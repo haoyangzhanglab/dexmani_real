@@ -114,9 +114,7 @@ class XArm7Kinematics:
         return compose_pose(self.base_pose_world, pose_base)
 
     def compute_eef_pose_base(self, qpos: np.ndarray) -> Pose:
-        # Hot-path: ensure_qpos validation is done at entry points (solve / solve_teleop_ik).
-        # Boundary callers validate the base pose once.
-        # Defense-in-depth: NaN/Inf qpos causes undefined behavior in Pinocchio C++ FK.
+        # Entry points validate qpos and the base pose; this path stays allocation-light.
         if not np.all(np.isfinite(qpos)):
             raise ValueError(f"compute_eef_pose_base: qpos contains NaN or Inf")
         full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
@@ -127,16 +125,13 @@ class XArm7Kinematics:
     def compute_eef_pose_world(self, qpos: np.ndarray) -> Pose:
         pose_base = self.compute_eef_pose_base(qpos)
         pose_world = self.base_to_world_pose(pose_base)
-        # Defense-in-depth: NaN guard symmetric with fingertip FK.
-        # Pinocchio FK is robust, but guard against model corruption or numerical anomalies.
+        # Keep a NaN guard for model corruption or numerical anomalies.
         if not np.all(np.isfinite(pose_world.p)) or not np.all(np.isfinite(pose_world.q)):
             return Pose(p=np.full(3, np.nan), q=np.full(4, np.nan))
         return pose_world
 
     def compute_eef_jacobian(self, qpos: np.ndarray) -> np.ndarray:
-        # Hot-path: ensure_qpos validation is done at entry points.
-        # Boundary callers validate the base pose once.
-        # Defense-in-depth: NaN/Inf qpos causes undefined behavior in Pinocchio C++ FK.
+        # Entry points validate qpos and the base pose before this hot path.
         if not np.all(np.isfinite(qpos)):
             raise ValueError(f"compute_eef_jacobian: qpos contains NaN or Inf")
         full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
@@ -159,17 +154,13 @@ class XArm7Kinematics:
             Jacobian columns map joint velocities to world-frame spatial velocity
             [v_world; ω_world].  Pose is the world-frame EEF pose.
         """
-        # Reject NaN/Inf qpos before Pinocchio FK — prevents undefined
-        # behavior in the C++ kinematics engine (cf. _to_full_qpos guard
-        # in collision_model.py).
+        # Reject NaN/Inf before Pinocchio FK to protect the C++ engine.
         if not np.all(np.isfinite(qpos)):
             raise ValueError("compute_eef_jacobian_and_pose_world: qpos contains NaN or Inf")
         full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
         self.pinocchio_model.compute_forward_kinematics(full_qpos)
 
-        # Jacobian (base frame) — Pinocchio local_frame=False gives
-        # spatial Jacobian expressed in the model's world frame, which
-        # for a fixed-base model is the robot base frame.
+        # Pinocchio returns this Jacobian in the fixed-base frame.
         jacobian_full = np.asarray(
             self.pinocchio_model.compute_single_link_jacobian(full_qpos, self.eef_link_id, False),
             dtype=np.float64,
@@ -185,10 +176,7 @@ class XArm7Kinematics:
             q=np.asarray(link_pose.q, dtype=np.float64),
         )
 
-        # Transform Jacobian from base frame → world frame.
-        # Spatial velocity transforms as [v_w; ω_w] = Ad_{R} @ [v_b; ω_b],
-        # where Ad_R = block_diag(R_b2w, R_b2w).  When base_pose_world is
-        # identity, this is a no-op.
+        # Transform spatial velocity from base frame to world frame.
         R_b2w = quat_wxyz_to_rotmat(self.base_pose_world.q)
         jacobian_world = np.empty_like(jacobian_base)
         jacobian_world[:3, :] = R_b2w @ jacobian_base[:3, :]  # linear part

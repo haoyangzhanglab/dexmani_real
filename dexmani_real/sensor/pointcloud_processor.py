@@ -36,7 +36,6 @@ class PointCloudProcessorConfig:
     )
     voxel_size: float = 0.005
 
-    # Optional 3-D filters. Zero disables the corresponding filter.
     radius_outlier_min_points: int = 0
     radius_outlier_radius: float = 0.01
     stat_outlier_nb_neighbors: int = 0
@@ -48,7 +47,6 @@ class PointCloudProcessorConfig:
     fps_backend: Literal["o3d", "pytorch3d"] = "o3d"
     hybrid_fps_threshold: int = 0
 
-    # Optional 2-D depth filters. Zero disables the corresponding filter.
     depth_edge_threshold_m: float = 0.030
     depth_edge_dilate_px: int = 1
     depth_edge_relative_ratio: float = 0.02

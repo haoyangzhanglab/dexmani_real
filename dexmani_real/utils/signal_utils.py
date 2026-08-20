@@ -80,15 +80,11 @@ def ema_smooth_pose(
     alpha_pos = float(np.clip(alpha_pos, 0.0, 1.0))
     alpha_rot = float(np.clip(alpha_rot, 0.0, 1.0))
 
-    # Position: standard EMA in R³
     pos = alpha_pos * np.asarray(target_pos, dtype=np.float64) + (1.0 - alpha_pos) * np.asarray(
         prev_pos, dtype=np.float64
     )
 
-    # Orientation: interpolate the relative rotation, not two absolute
-    # rotation vectors.  Choose the target quaternion sign from the adjacent
-    # dot product so the ±π/S³ antipode boundary always follows the shortest
-    # arc, then apply an exp/log SO(3) step from the previous orientation.
+    # Interpolate relative rotation and choose the quaternion sign from adjacency.
     prev_quat = _normalize_quat(prev_quat_wxyz, name="prev_quat_wxyz")
     target_quat = _normalize_quat(target_quat_wxyz, name="target_quat_wxyz")
     if float(np.dot(prev_quat, target_quat)) < 0.0:

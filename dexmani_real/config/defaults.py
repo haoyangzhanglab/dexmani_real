@@ -19,9 +19,6 @@ from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 _HEARTBEAT_SUBSYSTEMS = frozenset({"arm", "hand", "policy", "recorder", "vr", "camera", "inference"})
 _READINESS_SUBSYSTEMS = frozenset({"arm", "hand", "camera", "recorder", "policy", "vr", "inference"})
 
-# Shared sub-structures
-
-
 @dataclass(frozen=True)
 class HomingParams:
     """Firmware-planned execution parameters for validated home milestones."""
@@ -211,14 +208,10 @@ class EnvironmentConfig:
             raise ValueError("environment.static_boxes names must be unique")
 
 
-# Arm parameters (xArm7, 7-DOF)
-
-
 @dataclass(frozen=True)
 class ArmParams:
     """xArm7 hardware parameters — single source of truth."""
 
-    # Home position in radians.
     home_qpos: tuple[float, ...] = (
         0.0,
         0.041888,
@@ -229,8 +222,7 @@ class ArmParams:
         0.0,
     )
 
-    # Joint limits (rad), mirrored from the xArm URDF.
-    # URDF source: assets/robots/xhand/xarm7_xhand_collision.urdf
+    # Joint limits mirror assets/robots/xhand/xarm7_xhand_collision.urdf.
     joint_limit_lower: tuple[float, ...] = (
         -6.28318530718,
         -2.059,
@@ -250,28 +242,21 @@ class ArmParams:
         6.28318530718,
     )
 
-    # Mode 6 firmware limits.
     max_joint_velocity_deg_per_s: float = 135.0  # 75% of the 180 deg/s SDK command limit
     max_joint_acceleration_deg_per_s2: float = 1031.324031235482  # 18 rad/s²; 90% of the 20 rad/s² SDK limit
     loop_hz: float = 30.0  # arm_loop servo rate
 
     ip: str = "192.168.1.111"
 
-    # Device identity checks at connect.
     expected_axis: int = 7
-    # Explicit model check is opt-in: None means "don't guess the model".
     device_profile: str | None = None
 
-    # Fixed-Z fallback when calibrated table geometry is disabled.
     table_z_surface_m: float = 0.022
     hand_safety_margin_m: float = 0.05
 
-    # Safety thresholds.
     tracking_error_warn_rad: float = 0.35  # diagnostic warning threshold
-    # UFACTORY collision sensitivity, 0–5.
     collision_sensitivity: int = 1
 
-    # TCP load for firmware dynamics; COG is in the tool-flange frame.
     tcp_load_mass_kg: float = 1.1
     tcp_load_cog_mm: tuple[float, float, float] = (16.3, 7.9, 109.5)
 
@@ -307,9 +292,8 @@ class ArmParams:
             raise ValueError("tracking_error_warn_rad must be finite and positive")
         if not (0 <= self.collision_sensitivity <= 5):
             raise ValueError(f"collision_sensitivity={self.collision_sensitivity} out of range [0, 5]")
-        # The Mode 6 command path hard-clamps speed to [0.0001, π] rad/s and
-        # mvacc to [0.01, 20] rad/s²; validate in radians (not degrees) so the
-        # configured value can never be silently rewritten by the firmware.
+        # Mode 6 firmware clamps speed to [0.0001, π] rad/s and acceleration to
+        # [0.01, 20] rad/s²; validate in radians before sending.
         _max_speed_rad = self.max_joint_velocity_rad_per_s
         _max_acc_rad = self.max_joint_acceleration_rad_per_s2
         if not (np.isfinite(_max_speed_rad) and 0.0001 <= _max_speed_rad <= np.pi):
@@ -332,8 +316,6 @@ class ArmParams:
         if cog.shape != (3,) or not np.all(np.isfinite(cog)):
             raise ValueError("tcp_load_cog_mm must be a finite (3,) vector")
 
-
-# Hand parameters (XHand, 12-DOF)
 
 _XHAND_RATED_QPOS_MIN_RAD: tuple[float, ...] = (
     0.0,
@@ -369,25 +351,17 @@ _XHAND_RATED_QPOS_MAX_RAD: tuple[float, ...] = (
 class HandParams:
     """XHand hardware parameters — single source of truth."""
 
-    # -1 means unknown; EtherCAT is closed without a guessed state request.
     ethercat_slave_position: int = -1
 
-    # Explicit transport protocol: serial or ethercat.
     comm_type: str = "serial"
-    # Fixed RS485 serial device. Ignored for EtherCAT.
     device_name: str | None = "/dev/ttyUSB0"
-    # RS485 baudrate. Ignored for EtherCAT.
     baudrate: int = 3_000_000
-    # Vendor device id the driver must find among enumerated hands at connect.
     device_id: int = 0
-    # Allow the receive thread to settle after opening the port.
     rs485_post_open_settle_s: float = 1.0
-    # Send/read retry counts for transient serial CRC errors.
     rs485_crc_retry_count: int = 1
     rs485_read_crc_retry_count: int = 2
     rs485_crc_retry_backoff_s: float = 0.08
 
-    # Home position in canonical SDK order (degrees).
     home_qpos_deg: tuple[float, ...] = (
         30.0,
         55.33,
@@ -403,11 +377,9 @@ class HandParams:
         5.0,
     )
 
-    # Rated mechanical envelope from the bundled XHand URDF.
     mechanical_qpos_min_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MIN_RAD
     mechanical_qpos_max_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MAX_RAD
 
-    # Command-only operational bounds; applied at publication, not feedback validation.
     qpos_min_rad: tuple[float, ...] = (
         0.0,
         -0.698,
@@ -424,8 +396,6 @@ class HandParams:
     )
     qpos_max_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MAX_RAD
 
-    # Servo gains and current limit.
-    # Per-joint proportional gains.
     kp: tuple[int, ...] = (
         100,
         100,
@@ -443,7 +413,6 @@ class HandParams:
     ki: int = 0
     kd: int = 0
 
-    # Per-joint current limits in mA.
     tor_max_ma: tuple[int, ...] = (
         360,
         300,
@@ -461,19 +430,13 @@ class HandParams:
 
     loop_hz: float = 30.0
 
-    # Homing.
-    # Return-home waits only for the hand worker/SDK to accept the configured
-    # home command. It never waits for measured joint convergence.
+    # Homing waits for command acceptance, not measured joint convergence.
     home_command_ack_timeout_s: float = 1.0
 
-    # Send-error watchdog.
-    # Only a failed new-command send increments this counter.
     send_err_watchdog_count: int = 30
 
-    # Read and persistent-board-fault watchdog threshold.
     error_state_watchdog_frames: int = 5
 
-    # Hand FK (world-frame fingertip positions).
     fingertip_link_names: tuple[str, ...] = (
         "right_hand_thumb_rota_tip",
         "right_hand_index_rota_tip",
@@ -481,10 +444,6 @@ class HandParams:
         "right_hand_ring_tip",
         "right_hand_pinky_tip",
     )
-    # Planning EEF (custom_eef_link) to hand base (right_hand_link).
-    # Position includes the URDF mount and measured flange correction; collision
-    # uses the raw URDF model and folds that correction into table clearance.
-    #
     T_eef_handbase_pos_xyz: tuple[float, float, float] = (-0.015, 0.0, 0.0)
     T_eef_handbase_quat_wxyz: tuple[float, float, float, float] = (0.707107, 0.0, 0.707107, 0.0)
 
@@ -559,9 +518,6 @@ class HandParams:
             raise ValueError("hand base quaternion must be non-zero")
 
 
-# Policy / teleop parameters
-
-
 @dataclass(frozen=True)
 class PolicyParams:
     """Policy / teleop parameters — single source of truth."""
@@ -578,12 +534,10 @@ class PolicyParams:
 
     vr_mapping: VRMappingParams = field(default_factory=VRMappingParams)
 
-    # Arm-base workspace bounds (meters).
     workspace: WorkspaceBounds = field(default_factory=WorkspaceBounds)
 
     recording_enabled: bool = True
     max_record_duration_s: float = 60.0
-    # Quality label only; filtering remains downstream.
     min_record_duration_s: float = 1.0
     episodes_dir: str = "episodes"
 
@@ -598,7 +552,6 @@ class PolicyParams:
     arm_max_delta_rad_per_tick: float | None = np.deg2rad(8.0)
 
     hand_enabled: bool = True
-    # "tag" is in-repo; "dexpilot" uses the external backend.
     hand_retargeting_type: str = "tag"
     hand_ramp_duration_s: float = 0.5  # smoothstep startup ramp, rate-independent
     begin_motion_gate_timeout_s: float = 0.35  # begin voice may delay motion by at most this long
@@ -697,9 +650,6 @@ class KeyboardTeleopParams:
             raise ValueError("keyboard status/idle intervals must be > 0")
 
 
-# TAG retargeting parameters
-
-
 @dataclass(frozen=True)
 class TAGRetargetingParams:
     """TAG two-stage NLopt hand retargeting parameters (``retargeting_type="tag"``)."""
@@ -719,16 +669,13 @@ class TAGRetargetingParams:
     pinky_palm_scale: float = 1.25
     """Scale the pinky wrist→MCP baseline before TAG optimization."""
 
-    # MANO → XHand URDF frame (Euler XYZ, radians).
     mano_to_urdf_euler: tuple[float, float, float] = (0.0, 0.0, 0.0)
     """Frame alignment rotation."""
 
-    # Stage 1: global fingertip position matching.
     smooth_weight: float = 0.003
     ftol_abs_s1: float = 1e-4
     maxeval_s1: int = 80
 
-    # Stage 2 pinch refinement.
     ftol_abs_s2: float = 1e-6
     maxeval_s2: int = 100
     pinch_base_weight: float = 2000.0
@@ -814,9 +761,6 @@ class DexPilotRetargetingParams:
             raise ValueError("DexPilot prior_weight must be non-negative")
 
 
-# VR receiver parameters
-
-
 @dataclass(frozen=True)
 class VRParams:
     """VR receiver (HTS) parameters."""
@@ -831,9 +775,6 @@ class VRParams:
             raise ValueError("VR transport, host, and hand_side must be non-empty")
         if not (1 <= self.port <= 65535):
             raise ValueError("VR port must be in [1, 65535]")
-
-
-# Safety parameters
 
 
 @dataclass(frozen=True)
@@ -864,7 +805,6 @@ class SafetyParams:
     )
     shutdown_timeout_s: float = 65.0
 
-    # Supervisor check rate (Main)
     supervisor_hz: float = 10.0
 
     def __post_init__(self) -> None:
@@ -900,9 +840,6 @@ class SafetyParams:
         )
 
 
-# Camera parameters
-
-
 @dataclass(frozen=True)
 class CameraParams:
     """Camera / RealSense parameters."""
@@ -915,10 +852,7 @@ class CameraParams:
     warmup_frames: int = 10
     max_frame_age_s: float = 0.25
     recording_stall_abort_s: float = 2.0
-    # Frames skipped between consecutive reads that still count as normal.
-    # 0 (default) derives the threshold from fps/publish_hz, so the intentional
-    # publish-rate throttle does not read as a stall; set a positive value to
-    # override.  FRAME_GAP is flagged only when the gap exceeds this threshold.
+    # Zero derives the normal frame-gap threshold from fps and publish_hz.
     frame_gap_stall_threshold: int = 0
     ring_maxlen: int = 5
     pointcloud_num_points: int = 2048
@@ -952,8 +886,6 @@ class CameraParams:
         if self.serial is not None and not self.serial:
             raise ValueError("camera serial must be non-empty when configured")
 
-
-# Module-level defaults
 
 arm = ArmParams()
 hand = HandParams()

@@ -57,29 +57,19 @@ class L515DepthConfig:
 
     enabled: bool = True
 
-    # Visual preset.
     visual_preset: int = 5  # L500 Short Range preset.
 
-    # Explicit overrides.
     laser_power: int = 100  # 0-100, full power (MEMS eye-safe at all levels)
     receiver_gain: int = 9  # 8-18; numerically higher = *lower* actual gain.
-    # Higher receiver-gain values reduce the configured analog gain.
     confidence_threshold: int = 1  # 0-3 firmware confidence cull; 1 = keep more
-    # Pixels with confidence below this threshold are discarded.
     noise_filtering: int = 1  # 0-6; light temporal smoothing.
     min_distance: int = 150  # mm.
 
-    # Gains and sharpening.
     digital_gain: int = 1  # 1-2; post-ADC digital amplification.
     depth_offset: float = 4.5  # mm; expected read-only per-unit calibration.
-    # This is verified at startup, not written and not used as a tuning knob.
     post_processing_sharpening: int = 2  # 0-3; edge-enhancement on the firmware
-    # depth output.  2 = moderate sharpening — crisper object boundaries without
-    # the ringing artefacts that 3 can produce on thin geometry.
     pre_processing_sharpening: int = 0  # 0-5; pre-sharpening amplifies sensor
-    # noise before the noise filter runs — keep off.
     noise_estimation: float | None = None  # 0-4100; None = leave at the Short
-    # Range preset's factory value.  Explicit override only for custom tuning.
 
 
 @dataclass(frozen=True)
@@ -97,8 +87,7 @@ class RealSenseConfig:
     l515_depth_config: L515DepthConfig | None = field(default_factory=L515DepthConfig)
 
     def __post_init__(self) -> None:
-        # object.__setattr__ bypasses frozen=True in __post_init__ so we can
-        # normalize/normalize assign immutable fields after construction.
+        # Normalize frozen fields during construction.
         mode = _normalize_align_mode(self.align_mode)
         object.__setattr__(self, "align_mode", mode)
         if mode != "none" and not self.enable_color:
@@ -265,13 +254,10 @@ class RealSense:
             except (RuntimeError, OSError) as error:
                 logger.warning("L515 set_option(%s) failed: %s", option, error)
 
-        # Verify with a read-back sentinel. The preset label itself always
-        # flips to 0 (Custom) once individual options are overridden, so
-        # receiver_gain is checked instead.
+        # Verify receiver_gain because individual overrides change the preset label.
         time.sleep(0.5)
         actual_gain = float(sensor.get_option(rs.option.receiver_gain))
-        # depth_offset is a per-unit calibration constant and read-only on the
-        # connected L515. Verify/read it instead of issuing a failing setter.
+        # depth_offset is a per-unit read-only calibration constant; verify it only.
         actual_depth_offset = (
             float(sensor.get_option(rs.option.depth_offset))
             if sensor.supports(rs.option.depth_offset)
@@ -339,7 +325,6 @@ class RealSense:
         if sensor.supports(rs.option.emitter_enabled):
             options.append((rs.option.emitter_enabled, 1.0))
         if sensor.supports(rs.option.visual_preset):
-            # RS2_RS400_VISUAL_PRESET_HIGH_ACCURACY = 3
             options.append((rs.option.visual_preset, 3.0))
 
         for option, value in options:
@@ -470,9 +455,7 @@ class RealSense:
             self.K = K
             self.intr = intrinsics_to_vector(K)
             self.intrinsics_info = intrinsics_to_dict(intrinsics)
-            # Unit rays precomputed once per intrinsics change (edge-LUT
-            # pattern): per-frame deprojection is then a single multiply,
-            # points_cam = rays * depth_m[..., None].
+            # Precompute unit rays per intrinsics; each frame then needs one multiply.
             self.rays = make_rays(int(intrinsics.height), int(intrinsics.width), K).numpy()
 
     def get_rays(self) -> np.ndarray:

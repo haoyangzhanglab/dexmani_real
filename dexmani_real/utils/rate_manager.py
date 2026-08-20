@@ -107,14 +107,10 @@ class RateManager:
                     self._sleep(final_remaining)
             self._next_deadline += self.period
         else:
-            # Overdue. Count every late deadline and the number of complete
-            # additional slots skipped beyond that deadline.
             lateness = -remaining
             self._deadline_overrun_count += 1
             self._missed_slot_count += int((lateness + self.period * 1e-12) // self.period)
 
-            # Long block (>1 s): deliberate blocking operation (e.g. return-to-home,
-            # episode save). Re-anchor without a catch-up burst.
             if lateness > 1.0:
                 self._long_block_reanchor_count += 1
                 self._next_deadline = now + self.period

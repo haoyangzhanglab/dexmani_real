@@ -72,8 +72,7 @@ class PriorDexPilotOptimizer(DexPilotOptimizer):
         def objective(x: np.ndarray, grad: np.ndarray) -> float:
             result = base(x, grad)
             diff = x - ref
-            # Add the prior to BOTH value and gradient — unlike the temporal
-            # term upstream (gradient-only), so SLSQP's line search sees it.
+            # Add the prior to both value and gradient for SLSQP line search.
             if grad.size > 0:
                 grad += 2.0 * weighted_mask * diff
             return result + float(np.sum(weighted_mask * diff * diff))

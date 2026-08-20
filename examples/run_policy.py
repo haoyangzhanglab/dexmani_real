@@ -1,18 +1,7 @@
 #!/usr/bin/env python3
-"""Thin learned-policy deployment CLI.
+"""Usage: ``python examples/run_policy.py --deployment-config FILE``.
 
-Contains only ``argparse -> config override -> resolve -> run lifecycle -> exit
-code``. It never carries model code, CUDA code, scheduling, a SafetyGate, or
-SharedStorage business logic — those live in ``dexmani_real/deployment`` and the
-backend/adapter targets named by the deployment config.
-
-The deployment config names ``backend_target`` / ``observation_adapter_target``
-/ ``action_adapter_target`` as ``module:symbol`` factories (resolved lazily in
-the inference child). The runtime config supplies the arm/hand safety limits and
-control rates shared with every other workflow.
-
-Usage:
-    python examples/run_policy.py --deployment-config deploy.yaml [--config runtime.yaml]
+Resolve configs and start learned-policy deployment.
 """
 
 from __future__ import annotations
@@ -38,7 +27,10 @@ def main(argv: list[str] | None = None) -> int:
         description="Run a learned-policy deployment on the xArm7 + XHand runtime"
     )
     parser.add_argument(
-        "--config", type=str, default=None, help="YAML with runtime overrides (arm/hand/safety/control rates)"
+        "--config",
+        type=str,
+        default=None,
+        help="YAML with runtime overrides (arm/hand/safety/control rates)",
     )
     parser.add_argument(
         "--deployment-config",
@@ -46,19 +38,38 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="YAML with deployment overrides (backend/adapter targets, checkpoint, device)",
     )
-    parser.add_argument("--backend", type=str, default=None, help="module:symbol backend target")
     parser.add_argument(
-        "--observation-adapter", type=str, default=None, help="module:symbol observation adapter target"
+        "--backend", type=str, default=None, help="module:symbol backend target"
     )
-    parser.add_argument("--action-adapter", type=str, default=None, help="module:symbol action adapter target")
-    parser.add_argument("--checkpoint", type=str, default=None, help="model checkpoint path")
-    parser.add_argument("--device", type=str, default=None, help="inference device (default from config)")
+    parser.add_argument(
+        "--observation-adapter",
+        type=str,
+        default=None,
+        help="module:symbol observation adapter target",
+    )
+    parser.add_argument(
+        "--action-adapter",
+        type=str,
+        default=None,
+        help="module:symbol action adapter target",
+    )
+    parser.add_argument(
+        "--checkpoint", type=str, default=None, help="model checkpoint path"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="inference device (default from config)",
+    )
     parser.add_argument(
         "--hand",
         action="store_true",
         help="Enable coupled XHand control (deployment.hand_enabled=true)",
     )
-    parser.add_argument("--print-config", action="store_true", help="Print resolved configs and exit")
+    parser.add_argument(
+        "--print-config", action="store_true", help="Print resolved configs and exit"
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -74,7 +85,14 @@ def main(argv: list[str] | None = None) -> int:
                 "hand_enabled": True if args.hand else None,
             },
         )
-    except (KeyError, OSError, TypeError, UnicodeError, ValueError, yaml.YAMLError) as exc:
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+        yaml.YAMLError,
+    ) as exc:
         parser.error(f"invalid deployment config: {exc}")
 
     if args.print_config:
@@ -87,7 +105,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return run_policy_deployment(runtime, deployment)
     except Exception:
-        logger.error("policy deployment failed before lifecycle ownership was established", exc_info=True)
+        logger.error(
+            "policy deployment failed before lifecycle ownership was established",
+            exc_info=True,
+        )
         return 1
 
 

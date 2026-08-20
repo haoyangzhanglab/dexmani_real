@@ -19,8 +19,7 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-# counter/guard names — the single source of truth used by both the
-# inference worker and the coordinator so they never diverge.
+# Counter and guard names shared by the inference worker and coordinator.
 OBSERVATIONS_BUILT = "observations_built"
 OBSERVATION_AGE_MS = "observation_age_ms"
 OBSERVATION_SKEW_MS = "observation_skew_ms"
@@ -39,7 +38,6 @@ HAND_PREFLIGHT_REJECTIONS = "hand_preflight_rejections"
 POLICY_ABORTS = "policy_aborts"
 COMMAND_SILENCE_ABORT = "command_silence_abort"
 
-# Names whose value is a per-flush delta (increment-only); gauges are everything
 # else and keep their last observed value across flushes.
 _COUNTER_NAMES = frozenset(
     {
@@ -56,9 +54,7 @@ _COUNTER_NAMES = frozenset(
         HAND_PREFLIGHT_REJECTIONS,
         POLICY_ABORTS,
         COMMAND_SILENCE_ABORT,
-        # Per-gate-code reject counters are derived from
-        # ``reject_counter_name`` and are therefore also counters, though their
-        # names cannot be enumerated statically here.
+        # Per-gate reject counters are derived from ``reject_counter_name``.
     }
 )
 

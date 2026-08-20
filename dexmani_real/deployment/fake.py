@@ -21,9 +21,7 @@ from dexmani_real.deployment.contracts import InferenceContext, JointActionChunk
 from dexmani_real.deployment.observation import ObservationBatch
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
-# Fixed chunk length the fake emits when no explicit horizon is supplied. Kept
-# small so scheduler/generation checks stay readable; a real backend derives its
-# horizon from its model config, not from the transport capacity.
+# Fixed fake horizon for scheduler tests; real backends derive it from model config.
 _FAKE_HORIZON = 8
 
 

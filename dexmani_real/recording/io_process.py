@@ -562,9 +562,7 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
                         state,
                         action,
                         vr_frame,
-                        # Keep typed camera quality metadata even when the
-                        # image payload is absent; EpisodeRecorder fills
-                        # shape-stable zero arrays for that grid slot.
+                        # Preserve typed camera quality metadata when image payload is absent.
                         camera_frame=camera_frame,
                         signals=signals,
                         arm_qpos_sent=arm_qpos_sent,
@@ -611,10 +609,7 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
                         active_generation,
                     )
 
-            # An unexpected policy/main shutdown may arrive before the policy
-            # can publish STOP.  Do not keep the RecorderIO child alive merely
-            # because an episode is active: drain every resident sample, close
-            # all codecs/HDF5 handles, and retain only the aborted manifest.
+            # Exit if policy/main shuts down before publishing STOP.
             if not shared.is_running.value and recorder.is_recording and pending_finalization is None:
                 _begin_finalization(
                     generation=active_generation,
@@ -638,10 +633,7 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
                     )
                     _publish_status(
                         shared,
-                        # Timeout is a sticky session failure, but it is not a
-                        # terminal transaction state while the stop thread is
-                        # still alive. Keeping FINALIZING prevents a new START
-                        # from overtaking ownership of its recorder state.
+                        # A timeout is sticky session failure, not a terminal transaction state.
                         RecorderPhase.FINALIZING,
                         pending_finalization.generation,
                         frame_count=pending_finalization.frame_count,
@@ -697,9 +689,7 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
                     success=False,
                     reason="recorder_process_shutdown",
                 )
-            # Also reap a stop thread that was already pending when an
-            # unexpected exception escaped the polling loop. The thread owns
-            # HDF5/camera state and must not be abandoned at process exit.
+            # Reap any stop thread that was pending when shutdown began.
             if not recorder.join_stop(timeout=_RECORDER_STOP_TIMEOUT_S):
                 if recorder.stop_error:
                     logger.error(

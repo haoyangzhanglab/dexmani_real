@@ -300,9 +300,7 @@ def send_arm_home(
     if not np.isfinite(result_tolerance_rad) or result_tolerance_rad <= 0.0:
         raise ValueError("arm home result tolerance must be finite and positive")
 
-    # HOME is a motion command, not a fault-recovery command.  arm_loop stops
-    # consuming actions after a sticky fault, so rejecting here prevents
-    # impossible requests from filling the bounded action queue.
+    # Reject HOME after a sticky fault; the arm loop no longer consumes actions.
     if not shared.is_running.value:
         if verbose:
             print("  arm: homing cancelled — shutdown in progress", flush=True)
@@ -347,10 +345,7 @@ def send_arm_home(
             print("  arm: no collision planner — homing cancelled", flush=True)
         return False
 
-    # Plan a collision-safe path.  Prefer a single-phase path directly to the
-    # canonical home_qpos (equivalent joints rotate concurrently with the rest
-    # of the arm).  If no canonical candidate is safe, fall back to the proven
-    # two-phase path: nearest-equivalent home, then a band-alignment rotation.
+    # Prefer a direct collision-safe path to canonical home_qpos.
     _home_path_report: dict[str, Any] = {}
     try:
         _waypoints = plan_joint_home_path(
@@ -373,8 +368,7 @@ def send_arm_home(
         return False
 
     if _waypoints is not None and len(_waypoints) == 0:
-        # No safe single-phase path to canonical home.  Fall back to the
-        # two-phase wrapped path + band alignment.
+        # Fall back to the wrapped two-phase path when direct homing is unsafe.
         if verbose:
             _canonical_rejections = "; ".join(
                 _format_home_candidate_rejection(candidate)
@@ -430,12 +424,7 @@ def send_arm_home(
         if _waypoints is None:
             _waypoints = np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
 
-        # Align the nearest equivalent home to the canonical joint band.
-        # plan_joint_home_path wraps home_qpos to the nearest 2π band of the
-        # arm's current encoder position.  The returned waypoints end at this
-        # wrapped position.  For strategy learning we need the arm at the
-        # canonical home_qpos, so we append a collision-checked alignment
-        # segment that rotates only the band-mismatched equivalent joints.
+        # Align the wrapped home path to the canonical joint band.
         try:
             _align_path = plan_band_alignment_path(_wrapped_home, home_qpos, planner, table_z_surface_m=table_z_surface_m)
         except Exception as exc:

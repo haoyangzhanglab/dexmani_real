@@ -35,7 +35,6 @@ def _tag_config_with_urdf(config: Any | None, urdf_path: str) -> _TAGRuntimeOver
     return _TAGRuntimeOverrides(config, urdf_path)
 
 
-# MediaPipe pinky landmark indices.
 _PINKY_MCP = 17
 _PINKY_PIP = 18
 _PINKY_DIP = 19
@@ -116,9 +115,7 @@ def _human_flexion_sdk_reference(landmarks: np.ndarray) -> np.ndarray:
     return reference
 
 
-# Operator→MANO coordinate transform (right hand).
-# det = +1: this is a proper rotation.  Unity left-handed → FLU chirality conversion
-# has already happened once in sensor/vr_receiver_process.py.
+# Right-hand operator→MANO rotation; Unity→FLU conversion occurs in the VR receiver.
 _OPERATOR2MANO_RIGHT = np.array(
     [
         [0, 0, -1],
@@ -179,7 +176,6 @@ def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
         raise ValueError("palm normal is degenerate")
     normal = normal / normal_norm
 
-    # Gram-Schmidt
     x = x_vector - np.sum(x_vector * normal) * normal
     x_norm = np.linalg.norm(x)
     if x_norm < eps:
@@ -219,7 +215,6 @@ def adaptive_retargeting_xhand(
     landmarks = np.asarray(landmarks, dtype=np.float64).copy()
     if landmarks.shape != (21, 3) or not np.all(np.isfinite(landmarks)):
         raise ValueError("landmarks must be a finite (21, 3) array")
-    # Compute every segment from the original landmarks.
     raw = landmarks.copy()
 
     # Scale the wrist→MCP baseline independently.
@@ -267,7 +262,6 @@ class XHandRetargeter:
         self.load_retargeter()
 
     def load_retargeter(self):
-        # Load the selected backend lazily.
         import yaml
         from dex_retargeting.retargeting_config import RetargetingConfig
 
@@ -279,8 +273,7 @@ class XHandRetargeter:
             yaml_config = yaml.load(f, Loader=yaml.FullLoader)
         cfg = yaml_config["retargeting"]
 
-        # The YAML list is required by dex-retargeting, but it may not define a
-        # competing qpos order. Fail closed if it drifts from the schema.
+        # Require the YAML list without allowing it to redefine schema qpos order.
         configured_joint_names = tuple(cfg.get("target_joint_names", ()))
         if configured_joint_names != XHAND_SDK_JOINT_NAMES:
             raise ValueError(
@@ -408,8 +401,6 @@ class XHandRetargeter:
                 logger.warning("initial_qpos contains NaN/Inf — falling back to neutral seed")
 
 
-# MediaPipe fingertip landmark indices
-
 _FINGERTIP_INDICES = np.array([4, 8, 12, 16, 20], dtype=np.intp)
 
 
@@ -458,7 +449,6 @@ class TAGHandRetargeter:
             tag_config = tag_config.config
         tag_cfg = default_tag_cfg if tag_config is None else tag_config
 
-        # Load URDF and joint limits.
         resolved_urdf_path = (
             str(ASSET_DIR / "robots" / "xhand" / f"xhand_{hand_type}.urdf")
             if runtime_urdf_path is None
@@ -503,7 +493,6 @@ class TAGHandRetargeter:
             prior_mask=_SDK_FLEXION_MASK[self._mapping_sdk_to_model],
         )
 
-        # Precompute frame transforms and resolved scales.
         self._R_mano_to_urdf: np.ndarray = Rotation.from_euler("xyz", tag_cfg.mano_to_urdf_euler).as_matrix()
         self._pinky_scale = float(tag_cfg.pinky_scale)
         self._pinky_palm_scale = float(tag_cfg.pinky_palm_scale)
@@ -550,7 +539,6 @@ class TAGHandRetargeter:
             palm_scale=self._pinky_palm_scale,
         )
 
-        # Extract wrist-centered fingertips in the URDF frame.
         tips = mano[_FINGERTIP_INDICES].copy()  # (5, 3) in MANO frame
         tips -= mano[0]  # center at wrist
         tips_urdf = tips @ self._R_mano_to_urdf.T  # (5, 3) in URDF frame
@@ -564,7 +552,6 @@ class TAGHandRetargeter:
         if qpos_model is None:
             return None
 
-        # Remap model order to canonical SDK order.
         qpos_sdk = qpos_model[self._mapping_model_to_sdk]
         self._last_raw_qpos = qpos_sdk.copy()
 
@@ -591,7 +578,6 @@ class TAGHandRetargeter:
         return self._last_raw_qpos.copy() if self._last_raw_qpos is not None else None
 
 
-# Lazy Pinocchio URDF loader.
 
 
 def pin_loading(urdf_path: str):

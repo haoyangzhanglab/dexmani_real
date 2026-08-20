@@ -13,7 +13,6 @@ from typing import Any, get_args, get_origin
 
 import numpy as np
 
-# Type-introspection helpers.
 
 
 def _is_ndarray_annotation(tp: object) -> bool:
@@ -77,7 +76,6 @@ def _is_tuple_annotation(tp: object) -> bool:
     return get_origin(tp) is tuple
 
 
-# Value conversion.
 
 
 def _convert_field_value(val: object, target_tp: object) -> object:
@@ -133,7 +131,6 @@ def _convert_field_value(val: object, target_tp: object) -> object:
     return val
 
 
-# Centralized ``from_dict`` implementation.
 
 
 def from_dict_helper(cls: type, d: dict[str, Any]) -> dict[str, object]:

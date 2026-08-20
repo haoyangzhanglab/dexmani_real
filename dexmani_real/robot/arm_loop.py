@@ -203,8 +203,7 @@ def _startup(shared: Any, arm: XArm7, cfg: ArmLoopConfig) -> _LoopState:
         frame=new_frame(ARM_STATE_DTYPE),
         last_target=qpos.copy(),
     )
-    # Publish the initial frame before the ready signal so consumers never
-    # see an empty ring.
+    # Publish the initial frame before signaling ready.
     _write_arm_frame(
         shared,
         st.frame,
@@ -392,9 +391,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         shared.error_state.value = True
         logger.exception("arm_loop: worker failed")
     finally:
-        # Cleanup: best-effort state-4 stop + disconnect, fire-and-forget —
-        # the firmware is the final backstop, so no confirmation polling and
-        # no error escalation from cleanup.
+        # Cleanup requests a best-effort state-4 stop and disconnect; firmware is the backstop.
         arm.stop()
         arm.close()
         logger.info("arm_loop: exited")

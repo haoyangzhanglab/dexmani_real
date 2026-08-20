@@ -478,19 +478,14 @@ def _run_control_loop(
                     )
                 continue
             blocked_keys = None
-        # Idle: no keys pressed.
-        # Mode 6 is a position servo: after publication stops, firmware may
-        # still converge to its last accepted endpoint. No measured-hold,
-        # explicit stop, or explicit resume command is sent here.
+        # Idle: stop publishing commands while Mode 6 settles its last endpoint.
         if not moving:
             if motion_active:
                 advance_run_generation(shared)
                 require_transition(shared, SafetyState.ARMED)
                 motion_active = False
                 rate.reset()
-            # Rebuild both joint and Cartesian baselines continuously.  A new
-            # key press therefore starts from current feedback rather than a
-            # virtual target left behind before command silence.
+            # Rebuild baselines so new key presses start from current feedback.
             previous_command, target_pos, target_quat = _keyboard_command_anchor(
                 planner,
                 current_qpos,
@@ -510,9 +505,7 @@ def _run_control_loop(
             motion_active = True
             rate.reset()
 
-        # Advance a virtual Cartesian command at delta/dt, but cap its lead
-        # over fresh feedback.  This gives Mode 6 enough following error to
-        # reach the requested speed without allowing an unbounded target.
+        # Advance the virtual command at delta/dt while capping its lead over feedback.
         measured_pose = planner.kin.compute_eef_pose_world(current_qpos)
         workspace_margin_m = float(cfg.workspace_command_margin_m)
         command_low = workspace[:, 0] + workspace_margin_m
@@ -569,9 +562,7 @@ def _run_control_loop(
             if now_s - last_ik_warning_s >= _IK_WARNING_INTERVAL_S:
                 logger.warning("IK rejected target: %s", result.reason or "unknown")
                 last_ik_warning_s = now_s
-            # Don't stop the arm — the last valid Mode 6 endpoint is still
-            # active and the arm is converging to a safe position.  Just
-            # block this key combination until the user changes keys.
+            # Keep the last valid endpoint active and block this key combination.
             blocked_keys = active_keys
             continue
 
@@ -645,10 +636,7 @@ def _run_keyboard_session(
 
     keys.start()
     require_transition(shared, SafetyState.ARMED)
-    # Actively servo the hand at its home position.  Without this the hand
-    # stays at its power-up position and joints near the mechanical limit
-    # (particularly J5) may drift or repeatedly trigger feedback-bound
-    # tolerance warnings.
+    # Servo the hand home position to prevent drift near mechanical limits.
     if hand_enabled:
         hand_home = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
         if publish_hand_home_and_wait_applied(

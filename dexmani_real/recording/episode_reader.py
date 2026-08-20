@@ -11,10 +11,8 @@ intentionally require an external migration tool.
 Usage::
 
     with EpisodeReader("episode_001") as reader:
-        # Non-camera data — direct merged-h5py access
         arm_qpos = reader.h5f["arm_qpos"][:]
 
-        # Camera data
         rgb_frame  = reader.read_camera_frame("rgb", 42)
         all_depth  = reader.read_camera_all("depth")
 """
@@ -149,7 +147,6 @@ class EpisodeReader:
                 "(migrate historical episodes outside the runtime)"
             )
 
-    # -- public properties ------------------------------------------------
 
     @property
     def h5f(self) -> MergedH5File:
@@ -292,9 +289,7 @@ class EpisodeReader:
             or np.any(is_leading & (sample_valid | source_defined | source_time_finite))
         ):
             return ValidityState.INVALID
-        # All non-placeholder values must be causally available at their grid
-        # deadline. The small tolerance only covers float64 representation of
-        # large monotonic timestamps; it is far below a control tick.
+        # Non-placeholder values must be causally available by the grid deadline.
         if np.any(source_defined & (source_timestamps > timestamps + 1e-7)):
             return ValidityState.INVALID
         defined_indices = source_indices[source_defined]
@@ -361,9 +356,7 @@ class EpisodeReader:
             if "flag_held" in self._h5f
             else np.zeros(frame_count, dtype=bool)
         )
-        # A held source sample may intentionally publish no new action. Active
-        # samples require an action identity, and queue progress may never
-        # claim the zero-action sentinel.
+        # Held samples may omit actions; active samples require an action identity.
         if np.any(observation_ids[sample_valid] == 0) or np.any(sample_valid & ~held & (action_ids == 0)):
             return ValidityState.INVALID
         if np.any(queued & (action_ids == 0)):
@@ -454,7 +447,6 @@ class EpisodeReader:
             non_sampled_duration_s=non_sampled_duration_s,
         )
 
-    # -- camera queries ---------------------------------------------------
 
     def read_camera_frame(self, key: str, index: int) -> np.ndarray:
         """Read a single camera frame by index.
@@ -505,7 +497,6 @@ class EpisodeReader:
             raise RuntimeError("EpisodeReader has no RGB decoder")
         yield from self._rgb_decoder.iter_frames()
 
-    # -- context manager --------------------------------------------------
 
     def close(self) -> None:
         """Close all files and decoders. Idempotent."""

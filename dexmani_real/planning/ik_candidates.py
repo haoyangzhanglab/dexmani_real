@@ -21,7 +21,6 @@ logger = get_logger(__name__)
 
 # Map freeform reject reason strings → structured diagnostic categories.
 # Used in collect_ik_candidates() to produce reject_by_category summary.
-# Ref: ssik explain=True pattern — distinguishes unreachable vs all-filtered.
 _REJECT_CATEGORY_MAP: dict[str, str] = {
     "mplib_ik_failed": "unreachable",
     "IK candidate outside planning limits.": "limits",
@@ -67,25 +66,13 @@ class IKCandidateManager:
         self.equivalent_joint_mask = kinematics.equivalent_joint_mask
         self.mp_planner = kinematics.mp_planner
         self._cm = collision_model
-        # Cached: mask already guarantees range > 2π for equivalent joints,
-        # so min(2π, joint_range) ≡ 2π — the np.minimum in the original
-        # _periods() was dead logic.
+        # Equivalent-joint masks already guarantee a range of at least 2π.
         self._periods_arr = np.where(self.equivalent_joint_mask, 2.0 * np.pi, 1.0)
 
     def call_mplib_ik(
         self, target_pose_base: Pose, seed_qpos: np.ndarray, n_init_qpos: int, return_closest: bool
     ) -> tuple[str, Any]:
-        # MPlib semantics (installed mplib/planner.py): return_closest only
-        # re-selects among q_goals that already converged within threshold; a
-        # CLIK solution that converges above threshold is discarded ("IK Failed!
-        # Distance ... greater than threshold") and the qpos is lost. So
-        # return_closest does NOT rescue near-miss solves. threshold=1e-3 is
-        # deliberately far tighter than the downstream FK pose-error gate
-        # (max_pose_error_pos_m / max_pose_error_rot_rad); any future near-miss
-        # acceptance must raise threshold, with the downstream FK gate as the
-        # authority. n_init_qpos restarts MPlib from whole-space random
-        # configurations (not local perturbations), so it trades basin
-        # diversity for extra solve cost.
+        # MPlib's return_closest only re-selects already-converged goals.
         return self.mp_planner.IK(
             goal_pose=self.kin.to_mplib_pose(target_pose_base),
             start_qpos=seed_qpos,
@@ -133,9 +120,7 @@ class IKCandidateManager:
 
             raw_success_count += 1
             raw_qpos = np.asarray(raw_qpos, dtype=np.float64)
-            # Reject NaN/Inf from MPlib — symmetric with the teleop path
-            # (ik.py:149).  MPlib can return "Success" status alongside
-            # NaN/Inf qpos from numerical instability or degenerate seeds.
+            # Reject NaN/Inf even when MPlib reports success.
             if not np.all(np.isfinite(raw_qpos)):
                 reason = "mplib_ik_failed"
                 reject_counts[reason] = reject_counts.get(reason, 0) + 1
@@ -280,12 +265,7 @@ class IKCandidateManager:
             reference_qpos = np.zeros(self.dof, dtype=np.float64)
         reference_qpos = ensure_qpos(reference_qpos, self.dof, "reference_qpos")
 
-        # Expand the ±π window by one full period for equivalent joints so
-        # configurations near hardware limits (e.g. ref at +354°, valid
-        # solution at 0°) are not rejected.  canonicalize_qpos handles
-        # wrapping the IK output back into the correct band; this window
-        # only needs to be wide enough to accept the raw MPlib output in
-        # any equivalent band within ±π wrapped distance.
+        # Allow equivalent solutions near hardware limits by expanding the ±π window.
         mask = self.equivalent_joint_mask
         if np.any(mask):
             limits[mask, 0] = np.maximum(self.joint_limits[mask, 0], reference_qpos[mask] - 3.0 * np.pi)
@@ -370,7 +350,6 @@ class IKCandidateManager:
         upper = np.maximum(path - limits[None, :, 1], 0.0)
         return outside, np.maximum(lower, upper)
 
-    # Collision-check wrappers.
 
     def _require_collision_model(self) -> None:
         if self._cm is None:

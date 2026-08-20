@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Run the RealSense point-cloud and desk-plane diagnostic workflow."""
+"""Usage: ``python examples/pointcloud_process_example.py``.
+
+Run the RealSense point-cloud and desk-plane diagnostic workflow.
+"""
 
 import sys
 from pathlib import Path

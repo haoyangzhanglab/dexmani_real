@@ -54,7 +54,6 @@ class CollisionInfo:
     num_contacts: int = 0
     sample_qpos_rad: tuple[float, ...] | None = None
 
-    # Module-level cached singleton — set after the class body.
     _NO_COLLISION: ClassVar[CollisionInfo]
 
     @classmethod
@@ -142,8 +141,7 @@ class XArm7PlannerConfig:
     use_convex: bool = False
     joint_vel_limits_deg: tuple[float, ...] = (180, 180, 180, 180, 180, 180, 180)
     joint_acc_scale: float = 2.0
-    # Optional world-frame EEF bounds, shape (3, 2). Paths are validated at
-    # every returned waypoint; None keeps generic offline use unrestricted.
+    # Optional world-frame EEF bounds, shape (3, 2); None leaves offline use unrestricted.
     workspace_bounds: np.ndarray | None = None
 
 
@@ -154,8 +152,7 @@ class PlanningProfile:
     path_dt: float = 1 / 15
     planning_limits_deg: tuple[tuple[float, float], ...] | None = None
     max_ik_delta_deg: tuple[float, ...] = (120, 135, 120, 120, 180, 150, 180)
-    # Validation bound between returned planner waypoints. Firmware, not the
-    # application, owns execution-time trajectory generation.
+    # Application waypoint bound; firmware owns execution-time trajectory generation.
     max_waypoint_delta_deg: float = 15.0
     max_pose_error_pos_m: float = 0.005
     max_pose_error_rot_rad: float = 0.05
@@ -190,10 +187,7 @@ class PlanningProfile:
 class TeleopProfile:
     """Online teleoperation IK/servo configuration."""
 
-    # Per-tick joint jump gate (rad): a candidate whose wrapped delta vs the
-    # previous command exceeds this is rejected (hold), so an IK branch switch
-    # degrades to a smooth Mode-6 finish instead of an executed jump. It is a
-    # discontinuity guard, not a velocity clamp — firmware owns smoothing.
+    # Reject per-tick joint jumps in radians; firmware remains responsible for smoothing.
     max_ik_jump_deg: tuple[float, ...] = (30, 30, 30, 35, 40, 40, 40)
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
@@ -206,16 +200,12 @@ class TeleopProfile:
     position_ik_num_random_seeds: int = 3
     position_ik_seed_offset_deg: float = 5.0
     teleop_ik_seed: int | None = 42
-    # Multiplies a manipulability term normalized to the measured posture's
-    # conditioning (unitless, bounded [0, 1]) rather than raw Yoshikawa μ —
-    # see TeleopIKSolver._score_candidate for the normalization.
+    # Weight a unitless [0, 1] manipulability score normalized to measured posture.
     position_ik_manipulability_weight: float = 0.02
     position_ik_limit_penalty_weight: float = 0.01
     position_ik_velocity_weight: float = 0.25
     position_ik_pose_accuracy_weight: float = 0.1
-    # Rotation residuals are the user-perceived wrist-orientation tracking axis;
-    # weight them separately from position so orientation tracking can be tuned
-    # independently. Keep <= 1 to avoid cross-basin churn within the jump gate.
+    # Weight wrist orientation residuals separately from position tracking.
     position_ik_pose_rot_weight: float = 0.5
     # Zero disables hard rejection by Yoshikawa manipulability.
     position_ik_min_manipulability: float = 0.0
@@ -230,9 +220,7 @@ class TeleopProfile:
     # Range-normalized weights keep the base stable and favor wrist motion.
     joint_weights: tuple[float, ...] = (4.0, 1.8, 1.2, 0.6, 0.6, 0.9, 0.35)
 
-    # Post-IK null-space projection that adjusts the redundant DOF to repel
-    # joints from their limits while preserving the EEF pose to first order
-    # (J · dq_null = 0). Final nonlinear pose and collision gates run after it.
+    # Post-IK null-space projection repels joints from limits while preserving EEF pose.
     enable_nullspace_optimization: bool = True
     nullspace_step_size_deg: float = 1.0  # max null-space joint step per frame [deg]
     nullspace_joint_limit_margin_deg: float = 15.0  # repulsion margin from limits [deg]

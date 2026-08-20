@@ -32,8 +32,7 @@ _PATH_SCORE_JOINT_LENGTH_WEIGHT = 1.0
 _PATH_SCORE_WAYPOINT_DELTA_WEIGHT = 2.0
 _PATH_SCORE_EEF_EFFICIENCY_WEIGHT = 3.0
 
-# Allow a small outward tolerance because nonlinear FK can move a dense
-# interpolation slightly outside the endpoint box.
+# Allow a small outward tolerance for nonlinear FK interpolation.
 _WORKSPACE_BOUNDS_TOLERANCE_M = 1e-3
 
 
@@ -135,11 +134,7 @@ class XArm7MotionPlanner:
             base_pose_world=base_pose_world,
             mplib=self.mplib,
         )
-        # Dual-model design: this Pinocchio CollisionModel validates paths
-        # post-hoc with dense interpolation (0.02 rad step), complementing
-        # MPlib's internal FCL collision checking during RRT tree expansion.
-        # Both use the same SRDF (xarm7_xhand.srdf) so collision pair rules
-        # are consistent.
+        # Pinocchio validates dense paths post-hoc, complementing MPlib's FCL checks.
         self.collision_model = CollisionModel(hand_dof=hand_dof, static_boxes=static_boxes, table=table)
         self.ik_mgr = IKCandidateManager(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
@@ -151,7 +146,6 @@ class XArm7MotionPlanner:
             elbow_joint_index=self._elbow_joint_index,
         )
 
-        # Convenience aliases (used by teleop_solver and external code)
         self.dof = dof
         self.joint_limits = joint_limits
         self.equivalent_joint_mask = equivalent_joint_mask
@@ -235,9 +229,7 @@ class XArm7MotionPlanner:
             current_qpos, current_qpos, self.resolve_planning_limits(profile, current_qpos)
         )
 
-        # Diagnostic: when hand_dof=True, CollisionModel auto-expands arm qpos
-        # with _hand_qpos.  Warn if the buffer was never initialized — all-zero
-        # is ambiguous (could be a valid home pose), so use the dedicated flag.
+        # Warn when hand_dof=True but the hand pose buffer was never initialized.
         if self.collision_model.hand_dof and self.collision_model._hand_qpos is None:
             logger.warning(
                 "plan_path: _hand_qpos was never set — "
@@ -349,7 +341,6 @@ class XArm7MotionPlanner:
         path_result.report["planning_time_s"] = float(planning_time_s)
         return path_result
 
-    # Kinematics, IK candidate, and collision-check methods are proxied via
     # __getattr__ to self.kin / self.ik_mgr / self.mplib_planner.
 
     def try_screw_plan(
@@ -504,7 +495,6 @@ class XArm7MotionPlanner:
         gaps larger than max_waypoint_delta_deg when the arm is far from the
         target (e.g. return-to-home from a stretched pose).
         """
-        # Preprocessing
         try:
             path = self.snap_path_to_nearest_equivalent(path, current_qpos)
             path = self.canonicalize_path_to_planning_limits(path, current_qpos, profile)
@@ -707,11 +697,7 @@ class XArm7MotionPlanner:
             report["limit_violation_qpos_deg"] = np.rad2deg(path[waypoint_indices[0]].copy())
         return report
 
-    # Elbow branch-flip detection thresholds (path-wide min/max check).
-    # The -5°/15° band boundaries are shared with TeleopIKSolver; the span
-    # threshold (45°) is deliberately larger than the single-step check (40°)
-    # — a path can have a legitimate elbow crossing without any single frame
-    # being a "flip."
+    # Detect elbow branch flips using the shared -5°/15° band and path span.
     _ELBOW_NEG_BAND_RAD: float = np.deg2rad(-5.0)
     _ELBOW_POS_BAND_RAD: float = np.deg2rad(15.0)
     _ELBOW_MIN_SPAN_RAD: float = np.deg2rad(45.0)

@@ -54,9 +54,7 @@ HAND_TACTILE_FORCE_SHAPE = (
 HAND_CONTACT_SHAPE = (HAND_FINGER_COUNT,)
 HAND_FINGERTIP_SHAPE = (HAND_FINGER_COUNT, 3)
 
-# Learned-policy plan transport capacity. This is a runtime
-# IPC capacity, not a model horizon; an adapter that requests N > this must fail
-# rather than silently truncate.
+# Runtime IPC capacity for learned-policy plans; adapters must not truncate larger requests.
 MAX_POLICY_CHUNK_STEPS = 32
 
 _HAND_COMMAND_COMMON_FIELDS = [
@@ -69,9 +67,7 @@ _HAND_COMMAND_COMMON_FIELDS = [
     ("is_hold", "<u1"),
 ]
 
-# The arm command ring is latest-wins: the worker applies the newest endpoint
-# and never replays history, so staleness is decided by ``action_id`` against
-# the sequence captured when motion was armed, plus a bounded command age.
+# The arm ring is latest-wins; staleness uses ``action_id`` and command age.
 ARM_COMMAND_DTYPE = np.dtype(
     [
         ("action_id", "<u8"),
@@ -85,9 +81,7 @@ HAND_COMMAND_DTYPE = np.dtype(
     _HAND_COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", HAND_JOINT_SHAPE)], align=True
 )
 
-# Learned-policy plan payload. The inference worker writes
-# one of these per completed inference; the coordinator consumes the latest-wins
-# ring and never dumps the whole chunk into the arm queue or hand ring.
+# One payload is written per inference; the coordinator consumes only the latest.
 POLICY_PLAN_DTYPE = np.dtype(
     [
         ("plan_id", "<u8"),
@@ -138,10 +132,7 @@ HAND_STATE_DTYPE = np.dtype(
         ("tactile_contact", "<u1", HAND_CONTACT_SHAPE),
         ("error_state", "<u1"),
         ("connected", "<u1"),
-        # Set to 1 when the most recent single-frame read failed and the
-        # published qpos is the last-known (held) value, not a fresh read.
-        # Feedback *age* (staleness) is tracked separately via the source
-        # timestamp and read_healthy/state_valid.
+        # Set when qpos is held from the last read after a single-frame failure.
         ("qpos_stale", "<u1"),
         # action_id of the last command for which XHand.send_action() returned
         # success; this is not the hand command ring's internal sequence.

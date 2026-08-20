@@ -42,22 +42,18 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# Home (open-hand) posture — used as the default when _hand_qpos hasn't been set.
-# Zero = clenched fist, which would pass collision checks that the actual open
-# hand would fail.  Values from XHandParams.home_qpos_deg.
+# Open-hand home posture is the collision-check default until feedback is set.
 _HAND_HOME_QPOS: np.ndarray = np.deg2rad(np.asarray(hand.home_qpos_deg, dtype=np.float64))
 _warn_hand_qpos_unset = ThrottledWarner(interval_s=30.0)  # warn every 30s if hand_qpos never set
 _collision_detail_warn = ThrottledWarner(interval_s=60.0)
 
-# Collision model assets.
 _COLLISION_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)  # 7-DOF (hand fixed)
 _FULL_URDF = str(XARM7_XHAND_RIGHT_URDF_PATH)  # 19-DOF (7 arm + 12 hand)
 _COLLISION_SRDF = str(XARM7_XHAND_SRDF_PATH)  # unified SRDF (single source)
 
 _HAND_DOF_COUNT = HAND_DOF
 
-# User→URDF reorder map for set_hand_qpos().  Defined in planning.constants
-# (single source of truth shared with hand_kinematics.py).
+# Hand order mapping is defined in planning.constants and shared with kinematics.
 _HAND_USER_TO_URDF = HAND_SDK_TO_URDF_IDX
 _HAND_HOME_QPOS_URDF: np.ndarray = _HAND_HOME_QPOS[list(_HAND_USER_TO_URDF)]
 
@@ -103,11 +99,9 @@ class CollisionModel:
         _urdf = urdf_path or (_FULL_URDF if hand_dof else _COLLISION_URDF)
         _srdf = srdf_path or _COLLISION_SRDF
 
-        # Build model.
         self._model = pin.buildModelFromUrdf(_urdf)
         self._data = self._model.createData()
 
-        # Build collision geometry.
         self._collision_model = pin.buildGeomFromUrdf(
             self._model, _urdf, pin.GeometryType.COLLISION, package_dirs=[pkg]
         )
@@ -120,15 +114,11 @@ class CollisionModel:
             self._collision_model.addCollisionPair(pin.CollisionPair(i, j))
         pin.removeCollisionPairs(self._model, self._collision_model, _srdf)
 
-        # Hand self-collision is NOT checked: SRDF filtering leaves no active
-        # hand-hand pair, while arm↔hand pairs remain enabled.
-        # Arm↔hand collisions (e.g., wrist hitting fingers) remain active.
+        # SRDF disables hand-hand pairs; arm↔hand pairs remain active.
 
         self._collision_data = self._collision_model.createData()
 
-        # A separate geometry model contains only robot↔static-obstacle pairs.
-        # It deliberately has no robot↔robot or obstacle↔obstacle pairs, so the
-        # existing self-collision API and SRDF semantics remain unchanged.
+        # Environment checks use a separate robot↔static-obstacle geometry model.
         self._environment_collision_model = pin.buildGeomFromUrdf(
             self._model, _urdf, pin.GeometryType.COLLISION, package_dirs=[pkg]
         )
@@ -198,7 +188,6 @@ class CollisionModel:
             len(self._environment_collision_model.collisionPairs),
         )
 
-        # Cache qpos shape for validation.
         self._expected_qpos_shape: tuple[int, ...] = (self._nq,)
 
         # Hand qpos buffer (used in hand_dof mode to auto-expand 7→19 DOF).
@@ -295,7 +284,6 @@ class CollisionModel:
             dtype=np.float64,
         )
 
-    # qpos handling.
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
         """Set the current hand joint configuration for auto-expansion.
@@ -347,7 +335,6 @@ class CollisionModel:
             )
         return qpos
 
-    # Core collision evaluation.
 
     def _pin_update(self, qpos: np.ndarray, stop_at_first: bool = True) -> bool:
         """Compute self-collisions for a validated full configuration."""
@@ -358,7 +345,6 @@ class CollisionModel:
             )
         )
 
-    # Self-collision.
 
     def check_self_collision(self, qpos: np.ndarray) -> bool:
         """Check if qpos is in self-collision (fast bool, single point).
@@ -399,10 +385,8 @@ class CollisionModel:
         has_any = self._pin_update(qpos, stop_at_first=False)
         if not has_any:
             return CollisionInfo.no_collision()
-        # self._collision_data.collisionResults returns a C++ std::vector that
-        # can fail pybind11 type conversion on some hpp-fcl builds.  Fall back
-        # to a generic "collision detected" result when individual access isn't
-        # available.
+        # Some hpp-fcl builds cannot convert collisionResults through pybind11;
+        # keep collision detection authoritative even if pair details are absent.
         try:
             results = self._collision_data.collisionResults
             pairs: list[CollisionPair] = []
@@ -428,12 +412,10 @@ class CollisionModel:
             )
             return CollisionInfo(in_collision=True, collision_pairs=(), num_contacts=1)
         if not pairs:
-            # ``computeCollisions`` is authoritative. Pair enumeration is
-            # diagnostic-only; never turn a real collision into a pass.
+            # Pair enumeration is diagnostic-only; never turn a real collision into a pass.
             return CollisionInfo(in_collision=True, collision_pairs=(), num_contacts=1)
         return CollisionInfo(in_collision=True, collision_pairs=tuple(pairs), num_contacts=len(pairs))
 
-    # Static environment and combined collision checks.
 
     @property
     def has_static_environment(self) -> bool:
@@ -537,7 +519,6 @@ class CollisionModel:
         self_info = self.check_self_collision_details(qpos)
         return self_info if self_info else self.check_environment_collision_details(qpos)
 
-    # Segment collision checking.
 
     @staticmethod
     def _validate_step_size(step_size: float) -> float:
@@ -630,7 +611,6 @@ class CollisionModel:
     def _user_hand_to_urdf(self, hand_qpos: np.ndarray, name: str) -> np.ndarray:
         return self._validate_vector(hand_qpos, _HAND_DOF_COUNT, name)[list(_HAND_USER_TO_URDF)]
 
-    # Helpers.
 
     def _get_geom_link_name(self, geom_id: int) -> str:
         """Get the link name for a geometry object index."""
@@ -647,7 +627,6 @@ class CollisionModel:
             return self._model.frames[parent_frame].name
         return geom.name
 
-    # Properties.
 
     @property
     def hand_dof(self) -> bool:

@@ -90,9 +90,8 @@ class DexManiObservationAdapter:
                     else _last_valid(observation.hand_history, _HAND_DOF)
                 )
             elif field in {"hand_current", "hand_joint_torque"}:
-                # XHand exposes the vendor joint ``torque`` reading through
-                # DexMani's established ``current`` state field; no unit or
-                # scale conversion is applied at this boundary.
+                # Map vendor ``torque`` to the established ``current`` field
+                # without unit or scale conversion.
                 encoded[field] = _last_valid_optional(observation.hand_current_history)
             elif field in {"hand_tactile_sum", "fingertip_force"}:
                 encoded[field] = _last_valid_optional(observation.hand_tactile_sum_history)

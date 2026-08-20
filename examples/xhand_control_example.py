@@ -1,18 +1,7 @@
 #!/usr/bin/env python3
-"""XHand control example -- standalone vendor exercise using raw xhand_controller SDK.
+"""Usage: ``python examples/xhand_control_example.py``.
 
-Usage::
-
-    conda activate real_robot
-    python examples/xhand_control_example.py              # home + preset motion
-
-Default behaviour: open, identify, read/print state, then run home + preset
-actions.  The script always moves the hand when it runs -- there is no read-only
-mode and no CLI flag gate.  Keep the workspace clear before running.  The native
-SDK session runs in an isolated worker because its receive thread can abort the
-process when a device disconnects.
-
-Uses the xhand_controller SDK directly -- no dexmani_real runtime dependencies.
+Run a moving XHand diagnostic through the native SDK in an isolated worker.
 """
 
 from __future__ import annotations
@@ -28,7 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# Diagnostic default kept local so this script can run without the full package.
 HOME_QPOS_DEG = (
     30.0,
     55.33,
@@ -58,7 +46,9 @@ _RS485_TACTILE_STATUS_CODES = frozenset(
     }
 )
 _RS485_TACTILE_STATUS_DETAIL = {
-    _RS485_COMBINED_FORCE_ERROR_CODE: "combined force unavailable; force frame invalidated conservatively",
+    _RS485_COMBINED_FORCE_ERROR_CODE: (
+        "combined force unavailable; force frame invalidated conservatively"
+    ),
     _RS485_DISTRIBUTED_FORCE_ERROR_CODE: "distributed force unavailable; combined force retained",
     _RS485_TEMPERATURE_ERROR_CODE: "temperature unavailable; force fields retained",
 }
@@ -70,10 +60,7 @@ _RS485_SENSOR_VERIFY_RETRY_COUNT = 2
 _RS485_CRC_RETRY_BACKOFF_S = 0.08
 _HARDWARE_WORKER_ARG = "--_xhand-hardware-worker"
 
-# Command envelope (rad), duplicated from
-# dexmani_real.config.defaults.hand.qpos_min_rad / qpos_max_rad so the
-# diagnostic validates/clips presets against the worker's bounds. Presets are
-# clipped before sending.
+# Keep the local command envelope aligned with the runtime hand limits.
 COMMAND_QPOS_MIN_RAD = (
     0.0,
     -0.698,
@@ -103,9 +90,7 @@ COMMAND_QPOS_MAX_RAD = (
     1.919,
 )
 
-# Fingertip sensor joint IDs (thumb, index, middle, ring, little).
 _FINGERTIP_IDS = frozenset({2, 5, 7, 9, 11})
-# Map each fingertip joint ID to its index into state.sensor_data (0-4).
 _FINGERTIP_TO_SENSOR_IDX = {2: 0, 5: 1, 7: 2, 9: 3, 11: 4}
 
 
@@ -137,7 +122,6 @@ class PresetActions:
         yield "ok", self.ok
 
 
-# XHand 1 (serial digit "3"). Preset angles stay inside the command envelope.
 PRESET_XHAND1 = PresetActions(
     fist=(
         11.85,
@@ -171,7 +155,6 @@ PRESET_XHAND1 = PresetActions(
     ),
 )
 
-# XHand 1 Lite (serial digit "6").
 PRESET_XHAND1_LITE = PresetActions(
     fist=(0, 58, 83, 80, 80, 80, 0, 0, 0, 0, 0, 0),
     palm=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
@@ -186,9 +169,7 @@ class XHandControlExample:
     def __init__(
         self, hand_id: int = 0, params: HandCommandParams | None = None
     ) -> None:
-        # Import the native SDK only in the isolated hardware worker.  Version
-        # 1.1.8 can call std::terminate() from its serial receive thread, which
-        # cannot be caught by Python in the process that loaded the extension.
+        # Keep the native SDK inside the crash-isolated worker.
         from xhand_controller import xhand_control  # type: ignore[import-untyped]  # isort: skip
 
         self._sdk = xhand_control
@@ -197,8 +178,6 @@ class XHandControlExample:
         self._device = self._sdk.XHandControl()
         self._hand_command = self._build_command(self._params.default_position)
         self._protocol: str | None = None
-
-    # Command builders.
 
     def _build_command(self, position: float) -> Any:
         """Build a homogeneous hand command with the configured servo params."""
@@ -215,9 +194,7 @@ class XHandControlExample:
         return cmd
 
     def _set_positions(self, qpos_deg: tuple[float, ...] | list[float]) -> None:
-        """Write joint positions (deg -> rad) into the current command, clipped
-        to the command envelope so the diagnostic never sends an
-        out-of-range raw SDK command."""
+        """Write clipped degree inputs as radians into the current command."""
         for i in range(_HAND_DOF):
             rad = qpos_deg[i] * math.pi / 180.0
             lo = COMMAND_QPOS_MIN_RAD[i]
@@ -234,8 +211,6 @@ class XHandControlExample:
     @staticmethod
     def _header(title: str) -> None:
         print(f"\n{'=' * 60}\n  {title}\n{'=' * 60}")
-
-    # Device enumeration and open.
 
     def enumerate_devices(self, protocol: str) -> list[str]:
         self._header(f"Enumerate devices ({protocol})")
@@ -272,15 +247,14 @@ class XHandControlExample:
             print("  OK")
             if protocol == "RS485":
                 print(
-                    f"  Waiting {_RS485_POST_OPEN_SETTLE_S:.1f}s for the RS485 receive path to settle..."
+                    f"  Waiting {_RS485_POST_OPEN_SETTLE_S:.1f}s for the RS485 "
+                    "receive path to settle..."
                 )
                 time.sleep(_RS485_POST_OPEN_SETTLE_S)
         else:
             err = rsp.error_message if rsp else "no response"
             print(f"  FAILED: {err}")
         return ok
-
-    # Identity and version.
 
     def read_sdk_version(self) -> None:
         self._header("SDK versions")
@@ -305,8 +279,6 @@ class XHandControlExample:
         print(f"  serial_number: {sn}")
         return sn
 
-    # State.
-
     def _read_state_response(
         self, force_update: bool, *, label: str
     ) -> tuple[Any, Any]:
@@ -330,9 +302,7 @@ class XHandControlExample:
         return error_struct, state
 
     def read_state(self, finger_id: int = 2, force_update: bool = True) -> bool:
-        # The vendor 1.1.8 API documents True as a read-only state-refresh
-        # request.  Cached mode is useful immediately after send_command(), but
-        # this standalone diagnostic needs a live frame before its first send.
+        # Request a live frame before the first command.
         self._header(f"Read state (finger {finger_id})")
         error_struct, state = self._read_state_response(
             force_update, label="read_state"
@@ -492,8 +462,6 @@ class XHandControlExample:
         )
         return True
 
-    # Motion commands.
-
     def send_command(self, sleep_s: float = 1.0) -> bool:
         error_struct = self._device.send_command(self._hand_id, self._hand_command)
         code = int(error_struct.error_code)
@@ -546,8 +514,6 @@ class XHandControlExample:
         self._header("Return to home")
         self._set_positions(HOME_QPOS_DEG)
         return self.send_command()
-
-    # Cleanup.
 
     def close(self) -> None:
         self._header("Close device")
@@ -604,16 +570,13 @@ def _run_hardware_session() -> int:
         return 1
 
     try:
-        # Identity and diagnostics.
         xhand_exam.read_sdk_version()
         xhand_exam.read_device_info()
         serial_number = xhand_exam.read_serial_number()
-        # No command has been sent yet, so explicitly request a live state.
         if not xhand_exam.read_state(finger_id=5, force_update=True):
             print("Aborting: no valid initial joint state was received.")
             return 2
 
-        # Motion: home, then preset actions, then return home.
         if not xhand_exam.go_home():
             print("Aborting: initial home command failed after the bounded retry.")
             return 2
@@ -646,7 +609,8 @@ def _run_isolated_hardware_session() -> int:
         print(
             "\nXHand SDK worker aborted while its native communication thread was running.\n"
             "The launcher remained alive and no core file was written. For RS485, check that\n"
-            f"{_DEFAULT_SERIAL_PORT} still exists, the hand is powered, USB/RS485 wiring is stable,\n"
+            f"{_DEFAULT_SERIAL_PORT} still exists, the hand is powered, "
+            "USB/RS485 wiring is stable,\n"
             "and no other process owns the serial port, then reconnect and retry.",
             file=sys.stderr,
         )

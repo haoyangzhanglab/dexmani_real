@@ -40,9 +40,7 @@ from dexmani_real.utils.pointcloud_utils import (
     rgbd_to_pointcloud,
 )
 
-# Constants.
 
-# Point-cloud defaults.
 _DEFAULT_PCD_NPOINTS = 1024
 _DEFAULT_PCD_MIN_DEPTH = 0.05
 _DEFAULT_PCD_MAX_DEPTH = 1.5
@@ -55,10 +53,8 @@ _DEFAULT_WORKSPACE: tuple[float, float, float, float, float, float] = (
     1.5,  # xyz_max
 )
 
-# Voxel cycle order for 'v' key.
 _VOXEL_CYCLE: tuple[float | None, ...] = (None, 0.005, 0.01)
 
-# Sampling mode cycle order for 's' key.
 _SAMPLING_MODES: tuple[str, ...] = ("random", "fps", "none")
 
 _WINDOW_NAME = "RealSense Test | RGB(left) Depth(right)"
@@ -139,8 +135,7 @@ class NonBlockingPCDViewer:
     """Non-blocking open3d point-cloud window -- create on first frame, update thereafter."""
 
     def __init__(self, point_size: float = 3.0) -> None:
-        # Open3D does not publish usable type information in the target
-        # environment; keep the optional lifecycle state explicit here.
+        # Keep optional Open3D lifecycle state explicit because its stubs are incomplete.
         self._vis: Any | None = None
         self._pcd: Any | None = None
         self._frame: Any | None = None
@@ -346,7 +341,6 @@ def _build_hud_lines(
     return lines
 
 
-# Keyboard action handlers.
 
 
 def _build_key_actions(
@@ -442,7 +436,6 @@ def _run_rgbd_test(camera: RealSense, test_cfg: RealSenseDiagnosticConfig) -> di
     while True:
         loop_start = time.perf_counter()
 
-        # Read frame.
         t0 = time.perf_counter()
         try:
             frame = camera.read(timeout_ms=5000)
@@ -452,7 +445,6 @@ def _run_rgbd_test(camera: RealSense, test_cfg: RealSenseDiagnosticConfig) -> di
         read_ms = (time.perf_counter() - t0) * 1000.0
         frame_count += 1
 
-        # Point cloud generation.
         pcd_ms = 0.0
         point_count = 0
         pcd_array = None
@@ -470,7 +462,6 @@ def _run_rgbd_test(camera: RealSense, test_cfg: RealSenseDiagnosticConfig) -> di
                     print(f"  PCD generation failed (frame {frame_count}): {e}")
             pcd_ms = (time.perf_counter() - t0) * 1000.0
 
-        # Depth visualization.
         if state.colormap == "jet":
             depth_vis = make_depth_vis(
                 frame.depth, _DEFAULT_PCD_MIN_DEPTH, _DEFAULT_PCD_MAX_DEPTH
@@ -484,7 +475,6 @@ def _run_rgbd_test(camera: RealSense, test_cfg: RealSenseDiagnosticConfig) -> di
             frame.depth, _DEFAULT_PCD_MIN_DEPTH, _DEFAULT_PCD_MAX_DEPTH
         )
 
-        # Panel assembly.
         if frame.rgb is not None:
             color_bgr = np.ascontiguousarray(frame.rgb[..., ::-1])
             if color_bgr.shape[:2] != depth_vis.shape[:2]:
@@ -511,21 +501,18 @@ def _run_rgbd_test(camera: RealSense, test_cfg: RealSenseDiagnosticConfig) -> di
         _overlay_text(panel, lines)
         cv2.imshow(_WINDOW_NAME, panel)
 
-        # Point cloud window update.
         if state.show and pcd_array is not None and pcd_array.shape[0] > 0:
             if not viewer.update(pcd_array):
                 state.show = False
                 viewer.close()
                 print("  Point cloud window closed")
 
-        # Keyboard.
         if not _handle_keyboard(cv2.waitKey(1) & 0xFF, state, viewer):
             break
 
     viewer.close()
     cv2.destroyAllWindows()
 
-    # Performance summary.
     if stats_history:
         reads = np.array([s.read_ms for s in stats_history])
         totals = np.array([s.total_ms for s in stats_history])
@@ -663,17 +650,14 @@ def main() -> int:
         print("pyrealsense2 : NOT INSTALLED")
         return 1
 
-    # Enumerate.
     cameras = _list_cameras()
     if not cameras:
         return 1
 
-    # Lifecycle.
     if not _test_lifecycle(test_cfg):
         print("Lifecycle test failed, exiting.")
         return 1
 
-    # Main loop.
     config = RealSenseConfig(
         depth_resolution=test_cfg.depth_resolution,
         color_resolution=test_cfg.color_resolution,

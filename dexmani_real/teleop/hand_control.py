@@ -156,8 +156,7 @@ def _compute_hand_command(
             return cached.copy(), True
         return prev_hand_cmd.copy(), False
 
-    # Claim the observation before entering the stateful solver. A failed or
-    # partially failed solve is not retried on later control ticks.
+    # Claim each observation once; failed solves are not retried on later ticks.
     observation_cache.observation_id = observation_id
     observation_cache.target_qpos = None
     observation_cache.succeeded = False

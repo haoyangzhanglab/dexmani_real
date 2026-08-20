@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Run the xArm7/RealSense eye-to-hand camera calibration workflow."""
+"""Usage: ``python examples/calibrate_camera.py``.
+
+Run the xArm7/RealSense eye-to-hand camera calibration workflow.
+"""
 
 import sys
 from pathlib import Path

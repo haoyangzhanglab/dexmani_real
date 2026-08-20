@@ -192,23 +192,15 @@ def hand_loop(shared, config: HandParams) -> None:
             _mark_startup_failure()
             return
 
-        # Explicit tactile reset/bias, split out of connect(). The connection
-        # itself only opens the device and seeds the command history.  Tactile
-        # failure degrades to calibrated=False without blocking joint control —
-        # never a startup failure.
+        # Initialize tactile reset/bias separately; tactile failure does not block joint control.
         try:
             hand.calibrate_tactile()
         except Exception:
             logger.warning("hand_loop: tactile calibration raised", exc_info=True)
 
-        # DISARMED startup is read-only.  Opening the bus and validating feedback
-        # must never create a home motion; homing remains an explicit, correlated
-        # policy action after Main transitions the system to ARMED.
+        # DISARMED startup is read-only; homing remains an explicit policy action.
 
-        # Publish initial state BEFORE hand_ready — consumers wait on hand_ready and
-        # expect the ring to already contain a valid frame.  Without this, there is
-        # a one-tick window where hand_ready is set but hand_state_ring is empty.
-        # (Same pattern as arm_loop arm_ready.)
+        # Publish initial state before hand_ready so consumers never see an empty ring.
         try:
             st = hand.get_state()
             _init_qpos = st.qpos
@@ -260,10 +252,7 @@ def hand_loop(shared, config: HandParams) -> None:
             overcurrent_error_count=0,
         )
 
-        # Write heartbeat BEFORE ready signal — prevents false FAULT on startup
-        # (same pattern as vr_loop).  Main's supervisor checks heartbeats immediately
-        # after all ready events; if this process hasn't entered its main loop yet,
-        # heartbeat=0 → age=inf → spurious FAULT.
+        # Publish heartbeat before ready to avoid a false startup fault.
         shared.set_heartbeat("hand", time.monotonic())
         shared.set_ready("hand")
         ready = True
@@ -320,13 +309,11 @@ def hand_loop(shared, config: HandParams) -> None:
             return data.copy()
 
         while shared.is_running.value:
-            # Heartbeat — written even when gated (proves we're alive)
             shared.set_heartbeat("hand", time.monotonic())
 
             if shared.estop_request.value:
                 break
 
-            # Safety state gate — only process commands in ARMED or RUNNING.
             _safety = shared.safety_state.value
             if _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not shared.error_state.value:
                 execute_action = _read_latest_command()
@@ -341,15 +328,11 @@ def hand_loop(shared, config: HandParams) -> None:
                         _send_error_counter.reset()
                         last_applied_action_id = int(execute_action["action_id"][0])
 
-                # Send-error watchdog: persistent failed sends latch a global fault.
-                # ``has_hardware_fault`` is derived from each fresh state, so the
-                # send counter is the only send-recovery bookkeeping: successes reset
-                # it and failed new commands accumulate.
+                # Persistent send failures latch a global fault.
                 if _send_error_counter.triggered:
                     shared.error_state.value = True
                     logger.error("hand_loop: persistent send failures — latching global fault")
 
-            # Read state (always — even when safety-gated)
             read_failed = False
             try:
                 st = hand.get_state()
@@ -368,7 +351,6 @@ def hand_loop(shared, config: HandParams) -> None:
                 _last_tactile_sum = tactile_sum.copy()
                 _last_tactile_force = tactile_force.copy()
                 _read_error_counter.reset()
-                # Board error registers (per-joint hardware fault indicators).
                 commboard_err = st.commboard_err
                 jointboard_err = st.jointboard_err
                 tipboard_err = st.tipboard_err
@@ -384,11 +366,7 @@ def hand_loop(shared, config: HandParams) -> None:
                 _last_read_error_code = exc.code
                 is_overcurrent = _last_read_error_code == XHAND_OVERCURRENT_ERROR_CODE
                 if is_overcurrent:
-                    # Overcurrent is a recoverable firmware warning, not a read
-                    # failure: the hand stays connected and joint feedback stays
-                    # valid. Keep the last-known current so the stall load stays
-                    # observable (firmware tor_max already bounds it) and record
-                    # the event as an observation only — no pause, no fault.
+                    # Treat overcurrent as a recoverable warning and retain feedback.
                     read_failed = False
                     _overcurrent_error_count_total += 1
                     logger.warning(
@@ -429,18 +407,14 @@ def hand_loop(shared, config: HandParams) -> None:
                 tactile_contact = np.zeros(HAND_CONTACT_SHAPE, dtype=bool)
                 tactile_valid = False
                 connected = hand.is_connected
-                # A transient read failure is not a board fault. The independent
-                # read watchdog owns escalation to shared.error_state.
+                # Transient read failures are escalated by the independent watchdog.
                 has_hardware_fault = False
                 commboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
                 jointboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
                 tipboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
 
                 if not is_overcurrent:
-                    # Read-error escalation: persistent get_state exceptions (SDK crash,
-                    # USB disconnect) bypass the board-fault path because no fresh
-                    # board registers are available. A dedicated counter still latches
-                    # global error_state for this silent-dead-hand scenario.
+                    # Persistent read errors latch global error_state without board registers.
                     _read_error_counter.inc()
                     if _read_error_counter.triggered:
                         shared.error_state.value = True
@@ -449,8 +423,7 @@ def hand_loop(shared, config: HandParams) -> None:
                             _read_error_counter.max_consecutive,
                         )
 
-            # Board-fault escalation is independent of transient read failures.
-            # Each successful fresh state decides the current board-fault value.
+            # Board-fault status is evaluated only from fresh successful reads.
             if has_hardware_fault and not shared.error_state.value:
                 _error_state_counter.inc()
                 if _error_state_counter.triggered:
@@ -487,14 +460,9 @@ def hand_loop(shared, config: HandParams) -> None:
                 overcurrent_error_count=_overcurrent_error_count_total,
             )
 
-            # Keep absolute-deadline scheduling.
             rate_mgr.wait()
     finally:
-        # Shutdown never creates new motion. Homing is an explicit, correlated
-        # policy operation; worker cleanup only closes the device and releases the
-        # bus after the command loop has been gated. The hand is intentionally NOT
-        # unforced (mode=0) on shutdown — it stays in its last commanded position,
-        # matching examples/xhand_control_example.py.
+        # Shutdown closes the device without creating new motion.
         if not _safe_disconnect(hand):
             logger.error("hand_loop: XHand disconnect failed")
             shared.error_state.value = True

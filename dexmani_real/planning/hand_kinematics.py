@@ -31,7 +31,6 @@ logger = get_logger(__name__)
 
 # Remap from XHand SDK qpos order to Pinocchio model order.
 # Defined in planning.constants (single source of truth shared with collision_model.py).
-# See constants.HAND_SDK_TO_URDF_IDX for the full joint-name mapping.
 _SDK_TO_URDF_IDX = np.array(HAND_SDK_TO_URDF_IDX, dtype=np.intp)
 
 

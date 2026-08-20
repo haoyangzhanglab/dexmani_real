@@ -13,8 +13,7 @@ import os
 import time
 from pathlib import Path
 
-# Set a quiet default before importing Rerun, while preserving an operator's
-# explicit Rust logging configuration.
+# Set a quiet Rerun logging default unless the operator already configured one.
 os.environ.setdefault("RUST_LOG", "error")
 
 import h5py
@@ -29,7 +28,6 @@ from dexmani_real.utils.schema import HAND_FINGERTIP_SHAPE
 
 logger = get_logger(__name__)
 
-# Known dataset categories for auto-detection.
 
 _KNOWN_CATEGORIES: dict[str, set[str]] = {
     "arm": {"arm_qpos", "arm_ee"},
@@ -48,7 +46,6 @@ _KNOWN_CATEGORIES: dict[str, set[str]] = {
     "meta": {"timestamp"},
 }
 
-# Per-finger colors for hand_fingertip keypoints (thumb, index, middle, ring, pinky).
 _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
     (255, 60, 60),  # thumb  — red
     (60, 255, 60),  # index  — green
@@ -71,7 +68,6 @@ def _classify_datasets(h5f: MergedH5File) -> dict[str, list[str]]:
     return classified
 
 
-# Info mode (no Rerun needed).
 
 
 def print_episode_info(h5_path: str) -> None:
@@ -85,7 +81,6 @@ def print_episode_info(h5_path: str) -> None:
         keys = sorted(k for k in f.keys() if isinstance(f[k], h5py.Dataset))
         groups = sorted(k for k in f.keys() if not isinstance(f[k], h5py.Dataset))
 
-        # Determine frame counts
         t_key = next((k for k in keys if k == "arm_qpos"), None)
         t_key = t_key or next((k for k in keys if k == "timestamp"), keys[0])
         t_frames = f[t_key].shape[0]
@@ -101,20 +96,17 @@ def print_episode_info(h5_path: str) -> None:
             print(f"Camera frames (C): {c_frames}  (ratio={c_frames / t_frames:.2f})")
         print()
 
-        # Metadata
         if "meta" in groups:
             print("Meta:")
             for attr in sorted(f["meta"].attrs.keys()):
                 print(f"  {attr}: {f['meta'].attrs[attr]}")
             print()
 
-        # Datasets
         print(f"Datasets ({len(keys)}):")
         for key in sorted(keys):
             ds = f[key]
             print(f"  {key:<28s} shape={str(ds.shape):<22s} dtype={str(ds.dtype):<10s}")
 
-        # Quick stats
         print()
         if "arm_qpos" in f:
             q = f["arm_qpos"][:]
@@ -151,7 +143,6 @@ def print_episode_info(h5_path: str) -> None:
             print(f"flag_camera_fresh rate: {fresh.mean():.2%}")
 
 
-# Main visualizer.
 
 
 class EpisodeVisualizer:
@@ -176,11 +167,9 @@ class EpisodeVisualizer:
                 )
             self._h5f = self._reader.h5f
 
-            # Pre-decode camera sidecars once for interactive playback.
             self._rgb_cache: np.ndarray | None = None
             self._depth_cache: np.ndarray | None = None
-            # RGB lives in the MP4 sidecar, so query the reader rather than the
-            # merged HDF5 dataset view.
+            # RGB lives in the MP4 sidecar; query the reader rather than HDF5.
             try:
                 self._rgb_cache = self._reader.read_camera_all("rgb")
                 logger.info("Pre-decoded %d rgb frames", self._rgb_cache.shape[0])
@@ -232,7 +221,6 @@ class EpisodeVisualizer:
                     "No camera extrinsics in /meta — camera frame = world frame (identity)"
                 )
 
-            # Point-cloud configuration.
             self._pc_enabled = point_cloud and "depth" in (
                 self._available.get("camera") or []
             )
@@ -258,7 +246,6 @@ class EpisodeVisualizer:
                     )
                     h, w = depth_shape[1], depth_shape[2]
                     self._pc_h, self._pc_w = h, w
-                    # Precompute strided pixel coordinates
                     v, u = np.mgrid[0 : h : self._pc_stride, 0 : w : self._pc_stride]
                     self._pc_rays = (u.astype(np.float32), v.astype(np.float32))
                     logger.info(
@@ -281,10 +268,8 @@ class EpisodeVisualizer:
             self._C = self._resolve_camera_count()
             logger.info("State frames=%d, Camera frames=%d", self._T, self._C or 0)
 
-            # Preload non-camera data (small, fits in memory)
             self._state = self._preload_state()
 
-            # state step → camera frame mapping
             self._cam_idx: np.ndarray | None = None
             if self._C is not None and self._C > 0:
                 if self._C < self._T:
@@ -295,7 +280,6 @@ class EpisodeVisualizer:
                 else:
                     self._cam_idx = np.arange(self._T, dtype=int)
 
-            # Unique recording_id per invocation avoids stale-data merge on re-run.
             self._blueprint = self._build_blueprint()
             app_id = f"DexMani - {self._h5_path.stem}"
             rec_id = f"{self._h5_path.stem}-{time.time_ns()}"
@@ -313,7 +297,6 @@ class EpisodeVisualizer:
             self.close()
             raise
 
-    # Init helpers.
 
     def _resolve_frame_count(self, max_frames: int | None) -> int:
         """Return T = min(arm_qpos.shape[0], max_frames) falling back through meta keys."""
@@ -354,7 +337,6 @@ class EpisodeVisualizer:
                     data = data[()]
                 state[key] = np.asarray(data)
 
-        # Derived 2-D series from hand_contact (T,5,3)
         if "hand_contact" in state:
             contact = state["hand_contact"]
             state["hand_contact_mag"] = np.linalg.norm(contact, axis=2)  # (T, 5)
@@ -363,7 +345,6 @@ class EpisodeVisualizer:
 
         return state
 
-    # Point cloud generation.
 
     @staticmethod
     def _depth_to_pointcloud(
@@ -399,7 +380,6 @@ class EpisodeVisualizer:
 
         return points, colors
 
-    # Blueprint.
 
     def _build_blueprint(self) -> rrb.Blueprint:
         """Build Rerun view layout from detected data categories."""
@@ -409,7 +389,6 @@ class EpisodeVisualizer:
 
         columns: list[rrb.Container | rrb.View] = []
 
-        # Camera column
         cam_views = []
         if "rgb" in (self._available.get("camera") or []):
             cam_views.append(rrb.Spatial2DView(origin="camera/rgb", name="RGB"))
@@ -418,7 +397,6 @@ class EpisodeVisualizer:
         if cam_views:
             columns.append(rrb.Vertical(contents=cam_views, name="Camera"))
 
-        # 3D view: point cloud and/or fingertip keypoints
         _has_3d = self._pc_enabled or "hand_fingertip" in self._state
         if _has_3d:
             columns.append(
@@ -429,7 +407,6 @@ class EpisodeVisualizer:
                 )
             )
 
-        # Time-series column
         ts_verticals = []
 
         if has_state:
@@ -439,7 +416,6 @@ class EpisodeVisualizer:
                     state_views.append(
                         rrb.TimeSeriesView(origin=f"state/{key}", name=key)
                     )
-            # Derived force views (computed from 3-D hand_contact in _preload_state)
             for fkey in ("hand_contact_mag", "hand_force_thumb", "hand_force_index"):
                 if fkey in self._state:
                     state_views.append(
@@ -475,7 +451,6 @@ class EpisodeVisualizer:
 
         return rrb.Blueprint(rrb.Horizontal(contents=columns))
 
-    # Static metadata.
 
     def _log_static(self) -> None:
         """Log per-series labels, camera pinhole, and extrinsics once."""
@@ -495,7 +470,6 @@ class EpisodeVisualizer:
                     for i in range(arr.shape[1]):
                         rr.log(f"{base}/{i}", rr.SeriesLine(name=f"{i}"), static=True)
 
-        # Camera pinhole
         meta = self._h5f.get("meta")
         has_rgb = "rgb" in self._h5f or self._rgb_cache is not None
         if meta is not None and "camera_K" in meta.attrs and has_rgb:
@@ -518,7 +492,6 @@ class EpisodeVisualizer:
             )
             logger.info("Camera pinhole logged (%dx%d)", w, h)
 
-        # Camera extrinsics
         if self._cam_R is not None and self._cam_t is not None:
             rr.log(
                 "camera",
@@ -526,8 +499,6 @@ class EpisodeVisualizer:
                 static=True,
             )
 
-        # Derived force series labels.  Tactile values are SDK-scaled (physical
-        # unit unverified), so do not label them "(N)".
         _force_series = {
             "hand_contact_mag": (
                 "thumb (SDK-scaled)",
@@ -552,7 +523,6 @@ class EpisodeVisualizer:
             return f"state/{key}"
         return f"{category}/{key}"
 
-    # Per-step logging.
 
     def log_step(self, step_idx: int) -> None:
         """Log camera, fingertips, and time series for one timestep."""
@@ -563,7 +533,6 @@ class EpisodeVisualizer:
         self._log_fingertips(step_idx)
         self._log_time_series(step_idx)
 
-    # Camera and point cloud.
 
     def _log_camera(self, step_idx: int) -> None:
         camera_keys = self._available.get("camera", [])
@@ -592,8 +561,6 @@ class EpisodeVisualizer:
                 rr.DepthImage(depth, meter=self._depth_meter, depth_range=(0, 10000)),
             )  # clamp outliers to stabilize colormap
 
-        # Supported schemas have no precomputed point-cloud sidecar; derive the
-        # 3D points from depth at this consumer boundary.
         if self._pc_enabled and self._pc_K is not None and self._pc_rays is not None:
             if cam_idx not in self._pc_cache:
                 depth = (
@@ -624,7 +591,6 @@ class EpisodeVisualizer:
                     points = points @ self._cam_R.T + self._cam_t
                 rr.log("pcd", rr.Points3D(positions=points, colors=colors, radii=0.003))
 
-    # Fingertip keypoints.
 
     def _log_fingertips(self, step_idx: int) -> None:
         """Render hand_fingertip FK positions as per-finger colored keypoints."""
@@ -646,7 +612,6 @@ class EpisodeVisualizer:
             ),
         )
 
-    # Time-series logging.
 
     def _log_time_series(self, step_idx: int) -> None:
         for category, keys in self._available.items():
@@ -665,14 +630,12 @@ class EpisodeVisualizer:
                     for i in range(arr.shape[1]):
                         rr.log(f"{base}/{i}", rr.Scalar(float(arr[step_idx, i])))
 
-        # Derived force scalars
         for fkey in ("hand_contact_mag", "hand_force_thumb", "hand_force_index"):
             if fkey in self._state:
                 arr = self._state[fkey]
                 for i in range(arr.shape[1]):
                     rr.log(f"state/{fkey}/{i}", rr.Scalar(float(arr[step_idx, i])))
 
-    # Public helpers.
 
     @property
     def num_steps(self) -> int:
@@ -690,7 +653,6 @@ class EpisodeVisualizer:
             pass
 
 
-# CLI.
 
 
 def main(argv: list[str] | None = None) -> int:

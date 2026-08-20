@@ -26,7 +26,6 @@ logger = get_logger(__name__)
 
 _AUDIO_DIR = str(ASSET_DIR / "audio")
 
-# Event key → audio filename (under assets/audio/)
 _EVENT_MAP: dict[str, str] = {
     "begin": "遥操作启动.wav",
     "pause": "操作暂停.wav",
@@ -146,9 +145,7 @@ class AudioFeedback:
         if path is None:
             return
 
-        # A new immediate cue supersedes the current generation and any queued
-        # prompts.  The single worker observes the generation before and after
-        # spawning a player, so a concurrent preemption cannot leak audio.
+        # An immediate cue supersedes queued prompts; the worker checks generation.
         with self._condition:
             if self._closed:
                 logger.warning("Audio event ignored after close: %s", event)
@@ -243,8 +240,7 @@ class AudioFeedback:
             try:
                 self._play_one(request)
             except Exception:
-                # Keep the permanent worker alive even if an unexpected player
-                # adapter/fake violates the normal subprocess contract.
+                # Keep the permanent worker alive after an unexpected player failure.
                 logger.warning(
                     "Audio worker recovered from unexpected failure: event=%s",
                     request.event,

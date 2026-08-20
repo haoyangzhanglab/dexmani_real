@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Visualize a recorded DexMani episode with Rerun."""
+"""Usage: ``python examples/visualize_episode.py EPISODE``.
+
+Visualize a recorded DexMani episode with Rerun.
+"""
 
 import sys
 from pathlib import Path

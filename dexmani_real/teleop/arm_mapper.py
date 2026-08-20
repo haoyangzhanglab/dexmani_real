@@ -82,9 +82,7 @@ class ArmWristMapper:
             if T_vr_to_robot is None
             else validate_rotation_matrix(T_vr_to_robot, name="T_vr_to_robot")
         )
-        # Total-from-reset rotation cap.
         self.max_delta_rot_rad = max_delta_rot_rad
-        # Per-frame rotation cap for tracking spikes.
         self.max_per_frame_rot_rad = max_per_frame_rot_rad
 
         self.wrist_pos0: np.ndarray | None = None
@@ -101,8 +99,7 @@ class ArmWristMapper:
         eef_pos: np.ndarray,
         eef_quat_wxyz: np.ndarray,
     ) -> None:
-        # Validate into locals, then commit atomically.  A failed reset clears
-        # the old anchor so callers cannot unknowingly continue from stale data.
+        # Validate before committing the new anchor; failed resets clear stale state.
         try:
             next_wrist_pos0 = _finite_vector(wrist_pos, (3,), "wrist_pos")
             next_wrist_rot0 = quat2mat(_unit_quat_wxyz(wrist_quat_wxyz, "wrist_quat_wxyz"))
@@ -116,9 +113,7 @@ class ArmWristMapper:
         self.wrist_rot0 = next_wrist_rot0
         self.eef_pos0 = next_eef_pos0
         self.eef_rot0 = next_eef_rot0
-        # Seed continuous_quat in WORLD frame so the first map() dot-product
-        # compares quaternions in the same coordinate system.
-        # (base_to_world_rot is identity — base frame = world frame, zero transform.)
+        # Seed the quaternion in WORLD coordinates for continuity checks.
         _eef_rot0_world = self.base_to_world_rot @ self.eef_rot0
         self.last_quat_wxyz = mat2quat(_eef_rot0_world)
         self._last_wrist_rot = self.wrist_rot0.copy()
@@ -138,8 +133,7 @@ class ArmWristMapper:
             logger.warning("ArmWristMapper.map: invalid wrist pose — holding", exc_info=True)
             return None
 
-        # Compare each raw frame with the previous raw frame so a clamped spike
-        # does not shift the recovery baseline.
+        # Compare raw frames so a clamped spike does not shift the baseline.
         wrist_rot_gated = wrist_rot
         if self._last_wrist_rot is not None:
             frame_delta = wrist_rot @ self._last_wrist_rot.T
@@ -156,9 +150,7 @@ class ArmWristMapper:
 
         delta_pos_vr = current_wrist_pos - self.wrist_pos0
         delta_pos_base = self.pos_scale * (self.vr_to_base_rot @ delta_pos_vr)
-        # Transform base-frame delta → world frame before adding to
-        # world-frame eef_pos0.  eef_pos0 comes from ArmFK (base frame),
-        # so it must also be rotated to world frame for a consistent sum.
+        # Rotate the base-frame delta into world coordinates before adding it.
         delta_pos_world = self.base_to_world_rot @ delta_pos_base
 
         delta_rot_vr = wrist_rot_gated @ self.wrist_rot0.T  # type: ignore[union-attr]  # is_ready() gate above implies reset() ran (wrist_rot0 set)
@@ -168,9 +160,7 @@ class ArmWristMapper:
         delta_rot_base = self.T_vr_to_robot @ delta_rot_vr @ self.T_vr_to_robot.T
         delta_rot_world = self.base_to_world_rot @ delta_rot_base @ self.base_to_world_rot.T
 
-        # Convert eef reference from base frame → world frame so both
-        # terms are in the same coordinate system before adding.
-        # (is_ready() gate above guarantees eef_pos0/eef_rot0 are set.)
+        # Convert the EEF reference to world coordinates before combining terms.
         eef_pos0_world = self.base_to_world_rot @ self.eef_pos0  # type: ignore[operator]  # is_ready() gate
         eef_rot0_world = self.base_to_world_rot @ self.eef_rot0  # type: ignore[operator]  # is_ready() gate
 
@@ -183,9 +173,7 @@ class ArmWristMapper:
             logger.warning("ArmWristMapper.map: non-finite mapped pose — holding")
             return None
 
-        # Mutate temporal state only after the complete input and mapped output
-        # have passed validation.  Invalid frames therefore cannot poison the
-        # next frame's glitch baseline or quaternion-continuity reference.
+        # Commit temporal state only after input and output validation succeeds.
         self._last_wrist_rot = wrist_rot.copy()
         self.last_quat_wxyz = target_quat_wxyz.copy()
 

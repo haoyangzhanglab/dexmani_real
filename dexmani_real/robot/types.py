@@ -36,21 +36,17 @@ def _validate_field_shapes(
 class RobotState:
     """Recording state assembled from the arm, hand, and tactile rings."""
 
-    # Arm joints.
     arm_qpos: np.ndarray  # (7,)  float64  rad
     arm_qvel: np.ndarray  # (7,)  float64  rad/s
     # xArm SDK current-estimated effort; precise SI unit is unverified.
     arm_tau: np.ndarray  # (7,) float64
 
-    # EEF pose in the arm-base frame.
     eef_pos: np.ndarray  # (3,)  float64  m
     eef_quat_wxyz: np.ndarray  # (4,)  float64
     eef_rot6d: np.ndarray  # (6,)  float64
 
-    # Hand joints.
     hand_qpos: np.ndarray  # (12,) float64  rad
 
-    # Tactile.
     hand_tactile_sum: np.ndarray  # (5,3) float64 — SDK-scaled, physical unit unverified
     hand_tactile_force: (
         np.ndarray
@@ -63,19 +59,15 @@ class RobotState:
     hand_jointboard_err: (
         np.ndarray
     )  # (12,) int32 — joint motor-driver board error registers per joint
-    # Reserved compatibility flag. Normal contact/non-convergence is not a
-    # freshness fault; runtime health uses timestamps and read/state validity.
+    # Compatibility flag; freshness health uses timestamps and read/state validity.
     hand_qpos_stale: bool
 
-    # Derived FK.
     fingertip_pos: np.ndarray  # (5,3) float64 m (arm-base frame)
 
-    # Status.
     arm_connected: bool
     hand_connected: bool
     timestamp: float  # seconds
 
-    # Optional hand motor current.
     hand_current: np.ndarray | None = None  # (12,) float64 mA — per-motor current
 
     hand_error_state: bool = (

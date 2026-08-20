@@ -52,8 +52,7 @@ class DeploymentConfig:
     max_command_silence_s: float = 2.0
     action_validity_s: float = 0.5
     hand_enabled: bool = False
-    # Comma-separated DexMani observation keys; the default preserves the
-    # original joint-only adapter contract.
+    # Comma-separated observation keys; the default preserves the joint-only contract.
     observation_fields: str = "arm_qpos,hand_qpos"
 
     def __post_init__(self) -> None:
@@ -68,7 +67,6 @@ class DeploymentConfig:
         parse_observation_fields(self.observation_fields)
 
 
-# Frozen template; never mutated (resolve() copies it).
 DEFAULT_DEPLOYMENT_CONFIG = DeploymentConfig()
 
 
@@ -154,13 +152,11 @@ def resolve_deployment_config(
     elif data is not None:
         file_overrides = data
 
-    # Unwrap a `deployment:` section when present; otherwise treat as flat.
     if isinstance(file_overrides.get("deployment"), Mapping):
         file_overrides = file_overrides["deployment"]
 
     merged = _merge(DEFAULT_DEPLOYMENT_CONFIG, file_overrides)
-    # CLI values of None mean "not supplied" and never mask file/data defaults
-    # (mirrors resolve_runtime_config's _expand_dotted None-skip).
+    # Unset CLI values do not override file or data defaults.
     cli = {str(key): value for key, value in (cli_overrides or {}).items() if value is not None}
     merged = _merge(DeploymentConfig(**merged), cli)
 

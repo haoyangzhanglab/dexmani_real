@@ -82,9 +82,7 @@ def _get_accumulate_timestamp_idxs(
     for local_idx, ts in enumerate(timestamps):
         if not np.isfinite(ts):
             continue
-        # The grid is a causal deadline, not the left edge of an arrival-time
-        # bucket. eps keeps floating-point representations of exact boundaries
-        # on that boundary while every truly later source moves to the next one.
+        # The grid is a causal deadline; tolerate only floating-point boundary error.
         global_idx = math.ceil((ts - start_time) / dt - eps)
         if global_idx < 0:
             continue
@@ -138,7 +136,6 @@ class TimestampAlignedBuffer:
         self._last_source_index: int = -1
         self._last_source_timestamp: float = float("nan")
 
-    # -- public properties ----------------------------------------------------
 
     @property
     def data(self) -> dict[str, np.ndarray]:
@@ -162,7 +159,6 @@ class TimestampAlignedBuffer:
     def __len__(self) -> int:
         return self._size
 
-    # -- core methods ---------------------------------------------------------
 
     def reanchor(self, next_source_timestamp: float) -> None:
         """Start the next contiguous storage slot at a new wall-time anchor.
@@ -197,9 +193,7 @@ class TimestampAlignedBuffer:
         if self._recording_stopped:
             return BufferAddResult(previous_size, self._size, False, True)
 
-        # Validate before advancing source/grid indices so a malformed frame
-        # cannot partially mutate buffer state. The first accepted layout is
-        # the contract for every subsequent call.
+        # Validate before mutating source/grid state.
         self._validate_input_layout(data)
 
         source_index = self._next_source_index
@@ -221,10 +215,8 @@ class TimestampAlignedBuffer:
         gap_idxs = list(range(previous_next_idx, source_global_idx))
         write_idxs = gap_idxs + [source_global_idx]
 
-        # Check capacity — truncate to valid slots if last index overflows.
         max_required = source_global_idx + 1
         if max_required > self.max_record_steps:
-            # Keep only the indices that fit within the pre-allocated arrays.
             write_idxs = [g for g in write_idxs if g < self.max_record_steps]
             if not write_idxs:
                 self._recording_stopped = True
@@ -240,7 +232,6 @@ class TimestampAlignedBuffer:
             )
             self._recording_stopped = True
 
-        # Lazy allocation on first call
         if self._data_buffer is None:
             self._allocate(data)
 
@@ -278,11 +269,7 @@ class TimestampAlignedBuffer:
             self._last_source_timestamp = timestamp
 
         if self._timestamp_buffer is not None:
-            # Assign grid-aligned synthetic timestamps so every slot gets
-            # a unique, strictly-monotonic value even when the data source
-            # back-fills or stalls.  Without this, back-filled slots all
-            # share the original timestamp → duplicate timestamps in the
-            # HDF5 → broken temporal alignment for downstream training.
+            # Assign unique monotonic timestamps to synthetic slots.
             for gidx in write_idxs:
                 self._timestamp_buffer[gidx] = self.start_time + gidx * self.dt
 
@@ -294,7 +281,6 @@ class TimestampAlignedBuffer:
             capacity_reached=self._recording_stopped or self._size >= self.max_record_steps,
         )
 
-    # -- internal helpers -----------------------------------------------------
 
     @staticmethod
     def _field_layout(key: str, value: Any) -> tuple[tuple[int, ...], np.dtype[Any]]:

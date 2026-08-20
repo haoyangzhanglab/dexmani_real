@@ -66,9 +66,7 @@ def get_logger(name: str) -> logging.Logger:
     return logger
 
 
-# Module-level logger for ThrottledWarner — goes through get_logger so
-# throttled warnings share the same [timestamp] [level] [name] format as
-# every other log message in the project.
+# ThrottledWarner uses the project logger format for consistent diagnostics.
 _logger = get_logger(__name__)
 
 

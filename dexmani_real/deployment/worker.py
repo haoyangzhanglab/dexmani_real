@@ -245,9 +245,7 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
     backend.load()  # raises -> process failure (no dummy safe mode)
 
     shared.set_ready("inference")
-    # Refresh right after ready: backend.load() can exceed the 5.0s inference
-    # heartbeat timeout, and run_supervisor starts checking heartbeats
-    # immediately after wait_subsystem_ready returns.
+    # Refresh the heartbeat after model loading, which may exceed the timeout.
     shared.set_heartbeat("inference", time.monotonic())
     logger.info("inference_loop: ready (backend=%s)", config.backend_target)
 
@@ -262,9 +260,7 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
     try:
         while shared.is_running.value:
             tick_start = time.monotonic()
-            # Heartbeat every tick so the no-feedback continue paths and the
-            # first (potentially slow) inference never leave a stale heartbeat
-            # that run_supervisor reads as a dead worker.
+            # Heartbeat every tick, including no-feedback and slow-inference paths.
             shared.set_heartbeat("inference", time.monotonic())
 
             run_generation = int(shared.run_generation.value)
@@ -307,9 +303,8 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
             try:
                 chunk = action_adapter.decode(raw_output, context=context)
             except ValueError as exc:
-                # Bad model result (NaN/Inf/shape/ordering) is a dropped proposal,
-                # not a process failure; the coordinator's silence watchdog
-                # is the eventual abort backstop.
+                # Drop invalid model results; the coordinator's silence watchdog
+                # handles a prolonged absence of valid proposals.
                 logger.warning("inference: bad model output dropped: %s", exc)
                 metrics.increment(INFERENCE_FAILURES)
                 continue

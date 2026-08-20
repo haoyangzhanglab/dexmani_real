@@ -165,7 +165,6 @@ class XArm7:
         self.cfg = cfg
         self._api: Any = None
 
-    # -- lifecycle -----------------------------------------------------------
 
     def connect(self, *, on_poll: Callable[[], None] | None = None) -> None:
         """One-shot initialization ending in servo Mode 6.
@@ -224,7 +223,6 @@ class XArm7:
         except Exception:
             logger.warning("xarm7: disconnect failed during cleanup", exc_info=True)
 
-    # -- runtime primitives ---------------------------------------------------
 
     def read(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Read joint positions/velocities/efforts [rad, rad/s, Nm]; raise on any failure."""
@@ -390,7 +388,6 @@ class XArm7:
                 exc_info=True,
             )
 
-    # -- mode/live-error helpers (used by connect() and home()) ----------------
 
     def enter_mode0(self, *, on_poll: Callable[[], None] | None = None) -> None:
         """Enter Mode 0 (MoveJoint) and wait for a movable state; raise on failure."""
@@ -406,7 +403,6 @@ class XArm7:
         _check_sdk_return_code(code, "get_err_warn_code")
         return int(values[0])
 
-    # -- queries ---------------------------------------------------------------
 
     @property
     def api(self) -> Any:
@@ -430,7 +426,6 @@ class XArm7:
     def error_code(self) -> int:
         return int(getattr(self._api, "error_code", 0) or 0)
 
-    # -- private helpers -------------------------------------------------------
 
     def _wait_for_axis_report(self, *, on_poll: Callable[[], None] | None) -> None:
         """Wait for the report thread's axis count and validate it."""

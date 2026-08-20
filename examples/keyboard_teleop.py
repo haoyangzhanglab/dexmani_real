@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""CLI for a keyboard teleoperation session."""
+"""Usage: ``python examples/keyboard_teleop.py [--config FILE] [--no-hand]``.
+
+Run a keyboard teleoperation session.
+"""
 
 from __future__ import annotations
 

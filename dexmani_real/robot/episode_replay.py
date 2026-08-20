@@ -89,8 +89,7 @@ _MODEL_PROVENANCE_KEYS = (
 
 _STATUS_INTERVAL_FRAMES = 50
 _WAIT_POLL_INTERVAL_S = 0.01
-# The arm worker enters Mode 6 once at startup (a blocking postcondition poll
-# of up to ~1.0s); allow headroom before giving up waiting for Mode 6.
+# Allow startup headroom for the arm worker's blocking Mode 6 postcondition poll.
 _ARM_STREAMING_WAIT_TIMEOUT_S = 2.0
 
 _TRACKING_LAG_WINDOW_S = 0.4
@@ -407,7 +406,6 @@ class ReplayRecorder:
 class ReplayMetrics:
     """Evaluated consistency between replayed and original trajectory."""
 
-    # Metadata
     episode_path: str = ""
     task_label: str = ""
     speed_factor: float = 1.0
@@ -415,7 +413,6 @@ class ReplayMetrics:
     replayed_frames: int = 0
     matching_frames: int = 0
 
-    # Arm joint error (rad, converted to deg for reporting)
     arm_joint_mae_deg: np.ndarray = field(
         default_factory=lambda: np.zeros(ARM_JOINT_SHAPE)
     )
@@ -425,28 +422,22 @@ class ReplayMetrics:
     arm_joint_mae_overall_deg: float = 0.0
     arm_joint_rmse_overall_deg: float = 0.0
 
-    # EEF position error (m → mm for reporting)
     eef_pos_error_mean_mm: float = 0.0
     eef_pos_error_max_mm: float = 0.0
     eef_pos_error_rmse_mm: float = 0.0
 
-    # EEF orientation error (deg)
     eef_rot_error_mean_deg: float = 0.0
     eef_rot_error_max_deg: float = 0.0
 
-    # Per-frame error arrays (1-D)
     eef_pos_error_per_frame_mm: np.ndarray | None = None
     eef_rot_error_per_frame_deg: np.ndarray | None = None
 
-    # Hand joint error (deg, optional)
     hand_joint_mae_overall_deg: float | None = None
     hand_joint_rmse_overall_deg: float | None = None
 
-    # Tracking lag
     tracking_lag_frames: int = 0
     tracking_lag_seconds: float = 0.0
 
-    # Tracking error during replay (replay cmd vs actual, from inner-loop monitor)
     arm_tracking_error_mean_deg: float = 0.0
     arm_tracking_error_p95_deg: float = 0.0
     arm_tracking_error_max_deg: float = 0.0
@@ -564,7 +555,6 @@ def compute_metrics(
                     np.rad2deg(np.sqrt(np.mean(diff_h**2)))
                 )
 
-    # Aggregate per-joint position RMSE with a noise-robust median.
     if frame_count >= _MIN_TRACKING_SEQUENCE_FRAMES:
         max_lag = max(
             int(np.ceil(fps * _TRACKING_LAG_WINDOW_S)), _MIN_TRACKING_LAG_FRAMES
@@ -1165,10 +1155,7 @@ class EpisodeReplayer:
                 hand_cmd = None
                 if has_hand and self.traj.action_hand_joint is not None:
                     hand_cmd = self.traj.action_hand_joint[frame_idx].copy()
-                # ``flag_action_queued`` marks whether a command was actually
-                # queued on this grid slot during recording.  Synthetic hold
-                # slots recorded no send event; reproduce that quiescence below
-                # rather than republishing the inherited effective target.
+                # Replay only slots whose recording flag indicates a queued command.
                 send_this = self.traj.send_mask is None or bool(
                     self.traj.send_mask[frame_idx]
                 )
@@ -1222,9 +1209,7 @@ class EpisodeReplayer:
                     hand_qpos = hand_state["qpos"]
 
                 if not send_this:
-                    # Recorded command quiescence: observe and record the slot
-                    # but send nothing (Mode 6 finishes the last accepted
-                    # endpoint).  ``arm_sent_cmd`` stays NaN in the recorder.
+                    # During recorded quiescence, observe but send nothing.
                     self._recorder.record(
                         frame_idx,
                         arm_state["qpos"],

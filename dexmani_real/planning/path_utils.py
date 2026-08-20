@@ -109,8 +109,7 @@ def wrap_nearest_equivalent(
     valid = k_min <= k_max
     nearest_k = np.rint((ref_equiv - res_equiv) / period)
     nearest_k = np.minimum(np.maximum(nearest_k, k_min), k_max)
-    # Preserve an invalid raw value when no legal equivalent exists.  A
-    # downstream validator can reject it; clipping would change the robot pose.
+    # Preserve invalid raw values so downstream validation can reject them.
     result[is_equiv] = np.where(valid, res_equiv + nearest_k * period, res_equiv)
 
     return result
@@ -176,31 +175,17 @@ def plan_joint_home_path(
         hand_safety_margin_m = _arm_cfg.hand_safety_margin_m
 
     if use_canonical_target:
-        # Target canonical home_qpos directly, without band wrapping.  The
-        # firmware plans raw absolute deltas, so an equivalent joint whose
-        # encoder sits in a different 2π band (e.g. J7 at 350° vs canonical
-        # 0°) rotates through the full raw difference — concurrently with the
-        # other joints, in a single motion — instead of a separate
-        # band-alignment phase.
+        # Canonical home uses raw absolute deltas; equivalent joints may rotate a full band.
         target = np.asarray(home_qpos, dtype=np.float64)
-        # "Already home" must use RAW delta.  compute_qpos_delta wraps 2π
-        # differences to 0 and would falsely report a band-mismatched arm
-        # (J7=360°) as already home; the arm_loop raw convergence check would
-        # then fail.  Raw delta returns None only when encoders read canonical.
+        # Use raw delta for the already-home check; wrapped deltas hide band mismatches.
         delta = float(np.max(np.abs(target - qpos)))
     else:
-        # Wrap home target to the nearest equivalent.
-        # Prevents interpolate_waypoints from generating up to 360° of
-        # unnecessary rotation for equivalent joints (J1/J3/J5/J7 on xArm7,
-        # 720° range).  Wrapping home→qpos (not qpos→home) keeps all waypoints
-        # in the arm's current encoder band — critical because the firmware
-        # plans from the physical encoder position to each waypoint target.
+        # Wrap to the nearest equivalent to avoid unnecessary full-band motion.
         if planner is not None:
             target = planner.ik_mgr.nearest_equivalent_qpos(home_qpos, qpos)
             delta = float(np.max(np.abs(planner.ik_mgr.compute_qpos_delta(target, qpos))))
         else:
-            # Fallback when planner is unavailable: wrap to nearest equivalent
-            # using the arm config limits (which mirror the URDF).
+            # Without a planner, wrap using the URDF-mirrored arm limits.
             target = wrap_nearest_equivalent(
                 home_qpos,
                 qpos,
@@ -224,7 +209,6 @@ def plan_joint_home_path(
         }
         report["candidates"].append(candidate)
 
-        # Self-collision check.
         if have_collision:
             assert planner is not None
             _path_check = getattr(
@@ -253,8 +237,7 @@ def plan_joint_home_path(
                 )
                 return False
 
-        # Homing bypasses planner.validate_path(), so apply the same configured
-        # world-frame EEF workspace boundary explicitly to every segment.
+        # Homing applies the configured world-frame EEF boundary explicitly.
         if planner is not None:
             try:
                 for _segment_index, (_start, _end) in enumerate(zip(path[:-1], path[1:])):
@@ -269,10 +252,7 @@ def plan_joint_home_path(
                 candidate.update(safe=False, reason="workspace_check_error", detail=str(exc))
                 return False
 
-        # Table-clearance check.
-        # Prefer the calibrated, tilted table box and exact mesh distance.
-        # The fixed-Z hand-frame proxy remains only as a compatibility fallback
-        # for planners constructed without calibrated table geometry.
+        # Prefer calibrated table geometry for clearance checks.
         if _check_table:
             _minimum_clearance_m = float("inf")
             _table_samples: list[tuple[int, float, float, str]] = []
@@ -346,12 +326,7 @@ def plan_joint_home_path(
                 unique.append(point)
         return np.asarray(unique, dtype=np.float64)
 
-    # Collision validation and execution intentionally use different
-    # representations.  The dense samples validate the whole joint-space
-    # segment; the Mode 0 MoveJoint executor receives only its endpoints and
-    # lets the firmware generate the point-to-point trajectory.  Sending every
-    # 1° validation sample would add arm-side interpolation and force repeated
-    # deceleration at artificial stops.
+    # Dense samples validate the path; firmware receives only its endpoints.
 
     # Attempt 1: direct joint-space segment.
     direct_milestones = np.stack([qpos, target])
@@ -359,9 +334,7 @@ def plan_joint_home_path(
         report.update(status="safe", selected_candidate="direct")
         return direct_milestones
 
-    # Attempt 2: proximal-to-wrist detour.
-    # Move shoulder/elbow joints to home first while keeping wrist fixed,
-    # then move wrist joints.  This avoids the hand swinging through the body.
+    # Attempt 2: move shoulder/elbow first while keeping the wrist fixed.
     mid = qpos.copy()
     mid[_PROXIMAL_MASK] = target[_PROXIMAL_MASK]
 
@@ -370,10 +343,7 @@ def plan_joint_home_path(
         report.update(status="safe", selected_candidate="proximal_first")
         return proximal_first
 
-    # The opposite ordering is materially different: from some extended/high
-    # poses, bringing the wrist close to its home orientation before sweeping
-    # the shoulder avoids the hand/body or hand/table intersection created by
-    # the proximal-first heuristic.  It receives exactly the same dense checks.
+    # Also try the wrist-first ordering for extended poses.
     distal_mid = qpos.copy()
     distal_mid[~_PROXIMAL_MASK] = target[~_PROXIMAL_MASK]
     distal_first = _unique_milestones(qpos, distal_mid, target)
@@ -381,9 +351,7 @@ def plan_joint_home_path(
         report.update(status="safe", selected_candidate="distal_first")
         return distal_first
 
-    # Straight-line heuristics are not a proof that no path exists. Use the
-    # project's bounded joint-space RRT as a final candidate, then re-run the
-    # same 19-DOF/table checks before publishing any firmware milestones.
+    # Use bounded joint-space RRT as a final candidate after heuristic paths fail.
     if planner is not None and hasattr(planner, "plan_joint_qpos_path"):
         try:
             planned = planner.plan_joint_qpos_path(target, qpos, planning_time_s=0.5)
@@ -441,19 +409,13 @@ def plan_band_alignment_path(
     if hand_safety_margin_m is None:
         hand_safety_margin_m = _arm_cfg.hand_safety_margin_m
 
-    # Only plan if the two home positions differ on equivalent joints.
-    # Use RAW (unwrapped) delta — compute_qpos_delta wraps 2π apart to 0,
-    # defeating the purpose of detecting band mismatches.
-    # Equivalent joints: range > 2π (J1, J3, J5, J7 on xArm7 — 720° range).
+    # Plan only when raw deltas show an equivalent-joint band mismatch.
     _eq_mask = (np.array(_arm_cfg.joint_limit_upper) - np.array(_arm_cfg.joint_limit_lower)) > 2.0 * np.pi
     _raw_delta_deg = np.rad2deg(np.abs(wrapped_home - canonical_home))
     if not np.any(_raw_delta_deg[_eq_mask] > 1.0):
         return None  # same band — no alignment needed
 
-    # Linear joint-space interpolation at 1°/step — this produces a pure
-    # equivalent-joint rotation (e.g. J7: -360° → 0° at 1°/step = 360 steps).
-    # The path is fully wrapping-aware because interpolate_waypoints computes
-    # raw (unwrapped) deltas between waypoints.
+    # Interpolate the band-alignment rotation at 1° per step.
     path = interpolate_waypoints(np.stack([wrapped_home, canonical_home]), np.deg2rad(1.0))
 
     have_collision = planner is not None and planner.planning_profile.check_self_collision
@@ -461,7 +423,6 @@ def plan_band_alignment_path(
         bool(getattr(planner.collision_model, "has_table", False)) or table_z_surface_m is not None
     )
 
-    # Safety checks.
     if have_collision:
         assert planner is not None
         _path_check = getattr(

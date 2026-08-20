@@ -142,9 +142,7 @@ class CameraStreamWriter:
             self._closed = True
         if first_close and self._thread.is_alive():
             if self.error is not None:
-                # The episode is already doomed.  Bound shutdown latency by
-                # discarding only the unpublished in-memory queue; the temp
-                # directory will be removed by EpisodeRecorder.
+                # Bound shutdown latency after an episode is already doomed.
                 while True:
                     try:
                         self._queue.get_nowait()

@@ -77,11 +77,7 @@ class CameraLoopConfig:
     def from_runtime(cls, runtime: object) -> "CameraLoopConfig":
         cam = getattr(runtime, "camera")
         pol = getattr(runtime, "policy")
-        # The resolved environment.table.plane_abcd is the single desk-plane
-        # source of truth (already refreshed from plane_path at resolve time);
-        # consume it here instead of letting the pointcloud processor auto-load
-        # its own hardcoded desk_plane.json.  A disabled table means "no desk
-        # removal" rather than "re-read the calibration file".
+        # Use the resolved desk plane as the single source of truth.
         table = getattr(getattr(runtime, "environment"), "table")
         desk_plane = (
             cast(tuple[float, float, float, float], tuple(float(v) for v in table.plane_abcd))
@@ -188,8 +184,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
     failed = False
     _logger.debug("camera_loop: LOADING")
 
-    # Calibration and aligned depth must use the same color-optical frame.
-    # Reject incompatible alignment before opening the device SDK.
+    # Reject calibration/depth alignment mismatches before opening the SDK.
     if cfg.align_mode != "depth_to_color":
         _logger.error(
             "camera_loop: align_mode=%r is unsupported for recording; "
@@ -199,10 +194,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
         _logger.info("camera_loop: exited")
         return
 
-    # Thread pool limit.
-    # OpenCV/NumPy default to multi-threading on many-core machines, competing
-    # for CPU with the configured policy loop. We rely on process-level parallelism
-    # (arm/hand/camera each in its own process), not per-library thread pools.
+        # Limit library thread pools so process-level scheduling remains predictable.
     try:
         import cv2
 
@@ -212,7 +204,6 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
 
     cam = None
     try:
-        # Create and connect camera.
         from dexmani_real.sensor.realsense import RealSense, RealSenseConfig
 
         rs_config = RealSenseConfig(
@@ -231,7 +222,6 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
             failed = True
             return
 
-        # Publish metadata.
         shared.camera_depth_scale.value = float(cam.get_depth_scale())
         _serial_raw = str(cam.active_serial or "")
         shared.camera_serial.value = _serial_raw[:31].ljust(32, "\x00").encode()
@@ -259,13 +249,6 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
         if cam.K is not None:
             shared.camera_K[:] = cam.K.flatten().tolist()
 
-        # Publish point-cloud derivation metadata.
-        # The point cloud is no longer computed in this loop: it is derived at
-        # the consumption boundary (offline in data_processing, online in the
-        # deployment observation adapter) from the recorded depth.  We still
-        # publish the resolved processor parameters so both derivation sites can
-        # reconstruct an identical point cloud from the same depth/intrinsics/
-        # extrinsics (train/inference distribution consistency).
         try:
             from dexmani_real.config.camera_calib import CameraCalib
             from dexmani_real.sensor.pointcloud_processor import PointCloudProcessorConfig
@@ -278,8 +261,7 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                 "desk_plane": cfg.desk_plane,
             }
             if cfg.desk_plane is None:
-                # No resolved plane (table disabled): fall back to workspace
-                # z_min rather than the processor's own desk_plane.json auto-load.
+                # With the table disabled, use workspace z_min.
                 pc_kwargs["desk_plane_path"] = ""
             pc_config = PointCloudProcessorConfig(**pc_kwargs)
             _pc_meta = json.dumps(pc_config.to_meta_dict(), separators=(",", ":"))
@@ -292,33 +274,25 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
             _logger.warning("camera_loop: pointcloud derivation config DISABLED", exc_info=True)
             shared.camera_pointcloud_config.value = "{}".ljust(2048, "\x00").encode()
 
-        # Main capture loop.
         rate_mgr = RateManager(cfg.publish_hz, label="camera")
         ready_published = False
 
         while shared.is_running.value:
-            # Publish startup/recording RGB-D payloads; publish metadata-only
-            # frames during steady operation to keep the camera ring current.
             _publish_payload = (
                 not ready_published
                 or int(shared.safety_state.value) == int(SafetyState.DISARMED)
                 or bool(shared.is_recording.value)
             )
-            # Read frame.
             try:
                 frame = cam.read(timeout_ms=300, compute_depth=False)
             except (RuntimeError, OSError):
                 _logger.warning("camera_loop: frame read failed", exc_info=True)
-                # This heartbeat represents worker liveness.  Source freshness
-                # is carried by capture_monotonic_s and enforced by Policy.
+                # Keep the heartbeat for worker liveness while pacing failed reads.
                 shared.set_heartbeat("camera", time.monotonic())
-                # Maintain target rate even on read failure so a persistent
-                # error doesn't turn into a tight loop.
                 rate_mgr.wait()
                 continue
             shared.set_heartbeat("camera", time.monotonic())
 
-            # Write to the shared ring.
             if _publish_payload:
                 pc_valid_depth_ratio = float(np.count_nonzero(frame.depth_raw) / frame.depth_raw.size)
                 if frame.clock_reset:
@@ -356,7 +330,6 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                 except Exception:
                     _logger.warning("camera_loop: ring write failed", exc_info=True)
 
-            # Maintain the target rate.
             rate_mgr.wait()
 
     except Exception:

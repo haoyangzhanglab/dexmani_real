@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""CLI for one VR teleoperation and data-collection session."""
+"""Usage: ``python examples/collect_teleop.py [--config FILE]``.
+
+Run one VR teleoperation and data-collection session.
+"""
 
 from __future__ import annotations
 

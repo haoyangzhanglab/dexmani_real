@@ -305,7 +305,6 @@ class SafetyGate:
         self.hand_low = _hand_low
         self.hand_high = _hand_high
 
-    # -- callback set after construction (avoids circular imports) ----------
     workspace_check: Any = None  # Callable[[np.ndarray, np.ndarray], bool] | None
 
     def validate(
@@ -325,7 +324,6 @@ class SafetyGate:
         Returns:
             A typed accept/reject result. The candidate is never modified.
         """
-        # 1 ── Well-formed ────────────────────────────────────────────
         if (
             candidate.representation != "joint_position"
             or candidate.units != "rad"
@@ -361,7 +359,6 @@ class SafetyGate:
         ):
             return GateResult(False, GateRejectCode.NONFINITE_CANDIDATE)
 
-        # 2 ── Joint limits (commanded actuators only) ─────────────────
         if candidate.arm_qpos is not None and (
             np.any(arm_end < self.arm_low) or np.any(arm_end > self.arm_high)
         ):
@@ -372,7 +369,6 @@ class SafetyGate:
         ):
             return GateResult(False, GateRejectCode.HAND_JOINT_LIMIT)
 
-        # 3 ── Workspace (optional) ────────────────────────────────────
         if self.workspace_check is not None and candidate.arm_qpos is not None:
             try:
                 if not self.workspace_check(arm_start, arm_end):
@@ -386,7 +382,6 @@ class SafetyGate:
         return GateResult(True)
 
 
-# Command serialization and publication.
 
 
 def _make_arm_command(
@@ -455,8 +450,7 @@ def send_command(
     lead_time_s = float(getattr(shared, "action_lead_time_s", 0.05))
     target_ns = now_ns + int(lead_time_s * 1e9)
 
-    # The candidate validity window protects the policy boundary.  The publish
-    # boundary owns the worker delivery target because queueing adds latency.
+    # Candidate validity and worker delivery have separate time boundaries.
     if target_ns <= now_ns or candidate.valid_until_monotonic_ns < now_ns:
         logger.error(
             "send_command: action_id=%d temporal window closed", candidate.action_id
@@ -477,13 +471,7 @@ def send_command(
     if candidate.arm_qpos is not None:
         shared.arm_cmd_ring.write(_make_arm_command(candidate, now_ns))
 
-    # Both actuator transports are latest-wins seqlock rings
-    # (``SharedMemoryRingBuffer``): ``write`` overwrites the oldest slot and
-    # returns the new sequence number, so there is no ``Full``/backpressure and
-    # no error-return channel.  The arm-then-hand ordering is therefore
-    # non-atomic by design, and no rollback is performed or claimed; if a
-    # transport ever gains a failing write, a coordinated stop/fault path is
-    # required here instead of returning ``PUBLISHED``.
+    # Both actuator transports are latest-wins seqlock rings; publication is not atomic.
     if candidate.hand_qpos is not None:
         hand_frame = _make_hand_command(candidate, now_ns, target_ns)
         shared.hand_cmd_ring.write(hand_frame)
@@ -494,7 +482,6 @@ def send_command(
     )
 
 
-# Worker-side validation.
 
 
 def _worker_command_is_current(
@@ -577,7 +564,6 @@ def worker_validate_hand(
     )
 
 
-# Gate factory.
 
 
 def planner_action_safety_gate(
@@ -599,7 +585,6 @@ def planner_action_safety_gate(
     return gate
 
 
-# Convenience publication.
 
 
 def build_action_candidate(
@@ -832,10 +817,7 @@ def publish_joint_targets(
         if not (np.isfinite(apply_timeout_s) and apply_timeout_s > 0):
             raise ValueError("apply_timeout_s must be finite and positive")
         deadline_s = time.monotonic() + float(apply_timeout_s)
-        # A candidate carrying a hand_qpos is published to both actuators under
-        # the same action_id (see send_command), so a synchronous caller must
-        # observe BOTH applied before returning.  Arm-only candidates keep the
-        # existing arm last_cmd_seq >= action_id gate.
+        # Coupled arm/hand candidates use one action_id and require both acknowledgements.
         with_hand = published.hand_qpos is not None
         while time.monotonic() < deadline_s:
             runtime_rejection = _publication_runtime_gate(shared)
@@ -892,7 +874,6 @@ def publish_joint_targets(
     return publish_result
 
 
-# Hand command bounds preflight.
 
 
 def validate_hand_command_bounds(
@@ -948,7 +929,6 @@ def validate_hand_command_bounds(
     return command.copy()
 
 
-# Hand homing utility.
 
 
 def publish_hand_home_and_wait_applied(
@@ -978,8 +958,7 @@ def publish_hand_home_and_wait_applied(
         raise ValueError(
             "hand home command acknowledgement timeout must be finite and positive"
         )
-    # Bound validation is shared with the other coupled hand paths; a
-    # violation raises (reject-whole, never clip).
+    # Reject bound violations; never clip coupled hand commands here.
     target = validate_hand_command_bounds(
         home_qpos,
         command_lower_rad,
@@ -1011,8 +990,7 @@ def publish_hand_home_and_wait_applied(
         )
         return False
 
-    # The exact home endpoint is published as a single command, not spread
-    # over milestones.
+    # Publish the exact home endpoint as one command.
     milestone_count = 1
 
     last_action_id = 0

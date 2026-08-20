@@ -24,10 +24,7 @@ from dexmani_real.utils.schema import (
 )
 
 EPISODE_SCHEMA_VERSION = 18
-# Runtime writes v18 only; readers accept v17 as well.  v18 drops the three
-# arm command-latency datasets: they measured timing internal to the arm
-# worker, which no longer publishes them (fail-fast worker, no per-command
-# telemetry).  Every other dataset keeps its v17 semantics.
+# Runtime writes v18; readers accept v17 and v18.
 SUPPORTED_EPISODE_SCHEMA_VERSIONS: frozenset[int] = frozenset({17, 18})
 ARM_WORKER_TELEMETRY_DATASETS_V17: frozenset[str] = frozenset(
     {
@@ -58,16 +55,13 @@ def _spec(dtype: Any, tail_shape: tuple[int, ...] = ()) -> DatasetSpec:
 
 
 # Superset field specifications anchored to v17. ``required_dataset_names``
-# selects the v17 or v18 required subset. Keep the grouping aligned with the
-# writer data construction so reviewers can compare producer and contract.
+# Select the v17 or v18 required subset while preserving field grouping.
 BASE_DATASET_SPECS_V17: dict[str, DatasetSpec] = {
-    # Fixed control grid and causal fill.
     "timestamp": _spec(np.float64),
     "flag_sample_valid": _spec(np.bool_),
     "source_sample_index": _spec(np.int64),
     "source_timestamp": _spec(np.float64),
     "fill_reason": _spec(np.uint8),
-    # Arm state and command timing.
     "arm_qpos": _spec(np.float64, ARM_JOINT_SHAPE),
     "arm_qvel": _spec(np.float64, ARM_JOINT_SHAPE),
     "arm_tau": _spec(np.float64, ARM_JOINT_SHAPE),
@@ -78,7 +72,6 @@ BASE_DATASET_SPECS_V17: dict[str, DatasetSpec] = {
     "arm_last_cmd_apply_latency_s": _spec(np.float64),
     "arm_last_cmd_sdk_duration_s": _spec(np.float64),
     "arm_last_cmd_is_hold": _spec(np.bool_),
-    # Hand state, tactile, and health.
     "hand_qpos": _spec(np.float64, HAND_JOINT_SHAPE),
     "hand_current": _spec(np.float64, HAND_JOINT_SHAPE),
     "hand_fingertip": _spec(np.float64, HAND_FINGERTIP_SHAPE),
@@ -95,7 +88,6 @@ BASE_DATASET_SPECS_V17: dict[str, DatasetSpec] = {
     "tactile_source_monotonic_ns": _spec(np.int64),
     "tactile_calibrated": _spec(np.bool_),
     "tactile_unit_code": _spec(np.int64),
-    # Actions and targets.
     "action_arm_joint_raw": _spec(np.float64, ARM_JOINT_SHAPE),
     "action_arm_joint": _spec(np.float64, ARM_JOINT_SHAPE),
     "action_hand_joint_raw": _spec(np.float64, HAND_JOINT_SHAPE),
@@ -104,7 +96,6 @@ BASE_DATASET_SPECS_V17: dict[str, DatasetSpec] = {
     "target_eef_pos_raw": _spec(np.float64, (3,)),
     "target_eef_rot6d_raw": _spec(np.float64, (6,)),
     "target_pos_before_clamp": _spec(np.float64, (3,)),
-    # Observation/action causal protocol.
     "observation_id": _spec(np.int64),
     "observation_anchor_monotonic_ns": _spec(np.int64),
     "arm_source_sequence": _spec(np.int64),
@@ -130,12 +121,10 @@ BASE_DATASET_SPECS_V17: dict[str, DatasetSpec] = {
     "action_target_monotonic_ns": _spec(np.int64),
     "action_valid_until_monotonic_ns": _spec(np.int64),
     "flag_action_queued": _spec(np.bool_),
-    # VR input.
     "vr_wrist_pos": _spec(np.float64, (3,)),
     "vr_wrist_rot6d": _spec(np.float64, (6,)),
     "vr_landmarks": _spec(np.float64, (21, 3)),
     "head_quat_wxyz": _spec(np.float64, (4,)),
-    # Camera state and point-cloud quality.
     "camera_health": _spec(np.int64),
     "flag_camera_fresh": _spec(np.bool_),
     "camera_frame_number": _spec(np.int64),
@@ -149,7 +138,6 @@ BASE_DATASET_SPECS_V17: dict[str, DatasetSpec] = {
     "camera_frame_gap": _spec(np.int64),
     "camera_backlog_s": _spec(np.float64),
     "pointcloud_valid_depth_ratio": _spec(np.float64),
-    # IK, retargeting, safety, and performance diagnostics.
     "flag_ik_ok": _spec(np.bool_),
     "flag_ik_attempted": _spec(np.bool_),
     "flag_retarget_ok": _spec(np.bool_),
@@ -183,8 +171,7 @@ SOURCE_FRAME_DATASET_NAMES_V17 = (
     - ARM_WORKER_TELEMETRY_DATASETS_V17
 )
 
-# These are value overrides for fields already present in the base contract,
-# never an extension mechanism.  NaN is valid for unavailable diagnostics.
+# These values override existing fields; they do not extend the contract.
 DIAGNOSTIC_TAIL_SHAPES_V17: dict[str, tuple[int, ...]] = {
     "tracking_error": (),
     "ik_solve_time_ms": (),

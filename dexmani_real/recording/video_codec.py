@@ -92,7 +92,6 @@ class VideoEncoder:
         self._lock = threading.Lock()
         self._closed = False
 
-    # -- public ----------------------------------------------------------
 
     @property
     def path(self) -> Path:
@@ -131,7 +130,6 @@ class VideoEncoder:
             self._closed = True
             if self._container is None:
                 return
-            # Flush any buffered frames still inside the encoder.
             if self._stream is not None:
                 for packet in self._stream.encode(None):  # type: ignore[attr-defined]
                     self._container.mux(packet)
@@ -144,7 +142,6 @@ class VideoEncoder:
                 self._frame_count,
             )
 
-    # -- context manager -------------------------------------------------
 
     def __enter__(self) -> "VideoEncoder":
         return self
@@ -152,7 +149,6 @@ class VideoEncoder:
     def __exit__(self, *args: object) -> None:
         self.close()
 
-    # -- internals -------------------------------------------------------
 
     def _write_frame_impl(self, frame: np.ndarray) -> None:
         """Lock must be held by caller."""
@@ -178,9 +174,7 @@ class VideoEncoder:
                 "preset": self._cfg.preset,
             }
 
-        # Convert numpy RGB → PyAV frame → reformat to encoder pixel format.
-        # libx264 (yuv444p): reformat() does RGB→YUV automatically;
-        # libx264rgb (rgb24): reformat() is a no-op (same format).
+        # Convert RGB to the encoder pixel format; PyAV performs RGB→YUV.
         av_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
         if self._cfg.pixel_format != "rgb24":
             av_frame = av_frame.reformat(format=self._cfg.pixel_format)
@@ -210,7 +204,6 @@ class VideoDecoder:
         self._fps_val: float = 0.0
         self._opened = False
 
-    # -- public ----------------------------------------------------------
 
     @property
     def frame_count(self) -> int:
@@ -240,8 +233,7 @@ class VideoDecoder:
         self._container.seek(0)
         for packet in self._container.demux(self._stream):
             for frame in packet.decode():
-                # PyAV stubs include subtitle types in the decode union;
-                # filter to VideoFrame (the only type we care about).
+                # Decode only VideoFrame values; PyAV stubs include subtitle types.
                 if isinstance(frame, av.VideoFrame):
                     yield frame.to_ndarray(format="rgb24")
 
@@ -298,7 +290,6 @@ class VideoDecoder:
             self._stream = None
             self._opened = False
 
-    # -- context manager -------------------------------------------------
 
     def __enter__(self) -> "VideoDecoder":
         return self
@@ -306,7 +297,6 @@ class VideoDecoder:
     def __exit__(self, *args: object) -> None:
         self.close()
 
-    # -- internals -------------------------------------------------------
 
     def _open(self) -> None:
         if self._opened:

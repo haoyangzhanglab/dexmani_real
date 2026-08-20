@@ -150,8 +150,7 @@ def _recording_provenance(
     if observation_id <= 0:
         observation_id = anchor_ns
 
-    # Fire-and-forget worker status is not recorded: there is no ACK path to
-    # make those values meaningful on this control tick.
+    # Fire-and-forget worker status is omitted because there is no same-tick ACK.
     tactile_source_ns = _field(hand_tactile, "source_monotonic_ns")
     tactile_fresh = (
         _field(hand_tactile, "fresh") == 1
@@ -465,7 +464,6 @@ def _build_robot_state(
         hand_connected = bool(h["connected"])
         hand_qpos_stale = bool(h["qpos_stale"]) if "qpos_stale" in h.dtype.names else False
         hand_error_state = bool(h["error_state"]) if "error_state" in h.dtype.names else False
-        # Board error registers — per-joint hardware fault indicators.
         hand_commboard_err = (
             np.asarray(h["commboard_err"], dtype=np.int32)
             if "commboard_err" in h.dtype.names
@@ -493,7 +491,6 @@ def _build_robot_state(
         hand_jointboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
         hand_tipboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
 
-    # Tactile force comes from the separate sparse ring.
     if hand_tactile is not None:
         hand_tactile_force = np.asarray(hand_tactile[0]["tactile_force"], dtype=np.float64)
     else:
@@ -502,8 +499,7 @@ def _build_robot_state(
     _eef_finite = np.all(np.isfinite(eef_rot6d))
     eef_quat_wxyz = rot6d_to_quat_wxyz(eef_rot6d) if _eef_finite else np.array([1.0, 0.0, 0.0, 0.0])
 
-    # Compute arm-base-frame fingertip positions via hand FK.  Standard runtime
-    # world is the arm base, but keep the producer's native frame explicit here.
+    # Compute fingertip positions in the producer's arm-base frame.
     fingertip_pos = nan_array(HAND_FINGERTIP_SHAPE)
     if hk is not None and hk.is_ready() and hand_connected and np.all(np.isfinite(hand_qpos)):
         tips_in_handbase = hk.compute_tip_positions_in_handbase(hand_qpos)

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""CLI for physically replaying one recorded episode on the real robot."""
+"""Usage: ``python examples/replay_episode.py EPISODE [--config FILE]``.
+
+Physically replay one recorded episode on the real robot.
+"""
 
 from __future__ import annotations
 

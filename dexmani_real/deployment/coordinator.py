@@ -184,11 +184,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     if config is None:
         raise ValueError("coordinator_loop requires a CoordinatorConfig")
 
-    # The deployment path is machine-driven (no operator in the loop), so it must
-    # run the same arm-base Cartesian workspace check as VR teleop.  Build a
-    # planner wired to the configured workspace bounds and extend the shared
-    # SafetyGate boundary with it.  Build before the first heartbeat/ready
-    # publish so a planner failure fails closed at readiness rather than mid-run.
+    # Deployment uses the same arm-base workspace gate as VR teleoperation.
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(
             urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
@@ -206,22 +202,14 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     metrics = Metrics()
 
     shared.set_heartbeat("policy", time.monotonic())
-    # Publish readiness while still DISARMED/ARMED so Main's
-    # wait_subsystem_ready observes a ready worker with a live heartbeat.
     shared.set_ready("policy")
 
-    # RUNNING entry — the coordinator is the policy control source, so there is
-    # no operator BEGIN. It waits for Main to arm the system (DISARMED -> ARMED),
-    # then self-enters RUNNING and advances the generation once. The advance
-    # invalidates any startup-generation plan and makes the inference worker
-    # reset its backend before the first proposal.
+    # RUNNING entry is automatic after Main arms the system; no operator BEGIN.
     while (
         shared.is_running.value
         and int(shared.safety_state.value) != int(SafetyState.ARMED)
     ):
-        # Keep the heartbeat fresh while blocked: arm/inference readiness can
-        # exceed the 1.0s policy timeout, and run_supervisor starts checking
-        # heartbeats immediately after Main arms (mirrors the hand_process wait).
+        # Keep the heartbeat fresh while waiting for arm/inference readiness.
         shared.set_heartbeat("policy", time.monotonic())
         if bool(shared.error_state.value) or bool(shared.estop_request.value):
             return
@@ -247,10 +235,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     active_plan_id = 0
     last_adopted_observation_id = 0
     next_step = 0
-    # Command-to-command silence reference. ``None`` until the first publish so
-    # the slow first inference (forced reset + encode + infer after the
-    # RUNNING-entry generation advance) is not charged against the silence
-    # budget.
+    # Silence timeout starts at the first published command, not first inference.
     last_valid_policy_command_ns: int | None = None
     last_metrics_flush_ns = time.monotonic_ns()
     running = True
@@ -262,16 +247,13 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
             shared.set_heartbeat("policy", time.monotonic())
 
             if not running:
-                # Post-abort: idle in ARMED, heartbeat only, await explicit restart.
                 _sleep_tick(period_s, tick_start)
                 continue
             if bool(shared.error_state.value) or bool(shared.estop_request.value):
                 _sleep_tick(period_s, tick_start)
                 continue
 
-            # Command silence watchdog: command-to-command only, armed at
-            # the first publish, so first-command inference latency is not
-            # charged against the budget.
+            # Watch command-to-command silence; first-inference latency is exempt.
             if (
                 last_valid_policy_command_ns is not None
                 and now_ns - last_valid_policy_command_ns > max_silence_ns
@@ -283,7 +265,6 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 active_plan = None
                 continue
 
-            # Adopt the latest plan (latest-wins; a higher plan_id supersedes).
             rec = _read_latest_plan(shared)
             if rec is not None and int(rec["plan_id"]) != active_plan_id:
                 ok, reason = _adoptable(
@@ -324,8 +305,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 metrics.increment(ENDPOINTS_COALESCED, coalesced)
 
             arm_qpos = np.asarray(active_plan["arm_qpos"][selected], dtype=np.float64)
-            # 2π-canonicalize the plan target to the freshest measured arm pose;
-            # the worker no longer wraps, so the producer owns band safety here.
+            # Canonicalize targets against fresh feedback before publication.
             _arm_state = read_arm_state_dict(shared)
             if _arm_state is not None and np.all(np.isfinite(_arm_state["qpos"])):
                 arm_qpos = wrap_nearest_equivalent(
@@ -365,10 +345,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
             )
             if not publish_result.succeeded:
                 if publish_result.status == CommandPublishStatus.GATE_REJECTED:
-                    # SafetyGate rejection is a policy-semantic failure:
-                    # the model proposed an invalid endpoint. Abort immediately.
-                    # Attribute the rejection per gate code so the flush
-                    # log shows *which* operation rejected, not just a total.
+                    # A gate rejection is an invalid model endpoint; abort the run.
                     metrics.increment(
                         reject_counter_name(
                             publish_result.gate_code.value
@@ -395,8 +372,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                     running = False
                     active_plan = None
                     continue
-                # Feedback/transport failure is transient: drop this tick; the
-                # silence watchdog is the eventual abort backstop.
+                # Drop transient feedback failures; the silence watchdog is the backstop.
                 _sleep_tick(period_s, tick_start)
                 continue
 

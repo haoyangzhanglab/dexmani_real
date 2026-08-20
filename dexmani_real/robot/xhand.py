@@ -138,7 +138,6 @@ class XHand:
         self._last_tactile_valid: bool | None = None
         self._sensor_status: dict[str, int | None] = {"read": None, "send": None}
 
-    # Lifecycle
 
     @property
     def is_connected(self) -> bool:
@@ -353,7 +352,6 @@ class XHand:
         except Exception:
             logger.warning("XHand control did not close cleanly", exc_info=True)
 
-    # Tactile initialization
 
     def calibrate_tactile(self) -> bool:
         """Reset sensors and estimate a no-contact bias without gating joint control."""
@@ -419,7 +417,6 @@ class XHand:
         self._tactile_bias_raw = np.mean(
             np.stack([sample.tactile_force for sample in samples]), axis=0
         )
-    # State and commands
 
     def get_state(self) -> XHandState:
         """Return fresh joint feedback; sensor-only errors degrade tactile fields."""
@@ -550,7 +547,6 @@ class XHand:
                 f"range=[{lower:.6f},{upper:.6f}]rad"
             )
 
-    # Parsing and status handling
 
     def _parse_state(
         self, state: Any, *, raw_expected: bool, sum_expected: bool

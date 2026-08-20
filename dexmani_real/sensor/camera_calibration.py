@@ -96,19 +96,16 @@ _INITIAL_STATE_POLL_S = 0.05
 _IK_WARNING_INTERVAL_S = 1.0
 _BOUNDARY_WARN_INTERVAL_S = 2.0
 
-# Camera stream defaults.
 _CAMERA_WIDTH = 640
 _CAMERA_HEIGHT = 480
 _CAMERA_FPS = 30
 _CAMERA_WARMUP_FRAMES = 30
 
-# ArUco dictionary — fixed per-marker-type, not configurable per session.
 _ARUCO_DICT = cv2.aruco.DICT_7X7_50
 _ARUCO_DICT_NAME = "7x7_50"
 
 # OpenCV hand-eye methods.  TSAI is most sensitive to rotation noise;
-# PARK is the most stable in the literature (PLOS ONE 2022).  All five are
-# evaluated and the one with the lowest closed-loop position scatter wins.
+# Evaluate all five hand-eye methods and select the lowest-scatter result.
 _HAND_EYE_METHODS = {
     "TSAI": cv2.CALIB_HAND_EYE_TSAI,
     "PARK": cv2.CALIB_HAND_EYE_PARK,
@@ -122,7 +119,6 @@ _HAND_EYE_METHODS = {
 class ArucoConfig:
     """ArUco marker detection parameters."""
 
-    # marker_size_m: float = 0.1228
     marker_size_m: float = 0.0982
     target_id: int | None = 1
     capture_frames: int = 5
@@ -552,7 +548,6 @@ def _save_cameras_json(
     else:
         existing = {}
 
-    # Reuse existing key for the same serial; otherwise allocate a new one.
     cam_name = "camera_0"
     for name, cam_data in existing.items():
         if cam_data.get("serial") == serial:
@@ -568,8 +563,7 @@ def _save_cameras_json(
         backup = json_path.with_suffix(
             f".json.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )
-        # Copy (not rename) so the live cameras.json is never left absent in
-        # the window between backup and atomic write.
+        # Copy before the atomic write so cameras.json is never briefly absent.
         shutil.copy2(json_path, backup)
         print(f"  backed up previous config → {backup.name}")
 
@@ -695,7 +689,6 @@ def _run_calibration(
         _set_fault(shared, "initial arm feedback is unavailable or unhealthy")
         return 1
 
-    # Camera state.
     pipeline, serial, intrinsics, distortion = _start_camera(camera_serial)
     print(f"  Camera serial: {serial}")
     print(
@@ -703,7 +696,6 @@ def _run_calibration(
         f"({_CAMERA_WIDTH}x{_CAMERA_HEIGHT})"
     )
 
-    # Keyboard state.
     keys = GlobalKeyState(
         suppress_echo=True,
         estop_callback=lambda: _set_fault(
@@ -712,7 +704,6 @@ def _run_calibration(
     )
     keys.start()
 
-    # Runtime state.
     samples = _Samples()
     T_world_camera: np.ndarray | None = None
     marker_corners = _marker_corners_3d(aruco_cfg.marker_size_m)
@@ -876,7 +867,6 @@ def _run_calibration(
             rate.wait()
             frame += 1
 
-            # Non-blocking preview.
             frames = pipeline.poll_for_frames()
             color_frame = frames.get_color_frame() if frames else None
             if color_frame:
@@ -896,7 +886,6 @@ def _run_calibration(
                 cv2.imshow(_WINDOW_NAME, display_img)
             cv2.waitKey(1)
 
-            # Input events.
             event = keys.pop_event()
             while event is not None:
                 if event == "space":
@@ -922,7 +911,6 @@ def _run_calibration(
                     _event_solve()
                 event = keys.pop_event()
 
-            # Exit and e-stop.
             if keys.is_pressed("esc"):
                 _set_fault(shared, "operator e-stop", estop=True)
                 return 1
@@ -989,7 +977,6 @@ def _run_calibration(
                     require_transition(shared, SafetyState.ARMED)
                 return 0 if T_world_camera is not None else 2
 
-            # Edge-triggered home.
             home_pressed = keys.is_pressed("r")
             if home_pressed and not home_key_down:
                 if int(shared.safety_state.value) == int(SafetyState.RUNNING):
@@ -1037,7 +1024,6 @@ def _run_calibration(
                 continue
             home_key_down = home_pressed
 
-            # Keyboard deltas.
             dx, drpy = eef_delta_from_keys(
                 keys, calib_cfg.delta_pos_m, calib_cfg.delta_rpy_rad
             )
@@ -1056,8 +1042,7 @@ def _run_calibration(
                 target_pos, target_quat = held_pose.p.copy(), held_pose.q.copy()
             motion_active = moving
             if not moving:
-                # Track measured position during idle so the velocity check on
-                # the next motion tick uses a fresh reference.
+                # Track idle position so the next velocity check uses a fresh reference.
                 previous_command = current_qpos.copy()
                 if frame % idle_interval == 0:
                     measured_pose = planner.kin.compute_eef_pose_world(current_qpos)
@@ -1183,7 +1168,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  hand geometry assertion: {args.hand_geometry}")
     print("=" * 60)
 
-    # Resolve runtime configuration.
     try:
         runtime = resolve_runtime_config(
             yaml_path=args.config,
@@ -1200,13 +1184,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Invalid calibration config: {exc}", file=sys.stderr)
         return 2
 
-    # Planner and safety gate.
     planner, safety_gate, workspace = _build_planner_and_gate(runtime)
     print(
         f"  XHand: not required ({args.hand_geometry} geometry used for collision checks)"
     )
 
-    # Shared storage and arm worker.
     ctx = mp.get_context("spawn")
     shared = SharedStorage.create(
         prefix=f"dexmani_calib_{os.getpid()}",
@@ -1239,7 +1221,6 @@ def main(argv: list[str] | None = None) -> int:
     require_transition(shared, SafetyState.ARMED)
     print(f"  arm worker ready (Mode 6, {runtime.arm.loop_hz}Hz)")
 
-    # Run calibration.
     exit_code = 1
     try:
         exit_code = _run_calibration(

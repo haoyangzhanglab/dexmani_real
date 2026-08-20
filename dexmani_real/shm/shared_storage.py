@@ -35,7 +35,6 @@ from dexmani_real.utils.schema import (
 logger = get_logger(__name__)
 
 
-# SharedStorageConfig — centralized tuning constants
 
 
 @dataclass
@@ -165,8 +164,7 @@ _RING_RESOURCE_NAMES = (
 _QUEUE_RESOURCE_NAMES = ("arm_home_q",)
 _ALLOCATION_ROLLBACK_ATTEMPTS = 2
 
-# Ordered heartbeat slots — one fixed array. Index order is stable across
-# processes.
+# Heartbeat slots use a fixed process-stable order.
 HEARTBEAT_FIELDS: tuple[str, ...] = (
     "arm",
     "hand",
@@ -178,9 +176,7 @@ HEARTBEAT_FIELDS: tuple[str, ...] = (
 )
 HEARTBEAT_INDEX: dict[str, int] = {name: index for index, name in enumerate(HEARTBEAT_FIELDS)}
 
-# Ordered readiness slots — one fixed array. Per-element access on
-# ``ctx.Array`` is atomic, so each flag is a simple 0/1 store; the index order
-# is stable across processes.
+# Readiness slots use a fixed, process-stable order and atomic 0/1 flags.
 READY_FIELDS: tuple[str, ...] = (
     "arm",
     "hand",
@@ -192,9 +188,7 @@ READY_FIELDS: tuple[str, ...] = (
 )
 READY_INDEX: dict[str, int] = {name: index for index, name in enumerate(READY_FIELDS)}
 
-# Poll granularity for wait_ready(). Readiness is a one-shot startup wait with
-# generous timeouts; a short poll keeps the observed return value identical to
-# Event.wait(timeout) without burning CPU.
+# Short polling keeps one-shot readiness waits responsive without busy looping.
 _READY_POLL_INTERVAL_S = 0.01
 
 
@@ -377,8 +371,7 @@ class SharedStorage:
         )
         storage.arm_home_q = ctx.Queue(maxsize=cfg.arm_home_q_maxsize)
         storage.arm_command_seq = ctx.Value("Q", 0)
-        # Sequence captured when motion was armed; the worker ignores endpoints
-        # created before it so a re-arm never replays pre-disarm commands.
+        # Ignore endpoints created before the latest motion-arm sequence.
         storage.arm_armed_at_seq = ctx.Value("Q", 0)
         storage.run_generation = ctx.Value("Q", 1)
         storage.recorder_consumed_sequence = ctx.Value("Q", 0)
@@ -517,7 +510,6 @@ def vr_frame_dtype() -> np.dtype:
     return VR_FRAME_DTYPE
 
 
-# Shared ring read/write helpers
 
 
 def read_arm_state(shared: "SharedStorage") -> "np.ndarray | None":

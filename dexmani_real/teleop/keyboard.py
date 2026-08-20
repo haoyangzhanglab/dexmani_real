@@ -17,9 +17,7 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-# stop() disables callbacks synchronously.  A Linux/XRecord backend thread may
-# remain blocked until another input event wakes it, so do not add seconds of
-# user-visible shutdown latency waiting for a daemon-thread bookkeeping state.
+# stop() disables callbacks, but Linux/XRecord may remain blocked; avoid long waits.
 _LISTENER_STOP_TIMEOUT_S = 0.25
 
 __all__ = [
@@ -40,7 +38,6 @@ class ControlSignal(Enum):
     QUIT = "QUIT"
 
 
-# Character key → ControlSignal mapping (lowercase)
 _KEY_MAP: dict[str, ControlSignal] = {
     "b": ControlSignal.BEGIN,
     "c": ControlSignal.PAUSE,
@@ -75,10 +72,7 @@ def _restore_terminal_echo(saved: list[Any] | None) -> None:
     try:
         import termios
 
-        # pynput receives events globally while the terminal's canonical input
-        # queue independently accumulates the same characters.  TCSAFLUSH
-        # restores the saved attributes after draining output and atomically
-        # discards that unread input, preventing it from reaching the shell.
+        # TCSAFLUSH discards terminal input accumulated alongside pynput events.
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSAFLUSH, saved)
     except (termios.error, OSError):
         logger.warning("terminal echo restoration failed", exc_info=True)
@@ -96,10 +90,8 @@ def _stop_listener_bounded(listener: Any, *, label: str) -> bool:
         logger.warning("%s listener shutdown raised", label, exc_info=True)
         return False
     if alive:
-        # pynput's Linux backend may remain blocked in its native event wait
-        # after stop() even though callbacks have been disabled.  It is a
-        # daemon thread; terminal restoration/flush below is the user-visible
-        # shutdown boundary, so this is diagnostic rather than a robot fault.
+        # pynput may remain blocked after stop(); terminal restoration is the
+        # user-visible shutdown boundary.
         logger.debug(
             "%s listener backend did not confirm exit within %.1fs; "
             "terminal input will still be restored and flushed",
@@ -344,7 +336,6 @@ class KeyboardHandler:
                 self._buffer.clear()
                 return signals
 
-        # Slow path: buffer empty, wait briefly for events
         if timeout > 0:
             deadline = time.perf_counter() + timeout
             while time.perf_counter() < deadline:
@@ -543,10 +534,7 @@ class GlobalKeyState:
             self._saved_termios = _suppress_terminal_echo()
         try:
             on_press, on_release = self._callbacks(keyboard)
-            # Do not request pynput's X11-wide keyboard grab: its RECORD
-            # listener can fail to terminate after an asynchronous device
-            # shutdown.  Terminal echo stays disabled until all workers exit,
-            # then TCSAFLUSH discards the canonical input queue atomically.
+            # Avoid pynput's X11-wide grab, which can outlive device shutdown.
             listener = keyboard.Listener(
                 on_press=on_press,
                 on_release=on_release,

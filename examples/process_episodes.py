@@ -1,14 +1,6 @@
-"""Compact one task's supported schema-v17/v18 episodes into one HDF5 per source.
+"""Usage: ``python examples/process_episodes.py --input-root DIR``.
 
-Usage:
-    python examples/process_episodes.py \
-        --input-root episodes/<task_name> --profile rgb_pc
-
-Without ``--output-root``, the batch is published to
-``episodes_processed/<task_name>/``.
-
-All modalities share one compacted row mask. The command never splits one demo
-into multiple outputs, and the default bridge policy rejects unsafe adjacency.
+Compact one task's schema-v17/v18 episodes into processed HDF5 files.
 """
 
 from dexmani_real.data_processing.cli import main

@@ -143,8 +143,7 @@ def supervisor_exit_reason(
         return ExitReason.STICKY_FAULT
     stopped = [process for process in processes if process.exitcode is not None]
     explicit_quit = bool(shared.quit_requested.value) or not bool(shared.is_running.value)
-    # The policy sets quit_requested before its own clean exit. Accept that
-    # expected zero exit without masking non-zero worker failures.
+    # Accept the policy's intentional zero exit without masking worker failures.
     if stopped and explicit_quit and all(int(process.exitcode) == 0 for process in stopped):
         return ExitReason.EXPLICIT_QUIT
     if stopped:

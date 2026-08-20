@@ -48,7 +48,6 @@ _FLEXION_FEATURE_JOINT_PAIRS = (
     (6, 8), (7, 9),  # ring
     (8, 10), (9, 11),  # pinky
 )
-# Finger flexion is primary; thumb opposition is scored separately.
 _FINGER_FEATURE_JOINT_PAIRS = _FLEXION_FEATURE_JOINT_PAIRS[2:]
 _THUMB_FEATURE_JOINT_PAIRS = _FLEXION_FEATURE_JOINT_PAIRS[:2]
 _FINGER_JOINT_NAMES = tuple(
@@ -58,9 +57,7 @@ _THUMB_JOINT_NAMES = tuple(
     XHAND_SDK_JOINT_NAMES[joint_index] for _, joint_index in _THUMB_FEATURE_JOINT_PAIRS
 )
 
-# Finger-flexion joints only (no thumb/abduction) — the subset that receives the
-# explicit lower-stop margin when estimating home. Thumb opposition and index
-# abduction keep their configured operational envelope there.
+# Finger-flexion joints receive the lower-stop home margin; thumb/abduction do not.
 _HOME_MARGIN_JOINT_INDICES = (4, 5, 6, 7, 8, 9, 10, 11)
 
 
@@ -387,7 +384,6 @@ def evaluate_run(
     operational_upper = np.asarray(hand.qpos_max_rad, dtype=np.float64)
     # Teleop applies this deterministic command-box clip before publication.
     # Score hand geometry and motion on the endpoint the robot can actually
-    # receive; keep solver-bound/clip occupancy as separate raw diagnostics.
     qpos = np.clip(solver_qpos, operational_lower, operational_upper)
 
     best_lags: list[int] = []

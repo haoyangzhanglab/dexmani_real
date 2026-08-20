@@ -68,7 +68,6 @@ class CameraRingBuffer:
         self.name = name
         self.maxlen = maxlen
 
-        # Per-slot layout
         self._slot_header_size = 8 + 8 + CAMERA_FRAME_HEADER_DTYPE.itemsize
 
         if create:
@@ -84,7 +83,6 @@ class CameraRingBuffer:
             self._shm = shared_memory.SharedMemory(name=name, create=True, size=self._total_size)
             self._init_header()
         else:
-            # Attach to existing SHM — read dimensions from the header.
             self._shm = shared_memory.SharedMemory(name=name)
             self._max_rgb_bytes = int(
                 np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_RGB)[0]
@@ -94,7 +92,6 @@ class CameraRingBuffer:
             )
             self._slot_size = self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes
             self._total_size = self._HEADER_SIZE + maxlen * self._slot_size
-            # Reconstruct shapes from byte counts for attach-mode consumers.
             self._rgb_shape = None
             self._depth_shape = None
 
@@ -176,21 +173,16 @@ class CameraRingBuffer:
         idx = seq % self.maxlen
         slot_base = self._HEADER_SIZE + idx * self._slot_size
 
-        # Seqlock write protocol: odd → data → even.
-        # Write an odd marker BEFORE the payload so concurrent readers see
-        # "writer active" and bail out.  The timestamp is stamped only after the
-        # payload is committed below, so it reflects the true commit time.
+        # Seqlock protocol: mark odd before the payload and even after commit.
         seqlock = SeqlockSlot(self._shm.buf, slot_base)
         seqlock.begin_write(seq, 0)
 
-        # Write the fixed camera transport header.
         header_offset = slot_base + 16
         header_dest: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
             (1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=header_offset
         )
         header_dest[0] = header[0]
 
-        # Write RGB bytes
         rgb_offset = header_offset + CAMERA_FRAME_HEADER_DTYPE.itemsize
         rgb_len = rgb.nbytes
         rgb_dest: np.ndarray[Any, np.dtype[np.uint8]] = np.ndarray(
@@ -198,7 +190,6 @@ class CameraRingBuffer:
         )
         rgb_dest[:] = rgb.ravel()[:rgb_len]
 
-        # Write depth bytes
         depth_offset = rgb_offset + self._max_rgb_bytes
         depth_len = depth.nbytes
         depth_dest: np.ndarray[Any, np.dtype[np.uint8]] = np.ndarray(
@@ -206,17 +197,13 @@ class CameraRingBuffer:
         )
         depth_dest[:] = depth.view(np.uint8).ravel()[:depth_len]
 
-        # Commit after the payload is fully copied.
-        # so both the seqlock timestamp and the header publish field reflect the
-        # true commit time, not the start of a long RGB/depth copy.
+        # Stamp and publish only after the payload is fully copied.
         now_ns = time.monotonic_ns()
         seqlock.stamp_timestamp(now_ns)
         header_dest["publish_monotonic_ns"][0] = np.uint64(now_ns)
 
-        # Publish the even marker.
         seqlock.end_write(seq)
 
-        # Publish the logical sequence only after the payload is committed.
         self._write_seq[0] = np.uint64(seq)
 
         self._write_idx_view()[0] = np.uint64(idx)
@@ -234,23 +221,18 @@ class CameraRingBuffer:
 
         slot_base = self._HEADER_SIZE + idx * self._slot_size
 
-        # Read timestamp + sequence
         seqlock = SeqlockSlot(self._shm.buf, slot_base)
         slot_seq = seqlock.marker
 
         if slot_seq == 0 and idx == 0 and int(self._write_seq[0]) == 0:
             return None
 
-        # Read header
         header_offset = slot_base + 16
         header: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
             (1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=header_offset
         ).copy()
 
-        # Read RGB — validate size and shape against known maxima to guard
-        # against torn reads where the producer is mid-write and header fields
-        # contain garbage values that would create an out-of-bounds ndarray view
-        # or cause reshape to fail with mismatched dimensions.
+        # Validate sizes and shapes before creating views to reject torn reads.
         h = header[0]
         rgb_size = int(h["rgb_size"])
         rgb_h, rgb_w, rgb_c = int(h["rgb_shape_h"]), int(h["rgb_shape_w"]), int(h["rgb_shape_c"])
@@ -275,7 +257,6 @@ class CameraRingBuffer:
             .reshape((rgb_h, rgb_w, rgb_c))
         )
 
-        # Read depth — same torn-read guard (size + shape consistency)
         depth_size = int(h["depth_size"])
         depth_h, depth_w = int(h["depth_shape_h"]), int(h["depth_shape_w"])
         if depth_size > self._max_depth_bytes or depth_size <= 0 or depth_h * depth_w * 2 != depth_size:
@@ -300,7 +281,6 @@ class CameraRingBuffer:
         )
 
         # Reject writer-active or torn reads.
-        # odd seq → writer is mid-write; re-read mismatch → overwritten during read.
         if not seqlock.verify(slot_seq):
             return None
 

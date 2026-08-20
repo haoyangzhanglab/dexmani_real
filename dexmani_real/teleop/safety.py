@@ -122,9 +122,6 @@ def _do_teleop_home(
     if hand_retargeter is not None:
         _reset_hand_retargeter(hand_retargeter)
 
-    # Step 1: publish the exact configured hand-home endpoint. Success means
-    # the hand worker received it and XHand.send_action() returned success; a
-    # grasped object or steady-state joint error never blocks arm homing.
     if hand_available and not shared.error_state.value:
         hand_accepted = publish_hand_home_and_wait_applied(
             shared,
@@ -159,9 +156,6 @@ def _do_teleop_home(
         )
         return prev_hand_qpos
 
-    # Step 2: arm home (collision-checked path). Planning uses configured
-    # hand-home geometry by explicit operator policy; it does not wait for or
-    # substitute measured hand convergence.
     _arm_state = read_arm_state_causal(shared)
     if _arm_state is None:
         logger.warning("arm home cancelled: no current arm state")

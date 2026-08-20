@@ -55,10 +55,7 @@ from dexmani_real.utils.schema import RECORD_TASK_LABEL_BYTES
 
 logger = get_logger(__name__)
 
-# Operator-editable default. Published recordings live below
-# ``episodes/<task_name>/episode_*`` and carry the same value in metadata.
-# The name groups data; it is not a success label. Operators delete failed or
-# unusable episode directories before offline processing.
+# Operator-editable task name; recordings are stored below episodes/<task>/.
 DEFAULT_TASK_NAME = "test"
 
 
@@ -282,9 +279,7 @@ def _build_processes(
         operator=operator,
         hand_urdf_path=str(XHAND_RIGHT_URDF_PATH),
     )
-    # Readiness order is the single source of truth for build order and for the
-    # readiness/heartbeat names derived from it (arm → vr → policy → camera →
-    # recorder → hand).
+    # Readiness order drives process startup and heartbeat names.
     specs = [
         WorkerSpec(
             "arm",
@@ -441,12 +436,7 @@ def run_teleop_experiment(
             if spec.ready_name
         ]
 
-        # VR is the one subsystem that needs operator action (donning the
-        # Quest headset), so it is prompted for and waited on last — only after
-        # every other subsystem has confirmed ready. This keeps "System ready"
-        # truthful and lets non-VR init failures surface without first waiting
-        # out the full VR timeout. The VR process is still *started* early (in
-        # specs order); only its readiness check is deferred.
+        # Wait for VR last because it requires the operator to don the headset.
         non_vr_checks = [rc for rc in ready_checks if rc[0] != "vr"]
         vr_checks = [rc for rc in ready_checks if rc[0] == "vr"]
 
@@ -505,11 +495,7 @@ def run_teleop_experiment(
 
         require_transition(shared, SafetyState.ARMED)
 
-        # Reset the XHand to its configured open-neutral home once it has
-        # initialized and the system is ARMED. The hand worker only applies
-        # commands in ARMED/RUNNING, so this must follow the ARMED transition.
-        # It is an explicit, correlated homing action (the same hand-only path
-        # used by return-home/replay) and does not move the arm.
+        # Reset XHand to its configured home after initialization and ARM.
         if hand_enabled:
             hand_home = np.deg2rad(
                 np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)

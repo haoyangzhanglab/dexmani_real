@@ -105,9 +105,7 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
     _latest_head_recv_ts_ns = 0
 
     # vr_ready is deferred to the first event (HeadFrame or HandFrame).
-    # TCP connect alone is not enough — data must actually be flowing before
-    # Main considers VR "ready", otherwise the 5 s heartbeat timeout fires
-    # before the operator has time to put on the headset.
+    # Mark VR ready only after tracking data flows, not on TCP connection alone.
 
     dtype = vr_frame_dtype()
 
@@ -117,7 +115,6 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
 
         # Heartbeat on every event — proves VR process is alive + receiving data.
         # Written *before* vr_ready so the supervisor sees a fresh heartbeat
-        # immediately (avoids false FAULT on the first check).
         shared.set_heartbeat("vr", time.monotonic())
 
         if not shared.is_ready("vr"):

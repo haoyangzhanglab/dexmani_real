@@ -78,9 +78,7 @@ class DeviceClockMapper:
                 frame_gap = frame - self._last_frame_number - 1
 
         offset = host_ns - device_ns
-        # Slide the trailing window forward and take its minimum offset.  The
-        # minimum ignores transient USB-delivery spikes (an inflated offset)
-        # while still rising to track slow device-clock drift.
+        # Use the trailing-window minimum to ignore transient USB-delivery spikes.
         while self._offset_window and host_ns - self._offset_window[0][0] > self.window_ns:
             self._offset_window.popleft()
         self._offset_window.append((host_ns, offset))

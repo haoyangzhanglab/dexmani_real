@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Run the interactive RealSense RGB-D and point-cloud diagnostic."""
+"""Usage: ``python examples/realsense_record_example.py``.
+
+Run the interactive RealSense RGB-D and point-cloud diagnostic.
+"""
 
 import sys
 from pathlib import Path

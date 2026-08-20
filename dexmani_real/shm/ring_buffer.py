@@ -7,11 +7,9 @@ prevent readers from accepting a slot while its payload is being overwritten.
      DexUMI drop-oldest backpressure via FILO semantics.
 
 Usage:
-    # Producer process
     buf = SharedMemoryRingBuffer("vr_frames", VR_FRAME_DTYPE, maxlen=3, create=True)
     buf.write(vr_frame_array)
 
-    # Consumer process
     buf = SharedMemoryRingBuffer("vr_frames", VR_FRAME_DTYPE, maxlen=3, create=False)
     latest = buf.read_latest()  # (data copy, timestamp_ns, logical sequence) or None
 """
@@ -26,7 +24,6 @@ import numpy as np
 
 from dexmani_real.utils.log import get_logger
 
-# Seqlock protocol helpers.
 
 
 def _seqlock_odd(seq: int) -> int:
@@ -114,7 +111,6 @@ class SeqlockSlot:
 logger = get_logger(__name__)
 
 # Torn-read warning throttle: at most one warning per 5 s per buffer.
-# Shared by CameraRingBuffer and SharedMemoryRingBuffer.
 TORN_WARN_INTERVAL_NS = 5 * 1_000_000_000
 
 
@@ -139,7 +135,6 @@ class SharedMemoryRingBuffer:
     are silently overwritten (drop-oldest backpressure).
     """
 
-    # Offset constants
     _OFF_WRITE_IDX = 0
     _OFF_SEQUENCE = 8
     _OFF_SLOT_SIZE = 16
@@ -170,7 +165,6 @@ class SharedMemoryRingBuffer:
         self._slot_dtype = np.dtype([("timestamp_ns", "<u8"), ("sequence", "<u8"), ("data", self.dtype)])
         self._slot_size = self._slot_dtype.itemsize
 
-        # Total shared memory size
         self._total_size = self._HEADER_SIZE + maxlen * self._slot_size
 
         if create:
@@ -178,12 +172,10 @@ class SharedMemoryRingBuffer:
         else:
             self._shm = shared_memory.SharedMemory(name=name)
 
-        # Map the header first (needed by _init_header)
         self._header: np.ndarray[Any, np.dtype[np.uint8]] = np.ndarray(
             (self._HEADER_SIZE,), dtype=np.uint8, buffer=self._shm.buf, offset=0
         )
 
-        # Map the data region as a numpy array
         self._data_buf: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
             (maxlen,), dtype=self._slot_dtype, buffer=self._shm.buf, offset=self._HEADER_SIZE
         )
@@ -219,7 +211,6 @@ class SharedMemoryRingBuffer:
             stale.unlink()
             return cls(name, dtype, maxlen=maxlen, create=True)
 
-    # Producer API.
 
     def write(self, data: np.ndarray) -> int:
         """Write one frame into the ring buffer (producer-side).
@@ -229,19 +220,11 @@ class SharedMemoryRingBuffer:
         Args:
             data: A 0-d or 1-d structured array matching self.dtype.
         """
-        # Increment the logical sequence locally; publish it only after the
-        # payload is committed below, so a reader that samples a fresh
-        # _write_seq can never observe a half-written slot as "latest".
         seq = int(self._write_seq[0]) + 1
 
-        # Compute slot index
         idx = seq % self.maxlen
 
-        # Mark the slot incomplete before touching its payload, then publish an
-        # even completion marker. Readers accept only two matching even reads.
-        # The timestamp is stamped only after the payload is committed (mirrors
-        # CameraRingBuffer) so it reflects the true commit time, not the start
-        # of the payload copy.
+        # Mark the slot incomplete before writing; readers accept matching even markers.
         slot = self._data_buf[idx]
         seqlock = SeqlockSlot(self._shm.buf, self._HEADER_SIZE + idx * self._slot_size)
         seqlock.begin_write(seq, 0)
@@ -249,15 +232,12 @@ class SharedMemoryRingBuffer:
         seqlock.stamp_timestamp(time.monotonic_ns())
         seqlock.end_write(seq)
 
-        # Publish the logical sequence only after the payload is committed.
         self._write_seq[0] = np.uint64(seq)
 
-        # Atomic write of write_idx (aligned uint64 store on x86_64)
         self._write_idx_view()[0] = np.uint64(idx)
 
         return seq
 
-    # Consumer API.
 
     def read_latest(self) -> tuple[np.ndarray, int, int] | None:
         """Return a verified ``(data, timestamp_ns, logical_sequence)`` frame."""
@@ -289,8 +269,6 @@ class SharedMemoryRingBuffer:
         dropped = False
         count = min(k, latest_seq)
         first_seq = latest_seq - count + 1
-        # Copy the oldest (next-to-be-overwritten) slot first. Reading newest
-        # first needlessly left that vulnerable slot until the end.
         for target_seq in range(first_seq, latest_seq + 1):
             slot = self._data_buf[target_seq % self.maxlen]
             seqlock = SeqlockSlot(self._shm.buf, self._HEADER_SIZE + (target_seq % self.maxlen) * self._slot_size)
@@ -300,10 +278,7 @@ class SharedMemoryRingBuffer:
                 if not _seqlock_is_complete(marker1):
                     continue
                 if _seqlock_to_logical(marker1) != target_seq:
-                    # This slot has already been overwritten by a newer write
-                    # (its marker now belongs to a later sequence).  Skip it and
-                    # keep walking the requested range rather than discarding the
-                    # still-valid history we already collected.
+                    # Skip slots overwritten during the read.
                     dropped = True
                     break
                 timestamp_ns = seqlock.timestamp_ns
@@ -322,7 +297,6 @@ class SharedMemoryRingBuffer:
     def latest_sequence(self) -> int:
         return int(self._write_seq[0])
 
-    # Lifecycle.
 
     def close(self) -> None:
         """Close the shared memory file descriptor (does NOT destroy)."""
@@ -339,9 +313,7 @@ class SharedMemoryRingBuffer:
         pickle transport.  Reconstructing them from the named block also keeps
         parent and child resource ownership explicit.
         """
-        # Pickle the dtype object itself. ``dtype.descr`` materializes implicit
-        # alignment gaps as synthetic ``fN`` fields, so an aligned structured
-        # dtype no longer compares/casts equal after spawn reconstruction.
+        # Preserve the dtype object during spawn reconstruction to retain alignment.
         return {"name": self.name, "dtype": self.dtype, "maxlen": self.maxlen}
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -349,12 +321,10 @@ class SharedMemoryRingBuffer:
             self, state["name"], np.dtype(state["dtype"]), maxlen=int(state["maxlen"]), create=False
         )
 
-    # Internal helpers.
 
     def _init_header(self) -> None:
         """Initialize the header region with zeros."""
         self._header[:] = 0
-        # Write slot_size and maxlen for introspection
         np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_SLOT_SIZE)[0] = np.uint64(
             self._slot_size
         )

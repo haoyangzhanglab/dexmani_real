@@ -215,8 +215,7 @@ class TeleopLoopState:
     ema_prev_quat: np.ndarray | None = None
     hand_ramp_start: np.ndarray | None = None
     hand_ramp_step: int = 0
-    # Solver result/failure keyed by verified VR ring sequence. Unlike the
-    # ramp, this state advances only on a new observation.
+    # Solver results are keyed by verified VR sequence, not every ramp tick.
     hand_retarget_cache: HandRetargetObservationCache = field(
         default_factory=HandRetargetObservationCache
     )
@@ -361,7 +360,6 @@ def _complete_reanchor_impl(
         hand_anchor = ctx.prev_hand_qpos.copy()
     ctx.hand_ramp_start = hand_anchor
     ctx.hand_ramp_step = 0
-    # Keep the observation cursor and stateful backend on the same reset epoch.
     ctx.hand_retarget_cache.reset()
     _reset_hand_retargeter(ctx.hand_retargeter, hand_anchor)
     return True
@@ -541,7 +539,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             kb.stop()
             return
 
-    # Publish the heartbeat before marking policy ready.
     shared.set_heartbeat("policy", time.monotonic())
     shared.set_ready("policy")
     logger.debug("teleop_loop: READY")
@@ -567,14 +564,12 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     _ignore_begin_audio_until_silent = False
     _quiescence = CommandQuiescence()
 
-    # First Q leaves teleop active for an optional home; the next Q exits.
     quit_pending = False
     quit_after_recording = False
     quit_recording_deadline_s = 0.0
     post_teleop_deadline = 0.0
 
-    # Coordinator duties run at coordinator_hz; observations, actions, and
-    # recording remain on the configured control_hz grid.
+    # Coordination runs at coordinator_hz; control and recording use control_hz.
     limiter = RateManager(cfg.runtime.policy.coordinator_hz, label="teleop")
     _grid_period_ns = int(round(_NS_PER_SECOND / cfg.runtime.policy.control_hz))
     _next_grid_ns = time.monotonic_ns() + _grid_period_ns
@@ -635,7 +630,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             current_hand_state,
         )
 
-    # SIGTERM is intercepted so RecorderIO can finish its episode transaction.
     def _on_sigterm(signum: int, frame: object) -> None:
         ctx.sigterm_requested = True
 
@@ -722,9 +716,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 )
                 recording_active = False
 
-            # Entered after Q key stops teleop. The teleop loop stays alive with
-            # heartbeats ticking so arm/hand/vr continue running — H (return_home)
-            # can still queue a HOME request and wait for convergence.
+            # After Q, keep workers alive for optional H (return_home).
             if quit_pending:
                 # Show prompt once per entry; re-shown after H completes.
                 home_handled = False
@@ -907,9 +899,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                                 hand_retargeter=ctx.hand_retargeter,
                             )
 
-                    # Enter post-teleop state (two-stage Q) instead of immediate exit.
-                    # Teleop stays alive with heartbeats ticking; arm/hand/vr
-                    # continue running so H (return_home) still works.
+                    # Enter post-teleop state while keeping workers alive for H.
                     quit_pending = True
                     post_teleop_deadline = (
                         time.perf_counter() + cfg.runtime.policy.post_teleop_timeout_s
@@ -944,9 +934,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         arm_mapper=arm_mapper,
                         hand_retargeter=ctx.hand_retargeter,
                     )
-                    # HOME is a one-shot operation.  Drop OS auto-repeat that
-                    # arrived while homing blocked this coordinator, then
-                    # discard controls captured before the terminal state.
+                    # HOME is one-shot; discard auto-repeat and stale controls.
                     kb.drain_signal(ControlSignal.HOME)
                     limiter.reset()
                     skip_rest = True
@@ -972,9 +960,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
                 elif sig == ControlSignal.PAUSE:
                     if teleop_active:
-                        # C is an explicit operator pause. If an automatic gate
-                        # is already silent, retain its freshness boundary but
-                        # make this state resumable by the next C.
+                        # C pauses explicitly while retaining the freshness boundary.
                         _enter_command_quiescence(
                             "pause",
                             replace_existing_reason=True,
@@ -1076,10 +1062,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         )
                         recording_active = False
                         break
-                    # BEGIN is a distinct run boundary even when a prior STOP,
-                    # DISCARD, or max-duration stop already invalidated its own
-                    # generation. Require feedback newer than this BEGIN before
-                    # the one-grid re-anchor.
+                    # BEGIN starts a new run boundary.
                     _enter_command_quiescence("begin", start_new_run=True)
                     teleop_active = True
                     logger.debug("teleop_loop: RUNNING")
@@ -1229,7 +1212,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             if teleop_active and vr_stale and not _quiescence.active:
                 _enter_command_quiescence("vr_stale")
 
-            # State-transition audio gates motion by invalidating old commands
             # once and publishing nothing until the cue has released.
             _audio_playing = audio.is_playing
             (
@@ -1246,9 +1228,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 _enter_command_quiescence("audio_gate")
 
             if not teleop_active or vr_stale or _quiescence.active:
-                # Resumption requires source feedback newer than the original
-                # quiescence boundary.  This grid only re-anchors; command
-                # publication starts on the following grid.
+                # Resume only with feedback newer than the quiescence boundary.
                 if (
                     teleop_active
                     and not vr_stale
@@ -1276,8 +1256,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                             "teleop_loop: released %s command quiescence after fresh re-anchor",
                             quiescence_reason,
                         )
-                # Track measured arm position while silent.  This updates only
-                # the local command baseline; it does not publish a hold target.
+                # Track measured position while silent without publishing a hold target.
                 ctx.prev_qpos_cmd = arm_qpos.copy()
                 ctx.ema_prev_pos = ctx.ema_prev_quat = None
                 continue
@@ -1378,11 +1357,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             policy_map_time_ms = (time.perf_counter() - _map_t0) * 1000.0
             stage_timer.mark("map")
 
-            # Compute the hand command first so the arm IK collision model sees
-            # the current-frame (post-shaping) hand pose, not the previous
-            # frame's applied command.  Hand-only motion stays independent of
-            # the IK outcome; the hand-only hold below still publishes on IK
-            # failure.
+            # Compute hand command first so arm collision checks use current-frame pose.
             _hand_retarget_t0 = time.perf_counter()
             hand_cmd, retarget_ok = _compute_hand_command(
                 ctx.hand_retargeter,
@@ -1391,16 +1366,12 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 hand_available,
                 ctx.hand_retarget_cache,
             )
-            # Cache hits intentionally measure lookup time, not a synthetic
-            # repeated solver duration; the recording data dictionary documents
-            # this distinction.
+            # Cache-hit timing measures lookup, not synthetic solver duration.
             hand_retarget_time_ms = (time.perf_counter() - _hand_retarget_t0) * 1000.0
             hand_cmd_raw = _get_raw_hand_command(
                 ctx.hand_retargeter, hand_cmd, retarget_ok
             )
-            # Rate-independent smoothstep ramp from the measured pose captured
-            # when command quiescence ends. The last configured frame reaches
-            # the live target exactly, avoiding an extra one-frame tail.
+            # Smoothstep from the measured pose at quiescence to the live target.
             if (
                 ctx.hand_ramp_start is not None
                 and ctx.hand_ramp_step < _hand_ramp_total_frames
@@ -1418,9 +1389,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 ctx.hand_ramp_start = None
                 ctx.hand_ramp_step = 0
 
-            # Hand command-floor clip: project the command into the
-            # operator-set anti-clogging command box instead of rejecting the
-            # whole action; measured feedback is never clipped here.
+            # Clip the hand command to the operator anti-clogging command box.
             hand_cmd = np.clip(hand_cmd, hand_qpos_lower_rad, hand_qpos_upper_rad)
             hand_cmd_valid = True
             try:
@@ -1573,18 +1542,10 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             arm_cmd_raw = np.asarray(ik_result.qpos, dtype=np.float64).copy()
             arm_cmd = arm_cmd_raw.copy()
 
-            # Keep IK output inside the firmware-accepted joint limits;
-            # velocity/acceleration smoothing is Mode 6 firmware's job.
+            # Keep IK output inside firmware-accepted joint limits.
             arm_cmd = np.clip(arm_cmd, joint_lower_rad, joint_upper_rad)
 
-            # Arm delta-clip fallback: cap the command-to-command joint step so
-            # a distant IK solution (multi-seed fallback / nullspace jump)
-            # degrades to a bounded ramp instead of an incoherent jerk. This is
-            # NOT application-side interpolation — it edits the single Mode-6
-            # endpoint per grid tick and Mode 6 still owns trajectory
-            # smoothing. compute_qpos_delta wraps J1/J3/J5/J7 into (-pi, pi],
-            # so crossing the +-pi seam is never mistaken for a ~2pi jump, and
-            # re-adding keeps the command in prev_qpos_cmd's unwrapped frame.
+            # Cap command-to-command joint steps after a distant IK solution.
             if (
                 arm_max_delta_rad_per_tick is not None
                 and ctx.prev_qpos_cmd is not None
@@ -1597,8 +1558,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 arm_cmd = ctx.prev_qpos_cmd + _arm_delta
                 arm_cmd = np.clip(arm_cmd, joint_lower_rad, joint_upper_rad)
 
-            # Pre-flight checks specific to teleop command assembly. Joint
-            # limits and workspace are enforced once by SafetyGate.
             _reject = False
             _reject_reason = ""
             if not np.all(np.isfinite(arm_cmd)):
@@ -1724,12 +1683,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     )
                 continue
             if not publish_result.succeeded or published_candidate is None:
-                # Recoverable "hold" statuses keep the loop alive with arm+hand
-                # held in place instead of latching a fault: safety-state gating
-                # and transient hand-feedback unavailability/unhealth.
-                # A single stale hand frame must not kill the session — the
-                # debounced per-frame hand check (hand_disconnect_timeout_s) above
-                # is the sole fault path for sustained hand-unhealthy.
+                # Recoverable holds keep arm and hand in place without latching a fault.
                 hold_status = publish_result.status in (
                     CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY,
                     CommandPublishStatus.HAND_FEEDBACK_UNAVAILABLE,
@@ -1783,12 +1737,10 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 policy_compute_time_ms = (
                     time.perf_counter() - _policy_compute_t0
                 ) * 1000.0
-                # Track last valid IK target for held-frame continuity.
                 _last_target_eef_pos = target_pos.copy()
                 _last_target_eef_rot6d = quat_wxyz_to_rot6d(
                     normalize_quat_wxyz(target_quat)
                 )
-                # Hand retargeting fail but IK success → mark separately
                 if not retarget_ok and hand_available:
                     _f_status = _FRAME_RETARGET_FAIL
                 else:

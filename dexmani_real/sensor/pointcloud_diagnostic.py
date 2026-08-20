@@ -47,16 +47,13 @@ class PointCloudDiagnosticConfig:
     warmup_frames: int = 30
     target_points: int = 2048
 
-    # Visualization toggles.
     show_rgbd_panels: bool = True
     show_o3d: bool = True
 
-    # Depth range for visualization.
     vis_depth_min_m: float = 0.3
     vis_depth_max_m: float = 2.5
 
 
-# Sensor options to read back for diagnostics.
 _SENSOR_OPTIONS: list[tuple[str, rs.option]] = [
     ("visual_preset", rs.option.visual_preset),
     ("laser_power", rs.option.laser_power),
@@ -254,7 +251,6 @@ def _run_2d_filters(
     print("2-D Depth Filtering (before deprojection)")
     print("=" * 60)
 
-    # Median filter.
     t0 = time.perf_counter()
     depth_m = PointCloudProcessor.apply_depth_median(depth_m, cfg.depth_median_enabled)
     timings["2d_median"] = (time.perf_counter() - t0) * 1000.0
@@ -263,7 +259,6 @@ def _run_2d_filters(
         f"{timings['2d_median']:.2f}ms"
     )
 
-    # Depth range gate.
     t0 = time.perf_counter()
     z_flat = depth_m.ravel()
     mask = np.isfinite(z_flat) & (z_flat > cfg.depth_min_m) & (z_flat < cfg.depth_max_m)
@@ -274,7 +269,6 @@ def _run_2d_filters(
         f"{n_gate:6d} / {total_pixels} pixels  ({timings['2d_depth_gate']:.2f}ms)"
     )
 
-    # Depth edge filter.
     t0 = time.perf_counter()
     edge_vis = None
     n_before_edge = 0
@@ -305,7 +299,6 @@ def _run_2d_filters(
         mask = mask & ~edge_2d.ravel()
         n_after_edge = int(mask.sum())
 
-        # Build edge visualization: grey=kept, red=core, yellow=dilation band.
         edge_vis_arr = np.full((*depth_m.shape, 3), 128, dtype=np.uint8)
         edge_vis_arr[edge_raw] = [0, 0, 255]
         edge_vis_arr[edge_2d & ~edge_raw] = [0, 255, 255]
@@ -323,7 +316,6 @@ def _run_2d_filters(
     else:
         print("  2. Edge filter:  DISABLED")
 
-    # Speckle filter.
     t0 = time.perf_counter()
     if cfg.speckle_min_pixels > 0:
         mask_2d = mask.reshape(depth_m.shape).astype(np.uint8)
@@ -401,9 +393,7 @@ def _calibrate_desk(
     print(f"  Plane:  {a:.4f}x + {b:.4f}y + {c_plane:.4f}z + {d_plane:.4f} = 0")
     print(f"  Tilt:   {angle_deg:.1f} deg from horizontal")
 
-    # Persist and round-trip verify. The desk plane is shared calibration input
-    # for point-cloud filtering, collision checks, and homing, so overwriting it
-    # requires an explicit confirmation and backs up any prior value first.
+    # Persist and verify the shared desk-plane calibration.
     plane_file = PACKAGE_DIR / "config" / "desk_plane.json"
     plane_path = str(plane_file)
 
@@ -444,7 +434,6 @@ def _run_pipeline(
     processor = PointCloudProcessor(T_world_camera)
     cfg = processor.config
 
-    # Describe stages.
     if processor._desk_plane is not None:
         print(
             f"  Desk plane: auto-loaded  (clearance={cfg.desk_clearance_m*1000:.0f}mm)"
@@ -492,8 +481,7 @@ def _run_pipeline(
         print("  6. Statistical outlier     -> DISABLED")
     print(f"  7. FPS sampling            -> {cfg.num_points} points")
 
-    # Warm-up frame, then time the public operation. PointCloudProcessor keeps
-    # no diagnostic state; profiling individual stages belongs in a profiler.
+    # Warm up once, then time the public operation.
     rays = camera.get_rays()
     rays_2d = rays.reshape(depth_m.shape[0], depth_m.shape[1], 3)
     _ = processor.process(depth_m, rgb, rays_2d)
@@ -612,38 +600,30 @@ def main() -> int:
     cfg = PointCloudDiagnosticConfig()
     all_timings: dict[str, float] = {}
 
-    # Connect.
     camera, t = _connect_camera(cfg)
     all_timings.update(t)
 
     try:
         camera_info = _print_device_info(camera)
 
-        # Capture frame.
         rgb, depth_m, K, t = _capture_frame(camera)
         all_timings.update(t)
 
-        # 2-D filtering.
         _mask, edge_vis, t = _run_2d_filters(depth_m)
         all_timings.update(t)
         _show_rgbd_panels(rgb, depth_m, edge_vis, cfg)
 
-        # Extrinsics.
         T_world_camera, extrinsics_ms = _load_extrinsics(camera_info)
         all_timings["extrinsics"] = extrinsics_ms
 
-        # Desk plane calibration.
         desk_plane, desk_ms = _calibrate_desk(depth_m, rgb, camera, T_world_camera)
         all_timings["desk_calib"] = desk_ms
 
-        # Point-cloud pipeline.
         result, t = _run_pipeline(depth_m, rgb, T_world_camera, desk_plane, camera)
         all_timings.update(t)
 
-        # Timing summary.
         _print_timing_summary(all_timings)
 
-        # Visualization.
         if cfg.show_o3d:
             _visualize_result(result, T_world_camera, PointCloudProcessorConfig())
         else:

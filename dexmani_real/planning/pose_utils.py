@@ -82,10 +82,7 @@ def invert_pose(pose: Pose) -> Pose:
 
 
 def compute_pose_error(target: Pose, actual: Pose) -> tuple[float, float]:
-    # Guard against NaN/Inf Pose inputs.  Return infinite errors so that
-    # downstream >threshold comparisons correctly reject the candidate
-    # (NaN > threshold is always False per IEEE 754, but inf > threshold
-    # is always True).
+    # Return infinite errors for non-finite poses so gates reject them.
     if not np.all(np.isfinite(actual.p)) or not np.all(np.isfinite(actual.q)):
         return (float("inf"), float("inf"))
     if not np.all(np.isfinite(target.p)) or not np.all(np.isfinite(target.q)):

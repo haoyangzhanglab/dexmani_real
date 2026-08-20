@@ -67,7 +67,6 @@ class TeleopIKSolver:
                 profile=profile,
                 report=report,
             )
-            # Include total solve time in success diagnostics.
             result.report["ik_timing_ms"] = round((time.perf_counter() - t_start) * 1000.0, 1)
         else:
             dt_total_ms = (time.perf_counter() - t_start) * 1000
@@ -114,16 +113,11 @@ class TeleopIKSolver:
         fast_accept_rad = profile.position_ik_fast_accept_rad
         weights = self.ik_mgr.profile_array(profile.joint_weights, "joint_weights")
 
-        # Baseline manipulability at the measured posture, computed once per
-        # solve tick. Normalizes the scoring term so a candidate is penalized
-        # relative to the current posture's conditioning rather than by raw
-        # (unit-mixed, posture-dependent) Yoshikawa magnitude.
+        # Normalize manipulability against the measured posture for scoring.
         try:
             mu_current = self.kin.compute_manipulability(current_qpos)
         except (ValueError, RuntimeError):
-            # Non-finite measured qpos should never reach here (the caller
-            # validates arm-state finiteness), but fail closed to a constant
-            # term rather than crashing the teleop loop.
+            # Fail closed if measured qpos is non-finite.
             mu_current = 0.0
 
         seeds = self._make_teleop_seeds(previous_qpos_cmd, current_qpos, profile)
@@ -142,11 +136,7 @@ class TeleopIKSolver:
             )
             _solve_ms = (time.perf_counter() - _tik0) * 1000.0
             if not is_mplib_success(status) or raw_qpos is None:
-                # Distinguish MPlib failure modes (telemetry-only — every case
-                # yields raw_qpos=None and holds identically). A CLIK solution
-                # that converged above threshold ("Distance ... greater than
-                # threshold") or was rejected internally ("Cannot find valid
-                # solution") is not the same as a non-convergent solve.
+                # Classify MPlib failures for telemetry; all failure modes hold.
                 if "Cannot find valid solution" in status:
                     tag = "mplib_no_solution"
                 elif "Distance" in status:
@@ -157,16 +147,11 @@ class TeleopIKSolver:
                 continue
 
             raw_qpos = np.asarray(raw_qpos, dtype=np.float64)
-            # Reject NaN/Inf from MPlib immediately — the earliest
-            # interception point before any validation gate (all of
-            # which use >threshold comparisons that silently pass NaN
-            # per IEEE 754).
+            # Reject NaN/Inf before validation gates, which do not reject NaN.
             if not np.all(np.isfinite(raw_qpos)):
                 attempts.append(f"{seed_name}:nan_qpos({_solve_ms:.1f}ms)")
                 continue
-            # Canonicalize relative to physical encoder position (current_qpos)
-            # to avoid Mode 6 taking the "long way" around 2π equivalent joints.
-            # previous_qpos_cmd can drift into a different band over many frames.
+            # Canonicalize against physical encoder position to avoid long rotations.
             qpos = self.ik_mgr.canonicalize_qpos(raw_qpos, current_qpos)
             outside, _ = self.ik_mgr.limit_violation(qpos, self.ik_mgr.joint_limits)
             if np.any(outside):
@@ -199,7 +184,6 @@ class TeleopIKSolver:
             hw_dist = float(np.max(np.abs(delta_current)))
             weighted_dist = self.ik_mgr.weighted_joint_distance(qpos, current_qpos, weights, delta=delta_current)
 
-            # Reject a large physical move hidden by equivalent-angle wrapping.
             _hw_band_mismatch = hw_dist_raw - hw_dist
             _hw_band_limit_rad = np.deg2rad(90.0)
             if _hw_band_mismatch > _hw_band_limit_rad:
@@ -208,16 +192,12 @@ class TeleopIKSolver:
                 )
                 continue
 
-            # Reject candidates too far from the measured arm position.
             _hw_limit_rad = np.deg2rad(150.0)
             if hw_dist > _hw_limit_rad:
                 attempts.append(f"{seed_name}:hw_dist({_solve_ms:.1f}ms, {np.rad2deg(hw_dist):.0f}deg)")
                 continue
 
-            # Self-collision gate: reject colliding candidates during ranking
-            # so safe lower-scored alternatives can be selected.  Post-nullspace
-            # collision is still checked in _command_from_target_qpos as
-            # defense-in-depth for the winning candidate.
+            # Rank collision-free candidates and recheck the winner after refinement.
             if profile.check_self_collision:
                 try:
                     candidate_in_collision = self.ik_mgr.has_collision(qpos)
@@ -234,10 +214,7 @@ class TeleopIKSolver:
             if (
                 seed_name == "prev_cmd"
                 and hw_dist <= fast_accept_rad
-                # Fast-accept only when the prev_cmd-basin solution genuinely
-                # tracks the (possibly moved) target; otherwise fall through to
-                # multi-seed scoring so a better-tracking candidate can win.
-                # pos_err/rot_err are already computed above (never a new gate).
+                # Fast-accept only when the previous-command solution tracks target.
                 and pos_err <= 0.5 * profile.max_pose_error_pos_m
                 and rot_err <= 0.5 * profile.max_pose_error_rot_rad
             ):
@@ -353,9 +330,7 @@ class TeleopIKSolver:
         )
         velocity_dist = self.ik_mgr.weighted_joint_distance(qpos, previous_qpos_cmd, vel_weights)
 
-        # Normalize raw Yoshikawa manipulability to the measured posture so the
-        # term is unitless and bounded to [0, 1]; raw mu is posture-dependent
-        # and otherwise too small (weight 0.02) to ever re-rank candidates.
+        # Normalize Yoshikawa manipulability to a unitless [0, 1] score.
         normalized_mu = min(manipulability / max(mu_current, 1e-9), 1.0)
 
         pose_cost = pos_err / max(profile.max_pose_error_pos_m, 1e-6) + profile.position_ik_pose_rot_weight * (
@@ -434,10 +409,7 @@ class TeleopIKSolver:
         """
         attempts = report.get("attempts")
         if attempts is None or isinstance(attempts, str):
-            # Fallback for reports assembled without a structured attempts
-            # list: classify the failure_reason string best-effort, defaulting
-            # to a no-op list so downstream classification degrades to
-            # "unknown" rather than misreading a bare reason string.
+            # Reports without structured attempts degrade to unknown.
             attempts = []
         classification = cls._classify_attempts(list(attempts))
         failure_reason = str(report.get("failure_reason", ""))
@@ -505,8 +477,7 @@ class TeleopIKSolver:
         """Nullspace-optimize, collision-check, and assemble IKResult."""
         qpos_cmd = target_qpos.copy()
 
-        # Null-space joint-limit repulsion. J·dq=0 is only a first-order
-        # property, so the final nonlinear FK is always validated below.
+        # Null-space repulsion preserves EEF pose only to first order; validate FK below.
         if profile.enable_nullspace_optimization:
             try:
                 jacobian, _ = self.kin.compute_eef_jacobian_and_pose_world(qpos_cmd)
@@ -545,14 +516,10 @@ class TeleopIKSolver:
                 cmd_tracking_error_rot_rad=cmd_rot_error,
             )
 
-        # Collision safety gate.
         try:
             collision_reason, collision_extra = self._check_teleop_collision_gate(qpos_cmd, profile)
         except (ValueError, RuntimeError):
-            # CollisionModel._to_full_qpos rejects NaN/Inf qpos with
-            # ValueError.  RuntimeError is raised by _require_collision_model
-            # when CollisionModel is not configured.  Treat both as collision
-            # → hold position rather than crashing the policy process.
+            # Treat invalid qpos or an unavailable collision model as collision.
             logger.warning(
                 "Collision check failed (NaN/Inf qpos likely) — holding position",
                 exc_info=True,
@@ -585,7 +552,6 @@ class TeleopIKSolver:
         return IKResult(success=True, qpos=qpos_cmd, report=result_report)
 
 
-# Null-space optimization helpers
 
 
 def nullspace_projector(J: np.ndarray, rcond: float = 1e-6) -> np.ndarray:
@@ -656,13 +622,7 @@ def apply_nullspace_optimization(
         dq *= step_size_rad / dq_max
 
     qpos_new = qpos + dq
-    # Guard: the rank-1 null-space projector can push a near-limit joint across
-    # its hard limit (dq is clamped only by its max element, never per-joint),
-    # which the post-nullspace limit_violation gate would turn into a false hold
-    # of an otherwise valid candidate. Skip the refinement on those frames
-    # rather than invalidate the candidate. tol matches limit_violation
-    # (ik_candidates.py) so a joint landing within (0, 1e-5) past the limit
-    # cannot slip through this guard only to fail the downstream gate.
+    # Skip refinement if the projected qpos crosses a hard joint limit.
     if np.any(qpos_new < joint_limits[:, 0] - 1e-5) or np.any(qpos_new > joint_limits[:, 1] + 1e-5):
         return qpos
     return qpos_new
