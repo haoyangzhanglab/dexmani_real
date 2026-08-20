@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rerun-based visualizer for schema-v17 DexMani episodes.
+"""Rerun-based visualizer for supported schema-v17/v18 DexMani episodes.
 
 Usage:
   python examples/visualize_episode.py episodes/<task_name>/<episode_dir>
@@ -191,7 +191,7 @@ class EpisodeVisualizer:
                 if meta is not None and "depth_scale" in meta.attrs:
                     depth_scale = float(meta.attrs["depth_scale"])
                 elif "depth" in self._h5f:
-                    raise ValueError("schema-v17 episode is missing /meta depth_scale")
+                    raise ValueError("episode is missing /meta depth_scale")
             self._depth_meter = 1.0 / (depth_scale if depth_scale else 0.001)
             self._depth_scale = depth_scale if depth_scale else 0.001  # meters per raw unit
     
@@ -238,7 +238,7 @@ class EpisodeVisualizer:
                     self._pc_enabled = False
     
             if self._pc_enabled:
-                logger.info("Point cloud derived from depth back-projection + camera_K (schema v17).")
+                logger.info("Point cloud derived from depth back-projection + camera_K.")
     
             self._T = self._resolve_frame_count(max_frames)
             self._C = self._resolve_camera_count()
@@ -511,8 +511,8 @@ class EpisodeVisualizer:
                 "camera/depth", rr.DepthImage(depth, meter=self._depth_meter, depth_range=(0, 10000))
             )  # clamp outliers to stabilize colormap
 
-        # 3D point cloud: derived from depth back-projection (schema v17 has no
-        # pre-computed pointcloud sidecar).
+        # Supported schemas have no precomputed point-cloud sidecar; derive the
+        # 3D points from depth at this consumer boundary.
         if self._pc_enabled and self._pc_K is not None and self._pc_rays is not None:
             if cam_idx not in self._pc_cache:
                 depth = self._depth_cache[cam_idx] if self._depth_cache is not None else self._h5f["depth"][cam_idx]
@@ -613,7 +613,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "episode",
         type=str,
-        help="Path to episodes/<task_name>/episode_* (schema v17).",
+        help="Path to a supported schema-v17/v18 episodes/<task_name>/episode_* directory.",
     )
     parser.add_argument("--max-frames", type=int, default=None, help="Limit number of state frames to load.")
     parser.add_argument(

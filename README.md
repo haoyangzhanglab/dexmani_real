@@ -7,8 +7,8 @@
 | 你要做什么 | 先读/先改 | 相关入口 |
 |---|---|---|
 | 理解项目约束、修改代码 | [`AGENTS.md`](AGENTS.md) → [`CLAUDE.md`](CLAUDE.md) | — |
-| 采集遥操作 episode | `teleop/loop.py`、`teleop/episode_samples.py` | `examples/collect_teleop.py` |
-| 回放或检查 episode | `recording/episode_reader.py`、`examples/replay_episode.py` | `examples/replay_episode.py` |
+| 采集遥操作 episode | `teleop/session.py`、`teleop/loop.py`、`teleop/episode_samples.py` | `examples/collect_teleop.py` |
+| 物理重现 episode | `robot/episode_replay.py`、`recording/episode_reader.py` | `examples/replay_episode.py` |
 | 读取 v17 数据 | `recording/episode_schema.py`、`recording/episode_reader.py` | [`docs/dataset/hdf5_episode.md`](docs/dataset/hdf5_episode.md) |
 | 清洗并生成训练视图/Zarr | `data_processing/` | [`docs/dataset/processed_hdf5.md`](docs/dataset/processed_hdf5.md) |
 | 修改手部 retarget | `teleop/hand_control.py`、`teleop/hand_retarget.py` | [`docs/hand_retargeting.md`](docs/hand_retargeting.md) |
@@ -20,7 +20,7 @@
 正式数据目录与仓库根目录同级组织：
 
 ```text
-episodes/<task_name>/episode_*                 # raw v17
+episodes/<task_name>/episode_*                 # raw v18；reader 兼容 v17
 episodes_processed/<task_name>/episode_*.h5   # 每个 raw 对应一个压紧 HDF5 + processing_index.json
 dataset/<task_name>.zarr                       # dexmani_policy 训练容器
 ```
@@ -63,8 +63,8 @@ camera / VR / arm / hand
 | 遥操作采集 | `python examples/collect_teleop.py --task-name <task>` | 硬件；写入 `episodes/<task>/episode_*` |
 | 键盘控制 | `python examples/keyboard_teleop.py` | 硬件 |
 | learned policy | `python examples/run_policy.py --help` | 离线（仅帮助） |
-| 回放预检 | `python examples/replay_episode.py <episode> --dry-run` | 离线 |
-| 真实回放 | `python examples/replay_episode.py <episode>` | 硬件 |
+| 回放参数 | `python examples/replay_episode.py --help` | 离线（仅帮助） |
+| 物理回放 | `python examples/replay_episode.py <episode>` | 硬件；启动前执行严格 episode/provenance/几何预检 |
 | 数据清洗 | `python examples/process_episodes.py --input-root episodes/<task> --profile rgb_pc --dry-run` | 离线；先审计、不写输出 |
 | 导出 Policy Zarr | `python examples/export_policy_zarr.py --help` | 离线 |
 | 手部调参 | `python examples/tune_hand_retarget.py --help` | 离线 |

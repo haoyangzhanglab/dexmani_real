@@ -31,7 +31,7 @@ class OutputProfile(str, Enum):
     @property
     def dataset_keys(self) -> tuple[str, ...]:
         # These Real-native robot/tactile modalities are available in every
-        # schema-v17 recording and therefore form the processed core.
+        # supported raw episode recording and therefore form the processed core.
         keys = [
             "joint_state",
             "action",

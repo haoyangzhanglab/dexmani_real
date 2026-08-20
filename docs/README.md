@@ -7,6 +7,8 @@
 | 主题 | 文档 | 什么时候读 |
 |---|---|---|
 | 工作约束与任务路由 | [`../AGENTS.md`](../AGENTS.md)、[`../CLAUDE.md`](../CLAUDE.md) | 所有代码修改前 |
+| 代码风格与重构准则 | [`CODE_STYLE.md`](CODE_STYLE.md) | 新建或重构 Python 模块前 |
+| 关键行为护栏 | [`golden_paths.md`](golden_paths.md) | 修改入口、硬件、IPC、录制或部署链路前 |
 | Real episode（写 v18，读 v17+v18） | [`dataset/hdf5_episode.md`](dataset/hdf5_episode.md) | writer、reader、replay、数据读取 |
 | Real 清洗输出与 Policy Zarr | [`dataset/processed_hdf5.md`](dataset/processed_hdf5.md) | 生成训练视图、改质量规则或核对 Zarr 合同 |
 | Real → Sim label 边界 | [`dataset/real_to_sim_mapping.md`](dataset/real_to_sim_mapping.md) | 设计字段映射，避免伪造等价关系 |
@@ -20,6 +22,7 @@
 
 | 主题 | 文档 | 状态 |
 |---|---|---|
+| 全仓分阶段迁移与简化 | [`dexmani_real 分阶段迁移与简化指南.md`](dexmani_real%20分阶段迁移与简化指南.md) | Phase 0 与第一批薄入口已实施；其余目录经依赖审计后暂不机械合并 |
 | XArm7 arm 栈化简迁移计划 | [`Dexmani XArm7 大幅化简迁移操作指南.md`](Dexmani%20XArm7%20大幅化简迁移操作指南.md) | 第一轮（阶段 1–4）已实施，见文末执行记录 |
 | XArm7 化简迁移对账（指南 vs 代码审计） | [`XArm7 化简迁移对账.html`](XArm7%20化简迁移对账.html) | 2026-08-19 审计快照，含实施进展区块 |
 | XHand 简化重构执行指南 | [`xhand_simplification_execution_guide.md`](xhand_simplification_execution_guide.md) | 手部工作线计划 |

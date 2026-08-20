@@ -1,10 +1,10 @@
-"""Pure schema-v17 contracts shared by episode writers and readers.
+"""Pure schema-v17/v18 contracts shared by episode writers and readers.
 
-The HDF5 data file has 93 unconditional per-grid datasets.  The exact command
-actually submitted to the arm worker is a 94th, conditional dataset controlled
-by the ``arm_sent_stream`` metadata marker.  Unknown datasets are tolerated by
-the reader for historical diagnostic extensions, but they must remain aligned
-to the episode grid.
+The v17 HDF5 data file has 93 unconditional per-grid datasets; v18 drops three
+retired arm-worker latency fields. The exact command submitted to the arm
+worker is a conditional dataset controlled by the ``arm_sent_stream`` metadata
+marker. Unknown datasets are tolerated for historical diagnostic extensions,
+but they must remain aligned to the episode grid.
 """
 
 from __future__ import annotations
@@ -57,9 +57,9 @@ def _spec(dtype: Any, tail_shape: tuple[int, ...] = ()) -> DatasetSpec:
     return DatasetSpec(tail_shape=tail_shape, dtype=np.dtype(dtype))
 
 
-# The 96 fields that every schema-v17 data.h5 produced by EpisodeRecorder has.
-# Keep the grouping aligned with the public data dictionary and writer data
-# construction so a review can compare each producer category directly.
+# Superset field specifications anchored to v17. ``required_dataset_names``
+# selects the v17 or v18 required subset. Keep the grouping aligned with the
+# writer data construction so reviewers can compare producer and contract.
 BASE_DATASET_SPECS_V17: dict[str, DatasetSpec] = {
     # Fixed control grid and causal fill.
     "timestamp": _spec(np.float64),
@@ -250,7 +250,7 @@ def validate_source_frame_keys_v17(
 def normalize_diagnostics_v17(
     diagnostics: Mapping[str, Any] | None,
 ) -> dict[str, np.ndarray]:
-    """Validate and normalize the fixed schema-v17 diagnostic override set."""
+    """Validate the diagnostic override set shared by schema v17 and v18."""
 
     if not diagnostics:
         return {}
@@ -268,7 +268,7 @@ def normalize_diagnostics_v17(
             details.append(f"reserved dataset collisions={reserved}")
         if unknown:
             details.append(f"unsupported keys={unknown}")
-        raise ValueError("schema-v17 diagnostics rejected: " + "; ".join(details))
+        raise ValueError("episode diagnostics rejected: " + "; ".join(details))
 
     normalized: dict[str, np.ndarray] = {}
     for name in sorted(keys):
@@ -276,12 +276,12 @@ def normalize_diagnostics_v17(
             value = np.asarray(diagnostics[name], dtype=np.float64)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"schema-v17 diagnostic {name!r} must be float64-compatible"
+                f"episode diagnostic {name!r} must be float64-compatible"
             ) from exc
         expected_shape = DIAGNOSTIC_TAIL_SHAPES_V17[name]
         if value.shape != expected_shape:
             raise ValueError(
-                f"schema-v17 diagnostic {name!r} has shape {value.shape}, expected {expected_shape}"
+                f"episode diagnostic {name!r} has shape {value.shape}, expected {expected_shape}"
             )
         normalized[name] = value
     return normalized

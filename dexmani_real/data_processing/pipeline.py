@@ -1,4 +1,4 @@
-"""Transactional one-episode-to-one-HDF5 processing for Real schema v17."""
+"""Transactional one-episode-to-one-HDF5 processing for Real schema v17/v18."""
 
 from __future__ import annotations
 

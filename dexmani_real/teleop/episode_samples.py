@@ -426,7 +426,7 @@ def _build_robot_state(
     Reads arm_state_ring + hand_state_ring + hand_tactile_ring and assembles
     a complete RobotState.  Computes arm-base-frame fingertip positions via the
     hand FK chain.  The standard runtime defines robot world == arm base, so this
-    preserves the schema-v17 numeric convention without an extra transform.
+    preserves the supported episode numeric convention without an extra transform.
 
     Hand hardware/error flags are forwarded to RobotState for recording.
     ``qpos_stale`` is set when the most recent single-frame read failed and the

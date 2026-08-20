@@ -1,4 +1,4 @@
-"""Compact one task's schema-v17 episodes into one HDF5 per source.
+"""Compact one task's supported schema-v17/v18 episodes into one HDF5 per source.
 
 Usage:
     python examples/process_episodes.py \

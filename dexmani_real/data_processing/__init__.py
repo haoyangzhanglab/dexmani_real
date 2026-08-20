@@ -1,4 +1,4 @@
-"""Offline cleaning and Real-native policy views for schema-v17 episodes."""
+"""Offline cleaning and Real-native policy views for supported Real episodes."""
 
 from dexmani_real.data_processing.contracts import (
     BridgePolicy,

@@ -20,7 +20,7 @@ episodes/
         └── rgb.mp4     # 与控制网格对齐的 RGB 侧车
 ```
 
-`examples/collect_teleop.py` 中 `TASK_NAME="test"` 是默认值，CLI
+`teleop/session.py` 中 `DEFAULT_TASK_NAME="test"` 是默认值，CLI
 `--task-name` 可覆盖。目录名与 `/meta.task_label` 使用同一个已校验值；task name
 不能包含路径分隔符。旧版本产生的 `episodes/episode_*` 平铺数据保持只读，不会被
 自动移动或改写。

@@ -610,7 +610,7 @@ class EpisodeRecorder:
             "transition_check_time_ms": np.nan,
             "policy_compute_time_ms": np.nan,
         }
-        # ── Conditional sent-command stream (schema v17) ──
+        # ── Conditional sent-command stream ──
         # None (kwarg unset) → NaN placeholder for this source sample; causal
         # alignment may only hold it into later slots, never backward-fill an
         # earlier slot. Gated on the constructor flag so
@@ -624,12 +624,14 @@ class EpisodeRecorder:
             data[ARM_SENT_DATASET] = sent
 
         # Diagnostics are fixed-schema value overrides, never an extension
-        # mechanism. ``normalize_diagnostics_v17`` rejects unknown keys,
+        # mechanism. The shared v17/v18 normalizer rejects unknown keys,
         # reserved-field collisions, and incorrect tail shapes.
         data.update(diagnostic_values)
         source_layout_errors = validate_source_frame_keys_v17(set(data), arm_sent_stream=self.arm_sent_stream)
         if source_layout_errors:
-            raise RuntimeError("schema-v17 source frame mismatch: " + "; ".join(source_layout_errors))
+            raise RuntimeError(
+                "episode source frame mismatch: " + "; ".join(source_layout_errors)
+            )
 
         add_result = self._buffer.add(data, timestamp=ts)
         if add_result.source_written:
@@ -759,7 +761,7 @@ class EpisodeRecorder:
 
         # Validate the complete in-memory schema before creating or extending
         # any HDF5 dataset. Timestamp is stored outside ``buf_data`` but belongs
-        # to the same schema-v17 field contract.
+        # to the same version-selected episode field contract.
         buffer_shapes = {name: tuple(values.shape) for name, values in buf_data.items()}
         buffer_dtypes = {name: values.dtype for name, values in buf_data.items()}
         buffer_shapes["timestamp"] = tuple(self._buffer.timestamps.shape)
@@ -771,7 +773,9 @@ class EpisodeRecorder:
             arm_sent_stream=self.arm_sent_stream,
         )
         if layout_errors:
-            raise RuntimeError("schema-v17 recorder buffer mismatch: " + "; ".join(layout_errors))
+            raise RuntimeError(
+                "episode recorder buffer mismatch: " + "; ".join(layout_errors)
+            )
 
         for h5_key, arr in buf_data.items():
             if h5_key not in self._datasets:
@@ -1148,7 +1152,9 @@ class EpisodeRecorder:
                 arm_sent_stream=bool(meta.attrs.get(ARM_SENT_MARKER, False)),
             )
             if layout_errors:
-                raise RuntimeError("data.h5 schema-v17 layout mismatch: " + "; ".join(layout_errors))
+                raise RuntimeError(
+                    "data.h5 episode layout mismatch: " + "; ".join(layout_errors)
+                )
         for key in ("depth",):
             with h5py.File(paths[key], "r") as sidecar:
                 if key not in sidecar or int(sidecar[key].shape[0]) != expected_frames:

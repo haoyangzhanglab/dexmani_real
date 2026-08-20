@@ -1,4 +1,4 @@
-"""Pure one-source-to-one-artifact cleaning decisions for schema-v17 episodes."""
+"""Pure one-source-to-one-artifact cleaning decisions for supported Real episodes."""
 
 from __future__ import annotations
 

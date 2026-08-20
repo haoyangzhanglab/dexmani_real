@@ -471,11 +471,10 @@ WorkerSpec(
 需要搜索并修改（2026-08-19 审计确认的完整调用点）：
 
 ```text
-dexmani_real/deployment/lifecycle.py      (:82)
-
-examples/collect_teleop.py                (:333)
-examples/keyboard_teleop.py               (:219)
-examples/replay_episode.py                (:1568)
+dexmani_real/deployment/lifecycle.py
+dexmani_real/teleop/session.py
+dexmani_real/teleop/keyboard_session.py
+dexmani_real/robot/episode_replay.py
 ```
 
 ## A4. 删除 `startup_failure_is_fatal`
@@ -509,7 +508,7 @@ dependency patch
 
 不要为了测试在 production control path 中长期保留双行为分支。
 
-审计确认：`startup_failure_is_fatal` 在 `hand_loop` 内有四处使用（:250/:286/:297/:344），唯一显式传参在 `examples/keyboard_teleop.py:219`。删除后四处分支统一为 fail-closed 路径。
+审计确认：`startup_failure_is_fatal` 在 `hand_loop` 内有四处使用；唯一显式传参原位于 keyboard teleop 会话。删除后四处分支统一为 fail-closed 路径。
 
 ---
 
@@ -1510,7 +1509,7 @@ not state_valid
 
 替代。
 
-但是当前 schema-v17 保存的是：
+但是当前受支持的 schema v17/v18 保存的是：
 
 ```text
 hand_qpos_stale
