@@ -17,7 +17,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real import ASSET_DIR
 from dexmani_real.deployment.config import DeploymentConfig
 from dexmani_real.deployment.metrics import (
     COMMAND_SILENCE_ABORT,
@@ -32,6 +31,10 @@ from dexmani_real.deployment.metrics import (
     reject_counter_name,
 )
 from dexmani_real.planning import XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.planning.constants import (
+    XARM7_XHAND_COLLISION_URDF_PATH,
+    XARM7_XHAND_SRDF_PATH,
+)
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.policy.safety import (
     CommandPublishStatus,
@@ -188,8 +191,8 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     # publish so a planner failure fails closed at readiness rather than mid-run.
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(
-            urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf"),
-            srdf_path=str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf"),
+            urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
+            srdf_path=str(XARM7_XHAND_SRDF_PATH),
             workspace_bounds=np.asarray(config.workspace_bounds, dtype=np.float64),
         ),
     )

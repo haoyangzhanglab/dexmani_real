@@ -11,13 +11,16 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real import ASSET_DIR
 from dexmani_real.planning import (
     PlanningProfile,
     Pose,
     TeleopProfile,
     XArm7MotionPlanner,
     XArm7PlannerConfig,
+)
+from dexmani_real.planning.constants import (
+    XARM7_XHAND_COLLISION_URDF_PATH,
+    XARM7_XHAND_SRDF_PATH,
 )
 from dexmani_real.planning.hand_kinematics import HandKinematics
 from dexmani_real.planning.kinematics import make_arm_fk
@@ -34,9 +37,17 @@ from dexmani_real.policy.safety import (
     validate_and_send_candidate,
 )
 from dexmani_real.recording.recorder_client import RecorderClient, RecorderPhase
+from dexmani_real.shm.causal_reader import (
+    read_arm_state_causal,
+    read_camera_frame_causal,
+    read_hand_state_causal,
+    read_hand_tactile_causal,
+    read_vr_frame_causal,
+)
 from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.audio_feedback import AudioFeedback, update_motion_gate
+from dexmani_real.teleop.camera_freshness import CameraFreshnessTracker
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.control_state import CommandQuiescence
 from dexmani_real.teleop.episode_samples import (
@@ -72,14 +83,6 @@ from dexmani_real.teleop.safety import (
     _do_configured_teleop_home,
     _reset_mapper_from_frames,
 )
-from dexmani_real.teleop.snapshot import (
-    CameraFreshnessTracker,
-    _read_arm_state,
-    _read_camera_frame,
-    _read_hand_state,
-    _read_hand_tactile,
-    _read_vr_frame,
-)
 from dexmani_real.teleop.vr_transform import load_vr_transform
 from dexmani_real.utils.hand_health import (
     validate_arm_feedback,
@@ -95,12 +98,6 @@ _END_AUDIO_GRACE_S = 2.0
 _NS_PER_SECOND = 1_000_000_000
 _VALIDATION_WARN_INTERVAL_S = 2.0
 _ARM_FEEDBACK_WARN_INTERVAL_S = 3.0
-
-
-def _load_vr_transform(path: Path) -> tuple[np.ndarray, str]:
-    """Compatibility wrapper around the shared schema-v1 calibration loader."""
-    calibration = load_vr_transform(path)
-    return calibration.transform, f"{calibration.theta_deg:.6g}"
 
 
 def _build_safety_gate(config: TeleopConfig, planner: XArm7MotionPlanner) -> SafetyGate:
@@ -177,25 +174,6 @@ def _start_keyboard(shared: SharedStorage) -> KeyboardHandler | None:
         shared.error_state.value = True
         return None
     return keyboard
-
-
-def _transition_or_fault_impl(
-    shared: SharedStorage,
-    transition: Any,
-    new_state: Any,
-    reason: str,
-) -> bool:
-    if transition(shared, new_state):
-        return True
-    logger.error(
-        "teleop_loop: safety transition to %s failed during %s", new_state.name, reason
-    )
-    shared.error_state.value = True
-    return False
-
-
-def _keyboard_estop_requested_impl(kb: KeyboardHandler) -> bool:
-    return kb.estop_latched or not kb.healthy
 
 
 def _hand_feedback_issue_impl(
@@ -285,7 +263,7 @@ def _init_and_seed_hand_retargeter_impl(
         return None
     if not _try_init_hand_retargeter_impl(ctx, cfg):
         return None
-    hs = _read_hand_state(shared)
+    hs = read_hand_state_causal(shared)
     qpos = (
         hs["qpos"][0]
         if _hand_feedback_issue_impl(cfg, hs) is None and hs is not None
@@ -351,16 +329,6 @@ def _enter_command_quiescence_impl(
     ctx.hand_retarget_cache.reset()
 
 
-def _handoff_command_quiescence_to_home_impl(quiescence: CommandQuiescence) -> None:
-    """Let the homing protocol supersede command quiescence."""
-    reason, _entered_ns = quiescence.clear()
-    if reason is not None:
-        logger.info(
-            "teleop_loop: homing supersedes %s command quiescence",
-            reason,
-        )
-
-
 def _complete_reanchor_impl(
     ctx: TeleopLoopState,
     arm_mapper: ArmWristMapper,
@@ -411,7 +379,15 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     ctx = TeleopLoopState()
 
     def _transition_or_fault(new_state: SafetyState, reason: str) -> bool:
-        return _transition_or_fault_impl(shared, transition, new_state, reason)
+        if transition(shared, new_state):
+            return True
+        logger.error(
+            "teleop_loop: safety transition to %s failed during %s",
+            new_state.name,
+            reason,
+        )
+        shared.error_state.value = True
+        return False
 
     logger.debug("teleop_loop: LOADING")
     ctrl_dt = 1.0 / cfg.runtime.policy.control_hz
@@ -439,12 +415,10 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     )
 
     try:
-        urdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
-        srdf_path = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf")
         planner = XArm7MotionPlanner(
             XArm7PlannerConfig(
-                urdf_path=urdf_path,
-                srdf_path=srdf_path,
+                urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
+                srdf_path=str(XARM7_XHAND_SRDF_PATH),
                 base_pose_world=Pose(
                     p=np.array([0.0, 0.0, 0.0]),
                     q=np.array([1.0, 0.0, 0.0, 0.0]),
@@ -466,8 +440,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         )
 
         vr_config_path = Path(__file__).resolve().parents[2] / cfg.vr_transform_path
-        vr_to_robot, vr_heading_deg = _load_vr_transform(vr_config_path)
-        logger.info("VR transform loaded: theta=%s°", vr_heading_deg)
+        vr_calibration = load_vr_transform(vr_config_path)
+        vr_to_robot = vr_calibration.transform
+        logger.info("VR transform loaded: theta=%.6g°", vr_calibration.theta_deg)
 
         arm_mapper = ArmWristMapper(
             pos_scale=cfg.runtime.policy.vr_mapping.pos_scale,
@@ -490,7 +465,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         return
 
     def _keyboard_estop_requested() -> bool:
-        return _keyboard_estop_requested_impl(kb)
+        return kb.estop_latched or not kb.healthy
 
     audio = AudioFeedback()
 
@@ -550,7 +525,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             "Hand explicitly disabled — using the configured fixed-home collision assumption"
         )
     else:
-        _init_hand_state = _read_hand_state(shared)
+        _init_hand_state = read_hand_state_causal(shared)
         initial_hand_issue = _hand_feedback_issue(_init_hand_state)
         if initial_hand_issue is not None:
             logger.error(
@@ -572,8 +547,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     logger.debug("teleop_loop: READY")
 
     home_qpos = np.array(cfg.runtime.arm.home_qpos, dtype=np.float64)
-    arm_state = _read_arm_state(shared)
-    hand_state = _read_hand_state(shared)
+    arm_state = read_arm_state_causal(shared)
+    hand_state = read_hand_state_causal(shared)
     if arm_state is None:
         arm_qpos = home_qpos.copy()
     else:
@@ -638,7 +613,12 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         )
 
     def _handoff_command_quiescence_to_home() -> None:
-        _handoff_command_quiescence_to_home_impl(_quiescence)
+        reason, _entered_ns = _quiescence.clear()
+        if reason is not None:
+            logger.info(
+                "teleop_loop: homing supersedes %s command quiescence",
+                reason,
+            )
 
     def _complete_reanchor(
         current_arm_state: np.ndarray,
@@ -1043,13 +1023,13 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                         )
                         skip_rest = True
                         continue
-                    vr_frame = _read_vr_frame(shared)
+                    vr_frame = read_vr_frame_causal(shared)
                     if vr_frame is None:
                         print("\nB: 无 VR 帧，无法开始遥操作")
                         skip_rest = True
                         continue
                     begin_hand_state = (
-                        _read_hand_state(shared)
+                        read_hand_state_causal(shared)
                         if cfg.runtime.policy.hand_enabled
                         else None
                     )
@@ -1128,7 +1108,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             if not _grid_due:
                 continue
 
-            arm_state = _read_arm_state(
+            arm_state = read_arm_state_causal(
                 shared, anchor_monotonic_ns=_current_grid_anchor_ns
             )
             arm_issue = _arm_feedback_issue(
@@ -1158,7 +1138,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             assert arm_state is not None  # validation above proved availability
             arm_qpos = arm_state["qpos"][0].copy()
 
-            vr_frame = _read_vr_frame(
+            vr_frame = read_vr_frame_causal(
                 shared, anchor_monotonic_ns=_current_grid_anchor_ns
             )
             vr_stale = vr_frame is None or (
@@ -1170,7 +1150,9 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             # VR control does not consume camera pixels.  Scan/copy the large
             # payload only while the policy-owned recorder requests it.
             cam = (
-                _read_camera_frame(shared, anchor_monotonic_ns=_current_grid_anchor_ns)
+                read_camera_frame_causal(
+                    shared, anchor_monotonic_ns=_current_grid_anchor_ns
+                )
                 if recording_active
                 else None
             )
@@ -1192,10 +1174,10 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     recording_active = False
             stage_timer.mark("cam")
 
-            hand_state = _read_hand_state(
+            hand_state = read_hand_state_causal(
                 shared, anchor_monotonic_ns=_current_grid_anchor_ns
             )
-            hand_tactile = _read_hand_tactile(
+            hand_tactile = read_hand_tactile_causal(
                 shared, anchor_monotonic_ns=_current_grid_anchor_ns
             )
 

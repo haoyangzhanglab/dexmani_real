@@ -26,11 +26,16 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from dexmani_real import ASSET_DIR
 from dexmani_real.config.defaults import hand
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_DOF
-from dexmani_real.planning.constants import HAND_SDK_TO_URDF_IDX
+from dexmani_real.planning.constants import (
+    HAND_SDK_TO_URDF_IDX,
+    XARM7_XHAND_COLLISION_URDF_PATH,
+    XARM7_XHAND_RIGHT_URDF_PATH,
+    XARM7_XHAND_SRDF_PATH,
+    XHAND_MODEL_DIR,
+)
 from dexmani_real.utils.log import ThrottledWarner, get_logger
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_DOF
 
 if TYPE_CHECKING:
     from .types import CollisionInfo
@@ -45,10 +50,9 @@ _warn_hand_qpos_unset = ThrottledWarner(interval_s=30.0)  # warn every 30s if ha
 _collision_detail_warn = ThrottledWarner(interval_s=60.0)
 
 # Collision model assets.
-_XHAND_DIR = ASSET_DIR / "robots" / "xhand"
-_COLLISION_URDF = str(_XHAND_DIR / "xarm7_xhand_collision.urdf")  # 7-DOF (hand fixed)
-_FULL_URDF = str(_XHAND_DIR / "xarm7_xhand_right.urdf")  # 19-DOF (7 arm + 12 hand)
-_COLLISION_SRDF = str(_XHAND_DIR / "xarm7_xhand.srdf")  # unified SRDF (single source)
+_COLLISION_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)  # 7-DOF (hand fixed)
+_FULL_URDF = str(XARM7_XHAND_RIGHT_URDF_PATH)  # 19-DOF (7 arm + 12 hand)
+_COLLISION_SRDF = str(XARM7_XHAND_SRDF_PATH)  # unified SRDF (single source)
 
 _HAND_DOF_COUNT = HAND_DOF
 
@@ -95,7 +99,7 @@ class CollisionModel:
         self._pin = pin
         self._hand_dof = hand_dof
 
-        pkg = package_dir or str(_XHAND_DIR)
+        pkg = package_dir or str(XHAND_MODEL_DIR)
         _urdf = urdf_path or (_FULL_URDF if hand_dof else _COLLISION_URDF)
         _srdf = srdf_path or _COLLISION_SRDF
 

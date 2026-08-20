@@ -29,13 +29,17 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real import ASSET_DIR
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
 from dexmani_real.planning import (
     Pose,
     TeleopProfile,
     XArm7MotionPlanner,
     XArm7PlannerConfig,
+)
+from dexmani_real.planning.constants import (
+    XARM7_XHAND_COLLISION_URDF_PATH,
+    XARM7_XHAND_RIGHT_URDF_PATH,
+    XARM7_XHAND_SRDF_PATH,
 )
 from dexmani_real.planning.kinematics import make_arm_fk
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
@@ -111,11 +115,10 @@ def _is_sha256(value: str | None) -> bool:
 
 def preflight_model_paths() -> tuple[Path, ...]:
     """Return the three URDF/SRDF model paths used for geometry provenance checks."""
-    model_dir = ASSET_DIR / "robots" / "xhand"
     return (
-        model_dir / "xarm7_xhand_collision.urdf",
-        model_dir / "xarm7_xhand_right.urdf",
-        model_dir / "xarm7_xhand.srdf",
+        XARM7_XHAND_COLLISION_URDF_PATH,
+        XARM7_XHAND_RIGHT_URDF_PATH,
+        XARM7_XHAND_SRDF_PATH,
     )
 
 
@@ -770,11 +773,10 @@ def verify_replay_preflight(
         ],
         dtype=np.float64,
     )
-    model_dir = ASSET_DIR / "robots" / "xhand"
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(
-            urdf_path=str(model_dir / "xarm7_xhand_collision.urdf"),
-            srdf_path=str(model_dir / "xarm7_xhand.srdf"),
+            urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
+            srdf_path=str(XARM7_XHAND_SRDF_PATH),
             base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
             workspace_bounds=workspace,
         ),
@@ -922,11 +924,10 @@ class EpisodeReplayer:
             ],
             dtype=np.float64,
         )
-        model_dir = ASSET_DIR / "robots" / "xhand"
         self._planner = XArm7MotionPlanner(
             XArm7PlannerConfig(
-                urdf_path=str(model_dir / "xarm7_xhand_collision.urdf"),
-                srdf_path=str(model_dir / "xarm7_xhand.srdf"),
+                urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
+                srdf_path=str(XARM7_XHAND_SRDF_PATH),
                 base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
                 workspace_bounds=workspace,
             ),

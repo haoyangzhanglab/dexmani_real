@@ -16,8 +16,13 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real import ASSET_DIR
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
+from dexmani_real.planning.constants import (
+    XARM7_XHAND_COLLISION_URDF_PATH,
+    XARM7_XHAND_RIGHT_URDF_PATH,
+    XARM7_XHAND_SRDF_PATH,
+    XHAND_RIGHT_URDF_PATH,
+)
 from dexmani_real.policy.safety import publish_hand_home_and_wait_applied
 from dexmani_real.recording.io_process import RecorderIOConfig, recorder_io_loop
 from dexmani_real.recording.recorder_client import RecorderPhase
@@ -77,15 +82,9 @@ def validate_task_name(value: str) -> str:
 def _resource_provenance(repo_root: Path) -> tuple[tuple[str, str], ...]:
     """Hash static planning/calibration resources without importing a device SDK."""
     resources = {
-        "arm_hand_collision_urdf_sha256": ASSET_DIR
-        / "robots"
-        / "xhand"
-        / "xarm7_xhand_collision.urdf",
-        "arm_hand_urdf_sha256": ASSET_DIR
-        / "robots"
-        / "xhand"
-        / "xarm7_xhand_right.urdf",
-        "arm_hand_srdf_sha256": ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf",
+        "arm_hand_collision_urdf_sha256": XARM7_XHAND_COLLISION_URDF_PATH,
+        "arm_hand_urdf_sha256": XARM7_XHAND_RIGHT_URDF_PATH,
+        "arm_hand_srdf_sha256": XARM7_XHAND_SRDF_PATH,
         "camera_calibration_sha256": repo_root
         / "dexmani_real"
         / "config"
@@ -281,7 +280,7 @@ def _build_processes(
         runtime,
         task_label=task_name,
         operator=operator,
-        hand_urdf_path=str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"),
+        hand_urdf_path=str(XHAND_RIGHT_URDF_PATH),
     )
     # Readiness order is the single source of truth for build order and for the
     # readiness/heartbeat names derived from it (arm → vr → policy → camera →

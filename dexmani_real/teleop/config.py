@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from dexmani_real import ASSET_DIR
 from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
+from dexmani_real.planning.constants import XHAND_RIGHT_URDF_PATH
 
 
 @dataclass(frozen=True)
@@ -20,7 +20,7 @@ class TeleopConfig:
     runtime: ResolvedRuntimeConfig = field(default_factory=resolve_runtime_config)
     task_label: str = ""
     operator: str = ""
-    hand_urdf_path: str = field(default_factory=lambda: str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf"))
+    hand_urdf_path: str = field(default_factory=lambda: str(XHAND_RIGHT_URDF_PATH))
     vr_transform_path: str = "dexmani_real/config/vr_transform.json"
 
     def __post_init__(self) -> None:
@@ -41,6 +41,8 @@ class TeleopConfig:
             task_label=task_label,
             operator=operator,
             hand_urdf_path=(
-                str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf") if hand_urdf_path is None else hand_urdf_path
+                str(XHAND_RIGHT_URDF_PATH)
+                if hand_urdf_path is None
+                else hand_urdf_path
             ),
         )

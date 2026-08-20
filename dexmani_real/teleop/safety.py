@@ -14,11 +14,11 @@ from dexmani_real.planning.kinematics import make_arm_fk
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.policy.safety import publish_hand_home_and_wait_applied
 from dexmani_real.robot.homing import send_arm_home
+from dexmani_real.shm.causal_reader import read_arm_state_causal
 from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.hand_control import _reset_hand_retargeter
-from dexmani_real.teleop.snapshot import _read_arm_state
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -162,7 +162,7 @@ def _do_teleop_home(
     # Step 2: arm home (collision-checked path). Planning uses configured
     # hand-home geometry by explicit operator policy; it does not wait for or
     # substitute measured hand convergence.
-    _arm_state = _read_arm_state(shared)
+    _arm_state = read_arm_state_causal(shared)
     if _arm_state is None:
         logger.warning("arm home cancelled: no current arm state")
         return prev_hand_qpos

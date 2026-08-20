@@ -5,12 +5,12 @@ Subsystems:
     teleop/       — VR teleoperation (mapping, retargeting, control loop)
     planning/     — FK/IK, kinematics, collision and path planning
     policy/       — Action protocol and safety validation
-    recording/    — HDF5 episode recording and offline readers
+    recording/    — Episode recording, offline readers, and visualization
     deployment/   — Learned-policy deployment runtime
     integrations/ — Model-repository adapters
     runtime/      — Process lifecycle, supervision, shutdown
     shm/          — Shared-memory data plane (rings, queues, storage)
-    sensor/       — RealSense camera, VR receiver, point-cloud processing
+    sensor/       — Camera/VR input, point-cloud processing, calibration, diagnostics
     config/       — Defaults, runtime snapshot, calibration
     utils/        — Shared utilities (schema, limits, logging, arrays)
 """

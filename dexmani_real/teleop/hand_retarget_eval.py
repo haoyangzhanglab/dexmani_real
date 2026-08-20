@@ -16,18 +16,18 @@ from typing import Any, Iterable
 import numpy as np
 from scipy.stats import spearmanr
 
-from dexmani_real import ASSET_DIR
 from dexmani_real.config.defaults import (
     DexPilotRetargetingParams,
     TAGRetargetingParams,
     hand,
 )
+from dexmani_real.planning.constants import XHAND_RIGHT_URDF_PATH
 from dexmani_real.planning.hand_kinematics import HandKinematics
 from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.teleop.hand_retarget import TAGHandRetargeter, XHandRetargeter
 from dexmani_real.utils.schema import HAND_JOINT_SHAPE, XHAND_SDK_JOINT_NAMES
 
-_HAND_URDF_PATH = str(ASSET_DIR / "robots" / "xhand" / "xhand_right.urdf")
+_HAND_URDF_PATH = str(XHAND_RIGHT_URDF_PATH)
 _CHAINS = (
     (0, 1, 2, 3, 4),
     (0, 5, 6, 7, 8),

@@ -1,12 +1,23 @@
-"""Shared constants for the planning module.
+"""Canonical robot-model resources and joint mappings used by planning.
 
-Constants that are used by multiple planning submodules live here
-to avoid duplication and ensure a single source of truth.
+The resource paths are also consumed by lifecycle and provenance code. Keeping
+them here ensures that planning, replay, deployment, and recording hash the
+same static models.
 """
 
 from __future__ import annotations
 
+from dexmani_real import ASSET_DIR
 from dexmani_real.utils.schema import XHAND_SDK_JOINT_NAMES
+
+XHAND_MODEL_DIR = ASSET_DIR / "robots" / "xhand"
+# Arm planning model with the hand geometry fixed in its open/home posture.
+XARM7_XHAND_COLLISION_URDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand_collision.urdf"
+# Full 19-DOF model: seven arm joints followed by twelve right-hand joints.
+XARM7_XHAND_RIGHT_URDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand_right.urdf"
+XARM7_XHAND_SRDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand.srdf"
+# Standalone 12-DOF right-hand model used by hand retargeting/kinematics.
+XHAND_RIGHT_URDF_PATH = XHAND_MODEL_DIR / "xhand_right.urdf"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Hand joint order remap: XHand SDK → URDF / Pinocchio

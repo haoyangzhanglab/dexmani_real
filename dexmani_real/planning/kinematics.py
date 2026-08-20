@@ -12,13 +12,13 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real import ASSET_DIR
+from dexmani_real.planning.constants import XARM7_XHAND_COLLISION_URDF_PATH
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
 from .pose_utils import compose_pose, compute_pose_error, invert_pose, quat_wxyz_to_rotmat
 from .types import Pose
 
-_ARM_FK_URDF = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
+_ARM_FK_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)
 
 
 @lru_cache(maxsize=1)

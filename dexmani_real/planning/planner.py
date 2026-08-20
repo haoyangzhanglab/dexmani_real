@@ -16,6 +16,7 @@ logger = get_logger(__name__)
 _warn_hand_qpos_unset_teleop = ThrottledWarner(interval_s=30.0)
 
 from .collision_model import CollisionModel
+from .constants import XARM7_XHAND_COLLISION_URDF_PATH, XARM7_XHAND_SRDF_PATH
 from .ik import TeleopIKSolver
 from .ik_candidates import IKCandidateManager, is_mplib_success
 from .kinematics import XArm7Kinematics
@@ -170,14 +171,9 @@ class XArm7MotionPlanner:
         *planning_profile* / *teleop_profile* to match their use case (teleop
         tolerances are intentionally looser than the dataclass defaults).
         """
-        from pathlib import Path
-
-        _ASSET_DIR = Path(__file__).parent.parent.parent / "assets"
-        urdf_path = str(_ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
-        srdf_path = str(_ASSET_DIR / "robots" / "xhand" / "xarm7_xhand.srdf")
         cfg = XArm7PlannerConfig(
-            urdf_path=urdf_path,
-            srdf_path=srdf_path,
+            urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
+            srdf_path=str(XARM7_XHAND_SRDF_PATH),
             base_pose_world=Pose(
                 p=np.array([0.0, 0.0, 0.0]),
                 q=np.array([1.0, 0.0, 0.0, 0.0]),

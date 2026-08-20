@@ -70,6 +70,8 @@ camera / VR / arm / hand
 | 手部调参 | `python examples/tune_hand_retarget.py --help` | 离线 |
 | episode 可视化 | `python examples/visualize_episode.py <episode>` | 离线/GUI |
 | 相机标定 | `python examples/calibrate_camera.py` | 硬件/写标定文件 |
+| RealSense RGB-D 诊断 | `python examples/realsense_record_example.py` | 硬件/GUI |
+| 点云与桌面平面诊断 | `python examples/pointcloud_process_example.py` | 硬件/GUI；确认后写标定文件 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 设备/写标定文件 |
 
 ## 环境与验证
@@ -94,13 +96,13 @@ git diff --check
 |---|---|
 | `config/` | 默认值、运行时配置、相机标定读取 |
 | `shm/` | 共享内存、ring、queue 和 seqlock 读取 |
-| `sensor/` | RealSense、VR 和点云输入 |
+| `sensor/` | RealSense、VR、点云输入，以及相机标定/诊断领域实现 |
 | `robot/` | xArm/XHand worker、SDK、反馈和回零 |
 | `planning/` | FK、IK、碰撞和路径 |
 | `teleop/` | VR 映射、retarget、动作与采样决策 |
 | `policy/` | action candidate 与统一安全门 |
 | `deployment/` | learned-policy 推理和动作协调 |
-| `recording/` | v17 episode 写入、读取和相机 sidecar |
+| `recording/` | v18 episode 写入、v17/v18 读取、相机 sidecar 和离线可视化 |
 | `data_processing/` | v17 → real-domain 离线视图，以及 processed HDF5 → Policy Zarr |
 | `examples/` | 薄 CLI/实验入口，不承载通用合同 |
 
