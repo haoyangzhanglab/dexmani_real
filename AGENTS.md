@@ -1,278 +1,182 @@
 # AGENTS.md — DexMani Real Agent Contract
 
-This file defines the repository-wide working contract for coding agents.
+This is the repository-wide contract for coding agents. It applies everywhere
+unless a deeper `AGENTS.md` explicitly overrides it.
 
-It applies to the repository unless a more specific `AGENTS.md` exists deeper in the tree.
+Keep this file stable. It defines how to work in the repository, not the
+current module inventory or a snapshot of runtime parameters.
 
-Keep this document stable. It defines **how agents should modify the repository**, not a snapshot of the current implementation.
+## 1. Authority and document ownership
 
-Current implementation details belong in source code, configuration, README, and focused documents under `docs/`.
-
-## 1. Source of Truth
-
-When information conflicts, use this priority:
+When information conflicts, use this order:
 
 ```text
 runtime behavior and source code
-→ schema / configuration definitions
-→ focused domain documentation
-→ README
+→ schemas and configuration definitions
+→ README and focused implementation documentation
+→ repo_map.md
 → agent guidance
 ```
 
-Do not preserve outdated documentation behavior merely because it is described here.
+Each top-level document has one job:
 
-For code style, follow `docs/CODE_STYLE.md`.
+- `AGENTS.md`: repository-wide engineering and safety contract.
+- `CLAUDE.md`: concise Claude Code entry point; it must defer to this file.
+- `code_style.md`: concrete coding conventions for this personal research codebase.
+- `README.md`: user-facing setup, architecture, workflows, and commands.
+- `repo_map.md`: current file inventory and ownership map.
 
-## 2. Repository Intent
+Do not preserve stale documentation behavior when the implementation disagrees.
 
-DexMani Real is safety-sensitive robotics research software.
+## 2. Engineering priorities
 
-Changes should prioritize:
+DexMani Real is safety-sensitive robotics research software. Prioritize:
 
-1. correctness
-2. safety
-3. readable data flow
-4. debuggability
-5. reproducibility
-6. minimal conceptual complexity
+1. correctness and fail-closed behavior
+2. hardware and operator safety
+3. explicit ownership and readable data flow
+4. debuggability and reproducibility
+5. minimal conceptual complexity
 
-General-purpose extensibility is not a goal by itself.
+General-purpose extensibility is not a goal by itself. Prefer the simplest
+design that accurately represents the current system.
 
-Prefer the simplest design that clearly represents the current system.
+## 3. Required workflow
 
-## 3. Before Making Changes
+Before editing:
 
-Always inspect the current worktree first.
+1. Run `git status --short` and preserve unrelated user changes.
+2. Read the smallest relevant entry point and call path.
+3. Trace important values through:
 
-Do not assume:
+   ```text
+   definition → producer → transformation → consumer → side effect
+   ```
 
-- the tree is clean
-- adjacent files are unchanged
-- documentation matches current behavior
-- a named component still has the same implementation
+4. Inspect both sides of every changed boundary: hardware/software,
+   process/process, model/control, control/robot, runtime/storage, and
+   user-input/robot-behavior.
+5. Confirm current behavior from source and configuration rather than filenames,
+   comments, or old documentation.
 
-Identify the smallest relevant call path.
+While editing:
 
-For a value or behavior, determine:
+- Make the smallest coherent vertical change.
+- Preserve externally visible behavior unless the task explicitly changes it.
+- Do not reformat, rename, relocate, or refactor unrelated code.
+- Keep entry scripts thin; put reusable behavior in the owning package.
+- Remove only artifacts made obsolete by the current change.
 
-```text
-definition
-→ producer
-→ transformation
-→ consumer
-→ side effect
-```
+Before handoff:
 
-When changing a boundary, inspect both sides of that boundary.
+1. Inspect the focused diff and final worktree status.
+2. Check for duplicated logic, hidden ownership, and unnecessary abstractions.
+3. Run the smallest safe validation proportional to the risk.
+4. Report what changed, what was validated, and what was not validated.
 
-Do not overwrite unrelated user changes.
+## 4. Safety and side effects
 
-## 4. Change Scope
+Never run hardware-affecting code unless the user explicitly requests it. Treat
+all scripts under `examples/` as potentially hardware-affecting until inspected.
 
-Prefer a small vertical change over a broad horizontal refactor.
+Hardware-affecting behavior includes connecting to a device, commanding motion,
+homing, teleoperation, physical replay, calibration writes, and constructors or
+imports that initialize an SDK.
 
-A good change normally modifies only the components necessary to preserve one coherent behavior.
+Required ownership rules:
 
-Do not:
+- A live hardware SDK object stays inside its owning driver or worker process.
+- Do not pass SDK objects across multiprocessing boundaries.
+- Robot commands must pass through the existing safety and lifecycle boundaries.
+- Do not weaken validation, freshness checks, collision checks, generation
+  checks, or fail-closed behavior to make a test pass.
+- Constructors should be cheap; use explicit `start`/`connect` and `stop`/`close`
+  lifecycle operations.
 
-- reformat unrelated files
-- rename unrelated APIs
-- reorganize directories during a bug fix
-- replace working code merely for stylistic uniformity
-- introduce infrastructure unrelated to the requested task
+Prefer offline inspection, compilation, deterministic pure-function checks,
+fakes, and mocks during normal development. Never claim hardware validation
+unless real hardware was actually exercised.
 
-If local cleanup is required to make the requested change understandable, keep it tightly scoped.
+## 5. Architecture and ownership
 
-## 5. Architectural Principles
-
-### 5.1 Explicit ownership
-
-Every important mutable resource should have a clear owner.
-
-This especially applies to:
+Every important mutable resource must have one clear owner, especially:
 
 - hardware SDK instances
-- worker/process lifecycle
-- shared state
+- process lifecycle and shutdown
+- shared-memory state
 - robot command publication
 - recording output
 - model runtime resources
 
-Do not create multiple competing owners for the same resource.
+Keep dependency direction aligned with domain ownership. Avoid circular imports,
+hidden imports used only to escape dependency problems, and competing owners for
+the same state.
 
-### 5.2 Explicit boundaries
-
-Treat these as important system boundaries:
-
-```text
-hardware → software
-process → process
-model → control
-control → robot
-runtime → storage
-storage → runtime
-user input → robot behavior
-```
-
-Validate important shape, dtype, unit, frame, freshness and state assumptions at these boundaries.
-
-Avoid duplicating identical validation throughout internal helpers.
-
-### 5.3 One source of truth
-
-Do not create parallel definitions of:
-
-- configuration defaults
-- shared data layouts
-- persisted schemas
-- state semantics
-- safety constraints
-
-Extend the existing canonical definition.
-
-### 5.4 Simple dependency direction
-
-Dependencies should follow domain ownership.
-
-Avoid circular imports and mutually dependent subsystems.
-
-Do not solve dependency problems with hidden imports unless the dependency is genuinely optional.
-
-### 5.5 Separate computation from side effects
-
-Whenever practical, isolate pure:
-
-- geometry
-- transformations
-- filtering
-- validation
-- trajectory computation
-- data conversion
-
-from:
-
-- hardware IO
-- process communication
-- file IO
-- visualization
-- logging
-
-This keeps important algorithms testable without hardware.
-
-## 6. Hardware and Process Safety
-
-Never run hardware-affecting code unless explicitly requested by the user.
-
-Do not assume that a Python script is harmless merely because it is under `examples/`.
-
-Imports and constructors should not introduce new hidden hardware side effects.
-
-Prefer explicit lifecycle APIs such as:
-
-```text
-construct
-→ start/connect
-→ operate
-→ stop/close
-```
-
-A live hardware SDK object should remain local to its owning component or process.
-
-Do not pass live SDK objects through multiprocessing boundaries.
-
-Do not bypass an existing safety boundary in order to simplify an implementation or make a test pass.
-
-## 7. Coding Style
-
-Follow `docs/CODE_STYLE.md`.
-
-Important defaults:
-
-- precise `snake_case` names
-- `PascalCase` classes
-- units in physical-value names when ambiguous
-- coordinate frames visible in robotics data names
-- grouped standard / third-party / project imports
-- no wildcard imports
-- one semantic responsibility per function
-- pure helpers for mathematical operations
-- early returns instead of deep nesting
-- classes only when state or ownership justifies them
-- cheap constructors
-- thin CLI and example scripts
-- explicit side effects
-- concise comments explaining why, not what
-
-Avoid generic names such as `Manager`, `Handler`, `Processor`, `Data`, or `Utils` when a domain-specific name exists.
-
-## 8. Avoid Overengineering
-
-Before adding any of the following, establish a concrete need:
-
-- abstract base class
-- protocol/interface
-- factory
-- registry
-- plugin system
-- generic event bus
-- dependency-injection layer
-- manager/service/controller hierarchy
-- adapter that only forwards calls
-
-Prefer direct composition.
-
-Prefer three obvious functions over a generic subsystem that requires significant navigation to understand.
-
-An abstraction should either:
-
-1. establish a meaningful system boundary, or
-2. remove demonstrated duplication.
-
-Do not abstract hypothetical future implementations.
-
-## 9. Configuration and Schemas
-
-Configuration should be traceable to one canonical default.
-
-Avoid independent fallback defaults scattered across workers and scripts.
-
-Pass components the configuration they actually own rather than an unnecessarily large global configuration object.
-
-Changes to shared or persisted data must be treated as boundary changes.
-
-When modifying such data, identify all relevant:
-
-```text
-writers
-→ representation
-→ readers
-→ persistence
-→ downstream consumers
-```
-
-Do not silently change the meaning of an existing persisted field.
-
-## 10. Concurrency
-
-Concurrency should remain explicit.
+Separate pure computation—geometry, transforms, filtering, validation,
+trajectory generation, and data conversion—from hardware IO, IPC, file IO,
+visualization, and logging whenever practical.
 
 For worker loops:
 
 - keep the critical loop narrow
-- avoid blocking unrelated IO
-- make startup and shutdown bounded
-- preserve failure visibility
-- use appropriate monotonic timing for elapsed-time logic
-- avoid silent exception swallowing
+- use monotonic time for elapsed-time and freshness logic
+- avoid unrelated blocking IO
+- keep startup and shutdown bounded
+- expose failures; do not silently swallow exceptions
+- add synchronization only for identified shared mutable state
 
 Do not add multiprocessing merely to isolate ordinary synchronous code.
 
-Do not add synchronization without first identifying the actual shared mutable state.
+## 6. Boundaries, configuration, and schemas
 
-## 11. Refactoring Policy
+Validate shape, dtype, units, coordinate frame, freshness, lifecycle state, and
+provenance at the boundary that owns the contract. Avoid repeating identical
+validation throughout internal helpers.
 
-When simplifying complicated existing code, use this order:
+Maintain one source of truth for:
+
+- runtime defaults and resolved configuration
+- shared-memory layouts
+- persisted episode and processed-data schemas
+- safety state semantics and command limits
+- robot model and calibration resource paths
+
+Pass components the configuration they own rather than an unnecessarily broad
+global object. Do not add fallback defaults in workers or scripts when a
+canonical definition already exists.
+
+Treat shared-memory and persisted-data changes as boundary changes. Inspect all
+writers, representations, readers, persistence paths, and downstream consumers.
+Never silently change the meaning of an existing persisted field.
+
+## 7. Implementation style
+
+Follow [`code_style.md`](code_style.md). Its central rule is to keep the two
+research paths—real-data collection and model deployment—direct, readable, and
+safe rather than turning the repository into a general robotics platform.
+
+Required defaults include:
+
+- precise `snake_case` functions and values; `PascalCase` classes
+- units in physical-value names when ambiguous
+- coordinate frames visible in robotics data names
+- standard, third-party, then project import groups; no wildcard imports
+- one semantic responsibility per function
+- pure helpers for mathematical operations
+- early returns instead of deep nesting
+- classes only when state, ownership, or lifecycle justifies them
+- concise comments explaining why, invariants, or safety rationale
+- explicit side effects and bounded failure behavior
+
+Prefer domain-specific names over generic `Manager`, `Handler`, `Processor`,
+`Data`, or `Utils` names when a precise alternative exists.
+
+Before adding an abstract base class, protocol, factory, registry, plugin system,
+event bus, dependency-injection layer, or manager/service/controller hierarchy,
+show that it establishes a real boundary or removes demonstrated duplication.
+Do not abstract hypothetical future implementations.
+
+When simplifying existing code, prefer this order:
 
 1. clarify names
 2. reveal data flow
@@ -282,15 +186,9 @@ When simplifying complicated existing code, use this order:
 6. remove unnecessary wrappers
 7. split genuinely independent responsibilities
 
-Do not begin a cleanup by building a new abstraction framework around the existing code.
+## 8. Verification
 
-Preserve externally visible behavior unless the task explicitly changes it.
-
-## 12. Verification
-
-Use the smallest relevant offline validation first.
-
-Typical safe checks include:
+Start with the least risky relevant checks:
 
 ```bash
 git status --short
@@ -299,51 +197,25 @@ git diff --check
 git diff --stat
 ```
 
-Use focused unit-style scripts, mocks, fakes, or deterministic examples when appropriate.
+Add focused offline checks for changed pure functions, schemas, readers,
+lifecycle branches, IPC contracts, recording transactions, and safety failure
+paths as appropriate. The repository does not currently have a general unit
+test suite, so do not treat example programs as tests.
 
-For changes involving lifecycle, IPC, recording or safety-sensitive logic, consider relevant failure paths in addition to the normal path.
+## 9. Documentation maintenance
 
-Do not claim hardware validation unless hardware execution was actually performed.
+Documentation changes must follow their ownership boundary:
 
-## 13. Finishing a Task
+- Update `README.md` when supported user workflows, setup, or stable architecture
+  navigation changes.
+- Update `code_style.md` only when concrete repository-wide coding conventions
+  change.
+- Update `repo_map.md` when tracked files are added, removed, moved, or change
+  primary responsibility.
+- Update `CLAUDE.md` only for Claude-specific working guidance.
+- Update this file only when the repository-wide agent contract, safety policy,
+  or engineering philosophy changes.
 
-Before handing off:
-
-1. inspect the final diff
-2. preserve unrelated worktree changes
-3. remove debugging artifacts
-4. check for duplicated logic
-5. check for unnecessary abstractions
-6. run appropriate safe validation
-7. report what changed
-8. report what was tested
-9. report important validation that was not performed
-
-The final implementation should be understandable without requiring the agent conversation that produced it.
-
-## 14. Documentation Maintenance
-
-Do **not** modify this file for ordinary implementation changes.
-
-The following should normally live elsewhere:
-
-- module inventories
-- exact filenames for every subsystem
-- current schema version
-- queue/ring capacities
-- device addresses
-- ports
-- concrete dataset field lists
-- current hardware parameters
-- individual CLI commands
-- temporary architectural migration state
-
-Use:
-
-- source code for executable truth
-- configuration for tunable values
-- README for user-facing navigation
-- `docs/` for domain contracts and architecture
-- `CODE_STYLE.md` for coding conventions
-
-Update `AGENTS.md` only when the repository-wide **agent working contract, safety policy, or engineering philosophy** changes.
+Implementation snapshots—schema versions, queue capacities, device addresses,
+ports, dataset fields, CLI flags, and current hardware parameters—belong in
+source, configuration, README, or `repo_map.md`, not in agent/style guidance.

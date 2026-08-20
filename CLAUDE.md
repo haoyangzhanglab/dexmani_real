@@ -1,156 +1,57 @@
 # CLAUDE.md
 
-This file gives Claude Code repository-level working guidance.
+Claude Code must read and follow [`AGENTS.md`](AGENTS.md) before modifying this
+repository. `AGENTS.md` is authoritative for safety, scope, style, verification,
+and documentation ownership; this file only adds a concise Claude-specific
+workflow.
 
-Keep this file **small and stable**. It should describe how to work in the repository, not mirror the current implementation.
+## Start here
 
-For detailed coding conventions, read `docs/CODE_STYLE.md`.  
-For the agent-wide repository contract, read `AGENTS.md`.  
-Use the source code, configuration and domain documentation as the authority for current implementation details.
+- Use [`README.md`](README.md) for supported workflows and architecture.
+- Use [`repo_map.md`](repo_map.md) to find the current owner of a file or behavior.
+- Use [`code_style.md`](code_style.md) for concrete Python and research-code style.
+- Use source and resolved configuration as the final authority.
+- When writing, reviewing, or refactoring code, apply the project-local
+  `.claude/skills/karpathy-guidelines/SKILL.md` guidance where available.
 
-## Working Principles
+## Working loop
 
-When modifying this repository:
+1. Inspect `git status --short`; never overwrite unrelated user changes.
+2. Identify the smallest relevant call path and trace producer → representation
+   → consumer → side effect.
+3. State material assumptions and success criteria before a non-trivial edit.
+4. Make the smallest coherent change; avoid speculative abstractions and nearby
+   cleanup.
+5. Validate offline first, inspect the final diff, and report unperformed checks.
 
-1. Understand the relevant data flow before editing.
-2. Make the smallest coherent change that solves the requested problem.
-3. Prefer explicit code over framework-like abstractions.
-4. Preserve existing behavior unless the task requires changing it.
-5. Keep hardware ownership, process ownership and side effects obvious.
-6. Do not mix unrelated refactoring into a focused change.
-7. Treat real-robot execution as safety-sensitive.
-
-The repository is research software. Optimize primarily for:
-
-```text
-readability
-→ correctness
-→ debuggability
-→ reproducibility
-→ extensibility
-```
-
-Do not optimize for hypothetical generality.
-
-## Before Editing
-
-Inspect the current worktree and the smallest relevant call path.
-
-Useful operations include:
+Useful read-only discovery commands:
 
 ```bash
-git status --short
 rg -n "<symbol-or-key>" dexmani_real examples
+rg --files
+git diff -- <focused-paths>
 ```
 
-Read neighboring producers and consumers when changing:
-
-- shared data
-- robot commands
-- configuration
-- coordinate transforms
-- dataset fields
-- lifecycle behavior
-
-Do not assume documentation is more current than the implementation.
-
-## Implementation Style
-
-Follow `docs/CODE_STYLE.md`.
-
-In particular:
-
-- use precise domain names
-- make units and coordinate frames explicit
-- prefer small pure functions for math and transforms
-- use classes for genuine state, ownership or lifecycle
-- keep constructors cheap
-- keep scripts and CLI entry points thin
-- avoid pass-through wrappers
-- avoid speculative interfaces, factories and registries
-- centralize schemas and configuration defaults
-- keep control loops free of unrelated blocking work
-
-When existing code is complicated, simplify the local data flow before introducing another abstraction.
-
-## Architecture Changes
-
-Do not perform architectural redesign implicitly.
-
-If a task can be solved with a local implementation, prefer that first.
-
-Before introducing a new:
-
-- manager
-- service
-- controller layer
-- abstract base class
-- protocol
-- registry
-- factory
-- generic framework
-
-verify that it represents a real boundary or removes demonstrated duplication.
-
-One implementation normally does not require an abstraction layer.
-
-## Hardware Safety
-
-Do not run hardware-affecting programs unless the user explicitly requests it.
-
-This includes operations that may:
-
-- connect to a robot
-- command motion
-- home a device
-- start teleoperation
-- replay trajectories
-- modify calibration
-- initialize hardware through an SDK
-
-Static inspection, compilation and focused offline checks are preferred during normal code editing.
-
-Do not weaken a safety check to make an offline test pass.
-
-## Verification
-
-Use the least risky validation appropriate to the change.
-
-Typical checks include:
+Typical safe validation:
 
 ```bash
 python -m compileall -q dexmani_real examples
 git diff --check
 git diff --stat
+git status --short
 ```
 
-Run focused tests or small offline reproductions where useful.
+## Safety reminders
 
-Before finishing:
+Do not run anything that may connect to xArm7, XHand, RealSense, or Quest/HTS,
+command motion, home hardware, replay an episode, or write calibration unless
+the user explicitly asks. An `examples/` script, import, or constructor is not
+assumed safe until inspected.
 
-1. inspect the focused diff
-2. check for unrelated modifications
-3. check for unnecessary abstractions
-4. verify important failure paths when relevant
-5. report exactly what was and was not tested
+Never bypass `SharedStorage`, the unified safety gate, worker-side validation,
+generation/freshness checks, collision checks, or verified shutdown to simplify
+an implementation or make a check pass.
 
-Hardware validation should be reported separately from offline validation.
-
-## Documentation Policy
-
-Do **not** update this file simply because implementation details change.
-
-Information that does not belong here includes:
-
-- current schema version numbers
-- exact queue or ring capacities
-- hardware IP addresses or ports
-- complete module/file maps
-- individual configuration values
-- current CLI names
-- dataset field lists
-- detailed state-machine internals
-
-Put such information in the source code, README, configuration or focused documents under `docs/`.
-
-Update `CLAUDE.md` only when the **repository-wide way Claude should work** materially changes.
+Keep this file small and stable. Current filenames and module responsibilities
+belong in `repo_map.md`; coding conventions belong in `code_style.md`; commands
+and supported workflows belong in `README.md`.

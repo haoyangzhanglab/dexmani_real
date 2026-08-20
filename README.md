@@ -1,115 +1,186 @@
 # DexMani Real
 
-面向 xArm7（7 DoF）、XHand（12 DoF）、Quest VR 和 RealSense L515 的遥操作、数据采集、回放与策略部署系统。
+DexMani Real 是面向灵巧操作研究的真实机器人运行时，覆盖 xArm7（7 DoF）、
+XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数据采集、
+物理回放、离线处理和 learned-policy 部署。
 
-## 从哪里开始
+> 这是安全敏感的真实硬件软件。除明确标注为离线的命令外，运行前必须确认
+> 硬件连接、工作空间、标定状态、急停条件和操作者授权。
 
-| 你要做什么 | 先读/先改 | 相关入口 |
+## 当前能力
+
+- VR 或键盘控制 xArm7，并可选联动 XHand。
+- 通过共享内存协调 arm、hand、VR、camera、recorder 与 policy 进程。
+- 常规 arm/hand joint command 统一经过安全门，并在设备 worker 的 SDK 边界再次
+  校验；homing 使用独立的碰撞检查路径和专用 queue。
+- 事务式写入 raw episode；当前 writer 写 v18，reader 与处理管线支持 v17/v18。
+- 将 raw episode 清洗为 processed HDF5 v3，再导出 Policy Zarr v2。
+- 物理回放已记录 episode，并保存回放轨迹与一致性指标。
+- 通过可替换 backend/adapter 运行 joint-action learned policy；仓库包含无模型的
+  deterministic fake 实现和 `dexmani_policy` 集成适配器。
+
+## 导航
+
+| 目标 | 入口 | 主要实现 |
 |---|---|---|
-| 理解项目约束、修改代码 | [`AGENTS.md`](AGENTS.md) → [`CLAUDE.md`](CLAUDE.md) | — |
-| 采集遥操作 episode | `teleop/session.py`、`teleop/loop.py`、`teleop/episode_samples.py` | `examples/collect_teleop.py` |
-| 物理重现 episode | `robot/episode_replay.py`、`recording/episode_reader.py` | `examples/replay_episode.py` |
-| 读取 v17 数据 | `recording/episode_schema.py`、`recording/episode_reader.py` | [`docs/dataset/hdf5_episode.md`](docs/dataset/hdf5_episode.md) |
-| 清洗并生成训练视图/Zarr | `data_processing/` | [`docs/dataset/processed_hdf5.md`](docs/dataset/processed_hdf5.md) |
-| 修改手部 retarget | `teleop/hand_control.py`、`teleop/hand_retarget.py` | [`docs/hand_retargeting.md`](docs/hand_retargeting.md) |
-| 部署 learned policy | `deployment/coordinator.py`、`deployment/worker.py` | `examples/run_policy.py` |
-| 对照 Sim 数据 | — | [`docs/dataset/sim_hdf5_zarr.md`](docs/dataset/sim_hdf5_zarr.md)、[`docs/dataset/real_to_sim_mapping.md`](docs/dataset/real_to_sim_mapping.md) |
+| 理解仓库与修改约束 | [`AGENTS.md`](AGENTS.md)、[`code_style.md`](code_style.md) | [`repo_map.md`](repo_map.md) |
+| VR 遥操作与采集 | [`examples/collect_teleop.py`](examples/collect_teleop.py) | [`teleop/session.py`](dexmani_real/teleop/session.py)、[`teleop/loop.py`](dexmani_real/teleop/loop.py) |
+| 键盘遥操作 | [`examples/keyboard_teleop.py`](examples/keyboard_teleop.py) | [`teleop/keyboard_session.py`](dexmani_real/teleop/keyboard_session.py) |
+| 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`robot/episode_replay.py`](dexmani_real/robot/episode_replay.py) |
+| raw episode 读取/录制 | — | [`recording/episode_reader.py`](dexmani_real/recording/episode_reader.py)、[`recording/episode_recorder.py`](dexmani_real/recording/episode_recorder.py) |
+| 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`data_processing/`](dexmani_real/data_processing) |
+| learned-policy 部署 | [`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`integrations/`](dexmani_real/integrations) |
+| 相机、点云与 VR 标定 | [`examples/`](examples) | [`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
 
-完整文档索引见 [`docs/README.md`](docs/README.md)。代码是运行行为的最终事实来源；文档只记录跨模块边界、读取合同和稳定的使用方式。
+完整的逐文件职责见 [`repo_map.md`](repo_map.md)。
 
-正式数据目录与仓库根目录同级组织：
-
-```text
-episodes/<task_name>/episode_*                 # raw v18；reader 兼容 v17
-episodes_processed/<task_name>/episode_*.h5   # 每个 raw 对应一个压紧 HDF5 + processing_index.json
-dataset/<task_name>.zarr                       # dexmani_policy 训练容器
-```
-
-不使用额外的 `inputs/` staging 层；旧平铺 episode 只通过显式迁移/annotation 兼容。
-任务失败由操作者删除整条 raw episode，不由处理代码推断。Policy Zarr 只包含
-`data/*` 与 `meta/episode_ends`；不写 `task_success` 或 raw episode provenance。
-清洗默认审计停滞/抖动，只自动删除硬无效行；压紧产生危险动作跳变时拒绝整条轨迹。
-
-## 系统边界
+## 核心架构
 
 ```text
-camera / VR / arm / hand
-          │
-          ▼
-  SharedStorage（固定 dtype、ring、queue、状态标志）
-          │
-          ├── teleop ──► SafetyGate ──► arm queue / hand ring ──► device workers
-          │       └────► fixed-grid samples ──► EpisodeRecorder ──► v17 episode
-          │
-          └── policy worker ──► policy_plan_ring ──► deployment coordinator
-                                                  └──► 同一 SafetyGate 边界
+RealSense / Quest-HTS / xArm7 / XHand
+                 │
+                 ▼
+        device-specific workers
+                 │
+                 ▼
+ SharedStorage: typed rings + queues + lifecycle state
+          │                         │
+          ├─ teleop coordinator     └─ inference worker → policy plan ring
+          │                                      │
+          └──────────────────────────────────────┤
+                                                 ▼
+                                      unified SafetyGate
+                                                 │
+                                    arm/hand command IPC
+                                                 │
+                                      device workers + SDK checks
+
+ teleop fixed-grid samples → RecorderIO → data.h5 + depth.h5 + rgb.mp4
+ raw episode → offline processing → processed HDF5 → Policy Zarr
 ```
 
 必须保持的边界：
 
-- 跨进程数据只经 `SharedStorage`；固定 shape/dtype 由 `utils/schema.py` 定义。
-- xArm、XHand、RealSense SDK 只在各自 worker/driver 内初始化和使用。
-- teleop/deployment 决定动作和固定控制网格；Recorder 只序列化已选样本。
-- arm queue 有序且有界；hand command ring 和 policy plan ring 是 latest-wins。
-- `run_generation` 使暂停、回零或反馈故障前的命令失效；worker 在 SDK 边界前再次检查。
-- 固件是最后安全保护；应用层负责数据有效性、生命周期和协调停止。
+- 跨进程状态通过 `SharedStorage`；固定 shape/dtype 由
+  [`utils/schema.py`](dexmani_real/utils/schema.py) 定义。
+- xArm、XHand、RealSense 和 HTS SDK 对象只存在于各自 owner/worker 内。
+- teleop、replay 和 deployment 负责动作决策；常规 joint command 发布统一经过
+  [`policy/safety.py`](dexmani_real/policy/safety.py)，homing 由
+  [`robot/homing.py`](dexmani_real/robot/homing.py) 规划、校验并排入专用 queue。
+- Recorder 只持久化选定的固定网格样本，不拥有机器人控制。
+- `run_generation`、freshness、heartbeat、safety state 与 worker 侧检查共同使
+  暂停、回零或故障前的旧命令失效。
 
-## 常用入口
+## 环境
 
-下面的命令只表示入口和参数形状。除标注“离线”者外，运行前都需要确认硬件、工作空间和操作授权。
-
-| 用途 | 命令 | 性质 |
-|---|---|---|
-| 遥操作采集 | `python examples/collect_teleop.py --task-name <task>` | 硬件；写入 `episodes/<task>/episode_*` |
-| 键盘控制 | `python examples/keyboard_teleop.py` | 硬件 |
-| learned policy | `python examples/run_policy.py --help` | 离线（仅帮助） |
-| 回放参数 | `python examples/replay_episode.py --help` | 离线（仅帮助） |
-| 物理回放 | `python examples/replay_episode.py <episode>` | 硬件；启动前执行严格 episode/provenance/几何预检 |
-| 数据清洗 | `python examples/process_episodes.py --input-root episodes/<task> --profile rgb_pc --dry-run` | 离线；先审计、不写输出 |
-| 导出 Policy Zarr | `python examples/export_policy_zarr.py --help` | 离线 |
-| 手部调参 | `python examples/tune_hand_retarget.py --help` | 离线 |
-| episode 可视化 | `python examples/visualize_episode.py <episode>` | 离线/GUI |
-| 相机标定 | `python examples/calibrate_camera.py` | 硬件/写标定文件 |
-| RealSense RGB-D 诊断 | `python examples/realsense_record_example.py` | 硬件/GUI |
-| 点云与桌面平面诊断 | `python examples/pointcloud_process_example.py` | 硬件/GUI；确认后写标定文件 |
-| VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 设备/写标定文件 |
-
-## 环境与验证
-
-目标环境是 Python 3.10 conda 环境 `real_robot`，从仓库根目录运行并设置 `PYTHONPATH=.`。
+项目声明 Python `>=3.10`，目标开发环境是 conda 环境 `real_robot`。从仓库根目录：
 
 ```bash
-source ~/miniconda3/etc/profile.d/conda.sh
 conda activate real_robot
-export PYTHONPATH=.
-
-# 不初始化硬件的最低成本检查
-python -m compileall -q dexmani_real examples
-git diff --check
+python -m pip install -e .
 ```
 
-仓库没有常规单元测试套件；`examples/test_*.py`（若存在）也按硬件程序处理，不要当作自动化测试运行。修改纯函数、schema、reader 或生命周期分支时，优先补充不连接硬件的 deterministic check。
+`pyproject.toml` 提供基础 Python 依赖，但不是完整的硬件/研究环境锁文件。
+实际工作流还可能需要对应设备或功能的外部包，例如 xArm SDK、XHand controller、
+RealSense SDK、HTS hand-tracking SDK、Pinocchio、MPlib、NLopt、
+`dex-retargeting`、Open3D、PyTorch/PyTorch3D、Rerun，以及外部
+`dexmani_policy` 仓库。按当前任务安装这些依赖，不要假设一次基础安装即可连接硬件。
 
-## 代码地图
+配置的唯一合并优先级是：
 
-| 目录 | 责任 |
-|---|---|
-| `config/` | 默认值、运行时配置、相机标定读取 |
-| `shm/` | 共享内存、ring、queue 和 seqlock 读取 |
-| `sensor/` | RealSense、VR、点云输入，以及相机标定/诊断领域实现 |
-| `robot/` | xArm/XHand worker、SDK、反馈和回零 |
-| `planning/` | FK、IK、碰撞和路径 |
-| `teleop/` | VR 映射、retarget、动作与采样决策 |
-| `policy/` | action candidate 与统一安全门 |
-| `deployment/` | learned-policy 推理和动作协调 |
-| `recording/` | v18 episode 写入、v17/v18 读取、相机 sidecar 和离线可视化 |
-| `data_processing/` | v17 → real-domain 离线视图，以及 processed HDF5 → Policy Zarr |
-| `examples/` | 薄 CLI/实验入口，不承载通用合同 |
+```text
+CLI override > YAML file > dexmani_real/config/defaults.py
+```
 
-### 修改闭环
+运行时配置由 [`config/runtime.py`](dexmani_real/config/runtime.py) 校验、冻结并生成
+SHA-256；部署配置由 [`deployment/config.py`](dexmani_real/deployment/config.py)
+独立解析。可在不启动硬件的情况下查看遥操作解析结果：
 
-1. 先按 [`CLAUDE.md`](CLAUDE.md) 的任务路由找到 owner。
-2. 读取 producer、consumer 和对应 schema；不要只改一个调用点。
-3. 保留当前工作区已有修改，做最小垂直变更。
-4. 运行与风险匹配的离线检查，记录未运行的硬件验证。
-5. 查看 `git diff`、`git status --short`，确认没有混入无关文件。
+```bash
+python examples/collect_teleop.py --print-config
+```
+
+## 常用命令
+
+### 硬件工作流
+
+| 用途 | 命令 | 主要副作用 |
+|---|---|---|
+| VR 遥操作采集 | `python examples/collect_teleop.py --task-name <task>` | 连接 arm/hand/VR/camera；写 raw episode |
+| VR 遥操作但不录制 | `python examples/collect_teleop.py --task-name <task> --no-record` | 连接 arm/hand/VR；不启动 camera/recorder |
+| 键盘遥操作 | `python examples/keyboard_teleop.py` | 连接并控制 xArm7，可选 XHand |
+| 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 预检后控制 xArm7/XHand；写 `results/` |
+| learned policy | `python examples/run_policy.py --deployment-config <file.yml>` | 启动 arm、可选 hand、inference 与 coordinator |
+| 相机标定 | `python examples/calibrate_camera.py` | 连接 xArm/RealSense；更新相机标定 |
+| VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
+| RealSense 诊断 | `python examples/realsense_record_example.py` | 打开相机与 GUI |
+| 点云/桌面平面诊断 | `python examples/pointcloud_process_example.py` | 打开相机与 GUI；确认后写桌面平面 |
+| XHand 独立诊断 | `python examples/xhand_control_example.py` | 连接并控制 XHand |
+
+支持 argparse 的入口应先用 `--help` 查看当前参数；
+`examples/xhand_control_example.py` 没有 `--help` 模式，执行即进入硬件流程。
+不要从旧文档复制硬件地址或运动参数。
+
+### 离线数据工作流
+
+先审计一个任务目录，不写输出：
+
+```bash
+python examples/process_episodes.py \
+  --input-root episodes/<task> \
+  --profile rgb_pc \
+  --dry-run
+```
+
+确认审计结果后去掉 `--dry-run`，默认发布到
+`episodes_processed/<task>/`。可选 profile 为 `joint`、`rgb`、`pointcloud`
+和 `rgb_pc`。随后导出一个全新的 Zarr 目标：
+
+```bash
+python examples/export_policy_zarr.py \
+  --input-root episodes_processed/<task> \
+  --output dataset/<task>.zarr \
+  --task-name <task>
+```
+
+输出目标已存在时会拒绝覆盖。可视化 raw episode：
+
+```bash
+python examples/visualize_episode.py episodes/<task>/episode_*
+```
+
+## 数据布局
+
+```text
+episodes/<task>/episode_<timestamp>/
+├── data.h5       # fixed-grid robot/action/VR/quality data and metadata
+├── depth.h5      # grid-aligned uint16 depth stream
+└── rgb.mp4       # grid-aligned RGB stream
+
+episodes_processed/<task>/
+├── episode_<timestamp>.h5
+└── processing_index.json
+
+dataset/<task>.zarr/
+├── data/*
+└── meta/episode_ends
+```
+
+正式 raw writer 写 schema v18；reader、replay、visualizer 和离线处理支持 v17/v18。
+更早的 flat HDF5 或 pre-v17 数据需要在运行时之外显式迁移。离线处理默认保守：
+硬无效行可被移除，时序异常先审计；压紧后产生危险动作跳变时默认拒绝该轨迹。
+
+## 开发与验证
+
+安全的最低成本检查：
+
+```bash
+python -m compileall -q dexmani_real examples
+git diff --check
+git diff --stat
+git status --short
+```
+
+仓库当前没有通用单元测试套件。针对纯函数、schema、reader、生命周期和 IPC
+边界，优先写或运行不连接硬件的 deterministic check。仓库级 agent 工作约定见
+[`AGENTS.md`](AGENTS.md)，具体编码规范见 [`code_style.md`](code_style.md)。
