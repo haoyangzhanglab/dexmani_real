@@ -73,6 +73,15 @@ def transition(shared: Any, new_state: SafetyState) -> bool:
             )
             return False
 
+        if new_state is SafetyState.ARMED and current is SafetyState.DISARMED:
+            # Motion is (re-)armed: endpoints published before this moment are
+            # stale for the latest-wins arm ring, so the worker ignores every
+            # command id at or below the current sequence.
+            armed_at_seq = getattr(shared, "arm_armed_at_seq", None)
+            command_seq = getattr(shared, "arm_command_seq", None)
+            if armed_at_seq is not None and command_seq is not None:
+                armed_at_seq.value = int(command_seq.value)
+
         shared.safety_state.value = int(new_state)
     logger.info(
         "safety: %s(%d) → %s(%d)",

@@ -859,9 +859,6 @@ class SafetyParams:
     )
     shutdown_timeout_s: float = 65.0
 
-    # Consecutive arm-health failure threshold (feedback/FK reads, arm_loop)
-    max_consecutive_arm_health_failures: int = 30
-
     # Supervisor check rate (Main)
     supervisor_hz: float = 10.0
 
@@ -880,10 +877,6 @@ class SafetyParams:
             raise ValueError("readiness_timeouts_s is missing a runtime subsystem")
         if not np.isfinite(self.shutdown_timeout_s) or self.shutdown_timeout_s <= 0:
             raise ValueError("shutdown_timeout_s must be finite and positive")
-        if self.max_consecutive_arm_health_failures <= 0:
-            raise ValueError(
-                f"max_consecutive_arm_health_failures={self.max_consecutive_arm_health_failures} must be > 0"
-            )
         if not np.isfinite(self.supervisor_hz) or self.supervisor_hz <= 0:
             raise ValueError(f"supervisor_hz={self.supervisor_hz} must be > 0")
         object.__setattr__(self, "heartbeat_timeouts", MappingProxyType(dict(self.heartbeat_timeouts)))
@@ -897,7 +890,6 @@ class SafetyParams:
                 dict(self.heartbeat_timeouts),
                 dict(self.readiness_timeouts_s),
                 self.shutdown_timeout_s,
-                self.max_consecutive_arm_health_failures,
                 self.supervisor_hz,
             ),
         )

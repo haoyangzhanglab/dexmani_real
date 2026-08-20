@@ -20,6 +20,7 @@ from dexmani_real.planning import (
     XArm7PlannerConfig,
 )
 from dexmani_real.planning.hand_kinematics import HandKinematics
+from dexmani_real.planning.kinematics import make_arm_fk
 from dexmani_real.planning.pose_utils import normalize_quat_wxyz, quat_wxyz_to_rot6d
 from dexmani_real.policy.loop_timing import StageTimer
 from dexmani_real.policy.safety import (
@@ -130,8 +131,6 @@ def _arm_feedback_issue(
         max_age_s=max_age_s,
         qpos=np.asarray(state["qpos"][0]),
         qvel=np.asarray(state["qvel"][0]),
-        eef_pos=np.asarray(state["eef_pos"][0]),
-        eef_rot6d=np.asarray(state["eef_rot6d"][0]),
     )
     if issue is not None:
         return issue
@@ -404,7 +403,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     """Teleoperation process entry point used by ``collect_teleop.py``.
 
     Reads from rings (vr, arm_state, hand_state, camera), writes actions
-    to queues/rings (arm_action_q, hand_cmd_ring), owns recording.
+    to the actuator rings (arm_cmd_ring, hand_cmd_ring), owns recording.
     """
     from dexmani_real.robot.safety import SafetyState, transition
 
@@ -745,7 +744,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
             # Entered after Q key stops teleop. The teleop loop stays alive with
             # heartbeats ticking so arm/hand/vr continue running — H (return_home)
-            # can still queue HOME_SENTINEL and wait for convergence.
+            # can still queue a HOME request and wait for convergence.
             if quit_pending:
                 # Show prompt once per entry; re-shown after H completes.
                 home_handled = False
@@ -1229,11 +1228,11 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
             if loop_count % cfg.runtime.policy.status_print_interval == 0:
                 _arm_age = (
-                    time.monotonic() - float(arm_state["timestamp"][0])
+                    (time.monotonic_ns() - int(arm_state["source_monotonic_ns"][0])) * 1e-9
                     if arm_state is not None
                     else -1.0
                 )
-                _qdepth = shared.arm_action_q.qsize()
+                _qdepth = -1  # latest-wins arm ring has no queue depth
                 _print_status(
                     loop_count,
                     arm_state,
@@ -1273,7 +1272,6 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                     and not vr_stale
                     and not _hold_for_audio
                     and _quiescence.active
-                    and bool(arm_state["accepts_motion_commands"][0])
                     and vr_frame is not None
                     and (not hand_available or hand_state is not None)
                     and (not hand_available or hand_issue is None)
@@ -1745,16 +1743,14 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 continue
             if not publish_result.succeeded or published_candidate is None:
                 # Recoverable "hold" statuses keep the loop alive with arm+hand
-                # held in place instead of latching a fault: safety-state gating,
-                # transient hand-feedback unavailability/unhealth, and a transient
-                # arm "not accepting yet" (Mode-6 entry / homing / re-arm window).
+                # held in place instead of latching a fault: safety-state gating
+                # and transient hand-feedback unavailability/unhealth.
                 # A single stale hand frame must not kill the session — the
                 # debounced per-frame hand check (hand_disconnect_timeout_s) above
                 # is the sole fault path for sustained hand-unhealthy.
                 hold_status = publish_result.status in (
                     CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY,
                     CommandPublishStatus.HAND_FEEDBACK_UNAVAILABLE,
-                    CommandPublishStatus.ARM_NOT_READY,
                 )
                 if publish_result.runtime_gated:
                     logger.info(
@@ -1960,8 +1956,11 @@ def _print_status(
 ) -> None:
     """Periodic status print."""
     if arm_state is not None:
-        _e = arm_state["eef_pos"][0]
-        eef_str = f"eef={_e[0]:.3f},{_e[1]:.3f},{_e[2]:.3f}"
+        try:
+            _e, _ = make_arm_fk().compute(np.asarray(arm_state["qpos"][0], dtype=np.float64))
+            eef_str = f"eef={_e[0]:.3f},{_e[1]:.3f},{_e[2]:.3f}"
+        except Exception:
+            eef_str = "eef=?,?,?"
     else:
         eef_str = "eef=?,?,?"
     if vr_frame is not None:

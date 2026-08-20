@@ -337,9 +337,6 @@ class RecorderClient:
             frame[name][0] = int(bool(getattr(state, name)))
         frame["state_timestamp"][0] = state.timestamp
         frame["arm_last_cmd_seq"][0] = state.arm_last_cmd_seq
-        frame["arm_last_cmd_queue_latency_s"][0] = state.arm_last_cmd_queue_latency_s
-        frame["arm_last_cmd_apply_latency_s"][0] = state.arm_last_cmd_apply_latency_s
-        frame["arm_last_cmd_sdk_duration_s"][0] = state.arm_last_cmd_sdk_duration_s
         frame["action_arm_qpos"][0] = action.arm_qpos_cmd
         frame["action_hand_qpos"][0] = action.hand_qpos_cmd
         frame["action_target_eef_pos"][0] = (

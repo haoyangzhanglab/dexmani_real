@@ -17,6 +17,7 @@ from dexmani_real.utils.schema import (
 )
 from dexmani_real.planning import Pose
 from dexmani_real.planning.hand_kinematics import HandKinematics
+from dexmani_real.planning.kinematics import make_arm_fk
 from dexmani_real.planning.pose_utils import compose_pose, normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.recording.recorder_client import RecorderClient
@@ -222,7 +223,7 @@ def _record_held(
     pause emits neither an actuator action nor a recording sample.
 
     Args:
-        arm_qpos_sent: Last command actually queued to arm_action_q.
+        arm_qpos_sent: Last command actually published to arm_cmd_ring.
             Persists the exact command sent so held-frame samples stay consistent.
         diagnostics: Per-frame diagnostics (tracking_error, ik_solve_time_ms, etc.).
         target_eef_pos/rot6d: Last valid IK target — prevents NaN gaps in
@@ -437,19 +438,13 @@ def _build_robot_state(
         arm_qpos = np.asarray(r["qpos"], dtype=np.float64)
         arm_qvel = np.asarray(r["qvel"], dtype=np.float64)
         arm_tau = np.asarray(r["tau"], dtype=np.float64)
-        eef_pos = np.asarray(r["eef_pos"], dtype=np.float64)
-        eef_rot6d = np.asarray(r["eef_rot6d"], dtype=np.float64)
+        try:
+            eef_pos, eef_rot6d = make_arm_fk().compute(arm_qpos)
+        except Exception:
+            eef_pos = nan_array(3)
+            eef_rot6d = nan_array(6)
         arm_connected = bool(r["connected"])
         arm_last_cmd_seq = int(r["last_cmd_seq"]) if "last_cmd_seq" in r.dtype.names else 0
-        arm_last_cmd_queue_latency_s = (
-            float(r["last_cmd_queue_latency_s"]) if "last_cmd_queue_latency_s" in r.dtype.names else 0.0
-        )
-        arm_last_cmd_apply_latency_s = (
-            float(r["last_cmd_apply_latency_s"]) if "last_cmd_apply_latency_s" in r.dtype.names else 0.0
-        )
-        arm_last_cmd_sdk_duration_s = (
-            float(r["last_cmd_sdk_duration_s"]) if "last_cmd_sdk_duration_s" in r.dtype.names else 0.0
-        )
         arm_last_cmd_is_hold = bool(r["last_cmd_is_hold"]) if "last_cmd_is_hold" in r.dtype.names else False
     else:
         arm_qpos = nan_array(ARM_JOINT_SHAPE)
@@ -459,9 +454,6 @@ def _build_robot_state(
         eef_rot6d = nan_array(6)
         arm_connected = False
         arm_last_cmd_seq = 0
-        arm_last_cmd_queue_latency_s = 0.0
-        arm_last_cmd_apply_latency_s = 0.0
-        arm_last_cmd_sdk_duration_s = 0.0
         arm_last_cmd_is_hold = False
 
     if hand_state is not None:
@@ -547,9 +539,6 @@ def _build_robot_state(
         hand_qpos_stale=hand_qpos_stale,
         hand_error_state=hand_error_state,
         arm_last_cmd_seq=arm_last_cmd_seq,
-        arm_last_cmd_queue_latency_s=arm_last_cmd_queue_latency_s,
-        arm_last_cmd_apply_latency_s=arm_last_cmd_apply_latency_s,
-        arm_last_cmd_sdk_duration_s=arm_last_cmd_sdk_duration_s,
         arm_last_cmd_is_hold=arm_last_cmd_is_hold,
         fingertip_pos=fingertip_pos,
         arm_connected=arm_connected,

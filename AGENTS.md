@@ -1,190 +1,349 @@
-# AGENTS.md — DexMani Real Working Contract
+# AGENTS.md — DexMani Real Agent Contract
 
-This is the repository-wide contract for coding agents. It applies below the
-repository root unless a deeper `AGENTS.md` overrides it. Read this file before
-editing; use [README.md](README.md) as the file-by-file project map and
-[CLAUDE.md](CLAUDE.md) as the implementation navigation guide.
+This file defines the repository-wide working contract for coding agents.
 
-## 1. Fast start
+It applies to the repository unless a more specific `AGENTS.md` exists deeper in the tree.
 
-Work from the repository root. Before editing, inspect the current worktree and
-the smallest relevant call path; do not assume a clean tree or reformat unrelated
-files.
+Keep this document stable. It defines **how agents should modify the repository**, not a snapshot of the current implementation.
+
+Current implementation details belong in source code, configuration, README, and focused documents under `docs/`.
+
+## 1. Source of Truth
+
+When information conflicts, use this priority:
+
+```text
+runtime behavior and source code
+→ schema / configuration definitions
+→ focused domain documentation
+→ README
+→ agent guidance
+```
+
+Do not preserve outdated documentation behavior merely because it is described here.
+
+For code style, follow `docs/CODE_STYLE.md`.
+
+## 2. Repository Intent
+
+DexMani Real is safety-sensitive robotics research software.
+
+Changes should prioritize:
+
+1. correctness
+2. safety
+3. readable data flow
+4. debuggability
+5. reproducibility
+6. minimal conceptual complexity
+
+General-purpose extensibility is not a goal by itself.
+
+Prefer the simplest design that clearly represents the current system.
+
+## 3. Before Making Changes
+
+Always inspect the current worktree first.
+
+Do not assume:
+
+- the tree is clean
+- adjacent files are unchanged
+- documentation matches current behavior
+- a named component still has the same implementation
+
+Identify the smallest relevant call path.
+
+For a value or behavior, determine:
+
+```text
+definition
+→ producer
+→ transformation
+→ consumer
+→ side effect
+```
+
+When changing a boundary, inspect both sides of that boundary.
+
+Do not overwrite unrelated user changes.
+
+## 4. Change Scope
+
+Prefer a small vertical change over a broad horizontal refactor.
+
+A good change normally modifies only the components necessary to preserve one coherent behavior.
+
+Do not:
+
+- reformat unrelated files
+- rename unrelated APIs
+- reorganize directories during a bug fix
+- replace working code merely for stylistic uniformity
+- introduce infrastructure unrelated to the requested task
+
+If local cleanup is required to make the requested change understandable, keep it tightly scoped.
+
+## 5. Architectural Principles
+
+### 5.1 Explicit ownership
+
+Every important mutable resource should have a clear owner.
+
+This especially applies to:
+
+- hardware SDK instances
+- worker/process lifecycle
+- shared state
+- robot command publication
+- recording output
+- model runtime resources
+
+Do not create multiple competing owners for the same resource.
+
+### 5.2 Explicit boundaries
+
+Treat these as important system boundaries:
+
+```text
+hardware → software
+process → process
+model → control
+control → robot
+runtime → storage
+storage → runtime
+user input → robot behavior
+```
+
+Validate important shape, dtype, unit, frame, freshness and state assumptions at these boundaries.
+
+Avoid duplicating identical validation throughout internal helpers.
+
+### 5.3 One source of truth
+
+Do not create parallel definitions of:
+
+- configuration defaults
+- shared data layouts
+- persisted schemas
+- state semantics
+- safety constraints
+
+Extend the existing canonical definition.
+
+### 5.4 Simple dependency direction
+
+Dependencies should follow domain ownership.
+
+Avoid circular imports and mutually dependent subsystems.
+
+Do not solve dependency problems with hidden imports unless the dependency is genuinely optional.
+
+### 5.5 Separate computation from side effects
+
+Whenever practical, isolate pure:
+
+- geometry
+- transformations
+- filtering
+- validation
+- trajectory computation
+- data conversion
+
+from:
+
+- hardware IO
+- process communication
+- file IO
+- visualization
+- logging
+
+This keeps important algorithms testable without hardware.
+
+## 6. Hardware and Process Safety
+
+Never run hardware-affecting code unless explicitly requested by the user.
+
+Do not assume that a Python script is harmless merely because it is under `examples/`.
+
+Imports and constructors should not introduce new hidden hardware side effects.
+
+Prefer explicit lifecycle APIs such as:
+
+```text
+construct
+→ start/connect
+→ operate
+→ stop/close
+```
+
+A live hardware SDK object should remain local to its owning component or process.
+
+Do not pass live SDK objects through multiprocessing boundaries.
+
+Do not bypass an existing safety boundary in order to simplify an implementation or make a test pass.
+
+## 7. Coding Style
+
+Follow `docs/CODE_STYLE.md`.
+
+Important defaults:
+
+- precise `snake_case` names
+- `PascalCase` classes
+- units in physical-value names when ambiguous
+- coordinate frames visible in robotics data names
+- grouped standard / third-party / project imports
+- no wildcard imports
+- one semantic responsibility per function
+- pure helpers for mathematical operations
+- early returns instead of deep nesting
+- classes only when state or ownership justifies them
+- cheap constructors
+- thin CLI and example scripts
+- explicit side effects
+- concise comments explaining why, not what
+
+Avoid generic names such as `Manager`, `Handler`, `Processor`, `Data`, or `Utils` when a domain-specific name exists.
+
+## 8. Avoid Overengineering
+
+Before adding any of the following, establish a concrete need:
+
+- abstract base class
+- protocol/interface
+- factory
+- registry
+- plugin system
+- generic event bus
+- dependency-injection layer
+- manager/service/controller hierarchy
+- adapter that only forwards calls
+
+Prefer direct composition.
+
+Prefer three obvious functions over a generic subsystem that requires significant navigation to understand.
+
+An abstraction should either:
+
+1. establish a meaningful system boundary, or
+2. remove demonstrated duplication.
+
+Do not abstract hypothetical future implementations.
+
+## 9. Configuration and Schemas
+
+Configuration should be traceable to one canonical default.
+
+Avoid independent fallback defaults scattered across workers and scripts.
+
+Pass components the configuration they actually own rather than an unnecessarily large global configuration object.
+
+Changes to shared or persisted data must be treated as boundary changes.
+
+When modifying such data, identify all relevant:
+
+```text
+writers
+→ representation
+→ readers
+→ persistence
+→ downstream consumers
+```
+
+Do not silently change the meaning of an existing persisted field.
+
+## 10. Concurrency
+
+Concurrency should remain explicit.
+
+For worker loops:
+
+- keep the critical loop narrow
+- avoid blocking unrelated IO
+- make startup and shutdown bounded
+- preserve failure visibility
+- use appropriate monotonic timing for elapsed-time logic
+- avoid silent exception swallowing
+
+Do not add multiprocessing merely to isolate ordinary synchronous code.
+
+Do not add synchronization without first identifying the actual shared mutable state.
+
+## 11. Refactoring Policy
+
+When simplifying complicated existing code, use this order:
+
+1. clarify names
+2. reveal data flow
+3. isolate pure computation
+4. remove duplication
+5. simplify ownership
+6. remove unnecessary wrappers
+7. split genuinely independent responsibilities
+
+Do not begin a cleanup by building a new abstraction framework around the existing code.
+
+Preserve externally visible behavior unless the task explicitly changes it.
+
+## 12. Verification
+
+Use the smallest relevant offline validation first.
+
+Typical safe checks include:
 
 ```bash
 git status --short
-rg -n "<symbol-or-config-key>" dexmani_real examples
-conda run -n real_robot python -m compileall -q dexmani_real examples
+python -m compileall -q dexmani_real examples
+git diff --check
+git diff --stat
 ```
 
-- Target environment: conda `real_robot`, Python 3.10, `PYTHONPATH=.`.
-- `pyproject.toml` is the only packaging configuration. Native planning, CUDA,
-  device-SDK, and robot dependencies are managed by the conda environment.
-- This repository has no conventional unit-test suite. Treat any `test_*.py`
-  under `examples/` as an interactive hardware program, never as a test.
-- Prefer a small deterministic offline check that exercises the changed pure
-  helper, dtype, reader, or lifecycle branch.
+Use focused unit-style scripts, mocks, fakes, or deterministic examples when appropriate.
 
-## 2. System model
+For changes involving lifecycle, IPC, recording or safety-sensitive logic, consider relevant failure paths in addition to the normal path.
 
-DexMani Real is a VR teleoperation, data collection, replay, and learned-policy
-deployment system for an xArm7 (7 DoF), XHand (12 DoF), Quest, and RealSense L515.
+Do not claim hardware validation unless hardware execution was actually performed.
 
-```text
-camera / VR / arm / hand ──shared-memory state──► teleop
-                                                     │
-                       arm queue ◄──────────────────┼──► hand command ring
-                                                     │
-                                         aligned sample ring
-                                                     ▼
-                                            RecorderIO ──► HDF5 episode v17
-```
-
-The main/lifecycle process resolves immutable configuration, creates
-`SharedStorage`, performs bounded read-only readiness checks, supervises worker
-health, and shuts down. It does not map VR poses, publish actions, or choose
-recording samples.
-
-A second controller — the learned-policy deployment coordinator — consumes a
-`policy_plan_ring` written by an inference worker and publishes robot actions
-through the same shared safety boundary; it never touches the arm/hand transport
-or safety state directly. See `dexmani_real/deployment/`.
-
-### Task router
-
-Start with the source of truth in this table, then follow only its direct
-producers and consumers.
-
-| If the task changes… | Start here | Then audit |
-|---|---|---|
-| Numeric default or runtime override | `config/defaults.py`, `config/runtime.py` | Derived rates, buffer capacities, timeouts, metadata, CLI overrides |
-| Cross-process state/action layout | `utils/schema.py` | `robot/types.py`, `SharedStorage`, producer, consumer, recording reader/writer |
-| Ring, queue, flag, event, or metric | `shm/shared_storage.py` | Allocation/cleanup, all writers/readers (including `policy_plan_ring`: `deployment/worker.py` → `deployment/coordinator.py`, latest-wins, maxlen 3), readiness, heartbeat, shutdown |
-| VR teleoperation behavior | `teleop/loop.py` | mapper, snapshot, hand control, IK fallback, action protocol, recording samples |
-| Arm/hand action or safety gate | `policy/safety.py` | `SafetyGate` validation → `send_command` → worker apply (`robot/arm_loop.py`, `robot/hand_process.py`), `robot/safety.py`, supervisor, homing and e-stop paths |
-| Learned-policy deployment | `deployment/coordinator.py`, `deployment/lifecycle.py` | `deployment/worker.py` (inference loop), `deployment/config.py`, `deployment/contracts.py` (Protocols), `integrations/` adapter, `policy_plan_ring` producer/consumer |
-| FK, IK, collision, or a joint path | `planning/` | teleop hold/fallback/delta clamp and replay dense preflight |
-| Episode schema or quality rule | `recording/` | reader, analysis, visualization, replay consumers, v17 schema contract |
-| Replay behavior | `examples/replay_episode.py` | provenance/dense preflight, session/runner, metrics, live safety path |
-| Episode visualization | `examples/visualize_episode.py` | Rerun integration, EpisodeReader, point cloud, time-series views |
-| Calibration | `examples/calibrate_camera.py`, `examples/calibrate_vr_heading.py` | explicit write/confirmation path and calibration JSON contract |
-| CLI surface | `examples/` | Keep the wrapper thin; put lifecycle and behavior in a domain module |
-
-## 3. Non-negotiable architecture
-
-Preserve these unless the user explicitly requests an architectural redesign.
-
-1. `SharedStorage` is the only cross-process data plane. Processes do not call
-   each other or exchange live SDK objects/mutable object graphs.
-2. `utils/schema.py` owns fixed-shape NumPy payload definitions. Cross-process
-   values must stay structured and shape/finite-validated at their boundary.
-3. Hardware SDK instances are local to their owning device worker/driver. Do
-   not add xArm/XHand SDK calls to main, policy, recorder, or replay code; never
-   share a live SDK instance across processes.
-4. Teleoperation owns control-grid, action, and episode/sample decisions.
-   `RecorderIO` only serializes, verifies, and transactionally publishes what
-   it receives.
-5. Recording is grid-aligned to `1 / control_hz` (normally 16 Hz), never
-   arrival-time sampled.
-6. The arm queue is ordered and intentionally bounded (`maxsize=2`). The hand
-   command ring is intentionally latest-wins.
-7. Shared control/state rings use seqlocks. `get_last_k(k)` is verified,
-   oldest-first, may return fewer than `k`, and rejects `k > maxlen`.
-8. `is_running`, `is_recording`, `error_state`, and `estop_request` are simple
-   shared flags. Only `safety_state` stores the `SafetyState` enum.
-9. `error_state` is sticky; heartbeats use `time.monotonic()`, never wall time.
-10. Main owns `DISARMED ↔ ARMED`, transition to `FAULT`, and shutdown. Policy
-    owns `ARMED ↔ RUNNING`; arm/hand workers only gate behavior on state.
-11. xArm Mode 6 firmware performs arm trajectory smoothing. Do not add
-    application-side arm interpolation; it can cause overshoot and C24 faults.
-12. Firmware is the final safety backstop. Application checks protect command
-    validity, recovery, data quality, and coordinated stop—they do not replace
-    firmware limits.
-13. `run_generation` invalidates stale queued/ring commands across begin, pause,
-    home, and feedback fault. Workers reject a command from an older generation
-    before it crosses the command boundary. A camera stall or camera-writer
-    error discards the episode without advancing generation; only the next
-    explicit BEGIN advances it.
-14. Recorder START/STOP boundaries, recorder status, and aligned samples are
-    fixed NumPy dtypes. Do not put JSON or an acknowledgement/apply protocol
-    in the shared-memory control path.
-15. Learned-policy deployment is layered: `integrations/` may import
-    `deployment/`, never the reverse. The inference worker only writes
-    `policy_plan_ring`; `deployment/coordinator.py` is the sole robot-action
-    producer and routes through the shared `SafetyGate`/`send_command` boundary.
-
-## 4. Hardware and operational safety
-
-Every program below `examples/` can affect hardware. Do **not** run
-teleoperation, replay, homing, calibration, or RealSense
-without explicit user authorization and confirmation that the
-workspace is clear and the hardware is ready. Do not use a module import as a
-shortcut when it might initialize a device SDK.
-
-Allowed without that authorization: static inspection, compilation, and focused
-offline tests with fakes/mocks. Do not weaken safety checks merely to make an
-offline check pass.
-
-Operational data is not disposable test data:
-
-- `dexmani_real/config/*.json` carries calibration/frame conventions.
-- Recordings, logs, videos, and temporary episode directories may be large and
-  safety-relevant. Do not delete or rewrite them without an explicit target.
-- The xArm default address is `192.168.1.111`; never probe it without approval.
-- Quest HTS uses TCP 8000; the L515 should use a direct USB 3 connection.
-
-## 5. Change playbooks
-
-Use the smallest vertical slice that fully preserves a contract.
-
-| Change | Required impact check |
-|---|---|
-| Add/change arm or hand state | dtype → documentation dataclass → worker write → policy read → recording path → reader/analysis if persisted |
-| Add/change a recording dataset | schema dtype → recorder → reader → analysis/visualization → replay consumer → v17 schema contract |
-| Add/change a ring or queue | `SharedStorage` create/close → producer → consumer → readiness/heartbeat → failure/shutdown behavior |
-| Change IK/collision logic | planner + candidate/fallback behavior + hold-on-failure + delta clamp + frame-quality flags + replay preflight |
-| Change a rate/default | `config/defaults.py` first → all derived durations/capacities/timeouts → metadata and CLI help |
-| Change safety/fault transition | supervisor + policy + arm + hand + shutdown + e-stop, including sticky-fault behavior |
-| Change learned-policy deployment | `deployment/config.py` → `deployment/contracts.py` (Protocols, no torch) → `deployment/worker.py` → `deployment/coordinator.py` → `deployment/lifecycle.py` → `integrations/` adapter (integration → deployment only) |
-| Add an entry point | Thin `examples/` forwarding CLI → domain lifecycle that owns storage, spawn, readiness, supervision, and shutdown |
-
-Do not silently change HDF5 meaning in place. Runtime episodes use schema v17
-only: coordinate format changes across writer, reader, visualization, replay,
-and the schema marker. The direct recording backend must remain field-for-field
-compatible with the RecorderIO backend.
-
-## 6. Implementation rules
-
-- Use Python 3.10+ syntax and `from __future__ import annotations` in new
-  modules. Use dataclasses for configuration/state and NumPy arrays for numeric
-  payloads.
-- Keep units in names (`_rad`, `_deg`, `_m`, `_s`, `_hz`); unsuffixed angles are
-  radians. Validate shapes and finite values at module/process boundaries.
-- Put `logger = get_logger(__name__)` after imports. Log caught operational
-  exceptions with context and `exc_info=True`; never silently swallow a control,
-  hardware, IPC, or recording fault.
-- Use `field(default_factory=...)` for mutable dataclass fields. Do not mutate a
-  published state/action array in place.
-- Keep control loops free of blocking file, camera, network, or UI work. Put
-  pure math and transforms in small helpers that can be tested offline.
-- Avoid broad refactors while addressing a focused issue. Preserve unrelated
-  changes in a dirty worktree.
-
-## 7. Finish definition
+## 13. Finishing a Task
 
 Before handing off:
 
-1. Inspect the focused diff and `git status --short`; do not overwrite or
-   include unrelated modifications.
-2. Verify changed paths/commands and run the least risky relevant offline check.
-3. Run `conda run -n real_robot python -m compileall -q dexmani_real examples`
-   for Python-source changes unless a narrower check is more appropriate.
-4. For safety/process changes, cover startup failure, normal shutdown, worker
-   death, heartbeat timeout, sticky fault, and e-stop with fakes/mocks where
-   feasible.
-5. Report exactly what was and was not run. Hardware validation is a separate,
-   explicitly authorized manual step.
+1. inspect the final diff
+2. preserve unrelated worktree changes
+3. remove debugging artifacts
+4. check for duplicated logic
+5. check for unnecessary abstractions
+6. run appropriate safe validation
+7. report what changed
+8. report what was tested
+9. report important validation that was not performed
 
-Update `README.md` when the file map or user-facing architecture changes, and
-update `CLAUDE.md` when implementation routing, ownership, or a key invariant
-changes.
+The final implementation should be understandable without requiring the agent conversation that produced it.
+
+## 14. Documentation Maintenance
+
+Do **not** modify this file for ordinary implementation changes.
+
+The following should normally live elsewhere:
+
+- module inventories
+- exact filenames for every subsystem
+- current schema version
+- queue/ring capacities
+- device addresses
+- ports
+- concrete dataset field lists
+- current hardware parameters
+- individual CLI commands
+- temporary architectural migration state
+
+Use:
+
+- source code for executable truth
+- configuration for tunable values
+- README for user-facing navigation
+- `docs/` for domain contracts and architecture
+- `CODE_STYLE.md` for coding conventions
+
+Update `AGENTS.md` only when the repository-wide **agent working contract, safety policy, or engineering philosophy** changes.

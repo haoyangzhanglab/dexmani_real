@@ -10,6 +10,7 @@ import numpy as np
 
 from dexmani_real.config.defaults import arm, hand, safety
 from dexmani_real.planning import XArm7MotionPlanner
+from dexmani_real.planning.kinematics import make_arm_fk
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.policy.safety import publish_hand_home_and_wait_applied
 from dexmani_real.robot.homing import send_arm_home
@@ -39,12 +40,11 @@ def _reset_mapper_from_frames(
     if "connected" in names and not bool(arm_state["connected"][0]):
         mapper.clear()
         return False
-    eef_pos = np.asarray(arm_state["eef_pos"][0], dtype=np.float64)
-    eef_rot6d = np.asarray(arm_state["eef_rot6d"][0], dtype=np.float64)
-    if eef_pos.shape != (3,) or eef_rot6d.shape != (6,):
-        mapper.clear()
-        return False
-    if not np.all(np.isfinite(eef_pos)) or not np.all(np.isfinite(eef_rot6d)):
+    try:
+        eef_pos, eef_rot6d = make_arm_fk().compute(
+            np.asarray(arm_state["qpos"][0], dtype=np.float64)
+        )
+    except Exception:
         mapper.clear()
         return False
     c1 = eef_rot6d[:3]
@@ -159,14 +159,16 @@ def _do_teleop_home(
         )
         return prev_hand_qpos
 
-    # Step 2: arm home (collision-checked path via HOME_SENTINEL). Planning uses
-    # configured hand-home geometry by explicit operator policy; it does not
-    # wait for or substitute measured hand convergence.
+    # Step 2: arm home (collision-checked path). Planning uses configured
+    # hand-home geometry by explicit operator policy; it does not wait for or
+    # substitute measured hand convergence.
     _arm_state = _read_arm_state(shared)
     if _arm_state is None:
         logger.warning("arm home cancelled: no current arm state")
         return prev_hand_qpos
-    _state_age_s = time.monotonic() - float(_arm_state["timestamp"][0])
+    _state_age_s = (
+        time.monotonic_ns() - int(_arm_state["source_monotonic_ns"][0])
+    ) * 1e-9
     if (
         _state_age_s > arm_home_state_max_age_s
         or not bool(_arm_state["connected"][0])
@@ -207,7 +209,7 @@ def _do_teleop_home(
         print("  arm: home reached", flush=True)
     else:
         logger.warning(
-            "arm home failed or was cancelled; see correlated HOME result above"
+            "arm home failed or was cancelled"
         )
 
     return prev_hand_qpos

@@ -25,7 +25,7 @@ from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_l
 from dexmani_real.deployment.provenance import log_deployment_provenance, sha256_file
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.robot.arm_loop import arm_loop
-from dexmani_real.robot.arm_sdk import ArmLoopConfig
+from dexmani_real.config.runtime import ArmLoopConfig
 from dexmani_real.robot.hand_process import HandProcessConfig, hand_loop
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
 from dexmani_real.runtime.processes import (

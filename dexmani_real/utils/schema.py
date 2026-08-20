@@ -59,7 +59,7 @@ HAND_FINGERTIP_SHAPE = (HAND_FINGER_COUNT, 3)
 # rather than silently truncate.
 MAX_POLICY_CHUNK_STEPS = 32
 
-_COMMAND_COMMON_FIELDS = [
+_HAND_COMMAND_COMMON_FIELDS = [
     ("run_generation", "<u8"),
     ("observation_id", "<u8"),
     ("action_id", "<u8"),
@@ -69,11 +69,20 @@ _COMMAND_COMMON_FIELDS = [
     ("is_hold", "<u1"),
 ]
 
+# The arm command ring is latest-wins: the worker applies the newest endpoint
+# and never replays history, so staleness is decided by ``action_id`` against
+# the sequence captured when motion was armed, plus a bounded command age.
 ARM_COMMAND_DTYPE = np.dtype(
-    _COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", ARM_JOINT_SHAPE)], align=True
+    [
+        ("action_id", "<u8"),
+        ("created_monotonic_ns", "<u8"),
+        ("is_hold", "<u1"),
+        ("qpos_cmd", "<f8", ARM_JOINT_SHAPE),
+    ],
+    align=True,
 )
 HAND_COMMAND_DTYPE = np.dtype(
-    _COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", HAND_JOINT_SHAPE)], align=True
+    _HAND_COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", HAND_JOINT_SHAPE)], align=True
 )
 
 # Learned-policy plan payload. The inference worker writes
@@ -103,31 +112,18 @@ ARM_STATE_DTYPE = np.dtype(
         ("qpos", "<f8", ARM_JOINT_SHAPE),
         ("qvel", "<f8", ARM_JOINT_SHAPE),
         ("tau", "<f8", ARM_JOINT_SHAPE),
-        ("eef_pos", "<f8", (3,)),
-        ("eef_rot6d", "<f8", (6,)),
         ("error_code", "<i4"),
+        # Worker-alive indicator kept for the shared feedback-health predicate;
+        # a disconnect now fails the worker, so this is truthful while alive.
         ("connected", "<u1"),
-        ("mode", "<i4"),
         ("tracking_err", "<f8"),
         ("last_cmd_seq", "<u8"),
-        ("last_cmd_created_s", "<f8"),
-        ("last_cmd_received_s", "<f8"),
-        ("last_cmd_applied_s", "<f8"),
-        ("last_cmd_queue_latency_s", "<f8"),
-        ("last_cmd_apply_latency_s", "<f8"),
-        ("last_cmd_sdk_duration_s", "<f8"),
         ("last_cmd_is_hold", "<u1"),
         ("source_monotonic_ns", "<u8"),
+        # Load-bearing for causal consumer selection (shm/causal_reader.py,
+        # deployment observation history, recording sample alignment).
         ("publish_monotonic_ns", "<u8"),
         ("state_valid", "<u1"),
-        # Truthful "the arm worker is currently accepting servo commands" signal.
-        # 0 during DISARMED/FAULT, homing, and the whole non-blocking Mode-6
-        # entry window; 1 only in the frame that first confirms the movable
-        # Mode-6 postcondition.  Consumers must gate on this *and* ``mode == 6``:
-        # ``mode`` alone stays 6 across a re-arm because stop_controller never
-        # resets the cached mode, so it is necessary but not sufficient.
-        ("accepts_motion_commands", "<u1"),
-        ("timestamp", "<f8"),
     ]
 )
 
@@ -290,9 +286,6 @@ def make_record_sample_dtype(
             ("state_timestamp", "<f8"),
             ("hand_error_state", "<u1"),
             ("arm_last_cmd_seq", "<u8"),
-            ("arm_last_cmd_queue_latency_s", "<f8"),
-            ("arm_last_cmd_apply_latency_s", "<f8"),
-            ("arm_last_cmd_sdk_duration_s", "<f8"),
             ("arm_last_cmd_is_hold", "<u1"),
             ("action_arm_qpos", "<f8", ARM_JOINT_SHAPE),
             ("action_hand_qpos", "<f8", HAND_JOINT_SHAPE),

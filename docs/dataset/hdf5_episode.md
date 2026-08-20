@@ -1,4 +1,4 @@
-# DexMani Real schema v17
+# DexMani Real schema v18（reader 兼容 v17）
 
 本文只描述 Real runtime 的当前 episode 合同。字段的最终来源是
 [`recording/episode_schema.py`](../../dexmani_real/recording/episode_schema.py)、writer 和
@@ -33,8 +33,17 @@ raw episode 始终只读；清洗只在 processed HDF5 中保存删除行、压�
 
 writer 先写临时目录，完成帧数、schema、相机侧车和 metadata 校验后再原子发布。失败、相机写盘错误、队列溢出、codec 错误或磁盘错误不能发布半成品。
 
-runtime 只接受 `schema_version=17`。非 v17 文件必须在 runtime 外迁移；不能只修改
-version attribute 伪装成 v17。
+runtime **写 v18**；reader 接受 `schema_version ∈ {17, 18}`（`SUPPORTED_EPISODE_SCHEMA_VERSIONS`），
+所以既有 v17 episode 保持可读、可清洗、可 replay。其它版本必须在 runtime 外迁移；不能只改
+version attribute 伪装成受支持版本。
+
+**v18 与 v17 的唯一差异**：v18 不再写 3 个 arm 命令延迟 dataset
+（`arm_last_cmd_queue_latency_s`、`arm_last_cmd_apply_latency_s`、`arm_last_cmd_sdk_duration_s`）。
+它们度量的是 arm worker 内部的逐命令时序，而该 worker 已改为 fail-fast、不再产出这些遥测。
+其余 dataset（含 `arm_connected`、`arm_last_cmd_seq`、`arm_last_cmd_is_hold`、
+`arm_publish_monotonic_ns`、`tracking_error`）语义不变，因此离线清洗与质量规则不受影响。
+必需 dataset 集按版本切换：`required_dataset_names(schema_version)`；读 v17 文件时多出的
+3 个 dataset 被容忍。
 
 ## 2. 固定合同
 
@@ -42,10 +51,10 @@ version attribute 伪装成 v17。
 |---|---|
 | 行语义 | 一个 `1 / control_hz` 控制网格槽；不是传感器到达事件 |
 | 数量 | `N = /meta.num_frames`，所有逐帧 dataset 首维都应为 `N` |
-| 基础 dataset | `BASE_DATASET_SPECS_V17` 定义的 93 个无条件字段 |
-| sent arm stream | `/meta.arm_sent_stream=True` 且存在 `action_arm_joint_sent` 时增加；不是所有 v17 都无条件拥有 |
+| 基础 dataset | `required_dataset_names(schema_version)`：v18 为 90 个，v17 为 93 个（多 3 个 arm 命令延迟 dataset）；规格由 `BASE_DATASET_SPECS_V17` 统一定义 |
+| sent arm stream | `/meta.arm_sent_stream=True` 且存在 `action_arm_joint_sent` 时增加；不是所有 episode 都无条件拥有 |
 | dtype/shape | 由 `episode_schema.py` 统一定义；writer、reader、finalizer 共用校验器 |
-| recorder backend | RecorderIO 消费固定共享内存控制/样本 payload，并输出 schema-v17 episode |
+| recorder backend | RecorderIO 消费固定共享内存控制/样本 payload，并输出 schema-v18 episode |
 | point cloud | 不写 `pointcloud.h5`；从 depth、相机 metadata 和点云配置在消费边界确定性派生 |
 
 不要根据 dataset 数量猜 schema；先读 `/meta.schema_version`、`arm_sent_stream` 和实际 keys，再调用 `EpisodeReader.require_valid()`。
@@ -154,4 +163,4 @@ rows = (
 
 ## 9. 修改格式时
 
-先修改 `recording/episode_schema.py`，再同步 writer、reader、processing、visualization、replay 和文档。任何字段名、shape、dtype、单位、frame 或时间语义变化都应按 schema 变更处理；不要在 v17 文件中静默混入新含义。
+先修改 `recording/episode_schema.py`，再同步 writer、reader、processing、visualization、replay 和文档。任何字段名、shape、dtype、单位、frame 或时间语义变化都应按 schema 变更处理；不要在已发布文件中静默混入新含义。删除 dataset 时同时更新 `EPISODE_SCHEMA_VERSION`、`SUPPORTED_EPISODE_SCHEMA_VERSIONS` 与 `required_dataset_names()`，让旧版本保持可读。

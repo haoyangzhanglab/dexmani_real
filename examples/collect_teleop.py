@@ -40,7 +40,7 @@ from dexmani_real.policy.safety import publish_hand_home_and_wait_applied
 from dexmani_real.recording.io_process import RecorderIOConfig, recorder_io_loop
 from dexmani_real.recording.recorder_client import RecorderPhase
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
-from dexmani_real.robot.arm_sdk import ArmLoopConfig
+from dexmani_real.config.runtime import ArmLoopConfig
 from dexmani_real.robot.hand_process import HandProcessConfig
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
@@ -172,8 +172,6 @@ def _preflight_health_issues(
             max_age_s=float(runtime.policy.arm_state_stale_threshold_s),
             qpos=arm["qpos"][0],
             qvel=arm["qvel"][0],
-            eef_pos=arm["eef_pos"][0],
-            eef_rot6d=arm["eef_rot6d"][0],
         )
         if arm_issue is not None:
             issues.append(arm_issue)

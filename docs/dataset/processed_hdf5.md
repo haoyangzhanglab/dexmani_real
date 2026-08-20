@@ -1,6 +1,6 @@
 # DexMani Real processed HDF5 v3 与 Policy Zarr
 
-本文定义 schema-v17 raw episode 的离线清洗、Real-native processed HDF5 和
+本文定义 Real raw episode（schema v18，兼容 v17）的离线清洗、Real-native processed HDF5 和
 dexmani_policy Zarr 合同。Sim 格式只用于参考键名；Real 与 Sim 数据不会混用，数值、
 frame 和单位不要求相同。
 

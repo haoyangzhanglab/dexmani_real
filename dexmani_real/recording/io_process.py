@@ -294,9 +294,6 @@ def _unpack_sample(
         hand_current=np.array(record["hand_current"], copy=True),
         hand_error_state=bool(record["hand_error_state"]),
         arm_last_cmd_seq=int(record["arm_last_cmd_seq"]),
-        arm_last_cmd_queue_latency_s=float(record["arm_last_cmd_queue_latency_s"]),
-        arm_last_cmd_apply_latency_s=float(record["arm_last_cmd_apply_latency_s"]),
-        arm_last_cmd_sdk_duration_s=float(record["arm_last_cmd_sdk_duration_s"]),
         arm_last_cmd_is_hold=bool(record["arm_last_cmd_is_hold"]),
     )
     action = RobotAction(

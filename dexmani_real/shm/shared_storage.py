@@ -9,7 +9,6 @@ from __future__ import annotations
 import multiprocessing as mp
 import time
 from dataclasses import dataclass, field
-from enum import IntEnum
 from typing import Any
 
 import numpy as np
@@ -20,6 +19,7 @@ from dexmani_real.shm.camera_ring import CameraRingBuffer
 from dexmani_real.shm.ring_buffer import SharedMemoryRingBuffer
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import (
+    ARM_COMMAND_DTYPE,
     ARM_STATE_DTYPE,
     HAND_COMMAND_DTYPE,
     HAND_JOINT_SHAPE,
@@ -80,7 +80,8 @@ class SharedStorageConfig:
         default_factory=lambda: camera.depth_shape
     )
 
-    arm_action_q_maxsize: int = 2
+    arm_cmd_ring_maxlen: int = 4
+    arm_home_q_maxsize: int = 2
 
     workspace_bounds: "np.ndarray" = field(
         default_factory=lambda: policy.workspace.as_array()
@@ -98,7 +99,8 @@ class SharedStorageConfig:
             self.record_sample_ring_maxlen,
             self.record_status_ring_maxlen,
             self.policy_plan_ring_maxlen,
-            self.arm_action_q_maxsize,
+            self.arm_cmd_ring_maxlen,
+            self.arm_home_q_maxsize,
         )
         if any(int(value) <= 0 for value in capacities):
             raise ValueError("SharedStorage ring/queue capacities must be positive")
@@ -147,40 +149,6 @@ class SharedStorageConfig:
         )
 
 
-HOME_SENTINEL = "__HOME__"
-
-
-class HomeOutcome(IntEnum):
-    """Terminal outcome of one planned-homing execution."""
-
-    SUCCESS = 0
-    CANCELLED = 1
-    FAILED = 2
-
-
-@dataclass(frozen=True)
-class HomeRequest:
-    request_id: int
-    run_generation: int
-    waypoints: np.ndarray
-    final_qpos: np.ndarray
-    execution_timeout_s: float
-
-
-@dataclass(frozen=True)
-class HomeResult:
-    request_id: int
-    outcome: HomeOutcome
-    reason: str
-    final_qpos: np.ndarray
-    completed_at_s: float
-
-    @property
-    def success(self) -> bool:
-        """Compatibility view: True only for a converged SUCCESS outcome."""
-        return self.outcome is HomeOutcome.SUCCESS
-
-
 _RING_RESOURCE_NAMES = (
     "camera_ring",
     "vr_ring",
@@ -192,8 +160,9 @@ _RING_RESOURCE_NAMES = (
     "record_sample_ring",
     "record_status_ring",
     "policy_plan_ring",
+    "arm_cmd_ring",
 )
-_QUEUE_RESOURCE_NAMES = ("arm_action_q", "arm_home_result_q")
+_QUEUE_RESOURCE_NAMES = ("arm_home_q",)
 _ALLOCATION_ROLLBACK_ATTEMPTS = 2
 
 # Ordered heartbeat slots — one fixed array. Index order is stable across
@@ -253,11 +222,12 @@ class SharedStorage:
     record_status_ring: SharedMemoryRingBuffer  # RecorderIO -> policy/main
     policy_plan_ring: SharedMemoryRingBuffer  # inference -> coordinator, latest-wins
 
-    arm_action_q: mp.Queue  # policy -> ordered arm endpoints + HOME, maxsize=2
-    arm_home_result_q: mp.Queue  # arm -> requester; request_id correlates replies
+    arm_cmd_ring: SharedMemoryRingBuffer  # policy -> arm servo endpoints, latest-wins
+    arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, generation)
     arm_command_seq: (
         Any  # all actuator-action producers -> globally unique monotonic IDs
     )
+    arm_armed_at_seq: Any  # command seq at arm time; older endpoints are stale
     run_generation: Any  # controller advances it to invalidate old policy proposals
     recorder_consumed_sequence: Any
     action_control_hz: float
@@ -400,9 +370,16 @@ class SharedStorage:
             maxlen=cfg.policy_plan_ring_maxlen,
         )
 
-        storage.arm_action_q = ctx.Queue(maxsize=cfg.arm_action_q_maxsize)
-        storage.arm_home_result_q = ctx.Queue(maxsize=cfg.arm_action_q_maxsize)
+        storage.arm_cmd_ring = SharedMemoryRingBuffer.create_or_replace(
+            f"{prefix}_arm_cmd",
+            dtype=ARM_COMMAND_DTYPE,
+            maxlen=cfg.arm_cmd_ring_maxlen,
+        )
+        storage.arm_home_q = ctx.Queue(maxsize=cfg.arm_home_q_maxsize)
         storage.arm_command_seq = ctx.Value("Q", 0)
+        # Sequence captured when motion was armed; the worker ignores endpoints
+        # created before it so a re-arm never replays pre-disarm commands.
+        storage.arm_armed_at_seq = ctx.Value("Q", 0)
         storage.run_generation = ctx.Value("Q", 1)
         storage.recorder_consumed_sequence = ctx.Value("Q", 0)
         storage.action_control_hz = float(cfg.control_hz)
@@ -564,10 +541,12 @@ def read_hand_state(shared: "SharedStorage") -> "np.ndarray | None":
 def read_arm_state_dict(shared: "SharedStorage") -> "dict | None":
     """Read latest arm state from ring. Return dict of numpy arrays or None.
 
-    Fields: qpos(7), qvel(7), tau(7), eef_pos(3), eef_rot6d(6),
-            error_code, connected, mode, tracking_err, state_valid,
-            accepts_motion_commands, and last-command timing.
+    Fields: qpos(7), qvel(7), tau(7), error_code, connected, tracking_err,
+            last_cmd_seq, last_cmd_is_hold, source/publish timestamps,
+            state_valid.
     Callers must validate fields they depend on (e.g. ``np.all(np.isfinite(d["qpos"]))``).
+    The EEF pose is not published; derive it from ``qpos`` via
+    ``planning.kinematics.make_arm_fk()`` when needed.
     """
     data = read_arm_state(shared)
     if data is None:
@@ -576,24 +555,14 @@ def read_arm_state_dict(shared: "SharedStorage") -> "dict | None":
         "qpos": np.asarray(data["qpos"][0], dtype=np.float64),
         "qvel": np.asarray(data["qvel"][0], dtype=np.float64),
         "tau": np.asarray(data["tau"][0], dtype=np.float64),
-        "eef_pos": np.asarray(data["eef_pos"][0], dtype=np.float64),
-        "eef_rot6d": np.asarray(data["eef_rot6d"][0], dtype=np.float64),
         "error_code": int(data["error_code"][0]),
         "connected": bool(data["connected"][0]),
-        "mode": int(data["mode"][0]),
         "tracking_err": float(data["tracking_err"][0]),
         "last_cmd_seq": int(data["last_cmd_seq"][0]),
-        "last_cmd_created_s": float(data["last_cmd_created_s"][0]),
-        "last_cmd_received_s": float(data["last_cmd_received_s"][0]),
-        "last_cmd_applied_s": float(data["last_cmd_applied_s"][0]),
-        "last_cmd_queue_latency_s": float(data["last_cmd_queue_latency_s"][0]),
-        "last_cmd_apply_latency_s": float(data["last_cmd_apply_latency_s"][0]),
-        "last_cmd_sdk_duration_s": float(data["last_cmd_sdk_duration_s"][0]),
         "last_cmd_is_hold": bool(data["last_cmd_is_hold"][0]),
         "source_monotonic_ns": int(data["source_monotonic_ns"][0]),
         "publish_monotonic_ns": int(data["publish_monotonic_ns"][0]),
         "state_valid": bool(data["state_valid"][0]),
-        "accepts_motion_commands": bool(data["accepts_motion_commands"][0]),
     }
 
 

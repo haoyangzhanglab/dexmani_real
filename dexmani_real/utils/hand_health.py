@@ -32,8 +32,6 @@ def validate_arm_feedback(
     max_age_s: float,
     qpos: np.ndarray,
     qvel: np.ndarray,
-    eef_pos: np.ndarray,
-    eef_rot6d: np.ndarray,
 ) -> str | None:
     """Return why required arm feedback is unusable, or ``None``."""
     if not connected:
@@ -52,8 +50,6 @@ def validate_arm_feedback(
     fields = {
         "qpos": (np.asarray(qpos), ARM_JOINT_SHAPE),
         "qvel": (np.asarray(qvel), ARM_JOINT_SHAPE),
-        "eef_pos": (np.asarray(eef_pos), (3,)),
-        "eef_rot6d": (np.asarray(eef_rot6d), (6,)),
     }
     for name, (value, expected_shape) in fields.items():
         if value.shape != expected_shape:

@@ -83,9 +83,6 @@ class RobotState:
     )
 
     arm_last_cmd_seq: int = 0
-    arm_last_cmd_queue_latency_s: float = 0.0  # producer -> arm queue receive
-    arm_last_cmd_apply_latency_s: float = 0.0  # producer -> successful SDK return
-    arm_last_cmd_sdk_duration_s: float = 0.0  # duration of set_servo_angle()
     # Safety/IK fallback endpoint marker; ordinary command quiescence publishes
     # no endpoint.
     arm_last_cmd_is_hold: bool = False

@@ -3,7 +3,7 @@
 The inference worker is the *only* process that touches the backend. It reads
 causal observations from the shared rings, runs ``encode -> infer -> decode``,
 and publishes the resulting :class:`~dexmani_real.deployment.contracts.JointActionChunk`
-to the latest-wins ``policy_plan_ring``. It never writes ``arm_action_q``,
+to the latest-wins ``policy_plan_ring``. It never writes ``arm_cmd_ring``,
 ``hand_cmd_ring``, the SDK, ``SafetyState``, or ``run_generation`` — model output
 is a proposal, not a robot command.
 

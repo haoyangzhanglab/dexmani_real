@@ -167,10 +167,11 @@ class HandProcessConfig:
 def _safe_disconnect(hand) -> bool:
     """Disconnect the hand driver, tolerating a never-connected instance.
 
-    Mirrors ``_disconnect_arm`` (arm_loop.py): the single cleanup path for the
-    hand worker, reached from every exit (startup failure, init exception, loop
-    exit, or fault).  Returns True when there is nothing to disconnect or the
-    disconnect succeeds; a raised disconnect is logged and reported as False.
+    Mirrors the arm cleanup path (``XArm7.close`` in robot/xarm7.py): the
+    single cleanup path for the hand worker, reached from every exit (startup
+    failure, init exception, loop exit, or fault).  Returns True when there is
+    nothing to disconnect or the disconnect succeeds; a raised disconnect is
+    logged and reported as False.
     """
     if hand is None:
         return True

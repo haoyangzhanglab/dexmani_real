@@ -23,7 +23,19 @@ from dexmani_real.utils.schema import (
     HAND_TACTILE_SUM_SHAPE,
 )
 
-EPISODE_SCHEMA_VERSION = 17
+EPISODE_SCHEMA_VERSION = 18
+# Runtime writes v18 only; readers accept v17 as well.  v18 drops the three
+# arm command-latency datasets: they measured timing internal to the arm
+# worker, which no longer publishes them (fail-fast worker, no per-command
+# telemetry).  Every other dataset keeps its v17 semantics.
+SUPPORTED_EPISODE_SCHEMA_VERSIONS: frozenset[int] = frozenset({17, 18})
+ARM_WORKER_TELEMETRY_DATASETS_V17: frozenset[str] = frozenset(
+    {
+        "arm_last_cmd_queue_latency_s",
+        "arm_last_cmd_apply_latency_s",
+        "arm_last_cmd_sdk_duration_s",
+    }
+)
 ARM_SENT_DATASET = "action_arm_joint_sent"
 ARM_SENT_MARKER = "arm_sent_stream"
 
@@ -166,7 +178,9 @@ ALIGNMENT_DATASET_NAMES_V17 = frozenset(
     }
 )
 SOURCE_FRAME_DATASET_NAMES_V17 = (
-    frozenset(BASE_DATASET_SPECS_V17) - ALIGNMENT_DATASET_NAMES_V17
+    frozenset(BASE_DATASET_SPECS_V17)
+    - ALIGNMENT_DATASET_NAMES_V17
+    - ARM_WORKER_TELEMETRY_DATASETS_V17
 )
 
 # These are value overrides for fields already present in the base contract,
@@ -273,19 +287,32 @@ def normalize_diagnostics_v17(
     return normalized
 
 
+def required_dataset_names(schema_version: int = EPISODE_SCHEMA_VERSION) -> frozenset[str]:
+    """Return the datasets a ``data.h5`` of *schema_version* must contain.
+
+    v18 drops the arm-worker telemetry datasets; v17 episodes keep them and
+    stay readable (the extra datasets are accepted as known-but-optional).
+    """
+    if int(schema_version) <= 17:
+        return frozenset(BASE_DATASET_SPECS_V17)
+    return frozenset(BASE_DATASET_SPECS_V17) - ARM_WORKER_TELEMETRY_DATASETS_V17
+
+
 def validate_data_layout_v17(
     dataset_shapes: Mapping[str, tuple[int, ...]],
     dataset_dtypes: Mapping[str, Any],
     *,
     frame_count: int,
     arm_sent_stream: bool,
+    schema_version: int = EPISODE_SCHEMA_VERSION,
 ) -> tuple[str, ...]:
     """Return deterministic errors for one ``data.h5`` or in-memory layout.
 
     Unknown historical diagnostic datasets are accepted, but—like every
     writer-produced data stream—they must have a grid dimension equal to
-    ``frame_count``.  Known fields additionally require their exact v17 tail
-    shape and dtype.
+    ``frame_count``.  Known fields additionally require their exact tail shape
+    and dtype.  ``schema_version`` selects the required dataset set (v17 keeps
+    the arm-worker telemetry datasets, v18 drops them).
     """
 
     errors: list[str] = []
@@ -293,7 +320,7 @@ def validate_data_layout_v17(
         errors.append(f"num_frames must be non-negative, got {frame_count}")
 
     names = set(dataset_shapes)
-    missing = sorted(set(BASE_DATASET_SPECS_V17) - names)
+    missing = sorted(required_dataset_names(schema_version) - names)
     if missing:
         errors.append(f"missing required data.h5 datasets: {missing}")
 
@@ -345,6 +372,9 @@ __all__ = [
     "ARM_RAW_ACTION_VALIDITY_EXPRESSION",
     "ARM_SENT_DATASET",
     "ARM_SENT_MARKER",
+    "ARM_WORKER_TELEMETRY_DATASETS_V17",
+    "SUPPORTED_EPISODE_SCHEMA_VERSIONS",
+    "required_dataset_names",
     "BASE_DATASET_SPECS_V17",
     "CONDITIONAL_DATASET_SPECS_V17",
     "DIAGNOSTIC_TAIL_SHAPES_V17",

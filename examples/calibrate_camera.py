@@ -65,6 +65,7 @@ if str(_repo_root) not in sys.path:
 from dexmani_real import PACKAGE_DIR
 from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
 from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
+from dexmani_real.planning.kinematics import make_arm_fk
 from dexmani_real.planning.pose_utils import quat_multiply, rot6d_to_quat_wxyz
 from dexmani_real.policy.safety import (
     advance_run_generation,
@@ -73,7 +74,7 @@ from dexmani_real.policy.safety import (
 )
 from dexmani_real.recording.transaction import atomic_json_dump
 from dexmani_real.robot.arm_loop import arm_loop
-from dexmani_real.robot.arm_sdk import ArmLoopConfig
+from dexmani_real.config.runtime import ArmLoopConfig
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
 from dexmani_real.runtime.processes import WorkerSpec, build_processes, start_processes
@@ -535,8 +536,6 @@ def _read_initial_arm(shared: SharedStorage, runtime: ResolvedRuntimeConfig) -> 
                 max_age_s=float(runtime.policy.arm_state_stale_threshold_s),
                 qpos=state["qpos"],
                 qvel=state["qvel"],
-                eef_pos=state["eef_pos"],
-                eef_rot6d=state["eef_rot6d"],
             )
             if issue is None and state["error_code"] == 0:
                 return state
@@ -569,9 +568,9 @@ def _runtime_issue(shared: SharedStorage, arm_process: Any, heartbeat_timeout_s:
     return None
 
 
-def _eef_rpy_from_state(arm_state: dict[str, Any]) -> np.ndarray:
-    """Convert arm state rot6d to RPY (rad) via the canonical library path."""
-    q_wxyz = rot6d_to_quat_wxyz(arm_state["eef_rot6d"])
+def _eef_rpy_from_rot6d(rot6d: np.ndarray) -> np.ndarray:
+    """Convert arm EEF rot6d to RPY (rad) via the canonical library path."""
+    q_wxyz = rot6d_to_quat_wxyz(rot6d)
     rpy = Rotation.from_quat(np.roll(q_wxyz, -1)).as_euler("xyz", degrees=False)
     return np.asarray(rpy, dtype=np.float64)
 
@@ -666,14 +665,12 @@ def _run_calibration(
             max_age_s=float(policy.arm_state_stale_threshold_s),
             qpos=np.asarray(arm_state["qpos"], dtype=np.float64),
             qvel=arm_state["qvel"],
-            eef_pos=arm_state["eef_pos"],
-            eef_rot6d=arm_state["eef_rot6d"],
         )
         if feedback_issue is not None:
             print(f"FAILED — {feedback_issue}, skipped")
             return
-        pos_ee = arm_state["eef_pos"].copy()
-        rpy_ee = _eef_rpy_from_state(arm_state)
+        pos_ee, rot6d_ee = make_arm_fk().compute(np.asarray(arm_state["qpos"], dtype=np.float64))
+        rpy_ee = _eef_rpy_from_rot6d(rot6d_ee)
         samples.append(pos_ee, rpy_ee, rvec, tvec)
         print(f"OK (total {len(samples)})  EE={np.round(pos_ee, 3)}m  "
               f"marker_dist={np.linalg.norm(tvec):.3f}m")
@@ -810,8 +807,6 @@ def _run_calibration(
                 max_age_s=float(policy.arm_state_stale_threshold_s),
                 qpos=current_qpos,
                 qvel=state["qvel"],
-                eef_pos=state["eef_pos"],
-                eef_rot6d=state["eef_rot6d"],
             )
             if feedback_issue is not None:
                 if quit_requested:

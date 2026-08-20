@@ -32,7 +32,7 @@ import numpy as np
 
 from dexmani_real.recording.episode_schema import (
     ARM_SENT_MARKER,
-    EPISODE_SCHEMA_VERSION,
+    SUPPORTED_EPISODE_SCHEMA_VERSIONS,
     validate_data_layout_v17,
 )
 from dexmani_real.recording.timestamp_buffer import FillReason
@@ -139,10 +139,11 @@ class EpisodeReader:
         )
         self._rgb_decoder: VideoDecoder | None = VideoDecoder(paths["rgb"])
         schema_version = self.schema_version
-        if schema_version != EPISODE_SCHEMA_VERSION:
+        if schema_version not in SUPPORTED_EPISODE_SCHEMA_VERSIONS:
             self.close()
             raise ValueError(
-                f"unsupported episode schema v{schema_version}; expected v{EPISODE_SCHEMA_VERSION} "
+                f"unsupported episode schema v{schema_version}; supported: "
+                f"{sorted(SUPPORTED_EPISODE_SCHEMA_VERSIONS)} "
                 "(migrate historical episodes outside the runtime)"
             )
 
@@ -233,6 +234,7 @@ class EpisodeReader:
             dataset_dtypes,
             frame_count=frame_count,
             arm_sent_stream=bool(meta.attrs.get(ARM_SENT_MARKER, False)),
+            schema_version=self.schema_version,
         )
         if layout_errors:
             return ValidityState.INVALID

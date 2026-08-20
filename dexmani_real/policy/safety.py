@@ -12,7 +12,6 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from enum import Enum
-from queue import Full
 from typing import Any
 
 import numpy as np
@@ -89,16 +88,12 @@ class CommandPublishStatus(str, Enum):
     SAFETY_STATE_GATED = "safety state gated"
     ARM_FEEDBACK_UNAVAILABLE = "arm feedback unavailable"
     ARM_FEEDBACK_UNHEALTHY = "arm feedback unhealthy"
-    # Transient "not accepting servo commands yet" (Mode-6 entry window, homing
-    # Mode 0, or a re-arm) — producers should hold/retry, not fault.
-    ARM_NOT_READY = "arm not ready"
     HAND_FEEDBACK_UNAVAILABLE = "hand feedback unavailable"
     HAND_FEEDBACK_UNHEALTHY = "hand feedback unhealthy"
     HAND_PREFLIGHT_REJECTED = "hand preflight rejected"
     GATE_REJECTED = "safety gate rejected"
     TEMPORAL_WINDOW_CLOSED = "temporal window closed"
     PREPARE_TIMEOUT = "prepare timeout"
-    ARM_QUEUE_FULL = "arm queue full"
     ACK_SUPERSEDED = "acknowledgement superseded"
     ACK_TIMEOUT = "acknowledgement timeout"
 
@@ -180,13 +175,10 @@ def _arm_feedback_snapshot(
 ) -> tuple[_ArmFeedbackSnapshot | None, CommandPublishResult | None]:
     """Read the arm fields required by publication and acknowledgement.
 
-    Fails closed on two distinct signals: ``ARM_FEEDBACK_UNHEALTHY`` for a
-    genuinely disconnected/invalid frame, and ``ARM_NOT_READY`` when the arm is
-    simply not accepting servo commands yet — ``mode != 6`` OR the truthful
-    ``accepts_motion_commands`` bit is 0 (during the non-blocking Mode-6 entry
-    window, homing's Mode 0 window, or a re-arm where the cached mode is still
-    6).  The transient ``ARM_NOT_READY`` lets producers hold/retry instead of
-    faulting and never overruns the bounded arm queue.
+    Readiness is owned by the runtime gate (``is_running``/``error_state``/
+    ``safety_state``), not by the arm frame: this only supplies the current
+    joint positions for :meth:`SafetyGate.validate` and the acknowledgement
+    wait, failing closed on a missing or malformed frame.
     """
     result = shared.arm_state_ring.read_latest()
     if result is None:
@@ -195,28 +187,6 @@ def _arm_feedback_snapshot(
             candidate=candidate,
         )
     record = result[0][0]
-    if not bool(record["connected"]) or not bool(record["state_valid"]):
-        return None, CommandPublishResult(
-            CommandPublishStatus.ARM_FEEDBACK_UNHEALTHY,
-            candidate=candidate,
-            detail=(
-                "arm feedback is disconnected or marked invalid "
-                f"(connected={bool(record['connected'])}, "
-                f"state_valid={bool(record['state_valid'])})"
-            ),
-        )
-    mode = int(record["mode"])
-    accepts = bool(record["accepts_motion_commands"])
-    if mode != 6 or not accepts:
-        return None, CommandPublishResult(
-            CommandPublishStatus.ARM_NOT_READY,
-            candidate=candidate,
-            detail=(
-                "arm is not accepting servo commands "
-                f"(mode={mode}, accepts_motion_commands={accepts}); "
-                "command rejected at publication boundary"
-            ),
-        )
     qpos = np.asarray(record["qpos"], dtype=np.float64)
     if qpos.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(qpos)):
         return None, CommandPublishResult(
@@ -420,18 +390,14 @@ class SafetyGate:
 
 
 def _make_arm_command(
-    candidate: ActionCandidate, now_monotonic_ns: int, target_monotonic_ns: int
+    candidate: ActionCandidate, now_monotonic_ns: int
 ) -> np.ndarray:
     """Serialize an ActionCandidate into an ARM_COMMAND_DTYPE record."""
     if candidate.arm_qpos is None:
         raise ValueError("candidate has no arm command")
     frame = np.zeros(1, dtype=ARM_COMMAND_DTYPE)
-    frame["run_generation"][0] = candidate.run_generation
-    frame["observation_id"][0] = candidate.observation_id
     frame["action_id"][0] = candidate.action_id
     frame["created_monotonic_ns"][0] = now_monotonic_ns
-    frame["target_monotonic_ns"][0] = target_monotonic_ns
-    frame["valid_until_monotonic_ns"][0] = target_monotonic_ns + int(3e8)  # +300ms
     frame["is_hold"][0] = int(bool(candidate.is_hold))
     frame["qpos_cmd"][0] = candidate.arm_qpos
     return frame
@@ -509,29 +475,15 @@ def send_command(
         )
 
     if candidate.arm_qpos is not None:
-        try:
-            arm_frame = _make_arm_command(candidate, now_ns, target_ns)
-            shared.arm_action_q.put(arm_frame, block=True, timeout=remaining_s)
-        except Full:
-            logger.warning(
-                "send_command: arm endpoint queue backpressure (action_id=%d)",
-                candidate.action_id,
-            )
-            return CommandPublishResult(
-                CommandPublishStatus.ARM_QUEUE_FULL,
-                candidate=candidate,
-            )
+        shared.arm_cmd_ring.write(_make_arm_command(candidate, now_ns))
 
-    # The arm endpoint is published before the hand endpoint, and the hand ring
-    # write cannot fail: ``hand_cmd_ring`` is a latest-wins seqlock
-    # (``SharedMemoryRingBuffer``) whose ``write`` only overwrites the oldest
-    # slot and returns the new sequence number — there is no ``Full``/backpressure
-    # and no error-return channel.  So there is deliberately no second
-    # write-failure path after the arm endpoint is enqueued, and no rollback or
-    # compensation is performed or claimed.  This arm-then-hand ordering is
-    # non-atomic by design; if the transport ever changes to one whose hand write
-    # can fail, a coordinated stop/fault path would be required here instead of
-    # returning ``PUBLISHED``.
+    # Both actuator transports are latest-wins seqlock rings
+    # (``SharedMemoryRingBuffer``): ``write`` overwrites the oldest slot and
+    # returns the new sequence number, so there is no ``Full``/backpressure and
+    # no error-return channel.  The arm-then-hand ordering is therefore
+    # non-atomic by design, and no rollback is performed or claimed; if a
+    # transport ever gains a failing write, a coordinated stop/fault path is
+    # required here instead of returning ``PUBLISHED``.
     if candidate.hand_qpos is not None:
         hand_frame = _make_hand_command(candidate, now_ns, target_ns)
         shared.hand_cmd_ring.write(hand_frame)
@@ -551,7 +503,7 @@ def _worker_command_is_current(
     expected_run_generation: int | None,
     now_monotonic_ns: int | None,
 ) -> bool:
-    """Validate the lifecycle metadata common to fixed actuator commands."""
+    """Validate the lifecycle metadata of a fixed hand command."""
     if expected_run_generation is not None and int(command["run_generation"][0]) != int(
         expected_run_generation
     ):
@@ -566,28 +518,35 @@ def _worker_command_is_current(
 def worker_validate_arm(
     command: np.ndarray,
     *,
-    expected_run_generation: int | None = None,
+    armed_at_seq: int = 0,
     now_monotonic_ns: int | None = None,
+    max_command_age_s: float = 0.3,
 ) -> bool:
-    """Minimal hardware-level check for an arm command from the queue.
+    """Minimal hardware-level check for an arm endpoint from the ring.
 
-    Returns True when the command is well-formed, belongs to the active run,
-    and has not expired. The gate already validated limits and geometry.
+    The arm transport is latest-wins, so freshness is decided by two rules
+    instead of a generation/expiry protocol: the endpoint must have been created
+    after motion was armed (``action_id > armed_at_seq``), and it must not be
+    older than ``max_command_age_s``.  The gate already validated limits and
+    geometry.
     """
-    well_formed = (
+    if not (
         isinstance(command, np.ndarray)
         and command.shape == (1,)
         and command.dtype == ARM_COMMAND_DTYPE
         and np.all(np.isfinite(command["qpos_cmd"][0]))
-    )
-    return bool(
-        well_formed
-        and _worker_command_is_current(
-            command,
-            expected_run_generation=expected_run_generation,
-            now_monotonic_ns=now_monotonic_ns,
-        )
-    )
+    ):
+        return False
+    if int(command["action_id"][0]) <= int(armed_at_seq):
+        return False
+    if now_monotonic_ns is not None:
+        created_ns = int(command["created_monotonic_ns"][0])
+        if created_ns <= 0:
+            return False
+        age_s = (int(now_monotonic_ns) - created_ns) * 1e-9
+        if age_s < 0.0 or age_s > max_command_age_s:
+            return False
+    return True
 
 
 def worker_validate_hand(

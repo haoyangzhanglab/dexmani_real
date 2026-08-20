@@ -1,4 +1,4 @@
-# Real v17 → Sim/Policy label 边界
+# Real raw episode → Sim/Policy label 边界
 
 本文定义“标签关联”和“数值转换”的边界。它不是一个自动转换脚本，也不证明 Real 与 Sim 的物理语义等价。
 
@@ -80,7 +80,7 @@ action_arm_joint_raw_valid_mask, action_hand_joint_raw_valid_mask
 ```yaml
 source:
   episode: episode_...
-  schema_version: 17
+  schema_version: 18        # reader 也接受 17
   data_path: data.h5
 target:
   domain: real

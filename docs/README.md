@@ -7,12 +7,22 @@
 | 主题 | 文档 | 什么时候读 |
 |---|---|---|
 | 工作约束与任务路由 | [`../AGENTS.md`](../AGENTS.md)、[`../CLAUDE.md`](../CLAUDE.md) | 所有代码修改前 |
-| Real v17 episode | [`dataset/hdf5_episode.md`](dataset/hdf5_episode.md) | writer、reader、replay、数据读取 |
+| Real episode（写 v18，读 v17+v18） | [`dataset/hdf5_episode.md`](dataset/hdf5_episode.md) | writer、reader、replay、数据读取 |
 | Real 清洗输出与 Policy Zarr | [`dataset/processed_hdf5.md`](dataset/processed_hdf5.md) | 生成训练视图、改质量规则或核对 Zarr 合同 |
 | Real → Sim label 边界 | [`dataset/real_to_sim_mapping.md`](dataset/real_to_sim_mapping.md) | 设计字段映射，避免伪造等价关系 |
 | Sim HDF5/Zarr | [`dataset/sim_hdf5_zarr.md`](dataset/sim_hdf5_zarr.md) | 读取或审计 Sim 数据 |
 | Hand retarget | [`hand_retargeting.md`](hand_retargeting.md) | 改输入、求解、整形、缓存或 hand worker |
 | 数据处理原则 | [`dataset/data_process_reference.md`](dataset/data_process_reference.md) | 需要判断“该不该修数据”时 |
+
+## 迁移与审计快照
+
+带日期的审计/迁移文档属于快照：实现变更后必须重新核对，不能当作永久合同。
+
+| 主题 | 文档 | 状态 |
+|---|---|---|
+| XArm7 arm 栈化简迁移计划 | [`Dexmani XArm7 大幅化简迁移操作指南.md`](Dexmani%20XArm7%20大幅化简迁移操作指南.md) | 第一轮（阶段 1–4）已实施，见文末执行记录 |
+| XArm7 化简迁移对账（指南 vs 代码审计） | [`XArm7 化简迁移对账.html`](XArm7%20化简迁移对账.html) | 2026-08-19 审计快照，含实施进展区块 |
+| XHand 简化重构执行指南 | [`xhand_simplification_execution_guide.md`](xhand_simplification_execution_guide.md) | 手部工作线计划 |
 
 ## 文档规则
 

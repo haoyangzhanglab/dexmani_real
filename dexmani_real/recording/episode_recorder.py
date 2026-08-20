@@ -513,9 +513,6 @@ class EpisodeRecorder:
             "hand_error_state": bool(state.hand_error_state),
             # Arm command timing.
             "arm_last_cmd_seq": int(state.arm_last_cmd_seq),
-            "arm_last_cmd_queue_latency_s": float(state.arm_last_cmd_queue_latency_s),
-            "arm_last_cmd_apply_latency_s": float(state.arm_last_cmd_apply_latency_s),
-            "arm_last_cmd_sdk_duration_s": float(state.arm_last_cmd_sdk_duration_s),
             "arm_last_cmd_is_hold": bool(state.arm_last_cmd_is_hold),
             # ── Actions ──
             "action_arm_joint": np.asarray(action.arm_qpos_cmd, dtype=np.float64),

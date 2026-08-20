@@ -32,7 +32,7 @@ from dexmani_real.policy.safety import (
     publish_joint_targets,
 )
 from dexmani_real.robot.arm_loop import arm_loop
-from dexmani_real.robot.arm_sdk import ArmLoopConfig
+from dexmani_real.config.runtime import ArmLoopConfig
 from dexmani_real.robot.hand_process import HandProcessConfig, hand_loop
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
@@ -181,8 +181,6 @@ def _read_initial_arm(
                 max_age_s=float(runtime.policy.arm_state_stale_threshold_s),
                 qpos=state["qpos"],
                 qvel=state["qvel"],
-                eef_pos=state["eef_pos"],
-                eef_rot6d=state["eef_rot6d"],
             )
             if issue is None and state["error_code"] == 0:
                 return state
@@ -348,8 +346,6 @@ def _run_control_loop(
                 max_age_s=float(policy.arm_state_stale_threshold_s),
                 qpos=current_qpos,
                 qvel=state["qvel"],
-                eef_pos=state["eef_pos"],
-                eef_rot6d=state["eef_rot6d"],
             )
         if feedback_issue is not None:
             state_failures += 1

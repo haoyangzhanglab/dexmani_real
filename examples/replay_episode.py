@@ -2,7 +2,7 @@
 """Replay one DexMani schema-v17 episode on the real robot.
 
 Spawn-only architecture: arm_loop + hand_loop processes with SharedStorage
-and the SafetyState machine. Commands flow through arm_action_q / hand_cmd_ring;
+and the SafetyState machine. Commands flow through arm_cmd_ring / hand_cmd_ring;
 state is read from arm_state_ring / hand_state_ring. No direct SDK access from
 the main process.
 
@@ -56,6 +56,7 @@ from dexmani_real.config.runtime import (ResolvedRuntimeConfig,
                                          resolve_runtime_config)
 from dexmani_real.planning import (Pose, TeleopProfile, XArm7MotionPlanner,
                                    XArm7PlannerConfig)
+from dexmani_real.planning.kinematics import make_arm_fk
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.policy.safety import (SafetyGate, advance_run_generation,
@@ -65,7 +66,7 @@ from dexmani_real.policy.safety import (SafetyGate, advance_run_generation,
 from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.recording.transaction import atomic_json_dump
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
-from dexmani_real.robot.arm_sdk import ArmLoopConfig
+from dexmani_real.config.runtime import ArmLoopConfig
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.robot.safety import SafetyState, require_transition
@@ -104,8 +105,8 @@ _MODEL_PROVENANCE_KEYS = (
 
 _STATUS_INTERVAL_FRAMES = 50
 _WAIT_POLL_INTERVAL_S = 0.01
-# The arm worker's ``enter_mode6`` postcondition poll blocks up to 1.0s on the
-# ARMED/RUNNING edge; allow headroom before giving up waiting for Mode 6.
+# The arm worker enters Mode 6 once at startup (a blocking postcondition poll
+# of up to ~1.0s); allow headroom before giving up waiting for Mode 6.
 _ARM_STREAMING_WAIT_TIMEOUT_S = 2.0
 
 _TRACKING_LAG_WINDOW_S = 0.4
@@ -791,8 +792,6 @@ def arm_feedback_issue(
             max_age_s=max_age_s,
             qpos=np.asarray(state.get("qpos")),
             qvel=np.asarray(state.get("qvel")),
-            eef_pos=np.asarray(state.get("eef_pos")),
-            eef_rot6d=np.asarray(state.get("eef_rot6d")),
         )
     except (TypeError, ValueError) as exc:
         return f"invalid arm feedback: {exc}"
@@ -1006,20 +1005,15 @@ class TrajectoryReplayer:
         return False
 
     def _wait_arm_streaming(self, keyboard: KeyboardHandler) -> bool:
-        """Block until the arm worker is accepting servo commands before the first publish.
+        """Block until the arm worker is streaming valid state before the first publish.
 
-        The arm worker issues a non-blocking Mode-6 entry on the ARMED/RUNNING
-        edge and confirms it over subsequent ticks; the ring reports
-        ``accepts_motion_commands == 1`` only once Mode 6 is movable.  The replay
-        publishes into a bounded arm queue (maxsize=2), so firing the first
-        frames during that transition can fill the queue and fault as
-        ``ARM_QUEUE_FULL``.  Waiting for ``mode == 6`` AND
-        ``accepts_motion_commands`` makes the consumer ready before the producer
-        starts (``mode`` alone is not enough across a re-arm, where the cached
-        mode is still 6 during the entry).
+        The worker enters servo Mode 6 once at startup and publishes its first
+        frame just before signalling READY.  Publishing before the worker
+        streams would send endpoints nobody applies, so waiting for a valid,
+        fault-free frame makes the consumer ready before the producer starts.
 
         Returns False (with a fault/quit already latched) if the run is stopped
-        or the arm never accepts servo commands within the bounded window.
+        or the arm never streams within the bounded window.
         """
         assert self.shared is not None
         deadline = time.perf_counter() + _ARM_STREAMING_WAIT_TIMEOUT_S
@@ -1029,13 +1023,12 @@ class TrajectoryReplayer:
             arm_state = read_arm_state_dict(self.shared)
             if (
                 arm_state is not None
-                and int(arm_state.get("mode", 0)) == 6
-                and bool(arm_state.get("accepts_motion_commands", False))
                 and bool(arm_state.get("state_valid", False))
+                and int(arm_state.get("error_code", -1)) == 0
             ):
                 return True
             time.sleep(_WAIT_POLL_INTERVAL_S)
-        self._fault("arm worker did not reach Mode 6 before the replay start deadline")
+        self._fault("arm worker did not start streaming before the replay start deadline")
         return False
 
     def run(self) -> ReplayOutcome:
@@ -1126,6 +1119,8 @@ class TrajectoryReplayer:
                     continue
                 assert arm_state is not None
 
+                eef_pos, eef_rot6d = make_arm_fk().compute(arm_state["qpos"])
+
                 error_code = int(arm_state["error_code"])
                 if arm_error_requires_stop(error_code):
                     self._fault(f"fatal arm controller error C{error_code}")
@@ -1151,8 +1146,8 @@ class TrajectoryReplayer:
                     self._recorder.record(
                         frame_idx,
                         arm_state["qpos"],
-                        arm_state["eef_pos"],
-                        arm_state["eef_rot6d"],
+                        eef_pos,
+                        eef_rot6d,
                         arm_cmd,
                         hand_cmd,
                         time.perf_counter(),
@@ -1206,8 +1201,8 @@ class TrajectoryReplayer:
                 self._recorder.record(
                     frame_idx,
                     arm_state["qpos"],
-                    arm_state["eef_pos"],
-                    arm_state["eef_rot6d"],
+                    eef_pos,
+                    eef_rot6d,
                     sent_arm_cmd,
                     hand_cmd,
                     time.perf_counter(),
@@ -1220,7 +1215,7 @@ class TrajectoryReplayer:
                     elapsed_s = time.perf_counter() - start_time
                     print(
                         f"[T+{elapsed_s:.1f}s f={frame_idx}/{frame_count}] "
-                        f"eef={np.round(arm_state['eef_pos'], 3)}m  err={error_count}",
+                        f"eef={np.round(eef_pos, 3)}m  err={error_count}",
                         flush=True,
                     )
                 next_deadline_s += period_s

@@ -1,20 +1,34 @@
 """xArm7 kinematics via Pinocchio — FK, Jacobian, pose transforms.
 
 Two FK classes:
-  - ``ArmFK`` — standalone Pinocchio FK for arm_loop (no MPlib dependency).
+  - ``ArmFK`` — standalone Pinocchio FK (no MPlib dependency).
   - ``XArm7Kinematics`` — full kinematics with MPlib integration for planning.
 """
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
 
+from dexmani_real import ASSET_DIR
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
 from .pose_utils import compose_pose, compute_pose_error, invert_pose, quat_wxyz_to_rotmat
 from .types import Pose
+
+_ARM_FK_URDF = str(ASSET_DIR / "robots" / "xhand" / "xarm7_xhand_collision.urdf")
+
+
+@lru_cache(maxsize=1)
+def make_arm_fk() -> "ArmFK":
+    """Return the shared, URDF-consistent arm FK (cached per process).
+
+    The arm worker no longer computes EEF; any consumer that needs the EEF
+    pose derives it from ``qpos`` through this single factory.
+    """
+    return ArmFK(_ARM_FK_URDF)
 
 
 class ArmFK:

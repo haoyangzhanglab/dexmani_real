@@ -5,14 +5,14 @@
 ## 先区分三层数据
 
 ```text
-Real v17 episode（事实，只读）
+Real raw episode（事实，只读；v18，兼容 v17）
         ↓
 real-domain processed view（带版本、可重建）
         ↓
 model-specific training view（由训练配置决定）
 ```
 
-- **Raw/Real v17** 保存采集事实：状态、命令、时间、质量、相机和 provenance。不要为某个模型覆盖它。
+- **Raw/Real episode** 保存采集事实：状态、命令、时间、质量、相机和 provenance。不要为某个模型覆盖它。
 - **Processed view** 可以删行压紧、resize、派生点云或转换 dtype，但一个 raw 只对应一个 HDF5，并记录 source mapping、profile、规则和输出版本。
 - **Training view** 只负责采样、窗口、权重和 batch 组织，不应反向修改前两层。
 
@@ -52,7 +52,7 @@ model-specific training view（由训练配置决定）
 
 修改 `data_processing/` 时，保持以下性质：
 
-- v17 source 只读；输出目录通过临时目录校验后原子发布。
+- raw source 只读；输出目录通过临时目录校验后原子发布。
 - profile 明确决定 hard-valid 模态；不能让缺失模态静默降级。
 - point cloud 从 depth 和 metadata 确定性派生；不把 Real frame 重命名成 Sim world。
 - processed HDF5 保留 source episode、逐行映射、profile、规则版本和验证结果；Zarr 不复制这些 provenance。
