@@ -41,7 +41,6 @@ from dexmani_real.recording.io_process import RecorderIOConfig, recorder_io_loop
 from dexmani_real.recording.recorder_client import RecorderPhase
 from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
 from dexmani_real.config.runtime import ArmLoopConfig
-from dexmani_real.robot.hand_process import HandProcessConfig
 from dexmani_real.robot.hand_process import hand_loop as _hand_loop
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
 from dexmani_real.runtime.processes import (
@@ -328,7 +327,7 @@ def _build_processes(
         )
         specs.append(WorkerSpec("recorder", recorder_io_loop, (shared, recorder_config), ready_name="recorder"))
     if hand_enabled:
-        specs.append(WorkerSpec("hand", _hand_loop, (shared, HandProcessConfig.from_runtime(runtime)), ready_name="hand"))
+        specs.append(WorkerSpec("hand", _hand_loop, (shared, runtime.hand), ready_name="hand"))
     return specs
 
 

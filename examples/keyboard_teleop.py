@@ -33,7 +33,7 @@ from dexmani_real.policy.safety import (
 )
 from dexmani_real.robot.arm_loop import arm_loop
 from dexmani_real.config.runtime import ArmLoopConfig
-from dexmani_real.robot.hand_process import HandProcessConfig, hand_loop
+from dexmani_real.robot.hand_process import hand_loop
 from dexmani_real.robot.homing import send_arm_home
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
 from dexmani_real.runtime.processes import WorkerSpec, build_processes, start_processes
@@ -214,7 +214,7 @@ def _start_workers(
     hand_spec = WorkerSpec(
         "hand",
         hand_loop,
-        (shared, HandProcessConfig.from_runtime(runtime, startup_failure_is_fatal=True)),
+        (shared, runtime.hand),
         ready_name="hand",
     )
     hand_process = build_processes(context, [hand_spec])[0]

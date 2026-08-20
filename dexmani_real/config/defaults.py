@@ -470,6 +470,9 @@ class HandParams:
     # Only a failed new-command send increments this counter.
     send_err_watchdog_count: int = 30
 
+    # Read and persistent-board-fault watchdog threshold.
+    error_state_watchdog_frames: int = 5
+
     # Hand FK (world-frame fingertip positions).
     fingertip_link_names: tuple[str, ...] = (
         "right_hand_thumb_rota_tip",
@@ -545,6 +548,8 @@ class HandParams:
             raise ValueError("hand home_command_ack_timeout_s must be finite and positive")
         if self.send_err_watchdog_count <= 0:
             raise ValueError("hand send_err_watchdog_count must be positive")
+        if self.error_state_watchdog_frames <= 0:
+            raise ValueError("hand error_state_watchdog_frames must be positive")
         if len(self.fingertip_link_names) != 5 or any(not name for name in self.fingertip_link_names):
             raise ValueError("hand fingertip_link_names must contain five non-empty names")
         transform = np.asarray(self.T_eef_handbase_pos_xyz + self.T_eef_handbase_quat_wxyz, dtype=np.float64)

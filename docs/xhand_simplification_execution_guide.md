@@ -3,13 +3,13 @@
 > 适用仓库：`haoyangzhanglab/dexmani_real`  
 > 核心文件：`dexmani_real/robot/xhand.py`、`dexmani_real/robot/hand_process.py`  
 > 目标：**显著降低 XHand 控制链路的认知复杂度和代码体量，同时不削弱已经验证有价值的实机可靠性机制。**
-> 状态（2026-08-19 审计修订）：Phase A–E、G 未开始；F 主循环可读性已提前达标、publication 未合并。本文档已按逐阶段审计结论修订定稿，见各节「审计注」与 §36 变更记录。
+> 状态（2026-08-20）：Phase A–F 已完成并通过离线验证；Phase G（runtime schema）与 Phase H（实机语义验证）保持独立、尚未执行。本文保留实施前审计内容，历史描述以本状态和 §36 的实施记录为准。
 
 ---
 
 ## 0. 重构目标
 
-当前 XHand 路径存在较明显的 accidental complexity：
+重构前的 XHand 路径存在较明显的 accidental complexity：
 
 ```text
 HandParams
@@ -80,6 +80,14 @@ state = hand.get_state()
 hand.send_action(qpos)
 
 hand.disconnect()
+```
+
+当前实现还提供：
+
+```python
+hand.calibrate_tactile()
+state.has_hardware_fault
+hand.is_connected
 ```
 
 ---
@@ -347,7 +355,18 @@ tactile_contact              保留，进入 XHandState 目标字段（见 §11�
 error_state_watchdog_frames  提升到 HandParams（见 §6 A6）
 ```
 
-截至 2026-08-19 审计：代码库处于 Phase A 未起步状态（唯一例外：F 的主循环可读性已提前达标）。
+实施状态（2026-08-20）：
+
+| Phase | 状态 | 说明 |
+|---|---|---|
+| A | 已完成 | `HandParams` 是 worker 与 driver 的唯一配置来源。 |
+| B | 已完成 | gain fallback、可配置 mode 和 driver home 配置已删除。 |
+| C | 已完成 | SDK 失败统一为 `XHandError`。 |
+| D | 已完成 | `XHandState` 在 SDK payload 边界验证，并派生 hardware fault。 |
+| E | 已完成 | Producer 保留限位 preflight；Worker 保留 IPC 时效检查；Driver 保留机械硬限位。 |
+| F | 已完成 | startup/loop 统一经 `_publish_feedback()` 序列化。 |
+| G | 未开始 | 不修改 runtime/shared-memory/HDF5 数据合同。 |
+| H | 未开始 | 需要受控实机执行 H0–H7。 |
 
 ---
 
@@ -1200,7 +1219,7 @@ mechanical_qpos_min/max
 
 目标不是“多写 helper”，而是让主流程肉眼可见。
 
-审计状态：`hand_process.py` 主流程已可从上往下直读（connect → initialize_tactile → initial read → publish → ready → loop → finally disconnect），三个 RetryCounter（send/board/read）齐备，§18 禁止的抽象层 helper 名称零出现。**Phase F 的剩余差距集中在 §17 publication 合并与 helper 提取**；`hand_loop` 内 16 个字段的手工 config 映射（:263–283）随 Phase A 消失。
+实施状态（2026-08-20）：`hand_process.py` 主流程可从上往下直读（connect → calibrate tactile → initial read → publish → ready → loop → finally disconnect），三个 `RetryCounter`（send/board/read）齐备。startup 与 loop 均通过 `_publish_feedback()` 序列化，且没有合并 startup acceptance policy；`HandProcessConfig` 的字段映射已随 Phase A 删除。
 
 最终应该能直接读成：
 
@@ -1333,7 +1352,7 @@ def hand_loop(shared, config: HandParams) -> None:
 
 # 17. Phase F — 合并重复 Publication
 
-当前 startup publication 与 loop publication 都在逐字段填：
+重构前 startup publication 与 loop publication 都在逐字段填：
 
 ```text
 qpos
@@ -1346,7 +1365,7 @@ last command
 ...
 ```
 
-应该统一。
+现已统一。
 
 建议：
 
@@ -1378,7 +1397,7 @@ _publish_feedback(...)
 
 > **只合并 serialization，不合并 startup acceptance policy。**
 
-审计定位：两套逐字段填充位于 `hand_process.py:349–373`（startup，硬编码 `state_valid=1/send_healthy=1/read_healthy=1/qpos_stale=0` 等健康字段）与 :591–612（loop，动态计算），字段集合完全相同（21 个）。
+当前 `_publish_feedback()` 仅统一 serialization；startup 的有效反馈要求和 loop 的动态健康计算仍在各自控制路径中明确决定。
 
 ---
 
@@ -1978,6 +1997,8 @@ close_device 执行
 
 # 31. 每个 Commit 的建议范围
 
+Phase A–F 已按以下边界完成。这里保留建议拆分，便于审查或回溯；Phase G 仍必须保持独立。
+
 ## Commit 1 — `refactor: collapse xhand configuration`
 
 修改：
@@ -2294,6 +2315,16 @@ SDK error
 ---
 
 # 36. 变更记录
+
+## 2026-08-20 — Phase A–F 实施完成
+
+- `runtime.hand` 直接传入 hand worker 和 `XHand`；删除 `HandProcessConfig`、`XHandConfig` 与 `startup_failure_is_fatal`。
+- `error_state_watchdog_frames` 归入 `HandParams`；gain、current limit、transport 与机械限位不再经 worker 映射复制。
+- `XHandError` 统一 connect/read/send 的 SDK 失败；`XHandState` 取代 `XHandSample`，在 parser 验证 joint payload，并以 `has_hardware_fault` 派生 board fault。
+- 保留 fresh read、RS485 CRC retry、EtherCAT cleanup、joint-ID 检查、tactile 降级/校准、run generation、TTL、latest-wins、三个 watchdog 和 overcurrent 降级语义。
+- `worker_validate_hand()` 只检查 IPC 结构、finite、generation 和 TTL；Producer 仍做 operational/mechanical preflight，Driver 仍拒绝机械越界。
+- startup 与 loop 反馈统一经 `_publish_feedback()` 写入既有 `HAND_STATE_DTYPE`；本次未修改 schema 或持久化字段。
+- 离线验证：compileall、diff check、runtime override、worker command、driver parser/command/error/hard-limit 与 feedback serialization。未运行硬件。
 
 ## 2026-08-19 — 审计修订（实施前定稿）
 

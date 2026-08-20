@@ -1558,10 +1558,7 @@ def run_live_replay(
         hand_available = trajectory.has_hand
         specs = [WorkerSpec("arm", _arm_loop, (shared, arm_config), ready_name="arm")]
         if hand_available:
-            from dexmani_real.robot.hand_process import HandProcessConfig
-
-            hand_config = HandProcessConfig.from_runtime(runtime)
-            specs.append(WorkerSpec("hand", _hand_loop, (shared, hand_config), ready_name="hand"))
+            specs.append(WorkerSpec("hand", _hand_loop, (shared, runtime.hand), ready_name="hand"))
 
         require_transition(shared, SafetyState.DISARMED)
         processes = build_processes(context, specs)

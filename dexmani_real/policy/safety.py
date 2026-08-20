@@ -552,63 +552,20 @@ def worker_validate_arm(
 def worker_validate_hand(
     command: np.ndarray,
     *,
-    qpos_lower_rad: np.ndarray,
-    qpos_upper_rad: np.ndarray,
-    mechanical_lower_rad: np.ndarray,
-    mechanical_upper_rad: np.ndarray,
     expected_run_generation: int | None = None,
     now_monotonic_ns: int | None = None,
 ) -> bool:
     """Hardware-boundary check for a hand command from the ring.
 
     Returns True when the command is well-formed, belongs to the active run,
-    has not expired, and lies inside both operational and rated mechanical
-    limits. These redundant checks protect direct/home publishers and IPC
-    corruption; they never modify the endpoint.
+    and has not expired. Producers preflight operational and mechanical limits;
+    the driver enforces its mechanical hard boundary before every SDK send.
     """
-    command_lower = np.asarray(qpos_lower_rad, dtype=np.float64)
-    command_upper = np.asarray(qpos_upper_rad, dtype=np.float64)
-    mechanical_lower = np.asarray(mechanical_lower_rad, dtype=np.float64)
-    mechanical_upper = np.asarray(mechanical_upper_rad, dtype=np.float64)
-    rated_lower = np.asarray(hand_defaults.mechanical_qpos_min_rad, dtype=np.float64)
-    rated_upper = np.asarray(hand_defaults.mechanical_qpos_max_rad, dtype=np.float64)
-    limits_well_formed = (
-        command_lower.shape == HAND_JOINT_SHAPE
-        and command_upper.shape == HAND_JOINT_SHAPE
-        and mechanical_lower.shape == HAND_JOINT_SHAPE
-        and mechanical_upper.shape == HAND_JOINT_SHAPE
-        and np.all(
-            np.isfinite(
-                np.concatenate(
-                    (command_lower, command_upper, mechanical_lower, mechanical_upper)
-                )
-            )
-        )
-        and np.all(command_lower <= command_upper)
-        and np.all(mechanical_lower <= mechanical_upper)
-        and np.all(mechanical_lower >= rated_lower)
-        and np.all(mechanical_upper <= rated_upper)
-        and np.all(command_lower >= mechanical_lower)
-        and np.all(command_upper <= mechanical_upper)
-    )
-    qpos_cmd = (
-        np.asarray(command["qpos_cmd"][0], dtype=np.float64)
-        if isinstance(command, np.ndarray)
-        and command.shape == (1,)
-        and command.dtype == HAND_COMMAND_DTYPE
-        else np.empty(0, dtype=np.float64)
-    )
     well_formed = (
         isinstance(command, np.ndarray)
         and command.shape == (1,)
         and command.dtype == HAND_COMMAND_DTYPE
-        and qpos_cmd.shape == HAND_JOINT_SHAPE
-        and np.all(np.isfinite(qpos_cmd))
-        and limits_well_formed
-        and np.all(qpos_cmd >= command_lower - 1e-12)
-        and np.all(qpos_cmd <= command_upper + 1e-12)
-        and np.all(qpos_cmd >= mechanical_lower - 1e-12)
-        and np.all(qpos_cmd <= mechanical_upper + 1e-12)
+        and np.all(np.isfinite(command["qpos_cmd"][0]))
     )
     return bool(
         well_formed

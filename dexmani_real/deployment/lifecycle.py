@@ -26,7 +26,7 @@ from dexmani_real.deployment.provenance import log_deployment_provenance, sha256
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.robot.arm_loop import arm_loop
 from dexmani_real.config.runtime import ArmLoopConfig
-from dexmani_real.robot.hand_process import HandProcessConfig, hand_loop
+from dexmani_real.robot.hand_process import hand_loop
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
 from dexmani_real.runtime.processes import (
     ShutdownReport,
@@ -79,7 +79,7 @@ def build_policy_worker_specs(
             WorkerSpec(
                 "hand",
                 hand_loop,
-                (shared, HandProcessConfig.from_runtime(runtime)),
+                (shared, runtime.hand),
                 ready_name="hand",
             )
         )
