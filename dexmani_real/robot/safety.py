@@ -35,6 +35,15 @@ _ALLOWED_TRANSITIONS = frozenset(
 )
 
 
+def advance_run_generation(shared: Any) -> int:
+    """Invalidate robot commands prepared before the current control run."""
+    lock_getter = getattr(shared.run_generation, "get_lock", None)
+    lock = lock_getter() if callable(lock_getter) else nullcontext()
+    with lock:
+        shared.run_generation.value = int(shared.run_generation.value) + 1
+        return int(shared.run_generation.value)
+
+
 def transition(shared: Any, new_state: SafetyState) -> bool:
     """Validate and execute a safety state transition.
 
@@ -56,7 +65,9 @@ def transition(shared: Any, new_state: SafetyState) -> bool:
         try:
             current = SafetyState(current_int)
         except ValueError:
-            logger.error("safety: unknown current state %d — forcing FAULT", current_int)
+            logger.error(
+                "safety: unknown current state %d — forcing FAULT", current_int
+            )
             shared.safety_state.value = int(SafetyState.FAULT)
             return False
 

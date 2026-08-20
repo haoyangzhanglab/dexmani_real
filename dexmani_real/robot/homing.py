@@ -27,8 +27,7 @@ from dexmani_real.planning.path_utils import (
     compute_band_alignment_path,
     compute_joint_home_path,
 )
-from dexmani_real.policy.safety import advance_run_generation
-from dexmani_real.robot.safety import SafetyState
+from dexmani_real.robot.safety import SafetyState, advance_run_generation
 from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE

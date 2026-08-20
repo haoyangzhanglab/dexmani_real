@@ -14,12 +14,15 @@ from dexmani_real.planning.kinematics import make_arm_fk
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.policy.safety import publish_hand_home_and_wait_applied
 from dexmani_real.robot.homing import send_arm_home
+from dexmani_real.robot.safety import advance_run_generation
 from dexmani_real.shm.causal_reader import read_arm_state_causal
 from dexmani_real.shm.shared_storage import SharedStorage
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.config import TeleopConfig
+from dexmani_real.teleop.control_state import CommandQuiescence, TeleopLoopState
 from dexmani_real.teleop.hand_control import _reset_hand_retargeter
-from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.hand_health import validate_arm_feedback, validate_hand_feedback
+from dexmani_real.utils.log import ThrottledWarner, get_logger
 
 logger = get_logger(__name__)
 
@@ -202,9 +205,7 @@ def _do_teleop_home(
         audio.queue("home_done")
         print("  arm: home reached", flush=True)
     else:
-        logger.warning(
-            "arm home failed or was cancelled"
-        )
+        logger.warning("arm home failed or was cancelled")
 
     return prev_hand_qpos
 
@@ -262,3 +263,155 @@ def _do_configured_teleop_home(
         hand_retargeter=hand_retargeter,
         arm_home_qpos=np.asarray(config.runtime.arm.home_qpos, dtype=np.float64),
     )
+
+
+def _arm_feedback_issue(
+    state: np.ndarray | None,
+    *,
+    now_monotonic_ns: int,
+    max_age_s: float,
+) -> str | None:
+    """Return why an arm state is unsafe to consume, including controller faults."""
+    if state is None:
+        return "arm feedback unavailable"
+    issue = validate_arm_feedback(
+        connected=bool(state["connected"][0]),
+        state_valid=bool(state["state_valid"][0]),
+        source_monotonic_ns=int(state["source_monotonic_ns"][0]),
+        now_monotonic_ns=int(now_monotonic_ns),
+        max_age_s=max_age_s,
+        qpos=np.asarray(state["qpos"][0]),
+        qvel=np.asarray(state["qvel"][0]),
+    )
+    if issue is not None:
+        return issue
+    error_code = int(state["error_code"][0])
+    return None if error_code == 0 else f"arm controller error C{error_code}"
+
+
+def _advance_arm_feedback_error_count(
+    current_count: int,
+    issue: str | None,
+    *,
+    max_consecutive_errors: int,
+) -> tuple[int, bool]:
+    """Reset on valid feedback; fault exactly at the configured invalid-frame limit."""
+    if issue is None:
+        return 0, False
+    next_count = current_count + 1
+    return next_count, next_count >= max_consecutive_errors
+
+
+def _hand_feedback_issue_impl(
+    cfg: TeleopConfig,
+    state: np.ndarray | None,
+) -> str | None:
+    if not cfg.runtime.policy.hand_enabled:
+        return None
+    if state is None:
+        return "hand feedback unavailable"
+    return validate_hand_feedback(
+        connected=bool(state["connected"][0]),
+        error_state=bool(state["error_state"][0]),
+        state_valid=bool(state["state_valid"][0]),
+        send_healthy=bool(state["send_healthy"][0]),
+        read_healthy=bool(state["read_healthy"][0]),
+        source_monotonic_ns=int(state["source_monotonic_ns"][0]),
+        now_monotonic_ns=time.monotonic_ns(),
+        max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
+        qpos=np.asarray(state["qpos"][0]),
+    )
+
+
+def _enter_command_quiescence_impl(
+    ctx: TeleopLoopState,
+    shared: SharedStorage,
+    quiescence: CommandQuiescence,
+    arm_mapper: ArmWristMapper,
+    reason: str,
+    *,
+    start_new_run: bool = False,
+    replace_existing_reason: bool = False,
+) -> None:
+    """Invalidate pending commands, then remain silent until re-anchored.
+
+    Repeated observations preserve the existing boundary and do not advance
+    the generation again. Explicit operator transitions may replace the reason
+    while retaining that boundary: C marks a resumable pause, whereas a
+    session-ending signal cancels that eligibility. A distinct BEGIN supersedes
+    the prior pause boundary and always creates a new run generation.
+    """
+    if start_new_run and replace_existing_reason:
+        raise ValueError("BEGIN cannot reuse an existing quiescence boundary")
+    if start_new_run:
+        previous_reason, _entered_ns = quiescence.clear()
+        if previous_reason is not None:
+            logger.info(
+                "teleop_loop: new run supersedes %s command quiescence",
+                previous_reason,
+            )
+    first_entry = quiescence.enter(
+        reason,
+        entered_monotonic_ns=time.monotonic_ns(),
+    )
+    if first_entry:
+        run_generation = advance_run_generation(shared)
+        logger.info(
+            "teleop_loop: entered %s command quiescence (run=%d)",
+            reason,
+            run_generation,
+        )
+    else:
+        previous_reason = quiescence.reason
+        if replace_existing_reason:
+            quiescence.relabel(reason)
+        logger.debug(
+            "teleop_loop: remaining in %s command quiescence "
+            "(observed %s; prior reason=%s)",
+            quiescence.reason,
+            reason,
+            previous_reason,
+        )
+    arm_mapper.clear()
+    ctx.ema_prev_pos = ctx.ema_prev_quat = None
+    ctx.hand_ramp_start = None
+    ctx.hand_ramp_step = 0
+    # No cached observation may cross a generation/quiescence boundary.
+    ctx.hand_retarget_cache.reset()
+
+
+def _complete_reanchor_impl(
+    ctx: TeleopLoopState,
+    arm_mapper: ArmWristMapper,
+    validate_warn: ThrottledWarner,
+    hand_available: bool,
+    current_arm_state: np.ndarray,
+    current_vr_frame: dict[str, Any],
+    current_hand_state: np.ndarray | None,
+) -> bool:
+    """Reset temporal state; the caller suppresses this grid's publication."""
+    if not _reset_mapper_from_frames(arm_mapper, current_arm_state, current_vr_frame):
+        validate_warn(
+            "teleop_loop: re-anchor inputs invalid — remaining command-silent"
+        )
+        return False
+    ctx.ema_prev_pos = ctx.ema_prev_quat = None
+    hand_anchor: np.ndarray | None = None
+    if hand_available:
+        if current_hand_state is not None and np.all(
+            np.isfinite(current_hand_state["qpos"][0])
+        ):
+            ctx.prev_hand_qpos = np.asarray(
+                current_hand_state["qpos"][0], dtype=np.float64
+            ).copy()
+        if ctx.prev_hand_qpos is None:
+            validate_warn(
+                "teleop_loop: hand re-anchor unavailable — remaining command-silent"
+            )
+            return False
+        hand_anchor = ctx.prev_hand_qpos.copy()
+    ctx.hand_ramp_start = hand_anchor
+    ctx.hand_ramp_step = 0
+    ctx.hand_retarget_cache.reset()
+    _reset_hand_retargeter(ctx.hand_retargeter, hand_anchor)
+    return True

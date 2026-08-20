@@ -2,7 +2,55 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+import numpy as np
+
+from dexmani_real.teleop.hand_control import HandRetargetObservationCache
+
+
+@dataclass
+class TeleopLoopState:
+    """Mutable state owned by one teleoperation coordinator run."""
+
+    hand_retargeter: Any = None
+    prev_qpos_cmd: np.ndarray | None = None
+    prev_hand_qpos: np.ndarray | None = None
+    ema_prev_pos: np.ndarray | None = None
+    ema_prev_quat: np.ndarray | None = None
+    hand_ramp_start: np.ndarray | None = None
+    hand_ramp_step: int = 0
+    hand_retarget_cache: HandRetargetObservationCache = field(
+        default_factory=HandRetargetObservationCache
+    )
+    hand_available: bool = False
+    hand_disconnected_at_s: float | None = None
+    teleop_active: bool = False
+    recording_active: bool = False
+    begin_audio_gate_deadline_s: float | None = None
+    ignore_begin_audio_until_silent: bool = False
+    quit_pending: bool = False
+    quit_after_recording: bool = False
+    quit_recording_deadline_s: float = 0.0
+    post_teleop_deadline_s: float = 0.0
+    arm_feedback_error_count: int = 0
+    consecutive_ik_hold_frames: int = 0
+    ik_hold_started_s: float = 0.0
+    last_target_eef_pos: np.ndarray = field(default_factory=lambda: np.full(3, np.nan))
+    last_target_eef_rot6d: np.ndarray = field(
+        default_factory=lambda: np.full(6, np.nan)
+    )
+    sigterm_requested: bool = False
+
+
+class CoordinatorDirective(str, Enum):
+    """Control-flow decision returned by one coordinator state handler."""
+
+    NORMAL = "normal"
+    CONTINUE = "continue"
+    BREAK = "break"
 
 
 @dataclass

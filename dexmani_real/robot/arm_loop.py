@@ -27,7 +27,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.runtime import ArmLoopConfig
-from dexmani_real.policy.safety import worker_validate_arm
+from dexmani_real.robot.command_validation import worker_validate_arm
 from dexmani_real.robot.xarm7 import HomeAborted, XArm7
 from dexmani_real.robot.safety import SafetyState
 from dexmani_real.shm.shared_storage import new_frame

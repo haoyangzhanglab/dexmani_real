@@ -20,17 +20,18 @@
 | `code_style.md` | 面向个人博士科研、数据采集和模型部署的具体编码风格与审查清单。 |
 | `README.md` | 面向使用者的能力概览、架构、环境、命令、配置和数据流说明。 |
 | `repo_map.md` | 当前逐文件职责索引。 |
+| `xhand_issue.md` | XHand RS485 CRC 与触觉温度间歇性降级的诊断记录、风险边界和排查顺序。 |
 | `pyproject.toml` | Python 包元数据、基础依赖、setuptools 包发现、内置 JSON 数据声明与 Black-compatible isort 配置。 |
 
 ## 2. 运行时主路径
 
 | 路径 | Owner 与数据流 |
 |---|---|
-| 遥操作 | `examples/collect_teleop.py` → `teleop/session.py` → device workers + `teleop/loop.py` → `policy/safety.py` → command IPC。 |
-| 键盘控制 | `examples/keyboard_teleop.py` → `teleop/keyboard_session.py` → `policy/safety.py` → arm/hand workers。 |
+| 遥操作 | `examples/collect_teleop.py` → `teleop/session.py` → device workers + `teleop/loop.py` → operator controls / control grid → safety gate → command publication → command IPC。 |
+| 键盘控制 | `examples/keyboard_teleop.py` → `teleop/keyboard_session.py` → safety gate → command publication → arm/hand workers。 |
 | 策略部署 | `examples/run_policy.py` → `deployment/lifecycle.py` → inference worker → plan ring → coordinator → safety gate。 |
-| 录制 | teleop fixed-grid sample → `recording/recorder_client.py` → `EpisodeFrame` ownership-copy → RecorderIO transaction/finalize → episode sidecars。 |
-| 回放 | `examples/replay_episode.py` → `robot/replay_trajectory.py` preflight → `robot/episode_replay.py` → safety gate → workers → `robot/replay_evaluation.py`。 |
+| 录制 | teleop fixed-grid sample → `recording/recorder_client.py` → `EpisodeFrame` ownership-copy → RecorderIO / `EpisodeRecorder` transaction → `EpisodeDataWriter` data.h5 append + camera sidecars → finalize。 |
+| 回放 | `examples/replay_episode.py` → `robot/replay_trajectory.py` preflight → `robot/episode_replay.py` lifecycle → `robot/replay_controller.py` → safety gate / command publication → workers → `robot/replay_evaluation.py`。 |
 | 离线数据 | raw v17/v18 episode → cleaning/pipeline → processed HDF5 v3 → Policy Zarr v2。 |
 
 ## 3. Python package
@@ -78,15 +79,18 @@
 |---|---|
 | `dexmani_real/robot/__init__.py` | 机器人硬件子包标记。 |
 | `dexmani_real/robot/types.py` | `RobotState` 与 `RobotAction` 的 shape/finite 校验数据类型。 |
-| `dexmani_real/robot/safety.py` | 共享 robot safety state 及合法状态转换。 |
+| `dexmani_real/robot/safety.py` | 共享 robot safety state、run generation 及合法状态转换。 |
+| `dexmani_real/robot/command_validation.py` | arm/hand worker 在硬件调用前执行的 shape、finite、freshness、generation 与 expiry 复核。 |
 | `dexmani_real/robot/xarm7.py` | 唯一的 xArm Python SDK 驱动边界；连接、状态读取、模式切换、servo 与 homing。 |
 | `dexmani_real/robot/xhand.py` | XHand controller 驱动边界；12-DoF 命令、状态、触觉和错误处理。 |
 | `dexmani_real/robot/arm_loop.py` | xArm7 Mode 6 arm worker；消费命令/home 请求并发布状态与执行反馈。 |
 | `dexmani_real/robot/hand_process.py` | XHand worker；消费 hand command ring，并发布关节状态、触觉和板级错误。 |
 | `dexmani_real/robot/homing.py` | 各入口共享的 typed arm-homing 合同、碰撞检查路径选择、请求等待与 abort 处理。 |
-| `dexmani_real/robot/episode_replay.py` | 真实机器人回放 lifecycle；拥有 worker、safety transition、命令发布、operator flow 与 cleanup。 |
+| `dexmani_real/robot/episode_replay.py` | 真实机器人回放 session owner；负责 worker、safety transition、operator flow、评估调用与 cleanup。 |
+| `dexmani_real/robot/replay_controller.py` | preflight 后轨迹的 fixed-rate safety-gated 命令调度、反馈检查与 terminal outcome。 |
+| `dexmani_real/robot/replay_capture.py` | 回放期间 measured state、sent command 与 rejection provenance 的有界内存捕获。 |
 | `dexmani_real/robot/replay_trajectory.py` | raw replay trajectory 加载、hand-action requirement、provenance 与模型/几何 preflight。 |
-| `dexmani_real/robot/replay_evaluation.py` | 回放观测记录、跟踪/一致性指标和结果文件持久化。 |
+| `dexmani_real/robot/replay_evaluation.py` | 回放跟踪/一致性指标、报告和结果文件持久化。 |
 
 ### `dexmani_real/sensor/`
 
@@ -99,7 +103,8 @@
 | `dexmani_real/sensor/vr_receiver_process.py` | crash-isolated HTS/Quest 接收 worker 与 VR frame 发布。 |
 | `dexmani_real/sensor/pointcloud_processor.py` | RGB-D 到固定点数世界坐标点云的滤波、裁剪、桌面去除与采样。 |
 | `dexmani_real/sensor/camera_calibration.py` | ArUco 检测、eye-to-hand 求解、残差筛选与标定文件持久化；不打开设备或 GUI。 |
-| `dexmani_real/sensor/camera_calibration_session.py` | xArm7 + RealSense 标定 lifecycle 的唯一 side-effect owner：设备、采样、GUI、交互、归位与失败 cleanup。 |
+| `dexmani_real/sensor/camera_calibration_control.py` | 标定用 arm feedback、运动状态、workspace clipping、gated publish、quit hold 与归位。 |
+| `dexmani_real/sensor/camera_calibration_session.py` | xArm7 + RealSense 标定 lifecycle 的 side-effect owner：设备、采样、GUI、交互与失败 cleanup。 |
 | `dexmani_real/sensor/realsense_diagnostic.py` | RealSense RGB、depth、点云和 frame timing 的交互诊断。 |
 | `dexmani_real/sensor/pointcloud_diagnostic.py` | L515 tabletop 点云质量检查及 desk-plane 标定。 |
 
@@ -125,7 +130,9 @@
 |---|---|
 | `dexmani_real/policy/__init__.py` | 动作协议与安全子包标记。 |
 | `dexmani_real/policy/runtime.py` | backend-neutral `ActionCandidate` 合同及动作表示校验。 |
-| `dexmani_real/policy/safety.py` | 所有控制路径共用的安全门、命令发布、worker 边界复核及 hand-home helper。 |
+| `dexmani_real/policy/safety.py` | 兼容性显式出口与 hand-home helper；具体边界由下列模块拥有。 |
+| `dexmani_real/policy/safety_gate.py` | `ActionCandidate` 的 representation、generation、joint-limit 与 workspace fail-closed 校验。 |
+| `dexmani_real/policy/command_publication.py` | controller 侧 runtime/feedback gate、candidate 序列化、arm/hand 发布与 acknowledgement。 |
 | `dexmani_real/policy/loop_timing.py` | teleop 固定控制网格的分阶段 timing 采集。 |
 
 ### `dexmani_real/teleop/`
@@ -133,13 +140,15 @@
 | 文件 | 职责 |
 |---|---|
 | `dexmani_real/teleop/__init__.py` | 遥操作子包标记。 |
-| `dexmani_real/teleop/config.py` | 从 resolved runtime 投影出的窄 `TeleopConfig` 视图。 |
+| `dexmani_real/teleop/config.py` | 从 resolved runtime 投影出的窄 `TeleopConfig` 与 command-limit 视图。 |
 | `dexmani_real/teleop/session.py` | VR teleop 主进程 owner：预检、SharedStorage、worker topology、readiness、监督与 cleanup。 |
-| `dexmani_real/teleop/loop.py` | VR teleop coordinator；按 fixed grid 编排 operator signal、causal observation、re-anchor、proposal、safety publish 与 recording，不拥有硬件 SDK。 |
+| `dexmani_real/teleop/loop.py` | VR teleop coordinator；构造资源、等待 readiness、调度 operator/control grid 并执行 cleanup。 |
+| `dexmani_real/teleop/operator_controls.py` | BEGIN/pause/home/quit 信号、retargeter session 初始化及 bounded recording disposition。 |
+| `dexmani_real/teleop/control_grid.py` | 单个 causal grid 的 observation read/check、proposal、validate、publish 与 recording。 |
 | `dexmani_real/teleop/action_proposal.py` | 纯 EEF、hand 与 arm typed proposal 计算/限幅；不发布命令、不读 shared memory、不写录制。 |
 | `dexmani_real/teleop/keyboard_session.py` | 键盘 teleop lifecycle、typed feedback/publish 结果与实时控制流。 |
 | `dexmani_real/teleop/keyboard.py` | pynput 全局快捷键、控制信号和键盘 EEF delta 计算。 |
-| `dexmani_real/teleop/control_state.py` | teleop loop 使用的确定性 command-quiescence 状态转换。 |
+| `dexmani_real/teleop/control_state.py` | teleop coordinator mutable state、control directive 与确定性 command-quiescence 状态转换。 |
 | `dexmani_real/teleop/arm_mapper.py` | 将 VR wrist 相对运动映射为 robot-frame target EEF pose。 |
 | `dexmani_real/teleop/vr_transform.py` | VR heading 标定文件的 schema、质量等级与 rotation 校验。 |
 | `dexmani_real/teleop/camera_freshness.py` | 录制网格上的 camera frame freshness、duplicate、gap 与 generation 分类。 |
@@ -160,10 +169,11 @@
 | 文件 | 职责 |
 |---|---|
 | `dexmani_real/recording/__init__.py` | 录制子包标记。 |
-| `dexmani_real/recording/episode_schema.py` | raw episode v17/v18 dataset shape/dtype、必需字段、条件字段和 semantic metadata 合同。 |
+| `dexmani_real/recording/episode_schema.py` | raw episode v17/v18 dataset shape/dtype、semantic metadata 与 quality metric 合同。 |
 | `dexmani_real/recording/episode_frame.py` | shared-memory record/legacy inputs 到 immutable typed episode row 的唯一解码、schema shaping 与 ownership-copy 边界。 |
 | `dexmani_real/recording/timestamp_buffer.py` | 多速率输入到 fixed-grid row 的 timestamp 对齐、填充原因和容量管理。 |
 | `dexmani_real/recording/episode_recorder.py` | raw v18 `EpisodeFrame` 的 fixed-grid 对齐、事务式录制、质量汇总、sidecar 验证与原子发布。 |
+| `dexmani_real/recording/episode_data_writer.py` | 单个 `data.h5` handle、dataset append 与 flushed offset 的唯一 owner。 |
 | `dexmani_real/recording/camera_stream_writer.py` | grid-aligned RGB/depth 的有界后台 writer 与失败传播。 |
 | `dexmani_real/recording/video_codec.py` | PyAV RGB video encoder/decoder 与 codec 配置。 |
 | `dexmani_real/recording/recorder_client.py` | policy/teleop 侧 recorder control protocol、sample 发布和 stop result。 |

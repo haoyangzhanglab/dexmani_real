@@ -40,6 +40,9 @@ ARM_RAW_ACTION_VALIDITY_EXPRESSION = "flag_sample_valid & ~flag_held & flag_ik_o
 HAND_RAW_ACTION_VALIDITY_EXPRESSION = (
     "flag_sample_valid & ~flag_held & flag_retarget_ok"
 )
+RUNTIME_QUALITY_METRIC_NAMES = frozenset(
+    {"hand_read_error_count", "hand_overcurrent_count"}
+)
 
 
 @dataclass(frozen=True)
@@ -218,6 +221,60 @@ def expected_source_frame_dataset_names_v17(*, arm_sent_stream: bool) -> frozens
     return SOURCE_FRAME_DATASET_NAMES_V17
 
 
+def compute_episode_quality_metrics(
+    datasets: dict[str, Any],
+    *,
+    frame_count: int,
+    control_hz: float,
+    runtime_metrics: dict[str, int],
+) -> dict[str, int]:
+    """Summarize persisted frame flags and runtime-only quality counters."""
+    if frame_count < 0 or not np.isfinite(control_hz) or control_hz <= 0:
+        raise ValueError("invalid episode quality dimensions")
+    unknown_metrics = set(runtime_metrics) - RUNTIME_QUALITY_METRIC_NAMES
+    if unknown_metrics:
+        raise ValueError(f"unknown runtime quality metrics: {sorted(unknown_metrics)}")
+    normalized_runtime = {name: int(value) for name, value in runtime_metrics.items()}
+    if any(value < 0 for value in normalized_runtime.values()):
+        raise ValueError("runtime quality metrics must be non-negative")
+    if frame_count == 0:
+        return {
+            "ik_hold_frame_count": 0,
+            "camera_invalid_frame_count": 0,
+            "observation_invalid_frame_count": 0,
+            "sample_invalid_frame_count": 0,
+            "safety_reject_frame_count": 0,
+            "command_quiescence_count": 0,
+            **normalized_runtime,
+        }
+
+    def read_bool_dataset(name: str) -> np.ndarray:
+        if name not in datasets:
+            raise KeyError(f"required quality dataset missing: {name}")
+        return np.asarray(datasets[name][:frame_count], dtype=bool)
+
+    held = read_bool_dataset("flag_held")
+    ik_ok = read_bool_dataset("flag_ik_ok")
+    observation_valid = read_bool_dataset("observation_valid")
+    camera_fresh = read_bool_dataset("flag_camera_fresh")
+    sample_valid = read_bool_dataset("flag_sample_valid")
+    safety_reject = read_bool_dataset("flag_safety_reject")
+    if "timestamp" not in datasets:
+        raise KeyError("required quality dataset missing: timestamp")
+    timestamps = np.asarray(datasets["timestamp"][:frame_count], dtype=np.float64)
+    return {
+        "ik_hold_frame_count": int(np.count_nonzero(held & ~ik_ok)),
+        "camera_invalid_frame_count": int(np.count_nonzero(~camera_fresh)),
+        "observation_invalid_frame_count": int(np.count_nonzero(~observation_valid)),
+        "sample_invalid_frame_count": int(np.count_nonzero(~sample_valid)),
+        "safety_reject_frame_count": int(np.count_nonzero(safety_reject)),
+        "command_quiescence_count": int(
+            np.count_nonzero(np.diff(timestamps) > (1.5 / control_hz))
+        ),
+        **normalized_runtime,
+    }
+
+
 def validate_source_frame_keys_v17(
     keys: set[str], *, arm_sent_stream: bool
 ) -> tuple[str, ...]:
@@ -274,7 +331,9 @@ def normalize_diagnostics_v17(
     return normalized
 
 
-def required_dataset_names(schema_version: int = EPISODE_SCHEMA_VERSION) -> frozenset[str]:
+def required_dataset_names(
+    schema_version: int = EPISODE_SCHEMA_VERSION,
+) -> frozenset[str]:
     """Return the datasets a ``data.h5`` of *schema_version* must contain.
 
     v18 drops the arm-worker telemetry datasets; v17 episodes keep them and
@@ -364,6 +423,7 @@ __all__ = [
     "required_dataset_names",
     "BASE_DATASET_SPECS_V17",
     "CONDITIONAL_DATASET_SPECS_V17",
+    "RUNTIME_QUALITY_METRIC_NAMES",
     "DIAGNOSTIC_TAIL_SHAPES_V17",
     "DatasetSpec",
     "EPISODE_SCHEMA_VERSION",
@@ -371,6 +431,7 @@ __all__ = [
     "SEMANTIC_META_ATTRS_V17",
     "SOURCE_FRAME_DATASET_NAMES_V17",
     "expected_source_frame_dataset_names_v17",
+    "compute_episode_quality_metrics",
     "normalize_diagnostics_v17",
     "validate_data_layout_v17",
     "validate_source_frame_keys_v17",

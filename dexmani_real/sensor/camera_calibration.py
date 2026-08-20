@@ -1,8 +1,9 @@
 """ArUco eye-to-hand calibration math and persistence without device ownership.
 
 This module does not start cameras, open GUI windows, create worker processes,
-or publish robot commands. The interactive hardware lifecycle lives in
-camera_calibration_session.py.
+or publish robot commands. ``camera_calibration_control`` owns arm-motion
+state and command publication; ``camera_calibration_session`` owns the
+interactive device, GUI, sampling, and cleanup lifecycle.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real import PACKAGE_DIR
+from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.recording.transaction import atomic_json_dump
 
 CAMERA_CALIBRATION_PATH = PACKAGE_DIR / "config" / "cameras.json"
@@ -31,6 +33,13 @@ _HAND_EYE_METHODS = {
     "ANDREFF": cv2.CALIB_HAND_EYE_ANDREFF,
     "DANIILIDIS": cv2.CALIB_HAND_EYE_DANIILIDIS,
 }
+
+
+def eef_rpy_from_rot6d(rot6d: np.ndarray) -> np.ndarray:
+    """Convert an arm EEF rot6d orientation to xyz RPY in radians."""
+    quat_wxyz = rot6d_to_quat_wxyz(rot6d)
+    rpy_rad = Rotation.from_quat(np.roll(quat_wxyz, -1)).as_euler("xyz", degrees=False)
+    return np.asarray(rpy_rad, dtype=np.float64)
 
 
 @dataclass(frozen=True)

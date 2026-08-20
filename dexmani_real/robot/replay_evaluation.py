@@ -11,8 +11,9 @@ from scipy.spatial.transform import Rotation
 
 from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.recording.transaction import atomic_json_dump
+from dexmani_real.robot.replay_trajectory import TrajectoryData
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
 logger = get_logger(__name__)
 
@@ -20,126 +21,7 @@ _TRACKING_LAG_WINDOW_S = 0.4
 _MIN_TRACKING_LAG_FRAMES = 6
 _MIN_TRACKING_OVERLAP_FRAMES = 10
 _MIN_TRACKING_SEQUENCE_FRAMES = 20
-_SAFETY_REASON_BYTES = 256
-
-
-class ReplayRecorder:
-    """Pre-allocated buffer capturing robot state during replay.
-
-    Single-threaded (main loop), so no locking is needed.
-    """
-
-    def __init__(self, capacity: int, has_hand: bool = False) -> None:
-        self.capacity = capacity
-        self.has_hand = has_hand
-        self._count = 0
-
-        self.arm_qpos = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
-        self.eef_pos = np.full((capacity, 3), np.nan, dtype=np.float64)
-        self.eef_quat_wxyz = np.full((capacity, 4), np.nan, dtype=np.float64)
-        self.eef_rot6d = np.full((capacity, 6), np.nan, dtype=np.float64)
-        self.arm_cmd = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
-        self.arm_sent_cmd = np.full(
-            (capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64
-        )
-        self.arm_tracking_error = np.full((capacity,), np.nan, dtype=np.float64)
-        self.timestamps = np.full((capacity,), np.nan, dtype=np.float64)
-
-        # A rejected frame keeps state/candidate data but leaves arm_sent_cmd NaN.
-        self.flag_safety_reject = np.zeros(capacity, dtype=bool)
-        self.safety_reject_reason: list[str | None] = [None] * capacity
-
-        self.hand_qpos: np.ndarray | None = None
-        self.hand_cmd: np.ndarray | None = None
-        if has_hand:
-            self.hand_qpos = np.full(
-                (capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64
-            )
-            self.hand_cmd = np.full(
-                (capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64
-            )
-
-    def record(
-        self,
-        idx: int,
-        arm_qpos: np.ndarray,
-        eef_pos: np.ndarray,
-        eef_rot6d: np.ndarray,
-        arm_cmd: np.ndarray,
-        hand_cmd: np.ndarray | None,
-        ts: float,
-        arm_sent_cmd: np.ndarray | None = None,
-        arm_tracking_error: float | None = None,
-        safety_reject_reason: str | None = None,
-        hand_qpos: np.ndarray | None = None,
-    ) -> None:
-        """Record one frame of replay state.
-
-        When *safety_reject_reason* is set the frame is marked as a safety
-        gate rejection: observables + cmd are preserved (the action that was
-        *attempted*), but ``arm_sent_cmd`` is left at its pre-allocated NaN
-        (nothing was sent to the robot).  Downstream scripts can filter on
-        ``flag_safety_reject`` or ``safety_reject_reason``.
-        """
-        if idx < 0:
-            raise ValueError("replay frame index must be non-negative")
-        if idx >= self.capacity:
-            return
-        self.arm_qpos[idx] = arm_qpos
-        self.eef_pos[idx] = eef_pos
-        self.eef_rot6d[idx] = eef_rot6d
-        try:
-            rotation_matrix = _rot6d_to_matrix(eef_rot6d)
-            quat_xyzw = Rotation.from_matrix(rotation_matrix).as_quat()
-            self.eef_quat_wxyz[idx] = np.array(
-                [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
-            )
-        except ValueError:
-            self.eef_quat_wxyz[idx] = np.full(4, np.nan)
-        self.arm_cmd[idx] = arm_cmd
-        self.timestamps[idx] = ts
-        if arm_sent_cmd is not None:
-            self.arm_sent_cmd[idx] = arm_sent_cmd
-        if arm_tracking_error is not None:
-            self.arm_tracking_error[idx] = arm_tracking_error
-        if self.has_hand and self.hand_qpos is not None and hand_qpos is not None:
-            self.hand_qpos[idx] = hand_qpos
-        if self.has_hand and self.hand_cmd is not None and hand_cmd is not None:
-            self.hand_cmd[idx] = hand_cmd
-        if safety_reject_reason is not None:
-            self.flag_safety_reject[idx] = True
-            self.safety_reject_reason[idx] = safety_reject_reason
-        self._count = idx + 1
-
-    @property
-    def count(self) -> int:
-        return self._count
-
-    def to_dict(self) -> dict[str, np.ndarray]:
-        """Return truncated arrays as a dict."""
-        n = self._count
-        # Fixed bytes keep the NPZ readable with allow_pickle=False.
-        reasons = np.array(
-            [r.encode() if r else b"" for r in self.safety_reject_reason[:n]],
-            dtype=f"S{_SAFETY_REASON_BYTES}",
-        )
-        result: dict[str, np.ndarray] = {
-            "arm_qpos": self.arm_qpos[:n].copy(),
-            "eef_pos": self.eef_pos[:n].copy(),
-            "eef_quat_wxyz": self.eef_quat_wxyz[:n].copy(),
-            "eef_rot6d": self.eef_rot6d[:n].copy(),
-            "arm_cmd": self.arm_cmd[:n].copy(),
-            "arm_sent_cmd": self.arm_sent_cmd[:n].copy(),
-            "arm_tracking_error": self.arm_tracking_error[:n].copy(),
-            "timestamp": self.timestamps[:n].copy(),
-            "flag_safety_reject": self.flag_safety_reject[:n].copy(),
-            "safety_reject_reason": reasons,
-        }
-        if self.hand_qpos is not None:
-            result["hand_qpos"] = self.hand_qpos[:n].copy()
-        if self.hand_cmd is not None:
-            result["hand_cmd"] = self.hand_cmd[:n].copy()
-        return result
+_TRACKING_ERROR_PERCENTILE = 95.0
 
 
 @dataclass
@@ -208,6 +90,7 @@ def compute_metrics(
     episode_path: str = "",
     task_label: str = "",
     speed_factor: float = 1.0,
+    arm_tracking_error: np.ndarray | None = None,
 ) -> ReplayMetrics:
     """Compare matching frame indices from the recorded and replayed streams."""
     if not np.isfinite(fps) or fps <= 0:
@@ -326,7 +209,114 @@ def compute_metrics(
         metrics.tracking_lag_frames = peak_lag
         metrics.tracking_lag_seconds = float(peak_lag) / fps
 
+    if arm_tracking_error is not None:
+        finite_tracking_error = arm_tracking_error[np.isfinite(arm_tracking_error)]
+        if finite_tracking_error.size:
+            metrics.arm_tracking_error_mean_deg = float(
+                np.rad2deg(np.mean(finite_tracking_error))
+            )
+            metrics.arm_tracking_error_p95_deg = float(
+                np.rad2deg(
+                    np.percentile(finite_tracking_error, _TRACKING_ERROR_PERCENTILE)
+                )
+            )
+            metrics.arm_tracking_error_max_deg = float(
+                np.rad2deg(np.max(finite_tracking_error))
+            )
+
     return metrics
+
+
+def report_consistency(metrics: ReplayMetrics) -> None:
+    """Print a human-readable replay-vs-original consistency summary."""
+    print("\n" + "=" * 60)
+    print("Consistency Evaluation")
+    print("=" * 60)
+    print(
+        f"  Frames: {metrics.replayed_frames} replayed / {metrics.original_frames} original"
+    )
+    print(
+        f"  Arm joint MAE:  {np.round(metrics.arm_joint_mae_deg, 2)} deg  "
+        f"(overall: {metrics.arm_joint_mae_overall_deg:.3f} deg)"
+    )
+    print(
+        f"  Arm joint RMSE: {np.round(metrics.arm_joint_rmse_deg, 2)} deg  "
+        f"(overall: {metrics.arm_joint_rmse_overall_deg:.3f} deg)"
+    )
+    if metrics.eef_pos_error_per_frame_mm is not None:
+        print(
+            f"  EEF pos error:  mean={metrics.eef_pos_error_mean_mm:.1f}mm  "
+            f"max={metrics.eef_pos_error_max_mm:.1f}mm  "
+            f"rmse={metrics.eef_pos_error_rmse_mm:.1f}mm"
+        )
+    if metrics.eef_rot_error_per_frame_deg is not None:
+        print(
+            f"  EEF rot error:  mean={metrics.eef_rot_error_mean_deg:.2f}°  "
+            f"max={metrics.eef_rot_error_max_deg:.2f}°"
+        )
+    if metrics.hand_joint_mae_overall_deg is not None:
+        print(f"  Hand joint MAE: {metrics.hand_joint_mae_overall_deg:.3f} deg")
+    print(
+        f"  Tracking lag:  {metrics.tracking_lag_frames} frames "
+        f"({metrics.tracking_lag_seconds:.3f}s)"
+    )
+    if metrics.arm_tracking_error_mean_deg > 0:
+        print(
+            "  Replay tracking error (cmd vs actual): "
+            f"mean={metrics.arm_tracking_error_mean_deg:.2f}°  "
+            f"p95={metrics.arm_tracking_error_p95_deg:.2f}°  "
+            f"max={metrics.arm_tracking_error_max_deg:.2f}°"
+        )
+    print("=" * 60)
+
+
+def evaluate_replay(
+    trajectory: TrajectoryData,
+    replay_data: dict[str, np.ndarray] | None,
+    *,
+    evaluate_consistency: bool,
+    output_dir: str,
+) -> None:
+    """Evaluate and persist samples captured by one physical replay."""
+    if replay_data is None:
+        print(
+            "\nNo replay data collected (replay interrupted before any frames captured)."
+        )
+        return
+    if replay_data["arm_qpos"].shape[0] == 0:
+        print("\nSkipping metrics: no valid reference or replay data available")
+        return
+    if not evaluate_consistency:
+        print("\nSkipping consistency metrics; saving captured replay data.")
+        save_replay_data(replay_data, output_dir)
+        return
+
+    print("\nComputing consistency metrics...")
+    try:
+        metrics = compute_metrics(
+            original_arm_qpos=trajectory.arm_qpos,
+            replay_arm_qpos=replay_data["arm_qpos"],
+            original_arm_ee=trajectory.arm_ee,
+            replay_arm_ee_pos=replay_data["eef_pos"],
+            replay_arm_ee_rot6d=replay_data["eef_rot6d"],
+            fps=trajectory.fps,
+            original_hand_qpos=trajectory.hand_qpos,
+            replay_hand_qpos=replay_data.get("hand_qpos"),
+            episode_path=trajectory.episode_path,
+            task_label=trajectory.task_label,
+            speed_factor=1.0,
+            arm_tracking_error=replay_data.get("arm_tracking_error"),
+        )
+    except Exception:
+        logger.error(
+            "replay consistency evaluation failed; saving raw replay data",
+            exc_info=True,
+        )
+        save_replay_data(replay_data, output_dir)
+        raise
+
+    report_consistency(metrics)
+    save_results(metrics, replay_data, output_dir)
 
 
 def save_replay_data(replay_data: dict[str, np.ndarray], output_dir: str) -> Path:

@@ -17,7 +17,7 @@ import time
 import numpy as np
 
 from dexmani_real.config.defaults import HandParams
-from dexmani_real.policy.safety import worker_validate_hand
+from dexmani_real.robot.command_validation import worker_validate_hand
 from dexmani_real.utils.hand_health import XHAND_OVERCURRENT_ERROR_CODE
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager

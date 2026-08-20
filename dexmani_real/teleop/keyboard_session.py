@@ -21,7 +21,6 @@ from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
 from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.pose_utils import quat_multiply
 from dexmani_real.policy.safety import (
-    advance_run_generation,
     planner_action_safety_gate,
     publish_hand_home_and_wait_applied,
     publish_joint_targets,
@@ -29,7 +28,12 @@ from dexmani_real.policy.safety import (
 from dexmani_real.robot.arm_loop import arm_loop
 from dexmani_real.robot.hand_process import hand_loop
 from dexmani_real.robot.homing import ArmHomeConfig, execute_arm_home
-from dexmani_real.robot.safety import SafetyState, require_transition, transition
+from dexmani_real.robot.safety import (
+    SafetyState,
+    advance_run_generation,
+    require_transition,
+    transition,
+)
 from dexmani_real.runtime.processes import WorkerSpec, build_processes, start_processes
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
 from dexmani_real.shm.shared_storage import (

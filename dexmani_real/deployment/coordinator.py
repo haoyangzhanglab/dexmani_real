@@ -38,12 +38,11 @@ from dexmani_real.planning.constants import (
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
 from dexmani_real.policy.safety import (
     CommandPublishStatus,
-    advance_run_generation,
     build_action_candidate,
     planner_action_safety_gate,
     validate_and_send_candidate,
 )
-from dexmani_real.robot.safety import SafetyState, transition
+from dexmani_real.robot.safety import SafetyState, advance_run_generation, transition
 from dexmani_real.shm.shared_storage import SharedStorage, read_arm_state_dict
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import MAX_POLICY_CHUNK_STEPS

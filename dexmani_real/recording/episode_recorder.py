@@ -1,8 +1,10 @@
 """Transactional raw v18 episode serialization from owned ``EpisodeFrame`` rows.
 
 State, action, VR, and camera rows are causally aligned to the policy grid.
-The recorder owns HDF5/video sidecars and verifies them before atomically
-publishing an episode; it neither reads shared memory nor controls hardware.
+The recorder owns transaction lifecycle, camera sidecar coordination, metadata,
+verification, and atomic publication. ``EpisodeDataWriter`` is the sole owner
+of the ``data.h5`` handle, datasets, and append offset. Neither component reads
+shared memory or controls hardware.
 """
 
 from __future__ import annotations
@@ -11,9 +13,7 @@ __all__ = ["EpisodeRecorder", "StopResult"]
 
 import atexit
 import json
-import os
 import shutil
-import tempfile
 import threading
 import time
 import weakref
@@ -31,25 +31,24 @@ from dexmani_real.recording.camera_stream_writer import (
     CameraStreamWriter,
     CameraStreamWriterConfig,
 )
+from dexmani_real.recording.episode_data_writer import EpisodeDataWriter
 from dexmani_real.recording.episode_frame import EpisodeFrame, build_episode_frame
 from dexmani_real.recording.episode_schema import (
     ARM_SENT_MARKER,
     EPISODE_SCHEMA_VERSION,
+    RUNTIME_QUALITY_METRIC_NAMES,
     SEMANTIC_META_ATTRS_V17,
+    compute_episode_quality_metrics,
     validate_data_layout_v17,
     validate_source_frame_keys_v17,
 )
 from dexmani_real.recording.timestamp_buffer import TimestampAlignedBuffer
-from dexmani_real.recording.transaction import atomic_publish
+from dexmani_real.recording.transaction import atomic_json_dump, atomic_publish
 from dexmani_real.recording.video_codec import VideoDecoder
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-_RUNTIME_QUALITY_METRIC_NAMES = frozenset(
-    {"hand_read_error_count", "hand_overcurrent_count"}
-)
 
 DEFAULT_MAX_RECORD_FRAMES: int = 10000
 SCHEMA_VERSION = EPISODE_SCHEMA_VERSION
@@ -58,7 +57,7 @@ _PREVIOUS_EPISODE_STOP_TIMEOUT_S = 15.0
 _PROCESS_EXIT_STOP_TIMEOUT_S = 60.0
 
 
-# The episode-stop thread is daemonized so forced exits do not block shutdown.
+# The episode-stop thread is non-daemon so transaction finalization is not abandoned.
 _LIVE_RECORDERS: weakref.WeakSet = weakref.WeakSet()
 
 
@@ -78,62 +77,6 @@ def _flush_all_recorders() -> None:
 atexit.register(_flush_all_recorders)
 
 
-def _episode_quality_metrics(
-    datasets: dict[str, Any],
-    *,
-    frame_count: int,
-    control_hz: float,
-    runtime_metrics: dict[str, int],
-) -> dict[str, int]:
-    """Summarize persisted frame flags plus runtime-only event counters."""
-    if frame_count < 0 or not np.isfinite(control_hz) or control_hz <= 0:
-        raise ValueError("invalid episode quality dimensions")
-    unknown_metrics = set(runtime_metrics) - _RUNTIME_QUALITY_METRIC_NAMES
-    if unknown_metrics:
-        raise ValueError(f"unknown runtime quality metrics: {sorted(unknown_metrics)}")
-    normalized_runtime_metrics = {
-        name: int(value) for name, value in runtime_metrics.items()
-    }
-    if any(value < 0 for value in normalized_runtime_metrics.values()):
-        raise ValueError("runtime quality metrics must be non-negative")
-    if frame_count == 0:
-        return {
-            "ik_hold_frame_count": 0,
-            "camera_invalid_frame_count": 0,
-            "observation_invalid_frame_count": 0,
-            "sample_invalid_frame_count": 0,
-            "safety_reject_frame_count": 0,
-            "command_quiescence_count": 0,
-            **normalized_runtime_metrics,
-        }
-
-    def _bool_dataset(name: str) -> np.ndarray:
-        if name not in datasets:
-            raise KeyError(f"required quality dataset missing: {name}")
-        return np.asarray(datasets[name][:frame_count], dtype=bool)
-
-    held = _bool_dataset("flag_held")
-    ik_ok = _bool_dataset("flag_ik_ok")
-    observation_valid = _bool_dataset("observation_valid")
-    camera_fresh = _bool_dataset("flag_camera_fresh")
-    sample_valid = _bool_dataset("flag_sample_valid")
-    safety_reject = _bool_dataset("flag_safety_reject")
-    if "timestamp" not in datasets:
-        raise KeyError("required quality dataset missing: timestamp")
-    timestamps = np.asarray(datasets["timestamp"][:frame_count], dtype=np.float64)
-    return {
-        "ik_hold_frame_count": int(np.count_nonzero(held & ~ik_ok)),
-        "camera_invalid_frame_count": int(np.count_nonzero(~camera_fresh)),
-        "observation_invalid_frame_count": int(np.count_nonzero(~observation_valid)),
-        "sample_invalid_frame_count": int(np.count_nonzero(~sample_valid)),
-        "safety_reject_frame_count": int(np.count_nonzero(safety_reject)),
-        "command_quiescence_count": int(
-            np.count_nonzero(np.diff(timestamps) > (1.5 / control_hz))
-        ),
-        **normalized_runtime_metrics,
-    }
-
-
 @dataclass
 class StopResult:
     """Outcome of a background stop_episode daemon, returned by poll_stop()."""
@@ -151,7 +94,7 @@ class StopResult:
 
 
 class EpisodeRecorder:
-    """Records teleoperation episodes to HDF5 files.
+    """Coordinate one transactional episode around a dedicated data writer.
 
     Lifecycle: start_episode() → add_frame() × N → stop_episode()
     """
@@ -180,9 +123,7 @@ class EpisodeRecorder:
 
         self.arm_sent_stream: bool = bool(arm_sent_stream)
 
-        self._file: Any = (
-            None  # h5py.File | None — data.h5 (control streams + metadata)
-        )
+        self._data_writer: EpisodeDataWriter | None = None
         self._camera_writer: CameraStreamWriter | None = None
         self._camera_writer_metrics: dict[str, float | int] = {}
         self._last_camera_payload: tuple[np.ndarray, np.ndarray] | None = None
@@ -200,13 +141,11 @@ class EpisodeRecorder:
         self._start_time: float | None = None
         self._episode_dir: str | None = None  # episode_XXX/ directory
         self._temp_dir: str | None = None  # .tmp_episode_XXX/ directory
-        self._datasets: dict[str, Any] = {}
         self._pending_meta: dict[str, Any] = {}
         self._runtime_quality_metrics: dict[str, int] = {}
 
         self._buffer: TimestampAlignedBuffer | None = None
         self._flush_interval: int = max(1, int(round(10.0 * self.control_hz)))
-        self._flushed_frames: int = 0
 
         self._skip_initial_frames: int = 0
         self._skipped_so_far: int = 0
@@ -237,7 +176,7 @@ class EpisodeRecorder:
             raise RuntimeError("runtime quality metrics require an active episode")
         normalized: dict[str, int] = {}
         for name, value in metrics.items():
-            if name not in _RUNTIME_QUALITY_METRIC_NAMES:
+            if name not in RUNTIME_QUALITY_METRIC_NAMES:
                 raise ValueError(f"unknown runtime quality metric: {name!r}")
             count = int(value)
             if count < 0:
@@ -307,8 +246,7 @@ class EpisodeRecorder:
         self._start_time = time.perf_counter()
         self._recording = True
         self._stop_error = None
-        self._datasets = {}
-        self._flushed_frames = 0
+        self._data_writer = None
 
         self._skip_initial_frames = max(
             0, min(int(skip_initial_frames), self.max_frames - 1)
@@ -337,13 +275,12 @@ class EpisodeRecorder:
             # Only tolerate floating-point error at an exact grid boundary.
             eps=1e-5,
         )
-        self._file = None
         self._camera_writer = CameraStreamWriter(tmp_dir, self._camera_writer_config)
         self._last_camera_payload = None
         return True
 
     def _write_meta_attrs(self, meta: h5py.Group) -> None:
-        """Write deferred metadata attributes to the HDF5 meta group."""
+        """Write initial metadata through the data writer's owned HDF5 handle."""
         p = self._pending_meta
         meta.attrs["task_label"] = p.get("task_label", "")
         meta.attrs["operator"] = p.get("operator", "")
@@ -511,7 +448,10 @@ class EpisodeRecorder:
         if k > 0:
             self._update_aligned_causality(slice(prev_size, self._buffer.size))
 
-        if self._buffer.size - self._flushed_frames >= self._flush_interval:
+        flushed_frames = (
+            0 if self._data_writer is None else self._data_writer.flushed_frames
+        )
+        if self._buffer.size - flushed_frames >= self._flush_interval:
             self._ensure_hdf5()
             self._flush_buffered()
 
@@ -618,75 +558,31 @@ class EpisodeRecorder:
         return rgb, depth
 
     def _ensure_hdf5(self) -> None:
-        """Lazily create ``data.h5`` in the temp directory."""
-        if self._file is not None:
+        """Lazily create the ``data.h5`` owner for the active temp directory."""
+        if self._data_writer is not None:
             return
         if self._temp_dir is None:
             raise RuntimeError("EpisodeRecorder: _temp_dir is None during HDF5 open")
-        self._file = h5py.File(str(Path(self._temp_dir) / "data.h5"), "w")
-        self._write_meta_attrs(self._file.create_group("meta"))
+        self._data_writer = EpisodeDataWriter(
+            Path(self._temp_dir) / "data.h5",
+            arm_sent_stream=self.arm_sent_stream,
+            write_initial_meta=self._write_meta_attrs,
+        )
 
     def _flush_buffered(self) -> None:
-        """Write buffered non-camera streams to HDF5, keeping datasets resizable.
+        """Pass buffered non-camera streams to the resizable data writer.
 
         Called periodically during recording (every ``_flush_interval`` frames)
         and finally at :meth:`stop_episode`.  On first call the datasets are
         created with ``maxshape=(None, ...)``; subsequent calls resize and
         append only the new frames.
         """
-        if self._buffer is None or self._buffer.size == self._flushed_frames:
+        if self._buffer is None:
             return
 
         self._ensure_hdf5()
-        buf_data = self._buffer.data
-        buf_size = self._buffer.size
-        new_start = self._flushed_frames
-
-        # Validate the schema before creating or extending HDF5 datasets.
-        buffer_shapes = {name: tuple(values.shape) for name, values in buf_data.items()}
-        buffer_dtypes = {name: values.dtype for name, values in buf_data.items()}
-        buffer_shapes["timestamp"] = tuple(self._buffer.timestamps.shape)
-        buffer_dtypes["timestamp"] = self._buffer.timestamps.dtype
-        layout_errors = validate_data_layout_v17(
-            buffer_shapes,
-            buffer_dtypes,
-            frame_count=buf_size,
-            arm_sent_stream=self.arm_sent_stream,
-        )
-        if layout_errors:
-            raise RuntimeError(
-                "episode recorder buffer mismatch: " + "; ".join(layout_errors)
-            )
-
-        for h5_key, arr in buf_data.items():
-            if h5_key not in self._datasets:
-                self._datasets[h5_key] = self._file.create_dataset(
-                    h5_key,
-                    data=arr[:buf_size].copy(),
-                    maxshape=(None,) + arr.shape[1:],
-                    dtype=arr.dtype,
-                    compression="gzip",
-                )
-            else:
-                ds = self._datasets[h5_key]
-                ds.resize(buf_size, axis=0)
-                ds[new_start:buf_size] = arr[new_start:buf_size]
-
-        ts = self._buffer.timestamps
-        if "timestamp" not in self._datasets:
-            self._datasets["timestamp"] = self._file.create_dataset(
-                "timestamp",
-                data=ts[:buf_size].copy(),
-                maxshape=(None,),
-                dtype=np.float64,
-                compression="gzip",
-            )
-        else:
-            ts_ds = self._datasets["timestamp"]
-            ts_ds.resize(buf_size, axis=0)
-            ts_ds[new_start:buf_size] = ts[new_start:buf_size]
-
-        self._flushed_frames = buf_size
+        assert self._data_writer is not None
+        self._data_writer.append(self._buffer.data, self._buffer.timestamps)
 
     def stop_episode(self, success: bool = True, reason: str = "") -> str | None:
         """Signal end of episode; return path immediately, flush in background.
@@ -836,13 +732,13 @@ class EpisodeRecorder:
                 )
             self._camera_writer = None
             try:
-                if self._file is not None:
-                    self._file.close()
+                if self._data_writer is not None:
+                    self._data_writer.close()
             except Exception:
                 logger.warning(
                     "HDF5 cleanup failed after episode stop error", exc_info=True
                 )
-            self._file = None
+            self._data_writer = None
         finally:
             # Always clean up the temp directory and reset state after stopping.
             _tmp = self._temp_dir
@@ -880,8 +776,10 @@ class EpisodeRecorder:
 
         self._buffer = None
         self._frame_count = buf_size
-        quality_metrics = _episode_quality_metrics(
-            self._datasets,
+        assert self._data_writer is not None
+        data_writer = self._data_writer
+        quality_metrics = compute_episode_quality_metrics(
+            dict(data_writer.datasets),
             frame_count=self._frame_count,
             control_hz=self.control_hz,
             runtime_metrics=runtime_quality_metrics,
@@ -889,8 +787,7 @@ class EpisodeRecorder:
 
         _had_rgb = camera_frame_count > 0
 
-        if self._file is not None:
-            meta = self._file["meta"]
+        def _write_final_meta(meta: h5py.Group) -> None:
             grid_dt_s = 1.0 / self.control_hz
             grid_duration_s = max(0, self._frame_count - 1) * grid_dt_s
             meta.attrs["schema_version"] = SCHEMA_VERSION
@@ -909,7 +806,7 @@ class EpisodeRecorder:
             )
             meta.attrs["min_frames_met"] = self._frame_count >= self.min_frames
             meta.attrs["has_camera"] = _had_rgb
-            meta.attrs["has_timestamps"] = "timestamp" in self._datasets
+            meta.attrs["has_timestamps"] = "timestamp" in data_writer.datasets
             meta.attrs["camera_stream_frames"] = camera_frame_count
             meta.attrs["camera_writer_error"] = ""
             for metric_name, metric_value in self._camera_writer_metrics.items():
@@ -920,18 +817,18 @@ class EpisodeRecorder:
             meta.attrs["stop_reason"] = reason or (
                 "max_frames" if truncated else "manual"
             )
-            # Backfill camera metadata if the child connected after the lazy write.
+            # Repeat the camera snapshot during finalization before the handle closes.
             self._write_camera_meta_attrs(meta)
 
-        if self._file is not None:
-            self._file.close()
-        self._file = None
+        data_writer.update_meta(_write_final_meta)
+        data_writer.close()
+        self._data_writer = None
         # Atomically rename the temporary directory into its final location.
         _final = self._episode_dir
         _tmp = self._temp_dir
         if _tmp is not None and _final is not None:
             if success:
-                self._validate_and_sync_temp_episode(Path(_tmp), self._frame_count)
+                self._validate_temp_episode(Path(_tmp), self._frame_count)
                 atomic_publish(_tmp, _final)
                 logger.info(
                     "Episode quality: path=%s frames=%d ik_hold=%d camera_invalid=%d "
@@ -951,14 +848,11 @@ class EpisodeRecorder:
                 )
             else:
                 self._write_aborted_manifest(reason=reason or "discarded", error="")
-                self._discard_temp_files(_tmp)
-
-        self._reset_episode_state()
 
     def _reset_episode_state(self) -> None:
         """Reset all mutable episode state to defaults (called from both the
         success path and the crash-handler in _stop_episode_impl)."""
-        self._datasets.clear()
+        self._data_writer = None
         self._recording = False
         self._max_frames_reached = False
         self._frame_count = 0
@@ -966,7 +860,6 @@ class EpisodeRecorder:
         self._episode_dir = None
         self._temp_dir = None
         self._buffer = None
-        self._flushed_frames = 0
         self._camera_writer = None
         self._camera_writer_metrics = {}
         self._last_camera_payload = None
@@ -992,37 +885,11 @@ class EpisodeRecorder:
             "created_wall_time_ns": time.time_ns(),
             "resolved_config_sha256": self._resolved_config_hash or "",
         }
-        fd, temp_name = tempfile.mkstemp(
-            prefix=f".{target.name}.tmp-", dir=self.data_dir
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(
-                    payload,
-                    stream,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                )
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.rename(temp_name, target)
-            dir_fd = os.open(self.data_dir, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except Exception:
-            try:
-                os.unlink(temp_name)
-            except FileNotFoundError:
-                pass
-            raise
-        return target
+        return atomic_json_dump(payload, target, indent=2, ensure_ascii=False)
 
     @staticmethod
-    def _validate_and_sync_temp_episode(temp_dir: Path, expected_frames: int) -> None:
-        """Reopen/decode all three modalities, then fsync before publication."""
+    def _validate_temp_episode(temp_dir: Path, expected_frames: int) -> None:
+        """Reopen and decode all three modalities before durable publication."""
         paths = {
             "data": temp_dir / "data.h5",
             "depth": temp_dir / "depth.h5",
@@ -1065,17 +932,6 @@ class EpisodeRecorder:
                 raise RuntimeError(
                     f"RGB decoded frame count {decoded_frames} != {expected_frames}"
                 )
-        for path in paths.values():
-            fd = os.open(path, os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        dir_fd = os.open(temp_dir, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
 
     @staticmethod
     def _discard_temp_files(tmp: str) -> None:

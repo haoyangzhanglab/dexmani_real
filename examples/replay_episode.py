@@ -21,11 +21,10 @@ from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_c
 from dexmani_real.robot.episode_replay import (
     DEFAULT_OUTPUT_DIR,
     EpisodeReplayConfig,
-    ReplayStatus,
-    load_trajectory,
     replay_episode,
-    resolve_episode_path,
 )
+from dexmani_real.robot.replay_controller import ReplayStatus
+from dexmani_real.robot.replay_trajectory import load_trajectory, resolve_episode_path
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
