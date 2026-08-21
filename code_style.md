@@ -79,7 +79,7 @@ entry point
 按稳定的领域责任组织，而不是按技术模式组织：
 
 - `config/`：canonical defaults、运行时快照和标定读取。
-- `sensor/`：设备输入、点云、时钟映射和传感器诊断。
+- `sensor/`：设备输入、点云和时钟映射。
 - `robot/`：硬件 driver、worker、homing 与物理回放。
 - `planning/`：FK、IK、collision 和 path 等纯计算优先的能力。
 - `teleop/`：操作者输入到 action proposal 的映射与采集决策。
@@ -87,7 +87,7 @@ entry point
 - `deployment/`：模型 observation、inference、plan 和调度。
 - `recording/`：raw episode schema、写入、读取和可视化。
 - `data_processing/`：离线清洗和训练数据导出。
-- `examples/`：薄入口和明确的硬件诊断程序。
+- `examples/`：薄入口和自包含的诊断/可视化/离线分析程序。
 
 不要轻易新增顶层包。新模块应先回答“它属于哪个现有领域”。
 
@@ -148,8 +148,8 @@ if __name__ == "__main__":
 - 打印面向操作者的结果。
 
 入口不应拥有通用的 geometry、retarget、safety、recording 或 device protocol 逻辑。
-一次性诊断可以保留在 `examples/`，但文件名和顶部 docstring 必须说明是否连接硬件、
-是否打开 GUI、是否写标定。
+诊断、可视化与离线分析程序可以保留在 `examples/`，但文件名和顶部 docstring 必须
+说明是否连接硬件、是否打开 GUI、是否写标定。
 
 ## 6. 命名
 

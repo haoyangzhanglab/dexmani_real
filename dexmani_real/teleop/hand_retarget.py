@@ -82,7 +82,8 @@ def _human_flexion_rad(landmarks: np.ndarray) -> np.ndarray:
 
     Rotation-invariant per-finger angles: thumb CMC + MCP+IP, then per finger
     (index/mid/ring/pinky) MCP + PIP+DIP — the same feature order as
-    ``_HUMAN_FLEXION_JOINT_PAIRS`` and ``hand_retarget_eval.extract_hand_features``.
+    ``_HUMAN_FLEXION_JOINT_PAIRS`` and
+    ``extract_hand_features`` in ``examples/tune_hand_retarget.py``.
     """
     pts = np.asarray(landmarks, dtype=np.float64)
     if pts.shape != (21, 3):

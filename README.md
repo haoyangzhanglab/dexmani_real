@@ -32,7 +32,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | 理解仓库与修改约束 | [`AGENTS.md`](AGENTS.md)、[`code_style.md`](code_style.md) | [`repo_map.md`](repo_map.md)、[`user_design.md`](user_design.md) |
 | VR 遥操作与采集 | [`examples/collect_teleop.py`](examples/collect_teleop.py) | [`teleop/session.py`](dexmani_real/teleop/session.py)、[`teleop/loop.py`](dexmani_real/teleop/loop.py)、[`teleop/operator_controls.py`](dexmani_real/teleop/operator_controls.py)、[`teleop/control_grid.py`](dexmani_real/teleop/control_grid.py)、[`teleop/action_proposal.py`](dexmani_real/teleop/action_proposal.py) |
 | 键盘遥操作 | [`examples/keyboard_teleop.py`](examples/keyboard_teleop.py) | [`teleop/keyboard_session.py`](dexmani_real/teleop/keyboard_session.py) |
-| 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`robot/replay_trajectory.py`](dexmani_real/robot/replay_trajectory.py)、[`robot/episode_replay.py`](dexmani_real/robot/episode_replay.py)、[`robot/replay_controller.py`](dexmani_real/robot/replay_controller.py)、[`robot/replay_evaluation.py`](dexmani_real/robot/replay_evaluation.py) |
+| 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`robot/replay_trajectory.py`](dexmani_real/robot/replay_trajectory.py)、[`robot/episode_replay.py`](dexmani_real/robot/episode_replay.py)、[`robot/replay_controller.py`](dexmani_real/robot/replay_controller.py)、[`robot/replay_capture.py`](dexmani_real/robot/replay_capture.py)、[`robot/replay_evaluation.py`](dexmani_real/robot/replay_evaluation.py) |
 | raw episode 读取/录制 | — | [`recording/episode_frame.py`](dexmani_real/recording/episode_frame.py)、[`recording/episode_recorder.py`](dexmani_real/recording/episode_recorder.py)、[`recording/episode_data_writer.py`](dexmani_real/recording/episode_data_writer.py)、[`recording/episode_reader.py`](dexmani_real/recording/episode_reader.py) |
 | 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`data_processing/`](dexmani_real/data_processing) |
 | learned-policy 部署 | [`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`integrations/`](dexmani_real/integrations) |
@@ -182,6 +182,12 @@ python examples/export_policy_zarr.py \
 
 ```bash
 python examples/visualize_episode.py episodes/<task>/episode_*
+```
+
+离线评估 TAG/DexPilot 手部 retarget（不连硬件，只读 episode 并打印 JSON 报告）：
+
+```bash
+python examples/tune_hand_retarget.py episodes/<task>/episode_* [--search]
 ```
 
 ## 数据布局

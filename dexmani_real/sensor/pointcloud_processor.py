@@ -113,6 +113,11 @@ class PointCloudProcessor:
         self.last_valid_depth_ratio = 0.0
         self.last_padding_count = 0
 
+    @property
+    def desk_plane(self) -> tuple[float, float, float, float] | None:
+        """Effective desk plane (configured or auto-loaded), else None."""
+        return self._desk_plane
+
     @staticmethod
     def apply_depth_median(depth_m: np.ndarray, enabled: bool) -> np.ndarray:
         """Apply an edge-preserving 3x3 median filter to valid depth pixels."""

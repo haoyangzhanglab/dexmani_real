@@ -161,6 +161,11 @@ def quat_wxyz_to_rotmat(q_wxyz: np.ndarray) -> np.ndarray:
     return Rotation.from_quat(quat_xyzw).as_matrix()
 
 
+def rot6d_to_rotmat(r6: np.ndarray) -> np.ndarray:
+    """6D rotation → 3×3 rotation matrix (via WXYZ quaternion)."""
+    return quat_wxyz_to_rotmat(rot6d_to_quat_wxyz(r6))
+
+
 def forward_from_quat_wxyz(q_wxyz: np.ndarray) -> np.ndarray:
     """FLU +X forward direction from a WXYZ quaternion.
 

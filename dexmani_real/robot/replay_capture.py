@@ -5,15 +5,10 @@ from __future__ import annotations
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
+from dexmani_real.planning.pose_utils import rot6d_to_rotmat
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 _SAFETY_REASON_BYTES = 256
-
-
-def _rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
-    quat_wxyz = rot6d_to_quat_wxyz(rot6d)
-    return Rotation.from_quat(np.roll(quat_wxyz, -1)).as_matrix()
 
 
 class ReplayRecorder:
@@ -68,7 +63,7 @@ class ReplayRecorder:
         self.eef_pos[idx] = eef_pos
         self.eef_rot6d[idx] = eef_rot6d
         try:
-            quat_xyzw = Rotation.from_matrix(_rot6d_to_matrix(eef_rot6d)).as_quat()
+            quat_xyzw = Rotation.from_matrix(rot6d_to_rotmat(eef_rot6d)).as_quat()
             self.eef_quat_wxyz[idx] = np.array(
                 [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
             )

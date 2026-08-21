@@ -7,9 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 
-from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
+from dexmani_real.planning.pose_utils import rot6d_to_rotmat
 from dexmani_real.recording.transaction import atomic_json_dump
 from dexmani_real.robot.replay_trajectory import TrajectoryData
 from dexmani_real.utils.log import get_logger
@@ -63,12 +62,6 @@ class ReplayMetrics:
     arm_tracking_error_mean_deg: float = 0.0
     arm_tracking_error_p95_deg: float = 0.0
     arm_tracking_error_max_deg: float = 0.0
-
-
-def _rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
-    """Convert (6,) rot6d to (3,3) rotation matrix via rot6d→quat→matrix."""
-    q_wxyz = rot6d_to_quat_wxyz(rot6d)
-    return Rotation.from_quat(np.roll(q_wxyz, -1)).as_matrix()  # wxyz→xyzw
 
 
 def _geodesic_distance_deg(rotation_a: np.ndarray, rotation_b: np.ndarray) -> float:
@@ -151,8 +144,8 @@ def compute_metrics(
             rot_errs = []
             for i in np.where(valid_rot)[0]:
                 try:
-                    rotation_a = _rot6d_to_matrix(orig_rot6d[i])
-                    rotation_b = _rot6d_to_matrix(rep_rot6d[i])
+                    rotation_a = rot6d_to_rotmat(orig_rot6d[i])
+                    rotation_b = rot6d_to_rotmat(rep_rot6d[i])
                     rot_errs.append(_geodesic_distance_deg(rotation_a, rotation_b))
                 except ValueError:
                     rot_errs.append(np.nan)

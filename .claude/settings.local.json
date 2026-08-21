@@ -226,7 +226,8 @@
       "Bash(PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python *)",
       "Bash(rm -rf pi-r2-flow)",
       "Bash(gh repo *)",
-      "Bash(curl -s \"https://api.github.com/repos/wengmister/LeFranX/git/trees/main?recursive=1\")"
+      "Bash(curl -s \"https://api.github.com/repos/wengmister/LeFranX/git/trees/main?recursive=1\")",
+      "Bash(echo \"---exit:$?\")"
     ]
   }
 }

@@ -107,8 +107,6 @@
 | `dexmani_real/sensor/camera_calibration.py` | ArUco 检测、eye-to-hand 求解、残差筛选与标定文件持久化；不打开设备或 GUI。 |
 | `dexmani_real/sensor/camera_calibration_control.py` | 标定用 arm feedback、运动状态、workspace clipping、gated publish、quit hold 与归位。 |
 | `dexmani_real/sensor/camera_calibration_session.py` | xArm7 + RealSense 标定 lifecycle 的 side-effect owner：设备、采样、GUI、交互与失败 cleanup。 |
-| `dexmani_real/sensor/realsense_diagnostic.py` | RealSense RGB、depth、点云和 frame timing 的交互诊断。 |
-| `dexmani_real/sensor/pointcloud_diagnostic.py` | L515 tabletop 点云质量检查及 desk-plane 标定。 |
 
 ### `dexmani_real/planning/`
 
@@ -157,7 +155,6 @@
 | `dexmani_real/teleop/hand_control.py` | hand observation cache、retarget 状态和 hand command 生成 helper。 |
 | `dexmani_real/teleop/hand_retarget.py` | VR landmarks 到 XHand 的 TAG/DexPilot retarget facade、校验与状态管理。 |
 | `dexmani_real/teleop/dexpilot_prior.py` | 带 human-flexion prior 的 in-repo DexPilot optimizer wrapper。 |
-| `dexmani_real/teleop/hand_retarget_eval.py` | 离线加载 episode、评估 retarget backend、搜索参数、估计 home 与 Pareto 分析。 |
 | `dexmani_real/teleop/episode_samples.py` | 从因果 snapshot 构造并发布 typed fixed-grid recording sample。 |
 | `dexmani_real/teleop/recording_session.py` | 退出时保存或丢弃 active recording 的有界操作者决策。 |
 | `dexmani_real/teleop/safety.py` | teleop pause/hold、re-anchor、contact guard 与 configured homing helper。 |
@@ -182,7 +179,6 @@
 | `dexmani_real/recording/io_process.py` | 独立 RecorderIO worker；`_RecorderIOSession` 按 sequence 连续取得未确认 sample、监控 backlog，拥有 active generation、episode transaction 与有界 finalize。 |
 | `dexmani_real/recording/transaction.py` | 同文件系统 fsync、atomic publish 和 atomic JSON helper。 |
 | `dexmani_real/recording/episode_reader.py` | published v17/v18/v19 episode 校验、HDF5 sidecar merged view 与 RGB/depth 读取。 |
-| `dexmani_real/recording/episode_visualizer.py` | Rerun raw-episode metadata、robot state、camera 和点云可视化。 |
 
 ### `dexmani_real/data_processing/`
 
@@ -194,9 +190,7 @@
 | `dexmani_real/data_processing/cleaning.py` | 将 raw flags、limits、annotations 与质量结果组合为保留/拒绝决策。 |
 | `dexmani_real/data_processing/transforms.py` | RGB/depth/intrinsics resize 与 point-cloud 采样的确定性数值变换。 |
 | `dexmani_real/data_processing/pipeline.py` | 逐 raw episode 生成 processed HDF5 v3，验证整批并事务式发布 index。 |
-| `dexmani_real/data_processing/cli.py` | raw → processed HDF5 的参数解析和 JSON report CLI。 |
 | `dexmani_real/data_processing/zarr_export.py` | 校验同任务 processed HDF5，并事务式导出最小 Policy Zarr v2。 |
-| `dexmani_real/data_processing/zarr_cli.py` | processed HDF5 → Policy Zarr 的参数解析和 JSON report CLI。 |
 
 ### `dexmani_real/deployment/`
 
@@ -236,8 +230,8 @@
 
 ## 4. 可执行入口
 
-`examples/` 中的文件是薄入口或硬件诊断程序，不是自动化测试。除纯 `--help`、
-`--print-config` 和明确的离线数据命令外，均应按可能影响硬件处理。
+`examples/` 中的文件是薄入口或自包含的诊断/可视化/离线分析程序，不是自动化测试。
+除纯 `--help`、`--print-config` 和明确的离线数据命令外，均应按可能影响硬件处理。
 
 | 文件 | 职责 |
 |---|---|
@@ -245,13 +239,14 @@
 | `examples/keyboard_teleop.py` | 解析 runtime config 和 no-hand 确认，并启动 keyboard teleop。 |
 | `examples/run_policy.py` | 解析 runtime/deployment config、backend targets 和 checkpoint，并启动 policy deployment。 |
 | `examples/replay_episode.py` | 加载 raw episode、解析 replay runtime、显示 provenance，并启动真实机器人回放。 |
-| `examples/process_episodes.py` | `data_processing.cli` 的 raw → processed HDF5 薄入口。 |
-| `examples/export_policy_zarr.py` | `data_processing.zarr_cli` 的 processed HDF5 → Zarr 薄入口。 |
-| `examples/visualize_episode.py` | `recording.episode_visualizer` 的 Rerun 薄入口。 |
+| `examples/process_episodes.py` | raw → processed HDF5 离线处理 CLI：argparse 与 JSON report；管线在 `data_processing/`。 |
+| `examples/export_policy_zarr.py` | processed HDF5 → Policy Zarr 离线导出 CLI：argparse 与 JSON report；导出事务在 `data_processing/zarr_export.py`。 |
+| `examples/visualize_episode.py` | 自包含 Rerun raw-episode 可视化（离线、不连硬件）：metadata、robot state、camera 和点云。 |
+| `examples/tune_hand_retarget.py` | 自包含离线 TAG/DexPilot retarget 评估：参数搜索、home 估计与 Pareto 分析，不连硬件。 |
 | `examples/calibrate_camera.py` | xArm7 + RealSense eye-to-hand ArUco 标定入口。 |
 | `examples/calibrate_vr_heading.py` | 收集 HTS head/wrist orientation、评估质量并原子更新 VR transform。 |
-| `examples/realsense_record_example.py` | RealSense RGB-D/point-cloud 交互诊断入口。 |
-| `examples/pointcloud_process_example.py` | tabletop 点云、深度边缘和 desk-plane 标定诊断入口。 |
+| `examples/realsense_record_example.py` | 自包含 RealSense RGB-D/点云交互诊断：连接相机，打开 cv2/Open3D GUI，不写标定。 |
+| `examples/pointcloud_process_example.py` | 自包含 L515 tabletop 点云与 desk-plane 标定诊断：连接相机，打开 GUI，确认后写 `desk_plane.json`。 |
 | `examples/xhand_control_example.py` | XHand 独立连接、状态/触觉读取和 preset command 交互诊断。 |
 
 ## 5. Retargeting 与语音资源
