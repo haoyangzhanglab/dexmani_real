@@ -33,7 +33,7 @@ class DeploymentConfig:
     """Frozen learned-policy deployment parameters.
 
     The three ``*_target`` fields name ``module:symbol`` factories resolved by
-    :mod:`dexmani_real.deployment.loader`; ``checkpoint`` /
+    :mod:`dexmani_real.deployment.worker`; ``checkpoint`` /
     ``model_config_path`` / ``device`` and the explicit ``observation_fields``
     contract are the model-facing values that cross the deployment boundary
     (everything else model-internal stays in the model repository).

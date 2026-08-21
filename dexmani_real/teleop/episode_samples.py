@@ -14,6 +14,7 @@ from dexmani_real.utils.schema import (
     HAND_JOINT_SHAPE,
     HAND_TACTILE_FORCE_SHAPE,
     HAND_TACTILE_SUM_SHAPE,
+    nan_array,
 )
 from dexmani_real.planning import Pose
 from dexmani_real.planning.hand_kinematics import HandKinematics
@@ -23,7 +24,6 @@ from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.recording.recorder_client import RecorderClient
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.shm.shared_storage import SharedStorage
-from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)

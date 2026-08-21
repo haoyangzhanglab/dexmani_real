@@ -11,18 +11,24 @@ carry ``arm``/``hand``/``inference``/``policy``.
 The first deployment is joint-only: no VR worker (only an adapter that declares
 VR needs it), no camera worker (only required by RGB/pointcloud adapters),
 and no recorder.
+
+Also owns the one-time startup provenance log line (commit hashes +
+checkpoint/model-config SHA-256) via ``sha256_file`` and
+``log_deployment_provenance``.
 """
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import multiprocessing as mp
 import os
+from pathlib import Path
 from typing import Any
 
 from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.deployment.config import DeploymentConfig
 from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_loop
-from dexmani_real.deployment.provenance import log_deployment_provenance, sha256_file
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.robot.arm_loop import arm_loop
 from dexmani_real.config.runtime import ArmLoopConfig
@@ -43,6 +49,55 @@ from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
+
+
+def sha256_file(path: str | Path) -> str:
+    """Return the hex SHA-256 of a file's contents ("" when unreadable/missing).
+
+    Best-effort: logs the checkpoint/model-config hash "if available"; an
+    unreadable file logs empty rather than failing startup (the backend load is
+    the authoritative check for a bad checkpoint).
+    """
+    try:
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return ""
+
+
+def log_deployment_provenance(
+    logger: logging.Logger,
+    *,
+    deployment: DeploymentConfig,
+    runtime_sha256: str,
+    dexmani_commit: str = "",
+    model_commit: str = "",
+    checkpoint_sha256: str = "",
+    model_config_sha256: str = "",
+) -> None:
+    """Log one structured provenance line (no SharedStorage write).
+
+    Provenance is a one-time startup log line, never a shared-memory payload:
+    the full resolved config must not enter high-frequency IPC. Commit hashes
+    are optional; absence logs ``unknown`` rather than fabricating a value.
+    """
+    logger.info(
+        "deployment provenance: dexmani_commit=%s model_commit=%s "
+        "backend_target=%s observation_adapter_target=%s action_adapter_target=%s "
+        "checkpoint=%s checkpoint_sha256=%s model_config_sha256=%s runtime_sha256=%s",
+        dexmani_commit or "unknown",
+        model_commit or "unknown",
+        deployment.backend_target,
+        deployment.observation_adapter_target,
+        deployment.action_adapter_target,
+        deployment.checkpoint or "",
+        checkpoint_sha256 or "",
+        model_config_sha256 or "",
+        runtime_sha256,
+    )
 
 
 def build_policy_worker_specs(

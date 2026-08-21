@@ -1,4 +1,4 @@
-"""Cross-process NumPy dtype definitions and shape constants.
+"""Cross-process NumPy dtype definitions, shape constants, and NaN-array construction.
 
 This module deliberately imports only NumPy.  Shared-memory allocation,
 policy logic, device workers, and recording serialization may depend on these
@@ -369,6 +369,15 @@ def make_record_sample_dtype(
     )
 
 
+def nan_array(shape: int | tuple[int, ...], dtype: type = np.float64) -> np.ndarray:
+    """Create an array filled with NaN.
+
+    Centralized factory for the ``np.full(shape, np.nan, dtype=np.float64)``
+    pattern repeated across the codebase.  Ensures consistent dtype and NaN fill.
+    """
+    return np.full(shape, np.nan, dtype=dtype)
+
+
 __all__ = [
     "ARM_COMMAND_DTYPE",
     "ARM_STATE_DTYPE",
@@ -385,4 +394,5 @@ __all__ = [
     "RECORD_TASK_LABEL_BYTES",
     "VR_FRAME_DTYPE",
     "make_record_sample_dtype",
+    "nan_array",
 ]

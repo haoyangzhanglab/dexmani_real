@@ -205,13 +205,11 @@
 | `dexmani_real/deployment/__init__.py` | learned-policy 部署子包标记。 |
 | `dexmani_real/deployment/contracts.py` | inference context、joint action chunk 与 backend/observation/action adapter protocols。 |
 | `dexmani_real/deployment/config.py` | deployment YAML/CLI 合并、类型校验、required target 校验与 SHA-256 identity。 |
-| `dexmani_real/deployment/loader.py` | 在 worker 中惰性加载 `module:symbol` backend/adapter factory。 |
 | `dexmani_real/deployment/observation.py` | 因果、不可变 arm/hand/tactile/camera history windows 与 observation batch。 |
-| `dexmani_real/deployment/worker.py` | inference worker：读取历史、编码 observation、运行 backend、解码并发布 plan。 |
+| `dexmani_real/deployment/worker.py` | inference worker：`module:symbol` backend/adapter factory 惰性加载、读取历史、编码 observation、运行 backend、解码并发布 plan。 |
 | `dexmani_real/deployment/coordinator.py` | learned-policy 唯一 command producer；采纳 plan、选择 due step 并通过安全门发布。 |
-| `dexmani_real/deployment/lifecycle.py` | policy worker topology、SharedStorage、readiness、ARMED、supervision 与 verified shutdown。 |
+| `dexmani_real/deployment/lifecycle.py` | policy worker topology、SharedStorage、readiness、ARMED、supervision、verified shutdown 与启动 provenance 日志（含文件 SHA-256）。 |
 | `dexmani_real/deployment/metrics.py` | inference/coordinator 计数、reject 分类和周期性日志。 |
-| `dexmani_real/deployment/provenance.py` | checkpoint/model config 文件 SHA-256 和 deployment provenance 日志。 |
 | `dexmani_real/deployment/fake.py` | CPU-only、无 torch、确定性的 fake adapters/backend，用于离线验证协议链路。 |
 
 ### `dexmani_real/integrations/`
@@ -226,14 +224,13 @@
 | 文件 | 职责 |
 |---|---|
 | `dexmani_real/utils/__init__.py` | 通用工具子包标记。 |
-| `dexmani_real/utils/schema.py` | cross-process NumPy dtype、shape、field size 和 recording sample dtype 的 canonical 定义。 |
+| `dexmani_real/utils/schema.py` | cross-process NumPy dtype、shape、field size、recording sample dtype 与 NaN array 构造的 canonical 定义。 |
 | `dexmani_real/utils/limits.py` | XHand mechanical/command/home limit 层级一致性校验。 |
 | `dexmani_real/utils/hand_health.py` | teleop、replay、deployment 共用的 arm/hand feedback freshness 与 finite 健康判断。 |
-| `dexmani_real/utils/array_utils.py` | 指定 shape/dtype 的 NaN array 构造。 |
 | `dexmani_real/utils/serialization.py` | dataclass 从 mapping 递归恢复的共享 helper。 |
 | `dexmani_real/utils/signal_utils.py` | Cartesian pose EMA 与 quaternion-aware 平滑。 |
 | `dexmani_real/utils/rate_manager.py` | 可选精确忙等的 absolute-deadline rate limiting 与 overrun 统计。 |
-| `dexmani_real/utils/retry.py` | consecutive-event 和 sliding-window event threshold 计数。 |
+| `dexmani_real/utils/retry.py` | consecutive-event 计数与阈值升级。 |
 | `dexmani_real/utils/log.py` | 中央 logging、native stdout capture、diagnostic 提取与 throttled warning。 |
 | `dexmani_real/utils/pointcloud_utils.py` | RGB-D deprojection、坐标变换、crop、voxel/FPS sampling、packing 与 depth 可视化。 |
 

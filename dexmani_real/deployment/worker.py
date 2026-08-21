@@ -9,20 +9,27 @@ is a proposal, not a robot command.
 
 ``inference_loop`` is a plain ``*_loop(shared, config)`` function (not an
 ``mp.Process`` subclass); lifecycle/supervision stays in the A/B runtime.
+
+The module also owns the ``module:symbol`` lazy loaders (``load_backend``,
+``load_observation_adapter``, ``load_action_adapter``) so torch/CUDA imports
+happen only inside the inference child process, never in the parent.
 """
 
 from __future__ import annotations
 
+import importlib
 import time
+from typing import TypeVar
 
 import numpy as np
 
 from dexmani_real.deployment.config import DeploymentConfig
-from dexmani_real.deployment.contracts import InferenceContext, JointActionChunk
-from dexmani_real.deployment.loader import (
-    load_action_adapter,
-    load_backend,
-    load_observation_adapter,
+from dexmani_real.deployment.contracts import (
+    ActionAdapter,
+    InferenceContext,
+    JointActionChunk,
+    ObservationAdapter,
+    PolicyBackend,
 )
 from dexmani_real.deployment.metrics import (
     INFERENCE_FAILURES,
@@ -46,6 +53,65 @@ logger = get_logger(__name__)
 
 # Poll delay while required causal feedback is unavailable.
 _NO_FEEDBACK_POLL_S = 0.005
+
+_ProtocolT = TypeVar("_ProtocolT")
+
+
+# A ``module:symbol`` target is imported and instantiated only when the
+# inference child calls these loaders, so the parent process never imports
+# torch or initializes CUDA, and a checkpoint/model object never crosses
+# ``spawn``. Every failure raises (fail closed); there is no dummy safe mode.
+def _split_target(target: str) -> tuple[str, str]:
+    if not isinstance(target, str) or ":" not in target:
+        raise ValueError(f"loader target must be 'module:symbol', got {target!r}")
+    module_name, _, symbol = target.rpartition(":")
+    if not module_name.strip() or not symbol.strip():
+        raise ValueError(f"loader target must be 'module:symbol', got {target!r}")
+    return module_name.strip(), symbol.strip()
+
+
+def _load(
+    target: str,
+    protocol: type[_ProtocolT],
+    kind: str,
+    config: DeploymentConfig | None,
+) -> _ProtocolT:
+    module_name, symbol = _split_target(target)
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:  # noqa: BLE001 - fail closed on any import error
+        raise ImportError(f"failed to import {kind} module {module_name!r}: {exc}") from exc
+
+    factory = getattr(module, symbol, None)
+    if factory is None:
+        raise ImportError(f"{kind} module {module_name!r} has no symbol {symbol!r}")
+    try:
+        instance = factory(config=config) if config is not None else factory()
+    except Exception as exc:  # noqa: BLE001 - fail closed on any construction error
+        raise TypeError(f"failed to instantiate {kind} {target!r}: {exc}") from exc
+
+    if not isinstance(instance, protocol):
+        raise TypeError(f"{kind} {target!r} does not satisfy {protocol.__name__}")
+    return instance
+
+
+def load_backend(target: str, *, config: DeploymentConfig | None = None) -> PolicyBackend:
+    """Load a :class:`PolicyBackend` from ``module:symbol``."""
+    return _load(target, PolicyBackend, "backend", config)
+
+
+def load_observation_adapter(
+    target: str, *, config: DeploymentConfig | None = None
+) -> ObservationAdapter:
+    """Load an :class:`ObservationAdapter` from ``module:symbol``."""
+    return _load(target, ObservationAdapter, "observation adapter", config)
+
+
+def load_action_adapter(
+    target: str, *, config: DeploymentConfig | None = None
+) -> ActionAdapter:
+    """Load an :class:`ActionAdapter` from ``module:symbol``."""
+    return _load(target, ActionAdapter, "action adapter", config)
 
 
 def publish_plan(

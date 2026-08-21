@@ -22,9 +22,8 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.utils.schema import HAND_FINGERTIP_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.utils.schema import HAND_FINGERTIP_SHAPE, HAND_JOINT_SHAPE, nan_array
 from dexmani_real.planning.constants import HAND_SDK_TO_URDF_IDX
-from dexmani_real.utils.array_utils import nan_array
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
