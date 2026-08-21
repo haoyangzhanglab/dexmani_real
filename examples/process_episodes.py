@@ -1,4 +1,4 @@
-"""Usage: ``python examples/process_episodes.py --input-root DIR --profile PROFILE``.
+"""Usage: ``python examples/process_episodes.py INPUT_ROOT [--profile PROFILE]``.
 
 Offline CLI that compacts one task's schema-v17/v18/v19 episodes into
 processed HDF5 files. Connects to no hardware, opens no GUI, and writes only
@@ -29,12 +29,11 @@ def _parser() -> argparse.ArgumentParser:
         description="Compact supported schema-v17/v18/v19 Real episodes into one processed HDF5 per source."
     )
     parser.add_argument(
-        "--input-root",
+        "input_root",
         type=Path,
-        required=True,
         help=(
-            "Directory whose direct children are episodes for one task, e.g. "
-            "episodes/pick_apple_messy; use episodes only for legacy flat recordings."
+            "One episode directory or a task directory whose direct children are "
+            "episodes, e.g. episodes/pick_apple_messy/episode_*."
         ),
     )
     parser.add_argument(
@@ -48,6 +47,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile",
         choices=[profile.value for profile in OutputProfile],
+        default=OutputProfile.RGB_PC.value,
         help="Select the required modalities and their shared hard-valid mask.",
     )
     parser.add_argument(
@@ -132,8 +132,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         }
         print(json.dumps(reports, ensure_ascii=False, indent=2))
         return
-    if args.profile is None:
-        raise SystemExit("--profile is required unless --compare-profiles is used")
     report = process_episode_root(
         args.input_root,
         output_root,

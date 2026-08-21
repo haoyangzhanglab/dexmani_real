@@ -553,6 +553,10 @@ class PolicyParams:
     # Endpoint bound per control tick; this is not arm interpolation.
     arm_max_delta_rad_per_tick: float | None = np.deg2rad(8.0)
 
+    # Hard endpoint bound for the hand after retargeting and startup ramp.
+    # This is deliberately independent of the TAG/DexPilot soft temporal costs.
+    hand_max_delta_rad_per_tick: float = 0.2
+
     hand_enabled: bool = True
     hand_retargeting_type: str = "tag"
     hand_ramp_duration_s: float = 0.5  # smoothstep startup ramp, rate-independent
@@ -609,6 +613,13 @@ class PolicyParams:
             and (not np.isfinite(self.arm_max_delta_rad_per_tick) or self.arm_max_delta_rad_per_tick <= 0)
         ):
             raise ValueError("arm_max_delta_rad_per_tick must be finite and > 0 or None")
+        if (
+            not np.isfinite(self.hand_max_delta_rad_per_tick)
+            or self.hand_max_delta_rad_per_tick <= 0
+        ):
+            raise ValueError(
+                "hand_max_delta_rad_per_tick must be finite and > 0"
+            )
 
 
 @dataclass(frozen=True)
@@ -857,6 +868,10 @@ class CameraParams:
     # Zero selects the default recovered-frame-gap logging threshold. Gaps are
     # retained as telemetry; current-frame freshness is timestamp-based.
     frame_gap_stall_threshold: int = 0
+    # Librealsense-owned capture queue between the device callback and the
+    # camera worker. It absorbs bounded host scheduling jitter without adding
+    # a second Python owner for the SDK object.
+    frame_queue_capacity: int = 8
     ring_maxlen: int = 5
     pointcloud_num_points: int = 2048
     writer_queue_size: int = 8
@@ -884,7 +899,12 @@ class CameraParams:
             raise ValueError("camera stall abort threshold must be greater than max frame age")
         if self.frame_gap_stall_threshold < 0:
             raise ValueError("camera frame_gap_stall_threshold must be >= 0")
-        if self.ring_maxlen <= 0 or self.pointcloud_num_points <= 0 or self.writer_queue_size <= 0:
+        if (
+            self.frame_queue_capacity <= 0
+            or self.ring_maxlen <= 0
+            or self.pointcloud_num_points <= 0
+            or self.writer_queue_size <= 0
+        ):
             raise ValueError("camera ring, pointcloud, and writer capacities must be > 0")
         if self.serial is not None and not self.serial:
             raise ValueError("camera serial must be non-empty when configured")

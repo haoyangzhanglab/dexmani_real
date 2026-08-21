@@ -134,8 +134,9 @@ HAND_STATE_DTYPE = np.dtype(
         ("connected", "<u1"),
         # Set when qpos is held from the last read after a single-frame failure.
         ("qpos_stale", "<u1"),
-        # action_id of the last command for which XHand.send_action() returned
-        # success; this is not the hand command ring's internal sequence.
+        # action_id of the last command accepted by XHand.send_action(),
+        # including a configured-current overrun accepted as grasp contact;
+        # this is not the hand command ring's internal sequence.
         ("last_cmd_seq", "<u8"),
         ("last_cmd_qpos", "<f8", HAND_JOINT_SHAPE),
         ("commboard_err", "<i4", HAND_JOINT_SHAPE),
@@ -146,9 +147,10 @@ HAND_STATE_DTYPE = np.dtype(
         ("state_valid", "<u1"),
         ("send_healthy", "<u1"),
         ("read_healthy", "<u1"),
-        # Cumulative error telemetry is carried by the next successful
-        # feedback frame, so slower consumers can observe a failed read that
-        # intentionally did not publish a synthetic state frame.
+        # Cumulative telemetry includes accepted grasp-contact overrun sends
+        # and recoverable overrun reads. It is carried by the next successful
+        # feedback frame when a read intentionally publishes no synthetic
+        # state frame.
         ("read_error_count", "<u8"),
         ("overcurrent_error_count", "<u8"),
         ("timestamp", "<f8"),

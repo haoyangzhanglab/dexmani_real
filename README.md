@@ -13,10 +13,11 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 - 通过共享内存协调 arm、hand、VR、camera、recorder 与 policy 进程。
 - 常规 arm/hand joint command 统一经过安全门，并在设备 worker 的 SDK 边界再次
   校验；homing 使用独立的碰撞检查路径和专用 queue。
-- VR/键盘遥操作保留机器人自碰撞和静态障碍检查，但桌面不作为动作拒绝条件，以允许
-  近桌面的精细抓取；物理回放和 homing 保留各自的桌面安全验证。
-- XHand 已知可恢复过流不会中止抓取；失败读取不生成伪造的新鲜反馈，恢复后的状态携带
-  累计过流计数，持续数据不可用仍由新鲜度和 watchdog 边界处理。
+- VR/键盘遥操作与物理回放的轨迹回放环节保留机器人自碰撞和静态障碍检查，但桌面不作为
+  动作拒绝条件，以允许近桌面的精细抓取；homing（含回放 return_home）保留桌面安全验证。
+- XHand 已知的抓取接触过流码 `1501035` 在发送位置命令时会被接受，不中止抓取，并记入
+  episode 质量指标；同一码在状态读取失败时不生成伪造的新鲜反馈。持续数据不可用仍由
+  新鲜度和 watchdog 边界处理。
 - RealSense 相机按设备原生频率连续采集；16 Hz 控制网格只选择最新严格因果帧，
   不再将相机发布节拍绑定到控制频率。
 - 事务式写入 raw episode；当前 writer 写 v19，reader 与处理管线支持 v17/v18/v19。
@@ -89,11 +90,14 @@ RealSense / Quest-HTS / xArm7 / XHand
   BEGIN/pause/home/quit 与录制决策，[`teleop/control_grid.py`](dexmani_real/teleop/control_grid.py)
   完成单个 causal tick 的读取、proposal、校验、发布和采样。pause、VR/hand feedback
   异常、BEGIN audio gate 或录制终结进入 command-quiescence；恢复前必须重新锚定，期间不发布命令。
+  同步 home 是有意的控制静默区间，返回后由 loop 同时重锚 coordinator 和 control-grid
+  时钟，不计作遥操作栅格丢失。
 - RecorderIO 从 fixed-size shared-memory record 按逻辑 sequence 严格、连续地取得所有权；
   它只复制尚未确认的 slot，缺失或超出环容量时丢弃 active episode，绝不跳过样本。随后它将
   record 解码为不可变、拥有自身数组副本的 `EpisodeFrame`，并拥有 episode transaction、
-  camera sidecar、验证和有界 finalize。其轮询是非执行器的服务循环，健康性以 sample backlog
-  和 sequence 连续性为准，而不是忙等的轮询相位。其中
+  camera sidecar、验证和有界 finalize。其轮询是非执行器的服务循环；周期性批量持久化允许
+  超过单次轮询周期，健康性以 sample backlog、sequence 连续性和 writer 状态为准，而不是
+  轮询相位。其中
   [`recording/episode_data_writer.py`](dexmani_real/recording/episode_data_writer.py) 是单个
   `data.h5` handle、dataset append 与 offset 的唯一 owner。两者都不拥有机器人命令或
   episode 的开始/停止决策。
@@ -158,18 +162,19 @@ python examples/collect_teleop.py --print-config
 
 ### 离线数据工作流
 
-先审计一个任务目录，不写输出：
+先审计一个任务目录或单个 episode，不写输出：
 
 ```bash
 python examples/process_episodes.py \
-  --input-root episodes/<task> \
-  --profile rgb_pc \
+  episodes/<task> \
   --dry-run
 ```
 
+传入 `episodes/<task>/episode_*` 时只处理该 episode；传入 `episodes/<task>` 时处理其直接子目录中的全部 episode。
+
 确认审计结果后去掉 `--dry-run`，默认发布到
-`episodes_processed/<task>/`。可选 profile 为 `joint`、`rgb`、`pointcloud`
-和 `rgb_pc`。随后导出一个全新的 Zarr 目标：
+`episodes_processed/<task>/`。默认 profile 为 `rgb_pc`；可通过
+`--profile` 选择 `joint`、`rgb`、`pointcloud` 或 `rgb_pc`。随后导出一个全新的 Zarr 目标：
 
 ```bash
 python examples/export_policy_zarr.py \

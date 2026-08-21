@@ -2,9 +2,10 @@
 
 Every completed device read publishes hand and tactile feedback. Complete
 sensor payloads are fresh, while malformed/missing tactile payloads publish
-fresh=0 and calibrated=0. A known recoverable overcurrent publishes no
-synthetic feedback frame; the next successful read carries its cumulative
-event count.
+fresh=0 and calibrated=0. The configured-current overrun expected at grasp
+contact is accepted on command send and counted. The same SDK response during
+a state read publishes no synthetic feedback frame; the next successful read
+carries its cumulative event count.
 Error recovery: three independent counters for send failures, board faults from
 ``XHandState``, and read exceptions — each latches global ``error_state`` only
 after persistent failure. An uncertain SDK send failure also closes the command
@@ -327,7 +328,7 @@ def hand_loop(shared, config: HandParams) -> None:
                 if execute_action is not None:
                     cmd = np.asarray(execute_action["qpos_cmd"][0], dtype=np.float64)
                     try:
-                        hand.send_action(cmd)
+                        grasp_overcurrent = hand.send_action(cmd)
                     except XHandError:
                         # The hand may have accepted the endpoint even when its
                         # response was corrupted. Do not consume another command
@@ -346,6 +347,11 @@ def hand_loop(shared, config: HandParams) -> None:
                         _send_error_counter.inc()
                     else:
                         _send_error_counter.reset()
+                        if grasp_overcurrent:
+                            # Position-control contact can legitimately hold a
+                            # finger at its configured current limit. The driver
+                            # accepted this endpoint; retain only telemetry.
+                            _overcurrent_error_count_total += 1
                         last_applied_action_id = int(execute_action["action_id"][0])
 
                 # Persistent send failures latch a global fault.

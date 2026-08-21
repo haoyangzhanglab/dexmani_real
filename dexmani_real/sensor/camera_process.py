@@ -53,6 +53,9 @@ class CameraLoopConfig:
     frame_gap_stall_threshold: int = field(
         default_factory=lambda: camera.frame_gap_stall_threshold
     )
+    frame_queue_capacity: int = field(
+        default_factory=lambda: camera.frame_queue_capacity
+    )
     desk_plane: tuple[float, float, float, float] | None = None
 
     def __post_init__(self) -> None:
@@ -67,6 +70,8 @@ class CameraLoopConfig:
             raise ValueError("pointcloud_num_points must be positive")
         if self.frame_gap_stall_threshold < 0:
             raise ValueError("frame_gap_stall_threshold must be >= 0")
+        if self.frame_queue_capacity <= 0:
+            raise ValueError("frame_queue_capacity must be positive")
 
     @property
     def resolved_frame_gap_stall_threshold(self) -> int:
@@ -103,6 +108,7 @@ class CameraLoopConfig:
             pointcloud_num_points=int(cam.pointcloud_num_points),
             max_frame_age_s=float(cam.max_frame_age_s),
             frame_gap_stall_threshold=int(cam.frame_gap_stall_threshold),
+            frame_queue_capacity=int(cam.frame_queue_capacity),
             desk_plane=desk_plane,
         )
 
@@ -251,6 +257,7 @@ def camera_loop(
             fps=cfg.fps,
             align_mode=cfg.align_mode,
             warmup_frames=cfg.warmup_frames,
+            frame_queue_capacity=cfg.frame_queue_capacity,
         )
         cam = RealSense(rs_config)
 
@@ -276,6 +283,7 @@ def camera_loop(
             {
                 "streams": cam.get_active_profiles(),
                 "align_mode": cam.config.align_mode,
+                "frame_queue_capacity": cam.config.frame_queue_capacity,
                 "common_viewport": "color",
                 "output_optical_frame": cam.config.frame_name,
                 "output_intrinsics": cam.get_intrinsics_info(),

@@ -245,7 +245,7 @@ def _apply_home_signal(
     cfg: TeleopConfig,
     resources: TeleopOperatorResources,
 ) -> CoordinatorDirective:
-    """Stop the current session and execute the configured home operation."""
+    """Stop the session and request a fresh control grid after synchronous home."""
     print("\nH: return_home")
     resources.audio.play("home")
     _stop_recording(
@@ -273,8 +273,9 @@ def _apply_home_signal(
         hand_retargeter=ctx.hand_retargeter,
     )
     resources.keyboard.drain_signal(ControlSignal.HOME)
-    resources.limiter.reset()
-    return CoordinatorDirective.CONTINUE
+    # teleop_loop owns both the coordinator and control-grid clocks. Returning
+    # an explicit directive keeps this handler from resetting only one of them.
+    return CoordinatorDirective.REANCHOR_GRID
 
 
 def _apply_pause_signal(

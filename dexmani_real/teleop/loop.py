@@ -338,8 +338,15 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     ctx.quit_recording_deadline_s = 0.0
     ctx.post_teleop_deadline_s = 0.0
 
-    # Coordination runs at coordinator_hz; control and recording use control_hz.
-    limiter = RateManager(cfg.runtime.policy.coordinator_hz, label="teleop")
+    # The coordinator polls controls; only the control grid publishes motion.
+    # Avoid spending a CPU core's precision spin window or warning on harmless
+    # sub-grid scheduler jitter. Actual skipped control grids are reported below.
+    limiter = RateManager(
+        cfg.runtime.policy.coordinator_hz,
+        label="teleop",
+        busy_wait=False,
+        warn_on_overrun=False,
+    )
     _grid_period_ns = int(round(_NS_PER_SECOND / cfg.runtime.policy.control_hz))
     _next_grid_ns = time.monotonic_ns() + _grid_period_ns
     _current_grid_anchor_ns = _next_grid_ns
@@ -347,6 +354,8 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     stage_timer = StageTimer(window=cfg.runtime.policy.status_print_interval)
     _validate_warn = ThrottledWarner(interval_s=_VALIDATION_WARN_INTERVAL_S)
     _arm_feedback_warn = ThrottledWarner(interval_s=_ARM_FEEDBACK_WARN_INTERVAL_S)
+    _grid_overrun_warn = ThrottledWarner(interval_s=_VALIDATION_WARN_INTERVAL_S)
+    missed_control_grid_total = 0
     loop_count = 0
     ctx.arm_feedback_error_count = 0
     ctx.consecutive_ik_hold_frames = 0
@@ -458,6 +467,14 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
                 _missed_periods = max(
                     1, (_coordinator_now_ns - _next_grid_ns) // _grid_period_ns + 1
                 )
+                if _missed_periods > 1:
+                    missed_control_grid_total += int(_missed_periods - 1)
+                    _grid_overrun_warn(
+                        "teleop_loop: skipped %d control-grid slots (total=%d, lateness=%.1fms)",
+                        _missed_periods - 1,
+                        missed_control_grid_total,
+                        (_coordinator_now_ns - _next_grid_ns) / 1e6,
+                    )
                 _current_grid_anchor_ns = (
                     _next_grid_ns + int(_missed_periods - 1) * _grid_period_ns
                 )
@@ -479,6 +496,14 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             )
             if operator_directive is CoordinatorDirective.BREAK:
                 break
+            if operator_directive is CoordinatorDirective.REANCHOR_GRID:
+                # Synchronous home is an intentional command-silent interval,
+                # not missed teleop work. Re-anchor both clocks here, where the
+                # control-grid deadline is owned, and wait for a new causal slot.
+                limiter.reset()
+                _next_grid_ns = time.monotonic_ns() + _grid_period_ns
+                _current_grid_anchor_ns = _next_grid_ns
+                continue
             if operator_directive is CoordinatorDirective.CONTINUE:
                 continue
             if not _grid_due:

@@ -24,9 +24,6 @@ from dexmani_real.policy.runtime import ActionCandidate
 from dexmani_real.recording.recorder_client import RecorderClient
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.shm.shared_storage import SharedStorage
-from dexmani_real.utils.log import get_logger
-
-logger = get_logger(__name__)
 
 _FRAME_OK = 0
 _FRAME_HELD = 1
@@ -53,29 +50,7 @@ def _stop_recording(
             shared.is_recording.value = False
 
 
-def _matching_source_sequence(ring: Any, frame: np.ndarray | None) -> int:
-    """Recover the exact verified ring identity for one copied state frame."""
-    if frame is None or frame.dtype.names is None or "source_monotonic_ns" not in frame.dtype.names:
-        return 0
-    source_ns = int(frame["source_monotonic_ns"][0])
-    publish_ns = int(frame["publish_monotonic_ns"][0]) if "publish_monotonic_ns" in frame.dtype.names else 0
-    try:
-        history = ring.get_last_k(ring.maxlen)
-    except Exception:
-        logger.warning("teleop: source history read failed", exc_info=True)
-        return 0
-    for data, _ring_publish_ns, sequence in reversed(history):
-        if int(data["source_monotonic_ns"][0]) != source_ns:
-            continue
-        if publish_ns and "publish_monotonic_ns" in (data.dtype.names or ()):
-            if int(data["publish_monotonic_ns"][0]) != publish_ns:
-                continue
-        return int(sequence)
-    return 0
-
-
 def _recording_provenance(
-    shared: SharedStorage,
     arm_state: np.ndarray | None,
     hand_state: np.ndarray | None,
     hand_tactile: np.ndarray | None,
@@ -83,6 +58,8 @@ def _recording_provenance(
     cam: dict | None,
     *,
     anchor_monotonic_ns: int | None = None,
+    arm_ring_sequence: int = 0,
+    hand_ring_sequence: int = 0,
     action_candidate: ActionCandidate | None = None,
 ) -> dict[str, object]:
     """Correlate one policy-grid sample with causal sources and send metadata."""
@@ -99,8 +76,8 @@ def _recording_provenance(
     arm_publish_ns = _field(arm_state, "publish_monotonic_ns")
     hand_source_ns = _field(hand_state, "source_monotonic_ns")
     hand_publish_ns = _field(hand_state, "publish_monotonic_ns")
-    arm_source_sequence = _matching_source_sequence(shared.arm_state_ring, arm_state)
-    hand_source_sequence = _matching_source_sequence(shared.hand_state_ring, hand_state)
+    arm_source_sequence = int(arm_ring_sequence)
+    hand_source_sequence = int(hand_ring_sequence)
     vr_source_ns = int(vr_frame.get("local_recv_ns", 0)) if vr_frame is not None else 0
     vr_source_sequence = int(vr_frame.get("ring_sequence", 0)) if vr_frame is not None else 0
     vr_publish_ns = int(vr_frame.get("publish_monotonic_ns", 0)) if vr_frame is not None else 0
@@ -213,6 +190,8 @@ def _record_held(
     T_eef_handbase_pos: np.ndarray | None = None,
     T_eef_handbase_quat_wxyz: np.ndarray | None = None,
     observation_anchor_monotonic_ns: int | None = None,
+    arm_ring_sequence: int = 0,
+    hand_ring_sequence: int = 0,
     shared: SharedStorage | None = None,
     action_candidate: ActionCandidate | None = None,
 ) -> None:
@@ -264,13 +243,14 @@ def _record_held(
     if shared is not None:
         signals.update(
             _recording_provenance(
-                shared,
                 arm_state,
                 hand_state,
                 hand_tactile,
                 vr_frame,
                 cam,
                 anchor_monotonic_ns=observation_anchor_monotonic_ns,
+                arm_ring_sequence=arm_ring_sequence,
+                hand_ring_sequence=hand_ring_sequence,
                 action_candidate=action_candidate,
             )
         )
@@ -312,6 +292,8 @@ def _record_frame(
     T_eef_handbase_pos: np.ndarray | None = None,
     T_eef_handbase_quat_wxyz: np.ndarray | None = None,
     observation_anchor_monotonic_ns: int | None = None,
+    arm_ring_sequence: int = 0,
+    hand_ring_sequence: int = 0,
     shared: SharedStorage | None = None,
     action_candidate: ActionCandidate | None = None,
 ) -> None:
@@ -362,13 +344,14 @@ def _record_frame(
     if shared is not None:
         signals.update(
             _recording_provenance(
-                shared,
                 arm_state,
                 hand_state,
                 hand_tactile,
                 vr_frame,
                 cam,
                 anchor_monotonic_ns=observation_anchor_monotonic_ns,
+                arm_ring_sequence=arm_ring_sequence,
+                hand_ring_sequence=hand_ring_sequence,
                 action_candidate=action_candidate,
             )
         )

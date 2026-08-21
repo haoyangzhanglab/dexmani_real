@@ -43,13 +43,20 @@ class RateManager:
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
         busy_wait: bool | None = None,
+        warn_on_overrun: bool = True,
     ) -> None:
-        if not isinstance(target_hz, (int, float)) or not math.isfinite(float(target_hz)) or target_hz <= 0:
+        if (
+            not isinstance(target_hz, (int, float))
+            or not math.isfinite(float(target_hz))
+            or target_hz <= 0
+        ):
             raise ValueError(f"target_hz must be positive, got {target_hz}")
         if not isinstance(label, str) or not label.strip():
             raise ValueError("rate manager label must be a non-empty string")
         if busy_wait is not None and not isinstance(busy_wait, bool):
             raise ValueError("busy_wait must be a bool or None")
+        if not isinstance(warn_on_overrun, bool):
+            raise ValueError("warn_on_overrun must be a bool")
         self.target_hz = float(target_hz)
         self.label = label.strip()
         self.period = 1.0 / target_hz
@@ -59,6 +66,7 @@ class RateManager:
         # default to sleep-only, while production control loops spin for the
         # final precision window unless their owner explicitly opts out.
         self._busy_wait = clock is None if busy_wait is None else bool(busy_wait)
+        self._warn_on_overrun = warn_on_overrun
         started = self._clock()
         self._started_at = started
         self._cycle_started_at = started
@@ -120,7 +128,9 @@ class RateManager:
         else:
             lateness = -remaining
             self._deadline_overrun_count += 1
-            self._missed_slot_count += int((lateness + self.period * 1e-12) // self.period)
+            self._missed_slot_count += int(
+                (lateness + self.period * 1e-12) // self.period
+            )
 
             if lateness > 1.0:
                 self._long_block_reanchor_count += 1
@@ -128,7 +138,7 @@ class RateManager:
                 self._overdue_throttle = 0
             else:
                 # Short overrun: emit a throttled warning.
-                if self._overdue_throttle <= 0:
+                if self._warn_on_overrun and self._overdue_throttle <= 0:
                     logger.warning(
                         "Control loop over budget: loop=%s actual=%.1fms "
                         "target=%.1fms lateness=%.1fms missed_total=%d",
@@ -139,7 +149,7 @@ class RateManager:
                         self._missed_slot_count,
                     )
                     self._overdue_throttle = 50
-                else:
+                elif self._warn_on_overrun:
                     self._overdue_throttle -= 1
 
                 if lateness >= self.period:

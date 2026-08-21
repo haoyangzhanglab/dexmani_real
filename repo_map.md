@@ -20,7 +20,7 @@
 | `code_style.md` | 面向个人博士科研、数据采集和模型部署的具体编码风格与审查清单。 |
 | `README.md` | 面向使用者的能力概览、架构、环境、命令、配置和数据流说明。 |
 | `repo_map.md` | 当前逐文件职责索引。 |
-| `user_design.md` | 使用者确认的遥操作桌面碰撞与 XHand 抓取过流行为取舍及其安全边界。 |
+| `user_design.md` | 使用者确认的遥操作与物理回放桌面碰撞、XHand 抓取过流行为取舍及其安全边界。 |
 | `xhand_issue.md` | XHand RS485 CRC 与触觉温度间歇性降级的诊断记录、风险边界和排查顺序。 |
 | `XHand_最简可靠修复方案_评估优化版.md` | 基于当前 XHand owner、IPC/episode schema 和已观测错误的最小修复设计、实施边界与验收计划。 |
 | `pyproject.toml` | Python 包元数据、基础依赖、setuptools 包发现、内置 JSON 数据声明与 Black-compatible isort 配置。 |

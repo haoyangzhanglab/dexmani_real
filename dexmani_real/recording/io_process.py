@@ -746,10 +746,15 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
         logger.debug("RecorderIO: READY")
         shared.set_heartbeat("recorder", time.monotonic())
         shared.set_ready("recorder")
-        # RecorderIO owns no actuator commands. Its correctness deadline is
-        # bounded sample backlog, not sub-millisecond poll phase, so avoid
-        # consuming a CPU core's final spin window on every idle poll.
-        limiter = RateManager(config.poll_hz, label="recorder", busy_wait=False)
+        # RecorderIO owns no actuator commands. Periodic batch persistence may
+        # exceed one poll period without threatening data ownership; backlog,
+        # sequence continuity, and writer failures are the actual boundaries.
+        limiter = RateManager(
+            config.poll_hz,
+            label="recorder",
+            busy_wait=False,
+            warn_on_overrun=False,
+        )
 
         while session.should_run:
             session.step()

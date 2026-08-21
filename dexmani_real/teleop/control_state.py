@@ -50,6 +50,7 @@ class CoordinatorDirective(str, Enum):
 
     NORMAL = "normal"
     CONTINUE = "continue"
+    REANCHOR_GRID = "reanchor_grid"
     BREAK = "break"
 
 

@@ -294,8 +294,12 @@ def verify_replay_preflight(
     """Fail-closed validation immediately before spawning hardware workers.
 
     Checks: hand-data attestation, provenance (source/config/models), and every
-    adjacent-frame pair for workspace and self-collision. Called once before
-    worker startup; any rejection prevents hardware access entirely.
+    adjacent-frame pair for workspace bounds and collision (self-collision plus
+    static obstacle boxes). Robot-table contact is deliberately not a replay
+    rejection condition (user_design.md §3): replayed episodes were recorded by
+    teleop without table gating, and table clearance remains enforced on the
+    return-home path. Called once before worker startup; any rejection prevents
+    hardware access entirely.
     """
     require_hand_actions(trajectory)
     if not bool(runtime.policy.hand_enabled):
@@ -319,7 +323,10 @@ def verify_replay_preflight(
         ),
         hand_dof=True,
         static_boxes=tuple(runtime.environment.static_boxes),
-        table=runtime.environment.table,
+        # user_design.md §3: replay does not reject on robot-table contact.
+        # Table clearance stays enforced on the return-home path, which uses the
+        # replay controller's own planner (see replay_controller.setup).
+        table=None,
     )
     arm_actions = np.asarray(trajectory.action_arm_joint, dtype=np.float64)
     for index in range(max(1, trajectory.num_frames - 1)):

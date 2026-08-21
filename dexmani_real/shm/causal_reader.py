@@ -31,8 +31,20 @@ def read_causal_structured_frame(
     source_field: str,
     anchor_monotonic_ns: int,
 ) -> tuple[np.ndarray, int, int] | None:
-    """Return the newest frame whose source and publication precede *anchor*."""
-    for data, ring_publish_ns, sequence in reversed(ring.get_last_k(ring.maxlen)):
+    """Return the newest verified frame whose source and publication precede *anchor*.
+
+    Search the resident sequence range newest-first instead of snapshotting the
+    whole ring.  A causal cut normally needs only the latest frame before its
+    anchor; copying every slot makes the oldest slot race the next producer
+    write, despite that old frame rarely being relevant to the result.
+    """
+    latest_sequence = int(ring.latest_sequence)
+    oldest_sequence = max(1, latest_sequence - int(ring.maxlen) + 1)
+    for target_sequence in range(latest_sequence, oldest_sequence - 1, -1):
+        result = ring.read_sequence(target_sequence)
+        if result is None:
+            continue
+        data, ring_publish_ns, sequence = result
         source_ns = int(data[source_field][0])
         names = data.dtype.names or ()
         publish_ns = (

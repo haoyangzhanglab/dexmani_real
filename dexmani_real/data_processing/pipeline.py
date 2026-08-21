@@ -276,9 +276,12 @@ def load_annotations(path: str | Path | None) -> dict[str, EpisodeAnnotation]:
 
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
+    """Accept either one episode directory or a task directory of episodes."""
     root = Path(input_root)
     if not root.is_dir():
         raise NotADirectoryError(root)
+    if (root / "data.h5").is_file():
+        return (root,)
     episodes = tuple(
         sorted(
             child

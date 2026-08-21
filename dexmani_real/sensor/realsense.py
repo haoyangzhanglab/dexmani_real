@@ -83,6 +83,7 @@ class RealSenseConfig:
     align_mode: AlignMode = "depth_to_color"
     enable_global_time: bool = True
     warmup_frames: int = 10
+    frame_queue_capacity: int = 8
     frame_name: str | None = None
     l515_depth_config: L515DepthConfig | None = field(default_factory=L515DepthConfig)
 
@@ -99,6 +100,8 @@ class RealSenseConfig:
                 else "camera_depth_optical"
             )
             object.__setattr__(self, "frame_name", frame_name)
+        if self.frame_queue_capacity <= 0:
+            raise ValueError("frame_queue_capacity must be positive")
 
 
 @dataclass(frozen=True)
@@ -150,6 +153,7 @@ class RealSense:
         self._clock_mapper = DeviceClockMapper()
 
         self.pipeline: rs.pipeline | None = None
+        self.frame_queue: rs.frame_queue | None = None
         self.profile: rs.pipeline_profile | None = None
         self.aligner: rs.align | None = None
 
@@ -360,15 +364,18 @@ class RealSense:
         Uses its own internal context (rs.pipeline() without argument) — sharing
         the discovery context via rs.pipeline(self.context) causes "Couldn't
         resolve requests" on L515 when the context still holds device handles
-        from the earlier query_devices() calls.
+        from the earlier query_devices() calls. A librealsense-owned queue
+        decouples device delivery from host-side alignment/copying without an
+        additional Python thread or a second SDK owner.
         """
         self.pipeline = rs.pipeline()
         rs_config.resolve(rs.pipeline_wrapper(self.pipeline))
-        self.profile = self.pipeline.start(rs_config)
+        self.frame_queue = rs.frame_queue(int(self.config.frame_queue_capacity))
+        self.profile = self.pipeline.start(rs_config, self.frame_queue)
 
     def _warmup_pipeline(self) -> None:
         """Consume exactly ``warmup_frames`` frames, restarting if necessary."""
-        if self.pipeline is None:
+        if self.pipeline is None or self.frame_queue is None:
             raise RuntimeError("Pipeline is unavailable during warmup.")
 
         warmup_frames = max(int(self.config.warmup_frames), 0)
@@ -379,7 +386,7 @@ class RealSense:
         for attempt in range(max_restarts + 1):
             try:
                 for _ in range(warmup_frames):
-                    self.pipeline.wait_for_frames(5000)
+                    self.frame_queue.wait_for_frame(5000)
                 return
             except RuntimeError:
                 if attempt >= max_restarts:
@@ -421,6 +428,7 @@ class RealSense:
             )
         finally:
             self.pipeline = None
+            self.frame_queue = None
             self.profile = None
             self.aligner = None
             self.depth_scale = None
@@ -514,12 +522,20 @@ class RealSense:
     def read(
         self, timeout_ms: int = 5000, *, compute_depth: bool = True
     ) -> CameraFrame:
-        if self.pipeline is None:
+        if self.pipeline is None or self.frame_queue is None:
             raise RuntimeError("RealSense is not connected. Call connect() first.")
         if self.depth_scale is None:
             raise RuntimeError("RealSense depth_scale is unavailable.")
 
-        frames = self.pipeline.wait_for_frames(timeout_ms)
+        # frame_queue returns the base ``rs.frame`` wrapper even when its
+        # payload is a frameset.  ``align.process`` accepts only the
+        # composite-frame binding, so recover that typed view at this SDK
+        # boundary before any downstream processing.
+        frames = self.frame_queue.wait_for_frame(timeout_ms).as_frameset()
+        if not frames:
+            raise RuntimeError(
+                "RealSense frame queue returned a non-frameset frame."
+            )
         # Timestamp SDK availability before any alignment or array conversion.
         # This is the closest host-monotonic approximation to frame delivery.
         wait_return_monotonic_ns = time.monotonic_ns()

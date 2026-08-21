@@ -15,6 +15,7 @@ import numpy as np
 from xhand_controller import xhand_control as xhc  # type: ignore[import-untyped]
 
 from dexmani_real.config.defaults import HandParams
+from dexmani_real.utils.hand_health import XHAND_OVERCURRENT_ERROR_CODE
 from dexmani_real.utils.log import (
     capture_native_stdout,
     extract_native_diagnostics,
@@ -448,8 +449,14 @@ class XHand:
             error, state = call()
         return error, state
 
-    def send_action(self, action: np.ndarray) -> None:
-        """Validate and send one absolute joint endpoint."""
+    def send_action(self, action: np.ndarray) -> bool:
+        """Validate and send one absolute joint endpoint.
+
+        Return ``True`` when the SDK accepted the endpoint but reported the
+        configured-current overrun used as an expected grasp-contact signal.
+        That response still updates ``last_qpos_cmd`` and is not an I/O
+        failure. All other non-sensor SDK errors raise ``XHandError``.
+        """
         target = np.asarray(action, dtype=np.float64)
         self._validate_action(target)
         if self._control is None or self._command is None or not self.connected_flag:
@@ -459,8 +466,13 @@ class XHand:
             for index, value in enumerate(target):
                 self._command.finger_command[index].position = float(value)
             error = self._send_with_crc_retry()
-            if not _error_ok(error) and not self._is_sensor_status(error):
-                code = _error_code(error)
+            code = _error_code(error)
+            grasp_overcurrent = code == XHAND_OVERCURRENT_ERROR_CODE
+            if (
+                not _error_ok(error)
+                and not self._is_sensor_status(error)
+                and not grasp_overcurrent
+            ):
                 raise XHandError(
                     "send",
                     -1 if code is None else code,
@@ -469,6 +481,7 @@ class XHand:
 
             self._update_sensor_status("send", error)
             self.last_qpos_cmd = target.copy()
+            return grasp_overcurrent
         except XHandError:
             raise
         except Exception as exc:

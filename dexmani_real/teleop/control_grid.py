@@ -22,9 +22,8 @@ from dexmani_real.policy.safety import (
 )
 from dexmani_real.recording.recorder_client import RecorderClient
 from dexmani_real.shm.causal_reader import (
-    read_arm_state_causal,
     read_camera_frame_causal,
-    read_hand_state_causal,
+    read_causal_structured_frame,
     read_hand_tactile_causal,
     read_vr_frame_causal,
 )
@@ -97,10 +96,12 @@ class TeleopGridObservation:
     """One validated causal observation ready for command computation."""
 
     arm_state: np.ndarray
+    arm_ring_sequence: int
     arm_qpos_rad: np.ndarray
     vr_frame: dict[str, Any]
     camera_frame: dict[str, Any] | None
     hand_state: np.ndarray | None
+    hand_ring_sequence: int
     hand_tactile: np.ndarray | None
     anchor_monotonic_ns: int
 
@@ -163,6 +164,8 @@ def _record_grid_hold(
         T_eef_handbase_pos=resources.handbase_position_eef_m,
         T_eef_handbase_quat_wxyz=resources.handbase_quat_eef_wxyz,
         observation_anchor_monotonic_ns=observation.anchor_monotonic_ns,
+        arm_ring_sequence=observation.arm_ring_sequence,
+        hand_ring_sequence=observation.hand_ring_sequence,
         shared=shared,
         action_candidate=action_candidate,
         **kwargs,
@@ -218,9 +221,13 @@ def _read_control_grid_observation(
             current_hand_state,
         )
 
-    arm_state = read_arm_state_causal(
-        shared, anchor_monotonic_ns=_current_grid_anchor_ns
+    arm_result = read_causal_structured_frame(
+        shared.arm_state_ring,
+        source_field="source_monotonic_ns",
+        anchor_monotonic_ns=_current_grid_anchor_ns,
     )
+    arm_state = None if arm_result is None else arm_result[0]
+    arm_ring_sequence = 0 if arm_result is None else int(arm_result[2])
     arm_issue = _arm_feedback_issue(
         arm_state,
         now_monotonic_ns=time.monotonic_ns(),
@@ -282,9 +289,13 @@ def _read_control_grid_observation(
             ctx.recording_active = False
     stage_timer.mark("cam")
 
-    hand_state = read_hand_state_causal(
-        shared, anchor_monotonic_ns=_current_grid_anchor_ns
+    hand_result = read_causal_structured_frame(
+        shared.hand_state_ring,
+        source_field="source_monotonic_ns",
+        anchor_monotonic_ns=_current_grid_anchor_ns,
     )
+    hand_state = None if hand_result is None else hand_result[0]
+    hand_ring_sequence = 0 if hand_result is None else int(hand_result[2])
     hand_tactile = read_hand_tactile_causal(
         shared, anchor_monotonic_ns=_current_grid_anchor_ns
     )
@@ -385,10 +396,12 @@ def _read_control_grid_observation(
         CoordinatorDirective.NORMAL,
         TeleopGridObservation(
             arm_state=arm_state,
+            arm_ring_sequence=arm_ring_sequence,
             arm_qpos_rad=arm_qpos,
             vr_frame=vr_frame,
             camera_frame=cam,
             hand_state=hand_state,
+            hand_ring_sequence=hand_ring_sequence,
             hand_tactile=hand_tactile,
             anchor_monotonic_ns=observation_anchor_monotonic_ns,
         ),
@@ -437,6 +450,7 @@ def _compute_action_computation(
         ramp_start_qpos_rad=ctx.hand_ramp_start,
         ramp_step=ctx.hand_ramp_step,
         ramp_total_frames=resources.hand_ramp_total_frames,
+        max_delta_rad_per_tick=command_limits.hand_max_delta_rad_per_tick,
         command_lower_rad=command_limits.hand_command_lower_rad,
         command_upper_rad=command_limits.hand_command_upper_rad,
         mechanical_lower_rad=command_limits.hand_mechanical_lower_rad,
@@ -803,6 +817,8 @@ def _publish_solved_action(
             T_eef_handbase_pos=_T_eef_handbase_pos,
             T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
             observation_anchor_monotonic_ns=_current_grid_anchor_ns,
+            arm_ring_sequence=observation.arm_ring_sequence,
+            hand_ring_sequence=observation.hand_ring_sequence,
             shared=shared,
             action_candidate=published_candidate,
         )

@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import arm, hand
+from dexmani_real.config.defaults import arm, hand, policy as policy_defaults
 
 
 class OutputProfile(str, Enum):
@@ -71,7 +71,7 @@ class TemporalQualityConfig:
 
     policy: QualityPolicy = QualityPolicy.AUDIT
     abrupt_arm_step_rad: float = float(np.deg2rad(8.0))
-    abrupt_hand_step_rad: float = 0.2
+    abrupt_hand_step_rad: float = policy_defaults.hand_max_delta_rad_per_tick
     impulse_arm_min_rad: float = 0.08
     impulse_hand_min_rad: float = 0.12
     impulse_min_return_ratio: float = 0.5
