@@ -1,6 +1,6 @@
 """Deterministic offline evaluation for XHand retargeting backends.
 
-The module reads recorded schema-v17/v18 hand data. It never creates shared
+The module reads recorded schema-v17/v18/v19 hand data. It never creates shared
 memory, starts a worker, or imports a hardware SDK.  Backend-native losses are
 intentionally excluded from the primary score: TAG and DexPilot are compared
 through the same human-joint, fingertip-geometry, timing, and bound metrics.
@@ -42,11 +42,16 @@ _TIP_PAIRS = tuple(
 # (feature_index, joint_index) pairs for flexion features. Finger MCP/PIP+DIP map
 # to j1/j2; thumb CMC and MCP+IP map to thumb_bend/thumb_rota2.
 _FLEXION_FEATURE_JOINT_PAIRS = (
-    (0, 0), (1, 2),  # thumb: CMC→bend, MCP+IP→rota2
-    (2, 4), (3, 5),  # index: MCP→j1, PIP+DIP→j2
-    (4, 6), (5, 7),  # middle
-    (6, 8), (7, 9),  # ring
-    (8, 10), (9, 11),  # pinky
+    (0, 0),
+    (1, 2),  # thumb: CMC→bend, MCP+IP→rota2
+    (2, 4),
+    (3, 5),  # index: MCP→j1, PIP+DIP→j2
+    (4, 6),
+    (5, 7),  # middle
+    (6, 8),
+    (7, 9),  # ring
+    (8, 10),
+    (9, 11),  # pinky
 )
 _FINGER_FEATURE_JOINT_PAIRS = _FLEXION_FEATURE_JOINT_PAIRS[2:]
 _THUMB_FEATURE_JOINT_PAIRS = _FLEXION_FEATURE_JOINT_PAIRS[:2]
@@ -407,7 +412,10 @@ def evaluate_run(
         response = qpos[:, joint_index]
         stop = len(reference) - lag
         bias_rad = float(
-            np.mean(response[startup_skip_frames + lag:] - reference[startup_skip_frames:stop])
+            np.mean(
+                response[startup_skip_frames + lag :]
+                - reference[startup_skip_frames:stop]
+            )
         )
         flexion_bias_deg[name] = float(np.rad2deg(bias_rad))
     mean_abs_flexion_bias_deg = float(

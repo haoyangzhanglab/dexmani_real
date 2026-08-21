@@ -48,7 +48,7 @@ class ValidityState(str, Enum):
 
 @dataclass(frozen=True)
 class EpisodeTiming:
-    """Timing metadata from a supported schema-v17/v18 episode."""
+    """Timing metadata from a supported schema-v17/v18/v19 episode."""
 
     rate_hz: float
     grid_dt_s: float
@@ -67,7 +67,9 @@ class MergedH5File:
 
     __slots__ = ("_data", "_sidecars")
 
-    def __init__(self, data_h5f: h5py.File, sidecars: dict[str, h5py.File] | None = None) -> None:
+    def __init__(
+        self, data_h5f: h5py.File, sidecars: dict[str, h5py.File] | None = None
+    ) -> None:
         self._data = data_h5f
         self._sidecars = sidecars or {}
 
@@ -147,7 +149,6 @@ class EpisodeReader:
                 "(migrate historical episodes outside the runtime)"
             )
 
-
     @property
     def h5f(self) -> MergedH5File:
         """Merged view of ``data.h5`` and camera HDF5 sidecars.
@@ -187,7 +188,10 @@ class EpisodeReader:
                 f"episode is missing raw-action validity fields: {missing}"
             )
         values = [np.asarray(self._data_h5f[name][:], dtype=bool) for name in names]
-        if any(value.ndim != 1 for value in values) or len({value.shape for value in values}) != 1:
+        if (
+            any(value.ndim != 1 for value in values)
+            or len({value.shape for value in values}) != 1
+        ):
             shapes = {name: value.shape for name, value in zip(names, values)}
             raise ValueError(
                 f"raw-action validity fields have inconsistent shapes: {shapes}"
@@ -244,7 +248,9 @@ class EpisodeReader:
         config_hash = str(meta.attrs.get("resolved_config_sha256", ""))
         if len(config_hash) != 64:
             return ValidityState.INVALID
-        if not bool(meta.attrs.get("success", False)) or str(meta.attrs.get("camera_writer_error", "")):
+        if not bool(meta.attrs.get("success", False)) or str(
+            meta.attrs.get("camera_writer_error", "")
+        ):
             return ValidityState.INVALID
         if self._rgb_decoder is None or "depth" not in self._h5f:
             return ValidityState.INVALID
@@ -266,15 +272,25 @@ class EpisodeReader:
         timestamps = np.asarray(self._h5f["timestamp"][:], dtype=np.float64)
         sample_valid = np.asarray(self._h5f["flag_sample_valid"][:], dtype=bool)
         source_indices = np.asarray(self._h5f["source_sample_index"][:], dtype=np.int64)
-        source_timestamps = np.asarray(self._h5f["source_timestamp"][:], dtype=np.float64)
+        source_timestamps = np.asarray(
+            self._h5f["source_timestamp"][:], dtype=np.float64
+        )
         fill_reasons = np.asarray(self._h5f["fill_reason"][:], dtype=np.uint8)
-        scalar_shapes = (timestamps, sample_valid, source_indices, source_timestamps, fill_reasons)
+        scalar_shapes = (
+            timestamps,
+            sample_valid,
+            source_indices,
+            source_timestamps,
+            fill_reasons,
+        )
         if any(values.shape != (frame_count,) for values in scalar_shapes):
             return ValidityState.INVALID
         if not np.all(np.isfinite(timestamps)) or np.any(np.diff(timestamps) <= 0.0):
             return ValidityState.INVALID
 
-        known_fill_reasons = np.isin(fill_reasons, [int(reason) for reason in FillReason])
+        known_fill_reasons = np.isin(
+            fill_reasons, [int(reason) for reason in FillReason]
+        )
         if not np.all(known_fill_reasons):
             return ValidityState.INVALID
         is_source = fill_reasons == int(FillReason.SOURCE)
@@ -298,7 +314,9 @@ class EpisodeReader:
         if not np.any(sample_valid):
             return ValidityState.INVALID
 
-        anchors = np.asarray(self._h5f["observation_anchor_monotonic_ns"][:], dtype=np.uint64)
+        anchors = np.asarray(
+            self._h5f["observation_anchor_monotonic_ns"][:], dtype=np.uint64
+        )
         source_sequences = np.column_stack(
             [
                 np.asarray(self._h5f[f"{name}_source_sequence"][:], dtype=np.uint64)
@@ -313,12 +331,18 @@ class EpisodeReader:
         )
         observation_publish_ns = np.column_stack(
             [
-                np.asarray(self._h5f[f"{name}_publish_monotonic_ns"][:], dtype=np.uint64)
+                np.asarray(
+                    self._h5f[f"{name}_publish_monotonic_ns"][:], dtype=np.uint64
+                )
                 for name in ("arm", "hand", "vr", "camera")
             ]
         )
-        observation_receive_ns = np.asarray(self._h5f["observation_source_receive_monotonic_ns"][:], dtype=np.uint64)
-        observation_history_valid = np.asarray(self._h5f["observation_history_valid_mask"][:], dtype=bool)
+        observation_receive_ns = np.asarray(
+            self._h5f["observation_source_receive_monotonic_ns"][:], dtype=np.uint64
+        )
+        observation_history_valid = np.asarray(
+            self._h5f["observation_history_valid_mask"][:], dtype=bool
+        )
         if observation_history_valid.shape != (frame_count, 4, 1):
             return ValidityState.INVALID
         valid_sources = observation_history_valid[:, :, 0]
@@ -341,15 +365,25 @@ class EpisodeReader:
         if np.any(valid_sources & ~causal_chain):
             return ValidityState.INVALID
         tactile_fresh = np.asarray(self._h5f["tactile_fresh"][:], dtype=bool)
-        tactile_source_ns = np.asarray(self._h5f["tactile_source_monotonic_ns"][:], dtype=np.uint64)
-        if np.any(tactile_fresh & ((tactile_source_ns == 0) | (tactile_source_ns > anchors))):
+        tactile_source_ns = np.asarray(
+            self._h5f["tactile_source_monotonic_ns"][:], dtype=np.uint64
+        )
+        if np.any(
+            tactile_fresh & ((tactile_source_ns == 0) | (tactile_source_ns > anchors))
+        ):
             return ValidityState.INVALID
 
         observation_ids = np.asarray(self._h5f["observation_id"][:], dtype=np.uint64)
         action_ids = np.asarray(self._h5f["action_id"][:], dtype=np.uint64)
-        action_created_ns = np.asarray(self._h5f["action_created_monotonic_ns"][:], dtype=np.uint64)
-        action_target_ns = np.asarray(self._h5f["action_target_monotonic_ns"][:], dtype=np.uint64)
-        action_valid_until_ns = np.asarray(self._h5f["action_valid_until_monotonic_ns"][:], dtype=np.uint64)
+        action_created_ns = np.asarray(
+            self._h5f["action_created_monotonic_ns"][:], dtype=np.uint64
+        )
+        action_target_ns = np.asarray(
+            self._h5f["action_target_monotonic_ns"][:], dtype=np.uint64
+        )
+        action_valid_until_ns = np.asarray(
+            self._h5f["action_valid_until_monotonic_ns"][:], dtype=np.uint64
+        )
         queued = np.asarray(self._h5f["flag_action_queued"][:], dtype=bool)
         held = (
             np.asarray(self._h5f["flag_held"][:], dtype=bool)
@@ -357,7 +391,9 @@ class EpisodeReader:
             else np.zeros(frame_count, dtype=bool)
         )
         # Held samples may omit actions; active samples require an action identity.
-        if np.any(observation_ids[sample_valid] == 0) or np.any(sample_valid & ~held & (action_ids == 0)):
+        if np.any(observation_ids[sample_valid] == 0) or np.any(
+            sample_valid & ~held & (action_ids == 0)
+        ):
             return ValidityState.INVALID
         if np.any(queued & (action_ids == 0)):
             return ValidityState.INVALID
@@ -376,7 +412,9 @@ class EpisodeReader:
         )
         for name, expected_shape in action_arrays:
             values = np.asarray(self._h5f[name][:], dtype=np.float64)
-            if values.shape != expected_shape or np.any(~np.isfinite(values[sample_valid])):
+            if values.shape != expected_shape or np.any(
+                ~np.isfinite(values[sample_valid])
+            ):
                 return ValidityState.INVALID
         if np.any(sample_valid & ~held & ~queued):
             return ValidityState.INVALID
@@ -424,7 +462,11 @@ class EpisodeReader:
         rate_hz = control_hz
         explicit_grid_duration_s = attrs.get("grid_duration_s")
         try:
-            grid_duration_s = float(explicit_grid_duration_s) if explicit_grid_duration_s is not None else float("nan")
+            grid_duration_s = (
+                float(explicit_grid_duration_s)
+                if explicit_grid_duration_s is not None
+                else float("nan")
+            )
         except (TypeError, ValueError):
             grid_duration_s = float("nan")
         if not np.isfinite(grid_duration_s) or grid_duration_s < 0:
@@ -435,7 +477,11 @@ class EpisodeReader:
         wall_duration_s = float(attrs.get("wall_duration_s", grid_duration_s))
         if not np.isfinite(wall_duration_s) or wall_duration_s < 0:
             wall_duration_s = grid_duration_s
-        non_sampled_duration_s = float(attrs.get("non_sampled_duration_s", max(0.0, wall_duration_s - grid_duration_s)))
+        non_sampled_duration_s = float(
+            attrs.get(
+                "non_sampled_duration_s", max(0.0, wall_duration_s - grid_duration_s)
+            )
+        )
         if not np.isfinite(non_sampled_duration_s) or non_sampled_duration_s < 0:
             non_sampled_duration_s = max(0.0, wall_duration_s - grid_duration_s)
 
@@ -446,7 +492,6 @@ class EpisodeReader:
             wall_duration_s=wall_duration_s,
             non_sampled_duration_s=non_sampled_duration_s,
         )
-
 
     def read_camera_frame(self, key: str, index: int) -> np.ndarray:
         """Read a single camera frame by index.
@@ -492,11 +537,12 @@ class EpisodeReader:
         HDF5 camera modalities remain directly sliceable through :attr:`h5f`.
         """
         if key != "rgb":
-            raise ValueError("iter_camera_frames currently supports only MP4-backed RGB")
+            raise ValueError(
+                "iter_camera_frames currently supports only MP4-backed RGB"
+            )
         if self._rgb_decoder is None:
             raise RuntimeError("EpisodeReader has no RGB decoder")
         yield from self._rgb_decoder.iter_frames()
-
 
     def close(self) -> None:
         """Close all files and decoders. Idempotent."""

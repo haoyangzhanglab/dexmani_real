@@ -225,12 +225,22 @@ def build_episode_frame(
         "camera_capture_monotonic_s": _scalar_float(
             camera.get("capture_monotonic_s", np.nan)
         ),
+        "camera_wait_return_monotonic_ns": _scalar_int(
+            camera.get("wait_return_monotonic_ns", 0)
+        ),
+        "camera_align_done_monotonic_ns": _scalar_int(
+            camera.get("align_done_monotonic_ns", 0)
+        ),
+        "camera_timestamp_domain": _scalar_int(camera.get("timestamp_domain", 0)),
         "camera_age_s": _scalar_float(camera.get("camera_age_s", np.nan)),
         "camera_generation": _scalar_int(camera.get("camera_generation", 0)),
         "camera_clock_reset": bool(camera.get("clock_reset", False)),
         "camera_duplicate": bool(camera.get("duplicate", False)),
         "camera_frame_gap": _scalar_int(camera.get("frame_gap", 0)),
         "camera_backlog_s": _scalar_float(camera.get("backlog_s", np.nan)),
+        "camera_delivery_delay_above_floor_s": _scalar_float(
+            camera.get("delivery_delay_above_floor_s", camera.get("backlog_s", np.nan))
+        ),
         "flag_frame_status": _scalar_int(signal.get("frame_status", 0)),
         "vr_wrist_pos": np.asarray(vr_frame["wrist_pos"], dtype=np.float64),
         "vr_wrist_rot6d": quat_wxyz_to_rot6d(
@@ -319,12 +329,18 @@ def decode_record_sample(
         "ring_sequence": int(record["camera_ring_sequence"]),
         "device_timestamp_s": float(record["camera_device_timestamp_s"]),
         "capture_monotonic_s": float(record["camera_capture_monotonic_s"]),
+        "wait_return_monotonic_ns": int(record["camera_wait_return_monotonic_ns"]),
+        "align_done_monotonic_ns": int(record["camera_align_done_monotonic_ns"]),
+        "timestamp_domain": int(record["camera_timestamp_domain"]),
         "camera_age_s": float(record["camera_age_s"]),
         "camera_generation": int(record["camera_generation"]),
         "clock_reset": bool(record["camera_clock_reset"]),
         "duplicate": bool(record["camera_duplicate"]),
         "frame_gap": int(record["camera_frame_gap"]),
         "backlog_s": float(record["camera_backlog_s"]),
+        "delivery_delay_above_floor_s": float(
+            record["camera_delivery_delay_above_floor_s"]
+        ),
     }
     if bool(record["camera_present"]):
         camera_frame.update(

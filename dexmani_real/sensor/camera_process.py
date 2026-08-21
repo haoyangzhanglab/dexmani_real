@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import json
-import math
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from dexmani_real.config.defaults import camera, policy
+from dexmani_real.config.defaults import camera
 from dexmani_real.robot.safety import SafetyState
-from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.rate_manager import RateManager
+from dexmani_real.utils.log import ThrottledWarner, get_logger
 
 if TYPE_CHECKING:
     import numpy as np
@@ -26,8 +24,16 @@ class CameraHealth(IntEnum):
     OK = 0
     CLOCK_RESET = 1
     DUPLICATE = 2
+    # Retained to decode historical episodes. A recovered current frame is not
+    # invalid merely because device frame numbers skipped earlier frames.
     FRAME_GAP = 3
+    # Historical name retained for persisted values. It means the current
+    # device-to-host delay above the clock mapper's lower envelope exceeded
+    # the freshness budget; it is not an SDK queue depth.
     BACKLOG = 4
+
+
+_READ_FAILURE_BACKOFF_S = 0.05
 
 
 @dataclass(frozen=True)
@@ -36,12 +42,17 @@ class CameraLoopConfig:
     width: int = field(default_factory=lambda: camera.width)
     height: int = field(default_factory=lambda: camera.height)
     fps: int = field(default_factory=lambda: camera.fps)
-    align_mode: Literal["depth_to_color", "color_to_depth", "none"] = field(default_factory=lambda: camera.align_mode)
+    align_mode: Literal["depth_to_color", "color_to_depth", "none"] = field(
+        default_factory=lambda: camera.align_mode
+    )
     warmup_frames: int = field(default_factory=lambda: camera.warmup_frames)
-    pointcloud_num_points: int = field(default_factory=lambda: camera.pointcloud_num_points)
-    publish_hz: float = field(default_factory=lambda: policy.control_hz)
+    pointcloud_num_points: int = field(
+        default_factory=lambda: camera.pointcloud_num_points
+    )
     max_frame_age_s: float = field(default_factory=lambda: camera.max_frame_age_s)
-    frame_gap_stall_threshold: int = field(default_factory=lambda: camera.frame_gap_stall_threshold)
+    frame_gap_stall_threshold: int = field(
+        default_factory=lambda: camera.frame_gap_stall_threshold
+    )
     desk_plane: tuple[float, float, float, float] | None = None
 
     def __post_init__(self) -> None:
@@ -49,38 +60,36 @@ class CameraLoopConfig:
             self.width <= 0
             or self.height <= 0
             or self.fps <= 0
-            or not math.isfinite(self.publish_hz)
-            or not math.isfinite(self.max_frame_age_s)
-            or self.publish_hz <= 0
             or self.max_frame_age_s <= 0
         ):
             raise ValueError("camera dimensions/rates must be positive")
         if self.pointcloud_num_points <= 0:
             raise ValueError("pointcloud_num_points must be positive")
         if self.frame_gap_stall_threshold < 0:
-            raise ValueError("frame_gap_stall_threshold must be >= 0 (0 = derive from fps/publish_hz)")
+            raise ValueError("frame_gap_stall_threshold must be >= 0")
 
     @property
     def resolved_frame_gap_stall_threshold(self) -> int:
-        """Skipped-frame count above which a read gap is flagged as a stall.
+        """Skipped-frame count above which a recovered-frame gap is logged.
 
-        A read throttled to ``publish_hz`` below the device ``fps`` inherently
-        skips ~``fps/publish_hz`` frames per read; only a gap beyond that
-        ceiling (plus jitter) is a real pipeline stall.  A positive configured
-        threshold overrides the derived value.
+        Camera acquisition now drains at the device frame rate. A frame-number
+        gap remains useful telemetry, but does not invalidate the recovered
+        current frame; freshness is decided from its timestamps and payload.
         """
         if self.frame_gap_stall_threshold > 0:
             return self.frame_gap_stall_threshold
-        return int(math.ceil(self.fps / self.publish_hz))
+        return 1
 
     @classmethod
     def from_runtime(cls, runtime: object) -> "CameraLoopConfig":
         cam = getattr(runtime, "camera")
-        pol = getattr(runtime, "policy")
         # Use the resolved desk plane as the single source of truth.
         table = getattr(getattr(runtime, "environment"), "table")
         desk_plane = (
-            cast(tuple[float, float, float, float], tuple(float(v) for v in table.plane_abcd))
+            cast(
+                tuple[float, float, float, float],
+                tuple(float(v) for v in table.plane_abcd),
+            )
             if table.enabled
             else None
         )
@@ -92,7 +101,6 @@ class CameraLoopConfig:
             align_mode=cam.align_mode,
             warmup_frames=int(cam.warmup_frames),
             pointcloud_num_points=int(cam.pointcloud_num_points),
-            publish_hz=float(pol.control_hz),
             max_frame_age_s=float(cam.max_frame_age_s),
             frame_gap_stall_threshold=int(cam.frame_gap_stall_threshold),
             desk_plane=desk_plane,
@@ -113,8 +121,17 @@ def pack_camera_frame(
     clock_reset: bool = False,
     duplicate: bool = False,
     backlog_s: float = 0.0,
+    wait_return_monotonic_ns: int = 0,
+    align_done_monotonic_ns: int = 0,
+    timestamp_domain: int = 0,
 ) -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
-    """Pack camera frame attributes into (header, rgb_bytes, depth_bytes)."""
+    """Pack one frame with explicit device, host-receive, align, and publish stages.
+
+    ``capture_monotonic_s`` is retained as the historical post-align timestamp.
+    New producers must also pass ``wait_return_monotonic_ns`` and
+    ``align_done_monotonic_ns``; old callers remain readable by falling back to
+    the legacy value for both stages.
+    """
     import numpy as np
 
     from dexmani_real.utils.schema import CAMERA_FRAME_HEADER_DTYPE
@@ -124,30 +141,48 @@ def pack_camera_frame(
     if rgb_arr.ndim != 3 or rgb_arr.shape[2] != 3:
         raise ValueError(f"RGB frame must have shape (H, W, 3), got {rgb_arr.shape}")
     if depth_arr.ndim != 2 or depth_arr.shape != rgb_arr.shape[:2]:
-        raise ValueError(f"depth frame must match RGB H/W, got {depth_arr.shape} and {rgb_arr.shape}")
+        raise ValueError(
+            f"depth frame must match RGB H/W, got {depth_arr.shape} and {rgb_arr.shape}"
+        )
     numeric = (timestamp, capture_monotonic_s, pc_valid_depth_ratio, backlog_s)
-    if not all(np.isfinite(value) for value in numeric) or capture_monotonic_s < 0 or backlog_s < 0:
-        raise ValueError("camera frame timestamps/ratios/backlog must be finite and non-negative")
+    if (
+        not all(np.isfinite(value) for value in numeric)
+        or capture_monotonic_s < 0
+        or backlog_s < 0
+    ):
+        raise ValueError(
+            "camera frame timestamps/ratios/backlog must be finite and non-negative"
+        )
     if not 0.0 <= pc_valid_depth_ratio <= 1.0:
         raise ValueError("pc_valid_depth_ratio must be in [0, 1]")
     integers = (
         frame_id,
         source_monotonic_ns,
         camera_generation,
+        wait_return_monotonic_ns,
+        align_done_monotonic_ns,
     )
     if any(int(value) < 0 for value in integers) or frame_gap < 0:
         raise ValueError("camera frame identifiers/counts must be non-negative")
+    if not 0 <= int(timestamp_domain) <= 255:
+        raise ValueError("camera timestamp_domain must fit uint8")
     if int(camera_health) not in {int(item) for item in CameraHealth}:
         raise ValueError("camera_health is not a known CameraHealth value")
-    receive_monotonic_ns = max(0, round(capture_monotonic_s * 1e9))
+    legacy_align_done_ns = max(0, round(capture_monotonic_s * 1e9))
+    receive_monotonic_ns = int(wait_return_monotonic_ns) or legacy_align_done_ns
+    align_done_ns = int(align_done_monotonic_ns) or legacy_align_done_ns
     if source_monotonic_ns > receive_monotonic_ns:
         raise ValueError("camera source time cannot be later than host receive time")
+    if align_done_ns < receive_monotonic_ns:
+        raise ValueError("camera align completion cannot precede host receive time")
 
     header = np.zeros(1, dtype=CAMERA_FRAME_HEADER_DTYPE)
     header["timestamp"] = np.float64(timestamp)
     header["capture_monotonic_s"] = np.float64(capture_monotonic_s)
     header["source_monotonic_ns"] = np.uint64(source_monotonic_ns)
     header["receive_monotonic_ns"] = np.uint64(receive_monotonic_ns)
+    header["align_done_monotonic_ns"] = np.uint64(align_done_ns)
+    header["timestamp_domain"] = np.uint8(timestamp_domain)
     header["camera_generation"] = np.uint64(camera_generation)
     header["frame_number"] = np.uint64(frame_id)
     header["frame_gap"] = np.uint32(frame_gap)
@@ -168,7 +203,9 @@ def pack_camera_frame(
     return header, rgb_arr, depth_arr
 
 
-def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None) -> None:
+def camera_loop(
+    shared: "SharedStorage", config: CameraLoopConfig | None = None
+) -> None:
     """Run RealSense camera → write frames directly to ``shared.camera_ring``.
 
     Designed as an ``mp.Process`` target. Runs the camera capture loop directly
@@ -251,7 +288,9 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
 
         try:
             from dexmani_real.config.camera_calib import CameraCalib
-            from dexmani_real.sensor.pointcloud_processor import PointCloudProcessorConfig
+            from dexmani_real.sensor.pointcloud_processor import (
+                PointCloudProcessorConfig,
+            )
 
             calib = CameraCalib()
             cam_name = calib.resolve_name_by_serial(str(cam.active_serial))
@@ -265,17 +304,21 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                 pc_kwargs["desk_plane_path"] = ""
             pc_config = PointCloudProcessorConfig(**pc_kwargs)
             _pc_meta = json.dumps(pc_config.to_meta_dict(), separators=(",", ":"))
-            shared.camera_pointcloud_config.value = _pc_meta[:2047].ljust(2048, "\x00").encode()
+            shared.camera_pointcloud_config.value = (
+                _pc_meta[:2047].ljust(2048, "\x00").encode()
+            )
             _logger.info(
                 "camera_loop: pointcloud derivation config published, T pos=%s",
                 _t_world_camera[:3, 3].round(3).tolist(),
             )
         except Exception:
-            _logger.warning("camera_loop: pointcloud derivation config DISABLED", exc_info=True)
+            _logger.warning(
+                "camera_loop: pointcloud derivation config DISABLED", exc_info=True
+            )
             shared.camera_pointcloud_config.value = "{}".ljust(2048, "\x00").encode()
 
-        rate_mgr = RateManager(cfg.publish_hz, label="camera")
         ready_published = False
+        frame_gap_warn = ThrottledWarner(interval_s=5.0, logger=_logger)
 
         while shared.is_running.value:
             _publish_payload = (
@@ -287,24 +330,31 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                 frame = cam.read(timeout_ms=300, compute_depth=False)
             except (RuntimeError, OSError):
                 _logger.warning("camera_loop: frame read failed", exc_info=True)
-                # Keep the heartbeat for worker liveness while pacing failed reads.
+                # ``wait_for_frames`` normally provides the device-rate pacing.
+                # Back off only after a failure so repeated errors cannot spin.
                 shared.set_heartbeat("camera", time.monotonic())
-                rate_mgr.wait()
+                time.sleep(_READ_FAILURE_BACKOFF_S)
                 continue
             shared.set_heartbeat("camera", time.monotonic())
 
             if _publish_payload:
-                pc_valid_depth_ratio = float(np.count_nonzero(frame.depth_raw) / frame.depth_raw.size)
+                pc_valid_depth_ratio = float(
+                    np.count_nonzero(frame.depth_raw) / frame.depth_raw.size
+                )
                 if frame.clock_reset:
                     camera_health = CameraHealth.CLOCK_RESET
                 elif frame.duplicate:
                     camera_health = CameraHealth.DUPLICATE
-                elif frame.frame_gap > cfg.resolved_frame_gap_stall_threshold:
-                    camera_health = CameraHealth.FRAME_GAP
                 elif frame.backlog_s > cfg.max_frame_age_s:
                     camera_health = CameraHealth.BACKLOG
                 else:
                     camera_health = CameraHealth.OK
+                if frame.frame_gap > cfg.resolved_frame_gap_stall_threshold:
+                    frame_gap_warn(
+                        "camera_loop: device frame gap=%d (current frame retained; threshold=%d)",
+                        frame.frame_gap,
+                        cfg.resolved_frame_gap_stall_threshold,
+                    )
                 try:
                     header, rgb, depth = pack_camera_frame(
                         frame.rgb,  # type: ignore[arg-type]
@@ -320,18 +370,21 @@ def camera_loop(shared: "SharedStorage", config: CameraLoopConfig | None = None)
                         clock_reset=frame.clock_reset,
                         duplicate=frame.duplicate,
                         backlog_s=frame.backlog_s,
+                        wait_return_monotonic_ns=frame.wait_return_monotonic_ns,
+                        align_done_monotonic_ns=frame.align_done_monotonic_ns,
+                        timestamp_domain=frame.timestamp_domain,
                     )
                     shared.camera_ring.write(header, rgb, depth)
                     if not ready_published:
                         ready_published = True
                         shared.set_ready("camera")
                         _logger.debug("camera_loop: READY")
-                        _logger.info("camera_loop: ready after first verified frame @ %.1f Hz", cfg.publish_hz)
+                        _logger.info(
+                            "camera_loop: ready after first verified frame @ device %.1f Hz",
+                            cfg.fps,
+                        )
                 except Exception:
                     _logger.warning("camera_loop: ring write failed", exc_info=True)
-
-            rate_mgr.wait()
-
     except Exception:
         failed = True
         _logger.exception("camera_loop: crashed")

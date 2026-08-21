@@ -333,6 +333,8 @@ class _RecorderIOSession:
     failure_count: int = 0
     start_hand_read_error_count: int = 0
     start_hand_overcurrent_count: int = 0
+    sample_backlog_high_watermark: int = 0
+    sample_read_failure_count: int = 0
 
     @classmethod
     def create(
@@ -446,6 +448,8 @@ class _RecorderIOSession:
                 raise RuntimeError("EpisodeRecorder refused start")
             self.start_hand_read_error_count = read_count
             self.start_hand_overcurrent_count = overcurrent_count
+            self.sample_backlog_high_watermark = 0
+            self.sample_read_failure_count = 0
             self.active_generation = generation
             _publish_status(
                 self.shared,
@@ -465,34 +469,107 @@ class _RecorderIOSession:
                 failure_count=self.failure_count,
             )
 
-    def _drain_samples(self) -> None:
-        """Consume all resident samples oldest-first before handling STOP."""
-        samples = self.shared.record_sample_ring.get_last_k(
-            self.shared.record_sample_ring.maxlen
-        )
-        unseen = [
-            (data, sequence)
-            for data, _publish_ns, sequence in samples
-            if sequence > self.last_sample_sequence
-        ]
-        if (
-            unseen
-            and unseen[0][1] > self.last_sample_sequence + 1
-            and self.recorder.is_recording
-        ):
-            reason = (
-                f"sample ring overflow: expected {self.last_sample_sequence + 1}, "
-                f"found {unseen[0][1]}"
-            )
+    def _discard_unrecoverable_samples(
+        self,
+        *,
+        latest_sequence: int,
+        reason: str,
+        stop_reason: str,
+    ) -> None:
+        """Fail the active transaction, then release stale producer capacity."""
+        self.sample_read_failure_count += 1
+        if self.recorder.is_recording:
             logger.error("RecorderIO %s", reason)
             self._begin_finalization(
                 generation=self.active_generation,
                 save=False,
-                reason="sample_ring_overflow",
+                reason=stop_reason,
                 forced_error=reason,
             )
-        for data, sequence in unseen:
-            self.last_sample_sequence = int(sequence)
+        else:
+            logger.warning("RecorderIO discarded stale samples: %s", reason)
+        # Once the transaction is doomed (or no transaction is active),
+        # acknowledge through the snapshot so a later episode cannot be blocked
+        # behind stale slots from the discarded generation.
+        self.last_sample_sequence = latest_sequence
+        self.shared.recorder_consumed_sequence.value = latest_sequence
+
+    def _drain_samples(self) -> None:
+        """Ownership-copy only consecutive unacknowledged samples before STOP.
+
+        ``record_sample_ring`` carries full RGB-D payloads. Scanning its whole
+        history at every poll needlessly copied already-consumed image slots and
+        raced the producer while it recycled the oldest one. The recorder is a
+        FIFO consumer, so it snapshots the producer sequence and reads only
+        the exact next sequence(s) it still owns.
+        """
+        ring = self.shared.record_sample_ring
+        latest_sequence = int(ring.latest_sequence)
+        pending_count = latest_sequence - self.last_sample_sequence
+        if pending_count <= 0:
+            return
+
+        previous_high_watermark = self.sample_backlog_high_watermark
+        self.sample_backlog_high_watermark = max(
+            self.sample_backlog_high_watermark, pending_count
+        )
+        backlog_warning_threshold = max(1, ring.maxlen - 1)
+        if (
+            pending_count >= backlog_warning_threshold
+            and pending_count > previous_high_watermark
+        ):
+            logger.warning(
+                "RecorderIO sample backlog high: pending=%d capacity=%d",
+                pending_count,
+                ring.maxlen,
+            )
+
+        if pending_count > ring.maxlen:
+            self._discard_unrecoverable_samples(
+                latest_sequence=latest_sequence,
+                reason=(
+                    "sample ring overflow: "
+                    f"expected {self.last_sample_sequence + 1}, "
+                    f"latest {latest_sequence}, capacity {ring.maxlen}"
+                ),
+                stop_reason="sample_ring_overflow",
+            )
+            return
+
+        for expected_sequence in range(
+            self.last_sample_sequence + 1, latest_sequence + 1
+        ):
+            result = ring.read_sequence(expected_sequence)
+            if result is None:
+                # A producer is forbidden from overwriting an unacknowledged
+                # slot. Therefore a committed snapshot sequence that cannot be
+                # copied is a loss of recorder ownership, not a history miss
+                # that this FIFO reader may skip.
+                self._discard_unrecoverable_samples(
+                    latest_sequence=latest_sequence,
+                    reason=(
+                        f"sample sequence {expected_sequence} unavailable "
+                        f"from snapshot latest={latest_sequence}"
+                    ),
+                    stop_reason="sample_sequence_unavailable",
+                )
+                return
+
+            data, _publish_ns, sequence = result
+            if sequence != expected_sequence:
+                self._discard_unrecoverable_samples(
+                    latest_sequence=latest_sequence,
+                    reason=(
+                        f"sample sequence mismatch: expected {expected_sequence}, "
+                        f"received {sequence}"
+                    ),
+                    stop_reason="sample_sequence_unavailable",
+                )
+                return
+
+            # This private copy is now owned by RecorderIO, so the producer may
+            # safely reuse its shared-memory slot while serialization continues.
+            self.last_sample_sequence = sequence
             self.shared.recorder_consumed_sequence.value = sequence
             record = data[0]
             if (
@@ -522,7 +599,7 @@ class _RecorderIOSession:
                     reason="sample_write_error",
                     forced_error=str(exc),
                 )
-                break
+                return
 
     def _handle_stop(self, control: np.void) -> None:
         generation = int(control["generation"])
@@ -600,6 +677,12 @@ class _RecorderIOSession:
         path = stop_result.path or pending.path
         frame_count = stop_result.frame_count or pending.frame_count
         self.pending_finalization = None
+        logger.info(
+            "RecorderIO sample transport: max_backlog=%d/%d read_failures=%d",
+            self.sample_backlog_high_watermark,
+            self.shared.record_sample_ring.maxlen,
+            self.sample_read_failure_count,
+        )
         _publish_status(
             self.shared,
             phase,
@@ -663,7 +746,10 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
         logger.debug("RecorderIO: READY")
         shared.set_heartbeat("recorder", time.monotonic())
         shared.set_ready("recorder")
-        limiter = RateManager(config.poll_hz, label="recorder")
+        # RecorderIO owns no actuator commands. Its correctness deadline is
+        # bounded sample backlog, not sub-millisecond poll phase, so avoid
+        # consuming a CPU core's final spin window on every idle poll.
+        limiter = RateManager(config.poll_hz, label="recorder", busy_wait=False)
 
         while session.should_run:
             session.step()

@@ -66,7 +66,12 @@ class RecorderStopResult:
     @property
     def success(self) -> bool:
         """Compatibility alias: only a successfully published save is success."""
-        return self.done and self.phase is RecorderPhase.COMPLETED and self.saved and self.error is None
+        return (
+            self.done
+            and self.phase is RecorderPhase.COMPLETED
+            and self.saved
+            and self.error is None
+        )
 
 
 def _bounded_control_text(value: str, *, capacity: int, field: str) -> bytes:
@@ -135,16 +140,20 @@ def _write_sample_metadata(
     frame["tactile_unit_code"][0] = int(signal_data.get("tactile_unit_code", 0))
     frame["flag_frame_status"][0] = int(signal_data.get("frame_status", 0))
     frame["observation_source_receive_monotonic_ns"][0] = np.asarray(
-        signal_data.get("observation_source_receive_monotonic_ns", np.zeros(4)), dtype=np.uint64
+        signal_data.get("observation_source_receive_monotonic_ns", np.zeros(4)),
+        dtype=np.uint64,
     )
     frame["observation_source_age_s"][0] = np.asarray(
-        signal_data.get("observation_source_age_s", np.full(4, np.nan)), dtype=np.float64
+        signal_data.get("observation_source_age_s", np.full(4, np.nan)),
+        dtype=np.float64,
     )
     frame["observation_source_skew_s"][0] = np.asarray(
-        signal_data.get("observation_source_skew_s", np.full(4, np.nan)), dtype=np.float64
+        signal_data.get("observation_source_skew_s", np.full(4, np.nan)),
+        dtype=np.float64,
     )
     frame["observation_history_valid_mask"][0] = np.asarray(
-        signal_data.get("observation_history_valid_mask", np.zeros((4, 1), dtype=bool)), dtype=np.uint8
+        signal_data.get("observation_history_valid_mask", np.zeros((4, 1), dtype=bool)),
+        dtype=np.uint8,
     )
     for name in (
         "observation_skew_s",
@@ -155,7 +164,8 @@ def _write_sample_metadata(
         signal_data.get("action_arm_joint_raw", action.arm_qpos_cmd), dtype=np.float64
     )
     frame["action_hand_joint_raw"][0] = np.asarray(
-        diagnostic_data.get("action_hand_joint_raw", action.hand_qpos_cmd), dtype=np.float64
+        diagnostic_data.get("action_hand_joint_raw", action.hand_qpos_cmd),
+        dtype=np.float64,
     )
 
     cam = camera_frame or {}
@@ -165,6 +175,9 @@ def _write_sample_metadata(
         "camera_frame_number": "frame_number",
         "camera_ring_sequence": "ring_sequence",
         "camera_generation": "camera_generation",
+        "camera_wait_return_monotonic_ns": "wait_return_monotonic_ns",
+        "camera_align_done_monotonic_ns": "align_done_monotonic_ns",
+        "camera_timestamp_domain": "timestamp_domain",
     }
     for field_name, camera_name in camera_integer_fields.items():
         frame[field_name][0] = int(cam.get(camera_name, 0))
@@ -176,6 +189,7 @@ def _write_sample_metadata(
         ("camera_capture_monotonic_s", "capture_monotonic_s"),
         ("camera_age_s", "camera_age_s"),
         ("camera_backlog_s", "backlog_s"),
+        ("camera_delivery_delay_above_floor_s", "delivery_delay_above_floor_s"),
     ):
         frame[name][0] = float(cam.get(source_name, np.nan))
 
@@ -194,7 +208,9 @@ def _write_sample_metadata(
         ("target_eef_pos_raw", (3,)),
         ("target_eef_rot6d_raw", (6,)),
     ):
-        frame[name][0] = np.asarray(diagnostic_data.get(name, np.full(shape, np.nan)), dtype=np.float64)
+        frame[name][0] = np.asarray(
+            diagnostic_data.get(name, np.full(shape, np.nan)), dtype=np.float64
+        )
 
 
 class RecorderClient:
@@ -226,7 +242,11 @@ class RecorderClient:
         status = self._read_status()
         if status is None or int(status["generation"]) != self._generation:
             return None
-        return self._text(status, "error") if int(status["phase"]) == int(RecorderPhase.ERROR) else None
+        return (
+            self._text(status, "error")
+            if int(status["phase"]) == int(RecorderPhase.ERROR)
+            else None
+        )
 
     def _read_status_with_sequence(self) -> tuple[np.void, int] | None:
         result = self.shared.record_status_ring.read_latest()
@@ -258,24 +278,39 @@ class RecorderClient:
         frame["task_label"][0] = _bounded_control_text(
             task_label, capacity=RECORD_TASK_LABEL_BYTES, field="task_label"
         )
-        frame["operator"][0] = _bounded_control_text(operator, capacity=RECORD_OPERATOR_BYTES, field="operator")
+        frame["operator"][0] = _bounded_control_text(
+            operator, capacity=RECORD_OPERATOR_BYTES, field="operator"
+        )
         frame["stop_reason"][0] = _bounded_control_text(
             stop_reason, capacity=RECORD_STOP_REASON_BYTES, field="stop_reason"
         )
         self.shared.record_control_ring.write(frame)
 
     def start_episode(self, *, task_label: str = "", operator: str = "") -> bool:
-        if self._recording or self._stop_requested or not self.shared.is_ready("recorder"):
+        if (
+            self._recording
+            or self._stop_requested
+            or not self.shared.is_ready("recorder")
+        ):
             return False
         try:
-            _bounded_control_text(task_label, capacity=RECORD_TASK_LABEL_BYTES, field="task_label")
-            _bounded_control_text(operator, capacity=RECORD_OPERATOR_BYTES, field="operator")
+            _bounded_control_text(
+                task_label, capacity=RECORD_TASK_LABEL_BYTES, field="task_label"
+            )
+            _bounded_control_text(
+                operator, capacity=RECORD_OPERATOR_BYTES, field="operator"
+            )
         except ValueError:
-            logger.error("RecorderIO start metadata exceeds its fixed control boundary", exc_info=True)
+            logger.error(
+                "RecorderIO start metadata exceeds its fixed control boundary",
+                exc_info=True,
+            )
             return False
         self._generation += 1
         self._last_stop_result = None
-        self._write_control(RecorderCommand.START, task_label=task_label, operator=operator)
+        self._write_control(
+            RecorderCommand.START, task_label=task_label, operator=operator
+        )
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline and self.shared.is_running.value:
             status = self._read_status()
@@ -318,10 +353,20 @@ class RecorderClient:
         frame["generation"][0] = self._generation
         frame["control_run_generation"][0] = int(self.shared.run_generation.value)
         frame["sample_sequence"][0] = self._frame_count + 1
-        for name in ("arm_qpos", "arm_qvel", "arm_tau", "eef_pos", "eef_quat_wxyz", "eef_rot6d", "hand_qpos"):
+        for name in (
+            "arm_qpos",
+            "arm_qvel",
+            "arm_tau",
+            "eef_pos",
+            "eef_quat_wxyz",
+            "eef_rot6d",
+            "hand_qpos",
+        ):
             frame[name][0] = getattr(state, name)
         frame["hand_current"][0] = (
-            state.hand_current if state.hand_current is not None else np.full(HAND_JOINT_SHAPE, np.nan)
+            state.hand_current
+            if state.hand_current is not None
+            else np.full(HAND_JOINT_SHAPE, np.nan)
         )
         for name in (
             "hand_tactile_sum",
@@ -333,26 +378,42 @@ class RecorderClient:
             "fingertip_pos",
         ):
             frame[name][0] = getattr(state, name)
-        for name in ("hand_qpos_stale", "arm_connected", "hand_connected", "hand_error_state", "arm_last_cmd_is_hold"):
+        for name in (
+            "hand_qpos_stale",
+            "arm_connected",
+            "hand_connected",
+            "hand_error_state",
+            "arm_last_cmd_is_hold",
+        ):
             frame[name][0] = int(bool(getattr(state, name)))
         frame["state_timestamp"][0] = state.timestamp
         frame["arm_last_cmd_seq"][0] = state.arm_last_cmd_seq
         frame["action_arm_qpos"][0] = action.arm_qpos_cmd
         frame["action_hand_qpos"][0] = action.hand_qpos_cmd
         frame["action_target_eef_pos"][0] = (
-            action.target_eef_pos if action.target_eef_pos is not None else np.full(3, np.nan)
+            action.target_eef_pos
+            if action.target_eef_pos is not None
+            else np.full(3, np.nan)
         )
         frame["action_target_eef_rot6d"][0] = (
-            action.target_eef_rot6d if action.target_eef_rot6d is not None else np.full(6, np.nan)
+            action.target_eef_rot6d
+            if action.target_eef_rot6d is not None
+            else np.full(6, np.nan)
         )
         frame["vr_wrist_pos"][0] = vr_frame["wrist_pos"]
         frame["vr_wrist_quat_wxyz"][0] = vr_frame["wrist_quat_wxyz"]
         frame["vr_landmarks"][0] = vr_frame["landmarks"]
-        frame["vr_head_quat_wxyz"][0] = vr_frame.get("head_quat_wxyz", np.full(4, np.nan))
+        frame["vr_head_quat_wxyz"][0] = vr_frame.get(
+            "head_quat_wxyz", np.full(4, np.nan)
+        )
         if camera_frame is not None:
             frame["camera_present"][0] = 1
-            frame["camera_rgb"][0] = camera_frame.get("rgb", np.zeros(frame["camera_rgb"][0].shape, np.uint8))
-            frame["camera_depth"][0] = camera_frame.get("depth", np.zeros(frame["camera_depth"][0].shape, np.uint16))
+            frame["camera_rgb"][0] = camera_frame.get(
+                "rgb", np.zeros(frame["camera_rgb"][0].shape, np.uint8)
+            )
+            frame["camera_depth"][0] = camera_frame.get(
+                "depth", np.zeros(frame["camera_depth"][0].shape, np.uint16)
+            )
         _write_sample_metadata(
             frame,
             action=action,
@@ -381,7 +442,9 @@ class RecorderClient:
             done=done,
             phase=phase,
             generation=int(status["generation"]),
-            saved=phase is RecorderPhase.COMPLETED and error is None and bool(status["saved"]),
+            saved=phase is RecorderPhase.COMPLETED
+            and error is None
+            and bool(status["saved"]),
             error=error,
             path=path,
             frame_count=int(status["frame_count"]),
@@ -396,7 +459,10 @@ class RecorderClient:
         if status_result is None:
             return RecorderStopResult(done=False)
         status, sequence = status_result
-        if sequence == self._last_poll_status_sequence or int(status["generation"]) != self._generation:
+        if (
+            sequence == self._last_poll_status_sequence
+            or int(status["generation"]) != self._generation
+        ):
             return RecorderStopResult(done=False)
         self._last_poll_status_sequence = sequence
         phase = RecorderPhase(int(status["phase"]))
@@ -405,7 +471,9 @@ class RecorderClient:
             self._stop_requested = True
             return self._status_result(status, done=False)
         if phase not in (RecorderPhase.COMPLETED, RecorderPhase.ERROR):
-            return RecorderStopResult(done=False, phase=phase, generation=self._generation)
+            return RecorderStopResult(
+                done=False, phase=phase, generation=self._generation
+            )
         self._recording = False
         self._stop_requested = False
         result = self._status_result(status, done=True)

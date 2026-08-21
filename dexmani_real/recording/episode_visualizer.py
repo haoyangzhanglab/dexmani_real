@@ -1,4 +1,4 @@
-"""Rerun-based visualizer for supported schema-v17/v18 DexMani episodes.
+"""Rerun-based visualizer for supported schema-v17/v18/v19 DexMani episodes.
 
 Usage:
   python examples/visualize_episode.py episodes/<task_name>/<episode_dir>
@@ -66,8 +66,6 @@ def _classify_datasets(h5f: MergedH5File) -> dict[str, list[str]]:
             classified[category] = found
 
     return classified
-
-
 
 
 def print_episode_info(h5_path: str) -> None:
@@ -141,8 +139,6 @@ def print_episode_info(h5_path: str) -> None:
         if "flag_camera_fresh" in f:
             fresh = f["flag_camera_fresh"][:]
             print(f"flag_camera_fresh rate: {fresh.mean():.2%}")
-
-
 
 
 class EpisodeVisualizer:
@@ -297,7 +293,6 @@ class EpisodeVisualizer:
             self.close()
             raise
 
-
     def _resolve_frame_count(self, max_frames: int | None) -> int:
         """Return T = min(arm_qpos.shape[0], max_frames) falling back through meta keys."""
         arm_keys = self._available.get("arm", [])
@@ -345,7 +340,6 @@ class EpisodeVisualizer:
 
         return state
 
-
     @staticmethod
     def _depth_to_pointcloud(
         depth: np.ndarray,
@@ -379,7 +373,6 @@ class EpisodeVisualizer:
             colors = rgb[::stride, ::stride][valid]
 
         return points, colors
-
 
     def _build_blueprint(self) -> rrb.Blueprint:
         """Build Rerun view layout from detected data categories."""
@@ -450,7 +443,6 @@ class EpisodeVisualizer:
                 )
 
         return rrb.Blueprint(rrb.Horizontal(contents=columns))
-
 
     def _log_static(self) -> None:
         """Log per-series labels, camera pinhole, and extrinsics once."""
@@ -523,7 +515,6 @@ class EpisodeVisualizer:
             return f"state/{key}"
         return f"{category}/{key}"
 
-
     def log_step(self, step_idx: int) -> None:
         """Log camera, fingertips, and time series for one timestep."""
         rr.set_time_sequence("step", step_idx)
@@ -532,7 +523,6 @@ class EpisodeVisualizer:
         self._log_camera(step_idx)
         self._log_fingertips(step_idx)
         self._log_time_series(step_idx)
-
 
     def _log_camera(self, step_idx: int) -> None:
         camera_keys = self._available.get("camera", [])
@@ -591,7 +581,6 @@ class EpisodeVisualizer:
                     points = points @ self._cam_R.T + self._cam_t
                 rr.log("pcd", rr.Points3D(positions=points, colors=colors, radii=0.003))
 
-
     def _log_fingertips(self, step_idx: int) -> None:
         """Render hand_fingertip FK positions as per-finger colored keypoints."""
         fp_data = self._state.get("hand_fingertip")
@@ -611,7 +600,6 @@ class EpisodeVisualizer:
                 radii=0.012,
             ),
         )
-
 
     def _log_time_series(self, step_idx: int) -> None:
         for category, keys in self._available.items():
@@ -636,7 +624,6 @@ class EpisodeVisualizer:
                 for i in range(arr.shape[1]):
                     rr.log(f"state/{fkey}/{i}", rr.Scalar(float(arr[step_idx, i])))
 
-
     @property
     def num_steps(self) -> int:
         return self._T
@@ -653,8 +640,6 @@ class EpisodeVisualizer:
             pass
 
 
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Visualize DexMani HDF5 teleop episodes with Rerun 3D."
@@ -662,7 +647,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "episode",
         type=str,
-        help="Path to a supported schema-v17/v18 episodes/<task_name>/episode_* directory.",
+        help="Path to a supported schema-v17/v18/v19 episodes/<task_name>/episode_* directory.",
     )
     parser.add_argument(
         "--max-frames",

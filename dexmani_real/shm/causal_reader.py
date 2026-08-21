@@ -37,7 +37,8 @@ def read_causal_structured_frame(
         names = data.dtype.names or ()
         publish_ns = (
             int(data["publish_monotonic_ns"][0])
-            if "publish_monotonic_ns" in names and int(data["publish_monotonic_ns"][0]) > 0
+            if "publish_monotonic_ns" in names
+            and int(data["publish_monotonic_ns"][0]) > 0
             else int(ring_publish_ns)
         )
         if 0 < source_ns <= publish_ns <= anchor_monotonic_ns:
@@ -141,7 +142,13 @@ def read_camera_frame_causal(
                 source_ns = int(header["source_monotonic_ns"][0])
                 receive_ns = int(header["receive_monotonic_ns"][0])
                 publish_ns = int(header["publish_monotonic_ns"][0]) or int(_publish_ns)
-                if 0 < source_ns <= receive_ns <= publish_ns <= int(anchor_monotonic_ns):
+                if (
+                    0
+                    < source_ns
+                    <= receive_ns
+                    <= publish_ns
+                    <= int(anchor_monotonic_ns)
+                ):
                     payload = shared.camera_ring.read_sequence(
                         int(sequence),
                         modalities=("rgb", "depth"),
@@ -167,12 +174,16 @@ def read_camera_frame_causal(
                 "capture_monotonic_s": float(rec["capture_monotonic_s"]),
                 "source_monotonic_ns": int(rec["source_monotonic_ns"]),
                 "receive_monotonic_ns": int(rec["receive_monotonic_ns"]),
+                "wait_return_monotonic_ns": int(rec["receive_monotonic_ns"]),
+                "align_done_monotonic_ns": int(rec["align_done_monotonic_ns"]),
+                "timestamp_domain": int(rec["timestamp_domain"]),
                 "publish_monotonic_ns": int(rec["publish_monotonic_ns"]),
                 "camera_generation": int(rec["camera_generation"]),
                 "clock_reset": bool(rec["clock_reset"]),
                 "duplicate": bool(rec["duplicate"]),
                 "frame_gap": int(rec["frame_gap"]),
                 "backlog_s": float(rec["backlog_s"]),
+                "delivery_delay_above_floor_s": float(rec["backlog_s"]),
                 "camera_health": int(rec["camera_health"]),
                 "valid_depth_ratio": float(rec["pc_valid_depth_ratio"]),
             }

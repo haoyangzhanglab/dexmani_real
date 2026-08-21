@@ -146,8 +146,9 @@ HAND_STATE_DTYPE = np.dtype(
         ("state_valid", "<u1"),
         ("send_healthy", "<u1"),
         ("read_healthy", "<u1"),
-        # Cumulative failure telemetry survives a one-tick error so a slower
-        # consumer can still observe and classify the event.
+        # Cumulative error telemetry is carried by the next successful
+        # feedback frame, so slower consumers can observe a failed read that
+        # intentionally did not publish a synthetic state frame.
         ("read_error_count", "<u8"),
         ("overcurrent_error_count", "<u8"),
         ("timestamp", "<f8"),
@@ -190,6 +191,11 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
         ("capture_monotonic_s", "<f8"),
         ("source_monotonic_ns", "<u8"),
         ("receive_monotonic_ns", "<u8"),
+        # ``receive`` is the host timestamp immediately after wait_for_frames;
+        # ``align_done`` separates alignment from shared-memory publication.
+        ("align_done_monotonic_ns", "<u8"),
+        # librealsense rs2_timestamp_domain value for ``timestamp``.
+        ("timestamp_domain", "<u1"),
         ("publish_monotonic_ns", "<u8"),
         ("camera_generation", "<u8"),
         ("frame_number", "<u8"),
@@ -334,13 +340,18 @@ def make_record_sample_dtype(
             ("camera_frame_number", "<u8"),
             ("camera_ring_sequence", "<u8"),
             ("camera_device_timestamp_s", "<f8"),
+            # Legacy post-align host timestamp. v19 adds its explicit stages.
             ("camera_capture_monotonic_s", "<f8"),
+            ("camera_wait_return_monotonic_ns", "<u8"),
+            ("camera_align_done_monotonic_ns", "<u8"),
+            ("camera_timestamp_domain", "<u1"),
             ("camera_age_s", "<f8"),
             ("camera_generation", "<u8"),
             ("camera_clock_reset", "<u1"),
             ("camera_duplicate", "<u1"),
             ("camera_frame_gap", "<u4"),
             ("camera_backlog_s", "<f8"),
+            ("camera_delivery_delay_above_floor_s", "<f8"),
             ("tracking_error", "<f8"),
             ("ik_solve_time_ms", "<f8"),
             ("target_pos_before_clamp", "<f8", (3,)),

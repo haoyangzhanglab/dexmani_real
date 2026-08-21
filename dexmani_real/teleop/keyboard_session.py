@@ -91,7 +91,9 @@ def _build_planner_and_gate(
             ),
         ),
         static_boxes=tuple(runtime.environment.static_boxes),
-        table=runtime.environment.table,
+        # Match VR teleoperation: retain self/static-box checks but do not
+        # reject intentional tabletop contact.
+        table=None,
     )
     planner.workspace_bounds = _workspace(runtime)
     planner.set_hand_qpos(

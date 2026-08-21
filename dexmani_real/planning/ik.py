@@ -24,7 +24,9 @@ class TeleopIKSolver:
     """MPlib position IK with prev_cmd seeding and fast-accept.
 
     Priority: prev_cmd seed (position IK) → multi-seed fallback → hold.
-    Self-collision checks when TeleopProfile.check_self_collision=True.
+    Checks self-collision and any static geometry configured by the caller
+    when TeleopProfile.check_self_collision=True. Teleoperation callers omit
+    the table deliberately; table-aware callers retain it.
     """
 
     # Elbow flip detection thresholds (ref: planner.py check_elbow_consistency).

@@ -1,12 +1,14 @@
 """Hand servo process — reads hand_cmd_ring, servos XHand, writes hand state and tactile rings.
 
-Every device-read result publishes a tactile frame: complete sensor payloads
-are fresh, while malformed/missing payloads immediately publish fresh=0 and
-calibrated=0 so consumers never keep treating an older tactile frame as valid.
-hand_state_ring publishes every tick and marks failed reads invalid.
+Every completed device read publishes hand and tactile feedback. Complete
+sensor payloads are fresh, while malformed/missing tactile payloads publish
+fresh=0 and calibrated=0. A known recoverable overcurrent publishes no
+synthetic feedback frame; the next successful read carries its cumulative
+event count.
 Error recovery: three independent counters for send failures, board faults from
 ``XHandState``, and read exceptions — each latches global ``error_state`` only
-after persistent failure.
+after persistent failure. An uncertain SDK send failure also closes the command
+path until a fresh live state read re-establishes the hand's measured pose.
 """
 
 from __future__ import annotations
@@ -192,7 +194,7 @@ def hand_loop(shared, config: HandParams) -> None:
             _mark_startup_failure()
             return
 
-        # Initialize tactile reset/bias separately; tactile failure does not block joint control.
+        # Software bias is optional observation setup; failure does not block joint control.
         try:
             hand.calibrate_tactile()
         except Exception:
@@ -274,6 +276,7 @@ def hand_loop(shared, config: HandParams) -> None:
         _overcurrent_error_count_total = 0
         _last_read_error_code = 0
         last_applied_action_id = 0
+        command_path_synchronized = True
 
         _prev_board_errs: dict[str, np.ndarray] = {
             _name: _initial_board_errors[_name].copy()
@@ -316,13 +319,30 @@ def hand_loop(shared, config: HandParams) -> None:
 
             _safety = shared.safety_state.value
             if _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not shared.error_state.value:
-                execute_action = _read_latest_command()
+                # While an SDK send outcome is uncertain, preserve the ring
+                # cursor; after a fresh read, latest-wins selects a current command.
+                execute_action = (
+                    _read_latest_command() if command_path_synchronized else None
+                )
                 if execute_action is not None:
                     cmd = np.asarray(execute_action["qpos_cmd"][0], dtype=np.float64)
                     try:
                         hand.send_action(cmd)
-                    except (XHandError, ValueError):
-                        logger.warning("hand_loop: send_action raised", exc_info=True)
+                    except XHandError:
+                        # The hand may have accepted the endpoint even when its
+                        # response was corrupted. Do not consume another command
+                        # until live feedback re-establishes the measured pose.
+                        command_path_synchronized = False
+                        logger.warning(
+                            "hand_loop: send_action failed; waiting for fresh state before more commands",
+                            exc_info=True,
+                        )
+                        _send_error_counter.inc()
+                    except ValueError:
+                        logger.warning(
+                            "hand_loop: send_action rejected before SDK call",
+                            exc_info=True,
+                        )
                         _send_error_counter.inc()
                     else:
                         _send_error_counter.reset()
@@ -334,6 +354,7 @@ def hand_loop(shared, config: HandParams) -> None:
                     logger.error("hand_loop: persistent send failures — latching global fault")
 
             read_failed = False
+            publish_feedback = True
             try:
                 st = hand.get_state()
                 qpos = st.qpos
@@ -351,6 +372,11 @@ def hand_loop(shared, config: HandParams) -> None:
                 _last_tactile_sum = tactile_sum.copy()
                 _last_tactile_force = tactile_force.copy()
                 _read_error_counter.reset()
+                if not command_path_synchronized:
+                    command_path_synchronized = True
+                    logger.info(
+                        "hand_loop: fresh state restored command-path synchronization"
+                    )
                 commboard_err = st.commboard_err
                 jointboard_err = st.jointboard_err
                 tipboard_err = st.tipboard_err
@@ -366,11 +392,13 @@ def hand_loop(shared, config: HandParams) -> None:
                 _last_read_error_code = exc.code
                 is_overcurrent = _last_read_error_code == XHAND_OVERCURRENT_ERROR_CODE
                 if is_overcurrent:
-                    # Treat overcurrent as a recoverable warning and retain feedback.
-                    read_failed = False
+                    # Grasp contact can produce this recoverable SDK code. Keep
+                    # commanding, but do not publish cached values as a fresh read.
+                    publish_feedback = False
                     _overcurrent_error_count_total += 1
                     logger.warning(
-                        "hand_loop: overcurrent context last_current_ma=%s tor_max_ma=%s "
+                        "hand_loop: recoverable overcurrent context "
+                        "last_current_ma=%s tor_max_ma=%s "
                         "last_qpos_rad=%s last_cmd_qpos_rad=%s",
                         np.round(last_known_current, 1).tolist(),
                         list(config.tor_max_ma),
@@ -435,30 +463,35 @@ def hand_loop(shared, config: HandParams) -> None:
             elif not has_hardware_fault:
                 _error_state_counter.reset()
 
-            _publish_feedback(
-                shared,
-                qpos=qpos,
-                current_ma=current,
-                tactile_sum=tactile_sum,
-                tactile_sum_valid=tactile_sum_valid,
-                tactile_contact=tactile_contact,
-                tactile_force=tactile_force,
-                tactile_valid=tactile_valid,
-                tactile_calibrated=hand.tactile_calibrated,
-                has_hardware_fault=has_hardware_fault,
-                connected=connected,
-                read_failed=read_failed,
-                last_cmd_seq=last_applied_action_id,
-                last_cmd_qpos=np.asarray(hand.last_qpos_cmd, dtype=np.float64),
-                commboard_err=commboard_err,
-                jointboard_err=jointboard_err,
-                tipboard_err=tipboard_err,
-                source_monotonic_ns=_last_state_source_ns,
-                send_healthy=not _send_error_counter.triggered,
-                read_healthy=not read_failed and not _read_error_counter.triggered,
-                read_error_count=_read_error_count_total,
-                overcurrent_error_count=_overcurrent_error_count_total,
-            )
+            if publish_feedback:
+                _publish_feedback(
+                    shared,
+                    qpos=qpos,
+                    current_ma=current,
+                    tactile_sum=tactile_sum,
+                    tactile_sum_valid=tactile_sum_valid,
+                    tactile_contact=tactile_contact,
+                    tactile_force=tactile_force,
+                    tactile_valid=tactile_valid,
+                    tactile_calibrated=hand.tactile_calibrated,
+                    has_hardware_fault=has_hardware_fault,
+                    connected=connected,
+                    read_failed=read_failed,
+                    last_cmd_seq=last_applied_action_id,
+                    last_cmd_qpos=np.asarray(hand.last_qpos_cmd, dtype=np.float64),
+                    commboard_err=commboard_err,
+                    jointboard_err=jointboard_err,
+                    tipboard_err=tipboard_err,
+                    source_monotonic_ns=_last_state_source_ns,
+                    send_healthy=(
+                        command_path_synchronized and not _send_error_counter.triggered
+                    ),
+                    read_healthy=(
+                        not read_failed and not _read_error_counter.triggered
+                    ),
+                    read_error_count=_read_error_count_total,
+                    overcurrent_error_count=_overcurrent_error_count_total,
+                )
 
             rate_mgr.wait()
     finally:

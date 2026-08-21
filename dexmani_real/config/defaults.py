@@ -152,8 +152,10 @@ class TableCollisionConfig:
     """Calibrated table represented as a finite box below an upward plane.
 
     ``plane_abcd`` uses the robot-base/world convention ``ax+by+cz+d=0``.
-    Runtime resolution refreshes it from ``plane_path`` so perception,
-    online action validation, and homing use the same calibration artifact.
+    Runtime resolution refreshes it from ``plane_path`` so perception and
+    table-aware planning/validation paths use the same calibration artifact.
+    Fine teleoperation deliberately does not use this geometry to reject
+    robot-table contact.
     """
 
     enabled: bool = True
@@ -852,7 +854,8 @@ class CameraParams:
     warmup_frames: int = 10
     max_frame_age_s: float = 0.25
     recording_stall_abort_s: float = 2.0
-    # Zero derives the normal frame-gap threshold from fps and publish_hz.
+    # Zero selects the default recovered-frame-gap logging threshold. Gaps are
+    # retained as telemetry; current-frame freshness is timestamp-based.
     frame_gap_stall_threshold: int = 0
     ring_maxlen: int = 5
     pointcloud_num_points: int = 2048
@@ -880,7 +883,7 @@ class CameraParams:
         if self.max_frame_age_s <= 0 or self.recording_stall_abort_s <= self.max_frame_age_s:
             raise ValueError("camera stall abort threshold must be greater than max frame age")
         if self.frame_gap_stall_threshold < 0:
-            raise ValueError("camera frame_gap_stall_threshold must be >= 0 (0 = derive from fps/publish_hz)")
+            raise ValueError("camera frame_gap_stall_threshold must be >= 0")
         if self.ring_maxlen <= 0 or self.pointcloud_num_points <= 0 or self.writer_queue_size <= 0:
             raise ValueError("camera ring, pointcloud, and writer capacities must be > 0")
         if self.serial is not None and not self.serial:

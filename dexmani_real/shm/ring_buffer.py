@@ -1,4 +1,4 @@
-"""Lock-free FILO ring buffer in shared memory.
+"""Lock-free shared-memory ring buffer with latest, history, and sequence reads.
 
 Uses multiprocessing.shared_memory for zero-copy cross-process communication.
 Each ring has one producer and may have multiple readers. Odd/even markers
@@ -23,7 +23,6 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.utils.log import get_logger
-
 
 
 def _seqlock_odd(seq: int) -> int:
@@ -131,8 +130,10 @@ class SharedMemoryRingBuffer:
     Because only the producer writes write_idx and only the consumer reads
     it, this is safe on x86_64 without CAS.
 
-    FILO semantics: the buffer always returns the latest frame; old frames
-    are silently overwritten (drop-oldest backpressure).
+    Latest/history readers use FILO semantics: old frames are silently
+    overwritten (drop-oldest backpressure). A sequence-addressed reader can
+    instead ownership-copy one known resident frame. That form is for bounded
+    FIFO consumers that track their own acknowledgement sequence.
     """
 
     _OFF_WRITE_IDX = 0
@@ -255,6 +256,36 @@ class SharedMemoryRingBuffer:
                 return self._last_good
         self._warn_torn_read()
         return self._last_good
+
+    def read_sequence(self, sequence: int) -> tuple[np.ndarray, int, int] | None:
+        """Ownership-copy one exact, still-resident logical sequence.
+
+        Unlike :meth:`get_last_k`, this method never scans or copies unrelated
+        history slots. It is therefore suitable for a bounded FIFO consumer
+        that already knows the next sequence it must acknowledge. ``None``
+        means that the requested sequence is not resident or could not be read
+        consistently; callers that require losslessness must not skip ahead.
+        """
+        if sequence <= 0:
+            return None
+
+        slot = self._data_buf[sequence % self.maxlen]
+        seqlock = SeqlockSlot(
+            self._shm.buf,
+            self._HEADER_SIZE + (sequence % self.maxlen) * self._slot_size,
+        )
+        for _attempt in range(2):
+            marker1 = seqlock.marker
+            if (
+                not _seqlock_is_complete(marker1)
+                or _seqlock_to_logical(marker1) != sequence
+            ):
+                return None
+            timestamp_ns = seqlock.timestamp_ns
+            data = slot["data"].copy().reshape(1)
+            if seqlock.verify(marker1) and _seqlock_to_logical(marker1) == sequence:
+                return data, timestamp_ns, sequence
+        return None
 
     def get_last_k(self, k: int) -> list[tuple[np.ndarray, int, int]]:
         """Return up to ``k`` independently verified frames, oldest first."""

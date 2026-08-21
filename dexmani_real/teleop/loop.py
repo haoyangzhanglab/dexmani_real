@@ -144,7 +144,9 @@ def _load_control_resources(
         ),
         hand_dof=True,
         static_boxes=config.runtime.environment.static_boxes,
-        table=config.runtime.environment.table,
+        # Table contact is intentional during fine teleoperation. Homing still
+        # applies its independent table-clearance validation.
+        table=None,
     )
 
     vr_config_path = Path(__file__).resolve().parents[2] / config.vr_transform_path

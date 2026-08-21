@@ -1,7 +1,7 @@
 """XHand 12-DOF hardware driver.
 
-The worker-facing API is intentionally small: connect, calibrate tactile
-sensors, read state, send an endpoint, and disconnect. SDK objects remain
+The worker-facing API is intentionally small: connect, estimate a software
+tactile bias, read state, send an endpoint, and disconnect. SDK objects remain
 local to the hand worker.
 """
 
@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Callable
 
 import numpy as np
@@ -51,7 +50,8 @@ _EC_STATE_INIT = 1
 _STALE_EC_RECOVERY_S = 3.0
 _POST_EC_DISCONNECT_S = 2.0
 _TACTILE_SCALE = 0.1
-_TACTILE_SENSOR_IDS = tuple(range(0x11, 0x16))
+_TACTILE_BIAS_SAMPLE_COUNT = 5
+_TACTILE_BIAS_SAMPLE_INTERVAL_S = 0.02
 _POSITION_MODE = 3
 _TACTILE_CONTACT_THRESHOLD = 1.0
 _RAW_FORCE_CONTACT_THRESHOLD = 1.0
@@ -354,17 +354,20 @@ class XHand:
 
 
     def calibrate_tactile(self) -> bool:
-        """Reset sensors and estimate a no-contact bias without gating joint control."""
+        """Estimate a software-only no-contact bias without gating joint control."""
         self._tactile_bias_sum = None
         self._tactile_bias_raw = None
         startup = self.get_state()
-        if not startup.tactile_sum_valid or self._tactile_load_present(startup):
+        if not startup.tactile_valid or self._tactile_load_present(startup):
             logger.error(
-                "Tactile calibration refused: contact/load or invalid data at startup"
+                "Tactile calibration refused: contact/load or incomplete data at startup"
             )
             return False
-        self._reset_tactile_sensors()
         self._capture_tactile_bias()
+        logger.info(
+            "XHand tactile software bias calibrated from %d no-contact samples",
+            _TACTILE_BIAS_SAMPLE_COUNT,
+        )
         return self.tactile_calibrated
 
     def _tactile_load_present(self, state: XHandState) -> bool:
@@ -374,33 +377,12 @@ class XHand:
         magnitude = np.linalg.norm(state.tactile_sum, axis=1)
         return bool(np.any(magnitude > _TACTILE_CONTACT_THRESHOLD))
 
-    def _reset_tactile_sensors(self) -> None:
-        unsupported = 0
-        for sensor_id in _TACTILE_SENSOR_IDS:
-            reset_sensor = partial(
-                self._control.reset_sensor, self.cfg.device_id, sensor_id
-            )
-            for attempt in range(3):
-                error, output = self._captured_sdk_call(
-                    f"reset sensor {sensor_id}",
-                    reset_sensor,
-                    ignore=("Unknow Cmd!",),
-                )
-                unsupported += int("Unknow Cmd!" in output)
-                if _error_ok(error):
-                    break
-                if attempt < 2:
-                    time.sleep(0.2)
-            else:
-                logger.warning("XHand tactile sensor %d reset failed", sensor_id)
-        if unsupported:
-            logger.info(
-                "XHand firmware did not implement %d tactile reset request(s)",
-                unsupported,
-            )
-
-    def _capture_tactile_bias(self, sample_count: int = 5) -> None:
-        samples = [self.get_state() for _ in range(sample_count)]
+    def _capture_tactile_bias(self) -> None:
+        samples: list[XHandState] = []
+        for _ in range(_TACTILE_BIAS_SAMPLE_COUNT):
+            # Space live RS485 reads so startup calibration does not burst the bus.
+            time.sleep(_TACTILE_BIAS_SAMPLE_INTERVAL_S)
+            samples.append(self.get_state())
         if not all(sample.tactile_valid for sample in samples):
             raise XHandError(
                 "calibrate_tactile", -1, "incomplete tactile data during bias capture"
@@ -411,12 +393,15 @@ class XHand:
                 -1,
                 "contact/load detected during tactile bias capture",
             )
-        self._tactile_bias_sum = np.mean(
+        tactile_bias_sum = np.mean(
             np.stack([sample.tactile_sum for sample in samples]), axis=0
         )
-        self._tactile_bias_raw = np.mean(
+        tactile_bias_raw = np.mean(
             np.stack([sample.tactile_force for sample in samples]), axis=0
         )
+        # Publish both biases together so calibration is never half-initialized.
+        self._tactile_bias_sum = tactile_bias_sum
+        self._tactile_bias_raw = tactile_bias_raw
 
     def get_state(self) -> XHandState:
         """Return fresh joint feedback; sensor-only errors degrade tactile fields."""

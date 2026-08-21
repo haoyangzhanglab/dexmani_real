@@ -19,7 +19,7 @@ from dexmani_real.data_processing.pipeline import process_episode_root
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Compact supported schema-v17/v18 Real episodes into one processed HDF5 per source."
+        description="Compact supported schema-v17/v18/v19 Real episodes into one processed HDF5 per source."
     )
     parser.add_argument(
         "--input-root",

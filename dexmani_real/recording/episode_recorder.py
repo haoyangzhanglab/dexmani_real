@@ -1,4 +1,4 @@
-"""Transactional raw v18 episode serialization from owned ``EpisodeFrame`` rows.
+"""Transactional raw v19 episode serialization from owned ``EpisodeFrame`` rows.
 
 State, action, VR, and camera rows are causally aligned to the policy grid.
 The recorder owns transaction lifecycle, camera sidecar coordination, metadata,
@@ -321,11 +321,15 @@ class EpisodeRecorder:
                 "0": "OK",
                 "1": "CLOCK_RESET",
                 "2": "DUPLICATE",
-                "3": "FRAME_GAP",
-                "4": "BACKLOG",
+                "3": "FRAME_GAP_LEGACY",
+                "4": "DELIVERY_DELAY_ABOVE_FLOOR_LEGACY_NAME_BACKLOG",
             },
             sort_keys=True,
             separators=(",", ":"),
+        )
+        meta.attrs["camera_frame_gap_semantics"] = (
+            "telemetry_only; a recovered current frame remains eligible when its "
+            "payload and timestamps are fresh"
         )
         meta.attrs["camera_depth_storage"] = "uint16/gzip-1"
 

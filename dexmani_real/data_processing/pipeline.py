@@ -1,4 +1,4 @@
-"""Transactional one-episode-to-one-HDF5 processing for Real schema v17/v18."""
+"""Transactional one-episode-to-one-HDF5 processing for Real schema v17/v18/v19."""
 
 from __future__ import annotations
 
@@ -30,7 +30,6 @@ from dexmani_real.data_processing.transforms import (
 )
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rotmat, rot6d_to_quat_wxyz
 from dexmani_real.recording.episode_reader import EpisodeReader
-from dexmani_real.recording.episode_schema import EPISODE_SCHEMA_VERSION
 from dexmani_real.recording.transaction import atomic_publish
 from dexmani_real.sensor.pointcloud_processor import (
     PointCloudProcessor,
@@ -372,8 +371,8 @@ def _write_attrs(
             "schema_name": PROCESSED_SCHEMA_NAME,
             "schema_version": PROCESSED_SCHEMA_VERSION,
             "domain": "real",
-            "source_format": "dexmani_v17",
-            "source_schema_version": EPISODE_SCHEMA_VERSION,
+            "source_format": f"dexmani_v{reader.schema_version}",
+            "source_schema_version": reader.schema_version,
             "source_episode": reader.h5_path.name,
             "source_frames": decision.source_frames,
             "profile": config.profile.value,

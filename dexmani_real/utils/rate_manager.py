@@ -28,7 +28,12 @@ class RateStats:
 
 
 class RateManager:
-    """Rate limiter that preserves an absolute schedule without catch-up bursts."""
+    """Rate limiter that preserves an absolute schedule without catch-up bursts.
+
+    ``busy_wait`` is deliberately owner-selected: actuator-facing loops may
+    need the final precision window, while non-actuating service loops should
+    sleep so they do not compete for CPU time merely to preserve poll phase.
+    """
 
     def __init__(
         self,
@@ -37,17 +42,23 @@ class RateManager:
         label: str = "unnamed",
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
+        busy_wait: bool | None = None,
     ) -> None:
         if not isinstance(target_hz, (int, float)) or not math.isfinite(float(target_hz)) or target_hz <= 0:
             raise ValueError(f"target_hz must be positive, got {target_hz}")
         if not isinstance(label, str) or not label.strip():
             raise ValueError("rate manager label must be a non-empty string")
+        if busy_wait is not None and not isinstance(busy_wait, bool):
+            raise ValueError("busy_wait must be a bool or None")
         self.target_hz = float(target_hz)
         self.label = label.strip()
         self.period = 1.0 / target_hz
         self._clock = time.perf_counter if clock is None else clock
         self._sleep = time.sleep if sleep is None else sleep
-        self._busy_wait = clock is None
+        # Preserve the existing deterministic-test behavior: injected clocks
+        # default to sleep-only, while production control loops spin for the
+        # final precision window unless their owner explicitly opts out.
+        self._busy_wait = clock is None if busy_wait is None else bool(busy_wait)
         started = self._clock()
         self._started_at = started
         self._cycle_started_at = started

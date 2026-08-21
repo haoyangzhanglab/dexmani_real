@@ -93,7 +93,11 @@ class RealSenseConfig:
         if mode != "none" and not self.enable_color:
             raise ValueError("alignment requires enable_color=True.")
         if self.frame_name is None:
-            frame_name = "camera_color_optical" if mode == "depth_to_color" else "camera_depth_optical"
+            frame_name = (
+                "camera_color_optical"
+                if mode == "depth_to_color"
+                else "camera_depth_optical"
+            )
             object.__setattr__(self, "frame_name", frame_name)
 
 
@@ -104,7 +108,12 @@ class CameraFrame:
     depth_raw: np.ndarray
     timestamp: float
     host_time: float
+    # Legacy post-align host timestamp retained for episode compatibility.
     capture_monotonic_s: float
+    # Explicit host stages for timing diagnosis and causal provenance.
+    wait_return_monotonic_ns: int
+    align_done_monotonic_ns: int
+    timestamp_domain: int
     source_monotonic_ns: int
     camera_generation: int
     clock_reset: bool
@@ -171,7 +180,9 @@ class RealSense:
         device — otherwise the next open would hit "Device or resource busy".
         """
         try:
-            self.active_serial = self.config.serial or self._find_default_serial_in_context()
+            self.active_serial = (
+                self.config.serial or self._find_default_serial_in_context()
+            )
             device = self._find_device_by_serial_in_context(self.active_serial)
             self.active_is_l515 = self.is_l515_device(device)
         except (RuntimeError, OSError) as e:
@@ -241,7 +252,10 @@ class RealSense:
             (rs.option.noise_filtering, float(cfg.noise_filtering)),
             (rs.option.min_distance, float(cfg.min_distance)),
             (rs.option.digital_gain, float(cfg.digital_gain)),
-            (rs.option.post_processing_sharpening, float(cfg.post_processing_sharpening)),
+            (
+                rs.option.post_processing_sharpening,
+                float(cfg.post_processing_sharpening),
+            ),
             (rs.option.pre_processing_sharpening, float(cfg.pre_processing_sharpening)),
         ]
         if cfg.noise_estimation is not None:
@@ -285,7 +299,9 @@ class RealSense:
                 int(cfg.receiver_gain),
                 actual_gain,
             )
-        if np.isfinite(actual_depth_offset) and not np.isclose(actual_depth_offset, float(cfg.depth_offset), atol=1e-6):
+        if np.isfinite(actual_depth_offset) and not np.isclose(
+            actual_depth_offset, float(cfg.depth_offset), atol=1e-6
+        ):
             logger.warning(
                 "L515 read-only depth_offset mismatch: expected=%.1f, actual=%.1f",
                 float(cfg.depth_offset),
@@ -301,7 +317,9 @@ class RealSense:
         self.aligner = self.create_aligner()
 
         self.set_global_time()
-        self.depth_scale = float(self.profile.get_device().first_depth_sensor().get_depth_scale())
+        self.depth_scale = float(
+            self.profile.get_device().first_depth_sensor().get_depth_scale()
+        )
         self.update_intrinsics_from_profile()
         self.frame_id = 0
 
@@ -369,7 +387,8 @@ class RealSense:
 
                 delay = 3.0 * (attempt + 1)
                 logger.warning(
-                    "L515 warmup timed out; restarting pipeline after %.0f s " "(attempt %d/%d).",
+                    "L515 warmup timed out; restarting pipeline after %.0f s "
+                    "(attempt %d/%d).",
                     delay,
                     attempt + 1,
                     max_restarts,
@@ -377,7 +396,9 @@ class RealSense:
                 try:
                     self.pipeline.stop()
                 except RuntimeError:
-                    logger.warning("RealSense pipeline stop failed before restart", exc_info=True)
+                    logger.warning(
+                        "RealSense pipeline stop failed before restart", exc_info=True
+                    )
                 time.sleep(delay)
                 self._start_pipeline(self.create_rs_config())
                 # Reapply Short Range and rebuild active-profile state after every restart.
@@ -395,7 +416,9 @@ class RealSense:
         try:
             self.pipeline.stop()
         except RuntimeError:
-            logger.warning("RealSense pipeline stop failed during disconnect", exc_info=True)
+            logger.warning(
+                "RealSense pipeline stop failed during disconnect", exc_info=True
+            )
         finally:
             self.pipeline = None
             self.profile = None
@@ -411,15 +434,27 @@ class RealSense:
 
         rs_config = rs.config()
         rs_config.enable_device(self.active_serial)
-        rs_config.enable_stream(rs.stream.depth, depth_width, depth_height, rs.format.z16, self.config.fps)
+        rs_config.enable_stream(
+            rs.stream.depth, depth_width, depth_height, rs.format.z16, self.config.fps
+        )
         if self.config.enable_color:
-            rs_config.enable_stream(rs.stream.color, color_width, color_height, rs.format.bgr8, self.config.fps)
+            rs_config.enable_stream(
+                rs.stream.color,
+                color_width,
+                color_height,
+                rs.format.bgr8,
+                self.config.fps,
+            )
         return rs_config
 
     def create_aligner(self) -> rs.align | None:
         if self.config.align_mode == "none":
             return None
-        target = rs.stream.color if self.config.align_mode == "depth_to_color" else rs.stream.depth
+        target = (
+            rs.stream.color
+            if self.config.align_mode == "depth_to_color"
+            else rs.stream.depth
+        )
         return rs.align(target)
 
     def set_global_time(self) -> None:
@@ -430,18 +465,26 @@ class RealSense:
                 if sensor.supports(rs.option.global_time_enabled):
                     sensor.set_option(rs.option.global_time_enabled, 1)
             except RuntimeError:
-                logger.warning("RealSense global-time option could not be enabled", exc_info=True)
+                logger.warning(
+                    "RealSense global-time option could not be enabled", exc_info=True
+                )
 
     @staticmethod
     def is_l515_device(device: rs.device) -> bool:
         name = RealSense.get_device_info_value(device, rs.camera_info.name).upper()
-        product_line = RealSense.get_device_info_value(device, rs.camera_info.product_line)
+        product_line = RealSense.get_device_info_value(
+            device, rs.camera_info.product_line
+        )
         return product_line == "L500" or "L515" in name
 
     def update_intrinsics_from_profile(self) -> None:
         if self.profile is None:
             raise RuntimeError("RealSense is not connected.")
-        stream = rs.stream.color if self.config.align_mode == "depth_to_color" else rs.stream.depth
+        stream = (
+            rs.stream.color
+            if self.config.align_mode == "depth_to_color"
+            else rs.stream.depth
+        )
         video_profile = self.profile.get_stream(stream).as_video_stream_profile()
         self.set_intrinsics(video_profile.get_intrinsics())
 
@@ -456,27 +499,36 @@ class RealSense:
             self.intr = intrinsics_to_vector(K)
             self.intrinsics_info = intrinsics_to_dict(intrinsics)
             # Precompute unit rays per intrinsics; each frame then needs one multiply.
-            self.rays = make_rays(int(intrinsics.height), int(intrinsics.width), K).numpy()
+            self.rays = make_rays(
+                int(intrinsics.height), int(intrinsics.width), K
+            ).numpy()
 
     def get_rays(self) -> np.ndarray:
         """(H, W, 3) float32 unit rays matching the output frame geometry."""
         if self.rays is None:
-            raise RuntimeError("RealSense is not connected or intrinsics are unavailable.")
+            raise RuntimeError(
+                "RealSense is not connected or intrinsics are unavailable."
+            )
         return self.rays
 
-    def read(self, timeout_ms: int = 5000, *, compute_depth: bool = True) -> CameraFrame:
+    def read(
+        self, timeout_ms: int = 5000, *, compute_depth: bool = True
+    ) -> CameraFrame:
         if self.pipeline is None:
             raise RuntimeError("RealSense is not connected. Call connect() first.")
         if self.depth_scale is None:
             raise RuntimeError("RealSense depth_scale is unavailable.")
 
         frames = self.pipeline.wait_for_frames(timeout_ms)
+        # Timestamp SDK availability before any alignment or array conversion.
+        # This is the closest host-monotonic approximation to frame delivery.
+        wait_return_monotonic_ns = time.monotonic_ns()
         if self.aligner is not None:
             frames = self.aligner.process(frames)
 
         host_time = time.time()
-        capture_monotonic_ns = time.monotonic_ns()
-        capture_monotonic_s = capture_monotonic_ns / 1e9
+        align_done_monotonic_ns = time.monotonic_ns()
+        capture_monotonic_s = align_done_monotonic_ns / 1e9
         depth_frame = frames.get_depth_frame()
         color_frame = frames.get_color_frame() if self.config.enable_color else None
         if not depth_frame:
@@ -504,9 +556,10 @@ class RealSense:
         self.frame_id = int(depth_frame.get_frame_number())
 
         device_timestamp_s = float(depth_frame.get_timestamp()) * 1e-3
+        timestamp_domain = int(depth_frame.get_frame_timestamp_domain())
         clock_mapping = self._clock_mapper.map(
             device_time_s=device_timestamp_s,
-            host_receive_ns=capture_monotonic_ns,
+            host_receive_ns=wait_return_monotonic_ns,
             frame_number=self.frame_id,
         )
         frame = CameraFrame(
@@ -516,6 +569,9 @@ class RealSense:
             timestamp=device_timestamp_s,
             host_time=host_time,
             capture_monotonic_s=capture_monotonic_s,
+            wait_return_monotonic_ns=wait_return_monotonic_ns,
+            align_done_monotonic_ns=align_done_monotonic_ns,
+            timestamp_domain=timestamp_domain,
             source_monotonic_ns=clock_mapping.source_monotonic_ns,
             camera_generation=clock_mapping.generation,
             clock_reset=clock_mapping.clock_reset,
@@ -537,17 +593,23 @@ class RealSense:
 
     def get_intrinsics(self) -> np.ndarray:
         if self.K is None:
-            raise RuntimeError("RealSense is not connected or intrinsics are unavailable.")
+            raise RuntimeError(
+                "RealSense is not connected or intrinsics are unavailable."
+            )
         return self.K.copy()
 
     def get_intrinsics_info(self) -> dict:
         if self.intrinsics_info is None:
-            raise RuntimeError("RealSense is not connected or intrinsics info is unavailable.")
+            raise RuntimeError(
+                "RealSense is not connected or intrinsics info is unavailable."
+            )
         return dict(self.intrinsics_info)
 
     def get_depth_scale(self) -> float:
         if self.depth_scale is None:
-            raise RuntimeError("RealSense is not connected or depth_scale is unavailable.")
+            raise RuntimeError(
+                "RealSense is not connected or depth_scale is unavailable."
+            )
         return float(self.depth_scale)
 
     def get_device_info(self) -> dict:
@@ -596,7 +658,9 @@ class RealSense:
 
     def _find_device_by_serial_in_context(self, serial: str) -> rs.device:
         for device in self.context.query_devices():
-            device_serial = self.get_device_info_value(device, rs.camera_info.serial_number)
+            device_serial = self.get_device_info_value(
+                device, rs.camera_info.serial_number
+            )
             if device_serial == serial:
                 return device
         raise RuntimeError(f"No RealSense camera found with serial={serial}.")
@@ -606,14 +670,19 @@ class RealSense:
         if len(devices) == 0:
             raise RuntimeError("No RealSense camera found.")
         if len(devices) != 1:
-            serials = [self.get_device_info_value(device, rs.camera_info.serial_number) for device in devices]
+            serials = [
+                self.get_device_info_value(device, rs.camera_info.serial_number)
+                for device in devices
+            ]
             raise RuntimeError(
                 "Multiple RealSense cameras found; configure an explicit serial "
                 f"instead of relying on discovery order (connected={serials})."
             )
         serial = self.get_device_info_value(devices[0], rs.camera_info.serial_number)
         if not serial:
-            raise RuntimeError("The first RealSense camera does not expose a serial number.")
+            raise RuntimeError(
+                "The first RealSense camera does not expose a serial number."
+            )
         return serial
 
     @staticmethod

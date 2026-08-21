@@ -13,6 +13,8 @@ class ClockMapping:
     duplicate: bool
     frame_gap: int
     clock_reset: bool
+    # Delay above the trailing lower-envelope estimate. This is a relative
+    # delivery-delay diagnostic, not an SDK queue depth or absolute latency.
     backlog_ns: int
 
 
@@ -33,7 +35,9 @@ class DeviceClockMapper:
     the window.
     """
 
-    def __init__(self, *, reset_jump_ns: int = 2_000_000_000, window_ns: int = 2_000_000_000) -> None:
+    def __init__(
+        self, *, reset_jump_ns: int = 2_000_000_000, window_ns: int = 2_000_000_000
+    ) -> None:
         if reset_jump_ns <= 0:
             raise ValueError("reset_jump_ns must be positive")
         if window_ns <= 0:
@@ -54,32 +58,45 @@ class DeviceClockMapper:
         self._last_host_ns = None
         self._last_frame_number = None
 
-    def map(self, *, device_time_s: float, host_receive_ns: int, frame_number: int) -> ClockMapping:
+    def map(
+        self, *, device_time_s: float, host_receive_ns: int, frame_number: int
+    ) -> ClockMapping:
         device_ns = int(round(float(device_time_s) * 1e9))
         host_ns = int(host_receive_ns)
         frame = int(frame_number)
         if device_ns < 0 or host_ns <= 0 or frame < 0:
-            raise ValueError("device/host timestamps and frame number must be non-negative")
+            raise ValueError(
+                "device/host timestamps and frame number must be non-negative"
+            )
 
-        duplicate = self._last_frame_number == frame and self._last_device_ns == device_ns
+        duplicate = (
+            self._last_frame_number == frame and self._last_device_ns == device_ns
+        )
         frame_gap = 0
         clock_reset = False
         if self._last_device_ns is not None and self._last_host_ns is not None:
             device_delta = device_ns - self._last_device_ns
             host_delta = host_ns - self._last_host_ns
             rollback = device_delta < 0 or (
-                self._last_frame_number is not None and frame < self._last_frame_number and not duplicate
+                self._last_frame_number is not None
+                and frame < self._last_frame_number
+                and not duplicate
             )
             jump = abs(device_delta - host_delta) > self.reset_jump_ns
             if rollback or jump:
                 self.reset()
                 clock_reset = True
-            elif self._last_frame_number is not None and frame > self._last_frame_number + 1:
+            elif (
+                self._last_frame_number is not None
+                and frame > self._last_frame_number + 1
+            ):
                 frame_gap = frame - self._last_frame_number - 1
 
         offset = host_ns - device_ns
         # Use the trailing-window minimum to ignore transient USB-delivery spikes.
-        while self._offset_window and host_ns - self._offset_window[0][0] > self.window_ns:
+        while (
+            self._offset_window and host_ns - self._offset_window[0][0] > self.window_ns
+        ):
             self._offset_window.popleft()
         self._offset_window.append((host_ns, offset))
         offset_lower_bound = min(off for _, off in self._offset_window)

@@ -13,7 +13,13 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 - 通过共享内存协调 arm、hand、VR、camera、recorder 与 policy 进程。
 - 常规 arm/hand joint command 统一经过安全门，并在设备 worker 的 SDK 边界再次
   校验；homing 使用独立的碰撞检查路径和专用 queue。
-- 事务式写入 raw episode；当前 writer 写 v18，reader 与处理管线支持 v17/v18。
+- VR/键盘遥操作保留机器人自碰撞和静态障碍检查，但桌面不作为动作拒绝条件，以允许
+  近桌面的精细抓取；物理回放和 homing 保留各自的桌面安全验证。
+- XHand 已知可恢复过流不会中止抓取；失败读取不生成伪造的新鲜反馈，恢复后的状态携带
+  累计过流计数，持续数据不可用仍由新鲜度和 watchdog 边界处理。
+- RealSense 相机按设备原生频率连续采集；16 Hz 控制网格只选择最新严格因果帧，
+  不再将相机发布节拍绑定到控制频率。
+- 事务式写入 raw episode；当前 writer 写 v19，reader 与处理管线支持 v17/v18/v19。
 - 将 raw episode 清洗为 processed HDF5 v3，再导出 Policy Zarr v2。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
 - 通过可替换 backend/adapter 运行 joint-action learned policy；仓库包含无模型的
@@ -23,7 +29,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 
 | 目标 | 入口 | 主要实现 |
 |---|---|---|
-| 理解仓库与修改约束 | [`AGENTS.md`](AGENTS.md)、[`code_style.md`](code_style.md) | [`repo_map.md`](repo_map.md) |
+| 理解仓库与修改约束 | [`AGENTS.md`](AGENTS.md)、[`code_style.md`](code_style.md) | [`repo_map.md`](repo_map.md)、[`user_design.md`](user_design.md) |
 | VR 遥操作与采集 | [`examples/collect_teleop.py`](examples/collect_teleop.py) | [`teleop/session.py`](dexmani_real/teleop/session.py)、[`teleop/loop.py`](dexmani_real/teleop/loop.py)、[`teleop/operator_controls.py`](dexmani_real/teleop/operator_controls.py)、[`teleop/control_grid.py`](dexmani_real/teleop/control_grid.py)、[`teleop/action_proposal.py`](dexmani_real/teleop/action_proposal.py) |
 | 键盘遥操作 | [`examples/keyboard_teleop.py`](examples/keyboard_teleop.py) | [`teleop/keyboard_session.py`](dexmani_real/teleop/keyboard_session.py) |
 | 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`robot/replay_trajectory.py`](dexmani_real/robot/replay_trajectory.py)、[`robot/episode_replay.py`](dexmani_real/robot/episode_replay.py)、[`robot/replay_controller.py`](dexmani_real/robot/replay_controller.py)、[`robot/replay_evaluation.py`](dexmani_real/robot/replay_evaluation.py) |
@@ -83,8 +89,11 @@ RealSense / Quest-HTS / xArm7 / XHand
   BEGIN/pause/home/quit 与录制决策，[`teleop/control_grid.py`](dexmani_real/teleop/control_grid.py)
   完成单个 causal tick 的读取、proposal、校验、发布和采样。pause、VR/hand feedback
   异常、BEGIN audio gate 或录制终结进入 command-quiescence；恢复前必须重新锚定，期间不发布命令。
-- RecorderIO 从 fixed-size shared-memory record 解码为不可变、拥有自身数组副本的
-  `EpisodeFrame`，并拥有 episode transaction、camera sidecar、验证和有界 finalize；其中
+- RecorderIO 从 fixed-size shared-memory record 按逻辑 sequence 严格、连续地取得所有权；
+  它只复制尚未确认的 slot，缺失或超出环容量时丢弃 active episode，绝不跳过样本。随后它将
+  record 解码为不可变、拥有自身数组副本的 `EpisodeFrame`，并拥有 episode transaction、
+  camera sidecar、验证和有界 finalize。其轮询是非执行器的服务循环，健康性以 sample backlog
+  和 sequence 连续性为准，而不是忙等的轮询相位。其中
   [`recording/episode_data_writer.py`](dexmani_real/recording/episode_data_writer.py) 是单个
   `data.h5` handle、dataset append 与 offset 的唯一 owner。两者都不拥有机器人命令或
   episode 的开始/停止决策。
@@ -192,7 +201,9 @@ dataset/<task>.zarr/
 └── meta/episode_ends
 ```
 
-正式 raw writer 写 schema v18；reader、replay、visualizer 和离线处理支持 v17/v18。
+正式 raw writer 写 schema v19；reader、replay、visualizer 和离线处理支持 v17/v18/v19。
+v19 将 RealSense 的 SDK 返回、对齐完成、共享内存发布三段时间区分记录，并保存 SDK
+timestamp domain；旧的 `camera_capture_monotonic_s` 与 `camera_backlog_s` 保留其历史含义。
 更早的 flat HDF5 或 pre-v17 数据需要在运行时之外显式迁移。离线处理默认保守：
 硬无效行可被移除，时序异常先审计；压紧后产生危险动作跳变时默认拒绝该轨迹。
 
