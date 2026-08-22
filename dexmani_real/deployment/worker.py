@@ -43,11 +43,16 @@ from dexmani_real.deployment.metrics import (
 from dexmani_real.deployment.observation import (
     FrameWindow,
     ObservationBatch,
+    PointCloudFrame,
     parse_observation_fields,
 )
 from dexmani_real.shm.shared_storage import SharedStorage, new_frame
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.schema import MAX_POLICY_CHUNK_STEPS, POLICY_PLAN_DTYPE
+from dexmani_real.utils.schema import (
+    MAX_POLICY_CHUNK_STEPS,
+    POLICY_PLAN_DTYPE,
+    validate_point_cloud_array,
+)
 
 logger = get_logger(__name__)
 
@@ -80,7 +85,9 @@ def _load(
     try:
         module = importlib.import_module(module_name)
     except Exception as exc:  # noqa: BLE001 - fail closed on any import error
-        raise ImportError(f"failed to import {kind} module {module_name!r}: {exc}") from exc
+        raise ImportError(
+            f"failed to import {kind} module {module_name!r}: {exc}"
+        ) from exc
 
     factory = getattr(module, symbol, None)
     if factory is None:
@@ -95,7 +102,9 @@ def _load(
     return instance
 
 
-def load_backend(target: str, *, config: DeploymentConfig | None = None) -> PolicyBackend:
+def load_backend(
+    target: str, *, config: DeploymentConfig | None = None
+) -> PolicyBackend:
     """Load a :class:`PolicyBackend` from ``module:symbol``."""
     return _load(target, PolicyBackend, "backend", config)
 
@@ -133,15 +142,23 @@ def publish_plan(
 
     n = int(chunk.arm_qpos.shape[0])
     if n <= 0 or n > MAX_POLICY_CHUNK_STEPS:
-        raise ValueError(f"policy chunk has {n} steps; transport capacity is {MAX_POLICY_CHUNK_STEPS}")
+        raise ValueError(
+            f"policy chunk has {n} steps; transport capacity is {MAX_POLICY_CHUNK_STEPS}"
+        )
 
     frame = new_frame(POLICY_PLAN_DTYPE)
     frame["plan_id"][0] = np.uint64(plan_id)
     frame["run_generation"][0] = np.uint64(context.run_generation)
     frame["observation_id"][0] = np.uint64(context.observation_id)
-    frame["observation_anchor_monotonic_ns"][0] = np.uint64(context.observation_anchor_monotonic_ns)
-    frame["inference_started_monotonic_ns"][0] = np.uint64(context.inference_started_monotonic_ns)
-    frame["inference_finished_monotonic_ns"][0] = np.uint64(context.inference_finished_monotonic_ns)
+    frame["observation_anchor_monotonic_ns"][0] = np.uint64(
+        context.observation_anchor_monotonic_ns
+    )
+    frame["inference_started_monotonic_ns"][0] = np.uint64(
+        context.inference_started_monotonic_ns
+    )
+    frame["inference_finished_monotonic_ns"][0] = np.uint64(
+        context.inference_finished_monotonic_ns
+    )
     frame["num_steps"][0] = np.uint32(n)
     frame["arm_present"][0] = 1
     frame["hand_present"][0] = 1 if chunk.hand_qpos is not None else 0
@@ -175,12 +192,16 @@ def _read_state_history(
     publishes: list[int] = []
     for data, ring_publish_ns, sequence in history:
         names = data.dtype.names or ()
-        if any(field not in names or not bool(data[field][0]) for field in required_true_fields):
+        if any(
+            field not in names or not bool(data[field][0])
+            for field in required_true_fields
+        ):
             continue
         source_ns = int(data["source_monotonic_ns"][0])
         publish_ns = (
             int(data["publish_monotonic_ns"][0])
-            if "publish_monotonic_ns" in names and int(data["publish_monotonic_ns"][0]) > 0
+            if "publish_monotonic_ns" in names
+            and int(data["publish_monotonic_ns"][0]) > 0
             else int(ring_publish_ns)
         )
         if not (0 < source_ns <= publish_ns <= anchor_ns):
@@ -200,6 +221,57 @@ def _read_state_history(
         publish_monotonic_ns=np.asarray(publishes, dtype=np.uint64),
         valid_mask=np.ones(t, dtype=np.uint8),
     )
+
+
+def _read_pointcloud_frame(
+    shared: SharedStorage,
+    *,
+    anchor_ns: int,
+    max_age_ns: int,
+    num_points: int,
+) -> PointCloudFrame | None:
+    """Read the latest causally published, fresh ``float32[N,6]`` cloud."""
+    try:
+        result = shared.pointcloud_ring.read_latest()
+    except Exception:
+        logger.warning("inference: point-cloud read failed", exc_info=True)
+        return None
+    if result is None:
+        return None
+    data, ring_publish_ns, _ring_sequence = result
+    record = data[0]
+    source_ns = int(record["source_monotonic_ns"])
+    camera_publish_ns = int(record["camera_publish_monotonic_ns"])
+    payload_publish_ns = int(record["publish_monotonic_ns"])
+    camera_sequence = int(record["source_camera_sequence"])
+    camera_generation = int(record["camera_generation"])
+    if not (
+        camera_sequence > 0
+        and camera_generation > 0
+        and 0
+        < source_ns
+        <= camera_publish_ns
+        <= payload_publish_ns
+        <= int(ring_publish_ns)
+        <= anchor_ns
+        and anchor_ns - source_ns <= max_age_ns
+    ):
+        return None
+    try:
+        cloud = validate_point_cloud_array(
+            record["point_cloud"],
+            num_points=num_points,
+        )
+        return PointCloudFrame(
+            values=cloud,
+            source_camera_sequence=camera_sequence,
+            source_monotonic_ns=source_ns,
+            publish_monotonic_ns=int(ring_publish_ns),
+            camera_generation=camera_generation,
+        )
+    except ValueError:
+        logger.warning("inference: invalid point-cloud payload dropped", exc_info=True)
+        return None
 
 
 def _build_observation(
@@ -228,8 +300,11 @@ def _build_observation(
     hand_current_history: FrameWindow | None = None
     hand_tactile_sum_history: FrameWindow | None = None
     tactile_history: FrameWindow | None = None
+    pointcloud: PointCloudFrame | None = None
     requested = set(
-        parse_observation_fields(getattr(config, "observation_fields", "arm_qpos,hand_qpos"))
+        parse_observation_fields(
+            getattr(config, "observation_fields", "arm_qpos,hand_qpos")
+        )
     )
     hand_state_requested = bool(
         requested
@@ -243,6 +318,13 @@ def _build_observation(
         }
     )
     tactile_requested = bool(requested & {"hand_tactile_force", "xhand_tactile"})
+    if "point_cloud" in requested:
+        pointcloud = _read_pointcloud_frame(
+            shared,
+            anchor_ns=anchor_ns,
+            max_age_ns=int(config.max_observation_age_s * 1e9),
+            num_points=int(config.pointcloud_num_points),
+        )
     if config.hand_enabled:
         if hand_state_requested:
             hand_history = _read_state_history(
@@ -266,7 +348,11 @@ def _build_observation(
                     horizon=horizon,
                     anchor_ns=anchor_ns,
                     values_field="tactile_sum",
-                    required_true_fields=("state_valid", "read_healthy", "tactile_sum_valid"),
+                    required_true_fields=(
+                        "state_valid",
+                        "read_healthy",
+                        "tactile_sum_valid",
+                    ),
                 )
         if tactile_requested:
             tactile_history = _read_state_history(
@@ -285,6 +371,7 @@ def _build_observation(
         hand_current_history=hand_current_history,
         hand_tactile_sum_history=hand_tactile_sum_history,
         tactile_history=tactile_history,
+        pointcloud=pointcloud,
     )
 
 
@@ -305,7 +392,9 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
     metrics = Metrics()
 
     backend = load_backend(config.backend_target, config=config)
-    observation_adapter = load_observation_adapter(config.observation_adapter_target, config=config)
+    observation_adapter = load_observation_adapter(
+        config.observation_adapter_target, config=config
+    )
     action_adapter = load_action_adapter(config.action_adapter_target, config=config)
 
     backend.load()  # raises -> process failure (no dummy safe mode)
@@ -317,6 +406,7 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
 
     step_dt_ns = int(round(1e9 / float(shared.action_control_hz)))
     period_s = 1.0 / float(config.inference_hz)
+    requested = set(parse_observation_fields(config.observation_fields))
 
     plan_id = 0
     observation_id = 0
@@ -347,6 +437,9 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
                 time.sleep(_NO_FEEDBACK_POLL_S)
                 continue  # no causal arm feedback yet — never publish garbage
             if config.hand_enabled and observation.hand_history is None:
+                time.sleep(_NO_FEEDBACK_POLL_S)
+                continue
+            if "point_cloud" in requested and observation.pointcloud is None:
                 time.sleep(_NO_FEEDBACK_POLL_S)
                 continue
             metrics.increment(OBSERVATIONS_BUILT)
@@ -380,7 +473,9 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
                 metrics.increment(PLANS_CREATED)
             else:
                 metrics.increment(PLANS_GENERATION_DROPPED)
-                logger.debug("inference: plan %d dropped (generation advanced)", plan_id)
+                logger.debug(
+                    "inference: plan %d dropped (generation advanced)", plan_id
+                )
 
             last_metrics_flush_ns = flush_every(
                 metrics, last_ns=last_metrics_flush_ns, prefix="inference metrics"

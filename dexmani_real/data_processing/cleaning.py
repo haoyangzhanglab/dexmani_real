@@ -231,7 +231,6 @@ def analyze_episode(
     annotation: EpisodeAnnotation | None = None,
     *,
     depth_valid_mask: np.ndarray | None = None,
-    pointcloud_valid_mask: np.ndarray | None = None,
     source_already_validated: bool = False,
 ) -> EpisodeDecision:
     """Return a deterministic compact-row decision without writing output."""
@@ -386,30 +385,15 @@ def analyze_episode(
             & (arrays["camera_health"] == int(CameraHealth.OK))
             & camera_age_valid
         )
-    if config.profile.needs_rgb:
+    if config.profile.needs_rgb or config.profile.needs_pointcloud:
         if depth_valid_mask is None:
-            raise ValueError("RGB profile requires a derived depth_valid_mask")
+            raise ValueError("RGB/pointcloud profile requires a depth_valid_mask")
         depth_valid = np.asarray(depth_valid_mask, dtype=bool)
         if depth_valid.shape != (frame_count,):
             raise ValueError(
                 f"depth_valid_mask must have shape ({frame_count},), got {depth_valid.shape}"
             )
         reason_masks["depth_invalid"] = ~depth_valid
-    if config.profile.needs_pointcloud:
-        arrays["pointcloud_valid_depth_ratio"] = _as_f64(
-            reader, "pointcloud_valid_depth_ratio"
-        )
-        if pointcloud_valid_mask is None:
-            raise ValueError("pointcloud profile requires a derived validity mask")
-        derived_valid = np.asarray(pointcloud_valid_mask, dtype=bool)
-        if derived_valid.shape != (frame_count,):
-            raise ValueError(
-                f"pointcloud_valid_mask must have shape ({frame_count},), got {derived_valid.shape}"
-            )
-        ratio = arrays["pointcloud_valid_depth_ratio"]
-        reason_masks["pointcloud_invalid"] = ~(
-            derived_valid & np.isfinite(ratio) & (ratio > 0.0) & (ratio <= 1.0)
-        )
 
     include_mask = _range_mask(
         frame_count,

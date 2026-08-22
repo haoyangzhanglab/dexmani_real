@@ -172,12 +172,14 @@ def _write_sample_metadata(
     frame["camera_health"][0] = int(cam.get("camera_health", 1))
     frame["camera_fresh"][0] = int(bool(cam.get("camera_fresh", False)))
     camera_integer_fields = {
-        "camera_frame_number": "frame_number",
+        "camera_depth_frame_number": "depth_frame_number",
+        "camera_color_frame_number": "color_frame_number",
         "camera_ring_sequence": "ring_sequence",
         "camera_generation": "camera_generation",
         "camera_wait_return_monotonic_ns": "wait_return_monotonic_ns",
-        "camera_align_done_monotonic_ns": "align_done_monotonic_ns",
-        "camera_timestamp_domain": "timestamp_domain",
+        "camera_payload_ready_monotonic_ns": "payload_ready_monotonic_ns",
+        "camera_depth_timestamp_domain": "depth_timestamp_domain",
+        "camera_color_timestamp_domain": "color_timestamp_domain",
     }
     for field_name, camera_name in camera_integer_fields.items():
         frame[field_name][0] = int(cam.get(camera_name, 0))
@@ -185,8 +187,8 @@ def _write_sample_metadata(
     frame["camera_duplicate"][0] = int(bool(cam.get("duplicate", False)))
     frame["camera_frame_gap"][0] = int(cam.get("frame_gap", 0))
     for name, source_name in (
-        ("camera_device_timestamp_s", "device_timestamp_s"),
-        ("camera_capture_monotonic_s", "capture_monotonic_s"),
+        ("camera_depth_device_timestamp_s", "depth_device_timestamp_s"),
+        ("camera_color_device_timestamp_s", "color_device_timestamp_s"),
         ("camera_age_s", "camera_age_s"),
         ("camera_backlog_s", "backlog_s"),
         ("camera_delivery_delay_above_floor_s", "delivery_delay_above_floor_s"),

@@ -1,4 +1,4 @@
-"""Pure schema-v17/v18/v19 contracts shared by episode writers and readers.
+"""Pure schema-v17/v18/v19/v20 contracts shared by episode writers and readers.
 
 The v17 HDF5 data file has 93 unconditional per-grid datasets; v18 drops three
 retired arm-worker latency fields; v19 adds explicit camera stage timing and
@@ -24,9 +24,9 @@ from dexmani_real.utils.schema import (
     HAND_TACTILE_SUM_SHAPE,
 )
 
-EPISODE_SCHEMA_VERSION = 19
-# Runtime writes v19; readers retain v17/v18 compatibility.
-SUPPORTED_EPISODE_SCHEMA_VERSIONS: frozenset[int] = frozenset({17, 18, 19})
+EPISODE_SCHEMA_VERSION = 20
+# Runtime writes native RGB-D v20; readers retain historical validation.
+SUPPORTED_EPISODE_SCHEMA_VERSIONS: frozenset[int] = frozenset({17, 18, 19, 20})
 ARM_WORKER_TELEMETRY_DATASETS_V17: frozenset[str] = frozenset(
     {
         "arm_last_cmd_queue_latency_s",
@@ -170,6 +170,31 @@ CAMERA_TIMING_DATASET_SPECS_V19: dict[str, DatasetSpec] = {
     "camera_delivery_delay_above_floor_s": _spec(np.float64),
 }
 
+# v20 records native streams without inventing a shared RGB-D pixel geometry.
+# It intentionally replaces the old single-camera timestamp/frame fields.
+BASE_DATASET_SPECS_V20: dict[str, DatasetSpec] = dict(BASE_DATASET_SPECS_V17)
+for _legacy_camera_name in (
+    "camera_frame_number",
+    "camera_device_timestamp_s",
+    "camera_capture_monotonic_s",
+):
+    del BASE_DATASET_SPECS_V20[_legacy_camera_name]
+BASE_DATASET_SPECS_V20.update(
+    {
+        "camera_depth_frame_number": _spec(np.int64),
+        "camera_color_frame_number": _spec(np.int64),
+        "camera_depth_device_timestamp_s": _spec(np.float64),
+        "camera_color_device_timestamp_s": _spec(np.float64),
+    }
+)
+CAMERA_TIMING_DATASET_SPECS_V20: dict[str, DatasetSpec] = {
+    "camera_wait_return_monotonic_ns": _spec(np.int64),
+    "camera_payload_ready_monotonic_ns": _spec(np.int64),
+    "camera_depth_timestamp_domain": _spec(np.int64),
+    "camera_color_timestamp_domain": _spec(np.int64),
+    "camera_delivery_delay_above_floor_s": _spec(np.float64),
+}
+
 ALIGNMENT_DATASET_NAMES_V17 = frozenset(
     {
         "timestamp",
@@ -186,6 +211,11 @@ SOURCE_FRAME_DATASET_NAMES_V17 = (
 )
 SOURCE_FRAME_DATASET_NAMES_V19 = SOURCE_FRAME_DATASET_NAMES_V17 | frozenset(
     CAMERA_TIMING_DATASET_SPECS_V19
+)
+SOURCE_FRAME_DATASET_NAMES_V20 = frozenset(
+    BASE_DATASET_SPECS_V20
+) - ALIGNMENT_DATASET_NAMES_V17 - ARM_WORKER_TELEMETRY_DATASETS_V17 | frozenset(
+    CAMERA_TIMING_DATASET_SPECS_V20
 )
 
 # These values override existing fields; they do not extend the contract.
@@ -229,6 +259,23 @@ SEMANTIC_META_ATTRS_V17: dict[str, str | float | bool] = {
     "camera_align_done_monotonic_ns_semantics": "host_monotonic_after_sdk_alignment",
     "camera_delivery_delay_above_floor_s_semantics": "relative_host_device_delay_above_trailing_lower_envelope_not_sdk_queue_depth",
 }
+SEMANTIC_META_ATTRS_V20: dict[str, str | float | bool] = {
+    **{
+        key: value
+        for key, value in SEMANTIC_META_ATTRS_V17.items()
+        if key
+        not in {
+            "camera_capture_monotonic_s_semantics",
+            "camera_align_done_monotonic_ns_semantics",
+        }
+    },
+    "camera_payload_mode": "native_rgbd",
+    "camera_pair_source_monotonic_ns_semantics": "minimum_of_depth_and_color_mapped_source_times",
+    "camera_wait_return_monotonic_ns_semantics": "host_monotonic_immediately_after_wait_for_frames",
+    "camera_payload_ready_monotonic_ns_semantics": "host_monotonic_after_owned_native_rgb_depth_copies",
+    "camera_depth_device_timestamp_s_semantics": "native_depth_frame_device_timestamp",
+    "camera_color_device_timestamp_s_semantics": "native_color_frame_device_timestamp_or_nan_when_absent",
+}
 
 
 def expected_source_frame_dataset_names_v17(
@@ -236,11 +283,12 @@ def expected_source_frame_dataset_names_v17(
 ) -> frozenset[str]:
     """Return the exact keys accepted from one low-level recorder source frame."""
 
-    source_names = (
-        SOURCE_FRAME_DATASET_NAMES_V19
-        if int(schema_version) >= 19
-        else SOURCE_FRAME_DATASET_NAMES_V17
-    )
+    if int(schema_version) >= 20:
+        source_names = SOURCE_FRAME_DATASET_NAMES_V20
+    elif int(schema_version) >= 19:
+        source_names = SOURCE_FRAME_DATASET_NAMES_V19
+    else:
+        source_names = SOURCE_FRAME_DATASET_NAMES_V17
     if arm_sent_stream:
         return source_names | frozenset({ARM_SENT_DATASET})
     return source_names
@@ -366,13 +414,18 @@ def required_dataset_names(
 ) -> frozenset[str]:
     """Return the datasets a ``data.h5`` of *schema_version* must contain.
 
-    v18 drops the arm-worker telemetry datasets; v19 additionally requires
-    explicit camera-stage timing datasets. v17/v18 remain readable.
+    v18 drops arm-worker telemetry; v19 adds aligned-camera timing; v20
+    replaces aligned camera fields with native per-stream provenance.
     """
     if int(schema_version) <= 17:
         return frozenset(BASE_DATASET_SPECS_V17)
-    names = frozenset(BASE_DATASET_SPECS_V17) - ARM_WORKER_TELEMETRY_DATASETS_V17
-    if int(schema_version) >= 19:
+    base_specs = (
+        BASE_DATASET_SPECS_V20 if int(schema_version) >= 20 else BASE_DATASET_SPECS_V17
+    )
+    names = frozenset(base_specs) - ARM_WORKER_TELEMETRY_DATASETS_V17
+    if int(schema_version) >= 20:
+        names |= frozenset(CAMERA_TIMING_DATASET_SPECS_V20)
+    elif int(schema_version) >= 19:
         names |= frozenset(CAMERA_TIMING_DATASET_SPECS_V19)
     return names
 
@@ -390,8 +443,9 @@ def validate_data_layout_v17(
     Unknown historical diagnostic datasets are accepted, but—like every
     writer-produced data stream—they must have a grid dimension equal to
     ``frame_count``.  Known fields additionally require their exact tail shape
-    and dtype. ``schema_version`` selects the required dataset set (v17 keeps
-    arm-worker telemetry; v19 adds camera timing provenance).
+    and dtype. ``schema_version`` selects the required dataset set: v17 keeps
+    arm-worker telemetry, v19 adds aligned-camera timing, and v20 replaces it
+    with native per-stream provenance.
     """
 
     errors: list[str] = []
@@ -409,8 +463,14 @@ def validate_data_layout_v17(
     elif sent_present and not arm_sent_stream:
         errors.append(f"dataset {ARM_SENT_DATASET!r} requires {ARM_SENT_MARKER}=True")
 
-    known_specs = dict(BASE_DATASET_SPECS_V17)
-    known_specs.update(CAMERA_TIMING_DATASET_SPECS_V19)
+    known_specs = dict(
+        BASE_DATASET_SPECS_V20 if int(schema_version) >= 20 else BASE_DATASET_SPECS_V17
+    )
+    known_specs.update(
+        CAMERA_TIMING_DATASET_SPECS_V20
+        if int(schema_version) >= 20
+        else CAMERA_TIMING_DATASET_SPECS_V19
+    )
     known_specs.update(CONDITIONAL_DATASET_SPECS_V17)
     for name in sorted(names):
         shape = tuple(int(dim) for dim in dataset_shapes[name])
@@ -456,7 +516,9 @@ __all__ = [
     "SUPPORTED_EPISODE_SCHEMA_VERSIONS",
     "required_dataset_names",
     "BASE_DATASET_SPECS_V17",
+    "BASE_DATASET_SPECS_V20",
     "CAMERA_TIMING_DATASET_SPECS_V19",
+    "CAMERA_TIMING_DATASET_SPECS_V20",
     "CONDITIONAL_DATASET_SPECS_V17",
     "RUNTIME_QUALITY_METRIC_NAMES",
     "DIAGNOSTIC_TAIL_SHAPES_V17",
@@ -464,8 +526,10 @@ __all__ = [
     "EPISODE_SCHEMA_VERSION",
     "HAND_RAW_ACTION_VALIDITY_EXPRESSION",
     "SEMANTIC_META_ATTRS_V17",
+    "SEMANTIC_META_ATTRS_V20",
     "SOURCE_FRAME_DATASET_NAMES_V17",
     "SOURCE_FRAME_DATASET_NAMES_V19",
+    "SOURCE_FRAME_DATASET_NAMES_V20",
     "expected_source_frame_dataset_names_v17",
     "compute_episode_quality_metrics",
     "normalize_diagnostics_v17",

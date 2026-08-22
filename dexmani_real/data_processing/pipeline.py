@@ -1,4 +1,4 @@
-"""Transactional one-episode-to-one-HDF5 processing for Real schema v17/v18/v19."""
+"""Transactional raw-v20 to processed-v4 Real episode processing."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ import shutil
 import tempfile
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, cast
 
 import h5py
 import numpy as np
@@ -25,23 +25,23 @@ from dexmani_real.data_processing.contracts import (
 from dexmani_real.data_processing.transforms import (
     resize_camera_intrinsic,
     resize_depth,
-    resize_point_cloud,
     resize_rgb,
 )
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rotmat, rot6d_to_quat_wxyz
 from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.recording.transaction import atomic_publish
-from dexmani_real.sensor.pointcloud_processor import (
-    PointCloudProcessor,
-    PointCloudProcessorConfig,
+from dexmani_real.sensor.camera_geometry import CameraIntrinsics, RGBDGeometry
+from dexmani_real.sensor.pointcloud import (
+    POINT_CLOUD_COLOR_SOURCE,
+    POINT_CLOUD_SAMPLING,
+    build_point_cloud,
 )
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.pointcloud_utils import depth_to_meters, make_rays
 
 logger = get_logger(__name__)
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 3
+PROCESSED_SCHEMA_VERSION = 4
 _SOURCE_MEMBERS = ("data.h5", "depth.h5", "rgb.mp4")
 _VALIDATION_CHUNK_BYTES = 64 * 1024 * 1024
 
@@ -72,18 +72,52 @@ def _validate_transform(transform: np.ndarray, *, label: str) -> np.ndarray:
     return value
 
 
-def _camera_transform_for_index(reader: EpisodeReader, source_index: int) -> np.ndarray:
+def _intrinsics_from_meta(meta: Any, *, stream: str) -> CameraIntrinsics:
+    prefix = f"camera_{stream}"
+    matrix = np.asarray(meta[f"{prefix}_intrinsics"], dtype=np.float64).reshape(3, 3)
+    if not np.allclose(matrix[2], (0.0, 0.0, 1.0), rtol=0.0, atol=1e-9):
+        raise ValueError(f"{prefix}_intrinsics must be a canonical pinhole matrix")
+    coefficients = tuple(float(value) for value in meta[f"{prefix}_distortion_coeffs"])
+    return CameraIntrinsics(
+        width=int(meta[f"{prefix}_width"]),
+        height=int(meta[f"{prefix}_height"]),
+        fx=float(matrix[0, 0]),
+        fy=float(matrix[1, 1]),
+        ppx=float(matrix[0, 2]),
+        ppy=float(matrix[1, 2]),
+        distortion_model=str(meta[f"{prefix}_distortion_model"]),
+        distortion_coeffs=cast(tuple[float, float, float, float, float], coefficients),
+    )
+
+
+def _geometry_from_reader(reader: EpisodeReader) -> RGBDGeometry:
+    if reader.schema_version != 20:
+        raise ValueError(
+            f"processed v4 requires native raw schema v20, got v{reader.schema_version}"
+        )
+    meta = reader.h5f["meta"].attrs
+    return RGBDGeometry(
+        depth=_intrinsics_from_meta(meta, stream="depth"),
+        color=_intrinsics_from_meta(meta, stream="color"),
+        T_color_from_depth=np.asarray(
+            meta["camera_T_color_from_depth"], dtype=np.float64
+        ).reshape(4, 4),
+    )
+
+
+def _depth_transform_for_index(reader: EpisodeReader, source_index: int) -> np.ndarray:
     meta = reader.h5f["meta"].attrs
     camera_type = str(meta.get("camera_type", ""))
     if camera_type == "eye_to_hand":
         return _validate_transform(
-            np.asarray(meta["camera_T_world_camera"]),
-            label="camera_T_world_camera",
+            np.asarray(meta["camera_T_xarm_base_from_depth"]),
+            label="camera_T_xarm_base_from_depth",
         )
     if camera_type != "eye_in_hand":
         raise ValueError(f"unsupported camera_type {camera_type!r}")
-    t_eef_camera = _validate_transform(
-        np.asarray(meta["camera_T_eef_camera"]), label="camera_T_eef_camera"
+    t_eef_from_depth = _validate_transform(
+        np.asarray(meta["camera_T_eef_from_depth"]),
+        label="camera_T_eef_from_depth",
     )
     arm_ee = np.asarray(reader.h5f["arm_ee"][source_index], dtype=np.float64)
     if arm_ee.shape != (9,) or not np.all(np.isfinite(arm_ee)):
@@ -91,7 +125,22 @@ def _camera_transform_for_index(reader: EpisodeReader, source_index: int) -> np.
     t_base_eef = np.eye(4, dtype=np.float64)
     t_base_eef[:3, :3] = quat_wxyz_to_rotmat(rot6d_to_quat_wxyz(arm_ee[3:]))
     t_base_eef[:3, 3] = arm_ee[:3]
-    return _validate_transform(t_base_eef @ t_eef_camera, label="T_xarm_base_camera")
+    return _validate_transform(
+        t_base_eef @ t_eef_from_depth,
+        label="T_xarm_base_from_depth",
+    )
+
+
+def _color_transform_for_index(
+    reader: EpisodeReader,
+    source_index: int,
+    geometry: RGBDGeometry,
+) -> np.ndarray:
+    depth_from_color = np.linalg.inv(geometry.T_color_from_depth)
+    return _validate_transform(
+        _depth_transform_for_index(reader, source_index) @ depth_from_color,
+        label="T_xarm_base_from_color",
+    )
 
 
 @dataclass
@@ -99,78 +148,44 @@ class _PointCloudDeriver:
     """Resolved deterministic point-cloud state for one source."""
 
     reader: EpisodeReader
-    processor_config: PointCloudProcessorConfig
-    rays: np.ndarray
+    geometry: RGBDGeometry
     depth_scale: float
-    target_point_count: int
-    static_processor: PointCloudProcessor | None
+    config: ProcessingConfig
+    static_base_from_depth: np.ndarray | None
 
     @classmethod
     def from_reader(
         cls, reader: EpisodeReader, config: ProcessingConfig
     ) -> _PointCloudDeriver:
         meta = reader.h5f["meta"].attrs
-        source_height = int(meta["camera_encoding_height"])
-        source_width = int(meta["camera_encoding_width"])
-        if source_height <= 0 or source_width <= 0:
-            raise ValueError("camera encoding dimensions must be positive")
-        source_k = np.asarray(meta["camera_K"], dtype=np.float64).reshape(3, 3)
-        if not np.all(np.isfinite(source_k)) or not np.allclose(
-            source_k[2], (0.0, 0.0, 1.0), rtol=0.0, atol=1e-9
-        ):
-            raise ValueError("camera_K must be a finite canonical pinhole matrix")
-        raw_pc_meta = meta.get("camera_pointcloud_config_json", "")
-        if isinstance(raw_pc_meta, bytes):
-            raw_pc_meta = raw_pc_meta.decode("utf-8")
-        try:
-            pc_meta = json.loads(str(raw_pc_meta))
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise ValueError(
-                "camera_pointcloud_config_json must be valid JSON"
-            ) from exc
-        if not isinstance(pc_meta, dict):
-            raise ValueError("camera_pointcloud_config_json must encode an object")
-        optional_keys = {"pc_desk_plane", "pc_desk_clearance_m"}
-        required_keys = {
-            f"pc_{item.name}" for item in fields(PointCloudProcessorConfig)
-        } - optional_keys
-        missing_keys = sorted(required_keys - set(pc_meta))
-        if missing_keys:
-            raise ValueError(f"point-cloud metadata missing keys: {missing_keys}")
-        processor_config = PointCloudProcessorConfig.from_meta_dict(pc_meta)
+        geometry = _geometry_from_reader(reader)
         depth_scale = float(meta["depth_scale"])
         if not np.isfinite(depth_scale) or depth_scale <= 0.0:
             raise ValueError("depth_scale must be finite and positive")
-        static_processor = None
+        static_base_from_depth = None
         if str(meta.get("camera_type", "")) == "eye_to_hand":
-            static_processor = PointCloudProcessor(
-                _camera_transform_for_index(reader, 0), processor_config
-            )
+            static_base_from_depth = _depth_transform_for_index(reader, 0)
         return cls(
             reader=reader,
-            processor_config=processor_config,
-            rays=make_rays(source_height, source_width, source_k).numpy(),
+            geometry=geometry,
             depth_scale=depth_scale,
-            target_point_count=config.target_point_count,
-            static_processor=static_processor,
+            config=config,
+            static_base_from_depth=static_base_from_depth,
         )
 
     def derive(self, source_index: int, rgb: np.ndarray) -> np.ndarray | None:
-        depth_m = depth_to_meters(
-            np.asarray(self.reader.h5f["depth"][source_index], dtype=np.uint16),
-            depth_scale=self.depth_scale,
-        )
-        processor = self.static_processor or PointCloudProcessor(
-            _camera_transform_for_index(self.reader, source_index),
-            self.processor_config,
-        )
-        cloud = processor.process(depth_m, rgb, self.rays)
-        if cloud is None:
-            return None
-        return resize_point_cloud(
-            cloud,
-            source_point_count=int(processor.last_source_point_count),
-            target_point_count=self.target_point_count,
+        depth_raw = np.asarray(self.reader.h5f["depth"][source_index], dtype=np.uint16)
+        base_from_depth = self.static_base_from_depth
+        if base_from_depth is None:
+            base_from_depth = _depth_transform_for_index(self.reader, source_index)
+        return build_point_cloud(
+            depth_raw=depth_raw,
+            color=np.asarray(rgb, dtype=np.uint8),
+            depth_scale_m=self.depth_scale,
+            geometry=self.geometry,
+            T_xarm_base_from_depth=base_from_depth,
+            table_plane_abcd=self.config.table_plane_abcd,
+            config=self.config.pointcloud,
         )
 
 
@@ -183,36 +198,6 @@ def _derive_depth_valid_mask(reader: EpisodeReader) -> np.ndarray:
     for index in range(frame_count):
         frame = np.asarray(depth[index], dtype=np.uint16)
         valid[index] = frame.ndim == 2 and bool(np.any(frame > 0))
-    return valid
-
-
-def _derive_pointcloud_valid_mask(
-    reader: EpisodeReader, config: ProcessingConfig
-) -> np.ndarray:
-    frame_count = int(reader.h5f["meta"].attrs["num_frames"])
-    valid = np.zeros(frame_count, dtype=bool)
-    deriver = _PointCloudDeriver.from_reader(reader, config)
-    decoded_count = 0
-    logged_value_error = False
-    for source_index, rgb in enumerate(reader.iter_camera_frames("rgb")):
-        if source_index >= frame_count:
-            raise ValueError("decoded RGB frame count exceeds source grid")
-        decoded_count += 1
-        try:
-            valid[source_index] = deriver.derive(source_index, rgb) is not None
-        except ValueError:
-            if not logged_value_error:
-                logger.warning(
-                    "point-cloud preflight rejected malformed frame %d in %s",
-                    source_index,
-                    reader.h5_path,
-                    exc_info=True,
-                )
-                logged_value_error = True
-    if decoded_count != frame_count:
-        raise ValueError(
-            f"decoded RGB frame count {decoded_count} != source grid {frame_count}"
-        )
     return valid
 
 
@@ -357,9 +342,9 @@ def _create_data_datasets(
         )
     if config.profile.needs_pointcloud:
         specs["point_cloud"] = (
-            (length, config.target_point_count, 6),
+            (length, config.pointcloud.num_points, 6),
             np.float32,
-            (1, config.target_point_count, 6),
+            (1, config.pointcloud.num_points, 6),
         )
     for name in config.profile.dataset_keys:
         shape, dtype, chunks = specs[name]
@@ -407,7 +392,7 @@ def _write_attrs(
             "fingertip_points_unit": "m",
             "action_ee_frame": "xarm_base",
             "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
-            "contact_force_source": "schema_v17.hand_contact",
+            "contact_force_source": "raw_v20.hand_contact",
             "contact_force_unit": str(
                 meta.get("tactile_unit", "sdk_scaled_unknown_si")
             ),
@@ -434,16 +419,51 @@ def _write_attrs(
         output.attrs.update(
             {
                 "rgb_transform": "resize_no_crop",
-                "depth_transform": "resize_no_crop_nearest",
+                "depth_transform": (
+                    "native_depth_resize_no_crop_nearest;not_registered_to_rgb"
+                ),
                 "depth_unit": "sensor_unit",
                 "depth_scale_m_per_unit": float(meta["depth_scale"]),
                 "depth_invalid_value": 0,
-                "camera_extrinsic_semantics": "T_xarm_base_camera;camera_optical_to_xarm_base",
+                "camera_intrinsic_semantics": (
+                    "resized_native_color_pinhole_intrinsics"
+                ),
+                "camera_extrinsic_semantics": (
+                    "T_xarm_base_from_color;native_color_optical_to_xarm_base"
+                ),
+                "camera_depth_intrinsics_native": np.asarray(
+                    meta["camera_depth_intrinsics"], dtype=np.float64
+                ),
+                "camera_depth_distortion_model": str(
+                    meta["camera_depth_distortion_model"]
+                ),
+                "camera_depth_distortion_coeffs": np.asarray(
+                    meta["camera_depth_distortion_coeffs"], dtype=np.float64
+                ),
+                "camera_color_distortion_model": str(
+                    meta["camera_color_distortion_model"]
+                ),
+                "camera_color_distortion_coeffs": np.asarray(
+                    meta["camera_color_distortion_coeffs"], dtype=np.float64
+                ),
+                "camera_T_color_from_depth": np.asarray(
+                    meta["camera_T_color_from_depth"], dtype=np.float64
+                ),
             }
         )
     if config.profile.needs_pointcloud:
-        output.attrs["point_cloud_transform"] = (
-            "real_rgbd_to_xarm_base_then_deterministic_fps_or_cyclic_pad"
+        output.attrs.update(
+            {
+                "point_cloud_shape": np.asarray(
+                    (config.pointcloud.num_points, 6), dtype=np.int64
+                ),
+                "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
+                "point_cloud_sampling": POINT_CLOUD_SAMPLING,
+                "point_cloud_transform": (
+                    "native_depth_to_xarm_base;table_workspace_crop;"
+                    "voxel_representative;color_projection;uniform_or_cyclic_pad"
+                ),
+            }
         )
 
 
@@ -514,18 +534,20 @@ def _write_processed_episode(
 
         if config.profile.needs_rgb:
             meta = reader.h5f["meta"].attrs
-            source_height = int(meta["camera_encoding_height"])
-            source_width = int(meta["camera_encoding_width"])
+            geometry = _geometry_from_reader(reader)
             camera_k = resize_camera_intrinsic(
-                np.asarray(meta["camera_K"]),
-                source_height=source_height,
-                source_width=source_width,
+                geometry.color.matrix(),
+                source_height=geometry.color.height,
+                source_width=geometry.color.width,
                 target_height=config.target_rgb_height,
                 target_width=config.target_rgb_width,
             )
             output["camera_intrinsic"][:] = camera_k[None, :]
             output["camera_extrinsic"][:] = np.stack(
-                [_camera_transform_for_index(reader, int(index)) for index in selected]
+                [
+                    _color_transform_for_index(reader, int(index), geometry)
+                    for index in selected
+                ]
             ).astype(np.float32)
             for target_index, source_index in enumerate(selected):
                 depth = np.asarray(reader.h5f["depth"][source_index], dtype=np.uint16)
@@ -618,7 +640,7 @@ def _expected_specs(
         )
     if config.profile.needs_pointcloud:
         specs["point_cloud"] = (
-            (length, config.target_point_count, 6),
+            (length, config.pointcloud.num_points, 6),
             np.dtype(np.float32),
         )
     return specs
@@ -627,13 +649,13 @@ def _expected_specs(
 def validate_processed_hdf5(
     path: str | Path, config: ProcessingConfig
 ) -> dict[str, Any]:
-    """Fail closed on a processed Real HDF5 v3 artifact."""
+    """Fail closed on a processed Real HDF5 v4 artifact."""
 
     artifact = Path(path)
     with h5py.File(artifact, "r") as source:
         expected_top = set(config.profile.dataset_keys) | {"provenance"}
         if set(source.keys()) != expected_top:
-            raise ValueError(f"{artifact.name}: top-level keys do not match v3 profile")
+            raise ValueError(f"{artifact.name}: top-level keys do not match v4 profile")
         length = int(source.attrs.get("episode_steps", -1))
         if length < config.min_episode_frames:
             raise ValueError(f"{artifact.name}: episode_steps={length} is too short")
@@ -670,6 +692,29 @@ def validate_processed_hdf5(
             scale = float(source.attrs.get("depth_scale_m_per_unit", np.nan))
             if not np.isfinite(scale) or scale <= 0.0:
                 raise ValueError(f"{artifact.name}: invalid depth scale")
+            if (
+                str(source.attrs.get("camera_intrinsic_semantics", ""))
+                != "resized_native_color_pinhole_intrinsics"
+                or str(source.attrs.get("camera_extrinsic_semantics", ""))
+                != "T_xarm_base_from_color;native_color_optical_to_xarm_base"
+                or str(source.attrs.get("depth_transform", ""))
+                != "native_depth_resize_no_crop_nearest;not_registered_to_rgb"
+            ):
+                raise ValueError(f"{artifact.name}: invalid native RGB-D semantics")
+            depth_k = np.asarray(
+                source.attrs.get("camera_depth_intrinsics_native", ()),
+                dtype=np.float64,
+            )
+            color_from_depth = np.asarray(
+                source.attrs.get("camera_T_color_from_depth", ()),
+                dtype=np.float64,
+            )
+            if depth_k.shape != (9,) or not np.all(np.isfinite(depth_k)):
+                raise ValueError(f"{artifact.name}: invalid native depth intrinsics")
+            _validate_transform(
+                color_from_depth,
+                label="camera_T_color_from_depth",
+            )
         if config.profile.needs_pointcloud:
             for row_slice in _dataset_row_slices(source["point_cloud"]):
                 cloud = np.asarray(source["point_cloud"][row_slice], dtype=np.float32)
@@ -679,6 +724,18 @@ def validate_processed_hdf5(
                     ~np.any(np.linalg.norm(cloud[..., :3], axis=2) > 0.0, axis=1)
                 ):
                     raise ValueError(f"{artifact.name}: all-zero point-cloud frame")
+            if (
+                not np.array_equal(
+                    np.asarray(source.attrs.get("point_cloud_shape", ())),
+                    np.asarray((config.pointcloud.num_points, 6)),
+                )
+                or str(source.attrs.get("point_cloud_frame", "")) != "xarm_base"
+                or str(source.attrs.get("point_cloud_color_source", ""))
+                != POINT_CLOUD_COLOR_SOURCE
+                or str(source.attrs.get("point_cloud_sampling", ""))
+                != POINT_CLOUD_SAMPLING
+            ):
+                raise ValueError(f"{artifact.name}: invalid v4 point-cloud semantics")
         if str(source.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
             raise ValueError(f"{artifact.name}: invalid schema_name")
         if int(source.attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
@@ -805,6 +862,11 @@ def process_episode_root(
         try:
             with _open_episode(episode) as reader:
                 reader.require_valid(purpose="offline processing")
+                if reader.schema_version != 20:
+                    raise ValueError(
+                        "processed v4 accepts native raw schema v20 only; "
+                        f"got v{reader.schema_version}"
+                    )
                 decisions.append(
                     analyze_episode(
                         reader,
@@ -812,12 +874,11 @@ def process_episode_root(
                         annotation,
                         depth_valid_mask=(
                             _derive_depth_valid_mask(reader)
-                            if config.profile.needs_rgb and annotation.include
-                            else None
-                        ),
-                        pointcloud_valid_mask=(
-                            _derive_pointcloud_valid_mask(reader, config)
-                            if config.profile.needs_pointcloud and annotation.include
+                            if (
+                                config.profile.needs_rgb
+                                or config.profile.needs_pointcloud
+                            )
+                            and annotation.include
                             else None
                         ),
                         source_already_validated=True,

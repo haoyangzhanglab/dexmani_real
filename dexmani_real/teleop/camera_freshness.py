@@ -39,12 +39,12 @@ class CameraFreshnessTracker:
         fresh = False
         if frame is not None:
             sequence = int(frame.get("ring_sequence", 0))
-            frame_number = int(frame.get("frame_number", 0))
+            frame_number = int(frame.get("depth_frame_number", 0))
             source_ns = int(frame.get("source_monotonic_ns", 0))
             source_s = (
                 source_ns / 1e9
                 if source_ns > 0
-                else float(frame.get("capture_monotonic_s", np.nan))
+                else float(frame.get("payload_ready_monotonic_ns", 0)) / 1e9
             )
             age_s = max(0.0, now - source_s) if np.isfinite(source_s) else float("inf")
             is_new = (

@@ -19,6 +19,9 @@ from typing import Any
 
 import yaml
 
+from dexmani_real.deployment.observation import parse_observation_fields
+from dexmani_real.utils.schema import SUPPORTED_POINT_CLOUD_COUNTS
+
 _POSITIVE_FLOAT_FIELDS = (
     "inference_hz",
     "max_observation_age_s",
@@ -54,6 +57,7 @@ class DeploymentConfig:
     hand_enabled: bool = False
     # Comma-separated observation keys; the default preserves the joint-only contract.
     observation_fields: str = "arm_qpos,hand_qpos"
+    pointcloud_num_points: int = 1024
 
     def __post_init__(self) -> None:
         if self.observation_horizon <= 0:
@@ -62,9 +66,15 @@ class DeploymentConfig:
             value = getattr(self, name)
             if not math.isfinite(float(value)) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
-        from dexmani_real.deployment.observation import parse_observation_fields
-
         parse_observation_fields(self.observation_fields)
+        if (
+            isinstance(self.pointcloud_num_points, bool)
+            or self.pointcloud_num_points not in SUPPORTED_POINT_CLOUD_COUNTS
+        ):
+            raise ValueError(
+                "pointcloud_num_points must be one of "
+                f"{sorted(SUPPORTED_POINT_CLOUD_COUNTS)}"
+            )
 
 
 DEFAULT_DEPLOYMENT_CONFIG = DeploymentConfig()
@@ -74,7 +84,9 @@ def _coerce_value(template: Any, raw: Any, path: str) -> Any:
     """Coerce one override to the template field's scalar type."""
     if template is None:
         if raw is not None and not isinstance(raw, str):
-            raise TypeError(f"deployment config field {path!r} must be a string or null")
+            raise TypeError(
+                f"deployment config field {path!r} must be a string or null"
+            )
         return raw
     if isinstance(template, bool):
         if not isinstance(raw, bool):
@@ -85,14 +97,20 @@ def _coerce_value(template: Any, raw: Any, path: str) -> Any:
             raise TypeError(f"deployment config field {path!r} must be an integer")
         return int(raw)
     if isinstance(template, float):
-        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(float(raw)):
+        if (
+            isinstance(raw, bool)
+            or not isinstance(raw, (int, float))
+            or not math.isfinite(float(raw))
+        ):
             raise TypeError(f"deployment config field {path!r} must be a finite number")
         return float(raw)
     if isinstance(template, str):
         if not isinstance(raw, str):
             raise TypeError(f"deployment config field {path!r} must be a string")
         return raw
-    raise TypeError(f"unsupported deployment config field type {type(template).__name__}")
+    raise TypeError(
+        f"unsupported deployment config field type {type(template).__name__}"
+    )
 
 
 def _merge(base: DeploymentConfig, overrides: Mapping[str, Any]) -> dict[str, Any]:
@@ -157,7 +175,11 @@ def resolve_deployment_config(
 
     merged = _merge(DEFAULT_DEPLOYMENT_CONFIG, file_overrides)
     # Unset CLI values do not override file or data defaults.
-    cli = {str(key): value for key, value in (cli_overrides or {}).items() if value is not None}
+    cli = {
+        str(key): value
+        for key, value in (cli_overrides or {}).items()
+        if value is not None
+    }
     merged = _merge(DeploymentConfig(**merged), cli)
 
     config = DeploymentConfig(**merged)
@@ -169,7 +191,9 @@ def resolve_deployment_config(
         if not getattr(config, target_name).strip():
             raise ValueError(f"deployment {target_name} must be provided")
 
-    canonical = {field.name: getattr(config, field.name) for field in fields(DeploymentConfig)}
+    canonical = {
+        field.name: getattr(config, field.name) for field in fields(DeploymentConfig)
+    }
     canonical_json = json.dumps(
         canonical,
         sort_keys=True,
@@ -178,4 +202,6 @@ def resolve_deployment_config(
         allow_nan=False,
     )
     digest = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
-    return ResolvedDeploymentConfig(deployment=config, canonical_json=canonical_json, sha256=digest)
+    return ResolvedDeploymentConfig(
+        deployment=config, canonical_json=canonical_json, sha256=digest
+    )

@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.utils.schema import validate_point_cloud_array
 
 POLICY_OBSERVATION_FIELDS = frozenset(
     {
@@ -24,6 +25,7 @@ POLICY_OBSERVATION_FIELDS = frozenset(
         "hand_joint_torque",
         "fingertip_force",
         "xhand_tactile",
+        "point_cloud",
     }
 )
 
@@ -82,11 +84,15 @@ class FrameWindow:
 
     def __post_init__(self) -> None:
         values = _freeze(self.values, name="FrameWindow.values")
+        if values is None:
+            raise ValueError("FrameWindow.values must not be None")
         if values.ndim < 2:
             raise ValueError("FrameWindow.values must be [T, ...]")
         t = values.shape[0]
         for name in ("source_sequence", "source_monotonic_ns", "publish_monotonic_ns"):
-            arr = _freeze(getattr(self, name), name=f"FrameWindow.{name}", dtype=np.uint64)
+            arr = _freeze(
+                getattr(self, name), name=f"FrameWindow.{name}", dtype=np.uint64
+            )
             if arr is None or arr.shape != (t,):
                 raise ValueError(f"FrameWindow.{name} must be a ({t},) uint64 array")
             object.__setattr__(self, name, arr)
@@ -100,55 +106,57 @@ class FrameWindow:
 
 
 @dataclass(frozen=True)
-class CameraWindow:
-    """Oldest-first camera frame window (rgb/depth/pointcloud) + metadata.
+class PointCloudFrame:
+    """One fixed-size xArm-base point cloud and its causal provenance."""
 
-    Camera frames add a ``receive_monotonic_ns`` layer between source and
-    publish (``source <= receive <= publish``). Sub-modality arrays share the
-    leading ``T`` axis; at least one sub-modality must be present.
-    """
-
-    rgb: np.ndarray | None = None  # [T, H, W, 3] uint8
-    depth: np.ndarray | None = None  # [T, H, W] uint16
-    pointcloud: np.ndarray | None = None  # [T, N, 3] float32
-    source_sequence: np.ndarray | None = None
-    source_monotonic_ns: np.ndarray | None = None
-    receive_monotonic_ns: np.ndarray | None = None
-    publish_monotonic_ns: np.ndarray | None = None
-    valid_mask: np.ndarray | None = None
+    values: np.ndarray  # [N, 6] float32
+    source_camera_sequence: int
+    source_monotonic_ns: int
+    publish_monotonic_ns: int
+    camera_generation: int
 
     def __post_init__(self) -> None:
-        mods = [m for m in ("rgb", "depth", "pointcloud") if getattr(self, m) is not None]
-        if not mods:
-            raise ValueError("CameraWindow requires at least one of rgb/depth/pointcloud")
-        t = np.asarray(getattr(self, mods[0])).shape[0]
-        for m in mods:
-            arr = _freeze(getattr(self, m), name=f"CameraWindow.{m}")
-            if arr.ndim < 2 or arr.shape[0] != t:
-                raise ValueError(f"CameraWindow.{m} must be [T, ...] with leading axis {t}")
-            object.__setattr__(self, m, arr)
-        for name in ("source_sequence", "source_monotonic_ns", "receive_monotonic_ns", "publish_monotonic_ns"):
-            arr = _freeze(getattr(self, name), name=f"CameraWindow.{name}", dtype=np.uint64)
-            if arr is None or arr.shape != (t,):
-                raise ValueError(f"CameraWindow.{name} must be a ({t},) uint64 array")
-            object.__setattr__(self, name, arr)
-        mask = _freeze(self.valid_mask, name="CameraWindow.valid_mask", dtype=np.uint8)
-        if mask is None or mask.shape != (t,):
-            raise ValueError(f"CameraWindow.valid_mask must be a ({t},) uint8 array")
-        if not np.all((mask == 0) | (mask == 1)):
-            raise ValueError("CameraWindow.valid_mask must be 0 or 1")
-        object.__setattr__(self, "valid_mask", mask)
+        raw_values = np.asarray(self.values)
+        values = validate_point_cloud_array(
+            raw_values,
+            num_points=raw_values.shape[0] if raw_values.ndim == 2 else 1,
+            label="PointCloudFrame.values",
+        )
+        values = np.array(values, copy=True, order="C")
+        values.flags.writeable = False
+        provenance = (
+            self.source_camera_sequence,
+            self.source_monotonic_ns,
+            self.publish_monotonic_ns,
+            self.camera_generation,
+        )
+        if any(
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or int(value) <= 0
+            for value in provenance
+        ):
+            raise ValueError("PointCloudFrame provenance values must be positive")
+        if int(self.source_monotonic_ns) > int(self.publish_monotonic_ns):
+            raise ValueError("PointCloudFrame source time cannot exceed publish time")
+        object.__setattr__(self, "values", values)
+        for name in (
+            "source_camera_sequence",
+            "source_monotonic_ns",
+            "publish_monotonic_ns",
+            "camera_generation",
+        ):
+            object.__setattr__(self, name, int(getattr(self, name)))
 
 
 @dataclass(frozen=True)
 class ObservationBatch:
-    """One causal observation assembled from the arm/hand/tactile/camera rings.
+    """One causal observation assembled from state and point-cloud rings.
 
     Immutable and process-local. ``arm_history``/``hand_history``/
-    ``hand_current_history``/``hand_tactile_sum_history``/``tactile_history``/
-    ``camera_history`` are ``FrameWindow``/``CameraWindow`` (or None when the
-    modality is absent or not required by the adapter); each carries its own
-    source/publish metadata because the rings advance independently.
+    ``hand_current_history``/``hand_tactile_sum_history``/``tactile_history``
+    are ``FrameWindow`` values. ``pointcloud`` is the latest causally valid
+    ``PointCloudFrame``. Optional modalities are None when not requested.
     ``anchor_monotonic_ns`` is the causal cut: no frame published after the
     anchor may be included.
     """
@@ -160,11 +168,9 @@ class ObservationBatch:
     arm_history: FrameWindow | None = None
     hand_history: FrameWindow | None = None
     tactile_history: FrameWindow | None = None
-    camera_history: CameraWindow | None = None
-    # Appended after the original fields to preserve positional construction
-    # compatibility for existing adapters and offline callers.
     hand_current_history: FrameWindow | None = None
     hand_tactile_sum_history: FrameWindow | None = None
+    pointcloud: PointCloudFrame | None = None
 
     def __post_init__(self) -> None:
         if self.observation_id < 0 or self.run_generation < 0:

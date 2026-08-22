@@ -9,15 +9,18 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal
 
 import numpy as np
 
 from dexmani_real.utils.limits import validate_hand_limit_nesting
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
-_HEARTBEAT_SUBSYSTEMS = frozenset({"arm", "hand", "policy", "recorder", "vr", "camera", "inference"})
-_READINESS_SUBSYSTEMS = frozenset({"arm", "hand", "camera", "recorder", "policy", "vr", "inference"})
+_HEARTBEAT_SUBSYSTEMS = frozenset(
+    {"arm", "hand", "policy", "recorder", "vr", "camera", "pointcloud", "inference"}
+)
+_READINESS_SUBSYSTEMS = frozenset(
+    {"arm", "hand", "camera", "pointcloud", "recorder", "policy", "vr", "inference"}
+)
 
 @dataclass(frozen=True)
 class HomingParams:
@@ -802,6 +805,7 @@ class SafetyParams:
             "recorder": 2.0,
             "vr": 5.0,
             "camera": 2.0,
+            "pointcloud": 2.0,
             "inference": 5.0,
         }
     )
@@ -810,6 +814,7 @@ class SafetyParams:
             "arm": 15.0,
             "hand": 15.0,
             "camera": 15.0,
+            "pointcloud": 30.0,
             "recorder": 15.0,
             "policy": 120.0,
             "vr": 120.0,
@@ -861,19 +866,18 @@ class CameraParams:
     width: int = 640
     height: int = 480
     fps: int = 30
-    align_mode: Literal["depth_to_color", "color_to_depth", "none"] = "depth_to_color"
     warmup_frames: int = 10
     max_frame_age_s: float = 0.25
     recording_stall_abort_s: float = 2.0
     # Zero selects the default recovered-frame-gap logging threshold. Gaps are
     # retained as telemetry; current-frame freshness is timestamp-based.
     frame_gap_stall_threshold: int = 0
-    # Librealsense-owned capture queue between the device callback and the
-    # camera worker. It absorbs bounded host scheduling jitter without adding
-    # a second Python owner for the SDK object.
-    frame_queue_capacity: int = 8
+    l515_visual_preset: int = 5
+    l515_confidence_threshold: int | None = None
+    # Librealsense-owned frameset queue. Keep only a small scheduling cushion:
+    # control freshness is more important than retaining historical frames.
+    frame_queue_capacity: int = 2
     ring_maxlen: int = 5
-    pointcloud_num_points: int = 2048
     writer_queue_size: int = 8
 
     @property
@@ -884,15 +888,9 @@ class CameraParams:
     def depth_shape(self) -> tuple[int, int]:
         return (self.height, self.width)
 
-    @property
-    def pointcloud_shape(self) -> tuple[int, int]:
-        return (self.pointcloud_num_points, 6)
-
     def __post_init__(self) -> None:
         if self.width <= 0 or self.height <= 0 or self.fps <= 0:
             raise ValueError("camera width, height, and fps must be > 0")
-        if self.align_mode not in ("depth_to_color", "color_to_depth", "none"):
-            raise ValueError(f"unsupported camera align_mode={self.align_mode!r}")
         if self.warmup_frames < 0:
             raise ValueError("camera warmup_frames must be >= 0")
         if self.max_frame_age_s <= 0 or self.recording_stall_abort_s <= self.max_frame_age_s:
@@ -900,12 +898,25 @@ class CameraParams:
         if self.frame_gap_stall_threshold < 0:
             raise ValueError("camera frame_gap_stall_threshold must be >= 0")
         if (
+            not isinstance(self.l515_visual_preset, int)
+            or isinstance(self.l515_visual_preset, bool)
+            or not 0 <= self.l515_visual_preset <= 5
+        ):
+            raise ValueError("camera l515_visual_preset must be an integer in [0, 5]")
+        if self.l515_confidence_threshold is not None and (
+            not isinstance(self.l515_confidence_threshold, int)
+            or isinstance(self.l515_confidence_threshold, bool)
+            or not 0 <= self.l515_confidence_threshold <= 3
+        ):
+            raise ValueError(
+                "camera l515_confidence_threshold must be in [0, 3] or null"
+            )
+        if (
             self.frame_queue_capacity <= 0
             or self.ring_maxlen <= 0
-            or self.pointcloud_num_points <= 0
             or self.writer_queue_size <= 0
         ):
-            raise ValueError("camera ring, pointcloud, and writer capacities must be > 0")
+            raise ValueError("camera ring and writer capacities must be > 0")
         if self.serial is not None and not self.serial:
             raise ValueError("camera serial must be non-empty when configured")
 

@@ -221,7 +221,7 @@ def load_trajectory(
 
 
 def load_processed_trajectory(episode_path: str) -> TrajectoryData:
-    """Load a processed HDF5 v3 artifact's exact submitted command stream.
+    """Load a processed HDF5 v4 artifact's exact submitted command stream.
 
     A processed artifact stores the same submitted joint-command stream as its raw
     source episode — ``action[:, :7]`` is ``action_arm_joint_sent`` and

@@ -31,8 +31,16 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.deployment.contracts import InferenceContext, JointActionChunk
-from dexmani_real.deployment.observation import ObservationBatch, parse_observation_fields
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.deployment.observation import (
+    ObservationBatch,
+    PointCloudFrame,
+    parse_observation_fields,
+)
+from dexmani_real.utils.schema import (
+    ARM_JOINT_SHAPE,
+    HAND_JOINT_SHAPE,
+    validate_point_cloud_array,
+)
 
 _ARM_DOF = ARM_JOINT_SHAPE[0]
 _HAND_DOF = HAND_JOINT_SHAPE[0]
@@ -64,19 +72,31 @@ def _last_valid_optional(window: Any) -> np.ndarray | None:
     return np.asarray(window.values[idx[-1]], dtype=np.float64).copy()
 
 
+def _point_cloud(frame: PointCloudFrame | None, *, num_points: int) -> np.ndarray:
+    """Return the model-facing ``float32[N,6]`` cloud."""
+    if frame is None:
+        raise ValueError("point_cloud was requested but no valid frame is available")
+    return validate_point_cloud_array(
+        frame.values,
+        num_points=num_points,
+    ).copy()
+
+
 class DexManiObservationAdapter:
     """``ObservationBatch`` -> model-native joint observation dict.
 
     The default remains joint-only. ``observation_fields`` can opt into current
-    and tactile modalities; all optional fields are omitted as ``None`` when no
-    causally valid frame is available. Any history stacking, normalization,
-    batch-dimension, or device transfer the real policy needs belongs here.
+    and tactile modalities, or a latest ``float32[N,6]`` xArm-base point cloud.
+    Optional current/tactile fields are emitted as ``None`` when unavailable;
+    requested point clouds fail closed. Any normalization, batch dimension, or
+    device transfer the real policy needs belongs here.
     """
 
     def __init__(self, config: Any = None) -> None:
         self.config = config
         spec = getattr(config, "observation_fields", "arm_qpos,hand_qpos")
         self.observation_fields = parse_observation_fields(spec)
+        self.pointcloud_num_points = int(getattr(config, "pointcloud_num_points", 1024))
 
     def encode(self, observation: ObservationBatch) -> dict[str, np.ndarray | None]:
         encoded: dict[str, np.ndarray | None] = {}
@@ -94,9 +114,16 @@ class DexManiObservationAdapter:
                 # without unit or scale conversion.
                 encoded[field] = _last_valid_optional(observation.hand_current_history)
             elif field in {"hand_tactile_sum", "fingertip_force"}:
-                encoded[field] = _last_valid_optional(observation.hand_tactile_sum_history)
+                encoded[field] = _last_valid_optional(
+                    observation.hand_tactile_sum_history
+                )
             elif field in {"hand_tactile_force", "xhand_tactile"}:
                 encoded[field] = _last_valid_optional(observation.tactile_history)
+            elif field == "point_cloud":
+                encoded[field] = _point_cloud(
+                    observation.pointcloud,
+                    num_points=self.pointcloud_num_points,
+                )
             else:  # pragma: no cover - parse_observation_fields rejects this first
                 raise ValueError(f"unsupported observation field: {field}")
         return encoded
@@ -203,9 +230,9 @@ class DexManiActionAdapter:
                 )
 
         steps = np.arange(1, n + 1, dtype=np.uint64)
-        target = np.asarray(context.inference_finished_monotonic_ns, dtype=np.uint64) + (
-            steps * np.uint64(context.step_dt_ns)
-        )
+        target = np.asarray(
+            context.inference_finished_monotonic_ns, dtype=np.uint64
+        ) + (steps * np.uint64(context.step_dt_ns))
         return JointActionChunk(
             arm_qpos=arm,
             hand_qpos=hand,

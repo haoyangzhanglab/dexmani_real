@@ -48,7 +48,7 @@ class ValidityState(str, Enum):
 
 @dataclass(frozen=True)
 class EpisodeTiming:
-    """Timing metadata from a supported schema-v17/v18/v19 episode."""
+    """Timing metadata from a supported schema-v17-v20 episode."""
 
     rate_hz: float
     grid_dt_s: float

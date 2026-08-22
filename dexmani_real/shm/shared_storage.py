@@ -28,13 +28,13 @@ from dexmani_real.utils.schema import (
     POLICY_PLAN_DTYPE,
     RECORD_CONTROL_DTYPE,
     RECORD_STATUS_DTYPE,
+    SUPPORTED_POINT_CLOUD_COUNTS,
     VR_FRAME_DTYPE,
+    make_pointcloud_frame_dtype,
     make_record_sample_dtype,
 )
 
 logger = get_logger(__name__)
-
-
 
 
 @dataclass
@@ -62,6 +62,8 @@ class SharedStorageConfig:
     record_sample_ring_maxlen: int = 4
     record_status_ring_maxlen: int = 1
     policy_plan_ring_maxlen: int = 3
+    pointcloud_num_points: int = 1024
+    pointcloud_requested: bool = False
 
     control_hz: float = field(default_factory=lambda: policy.control_hz)
     arm_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
@@ -105,6 +107,16 @@ class SharedStorageConfig:
             raise ValueError("SharedStorage ring/queue capacities must be positive")
         if min(self.control_hz, self.arm_loop_hz, self.hand_loop_hz) <= 0:
             raise ValueError("SharedStorage action rates must be positive")
+        if (
+            isinstance(self.pointcloud_num_points, bool)
+            or int(self.pointcloud_num_points) not in SUPPORTED_POINT_CLOUD_COUNTS
+        ):
+            raise ValueError(
+                "SharedStorage pointcloud_num_points must be one of "
+                f"{sorted(SUPPORTED_POINT_CLOUD_COUNTS)}"
+            )
+        if not isinstance(self.pointcloud_requested, bool):
+            raise TypeError("SharedStorage pointcloud_requested must be boolean")
         bounds = np.asarray(self.workspace_bounds, dtype=np.float64)
         if (
             bounds.shape != (3, 2)
@@ -121,7 +133,13 @@ class SharedStorageConfig:
             )
 
     @classmethod
-    def from_runtime(cls, runtime: object) -> "SharedStorageConfig":
+    def from_runtime(
+        cls,
+        runtime: object,
+        *,
+        pointcloud_num_points: int = 1024,
+        pointcloud_requested: bool = False,
+    ) -> "SharedStorageConfig":
         cam = getattr(runtime, "camera")
         pol = getattr(runtime, "policy")
         arm_cfg = getattr(runtime, "arm")
@@ -138,6 +156,8 @@ class SharedStorageConfig:
             camera_ring_maxlen=int(cam.ring_maxlen),
             camera_rgb_shape=(int(cam.height), int(cam.width), 3),
             camera_depth_shape=(int(cam.height), int(cam.width)),
+            pointcloud_num_points=int(pointcloud_num_points),
+            pointcloud_requested=pointcloud_requested,
             control_hz=float(pol.control_hz),
             arm_loop_hz=float(arm_cfg.loop_hz),
             hand_loop_hz=float(hand_cfg.loop_hz),
@@ -159,6 +179,7 @@ _RING_RESOURCE_NAMES = (
     "record_sample_ring",
     "record_status_ring",
     "policy_plan_ring",
+    "pointcloud_ring",
     "arm_cmd_ring",
 )
 _QUEUE_RESOURCE_NAMES = ("arm_home_q",)
@@ -172,15 +193,19 @@ HEARTBEAT_FIELDS: tuple[str, ...] = (
     "recorder",
     "vr",
     "camera",
+    "pointcloud",
     "inference",
 )
-HEARTBEAT_INDEX: dict[str, int] = {name: index for index, name in enumerate(HEARTBEAT_FIELDS)}
+HEARTBEAT_INDEX: dict[str, int] = {
+    name: index for index, name in enumerate(HEARTBEAT_FIELDS)
+}
 
 # Readiness slots use a fixed, process-stable order and atomic 0/1 flags.
 READY_FIELDS: tuple[str, ...] = (
     "arm",
     "hand",
     "camera",
+    "pointcloud",
     "vr",
     "policy",
     "recorder",
@@ -215,6 +240,7 @@ class SharedStorage:
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     record_status_ring: SharedMemoryRingBuffer  # RecorderIO -> policy/main
     policy_plan_ring: SharedMemoryRingBuffer  # inference -> coordinator, latest-wins
+    pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> inference
 
     arm_cmd_ring: SharedMemoryRingBuffer  # policy -> arm servo endpoints, latest-wins
     arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, generation)
@@ -233,6 +259,7 @@ class SharedStorage:
     error_state: Any  # arm/hand -> all (sticky latch)
     estop_request: Any  # policy -> arm/hand
     quit_requested: Any  # policy -> Main
+    pointcloud_requested: Any  # Main -> camera; keep native payload publication active
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write
 
@@ -243,12 +270,11 @@ class SharedStorage:
     arm_device_identity: Any  # worker-reported canonical identity JSON
     hand_device_identity: Any  # worker-reported canonical identity JSON
     camera_depth_scale: Any  # depth scale (mm to meters)
-    camera_K: Any  # 3x3 intrinsics, row-major
     camera_serial: Any  # serial number string
     camera_firmware: Any  # firmware version string
     camera_sdk_version: Any  # pyrealsense2/librealsense version string
-    camera_profile: Any  # actual color/depth profile JSON
-    camera_pointcloud_config: Any  # resolved pointcloud filter config JSON
+    camera_profile: Any  # active stream/profile and L515 setting JSON
+    camera_geometry: Any  # static native RGB-D geometry JSON
     _closed: bool = field(init=False, repr=False, default=False)
     _close_completed_operations: set[str] = field(
         init=False, repr=False, default_factory=set
@@ -363,6 +389,11 @@ class SharedStorage:
             dtype=POLICY_PLAN_DTYPE,
             maxlen=cfg.policy_plan_ring_maxlen,
         )
+        storage.pointcloud_ring = SharedMemoryRingBuffer.create_or_replace(
+            f"{prefix}_pointcloud",
+            dtype=make_pointcloud_frame_dtype(cfg.pointcloud_num_points),
+            maxlen=1,
+        )
 
         storage.arm_cmd_ring = SharedMemoryRingBuffer.create_or_replace(
             f"{prefix}_arm_cmd",
@@ -388,6 +419,7 @@ class SharedStorage:
         storage.error_state = ctx.Value("b", False)
         storage.estop_request = ctx.Value("b", False)
         storage.quit_requested = ctx.Value("b", False)
+        storage.pointcloud_requested = ctx.Value("b", cfg.pointcloud_requested)
 
         storage.safety_state = ctx.Value("i", int(SafetyState.DISARMED))
 
@@ -398,12 +430,11 @@ class SharedStorage:
         storage.arm_device_identity = ctx.Array("c", b"\x00" * 1024)
         storage.hand_device_identity = ctx.Array("c", b"\x00" * 1024)
         storage.camera_depth_scale = ctx.Value("d", 0.0)
-        storage.camera_K = ctx.Array("d", [0.0] * 9)
         storage.camera_serial = ctx.Array("c", b"\x00" * 32)
         storage.camera_firmware = ctx.Array("c", b"\x00" * 64)
         storage.camera_sdk_version = ctx.Array("c", b"\x00" * 64)
         storage.camera_profile = ctx.Array("c", b"\x00" * 2048)
-        storage.camera_pointcloud_config = ctx.Array("c", b"\x00" * 2048)
+        storage.camera_geometry = ctx.Array("c", b"\x00" * 2048)
 
     def close(self) -> bool:
         """Release all shared memory primitives.
@@ -508,8 +539,6 @@ class SharedStorage:
 def vr_frame_dtype() -> np.dtype:
     """VR frame dtype — mirrors vr_receiver_process frame output."""
     return VR_FRAME_DTYPE
-
-
 
 
 def read_arm_state(shared: "SharedStorage") -> "np.ndarray | None":

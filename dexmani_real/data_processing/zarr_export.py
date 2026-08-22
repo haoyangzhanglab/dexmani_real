@@ -1,4 +1,4 @@
-"""Transactional export of processed Real HDF5 v3 episodes to minimal Zarr."""
+"""Transactional export of processed Real HDF5 v4 episodes to minimal Zarr."""
 
 from __future__ import annotations
 
@@ -19,6 +19,10 @@ from dexmani_real.data_processing.pipeline import (
     PROCESSED_SCHEMA_VERSION,
 )
 from dexmani_real.recording.transaction import atomic_publish
+from dexmani_real.sensor.pointcloud import (
+    POINT_CLOUD_COLOR_SOURCE,
+    POINT_CLOUD_SAMPLING,
+)
 
 POLICY_ZARR_SCHEMA_NAME = "dexmani-real-policy-zarr"
 POLICY_ZARR_SCHEMA_VERSION = 2
@@ -177,9 +181,27 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
                 or semantics["depth_scale_m_per_unit"] <= 0.0
                 or semantics["depth_invalid_value"] != 0
                 or semantics["camera_extrinsic_semantics"]
-                != "T_xarm_base_camera;camera_optical_to_xarm_base"
+                != "T_xarm_base_from_color;native_color_optical_to_xarm_base"
             ):
                 raise ValueError(f"{path.name}: invalid Real RGB-D semantics")
+        if profile.needs_pointcloud:
+            point_cloud_semantics = {
+                "frame": _text(source.attrs.get("point_cloud_frame", "")),
+                "color_source": _text(source.attrs.get("point_cloud_color_source", "")),
+                "sampling": _text(source.attrs.get("point_cloud_sampling", "")),
+            }
+            if point_cloud_semantics != {
+                "frame": "xarm_base",
+                "color_source": POINT_CLOUD_COLOR_SOURCE,
+                "sampling": POINT_CLOUD_SAMPLING,
+            }:
+                raise ValueError(f"{path.name}: invalid Real point-cloud semantics")
+            semantics.update(
+                {
+                    f"point_cloud_{key}": value
+                    for key, value in point_cloud_semantics.items()
+                }
+            )
     return _Artifact(
         path=path,
         length=length,

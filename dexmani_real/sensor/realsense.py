@@ -1,75 +1,64 @@
-"""RealSense D400/L515 camera driver — streaming, alignment, point clouds."""
+"""RealSense D400/L515 camera driver for native RGB-D payloads."""
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, cast
 
 __all__ = [
     "RealSense",
     "RealSenseConfig",
     "CameraFrame",
     "L515DepthConfig",
-    "AlignMode",
-    "_normalize_align_mode",
 ]
 
 import numpy as np
 import pyrealsense2 as rs
 
+from dexmani_real.sensor.camera_geometry import CameraIntrinsics, RGBDGeometry
 from dexmani_real.sensor.clock_sync import DeviceClockMapper
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.pointcloud_utils import (
-    intrinsics_to_dict,
-    intrinsics_to_matrix,
-    intrinsics_to_vector,
-    make_rays,
-)
 
 logger = get_logger(__name__)
 
 
-AlignMode = Literal["depth_to_color", "color_to_depth", "none"]
-ALIGN_MODE_ALIASES = {
-    "depth_to_color": "depth_to_color",
-    "color_to_depth": "color_to_depth",
-    "none": "none",
-    "color": "depth_to_color",
-    "depth": "color_to_depth",
-}
+_L515_OPTION_NAMES = (
+    "visual_preset",
+    "confidence_threshold",
+    "laser_power",
+    "receiver_gain",
+    "noise_filtering",
+    "zero_order_enabled",
+    "invalidation_bypass",
+)
 
 
 @dataclass(frozen=True)
 class L515DepthConfig:
-    """L515-only depth settings, applied via set_option after pipeline start.
+    """Evidence-bounded L515 settings applied after pipeline start.
 
-    Ten writable L515 options are exposed, plus the read-only depth-offset
-    calibration for verification. load_json (XU control path) fails silently
-    on the stock uvcvideo kernel, so set_option is the sole config path.
-
-    The Short Range preset (5) targets the close-range
-    dexterous-manipulation workspace (0.25-0.85 m).  The factory Short Range
-    parameter table optimises MEMS timing, noise estimation, and confidence
-    mapping for < 1 m — then we override only what needs fine-tuning on top.
-    D400 cameras ignore this config.
+    The selected factory preset owns laser, gain, noise, sharpening, zero-order,
+    and invalidation behavior. Confidence is the only optional production
+    override and remains preset-owned when ``None``.
     """
 
-    enabled: bool = True
-
     visual_preset: int = 5  # L500 Short Range preset.
+    confidence_threshold: int | None = None
 
-    laser_power: int = 100  # 0-100, full power (MEMS eye-safe at all levels)
-    receiver_gain: int = 9  # 8-18; numerically higher = *lower* actual gain.
-    confidence_threshold: int = 1  # 0-3 firmware confidence cull; 1 = keep more
-    noise_filtering: int = 1  # 0-6; light temporal smoothing.
-    min_distance: int = 150  # mm.
-
-    digital_gain: int = 1  # 1-2; post-ADC digital amplification.
-    depth_offset: float = 4.5  # mm; expected read-only per-unit calibration.
-    post_processing_sharpening: int = 2  # 0-3; edge-enhancement on the firmware
-    pre_processing_sharpening: int = 0  # 0-5; pre-sharpening amplifies sensor
-    noise_estimation: float | None = None  # 0-4100; None = leave at the Short
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.visual_preset, int)
+            or isinstance(self.visual_preset, bool)
+            or not 0 <= self.visual_preset <= 5
+        ):
+            raise ValueError("L515 visual_preset must be an integer in [0, 5]")
+        if self.confidence_threshold is not None and (
+            not isinstance(self.confidence_threshold, int)
+            or isinstance(self.confidence_threshold, bool)
+            or not 0 <= self.confidence_threshold <= 3
+        ):
+            raise ValueError("L515 confidence_threshold must be in [0, 3] or None")
 
 
 @dataclass(frozen=True)
@@ -80,28 +69,51 @@ class RealSenseConfig:
     color_resolution: tuple[int, int] = (640, 480)
     fps: int = 30
     enable_color: bool = True
-    align_mode: AlignMode = "depth_to_color"
     enable_global_time: bool = True
     warmup_frames: int = 10
-    frame_queue_capacity: int = 8
-    frame_name: str | None = None
+    frame_queue_capacity: int = 2
     l515_depth_config: L515DepthConfig | None = field(default_factory=L515DepthConfig)
 
     def __post_init__(self) -> None:
-        # Normalize frozen fields during construction.
-        mode = _normalize_align_mode(self.align_mode)
-        object.__setattr__(self, "align_mode", mode)
-        if mode != "none" and not self.enable_color:
-            raise ValueError("alignment requires enable_color=True.")
-        if self.frame_name is None:
-            frame_name = (
-                "camera_color_optical"
-                if mode == "depth_to_color"
-                else "camera_depth_optical"
-            )
-            object.__setattr__(self, "frame_name", frame_name)
-        if self.frame_queue_capacity <= 0:
-            raise ValueError("frame_queue_capacity must be positive")
+        if not isinstance(self.camera_name, str) or not self.camera_name.strip():
+            raise ValueError("camera_name must be a non-empty string")
+        if self.serial is not None and (
+            not isinstance(self.serial, str) or not self.serial.strip()
+        ):
+            raise ValueError("serial must be a non-empty string or None")
+        for name in ("depth_resolution", "color_resolution"):
+            resolution = getattr(self, name)
+            if (
+                not isinstance(resolution, tuple)
+                or len(resolution) != 2
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                    for value in resolution
+                )
+            ):
+                raise ValueError(f"{name} must contain two positive integers")
+        if isinstance(self.fps, bool) or not isinstance(self.fps, int) or self.fps <= 0:
+            raise ValueError("fps must be a positive integer")
+        if (
+            isinstance(self.warmup_frames, bool)
+            or not isinstance(self.warmup_frames, int)
+            or self.warmup_frames < 0
+        ):
+            raise ValueError("warmup_frames must be a non-negative integer")
+        if (
+            isinstance(self.frame_queue_capacity, bool)
+            or not isinstance(self.frame_queue_capacity, int)
+            or self.frame_queue_capacity <= 0
+        ):
+            raise ValueError("frame_queue_capacity must be a positive integer")
+        if not isinstance(self.enable_color, bool) or not isinstance(
+            self.enable_global_time, bool
+        ):
+            raise TypeError("enable_color and enable_global_time must be boolean")
+        if self.l515_depth_config is not None and not isinstance(
+            self.l515_depth_config, L515DepthConfig
+        ):
+            raise TypeError("l515_depth_config must be L515DepthConfig or None")
 
 
 @dataclass(frozen=True)
@@ -109,14 +121,15 @@ class CameraFrame:
     rgb: np.ndarray | None
     depth: np.ndarray
     depth_raw: np.ndarray
-    timestamp: float
     host_time: float
-    # Legacy post-align host timestamp retained for episode compatibility.
-    capture_monotonic_s: float
-    # Explicit host stages for timing diagnosis and causal provenance.
     wait_return_monotonic_ns: int
-    align_done_monotonic_ns: int
-    timestamp_domain: int
+    payload_ready_monotonic_ns: int
+    depth_frame_number: int
+    color_frame_number: int | None
+    depth_device_timestamp_s: float
+    color_device_timestamp_s: float | None
+    depth_timestamp_domain: int
+    color_timestamp_domain: int | None
     source_monotonic_ns: int
     camera_generation: int
     clock_reset: bool
@@ -124,22 +137,9 @@ class CameraFrame:
     frame_gap: int
     backlog_s: float
     frame_id: int
-    K: np.ndarray
-    intr: np.ndarray
-    intrinsics_info: dict
     depth_scale: float
     camera_name: str
     serial: str | None
-    align_mode: AlignMode
-    frame_name: str
-
-
-def _normalize_align_mode(mode: str) -> AlignMode:
-    key = str(mode).lower()
-    if key not in ALIGN_MODE_ALIASES:
-        valid = ", ".join(ALIGN_MODE_ALIASES.keys())
-        raise ValueError(f"align_mode must be one of: {valid}.")
-    return ALIGN_MODE_ALIASES[key]  # type: ignore[return-value]
 
 
 class RealSense:
@@ -151,17 +151,15 @@ class RealSense:
         self.active_serial: str | None = config.serial
         self.active_is_l515 = False
         self._clock_mapper = DeviceClockMapper()
+        self._color_clock_mapper = DeviceClockMapper()
 
         self.pipeline: rs.pipeline | None = None
         self.frame_queue: rs.frame_queue | None = None
         self.profile: rs.pipeline_profile | None = None
-        self.aligner: rs.align | None = None
 
         self.depth_scale: float | None = None
-        self.K: np.ndarray | None = None
-        self.intr: np.ndarray | None = None
-        self.intrinsics_info: dict | None = None
-        self.rays: np.ndarray | None = None
+        self.geometry: RGBDGeometry | None = None
+        self.l515_depth_option_snapshot: dict[str, Any] | None = None
         self.frame_id = 0
 
     def connect(self) -> bool:
@@ -174,6 +172,7 @@ class RealSense:
             return True
 
         self._clock_mapper.reset()
+        self._color_clock_mapper.reset()
         return self._open_pipeline()
 
     def _open_pipeline(self) -> bool:
@@ -230,101 +229,90 @@ class RealSense:
             self._apply_d400_depth_config()
 
     def _apply_l515_depth_config(self) -> None:
-        """Apply L515 depth settings via set_option after pipeline start.
-
-        The only config path: load_json (XU controls) fails silently on the
-        stock uvcvideo kernel — no error, but hardware reads back preset
-        defaults. set_option is reliable. Order matters: visual_preset first
-        (loads the factory base parameter set, including internals with no
-        corresponding rs.option), then the explicit overrides — which flips
-        the preset label to 0 (Custom); that is the expected final state.
-        """
+        """Apply one factory preset and an optional confidence override."""
         cfg = self.config.l515_depth_config
-        if cfg is None or not cfg.enabled:
+        if cfg is None:
+            self.l515_depth_option_snapshot = None
             return
 
         if self.profile is None:
-            logger.warning("RealSense: profile is None — cannot apply depth config")
-            return
+            raise RuntimeError("RealSense profile is unavailable for L515 settings")
         sensor = self.profile.get_device().first_depth_sensor()
-
-        options: list[tuple[rs.option, float]] = [
-            (rs.option.visual_preset, float(cfg.visual_preset)),
-            (rs.option.laser_power, float(cfg.laser_power)),
-            (rs.option.receiver_gain, float(cfg.receiver_gain)),
-            (rs.option.confidence_threshold, float(cfg.confidence_threshold)),
-            (rs.option.noise_filtering, float(cfg.noise_filtering)),
-            (rs.option.min_distance, float(cfg.min_distance)),
-            (rs.option.digital_gain, float(cfg.digital_gain)),
-            (
-                rs.option.post_processing_sharpening,
-                float(cfg.post_processing_sharpening),
-            ),
-            (rs.option.pre_processing_sharpening, float(cfg.pre_processing_sharpening)),
-        ]
-        if cfg.noise_estimation is not None:
-            options.append((rs.option.noise_estimation, float(cfg.noise_estimation)))
-
-        for option, value in options:
-            try:
-                if sensor.supports(option):
-                    sensor.set_option(option, value)
-            except (RuntimeError, OSError) as error:
-                logger.warning("L515 set_option(%s) failed: %s", option, error)
-
-        # Verify receiver_gain because individual overrides change the preset label.
+        if not sensor.supports(rs.option.visual_preset):
+            raise RuntimeError("connected L515 does not expose visual_preset")
+        sensor.set_option(rs.option.visual_preset, float(cfg.visual_preset))
         time.sleep(0.5)
-        actual_gain = float(sensor.get_option(rs.option.receiver_gain))
-        # depth_offset is a per-unit read-only calibration constant; verify it only.
-        actual_depth_offset = (
-            float(sensor.get_option(rs.option.depth_offset))
-            if sensor.supports(rs.option.depth_offset)
-            else float("nan")
-        )
-        logger.info(
-            "L515 depth config applied (set_option): preset_base=%d, laser=%d, "
-            "gain=%d, conf=%d, noise=%d, min_dist=%d, digital_gain=%d, "
-            "sharpening(post=%d, pre=%d), depth_offset_readback=%.1f, noise_est=%s",
-            int(cfg.visual_preset),
-            int(cfg.laser_power),
-            int(actual_gain),
-            int(cfg.confidence_threshold),
-            int(cfg.noise_filtering),
-            int(cfg.min_distance),
-            int(cfg.digital_gain),
-            int(cfg.post_processing_sharpening),
-            int(cfg.pre_processing_sharpening),
-            actual_depth_offset,
-            "preset" if cfg.noise_estimation is None else str(cfg.noise_estimation),
-        )
-        if not np.isclose(actual_gain, float(cfg.receiver_gain), atol=1e-6):
-            logger.warning(
-                "L515 receiver_gain read-back mismatch: requested=%d, actual=%.0f.",
-                int(cfg.receiver_gain),
-                actual_gain,
-            )
-        if np.isfinite(actual_depth_offset) and not np.isclose(
-            actual_depth_offset, float(cfg.depth_offset), atol=1e-6
+        base_readbacks = self._read_l515_option_snapshot(sensor)
+        base_preset = base_readbacks["visual_preset"]
+        if base_preset is None or not np.isclose(
+            base_preset, float(cfg.visual_preset), atol=1e-6
         ):
-            logger.warning(
-                "L515 read-only depth_offset mismatch: expected=%.1f, actual=%.1f",
-                float(cfg.depth_offset),
-                actual_depth_offset,
+            raise RuntimeError(
+                "L515 visual preset readback mismatch: "
+                f"requested={cfg.visual_preset}, actual={base_preset}"
             )
+
+        if cfg.confidence_threshold is not None:
+            if not sensor.supports(rs.option.confidence_threshold):
+                raise RuntimeError(
+                    "configured L515 confidence override is unsupported by this device"
+                )
+            sensor.set_option(
+                rs.option.confidence_threshold,
+                float(cfg.confidence_threshold),
+            )
+
+        final_readbacks = self._read_l515_option_snapshot(sensor)
+        final_confidence = final_readbacks["confidence_threshold"]
+        if cfg.confidence_threshold is not None and (
+            final_confidence is None
+            or not np.isclose(
+                final_confidence, float(cfg.confidence_threshold), atol=1e-6
+            )
+        ):
+            raise RuntimeError(
+                "L515 confidence readback mismatch: "
+                f"requested={cfg.confidence_threshold}, actual={final_confidence}"
+            )
+        self.l515_depth_option_snapshot = {
+            "base_visual_preset": int(cfg.visual_preset),
+            "base_readbacks": base_readbacks,
+            "confidence_override": cfg.confidence_threshold,
+            "final_readbacks": final_readbacks,
+        }
+        logger.info("L515 depth option snapshot: %s", self.l515_depth_option_snapshot)
+
+    @staticmethod
+    def _read_l515_option_snapshot(sensor: Any) -> dict[str, float | None]:
+        """Read only supported, firmware-owned L515 options."""
+        snapshot: dict[str, float | None] = {}
+        for name in _L515_OPTION_NAMES:
+            option = getattr(rs.option, name, None)
+            if option is None:
+                snapshot[name] = None
+                continue
+            try:
+                snapshot[name] = (
+                    float(sensor.get_option(option))
+                    if sensor.supports(option)
+                    else None
+                )
+            except (RuntimeError, OSError):
+                snapshot[name] = None
+        return snapshot
 
     def _setup_pipeline_post_start(self) -> None:
-        """Configure active-device options, alignment, filters, and intrinsics."""
+        """Configure active-device options and immutable native geometry."""
         if self.profile is None:
             raise RuntimeError("Pipeline profile is unavailable after start.")
 
         self._apply_depth_config()
-        self.aligner = self.create_aligner()
 
         self.set_global_time()
         self.depth_scale = float(
             self.profile.get_device().first_depth_sensor().get_depth_scale()
         )
-        self.update_intrinsics_from_profile()
+        self.update_geometry_from_profile()
         self.frame_id = 0
 
     def _apply_d400_depth_config(self) -> None:
@@ -430,11 +418,9 @@ class RealSense:
             self.pipeline = None
             self.frame_queue = None
             self.profile = None
-            self.aligner = None
             self.depth_scale = None
-            self.K = None
-            self.intr = None
-            self.intrinsics_info = None
+            self.geometry = None
+            self.l515_depth_option_snapshot = None
 
     def create_rs_config(self) -> rs.config:
         depth_width, depth_height = self.config.depth_resolution
@@ -454,16 +440,6 @@ class RealSense:
                 self.config.fps,
             )
         return rs_config
-
-    def create_aligner(self) -> rs.align | None:
-        if self.config.align_mode == "none":
-            return None
-        target = (
-            rs.stream.color
-            if self.config.align_mode == "depth_to_color"
-            else rs.stream.depth
-        )
-        return rs.align(target)
 
     def set_global_time(self) -> None:
         if not self.config.enable_global_time or self.profile is None:
@@ -485,39 +461,68 @@ class RealSense:
         )
         return product_line == "L500" or "L515" in name
 
-    def update_intrinsics_from_profile(self) -> None:
+    @staticmethod
+    def _intrinsics_from_sdk(intrinsics: Any) -> CameraIntrinsics:
+        coefficients = tuple(float(value) for value in intrinsics.coeffs)
+        if len(coefficients) != 5:
+            raise RuntimeError(
+                "RealSense intrinsics did not provide five distortion coefficients"
+            )
+        return CameraIntrinsics(
+            width=int(intrinsics.width),
+            height=int(intrinsics.height),
+            fx=float(intrinsics.fx),
+            fy=float(intrinsics.fy),
+            ppx=float(intrinsics.ppx),
+            ppy=float(intrinsics.ppy),
+            distortion_model=str(intrinsics.model),
+            distortion_coeffs=cast(
+                tuple[float, float, float, float, float], coefficients
+            ),
+        )
+
+    @staticmethod
+    def _transform_from_sdk_extrinsics(extrinsics: Any) -> np.ndarray:
+        """Decode SDK rotation storage and verify the chosen convention."""
+        raw_rotation = np.asarray(extrinsics.rotation, dtype=np.float64).reshape(3, 3)
+        translation = np.asarray(extrinsics.translation, dtype=np.float64)
+        points = np.vstack((np.zeros(3), np.eye(3)))
+        oracle = np.asarray(
+            [
+                rs.rs2_transform_point_to_point(extrinsics, point.tolist())
+                for point in points
+            ],
+            dtype=np.float64,
+        )
+        for rotation in (raw_rotation.T, raw_rotation):
+            transformed = points @ rotation.T + translation
+            if np.allclose(transformed, oracle, rtol=0.0, atol=1e-7):
+                transform = np.eye(4, dtype=np.float64)
+                transform[:3, :3] = rotation
+                transform[:3, 3] = translation
+                return transform
+        raise RuntimeError("failed to decode RealSense extrinsic rotation convention")
+
+    def update_geometry_from_profile(self) -> None:
+        """Read immutable native stream calibration from the active profile."""
         if self.profile is None:
             raise RuntimeError("RealSense is not connected.")
-        stream = (
+        if not self.config.enable_color:
+            self.geometry = None
+            return
+        depth_profile = self.profile.get_stream(
+            rs.stream.depth
+        ).as_video_stream_profile()
+        color_profile = self.profile.get_stream(
             rs.stream.color
-            if self.config.align_mode == "depth_to_color"
-            else rs.stream.depth
+        ).as_video_stream_profile()
+        self.geometry = RGBDGeometry(
+            depth=self._intrinsics_from_sdk(depth_profile.get_intrinsics()),
+            color=self._intrinsics_from_sdk(color_profile.get_intrinsics()),
+            T_color_from_depth=self._transform_from_sdk_extrinsics(
+                depth_profile.get_extrinsics_to(color_profile)
+            ),
         )
-        video_profile = self.profile.get_stream(stream).as_video_stream_profile()
-        self.set_intrinsics(video_profile.get_intrinsics())
-
-    def update_intrinsics_from_depth_frame(self, depth_frame: rs.depth_frame) -> None:
-        video_profile = depth_frame.get_profile().as_video_stream_profile()
-        self.set_intrinsics(video_profile.get_intrinsics())
-
-    def set_intrinsics(self, intrinsics: Any) -> None:
-        K = intrinsics_to_matrix(intrinsics)
-        if self.K is None or not np.allclose(K, self.K):
-            self.K = K
-            self.intr = intrinsics_to_vector(K)
-            self.intrinsics_info = intrinsics_to_dict(intrinsics)
-            # Precompute unit rays per intrinsics; each frame then needs one multiply.
-            self.rays = make_rays(
-                int(intrinsics.height), int(intrinsics.width), K
-            ).numpy()
-
-    def get_rays(self) -> np.ndarray:
-        """(H, W, 3) float32 unit rays matching the output frame geometry."""
-        if self.rays is None:
-            raise RuntimeError(
-                "RealSense is not connected or intrinsics are unavailable."
-            )
-        return self.rays
 
     def read(
         self, timeout_ms: int = 5000, *, compute_depth: bool = True
@@ -528,23 +533,15 @@ class RealSense:
             raise RuntimeError("RealSense depth_scale is unavailable.")
 
         # frame_queue returns the base ``rs.frame`` wrapper even when its
-        # payload is a frameset.  ``align.process`` accepts only the
-        # composite-frame binding, so recover that typed view at this SDK
-        # boundary before any downstream processing.
+        # payload is a frameset. Recover the typed frameset at this SDK
+        # boundary; production never spatially aligns either native stream.
         frames = self.frame_queue.wait_for_frame(timeout_ms).as_frameset()
         if not frames:
-            raise RuntimeError(
-                "RealSense frame queue returned a non-frameset frame."
-            )
-        # Timestamp SDK availability before any alignment or array conversion.
+            raise RuntimeError("RealSense frame queue returned a non-frameset frame.")
+        # Timestamp SDK availability before array ownership copies.
         # This is the closest host-monotonic approximation to frame delivery.
         wait_return_monotonic_ns = time.monotonic_ns()
-        if self.aligner is not None:
-            frames = self.aligner.process(frames)
-
         host_time = time.time()
-        align_done_monotonic_ns = time.monotonic_ns()
-        capture_monotonic_s = align_done_monotonic_ns / 1e9
         depth_frame = frames.get_depth_frame()
         color_frame = frames.get_color_frame() if self.config.enable_color else None
         if not depth_frame:
@@ -552,74 +549,80 @@ class RealSense:
         if self.config.enable_color and not color_frame:
             raise RuntimeError("Failed to get color frame.")
 
-        self.update_intrinsics_from_depth_frame(depth_frame)
-        if self.K is None or self.intr is None or self.intrinsics_info is None:
-            raise RuntimeError("RealSense intrinsics are unavailable.")
-
-        depth_raw = np.ascontiguousarray(np.asanyarray(depth_frame.get_data()))
+        # ``ascontiguousarray`` may return an SDK-backed view. Use ``array``
+        # with copy=True because the frame becomes invalid after this method.
+        depth_raw = np.array(
+            depth_frame.get_data(), dtype=np.uint16, copy=True, order="C"
+        )
         if compute_depth:
-            depth = depth_raw.astype(np.float32) * float(self.depth_scale)
+            depth: np.ndarray = depth_raw.astype(np.float32) * float(self.depth_scale)
         else:
             depth = depth_raw  # shared-memory path keeps raw depth
 
         rgb = None
         if color_frame is not None:
-            bgr = np.asanyarray(color_frame.get_data())
-            rgb = np.ascontiguousarray(bgr[..., ::-1])
+            bgr = np.array(color_frame.get_data(), dtype=np.uint8, copy=True, order="C")
+            rgb = np.ascontiguousarray(bgr[..., ::-1].copy())
+        payload_ready_monotonic_ns = time.monotonic_ns()
 
         # Preserve the device-provided frame number.  Unlike a local counter,
         # this exposes device/pipeline stalls and dropped frames end-to-end.
         self.frame_id = int(depth_frame.get_frame_number())
-
-        device_timestamp_s = float(depth_frame.get_timestamp()) * 1e-3
-        timestamp_domain = int(depth_frame.get_frame_timestamp_domain())
-        clock_mapping = self._clock_mapper.map(
-            device_time_s=device_timestamp_s,
+        depth_timestamp_s = float(depth_frame.get_timestamp()) * 1e-3
+        depth_timestamp_domain = int(depth_frame.get_frame_timestamp_domain())
+        depth_clock_mapping = self._clock_mapper.map(
+            device_time_s=depth_timestamp_s,
             host_receive_ns=wait_return_monotonic_ns,
             frame_number=self.frame_id,
+        )
+        color_timestamp_s: float | None = None
+        color_timestamp_domain: int | None = None
+        color_frame_number: int | None = None
+        color_source_monotonic_ns = depth_clock_mapping.source_monotonic_ns
+        if color_frame is not None:
+            color_frame_number = int(color_frame.get_frame_number())
+            color_timestamp_s = float(color_frame.get_timestamp()) * 1e-3
+            color_timestamp_domain = int(color_frame.get_frame_timestamp_domain())
+            color_clock_mapping = self._color_clock_mapper.map(
+                device_time_s=color_timestamp_s,
+                host_receive_ns=wait_return_monotonic_ns,
+                frame_number=color_frame_number,
+            )
+            color_source_monotonic_ns = color_clock_mapping.source_monotonic_ns
+        source_monotonic_ns = min(
+            depth_clock_mapping.source_monotonic_ns, color_source_monotonic_ns
         )
         frame = CameraFrame(
             rgb=rgb,
             depth=depth,
             depth_raw=depth_raw,
-            timestamp=device_timestamp_s,
             host_time=host_time,
-            capture_monotonic_s=capture_monotonic_s,
             wait_return_monotonic_ns=wait_return_monotonic_ns,
-            align_done_monotonic_ns=align_done_monotonic_ns,
-            timestamp_domain=timestamp_domain,
-            source_monotonic_ns=clock_mapping.source_monotonic_ns,
-            camera_generation=clock_mapping.generation,
-            clock_reset=clock_mapping.clock_reset,
-            duplicate=clock_mapping.duplicate,
-            frame_gap=clock_mapping.frame_gap,
-            backlog_s=clock_mapping.backlog_ns / 1e9,
+            payload_ready_monotonic_ns=payload_ready_monotonic_ns,
+            depth_frame_number=self.frame_id,
+            color_frame_number=color_frame_number,
+            depth_device_timestamp_s=depth_timestamp_s,
+            color_device_timestamp_s=color_timestamp_s,
+            depth_timestamp_domain=depth_timestamp_domain,
+            color_timestamp_domain=color_timestamp_domain,
+            source_monotonic_ns=source_monotonic_ns,
+            camera_generation=depth_clock_mapping.generation,
+            clock_reset=depth_clock_mapping.clock_reset,
+            duplicate=depth_clock_mapping.duplicate,
+            frame_gap=depth_clock_mapping.frame_gap,
+            backlog_s=max(0, wait_return_monotonic_ns - source_monotonic_ns) / 1e9,
             frame_id=self.frame_id,
-            K=self.K.copy(),
-            intr=self.intr.copy(),
-            intrinsics_info=dict(self.intrinsics_info),
             depth_scale=float(self.depth_scale),
             camera_name=self.config.camera_name,
             serial=self.active_serial,
-            align_mode=self.config.align_mode,
-            frame_name=str(self.config.frame_name),
         )
 
         return frame
 
-    def get_intrinsics(self) -> np.ndarray:
-        if self.K is None:
-            raise RuntimeError(
-                "RealSense is not connected or intrinsics are unavailable."
-            )
-        return self.K.copy()
-
-    def get_intrinsics_info(self) -> dict:
-        if self.intrinsics_info is None:
-            raise RuntimeError(
-                "RealSense is not connected or intrinsics info is unavailable."
-            )
-        return dict(self.intrinsics_info)
+    def get_geometry(self) -> RGBDGeometry:
+        if self.geometry is None:
+            raise RuntimeError("RealSense native RGB-D geometry is unavailable.")
+        return RGBDGeometry.from_dict(self.geometry.to_dict())
 
     def get_depth_scale(self) -> float:
         if self.depth_scale is None:
@@ -627,6 +630,19 @@ class RealSense:
                 "RealSense is not connected or depth_scale is unavailable."
             )
         return float(self.depth_scale)
+
+    def get_l515_depth_option_snapshot(self) -> dict[str, Any] | None:
+        """Return the applied base/final L515 readbacks, if this is an L515."""
+        if self.l515_depth_option_snapshot is None:
+            return None
+        return {
+            "base_visual_preset": self.l515_depth_option_snapshot["base_visual_preset"],
+            "base_readbacks": dict(self.l515_depth_option_snapshot["base_readbacks"]),
+            "confidence_override": self.l515_depth_option_snapshot[
+                "confidence_override"
+            ],
+            "final_readbacks": dict(self.l515_depth_option_snapshot["final_readbacks"]),
+        }
 
     def get_device_info(self) -> dict:
         if self.profile is None:

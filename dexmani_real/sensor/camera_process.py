@@ -6,7 +6,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING
 
 from dexmani_real.config.defaults import camera
 from dexmani_real.robot.safety import SafetyState
@@ -42,21 +42,18 @@ class CameraLoopConfig:
     width: int = field(default_factory=lambda: camera.width)
     height: int = field(default_factory=lambda: camera.height)
     fps: int = field(default_factory=lambda: camera.fps)
-    align_mode: Literal["depth_to_color", "color_to_depth", "none"] = field(
-        default_factory=lambda: camera.align_mode
-    )
     warmup_frames: int = field(default_factory=lambda: camera.warmup_frames)
-    pointcloud_num_points: int = field(
-        default_factory=lambda: camera.pointcloud_num_points
-    )
     max_frame_age_s: float = field(default_factory=lambda: camera.max_frame_age_s)
     frame_gap_stall_threshold: int = field(
         default_factory=lambda: camera.frame_gap_stall_threshold
     )
+    l515_visual_preset: int = field(default_factory=lambda: camera.l515_visual_preset)
+    l515_confidence_threshold: int | None = field(
+        default_factory=lambda: camera.l515_confidence_threshold
+    )
     frame_queue_capacity: int = field(
         default_factory=lambda: camera.frame_queue_capacity
     )
-    desk_plane: tuple[float, float, float, float] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -66,10 +63,22 @@ class CameraLoopConfig:
             or self.max_frame_age_s <= 0
         ):
             raise ValueError("camera dimensions/rates must be positive")
-        if self.pointcloud_num_points <= 0:
-            raise ValueError("pointcloud_num_points must be positive")
+        if self.warmup_frames < 0:
+            raise ValueError("warmup_frames must be non-negative")
         if self.frame_gap_stall_threshold < 0:
             raise ValueError("frame_gap_stall_threshold must be >= 0")
+        if (
+            not isinstance(self.l515_visual_preset, int)
+            or isinstance(self.l515_visual_preset, bool)
+            or not 0 <= self.l515_visual_preset <= 5
+        ):
+            raise ValueError("l515_visual_preset must be an integer in [0, 5]")
+        if self.l515_confidence_threshold is not None and (
+            not isinstance(self.l515_confidence_threshold, int)
+            or isinstance(self.l515_confidence_threshold, bool)
+            or not 0 <= self.l515_confidence_threshold <= 3
+        ):
+            raise ValueError("l515_confidence_threshold must be in [0, 3] or None")
         if self.frame_queue_capacity <= 0:
             raise ValueError("frame_queue_capacity must be positive")
 
@@ -88,37 +97,31 @@ class CameraLoopConfig:
     @classmethod
     def from_runtime(cls, runtime: object) -> "CameraLoopConfig":
         cam = getattr(runtime, "camera")
-        # Use the resolved desk plane as the single source of truth.
-        table = getattr(getattr(runtime, "environment"), "table")
-        desk_plane = (
-            cast(
-                tuple[float, float, float, float],
-                tuple(float(v) for v in table.plane_abcd),
-            )
-            if table.enabled
-            else None
-        )
         return cls(
             serial=cam.serial,
             width=int(cam.width),
             height=int(cam.height),
             fps=int(cam.fps),
-            align_mode=cam.align_mode,
             warmup_frames=int(cam.warmup_frames),
-            pointcloud_num_points=int(cam.pointcloud_num_points),
             max_frame_age_s=float(cam.max_frame_age_s),
             frame_gap_stall_threshold=int(cam.frame_gap_stall_threshold),
+            l515_visual_preset=int(cam.l515_visual_preset),
+            l515_confidence_threshold=(
+                None
+                if cam.l515_confidence_threshold is None
+                else int(cam.l515_confidence_threshold)
+            ),
             frame_queue_capacity=int(cam.frame_queue_capacity),
-            desk_plane=desk_plane,
         )
 
 
 def pack_camera_frame(
     rgb: "np.ndarray",
     depth_raw: "np.ndarray",
-    timestamp: float,
-    capture_monotonic_s: float,
-    frame_id: int,
+    depth_device_timestamp_s: float,
+    color_device_timestamp_s: float | None,
+    depth_frame_number: int,
+    color_frame_number: int | None,
     pc_valid_depth_ratio: float = 0.0,
     camera_health: int = 0,
     source_monotonic_ns: int = 0,
@@ -128,16 +131,11 @@ def pack_camera_frame(
     duplicate: bool = False,
     backlog_s: float = 0.0,
     wait_return_monotonic_ns: int = 0,
-    align_done_monotonic_ns: int = 0,
-    timestamp_domain: int = 0,
+    payload_ready_monotonic_ns: int = 0,
+    depth_timestamp_domain: int = 0,
+    color_timestamp_domain: int | None = None,
 ) -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
-    """Pack one frame with explicit device, host-receive, align, and publish stages.
-
-    ``capture_monotonic_s`` is retained as the historical post-align timestamp.
-    New producers must also pass ``wait_return_monotonic_ns`` and
-    ``align_done_monotonic_ns``; old callers remain readable by falling back to
-    the legacy value for both stages.
-    """
+    """Pack one native RGB-D frame with explicit stream and host timing."""
     import numpy as np
 
     from dexmani_real.utils.schema import CAMERA_FRAME_HEADER_DTYPE
@@ -146,14 +144,18 @@ def pack_camera_frame(
     depth_arr = np.ascontiguousarray(depth_raw, dtype=np.uint16)
     if rgb_arr.ndim != 3 or rgb_arr.shape[2] != 3:
         raise ValueError(f"RGB frame must have shape (H, W, 3), got {rgb_arr.shape}")
-    if depth_arr.ndim != 2 or depth_arr.shape != rgb_arr.shape[:2]:
-        raise ValueError(
-            f"depth frame must match RGB H/W, got {depth_arr.shape} and {rgb_arr.shape}"
-        )
-    numeric = (timestamp, capture_monotonic_s, pc_valid_depth_ratio, backlog_s)
+    if depth_arr.ndim != 2:
+        raise ValueError(f"depth frame must have shape (H, W), got {depth_arr.shape}")
+    numeric: tuple[float, ...] = (
+        depth_device_timestamp_s,
+        pc_valid_depth_ratio,
+        backlog_s,
+    )
+    if color_device_timestamp_s is not None:
+        numeric = (*numeric, color_device_timestamp_s)
     if (
         not all(np.isfinite(value) for value in numeric)
-        or capture_monotonic_s < 0
+        or depth_device_timestamp_s < 0
         or backlog_s < 0
     ):
         raise ValueError(
@@ -162,35 +164,51 @@ def pack_camera_frame(
     if not 0.0 <= pc_valid_depth_ratio <= 1.0:
         raise ValueError("pc_valid_depth_ratio must be in [0, 1]")
     integers = (
-        frame_id,
+        depth_frame_number,
         source_monotonic_ns,
         camera_generation,
         wait_return_monotonic_ns,
-        align_done_monotonic_ns,
+        payload_ready_monotonic_ns,
     )
     if any(int(value) < 0 for value in integers) or frame_gap < 0:
         raise ValueError("camera frame identifiers/counts must be non-negative")
-    if not 0 <= int(timestamp_domain) <= 255:
-        raise ValueError("camera timestamp_domain must fit uint8")
+    if not 0 <= int(depth_timestamp_domain) <= 255:
+        raise ValueError("depth timestamp_domain must fit uint8")
+    if (
+        color_timestamp_domain is not None
+        and not 0 <= int(color_timestamp_domain) <= 254
+    ):
+        raise ValueError("color timestamp_domain must fit uint8")
+    if color_frame_number is not None and int(color_frame_number) < 0:
+        raise ValueError("color_frame_number must be non-negative")
     if int(camera_health) not in {int(item) for item in CameraHealth}:
         raise ValueError("camera_health is not a known CameraHealth value")
-    legacy_align_done_ns = max(0, round(capture_monotonic_s * 1e9))
-    receive_monotonic_ns = int(wait_return_monotonic_ns) or legacy_align_done_ns
-    align_done_ns = int(align_done_monotonic_ns) or legacy_align_done_ns
+    receive_monotonic_ns = int(wait_return_monotonic_ns)
+    payload_ready_ns = int(payload_ready_monotonic_ns)
+    if receive_monotonic_ns <= 0 or payload_ready_ns <= 0:
+        raise ValueError("native camera timing stages must be positive")
     if source_monotonic_ns > receive_monotonic_ns:
         raise ValueError("camera source time cannot be later than host receive time")
-    if align_done_ns < receive_monotonic_ns:
-        raise ValueError("camera align completion cannot precede host receive time")
+    if payload_ready_ns < receive_monotonic_ns:
+        raise ValueError("camera payload readiness cannot precede host receive time")
 
     header = np.zeros(1, dtype=CAMERA_FRAME_HEADER_DTYPE)
-    header["timestamp"] = np.float64(timestamp)
-    header["capture_monotonic_s"] = np.float64(capture_monotonic_s)
+    header["depth_device_timestamp_s"] = np.float64(depth_device_timestamp_s)
+    header["color_device_timestamp_s"] = np.float64(
+        np.nan if color_device_timestamp_s is None else color_device_timestamp_s
+    )
     header["source_monotonic_ns"] = np.uint64(source_monotonic_ns)
     header["receive_monotonic_ns"] = np.uint64(receive_monotonic_ns)
-    header["align_done_monotonic_ns"] = np.uint64(align_done_ns)
-    header["timestamp_domain"] = np.uint8(timestamp_domain)
+    header["payload_ready_monotonic_ns"] = np.uint64(payload_ready_ns)
+    header["depth_timestamp_domain"] = np.uint8(depth_timestamp_domain)
+    header["color_timestamp_domain"] = np.uint8(
+        255 if color_timestamp_domain is None else color_timestamp_domain
+    )
     header["camera_generation"] = np.uint64(camera_generation)
-    header["frame_number"] = np.uint64(frame_id)
+    header["depth_frame_number"] = np.uint64(depth_frame_number)
+    header["color_frame_number"] = np.uint64(
+        0 if color_frame_number is None else color_frame_number
+    )
     header["frame_gap"] = np.uint32(frame_gap)
     header["clock_reset"] = np.uint8(clock_reset)
     header["duplicate"] = np.uint8(duplicate)
@@ -209,9 +227,7 @@ def pack_camera_frame(
     return header, rgb_arr, depth_arr
 
 
-def camera_loop(
-    shared: "SharedStorage", config: CameraLoopConfig | None = None
-) -> None:
+def camera_loop(shared: "SharedStorage", config: CameraLoopConfig) -> None:
     """Run RealSense camera → write frames directly to ``shared.camera_ring``.
 
     Designed as an ``mp.Process`` target. Runs the camera capture loop directly
@@ -223,21 +239,13 @@ def camera_loop(
     import numpy as np
 
     _logger = get_logger("camera_loop")
-    cfg = config or CameraLoopConfig()
+    if not isinstance(config, CameraLoopConfig):
+        raise TypeError("camera_loop requires a CameraLoopConfig")
+    cfg = config
     failed = False
     _logger.debug("camera_loop: LOADING")
 
-    # Reject calibration/depth alignment mismatches before opening the SDK.
-    if cfg.align_mode != "depth_to_color":
-        _logger.error(
-            "camera_loop: align_mode=%r is unsupported for recording; "
-            "the color-optical calibration requires 'depth_to_color'",
-            cfg.align_mode,
-        )
-        _logger.info("camera_loop: exited")
-        return
-
-        # Limit library thread pools so process-level scheduling remains predictable.
+    # Limit library thread pools so process-level scheduling remains predictable.
     try:
         import cv2
 
@@ -247,7 +255,11 @@ def camera_loop(
 
     cam = None
     try:
-        from dexmani_real.sensor.realsense import RealSense, RealSenseConfig
+        from dexmani_real.sensor.realsense import (
+            L515DepthConfig,
+            RealSense,
+            RealSenseConfig,
+        )
 
         rs_config = RealSenseConfig(
             camera_name="realsense",
@@ -255,9 +267,12 @@ def camera_loop(
             depth_resolution=(cfg.width, cfg.height),
             color_resolution=(cfg.width, cfg.height),
             fps=cfg.fps,
-            align_mode=cfg.align_mode,
             warmup_frames=cfg.warmup_frames,
             frame_queue_capacity=cfg.frame_queue_capacity,
+            l515_depth_config=L515DepthConfig(
+                visual_preset=cfg.l515_visual_preset,
+                confidence_threshold=cfg.l515_confidence_threshold,
+            ),
         )
         cam = RealSense(rs_config)
 
@@ -279,51 +294,27 @@ def camera_loop(
         except Exception:
             _sdk_version = "unknown"
         shared.camera_sdk_version.value = _sdk_version[:63].ljust(64, "\x00").encode()
+        _geometry_json = json.dumps(cam.get_geometry().to_dict(), separators=(",", ":"))
+        _geometry_payload = _geometry_json.encode("utf-8")
+        if len(_geometry_payload) >= 2048:
+            raise RuntimeError("camera geometry exceeds shared metadata capacity")
+        shared.camera_geometry.value = _geometry_payload.ljust(2048, b"\x00")
         _profile_json = json.dumps(
             {
                 "streams": cam.get_active_profiles(),
-                "align_mode": cam.config.align_mode,
+                "payload_mode": "native_rgbd",
                 "frame_queue_capacity": cam.config.frame_queue_capacity,
-                "common_viewport": "color",
-                "output_optical_frame": cam.config.frame_name,
-                "output_intrinsics": cam.get_intrinsics_info(),
+                "l515_depth_options": cam.get_l515_depth_option_snapshot(),
+                "geometry": json.loads(_geometry_json),
             },
             separators=(",", ":"),
         )
-        shared.camera_profile.value = _profile_json[:2047].ljust(2048, "\x00").encode()
-        if cam.K is not None:
-            shared.camera_K[:] = cam.K.flatten().tolist()
-
-        try:
-            from dexmani_real.config.camera_calib import CameraCalib
-            from dexmani_real.sensor.pointcloud_processor import (
-                PointCloudProcessorConfig,
+        _profile_payload = _profile_json.encode("utf-8")
+        if len(_profile_payload) >= 2048:
+            raise RuntimeError(
+                "camera profile and L515 option snapshot exceed shared metadata capacity"
             )
-
-            calib = CameraCalib()
-            cam_name = calib.resolve_name_by_serial(str(cam.active_serial))
-            _t_world_camera = calib.get_extrinsics(cam_name)
-            pc_kwargs: dict[str, Any] = {
-                "num_points": cfg.pointcloud_num_points,
-                "desk_plane": cfg.desk_plane,
-            }
-            if cfg.desk_plane is None:
-                # With the table disabled, use workspace z_min.
-                pc_kwargs["desk_plane_path"] = ""
-            pc_config = PointCloudProcessorConfig(**pc_kwargs)
-            _pc_meta = json.dumps(pc_config.to_meta_dict(), separators=(",", ":"))
-            shared.camera_pointcloud_config.value = (
-                _pc_meta[:2047].ljust(2048, "\x00").encode()
-            )
-            _logger.info(
-                "camera_loop: pointcloud derivation config published, T pos=%s",
-                _t_world_camera[:3, 3].round(3).tolist(),
-            )
-        except Exception:
-            _logger.warning(
-                "camera_loop: pointcloud derivation config DISABLED", exc_info=True
-            )
-            shared.camera_pointcloud_config.value = "{}".ljust(2048, "\x00").encode()
+        shared.camera_profile.value = _profile_payload.ljust(2048, b"\x00")
 
         ready_published = False
         frame_gap_warn = ThrottledWarner(interval_s=5.0, logger=_logger)
@@ -333,6 +324,7 @@ def camera_loop(
                 not ready_published
                 or int(shared.safety_state.value) == int(SafetyState.DISARMED)
                 or bool(shared.is_recording.value)
+                or bool(shared.pointcloud_requested.value)
             )
             try:
                 frame = cam.read(timeout_ms=300, compute_depth=False)
@@ -367,9 +359,10 @@ def camera_loop(
                     header, rgb, depth = pack_camera_frame(
                         frame.rgb,  # type: ignore[arg-type]
                         frame.depth_raw,
-                        frame.timestamp,
-                        frame.capture_monotonic_s,
-                        frame.frame_id,
+                        frame.depth_device_timestamp_s,
+                        frame.color_device_timestamp_s,
+                        frame.depth_frame_number,
+                        frame.color_frame_number,
                         pc_valid_depth_ratio=pc_valid_depth_ratio,
                         camera_health=int(camera_health),
                         source_monotonic_ns=frame.source_monotonic_ns,
@@ -379,8 +372,9 @@ def camera_loop(
                         duplicate=frame.duplicate,
                         backlog_s=frame.backlog_s,
                         wait_return_monotonic_ns=frame.wait_return_monotonic_ns,
-                        align_done_monotonic_ns=frame.align_done_monotonic_ns,
-                        timestamp_domain=frame.timestamp_domain,
+                        payload_ready_monotonic_ns=frame.payload_ready_monotonic_ns,
+                        depth_timestamp_domain=frame.depth_timestamp_domain,
+                        color_timestamp_domain=frame.color_timestamp_domain,
                     )
                     shared.camera_ring.write(header, rgb, depth)
                     if not ready_published:

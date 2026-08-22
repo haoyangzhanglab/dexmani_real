@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/visualize_episode.py EPISODE [--info] [--max-frames N]``.
 
-Self-contained Rerun-based visualizer for supported schema-v17/v18/v19
+Self-contained Rerun-based visualizer for supported schema-v17-v20
 DexMani episodes. Offline only: connects to no hardware, writes no files;
 opens a Rerun viewer window (or prints a structure summary with ``--info``).
+Raw episodes are not used to reconstruct point clouds. Process an episode with
+``examples/process_episodes.py`` and use ``visualize_episode_processed.py`` to
+inspect its fixed-size ``(N, 6)`` point cloud.
 
 Examples::
 
@@ -32,7 +35,6 @@ import rerun.blueprint as rrb
 
 from dexmani_real.recording.episode_reader import EpisodeReader, MergedH5File
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.pointcloud_utils import depth_to_meters
 from dexmani_real.utils.schema import HAND_FINGERTIP_SHAPE
 
 logger = get_logger(__name__)
@@ -158,10 +160,6 @@ class EpisodeVisualizer:
         h5_path: str,
         max_frames: int | None = None,
         depth_scale: float | None = None,
-        point_cloud: bool = True,
-        pc_stride: int = 4,
-        pc_min_depth: float = 0.1,
-        pc_max_depth: float = 2.0,
     ):
         self._h5_path = Path(h5_path)
         self._reader = EpisodeReader(h5_path)
@@ -204,9 +202,6 @@ class EpisodeVisualizer:
                 elif "depth" in self._h5f:
                     raise ValueError("episode is missing /meta depth_scale")
             self._depth_meter = 1.0 / (depth_scale if depth_scale else 0.001)
-            self._depth_scale = (
-                depth_scale if depth_scale else 0.001
-            )  # meters per raw unit
 
             # Camera extrinsics: camera_T_world_camera (4x4 row-major) maps camera → world.
             self._cam_R: np.ndarray | None = None
@@ -224,49 +219,6 @@ class EpisodeVisualizer:
             else:
                 logger.info(
                     "No camera extrinsics in /meta — camera frame = world frame (identity)"
-                )
-
-            self._pc_enabled = point_cloud and "depth" in (
-                self._available.get("camera") or []
-            )
-            self._pc_stride = max(1, pc_stride)
-            self._pc_min_depth = pc_min_depth
-            self._pc_max_depth = pc_max_depth
-            self._pc_cache: dict[int, tuple[np.ndarray, np.ndarray | None]] = {}
-
-            self._pc_K: np.ndarray | None = None
-            self._pc_rays: tuple[np.ndarray, np.ndarray] | None = (
-                None  # (u_strided, v_strided)
-            )
-            if self._pc_enabled:
-                meta = self._h5f.get("meta")
-                if meta is not None and "camera_K" in meta.attrs:
-                    self._pc_K = np.asarray(
-                        meta.attrs["camera_K"], dtype=float
-                    ).reshape(3, 3)
-                    depth_shape = (
-                        self._depth_cache.shape
-                        if self._depth_cache is not None
-                        else self._h5f["depth"].shape
-                    )
-                    h, w = depth_shape[1], depth_shape[2]
-                    self._pc_h, self._pc_w = h, w
-                    v, u = np.mgrid[0 : h : self._pc_stride, 0 : w : self._pc_stride]
-                    self._pc_rays = (u.astype(np.float32), v.astype(np.float32))
-                    logger.info(
-                        "Point cloud enabled: stride=%d → ~%d points/frame, depth=[%.2f, %.2f]m",
-                        self._pc_stride,
-                        u.size,
-                        self._pc_min_depth,
-                        self._pc_max_depth,
-                    )
-                else:
-                    logger.warning("Point cloud disabled: no camera_K in /meta")
-                    self._pc_enabled = False
-
-            if self._pc_enabled:
-                logger.info(
-                    "Point cloud derived from depth back-projection + camera_K."
                 )
 
             self._T = self._resolve_frame_count(max_frames)
@@ -349,40 +301,6 @@ class EpisodeVisualizer:
 
         return state
 
-    @staticmethod
-    def _depth_to_pointcloud(
-        depth: np.ndarray,
-        K: np.ndarray,
-        u_strided: np.ndarray,
-        v_strided: np.ndarray,
-        rgb: np.ndarray | None,
-        depth_scale: float,
-        stride: int,
-        min_depth: float,
-        max_depth: float,
-    ) -> tuple[np.ndarray, np.ndarray | None]:
-        """Back-project a strided depth frame to camera-frame points (N,3) + optional colors (N,3)."""
-        depth_m = depth_to_meters(depth, depth_scale=depth_scale)
-        depth_strided = depth_m[::stride, ::stride]
-        z = depth_strided.astype(np.float32)
-
-        fx, fy = float(K[0, 0]), float(K[1, 1])
-        cx, cy = float(K[0, 2]), float(K[1, 2])
-        x = (u_strided - cx) * z / fx
-        y = (v_strided - cy) * z / fy
-
-        valid = (z > min_depth) & (z < max_depth) & np.isfinite(z)
-        if not valid.any():
-            return np.zeros((0, 3), dtype=np.float32), None
-
-        points = np.stack([x[valid], y[valid], z[valid]], axis=-1).astype(np.float32)
-
-        colors = None
-        if rgb is not None:
-            colors = rgb[::stride, ::stride][valid]
-
-        return points, colors
-
     def _build_blueprint(self) -> rrb.Blueprint:
         """Build Rerun view layout from detected data categories."""
         has_state = bool(self._available.get("arm") or self._available.get("hand"))
@@ -399,12 +317,11 @@ class EpisodeVisualizer:
         if cam_views:
             columns.append(rrb.Vertical(contents=cam_views, name="Camera"))
 
-        _has_3d = self._pc_enabled or "hand_fingertip" in self._state
-        if _has_3d:
+        if "hand_fingertip" in self._state:
             columns.append(
                 rrb.Spatial3DView(
                     origin="/",
-                    name="Point Cloud",
+                    name="Fingertips",
                     background=[0.12, 0.12, 0.14],
                 )
             )
@@ -560,36 +477,6 @@ class EpisodeVisualizer:
                 rr.DepthImage(depth, meter=self._depth_meter, depth_range=(0, 10000)),
             )  # clamp outliers to stabilize colormap
 
-        if self._pc_enabled and self._pc_K is not None and self._pc_rays is not None:
-            if cam_idx not in self._pc_cache:
-                depth = (
-                    self._depth_cache[cam_idx]
-                    if self._depth_cache is not None
-                    else self._h5f["depth"][cam_idx]
-                )
-                rgb = (
-                    self._rgb_cache[cam_idx]
-                    if self._rgb_cache is not None
-                    else (self._h5f["rgb"][cam_idx] if "rgb" in camera_keys else None)
-                )
-                u_strided, v_strided = self._pc_rays
-                self._pc_cache[cam_idx] = self._depth_to_pointcloud(
-                    depth=depth,
-                    K=self._pc_K,
-                    u_strided=u_strided,
-                    v_strided=v_strided,
-                    rgb=rgb,
-                    depth_scale=self._depth_scale,
-                    stride=self._pc_stride,
-                    min_depth=self._pc_min_depth,
-                    max_depth=self._pc_max_depth,
-                )
-            points, colors = self._pc_cache[cam_idx]
-            if points.shape[0] > 0:
-                if self._cam_R is not None:
-                    points = points @ self._cam_R.T + self._cam_t
-                rr.log("pcd", rr.Points3D(positions=points, colors=colors, radii=0.003))
-
     def _log_fingertips(self, step_idx: int) -> None:
         """Render hand_fingertip FK positions as per-finger colored keypoints."""
         fp_data = self._state.get("hand_fingertip")
@@ -656,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "episode",
         type=str,
-        help="Path to a supported schema-v17/v18/v19 episodes/<task_name>/episode_* directory.",
+        help="Path to a supported schema-v17-v20 episodes/<task_name>/episode_* directory.",
     )
     parser.add_argument(
         "--max-frames",
@@ -675,31 +562,6 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Print structure summary and exit without starting a Rerun viewer.",
     )
-    parser.add_argument(
-        "--point-cloud",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable 3D point cloud from depth.",
-    )
-    parser.add_argument(
-        "--pc-stride",
-        type=int,
-        default=4,
-        help="Pixel stride for point cloud downsampling (default: 4).",
-    )
-    parser.add_argument(
-        "--pc-min-depth",
-        type=float,
-        default=0.1,
-        help="Min depth for point cloud filtering in meters (default: 0.1).",
-    )
-    parser.add_argument(
-        "--pc-max-depth",
-        type=float,
-        default=2.0,
-        help="Max depth for point cloud filtering in meters (default: 2.0).",
-    )
-
     args = parser.parse_args(argv)
     h5_path = Path(args.episode).expanduser().resolve()
     if not h5_path.exists():
@@ -714,10 +576,6 @@ def main(argv: list[str] | None = None) -> int:
         str(h5_path),
         max_frames=args.max_frames,
         depth_scale=args.depth_scale,
-        point_cloud=args.point_cloud,
-        pc_stride=args.pc_stride,
-        pc_min_depth=args.pc_min_depth,
-        pc_max_depth=args.pc_max_depth,
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.num_steps)

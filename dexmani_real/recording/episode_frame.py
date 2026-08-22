@@ -217,21 +217,27 @@ def build_episode_frame(
         "flag_safety_reject": bool(signal.get("flag_safety_reject", False)),
         "camera_health": _scalar_int(camera.get("camera_health", 1)),
         "flag_camera_fresh": bool(camera.get("camera_fresh", False)),
-        "camera_frame_number": _scalar_int(camera.get("frame_number", 0)),
+        "camera_depth_frame_number": _scalar_int(camera.get("depth_frame_number", 0)),
+        "camera_color_frame_number": _scalar_int(camera.get("color_frame_number", 0)),
         "camera_ring_sequence": _scalar_int(camera.get("ring_sequence", 0)),
-        "camera_device_timestamp_s": _scalar_float(
-            camera.get("device_timestamp_s", np.nan)
+        "camera_depth_device_timestamp_s": _scalar_float(
+            camera.get("depth_device_timestamp_s", np.nan)
         ),
-        "camera_capture_monotonic_s": _scalar_float(
-            camera.get("capture_monotonic_s", np.nan)
+        "camera_color_device_timestamp_s": _scalar_float(
+            camera.get("color_device_timestamp_s", np.nan)
         ),
         "camera_wait_return_monotonic_ns": _scalar_int(
             camera.get("wait_return_monotonic_ns", 0)
         ),
-        "camera_align_done_monotonic_ns": _scalar_int(
-            camera.get("align_done_monotonic_ns", 0)
+        "camera_payload_ready_monotonic_ns": _scalar_int(
+            camera.get("payload_ready_monotonic_ns", 0)
         ),
-        "camera_timestamp_domain": _scalar_int(camera.get("timestamp_domain", 0)),
+        "camera_depth_timestamp_domain": _scalar_int(
+            camera.get("depth_timestamp_domain", 0)
+        ),
+        "camera_color_timestamp_domain": _scalar_int(
+            camera.get("color_timestamp_domain", 255)
+        ),
         "camera_age_s": _scalar_float(camera.get("camera_age_s", np.nan)),
         "camera_generation": _scalar_int(camera.get("camera_generation", 0)),
         "camera_clock_reset": bool(camera.get("clock_reset", False)),
@@ -325,13 +331,15 @@ def decode_record_sample(
     camera_frame: dict[str, object] = {
         "camera_health": int(record["camera_health"]),
         "camera_fresh": bool(record["camera_fresh"]),
-        "frame_number": int(record["camera_frame_number"]),
+        "depth_frame_number": int(record["camera_depth_frame_number"]),
+        "color_frame_number": int(record["camera_color_frame_number"]),
         "ring_sequence": int(record["camera_ring_sequence"]),
-        "device_timestamp_s": float(record["camera_device_timestamp_s"]),
-        "capture_monotonic_s": float(record["camera_capture_monotonic_s"]),
+        "depth_device_timestamp_s": float(record["camera_depth_device_timestamp_s"]),
+        "color_device_timestamp_s": float(record["camera_color_device_timestamp_s"]),
         "wait_return_monotonic_ns": int(record["camera_wait_return_monotonic_ns"]),
-        "align_done_monotonic_ns": int(record["camera_align_done_monotonic_ns"]),
-        "timestamp_domain": int(record["camera_timestamp_domain"]),
+        "payload_ready_monotonic_ns": int(record["camera_payload_ready_monotonic_ns"]),
+        "depth_timestamp_domain": int(record["camera_depth_timestamp_domain"]),
+        "color_timestamp_domain": int(record["camera_color_timestamp_domain"]),
         "camera_age_s": float(record["camera_age_s"]),
         "camera_generation": int(record["camera_generation"]),
         "clock_reset": bool(record["camera_clock_reset"]),

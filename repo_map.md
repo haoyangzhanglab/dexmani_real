@@ -20,6 +20,7 @@
 | `code_style.md` | 面向个人博士科研、数据采集和模型部署的具体编码风格与审查清单。 |
 | `README.md` | 面向使用者的能力概览、架构、环境、命令、配置和数据流说明。 |
 | `repo_map.md` | 当前逐文件职责索引。 |
+| `l515_camera_timing_known_limitation.md` | L515 color 实际约 16.68 Hz、重复 RGB 与动态颜色错位的实测证据、当前接受范围和后续议题。 |
 | `user_design.md` | 使用者确认的遥操作与物理回放桌面碰撞、XHand 抓取过流行为取舍及其安全边界。 |
 | `pyproject.toml` | Python 包元数据、基础依赖、setuptools 包发现、内置 JSON 数据声明与 Black-compatible isort 配置。 |
 
@@ -29,10 +30,10 @@
 |---|---|
 | 遥操作 | `examples/collect_teleop.py` → `teleop/session.py` → device workers + `teleop/loop.py` → operator controls / control grid → safety gate → command publication → command IPC。 |
 | 键盘控制 | `examples/keyboard_teleop.py` → `teleop/keyboard_session.py` → safety gate → command publication → arm/hand workers。 |
-| 策略部署 | `examples/run_policy.py` → `deployment/lifecycle.py` → inference worker → plan ring → coordinator → safety gate。 |
+| 策略部署 | `examples/run_policy.py` → `deployment/lifecycle.py` →（按 observation contract 可选 camera → latest-only pointcloud）→ inference worker → plan ring → coordinator → safety gate。 |
 | 录制 | teleop fixed-grid sample → `recording/recorder_client.py` → `EpisodeFrame` ownership-copy → RecorderIO / `EpisodeRecorder` transaction → `EpisodeDataWriter` data.h5 append + camera sidecars → finalize。 |
 | 回放 | `examples/replay_episode.py` → `robot/replay_trajectory.py` preflight → `robot/episode_replay.py` lifecycle → `robot/replay_controller.py` → safety gate / command publication → workers → `robot/replay_evaluation.py`。 |
-| 离线数据 | raw v17/v18/v19 episode → cleaning/pipeline → processed HDF5 v3 → Policy Zarr v2。 |
+| 离线数据 | native RGB-D raw v20 → processed HDF5 v4 → Policy Zarr v2。 |
 
 ## 3. Python package
 
@@ -89,7 +90,7 @@
 | `dexmani_real/robot/episode_replay.py` | 真实机器人回放 session owner；负责 worker、safety transition、operator flow、评估调用与 cleanup。 |
 | `dexmani_real/robot/replay_controller.py` | preflight 后轨迹的 fixed-rate safety-gated 命令调度、反馈检查与 terminal outcome。 |
 | `dexmani_real/robot/replay_capture.py` | 回放期间 measured state、sent command 与 rejection provenance 的有界内存捕获。 |
-| `dexmani_real/robot/replay_trajectory.py` | raw replay trajectory 加载与 processed HDF5 v3 加载、hand-action requirement、provenance 与模型/几何 preflight。 |
+| `dexmani_real/robot/replay_trajectory.py` | raw replay trajectory 加载与 processed HDF5 v4 加载、hand-action requirement、provenance 与模型/几何 preflight。 |
 | `dexmani_real/robot/replay_evaluation.py` | 回放跟踪/一致性指标、报告和结果文件持久化。 |
 
 ### `dexmani_real/sensor/`
@@ -97,11 +98,13 @@
 | 文件 | 职责 |
 |---|---|
 | `dexmani_real/sensor/__init__.py` | 传感器子包标记。 |
-| `dexmani_real/sensor/realsense.py` | RealSense D400/L515 驱动；原生帧率读取、对齐、intrinsics，以及 device/SDK-return/align 时间戳。 |
-| `dexmani_real/sensor/camera_process.py` | RealSense worker；以设备帧率发布、时间映射、健康状态和 camera ring。 |
+| `dexmani_real/sensor/camera_geometry.py` | 纯数据 native depth/color intrinsics 与 `T_color_from_depth` 合同。 |
+| `dexmani_real/sensor/realsense.py` | RealSense D400/L515 驱动；native RGB-D ownership copy、L515 preset 与分流时序。 |
+| `dexmani_real/sensor/camera_process.py` | RealSense worker；发布 native RGB-D、静态 geometry、时间映射、健康状态和 camera ring。 |
+| `dexmani_real/sensor/pointcloud.py` | SDK-free native depth/RGB 到 xArm-base 固定点云的确定性几何链。 |
+| `dexmani_real/sensor/pointcloud_process.py` | latest-only realtime worker；从 camera ring 生成固定 `float32[N,6]` 并携来源时序发布到 pointcloud ring。 |
 | `dexmani_real/sensor/clock_sync.py` | device clock 到 host monotonic clock 的保守映射、reset 检测与相对 delivery-delay 诊断。 |
 | `dexmani_real/sensor/vr_receiver_process.py` | crash-isolated HTS/Quest 接收 worker 与 VR frame 发布。 |
-| `dexmani_real/sensor/pointcloud_processor.py` | RGB-D 到固定点数世界坐标点云的滤波、裁剪、桌面去除与采样。 |
 | `dexmani_real/sensor/camera_calibration.py` | ArUco 检测、eye-to-hand 求解、残差筛选与标定文件持久化；不打开设备或 GUI。 |
 | `dexmani_real/sensor/camera_calibration_control.py` | 标定用 arm feedback、运动状态、workspace clipping、gated publish、quit hold 与归位。 |
 | `dexmani_real/sensor/camera_calibration_session.py` | xArm7 + RealSense 标定 lifecycle 的 side-effect owner：设备、采样、GUI、交互与失败 cleanup。 |
@@ -166,17 +169,17 @@
 | 文件 | 职责 |
 |---|---|
 | `dexmani_real/recording/__init__.py` | 录制子包标记。 |
-| `dexmani_real/recording/episode_schema.py` | raw episode v17/v18/v19 dataset shape/dtype、相机阶段时间戳语义与 quality metric 合同。 |
+| `dexmani_real/recording/episode_schema.py` | raw episode v17–v20 dataset shape/dtype、native RGB-D provenance 与 quality metric 合同。 |
 | `dexmani_real/recording/episode_frame.py` | shared-memory record/legacy inputs 到 immutable typed episode row 的唯一解码、schema shaping 与 ownership-copy 边界。 |
 | `dexmani_real/recording/timestamp_buffer.py` | 多速率输入到 fixed-grid row 的 timestamp 对齐、填充原因和容量管理。 |
-| `dexmani_real/recording/episode_recorder.py` | raw v19 `EpisodeFrame` 的 fixed-grid 对齐、事务式录制、质量汇总、sidecar 验证与原子发布。 |
+| `dexmani_real/recording/episode_recorder.py` | raw v20 `EpisodeFrame` 的 fixed-grid 对齐、事务式录制、质量汇总、sidecar 验证与原子发布。 |
 | `dexmani_real/recording/episode_data_writer.py` | 单个 `data.h5` handle、dataset append 与 flushed offset 的唯一 owner。 |
 | `dexmani_real/recording/camera_stream_writer.py` | grid-aligned RGB/depth 的有界后台 writer 与失败传播。 |
 | `dexmani_real/recording/video_codec.py` | PyAV RGB video encoder/decoder 与 codec 配置。 |
 | `dexmani_real/recording/recorder_client.py` | policy/teleop 侧 recorder control protocol、sample 发布和 stop result。 |
 | `dexmani_real/recording/io_process.py` | 独立 RecorderIO worker；`_RecorderIOSession` 按 sequence 连续取得未确认 sample、监控 backlog，拥有 active generation、episode transaction 与有界 finalize。 |
 | `dexmani_real/recording/transaction.py` | 同文件系统 fsync、atomic publish 和 atomic JSON helper。 |
-| `dexmani_real/recording/episode_reader.py` | published v17/v18/v19 episode 校验、HDF5 sidecar merged view 与 RGB/depth 读取。 |
+| `dexmani_real/recording/episode_reader.py` | published v17–v20 episode 校验、HDF5 sidecar merged view 与 RGB/depth 读取。 |
 
 ### `dexmani_real/data_processing/`
 
@@ -186,8 +189,8 @@
 | `dexmani_real/data_processing/contracts.py` | output profile、quality/bridge policy、processing config、annotation 与 decision 合同。 |
 | `dexmani_real/data_processing/quality.py` | 停滞、抖动、突变等 temporal quality 的纯函数审计。 |
 | `dexmani_real/data_processing/cleaning.py` | 将 raw flags、limits、annotations 与质量结果组合为保留/拒绝决策。 |
-| `dexmani_real/data_processing/transforms.py` | RGB/depth/intrinsics resize 与 point-cloud 采样的确定性数值变换。 |
-| `dexmani_real/data_processing/pipeline.py` | 逐 raw episode 生成 processed HDF5 v3，验证整批并事务式发布 index。 |
+| `dexmani_real/data_processing/transforms.py` | RGB、native depth 与 color intrinsics resize 的确定性数值变换。 |
+| `dexmani_real/data_processing/pipeline.py` | 逐 native raw v20 episode 生成 processed HDF5 v4，点云只派生一次，并事务式验证/发布整批。 |
 | `dexmani_real/data_processing/zarr_export.py` | 校验同任务 processed HDF5，并事务式导出最小 Policy Zarr v2。 |
 
 ### `dexmani_real/deployment/`
@@ -196,9 +199,9 @@
 |---|---|
 | `dexmani_real/deployment/__init__.py` | learned-policy 部署子包标记。 |
 | `dexmani_real/deployment/contracts.py` | inference context、joint action chunk 与 backend/observation/action adapter protocols。 |
-| `dexmani_real/deployment/config.py` | deployment YAML/CLI 合并、类型校验、required target 校验与 SHA-256 identity。 |
-| `dexmani_real/deployment/observation.py` | 因果、不可变 arm/hand/tactile/camera history windows 与 observation batch。 |
-| `dexmani_real/deployment/worker.py` | inference worker：`module:symbol` backend/adapter factory 惰性加载、读取历史、编码 observation、运行 backend、解码并发布 plan。 |
+| `dexmani_real/deployment/config.py` | deployment YAML/CLI 合并、点云 N/类型校验、required target 校验与 SHA-256 identity。 |
+| `dexmani_real/deployment/observation.py` | 因果、不可变 arm/hand/tactile history windows、最新点云帧与 observation batch。 |
+| `dexmani_real/deployment/worker.py` | inference worker：`module:symbol` backend/adapter factory 惰性加载、读取并校验因果历史（含新鲜点云）、编码 observation、运行 backend、解码并发布 plan。 |
 | `dexmani_real/deployment/coordinator.py` | learned-policy 唯一 command producer；采纳 plan、选择 due step 并通过安全门发布。 |
 | `dexmani_real/deployment/lifecycle.py` | policy worker topology、SharedStorage、readiness、ARMED、supervision、verified shutdown 与启动 provenance 日志（含文件 SHA-256）。 |
 | `dexmani_real/deployment/metrics.py` | inference/coordinator 计数、reject 分类和周期性日志。 |
@@ -209,14 +212,14 @@
 | 文件 | 职责 |
 |---|---|
 | `dexmani_real/integrations/__init__.py` | 外部模型仓库集成子包标记。 |
-| `dexmani_real/integrations/dexmani_policy.py` | `dexmani_policy` 的 observation/backend/action 三个适配器与 joint-action fail-closed 边界。 |
+| `dexmani_real/integrations/dexmani_policy.py` | `dexmani_policy` 的 observation/backend/action 三个适配器、单帧 `(N,6)` 点云输出与 joint-action fail-closed 边界。 |
 
 ### `dexmani_real/utils/`
 
 | 文件 | 职责 |
 |---|---|
 | `dexmani_real/utils/__init__.py` | 通用工具子包标记。 |
-| `dexmani_real/utils/schema.py` | cross-process NumPy dtype、shape、field size、recording sample dtype 与 NaN array 构造的 canonical 定义。 |
+| `dexmani_real/utils/schema.py` | cross-process NumPy dtype、固定点云 N/shape、field size、recording sample dtype 与 NaN array 构造的 canonical 定义。 |
 | `dexmani_real/utils/limits.py` | XHand mechanical/command/home limit 层级一致性校验。 |
 | `dexmani_real/utils/hand_health.py` | teleop、replay、deployment 共用的 arm/hand feedback freshness 与 finite 健康判断。 |
 | `dexmani_real/utils/serialization.py` | dataclass 从 mapping 递归恢复的共享 helper。 |
@@ -224,7 +227,6 @@
 | `dexmani_real/utils/rate_manager.py` | 可选精确忙等的 absolute-deadline rate limiting 与 overrun 统计。 |
 | `dexmani_real/utils/retry.py` | consecutive-event 计数与阈值升级。 |
 | `dexmani_real/utils/log.py` | 中央 logging、native stdout capture、diagnostic 提取与 throttled warning。 |
-| `dexmani_real/utils/pointcloud_utils.py` | RGB-D deprojection、坐标变换、crop、voxel/FPS sampling、packing 与 depth 可视化。 |
 
 ## 4. 可执行入口
 
@@ -235,16 +237,16 @@
 |---|---|
 | `examples/collect_teleop.py` | 解析 runtime overrides、task/operator/no-hand/no-record，并启动 VR teleop 数据采集。 |
 | `examples/keyboard_teleop.py` | 解析 runtime config 和 no-hand 确认，并启动 keyboard teleop。 |
-| `examples/run_policy.py` | 解析 runtime/deployment config、backend targets 和 checkpoint，并启动 policy deployment。 |
-| `examples/replay_episode.py` | 加载 raw episode 或（`--processed`）processed HDF5 v3、解析 replay runtime、显示 provenance，并启动真实机器人回放。 |
-| `examples/process_episodes.py` | raw → processed HDF5 离线处理 CLI：逐 episode 审计进度（tqdm）、损坏 episode 自动跳过与 JSON report；管线在 `data_processing/`。 |
+| `examples/run_policy.py` | 解析 runtime/deployment config、backend targets、checkpoint 与点云 N，并启动 policy deployment。 |
+| `examples/replay_episode.py` | 加载 raw episode 或（`--processed`）processed HDF5 v4、解析 replay runtime、显示 provenance，并启动真实机器人回放。 |
+| `examples/process_episodes.py` | raw → processed HDF5 离线处理 CLI：选择标准点云 N、逐 episode 审计进度（tqdm）、损坏 episode 自动跳过与 JSON report；管线在 `data_processing/`。 |
 | `examples/export_policy_zarr.py` | processed HDF5 → Policy Zarr 离线导出 CLI：argparse 与 JSON report；导出事务在 `data_processing/zarr_export.py`。 |
-| `examples/visualize_episode.py` | 自包含 Rerun raw-episode 可视化（离线、不连硬件）：metadata、robot state、camera 和点云。 |
-| `examples/visualize_episode_processed.py` | 自包含 Rerun processed-HDF5-v3 可视化（离线、不连硬件）：文件内 rgb/depth、预计算 xArm-base 点云、joint/action/触觉时间序列。 |
+| `examples/visualize_episode.py` | 自包含 Rerun raw-episode 可视化（离线、不连硬件）：metadata、robot state 与实际存储的 camera 数据；不合成点云。 |
+| `examples/visualize_episode_processed.py` | 自包含 Rerun processed-HDF5-v4 可视化（离线、不连硬件）：校验并显示文件内 native-derived rgb/depth、固定 `(N,6)` xArm-base 点云、joint/action/触觉时间序列。 |
 | `examples/calibrate_camera.py` | xArm7 + RealSense eye-to-hand ArUco 标定入口。 |
 | `examples/calibrate_vr_heading.py` | 收集 HTS head/wrist orientation、评估质量并原子更新 VR transform。 |
-| `examples/realsense_record_example.py` | 自包含 RealSense RGB-D/点云交互诊断：连接相机，打开 cv2/Open3D GUI，不写标定。 |
-| `examples/pointcloud_process_example.py` | 自包含 L515 tabletop 点云与 desk-plane 标定诊断：连接相机，打开 GUI，确认后写 `desk_plane.json`。 |
+| `examples/inspect_l515.py` | L515 native RGB-D 几何、option readback、跨流时序与 Z16 场景基线采集；只连接相机，无 GUI，不写标定。 |
+| `examples/check_l515_native_shadow.py` | 离线读取带 RGB 的 L515 inspection capture，以标准 N 运行 native xArm-base 点云与 RGB projection shadow gate。 |
 | `examples/xhand_control_example.py` | XHand 独立连接、状态/触觉读取和 preset command 交互诊断。 |
 
 ## 5. Retargeting 与语音资源

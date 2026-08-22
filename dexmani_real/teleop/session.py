@@ -322,7 +322,6 @@ def _build_processes(
                 )
             ),
             resolved_config_sha256=runtime.sha256,
-            align_mode=camera_config.align_mode,
             provenance=provenance,
             writer_queue_size=int(runtime.camera.writer_queue_size),
         )

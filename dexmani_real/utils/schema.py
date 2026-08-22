@@ -7,6 +7,8 @@ schemas; the schema layer must never depend on any of those implementations.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 RECORD_TASK_LABEL_BYTES = 128
@@ -56,6 +58,62 @@ HAND_FINGERTIP_SHAPE = (HAND_FINGER_COUNT, 3)
 
 # Runtime IPC capacity for learned-policy plans; adapters must not truncate larger requests.
 MAX_POLICY_CHUNK_STEPS = 32
+
+# Realtime point-cloud transport is fixed-size per deployment. Keeping the
+# supported sizes explicit prevents a model/SharedStorage shape mismatch from
+# reaching the inference boundary.
+POINT_CLOUD_FEATURE_DIM = 6
+SUPPORTED_POINT_CLOUD_COUNTS = frozenset({1024, 2048, 4096, 8192})
+
+
+def make_pointcloud_frame_dtype(num_points: int) -> np.dtype:
+    """Return the latest-only realtime point-cloud IPC schema."""
+    if (
+        isinstance(num_points, bool)
+        or int(num_points) not in SUPPORTED_POINT_CLOUD_COUNTS
+    ):
+        raise ValueError(
+            "point-cloud count must be one of "
+            f"{sorted(SUPPORTED_POINT_CLOUD_COUNTS)}, got {num_points!r}"
+        )
+    count = int(num_points)
+    return np.dtype(
+        [
+            ("source_camera_sequence", "<u8"),
+            ("source_monotonic_ns", "<u8"),
+            ("camera_publish_monotonic_ns", "<u8"),
+            ("publish_monotonic_ns", "<u8"),
+            ("camera_generation", "<u8"),
+            ("depth_frame_number", "<u8"),
+            ("color_frame_number", "<u8"),
+            ("point_cloud", "<f4", (count, POINT_CLOUD_FEATURE_DIM)),
+        ],
+        align=True,
+    )
+
+
+def validate_point_cloud_array(
+    value: Any,
+    *,
+    num_points: int,
+    label: str = "point_cloud",
+) -> np.ndarray:
+    """Validate the canonical finite ``float32[N,6]`` xyzrgb payload."""
+    if isinstance(num_points, bool) or int(num_points) <= 0:
+        raise ValueError("num_points must be a positive integer")
+    array = np.asarray(value)
+    expected_shape = (int(num_points), POINT_CLOUD_FEATURE_DIM)
+    if array.shape != expected_shape or array.dtype != np.float32:
+        raise ValueError(
+            f"{label} must be float32 {expected_shape}, "
+            f"got shape={array.shape} dtype={array.dtype}"
+        )
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{label} contains NaN/Inf")
+    if np.any(array[:, 3:] < 0.0) or np.any(array[:, 3:] > 1.0):
+        raise ValueError(f"{label} RGB values must be in [0,1]")
+    return array
+
 
 _HAND_COMMAND_COMMON_FIELDS = [
     ("run_generation", "<u8"),
@@ -189,18 +247,20 @@ VR_FRAME_DTYPE = np.dtype(
 
 CAMERA_FRAME_HEADER_DTYPE = np.dtype(
     [
-        ("timestamp", "<f8"),
-        ("capture_monotonic_s", "<f8"),
+        ("depth_device_timestamp_s", "<f8"),
+        ("color_device_timestamp_s", "<f8"),
         ("source_monotonic_ns", "<u8"),
         ("receive_monotonic_ns", "<u8"),
-        # ``receive`` is the host timestamp immediately after wait_for_frames;
-        # ``align_done`` separates alignment from shared-memory publication.
-        ("align_done_monotonic_ns", "<u8"),
-        # librealsense rs2_timestamp_domain value for ``timestamp``.
-        ("timestamp_domain", "<u1"),
+        # ``receive`` is immediately after wait_for_frames; payload readiness
+        # is after owned native RGB/depth NumPy copies.
+        ("payload_ready_monotonic_ns", "<u8"),
+        ("depth_timestamp_domain", "<u1"),
+        # 255 denotes that no color stream is present.
+        ("color_timestamp_domain", "<u1"),
         ("publish_monotonic_ns", "<u8"),
         ("camera_generation", "<u8"),
-        ("frame_number", "<u8"),
+        ("depth_frame_number", "<u8"),
+        ("color_frame_number", "<u8"),
         ("frame_gap", "<u4"),
         ("clock_reset", "<u1"),
         ("duplicate", "<u1"),
@@ -339,14 +399,15 @@ def make_record_sample_dtype(
             ("flag_frame_status", "<u1"),
             ("camera_health", "<u1"),
             ("camera_fresh", "<u1"),
-            ("camera_frame_number", "<u8"),
+            ("camera_depth_frame_number", "<u8"),
+            ("camera_color_frame_number", "<u8"),
             ("camera_ring_sequence", "<u8"),
-            ("camera_device_timestamp_s", "<f8"),
-            # Legacy post-align host timestamp. v19 adds its explicit stages.
-            ("camera_capture_monotonic_s", "<f8"),
+            ("camera_depth_device_timestamp_s", "<f8"),
+            ("camera_color_device_timestamp_s", "<f8"),
             ("camera_wait_return_monotonic_ns", "<u8"),
-            ("camera_align_done_monotonic_ns", "<u8"),
-            ("camera_timestamp_domain", "<u1"),
+            ("camera_payload_ready_monotonic_ns", "<u8"),
+            ("camera_depth_timestamp_domain", "<u1"),
+            ("camera_color_timestamp_domain", "<u1"),
             ("camera_age_s", "<f8"),
             ("camera_generation", "<u8"),
             ("camera_clock_reset", "<u1"),
@@ -388,13 +449,17 @@ __all__ = [
     "HAND_STATE_DTYPE",
     "HAND_TACTILE_DTYPE",
     "MAX_POLICY_CHUNK_STEPS",
+    "POINT_CLOUD_FEATURE_DIM",
     "POLICY_PLAN_DTYPE",
     "RECORD_CONTROL_DTYPE",
     "RECORD_OPERATOR_BYTES",
     "RECORD_STATUS_DTYPE",
     "RECORD_STOP_REASON_BYTES",
     "RECORD_TASK_LABEL_BYTES",
+    "SUPPORTED_POINT_CLOUD_COUNTS",
     "VR_FRAME_DTYPE",
+    "make_pointcloud_frame_dtype",
     "make_record_sample_dtype",
     "nan_array",
+    "validate_point_cloud_array",
 ]

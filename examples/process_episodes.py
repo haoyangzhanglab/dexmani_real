@@ -1,7 +1,7 @@
 """Usage: ``python examples/process_episodes.py INPUT_ROOT [--profile PROFILE]``.
 
-Offline CLI that audits and compacts one task's schema-v17/v18/v19 episodes
-into processed HDF5 files, one per source episode.
+Offline CLI that audits and compacts one task's native raw-v20 episodes into
+processed HDF5 v4 files, one per source episode.
 
 Directory mapping: ``episodes/<task>/episode_*`` (raw) is published to
 ``episodes_processed/<task>/episode_*.h5``.  Passing a single episode
@@ -42,6 +42,7 @@ from pathlib import Path
 import yaml
 from tqdm import tqdm
 
+from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.data_processing.contracts import (
     BridgePolicy,
     EpisodeAnnotation,
@@ -57,6 +58,9 @@ from dexmani_real.data_processing.pipeline import (
     load_annotations,
     process_episode_root,
 )
+from dexmani_real.sensor.pointcloud import PointCloudConfig
+from dexmani_real.utils.schema import SUPPORTED_POINT_CLOUD_COUNTS
+
 
 def _route_library_logging_to_stderr() -> None:
     """Keep the terminal concise: silence sub-error library chatter on streams.
@@ -85,8 +89,8 @@ def _route_library_logging_to_stderr() -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Audit and compact supported schema-v17/v18/v19 Real episodes into one "
-            "processed HDF5 per source; seriously broken episodes are skipped with a warning."
+            "Audit and compact native raw-v20 Real episodes into one processed-v4 "
+            "HDF5 per source; seriously broken episodes are skipped with a warning."
         )
     )
     parser.add_argument(
@@ -111,6 +115,16 @@ def _parser() -> argparse.ArgumentParser:
         choices=[profile.value for profile in OutputProfile],
         default=OutputProfile.RGB_PC.value,
         help="Select the required modalities and their shared hard-valid mask.",
+    )
+    parser.add_argument(
+        "--pointcloud-num-points",
+        type=int,
+        choices=sorted(SUPPORTED_POINT_CLOUD_COUNTS),
+        default=1024,
+        help=(
+            "Fixed (N,6) point-cloud size for pointcloud/rgb_pc profiles "
+            "(default: 1024)."
+        ),
     )
     parser.add_argument(
         "--annotations",
@@ -180,6 +194,8 @@ def _parser() -> argparse.ArgumentParser:
 def _config(
     args: argparse.Namespace, profile: OutputProfile, policy: QualityPolicy
 ) -> ProcessingConfig:
+    runtime = resolve_runtime_config()
+    table = runtime.environment.table
     return ProcessingConfig(
         profile=profile,
         horizon=args.horizon,
@@ -191,6 +207,8 @@ def _config(
             abrupt_hand_step_rad=args.abrupt_hand_step_rad,
         ),
         bridge_policy=BridgePolicy(args.bridge_policy),
+        pointcloud=PointCloudConfig(num_points=args.pointcloud_num_points),
+        table_plane_abcd=table.plane_abcd if table.enabled else None,
     )
 
 
@@ -213,7 +231,9 @@ def _write_annotations_yaml(
             for name, annotation in sorted(annotations.items())
         }
     }
-    fd, name = tempfile.mkstemp(suffix=".yml", prefix="annotations-", dir=str(directory))
+    fd, name = tempfile.mkstemp(
+        suffix=".yml", prefix="annotations-", dir=str(directory)
+    )
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
         yaml.safe_dump(payload, stream, allow_unicode=True, sort_keys=False)
     return Path(name)
@@ -265,7 +285,9 @@ def _audit_episodes(
     for episode in bar:
         annotation = user_annotations.get(episode.name)
         bar.set_postfix_str(episode.name)
-        decision, error = _audit_episode(episode, output_root, config, annotation, tmp_dir)
+        decision, error = _audit_episode(
+            episode, output_root, config, annotation, tmp_dir
+        )
         if annotation is not None and not annotation.include:
             status = "user-excluded"
         elif error is not None:
@@ -274,9 +296,10 @@ def _audit_episodes(
                 f"WARNING: skipping episode {episode.name}: analysis failed: {error}",
                 file=sys.stderr,
             )
-        elif decision["accepted"]:
+        elif decision is not None and decision["accepted"]:
             status = "ok"
         else:
+            assert decision is not None
             status = "SKIP"
             tqdm.write(
                 f"WARNING: skipping episode {episode.name}: {decision['rejected_reason']}",
@@ -310,9 +333,7 @@ def _print_audit_summary(results: list[dict]) -> None:
     print(f"audit: {len(results)} episode(s) -> {', '.join(parts)}", file=sys.stderr)
 
 
-def _write_process_logs(
-    output_root: Path, results: list[dict], report: dict
-) -> None:
+def _write_process_logs(output_root: Path, results: list[dict], report: dict) -> None:
     """Write one JSON per source episode under ``output_root/process_log/``.
 
     Runs after a successful publish, so the batch config, the per-episode
@@ -402,7 +423,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             + ", ".join(unknown),
             file=sys.stderr,
         )
-    user_annotations = {name: annotation for name, annotation in annotations.items() if name in known}
+    user_annotations = {
+        name: annotation for name, annotation in annotations.items() if name in known
+    }
     if not args.dry_run and not args.compare_profiles and output_root.exists():
         print(
             f"error: output root already exists: {output_root}; "
@@ -423,7 +446,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 decided = [
                     item["decision"]
                     for item in results
-                    if item["decision"] is not None and item["status"] != "user-excluded"
+                    if item["decision"] is not None
+                    and item["status"] != "user-excluded"
                 ]
                 source = sum(decision["source_frames"] for decision in decided)
                 selected = sum(decision["selected_frames"] for decision in decided)
@@ -437,7 +461,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = _config(args, OutputProfile(args.profile), policy)
     with tempfile.TemporaryDirectory(prefix="process_episodes-") as tmp_name:
         tmp_dir = Path(tmp_name)
-        results = _audit_episodes(episodes, config, user_annotations, output_root, tmp_dir)
+        results = _audit_episodes(
+            episodes, config, user_annotations, output_root, tmp_dir
+        )
         _print_audit_summary(results)
         if args.dry_run:
             return 0
@@ -453,7 +479,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
         merged_path = _write_annotations_yaml(merged, tmp_dir)
-        print(f"publishing {accepted_count} episode(s) to {output_root} ...", file=sys.stderr)
+        print(
+            f"publishing {accepted_count} episode(s) to {output_root} ...",
+            file=sys.stderr,
+        )
         try:
             report = process_episode_root(
                 input_root, output_root, config, annotations_path=merged_path
@@ -467,8 +496,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 _write_process_logs(output_root, results, report)
             except OSError as exc:
-                print(f"warning: failed to write process reports: {exc}", file=sys.stderr)
-    print(f"published {report['output_episode_count']} episode(s) -> {output_root}", file=sys.stderr)
+                print(
+                    f"warning: failed to write process reports: {exc}", file=sys.stderr
+                )
+    print(
+        f"published {report['output_episode_count']} episode(s) -> {output_root}",
+        file=sys.stderr,
+    )
     return 0
 
 

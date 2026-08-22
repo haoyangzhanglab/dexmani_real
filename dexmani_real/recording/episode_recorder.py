@@ -1,4 +1,4 @@
-"""Transactional raw v19 episode serialization from owned ``EpisodeFrame`` rows.
+"""Transactional raw v20 episode serialization from owned ``EpisodeFrame`` rows.
 
 State, action, VR, and camera rows are causally aligned to the policy grid.
 The recorder owns transaction lifecycle, camera sidecar coordination, metadata,
@@ -37,7 +37,7 @@ from dexmani_real.recording.episode_schema import (
     ARM_SENT_MARKER,
     EPISODE_SCHEMA_VERSION,
     RUNTIME_QUALITY_METRIC_NAMES,
-    SEMANTIC_META_ATTRS_V17,
+    SEMANTIC_META_ATTRS_V20,
     compute_episode_quality_metrics,
     validate_data_layout_v17,
     validate_source_frame_keys_v17,
@@ -46,6 +46,7 @@ from dexmani_real.recording.timestamp_buffer import TimestampAlignedBuffer
 from dexmani_real.recording.transaction import atomic_json_dump, atomic_publish
 from dexmani_real.recording.video_codec import VideoDecoder
 from dexmani_real.robot.types import RobotAction, RobotState
+from dexmani_real.sensor.camera_geometry import RGBDGeometry
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -205,7 +206,7 @@ class EpisodeRecorder:
         task_label: str = "",
         operator: str = "",
         calib: CameraCalib | None = None,
-        camera_K: np.ndarray | None = None,
+        camera_geometry: RGBDGeometry | None = None,
         camera_name: str | None = None,
         camera_serial: str | None = None,
         depth_scale: float | None = None,
@@ -258,7 +259,7 @@ class EpisodeRecorder:
             "task_label": task_label,
             "operator": operator,
             "calib": calib,
-            "camera_K": camera_K,
+            "camera_geometry": camera_geometry,
             "camera_name": camera_name,
             "camera_serial": camera_serial,
             "depth_scale": depth_scale,
@@ -294,7 +295,7 @@ class EpisodeRecorder:
             meta.attrs[f"provenance_{key}"] = str(value)
 
         # Additive metadata for fields whose numeric layout remains unchanged.
-        for key, semantic_value in SEMANTIC_META_ATTRS_V17.items():
+        for key, semantic_value in SEMANTIC_META_ATTRS_V20.items():
             meta.attrs[key] = semantic_value
 
         if self.arm_sent_stream:
@@ -347,21 +348,69 @@ class EpisodeRecorder:
             meta.attrs["camera_serial"] = str(camera_serial)
         if camera_name is not None:
             meta.attrs["camera_name"] = str(camera_name)
+        camera_geometry = p.get("camera_geometry")
+        if camera_geometry is not None and not isinstance(
+            camera_geometry, RGBDGeometry
+        ):
+            raise TypeError("camera_geometry must be an RGBDGeometry instance")
         if calib is not None and camera_name is not None:
             # Verify a supplied serial against the named calibration entry.
             calib_meta = calib.to_meta_dict(camera_name, expected_serial=camera_serial)
             meta.attrs["camera_serial"] = calib_meta.get("camera_serial", "")
             meta.attrs["camera_type"] = calib_meta.get("camera_type", "")
+            if camera_geometry is None:
+                raise RuntimeError("camera calibration requires native RGB-D geometry")
             if "camera_T_world_camera" in calib_meta:
-                meta.attrs["camera_T_world_camera"] = calib_meta[
-                    "camera_T_world_camera"
-                ]
+                T_xarm_base_from_color = np.asarray(
+                    calib_meta["camera_T_world_camera"], dtype=np.float64
+                ).reshape(4, 4)
+                meta.attrs["camera_T_xarm_base_from_depth"] = (
+                    (T_xarm_base_from_color @ camera_geometry.T_color_from_depth)
+                    .reshape(-1)
+                    .tolist()
+                )
             if "camera_T_eef_camera" in calib_meta:
-                meta.attrs["camera_T_eef_camera"] = calib_meta["camera_T_eef_camera"]
+                T_eef_from_color = np.asarray(
+                    calib_meta["camera_T_eef_camera"], dtype=np.float64
+                ).reshape(4, 4)
+                meta.attrs["camera_T_eef_from_depth"] = (
+                    (T_eef_from_color @ camera_geometry.T_color_from_depth)
+                    .reshape(-1)
+                    .tolist()
+                )
+            meta.attrs["camera_calibration_source_optical_frame"] = (
+                "camera_color_optical"
+            )
 
-        camera_K = p.get("camera_K")
-        if camera_K is not None:
-            meta.attrs["camera_K"] = camera_K.flatten().tolist()
+        if camera_geometry is not None:
+            meta.attrs["camera_depth_intrinsics"] = (
+                camera_geometry.depth.matrix().reshape(-1).tolist()
+            )
+            meta.attrs["camera_depth_width"] = camera_geometry.depth.width
+            meta.attrs["camera_depth_height"] = camera_geometry.depth.height
+            meta.attrs["camera_depth_distortion_model"] = (
+                camera_geometry.depth.distortion_model
+            )
+            meta.attrs["camera_depth_distortion_coeffs"] = list(
+                camera_geometry.depth.distortion_coeffs
+            )
+            meta.attrs["camera_color_intrinsics"] = (
+                camera_geometry.color.matrix().reshape(-1).tolist()
+            )
+            meta.attrs["camera_color_width"] = camera_geometry.color.width
+            meta.attrs["camera_color_height"] = camera_geometry.color.height
+            meta.attrs["camera_color_distortion_model"] = (
+                camera_geometry.color.distortion_model
+            )
+            meta.attrs["camera_color_distortion_coeffs"] = list(
+                camera_geometry.color.distortion_coeffs
+            )
+            meta.attrs["camera_T_color_from_depth"] = (
+                camera_geometry.T_color_from_depth.reshape(-1).tolist()
+            )
+            meta.attrs["camera_geometry_frame_semantics"] = (
+                "native_depth_and_native_color_optical_frames"
+            )
 
         # Raw uint16 depth units in meters (L515: 0.00025) — without this,
         # offline consumers cannot convert /depth correctly.

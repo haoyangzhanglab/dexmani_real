@@ -263,9 +263,21 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
                 raise TypeError(f"unknown runtime config field(s) in {path}: {sorted(unknown)}")
             return {key: rebuild(template[key], raw.get(key, template[key]), f"{path}.{key}") for key in template}
         if template is None:
-            if raw is not None and not isinstance(raw, str):
-                raise TypeError(f"runtime config field {path!r} must be a string or null")
-            return raw
+            if raw is None:
+                return None
+            optional_types = set(get_args(annotation)) - {type(None)}
+            if optional_types == {str} and isinstance(raw, str):
+                return raw
+            if (
+                optional_types == {int}
+                and isinstance(raw, int)
+                and not isinstance(raw, bool)
+            ):
+                return int(raw)
+            expected = "string" if optional_types == {str} else "integer"
+            raise TypeError(
+                f"runtime config field {path!r} must be {expected} or null"
+            )
         if isinstance(template, bool):
             if not isinstance(raw, bool):
                 raise TypeError(f"runtime config field {path!r} must be a boolean")

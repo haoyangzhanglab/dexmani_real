@@ -18,6 +18,7 @@ from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.deployment.config import resolve_deployment_config
 from dexmani_real.deployment.lifecycle import run_policy_deployment
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.schema import SUPPORTED_POINT_CLOUD_COUNTS
 
 logger = get_logger(__name__)
 
@@ -68,6 +69,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Enable coupled XHand control (deployment.hand_enabled=true)",
     )
     parser.add_argument(
+        "--pointcloud-num-points",
+        type=int,
+        choices=sorted(SUPPORTED_POINT_CLOUD_COUNTS),
+        default=None,
+        help="Fixed point-cloud observation size (default from deployment config)",
+    )
+    parser.add_argument(
         "--print-config", action="store_true", help="Print resolved configs and exit"
     )
     args = parser.parse_args(argv)
@@ -83,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
                 "checkpoint": args.checkpoint,
                 "device": args.device,
                 "hand_enabled": True if args.hand else None,
+                "pointcloud_num_points": args.pointcloud_num_points,
             },
         )
     except (

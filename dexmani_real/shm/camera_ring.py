@@ -72,25 +72,43 @@ class CameraRingBuffer:
 
         if create:
             if rgb_shape is None or depth_shape is None:
-                raise ValueError("rgb_shape and depth_shape are required when create=True")
+                raise ValueError(
+                    "rgb_shape and depth_shape are required when create=True"
+                )
             self._rgb_shape: tuple[int, int, int] | None = rgb_shape
             self._depth_shape: tuple[int, int] | None = depth_shape
             self._max_rgb_bytes = rgb_shape[0] * rgb_shape[1] * rgb_shape[2]
             self._max_depth_bytes = depth_shape[0] * depth_shape[1] * 2
-            self._slot_size = self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes
+            self._slot_size = (
+                self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes
+            )
             self._total_size = self._HEADER_SIZE + maxlen * self._slot_size
 
-            self._shm = shared_memory.SharedMemory(name=name, create=True, size=self._total_size)
+            self._shm = shared_memory.SharedMemory(
+                name=name, create=True, size=self._total_size
+            )
             self._init_header()
         else:
             self._shm = shared_memory.SharedMemory(name=name)
             self._max_rgb_bytes = int(
-                np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_RGB)[0]
+                np.ndarray(
+                    (1,),
+                    dtype=np.uint64,
+                    buffer=self._shm.buf,
+                    offset=self._OFF_MAX_RGB,
+                )[0]
             )
             self._max_depth_bytes = int(
-                np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_DEPTH)[0]
+                np.ndarray(
+                    (1,),
+                    dtype=np.uint64,
+                    buffer=self._shm.buf,
+                    offset=self._OFF_MAX_DEPTH,
+                )[0]
             )
-            self._slot_size = self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes
+            self._slot_size = (
+                self._slot_header_size + self._max_rgb_bytes + self._max_depth_bytes
+            )
             self._total_size = self._HEADER_SIZE + maxlen * self._slot_size
             self._rgb_shape = None
             self._depth_shape = None
@@ -119,11 +137,21 @@ class CameraRingBuffer:
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        CameraRingBuffer.__init__(self, state["name"], maxlen=int(state["maxlen"]), create=False)
+        CameraRingBuffer.__init__(
+            self, state["name"], maxlen=int(state["maxlen"]), create=False
+        )
         rgb_shape = state["rgb_shape"]
         depth_shape = state["depth_shape"]
-        self._rgb_shape = (int(rgb_shape[0]), int(rgb_shape[1]), int(rgb_shape[2])) if rgb_shape is not None else None
-        self._depth_shape = (int(depth_shape[0]), int(depth_shape[1])) if depth_shape is not None else None
+        self._rgb_shape = (
+            (int(rgb_shape[0]), int(rgb_shape[1]), int(rgb_shape[2]))
+            if rgb_shape is not None
+            else None
+        )
+        self._depth_shape = (
+            (int(depth_shape[0]), int(depth_shape[1]))
+            if depth_shape is not None
+            else None
+        )
 
     def write(
         self,
@@ -140,27 +168,54 @@ class CameraRingBuffer:
         Returns:
             New sequence number.
         """
-        if not isinstance(header, np.ndarray) or header.shape != (1,) or header.dtype != CAMERA_FRAME_HEADER_DTYPE:
+        if (
+            not isinstance(header, np.ndarray)
+            or header.shape != (1,)
+            or header.dtype != CAMERA_FRAME_HEADER_DTYPE
+        ):
             raise ValueError(
                 f"camera header must have shape (1,) and dtype {CAMERA_FRAME_HEADER_DTYPE}, "
                 f"got shape={getattr(header, 'shape', None)} dtype={getattr(header, 'dtype', None)}"
             )
-        if not isinstance(rgb, np.ndarray) or rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2:] != (3,):
-            raise ValueError(f"camera rgb must be (H, W, 3) uint8, got shape={getattr(rgb, 'shape', None)}")
-        if not isinstance(depth, np.ndarray) or depth.dtype != np.uint16 or depth.ndim != 2:
-            raise ValueError(f"camera depth must be (H, W) uint16, got shape={getattr(depth, 'shape', None)}")
+        if (
+            not isinstance(rgb, np.ndarray)
+            or rgb.dtype != np.uint8
+            or rgb.ndim != 3
+            or rgb.shape[2:] != (3,)
+        ):
+            raise ValueError(
+                f"camera rgb must be (H, W, 3) uint8, got shape={getattr(rgb, 'shape', None)}"
+            )
+        if (
+            not isinstance(depth, np.ndarray)
+            or depth.dtype != np.uint16
+            or depth.ndim != 2
+        ):
+            raise ValueError(
+                f"camera depth must be (H, W) uint16, got shape={getattr(depth, 'shape', None)}"
+            )
         if not rgb.flags.c_contiguous or not depth.flags.c_contiguous:
             raise ValueError("camera rgb/depth payloads must be C-contiguous")
         if self._rgb_shape is not None and rgb.shape != self._rgb_shape:
-            raise ValueError(f"camera rgb shape {rgb.shape} does not match ring capacity {self._rgb_shape}")
+            raise ValueError(
+                f"camera rgb shape {rgb.shape} does not match ring capacity {self._rgb_shape}"
+            )
         if self._depth_shape is not None and depth.shape != self._depth_shape:
-            raise ValueError(f"camera depth shape {depth.shape} does not match ring capacity {self._depth_shape}")
+            raise ValueError(
+                f"camera depth shape {depth.shape} does not match ring capacity {self._depth_shape}"
+            )
         if rgb.nbytes != self._max_rgb_bytes or depth.nbytes != self._max_depth_bytes:
-            raise ValueError("camera rgb/depth payload must exactly fill its configured ring capacity")
+            raise ValueError(
+                "camera rgb/depth payload must exactly fill its configured ring capacity"
+            )
         h = header[0]
         if int(h["rgb_size"]) != rgb.nbytes or int(h["depth_size"]) != depth.nbytes:
             raise ValueError("camera header byte sizes do not match payloads")
-        if (int(h["rgb_shape_h"]), int(h["rgb_shape_w"]), int(h["rgb_shape_c"])) != rgb.shape:
+        if (
+            int(h["rgb_shape_h"]),
+            int(h["rgb_shape_w"]),
+            int(h["rgb_shape_c"]),
+        ) != rgb.shape:
             raise ValueError("camera header RGB shape does not match payload")
         if (int(h["depth_shape_h"]), int(h["depth_shape_w"])) != depth.shape:
             raise ValueError("camera header depth shape does not match payload")
@@ -179,7 +234,10 @@ class CameraRingBuffer:
 
         header_offset = slot_base + 16
         header_dest: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
-            (1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=header_offset
+            (1,),
+            dtype=CAMERA_FRAME_HEADER_DTYPE,
+            buffer=self._shm.buf,
+            offset=header_offset,
         )
         header_dest[0] = header[0]
 
@@ -229,14 +287,25 @@ class CameraRingBuffer:
 
         header_offset = slot_base + 16
         header: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
-            (1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=header_offset
+            (1,),
+            dtype=CAMERA_FRAME_HEADER_DTYPE,
+            buffer=self._shm.buf,
+            offset=header_offset,
         ).copy()
 
         # Validate sizes and shapes before creating views to reject torn reads.
         h = header[0]
         rgb_size = int(h["rgb_size"])
-        rgb_h, rgb_w, rgb_c = int(h["rgb_shape_h"]), int(h["rgb_shape_w"]), int(h["rgb_shape_c"])
-        if rgb_size > self._max_rgb_bytes or rgb_size <= 0 or rgb_h * rgb_w * rgb_c != rgb_size:
+        rgb_h, rgb_w, rgb_c = (
+            int(h["rgb_shape_h"]),
+            int(h["rgb_shape_w"]),
+            int(h["rgb_shape_c"]),
+        )
+        if (
+            rgb_size > self._max_rgb_bytes
+            or rgb_size <= 0
+            or rgb_h * rgb_w * rgb_c != rgb_size
+        ):
             now_ns = time.monotonic_ns()
             if now_ns - self._last_torn_warn_ns >= TORN_WARN_INTERVAL_NS:
                 self._last_torn_warn_ns = now_ns
@@ -252,14 +321,20 @@ class CameraRingBuffer:
             return None
         rgb_offset = header_offset + CAMERA_FRAME_HEADER_DTYPE.itemsize
         rgb: np.ndarray[Any, np.dtype[np.uint8]] = (
-            np.ndarray((rgb_size,), dtype=np.uint8, buffer=self._shm.buf, offset=rgb_offset)
+            np.ndarray(
+                (rgb_size,), dtype=np.uint8, buffer=self._shm.buf, offset=rgb_offset
+            )
             .copy()
             .reshape((rgb_h, rgb_w, rgb_c))
         )
 
         depth_size = int(h["depth_size"])
         depth_h, depth_w = int(h["depth_shape_h"]), int(h["depth_shape_w"])
-        if depth_size > self._max_depth_bytes or depth_size <= 0 or depth_h * depth_w * 2 != depth_size:
+        if (
+            depth_size > self._max_depth_bytes
+            or depth_size <= 0
+            or depth_h * depth_w * 2 != depth_size
+        ):
             now_ns = time.monotonic_ns()
             if now_ns - self._last_torn_warn_ns >= TORN_WARN_INTERVAL_NS:
                 self._last_torn_warn_ns = now_ns
@@ -274,7 +349,9 @@ class CameraRingBuffer:
             return None
         depth_offset = rgb_offset + self._max_rgb_bytes
         depth = (
-            np.ndarray((depth_size,), dtype=np.uint8, buffer=self._shm.buf, offset=depth_offset)
+            np.ndarray(
+                (depth_size,), dtype=np.uint8, buffer=self._shm.buf, offset=depth_offset
+            )
             .copy()
             .view(np.uint16)
             .reshape((depth_h, depth_w))
@@ -300,20 +377,44 @@ class CameraRingBuffer:
         if latest_seq == 0:
             return []
         result: list[tuple[np.ndarray, int, int]] = []
-        for sequence in range(max(1, latest_seq - min(k, latest_seq) + 1), latest_seq + 1):
+        for sequence in range(
+            max(1, latest_seq - min(k, latest_seq) + 1), latest_seq + 1
+        ):
             idx = sequence % self.maxlen
             slot_base = self._HEADER_SIZE + idx * self._slot_size
             seqlock = SeqlockSlot(self._shm.buf, slot_base)
             marker1 = seqlock.marker
-            if not _seqlock_is_complete(marker1) or _seqlock_to_logical(marker1) != sequence:
+            if (
+                not _seqlock_is_complete(marker1)
+                or _seqlock_to_logical(marker1) != sequence
+            ):
                 continue
             publish_ns = seqlock.timestamp_ns
             header: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
-                (1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=slot_base + 16
+                (1,),
+                dtype=CAMERA_FRAME_HEADER_DTYPE,
+                buffer=self._shm.buf,
+                offset=slot_base + 16,
             ).copy()
             if seqlock.verify(marker1):
                 result.append((header, publish_ns, sequence))
         return result
+
+    @property
+    def latest_sequence(self) -> int:
+        """Return the newest published logical sequence without copying payloads.
+
+        The producer advances ``write_idx`` only after completing the slot.
+        Reading the selected slot marker therefore avoids observing the brief
+        interval where the global sequence has advanced but ``read_latest``
+        still points at the preceding frame.
+        """
+        idx = int(self._write_idx_view()[0])
+        slot_base = self._HEADER_SIZE + idx * self._slot_size
+        marker = SeqlockSlot(self._shm.buf, slot_base).marker
+        if not _seqlock_is_complete(marker):
+            return 0
+        return _seqlock_to_logical(marker)
 
     def read_sequence(
         self,
@@ -332,31 +433,55 @@ class CameraRingBuffer:
         slot_base = self._HEADER_SIZE + idx * self._slot_size
         seqlock = SeqlockSlot(self._shm.buf, slot_base)
         marker1 = seqlock.marker
-        if not _seqlock_is_complete(marker1) or _seqlock_to_logical(marker1) != sequence:
+        if (
+            not _seqlock_is_complete(marker1)
+            or _seqlock_to_logical(marker1) != sequence
+        ):
             return None
         header_offset = slot_base + 16
         header: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
-            (1,), dtype=CAMERA_FRAME_HEADER_DTYPE, buffer=self._shm.buf, offset=header_offset
+            (1,),
+            dtype=CAMERA_FRAME_HEADER_DTYPE,
+            buffer=self._shm.buf,
+            offset=header_offset,
         ).copy()
         h = header[0]
         output: dict[str, np.ndarray] = {"header": header}
         rgb_offset = header_offset + CAMERA_FRAME_HEADER_DTYPE.itemsize
         if "rgb" in modalities:
-            rgb_shape = (int(h["rgb_shape_h"]), int(h["rgb_shape_w"]), int(h["rgb_shape_c"]))
+            rgb_shape = (
+                int(h["rgb_shape_h"]),
+                int(h["rgb_shape_w"]),
+                int(h["rgb_shape_c"]),
+            )
             size = int(h["rgb_size"])
-            if size <= 0 or size > self._max_rgb_bytes or int(np.prod(rgb_shape)) != size:
+            if (
+                size <= 0
+                or size > self._max_rgb_bytes
+                or int(np.prod(rgb_shape)) != size
+            ):
                 return None
             output["rgb"] = (
-                np.ndarray((size,), dtype=np.uint8, buffer=self._shm.buf, offset=rgb_offset).copy().reshape(rgb_shape)
+                np.ndarray(
+                    (size,), dtype=np.uint8, buffer=self._shm.buf, offset=rgb_offset
+                )
+                .copy()
+                .reshape(rgb_shape)
             )
         depth_offset = rgb_offset + self._max_rgb_bytes
         if "depth" in modalities:
             depth_shape = (int(h["depth_shape_h"]), int(h["depth_shape_w"]))
             size = int(h["depth_size"])
-            if size <= 0 or size > self._max_depth_bytes or int(np.prod(depth_shape)) * 2 != size:
+            if (
+                size <= 0
+                or size > self._max_depth_bytes
+                or int(np.prod(depth_shape)) * 2 != size
+            ):
                 return None
             output["depth"] = (
-                np.ndarray((size,), dtype=np.uint8, buffer=self._shm.buf, offset=depth_offset)
+                np.ndarray(
+                    (size,), dtype=np.uint8, buffer=self._shm.buf, offset=depth_offset
+                )
                 .copy()
                 .view(np.uint16)
                 .reshape(depth_shape)
@@ -377,12 +502,14 @@ class CameraRingBuffer:
             (self._HEADER_SIZE,), dtype=np.uint8, buffer=self._shm.buf, offset=0
         )
         header_view[:] = 0
-        np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_RGB)[0] = np.uint64(
-            self._max_rgb_bytes
-        )
-        np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_DEPTH)[0] = np.uint64(
-            self._max_depth_bytes
-        )
+        np.ndarray(
+            (1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_RGB
+        )[0] = np.uint64(self._max_rgb_bytes)
+        np.ndarray(
+            (1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAX_DEPTH
+        )[0] = np.uint64(self._max_depth_bytes)
 
     def _write_idx_view(self) -> np.ndarray:
-        return np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_WRITE_IDX)
+        return np.ndarray(
+            (1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_WRITE_IDX
+        )

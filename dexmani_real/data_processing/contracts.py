@@ -9,7 +9,9 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import arm, hand, policy as policy_defaults
+from dexmani_real.config.defaults import arm, environment, hand
+from dexmani_real.config.defaults import policy as policy_defaults
+from dexmani_real.sensor.pointcloud import PointCloudConfig
 
 
 class OutputProfile(str, Enum):
@@ -148,7 +150,10 @@ class ProcessingConfig:
     min_full_windows: int = 1
     target_rgb_height: int = 240
     target_rgb_width: int = 320
-    target_point_count: int = 1024
+    pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
+    table_plane_abcd: tuple[float, float, float, float] | None = (
+        environment.table.plane_abcd
+    )
     max_camera_age_s: float = 0.25
     grid_dt_relative_tolerance: float = 0.05
     joint_limit_tolerance_rad: float = 1e-6
@@ -173,17 +178,25 @@ class ProcessingConfig:
             raise TypeError("temporal_quality must be a TemporalQualityConfig")
         if not isinstance(self.bridge_policy, BridgePolicy):
             raise TypeError("bridge_policy must be a BridgePolicy")
+        if not isinstance(self.pointcloud, PointCloudConfig):
+            raise TypeError("pointcloud must be a PointCloudConfig")
         positive_ints = (
             self.horizon,
             self.min_full_windows,
             self.target_rgb_height,
             self.target_rgb_width,
-            self.target_point_count,
         )
         if any(not isinstance(value, int) or value <= 0 for value in positive_ints):
             raise ValueError(
-                "horizon, window count, target image size, and point count must be positive integers"
+                "horizon, window count, and target image size must be positive integers"
             )
+        if self.table_plane_abcd is not None:
+            table_plane = tuple(float(value) for value in self.table_plane_abcd)
+            if len(table_plane) != 4 or not np.all(np.isfinite(table_plane)):
+                raise ValueError("table_plane_abcd must contain four finite values")
+            if np.linalg.norm(table_plane[:3]) <= 0.0:
+                raise ValueError("table_plane_abcd normal must be non-zero")
+            object.__setattr__(self, "table_plane_abcd", table_plane)
         finite_positive = (
             self.max_camera_age_s,
             self.grid_dt_relative_tolerance,
@@ -251,7 +264,10 @@ class ProcessingConfig:
             "min_episode_frames": self.min_episode_frames,
             "target_rgb_height": self.target_rgb_height,
             "target_rgb_width": self.target_rgb_width,
-            "target_point_count": self.target_point_count,
+            "pointcloud": self.pointcloud.to_dict(),
+            "table_plane_abcd": (
+                None if self.table_plane_abcd is None else list(self.table_plane_abcd)
+            ),
             "max_camera_age_s": self.max_camera_age_s,
             "grid_dt_relative_tolerance": self.grid_dt_relative_tolerance,
             "joint_limit_tolerance_rad": self.joint_limit_tolerance_rad,

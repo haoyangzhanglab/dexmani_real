@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/visualize_episode_processed.py PROCESSED.h5 [--info] [--max-frames N]``.
 
-Self-contained Rerun-based visualizer for processed HDF5 v3
+Self-contained Rerun-based visualizer for processed HDF5 v4
 (``dexmani-real-processed-hdf5``) artifacts written by
 ``examples/process_episodes.py``.  Offline only: connects to no hardware, writes
 no files; opens a Rerun viewer window (or prints a structure summary with
 ``--info``).
 
-Unlike ``examples/visualize_episode.py``, which reads a raw episode directory
-(RGB in the MP4 sidecar, depth back-projected into a point cloud), this reads a
-single ``.h5`` file whose RGB, depth, and point cloud are already stored
-grid-aligned at ``(T, ...)``.  The point cloud is precomputed in the xArm base
-frame, so nothing is back-projected here.
+Unlike ``examples/visualize_episode.py``, which only displays the camera and
+state data stored in a raw episode directory, this reads a single ``.h5`` file
+whose RGB, depth, and point cloud are already stored grid-aligned at ``(T,
+...)``. The point cloud is precomputed in the xArm base frame, so nothing is
+back-projected here.
 
 Examples::
 
@@ -38,7 +38,19 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
+from dexmani_real.data_processing.pipeline import (
+    PROCESSED_SCHEMA_NAME,
+    PROCESSED_SCHEMA_VERSION,
+)
+from dexmani_real.sensor.pointcloud import (
+    POINT_CLOUD_COLOR_SOURCE,
+    POINT_CLOUD_SAMPLING,
+)
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.schema import (
+    POINT_CLOUD_FEATURE_DIM,
+    validate_point_cloud_array,
+)
 
 logger = get_logger(__name__)
 
@@ -53,7 +65,7 @@ _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
 
 _FINGER_NAMES: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
 
-# Processed core modalities are fixed by the v3 contract: joint_state/action are
+# Processed core modalities are fixed by the v4 contract: joint_state/action are
 # arm (7) + hand (12), action_ee is eef_position (3) + eef_rot6d (6) + hand (12),
 # and contact_force is one native-axis 3-vector per finger.
 _ARM_JOINT_LABELS = tuple(f"arm_j{i}" for i in range(7))
@@ -80,6 +92,54 @@ def _present_keys(h5f: h5py.File) -> set[str]:
     return {k for k in h5f.keys() if isinstance(h5f[k], h5py.Dataset)}
 
 
+def _validate_pointcloud_dataset(h5f: h5py.File) -> int | None:
+    """Validate the processed-file point-cloud boundary and return its N."""
+    if "point_cloud" not in h5f:
+        return None
+    dataset = h5f["point_cloud"]
+    if not isinstance(dataset, h5py.Dataset):
+        raise ValueError("point_cloud must be an HDF5 dataset")
+    if (
+        dataset.ndim != 3
+        or dataset.shape[1] <= 0
+        or dataset.shape[2] != POINT_CLOUD_FEATURE_DIM
+    ):
+        raise ValueError(
+            f"point_cloud must have shape (T, N, {POINT_CLOUD_FEATURE_DIM}), "
+            f"got {dataset.shape}"
+        )
+    if dataset.dtype != np.dtype(np.float32):
+        raise ValueError(f"point_cloud must be float32, got {dataset.dtype}")
+
+    episode_steps = int(h5f.attrs.get("episode_steps", -1))
+    if episode_steps <= 0:
+        raise ValueError("episode_steps must be positive when point_cloud is present")
+    if dataset.shape[0] != episode_steps:
+        raise ValueError(
+            "point_cloud frame count must match episode_steps, "
+            f"got {dataset.shape[0]} and {episode_steps}"
+        )
+
+    num_points = int(dataset.shape[1])
+    declared_shape = np.asarray(h5f.attrs.get("point_cloud_shape", ()))
+    expected_shape = (num_points, POINT_CLOUD_FEATURE_DIM)
+    if not np.array_equal(declared_shape, np.asarray(expected_shape)):
+        raise ValueError(
+            "point_cloud_shape must match the dataset, "
+            f"got {declared_shape.tolist()} for {expected_shape}"
+        )
+    expected_attrs = {
+        "point_cloud_frame": "xarm_base",
+        "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
+        "point_cloud_sampling": POINT_CLOUD_SAMPLING,
+    }
+    for name, expected in expected_attrs.items():
+        actual = str(h5f.attrs.get(name, ""))
+        if actual != expected:
+            raise ValueError(f"{name} must be {expected!r}, got {actual!r}")
+    return num_points
+
+
 def print_episode_info(h5_path: str) -> None:
     """Print a human-readable summary of the processed file without opening Rerun."""
     with h5py.File(h5_path, "r") as f:
@@ -92,9 +152,13 @@ def print_episode_info(h5_path: str) -> None:
             f"schema: {attrs.get('schema_name', '?')} v{attrs.get('schema_version', '?')}  "
             f"profile={attrs.get('profile', '?')}  domain={attrs.get('domain', '?')}"
         )
-        print(f"task_name: {attrs.get('task_name', '?')}   "
-              f"source_episode: {attrs.get('source_episode', '?')}")
-        print(f"steps (T): {steps}   source_frames: {source_frames}   dt: {attrs.get('dt', '?')}")
+        print(
+            f"task_name: {attrs.get('task_name', '?')}   "
+            f"source_episode: {attrs.get('source_episode', '?')}"
+        )
+        print(
+            f"steps (T): {steps}   source_frames: {source_frames}   dt: {attrs.get('dt', '?')}"
+        )
         if "depth_scale_m_per_unit" in attrs:
             print(
                 f"depth_scale_m_per_unit: {attrs['depth_scale_m_per_unit']}   "
@@ -108,6 +172,16 @@ def print_episode_info(h5_path: str) -> None:
             ds = f[key]
             print(f"  {key:<22s} shape={str(ds.shape):<24s} dtype={str(ds.dtype):<10s}")
         print()
+
+        num_points = _validate_pointcloud_dataset(f)
+        if num_points is not None:
+            print(
+                f"point_cloud: ({num_points}, 6) float32, "
+                f"frame={attrs['point_cloud_frame']}, "
+                f"color={attrs['point_cloud_color_source']}"
+            )
+            print(f"sampling: {attrs['point_cloud_sampling']}")
+            print()
 
         if "provenance" in f:
             prov = f["provenance"]
@@ -151,7 +225,7 @@ def print_episode_info(h5_path: str) -> None:
 
 
 class ProcessedEpisodeVisualizer:
-    """Load a processed HDF5 v3 file and stream it into Rerun for interactive viewing."""
+    """Load a processed HDF5 v4 file and stream it into Rerun for interactive viewing."""
 
     def __init__(
         self,
@@ -162,13 +236,24 @@ class ProcessedEpisodeVisualizer:
         self._h5_path = Path(h5_path)
         self._h5f = h5py.File(h5_path, "r")
         try:
+            if (
+                str(self._h5f.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME
+                or int(self._h5f.attrs.get("schema_version", -1))
+                != PROCESSED_SCHEMA_VERSION
+            ):
+                raise ValueError(
+                    f"{self._h5_path.name} is not a processed HDF5 v4 artifact"
+                )
             self._keys = _present_keys(self._h5f)
             if "joint_state" not in self._keys and "action" not in self._keys:
-                raise ValueError(f"{self._h5_path.name} has no joint_state/action datasets")
+                raise ValueError(
+                    f"{self._h5_path.name} has no joint_state/action datasets"
+                )
 
             self._T = self._resolve_frame_count(max_frames)
             self._has_rgb = {"rgb", "depth"} <= self._keys
-            self._has_pointcloud = "point_cloud" in self._keys
+            self._pointcloud_num_points = _validate_pointcloud_dataset(self._h5f)
+            self._has_pointcloud = self._pointcloud_num_points is not None
 
             # Preload the small scalar/tactile/fingertip modalities; the larger
             # rgb/depth/point_cloud arrays are sliced per frame in log_step.
@@ -217,7 +302,9 @@ class ProcessedEpisodeVisualizer:
             if key in self._keys:
                 state[key] = np.asarray(self._h5f[key][: self._T])
         if "contact_force" in self._keys:
-            contact = np.asarray(self._h5f["contact_force"][: self._T], dtype=np.float32)
+            contact = np.asarray(
+                self._h5f["contact_force"][: self._T], dtype=np.float32
+            )
             state["contact_force_mag"] = np.linalg.norm(contact, axis=2)  # (T, 5)
         return state
 
@@ -262,9 +349,10 @@ class ProcessedEpisodeVisualizer:
 
         cam_views = []
         if "rgb" in self._keys:
-            cam_views.append(rrb.Spatial2DView(origin="camera/rgb", name="RGB"))
+            cam_views.append(rrb.Spatial2DView(origin="camera/color/rgb", name="RGB"))
         if "depth" in self._keys and self._depth_meter is not None:
-            cam_views.append(rrb.Spatial2DView(origin="camera/depth", name="Depth"))
+            # Native depth is intentionally not registered to the color pinhole.
+            cam_views.append(rrb.Spatial2DView(origin="depth/image", name="Depth"))
         if cam_views:
             columns.append(rrb.Vertical(contents=cam_views, name="Camera"))
 
@@ -310,7 +398,7 @@ class ProcessedEpisodeVisualizer:
 
         if self._K is not None and self._h > 0 and self._w > 0:
             rr.log(
-                "camera",
+                "camera/color",
                 rr.Pinhole(
                     image_from_camera=self._K,
                     resolution=[self._w, self._h],
@@ -335,10 +423,10 @@ class ProcessedEpisodeVisualizer:
         if not self._has_rgb:
             return
         if "rgb" in self._keys:
-            rr.log("camera/rgb", rr.Image(self._h5f["rgb"][step_idx]))
+            rr.log("camera/color/rgb", rr.Image(self._h5f["rgb"][step_idx]))
         if "depth" in self._keys and self._depth_meter is not None:
             rr.log(
-                "camera/depth",
+                "depth/image",
                 rr.DepthImage(
                     self._h5f["depth"][step_idx],
                     meter=self._depth_meter,
@@ -346,29 +434,28 @@ class ProcessedEpisodeVisualizer:
                 ),
             )
         if "camera_extrinsic" in self._keys:
-            # T_xarm_base_camera: maps the camera-optical frame into xArm base,
-            # which is the world frame of the processed data.  Logged per frame
-            # because eye-in-hand extrinsics change with the arm; eye-to-hand is
-            # simply re-logged unchanged.
-            transform = np.asarray(
-                self._h5f["camera_extrinsic"][step_idx], dtype=float
-            )
+            # T_xarm_base_from_color maps native color optical coordinates into
+            # xArm base. Native depth remains a separate 2D image here.
+            transform = np.asarray(self._h5f["camera_extrinsic"][step_idx], dtype=float)
             rr.log(
-                "camera",
+                "camera/color",
                 rr.Transform3D(translation=transform[:3, 3], mat3x3=transform[:3, :3]),
             )
 
     def _log_pointcloud(self, step_idx: int) -> None:
         if not self._pc_enabled:
             return
-        cloud = np.asarray(self._h5f["point_cloud"][step_idx], dtype=np.float32)
-        valid = np.linalg.norm(cloud[:, :3], axis=1) > 1e-6
-        if not valid.any():
-            return
-        positions = cloud[valid, :3]
-        colors = (np.clip(cloud[valid, 3:], 0.0, 1.0) * 255.0).astype(np.uint8)
+        assert self._pointcloud_num_points is not None
+        cloud = validate_point_cloud_array(
+            np.asarray(self._h5f["point_cloud"][step_idx]),
+            num_points=self._pointcloud_num_points,
+            label=f"point_cloud[{step_idx}]",
+        )
+        if not np.any(np.linalg.norm(cloud[:, :3], axis=1) > 0.0):
+            raise ValueError(f"point_cloud[{step_idx}] is an all-zero frame")
+        colors = (cloud[:, 3:] * 255.0).astype(np.uint8)
         # Already in xArm base (world); no extrinsic transform is applied.
-        rr.log("pcd", rr.Points3D(positions=positions, colors=colors, radii=0.003))
+        rr.log("pcd", rr.Points3D(positions=cloud[:, :3], colors=colors, radii=0.003))
 
     def _log_fingertips(self, step_idx: int) -> None:
         fp_data = self._state.get("fingertip_points")
@@ -410,7 +497,7 @@ class ProcessedEpisodeVisualizer:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Visualize processed DexMani HDF5 v3 episodes with Rerun 3D."
+        description="Visualize processed DexMani HDF5 v4 episodes with Rerun 3D."
     )
     parser.add_argument(
         "episode",

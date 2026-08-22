@@ -20,8 +20,8 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
   新鲜度和 watchdog 边界处理。
 - RealSense 相机按设备原生频率连续采集；16 Hz 控制网格只选择最新严格因果帧，
   不再将相机发布节拍绑定到控制频率。
-- 事务式写入 raw episode；当前 writer 写 v19，reader 与处理管线支持 v17/v18/v19。
-- 将 raw episode 清洗为 processed HDF5 v3，再导出 Policy Zarr v2。
+- 事务式写入 native RGB-D raw episode v20；分别保存 depth/color 几何与时序，历史 v17–v19 仅供旧环境复现。
+- 将 native raw v20 episode 清洗为 processed HDF5 v4，再导出 Policy Zarr v2。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
 - 通过可替换 backend/adapter 运行 joint-action learned policy；仓库包含无模型的
   deterministic fake 实现和 `dexmani_policy` 集成适配器。
@@ -147,11 +147,11 @@ python examples/collect_teleop.py --print-config
 | 键盘遥操作 | `python examples/keyboard_teleop.py` | 连接并控制 xArm7，可选 XHand |
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 预检后控制 xArm7/XHand；写 `replay_results/` |
 | 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | 同上；`--processed` 显式确认跳过记录期模型(URDF/SRDF)provenance，workspace/碰撞预检仍按当前模型执行；含 risky bridge 的压缩轨迹拒绝回放 |
-| learned policy | `python examples/run_policy.py --deployment-config <file.yml>` | 启动 arm、可选 hand、inference 与 coordinator |
+| learned policy | `python examples/run_policy.py --deployment-config <file.yml>` | 启动 arm、可选 hand、inference 与 coordinator；请求 `point_cloud` 时同时连接 camera |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
-| RealSense 诊断 | `python examples/realsense_record_example.py` | 打开相机与 GUI |
-| 点云/桌面平面诊断 | `python examples/pointcloud_process_example.py` | 打开相机与 GUI；确认后写桌面平面 |
+| L515 native baseline | `python examples/inspect_l515.py --scene <scene> --frames 300 --output-dir <dir>` | 只连接相机；无 GUI；写 native Z16 与几何/时序 JSON，不写标定 |
+| L515 native 点云 shadow | `python examples/check_l515_native_shadow.py <inspect-output-dir> --num-points 1024` | 离线；读取 `--save-rgb` 的采集结果，验证固定 `(N,6)` xArm-base 点云与 RGB 投影 |
 | XHand 独立诊断 | `python examples/xhand_control_example.py` | 连接并控制 XHand |
 
 支持 argparse 的入口应先用 `--help` 查看当前参数；
@@ -160,6 +160,37 @@ python examples/collect_teleop.py --print-config
 
 相机标定的 `--hand-geometry` 是物理事实声明：未安装 XHand 时使用 `absent`；已安装时，
 只有在它实际固定于配置的 home 姿态时才能使用 `secured-home`。它不绕过碰撞检查。
+
+### Learned policy 实时点云
+
+部署配置的 `observation_fields` 包含 `point_cloud` 时，lifecycle 才启动 camera 与独立
+point-cloud worker。worker 始终读取最新的 native RGB-D，旧帧不会排队；策略 adapter
+获得单帧 xArm-base `float32 (N, 6)`，列语义为 `xyzrgb`，RGB 范围为 `[0,1]`。
+`pointcloud_num_points` 只允许 `1024`、`2048`、`4096`、`8192`，也可通过
+`--pointcloud-num-points` 覆盖。示例 deployment YAML：
+
+```yaml
+deployment:
+  observation_fields: arm_qpos,hand_qpos,point_cloud
+  pointcloud_num_points: 2048
+```
+
+点云缺失、过期、shape/dtype 错误、非有限值或颜色越界时 inference fail closed，不发布
+新的 plan。实时路径当前仅支持静态 `eye_to_hand` 标定；`eye_in_hand` 需要另行建立与
+相机帧同步的机械臂位姿合同。离线 IPC、合成 RGB-D 和已保存的真实 L515 帧均已验证；
+实时 worker 的 compute/source-to-publish p95 仍须在完整硬件部署中记录，建议目标分别为
+30 ms/50 ms。
+
+### L515 RGB/Depth 时序限制
+
+实测 nominal 30 FPS 下 depth 约 30.13 Hz，而新 color 约 16.68 Hz；camera worker
+当前仍可能把旧 color 与新 depth 一起发布。空间投影保持正确，但运动物体可能出现颜色
+时间错位。本轮明确记录而不修改发布策略，详见
+[`l515_camera_timing_known_limitation.md`](l515_camera_timing_known_limitation.md)。
+processed v4 的点云颜色语义因此是 `native_color_projection`，不表示同步曝光。
+
+旧 aligned 点云/桌面诊断入口已删除。现有
+`dexmani_real/config/desk_plane.json` 继续作为环境单一来源；重新标定工具将在后续独立重建。
 
 ### 离线数据工作流
 
@@ -175,7 +206,13 @@ python examples/process_episodes.py \
 
 确认审计结果后去掉 `--dry-run`，默认发布到
 `episodes_processed/<task>/`。默认 profile 为 `rgb_pc`；可通过
-`--profile` 选择 `joint`、`rgb`、`pointcloud` 或 `rgb_pc`。
+`--profile` 选择 `joint`、`rgb`、`pointcloud` 或 `rgb_pc`。后两种 profile 可用
+`--pointcloud-num-points` 选择 `1024`、`2048`、`4096` 或 `8192`，默认 `1024`。
+
+raw episode 可视化只展示实际存储的相机与状态数据，不再从历史 aligned depth 合成点云。
+需要检查点云时，先用 `process_episodes.py` 生成 processed HDF5 v4，再运行
+`python examples/visualize_episode_processed.py <processed.h5>`；该入口会校验 `(N,6)`、
+`float32`、xArm-base 坐标系、RGB 范围与采样语义。
 
 发布时逐 episode 显示 tqdm 进度（stderr），终端只打印精简汇总，不再向 stdout 输出 JSON。
 需要机器可读报告时加 `--write-report`，发布成功后在
@@ -221,9 +258,9 @@ dataset/<task>.zarr/
 └── meta/episode_ends
 ```
 
-正式 raw writer 写 schema v19；reader、replay、visualizer 和离线处理支持 v17/v18/v19。
-v19 将 RealSense 的 SDK 返回、对齐完成、共享内存发布三段时间区分记录，并保存 SDK
-timestamp domain；旧的 `camera_capture_monotonic_s` 与 `camera_backlog_s` 保留其历史含义。
+正式 raw writer 写 schema v20；native depth 与 native RGB 不再进行 SDK spatial align。
+v20 分别保存两路帧号、设备时间戳、intrinsics、distortion 与 `T_color_from_depth`；旧
+v17–v19 的 aligned/synthetic depth 不能迁移为 native geometry。
 更早的 flat HDF5 或 pre-v17 数据需要在运行时之外显式迁移。离线处理默认保守：
 硬无效行可被移除，时序异常先审计；压紧后产生危险动作跳变时默认拒绝该轨迹。
 

@@ -3,14 +3,14 @@
 Composes the runtime primitives (``WorkerSpec`` +
 ``build_processes``/``start_processes``/``wait_subsystem_ready``/
 ``run_supervisor``/``shutdown_processes``) into the policy workflow — resolve
-config -> create ``SharedStorage`` -> spawn arm (+ optional hand) -> inference
--> coordinator -> readiness -> ARMED -> supervise -> verified shutdown. There is
+config -> create ``SharedStorage`` -> spawn arm (+ optional hand and RGB-D /
+point-cloud workers) -> inference -> coordinator -> readiness -> ARMED ->
+supervise -> verified shutdown. There is
 no second health mechanism: the supervisor's heartbeat/readiness slots already
-carry ``arm``/``hand``/``inference``/``policy``.
+carry ``arm``/``hand``/``camera``/``pointcloud``/``inference``/``policy``.
 
-The first deployment is joint-only: no VR worker (only an adapter that declares
-VR needs it), no camera worker (only required by RGB/pointcloud adapters),
-and no recorder.
+There is no VR worker or recorder. Camera and point-cloud workers are included
+only when the explicit observation contract contains ``point_cloud``.
 
 Also owns the one-time startup provenance log line (commit hashes +
 checkpoint/model-config SHA-256) via ``sha256_file`` and
@@ -26,12 +26,12 @@ import os
 from pathlib import Path
 from typing import Any
 
-from dexmani_real.config.runtime import ResolvedRuntimeConfig
+from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
 from dexmani_real.deployment.config import DeploymentConfig
 from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_loop
+from dexmani_real.deployment.observation import parse_observation_fields
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.robot.arm_loop import arm_loop
-from dexmani_real.config.runtime import ArmLoopConfig
 from dexmani_real.robot.hand_process import hand_loop
 from dexmani_real.robot.safety import SafetyState, require_transition, transition
 from dexmani_real.runtime.processes import (
@@ -45,10 +45,16 @@ from dexmani_real.runtime.supervisor import (
     shutdown_processes,
     wait_subsystem_ready,
 )
+from dexmani_real.sensor.camera_process import CameraLoopConfig, camera_loop
+from dexmani_real.sensor.pointcloud_process import PointCloudLoopConfig, pointcloud_loop
 from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
+
+
+def _requires_pointcloud(deployment: DeploymentConfig) -> bool:
+    return "point_cloud" in parse_observation_fields(deployment.observation_fields)
 
 
 def sha256_file(path: str | Path) -> str:
@@ -87,12 +93,15 @@ def log_deployment_provenance(
     logger.info(
         "deployment provenance: dexmani_commit=%s model_commit=%s "
         "backend_target=%s observation_adapter_target=%s action_adapter_target=%s "
-        "checkpoint=%s checkpoint_sha256=%s model_config_sha256=%s runtime_sha256=%s",
+        "observation_fields=%s pointcloud_num_points=%d checkpoint=%s "
+        "checkpoint_sha256=%s model_config_sha256=%s runtime_sha256=%s",
         dexmani_commit or "unknown",
         model_commit or "unknown",
         deployment.backend_target,
         deployment.observation_adapter_target,
         deployment.action_adapter_target,
+        deployment.observation_fields,
+        deployment.pointcloud_num_points,
         deployment.checkpoint or "",
         checkpoint_sha256 or "",
         model_config_sha256 or "",
@@ -105,7 +114,7 @@ def build_policy_worker_specs(
     runtime: ResolvedRuntimeConfig,
     deployment: DeploymentConfig,
 ) -> list[WorkerSpec]:
-    """Build the policy workflow's worker specs (arm -> hand? -> inference -> policy).
+    """Build the workers required by the explicit deployment contract.
 
     Readiness order is the single source of truth for build order and for the
     readiness/heartbeat names derived from it. ``ready_name`` mirrors the
@@ -114,21 +123,54 @@ def build_policy_worker_specs(
     slot).
     """
     coordinator_config = CoordinatorConfig.from_runtime(deployment, runtime)
+    pointcloud_requested = _requires_pointcloud(deployment)
     specs: list[WorkerSpec] = [
-        WorkerSpec("arm", arm_loop, (shared, ArmLoopConfig.from_runtime(runtime)), ready_name="arm"),
         WorkerSpec(
-            "inference",
-            inference_loop,
-            (shared, deployment),
-            ready_name="inference",
-        ),
-        WorkerSpec(
-            "policy",
-            coordinator_loop,
-            (shared, coordinator_config),
-            ready_name="policy",
+            "arm",
+            arm_loop,
+            (shared, ArmLoopConfig.from_runtime(runtime)),
+            ready_name="arm",
         ),
     ]
+    if pointcloud_requested:
+        specs.extend(
+            [
+                WorkerSpec(
+                    "camera",
+                    camera_loop,
+                    (shared, CameraLoopConfig.from_runtime(runtime)),
+                    ready_name="camera",
+                ),
+                WorkerSpec(
+                    "pointcloud",
+                    pointcloud_loop,
+                    (
+                        shared,
+                        PointCloudLoopConfig.from_runtime(
+                            runtime,
+                            num_points=deployment.pointcloud_num_points,
+                        ),
+                    ),
+                    ready_name="pointcloud",
+                ),
+            ]
+        )
+    specs.extend(
+        [
+            WorkerSpec(
+                "inference",
+                inference_loop,
+                (shared, deployment),
+                ready_name="inference",
+            ),
+            WorkerSpec(
+                "policy",
+                coordinator_loop,
+                (shared, coordinator_config),
+                ready_name="policy",
+            ),
+        ]
+    )
     if deployment.hand_enabled:
         specs.append(
             WorkerSpec(
@@ -158,16 +200,25 @@ def run_policy_deployment(
         logger,
         deployment=deployment,
         runtime_sha256=runtime.sha256,
-        checkpoint_sha256=sha256_file(deployment.checkpoint) if deployment.checkpoint else "",
+        checkpoint_sha256=(
+            sha256_file(deployment.checkpoint) if deployment.checkpoint else ""
+        ),
         model_config_sha256=(
-            sha256_file(deployment.model_config_path) if deployment.model_config_path else ""
+            sha256_file(deployment.model_config_path)
+            if deployment.model_config_path
+            else ""
         ),
     )
 
     ctx = mp.get_context("spawn")
+    pointcloud_requested = _requires_pointcloud(deployment)
     shared = SharedStorage.create(
         prefix=prefix or f"dexmani_policy_{os.getpid()}",
-        config=SharedStorageConfig.from_runtime(runtime),
+        config=SharedStorageConfig.from_runtime(
+            runtime,
+            pointcloud_num_points=deployment.pointcloud_num_points,
+            pointcloud_requested=pointcloud_requested,
+        ),
         mp_context=ctx,
     )
     specs: list[WorkerSpec] = []
@@ -189,7 +240,9 @@ def run_policy_deployment(
             shared.error_state.value = True
             require_transition(shared, SafetyState.FAULT)
             shutdown_report = shutdown_processes(
-                shared, procs, graceful_timeout_s=float(runtime.safety.shutdown_timeout_s)
+                shared,
+                procs,
+                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
             )
             return 1
 
