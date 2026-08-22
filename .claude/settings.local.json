@@ -227,7 +227,11 @@
       "Bash(rm -rf pi-r2-flow)",
       "Bash(gh repo *)",
       "Bash(curl -s \"https://api.github.com/repos/wengmister/LeFranX/git/trees/main?recursive=1\")",
-      "Bash(echo \"---exit:$?\")"
+      "Bash(echo \"---exit:$?\")",
+      "Bash(ffprobe -v error -show_format -show_streams /home/zhanghaoyang/Desktop/dexmani_real/episodes/test/episode_20260821_235152/rgb.mp4)",
+      "Bash(ffprobe *)",
+      "Bash(df *)",
+      "Bash(echo \"gate exit=$?\")"
     ]
   }
 }

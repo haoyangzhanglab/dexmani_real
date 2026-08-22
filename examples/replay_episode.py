@@ -24,7 +24,11 @@ from dexmani_real.robot.episode_replay import (
     replay_episode,
 )
 from dexmani_real.robot.replay_controller import ReplayStatus
-from dexmani_real.robot.replay_trajectory import load_trajectory, resolve_episode_path
+from dexmani_real.robot.replay_trajectory import (
+    load_processed_trajectory,
+    load_trajectory,
+    resolve_episode_path,
+)
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -55,7 +59,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 Examples:
   python examples/replay_episode.py episodes/<task_name>/<episode_dir>
   python examples/replay_episode.py episodes/<task_name>/<episode_dir> --acc 900 --speed 120
-  python examples/replay_episode.py episodes/<task_name>/<episode_dir> --output results/my_replay/
+  python examples/replay_episode.py episodes/<task_name>/<episode_dir> --output replay_results/my_replay/
+  python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed
 
 Controls:
   Q     clean exit (save partial results)
@@ -66,7 +71,10 @@ Controls:
     parser.add_argument(
         "episode",
         type=str,
-        help="Published episode directory: episodes/<task_name>/episode_*.",
+        help=(
+            "Published episode directory (episodes/<task_name>/episode_*) or, with "
+            "--processed, a processed HDF5 file (episodes_processed/<task>/episode_*.h5)."
+        ),
     )
     parser.add_argument(
         "--config", type=str, default=None, help="Validated experiment YAML overrides."
@@ -88,6 +96,16 @@ Controls:
         type=_positive_float,
         default=None,
         help="Joint max speed (°/s); must match the recording's resolved config.",
+    )
+    parser.add_argument(
+        "--processed",
+        action="store_true",
+        help=(
+            "Replay a processed HDF5 artifact (episodes_processed/<task>/episode_*.h5) "
+            "instead of a raw episode directory. The processed file lacks recording-time "
+            "model (URDF/SRDF) provenance; the full workspace and collision preflight "
+            "still runs against current models."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -113,9 +131,17 @@ def _resolve_replay_runtime(args: argparse.Namespace) -> ReplayRuntimeSelection:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
-        trajectory = load_trajectory(args.episode)
+        if args.processed:
+            trajectory = load_processed_trajectory(args.episode)
+        else:
+            trajectory = load_trajectory(args.episode)
     except (FileNotFoundError, OSError, ValueError) as exc:
         print(f"Error loading episode: {exc}")
+        if not args.processed and Path(args.episode).is_file():
+            print(
+                "Hint: this path is a file, not a raw episode directory; use "
+                "--processed to replay a processed HDF5."
+            )
         return 1
 
     try:
@@ -136,11 +162,20 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Joint speed: {selection.joint_speed_deg_s:.0f}°/s")
     print(f"  Replay config: {selection.config_sha256[:12]}")
 
+    if args.processed:
+        print(
+            "Warning: replaying a processed HDF5. Model (URDF/SRDF) provenance is "
+            "unavailable; workspace and collision preflight run against current models."
+        )
+
     evaluate_consistency = bool(np.all(np.isfinite(trajectory.arm_qpos)))
     if not evaluate_consistency:
         print("Warning: arm_qpos is invalid; consistency metrics will be skipped.")
     if args.output is None:
-        _, episode_name = resolve_episode_path(args.episode)
+        if args.processed:
+            episode_name = Path(args.episode).stem
+        else:
+            _, episode_name = resolve_episode_path(args.episode)
         output_dir = str(Path(DEFAULT_OUTPUT_DIR) / f"{episode_name}_replay")
     else:
         output_dir = args.output

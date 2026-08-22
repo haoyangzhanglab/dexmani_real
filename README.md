@@ -145,7 +145,8 @@ python examples/collect_teleop.py --print-config
 | VR 遥操作采集 | `python examples/collect_teleop.py --task-name <task>` | 连接 arm/hand/VR/camera；写 raw episode |
 | VR 遥操作但不录制 | `python examples/collect_teleop.py --task-name <task> --no-record` | 连接 arm/hand/VR；不启动 camera/recorder |
 | 键盘遥操作 | `python examples/keyboard_teleop.py` | 连接并控制 xArm7，可选 XHand |
-| 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 预检后控制 xArm7/XHand；写 `results/` |
+| 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 预检后控制 xArm7/XHand；写 `replay_results/` |
+| 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | 同上；`--processed` 显式确认跳过记录期模型(URDF/SRDF)provenance，workspace/碰撞预检仍按当前模型执行；含 risky bridge 的压缩轨迹拒绝回放 |
 | learned policy | `python examples/run_policy.py --deployment-config <file.yml>` | 启动 arm、可选 hand、inference 与 coordinator |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
@@ -174,7 +175,14 @@ python examples/process_episodes.py \
 
 确认审计结果后去掉 `--dry-run`，默认发布到
 `episodes_processed/<task>/`。默认 profile 为 `rgb_pc`；可通过
-`--profile` 选择 `joint`、`rgb`、`pointcloud` 或 `rgb_pc`。随后导出一个全新的 Zarr 目标：
+`--profile` 选择 `joint`、`rgb`、`pointcloud` 或 `rgb_pc`。
+
+发布时逐 episode 显示 tqdm 进度（stderr），终端只打印精简汇总，不再向 stdout 输出 JSON。
+需要机器可读报告时加 `--write-report`，发布成功后在
+`episodes_processed/<task>/process_log/episode_*.json` 为每个 episode 落一份（含 config、
+决策、输出与校验）；默认不生成。损坏或审计失败（硬无效帧过多、压紧产生危险跳变等）的
+episode 会自动跳过并打印 warning 与原因；`--annotations` 显式 `include: true` 的 episode
+不会被自动跳过，其失败会阻断整批。随后导出一个全新的 Zarr 目标：
 
 ```bash
 python examples/export_policy_zarr.py \
@@ -189,10 +197,10 @@ python examples/export_policy_zarr.py \
 python examples/visualize_episode.py episodes/<task>/episode_*
 ```
 
-离线评估 TAG/DexPilot 手部 retarget（不连硬件，只读 episode 并打印 JSON 报告）：
+可视化处理后的 processed HDF5（rgb/depth 与预计算点云已在文件内，离线、不连硬件）：
 
 ```bash
-python examples/tune_hand_retarget.py episodes/<task>/episode_* [--search]
+python examples/visualize_episode_processed.py episodes_processed/<task>/episode_<timestamp>.h5
 ```
 
 ## 数据布局
@@ -205,7 +213,8 @@ episodes/<task>/episode_<timestamp>/
 
 episodes_processed/<task>/
 ├── episode_<timestamp>.h5
-└── processing_index.json
+└── process_log/                 # only with --write-report
+    └── episode_<timestamp>.json
 
 dataset/<task>.zarr/
 ├── data/*

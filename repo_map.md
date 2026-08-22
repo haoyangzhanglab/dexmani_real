@@ -4,7 +4,7 @@
 运行行为仍以源码、schema 和配置为准；本文件不定义 API、数据格式或参数默认值。
 
 维护规则：新增、删除、移动文件或改变文件的主要职责时，同步更新本文件。运行时生成且
-被 `.gitignore` 排除的 `episodes/`、`episodes_processed/`、`dataset/`、`results/`
+被 `.gitignore` 排除的 `episodes/`、`episodes_processed/`、`dataset/`、`replay_results/`
 等目录不属于本清单。
 
 ## 1. 顶层与 agent 配置
@@ -21,8 +21,6 @@
 | `README.md` | 面向使用者的能力概览、架构、环境、命令、配置和数据流说明。 |
 | `repo_map.md` | 当前逐文件职责索引。 |
 | `user_design.md` | 使用者确认的遥操作与物理回放桌面碰撞、XHand 抓取过流行为取舍及其安全边界。 |
-| `xhand_issue.md` | XHand RS485 CRC 与触觉温度间歇性降级的诊断记录、风险边界和排查顺序。 |
-| `XHand_最简可靠修复方案_评估优化版.md` | 基于当前 XHand owner、IPC/episode schema 和已观测错误的最小修复设计、实施边界与验收计划。 |
 | `pyproject.toml` | Python 包元数据、基础依赖、setuptools 包发现、内置 JSON 数据声明与 Black-compatible isort 配置。 |
 
 ## 2. 运行时主路径
@@ -91,7 +89,7 @@
 | `dexmani_real/robot/episode_replay.py` | 真实机器人回放 session owner；负责 worker、safety transition、operator flow、评估调用与 cleanup。 |
 | `dexmani_real/robot/replay_controller.py` | preflight 后轨迹的 fixed-rate safety-gated 命令调度、反馈检查与 terminal outcome。 |
 | `dexmani_real/robot/replay_capture.py` | 回放期间 measured state、sent command 与 rejection provenance 的有界内存捕获。 |
-| `dexmani_real/robot/replay_trajectory.py` | raw replay trajectory 加载、hand-action requirement、provenance 与模型/几何 preflight。 |
+| `dexmani_real/robot/replay_trajectory.py` | raw replay trajectory 加载与 processed HDF5 v3 加载、hand-action requirement、provenance 与模型/几何 preflight。 |
 | `dexmani_real/robot/replay_evaluation.py` | 回放跟踪/一致性指标、报告和结果文件持久化。 |
 
 ### `dexmani_real/sensor/`
@@ -238,11 +236,11 @@
 | `examples/collect_teleop.py` | 解析 runtime overrides、task/operator/no-hand/no-record，并启动 VR teleop 数据采集。 |
 | `examples/keyboard_teleop.py` | 解析 runtime config 和 no-hand 确认，并启动 keyboard teleop。 |
 | `examples/run_policy.py` | 解析 runtime/deployment config、backend targets 和 checkpoint，并启动 policy deployment。 |
-| `examples/replay_episode.py` | 加载 raw episode、解析 replay runtime、显示 provenance，并启动真实机器人回放。 |
-| `examples/process_episodes.py` | raw → processed HDF5 离线处理 CLI：argparse 与 JSON report；管线在 `data_processing/`。 |
+| `examples/replay_episode.py` | 加载 raw episode 或（`--processed`）processed HDF5 v3、解析 replay runtime、显示 provenance，并启动真实机器人回放。 |
+| `examples/process_episodes.py` | raw → processed HDF5 离线处理 CLI：逐 episode 审计进度（tqdm）、损坏 episode 自动跳过与 JSON report；管线在 `data_processing/`。 |
 | `examples/export_policy_zarr.py` | processed HDF5 → Policy Zarr 离线导出 CLI：argparse 与 JSON report；导出事务在 `data_processing/zarr_export.py`。 |
 | `examples/visualize_episode.py` | 自包含 Rerun raw-episode 可视化（离线、不连硬件）：metadata、robot state、camera 和点云。 |
-| `examples/tune_hand_retarget.py` | 自包含离线 TAG/DexPilot retarget 评估：参数搜索、home 估计与 Pareto 分析，不连硬件。 |
+| `examples/visualize_episode_processed.py` | 自包含 Rerun processed-HDF5-v3 可视化（离线、不连硬件）：文件内 rgb/depth、预计算 xArm-base 点云、joint/action/触觉时间序列。 |
 | `examples/calibrate_camera.py` | xArm7 + RealSense eye-to-hand ArUco 标定入口。 |
 | `examples/calibrate_vr_heading.py` | 收集 HTS head/wrist orientation、评估质量并原子更新 VR transform。 |
 | `examples/realsense_record_example.py` | 自包含 RealSense RGB-D/点云交互诊断：连接相机，打开 cv2/Open3D GUI，不写标定。 |

@@ -85,8 +85,11 @@ entry point
 - `teleop/`：操作者输入到 action proposal 的映射与采集决策。
 - `policy/`：跨控制方式共用的 action contract 和 safety boundary。
 - `deployment/`：模型 observation、inference、plan 和调度。
-- `recording/`：raw episode schema、写入、读取和可视化。
+- `recording/`：raw episode schema、写入与读取。
 - `data_processing/`：离线清洗和训练数据导出。
+- `runtime/`：进程生命周期、supervisor 与结构化退出状态。
+- `shm/`：跨进程零拷贝共享内存基础设施（SharedStorage、ring buffer 与 causal read）。
+- `integrations/`：外部模型仓库适配器，满足 deployment 的三个 Protocol；依赖方向为 integrations → deployment。
 - `examples/`：薄入口和自包含的诊断/可视化/离线分析程序。
 
 不要轻易新增顶层包。新模块应先回答“它属于哪个现有领域”。

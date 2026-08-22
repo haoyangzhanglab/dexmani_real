@@ -275,8 +275,19 @@ def load_annotations(path: str | Path | None) -> dict[str, EpisodeAnnotation]:
     return result
 
 
+# Reserved subdirectory names under a task root that are never raw episode
+# directories.  ``process_log`` holds per-episode process reports written into
+# the processed output root, so it must not be rediscovered as an episode.
+_NON_EPISODE_DIR_NAMES = frozenset({"process_log"})
+
+
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
-    """Accept either one episode directory or a task directory of episodes."""
+    """Accept either one episode directory or a task directory of episodes.
+
+    Non-hidden subdirectories of a task root are treated as episodes, except
+    reserved names (``process_log``) that hold processed-output sidecars rather
+    than raw ``data.h5`` sources.
+    """
     root = Path(input_root)
     if not root.is_dir():
         raise NotADirectoryError(root)
@@ -286,7 +297,9 @@ def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
         sorted(
             child
             for child in root.iterdir()
-            if child.is_dir() and not child.name.startswith(".")
+            if child.is_dir()
+            and not child.name.startswith(".")
+            and child.name not in _NON_EPISODE_DIR_NAMES
         )
     )
     if not episodes:
@@ -881,9 +894,6 @@ def process_episode_root(
         ]
         report["outputs"] = outputs
         report["validation"] = validation
-        with (staging / "processing_index.json").open("w", encoding="utf-8") as stream:
-            json.dump(report, stream, ensure_ascii=False, indent=2)
-            stream.flush()
         atomic_publish(staging, target)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
