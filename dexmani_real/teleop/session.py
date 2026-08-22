@@ -162,10 +162,7 @@ def _preflight_health_issues(
             current_ns = time.monotonic_ns() if now_ns is None else now_ns
             hand_issue = validate_hand_feedback(
                 connected=bool(hand["connected"][0]),
-                error_state=bool(hand["error_state"][0]),
                 state_valid=bool(hand["state_valid"][0]),
-                send_healthy=bool(hand["send_healthy"][0]),
-                read_healthy=bool(hand["read_healthy"][0]),
                 source_monotonic_ns=int(hand["source_monotonic_ns"][0]),
                 now_monotonic_ns=current_ns,
                 max_age_s=float(heartbeat_timeouts["hand"]),

@@ -130,7 +130,6 @@ def compute_hand_joint_proposal(
     ramp_start_qpos_rad: np.ndarray | None,
     ramp_step: int,
     ramp_total_frames: int,
-    max_delta_rad_per_tick: np.ndarray | float,
     command_lower_rad: np.ndarray,
     command_upper_rad: np.ndarray,
     mechanical_lower_rad: np.ndarray,
@@ -166,20 +165,6 @@ def compute_hand_joint_proposal(
         next_ramp_start_qpos_rad = None
         next_ramp_step = 0
 
-    previous_hand = _finite_vector(
-        previous_hand_qpos_rad, hand_qpos_rad.shape, "previous_hand_qpos_rad"
-    )
-    max_delta = np.broadcast_to(
-        np.asarray(max_delta_rad_per_tick, dtype=np.float64), hand_qpos_rad.shape
-    )
-    if not np.all(np.isfinite(max_delta)) or np.any(max_delta <= 0.0):
-        raise ValueError("max_delta_rad_per_tick must be finite and positive")
-    hand_qpos_rad = previous_hand + np.clip(
-        hand_qpos_rad - previous_hand,
-        -max_delta,
-        max_delta,
-    )
-
     hand_qpos_rad = np.clip(
         hand_qpos_rad,
         np.asarray(command_lower_rad, dtype=np.float64),
@@ -196,7 +181,11 @@ def compute_hand_joint_proposal(
         )
     except ValueError as exc:
         validation_issue = str(exc)
-        hand_qpos_rad = np.asarray(previous_hand_qpos_rad, dtype=np.float64).copy()
+        hand_qpos_rad = _finite_vector(
+            previous_hand_qpos_rad,
+            hand_qpos_rad.shape,
+            "previous_hand_qpos_rad",
+        )
         retarget_succeeded = False
 
     return HandJointProposal(

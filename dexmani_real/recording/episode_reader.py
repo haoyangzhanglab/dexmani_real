@@ -5,8 +5,7 @@ Reads camera frames from DexMani episodes. Non-camera datasets
 :attr:`h5f` — a merged view of the episode HDF5 sidecars.
 
 An episode is one published directory containing ``data.h5``, ``depth.h5``,
-and ``rgb.mp4``. Older flat HDF5 files and pre-v17 episode directories
-intentionally require an external migration tool.
+and ``rgb.mp4``. Other raw layouts require an external migration tool.
 
 Usage::
 
@@ -31,7 +30,7 @@ import numpy as np
 from dexmani_real.recording.episode_schema import (
     ARM_SENT_MARKER,
     SUPPORTED_EPISODE_SCHEMA_VERSIONS,
-    validate_data_layout_v17,
+    validate_data_layout,
 )
 from dexmani_real.recording.timestamp_buffer import FillReason
 from dexmani_real.recording.video_codec import VideoDecoder
@@ -48,7 +47,7 @@ class ValidityState(str, Enum):
 
 @dataclass(frozen=True)
 class EpisodeTiming:
-    """Timing metadata from a supported schema-v17-v20 episode."""
+    """Timing metadata from a supported schema-v21 episode."""
 
     rate_hz: float
     grid_dt_s: float
@@ -203,9 +202,7 @@ class EpisodeReader:
     def action_arm_joint_raw_valid_mask(self) -> np.ndarray:
         """Rows with a conservative, explicit arm IK raw value.
 
-        Equivalent to ``flag_sample_valid & ~flag_held & flag_ik_ok``. Stored
-        v17 values are not rewritten: held/failure rows remain readable but are
-        excluded from this interpretation mask.
+        Equivalent to ``flag_sample_valid & ~flag_held & flag_ik_ok``.
         """
 
         return self._raw_action_valid_mask("flag_ik_ok")
@@ -236,12 +233,11 @@ class EpisodeReader:
             for key, dataset in self._data_h5f.items()
             if isinstance(dataset, h5py.Dataset)
         }
-        layout_errors = validate_data_layout_v17(
+        layout_errors = validate_data_layout(
             dataset_shapes,
             dataset_dtypes,
             frame_count=frame_count,
             arm_sent_stream=bool(meta.attrs.get(ARM_SENT_MARKER, False)),
-            schema_version=self.schema_version,
         )
         if layout_errors:
             return ValidityState.INVALID

@@ -17,7 +17,6 @@ class TeleopCommandLimits:
     arm_joint_lower_rad: np.ndarray
     arm_joint_upper_rad: np.ndarray
     arm_max_delta_rad_per_tick: np.ndarray | None
-    hand_max_delta_rad_per_tick: np.ndarray
     hand_home_qpos_rad: np.ndarray
     hand_command_lower_rad: np.ndarray
     hand_command_upper_rad: np.ndarray
@@ -38,15 +37,10 @@ class TeleopCommandLimits:
             ).copy()
         )
         hand_lower = np.asarray(config.runtime.hand.qpos_min_rad, dtype=np.float64)
-        configured_hand_delta = config.runtime.policy.hand_max_delta_rad_per_tick
-        hand_max_delta = np.broadcast_to(
-            np.asarray(configured_hand_delta, dtype=np.float64), hand_lower.shape
-        ).copy()
         return cls(
             arm_joint_lower_rad=arm_lower.copy(),
             arm_joint_upper_rad=arm_upper.copy(),
             arm_max_delta_rad_per_tick=max_delta,
-            hand_max_delta_rad_per_tick=hand_max_delta,
             hand_home_qpos_rad=np.deg2rad(
                 np.asarray(config.runtime.hand.home_qpos_deg, dtype=np.float64)
             ),

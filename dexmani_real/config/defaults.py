@@ -363,9 +363,6 @@ class HandParams:
     baudrate: int = 3_000_000
     device_id: int = 0
     rs485_post_open_settle_s: float = 1.0
-    rs485_crc_retry_count: int = 1
-    rs485_read_crc_retry_count: int = 2
-    rs485_crc_retry_backoff_s: float = 0.08
 
     home_qpos_deg: tuple[float, ...] = (
         30.0,
@@ -435,12 +432,12 @@ class HandParams:
 
     loop_hz: float = 30.0
 
+    # Per-hand-servo-tick bound.  0.1 rad at 30 Hz preserves the approximate
+    # 3.2 rad/s envelope previously imposed by 0.2 rad at the 16 Hz teleop grid.
+    hand_max_delta_rad_per_tick: float = 0.1
+
     # Homing waits for command acceptance, not measured joint convergence.
     home_command_ack_timeout_s: float = 1.0
-
-    send_err_watchdog_count: int = 30
-
-    error_state_watchdog_frames: int = 5
 
     fingertip_link_names: tuple[str, ...] = (
         "right_hand_thumb_rota_tip",
@@ -465,12 +462,6 @@ class HandParams:
             raise ValueError("hand device_id must be a non-negative integer")
         if not np.isfinite(self.rs485_post_open_settle_s) or self.rs485_post_open_settle_s < 0:
             raise ValueError("hand rs485_post_open_settle_s must be finite and non-negative")
-        if not isinstance(self.rs485_crc_retry_count, int) or self.rs485_crc_retry_count < 0:
-            raise ValueError("hand rs485_crc_retry_count must be a non-negative integer")
-        if not isinstance(self.rs485_read_crc_retry_count, int) or self.rs485_read_crc_retry_count < 0:
-            raise ValueError("hand rs485_read_crc_retry_count must be a non-negative integer")
-        if not np.isfinite(self.rs485_crc_retry_backoff_s) or self.rs485_crc_retry_backoff_s < 0:
-            raise ValueError("hand rs485_crc_retry_backoff_s must be finite and non-negative")
         limit_vectors = (
             self.mechanical_qpos_min_rad,
             self.mechanical_qpos_max_rad,
@@ -508,12 +499,15 @@ class HandParams:
             raise ValueError("hand tor_max_ma must contain twelve positive integer mA limits")
         if not np.isfinite(self.loop_hz) or self.loop_hz <= 0:
             raise ValueError("hand loop_hz must be finite and positive")
+        if (
+            not np.isfinite(self.hand_max_delta_rad_per_tick)
+            or self.hand_max_delta_rad_per_tick <= 0
+        ):
+            raise ValueError(
+                "hand hand_max_delta_rad_per_tick must be finite and positive"
+            )
         if not np.isfinite(self.home_command_ack_timeout_s) or self.home_command_ack_timeout_s <= 0:
             raise ValueError("hand home_command_ack_timeout_s must be finite and positive")
-        if self.send_err_watchdog_count <= 0:
-            raise ValueError("hand send_err_watchdog_count must be positive")
-        if self.error_state_watchdog_frames <= 0:
-            raise ValueError("hand error_state_watchdog_frames must be positive")
         if len(self.fingertip_link_names) != 5 or any(not name for name in self.fingertip_link_names):
             raise ValueError("hand fingertip_link_names must contain five non-empty names")
         transform = np.asarray(self.T_eef_handbase_pos_xyz + self.T_eef_handbase_quat_wxyz, dtype=np.float64)
@@ -555,10 +549,6 @@ class PolicyParams:
 
     # Endpoint bound per control tick; this is not arm interpolation.
     arm_max_delta_rad_per_tick: float | None = np.deg2rad(8.0)
-
-    # Hard endpoint bound for the hand after retargeting and startup ramp.
-    # This is deliberately independent of the TAG/DexPilot soft temporal costs.
-    hand_max_delta_rad_per_tick: float = 0.2
 
     hand_enabled: bool = True
     hand_retargeting_type: str = "tag"
@@ -616,13 +606,6 @@ class PolicyParams:
             and (not np.isfinite(self.arm_max_delta_rad_per_tick) or self.arm_max_delta_rad_per_tick <= 0)
         ):
             raise ValueError("arm_max_delta_rad_per_tick must be finite and > 0 or None")
-        if (
-            not np.isfinite(self.hand_max_delta_rad_per_tick)
-            or self.hand_max_delta_rad_per_tick <= 0
-        ):
-            raise ValueError(
-                "hand_max_delta_rad_per_tick must be finite and > 0"
-            )
 
 
 @dataclass(frozen=True)

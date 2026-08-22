@@ -1,47 +1,57 @@
-"""Hand servo process — reads hand_cmd_ring, servos XHand, writes hand state and tactile rings.
+"""Single-owner XHand servo process with latest-target, fixed-grid feedback.
 
-Every completed device read publishes hand and tactile feedback. Complete
-sensor payloads are fresh, while malformed/missing tactile payloads publish
-fresh=0 and calibrated=0. The configured-current overrun expected at grasp
-contact is accepted on command send and counted. The same SDK response during
-a state read publishes no synthetic feedback frame; the next successful read
-carries its cumulative event count.
-Error recovery: three independent counters for send failures, board faults from
-``XHandState``, and read exceptions — each latches global ``error_state`` only
-after persistent failure. An uncertain SDK send failure also closes the command
-path until a fresh live state read re-establishes the hand's measured pose.
+Each tick reads one state, publishes it (or a clearly stale previous state),
+then sends at most one measured-state-bounded target. Runtime SDK failures do
+not create recovery state or latch global faults; freshness, heartbeat,
+software arm/disarm, and e-stop remain the persistent safety boundaries.
 """
 
 from __future__ import annotations
 
 import json
 import time
+from typing import Any
 
 import numpy as np
 
 from dexmani_real.config.defaults import HandParams
 from dexmani_real.robot.command_validation import worker_validate_hand
-from dexmani_real.utils.hand_health import XHAND_OVERCURRENT_ERROR_CODE
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate_manager import RateManager
-from dexmani_real.utils.retry import RetryCounter
-from dexmani_real.utils.schema import (HAND_CONTACT_SHAPE, HAND_JOINT_SHAPE,
-                                       HAND_STATE_DTYPE, HAND_TACTILE_DTYPE,
-                                       HAND_TACTILE_FORCE_SHAPE,
-                                       HAND_TACTILE_SUM_SHAPE)
+from dexmani_real.utils.schema import (
+    HAND_CONTACT_SHAPE,
+    HAND_JOINT_SHAPE,
+    HAND_STATE_DTYPE,
+    HAND_TACTILE_DTYPE,
+    HAND_TACTILE_FORCE_SHAPE,
+    HAND_TACTILE_SUM_SHAPE,
+)
 
 logger = get_logger(__name__)
 
 
-def _safe_disconnect(hand) -> bool:
-    """Disconnect the hand driver, tolerating a never-connected instance.
+def limit_hand_delta(
+    target_qpos: np.ndarray,
+    measured_qpos: np.ndarray,
+    max_delta_rad_per_tick: float | np.ndarray,
+) -> np.ndarray:
+    """Bound one absolute target relative to fresh measured joint feedback."""
+    target = np.asarray(target_qpos, dtype=np.float64)
+    measured = np.asarray(measured_qpos, dtype=np.float64)
+    if target.shape != HAND_JOINT_SHAPE or measured.shape != HAND_JOINT_SHAPE:
+        raise ValueError("hand target and measured qpos must both have shape (12,)")
+    if not np.all(np.isfinite(target)) or not np.all(np.isfinite(measured)):
+        raise ValueError("hand target and measured qpos must be finite")
+    max_delta = np.broadcast_to(
+        np.asarray(max_delta_rad_per_tick, dtype=np.float64), HAND_JOINT_SHAPE
+    )
+    if not np.all(np.isfinite(max_delta)) or np.any(max_delta <= 0.0):
+        raise ValueError("hand max_delta_rad_per_tick must be finite and positive")
+    return measured + np.clip(target - measured, -max_delta, max_delta)
 
-    Mirrors the arm cleanup path (``XArm7.close`` in robot/xarm7.py): the
-    single cleanup path for the hand worker, reached from every exit (startup
-    failure, init exception, loop exit, or fault).  Returns True when there is
-    nothing to disconnect or the disconnect succeeds; a raised disconnect is
-    logged and reported as False.
-    """
+
+def _safe_disconnect(hand: Any) -> bool:
+    """Disconnect the hand driver, tolerating a never-connected instance."""
     if hand is None:
         return True
     try:
@@ -55,13 +65,7 @@ def _safe_disconnect(hand) -> bool:
 def _log_board_error_transitions(
     previous: dict[str, np.ndarray], current: dict[str, np.ndarray]
 ) -> dict[str, np.ndarray]:
-    """Log per-joint board-error register appear/change/disappear transitions.
-
-    Only joints whose register value changed since the previous sample are
-    logged, so a steady-state error value never spams the log.  Returns a fresh
-    dict of copies to use as the next ``previous`` (never aliases the driver's
-    arrays).
-    """
+    """Log board-register transitions without assigning them safety meaning."""
     for name in ("commboard_err", "jointboard_err", "tipboard_err"):
         prev = previous[name]
         cur = current[name]
@@ -98,13 +102,12 @@ def _build_tactile_frame(
     frame["source_monotonic_ns"][0] = max(0, int(source_monotonic_ns))
     frame["fresh"][0] = int(valid)
     frame["calibrated"][0] = int(valid and calibrated)
-    # SDK conversion provenance has not been independently established.
     frame["unit_code"][0] = 0
     return frame
 
 
 def _publish_feedback(
-    shared,
+    shared: Any,
     *,
     qpos: np.ndarray,
     current_ma: np.ndarray,
@@ -114,7 +117,6 @@ def _publish_feedback(
     tactile_force: np.ndarray,
     tactile_valid: bool,
     tactile_calibrated: bool,
-    has_hardware_fault: bool,
     connected: bool,
     read_failed: bool,
     last_cmd_seq: int,
@@ -123,12 +125,8 @@ def _publish_feedback(
     jointboard_err: np.ndarray,
     tipboard_err: np.ndarray,
     source_monotonic_ns: int,
-    send_healthy: bool,
-    read_healthy: bool,
-    read_error_count: int,
-    overcurrent_error_count: int,
 ) -> None:
-    """Serialize one feedback pair while preserving the existing SHM contract."""
+    """Serialize one feedback pair while preserving the existing SHM schema."""
     from dexmani_real.shm.shared_storage import new_frame
 
     source_ns = max(0, int(source_monotonic_ns))
@@ -138,7 +136,6 @@ def _publish_feedback(
     frame["tactile_sum"][0] = tactile_sum
     frame["tactile_sum_valid"][0] = int(tactile_sum_valid)
     frame["tactile_contact"][0] = tactile_contact
-    frame["error_state"][0] = int(has_hardware_fault)
     frame["connected"][0] = int(connected)
     frame["qpos_stale"][0] = int(read_failed)
     frame["last_cmd_seq"][0] = int(last_cmd_seq)
@@ -149,10 +146,6 @@ def _publish_feedback(
     frame["source_monotonic_ns"][0] = source_ns
     frame["publish_monotonic_ns"][0] = time.monotonic_ns()
     frame["state_valid"][0] = int(connected and not read_failed)
-    frame["send_healthy"][0] = int(send_healthy)
-    frame["read_healthy"][0] = int(read_healthy)
-    frame["read_error_count"][0] = int(read_error_count)
-    frame["overcurrent_error_count"][0] = int(overcurrent_error_count)
     frame["timestamp"][0] = source_ns / 1e9
     shared.hand_state_ring.write(frame)
     shared.hand_tactile_ring.write(
@@ -165,343 +158,207 @@ def _publish_feedback(
     )
 
 
-def hand_loop(shared, config: HandParams) -> None:
-    """Hand process entry point — reads shared.hand_cmd_ring, servos hand.
+def _last_command_qpos(hand: Any, fallback_qpos: np.ndarray) -> np.ndarray:
+    """Return the last SDK-accepted endpoint or a safe startup fallback."""
+    last = getattr(hand, "last_qpos_cmd", None)
+    if last is None:
+        return np.asarray(fallback_qpos, dtype=np.float64).copy()
+    value = np.asarray(last, dtype=np.float64)
+    if value.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(value)):
+        return np.asarray(fallback_qpos, dtype=np.float64).copy()
+    return value.copy()
 
-    Designed as an mp.Process target. Communicates exclusively through
-    SharedStorage (no RPC, no side channels).
-    """
+
+def hand_loop(shared: Any, config: HandParams) -> None:
+    """Run one XHand worker; all SDK objects remain in this process."""
     from dexmani_real.robot.safety import SafetyState
+    from dexmani_real.robot.xhand import XHand
+
     logger.debug("hand_loop: LOADING")
-
-    def _mark_startup_failure() -> None:
-        logger.error("hand_loop: XHand startup failed; see process log")
-        shared.error_state.value = True
-
-    hand = None
+    hand: XHand | None = None
     ready = False
     try:
         try:
-            from dexmani_real.robot.xhand import XHand, XHandError
-
             hand = XHand(config)
             hand.connect()
             if hasattr(shared, "hand_device_identity"):
                 identity = getattr(hand, "device_identity", {"backend": "unavailable"})
-                encoded_identity = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
-                shared.hand_device_identity.value = encoded_identity[:1023].ljust(1024, b"\x00")
+                encoded = json.dumps(
+                    identity, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+                shared.hand_device_identity.value = encoded[:1023].ljust(1024, b"\x00")
         except Exception:
             logger.error("hand_loop: init failed", exc_info=True)
-            _mark_startup_failure()
+            shared.error_state.value = True
             return
 
-        # Software bias is optional observation setup; failure does not block joint control.
         try:
             hand.calibrate_tactile()
         except Exception:
             logger.warning("hand_loop: tactile calibration raised", exc_info=True)
 
-        # DISARMED startup is read-only; homing remains an explicit policy action.
-
-        # Publish initial state before hand_ready so consumers never see an empty ring.
-        try:
-            st = hand.get_state()
-            _init_qpos = st.qpos
-            _initial_values: dict[str, np.ndarray] = {
-                "current": st.current_ma,
-                "tactile_sum": st.tactile_sum,
-                "tactile_contact": st.tactile_contact,
-            }
-            _initial_tactile_valid = bool(st.tactile_valid)
-            _initial_tactile_sum_valid = bool(st.tactile_sum_valid)
-            if not hand.is_connected:
-                raise RuntimeError("initial hand feedback reports a disconnected device")
-            if st.has_hardware_fault:
-                raise RuntimeError("initial hand feedback reports a hardware error")
-            _initial_board_errors: dict[str, np.ndarray] = {}
-            for _name in ("commboard_err", "jointboard_err", "tipboard_err"):
-                _value = getattr(st, _name)
-                if np.any(_value != 0):
-                    raise RuntimeError(f"initial hand feedback reports {_name}")
-                _initial_board_errors[_name] = _value.copy()
-        except Exception:
-            logger.error("hand_loop: cannot publish a valid initial state", exc_info=True)
-            _mark_startup_failure()
+        initial_state = hand.get_state()
+        if initial_state is None:
+            logger.error("hand_loop: cannot publish a valid initial state")
+            shared.error_state.value = True
+            return
+        if not hand.is_connected:
+            logger.error("hand_loop: initial state reports a disconnected hand")
+            shared.error_state.value = True
             return
 
-        _initial_source_ns = time.monotonic_ns()
+        last_state = initial_state
+        last_source_ns = time.monotonic_ns()
+        last_applied_action_id = 0
         _publish_feedback(
             shared,
-            qpos=_init_qpos,
-            current_ma=_initial_values["current"],
-            tactile_sum=_initial_values["tactile_sum"],
-            tactile_sum_valid=_initial_tactile_sum_valid,
-            tactile_contact=_initial_values["tactile_contact"],
-            tactile_force=st.tactile_force,
-            tactile_valid=_initial_tactile_valid,
+            qpos=initial_state.qpos,
+            current_ma=initial_state.current_ma,
+            tactile_sum=initial_state.tactile_sum,
+            tactile_sum_valid=initial_state.tactile_sum_valid,
+            tactile_contact=initial_state.tactile_contact,
+            tactile_force=initial_state.tactile_force,
+            tactile_valid=initial_state.tactile_valid,
             tactile_calibrated=hand.tactile_calibrated,
-            has_hardware_fault=st.has_hardware_fault,
-            connected=hand.is_connected,
+            connected=True,
             read_failed=False,
-            last_cmd_seq=0,
-            last_cmd_qpos=np.asarray(hand.last_qpos_cmd, dtype=np.float64),
-            commboard_err=_initial_board_errors["commboard_err"],
-            jointboard_err=_initial_board_errors["jointboard_err"],
-            tipboard_err=_initial_board_errors["tipboard_err"],
-            source_monotonic_ns=_initial_source_ns,
-            send_healthy=True,
-            read_healthy=True,
-            read_error_count=0,
-            overcurrent_error_count=0,
+            last_cmd_seq=last_applied_action_id,
+            last_cmd_qpos=_last_command_qpos(hand, initial_state.qpos),
+            commboard_err=initial_state.commboard_err,
+            jointboard_err=initial_state.jointboard_err,
+            tipboard_err=initial_state.tipboard_err,
+            source_monotonic_ns=last_source_ns,
         )
 
-        # Publish heartbeat before ready to avoid a false startup fault.
+        previous_board_errors = {
+            name: getattr(initial_state, name).copy()
+            for name in ("commboard_err", "jointboard_err", "tipboard_err")
+        }
         shared.set_heartbeat("hand", time.monotonic())
         shared.set_ready("hand")
         ready = True
-        logger.debug("hand_loop: READY")
         logger.info("hand_loop: ready")
 
         rate_mgr = RateManager(config.loop_hz, label="hand")
         last_consumed_ring_sequence = 0
-        _send_error_counter = RetryCounter(max_consecutive=config.send_err_watchdog_count, label="hand_send")
-        _error_state_counter = RetryCounter(max_consecutive=config.error_state_watchdog_frames, label="hand_error_state")
-        _read_error_counter = RetryCounter(max_consecutive=config.error_state_watchdog_frames, label="hand_read_error")
-
-        last_known_qpos = _init_qpos.copy()
-        last_known_current = np.asarray(_initial_values["current"], dtype=np.float64).copy()
-        _last_tactile_sum: np.ndarray = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
-        _last_tactile_force: np.ndarray = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
-        _last_state_source_ns = _initial_source_ns
-        _read_error_count_total = 0
-        _overcurrent_error_count_total = 0
-        _last_read_error_code = 0
-        last_applied_action_id = 0
-        command_path_synchronized = True
-
-        _prev_board_errs: dict[str, np.ndarray] = {
-            _name: _initial_board_errors[_name].copy()
-            for _name in ("commboard_err", "jointboard_err", "tipboard_err")
-        }
-
-        def _read_latest_command() -> np.ndarray | None:
-            """Read one new latest-wins ring publication, if available.
-
-            ``last_consumed_ring_sequence`` is the hand command ring cursor;
-            it is unrelated to ``HAND_STATE_DTYPE.last_cmd_seq``, which exposes
-            the last SDK-accepted ``action_id``. Claim before validation/send so
-            a malformed or failed latest-wins publication is never replayed.
-            """
-            nonlocal last_consumed_ring_sequence
-            result = shared.hand_cmd_ring.read_latest()
-            if result is None:
-                return None
-            data, _ts, seq = result
-            seq_int = int(seq) if isinstance(seq, (int, np.integer)) else 0
-            if seq_int == last_consumed_ring_sequence:
-                return None
-            last_consumed_ring_sequence = seq_int
-            if not worker_validate_hand(
-                data,
-                expected_run_generation=int(shared.run_generation.value),
-                now_monotonic_ns=time.monotonic_ns(),
-            ):
-                logger.info(
-                    "hand_loop: discarded malformed, stale-generation, or expired command"
-                )
-                return None
-            return data.copy()
+        latest_command: np.ndarray | None = None
+        latest_action_id = 0
 
         while shared.is_running.value:
             shared.set_heartbeat("hand", time.monotonic())
-
             if shared.estop_request.value:
                 break
 
-            _safety = shared.safety_state.value
-            if _safety in (SafetyState.ARMED, SafetyState.RUNNING) and not shared.error_state.value:
-                # While an SDK send outcome is uncertain, preserve the ring
-                # cursor; after a fresh read, latest-wins selects a current command.
-                execute_action = (
-                    _read_latest_command() if command_path_synchronized else None
-                )
-                if execute_action is not None:
-                    cmd = np.asarray(execute_action["qpos_cmd"][0], dtype=np.float64)
-                    try:
-                        grasp_overcurrent = hand.send_action(cmd)
-                    except XHandError:
-                        # The hand may have accepted the endpoint even when its
-                        # response was corrupted. Do not consume another command
-                        # until live feedback re-establishes the measured pose.
-                        command_path_synchronized = False
-                        logger.warning(
-                            "hand_loop: send_action failed; waiting for fresh state before more commands",
-                            exc_info=True,
-                        )
-                        _send_error_counter.inc()
-                    except ValueError:
-                        logger.warning(
-                            "hand_loop: send_action rejected before SDK call",
-                            exc_info=True,
-                        )
-                        _send_error_counter.inc()
-                    else:
-                        _send_error_counter.reset()
-                        if grasp_overcurrent:
-                            # Position-control contact can legitimately hold a
-                            # finger at its configured current limit. The driver
-                            # accepted this endpoint; retain only telemetry.
-                            _overcurrent_error_count_total += 1
-                        last_applied_action_id = int(execute_action["action_id"][0])
-
-                # Persistent send failures latch a global fault.
-                if _send_error_counter.triggered:
-                    shared.error_state.value = True
-                    logger.error("hand_loop: persistent send failures — latching global fault")
-
-            read_failed = False
-            publish_feedback = True
-            try:
-                st = hand.get_state()
-                qpos = st.qpos
-                current = st.current_ma
-                tactile_sum = st.tactile_sum
-                tactile_force = st.tactile_force
-                tactile_sum_valid = bool(st.tactile_sum_valid)
-                tactile_contact = st.tactile_contact
-                tactile_valid = bool(st.tactile_valid)
-                connected = hand.is_connected
-                has_hardware_fault = st.has_hardware_fault
-                _last_state_source_ns = time.monotonic_ns()
-                last_known_qpos = qpos.copy()
-                last_known_current = current.copy()
-                _last_tactile_sum = tactile_sum.copy()
-                _last_tactile_force = tactile_force.copy()
-                _read_error_counter.reset()
-                if not command_path_synchronized:
-                    command_path_synchronized = True
-                    logger.info(
-                        "hand_loop: fresh state restored command-path synchronization"
-                    )
-                commboard_err = st.commboard_err
-                jointboard_err = st.jointboard_err
-                tipboard_err = st.tipboard_err
-                _prev_board_errs = _log_board_error_transitions(
-                    _prev_board_errs,
-                    {
-                        "commboard_err": commboard_err,
-                        "jointboard_err": jointboard_err,
-                        "tipboard_err": tipboard_err,
-                    },
-                )
-            except XHandError as exc:
-                _last_read_error_code = exc.code
-                is_overcurrent = _last_read_error_code == XHAND_OVERCURRENT_ERROR_CODE
-                if is_overcurrent:
-                    # Grasp contact can produce this recoverable SDK code. Keep
-                    # commanding, but do not publish cached values as a fresh read.
-                    publish_feedback = False
-                    _overcurrent_error_count_total += 1
-                    logger.warning(
-                        "hand_loop: recoverable overcurrent context "
-                        "last_current_ma=%s tor_max_ma=%s "
-                        "last_qpos_rad=%s last_cmd_qpos_rad=%s",
-                        np.round(last_known_current, 1).tolist(),
-                        list(config.tor_max_ma),
-                        np.round(last_known_qpos, 4).tolist(),
-                        np.round(
-                            np.asarray(
-                                hand.last_qpos_cmd
-                                if hand.last_qpos_cmd is not None
-                                else last_known_qpos
-                            ),
-                            4,
-                        ).tolist(),
-                    )
-                else:
-                    read_failed = True
-                    _read_error_count_total += 1
-                    logger.warning(
-                        "hand_loop: get_state failed code=%d connected=%d action_id=%d",
-                        _last_read_error_code,
-                        int(bool(hand.connected_flag)),
-                        last_applied_action_id,
-                        exc_info=True,
-                    )
-
-                qpos = last_known_qpos.copy()
-                current = (
-                    last_known_current.copy()
-                    if is_overcurrent
-                    else np.zeros(HAND_JOINT_SHAPE)
-                )
-                tactile_sum = _last_tactile_sum.copy()
-                tactile_force = _last_tactile_force.copy()
-                tactile_sum_valid = False
-                tactile_contact = np.zeros(HAND_CONTACT_SHAPE, dtype=bool)
-                tactile_valid = False
-                connected = hand.is_connected
-                # Transient read failures are escalated by the independent watchdog.
-                has_hardware_fault = False
-                commboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
-                jointboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
-                tipboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
-
-                if not is_overcurrent:
-                    # Persistent read errors latch global error_state without board registers.
-                    _read_error_counter.inc()
-                    if _read_error_counter.triggered:
-                        shared.error_state.value = True
-                        logger.error(
-                            "hand_loop: %d consecutive get_state exceptions — latching global error_state",
-                            _read_error_counter.max_consecutive,
-                        )
-
-            # Board-fault status is evaluated only from fresh successful reads.
-            if has_hardware_fault and not shared.error_state.value:
-                _error_state_counter.inc()
-                if _error_state_counter.triggered:
-                    shared.error_state.value = True
-                    logger.error(
-                        "hand_loop: board fault persisted after %d retries — latching global error_state",
-                        _error_state_counter.max_consecutive,
-                    )
-            elif not has_hardware_fault:
-                _error_state_counter.reset()
-
-            if publish_feedback:
+            state = hand.get_state()
+            if state is None:
                 _publish_feedback(
                     shared,
-                    qpos=qpos,
-                    current_ma=current,
-                    tactile_sum=tactile_sum,
-                    tactile_sum_valid=tactile_sum_valid,
-                    tactile_contact=tactile_contact,
-                    tactile_force=tactile_force,
-                    tactile_valid=tactile_valid,
+                    qpos=last_state.qpos,
+                    current_ma=last_state.current_ma,
+                    tactile_sum=np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64),
+                    tactile_sum_valid=False,
+                    tactile_contact=np.zeros(HAND_CONTACT_SHAPE, dtype=bool),
+                    tactile_force=np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64),
+                    tactile_valid=False,
                     tactile_calibrated=hand.tactile_calibrated,
-                    has_hardware_fault=has_hardware_fault,
-                    connected=connected,
-                    read_failed=read_failed,
+                    connected=hand.is_connected,
+                    read_failed=True,
                     last_cmd_seq=last_applied_action_id,
-                    last_cmd_qpos=np.asarray(hand.last_qpos_cmd, dtype=np.float64),
-                    commboard_err=commboard_err,
-                    jointboard_err=jointboard_err,
-                    tipboard_err=tipboard_err,
-                    source_monotonic_ns=_last_state_source_ns,
-                    send_healthy=(
-                        command_path_synchronized and not _send_error_counter.triggered
-                    ),
-                    read_healthy=(
-                        not read_failed and not _read_error_counter.triggered
-                    ),
-                    read_error_count=_read_error_count_total,
-                    overcurrent_error_count=_overcurrent_error_count_total,
+                    last_cmd_qpos=_last_command_qpos(hand, last_state.qpos),
+                    commboard_err=last_state.commboard_err,
+                    jointboard_err=last_state.jointboard_err,
+                    tipboard_err=last_state.tipboard_err,
+                    source_monotonic_ns=last_source_ns,
                 )
+                rate_mgr.wait()
+                continue
+
+            last_state = state
+            last_source_ns = time.monotonic_ns()
+            previous_board_errors = _log_board_error_transitions(
+                previous_board_errors,
+                {
+                    "commboard_err": state.commboard_err,
+                    "jointboard_err": state.jointboard_err,
+                    "tipboard_err": state.tipboard_err,
+                },
+            )
+            _publish_feedback(
+                shared,
+                qpos=state.qpos,
+                current_ma=state.current_ma,
+                tactile_sum=state.tactile_sum,
+                tactile_sum_valid=state.tactile_sum_valid,
+                tactile_contact=state.tactile_contact,
+                tactile_force=state.tactile_force,
+                tactile_valid=state.tactile_valid,
+                tactile_calibrated=hand.tactile_calibrated,
+                connected=hand.is_connected,
+                read_failed=False,
+                last_cmd_seq=last_applied_action_id,
+                last_cmd_qpos=_last_command_qpos(hand, state.qpos),
+                commboard_err=state.commboard_err,
+                jointboard_err=state.jointboard_err,
+                tipboard_err=state.tipboard_err,
+                source_monotonic_ns=last_source_ns,
+            )
+
+            safety_state = shared.safety_state.value
+            if safety_state not in (SafetyState.ARMED, SafetyState.RUNNING):
+                latest_command = None
+                latest_action_id = 0
+                rate_mgr.wait()
+                continue
+            if shared.error_state.value:
+                rate_mgr.wait()
+                continue
+
+            result = shared.hand_cmd_ring.read_latest()
+            if result is not None:
+                command, _published_ns, sequence = result
+                sequence_int = (
+                    int(sequence) if isinstance(sequence, (int, np.integer)) else 0
+                )
+                if sequence_int != last_consumed_ring_sequence:
+                    last_consumed_ring_sequence = sequence_int
+                    if worker_validate_hand(
+                        command,
+                        expected_run_generation=int(shared.run_generation.value),
+                        now_monotonic_ns=time.monotonic_ns(),
+                    ):
+                        latest_command = command.copy()
+                        latest_action_id = int(latest_command["action_id"][0])
+                    else:
+                        logger.info(
+                            "hand_loop: discarded malformed, stale-generation, or expired command"
+                        )
+                        latest_command = None
+                        latest_action_id = 0
+
+            if latest_command is not None and not worker_validate_hand(
+                latest_command,
+                expected_run_generation=int(shared.run_generation.value),
+                now_monotonic_ns=time.monotonic_ns(),
+            ):
+                latest_command = None
+                latest_action_id = 0
+
+            if latest_command is not None:
+                target = np.asarray(latest_command["qpos_cmd"][0], dtype=np.float64)
+                bounded = limit_hand_delta(
+                    target,
+                    state.qpos,
+                    config.hand_max_delta_rad_per_tick,
+                )
+                if hand.send_action(bounded):
+                    actual = _last_command_qpos(hand, state.qpos)
+                    # ACK denotes acceptance of the original endpoint, not an
+                    # intermediate max-delta step. Home/replay rely on this.
+                    if np.array_equal(actual, target):
+                        last_applied_action_id = latest_action_id
 
             rate_mgr.wait()
     finally:
-        # Shutdown closes the device without creating new motion.
         if not _safe_disconnect(hand):
             logger.error("hand_loop: XHand disconnect failed")
             shared.error_state.value = True

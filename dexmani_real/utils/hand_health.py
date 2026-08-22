@@ -14,10 +14,7 @@ import numpy as np
 
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
-XHAND_OVERCURRENT_ERROR_CODE = 1_501_035
-
 __all__ = [
-    "XHAND_OVERCURRENT_ERROR_CODE",
     "validate_arm_feedback",
     "validate_hand_feedback",
 ]
@@ -62,10 +59,7 @@ def validate_arm_feedback(
 def validate_hand_feedback(
     *,
     connected: bool,
-    error_state: bool,
     state_valid: bool,
-    send_healthy: bool,
-    read_healthy: bool,
     source_monotonic_ns: int,
     now_monotonic_ns: int,
     max_age_s: float,
@@ -74,12 +68,8 @@ def validate_hand_feedback(
     """Return why measured XHand feedback is unusable, or ``None``."""
     if not connected:
         return "hand disconnected"
-    if error_state:
-        return "hand reported a hardware error"
     if not state_valid:
         return "hand state marked invalid"
-    if not send_healthy or not read_healthy:
-        return "hand command/state I/O is unhealthy"
     if source_monotonic_ns <= 0:
         return "hand state has no source timestamp"
     age_s = (now_monotonic_ns - source_monotonic_ns) * 1e-9

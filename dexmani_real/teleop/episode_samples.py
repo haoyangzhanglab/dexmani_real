@@ -426,8 +426,8 @@ def _build_robot_state(
             eef_pos = nan_array(3)
             eef_rot6d = nan_array(6)
         arm_connected = bool(r["connected"])
-        arm_last_cmd_seq = int(r["last_cmd_seq"]) if "last_cmd_seq" in r.dtype.names else 0
-        arm_last_cmd_is_hold = bool(r["last_cmd_is_hold"]) if "last_cmd_is_hold" in r.dtype.names else False
+        arm_last_cmd_seq = int(r["last_cmd_seq"])
+        arm_last_cmd_is_hold = bool(r["last_cmd_is_hold"])
     else:
         arm_qpos = nan_array(ARM_JOINT_SHAPE)
         arm_qvel = nan_array(ARM_JOINT_SHAPE)
@@ -445,23 +445,10 @@ def _build_robot_state(
         hand_tactile_sum = np.asarray(h["tactile_sum"], dtype=np.float64)
         hand_tactile_contact = np.asarray(h["tactile_contact"], dtype=bool)
         hand_connected = bool(h["connected"])
-        hand_qpos_stale = bool(h["qpos_stale"]) if "qpos_stale" in h.dtype.names else False
-        hand_error_state = bool(h["error_state"]) if "error_state" in h.dtype.names else False
-        hand_commboard_err = (
-            np.asarray(h["commboard_err"], dtype=np.int32)
-            if "commboard_err" in h.dtype.names
-            else np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
-        )
-        hand_jointboard_err = (
-            np.asarray(h["jointboard_err"], dtype=np.int32)
-            if "jointboard_err" in h.dtype.names
-            else np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
-        )
-        hand_tipboard_err = (
-            np.asarray(h["tipboard_err"], dtype=np.int32)
-            if "tipboard_err" in h.dtype.names
-            else np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
-        )
+        hand_qpos_stale = bool(h["qpos_stale"])
+        hand_commboard_err = np.asarray(h["commboard_err"], dtype=np.int32)
+        hand_jointboard_err = np.asarray(h["jointboard_err"], dtype=np.int32)
+        hand_tipboard_err = np.asarray(h["tipboard_err"], dtype=np.int32)
     else:
         hand_qpos = nan_array(HAND_JOINT_SHAPE)
         hand_current = nan_array(HAND_JOINT_SHAPE)
@@ -469,7 +456,6 @@ def _build_robot_state(
         hand_tactile_contact = np.zeros(HAND_CONTACT_SHAPE, dtype=bool)
         hand_connected = False
         hand_qpos_stale = False
-        hand_error_state = False
         hand_commboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
         hand_jointboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
         hand_tipboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
@@ -516,7 +502,6 @@ def _build_robot_state(
         hand_commboard_err=hand_commboard_err,
         hand_jointboard_err=hand_jointboard_err,
         hand_qpos_stale=hand_qpos_stale,
-        hand_error_state=hand_error_state,
         arm_last_cmd_seq=arm_last_cmd_seq,
         arm_last_cmd_is_hold=arm_last_cmd_is_hold,
         fingertip_pos=fingertip_pos,

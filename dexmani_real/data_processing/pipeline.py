@@ -1,4 +1,4 @@
-"""Transactional raw-v20 to processed-v4 Real episode processing."""
+"""Transactional raw-v21 to processed-v4 Real episode processing."""
 
 from __future__ import annotations
 
@@ -91,9 +91,10 @@ def _intrinsics_from_meta(meta: Any, *, stream: str) -> CameraIntrinsics:
 
 
 def _geometry_from_reader(reader: EpisodeReader) -> RGBDGeometry:
-    if reader.schema_version != 20:
+    if reader.schema_version != 21:
         raise ValueError(
-            f"processed v4 requires native raw schema v20, got v{reader.schema_version}"
+            "processed v4 requires native raw schema v21, "
+            f"got v{reader.schema_version}"
         )
     meta = reader.h5f["meta"].attrs
     return RGBDGeometry(
@@ -392,7 +393,7 @@ def _write_attrs(
             "fingertip_points_unit": "m",
             "action_ee_frame": "xarm_base",
             "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
-            "contact_force_source": "raw_v20.hand_contact",
+            "contact_force_source": "raw_v21.hand_contact",
             "contact_force_unit": str(
                 meta.get("tactile_unit", "sdk_scaled_unknown_si")
             ),
@@ -862,9 +863,9 @@ def process_episode_root(
         try:
             with _open_episode(episode) as reader:
                 reader.require_valid(purpose="offline processing")
-                if reader.schema_version != 20:
+                if reader.schema_version != 21:
                     raise ValueError(
-                        "processed v4 accepts native raw schema v20 only; "
+                        "processed v4 accepts native raw schema v21 only; "
                         f"got v{reader.schema_version}"
                     )
                 decisions.append(

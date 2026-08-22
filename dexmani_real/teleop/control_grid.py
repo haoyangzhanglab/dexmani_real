@@ -450,7 +450,6 @@ def _compute_action_computation(
         ramp_start_qpos_rad=ctx.hand_ramp_start,
         ramp_step=ctx.hand_ramp_step,
         ramp_total_frames=resources.hand_ramp_total_frames,
-        max_delta_rad_per_tick=command_limits.hand_max_delta_rad_per_tick,
         command_lower_rad=command_limits.hand_command_lower_rad,
         command_upper_rad=command_limits.hand_command_upper_rad,
         mechanical_lower_rad=command_limits.hand_mechanical_lower_rad,

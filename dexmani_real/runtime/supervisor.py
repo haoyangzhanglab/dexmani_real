@@ -192,10 +192,7 @@ def _hand_feedback_issue(hand_data: Any, *, max_age_s: float) -> str | None:
     """
     return validate_hand_feedback(
         connected=bool(hand_data["connected"][0]),
-        error_state=bool(hand_data["error_state"][0]),
         state_valid=bool(hand_data["state_valid"][0]),
-        send_healthy=bool(hand_data["send_healthy"][0]),
-        read_healthy=bool(hand_data["read_healthy"][0]),
         source_monotonic_ns=int(hand_data["source_monotonic_ns"][0]),
         now_monotonic_ns=time.monotonic_ns(),
         max_age_s=max_age_s,
@@ -232,15 +229,13 @@ def print_health_summary(
     if hand_result is not None:
         hand_data, _, _ = hand_result
         hand_connected = bool(hand_data["connected"][0])
-        hand_error = bool(hand_data["error_state"][0])
         hand_state_valid = bool(hand_data["state_valid"][0])
-        hand_io_healthy = bool(hand_data["send_healthy"][0]) and bool(hand_data["read_healthy"][0])
         hand_qpos = np.asarray(hand_data["qpos"][0], dtype=np.float64)
         hand_qpos_ok = int(np.all(np.isfinite(hand_qpos)))
         hand_ok = _hand_feedback_issue(hand_data, max_age_s=hand_feedback_max_age_s) is None
         print(
             f"  hand  {'OK' if hand_ok else 'FAIL':>4s}  connected={int(hand_connected)}  "
-            f"valid={int(hand_state_valid)}  io={int(hand_io_healthy)}  error={int(hand_error)}  "
+            f"valid={int(hand_state_valid)}  "
             f"qpos_ok={hand_qpos_ok}"
         )
     else:

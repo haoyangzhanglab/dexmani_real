@@ -258,8 +258,6 @@ class _RecorderIOSession:
     last_sample_sequence: int = 0
     pending_finalization: _PendingFinalization | None = None
     failure_count: int = 0
-    start_hand_read_error_count: int = 0
-    start_hand_overcurrent_count: int = 0
     sample_backlog_high_watermark: int = 0
     sample_read_failure_count: int = 0
 
@@ -295,22 +293,6 @@ class _RecorderIOSession:
         self.last_control_sequence = int(sequence)
         return control_data[0]
 
-    def _hand_error_counters(self) -> tuple[int, int]:
-        result = self.shared.hand_state_ring.read_latest()
-        if result is None:
-            return 0, 0
-        hand_state, _publish_ns, _sequence = result
-        names = hand_state.dtype.names or ()
-        read_count = (
-            int(hand_state["read_error_count"][0]) if "read_error_count" in names else 0
-        )
-        overcurrent_count = (
-            int(hand_state["overcurrent_error_count"][0])
-            if "overcurrent_error_count" in names
-            else 0
-        )
-        return read_count, overcurrent_count
-
     def _begin_finalization(
         self,
         *,
@@ -322,18 +304,6 @@ class _RecorderIOSession:
         if self.pending_finalization is not None or not self.recorder.is_recording:
             return
         frame_count = self.recorder.frame_count
-        end_read_count, end_overcurrent_count = self._hand_error_counters()
-        self.recorder.set_runtime_quality_metrics(
-            {
-                "hand_read_error_count": max(
-                    0, end_read_count - self.start_hand_read_error_count
-                ),
-                "hand_overcurrent_count": max(
-                    0,
-                    end_overcurrent_count - self.start_hand_overcurrent_count,
-                ),
-            }
-        )
         path = self.recorder.stop_episode(success=save, reason=reason) or ""
         self.pending_finalization = _PendingFinalization(
             generation=generation,
@@ -369,11 +339,8 @@ class _RecorderIOSession:
                 task_label=_control_text(control, "task_label"),
                 operator=_control_text(control, "operator"),
             )
-            read_count, overcurrent_count = self._hand_error_counters()
             if not self.recorder.start_episode(**metadata):
                 raise RuntimeError("EpisodeRecorder refused start")
-            self.start_hand_read_error_count = read_count
-            self.start_hand_overcurrent_count = overcurrent_count
             self.sample_backlog_high_watermark = 0
             self.sample_read_failure_count = 0
             self.active_generation = generation

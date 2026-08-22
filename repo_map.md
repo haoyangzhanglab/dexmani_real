@@ -23,6 +23,7 @@
 | `l515_camera_timing_known_limitation.md` | L515 color 实际约 16.68 Hz、重复 RGB 与动态颜色错位的实测证据、当前接受范围和后续议题。 |
 | `user_design.md` | 使用者确认的遥操作与物理回放桌面碰撞、XHand 抓取过流行为取舍及其安全边界。 |
 | `pyproject.toml` | Python 包元数据、基础依赖、setuptools 包发现、内置 JSON 数据声明与 Black-compatible isort 配置。 |
+| `tests/robot/test_xhand_runtime.py` | 不连接硬件的 XHand fake-SDK 合同测试：单次 I/O、soft/hard read、机械 clip、stale publication 与 exact-target ACK。 |
 
 ## 2. 运行时主路径
 
@@ -33,7 +34,7 @@
 | 策略部署 | `examples/run_policy.py` → `deployment/lifecycle.py` →（按 observation contract 可选 camera → latest-only pointcloud）→ inference worker → plan ring → coordinator → safety gate。 |
 | 录制 | teleop fixed-grid sample → `recording/recorder_client.py` → `EpisodeFrame` ownership-copy → RecorderIO / `EpisodeRecorder` transaction → `EpisodeDataWriter` data.h5 append + camera sidecars → finalize。 |
 | 回放 | `examples/replay_episode.py` → `robot/replay_trajectory.py` preflight → `robot/episode_replay.py` lifecycle → `robot/replay_controller.py` → safety gate / command publication → workers → `robot/replay_evaluation.py`。 |
-| 离线数据 | native RGB-D raw v20 → processed HDF5 v4 → Policy Zarr v2。 |
+| 离线数据 | native RGB-D raw v21 → processed HDF5 v4 → Policy Zarr v2。 |
 
 ## 3. Python package
 
@@ -83,9 +84,9 @@
 | `dexmani_real/robot/safety.py` | 共享 robot safety state、run generation 及合法状态转换。 |
 | `dexmani_real/robot/command_validation.py` | arm/hand worker 在硬件调用前执行的 shape、finite、freshness、generation 与 expiry 复核。 |
 | `dexmani_real/robot/xarm7.py` | 唯一的 xArm Python SDK 驱动边界；连接、状态读取、模式切换、servo 与 homing。 |
-| `dexmani_real/robot/xhand.py` | XHand controller 驱动边界；12-DoF 命令、状态、software-only 触觉 bias 和有界 RS485 错误处理。 |
+| `dexmani_real/robot/xhand.py` | XHand controller 驱动边界；startup retry、single-shot runtime read/send、joint-payload validity、software-only tactile bias 与 mechanical clip。 |
 | `dexmani_real/robot/arm_loop.py` | xArm7 Mode 6 arm worker；消费命令/home 请求并发布状态与执行反馈。 |
-| `dexmani_real/robot/hand_process.py` | XHand worker；消费 hand command ring，在不确定发送后以 live state 重同步；可恢复抓取过流不发布伪造反馈，恢复帧携带累计计数。 |
+| `dexmani_real/robot/hand_process.py` | XHand worker；single SDK owner，以 read→publish→measured-state bound→single send 的 latest-target servo 发布 fresh/stale fixed-grid feedback。 |
 | `dexmani_real/robot/homing.py` | 各入口共享的 typed arm-homing 合同、碰撞检查路径选择、请求等待与 abort 处理。 |
 | `dexmani_real/robot/episode_replay.py` | 真实机器人回放 session owner；负责 worker、safety transition、operator flow、评估调用与 cleanup。 |
 | `dexmani_real/robot/replay_controller.py` | preflight 后轨迹的 fixed-rate safety-gated 命令调度、反馈检查与 terminal outcome。 |
@@ -169,17 +170,17 @@
 | 文件 | 职责 |
 |---|---|
 | `dexmani_real/recording/__init__.py` | 录制子包标记。 |
-| `dexmani_real/recording/episode_schema.py` | raw episode v17–v20 dataset shape/dtype、native RGB-D provenance 与 quality metric 合同。 |
+| `dexmani_real/recording/episode_schema.py` | raw episode v21 dataset shape/dtype 与 native RGB-D provenance 合同。 |
 | `dexmani_real/recording/episode_frame.py` | shared-memory record/legacy inputs 到 immutable typed episode row 的唯一解码、schema shaping 与 ownership-copy 边界。 |
 | `dexmani_real/recording/timestamp_buffer.py` | 多速率输入到 fixed-grid row 的 timestamp 对齐、填充原因和容量管理。 |
-| `dexmani_real/recording/episode_recorder.py` | raw v20 `EpisodeFrame` 的 fixed-grid 对齐、事务式录制、质量汇总、sidecar 验证与原子发布。 |
+| `dexmani_real/recording/episode_recorder.py` | raw v21 `EpisodeFrame` 的 fixed-grid 对齐、事务式录制、质量汇总、sidecar 验证与原子发布。 |
 | `dexmani_real/recording/episode_data_writer.py` | 单个 `data.h5` handle、dataset append 与 flushed offset 的唯一 owner。 |
 | `dexmani_real/recording/camera_stream_writer.py` | grid-aligned RGB/depth 的有界后台 writer 与失败传播。 |
 | `dexmani_real/recording/video_codec.py` | PyAV RGB video encoder/decoder 与 codec 配置。 |
 | `dexmani_real/recording/recorder_client.py` | policy/teleop 侧 recorder control protocol、sample 发布和 stop result。 |
 | `dexmani_real/recording/io_process.py` | 独立 RecorderIO worker；`_RecorderIOSession` 按 sequence 连续取得未确认 sample、监控 backlog，拥有 active generation、episode transaction 与有界 finalize。 |
 | `dexmani_real/recording/transaction.py` | 同文件系统 fsync、atomic publish 和 atomic JSON helper。 |
-| `dexmani_real/recording/episode_reader.py` | published v17–v20 episode 校验、HDF5 sidecar merged view 与 RGB/depth 读取。 |
+| `dexmani_real/recording/episode_reader.py` | published v21 episode 校验、HDF5 sidecar merged view 与 RGB/depth 读取。 |
 
 ### `dexmani_real/data_processing/`
 
@@ -190,7 +191,7 @@
 | `dexmani_real/data_processing/quality.py` | 停滞、抖动、突变等 temporal quality 的纯函数审计。 |
 | `dexmani_real/data_processing/cleaning.py` | 将 raw flags、limits、annotations 与质量结果组合为保留/拒绝决策。 |
 | `dexmani_real/data_processing/transforms.py` | RGB、native depth 与 color intrinsics resize 的确定性数值变换。 |
-| `dexmani_real/data_processing/pipeline.py` | 逐 native raw v20 episode 生成 processed HDF5 v4，点云只派生一次，并事务式验证/发布整批。 |
+| `dexmani_real/data_processing/pipeline.py` | 逐 native raw v21 episode 生成 processed HDF5 v4，点云只派生一次，并事务式验证/发布整批。 |
 | `dexmani_real/data_processing/zarr_export.py` | 校验同任务 processed HDF5，并事务式导出最小 Policy Zarr v2。 |
 
 ### `dexmani_real/deployment/`

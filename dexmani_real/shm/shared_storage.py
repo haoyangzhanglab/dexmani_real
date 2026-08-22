@@ -590,8 +590,8 @@ def read_arm_state_dict(shared: "SharedStorage") -> "dict | None":
 def read_hand_state_dict(shared: "SharedStorage") -> "dict | None":
     """Read latest hand state from ring. Return dict of numpy arrays or None.
 
-    Fields include qpos/current/tactile data, tactile validity, hardware/read
-    health, and the last hand action ID accepted by the worker/SDK.
+    Fields include qpos/current/tactile data, freshness validity, board
+    telemetry, and the last hand action ID accepted by the worker/SDK.
     """
     data = read_hand_state(shared)
     if data is None:
@@ -603,13 +603,10 @@ def read_hand_state_dict(shared: "SharedStorage") -> "dict | None":
         "tactile_sum_valid": bool(data["tactile_sum_valid"][0]),
         "tactile_contact": np.asarray(data["tactile_contact"][0], dtype=bool),
         "connected": bool(data["connected"][0]),
-        "error_state": bool(data["error_state"][0]),
         "qpos_stale": bool(data["qpos_stale"][0]),
         "last_cmd_seq": int(data["last_cmd_seq"][0]),
         "last_cmd_qpos": np.asarray(data["last_cmd_qpos"][0], dtype=np.float64),
         "source_monotonic_ns": int(data["source_monotonic_ns"][0]),
         "publish_monotonic_ns": int(data["publish_monotonic_ns"][0]),
         "state_valid": bool(data["state_valid"][0]),
-        "send_healthy": bool(data["send_healthy"][0]),
-        "read_healthy": bool(data["read_healthy"][0]),
     }

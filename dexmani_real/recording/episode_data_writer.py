@@ -8,7 +8,7 @@ from pathlib import Path
 import h5py  # type: ignore[import-untyped]
 import numpy as np
 
-from dexmani_real.recording.episode_schema import validate_data_layout_v17
+from dexmani_real.recording.episode_schema import validate_data_layout
 
 
 class EpisodeDataWriter:
@@ -51,7 +51,7 @@ class EpisodeDataWriter:
         dtypes = {name: values.dtype for name, values in data.items()}
         shapes["timestamp"] = tuple(timestamps.shape)
         dtypes["timestamp"] = timestamps.dtype
-        errors = validate_data_layout_v17(
+        errors = validate_data_layout(
             shapes,
             dtypes,
             frame_count=frame_count,

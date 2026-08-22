@@ -59,7 +59,7 @@ class RobotState:
     hand_jointboard_err: (
         np.ndarray
     )  # (12,) int32 — joint motor-driver board error registers per joint
-    # Compatibility flag; freshness health uses timestamps and read/state validity.
+    # Recorder provenance for a sample held after a failed hand read.
     hand_qpos_stale: bool
 
     fingertip_pos: np.ndarray  # (5,3) float64 m (arm-base frame)
@@ -69,10 +69,6 @@ class RobotState:
     timestamp: float  # seconds
 
     hand_current: np.ndarray | None = None  # (12,) float64 mA — per-motor current
-
-    hand_error_state: bool = (
-        False  # True when hand reports hardware errors (board faults)
-    )
 
     arm_last_cmd_seq: int = 0
     # Safety/IK fallback endpoint marker; ordinary command quiescence publishes

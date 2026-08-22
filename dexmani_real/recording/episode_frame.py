@@ -16,7 +16,7 @@ import numpy as np
 from dexmani_real.planning.pose_utils import quat_wxyz_to_rot6d
 from dexmani_real.recording.episode_schema import (
     ARM_SENT_DATASET,
-    normalize_diagnostics_v17,
+    normalize_diagnostics,
 )
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
@@ -102,10 +102,10 @@ def build_episode_frame(
     control_run_generation: int = 0,
     arm_sent_stream: bool,
 ) -> EpisodeFrame:
-    """Normalize the legacy component API into one schema-shaped frame."""
+    """Build one schema-shaped frame from the recording inputs."""
     signal = signals or {}
     camera = camera_frame or {}
-    diagnostic_values = normalize_diagnostics_v17(diagnostics)
+    diagnostic_values = normalize_diagnostics(diagnostics)
     camera_source_ns = signal.get(
         "camera_source_monotonic_ns", camera.get("source_monotonic_ns", 0)
     )
@@ -133,7 +133,6 @@ def build_episode_frame(
         "arm_connected": bool(state.arm_connected),
         "hand_connected": bool(state.hand_connected),
         "hand_qpos_stale": bool(state.hand_qpos_stale),
-        "hand_error_state": bool(state.hand_error_state),
         "arm_last_cmd_seq": int(state.arm_last_cmd_seq),
         "arm_last_cmd_is_hold": bool(state.arm_last_cmd_is_hold),
         "action_arm_joint": np.asarray(action.arm_qpos_cmd, dtype=np.float64),
@@ -313,7 +312,6 @@ def decode_record_sample(
         hand_connected=bool(record["hand_connected"]),
         timestamp=float(record["state_timestamp"]),
         hand_current=np.array(record["hand_current"], copy=True),
-        hand_error_state=bool(record["hand_error_state"]),
         arm_last_cmd_seq=int(record["arm_last_cmd_seq"]),
         arm_last_cmd_is_hold=bool(record["arm_last_cmd_is_hold"]),
     )

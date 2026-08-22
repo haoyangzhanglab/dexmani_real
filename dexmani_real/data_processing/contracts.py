@@ -10,7 +10,6 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.defaults import arm, environment, hand
-from dexmani_real.config.defaults import policy as policy_defaults
 from dexmani_real.sensor.pointcloud import PointCloudConfig
 
 
@@ -73,7 +72,9 @@ class TemporalQualityConfig:
 
     policy: QualityPolicy = QualityPolicy.AUDIT
     abrupt_arm_step_rad: float = float(np.deg2rad(8.0))
-    abrupt_hand_step_rad: float = policy_defaults.hand_max_delta_rad_per_tick
+    # This is a raw-episode sampling-quality threshold, not the hand worker's
+    # servo-tick limit. It must remain independent when those rates differ.
+    abrupt_hand_step_rad: float = 0.25
     impulse_arm_min_rad: float = 0.08
     impulse_hand_min_rad: float = 0.12
     impulse_min_return_ratio: float = 0.5

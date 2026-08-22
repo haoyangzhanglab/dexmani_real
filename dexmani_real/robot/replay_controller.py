@@ -114,10 +114,7 @@ def hand_feedback_is_healthy(
     try:
         issue = validate_hand_feedback(
             connected=bool(state.get("connected", False)),
-            error_state=bool(state.get("error_state", True)),
             state_valid=bool(state.get("state_valid", False)),
-            send_healthy=bool(state.get("send_healthy", False)),
-            read_healthy=bool(state.get("read_healthy", False)),
             source_monotonic_ns=int(state.get("source_monotonic_ns", 0)),
             now_monotonic_ns=time.monotonic_ns() if now_ns is None else now_ns,
             max_age_s=max_age_s,

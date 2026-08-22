@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/visualize_episode.py EPISODE [--info] [--max-frames N]``.
 
-Self-contained Rerun-based visualizer for supported schema-v17-v20
+Self-contained Rerun-based visualizer for schema-v21
 DexMani episodes. Offline only: connects to no hardware, writes no files;
 opens a Rerun viewer window (or prints a structure summary with ``--info``).
 Raw episodes are not used to reconstruct point clouds. Process an episode with
@@ -543,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "episode",
         type=str,
-        help="Path to a supported schema-v17-v20 episodes/<task_name>/episode_* directory.",
+        help="Path to a schema-v21 episodes/<task_name>/episode_* directory.",
     )
     parser.add_argument(
         "--max-frames",

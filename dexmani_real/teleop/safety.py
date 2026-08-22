@@ -312,10 +312,7 @@ def _hand_feedback_issue_impl(
         return "hand feedback unavailable"
     return validate_hand_feedback(
         connected=bool(state["connected"][0]),
-        error_state=bool(state["error_state"][0]),
         state_valid=bool(state["state_valid"][0]),
-        send_healthy=bool(state["send_healthy"][0]),
-        read_healthy=bool(state["read_healthy"][0]),
         source_monotonic_ns=int(state["source_monotonic_ns"][0]),
         now_monotonic_ns=time.monotonic_ns(),
         max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),

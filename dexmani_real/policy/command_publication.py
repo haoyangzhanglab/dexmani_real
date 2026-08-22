@@ -179,7 +179,7 @@ def _hand_feedback_snapshot(
 ) -> tuple[_HandFeedbackSnapshot | None, CommandPublishResult | None]:
     """Read one fully healthy hand command/feedback snapshot fail-closed.
 
-    Delegates the five health flags, source-timestamp existence, future
+    Delegates connected/state-valid checks, source-timestamp existence, future
     timestamp, and ``max_age`` freshness to :func:`validate_hand_feedback`;
     the worker's last accepted command is then shape/finite-checked on its own
     (that predicate does not know about ``last_cmd_qpos``).
@@ -195,10 +195,7 @@ def _hand_feedback_snapshot(
     record = result[0][0]
     issue = validate_hand_feedback(
         connected=bool(record["connected"]),
-        error_state=bool(record["error_state"]),
         state_valid=bool(record["state_valid"]),
-        send_healthy=bool(record["send_healthy"]),
-        read_healthy=bool(record["read_healthy"]),
         source_monotonic_ns=int(record["source_monotonic_ns"]),
         now_monotonic_ns=time.monotonic_ns(),
         max_age_s=hand_feedback_max_age_s,
@@ -252,7 +249,9 @@ def _make_hand_command(
     frame["action_id"][0] = candidate.action_id
     frame["created_monotonic_ns"][0] = now_monotonic_ns
     frame["target_monotonic_ns"][0] = target_monotonic_ns
-    frame["valid_until_monotonic_ns"][0] = target_monotonic_ns + int(3e8)
+    # Preserve the candidate's ownership window. A measured-state bounded hand
+    # servo may need several worker ticks before the exact endpoint is sent.
+    frame["valid_until_monotonic_ns"][0] = candidate.valid_until_monotonic_ns
     frame["is_hold"][0] = int(bool(candidate.is_hold))
     frame["qpos_cmd"][0] = candidate.hand_qpos
     return frame

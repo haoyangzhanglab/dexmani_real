@@ -188,7 +188,6 @@ HAND_STATE_DTYPE = np.dtype(
         # distinguishes an invalid sample from a valid zero-contact sample.
         ("tactile_sum_valid", "<u1"),
         ("tactile_contact", "<u1", HAND_CONTACT_SHAPE),
-        ("error_state", "<u1"),
         ("connected", "<u1"),
         # Set when qpos is held from the last read after a single-frame failure.
         ("qpos_stale", "<u1"),
@@ -203,14 +202,6 @@ HAND_STATE_DTYPE = np.dtype(
         ("source_monotonic_ns", "<u8"),
         ("publish_monotonic_ns", "<u8"),
         ("state_valid", "<u1"),
-        ("send_healthy", "<u1"),
-        ("read_healthy", "<u1"),
-        # Cumulative telemetry includes accepted grasp-contact overrun sends
-        # and recoverable overrun reads. It is carried by the next successful
-        # feedback frame when a read intentionally publishes no synthetic
-        # state frame.
-        ("read_error_count", "<u8"),
-        ("overcurrent_error_count", "<u8"),
         ("timestamp", "<f8"),
     ]
 )
@@ -343,7 +334,6 @@ def make_record_sample_dtype(
             ("arm_connected", "<u1"),
             ("hand_connected", "<u1"),
             ("state_timestamp", "<f8"),
-            ("hand_error_state", "<u1"),
             ("arm_last_cmd_seq", "<u8"),
             ("arm_last_cmd_is_hold", "<u1"),
             ("action_arm_qpos", "<f8", ARM_JOINT_SHAPE),

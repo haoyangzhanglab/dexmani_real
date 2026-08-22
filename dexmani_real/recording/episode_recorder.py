@@ -1,4 +1,4 @@
-"""Transactional raw v20 episode serialization from owned ``EpisodeFrame`` rows.
+"""Transactional raw v21 episode serialization from owned ``EpisodeFrame`` rows.
 
 State, action, VR, and camera rows are causally aligned to the policy grid.
 The recorder owns transaction lifecycle, camera sidecar coordination, metadata,
@@ -36,11 +36,10 @@ from dexmani_real.recording.episode_frame import EpisodeFrame, build_episode_fra
 from dexmani_real.recording.episode_schema import (
     ARM_SENT_MARKER,
     EPISODE_SCHEMA_VERSION,
-    RUNTIME_QUALITY_METRIC_NAMES,
-    SEMANTIC_META_ATTRS_V20,
+    SEMANTIC_META_ATTRS,
     compute_episode_quality_metrics,
-    validate_data_layout_v17,
-    validate_source_frame_keys_v17,
+    validate_data_layout,
+    validate_source_frame_keys,
 )
 from dexmani_real.recording.timestamp_buffer import TimestampAlignedBuffer
 from dexmani_real.recording.transaction import atomic_json_dump, atomic_publish
@@ -143,7 +142,6 @@ class EpisodeRecorder:
         self._episode_dir: str | None = None  # episode_XXX/ directory
         self._temp_dir: str | None = None  # .tmp_episode_XXX/ directory
         self._pending_meta: dict[str, Any] = {}
-        self._runtime_quality_metrics: dict[str, int] = {}
 
         self._buffer: TimestampAlignedBuffer | None = None
         self._flush_interval: int = max(1, int(round(10.0 * self.control_hz)))
@@ -170,22 +168,6 @@ class EpisodeRecorder:
     @property
     def frame_count(self) -> int:
         return self._frame_count
-
-    def set_runtime_quality_metrics(self, metrics: dict[str, int]) -> None:
-        """Attach non-negative episode-level counters before stop."""
-        if not self._recording:
-            raise RuntimeError("runtime quality metrics require an active episode")
-        normalized: dict[str, int] = {}
-        for name, value in metrics.items():
-            if name not in RUNTIME_QUALITY_METRIC_NAMES:
-                raise ValueError(f"unknown runtime quality metric: {name!r}")
-            count = int(value)
-            if count < 0:
-                raise ValueError(
-                    f"runtime quality metric {name!r} must be non-negative"
-                )
-            normalized[name] = count
-        self._runtime_quality_metrics = normalized
 
     @property
     def max_frames_reached(self) -> bool:
@@ -294,8 +276,7 @@ class EpisodeRecorder:
         for key, value in sorted(self._provenance.items()):
             meta.attrs[f"provenance_{key}"] = str(value)
 
-        # Additive metadata for fields whose numeric layout remains unchanged.
-        for key, semantic_value in SEMANTIC_META_ATTRS_V20.items():
+        for key, semantic_value in SEMANTIC_META_ATTRS.items():
             meta.attrs[key] = semantic_value
 
         if self.arm_sent_stream:
@@ -429,7 +410,7 @@ class EpisodeRecorder:
         diagnostics: Mapping[str, object] | None = None,
         control_run_generation: int = 0,
     ) -> bool:
-        """Compatibility adapter from component inputs to :class:`EpisodeFrame`."""
+        """Build and add one :class:`EpisodeFrame` from component inputs."""
         if not self._accept_source_frame():
             return False
         frame = build_episode_frame(
@@ -481,7 +462,7 @@ class EpisodeRecorder:
             self._buffer.reanchor(ts)
 
         data = frame.data
-        source_layout_errors = validate_source_frame_keys_v17(
+        source_layout_errors = validate_source_frame_keys(
             set(data), arm_sent_stream=self.arm_sent_stream
         )
         if source_layout_errors:
@@ -665,11 +646,9 @@ class EpisodeRecorder:
         self._stop_success = success
         self._stop_path = path
         self._stop_frame_count = self._frame_count
-        runtime_quality_metrics = dict(self._runtime_quality_metrics)
-
         t = threading.Thread(
             target=self._stop_episode_impl,
-            args=(success, reason, truncated, runtime_quality_metrics),
+            args=(success, reason, truncated),
             daemon=False,
             name="episode-stop",
         )
@@ -752,7 +731,6 @@ class EpisodeRecorder:
         success: bool,
         reason: str,
         truncated: bool,
-        runtime_quality_metrics: dict[str, int],
     ) -> None:
         """Background: finalize sidecars, flush buffers, write metadata, and publish.
 
@@ -761,9 +739,7 @@ class EpisodeRecorder:
         or announcing a truncated episode.
         """
         try:
-            self._stop_episode_impl_inner(
-                success, reason, truncated, runtime_quality_metrics
-            )
+            self._stop_episode_impl_inner(success, reason, truncated)
         except Exception as exc:
             self._stop_error = f"{type(exc).__name__}: {exc}"
             logger.error(
@@ -804,7 +780,6 @@ class EpisodeRecorder:
         success: bool,
         reason: str,
         truncated: bool,
-        runtime_quality_metrics: dict[str, int],
     ) -> None:
         """Inner body of _stop_episode_impl — extracted so the try/except wrapper
         can reset state on any exception without duplicating the reset list."""
@@ -835,7 +810,6 @@ class EpisodeRecorder:
             dict(data_writer.datasets),
             frame_count=self._frame_count,
             control_hz=self.control_hz,
-            runtime_metrics=runtime_quality_metrics,
         )
 
         _had_rgb = camera_frame_count > 0
@@ -886,8 +860,7 @@ class EpisodeRecorder:
                 logger.info(
                     "Episode quality: path=%s frames=%d ik_hold=%d camera_invalid=%d "
                     "observation_invalid=%d "
-                    "sample_invalid=%d safety_reject=%d quiescence=%d "
-                    "hand_read_errors=%d hand_overcurrent=%d",
+                    "sample_invalid=%d safety_reject=%d quiescence=%d",
                     _final,
                     self._frame_count,
                     quality_metrics["ik_hold_frame_count"],
@@ -896,8 +869,6 @@ class EpisodeRecorder:
                     quality_metrics["sample_invalid_frame_count"],
                     quality_metrics["safety_reject_frame_count"],
                     quality_metrics["command_quiescence_count"],
-                    quality_metrics.get("hand_read_error_count", 0),
-                    quality_metrics.get("hand_overcurrent_count", 0),
                 )
             else:
                 self._write_aborted_manifest(reason=reason or "discarded", error="")
@@ -917,7 +888,6 @@ class EpisodeRecorder:
         self._camera_writer_metrics = {}
         self._last_camera_payload = None
         self._last_control_run_generation = None
-        self._runtime_quality_metrics = {}
 
     # ── Atomic file finalisation ──────────────────────────────────────
 
@@ -965,7 +935,7 @@ class EpisodeRecorder:
                 for key, dataset in data_h5.items()
                 if isinstance(dataset, h5py.Dataset)
             }
-            layout_errors = validate_data_layout_v17(
+            layout_errors = validate_data_layout(
                 dataset_shapes,
                 dataset_dtypes,
                 frame_count=expected_frames,

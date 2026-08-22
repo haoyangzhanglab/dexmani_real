@@ -20,8 +20,8 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
   新鲜度和 watchdog 边界处理。
 - RealSense 相机按设备原生频率连续采集；16 Hz 控制网格只选择最新严格因果帧，
   不再将相机发布节拍绑定到控制频率。
-- 事务式写入 native RGB-D raw episode v20；分别保存 depth/color 几何与时序，历史 v17–v19 仅供旧环境复现。
-- 将 native raw v20 episode 清洗为 processed HDF5 v4，再导出 Policy Zarr v2。
+- 事务式写入 native RGB-D raw episode v21；分别保存 depth/color 几何与时序。
+- 将 native raw v21 episode 清洗为 processed HDF5 v4，再导出 Policy Zarr v2。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
 - 通过可替换 backend/adapter 运行 joint-action learned policy；仓库包含无模型的
   deterministic fake 实现和 `dexmani_policy` 集成适配器。
@@ -258,10 +258,7 @@ dataset/<task>.zarr/
 └── meta/episode_ends
 ```
 
-正式 raw writer 写 schema v20；native depth 与 native RGB 不再进行 SDK spatial align。
-v20 分别保存两路帧号、设备时间戳、intrinsics、distortion 与 `T_color_from_depth`；旧
-v17–v19 的 aligned/synthetic depth 不能迁移为 native geometry。
-更早的 flat HDF5 或 pre-v17 数据需要在运行时之外显式迁移。离线处理默认保守：
+正式 raw writer 写 schema v21；native depth 与 native RGB 不进行 SDK spatial align，并分别保存两路帧号、设备时间戳、intrinsics、distortion 与 `T_color_from_depth`。其他 raw schema 需要在运行时之外显式迁移。离线处理默认保守：
 硬无效行可被移除，时序异常先审计；压紧后产生危险动作跳变时默认拒绝该轨迹。
 
 ## 开发与验证

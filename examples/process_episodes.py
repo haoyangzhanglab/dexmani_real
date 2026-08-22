@@ -1,6 +1,6 @@
 """Usage: ``python examples/process_episodes.py INPUT_ROOT [--profile PROFILE]``.
 
-Offline CLI that audits and compacts one task's native raw-v20 episodes into
+Offline CLI that audits and compacts one task's native raw-v21 episodes into
 processed HDF5 v4 files, one per source episode.
 
 Directory mapping: ``episodes/<task>/episode_*`` (raw) is published to
@@ -89,7 +89,7 @@ def _route_library_logging_to_stderr() -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Audit and compact native raw-v20 Real episodes into one processed-v4 "
+            "Audit and compact native raw-v21 Real episodes into one processed-v4 "
             "HDF5 per source; seriously broken episodes are skipped with a warning."
         )
     )

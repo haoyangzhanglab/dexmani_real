@@ -154,10 +154,7 @@ def _hand_feedback_issue(
         return "hand state ring is empty"
     return validate_hand_feedback(
         connected=state["connected"],
-        error_state=state["error_state"],
         state_valid=state["state_valid"],
-        send_healthy=state["send_healthy"],
-        read_healthy=state["read_healthy"],
         source_monotonic_ns=state["source_monotonic_ns"],
         now_monotonic_ns=now_ns,
         max_age_s=max_age_s,

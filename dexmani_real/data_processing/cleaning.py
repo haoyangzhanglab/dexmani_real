@@ -273,7 +273,6 @@ def analyze_episode(
         "frame_status": _as_i64(reader, "flag_frame_status"),
         "arm_connected": _as_bool(reader, "arm_connected"),
         "hand_connected": _as_bool(reader, "hand_connected"),
-        "hand_error": _as_bool(reader, "hand_error_state"),
         "hand_stale": _as_bool(reader, "hand_qpos_stale"),
         "history_valid": np.asarray(
             reader.h5f["observation_history_valid_mask"][:], dtype=bool
@@ -353,7 +352,6 @@ def analyze_episode(
         ),
         "hand_source_invalid": ~(
             arrays["hand_connected"]
-            & ~arrays["hand_error"]
             & ~arrays["hand_stale"]
             & arrays["history_valid"][:, 1]
         ),

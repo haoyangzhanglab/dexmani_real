@@ -332,7 +332,7 @@ def _build_observation(
                 horizon=horizon,
                 anchor_ns=anchor_ns,
                 values_field="qpos",
-                required_true_fields=("state_valid", "read_healthy"),
+                required_true_fields=("state_valid",),
             )
             if requested & {"hand_current", "hand_joint_torque"}:
                 hand_current_history = _read_state_history(
@@ -340,7 +340,7 @@ def _build_observation(
                     horizon=horizon,
                     anchor_ns=anchor_ns,
                     values_field="current",
-                    required_true_fields=("state_valid", "read_healthy"),
+                    required_true_fields=("state_valid",),
                 )
             if requested & {"hand_tactile_sum", "fingertip_force"}:
                 hand_tactile_sum_history = _read_state_history(
@@ -350,7 +350,6 @@ def _build_observation(
                     values_field="tactile_sum",
                     required_true_fields=(
                         "state_valid",
-                        "read_healthy",
                         "tactile_sum_valid",
                     ),
                 )
