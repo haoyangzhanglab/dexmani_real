@@ -535,12 +535,13 @@ class RealSense:
         # frame_queue returns the base ``rs.frame`` wrapper even when its
         # payload is a frameset. Recover the typed frameset at this SDK
         # boundary; production never spatially aligns either native stream.
-        frames = self.frame_queue.wait_for_frame(timeout_ms).as_frameset()
+        queued_frame = self.frame_queue.wait_for_frame(timeout_ms)
+        # Timestamp immediately after the queue wait returns, before frameset
+        # recovery or any array ownership copies.
+        wait_return_monotonic_ns = time.monotonic_ns()
+        frames = queued_frame.as_frameset()
         if not frames:
             raise RuntimeError("RealSense frame queue returned a non-frameset frame.")
-        # Timestamp SDK availability before array ownership copies.
-        # This is the closest host-monotonic approximation to frame delivery.
-        wait_return_monotonic_ns = time.monotonic_ns()
         host_time = time.time()
         depth_frame = frames.get_depth_frame()
         color_frame = frames.get_color_frame() if self.config.enable_color else None

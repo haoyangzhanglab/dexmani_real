@@ -247,6 +247,7 @@
 | `examples/calibrate_camera.py` | xArm7 + RealSense eye-to-hand ArUco 标定入口。 |
 | `examples/calibrate_vr_heading.py` | 收集 HTS head/wrist orientation、评估质量并原子更新 VR transform。 |
 | `examples/inspect_l515.py` | L515 native RGB-D 几何、option readback、跨流时序与 Z16 场景基线采集；只连接相机，无 GUI，不写标定。 |
+| `examples/diagnose_l515_rgb_timing.py` | L515 低开销 non-mutating camera-control RGB/D 流时序诊断：frame number、device timestamp、per-frame metadata 与 color option readback；只连接相机，不写 option。 |
 | `examples/check_l515_native_shadow.py` | 离线读取带 RGB 的 L515 inspection capture，以标准 N 运行 native xArm-base 点云与 RGB projection shadow gate。 |
 | `examples/xhand_control_example.py` | XHand 独立连接、状态/触觉读取和 preset command 交互诊断。 |
 

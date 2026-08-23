@@ -193,10 +193,15 @@ SEMANTIC_META_ATTRS: dict[str, str | float | bool] = {
     "arm_tau_si_unit_verified": False,
     "camera_payload_mode": "native_rgbd",
     "camera_pair_source_monotonic_ns_semantics": "minimum_of_depth_and_color_mapped_source_times",
-    "camera_wait_return_monotonic_ns_semantics": "host_monotonic_immediately_after_wait_for_frames",
+    "camera_wait_return_monotonic_ns_semantics": "host_monotonic_immediately_after_frame_queue_wait_for_frame_return",
     "camera_payload_ready_monotonic_ns_semantics": "host_monotonic_after_owned_native_rgb_depth_copies",
     "camera_depth_device_timestamp_s_semantics": "native_depth_frame_device_timestamp",
     "camera_color_device_timestamp_s_semantics": "native_color_frame_device_timestamp_or_nan_when_absent",
+    "camera_generation_semantics": "depth_stream_clock_mapper_generation",
+    "camera_clock_reset_semantics": "depth_stream_clock_mapper_reset",
+    "camera_duplicate_semantics": "depth_stream_duplicate_detection",
+    "camera_frame_gap_semantics": "depth_stream_frame_number_gap",
+    "camera_backlog_s_semantics": "host_wait_return_minus_pair_oldest_mapped_source_time",
 }
 
 

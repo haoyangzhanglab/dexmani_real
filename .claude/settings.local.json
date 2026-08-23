@@ -231,7 +231,9 @@
       "Bash(ffprobe -v error -show_format -show_streams /home/zhanghaoyang/Desktop/dexmani_real/episodes/test/episode_20260821_235152/rgb.mp4)",
       "Bash(ffprobe *)",
       "Bash(df *)",
-      "Bash(echo \"gate exit=$?\")"
+      "Bash(echo \"gate exit=$?\")",
+      "Bash(python3.12 -c \"import numpy; print\\('numpy', numpy.__version__\\)\")",
+      "Bash(python3.12 -c \"import h5py; print\\('h5py ok'\\)\")"
     ]
   }
 }

@@ -242,8 +242,8 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
         ("color_device_timestamp_s", "<f8"),
         ("source_monotonic_ns", "<u8"),
         ("receive_monotonic_ns", "<u8"),
-        # ``receive`` is immediately after wait_for_frames; payload readiness
-        # is after owned native RGB/depth NumPy copies.
+        # ``receive`` is immediately after frame_queue.wait_for_frame returns;
+        # payload readiness is after owned native RGB/depth NumPy copies.
         ("payload_ready_monotonic_ns", "<u8"),
         ("depth_timestamp_domain", "<u1"),
         # 255 denotes that no color stream is present.

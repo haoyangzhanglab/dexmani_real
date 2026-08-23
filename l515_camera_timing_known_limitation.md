@@ -1,6 +1,7 @@
 # L515 RGB/Depth 发布时序：已知限制
 
-状态：已记录，暂不修复。native 离线处理与实时点云路径均明确接受本限制。
+状态：已记录；RGB 降帧根因待独立诊断。在诊断结果确认前，不修改 production camera
+cadence、exposure/gain、repeated-color publication 或 skew filtering。
 
 ## 实测事实
 
@@ -27,8 +28,15 @@ native depth XYZ、`T_color_from_depth`、color distortion projection 的空间�
 - 点云 XYZ 以 depth timestamp 为准；
 - RGB 只是 color timestamp 下的 projected measurement；
 - `rs.align()` 或自定义空间投影都不能消除这个时间差；
-- raw v20 分别保存 depth/color frame number 与 timestamp，避免隐藏该限制；
+- raw v21 分别保存 depth/color frame number 与 timestamp，避免隐藏该限制；
 - 安全、碰撞和 workspace 判断不得依赖 projected RGB。
+
+三类 timestamp 应区分：
+
+- XYZ geometry 对应 native depth exposure/time；
+- projected RGB 对应 native color exposure/time；
+- camera pair `source_monotonic_ns` 是 `min(depth_mapped_source, color_mapped_source)`，
+  用于 conservative pair freshness / causality，不等价于 XYZ 的唯一物理采样时间。
 
 ## 当前决策
 

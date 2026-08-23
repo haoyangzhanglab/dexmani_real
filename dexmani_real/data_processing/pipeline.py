@@ -27,7 +27,6 @@ from dexmani_real.data_processing.transforms import (
     resize_depth,
     resize_rgb,
 )
-from dexmani_real.planning.pose_utils import quat_wxyz_to_rotmat, rot6d_to_quat_wxyz
 from dexmani_real.recording.episode_reader import EpisodeReader
 from dexmani_real.recording.transaction import atomic_publish
 from dexmani_real.sensor.camera_geometry import CameraIntrinsics, RGBDGeometry
@@ -106,40 +105,40 @@ def _geometry_from_reader(reader: EpisodeReader) -> RGBDGeometry:
     )
 
 
-def _depth_transform_for_index(reader: EpisodeReader, source_index: int) -> np.ndarray:
-    meta = reader.h5f["meta"].attrs
-    camera_type = str(meta.get("camera_type", ""))
+def _require_supported_processed_camera_pose(reader: EpisodeReader) -> None:
+    """Fail closed unless the raw timing contract supports camera geometry.
+
+    ``eye_to_hand`` uses a static calibration and is always supported.
+    ``eye_in_hand`` would need the wrist pose evaluated at the native
+    color/depth exposure times, but raw v21 does not persist per-stream
+    host-mapped camera source timestamps, so any camera-modal profile must
+    fail before a processed artifact is written.
+    """
+    camera_type = str(reader.h5f["meta"].attrs.get("camera_type", ""))
     if camera_type == "eye_to_hand":
-        return _validate_transform(
-            np.asarray(meta["camera_T_xarm_base_from_depth"]),
-            label="camera_T_xarm_base_from_depth",
+        return
+    if camera_type == "eye_in_hand":
+        raise ValueError(
+            "processed RGB/camera_extrinsic/pointcloud for eye_in_hand requires "
+            "arm pose evaluated at native color/depth exposure times; raw v21 "
+            "does not persist per-stream host-mapped camera source timestamps"
         )
-    if camera_type != "eye_in_hand":
-        raise ValueError(f"unsupported camera_type {camera_type!r}")
-    t_eef_from_depth = _validate_transform(
-        np.asarray(meta["camera_T_eef_from_depth"]),
-        label="camera_T_eef_from_depth",
-    )
-    arm_ee = np.asarray(reader.h5f["arm_ee"][source_index], dtype=np.float64)
-    if arm_ee.shape != (9,) or not np.all(np.isfinite(arm_ee)):
-        raise ValueError(f"arm_ee[{source_index}] must be finite (9,)")
-    t_base_eef = np.eye(4, dtype=np.float64)
-    t_base_eef[:3, :3] = quat_wxyz_to_rotmat(rot6d_to_quat_wxyz(arm_ee[3:]))
-    t_base_eef[:3, 3] = arm_ee[:3]
+    raise ValueError(f"unsupported camera_type {camera_type!r}")
+
+
+def _depth_transform(reader: EpisodeReader) -> np.ndarray:
+    meta = reader.h5f["meta"].attrs
+    _require_supported_processed_camera_pose(reader)
     return _validate_transform(
-        t_base_eef @ t_eef_from_depth,
-        label="T_xarm_base_from_depth",
+        np.asarray(meta["camera_T_xarm_base_from_depth"]),
+        label="camera_T_xarm_base_from_depth",
     )
 
 
-def _color_transform_for_index(
-    reader: EpisodeReader,
-    source_index: int,
-    geometry: RGBDGeometry,
-) -> np.ndarray:
+def _color_transform(reader: EpisodeReader, geometry: RGBDGeometry) -> np.ndarray:
     depth_from_color = np.linalg.inv(geometry.T_color_from_depth)
     return _validate_transform(
-        _depth_transform_for_index(reader, source_index) @ depth_from_color,
+        _depth_transform(reader) @ depth_from_color,
         label="T_xarm_base_from_color",
     )
 
@@ -152,7 +151,7 @@ class _PointCloudDeriver:
     geometry: RGBDGeometry
     depth_scale: float
     config: ProcessingConfig
-    static_base_from_depth: np.ndarray | None
+    static_base_from_depth: np.ndarray
 
     @classmethod
     def from_reader(
@@ -163,28 +162,22 @@ class _PointCloudDeriver:
         depth_scale = float(meta["depth_scale"])
         if not np.isfinite(depth_scale) or depth_scale <= 0.0:
             raise ValueError("depth_scale must be finite and positive")
-        static_base_from_depth = None
-        if str(meta.get("camera_type", "")) == "eye_to_hand":
-            static_base_from_depth = _depth_transform_for_index(reader, 0)
         return cls(
             reader=reader,
             geometry=geometry,
             depth_scale=depth_scale,
             config=config,
-            static_base_from_depth=static_base_from_depth,
+            static_base_from_depth=_depth_transform(reader),
         )
 
     def derive(self, source_index: int, rgb: np.ndarray) -> np.ndarray | None:
         depth_raw = np.asarray(self.reader.h5f["depth"][source_index], dtype=np.uint16)
-        base_from_depth = self.static_base_from_depth
-        if base_from_depth is None:
-            base_from_depth = _depth_transform_for_index(self.reader, source_index)
         return build_point_cloud(
             depth_raw=depth_raw,
             color=np.asarray(rgb, dtype=np.uint8),
             depth_scale_m=self.depth_scale,
             geometry=self.geometry,
-            T_xarm_base_from_depth=base_from_depth,
+            T_xarm_base_from_depth=self.static_base_from_depth,
             table_plane_abcd=self.config.table_plane_abcd,
             config=self.config.pointcloud,
         )
@@ -477,6 +470,10 @@ def _write_processed_episode(
 ) -> dict[str, Any]:
     path = output_root / f"{reader.h5_path.name}.h5"
     selected = decision.selected_indices
+    # Fail closed before creating the output file: camera-modal profiles
+    # require an eye_to_hand static transform (see the guard's docstring).
+    if config.profile.needs_rgb or config.profile.needs_pointcloud:
+        _require_supported_processed_camera_pose(reader)
     with h5py.File(path, "w") as output:
         _write_attrs(output, reader, decision, config, annotation)
         _create_data_datasets(output, decision.selected_frames, config)
@@ -544,11 +541,9 @@ def _write_processed_episode(
                 target_width=config.target_rgb_width,
             )
             output["camera_intrinsic"][:] = camera_k[None, :]
-            output["camera_extrinsic"][:] = np.stack(
-                [
-                    _color_transform_for_index(reader, int(index), geometry)
-                    for index in selected
-                ]
+            output["camera_extrinsic"][:] = np.broadcast_to(
+                _color_transform(reader, geometry),
+                output["camera_extrinsic"].shape,
             ).astype(np.float32)
             for target_index, source_index in enumerate(selected):
                 depth = np.asarray(reader.h5f["depth"][source_index], dtype=np.uint16)

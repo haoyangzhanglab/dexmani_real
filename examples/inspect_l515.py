@@ -9,6 +9,10 @@ It is read-only unless ``--visual-preset`` is explicitly supplied for a
 diagnostic preset ablation; that setting is volatile and applies only through
 the SDK.
 
+This script's acquisition loop includes geometry and depth-quality
+computation. For precise stream-cadence / RGB-FPS root-cause diagnosis use
+``diagnose_l515_rgb_timing.py``.
+
 Example::
 
     python examples/inspect_l515.py \
