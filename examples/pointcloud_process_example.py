@@ -1,35 +1,11 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/pointcloud_process_example.py``.
 
-Self-contained L515 tabletop point-cloud and depth diagnostic. Connects a
-RealSense L515, opens cv2 and open3d GUI windows, and prints per-stage timing.
-
-This file was restored against the NEW native point-cloud API
-(``dexmani_real.sensor.pointcloud.build_point_cloud``). The old modules
-``dexmani_real.utils.pointcloud_utils`` and
-``dexmani_real.sensor.pointcloud_processor`` were deleted in commit 749fe38;
-this example no longer imports them.
-
-What changed vs the old deleted version:
-
-  - ``PointCloudProcessor`` (class) -> ``build_point_cloud`` (function).
-  - ``PointCloudProcessorConfig`` / ``PointCloudConfig`` now live in
-    ``dexmani_real.sensor.pointcloud`` with renamed fields
-    (num_points / depth_min_m / depth_max_m / voxel_size_m).
-  - The new pipeline is FIXED: valid-mask -> flying-pixel reject -> deproject
-    -> transform to xArm-base -> crop(workspace + table) -> voxel
-    representatives -> color projection -> fixed-size sample.
-  - REMOVED (no new equivalent): the 2-D median / LoG-edge / speckle
-    pre-filters, the interactive RANSAC desk-plane calibration plus the
-    desk_plane.json save/load round-trip, DBSCAN / radius / statistical
-    outlier removal, pytorch3d-FPS sampling, and the sampling-mode /
-    voxel-cycle / config-variant comparison modes.  ``table_plane_abcd`` is
-    passed as ``None`` here (desk-plane RANSAC was removed), so only the
-    workspace crop is active.
-  - Output is float32 [N, 6] = xyz in the XARM-BASE frame + rgb(0..1), instead
-    of the old camera-frame output.
-  - ``make_depth_vis`` / ``depth_valid_ratio`` no longer exist; small jet
-    colormap / valid-ratio helpers are inlined below.
+Self-contained L515 tabletop point-cloud and table-plane diagnostic. It fits a
+multi-frame deterministic table plane every run, uses that fit immediately,
+and publishes ``desk_plane.json`` only after explicit operator confirmation.
+Publishing creates a timestamped backup and affects both perception cropping
+and table-aware collision geometry on the next runtime resolution.
 """
 
 from __future__ import annotations
@@ -37,8 +13,9 @@ from __future__ import annotations
 import math
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -47,10 +24,18 @@ import pyrealsense2 as rs
 from scipy.spatial.transform import Rotation as R
 
 from dexmani_real.config.camera_calib import CameraCalib
+from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.sensor.camera_geometry import RGBDGeometry
-from dexmani_real.sensor.pointcloud import PointCloudConfig, build_point_cloud
+from dexmani_real.sensor.pointcloud import (
+    build_point_cloud_with_stats,
+    depth_points_in_base,
+)
 from dexmani_real.sensor.realsense import L515DepthConfig, RealSense, RealSenseConfig
+from dexmani_real.sensor.table_calibration import fit_table_plane, publish_table_plane
+
+if TYPE_CHECKING:
+    import open3d as o3d
 
 
 @dataclass(frozen=True)
@@ -62,6 +47,7 @@ class PointCloudDiagnosticConfig:
     fps: int = 30
     warmup_frames: int = 30
     target_points: int = 2048
+    table_calibration_frames: int = 5
 
     show_rgbd_panels: bool = True
     show_o3d: bool = True
@@ -114,36 +100,21 @@ def _jet_colormap(values: np.ndarray) -> np.ndarray:
 
 
 def _make_depth_vis(depth_m: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
-    """Render a float depth map (meters) as a uint8 BGR-compatible RGB image.
-
-    # NOTE: removed -- make_depth_vis was deleted with pointcloud_utils; the
-    jet-colormap helper is inlined here.
-    """
-    safe = np.where(np.isfinite(depth_m), depth_m, 0.0)
+    """Render metric depth as an 8-bit BGR image for OpenCV."""
+    valid = np.isfinite(depth_m) & (depth_m > 0.0)
+    safe = np.where(valid, depth_m, vmin)
     normalized = (safe - float(vmin)) / (float(vmax) - float(vmin))
-    colored = _jet_colormap(normalized)
-    return (colored * 255.0).astype(np.uint8)
-
-
-def _depth_valid_ratio(
-    depth_m: np.ndarray, vmin: float, vmax: float
-) -> float:
-    """Fraction of pixels with finite depth inside [vmin, vmax] meters.
-
-    # NOTE: removed -- depth_valid_ratio was deleted with pointcloud_utils;
-    the mean-of-valid-mask helper is inlined here.
-    """
-    valid = np.isfinite(depth_m) & (depth_m >= float(vmin)) & (depth_m <= float(vmax))
-    return float(np.mean(valid))
+    depth_bgr = (_jet_colormap(normalized)[..., ::-1] * 255.0).astype(np.uint8)
+    depth_bgr[~valid] = 0
+    return depth_bgr
 
 
 def _show_rgbd_panels(
     rgb: np.ndarray,
     depth_m: np.ndarray,
-    edge_vis: np.ndarray | None,
     cfg: PointCloudDiagnosticConfig,
 ) -> None:
-    """Show RGB, depth, and optional edge mask side by side."""
+    """Show native RGB and depth side by side."""
     if not cfg.show_rgbd_panels:
         return
     try:
@@ -158,21 +129,14 @@ def _show_rgbd_panels(
         ("RGB", bgr),
         ("Depth", _make_depth_vis(depth_m, cfg.vis_depth_min_m, cfg.vis_depth_max_m)),
     ]
-    # NOTE: removed -- the LoG+dilate edge-mask visualization came from the old
-    # 2-D edge filter, which no longer exists; edge_vis is always None now.
-    if edge_vis is not None:
-        panels.append(("Edge mask (red=core, yellow=dilated)", edge_vis))
-
     labeled = []
     rgb_h, rgb_w = bgr.shape[:2]
     for title, image in panels:
         canvas = image.copy()
         if canvas.shape[:2] != (rgb_h, rgb_w):
             # Depth is native 1024x768 while RGB is 640x480 (both 4:3); resize
-            # the depth/edge panels to the RGB size so np.hstack lines up.
-            canvas = cv2.resize(
-                canvas, (rgb_w, rgb_h), interpolation=cv2.INTER_LINEAR
-            )
+            # the depth panel to the RGB size so np.hstack lines up.
+            canvas = cv2.resize(canvas, (rgb_w, rgb_h), interpolation=cv2.INTER_LINEAR)
         cv2.putText(
             canvas,
             title,
@@ -194,23 +158,19 @@ def _show_rgbd_panels(
         print(f"  RGBD window skipped (no display?): {error}")
 
 
-def _print_depth_stats(
-    depth_m: np.ndarray, vmin: float, vmax: float
-) -> float:
+def _print_depth_stats(depth_m: np.ndarray, vmin: float, vmax: float) -> None:
     """Print 2-D depth-gate statistics for the diagnostic view."""
     print("\n" + "=" * 60)
     print("2-D Depth Gate (diagnostic view)")
     print("=" * 60)
     valid = np.isfinite(depth_m) & (depth_m >= float(vmin)) & (depth_m <= float(vmax))
-    ratio = _depth_valid_ratio(depth_m, vmin, vmax)
+    ratio = float(np.mean(valid))
     print(
         f"  Range [{vmin:.2f}, {vmax:.2f}] m:  {int(valid.sum()):6d} / "
         f"{depth_m.size} pixels  ({ratio * 100:.1f}%)"
     )
-    # NOTE: removed -- the old 2-D median / LoG-edge / speckle pre-filters had
-    # no equivalent in the new fixed pipeline; build_point_cloud applies a
-    # single internal flying-pixel reject instead.
-    return ratio
+    # The production builder applies its own local depth-support and flying-
+    # pixel decisions; this panel intentionally reports only the depth gate.
 
 
 def _tprint(label: str, key: str, timings: dict[str, float]) -> None:
@@ -232,6 +192,7 @@ def _stage_label(key: str) -> str:
     return {
         "capture": "Frame capture",
         "extrinsics": "Extrinsics load",
+        "desk_calib": "Table plane calibration",
         "p_pipeline": "Complete point-cloud pipeline",
     }.get(key, key)
 
@@ -243,9 +204,6 @@ def _connect_camera(cfg: PointCloudDiagnosticConfig) -> RealSense:
     init (pipeline start + warmup frames), not a per-frame pipeline stage, and
     its multi-second duration would dominate the per-stage timing chart.
     """
-    # NOTE: removed -- RealSenseConfig no longer has an ``align_mode`` field;
-    # the driver keeps the native depth/color streams and maps them with
-    # T_color_from_depth (see get_geometry).
     camera = RealSense(
         RealSenseConfig(
             depth_resolution=cfg.depth_resolution,
@@ -311,8 +269,6 @@ def _capture_frame(
     if frame.rgb is None:
         raise RuntimeError("RGB frame unavailable.")
 
-    # NOTE: removed -- CameraFrame no longer carries ``align_mode`` or ``K``;
-    # the native depth/color streams are mapped by the driver's RGBDGeometry.
     rgb = np.ascontiguousarray(frame.rgb)
     depth_raw = np.ascontiguousarray(frame.depth_raw)
     depth_m = np.ascontiguousarray(frame.depth, dtype=np.float32)
@@ -353,32 +309,91 @@ def _load_extrinsics(
 
 
 def _production_config(num_points: int) -> PointCloudConfig:
-    """PointCloudConfig matching the production realtime worker.
-
-    Mirrors ``PointCloudLoopConfig.from_runtime`` in
-    ``dexmani_real/sensor/pointcloud_process.py``: the workspace crop volume is
-    taken from the active runtime policy, not the PointCloudConfig default.
-    """
+    """Return the canonical runtime policy with only output size overridden."""
     runtime = resolve_runtime_config()
-    ws = runtime.policy.workspace
-    return PointCloudConfig(
-        num_points=num_points,
-        workspace=(
-            float(ws.x_min),
-            float(ws.y_min),
-            float(ws.z_min),
-            float(ws.x_max),
-            float(ws.y_max),
-            float(ws.z_max),
-        ),
-    )
+    return replace(runtime.pointcloud, num_points=num_points)
 
 
-def _table_plane() -> tuple[float, float, float, float] | None:
-    """Active table plane from the runtime environment config, matching production."""
+def _table_plane_path() -> Path:
+    """Resolve the shared table calibration path from runtime configuration."""
     runtime = resolve_runtime_config()
     table = runtime.environment.table
-    return table.plane_abcd if table.enabled else None
+    if not table.enabled or table.plane_path is None:
+        raise RuntimeError("runtime table calibration is disabled or has no plane_path")
+    path = Path(table.plane_path)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[1] / path
+    return path
+
+
+def _calibrate_table(
+    *,
+    camera: RealSense,
+    geometry: RGBDGeometry,
+    T_xarm_base_from_depth: np.ndarray,
+    config: PointCloudConfig,
+    frame_count: int,
+) -> tuple[tuple[float, float, float, float], float]:
+    """Fit a deterministic multi-frame table plane and optionally publish it."""
+    print("\n" + "=" * 60)
+    print("Table Plane Calibration (multi-frame RANSAC)")
+    print("=" * 60)
+    print("  Clear movable objects from the visible table before continuing.")
+    input("  Press Enter to capture calibration frames...")
+
+    started = time.perf_counter()
+    depth_frames: list[np.ndarray] = []
+    for _ in range(max(1, frame_count)):
+        depth_frames.append(np.ascontiguousarray(camera.read().depth_raw))
+
+    point_batches: list[np.ndarray] = []
+    lower = np.asarray(config.workspace[:3], dtype=np.float32)
+    upper = np.asarray(config.workspace[3:], dtype=np.float32)
+    for depth_raw in depth_frames:
+        points = depth_points_in_base(
+            depth_raw=depth_raw,
+            depth_scale_m=camera.get_depth_scale(),
+            depth_intrinsics=geometry.depth,
+            T_xarm_base_from_depth=T_xarm_base_from_depth,
+            config=config,
+        )
+        points = points[np.all((points >= lower) & (points <= upper), axis=1)]
+        if points.shape[0] > 30_000:
+            step = max(1, points.shape[0] // 30_000)
+            points = points[::step][:30_000]
+        point_batches.append(points)
+    calibration_points = np.concatenate(point_batches, axis=0)
+    fit = fit_table_plane(calibration_points)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+    a, b, c, d = fit.plane_abcd
+    print(f"  Plane: {a:.6f}x + {b:.6f}y + {c:.6f}z + {d:.6f} = 0")
+    print(
+        f"  Support: {fit.inlier_points}/{fit.evaluated_points} "
+        f"({fit.inlier_ratio * 100:.1f}%), RMS={fit.rms_residual_m * 1000:.2f} mm, "
+        f"tilt={fit.tilt_deg:.2f} deg"
+    )
+
+    plane_path = _table_plane_path()
+    print(
+        "  WARNING: publishing updates the shared plane used by point-cloud "
+        "cropping and table collision geometry."
+    )
+    confirmed = input(f"Publish to {plane_path}? [y/N] ").strip().lower() in {
+        "y",
+        "yes",
+    }
+    if confirmed:
+        backup = publish_table_plane(plane_path, fit, confirmed=True)
+        if backup is not None:
+            print(f"  Backup: {backup}")
+        runtime_plane = resolve_runtime_config().environment.table.plane_abcd
+        if not np.allclose(runtime_plane, fit.plane_abcd, rtol=0.0, atol=1e-12):
+            raise RuntimeError("published plane failed runtime-config round-trip")
+        print("  Published and runtime-config round-trip verified.")
+    else:
+        print("  Calibration file unchanged; using the new fit for this run only.")
+    return fit.plane_abcd, elapsed_ms
 
 
 def _build_cloud(
@@ -395,21 +410,13 @@ def _build_cloud(
     print("\n" + "=" * 60)
     print("Point-Cloud Pipeline (native -> xArm-base)")
     print("=" * 60)
-    # NOTE: removed -- the old PointCloudProcessor supported median / LoG-edge /
-    # speckle pre-filters, RANSAC desk-plane removal, DBSCAN / radius /
-    # statistical outlier removal, and pytorch3d-FPS sampling.  The new
-    # pipeline is FIXED: valid-mask -> flying-pixel reject -> deproject ->
-    # transform to xArm-base -> crop(workspace + table) -> voxel
-    # representatives -> color projection -> fixed-size sample.
-    # NOTE: removed -- interactive desk-plane RANSAC calibration and the
-    # desk_plane.json save/load round-trip have no equivalent; the table plane
-    # is now loaded from the runtime environment config (same as production).
     table_state = "ENABLED" if table_plane_abcd is not None else "DISABLED"
     print(f"  num_points={config.num_points}  workspace={config.workspace}")
     print(f"  depth range [{config.depth_min_m}, {config.depth_max_m}] m")
     print(f"  voxel_size_m={config.voxel_size_m}  table crop: {table_state}")
 
-    build_kwargs = dict(
+    # Warm up once, then time the public operation.
+    _ = build_point_cloud_with_stats(
         depth_raw=depth_raw,
         color=rgb,
         depth_scale_m=depth_scale_m,
@@ -419,13 +426,26 @@ def _build_cloud(
         config=config,
     )
 
-    # Warm up once, then time the public operation.
-    _ = build_point_cloud(**build_kwargs)
-
     t0 = time.perf_counter()
-    result = build_point_cloud(**build_kwargs)
+    result, stats = build_point_cloud_with_stats(
+        depth_raw=depth_raw,
+        color=rgb,
+        depth_scale_m=depth_scale_m,
+        geometry=geometry,
+        T_xarm_base_from_depth=T_xarm_base_from_depth,
+        table_plane_abcd=table_plane_abcd,
+        config=config,
+    )
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     timings = {"pipeline_total": elapsed_ms, "p_pipeline": elapsed_ms}
+
+    print(
+        "  Stage counts: "
+        f"valid={stats.depth_valid_points} -> supported={stats.depth_trusted_points} "
+        f"-> crop={stats.cropped_points} -> voxel={stats.voxel_points} "
+        f"-> candidate={stats.outlier_candidate_points} "
+        f"-> inlier={stats.outlier_inlier_points} -> visible={stats.color_visible_points}"
+    )
 
     if result is not None:
         print(
@@ -445,7 +465,7 @@ def _print_timing_summary(timings: dict[str, float]) -> None:
     print("=" * 60)
 
     sections = [
-        ("Setup", ["capture", "extrinsics"]),
+        ("Setup", ["capture", "extrinsics", "desk_calib"]),
         ("Point-Cloud Pipeline (per-frame steady-state)", ["p_pipeline"]),
     ]
 
@@ -542,16 +562,23 @@ def main() -> int:
         rgb, depth_raw, depth_m, t = _capture_frame(camera)
         all_timings.update(t)
         _print_depth_stats(depth_m, cfg.vis_depth_min_m, cfg.vis_depth_max_m)
-        _show_rgbd_panels(rgb, depth_m, None, cfg)
+        _show_rgbd_panels(rgb, depth_m, cfg)
 
         geometry = camera.get_geometry()
         T_xarm_base_from_depth, extrinsics_ms = _load_extrinsics(camera_info, geometry)
         all_timings["extrinsics"] = extrinsics_ms
 
-        # Match the production realtime worker: workspace from the runtime
-        # policy, table plane from the runtime environment config.
+        # The diagnostic uses the exact runtime point-cloud policy. The new
+        # fit is used immediately whether or not the operator publishes it.
         pcd_config = _production_config(cfg.target_points)
-        table_plane_abcd = _table_plane()
+        table_plane_abcd, calibration_ms = _calibrate_table(
+            camera=camera,
+            geometry=geometry,
+            T_xarm_base_from_depth=T_xarm_base_from_depth,
+            config=pcd_config,
+            frame_count=cfg.table_calibration_frames,
+        )
+        all_timings["desk_calib"] = calibration_ms
 
         result, t = _build_cloud(
             depth_raw=depth_raw,

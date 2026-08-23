@@ -10,15 +10,16 @@ from __future__ import annotations
 import json
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from dexmani_real.config.camera_calib import CameraCalib
+from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.sensor.camera_geometry import RGBDGeometry
 from dexmani_real.sensor.camera_process import CameraHealth
-from dexmani_real.sensor.pointcloud import PointCloudConfig, build_point_cloud
+from dexmani_real.sensor.pointcloud import POINT_CLOUD_POLICY_ID, build_point_cloud
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import (
     SUPPORTED_POINT_CLOUD_COUNTS,
@@ -71,8 +72,9 @@ class PointCloudLoopConfig:
             plane = tuple(float(value) for value in self.table_plane_abcd)
             if len(plane) != 4 or not np.all(np.isfinite(plane)):
                 raise ValueError("table_plane_abcd must contain four finite values")
-            if np.linalg.norm(plane[:3]) <= 0.0:
-                raise ValueError("table_plane_abcd normal must be non-zero")
+            norm = np.linalg.norm(plane[:3])
+            if norm <= 0.0 or plane[2] / norm <= 0.0:
+                raise ValueError("table_plane_abcd normal must point upward")
             object.__setattr__(self, "table_plane_abcd", plane)
         if not np.isfinite(self.max_input_age_s) or self.max_input_age_s <= 0.0:
             raise ValueError("max_input_age_s must be finite and positive")
@@ -84,22 +86,11 @@ class PointCloudLoopConfig:
         *,
         num_points: int,
     ) -> "PointCloudLoopConfig":
-        policy = getattr(runtime, "policy")
         environment = getattr(runtime, "environment")
         camera = getattr(runtime, "camera")
         table = environment.table
         return cls(
-            pointcloud=PointCloudConfig(
-                num_points=num_points,
-                workspace=(
-                    float(policy.workspace.x_min),
-                    float(policy.workspace.y_min),
-                    float(policy.workspace.z_min),
-                    float(policy.workspace.x_max),
-                    float(policy.workspace.y_max),
-                    float(policy.workspace.z_max),
-                ),
-            ),
+            pointcloud=replace(getattr(runtime, "pointcloud"), num_points=num_points),
             table_plane_abcd=table.plane_abcd if table.enabled else None,
             max_input_age_s=float(camera.max_frame_age_s),
         )
@@ -195,6 +186,13 @@ def pointcloud_loop(shared: "SharedStorage", config: PointCloudLoopConfig) -> No
     if static_inputs is None:
         return
     geometry, depth_scale_m, base_from_depth = static_inputs
+    logger.info(
+        "pointcloud policy: id=%s config_sha256=%s config=%s table_plane_abcd=%s",
+        POINT_CLOUD_POLICY_ID,
+        cfg.pointcloud.sha256,
+        json.dumps(cfg.pointcloud.to_dict(), sort_keys=True, separators=(",", ":")),
+        json.dumps(cfg.table_plane_abcd, separators=(",", ":")),
+    )
 
     last_camera_sequence = 0
     frames_processed = 0

@@ -21,7 +21,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 - RealSense 相机按设备原生频率连续采集；16 Hz 控制网格只选择最新严格因果帧，
   不再将相机发布节拍绑定到控制频率。
 - 事务式写入 native RGB-D raw episode v21；分别保存 depth/color 几何与时序。
-- 将 native raw v21 episode 清洗为 processed HDF5 v4，再导出 Policy Zarr v2。
+- 将 native raw v21 episode 清洗为 processed HDF5 v5，再导出 Policy Zarr v3。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
 - 通过可替换 `PolicyRuntime` 运行 joint/EE-action learned policy；仓库包含无模型的
   deterministic fake 实现和 `dexmani_policy` 集成。启动时 `DeploymentManifest`
@@ -131,7 +131,9 @@ CLI override > YAML file > dexmani_real/config/defaults.py
 
 运行时配置由 [`config/runtime.py`](dexmani_real/config/runtime.py) 校验、冻结并生成
 SHA-256；部署配置由 [`deployment/config.py`](dexmani_real/deployment/config.py)
-独立解析。可在不启动硬件的情况下查看遥操作解析结果：
+独立解析。`pointcloud` 是与 EEF `policy.workspace` 分离的感知配置段；实时 worker、离线
+重建和 shadow 检查只从该段派生参数，并把策略 ID 与配置 SHA-256 写入 processed/Zarr
+语义。可在不启动硬件的情况下查看遥操作解析结果：
 
 ```bash
 python examples/collect_teleop.py --print-config
@@ -153,6 +155,8 @@ python examples/collect_teleop.py --print-config
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | L515 native baseline | `python examples/inspect_l515.py --scene <scene> --frames 300 --output-dir <dir>` | 只连接相机；无 GUI；写 native Z16 与几何/时序 JSON，不写标定 |
 | L515 native 点云 shadow | `python examples/check_l515_native_shadow.py <inspect-output-dir> --num-points 1024` | 离线；读取 `--save-rgb` 的采集结果，验证固定 `(N,6)` xArm-base 点云与 RGB 投影 |
+| RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |
+| 桌面点云与标定诊断 | `python examples/pointcloud_process_example.py` | 只连接相机；多帧拟合桌面；仅在显式确认后备份并更新共享桌面标定 |
 | XHand 独立诊断 | `python examples/xhand_control_example.py` | 连接并控制 XHand |
 
 支持 argparse 的入口应先用 `--help` 查看当前参数；
@@ -169,6 +173,13 @@ point-cloud worker。worker 始终读取最新的 native RGB-D，旧帧不会排
 点云 T 历史窗（`n_obs_steps` 帧，跨帧 `camera_generation` 一致），每帧为 xArm-base
 `float32 (N, 6)`，列语义为 `xyzrgb`，RGB 范围为 `[0,1]`。`pointcloud_num_points` 只允许
 `1024`、`2048`、`4096`、`8192`，也可通过 `--pointcloud-num-points` 覆盖。
+
+实时、离线处理和 shadow 诊断共用 `PointCloudConfig` 与同一个生产 builder。处理顺序为：
+native depth 范围/局部支持过滤 → depth-frame 桌面保守裁减 → xArm-base 变换与 workspace
+裁减 → 均值体素 → 空间候选上限 → 半径离群过滤 → native color 投影与可见性检查 →
+确定性固定 N 采样。processed HDF5 和 Policy Zarr 同时保存并校验算法、配置 SHA-256 与
+桌面平面身份，禁止混合不同点云语义的数据。
+
 示例 deployment YAML：
 
 ```yaml
@@ -197,13 +208,15 @@ deployment:
 Exposure 仍 ON），RGB 恢复 30 Hz，亮度由增益补偿、几乎不变（暗场噪声上升）。详见
 [`l515_camera_timing_known_limitation.md`](l515_camera_timing_known_limitation.md)。
 
-深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew），因此 processed v4 的点云
+深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew），因此 processed v5 的点云
 颜色语义仍是 `native_color_projection`，不表示同步曝光；运动物体可能出现颜色时间错位。
 
-旧 aligned（`rs.align()`）点云/桌面诊断入口已删除；点云/桌面交互诊断现以 native 几何版
-恢复为 `examples/realsense_record_example.py` 与 `examples/pointcloud_process_example.py`
-（均只连相机、无标定写入）。现有 `dexmani_real/config/desk_plane.json` 继续作为环境单一来源；
-重新标定工具将在后续独立重建。
+native 几何点云/桌面交互诊断入口为 `examples/realsense_record_example.py` 与
+`examples/pointcloud_process_example.py`。前者可在完整 RAW 点云和 canonical 处理后点云之间
+切换：`p` 显示点云，`s` 切换 RAW/PROCESSED，`v/w/f/r` 分别调整诊断体素、开关处理后
+裁减、冻结和重置。后者提示清空桌面后采集 5 帧，以确定性 RANSAC 重新拟合桌面；新拟合
+在本次运行立即使用，只有操作者输入 `y` 才会备份并原子更新
+`dexmani_real/config/desk_plane.json`。该文件同时服务感知裁减和桌面碰撞几何。
 
 ### 离线数据工作流
 
@@ -222,10 +235,10 @@ python examples/process_episodes.py \
 `--profile` 选择 `joint`、`rgb`、`pointcloud` 或 `rgb_pc`。后两种 profile 可用
 `--pointcloud-num-points` 选择 `1024`、`2048`、`4096` 或 `8192`，默认 `1024`。
 
-raw episode 可视化只展示实际存储的相机与状态数据，不再从历史 aligned depth 合成点云。
-需要检查点云时，先用 `process_episodes.py` 生成 processed HDF5 v4，再运行
+raw episode 可视化只展示文件实际存储的相机与状态数据。需要检查 canonical 点云时，先用
+`process_episodes.py` 生成 processed HDF5 v5，再运行
 `python examples/visualize_episode_processed.py <processed.h5>`；该入口会校验 `(N,6)`、
-`float32`、xArm-base 坐标系、RGB 范围与采样语义。
+`float32`、xArm-base 坐标系、RGB 范围、算法/采样语义、配置哈希与桌面标定身份。
 
 发布时逐 episode 显示 tqdm 进度（stderr），终端只打印精简汇总，不再向 stdout 输出 JSON。
 需要机器可读报告时加 `--write-report`，发布成功后在

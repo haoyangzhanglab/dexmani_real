@@ -1,4 +1,4 @@
-"""Transactional raw-v21 to processed-v4 Real episode processing."""
+"""Transactional raw-v21 to processed-v5 Real episode processing."""
 
 from __future__ import annotations
 
@@ -32,7 +32,9 @@ from dexmani_real.recording.transaction import atomic_publish
 from dexmani_real.sensor.camera_geometry import CameraIntrinsics, RGBDGeometry
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
+    POINT_CLOUD_POLICY_ID,
     POINT_CLOUD_SAMPLING,
+    POINT_CLOUD_TRANSFORM,
     build_point_cloud,
 )
 from dexmani_real.utils.log import get_logger
@@ -40,7 +42,7 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 4
+PROCESSED_SCHEMA_VERSION = 5
 _SOURCE_MEMBERS = ("data.h5", "depth.h5", "rgb.mp4")
 _VALIDATION_CHUNK_BYTES = 64 * 1024 * 1024
 
@@ -92,7 +94,7 @@ def _intrinsics_from_meta(meta: Any, *, stream: str) -> CameraIntrinsics:
 def _geometry_from_reader(reader: EpisodeReader) -> RGBDGeometry:
     if reader.schema_version != 21:
         raise ValueError(
-            "processed v4 requires native raw schema v21, "
+            "processed v5 requires native raw schema v21, "
             f"got v{reader.schema_version}"
         )
     meta = reader.h5f["meta"].attrs
@@ -452,11 +454,15 @@ def _write_attrs(
                     (config.pointcloud.num_points, 6), dtype=np.int64
                 ),
                 "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
-                "point_cloud_sampling": POINT_CLOUD_SAMPLING,
-                "point_cloud_transform": (
-                    "native_depth_to_xarm_base;table_workspace_crop;"
-                    "voxel_representative;color_projection;uniform_or_cyclic_pad"
+                "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
+                "point_cloud_config_sha256": config.pointcloud.sha256,
+                "point_cloud_table_plane_abcd_json": _json(
+                    None
+                    if config.table_plane_abcd is None
+                    else list(config.table_plane_abcd)
                 ),
+                "point_cloud_sampling": POINT_CLOUD_SAMPLING,
+                "point_cloud_transform": POINT_CLOUD_TRANSFORM,
             }
         )
 
@@ -645,13 +651,13 @@ def _expected_specs(
 def validate_processed_hdf5(
     path: str | Path, config: ProcessingConfig
 ) -> dict[str, Any]:
-    """Fail closed on a processed Real HDF5 v4 artifact."""
+    """Fail closed on a processed Real HDF5 v5 artifact."""
 
     artifact = Path(path)
     with h5py.File(artifact, "r") as source:
         expected_top = set(config.profile.dataset_keys) | {"provenance"}
         if set(source.keys()) != expected_top:
-            raise ValueError(f"{artifact.name}: top-level keys do not match v4 profile")
+            raise ValueError(f"{artifact.name}: top-level keys do not match v5 profile")
         length = int(source.attrs.get("episode_steps", -1))
         if length < config.min_episode_frames:
             raise ValueError(f"{artifact.name}: episode_steps={length} is too short")
@@ -728,10 +734,22 @@ def validate_processed_hdf5(
                 or str(source.attrs.get("point_cloud_frame", "")) != "xarm_base"
                 or str(source.attrs.get("point_cloud_color_source", ""))
                 != POINT_CLOUD_COLOR_SOURCE
+                or str(source.attrs.get("point_cloud_policy_id", ""))
+                != POINT_CLOUD_POLICY_ID
+                or str(source.attrs.get("point_cloud_config_sha256", ""))
+                != config.pointcloud.sha256
+                or str(source.attrs.get("point_cloud_table_plane_abcd_json", ""))
+                != _json(
+                    None
+                    if config.table_plane_abcd is None
+                    else list(config.table_plane_abcd)
+                )
                 or str(source.attrs.get("point_cloud_sampling", ""))
                 != POINT_CLOUD_SAMPLING
+                or str(source.attrs.get("point_cloud_transform", ""))
+                != POINT_CLOUD_TRANSFORM
             ):
-                raise ValueError(f"{artifact.name}: invalid v4 point-cloud semantics")
+                raise ValueError(f"{artifact.name}: invalid v5 point-cloud semantics")
         if str(source.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
             raise ValueError(f"{artifact.name}: invalid schema_name")
         if int(source.attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
@@ -860,7 +878,7 @@ def process_episode_root(
                 reader.require_valid(purpose="offline processing")
                 if reader.schema_version != 21:
                     raise ValueError(
-                        "processed v4 accepts native raw schema v21 only; "
+                        "processed v5 accepts native raw schema v21 only; "
                         f"got v{reader.schema_version}"
                     )
                 decisions.append(

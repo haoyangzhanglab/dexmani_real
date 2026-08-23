@@ -12,6 +12,7 @@ from types import MappingProxyType
 
 import numpy as np
 
+from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.utils.limits import validate_hand_limit_nesting
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
@@ -911,6 +912,7 @@ keyboard_teleop = KeyboardTeleopParams()
 vr = VRParams()
 safety = SafetyParams()
 camera = CameraParams()
+pointcloud = PointCloudConfig()
 tag_retargeting = TAGRetargetingParams()
 dexpilot_retargeting = DexPilotRetargetingParams()
 environment = EnvironmentConfig()

@@ -34,6 +34,7 @@ from dexmani_real.config.defaults import (
     VRParams,
 )
 from dexmani_real.config.defaults import arm as arm_defaults
+from dexmani_real.config.pointcloud import PointCloudConfig
 
 _SECTION_NAMES = (
     "arm",
@@ -43,6 +44,7 @@ _SECTION_NAMES = (
     "vr",
     "safety",
     "camera",
+    "pointcloud",
     "tag_retargeting",
     "dexpilot_retargeting",
     "environment",
@@ -78,6 +80,7 @@ class ResolvedRuntimeConfig:
     vr: VRParams
     safety: SafetyParams
     camera: CameraParams
+    pointcloud: PointCloudConfig
     tag_retargeting: TAGRetargetingParams
     dexpilot_retargeting: DexPilotRetargetingParams
     environment: EnvironmentConfig

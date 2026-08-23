@@ -62,7 +62,7 @@ native depth XYZ、`T_color_from_depth`、color distortion projection 的空间�
   color 传感器并回读校验。Auto Exposure 保持 ON；OFF 只把曝光压在帧周期内、用
   增益补偿，从而在暗场维持 30 Hz RGB。设 `None` 可退回设备默认。
 - 本轮不修改 camera worker 的发布节拍，不丢弃重复 color，不增加未经单独评审的
-  skew threshold。processed v4 可以使用这些 native pair，但其 metadata 只声明
+  skew threshold。processed v5 可以使用这些 native pair，但其 metadata 只声明
   `native_color_projection`，不声明同步曝光或完美可见性。
 
 ## 剩余风险

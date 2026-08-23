@@ -3,7 +3,7 @@
 > Review baseline: `haoyangzhanglab/dexmani_real@e28aa3e72646e12e065050ec24bbc750033506a1`  
 > Review date: 2026-08-23  
 > Current camera path: Intel RealSense L515, current calibration is `eye_to_hand`  
-> Current storage pipeline: raw v21 → processed HDF5 v4 → Policy Zarr v2
+> Current storage pipeline: raw v21 → processed HDF5 v5 → Policy Zarr v3
 
 ## 1. 目标与范围
 
@@ -420,17 +420,19 @@ rot6d_to_quat_wxyz
 
 如果在 `pipeline.py` 没有其他用途，应删除对应 import。
 
-#### A4.5 不升级 schema
+#### A4.5 Schema 边界
 
-本修复：
+本节的 eye-in-hand correctness guard 本身不改变 artifact layout。仓库随后因点云语义身份
+合同升级了 processed HDF5 和 Policy Zarr；当前版本为：
 
 ```text
 raw schema       = v21 不变
-processed schema = v4 不变
-Policy Zarr      = v2 不变
+processed schema = v5
+Policy Zarr      = v3
 ```
 
-因为没有改变 artifact layout/field semantics，只是禁止生成时间语义不正确的 camera geometry。
+processed v5 / Zarr v3 持久化并校验点云算法、配置 SHA-256 和桌面平面身份；该升级独立于
+本节只禁止生成时间语义不正确 camera geometry 的修复。
 
 #### A4.6 验收矩阵
 
@@ -511,8 +513,9 @@ exposure/gain、repeated-color publication 或 skew filtering。
 | `source_monotonic_ns` | 仍为 pair-oldest `min()` |
 | SHM schema | 不变 |
 | raw schema | 仍为 v21 |
-| processed schema | 仍为 v4 |
-| pointcloud algorithm | eye_to_hand 数学/采样算法不变 |
+| processed schema | Phase A 不因 eye-in-hand guard 升级；当前为 v5 |
+| Policy Zarr | 当前为 v3 |
+| pointcloud algorithm | Phase A 当时不变；当前由 canonical policy ID 与配置 SHA-256 标识 |
 | eye_to_hand processed camera profiles | 行为不变 |
 | eye_in_hand JOINT profile | 仍允许 |
 | eye_in_hand RGB/POINTCLOUD/RGB_PC | 在写 artifact 前 fail closed |

@@ -1,7 +1,7 @@
 """Usage: ``python examples/process_episodes.py INPUT_ROOT [--profile PROFILE]``.
 
 Offline CLI that audits and compacts one task's native raw-v21 episodes into
-processed HDF5 v4 files, one per source episode.
+processed HDF5 v5 files, one per source episode.
 
 Directory mapping: ``episodes/<task>/episode_*`` (raw) is published to
 ``episodes_processed/<task>/episode_*.h5``.  Passing a single episode
@@ -58,7 +58,6 @@ from dexmani_real.data_processing.pipeline import (
     load_annotations,
     process_episode_root,
 )
-from dexmani_real.sensor.pointcloud import PointCloudConfig
 from dexmani_real.utils.schema import SUPPORTED_POINT_CLOUD_COUNTS
 
 
@@ -89,7 +88,7 @@ def _route_library_logging_to_stderr() -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Audit and compact native raw-v21 Real episodes into one processed-v4 "
+            "Audit and compact native raw-v21 Real episodes into one processed-v5 "
             "HDF5 per source; seriously broken episodes are skipped with a warning."
         )
     )
@@ -207,7 +206,9 @@ def _config(
             abrupt_hand_step_rad=args.abrupt_hand_step_rad,
         ),
         bridge_policy=BridgePolicy(args.bridge_policy),
-        pointcloud=PointCloudConfig(num_points=args.pointcloud_num_points),
+        pointcloud=dataclasses.replace(
+            runtime.pointcloud, num_points=args.pointcloud_num_points
+        ),
         table_plane_abcd=table.plane_abcd if table.enabled else None,
     )
 

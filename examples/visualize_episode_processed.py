@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/visualize_episode_processed.py PROCESSED.h5 [--info] [--max-frames N]``.
 
-Self-contained Rerun-based visualizer for processed HDF5 v4
+Self-contained Rerun-based visualizer for processed HDF5 v5
 (``dexmani-real-processed-hdf5``) artifacts written by
 ``examples/process_episodes.py``.  Offline only: connects to no hardware, writes
 no files; opens a Rerun viewer window (or prints a structure summary with
@@ -23,6 +23,7 @@ Examples::
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -38,13 +39,16 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
+from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.data_processing.pipeline import (
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
 )
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
+    POINT_CLOUD_POLICY_ID,
     POINT_CLOUD_SAMPLING,
+    POINT_CLOUD_TRANSFORM,
 )
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import (
@@ -65,7 +69,7 @@ _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
 
 _FINGER_NAMES: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
 
-# Processed core modalities are fixed by the v4 contract: joint_state/action are
+# Processed core modalities are fixed by the v5 contract: joint_state/action are
 # arm (7) + hand (12), action_ee is eef_position (3) + eef_rot6d (6) + hand (12),
 # and contact_force is one native-axis 3-vector per finger.
 _ARM_JOINT_LABELS = tuple(f"arm_j{i}" for i in range(7))
@@ -131,12 +135,51 @@ def _validate_pointcloud_dataset(h5f: h5py.File) -> int | None:
     expected_attrs = {
         "point_cloud_frame": "xarm_base",
         "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
+        "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
         "point_cloud_sampling": POINT_CLOUD_SAMPLING,
+        "point_cloud_transform": POINT_CLOUD_TRANSFORM,
     }
     for name, expected in expected_attrs.items():
         actual = str(h5f.attrs.get(name, ""))
         if actual != expected:
             raise ValueError(f"{name} must be {expected!r}, got {actual!r}")
+    try:
+        processing_config = json.loads(str(h5f.attrs.get("processing_config_json", "")))
+        pointcloud_config = processing_config["pointcloud"]
+        table_plane_abcd = processing_config["table_plane_abcd"]
+        if not isinstance(pointcloud_config, dict):
+            raise TypeError("pointcloud config must be an object")
+        resolved_pointcloud = PointCloudConfig(**pointcloud_config)
+        if resolved_pointcloud.to_dict() != pointcloud_config:
+            raise ValueError("persisted point-cloud config is not canonical")
+        if resolved_pointcloud.num_points != num_points:
+            raise ValueError("persisted point-cloud count does not match dataset")
+        if table_plane_abcd is not None:
+            plane = np.asarray(table_plane_abcd, dtype=np.float64)
+            norm = float(np.linalg.norm(plane[:3])) if plane.shape == (4,) else 0.0
+            if (
+                plane.shape != (4,)
+                or not np.all(np.isfinite(plane))
+                or norm <= 0.0
+                or plane[2] / norm <= 0.0
+            ):
+                raise ValueError("persisted point-cloud table plane is invalid")
+        canonical_table_plane = json.dumps(
+            table_plane_abcd,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(
+            "processing_config_json has no valid pointcloud policy"
+        ) from exc
+    expected_hash = resolved_pointcloud.sha256
+    actual_hash = str(h5f.attrs.get("point_cloud_config_sha256", ""))
+    if actual_hash != expected_hash:
+        raise ValueError("point_cloud_config_sha256 does not match persisted policy")
+    actual_table_plane = str(h5f.attrs.get("point_cloud_table_plane_abcd_json", ""))
+    if actual_table_plane != canonical_table_plane:
+        raise ValueError("persisted point-cloud table plane is inconsistent")
     return num_points
 
 
@@ -225,7 +268,7 @@ def print_episode_info(h5_path: str) -> None:
 
 
 class ProcessedEpisodeVisualizer:
-    """Load a processed HDF5 v4 file and stream it into Rerun for interactive viewing."""
+    """Load a processed HDF5 v5 file and stream it into Rerun for interactive viewing."""
 
     def __init__(
         self,
@@ -242,7 +285,7 @@ class ProcessedEpisodeVisualizer:
                 != PROCESSED_SCHEMA_VERSION
             ):
                 raise ValueError(
-                    f"{self._h5_path.name} is not a processed HDF5 v4 artifact"
+                    f"{self._h5_path.name} is not a processed HDF5 v5 artifact"
                 )
             self._keys = _present_keys(self._h5f)
             if "joint_state" not in self._keys and "action" not in self._keys:
@@ -497,7 +540,7 @@ class ProcessedEpisodeVisualizer:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Visualize processed DexMani HDF5 v4 episodes with Rerun 3D."
+        description="Visualize processed DexMani HDF5 v5 episodes with Rerun 3D."
     )
     parser.add_argument(
         "episode",

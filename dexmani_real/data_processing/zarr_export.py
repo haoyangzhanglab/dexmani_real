@@ -1,8 +1,9 @@
-"""Transactional export of processed Real HDF5 v4 episodes to minimal Zarr."""
+"""Transactional export of processed Real HDF5 v5 episodes to minimal Zarr."""
 
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ import h5py
 import numpy as np
 import zarr
 
+from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.data_processing.contracts import OutputProfile
 from dexmani_real.data_processing.pipeline import (
     PROCESSED_SCHEMA_NAME,
@@ -21,11 +23,13 @@ from dexmani_real.data_processing.pipeline import (
 from dexmani_real.recording.transaction import atomic_publish
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
+    POINT_CLOUD_POLICY_ID,
     POINT_CLOUD_SAMPLING,
+    POINT_CLOUD_TRANSFORM,
 )
 
 POLICY_ZARR_SCHEMA_NAME = "dexmani-real-policy-zarr"
-POLICY_ZARR_SCHEMA_VERSION = 2
+POLICY_ZARR_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -185,15 +189,62 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
             ):
                 raise ValueError(f"{path.name}: invalid Real RGB-D semantics")
         if profile.needs_pointcloud:
+            try:
+                processing_config = json.loads(
+                    _text(source.attrs.get("processing_config_json", ""))
+                )
+                pointcloud_config = processing_config["pointcloud"]
+                table_plane_abcd = processing_config["table_plane_abcd"]
+                if not isinstance(pointcloud_config, dict):
+                    raise TypeError("pointcloud config must be an object")
+                resolved_pointcloud = PointCloudConfig(**pointcloud_config)
+                if resolved_pointcloud.to_dict() != pointcloud_config:
+                    raise ValueError("pointcloud config is not canonical")
+                if resolved_pointcloud.num_points != source["point_cloud"].shape[1]:
+                    raise ValueError("pointcloud config count does not match dataset")
+                if table_plane_abcd is not None:
+                    plane = np.asarray(table_plane_abcd, dtype=np.float64)
+                    norm = (
+                        float(np.linalg.norm(plane[:3])) if plane.shape == (4,) else 0.0
+                    )
+                    if (
+                        plane.shape != (4,)
+                        or not np.all(np.isfinite(plane))
+                        or norm <= 0.0
+                        or plane[2] / norm <= 0.0
+                    ):
+                        raise ValueError("table plane must be finite and upward")
+                canonical_table_plane = json.dumps(
+                    table_plane_abcd,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            except (KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
+                raise ValueError(
+                    f"{path.name}: invalid persisted point-cloud config"
+                ) from exc
+            pointcloud_config_sha256 = resolved_pointcloud.sha256
             point_cloud_semantics = {
                 "frame": _text(source.attrs.get("point_cloud_frame", "")),
                 "color_source": _text(source.attrs.get("point_cloud_color_source", "")),
+                "policy_id": _text(source.attrs.get("point_cloud_policy_id", "")),
+                "config_sha256": _text(
+                    source.attrs.get("point_cloud_config_sha256", "")
+                ),
+                "table_plane_abcd_json": _text(
+                    source.attrs.get("point_cloud_table_plane_abcd_json", "")
+                ),
                 "sampling": _text(source.attrs.get("point_cloud_sampling", "")),
+                "transform": _text(source.attrs.get("point_cloud_transform", "")),
             }
             if point_cloud_semantics != {
                 "frame": "xarm_base",
                 "color_source": POINT_CLOUD_COLOR_SOURCE,
+                "policy_id": POINT_CLOUD_POLICY_ID,
+                "config_sha256": pointcloud_config_sha256,
+                "table_plane_abcd_json": canonical_table_plane,
                 "sampling": POINT_CLOUD_SAMPLING,
+                "transform": POINT_CLOUD_TRANSFORM,
             }:
                 raise ValueError(f"{path.name}: invalid Real point-cloud semantics")
             semantics.update(

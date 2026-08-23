@@ -10,6 +10,7 @@ per captured frame using the active calibration and table configuration.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 import time
@@ -25,8 +26,9 @@ from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.sensor.camera_geometry import RGBDGeometry
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
+    POINT_CLOUD_POLICY_ID,
     POINT_CLOUD_SAMPLING,
-    PointCloudConfig,
+    POINT_CLOUD_TRANSFORM,
     build_point_cloud,
 )
 from dexmani_real.utils.schema import (
@@ -191,7 +193,7 @@ def run_shadow_check(
     table = runtime.environment.table
     base_from_depth = _base_from_depth(report, geometry)
     indices = _select_indices(depth.shape[0], max_frames)
-    config = PointCloudConfig(num_points=num_points)
+    config = dataclasses.replace(runtime.pointcloud, num_points=num_points)
     durations_ms: list[float] = []
     failed_indices: list[int] = []
     color_mean: list[float] = []
@@ -226,7 +228,10 @@ def run_shadow_check(
         "frame_indices": indices.tolist(),
         "pointcloud_config": {
             **config.to_dict(),
+            "policy_id": POINT_CLOUD_POLICY_ID,
+            "config_sha256": config.sha256,
             "sampling": POINT_CLOUD_SAMPLING,
+            "transform": POINT_CLOUD_TRANSFORM,
             "color_source": POINT_CLOUD_COLOR_SOURCE,
         },
         "pointcloud_available_ratio": float(

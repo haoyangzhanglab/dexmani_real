@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.defaults import arm, environment, hand
-from dexmani_real.sensor.pointcloud import PointCloudConfig
+from dexmani_real.config.pointcloud import PointCloudConfig
 
 
 class OutputProfile(str, Enum):
@@ -195,8 +195,9 @@ class ProcessingConfig:
             table_plane = tuple(float(value) for value in self.table_plane_abcd)
             if len(table_plane) != 4 or not np.all(np.isfinite(table_plane)):
                 raise ValueError("table_plane_abcd must contain four finite values")
-            if np.linalg.norm(table_plane[:3]) <= 0.0:
-                raise ValueError("table_plane_abcd normal must be non-zero")
+            norm = np.linalg.norm(table_plane[:3])
+            if norm <= 0.0 or table_plane[2] / norm <= 0.0:
+                raise ValueError("table_plane_abcd normal must point upward")
             object.__setattr__(self, "table_plane_abcd", table_plane)
         finite_positive = (
             self.max_camera_age_s,
