@@ -64,6 +64,16 @@ class FakePolicyRuntime:
         self._loaded = False
 
     def load(self) -> None:
+        action_key = (
+            getattr(self.config, "action_key", "action")
+            if self.config is not None
+            else "action"
+        )
+        if action_key != "action":
+            raise ValueError(
+                f"FakePolicyRuntime is joint-only; action_key={action_key!r} "
+                "is not supported"
+            )
         self._loaded = True
 
     def reset_episode(self) -> None:

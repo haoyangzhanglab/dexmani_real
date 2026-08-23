@@ -233,7 +233,9 @@
       "Bash(df *)",
       "Bash(echo \"gate exit=$?\")",
       "Bash(python3.12 -c \"import numpy; print\\('numpy', numpy.__version__\\)\")",
-      "Bash(python3.12 -c \"import h5py; print\\('h5py ok'\\)\")"
+      "Bash(python3.12 -c \"import h5py; print\\('h5py ok'\\)\")",
+      "Read(//opt/conda/**)",
+      "Bash(find / -maxdepth 6 -name \"numpy\" -type d)"
     ]
   }
 }

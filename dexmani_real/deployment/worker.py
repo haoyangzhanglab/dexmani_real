@@ -128,7 +128,12 @@ def publish_plan(
     if int(shared.run_generation.value) != int(context.run_generation):
         return False
 
-    n = int(chunk.arm_qpos.shape[0])
+    if chunk.arm_qpos is not None:
+        n = int(chunk.arm_qpos.shape[0])
+    elif chunk.ee_pos is not None:
+        n = int(chunk.ee_pos.shape[0])
+    else:
+        n = 0
     if n <= 0 or n > MAX_POLICY_CHUNK_STEPS:
         raise ValueError(
             f"policy chunk has {n} steps; transport capacity is {MAX_POLICY_CHUNK_STEPS}"
@@ -148,10 +153,17 @@ def publish_plan(
         context.inference_finished_monotonic_ns
     )
     frame["num_steps"][0] = np.uint32(n)
-    frame["arm_present"][0] = 1
     frame["hand_present"][0] = 1 if chunk.hand_qpos is not None else 0
     frame["target_monotonic_ns"][0, :n] = chunk.target_monotonic_ns
-    frame["arm_qpos"][0, :n] = chunk.arm_qpos
+    if chunk.arm_qpos is not None:
+        frame["arm_present"][0] = 1
+        frame["ee_present"][0] = 0
+        frame["arm_qpos"][0, :n] = chunk.arm_qpos
+    else:
+        frame["arm_present"][0] = 0
+        frame["ee_present"][0] = 1
+        frame["ee_pos"][0, :n] = chunk.ee_pos
+        frame["ee_rot6d"][0, :n] = chunk.ee_rot6d
     if chunk.hand_qpos is not None:
         frame["hand_qpos"][0, :n] = chunk.hand_qpos
     frame["valid_mask"][0, :n] = chunk.valid_mask
@@ -166,8 +178,13 @@ def _read_state_history(
     anchor_ns: int,
     values_field: str,
     required_true_fields: tuple[str, ...] = (),
+    max_age_ns: int | None = None,
 ) -> FrameWindow | None:
-    """Read the causal (source <= publish <= anchor) state frames, oldest-first."""
+    """Read the causal (source <= publish <= anchor) state frames, oldest-first.
+
+    When ``max_age_ns`` is given, frames older than the bound are dropped so a
+    stalled feedback stream cannot feed a stale window to the model.
+    """
     try:
         history = ring.get_last_k(min(int(horizon), ring.maxlen))
     except Exception:
@@ -194,6 +211,8 @@ def _read_state_history(
         )
         if not (0 < source_ns <= publish_ns <= anchor_ns):
             continue
+        if max_age_ns is not None and anchor_ns - source_ns > max_age_ns:
+            continue
         values.append(np.asarray(data[values_field][0], dtype=np.float64))
         sequences.append(int(sequence))
         sources.append(source_ns)
@@ -211,23 +230,15 @@ def _read_state_history(
     )
 
 
-def _read_pointcloud_frame(
-    shared: SharedStorage,
+def _pointcloud_frame_from_record(
+    record: np.ndarray,
+    ring_publish_ns: int,
     *,
     anchor_ns: int,
     max_age_ns: int,
     num_points: int,
 ) -> PointCloudFrame | None:
-    """Read the latest causally published, fresh ``float32[N,6]`` cloud."""
-    try:
-        result = shared.pointcloud_ring.read_latest()
-    except Exception:
-        logger.warning("inference: point-cloud read failed", exc_info=True)
-        return None
-    if result is None:
-        return None
-    data, ring_publish_ns, _ring_sequence = result
-    record = data[0]
+    """Extract one causal, fresh ``PointCloudFrame`` from a ring record (or None)."""
     source_ns = int(record["source_monotonic_ns"])
     camera_publish_ns = int(record["camera_publish_monotonic_ns"])
     payload_publish_ns = int(record["publish_monotonic_ns"])
@@ -262,6 +273,69 @@ def _read_pointcloud_frame(
         return None
 
 
+def _read_pointcloud_frame(
+    shared: SharedStorage,
+    *,
+    anchor_ns: int,
+    max_age_ns: int,
+    num_points: int,
+) -> PointCloudFrame | None:
+    """Read the latest causally published, fresh ``float32[N,6]`` cloud."""
+    try:
+        result = shared.pointcloud_ring.read_latest()
+    except Exception:
+        logger.warning("inference: point-cloud read failed", exc_info=True)
+        return None
+    if result is None:
+        return None
+    data, ring_publish_ns, _ring_sequence = result
+    return _pointcloud_frame_from_record(
+        data[0],
+        int(ring_publish_ns),
+        anchor_ns=anchor_ns,
+        max_age_ns=max_age_ns,
+        num_points=num_points,
+    )
+
+
+def _read_pointcloud_history(
+    shared: SharedStorage,
+    *,
+    anchor_ns: int,
+    max_age_ns: int,
+    num_points: int,
+    history_len: int,
+) -> tuple[PointCloudFrame, ...]:
+    """Read the last ``history_len`` causal, fresh clouds, oldest-first."""
+    if history_len <= 0:
+        return ()
+    try:
+        result = shared.pointcloud_ring.get_last_k(
+            min(int(history_len), shared.pointcloud_ring.maxlen)
+        )
+    except Exception:
+        logger.warning("inference: point-cloud history read failed", exc_info=True)
+        return ()
+    frames: list[PointCloudFrame] = []
+    for data, ring_publish_ns, _sequence in result:
+        frame = _pointcloud_frame_from_record(
+            data[0],
+            int(ring_publish_ns),
+            anchor_ns=anchor_ns,
+            max_age_ns=max_age_ns,
+            num_points=num_points,
+        )
+        if frame is not None:
+            frames.append(frame)
+    if not frames:
+        return ()
+    # A camera restart bumps camera_generation (new depth-clock mapping); the
+    # T-history must be mutually consistent, so drop any frame from an older
+    # generation than the newest frame.
+    newest_gen = frames[-1].camera_generation
+    return tuple(frame for frame in frames if frame.camera_generation == newest_gen)
+
+
 def _build_observation(
     shared: SharedStorage,
     config: DeploymentConfig,
@@ -277,18 +351,21 @@ def _build_observation(
     gated by its source/publish timestamps and modality-specific health flags.
     """
     horizon = int(config.observation_horizon)
+    max_age_ns = int(config.max_observation_age_s * 1e9)
     arm_history = _read_state_history(
         shared.arm_state_ring,
         horizon=horizon,
         anchor_ns=anchor_ns,
         values_field="qpos",
         required_true_fields=("state_valid",),
+        max_age_ns=max_age_ns,
     )
     hand_history: FrameWindow | None = None
     hand_current_history: FrameWindow | None = None
     hand_tactile_sum_history: FrameWindow | None = None
     tactile_history: FrameWindow | None = None
     pointcloud: PointCloudFrame | None = None
+    pointcloud_history: tuple[PointCloudFrame, ...] = ()
     requested = set(
         parse_observation_fields(
             getattr(config, "observation_fields", "arm_qpos,hand_qpos")
@@ -310,8 +387,15 @@ def _build_observation(
         pointcloud = _read_pointcloud_frame(
             shared,
             anchor_ns=anchor_ns,
-            max_age_ns=int(config.max_observation_age_s * 1e9),
+            max_age_ns=max_age_ns,
             num_points=int(config.pointcloud_num_points),
+        )
+        pointcloud_history = _read_pointcloud_history(
+            shared,
+            anchor_ns=anchor_ns,
+            max_age_ns=max_age_ns,
+            num_points=int(config.pointcloud_num_points),
+            history_len=int(config.observation_horizon),
         )
     if config.hand_enabled:
         if hand_state_requested:
@@ -321,6 +405,7 @@ def _build_observation(
                 anchor_ns=anchor_ns,
                 values_field="qpos",
                 required_true_fields=("state_valid",),
+                max_age_ns=max_age_ns,
             )
             if requested & {"hand_current", "hand_joint_torque"}:
                 hand_current_history = _read_state_history(
@@ -329,6 +414,7 @@ def _build_observation(
                     anchor_ns=anchor_ns,
                     values_field="current",
                     required_true_fields=("state_valid",),
+                    max_age_ns=max_age_ns,
                 )
             if requested & {"hand_tactile_sum", "fingertip_force"}:
                 hand_tactile_sum_history = _read_state_history(
@@ -340,6 +426,7 @@ def _build_observation(
                         "state_valid",
                         "tactile_sum_valid",
                     ),
+                    max_age_ns=max_age_ns,
                 )
         if tactile_requested:
             tactile_history = _read_state_history(
@@ -348,6 +435,7 @@ def _build_observation(
                 anchor_ns=anchor_ns,
                 values_field="tactile_force",
                 required_true_fields=("fresh",),
+                max_age_ns=max_age_ns,
             )
     return ObservationBatch(
         observation_id=observation_id,
@@ -359,6 +447,7 @@ def _build_observation(
         hand_tactile_sum_history=hand_tactile_sum_history,
         tactile_history=tactile_history,
         pointcloud=pointcloud,
+        pointcloud_history=pointcloud_history,
     )
 
 
@@ -428,7 +517,11 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
             if config.hand_enabled and observation.hand_history is None:
                 time.sleep(_NO_FEEDBACK_POLL_S)
                 continue
-            if "point_cloud" in requested and observation.pointcloud is None:
+            if (
+                "point_cloud" in requested
+                and observation.pointcloud is None
+                and not observation.pointcloud_history
+            ):
                 time.sleep(_NO_FEEDBACK_POLL_S)
                 continue
             metrics.increment(OBSERVATIONS_BUILT)

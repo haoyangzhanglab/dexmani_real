@@ -64,6 +64,25 @@ def main(argv: list[str] | None = None) -> int:
         help="Fixed point-cloud observation size (default from deployment config)",
     )
     parser.add_argument(
+        "--action-key",
+        type=str,
+        choices=("action", "action_ee"),
+        default=None,
+        help="Action contract (joint 19D or EE 21D); must match the checkpoint",
+    )
+    parser.add_argument(
+        "--observation-fields",
+        type=str,
+        default=None,
+        help="Comma-separated observation contract (deployment.observation_fields)",
+    )
+    parser.add_argument(
+        "--replan-stride-steps",
+        type=int,
+        default=None,
+        help="Plan steps to execute before admitting a replan (deployment.replan_stride_steps)",
+    )
+    parser.add_argument(
         "--print-config", action="store_true", help="Print resolved configs and exit"
     )
     args = parser.parse_args(argv)
@@ -78,6 +97,9 @@ def main(argv: list[str] | None = None) -> int:
                 "device": args.device,
                 "hand_enabled": True if args.hand else None,
                 "pointcloud_num_points": args.pointcloud_num_points,
+                "action_key": args.action_key,
+                "replan_stride_steps": args.replan_stride_steps,
+                "observation_fields": args.observation_fields,
             },
         )
     except (

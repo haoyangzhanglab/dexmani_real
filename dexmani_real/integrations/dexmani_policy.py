@@ -11,9 +11,9 @@ runs end-to-end on the fake without the model repository installed.
 The real ``dexmani_policy`` inference API is ``agent.predict_action(obs_dict)``
 returning ``{"pred_action", "control_action", "tail"}``; the actionable slice is
 ``control_action`` in native 19-DoF joint (arm7 + hand12) or 21-DoF EE
-(pos3 + rot6d + hand12) space.  Only native joint action is decoded here; an
-EE checkpoint requires an EE->joint conversion (IK) that lives in the
-coordinator and is wired in a later phase.
+(pos3 + rot6d + hand12) space.  Joint action is decoded directly; an EE chunk
+carries ``ee_pos``/``ee_rot6d`` that the coordinator resolves to joint space via
+collision-aware IK.
 """
 
 from __future__ import annotations
@@ -25,11 +25,27 @@ import numpy as np
 import torch
 
 from dexmani_real.deployment.contracts import InferenceContext, JointActionChunk
+from dexmani_real.deployment.manifest import (
+    DeploymentManifest,
+    EE_CONTROL_ACTION_DIM,
+    EE_POS_DIM,
+    EE_ROT6D_DIM,
+    manifest_from_sources,
+    validate_manifest_against_deployment,
+)
 from dexmani_real.deployment.observation import ObservationBatch
 from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 _ARM_DOF = ARM_JOINT_SHAPE[0]
 _HAND_DOF = HAND_JOINT_SHAPE[0]
+
+
+def _cfg_select(cfg: Any, path: str, default: Any = None) -> Any:
+    """Read a resolved OmegaConf node at *path*, returning *default* when absent."""
+    from omegaconf import OmegaConf
+
+    value = OmegaConf.select(cfg, path)
+    return default if value is None else value
 
 
 class DexManiPolicyRuntime:
@@ -47,6 +63,7 @@ class DexManiPolicyRuntime:
         self._agent: Any = None
         self._action_key: str = "action"
         self._device: str = "cpu"
+        self._manifest: DeploymentManifest | None = None
 
     def load(self) -> None:
         model_config_path = getattr(self.config, "model_config_path", None)
@@ -86,8 +103,34 @@ class DexManiPolicyRuntime:
 
         agent.to(device)
         agent.eval()
+
+        # Assemble the manifest from the loaded agent (already cross-validated
+        # against the checkpoint train_params by load_ckpt_for_inference) plus
+        # the model config sensor/point-cloud contract, then fail closed on any
+        # deployment inconsistency before the run can start.
+        manifest = manifest_from_sources(
+            action_key=cfg.action_key,
+            n_obs_steps=int(agent.n_obs_steps),
+            n_action_steps=int(agent.n_action_steps),
+            action_dim=int(agent.action_dim),
+            horizon=int(agent.horizon),
+            use_faas=bool(getattr(agent, "use_faas", False)),
+            tcp_dim=getattr(agent, "tcp_dim", None),
+            hand_dim=getattr(agent, "hand_dim", None),
+            control_action_dim=int(agent.control_action_dim),
+            sensor_modalities=_cfg_select(
+                cfg,
+                "dataset.sensor_modalities",
+                _cfg_select(cfg, "sensor_modalities", ["joint_state", "point_cloud"]),
+            ),
+            point_cloud_num_points=_cfg_select(cfg, "agent.num_points"),
+            point_cloud_feature_dim=_cfg_select(cfg, "agent.pc_dim"),
+        )
+        validate_manifest_against_deployment(manifest, self.config)
+
         self._agent = agent
-        self._action_key = cfg.action_key
+        self._manifest = manifest
+        self._action_key = manifest.action_key
         self._device = device
 
     def reset_episode(self) -> None:
@@ -98,59 +141,98 @@ class DexManiPolicyRuntime:
     def _encode(self, observation: ObservationBatch) -> dict[str, torch.Tensor]:
         """Build the model-native ``joint_state`` / ``point_cloud`` tensors.
 
-        ``joint_state`` is ``[1, T, 19]`` (arm7 + hand12 concatenated);
-        ``point_cloud`` is ``[1, T, N, 6]``.  The point cloud is currently the
-        latest causally valid frame broadcast across the observation horizon;
-        a true per-step point-cloud history is a later-phase refinement.
+        ``joint_state`` is ``[1, n_obs_steps, 19]`` (arm7 + hand12 concatenated,
+        most-recent ``n_obs_steps`` frames, anchor last); ``point_cloud`` is
+        ``[1, n_obs_steps, N, 6]`` built from the causal point-cloud history
+        (plan §6/§14.3.4) rather than a latest-frame broadcast.  The arm and hand
+        feedback streams publish at independent rates, so the two histories are
+        aligned to their common most-recent frame count; fewer than
+        ``n_obs_steps`` aligned frames fail closed (raise).
         """
         if observation.arm_history is None:
             raise ValueError("DexMani policy requires arm joint history")
         if observation.hand_history is None:
             raise ValueError("DexMani joint policy requires hand joint history")
-        if observation.pointcloud is None:
-            raise ValueError("DexMani policy requires a point cloud")
+        n_obs = int(self._manifest.n_obs_steps) if self._manifest is not None else 2
 
-        arm = observation.arm_history.values  # [T, 7]
-        hand = observation.hand_history.values  # [T, 12]
-        joint = np.concatenate([arm, hand], axis=-1).astype(np.float32)  # [T, 19]
-        t = joint.shape[0]
+        arm = observation.arm_history.values  # [Ta, 7]
+        hand = observation.hand_history.values  # [Th, 12]
+        if arm.ndim != 2 or hand.ndim != 2:
+            raise ValueError("arm/hand history must be [T, dof]")
+        t = min(arm.shape[0], hand.shape[0])
+        if t < n_obs:
+            raise ValueError(
+                f"need >= {n_obs} aligned arm/hand frames, got {t}"
+            )
+        arm = arm[-n_obs:]
+        hand = hand[-n_obs:]
+        joint = np.concatenate([arm, hand], axis=-1).astype(np.float32)  # [n_obs, 19]
 
-        pc = observation.pointcloud.values.astype(np.float32)  # [N, 6]
-        pc_t = np.tile(pc[None, None, :, :], (1, t, 1, 1))  # [1, T, N, 6]
+        # Point-cloud history, oldest-first; pad the oldest slots with the
+        # earliest available fresh cloud when the camera has fewer than n_obs.
+        pc_frames = list(observation.pointcloud_history or ())
+        if not pc_frames:
+            if observation.pointcloud is None:
+                raise ValueError("DexMani policy requires a point cloud")
+            pc_frames = [observation.pointcloud]
+        if len(pc_frames) >= n_obs:
+            use = pc_frames[-n_obs:]
+        else:
+            use = [pc_frames[0]] * (n_obs - len(pc_frames)) + pc_frames
+        pc = np.stack(
+            [frame.values.astype(np.float32) for frame in use], axis=0
+        )  # [n_obs, N, 6]
 
         joint_t = torch.as_tensor(joint, device=self._device).unsqueeze(0)
-        pc_t = torch.as_tensor(pc_t, device=self._device)
+        pc_t = torch.as_tensor(pc, device=self._device).unsqueeze(0)
         return {"joint_state": joint_t, "point_cloud": pc_t}
 
     def _decode(
         self, control_action: torch.Tensor, *, context: InferenceContext
     ) -> JointActionChunk:
-        """Decode the native ``control_action`` into a ``JointActionChunk``."""
+        """Decode the native ``control_action`` into a ``JointActionChunk``.
+
+        Joint (``action``): ``[H,19]`` = arm7 + hand12.  EE (``action_ee``):
+        ``[H,21]`` = pos3 + rot6d6 + hand12, emitted as an EE chunk the
+        coordinator resolves to joint space via IK (plan §14.2 decision 3).
+        """
         ctrl = control_action.detach().cpu().numpy()[0]  # [H, control_action_dim]
         n = ctrl.shape[0]
         dim = ctrl.shape[1]
-        if self._action_key != "action":
-            raise ValueError(
-                f"DexMani Policy action_key={self._action_key!r} requires an "
-                "EE->joint conversion (IK) that is not yet wired"
-            )
-        if dim != _ARM_DOF + _HAND_DOF:
-            raise ValueError(
-                f"DexMani joint action must be {_ARM_DOF + _HAND_DOF}-DoF "
-                f"(arm{_ARM_DOF}+hand{_HAND_DOF}), got {dim}"
-            )
-        arm = ctrl[:, :_ARM_DOF]
-        hand = ctrl[:, _ARM_DOF:]
         steps = np.arange(1, n + 1, dtype=np.uint64)
         target = (
             np.asarray(context.observation_anchor_monotonic_ns, dtype=np.uint64)
             + steps * np.uint64(context.step_dt_ns)
         )
+        if self._action_key == "action":
+            if dim != _ARM_DOF + _HAND_DOF:
+                raise ValueError(
+                    f"DexMani joint action must be {_ARM_DOF + _HAND_DOF}-DoF "
+                    f"(arm{_ARM_DOF}+hand{_HAND_DOF}), got {dim}"
+                )
+            arm = ctrl[:, :_ARM_DOF]
+            hand = ctrl[:, _ARM_DOF:]
+            return JointActionChunk(
+                arm_qpos=np.asarray(arm, dtype=np.float64),
+                hand_qpos=np.asarray(hand, dtype=np.float64),
+                target_monotonic_ns=target,
+                valid_mask=np.ones(n, dtype=np.uint8),
+            )
+        if dim != EE_CONTROL_ACTION_DIM:
+            raise ValueError(
+                f"DexMani EE action must be {EE_CONTROL_ACTION_DIM}-DoF "
+                f"(pos{EE_POS_DIM}+rot6d{EE_ROT6D_DIM}+hand{_HAND_DOF}), got {dim}"
+            )
+        ee_pos = ctrl[:, :EE_POS_DIM]
+        ee_rot6d = ctrl[:, EE_POS_DIM : EE_POS_DIM + EE_ROT6D_DIM]
+        hand = ctrl[:, EE_POS_DIM + EE_ROT6D_DIM :]
         return JointActionChunk(
-            arm_qpos=np.asarray(arm, dtype=np.float64),
+            arm_qpos=None,
             hand_qpos=np.asarray(hand, dtype=np.float64),
             target_monotonic_ns=target,
             valid_mask=np.ones(n, dtype=np.uint8),
+            ee_pos=np.asarray(ee_pos, dtype=np.float64),
+            ee_rot6d=np.asarray(ee_rot6d, dtype=np.float64),
         )
 
     def predict(

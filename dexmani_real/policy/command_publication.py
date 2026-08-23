@@ -139,6 +139,7 @@ class _ArmFeedbackSnapshot:
 
 @dataclass(frozen=True)
 class _HandFeedbackSnapshot:
+    qpos: np.ndarray
     last_cmd_qpos: np.ndarray
     last_cmd_seq: int
 
@@ -207,6 +208,13 @@ def _hand_feedback_snapshot(
             candidate=candidate,
             detail=f"hand feedback is unhealthy: {issue}",
         )
+    qpos = np.asarray(record["qpos"], dtype=np.float64)
+    if qpos.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(qpos)):
+        return None, CommandPublishResult(
+            CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY,
+            candidate=candidate,
+            detail="hand measured qpos is malformed",
+        )
     last_cmd_qpos = np.asarray(record["last_cmd_qpos"], dtype=np.float64)
     if last_cmd_qpos.shape != HAND_JOINT_SHAPE or not np.all(
         np.isfinite(last_cmd_qpos)
@@ -218,6 +226,7 @@ def _hand_feedback_snapshot(
         )
     return (
         _HandFeedbackSnapshot(
+            qpos.copy(),
             last_cmd_qpos.copy(),
             int(record["last_cmd_seq"]),
         ),
@@ -418,9 +427,26 @@ def validate_and_send_candidate(
         return feedback_rejection
     assert arm_feedback is not None
 
+    # Read hand feedback before the gate so delta/collision checks see the
+    # current hand state; the same snapshot then serves the coupled-hand preflight.
+    hand_feedback: _HandFeedbackSnapshot | None = None
+    if candidate.hand_qpos is not None:
+        hand_feedback, feedback_rejection = _hand_feedback_snapshot(
+            shared, candidate, hand_feedback_max_age_s=hand_feedback_max_age_s
+        )
+        if feedback_rejection is not None:
+            logger.warning(
+                "validate_and_send_candidate: action_id=%d rejected: %s",
+                action_id,
+                feedback_rejection.reason,
+            )
+            return feedback_rejection
+        assert hand_feedback is not None
+
     gate_result = gate.validate(
         candidate,
         current_arm_qpos=arm_feedback.qpos,
+        current_hand_qpos=(hand_feedback.qpos if hand_feedback is not None else None),
         run_generation=int(shared.run_generation.value),
     )
     if not gate_result.accepted:
@@ -438,16 +464,6 @@ def validate_and_send_candidate(
         )
 
     if candidate.hand_qpos is not None:
-        hand_feedback, feedback_rejection = _hand_feedback_snapshot(
-            shared, candidate, hand_feedback_max_age_s=hand_feedback_max_age_s
-        )
-        if feedback_rejection is not None:
-            logger.warning(
-                "validate_and_send_candidate: action_id=%d rejected: %s",
-                action_id,
-                feedback_rejection.reason,
-            )
-            return feedback_rejection
         assert hand_feedback is not None
         mechanical_lower = (
             np.asarray(hand_defaults.mechanical_qpos_min_rad, dtype=np.float64)

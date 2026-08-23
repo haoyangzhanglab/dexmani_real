@@ -47,6 +47,9 @@ if (
 ARM_JOINT_SHAPE = (ARM_DOF,)
 HAND_JOINT_SHAPE = (HAND_DOF,)
 ARM_EE_SHAPE = (9,)
+# EE arm-target decomposition carried by the policy plan ring: position + rot6d.
+EE_POS_DIM = 3
+EE_ROT6D_DIM = 6
 HAND_TACTILE_SUM_SHAPE = (HAND_FINGER_COUNT, TACTILE_AXIS_COUNT)
 HAND_TACTILE_FORCE_SHAPE = (
     HAND_FINGER_COUNT,
@@ -148,9 +151,12 @@ POLICY_PLAN_DTYPE = np.dtype(
         ("num_steps", "<u4"),
         ("arm_present", "<u1"),
         ("hand_present", "<u1"),
+        ("ee_present", "<u1"),
         ("target_monotonic_ns", "<u8", (MAX_POLICY_CHUNK_STEPS,)),
         ("arm_qpos", "<f8", (MAX_POLICY_CHUNK_STEPS, ARM_DOF)),
         ("hand_qpos", "<f8", (MAX_POLICY_CHUNK_STEPS, HAND_DOF)),
+        ("ee_pos", "<f8", (MAX_POLICY_CHUNK_STEPS, EE_POS_DIM)),
+        ("ee_rot6d", "<f8", (MAX_POLICY_CHUNK_STEPS, EE_ROT6D_DIM)),
         ("valid_mask", "<u1", (MAX_POLICY_CHUNK_STEPS,)),
     ],
     align=True,

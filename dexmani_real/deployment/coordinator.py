@@ -30,12 +30,13 @@ from dexmani_real.deployment.metrics import (
     flush_every,
     reject_counter_name,
 )
-from dexmani_real.planning import XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.constants import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
 from dexmani_real.planning.path_utils import wrap_nearest_equivalent
+from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
 from dexmani_real.policy.safety import (
     CommandPublishStatus,
     build_action_candidate,
@@ -69,6 +70,16 @@ class CoordinatorConfig:
     hand_mechanical_upper_rad: tuple[float, ...]
     hand_feedback_max_age_s: float
     control_hz: float
+    # Full 19-DoF collision model (hand + static boxes) for EE->IK and the
+    # transition collision gate (Phase 6/7); table clearance is not part of the
+    # policy safety gate.
+    static_boxes: tuple = ()
+    ik_max_pose_error_pos_m: float = 0.008
+    ik_max_pose_error_rot_rad: float = 0.08
+    # Per-tick delta limits for the learned-policy safety gate (reject, never
+    # clip).  ``None`` disables the arm delta check.
+    arm_max_delta_rad_per_tick: float | None = np.deg2rad(8.0)
+    hand_max_delta_rad_per_tick: float = 0.1
 
     @classmethod
     def from_runtime(cls, deployment: DeploymentConfig, runtime: object) -> "CoordinatorConfig":
@@ -83,6 +94,11 @@ class CoordinatorConfig:
             hand_mechanical_upper_rad=tuple(runtime.hand.mechanical_qpos_max_rad),
             hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
             control_hz=float(runtime.policy.control_hz),
+            static_boxes=tuple(runtime.environment.static_boxes),
+            ik_max_pose_error_pos_m=float(runtime.policy.ik_max_pose_error_pos_m),
+            ik_max_pose_error_rot_rad=float(runtime.policy.ik_max_pose_error_rot_rad),
+            arm_max_delta_rad_per_tick=runtime.policy.arm_max_delta_rad_per_tick,
+            hand_max_delta_rad_per_tick=float(runtime.hand.hand_max_delta_rad_per_tick),
         )
 
 
@@ -121,6 +137,19 @@ def _adoptable(
     if not np.all((mask == 0) | (mask == 1)):
         return False, "bad valid_mask"
     return True, ""
+
+
+def _ready_to_replan(active_plan, next_step: int, stride: int) -> bool:
+    """Whether a new plan may be admitted (adopt/promote) this tick.
+
+    True when there is no active plan, when the stride of steps has been served,
+    or when the active plan is fully consumed (``next_step`` reached its step
+    count) — the last case keeps a plan shorter than the stride from stalling
+    the scheduler.
+    """
+    if active_plan is None:
+        return True
+    return next_step >= stride or next_step >= int(active_plan["num_steps"])
 
 
 def _select_due_step(
@@ -194,13 +223,22 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     if config is None:
         raise ValueError("coordinator_loop requires a CoordinatorConfig")
 
-    # Deployment uses the same arm-base workspace gate as VR teleoperation.
+    # Deployment uses the arm-base workspace gate + the full 19-DoF collision
+    # model (hand + static boxes) so EE->IK and the transition collision gate
+    # see the hand geometry.  Table clearance is not part of the policy gate.
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(
             urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
             srdf_path=str(XARM7_XHAND_SRDF_PATH),
+            base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
             workspace_bounds=np.asarray(config.workspace_bounds, dtype=np.float64),
         ),
+        teleop_profile=TeleopProfile(
+            max_pose_error_pos_m=config.ik_max_pose_error_pos_m,
+            max_pose_error_rot_rad=config.ik_max_pose_error_rot_rad,
+        ),
+        hand_dof=True,
+        static_boxes=config.static_boxes,
     )
     gate = planner_action_safety_gate(
         planner=planner,
@@ -208,6 +246,9 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
         arm_joint_upper_rad=config.arm_joint_upper_rad,
         hand_joint_lower_rad=config.hand_joint_lower_rad,
         hand_joint_upper_rad=config.hand_joint_upper_rad,
+        max_arm_delta_rad=config.arm_max_delta_rad_per_tick,
+        max_hand_delta_rad=config.hand_max_delta_rad_per_tick,
+        collision_check=planner.collision_model.check_transition_collision_free,
     )
     metrics = Metrics()
 
@@ -231,13 +272,19 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     max_plan_age_ns = int(config.deployment.max_plan_age_s * 1e9)
     max_observation_age_ns = int(config.deployment.max_observation_age_s * 1e9)
     max_silence_ns = int(config.deployment.max_command_silence_s * 1e9)
+    first_command_timeout_ns = int(config.deployment.first_command_timeout_s * 1e9)
+    replan_stride_steps = int(config.deployment.replan_stride_steps)
 
     active_plan = None
     active_plan_id = 0
+    pending_plan = None
+    pending_plan_id = 0
     last_adopted_observation_id = 0
     next_step = 0
     # Silence timeout starts at the first published command, not first inference.
     last_valid_policy_command_ns: int | None = None
+    # RUNNING start time, for the first-command timeout.
+    run_started_ns: int | None = None
     last_metrics_flush_ns = time.monotonic_ns()
 
     try:
@@ -272,9 +319,12 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 # Reset per-run episode state for the new observation epoch.
                 active_plan = None
                 active_plan_id = 0
+                pending_plan = None
+                pending_plan_id = 0
                 last_adopted_observation_id = 0
                 next_step = 0
                 last_valid_policy_command_ns = None
+                run_started_ns = time.monotonic_ns()
                 _sleep_tick(period_s, tick_start)
                 continue
 
@@ -285,6 +335,22 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 shared.start_request.value = False
                 _end_policy_run(shared, "operator stop", abort=False)
                 _sleep_tick(period_s, tick_start)
+                continue
+
+            # Abort a run that never produced its first command (the model
+            # dropped every plan); command-to-command silence is checked below.
+            if (
+                last_valid_policy_command_ns is None
+                and run_started_ns is not None
+                and now_ns - run_started_ns > first_command_timeout_ns
+            ):
+                _end_policy_run(
+                    shared,
+                    "first command timeout",
+                    abort=True,
+                    metrics=metrics,
+                    metric=COMMAND_SILENCE_ABORT,
+                )
                 continue
 
             # Watch command-to-command silence; first-inference latency is exempt.
@@ -302,9 +368,42 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 continue
 
             rec = _read_latest_plan(shared)
-            if rec is not None and int(rec["plan_id"]) != active_plan_id:
+            if rec is not None:
+                rec_id = int(rec["plan_id"])
+                if rec_id != active_plan_id and rec_id != pending_plan_id:
+                    ok, reason = _adoptable(
+                        rec,
+                        current_generation=int(shared.run_generation.value),
+                        last_observation_id=last_adopted_observation_id,
+                        now_ns=now_ns,
+                        max_plan_age_ns=max_plan_age_ns,
+                        max_observation_age_ns=max_observation_age_ns,
+                    )
+                    if ok:
+                        if _ready_to_replan(active_plan, next_step, replan_stride_steps):
+                            # No active plan, the stride is served, or the plan is
+                            # consumed: adopt now (supersede any held plan).
+                            active_plan = rec
+                            active_plan_id = rec_id
+                            last_adopted_observation_id = int(rec["observation_id"])
+                            next_step = 0
+                            pending_plan = None
+                            pending_plan_id = 0
+                        else:
+                            # Hold the newest plan (latest wins) and promote it
+                            # once ready, so a mid-plan replan never opens a
+                            # command gap (plan §8).
+                            pending_plan = rec
+                            pending_plan_id = rec_id
+                    else:
+                        logger.debug("coordinator: plan %d dropped: %s", rec_id, reason)
+
+            # Promote a held plan once the active plan is done enough.
+            if pending_plan is not None and _ready_to_replan(
+                active_plan, next_step, replan_stride_steps
+            ):
                 ok, reason = _adoptable(
-                    rec,
+                    pending_plan,
                     current_generation=int(shared.run_generation.value),
                     last_observation_id=last_adopted_observation_id,
                     now_ns=now_ns,
@@ -312,12 +411,12 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                     max_observation_age_ns=max_observation_age_ns,
                 )
                 if ok:
-                    active_plan = rec
-                    active_plan_id = int(rec["plan_id"])
-                    last_adopted_observation_id = int(rec["observation_id"])
+                    active_plan = pending_plan
+                    active_plan_id = pending_plan_id
+                    last_adopted_observation_id = int(pending_plan["observation_id"])
                     next_step = 0
-                else:
-                    logger.debug("coordinator: plan %d dropped: %s", int(rec["plan_id"]), reason)
+                pending_plan = None
+                pending_plan_id = 0
 
             if active_plan is None:
                 _sleep_tick(period_s, tick_start)
@@ -340,19 +439,48 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
             if coalesced > 0:
                 metrics.increment(ENDPOINTS_COALESCED, coalesced)
 
-            arm_qpos = np.asarray(active_plan["arm_qpos"][selected], dtype=np.float64)
-            # Canonicalize targets against fresh feedback before publication.
-            _arm_state = read_arm_state_dict(shared)
-            if _arm_state is not None and np.all(np.isfinite(_arm_state["qpos"])):
-                arm_qpos = wrap_nearest_equivalent(
-                    arm_qpos,
-                    _arm_state["qpos"],
-                    config.arm_joint_lower_rad,
-                    config.arm_joint_upper_rad,
-                )
             hand_qpos: np.ndarray | None = None
             if int(active_plan["hand_present"]) == 1:
                 hand_qpos = np.asarray(active_plan["hand_qpos"][selected], dtype=np.float64)
+
+            _arm_state = read_arm_state_dict(shared)
+            if int(active_plan["ee_present"]) == 1:
+                # EE -> joint via collision-aware IK (plan §14.2 decision 3).
+                # hand_qpos is loaded into the collision model first so the solve
+                # sees the full 19-DoF geometry.
+                if _arm_state is None or not np.all(np.isfinite(_arm_state["qpos"])):
+                    # No causal arm feedback yet: drop (silence watchdog backstop).
+                    _sleep_tick(period_s, tick_start)
+                    continue
+                ee_pos = np.asarray(active_plan["ee_pos"][selected], dtype=np.float64)
+                ee_rot6d = np.asarray(active_plan["ee_rot6d"][selected], dtype=np.float64)
+                if hand_qpos is not None:
+                    planner.set_hand_qpos(hand_qpos)
+                ik_result = planner.solve_teleop_ik(
+                    Pose(p=ee_pos, q=rot6d_to_quat_wxyz(ee_rot6d)),
+                    _arm_state["qpos"],
+                    _arm_state["qpos"],
+                )
+                if not ik_result.success or ik_result.qpos is None:
+                    _end_policy_run(
+                        shared,
+                        f"EE IK failure: {ik_result.reason}",
+                        abort=True,
+                        metrics=metrics,
+                        metric=SAFETY_REJECTIONS,
+                    )
+                    continue
+                arm_qpos = np.asarray(ik_result.qpos, dtype=np.float64)
+            else:
+                arm_qpos = np.asarray(active_plan["arm_qpos"][selected], dtype=np.float64)
+                # Canonicalize targets against fresh feedback before publication.
+                if _arm_state is not None and np.all(np.isfinite(_arm_state["qpos"])):
+                    arm_qpos = wrap_nearest_equivalent(
+                        arm_qpos,
+                        _arm_state["qpos"],
+                        config.arm_joint_lower_rad,
+                        config.arm_joint_upper_rad,
+                    )
 
             candidate = build_action_candidate(
                 shared,

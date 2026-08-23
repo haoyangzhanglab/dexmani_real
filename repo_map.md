@@ -133,7 +133,7 @@
 | `dexmani_real/policy/__init__.py` | 动作协议与安全子包标记。 |
 | `dexmani_real/policy/runtime.py` | backend-neutral `ActionCandidate` 合同及动作表示校验。 |
 | `dexmani_real/policy/safety.py` | 兼容性显式出口与 hand-home helper；具体边界由下列模块拥有。 |
-| `dexmani_real/policy/safety_gate.py` | `ActionCandidate` 的 representation、generation、joint-limit 与 workspace fail-closed 校验。 |
+| `dexmani_real/policy/safety_gate.py` | `ActionCandidate` 的 representation、generation、joint-limit、delta-limit（拒绝不 clip）、arm/hand transition collision 与 workspace fail-closed 校验（delta/collision 为 opt-in）。 |
 | `dexmani_real/policy/command_publication.py` | controller 侧 runtime/feedback gate、candidate 序列化、arm/hand 发布与 acknowledgement。 |
 | `dexmani_real/policy/loop_timing.py` | teleop 固定控制网格的分阶段 timing 采集。 |
 
@@ -199,11 +199,12 @@
 | 文件 | 职责 |
 |---|---|
 | `dexmani_real/deployment/__init__.py` | learned-policy 部署子包标记。 |
-| `dexmani_real/deployment/contracts.py` | inference context、joint action chunk 与 `PolicyRuntime` protocol（load/predict/reset_episode）。 |
-| `dexmani_real/deployment/config.py` | deployment YAML/CLI 合并、点云 N/类型校验、required target 校验与 SHA-256 identity。 |
-| `dexmani_real/deployment/observation.py` | 因果、不可变 arm/hand/tactile history windows、最新点云帧与 observation batch。 |
-| `dexmani_real/deployment/worker.py` | inference worker：`module:symbol` `PolicyRuntime` factory 惰性加载、读取并校验因果历史（含新鲜点云）、`predict` 并发布 plan。 |
-| `dexmani_real/deployment/coordinator.py` | learned-policy 唯一 command producer；ARMED/RUNNING 状态机、采纳 plan、选择 due step 并通过安全门发布。 |
+| `dexmani_real/deployment/contracts.py` | inference context、joint/EE action chunk（`arm_qpos` XOR `ee_pos`/`ee_rot6d`）与 `PolicyRuntime` protocol（load/predict/reset_episode）。 |
+| `dexmani_real/deployment/config.py` | deployment YAML/CLI 合并、点云 N/类型校验、`action_key`/`replan_stride_steps`/`use_ema`/`first_command_timeout_s`、required target 校验与 SHA-256 identity。 |
+| `dexmani_real/deployment/manifest.py` | `DeploymentManifest`（checkpoint train_params + config.yaml + real 侧组装）、`manifest_from_sources` 与 `validate_manifest_against_deployment`（domain==real、hand/点云/stride 一致性，fail-closed）。 |
+| `dexmani_real/deployment/observation.py` | 因果、不可变 arm/hand/tactile history windows、最新点云帧 + `pointcloud_history` 与 observation batch。 |
+| `dexmani_real/deployment/worker.py` | inference worker：`module:symbol` `PolicyRuntime` factory 惰性加载、读取并校验因果历史（arm/hand source-age 上界 + 点云 T 历史 + camera_generation 一致性）、`predict` 并发布 plan。 |
+| `dexmani_real/deployment/coordinator.py` | learned-policy 唯一 command producer；ARMED/RUNNING 状态机、active/pending plan + `replan_stride_steps` 调度、EE→IK 分派、first-command/命令静默 watchdog、通过 delta/collision 安全门发布。 |
 | `dexmani_real/deployment/lifecycle.py` | policy worker topology、SharedStorage、readiness、ARMED、operator 线程、supervision、verified shutdown 与启动 provenance 日志（含文件 SHA-256）。 |
 | `dexmani_real/deployment/operator.py` | 键盘后台线程 B/S/H/Q/ESC → 共享请求 flag，及 H 的碰撞检查归位编排（主进程 hand-dof+table planner）。 |
 | `dexmani_real/deployment/metrics.py` | inference/coordinator 计数、reject 分类和周期性日志。 |
@@ -214,7 +215,7 @@
 | 文件 | 职责 |
 |---|---|
 | `dexmani_real/integrations/__init__.py` | 外部模型仓库集成子包标记。 |
-| `dexmani_real/integrations/dexmani_policy.py` | `dexmani_policy` 的 `PolicyRuntime`（懒加载 Hydra/OmegaConf + `load_ckpt_for_inference` + `predict_action`）、`[1,T,19]` joint_state/`[1,T,N,6]` 点云编码与 joint-action fail-closed 边界。 |
+| `dexmani_real/integrations/dexmani_policy.py` | `dexmani_policy` 的 `PolicyRuntime`（懒加载 Hydra/OmegaConf + `load_ckpt_for_inference` + `predict_action`）、`[1,n_obs,19]` joint_state / `[1,n_obs,N,6]` 点云编码、manifest 组装与 joint/EE（pos3‖rot6d6‖hand12）fail-closed 解码。 |
 
 ### `dexmani_real/utils/`
 
@@ -239,7 +240,7 @@
 |---|---|
 | `examples/collect_teleop.py` | 解析 runtime overrides、task/operator/no-hand/no-record，并启动 VR teleop 数据采集。 |
 | `examples/keyboard_teleop.py` | 解析 runtime config 和 no-hand 确认，并启动 keyboard teleop。 |
-| `examples/run_policy.py` | 解析 runtime/deployment config、backend targets、checkpoint 与点云 N，并启动 policy deployment。 |
+| `examples/run_policy.py` | 解析 runtime/deployment config、runtime target、checkpoint、点云 N、`--action-key`/`--replan-stride-steps`/`--observation-fields`，并启动 policy deployment。 |
 | `examples/replay_episode.py` | 加载 raw episode 或（`--processed`）processed HDF5 v4、解析 replay runtime、显示 provenance，并启动真实机器人回放。 |
 | `examples/process_episodes.py` | raw → processed HDF5 离线处理 CLI：选择标准点云 N、逐 episode 审计进度（tqdm）、损坏 episode 自动跳过与 JSON report；管线在 `data_processing/`。 |
 | `examples/export_policy_zarr.py` | processed HDF5 → Policy Zarr 离线导出 CLI：argparse 与 JSON report；导出事务在 `data_processing/zarr_export.py`。 |

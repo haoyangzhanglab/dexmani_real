@@ -28,6 +28,7 @@ _POSITIVE_FLOAT_FIELDS = (
     "max_plan_age_s",
     "max_command_silence_s",
     "action_validity_s",
+    "first_command_timeout_s",
 )
 
 
@@ -46,20 +47,36 @@ class DeploymentConfig:
     checkpoint: str | None = None
     model_config_path: str | None = None
     device: str = "cpu"
+    # Operator-declared action contract; validated against the checkpoint's
+    # train_params at load time (mismatch fails closed, never coerces).
+    action_key: str = "action"
     inference_hz: float = 10.0
     observation_horizon: int = 4
     max_observation_age_s: float = 0.5
     max_plan_age_s: float = 1.0
     max_command_silence_s: float = 2.0
     action_validity_s: float = 0.5
+    # Abort a RUNNING run that never produced its first command within this
+    # window (the command-to-command silence watchdog is exempt until then).
+    first_command_timeout_s: float = 5.0
     hand_enabled: bool = False
-    # Comma-separated observation keys; the default preserves the joint-only contract.
-    observation_fields: str = "arm_qpos,hand_qpos"
+    # Comma-separated observation keys; the runtime supports point-cloud policies.
+    observation_fields: str = "arm_qpos,hand_qpos,point_cloud"
     pointcloud_num_points: int = 1024
+    # Scheduler: number of plan steps to execute before admitting a replan.
+    replan_stride_steps: int = 8
+    use_ema: bool = True
 
     def __post_init__(self) -> None:
         if self.observation_horizon <= 0:
             raise ValueError("observation_horizon must be positive")
+        if self.action_key not in ("action", "action_ee"):
+            raise ValueError("action_key must be 'action' or 'action_ee'")
+        if (
+            isinstance(self.replan_stride_steps, bool)
+            or self.replan_stride_steps <= 0
+        ):
+            raise ValueError("replan_stride_steps must be a positive integer")
         for name in _POSITIVE_FLOAT_FIELDS:
             value = getattr(self, name)
             if not math.isfinite(float(value)) or value <= 0:

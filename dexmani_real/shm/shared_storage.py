@@ -64,6 +64,9 @@ class SharedStorageConfig:
     policy_plan_ring_maxlen: int = 3
     pointcloud_num_points: int = 1024
     pointcloud_requested: bool = False
+    # Point-cloud ring capacity must cover the observation horizon so the
+    # per-step point-cloud history is a real window, not a broadcast.
+    pointcloud_ring_maxlen: int = 8
 
     control_hz: float = field(default_factory=lambda: policy.control_hz)
     arm_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
@@ -100,6 +103,7 @@ class SharedStorageConfig:
             self.record_sample_ring_maxlen,
             self.record_status_ring_maxlen,
             self.policy_plan_ring_maxlen,
+            self.pointcloud_ring_maxlen,
             self.arm_cmd_ring_maxlen,
             self.arm_home_q_maxsize,
         )
@@ -394,7 +398,7 @@ class SharedStorage:
         storage.pointcloud_ring = SharedMemoryRingBuffer.create_or_replace(
             f"{prefix}_pointcloud",
             dtype=make_pointcloud_frame_dtype(cfg.pointcloud_num_points),
-            maxlen=1,
+            maxlen=cfg.pointcloud_ring_maxlen,
         )
 
         storage.arm_cmd_ring = SharedMemoryRingBuffer.create_or_replace(

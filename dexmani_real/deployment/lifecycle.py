@@ -63,8 +63,8 @@ def sha256_file(path: str | Path) -> str:
     """Return the hex SHA-256 of a file's contents ("" when unreadable/missing).
 
     Best-effort: logs the checkpoint/model-config hash "if available"; an
-    unreadable file logs empty rather than failing startup (the backend load is
-    the authoritative check for a bad checkpoint).
+    unreadable file logs empty rather than failing startup (the PolicyRuntime
+    load is the authoritative check for a bad checkpoint).
     """
     try:
         digest = hashlib.sha256()

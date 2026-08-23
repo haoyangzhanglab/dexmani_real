@@ -23,8 +23,9 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 - 事务式写入 native RGB-D raw episode v21；分别保存 depth/color 几何与时序。
 - 将 native raw v21 episode 清洗为 processed HDF5 v4，再导出 Policy Zarr v2。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
-- 通过可替换 backend/adapter 运行 joint-action learned policy；仓库包含无模型的
-  deterministic fake 实现和 `dexmani_policy` 集成适配器。
+- 通过可替换 `PolicyRuntime` 运行 joint/EE-action learned policy；仓库包含无模型的
+  deterministic fake 实现和 `dexmani_policy` 集成。启动时 `DeploymentManifest`
+  fail-closed 校验 checkpoint 契约与部署配置（action_key/点云 N/stride/observation）。
 
 ## 导航
 
@@ -147,7 +148,7 @@ python examples/collect_teleop.py --print-config
 | 键盘遥操作 | `python examples/keyboard_teleop.py` | 连接并控制 xArm7，可选 XHand |
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 预检后控制 xArm7/XHand；写 `replay_results/` |
 | 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | 同上；`--processed` 显式确认跳过记录期模型(URDF/SRDF)provenance，workspace/碰撞预检仍按当前模型执行；含 risky bridge 的压缩轨迹拒绝回放 |
-| learned policy | `python examples/run_policy.py --deployment-config <file.yml>` | 启动 arm、可选 hand、inference 与 coordinator；请求 `point_cloud` 时同时连接 camera |
+| learned policy | `python examples/run_policy.py --deployment-config <file.yml>` | 启动 arm、可选 hand、inference 与 coordinator（active/pending 调度 + EE→IK + delta/collision 安全门）；请求 `point_cloud` 时同时连接 camera |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | L515 native baseline | `python examples/inspect_l515.py --scene <scene> --frames 300 --output-dir <dir>` | 只连接相机；无 GUI；写 native Z16 与几何/时序 JSON，不写标定 |
@@ -164,15 +165,23 @@ python examples/collect_teleop.py --print-config
 ### Learned policy 实时点云
 
 部署配置的 `observation_fields` 包含 `point_cloud` 时，lifecycle 才启动 camera 与独立
-point-cloud worker。worker 始终读取最新的 native RGB-D，旧帧不会排队；策略 adapter
-获得单帧 xArm-base `float32 (N, 6)`，列语义为 `xyzrgb`，RGB 范围为 `[0,1]`。
-`pointcloud_num_points` 只允许 `1024`、`2048`、`4096`、`8192`，也可通过
-`--pointcloud-num-points` 覆盖。示例 deployment YAML：
+point-cloud worker。worker 始终读取最新的 native RGB-D，旧帧不会排队；inference 组装
+点云 T 历史窗（`n_obs_steps` 帧，跨帧 `camera_generation` 一致），每帧为 xArm-base
+`float32 (N, 6)`，列语义为 `xyzrgb`，RGB 范围为 `[0,1]`。`pointcloud_num_points` 只允许
+`1024`、`2048`、`4096`、`8192`，也可通过 `--pointcloud-num-points` 覆盖。
+示例 deployment YAML：
 
 ```yaml
 deployment:
+  runtime_target: dexmani_real.integrations.dexmani_policy:DexManiPolicyRuntime
+  checkpoint: /path/to/checkpoints/best.pt
+  model_config_path: /path/to/dp3.yaml
+  action_key: action            # action | action_ee（须与 checkpoint 一致）
+  hand_enabled: true
   observation_fields: arm_qpos,hand_qpos,point_cloud
   pointcloud_num_points: 2048
+  replan_stride_steps: 8        # 不得超过模型 n_action_steps
+  use_ema: true
 ```
 
 点云缺失、过期、shape/dtype 错误、非有限值或颜色越界时 inference fail closed，不发布

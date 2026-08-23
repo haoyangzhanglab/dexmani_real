@@ -651,24 +651,25 @@ read → check freshness/state → compute → validate → publish → rate con
 模型输出是 proposal，不是机器人命令。部署边界保持：
 
 ```text
-typed observation
-→ model-specific adapter
-→ inference
-→ native joint action chunk
-→ scheduler/coordinator
-→ shared safety gate
+typed observation (causal history windows + point-cloud T 历史)
+→ PolicyRuntime (load/predict/reset_episode)
+→ joint/EE action chunk
+→ scheduler/coordinator (active/pending + replan stride + EE→IK)
+→ shared safety gate (limits + delta + collision)
 → actuator IPC
 ```
 
 要求：
 
 - torch/model repository 的依赖留在 inference worker 或 integration module；
-- device、checkpoint、model config 和 observation fields 显式配置；
+- device、checkpoint、model config、observation fields 与 action_key 显式配置；
+- checkpoint 契约（n_obs_steps/n_action_steps/action_dim/horizon/control_action_dim/点云 N）
+  在 `DeploymentManifest` 中组装并在 `load` 时 fail-closed 校验（domain==real，杜绝 sim checkpoint）；
 - inference 使用适当的 no-grad/inference context；
-- normalization/denormalization 的 owner 唯一且在 adapter 合同中说明；
+- normalization/denormalization 的 owner 唯一且在 `PolicyRuntime` 合同中说明；
 - EE action、joint action、degrees/radians 不做静默猜测或自动兼容；
 - 不允许模型代码直接访问 hardware SDK 或绕过 coordinator；
-- fake backend 保持确定性，用于验证 observation → plan 链路而非模拟真实性能。
+- `FakePolicyRuntime` 保持确定性，用于验证 observation → plan 链路而非模拟真实性能。
 
 ## 13. 数据采集和离线处理
 

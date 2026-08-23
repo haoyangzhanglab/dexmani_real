@@ -171,9 +171,24 @@ class ObservationBatch:
     hand_current_history: FrameWindow | None = None
     hand_tactile_sum_history: FrameWindow | None = None
     pointcloud: PointCloudFrame | None = None
+    # Oldest-first causal window of recent point-cloud frames; ``pointcloud`` is
+    # the latest (and last element) when non-empty.  ``point_cloud`` models use
+    # this window for their per-step point-cloud history (plan §6/§14.3.4).
+    pointcloud_history: tuple[PointCloudFrame, ...] = ()
 
     def __post_init__(self) -> None:
         if self.observation_id < 0 or self.run_generation < 0:
             raise ValueError("observation_id and run_generation must be non-negative")
         if self.anchor_monotonic_ns <= 0:
             raise ValueError("anchor_monotonic_ns must be positive")
+        history = self.pointcloud_history
+        if history:
+            object.__setattr__(
+                self,
+                "pointcloud_history",
+                tuple(
+                    frame
+                    for frame in history
+                    if isinstance(frame, PointCloudFrame)
+                ),
+            )
