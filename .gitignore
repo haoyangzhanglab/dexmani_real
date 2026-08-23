@@ -151,6 +151,6 @@ episodes_hand/
 episodes/
 replay_results/
 
-# Local L515 diagnostic captures (large, reproducible, never source artifacts)
-l515_check_*/
-l515_native_shadow_*/
+tmp_docs/
+tmp_code/
+
