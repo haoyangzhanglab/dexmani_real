@@ -73,6 +73,10 @@ class RealSenseConfig:
     warmup_frames: int = 10
     frame_queue_capacity: int = 2
     l515_depth_config: L515DepthConfig | None = field(default_factory=L515DepthConfig)
+    # 0.0 = OFF (default): keep the requested fps instead of letting Auto
+    # Exposure extend exposure and drop RGB to ~16.7 Hz in a dark scene (see
+    # l515_camera_timing_known_limitation.md). None = leave the device default.
+    auto_exposure_priority: float | None = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.camera_name, str) or not self.camera_name.strip():
@@ -114,6 +118,15 @@ class RealSenseConfig:
             self.l515_depth_config, L515DepthConfig
         ):
             raise TypeError("l515_depth_config must be L515DepthConfig or None")
+        if self.auto_exposure_priority is not None and (
+            isinstance(self.auto_exposure_priority, bool)
+            or not isinstance(self.auto_exposure_priority, (int, float))
+            or not np.isfinite(self.auto_exposure_priority)
+            or not 0.0 <= self.auto_exposure_priority <= 1.0
+        ):
+            raise ValueError(
+                "auto_exposure_priority must be None or a finite value in [0, 1]"
+            )
 
 
 @dataclass(frozen=True)
@@ -301,12 +314,71 @@ class RealSense:
                 snapshot[name] = None
         return snapshot
 
+    def _find_color_sensor(self) -> Any:
+        """Return the color sensor from the live pipeline profile."""
+        if self.profile is None:
+            raise RuntimeError("RealSense profile is unavailable for color settings")
+        device = self.profile.get_device()
+        for sensor in device.query_sensors():
+            for profile in sensor.get_stream_profiles():
+                try:
+                    if profile.stream_type() == rs.stream.color:
+                        return sensor
+                except RuntimeError:
+                    continue
+        raise RuntimeError("no color sensor with a color stream profile found")
+
+    def _apply_color_config(self) -> None:
+        """Apply color sensor options after pipeline start.
+
+        The default ``auto_exposure_priority=0.0`` (OFF) keeps the color sensor
+        at the requested fps instead of letting Auto Exposure extend exposure —
+        which drops the RGB stream to ~16.7 Hz in a dark scene (the L515
+        finding recorded in ``l515_camera_timing_known_limitation.md``). Auto
+        Exposure stays ON; priority OFF only caps exposure at the frame period
+        and compensates with gain. Set the config field to ``None`` to leave
+        the device default untouched.
+        """
+        priority = self.config.auto_exposure_priority
+        if priority is None:
+            return
+        try:
+            sensor = self._find_color_sensor()
+        except RuntimeError as exc:
+            logger.warning(
+                "color sensor unavailable; auto_exposure_priority not applied: %s",
+                exc,
+            )
+            return
+        option = rs.option.auto_exposure_priority
+        try:
+            if not sensor.supports(option):
+                logger.warning(
+                    "color sensor does not expose auto_exposure_priority; "
+                    "left at device default"
+                )
+                return
+            sensor.set_option(option, float(priority))
+            readback = float(sensor.get_option(option))
+        except (RuntimeError, OSError) as exc:
+            logger.warning("auto_exposure_priority could not be set: %s", exc)
+            return
+        if not np.isclose(readback, float(priority), atol=1e-6):
+            logger.warning(
+                "auto_exposure_priority readback mismatch: requested=%s, actual=%s",
+                float(priority),
+                readback,
+            )
+        else:
+            logger.info("color auto_exposure_priority set to %s (0=OFF)", readback)
+
     def _setup_pipeline_post_start(self) -> None:
         """Configure active-device options and immutable native geometry."""
         if self.profile is None:
             raise RuntimeError("Pipeline profile is unavailable after start.")
 
         self._apply_depth_config()
+        self._apply_color_config()
 
         self.set_global_time()
         self.depth_scale = float(

@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -83,6 +85,9 @@ _PERIOD_TOLERANCE_MS = 4.0
 _EXPOSURE_60MS_US = 60_000.0
 _EXPOSURE_TOLERANCE_US = 6_000.0
 
+# Self-description of the on-disk report.json layout (guide §36 handoff).
+_REPORT_SCHEMA_VERSION = 1
+
 
 def _device_info(device: Any, key: Any) -> str:
     if key is None:
@@ -113,7 +118,7 @@ def _select_serial(context: Any, requested: str | None) -> str:
         return requested
     if len(serials) != 1:
         raise RuntimeError(
-            "connect exactly one RealSense or pass --serial; connected={serials}"
+            f"connect exactly one RealSense or pass --serial; connected={serials}"
         )
     return serials[0]
 
@@ -372,6 +377,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sample-luma-every", type=int, default=30)
     parser.add_argument("--label", default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--full-json",
+        action="store_true",
+        help="Also print the full report.json to stdout (default: one-line summary).",
+    )
     args = parser.parse_args(argv)
     if args.width <= 0 or args.height <= 0 or args.fps <= 0:
         parser.error("width, height, and fps must be positive")
@@ -382,6 +392,48 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.queue_capacity is not None and args.queue_capacity <= 0:
         parser.error("--queue-capacity must be positive when supplied")
     return args
+
+
+def _fmt_opt(value: Any, spec: str = ".1f") -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float) and not math.isfinite(value):
+        return "-"
+    return format(value, spec)
+
+
+def _summary_line(report: dict[str, Any]) -> str:
+    """One scannable stdout line; the full detail stays in report.json.
+
+    The ``band`` label is a measurement band (33ms / 60ms / other), never a
+    root-cause claim, matching guide §28.
+    """
+    mode = str(report.get("mode") or "?")
+    label = str(report.get("label") or "-")
+    evidence = report.get("evidence") or {}
+    period_p50 = (report.get("color_normalized_period_ms") or {}).get("p50")
+    luma_mean = (report.get("luminance") or {}).get("mean")
+    if evidence.get("color_normalized_period_near_33ms"):
+        band = "33ms"
+    elif evidence.get("color_normalized_period_near_60ms"):
+        band = "60ms"
+    else:
+        band = "other"
+    parts = [
+        f"mode={mode}",
+        f"label={label}",
+        f"color={_fmt_opt(report.get('color_unique_rate_hz'), '.2f')}Hz",
+        f"period_p50={_fmt_opt(period_p50)}ms",
+        f"band={band}",
+        f"luma={_fmt_opt(luma_mean)}",
+    ]
+    repeat = report.get("color_repeat_ratio")
+    if mode == "rgbd" and isinstance(repeat, (int, float)) and math.isfinite(repeat):
+        parts.append(f"repeat={repeat * 100:.1f}%")
+    gaps = report.get("color_frame_gap_event_count")
+    if gaps:
+        parts.append(f"gaps={gaps}")
+    return " ".join(parts)
 
 
 def _capture(
@@ -740,6 +792,8 @@ def _capture(
     }
 
     report: dict[str, Any] = {
+        "tool": "diagnose_l515_rgb_timing",
+        "schema_version": _REPORT_SCHEMA_VERSION,
         "mode": args.mode,
         "label": args.label,
         "serial": serial,
@@ -791,26 +845,51 @@ def _capture(
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     output_dir = args.output_dir
+    # Fail closed before starting the pipeline: never spend a warmup+capture
+    # session on a run whose output directory already exists and is non-empty.
+    if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
+        print(
+            f"output directory must be absent or empty: {output_dir} "
+            "(remove stale temp files from an interrupted run, if any)",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         report, frame_arrays, options = _capture(args)
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"L515 RGB timing diagnostic failed: {exc}", file=sys.stderr)
         return 1
 
-    if output_dir.exists() and (not output_dir.is_dir() or any(output_dir.iterdir())):
-        print(f"output directory must be absent or empty: {output_dir}", file=sys.stderr)
-        return 1
     output_dir.mkdir(parents=True, exist_ok=True)
 
     report_json = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    (output_dir / "report.json").write_text(report_json, encoding="utf-8")
     options_json = (
         json.dumps(options, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     )
-    (output_dir / "options.json").write_text(options_json, encoding="utf-8")
-    np.savez(output_dir / "frame_timing.npz", **frame_arrays)
 
-    print(report_json, end="")
+    # Write each artifact to a sibling temp path, then atomically rename into
+    # place so a killed run never leaves a truncated JSON or a corrupt npz
+    # under the final name (a leftover .tmp is refused on the next run).
+    report_tmp = output_dir / "report.json.tmp"
+    report_tmp.write_text(report_json, encoding="utf-8")
+    os.replace(report_tmp, output_dir / "report.json")
+
+    options_tmp = output_dir / "options.json.tmp"
+    options_tmp.write_text(options_json, encoding="utf-8")
+    os.replace(options_tmp, output_dir / "options.json")
+
+    # The temp name must already end in ".npz": np.savez_compressed appends
+    # ".npz" to any filename that does not, so a ".tmp" suffix would produce
+    # "frame_timing.npz.tmp.npz" and os.replace below would miss it.
+    npz_tmp = output_dir / "frame_timing.tmp.npz"
+    np.savez_compressed(npz_tmp, **frame_arrays)
+    os.replace(npz_tmp, output_dir / "frame_timing.npz")
+
+    if args.full_json:
+        print(report_json, end="")
+    else:
+        print(_summary_line(report))
     print(
         f"Wrote {output_dir / 'report.json'}, {output_dir / 'options.json'}, "
         f"{output_dir / 'frame_timing.npz'}"

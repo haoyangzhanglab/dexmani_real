@@ -183,14 +183,18 @@ deployment:
 
 ### L515 RGB/Depth 时序限制
 
-实测 nominal 30 FPS 下 depth 约 30.13 Hz，而新 color 约 16.68 Hz；camera worker
-当前仍可能把旧 color 与新 depth 一起发布。空间投影保持正确，但运动物体可能出现颜色
-时间错位。本轮明确记录而不修改发布策略，详见
+暗场下 RGB 曾因 Auto-Exposure Priority=ON 把曝光拉到 ~60 ms 而降帧到 ~16.7 Hz。
+根因已确认并修复：`RealSenseConfig.auto_exposure_priority` 默认 `0.0`（OFF，Auto
+Exposure 仍 ON），RGB 恢复 30 Hz，亮度由增益补偿、几乎不变（暗场噪声上升）。详见
 [`l515_camera_timing_known_limitation.md`](l515_camera_timing_known_limitation.md)。
-processed v4 的点云颜色语义因此是 `native_color_projection`，不表示同步曝光。
 
-旧 aligned 点云/桌面诊断入口已删除。现有
-`dexmani_real/config/desk_plane.json` 继续作为环境单一来源；重新标定工具将在后续独立重建。
+深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew），因此 processed v4 的点云
+颜色语义仍是 `native_color_projection`，不表示同步曝光；运动物体可能出现颜色时间错位。
+
+旧 aligned（`rs.align()`）点云/桌面诊断入口已删除；点云/桌面交互诊断现以 native 几何版
+恢复为 `examples/realsense_record_example.py` 与 `examples/pointcloud_process_example.py`
+（均只连相机、无标定写入）。现有 `dexmani_real/config/desk_plane.json` 继续作为环境单一来源；
+重新标定工具将在后续独立重建。
 
 ### 离线数据工作流
 

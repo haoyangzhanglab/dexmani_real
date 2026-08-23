@@ -20,7 +20,7 @@
 | `code_style.md` | 面向个人博士科研、数据采集和模型部署的具体编码风格与审查清单。 |
 | `README.md` | 面向使用者的能力概览、架构、环境、命令、配置和数据流说明。 |
 | `repo_map.md` | 当前逐文件职责索引。 |
-| `l515_camera_timing_known_limitation.md` | L515 color 实际约 16.68 Hz、重复 RGB 与动态颜色错位的实测证据、当前接受范围和后续议题。 |
+| `l515_camera_timing_known_limitation.md` | L515 RGB 降帧根因已确认（AE priority ON→60ms 曝光→16.7Hz）并已设 `auto_exposure_priority=0` 默认；记录 color/depth 曝光 skew 与 `native_color_projection` 语义、剩余噪声风险。 |
 | `user_design.md` | 使用者确认的遥操作与物理回放桌面碰撞、XHand 抓取过流行为取舍及其安全边界。 |
 | `pyproject.toml` | Python 包元数据、基础依赖、setuptools 包发现、内置 JSON 数据声明与 Black-compatible isort 配置。 |
 | `tests/robot/test_xhand_runtime.py` | 不连接硬件的 XHand fake-SDK 合同测试：单次 I/O、soft/hard read、机械 clip、stale publication 与 exact-target ACK。 |
@@ -100,7 +100,7 @@
 |---|---|
 | `dexmani_real/sensor/__init__.py` | 传感器子包标记。 |
 | `dexmani_real/sensor/camera_geometry.py` | 纯数据 native depth/color intrinsics 与 `T_color_from_depth` 合同。 |
-| `dexmani_real/sensor/realsense.py` | RealSense D400/L515 驱动；native RGB-D ownership copy、L515 preset 与分流时序。 |
+| `dexmani_real/sensor/realsense.py` | RealSense D400/L515 驱动；native RGB-D ownership copy、L515 preset 与分流时序；`auto_exposure_priority` 默认 OFF（0.0）以在暗场维持 30 Hz RGB。 |
 | `dexmani_real/sensor/camera_process.py` | RealSense worker；发布 native RGB-D、静态 geometry、时间映射、健康状态和 camera ring。 |
 | `dexmani_real/sensor/pointcloud.py` | SDK-free native depth/RGB 到 xArm-base 固定点云的确定性几何链。 |
 | `dexmani_real/sensor/pointcloud_process.py` | latest-only realtime worker；从 camera ring 生成固定 `float32[N,6]` 并携来源时序发布到 pointcloud ring。 |
@@ -248,7 +248,11 @@
 | `examples/calibrate_vr_heading.py` | 收集 HTS head/wrist orientation、评估质量并原子更新 VR transform。 |
 | `examples/inspect_l515.py` | L515 native RGB-D 几何、option readback、跨流时序与 Z16 场景基线采集；只连接相机，无 GUI，不写标定。 |
 | `examples/diagnose_l515_rgb_timing.py` | L515 低开销 non-mutating camera-control RGB/D 流时序诊断：frame number、device timestamp、per-frame metadata 与 color option readback；只连接相机，不写 option。 |
+| `examples/run_l515_timing_suite.py` | 批量串联 guide §29 诊断套件（3×RGB-D + 3×color-only）：仅以 subprocess 启动 diagnose_l515_rgb_timing.py，自身不连相机；每 run 一行摘要，结尾写自描述 `suite_summary.json` 聚合清单；`--dry-run` 预览命令。 |
+| `examples/run_l515_ablation.py` | guide §32 Branch A controlled ablation（Auto-Exposure Priority ON→OFF）：唯一会 `set_option(auto_exposure_priority)` 的 mutating 工具；短暂 color 流中改值→以 subprocess 跑 timing suite（独立输出根）→finally 无条件恢复优先级并回读校验→写 `ablation_summary.json`（含 precondition/validity 交叉核对/可选 baseline 对比）；`--dry-run` 不碰硬件。 |
 | `examples/check_l515_native_shadow.py` | 离线读取带 RGB 的 L515 inspection capture，以标准 N 运行 native xArm-base 点云与 RGB projection shadow gate。 |
+| `examples/realsense_record_example.py` | 交互式 RealSense RGB-D + 点云诊断（cv2/Open3D GUI）：枚举→intrinsics→RGB-D 实时采集(HUD)→实时点云→性能汇总；已适配新 native 点云 API（`build_point_cloud` + `CameraCalib`），点云输出在 xArm-base 帧；旧的 pointcloud_utils/processor 调用已替换。 |
+| `examples/pointcloud_process_example.py` | L515 桌面点云 + 深度诊断（cv2/Open3D GUI，分阶段耗时）；已适配 `build_point_cloud`；旧 desk-plane RANSAC / DBSCAN / pytorch3d-FPS / config 变体对比等无新等价的特性已移除（`table_plane_abcd=None`）。 |
 | `examples/xhand_control_example.py` | XHand 独立连接、状态/触觉读取和 preset command 交互诊断。 |
 
 ## 5. Retargeting 与语音资源
