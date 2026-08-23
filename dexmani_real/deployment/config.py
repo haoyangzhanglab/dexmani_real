@@ -35,16 +35,14 @@ _POSITIVE_FLOAT_FIELDS = (
 class DeploymentConfig:
     """Frozen learned-policy deployment parameters.
 
-    The three ``*_target`` fields name ``module:symbol`` factories resolved by
-    :mod:`dexmani_real.deployment.worker`; ``checkpoint`` /
+    ``runtime_target`` names the ``module:symbol`` :class:`PolicyRuntime`
+    factory resolved by :mod:`dexmani_real.deployment.worker`; ``checkpoint`` /
     ``model_config_path`` / ``device`` and the explicit ``observation_fields``
     contract are the model-facing values that cross the deployment boundary
     (everything else model-internal stays in the model repository).
     """
 
-    backend_target: str = ""
-    observation_adapter_target: str = ""
-    action_adapter_target: str = ""
+    runtime_target: str = ""
     checkpoint: str | None = None
     model_config_path: str | None = None
     device: str = "cpu"
@@ -147,9 +145,8 @@ def resolve_deployment_config(
     """Resolve ``CLI > file/data > defaults`` without mutating the template.
 
     Accepts either a flat mapping of deployment fields or a YAML document with a
-    top-level ``deployment:`` section.  Raises when any of the three
-    ``*_target`` fields is absent; the three targets are the required entry
-    points (the worker cannot run without all three).
+    top-level ``deployment:`` section.  Raises when ``runtime_target`` is
+    absent; it is the required entry point (the worker cannot run without it).
     """
     sources = [yaml_path is not None, data is not None]
     if sum(sources) > 1:
@@ -183,13 +180,8 @@ def resolve_deployment_config(
     merged = _merge(DeploymentConfig(**merged), cli)
 
     config = DeploymentConfig(**merged)
-    for target_name in (
-        "backend_target",
-        "observation_adapter_target",
-        "action_adapter_target",
-    ):
-        if not getattr(config, target_name).strip():
-            raise ValueError(f"deployment {target_name} must be provided")
+    if not config.runtime_target.strip():
+        raise ValueError("deployment runtime_target must be provided")
 
     canonical = {
         field.name: getattr(config, field.name) for field in fields(DeploymentConfig)

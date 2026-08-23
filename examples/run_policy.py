@@ -37,22 +37,10 @@ def main(argv: list[str] | None = None) -> int:
         "--deployment-config",
         type=str,
         default=None,
-        help="YAML with deployment overrides (backend/adapter targets, checkpoint, device)",
+        help="YAML with deployment overrides (runtime target, checkpoint, device)",
     )
     parser.add_argument(
-        "--backend", type=str, default=None, help="module:symbol backend target"
-    )
-    parser.add_argument(
-        "--observation-adapter",
-        type=str,
-        default=None,
-        help="module:symbol observation adapter target",
-    )
-    parser.add_argument(
-        "--action-adapter",
-        type=str,
-        default=None,
-        help="module:symbol action adapter target",
+        "--runtime", type=str, default=None, help="module:symbol PolicyRuntime target"
     )
     parser.add_argument(
         "--checkpoint", type=str, default=None, help="model checkpoint path"
@@ -85,9 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         deployment_resolved = resolve_deployment_config(
             yaml_path=args.deployment_config,
             cli_overrides={
-                "backend_target": args.backend,
-                "observation_adapter_target": args.observation_adapter,
-                "action_adapter_target": args.action_adapter,
+                "runtime_target": args.runtime,
                 "checkpoint": args.checkpoint,
                 "device": args.device,
                 "hand_enabled": True if args.hand else None,

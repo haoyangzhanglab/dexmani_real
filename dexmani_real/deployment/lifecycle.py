@@ -23,6 +23,7 @@ import hashlib
 import logging
 import multiprocessing as mp
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
 from dexmani_real.deployment.config import DeploymentConfig
 from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_loop
 from dexmani_real.deployment.observation import parse_observation_fields
+from dexmani_real.deployment.operator import build_home_planner, run_operator_control
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.robot.arm_loop import arm_loop
 from dexmani_real.robot.hand_process import hand_loop
@@ -92,14 +94,11 @@ def log_deployment_provenance(
     """
     logger.info(
         "deployment provenance: dexmani_commit=%s model_commit=%s "
-        "backend_target=%s observation_adapter_target=%s action_adapter_target=%s "
-        "observation_fields=%s pointcloud_num_points=%d checkpoint=%s "
+        "runtime_target=%s observation_fields=%s pointcloud_num_points=%d checkpoint=%s "
         "checkpoint_sha256=%s model_config_sha256=%s runtime_sha256=%s",
         dexmani_commit or "unknown",
         model_commit or "unknown",
-        deployment.backend_target,
-        deployment.observation_adapter_target,
-        deployment.action_adapter_target,
+        deployment.runtime_target,
         deployment.observation_fields,
         deployment.pointcloud_num_points,
         deployment.checkpoint or "",
@@ -224,6 +223,8 @@ def run_policy_deployment(
     specs: list[WorkerSpec] = []
     procs: list[Any] = []
     shutdown_report: ShutdownReport | None = None
+    operator_thread: threading.Thread | None = None
+    operator_stop: threading.Event | None = None
     try:
         specs = build_policy_worker_specs(shared, runtime, deployment)
         procs = build_processes(ctx, specs)
@@ -254,6 +255,21 @@ def run_policy_deployment(
             f"\nAll subsystems ready — safety=ARMED({int(SafetyState.ARMED)})",
             flush=True,
         )
+        print(
+            "  [B] start run   [S] stop run   [H] home   [Q] quit   [ESC] e-stop",
+            flush=True,
+        )
+
+        home_planner = build_home_planner(runtime)
+        operator_stop = threading.Event()
+        operator_thread = threading.Thread(
+            target=run_operator_control,
+            args=(shared, runtime, deployment, home_planner),
+            kwargs={"stop_event": operator_stop},
+            name="policy-operator",
+            daemon=True,
+        )
+        operator_thread.start()
 
         process_names = [spec.name for spec in specs]
         heartbeat_names = process_names
@@ -292,6 +308,10 @@ def run_policy_deployment(
         require_transition(shared, SafetyState.FAULT)
         return 1
     finally:
+        if operator_stop is not None:
+            operator_stop.set()
+        if operator_thread is not None:
+            operator_thread.join(timeout=1.0)
         if shutdown_report is None:
             started = [process for process in procs if process.pid is not None]
             if started:

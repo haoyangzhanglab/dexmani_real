@@ -115,7 +115,12 @@ def validate_point_cloud_array(
     return array
 
 
-_HAND_COMMAND_COMMON_FIELDS = [
+# ARM and HAND commands share one identity/timing prefix (run_generation,
+# observation_id, action_id, created/target/valid_until) so a generation bump
+# — STOP, FAULT, or a new run — invalidates both actuators at the same worker
+# boundary.  The arm ring is latest-wins; staleness additionally uses
+# ``action_id`` ordering and command age.
+_COMMON_COMMAND_FIELDS = [
     ("run_generation", "<u8"),
     ("observation_id", "<u8"),
     ("action_id", "<u8"),
@@ -124,19 +129,11 @@ _HAND_COMMAND_COMMON_FIELDS = [
     ("valid_until_monotonic_ns", "<u8"),
     ("is_hold", "<u1"),
 ]
-
-# The arm ring is latest-wins; staleness uses ``action_id`` and command age.
 ARM_COMMAND_DTYPE = np.dtype(
-    [
-        ("action_id", "<u8"),
-        ("created_monotonic_ns", "<u8"),
-        ("is_hold", "<u1"),
-        ("qpos_cmd", "<f8", ARM_JOINT_SHAPE),
-    ],
-    align=True,
+    _COMMON_COMMAND_FIELDS + [("qpos_cmd", "<f8", ARM_JOINT_SHAPE)], align=True
 )
 HAND_COMMAND_DTYPE = np.dtype(
-    _HAND_COMMAND_COMMON_FIELDS + [("qpos_cmd", "<f8", HAND_JOINT_SHAPE)], align=True
+    _COMMON_COMMAND_FIELDS + [("qpos_cmd", "<f8", HAND_JOINT_SHAPE)], align=True
 )
 
 # One payload is written per inference; the coordinator consumes only the latest.

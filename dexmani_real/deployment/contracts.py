@@ -7,7 +7,7 @@ runtime-canonical joint action. None of these import torch or SharedStorage.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 
@@ -17,7 +17,7 @@ from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE, MAX_POL
 
 @dataclass(frozen=True)
 class InferenceContext:
-    """Timing/identity context passed to ``ActionAdapter.decode``.
+    """Timing/identity context passed to ``PolicyRuntime.predict``.
 
     Field shape is design latitude; these six suffice for generation checks and
     metric timing.
@@ -100,27 +100,21 @@ class JointActionChunk:
 
 
 @runtime_checkable
-class PolicyBackend(Protocol):
-    """Model-side inference; may import torch/checkpoint/CUDA."""
+class PolicyRuntime(Protocol):
+    """Model-side policy boundary: load -> predict -> reset_episode.
+
+    ``predict`` encodes an ``ObservationBatch`` into the model-native input,
+    runs inference, and decodes the result into a ``JointActionChunk``.  The
+    implementation may import torch/checkpoint/CUDA; it never sees
+    SharedStorage or a robot command.
+    """
 
     def load(self) -> None: ...
 
-    def reset(self, *, run_generation: int) -> None: ...
+    def reset_episode(self) -> None: ...
 
-    def infer(self, model_input: Any) -> Any: ...
+    def predict(
+        self, observation: ObservationBatch, *, context: InferenceContext
+    ) -> JointActionChunk: ...
 
     def close(self) -> None: ...
-
-
-@runtime_checkable
-class ObservationAdapter(Protocol):
-    """``ObservationBatch`` -> model-native input."""
-
-    def encode(self, observation: ObservationBatch) -> Any: ...
-
-
-@runtime_checkable
-class ActionAdapter(Protocol):
-    """Model-native output -> ``JointActionChunk``."""
-
-    def decode(self, raw_output: Any, *, context: InferenceContext) -> JointActionChunk: ...

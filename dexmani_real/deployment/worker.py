@@ -1,18 +1,19 @@
 """Inference worker: observations -> model proposals -> ``policy_plan_ring``.
 
-The inference worker is the *only* process that touches the backend. It reads
-causal observations from the shared rings, runs ``encode -> infer -> decode``,
-and publishes the resulting :class:`~dexmani_real.deployment.contracts.JointActionChunk`
-to the latest-wins ``policy_plan_ring``. It never writes ``arm_cmd_ring``,
+The inference worker is the *only* process that touches the model. It reads
+causal observations from the shared rings, runs
+:meth:`~dexmani_real.deployment.contracts.PolicyRuntime.predict`, and publishes
+the resulting :class:`~dexmani_real.deployment.contracts.JointActionChunk` to
+the latest-wins ``policy_plan_ring``. It never writes ``arm_cmd_ring``,
 ``hand_cmd_ring``, the SDK, ``SafetyState``, or ``run_generation`` — model output
 is a proposal, not a robot command.
 
 ``inference_loop`` is a plain ``*_loop(shared, config)`` function (not an
 ``mp.Process`` subclass); lifecycle/supervision stays in the A/B runtime.
 
-The module also owns the ``module:symbol`` lazy loaders (``load_backend``,
-``load_observation_adapter``, ``load_action_adapter``) so torch/CUDA imports
-happen only inside the inference child process, never in the parent.
+The module also owns the ``module:symbol`` lazy loader (``load_policy_runtime``)
+so torch/CUDA imports happen only inside the inference child process, never in
+the parent.
 """
 
 from __future__ import annotations
@@ -25,11 +26,9 @@ import numpy as np
 
 from dexmani_real.deployment.config import DeploymentConfig
 from dexmani_real.deployment.contracts import (
-    ActionAdapter,
     InferenceContext,
     JointActionChunk,
-    ObservationAdapter,
-    PolicyBackend,
+    PolicyRuntime,
 )
 from dexmani_real.deployment.metrics import (
     INFERENCE_FAILURES,
@@ -46,6 +45,7 @@ from dexmani_real.deployment.observation import (
     PointCloudFrame,
     parse_observation_fields,
 )
+from dexmani_real.robot.safety import SafetyState
 from dexmani_real.shm.shared_storage import SharedStorage, new_frame
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.schema import (
@@ -58,6 +58,8 @@ logger = get_logger(__name__)
 
 # Poll delay while required causal feedback is unavailable.
 _NO_FEEDBACK_POLL_S = 0.005
+# Poll interval while ARMED (no inference) — gentler than the feedback poll.
+_ARMED_IDLE_POLL_S = 0.01
 
 _ProtocolT = TypeVar("_ProtocolT")
 
@@ -102,25 +104,11 @@ def _load(
     return instance
 
 
-def load_backend(
+def load_policy_runtime(
     target: str, *, config: DeploymentConfig | None = None
-) -> PolicyBackend:
-    """Load a :class:`PolicyBackend` from ``module:symbol``."""
-    return _load(target, PolicyBackend, "backend", config)
-
-
-def load_observation_adapter(
-    target: str, *, config: DeploymentConfig | None = None
-) -> ObservationAdapter:
-    """Load an :class:`ObservationAdapter` from ``module:symbol``."""
-    return _load(target, ObservationAdapter, "observation adapter", config)
-
-
-def load_action_adapter(
-    target: str, *, config: DeploymentConfig | None = None
-) -> ActionAdapter:
-    """Load an :class:`ActionAdapter` from ``module:symbol``."""
-    return _load(target, ActionAdapter, "action adapter", config)
+) -> PolicyRuntime:
+    """Load a :class:`PolicyRuntime` from ``module:symbol``."""
+    return _load(target, PolicyRuntime, "policy runtime", config)
 
 
 def publish_plan(
@@ -381,7 +369,7 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
     mark ready. A load/import/instantiation failure raises out of this function
     and becomes a supervisor-observed process failure; there is no dummy safe
     mode. The main loop reads a fresh generation each tick and calls
-    ``backend.reset`` when it changes.
+    ``runtime.reset_episode`` when it changes.
     """
     if config is None:
         raise ValueError("inference_loop requires a DeploymentConfig")
@@ -390,18 +378,14 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
     shared.set_heartbeat("inference", time.monotonic())
     metrics = Metrics()
 
-    backend = load_backend(config.backend_target, config=config)
-    observation_adapter = load_observation_adapter(
-        config.observation_adapter_target, config=config
-    )
-    action_adapter = load_action_adapter(config.action_adapter_target, config=config)
+    runtime = load_policy_runtime(config.runtime_target, config=config)
 
-    backend.load()  # raises -> process failure (no dummy safe mode)
+    runtime.load()  # raises -> process failure (no dummy safe mode)
 
     shared.set_ready("inference")
     # Refresh the heartbeat after model loading, which may exceed the timeout.
     shared.set_heartbeat("inference", time.monotonic())
-    logger.info("inference_loop: ready (backend=%s)", config.backend_target)
+    logger.info("inference_loop: ready (runtime=%s)", config.runtime_target)
 
     step_dt_ns = int(round(1e9 / float(shared.action_control_hz)))
     period_s = 1.0 / float(config.inference_hz)
@@ -420,8 +404,14 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
 
             run_generation = int(shared.run_generation.value)
             if run_generation != last_generation:
-                backend.reset(run_generation=run_generation)
+                runtime.reset_episode()
                 last_generation = run_generation
+                observation_id = 0  # new observation epoch for the new run
+
+            # ARMED = no inference; the coordinator gates RUNNING via B.
+            if int(shared.safety_state.value) != int(SafetyState.RUNNING):
+                time.sleep(_ARMED_IDLE_POLL_S)
+                continue
 
             anchor_ns = time.monotonic_ns()
             observation_id += 1
@@ -444,9 +434,26 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
             metrics.increment(OBSERVATIONS_BUILT)
 
             started_ns = time.monotonic_ns()
-            model_input = observation_adapter.encode(observation)
-            raw_output = backend.infer(model_input)
-            finished_ns = time.monotonic_ns()
+            # Action timestamps anchor to the observation cut, not inference
+            # finish; the true finish time is measured around predict and used
+            # only for plan freshness in the published context.
+            predict_context = InferenceContext(
+                run_generation=run_generation,
+                observation_id=observation_id,
+                observation_anchor_monotonic_ns=anchor_ns,
+                inference_started_monotonic_ns=started_ns,
+                inference_finished_monotonic_ns=started_ns,
+                step_dt_ns=step_dt_ns,
+            )
+            try:
+                chunk = runtime.predict(observation, context=predict_context)
+                finished_ns = time.monotonic_ns()
+            except ValueError as exc:
+                # Drop invalid model results; the coordinator's silence watchdog
+                # handles a prolonged absence of valid proposals.
+                logger.warning("inference: bad model output dropped: %s", exc)
+                metrics.increment(INFERENCE_FAILURES)
+                continue
             metrics.observe(INFERENCE_MS, (finished_ns - started_ns) / 1e6)
 
             context = InferenceContext(
@@ -457,15 +464,6 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
                 inference_finished_monotonic_ns=finished_ns,
                 step_dt_ns=step_dt_ns,
             )
-
-            try:
-                chunk = action_adapter.decode(raw_output, context=context)
-            except ValueError as exc:
-                # Drop invalid model results; the coordinator's silence watchdog
-                # handles a prolonged absence of valid proposals.
-                logger.warning("inference: bad model output dropped: %s", exc)
-                metrics.increment(INFERENCE_FAILURES)
-                continue
 
             plan_id += 1
             if publish_plan(shared, plan_id=plan_id, context=context, chunk=chunk):
@@ -486,7 +484,7 @@ def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
                 time.sleep(sleep_s)
     finally:
         try:
-            backend.close()
+            runtime.close()
         except Exception:
-            logger.warning("inference: backend.close raised", exc_info=True)
+            logger.warning("inference: runtime.close raised", exc_info=True)
         logger.info("inference_loop: exited")

@@ -93,6 +93,7 @@ def _read_latest_arm_command(shared: Any, armed_at_seq: int) -> Any | None:
     if not worker_validate_arm(
         command,
         armed_at_seq=armed_at_seq,
+        expected_run_generation=int(shared.run_generation.value),
         now_monotonic_ns=time.monotonic_ns(),
     ):
         return None

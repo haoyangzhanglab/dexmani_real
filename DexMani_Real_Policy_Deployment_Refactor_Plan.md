@@ -563,3 +563,116 @@ Safety：
     safety
     robot worker
     operator control
+
+------------------------------------------------------------------------
+
+# 14. 审查修订（2026-08-23，结合 dexmani_policy 实况）
+
+本节由对 `~/Desktop/dexmani_policy` 的逐条核对得出，**优先于**第 4/5/6/9/10
+节中与此冲突的表述。三个待决点已定：PolicyRuntime 放 `dexmani_real`、manifest
+由 real 侧产出、支持 EE。
+
+## 14.1 关键事实（`dexmani_policy` 真实契约）
+
+| 方案原假设 | 实况 | 结论 |
+|---|---|---|
+| §4 `PolicyRuntime` 替换 `build_agent()` | `__init__.py` 为空，无 `build_agent`；真实入口 `BaseAgent.predict_action`（`agents/core/base.py`） | 现有 `integrations/dexmani_policy.py` 建在臆想 API 上，须**整替换** |
+| §4 输入 `joint_state [B,T,19]` | `_validate_obs_dict` 要求每个 obs tensor `(B,T,...)`,`T>=n_obs_steps`；`state_dim:19`、`sensor_modalities:["joint_state","point_cloud"]` | 精确吻合；`T=n_obs_steps=2`（非 4） |
+| §4 输出 `future_action [H,19]` | `predict_action` 返回 `{"pred_action"(B,16,A),"control_action"(B,8,control_action_dim),"tail"}`；`control_action_dim`=19 原生关节 | 吻合；`H=n_action_steps=8`；EE 时 control_action_dim=21 |
+| §5 manifest `control_action_dim` | 已在 `base.py` 属性与 checkpoint `train_params` | 现成 |
+| §1.1 禁止 sim/env_runner/temporal ensemble | `env_runner/sim_runner.py:7` `from dexmani_sim import DATA_DIR`；eval 默认 `temporal_ensemble_coeff=0.01` | 该条 load-bearing |
+
+关键推论：
+
+- **normalizer 在 checkpoint 里**：`self.normalizer` 是 agent 子模块，随
+  `model_state` 存盘；`load_ckpt_for_inference`（`training/eval_utils.py`）
+  只 `instantiate(cfg.agent)` + `load_state_dict` + `is_fitted(["action"])`，
+  **不碰 dataset/DATA_DIR**。故 `PolicyRuntime.load` 可脱离数据集。
+- **`dt` 不在模型配置里**：模型只懂步数（`horizon=16/n_obs_steps=2/
+  n_action_steps=8`），时间尺度是 sim/real 控制栅格概念。manifest 的 `dt`
+  必须由 real 侧提供。
+- **`train_params` 已含 9 个 manifest 类字段**：`n_obs_steps / n_action_steps /
+  action_dim / horizon / action_key / tcp_dim / use_faas / hand_dim /
+  control_action_dim`（`common/checkpoint_io.py`）。manifest 大半可从它派生。
+
+## 14.2 三个决策的落地形态
+
+### 决策 1 — PolicyRuntime 放 `dexmani_real`
+
+`dexmani_real/integrations/dexmani_policy.py` 整替换为 `PolicyRuntime`：
+
+```python
+load(model_config, checkpoint, manifest, device)
+predict(obs)          # -> agent.predict_action(...)["control_action"]  [H, control_action_dim]
+reset_episode()
+```
+
+`load` 只 import `dexmani_policy.common.*`、`training/build_utils`、
+`training/eval_utils`、`agents.*`；**绝不 import `env_runner`**（其顶层
+`from dexmani_sim import DATA_DIR`）。流程：`OmegaConf.load(model_config)` →
+`register_resolvers` + `normalize_action_key` → `instantiate(cfg.agent)` +
+`inject_faas_into_agent` → `load_ckpt_for_inference`（EMA/raw）→ 校验
+`train_params == manifest`。`reset_episode` 无循环态（diffusion/flowmatch
+无状态），主要是 real 侧观测历史重置 + 可选 `ChunkOverlapBlender.reset`。
+
+### 决策 2 — manifest 由 real 侧产出
+
+`DeploymentManifest` 是 real 侧 frozen dataclass，启动时由 loader 组装：
+
+- 来源：checkpoint `train_params`（9 字段）+ config.yaml（`sensor_modalities/
+  pc_dim/num_points/normalizer_mode`）+ runtime config（`dt/control_hz`）。
+- `domain` 恒为 `real`（无 sim 组装路径，故 §5 的 domain==real 由构造保证）。
+- 校验：`action_key ∈ {action, action_ee}`、`use_faas/use_aux_ee ∈ {T,F}`、
+  `dt` 与录制/控制栅格一致。
+
+### 决策 3 — 支持 EE（`action_ee`, 21D）
+
+`manifest.action_key` 分派：
+
+- **joint（`action`）**：`control_action [H,19]` = arm7 ‖ hand12，arm 直接进
+  joint safety gate，hand12 直接。
+- **ee（`action_ee`）**：`control_action [H,21]` = pos3 ‖ rot6d6 ‖ hand12。
+  arm 走 `pose_utils.rot6d_to_quat_wxyz` → `Pose(p, q)` →
+  `planner.solve_teleop_ik(target_eef_pose_world, current_qpos, prev_cmd)`
+  （先 `planner.set_hand_qpos(hand12)` 做 19-DoF 碰撞）；IK fail → reject
+  （符合 §9）。hand12 直接。新增的只有 coordinator 里一段 EE→IK→joint
+  分派。
+- **FAAS**：透明。`predict_action` 内部做 19↔39 转换，`control_action`
+  仍是 native 19/21，real 侧无需特殊处理。
+
+EE 坐标帧（pos3/rot6d 的参考系）必须与 real 点云的 xArm-base 帧一致，锁进
+manifest 的 action representation + point cloud contract 字段。
+
+## 14.3 需补进对应章节的缺口
+
+1. **§5 domain 载体**：manifest 由 real 侧构造，`domain=real` 为常量；补
+   “谁产出、在哪校验”的说明（= 决策 2）。
+2. **§5 dt 来源**：`dt` 不在模型 config，由 real 控制栅格提供并校验。
+3. **§5/§6 point cloud contract 展开**：不止 `N` 个点，还含坐标帧、颜色
+   归一（normalizer 把 PC 归一化到 [-1,1]）、以及训练 FPS 采样 vs real 确定性
+   采样的一致性。dp3 训练用 `fps_random_config`（FPS+随机），real 侧
+   `pointcloud_process` 是确定性 `float32[N,6]`——此差异需在 manifest 显式
+   声明并校验，否则有 train/deploy 预处理不一致的隐性精度损失。
+4. **§6 观测组装**：real 侧需把 arm_qpos(7)/hand_qpos(12) 拼成 19D
+   `joint_state`（FAAS mapper 也按 `[...,:7]`/`[...,7:]` 切分）；点云从
+   latest-only 改成 `T=2` 历史窗（`pointcloud_process` 目前只有 latest）。
+
+## 14.4 修订后的实施顺序
+
+Phase 1–3 不变（纯 real 侧，与模型无关）：
+
+- Phase 1：ARM command generation（§10，arm dtype 补齐六字段）
+- Phase 2：Lifecycle（ARMED idle / RUNNING active / B/S）
+- Phase 3：Keyboard（B/S/H/Q/ESC）
+
+Phase 4 拆两步：
+
+- Phase 4a：整替换 `integrations/dexmani_policy.py` 为 `PolicyRuntime`
+  （现状是坏的，须先替换再谈其余）
+- Phase 4b：`DeploymentManifest`（real 侧组装 + 校验，含 EE 分派）
+
+Phase 5–7 追加 EE 与点云历史：
+
+- Phase 5：观测（19D joint_state 拼装 + 点云 `T=2` 历史 + causal grid）
+- Phase 6：Scheduler（`replan_stride_steps` + active/pending + EE→IK 分派）
+- Phase 7：Safety（delta limit + collision transition + publication gate）

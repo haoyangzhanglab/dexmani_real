@@ -260,6 +260,8 @@ class SharedStorage:
     estop_request: Any  # policy -> arm/hand
     quit_requested: Any  # policy -> Main
     pointcloud_requested: Any  # Main -> camera; keep native payload publication active
+    start_request: Any  # Main -> coordinator: B (start a new policy run)
+    stop_request: Any  # Main -> coordinator: S (stop the current policy run)
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write
 
@@ -420,6 +422,8 @@ class SharedStorage:
         storage.estop_request = ctx.Value("b", False)
         storage.quit_requested = ctx.Value("b", False)
         storage.pointcloud_requested = ctx.Value("b", cfg.pointcloud_requested)
+        storage.start_request = ctx.Value("b", False)
+        storage.stop_request = ctx.Value("b", False)
 
         storage.safety_state = ctx.Value("i", int(SafetyState.DISARMED))
 

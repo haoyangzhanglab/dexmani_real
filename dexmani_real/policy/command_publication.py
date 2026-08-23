@@ -225,13 +225,23 @@ def _hand_feedback_snapshot(
     )
 
 
-def _make_arm_command(candidate: ActionCandidate, now_monotonic_ns: int) -> np.ndarray:
-    """Serialize an ActionCandidate into an ARM_COMMAND_DTYPE record."""
+def _make_arm_command(
+    candidate: ActionCandidate, now_monotonic_ns: int, target_monotonic_ns: int
+) -> np.ndarray:
+    """Serialize an ActionCandidate into an ARM_COMMAND_DTYPE record.
+
+    Carries the same identity/timing prefix as ``_make_hand_command`` so a
+    STOP/FAULT generation bump invalidates arm and hand at the same boundary.
+    """
     if candidate.arm_qpos is None:
         raise ValueError("candidate has no arm command")
     frame = np.zeros(1, dtype=ARM_COMMAND_DTYPE)
+    frame["run_generation"][0] = candidate.run_generation
+    frame["observation_id"][0] = candidate.observation_id
     frame["action_id"][0] = candidate.action_id
     frame["created_monotonic_ns"][0] = now_monotonic_ns
+    frame["target_monotonic_ns"][0] = target_monotonic_ns
+    frame["valid_until_monotonic_ns"][0] = candidate.valid_until_monotonic_ns
     frame["is_hold"][0] = int(bool(candidate.is_hold))
     frame["qpos_cmd"][0] = candidate.arm_qpos
     return frame
@@ -310,7 +320,7 @@ def send_command(
         )
 
     if candidate.arm_qpos is not None:
-        shared.arm_cmd_ring.write(_make_arm_command(candidate, now_ns))
+        shared.arm_cmd_ring.write(_make_arm_command(candidate, now_ns, target_ns))
 
     # Both actuator transports are latest-wins seqlock rings; publication is not atomic.
     if candidate.hand_qpos is not None:

@@ -1,7 +1,7 @@
 """Process-local immutable observation windows for the deployment runtime.
 
 These types never enter SharedStorage and therefore carry no
-IPC dtype. They are the ``ObservationAdapter`` input contract.
+IPC dtype. They are the ``PolicyRuntime`` input contract.
 """
 
 from __future__ import annotations

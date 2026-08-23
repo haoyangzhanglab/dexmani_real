@@ -199,21 +199,22 @@
 | 文件 | 职责 |
 |---|---|
 | `dexmani_real/deployment/__init__.py` | learned-policy 部署子包标记。 |
-| `dexmani_real/deployment/contracts.py` | inference context、joint action chunk 与 backend/observation/action adapter protocols。 |
+| `dexmani_real/deployment/contracts.py` | inference context、joint action chunk 与 `PolicyRuntime` protocol（load/predict/reset_episode）。 |
 | `dexmani_real/deployment/config.py` | deployment YAML/CLI 合并、点云 N/类型校验、required target 校验与 SHA-256 identity。 |
 | `dexmani_real/deployment/observation.py` | 因果、不可变 arm/hand/tactile history windows、最新点云帧与 observation batch。 |
-| `dexmani_real/deployment/worker.py` | inference worker：`module:symbol` backend/adapter factory 惰性加载、读取并校验因果历史（含新鲜点云）、编码 observation、运行 backend、解码并发布 plan。 |
-| `dexmani_real/deployment/coordinator.py` | learned-policy 唯一 command producer；采纳 plan、选择 due step 并通过安全门发布。 |
-| `dexmani_real/deployment/lifecycle.py` | policy worker topology、SharedStorage、readiness、ARMED、supervision、verified shutdown 与启动 provenance 日志（含文件 SHA-256）。 |
+| `dexmani_real/deployment/worker.py` | inference worker：`module:symbol` `PolicyRuntime` factory 惰性加载、读取并校验因果历史（含新鲜点云）、`predict` 并发布 plan。 |
+| `dexmani_real/deployment/coordinator.py` | learned-policy 唯一 command producer；ARMED/RUNNING 状态机、采纳 plan、选择 due step 并通过安全门发布。 |
+| `dexmani_real/deployment/lifecycle.py` | policy worker topology、SharedStorage、readiness、ARMED、operator 线程、supervision、verified shutdown 与启动 provenance 日志（含文件 SHA-256）。 |
+| `dexmani_real/deployment/operator.py` | 键盘后台线程 B/S/H/Q/ESC → 共享请求 flag，及 H 的碰撞检查归位编排（主进程 hand-dof+table planner）。 |
 | `dexmani_real/deployment/metrics.py` | inference/coordinator 计数、reject 分类和周期性日志。 |
-| `dexmani_real/deployment/fake.py` | CPU-only、无 torch、确定性的 fake adapters/backend，用于离线验证协议链路。 |
+| `dexmani_real/deployment/fake.py` | CPU-only、无 torch、确定性的 `FakePolicyRuntime`，用于离线验证协议链路。 |
 
 ### `dexmani_real/integrations/`
 
 | 文件 | 职责 |
 |---|---|
 | `dexmani_real/integrations/__init__.py` | 外部模型仓库集成子包标记。 |
-| `dexmani_real/integrations/dexmani_policy.py` | `dexmani_policy` 的 observation/backend/action 三个适配器、单帧 `(N,6)` 点云输出与 joint-action fail-closed 边界。 |
+| `dexmani_real/integrations/dexmani_policy.py` | `dexmani_policy` 的 `PolicyRuntime`（懒加载 Hydra/OmegaConf + `load_ckpt_for_inference` + `predict_action`）、`[1,T,19]` joint_state/`[1,T,N,6]` 点云编码与 joint-action fail-closed 边界。 |
 
 ### `dexmani_real/utils/`
 
