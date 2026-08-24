@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from dexmani_real.utils.schema import ARM_COMMAND_DTYPE, HAND_COMMAND_DTYPE
+from dexmani_real.ipc.schema import ARM_COMMAND_DTYPE, HAND_COMMAND_DTYPE
 
 
 def _hand_command_is_current(

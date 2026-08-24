@@ -26,16 +26,18 @@ from pathlib import Path
 # Set a quiet Rerun logging default unless the operator already configured one.
 os.environ.setdefault("RUST_LOG", "error")
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import h5py
 import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
-from dexmani_real.recording.episode_reader import EpisodeReader, MergedH5File
+from dexmani_real.recording import EpisodeReader, MergedH5File
+from dexmani_real.robot_spec import HAND_FINGERTIP_SHAPE
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.schema import HAND_FINGERTIP_SHAPE
 
 logger = get_logger(__name__)
 

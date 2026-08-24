@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Usage: ``python examples/calibrate_vr_heading.py [--ref head|wrist]``.
+"""Calibrate ``T_vr_to_robot`` from live VR orientation samples.
 
-Calibrate ``T_vr_to_robot`` from VR orientation data; the default reference is the headset.
+This starts the VR receiver, writes ``config/vr_transform.json`` after quality
+checks, and never connects to or commands the robot.
 """
 
 from __future__ import annotations
@@ -10,7 +11,6 @@ import argparse
 import math
 import multiprocessing as mp
 import shutil
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -19,31 +19,38 @@ from pathlib import Path
 
 import numpy as np
 
-_repo_root = Path(__file__).resolve().parents[1]
-if str(_repo_root) not in sys.path:
-    sys.path.insert(0, str(_repo_root))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-from dexmani_real import ASSET_DIR, PACKAGE_DIR
-from dexmani_real.planning.pose_utils import forward_from_quat_wxyz, normalize_quat_wxyz
-from dexmani_real.recording.transaction import atomic_json_dump
-from dexmani_real.runtime.processes import WorkerSpec, build_processes, start_processes
-from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig, vr_loop
-from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig
+from dexmani_real import PACKAGE_DIR
+from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
+from dexmani_real.planning.poses import forward_from_quat_wxyz, normalize_quat_wxyz
+from dexmani_real.runtime.workers import (
+    WorkerSpec,
+    build_processes,
+    shutdown_processes_verified,
+    start_processes,
+)
+from dexmani_real.sensor.vr_worker import VRReceiverConfig, vr_loop
+from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.vr_transform import (
     VR_TRANSFORM_CONVENTION,
     VR_TRANSFORM_MIN_FRAMES,
     VR_TRANSFORM_SCHEMA_VERSION,
 )
+from dexmani_real.utils.atomic_io import atomic_json_dump
 
 _OUTPUT_PATH = PACKAGE_DIR / "config" / "vr_transform.json"
-_AUDIO_PATH = ASSET_DIR / "audio" / "轴向已标定.wav"
 
 _MIN_FORWARD_NORM = 1e-6
 _POLL_INTERVAL_S = 0.01
 _PRINT_INTERVAL_S = 5.0
 _JOIN_TIMEOUT_S = 5.0
 _TERMINATE_TIMEOUT_S = 1.0
+_KILL_TIMEOUT_S = 1.0
 _COUNTDOWN_DWELL_S = 1.0
+_AUDIO_IDLE_TIMEOUT_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -81,10 +88,15 @@ def _circular_mean(
         print(f"  WARNING: {n_bad} frames with near-vertical forward (skipped)")
     fwd_2d = fwd_2d[valid]
     norms = norms[valid]
+    if fwd_2d.shape[0] == 0:
+        raise ValueError("all VR forward samples are near-vertical")
     fwd_unit = fwd_2d / norms[:, None]
 
     mean_0 = np.mean(fwd_unit, axis=0)
-    mean_0 /= np.linalg.norm(mean_0)
+    mean_0_norm = float(np.linalg.norm(mean_0))
+    if mean_0_norm < _MIN_FORWARD_NORM:
+        raise ValueError("VR forward samples have no stable mean heading")
+    mean_0 /= mean_0_norm
 
     # Outlier rejection: |sin(Δθ)| ≈ angular distance from mean.
     dists = np.abs(np.cross(fwd_unit, mean_0))
@@ -96,7 +108,10 @@ def _circular_mean(
 
     fwd_inlier = fwd_unit[inlier]
     mean_fwd = np.mean(fwd_inlier, axis=0)
-    mean_fwd /= np.linalg.norm(mean_fwd)
+    mean_fwd_norm = float(np.linalg.norm(mean_fwd))
+    if mean_fwd_norm < _MIN_FORWARD_NORM:
+        raise ValueError("VR heading inliers have no stable mean direction")
+    mean_fwd /= mean_fwd_norm
     theta = float(np.arctan2(mean_fwd[1], mean_fwd[0]))
 
     full_inlier = np.zeros(len(forwards), dtype=bool)
@@ -138,7 +153,7 @@ def _quality_grade(
     }
 
 
-def _wait_for_vr_tracking(shared: SharedStorage, timeout_s: float) -> bool:
+def _wait_for_vr_tracking(shared: RuntimeChannels, timeout_s: float) -> bool:
     """Block until VR tracking data is observed, or return False on timeout."""
     deadline = time.monotonic() + timeout_s
     last_print = 0.0
@@ -159,16 +174,46 @@ def _wait_for_vr_tracking(shared: SharedStorage, timeout_s: float) -> bool:
     return False
 
 
-def _fatal_exit(shared: SharedStorage, vr_proc: mp.Process, message: str) -> None:
-    """Clean up and exit with an error message."""
-    print(f"  ERROR: {message}", flush=True)
-    shared.is_running.value = False
-    vr_proc.join(timeout=_JOIN_TIMEOUT_S)
-    shared.close()
-    sys.exit(1)
+def _shutdown_vr_receiver(shared: RuntimeChannels, vr_proc: mp.Process) -> bool:
+    """Return whether the receiver and every IPC resource stopped cleanly."""
+    if vr_proc.pid is None:
+        shared.is_running.value = False
+        return shared.close()
+    try:
+        report = shutdown_processes_verified(
+            shared,
+            [vr_proc],
+            graceful_timeout_s=_JOIN_TIMEOUT_S,
+            terminate_timeout_s=_TERMINATE_TIMEOUT_S,
+            kill_timeout_s=_KILL_TIMEOUT_S,
+        )
+    except RuntimeError as exc:
+        print(f"  ERROR: VR receiver shutdown could not be verified: {exc}")
+        return False
+    if not report.clean:
+        print(f"  ERROR: VR receiver shutdown was not clean: {report.exits}")
+    return report.clean
 
 
-def main() -> None:
+def _play_completion_audio() -> None:
+    """Request the canonical completion cue without affecting calibration success."""
+    audio: AudioFeedback | None = None
+    try:
+        audio = AudioFeedback()
+        audio.play("calibrated")
+        if not audio.wait_until_idle(timeout_s=_AUDIO_IDLE_TIMEOUT_S):
+            print("  WARNING: audio feedback timed out")
+    except Exception as exc:
+        print(f"  WARNING: audio feedback unavailable: {exc}")
+    finally:
+        if audio is not None:
+            try:
+                audio.close()
+            except Exception as exc:
+                print(f"  WARNING: audio feedback cleanup failed: {exc}")
+
+
+def main(argv: list[str] | None = None) -> int:
     cfg = HeadingCalibrationConfig()
     parser = argparse.ArgumentParser(description="VR heading calibration")
     parser.add_argument(
@@ -191,7 +236,7 @@ def main() -> None:
         action="store_true",
         help="write the transform even when quality grade is 'poor'",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not math.isfinite(args.duration) or args.duration <= 0:
         parser.error("--duration must be a positive finite number of seconds")
@@ -210,8 +255,8 @@ def main() -> None:
     print("=" * 55)
 
     ctx = mp.get_context("spawn")
-    shared = SharedStorage.create(
-        prefix="dexmani_vr_calib", config=SharedStorageConfig(), mp_context=ctx
+    shared = RuntimeChannels.create(
+        prefix="dexmani_vr_calib", config=RuntimeChannelsConfig(), mp_context=ctx
     )
     specs = [
         WorkerSpec(
@@ -223,21 +268,25 @@ def main() -> None:
         )
     ]
     vr_proc = build_processes(ctx, specs)[0]
-    start_processes([vr_proc])
-
-    print(
-        "\n  Waiting for VR connection (up to 120 s) — put on Quest headset...",
-        flush=True,
-    )
-    if not shared.wait_ready("vr", cfg.vr_ready_timeout_s):
-        _fatal_exit(shared, vr_proc, "VR receiver startup timeout")
-    print("  VR connected", flush=True)
-
-    print("  Waiting for VR tracking data (up to 15 s)...", flush=True)
-    if not _wait_for_vr_tracking(shared, cfg.tracking_data_timeout_s):
-        _fatal_exit(shared, vr_proc, "no VR tracking data received")
-
+    forwards: list[np.ndarray] = []
+    stale_count = 0
+    shutdown_clean = False
     try:
+        start_processes([vr_proc])
+        print(
+            "\n  Waiting for VR connection (up to 120 s) — put on Quest headset...",
+            flush=True,
+        )
+        if not shared.wait_ready("vr", cfg.vr_ready_timeout_s):
+            print("  ERROR: VR receiver startup timeout", flush=True)
+            return 1
+        print("  VR connected", flush=True)
+
+        print("  Waiting for VR tracking data (up to 15 s)...", flush=True)
+        if not _wait_for_vr_tracking(shared, cfg.tracking_data_timeout_s):
+            print("  ERROR: no VR tracking data received", flush=True)
+            return 1
+
         print(f"  Settling ({cfg.settle_s:.0f} s) — fine-tune your pose...", flush=True)
         time.sleep(cfg.settle_s)
 
@@ -252,11 +301,9 @@ def main() -> None:
             time.sleep(_COUNTDOWN_DWELL_S)
 
         quat_field = "wrist_quat_wxyz" if args.ref == "wrist" else "head_quat_wxyz"
-        forwards: list[np.ndarray] = []
         deadline = time.monotonic() + args.duration
         last_print = 0.0
         prev_seq: int | None = None
-        stale_count = 0
 
         print(f"  Collecting {args.duration}s (hold still)...")
         while time.monotonic() < deadline:
@@ -293,29 +340,32 @@ def main() -> None:
                 last_print = now
             time.sleep(_POLL_INTERVAL_S)
     finally:
-        shared.is_running.value = False
-        vr_proc.join(timeout=_JOIN_TIMEOUT_S)
-        if vr_proc.is_alive():
-            vr_proc.terminate()
-            vr_proc.join(timeout=_TERMINATE_TIMEOUT_S)
-        shared.close()
+        shutdown_clean = _shutdown_vr_receiver(shared, vr_proc)
+
+    if not shutdown_clean:
+        print("ERROR: VR receiver cleanup failed; calibration was not published")
+        return 1
 
     if len(forwards) < cfg.min_frames:
         print(
             f"ERROR: only {len(forwards)} frames collected (< {cfg.min_frames} required)"
         )
-        sys.exit(1)
+        return 1
 
     forwards_arr = np.array(forwards, dtype=np.float64)
-    theta_rad, mean_fwd, inlier = _circular_mean(
-        forwards_arr, outlier_sigma=cfg.outlier_sigma
-    )
+    try:
+        theta_rad, mean_fwd, inlier = _circular_mean(
+            forwards_arr, outlier_sigma=cfg.outlier_sigma
+        )
+    except ValueError as exc:
+        print(f"ERROR: invalid heading sample: {exc}")
+        return 1
     inlier_frames = int(np.sum(inlier))
     if inlier_frames < cfg.min_frames:
         print(
             f"ERROR: only {inlier_frames} inlier frames remain (< {cfg.min_frames} required)"
         )
-        sys.exit(1)
+        return 1
     theta_deg = float(np.rad2deg(theta_rad))
     quality = _quality_grade(
         forwards_arr,
@@ -362,7 +412,7 @@ def main() -> None:
             f"(σ={float(quality['std_deg']):.1f}°). Re-collect a steadier sample, "
             f"or pass --force to write anyway."
         )
-        sys.exit(1)
+        return 1
 
     if _OUTPUT_PATH.exists():
         backup = _OUTPUT_PATH.with_suffix(
@@ -383,15 +433,9 @@ def main() -> None:
     atomic_json_dump(config, _OUTPUT_PATH)
     print(f"\nSaved to: {_OUTPUT_PATH}")
 
-    if _AUDIO_PATH.exists():
-        player = "aplay" if sys.platform == "linux" else "afplay"
-        subprocess.run(
-            [player, str(_AUDIO_PATH)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        print("  Audio feedback played")
+    _play_completion_audio()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from dexmani_real.utils.schema import HAND_JOINT_SHAPE
+from dexmani_real.robot_spec import HAND_JOINT_SHAPE
 
 
 def validate_hand_limit_nesting(

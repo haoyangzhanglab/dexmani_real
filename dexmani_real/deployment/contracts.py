@@ -2,7 +2,7 @@
 
 ``PolicyRuntime`` defines the model boundary; ``InferenceContext`` carries the
 per-prediction identity/timing, and ``JointActionChunk`` is the
-runtime-canonical joint/EE action. None of these import torch or SharedStorage.
+runtime-canonical joint/EE action. None of these import torch or RuntimeChannels.
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-from dexmani_real.deployment.observation import ObservationBatch, _freeze
-from dexmani_real.utils.schema import (
+from dexmani_real.deployment.observation import ObservationBatch, freeze_array
+from dexmani_real.ipc.schema import (
     ARM_JOINT_SHAPE,
     EE_POS_DIM,
     EE_ROT6D_DIM,
@@ -40,11 +40,14 @@ class InferenceContext:
     def __post_init__(self) -> None:
         if self.run_generation < 0 or self.observation_id < 0:
             raise ValueError("run_generation and observation_id must be non-negative")
-        if min(
-            self.observation_anchor_monotonic_ns,
-            self.inference_started_monotonic_ns,
-            self.inference_finished_monotonic_ns,
-        ) <= 0:
+        if (
+            min(
+                self.observation_anchor_monotonic_ns,
+                self.inference_started_monotonic_ns,
+                self.inference_finished_monotonic_ns,
+            )
+            <= 0
+        ):
             raise ValueError("context timestamps must be positive")
         if self.inference_started_monotonic_ns > self.inference_finished_monotonic_ns:
             raise ValueError("inference finish precedes start")
@@ -74,42 +77,54 @@ class JointActionChunk:
 
     def __post_init__(self) -> None:
         arm = (
-            _freeze(self.arm_qpos, name="arm_qpos", dtype=np.float64)
+            freeze_array(self.arm_qpos, name="arm_qpos", dtype=np.float64)
             if self.arm_qpos is not None
             else None
         )
         ee_pos = (
-            _freeze(self.ee_pos, name="ee_pos", dtype=np.float64)
+            freeze_array(self.ee_pos, name="ee_pos", dtype=np.float64)
             if self.ee_pos is not None
             else None
         )
         ee_rot6d = (
-            _freeze(self.ee_rot6d, name="ee_rot6d", dtype=np.float64)
+            freeze_array(self.ee_rot6d, name="ee_rot6d", dtype=np.float64)
             if self.ee_rot6d is not None
             else None
         )
         has_arm = arm is not None
         has_ee = ee_pos is not None or ee_rot6d is not None
         if not has_arm and not has_ee:
-            raise ValueError("JointActionChunk requires arm_qpos (joint) or ee_pos/ee_rot6d (EE)")
+            raise ValueError(
+                "JointActionChunk requires arm_qpos (joint) or ee_pos/ee_rot6d (EE)"
+            )
         if has_arm and has_ee:
             raise ValueError("JointActionChunk cannot mix arm_qpos with EE fields")
         if ee_pos is not None and ee_rot6d is None:
-            raise ValueError("JointActionChunk ee_rot6d is required when ee_pos is present")
+            raise ValueError(
+                "JointActionChunk ee_rot6d is required when ee_pos is present"
+            )
         if ee_rot6d is not None and ee_pos is None:
-            raise ValueError("JointActionChunk ee_pos is required when ee_rot6d is present")
+            raise ValueError(
+                "JointActionChunk ee_pos is required when ee_rot6d is present"
+            )
 
         if arm is not None:
             if arm.ndim != 2 or arm.shape[1] != ARM_JOINT_SHAPE[0]:
-                raise ValueError(f"arm_qpos must be [N, {ARM_JOINT_SHAPE[0]}], got {arm.shape}")
+                raise ValueError(
+                    f"arm_qpos must be [N, {ARM_JOINT_SHAPE[0]}], got {arm.shape}"
+                )
             n = arm.shape[0]
         else:
+            if ee_pos is None or ee_rot6d is None:
+                raise ValueError("EE action requires both ee_pos and ee_rot6d")
             if ee_pos.ndim != 2 or ee_pos.shape[1] != EE_POS_DIM:
-                raise ValueError(f"ee_pos must be [N, {EE_POS_DIM}], got {ee_pos.shape}")
-            if ee_rot6d is None or ee_rot6d.ndim != 2 or ee_rot6d.shape[1] != EE_ROT6D_DIM:
+                raise ValueError(
+                    f"ee_pos must be [N, {EE_POS_DIM}], got {ee_pos.shape}"
+                )
+            if ee_rot6d.ndim != 2 or ee_rot6d.shape[1] != EE_ROT6D_DIM:
                 raise ValueError(
                     f"ee_rot6d must be [N, {EE_ROT6D_DIM}] when ee_pos is present, got "
-                    f"{None if ee_rot6d is None else ee_rot6d.shape}"
+                    f"{ee_rot6d.shape}"
                 )
             if ee_rot6d.shape[0] != ee_pos.shape[0]:
                 raise ValueError(
@@ -125,21 +140,31 @@ class JointActionChunk:
 
         hand = self.hand_qpos
         if hand is not None:
-            hand = _freeze(hand, name="hand_qpos", dtype=np.float64)
+            hand = freeze_array(hand, name="hand_qpos", dtype=np.float64)
+            if hand is None:
+                raise ValueError("hand_qpos must not be None")
             if hand.ndim != 2 or hand.shape != (n, HAND_JOINT_SHAPE[0]):
                 raise ValueError(
                     f"hand_qpos must be [N, {HAND_JOINT_SHAPE[0]}] matching N={n}, got {hand.shape}"
                 )
             object.__setattr__(self, "hand_qpos", hand)
 
-        target = _freeze(self.target_monotonic_ns, name="target_monotonic_ns", dtype=np.uint64)
+        target = freeze_array(
+            self.target_monotonic_ns, name="target_monotonic_ns", dtype=np.uint64
+        )
+        if target is None:
+            raise ValueError("target_monotonic_ns must not be None")
         if target.shape != (n,):
-            raise ValueError(f"target_monotonic_ns must have shape ({n},), got {target.shape}")
+            raise ValueError(
+                f"target_monotonic_ns must have shape ({n},), got {target.shape}"
+            )
         # Element-wise comparison, not np.diff: uint64 diff underflows on a decrease.
         if n > 1 and not bool(np.all(target[1:] > target[:-1])):
             raise ValueError("target_monotonic_ns must be strictly increasing")
 
-        mask = _freeze(self.valid_mask, name="valid_mask", dtype=np.uint8)
+        mask = freeze_array(self.valid_mask, name="valid_mask", dtype=np.uint8)
+        if mask is None:
+            raise ValueError("valid_mask must not be None")
         if mask.shape != (n,):
             raise ValueError(f"valid_mask must have shape ({n},), got {mask.shape}")
         if not np.all((mask == 0) | (mask == 1)):
@@ -163,7 +188,7 @@ class PolicyRuntime(Protocol):
     ``predict`` encodes an ``ObservationBatch`` into the model-native input,
     runs inference, and decodes the result into a ``JointActionChunk``.  The
     implementation may import torch/checkpoint/CUDA; it never sees
-    SharedStorage or a robot command.
+    RuntimeChannels or a robot command.
     """
 
     def load(self) -> None: ...

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/xhand_control_example.py``.
 
-Run a moving XHand diagnostic through the native SDK in an isolated worker.
+This immediately starts a moving XHand diagnostic through the native SDK in a
+crash-isolated worker. It has no non-hardware ``--help`` mode.
 """
 
 from __future__ import annotations
@@ -17,24 +18,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-HOME_QPOS_DEG = (
-    30.0,
-    55.33,
-    10.0,
-    0.17,
-    1.08,
-    5.0,
-    1.25,
-    5.0,
-    1.33,
-    5.0,
-    1.33,
-    5.0,
-)
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-_BAUD_RATE_RS485 = 3_000_000
-_DEFAULT_SERIAL_PORT = "/dev/ttyUSB0"
-_HAND_DOF = 12
+from dexmani_real.config.defaults import hand as hand_defaults
+from dexmani_real.robot_spec import HAND_DOF
+
+_HOME_QPOS_DEG = hand_defaults.home_qpos_deg
+_COMMAND_QPOS_MIN_RAD = hand_defaults.qpos_min_rad
+_COMMAND_QPOS_MAX_RAD = hand_defaults.qpos_max_rad
+_BAUD_RATE_RS485 = hand_defaults.baudrate
+_DEFAULT_SERIAL_PORT = hand_defaults.device_name
 _RS485_COMBINED_FORCE_ERROR_CODE = 1_501_018
 _RS485_DISTRIBUTED_FORCE_ERROR_CODE = 1_501_019
 _RS485_TEMPERATURE_ERROR_CODE = 1_501_020
@@ -53,45 +48,21 @@ _RS485_TACTILE_STATUS_DETAIL = {
     _RS485_TEMPERATURE_ERROR_CODE: "temperature unavailable; force fields retained",
 }
 _RS485_CRC_ERROR_CODE = 1_501_070
-_RS485_POST_OPEN_SETTLE_S = 1.0
+_RS485_POST_OPEN_SETTLE_S = hand_defaults.rs485_post_open_settle_s
 _RS485_CRC_RETRY_COUNT = 1
 _RS485_READ_CRC_RETRY_COUNT = 2
 _RS485_SENSOR_VERIFY_RETRY_COUNT = 2
 _RS485_CRC_RETRY_BACKOFF_S = 0.08
 _HARDWARE_WORKER_ARG = "--_xhand-hardware-worker"
 
-# Keep the local command envelope aligned with the runtime hand limits.
-COMMAND_QPOS_MIN_RAD = (
-    0.0,
-    -0.698,
-    0.17453292519943295,
-    -0.174,
-    0.0,
-    0.08726646259971647,
-    0.0,
-    0.08726646259971647,
-    0.0,
-    0.08726646259971647,
-    0.0,
-    0.08726646259971647,
-)
-COMMAND_QPOS_MAX_RAD = (
-    1.832,
-    1.745,
-    1.745,
-    0.174,
-    1.919,
-    1.919,
-    1.919,
-    1.919,
-    1.919,
-    1.919,
-    1.919,
-    1.919,
-)
-
 _FINGERTIP_IDS = frozenset({2, 5, 7, 9, 11})
 _FINGERTIP_TO_SENSOR_IDX = {2: 0, 5: 1, 7: 2, 9: 3, 11: 4}
+
+
+def _validate_qpos_deg(values: tuple[float, ...] | list[float], *, label: str) -> None:
+    """Reject malformed joint targets before touching the SDK command object."""
+    if len(values) != HAND_DOF or not all(math.isfinite(value) for value in values):
+        raise ValueError(f"{label} must contain {HAND_DOF} finite angles")
 
 
 @dataclass(frozen=True)
@@ -115,6 +86,10 @@ class PresetActions:
     v: tuple[float, ...]
     ok: tuple[float, ...]
 
+    def __post_init__(self) -> None:
+        for name, values in self.iter_actions():
+            _validate_qpos_deg(values, label=f"XHand preset {name!r}")
+
     def iter_actions(self):
         yield "fist", self.fist
         yield "palm", self.palm
@@ -137,7 +112,7 @@ PRESET_XHAND1 = PresetActions(
         109.1,
         109.15,
     ),
-    palm=HOME_QPOS_DEG,
+    palm=_HOME_QPOS_DEG,
     v=(38.32, 90, 52.08, 6.21, 2.6, 5.0, 2.1, 5.0, 109.5, 109.5, 109.5, 109.23),
     ok=(
         45.88,
@@ -182,7 +157,7 @@ class XHandControlExample:
     def _build_command(self, position: float) -> Any:
         """Build a homogeneous hand command with the configured servo params."""
         cmd = self._sdk.HandCommand_t()
-        for i in range(_HAND_DOF):
+        for i in range(HAND_DOF):
             fc = cmd.finger_command[i]
             fc.id = i
             fc.kp = self._params.kp
@@ -195,10 +170,11 @@ class XHandControlExample:
 
     def _set_positions(self, qpos_deg: tuple[float, ...] | list[float]) -> None:
         """Write clipped degree inputs as radians into the current command."""
-        for i in range(_HAND_DOF):
+        _validate_qpos_deg(qpos_deg, label="XHand command")
+        for i in range(HAND_DOF):
             rad = qpos_deg[i] * math.pi / 180.0
-            lo = COMMAND_QPOS_MIN_RAD[i]
-            hi = COMMAND_QPOS_MAX_RAD[i]
+            lo = _COMMAND_QPOS_MIN_RAD[i]
+            hi = _COMMAND_QPOS_MAX_RAD[i]
             if rad < lo or rad > hi:
                 clipped = max(lo, min(hi, rad))
                 print(
@@ -218,11 +194,12 @@ class XHandControlExample:
         print(f"  ports: {ports}")
         return ports
 
-    def open_device(
-        self, protocol: str, serial_port: str = _DEFAULT_SERIAL_PORT
-    ) -> bool:
+    def open_device(self, protocol: str, serial_port: str | None = None) -> bool:
         self._header(f"Open device ({protocol})")
         if protocol == "RS485":
+            if serial_port is None:
+                print("  RS485 serial device is not configured")
+                return False
             problem = _serial_port_problem(serial_port)
             if problem is not None:
                 print(f"  FAILED: {problem}")
@@ -512,7 +489,7 @@ class XHandControlExample:
     def go_home(self) -> bool:
         """Return to home position (matches hand.home_qpos_deg)."""
         self._header("Return to home")
-        self._set_positions(HOME_QPOS_DEG)
+        self._set_positions(_HOME_QPOS_DEG)
         return self.send_command()
 
     def close(self) -> None:

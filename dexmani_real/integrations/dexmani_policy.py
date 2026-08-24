@@ -26,15 +26,15 @@ import torch
 
 from dexmani_real.deployment.contracts import InferenceContext, JointActionChunk
 from dexmani_real.deployment.manifest import (
-    DeploymentManifest,
     EE_CONTROL_ACTION_DIM,
     EE_POS_DIM,
     EE_ROT6D_DIM,
+    DeploymentManifest,
     manifest_from_sources,
     validate_manifest_against_deployment,
 )
 from dexmani_real.deployment.observation import ObservationBatch
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.robot_spec import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 _ARM_DOF = ARM_JOINT_SHAPE[0]
 _HAND_DOF = HAND_JOINT_SHAPE[0]
@@ -82,12 +82,14 @@ class DexManiPolicyRuntime:
             ) from exc
 
         import hydra
-        from omegaconf import OmegaConf
-
         from dexmani_policy.common.checkpoint_io import CheckpointStore
-        from dexmani_policy.common.config import normalize_action_key, register_resolvers
+        from dexmani_policy.common.config import (
+            normalize_action_key,
+            register_resolvers,
+        )
         from dexmani_policy.training.build_utils import inject_faas_into_agent
         from dexmani_policy.training.eval_utils import load_ckpt_for_inference
+        from omegaconf import OmegaConf
 
         register_resolvers()
         cfg = OmegaConf.load(model_config_path)

@@ -15,12 +15,12 @@ import numpy as np
 
 from dexmani_real.teleop.hand_control import (
     HandRetargetObservationCache,
-    _compute_hand_command,
-    _get_raw_hand_command,
-    _sanitize_hand_command,
-    _smoothstep_hand_ramp,
+    compute_hand_command,
+    get_raw_hand_command,
+    sanitize_hand_command,
+    smoothstep_hand_ramp,
 )
-from dexmani_real.utils.signal_utils import ema_smooth_pose
+from dexmani_real.utils.smoothing import ema_smooth_pose
 
 
 @dataclass(frozen=True)
@@ -137,7 +137,7 @@ def compute_hand_joint_proposal(
 ) -> HandJointProposal:
     """Retarget, ramp, and validate one hand proposal without publishing it."""
     compute_started_s = time.perf_counter()
-    hand_qpos_rad, retarget_succeeded = _compute_hand_command(
+    hand_qpos_rad, retarget_succeeded = compute_hand_command(
         hand_retargeter,
         vr_frame,
         previous_hand_qpos_rad,
@@ -145,14 +145,14 @@ def compute_hand_joint_proposal(
         retarget_cache,
     )
     compute_time_ms = (time.perf_counter() - compute_started_s) * 1000.0
-    raw_qpos_rad = _get_raw_hand_command(
+    raw_qpos_rad = get_raw_hand_command(
         hand_retargeter, hand_qpos_rad, retarget_succeeded
     ).copy()
 
     next_ramp_start_qpos_rad = ramp_start_qpos_rad
     next_ramp_step = ramp_step
     if ramp_start_qpos_rad is not None and ramp_step < ramp_total_frames:
-        hand_qpos_rad = _smoothstep_hand_ramp(
+        hand_qpos_rad = smoothstep_hand_ramp(
             ramp_start_qpos_rad,
             hand_qpos_rad,
             ramp_step,
@@ -172,7 +172,7 @@ def compute_hand_joint_proposal(
     )
     validation_issue: str | None = None
     try:
-        hand_qpos_rad = _sanitize_hand_command(
+        hand_qpos_rad = sanitize_hand_command(
             hand_qpos_rad,
             command_lower_rad,
             command_upper_rad,

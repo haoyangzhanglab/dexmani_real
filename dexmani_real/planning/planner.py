@@ -15,14 +15,25 @@ logger = get_logger(__name__)
 
 _warn_hand_qpos_unset_teleop = ThrottledWarner(interval_s=30.0)
 
-from .collision_model import CollisionModel
-from .constants import XARM7_XHAND_COLLISION_URDF_PATH, XARM7_XHAND_SRDF_PATH
+from dexmani_real.robot_spec import (
+    XARM7_XHAND_COLLISION_URDF_PATH,
+    XARM7_XHAND_SRDF_PATH,
+)
+
+from .arm_fk import XArm7Kinematics
+from .candidates import IKCandidateManager, is_mplib_success
+from .collision import CollisionModel
 from .ik import TeleopIKSolver
-from .ik_candidates import IKCandidateManager, is_mplib_success
-from .kinematics import XArm7Kinematics
-from .path_utils import interpolate_waypoints
-from .pose_utils import compute_pose_error, ensure_qpos
-from .types import IKResult, PathResult, PlanningProfile, Pose, TeleopProfile, XArm7PlannerConfig
+from .paths import interpolate_waypoints
+from .poses import compute_pose_error, ensure_qpos
+from .types import (
+    IKResult,
+    PathResult,
+    PlanningProfile,
+    Pose,
+    TeleopProfile,
+    XArm7PlannerConfig,
+)
 
 __all__ = [
     "XArm7MotionPlanner",
@@ -61,6 +72,7 @@ class XArm7MotionPlanner:
         hand_dof: bool = True,
         static_boxes: Iterable[Any] = (),
         table: Any | None = None,
+        allow_unset_hand_qpos: bool = False,
     ) -> None:
         import mplib
 
@@ -78,7 +90,10 @@ class XArm7MotionPlanner:
         joint_vel_limits = np.deg2rad(np.asarray(config.joint_vel_limits_deg, dtype=np.float64))
         joint_acc_limits = joint_vel_limits * float(config.joint_acc_scale)
         if not os.path.exists(config.srdf_path):
-            mplib.urdf_utils.generate_srdf(config.urdf_path, config.srdf_path)
+            raise FileNotFoundError(
+                f"planner SRDF does not exist: {config.srdf_path}; "
+                "generate model assets explicitly before starting the runtime"
+            )
 
         self.mplib_planner = self.mplib.Planner(
             urdf=str(config.urdf_path),
@@ -135,7 +150,12 @@ class XArm7MotionPlanner:
             mplib=self.mplib,
         )
         # Pinocchio validates dense paths post-hoc, complementing MPlib's FCL checks.
-        self.collision_model = CollisionModel(hand_dof=hand_dof, static_boxes=static_boxes, table=table)
+        self.collision_model = CollisionModel(
+            hand_dof=hand_dof,
+            static_boxes=static_boxes,
+            table=table,
+            allow_unset_hand_qpos=allow_unset_hand_qpos,
+        )
         self.ik_mgr = IKCandidateManager(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
@@ -214,12 +234,6 @@ class XArm7MotionPlanner:
     def solve_teleop_ik(
         self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
     ) -> IKResult:
-        if self.collision_model.hand_dof and self.collision_model._hand_qpos is None:
-            _warn_hand_qpos_unset_teleop(
-                "solve_teleop_ik: hand_qpos not set — "
-                "collision checks use home (open-hand) pose. "
-                "Call set_hand_qpos() before solve_teleop_ik()."
-            )
         return self.teleop_solver.solve(target_eef_pose_world, current_qpos, previous_qpos_cmd)
 
     def plan_path(self, target_eef_pose_world: Pose, current_qpos: np.ndarray) -> PathResult:
@@ -228,14 +242,6 @@ class XArm7MotionPlanner:
         current_qpos = self.canonicalize_qpos(
             current_qpos, current_qpos, self.resolve_planning_limits(profile, current_qpos)
         )
-
-        # Warn when hand_dof=True but the hand pose buffer was never initialized.
-        if self.collision_model.hand_dof and self.collision_model._hand_qpos is None:
-            logger.warning(
-                "plan_path: _hand_qpos was never set — "
-                "CollisionModel env/self checks use zero (open-hand) pose.  "
-                "Call set_hand_qpos() before plan_path() to sync."
-            )
 
         current_pose = self.compute_eef_pose_world(current_qpos)
         pos_error, rot_error = compute_pose_error(target_eef_pose_world, current_pose)

@@ -20,7 +20,7 @@ from typing import Any
 import yaml
 
 from dexmani_real.deployment.observation import parse_observation_fields
-from dexmani_real.utils.schema import SUPPORTED_POINT_CLOUD_COUNTS
+from dexmani_real.ipc.schema import SUPPORTED_POINT_CLOUD_COUNTS
 
 _POSITIVE_FLOAT_FIELDS = (
     "inference_hz",

@@ -18,34 +18,32 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
-from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
-from dexmani_real.planning.pose_utils import quat_multiply
-from dexmani_real.policy.safety import (
-    planner_action_safety_gate,
-    publish_hand_home_and_wait_applied,
-    publish_joint_targets,
+from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
+from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
+from dexmani_real.control.publication import publish_joint_targets
+from dexmani_real.control.safety_gate import planner_action_safety_gate
+from dexmani_real.ipc.channels import (
+    RuntimeChannels,
+    RuntimeChannelsConfig,
+    read_arm_state_dict,
+    read_hand_state_dict,
 )
-from dexmani_real.robot.arm_loop import arm_loop
-from dexmani_real.robot.hand_process import hand_loop
-from dexmani_real.robot.homing import ArmHomeConfig, execute_arm_home
-from dexmani_real.robot.safety import (
+from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
+from dexmani_real.planning.poses import quat_multiply
+from dexmani_real.robot.arm_worker import arm_loop
+from dexmani_real.robot.hand_worker import hand_loop
+from dexmani_real.runtime.safety import (
     SafetyState,
     advance_run_generation,
     require_transition,
     transition,
 )
-from dexmani_real.runtime.processes import WorkerSpec, build_processes, start_processes
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
-from dexmani_real.shm.shared_storage import (
-    SharedStorage,
-    SharedStorageConfig,
-    read_arm_state_dict,
-    read_hand_state_dict,
-)
+from dexmani_real.runtime.workers import WorkerSpec, build_processes, start_processes
 from dexmani_real.teleop.keyboard import GlobalKeyState, eef_delta_from_keys
-from dexmani_real.utils.hand_health import validate_arm_feedback, validate_hand_feedback
+from dexmani_real.utils.feedback import validate_arm_feedback, validate_hand_feedback
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.rate_manager import RateManager
+from dexmani_real.utils.rate import LoopRate
 
 logger = get_logger(__name__)
 
@@ -110,7 +108,7 @@ def _build_planner_and_gate(
 
 
 def _runtime_issue(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     arm_process: Any,
     hand_process: Any | None,
     *,
@@ -162,8 +160,8 @@ def _hand_feedback_issue(
     )
 
 
-def _read_initial_arm(
-    shared: SharedStorage, runtime: ResolvedRuntimeConfig
+def read_initial_arm(
+    shared: RuntimeChannels, runtime: ResolvedRuntimeConfig
 ) -> dict[str, Any] | None:
     deadline_s = time.monotonic() + float(runtime.safety.readiness_timeouts_s["arm"])
     while time.monotonic() < deadline_s:
@@ -171,6 +169,7 @@ def _read_initial_arm(
         if state is not None:
             issue = validate_arm_feedback(
                 connected=state["connected"],
+                error_code=state["error_code"],
                 state_valid=state["state_valid"],
                 source_monotonic_ns=state["source_monotonic_ns"],
                 now_monotonic_ns=time.monotonic_ns(),
@@ -185,7 +184,7 @@ def _read_initial_arm(
 
 
 def _start_workers(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     context: Any,
     processes: list[Any],
@@ -238,7 +237,9 @@ def _start_workers(
     return arm_process, hand_process, True
 
 
-def _set_fault(shared: SharedStorage, reason: str, *, estop: bool = False) -> None:
+def set_keyboard_fault(
+    shared: RuntimeChannels, reason: str, *, estop: bool = False
+) -> None:
     logger.error("Keyboard teleop fault: %s", reason)
     if estop:
         shared.estop_request.value = True
@@ -286,7 +287,7 @@ class _KeyboardPublishResult:
 
 
 def _read_keyboard_feedback(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     *,
     hand_enabled: bool,
@@ -305,6 +306,7 @@ def _read_keyboard_feedback(
     arm_qpos_rad = np.asarray(arm_state["qpos"], dtype=np.float64)
     arm_issue = validate_arm_feedback(
         connected=arm_state["connected"],
+        error_code=arm_state["error_code"],
         state_valid=arm_state["state_valid"],
         source_monotonic_ns=arm_state["source_monotonic_ns"],
         now_monotonic_ns=time.monotonic_ns(),
@@ -424,7 +426,7 @@ def _compute_keyboard_target_update(
 
 
 def _run_keyboard_home(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     planner: XArm7MotionPlanner,
     keys: GlobalKeyState,
@@ -487,11 +489,11 @@ def _run_keyboard_home(
         home_result = None
 
     if shared.estop_request.value:
-        _set_fault(shared, "operator e-stop during homing")
+        set_keyboard_fault(shared, "operator e-stop during homing")
         return None
-    refreshed = _read_initial_arm(shared, runtime)
+    refreshed = read_initial_arm(shared, runtime)
     if refreshed is None:
-        _set_fault(shared, "fresh arm feedback unavailable after homing")
+        set_keyboard_fault(shared, "fresh arm feedback unavailable after homing")
         return None
     if home_result is not None and not home_result.succeeded:
         logger.warning("Return-home request was not executed: %s", home_result.detail)
@@ -502,7 +504,7 @@ def _run_keyboard_home(
 
 
 def _publish_keyboard_target(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     planner: XArm7MotionPlanner,
     safety_gate: Any,
@@ -528,6 +530,7 @@ def _publish_keyboard_target(
         ik_result.qpos,
         prepare_timeout_s=float(runtime.policy.action_prepare_timeout_s),
         safety_gate=safety_gate,
+        arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
     )
     candidate = publish_result.candidate
@@ -543,7 +546,7 @@ def _publish_keyboard_target(
 
 
 def _run_control_loop(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     planner: XArm7MotionPlanner,
     safety_gate: Any,
@@ -554,9 +557,9 @@ def _run_control_loop(
     hand_enabled: bool,
 ) -> bool:
     """Run until Q (True) or a fault/e-stop (False)."""
-    state = _read_initial_arm(shared, runtime)
+    state = read_initial_arm(shared, runtime)
     if state is None:
-        _set_fault(shared, "initial arm feedback is unavailable or unhealthy")
+        set_keyboard_fault(shared, "initial arm feedback is unavailable or unhealthy")
         return False
 
     cfg = runtime.keyboard_teleop
@@ -569,7 +572,7 @@ def _run_control_loop(
     )
 
     heartbeat_timeouts = dict(runtime.safety.heartbeat_timeouts)
-    rate = RateManager(float(cfg.control_hz), label="keyboard_teleop")
+    rate = LoopRate(float(cfg.control_hz), label="keyboard_teleop")
     state_failures = 0
     home_key_down = False
     motion_active = False
@@ -590,10 +593,10 @@ def _run_control_loop(
         frame += 1
 
         if keys.is_pressed("esc"):
-            _set_fault(shared, "operator e-stop", estop=True)
+            set_keyboard_fault(shared, "operator e-stop", estop=True)
             return False
         if not keys.healthy:
-            _set_fault(shared, "keyboard listener exited", estop=True)
+            set_keyboard_fault(shared, "keyboard listener exited", estop=True)
             return False
 
         issue = _runtime_issue(
@@ -604,7 +607,7 @@ def _run_control_loop(
             heartbeat_timeouts_s=heartbeat_timeouts,
         )
         if issue is not None:
-            _set_fault(shared, issue)
+            set_keyboard_fault(shared, issue)
             return False
         quit_requested = keys.is_pressed("q")
         if quit_requested and not quit_quiesced:
@@ -619,11 +622,11 @@ def _run_control_loop(
         )
         if feedback.issue is not None:
             if not feedback.retryable:
-                _set_fault(shared, feedback.issue)
+                set_keyboard_fault(shared, feedback.issue)
                 return False
             state_failures += 1
             if state_failures >= int(policy.max_consecutive_errors):
-                _set_fault(shared, feedback.issue)
+                set_keyboard_fault(shared, feedback.issue)
                 return False
             continue
         state_failures = 0
@@ -777,7 +780,7 @@ def _run_control_loop(
 
 
 def _run_keyboard_session(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     context: Any,
     processes: list[Any],
@@ -805,7 +808,7 @@ def _run_keyboard_session(
         logger.error("A worker failed during startup")
         return False
 
-    initial_state = _read_initial_arm(shared, runtime)
+    initial_state = read_initial_arm(shared, runtime)
     if initial_state is None:
         logger.error("Initial arm feedback is unavailable or unhealthy")
         return False
@@ -867,15 +870,15 @@ def run_keyboard_experiment(
         return 2
     planner, safety_gate = _build_planner_and_gate(runtime)
     context = mp.get_context("spawn")
-    shared = SharedStorage.create(
+    shared = RuntimeChannels.create(
         prefix=f"dexmani_keyboard_{os.getpid()}",
-        config=SharedStorageConfig.from_runtime(runtime),
+        config=RuntimeChannelsConfig.from_runtime(runtime),
         mp_context=context,
     )
     processes: list[Any] = []
     keys = GlobalKeyState(
         suppress_echo=True,
-        estop_callback=lambda: _set_fault(
+        estop_callback=lambda: set_keyboard_fault(
             shared, "operator e-stop callback", estop=True
         ),
     )
@@ -895,10 +898,10 @@ def run_keyboard_experiment(
         exit_code = 0 if clean_exit else 1
     except KeyboardInterrupt:
         if int(shared.safety_state.value) != int(SafetyState.DISARMED):
-            _set_fault(shared, "KeyboardInterrupt")
+            set_keyboard_fault(shared, "KeyboardInterrupt")
         exit_code = 130
     except Exception:
-        _set_fault(shared, "unexpected main-process exception")
+        set_keyboard_fault(shared, "unexpected main-process exception")
         logger.error("Keyboard teleop failed", exc_info=True)
         exit_code = 1
     finally:
@@ -916,7 +919,7 @@ def run_keyboard_experiment(
                 )
             except RuntimeError:
                 logger.critical(
-                    "child process remains alive; leaving SharedStorage linked",
+                    "child process remains alive; leaving RuntimeChannels linked",
                     exc_info=True,
                 )
                 exit_code = 1
@@ -930,11 +933,11 @@ def run_keyboard_experiment(
         else:
             try:
                 if not shared.close():
-                    _set_fault(shared, "SharedStorage cleanup was incomplete")
+                    set_keyboard_fault(shared, "RuntimeChannels cleanup was incomplete")
                     exit_code = 1
             except Exception:
-                _set_fault(shared, "SharedStorage cleanup failed")
-                logger.error("SharedStorage cleanup failed", exc_info=True)
+                set_keyboard_fault(shared, "RuntimeChannels cleanup failed")
+                logger.error("RuntimeChannels cleanup failed", exc_info=True)
                 exit_code = 1
         try:
             if not keys.wait_for_release(timeout_s=2.0):

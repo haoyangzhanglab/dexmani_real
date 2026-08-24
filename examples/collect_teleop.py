@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Usage: ``python examples/collect_teleop.py [--config FILE]``.
+"""Run one hardware-affecting VR teleoperation and collection session.
 
-Run one VR teleoperation and data-collection session.
+The session can command xArm7/XHand and, unless disabled, records a raw episode.
 """
 
 from __future__ import annotations
@@ -11,7 +11,9 @@ import math
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import yaml
 

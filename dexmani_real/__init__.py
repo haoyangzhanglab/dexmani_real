@@ -1,18 +1,21 @@
-"""DexMani Real — dexterous manipulation robot teleoperation & data collection.
+"""DexMani Real — real-robot dexterous manipulation runtime.
 
 Subsystems:
-    robot/        — Hardware drivers (xArm7 arm, XHand) and execution workers
-    teleop/       — VR teleoperation (mapping, retargeting, control loop)
-    planning/     — FK/IK, kinematics, collision and path planning
-    policy/       — Action protocol and safety validation
-    recording/    — Episode recording, offline readers, and visualization
+    calibration/  — Camera and table calibration behavior
+    config/       — Defaults, validated runtime snapshots, and calibration data
+    control/      — Safety gates, command publication, and homing
+    data/         — Offline episode processing and dataset export
     deployment/   — Learned-policy deployment runtime
-    integrations/ — Model-repository adapters
-    runtime/      — Process lifecycle, supervision, shutdown
-    shm/          — Shared-memory data plane (rings, queues, storage)
-    sensor/       — Camera/VR input, point-cloud processing, calibration, diagnostics
-    config/       — Defaults, runtime snapshot, calibration
-    utils/        — Shared utilities (schema, limits, logging, arrays)
+    integrations/ — External model-repository adapters
+    ipc/          — Shared-memory schemas, rings, queues, and channels
+    planning/     — FK/IK, collision checking, and path planning
+    recording/    — Transactional episode recording and reading
+    replay/       — Safety-gated physical replay
+    robot/        — xArm7/XHand drivers and execution workers
+    runtime/      — Process lifecycle, supervision, and shutdown
+    sensor/       — Camera, VR, and point-cloud acquisition
+    teleop/       — VR/keyboard teleoperation and hand retargeting
+    utils/        — Small shared helpers without domain ownership
 """
 
 from __future__ import annotations
@@ -20,4 +23,8 @@ from __future__ import annotations
 from pathlib import Path
 
 PACKAGE_DIR = Path(__file__).parent.resolve()
-ASSET_DIR = (PACKAGE_DIR / "assets") if (PACKAGE_DIR / "assets").exists() else (PACKAGE_DIR.parent / "assets")
+ASSET_DIR = (
+    (PACKAGE_DIR / "assets")
+    if (PACKAGE_DIR / "assets").exists()
+    else (PACKAGE_DIR.parent / "assets")
+)

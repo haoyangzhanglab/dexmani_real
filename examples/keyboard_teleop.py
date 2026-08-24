@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Usage: ``python examples/keyboard_teleop.py [--config FILE] [--no-hand]``.
+"""Run a hardware-affecting keyboard teleoperation session.
 
-Run a keyboard teleoperation session.
+The session commands xArm7 and can also command XHand unless ``--no-hand`` is set.
 """
 
 from __future__ import annotations
@@ -10,7 +10,9 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import yaml
 

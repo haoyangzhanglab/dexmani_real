@@ -1,0 +1,8 @@
+{
+  "direct_defaults_imports": 21,
+  "forbidden_edges": 0,
+  "heavy_init_imports": 0,
+  "missing_internal_imports": 0,
+  "package_cycles": 0,
+  "private_imports": 0
+}

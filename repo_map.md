@@ -1,382 +1,279 @@
 # DexMani Real Repository Map
 
-本文件记录当前版本控制树中每个文件的主要职责，帮助开发者从入口快速找到 owner。
-运行行为仍以源码、schema 和配置为准；本文件不定义 API、数据格式或参数默认值。
+本文件是当前版本控制树的职责索引。运行行为以源码、schema 与配置为准；新增、删除、
+移动文件或改变主要职责时必须同步更新本文件。被 `.gitignore` 排除的 episode、dataset、
+replay result 与缓存不在清单中。
 
-维护规则：新增、删除、移动文件或改变文件的主要职责时，同步更新本文件。运行时生成且
-被 `.gitignore` 排除的 `episodes/`、`episodes_processed/`、`dataset/`、`replay_results/`
-等目录不属于本清单。
+## 1. 架构总览
 
-## 1. 顶层与 agent 配置
+```text
+device input ──> sensor workers ──> ipc.RuntimeChannels ──> teleop/deployment/replay
+hardware SDK <── robot workers <── control publication <── safety gate/action candidate
 
-| 文件 | 职责 |
+teleop sample ──> recording worker ──> raw episode
+raw episode ──> data process ──> processed HDF5 ──> data export ──> Policy Zarr
+```
+
+所有重要 mutable resource 只有一个 owner：SDK 只在对应 worker/driver 内，IPC allocation
+只在 `RuntimeChannels`，动作发布只在 `control/publication.py`，录制 transaction 只在
+recording worker/recorder。当前架构门禁要求 package cycle、禁用依赖边和跨模块私有 import
+均为零。
+
+## 2. 顶层文件
+
+| 文件 | 主要职责 |
 |---|---|
-| `.gitignore` | 排除虚拟环境产物、缓存、构建物、实验输出、episode、dataset 与本地 IDE 文件。 |
-| `.codex/config.toml` | 仓库本地 Codex sandbox、审批和网络访问默认设置。 |
-| `.claude/settings.local.json` | 当前机器的 Claude Code 权限白名单；包含本地路径和命令授权，不是运行时配置。 |
-| `.claude/skills/karpathy-guidelines/SKILL.md` | Claude Code 的小改动、显式假设和可验证目标工作指南。 |
-| `AGENTS.md` | 所有 coding agent 的仓库级工程、安全、范围与验收契约。 |
-| `CLAUDE.md` | Claude Code 的精简入口与执行清单，具体规则委托给 `AGENTS.md`。 |
-| `code_style.md` | 面向个人博士科研、数据采集和模型部署的具体编码风格与审查清单。 |
-| `README.md` | 面向使用者的能力概览、架构、环境、命令、配置和数据流说明。 |
-| `repo_map.md` | 当前逐文件职责索引。 |
-| `l515_camera_timing_known_limitation.md` | L515 RGB 降帧根因已确认（AE priority ON→60ms 曝光→16.7Hz）并已设 `auto_exposure_priority=0` 默认；记录 color/depth 曝光 skew 与 `native_color_projection` 语义、剩余噪声风险。 |
-| `user_design.md` | 使用者确认的遥操作与物理回放桌面碰撞、XHand 抓取过流行为取舍及其安全边界。 |
-| `pyproject.toml` | Python 包元数据、基础依赖、setuptools 包发现、内置 JSON 数据声明与 Black-compatible isort 配置。 |
-| `tests/robot/test_xhand_runtime.py` | 不连接硬件的 XHand fake-SDK 合同测试：单次 I/O、soft/hard read、机械 clip、stale publication 与 exact-target ACK。 |
+| `AGENTS.md` | 仓库级工程、安全、范围与验收契约。 |
+| `CLAUDE.md` | Claude Code 精简入口，具体规则委托给 `AGENTS.md`。 |
+| `code_style.md` | 本研究代码库的具体编码与审查约定。 |
+| `README.md` | 面向使用者的能力、架构、环境与工作流。 |
+| `repo_map.md` | 当前文件与 owner 索引。 |
+| `user_design.md` | 已确认的机器人行为与安全取舍。 |
+| `.gitignore` | 生成物、本地环境、数据集与运行输出排除规则。 |
+| `pyproject.toml` | 包元数据、依赖、package data 与工具配置。 |
 
-## 2. 运行时主路径
+## 3. `dexmani_real/`
 
-| 路径 | Owner 与数据流 |
+| 文件 | 主要职责 |
 |---|---|
-| 遥操作 | `examples/collect_teleop.py` → `teleop/session.py` → device workers + `teleop/loop.py` → operator controls / control grid → safety gate → command publication → command IPC。 |
-| 键盘控制 | `examples/keyboard_teleop.py` → `teleop/keyboard_session.py` → safety gate → command publication → arm/hand workers。 |
-| 策略部署 | `examples/run_policy.py` → `deployment/lifecycle.py` →（按 observation contract 可选 camera → latest-only pointcloud）→ inference worker → plan ring → coordinator → safety gate。 |
-| 录制 | teleop fixed-grid sample → `recording/recorder_client.py` → `EpisodeFrame` ownership-copy → RecorderIO / `EpisodeRecorder` transaction → `EpisodeDataWriter` data.h5 append + camera sidecars → finalize。 |
-| 回放 | `examples/replay_episode.py` → `robot/replay_trajectory.py` preflight → `robot/episode_replay.py` lifecycle → `robot/replay_controller.py` → safety gate / command publication → workers → `robot/replay_evaluation.py`。 |
-| 离线数据 | native RGB-D raw v21 → processed HDF5 v5 → Policy Zarr v3。 |
+| `__init__.py` | 包说明及 `PACKAGE_DIR`/`ASSET_DIR` 解析。 |
+| `robot_spec.py` | 机器人 DoF/shape、XHand joint order、URDF/SRDF canonical 路径。 |
 
-## 3. Python package
+### `config/`
 
-### `dexmani_real/`
-
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `dexmani_real/__init__.py` | 包说明，并解析 `PACKAGE_DIR` 与开发树/安装包两种布局下的 `ASSET_DIR`。 |
+| `__init__.py` | 配置子包出口。 |
+| `defaults.py` | arm、hand、policy、sensor 与 safety canonical defaults。 |
+| `runtime.py` | CLI > YAML > defaults 合并、校验、冻结与 SHA-256 identity。 |
+| `pointcloud.py` | 实时/离线共享的不可变点云策略与 identity。 |
+| `camera_calib.py` | 校验并冻结相机序列号绑定的外参快照与来源 hash。 |
+| `cameras.json` | 相机序列号、安装类型与外参。 |
+| `desk_plane.json` | 桌面平面与 provenance。 |
+| `vr_transform.json` | VR 到机器人坐标系的标定与质量信息。 |
 
-### `dexmani_real/config/`
+### `ipc/`
 
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `dexmani_real/config/__init__.py` | 配置子包公共导出。 |
-| `dexmani_real/config/defaults.py` | arm、hand、policy、VR、camera、pointcloud、retarget、安全与环境参数的 canonical dataclass 默认值。 |
-| `dexmani_real/config/pointcloud.py` | 实时、离线与诊断共享的不可变点云策略、校验及 SHA-256 身份。 |
-| `dexmani_real/config/runtime.py` | 按 CLI > YAML > defaults 合并并校验不可变运行时配置，生成 canonical 内容与 SHA-256。 |
-| `dexmani_real/config/camera_calib.py` | 加载按相机序列号绑定的 eye-to-hand/eye-in-hand 外参，并生成录制 metadata。 |
-| `dexmani_real/config/cameras.json` | 当前 RealSense 相机序列号、安装类型和外参标定。 |
-| `dexmani_real/config/vr_transform.json` | VR/HTS 坐标系到机器人坐标系的朝向标定和质量信息。 |
-| `dexmani_real/config/desk_plane.json` | 世界坐标系中的桌面平面方程与标定 provenance。 |
+| `__init__.py` | 轻量 IPC 子包标记。 |
+| `schema.py` | 稳定 NumPy wire dtype、record sample 与 point-cloud ABI。 |
+| `ring.py` | 通用 seqlock shared-memory ring。 |
+| `camera_ring.py` | 大尺寸 RGB-D shared-memory ring。 |
+| `causal.py` | 按 observation anchor 读取 arm/hand/tactile/VR/camera。 |
+| `channels.py` | `RuntimeChannels`：rings、queues、flags、heartbeat、readiness 的唯一 allocation owner。 |
 
-### `dexmani_real/shm/`
+### `runtime/`
 
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `dexmani_real/shm/__init__.py` | 共享内存子包标记。 |
-| `dexmani_real/shm/ring_buffer.py` | 基于 seqlock slot 的共享内存 latest/history ring，以及面向有界 FIFO consumer 的精确 sequence ownership-copy。 |
-| `dexmani_real/shm/camera_ring.py` | 针对大尺寸 RGB/depth 帧的共享内存 ring。 |
-| `dexmani_real/shm/causal_reader.py` | 按 observation anchor 做因果读取的 arm、hand、tactile、VR、camera helper。 |
-| `dexmani_real/shm/shared_storage.py` | 跨进程 data/control plane owner：typed rings、home queue、events、heartbeat、ready 与 safety state。 |
+| `__init__.py` | 轻量运行时子包标记。 |
+| `safety.py` | safety state、run generation 与合法状态转换。 |
+| `status.py` | worker/supervisor 共用的结构化退出原因。 |
+| `workers.py` | spawn-only worker spec、构建、启动与退出优先级。 |
+| `supervisor.py` | readiness、heartbeat、进程健康、摘要与 verified shutdown。 |
 
-### `dexmani_real/runtime/`
+### `robot/`
 
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `dexmani_real/runtime/__init__.py` | 运行时生命周期子包标记。 |
-| `dexmani_real/runtime/status.py` | supervisor 与 worker 共用的结构化退出原因枚举。 |
-| `dexmani_real/runtime/processes.py` | spawn-only worker spec、进程构建/启动、退出优先级和可验证 shutdown。 |
-| `dexmani_real/runtime/supervisor.py` | readiness 等待、heartbeat/进程健康监督、健康摘要和 shutdown 入口。 |
+| `__init__.py` | 轻量硬件子包标记。 |
+| `types.py` | 校验后的 `RobotState` 与 `RobotAction`。 |
+| `command_validation.py` | worker 在 SDK 调用前执行 generation/freshness/shape/expiry 复核。 |
+| `xarm7.py` | xArm Python SDK 的唯一 driver 边界。 |
+| `xhand.py` | XHand controller 的唯一 driver 边界。 |
+| `arm_worker.py` | xArm Mode-6 command/home consumer 与状态 publisher。 |
+| `hand_worker.py` | XHand latest-target servo、状态/触觉 publisher 与 fault latch。 |
 
-### `dexmani_real/robot/`
+### `sensor/`
 
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `dexmani_real/robot/__init__.py` | 机器人硬件子包标记。 |
-| `dexmani_real/robot/types.py` | `RobotState` 与 `RobotAction` 的 shape/finite 校验数据类型。 |
-| `dexmani_real/robot/safety.py` | 共享 robot safety state、run generation 及合法状态转换。 |
-| `dexmani_real/robot/command_validation.py` | arm/hand worker 在硬件调用前执行的 shape、finite、freshness、generation 与 expiry 复核。 |
-| `dexmani_real/robot/xarm7.py` | 唯一的 xArm Python SDK 驱动边界；连接、状态读取、模式切换、servo 与 homing。 |
-| `dexmani_real/robot/xhand.py` | XHand controller 驱动边界；startup retry、single-shot runtime read/send、joint-payload validity、software-only tactile bias 与 mechanical clip。 |
-| `dexmani_real/robot/arm_loop.py` | xArm7 Mode 6 arm worker；消费命令/home 请求并发布状态与执行反馈。 |
-| `dexmani_real/robot/hand_process.py` | XHand worker；single SDK owner，以 read→publish→measured-state bound→single send 的 latest-target servo 发布 fresh/stale fixed-grid feedback。 |
-| `dexmani_real/robot/homing.py` | 各入口共享的 typed arm-homing 合同、碰撞检查路径选择、请求等待与 abort 处理。 |
-| `dexmani_real/robot/episode_replay.py` | 真实机器人回放 session owner；负责 worker、safety transition、operator flow、评估调用与 cleanup。 |
-| `dexmani_real/robot/replay_controller.py` | preflight 后轨迹的 fixed-rate safety-gated 命令调度、反馈检查与 terminal outcome。 |
-| `dexmani_real/robot/replay_capture.py` | 回放期间 measured state、sent command 与 rejection provenance 的有界内存捕获。 |
-| `dexmani_real/robot/replay_trajectory.py` | raw replay trajectory 加载与 processed HDF5 v5 加载、hand-action requirement、provenance 与模型/几何 preflight。 |
-| `dexmani_real/robot/replay_evaluation.py` | 回放跟踪/一致性指标、报告和结果文件持久化。 |
+| `__init__.py` | 轻量传感器子包标记。 |
+| `camera_geometry.py` | native RGB-D intrinsics 与 `T_color_from_depth` 数据合同。 |
+| `clock_sync.py` | device clock 到 host monotonic 的保守映射。 |
+| `realsense.py` | RealSense driver、native frame ownership copy 与设备配置。 |
+| `camera_worker.py` | RealSense lifecycle、时序/健康信息与 camera ring 发布。 |
+| `pointcloud.py` | SDK-free native RGB-D 到 xArm-base 点云算法。 |
+| `pointcloud_worker.py` | latest-only 固定 `float32[N,6]` point-cloud publisher。 |
+| `vr_worker.py` | crash-isolated Quest/HTS receiver 与 VR ring publisher。 |
 
-### `dexmani_real/sensor/`
+### `calibration/`
 
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `dexmani_real/sensor/__init__.py` | 传感器子包标记。 |
-| `dexmani_real/sensor/camera_geometry.py` | 纯数据 native depth/color intrinsics 与 `T_color_from_depth` 合同。 |
-| `dexmani_real/sensor/realsense.py` | RealSense D400/L515 驱动；native RGB-D ownership copy、L515 preset 与分流时序；`auto_exposure_priority` 默认 OFF（0.0）以在暗场维持 30 Hz RGB。 |
-| `dexmani_real/sensor/camera_process.py` | RealSense worker；发布 native RGB-D、静态 geometry、时间映射、健康状态和 camera ring。 |
-| `dexmani_real/sensor/pointcloud.py` | SDK-free native depth/RGB 到 xArm-base 的 RAW 诊断链和固定生产点云链；生产链含局部支持、保守桌面裁减、均值体素、半径离群与确定性空间采样。 |
-| `dexmani_real/sensor/table_calibration.py` | 多帧桌面点的确定性水平面 RANSAC/最小二乘拟合及显式确认后的备份、原子发布与回读。 |
-| `dexmani_real/sensor/pointcloud_process.py` | latest-only realtime worker；从 camera ring 生成固定 `float32[N,6]` 并携来源时序发布到 pointcloud ring。 |
-| `dexmani_real/sensor/clock_sync.py` | device clock 到 host monotonic clock 的保守映射、reset 检测与相对 delivery-delay 诊断。 |
-| `dexmani_real/sensor/vr_receiver_process.py` | crash-isolated HTS/Quest 接收 worker 与 VR frame 发布。 |
-| `dexmani_real/sensor/camera_calibration.py` | ArUco 检测、eye-to-hand 求解、残差筛选与标定文件持久化；不打开设备或 GUI。 |
-| `dexmani_real/sensor/camera_calibration_control.py` | 标定用 arm feedback、运动状态、workspace clipping、gated publish、quit hold 与归位。 |
-| `dexmani_real/sensor/camera_calibration_session.py` | xArm7 + RealSense 标定 lifecycle 的 side-effect owner：设备、采样、GUI、交互与失败 cleanup。 |
+| `__init__.py` | 标定子包标记。 |
+| `table.py` | 桌面 RANSAC/最小二乘拟合与确认后的原子发布。 |
+| `camera/__init__.py` | 相机标定子包标记。 |
+| `camera/solver.py` | ArUco 检测、hand-eye 求解、残差筛选与标定持久化。 |
+| `camera/control.py` | 标定 arm state、workspace clipping、gated publish 与 homing。 |
+| `camera/session.py` | xArm/RealSense/GUI/采样 lifecycle 与失败 cleanup。 |
 
-### `dexmani_real/planning/`
+### `planning/`
 
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `dexmani_real/planning/__init__.py` | 运动规划子包标记。 |
-| `dexmani_real/planning/constants.py` | canonical URDF/SRDF 路径及 XHand SDK ↔ URDF 关节顺序映射。 |
-| `dexmani_real/planning/types.py` | Pose、IK/path result、collision 信息和 planner/profile 配置类型。 |
-| `dexmani_real/planning/pose_utils.py` | pose 合成/求逆/误差、quaternion、rotation matrix 与 rot6d 转换。 |
-| `dexmani_real/planning/kinematics.py` | 基于 Pinocchio 的 xArm7 FK、Jacobian 和 pose transform。 |
-| `dexmani_real/planning/hand_kinematics.py` | XHand FK 与 fingertip position helper。 |
-| `dexmani_real/planning/ik.py` | MPlib teleop position IK、确定性 seed 与 null-space 优化。 |
-| `dexmani_real/planning/ik_candidates.py` | IK candidate 生成、规范化、过滤、排序和选择。 |
-| `dexmani_real/planning/collision_model.py` | xArm7 + XHand Pinocchio collision model、自碰撞与环境碰撞检查。 |
-| `dexmani_real/planning/path_utils.py` | waypoint 插值、关节 wrap、densification 与 typed `ALREADY_HOME`/`SAFE`/`UNSAFE` home/band-alignment path 结果。 |
-| `dexmani_real/planning/planner.py` | MPlib motion-planner facade，组合 IK、路径与碰撞检查。 |
+| `__init__.py` | planner 与核心类型出口。 |
+| `types.py` | Pose、IK/path/collision result 与 planner profile。 |
+| `poses.py` | pose、quaternion、matrix 与 rot6d 纯运算。 |
+| `arm_fk.py` | xArm7 Pinocchio FK、Jacobian 与 pose transform。 |
+| `hand_fk.py` | XHand Pinocchio fingertip FK。 |
+| `ik.py` | MPlib position IK、seed 与 null-space 优化。 |
+| `candidates.py` | IK candidate 生成、过滤、规范化、排序与选择。 |
+| `collision.py` | xArm7+XHand 自碰撞、环境碰撞与 transition 检查。 |
+| `paths.py` | 插值、wrap、densification 与 typed home path 结果。 |
+| `planner.py` | 组合 IK、路径与 collision 的 motion-planner facade。 |
 
-### `dexmani_real/policy/`
+### `control/`
 
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `dexmani_real/policy/__init__.py` | 动作协议与安全子包标记。 |
-| `dexmani_real/policy/runtime.py` | backend-neutral `ActionCandidate` 合同及动作表示校验。 |
-| `dexmani_real/policy/safety.py` | 兼容性显式出口与 hand-home helper；具体边界由下列模块拥有。 |
-| `dexmani_real/policy/safety_gate.py` | `ActionCandidate` 的 representation、generation、joint-limit、delta-limit（拒绝不 clip）、arm/hand transition collision 与 workspace fail-closed 校验（delta/collision 为 opt-in）。 |
-| `dexmani_real/policy/command_publication.py` | controller 侧 runtime/feedback gate、candidate 序列化、arm/hand 发布与 acknowledgement。 |
-| `dexmani_real/policy/loop_timing.py` | teleop 固定控制网格的分阶段 timing 采集。 |
+| `__init__.py` | 轻量控制子包标记。 |
+| `action.py` | backend-neutral `ActionCandidate` 与 representation 校验。 |
+| `safety_gate.py` | generation、limits、delta、workspace 与 collision fail-closed gate。 |
+| `publication.py` | controller feedback/runtime gate、序列化、发布与 acknowledgement。 |
+| `arm_home.py` | collision-checked arm homing 合同、排队、等待与 abort。 |
+| `hand_home.py` | exact hand-home 发布与 worker acknowledgement。 |
 
-### `dexmani_real/teleop/`
+### `teleop/`
 
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `dexmani_real/teleop/__init__.py` | 遥操作子包标记。 |
-| `dexmani_real/teleop/config.py` | 从 resolved runtime 投影出的窄 `TeleopConfig` 与 command-limit 视图。 |
-| `dexmani_real/teleop/session.py` | VR teleop 主进程 owner：预检、SharedStorage、worker topology、readiness、监督与 cleanup。 |
-| `dexmani_real/teleop/loop.py` | VR teleop coordinator；构造资源、等待 readiness、调度 operator/control grid 并执行 cleanup；桌面不参与在线动作拒绝。 |
-| `dexmani_real/teleop/operator_controls.py` | BEGIN/pause/home/quit 信号、retargeter session 初始化及 bounded recording disposition。 |
-| `dexmani_real/teleop/control_grid.py` | 单个 causal grid 的 observation read/check、proposal、validate、publish 与 recording。 |
-| `dexmani_real/teleop/action_proposal.py` | 纯 EEF、hand 与 arm typed proposal 计算/限幅；不发布命令、不读 shared memory、不写录制。 |
-| `dexmani_real/teleop/keyboard_session.py` | 键盘 teleop lifecycle、typed feedback/publish 结果与实时控制流；桌面不参与在线动作拒绝。 |
-| `dexmani_real/teleop/keyboard.py` | pynput 全局快捷键、控制信号和键盘 EEF delta 计算。 |
-| `dexmani_real/teleop/control_state.py` | teleop coordinator mutable state、control directive 与确定性 command-quiescence 状态转换。 |
-| `dexmani_real/teleop/arm_mapper.py` | 将 VR wrist 相对运动映射为 robot-frame target EEF pose。 |
-| `dexmani_real/teleop/vr_transform.py` | VR heading 标定文件的 schema、质量等级与 rotation 校验。 |
-| `dexmani_real/teleop/camera_freshness.py` | 录制网格上的 camera frame freshness、duplicate、gap 与 generation 分类。 |
-| `dexmani_real/teleop/hand_control.py` | hand observation cache、retarget 状态和 hand command 生成 helper。 |
-| `dexmani_real/teleop/hand_retarget.py` | VR landmarks 到 XHand 的 TAG/DexPilot retarget facade、校验与状态管理。 |
-| `dexmani_real/teleop/dexpilot_prior.py` | 带 human-flexion prior 的 in-repo DexPilot optimizer wrapper。 |
-| `dexmani_real/teleop/episode_samples.py` | 从因果 snapshot 构造并发布 typed fixed-grid recording sample。 |
-| `dexmani_real/teleop/recording_session.py` | 退出时保存或丢弃 active recording 的有界操作者决策。 |
-| `dexmani_real/teleop/safety.py` | teleop pause/hold、re-anchor、contact guard 与 configured homing helper。 |
-| `dexmani_real/teleop/audio_feedback.py` | teleop 状态变化的非阻塞中文语音提示。 |
-| `dexmani_real/teleop/tag_retargeting/__init__.py` | in-repo TAG retargeting 子包标记。 |
-| `dexmani_real/teleop/tag_retargeting/optimizer.py` | 两阶段 NLopt TAG hand-retarget optimizer。 |
-| `dexmani_real/teleop/tag_retargeting/pin_grad.py` | Pinocchio hand-kinematics analytical gradient engine 与 fingertip frame 校验。 |
+| `__init__.py` | 遥操作子包标记。 |
+| `config.py` | 从 resolved runtime 投影的窄 teleop 配置。 |
+| `session.py` | VR teleop 主进程 owner、预检、worker topology 与 cleanup。 |
+| `loop.py` | coordinator 资源构造、readiness 与 operator/grid 调度。 |
+| `control_grid.py` | 单个 causal grid 的读取、proposal、gate、publish 与 sample。 |
+| `control_state.py` | coordinator mutable state 与 command-quiescence 转换。 |
+| `operator_controls.py` | BEGIN/pause/home/quit 与录制 disposition。 |
+| `keyboard.py` | 全局快捷键、control signal 与 EEF delta。 |
+| `keyboard_session.py` | 键盘 teleop lifecycle 与实时控制流。 |
+| `action_proposal.py` | 纯 EEF/arm/hand proposal 计算。 |
+| `arm_mapper.py` | VR wrist 相对运动到 robot-frame EEF target。 |
+| `hand_control.py` | hand observation cache、ramp 与 command helper。 |
+| `safety.py` | pause/hold、re-anchor、feedback guard 与 configured home。 |
+| `episode_samples.py` | 因果 snapshot 到 typed fixed-grid record sample。 |
+| `recording_session.py` | 退出时有界保存/丢弃决策。 |
+| `camera_freshness.py` | camera duplicate/gap/generation/freshness 分类。 |
+| `vr_transform.py` | VR heading 标定 schema 与 rotation 校验。 |
+| `timing.py` | 控制网格分阶段 timing 统计。 |
+| `audio_feedback.py` | 非阻塞操作者语音反馈。 |
+| `retarget/__init__.py` | retargeting 子包出口。 |
+| `retarget/facade.py` | TAG/DexPilot 统一 facade、校验与状态。 |
+| `retarget/dexpilot.py` | 带 human-flexion prior 的 DexPilot wrapper。 |
+| `retarget/tag_optimizer.py` | 两阶段 NLopt TAG optimizer。 |
+| `retarget/pin_grad.py` | Pinocchio analytical gradient engine。 |
 
-### `dexmani_real/recording/`
+### `recording/`
 
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `dexmani_real/recording/__init__.py` | 录制子包标记。 |
-| `dexmani_real/recording/episode_schema.py` | raw episode v21 dataset shape/dtype 与 native RGB-D provenance 合同。 |
-| `dexmani_real/recording/episode_frame.py` | shared-memory record/legacy inputs 到 immutable typed episode row 的唯一解码、schema shaping 与 ownership-copy 边界。 |
-| `dexmani_real/recording/timestamp_buffer.py` | 多速率输入到 fixed-grid row 的 timestamp 对齐、填充原因和容量管理。 |
-| `dexmani_real/recording/episode_recorder.py` | raw v21 `EpisodeFrame` 的 fixed-grid 对齐、事务式录制、质量汇总、sidecar 验证与原子发布。 |
-| `dexmani_real/recording/episode_data_writer.py` | 单个 `data.h5` handle、dataset append 与 flushed offset 的唯一 owner。 |
-| `dexmani_real/recording/camera_stream_writer.py` | grid-aligned RGB/depth 的有界后台 writer 与失败传播。 |
-| `dexmani_real/recording/video_codec.py` | PyAV RGB video encoder/decoder 与 codec 配置。 |
-| `dexmani_real/recording/recorder_client.py` | policy/teleop 侧 recorder control protocol、sample 发布和 stop result。 |
-| `dexmani_real/recording/io_process.py` | 独立 RecorderIO worker；`_RecorderIOSession` 按 sequence 连续取得未确认 sample、监控 backlog，拥有 active generation、episode transaction 与有界 finalize。 |
-| `dexmani_real/recording/transaction.py` | 同文件系统 fsync、atomic publish 和 atomic JSON helper。 |
-| `dexmani_real/recording/episode_reader.py` | published v21 episode 校验、HDF5 sidecar merged view 与 RGB/depth 读取。 |
+| `__init__.py` | `EpisodeReader`/`EpisodeRecorder` 等稳定公开 facade。 |
+| `schema.py` | raw episode v21 persisted schema。 |
+| `frame.py` | IPC record 到 immutable owned `EpisodeFrame` 的唯一 decode 边界。 |
+| `timeline.py` | 多速率输入到 fixed grid 的 timestamp 对齐与填充原因。 |
+| `recorder.py` | raw episode transaction、质量汇总、验证与原子发布。 |
+| `hdf5_writer.py` | 单个 `data.h5` handle、dataset append 与 offset owner。 |
+| `camera_writer.py` | RGB/depth sidecar 的有界后台 writer。 |
+| `video.py` | PyAV RGB 编解码与 codec 配置。 |
+| `client.py` | controller 侧 recorder protocol、sample publication 与 stop result。 |
+| `worker.py` | RecorderIO active generation、sequence continuity、transaction 与 finalize。 |
+| `reader.py` | published v21 校验、HDF5 merged view 与 RGB/depth 读取。 |
 
-### `dexmani_real/data_processing/`
+### `data/`
 
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `dexmani_real/data_processing/__init__.py` | 离线数据处理子包标记。 |
-| `dexmani_real/data_processing/contracts.py` | output profile、quality/bridge policy、processing config、annotation 与 decision 合同。 |
-| `dexmani_real/data_processing/quality.py` | 停滞、抖动、突变等 temporal quality 的纯函数审计。 |
-| `dexmani_real/data_processing/cleaning.py` | 将 raw flags、limits、annotations 与质量结果组合为保留/拒绝决策。 |
-| `dexmani_real/data_processing/transforms.py` | RGB、native depth 与 color intrinsics resize 的确定性数值变换。 |
-| `dexmani_real/data_processing/pipeline.py` | 逐 native raw v21 episode 生成 processed HDF5 v5；点云只派生一次，持久化算法/配置/桌面身份，并事务式验证、发布整批。 |
-| `dexmani_real/data_processing/zarr_export.py` | 校验同任务 processed HDF5 的 schema 与统一点云身份，并事务式导出最小 Policy Zarr v3。 |
+| `__init__.py` | 轻量离线数据子包标记。 |
+| `contracts.py` | output/quality/bridge policy、processing config 与 decision。 |
+| `quality.py` | 停滞、抖动、突变等 temporal quality 纯函数审计。 |
+| `clean.py` | raw flags、limits、annotations 与质量结果到保留/拒绝决定。 |
+| `transforms.py` | RGB/depth/intrinsics 的确定性数值变换。 |
+| `process.py` | raw v21 到 processed HDF5 v5 的事务式管线。 |
+| `export.py` | processed HDF5 到 Policy Zarr v3 的事务式导出。 |
 
-### `dexmani_real/deployment/`
+### `deployment/`
 
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `dexmani_real/deployment/__init__.py` | learned-policy 部署子包标记。 |
-| `dexmani_real/deployment/contracts.py` | inference context、joint/EE action chunk（`arm_qpos` XOR `ee_pos`/`ee_rot6d`）与 `PolicyRuntime` protocol（load/predict/reset_episode）。 |
-| `dexmani_real/deployment/config.py` | deployment YAML/CLI 合并、点云 N/类型校验、`action_key`/`replan_stride_steps`/`use_ema`/`first_command_timeout_s`、required target 校验与 SHA-256 identity。 |
-| `dexmani_real/deployment/manifest.py` | `DeploymentManifest`（checkpoint train_params + config.yaml + real 侧组装）、`manifest_from_sources` 与 `validate_manifest_against_deployment`（domain==real、hand/点云/stride 一致性，fail-closed）。 |
-| `dexmani_real/deployment/observation.py` | 因果、不可变 arm/hand/tactile history windows、最新点云帧 + `pointcloud_history` 与 observation batch。 |
-| `dexmani_real/deployment/worker.py` | inference worker：`module:symbol` `PolicyRuntime` factory 惰性加载、读取并校验因果历史（arm/hand source-age 上界 + 点云 T 历史 + camera_generation 一致性）、`predict` 并发布 plan。 |
-| `dexmani_real/deployment/coordinator.py` | learned-policy 唯一 command producer；ARMED/RUNNING 状态机、active/pending plan + `replan_stride_steps` 调度、EE→IK 分派、first-command/命令静默 watchdog、通过 delta/collision 安全门发布。 |
-| `dexmani_real/deployment/lifecycle.py` | policy worker topology、SharedStorage、readiness、ARMED、operator 线程、supervision、verified shutdown 与启动 provenance 日志（含文件 SHA-256）。 |
-| `dexmani_real/deployment/operator.py` | 键盘后台线程 B/S/H/Q/ESC → 共享请求 flag，及 H 的碰撞检查归位编排（主进程 hand-dof+table planner）。 |
-| `dexmani_real/deployment/metrics.py` | inference/coordinator 计数、reject 分类和周期性日志。 |
-| `dexmani_real/deployment/fake.py` | CPU-only、无 torch、确定性的 `FakePolicyRuntime`，用于离线验证协议链路。 |
+| `__init__.py` | learned-policy 部署子包标记。 |
+| `contracts.py` | inference context、action chunk 与 `PolicyRuntime` protocol。 |
+| `config.py` | deployment YAML/CLI、target 与 point-cloud contract 校验。 |
+| `manifest.py` | checkpoint/config/runtime manifest 组装与 fail-closed 一致性检查。 |
+| `observation.py` | 因果不可变 arm/hand/tactile/pointcloud history batch。 |
+| `worker.py` | runtime factory 惰性加载、observation 校验、predict 与 plan 发布。 |
+| `coordinator.py` | learned-policy 唯一 command producer、plan scheduling 与 watchdog。 |
+| `lifecycle.py` | worker topology、readiness、supervision 与 verified shutdown。 |
+| `operator.py` | B/S/H/Q/ESC 请求及 collision-checked homing 编排。 |
+| `metrics.py` | inference/coordinator 指标与 reject 分类。 |
+| `fake.py` | CPU-only deterministic fake runtime。 |
 
-### `dexmani_real/integrations/`
+### `replay/`
 
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `dexmani_real/integrations/__init__.py` | 外部模型仓库集成子包标记。 |
-| `dexmani_real/integrations/dexmani_policy.py` | `dexmani_policy` 的 `PolicyRuntime`（懒加载 Hydra/OmegaConf + `load_ckpt_for_inference` + `predict_action`）、`[1,n_obs,19]` joint_state / `[1,n_obs,N,6]` 点云编码、manifest 组装与 joint/EE（pos3‖rot6d6‖hand12）fail-closed 解码。 |
+| `__init__.py` | 轻量回放子包标记。 |
+| `trajectory.py` | raw/processed trajectory 加载、provenance 与模型 preflight。 |
+| `controller.py` | fixed-rate safety-gated physical replay 调度。 |
+| `capture.py` | measured state、sent command 与 rejection 的有界捕获。 |
+| `evaluation.py` | tracking/consistency 指标与结果持久化。 |
+| `session.py` | worker、safety transition、operator flow、评估与 cleanup owner。 |
 
-### `dexmani_real/utils/`
+### `integrations/` 与 `utils/`
 
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `dexmani_real/utils/__init__.py` | 通用工具子包标记。 |
-| `dexmani_real/utils/schema.py` | cross-process NumPy dtype、固定点云 N/shape、field size、recording sample dtype 与 NaN array 构造的 canonical 定义。 |
-| `dexmani_real/utils/limits.py` | XHand mechanical/command/home limit 层级一致性校验。 |
-| `dexmani_real/utils/hand_health.py` | teleop、replay、deployment 共用的 arm/hand feedback freshness 与 finite 健康判断。 |
-| `dexmani_real/utils/serialization.py` | dataclass 从 mapping 递归恢复的共享 helper。 |
-| `dexmani_real/utils/signal_utils.py` | Cartesian pose EMA 与 quaternion-aware 平滑。 |
-| `dexmani_real/utils/rate_manager.py` | 可选精确忙等的 absolute-deadline rate limiting 与 overrun 统计。 |
-| `dexmani_real/utils/retry.py` | consecutive-event 计数与阈值升级。 |
-| `dexmani_real/utils/log.py` | 中央 logging、native stdout capture、diagnostic 提取与 throttled warning。 |
+| `integrations/__init__.py` | 外部集成子包标记。 |
+| `integrations/dexmani_policy.py` | 外部 `dexmani_policy` runtime 与 manifest adapter。 |
+| `utils/__init__.py` | 轻量通用工具子包标记。 |
+| `utils/atomic_io.py` | fsync、atomic publish 与 atomic JSON。 |
+| `utils/feedback.py` | arm/hand feedback freshness、finite 与 health predicate。 |
+| `utils/limits.py` | XHand rated/mechanical/command limit nesting。 |
+| `utils/log.py` | logging、native stdout capture 与 throttled warning。 |
+| `utils/rate.py` | absolute-deadline `LoopRate` 与 overrun 统计。 |
+| `utils/serialization.py` | dataclass mapping 恢复 helper。 |
+| `utils/smoothing.py` | quaternion-aware Cartesian pose EMA。 |
 
 ## 4. 可执行入口
 
-`examples/` 中的文件是薄入口或自包含的诊断/可视化/离线分析程序，不是自动化测试。
-除纯 `--help`、`--print-config` 和明确的离线数据命令外，均应按可能影响硬件处理。
+`examples/` 是薄入口或诊断程序，不是测试；除明确离线工具外均按可能影响硬件处理。
 
-| 文件 | 职责 |
+| 文件 | 主要职责 |
 |---|---|
-| `examples/collect_teleop.py` | 解析 runtime overrides、task/operator/no-hand/no-record，并启动 VR teleop 数据采集。 |
-| `examples/keyboard_teleop.py` | 解析 runtime config 和 no-hand 确认，并启动 keyboard teleop。 |
-| `examples/run_policy.py` | 解析 runtime/deployment config、runtime target、checkpoint、点云 N、`--action-key`/`--replan-stride-steps`/`--observation-fields`，并启动 policy deployment。 |
-| `examples/replay_episode.py` | 加载 raw episode 或（`--processed`）processed HDF5 v5、解析 replay runtime、显示 provenance，并启动真实机器人回放。 |
-| `examples/process_episodes.py` | raw → processed HDF5 离线处理 CLI：选择标准点云 N、逐 episode 审计进度（tqdm）、损坏 episode 自动跳过与 JSON report；管线在 `data_processing/`。 |
-| `examples/export_policy_zarr.py` | processed HDF5 → Policy Zarr 离线导出 CLI：argparse 与 JSON report；导出事务在 `data_processing/zarr_export.py`。 |
-| `examples/visualize_episode.py` | 自包含 Rerun raw-episode 可视化（离线、不连硬件）：metadata、robot state 与实际存储的 camera 数据；不合成点云。 |
-| `examples/visualize_episode_processed.py` | 自包含 Rerun processed-HDF5-v5 可视化（离线、不连硬件）：校验并显示文件内 native-derived rgb/depth、固定 `(N,6)` xArm-base 点云、joint/action/触觉时间序列。 |
-| `examples/calibrate_camera.py` | xArm7 + RealSense eye-to-hand ArUco 标定入口。 |
-| `examples/calibrate_vr_heading.py` | 收集 HTS head/wrist orientation、评估质量并原子更新 VR transform。 |
-| `examples/inspect_l515.py` | L515 native RGB-D 几何、option readback、跨流时序与 Z16 场景基线采集；只连接相机，无 GUI，不写标定。 |
-| `examples/diagnose_l515_rgb_timing.py` | L515 低开销 non-mutating camera-control RGB/D 流时序诊断：frame number、device timestamp、per-frame metadata 与 color option readback；只连接相机，不写 option。 |
-| `examples/run_l515_timing_suite.py` | 批量串联 guide §29 诊断套件（3×RGB-D + 3×color-only）：仅以 subprocess 启动 diagnose_l515_rgb_timing.py，自身不连相机；每 run 一行摘要，结尾写自描述 `suite_summary.json` 聚合清单；`--dry-run` 预览命令。 |
-| `examples/run_l515_ablation.py` | guide §32 Branch A controlled ablation（Auto-Exposure Priority ON→OFF）：唯一会 `set_option(auto_exposure_priority)` 的 mutating 工具；短暂 color 流中改值→以 subprocess 跑 timing suite（独立输出根）→finally 无条件恢复优先级并回读校验→写 `ablation_summary.json`（含 precondition/validity 交叉核对/可选 baseline 对比）；`--dry-run` 不碰硬件。 |
-| `examples/check_l515_native_shadow.py` | 离线读取带 RGB 的 L515 inspection capture，以标准 N 运行 native xArm-base 点云与 RGB projection shadow gate。 |
-| `examples/realsense_record_example.py` | 交互式 RealSense RGB-D + 点云诊断（cv2/Open3D GUI）：`s` 显式切换完整 RAW / canonical 处理点云，另提供诊断体素、裁减、冻结、重置和性能 HUD。 |
-| `examples/pointcloud_process_example.py` | L515 桌面点云 + 深度诊断（cv2/Open3D GUI，分阶段耗时）；每次提示清空桌面后用 5 帧拟合，本次立即使用，输入 `y` 后才备份并原子发布共享标定。 |
-| `examples/xhand_control_example.py` | XHand 独立连接、状态/触觉读取和 preset command 交互诊断。 |
+| `collect_teleop.py` | VR teleop 数据采集入口。 |
+| `keyboard_teleop.py` | keyboard teleop 入口。 |
+| `run_policy.py` | learned-policy deployment 入口。 |
+| `replay_episode.py` | 物理回放入口。 |
+| `process_episodes.py` | raw → processed HDF5 离线处理。 |
+| `export_policy_zarr.py` | processed HDF5 → Policy Zarr 离线导出。 |
+| `visualize_episode.py` | raw episode 离线可视化。 |
+| `visualize_episode_processed.py` | processed episode 离线可视化。 |
+| `calibrate_camera.py` | xArm+RealSense hand-eye 标定入口。 |
+| `calibrate_vr_heading.py` | VR heading 采集、质量门禁与 transform 发布。 |
+| `realsense_record_example.py` | RealSense RGB-D/point-cloud 交互诊断。 |
+| `pointcloud_process_example.py` | L515 桌面点云诊断与显式确认后的 plane 发布。 |
+| `xhand_control_example.py` | 使用 canonical hand 限位的 XHand 独立硬件诊断。 |
 
-## 5. Retargeting 与语音资源
+## 5. 离线验证与架构门禁
 
-| 文件 | 职责 |
+| 路径 | 主要职责 |
 |---|---|
-| `assets/retargeting/xhand_right_dexpilot.yml` | DexPilot 的 XHand URDF、wrist/tip link、target joint、scale 与 filter 参数。 |
-| `assets/audio/准备退出遥操作.wav` | 进入退出确认时的语音提示。 |
-| `assets/audio/即将回到初始姿态.wav` | 开始回到 home 前的语音提示。 |
-| `assets/audio/工作继续.wav` | 暂停后恢复工作的语音提示。 |
-| `assets/audio/已经回到初始姿态.wav` | homing 完成后的语音提示。 |
-| `assets/audio/已退出，是否需要保存轨迹.wav` | 退出后询问是否保存 episode 的语音提示。 |
-| `assets/audio/意外的事情出现了.wav` | fault/异常路径的语音提示。 |
-| `assets/audio/成功保存轨迹.wav` | episode 成功发布后的语音提示。 |
-| `assets/audio/操作暂停.wav` | teleop 进入暂停状态的语音提示。 |
-| `assets/audio/操作结束.wav` | 操作正常结束的语音提示。 |
-| `assets/audio/放弃保存轨迹.wav` | 操作者丢弃本次 recording 的语音提示。 |
-| `assets/audio/轴向已标定.wav` | VR heading/axis 标定成功的语音提示。 |
-| `assets/audio/遥操作启动.wav` | teleop session 启动的语音提示。 |
+| `tools/check_architecture.py` | AST-only package cycle、forbidden edge、private import、defaults 与 heavy-init 门禁。 |
+| `tests/architecture/` | 架构指标 ratchet 与主要运行入口/公开 API import smoke test。 |
+| `tests/config/` | immutable runtime/calibration snapshot、spawn pickle 只读性与配置传播。 |
+| `tests/control/` | fail-closed feedback health/publication。 |
+| `tests/examples/` | 可执行入口的离线生命周期与非关键反馈降级测试。 |
+| `tests/ipc/` | ABI manifest、ring exact dtype/shape 与重复共享内存名称的 fail-closed 门禁。 |
+| `tests/planning/` | collision/SRDF fail-closed 行为。 |
+| `tests/recording/` | raw/processed/Zarr schema contract。 |
+| `tests/fixtures/contracts/` | 冻结的 architecture、IPC ABI 与 storage schema manifest。 |
 
-## 6. 机器人模型资源
+## 6. 静态资源
 
-### xArm7 模型
+- `assets/robots/xarm7/`：xArm7 URDF、SRDF 与 visual/collision meshes。
+- `assets/robots/xhand/`：xArm7+XHand/standalone XHand URDF、SRDF 与 meshes。
+- `assets/retargeting/`：DexPilot XHand 配置。
+- `assets/audio/`：teleop 中文状态提示音。
 
-| 文件 | 职责 |
-|---|---|
-| `assets/robots/xarm7/xarm7_glb.urdf` | 独立 7-DoF xArm7 kinematic/visual/collision 模型。 |
-| `assets/robots/xarm7/xarm7_glb_mplib.srdf` | 独立 xArm7 的 MPlib self-collision disable pairs。 |
-
-### xArm7 collision meshes
-
-这些 OBJ 是 URDF 中 base/link1–link7 的简化碰撞几何。
-
-| 文件 | 对应 link |
-|---|---|
-| `assets/robots/xarm7/meshes/collision/link_base.obj` | xArm7 base。 |
-| `assets/robots/xarm7/meshes/collision/link1.obj` | xArm7 link1。 |
-| `assets/robots/xarm7/meshes/collision/link2.obj` | xArm7 link2。 |
-| `assets/robots/xarm7/meshes/collision/link3.obj` | xArm7 link3。 |
-| `assets/robots/xarm7/meshes/collision/link4.obj` | xArm7 link4。 |
-| `assets/robots/xarm7/meshes/collision/link5.obj` | xArm7 link5。 |
-| `assets/robots/xarm7/meshes/collision/link6.obj` | xArm7 link6。 |
-| `assets/robots/xarm7/meshes/collision/link7.obj` | xArm7 link7。 |
-
-### xArm7 visual meshes
-
-每个 link 的 GLB 是当前 URDF 使用的 visual mesh；OBJ 是同一 visual geometry 的
-通用格式版本，MTL 是对应 OBJ 的材质 sidecar。
-
-| 文件 | 职责 |
-|---|---|
-| `assets/robots/xarm7/meshes/visual/link_base.glb` | base GLB visual。 |
-| `assets/robots/xarm7/meshes/visual/link_base.obj` | base OBJ visual。 |
-| `assets/robots/xarm7/meshes/visual/link_base.mtl` | base OBJ material。 |
-| `assets/robots/xarm7/meshes/visual/link1.glb` | link1 GLB visual。 |
-| `assets/robots/xarm7/meshes/visual/link1.obj` | link1 OBJ visual。 |
-| `assets/robots/xarm7/meshes/visual/link1.mtl` | link1 OBJ material。 |
-| `assets/robots/xarm7/meshes/visual/link2.glb` | link2 GLB visual。 |
-| `assets/robots/xarm7/meshes/visual/link2.obj` | link2 OBJ visual。 |
-| `assets/robots/xarm7/meshes/visual/link2.mtl` | link2 OBJ material。 |
-| `assets/robots/xarm7/meshes/visual/link3.glb` | link3 GLB visual。 |
-| `assets/robots/xarm7/meshes/visual/link3.obj` | link3 OBJ visual。 |
-| `assets/robots/xarm7/meshes/visual/link3.mtl` | link3 OBJ material。 |
-| `assets/robots/xarm7/meshes/visual/link4.glb` | link4 GLB visual。 |
-| `assets/robots/xarm7/meshes/visual/link4.obj` | link4 OBJ visual。 |
-| `assets/robots/xarm7/meshes/visual/link4.mtl` | link4 OBJ material。 |
-| `assets/robots/xarm7/meshes/visual/link5.glb` | link5 GLB visual。 |
-| `assets/robots/xarm7/meshes/visual/link5.obj` | link5 OBJ visual。 |
-| `assets/robots/xarm7/meshes/visual/link5.mtl` | link5 OBJ material。 |
-| `assets/robots/xarm7/meshes/visual/link6.glb` | link6 GLB visual。 |
-| `assets/robots/xarm7/meshes/visual/link6.obj` | link6 OBJ visual。 |
-| `assets/robots/xarm7/meshes/visual/link6.mtl` | link6 OBJ material。 |
-| `assets/robots/xarm7/meshes/visual/link7.glb` | link7 GLB visual。 |
-| `assets/robots/xarm7/meshes/visual/link7.obj` | link7 OBJ visual。 |
-| `assets/robots/xarm7/meshes/visual/link7.mtl` | link7 OBJ material。 |
-
-### xArm7 + XHand / standalone XHand models
-
-| 文件 | 职责 |
-|---|---|
-| `assets/robots/xhand/xarm7_xhand_right.urdf` | 完整 19-DoF arm + right-hand 模型，用于 FK、碰撞与 provenance。 |
-| `assets/robots/xhand/xarm7_xhand_collision.urdf` | XHand 固定在 open/home 几何的 arm planning collision 模型。 |
-| `assets/robots/xhand/xarm7_xhand.srdf` | 完整 arm-hand 模型的 self-collision disable pairs。 |
-| `assets/robots/xhand/xhand_right.urdf` | standalone 12-DoF XHand 模型，用于 retarget 与 hand kinematics。 |
-
-### XHand STL meshes
-
-这些文件分别提供 `xhand_right.urdf` 和组合 URDF 中对应 link 的 visual/collision
-geometry。
-
-| 文件 | 对应 link/部件 |
-|---|---|
-| `assets/robots/xhand/meshes/flange.STL` | xArm-to-XHand flange。 |
-| `assets/robots/xhand/meshes/right_hand_link.STL` | 手掌主 link。 |
-| `assets/robots/xhand/meshes/right_hand_back_link.STL` | 手背 link。 |
-| `assets/robots/xhand/meshes/right_hand_ee_link.STL` | hand end-effector reference link。 |
-| `assets/robots/xhand/meshes/right_hand_thumb_bend_link.STL` | 拇指 bend link。 |
-| `assets/robots/xhand/meshes/right_hand_thumb_rota_link1.STL` | 拇指 rotation link1。 |
-| `assets/robots/xhand/meshes/right_hand_thumb_rota_link2.STL` | 拇指 rotation link2。 |
-| `assets/robots/xhand/meshes/right_hand_thumb_rota_tip.STL` | 拇指 fingertip。 |
-| `assets/robots/xhand/meshes/right_hand_thumb_rotaback_link1.STL` | 拇指 rear/support link1。 |
-| `assets/robots/xhand/meshes/right_hand_thumb_rotaback_link2.STL` | 拇指 rear/support link2。 |
-| `assets/robots/xhand/meshes/right_hand_index_bend_link.STL` | 食指 bend link。 |
-| `assets/robots/xhand/meshes/right_hand_index_rota_link1.STL` | 食指 rotation link1。 |
-| `assets/robots/xhand/meshes/right_hand_index_rota_link2.STL` | 食指 rotation link2。 |
-| `assets/robots/xhand/meshes/right_hand_index_rota_tip.STL` | 食指 fingertip。 |
-| `assets/robots/xhand/meshes/right_hand_index_rotaback_link1.STL` | 食指 rear/support link1。 |
-| `assets/robots/xhand/meshes/right_hand_index_rotaback_link2.STL` | 食指 rear/support link2。 |
-| `assets/robots/xhand/meshes/right_hand_mid_link1.STL` | 中指 link1。 |
-| `assets/robots/xhand/meshes/right_hand_mid_link2.STL` | 中指 link2。 |
-| `assets/robots/xhand/meshes/right_hand_mid_tip.STL` | 中指 fingertip。 |
-| `assets/robots/xhand/meshes/right_hand_midback_link1.STL` | 中指 rear/support link1。 |
-| `assets/robots/xhand/meshes/right_hand_midback_link2.STL` | 中指 rear/support link2。 |
-| `assets/robots/xhand/meshes/right_hand_ring_link1.STL` | 无名指 link1。 |
-| `assets/robots/xhand/meshes/right_hand_ring_link2.STL` | 无名指 link2。 |
-| `assets/robots/xhand/meshes/right_hand_ring_tip.STL` | 无名指 fingertip。 |
-| `assets/robots/xhand/meshes/right_hand_ringback_link1.STL` | 无名指 rear/support link1。 |
-| `assets/robots/xhand/meshes/right_hand_ringback_link2.STL` | 无名指 rear/support link2。 |
-| `assets/robots/xhand/meshes/right_hand_pinky_link1.STL` | 小指 link1。 |
-| `assets/robots/xhand/meshes/right_hand_pinky_link2.STL` | 小指 link2。 |
-| `assets/robots/xhand/meshes/right_hand_pinky_tip.STL` | 小指 fingertip。 |
-| `assets/robots/xhand/meshes/right_hand_pinkyback_link1.STL` | 小指 rear/support link1。 |
-| `assets/robots/xhand/meshes/right_hand_pinkyback_link2.STL` | 小指 rear/support link2。 |
+模型与标定资源路径必须通过 `robot_spec.py` 或 canonical config 解析，不在 worker、
+entry script 或文档中复制第二份默认值。

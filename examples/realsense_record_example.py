@@ -35,7 +35,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import cv2
 import numpy as np
@@ -475,17 +477,19 @@ def _toggle_cmap(state: PointCloudDisplayState) -> None:
     print(f"  Colormap: {state.colormap}")
 
 
-def _compute_base_from_depth(geometry: RGBDGeometry, serial: str | None) -> np.ndarray:
+def _compute_base_from_depth(
+    geometry: RGBDGeometry,
+    serial: str | None,
+    calibration: CameraCalib,
+) -> np.ndarray:
     """Return T_xarm_base_from_depth from calibration and live geometry.
 
-    Same wiring as ``examples/check_l515_native_shadow.py``: resolve the
-    calibration entry by serial, then compose the static camera extrinsic with
-    the live depth->color transform. Assumes an eye-to-hand camera (a static
-    extrinsic); an eye-in-hand entry would additionally need the live eef FK.
+    Resolve the calibration entry by serial, then compose the static camera
+    extrinsic with the live depth->color transform. Assumes an eye-to-hand
+    camera; an eye-in-hand entry would additionally need the live EEF FK.
     """
     if not serial:
         raise RuntimeError("connected camera did not publish a serial")
-    calibration = CameraCalib()
     camera_name = calibration.resolve_name_by_serial(serial)
     base_from_color = calibration.get_extrinsics(camera_name)
     return base_from_color @ geometry.T_color_from_depth
@@ -543,7 +547,14 @@ def _toggle_ae_priority(camera: RealSense) -> None:
     print(f"  auto_exposure_priority: {current:g} -> {readback:g}  [{label}]")
 
 
-def _run_rgbd_test(camera: RealSense, test_cfg: RealSenseDiagnosticConfig) -> dict:
+def _run_rgbd_test(
+    camera: RealSense,
+    test_cfg: RealSenseDiagnosticConfig,
+    *,
+    production: PointCloudConfig,
+    table_plane_abcd: tuple[float, float, float, float] | None,
+    calibration: CameraCalib,
+) -> dict:
     """Run interactive RGB-D live capture + point cloud visualization."""
     print("\n-- 2. RGB-D live capture + point cloud --")
     print(
@@ -551,10 +562,6 @@ def _run_rgbd_test(camera: RealSense, test_cfg: RealSenseDiagnosticConfig) -> di
         "r=reset  c=config  d=colormap  a=AE-priority"
     )
 
-    runtime = resolve_runtime_config()
-    production = runtime.pointcloud
-    table = runtime.environment.table
-    table_plane_abcd = table.plane_abcd if table.enabled else None
     state = PointCloudDisplayState(voxel_size_m=production.voxel_size_m)
     viewer = NonBlockingPCDViewer(point_size=3.0)
     stats_history: deque[FrameStats] = deque(maxlen=test_cfg.stats_window)
@@ -563,7 +570,9 @@ def _run_rgbd_test(camera: RealSense, test_cfg: RealSenseDiagnosticConfig) -> di
 
     geometry = camera.get_geometry()
     depth_scale_m = camera.get_depth_scale()
-    base_from_depth = _compute_base_from_depth(geometry, camera.active_serial)
+    base_from_depth = _compute_base_from_depth(
+        geometry, camera.active_serial, calibration
+    )
     pcd_config = _make_pcd_config(state, production)
     print(
         f"  Start: num_points={pcd_config.num_points}  "
@@ -715,6 +724,13 @@ def main() -> int:
     """Run the hardware diagnostic and return a process exit status."""
     test_cfg = RealSenseDiagnosticConfig()
 
+    # Validate policy and calibration files before enumerating or opening a camera.
+    runtime = resolve_runtime_config()
+    production = runtime.pointcloud
+    table = runtime.environment.table
+    table_plane_abcd = table.plane_abcd if table.enabled else None
+    calibration = CameraCalib()
+
     print("=" * 60)
     print("RealSense Test -- RGB-D Live Capture + Real-time Point Cloud")
     print("=" * 60)
@@ -769,7 +785,13 @@ def main() -> int:
 
     result: dict = {}
     try:
-        result = _run_rgbd_test(camera, test_cfg)
+        result = _run_rgbd_test(
+            camera,
+            test_cfg,
+            production=production,
+            table_plane_abcd=table_plane_abcd,
+            calibration=calibration,
+        )
     finally:
         if original_priority is not None:
             try:

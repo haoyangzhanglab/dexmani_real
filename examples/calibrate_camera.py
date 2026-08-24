@@ -7,17 +7,21 @@ ENTER.  ``--hand-geometry`` is a physical collision-model assertion: use
 mounted hand is physically fixed at its configured home pose.
 """
 
+from __future__ import annotations
+
 import argparse
 import sys
 from pathlib import Path
 
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
+from dexmani_real.calibration.camera.session import run_camera_calibration
+from dexmani_real.calibration.camera.solver import ARUCO_DICT_NAME, ArucoConfig
 from dexmani_real.config.runtime import resolve_runtime_config
-from dexmani_real.sensor.camera_calibration import ARUCO_DICT_NAME, ArucoConfig
-from dexmani_real.sensor.camera_calibration_session import run_camera_calibration
 
 
 def main(argv: list[str] | None = None) -> int:

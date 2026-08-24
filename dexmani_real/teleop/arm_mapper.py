@@ -8,7 +8,7 @@ import numpy as np
 from transforms3d.axangles import axangle2mat, mat2axangle
 from transforms3d.quaternions import mat2quat, quat2mat
 
-from dexmani_real.planning.pose_utils import normalize_quat_wxyz
+from dexmani_real.planning.poses import normalize_quat_wxyz
 from dexmani_real.teleop.vr_transform import validate_rotation_matrix
 from dexmani_real.utils.log import get_logger
 

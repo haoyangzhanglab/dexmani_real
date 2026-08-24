@@ -32,7 +32,9 @@ from pathlib import Path
 # Set a quiet Rerun logging default unless the operator already configured one.
 os.environ.setdefault("RUST_LOG", "error")
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import h5py
 import numpy as np
@@ -40,10 +42,8 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.data_processing.pipeline import (
-    PROCESSED_SCHEMA_NAME,
-    PROCESSED_SCHEMA_VERSION,
-)
+from dexmani_real.data.process import PROCESSED_SCHEMA_NAME, PROCESSED_SCHEMA_VERSION
+from dexmani_real.ipc.schema import POINT_CLOUD_FEATURE_DIM, validate_point_cloud_array
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
@@ -51,10 +51,6 @@ from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_TRANSFORM,
 )
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.schema import (
-    POINT_CLOUD_FEATURE_DIM,
-    validate_point_cloud_array,
-)
 
 logger = get_logger(__name__)
 

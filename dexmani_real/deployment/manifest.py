@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from dexmani_real.utils.schema import (
+from dexmani_real.ipc.schema import (
     ARM_DOF,
     EE_POS_DIM,
     EE_ROT6D_DIM,

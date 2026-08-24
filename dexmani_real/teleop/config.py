@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
-from dexmani_real.planning.constants import XHAND_RIGHT_URDF_PATH
+from dexmani_real.robot_spec import XHAND_RIGHT_URDF_PATH
 
 
 @dataclass(frozen=True)

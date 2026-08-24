@@ -14,7 +14,6 @@ from typing import Any, get_args, get_origin
 import numpy as np
 
 
-
 def _is_ndarray_annotation(tp: object) -> bool:
     """Check whether a type annotation represents ``np.ndarray``.
 

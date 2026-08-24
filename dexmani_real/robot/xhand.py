@@ -16,12 +16,7 @@ import numpy as np
 from xhand_controller import xhand_control as xhc  # type: ignore[import-untyped]
 
 from dexmani_real.config.defaults import HandParams
-from dexmani_real.utils.log import (
-    capture_native_stdout,
-    extract_native_diagnostics,
-    get_logger,
-)
-from dexmani_real.utils.schema import (
+from dexmani_real.ipc.schema import (
     HAND_CONTACT_SHAPE,
     HAND_DOF,
     HAND_FINGER_COUNT,
@@ -29,6 +24,11 @@ from dexmani_real.utils.schema import (
     HAND_TACTILE_FORCE_SHAPE,
     HAND_TACTILE_SUM_SHAPE,
     TACTILE_POINTS_PER_FINGER,
+)
+from dexmani_real.utils.log import (
+    capture_native_stdout,
+    extract_native_diagnostics,
+    get_logger,
 )
 
 logger = get_logger(__name__)

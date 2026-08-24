@@ -1,0 +1,1 @@
+"""IPC contract tests."""

@@ -6,9 +6,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.utils.schema import HAND_JOINT_SHAPE
-from dexmani_real.policy.safety import validate_hand_command_bounds
-from dexmani_real.teleop.hand_retarget import TAGHandRetargeter, XHandRetargeter
+from dexmani_real.control.publication import validate_hand_command_bounds
+from dexmani_real.robot_spec import HAND_JOINT_SHAPE
+from dexmani_real.teleop.retarget.facade import TAGHandRetargeter, XHandRetargeter
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 
 logger = get_logger(__name__)
@@ -42,7 +42,7 @@ class HandRetargetObservationCache:
         self.succeeded = False
 
 
-def _sanitize_hand_command(
+def sanitize_hand_command(
     hand_cmd: np.ndarray,
     lower: np.ndarray,
     upper: np.ndarray,
@@ -71,7 +71,7 @@ def _sanitize_hand_command(
     )
 
 
-def _hand_ramp_frame_count(duration_s: float, control_hz: float) -> int:
+def hand_ramp_frame_count(duration_s: float, control_hz: float) -> int:
     if not np.isfinite(duration_s) or duration_s < 0:
         raise ValueError("duration_s must be finite and >= 0")
     if not np.isfinite(control_hz) or control_hz <= 0:
@@ -79,7 +79,7 @@ def _hand_ramp_frame_count(duration_s: float, control_hz: float) -> int:
     return max(0, int(round(duration_s * control_hz)))
 
 
-def _smoothstep_hand_ramp(
+def smoothstep_hand_ramp(
     start: np.ndarray,
     target: np.ndarray,
     step_index: int,
@@ -99,7 +99,7 @@ def _smoothstep_hand_ramp(
     return start_arr + smooth * (target_arr - start_arr)
 
 
-def _get_raw_hand_command(
+def get_raw_hand_command(
     retargeter: TAGHandRetargeter | XHandRetargeter | None,
     filtered_command: np.ndarray,
     retarget_ok: bool,
@@ -115,7 +115,7 @@ def _get_raw_hand_command(
     return raw_arr.copy() if raw_arr.shape == HAND_JOINT_SHAPE and np.all(np.isfinite(raw_arr)) else fallback
 
 
-def _compute_hand_command(
+def compute_hand_command(
     retargeter: TAGHandRetargeter | XHandRetargeter | None,
     vr_frame: dict | None,
     prev_hand_cmd: np.ndarray,
@@ -183,7 +183,7 @@ def _compute_hand_command(
     return prev_hand_cmd.copy(), False
 
 
-def _reset_hand_retargeter(
+def reset_hand_retargeter(
     retargeter: TAGHandRetargeter | XHandRetargeter | None,
     hand_qpos: np.ndarray | None = None,
 ) -> None:
@@ -201,7 +201,7 @@ def _reset_hand_retargeter(
             logger.warning("Hand retargeter reset failed — previous optimizer state retained", exc_info=True)
 
 
-def _seed_hand_retargeter(
+def seed_hand_retargeter(
     retargeter: TAGHandRetargeter | XHandRetargeter | None,
     qpos: np.ndarray | None,
 ) -> np.ndarray | None:
@@ -211,7 +211,7 @@ def _seed_hand_retargeter(
     else ``None``.
     """
     if qpos is not None and np.all(np.isfinite(qpos)):
-        _reset_hand_retargeter(retargeter, qpos.copy())
+        reset_hand_retargeter(retargeter, qpos.copy())
         return qpos.copy()
-    _reset_hand_retargeter(retargeter, None)
+    reset_hand_retargeter(retargeter, None)
     return None

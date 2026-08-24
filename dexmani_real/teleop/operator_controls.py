@@ -9,11 +9,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from dexmani_real.ipc.causal import read_hand_state_causal, read_vr_frame_causal
+from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import XArm7MotionPlanner
-from dexmani_real.recording.recorder_client import RecorderClient, RecorderPhase
-from dexmani_real.robot.safety import SafetyState, transition
-from dexmani_real.shm.causal_reader import read_hand_state_causal, read_vr_frame_causal
-from dexmani_real.shm.shared_storage import SharedStorage
+from dexmani_real.recording.client import RecorderClient, RecorderPhase
+from dexmani_real.runtime.safety import SafetyState, transition
 from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.camera_freshness import CameraFreshnessTracker
 from dexmani_real.teleop.config import TeleopConfig
@@ -23,25 +23,25 @@ from dexmani_real.teleop.control_state import (
     CoordinatorDirective,
     TeleopLoopState,
 )
-from dexmani_real.teleop.episode_samples import _stop_recording
-from dexmani_real.teleop.hand_control import _seed_hand_retargeter
-from dexmani_real.teleop.hand_retarget import (
-    TAGHandRetargeter,
-    XHandRetargeter,
-    _tag_config_with_urdf,
-)
+from dexmani_real.teleop.episode_samples import stop_recording
+from dexmani_real.teleop.hand_control import seed_hand_retargeter
 from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.recording_session import (
     QuitRecordingDecision,
     await_quit_recording_decision,
 )
+from dexmani_real.teleop.retarget.facade import (
+    TAGHandRetargeter,
+    XHandRetargeter,
+    tag_config_with_urdf,
+)
 from dexmani_real.teleop.safety import (
-    _do_configured_teleop_home,
-    _enter_command_quiescence_impl,
-    _hand_feedback_issue_impl,
+    do_configured_teleop_home,
+    enter_command_quiescence,
+    hand_feedback_issue,
 )
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.rate_manager import RateManager
+from dexmani_real.utils.rate import LoopRate
 
 logger = get_logger(__name__)
 
@@ -53,12 +53,12 @@ class TeleopOperatorResources:
     control: TeleopControlResources
     keyboard: KeyboardHandler
     audio: AudioFeedback
-    limiter: RateManager
+    limiter: LoopRate
     quiescence: CommandQuiescence
     camera_freshness: CameraFreshnessTracker
 
 
-def _try_init_hand_retargeter_impl(ctx: TeleopLoopState, cfg: TeleopConfig) -> bool:
+def try_init_hand_retargeter(ctx: TeleopLoopState, cfg: TeleopConfig) -> bool:
     """Lazily initialize ctx.hand_retargeter if not already created."""
     if ctx.hand_retargeter is not None:
         return True
@@ -67,7 +67,7 @@ def _try_init_hand_retargeter_impl(ctx: TeleopLoopState, cfg: TeleopConfig) -> b
             ctx.hand_retargeter = TAGHandRetargeter(
                 hand_type="right",
                 fingertip_link_names=cfg.runtime.hand.fingertip_link_names,
-                tag_config=_tag_config_with_urdf(
+                tag_config=tag_config_with_urdf(
                     cfg.runtime.tag_retargeting, cfg.hand_urdf_path
                 ),
             )
@@ -88,7 +88,7 @@ def _try_init_hand_retargeter_impl(ctx: TeleopLoopState, cfg: TeleopConfig) -> b
 
 
 def _init_and_seed_hand_retargeter_impl(
-    ctx: TeleopLoopState, cfg: TeleopConfig, shared: SharedStorage
+    ctx: TeleopLoopState, cfg: TeleopConfig, shared: RuntimeChannels
 ) -> np.ndarray | None:
     """Lazy-init retargeter and seed NLP warm-start from hardware qpos.
 
@@ -96,19 +96,19 @@ def _init_and_seed_hand_retargeter_impl(
     """
     if not cfg.runtime.policy.hand_enabled:
         return None
-    if not _try_init_hand_retargeter_impl(ctx, cfg):
+    if not try_init_hand_retargeter(ctx, cfg):
         return None
     hs = read_hand_state_causal(shared)
     qpos = (
         hs["qpos"][0]
-        if _hand_feedback_issue_impl(cfg, hs) is None and hs is not None
+        if hand_feedback_issue(cfg, hs) is None and hs is not None
         else None
     )
-    return _seed_hand_retargeter(ctx.hand_retargeter, qpos)
+    return seed_hand_retargeter(ctx.hand_retargeter, qpos)
 
 
-def _transition_or_fault(
-    shared: SharedStorage,
+def transition_or_fault(
+    shared: RuntimeChannels,
     new_state: SafetyState,
     reason: str,
 ) -> bool:
@@ -126,14 +126,14 @@ def _transition_or_fault(
 
 def _enter_operator_quiescence(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     resources: TeleopOperatorResources,
     reason: str,
     *,
     start_new_run: bool = False,
     replace_existing_reason: bool = False,
 ) -> None:
-    _enter_command_quiescence_impl(
+    enter_command_quiescence(
         ctx,
         shared,
         resources.quiescence,
@@ -144,7 +144,7 @@ def _enter_operator_quiescence(
     )
 
 
-def _handoff_quiescence_to_home(resources: TeleopOperatorResources) -> None:
+def handoff_quiescence_to_home(resources: TeleopOperatorResources) -> None:
     reason, _entered_ns = resources.quiescence.clear()
     if reason is not None:
         logger.info(
@@ -159,7 +159,7 @@ def _keyboard_estop_requested(keyboard: KeyboardHandler) -> bool:
 
 def _apply_quit_signal(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     cfg: TeleopConfig,
     resources: TeleopOperatorResources,
 ) -> CoordinatorDirective:
@@ -175,7 +175,7 @@ def _apply_quit_signal(
         replace_existing_reason=True,
     )
     ctx.teleop_active = False
-    if not _transition_or_fault(shared, SafetyState.ARMED, "quit"):
+    if not transition_or_fault(shared, SafetyState.ARMED, "quit"):
         return CoordinatorDirective.BREAK
 
     if ctx.recording_active:
@@ -197,7 +197,7 @@ def _apply_quit_signal(
             resources.audio.play("emergency")
         else:
             resources.audio.play("save" if save else "discard")
-        _stop_recording(
+        stop_recording(
             recorder,
             ctx.recording_active,
             save=save,
@@ -215,8 +215,8 @@ def _apply_quit_signal(
             assert ctx.prev_hand_qpos is not None
             resources.audio.play("home")
             ctx.ema_prev_pos = ctx.ema_prev_quat = None
-            _handoff_quiescence_to_home(resources)
-            ctx.prev_hand_qpos = _do_configured_teleop_home(
+            handoff_quiescence_to_home(resources)
+            ctx.prev_hand_qpos = do_configured_teleop_home(
                 shared,
                 cfg,
                 hand_available=ctx.hand_available,
@@ -241,14 +241,14 @@ def _apply_quit_signal(
 
 def _apply_home_signal(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     cfg: TeleopConfig,
     resources: TeleopOperatorResources,
 ) -> CoordinatorDirective:
     """Stop the session and request a fresh control grid after synchronous home."""
     print("\nH: return_home")
     resources.audio.play("home")
-    _stop_recording(
+    stop_recording(
         resources.control.recorder,
         ctx.recording_active,
         save=True,
@@ -256,12 +256,12 @@ def _apply_home_signal(
     )
     ctx.recording_active = False
     ctx.teleop_active = False
-    if not _transition_or_fault(shared, SafetyState.ARMED, "home"):
+    if not transition_or_fault(shared, SafetyState.ARMED, "home"):
         return CoordinatorDirective.BREAK
     ctx.ema_prev_pos = ctx.ema_prev_quat = None
-    _handoff_quiescence_to_home(resources)
+    handoff_quiescence_to_home(resources)
     assert ctx.prev_hand_qpos is not None
-    ctx.prev_hand_qpos = _do_configured_teleop_home(
+    ctx.prev_hand_qpos = do_configured_teleop_home(
         shared,
         cfg,
         hand_available=ctx.hand_available,
@@ -280,7 +280,7 @@ def _apply_home_signal(
 
 def _apply_pause_signal(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     resources: TeleopOperatorResources,
 ) -> bool:
     """Pause or resume one existing session; return false on a safety fault."""
@@ -293,7 +293,7 @@ def _apply_pause_signal(
             replace_existing_reason=True,
         )
         ctx.teleop_active = False
-        if not _transition_or_fault(shared, SafetyState.ARMED, "pause"):
+        if not transition_or_fault(shared, SafetyState.ARMED, "pause"):
             return False
     else:
         if resources.quiescence.reason != "pause":
@@ -304,7 +304,7 @@ def _apply_pause_signal(
                 f"\nC: safety_state={shared.safety_state.value} — must be ARMED to resume"
             )
             return True
-        if not _transition_or_fault(shared, SafetyState.RUNNING, "resume"):
+        if not transition_or_fault(shared, SafetyState.RUNNING, "resume"):
             return False
         ctx.teleop_active = True
     state_str = "恢复" if ctx.teleop_active else "暂停"
@@ -315,7 +315,7 @@ def _apply_pause_signal(
 
 def _apply_begin_signal(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     cfg: TeleopConfig,
     resources: TeleopOperatorResources,
 ) -> bool:
@@ -336,7 +336,7 @@ def _apply_begin_signal(
     begin_hand_state = (
         read_hand_state_causal(shared) if cfg.runtime.policy.hand_enabled else None
     )
-    begin_hand_issue = _hand_feedback_issue_impl(cfg, begin_hand_state)
+    begin_hand_issue = hand_feedback_issue(cfg, begin_hand_state)
     if begin_hand_issue is not None:
         print(f"\nB: hand feedback unhealthy ({begin_hand_issue}) — cannot begin")
         return True
@@ -362,8 +362,8 @@ def _apply_begin_signal(
         begin_message = f"\nB: 遥操作+录制开始  episode={recorder.frame_count}"
 
     resources.keyboard.drain_signal(ControlSignal.BEGIN)
-    if not _transition_or_fault(shared, SafetyState.RUNNING, begin_reason):
-        _stop_recording(
+    if not transition_or_fault(shared, SafetyState.RUNNING, begin_reason):
+        stop_recording(
             recorder,
             ctx.recording_active,
             save=False,
@@ -390,9 +390,9 @@ def _apply_begin_signal(
     return True
 
 
-def _apply_operator_controls(
+def apply_operator_controls(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     cfg: TeleopConfig,
     resources: TeleopOperatorResources,
     controls: tuple[ControlSignal, ...],
@@ -404,7 +404,7 @@ def _apply_operator_controls(
             print("\nESC: emergency_stop")
             resources.audio.play("emergency")
             shared.estop_request.value = True
-            _stop_recording(
+            stop_recording(
                 resources.control.recorder,
                 ctx.recording_active,
                 save=False,
@@ -428,7 +428,7 @@ def _apply_operator_controls(
                 stop_reason,
                 replace_existing_reason=True,
             )
-            _stop_recording(
+            stop_recording(
                 resources.control.recorder,
                 ctx.recording_active,
                 save=save_episode,
@@ -436,7 +436,7 @@ def _apply_operator_controls(
             )
             ctx.recording_active = False
             ctx.teleop_active = False
-            if not _transition_or_fault(shared, SafetyState.ARMED, stop_reason):
+            if not transition_or_fault(shared, SafetyState.ARMED, stop_reason):
                 return CoordinatorDirective.BREAK
             skip_control_tick = True
         elif control is ControlSignal.PAUSE:
@@ -460,9 +460,9 @@ def _apply_operator_controls(
     return CoordinatorDirective.NORMAL
 
 
-def _poll_recording_lifecycle(
+def poll_recording_lifecycle(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     recorder: RecorderClient | None,
     audio: AudioFeedback,
     *,
@@ -523,7 +523,7 @@ def _poll_recording_lifecycle(
         writer_error,
     )
     print(f"  ⚠ 相机写盘失败，当前 episode 已废弃: {writer_error}")
-    _stop_recording(
+    stop_recording(
         recorder,
         ctx.recording_active,
         save=False,
@@ -534,14 +534,14 @@ def _poll_recording_lifecycle(
     return True
 
 
-def _advance_post_teleop_state(
+def advance_post_teleop_state(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     cfg: TeleopConfig,
     kb: KeyboardHandler,
     audio: AudioFeedback,
     planner: XArm7MotionPlanner,
-    limiter: RateManager,
+    limiter: LoopRate,
     recorder: RecorderClient | None,
     *,
     handoff_quiescence_to_home: Callable[[], None],
@@ -561,7 +561,7 @@ def _advance_post_teleop_state(
             audio.play("home")
             handoff_quiescence_to_home()
             assert ctx.prev_hand_qpos is not None
-            ctx.prev_hand_qpos = _do_configured_teleop_home(
+            ctx.prev_hand_qpos = do_configured_teleop_home(
                 shared,
                 cfg,
                 hand_available=ctx.hand_available,

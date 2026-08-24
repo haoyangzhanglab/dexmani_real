@@ -14,9 +14,16 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dexmani_real.control.publication import (
+    CommandPublishStatus,
+    build_action_candidate,
+    validate_and_send_candidate,
+)
+from dexmani_real.control.safety_gate import planner_action_safety_gate
 from dexmani_real.deployment.config import DeploymentConfig
 from dexmani_real.deployment.metrics import (
     COMMAND_SILENCE_ABORT,
@@ -30,23 +37,25 @@ from dexmani_real.deployment.metrics import (
     flush_every,
     reject_counter_name,
 )
-from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner, XArm7PlannerConfig
-from dexmani_real.planning.constants import (
+from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
+from dexmani_real.ipc.schema import MAX_POLICY_CHUNK_STEPS
+from dexmani_real.planning import (
+    Pose,
+    TeleopProfile,
+    XArm7MotionPlanner,
+    XArm7PlannerConfig,
+)
+from dexmani_real.planning.paths import wrap_nearest_equivalent
+from dexmani_real.planning.poses import rot6d_to_quat_wxyz
+from dexmani_real.robot_spec import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
-from dexmani_real.planning.path_utils import wrap_nearest_equivalent
-from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
-from dexmani_real.policy.safety import (
-    CommandPublishStatus,
-    build_action_candidate,
-    planner_action_safety_gate,
-    validate_and_send_candidate,
-)
-from dexmani_real.robot.safety import SafetyState, advance_run_generation, transition
-from dexmani_real.shm.shared_storage import SharedStorage, read_arm_state_dict
+from dexmani_real.runtime.safety import SafetyState, advance_run_generation, transition
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.schema import MAX_POLICY_CHUNK_STEPS
+
+if TYPE_CHECKING:
+    from dexmani_real.config.runtime import ResolvedRuntimeConfig
 
 logger = get_logger(__name__)
 
@@ -63,11 +72,14 @@ class CoordinatorConfig:
     deployment: DeploymentConfig
     arm_joint_lower_rad: tuple[float, ...]
     arm_joint_upper_rad: tuple[float, ...]
-    workspace_bounds: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
+    workspace_bounds: tuple[
+        tuple[float, float], tuple[float, float], tuple[float, float]
+    ]
     hand_joint_lower_rad: tuple[float, ...]
     hand_joint_upper_rad: tuple[float, ...]
     hand_mechanical_lower_rad: tuple[float, ...]
     hand_mechanical_upper_rad: tuple[float, ...]
+    arm_feedback_max_age_s: float
     hand_feedback_max_age_s: float
     control_hz: float
     # Full 19-DoF collision model (hand + static boxes) for EE->IK and the
@@ -82,7 +94,11 @@ class CoordinatorConfig:
     hand_max_delta_rad_per_tick: float = 0.1
 
     @classmethod
-    def from_runtime(cls, deployment: DeploymentConfig, runtime: object) -> "CoordinatorConfig":
+    def from_runtime(
+        cls,
+        deployment: DeploymentConfig,
+        runtime: "ResolvedRuntimeConfig",
+    ) -> "CoordinatorConfig":
         return cls(
             deployment=deployment,
             arm_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
@@ -92,6 +108,7 @@ class CoordinatorConfig:
             hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
             hand_mechanical_lower_rad=tuple(runtime.hand.mechanical_qpos_min_rad),
             hand_mechanical_upper_rad=tuple(runtime.hand.mechanical_qpos_max_rad),
+            arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
             hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
             control_hz=float(runtime.policy.control_hz),
             static_boxes=tuple(runtime.environment.static_boxes),
@@ -102,7 +119,7 @@ class CoordinatorConfig:
         )
 
 
-def _read_latest_plan(shared: SharedStorage):
+def _read_latest_plan(shared: RuntimeChannels):
     """Return the latest plan record (scalar structured array) or None."""
     result = shared.policy_plan_ring.read_latest()
     if result is None:
@@ -183,7 +200,7 @@ def _select_due_step(
 
 
 def _end_policy_run(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     reason: str,
     *,
     abort: bool,
@@ -212,7 +229,7 @@ def _end_policy_run(
         logger.info("coordinator: policy run stopped: %s", reason)
 
 
-def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
+def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None:
     """Coordinator process entry point — the only robot-action producer.
 
     Idles in ARMED until the operator presses B (``start_request``), runs one
@@ -256,16 +273,17 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
     shared.set_ready("policy")
 
     # Wait until Main has armed the system (model loaded, hardware ready).
-    while (
-        shared.is_running.value
-        and int(shared.safety_state.value) != int(SafetyState.ARMED)
+    while shared.is_running.value and int(shared.safety_state.value) != int(
+        SafetyState.ARMED
     ):
         # Keep the heartbeat fresh while waiting for arm/inference readiness.
         shared.set_heartbeat("policy", time.monotonic())
         if bool(shared.error_state.value) or bool(shared.estop_request.value):
             return
         time.sleep(0.01)
-    if not shared.is_running.value or int(shared.safety_state.value) != int(SafetyState.ARMED):
+    if not shared.is_running.value or int(shared.safety_state.value) != int(
+        SafetyState.ARMED
+    ):
         return
 
     period_s = 1.0 / float(config.control_hz)
@@ -380,7 +398,9 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                         max_observation_age_ns=max_observation_age_ns,
                     )
                     if ok:
-                        if _ready_to_replan(active_plan, next_step, replan_stride_steps):
+                        if _ready_to_replan(
+                            active_plan, next_step, replan_stride_steps
+                        ):
                             # No active plan, the stride is served, or the plan is
                             # consumed: adopt now (supersede any held plan).
                             active_plan = rec
@@ -441,7 +461,9 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
 
             hand_qpos: np.ndarray | None = None
             if int(active_plan["hand_present"]) == 1:
-                hand_qpos = np.asarray(active_plan["hand_qpos"][selected], dtype=np.float64)
+                hand_qpos = np.asarray(
+                    active_plan["hand_qpos"][selected], dtype=np.float64
+                )
 
             _arm_state = read_arm_state_dict(shared)
             if int(active_plan["ee_present"]) == 1:
@@ -453,7 +475,9 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                     _sleep_tick(period_s, tick_start)
                     continue
                 ee_pos = np.asarray(active_plan["ee_pos"][selected], dtype=np.float64)
-                ee_rot6d = np.asarray(active_plan["ee_rot6d"][selected], dtype=np.float64)
+                ee_rot6d = np.asarray(
+                    active_plan["ee_rot6d"][selected], dtype=np.float64
+                )
                 if hand_qpos is not None:
                     planner.set_hand_qpos(hand_qpos)
                 ik_result = planner.solve_teleop_ik(
@@ -472,7 +496,9 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                     continue
                 arm_qpos = np.asarray(ik_result.qpos, dtype=np.float64)
             else:
-                arm_qpos = np.asarray(active_plan["arm_qpos"][selected], dtype=np.float64)
+                arm_qpos = np.asarray(
+                    active_plan["arm_qpos"][selected], dtype=np.float64
+                )
                 # Canonicalize targets against fresh feedback before publication.
                 if _arm_state is not None and np.all(np.isfinite(_arm_state["qpos"])):
                     arm_qpos = wrap_nearest_equivalent(
@@ -488,7 +514,9 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 hand_qpos,
                 is_hold=False,
                 observation_id=int(active_plan["observation_id"]),
-                observation_anchor_monotonic_ns=int(active_plan["observation_anchor_monotonic_ns"]),
+                observation_anchor_monotonic_ns=int(
+                    active_plan["observation_anchor_monotonic_ns"]
+                ),
                 action_validity_s=float(config.deployment.action_validity_s),
             )
             if candidate is None:
@@ -499,6 +527,7 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                 shared,
                 candidate,
                 gate=gate,
+                arm_feedback_max_age_s=config.arm_feedback_max_age_s,
                 hand_feedback_max_age_s=config.hand_feedback_max_age_s,
                 hand_mechanical_lower_rad=np.asarray(
                     config.hand_mechanical_lower_rad, dtype=np.float64
@@ -525,7 +554,10 @@ def coordinator_loop(shared: SharedStorage, config: CoordinatorConfig) -> None:
                         metric=SAFETY_REJECTIONS,
                     )
                     continue
-                if publish_result.status == CommandPublishStatus.HAND_PREFLIGHT_REJECTED:
+                if (
+                    publish_result.status
+                    == CommandPublishStatus.HAND_PREFLIGHT_REJECTED
+                ):
                     metrics.increment(HAND_PREFLIGHT_REJECTIONS)
                     _end_policy_run(
                         shared,

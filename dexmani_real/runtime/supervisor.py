@@ -8,12 +8,12 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from dexmani_real.shm.shared_storage import SharedStorage
-from dexmani_real.utils.hand_health import validate_hand_feedback
+from dexmani_real.ipc.channels import RuntimeChannels
+from dexmani_real.utils.feedback import validate_hand_feedback
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
-    from dexmani_real.runtime.processes import ShutdownReport
+    from dexmani_real.runtime.workers import ShutdownReport
 
 logger = get_logger(__name__)
 
@@ -21,14 +21,14 @@ _READY_POLL_INTERVAL_S = 0.2
 
 
 def shutdown_processes(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     procs: list[Any],
     *,
     graceful_timeout_s: float = 5.0,
     disarm_if_clean: bool = False,
 ) -> ShutdownReport:
     """Stop workers and return their verified post-join safety state."""
-    from dexmani_real.runtime.processes import shutdown_processes_verified
+    from dexmani_real.runtime.workers import shutdown_processes_verified
 
     report = shutdown_processes_verified(
         shared,
@@ -42,7 +42,7 @@ def shutdown_processes(
 
 
 def run_supervisor(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     procs: list[Any],
     proc_names: list[str],
     heartbeat_names: list[str],
@@ -61,9 +61,9 @@ def run_supervisor(
     and must handle shutdown + DISARMED transition after it returns.
     """
     from dexmani_real.config.defaults import safety
-    from dexmani_real.robot.safety import SafetyState, transition
-    from dexmani_real.runtime.processes import supervisor_exit_reason
+    from dexmani_real.runtime.safety import SafetyState, transition
     from dexmani_real.runtime.status import ExitReason
+    from dexmani_real.runtime.workers import supervisor_exit_reason
 
     start_time = time.monotonic()
     last_status_s = start_time
@@ -140,7 +140,7 @@ def run_supervisor(
 
 
 def wait_subsystem_ready(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     ready_checks: list[tuple[str, float]],
     procs: list[Any],
 ) -> bool:
@@ -187,7 +187,7 @@ def _hand_feedback_issue(hand_data: Any, *, max_age_s: float) -> str | None:
     """Delegated fail-closed health check over one hand state record.
 
     Single source of truth for "is this hand feedback usable" in the supervisor,
-    matching ``policy._hand_feedback_snapshot`` and the teleop predicates.
+    matching ``control.publication.read_hand_feedback`` and the teleop predicates.
     Returns the rejection reason, or ``None`` when healthy.
     """
     return validate_hand_feedback(
@@ -201,7 +201,7 @@ def _hand_feedback_issue(hand_data: Any, *, max_age_s: float) -> str | None:
 
 
 def print_health_summary(
-    shared: SharedStorage, *, hand_feedback_max_age_s: float | None = None
+    shared: RuntimeChannels, *, hand_feedback_max_age_s: float | None = None
 ) -> None:
     """Print a pre-flight health summary from ring data (arm, hand, VR, camera)."""
     if hand_feedback_max_age_s is None:

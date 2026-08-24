@@ -8,7 +8,7 @@ integration and the swap fixture for runtime-replacement verification.
 Determinism contract: for a fixed observation and run_generation, ``predict``
 returns byte-identical arrays across calls and processes. The fake never reads
 the clock beyond the observation anchor, never samples randomness, and never
-touches SharedStorage.
+touches RuntimeChannels.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import numpy as np
 
 from dexmani_real.deployment.contracts import InferenceContext, JointActionChunk
 from dexmani_real.deployment.observation import ObservationBatch
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.robot_spec import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 # Fixed fake horizon for scheduler tests; real backends derive it from model config.
 _FAKE_HORIZON = 8

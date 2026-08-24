@@ -80,15 +80,17 @@ entry point
 
 - `config/`：canonical defaults、运行时快照和标定读取。
 - `sensor/`：设备输入、点云和时钟映射。
-- `robot/`：硬件 driver、worker、homing 与物理回放。
+- `robot/`：硬件 driver、worker 与 SDK 边界。
 - `planning/`：FK、IK、collision 和 path 等纯计算优先的能力。
 - `teleop/`：操作者输入到 action proposal 的映射与采集决策。
-- `policy/`：跨控制方式共用的 action contract 和 safety boundary。
+- `control/`：跨控制方式共用的 action contract、safety boundary、publication 与 homing。
+- `replay/`：物理回放的加载、调度、捕获、评估与 session。
+- `calibration/`：相机、桌面等标定算法与 side-effect lifecycle。
 - `deployment/`：模型 observation、inference、plan 和调度。
 - `recording/`：raw episode schema、写入与读取。
-- `data_processing/`：离线清洗和训练数据导出。
+- `data/`：离线清洗和训练数据导出。
 - `runtime/`：进程生命周期、supervisor 与结构化退出状态。
-- `shm/`：跨进程零拷贝共享内存基础设施（SharedStorage、ring buffer 与 causal read）。
+- `ipc/`：跨进程 typed channels、wire schema、ring buffer 与 causal read。
 - `integrations/`：外部模型仓库适配器，满足 deployment 的三个 Protocol；依赖方向为 integrations → deployment。
 - `examples/`：薄入口和自包含的诊断/可视化/离线分析程序。
 
@@ -722,7 +724,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.policy.safety import SafetyGate
+from dexmani_real.control.safety_gate import SafetyGate
 ```
 
 禁止 wildcard import。可选或重量级依赖只有在确实需要延迟加载、隔离硬件/torch 或支持

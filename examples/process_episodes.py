@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Usage: ``python examples/process_episodes.py INPUT_ROOT [--profile PROFILE]``.
 
 Offline CLI that audits and compacts one task's native raw-v21 episodes into
@@ -39,11 +40,15 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import yaml
 from tqdm import tqdm
 
 from dexmani_real.config.runtime import resolve_runtime_config
-from dexmani_real.data_processing.contracts import (
+from dexmani_real.data.contracts import (
     BridgePolicy,
     EpisodeAnnotation,
     OutputProfile,
@@ -51,14 +56,14 @@ from dexmani_real.data_processing.contracts import (
     QualityPolicy,
     TemporalQualityConfig,
 )
-from dexmani_real.data_processing.pipeline import (
+from dexmani_real.data.process import (
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
     discover_episode_dirs,
     load_annotations,
     process_episode_root,
 )
-from dexmani_real.utils.schema import SUPPORTED_POINT_CLOUD_COUNTS
+from dexmani_real.ipc.schema import SUPPORTED_POINT_CLOUD_COUNTS
 
 
 def _route_library_logging_to_stderr() -> None:
@@ -194,8 +199,8 @@ def _config(
     args: argparse.Namespace, profile: OutputProfile, policy: QualityPolicy
 ) -> ProcessingConfig:
     runtime = resolve_runtime_config()
-    table = runtime.environment.table
-    return ProcessingConfig(
+    return ProcessingConfig.from_runtime(
+        runtime,
         profile=profile,
         horizon=args.horizon,
         min_full_windows=args.min_full_windows,
@@ -209,7 +214,6 @@ def _config(
         pointcloud=dataclasses.replace(
             runtime.pointcloud, num_points=args.pointcloud_num_points
         ),
-        table_plane_abcd=table.plane_abcd if table.enabled else None,
     )
 
 

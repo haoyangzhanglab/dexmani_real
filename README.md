@@ -34,11 +34,11 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | 理解仓库与修改约束 | [`AGENTS.md`](AGENTS.md)、[`code_style.md`](code_style.md) | [`repo_map.md`](repo_map.md)、[`user_design.md`](user_design.md) |
 | VR 遥操作与采集 | [`examples/collect_teleop.py`](examples/collect_teleop.py) | [`teleop/session.py`](dexmani_real/teleop/session.py)、[`teleop/loop.py`](dexmani_real/teleop/loop.py)、[`teleop/operator_controls.py`](dexmani_real/teleop/operator_controls.py)、[`teleop/control_grid.py`](dexmani_real/teleop/control_grid.py)、[`teleop/action_proposal.py`](dexmani_real/teleop/action_proposal.py) |
 | 键盘遥操作 | [`examples/keyboard_teleop.py`](examples/keyboard_teleop.py) | [`teleop/keyboard_session.py`](dexmani_real/teleop/keyboard_session.py) |
-| 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`robot/replay_trajectory.py`](dexmani_real/robot/replay_trajectory.py)、[`robot/episode_replay.py`](dexmani_real/robot/episode_replay.py)、[`robot/replay_controller.py`](dexmani_real/robot/replay_controller.py)、[`robot/replay_capture.py`](dexmani_real/robot/replay_capture.py)、[`robot/replay_evaluation.py`](dexmani_real/robot/replay_evaluation.py) |
-| raw episode 读取/录制 | — | [`recording/episode_frame.py`](dexmani_real/recording/episode_frame.py)、[`recording/episode_recorder.py`](dexmani_real/recording/episode_recorder.py)、[`recording/episode_data_writer.py`](dexmani_real/recording/episode_data_writer.py)、[`recording/episode_reader.py`](dexmani_real/recording/episode_reader.py) |
-| 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`data_processing/`](dexmani_real/data_processing) |
+| 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`replay/`](dexmani_real/replay) |
+| raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/hdf5_writer.py`](dexmani_real/recording/hdf5_writer.py)、[`recording/reader.py`](dexmani_real/recording/reader.py) |
+| 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`data/`](dexmani_real/data) |
 | learned-policy 部署 | [`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`integrations/`](dexmani_real/integrations) |
-| 相机、点云与 VR 标定 | [`examples/`](examples) | [`sensor/camera_calibration.py`](dexmani_real/sensor/camera_calibration.py)、[`sensor/camera_calibration_control.py`](dexmani_real/sensor/camera_calibration_control.py)、[`sensor/camera_calibration_session.py`](dexmani_real/sensor/camera_calibration_session.py)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
+| 相机、桌面与 VR 标定 | [`examples/`](examples) | [`calibration/`](dexmani_real/calibration)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
 
 完整的逐文件职责见 [`repo_map.md`](repo_map.md)。
 
@@ -51,7 +51,7 @@ RealSense / Quest-HTS / xArm7 / XHand
         device-specific workers
                  │
                  ▼
- SharedStorage: typed rings + queues + lifecycle state
+ RuntimeChannels: typed rings + queues + lifecycle state
           │                         │
           ├─ teleop coordinator     └─ inference worker → policy plan ring
           │                                      │
@@ -69,15 +69,16 @@ RealSense / Quest-HTS / xArm7 / XHand
 
 必须保持的边界：
 
-- 跨进程状态通过 `SharedStorage`；固定 shape/dtype 由
-  [`utils/schema.py`](dexmani_real/utils/schema.py) 定义。
+- 跨进程状态通过 `RuntimeChannels`；固定 wire shape/dtype 由
+  [`ipc/schema.py`](dexmani_real/ipc/schema.py) 定义，机器人模型 shape 与关节顺序由
+  [`robot_spec.py`](dexmani_real/robot_spec.py) 定义。
 - xArm、XHand、RealSense 和 HTS SDK 对象只存在于各自 owner/worker 内。
 - teleop、replay 和 deployment 负责动作决策；候选先由
-  [`policy/safety_gate.py`](dexmani_real/policy/safety_gate.py) fail-closed 校验，再由
-  [`policy/command_publication.py`](dexmani_real/policy/command_publication.py) 发布；设备
+  [`control/safety_gate.py`](dexmani_real/control/safety_gate.py) fail-closed 校验，再由
+  [`control/publication.py`](dexmani_real/control/publication.py) 发布；设备
   worker 在 [`robot/command_validation.py`](dexmani_real/robot/command_validation.py) 再次校验。
-  [`policy/safety.py`](dexmani_real/policy/safety.py) 仅保留兼容性出口和 hand-home helper。
-  homing 由 [`robot/homing.py`](dexmani_real/robot/homing.py) 规划、校验并排入专用 queue。
+  arm/hand homing 分别由 [`control/arm_home.py`](dexmani_real/control/arm_home.py) 和
+  [`control/hand_home.py`](dexmani_real/control/hand_home.py) 拥有。
 - Recorder 只持久化选定的固定网格样本，不拥有机器人控制。
 - `run_generation`、freshness、heartbeat、safety state 与 worker 侧检查共同使
   暂停、回零或故障前的旧命令失效。
@@ -99,14 +100,13 @@ RealSense / Quest-HTS / xArm7 / XHand
   camera sidecar、验证和有界 finalize。其轮询是非执行器的服务循环；周期性批量持久化允许
   超过单次轮询周期，健康性以 sample backlog、sequence 连续性和 writer 状态为准，而不是
   轮询相位。其中
-  [`recording/episode_data_writer.py`](dexmani_real/recording/episode_data_writer.py) 是单个
+  [`recording/hdf5_writer.py`](dexmani_real/recording/hdf5_writer.py) 是单个
   `data.h5` handle、dataset append 与 offset 的唯一 owner。两者都不拥有机器人命令或
   episode 的开始/停止决策。
-- 相机标定的纯 ArUco/hand-eye 计算在
-  [`sensor/camera_calibration.py`](dexmani_real/sensor/camera_calibration.py)；
-  [`sensor/camera_calibration_control.py`](dexmani_real/sensor/camera_calibration_control.py)
-  拥有 arm motion state、gated publish 和归位，`camera_calibration_session.py` 持有设备、GUI、
-  采样和失败 cleanup。
+- 相机标定的纯 ArUco/hand-eye 计算、运动控制与 side-effect lifecycle 分别位于
+  [`calibration/camera/solver.py`](dexmani_real/calibration/camera/solver.py)、
+  [`calibration/camera/control.py`](dexmani_real/calibration/camera/control.py) 与
+  [`calibration/camera/session.py`](dexmani_real/calibration/camera/session.py)。
 
 ## 环境
 
@@ -153,8 +153,6 @@ python examples/collect_teleop.py --print-config
 | learned policy | `python examples/run_policy.py --deployment-config <file.yml>` | 启动 arm、可选 hand、inference 与 coordinator（active/pending 调度 + EE→IK + delta/collision 安全门）；请求 `point_cloud` 时同时连接 camera |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
-| L515 native baseline | `python examples/inspect_l515.py --scene <scene> --frames 300 --output-dir <dir>` | 只连接相机；无 GUI；写 native Z16 与几何/时序 JSON，不写标定 |
-| L515 native 点云 shadow | `python examples/check_l515_native_shadow.py <inspect-output-dir> --num-points 1024` | 离线；读取 `--save-rgb` 的采集结果，验证固定 `(N,6)` xArm-base 点云与 RGB 投影 |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |
 | 桌面点云与标定诊断 | `python examples/pointcloud_process_example.py` | 只连接相机；多帧拟合桌面；仅在显式确认后备份并更新共享桌面标定 |
 | XHand 独立诊断 | `python examples/xhand_control_example.py` | 连接并控制 XHand |
@@ -205,8 +203,7 @@ deployment:
 
 暗场下 RGB 曾因 Auto-Exposure Priority=ON 把曝光拉到 ~60 ms 而降帧到 ~16.7 Hz。
 根因已确认并修复：`RealSenseConfig.auto_exposure_priority` 默认 `0.0`（OFF，Auto
-Exposure 仍 ON），RGB 恢复 30 Hz，亮度由增益补偿、几乎不变（暗场噪声上升）。详见
-[`l515_camera_timing_known_limitation.md`](l515_camera_timing_known_limitation.md)。
+Exposure 仍 ON），RGB 恢复 30 Hz，亮度由增益补偿、几乎不变（暗场噪声上升）。
 
 深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew），因此 processed v5 的点云
 颜色语义仍是 `native_color_projection`，不表示同步曝光；运动物体可能出现颜色时间错位。
@@ -292,12 +289,16 @@ dataset/<task>.zarr/
 安全的最低成本检查：
 
 ```bash
-python -m compileall -q dexmani_real examples
+python -m compileall -q dexmani_real examples tests
+python -m pytest -q
+python tools/check_architecture.py
 git diff --check
 git diff --stat
 git status --short
 ```
 
-仓库当前没有通用单元测试套件。针对纯函数、schema、reader、生命周期和 IPC
-边界，优先写或运行不连接硬件的 deterministic check。仓库级 agent 工作约定见
-[`AGENTS.md`](AGENTS.md)，具体编码规范见 [`code_style.md`](code_style.md)。
+`tests/` 提供纯函数、配置快照、IPC ABI、ring buffer、schema、生命周期、安全失败路径和
+架构边界的离线回归门禁；`tests/fixtures/contracts/` 冻结需要显式审查的 ABI/schema/架构
+基线。example 程序不是测试，测试和静态检查通过也不等于完成真实硬件验证。仓库级
+agent 工作约定见 [`AGENTS.md`](AGENTS.md)，具体编码规范见
+[`code_style.md`](code_style.md)。

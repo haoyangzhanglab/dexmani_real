@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import time
 from enum import Enum, auto
-from dexmani_real.shm.shared_storage import SharedStorage
+
+from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 
 
@@ -18,7 +19,7 @@ class QuitRecordingDecision(Enum):
 
 
 def await_quit_recording_decision(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     keyboard: KeyboardHandler,
     *,
     timeout_s: float,

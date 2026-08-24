@@ -1,6 +1,6 @@
 """Process-local immutable observation windows for the deployment runtime.
 
-These types never enter SharedStorage and therefore carry no
+These types never enter RuntimeChannels and therefore carry no
 IPC dtype. They are the ``PolicyRuntime`` input contract.
 """
 
@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.utils.schema import validate_point_cloud_array
+from dexmani_real.ipc.schema import validate_point_cloud_array
 
 POLICY_OBSERVATION_FIELDS = frozenset(
     {
@@ -45,7 +45,7 @@ def parse_observation_fields(spec: str) -> tuple[str, ...]:
     return fields
 
 
-def _freeze(
+def freeze_array(
     arr: Any,
     *,
     name: str,
@@ -83,20 +83,20 @@ class FrameWindow:
     valid_mask: np.ndarray
 
     def __post_init__(self) -> None:
-        values = _freeze(self.values, name="FrameWindow.values")
+        values = freeze_array(self.values, name="FrameWindow.values")
         if values is None:
             raise ValueError("FrameWindow.values must not be None")
         if values.ndim < 2:
             raise ValueError("FrameWindow.values must be [T, ...]")
         t = values.shape[0]
         for name in ("source_sequence", "source_monotonic_ns", "publish_monotonic_ns"):
-            arr = _freeze(
+            arr = freeze_array(
                 getattr(self, name), name=f"FrameWindow.{name}", dtype=np.uint64
             )
             if arr is None or arr.shape != (t,):
                 raise ValueError(f"FrameWindow.{name} must be a ({t},) uint64 array")
             object.__setattr__(self, name, arr)
-        mask = _freeze(self.valid_mask, name="FrameWindow.valid_mask", dtype=np.uint8)
+        mask = freeze_array(self.valid_mask, name="FrameWindow.valid_mask", dtype=np.uint8)
         if mask is None or mask.shape != (t,):
             raise ValueError(f"FrameWindow.valid_mask must be a ({t},) uint8 array")
         if not np.all((mask == 0) | (mask == 1)):

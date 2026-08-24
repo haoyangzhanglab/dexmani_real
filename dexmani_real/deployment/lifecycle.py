@@ -3,7 +3,7 @@
 Composes the runtime primitives (``WorkerSpec`` +
 ``build_processes``/``start_processes``/``wait_subsystem_ready``/
 ``run_supervisor``/``shutdown_processes``) into the policy workflow — resolve
-config -> create ``SharedStorage`` -> spawn arm (+ optional hand and RGB-D /
+config -> create ``RuntimeChannels`` -> spawn arm (+ optional hand and RGB-D /
 point-cloud workers) -> inference -> coordinator -> readiness -> ARMED ->
 supervise -> verified shutdown. There is
 no second health mechanism: the supervisor's heartbeat/readiness slots already
@@ -33,23 +33,23 @@ from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_l
 from dexmani_real.deployment.observation import parse_observation_fields
 from dexmani_real.deployment.operator import build_home_planner, run_operator_control
 from dexmani_real.deployment.worker import inference_loop
-from dexmani_real.robot.arm_loop import arm_loop
-from dexmani_real.robot.hand_process import hand_loop
-from dexmani_real.robot.safety import SafetyState, require_transition, transition
-from dexmani_real.runtime.processes import (
-    ShutdownReport,
-    WorkerSpec,
-    build_processes,
-    start_processes,
-)
+from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
+from dexmani_real.robot.arm_worker import arm_loop
+from dexmani_real.robot.hand_worker import hand_loop
+from dexmani_real.runtime.safety import SafetyState, require_transition, transition
 from dexmani_real.runtime.supervisor import (
     run_supervisor,
     shutdown_processes,
     wait_subsystem_ready,
 )
-from dexmani_real.sensor.camera_process import CameraLoopConfig, camera_loop
-from dexmani_real.sensor.pointcloud_process import PointCloudLoopConfig, pointcloud_loop
-from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig
+from dexmani_real.runtime.workers import (
+    ShutdownReport,
+    WorkerSpec,
+    build_processes,
+    start_processes,
+)
+from dexmani_real.sensor.camera_worker import CameraLoopConfig, camera_loop
+from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig, pointcloud_loop
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -86,7 +86,7 @@ def log_deployment_provenance(
     checkpoint_sha256: str = "",
     model_config_sha256: str = "",
 ) -> None:
-    """Log one structured provenance line (no SharedStorage write).
+    """Log one structured provenance line (no RuntimeChannels write).
 
     Provenance is a one-time startup log line, never a shared-memory payload:
     the full resolved config must not enter high-frequency IPC. Commit hashes
@@ -109,7 +109,7 @@ def log_deployment_provenance(
 
 
 def build_policy_worker_specs(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     deployment: DeploymentConfig,
 ) -> list[WorkerSpec]:
@@ -211,9 +211,9 @@ def run_policy_deployment(
 
     ctx = mp.get_context("spawn")
     pointcloud_requested = _requires_pointcloud(deployment)
-    shared = SharedStorage.create(
+    shared = RuntimeChannels.create(
         prefix=prefix or f"dexmani_policy_{os.getpid()}",
-        config=SharedStorageConfig.from_runtime(
+        config=RuntimeChannelsConfig.from_runtime(
             runtime,
             pointcloud_num_points=deployment.pointcloud_num_points,
             pointcloud_requested=pointcloud_requested,
@@ -323,7 +323,7 @@ def run_policy_deployment(
                     )
                 except RuntimeError:
                     logger.critical(
-                        "child process remains alive; leaving SharedStorage linked",
+                        "child process remains alive; leaving RuntimeChannels linked",
                         exc_info=True,
                     )
                     raise
@@ -333,6 +333,6 @@ def run_policy_deployment(
                         shared.error_state.value = True
                         transition(shared, SafetyState.FAULT)
                 except Exception:
-                    logger.warning("SharedStorage cleanup failed", exc_info=True)
+                    logger.warning("RuntimeChannels cleanup failed", exc_info=True)
                     shared.error_state.value = True
                     transition(shared, SafetyState.FAULT)

@@ -74,8 +74,8 @@ class RealSenseConfig:
     frame_queue_capacity: int = 2
     l515_depth_config: L515DepthConfig | None = field(default_factory=L515DepthConfig)
     # 0.0 = OFF (default): keep the requested fps instead of letting Auto
-    # Exposure extend exposure and drop RGB to ~16.7 Hz in a dark scene (see
-    # l515_camera_timing_known_limitation.md). None = leave the device default.
+    # Exposure extend exposure and drop RGB to ~16.7 Hz in a dark scene.
+    # None leaves the device default unchanged.
     auto_exposure_priority: float | None = 0.0
 
     def __post_init__(self) -> None:
@@ -333,11 +333,10 @@ class RealSense:
 
         The default ``auto_exposure_priority=0.0`` (OFF) keeps the color sensor
         at the requested fps instead of letting Auto Exposure extend exposure —
-        which drops the RGB stream to ~16.7 Hz in a dark scene (the L515
-        finding recorded in ``l515_camera_timing_known_limitation.md``). Auto
-        Exposure stays ON; priority OFF only caps exposure at the frame period
-        and compensates with gain. Set the config field to ``None`` to leave
-        the device default untouched.
+        which drops the RGB stream to ~16.7 Hz in a dark scene. Auto Exposure
+        stays ON; priority OFF only caps exposure at the frame period and
+        compensates with gain. Set the config field to ``None`` to leave the
+        device default untouched.
         """
         priority = self.config.auto_exposure_priority
         if priority is None:

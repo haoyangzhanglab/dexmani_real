@@ -10,11 +10,11 @@ import numpy as np
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
-    from .ik_candidates import IKCandidateManager
-    from .kinematics import XArm7Kinematics
+    from .candidates import IKCandidateManager
+    from .arm_fk import XArm7Kinematics
 
-from .ik_candidates import is_mplib_success
-from .pose_utils import compute_pose_error, ensure_qpos
+from .candidates import is_mplib_success
+from .poses import compute_pose_error, ensure_qpos
 from .types import IKResult, Pose, TeleopProfile
 
 logger = get_logger(__name__)

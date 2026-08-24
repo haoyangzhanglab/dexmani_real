@@ -15,6 +15,9 @@ from pathlib import Path
 
 import numpy as np
 
+from dexmani_real.control.safety_gate import SafetyGate, planner_action_safety_gate
+from dexmani_real.ipc.causal import read_arm_state_causal, read_hand_state_causal
+from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import (
     PlanningProfile,
     Pose,
@@ -22,17 +25,13 @@ from dexmani_real.planning import (
     XArm7MotionPlanner,
     XArm7PlannerConfig,
 )
-from dexmani_real.planning.constants import (
+from dexmani_real.planning.hand_fk import HandKinematics
+from dexmani_real.recording.client import RecorderClient
+from dexmani_real.robot_spec import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
-from dexmani_real.planning.hand_kinematics import HandKinematics
-from dexmani_real.policy.loop_timing import StageTimer
-from dexmani_real.policy.safety import SafetyGate, planner_action_safety_gate
-from dexmani_real.recording.recorder_client import RecorderClient
-from dexmani_real.robot.safety import SafetyState
-from dexmani_real.shm.causal_reader import read_arm_state_causal, read_hand_state_causal
-from dexmani_real.shm.shared_storage import SharedStorage
+from dexmani_real.runtime.safety import SafetyState
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.camera_freshness import CameraFreshnessTracker
@@ -40,32 +39,30 @@ from dexmani_real.teleop.config import TeleopCommandLimits, TeleopConfig
 from dexmani_real.teleop.control_grid import (
     TeleopControlResources,
     TeleopGridResources,
-    _run_control_grid_tick,
+    run_control_grid_tick,
 )
 from dexmani_real.teleop.control_state import (
     CommandQuiescence,
     CoordinatorDirective,
     TeleopLoopState,
 )
-from dexmani_real.teleop.episode_samples import _stop_recording
-from dexmani_real.teleop.hand_control import _hand_ramp_frame_count
+from dexmani_real.teleop.episode_samples import stop_recording
+from dexmani_real.teleop.hand_control import hand_ramp_frame_count
 from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.operator_controls import (
     TeleopOperatorResources,
-    _advance_post_teleop_state,
-    _apply_operator_controls,
-    _handoff_quiescence_to_home,
-    _poll_recording_lifecycle,
-    _transition_or_fault,
-    _try_init_hand_retargeter_impl,
+    advance_post_teleop_state,
+    apply_operator_controls,
+    handoff_quiescence_to_home,
+    poll_recording_lifecycle,
+    transition_or_fault,
+    try_init_hand_retargeter,
 )
-from dexmani_real.teleop.safety import (
-    _enter_command_quiescence_impl,
-    _hand_feedback_issue_impl,
-)
+from dexmani_real.teleop.safety import enter_command_quiescence, hand_feedback_issue
+from dexmani_real.teleop.timing import StageTimer
 from dexmani_real.teleop.vr_transform import load_vr_transform
 from dexmani_real.utils.log import ThrottledWarner, get_logger
-from dexmani_real.utils.rate_manager import RateManager
+from dexmani_real.utils.rate import LoopRate
 
 logger = get_logger(__name__)
 
@@ -100,7 +97,7 @@ def _policy_exit_fault(
     return None
 
 
-def _start_keyboard(shared: SharedStorage) -> KeyboardHandler | None:
+def _start_keyboard(shared: RuntimeChannels) -> KeyboardHandler | None:
     """Start the required operator input boundary, failing closed on startup errors."""
     keyboard = KeyboardHandler(
         estop_callback=lambda: setattr(shared.estop_request, "value", True)
@@ -115,7 +112,7 @@ def _start_keyboard(shared: SharedStorage) -> KeyboardHandler | None:
 
 
 def _load_control_resources(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     config: TeleopConfig,
     *,
     recording_enabled: bool,
@@ -193,7 +190,7 @@ def _try_load_hand_kinematics(
 
 
 def _wait_for_enabled_capabilities(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     config: TeleopConfig,
     *,
     recording_enabled: bool,
@@ -213,7 +210,7 @@ def _wait_for_enabled_capabilities(
     return None
 
 
-def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> None:
+def teleop_loop(shared: RuntimeChannels, config: TeleopConfig | None = None) -> None:
     """Teleoperation process entry point used by ``collect_teleop.py``.
 
     Reads from rings (vr, arm_state, hand_state, camera), writes actions
@@ -251,15 +248,15 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
     ctx.hand_available = False
     ctx.hand_disconnected_at_s = None  # monotonic timestamp of first bad frame
-    _hand_ramp_total_frames = _hand_ramp_frame_count(
+    _hand_ramp_total_frames = hand_ramp_frame_count(
         cfg.runtime.policy.hand_ramp_duration_s, cfg.runtime.policy.control_hz
     )
 
     def _try_init_hand_retargeter() -> bool:
-        return _try_init_hand_retargeter_impl(ctx, cfg)
+        return try_init_hand_retargeter(ctx, cfg)
 
     def _hand_feedback_issue(state: np.ndarray | None) -> str | None:
-        return _hand_feedback_issue_impl(cfg, state)
+        return hand_feedback_issue(cfg, state)
 
     _hand_fk = _try_load_hand_kinematics(
         cfg,
@@ -341,7 +338,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
     # The coordinator polls controls; only the control grid publishes motion.
     # Avoid spending a CPU core's precision spin window or warning on harmless
     # sub-grid scheduler jitter. Actual skipped control grids are reported below.
-    limiter = RateManager(
+    limiter = LoopRate(
         cfg.runtime.policy.coordinator_hz,
         label="teleop",
         busy_wait=False,
@@ -395,10 +392,10 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         new_state: SafetyState,
         reason: str,
     ) -> bool:
-        return _transition_or_fault(shared, new_state, reason)
+        return transition_or_fault(shared, new_state, reason)
 
     def _handoff_operator_quiescence_to_home() -> None:
-        _handoff_quiescence_to_home(operator_resources)
+        handoff_quiescence_to_home(operator_resources)
 
     def _enter_command_quiescence(
         reason: str,
@@ -406,7 +403,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
         start_new_run: bool = False,
         replace_existing_reason: bool = False,
     ) -> None:
-        _enter_command_quiescence_impl(
+        enter_command_quiescence(
             ctx,
             shared,
             _quiescence,
@@ -432,7 +429,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             shared.set_heartbeat("policy", time.monotonic())
             limiter.wait()
 
-            if not _poll_recording_lifecycle(
+            if not poll_recording_lifecycle(
                 ctx,
                 shared,
                 recorder,
@@ -442,7 +439,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             ):
                 break
 
-            post_teleop_directive = _advance_post_teleop_state(
+            post_teleop_directive = advance_post_teleop_state(
                 ctx,
                 shared,
                 cfg,
@@ -487,7 +484,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
             _controls = tuple(_pending_controls)
             _pending_controls.clear()
-            operator_directive = _apply_operator_controls(
+            operator_directive = apply_operator_controls(
                 ctx,
                 shared,
                 cfg,
@@ -509,7 +506,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
             if not _grid_due:
                 continue
 
-            grid_directive = _run_control_grid_tick(
+            grid_directive = run_control_grid_tick(
                 ctx,
                 shared,
                 cfg,
@@ -524,7 +521,7 @@ def teleop_loop(shared: SharedStorage, config: TeleopConfig | None = None) -> No
 
     finally:
         if ctx.recording_active:
-            _stop_recording(
+            stop_recording(
                 recorder, True, save=False, shared=shared, reason="policy_shutdown"
             )
         kb.stop()

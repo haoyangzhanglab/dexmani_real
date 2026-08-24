@@ -9,19 +9,19 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.defaults import arm, hand, safety
+from dexmani_real.control.arm_home import send_arm_home
+from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
+from dexmani_real.ipc.causal import read_arm_state_causal
+from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import XArm7MotionPlanner
-from dexmani_real.planning.kinematics import make_arm_fk
-from dexmani_real.planning.pose_utils import rot6d_to_quat_wxyz
-from dexmani_real.policy.safety import publish_hand_home_and_wait_applied
-from dexmani_real.robot.homing import send_arm_home
-from dexmani_real.robot.safety import advance_run_generation
-from dexmani_real.shm.causal_reader import read_arm_state_causal
-from dexmani_real.shm.shared_storage import SharedStorage
+from dexmani_real.planning.arm_fk import make_arm_fk
+from dexmani_real.planning.poses import rot6d_to_quat_wxyz
+from dexmani_real.runtime.safety import advance_run_generation
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.control_state import CommandQuiescence, TeleopLoopState
-from dexmani_real.teleop.hand_control import _reset_hand_retargeter
-from dexmani_real.utils.hand_health import validate_arm_feedback, validate_hand_feedback
+from dexmani_real.teleop.hand_control import reset_hand_retargeter
+from dexmani_real.utils.feedback import validate_arm_feedback, validate_hand_feedback
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 
 logger = get_logger(__name__)
@@ -80,7 +80,7 @@ def _reset_mapper_from_frames(
 
 
 def _do_teleop_home(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     *,
     hand_available: bool,
     fixed_hand_home_acknowledged: bool = False,
@@ -123,7 +123,7 @@ def _do_teleop_home(
     if arm_mapper is not None:
         arm_mapper.clear()
     if hand_retargeter is not None:
-        _reset_hand_retargeter(hand_retargeter)
+        reset_hand_retargeter(hand_retargeter)
 
     if hand_available and not shared.error_state.value:
         hand_accepted = publish_hand_home_and_wait_applied(
@@ -210,8 +210,8 @@ def _do_teleop_home(
     return prev_hand_qpos
 
 
-def _do_configured_teleop_home(
-    shared: SharedStorage,
+def do_configured_teleop_home(
+    shared: RuntimeChannels,
     config: TeleopConfig,
     *,
     hand_available: bool,
@@ -265,7 +265,7 @@ def _do_configured_teleop_home(
     )
 
 
-def _arm_feedback_issue(
+def arm_feedback_issue(
     state: np.ndarray | None,
     *,
     now_monotonic_ns: int,
@@ -276,6 +276,7 @@ def _arm_feedback_issue(
         return "arm feedback unavailable"
     issue = validate_arm_feedback(
         connected=bool(state["connected"][0]),
+        error_code=int(state["error_code"][0]),
         state_valid=bool(state["state_valid"][0]),
         source_monotonic_ns=int(state["source_monotonic_ns"][0]),
         now_monotonic_ns=int(now_monotonic_ns),
@@ -285,11 +286,10 @@ def _arm_feedback_issue(
     )
     if issue is not None:
         return issue
-    error_code = int(state["error_code"][0])
-    return None if error_code == 0 else f"arm controller error C{error_code}"
+    return None
 
 
-def _advance_arm_feedback_error_count(
+def advance_arm_feedback_error_count(
     current_count: int,
     issue: str | None,
     *,
@@ -302,7 +302,7 @@ def _advance_arm_feedback_error_count(
     return next_count, next_count >= max_consecutive_errors
 
 
-def _hand_feedback_issue_impl(
+def hand_feedback_issue(
     cfg: TeleopConfig,
     state: np.ndarray | None,
 ) -> str | None:
@@ -320,9 +320,9 @@ def _hand_feedback_issue_impl(
     )
 
 
-def _enter_command_quiescence_impl(
+def enter_command_quiescence(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     quiescence: CommandQuiescence,
     arm_mapper: ArmWristMapper,
     reason: str,
@@ -377,7 +377,7 @@ def _enter_command_quiescence_impl(
     ctx.hand_retarget_cache.reset()
 
 
-def _complete_reanchor_impl(
+def complete_reanchor(
     ctx: TeleopLoopState,
     arm_mapper: ArmWristMapper,
     validate_warn: ThrottledWarner,
@@ -410,5 +410,5 @@ def _complete_reanchor_impl(
     ctx.hand_ramp_start = hand_anchor
     ctx.hand_ramp_step = 0
     ctx.hand_retarget_cache.reset()
-    _reset_hand_retargeter(ctx.hand_retargeter, hand_anchor)
+    reset_hand_retargeter(ctx.hand_retargeter, hand_anchor)
     return True

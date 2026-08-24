@@ -17,22 +17,24 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import numpy as np
 import pyrealsense2 as rs
 from scipy.spatial.transform import Rotation as R
 
+from dexmani_real.calibration.table import fit_table_plane, publish_table_plane
 from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.config.runtime import resolve_runtime_config
+from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
 from dexmani_real.sensor.camera_geometry import RGBDGeometry
 from dexmani_real.sensor.pointcloud import (
     build_point_cloud_with_stats,
     depth_points_in_base,
 )
 from dexmani_real.sensor.realsense import L515DepthConfig, RealSense, RealSenseConfig
-from dexmani_real.sensor.table_calibration import fit_table_plane, publish_table_plane
 
 if TYPE_CHECKING:
     import open3d as o3d
@@ -308,15 +310,15 @@ def _load_extrinsics(
     return T_xarm_base_from_depth, elapsed
 
 
-def _production_config(num_points: int) -> PointCloudConfig:
+def _production_config(
+    runtime: ResolvedRuntimeConfig, num_points: int
+) -> PointCloudConfig:
     """Return the canonical runtime policy with only output size overridden."""
-    runtime = resolve_runtime_config()
     return replace(runtime.pointcloud, num_points=num_points)
 
 
-def _table_plane_path() -> Path:
+def _resolve_table_plane_path(runtime: ResolvedRuntimeConfig) -> Path:
     """Resolve the shared table calibration path from runtime configuration."""
-    runtime = resolve_runtime_config()
     table = runtime.environment.table
     if not table.enabled or table.plane_path is None:
         raise RuntimeError("runtime table calibration is disabled or has no plane_path")
@@ -332,6 +334,7 @@ def _calibrate_table(
     geometry: RGBDGeometry,
     T_xarm_base_from_depth: np.ndarray,
     config: PointCloudConfig,
+    plane_path: Path,
     frame_count: int,
 ) -> tuple[tuple[float, float, float, float], float]:
     """Fit a deterministic multi-frame table plane and optionally publish it."""
@@ -374,7 +377,6 @@ def _calibrate_table(
         f"tilt={fit.tilt_deg:.2f} deg"
     )
 
-    plane_path = _table_plane_path()
     print(
         "  WARNING: publishing updates the shared plane used by point-cloud "
         "cropping and table collision geometry."
@@ -387,8 +389,8 @@ def _calibrate_table(
         backup = publish_table_plane(plane_path, fit, confirmed=True)
         if backup is not None:
             print(f"  Backup: {backup}")
-        runtime_plane = resolve_runtime_config().environment.table.plane_abcd
-        if not np.allclose(runtime_plane, fit.plane_abcd, rtol=0.0, atol=1e-12):
+        resolved_plane = resolve_runtime_config().environment.table.plane_abcd
+        if not np.allclose(resolved_plane, fit.plane_abcd, rtol=0.0, atol=1e-12):
             raise RuntimeError("published plane failed runtime-config round-trip")
         print("  Published and runtime-config round-trip verified.")
     else:
@@ -554,6 +556,11 @@ def main() -> int:
     cfg = PointCloudDiagnosticConfig()
     all_timings: dict[str, float] = {}
 
+    # Resolve and validate file-backed policy before connecting to hardware.
+    runtime = resolve_runtime_config()
+    pcd_config = _production_config(runtime, cfg.target_points)
+    table_plane_path = _resolve_table_plane_path(runtime)
+
     camera = _connect_camera(cfg)
 
     try:
@@ -570,12 +577,12 @@ def main() -> int:
 
         # The diagnostic uses the exact runtime point-cloud policy. The new
         # fit is used immediately whether or not the operator publishes it.
-        pcd_config = _production_config(cfg.target_points)
         table_plane_abcd, calibration_ms = _calibrate_table(
             camera=camera,
             geometry=geometry,
             T_xarm_base_from_depth=T_xarm_base_from_depth,
             config=pcd_config,
+            plane_path=table_plane_path,
             frame_count=cfg.table_calibration_frames,
         )
         all_timings["desk_calib"] = calibration_ms

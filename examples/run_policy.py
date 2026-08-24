@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Usage: ``python examples/run_policy.py --deployment-config FILE``.
+"""Resolve configs and start hardware-affecting learned-policy deployment.
 
-Resolve configs and start learned-policy deployment.
+The deployment can command xArm7/XHand and connect RealSense when required by
+the model observation contract.
 """
 
 from __future__ import annotations
@@ -10,15 +11,17 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import yaml
 
 from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.deployment.config import resolve_deployment_config
 from dexmani_real.deployment.lifecycle import run_policy_deployment
+from dexmani_real.ipc.schema import SUPPORTED_POINT_CLOUD_COUNTS
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.schema import SUPPORTED_POINT_CLOUD_COUNTS
 
 logger = get_logger(__name__)
 

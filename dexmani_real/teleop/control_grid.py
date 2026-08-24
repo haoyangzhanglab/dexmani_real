@@ -8,26 +8,21 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.planning import Pose, XArm7MotionPlanner
-from dexmani_real.planning.hand_kinematics import HandKinematics
-from dexmani_real.planning.kinematics import make_arm_fk
-from dexmani_real.planning.pose_utils import normalize_quat_wxyz, quat_wxyz_to_rot6d
-from dexmani_real.policy.loop_timing import StageTimer
-from dexmani_real.policy.runtime import ActionCandidate
-from dexmani_real.policy.safety import (
-    CommandPublishStatus,
-    GateRejectCode,
-    SafetyGate,
-    publish_joint_targets,
-)
-from dexmani_real.recording.recorder_client import RecorderClient
-from dexmani_real.shm.causal_reader import (
+from dexmani_real.control.action import ActionCandidate
+from dexmani_real.control.publication import CommandPublishStatus, publish_joint_targets
+from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
+from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
     read_causal_structured_frame,
     read_hand_tactile_causal,
     read_vr_frame_causal,
 )
-from dexmani_real.shm.shared_storage import SharedStorage
+from dexmani_real.ipc.channels import RuntimeChannels
+from dexmani_real.planning import Pose, XArm7MotionPlanner
+from dexmani_real.planning.arm_fk import make_arm_fk
+from dexmani_real.planning.hand_fk import HandKinematics
+from dexmani_real.planning.poses import normalize_quat_wxyz, quat_wxyz_to_rot6d
+from dexmani_real.recording.client import RecorderClient
 from dexmani_real.teleop.action_proposal import (
     compute_arm_joint_proposal,
     compute_hand_joint_proposal,
@@ -43,21 +38,22 @@ from dexmani_real.teleop.control_state import (
     TeleopLoopState,
 )
 from dexmani_real.teleop.episode_samples import (
-    _FRAME_IK_FAIL,
-    _FRAME_OK,
-    _FRAME_RETARGET_FAIL,
-    _FRAME_SAFETY_REJECT,
-    _record_frame,
-    _record_held,
-    _stop_recording,
+    FRAME_IK_FAIL,
+    FRAME_OK,
+    FRAME_RETARGET_FAIL,
+    FRAME_SAFETY_REJECT,
+    record_frame,
+    record_held,
+    stop_recording,
 )
 from dexmani_real.teleop.safety import (
-    _advance_arm_feedback_error_count,
-    _arm_feedback_issue,
-    _complete_reanchor_impl,
-    _enter_command_quiescence_impl,
-    _hand_feedback_issue_impl,
+    advance_arm_feedback_error_count,
+    arm_feedback_issue,
+    complete_reanchor,
+    enter_command_quiescence,
+    hand_feedback_issue,
 )
+from dexmani_real.teleop.timing import StageTimer
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 
 logger = get_logger(__name__)
@@ -129,7 +125,7 @@ class TeleopActionComputation:
 
 def _record_grid_hold(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     resources: TeleopGridResources,
     observation: TeleopGridObservation,
     *,
@@ -146,7 +142,7 @@ def _record_grid_hold(
     kwargs: dict[str, Any] = {}
     if frame_status is not None:
         kwargs["frame_status"] = frame_status
-    _record_held(
+    record_held(
         resources.control.recorder,
         observation.arm_state,
         ctx.prev_qpos_cmd,
@@ -174,7 +170,7 @@ def _record_grid_hold(
 
 def _read_control_grid_observation(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     cfg: TeleopConfig,
     resources: TeleopGridResources,
     *,
@@ -198,7 +194,7 @@ def _read_control_grid_observation(
     audio = resources.audio
 
     def _enter_command_quiescence(reason: str) -> None:
-        _enter_command_quiescence_impl(
+        enter_command_quiescence(
             ctx,
             shared,
             _quiescence,
@@ -211,7 +207,7 @@ def _read_control_grid_observation(
         current_vr_frame: dict[str, Any],
         current_hand_state: np.ndarray | None,
     ) -> bool:
-        return _complete_reanchor_impl(
+        return complete_reanchor(
             ctx,
             arm_mapper,
             _validate_warn,
@@ -228,13 +224,13 @@ def _read_control_grid_observation(
     )
     arm_state = None if arm_result is None else arm_result[0]
     arm_ring_sequence = 0 if arm_result is None else int(arm_result[2])
-    arm_issue = _arm_feedback_issue(
+    arm_issue = arm_feedback_issue(
         arm_state,
         now_monotonic_ns=time.monotonic_ns(),
         max_age_s=cfg.runtime.policy.arm_state_stale_threshold_s,
     )
     ctx.arm_feedback_error_count, arm_feedback_fault = (
-        _advance_arm_feedback_error_count(
+        advance_arm_feedback_error_count(
             ctx.arm_feedback_error_count,
             arm_issue,
             max_consecutive_errors=cfg.runtime.policy.max_consecutive_errors,
@@ -279,7 +275,7 @@ def _read_control_grid_observation(
                 cfg.runtime.camera.recording_stall_abort_s,
             )
             print("  ⚠ 相机连续失帧超过阈值，当前 episode 已废弃；遥操作继续")
-            _stop_recording(
+            stop_recording(
                 recorder,
                 ctx.recording_active,
                 save=False,
@@ -300,7 +296,7 @@ def _read_control_grid_observation(
         shared, anchor_monotonic_ns=_current_grid_anchor_ns
     )
 
-    hand_issue = _hand_feedback_issue_impl(cfg, hand_state)
+    hand_issue = hand_feedback_issue(cfg, hand_state)
     if cfg.runtime.policy.hand_enabled and hand_issue is not None:
         now_s = time.monotonic()
         if ctx.hand_disconnected_at_s is None:
@@ -497,7 +493,7 @@ def _compute_action_computation(
 
 def _publish_arm_safety_hold(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     cfg: TeleopConfig,
     resources: TeleopGridResources,
     observation: TeleopGridObservation,
@@ -517,6 +513,7 @@ def _publish_arm_safety_hold(
         observation_id=int(observation.vr_frame["ring_sequence"]),
         observation_anchor_monotonic_ns=int(observation.vr_frame["local_recv_ns"]),
         safety_gate=resources.control.safety_gate,
+        arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
     )
     published_hold = hold_result.candidate
@@ -542,7 +539,7 @@ def _publish_arm_safety_hold(
 
 def _publish_ik_failure_hold(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     cfg: TeleopConfig,
     resources: TeleopGridResources,
     observation: TeleopGridObservation,
@@ -575,6 +572,7 @@ def _publish_ik_failure_hold(
         safety_gate=resources.control.safety_gate,
         hand_mechanical_lower_rad=resources.command_limits.hand_mechanical_lower_rad,
         hand_mechanical_upper_rad=resources.command_limits.hand_mechanical_upper_rad,
+        arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
     )
 
@@ -630,7 +628,7 @@ def _publish_ik_failure_hold(
         resources,
         observation,
         action_candidate=published_candidate,
-        frame_status=_FRAME_IK_FAIL,
+        frame_status=FRAME_IK_FAIL,
         retarget_ok=computation.hand_retarget_succeeded,
         diagnostics=diagnostics,
     )
@@ -639,7 +637,7 @@ def _publish_ik_failure_hold(
 
 def _publish_solved_action(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     cfg: TeleopConfig,
     resources: TeleopGridResources,
     observation: TeleopGridObservation,
@@ -712,7 +710,7 @@ def _publish_solved_action(
             resources,
             observation,
             failure_context="rejected-action",
-            frame_status=_FRAME_SAFETY_REJECT,
+            frame_status=FRAME_SAFETY_REJECT,
             retarget_ok=computation.hand_retarget_succeeded,
         )
 
@@ -726,6 +724,7 @@ def _publish_solved_action(
         safety_gate=gate,
         hand_mechanical_lower_rad=command_limits.hand_mechanical_lower_rad,
         hand_mechanical_upper_rad=command_limits.hand_mechanical_upper_rad,
+        arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
     )
     published_candidate = publish_result.candidate
@@ -746,7 +745,7 @@ def _publish_solved_action(
             resources,
             observation,
             failure_context="workspace-rejection",
-            frame_status=_FRAME_SAFETY_REJECT,
+            frame_status=FRAME_SAFETY_REJECT,
             retarget_ok=computation.hand_retarget_succeeded,
         )
     if not publish_result.succeeded or published_candidate is None:
@@ -785,10 +784,10 @@ def _publish_solved_action(
         ctx.last_target_eef_pos = target_pos.copy()
         ctx.last_target_eef_rot6d = quat_wxyz_to_rot6d(normalize_quat_wxyz(target_quat))
         if not retarget_ok and ctx.hand_available:
-            _f_status = _FRAME_RETARGET_FAIL
+            _f_status = FRAME_RETARGET_FAIL
         else:
-            _f_status = _FRAME_OK
-        _record_frame(
+            _f_status = FRAME_OK
+        record_frame(
             recorder,
             arm_state,
             hand_state,
@@ -826,9 +825,9 @@ def _publish_solved_action(
     return CoordinatorDirective.NORMAL
 
 
-def _run_control_grid_tick(
+def run_control_grid_tick(
     ctx: TeleopLoopState,
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     cfg: TeleopConfig,
     resources: TeleopGridResources,
     *,
@@ -860,6 +859,9 @@ def _run_control_grid_tick(
             observation_id=int(vr_frame["ring_sequence"]),
             observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
             safety_gate=gate,
+            arm_feedback_max_age_s=float(
+                cfg.runtime.safety.heartbeat_timeouts["arm"]
+            ),
             hand_feedback_max_age_s=float(
                 cfg.runtime.safety.heartbeat_timeouts["hand"]
             ),

@@ -19,12 +19,12 @@ from typing import Any, Callable
 import numpy as np
 
 from dexmani_real.config.runtime import ArmLoopConfig
+from dexmani_real.robot_spec import ARM_JOINT_SHAPE
 from dexmani_real.utils.log import (
     capture_native_stdout,
     extract_native_diagnostics,
     get_logger,
 )
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
 logger = get_logger(__name__)
 

@@ -1,0 +1,1 @@
+"""Recording contract tests."""

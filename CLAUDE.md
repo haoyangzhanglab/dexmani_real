@@ -48,7 +48,7 @@ command motion, home hardware, replay an episode, or write calibration unless
 the user explicitly asks. An `examples/` script, import, or constructor is not
 assumed safe until inspected.
 
-Never bypass `SharedStorage`, the unified safety gate, worker-side validation,
+Never bypass `RuntimeChannels`, the unified safety gate, worker-side validation,
 generation/freshness checks, collision checks, or verified shutdown to simplify
 an implementation or make a check pass.
 

@@ -7,7 +7,9 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.utils.schema import (
+from dexmani_real.control.action import ActionCandidate
+from dexmani_real.ipc.channels import RuntimeChannels
+from dexmani_real.ipc.schema import (
     ARM_JOINT_SHAPE,
     HAND_CONTACT_SHAPE,
     HAND_FINGERTIP_SHAPE,
@@ -17,30 +19,33 @@ from dexmani_real.utils.schema import (
     nan_array,
 )
 from dexmani_real.planning import Pose
-from dexmani_real.planning.hand_kinematics import HandKinematics
-from dexmani_real.planning.kinematics import make_arm_fk
-from dexmani_real.planning.pose_utils import compose_pose, normalize_quat_wxyz, quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
-from dexmani_real.policy.runtime import ActionCandidate
-from dexmani_real.recording.recorder_client import RecorderClient
+from dexmani_real.planning.arm_fk import make_arm_fk
+from dexmani_real.planning.hand_fk import HandKinematics
+from dexmani_real.planning.poses import (
+    compose_pose,
+    normalize_quat_wxyz,
+    quat_wxyz_to_rot6d,
+    rot6d_to_quat_wxyz,
+)
+from dexmani_real.recording.client import RecorderClient
 from dexmani_real.robot.types import RobotAction, RobotState
-from dexmani_real.shm.shared_storage import SharedStorage
 
-_FRAME_OK = 0
+FRAME_OK = 0
 _FRAME_HELD = 1
-_FRAME_IK_FAIL = 2
-_FRAME_SAFETY_REJECT = 3
-_FRAME_RETARGET_FAIL = 4
+FRAME_IK_FAIL = 2
+FRAME_SAFETY_REJECT = 3
+FRAME_RETARGET_FAIL = 4
 _OBSERVATION_MAX_SKEW_S = 0.10
 _TACTILE_MAX_AGE_NS = 250_000_000
 _NS_PER_SECOND = 1_000_000_000
 
 
-def _stop_recording(
+def stop_recording(
     recorder: RecorderClient | None,
     was_active: bool,
     *,
     save: bool,
-    shared: SharedStorage | None = None,
+    shared: RuntimeChannels | None = None,
     reason: str = "",
 ) -> None:
     """Stop recording if active. Non-blocking — poll completion in main loop."""
@@ -170,7 +175,7 @@ def _recording_provenance(
     }
 
 
-def _record_held(
+def record_held(
     recorder: RecorderClient | None,
     arm_state: np.ndarray | None,
     hold_arm: np.ndarray,
@@ -192,7 +197,7 @@ def _record_held(
     observation_anchor_monotonic_ns: int | None = None,
     arm_ring_sequence: int = 0,
     hand_ring_sequence: int = 0,
-    shared: SharedStorage | None = None,
+    shared: RuntimeChannels | None = None,
     action_candidate: ActionCandidate | None = None,
 ) -> None:
     """Record an active safety-fallback frame and its optional hold command.
@@ -237,7 +242,7 @@ def _record_held(
         "ik_attempted": frame_status != _FRAME_HELD,
         "retarget_ok": retarget_ok,
         "held": True,
-        "flag_safety_reject": frame_status == _FRAME_SAFETY_REJECT,
+        "flag_safety_reject": frame_status == FRAME_SAFETY_REJECT,
         "frame_status": frame_status,
     }
     if shared is not None:
@@ -265,7 +270,7 @@ def _record_held(
     )
 
 
-def _record_frame(
+def record_frame(
     recorder: RecorderClient | None,
     arm_state: np.ndarray | None,
     hand_state: np.ndarray | None,
@@ -280,7 +285,7 @@ def _record_frame(
     hand_tactile: np.ndarray | None = None,
     *,
     retarget_ok: bool = False,
-    frame_status: int = _FRAME_OK,
+    frame_status: int = FRAME_OK,
     target_eef_pos_raw: np.ndarray | None = None,
     target_eef_rot6d_raw: np.ndarray | None = None,
     action_arm_joint_raw: np.ndarray | None = None,
@@ -294,7 +299,7 @@ def _record_frame(
     observation_anchor_monotonic_ns: int | None = None,
     arm_ring_sequence: int = 0,
     hand_ring_sequence: int = 0,
-    shared: SharedStorage | None = None,
+    shared: RuntimeChannels | None = None,
     action_candidate: ActionCandidate | None = None,
 ) -> None:
     """Record a normal (active teleop) frame.
@@ -335,7 +340,7 @@ def _record_frame(
         "ik_attempted": True,
         "retarget_ok": retarget_ok,
         "held": False,
-        "flag_safety_reject": frame_status == _FRAME_SAFETY_REJECT,
+        "flag_safety_reject": frame_status == FRAME_SAFETY_REJECT,
         "frame_status": frame_status,
         "action_arm_joint_raw": (
             np.asarray(action_arm_joint_raw, dtype=np.float64) if action_arm_joint_raw is not None else arm_cmd.copy()

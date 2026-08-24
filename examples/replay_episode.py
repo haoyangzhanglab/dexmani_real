@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Usage: ``python examples/replay_episode.py EPISODE [--config FILE]``.
+"""Physically replay one recorded episode on xArm7 and optional XHand.
 
-Physically replay one recorded episode on the real robot.
+This is a hardware-affecting entry point and writes replay evaluation results.
 """
 
 from __future__ import annotations
@@ -12,19 +12,21 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import numpy as np
 import yaml
 
 from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
-from dexmani_real.robot.episode_replay import (
+from dexmani_real.replay.controller import ReplayStatus
+from dexmani_real.replay.session import (
     DEFAULT_OUTPUT_DIR,
     EpisodeReplayConfig,
     replay_episode,
 )
-from dexmani_real.robot.replay_controller import ReplayStatus
-from dexmani_real.robot.replay_trajectory import (
+from dexmani_real.replay.trajectory import (
     load_processed_trajectory,
     load_trajectory,
     resolve_episode_path,

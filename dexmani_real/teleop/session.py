@@ -17,41 +17,41 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
-from dexmani_real.planning.constants import (
+from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
+from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
+from dexmani_real.ipc.schema import RECORD_TASK_LABEL_BYTES
+from dexmani_real.recording.client import RecorderPhase
+from dexmani_real.recording.worker import RecorderIOConfig, recorder_io_loop
+from dexmani_real.robot.arm_worker import arm_loop as _arm_loop
+from dexmani_real.robot.hand_worker import hand_loop as _hand_loop
+from dexmani_real.robot_spec import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_RIGHT_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
     XHAND_RIGHT_URDF_PATH,
 )
-from dexmani_real.policy.safety import publish_hand_home_and_wait_applied
-from dexmani_real.recording.io_process import RecorderIOConfig, recorder_io_loop
-from dexmani_real.recording.recorder_client import RecorderPhase
-from dexmani_real.robot.arm_loop import arm_loop as _arm_loop
-from dexmani_real.robot.hand_process import hand_loop as _hand_loop
-from dexmani_real.robot.safety import SafetyState, require_transition, transition
-from dexmani_real.runtime.processes import (
-    ShutdownReport,
-    WorkerSpec,
-    build_processes,
-    start_processes,
-)
+from dexmani_real.runtime.safety import SafetyState, require_transition, transition
 from dexmani_real.runtime.supervisor import (
     print_health_summary,
     run_supervisor,
     shutdown_processes,
     wait_subsystem_ready,
 )
-from dexmani_real.sensor.camera_process import CameraHealth, CameraLoopConfig
-from dexmani_real.sensor.camera_process import camera_loop as _camera_loop
-from dexmani_real.sensor.vr_receiver_process import VRReceiverConfig
-from dexmani_real.sensor.vr_receiver_process import vr_loop as _vr_loop
-from dexmani_real.shm.shared_storage import SharedStorage, SharedStorageConfig
+from dexmani_real.runtime.workers import (
+    ShutdownReport,
+    WorkerSpec,
+    build_processes,
+    start_processes,
+)
+from dexmani_real.sensor.camera_worker import CameraHealth, CameraLoopConfig
+from dexmani_real.sensor.camera_worker import camera_loop as _camera_loop
+from dexmani_real.sensor.vr_worker import VRReceiverConfig
+from dexmani_real.sensor.vr_worker import vr_loop as _vr_loop
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.loop import teleop_loop
 from dexmani_real.teleop.vr_transform import load_vr_transform
-from dexmani_real.utils.hand_health import validate_arm_feedback, validate_hand_feedback
+from dexmani_real.utils.feedback import validate_arm_feedback, validate_hand_feedback
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.schema import RECORD_TASK_LABEL_BYTES
 
 logger = get_logger(__name__)
 
@@ -100,7 +100,7 @@ def _resource_provenance(repo_root: Path) -> tuple[tuple[str, str], ...]:
 
 
 def _preflight_health_issues(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     runtime: Any,
     *,
     hand_enabled: bool,
@@ -115,7 +115,7 @@ def _preflight_health_issues(
     if shared.estop_request.value:
         issues.append("e-stop is requested")
 
-    # The teleop loop reuses the "policy" heartbeat/ready slots in SharedStorage.
+    # The teleop loop reuses the "policy" heartbeat/ready slots in RuntimeChannels.
     enabled_heartbeats = ["arm", "vr", "policy"]
     if hand_enabled:
         enabled_heartbeats.append("hand")
@@ -141,6 +141,7 @@ def _preflight_health_issues(
         current_ns = time.monotonic_ns() if now_ns is None else now_ns
         arm_issue = validate_arm_feedback(
             connected=bool(arm["connected"][0]),
+            error_code=int(arm["error_code"][0]),
             state_valid=bool(arm["state_valid"][0]),
             source_monotonic_ns=int(arm["source_monotonic_ns"][0]),
             now_monotonic_ns=current_ns,
@@ -260,7 +261,7 @@ def _print_session_header(
 
 
 def _build_processes(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     *,
     repo_root: Path,
@@ -337,7 +338,7 @@ def _build_processes(
     return specs
 
 
-def _recording_session_issue(shared: SharedStorage) -> str | None:
+def _recording_session_issue(shared: RuntimeChannels) -> str | None:
     """Return a data-session failure independently of robot safety state."""
     result = shared.record_status_ring.read_latest()
     if result is None:
@@ -401,9 +402,9 @@ def run_teleop_experiment(
     )
 
     ctx = mp.get_context("spawn")
-    shared = SharedStorage.create(
+    shared = RuntimeChannels.create(
         prefix=f"dexmani_collect_{os.getpid()}",
-        config=SharedStorageConfig.from_runtime(runtime),
+        config=RuntimeChannelsConfig.from_runtime(runtime),
         mp_context=ctx,
     )
     specs: list[WorkerSpec] = []
@@ -594,7 +595,7 @@ def run_teleop_experiment(
                     shared_closed = shutdown_report.shared_closed
                 except RuntimeError:
                     logger.critical(
-                        "child process remains alive; leaving SharedStorage linked",
+                        "child process remains alive; leaving RuntimeChannels linked",
                         exc_info=True,
                     )
                     raise
@@ -604,8 +605,8 @@ def run_teleop_experiment(
                     if not shared_closed:
                         shared.error_state.value = True
                         transition(shared, SafetyState.FAULT)
-                        logger.error("SharedStorage cleanup was incomplete")
+                        logger.error("RuntimeChannels cleanup was incomplete")
                 except Exception:
-                    logger.warning("SharedStorage cleanup failed", exc_info=True)
+                    logger.warning("RuntimeChannels cleanup failed", exc_info=True)
                     shared.error_state.value = True
                     transition(shared, SafetyState.FAULT)

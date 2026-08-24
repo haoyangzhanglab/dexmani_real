@@ -18,21 +18,21 @@ import time
 import numpy as np
 
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
+from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
+from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
 from dexmani_real.deployment.config import DeploymentConfig
+from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import (
     Pose,
     TeleopProfile,
     XArm7MotionPlanner,
     XArm7PlannerConfig,
 )
-from dexmani_real.planning.constants import (
+from dexmani_real.robot_spec import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
-from dexmani_real.policy.safety import publish_hand_home_and_wait_applied
-from dexmani_real.robot.homing import ArmHomeConfig, execute_arm_home
-from dexmani_real.robot.safety import SafetyState
-from dexmani_real.shm.shared_storage import SharedStorage
+from dexmani_real.runtime.safety import SafetyState
 from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.log import get_logger
 
@@ -75,7 +75,7 @@ def build_home_planner(runtime: ResolvedRuntimeConfig) -> XArm7MotionPlanner:
     )
 
 
-def _stop_to_armed(shared: SharedStorage) -> bool:
+def _stop_to_armed(shared: RuntimeChannels) -> bool:
     """Stop a RUNNING run and wait for the coordinator to return to ARMED."""
     if int(shared.safety_state.value) != int(SafetyState.RUNNING):
         return int(shared.safety_state.value) == int(SafetyState.ARMED)
@@ -92,7 +92,7 @@ def _stop_to_armed(shared: SharedStorage) -> bool:
 
 
 def _home(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     deployment: DeploymentConfig,
     planner: XArm7MotionPlanner,
@@ -143,7 +143,7 @@ def _home(
 
 
 def run_operator_control(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     deployment: DeploymentConfig,
     planner: XArm7MotionPlanner,

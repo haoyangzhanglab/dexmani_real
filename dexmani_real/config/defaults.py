@@ -13,8 +13,8 @@ from types import MappingProxyType
 import numpy as np
 
 from dexmani_real.config.pointcloud import PointCloudConfig
+from dexmani_real.robot_spec import ARM_JOINT_SHAPE
 from dexmani_real.utils.limits import validate_hand_limit_nesting
-from dexmani_real.utils.schema import ARM_JOINT_SHAPE
 
 _HEARTBEAT_SUBSYSTEMS = frozenset(
     {"arm", "hand", "policy", "recorder", "vr", "camera", "pointcloud", "inference"}

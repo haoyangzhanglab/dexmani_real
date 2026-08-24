@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import importlib
 import time
-from typing import TypeVar
+from typing import Any, cast
 
 import numpy as np
 
@@ -45,14 +45,14 @@ from dexmani_real.deployment.observation import (
     PointCloudFrame,
     parse_observation_fields,
 )
-from dexmani_real.robot.safety import SafetyState
-from dexmani_real.shm.shared_storage import SharedStorage, new_frame
-from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.schema import (
+from dexmani_real.ipc.channels import RuntimeChannels, new_frame
+from dexmani_real.ipc.schema import (
     MAX_POLICY_CHUNK_STEPS,
     POLICY_PLAN_DTYPE,
     validate_point_cloud_array,
 )
+from dexmani_real.runtime.safety import SafetyState
+from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
@@ -60,8 +60,6 @@ logger = get_logger(__name__)
 _NO_FEEDBACK_POLL_S = 0.005
 # Poll interval while ARMED (no inference) — gentler than the feedback poll.
 _ARMED_IDLE_POLL_S = 0.01
-
-_ProtocolT = TypeVar("_ProtocolT")
 
 
 # A ``module:symbol`` target is imported and instantiated only when the
@@ -79,10 +77,10 @@ def _split_target(target: str) -> tuple[str, str]:
 
 def _load(
     target: str,
-    protocol: type[_ProtocolT],
+    protocol: type[Any],
     kind: str,
     config: DeploymentConfig | None,
-) -> _ProtocolT:
+) -> Any:
     module_name, symbol = _split_target(target)
     try:
         module = importlib.import_module(module_name)
@@ -108,11 +106,14 @@ def load_policy_runtime(
     target: str, *, config: DeploymentConfig | None = None
 ) -> PolicyRuntime:
     """Load a :class:`PolicyRuntime` from ``module:symbol``."""
-    return _load(target, PolicyRuntime, "policy runtime", config)
+    return cast(
+        PolicyRuntime,
+        _load(target, PolicyRuntime, "policy runtime", config),
+    )
 
 
 def publish_plan(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     *,
     plan_id: int,
     context: InferenceContext,
@@ -274,7 +275,7 @@ def _pointcloud_frame_from_record(
 
 
 def _read_pointcloud_frame(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     *,
     anchor_ns: int,
     max_age_ns: int,
@@ -299,7 +300,7 @@ def _read_pointcloud_frame(
 
 
 def _read_pointcloud_history(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     *,
     anchor_ns: int,
     max_age_ns: int,
@@ -337,7 +338,7 @@ def _read_pointcloud_history(
 
 
 def _build_observation(
-    shared: SharedStorage,
+    shared: RuntimeChannels,
     config: DeploymentConfig,
     *,
     observation_id: int,
@@ -451,7 +452,7 @@ def _build_observation(
     )
 
 
-def inference_loop(shared: SharedStorage, config: DeploymentConfig) -> None:
+def inference_loop(shared: RuntimeChannels, config: DeploymentConfig) -> None:
     """Inference process entry point — produces proposals, never robot commands.
 
     Startup order: heartbeat early -> lazy import -> instantiate -> load ->
