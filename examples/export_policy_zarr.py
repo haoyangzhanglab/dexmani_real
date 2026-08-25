@@ -40,7 +40,7 @@ def _parser() -> argparse.ArgumentParser:
         "--output",
         type=Path,
         required=True,
-        help="New dataset/<task_name>.zarr path; existing targets are refused.",
+        help="New dataset/<task_name>.zarr path; files, directories, and symlinks are refused.",
     )
     parser.add_argument(
         "--task-name",

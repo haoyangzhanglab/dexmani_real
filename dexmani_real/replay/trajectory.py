@@ -18,6 +18,7 @@ from dexmani_real.ipc.schema import (
     HAND_JOINT_SHAPE,
 )
 from dexmani_real.planning import Pose, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.recording.reader import EpisodeReader
 from dexmani_real.robot_spec import (
     XARM7_XHAND_COLLISION_URDF_PATH,
@@ -365,6 +366,21 @@ def require_hand_actions(trajectory: TrajectoryData) -> None:
         )
 
 
+def replay_start_state(trajectory: TrajectoryData) -> tuple[np.ndarray, np.ndarray]:
+    """Return the finite measured arm/hand state at the first replay frame."""
+    if trajectory.num_frames <= 0:
+        raise ValueError("physical replay trajectory is empty")
+    arm_qpos = np.asarray(trajectory.arm_qpos[0], dtype=np.float64)
+    if arm_qpos.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(arm_qpos)):
+        raise ValueError("physical replay requires a finite first arm_qpos state")
+    if trajectory.hand_qpos is None:
+        raise ValueError("physical replay requires a recorded first hand_qpos state")
+    hand_qpos = np.asarray(trajectory.hand_qpos[0], dtype=np.float64)
+    if hand_qpos.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(hand_qpos)):
+        raise ValueError("physical replay requires a finite first hand_qpos state")
+    return arm_qpos.copy(), hand_qpos.copy()
+
+
 def _verify_trajectory_provenance(
     trajectory: TrajectoryData,
     *,
@@ -434,16 +450,17 @@ def verify_replay_preflight(
 ) -> None:
     """Fail-closed validation immediately before spawning hardware workers.
 
-    Checks: hand-data attestation, provenance (source/config/models), and every
-    adjacent-frame pair for workspace bounds and collision (self-collision plus
-    static obstacle boxes). Robot-table contact is deliberately not a replay
-    rejection condition (user_design.md §3): replayed episodes were recorded by
-    teleop without table gating, and table clearance remains enforced on the
-    return-home path. Called once before worker startup; any rejection prevents
-    hardware access entirely.  For a processed artifact (``trajectory.processed``),
-    the recording-time model (URDF/SRDF) provenance check is skipped — that hash is
-    not carried forward — but the source-stream, config-hash, workspace, and
-    collision checks all still apply.
+    Checks: recorded first measured state, hand-data attestation, provenance
+    (source/config/models), the recorded-state-to-first-command transition, and
+    every adjacent command pair for workspace bounds and collision
+    (self-collision plus static obstacle boxes). Robot-table contact is
+    deliberately not a replay rejection condition (user_design.md §3): replayed
+    episodes were recorded by teleop without table gating, and table clearance
+    remains enforced on the return-home path. Called once before worker startup;
+    any rejection prevents hardware access entirely. For a processed artifact
+    (``trajectory.processed``), the recording-time model (URDF/SRDF) provenance
+    check is skipped — that hash is not carried forward — but the source-stream,
+    config-hash, workspace, and collision checks all still apply.
     """
     require_hand_actions(trajectory)
     if not bool(runtime.policy.hand_enabled):
@@ -461,6 +478,11 @@ def verify_replay_preflight(
             "without a recording-time model hash to compare"
         )
     modeled_hand = modeled_hand_actions(trajectory)
+    recorded_arm_start, recorded_hand_start = replay_start_state(trajectory)
+    arm_lower = np.asarray(runtime.arm.joint_limit_lower, dtype=np.float64)
+    arm_upper = np.asarray(runtime.arm.joint_limit_upper, dtype=np.float64)
+    if np.any(recorded_arm_start < arm_lower) or np.any(recorded_arm_start > arm_upper):
+        raise ValueError("physical replay first arm_qpos violates joint limits")
     workspace = np.array(
         [
             [runtime.policy.workspace.x_min, runtime.policy.workspace.x_max],
@@ -484,6 +506,21 @@ def verify_replay_preflight(
         table=None,
     )
     arm_actions = np.asarray(trajectory.action_arm_joint, dtype=np.float64)
+    first_arm_cmd = wrap_nearest_equivalent(
+        arm_actions[0],
+        recorded_arm_start,
+        tuple(runtime.arm.joint_limit_lower),
+        tuple(runtime.arm.joint_limit_upper),
+    )
+    if not planner.is_workspace_segment_safe(recorded_arm_start, first_arm_cmd):
+        raise ValueError("physical replay workspace rejection at recorded start->0")
+    if not planner.collision_model.check_transition_collision_free(
+        recorded_arm_start,
+        first_arm_cmd,
+        recorded_hand_start,
+        modeled_hand[0],
+    ):
+        raise ValueError("physical replay collision rejection at recorded start->0")
     for index in range(max(1, trajectory.num_frames - 1)):
         start = min(index, trajectory.num_frames - 1)
         end = min(index + 1, trajectory.num_frames - 1)

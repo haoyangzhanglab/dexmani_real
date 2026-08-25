@@ -819,31 +819,6 @@ def _run_keyboard_session(
 
     keys.start()
     require_transition(shared, SafetyState.ARMED)
-    # Servo the hand home position to prevent drift near mechanical limits.
-    if hand_enabled:
-        hand_home = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
-        if publish_hand_home_and_wait_applied(
-            shared,
-            hand_home,
-            command_lower_rad=np.asarray(runtime.hand.qpos_min_rad, dtype=np.float64),
-            command_upper_rad=np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64),
-            mechanical_lower_rad=np.asarray(
-                runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
-            ),
-            mechanical_upper_rad=np.asarray(
-                runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
-            ),
-            hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
-            timeout_s=float(runtime.hand.home_command_ack_timeout_s),
-            heartbeat=False,
-            abort_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
-        ):
-            planner.set_hand_qpos(hand_home)
-        else:
-            logger.warning(
-                "Startup hand-home command was not accepted; "
-                "hand may be outside command limits"
-            )
     print(
         f"Keyboard teleop: {runtime.keyboard_teleop.control_hz:g}Hz, "
         f"hand={'measured' if hand_enabled else 'assumed-home'}, config={runtime.sha256[:12]}"

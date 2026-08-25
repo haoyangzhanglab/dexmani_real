@@ -7,11 +7,11 @@ Self-contained Rerun-based visualizer for processed HDF5 v7
 no files; opens a Rerun viewer window (or prints a structure summary with
 ``--info``).
 
-Unlike ``examples/visualize_episode.py``, which only displays the camera and
-state data stored in a raw episode directory, this reads a single ``.h5`` file
-whose RGB, depth, and point cloud are already stored grid-aligned at ``(T,
-...)``. The point cloud is precomputed in the xArm base frame, so nothing is
-back-projected here.
+Unlike ``examples/visualize_episode.py``, which derives a current-config point
+cloud preview from raw v22 RGB-D, this reads a single ``.h5`` file whose RGB,
+depth, and point cloud are already stored grid-aligned at ``(T, ...)`` with
+processing provenance. The point cloud is precomputed in the xArm base frame,
+so nothing is back-projected here.
 
 Examples::
 

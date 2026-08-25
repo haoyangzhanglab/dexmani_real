@@ -8,9 +8,8 @@ import shutil
 import tempfile
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, cast
+from typing import Any, Iterator
 
 import h5py
 import numpy as np
@@ -22,19 +21,23 @@ from dexmani_real.data.contracts import (
     EpisodeDecision,
     ProcessingConfig,
 )
+from dexmani_real.data.raw_pointcloud import (
+    RawEpisodePointCloudDeriver,
+    load_raw_episode_base_from_color,
+    load_raw_episode_camera_model,
+    validate_rigid_transform,
+)
 from dexmani_real.data.transforms import (
     resize_camera_intrinsic,
     resize_depth,
     resize_rgb,
 )
 from dexmani_real.recording.reader import EpisodeReader
-from dexmani_real.sensor.camera_geometry import CameraIntrinsics, RGBDGeometry
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
     POINT_CLOUD_SAMPLING,
     POINT_CLOUD_TRANSFORM,
-    build_point_cloud,
 )
 from dexmani_real.utils.atomic_io import atomic_publish
 from dexmani_real.utils.log import get_logger
@@ -57,130 +60,6 @@ def _sha256_file(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _validate_transform(transform: np.ndarray, *, label: str) -> np.ndarray:
-    value = np.asarray(transform, dtype=np.float64).reshape(4, 4)
-    if not np.all(np.isfinite(value)):
-        raise ValueError(f"{label} must be finite")
-    if not np.allclose(value[3], (0.0, 0.0, 0.0, 1.0), atol=1e-8, rtol=0.0):
-        raise ValueError(f"{label} must be homogeneous")
-    rotation = value[:3, :3]
-    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5, rtol=0.0):
-        raise ValueError(f"{label} rotation must be orthonormal")
-    if not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-5, rtol=0.0):
-        raise ValueError(f"{label} rotation determinant must be +1")
-    return value
-
-
-def _intrinsics_from_meta(meta: Any, *, stream: str) -> CameraIntrinsics:
-    prefix = f"camera_{stream}"
-    matrix = np.asarray(meta[f"{prefix}_intrinsics"], dtype=np.float64).reshape(3, 3)
-    if not np.allclose(matrix[2], (0.0, 0.0, 1.0), rtol=0.0, atol=1e-9):
-        raise ValueError(f"{prefix}_intrinsics must be a canonical pinhole matrix")
-    coefficients = tuple(float(value) for value in meta[f"{prefix}_distortion_coeffs"])
-    return CameraIntrinsics(
-        width=int(meta[f"{prefix}_width"]),
-        height=int(meta[f"{prefix}_height"]),
-        fx=float(matrix[0, 0]),
-        fy=float(matrix[1, 1]),
-        ppx=float(matrix[0, 2]),
-        ppy=float(matrix[1, 2]),
-        distortion_model=str(meta[f"{prefix}_distortion_model"]),
-        distortion_coeffs=cast(tuple[float, float, float, float, float], coefficients),
-    )
-
-
-def _geometry_from_reader(reader: EpisodeReader) -> RGBDGeometry:
-    if reader.schema_version != 22:
-        raise ValueError(
-            "processed v7 requires depth_to_color raw schema v22, "
-            f"got v{reader.schema_version}"
-        )
-    meta = reader.h5f["meta"].attrs
-    native_geometry = RGBDGeometry(
-        depth=_intrinsics_from_meta(meta, stream="depth"),
-        color=_intrinsics_from_meta(meta, stream="color"),
-        T_color_from_depth=np.asarray(
-            meta["camera_T_color_from_depth"], dtype=np.float64
-        ).reshape(4, 4),
-    )
-    return native_geometry.aligned_depth_to_color()
-
-
-def _require_supported_processed_camera_pose(reader: EpisodeReader) -> None:
-    """Fail closed unless the raw timing contract supports camera geometry.
-
-    ``eye_to_hand`` uses a static calibration and is always supported.
-    ``eye_in_hand`` would need the wrist pose evaluated at the aligned
-    color/depth exposure times, but raw v22 does not persist per-stream
-    host-mapped camera source timestamps, so any camera-modal profile must
-    fail before a processed artifact is written.
-    """
-    camera_type = str(reader.h5f["meta"].attrs.get("camera_type", ""))
-    if camera_type == "eye_to_hand":
-        return
-    if camera_type == "eye_in_hand":
-        raise ValueError(
-            "processed RGB/camera_extrinsic/pointcloud for eye_in_hand requires "
-            "arm pose evaluated at color/depth exposure times; raw v22 "
-            "does not persist per-stream host-mapped camera source timestamps"
-        )
-    raise ValueError(f"unsupported camera_type {camera_type!r}")
-
-
-def _base_from_color_transform(reader: EpisodeReader) -> np.ndarray:
-    meta = reader.h5f["meta"].attrs
-    _require_supported_processed_camera_pose(reader)
-    return _validate_transform(
-        np.asarray(meta["camera_T_xarm_base_from_color"]),
-        label="camera_T_xarm_base_from_color",
-    )
-
-
-def _color_transform(reader: EpisodeReader, geometry: RGBDGeometry) -> np.ndarray:
-    del geometry
-    return _base_from_color_transform(reader)
-
-
-@dataclass
-class _PointCloudDeriver:
-    """Resolved deterministic point-cloud state for one source."""
-
-    reader: EpisodeReader
-    geometry: RGBDGeometry
-    depth_scale: float
-    config: ProcessingConfig
-    static_base_from_color: np.ndarray
-
-    @classmethod
-    def from_reader(
-        cls, reader: EpisodeReader, config: ProcessingConfig
-    ) -> _PointCloudDeriver:
-        meta = reader.h5f["meta"].attrs
-        geometry = _geometry_from_reader(reader)
-        depth_scale = float(meta["depth_scale"])
-        if not np.isfinite(depth_scale) or depth_scale <= 0.0:
-            raise ValueError("depth_scale must be finite and positive")
-        return cls(
-            reader=reader,
-            geometry=geometry,
-            depth_scale=depth_scale,
-            config=config,
-            static_base_from_color=_base_from_color_transform(reader),
-        )
-
-    def derive(self, source_index: int, rgb: np.ndarray) -> np.ndarray | None:
-        depth_raw = np.asarray(self.reader.h5f["depth"][source_index], dtype=np.uint16)
-        return build_point_cloud(
-            depth_raw=depth_raw,
-            color=np.asarray(rgb, dtype=np.uint8),
-            depth_scale_m=self.depth_scale,
-            geometry=self.geometry,
-            T_xarm_base_from_color=self.static_base_from_color,
-            table_plane_abcd=self.config.table_plane_abcd,
-            config=self.config.pointcloud,
-        )
 
 
 def _derive_depth_valid_mask(reader: EpisodeReader) -> np.ndarray:
@@ -472,10 +351,12 @@ def _write_processed_episode(
 ) -> dict[str, Any]:
     path = output_root / f"{reader.h5_path.name}.h5"
     selected = decision.selected_indices
-    # Fail closed before creating the output file: camera-modal profiles
-    # require an eye_to_hand static transform (see the guard's docstring).
+    camera_model = None
+    T_xarm_base_from_color = None
     if config.profile.needs_rgb or config.profile.needs_pointcloud:
-        _require_supported_processed_camera_pose(reader)
+        # Resolve the raw-v22 geometry boundary before creating output.
+        camera_model = load_raw_episode_camera_model(reader)
+        T_xarm_base_from_color = load_raw_episode_base_from_color(reader)
     with h5py.File(path, "w") as output:
         _write_attrs(output, reader, decision, config, annotation)
         _create_data_datasets(output, decision.selected_frames, config)
@@ -533,8 +414,9 @@ def _write_processed_episode(
         )
 
         if config.profile.needs_rgb:
-            meta = reader.h5f["meta"].attrs
-            geometry = _geometry_from_reader(reader)
+            assert camera_model is not None
+            assert T_xarm_base_from_color is not None
+            geometry = camera_model.geometry
             camera_k = resize_camera_intrinsic(
                 geometry.color.matrix(),
                 source_height=geometry.color.height,
@@ -544,7 +426,7 @@ def _write_processed_episode(
             )
             output["camera_intrinsic"][:] = camera_k[None, :]
             output["camera_extrinsic"][:] = np.broadcast_to(
-                _color_transform(reader, geometry),
+                T_xarm_base_from_color,
                 output["camera_extrinsic"].shape,
             ).astype(np.float32)
             for target_index, source_index in enumerate(selected):
@@ -555,11 +437,18 @@ def _write_processed_episode(
                     width=config.target_rgb_width,
                 )
 
-        pointcloud_deriver = (
-            _PointCloudDeriver.from_reader(reader, config)
-            if config.profile.needs_pointcloud
-            else None
-        )
+        if config.profile.needs_pointcloud:
+            assert camera_model is not None
+            assert T_xarm_base_from_color is not None
+            pointcloud_deriver = RawEpisodePointCloudDeriver(
+                reader=reader,
+                camera=camera_model,
+                T_xarm_base_from_color=T_xarm_base_from_color,
+                pointcloud=config.pointcloud,
+                table_plane_abcd=config.table_plane_abcd,
+            )
+        else:
+            pointcloud_deriver = None
         if config.profile.needs_rgb or config.profile.needs_pointcloud:
             target_by_source = {
                 int(source_index): target_index
@@ -686,7 +575,7 @@ def validate_processed_hdf5(
             if np.any(k[:, (0, 4)] <= 0.0) or not np.allclose(k[:, 8], 1.0):
                 raise ValueError(f"{artifact.name}: invalid camera_intrinsic")
             for transform in source["camera_extrinsic"]:
-                _validate_transform(transform, label="camera_extrinsic")
+                validate_rigid_transform(transform, label="camera_extrinsic")
             scale = float(source.attrs.get("depth_scale_m_per_unit", np.nan))
             if not np.isfinite(scale) or scale <= 0.0:
                 raise ValueError(f"{artifact.name}: invalid depth scale")
@@ -709,7 +598,7 @@ def validate_processed_hdf5(
             )
             if depth_k.shape != (9,) or not np.all(np.isfinite(depth_k)):
                 raise ValueError(f"{artifact.name}: invalid native depth intrinsics")
-            _validate_transform(
+            validate_rigid_transform(
                 color_from_depth,
                 label="camera_T_color_from_depth",
             )

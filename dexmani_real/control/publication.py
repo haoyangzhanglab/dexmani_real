@@ -512,6 +512,7 @@ def publish_joint_targets(
     safety_gate: SafetyGate | None = None,
     wait_applied: bool = False,
     apply_timeout_s: float = 0.5,
+    action_validity_s: float = 0.5,
     hand_mechanical_lower_rad: np.ndarray | None = None,
     hand_mechanical_upper_rad: np.ndarray | None = None,
     arm_feedback_max_age_s: float,
@@ -528,7 +529,8 @@ def publish_joint_targets(
     hand command cannot desync the arm from the hand.
 
     ``hand_mechanical_lower_rad`` / ``hand_mechanical_upper_rad`` default to the
-    rated device envelope.
+    rated device envelope. ``action_validity_s`` bounds how long a worker may
+    continue a measured-state-bounded hand ramp toward this endpoint.
 
     Returns a typed validation/publication result. On success, ``candidate``
     contains the immutable target that was published (and, when
@@ -543,6 +545,8 @@ def publish_joint_targets(
     runtime_rejection = check_runtime_gate(shared)
     if runtime_rejection is not None:
         return runtime_rejection
+    if not np.isfinite(action_validity_s) or action_validity_s <= 0.0:
+        raise ValueError("action_validity_s must be finite and positive")
 
     try:
         candidate = build_action_candidate(
@@ -552,6 +556,7 @@ def publish_joint_targets(
             is_hold=is_hold,
             observation_id=observation_id,
             observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
+            action_validity_s=action_validity_s,
         )
     except (TypeError, ValueError) as exc:
         logger.warning("publish_joint_targets: invalid candidate: %s", exc)

@@ -23,7 +23,7 @@ from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_SAMPLING,
     POINT_CLOUD_TRANSFORM,
 )
-from dexmani_real.utils.atomic_io import atomic_publish
+from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 
 POLICY_ZARR_SCHEMA_NAME = "dexmani-real-policy-zarr"
 POLICY_ZARR_SCHEMA_VERSION = 3
@@ -370,7 +370,7 @@ def export_processed_hdf5_to_zarr(
     target = Path(output_path)
     if not source_root.is_dir():
         raise NotADirectoryError(source_root)
-    if target.exists():
+    if target_is_occupied(target):
         raise FileExistsError(f"refusing to overwrite existing policy Zarr: {target}")
     hdf5_paths = tuple(
         sorted(

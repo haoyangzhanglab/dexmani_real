@@ -17,7 +17,6 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
-from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.ipc.schema import RECORD_OPERATOR_BYTES, RECORD_TASK_LABEL_BYTES
 from dexmani_real.recording.client import RecorderPhase, bounded_control_text
@@ -516,37 +515,6 @@ def run_teleop_experiment(
             return 1
 
         require_transition(shared, SafetyState.ARMED)
-
-        # Reset XHand to its configured home after initialization and ARM.
-        if hand_enabled:
-            hand_home = np.deg2rad(
-                np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)
-            )
-            hand_home_accepted = publish_hand_home_and_wait_applied(
-                shared,
-                hand_home,
-                command_lower_rad=np.asarray(
-                    runtime.hand.qpos_min_rad, dtype=np.float64
-                ),
-                command_upper_rad=np.asarray(
-                    runtime.hand.qpos_max_rad, dtype=np.float64
-                ),
-                mechanical_lower_rad=np.asarray(
-                    runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
-                ),
-                mechanical_upper_rad=np.asarray(
-                    runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
-                ),
-                hand_feedback_max_age_s=float(
-                    runtime.safety.heartbeat_timeouts["hand"]
-                ),
-                timeout_s=float(runtime.hand.home_command_ack_timeout_s),
-                heartbeat=False,
-            )
-            if not hand_home_accepted:
-                logger.warning(
-                    "XHand reset-to-home was not acknowledged by the worker/SDK"
-                )
 
         begin_label = "teleop+record" if recording_enabled else "teleop"
         print(

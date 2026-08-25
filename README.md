@@ -18,6 +18,11 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 - XHand 已知的抓取接触过流码 `1501035` 在发送位置命令时会被接受，不中止抓取，并记入
   episode 质量指标；同一码在状态读取失败时不生成伪造的新鲜反馈。持续数据不可用仍由
   新鲜度和 watchdog 边界处理。
+- XHand worker 每次成功连接并完成触觉初始化后，会在发布 ready 前无条件发送一次配置的
+  `home_qpos`；连接 XHand 会引起手指运动，该初始化 reset 不等待物理收敛。
+- physical replay 以记录的首帧**实测 arm**关节状态作为起点：xArm 需先由操作者受监督地
+  定位；XHand 在连接 reset 后，以首帧手部命令完成 3 秒安全 warm-up，并经实时
+  自碰撞/静态障碍检查和新鲜反馈确认后才从 frame 0 开始重放。手部反馈不要求复现录制值。
 - RealSense 相机按设备原生频率连续采集；16 Hz 控制网格只选择最新严格因果帧，
   不再将相机发布节拍绑定到控制频率。
 - 事务式写入 depth-to-color aligned RGB-D raw episode v22；保留 native depth/color 几何与时序 provenance。
@@ -238,10 +243,15 @@ python examples/process_episodes.py \
 `--profile` 选择 `joint`、`rgb`、`pointcloud` 或 `rgb_pc`。后两种 profile 可用
 `--pointcloud-num-points` 选择 `1024`、`2048`、`4096` 或 `8192`，默认 `1024`。
 
-raw episode 可视化只展示文件实际存储的相机与状态数据。需要检查 canonical 点云时，先用
-`process_episodes.py` 生成 processed HDF5 v7，再运行
-`python examples/visualize_episode_processed.py <processed.h5>`；该入口会校验 `(N,6)`、
-`float32`、xArm-base 坐标系、RGB 范围、算法/采样语义、配置哈希与桌面标定身份。
+raw v22 episode 可视化默认使用当前 resolved runtime 中的点云策略和桌面标定即时生成
+canonical `(N,6)` 点云；该路径与 offline processing、实时 deployment 共用同一个
+`build_point_cloud()` 实现。记录期与当前 runtime config 哈希不一致时会明确 warning；raw v21
+没有 depth-to-color aligned 合同，默认只显示相机和状态。使用 `--no-point-cloud` 可关闭即时点云，
+`--pointcloud-num-points` 可选择 `1024`、`2048`、`4096` 或 `8192`。
+
+需要检查已清洗、持久化及 provenance 完整的点云时，仍应先用 `process_episodes.py` 生成
+processed HDF5 v7，再运行 `python examples/visualize_episode_processed.py <processed.h5>`；该入口
+会校验 `(N,6)`、`float32`、xArm-base 坐标系、RGB 范围、算法/采样语义、配置哈希与桌面标定身份。
 
 发布时逐 episode 显示 tqdm 进度（stderr），终端只打印精简汇总，不再向 stdout 输出 JSON。
 需要机器可读报告时加 `--write-report`，发布成功后在
@@ -257,10 +267,12 @@ python examples/export_policy_zarr.py \
   --task-name <task>
 ```
 
-输出目标已存在时会拒绝覆盖。可视化 raw episode：
+`--output` 必须是新路径；已有文件、目录或符号链接（包括悬空链接）都会拒绝覆盖。
+可视化 raw episode：
 
 ```bash
 python examples/visualize_episode.py episodes/<task>/episode_*
+python examples/visualize_episode.py episodes/<task>/episode_* --no-point-cloud
 ```
 
 可视化处理后的 processed HDF5（rgb/depth 与预计算点云已在文件内，离线、不连硬件）：

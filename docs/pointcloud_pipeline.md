@@ -46,11 +46,30 @@ Intel RealSense
         fixed float32[N, 6], frame=xarm_base
                  │
                  ├─ pointcloud_ring → deployment / policy observation
-                 └─ raw v22 → offline process → processed HDF5 v7 → Policy Zarr
+                 └─ raw v22
+                      ├─ raw visualizer → Rerun canonical preview
+                      └─ offline process → processed HDF5 v7 → Policy Zarr
 ```
 
 实时 worker 不排队旧帧：它只读取 `camera_ring` 的最新 sequence，并在构建前后检查相机健康、
 generation、时钟重置和最大帧龄。结果在计算后已过期时不会发布。
+
+## Raw episode 即时可视化
+
+`examples/visualize_episode.py` 对 raw v22 默认启用点云。持久化边界由
+`data/raw_pointcloud.py` 统一解析：它从 episode 读取 aligned RGB-D 几何、`depth_scale` 与
+`T_xarm_base_from_color`，再调用和 offline processing、实时 worker 相同的
+`sensor.pointcloud.build_point_cloud()`。可视化入口不维护第二套反投影、裁减或采样实现。
+
+raw episode 保存记录期 resolved config 的 SHA-256，但不复制可反序列化的完整点云策略与桌面
+平面。因此即时点云使用当前 resolved runtime 的 `PointCloudConfig` 和桌面标定；哈希与记录期不一致
+时入口会 warning，结果应视为 current-config preview。需要可持久复现和完整 provenance 时，应生成
+processed HDF5；其文件内保存 processing config、点云配置哈希与桌面平面身份。
+
+raw v21 的 depth 是 native depth 像素网格，没有 v22 的 depth-to-color aligned 合同，因此不会
+尝试生成 canonical 点云。`--no-point-cloud` 可关闭 v22 即时推导；单帧构建结果为空时 Rerun 会显式
+清除该时间点的点云，避免沿用上一帧。eye-in-hand 仍会 fail closed，因为 raw v22 没有保存相机曝光
+时刻对应的机械臂位姿。
 
 ## 坐标系与对齐语义
 
@@ -301,6 +320,8 @@ capture-to-cloud p50 比 pure-build p50 高约 4.6 ms，但其 p95 差约 9.5 ms
 | 最新帧消费、freshness 与 point-cloud IPC 发布 | `sensor/pointcloud_worker.py` |
 | 点云参数与稳定 identity | `config/pointcloud.py` |
 | 桌面 RANSAC 与 plane 文件 | `calibration/table.py`、`config/desk_plane.json` |
+| raw v22 相机 metadata 与点云输入适配 | `data/raw_pointcloud.py` |
 | raw v22 → processed v7 | `data/process.py` |
+| raw current-config preview | `examples/visualize_episode.py` |
 
 核心数学不访问 SDK、共享内存、文件或可视化；硬件采集、IPC、标定写入和 GUI 均在外围 owner 中。

@@ -8,6 +8,12 @@ import tempfile
 from pathlib import Path
 
 
+def target_is_occupied(path: str | Path) -> bool:
+    """Treat files, directories, and dangling symlinks as occupied targets."""
+    target = Path(path)
+    return target.exists() or target.is_symlink()
+
+
 def _fsync_path(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -35,12 +41,12 @@ def fsync_tree(path: str | Path) -> None:
 
 
 def atomic_publish(src: str | Path, dst: str | Path) -> Path:
-    """Fsync and rename one unpublished artifact without copy fallback."""
+    """Fsync and publish one unpublished artifact to an unoccupied target."""
     source = Path(src)
     target = Path(dst)
     if source.parent.resolve() != target.parent.resolve():
         raise OSError("temporary and final artifacts must share one parent filesystem")
-    if target.exists():
+    if target_is_occupied(target):
         raise FileExistsError(f"refusing to overwrite existing artifact: {target}")
     fsync_tree(source)
     os.rename(source, target)

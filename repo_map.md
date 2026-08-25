@@ -170,7 +170,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | 文件 | 主要职责 |
 |---|---|
 | `__init__.py` | `EpisodeReader`/`EpisodeRecorder` 等稳定公开 facade。 |
-| `schema.py` | raw episode v21 persisted schema。 |
+| `schema.py` | raw episode v22 persisted schema 与 v21/v22 reader compatibility。 |
 | `frame.py` | IPC record 到 immutable owned `EpisodeFrame` 的唯一 decode 边界。 |
 | `timeline.py` | 多速率输入到 fixed grid 的 timestamp 对齐与填充原因。 |
 | `recorder.py` | raw episode transaction、质量汇总、验证与原子发布。 |
@@ -179,7 +179,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `video.py` | PyAV RGB 编解码与 codec 配置。 |
 | `client.py` | controller 侧 recorder protocol、sample publication 与 stop result。 |
 | `worker.py` | RecorderIO active generation、sequence continuity、transaction 与 finalize。 |
-| `reader.py` | published v21 校验、HDF5 merged view 与 RGB/depth 读取。 |
+| `reader.py` | published v21/v22 校验、HDF5 merged view 与 RGB/depth 读取。 |
 
 ### `data/`
 
@@ -190,6 +190,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `quality.py` | 停滞、抖动、突变等 temporal quality 纯函数审计。 |
 | `clean.py` | raw flags、limits、annotations 与质量结果到保留/拒绝决定。 |
 | `transforms.py` | RGB/depth/intrinsics 的确定性数值变换。 |
+| `raw_pointcloud.py` | raw v22 相机 metadata 到 canonical 点云输入的共享持久化边界。 |
 | `process.py` | aligned raw v22 到 processed HDF5 v7 的事务式管线。 |
 | `export.py` | processed HDF5 到 Policy Zarr v3 的事务式导出。 |
 
@@ -214,8 +215,8 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | 文件 | 主要职责 |
 |---|---|
 | `__init__.py` | 轻量回放子包标记。 |
-| `trajectory.py` | raw/processed trajectory 加载、provenance 与模型 preflight。 |
-| `controller.py` | fixed-rate safety-gated physical replay 调度。 |
+| `trajectory.py` | raw/processed trajectory 加载、provenance、首帧状态与模型 preflight。 |
+| `controller.py` | XHand 首帧目标 warm-up、fixed-rate safety-gated physical replay 调度。 |
 | `capture.py` | measured state、sent command 与 rejection 的有界捕获。 |
 | `evaluation.py` | tracking/consistency 指标与结果持久化。 |
 | `session.py` | worker、safety transition、operator flow、评估与 cleanup owner。 |
@@ -227,7 +228,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `integrations/__init__.py` | 外部集成子包标记。 |
 | `integrations/dexmani_policy.py` | 外部 `dexmani_policy` runtime 与 manifest adapter。 |
 | `utils/__init__.py` | 轻量通用工具子包标记。 |
-| `utils/atomic_io.py` | fsync、atomic publish 与 atomic JSON。 |
+| `utils/atomic_io.py` | fsync、拒绝已有文件/目录/链接的 atomic publish 与 atomic JSON。 |
 | `utils/feedback.py` | arm/hand feedback freshness、finite 与 health predicate。 |
 | `utils/limits.py` | XHand rated/mechanical/command limit nesting。 |
 | `utils/log.py` | logging、native stdout capture 与 throttled warning。 |
@@ -247,7 +248,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `replay_episode.py` | 物理回放入口。 |
 | `process_episodes.py` | raw → processed HDF5 离线处理。 |
 | `export_policy_zarr.py` | processed HDF5 → Policy Zarr 离线导出。 |
-| `visualize_episode.py` | raw episode 离线可视化。 |
+| `visualize_episode.py` | raw v21/v22 离线可视化与 v22 canonical 点云即时预览。 |
 | `visualize_episode_processed.py` | processed episode 离线可视化。 |
 | `calibrate_camera.py` | xArm+RealSense hand-eye 标定入口。 |
 | `calibrate_vr_heading.py` | VR heading 采集、质量门禁与 transform 发布。 |

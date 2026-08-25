@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.runtime import ResolvedRuntimeConfig
-from dexmani_real.control.publication import publish_joint_targets
+from dexmani_real.control.publication import CommandPublishStatus, publish_joint_targets
 from dexmani_real.control.safety_gate import SafetyGate, planner_action_safety_gate
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
@@ -27,7 +27,7 @@ from dexmani_real.planning import (
 from dexmani_real.planning.arm_fk import make_arm_fk
 from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.replay.capture import ReplayRecorder
-from dexmani_real.replay.trajectory import TrajectoryData
+from dexmani_real.replay.trajectory import TrajectoryData, replay_start_state
 from dexmani_real.robot_spec import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
@@ -46,6 +46,7 @@ logger = get_logger(__name__)
 _STATUS_INTERVAL_FRAMES = 50
 _WAIT_POLL_INTERVAL_S = 0.01
 _ARM_STREAMING_WAIT_TIMEOUT_S = 2.0
+_START_HAND_WARMUP_S = 3.0
 
 
 class ReplayStatus(str, Enum):
@@ -69,6 +70,20 @@ class ReplayOutcome:
     @property
     def successful(self) -> bool:
         return self.status in (ReplayStatus.COMPLETED, ReplayStatus.USER_QUIT)
+
+
+def _max_joint_deviation_deg(
+    measured_qpos: np.ndarray, reference_qpos: np.ndarray
+) -> tuple[float, int]:
+    """Return the largest absolute joint error in degrees and its index."""
+    deviation_deg = np.rad2deg(
+        np.abs(
+            np.asarray(measured_qpos, dtype=np.float64)
+            - np.asarray(reference_qpos, dtype=np.float64)
+        )
+    )
+    index = int(np.argmax(deviation_deg))
+    return float(deviation_deg[index]), index
 
 
 def arm_error_requires_stop(error_code: int) -> bool:
@@ -143,9 +158,12 @@ class EpisodeReplayer:
         if not np.isfinite(self.replay_hz) or self.replay_hz <= 0:
             raise ValueError("replay rate must be finite and positive")
 
+        self._recorded_arm_start = replay_start_state(trajectory)[0]
         self._health_check = health_check
-        self._planner: XArm7MotionPlanner | None = None
+        self._home_planner: XArm7MotionPlanner | None = None
+        self._replay_planner: XArm7MotionPlanner | None = None
         self._action_safety_gate: SafetyGate | None = None
+        self._start_warmup_gate: SafetyGate | None = None
         self._recorder: ReplayRecorder | None = None
         self._running = False
         self._estopped = False
@@ -155,20 +173,12 @@ class EpisodeReplayer:
         self._hand_available = trajectory.has_hand
         self._frame_count = trajectory.num_frames
 
-    def setup(self) -> None:
-        """Create the action safety gate without connecting to hardware."""
-        runtime_arm = self.runtime.arm
-        runtime_hand = self.runtime.hand
+    def _make_planner(
+        self, workspace: np.ndarray, *, table: Any | None
+    ) -> XArm7MotionPlanner:
+        """Create one planner with an explicit table-collision policy."""
         runtime_policy = self.runtime.policy
-        workspace = np.array(
-            [
-                [runtime_policy.workspace.x_min, runtime_policy.workspace.x_max],
-                [runtime_policy.workspace.y_min, runtime_policy.workspace.y_max],
-                [runtime_policy.workspace.z_min, runtime_policy.workspace.z_max],
-            ],
-            dtype=np.float64,
-        )
-        self._planner = XArm7MotionPlanner(
+        return XArm7MotionPlanner(
             XArm7PlannerConfig(
                 urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
                 srdf_path=str(XARM7_XHAND_SRDF_PATH),
@@ -181,44 +191,210 @@ class EpisodeReplayer:
             ),
             hand_dof=True,
             static_boxes=tuple(self.runtime.environment.static_boxes),
+            table=table,
+        )
+
+    def setup(self) -> None:
+        """Create replay and return-home safety boundaries without device IO."""
+        runtime_arm = self.runtime.arm
+        runtime_hand = self.runtime.hand
+        runtime_policy = self.runtime.policy
+        workspace = np.array(
+            [
+                [runtime_policy.workspace.x_min, runtime_policy.workspace.x_max],
+                [runtime_policy.workspace.y_min, runtime_policy.workspace.y_max],
+                [runtime_policy.workspace.z_min, runtime_policy.workspace.z_max],
+            ],
+            dtype=np.float64,
+        )
+        replay_planner = self._make_planner(workspace, table=None)
+        home_planner = self._make_planner(
+            workspace,
             table=self.runtime.environment.table,
         )
+        self._replay_planner = replay_planner
+        self._home_planner = home_planner
         self._action_safety_gate = planner_action_safety_gate(
-            planner=self._planner,
+            planner=replay_planner,
             arm_joint_lower_rad=tuple(runtime_arm.joint_limit_lower),
             arm_joint_upper_rad=tuple(runtime_arm.joint_limit_upper),
             hand_joint_lower_rad=tuple(runtime_hand.qpos_min_rad),
             hand_joint_upper_rad=tuple(runtime_hand.qpos_max_rad),
         )
-        print("Replay safety gate ready")
+        self._start_warmup_gate = planner_action_safety_gate(
+            planner=replay_planner,
+            arm_joint_lower_rad=tuple(runtime_arm.joint_limit_lower),
+            arm_joint_upper_rad=tuple(runtime_arm.joint_limit_upper),
+            hand_joint_lower_rad=tuple(runtime_hand.qpos_min_rad),
+            hand_joint_upper_rad=tuple(runtime_hand.qpos_max_rad),
+            collision_check=replay_planner.collision_model.check_transition_collision_free,
+        )
+        print("Replay safety gates ready")
 
-    def _align_to_start(
+    def _arm_start_deviation(self, arm_qpos: np.ndarray) -> tuple[float, int]:
+        """Compare fresh xArm feedback with the recorded physical start state."""
+        nearest_arm_start = wrap_nearest_equivalent(
+            self._recorded_arm_start,
+            np.asarray(arm_qpos, dtype=np.float64),
+            tuple(self.runtime.arm.joint_limit_lower),
+            tuple(self.runtime.arm.joint_limit_upper),
+        )
+        return _max_joint_deviation_deg(arm_qpos, nearest_arm_start)
+
+    @staticmethod
+    def _format_arm_start_deviation(max_deg: float, joint_index: int) -> str:
+        """Format the xArm start error for the operator."""
+        return f"arm={max_deg:.1f}° (joint {joint_index + 1})"
+
+    def _first_replay_transition_issue(
+        self, arm_qpos: np.ndarray, hand_qpos: np.ndarray
+    ) -> str | None:
+        """Validate the live start state against the first replay command."""
+        assert self._replay_planner is not None
+        assert self.traj.action_hand_joint is not None
+        first_arm_cmd = wrap_nearest_equivalent(
+            self.traj.action_arm_joint[0],
+            np.asarray(arm_qpos, dtype=np.float64),
+            tuple(self.runtime.arm.joint_limit_lower),
+            tuple(self.runtime.arm.joint_limit_upper),
+        )
+        first_hand_cmd = self.traj.action_hand_joint[0]
+        if not self._replay_planner.is_workspace_segment_safe(arm_qpos, first_arm_cmd):
+            return "live start->frame 0 workspace check failed"
+        if not self._replay_planner.collision_model.check_transition_collision_free(
+            arm_qpos,
+            first_arm_cmd,
+            hand_qpos,
+            first_hand_cmd,
+        ):
+            return "live start->frame 0 collision check failed"
+        return None
+
+    def _confirm_replay_start(
         self,
-        first_arm_cmd: np.ndarray,
         arm_qpos: np.ndarray,
-        first_hand_cmd: np.ndarray | None = None,
-        hand_qpos: np.ndarray | None = None,
+        hand_qpos: np.ndarray,
     ) -> bool:
-        """Require measured joints to already be close to the validated start."""
-        max_dev = float(np.max(np.rad2deg(np.abs(arm_qpos - first_arm_cmd))))
-        if first_hand_cmd is not None:
-            if hand_qpos is None:
-                print(
-                    "Cannot verify the hand start pose from fresh connected feedback."
-                )
-                return False
-            max_dev = max(
-                max_dev, float(np.max(np.rad2deg(np.abs(hand_qpos - first_hand_cmd))))
+        """Accept the live post-warm-up state only when frame 0 remains safe."""
+        issue = self._first_replay_transition_issue(arm_qpos, hand_qpos)
+        if issue is not None:
+            self._enter_terminal_quiescence()
+            reason = f"replay start was rejected: {issue}"
+            print(f"Replay rejected: {reason}")
+            self._reject(reason)
+            return False
+        print("XHand warm-up complete")
+        return True
+
+    def _reject(self, reason: str) -> None:
+        """Stop before replay commands without converting a valid runtime into a fault."""
+        self._running = False
+        self._status = ReplayStatus.REJECTED
+        self._reason = reason
+
+    def _read_start_feedback(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Read fresh arm and hand feedback required by start warm-up."""
+        arm_state = read_arm_state_dict(self.shared)
+        arm_issue = arm_feedback_issue(
+            arm_state,
+            float(self.runtime.policy.arm_state_stale_threshold_s),
+        )
+        if arm_state is None or arm_issue is not None or arm_state["error_code"] != 0:
+            self._fault(
+                "initial arm feedback is unavailable or unhealthy: "
+                f"{arm_issue or 'controller error'}"
             )
-        if np.isfinite(max_dev) and max_dev <= self.START_POSE_TOLERANCE_DEG:
-            return True
+            return None
+        hand_state = read_hand_state_dict(self.shared)
+        if not hand_feedback_is_healthy(
+            hand_state,
+            float(self.runtime.safety.heartbeat_timeouts["hand"]),
+        ):
+            self._fault("initial hand feedback is unavailable or unhealthy")
+            return None
+        assert hand_state is not None
+        return arm_state, hand_state
+
+    def _warm_up_hand_at_start(self, keyboard: KeyboardHandler) -> bool:
+        """Warm up XHand's first target after reset while holding xArm still."""
+        feedback = self._read_start_feedback()
+        if feedback is None:
+            return False
+        arm_state, hand_state = feedback
+        arm_max_deg, arm_joint_index = self._arm_start_deviation(arm_state["qpos"])
+        if arm_max_deg > self.START_POSE_TOLERANCE_DEG:
+            print(
+                "\nReplay rejected: xArm is not at the recorded start "
+                f"({self._format_arm_start_deviation(arm_max_deg, arm_joint_index)}; "
+                f"limit {self.START_POSE_TOLERANCE_DEG:.1f}°)."
+            )
+            print("Move xArm to the recorded start in a separate supervised procedure.")
+            self._reject("xArm is not at the recorded trajectory start")
+            return False
+
+        assert self._start_warmup_gate is not None
+        assert self.traj.action_hand_joint is not None
         print(
-            f"\nRobot is {max_dev:.1f}° from the trajectory start (limit {self.START_POSE_TOLERANCE_DEG:.1f}°)."
+            "Warming up XHand from connection reset toward the frame 0 hand target "
+            f"({self._format_arm_start_deviation(arm_max_deg, arm_joint_index)}; "
+            "Q=quit  ESC=emergency_stop)"
         )
-        print(
-            "Move to the validated start pose in a separate supervised procedure, then retry replay."
+        published = publish_joint_targets(
+            self.shared,
+            np.asarray(arm_state["qpos"], dtype=np.float64),
+            self.traj.action_hand_joint[0],
+            is_hold=True,
+            prepare_timeout_s=float(self.runtime.policy.action_prepare_timeout_s),
+            safety_gate=self._start_warmup_gate,
+            action_validity_s=_START_HAND_WARMUP_S,
+            hand_mechanical_lower_rad=np.asarray(
+                self.runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
+            ),
+            hand_mechanical_upper_rad=np.asarray(
+                self.runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
+            ),
+            arm_feedback_max_age_s=float(self.runtime.safety.heartbeat_timeouts["arm"]),
+            hand_feedback_max_age_s=float(
+                self.runtime.safety.heartbeat_timeouts["hand"]
+            ),
         )
-        return False
+        if not published.succeeded:
+            reason = f"XHand start warm-up was rejected: {published.reason}"
+            if published.status in (
+                CommandPublishStatus.GATE_REJECTED,
+                CommandPublishStatus.HAND_PREFLIGHT_REJECTED,
+            ):
+                print(f"Replay rejected: {reason}")
+                self._reject(reason)
+            else:
+                self._fault(reason)
+            return False
+        self._motion_started = True
+
+        deadline_s = time.monotonic() + _START_HAND_WARMUP_S
+        while time.monotonic() < deadline_s:
+            if not self._poll_control(keyboard, 0.0):
+                return False
+            feedback = self._read_start_feedback()
+            if feedback is None:
+                return False
+            arm_state, hand_state = feedback
+            time.sleep(_WAIT_POLL_INTERVAL_S)
+
+        arm_max_deg, arm_joint_index = self._arm_start_deviation(arm_state["qpos"])
+        if arm_max_deg > self.START_POSE_TOLERANCE_DEG:
+            self._enter_terminal_quiescence()
+            reason = "xArm left the recorded start during XHand warm-up"
+            print(
+                "Replay rejected: "
+                f"{reason} ({self._format_arm_start_deviation(arm_max_deg, arm_joint_index)}; "
+                f"limit {self.START_POSE_TOLERANCE_DEG:.1f}°)"
+            )
+            self._reject(reason)
+            return False
+        return self._confirm_replay_start(arm_state["qpos"], hand_state["qpos"])
 
     def _outcome(self) -> ReplayOutcome:
         replay_data = self._recorder.to_dict() if self._recorder is not None else None
@@ -350,43 +526,8 @@ class EpisodeReplayer:
 
         has_hand = self._hand_available
         self._recorder = ReplayRecorder(frame_count, has_hand=has_hand)
-        arm_state = read_arm_state_dict(self.shared)
-        initial_arm_issue = arm_feedback_issue(
-            arm_state,
-            float(self.runtime.policy.arm_state_stale_threshold_s),
-        )
-        if (
-            arm_state is None
-            or initial_arm_issue is not None
-            or arm_state["error_code"] != 0
-        ):
-            self._fault(
-                f"initial arm feedback is unavailable or unhealthy: {initial_arm_issue or 'controller error'}"
-            )
-            return self._outcome()
-
-        first_arm_cmd = self.traj.action_arm_joint[0].copy()
-        first_hand_cmd: np.ndarray | None = None
-        initial_hand_qpos: np.ndarray | None = None
-        if has_hand and self.traj.action_hand_joint is not None:
-            first_hand_cmd = self.traj.action_hand_joint[0].copy()
-            hand_state = read_hand_state_dict(self.shared)
-            if hand_feedback_is_healthy(
-                hand_state,
-                float(self.runtime.safety.heartbeat_timeouts["hand"]),
-            ):
-                assert hand_state is not None
-                initial_hand_qpos = np.asarray(hand_state["qpos"], dtype=np.float64)
-        if not self._align_to_start(
-            first_arm_cmd, arm_state["qpos"], first_hand_cmd, initial_hand_qpos
-        ):
-            self._status = ReplayStatus.REJECTED
-            self._reason = "robot is not at the validated trajectory start"
-            return self._outcome()
-
-        shared = self.shared
         keyboard = KeyboardHandler(
-            estop_callback=lambda: setattr(shared.estop_request, "value", True)
+            estop_callback=lambda: setattr(self.shared.estop_request, "value", True)
         )
         keyboard.start()
         self._running = True
@@ -398,6 +539,8 @@ class EpisodeReplayer:
         frame_idx = 0
 
         try:
+            if not self._warm_up_hand_at_start(keyboard):
+                return self._outcome()
             require_transition(self.shared, SafetyState.RUNNING)
             self._motion_started = True
             if not self._wait_arm_streaming(keyboard):
@@ -580,7 +723,7 @@ class EpisodeReplayer:
 
     @property
     def planner(self) -> XArm7MotionPlanner | None:
-        return self._planner
+        return self._home_planner
 
     def shutdown(self) -> None:
         """Signal processes to stop; the session owns RuntimeChannels cleanup."""

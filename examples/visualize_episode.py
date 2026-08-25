@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/visualize_episode.py EPISODE [--info] [--max-frames N]``.
 
-Self-contained Rerun-based visualizer for schema-v21
-DexMani episodes. Offline only: connects to no hardware, writes no files;
-opens a Rerun viewer window (or prints a structure summary with ``--info``).
-Raw episodes are not used to reconstruct point clouds. Process an episode with
-``examples/process_episodes.py`` and use ``visualize_episode_processed.py`` to
-inspect its fixed-size ``(N, 6)`` point cloud.
+Self-contained Rerun visualizer for raw schema-v21/v22 DexMani episodes.
+Offline only: connects to no hardware and writes no files. Raw v22 episodes
+display a canonical fixed-size ``(N, 6)`` point cloud derived with the same
+production implementation used by offline processing and deployment. Raw v21
+episodes retain camera/state visualization but have no canonical point cloud.
 
 Examples::
 
@@ -21,6 +20,7 @@ import argparse
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 # Set a quiet Rerun logging default unless the operator already configured one.
@@ -35,6 +35,18 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
+from dexmani_real.config.pointcloud import PointCloudConfig
+from dexmani_real.config.runtime import resolve_runtime_config
+from dexmani_real.data.raw_pointcloud import (
+    RawEpisodeCameraModel,
+    RawEpisodePointCloudDeriver,
+    load_raw_episode_base_from_color,
+    load_raw_episode_camera_model,
+)
+from dexmani_real.ipc.schema import (
+    SUPPORTED_POINT_CLOUD_COUNTS,
+    validate_point_cloud_array,
+)
 from dexmani_real.recording import EpisodeReader, MergedH5File
 from dexmani_real.robot_spec import HAND_FINGERTIP_SHAPE
 from dexmani_real.utils.log import get_logger
@@ -161,7 +173,10 @@ class EpisodeVisualizer:
         self,
         h5_path: str,
         max_frames: int | None = None,
-        depth_scale: float | None = None,
+        point_cloud: bool | None = None,
+        pointcloud_config: PointCloudConfig | None = None,
+        table_plane_abcd: tuple[float, float, float, float] | None = None,
+        runtime_config_sha256: str | None = None,
     ):
         self._h5_path = Path(h5_path)
         self._reader = EpisodeReader(h5_path)
@@ -172,23 +187,14 @@ class EpisodeVisualizer:
                 )
             self._h5f = self._reader.h5f
 
-            self._rgb_cache: np.ndarray | None = None
-            self._depth_cache: np.ndarray | None = None
-            # RGB lives in the MP4 sidecar; query the reader rather than HDF5.
-            try:
-                self._rgb_cache = self._reader.read_camera_all("rgb")
-                logger.info("Pre-decoded %d rgb frames", self._rgb_cache.shape[0])
-            except KeyError:
-                pass
-            if "depth" in self._h5f:
-                self._depth_cache = self._reader.read_camera_all("depth")
-                logger.info("Pre-decoded %d depth frames", self._depth_cache.shape[0])
+            # Raw v21/v22 require both sidecars; preload them once for Rerun.
+            self._rgb_cache = self._reader.read_camera_all("rgb")
+            self._depth_cache = self._reader.read_camera_all("depth")
+            logger.info("Pre-decoded %d RGB-D frames", self._rgb_cache.shape[0])
 
             self._available = _classify_datasets(self._h5f)
-            # _classify_datasets only scans HDF5 keys — inject MP4 RGB when present.
-            if self._rgb_cache is not None and "rgb" not in self._available.get(
-                "camera", []
-            ):
+            # _classify_datasets only scans HDF5 keys; RGB lives in the MP4 sidecar.
+            if "rgb" not in self._available.get("camera", []):
                 self._available.setdefault("camera", []).append("rgb")
             logger.info(
                 "Detected %d categories: %s",
@@ -196,48 +202,86 @@ class EpisodeVisualizer:
                 sorted(self._available.keys()),
             )
 
-            # Depth units: CLI > the required /meta depth_scale.
-            if depth_scale is None:
-                meta = self._h5f.get("meta")
-                if meta is not None and "depth_scale" in meta.attrs:
-                    depth_scale = float(meta.attrs["depth_scale"])
-                elif "depth" in self._h5f:
-                    raise ValueError("episode is missing /meta depth_scale")
-            self._depth_meter = 1.0 / (depth_scale if depth_scale else 0.001)
-
-            # Camera extrinsics: camera_T_world_camera (4x4 row-major) maps camera → world.
-            self._cam_R: np.ndarray | None = None
-            self._cam_t: np.ndarray | None = None
             meta = self._h5f.get("meta")
-            if meta is not None and "camera_T_world_camera" in meta.attrs:
-                T_cw = np.asarray(
-                    meta.attrs["camera_T_world_camera"], dtype=float
-                ).reshape(4, 4)
-                self._cam_R = T_cw[:3, :3].copy()
-                self._cam_t = T_cw[:3, 3].copy()
-                logger.info(
-                    "Camera extrinsics loaded: t=[%.3f, %.3f, %.3f]", *self._cam_t
-                )
+            if meta is None:
+                raise ValueError("episode is missing /meta")
+            self._schema_version = self._reader.schema_version
+            self._camera_model: RawEpisodeCameraModel | None = None
+            self._camera_K: np.ndarray | None = None
+            self._T_xarm_base_from_color: np.ndarray | None = None
+
+            if self._schema_version == 22:
+                self._camera_model = load_raw_episode_camera_model(self._reader)
+                self._camera_K = self._camera_model.geometry.color.matrix()
+                self._depth_meter = 1.0 / self._camera_model.depth_scale_m
             else:
+                depth_scale_m = float(meta.attrs.get("depth_scale", 0.0))
+                if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
+                    raise ValueError("episode is missing a valid /meta depth_scale")
+                self._depth_meter = 1.0 / depth_scale_m
+                if "camera_K" in meta.attrs:
+                    self._camera_K = np.asarray(
+                        meta.attrs["camera_K"], dtype=np.float64
+                    ).reshape(3, 3)
+                if "camera_T_world_camera" in meta.attrs:
+                    self._T_xarm_base_from_color = np.asarray(
+                        meta.attrs["camera_T_world_camera"], dtype=np.float64
+                    ).reshape(4, 4)
+
+            self._pc_enabled = (
+                self._schema_version == 22 if point_cloud is None else point_cloud
+            )
+            if self._pc_enabled and self._schema_version != 22:
+                raise ValueError(
+                    "canonical point-cloud visualization requires raw schema v22; "
+                    "use --no-point-cloud for raw v21"
+                )
+            if self._schema_version == 22:
+                camera_type = str(meta.attrs.get("camera_type", ""))
+                if camera_type == "eye_to_hand" or self._pc_enabled:
+                    self._T_xarm_base_from_color = load_raw_episode_base_from_color(
+                        self._reader
+                    )
+
+            self._pointcloud_deriver: RawEpisodePointCloudDeriver | None = None
+            self._empty_pointcloud_frames = 0
+            self._pointcloud_processing_ns = 0
+            self._pointcloud_processed_frames = 0
+            if self._pc_enabled:
+                if pointcloud_config is None or self._camera_model is None:
+                    raise ValueError(
+                        "point-cloud visualization requires resolved config"
+                    )
+                assert self._T_xarm_base_from_color is not None
+                self._pointcloud_deriver = RawEpisodePointCloudDeriver(
+                    reader=self._reader,
+                    camera=self._camera_model,
+                    T_xarm_base_from_color=self._T_xarm_base_from_color,
+                    pointcloud=pointcloud_config,
+                    table_plane_abcd=table_plane_abcd,
+                )
+                source_config_sha256 = str(meta.attrs.get("resolved_config_sha256", ""))
+                if (
+                    runtime_config_sha256 is not None
+                    and source_config_sha256 != runtime_config_sha256
+                ):
+                    logger.warning(
+                        "Point cloud uses current runtime config %s, which differs "
+                        "from recorded config %s",
+                        runtime_config_sha256,
+                        source_config_sha256 or "missing",
+                    )
                 logger.info(
-                    "No camera extrinsics in /meta — camera frame = world frame (identity)"
+                    "Canonical point cloud enabled: N=%d config=%s table=%s",
+                    pointcloud_config.num_points,
+                    pointcloud_config.sha256,
+                    "enabled" if table_plane_abcd is not None else "disabled",
                 )
 
             self._T = self._resolve_frame_count(max_frames)
-            self._C = self._resolve_camera_count()
-            logger.info("State frames=%d, Camera frames=%d", self._T, self._C or 0)
+            logger.info("Frames=%d", self._T)
 
             self._state = self._preload_state()
-
-            self._cam_idx: np.ndarray | None = None
-            if self._C is not None and self._C > 0:
-                if self._C < self._T:
-                    self._cam_idx = np.minimum(
-                        (np.arange(self._T) * self._C / self._T).astype(int),
-                        self._C - 1,
-                    )
-                else:
-                    self._cam_idx = np.arange(self._T, dtype=int)
 
             self._blueprint = self._build_blueprint()
             app_id = f"DexMani - {self._h5_path.stem}"
@@ -257,31 +301,18 @@ class EpisodeVisualizer:
             raise
 
     def _resolve_frame_count(self, max_frames: int | None) -> int:
-        """Return T = min(arm_qpos.shape[0], max_frames) falling back through meta keys."""
-        arm_keys = self._available.get("arm", [])
-        meta_keys = self._available.get("meta", [])
-        ref_key = next(iter(arm_keys), None) or next(iter(meta_keys), None)
-        if ref_key is None:
-            all_keys = [k for v in self._available.values() for k in v]
-            ref_key = all_keys[0] if all_keys else None
-        if ref_key is None:
-            self._h5f.close()
-            raise ValueError("No datasets found in HDF5 file")
-
-        raw = self._h5f[ref_key].shape[0]
+        """Resolve the fixed-grid frame count and validate camera alignment."""
+        raw = int(self._h5f["meta"].attrs.get("num_frames", 0))
+        if raw <= 0:
+            raise ValueError("episode /meta num_frames must be positive")
+        camera_counts = [self._rgb_cache.shape[0], self._depth_cache.shape[0]]
+        if any(count != raw for count in camera_counts):
+            raise ValueError(
+                f"camera frame counts {camera_counts} do not match grid length {raw}"
+            )
         if max_frames is not None:
             return min(raw, max_frames)
         return raw
-
-    def _resolve_camera_count(self) -> int | None:
-        """Return C from pre-decoded cache or first camera dataset in HDF5."""
-        if self._rgb_cache is not None:
-            return self._rgb_cache.shape[0]
-        if self._depth_cache is not None:
-            return self._depth_cache.shape[0]
-        for cam_key in self._available.get("camera", []):
-            return self._h5f[cam_key].shape[0]
-        return None
 
     def _preload_state(self) -> dict[str, np.ndarray]:
         """Read all non-camera datasets into memory, truncated to T frames."""
@@ -313,17 +344,17 @@ class EpisodeVisualizer:
 
         cam_views = []
         if "rgb" in (self._available.get("camera") or []):
-            cam_views.append(rrb.Spatial2DView(origin="camera/rgb", name="RGB"))
+            cam_views.append(rrb.Spatial2DView(origin="camera/color/rgb", name="RGB"))
         if "depth" in (self._available.get("camera") or []):
-            cam_views.append(rrb.Spatial2DView(origin="camera/depth", name="Depth"))
+            cam_views.append(rrb.Spatial2DView(origin="depth/image", name="Depth"))
         if cam_views:
             columns.append(rrb.Vertical(contents=cam_views, name="Camera"))
 
-        if "hand_fingertip" in self._state:
+        if self._pc_enabled or "hand_fingertip" in self._state:
             columns.append(
                 rrb.Spatial3DView(
                     origin="/",
-                    name="Fingertips",
+                    name="Point Cloud",
                     background=[0.12, 0.12, 0.14],
                 )
             )
@@ -390,20 +421,13 @@ class EpisodeVisualizer:
                     for i in range(arr.shape[1]):
                         rr.log(f"{base}/{i}", rr.SeriesLine(name=f"{i}"), static=True)
 
-        meta = self._h5f.get("meta")
-        has_rgb = "rgb" in self._h5f or self._rgb_cache is not None
-        if meta is not None and "camera_K" in meta.attrs and has_rgb:
-            K = np.asarray(meta.attrs["camera_K"], dtype=float).reshape(3, 3)
-            rgb_shape = (
-                self._rgb_cache.shape
-                if self._rgb_cache is not None
-                else self._h5f["rgb"].shape
-            )
+        if self._camera_K is not None:
+            rgb_shape = self._rgb_cache.shape
             h, w = rgb_shape[1], rgb_shape[2]
             rr.log(
-                "camera",
+                "camera/color",
                 rr.Pinhole(
-                    image_from_camera=K,
+                    image_from_camera=self._camera_K,
                     resolution=[w, h],
                     camera_xyz=rr.ViewCoordinates.RDF,
                     image_plane_distance=1.25,
@@ -412,10 +436,13 @@ class EpisodeVisualizer:
             )
             logger.info("Camera pinhole logged (%dx%d)", w, h)
 
-        if self._cam_R is not None and self._cam_t is not None:
+        if self._T_xarm_base_from_color is not None:
             rr.log(
-                "camera",
-                rr.Transform3D(translation=self._cam_t, mat3x3=self._cam_R),
+                "camera/color",
+                rr.Transform3D(
+                    translation=self._T_xarm_base_from_color[:3, 3],
+                    mat3x3=self._T_xarm_base_from_color[:3, :3],
+                ),
                 static=True,
             )
 
@@ -444,11 +471,12 @@ class EpisodeVisualizer:
         return f"{category}/{key}"
 
     def log_step(self, step_idx: int) -> None:
-        """Log camera, fingertips, and time series for one timestep."""
+        """Log camera, canonical point cloud, fingertips, and state."""
         rr.set_time_sequence("step", step_idx)
         if "timestamp" in self._state:
             rr.set_time_seconds("time", float(self._state["timestamp"][step_idx]))
         self._log_camera(step_idx)
+        self._log_pointcloud(step_idx)
         self._log_fingertips(step_idx)
         self._log_time_series(step_idx)
 
@@ -457,27 +485,39 @@ class EpisodeVisualizer:
         if not camera_keys:
             return
 
-        cam_idx = (
-            int(self._cam_idx[step_idx]) if self._cam_idx is not None else step_idx
-        )
-
         if "rgb" in camera_keys:
-            rgb = (
-                self._rgb_cache[cam_idx]
-                if self._rgb_cache is not None
-                else self._h5f["rgb"][cam_idx]
-            )
-            rr.log("camera/rgb", rr.Image(rgb))
+            rr.log("camera/color/rgb", rr.Image(self._rgb_cache[step_idx]))
         if "depth" in camera_keys:
-            depth = (
-                self._depth_cache[cam_idx]
-                if self._depth_cache is not None
-                else self._h5f["depth"][cam_idx]
-            )
             rr.log(
-                "camera/depth",
-                rr.DepthImage(depth, meter=self._depth_meter, depth_range=(0, 10000)),
+                "depth/image",
+                rr.DepthImage(
+                    self._depth_cache[step_idx],
+                    meter=self._depth_meter,
+                    depth_range=(0, 10000),
+                ),
             )  # clamp outliers to stabilize colormap
+
+    def _log_pointcloud(self, step_idx: int) -> None:
+        if self._pointcloud_deriver is None:
+            return
+        started_ns = time.perf_counter_ns()
+        cloud = self._pointcloud_deriver.derive(step_idx, self._rgb_cache[step_idx])
+        self._pointcloud_processing_ns += time.perf_counter_ns() - started_ns
+        self._pointcloud_processed_frames += 1
+        if cloud is None:
+            self._empty_pointcloud_frames += 1
+            rr.log("pcd", rr.Clear(recursive=False))
+            return
+        cloud = validate_point_cloud_array(
+            cloud,
+            num_points=self._pointcloud_deriver.pointcloud.num_points,
+            label=f"point_cloud[{step_idx}]",
+        )
+        colors = (cloud[:, 3:] * 255.0).astype(np.uint8)
+        rr.log(
+            "pcd",
+            rr.Points3D(positions=cloud[:, :3], colors=colors, radii=0.003),
+        )
 
     def _log_fingertips(self, step_idx: int) -> None:
         """Render hand_fingertip FK positions as per-finger colored keypoints."""
@@ -526,6 +566,16 @@ class EpisodeVisualizer:
     def num_steps(self) -> int:
         return self._T
 
+    @property
+    def empty_pointcloud_frames(self) -> int:
+        return self._empty_pointcloud_frames
+
+    @property
+    def mean_pointcloud_processing_ms(self) -> float | None:
+        if self._pointcloud_processed_frames == 0:
+            return None
+        return self._pointcloud_processing_ns / self._pointcloud_processed_frames / 1e6
+
     def close(self) -> None:
         """Release HDF5/video resources and disconnect from Rerun."""
         if hasattr(self, "_reader") and self._reader is not None:
@@ -545,7 +595,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "episode",
         type=str,
-        help="Path to a schema-v21 episodes/<task_name>/episode_* directory.",
+        help="Path to a raw schema-v21/v22 episodes/<task_name>/episode_* directory.",
     )
     parser.add_argument(
         "--max-frames",
@@ -554,19 +604,33 @@ def main(argv: list[str] | None = None) -> int:
         help="Limit number of state frames to load.",
     )
     parser.add_argument(
-        "--depth-scale",
-        type=float,
-        default=None,
-        help="Raw depth units in meters (overrides /meta depth_scale).",
-    )
-    parser.add_argument(
         "--info",
         action="store_true",
         help="Print structure summary and exit without starting a Rerun viewer.",
     )
+    parser.add_argument(
+        "--point-cloud",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Display the canonical point cloud; defaults to on for raw v22 and "
+            "off for raw v21."
+        ),
+    )
+    parser.add_argument(
+        "--pointcloud-num-points",
+        type=int,
+        choices=sorted(SUPPORTED_POINT_CLOUD_COUNTS),
+        default=None,
+        help="Override the current runtime point-cloud count.",
+    )
     args = parser.parse_args(argv)
+    if args.max_frames is not None and args.max_frames <= 0:
+        parser.error("--max-frames must be a positive integer")
+    if args.point_cloud is False and args.pointcloud_num_points is not None:
+        parser.error("--pointcloud-num-points requires --point-cloud")
     h5_path = Path(args.episode).expanduser().resolve()
-    if not h5_path.exists():
+    if not h5_path.is_dir():
         logger.error("Episode not found: %s", h5_path)
         return 1
 
@@ -574,10 +638,39 @@ def main(argv: list[str] | None = None) -> int:
         print_episode_info(str(h5_path))
         return 0
 
+    with EpisodeReader(h5_path) as reader:
+        schema_version = reader.schema_version
+    point_cloud_enabled = (
+        schema_version == 22 if args.point_cloud is None else args.point_cloud
+    )
+    if point_cloud_enabled and schema_version != 22:
+        parser.error(
+            "--point-cloud requires raw schema v22; use --no-point-cloud for v21"
+        )
+    if args.pointcloud_num_points is not None and not point_cloud_enabled:
+        parser.error("--pointcloud-num-points requires an enabled point cloud")
+
+    runtime = resolve_runtime_config() if point_cloud_enabled else None
+    pointcloud_config = None
+    table_plane_abcd = None
+    runtime_config_sha256 = None
+    if runtime is not None:
+        pointcloud_config = runtime.pointcloud
+        if args.pointcloud_num_points is not None:
+            pointcloud_config = replace(
+                pointcloud_config, num_points=args.pointcloud_num_points
+            )
+        table = runtime.environment.table
+        table_plane_abcd = table.plane_abcd if table.enabled else None
+        runtime_config_sha256 = runtime.sha256
+
     viz = EpisodeVisualizer(
         str(h5_path),
         max_frames=args.max_frames,
-        depth_scale=args.depth_scale,
+        point_cloud=point_cloud_enabled,
+        pointcloud_config=pointcloud_config,
+        table_plane_abcd=table_plane_abcd,
+        runtime_config_sha256=runtime_config_sha256,
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.num_steps)
@@ -585,6 +678,17 @@ def main(argv: list[str] | None = None) -> int:
             viz.log_step(step)
             if step % 500 == 0:
                 logger.info("  frame %d/%d", step, viz.num_steps)
+        mean_pointcloud_ms = viz.mean_pointcloud_processing_ms
+        if mean_pointcloud_ms is not None:
+            logger.info(
+                "Point-cloud processing average: %.2f ms/frame",
+                mean_pointcloud_ms,
+            )
+        if viz.empty_pointcloud_frames:
+            logger.warning(
+                "%d point-cloud frames were empty and explicitly cleared",
+                viz.empty_pointcloud_frames,
+            )
         logger.info("Done. Close the Rerun window to exit.")
     finally:
         viz.close()
