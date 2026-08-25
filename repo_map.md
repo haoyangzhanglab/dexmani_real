@@ -28,6 +28,8 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `code_style.md` | 本研究代码库的具体编码与审查约定。 |
 | `README.md` | 面向使用者的能力、架构、环境与工作流。 |
 | `repo_map.md` | 当前文件与 owner 索引。 |
+| `docs/data_schema.md` | Real raw v22、processed v7 与 Policy Zarr v3 的持久化字段和语义参考。 |
+| `docs/deployment_review.md` | learned-policy 部署架构与安全审查结论、风险接受及整改优先级。 |
 | `docs/pointcloud_pipeline.md` | depth-to-color aligned 点云的采集、处理、时序与持久化契约。 |
 | `user_design.md` | 已确认的机器人行为与安全取舍。 |
 | `.gitignore` | 生成物、本地环境、数据集与运行输出排除规则。 |
@@ -215,7 +217,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | 文件 | 主要职责 |
 |---|---|
 | `__init__.py` | 轻量回放子包标记。 |
-| `trajectory.py` | raw/processed trajectory 加载、provenance、首帧状态与模型 preflight。 |
+| `trajectory.py` | raw 命令加载；processed provenance 到已校验 raw 行选择；首帧状态与模型 preflight。 |
 | `controller.py` | XHand 首帧目标 warm-up、fixed-rate safety-gated physical replay 调度。 |
 | `capture.py` | measured state、sent command 与 rejection 的有界捕获。 |
 | `evaluation.py` | tracking/consistency 指标与结果持久化。 |

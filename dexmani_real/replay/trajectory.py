@@ -1,4 +1,4 @@
-"""Load and fail-closed validate trajectories before physical replay starts."""
+"""Load exact raw commands and fail-closed validate physical replay trajectories."""
 
 from __future__ import annotations
 
@@ -11,12 +11,7 @@ import h5py
 import numpy as np
 
 from dexmani_real.config.runtime import ResolvedRuntimeConfig
-from dexmani_real.ipc.schema import (
-    ARM_DOF,
-    ARM_EE_SHAPE,
-    ARM_JOINT_SHAPE,
-    HAND_JOINT_SHAPE,
-)
+from dexmani_real.ipc.schema import ARM_EE_SHAPE, ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.planning import Pose, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.recording.reader import EpisodeReader
@@ -49,6 +44,15 @@ def _is_sha256(value: str | None) -> bool:
     return True
 
 
+def _sha256_file(path: Path) -> str:
+    """Return the SHA-256 digest of one replay-source file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def preflight_model_paths() -> tuple[Path, ...]:
     """Return the three URDF/SRDF model paths used for geometry provenance checks."""
     return (
@@ -75,7 +79,6 @@ class TrajectoryData:
     resolved_config_sha256: str | None = None
     model_provenance: tuple[tuple[str, str], ...] = ()
     send_mask: np.ndarray | None = None
-    processed: bool = False
 
     @property
     def has_hand(self) -> bool:
@@ -221,124 +224,204 @@ def load_trajectory(
     return trajectory
 
 
-def load_processed_trajectory(episode_path: str) -> TrajectoryData:
-    """Load a processed HDF5 v7 artifact's exact submitted command stream.
-
-    A processed artifact stores the same submitted joint-command stream as its raw
-    source episode — ``action[:, :7]`` is ``action_arm_joint_sent`` and
-    ``action[:, 7:]`` is ``action_hand_joint`` — but it is row-compacted and does
-    not carry the recording's model (URDF/SRDF) provenance.  Replaying one is a
-    lower-assurance operation than replaying the raw source: the caller must opt in
-    explicitly and must still run the full geometry preflight (see
-    :func:`verify_replay_preflight`).
-    """
+def _processed_replay_source(
+    artifact_path: Path,
+) -> tuple[Path, np.ndarray, str, int, str]:
+    """Read the raw-source identity and retained rows from one processed artifact."""
     from dexmani_real.data.process import (
         PROCESSED_SCHEMA_NAME,
         PROCESSED_SCHEMA_VERSION,
     )
 
-    path = Path(episode_path)
-    if not path.is_file():
-        raise ValueError(f"processed episode must be an HDF5 file: {path}")
+    if not artifact_path.is_file():
+        raise ValueError(f"processed episode must be an HDF5 file: {artifact_path}")
+    with h5py.File(artifact_path, "r") as artifact:
+        if str(artifact.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
+            raise ValueError(f"not a processed HDF5 artifact: {artifact_path.name}")
+        if int(artifact.attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported processed schema version in {artifact_path.name}"
+            )
+        if str(artifact.attrs.get("domain", "")) != "real":
+            raise ValueError(
+                f"processed episode {artifact_path.name} must have domain='real'"
+            )
 
-    with h5py.File(path, "r") as h5:
-        if str(h5.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
-            raise ValueError(f"not a processed HDF5 artifact: {path.name}")
-        if int(h5.attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
-            raise ValueError(f"unsupported processed schema version in {path.name}")
-        if str(h5.attrs.get("domain", "")) != "real":
-            raise ValueError(f"processed episode {path.name} must have domain='real'")
+        try:
+            decision = json.loads(str(artifact.attrs["source_decision_json"]))
+            member_hashes = json.loads(str(artifact.attrs["source_member_sha256_json"]))
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"processed episode {artifact_path.name} has invalid source provenance"
+            ) from exc
+        if not isinstance(decision, dict) or not isinstance(member_hashes, dict):
+            raise ValueError(
+                f"processed episode {artifact_path.name} has invalid source provenance"
+            )
+        source_path_text = decision.get("source_path")
+        expected_data_sha256 = member_hashes.get("data.h5")
+        if not isinstance(source_path_text, str) or not source_path_text:
+            raise ValueError(
+                f"processed episode {artifact_path.name} lacks its raw source path"
+            )
+        if not _is_sha256(expected_data_sha256):
+            raise ValueError(
+                f"processed episode {artifact_path.name} lacks a valid raw data.h5 hash"
+            )
 
-        total_frames = int(h5.attrs.get("episode_steps", -1))
-        if total_frames <= 0:
-            raise ValueError(f"processed episode {path.name} has invalid episode_steps")
-        for key in ("joint_state", "action", "action_ee"):
-            if key not in h5:
-                raise ValueError(f"processed episode missing required dataset: /{key}")
+        try:
+            processed_frames = int(artifact.attrs["episode_steps"])
+            source_frames = int(artifact.attrs["source_frames"])
+            retained_rows = np.asarray(
+                artifact["provenance/source_row_index"][:], dtype=np.int64
+            )
+            source_keep_mask = np.asarray(
+                artifact["provenance/source_keep_mask"][:], dtype=bool
+            )
+            source_drop_reason_bits = np.asarray(
+                artifact["provenance/source_drop_reason_bits"][:], dtype=np.uint64
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"processed episode {artifact_path.name} has invalid row provenance"
+            ) from exc
+        if (
+            processed_frames <= 0
+            or source_frames <= 0
+            or retained_rows.shape != (processed_frames,)
+            or retained_rows.size == 0
+            or source_keep_mask.shape != (source_frames,)
+            or source_drop_reason_bits.shape != (source_frames,)
+            or not np.array_equal(retained_rows, np.flatnonzero(source_keep_mask))
+            or np.any(source_drop_reason_bits[source_keep_mask] != 0)
+            or np.any(source_drop_reason_bits[~source_keep_mask] == 0)
+        ):
+            raise ValueError(
+                f"processed episode {artifact_path.name} has inconsistent row provenance"
+            )
 
-        action = np.asarray(h5["action"][:], dtype=np.float64)
-        joint_state = np.asarray(h5["joint_state"][:], dtype=np.float64)
-        action_ee = np.asarray(h5["action_ee"][:], dtype=np.float64)
-
-        dt = float(h5.attrs.get("dt", np.nan))
-        task_label = str(h5.attrs.get("task_name", "")).strip()
-        resolved_config_sha256 = str(
-            h5.attrs.get("source_resolved_config_sha256", "unknown")
-        )
-
-        raw_quality = h5.attrs.get("quality_summary_json")
-        risky_bridge_count = 0
+        raw_quality = artifact.attrs.get("quality_summary_json")
         if raw_quality is not None:
             try:
                 quality = json.loads(str(raw_quality))
             except (TypeError, json.JSONDecodeError) as exc:
                 raise ValueError(
-                    f"processed episode {path.name} has invalid quality_summary_json"
+                    f"processed episode {artifact_path.name} has invalid quality_summary_json"
                 ) from exc
             if not isinstance(quality, dict):
                 raise ValueError(
-                    f"processed episode {path.name} quality_summary_json must encode an object"
+                    f"processed episode {artifact_path.name} quality_summary_json must encode an object"
                 )
             risky_bridge_count = int(quality.get("risky_bridge_count", 0))
-        if risky_bridge_count > 0:
-            raise ValueError(
-                f"processed episode {path.name} has {risky_bridge_count} risky bridge "
-                "transition(s): row compaction created abrupt command jumps that the "
-                "geometry preflight does not bound. Refusing to physically replay; "
-                "reprocess with bridge_policy=reject or replay the raw source episode."
-            )
+            if risky_bridge_count > 0:
+                raise ValueError(
+                    f"processed episode {artifact_path.name} has {risky_bridge_count} risky bridge "
+                    "transition(s): row compaction created abrupt command jumps that the "
+                    "geometry preflight does not bound. Refusing to physically replay; "
+                    "reprocess with bridge_policy=reject or replay the raw source episode."
+                )
 
-    if not np.isfinite(dt) or dt <= 0:
-        raise ValueError(f"processed episode {path.name} has invalid dt")
-    fps = 1.0 / dt
-    if not _MIN_EPISODE_RATE_HZ <= fps <= _MAX_EPISODE_RATE_HZ:
-        raise ValueError(
-            f"physical replay requires a valid episode rate, got {fps!r} Hz"
+        source_config_sha256 = str(
+            artifact.attrs.get("source_resolved_config_sha256", "")
         )
 
-    action_arm_joint = action[:, :ARM_DOF]
-    action_hand_joint = action[:, ARM_DOF:]
-    arm_qpos = joint_state[:, :ARM_DOF]
-    hand_qpos = joint_state[:, ARM_DOF:]
-    # action_ee[:, :9] is the commanded (target) EEF; the processed file carries no
-    # measured-EEF dataset.  Consistency evaluation therefore compares the replayed
-    # measured EEF against this commanded reference rather than a recorded EEF.
-    arm_ee = action_ee[:, : ARM_EE_SHAPE[0]]
-
-    arrays: dict[str, tuple[np.ndarray, tuple[int, ...]]] = {
-        "arm action": (action_arm_joint, (total_frames, *ARM_JOINT_SHAPE)),
-        "arm state": (arm_qpos, (total_frames, *ARM_JOINT_SHAPE)),
-        "hand action": (action_hand_joint, (total_frames, *HAND_JOINT_SHAPE)),
-        "hand state": (hand_qpos, (total_frames, *HAND_JOINT_SHAPE)),
-        "arm EEF": (arm_ee, (total_frames, *ARM_EE_SHAPE)),
-    }
-    for name, (array, expected_shape) in arrays.items():
-        if array.shape != expected_shape:
-            raise ValueError(
-                f"processed episode {name} has shape {array.shape}, expected {expected_shape}"
-            )
-
-    trajectory = TrajectoryData(
-        episode_path=str(path),
-        num_frames=total_frames,
-        fps=fps,
-        task_label=task_label,
-        action_arm_joint=action_arm_joint,
-        action_hand_joint=action_hand_joint,
-        arm_qpos=arm_qpos,
-        hand_qpos=hand_qpos,
-        arm_ee=arm_ee,
-        action_source="sent",
-        resolved_config_sha256=resolved_config_sha256,
-        model_provenance=(),
-        send_mask=None,
-        processed=True,
+    return (
+        Path(source_path_text),
+        retained_rows,
+        source_config_sha256,
+        source_frames,
+        expected_data_sha256,
     )
+
+
+def _select_raw_trajectory_rows(
+    raw_trajectory: TrajectoryData,
+    retained_rows: np.ndarray,
+) -> TrajectoryData:
+    """Build a replay trajectory from exact raw commands at retained source rows."""
+    rows = np.asarray(retained_rows, dtype=np.int64)
+    if (
+        rows.ndim != 1
+        or rows.size == 0
+        or rows[0] < 0
+        or rows[-1] >= raw_trajectory.num_frames
+        or np.any(np.diff(rows) <= 0)
+    ):
+        raise ValueError("processed replay rows are invalid for the raw source episode")
+    return TrajectoryData(
+        episode_path=raw_trajectory.episode_path,
+        num_frames=int(rows.size),
+        fps=raw_trajectory.fps,
+        task_label=raw_trajectory.task_label,
+        action_arm_joint=raw_trajectory.action_arm_joint[rows].copy(),
+        action_hand_joint=(
+            None
+            if raw_trajectory.action_hand_joint is None
+            else raw_trajectory.action_hand_joint[rows].copy()
+        ),
+        arm_qpos=raw_trajectory.arm_qpos[rows].copy(),
+        hand_qpos=(
+            None
+            if raw_trajectory.hand_qpos is None
+            else raw_trajectory.hand_qpos[rows].copy()
+        ),
+        arm_ee=(
+            None
+            if raw_trajectory.arm_ee is None
+            else raw_trajectory.arm_ee[rows].copy()
+        ),
+        action_source=raw_trajectory.action_source,
+        resolved_config_sha256=raw_trajectory.resolved_config_sha256,
+        model_provenance=raw_trajectory.model_provenance,
+        send_mask=(
+            None
+            if raw_trajectory.send_mask is None
+            else raw_trajectory.send_mask[rows].copy()
+        ),
+    )
+
+
+def load_processed_trajectory(episode_path: str) -> TrajectoryData:
+    """Load exact raw commands selected and attested by one processed artifact.
+
+    Processed ``float32`` action arrays are training data, not physical commands.
+    This loader uses their provenance only: it hashes the recorded raw ``data.h5``
+    and selects the retained rows from the raw ``float64`` submitted command stream.
+    """
+    artifact_path = Path(episode_path)
+    (
+        source_path,
+        retained_rows,
+        source_config_sha256,
+        source_frames,
+        expected_data_sha256,
+    ) = _processed_replay_source(artifact_path)
+    source_data_path = source_path / "data.h5"
+    if not source_data_path.is_file():
+        raise ValueError(
+            f"processed episode {artifact_path.name} requires raw source data.h5 at {source_path}"
+        )
+
+    if _sha256_file(source_data_path) != expected_data_sha256:
+        raise ValueError(
+            f"processed episode {artifact_path.name} raw source data.h5 hash mismatch"
+        )
+
+    raw_trajectory = load_trajectory(str(source_path))
+    if raw_trajectory.num_frames != source_frames:
+        raise ValueError(
+            f"processed episode {artifact_path.name} source frame count does not match raw source"
+        )
+    if raw_trajectory.resolved_config_sha256 != source_config_sha256:
+        raise ValueError(
+            f"processed episode {artifact_path.name} source config hash does not match raw source"
+        )
+    trajectory = _select_raw_trajectory_rows(raw_trajectory, retained_rows)
     logger.info(
-        "Loaded processed trajectory: %d frames, fps=%.1f, task=%s, hand=yes, ee=yes",
+        "Loaded processed replay selection: %d raw frames from %s (artifact=%s)",
         trajectory.num_frames,
-        trajectory.fps,
-        trajectory.task_label or "(none)",
+        source_path,
+        artifact_path,
     )
     return trajectory
 
@@ -385,14 +468,8 @@ def _verify_trajectory_provenance(
     trajectory: TrajectoryData,
     *,
     provenance_sha256: str,
-    verify_model_provenance: bool = True,
 ) -> None:
-    """Fail-closed provenance gate: source stream, config hash, and model hashes.
-
-    ``verify_model_provenance=False`` is reserved for processed artifacts, which
-    do not record the URDF/SRDF hashes of the recording-time collision models.
-    The source-stream and config-hash checks above still apply.
-    """
+    """Fail-closed provenance gate: source stream, config hash, and model hashes."""
     if trajectory.action_source != "sent":
         raise ValueError(
             "physical replay requires the exact submitted action stream ('sent')"
@@ -413,9 +490,6 @@ def _verify_trajectory_provenance(
         raise ValueError(
             "physical replay config provenance mismatch: recorded config differs from replay config"
         )
-
-    if not verify_model_provenance:
-        return
 
     recorded_models = dict(trajectory.model_provenance)
     missing_models = [
@@ -457,26 +531,15 @@ def verify_replay_preflight(
     deliberately not a replay rejection condition (user_design.md §3): replayed
     episodes were recorded by teleop without table gating, and table clearance
     remains enforced on the return-home path. Called once before worker startup;
-    any rejection prevents hardware access entirely. For a processed artifact
-    (``trajectory.processed``), the recording-time model (URDF/SRDF) provenance
-    check is skipped — that hash is not carried forward — but the source-stream,
-    config-hash, workspace, and collision checks all still apply.
+    any rejection prevents hardware access entirely.
     """
     require_hand_actions(trajectory)
     if not bool(runtime.policy.hand_enabled):
         raise ValueError("physical replay requires policy.hand_enabled=true")
-    verify_model_provenance = not trajectory.processed
     _verify_trajectory_provenance(
         trajectory,
         provenance_sha256=provenance_sha256,
-        verify_model_provenance=verify_model_provenance,
     )
-    if not verify_model_provenance:
-        logger.warning(
-            "processed replay: model (URDF/SRDF) provenance is absent from the "
-            "processed artifact; geometry preflight proceeds against current models "
-            "without a recording-time model hash to compare"
-        )
     modeled_hand = modeled_hand_actions(trajectory)
     recorded_arm_start, recorded_hand_start = replay_start_state(trajectory)
     arm_lower = np.asarray(runtime.arm.joint_limit_lower, dtype=np.float64)

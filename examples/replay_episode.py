@@ -74,8 +74,8 @@ Controls:
         "episode",
         type=str,
         help=(
-            "Published episode directory (episodes/<task_name>/episode_*) or, with "
-            "--processed, a processed HDF5 file (episodes_processed/<task>/episode_*.h5)."
+            "Published raw episode directory (episodes/<task_name>/episode_*) or, with "
+            "--processed, a processed HDF5 selection artifact."
         ),
     )
     parser.add_argument(
@@ -103,10 +103,8 @@ Controls:
         "--processed",
         action="store_true",
         help=(
-            "Replay a processed HDF5 artifact (episodes_processed/<task>/episode_*.h5) "
-            "instead of a raw episode directory. The processed file lacks recording-time "
-            "model (URDF/SRDF) provenance; the full workspace and collision preflight "
-            "still runs against current models."
+            "Use a processed HDF5 only as a retained-row manifest. Physical commands "
+            "come from its hash-verified raw source episode."
         ),
     )
     return parser.parse_args(argv)
@@ -133,16 +131,21 @@ def _resolve_replay_runtime(args: argparse.Namespace) -> ReplayRuntimeSelection:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
-        if args.processed:
-            trajectory = load_processed_trajectory(args.episode)
-        else:
-            trajectory = load_trajectory(args.episode)
+        trajectory = (
+            load_processed_trajectory(args.episode)
+            if args.processed
+            else load_trajectory(args.episode)
+        )
     except (FileNotFoundError, OSError, ValueError) as exc:
         print(f"Error loading episode: {exc}")
-        if not args.processed and Path(args.episode).is_file():
+        if args.processed:
             print(
-                "Hint: this path is a file, not a raw episode directory; use "
-                "--processed to replay a processed HDF5."
+                "Hint: processed replay requires the recorded raw episode at its "
+                "provenance source_path with matching data.h5."
+            )
+        elif Path(args.episode).is_file():
+            print(
+                "Hint: this path is a file; use --processed only for a processed HDF5."
             )
         return 1
 
@@ -163,21 +166,21 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Acc: {selection.acceleration_deg_s2:.0f}°/s²")
     print(f"  Joint speed: {selection.joint_speed_deg_s:.0f}°/s")
     print(f"  Replay config: {selection.config_sha256[:12]}")
-
     if args.processed:
         print(
-            "Warning: replaying a processed HDF5. Model (URDF/SRDF) provenance is "
-            "unavailable; workspace and collision preflight run against current models."
+            "  Processed selection: verified raw source commands; "
+            "the processed float32 action array is not sent to hardware."
         )
 
     evaluate_consistency = bool(np.all(np.isfinite(trajectory.arm_qpos)))
     if not evaluate_consistency:
         print("Warning: arm_qpos is invalid; consistency metrics will be skipped.")
     if args.output is None:
-        if args.processed:
-            episode_name = Path(args.episode).stem
-        else:
-            _, episode_name = resolve_episode_path(args.episode)
+        episode_name = (
+            Path(args.episode).stem
+            if args.processed
+            else resolve_episode_path(args.episode)[1]
+        )
         output_dir = str(Path(DEFAULT_OUTPUT_DIR) / f"{episode_name}_replay")
     else:
         output_dir = args.output
