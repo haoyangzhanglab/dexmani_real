@@ -54,9 +54,15 @@ _SECTION_NAMES = (
 def _plain_value(value: Any) -> Any:
     """Return a deterministic YAML-safe copy of *value*."""
     if dataclasses.is_dataclass(value):
-        return {field.name: _plain_value(getattr(value, field.name)) for field in dataclasses.fields(value)}
+        return {
+            field.name: _plain_value(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+        }
     if isinstance(value, Mapping):
-        return {str(key): _plain_value(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+        return {
+            str(key): _plain_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
     if isinstance(value, (tuple, list, set, frozenset)):
         items = [_plain_value(item) for item in value]
         return sorted(items, key=repr) if isinstance(value, (set, frozenset)) else items
@@ -105,6 +111,9 @@ class ArmLoopConfig:
         default_factory=lambda: arm_defaults.max_joint_acceleration_rad_per_s2
     )
     arm_loop_hz: float = field(default_factory=lambda: arm_defaults.loop_hz)
+    max_servo_command_jump_rad: float = field(
+        default_factory=lambda: arm_defaults.max_servo_command_jump_rad
+    )
 
     joint_limit_lower: tuple[float, ...] = field(
         default_factory=lambda: arm_defaults.joint_limit_lower
@@ -122,7 +131,9 @@ class ArmLoopConfig:
     )
 
     expected_axis: int = field(default_factory=lambda: arm_defaults.expected_axis)
-    device_profile: str | None = field(default_factory=lambda: arm_defaults.device_profile)
+    device_profile: str | None = field(
+        default_factory=lambda: arm_defaults.device_profile
+    )
 
     homing_convergence_rad: float = field(
         default_factory=lambda: arm_defaults.homing.convergence_rad
@@ -141,7 +152,9 @@ class ArmLoopConfig:
     )
     homing_dwell_s: float = field(default_factory=lambda: arm_defaults.homing.dwell_s)
 
-    tcp_load_mass_kg: float = field(default_factory=lambda: arm_defaults.tcp_load_mass_kg)
+    tcp_load_mass_kg: float = field(
+        default_factory=lambda: arm_defaults.tcp_load_mass_kg
+    )
     tcp_load_cog_mm: tuple[float, float, float] = field(
         default_factory=lambda: arm_defaults.tcp_load_cog_mm
     )
@@ -157,6 +170,7 @@ class ArmLoopConfig:
                 np.deg2rad(cfg.max_joint_acceleration_deg_per_s2)
             ),
             arm_loop_hz=float(cfg.loop_hz),
+            max_servo_command_jump_rad=float(cfg.max_servo_command_jump_rad),
             joint_limit_lower=tuple(cfg.joint_limit_lower),
             joint_limit_upper=tuple(cfg.joint_limit_upper),
             arm_ip=str(cfg.ip),
@@ -177,7 +191,9 @@ class ArmLoopConfig:
         )
 
 
-def _merge(base: dict[str, Any], overrides: Mapping[str, Any], *, path: str = "") -> dict[str, Any]:
+def _merge(
+    base: dict[str, Any], overrides: Mapping[str, Any], *, path: str = ""
+) -> dict[str, Any]:
     result = {key: _plain_value(value) for key, value in base.items()}
     for key, value in overrides.items():
         key = str(key)
@@ -213,7 +229,9 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
     """Rebuild every defaults dataclass so all field validators run."""
     from dexmani_real.config import defaults
 
-    def rebuild(template: Any, raw: Any, path: str, annotation: Any | None = None) -> Any:
+    def rebuild(
+        template: Any, raw: Any, path: str, annotation: Any | None = None
+    ) -> Any:
         if raw is None and path in {"environment.table.plane_path"}:
             return None
         if dataclasses.is_dataclass(template):
@@ -222,7 +240,9 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
             field_names = {field.name for field in dataclasses.fields(template)}
             unknown = set(raw) - field_names
             if unknown:
-                raise TypeError(f"unknown runtime config field(s) in {path}: {sorted(unknown)}")
+                raise TypeError(
+                    f"unknown runtime config field(s) in {path}: {sorted(unknown)}"
+                )
             kwargs: dict[str, Any] = {}
             type_hints = get_type_hints(type(template))
             for field in dataclasses.fields(template):
@@ -240,16 +260,27 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
                 raise TypeError(f"runtime config field {path!r} must be an array")
             origin = get_origin(annotation)
             args = get_args(annotation)
-            if not template and origin is tuple and len(args) == 2 and args[1] is Ellipsis:
+            if (
+                not template
+                and origin is tuple
+                and len(args) == 2
+                and args[1] is Ellipsis
+            ):
                 item_type = args[0]
                 if dataclasses.is_dataclass(item_type):
                     item_factory = cast(Any, item_type)
-                    return tuple(rebuild(item_factory(), item, f"{path}[{index}]") for index, item in enumerate(raw))
+                    return tuple(
+                        rebuild(item_factory(), item, f"{path}[{index}]")
+                        for index, item in enumerate(raw)
+                    )
                 return tuple(raw)
             if len(raw) != len(template):
-                raise ValueError(f"runtime config field {path!r} must contain {len(template)} values")
+                raise ValueError(
+                    f"runtime config field {path!r} must contain {len(template)} values"
+                )
             return tuple(
-                rebuild(item, value, f"{path}[{index}]") for index, (item, value) in enumerate(zip(template, raw))
+                rebuild(item, value, f"{path}[{index}]")
+                for index, (item, value) in enumerate(zip(template, raw))
             )
         if isinstance(template, frozenset):
             if not isinstance(raw, (list, tuple, set, frozenset)):
@@ -263,8 +294,15 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
                 raise TypeError(f"runtime config field {path!r} must be an object")
             unknown = set(raw) - set(template)
             if unknown:
-                raise TypeError(f"unknown runtime config field(s) in {path}: {sorted(unknown)}")
-            return {key: rebuild(template[key], raw.get(key, template[key]), f"{path}.{key}") for key in template}
+                raise TypeError(
+                    f"unknown runtime config field(s) in {path}: {sorted(unknown)}"
+                )
+            return {
+                key: rebuild(
+                    template[key], raw.get(key, template[key]), f"{path}.{key}"
+                )
+                for key in template
+            }
         if template is None:
             if raw is None:
                 return None
@@ -278,9 +316,7 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
             ):
                 return int(raw)
             expected = "string" if optional_types == {str} else "integer"
-            raise TypeError(
-                f"runtime config field {path!r} must be {expected} or null"
-            )
+            raise TypeError(f"runtime config field {path!r} must be {expected} or null")
         if isinstance(template, bool):
             if not isinstance(raw, bool):
                 raise TypeError(f"runtime config field {path!r} must be a boolean")
@@ -290,8 +326,14 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
                 raise TypeError(f"runtime config field {path!r} must be an integer")
             return int(raw)
         if isinstance(template, float):
-            if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not np.isfinite(raw):
-                raise TypeError(f"runtime config field {path!r} must be a finite number")
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, (int, float))
+                or not np.isfinite(raw)
+            ):
+                raise TypeError(
+                    f"runtime config field {path!r} must be a finite number"
+                )
             return float(raw)
         if isinstance(template, str):
             if not isinstance(raw, str):
@@ -305,18 +347,36 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
 
     # Cross-section validation belongs here rather than in a worker.
     if rebuilt["camera"].recording_stall_abort_s <= rebuilt["camera"].max_frame_age_s:
-        raise ValueError("camera.recording_stall_abort_s must exceed camera.max_frame_age_s")
-    if rebuilt["policy"].control_hz <= 0 or rebuilt["arm"].loop_hz <= 0 or rebuilt["hand"].loop_hz <= 0:
+        raise ValueError(
+            "camera.recording_stall_abort_s must exceed camera.max_frame_age_s"
+        )
+    if (
+        rebuilt["policy"].control_hz <= 0
+        or rebuilt["arm"].loop_hz <= 0
+        or rebuilt["hand"].loop_hz <= 0
+    ):
         raise ValueError("all configured control rates must be positive")
     workspace = rebuilt["policy"].workspace
-    if workspace.x_min > workspace.x_max or workspace.y_min > workspace.y_max or workspace.z_min > workspace.z_max:
+    if (
+        workspace.x_min > workspace.x_max
+        or workspace.y_min > workspace.y_max
+        or workspace.z_min > workspace.z_max
+    ):
         raise ValueError("policy.workspace lower bounds must not exceed upper bounds")
     workspace_widths = np.array(
-        [workspace.x_max - workspace.x_min, workspace.y_max - workspace.y_min, workspace.z_max - workspace.z_min],
+        [
+            workspace.x_max - workspace.x_min,
+            workspace.y_max - workspace.y_min,
+            workspace.z_max - workspace.z_min,
+        ],
         dtype=np.float64,
     )
-    if 2.0 * rebuilt["keyboard_teleop"].workspace_command_margin_m >= float(np.min(workspace_widths)):
-        raise ValueError("keyboard workspace command margin leaves no interior workspace")
+    if 2.0 * rebuilt["keyboard_teleop"].workspace_command_margin_m >= float(
+        np.min(workspace_widths)
+    ):
+        raise ValueError(
+            "keyboard workspace command margin leaves no interior workspace"
+        )
     return rebuilt
 
 
@@ -364,9 +424,13 @@ def resolve_runtime_config(
         try:
             with plane_path.open("r", encoding="utf-8") as stream:
                 plane_data = json.load(stream)
-            table_config["plane_abcd"] = [float(plane_data[name]) for name in ("a", "b", "c", "d")]
+            table_config["plane_abcd"] = [
+                float(plane_data[name]) for name in ("a", "b", "c", "d")
+            ]
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ValueError(f"failed to load calibrated table plane from {plane_path}: {exc}") from exc
+            raise ValueError(
+                f"failed to load calibrated table plane from {plane_path}: {exc}"
+            ) from exc
     sections = _validated_defaults_snapshot(merged)
     validated = {name: _plain_value(value) for name, value in sections.items()}
     canonical_json = json.dumps(

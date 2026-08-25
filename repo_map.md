@@ -30,7 +30,9 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `repo_map.md` | 当前文件与 owner 索引。 |
 | `docs/data_schema.md` | Real raw v22、processed v7 与 Policy Zarr v3 的持久化字段和语义参考。 |
 | `docs/deployment_review.md` | learned-policy 部署架构与安全审查结论、风险接受及整改优先级。 |
+| `docs/maniunicon_reference_design.md` | 从 ManiUniCon 静态审查提炼的 learned-policy 部署改进思路、采纳边界与验收要求。 |
 | `docs/pointcloud_pipeline.md` | depth-to-color aligned 点云的采集、处理、时序与持久化契约。 |
+| `docs/teleop_jitter_incident.md` | 键盘遥操作卡顿、抖动、delta 拒绝与 coupled-command 修复复盘。 |
 | `user_design.md` | 已确认的机器人行为与安全取舍。 |
 | `.gitignore` | 生成物、本地环境、数据集与运行输出排除规则。 |
 | `pyproject.toml` | 包元数据、依赖、package data 与工具配置。 |
@@ -71,7 +73,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | 文件 | 主要职责 |
 |---|---|
 | `__init__.py` | 轻量运行时子包标记。 |
-| `safety.py` | safety state、run generation 与合法状态转换。 |
+| `safety.py` | safety state、run generation、coupled-command sequence ticket 与可撤销状态转换。 |
 | `status.py` | worker/supervisor 共用的结构化退出原因。 |
 | `workers.py` | spawn-only worker spec、构建、启动与退出优先级。 |
 | `supervisor.py` | readiness、heartbeat、进程健康、摘要与 verified shutdown。 |
@@ -82,7 +84,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 |---|---|
 | `__init__.py` | 轻量硬件子包标记。 |
 | `types.py` | 校验后的 `RobotState` 与 `RobotAction`。 |
-| `command_validation.py` | worker 在 SDK 调用前执行 generation/freshness/shape/expiry 复核。 |
+| `command_validation.py` | worker 在 SDK 调用前执行 generation/freshness/limits/异常跳变复核与 fault 分类。 |
 | `xarm7.py` | xArm Python SDK 的唯一 driver 边界。 |
 | `xhand.py` | XHand controller 的唯一 driver 边界。 |
 | `arm_worker.py` | xArm Mode-6 command/home consumer 与状态 publisher。 |
@@ -133,8 +135,8 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 |---|---|
 | `__init__.py` | 轻量控制子包标记。 |
 | `action.py` | backend-neutral `ActionCandidate` 与 representation 校验。 |
-| `safety_gate.py` | generation、limits、delta、workspace 与 collision fail-closed gate。 |
-| `publication.py` | controller feedback/runtime gate、序列化、发布与 acknowledgement。 |
+| `safety_gate.py` | generation、limits、命令历史 delta、实测 workspace/collision 的 fail-closed gate。 |
+| `publication.py` | controller feedback/runtime gate、coupled record 非阻塞发布与 acknowledgement。 |
 | `arm_home.py` | collision-checked arm homing 合同、排队、等待与 abort。 |
 | `hand_home.py` | exact hand-home 发布与 worker acknowledgement。 |
 
@@ -206,7 +208,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `manifest.py` | checkpoint/config/runtime manifest 组装与 fail-closed 一致性检查。 |
 | `observation.py` | 因果不可变 arm/hand/tactile/pointcloud history batch。 |
 | `worker.py` | runtime factory 惰性加载、observation 校验、predict 与 plan 发布。 |
-| `coordinator.py` | learned-policy 唯一 command producer、plan scheduling 与 watchdog。 |
+| `coordinator.py` | learned-policy 唯一 command producer、plan scheduling、命令连续性与 watchdog。 |
 | `lifecycle.py` | worker topology、readiness、supervision 与 verified shutdown。 |
 | `operator.py` | B/S/H/Q/ESC 请求及 collision-checked homing 编排。 |
 | `metrics.py` | inference/coordinator 指标与 reject 分类。 |
@@ -270,6 +272,12 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `tests/ipc/` | ABI manifest、ring exact dtype/shape 与重复共享内存名称的 fail-closed 门禁。 |
 | `tests/planning/` | collision/SRDF fail-closed 行为。 |
 | `tests/recording/` | raw/processed/Zarr schema contract。 |
+| `tests/test_coupled_command_publication.py` | coupled-command 非阻塞发布、active ticket 覆盖/撤销、ACK ownership 与运动准入合同。 |
+| `tests/test_deployment_manifest.py` | deployment manifest 模态去重与顺序规范化合同。 |
+| `tests/test_keyboard_arm_limits.py` | keyboard 发布完整 IK endpoint、禁用通用 arm delta clip 的合同。 |
+| `tests/test_runtime_channels_ticket_state.py` | RuntimeChannels 的 coupled-command ticket 分配、零初始化与真实 shared-memory round-trip 合同。 |
+| `tests/test_safety_gate_command_delta.py` | learned-policy 单步限幅使用命令历史、几何检查使用实测状态的合同。 |
+| `tests/test_worker_command_validation.py` | arm/hand 共用时效、限位、异常命令和 superseded snapshot 的 fail-closed 合同。 |
 | `tests/fixtures/contracts/` | 冻结的 architecture、IPC ABI 与 storage schema manifest。 |
 
 ## 6. 静态资源

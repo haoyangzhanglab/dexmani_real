@@ -15,7 +15,7 @@
 | 物理安全 | ESC/FAULT 到物理停止的闭环、XHand 的明确制动动作和执行器物理隔离，均无法由当前代码证明。 |
 | 部署判定 | **P0 未关闭前，不应进行常规 learned-policy 物理部署；仅适合不驱动执行器的离线或仿真验证。** |
 
-现有机制能够降低错误模型输出直接到达硬件的风险，但最终防护仍主要依赖软件路径。机械臂 SDK 前的独立限位、双执行器命令的一致提交，以及撤销指令的原子性仍有缺口；应将 P1 项作为启用 learned-policy 物理执行前的准入条件。
+现有机制能够降低错误模型输出直接到达硬件的风险，但最终防护仍主要依赖软件路径。本轮已收紧机械臂 SDK 前复核、逻辑命令一致性、撤销—发布竞态、模型 hand 合同、计划时效和观测合同；这些是**软件层缓解措施**，不构成物理安全证明。尚未关闭的 P0 与 P1 项仍是 learned-policy 物理执行的准入条件。
 
 ### 风险等级含义
 
@@ -30,7 +30,7 @@ policy worker（仅推理）
   -> policy plan ring
   -> DeploymentCoordinator（唯一 policy 命令发布者）
   -> SafetyGate（输入、限位、步长、工作空间、碰撞）
-  -> arm / hand latest-wins command rings
+  -> single coupled latest-wins command ring
   -> arm_worker / hand_worker（IPC 新鲜度、generation 等校验）
   -> 各自拥有的硬件 SDK
 
@@ -42,8 +42,9 @@ ESC / worker 失活 / 心跳超时
 
 - 推理子进程只写 policy plan ring，不拥有机器人 SDK，也不直接发布 arm 或 hand 命令。[`deployment/worker.py`](../dexmani_real/deployment/worker.py)
 - 协调器构造候选动作、读取反馈、调用 `SafetyGate`，并作为 learned-policy 指令的唯一生产者。[`deployment/coordinator.py`](../dexmani_real/deployment/coordinator.py)
-- `SafetyGate` 对候选动作执行表示/坐标系、有限值、当前反馈、关节限制、单步变化和工作空间段检查；当 arm 与 hand 的当前/目标状态齐全时，还执行转换碰撞检查。拒绝时默认不发布。[`control/safety_gate.py`](../dexmani_real/control/safety_gate.py)
-- hand worker 在硬件边界再次验证操作/机械范围及相对实测状态的增量；完整碰撞模型支持 arm 与 hand 组合状态的转换包络检查。[`robot/hand_worker.py`](../dexmani_real/robot/hand_worker.py)、[`planning/collision.py`](../dexmani_real/planning/collision.py)
+- `SafetyGate` 对候选动作执行表示/坐标系、有限值、当前反馈、关节限制、命令到命令的单步变化和工作空间段检查；当 arm 与 hand 的当前/目标状态齐全时，还执行从实测状态出发的转换碰撞检查。拒绝时默认不发布。[`control/safety_gate.py`](../dexmani_real/control/safety_gate.py)
+- 一个 `COUPLED_COMMAND_DTYPE` 记录同时携带 arm/hand target、generation、action ID 与时效；发布时以 ring 返回的递增 sequence 建立 `(run_generation, ring_sequence)` ownership ticket，并立即返回。`action_id` 仅用于审计和 ACK。worker 只执行在其 SDK 边界仍为 active 的最新 ticket；新 record 会原子覆盖旧 ticket。它保证 IPC 逻辑帧一致和非阻塞 latest-wins，**不保证两个执行器物理同步**。[`ipc/schema.py`](../dexmani_real/ipc/schema.py)、[`runtime/safety.py`](../dexmani_real/runtime/safety.py)、[`control/publication.py`](../dexmani_real/control/publication.py)
+- arm 与 hand worker 共用 generation 与 delivery window 校验，并在 SDK 前复核 active sequence、运行时 fault/stop、形状和有限值；arm 还复核关节范围，并以“上一条 SDK 接受目标 → 新目标”的 20° 异常跳变阈值兜底（触发即 fail-closed fault），而不以滞后实测位置限制正常命令流；hand 复核操作/机械范围并保留实测状态限速。[`robot/arm_worker.py`](../dexmani_real/robot/arm_worker.py)、[`robot/hand_worker.py`](../dexmani_real/robot/hand_worker.py)
 - 运行时使用 `spawn`、就绪状态、心跳和受监督的子进程收尾；arm home 是可中断、独立的碰撞检查轨迹。[`deployment/lifecycle.py`](../dexmani_real/deployment/lifecycle.py)、[`control/arm_home.py`](../dexmani_real/control/arm_home.py)
 
 这些机制降低了错误模型输出直接到达硬件的风险，但不能替代执行器层的物理安全功能。
@@ -68,26 +69,26 @@ arm 初始化即启用运动、设置模式和运行状态；`DISARMED` 的语�
 
 **要求：**将“软件不发新命令”与“执行器进入安全状态”区分记录；前者不能作为后者的证据。
 
-## P1：启用 learned-policy 物理执行前应修复的实现缺口
+## P1：启用 learned-policy 物理执行前的实现缺口
 
-| 问题 | 代码事实与影响 | 建议修复 |
+| 状态 | 问题 | 当前代码事实与剩余边界 |
 | --- | --- | --- |
-| arm 硬件边界缺少关节限位复核 | arm worker 的 IPC 校验覆盖形状、有限值、generation、序号与时效，但不校验 arm 关节范围；配置中已有 arm 限位。离线验证中，`qpos_cmd=1e6` 仍被 `worker_validate_arm` 接受。 | 将不可变的 arm 上下限（及必要的 worker 侧最大增量）传给 arm worker，并在每次 SDK 调用前复核。 |
-| 运动撤销不是原子的 | `SafetyState.transition(FAULT)` 不会自动推进 generation；supervisor 的多条故障路径只做该转换。worker 可在校验 generation 后、SDK 发送前遇到撤销。 | 令所有安全停止路径原子推进动作 epoch；将状态、epoch 与发送许可绑定，并在 SDK 发送点尽量线性化复核。 |
-| arm/hand 命令可能跨帧混合 | 协调器分别写入两个 latest-wins ring，双方无 ACK 或提交协议；两个 worker 独立消费。因此 arm 的第 *n* 帧可与 hand 的第 *n+1* 帧同时执行，候选碰撞检查并未覆盖该组合。 | 使用单一原子动作帧，或使用共同 transaction ID 的两阶段提交；worker 必须拒绝不匹配的 paired action。 |
-| 可选 hand 输出可绕过完整碰撞转换 | `JointActionChunk.hand_qpos` 是可选字段；缺失时协调器可形成仅 arm 候选，而碰撞门仅在 hand 起止状态齐全时运行。真实 DexMani 适配器会输出 hand，但契约没有强制这一点。 | 对支持的 manifest/checkpoint 强制 hand 输出；或在 hand 缺失时以当前 hand 目标/状态固定，并仍执行 arm-to-hand 碰撞检查。 |
-| 激活计划不会因观测过期自动失效 | 计划在采纳时检查计划和观测时效；激活后仍可按原端点继续发布。命令发布又会刷新 delivery 有效期，使旧观测派生的目标表现为新鲜命令。 | 在每个端点发布前检查观测年龄、计划年龄与截止时间；过期后清空 active/pending plan，并进入定义明确的 hold/安全状态。 |
-| deployment 碰撞世界排除桌面 | coordinator 明确不传入 table；operator home 规划则包含 runtime table。README 记录了 VR/键盘遥操作与回放为近桌抓取而排除桌面的取舍，但未找到针对 learned-policy deployment 的正式风险接受记录。 | 将其作为任务级风险接受项：定义可运行工作空间、接近桌面的速度/姿态约束和验证工装；不得暗示部署碰撞检查覆盖完整环境。 |
+| 已实施 | arm 硬件边界缺少关节限位复核 | `check_worker_arm_command` 现在复核不可变关节上下限、action ID、时效和相邻已接受目标的异常跳变；`_handle_servo_command` 在 SDK 前执行完整复核。实机限位/停止效果仍须验证。 |
+| 已实施（软件） | 运动撤销不是原子的 | `motion_lock` 将 state 与 generation 作为 `MotionPermit` 读取；开始、撤销和 IPC 发布在同一短临界区线性化，进入 `FAULT` 也推进 generation。SDK 调用前复核但不持锁，不能替代物理停止。 |
+| 已实施（IPC） | arm/hand 命令可能跨帧混合，或旧 record 在覆盖后被延迟执行 | 两条 ring 已替换为单条 coupled record；publisher 在 motion lock 内写完整 record 并更新 active sequence 后立即返回。worker 在 SDK 前复核同一 `(generation, ring sequence)` ownership ticket；action ID 仅承担审计/ACK。覆盖、普通 `RUNNING → ARMED` 停止和 home 取消均会使旧 ticket 失效；home 取消只影响其仍为当前的 ticket。执行器仍独立循环，未声明物理同步或 paired physical ACK。 |
+| 已实施 | 可选 hand 输出可绕过完整碰撞转换 | learned-policy `publish_plan` 拒绝缺 hand chunk，coordinator 采纳门也拒绝 `hand_present != 1`；DexMani manifest 强制 hand-enabled 的 19D/21D 合同。 |
+| 已实施 | 激活计划不会因观测过期自动失效 | coordinator 对每个 active endpoint 计算不可延长的 `min(inference_finished + max_plan_age, observation_anchor + max_observation_age)`；到期清空 active/pending 并撤销 RUNNING。 |
+| 未关闭 | deployment 碰撞世界排除桌面 | coordinator 仍不传入 table；需要任务级风险接受、工作空间/速度约束和受控工装验证，不能暗示碰撞检查覆盖完整环境。 |
 
 相关入口：[`robot/command_validation.py`](../dexmani_real/robot/command_validation.py)、[`runtime/safety.py`](../dexmani_real/runtime/safety.py)、[`control/publication.py`](../dexmani_real/control/publication.py)、[`deployment/contracts.py`](../dexmani_real/deployment/contracts.py)、[`deployment/coordinator.py`](../dexmani_real/deployment/coordinator.py)。
 
-## P2：应纳入后续可靠性和可审计性整改
+## P2：后续可靠性和可审计性整改
 
-| 问题 | 审查结论 | 建议 |
+| 状态 | 问题 | 当前代码事实与剩余边界 |
 | --- | --- | --- |
-| 观测历史并非时间对齐 | adapter 仅按最近样本数分别取 arm/hand 历史，point cloud 也独立填充；已声明的 observation skew 指标未实际使用。 | 按共同单调时间网格重采样或配对；设置最大 skew，超限拒绝计划，并记录实测 skew。 |
-| 观测窗口容量可小于配置/manifest 需求 | arm、hand、point-cloud history ring 的固定容量为 8；配置 horizon 和 manifest `nobs` 可接受大于 8 的值。 | 在运行时按最大允许 `nobs` 分配，或在启动前明确拒绝超出容量的配置。 |
-| manifest 与 adapter 的模态声明不一致 | manifest 可声明仅 `point_cloud` 并通过启动校验；DexMani adapter 却无条件构造并传入 `joint_state` 与 `point_cloud`。当前 worker 也无条件采集 arm history，因此这本身**不证明**会运行时丢弃观测；已证实的是模型声明与实际输入契约不一致。 | 要求 manifest 包含 `joint_state`，或将 adapter 改为按 manifest 显式、可验证地路由模态。 |
+| 已实施 | 观测历史并非时间对齐 | point cloud 是 reference timeline；每个 cloud 仅匹配 `source_time <= cloud_time` 且在 `max_observation_skew_s` 内的最新 arm/hand frame。数据不足、跨 camera generation 或超 skew 时不推理；不插值、不填充。 |
+| 已实施 | 观测窗口容量可小于配置/manifest 需求 | point-cloud deployment 按 horizon、camera FPS、arm/hand loop Hz、skew 与读取余量推导 state/point-cloud ring 容量；manifest `n_obs_steps` 必须等于 deployment horizon。最坏拷贝/调度预算仍应通过负载测试校准。 |
+| 已实施 | manifest 与 adapter 的模态声明不一致或仅因声明顺序不同而误拒绝 | DexMani real manifest 和 deployment config 现在都要求严格的 `joint_state + point_cloud`、`arm_qpos,hand_qpos,point_cloud` 合同；source manifest 会拒绝重复模态并规范化顺序，运行时以集合比较必需模态；adapter 只接受完整、对齐的窗口。 |
 | 数组转换可能静默改变整数语义 | `freeze_array` / action 合约在检查有限值后直接 cast；例如 `1.9` 可变成 `uint64(1)`，`0.5` 可变成 mask 值 `0`。 | 在转换前验证整型/布尔输入语义、范围和无损性；禁止依赖截断。 |
 | 时序字段语义混淆 | plan 的 `target_monotonic_ns` 表示期望执行时刻；发布候选时会重新生成 delivery target，worker 不做 not-before 等待。 | 区分“原始计划时刻”“可发送时刻”“命令过期时刻”，并按选择的控制策略明确执行。 |
 | 关键指标未闭环 | 定义了 observation skew、计划 age、stale/superseded 等指标，但部分路径不计量；推理异常或缺反馈也可能跳过指标刷新。 | 为每个拒绝、降级和异常路径定义指标；报警应依据实际采集的安全量。 |
@@ -100,20 +101,19 @@ arm 初始化即启用运动、设置模式和运行状态；`DISARMED` 的语�
 
 以下检查均未初始化 SDK 或连接机器人：
 
-- `worker_validate_arm` 对远超范围的 arm 目标返回 `True`，确认 arm worker 缺少范围复核。
-- hand 增益/扭矩均设为 `1_000_000`、碰撞灵敏度设为 `0` 时，当前配置解析仍接受，确认缺少安全 envelope 上限。
-- hand 字段缺失的候选可通过当前 collision gate，确认完整 19 自由度转换检查在该契约分支未强制执行。
-- point-cloud-only manifest 可通过启动校验，确认 manifest 声明与 adapter 实际输入之间存在契约缺口；`nobs=9` 也可通过相关配置校验，而运行时历史容量为 8，确认容量门禁缺口。
-- 整数目标/掩码的浮点输入在 cast 后可被接受，确认静默截断风险。
-- 已执行目标模块 `compileall` 与 `git diff --check`；它们只说明语法/补丁格式，不说明实时性、设备行为或安全性。
+- 审查初版曾证明 arm 越限、缺 hand chunk、point-cloud-only manifest 和超过固定 history 容量可通过旧合同；这些发现对应的路径已由本轮回归检查覆盖，现应 fail closed。
+- 构造 coupled record 的 IPC round-trip，确认 arm/hand payload、action ID、generation 与时效在同一记录中传递；hand 缺席会清除 hand worker 的待执行目标。
+- 用共享 `RLock`/`Value` 的替身验证非阻塞发布、sequence ticket 覆盖、`RUNNING → ARMED` 撤销、hand-only command 与定向取消；旧 generation 或旧 sequence 的 ticket 均不再 active。
+- 构造两条状态历史和两条 point-cloud 时间戳，确认只选择不晚于 cloud 的状态；超过 skew 的配对被拒绝。
+- 验证 strict manifest、按 horizon/skew 推导的 ring 容量、plan 不可延长截止时间，以及 arm worker 对越限/相邻命令异常跳变的拒绝。
+- 已执行 `python -m unittest discover -s tests -v`、`python -m compileall -q dexmani_real examples tests`、对命令边界定向文件的 `black --check --fast`、`isort --check-only` 和 `git diff --check`。这些只说明离线语法、格式和定向合同；不说明实时性、设备行为或安全性。
 
 ## 建议整改顺序与准入门槛
 
 1. **先建立物理安全案例。** 明确 xArm 与 XHand 的独立安全停止设备、接线、设备端状态和测试规程；将 ESC 保留为软件辅助通道，不作为唯一保护。
-2. **修复命令边界。** 为 arm 加入硬件边界限位和增量复核；使 FAULT/撤销原子化；确保 arm/hand 只会成对提交相同 transaction 的命令。
-3. **收紧模型与时效契约。** 将 hand 输出、实际输入模态、历史容量、观测对齐和计划终止时间变成启动期可证明的契约；任一不满足时 fail closed。
-4. **将配置变成安全 envelope。** 设备额定上限和任务相关最小保护值必须由受控 profile 提供，不能仅依赖操作者提供的数值为正。
-5. **补足审计和异常策略。** 为 tracking error、XHand 错误码、观测偏斜、计划过期和 worker 异常定义可观测、可升级、可复现的处置。
+2. **完成 P1 剩余闭环。** 为 coupled command 设计与验证跨 worker 的 applied/physical-state 语义；将桌面纳入明确的 task safety case，或限制任务并正式接受风险。
+3. **建立配置安全 envelope。** 设备额定上限和任务相关最小保护值必须由受控 profile 提供，不能仅依赖操作者提供的数值为正。
+4. **补足审计和异常策略。** 为 tracking error、XHand 错误码、观测偏斜、计划过期和 worker 异常定义可观测、可升级、可复现的处置。
 
 在 P0 未关闭前，只宜进行不驱动执行器的离线/仿真验证。P0 关闭后仍需在受控工装、低速低力、空载或等效安全条件下验证：急停响应时间、通信中断、worker 崩溃、陈旧命令、generation 撤销、pair mismatch、碰撞拒绝及各执行器的最终状态。任何一次验证都应保存设备型号、固件、通讯模式、参数、测量方法和原始日志。
 

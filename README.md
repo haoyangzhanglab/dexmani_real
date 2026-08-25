@@ -38,7 +38,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 |---|---|---|
 | 理解仓库与修改约束 | [`AGENTS.md`](AGENTS.md)、[`code_style.md`](code_style.md) | [`repo_map.md`](repo_map.md)、[`user_design.md`](user_design.md) |
 | VR 遥操作与采集 | [`examples/collect_teleop.py`](examples/collect_teleop.py) | [`teleop/session.py`](dexmani_real/teleop/session.py)、[`teleop/loop.py`](dexmani_real/teleop/loop.py)、[`teleop/operator_controls.py`](dexmani_real/teleop/operator_controls.py)、[`teleop/control_grid.py`](dexmani_real/teleop/control_grid.py)、[`teleop/action_proposal.py`](dexmani_real/teleop/action_proposal.py) |
-| 键盘遥操作 | [`examples/keyboard_teleop.py`](examples/keyboard_teleop.py) | [`teleop/keyboard_session.py`](dexmani_real/teleop/keyboard_session.py) |
+| 键盘遥操作 | [`examples/keyboard_teleop.py`](examples/keyboard_teleop.py) | [`teleop/keyboard_session.py`](dexmani_real/teleop/keyboard_session.py)、[`docs/teleop_jitter_incident.md`](docs/teleop_jitter_incident.md) |
 | 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`replay/`](dexmani_real/replay) |
 | raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/hdf5_writer.py`](dexmani_real/recording/hdf5_writer.py)、[`recording/reader.py`](dexmani_real/recording/reader.py) |
 | 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`data/`](dexmani_real/data) |
@@ -174,10 +174,17 @@ python examples/collect_teleop.py --print-config
 ### Learned policy 实时点云
 
 部署配置的 `observation_fields` 包含 `point_cloud` 时，lifecycle 才启动 camera 与独立
-point-cloud worker。worker 始终读取最新的 depth-to-color aligned RGB-D，旧帧不会排队；inference 组装
-点云 T 历史窗（`n_obs_steps` 帧，跨帧 `camera_generation` 一致），每帧为 xArm-base
+point-cloud worker。worker 始终读取最新的 depth-to-color aligned RGB-D，旧帧不会排队；inference 仅在
+点云 T 历史窗完整（`n_obs_steps` 帧、跨帧 `camera_generation` 一致）且每个点云均能因果配对到
+不晚于它、并处于 `max_observation_skew_s` 内的 arm/hand 状态时才推理，不插值或填充。每帧为 xArm-base
 `float32 (N, 6)`，列语义为 `xyzrgb`，RGB 范围为 `[0,1]`。`pointcloud_num_points` 只允许
 `1024`、`2048`、`4096`、`8192`，也可通过 `--pointcloud-num-points` 覆盖。
+
+coordinator 将通过安全门的策略 endpoint 原子写为单条 coupled command，并立即返回，不在控制热路径
+等待 worker 握手。ring sequence 是实际的传输 epoch；arm/hand worker 在各自 SDK 边界复核同一个
+`(run_generation, ring_sequence)` ticket，已被新 record 覆盖或被 motion permit 撤销的 endpoint
+不再执行。`action_id` 保留在 record 与反馈中用于审计和 ACK，不参与 ownership 判定。这保证软件
+IPC 记录一致且保持 latest-wins 实时性，不表示两个执行器物理同步或已完成动作。
 
 实时、离线处理和 shadow 诊断共用 `PointCloudConfig` 与同一个生产 builder。处理顺序为：
 aligned depth 范围/局部支持与边缘四方向支撑过滤 → 使用缓存 color-camera ray 的桌面高度

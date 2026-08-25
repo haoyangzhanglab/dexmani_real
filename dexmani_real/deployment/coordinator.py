@@ -51,7 +51,7 @@ from dexmani_real.robot_spec import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
-from dexmani_real.runtime.safety import SafetyState, advance_run_generation, transition
+from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -141,19 +141,41 @@ def _adoptable(
         return False, "generation mismatch"
     if int(rec["observation_id"]) < last_observation_id:
         return False, "stale observation"
-    finished_ns = int(rec["inference_finished_monotonic_ns"])
-    anchor_ns = int(rec["observation_anchor_monotonic_ns"])
-    if finished_ns <= 0 or now_ns - finished_ns > max_plan_age_ns:
-        return False, "plan expired"
-    if anchor_ns <= 0 or now_ns - anchor_ns > max_observation_age_ns:
-        return False, "observation expired"
+    deadline_ns = _plan_deadline_ns(
+        rec,
+        max_plan_age_ns=max_plan_age_ns,
+        max_observation_age_ns=max_observation_age_ns,
+    )
+    if deadline_ns is None:
+        return False, "invalid plan timestamps"
+    if now_ns >= deadline_ns:
+        return False, "plan or observation expired"
     n = int(rec["num_steps"])
     if n <= 0 or n > MAX_POLICY_CHUNK_STEPS:
         return False, "bad num_steps"
     mask = rec["valid_mask"][:n]
     if not np.all((mask == 0) | (mask == 1)):
         return False, "bad valid_mask"
+    if int(rec["hand_present"]) != 1:
+        return False, "learned-policy plan omits required hand target"
     return True, ""
+
+
+def _plan_deadline_ns(
+    rec,
+    *,
+    max_plan_age_ns: int,
+    max_observation_age_ns: int,
+) -> int | None:
+    """Return the immutable expiry shared by a plan and its source observation."""
+    finished_ns = int(rec["inference_finished_monotonic_ns"])
+    anchor_ns = int(rec["observation_anchor_monotonic_ns"])
+    if finished_ns <= 0 or anchor_ns <= 0:
+        return None
+    return min(
+        finished_ns + int(max_plan_age_ns),
+        anchor_ns + int(max_observation_age_ns),
+    )
 
 
 def _ready_to_replan(active_plan, next_step: int, stride: int) -> bool:
@@ -215,8 +237,7 @@ def _end_policy_run(
     ``flush_every`` is never reached once a run ends (the loop idles in ARMED),
     and the H0 gate reads these counters.
     """
-    advance_run_generation(shared)
-    if not transition(shared, SafetyState.ARMED):
+    if not revoke_motion(shared, SafetyState.ARMED):
         logger.error("coordinator: failed to transition RUNNING->ARMED (%s)", reason)
     if abort:
         logger.warning("coordinator: policy run aborted: %s", reason)
@@ -303,6 +324,8 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
     last_valid_policy_command_ns: int | None = None
     # RUNNING start time, for the first-command timeout.
     run_started_ns: int | None = None
+    previous_arm_command_qpos: np.ndarray | None = None
+    previous_hand_command_qpos: np.ndarray | None = None
     last_metrics_flush_ns = time.monotonic_ns()
 
     try:
@@ -323,13 +346,12 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 shared.start_request.value = False
                 # A stray S from ARMED must not stop the freshly started run.
                 shared.stop_request.value = False
-                if not transition(shared, SafetyState.RUNNING):
+                if not begin_motion(shared):
                     logger.error(
                         "coordinator: cannot enter RUNNING (safety_state=%d)",
                         int(shared.safety_state.value),
                     )
                     return
-                advance_run_generation(shared)
                 logger.info(
                     "coordinator_loop: RUNNING (run_generation=%d)",
                     int(shared.run_generation.value),
@@ -343,6 +365,8 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 next_step = 0
                 last_valid_policy_command_ns = None
                 run_started_ns = time.monotonic_ns()
+                previous_arm_command_qpos = None
+                previous_hand_command_qpos = None
                 _sleep_tick(period_s, tick_start)
                 continue
 
@@ -442,9 +466,29 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 _sleep_tick(period_s, tick_start)
                 continue
 
+            plan_deadline_ns = _plan_deadline_ns(
+                active_plan,
+                max_plan_age_ns=max_plan_age_ns,
+                max_observation_age_ns=max_observation_age_ns,
+            )
+            if plan_deadline_ns is None or now_ns >= plan_deadline_ns:
+                active_plan = None
+                active_plan_id = 0
+                pending_plan = None
+                pending_plan_id = 0
+                next_step = 0
+                _end_policy_run(
+                    shared,
+                    "active plan deadline reached",
+                    abort=True,
+                    metrics=metrics,
+                    metric=COMMAND_SILENCE_ABORT,
+                )
+                continue
+
             n = int(active_plan["num_steps"])
             prev_next_step = next_step
-            selected, next_step = _select_due_step(
+            selected, candidate_next_step = _select_due_step(
                 np.asarray(active_plan["target_monotonic_ns"][:n], dtype=np.uint64),
                 np.asarray(active_plan["valid_mask"][:n], dtype=np.uint8),
                 n,
@@ -452,6 +496,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 now_ns,
             )
             if selected is None:
+                next_step = candidate_next_step
                 _sleep_tick(period_s, tick_start)
                 continue
             metrics.increment(ENDPOINTS_DUE)
@@ -483,7 +528,11 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 ik_result = planner.solve_teleop_ik(
                     Pose(p=ee_pos, q=rot6d_to_quat_wxyz(ee_rot6d)),
                     _arm_state["qpos"],
-                    _arm_state["qpos"],
+                    (
+                        previous_arm_command_qpos
+                        if previous_arm_command_qpos is not None
+                        else _arm_state["qpos"]
+                    ),
                 )
                 if not ik_result.success or ik_result.qpos is None:
                     _end_policy_run(
@@ -499,11 +548,18 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 arm_qpos = np.asarray(
                     active_plan["arm_qpos"][selected], dtype=np.float64
                 )
-                # Canonicalize targets against fresh feedback before publication.
-                if _arm_state is not None and np.all(np.isfinite(_arm_state["qpos"])):
+                # Preserve joint-wrap continuity against the command stream.
+                arm_reference = previous_arm_command_qpos
+                if (
+                    arm_reference is None
+                    and _arm_state is not None
+                    and np.all(np.isfinite(_arm_state["qpos"]))
+                ):
+                    arm_reference = _arm_state["qpos"]
+                if arm_reference is not None:
                     arm_qpos = wrap_nearest_equivalent(
                         arm_qpos,
-                        _arm_state["qpos"],
+                        arm_reference,
                         config.arm_joint_lower_rad,
                         config.arm_joint_upper_rad,
                     )
@@ -518,9 +574,16 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     active_plan["observation_anchor_monotonic_ns"]
                 ),
                 action_validity_s=float(config.deployment.action_validity_s),
+                valid_until_monotonic_ns=plan_deadline_ns,
             )
             if candidate is None:
-                _sleep_tick(period_s, tick_start)
+                _end_policy_run(
+                    shared,
+                    "plan deadline left no command delivery window",
+                    abort=True,
+                    metrics=metrics,
+                    metric=COMMAND_SILENCE_ABORT,
+                )
                 continue
 
             publish_result = validate_and_send_candidate(
@@ -529,6 +592,8 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 gate=gate,
                 arm_feedback_max_age_s=config.arm_feedback_max_age_s,
                 hand_feedback_max_age_s=config.hand_feedback_max_age_s,
+                arm_delta_reference_qpos=previous_arm_command_qpos,
+                hand_delta_reference_qpos=previous_hand_command_qpos,
                 hand_mechanical_lower_rad=np.asarray(
                     config.hand_mechanical_lower_rad, dtype=np.float64
                 ),
@@ -571,6 +636,15 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 continue
 
             metrics.increment(ENDPOINTS_PUBLISHED)
+            next_step = candidate_next_step
+            previous_arm_command_qpos = np.asarray(
+                candidate.arm_qpos, dtype=np.float64
+            ).copy()
+            previous_hand_command_qpos = (
+                None
+                if candidate.hand_qpos is None
+                else np.asarray(candidate.hand_qpos, dtype=np.float64).copy()
+            )
             last_valid_policy_command_ns = now_ns
 
             last_metrics_flush_ns = flush_every(

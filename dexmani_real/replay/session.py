@@ -1,8 +1,8 @@
 """Physically replay one recorded DexMani episode on the real robot.
 
 Spawn-only architecture: arm_loop + hand_loop processes with RuntimeChannels
-and the SafetyState machine. Commands flow through arm_cmd_ring / hand_cmd_ring;
-state is read from arm_state_ring / hand_state_ring. No direct SDK access from
+and the SafetyState machine. Commands flow through coupled_cmd_ring; state is
+read from arm_state_ring / hand_state_ring. No direct SDK access from
 the main process.
 
 Replay reruns dense geometry and provenance preflight, spawns arm/hand workers,

@@ -32,12 +32,7 @@ from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
 from dexmani_real.planning.poses import quat_multiply
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.robot.hand_worker import hand_loop
-from dexmani_real.runtime.safety import (
-    SafetyState,
-    advance_run_generation,
-    require_transition,
-    transition,
-)
+from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
 from dexmani_real.runtime.workers import WorkerSpec, build_processes, start_processes
 from dexmani_real.teleop.keyboard import GlobalKeyState, eef_delta_from_keys
@@ -244,7 +239,7 @@ def set_keyboard_fault(
     if estop:
         shared.estop_request.value = True
     shared.error_state.value = True
-    transition(shared, SafetyState.FAULT)
+    revoke_motion(shared, SafetyState.FAULT)
 
 
 def _keyboard_command_anchor(
@@ -436,7 +431,8 @@ def _run_keyboard_home(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     """Home enabled actuators and rebuild command anchors from fresh feedback."""
     if int(shared.safety_state.value) == int(SafetyState.RUNNING):
-        require_transition(shared, SafetyState.ARMED)
+        if not revoke_motion(shared, SafetyState.ARMED):
+            return None
 
     hand_home_accepted = True
     if hand_enabled:
@@ -527,8 +523,7 @@ def _publish_keyboard_target(
 
     publish_result = publish_joint_targets(
         shared,
-        ik_result.qpos,
-        prepare_timeout_s=float(runtime.policy.action_prepare_timeout_s),
+        np.asarray(ik_result.qpos, dtype=np.float64).copy(),
         safety_gate=safety_gate,
         arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
@@ -613,7 +608,9 @@ def _run_control_loop(
         if quit_requested and not quit_quiesced:
             # Establish the terminal command-silence boundary before any
             # remaining feedback/fault classification work in this iteration.
-            advance_run_generation(shared)
+            if not revoke_motion(shared, SafetyState.ARMED):
+                set_keyboard_fault(shared, "failed to establish keyboard quit boundary")
+                return False
             quit_quiesced = True
         feedback = _read_keyboard_feedback(
             shared,
@@ -637,8 +634,6 @@ def _run_control_loop(
             planner.set_hand_qpos(feedback.hand_qpos_rad)
 
         if quit_requested:
-            if int(shared.safety_state.value) == int(SafetyState.RUNNING):
-                require_transition(shared, SafetyState.ARMED)
             return True
 
         home_pressed = keys.is_pressed("r")
@@ -691,8 +686,9 @@ def _run_control_loop(
         # Idle: stop publishing commands while Mode 6 settles its last endpoint.
         if not moving:
             if motion_active:
-                advance_run_generation(shared)
-                require_transition(shared, SafetyState.ARMED)
+                if not revoke_motion(shared, SafetyState.ARMED):
+                    set_keyboard_fault(shared, "failed to stop keyboard motion")
+                    return False
                 motion_active = False
                 rate.reset()
             # Rebuild baselines so new key presses start from current feedback.
@@ -711,7 +707,9 @@ def _run_control_loop(
 
         # Moving: keys are held.
         if not motion_active:
-            require_transition(shared, SafetyState.RUNNING)
+            if not begin_motion(shared):
+                set_keyboard_fault(shared, "failed to enter keyboard motion")
+                return False
             motion_active = True
             rate.reset()
 
@@ -818,7 +816,9 @@ def _run_keyboard_session(
         planner.set_hand_qpos(hand_state["qpos"])
 
     keys.start()
-    require_transition(shared, SafetyState.ARMED)
+    if not revoke_motion(shared, SafetyState.ARMED):
+        logger.error("failed to arm keyboard teleoperation")
+        return False
     print(
         f"Keyboard teleop: {runtime.keyboard_teleop.control_hz:g}Hz, "
         f"hand={'measured' if hand_enabled else 'assumed-home'}, config={runtime.sha256[:12]}"

@@ -70,7 +70,13 @@ class DeploymentManifest:
                 f"action_key must be one of {sorted(SUPPORTED_ACTION_KEYS)}, "
                 f"got {self.action_key!r}"
             )
-        for name in ("n_obs_steps", "n_action_steps", "action_dim", "horizon", "control_action_dim"):
+        for name in (
+            "n_obs_steps",
+            "n_action_steps",
+            "action_dim",
+            "horizon",
+            "control_action_dim",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}")
@@ -93,7 +99,9 @@ class DeploymentManifest:
             if value is not None and (
                 isinstance(value, bool) or not isinstance(value, int) or value <= 0
             ):
-                raise ValueError(f"{name} must be a positive integer or None, got {value!r}")
+                raise ValueError(
+                    f"{name} must be a positive integer or None, got {value!r}"
+                )
         expected_control = (
             JOINT_CONTROL_ACTION_DIM
             if self.action_key == "action"
@@ -107,6 +115,8 @@ class DeploymentManifest:
         modalities = self.sensor_modalities
         if not isinstance(modalities, tuple) or not modalities:
             raise ValueError("sensor_modalities must be a non-empty tuple")
+        if len(set(modalities)) != len(modalities):
+            raise ValueError("sensor_modalities must not contain duplicates")
         unknown = set(modalities) - SUPPORTED_SENSOR_MODALITIES
         if unknown:
             raise ValueError(f"unsupported sensor modalit(ies): {sorted(unknown)}")
@@ -155,9 +165,10 @@ def manifest_from_sources(
     absent (a non-point-cloud model has no point-cloud contract).
     """
     modalities = tuple(str(m) for m in sensor_modalities)
-    num_points = (
-        1024 if point_cloud_num_points is None else int(point_cloud_num_points)
-    )
+    if len(set(modalities)) != len(modalities):
+        raise ValueError("sensor_modalities must not contain duplicates")
+    modalities = tuple(sorted(modalities))
+    num_points = 1024 if point_cloud_num_points is None else int(point_cloud_num_points)
     pc_dim = (
         POINT_CLOUD_FEATURE_DIM
         if point_cloud_feature_dim is None
@@ -196,11 +207,10 @@ def validate_manifest_against_deployment(
             f"manifest action_key={manifest.action_key!r} does not match "
             f"deployment action_key={deployment.action_key!r}"
         )
-    if manifest.n_obs_steps > deployment.observation_horizon:
+    if manifest.n_obs_steps != deployment.observation_horizon:
         raise ValueError(
-            f"manifest n_obs_steps={manifest.n_obs_steps} exceeds deployment "
-            f"observation_horizon={deployment.observation_horizon} (cannot satisfy "
-            "T >= n_obs_steps)"
+            f"manifest n_obs_steps={manifest.n_obs_steps} does not match deployment "
+            f"observation_horizon={deployment.observation_horizon}"
         )
     if deployment.replan_stride_steps > manifest.n_action_steps:
         raise ValueError(
@@ -218,6 +228,12 @@ def validate_manifest_against_deployment(
     from dexmani_real.deployment.observation import parse_observation_fields
 
     requested = set(parse_observation_fields(deployment.observation_fields))
+    if requested != {"arm_qpos", "hand_qpos", "point_cloud"}:
+        raise ValueError(
+            "DexMani real deployment requires observation_fields exactly "
+            "'arm_qpos,hand_qpos,point_cloud'; got "
+            f"{deployment.observation_fields!r}"
+        )
     hand_fields = requested & {
         "hand_qpos",
         "hand_joint_position",
@@ -234,10 +250,12 @@ def validate_manifest_against_deployment(
     # Only point-cloud policies are supported by this runtime; a joint-only or
     # rgb manifest would otherwise hit an unconditional point-cloud requirement
     # in _encode and silently hang at inference.
-    if not manifest.uses_point_cloud:
+    required_modalities = frozenset({"joint_state", "point_cloud"})
+    if frozenset(manifest.sensor_modalities) != required_modalities:
         raise ValueError(
-            "deployment requires a point-cloud policy; manifest sensor_modalities="
-            f"{manifest.sensor_modalities!r} lacks 'point_cloud'"
+            "DexMani real deployment requires exactly the modalities "
+            "{'joint_state', 'point_cloud'}; "
+            f"got manifest sensor_modalities={manifest.sensor_modalities!r}"
         )
     if manifest.point_cloud_num_points != deployment.pointcloud_num_points:
         raise ValueError(

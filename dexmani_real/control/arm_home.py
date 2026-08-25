@@ -29,7 +29,7 @@ from dexmani_real.planning.paths import (
     compute_joint_home_path,
 )
 from dexmani_real.robot_spec import ARM_JOINT_SHAPE
-from dexmani_real.runtime.safety import SafetyState, advance_run_generation
+from dexmani_real.runtime.safety import SafetyState, revoke_motion
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -642,7 +642,14 @@ def execute_arm_home(
             operator_message="arm: no collision planner — homing cancelled",
         )
 
-    home_generation = advance_run_generation(shared)
+    if not revoke_motion(shared, SafetyState.ARMED):
+        return _home_failure(
+            ArmHomeStatus.NOT_ARMED,
+            "failed to establish the home command boundary",
+            progress=progress,
+            operator_message="arm: homing cancelled — command boundary unavailable",
+        )
+    home_generation = int(shared.run_generation.value)
     generation_started_ns = time.monotonic_ns()
     fresh_qpos, prehome_issue = _wait_for_prehome_state(
         shared,

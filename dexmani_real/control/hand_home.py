@@ -8,11 +8,16 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.control.publication import (
+    build_action_candidate,
     check_runtime_gate,
     read_hand_feedback,
+    send_command,
     validate_hand_command_bounds,
 )
-from dexmani_real.ipc.schema import HAND_COMMAND_DTYPE
+from dexmani_real.runtime.safety import (
+    cancel_coupled_command_if_current,
+    coupled_command_ticket_is_current,
+)
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -38,8 +43,8 @@ def publish_hand_home_and_wait_applied(
     """Publish exact hand-home and wait only for worker/SDK acceptance.
 
     The configured endpoint must lie inside both the operational command box
-    and the rated mechanical box. Success means every SDK send, including the
-    exact final home endpoint, was acknowledged. Measured qpos is deliberately
+    and the rated mechanical box. Success means the worker accepted the exact
+    home endpoint. Measured qpos is deliberately
     not compared with the target because contact and steady-state position
     error are valid.
     """
@@ -83,93 +88,84 @@ def publish_hand_home_and_wait_applied(
         )
         return False
 
-    # Publish the exact home endpoint as one command.
-    milestone_count = 1
-
-    last_action_id = 0
-    acknowledged = False
-    for milestone_index in range(1, milestone_count + 1):
-        if time.monotonic() >= deadline_s:
-            break
-        runtime_rejection = check_runtime_gate(
-            shared,
-            check_is_running=check_is_running,
+    runtime_rejection = check_runtime_gate(shared, check_is_running=check_is_running)
+    if runtime_rejection is not None:
+        logger.warning(
+            "hand home stopped by runtime gate: %s", runtime_rejection.reason
         )
-        if runtime_rejection is not None:
+        return False
+    candidate = build_action_candidate(
+        shared,
+        None,
+        target,
+        observation_id=None,
+        action_validity_s=max(0.3, deadline_s - time.monotonic() + 0.1),
+    )
+    if candidate is None:
+        logger.warning("hand home rejected: command delivery window is closed")
+        return False
+    publish_result = send_command(
+        shared,
+        candidate,
+        check_is_running=check_is_running,
+    )
+    if not publish_result.succeeded:
+        logger.warning("hand home publish failed: %s", publish_result.reason)
+        return False
+    if publish_result.ticket is None:
+        logger.error("hand home published without a coupled-command ticket")
+        return False
+
+    action_id = int(candidate.action_id)
+    ticket = publish_result.ticket
+
+    while time.monotonic() < deadline_s:
+        if abort_requested is not None and abort_requested():
+            cancel_coupled_command_if_current(shared, ticket=ticket)
+            return False
+        if check_runtime_gate(shared, check_is_running=check_is_running) is not None:
+            cancel_coupled_command_if_current(shared, ticket=ticket)
+            return False
+        if heartbeat:
+            shared.set_heartbeat("policy", time.monotonic())
+
+        hand_feedback, feedback_rejection = read_hand_feedback(
+            shared, None, hand_feedback_max_age_s=hand_feedback_max_age_s
+        )
+        if feedback_rejection is not None:
             logger.warning(
-                "hand home stopped by runtime gate: %s", runtime_rejection.reason
+                "hand home acknowledgement stopped: %s", feedback_rejection.reason
+            )
+            cancel_coupled_command_if_current(shared, ticket=ticket)
+            return False
+        assert hand_feedback is not None
+        accepted_action_id = hand_feedback.accepted_target_action_id
+        if accepted_action_id > action_id:
+            logger.warning(
+                "hand home action_id=%d was superseded by action_id=%d before acknowledgement",
+                action_id,
+                accepted_action_id,
+            )
+            cancel_coupled_command_if_current(shared, ticket=ticket)
+            return False
+        if accepted_action_id == action_id:
+            if verbose:
+                print(
+                    f"  hand: home command accepted (action_id={action_id})", flush=True
+                )
+            return True
+        if not coupled_command_ticket_is_current(shared, ticket=ticket):
+            logger.warning(
+                "hand home action_id=%d lost command ownership before acknowledgement",
+                action_id,
             )
             return False
-        milestone = target.copy()
-
-        with shared.arm_command_seq.get_lock():
-            action_id = int(shared.arm_command_seq.value) + 1
-            shared.arm_command_seq.value = action_id
-        last_action_id = action_id
-        now_ns = time.monotonic_ns()
-        frame = np.zeros(1, dtype=HAND_COMMAND_DTYPE)
-        frame["run_generation"][0] = int(shared.run_generation.value)
-        frame["observation_id"][0] = action_id
-        frame["action_id"][0] = action_id
-        frame["created_monotonic_ns"][0] = now_ns
-        frame["target_monotonic_ns"][0] = now_ns
-        frame["valid_until_monotonic_ns"][0] = now_ns + int(
-            max(0.3, deadline_s - time.monotonic() + 0.1) * 1e9
-        )
-        frame["is_hold"][0] = 0
-        frame["qpos_cmd"][0] = milestone
-        shared.hand_cmd_ring.write(frame)
-
-        acknowledged = False
-        while time.monotonic() < deadline_s:
-            if abort_requested is not None and abort_requested():
-                return False
-            if (
-                check_runtime_gate(
-                    shared,
-                    check_is_running=check_is_running,
-                )
-                is not None
-            ):
-                return False
-            if heartbeat:
-                shared.set_heartbeat("policy", time.monotonic())
-
-            hand_feedback, feedback_rejection = read_hand_feedback(
-                shared, None, hand_feedback_max_age_s=hand_feedback_max_age_s
-            )
-            if feedback_rejection is not None:
-                logger.warning(
-                    "hand home acknowledgement stopped: %s", feedback_rejection.reason
-                )
-                return False
-            assert hand_feedback is not None
-            accepted_action_id = hand_feedback.accepted_target_action_id
-            if accepted_action_id > action_id:
-                logger.warning(
-                    "hand home action_id=%d was superseded by action_id=%d before acknowledgement",
-                    action_id,
-                    accepted_action_id,
-                )
-                return False
-            if accepted_action_id == action_id:
-                acknowledged = True
-                break
-            time.sleep(0.01)
-        if not acknowledged:
-            break
-
-    if last_action_id and milestone_index == milestone_count and acknowledged:
-        if verbose:
-            print(
-                f"  hand: home command accepted (action_id={last_action_id})",
-                flush=True,
-            )
-        return True
+        time.sleep(0.01)
 
     logger.warning(
         "hand home action_id=%d was not acknowledged within %.3fs",
-        last_action_id,
+        action_id,
         timeout_s,
     )
+    cancel_coupled_command_if_current(shared, ticket=ticket)
     return False

@@ -68,9 +68,13 @@ def _recording_provenance(
     action_candidate: ActionCandidate | None = None,
 ) -> dict[str, object]:
     """Correlate one policy-grid sample with causal sources and send metadata."""
-    anchor_ns = time.monotonic_ns() if anchor_monotonic_ns is None else int(anchor_monotonic_ns)
+    anchor_ns = (
+        time.monotonic_ns() if anchor_monotonic_ns is None else int(anchor_monotonic_ns)
+    )
     if anchor_ns <= 0 or anchor_ns > time.monotonic_ns():
-        raise ValueError("recording observation anchor must be a positive elapsed grid deadline")
+        raise ValueError(
+            "recording observation anchor must be a positive elapsed grid deadline"
+        )
 
     def _field(frame: np.ndarray | None, name: str) -> int:
         if frame is None or frame.dtype.names is None or name not in frame.dtype.names:
@@ -84,21 +88,45 @@ def _recording_provenance(
     arm_source_sequence = int(arm_ring_sequence)
     hand_source_sequence = int(hand_ring_sequence)
     vr_source_ns = int(vr_frame.get("local_recv_ns", 0)) if vr_frame is not None else 0
-    vr_source_sequence = int(vr_frame.get("ring_sequence", 0)) if vr_frame is not None else 0
-    vr_publish_ns = int(vr_frame.get("publish_monotonic_ns", 0)) if vr_frame is not None else 0
+    vr_source_sequence = (
+        int(vr_frame.get("ring_sequence", 0)) if vr_frame is not None else 0
+    )
+    vr_publish_ns = (
+        int(vr_frame.get("publish_monotonic_ns", 0)) if vr_frame is not None else 0
+    )
     camera_source_ns = int(cam.get("source_monotonic_ns", 0)) if cam is not None else 0
-    camera_receive_ns = int(cam.get("receive_monotonic_ns", 0)) if cam is not None else 0
-    camera_publish_ns = int(cam.get("publish_monotonic_ns", 0)) if cam is not None else 0
-    source_ns = np.array([arm_source_ns, hand_source_ns, vr_source_ns, camera_source_ns], dtype=np.uint64)
-    publish_ns = np.array([arm_publish_ns, hand_publish_ns, vr_publish_ns, camera_publish_ns], dtype=np.uint64)
-    receive_ns = np.array([arm_publish_ns, hand_publish_ns, vr_source_ns, camera_receive_ns], dtype=np.uint64)
+    camera_receive_ns = (
+        int(cam.get("receive_monotonic_ns", 0)) if cam is not None else 0
+    )
+    camera_publish_ns = (
+        int(cam.get("publish_monotonic_ns", 0)) if cam is not None else 0
+    )
+    source_ns = np.array(
+        [arm_source_ns, hand_source_ns, vr_source_ns, camera_source_ns], dtype=np.uint64
+    )
+    publish_ns = np.array(
+        [arm_publish_ns, hand_publish_ns, vr_publish_ns, camera_publish_ns],
+        dtype=np.uint64,
+    )
+    receive_ns = np.array(
+        [arm_publish_ns, hand_publish_ns, vr_source_ns, camera_receive_ns],
+        dtype=np.uint64,
+    )
 
     source_valid = np.array(
         [
-            arm_source_ns > 0 and arm_source_sequence > 0 and _field(arm_state, "state_valid") == 1,
-            hand_source_ns > 0 and hand_source_sequence > 0 and _field(hand_state, "state_valid") == 1,
+            arm_source_ns > 0
+            and arm_source_sequence > 0
+            and _field(arm_state, "state_valid") == 1,
+            hand_source_ns > 0
+            and hand_source_sequence > 0
+            and _field(hand_state, "state_valid") == 1,
             vr_source_ns > 0 and vr_source_sequence > 0,
-            camera_source_ns > 0 and bool(cam.get("camera_fresh", False)) if cam is not None else False,
+            (
+                camera_source_ns > 0 and bool(cam.get("camera_fresh", False))
+                if cam is not None
+                else False
+            ),
         ],
         dtype=bool,
     )
@@ -112,16 +140,22 @@ def _recording_provenance(
     )
     source_valid &= time_valid
     ages_s = np.full(4, np.nan, dtype=np.float64)
-    ages_s[source_valid] = (anchor_ns - source_ns[source_valid].astype(np.int64)) / _NS_PER_SECOND
+    ages_s[source_valid] = (
+        anchor_ns - source_ns[source_valid].astype(np.int64)
+    ) / _NS_PER_SECOND
     valid_times = source_ns[source_valid]
     newest_source_ns = int(np.max(valid_times)) if valid_times.size else 0
     skew_s = np.full(4, np.nan, dtype=np.float64)
     if newest_source_ns:
-        skew_s[source_valid] = (newest_source_ns - source_ns[source_valid].astype(np.int64)) / _NS_PER_SECOND
+        skew_s[source_valid] = (
+            newest_source_ns - source_ns[source_valid].astype(np.int64)
+        ) / _NS_PER_SECOND
     required_mask = source_valid[[0, 2, 3]]
     if hand_state is not None:
         required_mask = np.concatenate([required_mask, source_valid[1:2]])
-    observation_valid = bool(np.all(required_mask)) and bool(np.nanmax(skew_s, initial=0.0) <= _OBSERVATION_MAX_SKEW_S)
+    observation_valid = bool(np.all(required_mask)) and bool(
+        np.nanmax(skew_s, initial=0.0) <= _OBSERVATION_MAX_SKEW_S
+    )
 
     action_id = action_candidate.action_id if action_candidate is not None else 0
     observation_id = (
@@ -145,7 +179,9 @@ def _recording_provenance(
         "arm_source_sequence": arm_source_sequence,
         "hand_source_sequence": hand_source_sequence,
         "vr_source_sequence": vr_source_sequence,
-        "camera_source_sequence": int(cam.get("ring_sequence", 0)) if cam is not None else 0,
+        "camera_source_sequence": (
+            int(cam.get("ring_sequence", 0)) if cam is not None else 0
+        ),
         "arm_source_monotonic_ns": arm_source_ns,
         "hand_source_monotonic_ns": hand_source_ns,
         "vr_source_monotonic_ns": vr_source_ns,
@@ -161,17 +197,25 @@ def _recording_provenance(
         "observation_valid": observation_valid,
         "observation_skew_s": float(np.nanmax(skew_s, initial=0.0)),
         "action_id": action_id,
-        "action_created_monotonic_ns": action_candidate.created_monotonic_ns if action_candidate is not None else 0,
-        "action_target_monotonic_ns": action_candidate.target_monotonic_ns if action_candidate is not None else 0,
+        "action_created_monotonic_ns": (
+            action_candidate.created_monotonic_ns if action_candidate is not None else 0
+        ),
+        "action_target_monotonic_ns": (
+            action_candidate.target_monotonic_ns if action_candidate is not None else 0
+        ),
         "action_valid_until_monotonic_ns": (
-            action_candidate.valid_until_monotonic_ns if action_candidate is not None else 0
+            action_candidate.valid_until_monotonic_ns
+            if action_candidate is not None
+            else 0
         ),
         "action_queued": action_candidate is not None,
         "tactile_fresh": tactile_fresh,
         "tactile_source_monotonic_ns": tactile_source_ns,
         "tactile_calibrated": _field(hand_tactile, "calibrated") == 1,
         "tactile_unit_code": _field(hand_tactile, "unit_code"),
-        "pointcloud_valid_depth_ratio": float(cam.get("valid_depth_ratio", np.nan)) if cam is not None else np.nan,
+        "pointcloud_valid_depth_ratio": (
+            float(cam.get("valid_depth_ratio", np.nan)) if cam is not None else np.nan
+        ),
     }
 
 
@@ -206,7 +250,7 @@ def record_held(
     pause emits neither an actuator action nor a recording sample.
 
     Args:
-        arm_qpos_sent: Last command actually published to arm_cmd_ring.
+        arm_qpos_sent: Last arm target published in the coupled command record.
             Persists the exact command sent so held-frame samples stay consistent.
         diagnostics: Per-frame diagnostics (tracking_error, ik_solve_time_ms, etc.).
         target_eef_pos/rot6d: Last valid IK target — prevents NaN gaps in
@@ -226,7 +270,9 @@ def record_held(
         arm_qpos_cmd=hold_arm,
         hand_qpos_cmd=hold_hand,
         target_eef_pos=target_eef_pos.copy() if target_eef_pos is not None else None,
-        target_eef_rot6d=target_eef_rot6d.copy() if target_eef_rot6d is not None else None,
+        target_eef_rot6d=(
+            target_eef_rot6d.copy() if target_eef_rot6d is not None else None
+        ),
     )
     state = _build_robot_state(
         arm_state,
@@ -235,7 +281,11 @@ def record_held(
         hk=hand_fk,
         T_eef_handbase_pos=T_eef_handbase_pos,
         T_eef_handbase_quat_wxyz=T_eef_handbase_quat_wxyz,
-        timestamp_s=(None if observation_anchor_monotonic_ns is None else int(observation_anchor_monotonic_ns) / 1e9),
+        timestamp_s=(
+            None
+            if observation_anchor_monotonic_ns is None
+            else int(observation_anchor_monotonic_ns) / 1e9
+        ),
     )
     signals: dict[str, object] = {
         "ik_ok": False,
@@ -323,7 +373,11 @@ def record_frame(
         hk=hand_fk,
         T_eef_handbase_pos=T_eef_handbase_pos,
         T_eef_handbase_quat_wxyz=T_eef_handbase_quat_wxyz,
-        timestamp_s=(None if observation_anchor_monotonic_ns is None else int(observation_anchor_monotonic_ns) / 1e9),
+        timestamp_s=(
+            None
+            if observation_anchor_monotonic_ns is None
+            else int(observation_anchor_monotonic_ns) / 1e9
+        ),
     )
     head_quat = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
     _vr = (
@@ -343,7 +397,9 @@ def record_frame(
         "flag_safety_reject": frame_status == FRAME_SAFETY_REJECT,
         "frame_status": frame_status,
         "action_arm_joint_raw": (
-            np.asarray(action_arm_joint_raw, dtype=np.float64) if action_arm_joint_raw is not None else arm_cmd.copy()
+            np.asarray(action_arm_joint_raw, dtype=np.float64)
+            if action_arm_joint_raw is not None
+            else arm_cmd.copy()
         ),
     }
     if shared is not None:
@@ -375,7 +431,9 @@ def record_frame(
             ),
             "ik_solve_time_ms": ik_solve_time_ms,
             "target_pos_before_clamp": target_pos_before_clamp,
-            "head_quat_wxyz": head_quat if head_quat is not None else np.full(4, np.nan),
+            "head_quat_wxyz": (
+                head_quat if head_quat is not None else np.full(4, np.nan)
+            ),
             "target_eef_pos_raw": (
                 np.asarray(target_eef_pos_raw, dtype=np.float64)
                 if target_eef_pos_raw is not None
@@ -466,28 +524,47 @@ def _build_robot_state(
         hand_tipboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
 
     if hand_tactile is not None:
-        hand_tactile_force = np.asarray(hand_tactile[0]["tactile_force"], dtype=np.float64)
+        hand_tactile_force = np.asarray(
+            hand_tactile[0]["tactile_force"], dtype=np.float64
+        )
     else:
         hand_tactile_force = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
 
     _eef_finite = np.all(np.isfinite(eef_rot6d))
-    eef_quat_wxyz = rot6d_to_quat_wxyz(eef_rot6d) if _eef_finite else np.array([1.0, 0.0, 0.0, 0.0])
+    eef_quat_wxyz = (
+        rot6d_to_quat_wxyz(eef_rot6d) if _eef_finite else np.array([1.0, 0.0, 0.0, 0.0])
+    )
 
     # Compute fingertip positions in the producer's arm-base frame.
     fingertip_pos = nan_array(HAND_FINGERTIP_SHAPE)
-    if hk is not None and hk.is_ready() and hand_connected and np.all(np.isfinite(hand_qpos)):
+    if (
+        hk is not None
+        and hk.is_ready()
+        and hand_connected
+        and np.all(np.isfinite(hand_qpos))
+    ):
         tips_in_handbase = hk.compute_tip_positions_in_handbase(hand_qpos)
-        if np.all(np.isfinite(tips_in_handbase)) and _eef_finite and np.all(np.isfinite(eef_pos)):
+        if (
+            np.all(np.isfinite(tips_in_handbase))
+            and _eef_finite
+            and np.all(np.isfinite(eef_pos))
+        ):
             T_base_eef = Pose(p=eef_pos, q=eef_quat_wxyz)
             T_eef_handbase = Pose(
                 p=T_eef_handbase_pos if T_eef_handbase_pos is not None else np.zeros(3),
-                q=T_eef_handbase_quat_wxyz if T_eef_handbase_quat_wxyz is not None else np.array([1.0, 0.0, 0.0, 0.0]),
+                q=(
+                    T_eef_handbase_quat_wxyz
+                    if T_eef_handbase_quat_wxyz is not None
+                    else np.array([1.0, 0.0, 0.0, 0.0])
+                ),
             )
             T_base_handbase = compose_pose(T_base_eef, T_eef_handbase)
             tips_base = np.zeros(HAND_FINGERTIP_SHAPE, dtype=np.float64)
             _id_quat = np.array([1.0, 0.0, 0.0, 0.0])
             for i in range(5):
-                T_base_tip = compose_pose(T_base_handbase, Pose(p=tips_in_handbase[i], q=_id_quat))
+                T_base_tip = compose_pose(
+                    T_base_handbase, Pose(p=tips_in_handbase[i], q=_id_quat)
+                )
                 tips_base[i] = T_base_tip.p
             fingertip_pos = tips_base
 

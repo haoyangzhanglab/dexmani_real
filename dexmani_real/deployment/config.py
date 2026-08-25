@@ -25,6 +25,7 @@ from dexmani_real.ipc.schema import SUPPORTED_POINT_CLOUD_COUNTS
 _POSITIVE_FLOAT_FIELDS = (
     "inference_hz",
     "max_observation_age_s",
+    "max_observation_skew_s",
     "max_plan_age_s",
     "max_command_silence_s",
     "action_validity_s",
@@ -53,6 +54,7 @@ class DeploymentConfig:
     inference_hz: float = 10.0
     observation_horizon: int = 4
     max_observation_age_s: float = 0.5
+    max_observation_skew_s: float = 0.10
     max_plan_age_s: float = 1.0
     max_command_silence_s: float = 2.0
     action_validity_s: float = 0.5
@@ -72,10 +74,7 @@ class DeploymentConfig:
             raise ValueError("observation_horizon must be positive")
         if self.action_key not in ("action", "action_ee"):
             raise ValueError("action_key must be 'action' or 'action_ee'")
-        if (
-            isinstance(self.replan_stride_steps, bool)
-            or self.replan_stride_steps <= 0
-        ):
+        if isinstance(self.replan_stride_steps, bool) or self.replan_stride_steps <= 0:
             raise ValueError("replan_stride_steps must be a positive integer")
         for name in _POSITIVE_FLOAT_FIELDS:
             value = getattr(self, name)

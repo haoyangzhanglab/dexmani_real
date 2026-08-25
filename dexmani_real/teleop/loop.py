@@ -214,7 +214,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig | None = None) -> 
     """Teleoperation process entry point used by ``collect_teleop.py``.
 
     Reads from rings (vr, arm_state, hand_state, camera), writes actions
-    to the actuator rings (arm_cmd_ring, hand_cmd_ring), owns recording.
+    to the coherent actuator command ring, owns recording.
     """
     cfg = config or TeleopConfig()
     ctx = TeleopLoopState()

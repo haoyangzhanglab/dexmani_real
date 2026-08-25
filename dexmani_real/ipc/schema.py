@@ -95,11 +95,9 @@ def validate_point_cloud_array(
     return array
 
 
-# ARM and HAND commands share one identity/timing prefix (run_generation,
-# observation_id, action_id, created/target/valid_until) so a generation bump
-# — STOP, FAULT, or a new run — invalidates both actuators at the same worker
-# boundary.  The arm ring is latest-wins; staleness additionally uses
-# ``action_id`` ordering and command age.
+# Every servo publication is one coherent arm/hand record. The publisher marks
+# its ring sequence active atomically; workers execute only while that exact
+# latest-wins ticket is still active. Physical execution remains asynchronous.
 _COMMON_COMMAND_FIELDS = [
     ("run_generation", "<u8"),
     ("observation_id", "<u8"),
@@ -109,11 +107,15 @@ _COMMON_COMMAND_FIELDS = [
     ("valid_until_monotonic_ns", "<u8"),
     ("is_hold", "<u1"),
 ]
-ARM_COMMAND_DTYPE = np.dtype(
-    _COMMON_COMMAND_FIELDS + [("qpos_cmd", "<f8", ARM_JOINT_SHAPE)], align=True
-)
-HAND_COMMAND_DTYPE = np.dtype(
-    _COMMON_COMMAND_FIELDS + [("qpos_cmd", "<f8", HAND_JOINT_SHAPE)], align=True
+COUPLED_COMMAND_DTYPE = np.dtype(
+    _COMMON_COMMAND_FIELDS
+    + [
+        ("arm_present", "<u1"),
+        ("hand_present", "<u1"),
+        ("arm_qpos", "<f8", ARM_JOINT_SHAPE),
+        ("hand_qpos", "<f8", HAND_JOINT_SHAPE),
+    ],
+    align=True,
 )
 
 # One payload is written per inference; the coordinator consumes only the latest.
@@ -173,8 +175,7 @@ HAND_STATE_DTYPE = np.dtype(
         ("qpos_stale", "<u1"),
         # action_id whose exact requested target was accepted by
         # XHand.send_action(), including a configured-current overrun accepted
-        # as grasp contact.  This is not physical convergence and is not the
-        # hand command ring's internal sequence.
+        # as grasp contact. This is not physical convergence.
         ("accepted_target_action_id", "<u8"),
         ("commboard_err", "<i4", HAND_JOINT_SHAPE),
         ("jointboard_err", "<i4", HAND_JOINT_SHAPE),
@@ -412,10 +413,9 @@ def nan_array(shape: int | tuple[int, ...], dtype: type = np.float64) -> np.ndar
 
 
 __all__ = [
-    "ARM_COMMAND_DTYPE",
     "ARM_STATE_DTYPE",
     "CAMERA_FRAME_HEADER_DTYPE",
-    "HAND_COMMAND_DTYPE",
+    "COUPLED_COMMAND_DTYPE",
     "HAND_STATE_DTYPE",
     "HAND_TACTILE_DTYPE",
     "MAX_POLICY_CHUNK_STEPS",

@@ -34,8 +34,9 @@ from dexmani_real.robot_spec import (
 )
 from dexmani_real.runtime.safety import (
     SafetyState,
-    advance_run_generation,
+    begin_motion,
     require_transition,
+    revoke_motion,
 )
 from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.feedback import validate_arm_feedback, validate_hand_feedback
@@ -346,7 +347,6 @@ class EpisodeReplayer:
             np.asarray(arm_state["qpos"], dtype=np.float64),
             self.traj.action_hand_joint[0],
             is_hold=True,
-            prepare_timeout_s=float(self.runtime.policy.action_prepare_timeout_s),
             safety_gate=self._start_warmup_gate,
             action_validity_s=_START_HAND_WARMUP_S,
             hand_mechanical_lower_rad=np.asarray(
@@ -438,7 +438,10 @@ class EpisodeReplayer:
         shutdown later places the controller in State 4.
         """
         assert self.shared is not None
-        run_generation = advance_run_generation(self.shared)
+        if not revoke_motion(self.shared, SafetyState.ARMED):
+            self._fault("failed to establish terminal replay command boundary")
+            return
+        run_generation = int(self.shared.run_generation.value)
         logger.info(
             "replay entered terminal command quiescence (run=%d)",
             run_generation,
@@ -541,7 +544,9 @@ class EpisodeReplayer:
         try:
             if not self._warm_up_hand_at_start(keyboard):
                 return self._outcome()
-            require_transition(self.shared, SafetyState.RUNNING)
+            if not begin_motion(self.shared):
+                self._fault("failed to enter replay motion")
+                return self._outcome()
             self._motion_started = True
             if not self._wait_arm_streaming(keyboard):
                 return self._outcome()
@@ -638,9 +643,6 @@ class EpisodeReplayer:
                     self.shared,
                     arm_cmd,
                     hand_cmd,
-                    prepare_timeout_s=float(
-                        self.runtime.policy.action_prepare_timeout_s
-                    ),
                     safety_gate=self._action_safety_gate,
                     wait_applied=is_final_frame,
                     apply_timeout_s=float(self.runtime.policy.action_apply_timeout_s),
@@ -707,7 +709,7 @@ class EpisodeReplayer:
             if not self._estopped and int(self.shared.safety_state.value) == int(
                 SafetyState.RUNNING
             ):
-                require_transition(self.shared, SafetyState.ARMED)
+                revoke_motion(self.shared, SafetyState.ARMED)
 
         if self._recorder.count < frame_count:
             print(f"\nReplay stopped at frame {self._recorder.count}/{frame_count}")

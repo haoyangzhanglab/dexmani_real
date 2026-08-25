@@ -23,7 +23,7 @@ from dexmani_real.ipc.schema import (
     HAND_TACTILE_FORCE_SHAPE,
     HAND_TACTILE_SUM_SHAPE,
 )
-from dexmani_real.robot.command_validation import worker_validate_hand
+from dexmani_real.robot.command_validation import check_worker_hand_command
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
@@ -130,7 +130,7 @@ def _publish_feedback(
     tipboard_err: np.ndarray,
     source_monotonic_ns: int,
 ) -> None:
-    """Serialize one feedback pair while preserving the existing SHM schema."""
+    """Serialize one hand-state and tactile feedback pair."""
     from dexmani_real.ipc.channels import new_frame
 
     source_ns = max(0, int(source_monotonic_ns))
@@ -164,7 +164,11 @@ def _publish_feedback(
 def hand_loop(shared: Any, config: HandParams) -> None:
     """Run one XHand worker; all SDK objects remain in this process."""
     from dexmani_real.robot.xhand import XHand
-    from dexmani_real.runtime.safety import SafetyState
+    from dexmani_real.runtime.safety import (
+        CoupledCommandTicket,
+        coupled_command_ticket_allows_execution,
+        read_motion_permit,
+    )
 
     logger.debug("hand_loop: LOADING")
     hand: XHand | None = None
@@ -247,9 +251,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
         operational_upper = np.asarray(config.qpos_max_rad, dtype=np.float64)
         mechanical_lower = np.asarray(config.mechanical_qpos_min_rad, dtype=np.float64)
         mechanical_upper = np.asarray(config.mechanical_qpos_max_rad, dtype=np.float64)
-        last_consumed_ring_sequence = 0
-        latest_command: np.ndarray | None = None
-        latest_action_id = 0
+        last_rejected_ring_sequence = 0
 
         while shared.is_running.value:
             shared.set_heartbeat("hand", time.monotonic())
@@ -308,82 +310,93 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                 source_monotonic_ns=last_source_ns,
             )
 
-            safety_state = shared.safety_state.value
-            if safety_state not in (SafetyState.ARMED, SafetyState.RUNNING):
-                latest_command = None
-                latest_action_id = 0
+            permit = read_motion_permit(shared)
+            if not permit.allows_motion:
                 rate_mgr.wait()
                 continue
             if shared.error_state.value:
                 rate_mgr.wait()
                 continue
 
-            result = shared.hand_cmd_ring.read_latest()
-            if result is not None:
-                command, _published_ns, sequence = result
-                sequence_int = (
-                    int(sequence) if isinstance(sequence, (int, np.integer)) else 0
-                )
-                if sequence_int != last_consumed_ring_sequence:
-                    last_consumed_ring_sequence = sequence_int
-                    if worker_validate_hand(
-                        command,
-                        operational_lower_rad=operational_lower,
-                        operational_upper_rad=operational_upper,
-                        mechanical_lower_rad=mechanical_lower,
-                        mechanical_upper_rad=mechanical_upper,
-                        expected_run_generation=int(shared.run_generation.value),
-                        now_monotonic_ns=time.monotonic_ns(),
-                    ):
-                        latest_command = command.copy()
-                        latest_action_id = int(latest_command["action_id"][0])
-                    else:
-                        logger.info(
-                            "hand_loop: discarded malformed, stale-generation, or expired command"
-                        )
-                        latest_command = None
-                        latest_action_id = 0
-
-            if latest_command is not None and not worker_validate_hand(
-                latest_command,
+            result = shared.coupled_cmd_ring.read_latest()
+            if result is None:
+                rate_mgr.wait()
+                continue
+            command, _published_ns, sequence = result
+            sequence_int = int(sequence)
+            if not bool(command["hand_present"][0]):
+                rate_mgr.wait()
+                continue
+            ticket = CoupledCommandTicket(
+                run_generation=int(command["run_generation"][0]),
+                ring_sequence=sequence_int,
+            )
+            command_generation = int(command["run_generation"][0])
+            if command_generation != permit.run_generation or not (
+                coupled_command_ticket_allows_execution(shared, ticket=ticket)
+            ):
+                rate_mgr.wait()
+                continue
+            issue = check_worker_hand_command(
+                command,
                 operational_lower_rad=operational_lower,
                 operational_upper_rad=operational_upper,
                 mechanical_lower_rad=mechanical_lower,
                 mechanical_upper_rad=mechanical_upper,
-                expected_run_generation=int(shared.run_generation.value),
+                expected_run_generation=permit.run_generation,
                 now_monotonic_ns=time.monotonic_ns(),
-            ):
-                latest_command = None
-                latest_action_id = 0
+            )
+            # A superseded/revoked snapshot has no authority to move hardware
+            # or latch a fault, even if its contents fail validation.
+            if not coupled_command_ticket_allows_execution(shared, ticket=ticket):
+                rate_mgr.wait()
+                continue
+            if issue is not None:
+                if issue.fault:
+                    logger.error(
+                        "hand_loop: unsafe action_id=%d: %s; latching runtime fault",
+                        int(command["action_id"][0]),
+                        issue.reason,
+                    )
+                    shared.error_state.value = True
+                    return
+                if sequence_int != last_rejected_ring_sequence:
+                    logger.info("hand_loop: discarded command: %s", issue.reason)
+                    last_rejected_ring_sequence = sequence_int
+                rate_mgr.wait()
+                continue
 
-            if latest_command is not None:
-                target = np.asarray(latest_command["qpos_cmd"][0], dtype=np.float64)
-                bounded = limit_hand_delta(
-                    target,
-                    state.qpos,
-                    config.hand_max_delta_rad_per_tick,
+            action_id = int(command["action_id"][0])
+            target = np.asarray(command["hand_qpos"][0], dtype=np.float64)
+            bounded = limit_hand_delta(
+                target,
+                state.qpos,
+                config.hand_max_delta_rad_per_tick,
+            )
+            if not coupled_command_ticket_allows_execution(shared, ticket=ticket):
+                rate_mgr.wait()
+                continue
+            if np.any(bounded < mechanical_lower - 1e-12) or np.any(
+                bounded > mechanical_upper + 1e-12
+            ):
+                logger.error(
+                    "hand_loop: measured-state-bounded action_id=%d violates mechanical limits",
+                    action_id,
                 )
-                if np.any(bounded < mechanical_lower - 1e-12) or np.any(
-                    bounded > mechanical_upper + 1e-12
-                ):
-                    logger.error(
-                        "hand_loop: measured-state-bounded action_id=%d violates mechanical limits",
-                        latest_action_id,
-                    )
-                    shared.error_state.value = True
-                    return
-                if hand.send_action(bounded):
-                    # ACK denotes SDK acceptance of the exact original endpoint,
-                    # not physical convergence or acceptance of an intermediate step.
-                    if np.array_equal(bounded, target):
-                        accepted_target_action_id = latest_action_id
-                else:
-                    logger.error(
-                        "hand_loop: SDK rejected action_id=%d; latching runtime fault",
-                        latest_action_id,
-                    )
-                    shared.error_state.value = True
-                    return
+                shared.error_state.value = True
+                return
+            if hand.send_action(bounded):
+                # ACK denotes SDK acceptance of the exact original endpoint,
+                # not physical convergence or acceptance of an intermediate step.
+                if np.array_equal(bounded, target):
+                    accepted_target_action_id = action_id
+            else:
+                logger.error(
+                    "hand_loop: SDK rejected action_id=%d; latching runtime fault",
+                    action_id,
+                )
+                shared.error_state.value = True
+                return
 
             rate_mgr.wait()
     finally:

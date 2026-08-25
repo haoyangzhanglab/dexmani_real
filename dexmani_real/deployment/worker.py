@@ -4,9 +4,9 @@ The inference worker is the *only* process that touches the model. It reads
 causal observations from the shared rings, runs
 :meth:`~dexmani_real.deployment.contracts.PolicyRuntime.predict`, and publishes
 the resulting :class:`~dexmani_real.deployment.contracts.JointActionChunk` to
-the latest-wins ``policy_plan_ring``. It never writes ``arm_cmd_ring``,
-``hand_cmd_ring``, the SDK, ``SafetyState``, or ``run_generation`` — model output
-is a proposal, not a robot command.
+the latest-wins ``policy_plan_ring``. It never writes ``coupled_cmd_ring``, the
+SDK, ``SafetyState``, or ``run_generation`` — model output is a proposal, not a
+robot command.
 
 ``inference_loop`` is a plain ``*_loop(shared, config)`` function (not an
 ``mp.Process`` subclass); lifecycle/supervision stays in the A/B runtime.
@@ -129,6 +129,11 @@ def publish_plan(
     if int(shared.run_generation.value) != int(context.run_generation):
         return False
 
+    if chunk.hand_qpos is None:
+        raise ValueError(
+            "learned-policy output must contain a hand target for every step"
+        )
+
     if chunk.arm_qpos is not None:
         n = int(chunk.arm_qpos.shape[0])
     elif chunk.ee_pos is not None:
@@ -154,7 +159,7 @@ def publish_plan(
         context.inference_finished_monotonic_ns
     )
     frame["num_steps"][0] = np.uint32(n)
-    frame["hand_present"][0] = 1 if chunk.hand_qpos is not None else 0
+    frame["hand_present"][0] = 1
     frame["target_monotonic_ns"][0, :n] = chunk.target_monotonic_ns
     if chunk.arm_qpos is not None:
         frame["arm_present"][0] = 1
@@ -165,8 +170,7 @@ def publish_plan(
         frame["ee_present"][0] = 1
         frame["ee_pos"][0, :n] = chunk.ee_pos
         frame["ee_rot6d"][0, :n] = chunk.ee_rot6d
-    if chunk.hand_qpos is not None:
-        frame["hand_qpos"][0, :n] = chunk.hand_qpos
+    frame["hand_qpos"][0, :n] = chunk.hand_qpos
     frame["valid_mask"][0, :n] = chunk.valid_mask
     shared.policy_plan_ring.write(frame)
     return True
@@ -175,7 +179,7 @@ def publish_plan(
 def _read_state_history(
     ring,
     *,
-    horizon: int,
+    history_len: int,
     anchor_ns: int,
     values_field: str,
     required_true_fields: tuple[str, ...] = (),
@@ -187,7 +191,7 @@ def _read_state_history(
     stalled feedback stream cannot feed a stale window to the model.
     """
     try:
-        history = ring.get_last_k(min(int(horizon), ring.maxlen))
+        history = ring.get_last_k(min(int(history_len), ring.maxlen))
     except Exception:
         logger.warning("inference: state history read failed", exc_info=True)
         return None
@@ -274,31 +278,6 @@ def _pointcloud_frame_from_record(
         return None
 
 
-def _read_pointcloud_frame(
-    shared: RuntimeChannels,
-    *,
-    anchor_ns: int,
-    max_age_ns: int,
-    num_points: int,
-) -> PointCloudFrame | None:
-    """Read the latest causally published, fresh ``float32[N,6]`` cloud."""
-    try:
-        result = shared.pointcloud_ring.read_latest()
-    except Exception:
-        logger.warning("inference: point-cloud read failed", exc_info=True)
-        return None
-    if result is None:
-        return None
-    data, ring_publish_ns, _ring_sequence = result
-    return _pointcloud_frame_from_record(
-        data[0],
-        int(ring_publish_ns),
-        anchor_ns=anchor_ns,
-        max_age_ns=max_age_ns,
-        num_points=num_points,
-    )
-
-
 def _read_pointcloud_history(
     shared: RuntimeChannels,
     *,
@@ -337,6 +316,43 @@ def _read_pointcloud_history(
     return tuple(frame for frame in frames if frame.camera_generation == newest_gen)
 
 
+def _align_state_history_to_pointclouds(
+    state_history: FrameWindow | None,
+    pointcloud_history: tuple[PointCloudFrame, ...],
+    *,
+    max_skew_ns: int,
+) -> FrameWindow | None:
+    """Causally align one state window to the point-cloud reference timeline.
+
+    For every point-cloud source time, choose the newest valid state at or
+    before that time. Future state samples and pairs outside the explicit skew
+    budget are rejected rather than interpolated or padded.
+    """
+    if state_history is None or not pointcloud_history:
+        return None
+    source_ns = np.asarray(state_history.source_monotonic_ns, dtype=np.int64)
+    valid = np.asarray(state_history.valid_mask, dtype=np.uint8) == 1
+    selected: list[int] = []
+    for pointcloud in pointcloud_history:
+        reference_ns = np.int64(pointcloud.source_monotonic_ns)
+        candidates = np.flatnonzero(
+            valid
+            & (source_ns <= reference_ns)
+            & (reference_ns - source_ns <= int(max_skew_ns))
+        )
+        if candidates.size == 0:
+            return None
+        selected.append(int(candidates[-1]))
+    indices = np.asarray(selected, dtype=np.intp)
+    return FrameWindow(
+        values=state_history.values[indices],
+        source_sequence=state_history.source_sequence[indices],
+        source_monotonic_ns=state_history.source_monotonic_ns[indices],
+        publish_monotonic_ns=state_history.publish_monotonic_ns[indices],
+        valid_mask=np.ones(len(indices), dtype=np.uint8),
+    )
+
+
 def _build_observation(
     shared: RuntimeChannels,
     config: DeploymentConfig,
@@ -353,14 +369,7 @@ def _build_observation(
     """
     horizon = int(config.observation_horizon)
     max_age_ns = int(config.max_observation_age_s * 1e9)
-    arm_history = _read_state_history(
-        shared.arm_state_ring,
-        horizon=horizon,
-        anchor_ns=anchor_ns,
-        values_field="qpos",
-        required_true_fields=("state_valid",),
-        max_age_ns=max_age_ns,
-    )
+    max_skew_ns = int(config.max_observation_skew_s * 1e9)
     hand_history: FrameWindow | None = None
     hand_current_history: FrameWindow | None = None
     hand_tactile_sum_history: FrameWindow | None = None
@@ -371,6 +380,18 @@ def _build_observation(
         parse_observation_fields(
             getattr(config, "observation_fields", "arm_qpos,hand_qpos")
         )
+    )
+    pointcloud_requested = "point_cloud" in requested
+    state_history_len = (
+        shared.arm_state_ring.maxlen if pointcloud_requested else horizon
+    )
+    arm_history = _read_state_history(
+        shared.arm_state_ring,
+        history_len=state_history_len,
+        anchor_ns=anchor_ns,
+        values_field="qpos",
+        required_true_fields=("state_valid",),
+        max_age_ns=max_age_ns,
     )
     hand_state_requested = bool(
         requested
@@ -384,25 +405,24 @@ def _build_observation(
         }
     )
     tactile_requested = bool(requested & {"hand_tactile_force", "xhand_tactile"})
-    if "point_cloud" in requested:
-        pointcloud = _read_pointcloud_frame(
+    if pointcloud_requested:
+        all_pointclouds = _read_pointcloud_history(
             shared,
             anchor_ns=anchor_ns,
             max_age_ns=max_age_ns,
             num_points=int(config.pointcloud_num_points),
+            history_len=shared.pointcloud_ring.maxlen,
         )
-        pointcloud_history = _read_pointcloud_history(
-            shared,
-            anchor_ns=anchor_ns,
-            max_age_ns=max_age_ns,
-            num_points=int(config.pointcloud_num_points),
-            history_len=int(config.observation_horizon),
-        )
+        if len(all_pointclouds) >= horizon:
+            pointcloud_history = all_pointclouds[-horizon:]
+            pointcloud = pointcloud_history[-1]
     if config.hand_enabled:
         if hand_state_requested:
             hand_history = _read_state_history(
                 shared.hand_state_ring,
-                horizon=horizon,
+                history_len=(
+                    shared.hand_state_ring.maxlen if pointcloud_requested else horizon
+                ),
                 anchor_ns=anchor_ns,
                 values_field="qpos",
                 required_true_fields=("state_valid",),
@@ -411,7 +431,7 @@ def _build_observation(
             if requested & {"hand_current", "hand_joint_torque"}:
                 hand_current_history = _read_state_history(
                     shared.hand_state_ring,
-                    horizon=horizon,
+                    history_len=horizon,
                     anchor_ns=anchor_ns,
                     values_field="current",
                     required_true_fields=("state_valid",),
@@ -420,7 +440,7 @@ def _build_observation(
             if requested & {"hand_tactile_sum", "fingertip_force"}:
                 hand_tactile_sum_history = _read_state_history(
                     shared.hand_state_ring,
-                    horizon=horizon,
+                    history_len=horizon,
                     anchor_ns=anchor_ns,
                     values_field="tactile_sum",
                     required_true_fields=(
@@ -432,11 +452,23 @@ def _build_observation(
         if tactile_requested:
             tactile_history = _read_state_history(
                 shared.hand_tactile_ring,
-                horizon=horizon,
+                history_len=horizon,
                 anchor_ns=anchor_ns,
                 values_field="tactile_force",
                 required_true_fields=("fresh",),
                 max_age_ns=max_age_ns,
+            )
+    if pointcloud_requested and len(pointcloud_history) == horizon:
+        arm_history = _align_state_history_to_pointclouds(
+            arm_history,
+            pointcloud_history,
+            max_skew_ns=max_skew_ns,
+        )
+        if hand_state_requested:
+            hand_history = _align_state_history_to_pointclouds(
+                hand_history,
+                pointcloud_history,
+                max_skew_ns=max_skew_ns,
             )
     return ObservationBatch(
         observation_id=observation_id,
@@ -512,16 +544,22 @@ def inference_loop(shared: RuntimeChannels, config: DeploymentConfig) -> None:
                 run_generation=run_generation,
                 anchor_ns=anchor_ns,
             )
-            if observation.arm_history is None:
+            horizon = int(config.observation_horizon)
+            if (
+                observation.arm_history is None
+                or observation.arm_history.values.shape[0] != horizon
+            ):
                 time.sleep(_NO_FEEDBACK_POLL_S)
-                continue  # no causal arm feedback yet — never publish garbage
-            if config.hand_enabled and observation.hand_history is None:
+                continue  # no complete causal arm history yet — never infer
+            if config.hand_enabled and (
+                observation.hand_history is None
+                or observation.hand_history.values.shape[0] != horizon
+            ):
                 time.sleep(_NO_FEEDBACK_POLL_S)
                 continue
             if (
                 "point_cloud" in requested
-                and observation.pointcloud is None
-                and not observation.pointcloud_history
+                and len(observation.pointcloud_history) != horizon
             ):
                 time.sleep(_NO_FEEDBACK_POLL_S)
                 continue

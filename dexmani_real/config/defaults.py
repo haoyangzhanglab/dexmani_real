@@ -261,6 +261,9 @@ class ArmParams:
     hand_safety_margin_m: float = 0.05
 
     tracking_error_warn_rad: float = 0.35  # diagnostic warning threshold
+    # Final worker fallback against discontinuous producer/IK branch jumps.
+    # Normal command-rate shaping remains owned by each producer.
+    max_servo_command_jump_rad: float = np.deg2rad(20.0)
     collision_sensitivity: int = 1
 
     tcp_load_mass_kg: float = 1.1
@@ -296,6 +299,11 @@ class ArmParams:
             raise ValueError("hand_safety_margin_m must be finite and non-negative")
         if not np.isfinite(self.tracking_error_warn_rad) or self.tracking_error_warn_rad <= 0:
             raise ValueError("tracking_error_warn_rad must be finite and positive")
+        if (
+            not np.isfinite(self.max_servo_command_jump_rad)
+            or self.max_servo_command_jump_rad <= 0
+        ):
+            raise ValueError("max_servo_command_jump_rad must be finite and positive")
         if not (0 <= self.collision_sensitivity <= 5):
             raise ValueError(f"collision_sensitivity={self.collision_sensitivity} out of range [0, 5]")
         # Mode 6 firmware clamps speed to [0.0001, π] rad/s and acceleration to
@@ -524,7 +532,6 @@ class PolicyParams:
 
     control_hz: float = 16.0
     coordinator_hz: float = 64.0
-    action_prepare_timeout_s: float = 0.06
     action_apply_timeout_s: float = 0.75
     arm_state_stale_threshold_s: float = 0.5
     quit_save_timeout_s: float = 30.0
@@ -563,7 +570,6 @@ class PolicyParams:
         if not np.isfinite(self.coordinator_hz) or self.coordinator_hz < self.control_hz:
             raise ValueError("coordinator_hz must be finite and >= control_hz")
         timing = (
-            self.action_prepare_timeout_s,
             self.action_apply_timeout_s,
             self.arm_state_stale_threshold_s,
             self.quit_save_timeout_s,

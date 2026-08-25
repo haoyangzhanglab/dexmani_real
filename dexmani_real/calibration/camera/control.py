@@ -18,12 +18,7 @@ from dexmani_real.control.safety_gate import SafetyGate
 from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
 from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.poses import quat_multiply
-from dexmani_real.runtime.safety import (
-    SafetyState,
-    advance_run_generation,
-    require_transition,
-    transition,
-)
+from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
 from dexmani_real.teleop.keyboard import GlobalKeyState, eef_delta_from_keys
 from dexmani_real.utils.feedback import validate_arm_feedback
 from dexmani_real.utils.log import get_logger
@@ -59,12 +54,14 @@ def read_initial_arm(
     return None
 
 
-def set_calibration_fault(shared: RuntimeChannels, reason: str, *, estop: bool = False) -> None:
+def set_calibration_fault(
+    shared: RuntimeChannels, reason: str, *, estop: bool = False
+) -> None:
     logger.error("Calibration fault: %s", reason)
     if estop:
         shared.estop_request.value = True
     shared.error_state.value = True
-    transition(shared, SafetyState.FAULT)
+    revoke_motion(shared, SafetyState.FAULT)
 
 
 @dataclass
@@ -145,12 +142,13 @@ def publish_calibration_quit_hold(
     calibration_saved: bool,
 ) -> int:
     """Invalidate queued motion, publish measured hold, and return exit status."""
-    advance_run_generation(shared)
+    if not revoke_motion(shared, SafetyState.ARMED):
+        set_calibration_fault(shared, "failed to establish calibration quit boundary")
+        return 1
     published = publish_joint_targets(
         shared,
         current_qpos,
         is_hold=True,
-        prepare_timeout_s=float(runtime.policy.action_prepare_timeout_s),
         safety_gate=safety_gate,
         wait_applied=True,
         apply_timeout_s=float(runtime.policy.action_apply_timeout_s),
@@ -163,8 +161,6 @@ def publish_calibration_quit_hold(
             f"measured quit hold was not applied: {published.reason}",
         )
         return 1
-    if int(shared.safety_state.value) == int(SafetyState.RUNNING):
-        require_transition(shared, SafetyState.ARMED)
     return 0 if calibration_saved else 2
 
 
@@ -186,7 +182,11 @@ def handle_calibration_home_key(
     state.home_key_down = True
 
     if int(shared.safety_state.value) == int(SafetyState.RUNNING):
-        require_transition(shared, SafetyState.ARMED)
+        if not revoke_motion(shared, SafetyState.ARMED):
+            set_calibration_fault(
+                shared, "failed to stop calibration motion before home"
+            )
+            return HomeKeyOutcome.FAULT
     home_result = execute_arm_home(
         shared,
         np.asarray(runtime.arm.home_qpos, dtype=np.float64),
@@ -259,9 +259,13 @@ def run_calibration_motion_tick(
     state.blocked_keys = None
 
     if moving and not state.motion_active:
-        require_transition(shared, SafetyState.RUNNING)
+        if not begin_motion(shared):
+            set_calibration_fault(shared, "failed to enter calibration motion")
+            return
     elif not moving and state.motion_active:
-        require_transition(shared, SafetyState.ARMED)
+        if not revoke_motion(shared, SafetyState.ARMED):
+            set_calibration_fault(shared, "failed to stop calibration motion")
+            return
         held_pose = planner.kin.compute_eef_pose_world(state.previous_command)
         state.target_pos = held_pose.p.copy()
         state.target_quat = held_pose.q.copy()
@@ -311,7 +315,6 @@ def run_calibration_motion_tick(
     published = publish_joint_targets(
         shared,
         ik_result.qpos,
-        prepare_timeout_s=float(runtime.policy.action_prepare_timeout_s),
         safety_gate=safety_gate,
         wait_applied=True,
         apply_timeout_s=float(runtime.policy.action_apply_timeout_s),

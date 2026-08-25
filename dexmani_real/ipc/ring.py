@@ -1,8 +1,9 @@
 """Lock-free shared-memory ring buffer with latest, history, and sequence reads.
 
 Uses multiprocessing.shared_memory for zero-copy cross-process communication.
-Each ring has one producer and may have multiple readers. Odd/even markers
-prevent readers from accepting a slot while its payload is being overwritten.
+Each ring has one serialized writer at a time and may have multiple readers.
+Odd/even markers prevent readers from accepting a slot while its payload is
+being overwritten.
 
      DexUMI drop-oldest backpressure via FILO semantics.
 
@@ -127,8 +128,9 @@ class SharedMemoryRingBuffer:
 
     The write_idx always points to the most recently written slot index
     (0..maxlen-1). The consumer reads write_idx to find the latest frame.
-    Because only the producer writes write_idx and only the consumer reads
-    it, this is safe on x86_64 without CAS.
+    Because only one serialized writer updates write_idx, this is safe on
+    x86_64 without CAS. Callers with multiple writer processes must hold their
+    own cross-process write lock.
 
     Latest/history readers use FILO semantics: old frames are silently
     overwritten (drop-oldest backpressure). A sequence-addressed reader can

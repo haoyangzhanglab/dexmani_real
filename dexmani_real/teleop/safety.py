@@ -16,7 +16,7 @@ from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.arm_fk import make_arm_fk
 from dexmani_real.planning.poses import rot6d_to_quat_wxyz
-from dexmani_real.runtime.safety import advance_run_generation
+from dexmani_real.runtime.safety import invalidate_coupled_commands
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.control_state import CommandQuiescence, TeleopLoopState
@@ -352,7 +352,14 @@ def enter_command_quiescence(
         entered_monotonic_ns=time.monotonic_ns(),
     )
     if first_entry:
-        run_generation = advance_run_generation(shared)
+        # ``begin_motion`` already created the generation for a new run. All
+        # other quiescence paths remain RUNNING but must still invalidate the
+        # active coupled-command ticket atomically.
+        run_generation = (
+            int(shared.run_generation.value)
+            if start_new_run
+            else invalidate_coupled_commands(shared)
+        )
         logger.info(
             "teleop_loop: entered %s command quiescence (run=%d)",
             reason,

@@ -33,12 +33,12 @@ def _readonly_array(
 class ActionCandidate:
     """One current-tick joint target proposed by a control source.
 
-    The controller assigns the globally monotonic action ID only after it
-    confirms that the observation and candidate belong to the active
+    The controller assigns a globally monotonic action ID while building the
+    candidate; publication confirms it still belongs to the active
     ``run_generation``. ``target_monotonic_ns`` and
     ``valid_until_monotonic_ns`` describe the proposal's intended timing for
-    freshness and recording provenance; command publication emits its own
-    worker delivery target.
+    freshness and recording provenance; publication preserves that timing in
+    the coupled worker command.
     """
 
     observation_id: int
@@ -77,11 +77,15 @@ class ActionCandidate:
             object.__setattr__(
                 self,
                 "arm_qpos",
-                _readonly_array(self.arm_qpos, ARM_JOINT_SHAPE, np.float64, name="arm_qpos"),
+                _readonly_array(
+                    self.arm_qpos, ARM_JOINT_SHAPE, np.float64, name="arm_qpos"
+                ),
             )
         if self.hand_qpos is not None:
             object.__setattr__(
                 self,
                 "hand_qpos",
-                _readonly_array(self.hand_qpos, HAND_JOINT_SHAPE, np.float64, name="hand_qpos"),
+                _readonly_array(
+                    self.hand_qpos, HAND_JOINT_SHAPE, np.float64, name="hand_qpos"
+                ),
             )

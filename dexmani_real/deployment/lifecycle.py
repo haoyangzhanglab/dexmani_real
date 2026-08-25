@@ -217,6 +217,8 @@ def run_policy_deployment(
             runtime,
             pointcloud_num_points=deployment.pointcloud_num_points,
             pointcloud_requested=pointcloud_requested,
+            observation_horizon=deployment.observation_horizon,
+            max_observation_skew_s=deployment.max_observation_skew_s,
         ),
         mp_context=ctx,
     )

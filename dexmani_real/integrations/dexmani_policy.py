@@ -146,10 +146,9 @@ class DexManiPolicyRuntime:
         ``joint_state`` is ``[1, n_obs_steps, 19]`` (arm7 + hand12 concatenated,
         most-recent ``n_obs_steps`` frames, anchor last); ``point_cloud`` is
         ``[1, n_obs_steps, N, 6]`` built from the causal point-cloud history
-        (plan §6/§14.3.4) rather than a latest-frame broadcast.  The arm and hand
-        feedback streams publish at independent rates, so the two histories are
-        aligned to their common most-recent frame count; fewer than
-        ``n_obs_steps`` aligned frames fail closed (raise).
+        (plan §6/§14.3.4) rather than a latest-frame broadcast. The inference
+        worker uses the point-cloud source timestamps as the reference timeline
+        and causally pairs each arm/hand frame before this method runs.
         """
         if observation.arm_history is None:
             raise ValueError("DexMani policy requires arm joint history")
@@ -161,26 +160,24 @@ class DexManiPolicyRuntime:
         hand = observation.hand_history.values  # [Th, 12]
         if arm.ndim != 2 or hand.ndim != 2:
             raise ValueError("arm/hand history must be [T, dof]")
-        t = min(arm.shape[0], hand.shape[0])
-        if t < n_obs:
+        if arm.shape[0] != n_obs or hand.shape[0] != n_obs:
             raise ValueError(
-                f"need >= {n_obs} aligned arm/hand frames, got {t}"
+                f"need exactly {n_obs} point-cloud-aligned arm/hand frames, got "
+                f"arm={arm.shape[0]} hand={hand.shape[0]}"
             )
-        arm = arm[-n_obs:]
-        hand = hand[-n_obs:]
         joint = np.concatenate([arm, hand], axis=-1).astype(np.float32)  # [n_obs, 19]
 
-        # Point-cloud history, oldest-first; pad the oldest slots with the
-        # earliest available fresh cloud when the camera has fewer than n_obs.
+        # Point-cloud history is a real oldest-first temporal window. Repeating
+        # an old cloud would turn a missing observation into a plausible input,
+        # so insufficient history fails closed.
         pc_frames = list(observation.pointcloud_history or ())
-        if not pc_frames:
-            if observation.pointcloud is None:
-                raise ValueError("DexMani policy requires a point cloud")
-            pc_frames = [observation.pointcloud]
-        if len(pc_frames) >= n_obs:
-            use = pc_frames[-n_obs:]
-        else:
-            use = [pc_frames[0]] * (n_obs - len(pc_frames)) + pc_frames
+        if len(pc_frames) < n_obs:
+            raise ValueError(
+                f"need >= {n_obs} causal point-cloud frames, got {len(pc_frames)}"
+            )
+        use = pc_frames[-n_obs:]
+        if len({frame.camera_generation for frame in use}) != 1:
+            raise ValueError("point-cloud history crosses a camera generation boundary")
         pc = np.stack(
             [frame.values.astype(np.float32) for frame in use], axis=0
         )  # [n_obs, N, 6]
@@ -202,10 +199,9 @@ class DexManiPolicyRuntime:
         n = ctrl.shape[0]
         dim = ctrl.shape[1]
         steps = np.arange(1, n + 1, dtype=np.uint64)
-        target = (
-            np.asarray(context.observation_anchor_monotonic_ns, dtype=np.uint64)
-            + steps * np.uint64(context.step_dt_ns)
-        )
+        target = np.asarray(
+            context.observation_anchor_monotonic_ns, dtype=np.uint64
+        ) + steps * np.uint64(context.step_dt_ns)
         if self._action_key == "action":
             if dim != _ARM_DOF + _HAND_DOF:
                 raise ValueError(

@@ -69,7 +69,9 @@ class SafetyGate:
         workspace_check: Callable[[np.ndarray, np.ndarray], bool] | None = None,
         max_arm_delta_rad: Any = None,
         max_hand_delta_rad: Any = None,
-        collision_check: Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], bool] | None = None,
+        collision_check: (
+            Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], bool] | None
+        ) = None,
     ) -> None:
         arm_low = np.asarray(arm_joint_lower_rad, dtype=np.float64)
         arm_high = np.asarray(arm_joint_upper_rad, dtype=np.float64)
@@ -100,7 +102,9 @@ class SafetyGate:
         self.collision_check = collision_check
 
     @staticmethod
-    def _coerce_delta(value: Any, shape: tuple[int, ...], name: str) -> np.ndarray | None:
+    def _coerce_delta(
+        value: Any, shape: tuple[int, ...], name: str
+    ) -> np.ndarray | None:
         if value is None:
             return None
         arr = np.broadcast_to(np.asarray(value, dtype=np.float64), shape).copy()
@@ -114,9 +118,16 @@ class SafetyGate:
         *,
         current_arm_qpos: np.ndarray,
         current_hand_qpos: np.ndarray | None = None,
+        arm_delta_reference_qpos: np.ndarray | None = None,
+        hand_delta_reference_qpos: np.ndarray | None = None,
         run_generation: int,
     ) -> GateResult:
-        """Validate one candidate without modifying it or external state."""
+        """Validate one candidate without modifying it or external state.
+
+        Workspace and collision transitions start at measured feedback. Optional
+        delta references are the previous published targets, so actuator lag
+        cannot turn a command-rate limit into an unintended tracking-error gate.
+        """
         if (
             candidate.representation != "joint_position"
             or candidate.units != "rad"
@@ -131,6 +142,13 @@ class SafetyGate:
             return GateResult(False, GateRejectCode.INVALID_CURRENT_ARM_SHAPE)
         if not np.all(np.isfinite(arm_start)):
             return GateResult(False, GateRejectCode.NONFINITE_CURRENT_ARM)
+        arm_delta_start = arm_start
+        if arm_delta_reference_qpos is not None:
+            arm_delta_start = np.asarray(arm_delta_reference_qpos, dtype=np.float64)
+            if arm_delta_start.shape != ARM_JOINT_SHAPE:
+                return GateResult(False, GateRejectCode.INVALID_CURRENT_ARM_SHAPE)
+            if not np.all(np.isfinite(arm_delta_start)):
+                return GateResult(False, GateRejectCode.NONFINITE_CURRENT_ARM)
         arm_end = (
             arm_start.copy()
             if candidate.arm_qpos is None
@@ -142,17 +160,30 @@ class SafetyGate:
             else np.asarray(candidate.hand_qpos, dtype=np.float64).copy()
         )
         hand_start: np.ndarray | None = None
+        hand_delta_start: np.ndarray | None = None
         if hand_end is not None:
             if current_hand_qpos is None:
                 # A hand target without a current hand state cannot be delta- or
                 # collision-checked; fail closed rather than silently skipping.
-                if self.max_hand_delta_rad is not None or self.collision_check is not None:
+                if (
+                    self.max_hand_delta_rad is not None
+                    or self.collision_check is not None
+                ):
                     return GateResult(False, GateRejectCode.INVALID_CURRENT_HAND_SHAPE)
             else:
                 hand_start = np.asarray(current_hand_qpos, dtype=np.float64)
                 if hand_start.shape != HAND_JOINT_SHAPE:
                     return GateResult(False, GateRejectCode.INVALID_CURRENT_HAND_SHAPE)
                 if not np.all(np.isfinite(hand_start)):
+                    return GateResult(False, GateRejectCode.NONFINITE_CURRENT_HAND)
+            hand_delta_start = hand_start
+            if hand_delta_reference_qpos is not None:
+                hand_delta_start = np.asarray(
+                    hand_delta_reference_qpos, dtype=np.float64
+                )
+                if hand_delta_start.shape != HAND_JOINT_SHAPE:
+                    return GateResult(False, GateRejectCode.INVALID_CURRENT_HAND_SHAPE)
+                if not np.all(np.isfinite(hand_delta_start)):
                     return GateResult(False, GateRejectCode.NONFINITE_CURRENT_HAND)
         if arm_end.shape != ARM_JOINT_SHAPE or (
             hand_end is not None and hand_end.shape != HAND_JOINT_SHAPE
@@ -173,10 +204,14 @@ class SafetyGate:
             return GateResult(False, GateRejectCode.HAND_JOINT_LIMIT)
         # Per-tick delta limits (reject, never clip).
         if self.max_arm_delta_rad is not None and candidate.arm_qpos is not None:
-            if np.any(np.abs(arm_end - arm_start) > self.max_arm_delta_rad):
+            if np.any(np.abs(arm_end - arm_delta_start) > self.max_arm_delta_rad):
                 return GateResult(False, GateRejectCode.ARM_DELTA_LIMIT)
-        if self.max_hand_delta_rad is not None and hand_end is not None and hand_start is not None:
-            if np.any(np.abs(hand_end - hand_start) > self.max_hand_delta_rad):
+        if (
+            self.max_hand_delta_rad is not None
+            and hand_end is not None
+            and hand_delta_start is not None
+        ):
+            if np.any(np.abs(hand_end - hand_delta_start) > self.max_hand_delta_rad):
                 return GateResult(False, GateRejectCode.HAND_DELTA_LIMIT)
         if self.workspace_check is not None and candidate.arm_qpos is not None:
             try:
@@ -199,7 +234,8 @@ class SafetyGate:
                     return GateResult(False, GateRejectCode.COLLISION_TRANSITION)
             except Exception:
                 logger.warning(
-                    "SafetyGate: collision transition check failed closed", exc_info=True
+                    "SafetyGate: collision transition check failed closed",
+                    exc_info=True,
                 )
                 return GateResult(False, GateRejectCode.COLLISION_TRANSITION)
         return GateResult(True)
@@ -214,13 +250,14 @@ def planner_action_safety_gate(
     hand_joint_upper_rad: tuple[float, ...],
     max_arm_delta_rad: Any = None,
     max_hand_delta_rad: Any = None,
-    collision_check: Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], bool] | None = None,
+    collision_check: (
+        Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], bool] | None
+    ) = None,
 ) -> SafetyGate:
     """Build a safety gate using the planner's segment workspace check.
 
     ``max_arm_delta_rad`` / ``max_hand_delta_rad`` / ``collision_check`` are
-    opt-in and default to ``None``; only the learned-policy deployment enables
-    them (the shared teleop/replay/calibration gate keeps its prior behavior).
+    opt-in; each caller enables only the checks owned by its command path.
     """
     return SafetyGate(
         arm_joint_lower_rad=arm_joint_lower_rad,

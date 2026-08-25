@@ -28,10 +28,15 @@ import numpy as np
 
 from dexmani_real.config.runtime import ArmLoopConfig
 from dexmani_real.ipc.channels import new_frame
-from dexmani_real.ipc.schema import ARM_COMMAND_DTYPE, ARM_STATE_DTYPE
-from dexmani_real.robot.command_validation import worker_validate_arm
+from dexmani_real.ipc.schema import ARM_STATE_DTYPE, COUPLED_COMMAND_DTYPE
+from dexmani_real.robot.command_validation import check_worker_arm_command
 from dexmani_real.robot.xarm7 import HomeAborted, XArm7
-from dexmani_real.runtime.safety import SafetyState
+from dexmani_real.runtime.safety import (
+    CoupledCommandTicket,
+    SafetyState,
+    coupled_command_ticket_allows_execution,
+    read_motion_permit,
+)
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
@@ -62,39 +67,28 @@ class _LoopState:
     arm: XArm7
     frame: Any
     last_target: np.ndarray
+    last_measured_qpos: np.ndarray
+    last_command_generation: int
     last_cmd: _CmdState = field(default_factory=_CmdState.idle)
+    last_rejected_ring_sequence: int = 0
     last_state_source_ns: int = field(default_factory=time.monotonic_ns)
 
 
-def _parse_arm_action_metadata(action: Any) -> tuple[int, bool]:
-    """Return ``(sequence, is_hold)`` for a fixed command frame."""
-    if (
-        isinstance(action, np.ndarray)
-        and action.shape == (1,)
-        and action.dtype == ARM_COMMAND_DTYPE
-    ):
-        return int(action["action_id"][0]), bool(action["is_hold"][0])
-    return 0, False
-
-
-def _read_latest_arm_command(shared: Any, armed_at_seq: int) -> Any | None:
-    """Return the newest servo endpoint worth applying, or ``None``.
-
-    The transport is latest-wins: history is never replayed, so an endpoint is
-    applied only when it was created after motion was armed and is not stale.
-    """
-    result = shared.arm_cmd_ring.read_latest()
+def _read_latest_arm_command(
+    shared: Any,
+) -> tuple[Any, CoupledCommandTicket] | None:
+    """Read the newest arm-present record; the handler owns safety checks."""
+    result = shared.coupled_cmd_ring.read_latest()
     if result is None:
         return None
-    command = result[0]
-    if not worker_validate_arm(
-        command,
-        armed_at_seq=armed_at_seq,
-        expected_run_generation=int(shared.run_generation.value),
-        now_monotonic_ns=time.monotonic_ns(),
-    ):
+    command, _published_ns, ring_sequence = result
+    if not bool(command["arm_present"][0]):
         return None
-    return command
+    ticket = CoupledCommandTicket(
+        run_generation=int(command["run_generation"][0]),
+        ring_sequence=int(ring_sequence),
+    )
+    return command, ticket
 
 
 def _home_abort_reason(shared: Any, generation: int) -> str | None:
@@ -179,7 +173,9 @@ def _publish_identity(shared: Any, arm: XArm7, cfg: ArmLoopConfig) -> None:
         "serial_number": sn or "unavailable",
         "firmware_version": firmware_str,
     }
-    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
     shared.arm_device_identity.value = encoded[:1023].ljust(1024, b"\x00")
 
 
@@ -200,6 +196,8 @@ def _startup(shared: Any, arm: XArm7, cfg: ArmLoopConfig) -> _LoopState:
         arm=arm,
         frame=new_frame(ARM_STATE_DTYPE),
         last_target=qpos.copy(),
+        last_measured_qpos=qpos.copy(),
+        last_command_generation=int(shared.run_generation.value),
     )
     # Publish the initial frame before signaling ready.
     _write_arm_frame(
@@ -284,24 +282,71 @@ def _handle_home(st: _LoopState, shared: Any, request: tuple) -> None:
             st.arm.enter_mode6(on_poll=heartbeat)
         return
     st.last_target = np.asarray(final_qpos, dtype=np.float64).copy()
+    st.last_command_generation = int(generation)
     logger.info("arm_loop: HOME complete")
 
 
-def _handle_servo_command(st: _LoopState, shared: Any, action: Any) -> None:
+def _handle_servo_command(
+    st: _LoopState,
+    shared: Any,
+    action: Any,
+    ticket: CoupledCommandTicket,
+) -> None:
     """Validate and servo one endpoint command.
 
     Fail-fast: a raised SDK exception or a non-zero return propagates to the
     worker's top-level handler, which latches ``error_state`` and stops the
     controller in cleanup.
     """
-    target = np.asarray(action["qpos_cmd"][0], dtype=np.float64)
-    st.last_target = target.copy()  # target is 2π-canonicalized by the producer; no wrap
+    permit = read_motion_permit(shared)
+    command_generation = int(action["run_generation"][0])
+    if command_generation != permit.run_generation or not (
+        coupled_command_ticket_allows_execution(shared, ticket=ticket)
+    ):
+        return
+    jump_reference = (
+        st.last_target
+        if command_generation == st.last_command_generation
+        else st.last_measured_qpos
+    )
+    issue = check_worker_arm_command(
+        action,
+        expected_run_generation=permit.run_generation,
+        now_monotonic_ns=time.monotonic_ns(),
+        joint_limit_lower_rad=np.asarray(st.cfg.joint_limit_lower, dtype=np.float64),
+        joint_limit_upper_rad=np.asarray(st.cfg.joint_limit_upper, dtype=np.float64),
+        previous_command_qpos_rad=jump_reference,
+        max_command_jump_rad=st.cfg.max_servo_command_jump_rad,
+    )
+    # A newer command or a stop/fault may arrive while validation is running.
+    # Do not execute or fault on a snapshot that no longer owns the slot.
+    if not coupled_command_ticket_allows_execution(shared, ticket=ticket):
+        return
+    if issue is not None:
+        if issue.fault:
+            raise RuntimeError(
+                "unsafe servo action_id="
+                f"{int(action['action_id'][0])}: {issue.reason}"
+            )
+        if ticket.ring_sequence != st.last_rejected_ring_sequence:
+            logger.info(
+                "arm_loop: discarded action_id=%d: %s",
+                int(action["action_id"][0]),
+                issue.reason,
+            )
+            st.last_rejected_ring_sequence = ticket.ring_sequence
+        return
+    target = np.asarray(action["arm_qpos"][0], dtype=np.float64)
     code = st.arm.servo(target)
     if code != 0:
         # Non-zero setter return is terminal even if the cached error is 0.
         raise RuntimeError(f"set_servo_angle failed (SDK code={code})")
-    seq, is_hold = _parse_arm_action_metadata(action)
-    st.last_cmd = _CmdState(seq, is_hold)
+    st.last_target = target.copy()  # producer owns 2π canonicalization
+    st.last_command_generation = command_generation
+    st.last_cmd = _CmdState(
+        int(action["action_id"][0]),
+        bool(action["is_hold"][0]),
+    )
 
 
 def _step(st: _LoopState, shared: Any) -> bool:
@@ -312,11 +357,8 @@ def _step(st: _LoopState, shared: Any) -> bool:
     outside ARMED/RUNNING (or on ``error_state``) nothing is consumed, while
     observation keeps publishing every tick.
     """
-    safety = shared.safety_state.value
-    if (
-        safety in (SafetyState.ARMED, SafetyState.RUNNING)
-        and not shared.error_state.value
-    ):
+    permit = read_motion_permit(shared)
+    if permit.allows_motion and not shared.error_state.value:
         try:
             home_request = shared.arm_home_q.get(timeout=0.0)
         except Empty:
@@ -324,11 +366,10 @@ def _step(st: _LoopState, shared: Any) -> bool:
         if home_request is not None:
             _handle_home(st, shared, home_request)
         else:
-            command = _read_latest_arm_command(
-                shared, int(shared.arm_armed_at_seq.value)
-            )
-            if command is not None:
-                _handle_servo_command(st, shared, command)
+            latest = _read_latest_arm_command(shared)
+            if latest is not None:
+                command, ticket = latest
+                _handle_servo_command(st, shared, command, ticket)
     return _observe_and_publish(st, shared)
 
 
@@ -340,6 +381,7 @@ def _observe_and_publish(st: _LoopState, shared: Any) -> bool:
     top-level handler.
     """
     qpos, qvel, tau = st.arm.read()
+    st.last_measured_qpos = qpos.copy()
     st.last_state_source_ns = time.monotonic_ns()
 
     tracking_err = float(np.max(np.abs(qpos - st.last_target)))
@@ -364,7 +406,7 @@ def _observe_and_publish(st: _LoopState, shared: Any) -> bool:
 
 
 def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
-    """Arm process entry point — applies arm_cmd_ring endpoints via Mode 6.
+    """Arm process entry point — applies coupled servo endpoints via Mode 6.
 
     mp.Process target communicating exclusively through RuntimeChannels.  The
     single fail-fast boundary: any SDK/hardware failure raises into the

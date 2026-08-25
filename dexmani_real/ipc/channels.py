@@ -6,6 +6,7 @@ through it — no direct references, no RPC, no business logic.
 
 from __future__ import annotations
 
+import math
 import multiprocessing as mp
 import time
 from dataclasses import dataclass, field
@@ -13,13 +14,12 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import arm, camera, hand, policy
+from dexmani_real.config.defaults import camera, hand, policy
 from dexmani_real.ipc.camera_ring import CameraRingBuffer
 from dexmani_real.ipc.ring import SharedMemoryRingBuffer
 from dexmani_real.ipc.schema import (
-    ARM_COMMAND_DTYPE,
     ARM_STATE_DTYPE,
-    HAND_COMMAND_DTYPE,
+    COUPLED_COMMAND_DTYPE,
     HAND_JOINT_SHAPE,
     HAND_STATE_DTYPE,
     HAND_TACTILE_DTYPE,
@@ -56,7 +56,7 @@ class RuntimeChannelsConfig:
     arm_state_ring_maxlen: int = 8
     hand_state_ring_maxlen: int = 8
     hand_tactile_ring_maxlen: int = 8
-    hand_cmd_ring_maxlen: int = 8
+    coupled_cmd_ring_maxlen: int = 8
     record_control_ring_maxlen: int = 1
     record_sample_ring_maxlen: int = 4
     record_status_ring_maxlen: int = 1
@@ -71,8 +71,6 @@ class RuntimeChannelsConfig:
     initial_safety_state: int = 0
 
     control_hz: float = field(default_factory=lambda: policy.control_hz)
-    arm_loop_hz: float = field(default_factory=lambda: arm.loop_hz)
-    hand_loop_hz: float = field(default_factory=lambda: hand.loop_hz)
     hand_home_qpos_rad: tuple[float, ...] = field(
         default_factory=lambda: tuple(
             float(value) for value in np.deg2rad(hand.home_qpos_deg)
@@ -86,7 +84,6 @@ class RuntimeChannelsConfig:
         default_factory=lambda: camera.depth_shape
     )
 
-    arm_cmd_ring_maxlen: int = 4
     arm_home_q_maxsize: int = 2
 
     workspace_bounds: "np.ndarray" = field(
@@ -100,19 +97,18 @@ class RuntimeChannelsConfig:
             self.arm_state_ring_maxlen,
             self.hand_state_ring_maxlen,
             self.hand_tactile_ring_maxlen,
-            self.hand_cmd_ring_maxlen,
+            self.coupled_cmd_ring_maxlen,
             self.record_control_ring_maxlen,
             self.record_sample_ring_maxlen,
             self.record_status_ring_maxlen,
             self.policy_plan_ring_maxlen,
             self.pointcloud_ring_maxlen,
-            self.arm_cmd_ring_maxlen,
             self.arm_home_q_maxsize,
         )
         if any(int(value) <= 0 for value in capacities):
             raise ValueError("RuntimeChannels ring/queue capacities must be positive")
-        if min(self.control_hz, self.arm_loop_hz, self.hand_loop_hz) <= 0:
-            raise ValueError("RuntimeChannels action rates must be positive")
+        if not math.isfinite(self.control_hz) or self.control_hz <= 0:
+            raise ValueError("RuntimeChannels control_hz must be finite and positive")
         if (
             isinstance(self.pointcloud_num_points, bool)
             or int(self.pointcloud_num_points) not in SUPPORTED_POINT_CLOUD_COUNTS
@@ -153,6 +149,8 @@ class RuntimeChannelsConfig:
         *,
         pointcloud_num_points: int = 1024,
         pointcloud_requested: bool = False,
+        observation_horizon: int | None = None,
+        max_observation_skew_s: float = 0.0,
     ) -> "RuntimeChannelsConfig":
         cam = getattr(runtime, "camera")
         pol = getattr(runtime, "policy")
@@ -166,15 +164,48 @@ class RuntimeChannelsConfig:
             ],
             dtype=np.float64,
         )
+        arm_state_ring_maxlen = 8
+        hand_state_ring_maxlen = 8
+        pointcloud_ring_maxlen = 8
+        if pointcloud_requested:
+            if (
+                observation_horizon is None
+                or isinstance(observation_horizon, bool)
+                or int(observation_horizon) <= 0
+            ):
+                raise ValueError(
+                    "point-cloud deployment requires a positive observation_horizon"
+                )
+            if (
+                not math.isfinite(float(max_observation_skew_s))
+                or float(max_observation_skew_s) < 0.0
+            ):
+                raise ValueError(
+                    "max_observation_skew_s must be finite and non-negative"
+                )
+            horizon = int(observation_horizon)
+            span_s = (horizon - 1) / float(cam.fps) + float(max_observation_skew_s)
+            arm_state_ring_maxlen = max(
+                arm_state_ring_maxlen,
+                math.ceil(float(arm_cfg.loop_hz) * span_s) + _OBSERVATION_READ_MARGIN,
+            )
+            hand_state_ring_maxlen = max(
+                hand_state_ring_maxlen,
+                math.ceil(float(hand_cfg.loop_hz) * span_s) + _OBSERVATION_READ_MARGIN,
+            )
+            pointcloud_ring_maxlen = max(
+                pointcloud_ring_maxlen, horizon + _OBSERVATION_READ_MARGIN
+            )
         return cls(
             camera_ring_maxlen=int(cam.ring_maxlen),
             camera_rgb_shape=(int(cam.height), int(cam.width), 3),
             camera_depth_shape=(int(cam.height), int(cam.width)),
             pointcloud_num_points=int(pointcloud_num_points),
             pointcloud_requested=pointcloud_requested,
+            arm_state_ring_maxlen=arm_state_ring_maxlen,
+            hand_state_ring_maxlen=hand_state_ring_maxlen,
+            pointcloud_ring_maxlen=pointcloud_ring_maxlen,
             control_hz=float(pol.control_hz),
-            arm_loop_hz=float(arm_cfg.loop_hz),
-            hand_loop_hz=float(hand_cfg.loop_hz),
             hand_home_qpos_rad=tuple(
                 float(value) for value in np.deg2rad(hand_cfg.home_qpos_deg)
             ),
@@ -188,16 +219,16 @@ _RING_RESOURCE_NAMES = (
     "arm_state_ring",
     "hand_state_ring",
     "hand_tactile_ring",
-    "hand_cmd_ring",
+    "coupled_cmd_ring",
     "record_control_ring",
     "record_sample_ring",
     "record_status_ring",
     "policy_plan_ring",
     "pointcloud_ring",
-    "arm_cmd_ring",
 )
 _QUEUE_RESOURCE_NAMES = ("arm_home_q",)
 _ALLOCATION_ROLLBACK_ATTEMPTS = 2
+_OBSERVATION_READ_MARGIN = 2
 
 # Heartbeat slots use a fixed process-stable order.
 HEARTBEAT_FIELDS: tuple[str, ...] = (
@@ -249,23 +280,22 @@ class RuntimeChannels:
     arm_state_ring: SharedMemoryRingBuffer  # arm -> policy
     hand_state_ring: SharedMemoryRingBuffer  # hand -> policy
     hand_tactile_ring: SharedMemoryRingBuffer  # hand -> policy (sparse)
-    hand_cmd_ring: SharedMemoryRingBuffer  # policy -> hand
+    coupled_cmd_ring: SharedMemoryRingBuffer  # serialized control -> arm/hand endpoint
     record_control_ring: SharedMemoryRingBuffer  # policy -> RecorderIO episode boundary
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     record_status_ring: SharedMemoryRingBuffer  # RecorderIO -> controller/main
     policy_plan_ring: SharedMemoryRingBuffer  # inference -> coordinator, latest-wins
     pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> inference
 
-    arm_cmd_ring: SharedMemoryRingBuffer  # policy -> arm servo endpoints, latest-wins
     arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, generation)
     arm_command_seq: (
         Any  # all actuator-action producers -> globally unique monotonic IDs
     )
-    arm_armed_at_seq: Any  # command seq at arm time; older endpoints are stale
     run_generation: Any  # controller advances it to invalidate old policy proposals
+    # The active ring sequence fences latest-wins commands at each SDK boundary.
+    active_coupled_command_sequence: Any
     recorder_consumed_sequence: Any
     action_control_hz: float
-    action_lead_time_s: float
     hand_home_qpos_rad: tuple[float, ...]
 
     is_running: Any  # Main -> all
@@ -278,6 +308,9 @@ class RuntimeChannels:
     stop_request: Any  # Main -> coordinator: S (stop the current policy run)
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write
+    # Serializes the motion permit and coupled-command ticket state. It is
+    # never held across hardware SDK calls.
+    motion_lock: Any
 
     heartbeats: Any  # fixed-order array of per-subsystem heartbeat timestamps (s)
 
@@ -384,10 +417,10 @@ class RuntimeChannels:
             maxlen=cfg.hand_tactile_ring_maxlen,
             create=True,
         )
-        storage.hand_cmd_ring = SharedMemoryRingBuffer(
-            f"{prefix}_hand_cmd",
-            dtype=HAND_COMMAND_DTYPE,
-            maxlen=cfg.hand_cmd_ring_maxlen,
+        storage.coupled_cmd_ring = SharedMemoryRingBuffer(
+            f"{prefix}_coupled_cmd",
+            dtype=COUPLED_COMMAND_DTYPE,
+            maxlen=cfg.coupled_cmd_ring_maxlen,
             create=True,
         )
         storage.record_control_ring = SharedMemoryRingBuffer(
@@ -421,22 +454,12 @@ class RuntimeChannels:
             create=True,
         )
 
-        storage.arm_cmd_ring = SharedMemoryRingBuffer(
-            f"{prefix}_arm_cmd",
-            dtype=ARM_COMMAND_DTYPE,
-            maxlen=cfg.arm_cmd_ring_maxlen,
-            create=True,
-        )
         storage.arm_home_q = ctx.Queue(maxsize=cfg.arm_home_q_maxsize)
         storage.arm_command_seq = ctx.Value("Q", 0)
-        # Ignore endpoints created before the latest motion-arm sequence.
-        storage.arm_armed_at_seq = ctx.Value("Q", 0)
         storage.run_generation = ctx.Value("Q", 1)
+        storage.active_coupled_command_sequence = ctx.Value("Q", 0)
         storage.recorder_consumed_sequence = ctx.Value("Q", 0)
         storage.action_control_hz = float(cfg.control_hz)
-        storage.action_lead_time_s = 2.0 / min(
-            float(cfg.arm_loop_hz), float(cfg.hand_loop_hz)
-        )
         storage.hand_home_qpos_rad = tuple(
             float(value) for value in cfg.hand_home_qpos_rad
         )
@@ -451,6 +474,7 @@ class RuntimeChannels:
         storage.stop_request = ctx.Value("b", False)
 
         storage.safety_state = ctx.Value("i", int(cfg.initial_safety_state))
+        storage.motion_lock = ctx.RLock()
 
         storage.heartbeats = ctx.Array("d", [0.0] * len(HEARTBEAT_FIELDS))
 
