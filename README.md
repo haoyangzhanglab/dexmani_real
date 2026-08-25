@@ -20,8 +20,8 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
   新鲜度和 watchdog 边界处理。
 - RealSense 相机按设备原生频率连续采集；16 Hz 控制网格只选择最新严格因果帧，
   不再将相机发布节拍绑定到控制频率。
-- 事务式写入 native RGB-D raw episode v21；分别保存 depth/color 几何与时序。
-- 将 native raw v21 episode 清洗为 processed HDF5 v5，再导出 Policy Zarr v3。
+- 事务式写入 depth-to-color aligned RGB-D raw episode v22；保留 native depth/color 几何与时序 provenance。
+- 将 aligned raw v22 episode 清洗为 processed HDF5 v7，再导出 Policy Zarr v3。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
 - 通过可替换 `PolicyRuntime` 运行 joint/EE-action learned policy；仓库包含无模型的
   deterministic fake 实现和 `dexmani_policy` 集成。启动时 `DeploymentManifest`
@@ -39,6 +39,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`data/`](dexmani_real/data) |
 | learned-policy 部署 | [`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`integrations/`](dexmani_real/integrations) |
 | 相机、桌面与 VR 标定 | [`examples/`](examples) | [`calibration/`](dexmani_real/calibration)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
+| 点云完整链路 | [`docs/pointcloud_pipeline.md`](docs/pointcloud_pipeline.md) | [`sensor/pointcloud.py`](dexmani_real/sensor/pointcloud.py)、[`sensor/pointcloud_worker.py`](dexmani_real/sensor/pointcloud_worker.py) |
 
 完整的逐文件职责见 [`repo_map.md`](repo_map.md)。
 
@@ -167,16 +168,19 @@ python examples/collect_teleop.py --print-config
 ### Learned policy 实时点云
 
 部署配置的 `observation_fields` 包含 `point_cloud` 时，lifecycle 才启动 camera 与独立
-point-cloud worker。worker 始终读取最新的 native RGB-D，旧帧不会排队；inference 组装
+point-cloud worker。worker 始终读取最新的 depth-to-color aligned RGB-D，旧帧不会排队；inference 组装
 点云 T 历史窗（`n_obs_steps` 帧，跨帧 `camera_generation` 一致），每帧为 xArm-base
 `float32 (N, 6)`，列语义为 `xyzrgb`，RGB 范围为 `[0,1]`。`pointcloud_num_points` 只允许
 `1024`、`2048`、`4096`、`8192`，也可通过 `--pointcloud-num-points` 覆盖。
 
 实时、离线处理和 shadow 诊断共用 `PointCloudConfig` 与同一个生产 builder。处理顺序为：
-native depth 范围/局部支持过滤 → depth-frame 桌面保守裁减 → xArm-base 变换与 workspace
-裁减 → 均值体素 → 空间候选上限 → 半径离群过滤 → native color 投影与可见性检查 →
-确定性固定 N 采样。processed HDF5 和 Policy Zarr 同时保存并校验算法、配置 SHA-256 与
-桌面平面身份，禁止混合不同点云语义的数据。
+aligned depth 范围/局部支持与边缘四方向支撑过滤 → 使用缓存 color-camera ray 的桌面高度
+迟滞裁减（在反投影前，以可靠高点连通保护物体低处表面）→ color-frame 反投影 → xArm-base
+变换与 workspace 裁减 → XYZ/RGB 均值体素 →
+单次 radius graph 邻居密度/连通域过滤 → 空间候选上限 → 确定性固定 N 采样。感知
+workspace 当前为 x `[0.0,0.8]`、y `[-0.5,0.5]`、z `[0.0,0.8]` m；体素 RGB 是其源
+aligned 像素 RGB 的均值。processed HDF5 和 Policy Zarr 同时保存并校验算法、配置 SHA-256
+与桌面平面身份，禁止混合不同点云语义的数据。
 
 示例 deployment YAML：
 
@@ -196,8 +200,9 @@ deployment:
 点云缺失、过期、shape/dtype 错误、非有限值或颜色越界时 inference fail closed，不发布
 新的 plan。实时路径当前仅支持静态 `eye_to_hand` 标定；`eye_in_hand` 需要另行建立与
 相机帧同步的机械臂位姿合同。离线 IPC、合成 RGB-D 和已保存的真实 L515 帧均已验证；
-实时 worker 的 compute/source-to-publish p95 仍须在完整硬件部署中记录，建议目标分别为
-30 ms/50 ms。
+实时 worker 的 compute/source-to-publish p95 仍须在完整硬件部署中记录。
+`pointcloud_process_example.py` 同时报告纯构建与 capture-to-cloud 的 p50/p95/max，并报告
+深度滤波、桌面裁减、反投影、体素和离群过滤等逐阶段 p95；纯构建目标为 p95 < 40 ms。
 
 ### L515 RGB/Depth 时序限制
 
@@ -205,14 +210,15 @@ deployment:
 根因已确认并修复：`RealSenseConfig.auto_exposure_priority` 默认 `0.0`（OFF，Auto
 Exposure 仍 ON），RGB 恢复 30 Hz，亮度由增益补偿、几乎不变（暗场噪声上升）。
 
-深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew），因此 processed v5 的点云
-颜色语义仍是 `native_color_projection`，不表示同步曝光；运动物体可能出现颜色时间错位。
+深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew）。processed v7 的点云将
+depth-to-color aligned 像素 RGB 聚合为体素颜色，但这不表示同步曝光；运动物体仍可能出现
+颜色时间错位。
 
-native 几何点云/桌面交互诊断入口为 `examples/realsense_record_example.py` 与
+RGB-D 点云/桌面交互诊断入口为 `examples/realsense_record_example.py` 与
 `examples/pointcloud_process_example.py`。前者可在完整 RAW 点云和 canonical 处理后点云之间
-切换：`p` 显示点云，`s` 切换 RAW/PROCESSED，`v/w/f/r` 分别调整诊断体素、开关处理后
-裁减、冻结和重置。后者提示清空桌面后采集 5 帧，以确定性 RANSAC 重新拟合桌面；新拟合
-在本次运行立即使用，只有操作者输入 `y` 才会备份并原子更新
+切换：`p` 显示点云，`s` 切换 RAW/PROCESSED，`f/r` 分别冻结和重置。后者先询问是否执行
+桌面标定；选择后会提示清空桌面并采集 5 帧，以确定性 RANSAC 重新拟合桌面。新拟合在本次
+运行立即使用，只有操作者输入 `y` 才会备份并原子更新
 `dexmani_real/config/desk_plane.json`。该文件同时服务感知裁减和桌面碰撞几何。
 
 ### 离线数据工作流
@@ -233,7 +239,7 @@ python examples/process_episodes.py \
 `--pointcloud-num-points` 选择 `1024`、`2048`、`4096` 或 `8192`，默认 `1024`。
 
 raw episode 可视化只展示文件实际存储的相机与状态数据。需要检查 canonical 点云时，先用
-`process_episodes.py` 生成 processed HDF5 v5，再运行
+`process_episodes.py` 生成 processed HDF5 v7，再运行
 `python examples/visualize_episode_processed.py <processed.h5>`；该入口会校验 `(N,6)`、
 `float32`、xArm-base 坐标系、RGB 范围、算法/采样语义、配置哈希与桌面标定身份。
 
@@ -281,7 +287,7 @@ dataset/<task>.zarr/
 └── meta/episode_ends
 ```
 
-正式 raw writer 写 schema v21；native depth 与 native RGB 不进行 SDK spatial align，并分别保存两路帧号、设备时间戳、intrinsics、distortion 与 `T_color_from_depth`。其他 raw schema 需要在运行时之外显式迁移。离线处理默认保守：
+正式 raw writer 写 schema v22；depth 通过 SDK 对齐到 color 像素网格后保存，并同时保存两路帧号、设备时间戳、native intrinsics、distortion 与 `T_color_from_depth` 作为 provenance。其他 raw schema 需要在运行时之外显式迁移。离线处理默认保守：
 硬无效行可被移除，时序异常先审计；压紧后产生危险动作跳变时默认拒绝该轨迹。
 
 ## 开发与验证

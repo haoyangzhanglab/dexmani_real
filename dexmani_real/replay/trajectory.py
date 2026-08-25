@@ -221,7 +221,7 @@ def load_trajectory(
 
 
 def load_processed_trajectory(episode_path: str) -> TrajectoryData:
-    """Load a processed HDF5 v5 artifact's exact submitted command stream.
+    """Load a processed HDF5 v7 artifact's exact submitted command stream.
 
     A processed artifact stores the same submitted joint-command stream as its raw
     source episode — ``action[:, :7]`` is ``action_arm_joint_sent`` and
@@ -291,7 +291,9 @@ def load_processed_trajectory(episode_path: str) -> TrajectoryData:
         raise ValueError(f"processed episode {path.name} has invalid dt")
     fps = 1.0 / dt
     if not _MIN_EPISODE_RATE_HZ <= fps <= _MAX_EPISODE_RATE_HZ:
-        raise ValueError(f"physical replay requires a valid episode rate, got {fps!r} Hz")
+        raise ValueError(
+            f"physical replay requires a valid episode rate, got {fps!r} Hz"
+        )
 
     action_arm_joint = action[:, :ARM_DOF]
     action_hand_joint = action[:, ARM_DOF:]

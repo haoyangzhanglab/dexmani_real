@@ -1,4 +1,4 @@
-"""RealSense D400/L515 camera driver for native RGB-D payloads."""
+"""RealSense D400/L515 driver with native and depth-to-color RGB-D payloads."""
 
 from __future__ import annotations
 
@@ -114,6 +114,11 @@ class RealSenseConfig:
             self.enable_global_time, bool
         ):
             raise TypeError("enable_color and enable_global_time must be boolean")
+        if self.enable_color and self.depth_resolution != self.color_resolution:
+            raise ValueError(
+                "depth_resolution and color_resolution must match when "
+                "depth_to_color alignment is enabled"
+            )
         if self.l515_depth_config is not None and not isinstance(
             self.l515_depth_config, L515DepthConfig
         ):
@@ -132,8 +137,15 @@ class RealSenseConfig:
 @dataclass(frozen=True)
 class CameraFrame:
     rgb: np.ndarray | None
+    # Native depth is retained for measurement provenance. Production point
+    # clouds use the aligned payload with ``geometry.aligned_depth_to_color``.
     depth: np.ndarray
     depth_raw: np.ndarray
+    # ``rs.align(depth -> color)`` samples are deprojected with color intrinsics
+    # and transformed from the color-camera frame.
+    depth_aligned_to_color: np.ndarray | None
+    depth_aligned_to_color_raw: np.ndarray | None
+    alignment_elapsed_ns: int
     host_time: float
     wait_return_monotonic_ns: int
     payload_ready_monotonic_ns: int
@@ -172,6 +184,7 @@ class RealSense:
 
         self.depth_scale: float | None = None
         self.geometry: RGBDGeometry | None = None
+        self._depth_to_color_aligner: rs.align | None = None
         self.l515_depth_option_snapshot: dict[str, Any] | None = None
         self.frame_id = 0
 
@@ -384,6 +397,9 @@ class RealSense:
             self.profile.get_device().first_depth_sensor().get_depth_scale()
         )
         self.update_geometry_from_profile()
+        self._depth_to_color_aligner = (
+            rs.align(rs.stream.color) if self.config.enable_color else None
+        )
         self.frame_id = 0
 
     def _apply_d400_depth_config(self) -> None:
@@ -491,6 +507,7 @@ class RealSense:
             self.profile = None
             self.depth_scale = None
             self.geometry = None
+            self._depth_to_color_aligner = None
             self.l515_depth_option_snapshot = None
 
     def create_rs_config(self) -> rs.config:
@@ -603,9 +620,8 @@ class RealSense:
         if self.depth_scale is None:
             raise RuntimeError("RealSense depth_scale is unavailable.")
 
-        # frame_queue returns the base ``rs.frame`` wrapper even when its
-        # payload is a frameset. Recover the typed frameset at this SDK
-        # boundary; production never spatially aligns either native stream.
+        # Capture native frames for provenance, then construct the aligned
+        # depth-to-color payload used by geometry-sensitive point-cloud work.
         queued_frame = self.frame_queue.wait_for_frame(timeout_ms)
         # Timestamp immediately after the queue wait returns, before frameset
         # recovery or any array ownership copies.
@@ -621,6 +637,19 @@ class RealSense:
         if self.config.enable_color and not color_frame:
             raise RuntimeError("Failed to get color frame.")
 
+        aligned_depth_raw: np.ndarray | None = None
+        alignment_elapsed_ns = 0
+        if self._depth_to_color_aligner is not None:
+            alignment_start_ns = time.monotonic_ns()
+            aligned_frames = self._depth_to_color_aligner.process(frames)
+            aligned_depth_frame = aligned_frames.get_depth_frame()
+            alignment_elapsed_ns = time.monotonic_ns() - alignment_start_ns
+            if not aligned_depth_frame:
+                raise RuntimeError("Failed to align depth to the color stream.")
+            aligned_depth_raw = np.array(
+                aligned_depth_frame.get_data(), dtype=np.uint16, copy=True, order="C"
+            )
+
         # ``ascontiguousarray`` may return an SDK-backed view. Use ``array``
         # with copy=True because the frame becomes invalid after this method.
         depth_raw = np.array(
@@ -628,8 +657,14 @@ class RealSense:
         )
         if compute_depth:
             depth: np.ndarray = depth_raw.astype(np.float32) * float(self.depth_scale)
+            depth_aligned_to_color = (
+                None
+                if aligned_depth_raw is None
+                else aligned_depth_raw.astype(np.float32) * float(self.depth_scale)
+            )
         else:
             depth = depth_raw  # shared-memory path keeps raw depth
+            depth_aligned_to_color = aligned_depth_raw
 
         rgb = None
         if color_frame is not None:
@@ -668,6 +703,9 @@ class RealSense:
             rgb=rgb,
             depth=depth,
             depth_raw=depth_raw,
+            depth_aligned_to_color=depth_aligned_to_color,
+            depth_aligned_to_color_raw=aligned_depth_raw,
+            alignment_elapsed_ns=alignment_elapsed_ns,
             host_time=host_time,
             wait_return_monotonic_ns=wait_return_monotonic_ns,
             payload_ready_monotonic_ns=payload_ready_monotonic_ns,

@@ -171,11 +171,11 @@ HAND_STATE_DTYPE = np.dtype(
         ("connected", "<u1"),
         # Set when qpos is held from the last read after a single-frame failure.
         ("qpos_stale", "<u1"),
-        # action_id of the last command accepted by XHand.send_action(),
-        # including a configured-current overrun accepted as grasp contact;
-        # this is not the hand command ring's internal sequence.
-        ("last_cmd_seq", "<u8"),
-        ("last_cmd_qpos", "<f8", HAND_JOINT_SHAPE),
+        # action_id whose exact requested target was accepted by
+        # XHand.send_action(), including a configured-current overrun accepted
+        # as grasp contact.  This is not physical convergence and is not the
+        # hand command ring's internal sequence.
+        ("accepted_target_action_id", "<u8"),
         ("commboard_err", "<i4", HAND_JOINT_SHAPE),
         ("jointboard_err", "<i4", HAND_JOINT_SHAPE),
         ("tipboard_err", "<i4", HAND_JOINT_SHAPE),
@@ -223,7 +223,7 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
         ("source_monotonic_ns", "<u8"),
         ("receive_monotonic_ns", "<u8"),
         # ``receive`` is immediately after frame_queue.wait_for_frame returns;
-        # payload readiness is after owned native RGB/depth NumPy copies.
+        # payload readiness is after owned RGB and depth-to-color Z16 copies.
         ("payload_ready_monotonic_ns", "<u8"),
         ("depth_timestamp_domain", "<u1"),
         # 255 denotes that no color stream is present.

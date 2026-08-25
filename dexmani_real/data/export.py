@@ -1,4 +1,4 @@
-"""Transactional export of processed HDF5 v5 episodes to policy Zarr."""
+"""Transactional export of processed HDF5 v7 episodes to policy Zarr."""
 
 from __future__ import annotations
 

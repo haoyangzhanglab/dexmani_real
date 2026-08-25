@@ -64,8 +64,8 @@ def publish_hand_home_and_wait_applied(
             "hand home rejected by runtime gate: %s", runtime_rejection.reason
         )
         return False
-    command_lower = np.asarray(command_lower_rad, dtype=np.float64)
-    command_upper = np.asarray(command_upper_rad, dtype=np.float64)
+    mechanical_lower = np.asarray(mechanical_lower_rad, dtype=np.float64)
+    mechanical_upper = np.asarray(mechanical_upper_rad, dtype=np.float64)
     deadline_s = time.monotonic() + timeout_s
     hand_feedback, feedback_rejection = read_hand_feedback(
         shared, None, hand_feedback_max_age_s=hand_feedback_max_age_s
@@ -74,10 +74,12 @@ def publish_hand_home_and_wait_applied(
         logger.warning("hand home rejected: %s", feedback_rejection.reason)
         return False
     assert hand_feedback is not None
-    start = hand_feedback.last_cmd_qpos
-    if np.any(start < command_lower - 1e-12) or np.any(start > command_upper + 1e-12):
+    measured_qpos = hand_feedback.qpos
+    if np.any(measured_qpos < mechanical_lower - 1e-12) or np.any(
+        measured_qpos > mechanical_upper + 1e-12
+    ):
         logger.warning(
-            "hand home rejected: last accepted hand command violates operational limits"
+            "hand home rejected: measured hand qpos violates mechanical limits"
         )
         return False
 
@@ -142,15 +144,15 @@ def publish_hand_home_and_wait_applied(
                 )
                 return False
             assert hand_feedback is not None
-            applied_id = hand_feedback.last_cmd_seq
-            if applied_id > action_id:
+            accepted_action_id = hand_feedback.accepted_target_action_id
+            if accepted_action_id > action_id:
                 logger.warning(
                     "hand home action_id=%d was superseded by action_id=%d before acknowledgement",
                     action_id,
-                    applied_id,
+                    accepted_action_id,
                 )
                 return False
-            if applied_id == action_id:
+            if accepted_action_id == action_id:
                 acknowledged = True
                 break
             time.sleep(0.01)

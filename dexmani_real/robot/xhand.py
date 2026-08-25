@@ -127,7 +127,6 @@ class XHand:
     def __init__(self, config: HandParams):
         self.cfg = config
         self.connected_flag = False
-        self.last_qpos_cmd: np.ndarray | None = None
         self.device_identity = {
             "backend": "hardware",
             "hand_type": "unavailable",
@@ -149,7 +148,7 @@ class XHand:
         return self._tactile_bias_sum is not None and self._tactile_bias_raw is not None
 
     def connect(self) -> None:
-        """Open the configured device and seed command history from live feedback."""
+        """Open the configured device and seed its command buffer from live feedback."""
         if self.connected_flag:
             return
 
@@ -297,11 +296,6 @@ class XHand:
             sample = self.get_state()
             if sample is not None:
                 self._command = self._make_command(sample.qpos)
-                self.last_qpos_cmd = np.clip(
-                    sample.qpos,
-                    self.cfg.mechanical_qpos_min_rad,
-                    self.cfg.mechanical_qpos_max_rad,
-                )
                 return
             if attempt + 1 < _INITIAL_STATE_READ_ATTEMPTS:
                 time.sleep(_INITIAL_STATE_READ_INTERVAL_S)
@@ -472,14 +466,13 @@ class XHand:
     def send_action(self, action: np.ndarray) -> bool:
         """Send one absolute endpoint and report whether the SDK accepted it."""
         target = np.asarray(action, dtype=np.float64)
-        self._validate_action(target)
+        try:
+            self._validate_action(target)
+        except ValueError as exc:
+            logger.warning("XHand send rejected: %s", exc)
+            return False
         if self._control is None or self._command is None or not self.connected_flag:
             raise RuntimeError("XHand command path is not initialized")
-        target = np.clip(
-            target,
-            self.cfg.mechanical_qpos_min_rad,
-            self.cfg.mechanical_qpos_max_rad,
-        )
 
         try:
             for index, value in enumerate(target):
@@ -497,7 +490,6 @@ class XHand:
                 getattr(error, "error_message", ""),
             )
             return False
-        self.last_qpos_cmd = target.copy()
         return True
 
     def _make_command(self, qpos: np.ndarray) -> Any:
@@ -520,6 +512,12 @@ class XHand:
     def _validate_action(self, qpos: np.ndarray) -> None:
         if qpos.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(qpos)):
             raise ValueError("XHand.send_action requires twelve finite joint targets")
+        lower = np.asarray(self.cfg.mechanical_qpos_min_rad, dtype=np.float64)
+        upper = np.asarray(self.cfg.mechanical_qpos_max_rad, dtype=np.float64)
+        if np.any(qpos < lower - 1e-12) or np.any(qpos > upper + 1e-12):
+            raise ValueError(
+                "XHand.send_action target violates mechanical joint limits"
+            )
 
     @staticmethod
     def _parse_joints(

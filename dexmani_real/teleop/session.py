@@ -19,8 +19,8 @@ import numpy as np
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
 from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
-from dexmani_real.ipc.schema import RECORD_TASK_LABEL_BYTES
-from dexmani_real.recording.client import RecorderPhase
+from dexmani_real.ipc.schema import RECORD_OPERATOR_BYTES, RECORD_TASK_LABEL_BYTES
+from dexmani_real.recording.client import RecorderPhase, bounded_control_text
 from dexmani_real.recording.worker import RecorderIOConfig, recorder_io_loop
 from dexmani_real.robot.arm_worker import arm_loop as _arm_loop
 from dexmani_real.robot.hand_worker import hand_loop as _hand_loop
@@ -73,6 +73,21 @@ def validate_task_name(value: str) -> str:
         raise ValueError(
             f"task_name exceeds the {RECORD_TASK_LABEL_BYTES}-byte recording metadata limit"
         )
+    return value
+
+
+def validate_operator(value: str) -> str:
+    """Validate optional operator metadata against the recorder IPC boundary."""
+    if not isinstance(value, str):
+        raise ValueError("operator must be a string")
+    try:
+        bounded_control_text(
+            value,
+            capacity=RECORD_OPERATOR_BYTES,
+            field="operator",
+        )
+    except UnicodeError as exc:
+        raise ValueError("operator must be valid UTF-8 text") from exc
     return value
 
 
@@ -376,6 +391,12 @@ def run_teleop_experiment(
     except ValueError as exc:
         logger.error("invalid task_name: %s", exc)
         return 1
+    if recording_enabled:
+        try:
+            operator = validate_operator(operator)
+        except ValueError as exc:
+            logger.error("invalid operator: %s", exc)
+            return 1
     if not hand_enabled and not allow_no_hand:
         logger.error("disabled hand requires explicit allow_no_hand acknowledgement")
         return 1
@@ -433,11 +454,14 @@ def run_teleop_experiment(
             if spec.ready_name
         ]
 
-        # Wait for VR last because it requires the operator to don the headset.
-        non_vr_checks = [rc for rc in ready_checks if rc[0] != "vr"]
+        # Independent workers must be ready before policy.  VR stays last so
+        # its full timeout begins only after the operator sees the prompt.
+        worker_checks = [rc for rc in ready_checks if rc[0] not in {"policy", "vr"}]
+        policy_checks = [rc for rc in ready_checks if rc[0] == "policy"]
+        pre_vr_checks = worker_checks + policy_checks
         vr_checks = [rc for rc in ready_checks if rc[0] == "vr"]
 
-        if not wait_subsystem_ready(shared, non_vr_checks, procs):
+        if not wait_subsystem_ready(shared, pre_vr_checks, procs):
             shared.error_state.value = True
             require_transition(shared, SafetyState.FAULT)
             shutdown_report = shutdown_processes(
@@ -448,13 +472,14 @@ def run_teleop_experiment(
             shared_closed = shutdown_report.shared_closed
             return 1
 
-        for name, _timeout in non_vr_checks:
+        for name, _timeout in pre_vr_checks:
             print(f"  {name}: ready", flush=True)
 
         if vr_checks:
             _, vr_timeout = vr_checks[0]
             print(
-                f"\n  System ready — waiting for VR connection (up to {vr_timeout}s) — "
+                f"\n  Non-VR subsystems ready — waiting for VR tracking "
+                f"(up to {vr_timeout}s) — "
                 f"put on Quest headset...",
                 flush=True,
             )

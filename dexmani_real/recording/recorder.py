@@ -1,4 +1,4 @@
-"""Transactional raw v21 episode serialization from owned ``EpisodeFrame`` rows.
+"""Transactional raw v22 episode serialization from owned ``EpisodeFrame`` rows.
 
 State, action, VR, and camera rows are causally aligned to the policy grid.
 The recorder owns transaction lifecycle, camera sidecar coordination, metadata,
@@ -314,6 +314,10 @@ class EpisodeRecorder:
             "payload and timestamps are fresh"
         )
         meta.attrs["camera_depth_storage"] = "uint16/gzip-1"
+        meta.attrs["camera_depth_payload_semantics"] = (
+            "v22: librealsense_align_depth_to_color_z16; depth pixels are in "
+            "camera_color_optical and match camera_rgb pixels"
+        )
 
     def _write_camera_meta_attrs(self, meta: h5py.Group) -> None:
         """Camera identity/geometry attrs from _pending_meta (None entries skipped).
@@ -345,6 +349,9 @@ class EpisodeRecorder:
                 T_xarm_base_from_color = np.asarray(
                     calib_meta["camera_T_world_camera"], dtype=np.float64
                 ).reshape(4, 4)
+                meta.attrs["camera_T_xarm_base_from_color"] = (
+                    T_xarm_base_from_color.reshape(-1).tolist()
+                )
                 meta.attrs["camera_T_xarm_base_from_depth"] = (
                     (T_xarm_base_from_color @ camera_geometry.T_color_from_depth)
                     .reshape(-1)

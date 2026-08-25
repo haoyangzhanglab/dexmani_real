@@ -2,22 +2,19 @@
 """Usage: ``python examples/realsense_record_example.py``.
 
 Self-contained interactive RealSense RGB-D and point-cloud diagnostic. The
-point-cloud window switches explicitly between the complete unprocessed native
-depth cloud and the canonical processed production cloud. Diagnostic crop and
-voxel overrides never mutate the runtime production policy.
+point-cloud window switches explicitly between the complete unprocessed
+depth-to-color cloud and the canonical processed production cloud.
 
 Keyboard controls::
 
     q / Esc    Quit
     p          Toggle point cloud display
     s          Switch RAW full <-> PROCESSED
-    v          Cycle diagnostic processed voxel size
-    w          Toggle processed table/workspace crop
     f          Freeze/unfreeze the point-cloud frame
     r          Reset to defaults
     c          Print current config
     d          Toggle depth colormap (jet <-> gray)
-    a          Toggle auto-exposure priority ON <-> OFF (Option A test)
+    a          Toggle auto-exposure priority ON <-> OFF
 
 The ``a`` key toggles ``auto_exposure_priority`` live (Auto Exposure stays ON),
 so you can watch the RGB brighten/darken and the fps jump between ~16.7 Hz
@@ -31,7 +28,7 @@ import sys
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -48,17 +45,7 @@ from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.sensor.camera_geometry import RGBDGeometry
 from dexmani_real.sensor.pointcloud import build_point_cloud, build_raw_point_cloud
-from dexmani_real.sensor.realsense import CameraFrame, RealSense, RealSenseConfig
-
-_DIAGNOSTIC_VOXEL_CYCLE_M = (0.005, 0.010)
-_FULL_VIEW_WORKSPACE: tuple[float, float, float, float, float, float] = (
-    -0.3,
-    -1.0,
-    -0.5,  # xyz_min
-    2.0,
-    1.0,
-    1.5,  # xyz_max
-)
+from dexmani_real.sensor.realsense import RealSense, RealSenseConfig
 
 _WINDOW_NAME = "RealSense Test | RGB(left) Depth(right)"
 
@@ -84,20 +71,16 @@ class PointCloudDisplayState:
     show: bool = False
     colormap: str = "jet"
     cloud_mode: str = "processed"
-    voxel_size_m: float = 0.005
-    crop_on: bool = True
     frozen: bool = False
     cached_cloud: np.ndarray | None = None
 
     def toggle_colormap(self) -> None:
         self.colormap = "gray" if self.colormap == "jet" else "jet"
 
-    def reset(self, production: PointCloudConfig) -> None:
+    def reset(self) -> None:
         self.show = False
         self.colormap = "jet"
         self.cloud_mode = "processed"
-        self.voxel_size_m = production.voxel_size_m
-        self.crop_on = True
         self.frozen = False
         self.cached_cloud = None
 
@@ -113,17 +96,6 @@ class FrameStats:
     total_ms: float = 0.0
 
 
-def _make_pcd_config(
-    state: PointCloudDisplayState, production: PointCloudConfig
-) -> PointCloudConfig:
-    """Apply explicit diagnostic overrides to the immutable production policy."""
-    return replace(
-        production,
-        voxel_size_m=state.voxel_size_m,
-        workspace=production.workspace if state.crop_on else _FULL_VIEW_WORKSPACE,
-    )
-
-
 class NonBlockingPCDViewer:
     """Non-blocking open3d point-cloud window -- create on first frame, update thereafter."""
 
@@ -136,24 +108,20 @@ class NonBlockingPCDViewer:
         self.point_size = point_size
 
     def update(self, points: np.ndarray) -> bool:
-        """Update point cloud.  *points*: (N, 3) or (N, 6).  Returns False if window closed."""
+        """Display one production-format cloud; return false after window close."""
         import open3d as o3d
 
-        pcd_array = points.astype(np.float32)
-        if pcd_array.ndim != 2 or pcd_array.shape[1] not in (3, 6):
-            return self._created
+        if points.dtype != np.float32 or points.ndim != 2 or points.shape[1] != 6:
+            raise ValueError("viewer points must be float32 [N,6]")
+        if not np.all(np.isfinite(points)):
+            raise ValueError("viewer points must be finite")
+        if points.size and np.any((points[:, 3:] < 0.0) | (points[:, 3:] > 1.0)):
+            raise ValueError("viewer RGB values must be within [0,1]")
 
         if self._pcd is None:
             self._pcd = o3d.geometry.PointCloud()
-        self._pcd.points = o3d.utility.Vector3dVector(
-            pcd_array[:, :3].astype(np.float64)
-        )
-
-        if pcd_array.shape[1] == 6:
-            colors = pcd_array[:, 3:].astype(np.float64)
-            if colors.size and colors.max() > 1.0:
-                colors /= 255.0
-            self._pcd.colors = o3d.utility.Vector3dVector(colors)
+        self._pcd.points = o3d.utility.Vector3dVector(points[:, :3].astype(np.float64))
+        self._pcd.colors = o3d.utility.Vector3dVector(points[:, 3:].astype(np.float64))
 
         if not self._created:
             self._vis = o3d.visualization.Visualizer()
@@ -334,7 +302,6 @@ def _compute_rolling_stats(history: deque[FrameStats]) -> dict[str, float]:
 
 
 def _build_hud_lines(
-    frame: CameraFrame,
     frame_count: int,
     stats: dict[str, float],
     state: PointCloudDisplayState,
@@ -359,11 +326,11 @@ def _build_hud_lines(
         else:
             lines.append(
                 f"PCD PROCESSED  n={stats['points']:.0f}  "
-                f"vox={state.voxel_size_m:.3f} crop={state.crop_on} "
+                f"vox={production.voxel_size_m:.3f} crop=production "
                 f"freeze={state.frozen} drop={total_dropped}"
             )
     else:
-        lines.append("PCD OFF  [p]toggle [s]raw/processed [v]voxel [w]crop [f]freeze")
+        lines.append("PCD OFF  [p]toggle [s]raw/processed [f]freeze")
     lines.append(
         f"cmap={state.colormap}  depth=[{production.depth_min_m:.2f},"
         f"{production.depth_max_m:.2f}]"
@@ -380,10 +347,8 @@ def _build_key_actions(
     return {
         ord("p"): lambda: _toggle_pcd(state, viewer),
         ord("s"): lambda: _toggle_cloud_mode(state),
-        ord("v"): lambda: _cycle_voxel(state),
-        ord("w"): lambda: _toggle_crop(state),
         ord("f"): lambda: _toggle_freeze(state),
-        ord("r"): lambda: _reset_state(state, viewer, production),
+        ord("r"): lambda: _reset_state(state, viewer),
         ord("c"): lambda: _print_state(state, production),
         ord("d"): lambda: _toggle_cmap(state),
     }
@@ -400,7 +365,6 @@ def _handle_keyboard(
     if key in (ord("q"), 27):
         return False
 
-    # 'a' toggles auto_exposure_priority live (Option A test: OFF -> ~30 Hz).
     if key == ord("a"):
         _toggle_ae_priority(camera)
         return True
@@ -425,25 +389,6 @@ def _toggle_cloud_mode(state: PointCloudDisplayState) -> None:
     print(f"  Cloud mode: {state.cloud_mode.upper()}")
 
 
-def _cycle_voxel(state: PointCloudDisplayState) -> None:
-    try:
-        index = _DIAGNOSTIC_VOXEL_CYCLE_M.index(state.voxel_size_m)
-        next_index = (index + 1) % len(_DIAGNOSTIC_VOXEL_CYCLE_M)
-    except ValueError:
-        next_index = 0
-    state.voxel_size_m = _DIAGNOSTIC_VOXEL_CYCLE_M[next_index]
-    state.frozen = False
-    state.cached_cloud = None
-    print(f"  Processed voxel: {state.voxel_size_m:.3f} m")
-
-
-def _toggle_crop(state: PointCloudDisplayState) -> None:
-    state.crop_on = not state.crop_on
-    state.frozen = False
-    state.cached_cloud = None
-    print(f"  Processed table/workspace crop: {'ON' if state.crop_on else 'OFF'}")
-
-
 def _toggle_freeze(state: PointCloudDisplayState) -> None:
     if state.cached_cloud is None:
         print("  Freeze unavailable until a point-cloud frame has been built")
@@ -455,19 +400,18 @@ def _toggle_freeze(state: PointCloudDisplayState) -> None:
 def _reset_state(
     state: PointCloudDisplayState,
     viewer: NonBlockingPCDViewer,
-    production: PointCloudConfig,
 ) -> None:
-    state.reset(production)
+    state.reset()
     viewer.close()
     print("  Config reset to defaults")
 
 
 def _print_state(state: PointCloudDisplayState, production: PointCloudConfig) -> None:
-    pcd = _make_pcd_config(state, production)
     print(
-        f"  mode={state.cloud_mode}  num_points={pcd.num_points}  "
-        f"voxel={pcd.voxel_size_m}  crop={state.crop_on}  frozen={state.frozen}  "
-        f"depth=[{pcd.depth_min_m},{pcd.depth_max_m}]  workspace={pcd.workspace}  "
+        f"  mode={state.cloud_mode}  num_points={production.num_points}  "
+        f"voxel={production.voxel_size_m}  crop=production  frozen={state.frozen}  "
+        f"depth=[{production.depth_min_m},{production.depth_max_m}]  "
+        f"workspace={production.workspace}  "
         f"pcd={'ON' if state.show else 'OFF'}"
     )
 
@@ -477,22 +421,15 @@ def _toggle_cmap(state: PointCloudDisplayState) -> None:
     print(f"  Colormap: {state.colormap}")
 
 
-def _compute_base_from_depth(
-    geometry: RGBDGeometry,
-    serial: str | None,
-    calibration: CameraCalib,
+def _compute_base_from_color(
+    serial: str | None, calibration: CameraCalib
 ) -> np.ndarray:
-    """Return T_xarm_base_from_depth from calibration and live geometry.
-
-    Resolve the calibration entry by serial, then compose the static camera
-    extrinsic with the live depth->color transform. Assumes an eye-to-hand
-    camera; an eye-in-hand entry would additionally need the live EEF FK.
-    """
+    """Return T_xarm_base_from_color for aligned depth-to-color clouds."""
     if not serial:
         raise RuntimeError("connected camera did not publish a serial")
     camera_name = calibration.resolve_name_by_serial(serial)
     base_from_color = calibration.get_extrinsics(camera_name)
-    return base_from_color @ geometry.T_color_from_depth
+    return base_from_color
 
 
 def _find_color_sensor(camera: RealSense) -> Any:
@@ -533,7 +470,7 @@ def _set_ae_priority(camera: RealSense, value: float) -> float | None:
 
 
 def _toggle_ae_priority(camera: RealSense) -> None:
-    """Toggle auto_exposure_priority ON<->OFF (Option A: OFF keeps ~30 Hz)."""
+    """Toggle auto_exposure_priority; OFF keeps the color stream near 30 Hz."""
     current = _get_ae_priority(camera)
     if current is None:
         print("  auto_exposure_priority: not supported/readable on this color sensor")
@@ -543,7 +480,7 @@ def _toggle_ae_priority(camera: RealSense) -> None:
     if readback is None:
         print("  auto_exposure_priority: set failed (unsupported)")
         return
-    label = "OFF (keep ~30 Hz)" if target == 0.0 else "ON (default)"
+    label = "OFF (keep ~30 Hz)" if target == 0.0 else "ON (may reduce FPS)"
     print(f"  auto_exposure_priority: {current:g} -> {readback:g}  [{label}]")
 
 
@@ -558,26 +495,23 @@ def _run_rgbd_test(
     """Run interactive RGB-D live capture + point cloud visualization."""
     print("\n-- 2. RGB-D live capture + point cloud --")
     print(
-        "   q/Esc=quit  p=pcd  s=raw/processed  v=voxel  w=crop  f=freeze "
+        "   q/Esc=quit  p=pcd  s=raw/processed  f=freeze "
         "r=reset  c=config  d=colormap  a=AE-priority"
     )
 
-    state = PointCloudDisplayState(voxel_size_m=production.voxel_size_m)
+    state = PointCloudDisplayState()
     viewer = NonBlockingPCDViewer(point_size=3.0)
     stats_history: deque[FrameStats] = deque(maxlen=test_cfg.stats_window)
     frame_count = 0
     total_dropped = 0
 
-    geometry = camera.get_geometry()
+    geometry = camera.get_geometry().aligned_depth_to_color()
     depth_scale_m = camera.get_depth_scale()
-    base_from_depth = _compute_base_from_depth(
-        geometry, camera.active_serial, calibration
-    )
-    pcd_config = _make_pcd_config(state, production)
+    base_from_color = _compute_base_from_color(camera.active_serial, calibration)
     print(
-        f"  Start: num_points={pcd_config.num_points}  "
-        f"depth=[{pcd_config.depth_min_m}, {pcd_config.depth_max_m}]  "
-        f"voxel={pcd_config.voxel_size_m}  workspace={pcd_config.workspace}"
+        f"  Start: num_points={production.num_points}  "
+        f"depth=[{production.depth_min_m}, {production.depth_max_m}]  "
+        f"voxel={production.voxel_size_m}  workspace={production.workspace}"
     )
 
     while True:
@@ -592,8 +526,16 @@ def _run_rgbd_test(
         read_ms = (time.perf_counter() - t0) * 1000.0
         frame_count += 1
         frame_rgb = frame.rgb
-        if frame_rgb is None:
-            print("  RGB frame unavailable; stopping diagnostic")
+        aligned_depth_raw = frame.depth_aligned_to_color_raw
+        aligned_depth_m = frame.depth_aligned_to_color
+        if frame_rgb is None or aligned_depth_raw is None or aligned_depth_m is None:
+            print("  aligned RGB-D frame unavailable; stopping diagnostic")
+            break
+        if (
+            frame_rgb.shape[:2] != aligned_depth_raw.shape
+            or aligned_depth_raw.shape != aligned_depth_m.shape
+        ):
+            print("  aligned RGB-D dimensions do not match; stopping diagnostic")
             break
 
         pcd_ms = 0.0
@@ -606,23 +548,22 @@ def _run_rgbd_test(
                     pcd_array = state.cached_cloud
                 elif state.cloud_mode == "raw":
                     pcd_array = build_raw_point_cloud(
-                        depth_raw=frame.depth_raw,
+                        depth_raw=aligned_depth_raw,
                         color=frame_rgb,
                         depth_scale_m=depth_scale_m,
                         geometry=geometry,
-                        T_xarm_base_from_depth=base_from_depth,
+                        T_xarm_base_from_color=base_from_color,
                     )
                     state.cached_cloud = pcd_array
                 else:
-                    pcd_config = _make_pcd_config(state, production)
                     pcd_array = build_point_cloud(
-                        depth_raw=frame.depth_raw,
+                        depth_raw=aligned_depth_raw,
                         color=frame_rgb,
                         depth_scale_m=depth_scale_m,
                         geometry=geometry,
-                        T_xarm_base_from_depth=base_from_depth,
-                        table_plane_abcd=(table_plane_abcd if state.crop_on else None),
-                        config=pcd_config,
+                        T_xarm_base_from_color=base_from_color,
+                        table_plane_abcd=table_plane_abcd,
+                        config=production,
                     )
                     state.cached_cloud = pcd_array
                 point_count = pcd_array.shape[0] if pcd_array is not None else 0
@@ -634,20 +575,24 @@ def _run_rgbd_test(
 
         if state.colormap == "jet":
             depth_vis = _make_jet_depth_vis(
-                frame.depth, production.depth_min_m, production.depth_max_m
+                aligned_depth_m,
+                production.depth_min_m,
+                production.depth_max_m,
             )
         else:
             depth_vis = _make_gray_depth_vis(
-                frame.depth, production.depth_min_m, production.depth_max_m
+                aligned_depth_m,
+                production.depth_min_m,
+                production.depth_max_m,
             )
 
         valid_ratio = _depth_valid_ratio(
-            frame.depth, production.depth_min_m, production.depth_max_m
+            aligned_depth_m,
+            production.depth_min_m,
+            production.depth_max_m,
         )
 
         color_bgr = np.ascontiguousarray(frame_rgb[..., ::-1])
-        if color_bgr.shape[:2] != depth_vis.shape[:2]:
-            depth_vis = cv2.resize(depth_vis, (color_bgr.shape[1], color_bgr.shape[0]))
         panel = np.concatenate([color_bgr, depth_vis], axis=1)
 
         total_ms = (time.perf_counter() - loop_start) * 1000.0
@@ -663,7 +608,7 @@ def _run_rgbd_test(
 
         stats = _compute_rolling_stats(stats_history)
         lines = _build_hud_lines(
-            frame, frame_count, stats, state, total_dropped, geometry, production
+            frame_count, stats, state, total_dropped, geometry, production
         )
         _overlay_text(panel, lines)
         cv2.imshow(_WINDOW_NAME, panel)

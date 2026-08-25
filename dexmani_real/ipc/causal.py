@@ -142,7 +142,7 @@ def read_hand_tactile_causal(
 def read_camera_frame_causal(
     shared: RuntimeChannels, *, anchor_monotonic_ns: int | None = None
 ) -> dict | None:
-    """Read the latest or newest causal camera frame. Returns None on failure."""
+    """Read the latest or newest causal aligned RGB-D frame."""
     try:
         if anchor_monotonic_ns is None:
             result = shared.camera_ring.read_latest()

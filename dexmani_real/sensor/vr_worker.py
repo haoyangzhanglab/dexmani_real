@@ -104,8 +104,8 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
     _latest_head_sequence_id = 0
     _latest_head_recv_ts_ns = 0
 
-    # vr_ready is deferred to the first event (HeadFrame or HandFrame).
-    # Mark VR ready only after tracking data flows, not on TCP connection alone.
+    # vr_ready guarantees that the ring already contains one validated
+    # right-hand frame; consumers may read it immediately after readiness.
 
     dtype = vr_frame_dtype()
 
@@ -116,11 +116,6 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
         # Heartbeat on every event — proves VR process is alive + receiving data.
         # Written *before* vr_ready so the supervisor sees a fresh heartbeat
         shared.set_heartbeat("vr", time.monotonic())
-
-        if not shared.is_ready("vr"):
-            shared.set_ready("vr")
-            logger.debug("vr_loop: READY")
-            logger.info("vr_loop: ready (first event received)")
 
         if isinstance(event, HeadFrame):
             try:
@@ -176,6 +171,10 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
             frame["side"][0] = np.int32(0 if "right" in _side_str else -1)
 
             shared.vr_ring.write(frame)
+            if not shared.is_ready("vr"):
+                shared.set_ready("vr")
+                logger.debug("vr_loop: READY")
+                logger.info("vr_loop: ready (first valid right-hand frame received)")
 
         except (ValueError, TypeError, AttributeError):
             logger.warning("vr_loop: frame conversion error", exc_info=True)

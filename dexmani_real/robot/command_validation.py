@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
+from dexmani_real.config.defaults import hand as hand_defaults
 from dexmani_real.ipc.schema import ARM_COMMAND_DTYPE, HAND_COMMAND_DTYPE
+from dexmani_real.utils.limits import validate_hand_command_bounds
 
 
 def _hand_command_is_current(
@@ -68,21 +70,36 @@ def worker_validate_arm(
 def worker_validate_hand(
     command: np.ndarray,
     *,
+    operational_lower_rad: np.ndarray,
+    operational_upper_rad: np.ndarray,
+    mechanical_lower_rad: np.ndarray,
+    mechanical_upper_rad: np.ndarray,
     expected_run_generation: int | None = None,
     now_monotonic_ns: int | None = None,
 ) -> bool:
-    """Validate hand shape, finiteness, generation, and expiry at the worker."""
+    """Validate hand target, generation, and expiry at the worker boundary."""
     well_formed = (
         isinstance(command, np.ndarray)
         and command.shape == (1,)
         and command.dtype == HAND_COMMAND_DTYPE
         and np.all(np.isfinite(command["qpos_cmd"][0]))
     )
-    return bool(
-        well_formed
-        and _hand_command_is_current(
-            command,
-            expected_run_generation=expected_run_generation,
-            now_monotonic_ns=now_monotonic_ns,
+    if not well_formed or not _hand_command_is_current(
+        command,
+        expected_run_generation=expected_run_generation,
+        now_monotonic_ns=now_monotonic_ns,
+    ):
+        return False
+    try:
+        validate_hand_command_bounds(
+            command["qpos_cmd"][0],
+            operational_lower_rad,
+            operational_upper_rad,
+            mechanical_lower_rad,
+            mechanical_upper_rad,
+            hand_defaults.mechanical_qpos_min_rad,
+            hand_defaults.mechanical_qpos_max_rad,
         )
-    )
+    except (TypeError, ValueError):
+        return False
+    return True

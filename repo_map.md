@@ -28,6 +28,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `code_style.md` | 本研究代码库的具体编码与审查约定。 |
 | `README.md` | 面向使用者的能力、架构、环境与工作流。 |
 | `repo_map.md` | 当前文件与 owner 索引。 |
+| `docs/pointcloud_pipeline.md` | depth-to-color aligned 点云的采集、处理、时序与持久化契约。 |
 | `user_design.md` | 已确认的机器人行为与安全取舍。 |
 | `.gitignore` | 生成物、本地环境、数据集与运行输出排除规则。 |
 | `pyproject.toml` | 包元数据、依赖、package data 与工具配置。 |
@@ -94,8 +95,8 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `clock_sync.py` | device clock 到 host monotonic 的保守映射。 |
 | `realsense.py` | RealSense driver、native frame ownership copy 与设备配置。 |
 | `camera_worker.py` | RealSense lifecycle、时序/健康信息与 camera ring 发布。 |
-| `pointcloud.py` | SDK-free native RGB-D 到 xArm-base 点云算法。 |
-| `pointcloud_worker.py` | latest-only 固定 `float32[N,6]` point-cloud publisher。 |
+| `pointcloud.py` | SDK-free depth-to-color aligned RGB-D 到 xArm-base 点云算法、桌面预裁减与体素 RGB 聚合。 |
+| `pointcloud_worker.py` | latest-only 固定 `float32[N,6]` aligned point-cloud publisher。 |
 | `vr_worker.py` | crash-isolated Quest/HTS receiver 与 VR ring publisher。 |
 
 ### `calibration/`
@@ -189,7 +190,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `quality.py` | 停滞、抖动、突变等 temporal quality 纯函数审计。 |
 | `clean.py` | raw flags、limits、annotations 与质量结果到保留/拒绝决定。 |
 | `transforms.py` | RGB/depth/intrinsics 的确定性数值变换。 |
-| `process.py` | raw v21 到 processed HDF5 v5 的事务式管线。 |
+| `process.py` | aligned raw v22 到 processed HDF5 v7 的事务式管线。 |
 | `export.py` | processed HDF5 到 Policy Zarr v3 的事务式导出。 |
 
 ### `deployment/`
@@ -251,7 +252,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `calibrate_camera.py` | xArm+RealSense hand-eye 标定入口。 |
 | `calibrate_vr_heading.py` | VR heading 采集、质量门禁与 transform 发布。 |
 | `realsense_record_example.py` | RealSense RGB-D/point-cloud 交互诊断。 |
-| `pointcloud_process_example.py` | L515 桌面点云诊断与显式确认后的 plane 发布。 |
+| `pointcloud_process_example.py` | L515 点云处理分段/端到端时延诊断，以及按需桌面标定与显式 plane 发布。 |
 | `xhand_control_example.py` | 使用 canonical hand 限位的 XHand 独立硬件诊断。 |
 
 ## 5. 离线验证与架构门禁
@@ -261,7 +262,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `tools/check_architecture.py` | AST-only package cycle、forbidden edge、private import、defaults 与 heavy-init 门禁。 |
 | `tests/architecture/` | 架构指标 ratchet 与主要运行入口/公开 API import smoke test。 |
 | `tests/config/` | immutable runtime/calibration snapshot、spawn pickle 只读性与配置传播。 |
-| `tests/control/` | fail-closed feedback health/publication。 |
+| `tests/control/` | fail-closed feedback health/publication，以及 hand-home recovery 与精确目标 ACK 合同。 |
 | `tests/examples/` | 可执行入口的离线生命周期与非关键反馈降级测试。 |
 | `tests/ipc/` | ABI manifest、ring exact dtype/shape 与重复共享内存名称的 fail-closed 门禁。 |
 | `tests/planning/` | collision/SRDF fail-closed 行为。 |

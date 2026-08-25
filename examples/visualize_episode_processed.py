@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/visualize_episode_processed.py PROCESSED.h5 [--info] [--max-frames N]``.
 
-Self-contained Rerun-based visualizer for processed HDF5 v5
+Self-contained Rerun-based visualizer for processed HDF5 v7
 (``dexmani-real-processed-hdf5``) artifacts written by
 ``examples/process_episodes.py``.  Offline only: connects to no hardware, writes
 no files; opens a Rerun viewer window (or prints a structure summary with
@@ -65,7 +65,7 @@ _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
 
 _FINGER_NAMES: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
 
-# Processed core modalities are fixed by the v5 contract: joint_state/action are
+# Processed core modalities are fixed by the v7 contract: joint_state/action are
 # arm (7) + hand (12), action_ee is eef_position (3) + eef_rot6d (6) + hand (12),
 # and contact_force is one native-axis 3-vector per finger.
 _ARM_JOINT_LABELS = tuple(f"arm_j{i}" for i in range(7))
@@ -264,7 +264,7 @@ def print_episode_info(h5_path: str) -> None:
 
 
 class ProcessedEpisodeVisualizer:
-    """Load a processed HDF5 v5 file and stream it into Rerun for interactive viewing."""
+    """Load a processed HDF5 v7 file and stream it into Rerun for interactive viewing."""
 
     def __init__(
         self,
@@ -281,7 +281,7 @@ class ProcessedEpisodeVisualizer:
                 != PROCESSED_SCHEMA_VERSION
             ):
                 raise ValueError(
-                    f"{self._h5_path.name} is not a processed HDF5 v5 artifact"
+                    f"{self._h5_path.name} is not a processed HDF5 v7 artifact"
                 )
             self._keys = _present_keys(self._h5f)
             if "joint_state" not in self._keys and "action" not in self._keys:
@@ -390,7 +390,7 @@ class ProcessedEpisodeVisualizer:
         if "rgb" in self._keys:
             cam_views.append(rrb.Spatial2DView(origin="camera/color/rgb", name="RGB"))
         if "depth" in self._keys and self._depth_meter is not None:
-            # Native depth is intentionally not registered to the color pinhole.
+            # Processed depth is aligned to the color pinhole.
             cam_views.append(rrb.Spatial2DView(origin="depth/image", name="Depth"))
         if cam_views:
             columns.append(rrb.Vertical(contents=cam_views, name="Camera"))
@@ -473,8 +473,8 @@ class ProcessedEpisodeVisualizer:
                 ),
             )
         if "camera_extrinsic" in self._keys:
-            # T_xarm_base_from_color maps native color optical coordinates into
-            # xArm base. Native depth remains a separate 2D image here.
+            # T_xarm_base_from_color maps aligned color/depth optical coordinates
+            # into xArm base.
             transform = np.asarray(self._h5f["camera_extrinsic"][step_idx], dtype=float)
             rr.log(
                 "camera/color",
@@ -536,7 +536,7 @@ class ProcessedEpisodeVisualizer:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Visualize processed DexMani HDF5 v5 episodes with Rerun 3D."
+        description="Visualize processed DexMani HDF5 v7 episodes with Rerun 3D."
     )
     parser.add_argument(
         "episode",

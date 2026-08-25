@@ -1,4 +1,4 @@
-"""Shared memory ring buffer for large camera frames (RGB + depth).
+"""Shared memory ring buffer for RGB plus depth-to-color aligned Z16 frames.
 
 ``CameraRingBuffer`` uses a variable-size slot layout (header + RGB + depth)
 rather than the fixed-dtype layout of
@@ -35,7 +35,7 @@ class CameraRingBuffer:
     frames contain variable-size RGB and depth arrays. Each slot stores:
       - Header: CAMERA_FRAME_HEADER_DTYPE (metadata)
       - RGB raw bytes
-      - Depth raw bytes
+      - Depth-to-color aligned Z16 bytes
 
     Layout of shared memory:
         [0:8)     write_idx  (uint64, atomic)

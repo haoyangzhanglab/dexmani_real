@@ -47,6 +47,11 @@ def limit_hand_delta(
     )
     if not np.all(np.isfinite(max_delta)) or np.any(max_delta <= 0.0):
         raise ValueError("hand max_delta_rad_per_tick must be finite and positive")
+    if np.all(np.abs(target - measured) <= max_delta):
+        # Preserve the original endpoint bit-for-bit once it is reachable in
+        # one tick.  ``measured + (target - measured)`` can differ by one ULP,
+        # which would otherwise prevent exact-target acknowledgement forever.
+        return target.copy()
     return measured + np.clip(target - measured, -max_delta, max_delta)
 
 
@@ -119,8 +124,7 @@ def _publish_feedback(
     tactile_calibrated: bool,
     connected: bool,
     read_failed: bool,
-    last_cmd_seq: int,
-    last_cmd_qpos: np.ndarray,
+    accepted_target_action_id: int,
     commboard_err: np.ndarray,
     jointboard_err: np.ndarray,
     tipboard_err: np.ndarray,
@@ -138,8 +142,7 @@ def _publish_feedback(
     frame["tactile_contact"][0] = tactile_contact
     frame["connected"][0] = int(connected)
     frame["qpos_stale"][0] = int(read_failed)
-    frame["last_cmd_seq"][0] = int(last_cmd_seq)
-    frame["last_cmd_qpos"][0] = last_cmd_qpos
+    frame["accepted_target_action_id"][0] = int(accepted_target_action_id)
     frame["commboard_err"][0] = commboard_err
     frame["jointboard_err"][0] = jointboard_err
     frame["tipboard_err"][0] = tipboard_err
@@ -156,17 +159,6 @@ def _publish_feedback(
             calibrated=tactile_calibrated,
         )
     )
-
-
-def _last_command_qpos(hand: Any, fallback_qpos: np.ndarray) -> np.ndarray:
-    """Return the last SDK-accepted endpoint or a safe startup fallback."""
-    last = getattr(hand, "last_qpos_cmd", None)
-    if last is None:
-        return np.asarray(fallback_qpos, dtype=np.float64).copy()
-    value = np.asarray(last, dtype=np.float64)
-    if value.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(value)):
-        return np.asarray(fallback_qpos, dtype=np.float64).copy()
-    return value.copy()
 
 
 def hand_loop(shared: Any, config: HandParams) -> None:
@@ -209,7 +201,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
 
         last_state = initial_state
         last_source_ns = time.monotonic_ns()
-        last_applied_action_id = 0
+        accepted_target_action_id = 0
         _publish_feedback(
             shared,
             qpos=initial_state.qpos,
@@ -222,8 +214,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
             tactile_calibrated=hand.tactile_calibrated,
             connected=True,
             read_failed=False,
-            last_cmd_seq=last_applied_action_id,
-            last_cmd_qpos=_last_command_qpos(hand, initial_state.qpos),
+            accepted_target_action_id=accepted_target_action_id,
             commboard_err=initial_state.commboard_err,
             jointboard_err=initial_state.jointboard_err,
             tipboard_err=initial_state.tipboard_err,
@@ -240,6 +231,10 @@ def hand_loop(shared: Any, config: HandParams) -> None:
         logger.info("hand_loop: ready")
 
         rate_mgr = LoopRate(config.loop_hz, label="hand")
+        operational_lower = np.asarray(config.qpos_min_rad, dtype=np.float64)
+        operational_upper = np.asarray(config.qpos_max_rad, dtype=np.float64)
+        mechanical_lower = np.asarray(config.mechanical_qpos_min_rad, dtype=np.float64)
+        mechanical_upper = np.asarray(config.mechanical_qpos_max_rad, dtype=np.float64)
         last_consumed_ring_sequence = 0
         latest_command: np.ndarray | None = None
         latest_action_id = 0
@@ -263,8 +258,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                     tactile_calibrated=hand.tactile_calibrated,
                     connected=hand.is_connected,
                     read_failed=True,
-                    last_cmd_seq=last_applied_action_id,
-                    last_cmd_qpos=_last_command_qpos(hand, last_state.qpos),
+                    accepted_target_action_id=accepted_target_action_id,
                     commboard_err=last_state.commboard_err,
                     jointboard_err=last_state.jointboard_err,
                     tipboard_err=last_state.tipboard_err,
@@ -295,8 +289,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                 tactile_calibrated=hand.tactile_calibrated,
                 connected=hand.is_connected,
                 read_failed=False,
-                last_cmd_seq=last_applied_action_id,
-                last_cmd_qpos=_last_command_qpos(hand, state.qpos),
+                accepted_target_action_id=accepted_target_action_id,
                 commboard_err=state.commboard_err,
                 jointboard_err=state.jointboard_err,
                 tipboard_err=state.tipboard_err,
@@ -323,6 +316,10 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                     last_consumed_ring_sequence = sequence_int
                     if worker_validate_hand(
                         command,
+                        operational_lower_rad=operational_lower,
+                        operational_upper_rad=operational_upper,
+                        mechanical_lower_rad=mechanical_lower,
+                        mechanical_upper_rad=mechanical_upper,
                         expected_run_generation=int(shared.run_generation.value),
                         now_monotonic_ns=time.monotonic_ns(),
                     ):
@@ -337,6 +334,10 @@ def hand_loop(shared: Any, config: HandParams) -> None:
 
             if latest_command is not None and not worker_validate_hand(
                 latest_command,
+                operational_lower_rad=operational_lower,
+                operational_upper_rad=operational_upper,
+                mechanical_lower_rad=mechanical_lower,
+                mechanical_upper_rad=mechanical_upper,
                 expected_run_generation=int(shared.run_generation.value),
                 now_monotonic_ns=time.monotonic_ns(),
             ):
@@ -350,12 +351,20 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                     state.qpos,
                     config.hand_max_delta_rad_per_tick,
                 )
+                if np.any(bounded < mechanical_lower - 1e-12) or np.any(
+                    bounded > mechanical_upper + 1e-12
+                ):
+                    logger.error(
+                        "hand_loop: measured-state-bounded action_id=%d violates mechanical limits",
+                        latest_action_id,
+                    )
+                    shared.error_state.value = True
+                    return
                 if hand.send_action(bounded):
-                    actual = _last_command_qpos(hand, state.qpos)
-                    # ACK denotes acceptance of the original endpoint, not an
-                    # intermediate max-delta step. Home/replay rely on this.
-                    if np.array_equal(actual, target):
-                        last_applied_action_id = latest_action_id
+                    # ACK denotes SDK acceptance of the exact original endpoint,
+                    # not physical convergence or acceptance of an intermediate step.
+                    if np.array_equal(bounded, target):
+                        accepted_target_action_id = latest_action_id
                 else:
                     logger.error(
                         "hand_loop: SDK rejected action_id=%d; latching runtime fault",

@@ -1,4 +1,4 @@
-"""Pure native RGB-D to xArm-base point-cloud construction.
+"""Pure depth-to-color aligned RGB-D to xArm-base point-cloud construction.
 
 The module owns only deterministic numerical geometry.  It does not import a
 camera SDK, Open3D, shared memory, calibration files, or recording code.
@@ -6,26 +6,34 @@ camera SDK, Open3D, shared memory, calibration files, or recording code.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import Any
 
 import numpy as np
-from scipy.ndimage import (  # type: ignore[import-untyped]
-    convolve,
-    maximum_filter,
-    minimum_filter,
+from scipy.ndimage import convolve
+from scipy.ndimage import (
+    label as label_connected_components,  # type: ignore[import-untyped]
 )
+from scipy.ndimage import maximum_filter, minimum_filter
+from scipy.sparse import coo_matrix  # type: ignore[import-untyped]
+from scipy.sparse.csgraph import connected_components  # type: ignore[import-untyped]
 from scipy.spatial import cKDTree  # type: ignore[import-untyped]
 
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.sensor.camera_geometry import CameraIntrinsics, RGBDGeometry
 
-POINT_CLOUD_POLICY_ID = "native_support_mean_voxel_radius_v1"
-POINT_CLOUD_COLOR_SOURCE = "native_color_projection"
+_EIGHT_CONNECTED_STRUCTURE = np.ones((3, 3), dtype=np.uint8)
+
+POINT_CLOUD_POLICY_ID = "depth_to_color_orthogonal_edge_table_voxel_radius_graph_v8"
+POINT_CLOUD_COLOR_SOURCE = "mean_rgb_of_aligned_depth_pixels_per_voxel"
 POINT_CLOUD_SAMPLING = "deterministic_spatial_hash_or_cyclic_pad"
 POINT_CLOUD_TRANSFORM = (
-    "depth_gate_and_local_support;native_depth_deprojection;"
-    "table_plane_crop_in_depth_frame;xarm_base_transform;workspace_crop;"
-    "mean_voxel;spatial_candidate_cap;radius_outlier;color_projection_and_visibility;"
+    "depth_gate_and_cardinal_edge_support;depth_to_color_deprojection;"
+    "table_plane_height_hysteresis_crop_in_color_frame_before_deprojection;"
+    "xarm_base_transform;workspace_crop;mean_voxel_xyz_and_rgb;"
+    "single_radius_graph_density_and_component_outlier;spatial_candidate_cap;"
     "spatial_hash_or_cyclic_pad"
 )
 
@@ -34,36 +42,52 @@ __all__ = [
     "POINT_CLOUD_POLICY_ID",
     "POINT_CLOUD_SAMPLING",
     "POINT_CLOUD_TRANSFORM",
+    "PointCloudBuildTimings",
     "PointCloudBuildStats",
     "PointCloudConfig",
     "build_raw_point_cloud",
     "build_point_cloud",
     "build_point_cloud_with_stats",
-    "depth_points_in_base",
+    "aligned_depth_points_in_base",
 ]
 
 
 @dataclass(frozen=True)
+class PointCloudBuildTimings:
+    """Per-frame elapsed times for the deterministic production stages."""
+
+    depth_filter_ms: float = 0.0
+    table_crop_ms: float = 0.0
+    deprojection_ms: float = 0.0
+    base_workspace_ms: float = 0.0
+    voxelization_ms: float = 0.0
+    spatial_outlier_filter_ms: float = 0.0
+    color_sampling_ms: float = 0.0
+    total_ms: float = 0.0
+
+
+@dataclass(frozen=True)
 class PointCloudBuildStats:
-    """Cheap stage counts for diagnostics without copying intermediate clouds."""
+    """Stage counts and elapsed times without retaining intermediate clouds."""
 
     depth_valid_points: int = 0
     depth_trusted_points: int = 0
+    table_rejected_points: int = 0
+    workspace_rejected_points: int = 0
     cropped_points: int = 0
     voxel_points: int = 0
-    outlier_candidate_points: int = 0
-    outlier_inlier_points: int = 0
-    color_visible_points: int = 0
-    unique_output_points: int = 0
-    padded_output_points: int = 0
+    radius_density_points: int = 0
+    spatial_inlier_points: int = 0
+    candidate_points: int = 0
     failure_stage: str | None = None
+    timings: PointCloudBuildTimings = field(default_factory=PointCloudBuildTimings)
 
 
 def _depth_valid_mask(
     depth_raw: np.ndarray, *, depth_scale_m: float, config: PointCloudConfig
 ) -> tuple[np.ndarray, np.ndarray]:
     if depth_raw.ndim != 2 or depth_raw.dtype != np.uint16:
-        raise ValueError("depth_raw must be a native uint16 [H,W] frame")
+        raise ValueError("depth_raw must be a uint16 [H,W] frame")
     if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
         raise ValueError("depth_scale_m must be finite and positive")
     depth_m = depth_raw.astype(np.float32) * np.float32(depth_scale_m)
@@ -82,7 +106,7 @@ def _validate_color(color: np.ndarray, geometry: RGBDGeometry) -> None:
         geometry.color.width,
         3,
     ):
-        raise ValueError("color must be native uint8 [H,W,3] matching color intrinsics")
+        raise ValueError("color must be uint8 [H,W,3] matching color intrinsics")
 
 
 def _reject_flying_depth(
@@ -104,20 +128,24 @@ def _reject_flying_depth(
         valid.astype(np.uint8), np.ones((3, 3), dtype=np.uint8), mode="constant"
     )
     endpoint_distance = np.minimum(depth_m - local_min, local_max - depth_m)
-    flying = (
+    depth_discontinuity = (
         valid
         & (local_valid_count >= 3)
         & ((local_max - local_min) > config.edge_jump_m)
-        & (endpoint_distance > config.edge_surface_band_m)
     )
+    flying = depth_discontinuity & (endpoint_distance > config.edge_surface_band_m)
     trusted = valid & ~flying
-    if config.depth_support_min_neighbors == 0:
+    if (
+        config.depth_support_min_neighbors == 0
+        and config.edge_support_min_neighbors == 0
+    ):
         return trusted
 
     padded_depth = np.pad(depth_m, 1, mode="constant", constant_values=np.nan)
     padded_valid = np.pad(trusted, 1, mode="constant", constant_values=False)
     height, width = depth_m.shape
     support_count = np.zeros(depth_m.shape, dtype=np.uint8)
+    cardinally_supported = np.ones(depth_m.shape, dtype=bool)
     for row_offset in range(3):
         for column_offset in range(3):
             if row_offset == 1 and column_offset == 1:
@@ -130,10 +158,75 @@ def _reject_flying_depth(
                 row_offset : row_offset + height,
                 column_offset : column_offset + width,
             ]
-            support_count += neighbor_valid & (
+            same_surface = neighbor_valid & (
                 np.abs(neighbor_depth - depth_m) <= config.edge_surface_band_m
             )
-    return trusted & (support_count >= config.depth_support_min_neighbors)
+            support_count += same_surface
+            if (row_offset == 1) != (column_offset == 1):
+                cardinally_supported &= same_surface
+    required_support = np.where(
+        depth_discontinuity,
+        config.edge_support_min_neighbors,
+        config.depth_support_min_neighbors,
+    )
+    # Erode only the unreliable one-pixel layer at a depth discontinuity.
+    # Resolved objects keep their non-discontinuity interiors; one- and
+    # two-pixel structures at an edge are intentionally treated as unreliable.
+    return (
+        trusted
+        & (support_count >= required_support)
+        & (~depth_discontinuity | cardinally_supported)
+    )
+
+
+def _undistorted_depth_coordinates(
+    rows: np.ndarray,
+    columns: np.ndarray,
+    intrinsics: CameraIntrinsics,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return normalized camera rays for color-grid depth pixels."""
+    xd = (columns.astype(np.float32) - np.float32(intrinsics.ppx)) / np.float32(
+        intrinsics.fx
+    )
+    yd = (rows.astype(np.float32) - np.float32(intrinsics.ppy)) / np.float32(
+        intrinsics.fy
+    )
+    if intrinsics.distortion_model in {"distortion.none", "none"}:
+        x, y = xd, yd
+    elif intrinsics.distortion_model in {"distortion.brown_conrady", "brown_conrady"}:
+        # Invert the Brown-Conrady projection with the same fixed-point scheme
+        # used by librealsense for deprojection.
+        k1, k2, p1, p2, k3 = (
+            np.float32(value) for value in intrinsics.distortion_coeffs
+        )
+        x, y = xd.copy(), yd.copy()
+        for _ in range(10):
+            r2 = x * x + y * y
+            radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
+            delta_x = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+            delta_y = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+            x = (xd - delta_x) / radial
+            y = (yd - delta_y) / radial
+    else:
+        raise ValueError(
+            "depth deprojection has no validated path for distortion model "
+            f"{intrinsics.distortion_model!r}"
+        )
+    return x, y
+
+
+@lru_cache(maxsize=4)
+def _depth_rays(intrinsics: CameraIntrinsics) -> np.ndarray:
+    """Cache one deprojection ray per static aligned depth pixel."""
+    rows, columns = np.indices((intrinsics.height, intrinsics.width), dtype=np.int64)
+    x, y = _undistorted_depth_coordinates(
+        rows.reshape(-1), columns.reshape(-1), intrinsics
+    )
+    rays = np.column_stack((x, y, np.ones(x.size, dtype=np.float32))).reshape(
+        intrinsics.height, intrinsics.width, 3
+    )
+    rays.setflags(write=False)
+    return rays
 
 
 def _deproject_depth(
@@ -141,12 +234,7 @@ def _deproject_depth(
     valid: np.ndarray,
     intrinsics: CameraIntrinsics,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Vectorized deprojection for the measured L515 native depth NONE model."""
-    if intrinsics.distortion_model not in {"distortion.none", "none"}:
-        raise ValueError(
-            "native depth deprojection only supports the measured NONE distortion "
-            f"model, got {intrinsics.distortion_model!r}"
-        )
+    """Vectorized deprojection for depth-to-color aligned depth."""
     if (
         depth_m.shape != (intrinsics.height, intrinsics.width)
         or valid.shape != depth_m.shape
@@ -154,16 +242,9 @@ def _deproject_depth(
         raise ValueError("depth frame shape does not match depth intrinsics")
     rows, columns = np.nonzero(valid)
     z = depth_m[rows, columns]
-    x = (
-        (columns.astype(np.float32) - np.float32(intrinsics.ppx))
-        * z
-        / np.float32(intrinsics.fx)
-    )
-    y = (
-        (rows.astype(np.float32) - np.float32(intrinsics.ppy))
-        * z
-        / np.float32(intrinsics.fy)
-    )
+    x, y = _undistorted_depth_coordinates(rows, columns, intrinsics)
+    x *= z
+    y *= z
     return np.column_stack((x, y, z)).astype(np.float32), rows, columns
 
 
@@ -188,21 +269,75 @@ def _transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return (points @ matrix[:3, :3].T + matrix[:3, 3]).astype(np.float32)
 
 
-def _table_keep_mask(
-    points_depth: np.ndarray,
+def _table_height_hysteresis_keep_mask(
+    valid: np.ndarray,
     *,
-    depth_rows: np.ndarray,
-    depth_columns: np.ndarray,
-    depth_shape: tuple[int, int],
-    T_xarm_base_from_depth: np.ndarray,
-    table_plane_abcd: tuple[float, float, float, float] | None,
-    table_clearance_m: float,
-    table_support_min_pixels: int,
+    rows: np.ndarray,
+    columns: np.ndarray,
+    signed_height_m: np.ndarray,
+    core_height_m: float,
+    object_seed_height_m: float,
+    object_seed_min_pixels: int,
 ) -> np.ndarray:
-    if not np.isfinite(table_clearance_m):
-        raise ValueError("table_clearance_m must be finite")
+    """Preserve low object surfaces only when connected to reliable high seeds."""
+    if valid.ndim != 2 or valid.dtype != np.bool_:
+        raise ValueError("valid must be a boolean [H,W] mask")
+    if rows.shape != columns.shape or rows.shape != signed_height_m.shape:
+        raise ValueError("rows, columns, and signed heights must have equal shape")
+
+    # The >core mask is normally sparse over a tabletop. One 8-connected label
+    # pass is linear in image size and avoids iterative morphology. Requiring
+    # several high seed pixels prevents an isolated depth spike from preserving
+    # an otherwise table-like residual component.
+    above_core = signed_height_m > core_height_m
+    above_core_image = np.zeros(valid.shape, dtype=bool)
+    above_core_image[rows[above_core], columns[above_core]] = True
+    component_labels, component_count = label_connected_components(
+        above_core_image,
+        structure=_EIGHT_CONNECTED_STRUCTURE,
+    )
+    if component_count == 0:
+        return np.zeros(valid.shape, dtype=bool)
+
+    object_seeds = signed_height_m >= object_seed_height_m
+    valid_labels = component_labels[rows, columns]
+    seed_labels = valid_labels[object_seeds]
+    seed_counts = np.bincount(seed_labels, minlength=component_count + 1)
+    keep_component = seed_counts >= object_seed_min_pixels
+    keep_component[0] = False
+
+    keep = np.zeros(valid.shape, dtype=bool)
+    keep[rows, columns] = keep_component[valid_labels]
+    return keep
+
+
+def _table_keep_mask(
+    depth_m: np.ndarray,
+    valid: np.ndarray,
+    *,
+    intrinsics: CameraIntrinsics,
+    T_xarm_base_from_color: np.ndarray,
+    table_plane_abcd: tuple[float, float, float, float] | None,
+    table_core_height_m: float,
+    table_object_seed_height_m: float,
+    table_object_seed_min_pixels: int,
+) -> np.ndarray:
+    """Keep non-table valid pixels before allocating 3-D point arrays."""
+    if (
+        depth_m.shape != (intrinsics.height, intrinsics.width)
+        or valid.shape != depth_m.shape
+    ):
+        raise ValueError("depth and valid mask must match depth intrinsics")
+    if not np.isfinite(table_core_height_m) or not np.isfinite(
+        table_object_seed_height_m
+    ):
+        raise ValueError("table crop heights must be finite")
+    if table_core_height_m < 0.0 or table_object_seed_height_m <= table_core_height_m:
+        raise ValueError("table crop heights must satisfy 0 <= core < object seed")
+    if table_object_seed_min_pixels < 1:
+        raise ValueError("table_object_seed_min_pixels must be positive")
     if table_plane_abcd is None:
-        return np.ones(points_depth.shape[0], dtype=bool)
+        return valid.copy()
     plane = np.asarray(table_plane_abcd, dtype=np.float64)
     if plane.shape != (4,) or not np.all(np.isfinite(plane)):
         raise ValueError("table_plane_abcd must contain four finite values")
@@ -211,25 +346,22 @@ def _table_keep_mask(
         raise ValueError("table plane must have an upward non-zero normal")
     plane /= norm
 
-    # Transform the plane into the depth frame. This removes the large table
-    # support before transforming every surviving point into xArm-base.
-    plane_depth = _validated_transform(T_xarm_base_from_depth).T @ plane
-    signed_height = points_depth @ plane_depth[:3] + plane_depth[3]
-    below_table = signed_height < -table_clearance_m
-    near_table = np.abs(signed_height) <= table_clearance_m
-
-    # A calibrated plane may be a few millimetres imperfect, but a real object
-    # boundary can have the same height. Remove only locally supported plane
-    # pixels and leave isolated candidates to the later 3-D outlier decision.
-    near_table_image = np.zeros(depth_shape, dtype=np.uint8)
-    near_table_image[depth_rows[near_table], depth_columns[near_table]] = 1
-    support = convolve(
-        near_table_image, np.ones((3, 3), dtype=np.uint8), mode="constant"
+    # Transform the plane into the aligned color-camera frame. Cached rays make
+    # ``z * dot(plane_normal, ray) + offset`` equivalent to evaluating the
+    # plane after deprojection, without allocating table points in 3-D.
+    plane_color = _validated_transform(T_xarm_base_from_color).T @ plane
+    rows, columns = np.nonzero(valid)
+    rays = _depth_rays(intrinsics)[rows, columns]
+    signed_height = depth_m[rows, columns] * (rays @ plane_color[:3]) + plane_color[3]
+    return _table_height_hysteresis_keep_mask(
+        valid,
+        rows=rows,
+        columns=columns,
+        signed_height_m=signed_height,
+        core_height_m=table_core_height_m,
+        object_seed_height_m=table_object_seed_height_m,
+        object_seed_min_pixels=table_object_seed_min_pixels,
     )
-    supported_table = near_table & (
-        support[depth_rows, depth_columns] >= table_support_min_pixels
-    )
-    return ~(below_table | supported_table)
 
 
 def _workspace_keep_mask(
@@ -242,15 +374,21 @@ def _workspace_keep_mask(
 
 
 def _voxel_means(
-    points_depth: np.ndarray,
     points_base: np.ndarray,
+    colors: np.ndarray,
     voxel_size_m: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if points_base.ndim != 2 or points_base.shape[1] != 3:
         raise ValueError("points_base must have shape [N,3]")
+    if colors.shape != points_base.shape:
+        raise ValueError("colors must have shape [N,3] matching points_base")
     if points_base.shape[0] == 0:
         empty_points = np.empty((0, 3), dtype=np.float32)
-        return empty_points, empty_points.copy(), np.empty((0, 3), dtype=np.int64)
+        return (
+            empty_points.copy(),
+            empty_points.copy(),
+            np.empty((0, 3), dtype=np.int64),
+        )
     keys = np.floor(points_base / np.float32(voxel_size_m)).astype(np.int64)
     # Group exact 3-int rows through one packed scalar key. Mean aggregation is
     # independent of depth-image traversal order and avoids first-pixel bias.
@@ -267,91 +405,54 @@ def _voxel_means(
         ]
         return np.column_stack(columns).astype(np.float32)
 
-    return aggregate(points_depth), aggregate(points_base), keys[first_indices]
+    return (
+        aggregate(points_base),
+        aggregate(colors),
+        keys[first_indices],
+    )
 
 
-def _radius_inlier_mask(
-    query_points_base: np.ndarray,
+def _radius_component_keep_masks(
+    points_base: np.ndarray,
     *,
-    reference_points_base: np.ndarray,
     radius_m: float,
     min_neighbors: int,
-) -> np.ndarray:
-    """Return a conservative radius-neighbor mask after voxel reduction."""
-    if query_points_base.shape[0] == 0:
-        return np.empty(0, dtype=bool)
-    if min_neighbors == 0:
-        return np.ones(query_points_base.shape[0], dtype=bool)
-    neighbor_counts = np.asarray(
-        cKDTree(reference_points_base).query_ball_point(
-            query_points_base, r=radius_m, return_length=True
-        )
+    min_component_points: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Use one radius graph for connected-island and local-density filtering."""
+    if points_base.ndim != 2 or points_base.shape[1] != 3:
+        raise ValueError("points_base must have shape [N,3]")
+    count = points_base.shape[0]
+    if count == 0:
+        empty = np.empty(0, dtype=bool)
+        return empty, empty.copy()
+    if min_neighbors == 0 and min_component_points <= 1:
+        keep = np.ones(count, dtype=bool)
+        return keep, keep.copy()
+
+    # query_pairs evaluates every undirected neighbor pair once. The same
+    # sparse graph provides exact radius-neighbor counts and physical
+    # connected components, avoiding the former second KD-tree/query pass.
+    pairs = cKDTree(points_base).query_pairs(
+        radius_m,
+        output_type="ndarray",
     )
-    # query_ball_point includes the query point itself.
-    return neighbor_counts >= min_neighbors + 1
-
-
-def _project_color(
-    points_color: np.ndarray, intrinsics: CameraIntrinsics
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Project color-camera points with the observed Brown-Conrady model."""
-    if points_color.ndim != 2 or points_color.shape[1] != 3:
-        raise ValueError("points_color must have shape [N,3]")
-    z = points_color[:, 2]
-    valid = np.isfinite(points_color).all(axis=1) & (z > 0.0)
-    x = np.zeros_like(z, dtype=np.float32)
-    y = np.zeros_like(z, dtype=np.float32)
-    x[valid] = points_color[valid, 0] / z[valid]
-    y[valid] = points_color[valid, 1] / z[valid]
-    if intrinsics.distortion_model in {"distortion.none", "none"}:
-        xd, yd = x, y
-    elif intrinsics.distortion_model in {"distortion.brown_conrady", "brown_conrady"}:
-        k1, k2, p1, p2, k3 = (
-            np.float32(value) for value in intrinsics.distortion_coeffs
-        )
-        r2 = x * x + y * y
-        radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
-        xd = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
-        yd = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
-    else:
-        raise ValueError(
-            "color projection has no validated path for distortion model "
-            f"{intrinsics.distortion_model!r}"
-        )
-    columns = np.rint(
-        xd * np.float32(intrinsics.fx) + np.float32(intrinsics.ppx)
-    ).astype(np.int64)
-    rows = np.rint(yd * np.float32(intrinsics.fy) + np.float32(intrinsics.ppy)).astype(
-        np.int64
+    neighbor_counts = np.bincount(pairs.reshape(-1), minlength=count)
+    density_keep = neighbor_counts >= min_neighbors
+    retained_pairs = pairs[density_keep[pairs[:, 0]] & density_keep[pairs[:, 1]]]
+    graph = coo_matrix(
+        (
+            np.ones(retained_pairs.shape[0], dtype=np.uint8),
+            (retained_pairs[:, 0], retained_pairs[:, 1]),
+        ),
+        shape=(count, count),
     )
-    valid &= (
-        (columns >= 0)
-        & (columns < intrinsics.width)
-        & (rows >= 0)
-        & (rows < intrinsics.height)
+    _component_count, labels = connected_components(
+        graph, directed=False, return_labels=True
     )
-    return rows, columns, valid
-
-
-def _color_visibility(
-    rows: np.ndarray,
-    columns: np.ndarray,
-    points_color: np.ndarray,
-    valid_projection: np.ndarray,
-) -> np.ndarray:
-    """Keep nearest depth-derived candidate at each color texel (0 m tolerance)."""
-    visible = np.zeros(valid_projection.shape, dtype=bool)
-    if not np.any(valid_projection):
-        return visible
-    # Width is not passed because pixel IDs need only unique ordered pairs here.
-    coordinates = np.column_stack((rows[valid_projection], columns[valid_projection]))
-    _, inverse = np.unique(coordinates, axis=0, return_inverse=True)
-    depth = points_color[valid_projection, 2]
-    nearest = np.full(int(inverse.max()) + 1, np.inf, dtype=np.float32)
-    np.minimum.at(nearest, inverse, depth)
-    visible_indices = np.flatnonzero(valid_projection)
-    visible[visible_indices] = depth <= nearest[inverse]
-    return visible
+    component_sizes = np.bincount(labels, minlength=count)
+    component_keep = density_keep & (component_sizes[labels] >= min_component_points)
+    return density_keep, component_keep
 
 
 def _spatial_hash(voxel_keys: np.ndarray) -> np.ndarray:
@@ -397,15 +498,15 @@ def _fixed_size_sample(
     return np.ascontiguousarray(cloud[indices], dtype=np.float32)
 
 
-def depth_points_in_base(
+def aligned_depth_points_in_base(
     *,
     depth_raw: np.ndarray,
     depth_scale_m: float,
-    depth_intrinsics: CameraIntrinsics,
-    T_xarm_base_from_depth: np.ndarray,
+    aligned_depth_intrinsics: CameraIntrinsics,
+    T_xarm_base_from_color: np.ndarray,
     config: PointCloudConfig,
 ) -> np.ndarray:
-    """Return supported, depth-gated points for offline table calibration."""
+    """Return aligned supported points in xArm-base for table calibration."""
     if not isinstance(config, PointCloudConfig):
         raise TypeError("config must be a PointCloudConfig")
     depth_m, valid = _depth_valid_mask(
@@ -414,8 +515,10 @@ def depth_points_in_base(
     trusted = _reject_flying_depth(depth_m, valid, config)
     if not np.any(trusted):
         return np.empty((0, 3), dtype=np.float32)
-    points_depth, _rows, _columns = _deproject_depth(depth_m, trusted, depth_intrinsics)
-    return _transform_points(points_depth, T_xarm_base_from_depth)
+    points_depth, _rows, _columns = _deproject_depth(
+        depth_m, trusted, aligned_depth_intrinsics
+    )
+    return _transform_points(points_depth, T_xarm_base_from_color)
 
 
 def build_raw_point_cloud(
@@ -424,37 +527,26 @@ def build_raw_point_cloud(
     color: np.ndarray,
     depth_scale_m: float,
     geometry: RGBDGeometry,
-    T_xarm_base_from_depth: np.ndarray,
+    T_xarm_base_from_color: np.ndarray,
 ) -> np.ndarray | None:
-    """Build the diagnostic full measured cloud without production filtering.
+    """Build the diagnostic full aligned cloud without production filtering.
 
-    Every finite non-zero native depth sample is retained. RGB is projected
-    from the native color stream; samples outside its field of view are gray.
+    Every finite non-zero depth-to-color sample is retained. RGB is read from
+    the matching color pixel, with the aligned geometry's identity transform.
     This function is intentionally not used by recording or policy workers.
     """
     _validate_color(color, geometry)
     if depth_raw.ndim != 2 or depth_raw.dtype != np.uint16:
-        raise ValueError("depth_raw must be a native uint16 [H,W] frame")
+        raise ValueError("depth_raw must be a uint16 [H,W] frame")
     if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
         raise ValueError("depth_scale_m must be finite and positive")
     depth_m = depth_raw.astype(np.float32) * np.float32(depth_scale_m)
     valid = (depth_raw > 0) & np.isfinite(depth_m)
     if not np.any(valid):
         return None
-    points_depth, _rows, _columns = _deproject_depth(depth_m, valid, geometry.depth)
-    points_base = _transform_points(points_depth, T_xarm_base_from_depth)
-    points_color = _transform_points(points_depth, geometry.T_color_from_depth)
-    color_rows, color_columns, projection_valid = _project_color(
-        points_color, geometry.color
-    )
-    colors = np.full(points_base.shape, 0.5, dtype=np.float32)
-    colors[projection_valid] = (
-        color[
-            color_rows[projection_valid],
-            color_columns[projection_valid],
-        ].astype(np.float32)
-        / 255.0
-    )
+    points_depth, rows, columns = _deproject_depth(depth_m, valid, geometry.depth)
+    points_base = _transform_points(points_depth, T_xarm_base_from_color)
+    colors = color[rows, columns].astype(np.float32) / 255.0
     return np.ascontiguousarray(
         np.column_stack((points_base, colors)), dtype=np.float32
     )
@@ -466,17 +558,17 @@ def build_point_cloud(
     color: np.ndarray,
     depth_scale_m: float,
     geometry: RGBDGeometry,
-    T_xarm_base_from_depth: np.ndarray,
+    T_xarm_base_from_color: np.ndarray,
     table_plane_abcd: tuple[float, float, float, float] | None,
     config: PointCloudConfig,
 ) -> np.ndarray | None:
-    """Build native depth/color ``float32[num_points,6]`` in xArm-base frame."""
+    """Build aligned depth/color ``float32[num_points,6]`` in xArm-base frame."""
     cloud, _stats = build_point_cloud_with_stats(
         depth_raw=depth_raw,
         color=color,
         depth_scale_m=depth_scale_m,
         geometry=geometry,
-        T_xarm_base_from_depth=T_xarm_base_from_depth,
+        T_xarm_base_from_color=T_xarm_base_from_color,
         table_plane_abcd=table_plane_abcd,
         config=config,
     )
@@ -489,7 +581,7 @@ def build_point_cloud_with_stats(
     color: np.ndarray,
     depth_scale_m: float,
     geometry: RGBDGeometry,
-    T_xarm_base_from_depth: np.ndarray,
+    T_xarm_base_from_color: np.ndarray,
     table_plane_abcd: tuple[float, float, float, float] | None,
     config: PointCloudConfig,
 ) -> tuple[np.ndarray | None, PointCloudBuildStats]:
@@ -497,116 +589,172 @@ def build_point_cloud_with_stats(
     if not isinstance(config, PointCloudConfig):
         raise TypeError("config must be a PointCloudConfig")
     _validate_color(color, geometry)
+    started_ns = time.perf_counter_ns()
+    elapsed_ms = {
+        "depth_filter_ms": 0.0,
+        "table_crop_ms": 0.0,
+        "deprojection_ms": 0.0,
+        "base_workspace_ms": 0.0,
+        "voxelization_ms": 0.0,
+        "spatial_outlier_filter_ms": 0.0,
+        "color_sampling_ms": 0.0,
+    }
+
+    def stats(**kwargs: Any) -> PointCloudBuildStats:
+        return PointCloudBuildStats(
+            **kwargs,
+            timings=PointCloudBuildTimings(
+                **elapsed_ms,
+                total_ms=(time.perf_counter_ns() - started_ns) / 1e6,
+            ),
+        )
+
+    stage_started_ns = time.perf_counter_ns()
     depth_m, valid = _depth_valid_mask(
         depth_raw, depth_scale_m=depth_scale_m, config=config
     )
     valid_count = int(np.count_nonzero(valid))
     trusted = _reject_flying_depth(depth_m, valid, config)
     trusted_count = int(np.count_nonzero(trusted))
-    if not np.any(trusted):
-        return None, PointCloudBuildStats(
+    elapsed_ms["depth_filter_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
+    if trusted_count == 0:
+        return None, stats(
             depth_valid_points=valid_count,
             failure_stage="depth_support",
         )
-    points_depth, rows, columns = _deproject_depth(depth_m, trusted, geometry.depth)
+
+    stage_started_ns = time.perf_counter_ns()
     if table_plane_abcd is not None:
         table_keep = _table_keep_mask(
-            points_depth,
-            depth_rows=rows,
-            depth_columns=columns,
-            depth_shape=(int(depth_m.shape[0]), int(depth_m.shape[1])),
-            T_xarm_base_from_depth=T_xarm_base_from_depth,
+            depth_m,
+            trusted,
+            intrinsics=geometry.depth,
+            T_xarm_base_from_color=T_xarm_base_from_color,
             table_plane_abcd=table_plane_abcd,
-            table_clearance_m=config.table_clearance_m,
-            table_support_min_pixels=config.table_support_min_pixels,
+            table_core_height_m=config.table_core_height_m,
+            table_object_seed_height_m=config.table_object_seed_height_m,
+            table_object_seed_min_pixels=config.table_object_seed_min_pixels,
         )
-        if not np.any(table_keep):
-            return None, PointCloudBuildStats(
+        table_kept_count = int(np.count_nonzero(table_keep))
+        table_rejected_count = trusted_count - table_kept_count
+        if table_kept_count == 0:
+            elapsed_ms["table_crop_ms"] = (
+                time.perf_counter_ns() - stage_started_ns
+            ) / 1e6
+            return None, stats(
                 depth_valid_points=valid_count,
                 depth_trusted_points=trusted_count,
-                failure_stage="table_workspace_crop",
+                table_rejected_points=table_rejected_count,
+                failure_stage="table_crop",
             )
-        points_depth = points_depth[table_keep]
-    points_base = _transform_points(points_depth, T_xarm_base_from_depth)
+    else:
+        table_rejected_count = 0
+        table_keep = trusted
+    elapsed_ms["table_crop_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
+
+    stage_started_ns = time.perf_counter_ns()
+    points_depth, rows, columns = _deproject_depth(depth_m, table_keep, geometry.depth)
+    colors = color[rows, columns].astype(np.float32) / 255.0
+    elapsed_ms["deprojection_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
+
+    stage_started_ns = time.perf_counter_ns()
+    points_base = _transform_points(points_depth, T_xarm_base_from_color)
     workspace_keep = _workspace_keep_mask(points_base, config.workspace)
     cropped_count = int(np.count_nonzero(workspace_keep))
-    if not np.any(workspace_keep):
-        return None, PointCloudBuildStats(
+    workspace_rejected_count = int(workspace_keep.size - cropped_count)
+    if cropped_count == 0:
+        elapsed_ms["base_workspace_ms"] = (
+            time.perf_counter_ns() - stage_started_ns
+        ) / 1e6
+        return None, stats(
             depth_valid_points=valid_count,
             depth_trusted_points=trusted_count,
-            failure_stage="table_workspace_crop",
+            table_rejected_points=table_rejected_count,
+            workspace_rejected_points=workspace_rejected_count,
+            failure_stage="workspace_crop",
         )
-    points_depth = points_depth[workspace_keep]
     points_base = points_base[workspace_keep]
-    points_depth, points_base, voxel_keys = _voxel_means(
-        points_depth, points_base, config.voxel_size_m
+    colors = colors[workspace_keep]
+    elapsed_ms["base_workspace_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
+
+    stage_started_ns = time.perf_counter_ns()
+    points_base, colors, voxel_keys = _voxel_means(
+        points_base, colors, config.voxel_size_m
     )
+    elapsed_ms["voxelization_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
     voxel_count = points_base.shape[0]
     if voxel_count == 0:
-        return None, PointCloudBuildStats(
+        return None, stats(
             depth_valid_points=valid_count,
             depth_trusted_points=trusted_count,
+            table_rejected_points=table_rejected_count,
+            workspace_rejected_points=workspace_rejected_count,
             cropped_points=cropped_count,
             failure_stage="voxelization",
         )
+
+    stage_started_ns = time.perf_counter_ns()
+    density_keep, inlier = _radius_component_keep_masks(
+        points_base,
+        radius_m=config.outlier_radius_m,
+        min_neighbors=config.outlier_min_neighbors,
+        min_component_points=config.outlier_min_component_points,
+    )
+    density_count = int(np.count_nonzero(density_keep))
+    if density_count == 0:
+        elapsed_ms["spatial_outlier_filter_ms"] = (
+            time.perf_counter_ns() - stage_started_ns
+        ) / 1e6
+        return None, stats(
+            depth_valid_points=valid_count,
+            depth_trusted_points=trusted_count,
+            table_rejected_points=table_rejected_count,
+            workspace_rejected_points=workspace_rejected_count,
+            cropped_points=cropped_count,
+            voxel_points=voxel_count,
+            failure_stage="radius_density",
+        )
+    inlier_count = int(np.count_nonzero(inlier))
+    if inlier_count == 0:
+        elapsed_ms["spatial_outlier_filter_ms"] = (
+            time.perf_counter_ns() - stage_started_ns
+        ) / 1e6
+        return None, stats(
+            depth_valid_points=valid_count,
+            depth_trusted_points=trusted_count,
+            table_rejected_points=table_rejected_count,
+            workspace_rejected_points=workspace_rejected_count,
+            cropped_points=cropped_count,
+            voxel_points=voxel_count,
+            radius_density_points=density_count,
+            failure_stage="radius_components",
+        )
+    points_base = points_base[inlier]
+    colors = colors[inlier]
+    voxel_keys = voxel_keys[inlier]
     candidate_indices = _spatial_candidate_indices(
         voxel_keys, config.num_points * config.outlier_candidate_multiplier
     )
     candidate_count = int(candidate_indices.size)
-    reference_points_base = points_base
-    points_depth = points_depth[candidate_indices]
     points_base = points_base[candidate_indices]
+    colors = colors[candidate_indices]
     voxel_keys = voxel_keys[candidate_indices]
-    inlier = _radius_inlier_mask(
-        points_base,
-        reference_points_base=reference_points_base,
-        radius_m=config.outlier_radius_m,
-        min_neighbors=config.outlier_min_neighbors,
-    )
-    inlier_count = int(np.count_nonzero(inlier))
-    if not np.any(inlier):
-        return None, PointCloudBuildStats(
-            depth_valid_points=valid_count,
-            depth_trusted_points=trusted_count,
-            cropped_points=cropped_count,
-            voxel_points=voxel_count,
-            outlier_candidate_points=candidate_count,
-            failure_stage="radius_outlier",
-        )
-    points_depth = points_depth[inlier]
-    points_base = points_base[inlier]
-    voxel_keys = voxel_keys[inlier]
-    points_color = _transform_points(points_depth, geometry.T_color_from_depth)
-    color_rows, color_columns, projection_valid = _project_color(
-        points_color, geometry.color
-    )
-    visible = _color_visibility(
-        color_rows, color_columns, points_color, projection_valid
-    )
-    visible_count = int(np.count_nonzero(visible))
-    if not np.any(visible):
-        return None, PointCloudBuildStats(
-            depth_valid_points=valid_count,
-            depth_trusted_points=trusted_count,
-            cropped_points=cropped_count,
-            voxel_points=voxel_count,
-            outlier_candidate_points=candidate_count,
-            outlier_inlier_points=inlier_count,
-            failure_stage="color_visibility",
-        )
-    colors = (
-        color[color_rows[visible], color_columns[visible]].astype(np.float32) / 255.0
-    )
-    cloud = np.column_stack((points_base[visible], colors)).astype(np.float32)
-    result = _fixed_size_sample(cloud, voxel_keys[visible], config.num_points)
-    return result, PointCloudBuildStats(
+    elapsed_ms["spatial_outlier_filter_ms"] = (
+        time.perf_counter_ns() - stage_started_ns
+    ) / 1e6
+
+    stage_started_ns = time.perf_counter_ns()
+    cloud = np.column_stack((points_base, colors)).astype(np.float32)
+    result = _fixed_size_sample(cloud, voxel_keys, config.num_points)
+    elapsed_ms["color_sampling_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
+    return result, stats(
         depth_valid_points=valid_count,
         depth_trusted_points=trusted_count,
+        table_rejected_points=table_rejected_count,
+        workspace_rejected_points=workspace_rejected_count,
         cropped_points=cropped_count,
         voxel_points=voxel_count,
-        outlier_candidate_points=candidate_count,
-        outlier_inlier_points=inlier_count,
-        color_visible_points=visible_count,
-        unique_output_points=min(visible_count, config.num_points),
-        padded_output_points=max(0, config.num_points - visible_count),
+        radius_density_points=density_count,
+        spatial_inlier_points=inlier_count,
+        candidate_points=candidate_count,
     )

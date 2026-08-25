@@ -140,8 +140,7 @@ class _ArmFeedbackSnapshot:
 @dataclass(frozen=True)
 class _HandFeedbackSnapshot:
     qpos: np.ndarray
-    last_cmd_qpos: np.ndarray
-    last_cmd_seq: int
+    accepted_target_action_id: int
 
 
 def _arm_feedback_snapshot(
@@ -191,9 +190,7 @@ def read_hand_feedback(
     """Read one fully healthy hand command/feedback snapshot fail-closed.
 
     Delegates connected/state-valid checks, source-timestamp existence, future
-    timestamp, and ``max_age`` freshness to :func:`validate_hand_feedback`;
-    the worker's last accepted command is then shape/finite-checked on its own
-    (that predicate does not know about ``last_cmd_qpos``).
+    timestamp, and ``max_age`` freshness to :func:`validate_hand_feedback`.
     """
     if not np.isfinite(hand_feedback_max_age_s) or hand_feedback_max_age_s <= 0.0:
         raise ValueError("hand_feedback_max_age_s must be finite and positive")
@@ -225,20 +222,10 @@ def read_hand_feedback(
             candidate=candidate,
             detail="hand measured qpos is malformed",
         )
-    last_cmd_qpos = np.asarray(record["last_cmd_qpos"], dtype=np.float64)
-    if last_cmd_qpos.shape != HAND_JOINT_SHAPE or not np.all(
-        np.isfinite(last_cmd_qpos)
-    ):
-        return None, CommandPublishResult(
-            CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY,
-            candidate=candidate,
-            detail="hand last accepted command is malformed",
-        )
     return (
         _HandFeedbackSnapshot(
             qpos.copy(),
-            last_cmd_qpos.copy(),
-            int(record["last_cmd_seq"]),
+            int(record["accepted_target_action_id"]),
         ),
         None,
     )
@@ -630,18 +617,18 @@ def publish_joint_targets(
                 if feedback_rejection is not None:
                     return feedback_rejection
                 assert hand_feedback is not None
-                hand_seq = hand_feedback.last_cmd_seq
-                if hand_seq > action_id:
+                hand_action_id = hand_feedback.accepted_target_action_id
+                if hand_action_id > action_id:
                     logger.warning(
                         "publish_joint_targets: action_id=%d was superseded by hand action_id=%d",
                         action_id,
-                        hand_seq,
+                        hand_action_id,
                     )
                     return CommandPublishResult(
                         CommandPublishStatus.ACK_SUPERSEDED,
                         candidate=published,
                     )
-                if arm_ok and hand_seq == action_id:
+                if arm_ok and hand_action_id == action_id:
                     return CommandPublishResult(
                         CommandPublishStatus.APPLIED,
                         candidate=published,

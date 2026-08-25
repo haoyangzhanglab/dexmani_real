@@ -1,4 +1,4 @@
-"""Latest-only native RGB-D to realtime point-cloud worker.
+"""Latest-only depth-to-color RGB-D to realtime point-cloud worker.
 
 The worker owns no camera SDK object and never queues camera payloads. It
 observes the newest committed camera-ring sequence, builds at most one cloud
@@ -65,7 +65,9 @@ class PointCloudLoopConfig:
         if not isinstance(self.pointcloud, PointCloudConfig):
             raise TypeError("pointcloud must be a PointCloudConfig")
         if not isinstance(self.camera_calibration, CameraCalib):
-            raise TypeError("camera_calibration must be a preloaded CameraCalib snapshot")
+            raise TypeError(
+                "camera_calibration must be a preloaded CameraCalib snapshot"
+            )
         if self.pointcloud.num_points not in SUPPORTED_POINT_CLOUD_COUNTS:
             raise ValueError(
                 "realtime point-cloud count must be one of "
@@ -147,11 +149,9 @@ def _load_static_inputs(
             raise TypeError("camera geometry shared metadata must encode an object")
         geometry = RGBDGeometry.from_dict(geometry_payload)
         base_from_color = _resolve_base_from_color(shared, calibration)
-        base_from_depth = _validate_transform(
-            base_from_color @ geometry.T_color_from_depth,
-            label="T_xarm_base_from_depth",
-        )
-        return geometry, depth_scale_m, base_from_depth
+        # The camera ring carries depth aligned onto the color pixel grid.
+        # Its deprojection frame is therefore the color-camera frame.
+        return geometry.aligned_depth_to_color(), depth_scale_m, base_from_color
     return None
 
 
@@ -190,7 +190,7 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
     static_inputs = _load_static_inputs(shared, cfg.camera_calibration)
     if static_inputs is None:
         return
-    geometry, depth_scale_m, base_from_depth = static_inputs
+    geometry, depth_scale_m, base_from_color = static_inputs
     logger.info(
         "pointcloud policy: id=%s config_sha256=%s config=%s table_plane_abcd=%s",
         POINT_CLOUD_POLICY_ID,
@@ -241,7 +241,7 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
                 color=color,
                 depth_scale_m=depth_scale_m,
                 geometry=geometry,
-                T_xarm_base_from_depth=base_from_depth,
+                T_xarm_base_from_color=base_from_color,
                 table_plane_abcd=cfg.table_plane_abcd,
                 config=cfg.pointcloud,
             )

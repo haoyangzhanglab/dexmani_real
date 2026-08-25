@@ -157,6 +157,20 @@ class RGBDGeometry:
             "T_color_from_depth": self.T_color_from_depth.tolist(),
         }
 
+    def aligned_depth_to_color(self) -> "RGBDGeometry":
+        """Return geometry for ``rs.align(depth -> color)`` depth samples.
+
+        Librealsense writes the source Z16 measurement onto the color image
+        grid. Therefore its depth samples live in the color-camera coordinate
+        system: color intrinsics are used for deprojection and no depth-to-color
+        extrinsic is applied afterwards.
+        """
+        return RGBDGeometry(
+            depth=self.color,
+            color=self.color,
+            T_color_from_depth=np.eye(4, dtype=np.float64),
+        )
+
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "RGBDGeometry":
         required = {"depth", "color", "T_color_from_depth"}

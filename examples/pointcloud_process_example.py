@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/pointcloud_process_example.py``.
 
-Self-contained L515 tabletop point-cloud and table-plane diagnostic. It fits a
-multi-frame deterministic table plane every run, uses that fit immediately,
-and publishes ``desk_plane.json`` only after explicit operator confirmation.
-Publishing creates a timestamped backup and affects both perception cropping
-and table-aware collision geometry on the next runtime resolution.
+Self-contained L515 tabletop point-cloud and table-plane diagnostic. It uses
+the resolved table plane by default and enters deterministic multi-frame table
+calibration only after operator confirmation. A new fit is used immediately;
+publishing ``desk_plane.json`` requires separate confirmation and affects both
+perception cropping and table-aware collision geometry on the next runtime
+resolution.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from __future__ import annotations
 import math
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -31,8 +32,8 @@ from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
 from dexmani_real.sensor.camera_geometry import RGBDGeometry
 from dexmani_real.sensor.pointcloud import (
+    aligned_depth_points_in_base,
     build_point_cloud_with_stats,
-    depth_points_in_base,
 )
 from dexmani_real.sensor.realsense import L515DepthConfig, RealSense, RealSenseConfig
 
@@ -45,10 +46,9 @@ class PointCloudDiagnosticConfig:
     """Configuration for the interactive point-cloud diagnostic."""
 
     rgb_resolution: tuple[int, int] = (640, 480)
-    depth_resolution: tuple[int, int] = (1024, 768)
+    depth_resolution: tuple[int, int] = (640, 480)
     fps: int = 30
-    warmup_frames: int = 30
-    target_points: int = 2048
+    warmup_frames: int = 10
     table_calibration_frames: int = 5
 
     show_rgbd_panels: bool = True
@@ -116,7 +116,7 @@ def _show_rgbd_panels(
     depth_m: np.ndarray,
     cfg: PointCloudDiagnosticConfig,
 ) -> None:
-    """Show native RGB and depth side by side."""
+    """Show same-resolution depth-to-color aligned RGB and depth."""
     if not cfg.show_rgbd_panels:
         return
     try:
@@ -132,13 +132,8 @@ def _show_rgbd_panels(
         ("Depth", _make_depth_vis(depth_m, cfg.vis_depth_min_m, cfg.vis_depth_max_m)),
     ]
     labeled = []
-    rgb_h, rgb_w = bgr.shape[:2]
     for title, image in panels:
         canvas = image.copy()
-        if canvas.shape[:2] != (rgb_h, rgb_w):
-            # Depth is native 1024x768 while RGB is 640x480 (both 4:3); resize
-            # the depth panel to the RGB size so np.hstack lines up.
-            canvas = cv2.resize(canvas, (rgb_w, rgb_h), interpolation=cv2.INTER_LINEAR)
         cv2.putText(
             canvas,
             title,
@@ -195,8 +190,31 @@ def _stage_label(key: str) -> str:
         "capture": "Frame capture",
         "extrinsics": "Extrinsics load",
         "desk_calib": "Table plane calibration",
-        "p_pipeline": "Complete point-cloud pipeline",
+        "pipeline_p50": "Fresh-frame pipeline p50",
+        "pipeline_p95": "Fresh-frame pipeline p95",
+        "pipeline_max": "Fresh-frame pipeline max",
+        "end_to_end_p50": "Capture-to-cloud p50",
+        "end_to_end_p95": "Capture-to-cloud p95",
+        "end_to_end_max": "Capture-to-cloud max",
     }.get(key, key)
+
+
+_BUILD_TIMING_FIELDS = (
+    "depth_filter_ms",
+    "table_crop_ms",
+    "deprojection_ms",
+    "base_workspace_ms",
+    "voxelization_ms",
+    "spatial_outlier_filter_ms",
+    "color_sampling_ms",
+)
+
+
+def _print_build_stage_timings(prefix: str, values: dict[str, float]) -> None:
+    """Print compact stage timings from one build or benchmark percentile."""
+    print(f"  {prefix}:")
+    for field in _BUILD_TIMING_FIELDS:
+        print(f"    {field.removesuffix('_ms'):<24s} {values[field]:5.1f} ms")
 
 
 def _connect_camera(cfg: PointCloudDiagnosticConfig) -> RealSense:
@@ -261,9 +279,9 @@ def _print_device_info(camera: RealSense) -> dict:
 
 def _capture_frame(
     camera: RealSense,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
-    """Capture one native RGB-D frame.  Returns (rgb, depth_raw, depth_m, timings)."""
-    print("\nCapturing native RGBD frame...")
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Capture one aligned frame and return RGB, raw/metric depth, and elapsed ms."""
+    print("\nCapturing depth-to-color aligned RGBD frame...")
     t0 = time.perf_counter()
     frame = camera.read()
     capture_ms = (time.perf_counter() - t0) * 1000.0
@@ -272,8 +290,12 @@ def _capture_frame(
         raise RuntimeError("RGB frame unavailable.")
 
     rgb = np.ascontiguousarray(frame.rgb)
-    depth_raw = np.ascontiguousarray(frame.depth_raw)
-    depth_m = np.ascontiguousarray(frame.depth, dtype=np.float32)
+    if frame.depth_aligned_to_color_raw is None or frame.depth_aligned_to_color is None:
+        raise RuntimeError("depth_to_color alignment is unavailable")
+    depth_raw = np.ascontiguousarray(frame.depth_aligned_to_color_raw)
+    depth_m = np.ascontiguousarray(frame.depth_aligned_to_color, dtype=np.float32)
+    if rgb.shape[:2] != depth_raw.shape or depth_raw.shape != depth_m.shape:
+        raise RuntimeError("aligned RGB and depth frame dimensions do not match")
 
     print(f"  RGB:     shape={rgb.shape}, dtype={rgb.dtype}")
     print(
@@ -281,13 +303,11 @@ def _capture_frame(
     )
     print(f"  Depth scale: {float(frame.depth_scale):.6f} m")
 
-    return rgb, depth_raw, depth_m, {"capture": capture_ms}
+    return rgb, depth_raw, depth_m, capture_ms
 
 
-def _load_extrinsics(
-    camera_info: dict, geometry: RGBDGeometry
-) -> tuple[np.ndarray, float]:
-    """Load base_from_depth = base_from_color @ T_color_from_depth from cameras.json."""
+def _load_extrinsics(camera_info: dict) -> tuple[np.ndarray, float]:
+    """Load T_xarm_base_from_color for aligned depth-to-color samples."""
     print("\nLoading extrinsics from cameras.json...")
     t0 = time.perf_counter()
     calib = CameraCalib()
@@ -299,22 +319,13 @@ def _load_extrinsics(
     if not np.allclose(base_from_color[3], [0, 0, 0, 1], atol=1e-6):
         raise RuntimeError("Invalid homogeneous transform last row.")
 
-    T_xarm_base_from_depth = base_from_color @ geometry.T_color_from_depth
-
     elapsed = (time.perf_counter() - t0) * 1000.0
-    pos = T_xarm_base_from_depth[:3, 3]
-    quat_xyzw = R.from_matrix(T_xarm_base_from_depth[:3, :3]).as_quat()
-    print(f"  Camera '{cam_name}' -> depth stream in xArm-base frame")
+    pos = base_from_color[:3, 3]
+    quat_xyzw = R.from_matrix(base_from_color[:3, :3]).as_quat()
+    print(f"  Camera '{cam_name}' -> color/aligned-depth frame in xArm-base frame")
     print(f"  pos:         {np.round(pos, 4)} m")
     print(f"  quat (xyzw): {np.round(quat_xyzw, 4)}")
-    return T_xarm_base_from_depth, elapsed
-
-
-def _production_config(
-    runtime: ResolvedRuntimeConfig, num_points: int
-) -> PointCloudConfig:
-    """Return the canonical runtime policy with only output size overridden."""
-    return replace(runtime.pointcloud, num_points=num_points)
+    return base_from_color, elapsed
 
 
 def _resolve_table_plane_path(runtime: ResolvedRuntimeConfig) -> Path:
@@ -332,7 +343,7 @@ def _calibrate_table(
     *,
     camera: RealSense,
     geometry: RGBDGeometry,
-    T_xarm_base_from_depth: np.ndarray,
+    T_xarm_base_from_color: np.ndarray,
     config: PointCloudConfig,
     plane_path: Path,
     frame_count: int,
@@ -347,17 +358,20 @@ def _calibrate_table(
     started = time.perf_counter()
     depth_frames: list[np.ndarray] = []
     for _ in range(max(1, frame_count)):
-        depth_frames.append(np.ascontiguousarray(camera.read().depth_raw))
+        frame = camera.read()
+        if frame.depth_aligned_to_color_raw is None:
+            raise RuntimeError("depth_to_color alignment is unavailable")
+        depth_frames.append(np.ascontiguousarray(frame.depth_aligned_to_color_raw))
 
     point_batches: list[np.ndarray] = []
     lower = np.asarray(config.workspace[:3], dtype=np.float32)
     upper = np.asarray(config.workspace[3:], dtype=np.float32)
     for depth_raw in depth_frames:
-        points = depth_points_in_base(
+        points = aligned_depth_points_in_base(
             depth_raw=depth_raw,
             depth_scale_m=camera.get_depth_scale(),
-            depth_intrinsics=geometry.depth,
-            T_xarm_base_from_depth=T_xarm_base_from_depth,
+            aligned_depth_intrinsics=geometry.depth,
+            T_xarm_base_from_color=T_xarm_base_from_color,
             config=config,
         )
         points = points[np.all((points >= lower) & (points <= upper), axis=1)]
@@ -404,17 +418,33 @@ def _build_cloud(
     rgb: np.ndarray,
     depth_scale_m: float,
     geometry: RGBDGeometry,
-    T_xarm_base_from_depth: np.ndarray,
+    T_xarm_base_from_color: np.ndarray,
     config: PointCloudConfig,
     table_plane_abcd: tuple[float, float, float, float] | None,
-) -> tuple[np.ndarray, dict[str, float]]:
-    """Run ``build_point_cloud`` once and extract timing."""
+) -> np.ndarray:
+    """Build and report one production point cloud."""
     print("\n" + "=" * 60)
-    print("Point-Cloud Pipeline (native -> xArm-base)")
+    print("Point-Cloud Pipeline (depth_to_color -> xArm-base)")
     print("=" * 60)
     table_state = "ENABLED" if table_plane_abcd is not None else "DISABLED"
     print(f"  num_points={config.num_points}  workspace={config.workspace}")
     print(f"  depth range [{config.depth_min_m}, {config.depth_max_m}] m")
+    print(
+        "  3x3 support neighbors "
+        f"flat={config.depth_support_min_neighbors} "
+        f"edge={config.edge_support_min_neighbors}"
+    )
+    print(
+        "  radius-component minimum "
+        f"{config.outlier_min_component_points} points; radius neighbors "
+        f"{config.outlier_min_neighbors}"
+    )
+    print(
+        "  table height hysteresis "
+        f"core={config.table_core_height_m * 1000.0:.1f} mm "
+        f"object_seed={config.table_object_seed_height_m * 1000.0:.1f} mm "
+        f"x{config.table_object_seed_min_pixels} pixels"
+    )
     print(f"  voxel_size_m={config.voxel_size_m}  table crop: {table_state}")
 
     # Warm up once, then time the public operation.
@@ -423,7 +453,7 @@ def _build_cloud(
         color=rgb,
         depth_scale_m=depth_scale_m,
         geometry=geometry,
-        T_xarm_base_from_depth=T_xarm_base_from_depth,
+        T_xarm_base_from_color=T_xarm_base_from_color,
         table_plane_abcd=table_plane_abcd,
         config=config,
     )
@@ -434,30 +464,105 @@ def _build_cloud(
         color=rgb,
         depth_scale_m=depth_scale_m,
         geometry=geometry,
-        T_xarm_base_from_depth=T_xarm_base_from_depth,
+        T_xarm_base_from_color=T_xarm_base_from_color,
         table_plane_abcd=table_plane_abcd,
         config=config,
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
-    timings = {"pipeline_total": elapsed_ms, "p_pipeline": elapsed_ms}
+    build_stage_timings = {
+        field: float(getattr(stats.timings, field)) for field in _BUILD_TIMING_FIELDS
+    }
 
     print(
         "  Stage counts: "
         f"valid={stats.depth_valid_points} -> supported={stats.depth_trusted_points} "
+        f"-> table_reject={stats.table_rejected_points} "
+        f"-> workspace_reject={stats.workspace_rejected_points} "
         f"-> crop={stats.cropped_points} -> voxel={stats.voxel_points} "
-        f"-> candidate={stats.outlier_candidate_points} "
-        f"-> inlier={stats.outlier_inlier_points} -> visible={stats.color_visible_points}"
+        f"-> density={stats.radius_density_points} "
+        f"-> component={stats.spatial_inlier_points} "
+        f"-> candidate={stats.candidate_points}"
     )
+    _print_build_stage_timings("Single-frame build stages", build_stage_timings)
 
     if result is not None:
-        print(
-            f"\n  Output: {result.shape[0]} points  ({timings['pipeline_total']:.1f} ms)"
-        )
+        print(f"\n  Output: {result.shape[0]} points  ({elapsed_ms:.1f} ms)")
     else:
-        print("\n  Output: none (no in-workspace visible cloud)")
+        stage = stats.failure_stage or "unknown"
+        print(f"\n  Output: none (pipeline stopped at {stage})")
         result = np.zeros((0, 6), dtype=np.float32)
 
-    return result, timings
+    return result
+
+
+def _benchmark_production_pipeline(
+    *,
+    camera: RealSense,
+    geometry: RGBDGeometry,
+    T_xarm_base_from_color: np.ndarray,
+    config: PointCloudConfig,
+    table_plane_abcd: tuple[float, float, float, float] | None,
+    frame_count: int = 20,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Measure processing and capture-to-cloud p50/p95 on fresh RGB-D frames."""
+    elapsed_ms: list[float] = []
+    end_to_end_ms: list[float] = []
+    stage_samples: dict[str, list[float]] = {
+        field: [] for field in _BUILD_TIMING_FIELDS
+    }
+    latest = np.zeros((0, 6), dtype=np.float32)
+    for _ in range(frame_count):
+        frame_started = time.perf_counter()
+        frame = camera.read()
+        if frame.rgb is None or frame.depth_aligned_to_color_raw is None:
+            raise RuntimeError("aligned RGB-D frame is unavailable")
+        started = time.perf_counter()
+        cloud, stats = build_point_cloud_with_stats(
+            depth_raw=frame.depth_aligned_to_color_raw,
+            color=frame.rgb,
+            depth_scale_m=camera.get_depth_scale(),
+            geometry=geometry,
+            T_xarm_base_from_color=T_xarm_base_from_color,
+            table_plane_abcd=table_plane_abcd,
+            config=config,
+        )
+        elapsed_ms.append((time.perf_counter() - started) * 1000.0)
+        end_to_end_ms.append((time.perf_counter() - frame_started) * 1000.0)
+        for field in _BUILD_TIMING_FIELDS:
+            stage_samples[field].append(float(getattr(stats.timings, field)))
+        if cloud is not None:
+            latest = cloud
+    values = np.asarray(elapsed_ms, dtype=np.float64)
+    end_to_end_values = np.asarray(end_to_end_ms, dtype=np.float64)
+    timings = {
+        "pipeline_total": float(np.mean(values)),
+        "pipeline_p50": float(np.percentile(values, 50)),
+        "pipeline_p95": float(np.percentile(values, 95)),
+        "pipeline_max": float(np.max(values)),
+        "end_to_end_p50": float(np.percentile(end_to_end_values, 50)),
+        "end_to_end_p95": float(np.percentile(end_to_end_values, 95)),
+        "end_to_end_max": float(np.max(end_to_end_values)),
+    }
+    stage_p95 = {
+        field: float(np.percentile(stage_samples[field], 95))
+        for field in _BUILD_TIMING_FIELDS
+    }
+    timings.update({f"{field}_p95": value for field, value in stage_p95.items()})
+    print(
+        "  Fresh-frame benchmark: "
+        f"n={frame_count} p50={timings['pipeline_p50']:.1f} ms "
+        f"p95={timings['pipeline_p95']:.1f} ms "
+        f"max={timings['pipeline_max']:.1f} ms "
+        "(target p95 < 40.0 ms)"
+    )
+    print(
+        "  Capture-to-cloud benchmark: "
+        f"p50={timings['end_to_end_p50']:.1f} ms "
+        f"p95={timings['end_to_end_p95']:.1f} ms "
+        f"max={timings['end_to_end_max']:.1f} ms"
+    )
+    _print_build_stage_timings("Build-stage p95", stage_p95)
+    return latest, timings
 
 
 def _print_timing_summary(timings: dict[str, float]) -> None:
@@ -468,21 +573,27 @@ def _print_timing_summary(timings: dict[str, float]) -> None:
 
     sections = [
         ("Setup", ["capture", "extrinsics", "desk_calib"]),
-        ("Point-Cloud Pipeline (per-frame steady-state)", ["p_pipeline"]),
+        (
+            "Point-Cloud Pipeline (per-frame steady-state)",
+            [
+                "pipeline_p50",
+                "pipeline_p95",
+                "pipeline_max",
+                "end_to_end_p50",
+                "end_to_end_p95",
+                "end_to_end_max",
+            ],
+        ),
     ]
 
     for title, keys in sections:
         print(f"\n  -- {title} --")
-        section_total = 0.0
         for key in keys:
             _tprint(f"  {_stage_label(key)}", key, timings)
-            stage_ms = timings.get(key, 0.0)
-            if not math.isnan(stage_ms):
-                section_total += stage_ms
 
         if title.startswith("Point-Cloud"):
             pipeline_ms = timings.get("pipeline_total", 0.0)
-            print(f"  {'  Point-cloud total':<30s} {pipeline_ms:6.1f} ms")
+            print(f"  {'  Point-cloud mean':<30s} {pipeline_ms:6.1f} ms")
 
 
 def _build_workspace_box(workspace: tuple[float, ...]) -> "o3d.geometry.LineSet":
@@ -525,7 +636,7 @@ def _build_workspace_box(workspace: tuple[float, ...]) -> "o3d.geometry.LineSet"
 
 def _visualize_result(
     result: np.ndarray,
-    T_xarm_base_from_depth: np.ndarray,
+    T_xarm_base_from_color: np.ndarray,
     config: PointCloudConfig,
 ) -> None:
     """Visualize final xArm-base point cloud with coordinate frames and crop box."""
@@ -533,7 +644,7 @@ def _visualize_result(
 
     base_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
     depth_camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.15)
-    depth_camera_frame.transform(T_xarm_base_from_depth)
+    depth_camera_frame.transform(T_xarm_base_from_color)
 
     crop_box = _build_workspace_box(config.workspace)
 
@@ -558,50 +669,80 @@ def main() -> int:
 
     # Resolve and validate file-backed policy before connecting to hardware.
     runtime = resolve_runtime_config()
-    pcd_config = _production_config(runtime, cfg.target_points)
-    table_plane_path = _resolve_table_plane_path(runtime)
+    pcd_config = runtime.pointcloud
 
     camera = _connect_camera(cfg)
 
     try:
         camera_info = _print_device_info(camera)
 
-        rgb, depth_raw, depth_m, t = _capture_frame(camera)
-        all_timings.update(t)
+        rgb, _, depth_m, capture_ms = _capture_frame(camera)
+        all_timings["capture"] = capture_ms
         _print_depth_stats(depth_m, cfg.vis_depth_min_m, cfg.vis_depth_max_m)
         _show_rgbd_panels(rgb, depth_m, cfg)
 
-        geometry = camera.get_geometry()
-        T_xarm_base_from_depth, extrinsics_ms = _load_extrinsics(camera_info, geometry)
+        geometry = camera.get_geometry().aligned_depth_to_color()
+        T_xarm_base_from_color, extrinsics_ms = _load_extrinsics(camera_info)
         all_timings["extrinsics"] = extrinsics_ms
 
-        # The diagnostic uses the exact runtime point-cloud policy. The new
-        # fit is used immediately whether or not the operator publishes it.
-        table_plane_abcd, calibration_ms = _calibrate_table(
-            camera=camera,
-            geometry=geometry,
-            T_xarm_base_from_depth=T_xarm_base_from_depth,
-            config=pcd_config,
-            plane_path=table_plane_path,
-            frame_count=cfg.table_calibration_frames,
-        )
-        all_timings["desk_calib"] = calibration_ms
+        calibrate_table = input("\nRun table calibration? [y/N] ").strip().lower() in {
+            "y",
+            "yes",
+        }
+        if calibrate_table:
+            # The diagnostic uses the exact runtime point-cloud policy. The
+            # new fit is used immediately whether or not it is published.
+            table_plane_abcd, calibration_ms = _calibrate_table(
+                camera=camera,
+                geometry=geometry,
+                T_xarm_base_from_color=T_xarm_base_from_color,
+                config=pcd_config,
+                plane_path=_resolve_table_plane_path(runtime),
+                frame_count=cfg.table_calibration_frames,
+            )
+            all_timings["desk_calib"] = calibration_ms
+        elif runtime.environment.table.enabled:
+            table_plane_abcd = runtime.environment.table.plane_abcd
+            all_timings["desk_calib"] = math.nan
+            print(
+                "  Table calibration skipped; using resolved desk_plane.json: "
+                f"{np.round(table_plane_abcd, 6)}"
+            )
+        else:
+            table_plane_abcd = None
+            all_timings["desk_calib"] = math.nan
+            print(
+                "  Table calibration skipped; table crop is disabled by runtime config."
+            )
 
-        result, t = _build_cloud(
+        # Use a post-calibration frame for the reported production result;
+        # never apply a newly fitted plane to a stale pre-calibration frame.
+        rgb, depth_raw, _, _ = _capture_frame(camera)
+
+        result = _build_cloud(
             depth_raw=depth_raw,
             rgb=rgb,
             depth_scale_m=camera.get_depth_scale(),
             geometry=geometry,
-            T_xarm_base_from_depth=T_xarm_base_from_depth,
+            T_xarm_base_from_color=T_xarm_base_from_color,
+            config=pcd_config,
+            table_plane_abcd=table_plane_abcd,
+        )
+        benchmark_result, t = _benchmark_production_pipeline(
+            camera=camera,
+            geometry=geometry,
+            T_xarm_base_from_color=T_xarm_base_from_color,
             config=pcd_config,
             table_plane_abcd=table_plane_abcd,
         )
         all_timings.update(t)
+        if benchmark_result.shape[0]:
+            result = benchmark_result
 
         _print_timing_summary(all_timings)
 
         if cfg.show_o3d:
-            _visualize_result(result, T_xarm_base_from_depth, pcd_config)
+            _visualize_result(result, T_xarm_base_from_color, pcd_config)
         else:
             print("\n  open3d visualizer skipped (show_o3d=False)")
 

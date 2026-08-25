@@ -17,7 +17,7 @@ import numpy as np
 
 @dataclass(frozen=True)
 class PointCloudConfig:
-    """Validated native RGB-D point-cloud processing policy."""
+    """Validated depth-to-color aligned RGB-D point-cloud policy."""
 
     num_points: int = 1024
     depth_min_m: float = 0.30
@@ -25,27 +25,42 @@ class PointCloudConfig:
     edge_jump_m: float = 0.030
     edge_surface_band_m: float = 0.008
     depth_support_min_neighbors: int = 2
-    table_clearance_m: float = 0.008
-    table_support_min_pixels: int = 5
+    # Only at a depth discontinuity, require a denser same-surface 3x3
+    # neighborhood. One- or two-pixel structures at an unresolved edge are
+    # intentionally treated as unreliable depth rather than preserved noise.
+    edge_support_min_neighbors: int = 4
+    # Pixels at or below the core height are unambiguously table. Components
+    # above the core are preserved down to that height only when enough pixels
+    # exceed the object-seed height. This removes low table residual islands
+    # without dilating the table mask into object boundaries.
+    table_core_height_m: float = 0.006
+    table_object_seed_height_m: float = 0.012
+    table_object_seed_min_pixels: int = 4
     workspace: tuple[float, float, float, float, float, float] = (
-        0.25,
-        -0.60,
-        0.005,
-        0.85,
-        0.60,
+        0.0,
+        -0.50,
+        0.0,
+        0.80,
+        0.50,
         0.80,
     )
     voxel_size_m: float = 0.005
     outlier_radius_m: float = 0.012
-    outlier_min_neighbors: int = 2
+    outlier_min_neighbors: int = 5
+    # Radius-neighbor pairs define both local density and connected islands.
+    # Eight removes dense 6--7 point fragments that can satisfy the five-
+    # neighbor rule, while remaining conservative for small real objects.
+    outlier_min_component_points: int = 8
     outlier_candidate_multiplier: int = 8
 
     def __post_init__(self) -> None:
         integer_fields = (
             ("num_points", self.num_points, 1),
             ("depth_support_min_neighbors", self.depth_support_min_neighbors, 0),
-            ("table_support_min_pixels", self.table_support_min_pixels, 1),
+            ("edge_support_min_neighbors", self.edge_support_min_neighbors, 0),
+            ("table_object_seed_min_pixels", self.table_object_seed_min_pixels, 1),
             ("outlier_min_neighbors", self.outlier_min_neighbors, 0),
+            ("outlier_min_component_points", self.outlier_min_component_points, 1),
             ("outlier_candidate_multiplier", self.outlier_candidate_multiplier, 1),
         )
         for name, value, minimum in integer_fields:
@@ -59,7 +74,8 @@ class PointCloudConfig:
             "depth_max_m",
             "edge_jump_m",
             "edge_surface_band_m",
-            "table_clearance_m",
+            "table_core_height_m",
+            "table_object_seed_height_m",
             "voxel_size_m",
             "outlier_radius_m",
         )
@@ -79,10 +95,14 @@ class PointCloudConfig:
             raise ValueError("edge thresholds must be non-negative with positive jump")
         if self.depth_support_min_neighbors > 8:
             raise ValueError("depth_support_min_neighbors must be at most 8")
-        if self.table_clearance_m < 0.0:
-            raise ValueError("table_clearance_m must be non-negative")
-        if self.table_support_min_pixels > 9:
-            raise ValueError("table_support_min_pixels must be at most 9")
+        if self.edge_support_min_neighbors > 8:
+            raise ValueError("edge_support_min_neighbors must be at most 8")
+        if self.table_core_height_m < 0.0:
+            raise ValueError("table_core_height_m must be non-negative")
+        if self.table_object_seed_height_m <= self.table_core_height_m:
+            raise ValueError(
+                "table_object_seed_height_m must exceed table_core_height_m"
+            )
         if self.voxel_size_m <= 0.0 or self.outlier_radius_m <= 0.0:
             raise ValueError("voxel and outlier radii must be positive")
         lower = self.workspace[:3]
@@ -101,12 +121,15 @@ class PointCloudConfig:
             "edge_jump_m": self.edge_jump_m,
             "edge_surface_band_m": self.edge_surface_band_m,
             "depth_support_min_neighbors": self.depth_support_min_neighbors,
-            "table_clearance_m": self.table_clearance_m,
-            "table_support_min_pixels": self.table_support_min_pixels,
+            "edge_support_min_neighbors": self.edge_support_min_neighbors,
+            "table_core_height_m": self.table_core_height_m,
+            "table_object_seed_height_m": self.table_object_seed_height_m,
+            "table_object_seed_min_pixels": self.table_object_seed_min_pixels,
             "workspace": list(self.workspace),
             "voxel_size_m": self.voxel_size_m,
             "outlier_radius_m": self.outlier_radius_m,
             "outlier_min_neighbors": self.outlier_min_neighbors,
+            "outlier_min_component_points": self.outlier_min_component_points,
             "outlier_candidate_multiplier": self.outlier_candidate_multiplier,
         }
 

@@ -1,4 +1,4 @@
-"""Schema-v21 contracts shared by episode writers and readers."""
+"""Schema-v22 contracts shared by episode writers and readers."""
 
 from __future__ import annotations
 
@@ -16,9 +16,13 @@ from dexmani_real.ipc.schema import (
     HAND_TACTILE_SUM_SHAPE,
 )
 
-EPISODE_SCHEMA_VERSION = 21
-# Only the current raw layout is supported at runtime.
-SUPPORTED_EPISODE_SCHEMA_VERSIONS: frozenset[int] = frozenset({EPISODE_SCHEMA_VERSION})
+EPISODE_SCHEMA_VERSION = 22
+# v21 camera depth was native; v22 stores depth_to_color-aligned Z16 in the
+# same sidecar layout. Readers retain v21 support but consumers must branch on
+# the explicit schema/metadata semantics rather than silently reinterpret it.
+SUPPORTED_EPISODE_SCHEMA_VERSIONS: frozenset[int] = frozenset(
+    {21, EPISODE_SCHEMA_VERSION}
+)
 ARM_SENT_DATASET = "action_arm_joint_sent"
 ARM_SENT_MARKER = "arm_sent_stream"
 
@@ -313,7 +317,7 @@ def normalize_diagnostics(
 
 
 def required_dataset_names() -> frozenset[str]:
-    """Return the datasets required in every raw v21 data.h5."""
+    """Return the datasets required in every raw episode data.h5."""
     return frozenset(DATASET_SPECS) | frozenset(CAMERA_TIMING_DATASET_SPECS)
 
 
@@ -324,7 +328,7 @@ def validate_data_layout(
     frame_count: int,
     arm_sent_stream: bool,
 ) -> tuple[str, ...]:
-    """Return deterministic validation errors for a raw v21 layout."""
+    """Return deterministic validation errors for a raw episode layout."""
     errors: list[str] = []
     if frame_count < 0:
         errors.append("num_frames must be non-negative, got {}".format(frame_count))

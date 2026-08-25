@@ -135,7 +135,7 @@ def pack_camera_frame(
     depth_timestamp_domain: int = 0,
     color_timestamp_domain: int | None = None,
 ) -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
-    """Pack one native RGB-D frame with explicit stream and host timing."""
+    """Pack one depth-to-color aligned RGB-D frame with explicit timing."""
     import numpy as np
 
     from dexmani_real.ipc.schema import CAMERA_FRAME_HEADER_DTYPE
@@ -186,7 +186,7 @@ def pack_camera_frame(
     receive_monotonic_ns = int(wait_return_monotonic_ns)
     payload_ready_ns = int(payload_ready_monotonic_ns)
     if receive_monotonic_ns <= 0 or payload_ready_ns <= 0:
-        raise ValueError("native camera timing stages must be positive")
+        raise ValueError("camera timing stages must be positive")
     if source_monotonic_ns > receive_monotonic_ns:
         raise ValueError("camera source time cannot be later than host receive time")
     if payload_ready_ns < receive_monotonic_ns:
@@ -302,7 +302,9 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
         _profile_json = json.dumps(
             {
                 "streams": cam.get_active_profiles(),
-                "payload_mode": "native_rgbd",
+                "payload_mode": "depth_to_color_aligned_rgbd",
+                "depth_payload_frame": "color",
+                "native_depth_retained_by_driver": True,
                 "frame_queue_capacity": cam.config.frame_queue_capacity,
                 "l515_depth_options": cam.get_l515_depth_option_snapshot(),
                 "geometry": json.loads(_geometry_json),
@@ -338,8 +340,13 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
             shared.set_heartbeat("camera", time.monotonic())
 
             if _publish_payload:
+                if frame.rgb is None or frame.depth_aligned_to_color_raw is None:
+                    raise RuntimeError(
+                        "camera configured with color must publish aligned RGB-D"
+                    )
                 pc_valid_depth_ratio = float(
-                    np.count_nonzero(frame.depth_raw) / frame.depth_raw.size
+                    np.count_nonzero(frame.depth_aligned_to_color_raw)
+                    / frame.depth_aligned_to_color_raw.size
                 )
                 if frame.clock_reset:
                     camera_health = CameraHealth.CLOCK_RESET
@@ -357,8 +364,8 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
                     )
                 try:
                     header, rgb, depth = pack_camera_frame(
-                        frame.rgb,  # type: ignore[arg-type]
-                        frame.depth_raw,
+                        frame.rgb,
+                        frame.depth_aligned_to_color_raw,
                         frame.depth_device_timestamp_s,
                         frame.color_device_timestamp_s,
                         frame.depth_frame_number,

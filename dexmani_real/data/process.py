@@ -1,4 +1,4 @@
-"""Transactional raw-v21 to processed-v5 episode processing."""
+"""Transactional depth-to-color aligned raw-v22 to processed-v7 processing."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 5
+PROCESSED_SCHEMA_VERSION = 7
 _SOURCE_MEMBERS = ("data.h5", "depth.h5", "rgb.mp4")
 _VALIDATION_CHUNK_BYTES = 64 * 1024 * 1024
 
@@ -92,27 +92,28 @@ def _intrinsics_from_meta(meta: Any, *, stream: str) -> CameraIntrinsics:
 
 
 def _geometry_from_reader(reader: EpisodeReader) -> RGBDGeometry:
-    if reader.schema_version != 21:
+    if reader.schema_version != 22:
         raise ValueError(
-            "processed v5 requires native raw schema v21, "
+            "processed v7 requires depth_to_color raw schema v22, "
             f"got v{reader.schema_version}"
         )
     meta = reader.h5f["meta"].attrs
-    return RGBDGeometry(
+    native_geometry = RGBDGeometry(
         depth=_intrinsics_from_meta(meta, stream="depth"),
         color=_intrinsics_from_meta(meta, stream="color"),
         T_color_from_depth=np.asarray(
             meta["camera_T_color_from_depth"], dtype=np.float64
         ).reshape(4, 4),
     )
+    return native_geometry.aligned_depth_to_color()
 
 
 def _require_supported_processed_camera_pose(reader: EpisodeReader) -> None:
     """Fail closed unless the raw timing contract supports camera geometry.
 
     ``eye_to_hand`` uses a static calibration and is always supported.
-    ``eye_in_hand`` would need the wrist pose evaluated at the native
-    color/depth exposure times, but raw v21 does not persist per-stream
+    ``eye_in_hand`` would need the wrist pose evaluated at the aligned
+    color/depth exposure times, but raw v22 does not persist per-stream
     host-mapped camera source timestamps, so any camera-modal profile must
     fail before a processed artifact is written.
     """
@@ -122,27 +123,24 @@ def _require_supported_processed_camera_pose(reader: EpisodeReader) -> None:
     if camera_type == "eye_in_hand":
         raise ValueError(
             "processed RGB/camera_extrinsic/pointcloud for eye_in_hand requires "
-            "arm pose evaluated at native color/depth exposure times; raw v21 "
+            "arm pose evaluated at color/depth exposure times; raw v22 "
             "does not persist per-stream host-mapped camera source timestamps"
         )
     raise ValueError(f"unsupported camera_type {camera_type!r}")
 
 
-def _depth_transform(reader: EpisodeReader) -> np.ndarray:
+def _base_from_color_transform(reader: EpisodeReader) -> np.ndarray:
     meta = reader.h5f["meta"].attrs
     _require_supported_processed_camera_pose(reader)
     return _validate_transform(
-        np.asarray(meta["camera_T_xarm_base_from_depth"]),
-        label="camera_T_xarm_base_from_depth",
+        np.asarray(meta["camera_T_xarm_base_from_color"]),
+        label="camera_T_xarm_base_from_color",
     )
 
 
 def _color_transform(reader: EpisodeReader, geometry: RGBDGeometry) -> np.ndarray:
-    depth_from_color = np.linalg.inv(geometry.T_color_from_depth)
-    return _validate_transform(
-        _depth_transform(reader) @ depth_from_color,
-        label="T_xarm_base_from_color",
-    )
+    del geometry
+    return _base_from_color_transform(reader)
 
 
 @dataclass
@@ -153,7 +151,7 @@ class _PointCloudDeriver:
     geometry: RGBDGeometry
     depth_scale: float
     config: ProcessingConfig
-    static_base_from_depth: np.ndarray
+    static_base_from_color: np.ndarray
 
     @classmethod
     def from_reader(
@@ -169,7 +167,7 @@ class _PointCloudDeriver:
             geometry=geometry,
             depth_scale=depth_scale,
             config=config,
-            static_base_from_depth=_depth_transform(reader),
+            static_base_from_color=_base_from_color_transform(reader),
         )
 
     def derive(self, source_index: int, rgb: np.ndarray) -> np.ndarray | None:
@@ -179,7 +177,7 @@ class _PointCloudDeriver:
             color=np.asarray(rgb, dtype=np.uint8),
             depth_scale_m=self.depth_scale,
             geometry=self.geometry,
-            T_xarm_base_from_depth=self.static_base_from_depth,
+            T_xarm_base_from_color=self.static_base_from_color,
             table_plane_abcd=self.config.table_plane_abcd,
             config=self.config.pointcloud,
         )
@@ -388,7 +386,7 @@ def _write_attrs(
             "fingertip_points_unit": "m",
             "action_ee_frame": "xarm_base",
             "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
-            "contact_force_source": "raw_v21.hand_contact",
+            "contact_force_source": "raw_v22.hand_contact",
             "contact_force_unit": str(
                 meta.get("tactile_unit", "sdk_scaled_unknown_si")
             ),
@@ -415,25 +413,23 @@ def _write_attrs(
         output.attrs.update(
             {
                 "rgb_transform": "resize_no_crop",
-                "depth_transform": (
-                    "native_depth_resize_no_crop_nearest;not_registered_to_rgb"
-                ),
+                "depth_transform": "depth_to_color_aligned_resize_no_crop_nearest",
                 "depth_unit": "sensor_unit",
                 "depth_scale_m_per_unit": float(meta["depth_scale"]),
                 "depth_invalid_value": 0,
                 "camera_intrinsic_semantics": (
-                    "resized_native_color_pinhole_intrinsics"
+                    "resized_color_intrinsics_for_depth_to_color_aligned_depth"
                 ),
                 "camera_extrinsic_semantics": (
                     "T_xarm_base_from_color;native_color_optical_to_xarm_base"
                 ),
-                "camera_depth_intrinsics_native": np.asarray(
+                "source_camera_depth_intrinsics_native": np.asarray(
                     meta["camera_depth_intrinsics"], dtype=np.float64
                 ),
-                "camera_depth_distortion_model": str(
+                "source_camera_depth_distortion_model": str(
                     meta["camera_depth_distortion_model"]
                 ),
-                "camera_depth_distortion_coeffs": np.asarray(
+                "source_camera_depth_distortion_coeffs": np.asarray(
                     meta["camera_depth_distortion_coeffs"], dtype=np.float64
                 ),
                 "camera_color_distortion_model": str(
@@ -651,13 +647,13 @@ def _expected_specs(
 def validate_processed_hdf5(
     path: str | Path, config: ProcessingConfig
 ) -> dict[str, Any]:
-    """Fail closed on a processed Real HDF5 v5 artifact."""
+    """Fail closed on a processed Real HDF5 v7 artifact."""
 
     artifact = Path(path)
     with h5py.File(artifact, "r") as source:
         expected_top = set(config.profile.dataset_keys) | {"provenance"}
         if set(source.keys()) != expected_top:
-            raise ValueError(f"{artifact.name}: top-level keys do not match v5 profile")
+            raise ValueError(f"{artifact.name}: top-level keys do not match v7 profile")
         length = int(source.attrs.get("episode_steps", -1))
         if length < config.min_episode_frames:
             raise ValueError(f"{artifact.name}: episode_steps={length} is too short")
@@ -696,15 +692,15 @@ def validate_processed_hdf5(
                 raise ValueError(f"{artifact.name}: invalid depth scale")
             if (
                 str(source.attrs.get("camera_intrinsic_semantics", ""))
-                != "resized_native_color_pinhole_intrinsics"
+                != "resized_color_intrinsics_for_depth_to_color_aligned_depth"
                 or str(source.attrs.get("camera_extrinsic_semantics", ""))
                 != "T_xarm_base_from_color;native_color_optical_to_xarm_base"
                 or str(source.attrs.get("depth_transform", ""))
-                != "native_depth_resize_no_crop_nearest;not_registered_to_rgb"
+                != "depth_to_color_aligned_resize_no_crop_nearest"
             ):
-                raise ValueError(f"{artifact.name}: invalid native RGB-D semantics")
+                raise ValueError(f"{artifact.name}: invalid aligned RGB-D semantics")
             depth_k = np.asarray(
-                source.attrs.get("camera_depth_intrinsics_native", ()),
+                source.attrs.get("source_camera_depth_intrinsics_native", ()),
                 dtype=np.float64,
             )
             color_from_depth = np.asarray(
@@ -749,7 +745,7 @@ def validate_processed_hdf5(
                 or str(source.attrs.get("point_cloud_transform", ""))
                 != POINT_CLOUD_TRANSFORM
             ):
-                raise ValueError(f"{artifact.name}: invalid v5 point-cloud semantics")
+                raise ValueError(f"{artifact.name}: invalid v7 point-cloud semantics")
         if str(source.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
             raise ValueError(f"{artifact.name}: invalid schema_name")
         if int(source.attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
@@ -876,9 +872,9 @@ def process_episode_root(
         try:
             with _open_episode(episode) as reader:
                 reader.require_valid(purpose="offline processing")
-                if reader.schema_version != 21:
+                if reader.schema_version != 22:
                     raise ValueError(
-                        "processed v5 accepts native raw schema v21 only; "
+                        "processed v7 accepts depth_to_color raw schema v22 only; "
                         f"got v{reader.schema_version}"
                     )
                 decisions.append(
