@@ -148,13 +148,12 @@ def _load_control_resources(
 
     vr_config_path = Path(__file__).resolve().parents[2] / config.vr_transform_path
     vr_calibration = load_vr_transform(vr_config_path)
-    rotation_robot_vr = vr_calibration.transform
+    vr_to_robot_rot = vr_calibration.transform
     logger.info("VR transform loaded: theta=%.6g°", vr_calibration.theta_deg)
     arm_mapper = ArmWristMapper(
         pos_scale=config.runtime.policy.vr_mapping.pos_scale,
         rot_scale=config.runtime.policy.vr_mapping.rot_scale,
-        vr_to_base_rot=rotation_robot_vr,
-        T_vr_to_robot=rotation_robot_vr,
+        vr_to_robot_rot=vr_to_robot_rot,
         max_delta_rot_rad=config.runtime.policy.vr_mapping.max_delta_rot_rad,
         base_to_world_rot=np.eye(3, dtype=np.float64),
     )

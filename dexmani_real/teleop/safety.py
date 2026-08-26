@@ -57,9 +57,6 @@ def _reset_mapper_from_frames(
         return False
 
     try:
-        head_quat = vr_frame.get("head_quat_wxyz")
-        if head_quat is not None:
-            mapper.set_heading(np.asarray(head_quat, dtype=np.float64))
         wrist_pos = vr_frame.get("wrist_pos")
         wrist_quat_wxyz = vr_frame.get("wrist_quat_wxyz")
         if wrist_pos is None or wrist_quat_wxyz is None:

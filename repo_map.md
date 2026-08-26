@@ -34,6 +34,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `docs/maniunicon_reference_design.md` | 从 ManiUniCon 静态审查提炼的 learned-policy 部署改进思路、采纳边界与验收要求。 |
 | `docs/pointcloud_pipeline.md` | depth-to-color aligned 点云的采集、处理、时序与持久化契约。 |
 | `docs/teleop_jitter_incident.md` | 键盘遥操作卡顿、抖动、delta 拒绝与 coupled-command 修复复盘。 |
+| `docs/vr_coordinate_transform_followup.md` | VR wrist→EEF 坐标换算审查、证据边界、真实样本诊断与后续修正决策记录。 |
 | `user_design.md` | 已确认的机器人行为与安全取舍。 |
 | `.gitignore` | 生成物、本地环境、数据集与运行输出排除规则。 |
 | `pyproject.toml` | 包元数据、依赖、package data 与工具配置。 |
@@ -265,6 +266,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 
 | 路径 | 主要职责 |
 |---|---|
+| `tests/test_arm_wrist_mapper.py` | 固定 VR→robot 标定、腕部旋转限幅状态与 tracking 毛刺恢复的纯几何合同。 |
 | `tests/test_coupled_command_publication.py` | coupled-command 非阻塞发布、active ticket 覆盖/撤销、ACK ownership 与运动准入合同。 |
 | `tests/test_data_segments.py` | source 缺口到 processed/Zarr episode 边界及跨缺口质量计算的合同。 |
 | `tests/test_deployment_timing.py` | run epoch、因果 observation grid、checkpoint 数据合同与 immutable plan deadline。 |
