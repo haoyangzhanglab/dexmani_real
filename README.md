@@ -144,7 +144,7 @@ CLI override > YAML file > dexmani_real/config/defaults.py
 运行时配置由 [`config/runtime.py`](dexmani_real/config/runtime.py) 校验、冻结并生成
 SHA-256；部署配置由 [`deployment/config.py`](dexmani_real/deployment/config.py)
 独立解析。`pointcloud` 是与 EEF `policy.workspace` 分离的感知配置段；实时 worker、离线
-重建和 shadow 检查只从该段派生参数，并把策略 ID 与配置 SHA-256 写入 processed/Zarr
+重建和诊断入口只从该段派生参数，并把策略 ID 与配置 SHA-256 写入 processed/Zarr
 语义。可在不启动硬件的情况下查看遥操作解析结果：
 
 ```bash
@@ -166,7 +166,7 @@ python examples/collect_teleop.py --print-config
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |
-| 桌面点云与标定诊断 | `python examples/pointcloud_process_example.py` | 只连接相机；多帧拟合桌面；仅在显式确认后备份并更新共享桌面标定 |
+| 桌面点云与标定诊断 | `python examples/pointcloud_process_example.py [--save-dir outputs/pointcloud_diagnostics]` | 只连接相机；可保存 aligned RGB-D、raw/processed 点云与离线重建 metadata；仅在显式确认后更新共享桌面标定 |
 | XHand 独立诊断 | `python examples/xhand_control_example.py` | 连接并控制 XHand |
 
 支持 argparse 的入口应先用 `--help` 查看当前参数；
@@ -193,14 +193,19 @@ coordinator 将通过安全门的策略 endpoint 原子写为单条 coupled comm
 不再执行。`action_id` 保留在 record 与反馈中用于审计和 ACK，不参与 ownership 判定。这保证软件
 IPC 记录一致且保持 latest-wins 实时性，不表示两个执行器物理同步或已完成动作。
 
-实时、离线处理和 shadow 诊断共用 `PointCloudConfig` 与同一个生产 builder。处理顺序为：
-aligned depth 范围/局部支持与边缘四方向支撑过滤 → 使用缓存 color-camera ray 的桌面高度
+实时、离线处理和诊断入口共用 `PointCloudConfig` 与同一个生产 builder。处理顺序为：
+aligned depth 范围/OpenCV 3×3 局部支持与边缘四方向支撑过滤 → 使用缓存 color-camera ray 的桌面高度
 迟滞裁减（在反投影前，以可靠高点连通保护物体低处表面）→ color-frame 反投影 → xArm-base
 变换与 workspace 裁减 → XYZ/RGB 均值体素 →
-单次 radius graph 邻居密度/连通域过滤 → 空间候选上限 → 确定性固定 N 采样。感知
+单次 radius graph 邻居密度/连通域过滤 → 空间候选上限 → 15 mm 粗体素分层的确定性
+固定 N 采样。感知
 workspace 当前为 x `[0.0,0.8]`、y `[-0.5,0.5]`、z `[0.0,0.8]` m；体素 RGB 是其源
 aligned 像素 RGB 的均值。processed HDF5 和 Policy Zarr 同时保存并校验算法、配置 SHA-256
 与桌面平面身份，禁止混合不同点云语义的数据。
+
+deployment lifecycle 从 resolved runtime 直接投影实时 worker 的完整点云配置，并将同一
+policy ID、采样/变换语义、配置哈希和桌面平面写入模型数据合同；worker 启动日志输出这些身份，
+不存在独立的生产参数副本或旧策略兼容分支。
 
 示例 deployment YAML：
 
@@ -237,6 +242,9 @@ EMA 选择和 denoise steps 从 checkpoint 内嵌配置读取。部署不加载�
 实时 worker 的 compute/source-to-publish p95 仍须在完整硬件部署中记录。
 `pointcloud_process_example.py` 同时报告纯构建与 capture-to-cloud 的 p50/p95/max，并报告
 深度滤波、桌面裁减、反投影、体素和离群过滤等逐阶段 p95；纯构建目标为 p95 < 40 ms。
+传入 `--save-dir outputs/pointcloud_diagnostics` 时，它还会把 post-calibration 同一帧的 aligned
+RGB-D、完整 raw 点云、canonical processed 点云、相机几何、外参、桌面平面和点云配置原子保存为
+独立目录快照；不传该参数时不写文件。
 
 ### L515 RGB/Depth 时序限制
 

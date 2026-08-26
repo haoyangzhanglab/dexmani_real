@@ -101,7 +101,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `realsense.py` | RealSense driver、native frame ownership copy 与设备配置。 |
 | `camera_worker.py` | RealSense lifecycle、时序/健康信息与 camera ring 发布。 |
 | `pointcloud.py` | SDK-free depth-to-color aligned RGB-D 到 xArm-base 点云算法、桌面预裁减与体素 RGB 聚合。 |
-| `pointcloud_worker.py` | latest-only 固定 `float32[N,6]` aligned point-cloud publisher。 |
+| `pointcloud_worker.py` | resolved 点云策略的 latest-only 固定 `float32[N,6]` publisher、freshness 与语义身份日志。 |
 | `vr_worker.py` | crash-isolated Quest/HTS receiver 与 VR ring publisher。 |
 
 ### `calibration/`
@@ -258,7 +258,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `calibrate_camera.py` | xArm+RealSense hand-eye 标定入口。 |
 | `calibrate_vr_heading.py` | VR heading 采集、质量门禁与 transform 发布。 |
 | `realsense_record_example.py` | RealSense RGB-D/point-cloud 交互诊断。 |
-| `pointcloud_process_example.py` | L515 点云处理分段/端到端时延诊断，以及按需桌面标定与显式 plane 发布。 |
+| `pointcloud_process_example.py` | L515 点云处理分段/端到端时延诊断、raw/processed 离线快照，以及按需桌面标定与显式 plane 发布。 |
 | `xhand_control_example.py` | 使用 canonical hand 限位的 XHand 独立硬件诊断。 |
 
 ## 5. 离线验证
@@ -270,6 +270,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `tests/test_deployment_timing.py` | run epoch、因果 observation grid、checkpoint 数据合同与 immutable plan deadline。 |
 | `tests/test_deployment_manifest.py` | deployment manifest 模态去重与顺序规范化合同。 |
 | `tests/test_keyboard_arm_limits.py` | keyboard 发布完整 IK endpoint、禁用通用 arm delta clip 的合同。 |
+| `tests/test_pointcloud_sampling.py` | 固定 N 分层采样、数值快速路径、网格键 fail-closed 与实时策略投影合同。 |
 | `tests/test_runtime_channels_ticket_state.py` | RuntimeChannels 的 coupled-command ticket 分配、零初始化与真实 shared-memory round-trip 合同。 |
 | `tests/test_safety_gate_command_delta.py` | learned-policy 单步限幅使用命令历史、几何检查使用实测状态的合同。 |
 | `tests/test_worker_command_validation.py` | arm/hand 共用时效、限位、异常命令和 superseded snapshot 的 fail-closed 合同。 |

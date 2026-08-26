@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""Usage: ``python examples/pointcloud_process_example.py``.
+"""Usage: ``python examples/pointcloud_process_example.py [--save-dir DIR]``.
 
 Self-contained L515 tabletop point-cloud and table-plane diagnostic. It uses
 the resolved table plane by default and enters deterministic multi-frame table
 calibration only after operator confirmation. A new fit is used immediately;
 publishing ``desk_plane.json`` requires separate confirmation and affects both
 perception cropping and table-aware collision geometry on the next runtime
-resolution.
+resolution. ``--save-dir`` atomically saves the aligned RGB-D source, raw and
+processed xArm-base clouds, and complete offline reconstruction metadata.
 """
 
 from __future__ import annotations
 
+import argparse
 import math
+import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -32,10 +37,16 @@ from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
 from dexmani_real.sensor.camera_geometry import RGBDGeometry
 from dexmani_real.sensor.pointcloud import (
+    POINT_CLOUD_COLOR_SOURCE,
+    POINT_CLOUD_POLICY_ID,
+    POINT_CLOUD_SAMPLING,
+    POINT_CLOUD_TRANSFORM,
     aligned_depth_points_in_base,
     build_point_cloud_with_stats,
+    build_raw_point_cloud,
 )
 from dexmani_real.sensor.realsense import L515DepthConfig, RealSense, RealSenseConfig
+from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
 
 if TYPE_CHECKING:
     import open3d as o3d
@@ -208,6 +219,154 @@ _BUILD_TIMING_FIELDS = (
     "spatial_outlier_filter_ms",
     "color_sampling_ms",
 )
+
+_SNAPSHOT_SCHEMA_NAME = "dexmani-real-pointcloud-diagnostic-snapshot"
+_SNAPSHOT_SCHEMA_VERSION = 2
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="L515 tabletop point-cloud processing and calibration diagnostic"
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Atomically save the post-calibration aligned RGB-D frame, raw and "
+            "processed clouds, and reconstruction metadata below this directory"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def _validate_snapshot_cloud(cloud: np.ndarray, *, label: str) -> np.ndarray:
+    """Return one finite contiguous float32 ``[N,6]`` xyzrgb cloud."""
+    value = np.asarray(cloud)
+    if value.ndim != 2 or value.shape[1] != 6 or value.dtype != np.float32:
+        raise ValueError(
+            f"{label} must be float32 [N,6], got shape={value.shape} dtype={value.dtype}"
+        )
+    if not np.all(np.isfinite(value)):
+        raise ValueError(f"{label} contains NaN/Inf")
+    if value.size and (np.any(value[:, 3:] < 0.0) or np.any(value[:, 3:] > 1.0)):
+        raise ValueError(f"{label} RGB values must be in [0,1]")
+    return np.ascontiguousarray(value)
+
+
+def _save_diagnostic_snapshot(
+    *,
+    output_root: Path,
+    rgb: np.ndarray,
+    depth_raw: np.ndarray,
+    raw_point_cloud: np.ndarray,
+    processed_point_cloud: np.ndarray,
+    depth_scale_m: float,
+    geometry: RGBDGeometry,
+    T_xarm_base_from_color: np.ndarray,
+    table_plane_abcd: tuple[float, float, float, float] | None,
+    table_plane_source: str,
+    pointcloud_config: PointCloudConfig,
+    runtime_config_sha256: str,
+    camera_info: dict,
+) -> Path:
+    """Durably publish one self-contained offline point-cloud tuning snapshot."""
+    color = np.asarray(rgb)
+    depth = np.asarray(depth_raw)
+    if color.dtype != np.uint8 or color.ndim != 3 or color.shape[2] != 3:
+        raise ValueError("rgb must be uint8 [H,W,3]")
+    if depth.dtype != np.uint16 or depth.shape != color.shape[:2]:
+        raise ValueError("depth_raw must be uint16 [H,W] matching rgb")
+    expected_shape = (geometry.color.height, geometry.color.width)
+    if (
+        color.shape[:2] != expected_shape
+        or (
+            geometry.depth.height,
+            geometry.depth.width,
+        )
+        != expected_shape
+    ):
+        raise ValueError("aligned RGB-D arrays must match color-grid geometry")
+    if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
+        raise ValueError("depth_scale_m must be finite and positive")
+    raw_cloud = _validate_snapshot_cloud(raw_point_cloud, label="raw_point_cloud")
+    processed_cloud = _validate_snapshot_cloud(
+        processed_point_cloud,
+        label="processed_point_cloud",
+    )
+    if processed_cloud.shape[0] not in {0, pointcloud_config.num_points}:
+        raise ValueError("processed_point_cloud must be empty or match configured N")
+    transform = np.asarray(T_xarm_base_from_color, dtype=np.float64)
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError("T_xarm_base_from_color must be a finite 4x4 transform")
+    if table_plane_abcd is None:
+        table_plane_json = None
+    else:
+        plane = np.asarray(table_plane_abcd, dtype=np.float64)
+        if plane.shape != (4,) or not np.all(np.isfinite(plane)):
+            raise ValueError("table_plane_abcd must contain four finite values")
+        table_plane_json = plane.tolist()
+    if table_plane_source not in {
+        "calibrated_this_run",
+        "resolved_runtime",
+        "disabled",
+    }:
+        raise ValueError(f"invalid table_plane_source {table_plane_source!r}")
+
+    root = output_root.expanduser().resolve()
+    if root.exists() and not root.is_dir():
+        raise NotADirectoryError(f"snapshot output root is not a directory: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().astimezone()
+    artifact_name = timestamp.strftime("pointcloud_%Y%m%d_%H%M%S_%f")
+    target = root / artifact_name
+    temporary = Path(tempfile.mkdtemp(prefix=".pointcloud-tmp-", dir=root))
+
+    arrays = {
+        "rgb.npy": np.ascontiguousarray(color),
+        "depth_aligned_to_color_raw.npy": np.ascontiguousarray(depth),
+        "raw_point_cloud.npy": raw_cloud,
+        "processed_point_cloud.npy": processed_cloud,
+        "T_xarm_base_from_color.npy": np.ascontiguousarray(transform),
+    }
+    metadata = {
+        "schema_name": _SNAPSHOT_SCHEMA_NAME,
+        "schema_version": _SNAPSHOT_SCHEMA_VERSION,
+        "created_at": timestamp.isoformat(),
+        "payload_mode": "depth_to_color_aligned_rgbd",
+        "depth_payload_frame": "color",
+        "depth_scale_m_per_unit": float(depth_scale_m),
+        "aligned_geometry": geometry.to_dict(),
+        "table_plane_abcd": table_plane_json,
+        "table_plane_source": table_plane_source,
+        "runtime_config_sha256": runtime_config_sha256,
+        "pointcloud_config": pointcloud_config.to_dict(),
+        "pointcloud_config_sha256": pointcloud_config.sha256,
+        "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
+        "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
+        "point_cloud_sampling": POINT_CLOUD_SAMPLING,
+        "point_cloud_transform": POINT_CLOUD_TRANSFORM,
+        "point_cloud_frame": "xarm_base",
+        "point_cloud_columns": ["x_m", "y_m", "z_m", "r", "g", "b"],
+        "raw_point_cloud_semantics": "all_finite_nonzero_aligned_depth_pixels",
+        "processed_point_cloud_empty": processed_cloud.shape[0] == 0,
+        "camera": {
+            key: str(camera_info.get(key, "")) for key in ("name", "serial", "firmware")
+        },
+        "arrays": {
+            name: {"shape": list(value.shape), "dtype": str(value.dtype)}
+            for name, value in arrays.items()
+        },
+    }
+
+    try:
+        for name, value in arrays.items():
+            np.save(temporary / name, value, allow_pickle=False)
+        atomic_json_dump(metadata, temporary / "metadata.json", ensure_ascii=False)
+        return atomic_publish(temporary, target)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
 
 
 def _print_build_stage_timings(prefix: str, values: dict[str, float]) -> None:
@@ -662,8 +821,12 @@ def _visualize_result(
     )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     """Run the hardware diagnostic and return a process exit status."""
+    args = _parse_args(argv)
+    save_dir = None if args.save_dir is None else args.save_dir.expanduser().resolve()
+    if save_dir is not None and save_dir.exists() and not save_dir.is_dir():
+        raise NotADirectoryError(f"snapshot output root is not a directory: {save_dir}")
     cfg = PointCloudDiagnosticConfig()
     all_timings: dict[str, float] = {}
 
@@ -701,8 +864,10 @@ def main() -> int:
                 frame_count=cfg.table_calibration_frames,
             )
             all_timings["desk_calib"] = calibration_ms
+            table_plane_source = "calibrated_this_run"
         elif runtime.environment.table.enabled:
             table_plane_abcd = runtime.environment.table.plane_abcd
+            table_plane_source = "resolved_runtime"
             all_timings["desk_calib"] = math.nan
             print(
                 "  Table calibration skipped; using resolved desk_plane.json: "
@@ -710,6 +875,7 @@ def main() -> int:
             )
         else:
             table_plane_abcd = None
+            table_plane_source = "disabled"
             all_timings["desk_calib"] = math.nan
             print(
                 "  Table calibration skipped; table crop is disabled by runtime config."
@@ -728,6 +894,32 @@ def main() -> int:
             config=pcd_config,
             table_plane_abcd=table_plane_abcd,
         )
+        if save_dir is not None:
+            raw_cloud = build_raw_point_cloud(
+                depth_raw=depth_raw,
+                color=rgb,
+                depth_scale_m=camera.get_depth_scale(),
+                geometry=geometry,
+                T_xarm_base_from_color=T_xarm_base_from_color,
+            )
+            if raw_cloud is None:
+                raw_cloud = np.zeros((0, 6), dtype=np.float32)
+            snapshot_path = _save_diagnostic_snapshot(
+                output_root=save_dir,
+                rgb=rgb,
+                depth_raw=depth_raw,
+                raw_point_cloud=raw_cloud,
+                processed_point_cloud=result,
+                depth_scale_m=camera.get_depth_scale(),
+                geometry=geometry,
+                T_xarm_base_from_color=T_xarm_base_from_color,
+                table_plane_abcd=table_plane_abcd,
+                table_plane_source=table_plane_source,
+                pointcloud_config=pcd_config,
+                runtime_config_sha256=runtime.sha256,
+                camera_info=camera_info,
+            )
+            print(f"\nSaved point-cloud diagnostic snapshot: {snapshot_path}")
         benchmark_result, t = _benchmark_production_pipeline(
             camera=camera,
             geometry=geometry,

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import time
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -24,10 +24,17 @@ from dexmani_real.ipc.schema import (
 )
 from dexmani_real.sensor.camera_geometry import RGBDGeometry
 from dexmani_real.sensor.camera_worker import CameraHealth
-from dexmani_real.sensor.pointcloud import POINT_CLOUD_POLICY_ID, build_point_cloud
+from dexmani_real.sensor.pointcloud import (
+    POINT_CLOUD_COLOR_SOURCE,
+    POINT_CLOUD_POLICY_ID,
+    POINT_CLOUD_SAMPLING,
+    POINT_CLOUD_TRANSFORM,
+    build_point_cloud,
+)
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
+    from dexmani_real.config.runtime import ResolvedRuntimeConfig
     from dexmani_real.ipc.channels import RuntimeChannels
 
 logger = get_logger(__name__)
@@ -56,8 +63,8 @@ def _validate_transform(value: np.ndarray, *, label: str) -> np.ndarray:
 class PointCloudLoopConfig:
     """Resolved processing and freshness policy for the realtime worker."""
 
-    pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
-    camera_calibration: CameraCalib = field(default_factory=CameraCalib)
+    pointcloud: PointCloudConfig
+    camera_calibration: CameraCalib
     table_plane_abcd: tuple[float, float, float, float] | None = None
     max_input_age_s: float = 0.25
 
@@ -87,17 +94,16 @@ class PointCloudLoopConfig:
     @classmethod
     def from_runtime(
         cls,
-        runtime: object,
+        runtime: "ResolvedRuntimeConfig",
         *,
         num_points: int,
     ) -> "PointCloudLoopConfig":
-        environment = getattr(runtime, "environment")
-        camera = getattr(runtime, "camera")
-        table = environment.table
+        table = runtime.environment.table
         return cls(
-            pointcloud=replace(getattr(runtime, "pointcloud"), num_points=num_points),
+            pointcloud=replace(runtime.pointcloud, num_points=num_points),
+            camera_calibration=CameraCalib(),
             table_plane_abcd=table.plane_abcd if table.enabled else None,
-            max_input_age_s=float(camera.max_frame_age_s),
+            max_input_age_s=float(runtime.camera.max_frame_age_s),
         )
 
 
@@ -192,9 +198,13 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
         return
     geometry, depth_scale_m, base_from_color = static_inputs
     logger.info(
-        "pointcloud policy: id=%s config_sha256=%s config=%s table_plane_abcd=%s",
+        "pointcloud policy: id=%s config_sha256=%s color_source=%s sampling=%s "
+        "transform=%s config=%s table_plane_abcd=%s",
         POINT_CLOUD_POLICY_ID,
         cfg.pointcloud.sha256,
+        POINT_CLOUD_COLOR_SOURCE,
+        POINT_CLOUD_SAMPLING,
+        POINT_CLOUD_TRANSFORM,
         json.dumps(cfg.pointcloud.to_dict(), sort_keys=True, separators=(",", ":")),
         json.dumps(cfg.table_plane_abcd, separators=(",", ":")),
     )

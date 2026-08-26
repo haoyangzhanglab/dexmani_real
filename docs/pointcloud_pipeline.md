@@ -107,7 +107,7 @@ aligned uint16 depth + RGB
   → XYZ/RGB 均值体素化
   → 单次 radius graph 邻居密度/连通域过滤
   → 空间候选上限
-  → 固定 N 空间采样或循环补齐
+  → 粗体素分层的固定 N 采样或循环补齐
 ```
 
 ### 1. 深度 gate 与二维飞线过滤
@@ -145,15 +145,15 @@ height(u, v) = z(u, v) · dot(n_color, r(u, v)) + d_color
 这与反投影后代入平面等价，但可在分配三维点数组前删除桌面。随后对高于桌面核心的像素做
 一次 8 邻接连通域标记：
 
-- 高度不超过 `table_core_height_m=6 mm` 的点确定为桌面；
+- 高度不超过 `table_core_height_m=7 mm` 的点确定为桌面；
 - 每个候选连通域必须包含至少 `table_object_seed_min_pixels=4` 个高度不低于
-  `table_object_seed_height_m=12 mm` 的可靠物体种子；
-- 满足种子条件时，保留该连通域中所有高于 6 mm 的像素，包括物体接触边缘的 6–12 mm
+  `table_object_seed_height_m=13 mm` 的可靠物体种子；
+- 满足种子条件时，保留该连通域中所有高于 7 mm 的像素，包括物体接触边缘的 7–13 mm
   低处表面；不满足时，整个低矮残留簇作为桌面删除。
 
 这是一种高度迟滞：高阈值确认物体，低阈值恢复其连通表面。它不膨胀桌面掩膜，不会无条件
 吃掉物体边缘；一次连通域标记为线性复杂度，也没有逐像素迭代生长。
-低于或等于 6 mm 的表面与桌面在当前深度/平面观测中不可区分，仍按桌面处理；完全低于 12 mm
+低于或等于 7 mm 的表面与桌面在当前深度/平面观测中不可区分，仍按桌面处理；完全低于 13 mm
 且没有可靠高点的扁平物体也无法由纯几何高度与桌面残留可靠区分，需要降低种子阈值或增加其他
 感知先验。
 
@@ -195,10 +195,13 @@ graph。同一批邻接对依次提供：
 - 仅在通过邻居密度过滤的体素之间计算物理空间连通域，要求至少
   `outlier_min_component_points` 个体素点。这样稀疏桥接点不能把两个小孤立簇误连成大簇。
 
-当前最小连通域为 8 点，能删除虽满足 5 邻居规则、但总规模只有 6–7 点的紧凑碎片。过滤在
+当前最小连通域为 10 点，能删除虽满足 6 邻居规则、但总规模只有 7–9 点的紧凑碎片。过滤在
 全部体素上执行完成后，才以稳定空间哈希保留至多
-`num_points × outlier_candidate_multiplier` 个候选，避免离群点提前占用候选名额。最后按稳定
-空间哈希输出 `N` 个点；候选少于 `N` 时循环重复已有有效点，而不插值或伪造点。
+`num_points × outlier_candidate_multiplier` 个候选，避免离群点提前占用候选名额。固定 N 采样先在
+`sampling_coarse_voxel_stride=3` 的粗网格中各选一个确定性代表点；默认 5 mm 体素对应
+15 mm 粗网格。粗网格数少于 `N` 时，再按细体素空间哈希填充剩余名额；多于
+`N` 时按粗网格哈希截断。候选总数少于 `N` 时才循环重复已有有效点，而不插值或伪造点。
+这在不引入最远点采样二次时间成本的前提下，减少局部过密区域抢占名额造成的空间空洞。
 
 连通域和半径过滤只能删除小型或稀疏团块。密集、独立的假点团可能满足这两条纯几何规则；若
 场景保证所有有效物体接触桌面，可在业务层额外引入“连通域桌面锚定”规则。该规则不适用于
@@ -232,60 +235,38 @@ Run table calibration? [y/N]
 - 20 帧从 `camera.read()` 到点云结果的 capture-to-cloud p50/p95/max；
 - 各内部阶段的 p95。
 
+传入 `--save-dir <directory>` 时，入口会在该目录下原子发布一个 schema v2
+post-calibration 同帧诊断快照：
+`rgb.npy`、`depth_aligned_to_color_raw.npy`、`raw_point_cloud.npy`、
+`processed_point_cloud.npy`、`T_xarm_base_from_color.npy` 与 `metadata.json`。metadata 保存 aligned
+几何、`depth_scale_m`、桌面平面及来源、完整 `PointCloudConfig` 与 SHA-256、runtime SHA-256 和算法
+语义。所有 `.npy` 均禁用 pickle；即使 processed 构建为空，原始 RGB-D、raw 点云和空输出仍会保存，
+用于离线复现失败帧。该快照是算法诊断产物，不属于 raw episode 或 processed HDF5 schema。
+
 纯 build 不包含等待相机帧、SDK 对齐和共享内存发布；capture-to-cloud 包含 `camera.read()`
 及对齐/数组准备，但不包含实时 worker 的 ring 发布。需要评价部署总时延时，应同时读取实时
 worker 的 `source_to_publish_ms_p95` 日志。当前纯构建目标是 p95 < 40 ms。
 
-### 2026-08-25 L515 当前 v8 硬件基准
+### 2026-08-26 当前 v9 离线验证
 
-当前结果来自 L515（serial `f1382055`，firmware `1.5.8.1`）、Short Range preset、640×480
-depth-to-color aligned RGBD、桌面高度迟滞裁减、5 mm 体素、12 mm radius graph、5 邻居、
-8 点最小连通域和 `N=1024`。workspace 为 `x=[0.0, 0.8]`、`y=[-0.5, 0.5]`、
-`z=[0.0, 0.8]`；本次跳过桌面标定，使用已解析的 `desk_plane.json`。
+五个 L515 诊断快照覆盖常规桌面物体、机械臂轮廓和两个细小物体场景。当前默认策略使用
+5 邻居边缘支持、7/13 mm 桌面核心/物体种子高度、5 mm 体素、12 mm 离群半径、6 邻居、
+10 点最小连通域，以及 15 mm 粗体素分层的固定 N 采样。更严的桌面 8/14 mm 或半径 7 邻居
+会开始删除盘沿、物体轮廓和机械臂细结构，因此未进入生产默认值。
 
-| 指标 | 结果 | 诊断 |
-|---|---:|---|
-| 单帧 pure build | 26.9 ms | 内部阶段之和约 26.8 ms，计时一致 |
-| 20 帧 pure build p50 / p95 / max | 27.5 / 28.5 / 32.9 ms | p95 比 40 ms 目标低 11.5 ms |
-| 20 帧 capture-to-cloud p50 / p95 / max | 32.1 / 38.0 / 42.4 ms | p95 仍低于 40 ms；max 尾部来自采集/SDK 路径 |
-| 单独 frame capture | 6.0 ms | 单次展示帧，不与独立分位数直接相减 |
+`episode_20260826_152317` 的 240 个有效帧预先读入内存后，当前生产 builder 两轮结果如下：
 
-构建阶段 p95 如下。各阶段分别取 p95，不能严格相加；其和为 29.0 ms，略高于总耗时 p95
-28.5 ms 属于正常的分位数统计现象。
+| 指标 | 结果 |
+|---|---:|
+| pure-build p50 | 19.82--19.93 ms |
+| pure-build p95 | 23.73--24.01 ms |
+| 纯构建吞吐 | 56.8--57.5 FPS |
+| `depth_filter` p50 | 2.54--2.58 ms |
 
-| 阶段 | p95 | 占 pure-build p95 | 诊断 |
-|---|---:|---:|---|
-| `depth_filter` | 10.3 ms | 36.1% | 当前最大热点；范围、飞线与二维支持过滤 |
-| `table_crop` | 7.0 ms | 24.6% | plane height 与一次二维迟滞连通标记 |
-| `spatial_outlier_filter` | 5.9 ms | 20.7% | 单次 radius graph 密度/连通域过滤 |
-| `voxelization` | 2.3 ms | 8.1% | 23003 个裁减点聚合为 5126 个体素 |
-| `deprojection` | 1.8 ms | 6.3% | 仅反投影通过桌面裁减的像素 |
-| `base_workspace` | 1.4 ms | 4.9% | color → xArm-base 与 workspace 判断 |
-| `color_sampling` | 0.3 ms | 1.1% | 组装 `[xyzrgb]` 与固定 N 采样 |
-
-本帧点数变化为：
-
-```text
-valid 171,586
-→ supported 168,682        (二维过滤删除 2,904，1.69%)
-→ table reject 145,679     (删除 supported 的 86.36%)
-→ workspace reject 0       (本帧 workspace 不是有效裁减边界)
-→ crop 23,003
-→ voxel 5,126              (保留 crop 的 22.28%)
-→ density 4,991            (删除 135 个体素，2.63%)
-→ component 4,963          (再删除 28 个体素，0.56%)
-→ candidate 4,963
-→ output 1,024             (稳定空间下采样，不是额外离群过滤)
-```
-
-`workspace_reject=0` 与当前扩大后的 workspace 一致，表示这帧所有桌面裁减后点都位于配置范围内，
-不是 pipeline 漏执行。三维过滤共删除 163/5126 个体素（3.18%）；候选上限为 8192，因此本帧
-没有触发 candidate cap。若可视化仍有密集桌面残留，应优先调整桌面高度策略或检查平面标定，
-而不是继续提高半径邻居数，因为密集残留本来就能通过三维密度规则。
-
-capture-to-cloud p50 比 pure-build p50 高约 4.6 ms，但其 p95 差约 9.5 ms，max 差约
-9.5 ms。纯构建 max 只有 32.9 ms，因此 42.4 ms 的端到端尖峰主要来自 `camera.read()`、SDK
-对齐或调度等待。评价实时部署仍应以 point-cloud worker 的 `source_to_publish_ms_p95` 为准。
+OpenCV 3×3 depth fast path 与逐步 SciPy 参考实现的 240 帧最终点云 SHA-256 全部一致；五个
+诊断快照的可信深度掩码和当前策略点云也逐元素一致。上述数字不包含相机采集、IPC 和系统调度
+尾延迟；部署性能仍以实时 worker 的 `source_to_publish_ms_p95` 为准，真实硬件尚未按当前默认
+参数重新测试。
 
 [`examples/realsense_record_example.py`](../examples/realsense_record_example.py) 提供两种可视化：
 

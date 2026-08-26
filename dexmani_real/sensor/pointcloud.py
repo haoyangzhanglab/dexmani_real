@@ -9,14 +9,13 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any
+from typing import Any, cast
 
+import cv2
 import numpy as np
-from scipy.ndimage import convolve
 from scipy.ndimage import (
     label as label_connected_components,  # type: ignore[import-untyped]
 )
-from scipy.ndimage import maximum_filter, minimum_filter
 from scipy.sparse import coo_matrix  # type: ignore[import-untyped]
 from scipy.sparse.csgraph import connected_components  # type: ignore[import-untyped]
 from scipy.spatial import cKDTree  # type: ignore[import-untyped]
@@ -24,17 +23,17 @@ from scipy.spatial import cKDTree  # type: ignore[import-untyped]
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.sensor.camera_geometry import CameraIntrinsics, RGBDGeometry
 
-_EIGHT_CONNECTED_STRUCTURE = np.ones((3, 3), dtype=np.uint8)
+_KERNEL_3X3 = np.ones((3, 3), dtype=np.uint8)
 
-POINT_CLOUD_POLICY_ID = "depth_to_color_orthogonal_edge_table_voxel_radius_graph_v8"
+POINT_CLOUD_POLICY_ID = "depth_to_color_orthogonal_edge_table_voxel_radius_graph_v9"
 POINT_CLOUD_COLOR_SOURCE = "mean_rgb_of_aligned_depth_pixels_per_voxel"
-POINT_CLOUD_SAMPLING = "deterministic_spatial_hash_or_cyclic_pad"
+POINT_CLOUD_SAMPLING = "deterministic_coarse_voxel_stratified_hash_or_cyclic_pad"
 POINT_CLOUD_TRANSFORM = (
     "depth_gate_and_cardinal_edge_support;depth_to_color_deprojection;"
     "table_plane_height_hysteresis_crop_in_color_frame_before_deprojection;"
     "xarm_base_transform;workspace_crop;mean_voxel_xyz_and_rgb;"
     "single_radius_graph_density_and_component_outlier;spatial_candidate_cap;"
-    "spatial_hash_or_cyclic_pad"
+    "coarse_voxel_stratified_hash_or_cyclic_pad"
 )
 
 __all__ = [
@@ -109,6 +108,19 @@ def _validate_color(color: np.ndarray, geometry: RGBDGeometry) -> None:
         raise ValueError("color must be uint8 [H,W,3] matching color intrinsics")
 
 
+def _local_3x3_count(mask: np.ndarray) -> np.ndarray:
+    """Count true pixels in each clipped 3x3 neighborhood."""
+    if mask.ndim != 2 or mask.dtype != np.bool_:
+        raise ValueError("mask must be a boolean [H,W] array")
+    return cv2.boxFilter(
+        mask.astype(np.uint8),
+        ddepth=cv2.CV_8U,
+        ksize=(3, 3),
+        normalize=False,
+        borderType=cv2.BORDER_CONSTANT,
+    )
+
+
 def _reject_flying_depth(
     depth_m: np.ndarray, valid: np.ndarray, config: PointCloudConfig
 ) -> np.ndarray:
@@ -118,15 +130,25 @@ def _reject_flying_depth(
     if not np.any(valid):
         return valid
 
-    local_min = minimum_filter(
-        np.where(valid, depth_m, np.inf), size=3, mode="constant", cval=np.inf
+    local_min = cast(
+        np.ndarray,
+        cv2.erode(
+            np.where(valid, depth_m, np.float32(np.inf)),
+            _KERNEL_3X3,
+            borderType=cv2.BORDER_CONSTANT,
+            borderValue=(float("inf"),),
+        ),
     )
-    local_max = maximum_filter(
-        np.where(valid, depth_m, -np.inf), size=3, mode="constant", cval=-np.inf
+    local_max = cast(
+        np.ndarray,
+        cv2.dilate(
+            np.where(valid, depth_m, np.float32(-np.inf)),
+            _KERNEL_3X3,
+            borderType=cv2.BORDER_CONSTANT,
+            borderValue=(float("-inf"),),
+        ),
     )
-    local_valid_count = convolve(
-        valid.astype(np.uint8), np.ones((3, 3), dtype=np.uint8), mode="constant"
-    )
+    local_valid_count = _local_3x3_count(valid)
     endpoint_distance = np.minimum(depth_m - local_min, local_max - depth_m)
     depth_discontinuity = (
         valid
@@ -229,6 +251,17 @@ def _depth_rays(intrinsics: CameraIntrinsics) -> np.ndarray:
     return rays
 
 
+@lru_cache(maxsize=4)
+def _ray_plane_factors(
+    intrinsics: CameraIntrinsics,
+    plane_normal_color: tuple[float, float, float],
+) -> np.ndarray:
+    """Cache the static ray/plane-normal dot product for one calibration."""
+    factors = _depth_rays(intrinsics) @ np.asarray(plane_normal_color, dtype=np.float64)
+    factors.setflags(write=False)
+    return factors
+
+
 def _deproject_depth(
     depth_m: np.ndarray,
     valid: np.ndarray,
@@ -242,10 +275,8 @@ def _deproject_depth(
         raise ValueError("depth frame shape does not match depth intrinsics")
     rows, columns = np.nonzero(valid)
     z = depth_m[rows, columns]
-    x, y = _undistorted_depth_coordinates(rows, columns, intrinsics)
-    x *= z
-    y *= z
-    return np.column_stack((x, y, z)).astype(np.float32), rows, columns
+    rays = _depth_rays(intrinsics)[rows, columns]
+    return np.ascontiguousarray(rays * z[:, None], dtype=np.float32), rows, columns
 
 
 def _validated_transform(transform: np.ndarray) -> np.ndarray:
@@ -294,7 +325,7 @@ def _table_height_hysteresis_keep_mask(
     above_core_image[rows[above_core], columns[above_core]] = True
     component_labels, component_count = label_connected_components(
         above_core_image,
-        structure=_EIGHT_CONNECTED_STRUCTURE,
+        structure=_KERNEL_3X3,
     )
     if component_count == 0:
         return np.zeros(valid.shape, dtype=bool)
@@ -351,8 +382,11 @@ def _table_keep_mask(
     # plane after deprojection, without allocating table points in 3-D.
     plane_color = _validated_transform(T_xarm_base_from_color).T @ plane
     rows, columns = np.nonzero(valid)
-    rays = _depth_rays(intrinsics)[rows, columns]
-    signed_height = depth_m[rows, columns] * (rays @ plane_color[:3]) + plane_color[3]
+    plane_normal_color = tuple(float(value) for value in plane_color[:3])
+    ray_plane_factors = _ray_plane_factors(intrinsics, plane_normal_color)
+    signed_height = (
+        depth_m[rows, columns] * ray_plane_factors[rows, columns] + plane_color[3]
+    )
     return _table_height_hysteresis_keep_mask(
         valid,
         rows=rows,
@@ -373,6 +407,20 @@ def _workspace_keep_mask(
     return np.all((points_base >= lower) & (points_base <= upper), axis=1)
 
 
+def _packed_grid_keys(keys: np.ndarray) -> np.ndarray:
+    """Pack integer XYZ rows into collision-free scalar group identifiers."""
+    if keys.ndim != 2 or keys.shape[1] != 3 or keys.shape[0] == 0:
+        raise ValueError("grid keys must have non-empty shape [N,3]")
+    minimum = np.min(keys, axis=0)
+    shifted = keys - minimum
+    extents = np.max(shifted, axis=0) + 1
+    extent_yz = int(extents[1]) * int(extents[2])
+    volume = int(extents[0]) * extent_yz
+    if volume > np.iinfo(np.int64).max:
+        raise OverflowError("grid key volume exceeds int64")
+    return shifted[:, 0] * extent_yz + shifted[:, 1] * int(extents[2]) + shifted[:, 2]
+
+
 def _voxel_means(
     points_base: np.ndarray,
     colors: np.ndarray,
@@ -390,10 +438,9 @@ def _voxel_means(
             np.empty((0, 3), dtype=np.int64),
         )
     keys = np.floor(points_base / np.float32(voxel_size_m)).astype(np.int64)
-    # Group exact 3-int rows through one packed scalar key. Mean aggregation is
-    # independent of depth-image traversal order and avoids first-pixel bias.
-    packed_dtype = np.dtype((np.void, keys.dtype.itemsize * keys.shape[1]))
-    packed_keys = np.ascontiguousarray(keys).view(packed_dtype).reshape(-1)
+    # Mean aggregation is independent of depth-image traversal order and avoids
+    # first-pixel bias. Bounded workspace keys use a fast collision-free int64.
+    packed_keys = _packed_grid_keys(keys)
     _, first_indices, inverse = np.unique(
         packed_keys, return_index=True, return_inverse=True
     )
@@ -430,10 +477,13 @@ def _radius_component_keep_masks(
         keep = np.ones(count, dtype=bool)
         return keep, keep.copy()
 
-    # query_pairs evaluates every undirected neighbor pair once. The same
-    # sparse graph provides exact radius-neighbor counts and physical
-    # connected components, avoiding the former second KD-tree/query pass.
-    pairs = cKDTree(points_base).query_pairs(
+    # One undirected radius graph provides exact neighbor counts and physical
+    # connected components.
+    pairs = cKDTree(
+        points_base,
+        compact_nodes=False,
+        balanced_tree=False,
+    ).query_pairs(
         radius_m,
         output_type="ndarray",
     )
@@ -480,8 +530,43 @@ def _spatial_candidate_indices(
     return selected[np.argsort(hashes[selected], kind="stable")]
 
 
+def _coarse_stratified_sample_indices(
+    voxel_keys: np.ndarray,
+    num_points: int,
+    coarse_voxel_stride: int,
+) -> np.ndarray:
+    """Select broad spatial coverage, then fill remaining slots by fine hash."""
+    count = voxel_keys.shape[0]
+    if voxel_keys.shape != (count, 3):
+        raise ValueError("voxel_keys must have shape [N,3]")
+    if num_points <= 0 or coarse_voxel_stride <= 0:
+        raise ValueError("sample count and coarse voxel stride must be positive")
+    if count < num_points:
+        raise ValueError("stratified sampling requires at least num_points candidates")
+
+    fine_order = np.argsort(_spatial_hash(voxel_keys), kind="stable")
+    coarse_keys = np.floor_divide(voxel_keys, coarse_voxel_stride)
+    ordered_coarse_keys = coarse_keys[fine_order]
+    packed_keys = _packed_grid_keys(ordered_coarse_keys)
+    _, first_in_fine_order = np.unique(packed_keys, return_index=True)
+    representatives = fine_order[first_in_fine_order]
+    representatives = representatives[
+        np.argsort(_spatial_hash(coarse_keys[representatives]), kind="stable")
+    ]
+    if representatives.size >= num_points:
+        return representatives[:num_points]
+
+    selected = np.zeros(count, dtype=bool)
+    selected[representatives] = True
+    fill = fine_order[~selected[fine_order]][: num_points - representatives.size]
+    return np.concatenate((representatives, fill))
+
+
 def _fixed_size_sample(
-    cloud: np.ndarray, voxel_keys: np.ndarray, num_points: int
+    cloud: np.ndarray,
+    voxel_keys: np.ndarray,
+    num_points: int,
+    coarse_voxel_stride: int,
 ) -> np.ndarray:
     if cloud.ndim != 2 or cloud.shape[1] != 6:
         raise ValueError("cloud must have shape [N,6]")
@@ -490,10 +575,14 @@ def _fixed_size_sample(
         raise ValueError("cannot sample an empty cloud")
     if voxel_keys.shape != (count, 3):
         raise ValueError("voxel_keys must have shape [N,3] matching cloud")
-    spatial_order = np.argsort(_spatial_hash(voxel_keys), kind="stable")
     if count > num_points:
-        indices = spatial_order[:num_points]
+        indices = _coarse_stratified_sample_indices(
+            voxel_keys,
+            num_points,
+            coarse_voxel_stride,
+        )
     else:
+        spatial_order = np.argsort(_spatial_hash(voxel_keys), kind="stable")
         indices = spatial_order[np.arange(num_points, dtype=np.int64) % count]
     return np.ascontiguousarray(cloud[indices], dtype=np.float32)
 
@@ -673,8 +762,9 @@ def build_point_cloud_with_stats(
             workspace_rejected_points=workspace_rejected_count,
             failure_stage="workspace_crop",
         )
-    points_base = points_base[workspace_keep]
-    colors = colors[workspace_keep]
+    if cropped_count != workspace_keep.size:
+        points_base = points_base[workspace_keep]
+        colors = colors[workspace_keep]
     elapsed_ms["base_workspace_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
 
     stage_started_ns = time.perf_counter_ns()
@@ -745,7 +835,12 @@ def build_point_cloud_with_stats(
 
     stage_started_ns = time.perf_counter_ns()
     cloud = np.column_stack((points_base, colors)).astype(np.float32)
-    result = _fixed_size_sample(cloud, voxel_keys, config.num_points)
+    result = _fixed_size_sample(
+        cloud,
+        voxel_keys,
+        config.num_points,
+        config.sampling_coarse_voxel_stride,
+    )
     elapsed_ms["color_sampling_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
     return result, stats(
         depth_valid_points=valid_count,

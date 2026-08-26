@@ -28,13 +28,13 @@ class PointCloudConfig:
     # Only at a depth discontinuity, require a denser same-surface 3x3
     # neighborhood. One- or two-pixel structures at an unresolved edge are
     # intentionally treated as unreliable depth rather than preserved noise.
-    edge_support_min_neighbors: int = 4
+    edge_support_min_neighbors: int = 5
     # Pixels at or below the core height are unambiguously table. Components
     # above the core are preserved down to that height only when enough pixels
     # exceed the object-seed height. This removes low table residual islands
     # without dilating the table mask into object boundaries.
-    table_core_height_m: float = 0.006
-    table_object_seed_height_m: float = 0.012
+    table_core_height_m: float = 0.007
+    table_object_seed_height_m: float = 0.013
     table_object_seed_min_pixels: int = 4
     workspace: tuple[float, float, float, float, float, float] = (
         0.0,
@@ -46,12 +46,16 @@ class PointCloudConfig:
     )
     voxel_size_m: float = 0.005
     outlier_radius_m: float = 0.012
-    outlier_min_neighbors: int = 5
+    outlier_min_neighbors: int = 6
     # Radius-neighbor pairs define both local density and connected islands.
-    # Eight removes dense 6--7 point fragments that can satisfy the five-
-    # neighbor rule, while remaining conservative for small real objects.
-    outlier_min_component_points: int = 8
+    # Ten removes dense 7--9 point fragments that can satisfy the six-neighbor
+    # rule, while remaining conservative for small resolved object surfaces.
+    outlier_min_component_points: int = 10
     outlier_candidate_multiplier: int = 8
+    # Select one fine-voxel representative per coarse 3x3x3 cell before the
+    # final hash fill. At the default 5 mm voxel size this stratifies sampling
+    # over 15 mm cells without the runtime cost of farthest-point sampling.
+    sampling_coarse_voxel_stride: int = 3
 
     def __post_init__(self) -> None:
         integer_fields = (
@@ -62,6 +66,7 @@ class PointCloudConfig:
             ("outlier_min_neighbors", self.outlier_min_neighbors, 0),
             ("outlier_min_component_points", self.outlier_min_component_points, 1),
             ("outlier_candidate_multiplier", self.outlier_candidate_multiplier, 1),
+            ("sampling_coarse_voxel_stride", self.sampling_coarse_voxel_stride, 1),
         )
         for name, value, minimum in integer_fields:
             if isinstance(value, bool) or int(value) != value or int(value) < minimum:
@@ -131,6 +136,7 @@ class PointCloudConfig:
             "outlier_min_neighbors": self.outlier_min_neighbors,
             "outlier_min_component_points": self.outlier_min_component_points,
             "outlier_candidate_multiplier": self.outlier_candidate_multiplier,
+            "sampling_coarse_voxel_stride": self.sampling_coarse_voxel_stride,
         }
 
     @property
