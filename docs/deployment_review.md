@@ -94,7 +94,7 @@ arm 初始化即启用运动、设置模式和运行状态；`DISARMED` 的语�
 | 已实施 | 时序字段语义混淆 | plan 的 `target_monotonic_ns` 保持原始策略网格端点；coupled command 另存 `scheduled_target_monotonic_ns` 与 worker delivery target。采纳时跳过无足够 lead 的旧端点，既不重戳 action chunk，也不掩盖其原始时刻。 |
 | 关键指标未闭环 | 定义了 observation skew、计划 age、stale/superseded 等指标，但部分路径不计量；推理异常或缺反馈也可能跳过指标刷新。 | 为每个拒绝、降级和异常路径定义指标；报警应依据实际采集的安全量。 |
 | 已实施 | home 的关闭可等待手动作完成 | operator 的 hand/home 等待同时观察 `stop_event`、runtime shutdown、quit、fault 与软件急停；lifecycle 先有界 join operator，再关闭共享内存。若 operator 未退出，则先验证停止全部子进程并保留仍可能被线程访问的共享内存，不会先抛异常而遗留 hardware worker。普通 shutdown/fault 不再被错误升级为物理 e-stop 请求。 |
-| XHand 错误码的安全语义未被证明 | 某些通信/驱动错误码被视作“可读”或“发送成功”；`1501035` 被当作抓取接触。代码没有以任务阶段、触觉或电流条件限定。 | 以供应商错误码资料和实测证据建立白名单；将接触接受策略限制在明确任务阶段。 |
+| XHand 错误码的安全语义未被证明 | `1501070` 发送 CRC 现在保持“交付未确认”：不中止 worker，也不产生 action ACK；`1501035` 仍被当作抓取接触并接受。代码没有以任务阶段、触觉或电流条件限定后者。 | 以供应商错误码资料和实测证据建立白名单；将接触接受策略限制在明确任务阶段。 |
 | tracking error 仅为诊断量 | arm tracking error 被计算/记录，但没有部署侧拒绝或故障策略。 | 制定随时间的阈值、迟滞、持续时间及升级策略，或明确记录其不参与安全决策的风险接受。 |
 | 执行器与碰撞配置缺少硬上限 | hand 的 `kp`、`ki`、`kd`、`tor_max` 只校验正负，离线配置解析接受 `1_000_000`；`collision_sensitivity=0` 也可解析。 | 对设备 profile 建立额定安全上限、最小碰撞灵敏度和受审计的专家覆盖流程。 |
 

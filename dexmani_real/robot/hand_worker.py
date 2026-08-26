@@ -1,9 +1,9 @@
 """Single-owner XHand servo worker with latest-target, fixed-grid feedback.
 
 Each tick reads one state, publishes it (or a clearly stale previous state),
-then sends at most one measured-state-bounded target. A rejected SDK command
-latches the shared fault so fire-and-forget publishers cannot mistake silence
-for successful application.
+then sends at most one measured-state-bounded target. A CRC response keeps the
+target unacknowledged and the worker running; other rejected SDK commands latch
+the shared fault so publishers cannot mistake silence for successful application.
 """
 
 from __future__ import annotations
@@ -163,7 +163,7 @@ def _publish_feedback(
 
 def hand_loop(shared: Any, config: HandParams) -> None:
     """Run one XHand worker; all SDK objects remain in this process."""
-    from dexmani_real.robot.xhand import XHand
+    from dexmani_real.robot.xhand import XHand, XHandSendStatus
     from dexmani_real.runtime.safety import (
         CoupledCommandTicket,
         coupled_command_ticket_allows_execution,
@@ -194,16 +194,22 @@ def hand_loop(shared: Any, config: HandParams) -> None:
             logger.warning("hand_loop: tactile calibration raised", exc_info=True)
 
         try:
-            reset_accepted = hand.reset_home()
+            reset_status = hand.reset_home()
         except Exception:
             logger.error("hand_loop: startup reset-home command raised", exc_info=True)
             shared.error_state.value = True
             return
-        if not reset_accepted:
+        if reset_status is XHandSendStatus.REJECTED:
             logger.error("hand_loop: startup reset-home command was rejected")
             shared.error_state.value = True
             return
-        logger.info("hand_loop: startup reset-home command accepted")
+        if reset_status is XHandSendStatus.CRC_UNCONFIRMED:
+            logger.warning(
+                "hand_loop: startup reset-home delivery is unconfirmed after CRC; "
+                "continuing with live state"
+            )
+        else:
+            logger.info("hand_loop: startup reset-home command accepted")
 
         initial_state = hand.get_state()
         if initial_state is None:
@@ -385,18 +391,22 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                 )
                 shared.error_state.value = True
                 return
-            if hand.send_action(bounded):
+            send_status = hand.send_action(bounded)
+            if send_status is XHandSendStatus.ACCEPTED:
                 # ACK denotes SDK acceptance of the exact original endpoint,
                 # not physical convergence or acceptance of an intermediate step.
                 if np.array_equal(bounded, target):
                     accepted_target_action_id = action_id
-            else:
+            elif send_status is XHandSendStatus.REJECTED:
                 logger.error(
                     "hand_loop: SDK rejected action_id=%d; latching runtime fault",
                     action_id,
                 )
                 shared.error_state.value = True
                 return
+            # CRC_UNCONFIRMED deliberately leaves the action unacknowledged.
+            # The next tick starts from fresh measured state and the latest
+            # still-authorized command instead of latching a runtime fault.
 
             rate_mgr.wait()
     finally:

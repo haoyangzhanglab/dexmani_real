@@ -70,7 +70,9 @@ class _LoopState:
     last_measured_qpos: np.ndarray
     last_command_generation: int
     last_cmd: _CmdState = field(default_factory=_CmdState.idle)
-    last_rejected_ring_sequence: int = 0
+    last_processed_ring_sequence: int = 0
+    servo_call_count: int = 0
+    duplicate_command_skip_count: int = 0
     last_state_source_ns: int = field(default_factory=time.monotonic_ns)
 
 
@@ -298,6 +300,14 @@ def _handle_servo_command(
     worker's top-level handler, which latches ``error_state`` and stops the
     controller in cleanup.
     """
+    if ticket.ring_sequence <= st.last_processed_ring_sequence:
+        st.duplicate_command_skip_count += 1
+        return
+
+    # A coupled-ring endpoint is an event, not a level-triggered setpoint. Mark
+    # it consumed before validation so a superseded or rejected snapshot cannot
+    # be retried on every worker tick. A newer ring sequence remains eligible.
+    st.last_processed_ring_sequence = ticket.ring_sequence
     permit = read_motion_permit(shared)
     command_generation = int(action["run_generation"][0])
     if command_generation != permit.run_generation or not (
@@ -328,19 +338,18 @@ def _handle_servo_command(
                 "unsafe servo action_id="
                 f"{int(action['action_id'][0])}: {issue.reason}"
             )
-        if ticket.ring_sequence != st.last_rejected_ring_sequence:
-            logger.info(
-                "arm_loop: discarded action_id=%d: %s",
-                int(action["action_id"][0]),
-                issue.reason,
-            )
-            st.last_rejected_ring_sequence = ticket.ring_sequence
+        logger.info(
+            "arm_loop: discarded action_id=%d: %s",
+            int(action["action_id"][0]),
+            issue.reason,
+        )
         return
     target = np.asarray(action["arm_qpos"][0], dtype=np.float64)
     code = st.arm.servo(target)
     if code != 0:
         # Non-zero setter return is terminal even if the cached error is 0.
         raise RuntimeError(f"set_servo_angle failed (SDK code={code})")
+    st.servo_call_count += 1
     st.last_target = target.copy()  # producer owns 2π canonicalization
     st.last_command_generation = command_generation
     st.last_cmd = _CmdState(
@@ -415,6 +424,7 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     """
     cfg = config or ArmLoopConfig()
     arm = XArm7(cfg)
+    st: _LoopState | None = None
     try:
         st = _startup(shared, arm, cfg)
         limiter = LoopRate(cfg.arm_loop_hz, label="arm")
@@ -434,4 +444,11 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
         # Cleanup requests a best-effort state-4 stop and disconnect; firmware is the backstop.
         arm.stop()
         arm.close()
-        logger.info("arm_loop: exited")
+        if st is None:
+            logger.info("arm_loop: exited before loop startup")
+        else:
+            logger.info(
+                "arm_loop: exited (servo_calls=%d, duplicate_skips=%d)",
+                st.servo_call_count,
+                st.duplicate_command_skip_count,
+            )

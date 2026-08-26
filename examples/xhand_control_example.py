@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,23 @@ def _validate_qpos_deg(values: tuple[float, ...] | list[float], *, label: str) -
         raise ValueError(f"{label} must contain {HAND_DOF} finite angles")
 
 
+def _joint_payload_problem(state: Any) -> str | None:
+    """Validate the joint subset required to tolerate a CRC-degraded read."""
+    try:
+        joints = list(state.finger_state)
+        joint_ids = [int(joint.id) for joint in joints]
+        joint_values = [
+            float(value) for joint in joints for value in (joint.position, joint.torque)
+        ]
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        return str(exc)
+    if len(joints) != HAND_DOF or sorted(joint_ids) != list(range(HAND_DOF)):
+        return f"expected unique joint ids 0..{HAND_DOF - 1}, got {joint_ids}"
+    if not all(math.isfinite(value) for value in joint_values):
+        return "joint position/current payload contains non-finite values"
+    return None
+
+
 @dataclass(frozen=True)
 class HandCommandParams:
     """Default servo parameters for diagnostic hand commands."""
@@ -75,6 +93,14 @@ class HandCommandParams:
     kd: int = 0
     tor_max: int = 380  # mA
     default_position: float = 0.1  # rad
+
+
+class HandCommandStatus(Enum):
+    """Command result without treating an unconfirmed CRC as acceptance."""
+
+    ACCEPTED = "accepted"
+    CRC_UNCONFIRMED = "crc_unconfirmed"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -285,19 +311,28 @@ class XHandControlExample:
             force_update, label="read_state"
         )
         code = int(error_struct.error_code)
-        tactile_status = (
-            self._protocol == "RS485" and code in _RS485_TACTILE_STATUS_CODES
-        )
-        if code != 0 and not tactile_status:
-            print(
-                f"  read_state error: {error_struct.error_message} "
-                f"(error_code={code})"
-            )
-            return False
         if state is None:
             print(
                 "  read_state error: SDK returned no state "
                 f"(error_code={code} msg={error_struct.error_message})"
+            )
+            return False
+        tactile_status = (
+            self._protocol == "RS485" and code in _RS485_TACTILE_STATUS_CODES
+        )
+        crc_status = self._protocol == "RS485" and code == _RS485_CRC_ERROR_CODE
+        if crc_status:
+            joint_problem = _joint_payload_problem(state)
+            if joint_problem is not None:
+                print(
+                    "  read_state CRC payload unusable: "
+                    f"{joint_problem} (error_code={code})"
+                )
+                return False
+        if code != 0 and not tactile_status and not crc_status:
+            print(
+                f"  read_state error: {error_struct.error_message} "
+                f"(error_code={code})"
             )
             return False
         combined_force_valid = code == 0 or (
@@ -311,8 +346,16 @@ class XHandControlExample:
         distributed_force_valid = code == 0 or (
             self._protocol == "RS485" and code == _RS485_TEMPERATURE_ERROR_CODE
         )
-        temperature_valid = code != _RS485_TEMPERATURE_ERROR_CODE
-        if tactile_status:
+        temperature_valid = code not in {
+            _RS485_TEMPERATURE_ERROR_CODE,
+            _RS485_CRC_ERROR_CODE,
+        }
+        if crc_status:
+            print(
+                "  read_state: JOINTS USABLE; CRC UNCONFIRMED; SENSOR UNAVAILABLE; "
+                "continuing"
+            )
+        elif tactile_status:
             print(
                 "  read_state: JOINTS OK; SENSOR PARTIALLY DEGRADED  "
                 f"(error_code={code} msg={error_struct.error_message}; "
@@ -439,7 +482,7 @@ class XHandControlExample:
         )
         return True
 
-    def send_command(self, sleep_s: float = 1.0) -> bool:
+    def send_command(self, sleep_s: float = 1.0) -> HandCommandStatus:
         error_struct = self._device.send_command(self._hand_id, self._hand_command)
         code = int(error_struct.error_code)
         if self._protocol == "RS485":
@@ -457,7 +500,14 @@ class XHandControlExample:
                 )
                 code = int(error_struct.error_code)
         tactile_only = self._protocol == "RS485" and code in _RS485_TACTILE_STATUS_CODES
-        if tactile_only:
+        crc_unconfirmed = self._protocol == "RS485" and code == _RS485_CRC_ERROR_CODE
+        if crc_unconfirmed:
+            print(
+                "  send_command: CRC UNCONFIRMED; continuing without assuming "
+                "command acceptance  "
+                f"(error_code={code} msg={error_struct.error_message})"
+            )
+        elif tactile_only:
             print(
                 "  send_command: MOTION SENT; SENSOR PARTIALLY DEGRADED  "
                 f"(error_code={code} msg={error_struct.error_message}; "
@@ -471,7 +521,11 @@ class XHandControlExample:
         time.sleep(sleep_s)
         if tactile_only:
             self._verify_sensor_response_after_send()
-        return code == 0 or tactile_only
+        if crc_unconfirmed:
+            return HandCommandStatus.CRC_UNCONFIRMED
+        if code == 0 or tactile_only:
+            return HandCommandStatus.ACCEPTED
+        return HandCommandStatus.FAILED
 
     def run_preset_actions(self, actions: PresetActions) -> bool:
         """Run preset actions (fist, palm, v, ok) with 1 s dwell each."""
@@ -479,14 +533,14 @@ class XHandControlExample:
         for name, qpos_deg in actions.iter_actions():
             print(f"  -> {name}")
             self._set_positions(qpos_deg)
-            if not self.send_command():
+            if self.send_command() is HandCommandStatus.FAILED:
                 print(
                     "  Aborting remaining presets after an unresolved command failure."
                 )
                 return False
         return True
 
-    def go_home(self) -> bool:
+    def go_home(self) -> HandCommandStatus:
         """Return to home position (matches hand.home_qpos_deg)."""
         self._header("Return to home")
         self._set_positions(_HOME_QPOS_DEG)
@@ -554,13 +608,13 @@ def _run_hardware_session() -> int:
             print("Aborting: no valid initial joint state was received.")
             return 2
 
-        if not xhand_exam.go_home():
+        if xhand_exam.go_home() is HandCommandStatus.FAILED:
             print("Aborting: initial home command failed after the bounded retry.")
             return 2
         actions = _select_preset_actions(serial_number)
         if not xhand_exam.run_preset_actions(actions):
             return 2
-        if not xhand_exam.go_home():
+        if xhand_exam.go_home() is HandCommandStatus.FAILED:
             print("Final home command failed after the bounded retry.")
             return 2
         return 0

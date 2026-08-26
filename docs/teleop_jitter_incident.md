@@ -201,3 +201,111 @@ ACK 只表示 worker/SDK 接受目标，不表示关节已经物理到位，也�
 - [`robot/command_validation.py`](../dexmani_real/robot/command_validation.py)：worker 共用的时效、限位和异常跳变合同。
 - [`robot/arm_worker.py`](../dexmani_real/robot/arm_worker.py)、[`robot/hand_worker.py`](../dexmani_real/robot/hand_worker.py)：最终 actuator 边界。
 - [`tests/test_keyboard_arm_limits.py`](../tests/test_keyboard_arm_limits.py)、[`tests/test_safety_gate_command_delta.py`](../tests/test_safety_gate_command_delta.py)、[`tests/test_coupled_command_publication.py`](../tests/test_coupled_command_publication.py)、[`tests/test_worker_command_validation.py`](../tests/test_worker_command_validation.py)：离线回归合同。
+
+## 10. 2026-08-26 松键回撤事件
+
+### 10.1 症状与现场证据
+
+在前述连续运动问题修复后，键盘遥操作仍出现另一种独立现象：按键期间运动连续，
+但松键后机械臂会小幅反向回撤。发生回撤的版本在确认松键后额外发布一条
+`release_stop` 关节目标，并等待该目标速度收敛后才执行 `RUNNING → ARMED`。
+
+诊断日志证明这条停止目标本身就是不连续来源。例如：
+
+```text
+action_id=45  release_stop  cmd_step=7.18deg  endpoint_delta_to_measured=1.67deg
+action_id=406 release_stop  cmd_step=8.14deg  endpoint_delta_to_measured=1.96deg
+```
+
+`endpoint_delta_to_measured` 较小只能说明停止目标靠近当时的实测关节位置；
+它没有说明该目标靠近上一条已经发送给 Mode 6 的目标。运动时正常命令会领先实测状态，
+因此把停止目标重建为 measured qpos 等价于用一个滞后目标覆盖最后运动目标，机械臂自然会
+向后运动。日志中的 `release_stop` 命令步长显著大于正常连续命令，是回撤与该逻辑之间的
+直接证据。
+
+### 10.2 需要保持的停止语义
+
+键盘松键不是 e-stop，也不需要构造新的制动轨迹。正确语义是：
+
+1. 短暂确认输入确实已经松开；
+2. 确认最后一条正常运动 action 已成功跨过 arm SDK 边界；
+3. 不再发布任何新 endpoint；
+4. 执行 `RUNNING → ARMED`，撤销继续发布运动命令的权限；
+5. 让 xArm Mode 6 保持并完成最后一个已经接受的 endpoint。
+
+因此，日志中的
+
+```text
+safety: revoked motion RUNNING(2) → ARMED(1)
+```
+
+是正常的软件撤权，不代表故障、急停或动作被回滚。只有 `FAULT`、e-stop、worker/SDK
+错误等日志才表示异常停止。
+
+### 10.3 最终修复
+
+- 删除键盘松键路径生成和发布 `release_stop` 目标的逻辑，也不再等待该目标的 qvel
+  收敛；
+- 连续两个输入采样均为空才确认松键，桥接终端按键事件的瞬时空隙；
+- 最多等待 0.15 s，直到 arm state 的 `last_cmd_seq` 追平最后正常 action ID；
+- ACK 成功后直接撤权并保留最后 Mode 6 endpoint；ACK 超时则 fail closed 撤权并告警；
+- arm worker 以 coupled-command ring sequence 去重，同一个 record 最多调用一次
+  `servo()`；该 at-most-once 边界同时覆盖键盘、VR、回放和策略命令；
+- 没有降低键盘目标步长、控制频率或机械臂速度。
+
+修复后预期松键日志为：
+
+```text
+Keyboard release: final action_id=N accepted; leaving its Mode 6 endpoint unchanged
+safety: revoked motion RUNNING(2) → ARMED(1)
+```
+
+不应再次出现：
+
+```text
+Keyboard release stop published ...
+Keyboard release stop ... settled ...
+```
+
+### 10.4 真机复验结果
+
+2026-08-26 的后续真机运行确认：
+
+- 每次松键时 `latest=published/SDK-accepted` 最终均追平，最后 endpoint 没有被新目标覆盖；
+- 共发布 422 条正常 arm endpoint，arm SDK 实际调用 420 次；两次
+  `obs_gap_max=2` 表示 30 Hz producer/consumer 相位未同步时各合并了一个中间
+  latest-wins endpoint，最终目标没有丢失；
+- `duplicate_skips=179` 表示 worker 重读相同 ring sequence 时被去重，不是丢失
+  179 条命令；
+- 最大正常 command-to-command 步长为 2.90°，旧 `release_stop` 导致的 7–8°
+  跳变消失；
+- 最大 observed qvel 为 76.5°/s，IK 最慢约 3 ms，控制循环没有 overrun 或 missed
+  slot；
+- 操作者确认松键回撤已经消失，回零和 shutdown 均正常完成。
+
+离线回归为 42 项测试通过，`compileall`、isort 和 `git diff --check` 通过；
+真实运动效果以上述真机日志和操作者观察为准。
+
+### 10.5 剩余观察项
+
+这些项目不是本次松键回撤的根因，但后续应单独处理或持续监控：
+
+1. 当前 collision 启动摘要为 `table=disabled`、`0 environment pairs`，只提供
+   自碰撞和 workspace 保护；存在桌面或固定障碍物时必须确认这是有意配置；
+2. 键盘与 arm worker 同为 30 Hz 时可能偶发合并一个中间 latest-wins endpoint。
+   若物理上仍可感知，可在不改变运动速度的前提下评估更高的 worker 检查频率；
+3. 当前 `cmd_step_max` 是 published-to-published 指标；发生 action gap 时，它不能直接
+   表示相邻 SDK-accepted endpoint 的实际步长，必要时应在 arm worker 增加该指标；
+4. arm home 的上层完成判断依据位置/速度收敛，而 worker 还负责 dwell 和恢复 Mode 6。
+   更严格的合同应由 worker 在 Mode 6 恢复后发布明确的 home completion ID。
+
+### 10.6 防止复发
+
+- 不要在普通松键路径把 measured qpos 重新发布为“停止目标”；
+- 不要用 `qvel == 0` 代替“最后正常 endpoint 已跨过 SDK 边界”；
+- 比较停止行为时必须同时记录 previous commanded target、SDK-accepted target 和
+  measured qpos，不能只比较新目标与 measured qpos；
+- latest-wins 允许未消费的中间 endpoint 被覆盖，但必须保证最后 endpoint 被接受，
+  且 worker 对每个 ring sequence 最多执行一次；
+- 若需要真正的快速制动或紧急停止，应走显式 stop/e-stop 安全路径，不能复用普通松键
+  语义。

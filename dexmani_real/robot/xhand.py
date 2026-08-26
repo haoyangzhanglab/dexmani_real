@@ -2,14 +2,16 @@
 
 Runtime reads accept known sensor/CRC statuses only when their returned
 12-DoF joint payload is complete and finite; tactile data is then invalid.
-Runtime sends make one SDK call.  SDK errors are logged and affect only that
-transaction: there is no retry, backoff, watchdog, or recovery state.
+Runtime sends make one SDK call.  A CRC response leaves delivery unconfirmed
+but does not stop the worker; other SDK errors remain rejected.  There is no
+retry, backoff, watchdog, or recovery state in this driver.
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable
 
 import numpy as np
@@ -39,13 +41,14 @@ _OPEN_RETRIES = {"ethercat": 2, "serial": 3}
 _OPEN_RETRY_DELAY_S = 2.0
 _INITIAL_STATE_READ_ATTEMPTS = 3
 _INITIAL_STATE_READ_INTERVAL_S = 0.02
+_COMMUNICATION_CRC_ERROR_CODE = 1_501_070
 READ_USABLE_CODES = frozenset(
     {
         0,
         1_501_018,  # combined force unavailable
         1_501_019,  # distributed force unavailable
         1_501_020,  # temperature unavailable
-        1_501_070,  # communication CRC with a complete joint payload
+        _COMMUNICATION_CRC_ERROR_CODE,  # complete joint payload; tactile invalid
     }
 )
 SEND_ACCEPTED_CODES = frozenset(
@@ -103,6 +106,14 @@ class XHandError(RuntimeError):
         super().__init__(
             f"XHand {self.operation} failed: code={self.code} msg={self.message}"
         )
+
+
+class XHandSendStatus(Enum):
+    """SDK result without conflating CRC uncertainty with command acceptance."""
+
+    ACCEPTED = "accepted"
+    CRC_UNCONFIRMED = "crc_unconfirmed"
+    REJECTED = "rejected"
 
 
 @dataclass
@@ -463,14 +474,14 @@ class XHand:
             **board_errors,
         )
 
-    def send_action(self, action: np.ndarray) -> bool:
-        """Send one absolute endpoint and report whether the SDK accepted it."""
+    def send_action(self, action: np.ndarray) -> XHandSendStatus:
+        """Send one absolute endpoint and preserve CRC delivery uncertainty."""
         target = np.asarray(action, dtype=np.float64)
         try:
             self._validate_action(target)
         except ValueError as exc:
             logger.warning("XHand send rejected: %s", exc)
-            return False
+            return XHandSendStatus.REJECTED
         if self._control is None or self._command is None or not self.connected_flag:
             raise RuntimeError("XHand command path is not initialized")
 
@@ -480,19 +491,27 @@ class XHand:
             error = self._control.send_command(self.cfg.device_id, self._command)
         except Exception:
             logger.warning("XHand send_command raised", exc_info=True)
-            return False
+            return XHandSendStatus.REJECTED
 
         code = _error_code(error)
+        if code == _COMMUNICATION_CRC_ERROR_CODE:
+            logger.warning(
+                "XHand send delivery unconfirmed by CRC response: code=%s msg=%s; "
+                "continuing without action acknowledgement",
+                code,
+                getattr(error, "error_message", ""),
+            )
+            return XHandSendStatus.CRC_UNCONFIRMED
         if code not in SEND_ACCEPTED_CODES:
             logger.warning(
                 "XHand send failed: code=%s msg=%s",
                 code,
                 getattr(error, "error_message", ""),
             )
-            return False
-        return True
+            return XHandSendStatus.REJECTED
+        return XHandSendStatus.ACCEPTED
 
-    def reset_home(self) -> bool:
+    def reset_home(self) -> XHandSendStatus:
         """Send the configured home endpoint once after device initialization."""
         home_qpos_rad = np.deg2rad(np.asarray(self.cfg.home_qpos_deg, dtype=np.float64))
         return self.send_action(home_qpos_rad)

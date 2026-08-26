@@ -38,7 +38,7 @@ from dexmani_real.runtime.workers import WorkerSpec, build_processes, start_proc
 from dexmani_real.teleop.keyboard import GlobalKeyState, eef_delta_from_keys
 from dexmani_real.utils.feedback import validate_arm_feedback, validate_hand_feedback
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.rate import LoopRate
+from dexmani_real.utils.rate import LoopRate, LoopRateStats
 
 logger = get_logger(__name__)
 
@@ -279,6 +279,183 @@ class _KeyboardPublishResult:
     status: _KeyboardPublishStatus
     arm_qpos_rad: np.ndarray | None = None
     detail: str = ""
+    action_id: int = 0
+    ring_sequence: int = 0
+    ik_timing_ms: float = float("nan")
+    ik_seed: str = ""
+    max_qpos_delta_to_measured_deg: float = float("nan")
+
+
+def _keyboard_action_was_accepted(
+    action_id: int,
+    arm_state: dict[str, Any],
+) -> bool:
+    """Return whether the final normal keyboard action crossed the SDK boundary."""
+    return int(action_id) <= 0 or int(arm_state["last_cmd_seq"]) >= int(action_id)
+
+
+@dataclass
+class _KeyboardMotionDiagnostics:
+    """Low-rate observations of publication, SDK acceptance, and tracking."""
+
+    started_frame: int = 0
+    started_monotonic_s: float = 0.0
+    start_loop_overruns: int = 0
+    start_missed_slots: int = 0
+    published_count: int = 0
+    observed_sdk_updates: int = 0
+    first_published_action_id: int = 0
+    latest_published_action_id: int = 0
+    latest_published_ring_sequence: int = 0
+    latest_sdk_action_id: int = 0
+    max_observed_sdk_action_gap: int = 0
+    pending_frames: int = 0
+    max_pending_frames: int = 0
+    max_command_step_rad: float = 0.0
+    max_command_step_action_id: int = 0
+    max_command_step_seed: str = ""
+    max_command_to_measured_rad: float = 0.0
+    max_tracking_error_rad: float = 0.0
+    max_tracking_error_action_id: int = 0
+    max_abs_qvel_rad_s: float = 0.0
+    latest_ik_timing_ms: float = float("nan")
+    max_ik_timing_ms: float = 0.0
+    latest_ik_seed: str = ""
+
+    def begin(
+        self,
+        *,
+        frame: int,
+        arm_state: dict[str, Any],
+        loop_stats: LoopRateStats,
+    ) -> None:
+        self.started_frame = int(frame)
+        self.started_monotonic_s = time.monotonic()
+        self.start_loop_overruns = int(loop_stats.deadline_overrun_count)
+        self.start_missed_slots = int(loop_stats.missed_slot_count)
+        self.published_count = 0
+        self.observed_sdk_updates = 0
+        self.first_published_action_id = 0
+        self.latest_published_action_id = 0
+        self.latest_published_ring_sequence = 0
+        self.latest_sdk_action_id = int(arm_state["last_cmd_seq"])
+        self.max_observed_sdk_action_gap = 0
+        self.pending_frames = 0
+        self.max_pending_frames = 0
+        self.max_command_step_rad = 0.0
+        self.max_command_step_action_id = 0
+        self.max_command_step_seed = ""
+        self.max_command_to_measured_rad = 0.0
+        self.max_tracking_error_rad = max(0.0, float(arm_state["tracking_err"]))
+        self.max_tracking_error_action_id = int(arm_state["last_cmd_seq"])
+        self.max_abs_qvel_rad_s = float(
+            np.max(np.abs(np.asarray(arm_state["qvel"], dtype=np.float64)))
+        )
+        self.latest_ik_timing_ms = float("nan")
+        self.max_ik_timing_ms = 0.0
+        self.latest_ik_seed = ""
+
+    def observe_feedback(self, arm_state: dict[str, Any]) -> None:
+        sdk_action_id = int(arm_state["last_cmd_seq"])
+        if sdk_action_id != self.latest_sdk_action_id:
+            if sdk_action_id > self.latest_sdk_action_id:
+                if (
+                    self.observed_sdk_updates == 0
+                    and self.first_published_action_id > 0
+                ):
+                    observed_gap = sdk_action_id - self.first_published_action_id + 1
+                else:
+                    observed_gap = sdk_action_id - self.latest_sdk_action_id
+                self.max_observed_sdk_action_gap = max(
+                    self.max_observed_sdk_action_gap,
+                    observed_gap,
+                )
+            self.observed_sdk_updates += 1
+            self.latest_sdk_action_id = sdk_action_id
+            self.pending_frames = 0
+        elif self.latest_published_action_id > sdk_action_id:
+            self.pending_frames += 1
+            self.max_pending_frames = max(
+                self.max_pending_frames,
+                self.pending_frames,
+            )
+
+        tracking_error_rad = float(arm_state["tracking_err"])
+        if (
+            np.isfinite(tracking_error_rad)
+            and tracking_error_rad > self.max_tracking_error_rad
+        ):
+            self.max_tracking_error_rad = tracking_error_rad
+            self.max_tracking_error_action_id = sdk_action_id
+        qvel_rad_s = np.asarray(arm_state["qvel"], dtype=np.float64)
+        if np.all(np.isfinite(qvel_rad_s)):
+            self.max_abs_qvel_rad_s = max(
+                self.max_abs_qvel_rad_s,
+                float(np.max(np.abs(qvel_rad_s))),
+            )
+
+    def observe_publication(
+        self,
+        result: _KeyboardPublishResult,
+        *,
+        command_step_rad: float,
+    ) -> None:
+        self.published_count += 1
+        if self.first_published_action_id == 0:
+            self.first_published_action_id = int(result.action_id)
+        self.latest_published_action_id = int(result.action_id)
+        self.latest_published_ring_sequence = int(result.ring_sequence)
+        if command_step_rad > self.max_command_step_rad:
+            self.max_command_step_rad = float(command_step_rad)
+            self.max_command_step_action_id = int(result.action_id)
+            self.max_command_step_seed = result.ik_seed
+        if np.isfinite(result.max_qpos_delta_to_measured_deg):
+            self.max_command_to_measured_rad = max(
+                self.max_command_to_measured_rad,
+                float(np.deg2rad(result.max_qpos_delta_to_measured_deg)),
+            )
+        if np.isfinite(result.ik_timing_ms):
+            self.latest_ik_timing_ms = float(result.ik_timing_ms)
+            self.max_ik_timing_ms = max(
+                self.max_ik_timing_ms,
+                self.latest_ik_timing_ms,
+            )
+        self.latest_ik_seed = result.ik_seed
+
+    def format(self, *, frame: int, loop_stats: LoopRateStats) -> str:
+        elapsed_s = max(0.0, time.monotonic() - self.started_monotonic_s)
+        sdk_lag = (
+            self.latest_published_action_id - self.latest_sdk_action_id
+            if self.latest_published_action_id > 0
+            else 0
+        )
+        loop_overruns = (
+            int(loop_stats.deadline_overrun_count) - self.start_loop_overruns
+        )
+        missed_slots = int(loop_stats.missed_slot_count) - self.start_missed_slots
+        latest_ik_text = (
+            f"{self.latest_ik_timing_ms:.1f}"
+            if np.isfinite(self.latest_ik_timing_ms)
+            else "n/a"
+        )
+        seed_text = self.latest_ik_seed or "n/a"
+        max_step_seed_text = self.max_command_step_seed or "n/a"
+        return (
+            f"diag io: run={elapsed_s:.1f}s/{int(frame) - self.started_frame + 1}f "
+            f"pub={self.published_count} sdk_updates={self.observed_sdk_updates} "
+            f"latest={self.latest_published_action_id}/{self.latest_sdk_action_id} "
+            f"lag={sdk_lag} ring={self.latest_published_ring_sequence} "
+            f"obs_gap_max={self.max_observed_sdk_action_gap} "
+            f"pending_max={self.max_pending_frames}f\n"
+            f"       motion: cmd_step_max={np.rad2deg(self.max_command_step_rad):.2f}deg"
+            f"@{self.max_command_step_action_id}({max_step_seed_text}) "
+            f"cmd_lead_max={np.rad2deg(self.max_command_to_measured_rad):.2f}deg "
+            f"track_max={np.rad2deg(self.max_tracking_error_rad):.2f}deg"
+            f"@{self.max_tracking_error_action_id} "
+            f"qvel_max={np.rad2deg(self.max_abs_qvel_rad_s):.1f}deg/s; "
+            f"ik={latest_ik_text}/{self.max_ik_timing_ms:.1f}ms seed={seed_text} "
+            f"loop_overrun={loop_overruns} missed={missed_slots}"
+        )
 
 
 def _read_keyboard_feedback(
@@ -521,6 +698,18 @@ def _publish_keyboard_target(
             detail=ik_result.reason or "unknown",
         )
 
+    report = getattr(ik_result, "report", {}) or {}
+    try:
+        ik_timing_ms = float(report.get("ik_timing_ms", float("nan")))
+    except (TypeError, ValueError):
+        ik_timing_ms = float("nan")
+    try:
+        max_qpos_delta_to_measured_deg = float(
+            report.get("max_qpos_cmd_delta_deg", float("nan"))
+        )
+    except (TypeError, ValueError):
+        max_qpos_delta_to_measured_deg = float("nan")
+
     publish_result = publish_joint_targets(
         shared,
         np.asarray(ik_result.qpos, dtype=np.float64).copy(),
@@ -537,6 +726,13 @@ def _publish_keyboard_target(
     return _KeyboardPublishResult(
         _KeyboardPublishStatus.PUBLISHED,
         arm_qpos_rad=np.asarray(candidate.arm_qpos, dtype=np.float64).copy(),
+        action_id=int(getattr(candidate, "action_id", 0)),
+        ring_sequence=int(
+            getattr(getattr(publish_result, "ticket", None), "ring_sequence", 0)
+        ),
+        ik_timing_ms=ik_timing_ms,
+        ik_seed=str(report.get("seed", "")),
+        max_qpos_delta_to_measured_deg=max_qpos_delta_to_measured_deg,
     )
 
 
@@ -568,9 +764,13 @@ def _run_control_loop(
 
     heartbeat_timeouts = dict(runtime.safety.heartbeat_timeouts)
     rate = LoopRate(float(cfg.control_hz), label="keyboard_teleop")
+    diagnostics = _KeyboardMotionDiagnostics()
     state_failures = 0
     home_key_down = False
     motion_active = False
+    release_idle_frames = 0
+    last_motion_action_id = 0
+    release_ack_started_s = 0.0
     quit_quiesced = False
     previous_active_keys: tuple[str, ...] | None = None
     blocked_keys: tuple[str, ...] | None = None
@@ -582,6 +782,11 @@ def _run_control_loop(
     print(
         "Keyboard active (terminal input captured through shutdown): "
         "WASD/arrows/IJKL move, R home, Q quit, ESC e-stop"
+    )
+    print(
+        "Diagnostics: latest=published/SDK-accepted action_id; "
+        "obs_gap_max=largest observed SDK ID advance; "
+        "pending_max=frames without SDK progress"
     )
     while shared.is_running.value:
         rate.wait()
@@ -630,10 +835,14 @@ def _run_control_loop(
         assert feedback.arm_state is not None
         assert feedback.arm_qpos_rad is not None
         current_qpos = feedback.arm_qpos_rad
+        if motion_active:
+            diagnostics.observe_feedback(feedback.arm_state)
         if feedback.hand_qpos_rad is not None:
             planner.set_hand_qpos(feedback.hand_qpos_rad)
 
         if quit_requested:
+            if motion_active and diagnostics.published_count > 0:
+                print(f"  {diagnostics.format(frame=frame, loop_stats=rate.stats)}")
             return True
 
         home_pressed = keys.is_pressed("r")
@@ -650,7 +859,12 @@ def _run_control_loop(
                 return False
             current_qpos, target_pos, target_quat = home_anchor
             previous_command = current_qpos.copy()
+            if motion_active and diagnostics.published_count > 0:
+                print(f"  {diagnostics.format(frame=frame, loop_stats=rate.stats)}")
             motion_active = False
+            release_idle_frames = 0
+            last_motion_action_id = 0
+            release_ack_started_s = 0.0
             rate.reset()
             home_key_down = home_pressed
             continue
@@ -681,15 +895,58 @@ def _run_control_loop(
                         f"eef={_fmt_vec3(pose.p)}",
                         flush=True,
                     )
+                    if motion_active and diagnostics.published_count > 0:
+                        print(
+                            f"  {diagnostics.format(frame=frame, loop_stats=rate.stats)}",
+                            flush=True,
+                        )
                 continue
             blocked_keys = None
-        # Idle: stop publishing commands while Mode 6 settles its last endpoint.
+        # A short release debounce bridges transient key gaps. Once confirmed,
+        # wait only for the final normal endpoint to cross the SDK boundary;
+        # revocation then leaves Mode 6 to finish that endpoint unchanged.
         if not moving:
             if motion_active:
+                release_idle_frames += 1
+                if release_idle_frames < int(cfg.release_debounce_frames):
+                    continue
+                if release_ack_started_s <= 0.0:
+                    release_ack_started_s = time.monotonic()
+                last_action_accepted = _keyboard_action_was_accepted(
+                    last_motion_action_id,
+                    feedback.arm_state,
+                )
+                ack_timed_out = time.monotonic() - release_ack_started_s >= float(
+                    cfg.release_last_action_ack_timeout_s
+                )
+                if not last_action_accepted and not ack_timed_out:
+                    continue
+                if last_action_accepted:
+                    logger.info(
+                        "Keyboard release: final action_id=%d accepted; "
+                        "leaving its Mode 6 endpoint unchanged",
+                        last_motion_action_id,
+                    )
+                else:
+                    logger.warning(
+                        "Keyboard release: final action_id=%d was not accepted "
+                        "within %.3fs; revoking motion",
+                        last_motion_action_id,
+                        float(cfg.release_last_action_ack_timeout_s),
+                    )
+
                 if not revoke_motion(shared, SafetyState.ARMED):
                     set_keyboard_fault(shared, "failed to stop keyboard motion")
                     return False
+                if diagnostics.published_count > 0:
+                    print(
+                        f"  {diagnostics.format(frame=frame, loop_stats=rate.stats)}",
+                        flush=True,
+                    )
                 motion_active = False
+                release_idle_frames = 0
+                last_motion_action_id = 0
+                release_ack_started_s = 0.0
                 rate.reset()
             # Rebuild baselines so new key presses start from current feedback.
             previous_command, target_pos, target_quat = _keyboard_command_anchor(
@@ -706,12 +963,20 @@ def _run_control_loop(
             continue
 
         # Moving: keys are held.
+        release_idle_frames = 0
+        release_ack_started_s = 0.0
         if not motion_active:
             if not begin_motion(shared):
                 set_keyboard_fault(shared, "failed to enter keyboard motion")
                 return False
             motion_active = True
+            last_motion_action_id = 0
             rate.reset()
+            diagnostics.begin(
+                frame=frame,
+                arm_state=feedback.arm_state,
+                loop_stats=rate.stats,
+            )
 
         measured_pose = planner.kin.compute_eef_pose_world(current_qpos)
         target_update = _compute_keyboard_target_update(
@@ -762,6 +1027,14 @@ def _run_control_loop(
             blocked_keys = active_keys
             continue
         assert publish_result.arm_qpos_rad is not None
+        command_step_rad = float(
+            np.max(np.abs(publish_result.arm_qpos_rad - previous_command))
+        )
+        diagnostics.observe_publication(
+            publish_result,
+            command_step_rad=command_step_rad,
+        )
+        last_motion_action_id = publish_result.action_id
         previous_command = publish_result.arm_qpos_rad
 
         if frame % int(cfg.status_interval_frames) == 0:
@@ -772,6 +1045,10 @@ def _run_control_loop(
                 f"{_fmt_keys(active_keys):8s} [{elapsed:4.0f}s f={frame:5d}] "
                 f"eef={_fmt_vec3(measured_pose.p)} → {_fmt_vec3(target_pos)}  "
                 f"Δ={_err_m:.3f}m{boundary_indicator}",
+                flush=True,
+            )
+            print(
+                f"  {diagnostics.format(frame=frame, loop_stats=rate.stats)}",
                 flush=True,
             )
     return False

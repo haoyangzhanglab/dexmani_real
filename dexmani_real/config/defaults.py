@@ -623,6 +623,10 @@ class KeyboardTeleopParams:
     delta_pos_m: float = 0.008
     delta_rpy_rad: float = 0.03
     command_lookahead_frames: int = 5
+    # Confirm release across two input samples, then wait boundedly for the
+    # final normal motion action to cross the arm SDK boundary.
+    release_debounce_frames: int = 2
+    release_last_action_ack_timeout_s: float = 0.15
     workspace_command_margin_m: float = 0.005
     ik_max_pose_error_pos_m: float = 0.002
     ik_max_pose_error_rot_rad: float = np.deg2rad(2.0)
@@ -634,6 +638,7 @@ class KeyboardTeleopParams:
             self.control_hz,
             self.delta_pos_m,
             self.delta_rpy_rad,
+            self.release_last_action_ack_timeout_s,
             self.workspace_command_margin_m,
             self.ik_max_pose_error_pos_m,
             self.ik_max_pose_error_rot_rad,
@@ -648,6 +653,10 @@ class KeyboardTeleopParams:
             raise ValueError(f"delta_rpy_rad={self.delta_rpy_rad} must be > 0")
         if self.command_lookahead_frames <= 0:
             raise ValueError("command_lookahead_frames must be positive")
+        if self.release_debounce_frames <= 0:
+            raise ValueError("release_debounce_frames must be positive")
+        if self.release_last_action_ack_timeout_s <= 0:
+            raise ValueError("release_last_action_ack_timeout_s must be > 0")
         if self.workspace_command_margin_m < 0:
             raise ValueError("workspace_command_margin_m must be non-negative")
         if self.ik_max_pose_error_pos_m <= 0 or self.ik_max_pose_error_rot_rad <= 0:

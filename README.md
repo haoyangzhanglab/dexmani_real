@@ -18,6 +18,10 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 - XHand 已知的抓取接触过流码 `1501035` 在发送位置命令时会被接受，不中止抓取，并记入
   episode 质量指标；同一码在状态读取失败时不生成伪造的新鲜反馈。持续数据不可用仍由
   新鲜度和 watchdog 边界处理。
+- XHand 通信 CRC 码 `1501070` 在发送路径表示交付状态不明：worker 记录告警但不置位全局
+  fault、不退出，也不更新该 action 的 SDK-acceptance ACK；下一周期从新鲜实测状态和仍有效的
+  latest target 继续。读取路径仅在 12 关节反馈完整且有限时继续，并将该帧触觉标为无效。
+  其他未列入白名单的发送错误仍 fail closed。
 - XHand worker 每次成功连接并完成触觉初始化后，会在发布 ready 前无条件发送一次配置的
   `home_qpos`；连接 XHand 会引起手指运动，该初始化 reset 不等待物理收敛。
 - physical replay 以记录的首帧**实测 arm**关节状态作为起点：xArm 需先由操作者受监督地

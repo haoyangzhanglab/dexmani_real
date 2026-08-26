@@ -175,7 +175,9 @@ class WorkerCommandValidationTest(unittest.TestCase):
             last_target=np.zeros(7),
             last_measured_qpos=np.zeros(7),
             last_command_generation=7,
-            last_rejected_ring_sequence=0,
+            last_processed_ring_sequence=0,
+            servo_call_count=0,
+            duplicate_command_skip_count=0,
         )
         shared = SimpleNamespace(
             error_state=_Value(0),
@@ -196,6 +198,57 @@ class WorkerCommandValidationTest(unittest.TestCase):
             _handle_servo_command(cast(Any, state), shared, command, ticket)
 
         arm.servo.assert_not_called()
+
+    def test_arm_applies_each_ring_sequence_at_most_once(self) -> None:
+        now_ns = time.monotonic_ns()
+        command = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
+        command["action_id"][0] = 5
+        command["arm_present"][0] = 1
+        command["run_generation"][0] = 7
+        command["created_monotonic_ns"][0] = now_ns
+        command["scheduled_target_monotonic_ns"][0] = now_ns
+        command["target_monotonic_ns"][0] = now_ns
+        command["valid_until_monotonic_ns"][0] = now_ns + 1_000_000_000
+        command["arm_qpos"][0] = np.full(7, 0.05)
+
+        arm = SimpleNamespace(servo=Mock(return_value=0))
+        state = SimpleNamespace(
+            cfg=SimpleNamespace(
+                joint_limit_lower=tuple(np.full(7, -2.0)),
+                joint_limit_upper=tuple(np.full(7, 2.0)),
+                max_servo_command_jump_rad=0.1,
+            ),
+            arm=arm,
+            last_target=np.zeros(7),
+            last_measured_qpos=np.zeros(7),
+            last_command_generation=7,
+            last_processed_ring_sequence=0,
+            servo_call_count=0,
+            duplicate_command_skip_count=0,
+        )
+        shared = SimpleNamespace(
+            error_state=_Value(0),
+            estop_request=_Value(0),
+        )
+        ticket = CoupledCommandTicket(7, 11)
+
+        with (
+            patch(
+                "dexmani_real.robot.arm_worker.read_motion_permit",
+                return_value=MotionPermit(SafetyState.RUNNING, 7),
+            ),
+            patch(
+                "dexmani_real.robot.arm_worker.coupled_command_ticket_allows_execution",
+                return_value=True,
+            ),
+        ):
+            _handle_servo_command(cast(Any, state), shared, command, ticket)
+            _handle_servo_command(cast(Any, state), shared, command, ticket)
+
+        arm.servo.assert_called_once()
+        self.assertEqual(state.last_processed_ring_sequence, 11)
+        self.assertEqual(state.servo_call_count, 1)
+        self.assertEqual(state.duplicate_command_skip_count, 1)
 
 
 if __name__ == "__main__":

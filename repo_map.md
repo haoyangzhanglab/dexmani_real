@@ -273,6 +273,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `tests/test_runtime_channels_ticket_state.py` | RuntimeChannels 的 coupled-command ticket 分配、零初始化与真实 shared-memory round-trip 合同。 |
 | `tests/test_safety_gate_command_delta.py` | learned-policy 单步限幅使用命令历史、几何检查使用实测状态的合同。 |
 | `tests/test_worker_command_validation.py` | arm/hand 共用时效、限位、异常命令和 superseded snapshot 的 fail-closed 合同。 |
+| `tests/test_xhand_crc_policy.py` | XHand 发送 CRC 的未确认/非致命语义及 CRC 读取关节载荷完整性合同。 |
 | `tests/fixtures/contracts/` | 冻结的 architecture、IPC ABI 与 storage schema manifest。 |
 
 ## 6. 静态资源
