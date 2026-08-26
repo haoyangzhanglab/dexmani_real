@@ -1,4 +1,4 @@
-"""Transactional export of processed HDF5 v8 episodes to Policy Zarr v4."""
+"""Transactional export of processed HDF5 v10 episodes to Policy Zarr v5."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from dexmani_real.sensor.pointcloud import (
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 
 POLICY_ZARR_SCHEMA_NAME = "dexmani-real-policy-zarr"
-POLICY_ZARR_SCHEMA_VERSION = 4
+POLICY_ZARR_SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -105,6 +105,23 @@ def _validate_dataset(path: Path, key: str, dataset: h5py.Dataset, length: int) 
         raise ValueError(f"{path.name}: point_cloud must be (N,P,6)")
 
 
+def _discover_processed_hdf5_paths(source_root: Path) -> tuple[Path, ...]:
+    """Return direct processed artifacts from one task directory."""
+
+    if not source_root.is_dir():
+        raise NotADirectoryError(source_root)
+    paths = tuple(
+        sorted(
+            path
+            for path in source_root.iterdir()
+            if path.is_file() and path.suffix.lower() in {".h5", ".hdf5"}
+        )
+    )
+    if not paths:
+        raise FileNotFoundError(f"no processed HDF5 files found in {source_root}")
+    return paths
+
+
 def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
     with h5py.File(path, "r") as source:
         if _text(source.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
@@ -117,6 +134,10 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
             profile = OutputProfile(_text(source.attrs.get("profile", "")))
         except ValueError as exc:
             raise ValueError(f"{path.name}: invalid profile") from exc
+        if not profile.needs_pointcloud:
+            raise ValueError(
+                f"{path.name}: Policy Zarr v5 requires a pointcloud processed profile"
+            )
         data_keys = {
             key for key, value in source.items() if isinstance(value, h5py.Dataset)
         }
@@ -198,6 +219,27 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
             dtypes[key] = np.dtype(source[key].dtype)
         semantics: dict[str, Any] = {
             "obs_alignment": _text(source.attrs.get("obs_alignment", "")),
+            "observation_reference": _text(
+                source.attrs.get("observation_reference", "")
+            ),
+            "state_alignment": _text(source.attrs.get("state_alignment", "")),
+            "max_observation_skew_s": float(
+                source.attrs.get("max_observation_skew_s", np.nan)
+            ),
+            "action_semantics": _text(source.attrs.get("action_semantics", "")),
+            "arm_max_delta_rad_per_tick": (
+                None
+                if np.isnan(
+                    float(source.attrs.get("arm_max_delta_rad_per_tick", np.nan))
+                )
+                else float(source.attrs["arm_max_delta_rad_per_tick"])
+            ),
+            "hand_max_delta_rad_per_tick": float(
+                source.attrs.get("hand_max_delta_rad_per_tick", np.nan)
+            ),
+            "deployment_equivalent": bool(
+                source.attrs.get("deployment_equivalent", False)
+            ),
             "contact_force_unit": _text(source.attrs.get("contact_force_unit", "")),
             "contact_force_si_verified": bool(
                 source.attrs.get("contact_force_si_verified", False)
@@ -210,6 +252,21 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
         }
         if (
             semantics["obs_alignment"] != "obs[t]_before_action[t]"
+            or semantics["observation_reference"] != "camera_source_monotonic_ns"
+            or semantics["state_alignment"] != "camera_source_aligned_state"
+            or not np.isfinite(semantics["max_observation_skew_s"])
+            or semantics["max_observation_skew_s"] <= 0.0
+            or semantics["action_semantics"] != "deployment_grid_rate_limited_target"
+            or (
+                semantics["arm_max_delta_rad_per_tick"] is not None
+                and (
+                    not np.isfinite(semantics["arm_max_delta_rad_per_tick"])
+                    or semantics["arm_max_delta_rad_per_tick"] <= 0.0
+                )
+            )
+            or not np.isfinite(semantics["hand_max_delta_rad_per_tick"])
+            or semantics["hand_max_delta_rad_per_tick"] <= 0.0
+            or not semantics["deployment_equivalent"]
             or not semantics["contact_force_unit"]
             or not semantics["contact_force_frame"]
             or semantics["fingertip_points_frame"] != "xarm_base"
@@ -335,6 +392,77 @@ def _validate_uniform(artifacts: tuple[_Artifact, ...]) -> None:
             )
 
 
+def _load_artifacts(
+    input_root: str | Path, config: PolicyZarrExportConfig
+) -> tuple[_Artifact, ...]:
+    """Inspect one complete task input before any Zarr output is created."""
+
+    paths = _discover_processed_hdf5_paths(Path(input_root))
+    artifacts = tuple(_inspect_artifact(path, config) for path in paths)
+    _validate_uniform(artifacts)
+    return artifacts
+
+
+def _validate_artifact_payloads(
+    artifacts: tuple[_Artifact, ...], *, chunk_frames: int
+) -> None:
+    """Reject non-finite floating payloads without creating a Zarr store."""
+
+    for artifact in artifacts:
+        with h5py.File(artifact.path, "r") as source:
+            for key, dtype in artifact.dataset_dtypes.items():
+                if not np.issubdtype(dtype, np.floating):
+                    continue
+                for row_start in range(0, artifact.length, chunk_frames):
+                    row_end = min(artifact.length, row_start + chunk_frames)
+                    block = np.asarray(source[key][row_start:row_end])
+                    if not np.all(np.isfinite(block)):
+                        raise ValueError(
+                            f"{artifact.path.name}: {key} contains NaN/Inf"
+                        )
+
+
+def _export_plan_report(
+    artifacts: tuple[_Artifact, ...], *, input_root: str | Path
+) -> dict[str, Any]:
+    """Summarize the validated source layout used by preflight and publishing."""
+
+    first = artifacts[0]
+    episode_ends = np.cumsum(
+        [length for artifact in artifacts for length in artifact.segment_lengths],
+        dtype=np.int64,
+    )
+    return {
+        "input_root": str(Path(input_root).resolve()),
+        "task_name": first.task_name,
+        "profile": first.profile.value,
+        "dt": first.dt,
+        "source_file_count": len(artifacts),
+        "episode_count": len(episode_ends),
+        "total_frames": int(episode_ends[-1]),
+        "episode_ends": episode_ends.tolist(),
+        "dataset_keys": sorted(first.dataset_shapes),
+    }
+
+
+def preflight_processed_hdf5_to_zarr(
+    input_root: str | Path,
+    config: PolicyZarrExportConfig | None = None,
+) -> dict[str, Any]:
+    """Read and validate export inputs without creating or modifying a Zarr store.
+
+    The preflight checks the same per-artifact schema, deployment semantics,
+    task-level uniformity, and finite floating payload values that publishing
+    checks before writing. It deliberately does not create a temporary Zarr
+    store, so it is suitable for a quick fail-closed admission check.
+    """
+
+    resolved = config or PolicyZarrExportConfig()
+    artifacts = _load_artifacts(input_root, resolved)
+    _validate_artifact_payloads(artifacts, chunk_frames=resolved.chunk_frames)
+    return _export_plan_report(artifacts, input_root=input_root)
+
+
 def _copy_data(
     artifacts: tuple[_Artifact, ...], data_group: zarr.Group, *, chunk_frames: int
 ) -> dict[str, str]:
@@ -428,17 +556,7 @@ def export_processed_hdf5_to_zarr(
         raise NotADirectoryError(source_root)
     if target_is_occupied(target):
         raise FileExistsError(f"refusing to overwrite existing policy Zarr: {target}")
-    hdf5_paths = tuple(
-        sorted(
-            path
-            for path in source_root.iterdir()
-            if path.is_file() and path.suffix.lower() in {".h5", ".hdf5"}
-        )
-    )
-    if not hdf5_paths:
-        raise FileNotFoundError(f"no processed HDF5 files found in {source_root}")
-    artifacts = tuple(_inspect_artifact(path, resolved) for path in hdf5_paths)
-    _validate_uniform(artifacts)
+    artifacts = _load_artifacts(source_root, resolved)
     total_frames = sum(artifact.length for artifact in artifacts)
     episode_ends = np.cumsum(
         [length for artifact in artifacts for length in artifact.segment_lengths],
@@ -496,10 +614,5 @@ def export_processed_hdf5_to_zarr(
         raise
     return {
         "output_path": str(target.resolve()),
-        "task_name": first.task_name,
-        "profile": first.profile.value,
-        "episode_count": len(episode_ends),
-        "total_frames": total_frames,
-        "episode_ends": episode_ends.tolist(),
-        "dataset_keys": sorted(first.dataset_shapes),
+        **_export_plan_report(artifacts, input_root=source_root),
     }

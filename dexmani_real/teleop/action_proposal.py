@@ -132,10 +132,17 @@ def compute_hand_joint_proposal(
     ramp_total_frames: int,
     command_lower_rad: np.ndarray,
     command_upper_rad: np.ndarray,
+    max_delta_rad_per_tick: np.ndarray | float,
     mechanical_lower_rad: np.ndarray,
     mechanical_upper_rad: np.ndarray,
 ) -> HandJointProposal:
-    """Retarget, ramp, and validate one hand proposal without publishing it."""
+    """Retarget, shape, and validate one hand proposal without publishing it.
+
+    The final target is bounded against the previously published hand endpoint,
+    matching the learned-policy coordinator's reject-only per-grid contract.
+    The hand worker separately bounds from measured feedback before its SDK
+    call, so this proposal limit never weakens the actuator safety boundary.
+    """
     compute_started_s = time.perf_counter()
     hand_qpos_rad, retarget_succeeded = compute_hand_command(
         hand_retargeter,
@@ -188,6 +195,12 @@ def compute_hand_joint_proposal(
         )
         retarget_succeeded = False
 
+    hand_qpos_rad = limit_hand_target_delta(
+        hand_qpos_rad,
+        previous_hand_qpos_rad,
+        max_delta_rad_per_tick,
+    )
+
     return HandJointProposal(
         qpos_rad=np.asarray(hand_qpos_rad, dtype=np.float64).copy(),
         raw_qpos_rad=np.asarray(raw_qpos_rad, dtype=np.float64).copy(),
@@ -201,6 +214,26 @@ def compute_hand_joint_proposal(
         next_ramp_step=next_ramp_step,
         compute_time_ms=compute_time_ms,
     )
+
+
+def limit_hand_target_delta(
+    target_qpos_rad: np.ndarray,
+    previous_qpos_rad: np.ndarray,
+    max_delta_rad_per_tick: np.ndarray | float,
+) -> np.ndarray:
+    """Bound a policy-grid hand endpoint relative to its prior endpoint."""
+    target = np.asarray(target_qpos_rad, dtype=np.float64)
+    previous = np.asarray(previous_qpos_rad, dtype=np.float64)
+    if target.shape != previous.shape:
+        raise ValueError("hand target and previous endpoint must have the same shape")
+    if not np.all(np.isfinite(target)) or not np.all(np.isfinite(previous)):
+        raise ValueError("hand target and previous endpoint must be finite")
+    max_delta = np.broadcast_to(
+        np.asarray(max_delta_rad_per_tick, dtype=np.float64), target.shape
+    )
+    if not np.all(np.isfinite(max_delta)) or np.any(max_delta <= 0.0):
+        raise ValueError("hand max_delta_rad_per_tick must be finite and positive")
+    return previous + np.clip(target - previous, -max_delta, max_delta)
 
 
 def compute_arm_joint_proposal(

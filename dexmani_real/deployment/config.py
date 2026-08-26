@@ -127,12 +127,26 @@ class PolicyRuntimeConfig:
     point_cloud_table_plane_abcd_json: str = ""
     point_cloud_sampling: str = ""
     point_cloud_transform: str = ""
+    arm_max_delta_rad_per_tick: float | None = None
+    hand_max_delta_rad_per_tick: float = 0.1
 
     def __post_init__(self) -> None:
         if not isinstance(self.deployment, DeploymentConfig):
             raise TypeError("deployment must be a DeploymentConfig")
         if not math.isfinite(self.control_dt_s) or self.control_dt_s <= 0.0:
             raise ValueError("control_dt_s must be finite and positive")
+        if self.arm_max_delta_rad_per_tick is not None and (
+            not math.isfinite(self.arm_max_delta_rad_per_tick)
+            or self.arm_max_delta_rad_per_tick <= 0.0
+        ):
+            raise ValueError(
+                "arm_max_delta_rad_per_tick must be finite and positive or None"
+            )
+        if (
+            not math.isfinite(self.hand_max_delta_rad_per_tick)
+            or self.hand_max_delta_rad_per_tick <= 0.0
+        ):
+            raise ValueError("hand_max_delta_rad_per_tick must be finite and positive")
         if "point_cloud" in parse_observation_fields(
             self.deployment.observation_fields
         ):

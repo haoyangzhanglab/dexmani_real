@@ -249,7 +249,8 @@ class ArmParams:
     )
 
     max_joint_velocity_deg_per_s: float = 135.0  # 75% of the 180 deg/s SDK command limit
-    max_joint_acceleration_deg_per_s2: float = 1031.324031235482  # 18 rad/s²; 90% of the 20 rad/s² SDK limit
+    # ~14.14 rad/s²; ~71% of the 20 rad/s² SDK limit.
+    max_joint_acceleration_deg_per_s2: float = 810.0
     loop_hz: float = 30.0  # arm_loop servo rate
 
     ip: str = "192.168.1.111"

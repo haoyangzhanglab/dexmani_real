@@ -1,4 +1,4 @@
-"""Transactional raw v22 episode serialization from owned ``EpisodeFrame`` rows.
+"""Transactional raw v23 episode serialization from owned ``EpisodeFrame`` rows.
 
 State, action, VR, and camera rows are causally aligned to the policy grid.
 The recorder owns transaction lifecycle, camera sidecar coordination, metadata,
@@ -51,7 +51,6 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_MAX_RECORD_FRAMES: int = 10000
-SCHEMA_VERSION = EPISODE_SCHEMA_VERSION
 _CAMERA_WRITER_CLOSE_TIMEOUT_S = 60.0
 _PREVIOUS_EPISODE_STOP_TIMEOUT_S = 15.0
 _PROCESS_EXIT_STOP_TIMEOUT_S = 60.0
@@ -303,8 +302,8 @@ class EpisodeRecorder:
                 "0": "OK",
                 "1": "CLOCK_RESET",
                 "2": "DUPLICATE",
-                "3": "FRAME_GAP_LEGACY",
-                "4": "DELIVERY_DELAY_ABOVE_FLOOR_LEGACY_NAME_BACKLOG",
+                "3": "FRAME_GAP",
+                "4": "DELIVERY_DELAY_ABOVE_FLOOR",
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -315,7 +314,7 @@ class EpisodeRecorder:
         )
         meta.attrs["camera_depth_storage"] = "uint16/gzip-1"
         meta.attrs["camera_depth_payload_semantics"] = (
-            "v22: librealsense_align_depth_to_color_z16; depth pixels are in "
+            "v23: librealsense_align_depth_to_color_z16; depth pixels are in "
             "camera_color_optical and match camera_rgb pixels"
         )
 
@@ -824,7 +823,7 @@ class EpisodeRecorder:
         def _write_final_meta(meta: h5py.Group) -> None:
             grid_dt_s = 1.0 / self.control_hz
             grid_duration_s = max(0, self._frame_count - 1) * grid_dt_s
-            meta.attrs["schema_version"] = SCHEMA_VERSION
+            meta.attrs["schema_version"] = EPISODE_SCHEMA_VERSION
             # ``duration`` remains wall-clock time; explicit grid fields keep
             # pauses and other non-sampled time distinct from the control rate.
             meta.attrs["duration"] = duration

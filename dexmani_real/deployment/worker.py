@@ -192,6 +192,7 @@ def _read_state_history(
     anchor_ns: int,
     values_field: str,
     required_true_fields: tuple[str, ...] = (),
+    required_false_fields: tuple[str, ...] = (),
     max_age_ns: int | None = None,
     not_before_ns: int = 0,
 ) -> FrameWindow | None:
@@ -215,6 +216,11 @@ def _read_state_history(
         if any(
             field not in names or not bool(data[field][0])
             for field in required_true_fields
+        ):
+            continue
+        if any(
+            field not in names or bool(data[field][0])
+            for field in required_false_fields
         ):
             continue
         source_ns = int(data["source_monotonic_ns"][0])
@@ -495,6 +501,7 @@ def _build_observation(
                 anchor_ns=anchor_ns,
                 values_field="qpos",
                 required_true_fields=("state_valid",),
+                required_false_fields=("qpos_stale",),
                 max_age_ns=(
                     state_history_max_age_ns if pointcloud_requested else max_age_ns
                 ),
@@ -511,6 +518,7 @@ def _build_observation(
                     anchor_ns=anchor_ns,
                     values_field="current",
                     required_true_fields=("state_valid",),
+                    required_false_fields=("qpos_stale",),
                     max_age_ns=(
                         state_history_max_age_ns if pointcloud_requested else max_age_ns
                     ),
@@ -530,6 +538,7 @@ def _build_observation(
                         "state_valid",
                         "tactile_sum_valid",
                     ),
+                    required_false_fields=("qpos_stale",),
                     max_age_ns=(
                         state_history_max_age_ns if pointcloud_requested else max_age_ns
                     ),

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/visualize_episode.py EPISODE [--info] [--max-frames N]``.
 
-Self-contained Rerun visualizer for raw schema-v21/v22 DexMani episodes.
-Offline only: connects to no hardware and writes no files. Raw v22 episodes
-display a canonical fixed-size ``(N, 6)`` point cloud derived with the same
-production implementation used by offline processing and deployment. Raw v21
-episodes retain camera/state visualization but have no canonical point cloud.
+Self-contained Rerun visualizer for raw schema-v23 DexMani episodes. Offline
+only: connects to no hardware and writes no files. Episodes display a canonical
+fixed-size ``(N, 6)`` point cloud derived with the same production implementation
+used by offline processing and deployment.
 
 Examples::
 
@@ -173,7 +172,7 @@ class EpisodeVisualizer:
         self,
         h5_path: str,
         max_frames: int | None = None,
-        point_cloud: bool | None = None,
+        point_cloud: bool = True,
         pointcloud_config: PointCloudConfig | None = None,
         table_plane_abcd: tuple[float, float, float, float] | None = None,
         runtime_config_sha256: str | None = None,
@@ -187,7 +186,7 @@ class EpisodeVisualizer:
                 )
             self._h5f = self._reader.h5f
 
-            # Raw v21/v22 require both sidecars; preload them once for Rerun.
+            # Preload the RGB-D sidecars once for Rerun.
             self._rgb_cache = self._reader.read_camera_all("rgb")
             self._depth_cache = self._reader.read_camera_all("depth")
             logger.info("Pre-decoded %d RGB-D frames", self._rgb_cache.shape[0])
@@ -205,50 +204,23 @@ class EpisodeVisualizer:
             meta = self._h5f.get("meta")
             if meta is None:
                 raise ValueError("episode is missing /meta")
-            self._schema_version = self._reader.schema_version
-            self._camera_model: RawEpisodeCameraModel | None = None
-            self._camera_K: np.ndarray | None = None
+            self._camera_model = load_raw_episode_camera_model(self._reader)
+            self._camera_K = self._camera_model.geometry.color.matrix()
+            self._depth_meter = 1.0 / self._camera_model.depth_scale_m
             self._T_xarm_base_from_color: np.ndarray | None = None
-
-            if self._schema_version == 22:
-                self._camera_model = load_raw_episode_camera_model(self._reader)
-                self._camera_K = self._camera_model.geometry.color.matrix()
-                self._depth_meter = 1.0 / self._camera_model.depth_scale_m
-            else:
-                depth_scale_m = float(meta.attrs.get("depth_scale", 0.0))
-                if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
-                    raise ValueError("episode is missing a valid /meta depth_scale")
-                self._depth_meter = 1.0 / depth_scale_m
-                if "camera_K" in meta.attrs:
-                    self._camera_K = np.asarray(
-                        meta.attrs["camera_K"], dtype=np.float64
-                    ).reshape(3, 3)
-                if "camera_T_world_camera" in meta.attrs:
-                    self._T_xarm_base_from_color = np.asarray(
-                        meta.attrs["camera_T_world_camera"], dtype=np.float64
-                    ).reshape(4, 4)
-
-            self._pc_enabled = (
-                self._schema_version == 22 if point_cloud is None else point_cloud
-            )
-            if self._pc_enabled and self._schema_version != 22:
-                raise ValueError(
-                    "canonical point-cloud visualization requires raw schema v22; "
-                    "use --no-point-cloud for raw v21"
+            self._pc_enabled = point_cloud
+            camera_type = str(meta.attrs.get("camera_type", ""))
+            if camera_type == "eye_to_hand" or self._pc_enabled:
+                self._T_xarm_base_from_color = load_raw_episode_base_from_color(
+                    self._reader
                 )
-            if self._schema_version == 22:
-                camera_type = str(meta.attrs.get("camera_type", ""))
-                if camera_type == "eye_to_hand" or self._pc_enabled:
-                    self._T_xarm_base_from_color = load_raw_episode_base_from_color(
-                        self._reader
-                    )
 
             self._pointcloud_deriver: RawEpisodePointCloudDeriver | None = None
             self._empty_pointcloud_frames = 0
             self._pointcloud_processing_ns = 0
             self._pointcloud_processed_frames = 0
             if self._pc_enabled:
-                if pointcloud_config is None or self._camera_model is None:
+                if pointcloud_config is None:
                     raise ValueError(
                         "point-cloud visualization requires resolved config"
                     )
@@ -595,7 +567,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "episode",
         type=str,
-        help="Path to a raw schema-v21/v22 episodes/<task_name>/episode_* directory.",
+        help="Path to a raw schema-v23 episodes/<task_name>/episode_* directory.",
     )
     parser.add_argument(
         "--max-frames",
@@ -612,10 +584,7 @@ def main(argv: list[str] | None = None) -> int:
         "--point-cloud",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help=(
-            "Display the canonical point cloud; defaults to on for raw v22 and "
-            "off for raw v21."
-        ),
+        help=("Display the canonical point cloud (default: enabled)."),
     )
     parser.add_argument(
         "--pointcloud-num-points",
@@ -638,15 +607,7 @@ def main(argv: list[str] | None = None) -> int:
         print_episode_info(str(h5_path))
         return 0
 
-    with EpisodeReader(h5_path) as reader:
-        schema_version = reader.schema_version
-    point_cloud_enabled = (
-        schema_version == 22 if args.point_cloud is None else args.point_cloud
-    )
-    if point_cloud_enabled and schema_version != 22:
-        parser.error(
-            "--point-cloud requires raw schema v22; use --no-point-cloud for v21"
-        )
+    point_cloud_enabled = True if args.point_cloud is None else args.point_cloud
     if args.pointcloud_num_points is not None and not point_cloud_enabled:
         parser.error("--pointcloud-num-points requires an enabled point cloud")
 

@@ -20,6 +20,10 @@ class TeleopCommandLimits:
     hand_home_qpos_rad: np.ndarray
     hand_command_lower_rad: np.ndarray
     hand_command_upper_rad: np.ndarray
+    # Policy-grid endpoint bound shared with learned-policy deployment.  The
+    # hand worker keeps its measured-state limiter as an independent hardware
+    # backstop.
+    hand_max_delta_rad_per_tick: np.ndarray
     hand_mechanical_lower_rad: np.ndarray
     hand_mechanical_upper_rad: np.ndarray
     workspace_bounds_world_m: np.ndarray
@@ -37,6 +41,13 @@ class TeleopCommandLimits:
             ).copy()
         )
         hand_lower = np.asarray(config.runtime.hand.qpos_min_rad, dtype=np.float64)
+        hand_max_delta = np.broadcast_to(
+            np.asarray(
+                config.runtime.hand.hand_max_delta_rad_per_tick,
+                dtype=np.float64,
+            ),
+            hand_lower.shape,
+        ).copy()
         return cls(
             arm_joint_lower_rad=arm_lower.copy(),
             arm_joint_upper_rad=arm_upper.copy(),
@@ -48,6 +59,7 @@ class TeleopCommandLimits:
             hand_command_upper_rad=np.asarray(
                 config.runtime.hand.qpos_max_rad, dtype=np.float64
             ).copy(),
+            hand_max_delta_rad_per_tick=hand_max_delta,
             hand_mechanical_lower_rad=np.asarray(
                 config.runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
             ).copy(),

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -196,6 +196,9 @@ def _recording_provenance(
         "observation_history_valid_mask": source_valid[:, None],
         "observation_valid": observation_valid,
         "observation_skew_s": float(np.nanmax(skew_s, initial=0.0)),
+        "hand_accepted_target_action_id": _field(
+            hand_state, "accepted_target_action_id"
+        ),
         "action_id": action_id,
         "action_created_monotonic_ns": (
             action_candidate.created_monotonic_ns if action_candidate is not None else 0
@@ -243,6 +246,7 @@ def record_held(
     hand_ring_sequence: int = 0,
     shared: RuntimeChannels | None = None,
     action_candidate: ActionCandidate | None = None,
+    policy_observation: Mapping[str, object] | None = None,
 ) -> None:
     """Record an active safety-fallback frame and its optional hold command.
 
@@ -309,6 +313,8 @@ def record_held(
                 action_candidate=action_candidate,
             )
         )
+    if policy_observation is not None:
+        signals.update(policy_observation)
     recorder.add_frame(
         state,
         action,
@@ -351,6 +357,7 @@ def record_frame(
     hand_ring_sequence: int = 0,
     shared: RuntimeChannels | None = None,
     action_candidate: ActionCandidate | None = None,
+    policy_observation: Mapping[str, object] | None = None,
 ) -> None:
     """Record a normal (active teleop) frame.
 
@@ -416,6 +423,8 @@ def record_frame(
                 action_candidate=action_candidate,
             )
         )
+    if policy_observation is not None:
+        signals.update(policy_observation)
     recorder.add_frame(
         state,
         action,

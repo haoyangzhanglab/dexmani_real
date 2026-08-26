@@ -354,12 +354,3 @@ def _stderr_text(stderr: bytes | str | None) -> str:
 def _find_players() -> list[str]:
     """Return available system players in fallback order."""
     return [name for name in ("aplay", "paplay") if shutil.which(name)]
-
-
-def _find_player() -> str | None:
-    """Compatibility helper returning the preferred system player."""
-    players = _find_players()
-    if players:
-        return players[0]
-    logger.warning("No system audio player found (tried aplay, paplay)")
-    return None

@@ -11,7 +11,7 @@ sources:
   presence, point-cloud count).
 
 ``domain`` is a construct-time constant (``"real"``). The adapter separately
-requires a Real Policy Zarr v4 training-data contract before constructing this
+requires a Real Policy Zarr v5 training-data contract before constructing this
 manifest; the constant alone is not evidence of checkpoint provenance.
 
 ``dt`` remains outside the model-shape manifest, but the checkpoint training-data

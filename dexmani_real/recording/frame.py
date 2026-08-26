@@ -182,6 +182,44 @@ def build_episode_frame(
         ),
         "observation_valid": bool(signal.get("observation_valid", False)),
         "observation_skew_s": _scalar_float(signal.get("observation_skew_s", np.nan)),
+        "policy_observation_arm_qpos": np.asarray(
+            signal.get("policy_observation_arm_qpos", np.full(ARM_JOINT_SHAPE, np.nan)),
+            dtype=np.float64,
+        ),
+        "policy_observation_hand_qpos": np.asarray(
+            signal.get(
+                "policy_observation_hand_qpos", np.full(HAND_JOINT_SHAPE, np.nan)
+            ),
+            dtype=np.float64,
+        ),
+        "policy_observation_reference_monotonic_ns": _scalar_int(
+            signal.get("policy_observation_reference_monotonic_ns", 0)
+        ),
+        "policy_observation_arm_source_sequence": _scalar_int(
+            signal.get("policy_observation_arm_source_sequence", 0)
+        ),
+        "policy_observation_hand_source_sequence": _scalar_int(
+            signal.get("policy_observation_hand_source_sequence", 0)
+        ),
+        "policy_observation_arm_source_monotonic_ns": _scalar_int(
+            signal.get("policy_observation_arm_source_monotonic_ns", 0)
+        ),
+        "policy_observation_hand_source_monotonic_ns": _scalar_int(
+            signal.get("policy_observation_hand_source_monotonic_ns", 0)
+        ),
+        "policy_observation_arm_publish_monotonic_ns": _scalar_int(
+            signal.get("policy_observation_arm_publish_monotonic_ns", 0)
+        ),
+        "policy_observation_hand_publish_monotonic_ns": _scalar_int(
+            signal.get("policy_observation_hand_publish_monotonic_ns", 0)
+        ),
+        "policy_observation_valid": bool(signal.get("policy_observation_valid", False)),
+        "policy_observation_skew_s": _scalar_float(
+            signal.get("policy_observation_skew_s", np.nan)
+        ),
+        "hand_accepted_target_action_id": _scalar_int(
+            signal.get("hand_accepted_target_action_id", 0)
+        ),
         "action_id": _scalar_int(signal.get("action_id", 0)),
         "action_created_monotonic_ns": _scalar_int(
             signal.get("action_created_monotonic_ns", 0)
@@ -373,6 +411,18 @@ def decode_record_sample(
         "observation_history_valid_mask",
         "observation_valid",
         "observation_skew_s",
+        "policy_observation_arm_qpos",
+        "policy_observation_hand_qpos",
+        "policy_observation_reference_monotonic_ns",
+        "policy_observation_arm_source_sequence",
+        "policy_observation_hand_source_sequence",
+        "policy_observation_arm_source_monotonic_ns",
+        "policy_observation_hand_source_monotonic_ns",
+        "policy_observation_arm_publish_monotonic_ns",
+        "policy_observation_hand_publish_monotonic_ns",
+        "policy_observation_valid",
+        "policy_observation_skew_s",
+        "hand_accepted_target_action_id",
         "action_id",
         "action_created_monotonic_ns",
         "action_target_monotonic_ns",

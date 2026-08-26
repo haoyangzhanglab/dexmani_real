@@ -46,9 +46,9 @@ Intel RealSense
         fixed float32[N, 6], frame=xarm_base
                  │
                  ├─ pointcloud_ring → deployment / policy observation
-                 └─ raw v22
+                 └─ raw v23
                       ├─ raw visualizer → Rerun canonical preview
-                      └─ offline process → processed HDF5 v8 → Policy Zarr v4
+                      └─ offline process → processed HDF5 v10 → Policy Zarr v5
 ```
 
 实时 worker 不排队旧帧：它只读取 `camera_ring` 的最新 sequence，并在构建前后检查相机健康、
@@ -56,7 +56,7 @@ generation、时钟重置和最大帧龄。结果在计算后已过期时不会�
 
 ## Raw episode 即时可视化
 
-`examples/visualize_episode.py` 对 raw v22 默认启用点云。持久化边界由
+`examples/visualize_episode.py` 对 raw v23 默认启用点云。持久化边界由
 `data/raw_pointcloud.py` 统一解析：它从 episode 读取 aligned RGB-D 几何、`depth_scale` 与
 `T_xarm_base_from_color`，再调用和 offline processing、实时 worker 相同的
 `sensor.pointcloud.build_point_cloud()`。可视化入口不维护第二套反投影、裁减或采样实现。
@@ -66,9 +66,8 @@ raw episode 保存记录期 resolved config 的 SHA-256，但不复制可反序�
 时入口会 warning，结果应视为 current-config preview。需要可持久复现和完整 provenance 时，应生成
 processed HDF5；其文件内保存 processing config、点云配置哈希与桌面平面身份。
 
-raw v21 的 depth 是 native depth 像素网格，没有 v22 的 depth-to-color aligned 合同，因此不会
-尝试生成 canonical 点云。`--no-point-cloud` 可关闭 v22 即时推导；单帧构建结果为空时 Rerun 会显式
-清除该时间点的点云，避免沿用上一帧。eye-in-hand 仍会 fail closed，因为 raw v22 没有保存相机曝光
+运行时只读取 raw v23；`--no-point-cloud` 可关闭即时推导。单帧构建结果为空时 Rerun 会显式
+清除该时间点的点云，避免沿用上一帧。eye-in-hand 仍会 fail closed，因为 raw v23 没有保存相机曝光
 时刻对应的机械臂位姿。
 
 ## 坐标系与对齐语义
@@ -247,7 +246,7 @@ post-calibration 同帧诊断快照：
 及对齐/数组准备，但不包含实时 worker 的 ring 发布。需要评价部署总时延时，应同时读取实时
 worker 的 `source_to_publish_ms_p95` 日志。当前纯构建目标是 p95 < 40 ms。
 
-### 2026-08-26 当前 v9 离线验证
+### 2026-08-26 当前离线验证
 
 五个 L515 诊断快照覆盖常规桌面物体、机械臂轮廓和两个细小物体场景。当前默认策略使用
 5 邻居边缘支持、7/13 mm 桌面核心/物体种子高度、5 mm 体素、12 mm 离群半径、6 邻居、
@@ -277,8 +276,10 @@ OpenCV 3×3 depth fast path 与逐步 SciPy 参考实现的 240 帧最终点云 
 
 ## 录制、离线处理与语义校验
 
-录制 schema v22 保存 aligned raw depth、RGB、native depth/color 几何 provenance、帧号和时间
-信息。离线处理只接受 raw v22，并使用同一个生产 builder 生成 processed HDF5 v8。
+录制 schema v23 保存 aligned raw depth、RGB、native depth/color 几何 provenance、帧号和时间
+信息，并持久化与 camera source 对齐的 arm/hand policy observation。离线处理只接受 raw v23，
+并使用同一个生产 builder 生成 processed HDF5 v10；只有完整的对齐与动作限速合同的 pointcloud
+产物可进入 Policy Zarr v5。
 
 每个 processed 点云产物记录并在导出/可视化时校验：
 
@@ -289,7 +290,7 @@ OpenCV 3×3 depth fast path 与逐步 SciPy 参考实现的 240 帧最终点云 
 - 桌面平面、采样和变换语义。
 
 导出、可视化和部署只接受与当前 policy ID、配置哈希及桌面标定身份完全一致的产物；其他产物
-必须从受支持的 raw v22 episode 重新处理，不能通过兼容分支静默混用。
+必须从受支持的 raw v23 episode 重新处理。
 
 ## 代码所有权
 
@@ -301,8 +302,8 @@ OpenCV 3×3 depth fast path 与逐步 SciPy 参考实现的 240 帧最终点云 
 | 最新帧消费、freshness 与 point-cloud IPC 发布 | `sensor/pointcloud_worker.py` |
 | 点云参数与稳定 identity | `config/pointcloud.py` |
 | 桌面 RANSAC 与 plane 文件 | `calibration/table.py`、`config/desk_plane.json` |
-| raw v22 相机 metadata 与点云输入适配 | `data/raw_pointcloud.py` |
-| raw v22 → processed v8 | `data/process.py` |
+| raw v23 相机 metadata 与点云输入适配 | `data/raw_pointcloud.py` |
+| raw v23 → processed v10 | `data/process.py` |
 | raw current-config preview | `examples/visualize_episode.py` |
 
 核心数学不访问 SDK、共享内存、文件或可视化；硬件采集、IPC、标定写入和 GUI 均在外围 owner 中。

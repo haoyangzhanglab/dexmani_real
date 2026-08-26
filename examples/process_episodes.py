@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/process_episodes.py INPUT_ROOT [--profile PROFILE]``.
 
-Offline CLI that audits and compacts one task's depth-to-color aligned raw-v22
-episodes into processed HDF5 v8 files, one per source episode.
+Offline CLI that audits and compacts one task's depth-to-color aligned raw-v23
+episodes into processed HDF5 v10 files, one per source episode.
 
 Directory mapping: ``episodes/<task>/episode_*`` (raw) is published to
 ``episodes_processed/<task>/episode_*.h5``.  Passing a single episode
@@ -11,9 +11,9 @@ mapping holds for one episode.
 
 Processing is two-pass.  A per-episode audit pass (a dry-run analysis per
 episode, progress on stderr via tqdm) decides accept or skip per episode.
-Episodes with serious problems — unreadable files, schema validation failure,
-hard row loss, or no source-contiguous segment long enough for training — are then
-automatically skipped with a warning and the reason.  The surviving batch is
+Episodes with serious problems — unreadable files, schema validation failure, or
+no source-contiguous segment long enough for training — are then automatically
+skipped with a warning and the reason. The surviving batch is
 published in one transactional pass.  An episode whose annotation explicitly
 sets ``include: true`` is never auto-skipped: its rejection stays blocking and
 aborts the batch, so explicit operator intent is not silently overridden.
@@ -92,8 +92,8 @@ def _route_library_logging_to_stderr() -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Audit and compact depth-to-color aligned raw-v22 Real episodes into one "
-            "processed-v8 "
+            "Audit and compact depth-to-color aligned raw-v23 Real episodes into one "
+            "processed-v10 "
             "HDF5 per source; seriously broken episodes are skipped with a warning."
         )
     )
@@ -138,9 +138,25 @@ def _parser() -> argparse.ArgumentParser:
             "are rejected. Entries for episodes outside this input are ignored."
         ),
     )
+    parser.add_argument(
+        "--task-name",
+        help=(
+            "Write this one task_name into every processed episode, overriding raw "
+            "task_label. Refuses conflicts with per-episode annotation task_name."
+        ),
+    )
     parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument("--min-full-windows", type=int, default=1)
     parser.add_argument("--max-camera-age-s", type=float, default=0.25)
+    parser.add_argument(
+        "--max-observation-skew-s",
+        type=float,
+        default=0.10,
+        help=(
+            "Maximum source-time skew for visual observations; must match the "
+            "deployment observation contract (default: 0.10)."
+        ),
+    )
     parser.add_argument(
         "--quality-policy",
         choices=[policy.value for policy in QualityPolicy],
@@ -187,15 +203,18 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _config(
-    args: argparse.Namespace, profile: OutputProfile, policy: QualityPolicy
+    args: argparse.Namespace,
+    profile: OutputProfile,
+    policy: QualityPolicy,
+    runtime: object,
 ) -> ProcessingConfig:
-    runtime = resolve_runtime_config()
     return ProcessingConfig.from_runtime(
         runtime,
         profile=profile,
         horizon=args.horizon,
         min_full_windows=args.min_full_windows,
         max_camera_age_s=args.max_camera_age_s,
+        max_observation_skew_s=args.max_observation_skew_s,
         temporal_quality=TemporalQualityConfig(
             policy=policy,
             abrupt_arm_step_rad=args.abrupt_arm_step_rad,
@@ -213,6 +232,59 @@ def _resolve_default_output_root(input_root: Path) -> Path:
     if (input_root / "data.h5").is_file():
         return Path("episodes_processed") / input_root.parent.name
     return Path("episodes_processed") / input_root.name
+
+
+def _validate_task_name(parser: argparse.ArgumentParser, task_name: str | None) -> None:
+    """Reject task labels that cannot identify one processed dataset."""
+
+    if task_name is not None and (
+        not task_name
+        or task_name != task_name.strip()
+        or task_name == "unknown"
+        or any(ord(char) < 32 for char in task_name)
+    ):
+        parser.error(
+            "--task-name must be non-empty, trimmed, printable, and not 'unknown'"
+        )
+
+
+def _apply_task_name(
+    annotations: dict[str, EpisodeAnnotation],
+    episode_names: set[str],
+    task_name: str | None,
+) -> dict[str, EpisodeAnnotation]:
+    """Apply one explicit task identity without overriding audited conflicts."""
+
+    if task_name is None:
+        return annotations
+    resolved = dict(annotations)
+    for episode_name in sorted(episode_names):
+        annotation = resolved.get(episode_name, EpisodeAnnotation())
+        if annotation.task_name is not None and annotation.task_name != task_name:
+            raise ValueError(
+                f"--task-name={task_name!r} conflicts with annotation task_name="
+                f"{annotation.task_name!r} for {episode_name}"
+            )
+        resolved[episode_name] = dataclasses.replace(annotation, task_name=task_name)
+    return resolved
+
+
+def _rejection_detail(decision: dict) -> str:
+    """Make common processed-data admission failures actionable in terminal output."""
+
+    counts = decision.get("hard_reason_counts", {})
+    if not isinstance(counts, dict):
+        return ""
+    invalid_alignment = int(counts.get("policy_observation_invalid", 0))
+    if invalid_alignment:
+        return (
+            "; camera-source policy observation is invalid on "
+            f"{invalid_alignment} row(s)"
+        )
+    action_limit = int(counts.get("deployment_action_limit", 0))
+    if action_limit:
+        return f"; action endpoint delta limit is exceeded on {action_limit} row(s)"
+    return ""
 
 
 def _write_annotations_yaml(
@@ -297,7 +369,8 @@ def _audit_episodes(
             assert decision is not None
             status = "SKIP"
             tqdm.write(
-                f"WARNING: skipping episode {episode.name}: {decision['rejected_reason']}",
+                f"WARNING: skipping episode {episode.name}: "
+                f"{decision['rejected_reason']}{_rejection_detail(decision)}",
                 file=sys.stderr,
             )
         results.append(
@@ -328,7 +401,13 @@ def _print_audit_summary(results: list[dict]) -> None:
     print(f"audit: {len(results)} episode(s) -> {', '.join(parts)}", file=sys.stderr)
 
 
-def _write_process_logs(output_root: Path, results: list[dict], report: dict) -> None:
+def _write_process_logs(
+    output_root: Path,
+    results: list[dict],
+    report: dict,
+    *,
+    task_name: str | None,
+) -> None:
     """Write one JSON per source episode under ``output_root/process_log/``.
 
     Runs after a successful publish, so the batch config, the per-episode
@@ -349,7 +428,7 @@ def _write_process_logs(output_root: Path, results: list[dict], report: dict) ->
         entry = {
             "schema_name": PROCESSED_SCHEMA_NAME,
             "schema_version": PROCESSED_SCHEMA_VERSION,
-            "task_name": output_root.name,
+            "task_name": task_name or output_root.name,
             "dry_run": False,
             "config": report["config"],
             "source_episode": item["name"],
@@ -393,6 +472,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.strict and args.quality_policy is not None:
         parser.error("--strict is mutually exclusive with --quality-policy")
+    _validate_task_name(parser, args.task_name)
+    selected_profile = OutputProfile(args.profile)
     policy = (
         QualityPolicy.STRICT
         if args.strict
@@ -421,6 +502,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     user_annotations = {
         name: annotation for name, annotation in annotations.items() if name in known
     }
+    try:
+        user_annotations = _apply_task_name(
+            user_annotations,
+            known,
+            args.task_name,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if not args.dry_run and not args.compare_profiles and output_root.exists():
         print(
             f"error: output root already exists: {output_root}; "
@@ -429,12 +519,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
+    try:
+        runtime = resolve_runtime_config()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        print(f"error: failed to resolve runtime config: {exc}", file=sys.stderr)
+        return 2
+
     if args.compare_profiles:
         print("profile retention (selected/source frames):", file=sys.stderr)
         with tempfile.TemporaryDirectory(prefix="process_episodes-") as tmp_name:
             tmp_dir = Path(tmp_name)
             for profile in OutputProfile:
-                profile_config = _config(args, profile, policy)
+                try:
+                    profile_config = _config(args, profile, policy, runtime)
+                except (TypeError, ValueError) as exc:
+                    print(f"error: invalid processing config: {exc}", file=sys.stderr)
+                    return 2
                 results = _audit_episodes(
                     episodes, profile_config, user_annotations, output_root, tmp_dir
                 )
@@ -453,7 +553,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
         return 0
 
-    config = _config(args, OutputProfile(args.profile), policy)
+    try:
+        config = _config(args, selected_profile, policy, runtime)
+    except (TypeError, ValueError) as exc:
+        print(f"error: invalid processing config: {exc}", file=sys.stderr)
+        return 2
     with tempfile.TemporaryDirectory(prefix="process_episodes-") as tmp_name:
         tmp_dir = Path(tmp_name)
         results = _audit_episodes(
@@ -489,7 +593,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         if args.write_report:
             try:
-                _write_process_logs(output_root, results, report)
+                _write_process_logs(
+                    output_root,
+                    results,
+                    report,
+                    task_name=args.task_name,
+                )
             except OSError as exc:
                 print(
                     f"warning: failed to write process reports: {exc}", file=sys.stderr

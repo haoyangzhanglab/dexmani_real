@@ -53,7 +53,7 @@ def _validate_training_data_contract(data_contract: Any, runtime_config: Any) ->
     """Fail closed unless checkpoint data matches the realtime observation path."""
     if not isinstance(data_contract, dict):
         raise ValueError(
-            "checkpoint has no training data contract; retrain with Policy Zarr v4"
+            "checkpoint has no training data contract; retrain with Policy Zarr v5"
         )
     expected_task = getattr(runtime_config, "task_name", "")
     if not isinstance(expected_task, str) or not expected_task.strip():
@@ -63,9 +63,22 @@ def _validate_training_data_contract(data_contract: Any, runtime_config: Any) ->
     expected = {
         "domain": "real",
         "schema_name": "dexmani-real-policy-zarr",
-        "schema_version": 4,
+        "schema_version": 5,
         "episode_start_policy": "full_history",
         "obs_alignment": "obs[t]_before_action[t]",
+        "observation_reference": "camera_source_monotonic_ns",
+        "state_alignment": "camera_source_aligned_state",
+        "max_observation_skew_s": float(
+            getattr(runtime_config, "max_observation_skew_s", 0.0)
+        ),
+        "action_semantics": "deployment_grid_rate_limited_target",
+        "arm_max_delta_rad_per_tick": getattr(
+            runtime_config, "arm_max_delta_rad_per_tick", None
+        ),
+        "hand_max_delta_rad_per_tick": float(
+            getattr(runtime_config, "hand_max_delta_rad_per_tick", 0.0)
+        ),
+        "deployment_equivalent": True,
         "task_name": expected_task,
         "point_cloud_frame": getattr(runtime_config, "point_cloud_frame", ""),
         "point_cloud_color_source": getattr(

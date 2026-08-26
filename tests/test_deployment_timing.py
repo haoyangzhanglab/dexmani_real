@@ -21,8 +21,10 @@ from dexmani_real.deployment.manifest import DeploymentManifest
 from dexmani_real.deployment.observation import PointCloudFrame, freeze_array
 from dexmani_real.deployment.worker import (
     _build_observation,
+    _read_state_history,
     _select_pointcloud_control_grid,
 )
+from dexmani_real.ipc.causal import read_structured_frame_aligned_to_source
 from dexmani_real.integrations.dexmani_policy import (
     _expected_normalizer_dims,
     _validate_training_data_contract,
@@ -54,6 +56,18 @@ class _Ring:
 
     def get_last_k(self, count: int):
         return self.records[-count:]
+
+
+class _SequenceRing(_Ring):
+    @property
+    def latest_sequence(self) -> int:
+        return self.records[-1][2] if self.records else 0
+
+    def read_sequence(self, sequence: int):
+        for record in self.records:
+            if record[2] == sequence:
+                return record
+        return None
 
 
 def _shared_epoch() -> SimpleNamespace:
@@ -102,6 +116,50 @@ def _plan() -> np.void:
 
 
 class DeploymentTimingTest(unittest.TestCase):
+    def test_source_aligned_state_allows_delivery_after_camera_sample(self) -> None:
+        records: list[tuple[np.ndarray, int, int]] = []
+        for sequence, source_ns, publish_ns in (
+            (1, 80, 160),
+            (2, 120, 130),
+            (3, 90, 95),
+        ):
+            state = np.zeros(1, dtype=ARM_STATE_DTYPE)
+            state["source_monotonic_ns"][0] = source_ns
+            state["publish_monotonic_ns"][0] = publish_ns
+            records.append((state, publish_ns, sequence))
+
+        selected = read_structured_frame_aligned_to_source(
+            _SequenceRing(records),
+            source_field="source_monotonic_ns",
+            reference_source_monotonic_ns=100,
+            anchor_monotonic_ns=200,
+        )
+
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        data, publish_ns, sequence = selected
+        self.assertEqual(int(data["source_monotonic_ns"][0]), 90)
+        self.assertEqual(publish_ns, 95)
+        self.assertEqual(sequence, 3)
+
+    def test_stale_hand_qpos_is_not_a_policy_observation(self) -> None:
+        state = np.zeros(1, dtype=HAND_STATE_DTYPE)
+        state["source_monotonic_ns"][0] = 100
+        state["publish_monotonic_ns"][0] = 110
+        state["state_valid"][0] = 1
+        state["qpos_stale"][0] = 1
+
+        history = _read_state_history(
+            _Ring([(state, 110, 1)]),
+            history_len=1,
+            anchor_ns=200,
+            values_field="qpos",
+            required_true_fields=("state_valid",),
+            required_false_fields=("qpos_stale",),
+        )
+
+        self.assertIsNone(history)
+
     def test_deployment_wrapper_rejects_ignored_sibling_fields(self) -> None:
         with self.assertRaisesRegex(TypeError, "sibling"):
             resolve_deployment_config(
@@ -277,9 +335,16 @@ class DeploymentTimingTest(unittest.TestCase):
         contract = {
             "domain": "real",
             "schema_name": "dexmani-real-policy-zarr",
-            "schema_version": 4,
+            "schema_version": 5,
             "episode_start_policy": "full_history",
             "obs_alignment": "obs[t]_before_action[t]",
+            "observation_reference": "camera_source_monotonic_ns",
+            "state_alignment": "camera_source_aligned_state",
+            "max_observation_skew_s": config.max_observation_skew_s,
+            "action_semantics": "deployment_grid_rate_limited_target",
+            "arm_max_delta_rad_per_tick": config.arm_max_delta_rad_per_tick,
+            "hand_max_delta_rad_per_tick": config.hand_max_delta_rad_per_tick,
+            "deployment_equivalent": True,
             "profile": "pointcloud",
             "task_name": "pick",
             "dt": 0.0625,

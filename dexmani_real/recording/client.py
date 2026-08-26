@@ -63,16 +63,6 @@ class RecorderStopResult:
     min_frames_met: bool = False
     failure_count: int = 0
 
-    @property
-    def success(self) -> bool:
-        """Compatibility alias: only a successfully published save is success."""
-        return (
-            self.done
-            and self.phase is RecorderPhase.COMPLETED
-            and self.saved
-            and self.error is None
-        )
-
 
 def bounded_control_text(value: str, *, capacity: int, field: str) -> bytes:
     """Encode a control-plane text field without an unbounded JSON side channel."""
@@ -115,6 +105,14 @@ def _write_sample_metadata(
         "hand_publish_monotonic_ns",
         "vr_publish_monotonic_ns",
         "camera_publish_monotonic_ns",
+        "policy_observation_reference_monotonic_ns",
+        "policy_observation_arm_source_sequence",
+        "policy_observation_hand_source_sequence",
+        "policy_observation_arm_source_monotonic_ns",
+        "policy_observation_hand_source_monotonic_ns",
+        "policy_observation_arm_publish_monotonic_ns",
+        "policy_observation_hand_publish_monotonic_ns",
+        "hand_accepted_target_action_id",
         "action_id",
         "action_created_monotonic_ns",
         "action_target_monotonic_ns",
@@ -125,6 +123,7 @@ def _write_sample_metadata(
         frame[name][0] = int(signal_data.get(name, 0))
     bool_fields = {
         "observation_valid": "observation_valid",
+        "policy_observation_valid": "policy_observation_valid",
         "flag_action_queued": "action_queued",
         "tactile_fresh": "tactile_fresh",
         "tactile_calibrated": "tactile_calibrated",
@@ -157,9 +156,22 @@ def _write_sample_metadata(
     )
     for name in (
         "observation_skew_s",
+        "policy_observation_skew_s",
         "pointcloud_valid_depth_ratio",
     ):
         frame[name][0] = float(signal_data.get(name, np.nan))
+    frame["policy_observation_arm_qpos"][0] = np.asarray(
+        signal_data.get(
+            "policy_observation_arm_qpos", np.full(ARM_JOINT_SHAPE, np.nan)
+        ),
+        dtype=np.float64,
+    )
+    frame["policy_observation_hand_qpos"][0] = np.asarray(
+        signal_data.get(
+            "policy_observation_hand_qpos", np.full(HAND_JOINT_SHAPE, np.nan)
+        ),
+        dtype=np.float64,
+    )
     frame["action_arm_joint_raw"][0] = np.asarray(
         signal_data.get("action_arm_joint_raw", action.arm_qpos_cmd), dtype=np.float64
     )

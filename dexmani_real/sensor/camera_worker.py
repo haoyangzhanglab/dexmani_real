@@ -24,13 +24,12 @@ class CameraHealth(IntEnum):
     OK = 0
     CLOCK_RESET = 1
     DUPLICATE = 2
-    # Retained to decode historical episodes. A recovered current frame is not
-    # invalid merely because device frame numbers skipped earlier frames.
+    # A recovered current frame is not invalid merely because device frame
+    # numbers skipped earlier frames.
     FRAME_GAP = 3
-    # Historical name retained for persisted values. It means the current
-    # device-to-host delay above the clock mapper's lower envelope exceeded
-    # the freshness budget; it is not an SDK queue depth.
-    BACKLOG = 4
+    # Current device-to-host delay above the clock mapper's lower envelope
+    # exceeded the freshness budget; this is not an SDK queue depth.
+    DELIVERY_DELAY = 4
 
 
 _READ_FAILURE_BACKOFF_S = 0.05
@@ -353,7 +352,7 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
                 elif frame.duplicate:
                     camera_health = CameraHealth.DUPLICATE
                 elif frame.backlog_s > cfg.max_frame_age_s:
-                    camera_health = CameraHealth.BACKLOG
+                    camera_health = CameraHealth.DELIVERY_DELAY
                 else:
                     camera_health = CameraHealth.OK
                 if frame.frame_gap > cfg.resolved_frame_gap_stall_threshold:

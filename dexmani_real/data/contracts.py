@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import arm, environment, hand
+from dexmani_real.config.defaults import arm, environment, hand, policy
 from dexmani_real.config.pointcloud import PointCloudConfig
 
 
@@ -150,6 +150,10 @@ class ProcessingConfig:
         environment.table.plane_abcd
     )
     max_camera_age_s: float = 0.25
+    # Must match the learned-policy deployment observation-pairing budget.
+    # It is persisted in each processed artifact so a checkpoint cannot silently
+    # mix a looser recording policy with a stricter deployment policy.
+    max_observation_skew_s: float = 0.10
     grid_dt_relative_tolerance: float = 0.05
     joint_limit_tolerance_rad: float = 1e-6
     hand_state_limit_tolerance_rad: float = float(np.deg2rad(3.0))
@@ -160,6 +164,11 @@ class ProcessingConfig:
     hand_state_limit_upper_rad: tuple[float, ...] = hand.mechanical_qpos_max_rad
     hand_action_limit_lower_rad: tuple[float, ...] = hand.qpos_min_rad
     hand_action_limit_upper_rad: tuple[float, ...] = hand.qpos_max_rad
+    # Learned-policy endpoints are rejected, never clipped, by the deployment
+    # coordinator.  Offline processing therefore applies the same per-grid
+    # contract before an episode can enter a deployment training set.
+    arm_max_delta_rad_per_tick: float | None = policy.arm_max_delta_rad_per_tick
+    hand_max_delta_rad_per_tick: float = hand.hand_max_delta_rad_per_tick
     tracking_error_warn_rad: float = arm.tracking_error_warn_rad
     temporal_quality: TemporalQualityConfig = field(
         default_factory=TemporalQualityConfig
@@ -188,6 +197,12 @@ class ProcessingConfig:
             "hand_state_limit_upper_rad": tuple(hand_config.mechanical_qpos_max_rad),
             "hand_action_limit_lower_rad": tuple(hand_config.qpos_min_rad),
             "hand_action_limit_upper_rad": tuple(hand_config.qpos_max_rad),
+            "arm_max_delta_rad_per_tick": getattr(
+                runtime, "policy"
+            ).arm_max_delta_rad_per_tick,
+            "hand_max_delta_rad_per_tick": float(
+                hand_config.hand_max_delta_rad_per_tick
+            ),
             "tracking_error_warn_rad": float(arm_config.tracking_error_warn_rad),
         }
         unknown = set(overrides) - {field.name for field in dataclasses.fields(cls)}
@@ -223,6 +238,7 @@ class ProcessingConfig:
             object.__setattr__(self, "table_plane_abcd", table_plane)
         finite_positive = (
             self.max_camera_age_s,
+            self.max_observation_skew_s,
             self.grid_dt_relative_tolerance,
             self.joint_limit_tolerance_rad,
             self.hand_state_limit_tolerance_rad,
@@ -231,6 +247,18 @@ class ProcessingConfig:
             raise ValueError(
                 "camera age, grid tolerance, and joint tolerance must be finite and positive"
             )
+        if self.arm_max_delta_rad_per_tick is not None and (
+            not np.isfinite(self.arm_max_delta_rad_per_tick)
+            or self.arm_max_delta_rad_per_tick <= 0.0
+        ):
+            raise ValueError(
+                "arm_max_delta_rad_per_tick must be finite and positive or None"
+            )
+        if (
+            not np.isfinite(self.hand_max_delta_rad_per_tick)
+            or self.hand_max_delta_rad_per_tick <= 0.0
+        ):
+            raise ValueError("hand_max_delta_rad_per_tick must be finite and positive")
         if not 0 <= self.gzip_level <= 9:
             raise ValueError("gzip_level must be in [0, 9]")
         limit_pairs = (
@@ -293,6 +321,7 @@ class ProcessingConfig:
                 None if self.table_plane_abcd is None else list(self.table_plane_abcd)
             ),
             "max_camera_age_s": self.max_camera_age_s,
+            "max_observation_skew_s": self.max_observation_skew_s,
             "grid_dt_relative_tolerance": self.grid_dt_relative_tolerance,
             "joint_limit_tolerance_rad": self.joint_limit_tolerance_rad,
             "hand_state_limit_tolerance_rad": self.hand_state_limit_tolerance_rad,
@@ -303,6 +332,8 @@ class ProcessingConfig:
             "hand_state_limit_upper_rad": list(self.hand_state_limit_upper_rad),
             "hand_action_limit_lower_rad": list(self.hand_action_limit_lower_rad),
             "hand_action_limit_upper_rad": list(self.hand_action_limit_upper_rad),
+            "arm_max_delta_rad_per_tick": self.arm_max_delta_rad_per_tick,
+            "hand_max_delta_rad_per_tick": self.hand_max_delta_rad_per_tick,
             "tracking_error_warn_rad": self.tracking_error_warn_rad,
             "temporal_quality": self.temporal_quality.to_dict(),
         }

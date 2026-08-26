@@ -13,7 +13,7 @@
 以下证据：
 
 - 构造 agent 所需的完整 resolved inference config；
-- 训练数据是否来自 Real Policy Zarr v4；
+- 训练数据是否来自 Real Policy Zarr v5；
 - `task_name`、控制周期和 observation/action 对齐语义；
 - 点云 shape、坐标系、颜色来源、处理算法、配置哈希和桌面平面身份；
 - episode 起点是否使用完整历史，以及训练窗口是否跨越 source 数据缺口。
@@ -21,7 +21,7 @@
 因此，当前 checkpoint 会被
 [`DexManiPolicyRuntime.load`](../dexmani_real/integrations/dexmani_policy.py)
 明确拒绝。拒绝发生在硬件进程启动前，这是预期的安全行为；不要通过默认值、外部模型 YAML
-或旧 schema 猜测来绕过。
+或不完整 schema 猜测来绕过。
 
 ## 2. 跨仓所有权
 
@@ -47,7 +47,7 @@ dexmani_real 只通过 checkpoint 恢复并校验 agent
 `dexmani_policy` 不应 import `dexmani_real`。跨仓常量需要按本文列出的精确值实现，并由两侧
 contract tests 锁定。
 
-## 3. 必须实现的 Policy Zarr v4 读取合同
+## 3. 必须实现的 Policy Zarr v5 读取合同
 
 ### 3.1 Real 数据识别
 
@@ -64,9 +64,16 @@ schema_name == "dexmani-real-policy-zarr"
 |---|---|
 | `domain` | `"real"` |
 | `schema_name` | `"dexmani-real-policy-zarr"` |
-| `schema_version` | integer `4`，bool 不合法 |
+| `schema_version` | integer `5`，bool 不合法 |
 | `episode_start_policy` | `"full_history"` |
 | `obs_alignment` | `"obs[t]_before_action[t]"` |
+| `observation_reference` | `"camera_source_monotonic_ns"` |
+| `state_alignment` | `"camera_source_aligned_state"` |
+| `max_observation_skew_s` | finite positive float，且须与 deployment runtime 一致 |
+| `action_semantics` | `"deployment_grid_rate_limited_target"` |
+| `arm_max_delta_rad_per_tick` | finite positive float 或 null，且须与 deployment runtime 一致 |
+| `hand_max_delta_rad_per_tick` | finite positive float，且须与 deployment runtime 一致 |
+| `deployment_equivalent` | boolean `true` |
 | `profile` | 当前 real adapter 只接受 `"pointcloud"` 或 `"rgb_pc"` |
 | `task_name` | 非空且不为 `"unknown"` |
 | `dt` | finite positive float，单位为秒 |
@@ -82,8 +89,8 @@ Sim 数据保持现有行为，不应因 Real 合同新增全局强制字段。
 3. 末值等于每个 `/data/<key>` 的第一维；
 4. 不把不同 `episode_ends` 段拼成一个 sequence。
 
-Real Zarr v4 的每个 `episode_ends` 段代表一个 source-contiguous 训练 episode。同一 raw episode
-删除中间行后可能产生多个段；这是正常输入，不是需要兼容性合并的异常。
+Real Zarr v5 的每个 `episode_ends` 段代表一个 source-contiguous 训练 episode。同一 raw episode
+删除中间行后可能产生多个段；这是正常输入，不应被合并。
 
 ### 3.3 attrs 与实际数组一起保留
 
@@ -101,7 +108,7 @@ point_cloud_feature_dim = replay_buffer["point_cloud"].shape[2]
 
 ### 4.1 禁止 Real episode 起点左侧 padding
 
-Real v4 的 `episode_start_policy=full_history` 表示训练样本必须已有完整 observation history：
+Real v5 的 `episode_start_policy=full_history` 表示训练样本必须已有完整 observation history：
 
 ```text
 pad_before == 0
@@ -275,7 +282,7 @@ control_action: inverse FAAS 后的 native 19D 或 EE 21D
 - `dexmani_policy/datasets/sampler.py`
 - 真实数据训练所用配置
 
-先完成 Zarr v4、episode ends、full-history 和 eligible split tests，再进入 checkpoint 工作。
+先完成 Zarr v5、episode ends、full-history 和 eligible split tests，再进入 checkpoint 工作。
 
 ### 阶段 C：checkpoint provenance
 
@@ -300,8 +307,8 @@ control_action: inverse FAAS 后的 native 19D 或 EE 21D
 
 ### 阶段 E：生成新数据与 checkpoint
 
-1. 使用 `dexmani_real` 重新生成 processed HDF5 v8；
-2. 导出全新的 Policy Zarr v4 目标，不覆盖旧 Zarr；
+1. 使用 `dexmani_real` 重新生成 deployment-equivalent processed HDF5 v10；
+2. 导出全新的 Policy Zarr v5 目标，不覆盖旧 Zarr；
 3. 用 `pad_before=0` 训练单任务 point-cloud policy；
 4. 生成包含 resolved config/data contract 的新 checkpoint；
 5. 只做离线 real adapter preflight，确认通过后再进入受控硬件准入流程。
@@ -314,8 +321,8 @@ control_action: inverse FAAS 后的 native 19D 或 EE 21D
 ### 数据合同
 
 - Sim Zarr 无 Real attrs 时保持现有读取行为；
-- Real v4 完整 attrs 可读取；
-- Real v3、缺字段、错误 `obs_alignment`、错误 `episode_start_policy` 全部拒绝；
+- Real v5 完整 attrs 可读取；
+- 任意非 v5、缺字段、错误 `obs_alignment`、错误 `state_alignment`、错误 `episode_start_policy` 全部拒绝；
 - 空、非整数、非递增、末值不匹配的 `episode_ends` 全部拒绝；
 - point cloud 声明与实际 `[T,N,C]` shape 不一致时拒绝。
 
@@ -369,11 +376,11 @@ python examples/run_policy.py \
 4. 验证 CUDA/device 选择，但不连接机器人；
 5. 把环境 smoke 纳入部署说明，不能依赖开发机偶然的 `PYTHONPATH`。
 
-## 11. 禁止的兼容捷径
+## 11. 禁止的捷径
 
 - 不接受部署侧第二份 model YAML；
 - 不为缺失 data contract 填默认 Real 值；
-- 不把 Policy Zarr v3 当作 v4；
+- 不接受非 v5 的 Policy Zarr；
 - 不把 source gap 两侧拼成连续训练窗口；
 - 不用左侧重复帧模拟真实 observation history；
 - 不在真实部署中把缺失 EMA 静默降级为 raw weights；
@@ -385,7 +392,7 @@ python examples/run_policy.py \
 只有同时满足以下条件，`dexmani_policy` 对接才算完成：
 
 - policy 仓库的 Sim 既有流程没有非预期语义变化；
-- Real Zarr v4 和 full-history/segment 边界有自动化测试；
+- Real Zarr v5 和 full-history/segment 边界有自动化测试；
 - 新单任务 checkpoint 自描述且无需外部模型 YAML；
 - real adapter 对正确 checkpoint 离线通过，对每类错误合同明确拒绝；
 - FAAS、joint action、EE action 的 normalizer/control shape 均有覆盖；

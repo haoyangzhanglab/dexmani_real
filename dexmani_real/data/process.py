@@ -1,4 +1,4 @@
-"""Transactional depth-to-color aligned raw-v22 to processed-v8 processing."""
+"""Transactional depth-to-color aligned raw-v23 to processed-v10 processing."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 8
+PROCESSED_SCHEMA_VERSION = 10
 _SOURCE_MEMBERS = ("data.h5", "depth.h5", "rgb.mp4")
 _VALIDATION_CHUNK_BYTES = 64 * 1024 * 1024
 
@@ -240,13 +240,12 @@ def _write_attrs(
     task_name = (
         annotation.task_name or str(meta.get("task_label", "")).strip() or "unknown"
     )
+    visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
     output.attrs.update(
         {
             "schema_name": PROCESSED_SCHEMA_NAME,
             "schema_version": PROCESSED_SCHEMA_VERSION,
             "domain": "real",
-            "source_format": f"dexmani_v{reader.schema_version}",
-            "source_schema_version": reader.schema_version,
             "source_episode": reader.h5_path.name,
             "source_frames": decision.source_frames,
             "profile": config.profile.value,
@@ -262,6 +261,25 @@ def _write_attrs(
             "action_ee_dim": 21,
             "action_space": "joint",
             "obs_alignment": "obs[t]_before_action[t]",
+            "observation_reference": (
+                "camera_source_monotonic_ns"
+                if visual_profile
+                else "grid_anchor_monotonic_ns"
+            ),
+            "state_alignment": (
+                "camera_source_aligned_state"
+                if visual_profile
+                else "control_grid_state"
+            ),
+            "max_observation_skew_s": config.max_observation_skew_s,
+            "action_semantics": "deployment_grid_rate_limited_target",
+            "arm_max_delta_rad_per_tick": (
+                np.nan
+                if config.arm_max_delta_rad_per_tick is None
+                else float(config.arm_max_delta_rad_per_tick)
+            ),
+            "hand_max_delta_rad_per_tick": config.hand_max_delta_rad_per_tick,
+            "deployment_equivalent": bool(config.profile.needs_pointcloud),
             "task_name": task_name,
             "point_cloud_frame": (
                 "xarm_base" if config.profile.needs_pointcloud else "omitted"
@@ -270,7 +288,7 @@ def _write_attrs(
             "fingertip_points_unit": "m",
             "action_ee_frame": "xarm_base",
             "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
-            "contact_force_source": "raw_v22.hand_contact",
+            "contact_force_source": "raw.hand_contact",
             "contact_force_unit": str(
                 meta.get("tactile_unit", "sdk_scaled_unknown_si")
             ),
@@ -278,7 +296,6 @@ def _write_attrs(
                 meta.get("tactile_si_unit_verified", False)
             ),
             "contact_force_frame": "xhand_sensor_native_axes_per_finger",
-            "frame_compatibility_with_sim_world": False,
             "processing_config_json": _json(config.to_dict()),
             "quality_summary_json": _json(decision.quality),
             "source_decision_json": _json(decision.to_dict()),
@@ -347,6 +364,24 @@ def _write_attrs(
         )
 
 
+def _processed_joint_state(
+    reader: EpisodeReader,
+    selected: np.ndarray,
+    config: ProcessingConfig,
+) -> np.ndarray:
+    """Read the state representation selected by the processed profile."""
+    visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
+    if visual_profile:
+        arm_key = "policy_observation_arm_qpos"
+        hand_key = "policy_observation_hand_qpos"
+    else:
+        arm_key = "arm_qpos"
+        hand_key = "hand_qpos"
+    arm_state = np.asarray(reader.h5f[arm_key][selected], dtype=np.float32)
+    hand_state = np.asarray(reader.h5f[hand_key][selected], dtype=np.float32)
+    return np.concatenate((arm_state, hand_state), axis=1)
+
+
 def _write_processed_episode(
     reader: EpisodeReader,
     decision: EpisodeDecision,
@@ -359,14 +394,12 @@ def _write_processed_episode(
     camera_model = None
     T_xarm_base_from_color = None
     if config.profile.needs_rgb or config.profile.needs_pointcloud:
-        # Resolve the raw-v22 geometry boundary before creating output.
+        # Resolve the raw-v23 geometry boundary before creating output.
         camera_model = load_raw_episode_camera_model(reader)
         T_xarm_base_from_color = load_raw_episode_base_from_color(reader)
     with h5py.File(path, "w") as output:
         _write_attrs(output, reader, decision, config, annotation)
         _create_data_datasets(output, decision.selected_frames, config)
-        arm_state = np.asarray(reader.h5f["arm_qpos"][selected], dtype=np.float32)
-        hand_state = np.asarray(reader.h5f["hand_qpos"][selected], dtype=np.float32)
         arm_action = np.asarray(
             reader.h5f["action_arm_joint_sent"][selected], dtype=np.float32
         )
@@ -376,7 +409,7 @@ def _write_processed_episode(
         arm_action_ee = np.asarray(
             reader.h5f["action_arm_ee"][selected], dtype=np.float32
         )
-        output["joint_state"][:] = np.concatenate((arm_state, hand_state), axis=1)
+        output["joint_state"][:] = _processed_joint_state(reader, selected, config)
         output["action"][:] = np.concatenate((arm_action, hand_action), axis=1)
         output["action_ee"][:] = np.concatenate((arm_action_ee, hand_action), axis=1)
         output["contact_force"][:] = np.asarray(
@@ -546,13 +579,15 @@ def _expected_specs(
 def validate_processed_hdf5(
     path: str | Path, config: ProcessingConfig
 ) -> dict[str, Any]:
-    """Fail closed on a processed Real HDF5 v8 artifact."""
+    """Fail closed on a processed Real HDF5 v10 artifact."""
 
     artifact = Path(path)
     with h5py.File(artifact, "r") as source:
         expected_top = set(config.profile.dataset_keys) | {"provenance"}
         if set(source.keys()) != expected_top:
-            raise ValueError(f"{artifact.name}: top-level keys do not match v8 profile")
+            raise ValueError(
+                f"{artifact.name}: top-level keys do not match v10 profile"
+            )
         length = int(source.attrs.get("episode_steps", -1))
         if length < config.min_episode_frames:
             raise ValueError(f"{artifact.name}: episode_steps={length} is too short")
@@ -644,7 +679,7 @@ def validate_processed_hdf5(
                 or str(source.attrs.get("point_cloud_transform", ""))
                 != POINT_CLOUD_TRANSFORM
             ):
-                raise ValueError(f"{artifact.name}: invalid v8 point-cloud semantics")
+                raise ValueError(f"{artifact.name}: invalid v10 point-cloud semantics")
         if str(source.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
             raise ValueError(f"{artifact.name}: invalid schema_name")
         if int(source.attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
@@ -657,6 +692,52 @@ def validate_processed_hdf5(
             raise ValueError(f"{artifact.name}: explicit task_name required")
         if str(source.attrs.get("obs_alignment", "")) != "obs[t]_before_action[t]":
             raise ValueError(f"{artifact.name}: invalid observation/action alignment")
+        visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
+        expected_state_alignment = (
+            "camera_source_aligned_state" if visual_profile else "control_grid_state"
+        )
+        expected_reference = (
+            "camera_source_monotonic_ns"
+            if visual_profile
+            else "grid_anchor_monotonic_ns"
+        )
+        expected_deployment_equivalent = bool(config.profile.needs_pointcloud)
+        if (
+            str(source.attrs.get("state_alignment", "")) != expected_state_alignment
+            or str(source.attrs.get("observation_reference", "")) != expected_reference
+            or not np.isclose(
+                float(source.attrs.get("max_observation_skew_s", np.nan)),
+                config.max_observation_skew_s,
+                rtol=0.0,
+                atol=1e-15,
+            )
+            or (
+                config.arm_max_delta_rad_per_tick is None
+                and not np.isnan(
+                    float(source.attrs.get("arm_max_delta_rad_per_tick", np.nan))
+                )
+            )
+            or (
+                config.arm_max_delta_rad_per_tick is not None
+                and not np.isclose(
+                    float(source.attrs.get("arm_max_delta_rad_per_tick", np.nan)),
+                    config.arm_max_delta_rad_per_tick,
+                    rtol=0.0,
+                    atol=1e-15,
+                )
+            )
+            or not np.isclose(
+                float(source.attrs.get("hand_max_delta_rad_per_tick", np.nan)),
+                config.hand_max_delta_rad_per_tick,
+                rtol=0.0,
+                atol=1e-15,
+            )
+            or str(source.attrs.get("action_semantics", ""))
+            != "deployment_grid_rate_limited_target"
+            or bool(source.attrs.get("deployment_equivalent", False))
+            != expected_deployment_equivalent
+        ):
+            raise ValueError(f"{artifact.name}: invalid deployment data contract")
         if str(source.attrs.get("source_contiguity", "")) != (
             "segment_ends_in_provenance"
         ):
@@ -813,11 +894,6 @@ def process_episode_root(
         try:
             with _open_episode(episode) as reader:
                 reader.require_valid(purpose="offline processing")
-                if reader.schema_version != 22:
-                    raise ValueError(
-                        "processed v8 accepts depth_to_color raw schema v22 only; "
-                        f"got v{reader.schema_version}"
-                    )
                 decisions.append(
                     analyze_episode(
                         reader,

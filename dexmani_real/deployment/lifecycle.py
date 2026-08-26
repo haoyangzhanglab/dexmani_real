@@ -165,6 +165,8 @@ def build_policy_worker_specs(
         point_cloud_transform=(
             POINT_CLOUD_TRANSFORM if pointcloud_config is not None else ""
         ),
+        arm_max_delta_rad_per_tick=runtime.policy.arm_max_delta_rad_per_tick,
+        hand_max_delta_rad_per_tick=float(runtime.hand.hand_max_delta_rad_per_tick),
     )
     specs: list[WorkerSpec] = [
         WorkerSpec(

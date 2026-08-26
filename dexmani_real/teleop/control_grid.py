@@ -15,9 +15,11 @@ from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
     read_causal_structured_frame,
     read_hand_tactile_causal,
+    read_structured_frame_aligned_to_source,
     read_vr_frame_causal,
 )
 from dexmani_real.ipc.channels import RuntimeChannels
+from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.arm_fk import make_arm_fk
 from dexmani_real.planning.hand_fk import HandKinematics
@@ -100,6 +102,7 @@ class TeleopGridObservation:
     hand_ring_sequence: int
     hand_tactile: np.ndarray | None
     anchor_monotonic_ns: int
+    policy_observation_signals: dict[str, object] | None
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,101 @@ class TeleopActionComputation:
     ik_solve_time_ms: float
     policy_map_time_ms: float
     policy_compute_started_s: float
+
+
+def _empty_policy_observation_signals() -> dict[str, object]:
+    """Return an explicit invalid policy-observation record."""
+    return {
+        "policy_observation_arm_qpos": np.full(ARM_JOINT_SHAPE, np.nan),
+        "policy_observation_hand_qpos": np.full(HAND_JOINT_SHAPE, np.nan),
+        "policy_observation_reference_monotonic_ns": 0,
+        "policy_observation_arm_source_sequence": 0,
+        "policy_observation_hand_source_sequence": 0,
+        "policy_observation_arm_source_monotonic_ns": 0,
+        "policy_observation_hand_source_monotonic_ns": 0,
+        "policy_observation_arm_publish_monotonic_ns": 0,
+        "policy_observation_hand_publish_monotonic_ns": 0,
+        "policy_observation_valid": False,
+        "policy_observation_skew_s": np.nan,
+    }
+
+
+def _recording_policy_observation_signals(
+    shared: RuntimeChannels,
+    camera_frame: dict[str, Any] | None,
+    *,
+    anchor_monotonic_ns: int,
+) -> dict[str, object]:
+    """Pair causal arm/hand feedback with the recorded camera source time.
+
+    Teleoperation itself continues to use the latest feedback at the grid cut.
+    This separate record is the observation a point-cloud policy will receive
+    at deployment, so recording it prevents an offline train/deploy time shift.
+    """
+    signals = _empty_policy_observation_signals()
+    if camera_frame is None:
+        return signals
+    reference_ns = int(camera_frame.get("source_monotonic_ns", 0))
+    anchor_ns = int(anchor_monotonic_ns)
+    arm_result = read_structured_frame_aligned_to_source(
+        shared.arm_state_ring,
+        source_field="source_monotonic_ns",
+        reference_source_monotonic_ns=reference_ns,
+        anchor_monotonic_ns=anchor_ns,
+    )
+    hand_result = read_structured_frame_aligned_to_source(
+        shared.hand_state_ring,
+        source_field="source_monotonic_ns",
+        reference_source_monotonic_ns=reference_ns,
+        anchor_monotonic_ns=anchor_ns,
+    )
+    if arm_result is None or hand_result is None:
+        return signals
+    arm_state, arm_publish_ns, arm_sequence = arm_result
+    hand_state, hand_publish_ns, hand_sequence = hand_result
+    arm_names = arm_state.dtype.names or ()
+    hand_names = hand_state.dtype.names or ()
+    if (
+        "state_valid" not in arm_names
+        or "state_valid" not in hand_names
+        or "qpos" not in arm_names
+        or "qpos" not in hand_names
+        or not bool(arm_state["state_valid"][0])
+        or not bool(hand_state["state_valid"][0])
+        or ("qpos_stale" in hand_names and bool(hand_state["qpos_stale"][0]))
+    ):
+        return signals
+    arm_qpos = np.asarray(arm_state["qpos"][0], dtype=np.float64)
+    hand_qpos = np.asarray(hand_state["qpos"][0], dtype=np.float64)
+    arm_source_ns = int(arm_state["source_monotonic_ns"][0])
+    hand_source_ns = int(hand_state["source_monotonic_ns"][0])
+    if (
+        arm_qpos.shape != ARM_JOINT_SHAPE
+        or hand_qpos.shape != HAND_JOINT_SHAPE
+        or not np.all(np.isfinite(arm_qpos))
+        or not np.all(np.isfinite(hand_qpos))
+        or min(reference_ns, arm_source_ns, hand_source_ns) <= 0
+    ):
+        return signals
+    signals.update(
+        {
+            "policy_observation_arm_qpos": arm_qpos.copy(),
+            "policy_observation_hand_qpos": hand_qpos.copy(),
+            "policy_observation_reference_monotonic_ns": reference_ns,
+            "policy_observation_arm_source_sequence": int(arm_sequence),
+            "policy_observation_hand_source_sequence": int(hand_sequence),
+            "policy_observation_arm_source_monotonic_ns": arm_source_ns,
+            "policy_observation_hand_source_monotonic_ns": hand_source_ns,
+            "policy_observation_arm_publish_monotonic_ns": int(arm_publish_ns),
+            "policy_observation_hand_publish_monotonic_ns": int(hand_publish_ns),
+            "policy_observation_valid": True,
+            "policy_observation_skew_s": (
+                reference_ns - min(arm_source_ns, hand_source_ns)
+            )
+            / 1e9,
+        }
+    )
+    return signals
 
 
 def _record_grid_hold(
@@ -164,6 +262,7 @@ def _record_grid_hold(
         hand_ring_sequence=observation.hand_ring_sequence,
         shared=shared,
         action_candidate=action_candidate,
+        policy_observation=observation.policy_observation_signals,
         **kwargs,
     )
 
@@ -229,12 +328,10 @@ def _read_control_grid_observation(
         now_monotonic_ns=time.monotonic_ns(),
         max_age_s=cfg.runtime.policy.arm_state_stale_threshold_s,
     )
-    ctx.arm_feedback_error_count, arm_feedback_fault = (
-        advance_arm_feedback_error_count(
-            ctx.arm_feedback_error_count,
-            arm_issue,
-            max_consecutive_errors=cfg.runtime.policy.max_consecutive_errors,
-        )
+    ctx.arm_feedback_error_count, arm_feedback_fault = advance_arm_feedback_error_count(
+        ctx.arm_feedback_error_count,
+        arm_issue,
+        max_consecutive_errors=cfg.runtime.policy.max_consecutive_errors,
     )
     if arm_issue is not None:
         _arm_feedback_warn(
@@ -388,6 +485,15 @@ def _read_control_grid_observation(
         return CoordinatorDirective.CONTINUE, None
 
     assert vr_frame is not None
+    policy_observation_signals = (
+        _recording_policy_observation_signals(
+            shared,
+            cam,
+            anchor_monotonic_ns=observation_anchor_monotonic_ns,
+        )
+        if ctx.recording_active
+        else None
+    )
     return (
         CoordinatorDirective.NORMAL,
         TeleopGridObservation(
@@ -400,6 +506,7 @@ def _read_control_grid_observation(
             hand_ring_sequence=hand_ring_sequence,
             hand_tactile=hand_tactile,
             anchor_monotonic_ns=observation_anchor_monotonic_ns,
+            policy_observation_signals=policy_observation_signals,
         ),
     )
 
@@ -448,6 +555,7 @@ def _compute_action_computation(
         ramp_total_frames=resources.hand_ramp_total_frames,
         command_lower_rad=command_limits.hand_command_lower_rad,
         command_upper_rad=command_limits.hand_command_upper_rad,
+        max_delta_rad_per_tick=command_limits.hand_max_delta_rad_per_tick,
         mechanical_lower_rad=command_limits.hand_mechanical_lower_rad,
         mechanical_upper_rad=command_limits.hand_mechanical_upper_rad,
     )
@@ -816,6 +924,7 @@ def _publish_solved_action(
             hand_ring_sequence=observation.hand_ring_sequence,
             shared=shared,
             action_candidate=published_candidate,
+            policy_observation=observation.policy_observation_signals,
         )
     stage_timer.mark("rec")
 
@@ -855,9 +964,7 @@ def run_control_grid_tick(
             observation_id=int(vr_frame["ring_sequence"]),
             observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
             safety_gate=gate,
-            arm_feedback_max_age_s=float(
-                cfg.runtime.safety.heartbeat_timeouts["arm"]
-            ),
+            arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
             hand_feedback_max_age_s=float(
                 cfg.runtime.safety.heartbeat_timeouts["hand"]
             ),

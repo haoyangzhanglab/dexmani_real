@@ -1,4 +1,4 @@
-"""Raw-v22 camera metadata to canonical xArm-base point-cloud inputs.
+"""Raw-v23 camera metadata to canonical xArm-base point-cloud inputs.
 
 This module owns the persisted-data boundary shared by offline processing and
 raw episode visualization. It performs no hardware IO and does not own or
@@ -59,15 +59,10 @@ def _intrinsics_from_meta(meta: Any, *, stream: str) -> CameraIntrinsics:
 
 
 def load_raw_episode_camera_model(reader: EpisodeReader) -> RawEpisodeCameraModel:
-    """Load the depth-to-color aligned camera model persisted by raw v22."""
-    if reader.schema_version != 22:
-        raise ValueError(
-            "aligned RGB-D point-cloud inputs require raw schema v22, "
-            f"got v{reader.schema_version}"
-        )
+    """Load the depth-to-color aligned camera model persisted by raw v23."""
     meta = reader.h5f["meta"].attrs
     if str(meta.get("camera_payload_mode", "")) != "depth_to_color_aligned_rgbd":
-        raise ValueError("raw v22 camera payload is not depth-to-color aligned RGB-D")
+        raise ValueError("raw v23 camera payload is not depth-to-color aligned RGB-D")
     native_geometry = RGBDGeometry(
         depth=_intrinsics_from_meta(meta, stream="depth"),
         color=_intrinsics_from_meta(meta, stream="color"),
@@ -90,7 +85,7 @@ def load_raw_episode_base_from_color(reader: EpisodeReader) -> np.ndarray:
     camera_type = str(meta.get("camera_type", ""))
     if camera_type == "eye_in_hand":
         raise ValueError(
-            "raw-v22 xArm-base camera geometry for eye_in_hand requires arm pose "
+            "raw-v23 xArm-base camera geometry for eye_in_hand requires arm pose "
             "evaluated at color/depth exposure times, which is not persisted"
         )
     if camera_type != "eye_to_hand":

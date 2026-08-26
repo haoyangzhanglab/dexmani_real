@@ -92,6 +92,89 @@ def _inside(
     return np.all((values >= lower - tolerance) & (values <= upper + tolerance), axis=1)
 
 
+def _rows_are_source_contiguous(
+    arrays: Mapping[str, np.ndarray],
+    previous_index: int,
+    index: int,
+    *,
+    grid_dt_s: float,
+    grid_dt_relative_tolerance: float,
+) -> bool:
+    """Return whether two retained rows can share one policy action stream."""
+    if index != previous_index + 1:
+        return False
+    if (
+        int(arrays["source_index"][index])
+        != int(arrays["source_index"][previous_index]) + 1
+    ):
+        return False
+    tolerance_s = max(1e-7, grid_dt_s * grid_dt_relative_tolerance)
+    return bool(
+        abs(
+            float(arrays["timestamp"][index])
+            - float(arrays["timestamp"][previous_index])
+            - grid_dt_s
+        )
+        <= tolerance_s
+    )
+
+
+def _deployment_action_limit_masks(
+    arrays: Mapping[str, np.ndarray],
+    candidate_mask: np.ndarray,
+    config: ProcessingConfig,
+    *,
+    grid_dt_s: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Check the exact endpoint-delta contract enforced by deployment.
+
+    At the start of every retained source-contiguous segment the coordinator
+    compares a model endpoint against measured feedback.  Later endpoints are
+    compared against the previously published endpoint.  This mirrors that
+    distinction so old teleop targets are never silently relabelled as
+    deployment-safe data.
+    """
+    candidate = np.asarray(candidate_mask, dtype=bool)
+    action_invalid = np.zeros(candidate.shape, dtype=bool)
+    arm_invalid = np.zeros(candidate.shape, dtype=bool)
+    hand_invalid = np.zeros(candidate.shape, dtype=bool)
+    previous_index: int | None = None
+    arm_limit = config.arm_max_delta_rad_per_tick
+    hand_limit = float(config.hand_max_delta_rad_per_tick)
+
+    for index, candidate_row in enumerate(candidate):
+        if not candidate_row:
+            previous_index = None
+            continue
+        starts_segment = previous_index is None or not _rows_are_source_contiguous(
+            arrays,
+            previous_index,
+            index,
+            grid_dt_s=grid_dt_s,
+            grid_dt_relative_tolerance=config.grid_dt_relative_tolerance,
+        )
+        if starts_segment:
+            arm_reference = arrays["control_arm_qpos"][index]
+            hand_reference = arrays["control_hand_qpos"][index]
+        else:
+            assert previous_index is not None
+            arm_reference = arrays["action_arm"][previous_index]
+            hand_reference = arrays["action_hand"][previous_index]
+
+        if arm_limit is not None and np.any(
+            np.abs(arrays["action_arm"][index] - arm_reference) > arm_limit
+        ):
+            arm_invalid[index] = True
+        if np.any(np.abs(arrays["action_hand"][index] - hand_reference) > hand_limit):
+            hand_invalid[index] = True
+        action_invalid[index] = arm_invalid[index] or hand_invalid[index]
+        # An excluded endpoint starts a new candidate segment.  Its successor
+        # must be safe from contemporaneous feedback, not from an action that
+        # will not exist in the exported stream.
+        previous_index = None if action_invalid[index] else index
+    return action_invalid, arm_invalid, hand_invalid
+
+
 def _quality_summary(
     arrays: Mapping[str, np.ndarray],
     selected: np.ndarray,
@@ -104,7 +187,11 @@ def _quality_summary(
     action = np.concatenate((arrays["action_arm"], arrays["action_hand"]), axis=1)[
         selected
     ]
-    segment_starts = np.concatenate((np.asarray([0]), segment_ends[:-1]))
+    segment_starts = (
+        np.concatenate((np.asarray([0]), segment_ends[:-1]))
+        if len(segment_ends)
+        else np.empty(0, dtype=np.int64)
+    )
     step_blocks = [
         np.diff(action[start:end], axis=0)
         for start, end in zip(segment_starts, segment_ends, strict=True)
@@ -300,8 +387,10 @@ def analyze_episode(
         "action_created": _as_i64(reader, "action_created_monotonic_ns"),
         "action_target": _as_i64(reader, "action_target_monotonic_ns"),
         "action_valid_until": _as_i64(reader, "action_valid_until_monotonic_ns"),
-        "arm_qpos": _as_f64(reader, "arm_qpos"),
-        "hand_qpos": _as_f64(reader, "hand_qpos"),
+        # The first action in a retained segment is safety-gated against this
+        # control-grid feedback, while visual policy state is camera-aligned.
+        "control_arm_qpos": _as_f64(reader, "arm_qpos"),
+        "control_hand_qpos": _as_f64(reader, "hand_qpos"),
         "action_arm": _as_f64(reader, "action_arm_joint_sent"),
         "action_hand": _as_f64(reader, "action_hand_joint"),
         "action_arm_ee": _as_f64(reader, "action_arm_ee"),
@@ -310,6 +399,16 @@ def analyze_episode(
         "tracking_error": _as_f64(reader, "tracking_error"),
         "arm_last_cmd_seq": _as_i64(reader, "arm_last_cmd_seq"),
     }
+    visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
+    if visual_profile:
+        # Raw v23 stores the state that a visual policy actually observes:
+        # newest arm/hand feedback whose source time does not exceed the camera
+        # source time.
+        arrays["arm_qpos"] = _as_f64(reader, "policy_observation_arm_qpos")
+        arrays["hand_qpos"] = _as_f64(reader, "policy_observation_hand_qpos")
+    else:
+        arrays["arm_qpos"] = arrays["control_arm_qpos"]
+        arrays["hand_qpos"] = arrays["control_hand_qpos"]
     is_source = arrays["fill_reason"] == int(FillReason.SOURCE)
     timing_valid = (
         (arrays["action_created"] > 0)
@@ -318,6 +417,8 @@ def analyze_episode(
     )
     joint_numeric = np.concatenate(
         (
+            arrays["control_arm_qpos"],
+            arrays["control_hand_qpos"],
             arrays["arm_qpos"],
             arrays["hand_qpos"],
             arrays["action_arm"],
@@ -336,7 +437,18 @@ def analyze_episode(
     hand_state_upper = np.asarray(config.hand_state_limit_upper_rad, dtype=np.float64)
     hand_action_lower = np.asarray(config.hand_action_limit_lower_rad, dtype=np.float64)
     hand_action_upper = np.asarray(config.hand_action_limit_upper_rad, dtype=np.float64)
-    limits_valid = (
+    control_limits_valid = _inside(
+        arrays["control_arm_qpos"],
+        arm_lower,
+        arm_upper,
+        config.joint_limit_tolerance_rad,
+    ) & _inside(
+        arrays["control_hand_qpos"],
+        hand_state_lower,
+        hand_state_upper,
+        config.hand_state_limit_tolerance_rad,
+    )
+    limits_valid = control_limits_valid & (
         _inside(
             arrays["arm_qpos"], arm_lower, arm_upper, config.joint_limit_tolerance_rad
         )
@@ -382,13 +494,15 @@ def analyze_episode(
         "joint_limit_violation": ~limits_valid,
     }
 
-    if config.profile.needs_rgb or config.profile.needs_pointcloud:
+    if visual_profile:
         arrays.update(
             {
                 "camera_age_s": _as_f64(reader, "camera_age_s"),
                 "camera_frame_gap": _as_i64(reader, "camera_frame_gap"),
                 "camera_duplicate": _as_bool(reader, "camera_duplicate"),
                 "camera_health": _as_i64(reader, "camera_health"),
+                "observation_valid": _as_bool(reader, "observation_valid"),
+                "observation_skew_s": _as_f64(reader, "observation_skew_s"),
             }
         )
         camera_age_valid = (
@@ -403,7 +517,58 @@ def analyze_episode(
             & (arrays["camera_health"] == int(CameraHealth.OK))
             & camera_age_valid
         )
-    if config.profile.needs_rgb or config.profile.needs_pointcloud:
+        reason_masks["observation_invalid"] = ~(
+            arrays["observation_valid"]
+            & np.isfinite(arrays["observation_skew_s"])
+            & (arrays["observation_skew_s"] <= config.max_observation_skew_s)
+        )
+        policy_reference_ns = _as_i64(
+            reader, "policy_observation_reference_monotonic_ns"
+        )
+        policy_arm_sequence = _as_i64(reader, "policy_observation_arm_source_sequence")
+        policy_hand_sequence = _as_i64(
+            reader, "policy_observation_hand_source_sequence"
+        )
+        policy_arm_source_ns = _as_i64(
+            reader, "policy_observation_arm_source_monotonic_ns"
+        )
+        policy_hand_source_ns = _as_i64(
+            reader, "policy_observation_hand_source_monotonic_ns"
+        )
+        policy_arm_publish_ns = _as_i64(
+            reader, "policy_observation_arm_publish_monotonic_ns"
+        )
+        policy_hand_publish_ns = _as_i64(
+            reader, "policy_observation_hand_publish_monotonic_ns"
+        )
+        policy_anchor_ns = _as_i64(reader, "observation_anchor_monotonic_ns")
+        policy_skew_s = _as_f64(reader, "policy_observation_skew_s")
+        expected_policy_skew_s = (
+            policy_reference_ns
+            - np.minimum(policy_arm_source_ns, policy_hand_source_ns)
+        ) / 1e9
+        policy_observation_valid = (
+            _as_bool(reader, "policy_observation_valid")
+            & (policy_reference_ns > 0)
+            & (policy_reference_ns <= policy_anchor_ns)
+            & (policy_reference_ns == _as_i64(reader, "camera_source_monotonic_ns"))
+            & (policy_arm_sequence > 0)
+            & (policy_hand_sequence > 0)
+            & (policy_arm_source_ns > 0)
+            & (policy_hand_source_ns > 0)
+            & (policy_arm_source_ns <= policy_reference_ns)
+            & (policy_hand_source_ns <= policy_reference_ns)
+            & (policy_arm_source_ns <= policy_arm_publish_ns)
+            & (policy_hand_source_ns <= policy_hand_publish_ns)
+            & (policy_arm_publish_ns <= policy_anchor_ns)
+            & (policy_hand_publish_ns <= policy_anchor_ns)
+            & np.isfinite(policy_skew_s)
+            & (policy_skew_s >= 0.0)
+            & np.isclose(policy_skew_s, expected_policy_skew_s, rtol=0.0, atol=1e-9)
+            & (policy_skew_s <= config.max_observation_skew_s)
+        )
+        reason_masks["policy_observation_invalid"] = ~policy_observation_valid
+    if visual_profile:
         if depth_valid_mask is None:
             raise ValueError("RGB/pointcloud profile requires a depth_valid_mask")
         depth_valid = np.asarray(depth_valid_mask, dtype=bool)
@@ -420,12 +585,12 @@ def analyze_episode(
     )
     exclude_mask = _range_mask(frame_count, annotation.exclude_ranges, default=True)
     reason_masks["annotation_excluded_row"] = ~(include_mask & exclude_mask)
-    hard_invalid = np.zeros(frame_count, dtype=bool)
-    for mask in reason_masks.values():
-        hard_invalid |= mask
-    base_valid = ~hard_invalid
 
     timing = reader.timing
+    pre_action_base_valid = np.ones(frame_count, dtype=bool)
+    for mask in reason_masks.values():
+        pre_action_base_valid &= ~mask
+
     dt = np.diff(arrays["timestamp"])
     timestamp_gap = np.abs(dt - timing.grid_dt_s) > max(
         1e-7, timing.grid_dt_s * config.grid_dt_relative_tolerance
@@ -435,11 +600,33 @@ def analyze_episode(
     break_before[1:] = timestamp_gap | source_gap
     temporal_assessment = assess_temporal_quality(
         arrays,
-        base_valid,
+        pre_action_base_valid,
         break_before,
         config.temporal_quality,
         tracking_error_warn_rad=config.tracking_error_warn_rad,
     )
+
+    # Apply the endpoint contract to the stream that will actually be exported.
+    # A row removed for temporal quality cannot be used as the next action's
+    # delta reference, otherwise the retained labels could still exceed the
+    # deployment coordinator's reject-only limit.
+    candidate_mask = pre_action_base_valid & ~temporal_assessment.excluded_mask
+    (
+        deployment_action_invalid,
+        deployment_arm_action_invalid,
+        deployment_hand_action_invalid,
+    ) = _deployment_action_limit_masks(
+        arrays,
+        candidate_mask,
+        config,
+        grid_dt_s=timing.grid_dt_s,
+    )
+    reason_masks["deployment_action_limit"] = deployment_action_invalid
+
+    hard_invalid = np.zeros(frame_count, dtype=bool)
+    for mask in reason_masks.values():
+        hard_invalid |= mask
+    base_valid = ~hard_invalid
     keep_mask = base_valid & ~temporal_assessment.excluded_mask
     selected = np.flatnonzero(keep_mask).astype(np.int64)
     bits, reason_names = _reason_bits(reason_masks, temporal_assessment.excluded_mask)
@@ -476,6 +663,11 @@ def analyze_episode(
     )
     quality["source_gap_count"] = len(source_gaps)
     quality["segment_count"] = len(segment_ends)
+    quality["deployment_action_limits"] = {
+        "arm_invalid_row_count": int(np.count_nonzero(deployment_arm_action_invalid)),
+        "hand_invalid_row_count": int(np.count_nonzero(deployment_hand_action_invalid)),
+        "invalid_row_count": int(np.count_nonzero(deployment_action_invalid)),
+    }
     rejected_reason: str | None = None
     if quality["full_window_count"] < config.min_full_windows:
         rejected_reason = (

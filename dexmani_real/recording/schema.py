@@ -1,4 +1,4 @@
-"""Schema-v22 contracts shared by episode writers and readers."""
+"""Schema-v23 contracts shared by episode writers and readers."""
 
 from __future__ import annotations
 
@@ -16,13 +16,7 @@ from dexmani_real.ipc.schema import (
     HAND_TACTILE_SUM_SHAPE,
 )
 
-EPISODE_SCHEMA_VERSION = 22
-# v21 camera depth was native; v22 stores depth_to_color-aligned Z16 in the
-# same sidecar layout. Readers retain v21 support but consumers must branch on
-# the explicit schema/metadata semantics rather than silently reinterpret it.
-SUPPORTED_EPISODE_SCHEMA_VERSIONS: frozenset[int] = frozenset(
-    {21, EPISODE_SCHEMA_VERSION}
-)
+EPISODE_SCHEMA_VERSION = 23
 ARM_SENT_DATASET = "action_arm_joint_sent"
 ARM_SENT_MARKER = "arm_sent_stream"
 
@@ -135,6 +129,23 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
     "hand_retarget_time_ms": _spec(np.float64),
     "transition_check_time_ms": _spec(np.float64),
     "policy_compute_time_ms": _spec(np.float64),
+    # These fields are the policy observation, not the latest control
+    # feedback. They pair robot state with camera/point-cloud source time.
+    "policy_observation_arm_qpos": _spec(np.float64, ARM_JOINT_SHAPE),
+    "policy_observation_hand_qpos": _spec(np.float64, HAND_JOINT_SHAPE),
+    "policy_observation_reference_monotonic_ns": _spec(np.int64),
+    "policy_observation_arm_source_sequence": _spec(np.int64),
+    "policy_observation_hand_source_sequence": _spec(np.int64),
+    "policy_observation_arm_source_monotonic_ns": _spec(np.int64),
+    "policy_observation_hand_source_monotonic_ns": _spec(np.int64),
+    "policy_observation_arm_publish_monotonic_ns": _spec(np.int64),
+    "policy_observation_hand_publish_monotonic_ns": _spec(np.int64),
+    "policy_observation_valid": _spec(np.bool_),
+    "policy_observation_skew_s": _spec(np.float64),
+    # SDK acknowledgement of an exact hand endpoint, not physical
+    # convergence. It makes endpoint application auditable without
+    # relabelling action_hand_joint as a servo-tick command.
+    "hand_accepted_target_action_id": _spec(np.int64),
 }
 
 CONDITIONAL_DATASET_SPECS: dict[str, DatasetSpec] = {
@@ -195,7 +206,7 @@ SEMANTIC_META_ATTRS: dict[str, str | float | bool] = {
     "arm_tau_source": "xarm_get_joint_states_num_3_effort",
     "arm_tau_unit": "unknown",
     "arm_tau_si_unit_verified": False,
-    "camera_payload_mode": "native_rgbd",
+    "camera_payload_mode": "depth_to_color_aligned_rgbd",
     "camera_pair_source_monotonic_ns_semantics": "minimum_of_depth_and_color_mapped_source_times",
     "camera_wait_return_monotonic_ns_semantics": "host_monotonic_immediately_after_frame_queue_wait_for_frame_return",
     "camera_payload_ready_monotonic_ns_semantics": "host_monotonic_after_owned_native_rgb_depth_copies",
@@ -206,6 +217,11 @@ SEMANTIC_META_ATTRS: dict[str, str | float | bool] = {
     "camera_duplicate_semantics": "depth_stream_duplicate_detection",
     "camera_frame_gap_semantics": "depth_stream_frame_number_gap",
     "camera_backlog_s_semantics": "host_wait_return_minus_pair_oldest_mapped_source_time",
+    "policy_observation_reference_semantics": "camera_source_monotonic_ns",
+    "policy_observation_state_alignment": "newest_state_source_at_or_before_camera_source;state_publish_at_or_before_grid_anchor",
+    "policy_observation_skew_semantics": "camera_source_monotonic_ns_minus_oldest_selected_robot_state_source_monotonic_ns",
+    "action_hand_joint_semantics": "policy_grid_target_rate_limited_from_previous_published_endpoint_or_initial_feedback",
+    "hand_accepted_target_action_id_semantics": "xhand_sdk_accepted_exact_target_action_id_not_physical_convergence",
 }
 
 
@@ -317,7 +333,7 @@ def normalize_diagnostics(
 
 
 def required_dataset_names() -> frozenset[str]:
-    """Return the datasets required in every raw episode data.h5."""
+    """Return the datasets required in one raw episode data.h5."""
     return frozenset(DATASET_SPECS) | frozenset(CAMERA_TIMING_DATASET_SPECS)
 
 
@@ -408,7 +424,6 @@ __all__ = [
     "HAND_RAW_ACTION_VALIDITY_EXPRESSION",
     "SEMANTIC_META_ATTRS",
     "SOURCE_FRAME_DATASET_NAMES",
-    "SUPPORTED_EPISODE_SCHEMA_VERSIONS",
     "compute_episode_quality_metrics",
     "expected_source_frame_dataset_names",
     "normalize_diagnostics",

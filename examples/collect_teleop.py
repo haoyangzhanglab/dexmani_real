@@ -50,13 +50,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--task-name",
-        "--task",
-        dest="task_name",
         type=_task_name_arg,
         default=DEFAULT_TASK_NAME,
         help=(
             "Task name used for recording metadata and episodes/<task_name>/; "
-            f"default: {DEFAULT_TASK_NAME!r}. --task is a compatibility alias."
+            f"default: {DEFAULT_TASK_NAME!r}."
         ),
     )
     parser.add_argument(
