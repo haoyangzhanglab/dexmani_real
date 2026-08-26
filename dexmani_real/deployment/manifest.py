@@ -1,21 +1,22 @@
 """Real-side deployment manifest — the validated model <-> deployment contract.
 
 A :class:`DeploymentManifest` is the frozen summary of "what this checkpoint
-expects" that a new model must satisfy to run under the deployment runtime.  It
+expects" that a new model must satisfy to run under the deployment runtime. It
 is assembled by the real side (``DexManiPolicyRuntime.load``) from three
-sources, per the refactor plan §14.2 decision 2:
+sources:
 
 * the checkpoint's ``train_params`` (authoritative model hyper-parameters),
-* the model config ``sensor_modalities`` / ``num_points`` / ``pc_dim``,
+* the embedded model config ``sensor_modalities`` / ``num_points`` / ``pc_dim``,
 * the real control/deployment configuration (action-key expectation, hand
   presence, point-cloud count).
 
-``domain`` is a construct-time constant (``"real"``) — there is no sim assembly
-path, so a sim checkpoint can never enter a real deployment (plan §5).
+``domain`` is a construct-time constant (``"real"``). The adapter separately
+requires a Real Policy Zarr v4 training-data contract before constructing this
+manifest; the constant alone is not evidence of checkpoint provenance.
 
-``dt`` is deliberately *not* a manifest field: it is a control-grid concept
-(``1 / action_control_hz``) supplied per inference through
-``InferenceContext.step_dt_ns``, never read from the model config (plan §14.3.2).
+``dt`` remains outside the model-shape manifest, but the checkpoint training-data
+contract must match ``1 / action_control_hz`` before the agent is constructed.
+Per-inference action timestamps then use ``InferenceContext.step_dt_ns``.
 """
 
 from __future__ import annotations
@@ -211,12 +212,6 @@ def validate_manifest_against_deployment(
         raise ValueError(
             f"manifest n_obs_steps={manifest.n_obs_steps} does not match deployment "
             f"observation_horizon={deployment.observation_horizon}"
-        )
-    if deployment.replan_stride_steps > manifest.n_action_steps:
-        raise ValueError(
-            f"deployment replan_stride_steps={deployment.replan_stride_steps} exceeds "
-            f"manifest n_action_steps={manifest.n_action_steps} (the scheduler would "
-            "never reach the stride and stall)"
         )
     # Both action keys command hand12 (19-DoF joint or 21-DoF EE), so the hand
     # must be enabled and present in the observation contract.

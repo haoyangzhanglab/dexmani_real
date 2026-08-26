@@ -61,6 +61,16 @@ def freeze_array(
     raw = np.asarray(arr)
     if raw.dtype.kind in "fc" and not np.all(np.isfinite(raw)):
         raise ValueError(f"{name} contains NaN/Inf")
+    target_dtype = np.dtype(dtype) if dtype is not None else None
+    if target_dtype is not None and target_dtype.kind in "iu":
+        if raw.dtype.kind not in "iu":
+            raise TypeError(f"{name} must contain integers before {target_dtype} cast")
+        info = np.iinfo(target_dtype)
+        if raw.size and (np.any(raw < info.min) or np.any(raw > info.max)):
+            raise ValueError(f"{name} is out of range for {target_dtype}")
+    elif target_dtype is not None and target_dtype.kind == "b":
+        if raw.dtype.kind != "b":
+            raise TypeError(f"{name} must contain booleans before bool cast")
     out = np.array(raw, dtype=dtype, copy=True, order="C")
     out.flags.writeable = False
     return out
@@ -96,7 +106,9 @@ class FrameWindow:
             if arr is None or arr.shape != (t,):
                 raise ValueError(f"FrameWindow.{name} must be a ({t},) uint64 array")
             object.__setattr__(self, name, arr)
-        mask = freeze_array(self.valid_mask, name="FrameWindow.valid_mask", dtype=np.uint8)
+        mask = freeze_array(
+            self.valid_mask, name="FrameWindow.valid_mask", dtype=np.uint8
+        )
         if mask is None or mask.shape != (t,):
             raise ValueError(f"FrameWindow.valid_mask must be a ({t},) uint8 array")
         if not np.all((mask == 0) | (mask == 1)):
@@ -163,7 +175,10 @@ class ObservationBatch:
 
     observation_id: int
     run_generation: int
+    run_started_monotonic_ns: int
     anchor_monotonic_ns: int
+    latest_source_monotonic_ns: int
+    logical_step_monotonic_ns: int
 
     arm_history: FrameWindow | None = None
     hand_history: FrameWindow | None = None
@@ -173,22 +188,90 @@ class ObservationBatch:
     pointcloud: PointCloudFrame | None = None
     # Oldest-first causal window of recent point-cloud frames; ``pointcloud`` is
     # the latest (and last element) when non-empty.  ``point_cloud`` models use
-    # this window for their per-step point-cloud history (plan §6/§14.3.4).
+    # this window for their per-step point-cloud history.
     pointcloud_history: tuple[PointCloudFrame, ...] = ()
 
     def __post_init__(self) -> None:
         if self.observation_id < 0 or self.run_generation < 0:
             raise ValueError("observation_id and run_generation must be non-negative")
-        if self.anchor_monotonic_ns <= 0:
-            raise ValueError("anchor_monotonic_ns must be positive")
+        if (
+            min(
+                self.run_started_monotonic_ns,
+                self.anchor_monotonic_ns,
+                self.latest_source_monotonic_ns,
+                self.logical_step_monotonic_ns,
+            )
+            <= 0
+        ):
+            raise ValueError("observation timestamps must be positive")
+        if not (
+            self.run_started_monotonic_ns
+            <= self.latest_source_monotonic_ns
+            <= self.logical_step_monotonic_ns
+            <= self.anchor_monotonic_ns
+        ):
+            raise ValueError(
+                "observation time order must be epoch <= source <= logical step <= cut"
+            )
+        windows = {
+            "arm_history": self.arm_history,
+            "hand_history": self.hand_history,
+            "hand_current_history": self.hand_current_history,
+            "hand_tactile_sum_history": self.hand_tactile_sum_history,
+            "tactile_history": self.tactile_history,
+        }
+        for name, window in windows.items():
+            if window is None:
+                continue
+            valid = window.valid_mask == 1
+            sources = window.source_monotonic_ns[valid]
+            publishes = window.publish_monotonic_ns[valid]
+            if np.any(sources < self.run_started_monotonic_ns) or np.any(
+                (sources > publishes) | (publishes > self.anchor_monotonic_ns)
+            ):
+                raise ValueError(f"{name} crosses the observation causal cut")
         history = self.pointcloud_history
         if history:
-            object.__setattr__(
-                self,
-                "pointcloud_history",
-                tuple(
-                    frame
-                    for frame in history
-                    if isinstance(frame, PointCloudFrame)
-                ),
-            )
+            if not all(isinstance(frame, PointCloudFrame) for frame in history):
+                raise TypeError(
+                    "pointcloud_history must contain PointCloudFrame values"
+                )
+            sources = [frame.source_monotonic_ns for frame in history]
+            sequences = [frame.source_camera_sequence for frame in history]
+            generations = {frame.camera_generation for frame in history}
+            if any(
+                frame.source_monotonic_ns < self.run_started_monotonic_ns
+                or frame.publish_monotonic_ns > self.anchor_monotonic_ns
+                for frame in history
+            ):
+                raise ValueError(
+                    "pointcloud history crosses the observation causal cut"
+                )
+            if any(right <= left for left, right in zip(sources, sources[1:])):
+                raise ValueError("pointcloud source times must be strictly increasing")
+            if any(right <= left for left, right in zip(sequences, sequences[1:])):
+                raise ValueError(
+                    "pointcloud camera sequences must be strictly increasing"
+                )
+            if len(generations) != 1:
+                raise ValueError("pointcloud history crosses a camera generation")
+            latest = history[-1]
+            if self.pointcloud is None or (
+                self.pointcloud.source_camera_sequence,
+                self.pointcloud.source_monotonic_ns,
+                self.pointcloud.publish_monotonic_ns,
+                self.pointcloud.camera_generation,
+            ) != (
+                latest.source_camera_sequence,
+                latest.source_monotonic_ns,
+                latest.publish_monotonic_ns,
+                latest.camera_generation,
+            ):
+                raise ValueError("pointcloud must match the last history frame")
+            if sources[-1] != self.latest_source_monotonic_ns:
+                raise ValueError("latest_source_monotonic_ns must match pointcloud")
+            for name, window in windows.items():
+                if window is not None and window.values.shape[0] != len(history):
+                    raise ValueError(
+                        f"{name} must align one-to-one with pointcloud_history"
+                    )

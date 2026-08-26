@@ -35,15 +35,16 @@ class ActionCandidate:
 
     The controller assigns a globally monotonic action ID while building the
     candidate; publication confirms it still belongs to the active
-    ``run_generation``. ``target_monotonic_ns`` and
-    ``valid_until_monotonic_ns`` describe the proposal's intended timing for
-    freshness and recording provenance; publication preserves that timing in
-    the coupled worker command.
+    ``run_generation``. ``scheduled_target_monotonic_ns`` preserves the policy
+    grid endpoint for provenance. ``target_monotonic_ns`` is the worker delivery
+    target chosen at publication, and ``valid_until_monotonic_ns`` is its hard
+    expiry. An overdue policy endpoint is never relabeled as a fresh endpoint.
     """
 
     observation_id: int
     run_generation: int
     created_monotonic_ns: int
+    scheduled_target_monotonic_ns: int
     target_monotonic_ns: int
     valid_until_monotonic_ns: int
     action_id: int = 0
@@ -59,6 +60,7 @@ class ActionCandidate:
             min(
                 self.observation_id,
                 self.created_monotonic_ns,
+                self.scheduled_target_monotonic_ns,
                 self.target_monotonic_ns,
                 self.valid_until_monotonic_ns,
             )
@@ -66,7 +68,9 @@ class ActionCandidate:
         ):
             raise ValueError("action identifiers/timestamps must be positive")
         if self.created_monotonic_ns > self.target_monotonic_ns:
-            raise ValueError("action target precedes creation")
+            raise ValueError("delivery target precedes creation")
+        if self.scheduled_target_monotonic_ns > self.created_monotonic_ns:
+            raise ValueError("scheduled policy endpoint is not due yet")
         if self.target_monotonic_ns > self.valid_until_monotonic_ns:
             raise ValueError("action validity ends before target")
         if self.run_generation < 0 or self.action_id < 0:

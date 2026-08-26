@@ -1,4 +1,4 @@
-"""Transactional export of processed HDF5 v7 episodes to policy Zarr."""
+"""Transactional export of processed HDF5 v8 episodes to Policy Zarr v4."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from dexmani_real.sensor.pointcloud import (
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 
 POLICY_ZARR_SCHEMA_NAME = "dexmani-real-policy-zarr"
-POLICY_ZARR_SCHEMA_VERSION = 3
+POLICY_ZARR_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -68,6 +68,7 @@ class _Artifact:
     dataset_shapes: dict[str, tuple[int, ...]]
     dataset_dtypes: dict[str, np.dtype[Any]]
     semantic_attrs: dict[str, Any]
+    segment_lengths: tuple[int, ...]
 
 
 def _text(value: Any) -> str:
@@ -126,6 +127,59 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
         length = int(source.attrs.get("episode_steps", -1))
         if length <= 0:
             raise ValueError(f"{path.name}: episode_steps must be positive")
+        dt = float(source.attrs.get("dt", np.nan))
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError(f"{path.name}: dt must be finite and positive")
+        contiguity_tolerance_s = float(
+            source.attrs.get("source_contiguity_tolerance_s", np.nan)
+        )
+        if not np.isfinite(contiguity_tolerance_s) or contiguity_tolerance_s <= 0.0:
+            raise ValueError(f"{path.name}: invalid source contiguity tolerance")
+        try:
+            segment_ends = np.asarray(
+                source["provenance/source_segment_ends"][:], dtype=np.int64
+            )
+            source_rows = np.asarray(
+                source["provenance/source_row_index"][:], dtype=np.int64
+            )
+            source_samples = np.asarray(
+                source["provenance/source_sample_index"][:], dtype=np.int64
+            )
+            source_timestamps = np.asarray(
+                source["provenance/source_timestamp_s"][:], dtype=np.float64
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{path.name}: invalid source segment provenance") from exc
+        if (
+            segment_ends.ndim != 1
+            or segment_ends.size == 0
+            or segment_ends[-1] != length
+            or np.any(np.diff(segment_ends) <= 0)
+        ):
+            raise ValueError(f"{path.name}: invalid source segment ends")
+        if (
+            source_rows.shape != (length,)
+            or source_samples.shape != (length,)
+            or source_timestamps.shape != (length,)
+            or not np.all(np.isfinite(source_timestamps))
+        ):
+            raise ValueError(f"{path.name}: invalid source timeline provenance")
+        discontinuity = (
+            (np.diff(source_rows) != 1)
+            | (np.diff(source_samples) != 1)
+            | (np.abs(np.diff(source_timestamps) - dt) > contiguity_tolerance_s)
+        )
+        expected_segment_ends = np.concatenate(
+            (np.flatnonzero(discontinuity).astype(np.int64) + 1, [length])
+        )
+        if not np.array_equal(segment_ends, expected_segment_ends):
+            raise ValueError(f"{path.name}: source segment boundaries mismatch")
+        segment_lengths = tuple(
+            int(value)
+            for value in np.diff(
+                np.concatenate((np.asarray([0], dtype=np.int64), segment_ends))
+            )
+        )
         task_name = _text(source.attrs.get("task_name", ""))
         if not task_name or task_name == "unknown":
             raise ValueError(f"{path.name}: explicit task_name is required")
@@ -136,9 +190,6 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
             raise ValueError(
                 f"{path.name}: task_name={task_name!r}, expected {config.expected_task_name!r}"
             )
-        dt = float(source.attrs.get("dt", np.nan))
-        if not np.isfinite(dt) or dt <= 0.0:
-            raise ValueError(f"{path.name}: dt must be finite and positive")
         shapes: dict[str, tuple[int, ...]] = {}
         dtypes: dict[str, np.dtype[Any]] = {}
         for key in profile.dataset_keys:
@@ -146,6 +197,7 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
             shapes[key] = tuple(int(value) for value in source[key].shape[1:])
             dtypes[key] = np.dtype(source[key].dtype)
         semantics: dict[str, Any] = {
+            "obs_alignment": _text(source.attrs.get("obs_alignment", "")),
             "contact_force_unit": _text(source.attrs.get("contact_force_unit", "")),
             "contact_force_si_verified": bool(
                 source.attrs.get("contact_force_si_verified", False)
@@ -157,7 +209,8 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
             "action_ee_frame": _text(source.attrs.get("action_ee_frame", "")),
         }
         if (
-            not semantics["contact_force_unit"]
+            semantics["obs_alignment"] != "obs[t]_before_action[t]"
+            or not semantics["contact_force_unit"]
             or not semantics["contact_force_frame"]
             or semantics["fingertip_points_frame"] != "xarm_base"
             or semantics["action_ee_frame"] != "xarm_base"
@@ -259,6 +312,7 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
         dataset_shapes=shapes,
         dataset_dtypes=dtypes,
         semantic_attrs=semantics,
+        segment_lengths=segment_lengths,
     )
 
 
@@ -329,6 +383,7 @@ def _validate_zarr(
         "profile": first.profile.value,
         "task_name": first.task_name,
         "dt": first.dt,
+        "episode_start_policy": "full_history",
         **first.semantic_attrs,
     }
     if dict(root.attrs) != expected_attrs:
@@ -337,7 +392,8 @@ def _validate_zarr(
     if set(root["data"].array_keys()) != expected_keys:
         raise ValueError("Zarr data keys do not match processed HDF5")
     expected_ends = np.cumsum(
-        [artifact.length for artifact in artifacts], dtype=np.int64
+        [length for artifact in artifacts for length in artifact.segment_lengths],
+        dtype=np.int64,
     )
     if not np.array_equal(root["meta"]["episode_ends"][:], expected_ends):
         raise ValueError("Zarr episode_ends mismatch")
@@ -385,7 +441,8 @@ def export_processed_hdf5_to_zarr(
     _validate_uniform(artifacts)
     total_frames = sum(artifact.length for artifact in artifacts)
     episode_ends = np.cumsum(
-        [artifact.length for artifact in artifacts], dtype=np.int64
+        [length for artifact in artifacts for length in artifact.segment_lengths],
+        dtype=np.int64,
     )
     first = artifacts[0]
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -402,6 +459,7 @@ def export_processed_hdf5_to_zarr(
                 "profile": first.profile.value,
                 "task_name": first.task_name,
                 "dt": first.dt,
+                "episode_start_policy": "full_history",
                 **first.semantic_attrs,
             }
         )
@@ -440,7 +498,7 @@ def export_processed_hdf5_to_zarr(
         "output_path": str(target.resolve()),
         "task_name": first.task_name,
         "profile": first.profile.value,
-        "episode_count": len(artifacts),
+        "episode_count": len(episode_ends),
         "total_frames": total_frames,
         "episode_ends": episode_ends.tolist(),
         "dataset_keys": sorted(first.dataset_shapes),

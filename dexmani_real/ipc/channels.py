@@ -150,7 +150,10 @@ class RuntimeChannelsConfig:
         pointcloud_num_points: int = 1024,
         pointcloud_requested: bool = False,
         observation_horizon: int | None = None,
+        observation_dt_s: float | None = None,
+        max_input_age_s: float = 0.0,
         max_observation_skew_s: float = 0.0,
+        max_grid_lag_s: float = 0.0,
     ) -> "RuntimeChannelsConfig":
         cam = getattr(runtime, "camera")
         pol = getattr(runtime, "policy")
@@ -166,6 +169,7 @@ class RuntimeChannelsConfig:
         )
         arm_state_ring_maxlen = 8
         hand_state_ring_maxlen = 8
+        hand_tactile_ring_maxlen = 8
         pointcloud_ring_maxlen = 8
         if pointcloud_requested:
             if (
@@ -177,24 +181,51 @@ class RuntimeChannelsConfig:
                     "point-cloud deployment requires a positive observation_horizon"
                 )
             if (
+                observation_dt_s is None
+                or not math.isfinite(float(observation_dt_s))
+                or float(observation_dt_s) <= 0.0
+            ):
+                raise ValueError(
+                    "point-cloud deployment requires a finite positive observation_dt_s"
+                )
+            if (
+                not math.isfinite(float(max_input_age_s))
+                or float(max_input_age_s) <= 0.0
+            ):
+                raise ValueError("max_input_age_s must be finite and positive")
+            if (
                 not math.isfinite(float(max_observation_skew_s))
                 or float(max_observation_skew_s) < 0.0
             ):
                 raise ValueError(
                     "max_observation_skew_s must be finite and non-negative"
                 )
+            if not math.isfinite(float(max_grid_lag_s)) or float(max_grid_lag_s) < 0.0:
+                raise ValueError("max_grid_lag_s must be finite and non-negative")
             horizon = int(observation_horizon)
-            span_s = (horizon - 1) / float(cam.fps) + float(max_observation_skew_s)
+            # Observation history lives on the policy control grid. Camera FPS
+            # only determines how many source frames may land inside that span;
+            # it is not the model's temporal spacing.
+            history_span_s = (horizon - 1) * float(observation_dt_s)
+            pointcloud_span_s = (
+                history_span_s + float(max_grid_lag_s) + float(max_input_age_s)
+            )
+            state_span_s = pointcloud_span_s + float(max_observation_skew_s)
             arm_state_ring_maxlen = max(
                 arm_state_ring_maxlen,
-                math.ceil(float(arm_cfg.loop_hz) * span_s) + _OBSERVATION_READ_MARGIN,
+                math.ceil(float(arm_cfg.loop_hz) * state_span_s)
+                + _OBSERVATION_READ_MARGIN,
             )
             hand_state_ring_maxlen = max(
                 hand_state_ring_maxlen,
-                math.ceil(float(hand_cfg.loop_hz) * span_s) + _OBSERVATION_READ_MARGIN,
+                math.ceil(float(hand_cfg.loop_hz) * state_span_s)
+                + _OBSERVATION_READ_MARGIN,
             )
+            hand_tactile_ring_maxlen = hand_state_ring_maxlen
             pointcloud_ring_maxlen = max(
-                pointcloud_ring_maxlen, horizon + _OBSERVATION_READ_MARGIN
+                pointcloud_ring_maxlen,
+                math.ceil(float(cam.fps) * pointcloud_span_s)
+                + _OBSERVATION_READ_MARGIN,
             )
         return cls(
             camera_ring_maxlen=int(cam.ring_maxlen),
@@ -204,6 +235,7 @@ class RuntimeChannelsConfig:
             pointcloud_requested=pointcloud_requested,
             arm_state_ring_maxlen=arm_state_ring_maxlen,
             hand_state_ring_maxlen=hand_state_ring_maxlen,
+            hand_tactile_ring_maxlen=hand_tactile_ring_maxlen,
             pointcloud_ring_maxlen=pointcloud_ring_maxlen,
             control_hz=float(pol.control_hz),
             hand_home_qpos_rad=tuple(
@@ -292,6 +324,7 @@ class RuntimeChannels:
         Any  # all actuator-action producers -> globally unique monotonic IDs
     )
     run_generation: Any  # controller advances it to invalidate old policy proposals
+    run_started_monotonic_ns: Any  # start of the current RUNNING observation epoch
     # The active ring sequence fences latest-wins commands at each SDK boundary.
     active_coupled_command_sequence: Any
     recorder_consumed_sequence: Any
@@ -457,6 +490,7 @@ class RuntimeChannels:
         storage.arm_home_q = ctx.Queue(maxsize=cfg.arm_home_q_maxsize)
         storage.arm_command_seq = ctx.Value("Q", 0)
         storage.run_generation = ctx.Value("Q", 1)
+        storage.run_started_monotonic_ns = ctx.Value("Q", 0)
         storage.active_coupled_command_sequence = ctx.Value("Q", 0)
         storage.recorder_consumed_sequence = ctx.Value("Q", 0)
         storage.action_control_hz = float(cfg.control_hz)

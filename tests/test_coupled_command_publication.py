@@ -52,6 +52,7 @@ def _shared(*, state: SafetyState = SafetyState.RUNNING) -> SimpleNamespace:
     return SimpleNamespace(
         safety_state=_Value(int(state)),
         run_generation=_Value(7),
+        run_started_monotonic_ns=_Value(1),
         motion_lock=threading.RLock(),
         coupled_cmd_ring=_Ring(),
         active_coupled_command_sequence=_Value(0),
@@ -193,7 +194,8 @@ class CoupledCommandPublicationTest(unittest.TestCase):
             run_generation=7,
             action_id=1,
             created_monotonic_ns=now_ns,
-            target_monotonic_ns=now_ns + 50_000_000,
+            target_monotonic_ns=now_ns,
+            scheduled_target_monotonic_ns=now_ns,
             valid_until_monotonic_ns=now_ns + 500_000_000,
             arm_qpos=np.zeros(7),
         )
@@ -220,6 +222,7 @@ class CoupledCommandPublicationTest(unittest.TestCase):
             action_id=1,
             created_monotonic_ns=now_ns,
             target_monotonic_ns=now_ns,
+            scheduled_target_monotonic_ns=now_ns,
             valid_until_monotonic_ns=now_ns + 500_000_000,
             arm_qpos=np.zeros(7),
         )
@@ -274,6 +277,7 @@ class CoupledCommandPublicationTest(unittest.TestCase):
             action_id=1,
             created_monotonic_ns=now_ns,
             target_monotonic_ns=now_ns,
+            scheduled_target_monotonic_ns=now_ns,
             valid_until_monotonic_ns=now_ns + 500_000_000,
             arm_qpos=np.zeros(7),
         )

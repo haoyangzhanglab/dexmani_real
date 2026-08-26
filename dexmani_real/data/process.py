@@ -1,4 +1,4 @@
-"""Transactional depth-to-color aligned raw-v22 to processed-v7 processing."""
+"""Transactional depth-to-color aligned raw-v22 to processed-v8 processing."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 7
+PROCESSED_SCHEMA_VERSION = 8
 _SOURCE_MEMBERS = ("data.h5", "depth.h5", "rgb.mp4")
 _VALIDATION_CHUNK_BYTES = 64 * 1024 * 1024
 
@@ -253,6 +253,11 @@ def _write_attrs(
             "episode_steps": decision.selected_frames,
             "dt": float(reader.timing.grid_dt_s),
             "time_semantics": "logical_control_grid_after_row_compaction",
+            "source_contiguity": "segment_ends_in_provenance",
+            "source_contiguity_tolerance_s": max(
+                1e-7,
+                float(reader.timing.grid_dt_s) * config.grid_dt_relative_tolerance,
+            ),
             "action_dim": 19,
             "action_ee_dim": 21,
             "action_space": "joint",
@@ -403,6 +408,11 @@ def _write_processed_episode(
             **_dataset_kwargs(config, chunks=(min(len(selected), 256),)),
         )
         provenance.create_dataset(
+            "source_segment_ends",
+            data=decision.segment_ends,
+            **_dataset_kwargs(config, chunks=(min(len(decision.segment_ends), 256),)),
+        )
+        provenance.create_dataset(
             "source_keep_mask",
             data=decision.keep_mask,
             **_dataset_kwargs(config, chunks=(min(decision.source_frames, 256),)),
@@ -536,13 +546,13 @@ def _expected_specs(
 def validate_processed_hdf5(
     path: str | Path, config: ProcessingConfig
 ) -> dict[str, Any]:
-    """Fail closed on a processed Real HDF5 v7 artifact."""
+    """Fail closed on a processed Real HDF5 v8 artifact."""
 
     artifact = Path(path)
     with h5py.File(artifact, "r") as source:
         expected_top = set(config.profile.dataset_keys) | {"provenance"}
         if set(source.keys()) != expected_top:
-            raise ValueError(f"{artifact.name}: top-level keys do not match v7 profile")
+            raise ValueError(f"{artifact.name}: top-level keys do not match v8 profile")
         length = int(source.attrs.get("episode_steps", -1))
         if length < config.min_episode_frames:
             raise ValueError(f"{artifact.name}: episode_steps={length} is too short")
@@ -634,7 +644,7 @@ def validate_processed_hdf5(
                 or str(source.attrs.get("point_cloud_transform", ""))
                 != POINT_CLOUD_TRANSFORM
             ):
-                raise ValueError(f"{artifact.name}: invalid v7 point-cloud semantics")
+                raise ValueError(f"{artifact.name}: invalid v8 point-cloud semantics")
         if str(source.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
             raise ValueError(f"{artifact.name}: invalid schema_name")
         if int(source.attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
@@ -647,6 +657,10 @@ def validate_processed_hdf5(
             raise ValueError(f"{artifact.name}: explicit task_name required")
         if str(source.attrs.get("obs_alignment", "")) != "obs[t]_before_action[t]":
             raise ValueError(f"{artifact.name}: invalid observation/action alignment")
+        if str(source.attrs.get("source_contiguity", "")) != (
+            "segment_ends_in_provenance"
+        ):
+            raise ValueError(f"{artifact.name}: invalid source-contiguity contract")
         for key in (
             "processing_config_json",
             "quality_summary_json",
@@ -666,6 +680,7 @@ def validate_processed_hdf5(
             "source_row_index",
             "source_sample_index",
             "source_timestamp_s",
+            "source_segment_ends",
             "source_keep_mask",
             "source_drop_reason_bits",
         }
@@ -675,12 +690,17 @@ def validate_processed_hdf5(
         rows = np.asarray(provenance["source_row_index"][:], dtype=np.int64)
         samples = np.asarray(provenance["source_sample_index"][:], dtype=np.int64)
         timestamps = np.asarray(provenance["source_timestamp_s"][:], dtype=np.float64)
+        segment_ends = np.asarray(provenance["source_segment_ends"][:], dtype=np.int64)
         keep = np.asarray(provenance["source_keep_mask"][:], dtype=bool)
         reasons = np.asarray(provenance["source_drop_reason_bits"][:], dtype=np.uint64)
         if (
             rows.shape != (length,)
             or samples.shape != (length,)
             or timestamps.shape != (length,)
+            or segment_ends.ndim != 1
+            or segment_ends.size == 0
+            or segment_ends[-1] != length
+            or np.any(np.diff(segment_ends) <= 0)
             or keep.shape != (source_frames,)
             or reasons.shape != (source_frames,)
             or not np.array_equal(rows, np.flatnonzero(keep))
@@ -692,6 +712,38 @@ def validate_processed_hdf5(
             or np.any(np.diff(timestamps) <= 0.0)
         ):
             raise ValueError(f"{artifact.name}: provenance row mapping mismatch")
+        dt = float(source.attrs.get("dt", np.nan))
+        tolerance_s = float(source.attrs.get("source_contiguity_tolerance_s", np.nan))
+        if (
+            not np.isfinite(tolerance_s)
+            or tolerance_s <= 0.0
+            or not np.isclose(
+                tolerance_s,
+                max(1e-7, dt * config.grid_dt_relative_tolerance),
+                rtol=0.0,
+                atol=1e-15,
+            )
+        ):
+            raise ValueError(f"{artifact.name}: invalid contiguity tolerance")
+        discontinuity = (
+            (np.diff(rows) != 1)
+            | (np.diff(samples) != 1)
+            | (np.abs(np.diff(timestamps) - dt) > tolerance_s)
+        )
+        expected_segment_ends = np.concatenate(
+            (np.flatnonzero(discontinuity).astype(np.int64) + 1, [length])
+        )
+        if not np.array_equal(segment_ends, expected_segment_ends):
+            raise ValueError(f"{artifact.name}: source segment boundaries mismatch")
+        segment_starts = np.concatenate(
+            (np.asarray([0], dtype=np.int64), segment_ends[:-1])
+        )
+        full_window_count = sum(
+            max(0, int(end - start) - config.horizon + 1)
+            for start, end in zip(segment_starts, segment_ends, strict=True)
+        )
+        if full_window_count < config.min_full_windows:
+            raise ValueError(f"{artifact.name}: insufficient source-contiguous windows")
         try:
             reason_names = json.loads(
                 str(provenance.attrs["drop_reason_bit_names_json"])
@@ -763,7 +815,7 @@ def process_episode_root(
                 reader.require_valid(purpose="offline processing")
                 if reader.schema_version != 22:
                     raise ValueError(
-                        "processed v7 accepts depth_to_color raw schema v22 only; "
+                        "processed v8 accepts depth_to_color raw schema v22 only; "
                         f"got v{reader.schema_version}"
                     )
                 decisions.append(

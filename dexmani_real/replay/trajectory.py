@@ -275,6 +275,9 @@ def _processed_replay_source(
             retained_rows = np.asarray(
                 artifact["provenance/source_row_index"][:], dtype=np.int64
             )
+            source_segment_ends = np.asarray(
+                artifact["provenance/source_segment_ends"][:], dtype=np.int64
+            )
             source_keep_mask = np.asarray(
                 artifact["provenance/source_keep_mask"][:], dtype=bool
             )
@@ -290,6 +293,10 @@ def _processed_replay_source(
             or source_frames <= 0
             or retained_rows.shape != (processed_frames,)
             or retained_rows.size == 0
+            or not np.array_equal(
+                source_segment_ends, np.asarray([processed_frames], dtype=np.int64)
+            )
+            or np.any(np.diff(retained_rows) != 1)
             or source_keep_mask.shape != (source_frames,)
             or source_drop_reason_bits.shape != (source_frames,)
             or not np.array_equal(retained_rows, np.flatnonzero(source_keep_mask))
@@ -299,27 +306,6 @@ def _processed_replay_source(
             raise ValueError(
                 f"processed episode {artifact_path.name} has inconsistent row provenance"
             )
-
-        raw_quality = artifact.attrs.get("quality_summary_json")
-        if raw_quality is not None:
-            try:
-                quality = json.loads(str(raw_quality))
-            except (TypeError, json.JSONDecodeError) as exc:
-                raise ValueError(
-                    f"processed episode {artifact_path.name} has invalid quality_summary_json"
-                ) from exc
-            if not isinstance(quality, dict):
-                raise ValueError(
-                    f"processed episode {artifact_path.name} quality_summary_json must encode an object"
-                )
-            risky_bridge_count = int(quality.get("risky_bridge_count", 0))
-            if risky_bridge_count > 0:
-                raise ValueError(
-                    f"processed episode {artifact_path.name} has {risky_bridge_count} risky bridge "
-                    "transition(s): row compaction created abrupt command jumps that the "
-                    "geometry preflight does not bound. Refusing to physically replay; "
-                    "reprocess with bridge_policy=reject or replay the raw source episode."
-                )
 
         source_config_sha256 = str(
             artifact.attrs.get("source_resolved_config_sha256", "")

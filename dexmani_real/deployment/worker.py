@@ -20,11 +20,12 @@ from __future__ import annotations
 
 import importlib
 import time
+from dataclasses import replace
 from typing import Any, cast
 
 import numpy as np
 
-from dexmani_real.deployment.config import DeploymentConfig
+from dexmani_real.deployment.config import DeploymentConfig, PolicyRuntimeConfig
 from dexmani_real.deployment.contracts import (
     InferenceContext,
     JointActionChunk,
@@ -51,7 +52,7 @@ from dexmani_real.ipc.schema import (
     POLICY_PLAN_DTYPE,
     validate_point_cloud_array,
 )
-from dexmani_real.runtime.safety import SafetyState
+from dexmani_real.runtime.safety import SafetyState, read_run_epoch
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -79,7 +80,7 @@ def _load(
     target: str,
     protocol: type[Any],
     kind: str,
-    config: DeploymentConfig | None,
+    config: DeploymentConfig | PolicyRuntimeConfig | None,
 ) -> Any:
     module_name, symbol = _split_target(target)
     try:
@@ -103,7 +104,9 @@ def _load(
 
 
 def load_policy_runtime(
-    target: str, *, config: DeploymentConfig | None = None
+    target: str,
+    *,
+    config: DeploymentConfig | PolicyRuntimeConfig | None = None,
 ) -> PolicyRuntime:
     """Load a :class:`PolicyRuntime` from ``module:symbol``."""
     return cast(
@@ -152,6 +155,12 @@ def publish_plan(
     frame["observation_anchor_monotonic_ns"][0] = np.uint64(
         context.observation_anchor_monotonic_ns
     )
+    frame["observation_latest_source_monotonic_ns"][0] = np.uint64(
+        context.observation_latest_source_monotonic_ns
+    )
+    frame["observation_logical_step_monotonic_ns"][0] = np.uint64(
+        context.observation_logical_step_monotonic_ns
+    )
     frame["inference_started_monotonic_ns"][0] = np.uint64(
         context.inference_started_monotonic_ns
     )
@@ -184,6 +193,7 @@ def _read_state_history(
     values_field: str,
     required_true_fields: tuple[str, ...] = (),
     max_age_ns: int | None = None,
+    not_before_ns: int = 0,
 ) -> FrameWindow | None:
     """Read the causal (source <= publish <= anchor) state frames, oldest-first.
 
@@ -214,7 +224,7 @@ def _read_state_history(
             and int(data["publish_monotonic_ns"][0]) > 0
             else int(ring_publish_ns)
         )
-        if not (0 < source_ns <= publish_ns <= anchor_ns):
+        if not (max(0, int(not_before_ns)) <= source_ns <= publish_ns <= anchor_ns):
             continue
         if max_age_ns is not None and anchor_ns - source_ns > max_age_ns:
             continue
@@ -242,6 +252,7 @@ def _pointcloud_frame_from_record(
     anchor_ns: int,
     max_age_ns: int,
     num_points: int,
+    not_before_ns: int,
 ) -> PointCloudFrame | None:
     """Extract one causal, fresh ``PointCloudFrame`` from a ring record (or None)."""
     source_ns = int(record["source_monotonic_ns"])
@@ -259,6 +270,7 @@ def _pointcloud_frame_from_record(
         <= int(ring_publish_ns)
         <= anchor_ns
         and anchor_ns - source_ns <= max_age_ns
+        and source_ns >= int(not_before_ns)
     ):
         return None
     try:
@@ -285,6 +297,7 @@ def _read_pointcloud_history(
     max_age_ns: int,
     num_points: int,
     history_len: int,
+    not_before_ns: int,
 ) -> tuple[PointCloudFrame, ...]:
     """Read the last ``history_len`` causal, fresh clouds, oldest-first."""
     if history_len <= 0:
@@ -304,6 +317,7 @@ def _read_pointcloud_history(
             anchor_ns=anchor_ns,
             max_age_ns=max_age_ns,
             num_points=num_points,
+            not_before_ns=not_before_ns,
         )
         if frame is not None:
             frames.append(frame)
@@ -314,6 +328,44 @@ def _read_pointcloud_history(
     # generation than the newest frame.
     newest_gen = frames[-1].camera_generation
     return tuple(frame for frame in frames if frame.camera_generation == newest_gen)
+
+
+def _select_pointcloud_control_grid(
+    frames: tuple[PointCloudFrame, ...],
+    *,
+    run_started_ns: int,
+    anchor_ns: int,
+    history_len: int,
+    step_dt_ns: int,
+    max_grid_lag_ns: int,
+) -> tuple[tuple[PointCloudFrame, ...], int]:
+    """Select a strictly advancing causal window on the latest elapsed grid tick."""
+    if not frames or history_len <= 0 or step_dt_ns <= 0:
+        return (), 0
+    if anchor_ns < run_started_ns:
+        return (), 0
+    latest_tick = (anchor_ns - run_started_ns) // step_dt_ns
+    if latest_tick < history_len - 1:
+        return (), 0
+    logical_step_ns = run_started_ns + latest_tick * step_dt_ns
+    selected: list[PointCloudFrame] = []
+    previous_sequence = 0
+    for offset in range(history_len - 1, -1, -1):
+        desired_ns = logical_step_ns - offset * step_dt_ns
+        candidates = [
+            frame
+            for frame in frames
+            if frame.source_monotonic_ns <= desired_ns
+            and desired_ns - frame.source_monotonic_ns <= max_grid_lag_ns
+        ]
+        if not candidates:
+            return (), 0
+        frame = candidates[-1]
+        if frame.source_camera_sequence <= previous_sequence:
+            return (), 0
+        selected.append(frame)
+        previous_sequence = frame.source_camera_sequence
+    return tuple(selected), logical_step_ns
 
 
 def _align_state_history_to_pointclouds(
@@ -355,12 +407,14 @@ def _align_state_history_to_pointclouds(
 
 def _build_observation(
     shared: RuntimeChannels,
-    config: DeploymentConfig,
+    config: DeploymentConfig | PolicyRuntimeConfig,
     *,
     observation_id: int,
     run_generation: int,
+    run_started_ns: int,
     anchor_ns: int,
-) -> ObservationBatch:
+    step_dt_ns: int,
+) -> ObservationBatch | None:
     """Assemble requested causal modalities from the arm/hand rings.
 
     The hand state and tactile rings are read only when their corresponding
@@ -368,8 +422,12 @@ def _build_observation(
     gated by its source/publish timestamps and modality-specific health flags.
     """
     horizon = int(config.observation_horizon)
-    max_age_ns = int(config.max_observation_age_s * 1e9)
+    max_age_ns = int(config.max_input_age_s * 1e9)
     max_skew_ns = int(config.max_observation_skew_s * 1e9)
+    max_grid_lag_ns = int(config.max_grid_lag_s * 1e9)
+    history_span_ns = max(0, horizon - 1) * int(step_dt_ns)
+    pointcloud_history_max_age_ns = max_age_ns + history_span_ns + max_grid_lag_ns
+    state_history_max_age_ns = pointcloud_history_max_age_ns + max_skew_ns
     hand_history: FrameWindow | None = None
     hand_current_history: FrameWindow | None = None
     hand_tactile_sum_history: FrameWindow | None = None
@@ -391,7 +449,8 @@ def _build_observation(
         anchor_ns=anchor_ns,
         values_field="qpos",
         required_true_fields=("state_valid",),
-        max_age_ns=max_age_ns,
+        max_age_ns=(state_history_max_age_ns if pointcloud_requested else max_age_ns),
+        not_before_ns=run_started_ns,
     )
     hand_state_requested = bool(
         requested
@@ -409,13 +468,23 @@ def _build_observation(
         all_pointclouds = _read_pointcloud_history(
             shared,
             anchor_ns=anchor_ns,
-            max_age_ns=max_age_ns,
+            max_age_ns=pointcloud_history_max_age_ns,
             num_points=int(config.pointcloud_num_points),
             history_len=shared.pointcloud_ring.maxlen,
+            not_before_ns=run_started_ns,
         )
-        if len(all_pointclouds) >= horizon:
-            pointcloud_history = all_pointclouds[-horizon:]
+        pointcloud_history, logical_step_ns = _select_pointcloud_control_grid(
+            all_pointclouds,
+            run_started_ns=run_started_ns,
+            anchor_ns=anchor_ns,
+            history_len=horizon,
+            step_dt_ns=step_dt_ns,
+            max_grid_lag_ns=max_grid_lag_ns,
+        )
+        if len(pointcloud_history) == horizon:
             pointcloud = pointcloud_history[-1]
+    else:
+        logical_step_ns = 0
     if config.hand_enabled:
         if hand_state_requested:
             hand_history = _read_state_history(
@@ -426,37 +495,59 @@ def _build_observation(
                 anchor_ns=anchor_ns,
                 values_field="qpos",
                 required_true_fields=("state_valid",),
-                max_age_ns=max_age_ns,
+                max_age_ns=(
+                    state_history_max_age_ns if pointcloud_requested else max_age_ns
+                ),
+                not_before_ns=run_started_ns,
             )
             if requested & {"hand_current", "hand_joint_torque"}:
                 hand_current_history = _read_state_history(
                     shared.hand_state_ring,
-                    history_len=horizon,
+                    history_len=(
+                        shared.hand_state_ring.maxlen
+                        if pointcloud_requested
+                        else horizon
+                    ),
                     anchor_ns=anchor_ns,
                     values_field="current",
                     required_true_fields=("state_valid",),
-                    max_age_ns=max_age_ns,
+                    max_age_ns=(
+                        state_history_max_age_ns if pointcloud_requested else max_age_ns
+                    ),
+                    not_before_ns=run_started_ns,
                 )
             if requested & {"hand_tactile_sum", "fingertip_force"}:
                 hand_tactile_sum_history = _read_state_history(
                     shared.hand_state_ring,
-                    history_len=horizon,
+                    history_len=(
+                        shared.hand_state_ring.maxlen
+                        if pointcloud_requested
+                        else horizon
+                    ),
                     anchor_ns=anchor_ns,
                     values_field="tactile_sum",
                     required_true_fields=(
                         "state_valid",
                         "tactile_sum_valid",
                     ),
-                    max_age_ns=max_age_ns,
+                    max_age_ns=(
+                        state_history_max_age_ns if pointcloud_requested else max_age_ns
+                    ),
+                    not_before_ns=run_started_ns,
                 )
         if tactile_requested:
             tactile_history = _read_state_history(
                 shared.hand_tactile_ring,
-                history_len=horizon,
+                history_len=(
+                    shared.hand_tactile_ring.maxlen if pointcloud_requested else horizon
+                ),
                 anchor_ns=anchor_ns,
                 values_field="tactile_force",
                 required_true_fields=("fresh",),
-                max_age_ns=max_age_ns,
+                max_age_ns=(
+                    state_history_max_age_ns if pointcloud_requested else max_age_ns
+                ),
+                not_before_ns=run_started_ns,
             )
     if pointcloud_requested and len(pointcloud_history) == horizon:
         arm_history = _align_state_history_to_pointclouds(
@@ -470,10 +561,42 @@ def _build_observation(
                 pointcloud_history,
                 max_skew_ns=max_skew_ns,
             )
+        if hand_current_history is not None:
+            hand_current_history = _align_state_history_to_pointclouds(
+                hand_current_history,
+                pointcloud_history,
+                max_skew_ns=max_skew_ns,
+            )
+        if hand_tactile_sum_history is not None:
+            hand_tactile_sum_history = _align_state_history_to_pointclouds(
+                hand_tactile_sum_history,
+                pointcloud_history,
+                max_skew_ns=max_skew_ns,
+            )
+        if tactile_history is not None:
+            tactile_history = _align_state_history_to_pointclouds(
+                tactile_history,
+                pointcloud_history,
+                max_skew_ns=max_skew_ns,
+            )
+    if pointcloud_requested:
+        if pointcloud is None or logical_step_ns <= 0:
+            return None
+        latest_source_ns = int(pointcloud.source_monotonic_ns)
+        if anchor_ns - latest_source_ns > max_age_ns:
+            return None
+    elif arm_history is not None and arm_history.values.shape[0] > 0:
+        latest_source_ns = int(arm_history.source_monotonic_ns[-1])
+        logical_step_ns = latest_source_ns
+    else:
+        return None
     return ObservationBatch(
         observation_id=observation_id,
         run_generation=run_generation,
+        run_started_monotonic_ns=run_started_ns,
         anchor_monotonic_ns=anchor_ns,
+        latest_source_monotonic_ns=latest_source_ns,
+        logical_step_monotonic_ns=logical_step_ns,
         arm_history=arm_history,
         hand_history=hand_history,
         hand_current_history=hand_current_history,
@@ -484,7 +607,7 @@ def _build_observation(
     )
 
 
-def inference_loop(shared: RuntimeChannels, config: DeploymentConfig) -> None:
+def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None:
     """Inference process entry point — produces proposals, never robot commands.
 
     Startup order: heartbeat early -> lazy import -> instantiate -> load ->
@@ -494,7 +617,7 @@ def inference_loop(shared: RuntimeChannels, config: DeploymentConfig) -> None:
     ``runtime.reset_episode`` when it changes.
     """
     if config is None:
-        raise ValueError("inference_loop requires a DeploymentConfig")
+        raise ValueError("inference_loop requires a PolicyRuntimeConfig")
 
     # Heartbeat before any lazy import so the supervisor never sees a dead gap.
     shared.set_heartbeat("inference", time.monotonic())
@@ -516,6 +639,7 @@ def inference_loop(shared: RuntimeChannels, config: DeploymentConfig) -> None:
     plan_id = 0
     observation_id = 0
     last_generation = -1
+    last_logical_step_ns = 0
     last_metrics_flush_ns = time.monotonic_ns()
 
     try:
@@ -524,16 +648,20 @@ def inference_loop(shared: RuntimeChannels, config: DeploymentConfig) -> None:
             # Heartbeat every tick, including no-feedback and slow-inference paths.
             shared.set_heartbeat("inference", time.monotonic())
 
-            run_generation = int(shared.run_generation.value)
+            epoch = read_run_epoch(shared)
+            run_generation = epoch.generation
             if run_generation != last_generation:
                 runtime.reset_episode()
                 last_generation = run_generation
                 observation_id = 0  # new observation epoch for the new run
+                last_logical_step_ns = 0
 
             # ARMED = no inference; the coordinator gates RUNNING via B.
             if int(shared.safety_state.value) != int(SafetyState.RUNNING):
                 time.sleep(_ARMED_IDLE_POLL_S)
                 continue
+            if epoch.started_monotonic_ns <= 0:
+                raise RuntimeError("RUNNING state has no observation epoch")
 
             anchor_ns = time.monotonic_ns()
             observation_id += 1
@@ -542,8 +670,13 @@ def inference_loop(shared: RuntimeChannels, config: DeploymentConfig) -> None:
                 config,
                 observation_id=observation_id,
                 run_generation=run_generation,
+                run_started_ns=epoch.started_monotonic_ns,
                 anchor_ns=anchor_ns,
+                step_dt_ns=step_dt_ns,
             )
+            if observation is None:
+                time.sleep(_NO_FEEDBACK_POLL_S)
+                continue
             horizon = int(config.observation_horizon)
             if (
                 observation.arm_history is None
@@ -563,35 +696,58 @@ def inference_loop(shared: RuntimeChannels, config: DeploymentConfig) -> None:
             ):
                 time.sleep(_NO_FEEDBACK_POLL_S)
                 continue
+            if observation.logical_step_monotonic_ns <= last_logical_step_ns:
+                time.sleep(_NO_FEEDBACK_POLL_S)
+                continue
             metrics.increment(OBSERVATIONS_BUILT)
+            last_logical_step_ns = observation.logical_step_monotonic_ns
 
             started_ns = time.monotonic_ns()
-            # Action timestamps anchor to the observation cut, not inference
-            # finish; the true finish time is measured around predict and used
-            # only for plan freshness in the published context.
+            # The adapter timestamps actions on the observation's logical
+            # control grid; the causal cut is retained only as provenance.
             predict_context = InferenceContext(
                 run_generation=run_generation,
                 observation_id=observation_id,
                 observation_anchor_monotonic_ns=anchor_ns,
+                observation_latest_source_monotonic_ns=(
+                    observation.latest_source_monotonic_ns
+                ),
+                observation_logical_step_monotonic_ns=(
+                    observation.logical_step_monotonic_ns
+                ),
                 inference_started_monotonic_ns=started_ns,
                 inference_finished_monotonic_ns=started_ns,
                 step_dt_ns=step_dt_ns,
             )
-            try:
-                chunk = runtime.predict(observation, context=predict_context)
-                finished_ns = time.monotonic_ns()
-            except ValueError as exc:
-                # Drop invalid model results; the coordinator's silence watchdog
-                # handles a prolonged absence of valid proposals.
-                logger.warning("inference: bad model output dropped: %s", exc)
-                metrics.increment(INFERENCE_FAILURES)
-                continue
+            chunk = runtime.predict(observation, context=predict_context)
+            finished_ns = time.monotonic_ns()
             metrics.observe(INFERENCE_MS, (finished_ns - started_ns) / 1e6)
+
+            # Preserve the model's semantic grid. Expired endpoints are masked;
+            # they are never shifted forward and made plausible again.
+            earliest_target_ns = finished_ns + int(config.command_lead_s * 1e9)
+            future_mask = (
+                np.asarray(chunk.valid_mask, dtype=np.uint8)
+                & (np.asarray(chunk.target_monotonic_ns) > earliest_target_ns)
+            ).astype(np.uint8)
+            if not bool(np.any(future_mask)):
+                metrics.increment(INFERENCE_FAILURES)
+                elapsed = time.monotonic() - tick_start
+                if period_s > elapsed:
+                    time.sleep(period_s - elapsed)
+                continue
+            chunk = replace(chunk, valid_mask=future_mask)
 
             context = InferenceContext(
                 run_generation=run_generation,
                 observation_id=observation_id,
                 observation_anchor_monotonic_ns=anchor_ns,
+                observation_latest_source_monotonic_ns=(
+                    observation.latest_source_monotonic_ns
+                ),
+                observation_logical_step_monotonic_ns=(
+                    observation.logical_step_monotonic_ns
+                ),
                 inference_started_monotonic_ns=started_ns,
                 inference_finished_monotonic_ns=finished_ns,
                 step_dt_ns=step_dt_ns,

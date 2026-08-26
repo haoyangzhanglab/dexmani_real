@@ -240,6 +240,7 @@ def _make_coupled_command(candidate: ActionCandidate) -> np.ndarray:
     frame["observation_id"][0] = candidate.observation_id
     frame["action_id"][0] = candidate.action_id
     frame["created_monotonic_ns"][0] = candidate.created_monotonic_ns
+    frame["scheduled_target_monotonic_ns"][0] = candidate.scheduled_target_monotonic_ns
     frame["target_monotonic_ns"][0] = candidate.target_monotonic_ns
     frame["valid_until_monotonic_ns"][0] = candidate.valid_until_monotonic_ns
     frame["is_hold"][0] = int(bool(candidate.is_hold))
@@ -319,6 +320,7 @@ def build_action_candidate(
     is_hold: bool = False,
     observation_id: int | None = None,
     observation_anchor_monotonic_ns: int | None = None,
+    scheduled_target_monotonic_ns: int | None = None,
     now_ns: int | None = None,
     action_validity_s: float = 0.5,
     valid_until_monotonic_ns: int | None = None,
@@ -326,10 +328,10 @@ def build_action_candidate(
     """Build an ``ActionCandidate`` from raw joint targets.
 
     Allocates a fresh monotonic ``action_id`` from ``shared.arm_command_seq``
-    and stamps an immediate target timestamp. The delivery validity is the
-    earlier of ``action_validity_s`` and an optional immutable caller deadline.
-    Returns ``None`` when the optional observation anchor or timing window is
-    invalid.
+    and stamps an immediate delivery target. ``scheduled_target_monotonic_ns``
+    retains the source plan's control-grid time even when the coordinator is
+    publishing a due endpoint later. The delivery validity is the earlier of
+    ``action_validity_s`` and an optional immutable caller deadline.
     """
     with shared.arm_command_seq.get_lock():
         action_id = int(shared.arm_command_seq.value) + 1
@@ -344,6 +346,17 @@ def build_action_candidate(
             )
             return None
     target_ns = now_ns
+    scheduled_ns = int(
+        target_ns
+        if scheduled_target_monotonic_ns is None
+        else scheduled_target_monotonic_ns
+    )
+    if scheduled_ns <= 0:
+        logger.warning(
+            "build_action_candidate: action_id=%d rejected: invalid scheduled target",
+            action_id,
+        )
+        return None
     delivery_deadline_ns = now_ns + int(float(action_validity_s) * 1e9)
     if valid_until_monotonic_ns is not None:
         delivery_deadline_ns = min(delivery_deadline_ns, int(valid_until_monotonic_ns))
@@ -358,6 +371,7 @@ def build_action_candidate(
         run_generation=int(shared.run_generation.value),
         action_id=action_id,
         created_monotonic_ns=now_ns,
+        scheduled_target_monotonic_ns=scheduled_ns,
         target_monotonic_ns=target_ns,
         valid_until_monotonic_ns=delivery_deadline_ns,
         arm_qpos=(None if arm_qpos is None else np.asarray(arm_qpos, dtype=np.float64)),

@@ -40,6 +40,7 @@ class WorkerCommandValidationTest(unittest.TestCase):
         command["arm_present"][0] = 1
         command["run_generation"][0] = 7
         command["created_monotonic_ns"][0] = now_ns
+        command["scheduled_target_monotonic_ns"][0] = now_ns
         command["target_monotonic_ns"][0] = now_ns
         command["valid_until_monotonic_ns"][0] = now_ns + 1_000_000_000
         kwargs: dict[str, Any] = {
@@ -68,6 +69,7 @@ class WorkerCommandValidationTest(unittest.TestCase):
         command["hand_present"][0] = 1
         command["run_generation"][0] = 7
         command["created_monotonic_ns"][0] = now_ns
+        command["scheduled_target_monotonic_ns"][0] = now_ns
         command["target_monotonic_ns"][0] = now_ns
         command["valid_until_monotonic_ns"][0] = now_ns + 1_000_000_000
         command["hand_qpos"][0] = np.deg2rad(runtime.hand.home_qpos_deg)
@@ -100,6 +102,7 @@ class WorkerCommandValidationTest(unittest.TestCase):
         command["hand_present"][0] = 1
         command["run_generation"][0] = 7
         command["created_monotonic_ns"][0] = created_ns
+        command["scheduled_target_monotonic_ns"][0] = created_ns
         command["target_monotonic_ns"][0] = created_ns
         command["valid_until_monotonic_ns"][0] = created_ns + 500_000_000
         command["arm_qpos"][0] = np.zeros(7)
@@ -156,6 +159,7 @@ class WorkerCommandValidationTest(unittest.TestCase):
         command["arm_present"][0] = 1
         command["run_generation"][0] = 7
         command["created_monotonic_ns"][0] = now_ns
+        command["scheduled_target_monotonic_ns"][0] = now_ns
         command["target_monotonic_ns"][0] = now_ns
         command["valid_until_monotonic_ns"][0] = now_ns + 1_000_000_000
         command["arm_qpos"][0] = np.ones(7)

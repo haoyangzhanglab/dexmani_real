@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
@@ -53,6 +54,14 @@ class CoupledCommandTicket:
 
     run_generation: int
     ring_sequence: int
+
+
+@dataclass(frozen=True)
+class RunEpoch:
+    """Atomic identity and start time of the current control run."""
+
+    generation: int
+    started_monotonic_ns: int
 
 
 def _advance_run_generation_locked(shared: Any) -> int:
@@ -113,6 +122,15 @@ def read_motion_permit(shared: Any) -> MotionPermit:
     """Read state and generation as one indivisible worker/send permit."""
     with shared.motion_lock:
         return _read_motion_permit_locked(shared)
+
+
+def read_run_epoch(shared: Any) -> RunEpoch:
+    """Read the run generation and observation boundary under one lock."""
+    with shared.motion_lock:
+        return RunEpoch(
+            generation=int(shared.run_generation.value),
+            started_monotonic_ns=int(shared.run_started_monotonic_ns.value),
+        )
 
 
 def publish_coupled_command_if_motion_permitted(
@@ -216,8 +234,16 @@ def begin_motion(shared: Any) -> bool:
         ):
             return False
         generation = _invalidate_coupled_commands_locked(shared)
+        started_ns = time.monotonic_ns()
+        shared.run_started_monotonic_ns.value = started_ns
         shared.safety_state.value = int(SafetyState.RUNNING)
-    logger.info("safety: ARMED(%d) → RUNNING(%d), generation=%d", 1, 2, generation)
+    logger.info(
+        "safety: ARMED(%d) → RUNNING(%d), generation=%d epoch_ns=%d",
+        1,
+        2,
+        generation,
+        started_ns,
+    )
     return True
 
 
@@ -246,6 +272,7 @@ def revoke_motion(shared: Any, new_state: SafetyState = SafetyState.ARMED) -> bo
             )
             return False
         generation = _invalidate_coupled_commands_locked(shared)
+        shared.run_started_monotonic_ns.value = 0
         shared.safety_state.value = int(new_state)
     logger.info(
         "safety: revoked motion %s(%d) → %s(%d), generation=%d",
@@ -259,21 +286,7 @@ def revoke_motion(shared: Any, new_state: SafetyState = SafetyState.ARMED) -> bo
 
 
 def transition(shared: Any, new_state: SafetyState) -> bool:
-    """Validate and execute a safety state transition.
-
-    Compatibility entry point for callers that do not yet use the explicit
-    motion lifecycle API. Every state change is fenced: entering ``RUNNING``
-    delegates to :func:`begin_motion`; every other target delegates to
-    :func:`revoke_motion`. This prevents a legacy ``RUNNING -> ARMED`` call
-    from leaving a published endpoint executable.
-
-    Args:
-        shared: RuntimeChannels instance with ``safety_state`` (mp.Value('i')).
-        new_state: Target SafetyState.
-
-    Returns:
-        Whether the transition succeeded.
-    """
+    """Execute a fenced safety-state transition."""
     if new_state is SafetyState.RUNNING:
         return begin_motion(shared)
     return revoke_motion(shared, new_state)

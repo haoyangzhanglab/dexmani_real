@@ -45,10 +45,10 @@ class FakePolicyRuntime:
     """Deterministic hold-with-offset policy: tile the latest arm/hand vector.
 
     ``predict`` returns a ``JointActionChunk`` whose i-th step is
-    ``input + (i+1)*offset_rad``.  ``offset_rad=0`` (the default) is a pure
+    ``input + i*offset_rad``.  ``offset_rad=0`` (the default) is a pure
     hold; a non-zero offset proves step ordering without touching the clock.
-    Target timestamps are ``observation_anchor + (i+1)*step_dt_ns``, so they are
-    strictly increasing and anchored to the causal cut carried by the context.
+    Step zero is the action aligned with the latest logical observation step;
+    the inference worker masks it if inference has already made it undeliverable.
     """
 
     def __init__(
@@ -83,8 +83,16 @@ class FakePolicyRuntime:
         self, observation: ObservationBatch, *, context: InferenceContext
     ) -> JointActionChunk:
         arm = _last_valid(
-            observation.arm_history.values if observation.arm_history is not None else None,
-            observation.arm_history.valid_mask if observation.arm_history is not None else None,
+            (
+                observation.arm_history.values
+                if observation.arm_history is not None
+                else None
+            ),
+            (
+                observation.arm_history.valid_mask
+                if observation.arm_history is not None
+                else None
+            ),
             ARM_JOINT_SHAPE[0],
         )
         hand: np.ndarray | None = None
@@ -96,7 +104,7 @@ class FakePolicyRuntime:
             )
 
         n = self.horizon
-        offsets = np.arange(1, n + 1, dtype=np.float64) * self.offset_rad
+        offsets = np.arange(n, dtype=np.float64) * self.offset_rad
         arm_out = np.empty((n, ARM_JOINT_SHAPE[0]), dtype=np.float64)
         arm_out[:] = arm[None, :] + offsets[:, None]
 
@@ -104,11 +112,10 @@ class FakePolicyRuntime:
         if hand is not None:
             hand_out = np.tile(hand[None, :], (n, 1))
 
-        steps = np.arange(1, n + 1, dtype=np.uint64)
-        target = (
-            np.asarray(context.observation_anchor_monotonic_ns, dtype=np.uint64)
-            + steps * np.uint64(context.step_dt_ns)
-        )
+        steps = np.arange(n, dtype=np.uint64)
+        target = np.asarray(
+            context.observation_logical_step_monotonic_ns, dtype=np.uint64
+        ) + steps * np.uint64(context.step_dt_ns)
         return JointActionChunk(
             arm_qpos=arm_out,
             hand_qpos=hand_out,

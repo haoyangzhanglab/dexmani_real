@@ -46,6 +46,7 @@ ESC / worker 失活 / 心跳超时
 - 一个 `COUPLED_COMMAND_DTYPE` 记录同时携带 arm/hand target、generation、action ID 与时效；发布时以 ring 返回的递增 sequence 建立 `(run_generation, ring_sequence)` ownership ticket，并立即返回。`action_id` 仅用于审计和 ACK。worker 只执行在其 SDK 边界仍为 active 的最新 ticket；新 record 会原子覆盖旧 ticket。它保证 IPC 逻辑帧一致和非阻塞 latest-wins，**不保证两个执行器物理同步**。[`ipc/schema.py`](../dexmani_real/ipc/schema.py)、[`runtime/safety.py`](../dexmani_real/runtime/safety.py)、[`control/publication.py`](../dexmani_real/control/publication.py)
 - arm 与 hand worker 共用 generation 与 delivery window 校验，并在 SDK 前复核 active sequence、运行时 fault/stop、形状和有限值；arm 还复核关节范围，并以“上一条 SDK 接受目标 → 新目标”的 20° 异常跳变阈值兜底（触发即 fail-closed fault），而不以滞后实测位置限制正常命令流；hand 复核操作/机械范围并保留实测状态限速。[`robot/arm_worker.py`](../dexmani_real/robot/arm_worker.py)、[`robot/hand_worker.py`](../dexmani_real/robot/hand_worker.py)
 - 运行时使用 `spawn`、就绪状态、心跳和受监督的子进程收尾；arm home 是可中断、独立的碰撞检查轨迹。[`deployment/lifecycle.py`](../dexmani_real/deployment/lifecycle.py)、[`control/arm_home.py`](../dexmani_real/control/arm_home.py)
+- inference 进程先独立完成自描述 checkpoint 加载和 manifest 校验；只有其 ready 后才启动任何硬件 worker。每次 `RUNNING` 还原子创建新的 run epoch，观测历史不得读取 epoch 之前的数据。
 
 这些机制降低了错误模型输出直接到达硬件的风险，但不能替代执行器层的物理安全功能。
 
@@ -77,7 +78,7 @@ arm 初始化即启用运动、设置模式和运行状态；`DISARMED` 的语�
 | 已实施（软件） | 运动撤销不是原子的 | `motion_lock` 将 state 与 generation 作为 `MotionPermit` 读取；开始、撤销和 IPC 发布在同一短临界区线性化，进入 `FAULT` 也推进 generation。SDK 调用前复核但不持锁，不能替代物理停止。 |
 | 已实施（IPC） | arm/hand 命令可能跨帧混合，或旧 record 在覆盖后被延迟执行 | 两条 ring 已替换为单条 coupled record；publisher 在 motion lock 内写完整 record 并更新 active sequence 后立即返回。worker 在 SDK 前复核同一 `(generation, ring sequence)` ownership ticket；action ID 仅承担审计/ACK。覆盖、普通 `RUNNING → ARMED` 停止和 home 取消均会使旧 ticket 失效；home 取消只影响其仍为当前的 ticket。执行器仍独立循环，未声明物理同步或 paired physical ACK。 |
 | 已实施 | 可选 hand 输出可绕过完整碰撞转换 | learned-policy `publish_plan` 拒绝缺 hand chunk，coordinator 采纳门也拒绝 `hand_present != 1`；DexMani manifest 强制 hand-enabled 的 19D/21D 合同。 |
-| 已实施 | 激活计划不会因观测过期自动失效 | coordinator 对每个 active endpoint 计算不可延长的 `min(inference_finished + max_plan_age, observation_anchor + max_observation_age)`；到期清空 active/pending 并撤销 RUNNING。 |
+| 已实施 | 激活计划不会因观测过期自动失效 | coordinator 对每个 active endpoint 使用不可延长的 `min(inference_finished + max_plan_age, latest_physical_source + max_source_to_command_age)`；已过期前缀直接跳过，计划到期时清空 active/pending 并撤销 RUNNING。 |
 | 未关闭 | deployment 碰撞世界排除桌面 | coordinator 仍不传入 table；需要任务级风险接受、工作空间/速度约束和受控工装验证，不能暗示碰撞检查覆盖完整环境。 |
 
 相关入口：[`robot/command_validation.py`](../dexmani_real/robot/command_validation.py)、[`runtime/safety.py`](../dexmani_real/runtime/safety.py)、[`control/publication.py`](../dexmani_real/control/publication.py)、[`deployment/contracts.py`](../dexmani_real/deployment/contracts.py)、[`deployment/coordinator.py`](../dexmani_real/deployment/coordinator.py)。
@@ -86,13 +87,13 @@ arm 初始化即启用运动、设置模式和运行状态；`DISARMED` 的语�
 
 | 状态 | 问题 | 当前代码事实与剩余边界 |
 | --- | --- | --- |
-| 已实施 | 观测历史并非时间对齐 | point cloud 是 reference timeline；每个 cloud 仅匹配 `source_time <= cloud_time` 且在 `max_observation_skew_s` 内的最新 arm/hand frame。数据不足、跨 camera generation 或超 skew 时不推理；不插值、不填充。 |
-| 已实施 | 观测窗口容量可小于配置/manifest 需求 | point-cloud deployment 按 horizon、camera FPS、arm/hand loop Hz、skew 与读取余量推导 state/point-cloud ring 容量；manifest `n_obs_steps` 必须等于 deployment horizon。最坏拷贝/调度预算仍应通过负载测试校准。 |
-| 已实施 | manifest 与 adapter 的模态声明不一致或仅因声明顺序不同而误拒绝 | DexMani real manifest 和 deployment config 现在都要求严格的 `joint_state + point_cloud`、`arm_qpos,hand_qpos,point_cloud` 合同；source manifest 会拒绝重复模态并规范化顺序，运行时以集合比较必需模态；adapter 只接受完整、对齐的窗口。 |
-| 数组转换可能静默改变整数语义 | `freeze_array` / action 合约在检查有限值后直接 cast；例如 `1.9` 可变成 `uint64(1)`，`0.5` 可变成 mask 值 `0`。 | 在转换前验证整型/布尔输入语义、范围和无损性；禁止依赖截断。 |
-| 时序字段语义混淆 | plan 的 `target_monotonic_ns` 表示期望执行时刻；发布候选时会重新生成 delivery target，worker 不做 not-before 等待。 | 区分“原始计划时刻”“可发送时刻”“命令过期时刻”，并按选择的控制策略明确执行。 |
+| 已实施 | 观测历史并非时间对齐，且可能混入上一次 run | 新 run epoch 后以因果截点前最新已过去的 policy tick 为窗口末端，在控制网格上选择严格递增且不复用的 cloud；每个 cloud 仅匹配 `source_time <= cloud_time` 且在 `max_observation_skew_s` 内的最新 arm/hand frame。数据不足、grid lag 过大、跨 camera generation 或超 skew 时不推理；不插值、不填充。point-cloud 历史最大读取年龄为 `max_input_age + (T-1)*dt + max_grid_lag`，state 还增加 `max_observation_skew`；最新源帧仍单独受 `max_input_age` 限制。 |
+| 已实施 | 观测窗口容量可小于配置/manifest 需求 | point-cloud deployment 按 horizon、控制周期、camera FPS、arm/hand loop Hz、最大输入年龄、grid lag、skew 与读取余量推导 state/point-cloud ring 容量；manifest `n_obs_steps` 必须等于 deployment horizon。最坏拷贝/调度预算仍应通过负载测试校准。 |
+| Real 侧已实施；Policy 生产端待完成 | manifest 与 adapter 的模态/数据域声明不一致 | DexMani runtime 要求严格的 `joint_state + point_cloud`、`arm_qpos,hand_qpos,point_cloud` 合同；checkpoint 还必须携带 Real Policy Zarr v4 数据合同，部署声明的 `task_name`、训练 `dt`、`obs[t]_before_action[t]`、点云 shape、算法、配置哈希与桌面平面逐项匹配 realtime worker。当前 policy checkpoint 尚不生产完整合同，因此会在硬件启动前拒绝；实施清单见 [`dexmani_policy_integration_followup.md`](dexmani_policy_integration_followup.md)。 |
+| 已实施 | 数组转换可能静默改变整数语义 | `freeze_array` 在 uint wire cast 前要求原输入为整数 dtype 且范围可表示；浮点 timestamp/mask 与负数到 uint 均 fail closed。 |
+| 已实施 | 时序字段语义混淆 | plan 的 `target_monotonic_ns` 保持原始策略网格端点；coupled command 另存 `scheduled_target_monotonic_ns` 与 worker delivery target。采纳时跳过无足够 lead 的旧端点，既不重戳 action chunk，也不掩盖其原始时刻。 |
 | 关键指标未闭环 | 定义了 observation skew、计划 age、stale/superseded 等指标，但部分路径不计量；推理异常或缺反馈也可能跳过指标刷新。 | 为每个拒绝、降级和异常路径定义指标；报警应依据实际采集的安全量。 |
-| home 的关闭可等待手动作完成 | operator home 对 hand 调用仅用 ESC 作为 abort，外部 `stop_event` 未直接进入该 abort 路径。 | 将 `stop_event` 纳入 home 的 abort 条件，并在关闭 IPC 前有界地终止 operator。 |
+| 已实施 | home 的关闭可等待手动作完成 | operator 的 hand/home 等待同时观察 `stop_event`、runtime shutdown、quit、fault 与软件急停；lifecycle 先有界 join operator，再关闭共享内存。若 operator 未退出，则先验证停止全部子进程并保留仍可能被线程访问的共享内存，不会先抛异常而遗留 hardware worker。普通 shutdown/fault 不再被错误升级为物理 e-stop 请求。 |
 | XHand 错误码的安全语义未被证明 | 某些通信/驱动错误码被视作“可读”或“发送成功”；`1501035` 被当作抓取接触。代码没有以任务阶段、触觉或电流条件限定。 | 以供应商错误码资料和实测证据建立白名单；将接触接受策略限制在明确任务阶段。 |
 | tracking error 仅为诊断量 | arm tracking error 被计算/记录，但没有部署侧拒绝或故障策略。 | 制定随时间的阈值、迟滞、持续时间及升级策略，或明确记录其不参与安全决策的风险接受。 |
 | 执行器与碰撞配置缺少硬上限 | hand 的 `kp`、`ki`、`kd`、`tor_max` 只校验正负，离线配置解析接受 `1_000_000`；`collision_sensitivity=0` 也可解析。 | 对设备 profile 建立额定安全上限、最小碰撞灵敏度和受审计的专家覆盖流程。 |
@@ -104,9 +105,9 @@ arm 初始化即启用运动、设置模式和运行状态；`DISARMED` 的语�
 - 审查初版曾证明 arm 越限、缺 hand chunk、point-cloud-only manifest 和超过固定 history 容量可通过旧合同；这些发现对应的路径已由本轮回归检查覆盖，现应 fail closed。
 - 构造 coupled record 的 IPC round-trip，确认 arm/hand payload、action ID、generation 与时效在同一记录中传递；hand 缺席会清除 hand worker 的待执行目标。
 - 用共享 `RLock`/`Value` 的替身验证非阻塞发布、sequence ticket 覆盖、`RUNNING → ARMED` 撤销、hand-only command 与定向取消；旧 generation 或旧 sequence 的 ticket 均不再 active。
-- 构造两条状态历史和两条 point-cloud 时间戳，确认只选择不晚于 cloud 的状态；超过 skew 的配对被拒绝。
-- 验证 strict manifest、按 horizon/skew 推导的 ring 容量、plan 不可延长截止时间，以及 arm worker 对越限/相邻命令异常跳变的拒绝。
-- 已执行 `python -m unittest discover -s tests -v`、`python -m compileall -q dexmani_real examples tests`、对命令边界定向文件的 `black --check --fast`、`isort --check-only` 和 `git diff --check`。这些只说明离线语法、格式和定向合同；不说明实时性、设备行为或安全性。
+- 构造 run epoch、状态历史和 point-cloud 时间戳，确认旧 run frame、重复 camera frame、晚于 grid 的 frame 与超过 skew 的配对均被拒绝。
+- 验证 strict manifest、real 侧对非自描述 checkpoint 的拒绝边界、按 horizon/skew/grid span 推导的 ring 容量、plan 因果时序/不可延长截止时间、过期前缀跳过，以及 arm worker 对越限/相邻命令异常跳变的拒绝。Policy 生产端的 round-trip 与跨仓正向 preflight 仍待后续完成。
+- 当前仓库离线回归命令与结果应以本次变更交接记录为准；这些检查只说明离线语法、格式和定向合同，不说明实时性、设备行为或安全性。
 
 ## 建议整改顺序与准入门槛
 

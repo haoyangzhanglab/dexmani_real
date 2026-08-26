@@ -44,6 +44,7 @@ class SafetyGateCommandDeltaTest(unittest.TestCase):
             action_id=1,
             created_monotonic_ns=1,
             target_monotonic_ns=2,
+            scheduled_target_monotonic_ns=1,
             valid_until_monotonic_ns=3,
             arm_qpos=np.full(7, 0.15),
             hand_qpos=np.full(12, 0.15),

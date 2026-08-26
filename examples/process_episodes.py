@@ -2,7 +2,7 @@
 """Usage: ``python examples/process_episodes.py INPUT_ROOT [--profile PROFILE]``.
 
 Offline CLI that audits and compacts one task's depth-to-color aligned raw-v22
-episodes into processed HDF5 v7 files, one per source episode.
+episodes into processed HDF5 v8 files, one per source episode.
 
 Directory mapping: ``episodes/<task>/episode_*`` (raw) is published to
 ``episodes_processed/<task>/episode_*.h5``.  Passing a single episode
@@ -12,7 +12,7 @@ mapping holds for one episode.
 Processing is two-pass.  A per-episode audit pass (a dry-run analysis per
 episode, progress on stderr via tqdm) decides accept or skip per episode.
 Episodes with serious problems — unreadable files, schema validation failure,
-hard row loss, or compaction that would create risky action jumps — are then
+hard row loss, or no source-contiguous segment long enough for training — are then
 automatically skipped with a warning and the reason.  The surviving batch is
 published in one transactional pass.  An episode whose annotation explicitly
 sets ``include: true`` is never auto-skipped: its rejection stays blocking and
@@ -49,7 +49,6 @@ from tqdm import tqdm
 
 from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.data.contracts import (
-    BridgePolicy,
     EpisodeAnnotation,
     OutputProfile,
     ProcessingConfig,
@@ -94,7 +93,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Audit and compact depth-to-color aligned raw-v22 Real episodes into one "
-            "processed-v7 "
+            "processed-v8 "
             "HDF5 per source; seriously broken episodes are skipped with a warning."
         )
     )
@@ -154,15 +153,6 @@ def _parser() -> argparse.ArgumentParser:
         help="Shorthand for --quality-policy strict.",
     )
     parser.add_argument(
-        "--bridge-policy",
-        choices=[policy.value for policy in BridgePolicy],
-        default=BridgePolicy.REJECT.value,
-        help=(
-            "reject (default) blocks compaction that creates an abrupt transition; "
-            "audit permits it only for an explicitly reviewed batch"
-        ),
-    )
-    parser.add_argument(
         "--abrupt-arm-step-rad",
         type=float,
         default=float(TemporalQualityConfig().abrupt_arm_step_rad),
@@ -211,7 +201,6 @@ def _config(
             abrupt_arm_step_rad=args.abrupt_arm_step_rad,
             abrupt_hand_step_rad=args.abrupt_hand_step_rad,
         ),
-        bridge_policy=BridgePolicy(args.bridge_policy),
         pointcloud=dataclasses.replace(
             runtime.pointcloud, num_points=args.pointcloud_num_points
         ),

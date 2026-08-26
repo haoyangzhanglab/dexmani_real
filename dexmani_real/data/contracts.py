@@ -55,13 +55,6 @@ class QualityPolicy(str, Enum):
     STRICT = "strict"
 
 
-class BridgePolicy(str, Enum):
-    """Handle a risky compacted transition without splitting the demonstration."""
-
-    AUDIT = "audit"
-    REJECT = "reject"
-
-
 @dataclass(frozen=True)
 class TemporalQualityConfig:
     """Resolved thresholds for conservative temporal anomaly detection.
@@ -171,7 +164,6 @@ class ProcessingConfig:
     temporal_quality: TemporalQualityConfig = field(
         default_factory=TemporalQualityConfig
     )
-    bridge_policy: BridgePolicy = BridgePolicy.REJECT
 
     @classmethod
     def from_runtime(
@@ -209,8 +201,6 @@ class ProcessingConfig:
             raise TypeError("profile must be an OutputProfile")
         if not isinstance(self.temporal_quality, TemporalQualityConfig):
             raise TypeError("temporal_quality must be a TemporalQualityConfig")
-        if not isinstance(self.bridge_policy, BridgePolicy):
-            raise TypeError("bridge_policy must be a BridgePolicy")
         if not isinstance(self.pointcloud, PointCloudConfig):
             raise TypeError("pointcloud must be a PointCloudConfig")
         positive_ints = (
@@ -315,7 +305,6 @@ class ProcessingConfig:
             "hand_action_limit_upper_rad": list(self.hand_action_limit_upper_rad),
             "tracking_error_warn_rad": self.tracking_error_warn_rad,
             "temporal_quality": self.temporal_quality.to_dict(),
-            "bridge_policy": self.bridge_policy.value,
         }
 
 
@@ -357,10 +346,17 @@ class EpisodeDecision:
     boundary_counts: dict[str, int]
     selected_frames: int
     quality: dict[str, Any]
-    bridge_findings: tuple[dict[str, Any], ...] = ()
+    source_gap_findings: tuple[dict[str, Any], ...] = ()
     temporal_quality: dict[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
     rejected_reason: str | None = None
+
+    @property
+    def segment_ends(self) -> np.ndarray:
+        """Exclusive compact-row ends for source-contiguous policy episodes."""
+        return build_source_segment_ends(
+            self.selected_indices, self.source_gap_findings
+        )
 
     @property
     def accepted(self) -> bool:
@@ -383,11 +379,30 @@ class EpisodeDecision:
             "dropped_frames": self.source_frames - self.selected_frames,
             "full_window_count": self.quality.get("full_window_count", 0),
             "selected_source_ranges": _indices_to_ranges(self.selected_indices),
-            "bridge_findings": list(self.bridge_findings),
+            "selected_segment_ends": self.segment_ends.tolist(),
+            "source_gap_findings": list(self.source_gap_findings),
             "quality": self.quality,
             "temporal_quality": self.temporal_quality,
             "warnings": list(self.warnings),
         }
+
+
+def build_source_segment_ends(
+    selected_indices: np.ndarray,
+    source_gap_findings: tuple[dict[str, Any], ...],
+) -> np.ndarray:
+    """Map source-row discontinuities to compact-array exclusive ends."""
+    selected = np.asarray(selected_indices, dtype=np.int64)
+    if selected.size == 0:
+        return np.empty(0, dtype=np.int64)
+    boundary_rows = {int(item["source_row_after"]) for item in source_gap_findings}
+    ends = [
+        compact_index
+        for compact_index, source_row in enumerate(selected)
+        if compact_index > 0 and int(source_row) in boundary_rows
+    ]
+    ends.append(int(selected.size))
+    return np.asarray(ends, dtype=np.int64)
 
 
 def _indices_to_ranges(indices: np.ndarray) -> list[list[int]]:

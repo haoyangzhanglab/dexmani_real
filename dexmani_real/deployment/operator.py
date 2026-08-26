@@ -32,7 +32,7 @@ from dexmani_real.robot_spec import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
-from dexmani_real.runtime.safety import SafetyState
+from dexmani_real.runtime.safety import SafetyState, revoke_motion
 from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.log import get_logger
 
@@ -75,14 +75,18 @@ def build_home_planner(runtime: ResolvedRuntimeConfig) -> XArm7MotionPlanner:
     )
 
 
-def _stop_to_armed(shared: RuntimeChannels) -> bool:
+def _stop_to_armed(
+    shared: RuntimeChannels,
+    *,
+    abort_requested,
+) -> bool:
     """Stop a RUNNING run and wait for the coordinator to return to ARMED."""
     if int(shared.safety_state.value) != int(SafetyState.RUNNING):
         return int(shared.safety_state.value) == int(SafetyState.ARMED)
     shared.stop_request.value = True
     deadline = time.monotonic() + _HOME_WAIT_ARMED_TIMEOUT_S
     while time.monotonic() < deadline:
-        if shared.estop_request.value or shared.error_state.value:
+        if abort_requested():
             return False
         if int(shared.safety_state.value) == int(SafetyState.ARMED):
             return True
@@ -96,18 +100,18 @@ def _home(
     runtime: ResolvedRuntimeConfig,
     deployment: DeploymentConfig,
     planner: XArm7MotionPlanner,
+    *,
+    abort_requested,
 ) -> None:
     """Stop the run (if any), then return hand + arm to home."""
-    if not _stop_to_armed(shared):
+    if not _stop_to_armed(shared, abort_requested=abort_requested):
         return
-    if shared.estop_request.value or shared.error_state.value:
+    if abort_requested():
         return
     arm_config = ArmLoopConfig.from_runtime(runtime)
 
     if deployment.hand_enabled:
-        hand_home = np.deg2rad(
-            np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)
-        )
+        hand_home = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
         accepted = publish_hand_home_and_wait_applied(
             shared,
             hand_home,
@@ -122,9 +126,9 @@ def _home(
             hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
             timeout_s=float(runtime.hand.home_command_ack_timeout_s),
             heartbeat=False,
-            check_is_running=False,
+            check_is_running=True,
             verbose=True,
-            abort_requested=lambda: bool(shared.estop_request.value),
+            abort_requested=abort_requested,
         )
         if not accepted:
             logger.warning("operator: hand home not accepted; arm home skipped")
@@ -137,6 +141,8 @@ def _home(
         planner=planner,
         config=ArmHomeConfig.from_runtime(runtime, publish_policy_heartbeat=False),
         table_z_surface_m=float(runtime.arm.table_z_surface_m),
+        # Only the physical e-stop path may latch ESTOP. Ordinary shutdown,
+        # faults, and quit requests are already observed by execute_arm_home.
         estop_requested=lambda: bool(shared.estop_request.value),
         progress=lambda message: print(f"  {message}", flush=True),
     )
@@ -181,8 +187,24 @@ def run_operator_control(
                 elif signal is ControlSignal.STOP:
                     shared.stop_request.value = True
                 elif signal is ControlSignal.HOME:
-                    _home(shared, runtime, deployment, planner)
+                    _home(
+                        shared,
+                        runtime,
+                        deployment,
+                        planner,
+                        abort_requested=lambda: bool(
+                            stop_event.is_set()
+                            or not shared.is_running.value
+                            or shared.quit_requested.value
+                            or shared.error_state.value
+                            or shared.estop_request.value
+                        ),
+                    )
                 elif signal is ControlSignal.QUIT:
+                    if not revoke_motion(shared, SafetyState.ARMED) and int(
+                        shared.safety_state.value
+                    ) != int(SafetyState.FAULT):
+                        shared.error_state.value = True
                     shared.quit_requested.value = True
                     return
                 elif signal is ControlSignal.EMERGENCY_STOP:

@@ -103,6 +103,9 @@ _COMMON_COMMAND_FIELDS = [
     ("observation_id", "<u8"),
     ("action_id", "<u8"),
     ("created_monotonic_ns", "<u8"),
+    # Policy-grid target retained for provenance even when publication occurs
+    # after that instant and the worker delivery target is immediate.
+    ("scheduled_target_monotonic_ns", "<u8"),
     ("target_monotonic_ns", "<u8"),
     ("valid_until_monotonic_ns", "<u8"),
     ("is_hold", "<u1"),
@@ -125,6 +128,8 @@ POLICY_PLAN_DTYPE = np.dtype(
         ("run_generation", "<u8"),
         ("observation_id", "<u8"),
         ("observation_anchor_monotonic_ns", "<u8"),
+        ("observation_latest_source_monotonic_ns", "<u8"),
+        ("observation_logical_step_monotonic_ns", "<u8"),
         ("inference_started_monotonic_ns", "<u8"),
         ("inference_finished_monotonic_ns", "<u8"),
         ("num_steps", "<u4"),

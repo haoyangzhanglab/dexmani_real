@@ -24,9 +24,12 @@ from dexmani_real.ipc.schema import SUPPORTED_POINT_CLOUD_COUNTS
 
 _POSITIVE_FLOAT_FIELDS = (
     "inference_hz",
-    "max_observation_age_s",
+    "max_input_age_s",
     "max_observation_skew_s",
+    "max_grid_lag_s",
     "max_plan_age_s",
+    "max_source_to_command_age_s",
+    "command_lead_s",
     "max_command_silence_s",
     "action_validity_s",
     "first_command_timeout_s",
@@ -39,23 +42,28 @@ class DeploymentConfig:
 
     ``runtime_target`` names the ``module:symbol`` :class:`PolicyRuntime`
     factory resolved by :mod:`dexmani_real.deployment.worker`; ``checkpoint`` /
-    ``model_config_path`` / ``device`` and the explicit ``observation_fields``
+    ``device`` and the explicit ``observation_fields``
     contract are the model-facing values that cross the deployment boundary
     (everything else model-internal stays in the model repository).
     """
 
     runtime_target: str = ""
     checkpoint: str | None = None
-    model_config_path: str | None = None
     device: str = "cpu"
+    # Operator-declared semantic task identity; the DexMani Policy adapter
+    # requires an exact match with the checkpoint training-data contract.
+    task_name: str = ""
     # Operator-declared action contract; validated against the checkpoint's
     # train_params at load time (mismatch fails closed, never coerces).
     action_key: str = "action"
     inference_hz: float = 10.0
-    observation_horizon: int = 4
-    max_observation_age_s: float = 0.5
+    observation_horizon: int = 2
+    max_input_age_s: float = 0.15
     max_observation_skew_s: float = 0.10
+    max_grid_lag_s: float = 0.08
     max_plan_age_s: float = 1.0
+    max_source_to_command_age_s: float = 0.75
+    command_lead_s: float = 0.01
     max_command_silence_s: float = 2.0
     action_validity_s: float = 0.5
     # Abort a RUNNING run that never produced its first command within this
@@ -65,21 +73,30 @@ class DeploymentConfig:
     # Comma-separated observation keys; the runtime supports point-cloud policies.
     observation_fields: str = "arm_qpos,hand_qpos,point_cloud"
     pointcloud_num_points: int = 1024
-    # Scheduler: number of plan steps to execute before admitting a replan.
-    replan_stride_steps: int = 8
-    use_ema: bool = True
 
     def __post_init__(self) -> None:
-        if self.observation_horizon <= 0:
-            raise ValueError("observation_horizon must be positive")
+        if (
+            isinstance(self.observation_horizon, bool)
+            or not isinstance(self.observation_horizon, int)
+            or self.observation_horizon <= 0
+        ):
+            raise ValueError("observation_horizon must be a positive integer")
         if self.action_key not in ("action", "action_ee"):
             raise ValueError("action_key must be 'action' or 'action_ee'")
-        if isinstance(self.replan_stride_steps, bool) or self.replan_stride_steps <= 0:
-            raise ValueError("replan_stride_steps must be a positive integer")
+        if not isinstance(self.task_name, str):
+            raise TypeError("task_name must be a string")
+        if self.task_name != self.task_name.strip():
+            raise ValueError("task_name must not have leading or trailing whitespace")
         for name in _POSITIVE_FLOAT_FIELDS:
             value = getattr(self, name)
             if not math.isfinite(float(value)) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        if self.command_lead_s >= self.max_source_to_command_age_s:
+            raise ValueError(
+                "command_lead_s must be smaller than max_source_to_command_age_s"
+            )
+        if not isinstance(self.hand_enabled, bool):
+            raise TypeError("hand_enabled must be a boolean")
         parse_observation_fields(self.observation_fields)
         if (
             isinstance(self.pointcloud_num_points, bool)
@@ -89,6 +106,54 @@ class DeploymentConfig:
                 "pointcloud_num_points must be one of "
                 f"{sorted(SUPPORTED_POINT_CLOUD_COUNTS)}"
             )
+
+
+@dataclass(frozen=True)
+class PolicyRuntimeConfig:
+    """Deployment config plus resolved sensor semantics visible to the model.
+
+    The deployment fields remain available through attribute forwarding so
+    existing ``PolicyRuntime`` factories keep a narrow, read-only config
+    surface. Sensor identity is populated by the lifecycle from the exact
+    config passed to the realtime point-cloud worker, never by user YAML.
+    """
+
+    deployment: DeploymentConfig
+    control_dt_s: float = 0.0
+    point_cloud_frame: str = ""
+    point_cloud_color_source: str = ""
+    point_cloud_policy_id: str = ""
+    point_cloud_config_sha256: str = ""
+    point_cloud_table_plane_abcd_json: str = ""
+    point_cloud_sampling: str = ""
+    point_cloud_transform: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.deployment, DeploymentConfig):
+            raise TypeError("deployment must be a DeploymentConfig")
+        if not math.isfinite(self.control_dt_s) or self.control_dt_s <= 0.0:
+            raise ValueError("control_dt_s must be finite and positive")
+        if "point_cloud" in parse_observation_fields(
+            self.deployment.observation_fields
+        ):
+            names = (
+                "point_cloud_frame",
+                "point_cloud_color_source",
+                "point_cloud_policy_id",
+                "point_cloud_config_sha256",
+                "point_cloud_table_plane_abcd_json",
+                "point_cloud_sampling",
+                "point_cloud_transform",
+            )
+            if any(not getattr(self, name) for name in names):
+                raise ValueError("point-cloud runtime semantics must be complete")
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            deployment = object.__getattribute__(self, "deployment")
+        except AttributeError as exc:
+            raise AttributeError(name) from exc
+        return getattr(deployment, name)
 
 
 DEFAULT_DEPLOYMENT_CONFIG = DeploymentConfig()
@@ -184,6 +249,12 @@ def resolve_deployment_config(
         file_overrides = data
 
     if isinstance(file_overrides.get("deployment"), Mapping):
+        sibling_keys = {str(key) for key in file_overrides} - {"deployment"}
+        if sibling_keys:
+            raise TypeError(
+                "deployment config wrapper has unknown sibling field(s): "
+                f"{sorted(sibling_keys)}"
+            )
         file_overrides = file_overrides["deployment"]
 
     merged = _merge(DEFAULT_DEPLOYMENT_CONFIG, file_overrides)

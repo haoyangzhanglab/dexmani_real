@@ -9,10 +9,10 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.data.contracts import (
-    BridgePolicy,
     EpisodeAnnotation,
     EpisodeDecision,
     ProcessingConfig,
+    build_source_segment_ends,
 )
 from dexmani_real.data.quality import assess_temporal_quality
 from dexmani_real.recording.reader import EpisodeReader
@@ -99,17 +99,33 @@ def _quality_summary(
     grid_dt_s: float,
     tracking_error_warn_rad: float,
     horizon: int,
+    segment_ends: np.ndarray,
 ) -> dict[str, Any]:
     action = np.concatenate((arrays["action_arm"], arrays["action_hand"]), axis=1)[
         selected
     ]
-    steps = np.diff(action, axis=0)
+    segment_starts = np.concatenate((np.asarray([0]), segment_ends[:-1]))
+    step_blocks = [
+        np.diff(action[start:end], axis=0)
+        for start, end in zip(segment_starts, segment_ends, strict=True)
+        if end - start >= 2
+    ]
+    steps = (
+        np.concatenate(step_blocks, axis=0)
+        if step_blocks
+        else np.empty((0, action.shape[1]), dtype=action.dtype)
+    )
     max_step = (
         np.max(np.abs(steps), axis=1) if steps.size else np.empty(0, dtype=np.float64)
     )
+    acceleration_blocks = [
+        np.diff(np.diff(action[start:end], axis=0) / grid_dt_s, axis=0) / grid_dt_s
+        for start, end in zip(segment_starts, segment_ends, strict=True)
+        if end - start >= 3
+    ]
     acceleration = (
-        np.diff(steps / grid_dt_s, axis=0) / grid_dt_s
-        if len(steps) >= 2
+        np.concatenate(acceleration_blocks, axis=0)
+        if acceleration_blocks
         else np.empty((0, 19), dtype=np.float64)
     )
     summary: dict[str, Any] = {
@@ -125,7 +141,12 @@ def _quality_summary(
             np.max(np.abs(acceleration), axis=1) if acceleration.size else np.empty(0)
         ),
         "idle_step_ratio": float(np.mean(max_step <= 1e-4)) if max_step.size else 1.0,
-        "full_window_count": max(0, int(len(selected)) - horizon + 1),
+        "full_window_count": int(
+            sum(
+                max(0, int(end - start) - horizon + 1)
+                for start, end in zip(segment_starts, segment_ends, strict=True)
+            )
+        ),
     }
     if "camera_age_s" in arrays:
         summary["camera_age_s"] = _finite_stats(arrays["camera_age_s"][selected])
@@ -136,7 +157,7 @@ def _quality_summary(
     return summary
 
 
-def _bridge_findings(
+def _source_gap_findings(
     arrays: Mapping[str, np.ndarray],
     selected: np.ndarray,
     reason_masks: Mapping[str, np.ndarray],
@@ -147,8 +168,7 @@ def _bridge_findings(
 ) -> tuple[dict[str, Any], ...]:
     """Audit every adjacency that differs from the original one-step grid.
 
-    Findings never create output segments.  ``BridgePolicy`` decides whether
-    the complete compacted episode is accepted or rejected.
+    Every finding becomes an episode boundary during policy export.
     """
 
     findings: list[dict[str, Any]] = []
@@ -199,7 +219,7 @@ def _bridge_findings(
                 "max_arm_action_delta_rad": arm_delta,
                 "max_hand_action_delta_rad": hand_delta,
                 "removed_reasons": sorted(set(removed_reasons)),
-                "risky": risky,
+                "abrupt_or_irregular": risky,
             }
         )
     return tuple(findings)
@@ -423,7 +443,7 @@ def analyze_episode(
     keep_mask = base_valid & ~temporal_assessment.excluded_mask
     selected = np.flatnonzero(keep_mask).astype(np.int64)
     bits, reason_names = _reason_bits(reason_masks, temporal_assessment.excluded_mask)
-    bridges = _bridge_findings(
+    source_gaps = _source_gap_findings(
         arrays,
         selected,
         reason_masks,
@@ -431,11 +451,10 @@ def analyze_episode(
         config,
         grid_dt_s=timing.grid_dt_s,
     )
-    risky_bridges = [item for item in bridges if bool(item["risky"])]
     warnings: list[str] = []
-    if risky_bridges:
+    if source_gaps:
         warnings.append(
-            f"row compaction creates {len(risky_bridges)} risky transition(s)"
+            f"policy export will split {len(source_gaps)} source discontinuity boundary(s)"
         )
     frame_ok = arrays["frame_status"] == 0
     if np.count_nonzero(frame_ok & ~_as_bool(reader, "flag_ik_ok")) > frame_count // 2:
@@ -446,27 +465,23 @@ def analyze_episode(
     ):
         warnings.append("flag_retarget_ok conflicts with mostly-OK frame_status")
 
-    rejected_reason: str | None = None
-    if len(selected) < config.min_episode_frames:
-        rejected_reason = (
-            f"compact episode has {len(selected)} frames; requires "
-            f"{config.min_episode_frames}"
-        )
-    elif risky_bridges and config.bridge_policy is BridgePolicy.REJECT:
-        rejected_reason = (
-            f"row compaction creates {len(risky_bridges)} risky transition(s); "
-            "use bridge_policy=audit only after manual review"
-        )
-
+    segment_ends = build_source_segment_ends(selected, source_gaps)
     quality = _quality_summary(
         arrays,
         selected,
         grid_dt_s=timing.grid_dt_s,
         tracking_error_warn_rad=config.tracking_error_warn_rad,
         horizon=config.horizon,
+        segment_ends=segment_ends,
     )
-    quality["bridge_count"] = len(bridges)
-    quality["risky_bridge_count"] = len(risky_bridges)
+    quality["source_gap_count"] = len(source_gaps)
+    quality["segment_count"] = len(segment_ends)
+    rejected_reason: str | None = None
+    if quality["full_window_count"] < config.min_full_windows:
+        rejected_reason = (
+            f"source-contiguous segments provide {quality['full_window_count']} "
+            f"full windows; requires {config.min_full_windows}"
+        )
     return EpisodeDecision(
         source_path=reader.h5_path,
         source_frames=frame_count,
@@ -484,7 +499,7 @@ def analyze_episode(
         },
         selected_frames=int(len(selected)),
         quality=quality,
-        bridge_findings=bridges,
+        source_gap_findings=source_gaps,
         temporal_quality=temporal_assessment.to_dict(config.temporal_quality.policy),
         warnings=tuple(warnings),
         rejected_reason=rejected_reason,

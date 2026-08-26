@@ -51,7 +51,12 @@ from dexmani_real.robot_spec import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
-from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
+from dexmani_real.runtime.safety import (
+    SafetyState,
+    begin_motion,
+    read_run_epoch,
+    revoke_motion,
+)
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -134,61 +139,94 @@ def _adoptable(
     last_observation_id: int,
     now_ns: int,
     max_plan_age_ns: int,
-    max_observation_age_ns: int,
-) -> tuple[bool, str]:
+    max_source_to_command_age_ns: int,
+    command_lead_ns: int,
+) -> tuple[bool, str, int]:
     """Adoption gate for a fresh plan record. Any failure drops it."""
     if int(rec["run_generation"]) != current_generation:
-        return False, "generation mismatch"
-    if int(rec["observation_id"]) < last_observation_id:
-        return False, "stale observation"
+        return False, "generation mismatch", 0
+    if int(rec["plan_id"]) <= 0 or int(rec["observation_id"]) <= 0:
+        return False, "invalid plan identity", 0
+    if int(rec["observation_id"]) <= last_observation_id:
+        return False, "stale observation", 0
     deadline_ns = _plan_deadline_ns(
         rec,
         max_plan_age_ns=max_plan_age_ns,
-        max_observation_age_ns=max_observation_age_ns,
+        max_source_to_command_age_ns=max_source_to_command_age_ns,
     )
     if deadline_ns is None:
-        return False, "invalid plan timestamps"
+        return False, "invalid plan timestamps", 0
     if now_ns >= deadline_ns:
-        return False, "plan or observation expired"
+        return False, "plan or observation expired", 0
     n = int(rec["num_steps"])
     if n <= 0 or n > MAX_POLICY_CHUNK_STEPS:
-        return False, "bad num_steps"
+        return False, "bad num_steps", 0
     mask = rec["valid_mask"][:n]
     if not np.all((mask == 0) | (mask == 1)):
-        return False, "bad valid_mask"
+        return False, "bad valid_mask", 0
     if int(rec["hand_present"]) != 1:
-        return False, "learned-policy plan omits required hand target"
-    return True, ""
+        return False, "learned-policy plan omits required hand target", 0
+    arm_present = int(rec["arm_present"])
+    ee_present = int(rec["ee_present"])
+    if (arm_present, ee_present) not in ((1, 0), (0, 1)):
+        return False, "plan must contain exactly one arm representation", 0
+    targets = np.asarray(rec["target_monotonic_ns"][:n], dtype=np.uint64)
+    if n > 1 and not bool(np.all(targets[1:] > targets[:-1])):
+        return False, "non-increasing target timeline", 0
+    not_before_ns = now_ns + int(command_lead_ns)
+    future = np.flatnonzero(
+        (np.asarray(mask, dtype=np.uint8) == 1)
+        & (targets > not_before_ns)
+        & (targets < deadline_ns)
+    )
+    if future.size == 0:
+        return False, "no future endpoint inside plan deadline", 0
+    valid = np.flatnonzero(np.asarray(mask, dtype=np.uint8) == 1)
+    if not bool(np.all(np.isfinite(rec["hand_qpos"][:n][valid]))):
+        return False, "non-finite hand endpoint", 0
+    arm_fields = ("arm_qpos",) if arm_present else ("ee_pos", "ee_rot6d")
+    if any(
+        not bool(np.all(np.isfinite(rec[field][:n][valid]))) for field in arm_fields
+    ):
+        return False, "non-finite arm endpoint", 0
+    return True, "", int(future[0])
 
 
 def _plan_deadline_ns(
     rec,
     *,
     max_plan_age_ns: int,
-    max_observation_age_ns: int,
+    max_source_to_command_age_ns: int,
 ) -> int | None:
     """Return the immutable expiry shared by a plan and its source observation."""
     finished_ns = int(rec["inference_finished_monotonic_ns"])
+    started_ns = int(rec["inference_started_monotonic_ns"])
+    source_ns = int(rec["observation_latest_source_monotonic_ns"])
+    logical_ns = int(rec["observation_logical_step_monotonic_ns"])
     anchor_ns = int(rec["observation_anchor_monotonic_ns"])
-    if finished_ns <= 0 or anchor_ns <= 0:
+    if (
+        finished_ns <= 0
+        or started_ns <= 0
+        or source_ns <= 0
+        or logical_ns <= 0
+        or anchor_ns <= 0
+        or not source_ns <= logical_ns <= anchor_ns <= started_ns <= finished_ns
+    ):
         return None
     return min(
         finished_ns + int(max_plan_age_ns),
-        anchor_ns + int(max_observation_age_ns),
+        source_ns + int(max_source_to_command_age_ns),
     )
 
 
-def _ready_to_replan(active_plan, next_step: int, stride: int) -> bool:
+def _ready_to_replan(active_plan, next_step: int) -> bool:
     """Whether a new plan may be admitted (adopt/promote) this tick.
 
-    True when there is no active plan, when the stride of steps has been served,
-    or when the active plan is fully consumed (``next_step`` reached its step
-    count) — the last case keeps a plan shorter than the stride from stalling
-    the scheduler.
+    True when there is no active plan or its endpoint array is consumed.
     """
     if active_plan is None:
         return True
-    return next_step >= stride or next_step >= int(active_plan["num_steps"])
+    return next_step >= int(active_plan["num_steps"])
 
 
 def _select_due_step(
@@ -309,10 +347,12 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
 
     period_s = 1.0 / float(config.control_hz)
     max_plan_age_ns = int(config.deployment.max_plan_age_s * 1e9)
-    max_observation_age_ns = int(config.deployment.max_observation_age_s * 1e9)
+    max_source_to_command_age_ns = int(
+        config.deployment.max_source_to_command_age_s * 1e9
+    )
+    command_lead_ns = int(config.deployment.command_lead_s * 1e9)
     max_silence_ns = int(config.deployment.max_command_silence_s * 1e9)
     first_command_timeout_ns = int(config.deployment.first_command_timeout_s * 1e9)
-    replan_stride_steps = int(config.deployment.replan_stride_steps)
 
     active_plan = None
     active_plan_id = 0
@@ -333,6 +373,11 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
             tick_start = time.monotonic()
             now_ns = time.monotonic_ns()
             shared.set_heartbeat("policy", time.monotonic())
+
+            if bool(shared.quit_requested.value):
+                if int(shared.safety_state.value) == int(SafetyState.RUNNING):
+                    _end_policy_run(shared, "operator quit", abort=False)
+                return
 
             if bool(shared.error_state.value) or bool(shared.estop_request.value):
                 _sleep_tick(period_s, tick_start)
@@ -364,7 +409,14 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 last_adopted_observation_id = 0
                 next_step = 0
                 last_valid_policy_command_ns = None
-                run_started_ns = time.monotonic_ns()
+                run_epoch = read_run_epoch(shared)
+                if (
+                    run_epoch.generation != int(shared.run_generation.value)
+                    or run_epoch.started_monotonic_ns <= 0
+                ):
+                    _end_policy_run(shared, "invalid run epoch", abort=True)
+                    continue
+                run_started_ns = run_epoch.started_monotonic_ns
                 previous_arm_command_qpos = None
                 previous_hand_command_qpos = None
                 _sleep_tick(period_s, tick_start)
@@ -413,54 +465,55 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
             if rec is not None:
                 rec_id = int(rec["plan_id"])
                 if rec_id != active_plan_id and rec_id != pending_plan_id:
-                    ok, reason = _adoptable(
+                    ok, reason, first_future_step = _adoptable(
                         rec,
                         current_generation=int(shared.run_generation.value),
                         last_observation_id=last_adopted_observation_id,
                         now_ns=now_ns,
                         max_plan_age_ns=max_plan_age_ns,
-                        max_observation_age_ns=max_observation_age_ns,
+                        max_source_to_command_age_ns=max_source_to_command_age_ns,
+                        command_lead_ns=command_lead_ns,
                     )
                     if ok:
-                        if _ready_to_replan(
-                            active_plan, next_step, replan_stride_steps
-                        ):
-                            # No active plan, the stride is served, or the plan is
-                            # consumed: adopt now (supersede any held plan).
+                        if _ready_to_replan(active_plan, next_step):
+                            # No active plan or all of its endpoints were consumed.
                             active_plan = rec
                             active_plan_id = rec_id
                             last_adopted_observation_id = int(rec["observation_id"])
-                            next_step = 0
+                            next_step = first_future_step
                             pending_plan = None
                             pending_plan_id = 0
                         else:
                             # Hold the newest plan (latest wins) and promote it
                             # once ready, so a mid-plan replan never opens a
-                            # command gap (plan §8).
+                            # command gap.
                             pending_plan = rec
                             pending_plan_id = rec_id
                     else:
                         logger.debug("coordinator: plan %d dropped: %s", rec_id, reason)
 
             # Promote a held plan once the active plan is done enough.
-            if pending_plan is not None and _ready_to_replan(
-                active_plan, next_step, replan_stride_steps
-            ):
-                ok, reason = _adoptable(
+            if pending_plan is not None and _ready_to_replan(active_plan, next_step):
+                ok, reason, first_future_step = _adoptable(
                     pending_plan,
                     current_generation=int(shared.run_generation.value),
                     last_observation_id=last_adopted_observation_id,
                     now_ns=now_ns,
                     max_plan_age_ns=max_plan_age_ns,
-                    max_observation_age_ns=max_observation_age_ns,
+                    max_source_to_command_age_ns=max_source_to_command_age_ns,
+                    command_lead_ns=command_lead_ns,
                 )
                 if ok:
                     active_plan = pending_plan
                     active_plan_id = pending_plan_id
                     last_adopted_observation_id = int(pending_plan["observation_id"])
-                    next_step = 0
+                    next_step = first_future_step
                 pending_plan = None
                 pending_plan_id = 0
+
+            if active_plan is not None and next_step >= int(active_plan["num_steps"]):
+                active_plan = None
+                active_plan_id = 0
 
             if active_plan is None:
                 _sleep_tick(period_s, tick_start)
@@ -469,7 +522,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
             plan_deadline_ns = _plan_deadline_ns(
                 active_plan,
                 max_plan_age_ns=max_plan_age_ns,
-                max_observation_age_ns=max_observation_age_ns,
+                max_source_to_command_age_ns=max_source_to_command_age_ns,
             )
             if plan_deadline_ns is None or now_ns >= plan_deadline_ns:
                 active_plan = None
@@ -512,7 +565,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
 
             _arm_state = read_arm_state_dict(shared)
             if int(active_plan["ee_present"]) == 1:
-                # EE -> joint via collision-aware IK (plan §14.2 decision 3).
+                # EE -> joint via collision-aware IK.
                 # hand_qpos is loaded into the collision model first so the solve
                 # sees the full 19-DoF geometry.
                 if _arm_state is None or not np.all(np.isfinite(_arm_state["qpos"])):
@@ -572,6 +625,9 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 observation_id=int(active_plan["observation_id"]),
                 observation_anchor_monotonic_ns=int(
                     active_plan["observation_anchor_monotonic_ns"]
+                ),
+                scheduled_target_monotonic_ns=int(
+                    active_plan["target_monotonic_ns"][selected]
                 ),
                 action_validity_s=float(config.deployment.action_validity_s),
                 valid_until_monotonic_ns=plan_deadline_ns,

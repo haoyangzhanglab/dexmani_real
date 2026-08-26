@@ -26,13 +26,15 @@ from dexmani_real.ipc.schema import (
 class InferenceContext:
     """Timing/identity context passed to ``PolicyRuntime.predict``.
 
-    Field shape is design latitude; these six suffice for generation checks and
-    metric timing.
+    The causal cut, latest physical source time, and logical control-grid step
+    are distinct: conflating them hides sensor age and shifts action timing.
     """
 
     run_generation: int
     observation_id: int
     observation_anchor_monotonic_ns: int
+    observation_latest_source_monotonic_ns: int
+    observation_logical_step_monotonic_ns: int
     inference_started_monotonic_ns: int
     inference_finished_monotonic_ns: int
     step_dt_ns: int
@@ -43,14 +45,30 @@ class InferenceContext:
         if (
             min(
                 self.observation_anchor_monotonic_ns,
+                self.observation_latest_source_monotonic_ns,
+                self.observation_logical_step_monotonic_ns,
                 self.inference_started_monotonic_ns,
                 self.inference_finished_monotonic_ns,
             )
             <= 0
         ):
             raise ValueError("context timestamps must be positive")
-        if self.inference_started_monotonic_ns > self.inference_finished_monotonic_ns:
-            raise ValueError("inference finish precedes start")
+        if not (
+            self.observation_latest_source_monotonic_ns
+            <= self.observation_logical_step_monotonic_ns
+            <= self.observation_anchor_monotonic_ns
+        ):
+            raise ValueError(
+                "observation time order must be source <= logical step <= causal cut"
+            )
+        if not (
+            self.observation_anchor_monotonic_ns
+            <= self.inference_started_monotonic_ns
+            <= self.inference_finished_monotonic_ns
+        ):
+            raise ValueError(
+                "inference time order must be causal cut <= start <= finish"
+            )
         if self.step_dt_ns <= 0:
             raise ValueError("step_dt_ns must be positive")
 
@@ -62,7 +80,7 @@ class JointActionChunk:
     Exactly one of ``arm_qpos`` (joint, ``[N,7]`` rad) or ``ee_pos``/``ee_rot6d``
     (EE, ``[N,3]`` pos + ``[N,6]`` rot6d) is present; an EE chunk leaves
     ``arm_qpos`` as None and is resolved to joint space by the coordinator's
-    IK dispatch (plan §14.2 decision 3).  ``hand_qpos`` is None when the policy
+    IK dispatch. ``hand_qpos`` is None when the policy
     does not command the hand.  ``target_monotonic_ns`` holds strictly
     increasing intended execution timestamps; ``valid_mask[i] == 0`` marks a
     step to skip.

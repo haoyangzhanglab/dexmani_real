@@ -188,16 +188,15 @@ def supervisor_exit_reason(
     return ExitReason.NONE
 
 
-def shutdown_processes_verified(
+def stop_processes_verified(
     shared: Any,
     processes: Iterable[Any],
     *,
     graceful_timeout_s: float = 5.0,
     terminate_timeout_s: float = 1.0,
     kill_timeout_s: float = 1.0,
-    disarm_if_clean: bool = False,
-) -> ShutdownReport:
-    """Join workers, finalize safety from their terminal state, then close IPC."""
+) -> tuple[ProcessExit, ...]:
+    """Stop every worker without closing IPC that another local thread may use."""
     procs = list(processes)
     shared.is_running.value = False
     exits: list[ProcessExit] = []
@@ -227,6 +226,28 @@ def shutdown_processes_verified(
         exits.append(ProcessExit(process.name, process.exitcode, escalation))
 
     frozen_exits = tuple(exits)
+    logger.info("verified process stop: %s", frozen_exits)
+    return frozen_exits
+
+
+def shutdown_processes_verified(
+    shared: Any,
+    processes: Iterable[Any],
+    *,
+    graceful_timeout_s: float = 5.0,
+    terminate_timeout_s: float = 1.0,
+    kill_timeout_s: float = 1.0,
+    disarm_if_clean: bool = False,
+) -> ShutdownReport:
+    """Stop workers, finalize safety from their terminal state, then close IPC."""
+    frozen_exits = stop_processes_verified(
+        shared,
+        processes,
+        graceful_timeout_s=graceful_timeout_s,
+        terminate_timeout_s=terminate_timeout_s,
+        kill_timeout_s=kill_timeout_s,
+    )
+
     error_latched, estop_requested, safety_state = _finalize_shutdown_state(
         shared,
         frozen_exits,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/visualize_episode_processed.py PROCESSED.h5 [--info] [--max-frames N]``.
 
-Self-contained Rerun-based visualizer for processed HDF5 v7
+Self-contained Rerun-based visualizer for processed HDF5 v8
 (``dexmani-real-processed-hdf5``) artifacts written by
 ``examples/process_episodes.py``.  Offline only: connects to no hardware, writes
 no files; opens a Rerun viewer window (or prints a structure summary with
@@ -65,7 +65,7 @@ _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
 
 _FINGER_NAMES: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
 
-# Processed core modalities are fixed by the v7 contract: joint_state/action are
+# Processed core modalities are fixed by the v8 contract: joint_state/action are
 # arm (7) + hand (12), action_ee is eef_position (3) + eef_rot6d (6) + hand (12),
 # and contact_force is one native-axis 3-vector per finger.
 _ARM_JOINT_LABELS = tuple(f"arm_j{i}" for i in range(7))
@@ -264,7 +264,7 @@ def print_episode_info(h5_path: str) -> None:
 
 
 class ProcessedEpisodeVisualizer:
-    """Load a processed HDF5 v7 file and stream it into Rerun for interactive viewing."""
+    """Load a processed HDF5 v8 file and stream it into Rerun for interactive viewing."""
 
     def __init__(
         self,
@@ -281,7 +281,7 @@ class ProcessedEpisodeVisualizer:
                 != PROCESSED_SCHEMA_VERSION
             ):
                 raise ValueError(
-                    f"{self._h5_path.name} is not a processed HDF5 v7 artifact"
+                    f"{self._h5_path.name} is not a processed HDF5 v8 artifact"
                 )
             self._keys = _present_keys(self._h5f)
             if "joint_state" not in self._keys and "action" not in self._keys:
@@ -536,7 +536,7 @@ class ProcessedEpisodeVisualizer:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Visualize processed DexMani HDF5 v7 episodes with Rerun 3D."
+        description="Visualize processed DexMani HDF5 v8 episodes with Rerun 3D."
     )
     parser.add_argument(
         "episode",

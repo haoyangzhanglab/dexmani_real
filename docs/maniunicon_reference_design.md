@@ -60,7 +60,8 @@ DexMani 已将两条命令通道替换为一个面向执行层的不可变 coupl
 coordinator
   -> COUPLED_COMMAND_DTYPE {
        run_generation, observation_id, action_id,
-       created_monotonic_ns, target_monotonic_ns, valid_until_monotonic_ns,
+       created_monotonic_ns, scheduled_target_monotonic_ns,
+       target_monotonic_ns, valid_until_monotonic_ns,
        arm_present, hand_present, arm_qpos[7], hand_qpos[12]
      }
   -> ring write returns ring_sequence
@@ -118,7 +119,9 @@ checkpoint 对象跨进程传递。DexMani 的 `load_policy_runtime()` 已采用
   预期的无效模型输出可按既有语义丢弃，并由 command-silence watchdog 收敛；
 - `close()` 是清理路径，不得被当作已证明的安全停机。当前实现记录其异常；若未来需要把
   清理失败作为部署失败，应由 shutdown report 显式承载；
-- checkpoint、模型配置和 runtime 配置的 hash 写入一次性 provenance 日志；
+- checkpoint 和 runtime 配置的 hash 写入一次性 provenance 日志；模型 resolved inference
+  config 与训练数据合同必须内嵌在 checkpoint 中，不接受运行时第二份模型 YAML；Real
+  部署逐项比较训练 `dt`、点云配置/桌面平面与 realtime worker；
 - 不添加“加载失败则 fake policy 接管”的降级路径。
 
 ### 4. 受约束地试验 real-time chunk conditioning
@@ -176,7 +179,7 @@ ManiUniCon 的 `PoseTrajectoryInterpolator` 使用位置线性插值和旋转 Sl
 | single coupled command record + active sequence ticket | 完整记录提交思想 | arm/hand 跨帧混合、覆盖后迟到执行 | 已实施（IPC）；不等于 physical ACK |
 | 容量推导与启动门禁 | ring 容量公式 | `nobs` 与固定 history 容量不一致 | 已实施；仍须压力测量读取预算 |
 | 跨模态对齐 adapter | ManiUniCon 的缺口反例 | count-aligned、非 timestamp-aligned history | 已实施：point-cloud 时间线上的因果最近邻 + skew 拒绝 |
-| active plan 每端点过期复核 | ManiUniCon 的 stale 重排反例 | 已采纳计划继续执行旧观测端点 | 已实施：不可延长 plan/observation deadline |
+| active plan 每端点过期复核 | ManiUniCon 的 stale 重排反例 | 已采纳计划继续执行旧观测端点 | 已实施：跳过过期前缀；不可延长 plan/source deadline；保留原始 scheduled target |
 | chunk conditioning | 模型连续性机制 | 可能的重推理抖动 | 实验性，不得阻塞安全整改 |
 | 插补候选器 | 纯几何辅助 | 未来 EE 连续性需求 | 实验性，不得绕过 gate |
 

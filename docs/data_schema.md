@@ -1,7 +1,7 @@
 # Real 数据集 schema 参考
 
-本文是 DexMani Real 持久化数据的字段参考，覆盖 raw HDF5 v22、processed HDF5 v7
-与 Policy Zarr v3。运行行为和精确校验仍以
+本文是 DexMani Real 持久化数据的字段参考，覆盖 raw HDF5 v22、processed HDF5 v8
+与 Policy Zarr v4。运行行为和精确校验仍以
 [`recording/schema.py`](../dexmani_real/recording/schema.py)、
 [`data/process.py`](../dexmani_real/data/process.py) 与
 [`data/export.py`](../dexmani_real/data/export.py) 为准。
@@ -13,8 +13,8 @@
 
 - [约定与数据流](#约定与数据流)
 - [raw episode HDF5 v22](#1-raw-episode-hdf5-v22)
-- [processed HDF5 v7](#2-processed-hdf5-v7)
-- [Policy Zarr v3](#3-policy-zarr-v3)
+- [processed HDF5 v8](#2-processed-hdf5-v8)
+- [Policy Zarr v4](#3-policy-zarr-v4)
 - [字段映射摘要](#字段映射摘要)
 - [读取与训练注意事项](#读取与训练注意事项)
 
@@ -25,10 +25,10 @@ episodes/<task>/episode_*          raw v22 directory
     data.h5 + depth.h5 + rgb.mp4
                 │ process_episodes.py
                 ▼
-episodes_processed/<task>/*.h5     processed v7, one file per episode
+episodes_processed/<task>/*.h5     processed v8, one file per raw episode
                 │ export_policy_zarr.py
                 ▼
-dataset/<task>.zarr                Policy Zarr v3, one profile per store
+dataset/<task>.zarr                Policy Zarr v4, one profile per store
 ```
 
 - `N` 是单个 raw 或 processed episode 的帧数；`T` 是 Zarr 中全部 episode 的总帧数；
@@ -60,7 +60,7 @@ native depth 网格；下列相机语义只适用于 v22。
 ### 处理前提
 
 raw v22 可以是 `meta.arm_sent_stream=False` 的有效录制；这时
-`/action_arm_joint_sent` 合法地不存在。但当前 processed v7 writer 无条件以该字段生成
+`/action_arm_joint_sent` 合法地不存在。但当前 processed v8 writer 无条件以该字段生成
 `/action[:,:7]`，所以要生成 processed HDF5 或 Policy Zarr，原始 episode **必须**有
 `meta.arm_sent_stream=True` 与 `/action_arm_joint_sent`。这是处理链的输入前提，不是 raw
 schema 的通用必填条件。
@@ -168,14 +168,18 @@ schema 的通用必填条件。
 | `camera_T_eef_from_depth` | float64-like `(16,)` | calibration 提供 EEF-camera 外参时写入。 |
 | `camera_type`、`camera_calibration_source_optical_frame` | string | calibration 与 camera name 可解析时写入；后者固定为 `camera_color_optical`。 |
 
-## 2. processed HDF5 v7
+## 2. processed HDF5 v8
 
 processed 文件是 `episodes_processed/<task>/*.h5`。它从 raw v22 选择、清洗和压紧行；其
 `N` 因此不一定等于 raw 的 `num_frames`。它用于离线训练、导出与可视化；物理回放可将其作为
 保留 raw 行的 provenance 清单，但绝不发送其 `float32` 动作。回放必须在 `source_path` 找到并
 校验原始 `data.h5` hash，再从 raw episode 读取精确已发送命令和完整模型 provenance。根 attrs
 必须满足：
-`schema_name=dexmani-real-processed-hdf5`、`schema_version=7`、`domain=real`。
+`schema_name=dexmani-real-processed-hdf5`、`schema_version=8`、`domain=real`。
+
+删除无效 raw 行可能使压紧数组包含多个 source 连续段。v8 不把缺口两侧伪装成相邻时间步：
+`source_segment_ends` 明确记录每段边界，质量窗口只在段内计数，Policy Zarr 导出时每段成为
+独立 episode。一个 processed 文件仍对应一个 raw episode，但不一定只对应一个训练 episode。
 
 它只接受通过 raw reader 校验的 v22 episode，并适用前述 `arm_sent_stream` 前提；RGB 与
 点云 profile 还要求 raw RGB-D 几何、depth scale 与 `T_xarm_base_from_color` 完整有效。
@@ -212,6 +216,7 @@ processed 文件是 `episodes_processed/<task>/*.h5`。它从 raw v22 选择、�
 | `/provenance/source_row_index` | `(N,)` | int64 | processed row 对应的 raw grid row。 |
 | `/provenance/source_sample_index` | `(N,)` | int64 | 对应 raw source sample。 |
 | `/provenance/source_timestamp_s` | `(N,)` | float64 | 对应保留 raw grid row 的 `/timestamp`（逻辑控制网格时间，s）；**不是** raw `/source_timestamp` 的 producer sample 时间。 |
+| `/provenance/source_segment_ends` | `(S,)` | int64 | 各 source 连续段在 processed 紧凑数组中的累积结束下标（exclusive）；严格递增，末值为 `N`。连续性同时要求 raw row/source sample 各加一且 timestamp 差为 `dt`（允许记录的容差）。 |
 | `/provenance/source_keep_mask` | `(source_frames,)` | bool | 所有 raw row 的保留掩码。 |
 | `/provenance/source_drop_reason_bits` | `(source_frames,)` | uint64 | 每个 raw row 的拒绝原因位图；位名在 provenance attrs。 |
 
@@ -222,8 +227,8 @@ processed 文件是 `episodes_processed/<task>/*.h5`。它从 raw v22 选择、�
 
 | 分组 | keys | 类型 / shape | 固定值或语义 |
 |---|---|---|---|
-| schema 与来源 | `schema_name`、`schema_version`、`domain`、`source_format`、`source_schema_version`、`source_episode`、`source_frames` | string / int | `dexmani-real-processed-hdf5`、`7`、`real`，以及 raw 输入身份。 |
-| 长度与训练标签 | `profile`、`episode_steps`、`dt`、`time_semantics`、`obs_alignment`、`task_name`、`action_dim`、`action_ee_dim`、`action_space` | string / int / float | profile、压紧后长度、logical-control-grid 语义、`obs[t]_before_action[t]`、任务名、`19`、`21`、`joint`。 |
+| schema 与来源 | `schema_name`、`schema_version`、`domain`、`source_format`、`source_schema_version`、`source_episode`、`source_frames` | string / int | `dexmani-real-processed-hdf5`、`8`、`real`，以及 raw 输入身份。 |
+| 长度与训练标签 | `profile`、`episode_steps`、`dt`、`time_semantics`、`source_contiguity`、`source_contiguity_tolerance_s`、`obs_alignment`、`task_name`、`action_dim`、`action_ee_dim`、`action_space` | string / int / float | profile、压紧后长度、段边界 provenance 与容差、`obs[t]_before_action[t]`、任务名、`19`、`21`、`joint`。 |
 | Real core 语义 | `fingertip_points_frame`、`fingertip_points_unit`、`action_ee_frame`、`action_ee_components`、`contact_force_source`、`contact_force_unit`、`contact_force_si_verified`、`contact_force_frame`、`frame_compatibility_with_sim_world` | string / bool | xarm-base 位置与 EEF frame；指尖单位 m；tactile 的来源、单位和原生轴；最后一项固定为 `False`。 |
 | 处理与审计 | `processing_config_json`、`quality_summary_json`、`source_decision_json`、`source_member_sha256_json`、`source_resolved_config_sha256` | JSON string / string | 处理配置、选择/拒绝结论、三个 raw 成员哈希与录制配置哈希。 |
 | RGB-D（仅 RGB/RGB-PC） | `rgb_transform`、`depth_transform`、`depth_unit`、`depth_scale_m_per_unit`、`depth_invalid_value`、`camera_intrinsic_semantics`、`camera_extrinsic_semantics` | string / float / int | 无裁剪 resize、aligned depth 的 nearest resize、depth 单位与无效值 `0`、K/T 语义。 |
@@ -236,7 +241,7 @@ processed 文件是 `episodes_processed/<task>/*.h5`。它从 raw v22 选择、�
 浮点数据必须有限；processed validator 还检查 depth 非全零、K、刚体外参、点云 RGB 范围和
 非零几何，以及 profile/config/provenance 的完整性。
 
-## 3. Policy Zarr v3
+## 3. Policy Zarr v4
 
 Zarr 是同一 `task_name`、同一 profile、同一 `dt`、同一 tail shape/dtype 与同一 Real
 语义 attrs 的 processed episode 拼接结果：
@@ -252,7 +257,7 @@ Zarr 是同一 `task_name`、同一 profile、同一 `dt`、同一 tail shape/dt
 | 路径 | shape | dtype | 语义 |
 |---|---:|---|---|
 | `/data/<key>` | `(T, *processed_tail_shape)` | 与 processed 相同 | 逐 episode 按文件名字典序拼接；可用 key 集合仍由 profile 决定。 |
-| `/meta/episode_ends` | `(E,)` | int64 | 累积结束下标（exclusive）；第 `i` 段是 `[0 if i=0 else ends[i-1], ends[i])`。 |
+| `/meta/episode_ends` | `(E,)` | int64 | 所有 processed source 连续段的累积结束下标（exclusive）；第 `i` 个训练 episode 是 `[0 if i=0 else ends[i-1], ends[i])`。`E` 可大于 processed 文件数。 |
 
 数组使用 Zstd（默认 level 3）；时间 chunk 默认为 100 帧，最后 chunk 可更短。导出会逐数组
 校验 shape、dtype、episode ends 和内容 SHA-256。
@@ -261,7 +266,7 @@ Zarr root attrs 是最小运行语义，而不是 processed 全部 provenance：
 
 | 范围 | attrs | 类型 / 语义 |
 |---|---|---|
-| schema 与任务 | `schema_name`、`schema_version`、`domain`、`profile`、`task_name`、`dt` | string / int / float；固定为 `dexmani-real-policy-zarr`、`3`、`real`，并保留导出任务/profile 与控制周期。 |
+| schema 与任务 | `schema_name`、`schema_version`、`domain`、`profile`、`task_name`、`dt`、`episode_start_policy`、`obs_alignment` | string / int / float；固定为 `dexmani-real-policy-zarr`、`4`、`real`、`full_history`、`obs[t]_before_action[t]`，并保留导出任务/profile 与控制周期。训练不得用左侧 observation padding 构造 episode 起始样本。 |
 | 所有 profile 的 Real 语义 | `contact_force_unit`、`contact_force_si_verified`、`contact_force_frame`、`fingertip_points_frame`、`action_ee_frame` | string / bool；来自 processed 输入并要求全部 episode 一致。 |
 | RGB profile | `depth_scale_m_per_unit`、`depth_invalid_value`、`camera_extrinsic_semantics` | float / int / string；depth 单位、无效像素值与 `T_xarm_base_from_color` 语义。 |
 | pointcloud profile | `point_cloud_frame`、`point_cloud_color_source`、`point_cloud_policy_id`、`point_cloud_config_sha256`、`point_cloud_table_plane_abcd_json`、`point_cloud_sampling`、`point_cloud_transform` | string（其中 table plane 为 JSON string）；点云 frame、构建策略与处理身份。 |
@@ -272,7 +277,7 @@ Zarr root attrs 是最小运行语义，而不是 processed 全部 provenance：
 
 ## 字段映射摘要
 
-| raw v22 | processed v7 | Policy Zarr v3 | 变换 |
+| raw v22 | processed v8 | Policy Zarr v4 | 变换 |
 |---|---|---|---|
 | `arm_qpos + hand_qpos` | `joint_state` | `data/joint_state` | 拼接 7+12，float64 → float32。 |
 | `action_arm_joint_sent + action_hand_joint` | `action` | `data/action` | 拼接 7+12，使用实际 arm 提交流。 |
@@ -281,7 +286,7 @@ Zarr root attrs 是最小运行语义，而不是 processed 全部 provenance：
 | `hand_fingertip` | `fingertip_points` | `data/fingertip_points` | 重命名，float64 → float32。 |
 | `rgb.mp4` + `depth.h5:/depth` + camera meta | `rgb/depth/K/T` | 对应 `data/*` | RGB/depth resize 到 processed 尺寸；depth 已对齐 RGB。 |
 | raw RGB-D 与 calibration | `point_cloud` | `data/point_cloud` | 使用 canonical builder，输出 xarm-base `xyzrgb`。 |
-| raw grid/provenance | `/provenance` | `meta/episode_ends` | Zarr 仅保留 episode 边界，不保留逐行来源。 |
+| raw grid/provenance | `/provenance`（含 `source_segment_ends`） | `meta/episode_ends` | 每个 source 连续段映射为独立训练 episode；Zarr 不保留逐行来源。 |
 
 ## 读取与训练注意事项
 
@@ -290,3 +295,8 @@ Zarr root attrs 是最小运行语义，而不是 processed 全部 provenance：
 - 读取 depth 时必须应用 `depth_scale_m_per_unit`；不要假定所有设备的 Z16 单位相同。
 - `contact_force` 的 SI 单位仅在 `contact_force_si_verified=True` 时成立。
 - 训练 Zarr 前应保留其对应 processed HDF5；Zarr 是训练传输格式，不是完整审计归档。
+- Real 训练 loader 必须校验 `schema_version=4`、`episode_start_policy=full_history`，并使用
+  `pad_before=0`；每个 episode 的前 `n_obs_steps-1` 个位置不生成训练样本。
+- 训练 checkpoint 必须复制 Zarr root 语义及实际 point-cloud shape 作为数据合同。Real 部署
+  在模型构造前核对 domain/schema、`dt`、点云 policy/config/table identity 与实时 worker；
+  不能仅凭模型权重或配置文件名推断数据域。

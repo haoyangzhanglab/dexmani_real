@@ -26,11 +26,12 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 - RealSense 相机按设备原生频率连续采集；16 Hz 控制网格只选择最新严格因果帧，
   不再将相机发布节拍绑定到控制频率。
 - 事务式写入 depth-to-color aligned RGB-D raw episode v22；保留 native depth/color 几何与时序 provenance。
-- 将 aligned raw v22 episode 清洗为 processed HDF5 v7，再导出 Policy Zarr v3。
+- 将 aligned raw v22 episode 清洗为 processed HDF5 v8；导出 Policy Zarr v4 时把
+  source 不连续处拆成独立训练 episode，避免窗口跨越数据缺口。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
 - 通过可替换 `PolicyRuntime` 运行 joint/EE-action learned policy；仓库包含无模型的
   deterministic fake 实现和 `dexmani_policy` 集成。启动时 `DeploymentManifest`
-  fail-closed 校验 checkpoint 契约与部署配置（action_key/点云 N/stride/observation）。
+  fail-closed 校验自描述 checkpoint 与部署配置（action/observation/点云/时序合同）。
 
 ## 导航
 
@@ -42,7 +43,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`replay/`](dexmani_real/replay) |
 | raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/hdf5_writer.py`](dexmani_real/recording/hdf5_writer.py)、[`recording/reader.py`](dexmani_real/recording/reader.py) |
 | 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`data/`](dexmani_real/data) |
-| 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v22、processed v7 与 Policy Zarr v3 的字段、dtype、shape 与语义 |
+| 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v22、processed v8 与 Policy Zarr v4 的字段、dtype、shape 与语义 |
 | learned-policy 部署 | [`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`integrations/`](dexmani_real/integrations) |
 | 相机、桌面与 VR 标定 | [`examples/`](examples) | [`calibration/`](dexmani_real/calibration)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
 | 点云完整链路 | [`docs/pointcloud_pipeline.md`](docs/pointcloud_pipeline.md) | [`sensor/pointcloud.py`](dexmani_real/sensor/pointcloud.py)、[`sensor/pointcloud_worker.py`](dexmani_real/sensor/pointcloud_worker.py) |
@@ -156,7 +157,7 @@ python examples/collect_teleop.py --print-config
 | VR 遥操作但不录制 | `python examples/collect_teleop.py --task-name <task> --no-record` | 连接 arm/hand/VR；不启动 camera/recorder |
 | 键盘遥操作 | `python examples/keyboard_teleop.py` | 连接并控制 xArm7，可选 XHand |
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 使用 raw episode 的精确已发送命令、配置和模型 provenance，预检后控制 xArm7/XHand；写 `replay_results/` |
-| 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取并校验 `data.h5` hash 后的原始 `float64` 已发送命令，继续执行完整配置/模型/几何预检；含 risky bridge 的压缩选择拒绝回放 |
+| 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取并校验 `data.h5` hash 后的原始 `float64` 已发送命令，继续执行完整配置/模型/几何预检；包含多个 source 连续段的产物拒绝物理回放 |
 | learned policy | `python examples/run_policy.py --deployment-config <file.yml>` | 启动 arm、可选 hand、inference 与 coordinator（active/pending 调度 + EE→IK + delta/collision 安全门）；请求 `point_cloud` 时同时连接 camera |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
@@ -175,8 +176,10 @@ python examples/collect_teleop.py --print-config
 
 部署配置的 `observation_fields` 包含 `point_cloud` 时，lifecycle 才启动 camera 与独立
 point-cloud worker。worker 始终读取最新的 depth-to-color aligned RGB-D，旧帧不会排队；inference 仅在
-点云 T 历史窗完整（`n_obs_steps` 帧、跨帧 `camera_generation` 一致）且每个点云均能因果配对到
-不晚于它、并处于 `max_observation_skew_s` 内的 arm/hand 状态时才推理，不插值或填充。每帧为 xArm-base
+当前 RUNNING epoch 之后的点云 T 历史窗完整时才推理。窗口以因果截点前最新已过去的控制 tick 为末端，按策略控制网格选取严格递增、
+不重复的 camera frame；每帧不得晚于对应逻辑 tick，lag 不超过 `max_grid_lag_s`，且跨帧
+`camera_generation` 一致。每个点云均因果配对到不晚于它、并处于
+`max_observation_skew_s` 内的 arm/hand 状态，不插值、填充或复用旧 run 数据。每帧为 xArm-base
 `float32 (N, 6)`，列语义为 `xyzrgb`，RGB 范围为 `[0,1]`。`pointcloud_num_points` 只允许
 `1024`、`2048`、`4096`、`8192`，也可通过 `--pointcloud-num-points` 覆盖。
 
@@ -201,14 +204,28 @@ aligned 像素 RGB 的均值。processed HDF5 和 Policy Zarr 同时保存并校
 deployment:
   runtime_target: dexmani_real.integrations.dexmani_policy:DexManiPolicyRuntime
   checkpoint: /path/to/checkpoints/best.pt
-  model_config_path: /path/to/dp3.yaml
+  device: cuda:0
+  task_name: pick               # 须与训练数据合同 task_name 精确一致
   action_key: action            # action | action_ee（须与 checkpoint 一致）
   hand_enabled: true
   observation_fields: arm_qpos,hand_qpos,point_cloud
+  observation_horizon: 2        # 须与 checkpoint n_obs_steps 一致
   pointcloud_num_points: 2048
-  replan_stride_steps: 8        # 不得超过模型 n_action_steps
-  use_ema: true
+  max_grid_lag_s: 0.08
+  max_source_to_command_age_s: 0.75
+  command_lead_s: 0.01
 ```
+
+`dexmani_policy` 部署只接受包含 resolved inference config、完整 `train_params` 和训练数据合同的
+自描述 checkpoint。训练数据必须是 Real Policy Zarr v4，且 `task_name`、`dt`、
+`obs[t]_before_action[t]`、点云 shape/算法/配置哈希与桌面平面必须和本次 realtime worker
+完全一致；Sim、旧 schema 或 provenance 缺失均拒绝启动。
+EMA 选择和 denoise steps 从 checkpoint 内嵌配置读取。部署不加载训练 dataset 或 sim
+`env_runner`，当前也不启用 env-runner temporal ensemble。
+
+当前 `dexmani_policy` 尚未合入上述 checkpoint/data-contract 生产端改动，因此其现有 checkpoint
+会在硬件 worker 启动前被明确拒绝。后续实现顺序、字段合同和验收矩阵见
+[`docs/dexmani_policy_integration_followup.md`](docs/dexmani_policy_integration_followup.md)。
 
 点云缺失、过期、shape/dtype 错误、非有限值或颜色越界时 inference fail closed，不发布
 新的 plan。实时路径当前仅支持静态 `eye_to_hand` 标定；`eye_in_hand` 需要另行建立与
@@ -223,7 +240,7 @@ deployment:
 根因已确认并修复：`RealSenseConfig.auto_exposure_priority` 默认 `0.0`（OFF，Auto
 Exposure 仍 ON），RGB 恢复 30 Hz，亮度由增益补偿、几乎不变（暗场噪声上升）。
 
-深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew）。processed v7 的点云将
+深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew）。processed v8 的点云将
 depth-to-color aligned 像素 RGB 聚合为体素颜色，但这不表示同步曝光；运动物体仍可能出现
 颜色时间错位。
 
@@ -258,13 +275,14 @@ canonical `(N,6)` 点云；该路径与 offline processing、实时 deployment �
 `--pointcloud-num-points` 可选择 `1024`、`2048`、`4096` 或 `8192`。
 
 需要检查已清洗、持久化及 provenance 完整的点云时，仍应先用 `process_episodes.py` 生成
-processed HDF5 v7，再运行 `python examples/visualize_episode_processed.py <processed.h5>`；该入口
+processed HDF5 v8，再运行 `python examples/visualize_episode_processed.py <processed.h5>`；该入口
 会校验 `(N,6)`、`float32`、xArm-base 坐标系、RGB 范围、算法/采样语义、配置哈希与桌面标定身份。
 
 发布时逐 episode 显示 tqdm 进度（stderr），终端只打印精简汇总，不再向 stdout 输出 JSON。
 需要机器可读报告时加 `--write-report`，发布成功后在
 `episodes_processed/<task>/process_log/episode_*.json` 为每个 episode 落一份（含 config、
-决策、输出与校验）；默认不生成。损坏或审计失败（硬无效帧过多、压紧产生危险跳变等）的
+决策、输出与校验）；默认不生成。损坏或审计失败（硬无效帧过多、各 source 连续段均不足以
+形成完整训练窗口等）的
 episode 会自动跳过并打印 warning 与原因；`--annotations` 显式 `include: true` 的 episode
 不会被自动跳过，其失败会阻断整批。随后导出一个全新的 Zarr 目标：
 
@@ -276,6 +294,8 @@ python examples/export_policy_zarr.py \
 ```
 
 `--output` 必须是新路径；已有文件、目录或符号链接（包括悬空链接）都会拒绝覆盖。
+导出器依据 processed provenance 的 `source_segment_ends` 写 `meta/episode_ends`；同一 raw
+episode 中被删除行造成的缺口会形成多个训练 episode，训练窗口不会跨段。
 可视化 raw episode：
 
 ```bash

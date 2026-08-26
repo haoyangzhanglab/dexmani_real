@@ -16,8 +16,8 @@ raw episode ──> data process ──> processed HDF5 ──> data export ─�
 
 所有重要 mutable resource 只有一个 owner：SDK 只在对应 worker/driver 内，IPC allocation
 只在 `RuntimeChannels`，动作发布只在 `control/publication.py`，录制 transaction 只在
-recording worker/recorder。当前架构门禁要求 package cycle、禁用依赖边和跨模块私有 import
-均为零。
+recording worker/recorder。工程约束要求避免 package cycle、逆向依赖和跨模块私有 import；
+当前仓库没有独立的自动化架构门禁脚本。
 
 ## 2. 顶层文件
 
@@ -28,8 +28,9 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `code_style.md` | 本研究代码库的具体编码与审查约定。 |
 | `README.md` | 面向使用者的能力、架构、环境与工作流。 |
 | `repo_map.md` | 当前文件与 owner 索引。 |
-| `docs/data_schema.md` | Real raw v22、processed v7 与 Policy Zarr v3 的持久化字段和语义参考。 |
+| `docs/data_schema.md` | Real raw v22、processed v8 与 Policy Zarr v4 的持久化字段和语义参考。 |
 | `docs/deployment_review.md` | learned-policy 部署架构与安全审查结论、风险接受及整改优先级。 |
+| `docs/dexmani_policy_integration_followup.md` | `dexmani_policy` 稳定后实施的 Zarr、sampler、checkpoint 与跨仓离线验收清单。 |
 | `docs/maniunicon_reference_design.md` | 从 ManiUniCon 静态审查提炼的 learned-policy 部署改进思路、采纳边界与验收要求。 |
 | `docs/pointcloud_pipeline.md` | depth-to-color aligned 点云的采集、处理、时序与持久化契约。 |
 | `docs/teleop_jitter_incident.md` | 键盘遥操作卡顿、抖动、delta 拒绝与 coupled-command 修复复盘。 |
@@ -75,7 +76,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `__init__.py` | 轻量运行时子包标记。 |
 | `safety.py` | safety state、run generation、coupled-command sequence ticket 与可撤销状态转换。 |
 | `status.py` | worker/supervisor 共用的结构化退出原因。 |
-| `workers.py` | spawn-only worker spec、构建、启动与退出优先级。 |
+| `workers.py` | spawn-only worker spec、构建、启动、分阶段 verified stop/IPC cleanup 与退出优先级。 |
 | `supervisor.py` | readiness、heartbeat、进程健康、摘要与 verified shutdown。 |
 
 ### `robot/`
@@ -190,13 +191,13 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | 文件 | 主要职责 |
 |---|---|
 | `__init__.py` | 轻量离线数据子包标记。 |
-| `contracts.py` | output/quality/bridge policy、processing config 与 decision。 |
+| `contracts.py` | output/quality policy、processing config、source 连续段与 decision。 |
 | `quality.py` | 停滞、抖动、突变等 temporal quality 纯函数审计。 |
 | `clean.py` | raw flags、limits、annotations 与质量结果到保留/拒绝决定。 |
 | `transforms.py` | RGB/depth/intrinsics 的确定性数值变换。 |
 | `raw_pointcloud.py` | raw v22 相机 metadata 到 canonical 点云输入的共享持久化边界。 |
-| `process.py` | aligned raw v22 到 processed HDF5 v7 的事务式管线。 |
-| `export.py` | processed HDF5 到 Policy Zarr v3 的事务式导出。 |
+| `process.py` | aligned raw v22 到 processed HDF5 v8 的事务式管线。 |
+| `export.py` | processed HDF5 v8 到 Policy Zarr v4 的连续段感知事务式导出。 |
 
 ### `deployment/`
 
@@ -204,7 +205,7 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 |---|---|
 | `__init__.py` | learned-policy 部署子包标记。 |
 | `contracts.py` | inference context、action chunk 与 `PolicyRuntime` protocol。 |
-| `config.py` | deployment YAML/CLI、target 与 point-cloud contract 校验。 |
+| `config.py` | deployment YAML/CLI、task/target 与 point-cloud contract 校验。 |
 | `manifest.py` | checkpoint/config/runtime manifest 组装与 fail-closed 一致性检查。 |
 | `observation.py` | 因果不可变 arm/hand/tactile/pointcloud history batch。 |
 | `worker.py` | runtime factory 惰性加载、observation 校验、predict 与 plan 发布。 |
@@ -260,19 +261,13 @@ recording worker/recorder。当前架构门禁要求 package cycle、禁用依�
 | `pointcloud_process_example.py` | L515 点云处理分段/端到端时延诊断，以及按需桌面标定与显式 plane 发布。 |
 | `xhand_control_example.py` | 使用 canonical hand 限位的 XHand 独立硬件诊断。 |
 
-## 5. 离线验证与架构门禁
+## 5. 离线验证
 
 | 路径 | 主要职责 |
 |---|---|
-| `tools/check_architecture.py` | AST-only package cycle、forbidden edge、private import、defaults 与 heavy-init 门禁。 |
-| `tests/architecture/` | 架构指标 ratchet 与主要运行入口/公开 API import smoke test。 |
-| `tests/config/` | immutable runtime/calibration snapshot、spawn pickle 只读性与配置传播。 |
-| `tests/control/` | fail-closed feedback health/publication，以及 hand-home recovery 与精确目标 ACK 合同。 |
-| `tests/examples/` | 可执行入口的离线生命周期与非关键反馈降级测试。 |
-| `tests/ipc/` | ABI manifest、ring exact dtype/shape 与重复共享内存名称的 fail-closed 门禁。 |
-| `tests/planning/` | collision/SRDF fail-closed 行为。 |
-| `tests/recording/` | raw/processed/Zarr schema contract。 |
 | `tests/test_coupled_command_publication.py` | coupled-command 非阻塞发布、active ticket 覆盖/撤销、ACK ownership 与运动准入合同。 |
+| `tests/test_data_segments.py` | source 缺口到 processed/Zarr episode 边界及跨缺口质量计算的合同。 |
+| `tests/test_deployment_timing.py` | run epoch、因果 observation grid、checkpoint 数据合同与 immutable plan deadline。 |
 | `tests/test_deployment_manifest.py` | deployment manifest 模态去重与顺序规范化合同。 |
 | `tests/test_keyboard_arm_limits.py` | keyboard 发布完整 IK endpoint、禁用通用 arm delta clip 的合同。 |
 | `tests/test_runtime_channels_ticket_state.py` | RuntimeChannels 的 coupled-command ticket 分配、零初始化与真实 shared-memory round-trip 合同。 |

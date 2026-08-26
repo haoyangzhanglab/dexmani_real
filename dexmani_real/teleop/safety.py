@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.defaults import arm, hand, safety
-from dexmani_real.control.arm_home import send_arm_home
+from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
 from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
 from dexmani_real.ipc.causal import read_arm_state_causal
 from dexmani_real.ipc.channels import RuntimeChannels
@@ -181,25 +181,27 @@ def _do_teleop_home(
     _home_qpos = np.array(
         arm.home_qpos if arm_home_qpos is None else arm_home_qpos, dtype=np.float64
     )
-    _ok = send_arm_home(
+    home_result = execute_arm_home(
         shared,
         _home_qpos,
         planner=planner,
+        config=ArmHomeConfig(
+            request_queue_timeout_s=arm_home_request_queue_timeout_s,
+            prehome_timeout_s=arm_home_convergence_timeout_s,
+            state_max_age_s=arm_home_state_max_age_s,
+            max_speed_rad_s=arm_home_max_speed_rad_s,
+            target_timeout_s=arm_home_target_timeout_s,
+            arm_heartbeat_max_age_s=arm_heartbeat_timeout_s,
+            stationary_velocity_rad_s=arm_home_velocity_convergence_rad_s,
+            result_tolerance_rad=arm_home_result_tolerance_rad,
+            publish_policy_heartbeat=heartbeat,
+        ),
         table_z_surface_m=table_z_surface_m,
         current_qpos=arm_qpos,
-        heartbeat=heartbeat,
-        converge_timeout_s=arm_home_convergence_timeout_s,
-        queue_timeout=arm_home_request_queue_timeout_s,
-        state_max_age_s=arm_home_state_max_age_s,
-        homing_max_speed_rad_s=arm_home_max_speed_rad_s,
-        homing_target_timeout_s=arm_home_target_timeout_s,
-        preplan_velocity_rad_s=arm_home_velocity_convergence_rad_s,
-        result_tolerance_rad=arm_home_result_tolerance_rad,
-        arm_heartbeat_max_age_s=arm_heartbeat_timeout_s,
         estop_requested=estop_requested,
-        verbose=True,
+        progress=lambda message: print(f"  {message}", flush=True),
     )
-    if _ok:
+    if home_result.succeeded:
         # Keep the departure cue intact; AudioFeedback.queue() serializes this
         # completion cue after it instead of cancelling it mid-sentence.
         audio.queue("home_done")

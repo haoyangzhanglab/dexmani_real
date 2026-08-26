@@ -34,10 +34,12 @@ def _check_command_identity_and_timing(
         return None
 
     created_ns = int(command["created_monotonic_ns"][0])
+    scheduled_ns = int(command["scheduled_target_monotonic_ns"][0])
     target_ns = int(command["target_monotonic_ns"][0])
     valid_until_ns = int(command["valid_until_monotonic_ns"][0])
     if (
-        min(created_ns, target_ns, valid_until_ns) <= 0
+        min(created_ns, scheduled_ns, target_ns, valid_until_ns) <= 0
+        or scheduled_ns > created_ns
         or created_ns > target_ns
         or target_ns > valid_until_ns
         or int(now_monotonic_ns) < created_ns

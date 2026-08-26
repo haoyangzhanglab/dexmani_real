@@ -3,9 +3,9 @@
 Composes the runtime primitives (``WorkerSpec`` +
 ``build_processes``/``start_processes``/``wait_subsystem_ready``/
 ``run_supervisor``/``shutdown_processes``) into the policy workflow — resolve
-config -> create ``RuntimeChannels`` -> spawn arm (+ optional hand and RGB-D /
-point-cloud workers) -> inference -> coordinator -> readiness -> ARMED ->
-supervise -> verified shutdown. There is
+config -> create ``RuntimeChannels`` -> preflight the model process -> spawn arm
+(+ optional hand and RGB-D / point-cloud workers) -> coordinator -> readiness ->
+ARMED -> supervise -> verified shutdown. There is
 no second health mechanism: the supervisor's heartbeat/readiness slots already
 carry ``arm``/``hand``/``camera``/``pointcloud``/``inference``/``policy``.
 
@@ -13,13 +13,14 @@ There is no VR worker or recorder. Camera and point-cloud workers are included
 only when the explicit observation contract contains ``point_cloud``.
 
 Also owns the one-time startup provenance log line (commit hashes +
-checkpoint/model-config SHA-256) via ``sha256_file`` and
+checkpoint SHA-256) via ``sha256_file`` and
 ``log_deployment_provenance``.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -28,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
-from dexmani_real.deployment.config import DeploymentConfig
+from dexmani_real.deployment.config import DeploymentConfig, PolicyRuntimeConfig
 from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_loop
 from dexmani_real.deployment.observation import parse_observation_fields
 from dexmani_real.deployment.operator import build_home_planner, run_operator_control
@@ -47,8 +48,15 @@ from dexmani_real.runtime.workers import (
     WorkerSpec,
     build_processes,
     start_processes,
+    stop_processes_verified,
 )
 from dexmani_real.sensor.camera_worker import CameraLoopConfig, camera_loop
+from dexmani_real.sensor.pointcloud import (
+    POINT_CLOUD_COLOR_SOURCE,
+    POINT_CLOUD_POLICY_ID,
+    POINT_CLOUD_SAMPLING,
+    POINT_CLOUD_TRANSFORM,
+)
 from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig, pointcloud_loop
 from dexmani_real.utils.log import get_logger
 
@@ -62,7 +70,7 @@ def _requires_pointcloud(deployment: DeploymentConfig) -> bool:
 def sha256_file(path: str | Path) -> str:
     """Return the hex SHA-256 of a file's contents ("" when unreadable/missing).
 
-    Best-effort: logs the checkpoint/model-config hash "if available"; an
+    Best-effort: logs the checkpoint hash "if available"; an
     unreadable file logs empty rather than failing startup (the PolicyRuntime
     load is the authoritative check for a bad checkpoint).
     """
@@ -84,7 +92,6 @@ def log_deployment_provenance(
     dexmani_commit: str = "",
     model_commit: str = "",
     checkpoint_sha256: str = "",
-    model_config_sha256: str = "",
 ) -> None:
     """Log one structured provenance line (no RuntimeChannels write).
 
@@ -95,7 +102,7 @@ def log_deployment_provenance(
     logger.info(
         "deployment provenance: dexmani_commit=%s model_commit=%s "
         "runtime_target=%s observation_fields=%s pointcloud_num_points=%d checkpoint=%s "
-        "checkpoint_sha256=%s model_config_sha256=%s runtime_sha256=%s",
+        "checkpoint_sha256=%s runtime_sha256=%s",
         dexmani_commit or "unknown",
         model_commit or "unknown",
         deployment.runtime_target,
@@ -103,7 +110,6 @@ def log_deployment_provenance(
         deployment.pointcloud_num_points,
         deployment.checkpoint or "",
         checkpoint_sha256 or "",
-        model_config_sha256 or "",
         runtime_sha256,
     )
 
@@ -123,6 +129,43 @@ def build_policy_worker_specs(
     """
     coordinator_config = CoordinatorConfig.from_runtime(deployment, runtime)
     pointcloud_requested = _requires_pointcloud(deployment)
+    pointcloud_config = (
+        PointCloudLoopConfig.from_runtime(
+            runtime,
+            num_points=deployment.pointcloud_num_points,
+        )
+        if pointcloud_requested
+        else None
+    )
+    policy_runtime_config = PolicyRuntimeConfig(
+        deployment=deployment,
+        control_dt_s=1.0 / float(runtime.policy.control_hz),
+        point_cloud_frame="xarm_base" if pointcloud_config is not None else "",
+        point_cloud_color_source=(
+            POINT_CLOUD_COLOR_SOURCE if pointcloud_config is not None else ""
+        ),
+        point_cloud_policy_id=(
+            POINT_CLOUD_POLICY_ID if pointcloud_config is not None else ""
+        ),
+        point_cloud_config_sha256=(
+            pointcloud_config.pointcloud.sha256 if pointcloud_config is not None else ""
+        ),
+        point_cloud_table_plane_abcd_json=(
+            json.dumps(
+                pointcloud_config.table_plane_abcd,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            if pointcloud_config is not None
+            else ""
+        ),
+        point_cloud_sampling=(
+            POINT_CLOUD_SAMPLING if pointcloud_config is not None else ""
+        ),
+        point_cloud_transform=(
+            POINT_CLOUD_TRANSFORM if pointcloud_config is not None else ""
+        ),
+    )
     specs: list[WorkerSpec] = [
         WorkerSpec(
             "arm",
@@ -145,10 +188,7 @@ def build_policy_worker_specs(
                     pointcloud_loop,
                     (
                         shared,
-                        PointCloudLoopConfig.from_runtime(
-                            runtime,
-                            num_points=deployment.pointcloud_num_points,
-                        ),
+                        pointcloud_config,
                     ),
                     ready_name="pointcloud",
                 ),
@@ -159,7 +199,7 @@ def build_policy_worker_specs(
             WorkerSpec(
                 "inference",
                 inference_loop,
-                (shared, deployment),
+                (shared, policy_runtime_config),
                 ready_name="inference",
             ),
             WorkerSpec(
@@ -190,10 +230,9 @@ def run_policy_deployment(
 ) -> int:
     """Run one policy deployment lifecycle and return its exit code.
 
-    Mirrors the collect_teleop order: ``build -> DISARMED -> start ->
-    wait_subsystem_ready -> ARMED -> run_supervisor -> shutdown``, minus the VR
-    transform/provenance/recording preflight the joint-only workflow does not
-    need.
+    The inference worker must load successfully before any hardware process is
+    started. The runtime then follows ``DISARMED -> hardware readiness -> ARMED
+    -> supervision -> verified shutdown``.
     """
     log_deployment_provenance(
         logger,
@@ -201,11 +240,6 @@ def run_policy_deployment(
         runtime_sha256=runtime.sha256,
         checkpoint_sha256=(
             sha256_file(deployment.checkpoint) if deployment.checkpoint else ""
-        ),
-        model_config_sha256=(
-            sha256_file(deployment.model_config_path)
-            if deployment.model_config_path
-            else ""
         ),
     )
 
@@ -218,12 +252,16 @@ def run_policy_deployment(
             pointcloud_num_points=deployment.pointcloud_num_points,
             pointcloud_requested=pointcloud_requested,
             observation_horizon=deployment.observation_horizon,
+            observation_dt_s=1.0 / float(runtime.policy.control_hz),
+            max_input_age_s=deployment.max_input_age_s,
             max_observation_skew_s=deployment.max_observation_skew_s,
+            max_grid_lag_s=deployment.max_grid_lag_s,
         ),
         mp_context=ctx,
     )
     specs: list[WorkerSpec] = []
     procs: list[Any] = []
+    started_procs: list[Any] = []
     shutdown_report: ShutdownReport | None = None
     operator_thread: threading.Thread | None = None
     operator_stop: threading.Event | None = None
@@ -231,20 +269,56 @@ def run_policy_deployment(
         specs = build_policy_worker_specs(shared, runtime, deployment)
         procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)
-        start_processes(procs)
 
         timeouts = runtime.safety.readiness_timeouts_s
-        ready_checks = [
-            (spec.ready_name, float(timeouts[spec.ready_name]))
-            for spec in specs
-            if spec.ready_name
+        spec_processes = list(zip(specs, procs))
+        inference_pairs = [
+            (spec, process)
+            for spec, process in spec_processes
+            if spec.ready_name == "inference"
         ]
-        if not wait_subsystem_ready(shared, ready_checks, procs):
+        if len(inference_pairs) != 1:
+            raise RuntimeError("deployment requires exactly one inference worker")
+        inference_spec, inference_process = inference_pairs[0]
+        if inference_spec.ready_name is None:
+            raise RuntimeError("inference worker requires a readiness name")
+        start_processes([inference_process])
+        started_procs.append(inference_process)
+        inference_ready = [
+            (
+                inference_spec.ready_name,
+                float(timeouts[inference_spec.ready_name]),
+            )
+        ]
+        if not wait_subsystem_ready(shared, inference_ready, started_procs):
             shared.error_state.value = True
             require_transition(shared, SafetyState.FAULT)
             shutdown_report = shutdown_processes(
                 shared,
-                procs,
+                started_procs,
+                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+            )
+            return 1
+        print("  inference: ready", flush=True)
+
+        remaining_pairs = [
+            (spec, process)
+            for spec, process in spec_processes
+            if process is not inference_process
+        ]
+        remaining_procs = [process for _spec, process in remaining_pairs]
+        start_processes(remaining_procs)
+        started_procs.extend(remaining_procs)
+        ready_checks: list[tuple[str, float]] = []
+        for spec, _process in remaining_pairs:
+            if spec.ready_name is not None:
+                ready_checks.append((spec.ready_name, float(timeouts[spec.ready_name])))
+        if not wait_subsystem_ready(shared, ready_checks, started_procs):
+            shared.error_state.value = True
+            require_transition(shared, SafetyState.FAULT)
+            shutdown_report = shutdown_processes(
+                shared,
+                started_procs,
                 graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
             )
             return 1
@@ -277,16 +351,27 @@ def run_policy_deployment(
         heartbeat_names = process_names
         exit_reason, normal_exit = run_supervisor(
             shared,
-            procs,
+            started_procs,
             process_names,
             heartbeat_names,
             heartbeat_timeouts_s=dict(runtime.safety.heartbeat_timeouts),
             supervisor_hz=float(runtime.safety.supervisor_hz),
         )
 
+        if operator_stop is not None:
+            operator_stop.set()
+        if operator_thread is not None:
+            shared.is_running.value = False
+            operator_thread.join(timeout=float(runtime.safety.shutdown_timeout_s))
+            if operator_thread.is_alive():
+                raise RuntimeError(
+                    "operator control did not stop; RuntimeChannels cannot be closed"
+                )
+            operator_thread = None
+
         shutdown_report = shutdown_processes(
             shared,
-            procs,
+            started_procs,
             graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
             disarm_if_clean=normal_exit,
         )
@@ -312,24 +397,36 @@ def run_policy_deployment(
     finally:
         if operator_stop is not None:
             operator_stop.set()
+        operator_alive = False
         if operator_thread is not None:
-            operator_thread.join(timeout=1.0)
+            operator_thread.join(timeout=float(runtime.safety.shutdown_timeout_s))
+            operator_alive = operator_thread.is_alive()
+            if operator_alive:
+                logger.critical(
+                    "operator thread remains alive; leaving RuntimeChannels linked"
+                )
         if shutdown_report is None:
-            started = [process for process in procs if process.pid is not None]
-            if started:
+            if started_procs:
                 try:
-                    shutdown_processes(
-                        shared,
-                        started,
-                        graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-                    )
+                    if operator_alive:
+                        stop_processes_verified(
+                            shared,
+                            started_procs,
+                            graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+                        )
+                    else:
+                        shutdown_processes(
+                            shared,
+                            started_procs,
+                            graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+                        )
                 except RuntimeError:
                     logger.critical(
                         "child process remains alive; leaving RuntimeChannels linked",
                         exc_info=True,
                     )
                     raise
-            else:
+            elif not operator_alive:
                 try:
                     if not shared.close():
                         shared.error_state.value = True
