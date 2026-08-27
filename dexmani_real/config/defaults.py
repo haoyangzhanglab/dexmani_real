@@ -494,9 +494,9 @@ class HandParams:
 
     loop_hz: float = 30.0
 
-    # Per-hand-servo-tick bound.  0.1 rad at 30 Hz preserves the approximate
-    # 3.2 rad/s envelope previously imposed by 0.2 rad at the 16 Hz teleop grid.
-    hand_max_delta_rad_per_tick: float = 0.1
+    # Per-hand-servo-tick bound.  At the 30 Hz hand loop this is a 9 rad/s
+    # envelope; at the 16 Hz teleop grid it is a 4.8 rad/s envelope.
+    hand_max_delta_rad_per_tick: float = 0.3
 
     # Homing waits for command acceptance, not measured joint convergence.
     home_command_ack_timeout_s: float = 1.0
@@ -814,7 +814,7 @@ class TAGRetargetingParams:
     pinch_base_weight: float = 2000.0
     pinch_start_dist_m: float = 0.030
     pinch_full_dist_m: float = 0.008
-    pinch_ema_alpha: float = 0.4
+    pinch_ema_alpha: float = 0.75
     pinch_skip_threshold: float = 0.01
     reg_stage1_weight: float = 1.0
     reg_last_weight: float = 0.8

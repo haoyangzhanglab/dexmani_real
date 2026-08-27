@@ -327,21 +327,21 @@ raw/processed attestation，只检查内部 provenance、payload 以及 source h
 
 ```bash
 python examples/export_policy_zarr.py \
-  --input-root episodes_processed/<task> \
-  --task-name <task> \
+  episodes_processed/<task> \
   --dry-run
 ```
 
-预检通过后导出一个全新的 Zarr 目标：
+预检通过后导出到 `datasets/<task>.zarr`：
 
 ```bash
 python examples/export_policy_zarr.py \
-  --input-root episodes_processed/<task> \
-  --output dataset/<task>.zarr \
-  --task-name <task>
+  episodes_processed/<task>
 ```
 
-`--output` 必须是新路径；已有文件、目录或符号链接（包括悬空链接）都会拒绝覆盖。
+输入目录名决定导出任务名，且会与每个 processed HDF5 中的 `task_name` 校验；已有
+`datasets/<task>.zarr` 文件、目录或符号链接（包括悬空链接）都会拒绝覆盖。
+导出时在 stderr 显示输入校验、Zarr 写入和校验和验证的 tqdm 进度条；不会向 stdout
+打印 JSON 报告。
 导出器依据 processed provenance 的 `source_segment_ends` 写 `meta/episode_ends`；同一 raw
 episode 中被删除行造成的缺口会形成多个训练 episode，训练窗口不会跨段。
 可视化 raw episode：
@@ -370,7 +370,7 @@ episodes_processed/<task>/
 └── process_log/                 # only with --write-report
     └── episode_<timestamp>.json
 
-dataset/<task>.zarr/
+datasets/<task>.zarr/
 ├── data/*
 └── meta/episode_ends
 ```

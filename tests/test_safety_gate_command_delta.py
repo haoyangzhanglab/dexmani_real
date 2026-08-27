@@ -57,13 +57,13 @@ class SafetyGateCommandDeltaTest(unittest.TestCase):
 
     def test_producer_clipped_hand_endpoint_survives_ulp_roundoff(self) -> None:
         previous = np.full(12, 0.3)
-        clipped = limit_hand_target_delta(np.full(12, 1.0), previous, 0.1)
+        clipped = limit_hand_target_delta(np.full(12, 1.0), previous, 0.3)
         gate = SafetyGate(
             arm_joint_lower_rad=tuple(np.full(7, -1.0)),
             arm_joint_upper_rad=tuple(np.full(7, 1.0)),
             hand_joint_lower_rad=tuple(np.full(12, -1.0)),
             hand_joint_upper_rad=tuple(np.full(12, 1.0)),
-            max_hand_delta_rad=0.1,
+            max_hand_delta_rad=0.3,
         )
         candidate = ActionCandidate(
             observation_id=1,
@@ -111,7 +111,7 @@ class SafetyGateCommandDeltaTest(unittest.TestCase):
             hand_joint_upper_rad=tuple(np.full(12, 1.0)),
             workspace_check=workspace,
             max_arm_delta_rad=0.1,
-            max_hand_delta_rad=0.1,
+            max_hand_delta_rad=0.3,
             collision_check=collision,
         )
         candidate = ActionCandidate(

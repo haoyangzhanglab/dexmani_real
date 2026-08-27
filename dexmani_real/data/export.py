@@ -6,6 +6,7 @@ import hashlib
 import json
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 
 POLICY_ZARR_SCHEMA_NAME = "dexmani-real-policy-zarr"
 POLICY_ZARR_SCHEMA_VERSION = 5
+ExportProgressCallback = Callable[[str, int, int], None]
 
 
 @dataclass(frozen=True)
@@ -368,15 +370,34 @@ def _validate_uniform(artifacts: tuple[_Artifact, ...]) -> None:
             )
 
 
+def _report_progress(
+    callback: ExportProgressCallback | None,
+    phase: str,
+    completed: int,
+    total: int,
+) -> None:
+    """Report cumulative work from one export phase when a caller requested it."""
+
+    if callback is not None:
+        callback(phase, completed, total)
+
+
 def _load_artifacts(
-    input_root: str | Path, config: PolicyZarrExportConfig
+    input_root: str | Path,
+    config: PolicyZarrExportConfig,
+    *,
+    progress_callback: ExportProgressCallback | None = None,
 ) -> tuple[_Artifact, ...]:
     """Inspect one complete task input before any Zarr output is created."""
 
     paths = _discover_processed_hdf5_paths(Path(input_root))
-    artifacts = tuple(_inspect_artifact(path, config) for path in paths)
+    _report_progress(progress_callback, "validate", 0, len(paths))
+    artifacts: list[_Artifact] = []
+    for index, path in enumerate(paths, start=1):
+        artifacts.append(_inspect_artifact(path, config))
+        _report_progress(progress_callback, "validate", index, len(paths))
     _validate_uniform(artifacts)
-    return artifacts
+    return tuple(artifacts)
 
 
 def _export_plan_report(
@@ -405,6 +426,8 @@ def _export_plan_report(
 def preflight_processed_hdf5_to_zarr(
     input_root: str | Path,
     config: PolicyZarrExportConfig | None = None,
+    *,
+    progress_callback: ExportProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Read and validate export inputs without creating or modifying a Zarr store.
 
@@ -415,15 +438,25 @@ def preflight_processed_hdf5_to_zarr(
     """
 
     resolved = config or PolicyZarrExportConfig()
-    artifacts = _load_artifacts(input_root, resolved)
+    artifacts = _load_artifacts(
+        input_root,
+        resolved,
+        progress_callback=progress_callback,
+    )
     return _export_plan_report(artifacts, input_root=input_root)
 
 
 def _copy_data(
-    artifacts: tuple[_Artifact, ...], data_group: zarr.Group, *, chunk_frames: int
+    artifacts: tuple[_Artifact, ...],
+    data_group: zarr.Group,
+    *,
+    chunk_frames: int,
+    progress_callback: ExportProgressCallback | None = None,
 ) -> dict[str, str]:
     digests = {key: hashlib.sha256() for key in artifacts[0].dataset_shapes}
     offset = 0
+    total_frames = sum(artifact.length for artifact in artifacts)
+    _report_progress(progress_callback, "write", 0, total_frames)
     for artifact in artifacts:
         with h5py.File(artifact.path, "r") as source:
             for row_start in range(0, artifact.length, chunk_frames):
@@ -439,6 +472,12 @@ def _copy_data(
                         )
                     data_group[key][target_slice] = block
                     digest.update(np.ascontiguousarray(block).tobytes())
+                _report_progress(
+                    progress_callback,
+                    "write",
+                    offset + row_end,
+                    total_frames,
+                )
         offset += artifact.length
     return {key: digest.hexdigest() for key, digest in digests.items()}
 
@@ -449,6 +488,7 @@ def _validate_zarr(
     expected_digests: dict[str, str],
     *,
     chunk_frames: int,
+    progress_callback: ExportProgressCallback | None = None,
 ) -> None:
     root = zarr.open_group(str(path), mode="r")
     if set(root.group_keys()) != {"data", "meta"} or set(root.array_keys()):
@@ -482,6 +522,10 @@ def _validate_zarr(
     if not np.array_equal(root["meta"]["episode_ends"][:], expected_ends):
         raise ValueError("Zarr episode_ends mismatch")
     total = int(expected_ends[-1])
+    chunks_per_dataset = (total + chunk_frames - 1) // chunk_frames
+    total_chunks = len(expected_keys) * chunks_per_dataset
+    completed_chunks = 0
+    _report_progress(progress_callback, "verify", 0, total_chunks)
     for key in sorted(expected_keys):
         array = root["data"][key]
         expected_shape = (total,) + artifacts[0].dataset_shapes[key]
@@ -494,6 +538,13 @@ def _validate_zarr(
         for start in range(0, total, chunk_frames):
             block = np.asarray(array[start : min(total, start + chunk_frames)])
             digest.update(np.ascontiguousarray(block).tobytes())
+            completed_chunks += 1
+            _report_progress(
+                progress_callback,
+                "verify",
+                completed_chunks,
+                total_chunks,
+            )
         if digest.hexdigest() != expected_digests[key]:
             raise ValueError(f"Zarr {key} checksum mismatch")
 
@@ -502,8 +553,15 @@ def export_processed_hdf5_to_zarr(
     input_root: str | Path,
     output_path: str | Path,
     config: PolicyZarrExportConfig | None = None,
+    *,
+    progress_callback: ExportProgressCallback | None = None,
 ) -> dict[str, Any]:
-    """Atomically publish data/* + meta/episode_ends, without HDF provenance."""
+    """Atomically publish data/* + meta/episode_ends, without HDF provenance.
+
+    ``progress_callback`` receives ``(phase, completed, total)`` for validation,
+    Zarr writing, and Zarr checksum verification. It does not affect export
+    admission or publication behavior.
+    """
 
     resolved = config or PolicyZarrExportConfig()
     source_root = Path(input_root)
@@ -512,7 +570,11 @@ def export_processed_hdf5_to_zarr(
         raise NotADirectoryError(source_root)
     if target_is_occupied(target):
         raise FileExistsError(f"refusing to overwrite existing policy Zarr: {target}")
-    artifacts = _load_artifacts(source_root, resolved)
+    artifacts = _load_artifacts(
+        source_root,
+        resolved,
+        progress_callback=progress_callback,
+    )
     # All payload admission (including finite checks) completes before a
     # staging directory is created, so a rejected source leaves no partial
     # export artifact behind.
@@ -560,12 +622,18 @@ def export_processed_hdf5_to_zarr(
             compressor=compressor,
             overwrite=False,
         )
-        digests = _copy_data(artifacts, data_group, chunk_frames=resolved.chunk_frames)
+        digests = _copy_data(
+            artifacts,
+            data_group,
+            chunk_frames=resolved.chunk_frames,
+            progress_callback=progress_callback,
+        )
         _validate_zarr(
             staging,
             artifacts,
             digests,
             chunk_frames=resolved.chunk_frames,
+            progress_callback=progress_callback,
         )
         atomic_publish(staging, target)
     except BaseException:

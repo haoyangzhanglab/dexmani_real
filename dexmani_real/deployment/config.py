@@ -129,7 +129,7 @@ class PolicyRuntimeConfig:
     point_cloud_sampling: str = ""
     point_cloud_transform: str = ""
     arm_max_delta_rad_per_tick: float | None = None
-    hand_max_delta_rad_per_tick: float = 0.1
+    hand_max_delta_rad_per_tick: float = 0.3
     endpoint_delta_tolerance_rad: float = policy_defaults.endpoint_delta_tolerance_rad
 
     def __post_init__(self) -> None:

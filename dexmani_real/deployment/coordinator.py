@@ -97,7 +97,7 @@ class CoordinatorConfig:
     # Per-tick delta limits for the learned-policy safety gate (reject, never
     # clip).  ``None`` disables the arm delta check.
     arm_max_delta_rad_per_tick: float | None = np.deg2rad(8.0)
-    hand_max_delta_rad_per_tick: float = 0.1
+    hand_max_delta_rad_per_tick: float = 0.3
     endpoint_delta_tolerance_rad: float = policy_defaults.endpoint_delta_tolerance_rad
 
     @classmethod

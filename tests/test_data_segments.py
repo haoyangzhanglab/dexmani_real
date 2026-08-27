@@ -236,13 +236,13 @@ class DataSegmentTest(unittest.TestCase):
             "control_hand_qpos": np.zeros((3, 12), dtype=np.float64),
             "action_arm": np.zeros((3, 7), dtype=np.float64),
             "action_hand": np.asarray(
-                [[0.05] * 12, [0.10] * 12, [0.20] * 12], dtype=np.float64
+                [[0.05] * 12, [0.10] * 12, [0.40] * 12], dtype=np.float64
             ),
         }
         config = ProcessingConfig(
             profile=OutputProfile.JOINT,
             arm_max_delta_rad_per_tick=None,
-            hand_max_delta_rad_per_tick=0.1,
+            hand_max_delta_rad_per_tick=0.3,
         )
 
         invalid, arm_invalid, hand_invalid = _deployment_action_limit_masks(
@@ -286,10 +286,10 @@ class DataSegmentTest(unittest.TestCase):
         limited = limit_hand_target_delta(
             np.full(12, 0.5, dtype=np.float64),
             np.zeros(12, dtype=np.float64),
-            0.1,
+            0.3,
         )
 
-        np.testing.assert_allclose(limited, np.full(12, 0.1))
+        np.testing.assert_allclose(limited, np.full(12, 0.3))
 
 
 class PolicyZarrPreflightTest(unittest.TestCase):
@@ -315,7 +315,7 @@ class PolicyZarrPreflightTest(unittest.TestCase):
                     "max_observation_skew_s": 0.1,
                     "action_semantics": "deployment_grid_rate_limited_target",
                     "arm_max_delta_rad_per_tick": 0.1,
-                    "hand_max_delta_rad_per_tick": 0.1,
+                    "hand_max_delta_rad_per_tick": 0.3,
                     "endpoint_delta_tolerance_rad": 1e-12,
                     "deployment_equivalent": True,
                     "contact_force_unit": "sdk_scaled",
@@ -462,20 +462,19 @@ class PolicyZarrPreflightTest(unittest.TestCase):
             self.assertEqual(report["episode_ends"], [1])
             self.assertFalse(any(root.glob("*.zarr")))
 
-    def test_export_cli_dry_run_reports_preflight_without_writing_zarr(self) -> None:
+    def test_export_cli_dry_run_shows_progress_without_writing_zarr(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source_path = root / "episode.h5"
+            task_root = root / "episodes_processed" / "test_task"
+            task_root.mkdir(parents=True)
+            source_path = task_root / "episode.h5"
             self._write_deployment_equivalent_pointcloud(source_path)
 
             completed = subprocess.run(
                 [
                     sys.executable,
                     "examples/export_policy_zarr.py",
-                    "--input-root",
-                    str(root),
-                    "--task-name",
-                    "test_task",
+                    str(task_root),
                     "--dry-run",
                 ],
                 cwd=Path(__file__).resolve().parents[1],
@@ -485,7 +484,8 @@ class PolicyZarrPreflightTest(unittest.TestCase):
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertTrue(json.loads(completed.stdout)["dry_run"])
+            self.assertEqual(completed.stdout, "")
+            self.assertIn("validate processed episodes", completed.stderr)
             self.assertFalse(any(root.glob("*.zarr")))
 
     def test_export_publishes_the_validated_pointcloud_store(self) -> None:
@@ -494,16 +494,23 @@ class PolicyZarrPreflightTest(unittest.TestCase):
             source_path = root / "episode.h5"
             output_path = root / "test_task.zarr"
             self._write_deployment_equivalent_pointcloud(source_path)
+            progress_events: list[tuple[str, int, int]] = []
 
             report = export_processed_hdf5_to_zarr(
                 root,
                 output_path,
                 PolicyZarrExportConfig(expected_task_name="test_task"),
+                progress_callback=lambda phase, completed, total: progress_events.append(
+                    (phase, completed, total)
+                ),
             )
 
             self.assertEqual(report["task_name"], "test_task")
             self.assertEqual(report["total_frames"], 1)
             self.assertTrue(output_path.is_dir())
+            self.assertEqual(progress_events[0], ("validate", 0, 1))
+            self.assertEqual(progress_events[-1][0], "verify")
+            self.assertEqual(progress_events[-1][1], progress_events[-1][2])
 
     def test_preflight_rejects_nonfinite_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

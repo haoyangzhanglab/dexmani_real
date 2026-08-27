@@ -82,7 +82,7 @@ class HandOptimizer:
         pinch_base_weight: float = 2000.0,
         pinch_start_dist_m: float = 0.030,
         pinch_full_dist_m: float = 0.008,
-        pinch_ema_alpha: float = 0.4,
+        pinch_ema_alpha: float = 0.75,
         pinch_skip_threshold: float = 0.01,
         reg_stage1_weight: float = 1.0,
         reg_last_weight: float = 0.8,

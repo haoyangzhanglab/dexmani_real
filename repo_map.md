@@ -29,6 +29,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `README.md` | 面向使用者的能力、架构、环境与工作流。 |
 | `repo_map.md` | 当前文件与 owner 索引。 |
 | `docs/data_schema.md` | Real raw v24（显式 legacy v23）、processed v10 与 Policy Zarr v5 的持久化字段和语义参考。 |
+| `docs/action_clip_mechanisms.md` | 动作 clip、限幅、拒绝与动作源差异的实现参数和数据审计说明。 |
 | `docs/deployment_review.md` | learned-policy 部署架构与安全审查结论、风险接受及整改优先级。 |
 | `docs/dexmani_policy_integration_followup.md` | `dexmani_policy` 稳定后实施的 Zarr、sampler、checkpoint 与跨仓离线验收清单。 |
 | `docs/maniunicon_reference_design.md` | 从 ManiUniCon 静态审查提炼的 learned-policy 部署改进思路、采纳边界与验收要求。 |

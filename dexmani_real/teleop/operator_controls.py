@@ -330,9 +330,18 @@ def _apply_begin_signal(
             f"\nB: safety_state={shared.safety_state.value} — must be ARMED({SafetyState.ARMED})"
         )
         return True
-    if read_vr_frame_causal(shared) is None:
+    vr_frame = read_vr_frame_causal(shared)
+    if vr_frame is None:
         print("\nB: 无 VR 帧，无法开始遥操作")
         return True
+    wrist_pos = vr_frame["wrist_pos"]
+    wrist_quat_wxyz = vr_frame["wrist_quat_wxyz"]
+    print(
+        "\nB: wrist_pose "
+        f"pos=[{' '.join(f'{value:.6f}' for value in wrist_pos)}] + "
+        f"wxyz=[{' '.join(f'{value:.6f}' for value in wrist_quat_wxyz)}]",
+        flush=True,
+    )
     begin_hand_state = (
         read_hand_state_causal(shared) if cfg.runtime.policy.hand_enabled else None
     )
