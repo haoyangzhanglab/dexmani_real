@@ -28,7 +28,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `code_style.md` | 本研究代码库的具体编码与审查约定。 |
 | `README.md` | 面向使用者的能力、架构、环境与工作流。 |
 | `repo_map.md` | 当前文件与 owner 索引。 |
-| `docs/data_schema.md` | Real raw v23、processed v10 与 Policy Zarr v5 的持久化字段和语义参考。 |
+| `docs/data_schema.md` | Real raw v24（显式 legacy v23）、processed v10 与 Policy Zarr v5 的持久化字段和语义参考。 |
 | `docs/deployment_review.md` | learned-policy 部署架构与安全审查结论、风险接受及整改优先级。 |
 | `docs/dexmani_policy_integration_followup.md` | `dexmani_policy` 稳定后实施的 Zarr、sampler、checkpoint 与跨仓离线验收清单。 |
 | `docs/maniunicon_reference_design.md` | 从 ManiUniCon 静态审查提炼的 learned-policy 部署改进思路、采纳边界与验收要求。 |
@@ -176,7 +176,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | 文件 | 主要职责 |
 |---|---|
 | `__init__.py` | `EpisodeReader`/`EpisodeRecorder` 等稳定公开 facade。 |
-| `schema.py` | raw episode v23 persisted schema。 |
+| `schema.py` | raw episode v24 persisted schema、legacy-v23 boundary 与 sidecar/semantic validators。 |
 | `frame.py` | IPC record 到 immutable owned `EpisodeFrame` 的唯一 decode 边界。 |
 | `timeline.py` | 多速率输入到 fixed grid 的 timestamp 对齐与填充原因。 |
 | `recorder.py` | raw episode transaction、质量汇总、验证与原子发布。 |
@@ -185,7 +185,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `video.py` | PyAV RGB 编解码与 codec 配置。 |
 | `client.py` | controller 侧 recorder protocol、sample publication 与 stop result。 |
 | `worker.py` | RecorderIO active generation、sequence continuity、transaction 与 finalize。 |
-| `reader.py` | published v23 校验、HDF5 merged view 与 RGB/depth 读取。 |
+| `reader.py` | published v24 校验、显式 legacy-v23 opt-in、HDF5 merged view 与 RGB/depth 读取。 |
 
 ### `data/`
 
@@ -196,8 +196,8 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `quality.py` | 停滞、抖动、突变等 temporal quality 纯函数审计。 |
 | `clean.py` | raw flags、limits、annotations 与质量结果到保留/拒绝决定。 |
 | `transforms.py` | RGB/depth/intrinsics 的确定性数值变换。 |
-| `raw_pointcloud.py` | raw v23 相机 metadata 到 canonical 点云输入的共享持久化边界。 |
-| `process.py` | aligned raw v23 到 processed HDF5 v10 的事务式管线。 |
+| `raw_pointcloud.py` | raw v24 相机 metadata 到 canonical 点云输入的共享持久化边界。 |
+| `process.py` | aligned raw v24 到 processed HDF5 v10 的事务式管线。 |
 | `export.py` | processed HDF5 v10 到 Policy Zarr v5 的连续段感知事务式导出。 |
 
 ### `deployment/`
@@ -254,7 +254,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `replay_episode.py` | 物理回放入口。 |
 | `process_episodes.py` | raw → processed HDF5 离线处理。 |
 | `export_policy_zarr.py` | processed HDF5 → Policy Zarr 离线导出。 |
-| `visualize_episode.py` | raw v23 离线可视化与 canonical 点云即时预览。 |
+| `visualize_episode.py` | raw v24（legacy v23 显式 opt-in）离线可视化与 canonical 点云即时预览。 |
 | `visualize_episode_processed.py` | processed episode 离线可视化。 |
 | `calibrate_camera.py` | xArm+RealSense hand-eye 标定入口。 |
 | `calibrate_vr_heading.py` | VR heading 采集、质量门禁与 transform 发布。 |
@@ -269,6 +269,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `tests/test_arm_wrist_mapper.py` | 固定 VR→robot 标定、腕部旋转限幅状态与 tracking 毛刺恢复的纯几何合同。 |
 | `tests/test_coupled_command_publication.py` | coupled-command 非阻塞发布、active ticket 覆盖/撤销、ACK ownership 与运动准入合同。 |
 | `tests/test_data_segments.py` | source 缺口到 processed/Zarr episode 边界及跨缺口质量计算的合同。 |
+| `tests/test_recording_integrity.py` | raw v24 语义/sidecar manifest、legacy v23 opt-in 与 recorder fail-closed 发布合同。 |
 | `tests/test_deployment_timing.py` | run epoch、因果 observation grid、checkpoint 数据合同与 immutable plan deadline。 |
 | `tests/test_deployment_manifest.py` | deployment manifest 模态去重与顺序规范化合同。 |
 | `tests/test_keyboard_arm_limits.py` | keyboard 发布完整 IK endpoint、禁用通用 arm delta clip 的合同。 |

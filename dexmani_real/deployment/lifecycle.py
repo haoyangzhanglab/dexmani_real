@@ -167,6 +167,7 @@ def build_policy_worker_specs(
         ),
         arm_max_delta_rad_per_tick=runtime.policy.arm_max_delta_rad_per_tick,
         hand_max_delta_rad_per_tick=float(runtime.hand.hand_max_delta_rad_per_tick),
+        endpoint_delta_tolerance_rad=float(runtime.policy.endpoint_delta_tolerance_rad),
     )
     specs: list[WorkerSpec] = [
         WorkerSpec(

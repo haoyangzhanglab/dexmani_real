@@ -19,6 +19,7 @@ from typing import Any
 
 import yaml
 
+from dexmani_real.config.defaults import policy as policy_defaults
 from dexmani_real.deployment.observation import parse_observation_fields
 from dexmani_real.ipc.schema import SUPPORTED_POINT_CLOUD_COUNTS
 
@@ -129,6 +130,7 @@ class PolicyRuntimeConfig:
     point_cloud_transform: str = ""
     arm_max_delta_rad_per_tick: float | None = None
     hand_max_delta_rad_per_tick: float = 0.1
+    endpoint_delta_tolerance_rad: float = policy_defaults.endpoint_delta_tolerance_rad
 
     def __post_init__(self) -> None:
         if not isinstance(self.deployment, DeploymentConfig):
@@ -147,6 +149,14 @@ class PolicyRuntimeConfig:
             or self.hand_max_delta_rad_per_tick <= 0.0
         ):
             raise ValueError("hand_max_delta_rad_per_tick must be finite and positive")
+        if (
+            isinstance(self.endpoint_delta_tolerance_rad, bool)
+            or not math.isfinite(self.endpoint_delta_tolerance_rad)
+            or self.endpoint_delta_tolerance_rad < 0.0
+        ):
+            raise ValueError(
+                "endpoint_delta_tolerance_rad must be finite and non-negative"
+            )
         if "point_cloud" in parse_observation_fields(
             self.deployment.observation_fields
         ):

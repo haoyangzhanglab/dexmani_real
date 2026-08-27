@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +19,7 @@ from dexmani_real.robot_spec import (
     XARM7_XHAND_RIGHT_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
+from dexmani_real.utils.atomic_io import sha256_file
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -42,15 +42,6 @@ def _is_sha256(value: str | None) -> bool:
     except ValueError:
         return False
     return True
-
-
-def _sha256_file(path: Path) -> str:
-    """Return the SHA-256 digest of one replay-source file."""
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def preflight_model_paths() -> tuple[Path, ...]:
@@ -103,13 +94,19 @@ def resolve_episode_path(raw_path: str) -> tuple[str, str]:
 
 def load_trajectory(
     episode_path: str,
+    *,
+    allow_legacy_v23: bool = False,
 ) -> TrajectoryData:
-    """Load the exact submitted command stream for physical replay."""
+    """Load the exact submitted command stream for physical replay.
+
+    Raw schema v23 remains fail-closed unless the caller explicitly opts in;
+    its sidecars do not carry the v24 integrity manifest.
+    """
     resolved_path, _episode_name = resolve_episode_path(episode_path)
     if not Path(resolved_path).exists():
         raise FileNotFoundError(f"Episode not found: {episode_path}")
 
-    with EpisodeReader(resolved_path) as reader:
+    with EpisodeReader(resolved_path, allow_legacy_v23=allow_legacy_v23) as reader:
         if not reader.meets_min_duration:
             logger.warning(
                 "Episode %s is internally readable but below the configured minimum recording duration",
@@ -367,7 +364,9 @@ def _select_raw_trajectory_rows(
     )
 
 
-def load_processed_trajectory(episode_path: str) -> TrajectoryData:
+def load_processed_trajectory(
+    episode_path: str, *, allow_legacy_v23: bool = False
+) -> TrajectoryData:
     """Load exact raw commands selected and attested by one processed artifact.
 
     Processed ``float32`` action arrays are training data, not physical commands.
@@ -388,12 +387,14 @@ def load_processed_trajectory(episode_path: str) -> TrajectoryData:
             f"processed episode {artifact_path.name} requires raw source data.h5 at {source_path}"
         )
 
-    if _sha256_file(source_data_path) != expected_data_sha256:
+    if sha256_file(source_data_path) != expected_data_sha256:
         raise ValueError(
             f"processed episode {artifact_path.name} raw source data.h5 hash mismatch"
         )
 
-    raw_trajectory = load_trajectory(str(source_path))
+    raw_trajectory = load_trajectory(
+        str(source_path), allow_legacy_v23=allow_legacy_v23
+    )
     if raw_trajectory.num_frames != source_frames:
         raise ValueError(
             f"processed episode {artifact_path.name} source frame count does not match raw source"

@@ -2,9 +2,10 @@
 model repository.
 
 Encapsulates the ``dexmani_policy`` repo behind the single
-:class:`~dexmani_real.deployment.contracts.PolicyRuntime` Protocol so
-``deployment/*`` never imports it and the parent process / loader never touches
-torch. ``dexmani_policy`` is imported lazily — inside
+:class:`~dexmani_real.deployment.contracts.PolicyRuntime` Protocol so the
+deployment parent process and loader do not import this module or touch torch.
+This integration module itself imports torch when it is loaded in the inference
+worker. The external ``dexmani_policy`` repo is imported lazily — inside
 :meth:`DexManiPolicyRuntime.load` — so the architecture gate holds: the core
 runs end-to-end on the fake without the model repository installed.
 
@@ -35,6 +36,7 @@ from dexmani_real.deployment.manifest import (
     validate_manifest_against_deployment,
 )
 from dexmani_real.deployment.observation import ObservationBatch
+from dexmani_real.planning.poses import validate_rot6d_geometry
 from dexmani_real.robot_spec import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 _ARM_DOF = ARM_JOINT_SHAPE[0]
@@ -96,6 +98,9 @@ def _validate_training_data_contract(data_contract: Any, runtime_config: Any) ->
         "point_cloud_num_points": int(runtime_config.pointcloud_num_points),
         "point_cloud_feature_dim": 6,
     }
+    expected["endpoint_delta_tolerance_rad"] = (
+        runtime_config.endpoint_delta_tolerance_rad
+    )
     mismatches = {
         key: (data_contract.get(key), value)
         for key, value in expected.items()
@@ -460,22 +465,8 @@ class DexManiPolicyRuntime:
 
 
 def _validate_policy_rot6d(rot6d: np.ndarray) -> None:
-    """Reject rotations whose Gram-Schmidt projection is underdetermined."""
+    """Reject policy rotations whose Gram-Schmidt projection is underdetermined."""
     values = np.asarray(rot6d, dtype=np.float64)
     if values.ndim != 2 or values.shape[1] != EE_ROT6D_DIM:
         raise ValueError(f"ee_rot6d must be [N, {EE_ROT6D_DIM}]")
-    first = values[:, :3]
-    second = values[:, 3:]
-    first_norm = np.linalg.norm(first, axis=1)
-    second_norm = np.linalg.norm(second, axis=1)
-    unit_first = first / np.maximum(first_norm[:, None], 1e-12)
-    orthogonal_second = (
-        second - np.sum(second * unit_first, axis=1)[:, None] * unit_first
-    )
-    orthogonal_norm = np.linalg.norm(orthogonal_second, axis=1)
-    if (
-        np.any(first_norm < 1e-4)
-        or np.any(second_norm < 1e-4)
-        or np.any(orthogonal_norm / np.maximum(second_norm, 1e-12) < 1e-4)
-    ):
-        raise ValueError("ee_rot6d contains a zero or collinear basis")
+    validate_rot6d_geometry(values, label="ee_rot6d")

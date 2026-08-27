@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/process_episodes.py INPUT_ROOT [--profile PROFILE]``.
 
-Offline CLI that audits and compacts one task's depth-to-color aligned raw-v23
+Offline CLI that audits and compacts one task's depth-to-color aligned raw-v24
 episodes into processed HDF5 v10 files, one per source episode.
+Raw v23 is rejected by default; pass ``--allow-legacy-v23`` to make that
+compatibility boundary explicit (legacy sidecars have no v24 manifest).
 
 Directory mapping: ``episodes/<task>/episode_*`` (raw) is published to
 ``episodes_processed/<task>/episode_*.h5``.  Passing a single episode
@@ -92,7 +94,7 @@ def _route_library_logging_to_stderr() -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Audit and compact depth-to-color aligned raw-v23 Real episodes into one "
+            "Audit and compact depth-to-color aligned raw-v24 Real episodes into one "
             "processed-v10 "
             "HDF5 per source; seriously broken episodes are skipped with a warning."
         )
@@ -103,6 +105,14 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "One episode directory or a task directory whose direct children are "
             "episodes, e.g. episodes/pick_apple_messy/episode_*."
+        ),
+    )
+    parser.add_argument(
+        "--allow-legacy-v23",
+        action="store_true",
+        help=(
+            "Explicitly admit raw schema-v23 episodes; sidecar manifests are not "
+            "available for legacy data (default: reject v23)."
         ),
     )
     parser.add_argument(
@@ -158,6 +168,15 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--endpoint-delta-tolerance-rad",
+        type=float,
+        default=None,
+        help=(
+            "Numerical slack for the reject-only endpoint delta contract; "
+            "defaults to runtime.policy.endpoint_delta_tolerance_rad."
+        ),
+    )
+    parser.add_argument(
         "--quality-policy",
         choices=[policy.value for policy in QualityPolicy],
         default=None,
@@ -208,21 +227,27 @@ def _config(
     policy: QualityPolicy,
     runtime: object,
 ) -> ProcessingConfig:
-    return ProcessingConfig.from_runtime(
-        runtime,
-        profile=profile,
-        horizon=args.horizon,
-        min_full_windows=args.min_full_windows,
-        max_camera_age_s=args.max_camera_age_s,
-        max_observation_skew_s=args.max_observation_skew_s,
-        temporal_quality=TemporalQualityConfig(
+    overrides: dict[str, object] = {
+        "horizon": args.horizon,
+        "min_full_windows": args.min_full_windows,
+        "max_camera_age_s": args.max_camera_age_s,
+        "max_observation_skew_s": args.max_observation_skew_s,
+        "temporal_quality": TemporalQualityConfig(
             policy=policy,
             abrupt_arm_step_rad=args.abrupt_arm_step_rad,
             abrupt_hand_step_rad=args.abrupt_hand_step_rad,
         ),
-        pointcloud=dataclasses.replace(
+        "pointcloud": dataclasses.replace(
             runtime.pointcloud, num_points=args.pointcloud_num_points
         ),
+    }
+    endpoint_delta_tolerance_rad = args.endpoint_delta_tolerance_rad
+    if endpoint_delta_tolerance_rad is not None:
+        overrides["endpoint_delta_tolerance_rad"] = endpoint_delta_tolerance_rad
+    return ProcessingConfig.from_runtime(
+        runtime,
+        profile=profile,
+        **overrides,
     )
 
 
@@ -312,6 +337,8 @@ def _audit_episode(
     config: ProcessingConfig,
     annotation: EpisodeAnnotation | None,
     tmp_dir: Path,
+    *,
+    allow_legacy_v23: bool,
 ) -> tuple[dict, str | None] | tuple[None, str]:
     """Analyze one episode without writing; return (decision, error)."""
 
@@ -325,6 +352,7 @@ def _audit_episode(
             config,
             annotations_path=annotations_path,
             dry_run=True,
+            allow_legacy_v23=allow_legacy_v23,
         )
         return report["episodes"][0], None
     except Exception as exc:
@@ -340,6 +368,8 @@ def _audit_episodes(
     user_annotations: dict[str, EpisodeAnnotation],
     output_root: Path,
     tmp_dir: Path,
+    *,
+    allow_legacy_v23: bool,
 ) -> list[dict]:
     results: list[dict] = []
     bar = tqdm(
@@ -353,7 +383,12 @@ def _audit_episodes(
         annotation = user_annotations.get(episode.name)
         bar.set_postfix_str(episode.name)
         decision, error = _audit_episode(
-            episode, output_root, config, annotation, tmp_dir
+            episode,
+            output_root,
+            config,
+            annotation,
+            tmp_dir,
+            allow_legacy_v23=allow_legacy_v23,
         )
         if annotation is not None and not annotation.include:
             status = "user-excluded"
@@ -536,7 +571,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"error: invalid processing config: {exc}", file=sys.stderr)
                     return 2
                 results = _audit_episodes(
-                    episodes, profile_config, user_annotations, output_root, tmp_dir
+                    episodes,
+                    profile_config,
+                    user_annotations,
+                    output_root,
+                    tmp_dir,
+                    allow_legacy_v23=args.allow_legacy_v23,
                 )
                 decided = [
                     item["decision"]
@@ -561,7 +601,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     with tempfile.TemporaryDirectory(prefix="process_episodes-") as tmp_name:
         tmp_dir = Path(tmp_name)
         results = _audit_episodes(
-            episodes, config, user_annotations, output_root, tmp_dir
+            episodes,
+            config,
+            user_annotations,
+            output_root,
+            tmp_dir,
+            allow_legacy_v23=args.allow_legacy_v23,
         )
         _print_audit_summary(results)
         if args.dry_run:
@@ -584,7 +629,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         try:
             report = process_episode_root(
-                input_root, output_root, config, annotations_path=merged_path
+                input_root,
+                output_root,
+                config,
+                annotations_path=merged_path,
+                allow_legacy_v23=args.allow_legacy_v23,
             )
         except Exception as exc:
             # A publish-only failure (validation, transform, or h5py error)

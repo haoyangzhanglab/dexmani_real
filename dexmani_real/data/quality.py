@@ -267,8 +267,11 @@ def assess_temporal_quality(
 
     window = config.stall_window_frames
     for range_start, range_end in ranges:
-        for start in range(range_start, range_end - window):
-            end = start + window
+        # ``window`` is the number of samples, not the endpoint index delta.
+        # The inclusive endpoint is therefore ``start + window - 1`` and the
+        # final eligible start is ``range_end - window``.
+        for start in range(range_start, range_end - window + 1):
+            end = start + window - 1
             command_delta = float(np.max(np.abs(action_arm[end] - action_arm[start])))
             if command_delta < config.stall_arm_command_delta_rad:
                 continue

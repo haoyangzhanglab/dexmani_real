@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dexmani_real.config.defaults import policy as policy_defaults
 from dexmani_real.control.publication import (
     CommandPublishStatus,
     build_action_candidate,
@@ -46,7 +47,7 @@ from dexmani_real.planning import (
     XArm7PlannerConfig,
 )
 from dexmani_real.planning.paths import wrap_nearest_equivalent
-from dexmani_real.planning.poses import rot6d_to_quat_wxyz
+from dexmani_real.planning.poses import rot6d_to_quat_wxyz, validate_rot6d_geometry
 from dexmani_real.robot_spec import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
@@ -97,6 +98,7 @@ class CoordinatorConfig:
     # clip).  ``None`` disables the arm delta check.
     arm_max_delta_rad_per_tick: float | None = np.deg2rad(8.0)
     hand_max_delta_rad_per_tick: float = 0.1
+    endpoint_delta_tolerance_rad: float = policy_defaults.endpoint_delta_tolerance_rad
 
     @classmethod
     def from_runtime(
@@ -121,6 +123,9 @@ class CoordinatorConfig:
             ik_max_pose_error_rot_rad=float(runtime.policy.ik_max_pose_error_rot_rad),
             arm_max_delta_rad_per_tick=runtime.policy.arm_max_delta_rad_per_tick,
             hand_max_delta_rad_per_tick=float(runtime.hand.hand_max_delta_rad_per_tick),
+            endpoint_delta_tolerance_rad=float(
+                runtime.policy.endpoint_delta_tolerance_rad
+            ),
         )
 
 
@@ -189,6 +194,14 @@ def _adoptable(
         not bool(np.all(np.isfinite(rec[field][:n][valid]))) for field in arm_fields
     ):
         return False, "non-finite arm endpoint", 0
+    if not arm_present:
+        try:
+            validate_rot6d_geometry(
+                np.asarray(rec["ee_rot6d"][:n][valid], dtype=np.float64),
+                label="policy ee_rot6d",
+            )
+        except ValueError as exc:
+            return False, str(exc), 0
     return True, "", int(future[0])
 
 
@@ -324,6 +337,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
         hand_joint_upper_rad=config.hand_joint_upper_rad,
         max_arm_delta_rad=config.arm_max_delta_rad_per_tick,
         max_hand_delta_rad=config.hand_max_delta_rad_per_tick,
+        endpoint_delta_tolerance_rad=config.endpoint_delta_tolerance_rad,
         collision_check=planner.collision_model.check_transition_collision_free,
     )
     metrics = Metrics()
@@ -576,6 +590,20 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 ee_rot6d = np.asarray(
                     active_plan["ee_rot6d"][selected], dtype=np.float64
                 )
+                try:
+                    validate_rot6d_geometry(ee_rot6d, label="policy ee_rot6d")
+                except ValueError as exc:
+                    # Re-check immediately before IK as the plan is an IPC
+                    # proposal, not a trusted command. Never let the pose
+                    # converter manufacture an axis for a malformed target.
+                    _end_policy_run(
+                        shared,
+                        f"invalid EE rot6d: {exc}",
+                        abort=True,
+                        metrics=metrics,
+                        metric=SAFETY_REJECTIONS,
+                    )
+                    continue
                 if hand_qpos is not None:
                     planner.set_hand_qpos(hand_qpos)
                 ik_result = planner.solve_teleop_ik(

@@ -71,7 +71,7 @@ def _format_export_failure(exc: Exception) -> str:
         return (
             f"{message}\n"
             "hint: Policy Zarr v5 requires deployment-equivalent point-cloud "
-            "processed v10 data; reprocess raw v23 with --task-name <task>"
+            "processed v10 data; reprocess raw v24 with --task-name <task>"
         )
     return message
 

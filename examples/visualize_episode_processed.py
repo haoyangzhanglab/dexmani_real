@@ -8,7 +8,7 @@ no files; opens a Rerun viewer window (or prints a structure summary with
 ``--info``).
 
 Unlike ``examples/visualize_episode.py``, which derives a current-config point
-cloud preview from raw v23 RGB-D, this reads a single ``.h5`` file whose RGB,
+cloud preview from raw v24 RGB-D, this reads a single ``.h5`` file whose RGB,
 depth, and point cloud are already stored grid-aligned at ``(T, ...)`` with
 processing provenance. The point cloud is precomputed in the xArm base frame,
 so nothing is back-projected here.
@@ -42,7 +42,11 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.data.process import PROCESSED_SCHEMA_NAME, PROCESSED_SCHEMA_VERSION
+from dexmani_real.data.process import (
+    PROCESSED_SCHEMA_NAME,
+    PROCESSED_SCHEMA_VERSION,
+    validate_processed_admission,
+)
 from dexmani_real.ipc.schema import POINT_CLOUD_FEATURE_DIM, validate_point_cloud_array
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
@@ -182,6 +186,7 @@ def _validate_pointcloud_dataset(h5f: h5py.File) -> int | None:
 def print_episode_info(h5_path: str) -> None:
     """Print a human-readable summary of the processed file without opening Rerun."""
     with h5py.File(h5_path, "r") as f:
+        validate_processed_admission(f, label=Path(h5_path).name)
         attrs = f.attrs
         steps = int(attrs.get("episode_steps", -1))
         source_frames = int(attrs.get("source_frames", -1))
@@ -283,6 +288,7 @@ class ProcessedEpisodeVisualizer:
                 raise ValueError(
                     f"{self._h5_path.name} is not a processed HDF5 v10 artifact"
                 )
+            validate_processed_admission(self._h5f, label=self._h5_path.name)
             self._keys = _present_keys(self._h5f)
             if "joint_state" not in self._keys and "action" not in self._keys:
                 raise ValueError(

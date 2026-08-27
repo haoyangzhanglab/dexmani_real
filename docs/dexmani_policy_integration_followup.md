@@ -73,6 +73,7 @@ schema_name == "dexmani-real-policy-zarr"
 | `action_semantics` | `"deployment_grid_rate_limited_target"` |
 | `arm_max_delta_rad_per_tick` | finite positive float 或 null，且须与 deployment runtime 一致 |
 | `hand_max_delta_rad_per_tick` | finite positive float，且须与 deployment runtime 一致 |
+| `endpoint_delta_tolerance_rad` | finite non-negative float（允许 `0`），且须与 deployment runtime 一致 |
 | `deployment_equivalent` | boolean `true` |
 | `profile` | 当前 real adapter 只接受 `"pointcloud"` 或 `"rgb_pc"` |
 | `task_name` | 非空且不为 `"unknown"` |

@@ -32,6 +32,94 @@ def _as_f64(reader: EpisodeReader, name: str) -> np.ndarray:
     return np.asarray(reader.h5f[name][:], dtype=np.float64)
 
 
+def recompute_observation_skew_s(
+    source_timestamps_ns: np.ndarray, valid_mask: np.ndarray
+) -> np.ndarray:
+    """Recompute aggregate source skew from raw timestamps and validity masks.
+
+    The four source columns are arm, hand, VR, and camera.  A non-positive
+    timestamp is the raw invalid-source sentinel and is ignored when its mask
+    is false; rows with no valid source use the producer's legal ``0.0`` skew
+    sentinel.  A finite timestamp under a true mask is required so malformed
+    source metadata cannot pass visual cleaning.
+    """
+    timestamps = np.asarray(source_timestamps_ns)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if timestamps.ndim != 2 or timestamps.shape[1] != 4:
+        raise ValueError("source_timestamps_ns must have shape (frame_count, 4)")
+    if valid.shape != timestamps.shape:
+        raise ValueError("valid_mask must have the same shape as source_timestamps_ns")
+    if not np.issubdtype(timestamps.dtype, np.number):
+        raise ValueError("source_timestamps_ns must be numeric")
+    finite = np.isfinite(timestamps)
+    if np.any(valid & ~finite):
+        raise ValueError("valid source timestamps must be finite")
+
+    effective = valid & finite & (timestamps > 0)
+    expected = np.zeros(timestamps.shape[0], dtype=np.float64)
+    for row in np.flatnonzero(np.any(effective, axis=1)):
+        source_times = timestamps[row, effective[row]]
+        delta_ns: int | float
+        if np.issubdtype(timestamps.dtype, np.integer):
+            delta_ns = int(np.max(source_times)) - int(np.min(source_times))
+        else:
+            delta_ns = float(np.max(source_times)) - float(np.min(source_times))
+        expected[row] = delta_ns / 1e9
+    return expected
+
+
+def observation_skew_valid_mask(
+    recorded_observation_skew_s: np.ndarray,
+    source_timestamps_ns: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    max_observation_skew_s: float,
+) -> np.ndarray:
+    """Validate visual aggregate skew against its raw source provenance.
+
+    The aggregate is a deployment admission value: rows with the required
+    arm/VR/camera sources must be finite, non-negative, bounded, and equal to
+    the recomputed source span.  A row with no effective source may retain the
+    producer's historical ``0.0`` or explicit ``NaN`` sentinel, but it remains
+    invalid because the required-source mask is false.
+    """
+    recorded = np.asarray(recorded_observation_skew_s, dtype=np.float64)
+    timestamps = np.asarray(source_timestamps_ns)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if recorded.ndim != 1:
+        raise ValueError("recorded_observation_skew_s must be 1-D")
+    if timestamps.ndim != 2 or timestamps.shape[0] != recorded.shape[0]:
+        raise ValueError("source_timestamps_ns must have shape (len(recorded), 4)")
+    if valid.shape != timestamps.shape:
+        raise ValueError("valid_mask must have the same shape as source_timestamps_ns")
+    if not np.isfinite(max_observation_skew_s) or max_observation_skew_s <= 0.0:
+        raise ValueError("max_observation_skew_s must be finite and positive")
+
+    expected = recompute_observation_skew_s(timestamps, valid)
+    finite_timestamps = np.isfinite(timestamps)
+    source_metadata_valid = np.all(
+        (~valid) | (finite_timestamps & (timestamps > 0.0)), axis=1
+    )
+    required_sources_valid = np.all(valid[:, [0, 2, 3]], axis=1)
+    effective_sources = valid & finite_timestamps & (timestamps > 0.0)
+    has_effective_source = np.any(effective_sources, axis=1)
+    aggregate_finite_and_bounded = (
+        np.isfinite(recorded) & (recorded >= 0.0) & (recorded <= max_observation_skew_s)
+    )
+    aggregate_consistent = aggregate_finite_and_bounded & np.isclose(
+        recorded, expected, rtol=0.0, atol=1e-7
+    )
+    aggregate_consistent |= ~has_effective_source & (
+        np.isnan(recorded) | np.isclose(recorded, 0.0, rtol=0.0, atol=1e-15)
+    )
+    return (
+        required_sources_valid
+        & source_metadata_valid
+        & np.isfinite(expected)
+        & aggregate_consistent
+    )
+
+
 def _finite_stats(values: np.ndarray) -> dict[str, float | int | None]:
     finite = np.asarray(values, dtype=np.float64)
     finite = finite[np.isfinite(finite)]
@@ -141,6 +229,7 @@ def _deployment_action_limit_masks(
     previous_index: int | None = None
     arm_limit = config.arm_max_delta_rad_per_tick
     hand_limit = float(config.hand_max_delta_rad_per_tick)
+    endpoint_delta_tolerance = float(config.endpoint_delta_tolerance_rad)
 
     for index, candidate_row in enumerate(candidate):
         if not candidate_row:
@@ -162,10 +251,14 @@ def _deployment_action_limit_masks(
             hand_reference = arrays["action_hand"][previous_index]
 
         if arm_limit is not None and np.any(
-            np.abs(arrays["action_arm"][index] - arm_reference) > arm_limit
+            np.abs(arrays["action_arm"][index] - arm_reference)
+            > arm_limit + endpoint_delta_tolerance
         ):
             arm_invalid[index] = True
-        if np.any(np.abs(arrays["action_hand"][index] - hand_reference) > hand_limit):
+        if np.any(
+            np.abs(arrays["action_hand"][index] - hand_reference)
+            > hand_limit + endpoint_delta_tolerance
+        ):
             hand_invalid[index] = True
         action_invalid[index] = arm_invalid[index] or hand_invalid[index]
         # An excluded endpoint starts a new candidate segment.  Its successor
@@ -401,11 +494,18 @@ def analyze_episode(
     }
     visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
     if visual_profile:
-        # Raw v23 stores the state that a visual policy actually observes:
+        # Raw v24 (or explicitly admitted legacy v23) stores the state that a
+        # visual policy actually observes:
         # newest arm/hand feedback whose source time does not exceed the camera
         # source time.
         arrays["arm_qpos"] = _as_f64(reader, "policy_observation_arm_qpos")
         arrays["hand_qpos"] = _as_f64(reader, "policy_observation_hand_qpos")
+        arrays["observation_source_monotonic_ns"] = np.column_stack(
+            [
+                _as_i64(reader, f"{name}_source_monotonic_ns")
+                for name in ("arm", "hand", "vr", "camera")
+            ]
+        )
     else:
         arrays["arm_qpos"] = arrays["control_arm_qpos"]
         arrays["hand_qpos"] = arrays["control_hand_qpos"]
@@ -517,10 +617,14 @@ def analyze_episode(
             & (arrays["camera_health"] == int(CameraHealth.OK))
             & camera_age_valid
         )
+        observation_skew_valid = observation_skew_valid_mask(
+            arrays["observation_skew_s"],
+            arrays["observation_source_monotonic_ns"],
+            arrays["history_valid"],
+            max_observation_skew_s=config.max_observation_skew_s,
+        )
         reason_masks["observation_invalid"] = ~(
-            arrays["observation_valid"]
-            & np.isfinite(arrays["observation_skew_s"])
-            & (arrays["observation_skew_s"] <= config.max_observation_skew_s)
+            arrays["observation_valid"] & observation_skew_valid
         )
         policy_reference_ns = _as_i64(
             reader, "policy_observation_reference_monotonic_ns"

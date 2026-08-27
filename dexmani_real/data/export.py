@@ -16,7 +16,12 @@ import zarr
 
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.data.contracts import OutputProfile
-from dexmani_real.data.process import PROCESSED_SCHEMA_NAME, PROCESSED_SCHEMA_VERSION
+from dexmani_real.data.process import (
+    PROCESSED_SCHEMA_NAME,
+    PROCESSED_SCHEMA_VERSION,
+    validate_processed_payload,
+    validate_processed_provenance,
+)
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
@@ -77,34 +82,6 @@ def _text(value: Any) -> str:
     return str(value).strip()
 
 
-def _validate_dataset(path: Path, key: str, dataset: h5py.Dataset, length: int) -> None:
-    expected: dict[str, tuple[tuple[int, ...] | None, np.dtype[Any]]] = {
-        "joint_state": ((19,), np.dtype(np.float32)),
-        "action": ((19,), np.dtype(np.float32)),
-        "action_ee": ((21,), np.dtype(np.float32)),
-        "contact_force": ((5, 3), np.dtype(np.float32)),
-        "fingertip_points": ((5, 3), np.dtype(np.float32)),
-        "rgb": (None, np.dtype(np.uint8)),
-        "depth": (None, np.dtype(np.uint16)),
-        "camera_intrinsic": ((9,), np.dtype(np.float32)),
-        "camera_extrinsic": ((4, 4), np.dtype(np.float32)),
-        "point_cloud": (None, np.dtype(np.float32)),
-    }
-    if dataset.shape[0] != length:
-        raise ValueError(f"{path.name}: {key} length mismatch")
-    tail, dtype = expected[key]
-    if dataset.dtype != dtype:
-        raise ValueError(f"{path.name}: {key} dtype must be {dtype}")
-    if tail is not None and dataset.shape[1:] != tail:
-        raise ValueError(f"{path.name}: {key} tail shape must be {tail}")
-    if key == "rgb" and (len(dataset.shape) != 4 or dataset.shape[-1] != 3):
-        raise ValueError(f"{path.name}: rgb must be (N,H,W,3)")
-    if key == "depth" and len(dataset.shape) != 3:
-        raise ValueError(f"{path.name}: depth must be (N,H,W)")
-    if key == "point_cloud" and (len(dataset.shape) != 3 or dataset.shape[-1] != 6):
-        raise ValueError(f"{path.name}: point_cloud must be (N,P,6)")
-
-
 def _discover_processed_hdf5_paths(source_root: Path) -> tuple[Path, ...]:
     """Return direct processed artifacts from one task directory."""
 
@@ -151,56 +128,6 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
         dt = float(source.attrs.get("dt", np.nan))
         if not np.isfinite(dt) or dt <= 0.0:
             raise ValueError(f"{path.name}: dt must be finite and positive")
-        contiguity_tolerance_s = float(
-            source.attrs.get("source_contiguity_tolerance_s", np.nan)
-        )
-        if not np.isfinite(contiguity_tolerance_s) or contiguity_tolerance_s <= 0.0:
-            raise ValueError(f"{path.name}: invalid source contiguity tolerance")
-        try:
-            segment_ends = np.asarray(
-                source["provenance/source_segment_ends"][:], dtype=np.int64
-            )
-            source_rows = np.asarray(
-                source["provenance/source_row_index"][:], dtype=np.int64
-            )
-            source_samples = np.asarray(
-                source["provenance/source_sample_index"][:], dtype=np.int64
-            )
-            source_timestamps = np.asarray(
-                source["provenance/source_timestamp_s"][:], dtype=np.float64
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"{path.name}: invalid source segment provenance") from exc
-        if (
-            segment_ends.ndim != 1
-            or segment_ends.size == 0
-            or segment_ends[-1] != length
-            or np.any(np.diff(segment_ends) <= 0)
-        ):
-            raise ValueError(f"{path.name}: invalid source segment ends")
-        if (
-            source_rows.shape != (length,)
-            or source_samples.shape != (length,)
-            or source_timestamps.shape != (length,)
-            or not np.all(np.isfinite(source_timestamps))
-        ):
-            raise ValueError(f"{path.name}: invalid source timeline provenance")
-        discontinuity = (
-            (np.diff(source_rows) != 1)
-            | (np.diff(source_samples) != 1)
-            | (np.abs(np.diff(source_timestamps) - dt) > contiguity_tolerance_s)
-        )
-        expected_segment_ends = np.concatenate(
-            (np.flatnonzero(discontinuity).astype(np.int64) + 1, [length])
-        )
-        if not np.array_equal(segment_ends, expected_segment_ends):
-            raise ValueError(f"{path.name}: source segment boundaries mismatch")
-        segment_lengths = tuple(
-            int(value)
-            for value in np.diff(
-                np.concatenate((np.asarray([0], dtype=np.int64), segment_ends))
-            )
-        )
         task_name = _text(source.attrs.get("task_name", ""))
         if not task_name or task_name == "unknown":
             raise ValueError(f"{path.name}: explicit task_name is required")
@@ -211,12 +138,9 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
             raise ValueError(
                 f"{path.name}: task_name={task_name!r}, expected {config.expected_task_name!r}"
             )
+        resolved_pointcloud: PointCloudConfig | None = None
         shapes: dict[str, tuple[int, ...]] = {}
         dtypes: dict[str, np.dtype[Any]] = {}
-        for key in profile.dataset_keys:
-            _validate_dataset(path, key, source[key], length)
-            shapes[key] = tuple(int(value) for value in source[key].shape[1:])
-            dtypes[key] = np.dtype(source[key].dtype)
         semantics: dict[str, Any] = {
             "obs_alignment": _text(source.attrs.get("obs_alignment", "")),
             "observation_reference": _text(
@@ -236,6 +160,11 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
             ),
             "hand_max_delta_rad_per_tick": float(
                 source.attrs.get("hand_max_delta_rad_per_tick", np.nan)
+            ),
+            # This field is part of the processed deployment contract.  A
+            # missing/NaN value must not silently downgrade the endpoint gate.
+            "endpoint_delta_tolerance_rad": float(
+                source.attrs.get("endpoint_delta_tolerance_rad", np.nan)
             ),
             "deployment_equivalent": bool(
                 source.attrs.get("deployment_equivalent", False)
@@ -266,6 +195,8 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
             )
             or not np.isfinite(semantics["hand_max_delta_rad_per_tick"])
             or semantics["hand_max_delta_rad_per_tick"] <= 0.0
+            or not np.isfinite(semantics["endpoint_delta_tolerance_rad"])
+            or semantics["endpoint_delta_tolerance_rad"] < 0.0
             or not semantics["deployment_equivalent"]
             or not semantics["contact_force_unit"]
             or not semantics["contact_force_frame"]
@@ -360,6 +291,51 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
                     for key, value in point_cloud_semantics.items()
                 }
             )
+        expected_specs: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
+            "joint_state": ((length, 19), np.dtype(np.float32)),
+            "action": ((length, 19), np.dtype(np.float32)),
+            "action_ee": ((length, 21), np.dtype(np.float32)),
+            "contact_force": ((length, 5, 3), np.dtype(np.float32)),
+            "fingertip_points": ((length, 5, 3), np.dtype(np.float32)),
+        }
+        if profile.needs_rgb:
+            expected_specs.update(
+                {
+                    key: (tuple(int(value) for value in source[key].shape), dtype)
+                    for key, dtype in (
+                        ("rgb", np.dtype(np.uint8)),
+                        ("depth", np.dtype(np.uint16)),
+                        ("camera_intrinsic", np.dtype(np.float32)),
+                        ("camera_extrinsic", np.dtype(np.float32)),
+                    )
+                }
+            )
+        if profile.needs_pointcloud:
+            if resolved_pointcloud is None:
+                raise ValueError(f"{path.name}: point-cloud config is missing")
+            expected_specs["point_cloud"] = (
+                (length, resolved_pointcloud.num_points, 6),
+                np.dtype(np.float32),
+            )
+        validate_processed_payload(
+            source,
+            expected_specs=expected_specs,
+            length=length,
+            label=path.name,
+            validate_rgbd=profile.needs_rgb,
+            pointcloud_workspace=(
+                None if resolved_pointcloud is None else resolved_pointcloud.workspace
+            ),
+        )
+        provenance = validate_processed_provenance(
+            source,
+            expected_profile=profile.value,
+            label=path.name,
+        )
+        segment_lengths = provenance.segment_lengths
+        for key in profile.dataset_keys:
+            shapes[key] = tuple(int(value) for value in source[key].shape[1:])
+            dtypes[key] = np.dtype(source[key].dtype)
     return _Artifact(
         path=path,
         length=length,
@@ -403,25 +379,6 @@ def _load_artifacts(
     return artifacts
 
 
-def _validate_artifact_payloads(
-    artifacts: tuple[_Artifact, ...], *, chunk_frames: int
-) -> None:
-    """Reject non-finite floating payloads without creating a Zarr store."""
-
-    for artifact in artifacts:
-        with h5py.File(artifact.path, "r") as source:
-            for key, dtype in artifact.dataset_dtypes.items():
-                if not np.issubdtype(dtype, np.floating):
-                    continue
-                for row_start in range(0, artifact.length, chunk_frames):
-                    row_end = min(artifact.length, row_start + chunk_frames)
-                    block = np.asarray(source[key][row_start:row_end])
-                    if not np.all(np.isfinite(block)):
-                        raise ValueError(
-                            f"{artifact.path.name}: {key} contains NaN/Inf"
-                        )
-
-
 def _export_plan_report(
     artifacts: tuple[_Artifact, ...], *, input_root: str | Path
 ) -> dict[str, Any]:
@@ -459,7 +416,6 @@ def preflight_processed_hdf5_to_zarr(
 
     resolved = config or PolicyZarrExportConfig()
     artifacts = _load_artifacts(input_root, resolved)
-    _validate_artifact_payloads(artifacts, chunk_frames=resolved.chunk_frames)
     return _export_plan_report(artifacts, input_root=input_root)
 
 
@@ -557,6 +513,9 @@ def export_processed_hdf5_to_zarr(
     if target_is_occupied(target):
         raise FileExistsError(f"refusing to overwrite existing policy Zarr: {target}")
     artifacts = _load_artifacts(source_root, resolved)
+    # All payload admission (including finite checks) completes before a
+    # staging directory is created, so a rejected source leaves no partial
+    # export artifact behind.
     total_frames = sum(artifact.length for artifact in artifacts)
     episode_ends = np.cumsum(
         [length for artifact in artifacts for length in artifact.segment_lengths],

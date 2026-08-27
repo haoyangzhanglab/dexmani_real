@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
 from pathlib import Path
+
+
+def sha256_file(path: str | Path) -> str:
+    """Return a file's SHA-256 digest without changing its contents."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def target_is_occupied(path: str | Path) -> bool:
@@ -54,7 +64,9 @@ def atomic_publish(src: str | Path, dst: str | Path) -> Path:
     return target
 
 
-def atomic_json_dump(obj: object, path: str | Path, *, indent: int = 2, ensure_ascii: bool = True) -> Path:
+def atomic_json_dump(
+    obj: object, path: str | Path, *, indent: int = 2, ensure_ascii: bool = True
+) -> Path:
     """Atomically write ``obj`` as JSON, overwriting any existing target.
 
     Mirrors the proven ``mkstemp -> dump -> flush -> fsync -> replace -> fsync

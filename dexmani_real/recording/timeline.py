@@ -136,7 +136,6 @@ class TimestampAlignedBuffer:
         self._last_source_index: int = -1
         self._last_source_timestamp: float = float("nan")
 
-
     @property
     def data(self) -> dict[str, np.ndarray]:
         """Aligned data arrays trimmed to actual used size."""
@@ -159,7 +158,6 @@ class TimestampAlignedBuffer:
     def __len__(self) -> int:
         return self._size
 
-
     def reanchor(self, next_source_timestamp: float) -> None:
         """Start the next contiguous storage slot at a new wall-time anchor.
 
@@ -176,7 +174,9 @@ class TimestampAlignedBuffer:
         if self._size > 0 and self._timestamp_buffer is not None:
             previous_timestamp = float(self._timestamp_buffer[self._size - 1])
             if timestamp <= previous_timestamp:
-                raise ValueError("re-anchor timestamp must be newer than the previous stored slot")
+                raise ValueError(
+                    "re-anchor timestamp must be newer than the previous stored slot"
+                )
         self.start_time = timestamp - self._next_global_idx * self.dt
 
     def add(
@@ -209,7 +209,9 @@ class TimestampAlignedBuffer:
         self._next_global_idx = next_global_idx
 
         if len(global_idxs) == 0:
-            return BufferAddResult(previous_size, self._size, False, self._recording_stopped)
+            return BufferAddResult(
+                previous_size, self._size, False, self._recording_stopped
+            )
 
         source_global_idx = global_idxs[0]
         gap_idxs = list(range(previous_next_idx, source_global_idx))
@@ -245,13 +247,21 @@ class TimestampAlignedBuffer:
                 for key, value in self._last_source_data.items():
                     if key in self._data_buffer:
                         self._data_buffer[key][grid_idx] = value
-                self._data_buffer["source_sample_index"][grid_idx] = self._last_source_index
-                self._data_buffer["source_timestamp"][grid_idx] = self._last_source_timestamp
-                self._data_buffer["fill_reason"][grid_idx] = int(FillReason.CAUSAL_HOLD_LAST)
+                self._data_buffer["source_sample_index"][
+                    grid_idx
+                ] = self._last_source_index
+                self._data_buffer["source_timestamp"][
+                    grid_idx
+                ] = self._last_source_timestamp
+                self._data_buffer["fill_reason"][grid_idx] = int(
+                    FillReason.CAUSAL_HOLD_LAST
+                )
             else:
                 self._data_buffer["source_sample_index"][grid_idx] = -1
                 self._data_buffer["source_timestamp"][grid_idx] = np.nan
-                self._data_buffer["fill_reason"][grid_idx] = int(FillReason.LEADING_PLACEHOLDER)
+                self._data_buffer["fill_reason"][grid_idx] = int(
+                    FillReason.LEADING_PLACEHOLDER
+                )
 
         if source_global_idx < self.max_record_steps:
             for key, value in data.items():
@@ -259,14 +269,23 @@ class TimestampAlignedBuffer:
                     self._data_buffer[key][source_global_idx] = value
             self._data_buffer["flag_sample_valid"][source_global_idx] = True
             self._data_buffer["source_sample_index"][source_global_idx] = source_index
-            self._data_buffer["source_timestamp"][source_global_idx] = timestamp
+            # ``source_timestamp`` identifies the selected recorder source row
+            # on the logical grid.  It is deliberately the same anchor as
+            # ``timestamp``; modality producer clocks remain in their own
+            # provenance fields.
+            source_anchor = self.start_time + source_global_idx * self.dt
+            self._data_buffer["source_timestamp"][source_global_idx] = source_anchor
             self._data_buffer["fill_reason"][source_global_idx] = int(FillReason.SOURCE)
             self._last_source_data = {
-                key: np.array(value, copy=True) if isinstance(value, np.ndarray) else value
+                key: (
+                    np.array(value, copy=True)
+                    if isinstance(value, np.ndarray)
+                    else value
+                )
                 for key, value in data.items()
             }
             self._last_source_index = source_index
-            self._last_source_timestamp = timestamp
+            self._last_source_timestamp = source_anchor
 
         if self._timestamp_buffer is not None:
             # Assign unique monotonic timestamps to synthetic slots.
@@ -278,21 +297,27 @@ class TimestampAlignedBuffer:
             previous_size=previous_size,
             size=self._size,
             source_written=source_global_idx < self.max_record_steps,
-            capacity_reached=self._recording_stopped or self._size >= self.max_record_steps,
+            capacity_reached=self._recording_stopped
+            or self._size >= self.max_record_steps,
         )
 
-
     @staticmethod
-    def _field_layout(key: str, value: Any) -> tuple[tuple[int, ...], np.dtype[Any]]:
+    def _field_array(key: str, value: Any) -> np.ndarray:
         if isinstance(value, np.ndarray):
-            return value.shape, value.dtype
+            return value
         if isinstance(value, (float, int, np.generic)):
-            scalar = np.asarray(value)
-            return scalar.shape, scalar.dtype
+            return np.asarray(value)
         raise TypeError(
             f"TimestampAlignedBuffer field {key!r} must be a numpy array or numeric scalar, "
             f"got {type(value).__name__}"
         )
+
+    @classmethod
+    def _field_layout(
+        cls, key: str, value: Any
+    ) -> tuple[tuple[int, ...], np.dtype[Any]]:
+        array = cls._field_array(key, value)
+        return array.shape, array.dtype
 
     def _validate_input_layout(self, data: Mapping[str, Any]) -> None:
         """Require stable source keys, shapes, and dtypes across ``add`` calls."""
@@ -339,32 +364,20 @@ class TimestampAlignedBuffer:
         """Pre-allocate numpy arrays based on the shape/dtype of each field."""
         self._data_buffer = {}
         for key, value in data.items():
-            if isinstance(value, np.ndarray):
-                shape = (self.max_record_steps,) + value.shape
-                if np.issubdtype(value.dtype, np.floating):
-                    self._data_buffer[key] = np.full(shape, np.nan, dtype=value.dtype)
-                else:
-                    self._data_buffer[key] = np.zeros(shape, dtype=value.dtype)
-            elif isinstance(value, (float, int, np.generic)):
-                scalar = np.asarray(value)
-                if np.issubdtype(scalar.dtype, np.floating):
-                    self._data_buffer[key] = np.full(
-                        self.max_record_steps, np.nan, dtype=scalar.dtype
-                    )
-                else:
-                    self._data_buffer[key] = np.zeros(
-                        self.max_record_steps, dtype=scalar.dtype
-                    )
-            else:
-                # ``_validate_input_layout`` runs immediately before allocation.
-                raise TypeError(
-                    f"TimestampAlignedBuffer field {key!r} has unsupported type "
-                    f"{type(value).__name__}"
-                )
+            array = self._field_array(key, value)
+            shape = (self.max_record_steps,) + array.shape
+            fill_value = np.nan if np.issubdtype(array.dtype, np.floating) else 0
+            self._data_buffer[key] = np.full(shape, fill_value, dtype=array.dtype)
 
-        self._data_buffer["flag_sample_valid"] = np.zeros(self.max_record_steps, dtype=bool)
-        self._data_buffer["source_sample_index"] = np.full(self.max_record_steps, -1, dtype=np.int64)
-        self._data_buffer["source_timestamp"] = np.full(self.max_record_steps, np.nan, dtype=np.float64)
+        self._data_buffer["flag_sample_valid"] = np.zeros(
+            self.max_record_steps, dtype=bool
+        )
+        self._data_buffer["source_sample_index"] = np.full(
+            self.max_record_steps, -1, dtype=np.int64
+        )
+        self._data_buffer["source_timestamp"] = np.full(
+            self.max_record_steps, np.nan, dtype=np.float64
+        )
         self._data_buffer["fill_reason"] = np.full(
             self.max_record_steps, int(FillReason.LEADING_PLACEHOLDER), dtype=np.uint8
         )

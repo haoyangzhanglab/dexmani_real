@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.config.defaults import policy as policy_defaults
 from dexmani_real.control.action import ActionCandidate
 from dexmani_real.robot_spec import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.utils.log import get_logger
@@ -56,7 +57,8 @@ class SafetyGate:
     shared gate used by teleop/replay/calibration keeps its existing behavior;
     only the learned-policy deployment enables them.  Delta limits *reject*
     whole (never clip): clipping a learned action silently rewrites the model's
-    intent (plan §9).
+    intent (plan §9).  ``endpoint_delta_tolerance_rad`` is a shared numerical
+    slack applied to both arm and hand endpoint predicates.
     """
 
     def __init__(
@@ -69,6 +71,9 @@ class SafetyGate:
         workspace_check: Callable[[np.ndarray, np.ndarray], bool] | None = None,
         max_arm_delta_rad: Any = None,
         max_hand_delta_rad: Any = None,
+        endpoint_delta_tolerance_rad: float = (
+            policy_defaults.endpoint_delta_tolerance_rad
+        ),
         collision_check: (
             Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], bool] | None
         ) = None,
@@ -99,6 +104,15 @@ class SafetyGate:
         self.max_hand_delta_rad = self._coerce_delta(
             max_hand_delta_rad, HAND_JOINT_SHAPE, "max_hand_delta_rad"
         )
+        if (
+            isinstance(endpoint_delta_tolerance_rad, bool)
+            or not np.isfinite(endpoint_delta_tolerance_rad)
+            or endpoint_delta_tolerance_rad < 0.0
+        ):
+            raise ValueError(
+                "endpoint_delta_tolerance_rad must be finite and non-negative"
+            )
+        self.endpoint_delta_tolerance_rad = float(endpoint_delta_tolerance_rad)
         self.collision_check = collision_check
 
     @staticmethod
@@ -204,14 +218,20 @@ class SafetyGate:
             return GateResult(False, GateRejectCode.HAND_JOINT_LIMIT)
         # Per-tick delta limits (reject, never clip).
         if self.max_arm_delta_rad is not None and candidate.arm_qpos is not None:
-            if np.any(np.abs(arm_end - arm_delta_start) > self.max_arm_delta_rad):
+            if np.any(
+                np.abs(arm_end - arm_delta_start)
+                > self.max_arm_delta_rad + self.endpoint_delta_tolerance_rad
+            ):
                 return GateResult(False, GateRejectCode.ARM_DELTA_LIMIT)
         if (
             self.max_hand_delta_rad is not None
             and hand_end is not None
             and hand_delta_start is not None
         ):
-            if np.any(np.abs(hand_end - hand_delta_start) > self.max_hand_delta_rad):
+            if np.any(
+                np.abs(hand_end - hand_delta_start)
+                > self.max_hand_delta_rad + self.endpoint_delta_tolerance_rad
+            ):
                 return GateResult(False, GateRejectCode.HAND_DELTA_LIMIT)
         if self.workspace_check is not None and candidate.arm_qpos is not None:
             try:
@@ -250,6 +270,9 @@ def planner_action_safety_gate(
     hand_joint_upper_rad: tuple[float, ...],
     max_arm_delta_rad: Any = None,
     max_hand_delta_rad: Any = None,
+    endpoint_delta_tolerance_rad: float = (
+        policy_defaults.endpoint_delta_tolerance_rad
+    ),
     collision_check: (
         Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], bool] | None
     ) = None,
@@ -258,6 +281,7 @@ def planner_action_safety_gate(
 
     ``max_arm_delta_rad`` / ``max_hand_delta_rad`` / ``collision_check`` are
     opt-in; each caller enables only the checks owned by its command path.
+    The endpoint tolerance defaults to the canonical policy runtime default.
     """
     return SafetyGate(
         arm_joint_lower_rad=arm_joint_lower_rad,
@@ -267,5 +291,6 @@ def planner_action_safety_gate(
         workspace_check=planner.is_workspace_segment_safe,
         max_arm_delta_rad=max_arm_delta_rad,
         max_hand_delta_rad=max_hand_delta_rad,
+        endpoint_delta_tolerance_rad=endpoint_delta_tolerance_rad,
         collision_check=collision_check,
     )

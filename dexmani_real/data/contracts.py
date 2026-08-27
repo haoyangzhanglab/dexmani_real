@@ -73,6 +73,8 @@ class TemporalQualityConfig:
     impulse_hand_min_rad: float = 0.12
     impulse_min_return_ratio: float = 0.5
     tracking_persistence_frames: int = 4
+    # Number of samples included in each feedback/command stall window. The
+    # first and last sample are compared, so a valid window requires >= 2.
     stall_window_frames: int = 8
     stall_arm_command_delta_rad: float = 0.15
     stall_arm_state_delta_rad: float = 0.02
@@ -100,9 +102,18 @@ class TemporalQualityConfig:
             or not 0.0 < self.impulse_min_return_ratio <= 1.0
         ):
             raise ValueError("impulse_min_return_ratio must be in (0, 1]")
-        positive_ints = (self.tracking_persistence_frames, self.stall_window_frames)
-        if any(not isinstance(value, int) or value <= 0 for value in positive_ints):
-            raise ValueError("temporal quality window sizes must be positive integers")
+        if (
+            isinstance(self.tracking_persistence_frames, bool)
+            or not isinstance(self.tracking_persistence_frames, int)
+            or self.tracking_persistence_frames <= 0
+        ):
+            raise ValueError("tracking_persistence_frames must be a positive integer")
+        if (
+            isinstance(self.stall_window_frames, bool)
+            or not isinstance(self.stall_window_frames, int)
+            or self.stall_window_frames < 2
+        ):
+            raise ValueError("stall_window_frames must be an integer >= 2")
         nonnegative_ints = (
             self.stall_max_applied_command_advance,
             self.strict_guard_before_frames,
@@ -169,6 +180,8 @@ class ProcessingConfig:
     # contract before an episode can enter a deployment training set.
     arm_max_delta_rad_per_tick: float | None = policy.arm_max_delta_rad_per_tick
     hand_max_delta_rad_per_tick: float = hand.hand_max_delta_rad_per_tick
+    # Shared numerical slack for the reject-only endpoint-delta predicate.
+    endpoint_delta_tolerance_rad: float = policy.endpoint_delta_tolerance_rad
     tracking_error_warn_rad: float = arm.tracking_error_warn_rad
     temporal_quality: TemporalQualityConfig = field(
         default_factory=TemporalQualityConfig
@@ -202,6 +215,9 @@ class ProcessingConfig:
             ).arm_max_delta_rad_per_tick,
             "hand_max_delta_rad_per_tick": float(
                 hand_config.hand_max_delta_rad_per_tick
+            ),
+            "endpoint_delta_tolerance_rad": float(
+                getattr(runtime, "policy").endpoint_delta_tolerance_rad
             ),
             "tracking_error_warn_rad": float(arm_config.tracking_error_warn_rad),
         }
@@ -259,6 +275,14 @@ class ProcessingConfig:
             or self.hand_max_delta_rad_per_tick <= 0.0
         ):
             raise ValueError("hand_max_delta_rad_per_tick must be finite and positive")
+        if (
+            isinstance(self.endpoint_delta_tolerance_rad, bool)
+            or not np.isfinite(self.endpoint_delta_tolerance_rad)
+            or self.endpoint_delta_tolerance_rad < 0.0
+        ):
+            raise ValueError(
+                "endpoint_delta_tolerance_rad must be finite and non-negative"
+            )
         if not 0 <= self.gzip_level <= 9:
             raise ValueError("gzip_level must be in [0, 9]")
         limit_pairs = (
@@ -334,6 +358,7 @@ class ProcessingConfig:
             "hand_action_limit_upper_rad": list(self.hand_action_limit_upper_rad),
             "arm_max_delta_rad_per_tick": self.arm_max_delta_rad_per_tick,
             "hand_max_delta_rad_per_tick": self.hand_max_delta_rad_per_tick,
+            "endpoint_delta_tolerance_rad": self.endpoint_delta_tolerance_rad,
             "tracking_error_warn_rad": self.tracking_error_warn_rad,
             "temporal_quality": self.temporal_quality.to_dict(),
         }

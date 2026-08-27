@@ -9,6 +9,9 @@ from .types import Pose
 
 _WXYZ_TO_XYZW = np.array([1, 2, 3, 0], dtype=np.intp)
 _XYZW_TO_WXYZ = np.array([3, 0, 1, 2], dtype=np.intp)
+_ROT6D_MIN_BASIS_NORM = 1e-4
+_ROT6D_MIN_ORTHOGONAL_RATIO = 1e-4
+_ROT6D_CANONICAL_TOLERANCE = 1e-5
 
 __all__ = [
     "compose_pose",
@@ -19,12 +22,20 @@ __all__ = [
     "quat_multiply",
     "quat_wxyz_to_rot6d",
     "quat_wxyz_to_rotmat",
+    "validate_canonical_rot6d",
+    "validate_rot6d_geometry",
     "rot6d_to_quat_wxyz",
+    "rot6d_to_rotmat",
 ]
 
 
 def ensure_qpos(qpos: np.ndarray, dof: int, name: str) -> np.ndarray:
-    if isinstance(qpos, np.ndarray) and qpos.ndim == 1 and qpos.shape[0] == dof and qpos.dtype == np.float64:
+    if (
+        isinstance(qpos, np.ndarray)
+        and qpos.ndim == 1
+        and qpos.shape[0] == dof
+        and qpos.dtype == np.float64
+    ):
         return qpos
     array = np.asarray(qpos, dtype=np.float64).reshape(-1)
     if array.shape[0] != dof:
@@ -102,38 +113,99 @@ def normalize_quat_wxyz(q: np.ndarray) -> np.ndarray:
     return q / norm
 
 
+def validate_rot6d_geometry(
+    rot6d: np.ndarray,
+    *,
+    label: str = "rot6d",
+    min_basis_norm: float = _ROT6D_MIN_BASIS_NORM,
+    min_orthogonal_ratio: float = _ROT6D_MIN_ORTHOGONAL_RATIO,
+) -> np.ndarray:
+    """Validate a finite, non-degenerate rotation-6D geometry payload.
+
+    Model outputs may use arbitrary non-zero scale for the two basis columns;
+    only their direction and separation are required here.  The canonical
+    label validator below additionally requires unit, mutually orthogonal
+    columns.  A batch with shape ``(N, 6)`` is returned for both single-row
+    and batched inputs.
+    """
+    values = np.asarray(rot6d, dtype=np.float64)
+    if values.ndim == 1:
+        if values.shape != (6,):
+            raise ValueError(f"{label} must have shape (6,), got {values.shape}")
+        values = values[None, :]
+    elif values.ndim != 2 or values.shape[1] != 6:
+        raise ValueError(f"{label} must have shape (N, 6), got {values.shape}")
+    if (
+        not np.isfinite(min_basis_norm)
+        or min_basis_norm <= 0.0
+        or not np.isfinite(min_orthogonal_ratio)
+        or min_orthogonal_ratio <= 0.0
+    ):
+        raise ValueError("rot6d geometry thresholds must be finite and positive")
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"{label} contains NaN/Inf")
+
+    first = values[:, :3]
+    second = values[:, 3:]
+    first_norm = np.linalg.norm(first, axis=1)
+    second_norm = np.linalg.norm(second, axis=1)
+    unit_first = first / np.maximum(first_norm[:, None], min_basis_norm)
+    orthogonal_second = (
+        second - np.sum(second * unit_first, axis=1)[:, None] * unit_first
+    )
+    orthogonal_norm = np.linalg.norm(orthogonal_second, axis=1)
+    if (
+        np.any(first_norm < min_basis_norm)
+        or np.any(second_norm < min_basis_norm)
+        or np.any(
+            orthogonal_norm / np.maximum(second_norm, min_basis_norm)
+            < min_orthogonal_ratio
+        )
+    ):
+        raise ValueError(f"{label} contains a zero or near-collinear basis")
+    return values
+
+
+def validate_canonical_rot6d(
+    rot6d: np.ndarray,
+    *,
+    label: str = "rot6d",
+    tolerance: float = _ROT6D_CANONICAL_TOLERANCE,
+) -> np.ndarray:
+    """Validate canonical unit, orthogonal rotation-6D labels."""
+    values = validate_rot6d_geometry(rot6d, label=label)
+    if not np.isfinite(tolerance) or tolerance <= 0.0:
+        raise ValueError("rot6d canonical tolerance must be finite and positive")
+    first = values[:, :3]
+    second = values[:, 3:]
+    if (
+        not np.allclose(np.linalg.norm(first, axis=1), 1.0, rtol=0.0, atol=tolerance)
+        or not np.allclose(
+            np.linalg.norm(second, axis=1), 1.0, rtol=0.0, atol=tolerance
+        )
+        or not np.allclose(
+            np.sum(first * second, axis=1), 0.0, rtol=0.0, atol=tolerance
+        )
+    ):
+        raise ValueError(f"{label} must use canonical unit orthogonal columns")
+    return values
+
+
 def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
     """6D rotation → WXYZ quaternion via Gram-Schmidt orthonormalization.
 
-    r6 = [c1x, c1y, c1z, c2x, c2y, c2z]  (first two columns of a 3×3 rotation matrix).
-
-    Robust against degenerate inputs: near-zero c1, collinear c1/c2, and
-    negative-determinant matrices — all of which can arise from policy predictions.
+    ``r6`` is ``[c1x,c1y,c1z,c2x,c2y,c2z]``.  Non-finite and near-degenerate
+    inputs are rejected; no missing basis axis is invented implicitly.
     """
-    r6 = np.asarray(r6, dtype=np.float64).reshape(6)
+    r6 = validate_rot6d_geometry(r6, label="rot6d")[0]
     c1 = r6[:3].copy()
     c2 = r6[3:].copy()
 
     c1_norm = float(np.linalg.norm(c1))
-    if c1_norm < 1e-12:
-        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-
     u1 = c1 / c1_norm
     c2_orth = c2 - np.dot(c2, u1) * u1
     c2_orth_norm = float(np.linalg.norm(c2_orth))
-
-    if c2_orth_norm < 1e-12:
-        idx = int(np.argmin(np.abs(u1)))
-        e = np.zeros(3, dtype=np.float64)
-        e[idx] = 1.0
-        u2 = np.cross(u1, e)
-        if float(np.linalg.norm(u2)) < 1e-12:
-            e = np.zeros(3, dtype=np.float64)
-            e[(idx + 1) % 3] = 1.0
-            u2 = np.cross(u1, e)
-        u2 = u2 / np.linalg.norm(u2)
-    else:
-        u2 = c2_orth / c2_orth_norm
+    u2 = c2_orth / c2_orth_norm
 
     u3 = np.cross(u1, u2)
     R = np.column_stack([u1, u2, u3])

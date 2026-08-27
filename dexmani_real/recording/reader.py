@@ -30,11 +30,13 @@ import numpy as np
 from dexmani_real.recording.schema import (
     ARM_SENT_MARKER,
     EPISODE_SCHEMA_VERSION,
+    LEGACY_EPISODE_SCHEMA_VERSION,
     validate_data_layout,
+    validate_raw_member_hashes,
+    validate_raw_semantics,
 )
-from dexmani_real.recording.timeline import FillReason
 from dexmani_real.recording.video import VideoDecoder
-from dexmani_real.robot_spec import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.utils.atomic_io import sha256_file
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -114,10 +116,11 @@ class EpisodeReader:
     (``f["arm_qpos"]``, ``f["depth"]``).
     """
 
-    def __init__(self, h5_path: str | Path) -> None:
+    def __init__(self, h5_path: str | Path, *, allow_legacy_v23: bool = False) -> None:
         self._path = Path(h5_path)
         self._closed = False
         self._cache: dict[str, np.ndarray] = {}
+        self._legacy_v23 = False
         if not self._path.is_dir():
             raise ValueError(f"episode must be a published directory: {self._path}")
 
@@ -138,15 +141,36 @@ class EpisodeReader:
             self._data_h5f,
             {"depth": depth_h5f},
         )
-        self._rgb_decoder: VideoDecoder | None = VideoDecoder(paths["rgb"])
+        self._rgb_decoder: VideoDecoder | None = None
         schema_version = self.schema_version
-        if schema_version != EPISODE_SCHEMA_VERSION:
+        if schema_version == LEGACY_EPISODE_SCHEMA_VERSION:
+            if not allow_legacy_v23:
+                self.close()
+                raise ValueError(
+                    "raw schema v23 is legacy and has no sidecar integrity manifest; "
+                    "pass allow_legacy_v23=True to read it explicitly"
+                )
+            self._legacy_v23 = True
+            logger.warning(
+                "Reading legacy raw schema v23 without sidecar integrity verification: %s",
+                self._path,
+            )
+        elif schema_version != EPISODE_SCHEMA_VERSION:
             self.close()
             raise ValueError(
                 f"unsupported episode schema v{schema_version}; expected v"
-                f"{EPISODE_SCHEMA_VERSION}. Historical episodes must be migrated "
-                "or re-recorded outside this runtime."
+                f"{EPISODE_SCHEMA_VERSION}. v{LEGACY_EPISODE_SCHEMA_VERSION} requires "
+                "allow_legacy_v23=True; older episodes must be migrated or re-recorded."
             )
+        if not self._legacy_v23:
+            manifest_errors = self._sidecar_manifest_errors()
+            if manifest_errors:
+                self.close()
+                raise ValueError(
+                    "raw sidecar manifest validation failed: "
+                    + "; ".join(manifest_errors)
+                )
+        self._rgb_decoder = VideoDecoder(paths["rgb"])
 
     @property
     def h5f(self) -> MergedH5File:
@@ -165,6 +189,29 @@ class EpisodeReader:
     def schema_version(self) -> int:
         meta = self._h5f.get("meta")
         return 0 if meta is None else int(meta.attrs.get("schema_version", 0) or 0)
+
+    @property
+    def legacy_v23(self) -> bool:
+        """Whether this reader was explicitly opened in legacy-v23 mode."""
+        return self._legacy_v23
+
+    def _sidecar_manifest_errors(self) -> tuple[str, ...]:
+        """Recompute sidecar hashes and compare them with data.h5 metadata.
+
+        Do not cache this result: callers may ask for ``validity`` after a
+        sidecar has been modified while the reader is open.
+        """
+        meta = self._h5f.get("meta")
+        if meta is None:
+            return ("data.h5 is missing /meta",)
+        try:
+            member_sha256 = {
+                "depth.h5": sha256_file(self._path / "depth.h5"),
+                "rgb.mp4": sha256_file(self._path / "rgb.mp4"),
+            }
+        except (FileNotFoundError, OSError) as exc:
+            return (f"failed to hash raw sidecars: {type(exc).__name__}: {exc}",)
+        return validate_raw_member_hashes(meta.attrs, member_sha256)
 
     @property
     def min_frames_met(self) -> bool:
@@ -223,16 +270,15 @@ class EpisodeReader:
         if meta is None:
             return ValidityState.INVALID
         frame_count = int(meta.attrs.get("num_frames", -1))
+        datasets = {
+            key: dataset
+            for key, dataset in self._data_h5f.items()
+            if isinstance(dataset, h5py.Dataset)
+        }
         dataset_shapes = {
-            key: tuple(dataset.shape)
-            for key, dataset in self._data_h5f.items()
-            if isinstance(dataset, h5py.Dataset)
+            key: tuple(dataset.shape) for key, dataset in datasets.items()
         }
-        dataset_dtypes = {
-            key: dataset.dtype
-            for key, dataset in self._data_h5f.items()
-            if isinstance(dataset, h5py.Dataset)
-        }
+        dataset_dtypes = {key: dataset.dtype for key, dataset in datasets.items()}
         layout_errors = validate_data_layout(
             dataset_shapes,
             dataset_dtypes,
@@ -240,6 +286,20 @@ class EpisodeReader:
             arm_sent_stream=bool(meta.attrs.get(ARM_SENT_MARKER, False)),
         )
         if layout_errors:
+            return ValidityState.INVALID
+        try:
+            if not self._legacy_v23 and self._sidecar_manifest_errors():
+                return ValidityState.INVALID
+            semantic_errors = validate_raw_semantics(
+                datasets,
+                frame_count=frame_count,
+                attrs=meta.attrs,
+                legacy=self._legacy_v23,
+            )
+        except Exception:
+            logger.warning("failed raw semantic/integrity validation", exc_info=True)
+            return ValidityState.INVALID
+        if semantic_errors:
             return ValidityState.INVALID
         config_hash = str(meta.attrs.get("resolved_config_sha256", ""))
         if len(config_hash) != 64:
@@ -265,155 +325,6 @@ class EpisodeReader:
         except Exception:
             logger.warning("failed to decode episode RGB stream", exc_info=True)
             return ValidityState.INVALID
-        timestamps = np.asarray(self._h5f["timestamp"][:], dtype=np.float64)
-        sample_valid = np.asarray(self._h5f["flag_sample_valid"][:], dtype=bool)
-        source_indices = np.asarray(self._h5f["source_sample_index"][:], dtype=np.int64)
-        source_timestamps = np.asarray(
-            self._h5f["source_timestamp"][:], dtype=np.float64
-        )
-        fill_reasons = np.asarray(self._h5f["fill_reason"][:], dtype=np.uint8)
-        scalar_shapes = (
-            timestamps,
-            sample_valid,
-            source_indices,
-            source_timestamps,
-            fill_reasons,
-        )
-        if any(values.shape != (frame_count,) for values in scalar_shapes):
-            return ValidityState.INVALID
-        if not np.all(np.isfinite(timestamps)) or np.any(np.diff(timestamps) <= 0.0):
-            return ValidityState.INVALID
-
-        known_fill_reasons = np.isin(
-            fill_reasons, [int(reason) for reason in FillReason]
-        )
-        if not np.all(known_fill_reasons):
-            return ValidityState.INVALID
-        is_source = fill_reasons == int(FillReason.SOURCE)
-        is_hold = fill_reasons == int(FillReason.CAUSAL_HOLD_LAST)
-        is_leading = fill_reasons == int(FillReason.LEADING_PLACEHOLDER)
-        source_defined = source_indices >= 0
-        source_time_finite = np.isfinite(source_timestamps)
-        if (
-            np.any(is_source != sample_valid)
-            or np.any((is_source | is_hold) != source_defined)
-            or np.any((is_source | is_hold) != source_time_finite)
-            or np.any(is_leading & (sample_valid | source_defined | source_time_finite))
-        ):
-            return ValidityState.INVALID
-        # Non-placeholder values must be causally available by the grid deadline.
-        if np.any(source_defined & (source_timestamps > timestamps + 1e-7)):
-            return ValidityState.INVALID
-        defined_indices = source_indices[source_defined]
-        if defined_indices.size > 1 and np.any(np.diff(defined_indices) < 0):
-            return ValidityState.INVALID
-        if not np.any(sample_valid):
-            return ValidityState.INVALID
-
-        anchors = np.asarray(
-            self._h5f["observation_anchor_monotonic_ns"][:], dtype=np.uint64
-        )
-        source_sequences = np.column_stack(
-            [
-                np.asarray(self._h5f[f"{name}_source_sequence"][:], dtype=np.uint64)
-                for name in ("arm", "hand", "vr", "camera")
-            ]
-        )
-        observation_source_ns = np.column_stack(
-            [
-                np.asarray(self._h5f[f"{name}_source_monotonic_ns"][:], dtype=np.uint64)
-                for name in ("arm", "hand", "vr", "camera")
-            ]
-        )
-        observation_publish_ns = np.column_stack(
-            [
-                np.asarray(
-                    self._h5f[f"{name}_publish_monotonic_ns"][:], dtype=np.uint64
-                )
-                for name in ("arm", "hand", "vr", "camera")
-            ]
-        )
-        observation_receive_ns = np.asarray(
-            self._h5f["observation_source_receive_monotonic_ns"][:], dtype=np.uint64
-        )
-        observation_history_valid = np.asarray(
-            self._h5f["observation_history_valid_mask"][:], dtype=bool
-        )
-        if observation_history_valid.shape != (frame_count, 4, 1):
-            return ValidityState.INVALID
-        valid_sources = observation_history_valid[:, :, 0]
-        if (
-            anchors.shape != (frame_count,)
-            or source_sequences.shape != (frame_count, 4)
-            or observation_source_ns.shape != (frame_count, 4)
-            or observation_receive_ns.shape != (frame_count, 4)
-            or observation_publish_ns.shape != (frame_count, 4)
-            or np.any(anchors == 0)
-        ):
-            return ValidityState.INVALID
-        causal_chain = (
-            (source_sequences > 0)
-            & (observation_source_ns > 0)
-            & (observation_source_ns <= observation_receive_ns)
-            & (observation_receive_ns <= observation_publish_ns)
-            & (observation_publish_ns <= anchors[:, None])
-        )
-        if np.any(valid_sources & ~causal_chain):
-            return ValidityState.INVALID
-        tactile_fresh = np.asarray(self._h5f["tactile_fresh"][:], dtype=bool)
-        tactile_source_ns = np.asarray(
-            self._h5f["tactile_source_monotonic_ns"][:], dtype=np.uint64
-        )
-        if np.any(
-            tactile_fresh & ((tactile_source_ns == 0) | (tactile_source_ns > anchors))
-        ):
-            return ValidityState.INVALID
-
-        observation_ids = np.asarray(self._h5f["observation_id"][:], dtype=np.uint64)
-        action_ids = np.asarray(self._h5f["action_id"][:], dtype=np.uint64)
-        action_created_ns = np.asarray(
-            self._h5f["action_created_monotonic_ns"][:], dtype=np.uint64
-        )
-        action_target_ns = np.asarray(
-            self._h5f["action_target_monotonic_ns"][:], dtype=np.uint64
-        )
-        action_valid_until_ns = np.asarray(
-            self._h5f["action_valid_until_monotonic_ns"][:], dtype=np.uint64
-        )
-        queued = np.asarray(self._h5f["flag_action_queued"][:], dtype=bool)
-        held = (
-            np.asarray(self._h5f["flag_held"][:], dtype=bool)
-            if "flag_held" in self._h5f
-            else np.zeros(frame_count, dtype=bool)
-        )
-        # Held samples may omit actions; active samples require an action identity.
-        if np.any(observation_ids[sample_valid] == 0) or np.any(
-            sample_valid & ~held & (action_ids == 0)
-        ):
-            return ValidityState.INVALID
-        if np.any(queued & (action_ids == 0)):
-            return ValidityState.INVALID
-        action_timing_valid = (
-            (action_created_ns > 0)
-            & (action_created_ns <= action_target_ns)
-            & (action_target_ns <= action_valid_until_ns)
-        )
-        if np.any(queued & ~action_timing_valid):
-            return ValidityState.INVALID
-        action_arrays = (
-            ("action_arm_joint", (frame_count, *ARM_JOINT_SHAPE)),
-            ("action_hand_joint", (frame_count, *HAND_JOINT_SHAPE)),
-            ("action_arm_joint_raw", (frame_count, *ARM_JOINT_SHAPE)),
-            ("action_hand_joint_raw", (frame_count, *HAND_JOINT_SHAPE)),
-        )
-        for name, expected_shape in action_arrays:
-            values = np.asarray(self._h5f[name][:], dtype=np.float64)
-            if values.shape != expected_shape or np.any(
-                ~np.isfinite(values[sample_valid])
-            ):
-                return ValidityState.INVALID
-        if np.any(sample_valid & ~held & ~queued):
-            return ValidityState.INVALID
         return ValidityState.VALID
 
     def require_valid(self, purpose: str = "training") -> None:
@@ -421,7 +332,7 @@ class EpisodeReader:
         if state is not ValidityState.VALID:
             raise ValueError(
                 f"episode validity is {state.value}; {purpose} requires VALID data "
-                f"from raw schema v{EPISODE_SCHEMA_VERSION}"
+                f"from raw schema v{self.schema_version}"
             )
 
     @property

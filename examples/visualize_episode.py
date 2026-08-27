@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/visualize_episode.py EPISODE [--info] [--max-frames N]``.
 
-Self-contained Rerun visualizer for raw schema-v23 DexMani episodes. Offline
+Self-contained Rerun visualizer for raw schema-v24 DexMani episodes. Offline
 only: connects to no hardware and writes no files. Episodes display a canonical
 fixed-size ``(N, 6)`` point cloud derived with the same production implementation
 used by offline processing and deployment.
@@ -9,6 +9,7 @@ used by offline processing and deployment.
 Examples::
 
   python examples/visualize_episode.py episodes/<task_name>/<episode_dir>
+  python examples/visualize_episode.py episodes/<task_name>/<episode_dir> --allow-legacy-v23
   python examples/visualize_episode.py episodes/<task_name>/<episode_dir> --info
   python examples/visualize_episode.py episodes/<task_name>/<episode_dir> --max-frames 500
 """
@@ -92,9 +93,9 @@ def _classify_datasets(h5f: MergedH5File) -> dict[str, list[str]]:
     return classified
 
 
-def print_episode_info(h5_path: str) -> None:
+def print_episode_info(h5_path: str, *, allow_legacy_v23: bool = False) -> None:
     """Print a human-readable summary of the episode structure without opening Rerun."""
-    with EpisodeReader(h5_path) as reader:
+    with EpisodeReader(h5_path, allow_legacy_v23=allow_legacy_v23) as reader:
         if not reader.meets_min_duration:
             print(
                 "WARNING: episode is below the configured minimum recording duration (quality label only)"
@@ -176,9 +177,10 @@ class EpisodeVisualizer:
         pointcloud_config: PointCloudConfig | None = None,
         table_plane_abcd: tuple[float, float, float, float] | None = None,
         runtime_config_sha256: str | None = None,
+        allow_legacy_v23: bool = False,
     ):
         self._h5_path = Path(h5_path)
-        self._reader = EpisodeReader(h5_path)
+        self._reader = EpisodeReader(h5_path, allow_legacy_v23=allow_legacy_v23)
         try:
             if not self._reader.meets_min_duration:
                 logger.warning(
@@ -567,7 +569,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "episode",
         type=str,
-        help="Path to a raw schema-v23 episodes/<task_name>/episode_* directory.",
+        help=(
+            "Path to a raw schema-v24 episodes/<task_name>/episode_* directory; "
+            "v23 requires --allow-legacy-v23."
+        ),
+    )
+    parser.add_argument(
+        "--allow-legacy-v23",
+        action="store_true",
+        help=(
+            "Explicitly read raw schema-v23 without sidecar manifest verification "
+            "(default: reject v23)."
+        ),
     )
     parser.add_argument(
         "--max-frames",
@@ -604,7 +617,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.info:
-        print_episode_info(str(h5_path))
+        print_episode_info(str(h5_path), allow_legacy_v23=args.allow_legacy_v23)
         return 0
 
     point_cloud_enabled = True if args.point_cloud is None else args.point_cloud
@@ -632,6 +645,7 @@ def main(argv: list[str] | None = None) -> int:
         pointcloud_config=pointcloud_config,
         table_plane_abcd=table_plane_abcd,
         runtime_config_sha256=runtime_config_sha256,
+        allow_legacy_v23=args.allow_legacy_v23,
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.num_steps)

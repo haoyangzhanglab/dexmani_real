@@ -1,4 +1,4 @@
-"""Transactional raw v23 episode serialization from owned ``EpisodeFrame`` rows.
+"""Transactional raw-v24 episode serialization from owned ``EpisodeFrame`` rows.
 
 State, action, VR, and camera rows are causally aligned to the policy grid.
 The recorder owns transaction lifecycle, camera sidecar coordination, metadata,
@@ -36,16 +36,24 @@ from dexmani_real.recording.hdf5_writer import EpisodeDataWriter
 from dexmani_real.recording.schema import (
     ARM_SENT_MARKER,
     EPISODE_SCHEMA_VERSION,
+    RAW_DEPTH_SHA256_ATTR,
+    RAW_MANIFEST_VERSION,
+    RAW_MANIFEST_VERSION_ATTR,
+    RAW_MEMBER_SHA256_JSON_ATTR,
+    RAW_RGB_SHA256_ATTR,
     SEMANTIC_META_ATTRS,
     compute_episode_quality_metrics,
+    validate_camera_metadata_keys,
     validate_data_layout,
+    validate_raw_member_hashes,
+    validate_raw_semantics,
     validate_source_frame_keys,
 )
 from dexmani_real.recording.timeline import TimestampAlignedBuffer
 from dexmani_real.recording.video import VideoDecoder
 from dexmani_real.robot.types import RobotAction, RobotState
 from dexmani_real.sensor.camera_geometry import RGBDGeometry
-from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
+from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish, sha256_file
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -194,6 +202,11 @@ class EpisodeRecorder:
         camera_metadata: dict[str, Any] | None = None,
         skip_initial_frames: int = 0,
     ) -> bool:
+        metadata_errors = validate_camera_metadata_keys(camera_metadata)
+        if metadata_errors:
+            raise ValueError(
+                "episode camera metadata rejected: " + "; ".join(metadata_errors)
+            )
         if not self.join_stop(timeout=_PREVIOUS_EPISODE_STOP_TIMEOUT_S):
             if self._stop_error is not None:
                 logger.warning(
@@ -244,7 +257,7 @@ class EpisodeRecorder:
             "camera_name": camera_name,
             "camera_serial": camera_serial,
             "depth_scale": depth_scale,
-            "camera_metadata": camera_metadata,
+            "camera_metadata": dict(camera_metadata or {}),
             "skip_initial_frames": self._skip_initial_frames,
         }
 
@@ -297,24 +310,9 @@ class EpisodeRecorder:
         meta.attrs["camera_encoding_width"] = self._camera_writer_config.rgb_shape[1]
         meta.attrs["camera_encoding_height"] = self._camera_writer_config.rgb_shape[0]
         meta.attrs["camera_encoding_fps"] = self._camera_writer_config.fps
-        meta.attrs["camera_health_taxonomy_json"] = json.dumps(
-            {
-                "0": "OK",
-                "1": "CLOCK_RESET",
-                "2": "DUPLICATE",
-                "3": "FRAME_GAP",
-                "4": "DELIVERY_DELAY_ABOVE_FLOOR",
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        meta.attrs["camera_frame_gap_semantics"] = (
-            "telemetry_only; a recovered current frame remains eligible when its "
-            "payload and timestamps are fresh"
-        )
         meta.attrs["camera_depth_storage"] = "uint16/gzip-1"
         meta.attrs["camera_depth_payload_semantics"] = (
-            "v23: librealsense_align_depth_to_color_z16; depth pixels are in "
+            "v24: librealsense_align_depth_to_color_z16; depth pixels are in "
             "camera_color_optical and match camera_rgb pixels"
         )
 
@@ -819,6 +817,23 @@ class EpisodeRecorder:
         )
 
         _had_rgb = camera_frame_count > 0
+        if self._temp_dir is None:
+            raise RuntimeError("episode temp directory missing during finalization")
+        sidecar_paths = {
+            "depth.h5": Path(self._temp_dir) / "depth.h5",
+            "rgb.mp4": Path(self._temp_dir) / "rgb.mp4",
+        }
+        missing_sidecars = [
+            name for name, path in sidecar_paths.items() if not path.is_file()
+        ]
+        if missing_sidecars:
+            raise RuntimeError(
+                "episode finalization missing sidecars before manifest: "
+                + str(missing_sidecars)
+            )
+        sidecar_hashes = {
+            name: sha256_file(path) for name, path in sidecar_paths.items()
+        }
 
         def _write_final_meta(meta: h5py.Group) -> None:
             grid_dt_s = 1.0 / self.control_hz
@@ -842,6 +857,12 @@ class EpisodeRecorder:
             meta.attrs["has_timestamps"] = "timestamp" in data_writer.datasets
             meta.attrs["camera_stream_frames"] = camera_frame_count
             meta.attrs["camera_writer_error"] = ""
+            meta.attrs[RAW_MANIFEST_VERSION_ATTR] = RAW_MANIFEST_VERSION
+            meta.attrs[RAW_DEPTH_SHA256_ATTR] = sidecar_hashes["depth.h5"]
+            meta.attrs[RAW_RGB_SHA256_ATTR] = sidecar_hashes["rgb.mp4"]
+            meta.attrs[RAW_MEMBER_SHA256_JSON_ATTR] = json.dumps(
+                sidecar_hashes, sort_keys=True, separators=(",", ":")
+            )
             for metric_name, metric_value in self._camera_writer_metrics.items():
                 meta.attrs[metric_name] = metric_value
             for metric_name, metric_value in quality_metrics.items():
@@ -927,20 +948,24 @@ class EpisodeRecorder:
         missing = [name for name, path in paths.items() if not path.is_file()]
         if missing:
             raise RuntimeError(f"episode finalization missing modalities: {missing}")
+        meta_attrs: dict[str, Any]
         with h5py.File(paths["data"], "r") as data_h5:
             meta = data_h5.get("meta")
             if meta is None or int(meta.attrs.get("num_frames", -1)) != expected_frames:
                 raise RuntimeError("data.h5 frame count metadata mismatch")
+            if int(meta.attrs.get("schema_version", -1)) != EPISODE_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "new writer produced an unexpected raw schema version"
+                )
+            datasets = {
+                key: dataset
+                for key, dataset in data_h5.items()
+                if isinstance(dataset, h5py.Dataset)
+            }
             dataset_shapes = {
-                key: tuple(dataset.shape)
-                for key, dataset in data_h5.items()
-                if isinstance(dataset, h5py.Dataset)
+                key: tuple(dataset.shape) for key, dataset in datasets.items()
             }
-            dataset_dtypes = {
-                key: dataset.dtype
-                for key, dataset in data_h5.items()
-                if isinstance(dataset, h5py.Dataset)
-            }
+            dataset_dtypes = {key: dataset.dtype for key, dataset in datasets.items()}
             layout_errors = validate_data_layout(
                 dataset_shapes,
                 dataset_dtypes,
@@ -951,6 +976,16 @@ class EpisodeRecorder:
                 raise RuntimeError(
                     "data.h5 episode layout mismatch: " + "; ".join(layout_errors)
                 )
+            semantic_errors = validate_raw_semantics(
+                datasets,
+                frame_count=expected_frames,
+                attrs=meta.attrs,
+            )
+            if semantic_errors:
+                raise RuntimeError(
+                    "raw semantic validation failed: " + "; ".join(semantic_errors)
+                )
+            meta_attrs = {key: value for key, value in meta.attrs.items()}
         for key in ("depth",):
             with h5py.File(paths[key], "r") as sidecar:
                 if key not in sidecar or int(sidecar[key].shape[0]) != expected_frames:
@@ -961,6 +996,17 @@ class EpisodeRecorder:
                 raise RuntimeError(
                     f"RGB decoded frame count {decoded_frames} != {expected_frames}"
                 )
+        manifest_errors = validate_raw_member_hashes(
+            meta_attrs,
+            {
+                "depth.h5": sha256_file(paths["depth"]),
+                "rgb.mp4": sha256_file(paths["rgb"]),
+            },
+        )
+        if manifest_errors:
+            raise RuntimeError(
+                "raw sidecar manifest validation failed: " + "; ".join(manifest_errors)
+            )
 
     @staticmethod
     def _discard_temp_files(tmp: str) -> None:

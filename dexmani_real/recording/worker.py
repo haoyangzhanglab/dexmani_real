@@ -80,7 +80,9 @@ class RecorderIOConfig:
         if len(self.resolved_config_sha256) != 64:
             raise ValueError("RecorderIO requires the resolved config SHA-256")
         if not isinstance(self.camera_calibration, CameraCalib):
-            raise TypeError("camera_calibration must be a preloaded CameraCalib snapshot")
+            raise TypeError(
+                "camera_calibration must be a preloaded CameraCalib snapshot"
+            )
         provenance_names = [name for name, _value in self.provenance]
         if len(set(provenance_names)) != len(provenance_names):
             raise ValueError("RecorderIO provenance keys must be unique")
@@ -171,7 +173,6 @@ def _build_start_metadata(
             "camera_firmware": camera_firmware,
             "camera_sdk_version": camera_sdk_version,
             "camera_actual_profile_json": camera_profile_json,
-            "camera_payload_mode": "depth_to_color_aligned_rgbd",
             "camera_geometry_json": camera_geometry_json,
             "arm_device_identity_json": arm_identity_json,
             "hand_device_identity_json": hand_identity_json or '{"status":"disabled"}',

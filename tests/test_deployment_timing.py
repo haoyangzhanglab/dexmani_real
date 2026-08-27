@@ -24,11 +24,11 @@ from dexmani_real.deployment.worker import (
     _read_state_history,
     _select_pointcloud_control_grid,
 )
-from dexmani_real.ipc.causal import read_structured_frame_aligned_to_source
 from dexmani_real.integrations.dexmani_policy import (
     _expected_normalizer_dims,
     _validate_training_data_contract,
 )
+from dexmani_real.ipc.causal import read_structured_frame_aligned_to_source
 from dexmani_real.ipc.channels import RuntimeChannelsConfig
 from dexmani_real.ipc.schema import (
     ARM_STATE_DTYPE,
@@ -344,6 +344,7 @@ class DeploymentTimingTest(unittest.TestCase):
             "action_semantics": "deployment_grid_rate_limited_target",
             "arm_max_delta_rad_per_tick": config.arm_max_delta_rad_per_tick,
             "hand_max_delta_rad_per_tick": config.hand_max_delta_rad_per_tick,
+            "endpoint_delta_tolerance_rad": config.endpoint_delta_tolerance_rad,
             "deployment_equivalent": True,
             "profile": "pointcloud",
             "task_name": "pick",
@@ -362,6 +363,10 @@ class DeploymentTimingTest(unittest.TestCase):
             "point_cloud_feature_dim": 6,
         }
         _validate_training_data_contract(contract, restored)
+        contract.pop("endpoint_delta_tolerance_rad")
+        with self.assertRaises(ValueError):
+            _validate_training_data_contract(contract, restored)
+        contract["endpoint_delta_tolerance_rad"] = config.endpoint_delta_tolerance_rad
         contract["domain"] = "sim"
         with self.assertRaises(ValueError):
             _validate_training_data_contract(contract, restored)
