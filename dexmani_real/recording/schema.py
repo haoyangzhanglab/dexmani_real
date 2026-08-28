@@ -18,9 +18,6 @@ from dexmani_real.ipc.schema import (
     HAND_TACTILE_SUM_SHAPE,
 )
 
-# v23 is retained as an explicitly opted-in legacy format.  New recordings
-# carry the sidecar manifest and the stricter semantic checks below.
-LEGACY_EPISODE_SCHEMA_VERSION = 23
 EPISODE_SCHEMA_VERSION = 24
 RAW_MANIFEST_VERSION = 1
 RAW_MANIFEST_VERSION_ATTR = "raw_manifest_version"
@@ -395,17 +392,9 @@ def _attr_scalar(value: Any) -> Any:
     return value.item() if isinstance(value, np.generic) else value
 
 
-def validate_semantic_meta_attrs(
-    attrs: Mapping[str, Any], *, legacy: bool = False
-) -> tuple[str, ...]:
+def validate_semantic_meta_attrs(attrs: Mapping[str, Any]) -> tuple[str, ...]:
     """Validate fixed semantic attrs against this schema's single definition.
-
-    v23 had a different ``camera_frame_gap_semantics`` value and no explicit
-    source timestamp/index definitions, so an explicitly opted-in legacy read
-    intentionally skips these v24-only equality checks.
     """
-    if legacy:
-        return ()
     errors: list[str] = []
     for key, expected in SEMANTIC_META_ATTRS.items():
         if key not in attrs:
@@ -546,7 +535,6 @@ def validate_raw_semantics(
     *,
     frame_count: int,
     attrs: Mapping[str, Any] | None = None,
-    legacy: bool = False,
     source_timestamp_tolerance_s: float = 1e-7,
 ) -> tuple[str, ...]:
     """Return deterministic errors for persisted raw-v24 semantic values.
@@ -630,7 +618,7 @@ def validate_raw_semantics(
         errors.append("source_timestamp is later than its causal grid timestamp")
     if np.any(source_defined & (source_timestamps < 0.0)):
         errors.append("source_timestamp must be non-negative when defined")
-    if not legacy and np.any(
+    if np.any(
         is_source
         & ~np.isclose(
             source_timestamps,
@@ -1129,7 +1117,7 @@ def validate_raw_semantics(
         errors.append("valid raw hand actions require finite action_hand_joint_raw")
 
     if attrs is not None:
-        errors.extend(validate_semantic_meta_attrs(attrs, legacy=legacy))
+        errors.extend(validate_semantic_meta_attrs(attrs))
     return tuple(errors)
 
 
@@ -1327,7 +1315,6 @@ __all__ = [
     "DIAGNOSTIC_TAIL_SHAPES",
     "DatasetSpec",
     "EPISODE_SCHEMA_VERSION",
-    "LEGACY_EPISODE_SCHEMA_VERSION",
     "HAND_RAW_ACTION_VALIDITY_EXPRESSION",
     "RAW_DEPTH_SHA256_ATTR",
     "RAW_MANIFEST_VERSION",

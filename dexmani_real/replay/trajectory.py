@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,21 +93,14 @@ def resolve_episode_path(raw_path: str) -> tuple[str, str]:
     return str(path), path.name
 
 
-def load_trajectory(
-    episode_path: str,
-    *,
-    allow_legacy_v23: bool = False,
-) -> TrajectoryData:
+def load_trajectory(episode_path: str) -> TrajectoryData:
     """Load the exact submitted command stream for physical replay.
-
-    Raw schema v23 remains fail-closed unless the caller explicitly opts in;
-    its sidecars do not carry the v24 integrity manifest.
     """
     resolved_path, _episode_name = resolve_episode_path(episode_path)
     if not Path(resolved_path).exists():
         raise FileNotFoundError(f"Episode not found: {episode_path}")
 
-    with EpisodeReader(resolved_path, allow_legacy_v23=allow_legacy_v23) as reader:
+    with EpisodeReader(resolved_path) as reader:
         if not reader.meets_min_duration:
             logger.warning(
                 "Episode %s is internally readable but below the configured minimum recording duration",
@@ -261,7 +255,9 @@ def _processed_replay_source(
             raise ValueError(
                 f"processed episode {artifact_path.name} lacks its raw source path"
             )
-        if not _is_sha256(expected_data_sha256):
+        if not isinstance(expected_data_sha256, str) or not _is_sha256(
+            expected_data_sha256
+        ):
             raise ValueError(
                 f"processed episode {artifact_path.name} lacks a valid raw data.h5 hash"
             )
@@ -364,9 +360,7 @@ def _select_raw_trajectory_rows(
     )
 
 
-def load_processed_trajectory(
-    episode_path: str, *, allow_legacy_v23: bool = False
-) -> TrajectoryData:
+def load_processed_trajectory(episode_path: str) -> TrajectoryData:
     """Load exact raw commands selected and attested by one processed artifact.
 
     Processed ``float32`` action arrays are training data, not physical commands.
@@ -392,9 +386,7 @@ def load_processed_trajectory(
             f"processed episode {artifact_path.name} raw source data.h5 hash mismatch"
         )
 
-    raw_trajectory = load_trajectory(
-        str(source_path), allow_legacy_v23=allow_legacy_v23
-    )
+    raw_trajectory = load_trajectory(str(source_path))
     if raw_trajectory.num_frames != source_frames:
         raise ValueError(
             f"processed episode {artifact_path.name} source frame count does not match raw source"

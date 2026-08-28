@@ -1,7 +1,4 @@
-"""Transactional depth-to-color aligned raw-v24 to processed-v10 processing.
-
-Raw v23 remains available only through an explicit ``allow_legacy_v23`` option.
-"""
+"""Transactional depth-to-color aligned raw-v24 to processed-v11 processing."""
 
 from __future__ import annotations
 
@@ -11,7 +8,6 @@ import shutil
 import tempfile
 from collections import Counter
 from collections.abc import Mapping
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -52,7 +48,7 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 10
+PROCESSED_SCHEMA_VERSION = 11
 _SOURCE_MEMBERS = ("data.h5", "depth.h5", "rgb.mp4")
 _PROVENANCE_DATASETS = (
     "source_row_index",
@@ -86,16 +82,7 @@ class ProcessedProvenance:
     keep_mask: np.ndarray
     drop_reason_bits: np.ndarray
     drop_reason_names: tuple[str, ...]
-
-    @property
-    def segment_lengths(self) -> tuple[int, ...]:
-        starts = np.concatenate(
-            (np.asarray([0], dtype=np.int64), self.segment_ends[:-1])
-        )
-        return tuple(
-            int(end - start)
-            for start, end in zip(starts, self.segment_ends, strict=True)
-        )
+    hard_invalid_reason_names: tuple[str, ...]
 
 
 def _json(value: Any) -> str:
@@ -474,6 +461,15 @@ def validate_processed_provenance(
             raise ValueError(
                 f"{label}: source_decision_json {key!r} disagrees with provenance"
             )
+    hard_invalid_value = source_decision.get("hard_invalid_reason_names")
+    if (
+        not isinstance(hard_invalid_value, list)
+        or any(not isinstance(name, str) for name in hard_invalid_value)
+        or len(set(hard_invalid_value)) != len(hard_invalid_value)
+        or not set(hard_invalid_value).issubset(reason_names)
+    ):
+        raise ValueError(f"{label}: invalid hard-invalid reason names")
+    hard_invalid_reason_names = tuple(hard_invalid_value)
 
     source_hashes = _json_object_attr(source, "source_member_sha256_json", label=label)
     if set(source_hashes) != set(_SOURCE_MEMBERS) or any(
@@ -492,6 +488,7 @@ def validate_processed_provenance(
         keep_mask=keep_mask,
         drop_reason_bits=reasons,
         drop_reason_names=reason_names,
+        hard_invalid_reason_names=hard_invalid_reason_names,
     )
 
 
@@ -598,15 +595,6 @@ def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
     if not episodes:
         raise FileNotFoundError(f"no episode directories found in {root}")
     return episodes
-
-
-@contextmanager
-def _open_episode(
-    path: Path, *, allow_legacy_v23: bool = False
-) -> Iterator[EpisodeReader]:
-    """Open one raw episode with an explicit legacy opt-in boundary."""
-    with EpisodeReader(path, allow_legacy_v23=allow_legacy_v23) as reader:
-        yield reader
 
 
 def _dataset_kwargs(
@@ -824,9 +812,24 @@ def _write_processed_episode(
         output["joint_state"][:] = _processed_joint_state(reader, selected, config)
         output["action"][:] = np.concatenate((arm_action, hand_action), axis=1)
         output["action_ee"][:] = np.concatenate((arm_action_ee, hand_action), axis=1)
-        output["contact_force"][:] = np.asarray(
+        contact_force = np.asarray(
             reader.h5f["hand_contact"][selected], dtype=np.float32
         )
+        tactile_forward_fill = decision.tactile_forward_fill_mask
+        if tactile_forward_fill is not None:
+            repair_rows = np.flatnonzero(
+                np.asarray(tactile_forward_fill, dtype=bool)[selected]
+            )
+            for compact_row in repair_rows:
+                source_row = int(selected[compact_row])
+                if source_row <= 0:
+                    raise ValueError(
+                        "tactile forward-fill requires a previous source row"
+                    )
+                contact_force[compact_row] = np.asarray(
+                    reader.h5f["hand_contact"][source_row - 1], dtype=np.float32
+                )
+        output["contact_force"][:] = contact_force
         output["fingertip_points"][:] = np.asarray(
             reader.h5f["hand_fingertip"][selected], dtype=np.float32
         )
@@ -974,7 +977,7 @@ def _expected_specs(
 def validate_processed_hdf5(
     path: str | Path, config: ProcessingConfig
 ) -> dict[str, Any]:
-    """Fail closed on a processed Real HDF5 v10 artifact."""
+    """Fail closed on a processed Real HDF5 v11 artifact."""
 
     artifact = Path(path)
     with h5py.File(artifact, "r") as source:
@@ -1195,6 +1198,33 @@ def _rejected_decision(
     )
 
 
+def _invalid_frames_report(
+    decisions: list[EpisodeDecision], *, task_name: str
+) -> dict[str, Any]:
+    """Build the concise operator report for genuinely invalid source rows."""
+
+    episodes: list[dict[str, Any]] = []
+    for decision in decisions:
+        summary = decision.to_dict()
+        invalid_count = int(summary["hard_invalid_frame_count"])
+        if invalid_count == 0:
+            continue
+        episodes.append(
+            {
+                "episode": decision.source_path.name,
+                "invalid_frame_count": invalid_count,
+                "invalid_ranges": summary["hard_invalid_ranges"],
+                "reasons": summary["hard_invalid_reasons"],
+            }
+        )
+    return {
+        "schema_name": "dexmani-real-invalid-frames-report",
+        "schema_version": 1,
+        "task_name": task_name,
+        "episodes": episodes,
+    }
+
+
 def process_episode_root(
     input_root: str | Path,
     output_root: str | Path,
@@ -1202,13 +1232,8 @@ def process_episode_root(
     *,
     annotations_path: str | Path | None = None,
     dry_run: bool = False,
-    allow_legacy_v23: bool = False,
 ) -> dict[str, Any]:
-    """Publish a complete one-to-one batch, or publish nothing on rejection.
-
-    Legacy raw v23 is rejected by default; callers must opt in explicitly and
-    the option is passed to every raw reader opened by this transaction.
-    """
+    """Publish a complete one-to-one batch, or publish nothing on rejection."""
 
     episodes = discover_episode_dirs(input_root)
     annotations = load_annotations(annotations_path)
@@ -1221,7 +1246,7 @@ def process_episode_root(
     for episode in episodes:
         annotation = annotations.get(episode.name, EpisodeAnnotation())
         try:
-            with _open_episode(episode, allow_legacy_v23=allow_legacy_v23) as reader:
+            with EpisodeReader(episode) as reader:
                 reader.require_valid(purpose="offline processing")
                 decisions.append(
                     analyze_episode(
@@ -1300,9 +1325,7 @@ def process_episode_root(
             if not decision.accepted:
                 continue
             annotation = annotations.get(decision.source_path.name, EpisodeAnnotation())
-            with _open_episode(
-                decision.source_path, allow_legacy_v23=allow_legacy_v23
-            ) as reader:
+            with EpisodeReader(decision.source_path) as reader:
                 outputs.append(
                     _write_processed_episode(
                         reader, decision, staging, config, annotation
@@ -1311,8 +1334,19 @@ def process_episode_root(
         validation = [
             validate_processed_hdf5(staging / item["path"], config) for item in outputs
         ]
+        with h5py.File(staging / outputs[0]["path"], "r") as first_output:
+            task_name = str(first_output.attrs["task_name"])
+        invalid_report = _invalid_frames_report(decisions, task_name=task_name)
+        process_log = staging / "process_log"
+        process_log.mkdir()
+        with (process_log / "invalid_frames_report.json").open(
+            "w", encoding="utf-8"
+        ) as stream:
+            json.dump(invalid_report, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
         report["outputs"] = outputs
         report["validation"] = validation
+        report["invalid_frames_report"] = invalid_report
         atomic_publish(staging, target)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)

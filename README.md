@@ -32,8 +32,9 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 - 事务式写入带 sidecar manifest 的 depth-to-color aligned RGB-D raw episode v24；除 native depth/color 几何与
   时序 provenance 外，还保存与 camera source 对齐的 arm/hand policy observation、hand SDK ACK
   与限速后的 hand target。
-- 将 aligned raw v24 episode 清洗为 processed HDF5 v10；deployment-equivalent 的
-  点云数据可导出 Policy Zarr v5，并会把 source 不连续处拆成独立训练 episode，避免窗口跨越数据缺口。
+- 将 aligned raw v24 episode 清洗为 processed HDF5 v11；deployment-equivalent 的
+  点云数据可导出 Policy Zarr v5。导出坚持一份 processed HDF5 对应一个训练 episode；
+  删除过 source 行或存在时序缺口的 episode 整条拒绝，不在缺口处拆分。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
 - 通过可替换 `PolicyRuntime` 运行 joint/EE-action learned policy；仓库包含无模型的
   deterministic fake 实现和 `dexmani_policy` 集成。启动时 `DeploymentManifest`
@@ -49,7 +50,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`replay/`](dexmani_real/replay) |
 | raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/hdf5_writer.py`](dexmani_real/recording/hdf5_writer.py)、[`recording/reader.py`](dexmani_real/recording/reader.py) |
 | 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`data/`](dexmani_real/data) |
-| 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v24（显式 legacy v23）、processed v10 与 Policy Zarr v5 的字段、dtype、shape 与语义 |
+| 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v24、processed v11 与 Policy Zarr v5 的字段、dtype、shape 与语义 |
 | learned-policy 部署 | [`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`integrations/`](dexmani_real/integrations) |
 | 相机、桌面与 VR 标定 | [`examples/`](examples) | [`calibration/`](dexmani_real/calibration)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
 | 点云完整链路 | [`docs/pointcloud_pipeline.md`](docs/pointcloud_pipeline.md) | [`sensor/pointcloud.py`](dexmani_real/sensor/pointcloud.py)、[`sensor/pointcloud_worker.py`](dexmani_real/sensor/pointcloud_worker.py) |
@@ -255,7 +256,7 @@ RGB-D、完整 raw 点云、canonical processed 点云、相机几何、外参�
 根因已确认并修复：`RealSenseConfig.auto_exposure_priority` 默认 `0.0`（OFF，Auto
 Exposure 仍 ON），RGB 恢复 30 Hz，亮度由增益补偿、几乎不变（暗场噪声上升）。
 
-深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew）。processed v10 的点云将
+深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew）。processed v11 的点云将
 depth-to-color aligned 像素 RGB 聚合为体素颜色，但这不表示同步曝光；运动物体仍可能出现
 颜色时间错位。
 
@@ -283,9 +284,8 @@ python examples/process_episodes.py \
 `--profile` 选择 `joint`、`rgb`、`pointcloud` 或 `rgb_pc`。后两种 profile 可用
 `--pointcloud-num-points` 选择 `1024`、`2048`、`4096` 或 `8192`，默认 `1024`。
 
-运行时默认只接受带 manifest 的 raw v24；raw v23 只能通过 `--allow-legacy-v23` 显式读取，且不做
-sidecar 完整性验证。保留在磁盘上的 v21/v22 episode 是归档资料，只能在本运行时外迁移或检查，
-不能由 reader、处理器或可视化器静默重解释；它们缺少当前 policy 数据合同，必须重新采集才能进入训练链。
+运行时只接受带 manifest 的 raw v24。旧录制不属于当前数据契约，不能由 reader、处理器、
+回放或可视化器重解释；需要先在运行时外迁移或重新采集，才能进入训练链。
 要生成 learned-policy 训练数据，在发布
 前先使用明确的 task identity 做 dry-run：
 
@@ -296,7 +296,7 @@ python examples/process_episodes.py \
   --dry-run
 ```
 
-确认后去掉 `--dry-run`。所有处理 profile 都校验动作 endpoint delta；视觉 profile 还校验
+确认后去掉 `--dry-run`。所有处理 profile 都审计动作 endpoint delta；视觉 profile 还校验
 camera-source 对齐的 arm/hand policy observation。`--task-name` 会统一写入每个 processed
 episode，并拒绝与逐 episode annotation 中 task_name 冲突的情况。`pointcloud` 与 `rgb_pc`
 profile 的输出标为 `deployment_equivalent=True`，是 Policy Zarr v5 唯一接受的输入。
@@ -307,15 +307,17 @@ raw v24 episode 可视化默认使用当前 resolved runtime 中的点云策略�
 `--pointcloud-num-points` 可选择 `1024`、`2048`、`4096` 或 `8192`。
 
 需要检查已清洗、持久化及 provenance 完整的点云时，仍应先用 `process_episodes.py` 生成
-processed HDF5 v10，再运行 `python examples/visualize_episode_processed.py <processed.h5>`；该入口
+processed HDF5 v11，再运行 `python examples/visualize_episode_processed.py <processed.h5>`；该入口
 会在读取或渲染 payload 前调用共享的 processed payload/provenance admission，再校验
 `(N,6)`、`float32`、xArm-base 坐标系、RGB 范围、算法/采样语义、配置哈希与桌面标定身份；
 `rgb`/`rgb_pc` 还要求 RGB 与 depth 的 `N/H/W` 完全一致。
 
 发布时逐 episode 显示 tqdm 进度（stderr），终端只打印精简汇总，不再向 stdout 输出 JSON。
-需要机器可读报告时加 `--write-report`，发布成功后在
+发布成功后总会生成 `episodes_processed/<task>/process_log/invalid_frames_report.json`；
+它只列存在真正无效帧的 episode、半开行范围和原因，没有无效帧时 `episodes` 为空。
+需要每条 episode 的完整机器可读审计时加 `--write-report`，随后还会在
 `episodes_processed/<task>/process_log/episode_*.json` 为每个 episode 落一份（含 config、
-决策、输出与校验）；默认不生成。损坏或审计失败（硬无效帧过多、各 source 连续段均不足以
+决策、输出与校验）。损坏或审计失败（硬无效帧过多、各 source 连续段均不足以
 形成完整训练窗口等）的
 episode 会自动跳过并打印 warning 与原因；`--annotations` 显式 `include: true` 的 episode
 不会被自动跳过，其失败会阻断整批。先对待导出的 processed HDF5 执行只读预检；它会检查
@@ -341,9 +343,9 @@ python examples/export_policy_zarr.py \
 输入目录名决定导出任务名，且会与每个 processed HDF5 中的 `task_name` 校验；已有
 `datasets/<task>.zarr` 文件、目录或符号链接（包括悬空链接）都会拒绝覆盖。
 导出时在 stderr 显示输入校验、Zarr 写入和校验和验证的 tqdm 进度条；不会向 stdout
-打印 JSON 报告。
-导出器依据 processed provenance 的 `source_segment_ends` 写 `meta/episode_ends`；同一 raw
-episode 中被删除行造成的缺口会形成多个训练 episode，训练窗口不会跨段。
+打印 JSON 报告。每个 processed HDF5 只能贡献一个完整训练 episode；只要 provenance 表明
+删除过 source 行或存在内部 source/timestamp 缺口，导出器就在 stderr 打印 episode、范围和
+原因并整条拒绝，同时继续导出其他合格 episode。全部 episode 被拒绝时不创建 Zarr，并返回失败。
 可视化 raw episode：
 
 ```bash
@@ -367,15 +369,16 @@ episodes/<task>/episode_<timestamp>/
 
 episodes_processed/<task>/
 ├── episode_<timestamp>.h5
-└── process_log/                 # only with --write-report
-    └── episode_<timestamp>.json
+└── process_log/
+    ├── invalid_frames_report.json  # always written
+    └── episode_<timestamp>.json    # only with --write-report
 
 datasets/<task>.zarr/
 ├── data/*
 └── meta/episode_ends
 ```
 
-正式 raw writer 写 schema v24；depth 通过 SDK 对齐到 color 像素网格后保存，并同时保存两路帧号、设备时间戳、native intrinsics、distortion 与 `T_color_from_depth` 作为 provenance。它还持久化与 camera source 对齐的 state、其 source/publish provenance、有效性/skew 和 hand SDK ACK，并在 sidecar 关闭后写入 manifest。离线处理默认保守：硬无效行可被移除，时序异常默认先审计。`stall_window_frames=8` 表示包含 8 个样本的 inclusive stall window（端点差为 7）；只有 `strict` 才排除高置信时序异常，`audit` 只记录，`hard_only` 关闭 temporal detectors。压紧后的 endpoint delta 超限行按 reject-only contract 移除；若剩余 source-contiguous 段不足完整训练窗口，才拒绝该 episode。
+正式 raw writer 写 schema v24；depth 通过 SDK 对齐到 color 像素网格后保存，并同时保存两路帧号、设备时间戳、native intrinsics、distortion 与 `T_color_from_depth` 作为 provenance。它还持久化与 camera source 对齐的 state、其 source/publish provenance、有效性/skew 和 hand SDK ACK，并在 sidecar 关闭后写入 manifest。离线处理区分硬无效、软审计和有界修复：1–4 帧 IK hold 作为真实停顿保留，连续 5 帧起的长 IK hold 删除；单帧、前后有效的 tactile 通信错误因果保持上一触觉值；可重新验真的 Camera duplicate 保留；joint-state excursion 与 deployment action delta 只审计。`stall_window_frames=8` 表示包含 8 个样本的 inclusive stall window（端点差为 7）；只有 `strict` 才排除高置信时序异常，`audit` 只记录，`hard_only` 关闭 temporal detectors。Policy Zarr 不压紧或拆分有缺口的 episode，而是整条拒绝。
 
 ## 开发与验证
 

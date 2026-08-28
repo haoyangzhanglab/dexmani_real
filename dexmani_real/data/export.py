@@ -1,4 +1,4 @@
-"""Transactional export of processed HDF5 v10 episodes to Policy Zarr v5."""
+"""Transactional export of processed HDF5 v11 episodes to Policy Zarr v5."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from dexmani_real.data.contracts import OutputProfile
 from dexmani_real.data.process import (
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
+    ProcessedProvenance,
     validate_processed_payload,
     validate_processed_provenance,
 )
@@ -75,13 +76,85 @@ class _Artifact:
     dataset_shapes: dict[str, tuple[int, ...]]
     dataset_dtypes: dict[str, np.dtype[Any]]
     semantic_attrs: dict[str, Any]
-    segment_lengths: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _ArtifactRejection:
+    """One valid processed artifact excluded from whole-episode export."""
+
+    episode: str
+    source_file: str
+    invalid_frame_count: int
+    invalid_ranges: list[list[int]]
+    reasons: list[dict[str, Any]]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "episode": self.episode,
+            "source_file": self.source_file,
+            "invalid_frame_count": self.invalid_frame_count,
+            "invalid_ranges": self.invalid_ranges,
+            "reasons": self.reasons,
+        }
 
 
 def _text(value: Any) -> str:
     if isinstance(value, bytes):
         value = value.decode("utf-8")
     return str(value).strip()
+
+
+def _indices_to_ranges(indices: np.ndarray) -> list[list[int]]:
+    values = np.asarray(indices, dtype=np.int64)
+    if values.size == 0:
+        return []
+    starts = np.r_[0, np.flatnonzero(np.diff(values) != 1) + 1]
+    ends = np.r_[starts[1:], len(values)]
+    return [
+        [int(values[start]), int(values[end - 1] + 1)]
+        for start, end in zip(starts, ends, strict=True)
+    ]
+
+
+def _whole_episode_rejection(
+    path: Path, provenance: ProcessedProvenance
+) -> _ArtifactRejection | None:
+    """Reject compaction or a source-time break instead of splitting an episode."""
+
+    has_internal_break = len(provenance.segment_ends) != 1
+    hard_reason_names = provenance.hard_invalid_reason_names
+    reason_rows: dict[str, np.ndarray] = {}
+    hard_invalid = np.zeros(provenance.keep_mask.shape, dtype=bool)
+    for bit, name in enumerate(provenance.drop_reason_names):
+        mask = (provenance.drop_reason_bits & (np.uint64(1) << np.uint64(bit))) != 0
+        if name in hard_reason_names:
+            hard_invalid |= mask
+        if name in hard_reason_names or has_internal_break:
+            reason_rows[name] = np.flatnonzero(mask).astype(np.int64)
+    hard_invalid_rows = np.flatnonzero(hard_invalid).astype(np.int64)
+    if hard_invalid_rows.size == 0 and not has_internal_break:
+        return None
+    reasons: list[dict[str, Any]] = []
+    for name, rows in reason_rows.items():
+        if rows.size:
+            reasons.append(
+                {
+                    "reason": name,
+                    "frame_count": int(rows.size),
+                    "ranges": _indices_to_ranges(rows),
+                }
+            )
+    if has_internal_break:
+        reasons.append(
+            {"reason": "source_discontinuity", "frame_count": 0, "ranges": []}
+        )
+    return _ArtifactRejection(
+        episode=path.stem,
+        source_file=path.name,
+        invalid_frame_count=int(hard_invalid_rows.size),
+        invalid_ranges=_indices_to_ranges(hard_invalid_rows),
+        reasons=reasons,
+    )
 
 
 def _discover_processed_hdf5_paths(source_root: Path) -> tuple[Path, ...]:
@@ -101,7 +174,9 @@ def _discover_processed_hdf5_paths(source_root: Path) -> tuple[Path, ...]:
     return paths
 
 
-def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
+def _inspect_artifact(
+    path: Path, config: PolicyZarrExportConfig
+) -> _Artifact | _ArtifactRejection:
     with h5py.File(path, "r") as source:
         if _text(source.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
             raise ValueError(f"{path.name}: unsupported processed schema")
@@ -334,7 +409,9 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
             expected_profile=profile.value,
             label=path.name,
         )
-        segment_lengths = provenance.segment_lengths
+        rejection = _whole_episode_rejection(path, provenance)
+        if rejection is not None:
+            return rejection
         for key in profile.dataset_keys:
             shapes[key] = tuple(int(value) for value in source[key].shape[1:])
             dtypes[key] = np.dtype(source[key].dtype)
@@ -347,7 +424,6 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
         dataset_shapes=shapes,
         dataset_dtypes=dtypes,
         semantic_attrs=semantics,
-        segment_lengths=segment_lengths,
     )
 
 
@@ -387,39 +463,50 @@ def _load_artifacts(
     config: PolicyZarrExportConfig,
     *,
     progress_callback: ExportProgressCallback | None = None,
-) -> tuple[_Artifact, ...]:
+) -> tuple[tuple[_Artifact, ...], tuple[_ArtifactRejection, ...]]:
     """Inspect one complete task input before any Zarr output is created."""
 
     paths = _discover_processed_hdf5_paths(Path(input_root))
     _report_progress(progress_callback, "validate", 0, len(paths))
     artifacts: list[_Artifact] = []
+    rejections: list[_ArtifactRejection] = []
     for index, path in enumerate(paths, start=1):
-        artifacts.append(_inspect_artifact(path, config))
+        inspected = _inspect_artifact(path, config)
+        if isinstance(inspected, _ArtifactRejection):
+            rejections.append(inspected)
+        else:
+            artifacts.append(inspected)
         _report_progress(progress_callback, "validate", index, len(paths))
-    _validate_uniform(artifacts)
-    return tuple(artifacts)
+    if artifacts:
+        _validate_uniform(tuple(artifacts))
+    return tuple(artifacts), tuple(rejections)
 
 
 def _export_plan_report(
-    artifacts: tuple[_Artifact, ...], *, input_root: str | Path
+    artifacts: tuple[_Artifact, ...],
+    rejections: tuple[_ArtifactRejection, ...],
+    *,
+    input_root: str | Path,
+    expected_task_name: str | None,
 ) -> dict[str, Any]:
     """Summarize the validated source layout used by preflight and publishing."""
 
-    first = artifacts[0]
+    first = artifacts[0] if artifacts else None
     episode_ends = np.cumsum(
-        [length for artifact in artifacts for length in artifact.segment_lengths],
-        dtype=np.int64,
+        [artifact.length for artifact in artifacts], dtype=np.int64
     )
     return {
         "input_root": str(Path(input_root).resolve()),
-        "task_name": first.task_name,
-        "profile": first.profile.value,
-        "dt": first.dt,
-        "source_file_count": len(artifacts),
-        "episode_count": len(episode_ends),
-        "total_frames": int(episode_ends[-1]),
+        "task_name": first.task_name if first is not None else expected_task_name,
+        "profile": first.profile.value if first is not None else None,
+        "dt": first.dt if first is not None else None,
+        "source_file_count": len(artifacts) + len(rejections),
+        "episode_count": len(artifacts),
+        "rejected_episode_count": len(rejections),
+        "rejected_episodes": [item.to_dict() for item in rejections],
+        "total_frames": int(episode_ends[-1]) if len(episode_ends) else 0,
         "episode_ends": episode_ends.tolist(),
-        "dataset_keys": sorted(first.dataset_shapes),
+        "dataset_keys": sorted(first.dataset_shapes) if first is not None else [],
     }
 
 
@@ -438,12 +525,17 @@ def preflight_processed_hdf5_to_zarr(
     """
 
     resolved = config or PolicyZarrExportConfig()
-    artifacts = _load_artifacts(
+    artifacts, rejections = _load_artifacts(
         input_root,
         resolved,
         progress_callback=progress_callback,
     )
-    return _export_plan_report(artifacts, input_root=input_root)
+    return _export_plan_report(
+        artifacts,
+        rejections,
+        input_root=input_root,
+        expected_task_name=resolved.expected_task_name,
+    )
 
 
 def _copy_data(
@@ -516,8 +608,7 @@ def _validate_zarr(
     if set(root["data"].array_keys()) != expected_keys:
         raise ValueError("Zarr data keys do not match processed HDF5")
     expected_ends = np.cumsum(
-        [length for artifact in artifacts for length in artifact.segment_lengths],
-        dtype=np.int64,
+        [artifact.length for artifact in artifacts], dtype=np.int64
     )
     if not np.array_equal(root["meta"]["episode_ends"][:], expected_ends):
         raise ValueError("Zarr episode_ends mismatch")
@@ -570,18 +661,27 @@ def export_processed_hdf5_to_zarr(
         raise NotADirectoryError(source_root)
     if target_is_occupied(target):
         raise FileExistsError(f"refusing to overwrite existing policy Zarr: {target}")
-    artifacts = _load_artifacts(
+    artifacts, rejections = _load_artifacts(
         source_root,
         resolved,
         progress_callback=progress_callback,
     )
+    if not artifacts:
+        return {
+            "output_path": None,
+            **_export_plan_report(
+                artifacts,
+                rejections,
+                input_root=source_root,
+                expected_task_name=resolved.expected_task_name,
+            ),
+        }
     # All payload admission (including finite checks) completes before a
     # staging directory is created, so a rejected source leaves no partial
     # export artifact behind.
     total_frames = sum(artifact.length for artifact in artifacts)
     episode_ends = np.cumsum(
-        [length for artifact in artifacts for length in artifact.segment_lengths],
-        dtype=np.int64,
+        [artifact.length for artifact in artifacts], dtype=np.int64
     )
     first = artifacts[0]
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -641,5 +741,10 @@ def export_processed_hdf5_to_zarr(
         raise
     return {
         "output_path": str(target.resolve()),
-        **_export_plan_report(artifacts, input_root=source_root),
+        **_export_plan_report(
+            artifacts,
+            rejections,
+            input_root=source_root,
+            expected_task_name=resolved.expected_task_name,
+        ),
     }

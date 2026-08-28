@@ -77,9 +77,32 @@ def _format_export_failure(exc: Exception) -> str:
         return (
             f"{message}\n"
             "hint: Policy Zarr v5 requires deployment-equivalent point-cloud "
-            "processed v10 data; reprocess raw v24 with --task-name <task>"
+            "processed v11 data; reprocess raw v24 with --task-name <task>"
         )
     return message
+
+
+def _print_export_admission(report: dict) -> None:
+    """Print whole-episode rejections and one concise batch summary."""
+
+    for rejection in report["rejected_episodes"]:
+        print(f"REJECT {rejection['episode']}:", file=sys.stderr)
+        print(
+            f"  {rejection['invalid_frame_count']} invalid frame(s); "
+            f"rows: {rejection['invalid_ranges']}",
+            file=sys.stderr,
+        )
+        for reason in rejection["reasons"]:
+            print(
+                f"  reason: {reason['reason']} "
+                f"({reason['frame_count']} frame(s), rows {reason['ranges']})",
+                file=sys.stderr,
+            )
+    print(
+        f"Exported {report['episode_count']}/{report['source_file_count']} episode(s); "
+        f"rejected {report['rejected_episode_count']} episode(s).",
+        file=sys.stderr,
+    )
 
 
 class _ExportProgress:
@@ -123,15 +146,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
     progress = _ExportProgress()
+    report: dict
     try:
         if args.dry_run:
-            preflight_processed_hdf5_to_zarr(
+            report = preflight_processed_hdf5_to_zarr(
                 args.input_root,
                 config,
                 progress_callback=progress.update,
             )
         else:
-            export_processed_hdf5_to_zarr(
+            report = export_processed_hdf5_to_zarr(
                 args.input_root,
                 output_path,
                 config,
@@ -152,7 +176,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     finally:
         progress.close()
-    return 0
+    _print_export_admission(report)
+    return 0 if report["episode_count"] > 0 else 1
 
 
 if __name__ == "__main__":

@@ -13,12 +13,16 @@ from typing import Any
 
 import h5py
 import numpy as np
+import zarr
 
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.data.clean import (
     _deployment_action_limit_masks,
+    _isolated_tactile_forward_fill_mask,
     _quality_summary,
+    _revalidate_camera_duplicates,
+    _transient_ik_hold_masks,
     observation_skew_valid_mask,
     recompute_observation_skew_s,
 )
@@ -34,7 +38,11 @@ from dexmani_real.data.export import (
     export_processed_hdf5_to_zarr,
     preflight_processed_hdf5_to_zarr,
 )
-from dexmani_real.data.process import PROCESSED_SCHEMA_NAME, PROCESSED_SCHEMA_VERSION
+from dexmani_real.data.process import (
+    PROCESSED_SCHEMA_NAME,
+    PROCESSED_SCHEMA_VERSION,
+    _invalid_frames_report,
+)
 from dexmani_real.data.quality import assess_temporal_quality
 from dexmani_real.ipc.schema import make_record_sample_dtype
 from dexmani_real.planning.poses import (
@@ -58,6 +66,92 @@ from dexmani_real.teleop.action_proposal import limit_hand_target_delta
 
 
 class DataSegmentTest(unittest.TestCase):
+    def test_ik_hold_threshold_keeps_up_to_four_frames(self) -> None:
+        for length in (1, 2, 3, 4, 5):
+            with self.subTest(length=length):
+                held = np.ones(length, dtype=bool)
+                status = np.full(length, 2, dtype=np.int64)
+
+                transient, persistent = _transient_ik_hold_masks(held, status)
+
+                self.assertEqual(
+                    int(np.count_nonzero(transient)), length if length <= 4 else 0
+                )
+                self.assertEqual(
+                    int(np.count_nonzero(persistent)), length if length > 4 else 0
+                )
+
+    def test_tactile_forward_fill_repairs_only_one_bracketed_frame(self) -> None:
+        np.testing.assert_array_equal(
+            _isolated_tactile_forward_fill_mask([True, False, True]),
+            [False, True, False],
+        )
+        np.testing.assert_array_equal(
+            _isolated_tactile_forward_fill_mask([True, False, False, True]),
+            [False, False, False, False],
+        )
+        np.testing.assert_array_equal(
+            _isolated_tactile_forward_fill_mask([False, True, True]),
+            [False, False, False],
+        )
+
+    def test_camera_duplicate_revalidation_requires_advancing_trusted_frames(
+        self,
+    ) -> None:
+        arrays = {
+            "source_index": np.asarray([10, 11, 12]),
+            "timestamp": np.asarray([0.0, 0.1, 0.2]),
+            "camera_duplicate": np.asarray([False, True, True]),
+            "camera_clock_reset": np.zeros(3, dtype=bool),
+            "camera_generation": np.ones(3, dtype=np.int64),
+            "camera_depth_frame_number": np.asarray([100, 102, 104]),
+            "camera_color_frame_number": np.asarray([200, 202, 204]),
+            "camera_source_monotonic_ns": np.asarray([1000, 1100, 1200]),
+            "camera_depth_device_timestamp_s": np.asarray([1.0, 1.1, 1.2]),
+            "camera_color_device_timestamp_s": np.asarray([1.0, 1.1, 1.2]),
+        }
+
+        recovered = _revalidate_camera_duplicates(
+            arrays,
+            np.asarray([True, False, False]),
+            np.ones(3, dtype=bool),
+            grid_dt_s=0.1,
+            grid_dt_relative_tolerance=0.05,
+        )
+
+        np.testing.assert_array_equal(recovered, [False, True, True])
+        arrays["camera_depth_frame_number"][1] = 100
+        rejected = _revalidate_camera_duplicates(
+            arrays,
+            np.asarray([True, False, False]),
+            np.ones(3, dtype=bool),
+            grid_dt_s=0.1,
+            grid_dt_relative_tolerance=0.05,
+        )
+        np.testing.assert_array_equal(rejected, [False, False, False])
+
+    def test_invalid_report_counts_overlapping_reasons_once(self) -> None:
+        decision = EpisodeDecision(
+            source_path=Path("episode_x"),
+            source_frames=3,
+            profile=OutputProfile.JOINT,
+            selected_indices=np.asarray([0, 2], dtype=np.int64),
+            keep_mask=np.asarray([True, False, True]),
+            drop_reason_bits=np.asarray([0, 3, 0], dtype=np.uint64),
+            drop_reason_names=("reason_a", "reason_b"),
+            hard_reason_counts={"reason_a": 1, "reason_b": 1},
+            boundary_counts={},
+            selected_frames=2,
+            quality={},
+            hard_invalid_reason_names=("reason_a", "reason_b"),
+        )
+
+        report = _invalid_frames_report([decision], task_name="task")
+
+        self.assertEqual(report["episodes"][0]["invalid_frame_count"], 1)
+        self.assertEqual(report["episodes"][0]["invalid_ranges"], [[1, 2]])
+        self.assertEqual(len(report["episodes"][0]["reasons"]), 2)
+
     def test_endpoint_tolerance_round_trips_from_runtime_to_processing(self) -> None:
         runtime = resolve_runtime_config(
             data={"policy": {"endpoint_delta_tolerance_rad": 0.0}}
@@ -345,6 +439,7 @@ class PolicyZarrPreflightTest(unittest.TestCase):
                             "source_frames": 1,
                             "selected_frames": 1,
                             "dropped_frames": 0,
+                            "hard_invalid_reason_names": [],
                             "selected_source_ranges": [[0, 1]],
                             "selected_segment_ends": [1],
                         },
@@ -430,6 +525,36 @@ class PolicyZarrPreflightTest(unittest.TestCase):
             )
 
     @staticmethod
+    def _mark_one_source_row_removed(path: Path) -> None:
+        with h5py.File(path, "r+") as source:
+            source.attrs["source_frames"] = 2
+            decision = json.loads(str(source.attrs["source_decision_json"]))
+            decision.update(
+                {
+                    "source_frames": 2,
+                    "dropped_frames": 1,
+                    "hard_invalid_reason_names": ["long_ik_failure_hold"],
+                    "hard_invalid_frame_count": 1,
+                    "hard_invalid_ranges": [[1, 2]],
+                }
+            )
+            source.attrs["source_decision_json"] = json.dumps(
+                decision, separators=(",", ":")
+            )
+            provenance = source["provenance"]
+            provenance.attrs["drop_reason_bit_names_json"] = json.dumps(
+                {"0": "long_ik_failure_hold"}, separators=(",", ":")
+            )
+            del provenance["source_keep_mask"]
+            provenance.create_dataset(
+                "source_keep_mask", data=np.asarray([True, False], dtype=bool)
+            )
+            del provenance["source_drop_reason_bits"]
+            provenance.create_dataset(
+                "source_drop_reason_bits", data=np.asarray([0, 1], dtype=np.uint64)
+            )
+
+    @staticmethod
     def _load_processed_visualizer() -> Any:
         visualizer_path = (
             Path(__file__).resolve().parents[1]
@@ -460,6 +585,65 @@ class PolicyZarrPreflightTest(unittest.TestCase):
             self.assertEqual(report["episode_count"], 1)
             self.assertEqual(report["total_frames"], 1)
             self.assertEqual(report["episode_ends"], [1])
+            self.assertFalse(any(root.glob("*.zarr")))
+
+    def test_preflight_rejects_previous_processed_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "episode.h5"
+            self._write_deployment_equivalent_pointcloud(source_path)
+            with h5py.File(source_path, "r+") as source:
+                source.attrs["schema_version"] = 10
+
+            with self.assertRaisesRegex(ValueError, "unsupported processed schema version"):
+                preflight_processed_hdf5_to_zarr(root)
+
+    def test_export_rejects_incomplete_episode_without_splitting_others(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid_path = root / "episode_valid.h5"
+            rejected_path = root / "episode_rejected.h5"
+            output_path = root / "test_task.zarr"
+            self._write_deployment_equivalent_pointcloud(valid_path)
+            self._write_deployment_equivalent_pointcloud(rejected_path)
+            self._mark_one_source_row_removed(rejected_path)
+
+            report = export_processed_hdf5_to_zarr(root, output_path)
+
+            self.assertEqual(report["source_file_count"], 2)
+            self.assertEqual(report["episode_count"], 1)
+            self.assertEqual(report["rejected_episode_count"], 1)
+            self.assertEqual(report["episode_ends"], [1])
+            self.assertEqual(report["rejected_episodes"][0]["invalid_ranges"], [[1, 2]])
+            zarr_root = zarr.open_group(str(output_path), mode="r")
+            np.testing.assert_array_equal(zarr_root["meta"]["episode_ends"][:], [1])
+
+    def test_export_cli_reports_and_fails_when_all_episodes_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task_root = root / "episodes_processed" / "test_task"
+            task_root.mkdir(parents=True)
+            source_path = task_root / "episode_rejected.h5"
+            self._write_deployment_equivalent_pointcloud(source_path)
+            self._mark_one_source_row_removed(source_path)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "examples/export_policy_zarr.py",
+                    str(task_root),
+                    "--dry-run",
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            self.assertIn("REJECT episode_rejected", completed.stderr)
+            self.assertIn("long_ik_failure_hold", completed.stderr)
+            self.assertIn("Exported 0/1 episode(s)", completed.stderr)
             self.assertFalse(any(root.glob("*.zarr")))
 
     def test_export_cli_dry_run_shows_progress_without_writing_zarr(self) -> None:

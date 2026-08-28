@@ -30,7 +30,6 @@ import numpy as np
 from dexmani_real.recording.schema import (
     ARM_SENT_MARKER,
     EPISODE_SCHEMA_VERSION,
-    LEGACY_EPISODE_SCHEMA_VERSION,
     validate_data_layout,
     validate_raw_member_hashes,
     validate_raw_semantics,
@@ -116,11 +115,10 @@ class EpisodeReader:
     (``f["arm_qpos"]``, ``f["depth"]``).
     """
 
-    def __init__(self, h5_path: str | Path, *, allow_legacy_v23: bool = False) -> None:
+    def __init__(self, h5_path: str | Path) -> None:
         self._path = Path(h5_path)
         self._closed = False
         self._cache: dict[str, np.ndarray] = {}
-        self._legacy_v23 = False
         if not self._path.is_dir():
             raise ValueError(f"episode must be a published directory: {self._path}")
 
@@ -143,33 +141,18 @@ class EpisodeReader:
         )
         self._rgb_decoder: VideoDecoder | None = None
         schema_version = self.schema_version
-        if schema_version == LEGACY_EPISODE_SCHEMA_VERSION:
-            if not allow_legacy_v23:
-                self.close()
-                raise ValueError(
-                    "raw schema v23 is legacy and has no sidecar integrity manifest; "
-                    "pass allow_legacy_v23=True to read it explicitly"
-                )
-            self._legacy_v23 = True
-            logger.warning(
-                "Reading legacy raw schema v23 without sidecar integrity verification: %s",
-                self._path,
-            )
-        elif schema_version != EPISODE_SCHEMA_VERSION:
+        if schema_version != EPISODE_SCHEMA_VERSION:
             self.close()
             raise ValueError(
                 f"unsupported episode schema v{schema_version}; expected v"
-                f"{EPISODE_SCHEMA_VERSION}. v{LEGACY_EPISODE_SCHEMA_VERSION} requires "
-                "allow_legacy_v23=True; older episodes must be migrated or re-recorded."
+                f"{EPISODE_SCHEMA_VERSION}"
             )
-        if not self._legacy_v23:
-            manifest_errors = self._sidecar_manifest_errors()
-            if manifest_errors:
-                self.close()
-                raise ValueError(
-                    "raw sidecar manifest validation failed: "
-                    + "; ".join(manifest_errors)
-                )
+        manifest_errors = self._sidecar_manifest_errors()
+        if manifest_errors:
+            self.close()
+            raise ValueError(
+                "raw sidecar manifest validation failed: " + "; ".join(manifest_errors)
+            )
         self._rgb_decoder = VideoDecoder(paths["rgb"])
 
     @property
@@ -189,11 +172,6 @@ class EpisodeReader:
     def schema_version(self) -> int:
         meta = self._h5f.get("meta")
         return 0 if meta is None else int(meta.attrs.get("schema_version", 0) or 0)
-
-    @property
-    def legacy_v23(self) -> bool:
-        """Whether this reader was explicitly opened in legacy-v23 mode."""
-        return self._legacy_v23
 
     def _sidecar_manifest_errors(self) -> tuple[str, ...]:
         """Recompute sidecar hashes and compare them with data.h5 metadata.
@@ -288,13 +266,12 @@ class EpisodeReader:
         if layout_errors:
             return ValidityState.INVALID
         try:
-            if not self._legacy_v23 and self._sidecar_manifest_errors():
+            if self._sidecar_manifest_errors():
                 return ValidityState.INVALID
             semantic_errors = validate_raw_semantics(
                 datasets,
                 frame_count=frame_count,
                 attrs=meta.attrs,
-                legacy=self._legacy_v23,
             )
         except Exception:
             logger.warning("failed raw semantic/integrity validation", exc_info=True)

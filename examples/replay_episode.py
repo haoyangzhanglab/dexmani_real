@@ -75,16 +75,7 @@ Controls:
         type=str,
         help=(
             "Published raw schema-v24 episode directory (episodes/<task_name>/episode_*) "
-            "or, with --processed, a processed HDF5 selection artifact; raw v23 "
-            "requires --allow-legacy-v23."
-        ),
-    )
-    parser.add_argument(
-        "--allow-legacy-v23",
-        action="store_true",
-        help=(
-            "Explicitly read raw schema-v23 without sidecar manifest verification "
-            "(default: reject v23)."
+            "or, with --processed, a processed HDF5 selection artifact."
         ),
     )
     parser.add_argument(
@@ -141,11 +132,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
         trajectory = (
-            load_processed_trajectory(
-                args.episode, allow_legacy_v23=args.allow_legacy_v23
-            )
+            load_processed_trajectory(args.episode)
             if args.processed
-            else load_trajectory(args.episode, allow_legacy_v23=args.allow_legacy_v23)
+            else load_trajectory(args.episode)
         )
     except (FileNotFoundError, OSError, ValueError) as exc:
         print(f"Error loading episode: {exc}")

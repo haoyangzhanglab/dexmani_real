@@ -19,6 +19,9 @@ from dexmani_real.recording.reader import EpisodeReader
 from dexmani_real.recording.timeline import FillReason
 from dexmani_real.sensor.camera_worker import CameraHealth
 
+_FRAME_IK_FAIL = 2
+_MAX_TRANSIENT_IK_HOLD_FRAMES = 4
+
 
 def _as_bool(reader: EpisodeReader, name: str) -> np.ndarray:
     return np.asarray(reader.h5f[name][:], dtype=bool)
@@ -147,6 +150,48 @@ def _range_mask(
     return mask
 
 
+def _true_ranges(mask: np.ndarray) -> tuple[tuple[int, int], ...]:
+    """Return half-open ranges for contiguous true runs."""
+
+    values = np.asarray(mask, dtype=bool)
+    padded = np.pad(values.astype(np.int8), (1, 1))
+    edges = np.diff(padded)
+    return tuple(
+        (int(start), int(end))
+        for start, end in zip(
+            np.flatnonzero(edges == 1), np.flatnonzero(edges == -1), strict=True
+        )
+    )
+
+
+def _transient_ik_hold_masks(
+    held: np.ndarray, frame_status: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split IK fallback holds into brief pauses and persistent failures."""
+
+    ik_hold = np.asarray(held, dtype=bool) & (
+        np.asarray(frame_status, dtype=np.int64) == _FRAME_IK_FAIL
+    )
+    transient = np.zeros(ik_hold.shape, dtype=bool)
+    persistent = np.zeros(ik_hold.shape, dtype=bool)
+    for start, end in _true_ranges(ik_hold):
+        target = (
+            transient if end - start <= _MAX_TRANSIENT_IK_HOLD_FRAMES else persistent
+        )
+        target[start:end] = True
+    return transient, persistent
+
+
+def _isolated_tactile_forward_fill_mask(tactile_valid: np.ndarray) -> np.ndarray:
+    """Admit only one bad tactile sample bracketed by valid samples."""
+
+    valid = np.asarray(tactile_valid, dtype=bool)
+    repair = np.zeros(valid.shape, dtype=bool)
+    if len(valid) >= 3:
+        repair[1:-1] = valid[:-2] & ~valid[1:-1] & valid[2:]
+    return repair
+
+
 def _empty_decision(
     path: Path,
     frame_count: int,
@@ -205,6 +250,54 @@ def _rows_are_source_contiguous(
         )
         <= tolerance_s
     )
+
+
+def _revalidate_camera_duplicates(
+    arrays: Mapping[str, np.ndarray],
+    camera_nominal: np.ndarray,
+    camera_age_valid: np.ndarray,
+    *,
+    grid_dt_s: float,
+    grid_dt_relative_tolerance: float,
+) -> np.ndarray:
+    """Recover false duplicate flags only from a trusted advancing predecessor."""
+
+    revalidated = np.zeros(camera_nominal.shape, dtype=bool)
+    trusted = np.asarray(camera_nominal, dtype=bool).copy()
+    clock_reset = np.asarray(arrays["camera_clock_reset"], dtype=bool)
+    for index in np.flatnonzero(arrays["camera_duplicate"]):
+        if index == 0 or not trusted[index - 1]:
+            continue
+        previous = index - 1
+        source_contiguous = _rows_are_source_contiguous(
+            arrays,
+            previous,
+            int(index),
+            grid_dt_s=grid_dt_s,
+            grid_dt_relative_tolerance=grid_dt_relative_tolerance,
+        )
+        revalidated[index] = bool(
+            source_contiguous
+            and arrays["camera_generation"][index] > 0
+            and arrays["camera_generation"][index]
+            == arrays["camera_generation"][previous]
+            and arrays["camera_depth_frame_number"][index]
+            > arrays["camera_depth_frame_number"][previous]
+            and arrays["camera_color_frame_number"][index]
+            > arrays["camera_color_frame_number"][previous]
+            and arrays["camera_source_monotonic_ns"][index]
+            > arrays["camera_source_monotonic_ns"][previous]
+            and np.isfinite(arrays["camera_depth_device_timestamp_s"][index])
+            and np.isfinite(arrays["camera_color_device_timestamp_s"][index])
+            and arrays["camera_depth_device_timestamp_s"][index]
+            > arrays["camera_depth_device_timestamp_s"][previous]
+            and arrays["camera_color_device_timestamp_s"][index]
+            > arrays["camera_color_device_timestamp_s"][previous]
+            and not clock_reset[index]
+            and camera_age_valid[index]
+        )
+        trusted[index] = revalidated[index]
+    return revalidated
 
 
 def _deployment_action_limit_masks(
@@ -494,8 +587,7 @@ def analyze_episode(
     }
     visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
     if visual_profile:
-        # Raw v24 (or explicitly admitted legacy v23) stores the state that a
-        # visual policy actually observes:
+        # Raw v24 stores the state that a visual policy actually observes:
         # newest arm/hand feedback whose source time does not exceed the camera
         # source time.
         arrays["arm_qpos"] = _as_f64(reader, "policy_observation_arm_qpos")
@@ -537,23 +629,24 @@ def analyze_episode(
     hand_state_upper = np.asarray(config.hand_state_limit_upper_rad, dtype=np.float64)
     hand_action_lower = np.asarray(config.hand_action_limit_lower_rad, dtype=np.float64)
     hand_action_upper = np.asarray(config.hand_action_limit_upper_rad, dtype=np.float64)
-    control_limits_valid = _inside(
-        arrays["control_arm_qpos"],
-        arm_lower,
-        arm_upper,
-        config.joint_limit_tolerance_rad,
-    ) & _inside(
-        arrays["control_hand_qpos"],
-        hand_state_lower,
-        hand_state_upper,
-        config.hand_state_limit_tolerance_rad,
-    )
-    limits_valid = control_limits_valid & (
+    state_limits_valid = (
         _inside(
-            arrays["arm_qpos"], arm_lower, arm_upper, config.joint_limit_tolerance_rad
+            arrays["control_arm_qpos"],
+            arm_lower,
+            arm_upper,
+            config.joint_limit_tolerance_rad,
         )
         & _inside(
-            arrays["action_arm"], arm_lower, arm_upper, config.joint_limit_tolerance_rad
+            arrays["control_hand_qpos"],
+            hand_state_lower,
+            hand_state_upper,
+            config.hand_state_limit_tolerance_rad,
+        )
+        & _inside(
+            arrays["arm_qpos"],
+            arm_lower,
+            arm_upper,
+            config.joint_limit_tolerance_rad,
         )
         & _inside(
             arrays["hand_qpos"],
@@ -561,24 +654,33 @@ def analyze_episode(
             hand_state_upper,
             config.hand_state_limit_tolerance_rad,
         )
-        & _inside(
-            arrays["action_hand"],
-            hand_action_lower,
-            hand_action_upper,
-            config.joint_limit_tolerance_rad,
-        )
+    )
+    action_mechanical_limits_valid = _inside(
+        arrays["action_arm"], arm_lower, arm_upper, config.joint_limit_tolerance_rad
+    ) & _inside(
+        arrays["action_hand"],
+        hand_action_lower,
+        hand_action_upper,
+        config.joint_limit_tolerance_rad,
     )
     tactile_valid = (
         _as_bool(reader, "tactile_fresh")
         & _as_bool(reader, "tactile_calibrated")
         & (_as_i64(reader, "tactile_source_monotonic_ns") > 0)
     )
+    tactile_forward_fill = _isolated_tactile_forward_fill_mask(tactile_valid)
+    transient_ik_hold, long_ik_failure_hold = _transient_ik_hold_masks(
+        arrays["held"], arrays["frame_status"]
+    )
+    non_ik_frame_failure = (arrays["frame_status"] != 0) & ~(
+        arrays["held"] & (arrays["frame_status"] == _FRAME_IK_FAIL)
+    )
     reason_masks: dict[str, np.ndarray] = {
         "not_source_sample": ~(arrays["sample_valid"] & is_source),
         "action_not_queued": ~arrays["queued"],
-        "held": arrays["held"],
         "safety_reject": arrays["safety_reject"],
-        "frame_status_not_ok": arrays["frame_status"] != 0,
+        "frame_status_not_ok": non_ik_frame_failure,
+        "long_ik_failure_hold": long_ik_failure_hold,
         "arm_source_invalid": ~(
             arrays["arm_connected"] & arrays["history_valid"][:, 0]
         ),
@@ -587,11 +689,18 @@ def analyze_episode(
             & ~arrays["hand_stale"]
             & arrays["history_valid"][:, 1]
         ),
-        "tactile_invalid": ~tactile_valid,
+        "tactile_invalid": ~tactile_valid & ~tactile_forward_fill,
         "action_timing_invalid": ~timing_valid,
         "nonfinite_joint_or_action": ~np.all(np.isfinite(joint_numeric), axis=1),
         "nonfinite_real_modality": ~real_modalities_finite,
-        "joint_limit_violation": ~limits_valid,
+        "action_mechanical_limit_violation": ~action_mechanical_limits_valid,
+    }
+    audit_masks: dict[str, np.ndarray] = {
+        "joint_state_limit_excursion": ~state_limits_valid,
+        "transient_ik_hold": transient_ik_hold,
+    }
+    repair_masks: dict[str, np.ndarray] = {
+        "tactile_forward_fill": tactile_forward_fill,
     }
 
     if visual_profile:
@@ -603,6 +712,23 @@ def analyze_episode(
                 "camera_health": _as_i64(reader, "camera_health"),
                 "observation_valid": _as_bool(reader, "observation_valid"),
                 "observation_skew_s": _as_f64(reader, "observation_skew_s"),
+                "camera_generation": _as_i64(reader, "camera_generation"),
+                "camera_depth_frame_number": _as_i64(
+                    reader, "camera_depth_frame_number"
+                ),
+                "camera_color_frame_number": _as_i64(
+                    reader, "camera_color_frame_number"
+                ),
+                "camera_source_monotonic_ns": _as_i64(
+                    reader, "camera_source_monotonic_ns"
+                ),
+                "camera_clock_reset": _as_bool(reader, "camera_clock_reset"),
+                "camera_depth_device_timestamp_s": _as_f64(
+                    reader, "camera_depth_device_timestamp_s"
+                ),
+                "camera_color_device_timestamp_s": _as_f64(
+                    reader, "camera_color_device_timestamp_s"
+                ),
             }
         )
         camera_age_valid = (
@@ -610,21 +736,50 @@ def analyze_episode(
             & (arrays["camera_age_s"] >= 0.0)
             & (arrays["camera_age_s"] <= config.max_camera_age_s)
         )
-        reason_masks["camera_invalid"] = ~(
+        camera_clock_reset = arrays["camera_clock_reset"]
+        camera_nominal = (
             _as_bool(reader, "flag_camera_fresh")
             & arrays["history_valid"][:, 3]
-            & ~_as_bool(reader, "camera_clock_reset")
+            & ~camera_clock_reset
             & (arrays["camera_health"] == int(CameraHealth.OK))
             & camera_age_valid
         )
-        observation_skew_valid = observation_skew_valid_mask(
+        camera_duplicate_revalidated = _revalidate_camera_duplicates(
+            arrays,
+            camera_nominal,
+            camera_age_valid,
+            grid_dt_s=reader.timing.grid_dt_s,
+            grid_dt_relative_tolerance=config.grid_dt_relative_tolerance,
+        )
+        camera_admitted = camera_nominal | camera_duplicate_revalidated
+        reason_masks["camera_invalid"] = ~camera_admitted
+        audit_masks["camera_duplicate_revalidated"] = camera_duplicate_revalidated
+        effective_history_valid = arrays["history_valid"].copy()
+        effective_history_valid[camera_duplicate_revalidated, 3] = True
+        recorded_observation_skew_valid = observation_skew_valid_mask(
             arrays["observation_skew_s"],
             arrays["observation_source_monotonic_ns"],
             arrays["history_valid"],
             max_observation_skew_s=config.max_observation_skew_s,
         )
+        revalidated_skew_s = recompute_observation_skew_s(
+            arrays["observation_source_monotonic_ns"], effective_history_valid
+        )
+        source_metadata_valid = np.all(
+            (~effective_history_valid)
+            | (arrays["observation_source_monotonic_ns"] > 0),
+            axis=1,
+        )
+        duplicate_observation_revalidated = (
+            camera_duplicate_revalidated
+            & np.all(effective_history_valid[:, [0, 2, 3]], axis=1)
+            & source_metadata_valid
+            & np.isfinite(revalidated_skew_s)
+            & (revalidated_skew_s <= config.max_observation_skew_s)
+        )
         reason_masks["observation_invalid"] = ~(
-            arrays["observation_valid"] & observation_skew_valid
+            (arrays["observation_valid"] & recorded_observation_skew_valid)
+            | duplicate_observation_revalidated
         )
         policy_reference_ns = _as_i64(
             reader, "policy_observation_reference_monotonic_ns"
@@ -710,10 +865,9 @@ def analyze_episode(
         tracking_error_warn_rad=config.tracking_error_warn_rad,
     )
 
-    # Apply the endpoint contract to the stream that will actually be exported.
-    # A row removed for temporal quality cannot be used as the next action's
-    # delta reference, otherwise the retained labels could still exceed the
-    # deployment coordinator's reject-only limit.
+    # Deployment endpoint deltas are audit telemetry.  Collection commands have
+    # already crossed the live safety boundary; a large offline delta must not
+    # relabel a finite, mechanically valid recorded action as corrupt data.
     candidate_mask = pre_action_base_valid & ~temporal_assessment.excluded_mask
     (
         deployment_action_invalid,
@@ -725,7 +879,7 @@ def analyze_episode(
         config,
         grid_dt_s=timing.grid_dt_s,
     )
-    reason_masks["deployment_action_limit"] = deployment_action_invalid
+    audit_masks["deployment_action_limit"] = deployment_action_invalid
 
     hard_invalid = np.zeros(frame_count, dtype=bool)
     for mask in reason_masks.values():
@@ -742,10 +896,16 @@ def analyze_episode(
         config,
         grid_dt_s=timing.grid_dt_s,
     )
+    hard_invalid_reason_names = tuple(
+        name for name in reason_masks if name != "annotation_excluded_row"
+    )
+    if np.any(temporal_assessment.excluded_mask):
+        hard_invalid_reason_names += ("temporal_high_confidence",)
     warnings: list[str] = []
     if source_gaps:
         warnings.append(
-            f"policy export will split {len(source_gaps)} source discontinuity boundary(s)"
+            f"policy export will reject this episode: {len(source_gaps)} source "
+            "discontinuity boundary(s)"
         )
     frame_ok = arrays["frame_status"] == 0
     if np.count_nonzero(frame_ok & ~_as_bool(reader, "flag_ik_ok")) > frame_count // 2:
@@ -772,6 +932,12 @@ def analyze_episode(
         "hand_invalid_row_count": int(np.count_nonzero(deployment_hand_action_invalid)),
         "invalid_row_count": int(np.count_nonzero(deployment_action_invalid)),
     }
+    quality["audit_reason_counts"] = {
+        name: int(np.count_nonzero(mask)) for name, mask in audit_masks.items()
+    }
+    quality["repair_reason_counts"] = {
+        name: int(np.count_nonzero(mask)) for name, mask in repair_masks.items()
+    }
     rejected_reason: str | None = None
     if quality["full_window_count"] < config.min_full_windows:
         rejected_reason = (
@@ -797,6 +963,10 @@ def analyze_episode(
         quality=quality,
         source_gap_findings=source_gaps,
         temporal_quality=temporal_assessment.to_dict(config.temporal_quality.policy),
+        hard_invalid_reason_names=hard_invalid_reason_names,
+        audit_reason_counts=quality["audit_reason_counts"],
+        repair_reason_counts=quality["repair_reason_counts"],
+        tactile_forward_fill_mask=tactile_forward_fill,
         warnings=tuple(warnings),
         rejected_reason=rejected_reason,
     )

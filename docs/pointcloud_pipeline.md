@@ -46,9 +46,9 @@ Intel RealSense
         fixed float32[N, 6], frame=xarm_base
                  │
                  ├─ pointcloud_ring → deployment / policy observation
-                 └─ raw v24 (legacy v23 requires explicit opt-in)
+                 └─ raw v24
                       ├─ raw visualizer → Rerun canonical preview
-                      └─ offline process → processed HDF5 v10 → Policy Zarr v5
+                      └─ offline process → processed HDF5 v11 → Policy Zarr v5
 ```
 
 实时 worker 不排队旧帧：它只读取 `camera_ring` 的最新 sequence。构建前检查候选帧的相机健康、
@@ -68,7 +68,7 @@ raw episode 保存记录期 resolved config 的 SHA-256，但不复制可反序�
 时入口会 warning，结果应视为 current-config preview。需要可持久复现和完整 provenance 时，应生成
 processed HDF5；其文件内保存 processing config、点云配置哈希与桌面平面身份。
 
-运行时默认只读取 raw v24；raw v23 需要显式 `--allow-legacy-v23`。`--no-point-cloud` 可关闭即时推导。
+运行时只读取 raw v24。`--no-point-cloud` 可关闭即时推导。
 单帧构建结果为空时 Rerun 会显式清除该时间点的点云，避免沿用上一帧。eye-in-hand 仍会 fail closed，因为 raw schema 没有保存相机曝光
 时刻对应的机械臂位姿。
 
@@ -279,10 +279,8 @@ OpenCV 3×3 depth fast path 与逐步 SciPy 参考实现的 240 帧最终点云 
 ## 录制、离线处理与语义校验
 
 录制 schema v24 保存 aligned raw depth、RGB、native depth/color 几何 provenance、帧号和时间
-信息，并持久化与 camera source 对齐的 arm/hand policy observation。离线处理默认只接受 raw v24；
-CLI/API 显式启用 `--allow-legacy-v23`/`allow_legacy_v23=True` 时才读取没有 sidecar manifest
-的 legacy v23，并使用同一个生产 builder 生成 processed HDF5 v10；只有完整的对齐与动作限速
-合同的 pointcloud 产物可进入 Policy Zarr v5。
+信息，并持久化与 camera source 对齐的 arm/hand policy observation。离线处理只接受 raw v24；
+只有完整的对齐与动作限速合同的 pointcloud 产物可进入 Policy Zarr v5。
 
 每个 processed 点云产物记录并在导出/可视化时校验：
 
@@ -294,7 +292,7 @@ CLI/API 显式启用 `--allow-legacy-v23`/`allow_legacy_v23=True` 时才读取�
 - 桌面平面、采样和变换语义。
 
 导出、可视化和部署只接受与当前 policy ID、配置哈希及桌面标定身份完全一致的产物；其他产物
-必须从受支持的 raw v24 episode 重新处理；legacy v23 需显式 opt-in。
+必须从受支持的 raw v24 episode 重新处理。
 
 ## 代码所有权
 
@@ -307,7 +305,7 @@ CLI/API 显式启用 `--allow-legacy-v23`/`allow_legacy_v23=True` 时才读取�
 | 点云参数与稳定 identity | `config/pointcloud.py` |
 | 桌面 RANSAC 与 plane 文件 | `calibration/table.py`、`config/desk_plane.json` |
 | raw v24 相机 metadata 与点云输入适配 | `data/raw_pointcloud.py` |
-| raw v24 → processed v10 | `data/process.py` |
+| raw v24 → processed v11 | `data/process.py` |
 | raw current-config preview | `examples/visualize_episode.py` |
 
 核心数学不访问 SDK、共享内存、文件或可视化；硬件采集、IPC、标定写入和 GUI 均在外围 owner 中。

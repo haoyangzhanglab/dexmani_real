@@ -90,8 +90,9 @@ Sim 数据保持现有行为，不应因 Real 合同新增全局强制字段。
 3. 末值等于每个 `/data/<key>` 的第一维；
 4. 不把不同 `episode_ends` 段拼成一个 sequence。
 
-Real Zarr v5 的每个 `episode_ends` 段代表一个 source-contiguous 训练 episode。同一 raw episode
-删除中间行后可能产生多个段；这是正常输入，不应被合并。
+Real Zarr v5 的每个 `episode_ends` 段代表一份完整、source-contiguous 的 processed episode。
+同一 raw episode 只要删除过行或出现内部连续性缺口，就在 Zarr admission 阶段整条拒绝，
+不会展开为多个段。
 
 ### 3.3 attrs 与实际数组一起保留
 
@@ -308,7 +309,7 @@ control_action: inverse FAAS 后的 native 19D 或 EE 21D
 
 ### 阶段 E：生成新数据与 checkpoint
 
-1. 使用 `dexmani_real` 重新生成 deployment-equivalent processed HDF5 v10；
+1. 使用 `dexmani_real` 重新生成 deployment-equivalent processed HDF5 v11；
 2. 导出全新的 Policy Zarr v5 目标，不覆盖旧 Zarr；
 3. 用 `pad_before=0` 训练单任务 point-cloud policy；
 4. 生成包含 resolved config/data contract 的新 checkpoint；

@@ -404,6 +404,10 @@ class EpisodeDecision:
     quality: dict[str, Any]
     source_gap_findings: tuple[dict[str, Any], ...] = ()
     temporal_quality: dict[str, Any] = field(default_factory=dict)
+    hard_invalid_reason_names: tuple[str, ...] = ()
+    audit_reason_counts: dict[str, int] = field(default_factory=dict)
+    repair_reason_counts: dict[str, int] = field(default_factory=dict)
+    tactile_forward_fill_mask: np.ndarray | None = None
     warnings: tuple[str, ...] = ()
     rejected_reason: str | None = None
 
@@ -419,6 +423,7 @@ class EpisodeDecision:
         return self.rejected_reason is None and self.selected_frames > 0
 
     def to_dict(self) -> dict[str, Any]:
+        hard_invalid_ranges, hard_invalid_reasons = self._hard_invalid_report()
         return {
             "source_episode": self.source_path.name,
             "source_path": str(self.source_path),
@@ -431,6 +436,14 @@ class EpisodeDecision:
                 self.selected_frames / self.source_frames if self.source_frames else 0.0
             ),
             "hard_reason_counts": self.hard_reason_counts,
+            "hard_invalid_reason_names": list(self.hard_invalid_reason_names),
+            "hard_invalid_frame_count": sum(
+                end - start for start, end in hard_invalid_ranges
+            ),
+            "hard_invalid_ranges": hard_invalid_ranges,
+            "hard_invalid_reasons": hard_invalid_reasons,
+            "audit_reason_counts": self.audit_reason_counts,
+            "repair_reason_counts": self.repair_reason_counts,
             "boundary_counts": self.boundary_counts,
             "dropped_frames": self.source_frames - self.selected_frames,
             "full_window_count": self.quality.get("full_window_count", 0),
@@ -441,6 +454,28 @@ class EpisodeDecision:
             "temporal_quality": self.temporal_quality,
             "warnings": list(self.warnings),
         }
+
+    def _hard_invalid_report(self) -> tuple[list[list[int]], list[dict[str, Any]]]:
+        """Summarize only hard-invalid source rows from provenance reason bits."""
+
+        reason_masks = {
+            name: (self.drop_reason_bits & (np.uint64(1) << np.uint64(bit))) != 0
+            for bit, name in enumerate(self.drop_reason_names)
+            if name in self.hard_invalid_reason_names
+        }
+        hard_invalid = np.zeros(self.drop_reason_bits.shape, dtype=bool)
+        for mask in reason_masks.values():
+            hard_invalid |= mask
+        reasons = [
+            {
+                "reason": name,
+                "frame_count": int(np.count_nonzero(mask)),
+                "ranges": _indices_to_ranges(np.flatnonzero(mask)),
+            }
+            for name, mask in reason_masks.items()
+            if np.any(mask)
+        ]
+        return _indices_to_ranges(np.flatnonzero(hard_invalid)), reasons
 
 
 def build_source_segment_ends(

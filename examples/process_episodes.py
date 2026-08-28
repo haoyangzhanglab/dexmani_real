@@ -2,9 +2,7 @@
 """Usage: ``python examples/process_episodes.py INPUT_ROOT [--profile PROFILE]``.
 
 Offline CLI that audits and compacts one task's depth-to-color aligned raw-v24
-episodes into processed HDF5 v10 files, one per source episode.
-Raw v23 is rejected by default; pass ``--allow-legacy-v23`` to make that
-compatibility boundary explicit (legacy sidecars have no v24 manifest).
+episodes into processed HDF5 v11 files, one per source episode.
 
 Directory mapping: ``episodes/<task>/episode_*`` (raw) is published to
 ``episodes_processed/<task>/episode_*.h5``.  Passing a single episode
@@ -22,9 +20,11 @@ aborts the batch, so explicit operator intent is not silently overridden.
 
 Connects to no hardware, opens no GUI, and writes only the resolved
 ``episodes_processed/`` output.  No JSON is printed to stdout; progress,
-warnings, and a concise summary go to stderr.  With ``--write-report``, one JSON
-per source episode is written under ``episodes_processed/<task>/process_log/``
-after a successful publish.  Exit codes: 0 at least one episode was published
+warnings, and a concise summary go to stderr.  A concise
+``process_log/invalid_frames_report.json`` is always published; it lists only
+episodes with genuinely invalid source frames.  With ``--write-report``, one
+additional JSON per source episode is written in the same directory.  Exit
+codes: 0 at least one episode was published
 or an audit completed; 1 nothing was published or the publish failed; 2 usage
 or environment error (bad input root, existing output root, unreadable
 annotations).
@@ -41,6 +41,7 @@ import sys
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -65,6 +66,7 @@ from dexmani_real.data.process import (
     process_episode_root,
 )
 from dexmani_real.ipc.schema import SUPPORTED_POINT_CLOUD_COUNTS
+from dexmani_real.utils.atomic_io import atomic_json_dump
 
 
 def _route_library_logging_to_stderr() -> None:
@@ -95,7 +97,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Audit and compact depth-to-color aligned raw-v24 Real episodes into one "
-            "processed-v10 "
+            "processed-v11 "
             "HDF5 per source; seriously broken episodes are skipped with a warning."
         )
     )
@@ -105,14 +107,6 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "One episode directory or a task directory whose direct children are "
             "episodes, e.g. episodes/pick_apple_messy/episode_*."
-        ),
-    )
-    parser.add_argument(
-        "--allow-legacy-v23",
-        action="store_true",
-        help=(
-            "Explicitly admit raw schema-v23 episodes; sidecar manifests are not "
-            "available for legacy data (default: reject v23)."
         ),
     )
     parser.add_argument(
@@ -213,8 +207,9 @@ def _parser() -> argparse.ArgumentParser:
         "--write-report",
         action="store_true",
         help=(
-            "Write one JSON per source episode to <output_root>/process_log/"
-            "episode_<name>.json after a successful publish (off by default; "
+            "Write one detailed JSON per source episode to <output_root>/process_log/"
+            "episode_<name>.json in addition to the always-written invalid-frame "
+            "summary (off by default; "
             "ignored in --dry-run and --compare-profiles)."
         ),
     )
@@ -225,7 +220,7 @@ def _config(
     args: argparse.Namespace,
     profile: OutputProfile,
     policy: QualityPolicy,
-    runtime: object,
+    runtime: Any,
 ) -> ProcessingConfig:
     overrides: dict[str, object] = {
         "horizon": args.horizon,
@@ -337,8 +332,6 @@ def _audit_episode(
     config: ProcessingConfig,
     annotation: EpisodeAnnotation | None,
     tmp_dir: Path,
-    *,
-    allow_legacy_v23: bool,
 ) -> tuple[dict, str | None] | tuple[None, str]:
     """Analyze one episode without writing; return (decision, error)."""
 
@@ -352,7 +345,6 @@ def _audit_episode(
             config,
             annotations_path=annotations_path,
             dry_run=True,
-            allow_legacy_v23=allow_legacy_v23,
         )
         return report["episodes"][0], None
     except Exception as exc:
@@ -368,8 +360,6 @@ def _audit_episodes(
     user_annotations: dict[str, EpisodeAnnotation],
     output_root: Path,
     tmp_dir: Path,
-    *,
-    allow_legacy_v23: bool,
 ) -> list[dict]:
     results: list[dict] = []
     bar = tqdm(
@@ -388,7 +378,6 @@ def _audit_episodes(
             config,
             annotation,
             tmp_dir,
-            allow_legacy_v23=allow_legacy_v23,
         )
         if annotation is not None and not annotation.include:
             status = "user-excluded"
@@ -476,6 +465,38 @@ def _write_process_logs(
         with (log_dir / f"{item['name']}.json").open("w", encoding="utf-8") as stream:
             json.dump(entry, stream, ensure_ascii=False, indent=2)
             stream.flush()
+
+
+def _write_invalid_frames_report(
+    output_root: Path,
+    results: list[dict],
+    *,
+    task_name: str,
+) -> dict:
+    """Persist the concise invalid-row report from the original audit decisions."""
+
+    episodes = []
+    for item in results:
+        decision = item["decision"]
+        if decision is None or not decision["hard_invalid_frame_count"]:
+            continue
+        episodes.append(
+            {
+                "episode": item["name"],
+                "invalid_frame_count": decision["hard_invalid_frame_count"],
+                "invalid_ranges": decision["hard_invalid_ranges"],
+                "reasons": decision["hard_invalid_reasons"],
+            }
+        )
+    report = {
+        "schema_name": "dexmani-real-invalid-frames-report",
+        "schema_version": 1,
+        "task_name": task_name,
+        "episodes": episodes,
+    }
+    path = output_root / "process_log" / "invalid_frames_report.json"
+    atomic_json_dump(report, path, ensure_ascii=False)
+    return report
 
 
 def _merge_exclusions(
@@ -576,7 +597,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     user_annotations,
                     output_root,
                     tmp_dir,
-                    allow_legacy_v23=args.allow_legacy_v23,
                 )
                 decided = [
                     item["decision"]
@@ -606,7 +626,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             user_annotations,
             output_root,
             tmp_dir,
-            allow_legacy_v23=args.allow_legacy_v23,
         )
         _print_audit_summary(results)
         if args.dry_run:
@@ -633,12 +652,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_root,
                 config,
                 annotations_path=merged_path,
-                allow_legacy_v23=args.allow_legacy_v23,
             )
         except Exception as exc:
             # A publish-only failure (validation, transform, or h5py error)
             # aborts cleanly; staging was already removed by the pipeline.
             print(f"error: batch publish failed: {exc}", file=sys.stderr)
+            return 1
+        try:
+            report["invalid_frames_report"] = _write_invalid_frames_report(
+                output_root,
+                results,
+                task_name=report["invalid_frames_report"]["task_name"],
+            )
+        except OSError as exc:
+            print(
+                f"error: failed to write invalid-frame report: {exc}", file=sys.stderr
+            )
             return 1
         if args.write_report:
             try:
@@ -656,6 +685,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"published {report['output_episode_count']} episode(s) -> {output_root}",
         file=sys.stderr,
     )
+    invalid_report = report["invalid_frames_report"]
+    invalid_episodes = invalid_report["episodes"]
+    if invalid_episodes:
+        print(
+            f"invalid-frame report: {len(invalid_episodes)} episode(s) -> "
+            f"{output_root / 'process_log' / 'invalid_frames_report.json'}",
+            file=sys.stderr,
+        )
     return 0
 
 

@@ -306,7 +306,7 @@ class RawFinalizationIntegrityTest(unittest.TestCase):
             with h5py.File(path / "depth.h5", "r") as depth_h5:
                 self.assertEqual(depth_h5["depth"].shape[0], 1)
 
-    def test_v23_requires_explicit_legacy_opt_in(self) -> None:
+    def test_v23_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             recorder = self._recorder(root)
             self.assertTrue(recorder.start_episode())
@@ -323,15 +323,8 @@ class RawFinalizationIntegrityTest(unittest.TestCase):
             with h5py.File(path / "data.h5", "r+") as data_h5:
                 meta = data_h5["meta"]
                 meta.attrs["schema_version"] = 23
-                del meta.attrs["raw_manifest_version"]
-                del meta.attrs["depth_sha256"]
-                del meta.attrs["rgb_sha256"]
-                del meta.attrs["raw_member_sha256_json"]
-            with self.assertRaisesRegex(ValueError, "allow_legacy_v23"):
+            with self.assertRaisesRegex(ValueError, "unsupported episode schema v23"):
                 EpisodeReader(path)
-            with EpisodeReader(path, allow_legacy_v23=True) as reader:
-                self.assertTrue(reader.legacy_v23)
-                self.assertIs(reader.validity, ValidityState.VALID)
 
 
 if __name__ == "__main__":
