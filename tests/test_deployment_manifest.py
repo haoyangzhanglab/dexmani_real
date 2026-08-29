@@ -14,7 +14,6 @@ def _manifest(*, modalities: tuple[str, ...]):
         n_action_steps=8,
         action_dim=19,
         horizon=16,
-        use_faas=False,
         tcp_dim=None,
         hand_dim=None,
         control_action_dim=19,

@@ -1,109 +1,168 @@
 #!/usr/bin/env python3
-"""Resolve configs and start hardware-affecting learned-policy deployment.
+"""Resolve one hash-bound DexMani Policy artifact and run a bounded policy lifecycle.
 
-The deployment can command xArm7/XHand and connect RealSense when required by
-the model observation contract.
+``shadow`` is the default operational mode. ``execute`` is a deliberately
+one-publication H4 profile that needs explicit bounds and separate hardware
+authorization; this entry point never grants that authorization itself.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
+
+import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-import yaml
-
 from dexmani_real.config.runtime import resolve_runtime_config
-from dexmani_real.deployment.config import resolve_deployment_config
-from dexmani_real.deployment.lifecycle import run_policy_deployment
-from dexmani_real.ipc.schema import SUPPORTED_POINT_CLOUD_COUNTS
-from dexmani_real.utils.log import get_logger
+from dexmani_real.deployment.artifact import resolve_policy_artifact
+from dexmani_real.deployment.config import (
+    H4ExecuteBounds,
+    resolve_policy_runtime_config,
+)
+from dexmani_real.deployment.run_identity import (
+    canonical_run_receipt_json,
+    resolve_real_source_identity,
+)
 
-logger = get_logger(__name__)
+
+def _positive_finite_seconds(raw: str) -> float:
+    """Parse one operator-supplied positive duration without lifecycle imports."""
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a finite positive number") from exc
+    if not math.isfinite(value) or value <= 0.0:
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return value
 
 
-def main(argv: list[str] | None = None) -> int:
+def _one_positive_endpoint(raw: str) -> int:
+    """Parse the deliberately fixed H4 physical-publication bound."""
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be exactly 1 for H4") from exc
+    if value != 1:
+        raise argparse.ArgumentTypeError("must be exactly 1 for H4")
+    return value
+
+
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run a learned-policy deployment on the xArm7 + XHand runtime"
+        description="Resolve, preflight, shadow-validate, or bounded-H4 execute one DexMani Policy experiment"
+    )
+    parser.add_argument(
+        "--experiment-dir",
+        required=True,
+        help="experiment directory containing config.yaml and checkpoints/",
     )
     parser.add_argument(
         "--config",
-        type=str,
         default=None,
-        help="YAML with runtime overrides (arm/hand/safety/control rates)",
+        help="Real runtime YAML used after a shadow receipt is resolved",
     )
     parser.add_argument(
         "--deployment-config",
-        type=str,
         default=None,
-        help="YAML with deployment overrides (runtime target, checkpoint, device)",
+        help="Real-owned deployment timing/readiness YAML or artifact expectations",
     )
-    parser.add_argument(
-        "--runtime", type=str, default=None, help="module:symbol PolicyRuntime target"
-    )
-    parser.add_argument(
-        "--checkpoint", type=str, default=None, help="model checkpoint path"
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="inference device (default from config)",
-    )
-    parser.add_argument(
-        "--task-name",
-        type=str,
-        default=None,
-        help="Expected training task identity; required by DexMani Policy",
-    )
+    parser.add_argument("--device", default=None, help="operator inference device")
     parser.add_argument(
         "--hand",
         action="store_true",
-        help="Enable coupled XHand control (deployment.hand_enabled=true)",
+        help="acknowledge XHand control required for hand startup/reset and H4 execute",
     )
     parser.add_argument(
-        "--pointcloud-num-points",
-        type=int,
-        choices=sorted(SUPPORTED_POINT_CLOUD_COUNTS),
+        "--execution-mode",
+        choices=("shadow", "execute"),
+        default="shadow",
+        help="shadow validates policy endpoints without actuator publication",
+    )
+    parser.add_argument(
+        "--max-running-seconds",
+        type=_positive_finite_seconds,
         default=None,
-        help="Fixed point-cloud observation size (default from deployment config)",
+        help=(
+            "optional B-relative shadow-run limit; coordinator must acknowledge "
+            "the stop before shutdown"
+        ),
     )
     parser.add_argument(
-        "--action-key",
-        type=str,
-        choices=("action", "action_ee"),
+        "--execute-max-published-endpoints",
+        type=_one_positive_endpoint,
         default=None,
-        help="Action contract (joint 19D or EE 21D); must match the checkpoint",
+        help="required H4 execute bound; currently must be exactly 1",
     )
     parser.add_argument(
-        "--observation-fields",
-        type=str,
+        "--execute-ack-timeout-seconds",
+        type=_positive_finite_seconds,
         default=None,
-        help="Comma-separated observation contract (deployment.observation_fields)",
+        help="required H4 execute arm+hand acknowledgement deadline",
     )
-    parser.add_argument(
-        "--print-config", action="store_true", help="Print resolved configs and exit"
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
+        "--print-config",
+        action="store_true",
+        help="print pure resolved receipt and exit",
     )
-    args = parser.parse_args(argv)
+    modes.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="hash, single-load, restore, and fake-observation check in a child",
+    )
+    return parser
 
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _parser()
+    args = parser.parse_args(argv)
+    h4_execute_bounds = None
+    if args.execution_mode == "shadow":
+        if (
+            args.execute_max_published_endpoints is not None
+            or args.execute_ack_timeout_seconds is not None
+        ):
+            parser.error("--execute-* bounds require --execution-mode execute")
+        if args.max_running_seconds is not None and (
+            args.print_config or args.preflight_only
+        ):
+            parser.error(
+                "--max-running-seconds is only valid for an operational shadow lifecycle"
+            )
+    else:
+        if not args.hand:
+            parser.error("H4 execute requires explicit --hand acknowledgement")
+        if args.max_running_seconds is None:
+            parser.error("H4 execute requires --max-running-seconds")
+        if args.execute_max_published_endpoints is None:
+            parser.error("H4 execute requires --execute-max-published-endpoints 1")
+        if args.execute_ack_timeout_seconds is None:
+            parser.error("H4 execute requires --execute-ack-timeout-seconds")
+        try:
+            h4_execute_bounds = H4ExecuteBounds(
+                max_published_endpoints=args.execute_max_published_endpoints,
+                acknowledgement_timeout_s=args.execute_ack_timeout_seconds,
+                max_running_s=args.max_running_seconds,
+            )
+        except (TypeError, ValueError) as exc:
+            parser.error(f"invalid H4 execute bounds: {exc}")
     try:
+        artifact = resolve_policy_artifact(args.experiment_dir)
         runtime = resolve_runtime_config(yaml_path=args.config)
-        deployment_resolved = resolve_deployment_config(
+        projection = resolve_policy_runtime_config(
+            artifact=artifact,
+            runtime_config=runtime,
             yaml_path=args.deployment_config,
-            cli_overrides={
-                "runtime_target": args.runtime,
-                "checkpoint": args.checkpoint,
-                "device": args.device,
-                "task_name": args.task_name,
-                "hand_enabled": True if args.hand else None,
-                "pointcloud_num_points": args.pointcloud_num_points,
-                "action_key": args.action_key,
-                "observation_fields": args.observation_fields,
-            },
+            device=args.device,
+            execution_mode=args.execution_mode,
+            hand_acknowledged=args.hand,
+            h4_execute_bounds=h4_execute_bounds,
         )
     except (
         KeyError,
@@ -113,23 +172,51 @@ def main(argv: list[str] | None = None) -> int:
         ValueError,
         yaml.YAMLError,
     ) as exc:
-        parser.error(f"invalid deployment config: {exc}")
+        parser.error(f"invalid deployment receipt/config: {exc}")
 
+    real_source = resolve_real_source_identity()
     if args.print_config:
-        print(deployment_resolved.canonical_json)
-        print(f"deployment_sha256={deployment_resolved.sha256}")
-        print(f"runtime_sha256={runtime.sha256}")
-        return 0
-
-    deployment = deployment_resolved.deployment
-    try:
-        return run_policy_deployment(runtime, deployment)
-    except Exception:
-        logger.error(
-            "policy deployment failed before lifecycle ownership was established",
-            exc_info=True,
+        print(
+            canonical_run_receipt_json(
+                artifact=artifact,
+                projection=projection,
+                runtime_sha256=runtime.sha256,
+                real_source=real_source,
+                preflight_result=None,
+            )
         )
-        return 1
+        return 0
+    if args.preflight_only:
+        # Deliberately lazy: print-config must not import torch, Policy, worker,
+        # lifecycle, camera, robot, or other hardware-owning modules.
+        from dexmani_real.deployment.preflight import run_isolated_preflight
+
+        try:
+            result = run_isolated_preflight(projection.runtime)
+        except (OSError, RuntimeError, TimeoutError, TypeError, ValueError) as exc:
+            print(f"policy preflight failed: {exc}", file=sys.stderr)
+            return 1
+        print(
+            canonical_run_receipt_json(
+                artifact=artifact,
+                projection=projection,
+                runtime_sha256=runtime.sha256,
+                real_source=real_source,
+                preflight_result=result,
+            )
+        )
+        return 0
+    # Deliberately lazy: receipt/preflight modes above must remain isolated
+    # from lifecycle, camera, robot, and hardware-owning imports.
+    from dexmani_real.deployment.lifecycle import run_policy_deployment
+
+    return run_policy_deployment(
+        runtime,
+        projection.runtime,
+        max_running_s=(
+            args.max_running_seconds if args.execution_mode == "shadow" else None
+        ),
+    )
 
 
 if __name__ == "__main__":

@@ -20,6 +20,18 @@ logger = get_logger(__name__)
 _READY_POLL_INTERVAL_S = 0.2
 
 
+def validate_max_running_s(max_running_s: float | None) -> float | None:
+    """Validate an optional B-relative policy-run duration limit in seconds."""
+    if max_running_s is None:
+        return None
+    if isinstance(max_running_s, bool):
+        raise TypeError("max_running_s must be a finite positive number or None")
+    value = float(max_running_s)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError("max_running_s must be finite and positive")
+    return value
+
+
 def shutdown_processes(
     shared: RuntimeChannels,
     procs: list[Any],
@@ -37,7 +49,13 @@ def shutdown_processes(
         disarm_if_clean=disarm_if_clean,
     )
     if report.exits:
-        print("  shutdown: " + "  ".join(f"{item.name}={item.escalation}:{item.exitcode}" for item in report.exits))
+        print(
+            "  shutdown: "
+            + "  ".join(
+                f"{item.name}={item.escalation}:{item.exitcode}"
+                for item in report.exits
+            )
+        )
     return report
 
 
@@ -50,18 +68,21 @@ def run_supervisor(
     status_interval_s: float = 30.0,
     heartbeat_timeouts_s: dict[str, float] | None = None,
     supervisor_hz: float | None = None,
+    max_running_s: float | None = None,
+    exit_after_run_stops: bool = False,
 ) -> tuple[str, bool]:
     """Run the standard supervisor loop with resolved heartbeat settings.
 
     Returns ``(exit_reason, normal_exit)``.  *exit_reason* describes why the
     supervisor stopped; *normal_exit* is True for user-requested clean exits
-    (Q key or KeyboardInterrupt), False for faults.
+    (Q key or KeyboardInterrupt) and an acknowledged optional B-relative run
+    time limit, or a bounded execute run returning to ARMED, False for faults.
 
     The caller should have already transitioned to ARMED before calling this
     and must handle shutdown + DISARMED transition after it returns.
     """
     from dexmani_real.config.defaults import safety
-    from dexmani_real.runtime.safety import SafetyState, transition
+    from dexmani_real.runtime.safety import SafetyState, StopRequest, transition
     from dexmani_real.runtime.status import ExitReason
     from dexmani_real.runtime.workers import supervisor_exit_reason
 
@@ -74,7 +95,14 @@ def run_supervisor(
         raise ValueError("supervisor_hz must be finite and positive")
     if not np.isfinite(status_interval_s) or status_interval_s <= 0:
         raise ValueError("status_interval_s must be finite and positive")
-    configured_timeouts = safety.heartbeat_timeouts if heartbeat_timeouts_s is None else heartbeat_timeouts_s
+    if not isinstance(exit_after_run_stops, bool):
+        raise TypeError("exit_after_run_stops must be a boolean")
+    max_running_s = validate_max_running_s(max_running_s)
+    configured_timeouts = (
+        safety.heartbeat_timeouts
+        if heartbeat_timeouts_s is None
+        else heartbeat_timeouts_s
+    )
     if len(procs) != len(proc_names) or len(set(proc_names)) != len(proc_names):
         raise ValueError("proc_names must contain one unique name per process")
     if set(proc_names) != set(heartbeat_names):
@@ -85,13 +113,24 @@ def run_supervisor(
     timeouts = {name: float(configured_timeouts[name]) for name in heartbeat_names}
     if any(not np.isfinite(timeout) or timeout <= 0 for timeout in timeouts.values()):
         raise ValueError("heartbeat timeouts must be finite and positive")
+    if max_running_s is not None and "policy" not in timeouts:
+        raise ValueError("max_running_s requires a policy heartbeat")
+    time_limit_stop_grace_s = timeouts["policy"] if max_running_s is not None else 0.0
+    time_limit_stop_deadline_s: float | None = None
+    observed_running = False
 
     try:
         while True:
-            heartbeat_timestamps = {name: shared.get_heartbeat(name) for name in heartbeat_names}
+            heartbeat_timestamps = {
+                name: shared.get_heartbeat(name) for name in heartbeat_names
+            }
             now = time.monotonic()
             heartbeat_ages = {
-                name: (now - timestamp_s if np.isfinite(timestamp_s) and 0.0 < timestamp_s <= now else float("inf"))
+                name: (
+                    now - timestamp_s
+                    if np.isfinite(timestamp_s) and 0.0 < timestamp_s <= now
+                    else float("inf")
+                )
                 for name, timestamp_s in heartbeat_timestamps.items()
             }
             reason = supervisor_exit_reason(shared, procs, heartbeat_ages, timeouts)
@@ -104,12 +143,16 @@ def run_supervisor(
                 transition(shared, SafetyState.FAULT)
                 break
             if reason is ExitReason.WORKER_DEATH:
-                dead_names = [process.name for process in procs if process.exitcode is not None]
+                dead_names = [
+                    process.name for process in procs if process.exitcode is not None
+                ]
                 exit_reason = f"process died: {dead_names}"
                 transition(shared, SafetyState.FAULT)
                 break
             if reason is ExitReason.HEARTBEAT_TIMEOUT:
-                stale = [name for name, age in heartbeat_ages.items() if age > timeouts[name]]
+                stale = [
+                    name for name, age in heartbeat_ages.items() if age > timeouts[name]
+                ]
                 exit_reason = f"heartbeat timeout: {stale}"
                 transition(shared, SafetyState.FAULT)
                 break
@@ -118,10 +161,56 @@ def run_supervisor(
                 exit_reason = "explicit quit"
                 break
 
+            safety_state = int(shared.safety_state.value)
+            if safety_state == int(SafetyState.RUNNING):
+                observed_running = True
+            elif (
+                exit_after_run_stops
+                and observed_running
+                and safety_state == int(SafetyState.ARMED)
+            ):
+                normal_exit = True
+                exit_reason = "bounded execute run ended"
+                break
+            if max_running_s is not None:
+                if time_limit_stop_deadline_s is not None:
+                    if safety_state == int(SafetyState.ARMED):
+                        normal_exit = True
+                        exit_reason = "run time limit reached"
+                        break
+                    if now >= time_limit_stop_deadline_s:
+                        exit_reason = "run time limit stop was not acknowledged"
+                        transition(shared, SafetyState.FAULT)
+                        break
+                elif safety_state == int(SafetyState.RUNNING):
+                    started_ns = int(shared.run_started_monotonic_ns.value)
+                    now_ns = time.monotonic_ns()
+                    if started_ns <= 0 or started_ns > now_ns:
+                        exit_reason = "invalid RUNNING epoch for run time limit"
+                        transition(shared, SafetyState.FAULT)
+                        break
+                    elapsed_s = (now_ns - started_ns) / 1e9
+                    if elapsed_s >= max_running_s:
+                        # The coordinator remains the normal RUNNING -> ARMED
+                        # owner and emits the shadow receipt. A missing policy
+                        # acknowledgement is escalated after its heartbeat SLA.
+                        shared.start_request.value = False
+                        shared.stop_request.value = int(StopRequest.RUN_TIME_LIMIT)
+                        time_limit_stop_deadline_s = now + time_limit_stop_grace_s
+                        logger.info(
+                            "supervisor: requested B-relative run time limit "
+                            "after %.3fs (limit=%.3fs, stop_grace=%.3fs)",
+                            elapsed_s,
+                            max_running_s,
+                            time_limit_stop_grace_s,
+                        )
+
             if now - last_status_s >= status_interval_s:
                 runtime_m = (now - start_time) / 60.0
                 safety_state = shared.safety_state.value
-                heartbeat_text = ", ".join(f"{name}={heartbeat_ages[name]:.1f}s" for name in proc_names)
+                heartbeat_text = ", ".join(
+                    f"{name}={heartbeat_ages[name]:.1f}s" for name in proc_names
+                )
                 print(
                     f"  [supervisor]  runtime={runtime_m:.1f}min  safety={safety_state}  hb_age=({heartbeat_text})",
                     flush=True,
@@ -154,7 +243,9 @@ def wait_subsystem_ready(
     """
     for name, timeout in ready_checks:
         if not np.isfinite(timeout) or timeout <= 0:
-            raise ValueError(f"readiness timeout for {name!r} must be finite and positive")
+            raise ValueError(
+                f"readiness timeout for {name!r} must be finite and positive"
+            )
         deadline = time.monotonic() + timeout
         ready = False
         failure_logged = False
@@ -206,6 +297,7 @@ def print_health_summary(
     """Print a pre-flight health summary from ring data (arm, hand, VR, camera)."""
     if hand_feedback_max_age_s is None:
         from dexmani_real.config.defaults import safety
+
         hand_feedback_max_age_s = float(safety.heartbeat_timeouts["hand"])
     print("\n── Health Check ──")
 
@@ -217,7 +309,9 @@ def print_health_summary(
         arm_state_valid = bool(arm_data["state_valid"][0])
         arm_qpos = np.asarray(arm_data["qpos"][0], dtype=np.float64)
         arm_qpos_ok = int(np.all(np.isfinite(arm_qpos)))
-        arm_ok = arm_connected and arm_error == 0 and arm_state_valid and bool(arm_qpos_ok)
+        arm_ok = (
+            arm_connected and arm_error == 0 and arm_state_valid and bool(arm_qpos_ok)
+        )
         print(
             f"  arm   {'OK' if arm_ok else 'FAIL':>4s}  connected={int(arm_connected)}  "
             f"valid={int(arm_state_valid)}  error={arm_error}  qpos_ok={arm_qpos_ok}"
@@ -232,7 +326,9 @@ def print_health_summary(
         hand_state_valid = bool(hand_data["state_valid"][0])
         hand_qpos = np.asarray(hand_data["qpos"][0], dtype=np.float64)
         hand_qpos_ok = int(np.all(np.isfinite(hand_qpos)))
-        hand_ok = _hand_feedback_issue(hand_data, max_age_s=hand_feedback_max_age_s) is None
+        hand_ok = (
+            _hand_feedback_issue(hand_data, max_age_s=hand_feedback_max_age_s) is None
+        )
         print(
             f"  hand  {'OK' if hand_ok else 'FAIL':>4s}  connected={int(hand_connected)}  "
             f"valid={int(hand_state_valid)}  "
@@ -245,9 +341,13 @@ def print_health_summary(
     if vr_result is not None:
         vr_data, _, _ = vr_result
         vr_age_s = (
-            (time.monotonic_ns() - int(vr_data["local_recv_ns"][0])) / 1e9 if vr_data["local_recv_ns"][0] > 0 else -1
+            (time.monotonic_ns() - int(vr_data["local_recv_ns"][0])) / 1e9
+            if vr_data["local_recv_ns"][0] > 0
+            else -1
         )
-        print(f"  vr     OK   age={vr_age_s:.1f}s  seq={int(vr_data['sequence_id'][0])}")
+        print(
+            f"  vr     OK   age={vr_age_s:.1f}s  seq={int(vr_data['sequence_id'][0])}"
+        )
     else:
         print("  vr    ----  (no data yet)")
 

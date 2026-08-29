@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
@@ -24,7 +24,13 @@ from dexmani_real.runtime.safety import (
     publish_coupled_command_if_motion_permitted,
     read_motion_permit,
 )
-from dexmani_real.utils.feedback import validate_arm_feedback, validate_hand_feedback
+from dexmani_real.utils.feedback import (
+    FeedbackIssue,
+    FeedbackIssueCode,
+    diagnose_arm_feedback,
+    diagnose_hand_feedback,
+)
+from dexmani_real.utils.limits import canonicalize_policy_hand_endpoint_roundoff
 from dexmani_real.utils.limits import (
     validate_hand_command_bounds as _validate_hand_bounds,
 )
@@ -57,6 +63,7 @@ class CommandPublishStatus(str, Enum):
 
     PUBLISHED = "published"
     APPLIED = "applied"
+    SHADOW_VALIDATED = "shadow validated"
     NO_SAFETY_GATE = "no safety gate"
     INVALID_CANDIDATE = "invalid candidate"
     INVALID_OBSERVATION_ANCHOR = "invalid observation anchor"
@@ -72,8 +79,19 @@ class CommandPublishStatus(str, Enum):
     HAND_PREFLIGHT_REJECTED = "hand preflight rejected"
     GATE_REJECTED = "safety gate rejected"
     TEMPORAL_WINDOW_CLOSED = "temporal window closed"
+    ACK_PENDING = "acknowledgement pending"
     ACK_SUPERSEDED = "acknowledgement superseded"
     ACK_TIMEOUT = "acknowledgement timeout"
+
+
+class PolicyEndpointDisposition(str, Enum):
+    """Coordinator action for one typed policy endpoint result."""
+
+    COMMIT = "commit"
+    DISCARD_MOTION = "discard_motion"
+    DEFER_TRANSIENT = "defer_transient"
+    DISCARD_STALE = "discard_stale"
+    ABORT_FATAL = "abort_fatal"
 
 
 @dataclass(frozen=True)
@@ -85,12 +103,15 @@ class CommandPublishResult:
     detail: str = ""
     gate_code: GateRejectCode | None = None
     ticket: CoupledCommandTicket | None = None
+    feedback_issue: FeedbackIssue | None = None
+    hand_roundoff_canonicalized: bool = False
 
     @property
     def succeeded(self) -> bool:
         return self.status in (
             CommandPublishStatus.PUBLISHED,
             CommandPublishStatus.APPLIED,
+            CommandPublishStatus.SHADOW_VALIDATED,
         )
 
     @property
@@ -106,6 +127,69 @@ class CommandPublishResult:
     @property
     def reason(self) -> str:
         return self.detail or self.status.value
+
+
+def classify_policy_endpoint_disposition(
+    result: CommandPublishResult,
+    *,
+    hand_limit_nesting_valid: bool,
+) -> PolicyEndpointDisposition:
+    """Classify a publication result without interpreting diagnostic strings.
+
+    The policy coordinator owns what a typed gate/transport outcome means for
+    one scheduled endpoint.  Existing teleop callers retain their own
+    behavior by not using this classifier.
+    """
+    if result.succeeded:
+        return PolicyEndpointDisposition.COMMIT
+    if result.status is CommandPublishStatus.TEMPORAL_WINDOW_CLOSED:
+        return PolicyEndpointDisposition.DISCARD_STALE
+    if result.status is CommandPublishStatus.HAND_PREFLIGHT_REJECTED:
+        return (
+            PolicyEndpointDisposition.DISCARD_MOTION
+            if hand_limit_nesting_valid
+            else PolicyEndpointDisposition.ABORT_FATAL
+        )
+    if result.status is CommandPublishStatus.GATE_REJECTED:
+        if result.gate_code in {
+            GateRejectCode.ARM_JOINT_LIMIT,
+            GateRejectCode.HAND_JOINT_LIMIT,
+            GateRejectCode.ARM_DELTA_LIMIT,
+            GateRejectCode.WORKSPACE,
+            GateRejectCode.COLLISION_TRANSITION,
+        }:
+            return PolicyEndpointDisposition.DISCARD_MOTION
+        if result.gate_code is GateRejectCode.RUN_GENERATION_MISMATCH:
+            return PolicyEndpointDisposition.DEFER_TRANSIENT
+        # HAND_DELTA_LIMIT must never occur for learned policy (the coordinator
+        # disables this gate); all remaining gate/contract/checker failures are
+        # unsafe implementation or input faults.
+        return PolicyEndpointDisposition.ABORT_FATAL
+    if result.status in {
+        CommandPublishStatus.ARM_FEEDBACK_UNAVAILABLE,
+        CommandPublishStatus.HAND_FEEDBACK_UNAVAILABLE,
+    }:
+        return PolicyEndpointDisposition.DEFER_TRANSIENT
+    if result.status in {
+        CommandPublishStatus.ARM_FEEDBACK_UNHEALTHY,
+        CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY,
+    }:
+        if (
+            result.feedback_issue is not None
+            and result.feedback_issue.code is FeedbackIssueCode.STALE
+        ):
+            return PolicyEndpointDisposition.DEFER_TRANSIENT
+        return PolicyEndpointDisposition.ABORT_FATAL
+    if result.status in {
+        CommandPublishStatus.RUNTIME_STOPPED,
+        CommandPublishStatus.SAFETY_STATE_GATED,
+        CommandPublishStatus.RUN_GENERATION_GATED,
+    }:
+        return PolicyEndpointDisposition.DEFER_TRANSIENT
+    # ESTOP/STICKY are fatal but the coordinator leaves their lifecycle state
+    # untouched. Missing gate, malformed candidates, future feedback time,
+    # acknowledgement failures, and all unknown outcomes fail closed.
+    return PolicyEndpointDisposition.ABORT_FATAL
 
 
 def check_runtime_gate(
@@ -164,7 +248,7 @@ def _arm_feedback_snapshot(
         )
     record = result[0][0]
     qpos = np.asarray(record["qpos"], dtype=np.float64)
-    issue = validate_arm_feedback(
+    issue = diagnose_arm_feedback(
         connected=bool(record["connected"]),
         error_code=int(record["error_code"]),
         state_valid=bool(record["state_valid"]),
@@ -178,7 +262,8 @@ def _arm_feedback_snapshot(
         return None, CommandPublishResult(
             CommandPublishStatus.ARM_FEEDBACK_UNHEALTHY,
             candidate=candidate,
-            detail=f"arm feedback is unhealthy: {issue}",
+            detail=f"arm feedback is unhealthy: {issue.detail}",
+            feedback_issue=issue,
         )
     return _ArmFeedbackSnapshot(qpos.copy(), int(record["last_cmd_seq"])), None
 
@@ -203,7 +288,7 @@ def read_hand_feedback(
             candidate=candidate,
         )
     record = result[0][0]
-    issue = validate_hand_feedback(
+    issue = diagnose_hand_feedback(
         connected=bool(record["connected"]),
         state_valid=bool(record["state_valid"]),
         source_monotonic_ns=int(record["source_monotonic_ns"]),
@@ -215,7 +300,8 @@ def read_hand_feedback(
         return None, CommandPublishResult(
             CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY,
             candidate=candidate,
-            detail=f"hand feedback is unhealthy: {issue}",
+            detail=f"hand feedback is unhealthy: {issue.detail}",
+            feedback_issue=issue,
         )
     qpos = np.asarray(record["qpos"], dtype=np.float64)
     if qpos.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(qpos)):
@@ -253,17 +339,13 @@ def _make_coupled_command(candidate: ActionCandidate) -> np.ndarray:
     return frame
 
 
-def send_command(
+def _validate_command_delivery(
     shared: Any,
     candidate: ActionCandidate,
     *,
-    check_is_running: bool = True,
-) -> CommandPublishResult:
-    """Publish one coherent arm/hand record to the actuator IPC ring.
-
-    Returns a typed transport outcome. Callers decide whether a rejection
-    means hold, drop, command quiescence, run abort, or global fault.
-    """
+    check_is_running: bool,
+) -> CommandPublishResult | None:
+    """Return a typed final delivery rejection, or ``None`` when writable."""
     runtime_rejection = check_runtime_gate(
         shared,
         check_is_running=check_is_running,
@@ -282,8 +364,7 @@ def send_command(
             detail="candidate generation no longer owns the motion permit",
         )
 
-    now_ns = time.monotonic_ns()
-    if candidate.valid_until_monotonic_ns <= now_ns:
+    if candidate.valid_until_monotonic_ns <= time.monotonic_ns():
         logger.error(
             "send_command: action_id=%d temporal window closed", candidate.action_id
         )
@@ -291,6 +372,27 @@ def send_command(
             CommandPublishStatus.TEMPORAL_WINDOW_CLOSED,
             candidate=candidate,
         )
+    return None
+
+
+def send_command(
+    shared: Any,
+    candidate: ActionCandidate,
+    *,
+    check_is_running: bool = True,
+) -> CommandPublishResult:
+    """Publish one coherent arm/hand record to the actuator IPC ring.
+
+    Returns a typed transport outcome. Callers decide whether a rejection
+    means hold, drop, command quiescence, run abort, or global fault.
+    """
+    delivery_rejection = _validate_command_delivery(
+        shared,
+        candidate,
+        check_is_running=check_is_running,
+    )
+    if delivery_rejection is not None:
+        return delivery_rejection
 
     frame = _make_coupled_command(candidate)
     ticket = publish_coupled_command_if_motion_permitted(
@@ -310,6 +412,91 @@ def send_command(
         candidate=candidate,
         ticket=ticket,
     )
+
+
+def poll_coupled_command_acknowledgement(
+    shared: Any,
+    candidate: ActionCandidate,
+    *,
+    ticket: CoupledCommandTicket,
+    arm_feedback_max_age_s: float,
+    hand_feedback_max_age_s: float,
+) -> CommandPublishResult:
+    """Read one non-blocking arm/hand acknowledgement observation.
+
+    The publication owner calls this after a successful coupled write.  It
+    never publishes, sleeps, cancels, or changes lifecycle state: callers own
+    the timeout and cancellation policy.  Arm acknowledgement is its
+    ``last_cmd_seq`` reaching the candidate action id; with a hand target the
+    XHand worker must additionally acknowledge the exact endpoint.
+    """
+    if (
+        ticket.run_generation != int(candidate.run_generation)
+        or ticket.ring_sequence <= 0
+    ):
+        return CommandPublishResult(
+            CommandPublishStatus.INVALID_CANDIDATE,
+            candidate=candidate,
+            detail="coupled command ticket does not match the candidate",
+        )
+    runtime_rejection = check_runtime_gate(shared)
+    if runtime_rejection is not None:
+        return CommandPublishResult(
+            runtime_rejection.status,
+            candidate=candidate,
+            detail=runtime_rejection.detail,
+        )
+    arm_feedback, feedback_rejection = _arm_feedback_snapshot(
+        shared,
+        candidate,
+        arm_feedback_max_age_s=arm_feedback_max_age_s,
+    )
+    if feedback_rejection is not None:
+        return feedback_rejection
+    assert arm_feedback is not None
+
+    action_id = int(candidate.action_id)
+    if arm_feedback.last_cmd_seq > action_id:
+        return CommandPublishResult(
+            CommandPublishStatus.ACK_SUPERSEDED,
+            candidate=candidate,
+            detail=(
+                "arm acknowledgement belongs to newer action_id="
+                f"{arm_feedback.last_cmd_seq}"
+            ),
+        )
+    arm_acknowledged = arm_feedback.last_cmd_seq == action_id
+    hand_acknowledged = candidate.hand_qpos is None
+    if candidate.hand_qpos is not None:
+        hand_feedback, feedback_rejection = read_hand_feedback(
+            shared,
+            candidate,
+            hand_feedback_max_age_s=hand_feedback_max_age_s,
+        )
+        if feedback_rejection is not None:
+            return feedback_rejection
+        assert hand_feedback is not None
+        hand_action_id = hand_feedback.accepted_target_action_id
+        if hand_action_id > action_id:
+            return CommandPublishResult(
+                CommandPublishStatus.ACK_SUPERSEDED,
+                candidate=candidate,
+                detail=(
+                    "hand acknowledgement belongs to newer action_id="
+                    f"{hand_action_id}"
+                ),
+            )
+        hand_acknowledged = hand_action_id == action_id
+
+    if arm_acknowledged and hand_acknowledged:
+        return CommandPublishResult(CommandPublishStatus.APPLIED, candidate=candidate)
+    if not coupled_command_ticket_is_current(shared, ticket=ticket):
+        return CommandPublishResult(
+            CommandPublishStatus.ACK_SUPERSEDED,
+            candidate=candidate,
+            detail="published command was revoked or superseded before acknowledgement",
+        )
+    return CommandPublishResult(CommandPublishStatus.ACK_PENDING, candidate=candidate)
 
 
 def build_action_candidate(
@@ -393,6 +580,8 @@ def validate_and_send_candidate(
     hand_delta_reference_qpos: np.ndarray | None = None,
     hand_mechanical_lower_rad: np.ndarray | None = None,
     hand_mechanical_upper_rad: np.ndarray | None = None,
+    canonicalize_policy_hand_roundoff: bool = False,
+    execution_mode: str,
 ) -> CommandPublishResult:
     """Validate a pre-built candidate through the gate and publish it.
 
@@ -405,6 +594,8 @@ def validate_and_send_candidate(
         A typed result that distinguishes policy-semantic gate rejection from
         runtime, feedback, and transport failures.
     """
+    if execution_mode not in {"shadow", "execute"}:
+        raise ValueError("execution_mode must be 'shadow' or 'execute'")
     action_id = int(candidate.action_id)
     runtime_rejection = check_runtime_gate(shared)
     if runtime_rejection is not None:
@@ -444,6 +635,48 @@ def validate_and_send_candidate(
             return feedback_rejection
         assert hand_feedback is not None
 
+    hand_roundoff_canonicalized = False
+    mechanical_lower: np.ndarray | None = None
+    mechanical_upper: np.ndarray | None = None
+    if candidate.hand_qpos is not None:
+        mechanical_lower = (
+            np.asarray(hand_defaults.mechanical_qpos_min_rad, dtype=np.float64)
+            if hand_mechanical_lower_rad is None
+            else np.asarray(hand_mechanical_lower_rad, dtype=np.float64)
+        )
+        mechanical_upper = (
+            np.asarray(hand_defaults.mechanical_qpos_max_rad, dtype=np.float64)
+            if hand_mechanical_upper_rad is None
+            else np.asarray(hand_mechanical_upper_rad, dtype=np.float64)
+        )
+        if canonicalize_policy_hand_roundoff:
+            try:
+                canonical_hand_qpos, hand_roundoff_canonicalized = (
+                    canonicalize_policy_hand_endpoint_roundoff(
+                        candidate.hand_qpos,
+                        gate.hand_low,
+                        gate.hand_high,
+                        mechanical_lower,
+                        mechanical_upper,
+                        hand_defaults.mechanical_qpos_min_rad,
+                        hand_defaults.mechanical_qpos_max_rad,
+                    )
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "validate_and_send_candidate: action_id=%d rejected by policy hand "
+                    "endpoint preflight: %s",
+                    action_id,
+                    exc,
+                )
+                return CommandPublishResult(
+                    CommandPublishStatus.HAND_PREFLIGHT_REJECTED,
+                    candidate=candidate,
+                    detail=str(exc),
+                )
+            if hand_roundoff_canonicalized:
+                candidate = replace(candidate, hand_qpos=canonical_hand_qpos)
+
     permit = read_motion_permit(shared)
     if int(candidate.run_generation) != permit.run_generation:
         return CommandPublishResult(
@@ -471,20 +704,12 @@ def validate_and_send_candidate(
             candidate=candidate,
             detail=reason,
             gate_code=gate_result.code,
+            hand_roundoff_canonicalized=hand_roundoff_canonicalized,
         )
 
     if candidate.hand_qpos is not None:
         assert hand_feedback is not None
-        mechanical_lower = (
-            np.asarray(hand_defaults.mechanical_qpos_min_rad, dtype=np.float64)
-            if hand_mechanical_lower_rad is None
-            else np.asarray(hand_mechanical_lower_rad, dtype=np.float64)
-        )
-        mechanical_upper = (
-            np.asarray(hand_defaults.mechanical_qpos_max_rad, dtype=np.float64)
-            if hand_mechanical_upper_rad is None
-            else np.asarray(hand_mechanical_upper_rad, dtype=np.float64)
-        )
+        assert mechanical_lower is not None and mechanical_upper is not None
         try:
             validate_hand_command_bounds(
                 candidate.hand_qpos,
@@ -503,9 +728,29 @@ def validate_and_send_candidate(
                 CommandPublishStatus.HAND_PREFLIGHT_REJECTED,
                 candidate=candidate,
                 detail=str(exc),
+                hand_roundoff_canonicalized=hand_roundoff_canonicalized,
             )
 
-    return send_command(shared, candidate)
+    if execution_mode == "shadow":
+        delivery_rejection = _validate_command_delivery(
+            shared,
+            candidate,
+            check_is_running=True,
+        )
+        if delivery_rejection is not None:
+            return replace(
+                delivery_rejection,
+                hand_roundoff_canonicalized=hand_roundoff_canonicalized,
+            )
+        return CommandPublishResult(
+            CommandPublishStatus.SHADOW_VALIDATED,
+            candidate=candidate,
+            hand_roundoff_canonicalized=hand_roundoff_canonicalized,
+        )
+    return replace(
+        send_command(shared, candidate),
+        hand_roundoff_canonicalized=hand_roundoff_canonicalized,
+    )
 
 
 def publish_joint_targets(
@@ -587,6 +832,7 @@ def publish_joint_targets(
         hand_delta_reference_qpos=hand_delta_reference_qpos,
         hand_mechanical_lower_rad=hand_mechanical_lower_rad,
         hand_mechanical_upper_rad=hand_mechanical_upper_rad,
+        execution_mode="execute",
     )
     if not publish_result.succeeded:
         return publish_result
@@ -607,77 +853,20 @@ def publish_joint_targets(
                 detail="successful publication omitted its command ticket",
             )
         deadline_s = time.monotonic() + float(apply_timeout_s)
-        # Coupled arm/hand candidates use one action_id and require both acknowledgements.
-        with_hand = published.hand_qpos is not None
         while time.monotonic() < deadline_s:
-            runtime_rejection = check_runtime_gate(shared)
-            if runtime_rejection is not None:
-                cancel_coupled_command_if_current(shared, ticket=ticket)
-                return CommandPublishResult(
-                    runtime_rejection.status,
-                    candidate=published,
-                    detail=runtime_rejection.detail,
-                )
-            arm_feedback, feedback_rejection = _arm_feedback_snapshot(
+            acknowledgement = poll_coupled_command_acknowledgement(
                 shared,
                 published,
+                ticket=ticket,
                 arm_feedback_max_age_s=arm_feedback_max_age_s,
+                hand_feedback_max_age_s=hand_feedback_max_age_s,
             )
-            if feedback_rejection is not None:
-                cancel_coupled_command_if_current(shared, ticket=ticket)
-                return feedback_rejection
-            assert arm_feedback is not None
-            if arm_feedback.last_cmd_seq > action_id:
-                logger.warning(
-                    "publish_joint_targets: action_id=%d was superseded by arm action_id=%d",
-                    action_id,
-                    arm_feedback.last_cmd_seq,
-                )
-                return CommandPublishResult(
-                    CommandPublishStatus.ACK_SUPERSEDED,
-                    candidate=published,
-                )
-            arm_ok = arm_feedback.last_cmd_seq == action_id
-            if not with_hand:
-                if arm_ok:
-                    return CommandPublishResult(
-                        CommandPublishStatus.APPLIED,
-                        candidate=published,
-                    )
-            else:
-                hand_feedback, feedback_rejection = read_hand_feedback(
-                    shared, published, hand_feedback_max_age_s=hand_feedback_max_age_s
-                )
-                if feedback_rejection is not None:
+            if acknowledgement.status is CommandPublishStatus.APPLIED:
+                return acknowledgement
+            if acknowledgement.status is not CommandPublishStatus.ACK_PENDING:
+                if acknowledgement.status is not CommandPublishStatus.ACK_SUPERSEDED:
                     cancel_coupled_command_if_current(shared, ticket=ticket)
-                    return feedback_rejection
-                assert hand_feedback is not None
-                hand_action_id = hand_feedback.accepted_target_action_id
-                if hand_action_id > action_id:
-                    logger.warning(
-                        "publish_joint_targets: action_id=%d was superseded by hand action_id=%d",
-                        action_id,
-                        hand_action_id,
-                    )
-                    return CommandPublishResult(
-                        CommandPublishStatus.ACK_SUPERSEDED,
-                        candidate=published,
-                    )
-                if arm_ok and hand_action_id == action_id:
-                    return CommandPublishResult(
-                        CommandPublishStatus.APPLIED,
-                        candidate=published,
-                    )
-            if not coupled_command_ticket_is_current(shared, ticket=ticket):
-                logger.warning(
-                    "publish_joint_targets: action_id=%d lost command ownership before acknowledgement",
-                    action_id,
-                )
-                return CommandPublishResult(
-                    CommandPublishStatus.ACK_SUPERSEDED,
-                    candidate=published,
-                    detail="published command was revoked or superseded before acknowledgement",
-                )
+                return acknowledgement
             time.sleep(0.005)
         logger.warning(
             "publish_joint_targets: action_id=%d was not acknowledged within %.3fs",

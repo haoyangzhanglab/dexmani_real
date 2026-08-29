@@ -7,17 +7,21 @@ import time
 import unittest
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
+from dexmani_real.config.defaults import hand as hand_defaults
 from dexmani_real.control.action import ActionCandidate
 from dexmani_real.control.publication import (
     CommandPublishResult,
     CommandPublishStatus,
+    poll_coupled_command_acknowledgement,
     publish_joint_targets,
     send_command,
+    validate_and_send_candidate,
 )
+from dexmani_real.control.safety_gate import GateResult, SafetyGate
 from dexmani_real.ipc.schema import COUPLED_COMMAND_DTYPE
 from dexmani_real.runtime.safety import (
     CoupledCommandTicket,
@@ -212,6 +216,268 @@ class CoupledCommandPublicationTest(unittest.TestCase):
             int(shared.coupled_cmd_ring.latest["created_monotonic_ns"][0]),
             int(shared.coupled_cmd_ring.latest["target_monotonic_ns"][0]),
         )
+
+    def test_shadow_validates_full_candidate_without_coupled_command_write(
+        self,
+    ) -> None:
+        shared = _shared()
+        now_ns = time.monotonic_ns()
+        candidate = ActionCandidate(
+            observation_id=1,
+            run_generation=7,
+            action_id=1,
+            created_monotonic_ns=now_ns,
+            target_monotonic_ns=now_ns,
+            scheduled_target_monotonic_ns=now_ns,
+            valid_until_monotonic_ns=now_ns + 500_000_000,
+            arm_qpos=np.zeros(7),
+        )
+        gate = Mock()
+        gate.validate.return_value = GateResult(True)
+        arm_feedback = SimpleNamespace(qpos=np.zeros(7), last_cmd_seq=0)
+
+        with (
+            patch(
+                "dexmani_real.control.publication._arm_feedback_snapshot",
+                return_value=(arm_feedback, None),
+            ),
+            patch(
+                "dexmani_real.control.publication.publish_coupled_command_if_motion_permitted"
+            ) as publish_coupled,
+        ):
+            result = validate_and_send_candidate(
+                shared,
+                candidate,
+                gate=gate,
+                arm_feedback_max_age_s=0.5,
+                hand_feedback_max_age_s=0.5,
+                execution_mode="shadow",
+            )
+
+        self.assertEqual(result.status, CommandPublishStatus.SHADOW_VALIDATED)
+        self.assertTrue(result.succeeded)
+        self.assertIs(result.candidate, candidate)
+        self.assertIsNone(result.ticket)
+        gate.validate.assert_called_once()
+        publish_coupled.assert_not_called()
+        self.assertEqual(shared.coupled_cmd_ring.sequence, 0)
+        self.assertIsNone(shared.coupled_cmd_ring.latest)
+
+    def test_execute_publishes_one_fully_validated_coupled_record_to_fake_ring(
+        self,
+    ) -> None:
+        """Exercise the H4 publication tail without workers or hardware SDKs."""
+        shared = _shared()
+        now_ns = time.monotonic_ns()
+        hand_qpos = (
+            np.asarray(hand_defaults.qpos_min_rad, dtype=np.float64)
+            + np.asarray(hand_defaults.qpos_max_rad, dtype=np.float64)
+        ) / 2.0
+        candidate = ActionCandidate(
+            observation_id=1,
+            run_generation=7,
+            action_id=1,
+            created_monotonic_ns=now_ns,
+            target_monotonic_ns=now_ns,
+            scheduled_target_monotonic_ns=now_ns,
+            valid_until_monotonic_ns=now_ns + 500_000_000,
+            arm_qpos=np.zeros(7),
+            hand_qpos=hand_qpos,
+        )
+        gate = SafetyGate(
+            arm_joint_lower_rad=tuple(np.full(7, -1.0)),
+            arm_joint_upper_rad=tuple(np.full(7, 1.0)),
+            hand_joint_lower_rad=tuple(hand_defaults.qpos_min_rad),
+            hand_joint_upper_rad=tuple(hand_defaults.qpos_max_rad),
+        )
+        arm_feedback = SimpleNamespace(qpos=np.zeros(7), last_cmd_seq=0)
+        hand_feedback = SimpleNamespace(qpos=hand_qpos, accepted_target_action_id=0)
+
+        with (
+            patch(
+                "dexmani_real.control.publication._arm_feedback_snapshot",
+                return_value=(arm_feedback, None),
+            ),
+            patch(
+                "dexmani_real.control.publication.read_hand_feedback",
+                return_value=(hand_feedback, None),
+            ),
+        ):
+            result = validate_and_send_candidate(
+                shared,
+                candidate,
+                gate=gate,
+                arm_feedback_max_age_s=0.5,
+                hand_feedback_max_age_s=0.5,
+                hand_mechanical_lower_rad=np.asarray(
+                    hand_defaults.mechanical_qpos_min_rad
+                ),
+                hand_mechanical_upper_rad=np.asarray(
+                    hand_defaults.mechanical_qpos_max_rad
+                ),
+                execution_mode="execute",
+            )
+
+        self.assertEqual(result.status, CommandPublishStatus.PUBLISHED)
+        self.assertIs(result.candidate, candidate)
+        self.assertIsNotNone(result.ticket)
+        self.assertEqual(shared.coupled_cmd_ring.sequence, 1)
+        assert shared.coupled_cmd_ring.latest is not None
+        self.assertEqual(shared.coupled_cmd_ring.latest["action_id"][0], 1)
+        self.assertEqual(shared.coupled_cmd_ring.latest["arm_present"][0], 1)
+        self.assertEqual(shared.coupled_cmd_ring.latest["hand_present"][0], 1)
+        np.testing.assert_array_equal(
+            shared.coupled_cmd_ring.latest["arm_qpos"][0], candidate.arm_qpos
+        )
+        np.testing.assert_array_equal(
+            shared.coupled_cmd_ring.latest["hand_qpos"][0], candidate.hand_qpos
+        )
+
+    def test_execute_generation_change_after_gate_does_not_write(self) -> None:
+        """A post-gate lifecycle revocation wins over a stale H4 candidate."""
+        shared = _shared()
+        now_ns = time.monotonic_ns()
+        candidate = ActionCandidate(
+            observation_id=1,
+            run_generation=7,
+            action_id=1,
+            created_monotonic_ns=now_ns,
+            target_monotonic_ns=now_ns,
+            scheduled_target_monotonic_ns=now_ns,
+            valid_until_monotonic_ns=now_ns + 500_000_000,
+            arm_qpos=np.zeros(7),
+        )
+        gate = Mock()
+
+        def revoke_generation(*_args, **_kwargs) -> GateResult:
+            shared.run_generation.value = 8
+            return GateResult(True)
+
+        gate.validate.side_effect = revoke_generation
+        arm_feedback = SimpleNamespace(qpos=np.zeros(7), last_cmd_seq=0)
+
+        with patch(
+            "dexmani_real.control.publication._arm_feedback_snapshot",
+            return_value=(arm_feedback, None),
+        ):
+            result = validate_and_send_candidate(
+                shared,
+                candidate,
+                gate=gate,
+                arm_feedback_max_age_s=0.5,
+                hand_feedback_max_age_s=0.5,
+                execution_mode="execute",
+            )
+
+        self.assertEqual(result.status, CommandPublishStatus.RUN_GENERATION_GATED)
+        self.assertEqual(shared.coupled_cmd_ring.sequence, 0)
+        self.assertIsNone(shared.coupled_cmd_ring.latest)
+
+    def test_h4_acknowledgement_requires_both_arm_and_hand_workers(self) -> None:
+        """The H4 coordinator may finish only after the exact coupled ticket."""
+        shared = _shared()
+        shared.active_coupled_command_sequence.value = 3
+        now_ns = time.monotonic_ns()
+        candidate = ActionCandidate(
+            observation_id=1,
+            run_generation=7,
+            action_id=5,
+            created_monotonic_ns=now_ns,
+            target_monotonic_ns=now_ns,
+            scheduled_target_monotonic_ns=now_ns,
+            valid_until_monotonic_ns=now_ns + 500_000_000,
+            arm_qpos=np.zeros(7),
+            hand_qpos=np.zeros(12),
+        )
+        ticket = CoupledCommandTicket(7, 3)
+        arm_feedback = SimpleNamespace(qpos=np.zeros(7), last_cmd_seq=5)
+        hand_pending = SimpleNamespace(qpos=np.zeros(12), accepted_target_action_id=0)
+        hand_applied = SimpleNamespace(qpos=np.zeros(12), accepted_target_action_id=5)
+
+        with (
+            patch(
+                "dexmani_real.control.publication._arm_feedback_snapshot",
+                return_value=(arm_feedback, None),
+            ),
+            patch(
+                "dexmani_real.control.publication.read_hand_feedback",
+                side_effect=[(hand_pending, None), (hand_applied, None)],
+            ),
+        ):
+            pending = poll_coupled_command_acknowledgement(
+                shared,
+                candidate,
+                ticket=ticket,
+                arm_feedback_max_age_s=0.5,
+                hand_feedback_max_age_s=0.5,
+            )
+            applied = poll_coupled_command_acknowledgement(
+                shared,
+                candidate,
+                ticket=ticket,
+                arm_feedback_max_age_s=0.5,
+                hand_feedback_max_age_s=0.5,
+            )
+
+        self.assertEqual(pending.status, CommandPublishStatus.ACK_PENDING)
+        self.assertEqual(applied.status, CommandPublishStatus.APPLIED)
+
+    def test_policy_hand_roundoff_is_canonicalized_before_strict_gate(self) -> None:
+        shared = _shared()
+        now_ns = time.monotonic_ns()
+        hand_qpos = np.asarray(hand_defaults.qpos_min_rad, dtype=np.float64)
+        hand_qpos[5] -= 3.9791546155298896e-8
+        candidate = ActionCandidate(
+            observation_id=1,
+            run_generation=7,
+            action_id=1,
+            created_monotonic_ns=now_ns,
+            target_monotonic_ns=now_ns,
+            scheduled_target_monotonic_ns=now_ns,
+            valid_until_monotonic_ns=now_ns + 500_000_000,
+            arm_qpos=np.zeros(7),
+            hand_qpos=hand_qpos,
+        )
+        gate = SafetyGate(
+            arm_joint_lower_rad=tuple(np.full(7, -1.0)),
+            arm_joint_upper_rad=tuple(np.full(7, 1.0)),
+            hand_joint_lower_rad=tuple(hand_defaults.qpos_min_rad),
+            hand_joint_upper_rad=tuple(hand_defaults.qpos_max_rad),
+        )
+        arm_feedback = SimpleNamespace(qpos=np.zeros(7), last_cmd_seq=0)
+        hand_feedback = SimpleNamespace(qpos=hand_qpos, accepted_target_action_id=0)
+
+        with (
+            patch(
+                "dexmani_real.control.publication._arm_feedback_snapshot",
+                return_value=(arm_feedback, None),
+            ),
+            patch(
+                "dexmani_real.control.publication.read_hand_feedback",
+                return_value=(hand_feedback, None),
+            ),
+        ):
+            result = validate_and_send_candidate(
+                shared,
+                candidate,
+                gate=gate,
+                arm_feedback_max_age_s=0.5,
+                hand_feedback_max_age_s=0.5,
+                hand_mechanical_lower_rad=np.asarray(
+                    hand_defaults.mechanical_qpos_min_rad
+                ),
+                hand_mechanical_upper_rad=np.asarray(
+                    hand_defaults.mechanical_qpos_max_rad
+                ),
+                canonicalize_policy_hand_roundoff=True,
+                execution_mode="shadow",
+            )
+
+        self.assertEqual(result.status, CommandPublishStatus.SHADOW_VALIDATED)
+        self.assertTrue(result.hand_roundoff_canonicalized)
+        assert result.candidate is not None
+        self.assertEqual(result.candidate.hand_qpos[5], hand_defaults.qpos_min_rad[5])
+        self.assertEqual(shared.coupled_cmd_ring.sequence, 0)
 
     def test_wait_applied_exits_when_ticket_loses_ownership(self) -> None:
         shared = _shared()

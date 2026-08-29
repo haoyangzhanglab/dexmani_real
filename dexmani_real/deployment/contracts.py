@@ -1,8 +1,9 @@
 """Backend-neutral deployment contracts.
 
-``PolicyRuntime`` defines the model boundary; ``InferenceContext`` carries the
-per-prediction identity/timing, and ``JointActionChunk`` is the
-runtime-canonical joint/EE action. None of these import torch or RuntimeChannels.
+``PolicyRuntime`` defines the model boundary. ``PolicyPrediction`` is the
+untimed model output, ``InferenceContext`` carries per-publish provenance, and
+``JointActionChunk`` is the runtime-canonical timed joint/EE action. None of
+these import torch or RuntimeChannels.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from dexmani_real.ipc.schema import (
 
 @dataclass(frozen=True)
 class InferenceContext:
-    """Timing/identity context passed to ``PolicyRuntime.predict``.
+    """Timing/identity provenance carried from inference to plan publication.
 
     The causal cut, latest physical source time, and logical control-grid step
     are distinct: conflating them hides sensor age and shifts action timing.
@@ -71,6 +72,106 @@ class InferenceContext:
             )
         if self.step_dt_ns <= 0:
             raise ValueError("step_dt_ns must be positive")
+
+
+@dataclass(frozen=True)
+class PolicyPrediction:
+    """Untimed, immutable policy output in joint or end-effector space.
+
+    Exactly one of ``arm_qpos`` (joint, ``[N, 7]``) or
+    ``ee_pos``/``ee_rot6d`` (EE, ``[N, 3]`` + ``[N, 6]``) is present.
+    ``hand_qpos`` is optional.  Timing, validity, run identity, and all shared
+    state are deliberately absent: the inference worker owns their assignment.
+    """
+
+    arm_qpos: np.ndarray | None
+    hand_qpos: np.ndarray | None
+    ee_pos: np.ndarray | None = None
+    ee_rot6d: np.ndarray | None = None
+
+    @staticmethod
+    def _freeze_float64(value: object, *, name: str) -> np.ndarray:
+        raw = np.asarray(value)
+        if raw.dtype != np.dtype(np.float64):
+            raise TypeError(f"{name} must have dtype float64, got {raw.dtype}")
+        frozen = freeze_array(raw, name=name, dtype=np.float64)
+        if frozen is None:
+            raise ValueError(f"{name} must not be None")
+        return frozen
+
+    def __post_init__(self) -> None:
+        arm = (
+            self._freeze_float64(self.arm_qpos, name="arm_qpos")
+            if self.arm_qpos is not None
+            else None
+        )
+        ee_pos = (
+            self._freeze_float64(self.ee_pos, name="ee_pos")
+            if self.ee_pos is not None
+            else None
+        )
+        ee_rot6d = (
+            self._freeze_float64(self.ee_rot6d, name="ee_rot6d")
+            if self.ee_rot6d is not None
+            else None
+        )
+        has_arm = arm is not None
+        has_ee = ee_pos is not None or ee_rot6d is not None
+        if not has_arm and not has_ee:
+            raise ValueError(
+                "PolicyPrediction requires arm_qpos (joint) or ee_pos/ee_rot6d (EE)"
+            )
+        if has_arm and has_ee:
+            raise ValueError("PolicyPrediction cannot mix arm_qpos with EE fields")
+        if ee_pos is None and ee_rot6d is not None:
+            raise ValueError("PolicyPrediction ee_pos is required with ee_rot6d")
+        if ee_pos is not None and ee_rot6d is None:
+            raise ValueError("PolicyPrediction ee_rot6d is required with ee_pos")
+
+        if arm is not None:
+            if arm.ndim != 2 or arm.shape[1] != ARM_JOINT_SHAPE[0]:
+                raise ValueError(
+                    f"arm_qpos must be [N, {ARM_JOINT_SHAPE[0]}], got {arm.shape}"
+                )
+            n = arm.shape[0]
+        else:
+            assert ee_pos is not None and ee_rot6d is not None
+            if ee_pos.ndim != 2 or ee_pos.shape[1] != EE_POS_DIM:
+                raise ValueError(
+                    f"ee_pos must be [N, {EE_POS_DIM}], got {ee_pos.shape}"
+                )
+            if ee_rot6d.ndim != 2 or ee_rot6d.shape[1] != EE_ROT6D_DIM:
+                raise ValueError(
+                    f"ee_rot6d must be [N, {EE_ROT6D_DIM}], got {ee_rot6d.shape}"
+                )
+            if ee_pos.shape[0] != ee_rot6d.shape[0]:
+                raise ValueError("ee_pos and ee_rot6d must have matching N")
+            n = ee_pos.shape[0]
+        if n <= 0:
+            raise ValueError("PolicyPrediction must have at least one step")
+        if n > MAX_POLICY_CHUNK_STEPS:
+            raise ValueError(
+                f"PolicyPrediction has {n} steps; transport capacity is {MAX_POLICY_CHUNK_STEPS}"
+            )
+
+        hand = (
+            self._freeze_float64(self.hand_qpos, name="hand_qpos")
+            if self.hand_qpos is not None
+            else None
+        )
+        if hand is not None and hand.shape != (n, HAND_JOINT_SHAPE[0]):
+            raise ValueError(
+                f"hand_qpos must be [N, {HAND_JOINT_SHAPE[0]}] matching N={n}, got {hand.shape}"
+            )
+
+        object.__setattr__(self, "arm_qpos", arm)
+        object.__setattr__(self, "hand_qpos", hand)
+        object.__setattr__(self, "ee_pos", ee_pos)
+        object.__setattr__(self, "ee_rot6d", ee_rot6d)
+
+    @property
+    def is_ee(self) -> bool:
+        return self.ee_pos is not None
 
 
 @dataclass(frozen=True)
@@ -204,7 +305,8 @@ class PolicyRuntime(Protocol):
     """Model-side policy boundary: load -> predict -> reset_episode.
 
     ``predict`` encodes an ``ObservationBatch`` into the model-native input,
-    runs inference, and decodes the result into a ``JointActionChunk``.  The
+    runs inference, and decodes the result into an untimed
+    ``PolicyPrediction``.  The
     implementation may import torch/checkpoint/CUDA; it never sees
     RuntimeChannels or a robot command.
     """
@@ -213,8 +315,6 @@ class PolicyRuntime(Protocol):
 
     def reset_episode(self) -> None: ...
 
-    def predict(
-        self, observation: ObservationBatch, *, context: InferenceContext
-    ) -> JointActionChunk: ...
+    def predict(self, observation: ObservationBatch) -> PolicyPrediction: ...
 
     def close(self) -> None: ...

@@ -21,6 +21,14 @@ class SafetyState(IntEnum):
     FAULT = 3
 
 
+class StopRequest(IntEnum):
+    """Reason code carried by the Main-to-coordinator stop request."""
+
+    NONE = 0
+    OPERATOR = 1
+    RUN_TIME_LIMIT = 2
+
+
 _ALLOWED_TRANSITIONS = frozenset(
     {
         (SafetyState.DISARMED, SafetyState.ARMED),

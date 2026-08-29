@@ -11,16 +11,15 @@ robot command.
 ``inference_loop`` is a plain ``*_loop(shared, config)`` function (not an
 ``mp.Process`` subclass); lifecycle/supervision stays in the A/B runtime.
 
-The module also owns the ``module:symbol`` lazy loader (``load_policy_runtime``)
-so torch/CUDA imports happen only inside the inference child process, never in
-the parent.
+Artifact-bound DexMani deployments load through the preflight module's checked
+fd/hash/provenance stream loader. The generic ``module:symbol`` loader remains
+only for artifact-free fake runtimes used by focused offline tests.
 """
 
 from __future__ import annotations
 
 import importlib
 import time
-from dataclasses import replace
 from typing import Any, cast
 
 import numpy as np
@@ -29,11 +28,14 @@ from dexmani_real.deployment.config import DeploymentConfig, PolicyRuntimeConfig
 from dexmani_real.deployment.contracts import (
     InferenceContext,
     JointActionChunk,
+    PolicyPrediction,
     PolicyRuntime,
 )
 from dexmani_real.deployment.metrics import (
     INFERENCE_FAILURES,
     INFERENCE_MS,
+    OBSERVATION_AGE_MS,
+    OBSERVATION_SKEW_MS,
     OBSERVATIONS_BUILT,
     PLANS_CREATED,
     PLANS_GENERATION_DROPPED,
@@ -61,6 +63,7 @@ logger = get_logger(__name__)
 _NO_FEEDBACK_POLL_S = 0.005
 # Poll interval while ARMED (no inference) — gentler than the feedback poll.
 _ARMED_IDLE_POLL_S = 0.01
+_UINT64_MAX = int(np.iinfo(np.uint64).max)
 
 
 # A ``module:symbol`` target is imported and instantiated only when the
@@ -112,6 +115,68 @@ def load_policy_runtime(
     return cast(
         PolicyRuntime,
         _load(target, PolicyRuntime, "policy runtime", config),
+    )
+
+
+def _require_uint64_time(value: int, *, name: str, positive: bool) -> int:
+    """Validate a Python/NumPy integer before constructing uint64 wire data."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{name} must be an integer")
+    result = int(value)
+    if result < 0 or (positive and result == 0):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{name} must be {qualifier}")
+    if result > _UINT64_MAX:
+        raise ValueError(f"{name} exceeds uint64")
+    return result
+
+
+def stamp_prediction_timing(
+    prediction: PolicyPrediction,
+    *,
+    logical_step_ns: int,
+    step_dt_ns: int,
+    inference_finished_ns: int,
+    command_lead_ns: int,
+) -> JointActionChunk | None:
+    """Assign the fixed logical control grid, masking expired predictions only.
+
+    The model never controls timestamps.  Targets remain exactly
+    ``logical_step_ns + i * step_dt_ns``; a late inference may lose a prefix
+    or the whole prediction, but it is never shifted forward.
+    """
+    if not isinstance(prediction, PolicyPrediction):
+        raise TypeError("prediction must be a PolicyPrediction")
+    logical = _require_uint64_time(
+        logical_step_ns, name="logical_step_ns", positive=True
+    )
+    step_dt = _require_uint64_time(step_dt_ns, name="step_dt_ns", positive=True)
+    finished = _require_uint64_time(
+        inference_finished_ns, name="inference_finished_ns", positive=True
+    )
+    lead = _require_uint64_time(command_lead_ns, name="command_lead_ns", positive=False)
+    if finished > _UINT64_MAX - lead:
+        raise ValueError("inference_finished_ns + command_lead_ns exceeds uint64")
+    earliest_target = finished + lead
+
+    values = (
+        prediction.arm_qpos if prediction.arm_qpos is not None else prediction.ee_pos
+    )
+    assert values is not None
+    steps = int(values.shape[0])
+    if steps > 1 and logical > _UINT64_MAX - (steps - 1) * step_dt:
+        raise ValueError("prediction target grid exceeds uint64")
+    targets = logical + np.arange(steps, dtype=np.uint64) * np.uint64(step_dt)
+    valid_mask = (targets > np.uint64(earliest_target)).astype(np.uint8)
+    if not bool(np.any(valid_mask)):
+        return None
+    return JointActionChunk(
+        arm_qpos=prediction.arm_qpos,
+        hand_qpos=prediction.hand_qpos,
+        ee_pos=prediction.ee_pos,
+        ee_rot6d=prediction.ee_rot6d,
+        target_monotonic_ns=targets,
+        valid_mask=valid_mask,
     )
 
 
@@ -616,14 +681,58 @@ def _build_observation(
     )
 
 
+def observation_timing_ms(observation: ObservationBatch) -> tuple[float, float]:
+    """Return causal latest-frame age and cross-modality skew in milliseconds.
+
+    Age is measured from the causal cut to the newest source frame.  Skew uses
+    the newest valid frame of each modality, rather than the history span of a
+    single modality, so a normal ``n_obs_steps`` window is not misreported as
+    sensor skew.
+    """
+    latest_sources: list[int] = []
+    for window in (
+        getattr(observation, "arm_history", None),
+        getattr(observation, "hand_history", None),
+        getattr(observation, "hand_current_history", None),
+        getattr(observation, "hand_tactile_sum_history", None),
+        getattr(observation, "tactile_history", None),
+    ):
+        if window is None:
+            continue
+        valid_mask = getattr(window, "valid_mask", None)
+        source_ns = getattr(window, "source_monotonic_ns", None)
+        if valid_mask is None or source_ns is None:
+            continue
+        valid = np.asarray(valid_mask, dtype=np.uint8) == 1
+        if np.any(valid):
+            latest_sources.append(int(np.max(np.asarray(source_ns)[valid])))
+    pointcloud = getattr(observation, "pointcloud", None)
+    if pointcloud is not None:
+        latest_sources.append(int(pointcloud.source_monotonic_ns))
+    if not latest_sources:
+        latest_sources.append(int(observation.latest_source_monotonic_ns))
+    latest_ns = max(latest_sources)
+    anchor_ns = int(
+        getattr(
+            observation, "anchor_monotonic_ns", observation.logical_step_monotonic_ns
+        )
+    )
+    if latest_ns > anchor_ns:
+        raise ValueError("observation source timestamp exceeds causal cut")
+    return (
+        (anchor_ns - latest_ns) / 1e6,
+        (latest_ns - min(latest_sources)) / 1e6,
+    )
+
+
 def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None:
     """Inference process entry point — produces proposals, never robot commands.
 
-    Startup order: heartbeat early -> lazy import -> instantiate -> load ->
-    mark ready. A load/import/instantiation failure raises out of this function
-    and becomes a supervisor-observed process failure; there is no dummy safe
-    mode. The main loop reads a fresh generation each tick and calls
-    ``runtime.reset_episode`` when it changes.
+    Startup order: heartbeat early -> verified artifact load (or fake-runtime
+    test loader) -> mark ready. A load/import/instantiation failure raises out
+    of this function and becomes a supervisor-observed process failure; there
+    is no dummy safe mode. The main loop reads a fresh generation each tick and
+    calls ``runtime.reset_episode`` when it changes.
     """
     if config is None:
         raise ValueError("inference_loop requires a PolicyRuntimeConfig")
@@ -632,9 +741,17 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
     shared.set_heartbeat("inference", time.monotonic())
     metrics = Metrics()
 
-    runtime = load_policy_runtime(config.runtime_target, config=config)
+    if config.artifact is not None:
+        # This import is deliberately inside the inference child. The helper
+        # owns the fixed-artifact/no-follow/digest/provenance boundary and
+        # performs the sole checked stream deserialize for this process.
+        from dexmani_real.deployment.preflight import load_verified_policy_runtime
 
-    runtime.load()  # raises -> process failure (no dummy safe mode)
+        runtime = load_verified_policy_runtime(config)
+    else:
+        # Artifact-free configs exist only in focused fake-runtime tests.
+        runtime = load_policy_runtime(config.runtime_target, config=config)
+        runtime.load()  # raises -> process failure (no dummy safe mode)
 
     shared.set_ready("inference")
     # Refresh the heartbeat after model loading, which may exceed the timeout.
@@ -664,6 +781,7 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
                 last_generation = run_generation
                 observation_id = 0  # new observation epoch for the new run
                 last_logical_step_ns = 0
+                metrics.begin_run()
 
             # ARMED = no inference; the coordinator gates RUNNING via B.
             if int(shared.safety_state.value) != int(SafetyState.RUNNING):
@@ -709,43 +827,33 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
                 time.sleep(_NO_FEEDBACK_POLL_S)
                 continue
             metrics.increment(OBSERVATIONS_BUILT)
+            observation_age_ms, observation_skew_ms = observation_timing_ms(observation)
+            metrics.observe(OBSERVATION_AGE_MS, observation_age_ms)
+            metrics.observe_timing(OBSERVATION_AGE_MS, observation_age_ms)
+            metrics.observe(OBSERVATION_SKEW_MS, observation_skew_ms)
+            metrics.observe_timing(OBSERVATION_SKEW_MS, observation_skew_ms)
             last_logical_step_ns = observation.logical_step_monotonic_ns
 
             started_ns = time.monotonic_ns()
-            # The adapter timestamps actions on the observation's logical
-            # control grid; the causal cut is retained only as provenance.
-            predict_context = InferenceContext(
-                run_generation=run_generation,
-                observation_id=observation_id,
-                observation_anchor_monotonic_ns=anchor_ns,
-                observation_latest_source_monotonic_ns=(
-                    observation.latest_source_monotonic_ns
-                ),
-                observation_logical_step_monotonic_ns=(
-                    observation.logical_step_monotonic_ns
-                ),
-                inference_started_monotonic_ns=started_ns,
-                inference_finished_monotonic_ns=started_ns,
-                step_dt_ns=step_dt_ns,
-            )
-            chunk = runtime.predict(observation, context=predict_context)
+            prediction = runtime.predict(observation)
             finished_ns = time.monotonic_ns()
-            metrics.observe(INFERENCE_MS, (finished_ns - started_ns) / 1e6)
+            inference_ms = (finished_ns - started_ns) / 1e6
+            metrics.observe(INFERENCE_MS, inference_ms)
+            metrics.observe_timing(INFERENCE_MS, inference_ms)
 
-            # Preserve the model's semantic grid. Expired endpoints are masked;
-            # they are never shifted forward and made plausible again.
-            earliest_target_ns = finished_ns + int(config.command_lead_s * 1e9)
-            future_mask = (
-                np.asarray(chunk.valid_mask, dtype=np.uint8)
-                & (np.asarray(chunk.target_monotonic_ns) > earliest_target_ns)
-            ).astype(np.uint8)
-            if not bool(np.any(future_mask)):
+            chunk = stamp_prediction_timing(
+                prediction,
+                logical_step_ns=observation.logical_step_monotonic_ns,
+                step_dt_ns=step_dt_ns,
+                inference_finished_ns=finished_ns,
+                command_lead_ns=int(config.command_lead_s * 1e9),
+            )
+            if chunk is None:
                 metrics.increment(INFERENCE_FAILURES)
                 elapsed = time.monotonic() - tick_start
                 if period_s > elapsed:
                     time.sleep(period_s - elapsed)
                 continue
-            chunk = replace(chunk, valid_mask=future_mask)
 
             context = InferenceContext(
                 run_generation=run_generation,

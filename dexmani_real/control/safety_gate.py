@@ -16,6 +16,44 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
+_JOINT_LIMIT_TOLERANCE_RAD = 1e-12
+
+
+def _hand_joint_limit_detail(
+    hand_qpos_rad: np.ndarray,
+    lower_rad: np.ndarray,
+    upper_rad: np.ndarray,
+) -> str:
+    """Render the exact hand endpoint components outside the gate envelope.
+
+    This is diagnostic-only: it does not modify the rejected target or relax
+    the operational limit.  Keeping the values in the gate result makes a
+    shadow log sufficient to distinguish a slightly-open policy endpoint from
+    a mechanically unsafe one in the subsequent review.
+    """
+    below = np.flatnonzero(hand_qpos_rad < lower_rad - _JOINT_LIMIT_TOLERANCE_RAD)
+    above = np.flatnonzero(hand_qpos_rad > upper_rad + _JOINT_LIMIT_TOLERANCE_RAD)
+    violations: list[str] = []
+    violations.extend(
+        (
+            f"j{index}: target={hand_qpos_rad[index]:.17g}, "
+            f"lower={lower_rad[index]:.17g}, "
+            f"delta={hand_qpos_rad[index] - lower_rad[index]:+.3e}"
+        )
+        for index in below
+    )
+    violations.extend(
+        (
+            f"j{index}: target={hand_qpos_rad[index]:.17g}, "
+            f"upper={upper_rad[index]:.17g}, "
+            f"delta={hand_qpos_rad[index] - upper_rad[index]:+.3e}"
+        )
+        for index in above
+    )
+    if not violations:
+        raise ValueError("hand joint-limit diagnostic requires an out-of-bounds target")
+    return "hand joint limit violation (rad): " + ", ".join(violations)
+
 
 class GateRejectCode(str, Enum):
     """Stable machine-readable rejection reasons from :class:`SafetyGate`."""
@@ -33,6 +71,7 @@ class GateRejectCode(str, Enum):
     ARM_DELTA_LIMIT = "arm per-tick delta limit violation"
     HAND_DELTA_LIMIT = "hand per-tick delta limit violation"
     COLLISION_TRANSITION = "collision on arm/hand transition"
+    COLLISION_CHECK_FAILED = "collision transition check failed"
     WORKSPACE = "workspace"
     WORKSPACE_CHECK_FAILED = "workspace check failed"
 
@@ -212,10 +251,14 @@ class SafetyGate:
         ):
             return GateResult(False, GateRejectCode.ARM_JOINT_LIMIT)
         if hand_end is not None and (
-            np.any(hand_end < self.hand_low - 1e-12)
-            or np.any(hand_end > self.hand_high + 1e-12)
+            np.any(hand_end < self.hand_low - _JOINT_LIMIT_TOLERANCE_RAD)
+            or np.any(hand_end > self.hand_high + _JOINT_LIMIT_TOLERANCE_RAD)
         ):
-            return GateResult(False, GateRejectCode.HAND_JOINT_LIMIT)
+            return GateResult(
+                False,
+                GateRejectCode.HAND_JOINT_LIMIT,
+                _hand_joint_limit_detail(hand_end, self.hand_low, self.hand_high),
+            )
         # Per-tick delta limits (reject, never clip).
         if self.max_arm_delta_rad is not None and candidate.arm_qpos is not None:
             if np.any(
@@ -257,7 +300,7 @@ class SafetyGate:
                     "SafetyGate: collision transition check failed closed",
                     exc_info=True,
                 )
-                return GateResult(False, GateRejectCode.COLLISION_TRANSITION)
+                return GateResult(False, GateRejectCode.COLLISION_CHECK_FAILED)
         return GateResult(True)
 
 

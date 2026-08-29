@@ -2,10 +2,12 @@
 
 Runs as a daemon thread in the Main process.  B/S/Q/ESC translate to the shared
 request flags the coordinator and supervisor already consume (``start_request``,
-``stop_request``, ``quit_requested``, ``estop_request``).  H orchestrates a
-collision-checked return-home — stop the run if RUNNING, hand home, then arm
-home — using a Main-process planner that mirrors the replay collision setup
-(hand-dof + table + static boxes).  The keyboard owns the emergency-stop latch:
+``stop_request``, ``quit_requested``, ``estop_request``). When a caller owns a
+home lifecycle, H orchestrates a collision-checked return-home — stop the run
+if RUNNING, hand home, then arm home — using a Main-process planner that mirrors
+the replay collision setup (hand-dof + table + static boxes). Policy deployment
+does not provide that lifecycle, so it disables H explicitly. The keyboard owns
+the emergency-stop latch:
 ESC (or a dead listener) sets ``estop_request`` regardless of thread state, so
 e-stop never depends on this loop being scheduled.
 """
@@ -32,7 +34,7 @@ from dexmani_real.robot_spec import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
-from dexmani_real.runtime.safety import SafetyState, revoke_motion
+from dexmani_real.runtime.safety import SafetyState, StopRequest, revoke_motion
 from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.log import get_logger
 
@@ -83,7 +85,7 @@ def _stop_to_armed(
     """Stop a RUNNING run and wait for the coordinator to return to ARMED."""
     if int(shared.safety_state.value) != int(SafetyState.RUNNING):
         return int(shared.safety_state.value) == int(SafetyState.ARMED)
-    shared.stop_request.value = True
+    shared.stop_request.value = int(StopRequest.OPERATOR)
     deadline = time.monotonic() + _HOME_WAIT_ARMED_TIMEOUT_S
     while time.monotonic() < deadline:
         if abort_requested():
@@ -152,17 +154,21 @@ def run_operator_control(
     shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     deployment: DeploymentConfig,
-    planner: XArm7MotionPlanner,
+    planner: XArm7MotionPlanner | None,
     *,
     stop_event: threading.Event,
+    execution_mode: str,
 ) -> None:
     """Keyboard thread target: map operator keys to shared flags / home.
 
     B -> ``start_request``, S -> ``stop_request``, Q -> ``quit_requested``,
-    ESC -> ``estop_request``, H -> collision-checked return-home.  The thread
-    exits when *stop_event* is set, when the runtime stops, or after a terminal
-    Q/ESC.
+    ESC -> ``estop_request``. H is enabled only when a caller supplies a home
+    planner; policy deployment passes ``None`` and therefore never emits a home
+    command in either shadow or H4 execute. The thread exits when *stop_event*
+    is set, when the runtime stops, or after a terminal Q/ESC.
     """
+    if execution_mode not in {"shadow", "execute"}:
+        raise ValueError("execution_mode must be 'shadow' or 'execute'")
     keyboard = KeyboardHandler(
         estop_callback=lambda: setattr(shared.estop_request, "value", True)
     )
@@ -185,8 +191,11 @@ def run_operator_control(
                 if signal is ControlSignal.BEGIN:
                     shared.start_request.value = True
                 elif signal is ControlSignal.STOP:
-                    shared.stop_request.value = True
+                    shared.stop_request.value = int(StopRequest.OPERATOR)
                 elif signal is ControlSignal.HOME:
+                    if planner is None:
+                        logger.warning("operator: H is disabled in policy deployment")
+                        continue
                     _home(
                         shared,
                         runtime,

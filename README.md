@@ -165,7 +165,8 @@ python examples/collect_teleop.py --print-config
 | 键盘遥操作 | `python examples/keyboard_teleop.py` | 连接并控制 xArm7，可选 XHand |
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 使用 raw episode 的精确已发送命令、配置和模型 provenance，预检后控制 xArm7/XHand；写 `replay_results/` |
 | 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取并校验 `data.h5` hash 后的原始 `float64` 已发送命令，继续执行完整配置/模型/几何预检；包含多个 source 连续段的产物拒绝物理回放 |
-| learned policy | `python examples/run_policy.py --deployment-config <file.yml>` | 启动 arm、可选 hand、inference 与 coordinator（active/pending 调度 + EE→IK + delta/collision 安全门）；请求 `point_cloud` 时同时连接 camera |
+| learned policy | `python examples/run_policy.py --experiment-dir <experiment> --execution-mode shadow [--hand] [--max-running-seconds 120]` | hash-bound artifact 的 shadow lifecycle；B 前 hand reset-home，B 后完整验证但零 coupled write。该入口连接真实硬件，必须逐次取得 H2/H3 授权。 |
+| H4 one-shot execute | `python examples/run_policy.py --experiment-dir <experiment> --execution-mode execute --hand --max-running-seconds <s> --execute-max-published-endpoints 1 --execute-ack-timeout-seconds <s>` | 只允许一条 complete arm+hand coupled publication；必须获得单次、明确的 H4 真机授权。随后等待同一 action id 的 arm/hand SDK ACK，成功即回到 ARMED，任何回执/安全故障均 FAULT；详见 [`policy_h4_execute_runbook.md`](docs/policy_h4_execute_runbook.md)。 |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |

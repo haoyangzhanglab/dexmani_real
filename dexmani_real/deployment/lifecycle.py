@@ -3,9 +3,9 @@
 Composes the runtime primitives (``WorkerSpec`` +
 ``build_processes``/``start_processes``/``wait_subsystem_ready``/
 ``run_supervisor``/``shutdown_processes``) into the policy workflow — resolve
-config -> create ``RuntimeChannels`` -> preflight the model process -> spawn arm
-(+ optional hand and RGB-D / point-cloud workers) -> coordinator -> readiness ->
-ARMED -> supervise -> verified shutdown. There is
+config -> create ``RuntimeChannels`` -> start the artifact-verified inference
+process -> spawn arm (+ optional hand and RGB-D / point-cloud workers) ->
+coordinator -> readiness -> ARMED -> supervise -> verified shutdown. There is
 no second health mechanism: the supervisor's heartbeat/readiness slots already
 carry ``arm``/``hand``/``camera``/``pointcloud``/``inference``/``policy``.
 
@@ -20,7 +20,6 @@ checkpoint SHA-256) via ``sha256_file`` and
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import multiprocessing as mp
 import os
@@ -32,7 +31,7 @@ from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
 from dexmani_real.deployment.config import DeploymentConfig, PolicyRuntimeConfig
 from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_loop
 from dexmani_real.deployment.observation import parse_observation_fields
-from dexmani_real.deployment.operator import build_home_planner, run_operator_control
+from dexmani_real.deployment.operator import run_operator_control
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.robot.arm_worker import arm_loop
@@ -41,6 +40,7 @@ from dexmani_real.runtime.safety import SafetyState, require_transition, transit
 from dexmani_real.runtime.supervisor import (
     run_supervisor,
     shutdown_processes,
+    validate_max_running_s,
     wait_subsystem_ready,
 )
 from dexmani_real.runtime.workers import (
@@ -51,12 +51,6 @@ from dexmani_real.runtime.workers import (
     stop_processes_verified,
 )
 from dexmani_real.sensor.camera_worker import CameraLoopConfig, camera_loop
-from dexmani_real.sensor.pointcloud import (
-    POINT_CLOUD_COLOR_SOURCE,
-    POINT_CLOUD_POLICY_ID,
-    POINT_CLOUD_SAMPLING,
-    POINT_CLOUD_TRANSFORM,
-)
 from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig, pointcloud_loop
 from dexmani_real.utils.log import get_logger
 
@@ -117,7 +111,7 @@ def log_deployment_provenance(
 def build_policy_worker_specs(
     shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
-    deployment: DeploymentConfig,
+    policy_runtime_config: PolicyRuntimeConfig,
 ) -> list[WorkerSpec]:
     """Build the workers required by the explicit deployment contract.
 
@@ -127,7 +121,13 @@ def build_policy_worker_specs(
     ``policy`` control-source slot, the inference worker the new ``inference``
     slot).
     """
-    coordinator_config = CoordinatorConfig.from_runtime(deployment, runtime)
+    deployment = policy_runtime_config.deployment
+    coordinator_config = CoordinatorConfig.from_runtime(
+        deployment,
+        runtime,
+        execution_mode=policy_runtime_config.execution_mode,
+        h4_execute_bounds=policy_runtime_config.h4_execute_bounds,
+    )
     pointcloud_requested = _requires_pointcloud(deployment)
     pointcloud_config = (
         PointCloudLoopConfig.from_runtime(
@@ -136,38 +136,6 @@ def build_policy_worker_specs(
         )
         if pointcloud_requested
         else None
-    )
-    policy_runtime_config = PolicyRuntimeConfig(
-        deployment=deployment,
-        control_dt_s=1.0 / float(runtime.policy.control_hz),
-        point_cloud_frame="xarm_base" if pointcloud_config is not None else "",
-        point_cloud_color_source=(
-            POINT_CLOUD_COLOR_SOURCE if pointcloud_config is not None else ""
-        ),
-        point_cloud_policy_id=(
-            POINT_CLOUD_POLICY_ID if pointcloud_config is not None else ""
-        ),
-        point_cloud_config_sha256=(
-            pointcloud_config.pointcloud.sha256 if pointcloud_config is not None else ""
-        ),
-        point_cloud_table_plane_abcd_json=(
-            json.dumps(
-                pointcloud_config.table_plane_abcd,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
-            if pointcloud_config is not None
-            else ""
-        ),
-        point_cloud_sampling=(
-            POINT_CLOUD_SAMPLING if pointcloud_config is not None else ""
-        ),
-        point_cloud_transform=(
-            POINT_CLOUD_TRANSFORM if pointcloud_config is not None else ""
-        ),
-        arm_max_delta_rad_per_tick=runtime.policy.arm_max_delta_rad_per_tick,
-        hand_max_delta_rad_per_tick=float(runtime.hand.hand_max_delta_rad_per_tick),
-        endpoint_delta_tolerance_rad=float(runtime.policy.endpoint_delta_tolerance_rad),
     )
     specs: list[WorkerSpec] = [
         WorkerSpec(
@@ -227,16 +195,35 @@ def build_policy_worker_specs(
 
 def run_policy_deployment(
     runtime: ResolvedRuntimeConfig,
-    deployment: DeploymentConfig,
+    policy_runtime_config: PolicyRuntimeConfig,
     *,
     prefix: str | None = None,
+    max_running_s: float | None = None,
 ) -> int:
     """Run one policy deployment lifecycle and return its exit code.
 
-    The inference worker must load successfully before any hardware process is
-    started. The runtime then follows ``DISARMED -> hardware readiness -> ARMED
-    -> supervision -> verified shutdown``.
+    A frozen ``shadow`` projection or explicitly bounded H4 ``execute``
+    projection reaches this lifecycle. The inference worker must load
+    successfully before any hardware process is started. The runtime then
+    follows ``DISARMED -> hardware readiness -> ARMED -> supervision ->
+    verified shutdown``.
     """
+    if not isinstance(policy_runtime_config, PolicyRuntimeConfig):
+        raise TypeError("policy_runtime_config must be a PolicyRuntimeConfig")
+    if policy_runtime_config.execution_mode == "shadow":
+        max_running_s = validate_max_running_s(max_running_s)
+        if policy_runtime_config.h4_execute_bounds is not None:
+            raise ValueError("shadow lifecycle must not carry H4 execute bounds")
+    else:
+        if max_running_s is not None:
+            raise ValueError("H4 execute duration belongs to its immutable bounds")
+        h4_execute_bounds = policy_runtime_config.h4_execute_bounds
+        if h4_execute_bounds is None:
+            raise ValueError("execute lifecycle requires explicit H4 execute bounds")
+        max_running_s = h4_execute_bounds.max_running_s
+    deployment = policy_runtime_config.deployment
+    if deployment.hand_enabled and not policy_runtime_config.hand_acknowledged:
+        raise ValueError("deployment with hand targets requires --hand")
     log_deployment_provenance(
         logger,
         deployment=deployment,
@@ -269,7 +256,7 @@ def run_policy_deployment(
     operator_thread: threading.Thread | None = None
     operator_stop: threading.Event | None = None
     try:
-        specs = build_policy_worker_specs(shared, runtime, deployment)
+        specs = build_policy_worker_specs(shared, runtime, policy_runtime_config)
         procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)
 
@@ -335,16 +322,18 @@ def run_policy_deployment(
             flush=True,
         )
         print(
-            "  [B] start run   [S] stop run   [H] home   [Q] quit   [ESC] e-stop",
+            "  [B] start run   [S] stop run   [Q] quit   [ESC] e-stop   [H] disabled in policy deployment",
             flush=True,
         )
 
-        home_planner = build_home_planner(runtime)
         operator_stop = threading.Event()
         operator_thread = threading.Thread(
             target=run_operator_control,
-            args=(shared, runtime, deployment, home_planner),
-            kwargs={"stop_event": operator_stop},
+            args=(shared, runtime, deployment, None),
+            kwargs={
+                "stop_event": operator_stop,
+                "execution_mode": policy_runtime_config.execution_mode,
+            },
             name="policy-operator",
             daemon=True,
         )
@@ -359,6 +348,8 @@ def run_policy_deployment(
             heartbeat_names,
             heartbeat_timeouts_s=dict(runtime.safety.heartbeat_timeouts),
             supervisor_hz=float(runtime.safety.supervisor_hz),
+            max_running_s=max_running_s,
+            exit_after_run_stops=(policy_runtime_config.execution_mode == "execute"),
         )
 
         if operator_stop is not None:

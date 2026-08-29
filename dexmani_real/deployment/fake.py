@@ -1,7 +1,7 @@
 """Deterministic, CPU-only, torch-free fake PolicyRuntime.
 
 ``FakePolicyRuntime`` is a complete implementation of the ``PolicyRuntime``
-Protocol that exercises the full obs -> chunk -> plan-ring path with no model,
+Protocol that exercises the full obs -> prediction -> plan-ring path with no model,
 no torch, and no hardware. It is the reference for the real learned-policy
 integration and the swap fixture for runtime-replacement verification.
 
@@ -17,7 +17,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.deployment.contracts import InferenceContext, JointActionChunk
+from dexmani_real.deployment.contracts import PolicyPrediction
 from dexmani_real.deployment.observation import ObservationBatch
 from dexmani_real.robot_spec import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
@@ -44,11 +44,11 @@ def _last_valid(
 class FakePolicyRuntime:
     """Deterministic hold-with-offset policy: tile the latest arm/hand vector.
 
-    ``predict`` returns a ``JointActionChunk`` whose i-th step is
+    ``predict`` returns a ``PolicyPrediction`` whose i-th step is
     ``input + i*offset_rad``.  ``offset_rad=0`` (the default) is a pure
     hold; a non-zero offset proves step ordering without touching the clock.
-    Step zero is the action aligned with the latest logical observation step;
-    the inference worker masks it if inference has already made it undeliverable.
+    Step zero is aligned with the latest logical observation step.  The
+    inference worker owns the later timing and validity decision.
     """
 
     def __init__(
@@ -79,9 +79,7 @@ class FakePolicyRuntime:
     def reset_episode(self) -> None:
         self._loaded = True
 
-    def predict(
-        self, observation: ObservationBatch, *, context: InferenceContext
-    ) -> JointActionChunk:
+    def predict(self, observation: ObservationBatch) -> PolicyPrediction:
         arm = _last_valid(
             (
                 observation.arm_history.values
@@ -112,15 +110,9 @@ class FakePolicyRuntime:
         if hand is not None:
             hand_out = np.tile(hand[None, :], (n, 1))
 
-        steps = np.arange(n, dtype=np.uint64)
-        target = np.asarray(
-            context.observation_logical_step_monotonic_ns, dtype=np.uint64
-        ) + steps * np.uint64(context.step_dt_ns)
-        return JointActionChunk(
+        return PolicyPrediction(
             arm_qpos=arm_out,
             hand_qpos=hand_out,
-            target_monotonic_ns=target,
-            valid_mask=np.ones(n, dtype=np.uint8),
         )
 
     def close(self) -> None:

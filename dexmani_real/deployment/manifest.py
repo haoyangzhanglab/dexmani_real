@@ -53,7 +53,6 @@ class DeploymentManifest:
     n_action_steps: int = 8
     action_dim: int = 19
     horizon: int = 16
-    use_faas: bool = False
     hand_dim: int | None = None
     tcp_dim: int | None = None
     control_action_dim: int = JOINT_CONTROL_ACTION_DIM
@@ -93,8 +92,6 @@ class DeploymentManifest:
                 f"n_action_steps={self.n_action_steps} exceeds the plan transport "
                 f"capacity {MAX_POLICY_CHUNK_STEPS}"
             )
-        if not isinstance(self.use_faas, bool):
-            raise ValueError("use_faas must be a boolean")
         for name in ("hand_dim", "tcp_dim"):
             value = getattr(self, name)
             if value is not None and (
@@ -151,7 +148,6 @@ def manifest_from_sources(
     n_action_steps: int,
     action_dim: int,
     horizon: int,
-    use_faas: bool,
     tcp_dim: int | None,
     hand_dim: int | None,
     control_action_dim: int,
@@ -182,7 +178,6 @@ def manifest_from_sources(
         n_action_steps=n_action_steps,
         action_dim=action_dim,
         horizon=horizon,
-        use_faas=use_faas,
         hand_dim=hand_dim,
         tcp_dim=tcp_dim,
         control_action_dim=control_action_dim,

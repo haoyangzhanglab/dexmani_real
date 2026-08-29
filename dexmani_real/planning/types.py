@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, ClassVar
 
 import numpy as np
@@ -121,6 +122,17 @@ class IKResult:
     reason: str = ""
     report: dict[str, Any] = field(default_factory=dict)
     held: bool = False
+    failure_kind: "IKFailureKind | None" = None
+
+
+class IKFailureKind(str, Enum):
+    """Machine-readable reason for a held/failing IK result."""
+
+    NO_SOLUTION = "no_solution"
+    GEOMETRY_REJECTED = "geometry_rejected"
+    COLLISION = "collision"
+    CHECKER_FAILURE = "checker_failure"
+    INVALID_OUTPUT = "invalid_output"
 
 
 @dataclass(kw_only=True)
@@ -191,7 +203,9 @@ class TeleopProfile:
     max_ik_jump_deg: tuple[float, ...] = (30, 30, 30, 35, 40, 40, 40)
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
-    check_self_collision: bool = True  # checked in teleop IK hot path; holds on collision
+    check_self_collision: bool = (
+        True  # checked in teleop IK hot path; holds on collision
+    )
 
     # Skip extra seeds when the first valid solution is near measured state.
     position_ik_fast_accept_rad: float = np.deg2rad(8.0)
@@ -210,7 +224,15 @@ class TeleopProfile:
     # Zero disables hard rejection by Yoshikawa manipulability.
     position_ik_min_manipulability: float = 0.0
     # Dampen the heavy base/shoulder while leaving wrist joints responsive.
-    velocity_joint_weights: tuple[float, ...] | None = (10.0, 4.0, 2.0, 1.0, 0.5, 0.6, 0.1)
+    velocity_joint_weights: tuple[float, ...] | None = (
+        10.0,
+        4.0,
+        2.0,
+        1.0,
+        0.5,
+        0.6,
+        0.1,
+    )
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "TeleopProfile":

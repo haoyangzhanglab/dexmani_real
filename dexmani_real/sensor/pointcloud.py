@@ -20,21 +20,16 @@ from scipy.sparse import coo_matrix  # type: ignore[import-untyped]
 from scipy.sparse.csgraph import connected_components  # type: ignore[import-untyped]
 from scipy.spatial import cKDTree  # type: ignore[import-untyped]
 
-from dexmani_real.config.pointcloud import PointCloudConfig
+from dexmani_real.config.pointcloud import (
+    POINT_CLOUD_COLOR_SOURCE,
+    POINT_CLOUD_POLICY_ID,
+    POINT_CLOUD_SAMPLING,
+    POINT_CLOUD_TRANSFORM,
+    PointCloudConfig,
+)
 from dexmani_real.sensor.camera_geometry import CameraIntrinsics, RGBDGeometry
 
 _KERNEL_3X3 = np.ones((3, 3), dtype=np.uint8)
-
-POINT_CLOUD_POLICY_ID = "depth_to_color_orthogonal_edge_table_voxel_radius_graph_v9"
-POINT_CLOUD_COLOR_SOURCE = "mean_rgb_of_aligned_depth_pixels_per_voxel"
-POINT_CLOUD_SAMPLING = "deterministic_coarse_voxel_stratified_hash_or_cyclic_pad"
-POINT_CLOUD_TRANSFORM = (
-    "depth_gate_and_cardinal_edge_support;depth_to_color_deprojection;"
-    "table_plane_height_hysteresis_crop_in_color_frame_before_deprojection;"
-    "xarm_base_transform;workspace_crop;mean_voxel_xyz_and_rgb;"
-    "single_radius_graph_density_and_component_outlier;spatial_candidate_cap;"
-    "coarse_voxel_stratified_hash_or_cyclic_pad"
-)
 
 __all__ = [
     "POINT_CLOUD_COLOR_SOURCE",

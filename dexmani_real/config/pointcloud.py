@@ -14,6 +14,21 @@ from typing import Any
 
 import numpy as np
 
+# These strings are part of the persisted Real-data and deployment contract,
+# not sensor implementation details.  Keeping them in the pure config owner
+# lets offline artifact checks validate point-cloud semantics without importing
+# camera, OpenCV, or geometry code.
+POINT_CLOUD_POLICY_ID = "depth_to_color_orthogonal_edge_table_voxel_radius_graph_v9"
+POINT_CLOUD_COLOR_SOURCE = "mean_rgb_of_aligned_depth_pixels_per_voxel"
+POINT_CLOUD_SAMPLING = "deterministic_coarse_voxel_stratified_hash_or_cyclic_pad"
+POINT_CLOUD_TRANSFORM = (
+    "depth_gate_and_cardinal_edge_support;depth_to_color_deprojection;"
+    "table_plane_height_hysteresis_crop_in_color_frame_before_deprojection;"
+    "xarm_base_transform;workspace_crop;mean_voxel_xyz_and_rgb;"
+    "single_radius_graph_density_and_component_outlier;spatial_candidate_cap;"
+    "coarse_voxel_stratified_hash_or_cyclic_pad"
+)
+
 
 @dataclass(frozen=True)
 class PointCloudConfig:

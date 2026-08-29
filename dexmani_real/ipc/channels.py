@@ -338,7 +338,8 @@ class RuntimeChannels:
     quit_requested: Any  # policy -> Main
     pointcloud_requested: Any  # Main -> camera; keep native payload publication active
     start_request: Any  # Main -> coordinator: B (start a new policy run)
-    stop_request: Any  # Main -> coordinator: S (stop the current policy run)
+    # Main -> coordinator: StopRequest code (S or an explicit run-time limit).
+    stop_request: Any
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write
     # Serializes the motion permit and coupled-command ticket state. It is
