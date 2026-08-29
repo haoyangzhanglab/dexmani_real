@@ -164,7 +164,15 @@ def run_supervisor(
             safety_state = int(shared.safety_state.value)
             if safety_state == int(SafetyState.RUNNING):
                 observed_running = True
-            elif (
+            if (
+                max_running_s is not None
+                and time_limit_stop_deadline_s is not None
+                and safety_state == int(SafetyState.ARMED)
+            ):
+                normal_exit = True
+                exit_reason = "run time limit reached"
+                break
+            if (
                 exit_after_run_stops
                 and observed_running
                 and safety_state == int(SafetyState.ARMED)
@@ -174,10 +182,6 @@ def run_supervisor(
                 break
             if max_running_s is not None:
                 if time_limit_stop_deadline_s is not None:
-                    if safety_state == int(SafetyState.ARMED):
-                        normal_exit = True
-                        exit_reason = "run time limit reached"
-                        break
                     if now >= time_limit_stop_deadline_s:
                         exit_reason = "run time limit stop was not acknowledged"
                         transition(shared, SafetyState.FAULT)
@@ -192,7 +196,7 @@ def run_supervisor(
                     elapsed_s = (now_ns - started_ns) / 1e9
                     if elapsed_s >= max_running_s:
                         # The coordinator remains the normal RUNNING -> ARMED
-                        # owner and emits the shadow receipt. A missing policy
+                        # owner and emits the run receipt. A missing policy
                         # acknowledgement is escalated after its heartbeat SLA.
                         shared.start_request.value = False
                         shared.stop_request.value = int(StopRequest.RUN_TIME_LIMIT)

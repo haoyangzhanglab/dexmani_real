@@ -267,6 +267,8 @@ def execute_run_receipt_json(
     max_published_endpoints: int,
     acknowledgement_timeout_s: float,
     acknowledged_action_id: int | None,
+    completed: bool,
+    provenance_json: str | None = None,
     metrics: Mapping[str, int | float],
 ) -> str:
     """Render the bounded H4 execute receipt without hiding physical writes."""
@@ -282,6 +284,15 @@ def execute_run_receipt_json(
         isinstance(acknowledged_action_id, bool) or acknowledged_action_id <= 0
     ):
         raise ValueError("acknowledged_action_id must be positive or None")
+    if not isinstance(completed, bool):
+        raise TypeError("completed must be a boolean")
+    provenance = None
+    if provenance_json is not None:
+        if not isinstance(provenance_json, str):
+            raise TypeError("provenance_json must be a string or None")
+        provenance = json.loads(provenance_json)
+        if not isinstance(provenance, dict):
+            raise ValueError("provenance_json must encode a JSON object")
     if isinstance(run_generation, bool) or int(run_generation) <= 0:
         raise ValueError("run_generation must be a positive integer")
     if (
@@ -306,12 +317,15 @@ def execute_run_receipt_json(
     receipt = {
         "acknowledged_action_id": acknowledged_action_id,
         "acknowledgement_timeout_s": float(acknowledgement_timeout_s),
+        "completed": completed,
         "coupled_command_end_sequence": int(coupled_command_end_sequence),
         "coupled_command_start_sequence": int(coupled_command_start_sequence),
         "coupled_command_writes": writes,
         "execution_mode": "execute",
         "max_published_endpoints": int(max_published_endpoints),
         "metrics": normalized_metrics,
+        "outcome": "completed" if completed else "not_completed",
+        "provenance": provenance,
         "reason": reason,
         "run_generation": int(run_generation),
         "within_publication_bound": writes <= int(max_published_endpoints),

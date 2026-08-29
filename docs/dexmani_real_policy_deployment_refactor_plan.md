@@ -468,7 +468,9 @@ preflight hash/load 前后都要比较固定 file identity；run 内不得重新
 --device DEVICE              operator-owned inference device
 --hand                       显式 XHand hardware acknowledgement
 --execution-mode shadow|execute
---max-running-seconds FLOAT  可选，仅 operational shadow；从 B→RUNNING 起计时
+--max-running-seconds FLOAT  operational B-relative limit (shadow or bounded H4 execute)
+--execute-max-published-endpoints 1  H4 execute 的固定 one-publication bound
+--execute-ack-timeout-seconds FLOAT  H4 arm+hand ACK 的有限等待上限
 --print-config
 --preflight-only
 ```
@@ -477,8 +479,11 @@ preflight hash/load 前后都要比较固定 file identity；run 内不得重新
 
 - `--execution-mode` 默认 `shadow`；
 - execute 必须显式写在 CLI，YAML 不能暗中开启物理发布；
-- `--max-running-seconds` 必须为有限正数，且只允许 operational shadow；`print-config`/
-  `preflight-only` 带该参数明确拒绝，避免虚假的“已计时”预检；
+- `--max-running-seconds` 必须为有限正数。在 shadow 中它是 operational B-relative limit；在
+  H4 execute 中它被冻结到 immutable bounds。`print-config`/`preflight-only` 可以显示和校验
+  H4 bounds，但不声称已完成 operational timed run；
+- execute 还必须显式传入 `--hand`、`--execute-max-published-endpoints 1` 和有限正数
+  `--execute-ack-timeout-seconds`；YAML 不能暗中开启或放宽该 profile；
 - duration 从 `SafetyState.RUNNING` 的 atomic B epoch 开始。到期时 supervisor 写 typed
   `RUN_TIME_LIMIT` stop request，由 coordinator 正常撤销 motion、生成 `reason="run time limit"`
   的 receipt 后再结束 session；超过 policy heartbeat grace 未回到 ARMED 则 FAULT；
@@ -519,7 +524,7 @@ resolve
 
 禁止构建 hardware worker specs。
 
-#### `shadow` / `execute`
+#### `shadow` / bounded H4 `execute`
 
 ```text
 resolve + verify artifact
@@ -532,6 +537,10 @@ resolve + verify artifact
 → ARMED
 → enable keyboard operator
 ```
+
+H4 execute 在此之后最多发布一条完整 arm+hand coupled record，等待两个 worker 都确认同一
+action id，并在成功时回到 ARMED。ACK、feedback、generation、SafetyGate、worker 或超时故障
+均进入 sticky FAULT，不重试、不发送第二条 policy publication。
 
 正常 lifecycle 不先运行一个临时 preflight worker再加载第二份模型。正式 inference worker
 在 hardware startup 前完成相同 preflight，然后继续服务该 run。
@@ -1293,7 +1302,8 @@ endpoint 恰好一次；新 plan 对相同 target 永久胜出，且不能在新
 
 - publication owner 支持 shadow；
 - CLI 开放 `--execution-mode shadow`；
-- execute 仍可保持 feature-gated，直到 physical ladder 明确放行；
+- H4 execute 仅以固定 one-publication profile 开放，要求显式 `--hand`、ACK timeout 与
+  B-relative duration；仍须单独取得 physical authorization；
 - bounded latency stats；
 - usable horizon/readiness report；
 - startup reset-home/B epoch integration tests。
@@ -1317,7 +1327,7 @@ fatal/checker error visibility  yes
 Batch 5 offline implementation receipt（2026-08-29）：
 
 ```text
-execution mode:                       immutable shadow only; execute rejected
+execution mode:                       immutable shadow or bounded H4 execute; no unbounded execute
 full validation:                      runtime + feedback + SafetyGate + hand + temporal
 B 后 policy coupled command write:    structurally zero; sequence mutation or unobservable baseline latches FAULT
 run receipt:                          canonical JSON, start/end coupled sequence + run totals
@@ -1325,8 +1335,9 @@ timing evidence:                      bounded 256-sample p50/p95/p99 for observa
 hand acknowledgement:                 required before any IPC/process for hand-enabled shadow
 reset_home:                           one startup request before ready/B; no tolerance wait
 CRC_UNCONFIRMED reset response:       warn and continue after send; only REJECTED/exception fail closed
-H key in shadow:                      disabled (prevents post-B home publication)
-B-relative duration limit:            explicit shadow-only CLI; coordinator-acknowledged or FAULT
+H key in policy lifecycle:             disabled (prevents post-B home publication)
+B-relative duration limit:            shadow or immutable H4; coordinator-acknowledged or FAULT
+H4 publication bound:                 exactly one complete coupled record; dual worker ACK required
 focused R5 offline suite:             76 passed, 7 subtests
 full Real offline suite:               187 passed, 67 subtests
 compileall / diff --check:             PASS
@@ -2303,3 +2314,43 @@ experiments/dp3/pick_place_toy/2026-08-28_13-59_42/checkpoints/
 config。R5 的离线实现不可运行真实 hardware；只有同时取得本节 H2/H3 所列限定授权后，
 才允许用该 reference identity 产生一次 shadow report。H4 implementation 已完成离线验证，
 但一次 H4 真机运行仍须满足专属 runbook，并重新取得明确的 one-shot execute 授权。
+
+### H4 software closeout（2026-08-29，无硬件）
+
+本轮只做软件边界收口，没有启动 `run_policy` operational lifecycle，也没有连接或驱动任何
+设备。新增/复核的 H4 不变量如下：
+
+```text
+execute profile:                     --hand + bound=1 + ACK timeout + B-relative limit
+publication invariant:               coupled ring sequence 从 B 基线只增加 1
+candidate provenance:                ACK/previous-command 使用实际发布的 canonical candidate
+pending ACK + time limit:             未完成双 worker ACK 直接 sticky FAULT，不正常收尾
+extra/missing ring write:             运行中拒绝并 sticky FAULT
+```
+
+离线验证结果：
+
+```text
+full Real offline suite:             205 tests, OK
+focused H4 timing/preflight/IPC:     OK
+compileall (dexmani_real/examples/tests): PASS
+focused black / isort:                PASS
+git diff --check:                     PASS
+mypy focused H4 files:                无本地 H4 类型错误；环境缺少 scipy/pinocchio/hppfcl/yaml stubs
+```
+
+同一 frozen reference v2 experiment 的无硬件检查也重新通过：
+
+```text
+checkpoint:                           epoch=1126-step=00080000-deployment-v2.pt
+checkpoint SHA-256:                   b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c
+action_dim / required_action_steps:   19 / 15
+pad_before / pad_after:               1 / 7
+preflight:                            passed
+H4 bounds:                            publication=1, ACK=2.0 s, B-relative=30.0 s
+hardware lifecycle:                   not run
+```
+
+因此当前状态是“execute 软件路径具备 one-shot fail-closed guard，H4 真机仍未授权”。下一步只能
+在新的、单独限定的 H4 授权下运行一次现场实验；授权前继续使用 `--print-config` 或
+`--preflight-only`，不得以本节离线结果替代物理安全案例或操作员确认。

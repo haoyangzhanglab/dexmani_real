@@ -15,7 +15,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -498,7 +498,7 @@ def resolve_policy_runtime_config(
             "deployment config may contain only artifact expectations or "
             f"Real-owned fields; unknown={sorted(unknown)}"
         )
-    base = DeploymentConfig(**expected_artifact)
+    base = DeploymentConfig(**cast(dict[str, Any], expected_artifact))
     real_overrides = {
         key: value
         for key, value in raw.items()

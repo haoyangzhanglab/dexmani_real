@@ -20,6 +20,7 @@ checkpoint SHA-256) via ``sha256_file`` and
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -32,6 +33,7 @@ from dexmani_real.deployment.config import DeploymentConfig, PolicyRuntimeConfig
 from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_loop
 from dexmani_real.deployment.observation import parse_observation_fields
 from dexmani_real.deployment.operator import run_operator_control
+from dexmani_real.deployment.run_identity import RealSourceIdentity
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.robot.arm_worker import arm_loop
@@ -55,6 +57,20 @@ from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig, pointclo
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
+
+
+def _prepare_h4_receipt_dir() -> str:
+    """Create the H4 receipt directory before any hardware worker starts."""
+    receipt_dir = Path(
+        os.environ.get(
+            "DEXMANI_RECEIPT_DIR",
+            str(Path.home() / ".dexmani" / "receipts"),
+        )
+    )
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    if not receipt_dir.is_dir():
+        raise RuntimeError(f"H4 receipt path is not a directory: {receipt_dir}")
+    return str(receipt_dir)
 
 
 def _requires_pointcloud(deployment: DeploymentConfig) -> bool:
@@ -112,6 +128,9 @@ def build_policy_worker_specs(
     shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     policy_runtime_config: PolicyRuntimeConfig,
+    *,
+    h4_receipt_dir: str | None = None,
+    h4_receipt_provenance_json: str | None = None,
 ) -> list[WorkerSpec]:
     """Build the workers required by the explicit deployment contract.
 
@@ -127,6 +146,8 @@ def build_policy_worker_specs(
         runtime,
         execution_mode=policy_runtime_config.execution_mode,
         h4_execute_bounds=policy_runtime_config.h4_execute_bounds,
+        h4_receipt_dir=h4_receipt_dir,
+        h4_receipt_provenance_json=h4_receipt_provenance_json,
     )
     pointcloud_requested = _requires_pointcloud(deployment)
     pointcloud_config = (
@@ -199,6 +220,8 @@ def run_policy_deployment(
     *,
     prefix: str | None = None,
     max_running_s: float | None = None,
+    real_source: RealSourceIdentity | None = None,
+    invocation_argv: tuple[str, ...] | None = None,
 ) -> int:
     """Run one policy deployment lifecycle and return its exit code.
 
@@ -224,13 +247,48 @@ def run_policy_deployment(
     deployment = policy_runtime_config.deployment
     if deployment.hand_enabled and not policy_runtime_config.hand_acknowledged:
         raise ValueError("deployment with hand targets requires --hand")
+    h4_receipt_provenance_json: str | None = None
+    if policy_runtime_config.execution_mode == "execute":
+        if real_source is None or real_source.availability != "available":
+            raise ValueError("H4 execute requires resolved Real source identity")
+        if real_source.dirty != "false":
+            raise ValueError("H4 execute requires a clean Real source identity")
+        artifact = policy_runtime_config.artifact
+        if artifact is None:
+            raise ValueError("H4 execute requires a resolved policy artifact")
+        h4_receipt_provenance_json = json.dumps(
+            {
+                "artifact": {
+                    "checkpoint_sha256": artifact.checkpoint_sha256_from_index,
+                    "checkpoint": artifact.checkpoint_path.name,
+                    "index_sha256": artifact.index_sha256,
+                },
+                "invocation_argv": list(invocation_argv or ()),
+                "real_source": {
+                    "commit": real_source.commit,
+                    "dirty": real_source.dirty,
+                    "python_tree_sha256": real_source.python_tree_sha256,
+                },
+                "runtime": {"config_sha256": runtime.sha256},
+            },
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
     log_deployment_provenance(
         logger,
         deployment=deployment,
         runtime_sha256=runtime.sha256,
+        dexmani_commit=(real_source.commit if real_source is not None else ""),
         checkpoint_sha256=(
             sha256_file(deployment.checkpoint) if deployment.checkpoint else ""
         ),
+    )
+
+    h4_receipt_dir = (
+        _prepare_h4_receipt_dir()
+        if policy_runtime_config.execution_mode == "execute"
+        else None
     )
 
     ctx = mp.get_context("spawn")
@@ -256,7 +314,13 @@ def run_policy_deployment(
     operator_thread: threading.Thread | None = None
     operator_stop: threading.Event | None = None
     try:
-        specs = build_policy_worker_specs(shared, runtime, policy_runtime_config)
+        specs = build_policy_worker_specs(
+            shared,
+            runtime,
+            policy_runtime_config,
+            h4_receipt_dir=h4_receipt_dir,
+            h4_receipt_provenance_json=h4_receipt_provenance_json,
+        )
         procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)
 
@@ -369,7 +433,13 @@ def run_policy_deployment(
             graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
             disarm_if_clean=normal_exit,
         )
+        h4_completed = bool(shared.execute_completed.value)
         clean_exit = normal_exit and shutdown_report.clean
+        if policy_runtime_config.execution_mode == "execute":
+            # A clean cancellation is operationally safe, but it is not a
+            # successful H4 execute.  Keep the process status unambiguous for
+            # runbooks and any calling automation.
+            clean_exit = clean_exit and h4_completed
         safety_name = (
             SafetyState(shutdown_report.safety_state).name
             if shutdown_report.safety_state is not None
@@ -378,7 +448,8 @@ def run_policy_deployment(
         print(f"\n── Session End ──")
         print(
             f"  exit_reason={exit_reason}  safety={safety_name}  "
-            f"supervisor_normal={normal_exit}  clean={clean_exit}"
+            f"supervisor_normal={normal_exit}  h4_completed={h4_completed}  "
+            f"clean={clean_exit}"
         )
         print("──")
         return 0 if clean_exit else 1

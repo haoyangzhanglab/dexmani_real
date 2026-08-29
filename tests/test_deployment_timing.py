@@ -322,6 +322,43 @@ class DeploymentTimingTest(unittest.TestCase):
         self.assertEqual(clock.limit_request_times_s, [])
         self.assertEqual(shared.safety_state.value, int(SafetyState.FAULT))
 
+    def test_execute_time_limit_keeps_explicit_supervisor_reason(self) -> None:
+        clock = _SupervisorClock()
+        shared = SimpleNamespace(
+            safety_state=_Value(int(SafetyState.ARMED)),
+            run_started_monotonic_ns=_Value(0),
+            start_request=_Value(1),
+            stop_request=_Value(int(StopRequest.NONE)),
+            is_running=_Value(1),
+            error_state=_Value(0),
+            estop_request=_Value(0),
+            quit_requested=_Value(0),
+            get_heartbeat=lambda _name: clock.now_s,
+        )
+        clock.attach(shared)
+        process = SimpleNamespace(name="policy", exitcode=None)
+
+        with (
+            patch("dexmani_real.runtime.supervisor.time", clock),
+            patch(
+                "dexmani_real.runtime.workers.supervisor_exit_reason",
+                return_value=ExitReason.NONE,
+            ),
+        ):
+            exit_reason, normal_exit = run_supervisor(
+                shared,
+                [process],
+                ["policy"],
+                ["policy"],
+                heartbeat_timeouts_s={"policy": 0.5},
+                supervisor_hz=10.0,
+                max_running_s=1.0,
+                exit_after_run_stops=True,
+            )
+
+        self.assertEqual(exit_reason, "run time limit reached")
+        self.assertTrue(normal_exit)
+
     def test_policy_endpoint_disposition_uses_only_typed_outcomes(self) -> None:
         def classify(result: CommandPublishResult, *, nested: bool = True):
             return classify_policy_endpoint_disposition(
@@ -1370,6 +1407,7 @@ class DeploymentTimingTest(unittest.TestCase):
             quit_requested=_Value(0),
             start_request=_Value(1),
             stop_request=_Value(0),
+            execute_completed=_Value(0),
             error_state=_Value(0),
             estop_request=_Value(0),
             set_heartbeat=Mock(),
@@ -1480,6 +1518,7 @@ class DeploymentTimingTest(unittest.TestCase):
             quit_requested=_Value(0),
             start_request=_Value(1),
             stop_request=_Value(0),
+            execute_completed=_Value(0),
             error_state=_Value(0),
             estop_request=_Value(0),
             set_heartbeat=Mock(),
@@ -1565,6 +1604,10 @@ class DeploymentTimingTest(unittest.TestCase):
         execution_mode: str = "shadow",
         h4_acknowledgement: CommandPublishStatus | None = None,
         h4_ack_timeout_s: float = 1.0,
+        late_h4_acknowledgement: bool = False,
+        request_second_h4_begin: bool = False,
+        execute_sequence_delta: int = 1,
+        stop_request_after_publication: StopRequest | None = None,
         clock_values: tuple[int, ...] | None = None,
     ) -> tuple[SimpleNamespace, SimpleNamespace, list[object]]:
         base_ns = 6_000_000_000
@@ -1603,6 +1646,7 @@ class DeploymentTimingTest(unittest.TestCase):
             quit_requested=_Value(0),
             start_request=_Value(1),
             stop_request=_Value(0),
+            execute_completed=_Value(0),
             error_state=_Value(0),
             estop_request=_Value(0),
             set_heartbeat=Mock(),
@@ -1652,6 +1696,9 @@ class DeploymentTimingTest(unittest.TestCase):
                     and shared.safety_state.value == int(SafetyState.ARMED)
                 )
             ):
+                if request_second_h4_begin and sleep_ticks == 2:
+                    shared.start_request.value = 1
+                    return
                 shared.is_running.value = 0
             elif sleep_ticks >= (50 if execution_mode == "execute" else 3):
                 shared.is_running.value = 0
@@ -1661,13 +1708,25 @@ class DeploymentTimingTest(unittest.TestCase):
             if mutate_shadow_sequence:
                 coupled_cmd_ring.latest_sequence += 1
             if execution_mode == "execute":
-                coupled_cmd_ring.latest_sequence += 1
+                coupled_cmd_ring.latest_sequence += execute_sequence_delta
+                if stop_request_after_publication is not None:
+                    shared.stop_request.value = int(stop_request_after_publication)
                 return CommandPublishResult(
                     result.status,
                     candidate=candidate,
                     ticket=CoupledCommandTicket(5, 1),
                 )
+            if result.succeeded:
+                return CommandPublishResult(result.status, candidate=candidate)
             return result
+
+        def poll_acknowledgement(*_args, **_kwargs):
+            if late_h4_acknowledgement:
+                clock._monotonic_ns_values = iter((base_ns + 2,))
+                clock._last_monotonic_ns = base_ns + 2
+            return CommandPublishResult(
+                h4_acknowledgement or CommandPublishStatus.ACK_PENDING
+            )
 
         with (
             patch("dexmani_real.deployment.coordinator.time", clock),
@@ -1687,9 +1746,7 @@ class DeploymentTimingTest(unittest.TestCase):
             ),
             patch(
                 "dexmani_real.deployment.coordinator.poll_coupled_command_acknowledgement",
-                return_value=CommandPublishResult(
-                    h4_acknowledgement or CommandPublishStatus.ACK_PENDING
-                ),
+                side_effect=poll_acknowledgement,
             ),
             patch(
                 "dexmani_real.deployment.coordinator._sleep_tick",
@@ -1716,6 +1773,33 @@ class DeploymentTimingTest(unittest.TestCase):
         self.assertTrue(
             any('"reason":"run time limit"' in message for message in logs.output)
         )
+
+    def test_h4_rejects_an_acknowledgement_observed_after_its_deadline(self) -> None:
+        shared, coupled_cmd_ring, candidates = self._run_single_endpoint_coordinator(
+            CommandPublishResult(CommandPublishStatus.PUBLISHED),
+            execution_mode="execute",
+            h4_acknowledgement=CommandPublishStatus.APPLIED,
+            h4_ack_timeout_s=1e-9,
+            late_h4_acknowledgement=True,
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(coupled_cmd_ring.latest_sequence, 1)
+        self.assertEqual(shared.execute_completed.value, 0)
+        self.assertEqual(shared.safety_state.value, int(SafetyState.FAULT))
+
+    def test_h4_ignores_a_second_b_after_the_first_run(self) -> None:
+        shared, coupled_cmd_ring, candidates = self._run_single_endpoint_coordinator(
+            CommandPublishResult(CommandPublishStatus.PUBLISHED),
+            execution_mode="execute",
+            h4_acknowledgement=CommandPublishStatus.APPLIED,
+            request_second_h4_begin=True,
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(coupled_cmd_ring.latest_sequence, 1)
+        self.assertEqual(shared.safety_state.value, int(SafetyState.ARMED))
+        self.assertEqual(shared.execute_completed.value, 1)
 
     def test_coordinator_motion_discard_does_not_publish_or_abort_run(self) -> None:
         shared, coupled_cmd_ring, candidates = self._run_single_endpoint_coordinator(
@@ -1789,6 +1873,7 @@ class DeploymentTimingTest(unittest.TestCase):
                 for message in logs.output
             )
         )
+        self.assertEqual(shared.execute_completed.value, 1)
 
     def test_h4_ack_timeout_latches_fault_without_another_publication(self) -> None:
         base_ns = 6_000_000_000
@@ -1802,6 +1887,47 @@ class DeploymentTimingTest(unittest.TestCase):
 
         self.assertEqual(len(candidates), 1)
         self.assertEqual(coupled_cmd_ring.latest_sequence, 1)
+        self.assertEqual(shared.error_state.value, 1)
+        self.assertEqual(shared.safety_state.value, int(SafetyState.FAULT))
+        self.assertFalse(begin_motion(shared))
+
+    def test_h4_time_limit_with_pending_ack_latches_fault(self) -> None:
+        shared, coupled_cmd_ring, candidates = self._run_single_endpoint_coordinator(
+            CommandPublishResult(CommandPublishStatus.PUBLISHED),
+            execution_mode="execute",
+            h4_acknowledgement=CommandPublishStatus.ACK_PENDING,
+            stop_request_after_publication=StopRequest.RUN_TIME_LIMIT,
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(coupled_cmd_ring.latest_sequence, 1)
+        self.assertEqual(shared.error_state.value, 1)
+        self.assertEqual(shared.safety_state.value, int(SafetyState.FAULT))
+        self.assertFalse(begin_motion(shared))
+
+    def test_h4_time_limit_before_first_publication_latches_fault(self) -> None:
+        shared, coupled_cmd_ring, candidates = self._run_single_endpoint_coordinator(
+            CommandPublishResult(CommandPublishStatus.PUBLISHED),
+            execution_mode="execute",
+            stop_request_after_start=StopRequest.RUN_TIME_LIMIT,
+        )
+
+        self.assertEqual(candidates, [])
+        coupled_cmd_ring.write.assert_not_called()
+        self.assertEqual(shared.error_state.value, 1)
+        self.assertEqual(shared.safety_state.value, int(SafetyState.FAULT))
+        self.assertFalse(begin_motion(shared))
+
+    def test_h4_rejects_extra_coupled_ring_publication(self) -> None:
+        shared, coupled_cmd_ring, candidates = self._run_single_endpoint_coordinator(
+            CommandPublishResult(CommandPublishStatus.PUBLISHED),
+            execution_mode="execute",
+            h4_acknowledgement=CommandPublishStatus.APPLIED,
+            execute_sequence_delta=2,
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(coupled_cmd_ring.latest_sequence, 2)
         self.assertEqual(shared.error_state.value, 1)
         self.assertEqual(shared.safety_state.value, int(SafetyState.FAULT))
         self.assertFalse(begin_motion(shared))

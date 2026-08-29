@@ -76,7 +76,7 @@ arm 初始化即启用运动、设置模式和运行状态；`DISARMED` 的语�
 | --- | --- | --- |
 | 已实施 | arm 硬件边界缺少关节限位复核 | `check_worker_arm_command` 现在复核不可变关节上下限、action ID、时效和相邻已接受目标的异常跳变；`_handle_servo_command` 在 SDK 前执行完整复核。实机限位/停止效果仍须验证。 |
 | 已实施（软件） | 运动撤销不是原子的 | `motion_lock` 将 state 与 generation 作为 `MotionPermit` 读取；开始、撤销和 IPC 发布在同一短临界区线性化，进入 `FAULT` 也推进 generation。SDK 调用前复核但不持锁，不能替代物理停止。 |
-| 已实施（IPC） | arm/hand 命令可能跨帧混合，或旧 record 在覆盖后被延迟执行 | 两条 ring 已替换为单条 coupled record；publisher 在 motion lock 内写完整 record 并更新 active sequence 后立即返回。worker 在 SDK 前复核同一 `(generation, ring sequence)` ownership ticket；action ID 仅承担审计/ACK。覆盖、普通 `RUNNING → ARMED` 停止和 home 取消均会使旧 ticket 失效；home 取消只影响其仍为当前的 ticket。执行器仍独立循环，未声明物理同步或 paired physical ACK。 |
+| 已实施（IPC） | arm/hand 命令可能跨帧混合，或旧 record 在覆盖后被延迟执行 | 两条 ring 已替换为单条 coupled record；publisher 在 motion lock 内写完整 record 并更新 active sequence 后立即返回。worker 在 SDK 前复核同一 `(generation, ring sequence)` ownership ticket；action ID 仅承担审计/ACK。覆盖、普通 `RUNNING → ARMED` 停止和 home 取消均会使旧 ticket 失效；home 取消只影响其仍为当前的 ticket。常规 teleop/replay 仍不声明物理同步；H4 policy execute 额外限制为单条 publication，并由 coordinator 等待 arm `last_cmd_seq` 与 hand `accepted_target_action_id` 对同一 action-id 的 paired ACK。 |
 | 已实施 | 可选 hand 输出可绕过完整碰撞转换 | learned-policy `publish_plan` 拒绝缺 hand chunk，coordinator 采纳门也拒绝 `hand_present != 1`；DexMani manifest 强制 hand-enabled 的 19D/21D 合同。 |
 | 已实施 | 激活计划不会因观测过期自动失效 | coordinator 对每个 active endpoint 使用不可延长的 `min(inference_finished + max_plan_age, latest_physical_source + max_source_to_command_age)`；已过期前缀直接跳过，计划到期时清空 active/pending 并撤销 RUNNING。 |
 | 未关闭 | deployment 碰撞世界排除桌面 | coordinator 仍不传入 table；需要任务级风险接受、工作空间/速度约束和受控工装验证，不能暗示碰撞检查覆盖完整环境。 |

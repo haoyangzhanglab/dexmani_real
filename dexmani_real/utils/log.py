@@ -8,14 +8,17 @@ __all__ = [
     "extract_native_diagnostics",
     "get_logger",
     "ThrottledWarner",
+    "write_json_receipt",
 ]
 
 import ctypes
+import json
 import logging
 import os
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +34,7 @@ _FORMATTER = logging.Formatter(
 _file_handler: logging.FileHandler | None = None
 _file_handler_init = False
 
+
 def _get_file_handler() -> logging.FileHandler | None:
     """Create (once) a shared file handler for on-disk session logs.
 
@@ -42,7 +46,9 @@ def _get_file_handler() -> logging.FileHandler | None:
         return _file_handler
     _file_handler_init = True
     try:
-        log_dir = Path(os.environ.get("DEXMANI_LOG_DIR", str(Path.home() / ".dexmani" / "logs")))
+        log_dir = Path(
+            os.environ.get("DEXMANI_LOG_DIR", str(Path.home() / ".dexmani" / "logs"))
+        )
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"dexmani_{time.strftime('%Y%m%d_%H%M%S')}.log"
         handler = logging.FileHandler(str(log_path), encoding="utf-8")
@@ -64,6 +70,44 @@ def get_logger(name: str) -> logging.Logger:
             logger.addHandler(file_handler)
         logger.setLevel(logging.INFO)
     return logger
+
+
+def write_json_receipt(directory: str | Path, payload: str) -> Path:
+    """Atomically persist one already-canonical JSON receipt."""
+    parsed = json.loads(payload)
+    if not isinstance(parsed, dict):
+        raise ValueError("receipt payload must be a JSON object")
+    receipt_dir = Path(directory)
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    if not receipt_dir.is_dir():
+        raise OSError(f"receipt path is not a directory: {receipt_dir}")
+    destination = receipt_dir / (
+        f"h4_execute_{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex}.json"
+    )
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=receipt_dir,
+            prefix=".h4_receipt_",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(payload)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, destination)
+        return destination
+    except Exception:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
 
 
 # ThrottledWarner uses the project logger format for consistent diagnostics.
@@ -132,13 +176,26 @@ def capture_native_stdout() -> Iterator[CapturedProcessOutput]:
         sink.close()
 
 
-def extract_native_diagnostics(text: str, *, ignore: tuple[str, ...] = ()) -> tuple[str, ...]:
+def extract_native_diagnostics(
+    text: str, *, ignore: tuple[str, ...] = ()
+) -> tuple[str, ...]:
     """Return suspicious vendor-output lines while dropping known chatter."""
-    markers = ("error", "fail", "exception", "traceback", "permission", "unknown", "unknow", "compare_time")
+    markers = (
+        "error",
+        "fail",
+        "exception",
+        "traceback",
+        "permission",
+        "unknown",
+        "unknow",
+        "compare_time",
+    )
     return tuple(
         line
         for line in (value.strip() for value in text.splitlines())
-        if line and not any(token in line for token in ignore) and any(marker in line.lower() for marker in markers)
+        if line
+        and not any(token in line for token in ignore)
+        and any(marker in line.lower() for marker in markers)
     )
 
 
@@ -149,7 +206,9 @@ class ThrottledWarner:
     (torn reads, stale state, producer mismatch).  Default interval: 5.0 s.
     """
 
-    def __init__(self, interval_s: float = 5.0, logger: logging.Logger | None = None) -> None:
+    def __init__(
+        self, interval_s: float = 5.0, logger: logging.Logger | None = None
+    ) -> None:
         self._interval_ns = int(interval_s * 1e9)
         self._last_ns = 0
         self._logger = logger or _logger

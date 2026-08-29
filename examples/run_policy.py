@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -50,6 +51,14 @@ def _one_positive_endpoint(raw: str) -> int:
         raise argparse.ArgumentTypeError("must be exactly 1 for H4") from exc
     if value != 1:
         raise argparse.ArgumentTypeError("must be exactly 1 for H4")
+    return value
+
+
+def _sha256_hex(raw: str) -> str:
+    """Parse one immutable H4 checkpoint digest."""
+    value = raw.lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise argparse.ArgumentTypeError("must be a 64-character SHA-256 hex digest")
     return value
 
 
@@ -105,6 +114,12 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="required H4 execute arm+hand acknowledgement deadline",
     )
+    parser.add_argument(
+        "--execute-expected-checkpoint-sha256",
+        type=_sha256_hex,
+        default=None,
+        help="required immutable H4 checkpoint SHA-256 from the approved reference",
+    )
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument(
         "--print-config",
@@ -127,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         if (
             args.execute_max_published_endpoints is not None
             or args.execute_ack_timeout_seconds is not None
+            or args.execute_expected_checkpoint_sha256 is not None
         ):
             parser.error("--execute-* bounds require --execution-mode execute")
         if args.max_running_seconds is not None and (
@@ -144,6 +160,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("H4 execute requires --execute-max-published-endpoints 1")
         if args.execute_ack_timeout_seconds is None:
             parser.error("H4 execute requires --execute-ack-timeout-seconds")
+        if args.execute_expected_checkpoint_sha256 is None:
+            parser.error("H4 execute requires --execute-expected-checkpoint-sha256")
         try:
             h4_execute_bounds = H4ExecuteBounds(
                 max_published_endpoints=args.execute_max_published_endpoints,
@@ -173,6 +191,16 @@ def main(argv: list[str] | None = None) -> int:
         yaml.YAMLError,
     ) as exc:
         parser.error(f"invalid deployment receipt/config: {exc}")
+
+    if (
+        args.execution_mode == "execute"
+        and artifact.checkpoint_sha256_from_index
+        != args.execute_expected_checkpoint_sha256
+    ):
+        parser.error(
+            "selected checkpoint SHA-256 does not match "
+            "--execute-expected-checkpoint-sha256"
+        )
 
     real_source = resolve_real_source_identity()
     if args.print_config:
@@ -206,17 +234,25 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
+    if args.execution_mode == "execute" and (
+        real_source.availability != "available" or real_source.dirty != "false"
+    ):
+        parser.error("H4 execute requires a clean, identifiable DexMani Real revision")
     # Deliberately lazy: receipt/preflight modes above must remain isolated
     # from lifecycle, camera, robot, and hardware-owning imports.
     from dexmani_real.deployment.lifecycle import run_policy_deployment
 
-    return run_policy_deployment(
-        runtime,
-        projection.runtime,
-        max_running_s=(
+    lifecycle_kwargs: dict[str, object] = {
+        "max_running_s": (
             args.max_running_seconds if args.execution_mode == "shadow" else None
-        ),
-    )
+        )
+    }
+    if args.execution_mode == "execute":
+        lifecycle_kwargs["real_source"] = real_source
+        lifecycle_kwargs["invocation_argv"] = tuple(
+            sys.argv if argv is None else [sys.argv[0], *argv]
+        )
+    return run_policy_deployment(runtime, projection.runtime, **lifecycle_kwargs)
 
 
 if __name__ == "__main__":

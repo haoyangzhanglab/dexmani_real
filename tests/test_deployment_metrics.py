@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from dexmani_real.deployment.metrics import (
     Metrics,
     execute_run_receipt_json,
     shadow_run_receipt_json,
 )
+from dexmani_real.utils.log import write_json_receipt
 
 
 class DeploymentMetricsTest(unittest.TestCase):
@@ -100,6 +103,7 @@ class DeploymentMetricsTest(unittest.TestCase):
                 max_published_endpoints=1,
                 acknowledgement_timeout_s=2.0,
                 acknowledged_action_id=41,
+                completed=True,
                 metrics={
                     "coupled_command_writes": 1,
                     "execute_acknowledged": 1,
@@ -111,6 +115,8 @@ class DeploymentMetricsTest(unittest.TestCase):
         self.assertEqual(receipt["coupled_command_writes"], 1)
         self.assertTrue(receipt["within_publication_bound"])
         self.assertEqual(receipt["acknowledged_action_id"], 41)
+        self.assertTrue(receipt["completed"])
+        self.assertEqual(receipt["outcome"], "completed")
 
     def test_execute_receipt_rejects_non_h4_bound(self) -> None:
         with self.assertRaisesRegex(ValueError, "exactly one"):
@@ -122,7 +128,16 @@ class DeploymentMetricsTest(unittest.TestCase):
                 max_published_endpoints=2,
                 acknowledgement_timeout_s=2.0,
                 acknowledged_action_id=None,
+                completed=False,
                 metrics={},
+            )
+
+    def test_h4_receipt_is_written_as_one_json_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_json_receipt(directory, '{"outcome":"completed"}')
+            self.assertEqual(path.parent, Path(directory))
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")), {"outcome": "completed"}
             )
 
 

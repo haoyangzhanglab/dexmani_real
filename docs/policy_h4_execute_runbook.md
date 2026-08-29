@@ -19,11 +19,17 @@ shadow 证据解释成 execute 授权。
 - `--execution-mode execute --hand`，且 artifact 必须要求 hand；
 - `--execute-max-published-endpoints 1`，不能使用其他数值；
 - `--execute-ack-timeout-seconds <finite positive>`；
+- `--execute-expected-checkpoint-sha256 <64-hex>` 必须等于本次批准的 frozen
+  reference；dirty 或无法识别的 Real source revision 会在连接硬件前被拒绝；
 - `--max-running-seconds <finite positive>`，其值被冻结进 H4 runtime receipt；
 - B 后 coordinator 最多写一条 complete coupled arm+hand record，随后停止调度；
+- 一个 execute lifecycle 只接受第一次 B；即使 supervisor 尚未观察到 ARMED，后续 B 也会被
+  coordinator 忽略；
 - arm `last_cmd_seq` 与 hand `accepted_target_action_id` 都须确认同一个 action id；
 - 确认成功即撤销 motion 并回到 ARMED；超时、superseded、freshness/feedback 或 publication
   异常均进入 sticky FAULT，绝不重试或发送第二条 policy command。
+- ACK 在 coordinator 轮询到 `APPLIED` 后仍须处于 deadline 内；晚到的 `APPLIED` 按 timeout
+  处理。进程退出码 0 还要求 `completed=true`，人工 S/Q 的干净停止不是 H4 成功。
 
 `--print-config` / `--preflight-only` 可审计该 H4 projection，但 operational invocation 会连接
 真实设备。因此，**不得**绕过 lifecycle、直接调用 coordinator、复用 teleop/replay 入口，或把
@@ -44,7 +50,8 @@ shadow 证据解释成 execute 授权。
 | static checks | focused 与全量离线 tests、`compileall`、Black、isort、`git diff --check` 均通过 | 修复后重跑 |
 
 当前 H4 software guard 已通过 fake-ring、coordinator acknowledgement/timeout、CLI/lifecycle 和
-receipt 的离线测试；这只满足软件前置条件，仍不构成启动条件。
+receipt 的离线测试；全量 Real 离线套件为 208 tests，compileall、focused Black/isort 与
+`git diff --check` 均通过。这只满足软件前置条件，仍不构成启动条件。
 
 ## 4. 现场限定授权应包含的内容
 
@@ -79,7 +86,9 @@ receipt 的离线测试；这只满足软件前置条件，仍不构成启动条
 
 - 操作员 STOP/S、e-stop、人员或物体进入工作空间；
 - publication count 或 B-relative duration 达到本次授权上限；
-- `SafetyGate` rejection、hand preflight rejection、collision/workspace checker exception；
+- fatal `SafetyGate`/contract/checker exception 或 worker 反馈故障；typed 的 joint/workspace/
+  transition motion reject 与 hand preflight reject 只丢弃当前未发布 endpoint，并计入 receipt；
+  若一直没有可发布 endpoint，则由 first-command/B-relative timeout 结束为 FAULT；
 - arm/hand/camera/pointcloud/inference/policy heartbeat 或 freshness 故障；
 - generation mismatch、ticket superseded/timeout、SDK error、worker exit、unexpected command count；
 - reference identity、runtime config 或 calibration provenance 不匹配。
@@ -89,7 +98,9 @@ receipt 的离线测试；这只满足软件前置条件，仍不构成启动条
 
 ## 7. H4 receipt 的最低验收内容
 
-H4 receipt 必须持久化以下内容：
+H4 coordinator receipt 会作为原子 JSON 文件写到 `$DEXMANI_RECEIPT_DIR`（默认
+`~/.dexmani/receipts`）；写入失败会把 session 标为 FAULT。它与启动时保存的
+`--print-config` / `--preflight-only` receipt 一起构成 H4 审计材料。至少须持久化以下内容：
 
 - frozen artifact checkpoint/index SHA-256、runtime/source/config identities、准确 argv；
 - reset-home accepted、ARMED、B/RUNNING、first/last publication、stop、DISARMED 的 monotonic/UTC 时间；

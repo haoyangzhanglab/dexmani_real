@@ -97,7 +97,7 @@ from dexmani_real.runtime.safety import (
 )
 from dexmani_real.utils.feedback import FeedbackIssueCode, diagnose_arm_feedback
 from dexmani_real.utils.limits import validate_hand_limit_nesting
-from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.log import get_logger, write_json_receipt
 
 if TYPE_CHECKING:
     from dexmani_real.config.runtime import ResolvedRuntimeConfig
@@ -138,6 +138,8 @@ class CoordinatorConfig:
     control_hz: float
     execution_mode: str
     h4_execute_bounds: H4ExecuteBounds | None = None
+    h4_receipt_dir: str | None = None
+    h4_receipt_provenance_json: str | None = None
     # Full 19-DoF collision model (hand + static boxes) for EE->IK and the
     # transition collision gate (Phase 6/7); table clearance is not part of the
     # policy safety gate.
@@ -169,6 +171,8 @@ class CoordinatorConfig:
         *,
         execution_mode: str,
         h4_execute_bounds: H4ExecuteBounds | None,
+        h4_receipt_dir: str | None = None,
+        h4_receipt_provenance_json: str | None = None,
     ) -> "CoordinatorConfig":
         return cls(
             deployment=deployment,
@@ -184,6 +188,8 @@ class CoordinatorConfig:
             control_hz=float(runtime.policy.control_hz),
             execution_mode=execution_mode,
             h4_execute_bounds=h4_execute_bounds,
+            h4_receipt_dir=h4_receipt_dir,
+            h4_receipt_provenance_json=h4_receipt_provenance_json,
             static_boxes=tuple(runtime.environment.static_boxes),
             ik_max_pose_error_pos_m=float(runtime.policy.ik_max_pose_error_pos_m),
             ik_max_pose_error_rot_rad=float(runtime.policy.ik_max_pose_error_rot_rad),
@@ -458,6 +464,10 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
     execute_published_endpoints = 0
     execute_acknowledged_action_id: int | None = None
     h4_pending_acknowledgement: _H4PendingAcknowledgement | None = None
+    # H4 is one physical command per coordinator process, not merely per
+    # RUNNING epoch.  The supervisor exits after this epoch, but this latch
+    # also closes the ARMED/B race before it observes the state transition.
+    h4_session_started = False
     previous_arm_command_qpos: np.ndarray | None = None
     last_metrics_flush_ns = time.monotonic_ns()
 
@@ -508,12 +518,35 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     config.h4_execute_bounds.acknowledgement_timeout_s
                 ),
                 acknowledged_action_id=execute_acknowledged_action_id,
+                completed=bool(shared.execute_completed.value),
+                provenance_json=config.h4_receipt_provenance_json,
                 metrics=metrics.run_snapshot(),
             )
         except Exception:
+            # Receipt rendering is part of the same H4 acceptance boundary as
+            # persistence. Never leave a successful command marked complete
+            # when its terminal evidence cannot be produced.
+            shared.execute_completed.value = False
+            shared.error_state.value = True
+            revoke_motion(shared, SafetyState.FAULT)
             logger.critical("coordinator: cannot render execute receipt", exc_info=True)
         else:
             logger.info("execute run receipt: %s", receipt)
+            if config.h4_receipt_dir is not None:
+                try:
+                    receipt_path = write_json_receipt(config.h4_receipt_dir, receipt)
+                except Exception:
+                    # Receipt persistence is part of the H4 acceptance
+                    # boundary. Do not report a clean execute without it.
+                    shared.execute_completed.value = False
+                    shared.error_state.value = True
+                    revoke_motion(shared, SafetyState.FAULT)
+                    logger.critical(
+                        "coordinator: cannot persist H4 execute receipt",
+                        exc_info=True,
+                    )
+                else:
+                    logger.info("H4 execute receipt written: %s", receipt_path)
         finally:
             execute_run_generation = None
             execute_start_coupled_sequence = None
@@ -528,6 +561,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
     def fault_execute(reason: str, *, metric: str) -> None:
         """Latch FAULT for an H4 acknowledgement/boundary failure."""
         nonlocal buffer_generation, last_seen_plan_key, h4_pending_acknowledgement
+        shared.execute_completed.value = False
         shared.error_state.value = True
         if not revoke_motion(shared, SafetyState.FAULT):
             logger.critical("coordinator: unable to latch FAULT after H4 failure")
@@ -597,11 +631,18 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
             if bool(shared.quit_requested.value):
                 if int(shared.safety_state.value) == int(SafetyState.RUNNING):
                     _end_policy_run(shared, "operator quit", abort=False)
+                if config.execution_mode == "execute":
                     h4_pending_acknowledgement = None
                     emit_run_receipt("operator quit")
                 return
 
             if bool(shared.error_state.value) or bool(shared.estop_request.value):
+                if config.execution_mode == "execute":
+                    emit_execute_receipt(
+                        "e-stop requested"
+                        if bool(shared.estop_request.value)
+                        else "error_state set"
+                    )
                 if buffer_generation is not None:
                     action_buffer.reset(run_generation=int(shared.run_generation.value))
                     buffer_generation = None
@@ -620,6 +661,12 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     _sleep_tick(period_s, tick_start)
                     continue
                 shared.start_request.value = False
+                if config.execution_mode == "execute" and h4_session_started:
+                    logger.warning(
+                        "coordinator: ignored B after the H4 session already started"
+                    )
+                    _sleep_tick(period_s, tick_start)
+                    continue
                 # A stray S from ARMED must not stop the freshly started run.
                 shared.stop_request.value = False
                 if not begin_motion(shared):
@@ -632,6 +679,9 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     "coordinator_loop: RUNNING (run_generation=%d)",
                     int(shared.run_generation.value),
                 )
+                if config.execution_mode == "execute":
+                    h4_session_started = True
+                    shared.execute_completed.value = False
                 last_valid_policy_command_ns = None
                 run_epoch = read_run_epoch(shared)
                 if (
@@ -678,8 +728,9 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 _sleep_tick(period_s, tick_start)
                 continue
 
-            # RUNNING: an operator or bounded-run time-limit stop ends the run
-            # cleanly before the Main process shuts workers down.
+            # RUNNING: an operator stop ends cleanly; a bounded-run time-limit
+            # stop is clean for shadow and fail-closed for H4 without proof of
+            # the required publication/acknowledgement boundary.
             raw_stop_request = int(shared.stop_request.value)
             try:
                 stop_request = StopRequest(raw_stop_request)
@@ -698,6 +749,26 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     if stop_request is StopRequest.RUN_TIME_LIMIT
                     else "operator stop"
                 )
+                if (
+                    stop_request is StopRequest.RUN_TIME_LIMIT
+                    and config.execution_mode == "execute"
+                ):
+                    if h4_pending_acknowledgement is not None:
+                        fault_execute(
+                            "H4 run time limit reached before worker acknowledgement",
+                            metric=EXECUTE_ACK_TIMEOUT,
+                        )
+                    elif execute_published_endpoints == 0:
+                        fault_execute(
+                            "H4 run time limit reached before first publication",
+                            metric=COMMAND_SILENCE_ABORT,
+                        )
+                    else:
+                        fault_execute(
+                            "H4 publication bound reached without acknowledgement state",
+                            metric=ENDPOINTS_FATAL_REJECTED,
+                        )
+                    continue
                 _end_policy_run(shared, stop_reason, abort=False)
                 h4_pending_acknowledgement = None
                 emit_run_receipt(stop_reason)
@@ -738,10 +809,22 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     arm_feedback_max_age_s=config.arm_feedback_max_age_s,
                     hand_feedback_max_age_s=config.hand_feedback_max_age_s,
                 )
+                acknowledgement_observed_ns = time.monotonic_ns()
                 if acknowledgement.status is CommandPublishStatus.APPLIED:
+                    if (
+                        acknowledgement_observed_ns
+                        > h4_pending_acknowledgement.deadline_monotonic_ns
+                    ):
+                        fault_execute(
+                            "H4 worker acknowledgement arrived after deadline",
+                            metric=EXECUTE_ACK_TIMEOUT,
+                        )
+                        _sleep_tick(period_s, tick_start)
+                        continue
                     execute_acknowledged_action_id = int(
                         h4_pending_acknowledgement.candidate.action_id
                     )
+                    shared.execute_completed.value = True
                     metrics.increment(EXECUTE_ACKNOWLEDGED)
                     metrics.increment(EXECUTE_PUBLICATION_BOUND_REACHED)
                     h4_pending_acknowledgement = None
@@ -1092,21 +1175,52 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         metric=ENDPOINTS_FATAL_REJECTED,
                     )
                     continue
-                if shadow_start_coupled_sequence is not None:
-                    try:
-                        current_coupled_sequence = _coupled_command_sequence(shared)
-                    except Exception as exc:
+                try:
+                    current_coupled_sequence = _coupled_command_sequence(shared)
+                except Exception as exc:
+                    if config.execution_mode == "shadow":
                         fault_shadow_integrity(
                             reason=(
-                                "cannot inspect shadow coupled-command sequence: "
-                                f"{type(exc).__name__}"
+                                "cannot inspect coupled-command sequence after "
+                                f"validation: {type(exc).__name__}"
                             ),
                             write_violation=False,
                         )
-                        continue
+                    else:
+                        fault_execute(
+                            "cannot inspect H4 coupled-command sequence after "
+                            f"validation: {type(exc).__name__}",
+                            metric=ENDPOINTS_FATAL_REJECTED,
+                        )
+                    continue
+                if shadow_start_coupled_sequence is not None:
                     if current_coupled_sequence != shadow_start_coupled_sequence:
                         fault_shadow_coupled_write()
                         continue
+                elif config.execution_mode == "execute":
+                    assert execute_start_coupled_sequence is not None
+                    expected_sequence = execute_start_coupled_sequence + 1
+                    if current_coupled_sequence != expected_sequence:
+                        fault_execute(
+                            "H4 publication changed coupled-command sequence by "
+                            f"{current_coupled_sequence - execute_start_coupled_sequence}, "
+                            f"expected exactly 1",
+                            metric=ENDPOINTS_FATAL_REJECTED,
+                        )
+                        continue
+                published_candidate = publish_result.candidate
+                if published_candidate is None:
+                    abort_and_reset(
+                        "successful publication omitted its candidate",
+                        metric=ENDPOINTS_FATAL_REJECTED,
+                    )
+                    continue
+                if published_candidate.action_id != candidate.action_id:
+                    abort_and_reset(
+                        "publication changed candidate action identity",
+                        metric=ENDPOINTS_FATAL_REJECTED,
+                    )
+                    continue
                 try:
                     action_buffer.commit(endpoint_token)
                 except RuntimeError:
@@ -1139,7 +1253,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         )
                         continue
                     h4_pending_acknowledgement = _H4PendingAcknowledgement(
-                        candidate=candidate,
+                        candidate=published_candidate,
                         ticket=ticket,
                         deadline_monotonic_ns=(
                             time.monotonic_ns()
@@ -1150,11 +1264,11 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     )
                     logger.info(
                         "coordinator: H4 published action_id=%d; awaiting worker acknowledgement",
-                        candidate.action_id,
+                        published_candidate.action_id,
                     )
                 metrics.increment(ENDPOINTS_COMMITTED)
                 previous_arm_command_qpos = np.asarray(
-                    candidate.arm_qpos, dtype=np.float64
+                    published_candidate.arm_qpos, dtype=np.float64
                 ).copy()
                 last_valid_policy_command_ns = now_ns
             elif disposition in {

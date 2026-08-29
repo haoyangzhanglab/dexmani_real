@@ -340,6 +340,9 @@ class RuntimeChannels:
     start_request: Any  # Main -> coordinator: B (start a new policy run)
     # Main -> coordinator: StopRequest code (S or an explicit run-time limit).
     stop_request: Any
+    # Coordinator -> lifecycle: true only after the single H4 command was
+    # acknowledged by both workers before its deadline.
+    execute_completed: Any
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write
     # Serializes the motion permit and coupled-command ticket state. It is
@@ -507,6 +510,7 @@ class RuntimeChannels:
         storage.pointcloud_requested = ctx.Value("b", cfg.pointcloud_requested)
         storage.start_request = ctx.Value("b", False)
         storage.stop_request = ctx.Value("b", False)
+        storage.execute_completed = ctx.Value("b", False)
 
         storage.safety_state = ctx.Value("i", int(cfg.initial_safety_state))
         storage.motion_lock = ctx.RLock()

@@ -24,6 +24,7 @@ from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.deployment.artifact import resolve_policy_artifact
 from dexmani_real.deployment.config import (
     DeploymentConfig,
+    H4ExecuteBounds,
     PolicyRuntimeConfig,
     resolve_policy_runtime_config,
 )
@@ -207,6 +208,37 @@ class DeploymentPreflightTest(unittest.TestCase):
                 run_policy_deployment(runtime, policy_runtime)
 
         create_channels.assert_not_called()
+
+    def test_h4_execute_requires_hand_and_explicit_operator_acknowledgement(self):
+        runtime = resolve_runtime_config()
+        bounds = H4ExecuteBounds(
+            max_published_endpoints=1,
+            acknowledgement_timeout_s=2.0,
+            max_running_s=30.0,
+        )
+        with self.assertRaisesRegex(ValueError, "hand-enabled"):
+            PolicyRuntimeConfig(
+                deployment=DeploymentConfig(
+                    runtime_target="tests:fake",
+                    observation_fields="arm_qpos",
+                ),
+                control_dt_s=1.0 / float(runtime.policy.control_hz),
+                execution_mode="execute",
+                hand_acknowledged=True,
+                h4_execute_bounds=bounds,
+            )
+        with self.assertRaisesRegex(ValueError, "explicit --hand"):
+            PolicyRuntimeConfig(
+                deployment=DeploymentConfig(
+                    runtime_target="tests:fake",
+                    observation_fields="arm_qpos",
+                    hand_enabled=True,
+                ),
+                control_dt_s=1.0 / float(runtime.policy.control_hz),
+                execution_mode="execute",
+                hand_acknowledged=False,
+                h4_execute_bounds=bounds,
+            )
 
     def test_run_limit_is_validated_before_runtime_channels(self):
         runtime = resolve_runtime_config()
@@ -954,7 +986,7 @@ if loaded:
         )
         main = namespace["main"]
         module_globals = main.__globals__
-        artifact = object()
+        artifact = SimpleNamespace(checkpoint_sha256_from_index="a" * 64)
         runtime = object()
         projection = SimpleNamespace(runtime=object())
         module_globals["resolve_policy_artifact"] = lambda _path: artifact
@@ -970,13 +1002,24 @@ if loaded:
             return projection
 
         module_globals["resolve_policy_runtime_config"] = resolve_projection
-        module_globals["resolve_real_source_identity"] = lambda: object()
+        module_globals["resolve_real_source_identity"] = lambda: SimpleNamespace(
+            availability="available", dirty="false"
+        )
         lifecycle = ModuleType("dexmani_real.deployment.lifecycle")
 
-        def run_lifecycle(actual_runtime, actual_projection, *, max_running_s):
+        def run_lifecycle(
+            actual_runtime,
+            actual_projection,
+            *,
+            max_running_s,
+            real_source,
+            invocation_argv,
+        ):
             self.assertIs(actual_runtime, runtime)
             self.assertIs(actual_projection, projection.runtime)
             self.assertIsNone(max_running_s)
+            self.assertEqual(real_source.dirty, "false")
+            self.assertIn("--execution-mode", invocation_argv)
             return 0
 
         lifecycle.run_policy_deployment = run_lifecycle
@@ -997,6 +1040,8 @@ if loaded:
                     "1",
                     "--execute-ack-timeout-seconds",
                     "2",
+                    "--execute-expected-checkpoint-sha256",
+                    "a" * 64,
                 ]
             )
 
