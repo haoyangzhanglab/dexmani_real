@@ -1,8 +1,9 @@
 # H4 首次物理 coupled execute Runbook
 
-> 状态：**暂停。** Real-owned checkpoint decoder/restore 的 R0–R3 已完成离线验证，但新的
-> H2/H3 shadow evidence 尚未建立。本文保留首次 H4 的审核与现场流程，但不是启动授权。没有
-> 新的 shadow closeout 与明确、限定的 H4 真机授权，任何人不得运行 execute lifecycle。
+> 状态：**暂停。** Real-owned checkpoint decoder/restore 的 R0–R3 已完成离线验证，且当前
+> revision 的 H2/H3 zero-write shadow evidence 已建立。本文保留首次 H4 的审核与现场流程，
+> 但不是启动授权。没有独立的 H4 review 与明确、限定的 H4 真机授权，任何人不得运行 execute
+> lifecycle。
 
 ## 1. 目标与范围
 
@@ -42,8 +43,8 @@ shadow 证据解释成 execute 授权。
 
 | Gate | 需要的证据 | 失败处理 |
 |---|---|---|
-| reference identity | checkpoint SHA-256 与 [H2/H3 reference artifact](deployment_reference_h2h3_shadow_2026-08-29.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
-| H2/H3 baseline | time-bounded shadow receipt：1914/1914 validated、zero coupled writes、120.040 s clean stop | 停止，先恢复 shadow evidence |
+| reference identity | checkpoint SHA-256 与 [当前 H2/H3 reference artifact](deployment_reference_h2h3_shadow_2026-08-29_c9c3454.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
+| H2/H3 baseline | current `c9c3454` receipt：1912/1912 validated、zero coupled writes、120.007 s clean stop | 停止，先恢复 shadow evidence |
 | execute enablement diff | H4 仅增加 immutable CLI/lifecycle bounds、one-publication coordinator 和双 worker receipt；不改变 action、normalizer、SafetyGate、worker limit、collision、freshness 或 generation 语义 | 拒绝额外语义改动 |
 | bounded execute guard | execute 的 publication bound 固定为 `1`；ack timeout 与 B-relative duration 均为有限正值，并写入 coordinator receipt | 不允许用无界 execute 替代 |
 | offline publication | fake ring 的 full validation 成功只写一条 coherent arm+hand record；gate 后 generation 变化不得写入 | 停止并修复 |
@@ -52,8 +53,8 @@ shadow 证据解释成 execute 授权。
 
 H4 software guard 的 fake-ring、coordinator acknowledgement/timeout、CLI/lifecycle 与 receipt
 覆盖，在 Real-owned decoder/strict restore 重构后已重新通过全量 212 项离线测试，以及同一 frozen
-reference 的 `--print-config` / `--preflight-only`。这只恢复软件前置条件；必须重新完成 H2/H3
-shadow，才能恢复本节 gate。
+reference 的 `--print-config` / `--preflight-only`。当前 H2/H3 receipt 已恢复本节 shadow baseline；
+它不替代独立 H4 review、现场 checklist 或明确 H4 授权。
 
 ## 4. 现场限定授权应包含的内容
 

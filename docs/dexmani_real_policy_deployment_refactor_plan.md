@@ -2,7 +2,7 @@
 
 > 版本：2026-08-29 review-optimized revision
 >
-> 状态：R0–R3 已完成离线验证；R4 等待新的、明确的 H2/H3 shadow 授权。
+> 状态：R0–R4 已完成；H4 仍须单独 review 和明确授权。
 >
 > 唯一操作者入口：`examples/run_policy.py`
 
@@ -274,8 +274,11 @@ sidecar、runtime、Real source 和 Policy source identities。不得运行 oper
 
 ### R4 — shadow 恢复
 
-R0–R3 review 通过后，重新申请一次限定 H2/H3 shadow 授权。必须重新生成 zero coupled writes、
-bounded stop、clean shutdown evidence；旧 reference 只用于回归对比。
+R0–R3 review 后，已在 `c9c3454` 取得新的限定 H2/H3 shadow evidence：120.007 s bounded stop、
+1912/1912 endpoint shadow validation、zero coupled writes、arm servo calls=0 和所有 worker clean
+shutdown。冻结 receipt 见
+[`deployment_reference_h2h3_shadow_2026-08-29_c9c3454.json`](deployment_reference_h2h3_shadow_2026-08-29_c9c3454.json)；
+旧 reference 仅保留作回归对比。
 
 H4 必须等新的 shadow 证据通过后再单独 review 和授权。
 
@@ -319,12 +322,13 @@ H4 必须等新的 shadow 证据通过后再单独 review 和授权。
 
 - `dexmani_policy`：干净 `7e31d10`；本机 deployment 原型已撤回；
 - `dexmani_real`：artifact resolver、Real-owned decoder、strict restore、runtime 与 shadow/H4 guard
-  均已离线验证；
-- 下一步：提交并 review 当前干净的实现 revision，然后单独申请 R4 H2/H3 shadow；
-- 硬件：未授权；本轮未运行 shadow 或 execute。
+  已完成离线验证，并在 `c9c3454` 完成新的 H2/H3 zero-write shadow；
+- 下一步：单独 review H4 one-shot execute 的准入条件；
+- 硬件：H2/H3 已完成；H4 未获授权，未运行 execute。
 
 历史证据与现场要求见：
 
 - [部署架构审查](deployment_review.md)
-- [H2/H3 frozen reference](deployment_reference_h2h3_shadow_2026-08-29.json)
+- [当前 H2/H3 frozen reference](deployment_reference_h2h3_shadow_2026-08-29_c9c3454.json)
+- [历史 H2/H3 reference](deployment_reference_h2h3_shadow_2026-08-29.json)
 - [H4 runbook](policy_h4_execute_runbook.md)
