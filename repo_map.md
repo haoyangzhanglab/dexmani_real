@@ -31,11 +31,11 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `docs/data_schema.md` | Real raw v24、processed v11 与 Policy Zarr v5 的持久化字段和语义参考。 |
 | `docs/action_clip_mechanisms.md` | 动作 clip、限幅、拒绝与动作源差异的实现参数和数据审计说明。 |
 | `docs/deployment_review.md` | learned-policy 部署架构与安全审查结论、风险接受及整改优先级。 |
-| `docs/dexmani_real_policy_deployment_refactor_plan.md` | learned-policy 部署重构、shadow evidence、H4 前置 gate 与实施批次的当前方案。 |
-| `docs/dexmani_policy_integration_followup.md` | `dexmani_policy` 稳定后实施的 Zarr、sampler、checkpoint 与跨仓离线验收清单。 |
+| `docs/dexmani_real_policy_deployment_refactor_plan.md` | Real-owned artifact decoder/strict restore、Policy 兼容边界、R0–R4 gate 与暂停条件的当前方案。 |
+| `docs/dexmani_policy_integration_followup.md` | 另一台机器 Policy 分支稳定后的兼容性 review、验证与版本化 artifact 合并清单。 |
 | `docs/deployment_reference_h2h3_shadow_2026-08-29.json` | frozen reference v2 的 time-bounded H2/H3 shadow provenance、receipt、zero-write 与 clean-shutdown 证据。 |
 | `docs/maniunicon_reference_design.md` | 从 ManiUniCon 静态审查提炼的 learned-policy 部署改进思路、采纳边界与验收要求。 |
-| `docs/policy_h4_execute_runbook.md` | H4 首次 physical coupled execute 的离线通过软件 gate、限定授权、现场 stop 与 receipt 要求；不构成真机授权。 |
+| `docs/policy_h4_execute_runbook.md` | 暂停中的 H4 首次 physical coupled execute gate、限定授权、现场 stop 与 receipt 要求；不构成真机授权。 |
 | `docs/pointcloud_pipeline.md` | depth-to-color aligned 点云的采集、处理、时序与持久化契约。 |
 | `docs/teleop_jitter_incident.md` | 键盘遥操作卡顿、抖动、delta 拒绝与 coupled-command 修复复盘。 |
 | `docs/vr_coordinate_transform_followup.md` | VR wrist→EEF 坐标换算审查、证据边界、真实样本诊断与后续修正决策记录。 |
@@ -214,6 +214,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `contracts.py` | 无时间 `PolicyPrediction`、publish context、timed action chunk 与 `PolicyRuntime` protocol。 |
 | `config.py` | artifact-owned/Real-owned deployment projection、不可变 receipt、point-cloud contract 与 H4 one-shot execute bounds 校验。 |
 | `manifest.py` | checkpoint/config/runtime manifest 组装与 fail-closed 一致性检查。 |
+| `policy_checkpoint.py` | deployment-v2 checkpoint 的 Real-owned `weights_only` stream decoder、exact schema 与 canonical tensor-key 校验；不导入 Policy。 |
 | `preflight.py` | artifact-bound inference 与 spawn 预检共享的 no-follow/hash/provenance 单次 stream load；预检再执行 fake-observation。 |
 | `run_identity.py` | 纯标准库的 Real source provenance 与 print/preflight 共用 canonical run receipt。 |
 | `observation.py` | 因果不可变 arm/hand/tactile/pointcloud history batch。 |
@@ -281,6 +282,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `tests/test_deployment_timing.py` | run epoch、B-relative bounded stop、H4 one-publication/ACK/timeout、因果 observation grid、checkpoint 数据合同与 immutable plan deadline。 |
 | `tests/test_deployment_manifest.py` | deployment manifest 模态去重与顺序规范化合同。 |
 | `tests/test_deployment_metrics.py` | bounded p50/p95/p99 timing、flush/run totals、shadow zero-write 与 H4 one-shot receipt 合同。 |
+| `tests/test_policy_checkpoint.py` | Real-owned deployment-v2 `weights_only` decoder 的 exact schema、plain metadata 与 canonical tensor-key 拒绝路径。 |
 | `tests/test_keyboard_arm_limits.py` | keyboard 发布完整 IK endpoint、禁用通用 arm delta clip 的合同。 |
 | `tests/test_pointcloud_sampling.py` | 固定 N 分层采样、数值快速路径、网格键 fail-closed 与实时策略投影合同。 |
 | `tests/test_runtime_channels_ticket_state.py` | RuntimeChannels 的 coupled-command ticket 分配、零初始化与真实 shared-memory round-trip 合同。 |

@@ -1,7 +1,8 @@
 # H4 首次物理 coupled execute Runbook
 
-> 状态：**软件路径已完成离线验证，但未获真机授权。** 本文是首次 H4 的审核与现场流程，
-> 不是启动授权。没有一次明确、限定的 H4 真机授权，任何人不得运行 execute lifecycle。
+> 状态：**暂停。** Real-owned checkpoint decoder/restore 的 R0–R3 已完成离线验证，但新的
+> H2/H3 shadow evidence 尚未建立。本文保留首次 H4 的审核与现场流程，但不是启动授权。没有
+> 新的 shadow closeout 与明确、限定的 H4 真机授权，任何人不得运行 execute lifecycle。
 
 ## 1. 目标与范围
 
@@ -49,9 +50,10 @@ shadow 证据解释成 execute 授权。
 | fault paths | 预期覆盖 stop/e-stop、generation revoke、worker ack 超时、feedback stale、hand preflight reject、collision checker exception、publication failure | 任一路径不 fail-closed 即停止 |
 | static checks | focused 与全量离线 tests、`compileall`、Black、isort、`git diff --check` 均通过 | 修复后重跑 |
 
-当前 H4 software guard 已通过 fake-ring、coordinator acknowledgement/timeout、CLI/lifecycle 和
-receipt 的离线测试；全量 Real 离线套件为 208 tests，compileall、focused Black/isort 与
-`git diff --check` 均通过。这只满足软件前置条件，仍不构成启动条件。
+H4 software guard 的 fake-ring、coordinator acknowledgement/timeout、CLI/lifecycle 与 receipt
+覆盖，在 Real-owned decoder/strict restore 重构后已重新通过全量 212 项离线测试，以及同一 frozen
+reference 的 `--print-config` / `--preflight-only`。这只恢复软件前置条件；必须重新完成 H2/H3
+shadow，才能恢复本节 gate。
 
 ## 4. 现场限定授权应包含的内容
 

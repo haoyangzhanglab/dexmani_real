@@ -43,6 +43,7 @@ from dexmani_real.deployment.manifest import (
     validate_manifest_against_deployment,
 )
 from dexmani_real.deployment.observation import ObservationBatch
+from dexmani_real.deployment.policy_checkpoint import LoadedPolicyCheckpoint
 from dexmani_real.planning.poses import validate_rot6d_geometry
 from dexmani_real.robot_spec import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
@@ -193,6 +194,57 @@ def _canonical_json_sha256(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _validate_deployment_metadata(checkpoint: LoadedPolicyCheckpoint) -> None:
+    """Validate only metadata required to restore one Real deployment model."""
+    inference = checkpoint.inference_config
+    train = checkpoint.train_params
+    data = checkpoint.data_contract
+    for name, value in (
+        ("inference_config", inference),
+        ("train_params", train),
+        ("data_contract", data),
+    ):
+        if type(value) is not dict:
+            raise ValueError(f"checkpoint {name} must be a plain dict")
+    for key in ("action_key", "action_dim", "horizon", "n_obs_steps", "n_action_steps"):
+        if key not in inference or key not in train:
+            raise ValueError(f"checkpoint metadata is missing {key}")
+        if inference[key] != train[key]:
+            raise ValueError(f"checkpoint inference_config.{key} != train_params.{key}")
+    eval_config = inference.get("eval")
+    if not isinstance(eval_config, Mapping) or not isinstance(
+        eval_config.get("use_ema"), bool
+    ):
+        raise ValueError("checkpoint inference_config.eval.use_ema is invalid")
+    denoise_steps = eval_config.get("denoise_steps")
+    if (
+        isinstance(denoise_steps, bool)
+        or not isinstance(denoise_steps, int)
+        or denoise_steps <= 0
+    ):
+        raise ValueError("checkpoint inference_config.eval.denoise_steps is invalid")
+    for key in (
+        "action_key",
+        "model_action_dim",
+        "horizon",
+        "n_obs_steps",
+        "n_action_steps",
+    ):
+        if key not in data:
+            raise ValueError(f"checkpoint data_contract is missing {key}")
+    if data["action_key"] != train["action_key"]:
+        raise ValueError(
+            "checkpoint data_contract.action_key != train_params.action_key"
+        )
+    if data["model_action_dim"] != train["action_dim"]:
+        raise ValueError(
+            "checkpoint data_contract.model_action_dim != train_params.action_dim"
+        )
+    for key in ("horizon", "n_obs_steps", "n_action_steps"):
+        if data[key] != train[key]:
+            raise ValueError(f"checkpoint data_contract.{key} != train_params.{key}")
+
+
 def _is_under(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -325,6 +377,8 @@ def precheck_policy_package_provenance(
             "installed dexmani_policy commit does not match artifact producer: "
             f"installed={commit!r}, artifact={artifact.producer.commit!r}"
         )
+    if dirty != "false":
+        raise ValueError("dexmani_policy source tree must be clean for deployment")
     return {
         "origin": str(origin),
         "commit": commit,
@@ -378,7 +432,10 @@ class DexManiPolicyRuntime:
         )
 
     def load_loaded_checkpoint(
-        self, checkpoint_data: Any, *, package_provenance: Mapping[str, str]
+        self,
+        checkpoint_data: LoadedPolicyCheckpoint,
+        *,
+        package_provenance: Mapping[str, str],
     ) -> dict[str, str]:
         """Construct and restore from one already-deserialized checkpoint object."""
         if not isinstance(self.config, PolicyRuntimeConfig):
@@ -395,44 +452,24 @@ class DexManiPolicyRuntime:
             ) from exc
         verify_imported_policy_provenance(package_provenance)
 
+        if not isinstance(checkpoint_data, LoadedPolicyCheckpoint):
+            raise TypeError("deployment restore requires a LoadedPolicyCheckpoint")
+
         import hydra
-        from dexmani_policy.common.checkpoint_io import validate_new_checkpoint_metadata
-        from dexmani_policy.common.config import (
-            normalize_action_key,
-            register_resolvers,
-        )
-        from dexmani_policy.datasets.data_contract import (
-            validate_deployable_data_contract,
-        )
-        from dexmani_policy.training.eval_utils import (
-            restore_loaded_checkpoint_for_inference,
-        )
         from omegaconf import OmegaConf
 
-        register_resolvers()
-        inference_config = getattr(checkpoint_data, "inference_config", None)
-        if not isinstance(inference_config, dict):
-            raise ValueError(
-                "checkpoint has no embedded inference_config; retrain or export a "
-                "self-describing deployment checkpoint"
-            )
-        if not isinstance(checkpoint_data.train_params, dict):
-            raise ValueError("checkpoint train_params is missing")
-        if not isinstance(checkpoint_data.data_contract, dict):
-            raise ValueError("checkpoint data_contract is missing")
+        inference_config = checkpoint_data.inference_config
         _validate_embedded_targets(inference_config)
-        validate_new_checkpoint_metadata(
-            inference_config=inference_config,
-            data_contract=checkpoint_data.data_contract,
-            train_params=checkpoint_data.train_params,
-        )
-        validate_deployable_data_contract(checkpoint_data.data_contract)
+        _validate_deployment_metadata(checkpoint_data)
         self._validate_artifact_receipt(checkpoint_data)
-        _validate_training_data_contract(
-            getattr(checkpoint_data, "data_contract", None), self.config
-        )
+        _validate_training_data_contract(checkpoint_data.data_contract, self.config)
         cfg = OmegaConf.create(inference_config)
-        normalize_action_key(cfg)
+        try:
+            OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+        except Exception as exc:
+            raise ValueError(
+                "embedded inference config must be fully resolved"
+            ) from exc
         # DQ-RISE codebook buffers are persistent model state. Loading the
         # training-time file again would make deployment depend on an external
         # path and could overwrite the checkpoint-owned artifact.
@@ -448,7 +485,14 @@ class DexManiPolicyRuntime:
             raise ValueError(
                 "embedded eval.use_ema requires EMA weights in the checkpoint"
             )
-        restore_loaded_checkpoint_for_inference(agent, checkpoint_data, use_ema)
+        state_dict = (
+            checkpoint_data.ema_model_state if use_ema else checkpoint_data.model_state
+        )
+        if state_dict is None:
+            raise ValueError(
+                "embedded eval.use_ema requires EMA weights in the checkpoint"
+            )
+        agent.load_state_dict(state_dict, strict=True)
 
         agent.to(device)
         agent.eval()
@@ -639,7 +683,7 @@ class DexManiPolicyRuntime:
                 "checkpoint data_contract point feature dimension mismatch"
             )
         if (
-            data.get("pad_before") != 1
+            data.get("pad_before") != allocation.n_obs_steps - 1
             or data.get("pad_after") != allocation.n_action_steps - 1
             or data.get("padding_semantics") != "repeat_edge"
             or data.get("use_aux_ee") is not False

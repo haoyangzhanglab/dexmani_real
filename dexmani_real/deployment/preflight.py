@@ -359,7 +359,7 @@ def _load_verified_policy_runtime(
             provenance = precheck_policy_package_provenance(runtime_config)
             stream.seek(0)
             # The deployment loader is the only torch deserialize in this child.
-            from dexmani_policy.common.checkpoint_io import (
+            from dexmani_real.deployment.policy_checkpoint import (
                 load_deployment_checkpoint_stream,
             )
 

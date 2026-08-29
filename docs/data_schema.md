@@ -349,7 +349,8 @@ Policy Zarr v5 只接受 `deployment_equivalent=True`、未删除 source 行且�
 - 训练 Zarr 前应保留其对应 processed HDF5；Zarr 是训练传输格式，不是完整审计归档。
 - Real 训练 loader 必须校验 `schema_version=5`、`episode_start_policy=full_history`、camera-source
   state alignment 与 deployment action 合同，并使用
-  `pad_before=0`；每个 episode 的前 `n_obs_steps-1` 个位置不生成训练样本。
+  `pad_before=n_obs_steps-1`、`pad_after=n_action_steps-1` 和 repeat-edge padding。当前 DP3 的
+  `n_obs_steps=2`、`n_action_steps=8`，实例值为 `1/7`；不得把实例值写成通用常数。
 - 训练 checkpoint 必须复制 Zarr root 语义及实际 point-cloud shape 作为数据合同。Real 部署
   在模型构造前核对 domain/schema、`dt`、点云 policy/config/table identity 与实时 worker；
   不能仅凭模型权重或配置文件名推断数据域。

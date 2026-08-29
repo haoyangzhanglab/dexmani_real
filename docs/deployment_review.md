@@ -3,6 +3,11 @@
 > 审查对象：`dexmani_real/deployment`，并追踪其与 `control`、`runtime`、`robot`、`planning`、`integrations` 的运行时边界。
 >
 > 审查方式：源代码静态追踪、配置与共享内存契约检查、离线纯函数验证；**未连接设备、未执行任何硬件动作，也未完成供应商或实机安全验证**。
+
+> 2026-08-29 集成状态：控制、安全与 worker 结论仍适用；撤回 Policy-side deployment
+> 原型后，`run_policy.py` 的 checkpoint preflight 已迁移到 Real-owned decoder/strict restore，
+> 并完成离线验证。shadow 与 execute 仍需要各自的现场授权，参见
+> [当前实施方案](dexmani_real_policy_deployment_refactor_plan.md)。
 >
 > 结论状态：这是研发安全审查，不是功能验收、风险接受或安全认证。当前实现不应被表述为具备经验证的安全停机能力。
 
