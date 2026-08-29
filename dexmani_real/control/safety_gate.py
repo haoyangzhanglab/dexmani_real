@@ -55,6 +55,43 @@ def _hand_joint_limit_detail(
     return "hand joint limit violation (rad): " + ", ".join(violations)
 
 
+def _joint_delta_limit_detail(
+    *,
+    joint_group: str,
+    target_rad: np.ndarray,
+    reference_rad: np.ndarray,
+    limit_rad: np.ndarray,
+    tolerance_rad: float,
+    reference_kind: str,
+) -> str:
+    """Render the exact components that exceed a reject-only delta envelope."""
+    delta_rad = target_rad - reference_rad
+    abs_delta_rad = np.abs(delta_rad)
+    effective_limit_rad = limit_rad + tolerance_rad
+    violating = np.flatnonzero(abs_delta_rad > effective_limit_rad)
+    if violating.size == 0:
+        raise ValueError("delta-limit diagnostic requires an exceeded component")
+    max_index = int(np.argmax(abs_delta_rad))
+    violations = ", ".join(
+        (
+            f"j{index}: reference={reference_rad[index]:.17g}, "
+            f"target={target_rad[index]:.17g}, "
+            f"delta={delta_rad[index]:+.17g}, "
+            f"abs_delta={abs_delta_rad[index]:.17g}, "
+            f"limit={limit_rad[index]:.17g}, "
+            f"excess={abs_delta_rad[index] - effective_limit_rad[index]:+.3e}"
+        )
+        for index in violating
+    )
+    return (
+        f"{joint_group} per-tick delta limit violation "
+        f"(rad; reference={reference_kind}; "
+        f"tolerance={tolerance_rad:.3e}; "
+        f"max_abs_delta={abs_delta_rad[max_index]:.17g} at j{max_index}): "
+        f"{violations}"
+    )
+
+
 class GateRejectCode(str, Enum):
     """Stable machine-readable rejection reasons from :class:`SafetyGate`."""
 
@@ -196,12 +233,14 @@ class SafetyGate:
         if not np.all(np.isfinite(arm_start)):
             return GateResult(False, GateRejectCode.NONFINITE_CURRENT_ARM)
         arm_delta_start = arm_start
+        arm_delta_reference_kind = "measured_feedback"
         if arm_delta_reference_qpos is not None:
             arm_delta_start = np.asarray(arm_delta_reference_qpos, dtype=np.float64)
             if arm_delta_start.shape != ARM_JOINT_SHAPE:
                 return GateResult(False, GateRejectCode.INVALID_CURRENT_ARM_SHAPE)
             if not np.all(np.isfinite(arm_delta_start)):
                 return GateResult(False, GateRejectCode.NONFINITE_CURRENT_ARM)
+            arm_delta_reference_kind = "previous_published_target"
         arm_end = (
             arm_start.copy()
             if candidate.arm_qpos is None
@@ -214,6 +253,7 @@ class SafetyGate:
         )
         hand_start: np.ndarray | None = None
         hand_delta_start: np.ndarray | None = None
+        hand_delta_reference_kind = "measured_feedback"
         if hand_end is not None:
             if current_hand_qpos is None:
                 # A hand target without a current hand state cannot be delta- or
@@ -238,6 +278,7 @@ class SafetyGate:
                     return GateResult(False, GateRejectCode.INVALID_CURRENT_HAND_SHAPE)
                 if not np.all(np.isfinite(hand_delta_start)):
                     return GateResult(False, GateRejectCode.NONFINITE_CURRENT_HAND)
+                hand_delta_reference_kind = "previous_published_target"
         if arm_end.shape != ARM_JOINT_SHAPE or (
             hand_end is not None and hand_end.shape != HAND_JOINT_SHAPE
         ):
@@ -265,7 +306,18 @@ class SafetyGate:
                 np.abs(arm_end - arm_delta_start)
                 > self.max_arm_delta_rad + self.endpoint_delta_tolerance_rad
             ):
-                return GateResult(False, GateRejectCode.ARM_DELTA_LIMIT)
+                return GateResult(
+                    False,
+                    GateRejectCode.ARM_DELTA_LIMIT,
+                    _joint_delta_limit_detail(
+                        joint_group="arm",
+                        target_rad=arm_end,
+                        reference_rad=arm_delta_start,
+                        limit_rad=self.max_arm_delta_rad,
+                        tolerance_rad=self.endpoint_delta_tolerance_rad,
+                        reference_kind=arm_delta_reference_kind,
+                    ),
+                )
         if (
             self.max_hand_delta_rad is not None
             and hand_end is not None
@@ -275,7 +327,18 @@ class SafetyGate:
                 np.abs(hand_end - hand_delta_start)
                 > self.max_hand_delta_rad + self.endpoint_delta_tolerance_rad
             ):
-                return GateResult(False, GateRejectCode.HAND_DELTA_LIMIT)
+                return GateResult(
+                    False,
+                    GateRejectCode.HAND_DELTA_LIMIT,
+                    _joint_delta_limit_detail(
+                        joint_group="hand",
+                        target_rad=hand_end,
+                        reference_rad=hand_delta_start,
+                        limit_rad=self.max_hand_delta_rad,
+                        tolerance_rad=self.endpoint_delta_tolerance_rad,
+                        reference_kind=hand_delta_reference_kind,
+                    ),
+                )
         if self.workspace_check is not None and candidate.arm_qpos is not None:
             try:
                 if not self.workspace_check(arm_start, arm_end):

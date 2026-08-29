@@ -59,6 +59,35 @@ class SafetyGateCommandDeltaTest(unittest.TestCase):
         self.assertTrue(roundoff.accepted)
         self.assertEqual(real_excess.code, GateRejectCode.ARM_DELTA_LIMIT)
 
+    def test_arm_delta_rejection_reports_reference_target_and_excess(self) -> None:
+        result = self._gate().validate(
+            self._arm_candidate(0.125),
+            current_arm_qpos=np.zeros(7),
+            run_generation=3,
+        )
+
+        self.assertEqual(result.code, GateRejectCode.ARM_DELTA_LIMIT)
+        self.assertEqual(
+            result.detail,
+            "arm per-tick delta limit violation "
+            "(rad; reference=measured_feedback; tolerance=1.000e-12; "
+            "max_abs_delta=0.125 at j0): "
+            "j0: reference=0, target=0.125, delta=+0.125, "
+            "abs_delta=0.125, limit=0.10000000000000001, excess=+2.500e-02, "
+            "j1: reference=0, target=0.125, delta=+0.125, "
+            "abs_delta=0.125, limit=0.10000000000000001, excess=+2.500e-02, "
+            "j2: reference=0, target=0.125, delta=+0.125, "
+            "abs_delta=0.125, limit=0.10000000000000001, excess=+2.500e-02, "
+            "j3: reference=0, target=0.125, delta=+0.125, "
+            "abs_delta=0.125, limit=0.10000000000000001, excess=+2.500e-02, "
+            "j4: reference=0, target=0.125, delta=+0.125, "
+            "abs_delta=0.125, limit=0.10000000000000001, excess=+2.500e-02, "
+            "j5: reference=0, target=0.125, delta=+0.125, "
+            "abs_delta=0.125, limit=0.10000000000000001, excess=+2.500e-02, "
+            "j6: reference=0, target=0.125, delta=+0.125, "
+            "abs_delta=0.125, limit=0.10000000000000001, excess=+2.500e-02",
+        )
+
     def test_producer_clipped_hand_endpoint_survives_ulp_roundoff(self) -> None:
         previous = np.full(12, 0.3)
         clipped = limit_hand_target_delta(np.full(12, 1.0), previous, 0.3)
