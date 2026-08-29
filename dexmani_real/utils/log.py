@@ -81,8 +81,10 @@ def write_json_receipt(directory: str | Path, payload: str) -> Path:
     receipt_dir.mkdir(parents=True, exist_ok=True)
     if not receipt_dir.is_dir():
         raise OSError(f"receipt path is not a directory: {receipt_dir}")
+    execution_mode = parsed.get("execution_mode", "execute")
+    receipt_prefix = "task_execute" if execution_mode == "task" else "h4_execute"
     destination = receipt_dir / (
-        f"h4_execute_{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex}.json"
+        f"{receipt_prefix}_{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex}.json"
     )
     temporary_path: Path | None = None
     try:
@@ -90,7 +92,7 @@ def write_json_receipt(directory: str | Path, payload: str) -> Path:
             mode="w",
             encoding="utf-8",
             dir=receipt_dir,
-            prefix=".h4_receipt_",
+            prefix=f".{receipt_prefix}_receipt_",
             suffix=".tmp",
             delete=False,
         ) as stream:

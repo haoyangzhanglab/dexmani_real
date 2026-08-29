@@ -5,8 +5,8 @@ request flags the coordinator and supervisor already consume (``start_request``,
 ``stop_request``, ``quit_requested``, ``estop_request``). When a caller owns a
 home lifecycle, H orchestrates a collision-checked return-home — stop the run
 if RUNNING, hand home, then arm home — using a Main-process planner that mirrors
-the replay collision setup (hand-dof + table + static boxes). Policy deployment
-does not provide that lifecycle, so it disables H explicitly. The keyboard owns
+the replay collision setup (hand-dof + table + static boxes). Physical policy
+profiles supply that lifecycle; shadow keeps H disabled. The keyboard owns
 the emergency-stop latch:
 ESC (or a dead listener) sets ``estop_request`` regardless of thread state, so
 e-stop never depends on this loop being scheduled.
@@ -163,12 +163,11 @@ def run_operator_control(
 
     B -> ``start_request``, S -> ``stop_request``, Q -> ``quit_requested``,
     ESC -> ``estop_request``. H is enabled only when a caller supplies a home
-    planner; policy deployment passes ``None`` and therefore never emits a home
-    command in either shadow or H4 execute. The thread exits when *stop_event*
+    planner. The thread exits when *stop_event*
     is set, when the runtime stops, or after a terminal Q/ESC.
     """
-    if execution_mode not in {"shadow", "execute"}:
-        raise ValueError("execution_mode must be 'shadow' or 'execute'")
+    if execution_mode not in {"shadow", "execute", "task"}:
+        raise ValueError("execution_mode must be 'shadow', 'execute', or 'task'")
     keyboard = KeyboardHandler(
         estop_callback=lambda: setattr(shared.estop_request, "value", True)
     )

@@ -274,6 +274,44 @@ def execute_run_receipt_json(
     """Render the bounded H4 execute receipt without hiding physical writes."""
     if isinstance(max_published_endpoints, bool) or max_published_endpoints != 1:
         raise ValueError("H4 execute receipt requires exactly one publication bound")
+    return bounded_execute_run_receipt_json(
+        execution_mode="execute",
+        run_generation=run_generation,
+        reason=reason,
+        coupled_command_start_sequence=coupled_command_start_sequence,
+        coupled_command_end_sequence=coupled_command_end_sequence,
+        max_published_endpoints=max_published_endpoints,
+        acknowledgement_timeout_s=acknowledgement_timeout_s,
+        acknowledged_action_id=acknowledged_action_id,
+        completed=completed,
+        provenance_json=provenance_json,
+        metrics=metrics,
+    )
+
+
+def bounded_execute_run_receipt_json(
+    *,
+    execution_mode: str,
+    run_generation: int,
+    reason: str,
+    coupled_command_start_sequence: int,
+    coupled_command_end_sequence: int,
+    max_published_endpoints: int,
+    acknowledgement_timeout_s: float,
+    acknowledged_action_id: int | None,
+    completed: bool,
+    provenance_json: str | None = None,
+    metrics: Mapping[str, int | float],
+) -> str:
+    """Render one bounded physical-execution receipt."""
+    if execution_mode not in {"execute", "task"}:
+        raise ValueError("execution_mode must be 'execute' or 'task'")
+    if (
+        isinstance(max_published_endpoints, bool)
+        or not isinstance(max_published_endpoints, int)
+        or max_published_endpoints <= 0
+    ):
+        raise ValueError("max_published_endpoints must be a positive integer")
     if (
         isinstance(acknowledgement_timeout_s, bool)
         or not math.isfinite(float(acknowledgement_timeout_s))
@@ -314,6 +352,10 @@ def execute_run_receipt_json(
             int(value) if isinstance(value, int) else float(value)
         )
     writes = int(coupled_command_end_sequence) - int(coupled_command_start_sequence)
+    if completed and writes != max_published_endpoints:
+        raise ValueError(
+            "completed execute receipt requires exactly the bounded publication count"
+        )
     receipt = {
         "acknowledged_action_id": acknowledged_action_id,
         "acknowledgement_timeout_s": float(acknowledgement_timeout_s),
@@ -321,7 +363,7 @@ def execute_run_receipt_json(
         "coupled_command_end_sequence": int(coupled_command_end_sequence),
         "coupled_command_start_sequence": int(coupled_command_start_sequence),
         "coupled_command_writes": writes,
-        "execution_mode": "execute",
+        "execution_mode": execution_mode,
         "max_published_endpoints": int(max_published_endpoints),
         "metrics": normalized_metrics,
         "outcome": "completed" if completed else "not_completed",

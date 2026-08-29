@@ -26,6 +26,7 @@ from dexmani_real.deployment.config import (
     DeploymentConfig,
     H4ExecuteBounds,
     PolicyRuntimeConfig,
+    TaskExecuteBounds,
     resolve_policy_runtime_config,
 )
 from dexmani_real.deployment.contracts import PolicyPrediction
@@ -238,6 +239,32 @@ class DeploymentPreflightTest(unittest.TestCase):
                 execution_mode="execute",
                 hand_acknowledged=False,
                 h4_execute_bounds=bounds,
+            )
+
+    def test_task_execute_is_a_separate_multi_endpoint_profile(self):
+        runtime = resolve_runtime_config()
+        bounds = TaskExecuteBounds(
+            max_published_endpoints=320,
+            acknowledgement_timeout_s=2.0,
+            max_running_s=25.0,
+        )
+        config = PolicyRuntimeConfig(
+            deployment=DeploymentConfig(
+                runtime_target="tests:fake",
+                observation_fields="arm_qpos",
+                hand_enabled=True,
+            ),
+            control_dt_s=1.0 / float(runtime.policy.control_hz),
+            execution_mode="task",
+            hand_acknowledged=True,
+            task_execute_bounds=bounds,
+        )
+        self.assertIs(config.physical_execute_bounds, bounds)
+        with self.assertRaisesRegex(ValueError, "greater than 1"):
+            TaskExecuteBounds(
+                max_published_endpoints=1,
+                acknowledgement_timeout_s=2.0,
+                max_running_s=25.0,
             )
 
     def test_run_limit_is_validated_before_runtime_channels(self):
@@ -716,7 +743,11 @@ class DeploymentPreflightTest(unittest.TestCase):
     def test_adapter_uses_complete_future_pred_action_interval(self):
         with tempfile.TemporaryDirectory() as directory:
             root = _write_experiment(Path(directory) / "experiment")
-            runtime_config = self._projection(root).runtime
+            runtime_config = resolve_policy_runtime_config(
+                artifact=resolve_policy_artifact(root),
+                runtime_config=resolve_runtime_config(),
+                inference_seed=1066,
+            ).runtime
             allocation = runtime_config.artifact.allocation_contract
             runtime = DexManiPolicyRuntime(runtime_config)
             runtime._manifest = DeploymentManifest(
@@ -753,6 +784,7 @@ class DeploymentPreflightTest(unittest.TestCase):
                 }
             )
 
+            self.assertEqual(runtime_config.inference_seed, 1066)
             prediction = runtime.predict(
                 preflight_module._fake_observation(runtime_config)
             )
@@ -1046,6 +1078,63 @@ if loaded:
             )
 
         self.assertEqual(code, 0)
+
+    def test_cli_task_forwards_distinct_bounds_and_seed(self):
+        import runpy
+
+        namespace = runpy.run_path(
+            str(Path(__file__).resolve().parents[1] / "examples/run_policy.py")
+        )
+        main = namespace["main"]
+        module_globals = main.__globals__
+        artifact = SimpleNamespace(checkpoint_sha256_from_index="a" * 64)
+        runtime = object()
+        projection = SimpleNamespace(runtime=object())
+        module_globals["resolve_policy_artifact"] = lambda _path: artifact
+        module_globals["resolve_runtime_config"] = lambda *, yaml_path: runtime
+
+        def resolve_projection(**kwargs):
+            self.assertEqual(kwargs["execution_mode"], "task")
+            self.assertEqual(kwargs["inference_seed"], 1066)
+            self.assertIsNone(kwargs["h4_execute_bounds"])
+            bounds = kwargs["task_execute_bounds"]
+            self.assertEqual(bounds.max_published_endpoints, 320)
+            self.assertEqual(bounds.acknowledgement_timeout_s, 2.0)
+            self.assertEqual(bounds.max_running_s, 25.0)
+            return projection
+
+        module_globals["resolve_policy_runtime_config"] = resolve_projection
+        module_globals["resolve_real_source_identity"] = lambda: SimpleNamespace(
+            availability="available", dirty="false"
+        )
+        lifecycle = ModuleType("dexmani_real.deployment.lifecycle")
+        lifecycle.run_policy_deployment = Mock(return_value=0)
+        with patch.dict(
+            sys.modules,
+            {"dexmani_real.deployment.lifecycle": lifecycle},
+        ):
+            code = main(
+                [
+                    "--experiment-dir",
+                    "synthetic",
+                    "--execution-mode",
+                    "task",
+                    "--hand",
+                    "--inference-seed",
+                    "1066",
+                    "--max-running-seconds",
+                    "25",
+                    "--task-max-published-endpoints",
+                    "320",
+                    "--task-ack-timeout-seconds",
+                    "2",
+                    "--task-expected-checkpoint-sha256",
+                    "a" * 64,
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        lifecycle.run_policy_deployment.assert_called_once()
 
     def test_cli_rejects_execute_and_removed_legacy_parameters(self):
         import runpy

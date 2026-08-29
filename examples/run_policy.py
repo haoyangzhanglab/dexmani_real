@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Resolve one hash-bound DexMani Policy artifact and run a bounded policy lifecycle.
 
-``shadow`` is the default operational mode. ``execute`` is a deliberately
-one-publication H4 profile that needs explicit bounds and separate hardware
-authorization; this entry point never grants that authorization itself.
+``shadow`` is the default operational mode. ``execute`` remains the deliberately
+one-publication H4 profile. ``task`` is a separate bounded full-episode profile.
+Both physical profiles need independent review and hardware authorization; this
+entry point never grants that authorization itself.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.deployment.artifact import resolve_policy_artifact
 from dexmani_real.deployment.config import (
     H4ExecuteBounds,
+    TaskExecuteBounds,
     resolve_policy_runtime_config,
 )
 from dexmani_real.deployment.run_identity import (
@@ -54,6 +56,29 @@ def _one_positive_endpoint(raw: str) -> int:
     return value
 
 
+def _multiple_positive_endpoints(raw: str) -> int:
+    """Parse a bounded task publication count without widening H4."""
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer greater than 1") from exc
+    if value <= 1:
+        raise argparse.ArgumentTypeError("must be an integer greater than 1")
+    return value
+
+
+def _inference_seed(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "must be an integer in [0, 2**31 - 1]"
+        ) from exc
+    if not 0 <= value <= 2**31 - 1:
+        raise argparse.ArgumentTypeError("must be an integer in [0, 2**31 - 1]")
+    return value
+
+
 def _sha256_hex(raw: str) -> str:
     """Parse one immutable H4 checkpoint digest."""
     value = raw.lower()
@@ -64,7 +89,7 @@ def _sha256_hex(raw: str) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Resolve, preflight, shadow-validate, or bounded-H4 execute one DexMani Policy experiment"
+        description="Resolve, preflight, shadow-validate, H4-test, or run one bounded DexMani Policy task"
     )
     parser.add_argument(
         "--experiment-dir",
@@ -83,13 +108,19 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", default=None, help="operator inference device")
     parser.add_argument(
+        "--inference-seed",
+        type=_inference_seed,
+        default=None,
+        help="Real-owned deterministic diffusion seed (set explicitly for receipts)",
+    )
+    parser.add_argument(
         "--hand",
         action="store_true",
         help="acknowledge XHand control required for hand startup/reset and H4 execute",
     )
     parser.add_argument(
         "--execution-mode",
-        choices=("shadow", "execute"),
+        choices=("shadow", "execute", "task"),
         default="shadow",
         help="shadow validates policy endpoints without actuator publication",
     )
@@ -120,6 +151,24 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="required immutable H4 checkpoint SHA-256 from the approved reference",
     )
+    parser.add_argument(
+        "--task-max-published-endpoints",
+        type=_multiple_positive_endpoints,
+        default=None,
+        help="required bounded full-episode coupled-publication count",
+    )
+    parser.add_argument(
+        "--task-ack-timeout-seconds",
+        type=_positive_finite_seconds,
+        default=None,
+        help="required per-endpoint arm+hand acknowledgement deadline",
+    )
+    parser.add_argument(
+        "--task-expected-checkpoint-sha256",
+        type=_sha256_hex,
+        default=None,
+        help="required immutable task checkpoint SHA-256",
+    )
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument(
         "--print-config",
@@ -138,20 +187,35 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     h4_execute_bounds = None
+    task_execute_bounds = None
+    execute_args_present = any(
+        value is not None
+        for value in (
+            args.execute_max_published_endpoints,
+            args.execute_ack_timeout_seconds,
+            args.execute_expected_checkpoint_sha256,
+        )
+    )
+    task_args_present = any(
+        value is not None
+        for value in (
+            args.task_max_published_endpoints,
+            args.task_ack_timeout_seconds,
+            args.task_expected_checkpoint_sha256,
+        )
+    )
     if args.execution_mode == "shadow":
-        if (
-            args.execute_max_published_endpoints is not None
-            or args.execute_ack_timeout_seconds is not None
-            or args.execute_expected_checkpoint_sha256 is not None
-        ):
-            parser.error("--execute-* bounds require --execution-mode execute")
+        if execute_args_present or task_args_present:
+            parser.error("physical execution bounds require a physical execution mode")
         if args.max_running_seconds is not None and (
             args.print_config or args.preflight_only
         ):
             parser.error(
                 "--max-running-seconds is only valid for an operational shadow lifecycle"
             )
-    else:
+    elif args.execution_mode == "execute":
+        if task_args_present:
+            parser.error("--task-* bounds require --execution-mode task")
         if not args.hand:
             parser.error("H4 execute requires explicit --hand acknowledgement")
         if args.max_running_seconds is None:
@@ -170,6 +234,27 @@ def main(argv: list[str] | None = None) -> int:
             )
         except (TypeError, ValueError) as exc:
             parser.error(f"invalid H4 execute bounds: {exc}")
+    else:
+        if execute_args_present:
+            parser.error("--execute-* bounds require --execution-mode execute")
+        if not args.hand:
+            parser.error("task execute requires explicit --hand acknowledgement")
+        if args.max_running_seconds is None:
+            parser.error("task execute requires --max-running-seconds")
+        if args.task_max_published_endpoints is None:
+            parser.error("task execute requires --task-max-published-endpoints")
+        if args.task_ack_timeout_seconds is None:
+            parser.error("task execute requires --task-ack-timeout-seconds")
+        if args.task_expected_checkpoint_sha256 is None:
+            parser.error("task execute requires --task-expected-checkpoint-sha256")
+        try:
+            task_execute_bounds = TaskExecuteBounds(
+                max_published_endpoints=args.task_max_published_endpoints,
+                acknowledgement_timeout_s=args.task_ack_timeout_seconds,
+                max_running_s=args.max_running_seconds,
+            )
+        except (TypeError, ValueError) as exc:
+            parser.error(f"invalid task execute bounds: {exc}")
     try:
         artifact = resolve_policy_artifact(args.experiment_dir)
         runtime = resolve_runtime_config(yaml_path=args.config)
@@ -178,9 +263,11 @@ def main(argv: list[str] | None = None) -> int:
             runtime_config=runtime,
             yaml_path=args.deployment_config,
             device=args.device,
+            inference_seed=args.inference_seed,
             execution_mode=args.execution_mode,
             hand_acknowledged=args.hand,
             h4_execute_bounds=h4_execute_bounds,
+            task_execute_bounds=task_execute_bounds,
         )
     except (
         KeyError,
@@ -192,14 +279,21 @@ def main(argv: list[str] | None = None) -> int:
     ) as exc:
         parser.error(f"invalid deployment receipt/config: {exc}")
 
-    if (
-        args.execution_mode == "execute"
-        and artifact.checkpoint_sha256_from_index
-        != args.execute_expected_checkpoint_sha256
+    expected_checkpoint_sha256 = (
+        args.execute_expected_checkpoint_sha256
+        if args.execution_mode == "execute"
+        else (
+            args.task_expected_checkpoint_sha256
+            if args.execution_mode == "task"
+            else None
+        )
+    )
+    if expected_checkpoint_sha256 is not None and (
+        artifact.checkpoint_sha256_from_index != expected_checkpoint_sha256
     ):
         parser.error(
             "selected checkpoint SHA-256 does not match "
-            "--execute-expected-checkpoint-sha256"
+            "the expected physical-execution checkpoint SHA-256"
         )
 
     real_source = resolve_real_source_identity()
@@ -234,25 +328,29 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
-    if args.execution_mode == "execute" and (
+    if args.execution_mode in {"execute", "task"} and (
         real_source.availability != "available" or real_source.dirty != "false"
     ):
-        parser.error("H4 execute requires a clean, identifiable DexMani Real revision")
+        parser.error(
+            "physical execute requires a clean, identifiable DexMani Real revision"
+        )
     # Deliberately lazy: receipt/preflight modes above must remain isolated
     # from lifecycle, camera, robot, and hardware-owning imports.
     from dexmani_real.deployment.lifecycle import run_policy_deployment
 
-    lifecycle_kwargs: dict[str, object] = {
-        "max_running_s": (
-            args.max_running_seconds if args.execution_mode == "shadow" else None
+    if args.execution_mode == "shadow":
+        return run_policy_deployment(
+            runtime,
+            projection.runtime,
+            max_running_s=args.max_running_seconds,
         )
-    }
-    if args.execution_mode == "execute":
-        lifecycle_kwargs["real_source"] = real_source
-        lifecycle_kwargs["invocation_argv"] = tuple(
-            sys.argv if argv is None else [sys.argv[0], *argv]
-        )
-    return run_policy_deployment(runtime, projection.runtime, **lifecycle_kwargs)
+    return run_policy_deployment(
+        runtime,
+        projection.runtime,
+        max_running_s=None,
+        real_source=real_source,
+        invocation_argv=tuple(sys.argv if argv is None else [sys.argv[0], *argv]),
+    )
 
 
 if __name__ == "__main__":

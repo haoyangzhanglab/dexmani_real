@@ -9,6 +9,7 @@ from pathlib import Path
 
 from dexmani_real.deployment.metrics import (
     Metrics,
+    bounded_execute_run_receipt_json,
     execute_run_receipt_json,
     shadow_run_receipt_json,
 )
@@ -139,6 +140,49 @@ class DeploymentMetricsTest(unittest.TestCase):
                 acknowledgement_timeout_s=2.0,
                 acknowledged_action_id=None,
                 completed=False,
+                metrics={},
+            )
+
+    def test_task_receipt_exposes_multiple_acknowledged_publications(self) -> None:
+        receipt = json.loads(
+            bounded_execute_run_receipt_json(
+                execution_mode="task",
+                run_generation=9,
+                reason="task publication bound reached",
+                coupled_command_start_sequence=4,
+                coupled_command_end_sequence=324,
+                max_published_endpoints=320,
+                acknowledgement_timeout_s=2.0,
+                acknowledged_action_id=320,
+                completed=True,
+                metrics={"execute_acknowledged": 320},
+            )
+        )
+
+        self.assertEqual(receipt["execution_mode"], "task")
+        self.assertEqual(receipt["coupled_command_writes"], 320)
+        self.assertTrue(receipt["within_publication_bound"])
+        self.assertTrue(receipt["completed"])
+
+    def test_task_receipt_uses_a_distinct_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_json_receipt(
+                directory, '{"execution_mode":"task","outcome":"completed"}'
+            )
+            self.assertTrue(path.name.startswith("task_execute_"))
+
+    def test_task_receipt_cannot_claim_completion_below_its_bound(self) -> None:
+        with self.assertRaisesRegex(ValueError, "bounded publication count"):
+            bounded_execute_run_receipt_json(
+                execution_mode="task",
+                run_generation=9,
+                reason="incorrect completion",
+                coupled_command_start_sequence=4,
+                coupled_command_end_sequence=5,
+                max_published_endpoints=2,
+                acknowledgement_timeout_s=2.0,
+                acknowledged_action_id=1,
+                completed=True,
                 metrics={},
             )
 

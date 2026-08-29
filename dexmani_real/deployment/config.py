@@ -66,6 +66,7 @@ _ARTIFACT_OWNED_FIELDS = frozenset(
 )
 _REAL_OWNED_DEPLOYMENT_FIELDS = frozenset(
     {
+        "inference_seed",
         "inference_hz",
         "max_input_age_s",
         "max_observation_skew_s",
@@ -100,6 +101,9 @@ class DeploymentConfig:
     # Operator-declared action contract; validated against the checkpoint's
     # train_params at load time (mismatch fails closed, never coerces).
     action_key: str = "action"
+    # Seeds model construction and the subsequent diffusion RNG stream once in
+    # the inference worker, matching the Policy evaluation convention.
+    inference_seed: int = 0
     inference_hz: float = 10.0
     observation_horizon: int = 2
     max_input_age_s: float = 0.15
@@ -119,6 +123,12 @@ class DeploymentConfig:
     pointcloud_num_points: int = 1024
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.inference_seed, bool)
+            or not isinstance(self.inference_seed, int)
+            or not 0 <= self.inference_seed <= 2**31 - 1
+        ):
+            raise ValueError("inference_seed must be an integer in [0, 2**31 - 1]")
         if (
             isinstance(self.observation_horizon, bool)
             or not isinstance(self.observation_horizon, int)
@@ -189,6 +199,41 @@ class H4ExecuteBounds:
 
 
 @dataclass(frozen=True)
+class TaskExecuteBounds:
+    """Explicit bounds for one independently reviewed full policy episode.
+
+    This profile is intentionally separate from H4: it permits more than one
+    acknowledged coupled endpoint, but remains bounded by both endpoint count
+    and B-relative wall time.
+    """
+
+    max_published_endpoints: int
+    acknowledgement_timeout_s: float
+    max_running_s: float
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_published_endpoints, bool)
+            or not isinstance(self.max_published_endpoints, int)
+            or self.max_published_endpoints <= 1
+        ):
+            raise ValueError(
+                "task execute requires max_published_endpoints greater than 1"
+            )
+        for name in ("acknowledgement_timeout_s", "max_running_s"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be finite and positive")
+        if self.acknowledgement_timeout_s > self.max_running_s:
+            raise ValueError("acknowledgement_timeout_s must not exceed max_running_s")
+
+
+@dataclass(frozen=True)
 class PolicyRuntimeConfig:
     """Deployment config plus resolved sensor semantics visible to the model.
 
@@ -214,22 +259,42 @@ class PolicyRuntimeConfig:
     execution_mode: str = "shadow"
     hand_acknowledged: bool = False
     h4_execute_bounds: H4ExecuteBounds | None = None
+    task_execute_bounds: TaskExecuteBounds | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.deployment, DeploymentConfig):
             raise TypeError("deployment must be a DeploymentConfig")
-        if self.execution_mode not in {"shadow", "execute"}:
-            raise ValueError("execution_mode must be 'shadow' or 'execute'")
+        if self.execution_mode not in {"shadow", "execute", "task"}:
+            raise ValueError("execution_mode must be 'shadow', 'execute', or 'task'")
         if not isinstance(self.hand_acknowledged, bool):
             raise TypeError("hand_acknowledged must be a boolean")
         if self.execution_mode == "execute" and self.h4_execute_bounds is None:
             raise ValueError("execute requires explicit H4 execute bounds")
+        if self.h4_execute_bounds is not None and not isinstance(
+            self.h4_execute_bounds, H4ExecuteBounds
+        ):
+            raise TypeError("h4_execute_bounds must be H4ExecuteBounds or None")
         if self.execution_mode == "shadow" and self.h4_execute_bounds is not None:
             raise ValueError("shadow must not carry H4 execute bounds")
-        if self.execution_mode == "execute" and not self.deployment.hand_enabled:
-            raise ValueError("H4 execute requires a hand-enabled artifact")
-        if self.execution_mode == "execute" and not self.hand_acknowledged:
-            raise ValueError("H4 execute requires explicit --hand acknowledgement")
+        if self.execution_mode != "execute" and self.h4_execute_bounds is not None:
+            raise ValueError("only H4 execute may carry H4 execute bounds")
+        if self.execution_mode == "task" and self.task_execute_bounds is None:
+            raise ValueError("task execute requires explicit task execute bounds")
+        if self.task_execute_bounds is not None and not isinstance(
+            self.task_execute_bounds, TaskExecuteBounds
+        ):
+            raise TypeError("task_execute_bounds must be TaskExecuteBounds or None")
+        if self.execution_mode != "task" and self.task_execute_bounds is not None:
+            raise ValueError("only task execute may carry task execute bounds")
+        if (
+            self.execution_mode in {"execute", "task"}
+            and not self.deployment.hand_enabled
+        ):
+            raise ValueError("physical execute requires a hand-enabled artifact")
+        if self.execution_mode in {"execute", "task"} and not self.hand_acknowledged:
+            raise ValueError(
+                "physical execute requires explicit --hand acknowledgement"
+            )
         if self.artifact is not None:
             if not isinstance(self.artifact, ResolvedPolicyArtifact):
                 raise TypeError("artifact must be a ResolvedPolicyArtifact")
@@ -293,6 +358,14 @@ class PolicyRuntimeConfig:
         except AttributeError as exc:
             raise AttributeError(name) from exc
         return getattr(deployment, name)
+
+    @property
+    def physical_execute_bounds(self) -> H4ExecuteBounds | TaskExecuteBounds | None:
+        if self.execution_mode == "execute":
+            return self.h4_execute_bounds
+        if self.execution_mode == "task":
+            return self.task_execute_bounds
+        return None
 
 
 DEFAULT_DEPLOYMENT_CONFIG = DeploymentConfig()
@@ -441,9 +514,11 @@ def resolve_policy_runtime_config(
     yaml_path: str | Path | None = None,
     data: Mapping[str, Any] | None = None,
     device: str | None = None,
+    inference_seed: int | None = None,
     execution_mode: str = "shadow",
     hand_acknowledged: bool = False,
     h4_execute_bounds: H4ExecuteBounds | None = None,
+    task_execute_bounds: TaskExecuteBounds | None = None,
 ) -> ResolvedPolicyRuntimeConfig:
     """Project one immutable preflight config from an artifact and Real config.
 
@@ -516,6 +591,8 @@ def resolve_policy_runtime_config(
             )
     if device is not None:
         merged = _merge(DeploymentConfig(**merged), {"device": device})
+    if inference_seed is not None:
+        merged = _merge(DeploymentConfig(**merged), {"inference_seed": inference_seed})
     deployment = DeploymentConfig(**merged)
 
     control_dt_s = 1.0 / float(runtime_config.policy.control_hz)
@@ -556,6 +633,7 @@ def resolve_policy_runtime_config(
         execution_mode=execution_mode,
         hand_acknowledged=hand_acknowledged,
         h4_execute_bounds=h4_execute_bounds,
+        task_execute_bounds=task_execute_bounds,
     )
     canonical = {
         "artifact": {
@@ -597,6 +675,15 @@ def resolve_policy_runtime_config(
                 "max_published_endpoints": runtime.h4_execute_bounds.max_published_endpoints,
                 "acknowledgement_timeout_s": runtime.h4_execute_bounds.acknowledgement_timeout_s,
                 "max_running_s": runtime.h4_execute_bounds.max_running_s,
+            }
+        ),
+        "task_execute_bounds": (
+            None
+            if runtime.task_execute_bounds is None
+            else {
+                "max_published_endpoints": runtime.task_execute_bounds.max_published_endpoints,
+                "acknowledgement_timeout_s": runtime.task_execute_bounds.acknowledgement_timeout_s,
+                "max_running_s": runtime.task_execute_bounds.max_running_s,
             }
         ),
     }

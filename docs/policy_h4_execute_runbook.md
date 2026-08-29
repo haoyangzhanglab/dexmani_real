@@ -1,9 +1,9 @@
 # H4 首次物理 coupled execute Runbook
 
-> 状态：**暂停。** Real-owned checkpoint decoder/restore 的 R0–R3 已完成离线验证，且当前
-> revision 的 H2/H3 zero-write shadow evidence 已建立。本文保留首次 H4 的审核与现场流程，
-> 但不是启动授权。没有独立的 H4 review 与明确、限定的 H4 真机授权，任何人不得运行 execute
-> lifecycle。
+> 状态：**暂停。** 既有 H2/H3/H4 receipt 是历史证据；新增 deterministic inference seed、
+> canonical arm-home start gate 与 H lifecycle 后，必须在新的干净 revision 上重跑离线检查与
+> H2/H3 shadow。本文不是启动授权。没有独立 review 与明确、限定的 H4 真机授权，任何人不得
+> 运行 execute lifecycle。
 
 ## 1. 目标与范围
 
@@ -23,6 +23,9 @@ shadow 证据解释成 execute 授权。
 - `--execute-ack-timeout-seconds <finite positive>`；
 - `--execute-expected-checkpoint-sha256 <64-hex>` 必须等于本次批准的 frozen
   reference；dirty 或无法识别的 Real source revision 会在连接硬件前被拒绝；
+- B 前必须由操作员按 H，先确认 XHand home command accepted，再完成 collision-checked
+  canonical arm home；coordinator 会用 fresh arm feedback 复核 home tolerance，不满足则忽略 B；
+- XHand 仍不要求关节落入 home tolerance，只要求 home command 被接受；
 - `--max-running-seconds <finite positive>`，其值被冻结进 H4 runtime receipt；
 - B 后 coordinator 最多写一条 complete coupled arm+hand record，随后停止调度；
 - 一个 execute lifecycle 只接受第一次 B；即使 supervisor 尚未观察到 ARMED，后续 B 也会被
@@ -44,17 +47,16 @@ shadow 证据解释成 execute 授权。
 | Gate | 需要的证据 | 失败处理 |
 |---|---|---|
 | reference identity | checkpoint SHA-256 与 [当前 H2/H3 reference artifact](deployment_reference_h2h3_shadow_2026-08-29_c9c3454.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
-| H2/H3 baseline | current `c9c3454` receipt：1912/1912 validated、zero coupled writes、120.007 s clean stop | 停止，先恢复 shadow evidence |
-| execute enablement diff | H4 仅增加 immutable CLI/lifecycle bounds、one-publication coordinator 和双 worker receipt；不改变 action、normalizer、SafetyGate、worker limit、collision、freshness 或 generation 语义 | 拒绝额外语义改动 |
+| H2/H3 baseline | 新 arm-home/seed revision 的 120 s shadow receipt；旧 `c9c3454` receipt 只用于回归对比 | 停止，先恢复 shadow evidence |
+| execute enablement diff | H4 保持 one-publication 与原 SafetyGate/worker limits；新增 seed receipt、H home 和 B 前 canonical arm-home gate，不修改 normalizer、collision、freshness 或 generation 语义 | 任一未解释差异都停止 |
 | bounded execute guard | execute 的 publication bound 固定为 `1`；ack timeout 与 B-relative duration 均为有限正值，并写入 coordinator receipt | 不允许用无界 execute 替代 |
 | offline publication | fake ring 的 full validation 成功只写一条 coherent arm+hand record；gate 后 generation 变化不得写入 | 停止并修复 |
 | fault paths | 预期覆盖 stop/e-stop、generation revoke、worker ack 超时、feedback stale、hand preflight reject、collision checker exception、publication failure | 任一路径不 fail-closed 即停止 |
 | static checks | focused 与全量离线 tests、`compileall`、Black、isort、`git diff --check` 均通过 | 修复后重跑 |
 
-H4 software guard 的 fake-ring、coordinator acknowledgement/timeout、CLI/lifecycle 与 receipt
-覆盖，在 Real-owned decoder/strict restore 重构后已重新通过全量 212 项离线测试，以及同一 frozen
-reference 的 `--print-config` / `--preflight-only`。当前 H2/H3 receipt 已恢复本节 shadow baseline；
-它不替代独立 H4 review、现场 checklist 或明确 H4 授权。
+H4 software guard 必须覆盖 fake-ring、arm-home start gate、coordinator acknowledgement/timeout、
+CLI/lifecycle 与 receipt，并对同一 frozen reference 重跑 `--print-config` / `--preflight-only`。
+离线通过不替代独立 H4 review、现场 checklist、更新后的 H2/H3 shadow 或明确 H4 授权。
 
 ## 4. 现场限定授权应包含的内容
 
@@ -62,7 +64,8 @@ reference 的 `--print-config` / `--preflight-only`。当前 H2/H3 receipt 已�
 
 - H4、frozen reference v2 SHA、`--hand`、free-space、**execute**；
 - 操作员负责确认场地无人、无物体、无障碍，e-stop 就绪，并在 ARMED 后按 B；
-- B 前只允许既有的一次 XHand `reset_home`；不要求手指到达 home 容差；
+- B 前允许启动时 XHand `reset_home` 和操作员按 H 触发的 home command；不要求手指到达
+  home 容差。H 同时执行 collision-checked arm home；
 - 最大物理 publication 数、最大 B-relative 运行时长、是否允许 one run；
 - 操作员随时按 STOP/S，任何异常立即 e-stop；
 - 禁止自动升级为 H5、接触、抓取或重复运行。
@@ -80,8 +83,10 @@ reference 的 `--print-config` / `--preflight-only`。当前 H2/H3 receipt 已�
    fault 均取消本次 H4。
 4. 清空机械臂与手指潜在 sweep 空间；移除物体；人员退出；e-stop 可立即触及。
 5. 操作员明确读回本次 publication/duration 上限与 STOP/e-stop 职责。
-6. 系统 ARMED 后，确认日志显示 startup `reset_home` 已下发；不等待或判断 home tolerance。
-7. 仅由操作员按 B。实施者不代按 B，也不自动 begin。
+6. 系统 ARMED 后，确认日志显示 startup `reset_home` 已下发；由操作员按 H，等待 hand home
+   command accepted 与 arm canonical home 流程完成。只检查 arm home tolerance，不判断 hand
+   home tolerance。
+7. 仍处于 ARMED 且场地条件未变化时，仅由操作员按 B。实施者不代按 B，也不自动 begin。
 
 ## 6. 运行期间的停止规则
 

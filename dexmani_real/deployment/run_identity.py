@@ -147,6 +147,7 @@ def canonical_run_receipt_json(
             "projection_sha256": projection.sha256,
             "fixed_runtime_target": FIXED_POLICY_RUNTIME_TARGET,
             "device": projection.runtime.device,
+            "inference_seed": projection.runtime.inference_seed,
             "execution_mode": projection.runtime.execution_mode,
             "hand_acknowledged": projection.runtime.hand_acknowledged,
             "h4_execute_bounds": (
@@ -160,6 +161,21 @@ def canonical_run_receipt_json(
                         projection.runtime.h4_execute_bounds.acknowledgement_timeout_s
                     ),
                     "max_running_s": projection.runtime.h4_execute_bounds.max_running_s,
+                }
+            ),
+            "task_execute_bounds": (
+                None
+                if projection.runtime.task_execute_bounds is None
+                else {
+                    "max_published_endpoints": (
+                        projection.runtime.task_execute_bounds.max_published_endpoints
+                    ),
+                    "acknowledgement_timeout_s": (
+                        projection.runtime.task_execute_bounds.acknowledgement_timeout_s
+                    ),
+                    "max_running_s": (
+                        projection.runtime.task_execute_bounds.max_running_s
+                    ),
                 }
             ),
         },

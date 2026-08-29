@@ -475,6 +475,10 @@ class DexManiPolicyRuntime:
         # path and could overwrite the checkpoint-owned artifact.
         if OmegaConf.select(cfg, "agent.codebook_path") is not None:
             OmegaConf.update(cfg, "agent.codebook_path", None)
+        # Match the Policy evaluation convention: initialize one reproducible
+        # RNG stream before model construction, then let successive diffusion
+        # predictions advance that stream naturally.
+        torch.manual_seed(int(self.config.inference_seed))
         agent = hydra.utils.instantiate(cfg.agent)
         agent.action_key = cfg.action_key
 

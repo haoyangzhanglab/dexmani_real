@@ -166,7 +166,8 @@ python examples/collect_teleop.py --print-config
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 使用 raw episode 的精确已发送命令、配置和模型 provenance，预检后控制 xArm7/XHand；写 `replay_results/` |
 | 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取并校验 `data.h5` hash 后的原始 `float64` 已发送命令，继续执行完整配置/模型/几何预检；包含多个 source 连续段的产物拒绝物理回放 |
 | learned policy | `python examples/run_policy.py --experiment-dir <experiment> --print-config` 或 `--preflight-only` | Real-owned decoder/strict restore 已完成离线验证。连接硬件的 shadow 仍须使用干净、review 的 revision，并逐次取得新的 H2/H3 授权。当前方案见 [`dexmani_real_policy_deployment_refactor_plan.md`](docs/dexmani_real_policy_deployment_refactor_plan.md)。 |
-| H4 one-shot execute（暂停） | `examples/run_policy.py` | 旧 one-shot guard 保留，但必须先完成 loader closeout、重新建立 H2/H3 shadow evidence，并获得单次明确的 H4 真机授权；详见 [`policy_h4_execute_runbook.md`](docs/policy_h4_execute_runbook.md)。 |
+| H4 one-shot execute | `examples/run_policy.py --execution-mode execute ...` | bound 固定为 1；物理模式要求先按 H 完成 hand-command-accepted + canonical arm home，且须获得单次明确 H4 真机授权；详见 [`policy_h4_execute_runbook.md`](docs/policy_h4_execute_runbook.md)。 |
+| learned-policy 单次任务 rollout（未真机验证） | `examples/run_policy.py --execution-mode task ...` | 独立于 H4 的多 endpoint 有界执行；逐 endpoint 双 worker ACK、B 前 arm-home gate、确定性 seed 与 task receipt。必须先 review 并获得新的 task 真机授权；详见 [`policy_task_execute_runbook.md`](docs/policy_task_execute_runbook.md)。 |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |

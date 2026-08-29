@@ -23,6 +23,7 @@ from dexmani_real.deployment.config import (
     DeploymentConfig,
     H4ExecuteBounds,
     PolicyRuntimeConfig,
+    TaskExecuteBounds,
     resolve_deployment_config,
 )
 from dexmani_real.deployment.contracts import (
@@ -33,6 +34,7 @@ from dexmani_real.deployment.contracts import (
 from dexmani_real.deployment.coordinator import (
     CoordinatorConfig,
     _buffered_plan_from_record,
+    _physical_start_pose_rejection,
     _plan_deadline_ns,
     coordinator_loop,
 )
@@ -1594,6 +1596,59 @@ class DeploymentTimingTest(unittest.TestCase):
         planner.solve_teleop_ik.assert_called_once()
         self.assertEqual(shared.safety_state.value, int(SafetyState.RUNNING))
 
+    def test_physical_start_gate_requires_fresh_canonical_arm_home(self) -> None:
+        config = CoordinatorConfig(
+            deployment=DeploymentConfig(
+                runtime_target="tests:fake",
+                observation_fields="arm_qpos",
+                hand_enabled=True,
+            ),
+            arm_joint_lower_rad=tuple(np.full(7, -4.0)),
+            arm_joint_upper_rad=tuple(np.full(7, 4.0)),
+            workspace_bounds=((-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0)),
+            hand_joint_lower_rad=tuple(hand_defaults.qpos_min_rad),
+            hand_joint_upper_rad=tuple(hand_defaults.qpos_max_rad),
+            hand_mechanical_lower_rad=tuple(hand_defaults.mechanical_qpos_min_rad),
+            hand_mechanical_upper_rad=tuple(hand_defaults.mechanical_qpos_max_rad),
+            arm_feedback_max_age_s=0.5,
+            hand_feedback_max_age_s=0.5,
+            control_hz=100.0,
+            execution_mode="task",
+            task_execute_bounds=TaskExecuteBounds(
+                max_published_endpoints=2,
+                acknowledgement_timeout_s=1.0,
+                max_running_s=10.0,
+            ),
+            required_start_arm_qpos=tuple(np.zeros(7)),
+            start_arm_home_tolerance_rad=0.01,
+        )
+        feedback = {
+            "connected": True,
+            "error_code": 0,
+            "state_valid": True,
+            "source_monotonic_ns": 1_000_000_000,
+            "qpos": np.zeros(7),
+            "qvel": np.zeros(7),
+        }
+        with (
+            patch(
+                "dexmani_real.deployment.coordinator.read_arm_state_dict",
+                return_value=feedback,
+            ),
+            patch(
+                "dexmani_real.deployment.coordinator.time.monotonic_ns",
+                return_value=1_000_000_000,
+            ),
+        ):
+            self.assertIsNone(_physical_start_pose_rejection(object(), config))
+            feedback["qpos"] = np.array([0.0, 0.0, 0.02, 0.0, 0.0, 0.0, 0.0])
+            rejection = _physical_start_pose_rejection(object(), config)
+
+        assert rejection is not None
+        self.assertIn("press H before B", rejection)
+        self.assertIn("max_abs_delta_rad=0.020000000", rejection)
+        self.assertIn("tolerance_rad=0.010000000", rejection)
+
     def _run_single_endpoint_coordinator(
         self,
         result: CommandPublishResult,
@@ -1620,11 +1675,11 @@ class DeploymentTimingTest(unittest.TestCase):
         plan["observation_anchor_monotonic_ns"][0] = base_ns - 6
         plan["inference_started_monotonic_ns"][0] = base_ns - 4
         plan["inference_finished_monotonic_ns"][0] = base_ns - 2
-        plan["num_steps"][0] = 1
+        plan["num_steps"][0] = 2 if execution_mode == "task" else 1
         plan["arm_present"][0] = 1
         plan["hand_present"][0] = 1
-        plan["target_monotonic_ns"][0, 0] = base_ns
-        plan["valid_mask"][0, 0] = 1
+        plan["target_monotonic_ns"][0, :2] = (base_ns, base_ns + 1)
+        plan["valid_mask"][0, : (2 if execution_mode == "task" else 1)] = 1
 
         class _PlanRing:
             def read_latest(self):
@@ -1657,7 +1712,7 @@ class DeploymentTimingTest(unittest.TestCase):
                 runtime_target="tests:fake",
                 observation_fields="arm_qpos",
                 command_lead_s=1e-6,
-                hand_enabled=execution_mode == "execute",
+                hand_enabled=execution_mode in {"execute", "task"},
             ),
             arm_joint_lower_rad=tuple(np.full(7, -2.0)),
             arm_joint_upper_rad=tuple(np.full(7, 2.0)),
@@ -1679,6 +1734,21 @@ class DeploymentTimingTest(unittest.TestCase):
                 if execution_mode == "execute"
                 else None
             ),
+            task_execute_bounds=(
+                TaskExecuteBounds(
+                    max_published_endpoints=2,
+                    acknowledgement_timeout_s=h4_ack_timeout_s,
+                    max_running_s=10.0,
+                )
+                if execution_mode == "task"
+                else None
+            ),
+            required_start_arm_qpos=(
+                tuple(np.zeros(7)) if execution_mode in {"execute", "task"} else None
+            ),
+            start_arm_home_tolerance_rad=(
+                0.01 if execution_mode in {"execute", "task"} else None
+            ),
         )
         candidates: list[object] = []
         clock = _Clock(clock_values or (base_ns,) * 16)
@@ -1689,7 +1759,10 @@ class DeploymentTimingTest(unittest.TestCase):
             sleep_ticks += 1
             if sleep_ticks == 1 and stop_request_after_start is not None:
                 shared.stop_request.value = int(stop_request_after_start)
-            if execution_mode == "execute" and (
+            if execution_mode == "task" and coupled_cmd_ring.latest_sequence == 1:
+                clock._monotonic_ns_values = iter((base_ns + 1,) * 40)
+                clock._last_monotonic_ns = base_ns + 1
+            if execution_mode in {"execute", "task"} and (
                 shared.error_state.value
                 or (
                     sleep_ticks > 1
@@ -1700,14 +1773,14 @@ class DeploymentTimingTest(unittest.TestCase):
                     shared.start_request.value = 1
                     return
                 shared.is_running.value = 0
-            elif sleep_ticks >= (50 if execution_mode == "execute" else 3):
+            elif sleep_ticks >= (50 if execution_mode in {"execute", "task"} else 3):
                 shared.is_running.value = 0
 
         def publish_result(_shared, candidate, **_kwargs):
             candidates.append(candidate)
             if mutate_shadow_sequence:
                 coupled_cmd_ring.latest_sequence += 1
-            if execution_mode == "execute":
+            if execution_mode in {"execute", "task"}:
                 coupled_cmd_ring.latest_sequence += execute_sequence_delta
                 if stop_request_after_publication is not None:
                     shared.stop_request.value = int(stop_request_after_publication)
@@ -1738,7 +1811,14 @@ class DeploymentTimingTest(unittest.TestCase):
             ),
             patch(
                 "dexmani_real.deployment.coordinator.read_arm_state_dict",
-                return_value={"qpos": np.zeros(7)},
+                return_value={
+                    "connected": True,
+                    "error_code": 0,
+                    "state_valid": True,
+                    "source_monotonic_ns": base_ns,
+                    "qpos": np.zeros(7),
+                    "qvel": np.zeros(7),
+                },
             ),
             patch(
                 "dexmani_real.deployment.coordinator.validate_and_send_candidate",
@@ -1874,6 +1954,31 @@ class DeploymentTimingTest(unittest.TestCase):
             )
         )
         self.assertEqual(shared.execute_completed.value, 1)
+
+    def test_task_commits_each_endpoint_only_after_previous_dual_ack(self) -> None:
+        with self.assertLogs(
+            "dexmani_real.deployment.coordinator", level="INFO"
+        ) as logs:
+            shared, coupled_cmd_ring, candidates = (
+                self._run_single_endpoint_coordinator(
+                    CommandPublishResult(CommandPublishStatus.PUBLISHED),
+                    execution_mode="task",
+                    h4_acknowledgement=CommandPublishStatus.APPLIED,
+                )
+            )
+
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(coupled_cmd_ring.latest_sequence, 2)
+        self.assertEqual(shared.safety_state.value, int(SafetyState.ARMED))
+        self.assertEqual(shared.execute_completed.value, 1)
+        self.assertTrue(
+            any(
+                '"execution_mode":"task"' in message
+                and '"coupled_command_writes":2' in message
+                and '"execute_acknowledged":2' in message
+                for message in logs.output
+            )
+        )
 
     def test_h4_ack_timeout_latches_fault_without_another_publication(self) -> None:
         base_ns = 6_000_000_000
