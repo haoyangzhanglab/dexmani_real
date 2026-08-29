@@ -104,6 +104,12 @@ class DeploymentMetricsTest(unittest.TestCase):
                 acknowledgement_timeout_s=2.0,
                 acknowledged_action_id=41,
                 completed=True,
+                provenance_json=json.dumps(
+                    {
+                        "artifact": {"checkpoint_sha256": "a" * 64},
+                        "real_source": {"commit": "b" * 40, "dirty": "false"},
+                    }
+                ),
                 metrics={
                     "coupled_command_writes": 1,
                     "execute_acknowledged": 1,
@@ -117,6 +123,10 @@ class DeploymentMetricsTest(unittest.TestCase):
         self.assertEqual(receipt["acknowledged_action_id"], 41)
         self.assertTrue(receipt["completed"])
         self.assertEqual(receipt["outcome"], "completed")
+        self.assertEqual(
+            receipt["provenance"]["artifact"]["checkpoint_sha256"], "a" * 64
+        )
+        self.assertEqual(receipt["provenance"]["real_source"]["dirty"], "false")
 
     def test_execute_receipt_rejects_non_h4_bound(self) -> None:
         with self.assertRaisesRegex(ValueError, "exactly one"):

@@ -41,7 +41,7 @@ shadow 证据解释成 execute 授权。
 
 | Gate | 需要的证据 | 失败处理 |
 |---|---|---|
-| reference identity | checkpoint SHA-256 与 [H2/H3 reference artifact](deployment_reference_h2h3_shadow_2026-08-29.json) 均为 `b174bd…2484c` | 停止，不选取“最新” checkpoint |
+| reference identity | checkpoint SHA-256 与 [H2/H3 reference artifact](deployment_reference_h2h3_shadow_2026-08-29.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
 | H2/H3 baseline | time-bounded shadow receipt：1914/1914 validated、zero coupled writes、120.040 s clean stop | 停止，先恢复 shadow evidence |
 | execute enablement diff | H4 仅增加 immutable CLI/lifecycle bounds、one-publication coordinator 和双 worker receipt；不改变 action、normalizer、SafetyGate、worker limit、collision、freshness 或 generation 语义 | 拒绝额外语义改动 |
 | bounded execute guard | execute 的 publication bound 固定为 `1`；ack timeout 与 B-relative duration 均为有限正值，并写入 coordinator receipt | 不允许用无界 execute 替代 |
