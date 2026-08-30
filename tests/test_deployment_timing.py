@@ -1712,6 +1712,7 @@ class DeploymentTimingTest(unittest.TestCase):
             "qpos": np.zeros(7),
             "qvel": np.zeros(7),
         }
+        shared = SimpleNamespace(physical_home_completed=_Value(0))
         with (
             patch(
                 "dexmani_real.deployment.coordinator.read_arm_state_dict",
@@ -1722,9 +1723,14 @@ class DeploymentTimingTest(unittest.TestCase):
                 return_value=1_000_000_000,
             ),
         ):
-            self.assertIsNone(_physical_start_pose_rejection(object(), config))
+            rejection = _physical_start_pose_rejection(shared, config)
+            assert rejection is not None
+            self.assertIn("has not completed in this process", rejection)
+
+            shared.physical_home_completed.value = 1
+            self.assertIsNone(_physical_start_pose_rejection(shared, config))
             feedback["qpos"] = np.array([0.0, 0.0, 0.02, 0.0, 0.0, 0.0, 0.0])
-            rejection = _physical_start_pose_rejection(object(), config)
+            rejection = _physical_start_pose_rejection(shared, config)
 
         assert rejection is not None
         self.assertIn("press H before B", rejection)
@@ -1746,6 +1752,7 @@ class DeploymentTimingTest(unittest.TestCase):
         execute_sequence_delta: int = 1,
         stop_request_after_publication: StopRequest | None = None,
         clock_values: tuple[int, ...] | None = None,
+        physical_home_completed: bool = True,
     ) -> tuple[SimpleNamespace, SimpleNamespace, list[object]]:
         base_ns = 6_000_000_000
         plan = np.zeros(1, dtype=POLICY_PLAN_DTYPE)
@@ -1784,6 +1791,7 @@ class DeploymentTimingTest(unittest.TestCase):
             start_request=_Value(1),
             stop_request=_Value(0),
             execute_completed=_Value(0),
+            physical_home_completed=_Value(physical_home_completed),
             error_state=_Value(0),
             estop_request=_Value(0),
             set_heartbeat=Mock(),
@@ -2055,10 +2063,32 @@ class DeploymentTimingTest(unittest.TestCase):
             any(
                 '"coupled_command_writes":1' in message
                 and '"acknowledged_action_id":1' in message
+                and '"physical_home_completed":1' in message
                 for message in logs.output
             )
         )
         self.assertEqual(shared.execute_completed.value, 1)
+
+    def test_h4_ignores_b_until_physical_home_sequence_completed(self) -> None:
+        with self.assertLogs(
+            "dexmani_real.deployment.coordinator", level="WARNING"
+        ) as logs:
+            shared, coupled_cmd_ring, candidates = (
+                self._run_single_endpoint_coordinator(
+                    CommandPublishResult(CommandPublishStatus.PUBLISHED),
+                    execution_mode="execute",
+                    h4_acknowledgement=CommandPublishStatus.APPLIED,
+                    physical_home_completed=False,
+                )
+            )
+
+        self.assertEqual(candidates, [])
+        coupled_cmd_ring.write.assert_not_called()
+        self.assertEqual(shared.safety_state.value, int(SafetyState.ARMED))
+        self.assertEqual(shared.execute_completed.value, 0)
+        self.assertTrue(
+            any("home sequence has not completed" in message for message in logs.output)
+        )
 
     def test_task_commits_each_endpoint_only_after_previous_dual_ack(self) -> None:
         with self.assertLogs(

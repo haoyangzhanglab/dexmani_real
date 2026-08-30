@@ -68,6 +68,7 @@ HAND_POLICY_ENDPOINT_ROUNDOFF_CANONICALIZED = (
 )
 POLICY_ABORTS = "policy_aborts"
 COMMAND_SILENCE_ABORT = "command_silence_abort"
+PHYSICAL_HOME_COMPLETED = "physical_home_completed"
 
 _TIMING_SAMPLE_CAPACITY = 256
 _QUANTILE_POINTS = (("p50", 0.50), ("p95", 0.95), ("p99", 0.99))
@@ -109,6 +110,7 @@ _COUNTER_NAMES = frozenset(
         HAND_POLICY_ENDPOINT_ROUNDOFF_CANONICALIZED,
         POLICY_ABORTS,
         COMMAND_SILENCE_ABORT,
+        PHYSICAL_HOME_COMPLETED,
         # Per-gate reject counters are derived from ``reject_counter_name``.
     }
 )

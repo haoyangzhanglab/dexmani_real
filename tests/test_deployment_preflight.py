@@ -412,6 +412,7 @@ class DeploymentPreflightTest(unittest.TestCase):
             quit_requested=SimpleNamespace(value=False),
             error_state=SimpleNamespace(value=False),
             estop_request=SimpleNamespace(value=False),
+            physical_home_completed=SimpleNamespace(value=False),
             coupled_cmd_ring=coupled_ring,
         )
 
@@ -462,6 +463,7 @@ class DeploymentPreflightTest(unittest.TestCase):
             quit_requested=SimpleNamespace(value=False),
             error_state=SimpleNamespace(value=False),
             estop_request=SimpleNamespace(value=False),
+            physical_home_completed=SimpleNamespace(value=False),
         )
 
         class _Keyboard:
@@ -469,8 +471,9 @@ class DeploymentPreflightTest(unittest.TestCase):
             healthy = True
 
             def __init__(self):
-                self.signals = [ControlSignal.HOME, ControlSignal.HOME]
+                self.signals = [ControlSignal.HOME]
                 self.drained = 0
+                self.later_home_pending = True
 
             @staticmethod
             def start():
@@ -482,12 +485,15 @@ class DeploymentPreflightTest(unittest.TestCase):
 
             def poll(self, *, timeout):
                 del timeout
-                if not self.signals:
-                    shared.is_running.value = 0
-                    return ()
-                signals = tuple(self.signals)
-                self.signals.clear()
-                return signals
+                if self.signals:
+                    signals = tuple(self.signals)
+                    self.signals.clear()
+                    return signals
+                if self.later_home_pending:
+                    self.later_home_pending = False
+                    return (ControlSignal.HOME,)
+                shared.is_running.value = 0
+                return ()
 
             def drain_signal(self, target):
                 retained = [signal for signal in self.signals if signal is not target]
@@ -500,6 +506,7 @@ class DeploymentPreflightTest(unittest.TestCase):
 
         def home(*_args, **_kwargs):
             keyboard.signals.extend([ControlSignal.HOME] * 7)
+            return True
 
         with (
             patch(
@@ -521,6 +528,59 @@ class DeploymentPreflightTest(unittest.TestCase):
 
         run_home.assert_called_once()
         self.assertEqual(keyboard.drained, 7)
+        self.assertTrue(shared.physical_home_completed.value)
+
+    def test_physical_operator_failed_home_keeps_begin_gate_closed(self):
+        shared = SimpleNamespace(
+            is_running=SimpleNamespace(value=1),
+            start_request=SimpleNamespace(value=False),
+            stop_request=SimpleNamespace(value=False),
+            quit_requested=SimpleNamespace(value=False),
+            error_state=SimpleNamespace(value=False),
+            estop_request=SimpleNamespace(value=False),
+            physical_home_completed=SimpleNamespace(value=False),
+        )
+
+        class _Keyboard:
+            estop_latched = False
+            healthy = True
+
+            @staticmethod
+            def start():
+                return None
+
+            @staticmethod
+            def stop():
+                return None
+
+            @staticmethod
+            def poll(*, timeout):
+                del timeout
+                shared.is_running.value = 0
+                return (ControlSignal.HOME, ControlSignal.BEGIN)
+
+            @staticmethod
+            def drain_signal(_target):
+                return 0
+
+        with (
+            patch(
+                "dexmani_real.deployment.operator.KeyboardHandler",
+                return_value=_Keyboard(),
+            ),
+            patch("dexmani_real.deployment.operator._home", return_value=False),
+        ):
+            run_operator_control(
+                shared,
+                object(),
+                object(),
+                object(),
+                stop_event=threading.Event(),
+                execution_mode="execute",
+            )
+
+        self.assertFalse(shared.physical_home_completed.value)
+        self.assertTrue(shared.start_request.value)
 
     def test_table_plane_projection_is_null_when_disabled_and_exact_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory:

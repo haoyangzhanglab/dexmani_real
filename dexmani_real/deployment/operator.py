@@ -104,12 +104,12 @@ def _home(
     planner: XArm7MotionPlanner,
     *,
     abort_requested,
-) -> None:
-    """Stop the run (if any), then return hand + arm to home."""
+) -> bool:
+    """Stop the run, home hand + arm, and report full-sequence completion."""
     if not _stop_to_armed(shared, abort_requested=abort_requested):
-        return
+        return False
     if abort_requested():
-        return
+        return False
     arm_config = ArmLoopConfig.from_runtime(runtime)
 
     if deployment.hand_enabled:
@@ -134,10 +134,10 @@ def _home(
         )
         if not accepted:
             logger.warning("operator: hand home not accepted; arm home skipped")
-            return
+            return False
         planner.set_hand_qpos(hand_home)
 
-    execute_arm_home(
+    result = execute_arm_home(
         shared,
         np.asarray(arm_config.home_qpos, dtype=np.float64),
         planner=planner,
@@ -148,6 +148,7 @@ def _home(
         estop_requested=lambda: bool(shared.estop_request.value),
         progress=lambda message: print(f"  {message}", flush=True),
     )
+    return result.succeeded
 
 
 def run_operator_control(
@@ -182,11 +183,11 @@ def run_operator_control(
         shared.error_state.value = True
         return
     try:
+        home_attempted = False
         while not stop_event.is_set() and shared.is_running.value:
             if keyboard.estop_latched or not keyboard.healthy:
                 shared.estop_request.value = True
                 return
-            home_handled = False
             for signal in keyboard.poll(timeout=_POLL_S):
                 if signal is ControlSignal.BEGIN:
                     shared.start_request.value = True
@@ -196,10 +197,15 @@ def run_operator_control(
                     if planner is None:
                         logger.warning("operator: H is disabled in policy deployment")
                         continue
-                    if home_handled:
+                    if home_attempted:
+                        logger.warning(
+                            "operator: ignored H after the physical home sequence "
+                            "was already attempted in this process"
+                        )
                         continue
-                    home_handled = True
-                    _home(
+                    home_attempted = True
+                    shared.physical_home_completed.value = False
+                    completed = _home(
                         shared,
                         runtime,
                         deployment,
@@ -212,6 +218,14 @@ def run_operator_control(
                             or shared.estop_request.value
                         ),
                     )
+                    shared.physical_home_completed.value = bool(completed)
+                    if completed:
+                        logger.info("operator: physical home sequence completed")
+                    else:
+                        logger.warning(
+                            "operator: physical home sequence did not complete; "
+                            "B remains disabled for this process"
+                        )
                     # HOME blocks while hand/arm homing completes. Discard only
                     # HOME events accumulated during that interval so one
                     # operator key press cannot trigger repeated home commands;

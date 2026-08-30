@@ -62,6 +62,7 @@ from dexmani_real.deployment.metrics import (
     HAND_POLICY_ENDPOINT_ROUNDOFF_CANONICALIZED,
     HAND_PREFLIGHT_REJECTIONS,
     IK_CHECKER_REJECTS,
+    PHYSICAL_HOME_COMPLETED,
     PLAN_AGE_MS,
     PLANS_EVICTED,
     PLANS_GENERATION_DROPPED,
@@ -403,6 +404,11 @@ def _physical_start_pose_rejection(
     """Return why B cannot open a physical epoch, or ``None`` at arm home."""
     if config.execution_mode not in {"execute", "task"}:
         return None
+    if not bool(shared.physical_home_completed.value):
+        return (
+            "physical home sequence has not completed in this process; "
+            "press H before B"
+        )
     arm_state = read_arm_state_dict(shared)
     if arm_state is None:
         return "arm feedback unavailable; press H after feedback is ready"
@@ -801,6 +807,8 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 run_started_ns = run_epoch.started_monotonic_ns
                 previous_arm_command_qpos = None
                 metrics.begin_run()
+                if config.execution_mode in {"execute", "task"}:
+                    metrics.increment(PHYSICAL_HOME_COMPLETED)
                 execute_published_endpoints = 0
                 execute_acknowledged_action_id = None
                 execute_pending_acknowledgement = None

@@ -16,9 +16,9 @@
 
 修复不放宽 SafetyGate：
 
-- `execute` 与 `task` 在接受 B 前读取新鲜、健康的 xArm feedback，并要求机械臂处于
-  runtime canonical home 的 homing tolerance 内；不满足时保持 ARMED、忽略 B，并输出
-  current/home/delta/tolerance 数值；
+- `execute` 与 `task` 在接受 B 前要求本进程的 H home 链路已成功完成，同时读取新鲜、健康的
+  xArm feedback，并要求机械臂处于 runtime canonical home 的 homing tolerance 内；任一不满足
+  都保持 ARMED、忽略 B；
 - 物理模式启用 H：先要求 XHand home command 被 SDK 接受，再通过完整碰撞模型规划并
   执行 arm home；按既定要求，不判断 XHand 关节是否落在 home tolerance 内；
 - inference worker 在构造 agent 前按 Policy `set_seed` 约定用 receipt 中的
@@ -144,14 +144,14 @@ DEXMANI_RECEIPT_DIR="$receipt_dir" \
 操作顺序不可省略：
 
 1. 等全部 subsystem ready，系统显示 ARMED。
-2. 操作者按 H；该操作先下发 XHand home，再执行 collision-checked arm home。只要求 hand
-   command accepted，不检查手指 home tolerance。
-3. 等 arm home 流程明确完成并保持 ARMED；如果误按 B 且 arm 不在 home，coordinator 会忽略 B
-   并打印逐关节差值。
+2. 操作者按一次 H；该操作先下发 XHand home，再执行 collision-checked arm home。只要求 hand
+   command accepted，不检查手指 home tolerance。本进程不接受第二次 H 尝试。
+3. 等日志明确显示 `physical home sequence completed` 并保持 ARMED；缺少完成标志或 arm 不在
+   home 时，coordinator 都会忽略 B。H 失败后退出，不在同一进程重试。
 4. 操作者确认场地状态没有变化后按 B，开始一次 bounded task rollout。
 5. 任意异常立即按 S；人员/物体进入、失控趋势或紧急危险立即按 ESC/e-stop。不得自动重试。
 
-正常软件终态应包含 `reason="task publication bound reached"`、`completed=true`、
+正常软件终态应包含 `physical_home_completed=1`、`reason="task publication bound reached"`、`completed=true`、
 `coupled_command_writes=331`、`execute_acknowledged=331`、verified clean shutdown，并写出
 `task_execute_*.json`。退出码非零、FAULT、少于上限、ACK/sequence/freshness/safety reject 持续、
 receipt 缺失或物理结果异常均不是成功。

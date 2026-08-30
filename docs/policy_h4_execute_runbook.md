@@ -1,10 +1,10 @@
 # H4 首次物理 coupled execute Runbook
 
-> 状态：**通过。** HOME 事件合并修复 revision 的 H2/H3 shadow 与单 endpoint H4 均已
-> 完成；H4 证据见
-> [`deployment_reference_h4_execute_2026-08-30_2d37080.json`](deployment_reference_h4_execute_2026-08-30_2d37080.json)，
-> 当前 120 秒 zero-write baseline 见
-> [`deployment_reference_h2h3_shadow_2026-08-30_506729e.json`](deployment_reference_h2h3_shadow_2026-08-30_506729e.json)。
+> 状态：**等待重新验证。** 当前 `cuda:0` 120 秒 zero-write baseline 见
+> [`deployment_reference_h2h3_shadow_2026-08-30_6349147.json`](deployment_reference_h2h3_shadow_2026-08-30_6349147.json)。
+> `02f88e6` 的单 endpoint 与双 worker ACK 均成功，但日志没有 H home 链路证据，因此不计为
+> H4 通过；事实见
+> [`deployment_reference_h4_execute_failure_2026-08-30_02f88e6.json`](deployment_reference_h4_execute_failure_2026-08-30_02f88e6.json)。
 > 本文不是启动授权。没有独立 review 与明确、限定的 H4 真机授权，任何人不得运行 execute
 > lifecycle。
 
@@ -29,7 +29,8 @@ shadow 证据解释成 execute 授权。
 - `--execute-expected-checkpoint-sha256 <64-hex>` 必须等于本次批准的 frozen
   reference；dirty 或无法识别的 Real source revision 会在连接硬件前被拒绝；
 - B 前必须由操作员按 H，先确认 XHand home command accepted，再完成 collision-checked
-  canonical arm home；coordinator 会用 fresh arm feedback 复核 home tolerance，不满足则忽略 B；
+  canonical arm home；本进程只允许一次 H 尝试。coordinator 同时要求 H 链路完成标志与 fresh
+  arm feedback 的 home tolerance，任一不满足都忽略 B；
 - XHand 仍不要求关节落入 home tolerance，只要求 home command 被接受；
 - `--max-running-seconds <finite positive>`，其值被冻结进 H4 runtime receipt；
 - B 后 coordinator 最多写一条 complete coupled arm+hand record，随后停止调度；
@@ -51,8 +52,8 @@ shadow 证据解释成 execute 授权。
 
 | Gate | 需要的证据 | 失败处理 |
 |---|---|---|
-| reference identity | checkpoint SHA-256 与 [当前 H2/H3 reference artifact](deployment_reference_h2h3_shadow_2026-08-30_506729e.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
-| H2/H3 baseline | `506729e` 的 120 s shadow receipt：1912/1912 endpoint validated、zero coupled writes、clean shutdown、无 warning | Python source、runtime config 或 artifact 改变即停止并重跑 shadow |
+| reference identity | checkpoint SHA-256 与 [当前 H2/H3 reference artifact](deployment_reference_h2h3_shadow_2026-08-30_6349147.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
+| H2/H3 baseline | `6349147` 的 120 s shadow receipt：1916/1916 endpoint validated、zero coupled writes、clean shutdown | Python source、runtime config 或 artifact 改变即停止并重跑 shadow |
 | execute enablement diff | H4 保持 one-publication 与原 SafetyGate/worker limits；新增 seed receipt、H home 和 B 前 canonical arm-home gate，不修改 normalizer、collision、freshness 或 generation 语义 | 任一未解释差异都停止 |
 | bounded execute guard | execute 的 publication bound 固定为 `1`；ack timeout 与 B-relative duration 均为有限正值，并写入 coordinator receipt | 不允许用无界 execute 替代 |
 | offline publication | fake ring 的 full validation 成功只写一条 coherent arm+hand record；gate 后 generation 变化不得写入 | 停止并修复 |
@@ -90,8 +91,8 @@ CLI/lifecycle 与 receipt，并对同一 frozen reference 重跑 `--print-config
 4. 清空机械臂与手指潜在 sweep 空间；移除物体；人员退出；e-stop 可立即触及。
 5. 操作员明确读回本次 publication/duration 上限与 STOP/e-stop 职责。
 6. 系统 ARMED 后，确认日志显示 startup `reset_home` 已下发；由操作员按 H，等待 hand home
-   command accepted 与 arm canonical home 流程完成。只检查 arm home tolerance，不判断 hand
-   home tolerance。
+   command accepted、arm canonical home 流程完成和 `physical home sequence completed`。只检查
+   arm home tolerance，不判断 hand home tolerance。H 失败或误触后退出，不在同一进程重试。
 7. 仍处于 ARMED 且场地条件未变化时，仅由操作员按 B。实施者不代按 B，也不自动 begin。
 
 ## 6. 运行期间的停止规则
@@ -121,6 +122,8 @@ H4 coordinator receipt 会作为原子 JSON 文件写到 `$DEXMANI_RECEIPT_DIR`�
 - publication 上限、实际 `coupled_command_writes`、sequence start/end、每个 worker 的 SDK-side
   accepted/executed/duplicate/rejected 计数；
 - endpoint due/committed/published/discarded/fatal、roundoff canonicalization、所有 safety reject code；
+- `physical_home_completed=1`，且原始日志包含 hand home accepted、arm path selected、arm home
+  reached 和 physical home sequence completed；
 - p50/p95/p99 observation/inference/plan/horizon，worker exit status 与 final safety state；
 - 原始日志的 path、size、SHA-256，及人员/设备/场地确认的操作者记录。
 

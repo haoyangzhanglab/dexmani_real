@@ -38,6 +38,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `docs/deployment_reference_h2h3_shadow_failure_2026-08-30_acc2cc1.json` | observation-wait diagnostics revision 的 H2/H3 发现隐式 CPU 推理争用、两段 zero-write silence abort、正常 Q 退出，以及显式 CUDA device、inference-child warmup、单次 B 修复门槛。 |
 | `docs/deployment_reference_h2h3_shadow_2026-08-30_6349147.json` | 显式 `cuda:0` inference qualification revision 的 120 秒 H2/H3 shadow、1916 endpoint validation、zero-write、zero-servo 与 clean-shutdown 证据。 |
 | `docs/deployment_reference_h4_execute_2026-08-30_2d37080.json` | 当前 HOME-event coalescing revision 的单 HOME、单 coupled endpoint、双 worker ACK 与 clean-shutdown H4 证据。 |
+| `docs/deployment_reference_h4_execute_failure_2026-08-30_02f88e6.json` | CUDA H4 单 endpoint/双 ACK 成功但缺少操作员 H home 链路证据的失败事实、hash、根因与重新验证门槛。 |
 | `docs/deployment_reference_h2h3_shadow_2026-08-30_506729e.json` | 当前 `506729e` HOME-event coalescing revision 的 120 秒 H2/H3 shadow provenance、1912 endpoint validation、zero-write 与 clean-shutdown 证据。 |
 | `docs/deployment_reference_h2h3_shadow_2026-08-30_a3a45e3.json` | `a3a45e3` home/seed revision 的 120 秒 H2/H3 shadow provenance、1913 endpoint validation、zero-write 与 clean-shutdown 回归证据。 |
 | `docs/deployment_reference_h2h3_shadow_2026-08-29_c9c3454.json` | 上一版 `c9c3454` revision 的 time-bounded H2/H3 shadow provenance、receipt、zero-write 与 clean-shutdown 回归证据。 |
@@ -228,9 +229,9 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `run_identity.py` | 纯标准库的 Real source provenance 与 print/preflight 共用 canonical run receipt。 |
 | `observation.py` | 因果不可变 arm/hand/tactile/pointcloud history batch。 |
 | `worker.py` | artifact-bound verified stream runtime load（fake 才使用 generic factory）、observation 校验、logical-grid timing stamp、bounded timing samples 与 plan 发布。 |
-| `coordinator.py` | learned-policy 唯一 command producer、plan scheduling、物理执行 arm-home 初态门、逐 endpoint coupled ACK、typed stop、shadow/execute receipt、命令连续性与 watchdog。 |
+| `coordinator.py` | learned-policy 唯一 command producer、plan scheduling、物理执行本进程 H 完成 + arm-home 初态双门、逐 endpoint coupled ACK、typed stop、shadow/execute receipt、命令连续性与 watchdog。 |
 | `lifecycle.py` | shadow/H4/task worker topology、hand acknowledgement、物理模式 collision-checked home、B-relative supervision、receipt provenance 与 verified shutdown。 |
-| `operator.py` | B/S/Q/ESC typed request；物理 execute 模式的 H 依次下发 hand home 并执行 collision-checked arm home。 |
+| `operator.py` | B/S/Q/ESC typed request；物理模式每进程最多一次 H，依次下发 hand home、执行 collision-checked arm home，并发布完成标志。 |
 | `metrics.py` | inference/coordinator counters、bounded p50/p95/p99 timing 与 canonical shadow receipt。 |
 | `fake.py` | CPU-only deterministic fake runtime。 |
 
