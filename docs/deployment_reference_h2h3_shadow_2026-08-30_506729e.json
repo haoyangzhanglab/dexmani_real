@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "record_type": "dexmani_real.policy_deployment.reference_shadow_receipt",
+  "recorded_at": "2026-08-30T17:17:02+08:00",
+  "authorization_scope": {
+    "level": "H2/H3",
+    "execution_mode": "shadow",
+    "operator_action": "B starts the bounded run after ARMED",
+    "hand_behavior": "one startup reset_home before B; acceptance required, home-position tolerance not checked",
+    "physical_policy_command_publication": "forbidden"
+  },
+  "provenance": {
+    "dexmani_real_commit": "506729edd15f15c4c5c1451c65ff1d3a2d1bf700",
+    "dexmani_real_dirty_before_and_after": false,
+    "dexmani_real_python_tree_sha256": "d6a701d2f550a30e3e3db1a80cf5606a3a50109bf9a23f71e6c561ddba5c90f3",
+    "dexmani_policy_commit": "7e31d10e7a31ff3d12df31b8683c9c90b357cbc5",
+    "dexmani_policy_dirty": false,
+    "dexmani_policy_python_tree_sha256": "9f48ce9ce876be8aacadd38f3f7b1859b8a07f9660590a921043f5e389efa129",
+    "experiment_dir": "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/dp3/pick_place_toy/2026-08-28_13-59_42",
+    "checkpoint_path": "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/dp3/pick_place_toy/2026-08-28_13-59_42/checkpoints/epoch=1126-step=00080000-deployment-v2.pt",
+    "checkpoint_sha256": "b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c",
+    "index_sha256": "d67bf21394c8d79239dd0f116baf25a681c3e4d0964569ce47a520f62e047c6e",
+    "runtime_sha256": "186ec09369b4cd5b70b64b8d445123b9e72f10eaf08ea47df078141eb1d5a292",
+    "projection_sha256": "ac0183438ffdf97b04a53fea97c0fd6ec37984ce6eb7ccf177fa578d09eba4cc",
+    "runtime_target": "dexmani_real.integrations.dexmani_policy:DexManiPolicyRuntime",
+    "inference_seed": 1066,
+    "preflight": {
+      "state": "passed",
+      "checkpoint_sha256_verified": true,
+      "action_steps": 15,
+      "action_dim": 19
+    },
+    "runtime_log_dexmani_commit": "506729edd15f15c4c5c1451c65ff1d3a2d1bf700"
+  },
+  "operator_and_lifecycle_timeline": {
+    "startup_reset_home_accepted_at": "2026-08-30T17:14:50+08:00",
+    "armed_at": "2026-08-30T17:14:54+08:00",
+    "running_at": "2026-08-30T17:14:58+08:00",
+    "running_generation": 4,
+    "max_running_seconds": 120.0,
+    "supervisor_stop_request_at": "2026-08-30T17:16:58+08:00",
+    "supervisor_elapsed_seconds": 120.023,
+    "coordinator_stop_reason": "run time limit",
+    "final_disarmed_at": "2026-08-30T17:17:02+08:00"
+  },
+  "shadow_receipt": {
+    "execution_mode": "shadow",
+    "run_generation": 4,
+    "reason": "run time limit",
+    "coupled_command_start_sequence": 0,
+    "coupled_command_end_sequence": 0,
+    "coupled_command_writes": 0,
+    "zero_coupled_command_writes": true,
+    "metrics": {
+      "plans_ingested": 589,
+      "endpoints_due": 1912,
+      "endpoints_committed": 1912,
+      "endpoints_shadow_validated": 1912,
+      "endpoints_coalesced": 3,
+      "plan_age_ms_p50": 32.317568,
+      "plan_age_ms_p95": 58.214079,
+      "plan_age_ms_p99": 61.95102,
+      "usable_horizon_ms_p50": 349.471691,
+      "usable_horizon_ms_p95": 441.288465,
+      "usable_horizon_ms_p99": 486.733558
+    }
+  },
+  "physical_command_evidence": {
+    "arm_servo_calls": 0,
+    "policy_coupled_command_writes": 0,
+    "safety_gate_rejections": 0,
+    "motion_discards": 0,
+    "home_events_after_startup": 0
+  },
+  "observed_nonfatal_warnings": [],
+  "shutdown": {
+    "exit_reason": "run time limit reached",
+    "final_safety_state": "DISARMED",
+    "supervisor_normal": true,
+    "clean": true,
+    "workers": {
+      "inference": "graceful:0",
+      "arm": "graceful:0",
+      "camera": "graceful:0",
+      "pointcloud": "graceful:0",
+      "policy": "graceful:0",
+      "hand": "graceful:0"
+    }
+  },
+  "source_log": {
+    "original_path": "/tmp/dexmani-h2h3-shadow-506729e.FaAd55/terminal.log",
+    "size_bytes": 129804,
+    "line_count": 306,
+    "sha256": "b9af813ba3c8e036c9e59139055f3a9e57ff979a4c4db3992c30083fee12d179",
+    "retention_note": "The original /tmp log is ephemeral. This artifact retains the exact receipt, lifecycle evidence, warning inventory, and source checksum needed for review."
+  },
+  "interpretation": {
+    "validated": [
+      "the HOME-event coalescing and shadow-provenance revision completes an operational shadow lifecycle",
+      "the startup log records the exact clean Real commit and exactly one accepted startup reset_home",
+      "the B-relative supervisor watchdog requests a typed stop after the bounded interval",
+      "1912 learned-policy endpoints pass the full shadow validation path without a SafetyGate rejection",
+      "no physical policy command is published and all workers shut down cleanly"
+    ],
+    "not_validated": [
+      "Operator-triggered H event coalescing and canonical arm-home motion; H is disabled in shadow",
+      "Any execute publication or arm/hand worker acknowledgement of a policy command",
+      "Any H4 or task-level physical-motion authorization",
+      "Task success or object interaction"
+    ]
+  }
+}

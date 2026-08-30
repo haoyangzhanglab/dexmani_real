@@ -33,6 +33,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `docs/deployment_review.md` | learned-policy 部署架构与安全审查结论、风险接受及整改优先级。 |
 | `docs/dexmani_real_policy_deployment_refactor_plan.md` | Real-owned artifact decoder/strict restore、Policy 兼容边界、R0–R4 gate 与暂停条件的当前方案。 |
 | `docs/dexmani_policy_integration_followup.md` | 另一台机器 Policy 分支稳定后的兼容性 review、验证与版本化 artifact 合并清单。 |
+| `docs/deployment_reference_h2h3_shadow_2026-08-30_506729e.json` | 当前 `506729e` HOME-event coalescing revision 的 120 秒 H2/H3 shadow provenance、1912 endpoint validation、zero-write 与 clean-shutdown 证据。 |
 | `docs/deployment_reference_h2h3_shadow_2026-08-30_a3a45e3.json` | `a3a45e3` home/seed revision 的 120 秒 H2/H3 shadow provenance、1913 endpoint validation、zero-write 与 clean-shutdown 回归证据。 |
 | `docs/deployment_reference_h2h3_shadow_2026-08-29_c9c3454.json` | 上一版 `c9c3454` revision 的 time-bounded H2/H3 shadow provenance、receipt、zero-write 与 clean-shutdown 回归证据。 |
 | `docs/deployment_reference_h2h3_shadow_2026-08-29.json` | 早期 frozen reference v2 的 H2/H3 shadow evidence；仅用于回归对比。 |

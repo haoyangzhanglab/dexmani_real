@@ -1,9 +1,8 @@
 # H4 首次物理 coupled execute Runbook
 
-> 状态：**H4 one-endpoint 已在 `039107c` 通过，但现场发现阻塞式 H 期间积累的 HOME
-> 事件会在返回后重复触发；最小队列清理修复改变了 Python source，当前 revision 必须重跑
-> H2/H3 shadow 与 H4。** `a3a45e3` 的上一轮 120 秒 zero-write 证据见
-> [`deployment_reference_h2h3_shadow_2026-08-30_a3a45e3.json`](deployment_reference_h2h3_shadow_2026-08-30_a3a45e3.json)。
+> 状态：**HOME 事件合并修复 revision `506729e` 的离线检查与 H2/H3 shadow 已通过，等待
+> 独立 H4 授权。** 当前 120 秒 zero-write 证据见
+> [`deployment_reference_h2h3_shadow_2026-08-30_506729e.json`](deployment_reference_h2h3_shadow_2026-08-30_506729e.json)。
 > 本文不是启动授权。没有独立 review 与明确、限定的 H4 真机授权，任何人不得运行 execute
 > lifecycle。
 
@@ -48,8 +47,8 @@ shadow 证据解释成 execute 授权。
 
 | Gate | 需要的证据 | 失败处理 |
 |---|---|---|
-| reference identity | checkpoint SHA-256 与 [当前 H2/H3 reference artifact](deployment_reference_h2h3_shadow_2026-08-30_a3a45e3.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
-| H2/H3 baseline | `a3a45e3` 的 120 s shadow receipt：1913/1913 endpoint validated、zero coupled writes、clean shutdown；HOME 队列修复后的 revision 尚未重跑 | 停止，先在修复 revision 上重跑 shadow |
+| reference identity | checkpoint SHA-256 与 [当前 H2/H3 reference artifact](deployment_reference_h2h3_shadow_2026-08-30_506729e.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
+| H2/H3 baseline | `506729e` 的 120 s shadow receipt：1912/1912 endpoint validated、zero coupled writes、clean shutdown、无 warning | Python source、runtime config 或 artifact 改变即停止并重跑 shadow |
 | execute enablement diff | H4 保持 one-publication 与原 SafetyGate/worker limits；新增 seed receipt、H home 和 B 前 canonical arm-home gate，不修改 normalizer、collision、freshness 或 generation 语义 | 任一未解释差异都停止 |
 | bounded execute guard | execute 的 publication bound 固定为 `1`；ack timeout 与 B-relative duration 均为有限正值，并写入 coordinator receipt | 不允许用无界 execute 替代 |
 | offline publication | fake ring 的 full validation 成功只写一条 coherent arm+hand record；gate 后 generation 变化不得写入 | 停止并修复 |
