@@ -1,7 +1,8 @@
 # Learned Policy 单次任务执行 Runbook
 
-> 状态：**仅完成离线实现，尚未获得真机授权或真机验证。** 本文给出独立于 H4
-> one-shot 的 bounded task profile；文档和命令本身不构成硬件授权。
+> 状态：**离线、H2/H3 shadow 与 H4 one-endpoint 已通过；完整 task rollout 尚未授权或
+> 真机验证。** 本文给出独立于 H4 one-shot 的 bounded task profile；文档和既有 H4 证据
+> 均不构成 task 硬件授权。
 
 ## 1. 根因与修复边界
 

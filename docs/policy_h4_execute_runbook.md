@@ -1,7 +1,9 @@
 # H4 首次物理 coupled execute Runbook
 
-> 状态：**HOME 事件合并修复 revision `506729e` 的离线检查与 H2/H3 shadow 已通过，等待
-> 独立 H4 授权。** 当前 120 秒 zero-write 证据见
+> 状态：**通过。** HOME 事件合并修复 revision 的 H2/H3 shadow 与单 endpoint H4 均已
+> 完成；H4 证据见
+> [`deployment_reference_h4_execute_2026-08-30_2d37080.json`](deployment_reference_h4_execute_2026-08-30_2d37080.json)，
+> 当前 120 秒 zero-write baseline 见
 > [`deployment_reference_h2h3_shadow_2026-08-30_506729e.json`](deployment_reference_h2h3_shadow_2026-08-30_506729e.json)。
 > 本文不是启动授权。没有独立 review 与明确、限定的 H4 真机授权，任何人不得运行 execute
 > lifecycle。
