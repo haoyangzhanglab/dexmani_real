@@ -33,10 +33,11 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `docs/deployment_review.md` | learned-policy 部署架构与安全审查结论、风险接受及整改优先级。 |
 | `docs/dexmani_real_policy_deployment_refactor_plan.md` | Real-owned artifact decoder/strict restore、Policy 兼容边界、R0–R4 gate 与暂停条件的当前方案。 |
 | `docs/dexmani_policy_integration_followup.md` | 另一台机器 Policy 分支稳定后的兼容性 review、验证与版本化 artifact 合并清单。 |
-| `docs/deployment_reference_h2h3_shadow_2026-08-29_c9c3454.json` | 当前 `c9c3454` revision 的 time-bounded H2/H3 shadow provenance、receipt、zero-write 与 clean-shutdown 证据。 |
+| `docs/deployment_reference_h2h3_shadow_2026-08-30_a3a45e3.json` | 当前 `a3a45e3` home/seed revision 的 120 秒 H2/H3 shadow provenance、1913 endpoint validation、zero-write 与 clean-shutdown 证据。 |
+| `docs/deployment_reference_h2h3_shadow_2026-08-29_c9c3454.json` | 上一版 `c9c3454` revision 的 time-bounded H2/H3 shadow provenance、receipt、zero-write 与 clean-shutdown 回归证据。 |
 | `docs/deployment_reference_h2h3_shadow_2026-08-29.json` | 早期 frozen reference v2 的 H2/H3 shadow evidence；仅用于回归对比。 |
 | `docs/maniunicon_reference_design.md` | 从 ManiUniCon 静态审查提炼的 learned-policy 部署改进思路、采纳边界与验收要求。 |
-| `docs/policy_h4_execute_runbook.md` | 暂停中的 H4 首次 physical coupled execute gate、限定授权、现场 stop 与 receipt 要求；不构成真机授权。 |
+| `docs/policy_h4_execute_runbook.md` | 当前 H2/H3 已通过后等待独立授权的 H4 physical coupled execute gate、现场 stop 与 receipt 要求；不构成真机授权。 |
 | `docs/policy_task_execute_runbook.md` | 独立 bounded task rollout 的根因、arm-home 初态门、确定性推理、逐 endpoint ACK、完整命令与授权/验收要求。 |
 | `docs/pointcloud_pipeline.md` | depth-to-color aligned 点云的采集、处理、时序与持久化契约。 |
 | `docs/teleop_jitter_incident.md` | 键盘遥操作卡顿、抖动、delta 拒绝与 coupled-command 修复复盘。 |

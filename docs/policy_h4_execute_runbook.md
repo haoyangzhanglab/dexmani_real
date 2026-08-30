@@ -1,9 +1,10 @@
 # H4 首次物理 coupled execute Runbook
 
-> 状态：**暂停。** 既有 H2/H3/H4 receipt 是历史证据；新增 deterministic inference seed、
-> canonical arm-home start gate 与 H lifecycle 后，必须在新的干净 revision 上重跑离线检查与
-> H2/H3 shadow。本文不是启动授权。没有独立 review 与明确、限定的 H4 真机授权，任何人不得
-> 运行 execute lifecycle。
+> 状态：**当前 Python source revision 的离线检查与 H2/H3 shadow 已通过，等待独立 H4
+> 授权。** `a3a45e3` 的 120 秒 zero-write 证据见
+> [`deployment_reference_h2h3_shadow_2026-08-30_a3a45e3.json`](deployment_reference_h2h3_shadow_2026-08-30_a3a45e3.json)。
+> 本文不是启动授权。没有独立 review 与明确、限定的 H4 真机授权，任何人不得运行 execute
+> lifecycle。
 
 ## 1. 目标与范围
 
@@ -46,8 +47,8 @@ shadow 证据解释成 execute 授权。
 
 | Gate | 需要的证据 | 失败处理 |
 |---|---|---|
-| reference identity | checkpoint SHA-256 与 [当前 H2/H3 reference artifact](deployment_reference_h2h3_shadow_2026-08-29_c9c3454.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
-| H2/H3 baseline | 新 arm-home/seed revision 的 120 s shadow receipt；旧 `c9c3454` receipt 只用于回归对比 | 停止，先恢复 shadow evidence |
+| reference identity | checkpoint SHA-256 与 [当前 H2/H3 reference artifact](deployment_reference_h2h3_shadow_2026-08-30_a3a45e3.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
+| H2/H3 baseline | `a3a45e3` 的 120 s shadow receipt：1913/1913 endpoint validated、zero coupled writes、clean shutdown；旧 `c9c3454` receipt 只用于回归对比 | Python source、runtime config 或 artifact 改变即停止并重跑 shadow |
 | execute enablement diff | H4 保持 one-publication 与原 SafetyGate/worker limits；新增 seed receipt、H home 和 B 前 canonical arm-home gate，不修改 normalizer、collision、freshness 或 generation 语义 | 任一未解释差异都停止 |
 | bounded execute guard | execute 的 publication bound 固定为 `1`；ack timeout 与 B-relative duration 均为有限正值，并写入 coordinator receipt | 不允许用无界 execute 替代 |
 | offline publication | fake ring 的 full validation 成功只写一条 coherent arm+hand record；gate 后 generation 变化不得写入 | 停止并修复 |
