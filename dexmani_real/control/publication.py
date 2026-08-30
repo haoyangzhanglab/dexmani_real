@@ -344,8 +344,11 @@ def _validate_command_delivery(
     candidate: ActionCandidate,
     *,
     check_is_running: bool,
+    minimum_delivery_window_s: float = 0.0,
 ) -> CommandPublishResult | None:
     """Return a typed final delivery rejection, or ``None`` when writable."""
+    if not np.isfinite(minimum_delivery_window_s) or minimum_delivery_window_s < 0.0:
+        raise ValueError("minimum_delivery_window_s must be finite and non-negative")
     runtime_rejection = check_runtime_gate(
         shared,
         check_is_running=check_is_running,
@@ -364,13 +367,20 @@ def _validate_command_delivery(
             detail="candidate generation no longer owns the motion permit",
         )
 
-    if candidate.valid_until_monotonic_ns <= time.monotonic_ns():
-        logger.error(
-            "send_command: action_id=%d temporal window closed", candidate.action_id
+    remaining_ns = candidate.valid_until_monotonic_ns - time.monotonic_ns()
+    required_ns = int(minimum_delivery_window_s * 1e9)
+    if remaining_ns <= required_ns:
+        logger.warning(
+            "send_command: action_id=%d temporal window too short: "
+            "remaining_ms=%.3f required_ms=%.3f",
+            candidate.action_id,
+            remaining_ns / 1e6,
+            required_ns / 1e6,
         )
         return CommandPublishResult(
             CommandPublishStatus.TEMPORAL_WINDOW_CLOSED,
             candidate=candidate,
+            detail="insufficient worker delivery window",
         )
     return None
 
@@ -380,16 +390,20 @@ def send_command(
     candidate: ActionCandidate,
     *,
     check_is_running: bool = True,
+    minimum_delivery_window_s: float = 0.0,
 ) -> CommandPublishResult:
     """Publish one coherent arm/hand record to the actuator IPC ring.
 
     Returns a typed transport outcome. Callers decide whether a rejection
     means hold, drop, command quiescence, run abort, or global fault.
+    ``minimum_delivery_window_s`` lets schedulers reserve time for workers to
+    observe the record without changing its immutable expiry.
     """
     delivery_rejection = _validate_command_delivery(
         shared,
         candidate,
         check_is_running=check_is_running,
+        minimum_delivery_window_s=minimum_delivery_window_s,
     )
     if delivery_rejection is not None:
         return delivery_rejection
@@ -582,6 +596,7 @@ def validate_and_send_candidate(
     hand_mechanical_upper_rad: np.ndarray | None = None,
     canonicalize_policy_hand_roundoff: bool = False,
     execution_mode: str,
+    minimum_delivery_window_s: float = 0.0,
 ) -> CommandPublishResult:
     """Validate a pre-built candidate through the gate and publish it.
 
@@ -593,6 +608,10 @@ def validate_and_send_candidate(
     Returns:
         A typed result that distinguishes policy-semantic gate rejection from
         runtime, feedback, and transport failures.
+
+    ``minimum_delivery_window_s`` is checked at the final IPC boundary after
+    validation, so time spent inside the safety gate consumes the same fixed
+    source-owned deadline.
     """
     if execution_mode not in {"shadow", "execute"}:
         raise ValueError("execution_mode must be 'shadow' or 'execute'")
@@ -736,6 +755,7 @@ def validate_and_send_candidate(
             shared,
             candidate,
             check_is_running=True,
+            minimum_delivery_window_s=minimum_delivery_window_s,
         )
         if delivery_rejection is not None:
             return replace(
@@ -748,7 +768,11 @@ def validate_and_send_candidate(
             hand_roundoff_canonicalized=hand_roundoff_canonicalized,
         )
     return replace(
-        send_command(shared, candidate),
+        send_command(
+            shared,
+            candidate,
+            minimum_delivery_window_s=minimum_delivery_window_s,
+        ),
         hand_roundoff_canonicalized=hand_roundoff_canonicalized,
     )
 

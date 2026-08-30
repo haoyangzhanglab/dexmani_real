@@ -1267,6 +1267,10 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     execution_mode=(
                         "shadow" if config.execution_mode == "shadow" else "execute"
                     ),
+                    # Leave one full policy tick for both 30 Hz workers to
+                    # observe the coupled record. Near-expiry plans are stale;
+                    # never extend their immutable source deadline.
+                    minimum_delivery_window_s=period_s,
                 )
             except Exception as exc:
                 abort_and_reset(

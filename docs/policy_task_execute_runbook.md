@@ -1,8 +1,8 @@
 # Learned Policy 单次任务执行 Runbook
 
-> 状态：**离线、H2/H3 shadow 与 H4 one-endpoint 已通过；完整 task rollout 尚未授权或
-> 真机验证。** 本文给出独立于 H4 one-shot 的 bounded task profile；文档和既有 H4 证据
-> 均不构成 task 硬件授权。
+> 状态：**首次完整 task rollout 已在 58/331 次发布时 fail closed；修复已完成离线验证，
+> 尚须重新通过 H2/H3 shadow、H4 one-endpoint 和新的 task 授权。** 本文给出独立于 H4
+> one-shot 的 bounded task profile；文档和既有硬件证据均不构成新的真机授权。
 
 ## 1. 根因与修复边界
 
@@ -28,6 +28,9 @@
 - `task` 每次只允许一个 coupled command 在途；arm 与 hand 对同一 action id 均 ACK 后，
   coordinator 才处理下一个 endpoint。超时、feedback、generation、sequence 或 receipt
   异常继续 fail closed。
+- 策略 endpoint 在最终 IPC 写入前必须至少保留一个完整 policy control tick 的 immutable
+  delivery window（当前 16 Hz 为 62.5 ms）。不足时按 stale 丢弃并等待新 plan；不延长
+  原 plan deadline，也不放宽 worker freshness 或 ACK gate。
 
 归一化与反归一化仍由 checkpoint 恢复后的 Policy agent 完成；Real adapter 只拼接
 `joint_state=[arm7, hand12]`、传入 point cloud，并拆分反归一化后的 `pred_action`。本次没有
@@ -43,6 +46,12 @@
 当前数据 episode 最大长度为 331 control ticks。首次完整 rollout 不越过训练长度，使用
 331 endpoints（20.6875 s @ 16 Hz）和 25 s B-relative watchdog；任何更长或重复运行都需要
 重新 review 与授权。
+
+2026-08-30 在 `77d8c44` 上的首次 task 尝试发布 58 个 coupled endpoints，前 57 个获得双
+worker ACK。第 58 个动作仅剩 `8.517 ms` plan validity，短于 30 Hz worker 的单周期，因而被
+arm 和 hand 同时判为 expired；2 秒 ACK watchdog 随后正确转入 FAULT。该运行不是任务成功，
+没有自动重试。原始事实与 hash 记录在
+`deployment_reference_task_execute_failure_2026-08-30_77d8c44.json`。
 
 ## 3. 真机前离线检查
 

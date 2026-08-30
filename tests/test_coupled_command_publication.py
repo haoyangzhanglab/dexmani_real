@@ -217,6 +217,54 @@ class CoupledCommandPublicationTest(unittest.TestCase):
             int(shared.coupled_cmd_ring.latest["target_monotonic_ns"][0]),
         )
 
+    def test_validated_execute_candidate_preserves_worker_delivery_margin(
+        self,
+    ) -> None:
+        shared = _shared()
+        now_ns = 10_000_000_000
+        candidate = ActionCandidate(
+            observation_id=1,
+            run_generation=7,
+            action_id=1,
+            created_monotonic_ns=now_ns,
+            target_monotonic_ns=now_ns,
+            scheduled_target_monotonic_ns=now_ns,
+            valid_until_monotonic_ns=now_ns + 8_500_000,
+            arm_qpos=np.zeros(7),
+        )
+        gate = Mock()
+        gate.validate.return_value = GateResult(True)
+        arm_feedback = SimpleNamespace(qpos=np.zeros(7), last_cmd_seq=0)
+
+        with (
+            patch(
+                "dexmani_real.control.publication._arm_feedback_snapshot",
+                return_value=(arm_feedback, None),
+            ),
+            patch(
+                "dexmani_real.control.publication.time.monotonic_ns",
+                return_value=now_ns,
+            ),
+        ):
+            result = validate_and_send_candidate(
+                shared,
+                candidate,
+                gate=gate,
+                arm_feedback_max_age_s=0.5,
+                hand_feedback_max_age_s=0.5,
+                execution_mode="execute",
+                minimum_delivery_window_s=1.0 / 16.0,
+            )
+
+        self.assertEqual(
+            result.status,
+            CommandPublishStatus.TEMPORAL_WINDOW_CLOSED,
+        )
+        self.assertEqual(result.detail, "insufficient worker delivery window")
+        gate.validate.assert_called_once()
+        self.assertEqual(shared.coupled_cmd_ring.sequence, 0)
+        self.assertIsNone(shared.coupled_cmd_ring.latest)
+
     def test_shadow_validates_full_candidate_without_coupled_command_write(
         self,
     ) -> None:

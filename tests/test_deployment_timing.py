@@ -1446,6 +1446,7 @@ class DeploymentTimingTest(unittest.TestCase):
 
         def validate_through_gate(_shared, candidate, **kwargs):
             self.assertIs(kwargs["gate"], gate)
+            self.assertEqual(kwargs["minimum_delivery_window_s"], 0.01)
             published_candidates.append(candidate)
             shared.is_running.value = 0
             return CommandPublishResult(
