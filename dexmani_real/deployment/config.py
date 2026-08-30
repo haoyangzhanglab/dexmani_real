@@ -101,8 +101,8 @@ class DeploymentConfig:
     # Operator-declared action contract; validated against the checkpoint's
     # train_params at load time (mismatch fails closed, never coerces).
     action_key: str = "action"
-    # Seeds model construction and the subsequent diffusion RNG stream once in
-    # the inference worker, matching the Policy evaluation convention.
+    # Seeds model construction and subsequent process RNG streams once in the
+    # inference worker, matching the Policy evaluation convention.
     inference_seed: int = 0
     inference_hz: float = 10.0
     observation_horizon: int = 2

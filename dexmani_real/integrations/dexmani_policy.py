@@ -23,6 +23,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import random
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -475,10 +476,12 @@ class DexManiPolicyRuntime:
         # path and could overwrite the checkpoint-owned artifact.
         if OmegaConf.select(cfg, "agent.codebook_path") is not None:
             OmegaConf.update(cfg, "agent.codebook_path", None)
-        # Match the Policy evaluation convention: initialize one reproducible
-        # RNG stream before model construction, then let successive diffusion
-        # predictions advance that stream naturally.
-        torch.manual_seed(int(self.config.inference_seed))
+        # Match Policy ``set_seed`` before model construction. Successive
+        # predictions then advance these process-owned streams naturally.
+        inference_seed = int(self.config.inference_seed)
+        random.seed(inference_seed)
+        np.random.seed(inference_seed)
+        torch.manual_seed(inference_seed)
         agent = hydra.utils.instantiate(cfg.agent)
         agent.action_key = cfg.action_key
 

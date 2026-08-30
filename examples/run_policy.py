@@ -350,6 +350,7 @@ def main(argv: list[str] | None = None) -> int:
         max_running_s=None,
         real_source=real_source,
         invocation_argv=tuple(sys.argv if argv is None else [sys.argv[0], *argv]),
+        projection_sha256=projection.sha256,
     )
 
 

@@ -24,6 +24,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,8 @@ from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig, pointclo
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _prepare_execute_receipt_dir() -> str:
@@ -121,6 +124,66 @@ def log_deployment_provenance(
         deployment.checkpoint or "",
         checkpoint_sha256 or "",
         runtime_sha256,
+    )
+
+
+def _physical_execute_provenance_json(
+    policy_runtime_config: PolicyRuntimeConfig,
+    *,
+    runtime_sha256: str,
+    real_source: RealSourceIdentity,
+    invocation_argv: tuple[str, ...] | None,
+    projection_sha256: str | None,
+) -> str:
+    """Render the immutable contract recorded by a physical-run receipt."""
+    artifact = policy_runtime_config.artifact
+    if artifact is None:
+        raise ValueError("physical execute requires a resolved policy artifact")
+    if (
+        not isinstance(projection_sha256, str)
+        or _SHA256_RE.fullmatch(projection_sha256) is None
+    ):
+        raise ValueError("physical execute requires a canonical projection SHA-256")
+    execute_bounds = policy_runtime_config.physical_execute_bounds
+    if execute_bounds is None:
+        raise ValueError("physical execute requires explicit bounds")
+    return json.dumps(
+        {
+            "artifact": {
+                "checkpoint_sha256": artifact.checkpoint_sha256_from_index,
+                "checkpoint": artifact.checkpoint_path.name,
+                "index_sha256": artifact.index_sha256,
+            },
+            "invocation_argv": list(invocation_argv or ()),
+            # The inference worker independently verifies that the imported,
+            # clean Policy source exactly matches this artifact-owned contract.
+            "policy_package_contract": {
+                "commit": artifact.producer.commit,
+                "metadata_provenance": artifact.producer.metadata_provenance,
+                "repository": artifact.producer.repository,
+            },
+            "policy_projection": {
+                "bounds": {
+                    "acknowledgement_timeout_s": (
+                        execute_bounds.acknowledgement_timeout_s
+                    ),
+                    "max_published_endpoints": execute_bounds.max_published_endpoints,
+                    "max_running_s": execute_bounds.max_running_s,
+                },
+                "execution_mode": policy_runtime_config.execution_mode,
+                "inference_seed": policy_runtime_config.inference_seed,
+                "sha256": projection_sha256,
+            },
+            "real_source": {
+                "commit": real_source.commit,
+                "dirty": real_source.dirty,
+                "python_tree_sha256": real_source.python_tree_sha256,
+            },
+            "runtime": {"config_sha256": runtime_sha256},
+        },
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
     )
 
 
@@ -223,6 +286,7 @@ def run_policy_deployment(
     max_running_s: float | None = None,
     real_source: RealSourceIdentity | None = None,
     invocation_argv: tuple[str, ...] | None = None,
+    projection_sha256: str | None = None,
 ) -> int:
     """Run one policy deployment lifecycle and return its exit code.
 
@@ -256,33 +320,23 @@ def run_policy_deployment(
             raise ValueError("physical execute requires resolved Real source identity")
         if real_source.dirty != "false":
             raise ValueError("physical execute requires a clean Real source identity")
-        artifact = policy_runtime_config.artifact
-        if artifact is None:
-            raise ValueError("physical execute requires a resolved policy artifact")
-        execute_receipt_provenance_json = json.dumps(
-            {
-                "artifact": {
-                    "checkpoint_sha256": artifact.checkpoint_sha256_from_index,
-                    "checkpoint": artifact.checkpoint_path.name,
-                    "index_sha256": artifact.index_sha256,
-                },
-                "invocation_argv": list(invocation_argv or ()),
-                "real_source": {
-                    "commit": real_source.commit,
-                    "dirty": real_source.dirty,
-                    "python_tree_sha256": real_source.python_tree_sha256,
-                },
-                "runtime": {"config_sha256": runtime.sha256},
-            },
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
+        execute_receipt_provenance_json = _physical_execute_provenance_json(
+            policy_runtime_config,
+            runtime_sha256=runtime.sha256,
+            real_source=real_source,
+            invocation_argv=invocation_argv,
+            projection_sha256=projection_sha256,
         )
     log_deployment_provenance(
         logger,
         deployment=deployment,
         runtime_sha256=runtime.sha256,
         dexmani_commit=((real_source.commit or "") if real_source is not None else ""),
+        model_commit=(
+            policy_runtime_config.artifact.producer.commit
+            if policy_runtime_config.artifact is not None
+            else ""
+        ),
         checkpoint_sha256=(
             sha256_file(deployment.checkpoint) if deployment.checkpoint else ""
         ),

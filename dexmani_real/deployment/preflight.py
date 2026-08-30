@@ -407,8 +407,9 @@ def _run_preflight_child(runtime_config: PolicyRuntimeConfig) -> PreflightResult
     try:
         import torch
 
-        np.random.seed(0)
-        torch.manual_seed(0)
+        # Runtime construction already initialized the checkpoint-bound RNG
+        # streams. Do not replace them here: preflight must exercise the same
+        # first prediction stream as the operational inference worker.
         observation = _fake_observation(runtime_config)
         with torch.inference_mode():
             prediction = runtime.predict(observation)

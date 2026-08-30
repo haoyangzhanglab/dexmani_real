@@ -31,6 +31,7 @@ from dexmani_real.deployment.config import (
 )
 from dexmani_real.deployment.contracts import PolicyPrediction
 from dexmani_real.deployment.lifecycle import (
+    _physical_execute_provenance_json,
     build_policy_worker_specs,
     run_policy_deployment,
 )
@@ -46,6 +47,7 @@ from dexmani_real.deployment.preflight import (
     _validate_prediction,
     run_isolated_preflight,
 )
+from dexmani_real.deployment.run_identity import RealSourceIdentity
 from dexmani_real.deployment.worker import inference_loop, stamp_prediction_timing
 from dexmani_real.integrations.dexmani_policy import (
     DexManiPolicyRuntime,
@@ -188,6 +190,88 @@ class DeploymentPreflightTest(unittest.TestCase):
         runtime.load.assert_not_called()
         runtime.close.assert_called_once_with()
         shared.set_ready.assert_called_once_with("inference")
+
+    def test_preflight_does_not_replace_checkpoint_bound_rng_streams(self):
+        prediction = object()
+        runtime = SimpleNamespace(predict=Mock(return_value=prediction), close=Mock())
+        runtime_config = SimpleNamespace(
+            artifact=SimpleNamespace(
+                allocation_contract=SimpleNamespace(
+                    required_action_steps=15,
+                    action_dim=19,
+                )
+            ),
+            inference_seed=1066,
+        )
+        provenance = {
+            "origin": "/policy/__init__.py",
+            "commit": "c" * 40,
+            "dirty": "false",
+            "source_tree_sha256": "d" * 64,
+            "version": "0.1.0",
+        }
+        with (
+            patch.object(
+                preflight_module,
+                "_load_verified_policy_runtime",
+                return_value=(runtime, "a" * 64, provenance),
+            ),
+            patch.object(preflight_module, "_fake_observation", return_value=object()),
+            patch.object(preflight_module, "_validate_prediction") as validate,
+            patch.object(torch, "manual_seed") as manual_seed,
+            patch.object(np.random, "seed") as numpy_seed,
+        ):
+            result = _run_preflight_child(runtime_config)
+
+        manual_seed.assert_not_called()
+        numpy_seed.assert_not_called()
+        runtime.predict.assert_called_once()
+        validate.assert_called_once_with(prediction, runtime_config)
+        runtime.close.assert_called_once_with()
+        self.assertEqual(result.action_steps, 15)
+        self.assertEqual(result.package_commit, "c" * 40)
+
+    def test_physical_receipt_provenance_is_structured_and_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = _write_experiment(Path(directory) / "experiment")
+            runtime = resolve_runtime_config()
+            projection = resolve_policy_runtime_config(
+                artifact=resolve_policy_artifact(root),
+                runtime_config=runtime,
+                inference_seed=1066,
+                execution_mode="task",
+                hand_acknowledged=True,
+                task_execute_bounds=TaskExecuteBounds(
+                    max_published_endpoints=331,
+                    acknowledgement_timeout_s=2.0,
+                    max_running_s=25.0,
+                ),
+            )
+            provenance = json.loads(
+                _physical_execute_provenance_json(
+                    projection.runtime,
+                    runtime_sha256=runtime.sha256,
+                    real_source=RealSourceIdentity(
+                        availability="available",
+                        commit="e" * 40,
+                        dirty="false",
+                        python_tree_sha256="f" * 64,
+                    ),
+                    invocation_argv=("run_policy.py", "--execution-mode", "task"),
+                    projection_sha256=projection.sha256,
+                )
+            )
+
+        self.assertEqual(provenance["policy_projection"]["sha256"], projection.sha256)
+        self.assertEqual(provenance["policy_projection"]["inference_seed"], 1066)
+        self.assertEqual(
+            provenance["policy_projection"]["bounds"]["max_published_endpoints"],
+            331,
+        )
+        self.assertEqual(
+            provenance["policy_package_contract"]["commit"],
+            projection.runtime.artifact.producer.commit,
+        )
 
     def test_hand_shadow_requires_acknowledgement_before_runtime_channels(self):
         runtime = resolve_runtime_config()
@@ -967,7 +1051,7 @@ if loaded:
         events: list[str] = []
         artifact = object()
         runtime = object()
-        projection = SimpleNamespace(runtime=object())
+        projection = SimpleNamespace(runtime=object(), sha256="d" * 64)
         module_globals["resolve_policy_artifact"] = lambda _path: (
             events.append("artifact") or artifact
         )
@@ -1020,7 +1104,7 @@ if loaded:
         module_globals = main.__globals__
         artifact = SimpleNamespace(checkpoint_sha256_from_index="a" * 64)
         runtime = object()
-        projection = SimpleNamespace(runtime=object())
+        projection = SimpleNamespace(runtime=object(), sha256="d" * 64)
         module_globals["resolve_policy_artifact"] = lambda _path: artifact
         module_globals["resolve_runtime_config"] = lambda *, yaml_path: runtime
 
@@ -1046,12 +1130,14 @@ if loaded:
             max_running_s,
             real_source,
             invocation_argv,
+            projection_sha256,
         ):
             self.assertIs(actual_runtime, runtime)
             self.assertIs(actual_projection, projection.runtime)
             self.assertIsNone(max_running_s)
             self.assertEqual(real_source.dirty, "false")
             self.assertIn("--execution-mode", invocation_argv)
+            self.assertEqual(projection_sha256, projection.sha256)
             return 0
 
         lifecycle.run_policy_deployment = run_lifecycle
@@ -1089,7 +1175,7 @@ if loaded:
         module_globals = main.__globals__
         artifact = SimpleNamespace(checkpoint_sha256_from_index="a" * 64)
         runtime = object()
-        projection = SimpleNamespace(runtime=object())
+        projection = SimpleNamespace(runtime=object(), sha256="d" * 64)
         module_globals["resolve_policy_artifact"] = lambda _path: artifact
         module_globals["resolve_runtime_config"] = lambda *, yaml_path: runtime
 
@@ -1135,6 +1221,10 @@ if loaded:
 
         self.assertEqual(code, 0)
         lifecycle.run_policy_deployment.assert_called_once()
+        self.assertEqual(
+            lifecycle.run_policy_deployment.call_args.kwargs["projection_sha256"],
+            projection.sha256,
+        )
 
     def test_cli_rejects_execute_and_removed_legacy_parameters(self):
         import runpy
