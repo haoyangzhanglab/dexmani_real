@@ -1,8 +1,8 @@
 # Learned Policy 单次任务执行 Runbook
 
-> 状态：**首次完整 task rollout 已在 58/331 次发布时 fail closed；近截止动作修复后的首次
-> H2/H3 revalidation 又因首命令超时而停止，现已补齐只读 observation-wait diagnostics。
-> 尚须重新通过 H2/H3 shadow、H4 one-endpoint 和新的 task 授权。** 本文给出独立于 H4
+> 状态：**首次完整 task rollout 已在 58/331 次发布时 fail closed；其后的 observation 与
+> CPU inference 问题均已定位修复，`6349147` 的显式 `cuda:0` H2/H3 shadow 已通过。
+> 尚须重新通过 H4 one-endpoint 并获得新的 task 授权。** 本文给出独立于 H4
 > one-shot 的 bounded task profile；文档和既有硬件证据均不构成新的真机授权。
 
 ## 1. 根因与修复边界
@@ -71,6 +71,14 @@ RUNNING epoch 的 start-request 来源无法由旧日志归因，但旧 coordina
 ready 前还会完成 5 次无硬件 warmup，要求最后 3 次均落在 artifact action horizon 的可用窗口
 内，并在 warmup 后恢复所有 RNG 状态；同时所有模式每个进程只接受第一次 B。完整事实见
 `deployment_reference_h2h3_shadow_failure_2026-08-30_acc2cc1.json`。
+
+`6349147` 上使用显式 `--device cuda:0` 的后续 H2/H3 已通过完整 120 秒验证：启动 warmup
+稳定最大值为 `20.036 ms`，在线报告的最大 inference sample 为 `24.318 ms`、滚动 p99 最大值
+为 `25.957 ms`；`1916/1916` 个 endpoint 完成 shadow validation，SafetyGate reject、motion
+discard、inference failure 和 coupled command write 均为 0，arm `servo_calls=0`，最后所有
+worker graceful shutdown。事实与日志 hash 记录在
+`deployment_reference_h2h3_shadow_2026-08-30_6349147.json`。该结果只解除 H2/H3 阻塞，
+不构成 H4 或 task 真机授权。
 
 ## 3. 真机前离线检查
 
