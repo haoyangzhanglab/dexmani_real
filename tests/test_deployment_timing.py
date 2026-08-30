@@ -39,6 +39,7 @@ from dexmani_real.deployment.coordinator import (
     coordinator_loop,
 )
 from dexmani_real.deployment.manifest import DeploymentManifest
+from dexmani_real.deployment.metrics import OBSERVATION_WAIT_POINTCLOUD_GRID, Metrics
 from dexmani_real.deployment.observation import PointCloudFrame, freeze_array
 from dexmani_real.deployment.worker import (
     _build_observation,
@@ -973,6 +974,35 @@ class DeploymentTimingTest(unittest.TestCase):
         self.assertEqual(selected, ())
         self.assertEqual(logical_ns, 0)
 
+    def test_observation_reports_unavailable_pointcloud_grid(self) -> None:
+        metrics = Metrics()
+        shared = SimpleNamespace(
+            arm_state_ring=_Ring([]),
+            pointcloud_ring=_Ring([]),
+        )
+        config = DeploymentConfig(
+            runtime_target="tests:fake",
+            observation_horizon=2,
+            observation_fields="arm_qpos,point_cloud",
+        )
+
+        observation = _build_observation(
+            shared,
+            config,
+            observation_id=1,
+            run_generation=2,
+            run_started_ns=100,
+            anchor_ns=300,
+            step_dt_ns=100,
+            metrics=metrics,
+        )
+
+        self.assertIsNone(observation)
+        self.assertEqual(
+            metrics.run_snapshot()[OBSERVATION_WAIT_POINTCLOUD_GRID],
+            1,
+        )
+
     def test_ipc_plan_conversion_copies_without_retiming(self) -> None:
         plan = _plan()
         original_targets = plan["target_monotonic_ns"].copy()
@@ -1367,6 +1397,57 @@ class DeploymentTimingTest(unittest.TestCase):
         runtime.load.assert_called_once_with()
         runtime.close.assert_called_once_with()
         armed_idle_sleep.assert_called_once()
+
+    def test_running_inference_flushes_observation_wait_diagnostics(self) -> None:
+        runtime = SimpleNamespace(
+            load=Mock(),
+            reset_episode=Mock(),
+            predict=Mock(),
+            close=Mock(),
+        )
+        shared = SimpleNamespace(
+            is_running=_Value(1),
+            safety_state=_Value(int(SafetyState.RUNNING)),
+            run_generation=_Value(4),
+            run_started_monotonic_ns=_Value(1),
+            motion_lock=threading.RLock(),
+            action_control_hz=16.0,
+            set_heartbeat=Mock(),
+            set_ready=Mock(),
+        )
+        config = PolicyRuntimeConfig(
+            deployment=DeploymentConfig(
+                runtime_target="tests:fake",
+                observation_fields="arm_qpos",
+            ),
+            control_dt_s=1.0 / 16.0,
+        )
+
+        def stop_after_wait(_sleep_s: float) -> None:
+            shared.is_running.value = 0
+
+        with (
+            patch(
+                "dexmani_real.deployment.worker.load_policy_runtime",
+                return_value=runtime,
+            ),
+            patch(
+                "dexmani_real.deployment.worker._build_observation",
+                return_value=None,
+            ),
+            patch(
+                "dexmani_real.deployment.worker.flush_every",
+                side_effect=lambda _metrics, *, last_ns, **_kwargs: last_ns,
+            ) as flush_metrics,
+            patch(
+                "dexmani_real.deployment.worker.time.sleep",
+                side_effect=stop_after_wait,
+            ),
+        ):
+            inference_loop(shared, config)
+
+        flush_metrics.assert_called_once()
+        runtime.predict.assert_not_called()
 
     def test_coordinator_publishes_one_due_endpoint_through_its_safety_gate(
         self,

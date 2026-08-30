@@ -28,6 +28,12 @@ logger = get_logger(__name__)
 
 # Counter and guard names shared by the inference worker and coordinator.
 OBSERVATIONS_BUILT = "observations_built"
+OBSERVATION_WAIT_POINTCLOUD_GRID = "observation_wait_pointcloud_grid"
+OBSERVATION_WAIT_POINTCLOUD_STALE = "observation_wait_pointcloud_stale"
+OBSERVATION_WAIT_ARM_HISTORY = "observation_wait_arm_history"
+OBSERVATION_WAIT_HAND_HISTORY = "observation_wait_hand_history"
+OBSERVATION_WAIT_POINTCLOUD_HISTORY = "observation_wait_pointcloud_history"
+OBSERVATION_WAIT_GRID_ADVANCE = "observation_wait_grid_advance"
 OBSERVATION_AGE_MS = "observation_age_ms"
 OBSERVATION_SKEW_MS = "observation_skew_ms"
 INFERENCE_MS = "inference_ms"
@@ -70,6 +76,12 @@ _QUANTILE_POINTS = (("p50", 0.50), ("p95", 0.95), ("p99", 0.99))
 _COUNTER_NAMES = frozenset(
     {
         OBSERVATIONS_BUILT,
+        OBSERVATION_WAIT_POINTCLOUD_GRID,
+        OBSERVATION_WAIT_POINTCLOUD_STALE,
+        OBSERVATION_WAIT_ARM_HISTORY,
+        OBSERVATION_WAIT_HAND_HISTORY,
+        OBSERVATION_WAIT_POINTCLOUD_HISTORY,
+        OBSERVATION_WAIT_GRID_ADVANCE,
         INFERENCE_FAILURES,
         PLANS_CREATED,
         PLANS_SUPERSEDED,

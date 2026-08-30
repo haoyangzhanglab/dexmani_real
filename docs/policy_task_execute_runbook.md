@@ -1,6 +1,7 @@
 # Learned Policy 单次任务执行 Runbook
 
-> 状态：**首次完整 task rollout 已在 58/331 次发布时 fail closed；修复已完成离线验证，
+> 状态：**首次完整 task rollout 已在 58/331 次发布时 fail closed；近截止动作修复后的首次
+> H2/H3 revalidation 又因首命令超时而停止，现已补齐只读 observation-wait diagnostics。
 > 尚须重新通过 H2/H3 shadow、H4 one-endpoint 和新的 task 授权。** 本文给出独立于 H4
 > one-shot 的 bounded task profile；文档和既有硬件证据均不构成新的真机授权。
 
@@ -52,6 +53,13 @@ worker ACK。第 58 个动作仅剩 `8.517 ms` plan validity，短于 30 Hz work
 arm 和 hand 同时判为 expired；2 秒 ACK watchdog 随后正确转入 FAULT。该运行不是任务成功，
 没有自动重试。原始事实与 hash 记录在
 `deployment_reference_task_execute_failure_2026-08-30_77d8c44.json`。
+
+随后在 `bf79d4f` 上进行的 H2/H3 shadow revalidation 没有构建出首个 observation/plan，5 秒
+first-command watchdog 将 RUNNING 退回 ARMED；coupled ring 保持 zero-write。该 revision 的
+no-feedback 分支没有定期 flush 分类指标，无法从 receipt 继续区分具体 observation 前置条件。
+当前实现只增加每秒一次的 pointcloud-grid/stale、arm/hand history 与 grid-advance 等待计数，
+不改变任何 observation 条件或动作路径。失败事实记录在
+`deployment_reference_h2h3_shadow_failure_2026-08-30_bf79d4f.json`。
 
 ## 3. 真机前离线检查
 

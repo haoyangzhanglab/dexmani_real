@@ -36,6 +36,12 @@ from dexmani_real.deployment.metrics import (
     INFERENCE_MS,
     OBSERVATION_AGE_MS,
     OBSERVATION_SKEW_MS,
+    OBSERVATION_WAIT_ARM_HISTORY,
+    OBSERVATION_WAIT_GRID_ADVANCE,
+    OBSERVATION_WAIT_HAND_HISTORY,
+    OBSERVATION_WAIT_POINTCLOUD_GRID,
+    OBSERVATION_WAIT_POINTCLOUD_HISTORY,
+    OBSERVATION_WAIT_POINTCLOUD_STALE,
     OBSERVATIONS_BUILT,
     PLANS_CREATED,
     PLANS_GENERATION_DROPPED,
@@ -485,6 +491,7 @@ def _build_observation(
     run_started_ns: int,
     anchor_ns: int,
     step_dt_ns: int,
+    metrics: Metrics | None = None,
 ) -> ObservationBatch | None:
     """Assemble requested causal modalities from the arm/hand rings.
 
@@ -655,14 +662,20 @@ def _build_observation(
             )
     if pointcloud_requested:
         if pointcloud is None or logical_step_ns <= 0:
+            if metrics is not None:
+                metrics.increment(OBSERVATION_WAIT_POINTCLOUD_GRID)
             return None
         latest_source_ns = int(pointcloud.source_monotonic_ns)
         if anchor_ns - latest_source_ns > max_age_ns:
+            if metrics is not None:
+                metrics.increment(OBSERVATION_WAIT_POINTCLOUD_STALE)
             return None
     elif arm_history is not None and arm_history.values.shape[0] > 0:
         latest_source_ns = int(arm_history.source_monotonic_ns[-1])
         logical_step_ns = latest_source_ns
     else:
+        if metrics is not None:
+            metrics.increment(OBSERVATION_WAIT_ARM_HISTORY)
         return None
     return ObservationBatch(
         observation_id=observation_id,
@@ -768,6 +781,17 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
     last_logical_step_ns = 0
     last_metrics_flush_ns = time.monotonic_ns()
 
+    def wait_for_observation(reason: str | None = None) -> None:
+        nonlocal last_metrics_flush_ns
+        if reason is not None:
+            metrics.increment(reason)
+        last_metrics_flush_ns = flush_every(
+            metrics,
+            last_ns=last_metrics_flush_ns,
+            prefix="inference metrics",
+        )
+        time.sleep(_NO_FEEDBACK_POLL_S)
+
     try:
         while shared.is_running.value:
             tick_start = time.monotonic()
@@ -800,31 +824,32 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
                 run_started_ns=epoch.started_monotonic_ns,
                 anchor_ns=anchor_ns,
                 step_dt_ns=step_dt_ns,
+                metrics=metrics,
             )
             if observation is None:
-                time.sleep(_NO_FEEDBACK_POLL_S)
+                wait_for_observation()
                 continue
             horizon = int(config.observation_horizon)
             if (
                 observation.arm_history is None
                 or observation.arm_history.values.shape[0] != horizon
             ):
-                time.sleep(_NO_FEEDBACK_POLL_S)
+                wait_for_observation(OBSERVATION_WAIT_ARM_HISTORY)
                 continue  # no complete causal arm history yet — never infer
             if config.hand_enabled and (
                 observation.hand_history is None
                 or observation.hand_history.values.shape[0] != horizon
             ):
-                time.sleep(_NO_FEEDBACK_POLL_S)
+                wait_for_observation(OBSERVATION_WAIT_HAND_HISTORY)
                 continue
             if (
                 "point_cloud" in requested
                 and len(observation.pointcloud_history) != horizon
             ):
-                time.sleep(_NO_FEEDBACK_POLL_S)
+                wait_for_observation(OBSERVATION_WAIT_POINTCLOUD_HISTORY)
                 continue
             if observation.logical_step_monotonic_ns <= last_logical_step_ns:
-                time.sleep(_NO_FEEDBACK_POLL_S)
+                wait_for_observation(OBSERVATION_WAIT_GRID_ADVANCE)
                 continue
             metrics.increment(OBSERVATIONS_BUILT)
             observation_age_ms, observation_skew_ms = observation_timing_ms(observation)
