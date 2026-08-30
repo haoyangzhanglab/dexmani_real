@@ -1742,7 +1742,7 @@ class DeploymentTimingTest(unittest.TestCase):
         h4_acknowledgement: CommandPublishStatus | None = None,
         h4_ack_timeout_s: float = 1.0,
         late_h4_acknowledgement: bool = False,
-        request_second_h4_begin: bool = False,
+        request_second_begin: bool = False,
         execute_sequence_delta: int = 1,
         stop_request_after_publication: StopRequest | None = None,
         clock_values: tuple[int, ...] | None = None,
@@ -1841,6 +1841,13 @@ class DeploymentTimingTest(unittest.TestCase):
             sleep_ticks += 1
             if sleep_ticks == 1 and stop_request_after_start is not None:
                 shared.stop_request.value = int(stop_request_after_start)
+            if (
+                request_second_begin
+                and sleep_ticks == 2
+                and shared.safety_state.value == int(SafetyState.ARMED)
+            ):
+                shared.start_request.value = 1
+                return
             if execution_mode == "task" and coupled_cmd_ring.latest_sequence == 1:
                 clock._monotonic_ns_values = iter((base_ns + 1,) * 40)
                 clock._last_monotonic_ns = base_ns + 1
@@ -1851,9 +1858,6 @@ class DeploymentTimingTest(unittest.TestCase):
                     and shared.safety_state.value == int(SafetyState.ARMED)
                 )
             ):
-                if request_second_h4_begin and sleep_ticks == 2:
-                    shared.start_request.value = 1
-                    return
                 shared.is_running.value = 0
             elif sleep_ticks >= (50 if execution_mode in {"execute", "task"} else 3):
                 shared.is_running.value = 0
@@ -1955,13 +1959,32 @@ class DeploymentTimingTest(unittest.TestCase):
             CommandPublishResult(CommandPublishStatus.PUBLISHED),
             execution_mode="execute",
             h4_acknowledgement=CommandPublishStatus.APPLIED,
-            request_second_h4_begin=True,
+            request_second_begin=True,
         )
 
         self.assertEqual(len(candidates), 1)
         self.assertEqual(coupled_cmd_ring.latest_sequence, 1)
         self.assertEqual(shared.safety_state.value, int(SafetyState.ARMED))
         self.assertEqual(shared.execute_completed.value, 1)
+
+    def test_shadow_ignores_a_second_b_after_the_first_run(self) -> None:
+        with self.assertLogs(
+            "dexmani_real.deployment.coordinator", level="WARNING"
+        ) as logs:
+            shared, coupled_cmd_ring, candidates = (
+                self._run_single_endpoint_coordinator(
+                    CommandPublishResult(CommandPublishStatus.SHADOW_VALIDATED),
+                    stop_request_after_start=StopRequest.RUN_TIME_LIMIT,
+                    request_second_begin=True,
+                )
+            )
+
+        self.assertEqual(candidates, [])
+        coupled_cmd_ring.write.assert_not_called()
+        self.assertEqual(shared.safety_state.value, int(SafetyState.ARMED))
+        self.assertTrue(
+            any("policy session already started" in message for message in logs.output)
+        )
 
     def test_coordinator_motion_discard_does_not_publish_or_abort_run(self) -> None:
         shared, coupled_cmd_ring, candidates = self._run_single_endpoint_coordinator(

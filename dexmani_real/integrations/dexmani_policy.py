@@ -26,6 +26,7 @@ import json
 import random
 import subprocess
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -705,6 +706,55 @@ class DexManiPolicyRuntime:
         # Diffusion/FlowMatch backbones have no recurrent state; the real-side
         # observation history reset is the inference worker's responsibility.
         pass
+
+    def warmup(self, *, samples: int) -> tuple[float, ...]:
+        """Exercise the loaded model path without advancing deployment RNG streams."""
+        if isinstance(samples, bool) or not isinstance(samples, int) or samples <= 0:
+            raise ValueError("samples must be a positive integer")
+        if self._agent is None or self._manifest is None:
+            raise RuntimeError("DexManiPolicyRuntime.warmup called before load()")
+
+        n_obs = self._manifest.n_obs_steps
+        num_points = self._manifest.point_cloud_num_points
+        joint_state = torch.zeros(
+            (1, n_obs, _ARM_DOF + _HAND_DOF),
+            dtype=torch.float32,
+            device=self._device,
+        )
+        point_cloud = torch.zeros(
+            (1, n_obs, num_points, self._manifest.point_cloud_feature_dim),
+            dtype=torch.float32,
+            device=self._device,
+        )
+        obs_dict = {"joint_state": joint_state, "point_cloud": point_cloud}
+
+        python_rng_state = random.getstate()
+        numpy_rng_state = np.random.get_state()
+        device = torch.device(self._device)
+        cuda_devices = (
+            [device.index if device.index is not None else torch.cuda.current_device()]
+            if device.type == "cuda"
+            else []
+        )
+        timings_s: list[float] = []
+        try:
+            with torch.random.fork_rng(devices=cuda_devices), torch.inference_mode():
+                for _ in range(samples):
+                    started_ns = time.perf_counter_ns()
+                    result = self._agent.predict_action(
+                        obs_dict,
+                        denoise_timesteps=self._denoise_steps,
+                    )
+                    if not isinstance(result, Mapping) or "pred_action" not in result:
+                        raise ValueError(
+                            "DexMani agent warmup must return 'pred_action'"
+                        )
+                    self._decode(result["pred_action"])
+                    timings_s.append((time.perf_counter_ns() - started_ns) / 1e9)
+        finally:
+            random.setstate(python_rng_state)
+            np.random.set_state(numpy_rng_state)
+        return tuple(timings_s)
 
     def _encode(self, observation: ObservationBatch) -> dict[str, torch.Tensor]:
         """Build the model-native ``joint_state`` / ``point_cloud`` tensors.

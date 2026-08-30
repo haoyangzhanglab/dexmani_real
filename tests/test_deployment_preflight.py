@@ -7,6 +7,7 @@ import importlib
 import json
 import os
 import pickle
+import random
 import subprocess
 import sys
 import tempfile
@@ -167,7 +168,11 @@ class DeploymentPreflightTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = _write_experiment(Path(directory) / "experiment", matching_hash=True)
             config = self._projection(root).runtime
-            runtime = SimpleNamespace(load=Mock(), close=Mock())
+            runtime = SimpleNamespace(
+                load=Mock(),
+                warmup=Mock(return_value=(0.1,) * 5),
+                close=Mock(),
+            )
             shared = SimpleNamespace(
                 is_running=SimpleNamespace(value=0),
                 action_control_hz=16.0,
@@ -188,8 +193,34 @@ class DeploymentPreflightTest(unittest.TestCase):
 
         verified_loader.assert_called_once_with(config)
         runtime.load.assert_not_called()
+        runtime.warmup.assert_called_once_with(samples=5)
         runtime.close.assert_called_once_with()
         shared.set_ready.assert_called_once_with("inference")
+
+    def test_artifact_warmup_latency_failure_prevents_inference_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = _write_experiment(Path(directory) / "experiment", matching_hash=True)
+            config = self._projection(root).runtime
+            runtime = SimpleNamespace(
+                load=Mock(),
+                warmup=Mock(return_value=(0.1, 0.1, 0.9, 0.9, 0.9)),
+                close=Mock(),
+            )
+            shared = SimpleNamespace(
+                is_running=SimpleNamespace(value=0),
+                action_control_hz=16.0,
+                set_heartbeat=Mock(),
+                set_ready=Mock(),
+            )
+            with patch(
+                "dexmani_real.deployment.preflight.load_verified_policy_runtime",
+                return_value=runtime,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "viable action window"):
+                    inference_loop(shared, config)
+
+        shared.set_ready.assert_not_called()
+        runtime.close.assert_called_once_with()
 
     def test_preflight_does_not_replace_checkpoint_bound_rng_streams(self):
         prediction = object()
@@ -263,6 +294,7 @@ class DeploymentPreflightTest(unittest.TestCase):
             )
 
         self.assertEqual(provenance["policy_projection"]["sha256"], projection.sha256)
+        self.assertEqual(provenance["policy_projection"]["device"], "cpu")
         self.assertEqual(provenance["policy_projection"]["inference_seed"], 1066)
         self.assertEqual(
             provenance["policy_projection"]["bounds"]["max_published_endpoints"],
@@ -990,6 +1022,54 @@ class DeploymentPreflightTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "NaN/Inf"):
                 runtime._decode(invalid_pred_action)
 
+    def test_adapter_warmup_restores_python_numpy_and_torch_rng(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = _write_experiment(Path(directory) / "experiment")
+            runtime_config = self._projection(root).runtime
+            allocation = runtime_config.artifact.allocation_contract
+            runtime = DexManiPolicyRuntime(runtime_config)
+            runtime._manifest = DeploymentManifest(
+                action_key=allocation.action_key,
+                n_obs_steps=allocation.n_obs_steps,
+                n_action_steps=allocation.n_action_steps,
+                action_dim=allocation.action_dim,
+                horizon=allocation.horizon,
+                hand_dim=12,
+                control_action_dim=19,
+                sensor_modalities=allocation.sensor_modalities,
+                point_cloud_num_points=allocation.point_cloud_num_points,
+                point_cloud_feature_dim=allocation.point_cloud_feature_dim,
+            )
+
+            def predict_action(*_args, **_kwargs):
+                random.random()
+                np.random.random()
+                torch.rand(1)
+                return {
+                    "pred_action": torch.zeros(
+                        (1, allocation.horizon, allocation.action_dim),
+                        dtype=torch.float32,
+                    )
+                }
+
+            runtime._agent = SimpleNamespace(predict_action=predict_action)
+            random.seed(17)
+            np.random.seed(19)
+            torch.manual_seed(23)
+            python_state = random.getstate()
+            numpy_state = np.random.get_state()
+            torch_state = torch.random.get_rng_state().clone()
+
+            timings_s = runtime.warmup(samples=3)
+
+            self.assertEqual(len(timings_s), 3)
+            self.assertEqual(random.getstate(), python_state)
+            restored_numpy_state = np.random.get_state()
+            self.assertEqual(restored_numpy_state[0], numpy_state[0])
+            np.testing.assert_array_equal(restored_numpy_state[1], numpy_state[1])
+            self.assertEqual(restored_numpy_state[2:], numpy_state[2:])
+            torch.testing.assert_close(torch.random.get_rng_state(), torch_state)
+
     def test_adapter_decodes_complete_ee_future_and_rejects_degenerate_tail(self):
         with tempfile.TemporaryDirectory() as directory:
             root = _write_experiment(Path(directory) / "experiment")
@@ -1048,7 +1128,9 @@ class DeploymentPreflightTest(unittest.TestCase):
 import runpy
 import sys
 namespace = runpy.run_path("examples/run_policy.py")
-code = namespace["main"](["--experiment-dir", sys.argv[1], "--print-config"])
+code = namespace["main"](
+    ["--experiment-dir", sys.argv[1], "--device", "cpu", "--print-config"]
+)
 if code != 0:
     raise SystemExit(code)
 forbidden = (
@@ -1130,6 +1212,7 @@ if loaded:
         def resolve_projection(**kwargs):
             self.assertIs(kwargs["artifact"], artifact)
             self.assertIs(kwargs["runtime_config"], runtime)
+            self.assertEqual(kwargs["device"], "cpu")
             self.assertEqual(kwargs["execution_mode"], "shadow")
             events.append("projection")
             return projection
@@ -1162,6 +1245,8 @@ if loaded:
                 [
                     "--experiment-dir",
                     "synthetic",
+                    "--device",
+                    "cpu",
                     "--max-running-seconds",
                     "120",
                 ]
@@ -1185,6 +1270,7 @@ if loaded:
         module_globals["resolve_runtime_config"] = lambda *, yaml_path: runtime
 
         def resolve_projection(**kwargs):
+            self.assertEqual(kwargs["device"], "cpu")
             self.assertEqual(kwargs["execution_mode"], "execute")
             self.assertTrue(kwargs["hand_acknowledged"])
             bounds = kwargs["h4_execute_bounds"]
@@ -1225,6 +1311,8 @@ if loaded:
                 [
                     "--experiment-dir",
                     "synthetic",
+                    "--device",
+                    "cpu",
                     "--execution-mode",
                     "execute",
                     "--hand",
@@ -1256,6 +1344,7 @@ if loaded:
         module_globals["resolve_runtime_config"] = lambda *, yaml_path: runtime
 
         def resolve_projection(**kwargs):
+            self.assertEqual(kwargs["device"], "cpu")
             self.assertEqual(kwargs["execution_mode"], "task")
             self.assertEqual(kwargs["inference_seed"], 1066)
             self.assertIsNone(kwargs["h4_execute_bounds"])
@@ -1279,6 +1368,8 @@ if loaded:
                 [
                     "--experiment-dir",
                     "synthetic",
+                    "--device",
+                    "cpu",
                     "--execution-mode",
                     "task",
                     "--hand",
@@ -1302,7 +1393,7 @@ if loaded:
             projection.sha256,
         )
 
-    def test_cli_rejects_execute_and_removed_legacy_parameters(self):
+    def test_cli_requires_device_and_rejects_removed_legacy_parameters(self):
         import runpy
 
         main = runpy.run_path(
@@ -1311,6 +1402,8 @@ if loaded:
 
         with tempfile.TemporaryDirectory() as directory:
             root = _write_experiment(Path(directory) / "experiment")
+            with self.assertRaises(SystemExit):
+                main(["--experiment-dir", str(root), "--print-config"])
             with self.assertRaises(SystemExit):
                 main(
                     [

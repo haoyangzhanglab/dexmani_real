@@ -114,11 +114,14 @@ def log_deployment_provenance(
     """
     logger.info(
         "deployment provenance: dexmani_commit=%s model_commit=%s "
-        "runtime_target=%s observation_fields=%s pointcloud_num_points=%d checkpoint=%s "
+        "runtime_target=%s device=%s inference_seed=%d observation_fields=%s "
+        "pointcloud_num_points=%d checkpoint=%s "
         "checkpoint_sha256=%s runtime_sha256=%s",
         dexmani_commit or "unknown",
         model_commit or "unknown",
         deployment.runtime_target,
+        deployment.device,
+        deployment.inference_seed,
         deployment.observation_fields,
         deployment.pointcloud_num_points,
         deployment.checkpoint or "",
@@ -171,6 +174,7 @@ def _physical_execute_provenance_json(
                     "max_running_s": execute_bounds.max_running_s,
                 },
                 "execution_mode": policy_runtime_config.execution_mode,
+                "device": policy_runtime_config.device,
                 "inference_seed": policy_runtime_config.inference_seed,
                 "sha256": projection_sha256,
             },

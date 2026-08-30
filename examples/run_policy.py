@@ -106,7 +106,11 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="Real-owned deployment timing/readiness YAML or artifact expectations",
     )
-    parser.add_argument("--device", default=None, help="operator inference device")
+    parser.add_argument(
+        "--device",
+        required=True,
+        help="explicit operator-owned inference device, for example cuda:0 or cpu",
+    )
     parser.add_argument(
         "--inference-seed",
         type=_inference_seed,

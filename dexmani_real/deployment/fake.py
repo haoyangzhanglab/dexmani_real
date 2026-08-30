@@ -79,6 +79,11 @@ class FakePolicyRuntime:
     def reset_episode(self) -> None:
         self._loaded = True
 
+    def warmup(self, *, samples: int) -> tuple[float, ...]:
+        if isinstance(samples, bool) or not isinstance(samples, int) or samples <= 0:
+            raise ValueError("samples must be a positive integer")
+        return (0.0,) * samples
+
     def predict(self, observation: ObservationBatch) -> PolicyPrediction:
         arm = _last_valid(
             (

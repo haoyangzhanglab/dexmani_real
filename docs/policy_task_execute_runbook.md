@@ -61,6 +61,17 @@ no-feedback 分支没有定期 flush 分类指标，无法从 receipt 继续区�
 不改变任何 observation 条件或动作路径。失败事实记录在
 `deployment_reference_h2h3_shadow_failure_2026-08-30_bf79d4f.json`。
 
+`acc2cc1` 上的后续 H2/H3 已证明 observation 能构建并产生 plan，但该 invocation 未传
+`--device`，实际回落到 CPU；同一 inference child 在点云等 CPU worker 并发后出现
+`0.35–3.69 s` 的间歇推理延迟，固定 action grid 全部或大部过期，最终两次触发 command-silence
+abort。两段 receipt 均为 zero coupled writes，操作员随后从 ARMED 按 Q 正常退出。第二个
+RUNNING epoch 的 start-request 来源无法由旧日志归因，但旧 coordinator 确实允许一个 shadow
+进程内重复启动。离线同 checkpoint/seed 基准确认 CPU 稳态约 196 ms，而 `cuda:0` 首次约
+140 ms、随后约 18–20 ms。因此当前入口要求显式 device，本 reference 固定 `cuda:0`；inference
+ready 前还会完成 5 次无硬件 warmup，要求最后 3 次均落在 artifact action horizon 的可用窗口
+内，并在 warmup 后恢复所有 RNG 状态；同时所有模式每个进程只接受第一次 B。完整事实见
+`deployment_reference_h2h3_shadow_failure_2026-08-30_acc2cc1.json`。
+
 ## 3. 真机前离线检查
 
 在干净且已 review 的 DexMani Real revision 上执行；两条命令都不会连接硬件：
@@ -70,6 +81,7 @@ cd /home/zhanghaoyang/Desktop/dexmani_real
 
 common_args=(
   --experiment-dir /home/zhanghaoyang/Desktop/dexmani_policy/experiments/dp3/pick_place_toy/2026-08-28_13-59_42
+  --device cuda:0
   --execution-mode task
   --hand
   --inference-seed 1066
@@ -110,6 +122,7 @@ DEXMANI_RECEIPT_DIR="$receipt_dir" \
 /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python \
   examples/run_policy.py \
     --experiment-dir /home/zhanghaoyang/Desktop/dexmani_policy/experiments/dp3/pick_place_toy/2026-08-28_13-59_42 \
+    --device cuda:0 \
     --execution-mode task \
     --hand \
     --inference-seed 1066 \

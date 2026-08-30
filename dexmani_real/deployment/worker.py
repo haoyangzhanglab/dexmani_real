@@ -766,6 +766,45 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
         runtime = load_policy_runtime(config.runtime_target, config=config)
         runtime.load()  # raises -> process failure (no dummy safe mode)
 
+    try:
+        if config.artifact is not None:
+            warmup_samples = 5
+            stable_samples = 3
+            timings_s = runtime.warmup(samples=warmup_samples)
+            if len(timings_s) != warmup_samples:
+                raise RuntimeError(
+                    "policy runtime returned an incomplete warmup receipt"
+                )
+            if any(not np.isfinite(value) or value < 0.0 for value in timings_s):
+                raise RuntimeError("policy runtime returned invalid warmup timing")
+            allocation = config.artifact.allocation_contract
+            max_viable_s = (
+                allocation.required_action_steps - 2
+            ) * allocation.control_dt_s - config.command_lead_s
+            if max_viable_s <= 0.0:
+                raise RuntimeError(
+                    "policy artifact has no viable post-inference action window"
+                )
+            stable_timings_s = timings_s[-stable_samples:]
+            logger.info(
+                "inference warmup: samples_ms=%s stable_max_ms=%.3f limit_ms=%.3f",
+                ",".join(f"{value * 1e3:.3f}" for value in timings_s),
+                max(stable_timings_s) * 1e3,
+                max_viable_s * 1e3,
+            )
+            if any(value > max_viable_s for value in stable_timings_s):
+                raise RuntimeError(
+                    "policy inference warmup exceeds the viable action window: "
+                    f"stable_max_ms={max(stable_timings_s) * 1e3:.3f} "
+                    f"limit_ms={max_viable_s * 1e3:.3f}"
+                )
+    except BaseException:
+        try:
+            runtime.close()
+        except Exception:
+            logger.warning("inference: startup runtime.close raised", exc_info=True)
+        raise
+
     shared.set_ready("inference")
     # Refresh the heartbeat after model loading, which may exceed the timeout.
     shared.set_heartbeat("inference", time.monotonic())

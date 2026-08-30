@@ -564,9 +564,9 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
     execute_published_endpoints = 0
     execute_acknowledged_action_id: int | None = None
     execute_pending_acknowledgement: _PendingExecuteAcknowledgement | None = None
-    # Physical execution is one bounded episode per coordinator process. The
-    # supervisor exits after it, and this latch also closes the ARMED/B race.
-    physical_session_started = False
+    # One process carries one operator-authorized policy session. Physical
+    # modes exit after it; shadow remains ARMED for Q but cannot start again.
+    policy_session_started = False
     previous_arm_command_qpos: np.ndarray | None = None
     last_metrics_flush_ns = time.monotonic_ns()
 
@@ -762,12 +762,9 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     _sleep_tick(period_s, tick_start)
                     continue
                 shared.start_request.value = False
-                if (
-                    config.execution_mode in {"execute", "task"}
-                    and physical_session_started
-                ):
+                if policy_session_started:
                     logger.warning(
-                        "coordinator: ignored B after the physical session already started"
+                        "coordinator: ignored B after the policy session already started"
                     )
                     _sleep_tick(period_s, tick_start)
                     continue
@@ -788,8 +785,8 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     "coordinator_loop: RUNNING (run_generation=%d)",
                     int(shared.run_generation.value),
                 )
+                policy_session_started = True
                 if config.execution_mode in {"execute", "task"}:
-                    physical_session_started = True
                     shared.execute_completed.value = False
                 last_valid_policy_command_ns = None
                 run_epoch = read_run_epoch(shared)

@@ -6,6 +6,9 @@
 >
 > 唯一操作者入口：`examples/run_policy.py`
 
+入口要求操作者显式提供 inference `--device`，避免部署无意回落到默认 CPU。当前 frozen
+reference 的离线基准与后续真机验证统一使用 `--device cuda:0`。
+
 ## 1. Review 结论
 
 当前方向正确：训练与仿真保持在 `dexmani_policy`，真实机器人部署适配集中到

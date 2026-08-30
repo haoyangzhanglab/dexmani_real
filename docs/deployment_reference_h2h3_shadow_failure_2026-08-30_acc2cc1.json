@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "record_type": "dexmani_real.policy_deployment.reference_h2h3_shadow_failure",
+  "recorded_at": "2026-08-30T18:03:08+08:00",
+  "authorization_scope": {
+    "execution_mode": "shadow",
+    "workspace": "empty free-space; no object interaction",
+    "max_running_seconds": 120.0,
+    "automatic_retry": false,
+    "timeout_exit": "operator Q from ARMED"
+  },
+  "provenance": {
+    "dexmani_real_commit": "acc2cc1fb7d18694c67ec32a0c128c5342db4bf1",
+    "dexmani_real_dirty": false,
+    "dexmani_real_python_tree_sha256": "b0bb517d66ea8df1547a6add7435d12caf7e98a63e2068033a421d1723e82d21",
+    "dexmani_policy_commit": "7e31d10e7a31ff3d12df31b8683c9c90b357cbc5",
+    "checkpoint": "epoch=1126-step=00080000-deployment-v2.pt",
+    "checkpoint_sha256": "b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c",
+    "runtime_sha256": "186ec09369b4cd5b70b64b8d445123b9e72f10eaf08ea47df078141eb1d5a292",
+    "inference_seed": 1066
+  },
+  "startup": {
+    "all_subsystems_ready": true,
+    "startup_reset_home_accepted_count": 1,
+    "armed_before_first_run": true,
+    "arm_servo_calls": 0
+  },
+  "run_receipts": [
+    {
+      "run_generation": 4,
+      "reason": "command silence timeout",
+      "zero_coupled_command_writes": true,
+      "coupled_command_writes": 0,
+      "plans_ingested": 2,
+      "endpoints_due": 9,
+      "endpoints_shadow_validated": 6,
+      "endpoints_stale_discarded": 3,
+      "inference_samples": 2,
+      "inference_failures": 1,
+      "inference_ms_fast_sample": 253.525572,
+      "inference_ms_slow_sample": 3688.331393,
+      "observation_wait_pointcloud_grid": 21,
+      "observations_built": 2,
+      "plans_created": 1
+    },
+    {
+      "run_generation": 6,
+      "reason": "command silence timeout",
+      "zero_coupled_command_writes": true,
+      "coupled_command_writes": 0,
+      "plans_ingested": 2,
+      "endpoints_due": 7,
+      "endpoints_shadow_validated": 5,
+      "endpoints_stale_discarded": 2,
+      "plans_generation_dropped": 1,
+      "plans_stale": 1,
+      "inference_samples": 4,
+      "inference_failures": 1,
+      "inference_ms_last": 354.354379,
+      "inference_ms_p50": 496.762604,
+      "inference_ms_p95": 1069.770636,
+      "observations_built": 3,
+      "plans_created": 2
+    }
+  ],
+  "failure_chain": [
+    "Point-cloud grid history became available and complete observations reached the model; the previous unclassified observation-wait hypothesis is therefore eliminated for this run.",
+    "One generation-4 inference took 3688.331393 ms, so the complete fixed-grid action horizon expired and inference_failures incremented.",
+    "Later predictions intermittently took 354-1069 ms and several endpoints reached the final publication boundary with only 48.324, 25.596, 34.496, 6.828 ms or a negative temporal window remaining.",
+    "The near-expiry gate rejected those stale endpoints, then the 2 s command-silence watchdog returned each shadow run to ARMED without a coupled command write.",
+    "After generation 4 returned to ARMED, a second start_request was accepted immediately as generation 6. The source log does not identify whether this was a second physical key event or a queued input; the acc2cc1 coordinator allowed repeated shadow sessions, so no stronger attribution is supported."
+  ],
+  "offline_fact_check": {
+    "operational_runtime_device": "cpu",
+    "device_source": "--device was omitted; DeploymentConfig default resolved to cpu",
+    "same_checkpoint_process_samples_ms": [
+      190.369,
+      196.285,
+      196.578,
+      198.89,
+      197.525,
+      195.539,
+      197.458,
+      196.074,
+      197.766,
+      195.646
+    ],
+    "cpu_topology": "AMD Ryzen 9 9900X; 12 cores / 24 threads",
+    "torch_cpu_threads": 12,
+    "torch_interop_threads": 24,
+    "cuda_device": "NVIDIA GeForce RTX 4090",
+    "cuda_device_0_same_checkpoint_warmup_ms": [
+      139.853,
+      18.233,
+      18.064,
+      18.009,
+      18.052,
+      19.755,
+      18.014,
+      17.967,
+      18.004,
+      18.002
+    ],
+    "interpretation": "The failed operational invocation ran on CPU, so GPU desktop activity is excluded as its cause. The frozen model is stable around 196 ms in an isolated CPU process, but the operational multi-process lifecycle exhibited CPU scheduling/contention latency. Explicit cuda:0 inference removes that CPU compute contention and provides more than an order of magnitude stable-state timing margin."
+  },
+  "shutdown": {
+    "operator_q_from_armed": true,
+    "exit_reason": "explicit quit",
+    "final_safety_state": "DISARMED",
+    "supervisor_normal": true,
+    "all_worker_processes_exited_gracefully": true,
+    "clean": true
+  },
+  "source_evidence": {
+    "terminal_log_path": "/tmp/dexmani-h2h3-shadow-acc2cc1.EDeAf4/terminal.log",
+    "terminal_log_size_bytes": 18411,
+    "terminal_log_line_count": 90,
+    "terminal_log_sha256": "b9380ef5a18764465dbf254a8fc43b594322a6a026334bb299528190c16e7c82"
+  },
+  "disposition": {
+    "h2h3_passed": false,
+    "automatic_retry_performed_by_agent": false,
+    "required_remediation": [
+      "Qualify several predictions in the operational inference child before it reports ready or any robot worker starts; reject unstable latency against the immutable action horizon.",
+      "Restore checkpoint-bound Python, NumPy, Torch CPU and CUDA RNG state after warmup so qualification cannot change policy outputs.",
+      "Require an explicit operator inference device at the run_policy.py boundary; use the offline-qualified cuda:0 projection for this frozen reference.",
+      "Accept at most one B-started policy session per process in shadow as well as physical modes."
+    ],
+    "required_revalidation": "Run offline regression and exact frozen preflight, then obtain a new explicit one-shot H2/H3 shadow authorization."
+  }
+}

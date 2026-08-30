@@ -35,6 +35,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `docs/dexmani_policy_integration_followup.md` | 另一台机器 Policy 分支稳定后的兼容性 review、验证与版本化 artifact 合并清单。 |
 | `docs/deployment_reference_task_execute_failure_2026-08-30_77d8c44.json` | 首次 bounded task 在 58/331 次发布时因近截止动作被 worker 判为 expired 并触发 ACK-timeout FAULT 的失败证据、hash 与修复门槛。 |
 | `docs/deployment_reference_h2h3_shadow_failure_2026-08-30_bf79d4f.json` | 近截止动作修复后的首次 H2/H3 revalidation 在首命令前超时、zero-write、缺少分类 observation-wait 指标的失败证据与诊断门槛。 |
+| `docs/deployment_reference_h2h3_shadow_failure_2026-08-30_acc2cc1.json` | observation-wait diagnostics revision 的 H2/H3 发现隐式 CPU 推理争用、两段 zero-write silence abort、正常 Q 退出，以及显式 CUDA device、inference-child warmup、单次 B 修复门槛。 |
 | `docs/deployment_reference_h4_execute_2026-08-30_2d37080.json` | 当前 HOME-event coalescing revision 的单 HOME、单 coupled endpoint、双 worker ACK 与 clean-shutdown H4 证据。 |
 | `docs/deployment_reference_h2h3_shadow_2026-08-30_506729e.json` | 当前 `506729e` HOME-event coalescing revision 的 120 秒 H2/H3 shadow provenance、1912 endpoint validation、zero-write 与 clean-shutdown 证据。 |
 | `docs/deployment_reference_h2h3_shadow_2026-08-30_a3a45e3.json` | `a3a45e3` home/seed revision 的 120 秒 H2/H3 shadow provenance、1913 endpoint validation、zero-write 与 clean-shutdown 回归证据。 |

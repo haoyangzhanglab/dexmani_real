@@ -21,6 +21,8 @@ shadow 证据解释成 execute 授权。
 
 `examples/run_policy.py` 和 lifecycle 仅接受以下不可放宽的 H4 profile：
 
+- 必须显式声明 inference `--device`；本 frozen reference 使用已离线验证的
+  `--device cuda:0`，不能再隐式落到 CPU；
 - `--execution-mode execute --hand`，且 artifact 必须要求 hand；
 - `--execute-max-published-endpoints 1`，不能使用其他数值；
 - `--execute-ack-timeout-seconds <finite positive>`；
@@ -80,8 +82,9 @@ CLI/lifecycle 与 receipt，并对同一 frozen reference 重跑 `--print-config
 在启动硬件前，实施者与操作员逐项确认：
 
 1. 恢复干净、已 review 的 execute enablement revision；无未解释的配置或 artifact 差异。
-2. 用该 revision 对同一 frozen artifact 运行无硬件 `--print-config` 与 `--preflight-only`；记录
-   checkpoint/index/runtime/source identity。
+2. 用该 revision 和与 operational invocation 相同的显式 `--device cuda:0`，对同一 frozen
+   artifact 运行无硬件 `--print-config` 与 `--preflight-only`；记录 checkpoint/index/runtime/
+   source identity。
 3. 确认 xArm、XHand、RealSense、网络/串口、calibration 与 worker SDK 状态均健康；任一初始化
    fault 均取消本次 H4。
 4. 清空机械臂与手指潜在 sweep 空间；移除物体；人员退出；e-stop 可立即触及。

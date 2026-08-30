@@ -302,7 +302,7 @@ class JointActionChunk:
 
 @runtime_checkable
 class PolicyRuntime(Protocol):
-    """Model-side policy boundary: load -> predict -> reset_episode.
+    """Model-side policy boundary: load -> warmup -> predict -> reset_episode.
 
     ``predict`` encodes an ``ObservationBatch`` into the model-native input,
     runs inference, and decodes the result into an untimed
@@ -312,6 +312,8 @@ class PolicyRuntime(Protocol):
     """
 
     def load(self) -> None: ...
+
+    def warmup(self, *, samples: int) -> tuple[float, ...]: ...
 
     def reset_episode(self) -> None: ...
 
