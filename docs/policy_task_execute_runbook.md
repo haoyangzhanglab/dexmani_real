@@ -19,8 +19,9 @@
   current/home/delta/tolerance 数值；
 - 物理模式启用 H：先要求 XHand home command 被 SDK 接受，再通过完整碰撞模型规划并
   执行 arm home；按既定要求，不判断 XHand 关节是否落在 home tolerance 内；
-- diffusion 推理每次使用 receipt 中的 `inference_seed`，避免相同观测受进程 RNG 状态影响；
-  本 checkpoint 的命令采用 Policy eval 约定 `training.seed + 1024 = 42 + 1024 = 1066`；
+- inference worker 在构造 agent 前用 receipt 中的 `inference_seed` 初始化一次 diffusion RNG
+  stream，后续 prediction 自然推进该 stream；本 checkpoint 的命令采用 Policy eval 约定
+  `training.seed + 1024 = 42 + 1024 = 1066`；
 - H4 `execute` 仍严格只发布 1 个 endpoint；完整 rollout 使用独立 `task` 模式，不能用
   增大 H4 bound 的方式绕过 review；
 - `task` 每次只允许一个 coupled command 在途；arm 与 hand 对同一 action id 均 ACK 后，
