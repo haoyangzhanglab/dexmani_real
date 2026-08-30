@@ -422,6 +422,74 @@ class DeploymentPreflightTest(unittest.TestCase):
         self.assertFalse(shared.start_request.value)
         self.assertFalse(shared.stop_request.value)
 
+    def test_physical_operator_drains_home_events_accumulated_while_homing(self):
+        shared = SimpleNamespace(
+            is_running=SimpleNamespace(value=1),
+            start_request=SimpleNamespace(value=False),
+            stop_request=SimpleNamespace(value=False),
+            quit_requested=SimpleNamespace(value=False),
+            error_state=SimpleNamespace(value=False),
+            estop_request=SimpleNamespace(value=False),
+        )
+
+        class _Keyboard:
+            estop_latched = False
+            healthy = True
+
+            def __init__(self):
+                self.signals = [ControlSignal.HOME, ControlSignal.HOME]
+                self.drained = 0
+
+            @staticmethod
+            def start():
+                return None
+
+            @staticmethod
+            def stop():
+                return None
+
+            def poll(self, *, timeout):
+                del timeout
+                if not self.signals:
+                    shared.is_running.value = 0
+                    return ()
+                signals = tuple(self.signals)
+                self.signals.clear()
+                return signals
+
+            def drain_signal(self, target):
+                retained = [signal for signal in self.signals if signal is not target]
+                removed = len(self.signals) - len(retained)
+                self.signals = retained
+                self.drained += removed
+                return removed
+
+        keyboard = _Keyboard()
+
+        def home(*_args, **_kwargs):
+            keyboard.signals.extend([ControlSignal.HOME] * 7)
+
+        with (
+            patch(
+                "dexmani_real.deployment.operator.KeyboardHandler",
+                return_value=keyboard,
+            ),
+            patch(
+                "dexmani_real.deployment.operator._home", side_effect=home
+            ) as run_home,
+        ):
+            run_operator_control(
+                shared,
+                object(),
+                object(),
+                object(),
+                stop_event=threading.Event(),
+                execution_mode="execute",
+            )
+
+        run_home.assert_called_once()
+        self.assertEqual(keyboard.drained, 7)
+
     def test_table_plane_projection_is_null_when_disabled_and_exact_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory:
             root = _write_experiment(Path(directory) / "experiment")
@@ -1067,13 +1135,21 @@ if loaded:
             return projection
 
         module_globals["resolve_policy_runtime_config"] = resolve_projection
-        module_globals["resolve_real_source_identity"] = lambda: object()
+        real_source = object()
+        module_globals["resolve_real_source_identity"] = lambda: real_source
         lifecycle = ModuleType("dexmani_real.deployment.lifecycle")
 
-        def run_lifecycle(actual_runtime, actual_projection, *, max_running_s):
+        def run_lifecycle(
+            actual_runtime,
+            actual_projection,
+            *,
+            max_running_s,
+            real_source: object,
+        ):
             self.assertIs(actual_runtime, runtime)
             self.assertIs(actual_projection, projection.runtime)
             self.assertEqual(max_running_s, 120.0)
+            self.assertIs(real_source, module_globals["resolve_real_source_identity"]())
             events.append("lifecycle")
             return 0
 

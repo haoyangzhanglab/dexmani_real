@@ -186,6 +186,7 @@ def run_operator_control(
             if keyboard.estop_latched or not keyboard.healthy:
                 shared.estop_request.value = True
                 return
+            home_handled = False
             for signal in keyboard.poll(timeout=_POLL_S):
                 if signal is ControlSignal.BEGIN:
                     shared.start_request.value = True
@@ -195,6 +196,9 @@ def run_operator_control(
                     if planner is None:
                         logger.warning("operator: H is disabled in policy deployment")
                         continue
+                    if home_handled:
+                        continue
+                    home_handled = True
                     _home(
                         shared,
                         runtime,
@@ -208,6 +212,11 @@ def run_operator_control(
                             or shared.estop_request.value
                         ),
                     )
+                    # HOME blocks while hand/arm homing completes. Discard only
+                    # HOME events accumulated during that interval so one
+                    # operator key press cannot trigger repeated home commands;
+                    # preserve B/S/Q/ESC events for normal handling.
+                    keyboard.drain_signal(ControlSignal.HOME)
                 elif signal is ControlSignal.QUIT:
                     if not revoke_motion(shared, SafetyState.ARMED) and int(
                         shared.safety_state.value

@@ -343,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime,
             projection.runtime,
             max_running_s=args.max_running_seconds,
+            real_source=real_source,
         )
     return run_policy_deployment(
         runtime,
