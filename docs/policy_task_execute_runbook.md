@@ -1,11 +1,13 @@
 # Learned Policy 单次任务执行 Runbook
 
-> 状态：**首次完整 task rollout 已在 58/331 次发布时 fail closed；其后的 observation 与
-> CPU inference 问题均已定位修复。current Python tree 已通过 `cuda:0` H2/H3 shadow，并在
-> `a697480` sealed 完成 H4 one-endpoint。** task profile 的 deterministic seed=1066 也已在任务场景
-> 完成 zero-write shadow，见
+> 状态：**两次完整 task rollout 均已 fail closed：旧 revision 在 58/331 次发布时因 near-expiry
+> command 触发 ACK timeout；`3e1d096` 在 121/331 次发布时由 hand endpoint expiry 触发 ACK
+> timeout。** observation、CPU inference 和首个 near-expiry command 的问题已经定位修复；current
+> Python tree 已通过 `cuda:0` H2/H3 shadow，并在 `a697480` sealed 完成 H4 one-endpoint。task profile
+> 的 deterministic seed=1066 也已在任务场景完成 zero-write shadow，见
 > [`deployment_reference_task_scene_h2h3_shadow_2026-08-31_6b976f8.json`](deployment_reference_task_scene_h2h3_shadow_2026-08-31_6b976f8.json)。
-> 剩余 gate 是独立 task review 和新的 task 授权。
+> task rollout 现暂停于 hand endpoint expiry 的数值诊断；根因 review、修复验证和新的 task 授权
+> 均为后续 gate。
 > 本文给出独立于 H4 one-shot 的 bounded task profile；文档和既有硬件证据均不构成新的真机授权。
 
 ## 1. 根因与修复边界
@@ -47,7 +49,7 @@
 也没有任务成功传感器，因此软件不能自动证明物体已被成功 pick/place。物理任务结果仍须由
 现场操作者观察记录；策略能力本身不能由运行命令保证。
 
-当前数据 episode 最大长度为 331 control ticks。首次完整 rollout 不越过训练长度，使用
+当前数据 episode 最大长度为 331 control ticks。完整 rollout 不越过训练长度，使用
 331 endpoints（20.6875 s @ 16 Hz）和 25 s B-relative watchdog；任何更长或重复运行都需要
 重新 review 与授权。
 
@@ -56,6 +58,13 @@ worker ACK。第 58 个动作仅剩 `8.517 ms` plan validity，短于 30 Hz work
 arm 和 hand 同时判为 expired；2 秒 ACK watchdog 随后正确转入 FAULT。该运行不是任务成功，
 没有自动重试。原始事实与 hash 记录在
 `deployment_reference_task_execute_failure_2026-08-30_77d8c44.json`。
+
+2026-08-31 在 `3e1d096` 上的 task scene / `cuda:0` / seed=1066 尝试已完成一次 physical
+home，并发布 121/331 个 coupled endpoints；前 120 个获得双 worker ACK。最后一个发布 endpoint
+在 hand worker 侧因 hard delivery expiry 被丢弃，随后 2 秒双 ACK watchdog 正确进入 FAULT。
+该日志尚不能区分 task-object contact 与 hand-loop stall；在明确数值诊断出现之前，不能将它归因于
+任一者，也不得重试。完整事实与 source hash 记录在
+`deployment_reference_task_execute_failure_2026-08-31_3e1d096.json`。
 
 随后在 `bf79d4f` 上进行的 H2/H3 shadow revalidation 没有构建出首个 observation/plan，5 秒
 first-command watchdog 将 RUNNING 退回 ARMED；coupled ring 保持 zero-write。该 revision 的

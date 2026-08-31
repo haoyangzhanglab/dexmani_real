@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "record_type": "dexmani_real.policy_deployment.task_execute_failure_receipt",
+  "recorded_at": "2026-08-31T19:03:12+08:00",
+  "authorization_scope": {
+    "execution_mode": "task",
+    "inference_device": "cuda:0",
+    "inference_seed": 1066,
+    "scene": "task objects placed as in training; no personnel or non-task obstacles; e-stop ready; xArm, XHand, and RealSense healthy",
+    "hand_behavior": "one startup reset_home, then one accepted H hand-home plus collision-checked canonical arm-home sequence before B",
+    "max_running_seconds": 25.0,
+    "max_published_endpoints": 331,
+    "acknowledgement_timeout_seconds": 2.0,
+    "automatic_retry": false
+  },
+  "provenance": {
+    "dexmani_real_commit": "3e1d096c682de48c05a08c3915d6045d28e5afa0",
+    "dexmani_real_dirty_at_launch": false,
+    "dexmani_real_python_tree_sha256": "c5e3571bbe66a39cc75d17e9f2bf27ad7623a084b3457f4cf5f5678b6f0a51b5",
+    "dexmani_policy_commit": "7e31d10e7a31ff3d12df31b8683c9c90b357cbc5",
+    "dexmani_policy_dirty": false,
+    "dexmani_policy_python_tree_sha256": "9f48ce9ce876be8aacadd38f3f7b1859b8a07f9660590a921043f5e389efa129",
+    "checkpoint_sha256": "b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c",
+    "index_sha256": "d67bf21394c8d79239dd0f116baf25a681c3e4d0964569ce47a520f62e047c6e",
+    "runtime_sha256": "186ec09369b4cd5b70b64b8d445123b9e72f10eaf08ea47df078141eb1d5a292",
+    "projection_sha256": "fd46d7b9653fd43d6dcf6e02c0c408ad7785be890d77a4c81475f2c422c53505"
+  },
+  "physical_home": {
+    "startup_reset_home_accepted_count": 1,
+    "hand_home_action_id": 1,
+    "arm_home_path": "direct, 2 validated milestones",
+    "completed": true,
+    "run_generation": 5
+  },
+  "execution_result": {
+    "completed": false,
+    "outcome": "not_completed",
+    "reason": "arm/hand acknowledgement timeout",
+    "final_safety_state": "FAULT",
+    "supervisor_normal": false,
+    "clean": false,
+    "coupled_command_start_sequence": 1,
+    "coupled_command_end_sequence": 122,
+    "coupled_command_writes": 121,
+    "max_published_endpoints": 331,
+    "endpoints_published": 121,
+    "endpoints_acknowledged": 120,
+    "last_acknowledged_action_id": 121,
+    "pending_action_id_inferred_from_sequence": 122,
+    "acknowledgement_timeout_seconds": 2.0
+  },
+  "direct_failure_evidence": {
+    "hand_worker_log": "hand_loop: discarded command: expired command",
+    "coordinator_log": "physical execute failure: arm/hand acknowledgement timeout",
+    "candidate_delivery_window_contract": "candidate expiry is min(publication_time + action_validity_s=0.5, immutable source-plan deadline); worker rejects when now >= valid_until",
+    "established": "the final coupled endpoint was published, but the hand worker did not acknowledge it before its hard delivery expiry and the coordinator then failed closed after the 2-second dual-ACK deadline",
+    "not_established": [
+      "whether the hand was mechanically impeded by task-object contact",
+      "whether XHand state acquisition or the hand loop stalled before expiry",
+      "the final endpoint target, measured-hand delta, remaining delivery time, or ramp-step count; this revision did not log them"
+    ]
+  },
+  "metrics": {
+    "plans_ingested": 86,
+    "endpoints_due": 121,
+    "endpoints_committed": 121,
+    "endpoints_coalesced": 18,
+    "execute_acknowledged": 120,
+    "execute_ack_timeout": 1,
+    "plan_age_ms_p50": 37.395358,
+    "plan_age_ms_p95": 93.38628,
+    "plan_age_ms_p99": 96.759024,
+    "usable_horizon_ms_p50": 603.415054,
+    "usable_horizon_ms_p95": 671.853747,
+    "usable_horizon_ms_p99": 683.374081
+  },
+  "worker_exit_evidence": {
+    "arm": "graceful:0; servo_calls=121; duplicate_skips=200",
+    "hand": "graceful:0; sdk_send_attempts=136; exact_target_accepts=120; crc_unconfirmed=0; duplicate_skips=138; sdk_rejections=0",
+    "inference": "graceful:0",
+    "camera": "graceful:0",
+    "pointcloud": "graceful:0",
+    "policy": "graceful:0"
+  },
+  "observed_nonfatal_warnings": [
+    "arm loop over budget after completed home: actual=849.5 ms, target=33.3 ms; this was before B",
+    "hand_state shared-memory ring recovered 13/14 history frames once"
+  ],
+  "source_evidence": {
+    "terminal_log_path": "/tmp/dexmani-task-execute.xi0oRO/terminal.log",
+    "terminal_log_sha256": "12e6090732c039facee994ad0eae39a55105f6cb34532b86f9c93445c6ee6188",
+    "terminal_log_line_count": 207,
+    "terminal_log_size_bytes": 40121,
+    "runtime_receipt_path": "/home/zhanghaoyang/.dexmani/receipts/task_execute_1788174192797116591_3263720_4aacf56342cf4236be444ad6618f904f.json",
+    "runtime_receipt_sha256": "244891cad55c2e0cf5a8d3972823fdae08ffd6add0757aa906536922e2a0e0c3"
+  }
+}

@@ -55,6 +55,45 @@ def limit_hand_delta(
     return measured + np.clip(target - measured, -max_delta, max_delta)
 
 
+def expired_hand_command_diagnostics(
+    command: np.ndarray,
+    measured_qpos: np.ndarray,
+    *,
+    now_monotonic_ns: int,
+    max_delta_rad_per_tick: float | np.ndarray,
+) -> str:
+    """Render bounded numeric context for one already-validated expired command."""
+    target = np.asarray(command["hand_qpos"][0], dtype=np.float64)
+    measured = np.asarray(measured_qpos, dtype=np.float64)
+    max_delta = np.broadcast_to(
+        np.asarray(max_delta_rad_per_tick, dtype=np.float64), HAND_JOINT_SHAPE
+    )
+    delta = np.abs(target - measured)
+    worst_joint = int(np.argmax(delta))
+    created_ns = int(command["created_monotonic_ns"][0])
+    valid_until_ns = int(command["valid_until_monotonic_ns"][0])
+    now_ns = int(now_monotonic_ns)
+    return json.dumps(
+        {
+            "action_id": int(command["action_id"][0]),
+            "age_ms": round((now_ns - created_ns) / 1e6, 3),
+            "delivery_window_ms": round((valid_until_ns - created_ns) / 1e6, 3),
+            "overdue_ms": round((now_ns - valid_until_ns) / 1e6, 3),
+            "max_delta_rad_per_tick": float(max_delta[worst_joint]),
+            "max_target_minus_measured_rad": round(float(delta[worst_joint]), 6),
+            "minimum_ramp_ticks": int(
+                np.ceil(delta[worst_joint] / max_delta[worst_joint])
+            ),
+            "worst_joint_index": worst_joint,
+            "worst_joint_measured_rad": round(float(measured[worst_joint]), 6),
+            "worst_joint_target_rad": round(float(target[worst_joint]), 6),
+        },
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 def _safe_disconnect(hand: Any) -> bool:
     """Disconnect the hand driver, tolerating a never-connected instance."""
     if hand is None:
@@ -406,7 +445,19 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                     shared.error_state.value = True
                     return
                 if sequence_int != last_rejected_ring_sequence:
-                    logger.info("hand_loop: discarded command: %s", issue.reason)
+                    if issue.reason == "expired command":
+                        logger.info(
+                            "hand_loop: discarded command: %s diagnostics=%s",
+                            issue.reason,
+                            expired_hand_command_diagnostics(
+                                command,
+                                state.qpos,
+                                now_monotonic_ns=time.monotonic_ns(),
+                                max_delta_rad_per_tick=config.hand_max_delta_rad_per_tick,
+                            ),
+                        )
+                    else:
+                        logger.info("hand_loop: discarded command: %s", issue.reason)
                     last_rejected_ring_sequence = sequence_int
                 rate_mgr.wait()
                 continue

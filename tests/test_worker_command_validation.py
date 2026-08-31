@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
@@ -21,7 +22,7 @@ from dexmani_real.robot.command_validation import (
     check_worker_arm_command,
     check_worker_hand_command,
 )
-from dexmani_real.robot.hand_worker import hand_loop
+from dexmani_real.robot.hand_worker import expired_hand_command_diagnostics, hand_loop
 from dexmani_real.robot_spec import (
     HAND_CONTACT_SHAPE,
     HAND_JOINT_SHAPE,
@@ -43,6 +44,36 @@ class _StartupSendStatus(Enum):
 
 
 class WorkerCommandValidationTest(unittest.TestCase):
+    def test_expired_hand_command_diagnostics_reports_delivery_and_ramp_values(
+        self,
+    ) -> None:
+        command = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
+        command["action_id"][0] = 42
+        command["hand_present"][0] = 1
+        command["created_monotonic_ns"][0] = 10_000_000_000
+        command["scheduled_target_monotonic_ns"][0] = 10_000_000_000
+        command["target_monotonic_ns"][0] = 10_000_000_000
+        command["valid_until_monotonic_ns"][0] = 10_500_000_000
+        command["hand_qpos"][0, 11] = 0.95
+
+        diagnostics = json.loads(
+            expired_hand_command_diagnostics(
+                command,
+                np.zeros(HAND_JOINT_SHAPE, dtype=np.float64),
+                now_monotonic_ns=10_600_000_000,
+                max_delta_rad_per_tick=0.3,
+            )
+        )
+
+        self.assertEqual(diagnostics["action_id"], 42)
+        self.assertEqual(diagnostics["age_ms"], 600.0)
+        self.assertEqual(diagnostics["delivery_window_ms"], 500.0)
+        self.assertEqual(diagnostics["overdue_ms"], 100.0)
+        self.assertEqual(diagnostics["worst_joint_index"], 11)
+        self.assertEqual(diagnostics["max_target_minus_measured_rad"], 0.95)
+        self.assertEqual(diagnostics["max_delta_rad_per_tick"], 0.3)
+        self.assertEqual(diagnostics["minimum_ramp_ticks"], 4)
+
     def test_arm_uses_twenty_degree_command_jump_fallback(self) -> None:
         runtime = resolve_runtime_config()
         loop_config = ArmLoopConfig.from_runtime(runtime)
