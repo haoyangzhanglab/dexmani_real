@@ -182,7 +182,7 @@ def _parser() -> argparse.ArgumentParser:
     modes.add_argument(
         "--preflight-only",
         action="store_true",
-        help="hash, single-load, restore, and fake-observation check in a child",
+        help="hash, single-load, restore, and synthetic-observation check in a child",
     )
     return parser
 

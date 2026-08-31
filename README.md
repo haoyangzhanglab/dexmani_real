@@ -36,8 +36,8 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
   点云数据可导出 Policy Zarr v5。导出坚持一份 processed HDF5 对应一个训练 episode；
   删除过 source 行或存在时序缺口的 episode 整条拒绝，不在缺口处拆分。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
-- 通过可替换 `PolicyRuntime` 运行 joint/EE-action learned policy；仓库包含无模型的
-  deterministic fake 实现和 `dexmani_policy` 集成。启动时 `DeploymentManifest`
+- 通过 Real 固定拥有的 `dexmani_policy` adapter 运行 joint/EE-action learned policy。
+  启动时 `DeploymentManifest`
   fail-closed 校验自描述 checkpoint 与部署配置（action/observation/点云/时序合同）。
 
 ## 导航
@@ -190,7 +190,7 @@ point-cloud worker。worker 始终读取最新的 depth-to-color aligned RGB-D�
 `camera_generation` 一致。每个点云均因果配对到不晚于它、并处于
 `max_observation_skew_s` 内的 arm/hand 状态，不插值、填充或复用旧 run 数据。每帧为 xArm-base
 `float32 (N, 6)`，列语义为 `xyzrgb`，RGB 范围为 `[0,1]`。`pointcloud_num_points` 只允许
-`1024`、`2048`、`4096`、`8192`，也可通过 `--pointcloud-num-points` 覆盖。
+`1024`、`2048`、`4096`、`8192`，部署时必须与 artifact 和 Real runtime 精确一致。
 
 coordinator 将通过安全门的策略 endpoint 原子写为单条 coupled command，并立即返回，不在控制热路径
 等待 worker 握手。ring sequence 是实际的传输 epoch；arm/hand worker 在各自 SDK 边界复核同一个
@@ -216,9 +216,7 @@ policy ID、采样/变换语义、配置哈希和桌面平面写入模型数据�
 
 ```yaml
 deployment:
-  runtime_target: dexmani_real.integrations.dexmani_policy:DexManiPolicyRuntime
   checkpoint: /path/to/checkpoints/best.pt
-  device: cuda:0
   task_name: pick               # 须与训练数据合同 task_name 精确一致
   action_key: action            # action | action_ee（须与 checkpoint 一致）
   hand_enabled: true
@@ -228,7 +226,12 @@ deployment:
   max_grid_lag_s: 0.08
   max_source_to_command_age_s: 0.75
   command_lead_s: 0.01
+  inference_seed: 1066
 ```
+
+runtime 实现固定为 Real-owned `DexManiPolicyRuntime`，不能由 YAML 重定向；checkpoint、task、
+action、observation 与点云字段在 YAML 中只是 artifact expectation。推理 device 必须通过
+`examples/run_policy.py --device ...` 显式提供。
 
 `dexmani_policy` 部署只接受包含 resolved inference config、完整 `train_params` 和训练数据合同的
 自描述 checkpoint。训练数据必须是 Real Policy Zarr v5，且 `task_name`、`dt`、

@@ -109,13 +109,13 @@ DexMani 的 ring 实现与 ManiUniCon 不同，因此应采纳**容量推导原�
 ### 3. 保持模型资源在推理子进程内惰性初始化
 
 ManiUniCon 在 policy process 的 `run()` 中实例化模型和 wrapper；这避免将 CUDA context 或
-checkpoint 对象跨进程传递。DexMani 的 `load_policy_runtime()` 已采用同一更严格的原则：父进程
-不导入模型，worker 内 `load()` 失败即由 supervisor 可见。
+checkpoint 对象跨进程传递。DexMani 的固定 verified artifact loader 采用同一更严格的原则：
+父进程不导入模型，worker 内 restore 失败即由 supervisor 可见。
 
 此项是**已采纳、应保持**的机制，而不是新增抽象。后续模型接入应继续遵守：
 
-- factory 只接收冻结的 `DeploymentConfig`，不接收 `RuntimeChannels` 或 SDK；
-- 构造、`load()`、`reset_episode()` 和非预期 `predict()` 失败必须使 supervisor 可见；
+- adapter 只接收冻结的 `PolicyRuntimeConfig`，不接收 `RuntimeChannels` 或 SDK；
+- 构造、restore、`reset_episode()` 和非预期 `predict()` 失败必须使 supervisor 可见；
   预期的无效模型输出可按既有语义丢弃，并由 command-silence watchdog 收敛；
 - `close()` 是清理路径，不得被当作已证明的安全停机。当前实现记录其异常；若未来需要把
   清理失败作为部署失败，应由 shutdown report 显式承载；

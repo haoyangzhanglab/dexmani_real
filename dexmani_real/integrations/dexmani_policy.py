@@ -5,9 +5,9 @@ Encapsulates the ``dexmani_policy`` repo behind the single
 :class:`~dexmani_real.deployment.contracts.PolicyRuntime` Protocol so the
 deployment parent process and loader do not import this module or touch torch.
 This integration module itself imports torch when it is loaded in the inference
-worker. The external ``dexmani_policy`` repo is imported lazily — inside
-:meth:`DexManiPolicyRuntime.load` — so the architecture gate holds: the core
-runs end-to-end on the fake without the model repository installed.
+worker. The external ``dexmani_policy`` repo is imported lazily during verified
+checkpoint restore, so the parent process never imports the model repository or
+initializes CUDA.
 
 The real ``dexmani_policy`` inference API is ``agent.predict_action(obs_dict)``
 returning a full ``pred_action`` horizon.  This adapter selects the complete
@@ -53,21 +53,16 @@ _ARM_DOF = ARM_JOINT_SHAPE[0]
 _HAND_DOF = HAND_JOINT_SHAPE[0]
 
 
-def _cfg_select(cfg: Any, path: str, default: Any = None) -> Any:
-    """Read a resolved OmegaConf node at *path*, returning *default* when absent."""
-    from omegaconf import OmegaConf
-
-    value = OmegaConf.select(cfg, path)
-    return default if value is None else value
-
-
-def _validate_training_data_contract(data_contract: Any, runtime_config: Any) -> None:
+def _validate_training_data_contract(
+    data_contract: Any, runtime_config: PolicyRuntimeConfig
+) -> None:
     """Fail closed unless checkpoint data matches the realtime observation path."""
     if not isinstance(data_contract, dict):
         raise ValueError(
             "checkpoint has no training data contract; retrain with Policy Zarr v5"
         )
-    expected_task = getattr(runtime_config, "task_name", "")
+    deployment = runtime_config.deployment
+    expected_task = deployment.task_name
     if not isinstance(expected_task, str) or not expected_task.strip():
         raise ValueError(
             "DexMani Policy deployment requires an explicit non-empty task_name"
@@ -80,32 +75,24 @@ def _validate_training_data_contract(data_contract: Any, runtime_config: Any) ->
         "obs_alignment": "obs[t]_before_action[t]",
         "observation_reference": "camera_source_monotonic_ns",
         "state_alignment": "camera_source_aligned_state",
-        "max_observation_skew_s": float(
-            getattr(runtime_config, "max_observation_skew_s", 0.0)
-        ),
+        "max_observation_skew_s": float(deployment.max_observation_skew_s),
         "action_semantics": "deployment_grid_rate_limited_target",
-        "arm_max_delta_rad_per_tick": getattr(
-            runtime_config, "arm_max_delta_rad_per_tick", None
-        ),
+        "arm_max_delta_rad_per_tick": runtime_config.arm_max_delta_rad_per_tick,
         "hand_max_delta_rad_per_tick": float(
-            getattr(runtime_config, "hand_max_delta_rad_per_tick", 0.0)
+            runtime_config.hand_max_delta_rad_per_tick
         ),
         "deployment_equivalent": True,
         "task_name": expected_task,
-        "point_cloud_frame": getattr(runtime_config, "point_cloud_frame", ""),
-        "point_cloud_color_source": getattr(
-            runtime_config, "point_cloud_color_source", ""
+        "point_cloud_frame": runtime_config.point_cloud_frame,
+        "point_cloud_color_source": runtime_config.point_cloud_color_source,
+        "point_cloud_policy_id": runtime_config.point_cloud_policy_id,
+        "point_cloud_config_sha256": runtime_config.point_cloud_config_sha256,
+        "point_cloud_table_plane_abcd_json": (
+            runtime_config.point_cloud_table_plane_abcd_json
         ),
-        "point_cloud_policy_id": getattr(runtime_config, "point_cloud_policy_id", ""),
-        "point_cloud_config_sha256": getattr(
-            runtime_config, "point_cloud_config_sha256", ""
-        ),
-        "point_cloud_table_plane_abcd_json": getattr(
-            runtime_config, "point_cloud_table_plane_abcd_json", ""
-        ),
-        "point_cloud_sampling": getattr(runtime_config, "point_cloud_sampling", ""),
-        "point_cloud_transform": getattr(runtime_config, "point_cloud_transform", ""),
-        "point_cloud_num_points": int(runtime_config.pointcloud_num_points),
+        "point_cloud_sampling": runtime_config.point_cloud_sampling,
+        "point_cloud_transform": runtime_config.point_cloud_transform,
+        "point_cloud_num_points": int(deployment.pointcloud_num_points),
         "point_cloud_feature_dim": 6,
     }
     expected["endpoint_delta_tolerance_rad"] = (
@@ -131,7 +118,7 @@ def _validate_training_data_contract(data_contract: Any, runtime_config: Any) ->
             "checkpoint training sensor modalities must be joint_state + point_cloud"
         )
     training_dt_s = data_contract.get("dt")
-    runtime_dt_s = getattr(runtime_config, "control_dt_s", 0.0)
+    runtime_dt_s = runtime_config.control_dt_s
     if (
         isinstance(training_dt_s, bool)
         or not isinstance(training_dt_s, (int, float))
@@ -426,13 +413,6 @@ class DexManiPolicyRuntime:
         self._denoise_steps: int | None = None
         self._manifest: DeploymentManifest | None = None
 
-    def load(self) -> None:
-        """Reject path-based loads; preflight owns exactly one checked stream."""
-        raise RuntimeError(
-            "DexManiPolicyRuntime.load() is disabled for deployment; use "
-            "load_loaded_checkpoint() after the preflight stream checks"
-        )
-
     def load_loaded_checkpoint(
         self,
         checkpoint_data: LoadedPolicyCheckpoint,
@@ -444,7 +424,8 @@ class DexManiPolicyRuntime:
             raise TypeError("DexManiPolicyRuntime requires PolicyRuntimeConfig")
         if self.config.artifact is None:
             raise ValueError("DexManiPolicyRuntime requires an artifact-bound config")
-        device = self.config.device
+        deployment = self.config.deployment
+        device = deployment.device
         try:
             import dexmani_policy  # noqa: F401  (lazy; model repo import)
         except ImportError as exc:
@@ -479,16 +460,14 @@ class DexManiPolicyRuntime:
             OmegaConf.update(cfg, "agent.codebook_path", None)
         # Match Policy ``set_seed`` before model construction. Successive
         # predictions then advance these process-owned streams naturally.
-        inference_seed = int(self.config.inference_seed)
+        inference_seed = int(deployment.inference_seed)
         random.seed(inference_seed)
         np.random.seed(inference_seed)
         torch.manual_seed(inference_seed)
         agent = hydra.utils.instantiate(cfg.agent)
         agent.action_key = cfg.action_key
 
-        use_ema = _cfg_select(cfg, "eval.use_ema")
-        if not isinstance(use_ema, bool):
-            raise ValueError("embedded eval.use_ema must be a boolean")
+        use_ema = bool(checkpoint_data.inference_config["eval"]["use_ema"])
         if use_ema and checkpoint_data.ema_model_state is None:
             raise ValueError(
                 "embedded eval.use_ema requires EMA weights in the checkpoint"
@@ -497,9 +476,7 @@ class DexManiPolicyRuntime:
             checkpoint_data.ema_model_state if use_ema else checkpoint_data.model_state
         )
         if state_dict is None:
-            raise ValueError(
-                "embedded eval.use_ema requires EMA weights in the checkpoint"
-            )
+            raise ValueError("checkpoint is missing the selected model weights")
         agent.load_state_dict(state_dict, strict=True)
 
         agent.to(device)
@@ -517,15 +494,11 @@ class DexManiPolicyRuntime:
             tcp_dim=getattr(agent, "tcp_dim", None),
             hand_dim=getattr(agent, "hand_dim", None),
             control_action_dim=int(agent.control_action_dim),
-            sensor_modalities=_cfg_select(
-                cfg,
-                "dataset.sensor_modalities",
-                _cfg_select(cfg, "sensor_modalities", ["joint_state", "point_cloud"]),
-            ),
-            point_cloud_num_points=_cfg_select(cfg, "agent.num_points"),
-            point_cloud_feature_dim=_cfg_select(cfg, "agent.pc_dim"),
+            sensor_modalities=self.config.artifact.allocation_contract.sensor_modalities,
+            point_cloud_num_points=int(cfg.agent.num_points),
+            point_cloud_feature_dim=int(cfg.agent.pc_dim),
         )
-        validate_manifest_against_deployment(manifest, self.config)
+        validate_manifest_against_deployment(manifest, deployment)
 
         required_normalizers = ["action", *manifest.sensor_modalities]
         if not agent.normalizer.is_fitted(required_keys=required_normalizers):
@@ -557,11 +530,7 @@ class DexManiPolicyRuntime:
                     f"finite offset with {expected_dim} values"
                 )
 
-        denoise_steps = _cfg_select(cfg, "eval.denoise_steps")
-        if isinstance(denoise_steps, bool) or not isinstance(denoise_steps, int):
-            raise ValueError("model config eval.denoise_steps must be an integer")
-        if denoise_steps <= 0:
-            raise ValueError("model config eval.denoise_steps must be positive")
+        denoise_steps = int(checkpoint_data.inference_config["eval"]["denoise_steps"])
 
         self._agent = agent
         self._manifest = manifest
@@ -712,7 +681,9 @@ class DexManiPolicyRuntime:
         if isinstance(samples, bool) or not isinstance(samples, int) or samples <= 0:
             raise ValueError("samples must be a positive integer")
         if self._agent is None or self._manifest is None:
-            raise RuntimeError("DexManiPolicyRuntime.warmup called before load()")
+            raise RuntimeError(
+                "DexManiPolicyRuntime.warmup called before checkpoint restore"
+            )
 
         n_obs = self._manifest.n_obs_steps
         num_points = self._manifest.point_cloud_num_points
@@ -879,7 +850,9 @@ class DexManiPolicyRuntime:
 
     def predict(self, observation: ObservationBatch) -> PolicyPrediction:
         if self._agent is None:
-            raise RuntimeError("DexManiPolicyRuntime.predict called before load()")
+            raise RuntimeError(
+                "DexManiPolicyRuntime.predict called before checkpoint restore"
+            )
         obs_dict = self._encode(observation)
         result = self._agent.predict_action(
             obs_dict,

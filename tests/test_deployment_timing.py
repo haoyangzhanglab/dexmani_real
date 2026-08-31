@@ -24,7 +24,6 @@ from dexmani_real.deployment.config import (
     H4ExecuteBounds,
     PolicyRuntimeConfig,
     TaskExecuteBounds,
-    resolve_deployment_config,
 )
 from dexmani_real.deployment.contracts import (
     InferenceContext,
@@ -697,15 +696,6 @@ class DeploymentTimingTest(unittest.TestCase):
 
         self.assertIsNone(history)
 
-    def test_deployment_wrapper_rejects_ignored_sibling_fields(self) -> None:
-        with self.assertRaisesRegex(TypeError, "sibling"):
-            resolve_deployment_config(
-                data={
-                    "deployment": {"runtime_target": "tests:fake"},
-                    "task_nmae": "typo",
-                }
-            )
-
     def test_observation_freshness_allows_the_required_history_span(self) -> None:
         run_ns = 1_000_000_000
         step_ns = 62_500_000
@@ -745,12 +735,21 @@ class DeploymentTimingTest(unittest.TestCase):
             hand_tactile_ring=_Ring([]),
             pointcloud_ring=_Ring(cloud_records),
         )
-        config = DeploymentConfig(
-            runtime_target="tests:fake",
-            observation_horizon=4,
-            max_input_age_s=0.15,
-            hand_enabled=True,
-            observation_fields="arm_qpos,hand_qpos,hand_current,point_cloud",
+        config = PolicyRuntimeConfig(
+            deployment=DeploymentConfig(
+                observation_horizon=4,
+                max_input_age_s=0.15,
+                hand_enabled=True,
+                observation_fields="arm_qpos,hand_qpos,hand_current,point_cloud",
+            ),
+            control_dt_s=0.0625,
+            point_cloud_frame="xarm_base",
+            point_cloud_color_source="aligned_rgb",
+            point_cloud_policy_id="test-policy",
+            point_cloud_config_sha256="a" * 64,
+            point_cloud_table_plane_abcd_json="null",
+            point_cloud_sampling="test-sampling",
+            point_cloud_transform="test-transform",
         )
         observation = _build_observation(
             shared,
@@ -803,14 +802,23 @@ class DeploymentTimingTest(unittest.TestCase):
             hand_tactile_ring=_Ring([]),
             pointcloud_ring=_Ring(cloud_records),
         )
-        config = DeploymentConfig(
-            runtime_target="tests:fake",
-            observation_horizon=2,
-            max_input_age_s=0.15,
-            max_grid_lag_s=0.08,
-            max_observation_skew_s=0.10,
-            hand_enabled=True,
-            observation_fields="arm_qpos,hand_qpos,point_cloud",
+        config = PolicyRuntimeConfig(
+            deployment=DeploymentConfig(
+                observation_horizon=2,
+                max_input_age_s=0.15,
+                max_grid_lag_s=0.08,
+                max_observation_skew_s=0.10,
+                hand_enabled=True,
+                observation_fields="arm_qpos,hand_qpos,point_cloud",
+            ),
+            control_dt_s=0.0625,
+            point_cloud_frame="xarm_base",
+            point_cloud_color_source="aligned_rgb",
+            point_cloud_policy_id="test-policy",
+            point_cloud_config_sha256="a" * 64,
+            point_cloud_table_plane_abcd_json="null",
+            point_cloud_sampling="test-sampling",
+            point_cloud_transform="test-transform",
         )
 
         observation = _build_observation(
@@ -854,7 +862,6 @@ class DeploymentTimingTest(unittest.TestCase):
     def test_policy_runtime_config_and_training_data_contract_roundtrip(self) -> None:
         config = PolicyRuntimeConfig(
             deployment=DeploymentConfig(
-                runtime_target="tests:fake",
                 hand_enabled=True,
                 task_name="pick",
             ),
@@ -868,7 +875,7 @@ class DeploymentTimingTest(unittest.TestCase):
             point_cloud_transform="transform-v1",
         )
         restored = pickle.loads(pickle.dumps(config))
-        self.assertEqual(restored.runtime_target, "tests:fake")
+        self.assertEqual(restored.deployment.task_name, "pick")
         contract = {
             "domain": "real",
             "schema_name": "dexmani-real-policy-zarr",
@@ -877,7 +884,7 @@ class DeploymentTimingTest(unittest.TestCase):
             "obs_alignment": "obs[t]_before_action[t]",
             "observation_reference": "camera_source_monotonic_ns",
             "state_alignment": "camera_source_aligned_state",
-            "max_observation_skew_s": config.max_observation_skew_s,
+            "max_observation_skew_s": config.deployment.max_observation_skew_s,
             "action_semantics": "deployment_grid_rate_limited_target",
             "arm_max_delta_rad_per_tick": config.arm_max_delta_rad_per_tick,
             "hand_max_delta_rad_per_tick": config.hand_max_delta_rad_per_tick,
@@ -980,10 +987,19 @@ class DeploymentTimingTest(unittest.TestCase):
             arm_state_ring=_Ring([]),
             pointcloud_ring=_Ring([]),
         )
-        config = DeploymentConfig(
-            runtime_target="tests:fake",
-            observation_horizon=2,
-            observation_fields="arm_qpos,point_cloud",
+        config = PolicyRuntimeConfig(
+            deployment=DeploymentConfig(
+                observation_horizon=2,
+                observation_fields="arm_qpos,point_cloud",
+            ),
+            control_dt_s=0.0625,
+            point_cloud_frame="xarm_base",
+            point_cloud_color_source="aligned_rgb",
+            point_cloud_policy_id="test-policy",
+            point_cloud_config_sha256="a" * 64,
+            point_cloud_table_plane_abcd_json="null",
+            point_cloud_sampling="test-sampling",
+            point_cloud_transform="test-transform",
         )
 
         observation = _build_observation(
@@ -1092,7 +1108,6 @@ class DeploymentTimingTest(unittest.TestCase):
             logical_step_monotonic_ns=logical_step_ns,
         )
         runtime = SimpleNamespace(
-            load=Mock(),
             reset_episode=Mock(),
             predict=Mock(return_value=prediction),
             close=Mock(),
@@ -1107,7 +1122,6 @@ class DeploymentTimingTest(unittest.TestCase):
         )
         config = PolicyRuntimeConfig(
             deployment=DeploymentConfig(
-                runtime_target="tests:fake",
                 inference_hz=10.0,
                 observation_horizon=2,
                 observation_fields="arm_qpos",
@@ -1118,7 +1132,7 @@ class DeploymentTimingTest(unittest.TestCase):
 
         with (
             patch(
-                "dexmani_real.deployment.worker.load_policy_runtime",
+                "dexmani_real.deployment.worker._load_inference_runtime",
                 return_value=runtime,
             ),
             patch(
@@ -1296,10 +1310,12 @@ class DeploymentTimingTest(unittest.TestCase):
         post_b_second["source_monotonic_ns"][0] = 230
         post_b_second["publish_monotonic_ns"][0] = 240
         post_b_second["state_valid"][0] = 1
-        config = DeploymentConfig(
-            runtime_target="tests:fake",
-            observation_horizon=2,
-            observation_fields="arm_qpos",
+        config = PolicyRuntimeConfig(
+            deployment=DeploymentConfig(
+                observation_horizon=2,
+                observation_fields="arm_qpos",
+            ),
+            control_dt_s=0.0625,
         )
         shared = SimpleNamespace(
             arm_state_ring=_Ring([(pre_b, 110, 1), (post_b_first, 220, 2)]),
@@ -1338,7 +1354,6 @@ class DeploymentTimingTest(unittest.TestCase):
 
     def test_armed_inference_worker_does_not_build_or_predict(self) -> None:
         runtime = SimpleNamespace(
-            load=Mock(),
             reset_episode=Mock(),
             predict=Mock(),
             close=Mock(),
@@ -1355,7 +1370,6 @@ class DeploymentTimingTest(unittest.TestCase):
         )
         config = PolicyRuntimeConfig(
             deployment=DeploymentConfig(
-                runtime_target="tests:fake",
                 observation_fields="arm_qpos",
             ),
             control_dt_s=1.0 / 16.0,
@@ -1369,7 +1383,7 @@ class DeploymentTimingTest(unittest.TestCase):
         )
         with (
             patch(
-                "dexmani_real.deployment.worker.load_policy_runtime",
+                "dexmani_real.deployment.worker._load_inference_runtime",
                 return_value=runtime,
             ),
             patch(
@@ -1394,13 +1408,11 @@ class DeploymentTimingTest(unittest.TestCase):
 
         unexpected_observation.assert_not_called()
         runtime.predict.assert_not_called()
-        runtime.load.assert_called_once_with()
         runtime.close.assert_called_once_with()
         armed_idle_sleep.assert_called_once()
 
     def test_running_inference_flushes_observation_wait_diagnostics(self) -> None:
         runtime = SimpleNamespace(
-            load=Mock(),
             reset_episode=Mock(),
             predict=Mock(),
             close=Mock(),
@@ -1417,7 +1429,6 @@ class DeploymentTimingTest(unittest.TestCase):
         )
         config = PolicyRuntimeConfig(
             deployment=DeploymentConfig(
-                runtime_target="tests:fake",
                 observation_fields="arm_qpos",
             ),
             control_dt_s=1.0 / 16.0,
@@ -1428,7 +1439,7 @@ class DeploymentTimingTest(unittest.TestCase):
 
         with (
             patch(
-                "dexmani_real.deployment.worker.load_policy_runtime",
+                "dexmani_real.deployment.worker._load_inference_runtime",
                 return_value=runtime,
             ),
             patch(
@@ -1498,7 +1509,6 @@ class DeploymentTimingTest(unittest.TestCase):
         )
         config = CoordinatorConfig(
             deployment=DeploymentConfig(
-                runtime_target="tests:fake",
                 observation_fields="arm_qpos",
                 command_lead_s=1e-6,
             ),
@@ -1610,7 +1620,6 @@ class DeploymentTimingTest(unittest.TestCase):
         )
         config = CoordinatorConfig(
             deployment=DeploymentConfig(
-                runtime_target="tests:fake",
                 observation_fields="arm_qpos",
                 command_lead_s=1e-6,
             ),
@@ -1681,7 +1690,6 @@ class DeploymentTimingTest(unittest.TestCase):
     def test_physical_start_gate_requires_fresh_canonical_arm_home(self) -> None:
         config = CoordinatorConfig(
             deployment=DeploymentConfig(
-                runtime_target="tests:fake",
                 observation_fields="arm_qpos",
                 hand_enabled=True,
             ),
@@ -1799,7 +1807,6 @@ class DeploymentTimingTest(unittest.TestCase):
         )
         config = CoordinatorConfig(
             deployment=DeploymentConfig(
-                runtime_target="tests:fake",
                 observation_fields="arm_qpos",
                 command_lead_s=1e-6,
                 hand_enabled=execution_mode in {"execute", "task"},

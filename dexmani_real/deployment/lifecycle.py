@@ -30,7 +30,11 @@ from pathlib import Path
 from typing import Any
 
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
-from dexmani_real.deployment.config import DeploymentConfig, PolicyRuntimeConfig
+from dexmani_real.deployment.config import (
+    FIXED_POLICY_RUNTIME_TARGET,
+    DeploymentConfig,
+    PolicyRuntimeConfig,
+)
 from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_loop
 from dexmani_real.deployment.observation import parse_observation_fields
 from dexmani_real.deployment.operator import build_home_planner, run_operator_control
@@ -84,8 +88,8 @@ def sha256_file(path: str | Path) -> str:
     """Return the hex SHA-256 of a file's contents ("" when unreadable/missing).
 
     Best-effort: logs the checkpoint hash "if available"; an
-    unreadable file logs empty rather than failing startup (the PolicyRuntime
-    load is the authoritative check for a bad checkpoint).
+    unreadable file logs empty rather than failing startup (the verified
+    checkpoint restore is the authoritative check for a bad checkpoint).
     """
     try:
         digest = hashlib.sha256()
@@ -119,7 +123,7 @@ def log_deployment_provenance(
         "checkpoint_sha256=%s runtime_sha256=%s",
         dexmani_commit or "unknown",
         model_commit or "unknown",
-        deployment.runtime_target,
+        FIXED_POLICY_RUNTIME_TARGET,
         deployment.device,
         deployment.inference_seed,
         deployment.observation_fields,
@@ -174,8 +178,8 @@ def _physical_execute_provenance_json(
                     "max_running_s": execute_bounds.max_running_s,
                 },
                 "execution_mode": policy_runtime_config.execution_mode,
-                "device": policy_runtime_config.device,
-                "inference_seed": policy_runtime_config.inference_seed,
+                "device": policy_runtime_config.deployment.device,
+                "inference_seed": policy_runtime_config.deployment.inference_seed,
                 "sha256": projection_sha256,
             },
             "real_source": {

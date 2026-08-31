@@ -2,7 +2,7 @@
 
 A :class:`DeploymentManifest` is the frozen summary of "what this checkpoint
 expects" that a new model must satisfy to run under the deployment runtime. It
-is assembled by the real side (``DexManiPolicyRuntime.load``) from three
+is assembled by the Real side after verified checkpoint restore from three
 sources:
 
 * the checkpoint's ``train_params`` (authoritative model hyper-parameters),
@@ -21,9 +21,10 @@ Per-inference action timestamps then use ``InferenceContext.step_dt_ns``.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
 
+from dexmani_real.deployment.config import DeploymentConfig
 from dexmani_real.ipc.schema import (
     ARM_DOF,
     EE_POS_DIM,
@@ -151,26 +152,19 @@ def manifest_from_sources(
     tcp_dim: int | None,
     hand_dim: int | None,
     control_action_dim: int,
-    sensor_modalities: Any,
-    point_cloud_num_points: int | None,
-    point_cloud_feature_dim: int | None,
+    sensor_modalities: Iterable[str],
+    point_cloud_num_points: int,
+    point_cloud_feature_dim: int,
 ) -> DeploymentManifest:
     """Assemble and validate a manifest from model + config sources.
 
-    ``sensor_modalities`` may be any iterable of strings; ``num_points`` /
-    ``pc_dim`` are optional and default to the real-side canonical values when
-    absent (a non-point-cloud model has no point-cloud contract).
+    The fixed adapter supports only an explicit point-cloud model contract;
+    missing dimensions are invalid rather than replaced with defaults.
     """
     modalities = tuple(str(m) for m in sensor_modalities)
     if len(set(modalities)) != len(modalities):
         raise ValueError("sensor_modalities must not contain duplicates")
     modalities = tuple(sorted(modalities))
-    num_points = 1024 if point_cloud_num_points is None else int(point_cloud_num_points)
-    pc_dim = (
-        POINT_CLOUD_FEATURE_DIM
-        if point_cloud_feature_dim is None
-        else int(point_cloud_feature_dim)
-    )
     return DeploymentManifest(
         domain="real",
         action_key=action_key,
@@ -182,14 +176,14 @@ def manifest_from_sources(
         tcp_dim=tcp_dim,
         control_action_dim=control_action_dim,
         sensor_modalities=modalities,
-        point_cloud_num_points=num_points,
-        point_cloud_feature_dim=pc_dim,
+        point_cloud_num_points=int(point_cloud_num_points),
+        point_cloud_feature_dim=int(point_cloud_feature_dim),
     )
 
 
 def validate_manifest_against_deployment(
     manifest: DeploymentManifest,
-    deployment: Any,
+    deployment: DeploymentConfig,
 ) -> None:
     """Cross-validate a loaded manifest against the resolved deployment config.
 

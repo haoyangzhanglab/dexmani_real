@@ -9,22 +9,22 @@ SDK, ``SafetyState``, or ``run_generation`` — model output is a proposal, not 
 robot command.
 
 ``inference_loop`` is a plain ``*_loop(shared, config)`` function (not an
-``mp.Process`` subclass); lifecycle/supervision stays in the A/B runtime.
+``mp.Process`` subclass); lifecycle and supervision stay in the runtime layer.
 
 Artifact-bound DexMani deployments load through the preflight module's checked
-fd/hash/provenance stream loader. The generic ``module:symbol`` loader remains
-only for artifact-free fake runtimes used by focused offline tests.
+fd/hash/provenance stream loader. There is no configurable runtime loader.
 """
 
 from __future__ import annotations
 
-import importlib
 import time
-from typing import Any, cast
 
 import numpy as np
 
-from dexmani_real.deployment.config import DeploymentConfig, PolicyRuntimeConfig
+from dexmani_real.deployment.config import (
+    FIXED_POLICY_RUNTIME_TARGET,
+    PolicyRuntimeConfig,
+)
 from dexmani_real.deployment.contracts import (
     InferenceContext,
     JointActionChunk,
@@ -72,56 +72,15 @@ _ARMED_IDLE_POLL_S = 0.01
 _UINT64_MAX = int(np.iinfo(np.uint64).max)
 
 
-# A ``module:symbol`` target is imported and instantiated only when the
-# inference child calls these loaders, so the parent process never imports
-# torch or initializes CUDA, and a checkpoint/model object never crosses
-# ``spawn``. Every failure raises (fail closed); there is no dummy safe mode.
-def _split_target(target: str) -> tuple[str, str]:
-    if not isinstance(target, str) or ":" not in target:
-        raise ValueError(f"loader target must be 'module:symbol', got {target!r}")
-    module_name, _, symbol = target.rpartition(":")
-    if not module_name.strip() or not symbol.strip():
-        raise ValueError(f"loader target must be 'module:symbol', got {target!r}")
-    return module_name.strip(), symbol.strip()
+def _load_inference_runtime(config: PolicyRuntimeConfig) -> PolicyRuntime:
+    """Load the single Real-owned runtime through the verified stream boundary."""
+    if config.artifact is None:
+        raise ValueError("inference runtime requires a resolved artifact")
+    # Deliberately imported inside the inference child: the parent must not
+    # import torch/Policy or initialize CUDA, and model objects never cross spawn.
+    from dexmani_real.deployment.preflight import load_verified_policy_runtime
 
-
-def _load(
-    target: str,
-    protocol: type[Any],
-    kind: str,
-    config: DeploymentConfig | PolicyRuntimeConfig | None,
-) -> Any:
-    module_name, symbol = _split_target(target)
-    try:
-        module = importlib.import_module(module_name)
-    except Exception as exc:  # noqa: BLE001 - fail closed on any import error
-        raise ImportError(
-            f"failed to import {kind} module {module_name!r}: {exc}"
-        ) from exc
-
-    factory = getattr(module, symbol, None)
-    if factory is None:
-        raise ImportError(f"{kind} module {module_name!r} has no symbol {symbol!r}")
-    try:
-        instance = factory(config=config) if config is not None else factory()
-    except Exception as exc:  # noqa: BLE001 - fail closed on any construction error
-        raise TypeError(f"failed to instantiate {kind} {target!r}: {exc}") from exc
-
-    if not isinstance(instance, protocol):
-        raise TypeError(f"{kind} {target!r} does not satisfy {protocol.__name__}")
-    return instance
-
-
-def load_policy_runtime(
-    target: str,
-    *,
-    config: DeploymentConfig | PolicyRuntimeConfig | None = None,
-) -> PolicyRuntime:
-    """Load a :class:`PolicyRuntime` from ``module:symbol``."""
-    return cast(
-        PolicyRuntime,
-        _load(target, PolicyRuntime, "policy runtime", config),
-    )
+    return load_verified_policy_runtime(config)
 
 
 def _require_uint64_time(value: int, *, name: str, positive: bool) -> int:
@@ -484,7 +443,7 @@ def _align_state_history_to_pointclouds(
 
 def _build_observation(
     shared: RuntimeChannels,
-    config: DeploymentConfig | PolicyRuntimeConfig,
+    config: PolicyRuntimeConfig,
     *,
     observation_id: int,
     run_generation: int,
@@ -499,10 +458,11 @@ def _build_observation(
     ``observation_fields`` are requested. Every selected frame is additionally
     gated by its source/publish timestamps and modality-specific health flags.
     """
-    horizon = int(config.observation_horizon)
-    max_age_ns = int(config.max_input_age_s * 1e9)
-    max_skew_ns = int(config.max_observation_skew_s * 1e9)
-    max_grid_lag_ns = int(config.max_grid_lag_s * 1e9)
+    deployment = config.deployment
+    horizon = int(deployment.observation_horizon)
+    max_age_ns = int(deployment.max_input_age_s * 1e9)
+    max_skew_ns = int(deployment.max_observation_skew_s * 1e9)
+    max_grid_lag_ns = int(deployment.max_grid_lag_s * 1e9)
     history_span_ns = max(0, horizon - 1) * int(step_dt_ns)
     pointcloud_history_max_age_ns = max_age_ns + history_span_ns + max_grid_lag_ns
     state_history_max_age_ns = pointcloud_history_max_age_ns + max_skew_ns
@@ -512,11 +472,7 @@ def _build_observation(
     tactile_history: FrameWindow | None = None
     pointcloud: PointCloudFrame | None = None
     pointcloud_history: tuple[PointCloudFrame, ...] = ()
-    requested = set(
-        parse_observation_fields(
-            getattr(config, "observation_fields", "arm_qpos,hand_qpos")
-        )
-    )
+    requested = set(parse_observation_fields(deployment.observation_fields))
     pointcloud_requested = "point_cloud" in requested
     state_history_len = (
         shared.arm_state_ring.maxlen if pointcloud_requested else horizon
@@ -547,7 +503,7 @@ def _build_observation(
             shared,
             anchor_ns=anchor_ns,
             max_age_ns=pointcloud_history_max_age_ns,
-            num_points=int(config.pointcloud_num_points),
+            num_points=int(deployment.pointcloud_num_points),
             history_len=shared.pointcloud_ring.maxlen,
             not_before_ns=run_started_ns,
         )
@@ -563,7 +519,7 @@ def _build_observation(
             pointcloud = pointcloud_history[-1]
     else:
         logical_step_ns = 0
-    if config.hand_enabled:
+    if deployment.hand_enabled:
         if hand_state_requested:
             hand_history = _read_state_history(
                 shared.hand_state_ring,
@@ -741,8 +697,8 @@ def observation_timing_ms(observation: ObservationBatch) -> tuple[float, float]:
 def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None:
     """Inference process entry point — produces proposals, never robot commands.
 
-    Startup order: heartbeat early -> verified artifact load (or fake-runtime
-    test loader) -> mark ready. A load/import/instantiation failure raises out
+    Startup order: heartbeat early -> verified artifact load -> mark ready.
+    A load/import/instantiation failure raises out
     of this function and becomes a supervisor-observed process failure; there
     is no dummy safe mode. The main loop reads a fresh generation each tick and
     calls ``runtime.reset_episode`` when it changes.
@@ -754,17 +710,7 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
     shared.set_heartbeat("inference", time.monotonic())
     metrics = Metrics()
 
-    if config.artifact is not None:
-        # This import is deliberately inside the inference child. The helper
-        # owns the fixed-artifact/no-follow/digest/provenance boundary and
-        # performs the sole checked stream deserialize for this process.
-        from dexmani_real.deployment.preflight import load_verified_policy_runtime
-
-        runtime = load_verified_policy_runtime(config)
-    else:
-        # Artifact-free configs exist only in focused fake-runtime tests.
-        runtime = load_policy_runtime(config.runtime_target, config=config)
-        runtime.load()  # raises -> process failure (no dummy safe mode)
+    runtime = _load_inference_runtime(config)
 
     try:
         if config.artifact is not None:
@@ -780,7 +726,7 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
             allocation = config.artifact.allocation_contract
             max_viable_s = (
                 allocation.required_action_steps - 2
-            ) * allocation.control_dt_s - config.command_lead_s
+            ) * allocation.control_dt_s - config.deployment.command_lead_s
             if max_viable_s <= 0.0:
                 raise RuntimeError(
                     "policy artifact has no viable post-inference action window"
@@ -808,11 +754,12 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
     shared.set_ready("inference")
     # Refresh the heartbeat after model loading, which may exceed the timeout.
     shared.set_heartbeat("inference", time.monotonic())
-    logger.info("inference_loop: ready (runtime=%s)", config.runtime_target)
+    logger.info("inference_loop: ready (runtime=%s)", FIXED_POLICY_RUNTIME_TARGET)
 
     step_dt_ns = int(round(1e9 / float(shared.action_control_hz)))
-    period_s = 1.0 / float(config.inference_hz)
-    requested = set(parse_observation_fields(config.observation_fields))
+    deployment = config.deployment
+    period_s = 1.0 / float(deployment.inference_hz)
+    requested = set(parse_observation_fields(deployment.observation_fields))
 
     plan_id = 0
     observation_id = 0
@@ -868,14 +815,14 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
             if observation is None:
                 wait_for_observation()
                 continue
-            horizon = int(config.observation_horizon)
+            horizon = int(deployment.observation_horizon)
             if (
                 observation.arm_history is None
                 or observation.arm_history.values.shape[0] != horizon
             ):
                 wait_for_observation(OBSERVATION_WAIT_ARM_HISTORY)
                 continue  # no complete causal arm history yet — never infer
-            if config.hand_enabled and (
+            if deployment.hand_enabled and (
                 observation.hand_history is None
                 or observation.hand_history.values.shape[0] != horizon
             ):
@@ -910,7 +857,7 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
                 logical_step_ns=observation.logical_step_monotonic_ns,
                 step_dt_ns=step_dt_ns,
                 inference_finished_ns=finished_ns,
-                command_lead_ns=int(config.command_lead_s * 1e9),
+                command_lead_ns=int(deployment.command_lead_s * 1e9),
             )
             if chunk is None:
                 metrics.increment(INFERENCE_FAILURES)

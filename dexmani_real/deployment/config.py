@@ -54,7 +54,6 @@ FIXED_POLICY_RUNTIME_TARGET = (
 # may state one as an expectation, but may never change it.
 _ARTIFACT_OWNED_FIELDS = frozenset(
     {
-        "runtime_target",
         "checkpoint",
         "task_name",
         "action_key",
@@ -85,14 +84,12 @@ _REAL_OWNED_DEPLOYMENT_FIELDS = frozenset(
 class DeploymentConfig:
     """Frozen learned-policy deployment parameters.
 
-    ``runtime_target`` names the ``module:symbol`` :class:`PolicyRuntime`
-    factory resolved by :mod:`dexmani_real.deployment.worker`; ``checkpoint`` /
-    ``device`` and the explicit ``observation_fields``
-    contract are the model-facing values that cross the deployment boundary
-    (everything else model-internal stays in the model repository).
+    ``checkpoint`` / ``device`` and the explicit ``observation_fields``
+    contract are the model-facing values that cross the deployment boundary.
+    The runtime implementation is fixed by the Real-owned loader rather than
+    selected by configuration.
     """
 
-    runtime_target: str = ""
     checkpoint: str | None = None
     device: str = "cpu"
     # Operator-declared semantic task identity; the DexMani Policy adapter
@@ -237,10 +234,9 @@ class TaskExecuteBounds:
 class PolicyRuntimeConfig:
     """Deployment config plus resolved sensor semantics visible to the model.
 
-    The deployment fields remain available through attribute forwarding so
-    existing ``PolicyRuntime`` factories keep a narrow, read-only config
-    surface. Sensor identity is populated by the lifecycle from the exact
-    config passed to the realtime point-cloud worker, never by user YAML.
+    Deployment fields remain explicitly owned by ``deployment``. Sensor
+    identity is populated by the lifecycle from the exact config passed to the
+    realtime point-cloud worker, never by user YAML.
     """
 
     deployment: DeploymentConfig
@@ -300,7 +296,6 @@ class PolicyRuntimeConfig:
                 raise TypeError("artifact must be a ResolvedPolicyArtifact")
             allocation = self.artifact.allocation_contract
             expected = {
-                "runtime_target": FIXED_POLICY_RUNTIME_TARGET,
                 "checkpoint": str(self.artifact.checkpoint_path),
                 "task_name": allocation.task_name,
                 "action_key": allocation.action_key,
@@ -352,13 +347,6 @@ class PolicyRuntimeConfig:
             if any(not getattr(self, name) for name in names):
                 raise ValueError("point-cloud runtime semantics must be complete")
 
-    def __getattr__(self, name: str) -> Any:
-        try:
-            deployment = object.__getattribute__(self, "deployment")
-        except AttributeError as exc:
-            raise AttributeError(name) from exc
-        return getattr(deployment, name)
-
     @property
     def physical_execute_bounds(self) -> H4ExecuteBounds | TaskExecuteBounds | None:
         if self.execution_mode == "execute":
@@ -366,9 +354,6 @@ class PolicyRuntimeConfig:
         if self.execution_mode == "task":
             return self.task_execute_bounds
         return None
-
-
-DEFAULT_DEPLOYMENT_CONFIG = DeploymentConfig()
 
 
 def _coerce_value(template: Any, raw: Any, path: str) -> Any:
@@ -421,90 +406,12 @@ def _merge(base: DeploymentConfig, overrides: Mapping[str, Any]) -> dict[str, An
 
 
 @dataclass(frozen=True)
-class ResolvedDeploymentConfig:
-    """A validated deployment snapshot plus its canonical identity."""
-
-    deployment: DeploymentConfig
-    canonical_json: str
-    sha256: str
-
-
-@dataclass(frozen=True)
 class ResolvedPolicyRuntimeConfig:
     """Pickle-safe artifact/Real projection for isolated model preflight."""
 
     runtime: PolicyRuntimeConfig
     canonical_json: str
     sha256: str
-
-
-def resolve_deployment_config(
-    *,
-    yaml_path: str | Path | None = None,
-    data: Mapping[str, Any] | None = None,
-    cli_overrides: Mapping[str, Any] | None = None,
-) -> ResolvedDeploymentConfig:
-    """Resolve ``CLI > file/data > defaults`` without mutating the template.
-
-    Accepts either a flat mapping of deployment fields or a YAML document with a
-    top-level ``deployment:`` section.  Raises when ``runtime_target`` is
-    absent; it is the required entry point (the worker cannot run without it).
-    """
-    sources = [yaml_path is not None, data is not None]
-    if sum(sources) > 1:
-        raise ValueError("provide at most one of yaml_path or data")
-
-    file_overrides: Mapping[str, Any] = {}
-    if yaml_path is not None:
-        config_path = Path(yaml_path)
-        if config_path.suffix.lower() not in {".yaml", ".yml"}:
-            raise ValueError("deployment config path must use a .yaml or .yml suffix")
-        with config_path.open("r", encoding="utf-8") as stream:
-            loaded = yaml.safe_load(stream)
-        if loaded is None:
-            loaded = {}
-        if not isinstance(loaded, Mapping):
-            raise TypeError("deployment config root must be a mapping")
-        file_overrides = loaded
-    elif data is not None:
-        file_overrides = data
-
-    if isinstance(file_overrides.get("deployment"), Mapping):
-        sibling_keys = {str(key) for key in file_overrides} - {"deployment"}
-        if sibling_keys:
-            raise TypeError(
-                "deployment config wrapper has unknown sibling field(s): "
-                f"{sorted(sibling_keys)}"
-            )
-        file_overrides = file_overrides["deployment"]
-
-    merged = _merge(DEFAULT_DEPLOYMENT_CONFIG, file_overrides)
-    # Unset CLI values do not override file or data defaults.
-    cli = {
-        str(key): value
-        for key, value in (cli_overrides or {}).items()
-        if value is not None
-    }
-    merged = _merge(DeploymentConfig(**merged), cli)
-
-    config = DeploymentConfig(**merged)
-    if not config.runtime_target.strip():
-        raise ValueError("deployment runtime_target must be provided")
-
-    canonical = {
-        field.name: getattr(config, field.name) for field in fields(DeploymentConfig)
-    }
-    canonical_json = json.dumps(
-        canonical,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    )
-    digest = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
-    return ResolvedDeploymentConfig(
-        deployment=config, canonical_json=canonical_json, sha256=digest
-    )
 
 
 def resolve_policy_runtime_config(
@@ -557,7 +464,6 @@ def resolve_policy_runtime_config(
 
     allocation = artifact.allocation_contract
     expected_artifact = {
-        "runtime_target": FIXED_POLICY_RUNTIME_TARGET,
         "checkpoint": str(artifact.checkpoint_path),
         "task_name": allocation.task_name,
         "action_key": allocation.action_key,

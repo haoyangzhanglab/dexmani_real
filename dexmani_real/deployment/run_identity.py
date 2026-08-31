@@ -146,8 +146,8 @@ def canonical_run_receipt_json(
             "runtime_config_sha256": runtime_sha256,
             "projection_sha256": projection.sha256,
             "fixed_runtime_target": FIXED_POLICY_RUNTIME_TARGET,
-            "device": projection.runtime.device,
-            "inference_seed": projection.runtime.inference_seed,
+            "device": projection.runtime.deployment.device,
+            "inference_seed": projection.runtime.deployment.inference_seed,
             "execution_mode": projection.runtime.execution_mode,
             "hand_acknowledged": projection.runtime.hand_acknowledged,
             "h4_execute_bounds": (

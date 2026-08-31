@@ -157,7 +157,7 @@ resolve immutable artifact
 → instantiate only cfg.agent from resolved embedded config
 → strict restore selected model/EMA state
 → validate normalizer and loaded manifest
-→ deterministic fake observation prediction
+→ deterministic synthetic observation prediction
 → recheck file identities and emit receipt
 → exit
 ```
@@ -242,7 +242,7 @@ R0–R3 已完成离线验证；H4 runbook 继续暂停，直到新的 H2/H3 sha
 - 不再 import 四个已撤回 Policy helper；
 - `n_obs_steps=2 → pad_before=1` 通过；`n_obs_steps=3 → pad_before=2` 通过；错误值拒绝；
 - EMA 缺失、normalizer 缺失/维度错/scale=0、state key mismatch 均拒绝；
-- fake agent strict restore 和 15×19 prediction 通过。
+- test-double agent strict restore 和 15×19 prediction 通过。
 
 状态：已完成。adapter 不再导入已撤回的 Policy deployment helper。
 
@@ -255,10 +255,10 @@ R0–R3 已完成离线验证；H4 runbook 继续暂停，直到新的 H2/H3 sha
 - clean Policy `7e31d10` 与 reference producer 匹配；
 - dirty/mismatched Policy、checkpoint hash mismatch、TOCTOU identity change 均在硬件前拒绝；
 - `--print-config` 保持无 torch/Policy/hardware import；
-- `--preflight-only` 完成一次实际 reference load 和 fake prediction。
+- `--preflight-only` 完成一次实际 reference load 和 synthetic prediction。
 
 状态：已完成。reference artifact 在 clean Policy `7e31d10` 上通过 SHA、EMA strict restore 与
-15×19 fake prediction。
+15×19 synthetic prediction。
 
 ### R3 — 全量离线关闭
 

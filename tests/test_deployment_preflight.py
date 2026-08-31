@@ -49,7 +49,11 @@ from dexmani_real.deployment.preflight import (
     run_isolated_preflight,
 )
 from dexmani_real.deployment.run_identity import RealSourceIdentity
-from dexmani_real.deployment.worker import inference_loop, stamp_prediction_timing
+from dexmani_real.deployment.worker import (
+    _load_inference_runtime,
+    inference_loop,
+    stamp_prediction_timing,
+)
 from dexmani_real.integrations.dexmani_policy import (
     DexManiPolicyRuntime,
     _canonical_json_sha256,
@@ -138,7 +142,7 @@ class DeploymentPreflightTest(unittest.TestCase):
                 runtime_config=resolve_runtime_config(),
                 data={"inference_hz": 9.0},
             )
-            self.assertEqual(permitted.runtime.inference_hz, 9.0)
+            self.assertEqual(permitted.runtime.deployment.inference_hz, 9.0)
             with self.assertRaisesRegex(TypeError, "unknown"):
                 resolve_policy_runtime_config(
                     artifact=resolve_policy_artifact(root),
@@ -150,7 +154,6 @@ class DeploymentPreflightTest(unittest.TestCase):
         runtime = resolve_runtime_config()
         policy_runtime = PolicyRuntimeConfig(
             deployment=DeploymentConfig(
-                runtime_target="tests:fake",
                 observation_fields="arm_qpos",
             ),
             control_dt_s=1.0 / float(runtime.policy.control_hz),
@@ -164,12 +167,20 @@ class DeploymentPreflightTest(unittest.TestCase):
         self.assertIs(inference.args[1], policy_runtime)
         self.assertEqual(coordinator.args[1].execution_mode, "shadow")
 
+    def test_inference_runtime_requires_a_resolved_artifact(self):
+        config = PolicyRuntimeConfig(
+            deployment=DeploymentConfig(observation_fields="arm_qpos"),
+            control_dt_s=0.0625,
+        )
+
+        with self.assertRaisesRegex(ValueError, "resolved artifact"):
+            _load_inference_runtime(config)
+
     def test_artifact_bound_inference_uses_verified_stream_loader(self):
         with tempfile.TemporaryDirectory() as directory:
             root = _write_experiment(Path(directory) / "experiment", matching_hash=True)
             config = self._projection(root).runtime
             runtime = SimpleNamespace(
-                load=Mock(),
                 warmup=Mock(return_value=(0.1,) * 5),
                 close=Mock(),
             )
@@ -179,20 +190,13 @@ class DeploymentPreflightTest(unittest.TestCase):
                 set_heartbeat=Mock(),
                 set_ready=Mock(),
             )
-            with (
-                patch(
-                    "dexmani_real.deployment.preflight.load_verified_policy_runtime",
-                    return_value=runtime,
-                ) as verified_loader,
-                patch(
-                    "dexmani_real.deployment.worker.load_policy_runtime",
-                    side_effect=AssertionError("artifact runtime must not path-load"),
-                ),
-            ):
+            with patch(
+                "dexmani_real.deployment.preflight.load_verified_policy_runtime",
+                return_value=runtime,
+            ) as verified_loader:
                 inference_loop(shared, config)
 
         verified_loader.assert_called_once_with(config)
-        runtime.load.assert_not_called()
         runtime.warmup.assert_called_once_with(samples=5)
         runtime.close.assert_called_once_with()
         shared.set_ready.assert_called_once_with("inference")
@@ -202,7 +206,6 @@ class DeploymentPreflightTest(unittest.TestCase):
             root = _write_experiment(Path(directory) / "experiment", matching_hash=True)
             config = self._projection(root).runtime
             runtime = SimpleNamespace(
-                load=Mock(),
                 warmup=Mock(return_value=(0.1, 0.1, 0.9, 0.9, 0.9)),
                 close=Mock(),
             )
@@ -247,7 +250,11 @@ class DeploymentPreflightTest(unittest.TestCase):
                 "_load_verified_policy_runtime",
                 return_value=(runtime, "a" * 64, provenance),
             ),
-            patch.object(preflight_module, "_fake_observation", return_value=object()),
+            patch.object(
+                preflight_module,
+                "_synthetic_observation",
+                return_value=object(),
+            ),
             patch.object(preflight_module, "_validate_prediction") as validate,
             patch.object(torch, "manual_seed") as manual_seed,
             patch.object(np.random, "seed") as numpy_seed,
@@ -309,7 +316,6 @@ class DeploymentPreflightTest(unittest.TestCase):
         runtime = resolve_runtime_config()
         policy_runtime = PolicyRuntimeConfig(
             deployment=DeploymentConfig(
-                runtime_target="tests:fake",
                 observation_fields="arm_qpos",
                 hand_enabled=True,
             ),
@@ -336,7 +342,6 @@ class DeploymentPreflightTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "hand-enabled"):
             PolicyRuntimeConfig(
                 deployment=DeploymentConfig(
-                    runtime_target="tests:fake",
                     observation_fields="arm_qpos",
                 ),
                 control_dt_s=1.0 / float(runtime.policy.control_hz),
@@ -347,7 +352,6 @@ class DeploymentPreflightTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "explicit --hand"):
             PolicyRuntimeConfig(
                 deployment=DeploymentConfig(
-                    runtime_target="tests:fake",
                     observation_fields="arm_qpos",
                     hand_enabled=True,
                 ),
@@ -366,7 +370,6 @@ class DeploymentPreflightTest(unittest.TestCase):
         )
         config = PolicyRuntimeConfig(
             deployment=DeploymentConfig(
-                runtime_target="tests:fake",
                 observation_fields="arm_qpos",
                 hand_enabled=True,
             ),
@@ -387,7 +390,6 @@ class DeploymentPreflightTest(unittest.TestCase):
         runtime = resolve_runtime_config()
         policy_runtime = PolicyRuntimeConfig(
             deployment=DeploymentConfig(
-                runtime_target="tests:fake",
                 observation_fields="arm_qpos",
             ),
             control_dt_s=1.0 / float(runtime.policy.control_hz),
@@ -971,7 +973,7 @@ class DeploymentPreflightTest(unittest.TestCase):
                 encoding="utf-8",
             )
             ee_runtime = self._projection(root).runtime
-            self.assertEqual(ee_runtime.action_key, "action_ee")
+            self.assertEqual(ee_runtime.deployment.action_key, "action_ee")
             with self.assertRaisesRegex(ValueError, "EE action artifact"):
                 _validate_prediction(joint, ee_runtime)
             _validate_prediction(valid_ee, ee_runtime)
@@ -1028,9 +1030,9 @@ class DeploymentPreflightTest(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(runtime_config.inference_seed, 1066)
+            self.assertEqual(runtime_config.deployment.inference_seed, 1066)
             prediction = runtime.predict(
-                preflight_module._fake_observation(runtime_config)
+                preflight_module._synthetic_observation(runtime_config)
             )
 
             expected = pred_action[

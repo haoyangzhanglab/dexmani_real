@@ -225,15 +225,14 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `config.py` | artifact-owned/Real-owned deployment projection、确定性 seed、不可变 receipt、point-cloud contract，以及相互独立的 H4 one-shot/task execute bounds 校验。 |
 | `manifest.py` | checkpoint/config/runtime manifest 组装与 fail-closed 一致性检查。 |
 | `policy_checkpoint.py` | deployment-v2 checkpoint 的 Real-owned `weights_only` stream decoder、exact schema 与 canonical tensor-key 校验；不导入 Policy。 |
-| `preflight.py` | artifact-bound inference 与 spawn 预检共享的 no-follow/hash/provenance 单次 stream load；预检再执行 fake-observation。 |
+| `preflight.py` | artifact-bound inference 与 spawn 预检共享的 no-follow/hash/provenance 单次 stream load；预检再执行 deterministic synthetic observation。 |
 | `run_identity.py` | 纯标准库的 Real source provenance 与 print/preflight 共用 canonical run receipt。 |
 | `observation.py` | 因果不可变 arm/hand/tactile/pointcloud history batch。 |
-| `worker.py` | artifact-bound verified stream runtime load（fake 才使用 generic factory）、observation 校验、logical-grid timing stamp、bounded timing samples 与 plan 发布。 |
+| `worker.py` | 固定 DexMani Policy adapter 的 artifact-bound verified stream load、observation 校验、logical-grid timing stamp、bounded timing samples 与 plan 发布。 |
 | `coordinator.py` | learned-policy 唯一 command producer、plan scheduling、物理执行本进程 H 完成 + arm-home 初态双门、逐 endpoint coupled ACK、typed stop、shadow/execute receipt、命令连续性与 watchdog。 |
 | `lifecycle.py` | shadow/H4/task worker topology、hand acknowledgement、物理模式 collision-checked home、B-relative supervision、receipt provenance 与 verified shutdown。 |
 | `operator.py` | B/S/Q/ESC typed request；物理模式每进程最多一次 H，依次下发 hand home、执行 collision-checked arm home，并发布完成标志。 |
 | `metrics.py` | inference/coordinator counters、bounded p50/p95/p99 timing 与 canonical shadow receipt。 |
-| `fake.py` | CPU-only deterministic fake runtime。 |
 
 ### `replay/`
 

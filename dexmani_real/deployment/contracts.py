@@ -9,7 +9,7 @@ these import torch or RuntimeChannels.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 import numpy as np
 
@@ -300,9 +300,8 @@ class JointActionChunk:
         return self.ee_pos is not None
 
 
-@runtime_checkable
 class PolicyRuntime(Protocol):
-    """Model-side policy boundary: load -> warmup -> predict -> reset_episode.
+    """Model-side policy boundary after verified checkpoint restore.
 
     ``predict`` encodes an ``ObservationBatch`` into the model-native input,
     runs inference, and decodes the result into an untimed
@@ -310,8 +309,6 @@ class PolicyRuntime(Protocol):
     implementation may import torch/checkpoint/CUDA; it never sees
     RuntimeChannels or a robot command.
     """
-
-    def load(self) -> None: ...
 
     def warmup(self, *, samples: int) -> tuple[float, ...]: ...
 

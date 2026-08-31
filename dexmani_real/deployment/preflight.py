@@ -3,7 +3,7 @@
 The parent sends only a pickle-safe Real receipt to a fresh ``spawn`` child.
 The child reopens the fixed artifact entries through no-follow descriptors,
 checks the indexed digest, then performs the one safe stream deserialize and
-one fake-observation prediction. It never resolves a selector, creates
+one synthetic-observation prediction. It never resolves a selector, creates
 runtime channels, or imports a hardware owner.
 """
 
@@ -22,10 +22,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from dexmani_real.deployment.artifact import DirectoryIdentity, FileLstatIdentity
-from dexmani_real.deployment.config import (
-    FIXED_POLICY_RUNTIME_TARGET,
-    PolicyRuntimeConfig,
-)
+from dexmani_real.deployment.config import PolicyRuntimeConfig
 from dexmani_real.deployment.contracts import PolicyPrediction, PolicyRuntime
 from dexmani_real.deployment.observation import (
     FrameWindow,
@@ -282,8 +279,6 @@ def _load_verified_policy_runtime(
     artifact = runtime_config.artifact
     if artifact is None:
         raise ValueError("verified policy load requires a resolved artifact")
-    if runtime_config.runtime_target != FIXED_POLICY_RUNTIME_TARGET:
-        raise ValueError("artifact-bound policy runtime target is not fixed")
     experiment_fd: int | None = None
     checkpoints_fd: int | None = None
     checkpoint_fd: int | None = None
@@ -410,7 +405,7 @@ def _run_preflight_child(runtime_config: PolicyRuntimeConfig) -> PreflightResult
         # Runtime construction already initialized the checkpoint-bound RNG
         # streams. Do not replace them here: preflight must exercise the same
         # first prediction stream as the operational inference worker.
-        observation = _fake_observation(runtime_config)
+        observation = _synthetic_observation(runtime_config)
         with torch.inference_mode():
             prediction = runtime.predict(observation)
     finally:
@@ -565,12 +560,12 @@ def _sha256_stream(stream: Any) -> str:
     return digest.hexdigest()
 
 
-def _fake_observation(runtime_config: PolicyRuntimeConfig) -> ObservationBatch:
+def _synthetic_observation(runtime_config: PolicyRuntimeConfig) -> ObservationBatch:
     allocation = (
         runtime_config.artifact.allocation_contract if runtime_config.artifact else None
     )
     if allocation is None:
-        raise ValueError("fake observation requires an artifact")
+        raise ValueError("synthetic observation requires an artifact")
     count = allocation.n_obs_steps
     run_ns = 1_000_000_000
     source_ns = run_ns + np.arange(1, count + 1, dtype=np.uint64) * 1_000_000
@@ -628,32 +623,34 @@ def _validate_prediction(prediction: Any, runtime_config: PolicyRuntimeConfig) -
     artifact = runtime_config.artifact
     assert artifact is not None
     if not isinstance(prediction, PolicyPrediction):
-        raise TypeError("fake preflight prediction must be a PolicyPrediction")
+        raise TypeError("synthetic preflight prediction must be a PolicyPrediction")
     action_key = artifact.allocation_contract.action_key
     if action_key == "action" and prediction.is_ee:
         raise ValueError(
-            "fake preflight joint action artifact requires arm7 joint actions, not EE"
+            "synthetic preflight joint action artifact requires arm7 joint actions, not EE"
         )
     if action_key == "action_ee" and not prediction.is_ee:
         raise ValueError(
-            "fake preflight EE action artifact requires ee_pos/ee_rot6d actions"
+            "synthetic preflight EE action artifact requires ee_pos/ee_rot6d actions"
         )
     if action_key not in {"action", "action_ee"}:
         raise ValueError(
-            f"fake preflight artifact has unsupported action_key={action_key!r}"
+            f"synthetic preflight artifact has unsupported action_key={action_key!r}"
         )
     expected_steps = artifact.allocation_contract.required_action_steps
     if prediction.hand_qpos is None or prediction.hand_qpos.shape != (
         expected_steps,
         _HAND_DOF,
     ):
-        raise ValueError("fake preflight prediction is missing hand12 actions")
+        raise ValueError("synthetic preflight prediction is missing hand12 actions")
     if prediction.arm_qpos is not None:
         if prediction.arm_qpos.shape != (expected_steps, _ARM_DOF):
-            raise ValueError("fake preflight joint prediction has invalid arm7 actions")
+            raise ValueError(
+                "synthetic preflight joint prediction has invalid arm7 actions"
+            )
         if prediction.ee_pos is not None or prediction.ee_rot6d is not None:
             raise ValueError(
-                "fake preflight joint prediction mixes joint and EE actions"
+                "synthetic preflight joint prediction mixes joint and EE actions"
             )
         arrays = [prediction.arm_qpos, prediction.hand_qpos]
     else:
@@ -663,11 +660,13 @@ def _validate_prediction(prediction: Any, runtime_config: PolicyRuntimeConfig) -
             or prediction.ee_pos.shape != (expected_steps, 3)
             or prediction.ee_rot6d.shape != (expected_steps, 6)
         ):
-            raise ValueError("fake preflight EE prediction has invalid geometry fields")
+            raise ValueError(
+                "synthetic preflight EE prediction has invalid geometry fields"
+            )
         _validate_ee_rot6d(prediction.ee_rot6d)
         arrays = [prediction.ee_pos, prediction.ee_rot6d, prediction.hand_qpos]
     if any(not np.all(np.isfinite(array)) for array in arrays):
-        raise ValueError("fake preflight prediction contains NaN/Inf")
+        raise ValueError("synthetic preflight prediction contains NaN/Inf")
 
 
 def _validate_ee_rot6d(rot6d: np.ndarray) -> None:
@@ -677,7 +676,7 @@ def _validate_ee_rot6d(rot6d: np.ndarray) -> None:
     first_norm = np.linalg.norm(first, axis=1)
     if np.any(first_norm <= 1e-8):
         raise ValueError(
-            "fake preflight EE prediction has degenerate rotation geometry"
+            "synthetic preflight EE prediction has degenerate rotation geometry"
         )
     second_orthogonal = (
         second
@@ -689,7 +688,7 @@ def _validate_ee_rot6d(rot6d: np.ndarray) -> None:
     )
     if np.any(np.linalg.norm(second_orthogonal, axis=1) <= 1e-8):
         raise ValueError(
-            "fake preflight EE prediction has degenerate rotation geometry"
+            "synthetic preflight EE prediction has degenerate rotation geometry"
         )
 
 
