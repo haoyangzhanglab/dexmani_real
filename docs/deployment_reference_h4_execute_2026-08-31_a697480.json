@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "record_type": "dexmani_real.policy_deployment.h4_execute_receipt",
+  "recorded_at": "2026-08-31T17:39:00+08:00",
+  "authorization_scope": {
+    "level": "H4",
+    "execution_mode": "execute",
+    "inference_device": "cuda:0",
+    "scene": "no personnel, task objects, or obstacles; e-stop ready; xArm, XHand, and RealSense healthy",
+    "hand_behavior": "one startup reset_home, then one operator home attempt before B",
+    "arm_behavior": "one collision-checked canonical home after hand home acceptance",
+    "max_published_endpoints": 1,
+    "max_running_seconds": 30.0,
+    "acknowledgement_timeout_seconds": 2.0,
+    "automatic_retry": false,
+    "task_rollout": "forbidden"
+  },
+  "provenance": {
+    "dexmani_real_commit": "a6974800d567433390f323f90f8a5fc761f4d0dd",
+    "dexmani_real_dirty_at_launch": false,
+    "dexmani_real_python_tree_sha256": "c5e3571bbe66a39cc75d17e9f2bf27ad7623a084b3457f4cf5f5678b6f0a51b5",
+    "h2h3_python_tree_reference": "deployment_reference_h2h3_shadow_2026-08-31_837b5c7.json",
+    "dexmani_policy_commit": "7e31d10e7a31ff3d12df31b8683c9c90b357cbc5",
+    "dexmani_policy_dirty": false,
+    "dexmani_policy_python_tree_sha256": "9f48ce9ce876be8aacadd38f3f7b1859b8a07f9660590a921043f5e389efa129",
+    "checkpoint_sha256": "b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c",
+    "index_sha256": "d67bf21394c8d79239dd0f116baf25a681c3e4d0964569ce47a520f62e047c6e",
+    "runtime_config_sha256": "186ec09369b4cd5b70b64b8d445123b9e72f10eaf08ea47df078141eb1d5a292",
+    "projection_sha256": "bb4d48dc1da89ed86863aa9f9af1f075271787d0b32d17e1a5e11e5ba4d9c48a"
+  },
+  "terminal_timeline": {
+    "startup_reset_home_accepted_at": "2026-08-31T17:37:37+08:00",
+    "armed_at": "2026-08-31T17:37:40+08:00",
+    "ignored_pre_home_b_at": "2026-08-31T17:37:49+08:00",
+    "hand_home_accepted": true,
+    "hand_home_action_id": 1,
+    "arm_home_path": "direct",
+    "arm_home_milestones": 2,
+    "arm_home_reached_between": [
+      "2026-08-31T17:38:09+08:00",
+      "2026-08-31T17:38:10+08:00"
+    ],
+    "physical_home_completed_at": "2026-08-31T17:38:10+08:00",
+    "running_at": "2026-08-31T17:38:16+08:00",
+    "running_generation": 5,
+    "published_action_id": 2,
+    "final_disarmed_at": "2026-08-31T17:38:19+08:00"
+  },
+  "runtime_receipt": {
+    "path": "/home/zhanghaoyang/.dexmani/receipts/h4_execute_1788169096490281028_3159783_67edfd66681f49dfa2a4056c6e3a22fd.json",
+    "sha256": "bc18a4aac362c363aa576e88c148cc233777d21e9e6fc267d5f403f21b668e67",
+    "completed": true,
+    "acknowledged_action_id": 2,
+    "coupled_command_writes": 1,
+    "coupled_command_sequence": {
+      "start": 1,
+      "end": 2
+    },
+    "within_publication_bound": true,
+    "physical_home_completed": true,
+    "reason": "H4 publication bound reached",
+    "timeline_monotonic_ns": {
+      "run_started": 1193610640340582,
+      "first_publication": 1193610829767266,
+      "last_publication": 1193610829767266,
+      "receipt_emitted": 1193610953529982
+    }
+  },
+  "worker_command_evidence": {
+    "arm": {
+      "servo_calls": 1,
+      "duplicate_skips": 3
+    },
+    "hand": {
+      "sdk_send_attempts": 1,
+      "exact_target_accepts": 1,
+      "crc_unconfirmed": 0,
+      "duplicate_skips": 2,
+      "sdk_rejections": 0
+    }
+  },
+  "execution_metrics": {
+    "endpoints_due": 1,
+    "endpoints_committed": 1,
+    "endpoints_published": 1,
+    "plan_age_ms": 24.792185,
+    "usable_horizon_ms": 671.768565,
+    "hand_policy_endpoint_roundoff_canonicalized": 1
+  },
+  "observed_nonfatal_warnings": [
+    "one B before the physical-home gate was ignored; no policy endpoint was published",
+    "the arm home operation exceeded the 30 Hz loop budget while executing its two validated milestones",
+    "arm_state shared-memory ring recovered 13/14 history frames once after RUNNING began"
+  ],
+  "shutdown": {
+    "exit_reason": "bounded execute run ended",
+    "final_safety_state": "DISARMED",
+    "supervisor_normal": true,
+    "execute_completed": true,
+    "clean": true,
+    "workers": {
+      "inference": "graceful:0",
+      "arm": "graceful:0",
+      "camera": "graceful:0",
+      "pointcloud": "graceful:0",
+      "policy": "graceful:0",
+      "hand": "graceful:0"
+    }
+  },
+  "sealed_evidence": {
+    "state": "sealed",
+    "path": "/home/zhanghaoyang/.dexmani/receipts/h4_evidence_1788169310328202347_3165174_49625de7c65e41fdbe60095a810ca055.json",
+    "sha256": "7c0fd31f0b2021a4d22d05edcb2825a6d62c7a49457083b5a45c4d78949698a0",
+    "terminal_log_path": "/home/zhanghaoyang/.dexmani/receipts/h4-terminal-a697480-20260831_173730.log",
+    "terminal_log_sha256": "361c2359c5174fc9d88411077006170149e8612b8dae7ebb138c2a2d37c0034f",
+    "terminal_log_size_bytes": 13164
+  },
+  "disposition": {
+    "accepted_as_h4_pass": true,
+    "validated": [
+      "the H physical-home gate completed before the effective B press",
+      "exactly one policy coupled arm+hand endpoint was published and acknowledged by both workers",
+      "the policy-only hand exit evidence reports exactly one accepted target after coordinator revoke",
+      "the bounded run ended cleanly with a sealed evidence bundle"
+    ],
+    "not_validated": [
+      "task rollout, object interaction, grasping, or placement",
+      "more than one policy endpoint or any automatic retry",
+      "authorization for H5 or task-level execution"
+    ]
+  }
+}

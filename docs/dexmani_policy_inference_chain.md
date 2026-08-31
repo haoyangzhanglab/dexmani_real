@@ -347,7 +347,7 @@ device 写入 receipt。每次换 revision、命令、device 或 checkpoint 都�
 
 | 模型 | 当前判断 | 主要依据或阻塞项 |
 |---|---|---|
-| DP3 | 已验证模型兼容 | current-tree reference 已完成 strict restore、CUDA preflight 和 120 秒 H2/H3 shadow；进入 H4 前仍须完成独立 review 并取得新的硬件授权 |
+| DP3 | 已验证模型兼容 | current-tree reference 已完成 strict restore、CUDA preflight、120 秒 H2/H3 shadow 和一次 sealed H4；这不等价于 task rollout 或对其他 checkpoint 的验证 |
 | DQ-RISE | 结构上兼容，尚未实证 | point-cloud + joint-state、`num_points/pc_dim`、完整 `pred_action`、19/21 维均符合；adapter 已处理 checkpoint-owned codebook，但仍需专用 deployment-v2 artifact 与 preflight |
 | ActionFlow（默认 joint action） | 结构上兼容，尚未实证 | point-cloud contract、BaseAgent-style normalization 和完整 horizon output 符合；需验证 NFE/latency 与 artifact window。当前 config 将 `state_dim` 绑定到 `action_dim`，不能直接推导其 EE-action 变体也兼容 |
 | ManiFlow | 结构上兼容，尚未实证 | `joint_state + point_cloud`、显式 `num_points/pc_dim` 和 BaseAgent output 符合；需验证 GPU latency/显存与 checkpoint contract |

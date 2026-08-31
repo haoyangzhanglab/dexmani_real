@@ -9,7 +9,10 @@
 > 保留该 generation 的摘要。修复后的 `837b5c7` 已完成新的 `cuda:0` 120 秒 zero-write baseline：
 > [`deployment_reference_h2h3_shadow_2026-08-31_837b5c7.json`](deployment_reference_h2h3_shadow_2026-08-31_837b5c7.json)，
 > 1,916/1,916 个 endpoint 完成 shadow validation，且所有 policy physical command 计数均为零。
-> 下一步是独立 H4 review 和新的明确 H4 授权。
+> 在 Python tree SHA 相同、clean 的 `a697480` 上，H4 已完成一次 physical-home gate、一个
+> coupled endpoint、双 worker ACK 和 sealed evidence，详见
+> [`deployment_reference_h4_execute_2026-08-31_a697480.json`](deployment_reference_h4_execute_2026-08-31_a697480.json)。
+> 这不构成 H5 或 task rollout 授权。
 > `dfad0e7` receipt 保留为修复前的历史审计证据，不能替代 current-tree baseline。
 > `3b2615f` 已完成 65 秒、1038 endpoint、zero-write 的短 H2/H3 shadow，见
 > [`deployment_reference_h2h3_shadow_2026-08-31_3b2615f_short.json`](deployment_reference_h2h3_shadow_2026-08-31_3b2615f_short.json)；
