@@ -8,10 +8,10 @@ import numpy as np
 
 from dexmani_real.control.action import ActionCandidate
 from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
-from dexmani_real.teleop.action_proposal import limit_hand_target_delta
 from dexmani_real.utils.limits import (
     POLICY_HAND_ENDPOINT_ROUNDOFF_TOLERANCE_RAD,
     canonicalize_policy_hand_endpoint_roundoff,
+    limit_hand_target_delta,
 )
 
 
@@ -119,6 +119,15 @@ class SafetyGateCommandDeltaTest(unittest.TestCase):
         )
 
         self.assertTrue(result.accepted)
+
+    def test_hand_target_limiter_keeps_an_already_reachable_endpoint_exact(
+        self,
+    ) -> None:
+        target = np.full(12, 0.25)
+
+        limited = limit_hand_target_delta(target, np.zeros(12), 0.3)
+
+        np.testing.assert_array_equal(limited, target)
 
     def test_hand_limit_rejection_reports_joint_values_and_bounds(self) -> None:
         gate = SafetyGate(

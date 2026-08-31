@@ -24,35 +24,11 @@ from dexmani_real.ipc.schema import (
     HAND_TACTILE_SUM_SHAPE,
 )
 from dexmani_real.robot.command_validation import check_worker_hand_command
+from dexmani_real.utils.limits import limit_hand_target_delta
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
 logger = get_logger(__name__)
-
-
-def limit_hand_delta(
-    target_qpos: np.ndarray,
-    measured_qpos: np.ndarray,
-    max_delta_rad_per_tick: float | np.ndarray,
-) -> np.ndarray:
-    """Bound one absolute target relative to fresh measured joint feedback."""
-    target = np.asarray(target_qpos, dtype=np.float64)
-    measured = np.asarray(measured_qpos, dtype=np.float64)
-    if target.shape != HAND_JOINT_SHAPE or measured.shape != HAND_JOINT_SHAPE:
-        raise ValueError("hand target and measured qpos must both have shape (12,)")
-    if not np.all(np.isfinite(target)) or not np.all(np.isfinite(measured)):
-        raise ValueError("hand target and measured qpos must be finite")
-    max_delta = np.broadcast_to(
-        np.asarray(max_delta_rad_per_tick, dtype=np.float64), HAND_JOINT_SHAPE
-    )
-    if not np.all(np.isfinite(max_delta)) or np.any(max_delta <= 0.0):
-        raise ValueError("hand max_delta_rad_per_tick must be finite and positive")
-    if np.all(np.abs(target - measured) <= max_delta):
-        # Preserve the original endpoint bit-for-bit once it is reachable in
-        # one tick.  ``measured + (target - measured)`` can differ by one ULP,
-        # which would otherwise prevent exact-target acknowledgement forever.
-        return target.copy()
-    return measured + np.clip(target - measured, -max_delta, max_delta)
 
 
 def expired_hand_command_diagnostics(
@@ -464,7 +440,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
 
             action_id = int(command["action_id"][0])
             target = np.asarray(command["hand_qpos"][0], dtype=np.float64)
-            bounded = limit_hand_delta(
+            bounded = limit_hand_target_delta(
                 target,
                 state.qpos,
                 config.hand_max_delta_rad_per_tick,
@@ -484,8 +460,8 @@ def hand_loop(shared: Any, config: HandParams) -> None:
             sdk_send_attempts += 1
             send_status = hand.send_action(bounded)
             if send_status is XHandSendStatus.ACCEPTED:
-                # ACK denotes SDK acceptance of the exact original endpoint,
-                # not physical convergence or acceptance of an intermediate step.
+                # ACK denotes SDK acceptance of the exact IPC endpoint, not
+                # physical convergence or acceptance of an intermediate step.
                 if np.array_equal(bounded, target):
                     accepted_target_action_id = action_id
                     exact_target_accepts += 1

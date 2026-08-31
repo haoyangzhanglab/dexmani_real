@@ -2,11 +2,13 @@
 
 > 状态：**两次完整 task rollout 均已 fail closed：旧 revision 在 58/331 次发布时因 near-expiry
 > command 触发 ACK timeout；`3e1d096` 在 121/331 次发布时由 hand endpoint expiry 触发 ACK
-> timeout。** observation、CPU inference 和首个 near-expiry command 的问题已经定位修复；current
+> timeout。** observation、CPU inference 和首个 near-expiry command 的问题已经定位修复；后一次
+> 故障已由现场确认发生在手已抓住物体并接触桌面时，根因是 policy hand endpoint 的 ACK 边界，
+> 对应代码修复仍待新的硬件分阶段验证；current
 > Python tree 已通过 `cuda:0` H2/H3 shadow，并在 `a697480` sealed 完成 H4 one-endpoint。task profile
 > 的 deterministic seed=1066 也已在任务场景完成 zero-write shadow，见
 > [`deployment_reference_task_scene_h2h3_shadow_2026-08-31_6b976f8.json`](deployment_reference_task_scene_h2h3_shadow_2026-08-31_6b976f8.json)。
-> task rollout 现暂停于 hand endpoint expiry 的数值诊断；根因 review、修复验证和新的 task 授权
+> task rollout 现暂停于 hand endpoint expiry 的修复验证；新的 H2/H3、H4 review 和 task 授权
 > 均为后续 gate。
 > 本文给出独立于 H4 one-shot 的 bounded task profile；文档和既有硬件证据均不构成新的真机授权。
 
@@ -61,9 +63,14 @@ arm 和 hand 同时判为 expired；2 秒 ACK watchdog 随后正确转入 FAULT�
 
 2026-08-31 在 `3e1d096` 上的 task scene / `cuda:0` / seed=1066 尝试已完成一次 physical
 home，并发布 121/331 个 coupled endpoints；前 120 个获得双 worker ACK。最后一个发布 endpoint
-在 hand worker 侧因 hard delivery expiry 被丢弃，随后 2 秒双 ACK watchdog 正确进入 FAULT。
-该日志尚不能区分 task-object contact 与 hand-loop stall；在明确数值诊断出现之前，不能将它归因于
-任一者，也不得重试。完整事实与 source hash 记录在
+在 hand worker 侧因 hard delivery expiry 被丢弃，随后 2 秒双 ACK watchdog 正确进入 FAULT。现场
+随后确认该时手已经抓取物体并和桌面接触。这说明 hand worker 的“仅当测量关节已足够接近 raw
+absolute endpoint 才 ACK”的边界不适合接触抓取：它把 SDK 已接受的受力 setpoint 错当成必须无接触地
+到达 raw endpoint。修复将 learned hand endpoint 先以同一 0.3 rad/tick 上限相对 fresh hand
+feedback 整形为实际 IPC endpoint，再对该 endpoint 重跑完整 SafetyGate；hand worker 仍以 fresh
+feedback 复核限速，且仅在 SDK 接受该 exact IPC endpoint 时 ACK。机械/操作限位、碰撞、freshness、
+generation、expiry、双 ACK、watchdog 和 fail-closed 语义不变。该修复尚未在硬件上验证，因此不得
+直接重试 task。完整事实与 source hash 记录在
 `deployment_reference_task_execute_failure_2026-08-31_3e1d096.json`。
 
 随后在 `bf79d4f` 上进行的 H2/H3 shadow revalidation 没有构建出首个 observation/plan，5 秒

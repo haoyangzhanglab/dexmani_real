@@ -51,7 +51,10 @@ shadow 证据解释成 execute 授权。
 - B 后 coordinator 最多写一条 complete coupled arm+hand record，随后停止调度；
 - 一个 execute lifecycle 只接受第一次 B；即使 supervisor 尚未观察到 ARMED，后续 B 也会被
   coordinator 忽略；
-- arm `last_cmd_seq` 与 hand `accepted_target_action_id` 都须确认同一个 action id；
+- arm `last_cmd_seq` 与 hand `accepted_target_action_id` 都须确认同一个 action id。learned hand
+  raw endpoint 会先完整过 gate，再相对 fresh hand feedback 按 0.3 rad/tick 整形成实际 IPC
+  endpoint，并再次完整过 gate；hand ACK 的 exact target 指该实际 endpoint，不代表接触状态下的
+  raw model endpoint 已物理收敛；
 - 确认成功即撤销 motion 并回到 ARMED；超时、superseded、freshness/feedback 或 publication
   异常均进入 sticky FAULT，绝不重试或发送第二条 policy command。
 - ACK 在 coordinator 轮询到 `APPLIED` 后仍须处于 deadline 内；晚到的 `APPLIED` 按 timeout

@@ -30,7 +30,10 @@ from dexmani_real.utils.feedback import (
     diagnose_arm_feedback,
     diagnose_hand_feedback,
 )
-from dexmani_real.utils.limits import canonicalize_policy_hand_endpoint_roundoff
+from dexmani_real.utils.limits import (
+    canonicalize_policy_hand_endpoint_roundoff,
+    limit_hand_target_delta,
+)
 from dexmani_real.utils.limits import (
     validate_hand_command_bounds as _validate_hand_bounds,
 )
@@ -594,6 +597,7 @@ def validate_and_send_candidate(
     hand_delta_reference_qpos: np.ndarray | None = None,
     hand_mechanical_lower_rad: np.ndarray | None = None,
     hand_mechanical_upper_rad: np.ndarray | None = None,
+    hand_command_max_delta_rad_per_tick: float | np.ndarray | None = None,
     canonicalize_policy_hand_roundoff: bool = False,
     execution_mode: str,
     minimum_delivery_window_s: float = 0.0,
@@ -601,7 +605,9 @@ def validate_and_send_candidate(
     """Validate a pre-built candidate through the gate and publish it.
 
     Checks runtime and actuator feedback, runs :meth:`SafetyGate.validate`,
-    preflights a coupled hand target, and publishes via :func:`send_command`.
+    optionally shapes a learned hand endpoint into one measured-state-bounded
+    command, preflights that actual command, and publishes via
+    :func:`send_command`.
     This is the publication tail shared by VR teleop, keyboard/replay, and the
     learned-policy coordinator.
 
@@ -615,6 +621,14 @@ def validate_and_send_candidate(
     """
     if execution_mode not in {"shadow", "execute"}:
         raise ValueError("execution_mode must be 'shadow' or 'execute'")
+    if hand_command_max_delta_rad_per_tick is not None:
+        command_delta = np.asarray(
+            hand_command_max_delta_rad_per_tick, dtype=np.float64
+        )
+        if not np.all(np.isfinite(command_delta)) or np.any(command_delta <= 0.0):
+            raise ValueError(
+                "hand_command_max_delta_rad_per_tick must be finite and positive"
+            )
     action_id = int(candidate.action_id)
     runtime_rejection = check_runtime_gate(shared)
     if runtime_rejection is not None:
@@ -725,6 +739,49 @@ def validate_and_send_candidate(
             gate_code=gate_result.code,
             hand_roundoff_canonicalized=hand_roundoff_canonicalized,
         )
+
+    if (
+        candidate.hand_qpos is not None
+        and hand_command_max_delta_rad_per_tick is not None
+    ):
+        assert hand_feedback is not None
+        # The raw learned endpoint must pass the complete gate first.  The
+        # physical hand command is then shaped from the same fresh feedback so
+        # contact can produce an accepted torque-limited setpoint rather than
+        # waiting for unreachable joint convergence.  Revalidate the shaped
+        # target because componentwise clipping is not necessarily a point on
+        # the raw joint-space interpolation checked above.
+        candidate = replace(
+            candidate,
+            hand_qpos=limit_hand_target_delta(
+                candidate.hand_qpos,
+                hand_feedback.qpos,
+                hand_command_max_delta_rad_per_tick,
+            ),
+        )
+        shaped_gate_result = gate.validate(
+            candidate,
+            current_arm_qpos=arm_feedback.qpos,
+            current_hand_qpos=hand_feedback.qpos,
+            arm_delta_reference_qpos=arm_delta_reference_qpos,
+            hand_delta_reference_qpos=hand_delta_reference_qpos,
+            run_generation=permit.run_generation,
+        )
+        if not shaped_gate_result.accepted:
+            reason = shaped_gate_result.reason or "unspecified"
+            logger.warning(
+                "validate_and_send_candidate: action_id=%d rejected by safety gate "
+                "after hand rate shaping: %s",
+                action_id,
+                reason,
+            )
+            return CommandPublishResult(
+                CommandPublishStatus.GATE_REJECTED,
+                candidate=candidate,
+                detail=reason,
+                gate_code=shaped_gate_result.code,
+                hand_roundoff_canonicalized=hand_roundoff_canonicalized,
+            )
 
     if candidate.hand_qpos is not None:
         assert hand_feedback is not None

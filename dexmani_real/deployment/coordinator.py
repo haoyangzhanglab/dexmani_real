@@ -157,6 +157,13 @@ class CoordinatorConfig:
     # 0.3-rad/tick ramp.
     arm_max_delta_rad_per_tick: float | None = arm_defaults.max_servo_command_jump_rad
     hand_max_delta_rad_per_tick: float | None = None
+    # The learned hand command is shaped from fresh feedback before IPC. This
+    # is deliberately separate from the policy SafetyGate's disabled hand
+    # delta rejection: the worker can exactly accept the shaped command even
+    # when object contact prevents the raw absolute endpoint from converging.
+    hand_command_max_delta_rad_per_tick: float = (
+        hand_defaults.hand_max_delta_rad_per_tick
+    )
     endpoint_delta_tolerance_rad: float = policy_defaults.endpoint_delta_tolerance_rad
     required_start_arm_qpos: tuple[float, ...] | None = None
     start_arm_home_tolerance_rad: float | None = None
@@ -202,6 +209,13 @@ class CoordinatorConfig:
                 raise ValueError(
                     "physical start home tolerance must be finite and positive"
                 )
+        if (
+            not np.isfinite(self.hand_command_max_delta_rad_per_tick)
+            or self.hand_command_max_delta_rad_per_tick <= 0.0
+        ):
+            raise ValueError(
+                "hand command max delta per tick must be finite and positive"
+            )
 
     @property
     def physical_execute_bounds(self) -> H4ExecuteBounds | TaskExecuteBounds | None:
@@ -245,6 +259,9 @@ class CoordinatorConfig:
             ik_max_pose_error_rot_rad=float(runtime.policy.ik_max_pose_error_rot_rad),
             arm_max_delta_rad_per_tick=float(runtime.arm.max_servo_command_jump_rad),
             hand_max_delta_rad_per_tick=None,
+            hand_command_max_delta_rad_per_tick=float(
+                runtime.hand.hand_max_delta_rad_per_tick
+            ),
             endpoint_delta_tolerance_rad=float(
                 runtime.policy.endpoint_delta_tolerance_rad
             ),
@@ -1281,6 +1298,9 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     ),
                     hand_mechanical_upper_rad=np.asarray(
                         config.hand_mechanical_upper_rad, dtype=np.float64
+                    ),
+                    hand_command_max_delta_rad_per_tick=(
+                        config.hand_command_max_delta_rad_per_tick
                     ),
                     canonicalize_policy_hand_roundoff=True,
                     execution_mode=(

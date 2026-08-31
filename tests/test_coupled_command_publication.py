@@ -381,6 +381,95 @@ class CoupledCommandPublicationTest(unittest.TestCase):
             shared.coupled_cmd_ring.latest["hand_qpos"][0], candidate.hand_qpos
         )
 
+    def test_policy_hand_endpoint_is_feedback_rate_shaped_and_revalidated(
+        self,
+    ) -> None:
+        """A contact-blocked learned endpoint becomes one exact IPC command."""
+        shared = _shared()
+        now_ns = time.monotonic_ns()
+        hand_low = np.asarray(hand_defaults.qpos_min_rad, dtype=np.float64)
+        hand_high = np.asarray(hand_defaults.qpos_max_rad, dtype=np.float64)
+        measured_hand_qpos = hand_low.copy()
+        raw_hand_qpos = measured_hand_qpos + np.minimum(
+            0.4,
+            (hand_high - hand_low) / 2.0,
+        )
+        self.assertTrue(np.all(raw_hand_qpos < hand_high))
+        expected_hand_qpos = measured_hand_qpos + np.minimum(
+            raw_hand_qpos - measured_hand_qpos,
+            0.3,
+        )
+        self.assertTrue(np.any(raw_hand_qpos - measured_hand_qpos > 0.3))
+        candidate = ActionCandidate(
+            observation_id=1,
+            run_generation=7,
+            action_id=1,
+            created_monotonic_ns=now_ns,
+            target_monotonic_ns=now_ns,
+            scheduled_target_monotonic_ns=now_ns,
+            valid_until_monotonic_ns=now_ns + 500_000_000,
+            arm_qpos=np.zeros(7),
+            hand_qpos=raw_hand_qpos,
+        )
+        gate = SafetyGate(
+            arm_joint_lower_rad=tuple(np.full(7, -1.0)),
+            arm_joint_upper_rad=tuple(np.full(7, 1.0)),
+            hand_joint_lower_rad=tuple(hand_low),
+            hand_joint_upper_rad=tuple(hand_high),
+        )
+        arm_feedback = SimpleNamespace(qpos=np.zeros(7), last_cmd_seq=0)
+        hand_feedback = SimpleNamespace(
+            qpos=measured_hand_qpos,
+            accepted_target_action_id=0,
+        )
+
+        with (
+            patch(
+                "dexmani_real.control.publication._arm_feedback_snapshot",
+                return_value=(arm_feedback, None),
+            ),
+            patch(
+                "dexmani_real.control.publication.read_hand_feedback",
+                return_value=(hand_feedback, None),
+            ),
+            patch.object(gate, "validate", wraps=gate.validate) as validate,
+        ):
+            result = validate_and_send_candidate(
+                shared,
+                candidate,
+                gate=gate,
+                arm_feedback_max_age_s=0.5,
+                hand_feedback_max_age_s=0.5,
+                hand_mechanical_lower_rad=np.asarray(
+                    hand_defaults.mechanical_qpos_min_rad
+                ),
+                hand_mechanical_upper_rad=np.asarray(
+                    hand_defaults.mechanical_qpos_max_rad
+                ),
+                hand_command_max_delta_rad_per_tick=0.3,
+                execution_mode="execute",
+            )
+
+        self.assertEqual(result.status, CommandPublishStatus.PUBLISHED)
+        assert result.candidate is not None
+        np.testing.assert_array_equal(
+            result.candidate.hand_qpos,
+            expected_hand_qpos,
+        )
+        self.assertEqual(validate.call_count, 2)
+        first_candidate = validate.call_args_list[0].args[0]
+        second_candidate = validate.call_args_list[1].args[0]
+        np.testing.assert_array_equal(first_candidate.hand_qpos, raw_hand_qpos)
+        np.testing.assert_array_equal(
+            second_candidate.hand_qpos,
+            expected_hand_qpos,
+        )
+        assert shared.coupled_cmd_ring.latest is not None
+        np.testing.assert_array_equal(
+            shared.coupled_cmd_ring.latest["hand_qpos"][0],
+            expected_hand_qpos,
+        )
+
     def test_execute_generation_change_after_gate_does_not_write(self) -> None:
         """A post-gate lifecycle revocation wins over a stale H4 candidate."""
         shared = _shared()

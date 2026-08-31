@@ -20,6 +20,7 @@ from dexmani_real.teleop.hand_control import (
     sanitize_hand_command,
     smoothstep_hand_ramp,
 )
+from dexmani_real.utils.limits import limit_hand_target_delta
 from dexmani_real.utils.smoothing import ema_smooth_pose
 
 
@@ -214,26 +215,6 @@ def compute_hand_joint_proposal(
         next_ramp_step=next_ramp_step,
         compute_time_ms=compute_time_ms,
     )
-
-
-def limit_hand_target_delta(
-    target_qpos_rad: np.ndarray,
-    previous_qpos_rad: np.ndarray,
-    max_delta_rad_per_tick: np.ndarray | float,
-) -> np.ndarray:
-    """Bound a policy-grid hand endpoint relative to its prior endpoint."""
-    target = np.asarray(target_qpos_rad, dtype=np.float64)
-    previous = np.asarray(previous_qpos_rad, dtype=np.float64)
-    if target.shape != previous.shape:
-        raise ValueError("hand target and previous endpoint must have the same shape")
-    if not np.all(np.isfinite(target)) or not np.all(np.isfinite(previous)):
-        raise ValueError("hand target and previous endpoint must be finite")
-    max_delta = np.broadcast_to(
-        np.asarray(max_delta_rad_per_tick, dtype=np.float64), target.shape
-    )
-    if not np.all(np.isfinite(max_delta)) or np.any(max_delta <= 0.0):
-        raise ValueError("hand max_delta_rad_per_tick must be finite and positive")
-    return previous + np.clip(target - previous, -max_delta, max_delta)
 
 
 def compute_arm_joint_proposal(
