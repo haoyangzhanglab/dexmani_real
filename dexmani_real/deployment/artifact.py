@@ -40,7 +40,7 @@ _SIDECAR_KEYS = frozenset(
     }
 )
 _CHECKPOINT_KEYS = frozenset({"filename", "size_bytes", "sha256"})
-_ALLOCATION_KEYS = frozenset(
+_ALLOCATION_V1_KEYS = frozenset(
     {
         "task_name",
         "action_key",
@@ -55,6 +55,15 @@ _ALLOCATION_KEYS = frozenset(
         "requires_hand",
         "point_cloud_num_points",
         "point_cloud_feature_dim",
+    }
+)
+_ALLOCATION_V2_KEYS = _ALLOCATION_V1_KEYS | frozenset(
+    {
+        "control_action_dim",
+        "auxiliary_action_layout",
+        "rgb_shape",
+        "rgb_color_order",
+        "rgb_value_range",
     }
 )
 _PRODUCER_KEYS = frozenset({"repository", "commit", "metadata_provenance"})
@@ -124,7 +133,12 @@ class PolicyArtifactContract:
 
     task_name: str
     action_key: str
+    # Full checkpoint prediction width.  It may include a model-only
+    # auxiliary target, such as R3D joint19 + wrist-pose9.
     action_dim: int
+    # Prefix of ``action_dim`` authorized to enter Real control.
+    control_action_dim: int
+    auxiliary_action_layout: str
     n_obs_steps: int
     n_action_steps: int
     horizon: int
@@ -133,8 +147,12 @@ class PolicyArtifactContract:
     sensor_modalities: tuple[str, ...]
     observation_fields: tuple[str, ...]
     requires_hand: bool
-    point_cloud_num_points: int
-    point_cloud_feature_dim: int
+    point_cloud_num_points: int | None
+    point_cloud_feature_dim: int | None
+    # Raw camera payload contract.  RGB preprocessing remains model-owned.
+    rgb_shape: tuple[int, int, int] | None
+    rgb_color_order: str | None
+    rgb_value_range: str | None
 
 
 @dataclass(frozen=True)
@@ -513,8 +531,9 @@ def _validate_sidecar(
     checkpoint_lstat: FileLstatIdentity,
 ) -> tuple[str, str, PolicyArtifactContract, PolicyArtifactProducer]:
     _require_exact_keys(sidecar, _SIDECAR_KEYS, "checkpoint sidecar")
-    if _require_positive_int(sidecar["schema_version"], "schema_version") != 1:
-        raise ValueError("checkpoint sidecar schema_version must be 1")
+    schema_version = _require_positive_int(sidecar["schema_version"], "schema_version")
+    if schema_version not in {1, 2}:
+        raise ValueError("checkpoint sidecar schema_version must be 1 or 2")
 
     checkpoint = _require_object(sidecar["checkpoint"], "checkpoint")
     _require_exact_keys(checkpoint, _CHECKPOINT_KEYS, "checkpoint")
@@ -531,14 +550,17 @@ def _validate_sidecar(
     embedded_contract_sha256 = _require_sha256(
         sidecar["embedded_contract_sha256"], "embedded_contract_sha256"
     )
-    allocation = _validate_allocation(sidecar["allocation"])
+    allocation = _validate_allocation(
+        sidecar["allocation"], schema_version=schema_version
+    )
     producer = _validate_producer(sidecar["producer"])
     return checkpoint_sha256, embedded_contract_sha256, allocation, producer
 
 
-def _validate_allocation(value: Any) -> PolicyArtifactContract:
+def _validate_allocation(value: Any, *, schema_version: int) -> PolicyArtifactContract:
     allocation = _require_object(value, "allocation")
-    _require_exact_keys(allocation, _ALLOCATION_KEYS, "allocation")
+    expected_keys = _ALLOCATION_V1_KEYS if schema_version == 1 else _ALLOCATION_V2_KEYS
+    _require_exact_keys(allocation, expected_keys, "allocation")
     task_name = _require_non_empty_string(
         allocation["task_name"], "allocation.task_name"
     )
@@ -553,13 +575,41 @@ def _validate_allocation(value: Any) -> PolicyArtifactContract:
     }
     if action_key not in action_dimensions:
         raise ValueError(f"unsupported allocation.action_key={action_key!r}")
+    control_action_dim = action_dimensions[action_key]
     action_dim = _require_positive_int(
         allocation["action_dim"], "allocation.action_dim"
     )
-    if action_dim != action_dimensions[action_key]:
+    auxiliary_action_layout = "none"
+    if schema_version == 2:
+        control_action_dim = _require_positive_int(
+            allocation["control_action_dim"], "allocation.control_action_dim"
+        )
+        auxiliary_action_layout = _require_non_empty_string(
+            allocation["auxiliary_action_layout"], "allocation.auxiliary_action_layout"
+        )
+    if control_action_dim != action_dimensions[action_key]:
         raise ValueError(
-            f"allocation.action_dim={action_dim} is inconsistent with "
-            f"allocation.action_key={action_key!r}"
+            f"allocation.control_action_dim={control_action_dim} is inconsistent "
+            f"with allocation.action_key={action_key!r}"
+        )
+    if auxiliary_action_layout == "none":
+        if action_dim != control_action_dim:
+            raise ValueError(
+                "allocation.action_dim must equal control_action_dim without an "
+                "auxiliary action layout"
+            )
+    elif auxiliary_action_layout == "joint19_ee9":
+        if (
+            action_key != "action"
+            or control_action_dim != ARM_DOF + HAND_DOF
+            or action_dim != control_action_dim + EE_POS_DIM + EE_ROT6D_DIM
+        ):
+            raise ValueError(
+                "joint19_ee9 auxiliary layout requires action=28 and control_action=19"
+            )
+    else:
+        raise ValueError(
+            "allocation.auxiliary_action_layout must be 'none' or 'joint19_ee9'"
         )
 
     n_obs_steps = _require_positive_int(
@@ -590,38 +640,43 @@ def _validate_allocation(value: Any) -> PolicyArtifactContract:
     control_dt_s = _require_positive_finite_number(
         allocation["control_dt_s"], "allocation.control_dt_s"
     )
-    sensor_modalities = _require_exact_string_list(
-        allocation["sensor_modalities"],
-        ("joint_state", "point_cloud"),
-        "allocation.sensor_modalities",
-    )
-    observation_fields = _require_exact_string_list(
-        allocation["observation_fields"],
-        ("arm_qpos", "hand_qpos", "point_cloud"),
-        "allocation.observation_fields",
-    )
+    if schema_version == 1:
+        sensor_modalities = _require_exact_string_list(
+            allocation["sensor_modalities"],
+            ("joint_state", "point_cloud"),
+            "allocation.sensor_modalities",
+        )
+        observation_fields = _require_exact_string_list(
+            allocation["observation_fields"],
+            ("arm_qpos", "hand_qpos", "point_cloud"),
+            "allocation.observation_fields",
+        )
+    else:
+        sensor_modalities = _require_sensor_modalities(allocation["sensor_modalities"])
+        observation_fields = _require_observation_fields(
+            allocation["observation_fields"], sensor_modalities
+        )
     requires_hand = allocation["requires_hand"]
     if not isinstance(requires_hand, bool) or not requires_hand:
         raise ValueError("allocation.requires_hand must be true for Real hand actions")
-    point_cloud_num_points = _require_positive_int(
-        allocation["point_cloud_num_points"], "allocation.point_cloud_num_points"
+    point_cloud_num_points, point_cloud_feature_dim = _require_pointcloud_contract(
+        allocation,
+        required="point_cloud" in sensor_modalities,
     )
-    if point_cloud_num_points not in SUPPORTED_POINT_CLOUD_COUNTS:
-        raise ValueError(
-            "allocation.point_cloud_num_points must be one of "
-            f"{sorted(SUPPORTED_POINT_CLOUD_COUNTS)}"
-        )
-    point_cloud_feature_dim = _require_positive_int(
-        allocation["point_cloud_feature_dim"], "allocation.point_cloud_feature_dim"
-    )
-    if point_cloud_feature_dim != POINT_CLOUD_FEATURE_DIM:
-        raise ValueError(
-            f"allocation.point_cloud_feature_dim must be {POINT_CLOUD_FEATURE_DIM}"
+    rgb_shape: tuple[int, int, int] | None = None
+    rgb_color_order: str | None = None
+    rgb_value_range: str | None = None
+    if schema_version == 2:
+        rgb_shape, rgb_color_order, rgb_value_range = _require_rgb_contract(
+            allocation,
+            required="rgb" in sensor_modalities,
         )
     return PolicyArtifactContract(
         task_name=task_name,
         action_key=action_key,
         action_dim=action_dim,
+        control_action_dim=control_action_dim,
+        auxiliary_action_layout=auxiliary_action_layout,
         n_obs_steps=n_obs_steps,
         n_action_steps=n_action_steps,
         horizon=horizon,
@@ -632,6 +687,9 @@ def _validate_allocation(value: Any) -> PolicyArtifactContract:
         requires_hand=requires_hand,
         point_cloud_num_points=point_cloud_num_points,
         point_cloud_feature_dim=point_cloud_feature_dim,
+        rgb_shape=rgb_shape,
+        rgb_color_order=rgb_color_order,
+        rgb_value_range=rgb_value_range,
     )
 
 
@@ -708,6 +766,99 @@ def _require_exact_string_list(
     if actual != expected:
         raise ValueError(f"{label} must equal {list(expected)!r}")
     return actual
+
+
+def _require_sensor_modalities(value: Any) -> tuple[str, ...]:
+    """Validate the explicit Real visual-modality combinations for schema v2."""
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError("allocation.sensor_modalities must be a string list")
+    actual = tuple(value)
+    if len(set(actual)) != len(actual):
+        raise ValueError("allocation.sensor_modalities must not contain duplicates")
+    allowed = {"joint_state", "point_cloud", "rgb"}
+    unknown = set(actual) - allowed
+    if (
+        unknown
+        or "joint_state" not in actual
+        or not ({"point_cloud", "rgb"} & set(actual))
+    ):
+        raise ValueError(
+            "allocation.sensor_modalities must contain joint_state and at least one "
+            "of point_cloud/rgb"
+        )
+    order = ("joint_state", "point_cloud", "rgb")
+    return tuple(name for name in order if name in actual)
+
+
+def _require_observation_fields(
+    value: Any, sensor_modalities: tuple[str, ...]
+) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError("allocation.observation_fields must be a string list")
+    expected = ["arm_qpos", "hand_qpos"]
+    if "point_cloud" in sensor_modalities:
+        expected.append("point_cloud")
+    if "rgb" in sensor_modalities:
+        expected.append("rgb")
+    if tuple(value) != tuple(expected):
+        raise ValueError(f"allocation.observation_fields must equal {expected!r}")
+    return tuple(expected)
+
+
+def _require_pointcloud_contract(
+    allocation: dict[str, Any], *, required: bool
+) -> tuple[int | None, int | None]:
+    count = allocation["point_cloud_num_points"]
+    feature_dim = allocation["point_cloud_feature_dim"]
+    if not required:
+        if count is not None or feature_dim is not None:
+            raise ValueError(
+                "point-cloud allocation values must be null when point_cloud is absent"
+            )
+        return None, None
+    point_cloud_num_points = _require_positive_int(
+        count, "allocation.point_cloud_num_points"
+    )
+    if point_cloud_num_points not in SUPPORTED_POINT_CLOUD_COUNTS:
+        raise ValueError(
+            "allocation.point_cloud_num_points must be one of "
+            f"{sorted(SUPPORTED_POINT_CLOUD_COUNTS)}"
+        )
+    point_cloud_feature_dim = _require_positive_int(
+        feature_dim, "allocation.point_cloud_feature_dim"
+    )
+    if point_cloud_feature_dim != POINT_CLOUD_FEATURE_DIM:
+        raise ValueError(
+            f"allocation.point_cloud_feature_dim must be {POINT_CLOUD_FEATURE_DIM}"
+        )
+    return point_cloud_num_points, point_cloud_feature_dim
+
+
+def _require_rgb_contract(
+    allocation: dict[str, Any], *, required: bool
+) -> tuple[tuple[int, int, int] | None, str | None, str | None]:
+    shape = allocation["rgb_shape"]
+    color_order = allocation["rgb_color_order"]
+    value_range = allocation["rgb_value_range"]
+    if not required:
+        if shape is not None or color_order is not None or value_range is not None:
+            raise ValueError("RGB allocation values must be null when rgb is absent")
+        return None, None, None
+    if (
+        not isinstance(shape, list)
+        or len(shape) != 3
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in shape
+        )
+        or shape[2] != 3
+    ):
+        raise ValueError("allocation.rgb_shape must be [height, width, 3]")
+    if color_order != "rgb":
+        raise ValueError("allocation.rgb_color_order must be 'rgb'")
+    if value_range != "uint8_0_255":
+        raise ValueError("allocation.rgb_value_range must be 'uint8_0_255'")
+    return (int(shape[0]), int(shape[1]), int(shape[2])), color_order, value_range
 
 
 def _require_sha256(value: Any, label: str) -> str:

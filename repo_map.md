@@ -220,16 +220,16 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | 文件 | 主要职责 |
 |---|---|
 | `__init__.py` | learned-policy 部署子包标记。 |
-| `artifact.py` | 纯 experiment selector、sidecar index 与 allocation contract 的 fail-closed 解析；不加载或哈希 checkpoint。 |
+| `artifact.py` | 纯 experiment selector、schema v1/v2 sidecar index（point cloud/RGB/auxiliary-action contract）与 allocation contract 的 fail-closed 解析；不加载或哈希 checkpoint。 |
 | `action_buffer.py` | 纯内存、有界 latest-wins policy endpoint scheduler；提供 stable token 与 commit/discard watermark。 |
 | `contracts.py` | 无时间 `PolicyPrediction`、publish context、timed action chunk 与 `PolicyRuntime` protocol。 |
 | `config.py` | artifact-owned/Real-owned deployment projection、确定性 seed、不可变 receipt、point-cloud contract，以及相互独立的 H4 one-shot/task execute bounds 校验。 |
-| `manifest.py` | checkpoint/config/runtime manifest 组装与 fail-closed 一致性检查。 |
+| `manifest.py` | checkpoint/config/runtime manifest（point cloud/RGB 与 full/control action layout）组装和 fail-closed 一致性检查。 |
 | `policy_checkpoint.py` | deployment-v2 checkpoint 的 Real-owned `weights_only` stream decoder、exact schema 与 canonical tensor-key 校验；不导入 Policy。 |
 | `preflight.py` | artifact-bound inference 与 spawn 预检共享的 no-follow/hash/provenance 单次 stream load；预检再执行 deterministic synthetic observation。 |
 | `run_identity.py` | 纯标准库的 Real source provenance 与 print/preflight 共用 canonical run receipt。 |
-| `observation.py` | 因果不可变 arm/hand/tactile/pointcloud history batch。 |
-| `worker.py` | 固定 DexMani Policy adapter 的 artifact-bound verified stream load、observation 校验、logical-grid timing stamp、bounded timing samples 与 plan 发布。 |
+| `observation.py` | 因果不可变 arm/hand/tactile/pointcloud/RGB history batch。 |
+| `worker.py` | 固定 DexMani Policy adapter 的 artifact-bound verified stream load、camera-grid observation 校验、logical-grid timing stamp、bounded timing samples 与 plan 发布。 |
 | `coordinator.py` | learned-policy 唯一 command producer、plan scheduling、物理执行本进程 H 完成 + arm-home 初态双门、逐 endpoint coupled ACK、typed stop、shadow/execute receipt、命令连续性与 watchdog。 |
 | `lifecycle.py` | shadow/H4/task worker topology、hand acknowledgement、物理模式 collision-checked home、B-relative supervision、receipt provenance 与 verified shutdown。 |
 | `operator.py` | B/S/Q/ESC typed request；物理模式每进程最多一次 H，依次下发 hand home、执行 collision-checked arm home，并发布完成标志。 |
@@ -251,7 +251,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | 文件 | 主要职责 |
 |---|---|
 | `integrations/__init__.py` | 外部集成子包标记。 |
-| `integrations/dexmani_policy.py` | 外部 `dexmani_policy` 已加载 checkpoint restore、artifact receipt 与 package provenance adapter。 |
+| `integrations/dexmani_policy.py` | 外部 `dexmani_policy` 的 GPU-default checkpoint restore、artifact receipt/package provenance、point-cloud/RGB encoding 与 full/control-action decode adapter。 |
 | `utils/__init__.py` | 轻量通用工具子包标记。 |
 | `utils/atomic_io.py` | fsync、拒绝已有文件/目录/链接的 atomic publish 与 atomic JSON。 |
 | `utils/feedback.py` | arm/hand feedback freshness、finite 与 health predicate。 |

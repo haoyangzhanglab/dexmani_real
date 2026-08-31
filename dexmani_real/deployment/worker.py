@@ -42,6 +42,8 @@ from dexmani_real.deployment.metrics import (
     OBSERVATION_WAIT_POINTCLOUD_GRID,
     OBSERVATION_WAIT_POINTCLOUD_HISTORY,
     OBSERVATION_WAIT_POINTCLOUD_STALE,
+    OBSERVATION_WAIT_RGB_GRID,
+    OBSERVATION_WAIT_RGB_HISTORY,
     OBSERVATIONS_BUILT,
     PLANS_CREATED,
     PLANS_GENERATION_DROPPED,
@@ -52,6 +54,7 @@ from dexmani_real.deployment.observation import (
     FrameWindow,
     ObservationBatch,
     PointCloudFrame,
+    RgbFrame,
     parse_observation_fields,
 )
 from dexmani_real.ipc.channels import RuntimeChannels, new_frame
@@ -366,16 +369,159 @@ def _read_pointcloud_history(
     return tuple(frame for frame in frames if frame.camera_generation == newest_gen)
 
 
-def _select_pointcloud_control_grid(
-    frames: tuple[PointCloudFrame, ...],
+def _rgb_frame_from_camera_record(
+    shared: RuntimeChannels,
+    header: np.ndarray,
+    ring_publish_ns: int,
+    sequence: int,
+    *,
+    anchor_ns: int,
+    max_age_ns: int,
+    not_before_ns: int,
+    expected_shape: tuple[int, int, int],
+) -> RgbFrame | None:
+    """Copy one verified, causal raw RGB frame from the camera ring."""
+    record = header[0]
+    source_ns = int(record["source_monotonic_ns"])
+    camera_publish_ns = int(record["publish_monotonic_ns"])
+    camera_generation = int(record["camera_generation"])
+    if not (
+        sequence > 0
+        and camera_generation > 0
+        and int(record["camera_health"]) == 0
+        and not bool(record["clock_reset"])
+        and 0 < source_ns <= camera_publish_ns <= ring_publish_ns <= anchor_ns
+        and anchor_ns - source_ns <= max_age_ns
+        and source_ns >= not_before_ns
+    ):
+        return None
+    payload = shared.camera_ring.read_sequence(sequence, modalities=("rgb",))
+    if payload is None:
+        return None
+    payload_header = payload["header"][0]
+    if (
+        int(payload_header["source_monotonic_ns"]) != source_ns
+        or int(payload_header["publish_monotonic_ns"]) != camera_publish_ns
+        or int(payload_header["camera_generation"]) != camera_generation
+    ):
+        return None
+    rgb = payload["rgb"]
+    if rgb.shape != expected_shape:
+        logger.warning(
+            "inference: RGB frame shape %s does not match artifact %s",
+            rgb.shape,
+            expected_shape,
+        )
+        return None
+    try:
+        return RgbFrame(
+            values=rgb,
+            source_camera_sequence=sequence,
+            source_monotonic_ns=source_ns,
+            publish_monotonic_ns=camera_publish_ns,
+            camera_generation=camera_generation,
+        )
+    except ValueError:
+        logger.warning("inference: invalid RGB payload dropped", exc_info=True)
+        return None
+
+
+def _read_rgb_history(
+    shared: RuntimeChannels,
+    *,
+    anchor_ns: int,
+    max_age_ns: int,
+    history_len: int,
+    not_before_ns: int,
+    expected_shape: tuple[int, int, int],
+) -> tuple[RgbFrame, ...]:
+    """Read the verified causal RGB frames still resident in camera shared memory."""
+    if history_len <= 0:
+        return ()
+    try:
+        records = shared.camera_ring.get_last_metadata(
+            min(history_len, shared.camera_ring.maxlen)
+        )
+    except Exception:
+        logger.warning("inference: RGB history metadata read failed", exc_info=True)
+        return ()
+    frames: list[RgbFrame] = []
+    for header, ring_publish_ns, sequence in records:
+        frame = _rgb_frame_from_camera_record(
+            shared,
+            header,
+            int(ring_publish_ns),
+            int(sequence),
+            anchor_ns=anchor_ns,
+            max_age_ns=max_age_ns,
+            not_before_ns=not_before_ns,
+            expected_shape=expected_shape,
+        )
+        if frame is not None:
+            frames.append(frame)
+    if not frames:
+        return ()
+    newest_generation = frames[-1].camera_generation
+    return tuple(
+        frame for frame in frames if frame.camera_generation == newest_generation
+    )
+
+
+def _read_rgb_for_pointcloud_history(
+    shared: RuntimeChannels,
+    pointcloud_history: tuple[PointCloudFrame, ...],
+    *,
+    anchor_ns: int,
+    max_age_ns: int,
+    not_before_ns: int,
+    expected_shape: tuple[int, int, int],
+) -> tuple[RgbFrame, ...]:
+    """Read RGB frames with exactly the camera provenance selected for clouds."""
+    try:
+        metadata_by_sequence = {
+            int(sequence): (header, int(ring_publish_ns))
+            for header, ring_publish_ns, sequence in shared.camera_ring.get_last_metadata(
+                shared.camera_ring.maxlen
+            )
+        }
+    except Exception:
+        logger.warning("inference: RGB provenance metadata read failed", exc_info=True)
+        return ()
+    frames: list[RgbFrame] = []
+    for pointcloud in pointcloud_history:
+        metadata = metadata_by_sequence.get(pointcloud.source_camera_sequence)
+        if metadata is None:
+            return ()
+        header, ring_publish_ns = metadata
+        frame = _rgb_frame_from_camera_record(
+            shared,
+            header,
+            ring_publish_ns,
+            pointcloud.source_camera_sequence,
+            anchor_ns=anchor_ns,
+            max_age_ns=max_age_ns,
+            not_before_ns=not_before_ns,
+            expected_shape=expected_shape,
+        )
+        if frame is None or (
+            frame.source_monotonic_ns != pointcloud.source_monotonic_ns
+            or frame.camera_generation != pointcloud.camera_generation
+        ):
+            return ()
+        frames.append(frame)
+    return tuple(frames)
+
+
+def _select_camera_control_grid(
+    frames: tuple[PointCloudFrame | RgbFrame, ...],
     *,
     run_started_ns: int,
     anchor_ns: int,
     history_len: int,
     step_dt_ns: int,
     max_grid_lag_ns: int,
-) -> tuple[tuple[PointCloudFrame, ...], int]:
-    """Select a strictly advancing causal window on the latest elapsed grid tick."""
+) -> tuple[tuple[PointCloudFrame | RgbFrame, ...], int]:
+    """Select a strictly advancing causal visual window on the policy grid."""
     if not frames or history_len <= 0 or step_dt_ns <= 0:
         return (), 0
     if anchor_ns < run_started_ns:
@@ -384,7 +530,7 @@ def _select_pointcloud_control_grid(
     if latest_tick < history_len - 1:
         return (), 0
     logical_step_ns = run_started_ns + latest_tick * step_dt_ns
-    selected: list[PointCloudFrame] = []
+    selected: list[PointCloudFrame | RgbFrame] = []
     previous_sequence = 0
     for offset in range(history_len - 1, -1, -1):
         desired_ns = logical_step_ns - offset * step_dt_ns
@@ -404,25 +550,51 @@ def _select_pointcloud_control_grid(
     return tuple(selected), logical_step_ns
 
 
-def _align_state_history_to_pointclouds(
+def _select_pointcloud_control_grid(
+    frames: tuple[PointCloudFrame, ...],
+    *,
+    run_started_ns: int,
+    anchor_ns: int,
+    history_len: int,
+    step_dt_ns: int,
+    max_grid_lag_ns: int,
+) -> tuple[tuple[PointCloudFrame, ...], int]:
+    """Point-cloud typed wrapper retained for the existing worker boundary."""
+    selected, logical_step_ns = _select_camera_control_grid(
+        frames,
+        run_started_ns=run_started_ns,
+        anchor_ns=anchor_ns,
+        history_len=history_len,
+        step_dt_ns=step_dt_ns,
+        max_grid_lag_ns=max_grid_lag_ns,
+    )
+    if not all(isinstance(frame, PointCloudFrame) for frame in selected):
+        raise RuntimeError("point-cloud selection returned a non-point-cloud frame")
+    return (
+        tuple(frame for frame in selected if isinstance(frame, PointCloudFrame)),
+        logical_step_ns,
+    )
+
+
+def _align_state_history_to_camera_frames(
     state_history: FrameWindow | None,
-    pointcloud_history: tuple[PointCloudFrame, ...],
+    camera_history: tuple[PointCloudFrame | RgbFrame, ...],
     *,
     max_skew_ns: int,
 ) -> FrameWindow | None:
-    """Causally align one state window to the point-cloud reference timeline.
+    """Causally align state to a selected point-cloud or RGB reference timeline.
 
-    For every point-cloud source time, choose the newest valid state at or
+    For every camera source time, choose the newest valid state at or
     before that time. Future state samples and pairs outside the explicit skew
     budget are rejected rather than interpolated or padded.
     """
-    if state_history is None or not pointcloud_history:
+    if state_history is None or not camera_history:
         return None
     source_ns = np.asarray(state_history.source_monotonic_ns, dtype=np.int64)
     valid = np.asarray(state_history.valid_mask, dtype=np.uint8) == 1
     selected: list[int] = []
-    for pointcloud in pointcloud_history:
-        reference_ns = np.int64(pointcloud.source_monotonic_ns)
+    for camera_frame in camera_history:
+        reference_ns = np.int64(camera_frame.source_monotonic_ns)
         candidates = np.flatnonzero(
             valid
             & (source_ns <= reference_ns)
@@ -464,8 +636,8 @@ def _build_observation(
     max_skew_ns = int(deployment.max_observation_skew_s * 1e9)
     max_grid_lag_ns = int(deployment.max_grid_lag_s * 1e9)
     history_span_ns = max(0, horizon - 1) * int(step_dt_ns)
-    pointcloud_history_max_age_ns = max_age_ns + history_span_ns + max_grid_lag_ns
-    state_history_max_age_ns = pointcloud_history_max_age_ns + max_skew_ns
+    visual_history_max_age_ns = max_age_ns + history_span_ns + max_grid_lag_ns
+    state_history_max_age_ns = visual_history_max_age_ns + max_skew_ns
     hand_history: FrameWindow | None = None
     hand_current_history: FrameWindow | None = None
     hand_tactile_sum_history: FrameWindow | None = None
@@ -474,16 +646,23 @@ def _build_observation(
     pointcloud_history: tuple[PointCloudFrame, ...] = ()
     requested = set(parse_observation_fields(deployment.observation_fields))
     pointcloud_requested = "point_cloud" in requested
-    state_history_len = (
-        shared.arm_state_ring.maxlen if pointcloud_requested else horizon
-    )
+    rgb_requested = "rgb" in requested
+    camera_requested = pointcloud_requested or rgb_requested
+    rgb_history: tuple[RgbFrame, ...] = ()
+    rgb_shape: tuple[int, int, int] | None = None
+    if rgb_requested:
+        artifact = config.artifact
+        if artifact is None or artifact.allocation_contract.rgb_shape is None:
+            raise ValueError("RGB observation requires an artifact RGB contract")
+        rgb_shape = artifact.allocation_contract.rgb_shape
+    state_history_len = shared.arm_state_ring.maxlen if camera_requested else horizon
     arm_history = _read_state_history(
         shared.arm_state_ring,
         history_len=state_history_len,
         anchor_ns=anchor_ns,
         values_field="qpos",
         required_true_fields=("state_valid",),
-        max_age_ns=(state_history_max_age_ns if pointcloud_requested else max_age_ns),
+        max_age_ns=(state_history_max_age_ns if camera_requested else max_age_ns),
         not_before_ns=run_started_ns,
     )
     hand_state_requested = bool(
@@ -502,7 +681,7 @@ def _build_observation(
         all_pointclouds = _read_pointcloud_history(
             shared,
             anchor_ns=anchor_ns,
-            max_age_ns=pointcloud_history_max_age_ns,
+            max_age_ns=visual_history_max_age_ns,
             num_points=int(deployment.pointcloud_num_points),
             history_len=shared.pointcloud_ring.maxlen,
             not_before_ns=run_started_ns,
@@ -517,6 +696,39 @@ def _build_observation(
         )
         if len(pointcloud_history) == horizon:
             pointcloud = pointcloud_history[-1]
+            if rgb_requested:
+                assert rgb_shape is not None
+                rgb_history = _read_rgb_for_pointcloud_history(
+                    shared,
+                    pointcloud_history,
+                    anchor_ns=anchor_ns,
+                    max_age_ns=visual_history_max_age_ns,
+                    not_before_ns=run_started_ns,
+                    expected_shape=rgb_shape,
+                )
+    elif rgb_requested:
+        assert rgb_shape is not None
+        all_rgb = _read_rgb_history(
+            shared,
+            anchor_ns=anchor_ns,
+            max_age_ns=visual_history_max_age_ns,
+            history_len=shared.camera_ring.maxlen,
+            not_before_ns=run_started_ns,
+            expected_shape=rgb_shape,
+        )
+        selected_rgb, logical_step_ns = _select_camera_control_grid(
+            all_rgb,
+            run_started_ns=run_started_ns,
+            anchor_ns=anchor_ns,
+            history_len=horizon,
+            step_dt_ns=step_dt_ns,
+            max_grid_lag_ns=max_grid_lag_ns,
+        )
+        if not all(isinstance(frame, RgbFrame) for frame in selected_rgb):
+            raise RuntimeError("RGB selection returned a non-RGB camera frame")
+        rgb_history = tuple(
+            frame for frame in selected_rgb if isinstance(frame, RgbFrame)
+        )
     else:
         logical_step_ns = 0
     if deployment.hand_enabled:
@@ -524,14 +736,14 @@ def _build_observation(
             hand_history = _read_state_history(
                 shared.hand_state_ring,
                 history_len=(
-                    shared.hand_state_ring.maxlen if pointcloud_requested else horizon
+                    shared.hand_state_ring.maxlen if camera_requested else horizon
                 ),
                 anchor_ns=anchor_ns,
                 values_field="qpos",
                 required_true_fields=("state_valid",),
                 required_false_fields=("qpos_stale",),
                 max_age_ns=(
-                    state_history_max_age_ns if pointcloud_requested else max_age_ns
+                    state_history_max_age_ns if camera_requested else max_age_ns
                 ),
                 not_before_ns=run_started_ns,
             )
@@ -539,16 +751,14 @@ def _build_observation(
                 hand_current_history = _read_state_history(
                     shared.hand_state_ring,
                     history_len=(
-                        shared.hand_state_ring.maxlen
-                        if pointcloud_requested
-                        else horizon
+                        shared.hand_state_ring.maxlen if camera_requested else horizon
                     ),
                     anchor_ns=anchor_ns,
                     values_field="current",
                     required_true_fields=("state_valid",),
                     required_false_fields=("qpos_stale",),
                     max_age_ns=(
-                        state_history_max_age_ns if pointcloud_requested else max_age_ns
+                        state_history_max_age_ns if camera_requested else max_age_ns
                     ),
                     not_before_ns=run_started_ns,
                 )
@@ -556,9 +766,7 @@ def _build_observation(
                 hand_tactile_sum_history = _read_state_history(
                     shared.hand_state_ring,
                     history_len=(
-                        shared.hand_state_ring.maxlen
-                        if pointcloud_requested
-                        else horizon
+                        shared.hand_state_ring.maxlen if camera_requested else horizon
                     ),
                     anchor_ns=anchor_ns,
                     values_field="tactile_sum",
@@ -568,7 +776,7 @@ def _build_observation(
                     ),
                     required_false_fields=("qpos_stale",),
                     max_age_ns=(
-                        state_history_max_age_ns if pointcloud_requested else max_age_ns
+                        state_history_max_age_ns if camera_requested else max_age_ns
                     ),
                     not_before_ns=run_started_ns,
                 )
@@ -576,44 +784,49 @@ def _build_observation(
             tactile_history = _read_state_history(
                 shared.hand_tactile_ring,
                 history_len=(
-                    shared.hand_tactile_ring.maxlen if pointcloud_requested else horizon
+                    shared.hand_tactile_ring.maxlen if camera_requested else horizon
                 ),
                 anchor_ns=anchor_ns,
                 values_field="tactile_force",
                 required_true_fields=("fresh",),
                 max_age_ns=(
-                    state_history_max_age_ns if pointcloud_requested else max_age_ns
+                    state_history_max_age_ns if camera_requested else max_age_ns
                 ),
                 not_before_ns=run_started_ns,
             )
-    if pointcloud_requested and len(pointcloud_history) == horizon:
-        arm_history = _align_state_history_to_pointclouds(
+    reference_history: tuple[PointCloudFrame | RgbFrame, ...]
+    if pointcloud_requested:
+        reference_history = pointcloud_history
+    else:
+        reference_history = rgb_history
+    if camera_requested and len(reference_history) == horizon:
+        arm_history = _align_state_history_to_camera_frames(
             arm_history,
-            pointcloud_history,
+            reference_history,
             max_skew_ns=max_skew_ns,
         )
         if hand_state_requested:
-            hand_history = _align_state_history_to_pointclouds(
+            hand_history = _align_state_history_to_camera_frames(
                 hand_history,
-                pointcloud_history,
+                reference_history,
                 max_skew_ns=max_skew_ns,
             )
         if hand_current_history is not None:
-            hand_current_history = _align_state_history_to_pointclouds(
+            hand_current_history = _align_state_history_to_camera_frames(
                 hand_current_history,
-                pointcloud_history,
+                reference_history,
                 max_skew_ns=max_skew_ns,
             )
         if hand_tactile_sum_history is not None:
-            hand_tactile_sum_history = _align_state_history_to_pointclouds(
+            hand_tactile_sum_history = _align_state_history_to_camera_frames(
                 hand_tactile_sum_history,
-                pointcloud_history,
+                reference_history,
                 max_skew_ns=max_skew_ns,
             )
         if tactile_history is not None:
-            tactile_history = _align_state_history_to_pointclouds(
+            tactile_history = _align_state_history_to_camera_frames(
                 tactile_history,
-                pointcloud_history,
+                reference_history,
                 max_skew_ns=max_skew_ns,
             )
     if pointcloud_requested:
@@ -625,6 +838,20 @@ def _build_observation(
         if anchor_ns - latest_source_ns > max_age_ns:
             if metrics is not None:
                 metrics.increment(OBSERVATION_WAIT_POINTCLOUD_STALE)
+            return None
+        if rgb_requested and len(rgb_history) != horizon:
+            if metrics is not None:
+                metrics.increment(OBSERVATION_WAIT_RGB_HISTORY)
+            return None
+    elif rgb_requested:
+        if len(rgb_history) != horizon or logical_step_ns <= 0:
+            if metrics is not None:
+                metrics.increment(OBSERVATION_WAIT_RGB_GRID)
+            return None
+        latest_source_ns = int(rgb_history[-1].source_monotonic_ns)
+        if anchor_ns - latest_source_ns > max_age_ns:
+            if metrics is not None:
+                metrics.increment(OBSERVATION_WAIT_RGB_GRID)
             return None
     elif arm_history is not None and arm_history.values.shape[0] > 0:
         latest_source_ns = int(arm_history.source_monotonic_ns[-1])
@@ -647,6 +874,7 @@ def _build_observation(
         tactile_history=tactile_history,
         pointcloud=pointcloud,
         pointcloud_history=pointcloud_history,
+        rgb_history=rgb_history,
     )
 
 
@@ -678,6 +906,9 @@ def observation_timing_ms(observation: ObservationBatch) -> tuple[float, float]:
     pointcloud = getattr(observation, "pointcloud", None)
     if pointcloud is not None:
         latest_sources.append(int(pointcloud.source_monotonic_ns))
+    rgb_history = getattr(observation, "rgb_history", ())
+    if rgb_history:
+        latest_sources.append(int(rgb_history[-1].source_monotonic_ns))
     if not latest_sources:
         latest_sources.append(int(observation.latest_source_monotonic_ns))
     latest_ns = max(latest_sources)
@@ -833,6 +1064,9 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
                 and len(observation.pointcloud_history) != horizon
             ):
                 wait_for_observation(OBSERVATION_WAIT_POINTCLOUD_HISTORY)
+                continue
+            if "rgb" in requested and len(observation.rgb_history) != horizon:
+                wait_for_observation(OBSERVATION_WAIT_RGB_HISTORY)
                 continue
             if observation.logical_step_monotonic_ns <= last_logical_step_ns:
                 wait_for_observation(OBSERVATION_WAIT_GRID_ADVANCE)

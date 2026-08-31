@@ -52,17 +52,6 @@ FIXED_POLICY_RUNTIME_TARGET = (
 
 # The artifact is authoritative for model-facing fields.  A deployment YAML
 # may state one as an expectation, but may never change it.
-_ARTIFACT_OWNED_FIELDS = frozenset(
-    {
-        "checkpoint",
-        "task_name",
-        "action_key",
-        "observation_horizon",
-        "hand_enabled",
-        "observation_fields",
-        "pointcloud_num_points",
-    }
-)
 _REAL_OWNED_DEPLOYMENT_FIELDS = frozenset(
     {
         "inference_seed",
@@ -80,6 +69,22 @@ _REAL_OWNED_DEPLOYMENT_FIELDS = frozenset(
 )
 
 
+def _artifact_deployment_values(artifact: ResolvedPolicyArtifact) -> dict[str, Any]:
+    """Return only model-facing deployment values meaningful for this artifact."""
+    allocation = artifact.allocation_contract
+    values: dict[str, Any] = {
+        "checkpoint": str(artifact.checkpoint_path),
+        "task_name": allocation.task_name,
+        "action_key": allocation.action_key,
+        "observation_horizon": allocation.n_obs_steps,
+        "hand_enabled": allocation.requires_hand,
+        "observation_fields": ",".join(allocation.observation_fields),
+    }
+    if allocation.point_cloud_num_points is not None:
+        values["pointcloud_num_points"] = allocation.point_cloud_num_points
+    return values
+
+
 @dataclass(frozen=True)
 class DeploymentConfig:
     """Frozen learned-policy deployment parameters.
@@ -91,7 +96,9 @@ class DeploymentConfig:
     """
 
     checkpoint: str | None = None
-    device: str = "cpu"
+    # Policy inference is GPU-first.  CPU remains an explicit operator choice;
+    # the inference child validates the selected torch device before restore.
+    device: str = "cuda:0"
     # Operator-declared semantic task identity; the DexMani Policy adapter
     # requires an exact match with the checkpoint training-data contract.
     task_name: str = ""
@@ -120,6 +127,10 @@ class DeploymentConfig:
     pointcloud_num_points: int = 1024
 
     def __post_init__(self) -> None:
+        if not isinstance(self.device, str) or not self.device.strip():
+            raise ValueError("device must be a non-empty torch device string")
+        if self.device != self.device.strip():
+            raise ValueError("device must not have leading or trailing whitespace")
         if (
             isinstance(self.inference_seed, bool)
             or not isinstance(self.inference_seed, int)
@@ -295,15 +306,7 @@ class PolicyRuntimeConfig:
             if not isinstance(self.artifact, ResolvedPolicyArtifact):
                 raise TypeError("artifact must be a ResolvedPolicyArtifact")
             allocation = self.artifact.allocation_contract
-            expected = {
-                "checkpoint": str(self.artifact.checkpoint_path),
-                "task_name": allocation.task_name,
-                "action_key": allocation.action_key,
-                "observation_horizon": allocation.n_obs_steps,
-                "hand_enabled": allocation.requires_hand,
-                "observation_fields": ",".join(allocation.observation_fields),
-                "pointcloud_num_points": allocation.point_cloud_num_points,
-            }
+            expected = _artifact_deployment_values(self.artifact)
             for name, value in expected.items():
                 if getattr(self.deployment, name) != value:
                     raise ValueError(
@@ -463,16 +466,11 @@ def resolve_policy_runtime_config(
         raise TypeError("deployment config root must be a mapping")
 
     allocation = artifact.allocation_contract
-    expected_artifact = {
-        "checkpoint": str(artifact.checkpoint_path),
-        "task_name": allocation.task_name,
-        "action_key": allocation.action_key,
-        "observation_horizon": allocation.n_obs_steps,
-        "hand_enabled": allocation.requires_hand,
-        "observation_fields": ",".join(allocation.observation_fields),
-        "pointcloud_num_points": allocation.point_cloud_num_points,
-    }
-    allowed = _ARTIFACT_OWNED_FIELDS | _REAL_OWNED_DEPLOYMENT_FIELDS
+    expected_artifact = _artifact_deployment_values(artifact)
+    # Modality-specific artifact fields are accepted only when the artifact
+    # actually declares them. In particular, an RGB-only policy must not
+    # silently accept an irrelevant pointcloud_num_points override.
+    allowed = frozenset(expected_artifact) | _REAL_OWNED_DEPLOYMENT_FIELDS
     unknown = {str(key) for key in raw} - allowed
     if unknown:
         raise TypeError(
@@ -506,7 +504,10 @@ def resolve_policy_runtime_config(
         control_dt_s, allocation.control_dt_s, rel_tol=0.0, abs_tol=1e-12
     ):
         raise ValueError("artifact control_dt_s does not match Real policy.control_hz")
-    if runtime_config.pointcloud.num_points != allocation.point_cloud_num_points:
+    if (
+        allocation.point_cloud_num_points is not None
+        and runtime_config.pointcloud.num_points != allocation.point_cloud_num_points
+    ):
         raise ValueError(
             "artifact point_cloud_num_points does not match Real pointcloud config"
         )

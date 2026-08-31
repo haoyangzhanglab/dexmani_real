@@ -9,8 +9,9 @@ coordinator -> readiness -> ARMED -> supervise -> verified shutdown. There is
 no second health mechanism: the supervisor's heartbeat/readiness slots already
 carry ``arm``/``hand``/``camera``/``pointcloud``/``inference``/``policy``.
 
-There is no VR worker or recorder. Camera and point-cloud workers are included
-only when the explicit observation contract contains ``point_cloud``.
+There is no VR worker or recorder. The camera worker is included whenever the
+explicit observation contract contains ``point_cloud`` or ``rgb``; the
+point-cloud worker is included only for ``point_cloud``.
 
 Also owns the one-time startup provenance log line (commit hashes +
 checkpoint SHA-256) via ``sha256_file`` and
@@ -82,6 +83,11 @@ def _prepare_execute_receipt_dir() -> str:
 
 def _requires_pointcloud(deployment: DeploymentConfig) -> bool:
     return "point_cloud" in parse_observation_fields(deployment.observation_fields)
+
+
+def _requires_camera(deployment: DeploymentConfig) -> bool:
+    requested = parse_observation_fields(deployment.observation_fields)
+    return "point_cloud" in requested or "rgb" in requested
 
 
 def sha256_file(path: str | Path) -> str:
@@ -222,6 +228,7 @@ def build_policy_worker_specs(
         execute_receipt_provenance_json=execute_receipt_provenance_json,
     )
     pointcloud_requested = _requires_pointcloud(deployment)
+    camera_requested = _requires_camera(deployment)
     pointcloud_config = (
         PointCloudLoopConfig.from_runtime(
             runtime,
@@ -238,25 +245,26 @@ def build_policy_worker_specs(
             ready_name="arm",
         ),
     ]
+    if camera_requested:
+        specs.append(
+            WorkerSpec(
+                "camera",
+                camera_loop,
+                (shared, CameraLoopConfig.from_runtime(runtime)),
+                ready_name="camera",
+            )
+        )
     if pointcloud_requested:
-        specs.extend(
-            [
-                WorkerSpec(
-                    "camera",
-                    camera_loop,
-                    (shared, CameraLoopConfig.from_runtime(runtime)),
-                    ready_name="camera",
+        specs.append(
+            WorkerSpec(
+                "pointcloud",
+                pointcloud_loop,
+                (
+                    shared,
+                    pointcloud_config,
                 ),
-                WorkerSpec(
-                    "pointcloud",
-                    pointcloud_loop,
-                    (
-                        shared,
-                        pointcloud_config,
-                    ),
-                    ready_name="pointcloud",
-                ),
-            ]
+                ready_name="pointcloud",
+            )
         )
     specs.extend(
         [
@@ -358,11 +366,13 @@ def run_policy_deployment(
 
     ctx = mp.get_context("spawn")
     pointcloud_requested = _requires_pointcloud(deployment)
+    camera_requested = _requires_camera(deployment)
     shared = RuntimeChannels.create(
         prefix=prefix or f"dexmani_policy_{os.getpid()}",
         config=RuntimeChannelsConfig.from_runtime(
             runtime,
             pointcloud_num_points=deployment.pointcloud_num_points,
+            camera_requested=camera_requested,
             pointcloud_requested=pointcloud_requested,
             observation_horizon=deployment.observation_horizon,
             observation_dt_s=1.0 / float(runtime.policy.control_hz),

@@ -36,7 +36,7 @@ from dexmani_real.ipc.schema import (
 )
 
 SUPPORTED_ACTION_KEYS = frozenset({"action", "action_ee"})
-SUPPORTED_SENSOR_MODALITIES = frozenset({"joint_state", "point_cloud"})
+SUPPORTED_SENSOR_MODALITIES = frozenset({"joint_state", "point_cloud", "rgb"})
 
 # Native control-action dimensions (what the runtime hands the coordinator).
 # joint: arm(7) + hand(12); ee: position(3) + rot6d(6) + hand(12).
@@ -57,9 +57,13 @@ class DeploymentManifest:
     hand_dim: int | None = None
     tcp_dim: int | None = None
     control_action_dim: int = JOINT_CONTROL_ACTION_DIM
+    auxiliary_action_layout: str = "none"
     sensor_modalities: tuple[str, ...] = ("joint_state", "point_cloud")
-    point_cloud_num_points: int = 1024
-    point_cloud_feature_dim: int = POINT_CLOUD_FEATURE_DIM
+    point_cloud_num_points: int | None = 1024
+    point_cloud_feature_dim: int | None = POINT_CLOUD_FEATURE_DIM
+    rgb_shape: tuple[int, int, int] | None = None
+    rgb_color_order: str | None = None
+    rgb_value_range: str | None = None
 
     def __post_init__(self) -> None:
         if self.domain != "real":
@@ -111,6 +115,21 @@ class DeploymentManifest:
                 f"control_action_dim={self.control_action_dim} is inconsistent with "
                 f"action_key={self.action_key!r} (expected {expected_control})"
             )
+        if self.auxiliary_action_layout == "none":
+            if self.action_dim != self.control_action_dim:
+                raise ValueError(
+                    "action_dim must equal control_action_dim without an auxiliary layout"
+                )
+        elif self.auxiliary_action_layout == "joint19_ee9":
+            if (
+                self.action_key != "action"
+                or self.control_action_dim != JOINT_CONTROL_ACTION_DIM
+                or self.action_dim
+                != JOINT_CONTROL_ACTION_DIM + EE_POS_DIM + EE_ROT6D_DIM
+            ):
+                raise ValueError("joint19_ee9 requires action=28 and control_action=19")
+        else:
+            raise ValueError("auxiliary_action_layout must be 'none' or 'joint19_ee9'")
         modalities = self.sensor_modalities
         if not isinstance(modalities, tuple) or not modalities:
             raise ValueError("sensor_modalities must be a non-empty tuple")
@@ -119,6 +138,12 @@ class DeploymentManifest:
         unknown = set(modalities) - SUPPORTED_SENSOR_MODALITIES
         if unknown:
             raise ValueError(f"unsupported sensor modalit(ies): {sorted(unknown)}")
+        if "joint_state" not in modalities or not (
+            {"point_cloud", "rgb"} & set(modalities)
+        ):
+            raise ValueError(
+                "sensor_modalities must contain joint_state and at least one visual modality"
+            )
         if "point_cloud" in modalities:
             if (
                 isinstance(self.point_cloud_num_points, bool)
@@ -132,10 +157,41 @@ class DeploymentManifest:
                 raise ValueError(
                     f"point_cloud_feature_dim must be {POINT_CLOUD_FEATURE_DIM}"
                 )
+        elif (
+            self.point_cloud_num_points is not None
+            or self.point_cloud_feature_dim is not None
+        ):
+            raise ValueError(
+                "point-cloud metadata must be None when point_cloud is absent"
+            )
+        if "rgb" in modalities:
+            if (
+                not isinstance(self.rgb_shape, tuple)
+                or len(self.rgb_shape) != 3
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                    for value in self.rgb_shape
+                )
+                or self.rgb_shape[2] != 3
+            ):
+                raise ValueError(
+                    "rgb_shape must be a positive (height, width, 3) tuple"
+                )
+            if self.rgb_color_order != "rgb" or self.rgb_value_range != "uint8_0_255":
+                raise ValueError("RGB metadata must describe raw RGB uint8 [0,255]")
+        elif any(
+            value is not None
+            for value in (self.rgb_shape, self.rgb_color_order, self.rgb_value_range)
+        ):
+            raise ValueError("RGB metadata must be None when rgb is absent")
 
     @property
     def uses_point_cloud(self) -> bool:
         return "point_cloud" in self.sensor_modalities
+
+    @property
+    def uses_rgb(self) -> bool:
+        return "rgb" in self.sensor_modalities
 
     @property
     def is_ee(self) -> bool:
@@ -152,14 +208,18 @@ def manifest_from_sources(
     tcp_dim: int | None,
     hand_dim: int | None,
     control_action_dim: int,
+    auxiliary_action_layout: str,
     sensor_modalities: Iterable[str],
-    point_cloud_num_points: int,
-    point_cloud_feature_dim: int,
+    point_cloud_num_points: int | None,
+    point_cloud_feature_dim: int | None,
+    rgb_shape: tuple[int, int, int] | None,
+    rgb_color_order: str | None,
+    rgb_value_range: str | None,
 ) -> DeploymentManifest:
     """Assemble and validate a manifest from model + config sources.
 
-    The fixed adapter supports only an explicit point-cloud model contract;
-    missing dimensions are invalid rather than replaced with defaults.
+    Every input shape is artifact-owned. Missing metadata is invalid when its
+    modality is requested rather than replaced with a deployment fallback.
     """
     modalities = tuple(str(m) for m in sensor_modalities)
     if len(set(modalities)) != len(modalities):
@@ -175,9 +235,17 @@ def manifest_from_sources(
         hand_dim=hand_dim,
         tcp_dim=tcp_dim,
         control_action_dim=control_action_dim,
+        auxiliary_action_layout=auxiliary_action_layout,
         sensor_modalities=modalities,
-        point_cloud_num_points=int(point_cloud_num_points),
-        point_cloud_feature_dim=int(point_cloud_feature_dim),
+        point_cloud_num_points=(
+            None if point_cloud_num_points is None else int(point_cloud_num_points)
+        ),
+        point_cloud_feature_dim=(
+            None if point_cloud_feature_dim is None else int(point_cloud_feature_dim)
+        ),
+        rgb_shape=rgb_shape,
+        rgb_color_order=rgb_color_order,
+        rgb_value_range=rgb_value_range,
     )
 
 
@@ -212,10 +280,15 @@ def validate_manifest_against_deployment(
     from dexmani_real.deployment.observation import parse_observation_fields
 
     requested = set(parse_observation_fields(deployment.observation_fields))
-    if requested != {"arm_qpos", "hand_qpos", "point_cloud"}:
+    expected_fields = {"arm_qpos", "hand_qpos"}
+    if manifest.uses_point_cloud:
+        expected_fields.add("point_cloud")
+    if manifest.uses_rgb:
+        expected_fields.add("rgb")
+    if requested != expected_fields:
         raise ValueError(
-            "DexMani real deployment requires observation_fields exactly "
-            "'arm_qpos,hand_qpos,point_cloud'; got "
+            "DexMani real deployment observation_fields must match the artifact "
+            f"modalities {sorted(expected_fields)!r}; got "
             f"{deployment.observation_fields!r}"
         )
     hand_fields = requested & {
@@ -231,24 +304,29 @@ def validate_manifest_against_deployment(
             "policy commands the hand but observation_fields="
             f"{deployment.observation_fields!r} requests no hand field"
         )
-    # Only point-cloud policies are supported by this runtime; a joint-only or
-    # rgb manifest would otherwise hit an unconditional point-cloud requirement
-    # in _encode and silently hang at inference.
-    required_modalities = frozenset({"joint_state", "point_cloud"})
-    if frozenset(manifest.sensor_modalities) != required_modalities:
+    modalities = frozenset(manifest.sensor_modalities)
+    if "joint_state" not in modalities or not (modalities & {"point_cloud", "rgb"}):
         raise ValueError(
-            "DexMani real deployment requires exactly the modalities "
-            "{'joint_state', 'point_cloud'}; "
+            "DexMani real deployment requires joint_state plus at least one "
+            "supported visual modality; "
             f"got manifest sensor_modalities={manifest.sensor_modalities!r}"
         )
-    if manifest.point_cloud_num_points != deployment.pointcloud_num_points:
+    if (
+        manifest.uses_point_cloud
+        and manifest.point_cloud_num_points != deployment.pointcloud_num_points
+    ):
         raise ValueError(
             f"manifest point_cloud_num_points={manifest.point_cloud_num_points} "
             f"does not match deployment pointcloud_num_points="
             f"{deployment.pointcloud_num_points}"
         )
-    if "point_cloud" not in requested:
+    if manifest.uses_point_cloud and "point_cloud" not in requested:
         raise ValueError(
             "manifest requires point_cloud but deployment observation_fields "
+            f"={deployment.observation_fields!r} does not request it"
+        )
+    if manifest.uses_rgb and "rgb" not in requested:
+        raise ValueError(
+            "manifest requires rgb but deployment observation_fields "
             f"={deployment.observation_fields!r} does not request it"
         )

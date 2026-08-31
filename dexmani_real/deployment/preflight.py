@@ -28,6 +28,7 @@ from dexmani_real.deployment.observation import (
     FrameWindow,
     ObservationBatch,
     PointCloudFrame,
+    RgbFrame,
 )
 
 _ARM_DOF = 7
@@ -586,36 +587,57 @@ def _synthetic_observation(runtime_config: PolicyRuntimeConfig) -> ObservationBa
         publish_monotonic_ns=publish_ns,
         valid_mask=valid,
     )
-    points = np.zeros(
-        (allocation.point_cloud_num_points, allocation.point_cloud_feature_dim),
-        dtype=np.float32,
-    )
-    points[:, 0] = 0.4
-    points[:, 3:] = 0.5
-    history = tuple(
-        PointCloudFrame(
-            values=points,
-            source_camera_sequence=int(index),
-            source_monotonic_ns=int(source),
-            publish_monotonic_ns=int(published),
-            camera_generation=1,
+    pointcloud_history: tuple[PointCloudFrame, ...] = ()
+    if allocation.point_cloud_num_points is not None:
+        assert allocation.point_cloud_feature_dim is not None
+        points = np.zeros(
+            (allocation.point_cloud_num_points, allocation.point_cloud_feature_dim),
+            dtype=np.float32,
         )
-        for index, source, published in zip(
-            sequence, source_ns, publish_ns, strict=True
+        points[:, 0] = 0.4
+        points[:, 3:] = 0.5
+        pointcloud_history = tuple(
+            PointCloudFrame(
+                values=points,
+                source_camera_sequence=int(index),
+                source_monotonic_ns=int(source),
+                publish_monotonic_ns=int(published),
+                camera_generation=1,
+            )
+            for index, source, published in zip(
+                sequence, source_ns, publish_ns, strict=True
+            )
         )
-    )
-    latest = history[-1]
+    rgb_history: tuple[RgbFrame, ...] = ()
+    if allocation.rgb_shape is not None:
+        rgb = np.zeros(allocation.rgb_shape, dtype=np.uint8)
+        rgb_history = tuple(
+            RgbFrame(
+                values=rgb,
+                source_camera_sequence=int(index),
+                source_monotonic_ns=int(source),
+                publish_monotonic_ns=int(published),
+                camera_generation=1,
+            )
+            for index, source, published in zip(
+                sequence, source_ns, publish_ns, strict=True
+            )
+        )
+    latest_source_ns = int(source_ns[-1])
+    latest_publish_ns = int(publish_ns[-1])
+    latest_pointcloud = pointcloud_history[-1] if pointcloud_history else None
     return ObservationBatch(
         observation_id=1,
         run_generation=1,
         run_started_monotonic_ns=run_ns,
-        anchor_monotonic_ns=int(latest.publish_monotonic_ns + 1_000_000),
-        latest_source_monotonic_ns=latest.source_monotonic_ns,
-        logical_step_monotonic_ns=latest.source_monotonic_ns,
+        anchor_monotonic_ns=latest_publish_ns + 1_000_000,
+        latest_source_monotonic_ns=latest_source_ns,
+        logical_step_monotonic_ns=latest_source_ns,
         arm_history=arm,
         hand_history=hand,
-        pointcloud=latest,
-        pointcloud_history=history,
+        pointcloud=latest_pointcloud,
+        pointcloud_history=pointcloud_history,
+        rgb_history=rgb_history,
     )
 
 

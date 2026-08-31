@@ -62,6 +62,7 @@ class RuntimeChannelsConfig:
     record_status_ring_maxlen: int = 1
     policy_plan_ring_maxlen: int = 3
     pointcloud_num_points: int = 1024
+    camera_requested: bool = False
     pointcloud_requested: bool = False
     # Point-cloud ring capacity must cover the observation horizon so the
     # per-step point-cloud history is a real window, not a broadcast.
@@ -117,8 +118,12 @@ class RuntimeChannelsConfig:
                 "RuntimeChannels pointcloud_num_points must be one of "
                 f"{sorted(SUPPORTED_POINT_CLOUD_COUNTS)}"
             )
+        if not isinstance(self.camera_requested, bool):
+            raise TypeError("RuntimeChannels camera_requested must be boolean")
         if not isinstance(self.pointcloud_requested, bool):
             raise TypeError("RuntimeChannels pointcloud_requested must be boolean")
+        if self.pointcloud_requested and not self.camera_requested:
+            raise ValueError("pointcloud_requested requires camera_requested")
         if (
             isinstance(self.initial_safety_state, bool)
             or not isinstance(self.initial_safety_state, int)
@@ -148,6 +153,7 @@ class RuntimeChannelsConfig:
         runtime: object,
         *,
         pointcloud_num_points: int = 1024,
+        camera_requested: bool = False,
         pointcloud_requested: bool = False,
         observation_horizon: int | None = None,
         observation_dt_s: float | None = None,
@@ -155,6 +161,10 @@ class RuntimeChannelsConfig:
         max_observation_skew_s: float = 0.0,
         max_grid_lag_s: float = 0.0,
     ) -> "RuntimeChannelsConfig":
+        # Older callers only expressed the derived point-cloud requirement.
+        # A point-cloud worker always consumes camera frames, so preserve that
+        # valid contract while keeping RGB-only deployments explicit.
+        camera_requested = bool(camera_requested or pointcloud_requested)
         cam = getattr(runtime, "camera")
         pol = getattr(runtime, "policy")
         arm_cfg = getattr(runtime, "arm")
@@ -170,15 +180,16 @@ class RuntimeChannelsConfig:
         arm_state_ring_maxlen = 8
         hand_state_ring_maxlen = 8
         hand_tactile_ring_maxlen = 8
+        camera_ring_maxlen = int(cam.ring_maxlen)
         pointcloud_ring_maxlen = 8
-        if pointcloud_requested:
+        if camera_requested:
             if (
                 observation_horizon is None
                 or isinstance(observation_horizon, bool)
                 or int(observation_horizon) <= 0
             ):
                 raise ValueError(
-                    "point-cloud deployment requires a positive observation_horizon"
+                    "camera-backed deployment requires a positive observation_horizon"
                 )
             if (
                 observation_dt_s is None
@@ -186,7 +197,7 @@ class RuntimeChannelsConfig:
                 or float(observation_dt_s) <= 0.0
             ):
                 raise ValueError(
-                    "point-cloud deployment requires a finite positive observation_dt_s"
+                    "camera-backed deployment requires a finite positive observation_dt_s"
                 )
             if (
                 not math.isfinite(float(max_input_age_s))
@@ -207,10 +218,10 @@ class RuntimeChannelsConfig:
             # only determines how many source frames may land inside that span;
             # it is not the model's temporal spacing.
             history_span_s = (horizon - 1) * float(observation_dt_s)
-            pointcloud_span_s = (
+            visual_span_s = (
                 history_span_s + float(max_grid_lag_s) + float(max_input_age_s)
             )
-            state_span_s = pointcloud_span_s + float(max_observation_skew_s)
+            state_span_s = visual_span_s + float(max_observation_skew_s)
             arm_state_ring_maxlen = max(
                 arm_state_ring_maxlen,
                 math.ceil(float(arm_cfg.loop_hz) * state_span_s)
@@ -222,16 +233,22 @@ class RuntimeChannelsConfig:
                 + _OBSERVATION_READ_MARGIN,
             )
             hand_tactile_ring_maxlen = hand_state_ring_maxlen
-            pointcloud_ring_maxlen = max(
-                pointcloud_ring_maxlen,
-                math.ceil(float(cam.fps) * pointcloud_span_s)
-                + _OBSERVATION_READ_MARGIN,
+            camera_ring_maxlen = max(
+                camera_ring_maxlen,
+                math.ceil(float(cam.fps) * visual_span_s) + _OBSERVATION_READ_MARGIN,
             )
+            if pointcloud_requested:
+                pointcloud_ring_maxlen = max(
+                    pointcloud_ring_maxlen,
+                    math.ceil(float(cam.fps) * visual_span_s)
+                    + _OBSERVATION_READ_MARGIN,
+                )
         return cls(
-            camera_ring_maxlen=int(cam.ring_maxlen),
+            camera_ring_maxlen=camera_ring_maxlen,
             camera_rgb_shape=(int(cam.height), int(cam.width), 3),
             camera_depth_shape=(int(cam.height), int(cam.width)),
             pointcloud_num_points=int(pointcloud_num_points),
+            camera_requested=camera_requested,
             pointcloud_requested=pointcloud_requested,
             arm_state_ring_maxlen=arm_state_ring_maxlen,
             hand_state_ring_maxlen=hand_state_ring_maxlen,
@@ -336,7 +353,10 @@ class RuntimeChannels:
     error_state: Any  # arm/hand -> all (sticky latch)
     estop_request: Any  # policy -> arm/hand
     quit_requested: Any  # policy -> Main
-    pointcloud_requested: Any  # Main -> camera; keep native payload publication active
+    camera_requested: (
+        Any  # Main -> camera; keep native RGB-D payload publication active
+    )
+    pointcloud_requested: Any  # Main -> pointcloud worker
     start_request: Any  # Main -> coordinator: B (start a new policy run)
     # Main/operator -> coordinator: true only after this process completed the
     # authorized hand-home + collision-checked arm-home sequence.
@@ -510,6 +530,7 @@ class RuntimeChannels:
         storage.error_state = ctx.Value("b", False)
         storage.estop_request = ctx.Value("b", False)
         storage.quit_requested = ctx.Value("b", False)
+        storage.camera_requested = ctx.Value("b", cfg.camera_requested)
         storage.pointcloud_requested = ctx.Value("b", cfg.pointcloud_requested)
         storage.start_request = ctx.Value("b", False)
         storage.physical_home_completed = ctx.Value("b", False)

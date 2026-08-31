@@ -907,6 +907,12 @@ class DeploymentTimingTest(unittest.TestCase):
             "point_cloud_feature_dim": 6,
         }
         _validate_training_data_contract(contract, restored)
+        contract["profile"] = "rgb_pc"
+        _validate_training_data_contract(contract, restored)
+        contract["profile"] = "rgb"
+        with self.assertRaises(ValueError):
+            _validate_training_data_contract(contract, restored)
+        contract["profile"] = "pointcloud"
         contract.pop("endpoint_delta_tolerance_rad")
         with self.assertRaises(ValueError):
             _validate_training_data_contract(contract, restored)

@@ -325,7 +325,7 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
                 not ready_published
                 or int(shared.safety_state.value) == int(SafetyState.DISARMED)
                 or bool(shared.is_recording.value)
-                or bool(shared.pointcloud_requested.value)
+                or bool(shared.camera_requested.value)
             )
             try:
                 frame = cam.read(timeout_ms=300, compute_depth=False)

@@ -33,6 +33,8 @@ OBSERVATION_WAIT_POINTCLOUD_STALE = "observation_wait_pointcloud_stale"
 OBSERVATION_WAIT_ARM_HISTORY = "observation_wait_arm_history"
 OBSERVATION_WAIT_HAND_HISTORY = "observation_wait_hand_history"
 OBSERVATION_WAIT_POINTCLOUD_HISTORY = "observation_wait_pointcloud_history"
+OBSERVATION_WAIT_RGB_GRID = "observation_wait_rgb_grid"
+OBSERVATION_WAIT_RGB_HISTORY = "observation_wait_rgb_history"
 OBSERVATION_WAIT_GRID_ADVANCE = "observation_wait_grid_advance"
 OBSERVATION_AGE_MS = "observation_age_ms"
 OBSERVATION_SKEW_MS = "observation_skew_ms"
@@ -82,6 +84,8 @@ _COUNTER_NAMES = frozenset(
         OBSERVATION_WAIT_ARM_HISTORY,
         OBSERVATION_WAIT_HAND_HISTORY,
         OBSERVATION_WAIT_POINTCLOUD_HISTORY,
+        OBSERVATION_WAIT_RGB_GRID,
+        OBSERVATION_WAIT_RGB_HISTORY,
         OBSERVATION_WAIT_GRID_ADVANCE,
         INFERENCE_FAILURES,
         PLANS_CREATED,

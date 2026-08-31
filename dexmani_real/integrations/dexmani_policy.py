@@ -53,6 +53,31 @@ _ARM_DOF = ARM_JOINT_SHAPE[0]
 _HAND_DOF = HAND_JOINT_SHAPE[0]
 
 
+def _validate_inference_device(device_spec: str) -> torch.device:
+    """Resolve one operator-selected torch device without silent fallback."""
+    if not isinstance(device_spec, str) or not device_spec.strip():
+        raise ValueError("deployment device must be a non-empty torch device string")
+    try:
+        device = torch.device(device_spec)
+    except (TypeError, RuntimeError) as exc:
+        raise ValueError(f"invalid deployment device {device_spec!r}") from exc
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"deployment device {device_spec!r} requires CUDA, but CUDA is unavailable; "
+                "pass --device cpu only for an intentional CPU run"
+            )
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        count = torch.cuda.device_count()
+        if index < 0 or index >= count:
+            raise RuntimeError(
+                f"deployment device {device_spec!r} is unavailable; CUDA device count={count}"
+            )
+    return device
+
+
 def _validate_training_data_contract(
     data_contract: Any, runtime_config: PolicyRuntimeConfig
 ) -> None:
@@ -67,6 +92,17 @@ def _validate_training_data_contract(
         raise ValueError(
             "DexMani Policy deployment requires an explicit non-empty task_name"
         )
+    artifact = runtime_config.artifact
+    requested_fields = set(
+        part.strip()
+        for part in deployment.observation_fields.split(",")
+        if part.strip()
+    )
+    expected_modalities = {"joint_state"}
+    if "point_cloud" in requested_fields:
+        expected_modalities.add("point_cloud")
+    if "rgb" in requested_fields:
+        expected_modalities.add("rgb")
     expected = {
         "domain": "real",
         "schema_name": "dexmani-real-policy-zarr",
@@ -83,18 +119,33 @@ def _validate_training_data_contract(
         ),
         "deployment_equivalent": True,
         "task_name": expected_task,
-        "point_cloud_frame": runtime_config.point_cloud_frame,
-        "point_cloud_color_source": runtime_config.point_cloud_color_source,
-        "point_cloud_policy_id": runtime_config.point_cloud_policy_id,
-        "point_cloud_config_sha256": runtime_config.point_cloud_config_sha256,
-        "point_cloud_table_plane_abcd_json": (
-            runtime_config.point_cloud_table_plane_abcd_json
-        ),
-        "point_cloud_sampling": runtime_config.point_cloud_sampling,
-        "point_cloud_transform": runtime_config.point_cloud_transform,
-        "point_cloud_num_points": int(deployment.pointcloud_num_points),
-        "point_cloud_feature_dim": 6,
     }
+    if "point_cloud" in expected_modalities:
+        expected.update(
+            {
+                "point_cloud_frame": runtime_config.point_cloud_frame,
+                "point_cloud_color_source": runtime_config.point_cloud_color_source,
+                "point_cloud_policy_id": runtime_config.point_cloud_policy_id,
+                "point_cloud_config_sha256": runtime_config.point_cloud_config_sha256,
+                "point_cloud_table_plane_abcd_json": (
+                    runtime_config.point_cloud_table_plane_abcd_json
+                ),
+                "point_cloud_sampling": runtime_config.point_cloud_sampling,
+                "point_cloud_transform": runtime_config.point_cloud_transform,
+                "point_cloud_num_points": int(deployment.pointcloud_num_points),
+                "point_cloud_feature_dim": 6,
+            }
+        )
+    if "rgb" in expected_modalities:
+        if artifact is None or artifact.allocation_contract.rgb_shape is None:
+            raise ValueError("RGB deployment requires an artifact RGB contract")
+        expected.update(
+            {
+                "rgb_color_order": artifact.allocation_contract.rgb_color_order,
+                "rgb_value_range": artifact.allocation_contract.rgb_value_range,
+                "rgb_shape": list(artifact.allocation_contract.rgb_shape),
+            }
+        )
     expected["endpoint_delta_tolerance_rad"] = (
         runtime_config.endpoint_delta_tolerance_rad
     )
@@ -108,14 +159,27 @@ def _validate_training_data_contract(
             "checkpoint training data does not match the realtime Real "
             f"observation contract: {mismatches}"
         )
-    if data_contract.get("profile") not in {"pointcloud", "rgb_pc"}:
-        raise ValueError("checkpoint training data must contain canonical point clouds")
-    if set(data_contract.get("sensor_modalities", ())) != {
-        "joint_state",
-        "point_cloud",
-    }:
+    # ``profile`` describes the persisted source payload, not necessarily the
+    # narrower modality subset consumed by one model. A point-cloud model may
+    # validly train from an RGB+point-cloud export while declaring only
+    # point_cloud in sensor_modalities; reject only profiles that omit a
+    # visual input the model actually consumes.
+    expected_profiles = (
+        {"pointcloud", "rgb_pc"}
+        if expected_modalities == {"joint_state", "point_cloud"}
+        else (
+            {"rgb", "rgb_pc"}
+            if expected_modalities == {"joint_state", "rgb"}
+            else {"rgb_pc"}
+        )
+    )
+    if data_contract.get("profile") not in expected_profiles:
         raise ValueError(
-            "checkpoint training sensor modalities must be joint_state + point_cloud"
+            "checkpoint training data profile does not match deployment modalities"
+        )
+    if set(data_contract.get("sensor_modalities", ())) != expected_modalities:
+        raise ValueError(
+            "checkpoint training sensor modalities do not match the deployment artifact"
         )
     training_dt_s = data_contract.get("dt")
     runtime_dt_s = runtime_config.control_dt_s
@@ -138,11 +202,16 @@ def _validate_training_data_contract(
 
 def _expected_normalizer_dims(manifest: DeploymentManifest) -> dict[str, int]:
     """Return model-space dimensions seen by each fitted normalizer."""
-    return {
+    dimensions = {
         "action": manifest.action_dim,
         "joint_state": _ARM_DOF + _HAND_DOF,
-        "point_cloud": manifest.point_cloud_feature_dim,
     }
+    if manifest.uses_point_cloud:
+        assert manifest.point_cloud_feature_dim is not None
+        dimensions["point_cloud"] = manifest.point_cloud_feature_dim
+    # RGB has no affine normalizer entry: the model-owned image processor
+    # performs its explicit spatial and ImageNet-style transformations.
+    return dimensions
 
 
 def _validate_embedded_targets(value: Any, *, path: str = "") -> None:
@@ -425,7 +494,7 @@ class DexManiPolicyRuntime:
         if self.config.artifact is None:
             raise ValueError("DexManiPolicyRuntime requires an artifact-bound config")
         deployment = self.config.deployment
-        device = deployment.device
+        device = str(_validate_inference_device(deployment.device))
         try:
             import dexmani_policy  # noqa: F401  (lazy; model repo import)
         except ImportError as exc:
@@ -482,6 +551,14 @@ class DexManiPolicyRuntime:
         agent.to(device)
         agent.eval()
 
+        allocation = self.config.artifact.allocation_contract
+        if int(agent.action_dim) != allocation.action_dim:
+            raise ValueError("restored agent action_dim mismatches artifact allocation")
+        if int(agent.control_action_dim) != allocation.control_action_dim:
+            raise ValueError(
+                "restored agent control_action_dim mismatches artifact allocation"
+            )
+
         # Assemble the manifest from the restored agent plus the model
         # config/sensor contract, then fail closed on any deployment
         # inconsistency before the run can start.
@@ -495,12 +572,24 @@ class DexManiPolicyRuntime:
             hand_dim=getattr(agent, "hand_dim", None),
             control_action_dim=int(agent.control_action_dim),
             sensor_modalities=self.config.artifact.allocation_contract.sensor_modalities,
-            point_cloud_num_points=int(cfg.agent.num_points),
-            point_cloud_feature_dim=int(cfg.agent.pc_dim),
+            auxiliary_action_layout=(
+                self.config.artifact.allocation_contract.auxiliary_action_layout
+            ),
+            point_cloud_num_points=(
+                self.config.artifact.allocation_contract.point_cloud_num_points
+            ),
+            point_cloud_feature_dim=(
+                self.config.artifact.allocation_contract.point_cloud_feature_dim
+            ),
+            rgb_shape=self.config.artifact.allocation_contract.rgb_shape,
+            rgb_color_order=self.config.artifact.allocation_contract.rgb_color_order,
+            rgb_value_range=self.config.artifact.allocation_contract.rgb_value_range,
         )
         validate_manifest_against_deployment(manifest, deployment)
 
-        required_normalizers = ["action", *manifest.sensor_modalities]
+        required_normalizers = ["action", "joint_state"]
+        if manifest.uses_point_cloud:
+            required_normalizers.append("point_cloud")
         if not agent.normalizer.is_fitted(required_keys=required_normalizers):
             missing = [
                 key
@@ -653,19 +742,31 @@ class DexManiPolicyRuntime:
             raise ValueError("checkpoint data_contract.dt mismatches sidecar")
         if data.get("sensor_modalities") != list(allocation.sensor_modalities):
             raise ValueError("checkpoint data_contract sensor modalities mismatch")
-        if data.get("point_cloud_num_points") != allocation.point_cloud_num_points:
-            raise ValueError("checkpoint data_contract point count mismatch")
-        if data.get("point_cloud_feature_dim") != allocation.point_cloud_feature_dim:
-            raise ValueError(
-                "checkpoint data_contract point feature dimension mismatch"
-            )
+        if allocation.point_cloud_num_points is not None:
+            if data.get("point_cloud_num_points") != allocation.point_cloud_num_points:
+                raise ValueError("checkpoint data_contract point count mismatch")
+            if (
+                data.get("point_cloud_feature_dim")
+                != allocation.point_cloud_feature_dim
+            ):
+                raise ValueError(
+                    "checkpoint data_contract point feature dimension mismatch"
+                )
+        if allocation.rgb_shape is not None:
+            if data.get("rgb_shape") != list(allocation.rgb_shape):
+                raise ValueError("checkpoint data_contract RGB shape mismatch")
+            if data.get("rgb_color_order") != allocation.rgb_color_order:
+                raise ValueError("checkpoint data_contract RGB color order mismatch")
+            if data.get("rgb_value_range") != allocation.rgb_value_range:
+                raise ValueError("checkpoint data_contract RGB value range mismatch")
+        expected_auxiliary = allocation.auxiliary_action_layout != "none"
         if (
             data.get("pad_before") != allocation.n_obs_steps - 1
             or data.get("pad_after") != allocation.n_action_steps - 1
             or data.get("padding_semantics") != "repeat_edge"
-            or data.get("use_aux_ee") is not False
-            or train.get("use_aux_ee") is not False
-            or inference.get("use_aux_ee") is not False
+            or data.get("use_aux_ee") is not expected_auxiliary
+            or train.get("use_aux_ee") is not expected_auxiliary
+            or inference.get("use_aux_ee") is not expected_auxiliary
         ):
             raise ValueError(
                 "checkpoint padding or auxiliary-action contract is invalid"
@@ -686,18 +787,33 @@ class DexManiPolicyRuntime:
             )
 
         n_obs = self._manifest.n_obs_steps
-        num_points = self._manifest.point_cloud_num_points
         joint_state = torch.zeros(
             (1, n_obs, _ARM_DOF + _HAND_DOF),
             dtype=torch.float32,
             device=self._device,
         )
-        point_cloud = torch.zeros(
-            (1, n_obs, num_points, self._manifest.point_cloud_feature_dim),
-            dtype=torch.float32,
-            device=self._device,
-        )
-        obs_dict = {"joint_state": joint_state, "point_cloud": point_cloud}
+        obs_dict: dict[str, torch.Tensor] = {"joint_state": joint_state}
+        if self._manifest.uses_point_cloud:
+            assert self._manifest.point_cloud_num_points is not None
+            assert self._manifest.point_cloud_feature_dim is not None
+            obs_dict["point_cloud"] = torch.zeros(
+                (
+                    1,
+                    n_obs,
+                    self._manifest.point_cloud_num_points,
+                    self._manifest.point_cloud_feature_dim,
+                ),
+                dtype=torch.float32,
+                device=self._device,
+            )
+        if self._manifest.uses_rgb:
+            assert self._manifest.rgb_shape is not None
+            height, width, _channels = self._manifest.rgb_shape
+            obs_dict["rgb"] = torch.zeros(
+                (1, n_obs, 3, height, width),
+                dtype=torch.float32,
+                device=self._device,
+            )
 
         python_rng_state = random.getstate()
         numpy_rng_state = np.random.get_state()
@@ -728,7 +844,7 @@ class DexManiPolicyRuntime:
         return tuple(timings_s)
 
     def _encode(self, observation: ObservationBatch) -> dict[str, torch.Tensor]:
-        """Build the model-native ``joint_state`` / ``point_cloud`` tensors.
+        """Build the artifact-declared model-native observation tensors.
 
         ``joint_state`` is ``[1, n_obs_steps, 19]`` (arm7 + hand12 concatenated,
         most-recent ``n_obs_steps`` frames, anchor last); ``point_cloud`` is
@@ -756,23 +872,51 @@ class DexManiPolicyRuntime:
             )
         joint = np.concatenate([arm, hand], axis=-1).astype(np.float32)  # [n_obs, 19]
 
-        # Point-cloud history is a real oldest-first temporal window. Repeating
-        # an old cloud would turn a missing observation into a plausible input,
-        # so insufficient history fails closed.
-        pc_frames = list(observation.pointcloud_history)
-        if len(pc_frames) != n_obs:
-            raise ValueError(
-                f"need exactly {n_obs} causal point-cloud frames, got {len(pc_frames)}"
-            )
-        if len({frame.camera_generation for frame in pc_frames}) != 1:
-            raise ValueError("point-cloud history crosses a camera generation boundary")
-        pc = np.stack(
-            [frame.values.astype(np.float32) for frame in pc_frames], axis=0
-        )  # [n_obs, N, 6]
-
         joint_t = torch.as_tensor(joint, device=self._device).unsqueeze(0)
-        pc_t = torch.as_tensor(pc, device=self._device).unsqueeze(0)
-        return {"joint_state": joint_t, "point_cloud": pc_t}
+        encoded: dict[str, torch.Tensor] = {"joint_state": joint_t}
+        if self._manifest.uses_point_cloud:
+            # Repeating an old cloud would turn a missing observation into a
+            # plausible input, so insufficient history fails closed.
+            pc_frames = list(observation.pointcloud_history)
+            if len(pc_frames) != n_obs:
+                raise ValueError(
+                    f"need exactly {n_obs} causal point-cloud frames, got {len(pc_frames)}"
+                )
+            if len({frame.camera_generation for frame in pc_frames}) != 1:
+                raise ValueError(
+                    "point-cloud history crosses a camera generation boundary"
+                )
+            pc = np.stack(
+                [frame.values.astype(np.float32) for frame in pc_frames], axis=0
+            )
+            encoded["point_cloud"] = torch.as_tensor(pc, device=self._device).unsqueeze(
+                0
+            )
+        if self._manifest.uses_rgb:
+            rgb_frames = list(observation.rgb_history)
+            if len(rgb_frames) != n_obs:
+                raise ValueError(
+                    f"need exactly {n_obs} causal RGB frames, got {len(rgb_frames)}"
+                )
+            if len({frame.camera_generation for frame in rgb_frames}) != 1:
+                raise ValueError("RGB history crosses a camera generation boundary")
+            assert self._manifest.rgb_shape is not None
+            if any(
+                frame.values.shape != self._manifest.rgb_shape for frame in rgb_frames
+            ):
+                raise ValueError("RGB frame shape mismatches the artifact contract")
+            # Keep RGB uint8 through shared memory and transfer; conversion,
+            # layout and model image preprocessing then run on the GPU.
+            rgb = np.stack([frame.values for frame in rgb_frames], axis=0)
+            rgb_t = torch.as_tensor(rgb, device=self._device)
+            encoded["rgb"] = (
+                rgb_t.permute(0, 3, 1, 2)
+                .contiguous()
+                .to(dtype=torch.float32)
+                .div_(255.0)
+                .unsqueeze(0)
+            )
+        return encoded
 
     def _decode(self, pred_action: torch.Tensor) -> PolicyPrediction:
         """Decode the full native prediction into an untimed future interval.

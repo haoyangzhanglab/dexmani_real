@@ -21,8 +21,8 @@ shadow 证据解释成 execute 授权。
 
 `examples/run_policy.py` 和 lifecycle 仅接受以下不可放宽的 H4 profile：
 
-- 必须显式声明 inference `--device`；本 frozen reference 使用已离线验证的
-  `--device cuda:0`，不能再隐式落到 CPU；
+- inference 默认 `cuda:0`；CUDA 不可用会 fail closed，不会隐式落到 CPU。本 frozen reference
+  的 operational invocation 仍须显式写出 `--device cuda:0`，以使人工审计和 receipt 对齐；
 - `--execution-mode execute --hand`，且 artifact 必须要求 hand；
 - `--execute-max-published-endpoints 1`，不能使用其他数值；
 - `--execute-ack-timeout-seconds <finite positive>`；

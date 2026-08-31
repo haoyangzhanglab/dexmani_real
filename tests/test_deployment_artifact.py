@@ -592,6 +592,55 @@ class DeploymentArtifactTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     resolve_policy_artifact(root)
 
+    def test_schema_v2_accepts_rgb_and_r3d_auxiliary_prefix_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "experiment"
+            _, _, sidecar_path, sidecar = _write_experiment(root)
+            sidecar["schema_version"] = 2
+            sidecar["allocation"].update(
+                {
+                    "action_dim": 28,
+                    "control_action_dim": 19,
+                    "auxiliary_action_layout": "joint19_ee9",
+                    "sensor_modalities": ["joint_state", "rgb"],
+                    "observation_fields": ["arm_qpos", "hand_qpos", "rgb"],
+                    "point_cloud_num_points": None,
+                    "point_cloud_feature_dim": None,
+                    "rgb_shape": [480, 640, 3],
+                    "rgb_color_order": "rgb",
+                    "rgb_value_range": "uint8_0_255",
+                }
+            )
+            _write_sidecar(sidecar_path, sidecar)
+
+            artifact = resolve_policy_artifact(root)
+
+            self.assertEqual(artifact.allocation_contract.action_dim, 28)
+            self.assertEqual(artifact.allocation_contract.control_action_dim, 19)
+            self.assertEqual(
+                artifact.allocation_contract.auxiliary_action_layout, "joint19_ee9"
+            )
+            self.assertEqual(artifact.allocation_contract.rgb_shape, (480, 640, 3))
+
+    def test_schema_v2_rejects_unrecognized_auxiliary_action_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "experiment"
+            _, _, sidecar_path, sidecar = _write_experiment(root)
+            sidecar["schema_version"] = 2
+            sidecar["allocation"].update(
+                {
+                    "control_action_dim": 19,
+                    "auxiliary_action_layout": "unknown",
+                    "rgb_shape": None,
+                    "rgb_color_order": None,
+                    "rgb_value_range": None,
+                }
+            )
+            _write_sidecar(sidecar_path, sidecar)
+
+            with self.assertRaisesRegex(ValueError, "auxiliary_action_layout"):
+                resolve_policy_artifact(root)
+
     def test_artifact_import_does_not_load_policy_torch_lifecycle_or_hardware(
         self,
     ) -> None:

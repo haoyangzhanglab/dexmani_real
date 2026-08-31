@@ -26,6 +26,7 @@ POLICY_OBSERVATION_FIELDS = frozenset(
         "fingertip_force",
         "xhand_tactile",
         "point_cloud",
+        "rgb",
     }
 )
 
@@ -162,6 +163,45 @@ class PointCloudFrame:
 
 
 @dataclass(frozen=True)
+class RgbFrame:
+    """One raw RGB camera frame and its causal provenance."""
+
+    values: np.ndarray  # [H, W, 3] uint8, RGB, [0, 255]
+    source_camera_sequence: int
+    source_monotonic_ns: int
+    publish_monotonic_ns: int
+    camera_generation: int
+
+    def __post_init__(self) -> None:
+        values = freeze_array(self.values, name="RgbFrame.values", dtype=np.uint8)
+        if values is None or values.ndim != 3 or values.shape[2] != 3:
+            raise ValueError("RgbFrame.values must be uint8 [H, W, 3]")
+        provenance = (
+            self.source_camera_sequence,
+            self.source_monotonic_ns,
+            self.publish_monotonic_ns,
+            self.camera_generation,
+        )
+        if any(
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or int(value) <= 0
+            for value in provenance
+        ):
+            raise ValueError("RgbFrame provenance values must be positive")
+        if int(self.source_monotonic_ns) > int(self.publish_monotonic_ns):
+            raise ValueError("RgbFrame source time cannot exceed publish time")
+        object.__setattr__(self, "values", values)
+        for name in (
+            "source_camera_sequence",
+            "source_monotonic_ns",
+            "publish_monotonic_ns",
+            "camera_generation",
+        ):
+            object.__setattr__(self, name, int(getattr(self, name)))
+
+
+@dataclass(frozen=True)
 class ObservationBatch:
     """One causal observation assembled from state and point-cloud rings.
 
@@ -190,6 +230,9 @@ class ObservationBatch:
     # the latest (and last element) when non-empty.  ``point_cloud`` models use
     # this window for their per-step point-cloud history.
     pointcloud_history: tuple[PointCloudFrame, ...] = ()
+    # Raw camera RGB frames on the same causal control grid as state and, when
+    # requested jointly, the point-cloud history.
+    rgb_history: tuple[RgbFrame, ...] = ()
 
     def __post_init__(self) -> None:
         if self.observation_id < 0 or self.run_generation < 0:
@@ -275,3 +318,50 @@ class ObservationBatch:
                     raise ValueError(
                         f"{name} must align one-to-one with pointcloud_history"
                     )
+        rgb_history = self.rgb_history
+        if rgb_history:
+            if not all(isinstance(frame, RgbFrame) for frame in rgb_history):
+                raise TypeError("rgb_history must contain RgbFrame values")
+            sources = [frame.source_monotonic_ns for frame in rgb_history]
+            sequences = [frame.source_camera_sequence for frame in rgb_history]
+            generations = {frame.camera_generation for frame in rgb_history}
+            if any(
+                frame.source_monotonic_ns < self.run_started_monotonic_ns
+                or frame.publish_monotonic_ns > self.anchor_monotonic_ns
+                for frame in rgb_history
+            ):
+                raise ValueError("rgb history crosses the observation causal cut")
+            if any(right <= left for left, right in zip(sources, sources[1:])):
+                raise ValueError("rgb source times must be strictly increasing")
+            if any(right <= left for left, right in zip(sequences, sequences[1:])):
+                raise ValueError("rgb camera sequences must be strictly increasing")
+            if len(generations) != 1:
+                raise ValueError("rgb history crosses a camera generation")
+            if history:
+                paired = zip(history, rgb_history, strict=True)
+                if len(history) != len(rgb_history) or any(
+                    (
+                        pointcloud.source_camera_sequence,
+                        pointcloud.source_monotonic_ns,
+                        pointcloud.camera_generation,
+                    )
+                    != (
+                        rgb.source_camera_sequence,
+                        rgb.source_monotonic_ns,
+                        rgb.camera_generation,
+                    )
+                    for pointcloud, rgb in paired
+                ):
+                    raise ValueError(
+                        "rgb history must match pointcloud camera provenance"
+                    )
+            else:
+                if sources[-1] != self.latest_source_monotonic_ns:
+                    raise ValueError("latest_source_monotonic_ns must match rgb")
+                for name, window in windows.items():
+                    if window is not None and window.values.shape[0] != len(
+                        rgb_history
+                    ):
+                        raise ValueError(
+                            f"{name} must align one-to-one with rgb_history"
+                        )

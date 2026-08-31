@@ -58,6 +58,7 @@ from dexmani_real.integrations.dexmani_policy import (
     DexManiPolicyRuntime,
     _canonical_json_sha256,
     _validate_embedded_targets,
+    _validate_inference_device,
     precheck_policy_package_provenance,
     verify_imported_policy_provenance,
 )
@@ -121,6 +122,12 @@ class DeploymentPreflightTest(unittest.TestCase):
             artifact=resolve_policy_artifact(root),
             runtime_config=resolve_runtime_config(),
         )
+
+    def test_cuda_device_never_silently_falls_back_to_cpu(self) -> None:
+        with patch("torch.cuda.is_available", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "CUDA, but CUDA is unavailable"):
+                _validate_inference_device("cuda:0")
+        self.assertEqual(str(_validate_inference_device("cpu")), "cpu")
 
     def test_projection_is_pickle_safe_and_artifact_owned_values_cannot_change(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -301,7 +308,7 @@ class DeploymentPreflightTest(unittest.TestCase):
             )
 
         self.assertEqual(provenance["policy_projection"]["sha256"], projection.sha256)
-        self.assertEqual(provenance["policy_projection"]["device"], "cpu")
+        self.assertEqual(provenance["policy_projection"]["device"], "cuda:0")
         self.assertEqual(provenance["policy_projection"]["inference_seed"], 1066)
         self.assertEqual(
             provenance["policy_projection"]["bounds"]["max_published_endpoints"],
@@ -1132,6 +1139,112 @@ class DeploymentPreflightTest(unittest.TestCase):
             self.assertEqual(restored_numpy_state[2:], numpy_state[2:])
             torch.testing.assert_close(torch.random.get_rng_state(), torch_state)
 
+    def test_adapter_discards_r3d_auxiliary_ee_tail_after_full_shape_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = _write_experiment(Path(directory) / "experiment")
+            sidecar_path = next((root / "checkpoints").glob("*.deployment.json"))
+            sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            sidecar["schema_version"] = 2
+            sidecar["allocation"].update(
+                {
+                    "action_dim": 28,
+                    "control_action_dim": 19,
+                    "auxiliary_action_layout": "joint19_ee9",
+                    "rgb_shape": None,
+                    "rgb_color_order": None,
+                    "rgb_value_range": None,
+                }
+            )
+            sidecar_path.write_text(
+                json.dumps(sidecar, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            runtime_config = self._projection(root).runtime
+            allocation = runtime_config.artifact.allocation_contract
+            runtime = DexManiPolicyRuntime(runtime_config)
+            runtime._manifest = DeploymentManifest(
+                action_key="action",
+                n_obs_steps=allocation.n_obs_steps,
+                n_action_steps=allocation.n_action_steps,
+                action_dim=28,
+                horizon=allocation.horizon,
+                hand_dim=12,
+                control_action_dim=19,
+                auxiliary_action_layout="joint19_ee9",
+                sensor_modalities=allocation.sensor_modalities,
+                point_cloud_num_points=allocation.point_cloud_num_points,
+                point_cloud_feature_dim=allocation.point_cloud_feature_dim,
+            )
+            pred_action = torch.arange(
+                allocation.horizon * allocation.action_dim, dtype=torch.float32
+            ).reshape(1, allocation.horizon, allocation.action_dim)
+
+            prediction = runtime._decode(pred_action)
+
+            expected = pred_action[:, 1:16, :19].numpy()[0]
+            np.testing.assert_array_equal(prediction.arm_qpos, expected[:, :7])
+            np.testing.assert_array_equal(prediction.hand_qpos, expected[:, 7:])
+
+    def test_adapter_encodes_causal_rgb_history_in_model_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = _write_experiment(Path(directory) / "experiment")
+            sidecar_path = next((root / "checkpoints").glob("*.deployment.json"))
+            sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            sidecar["schema_version"] = 2
+            sidecar["allocation"].update(
+                {
+                    "control_action_dim": 19,
+                    "auxiliary_action_layout": "none",
+                    "sensor_modalities": ["joint_state", "rgb"],
+                    "observation_fields": ["arm_qpos", "hand_qpos", "rgb"],
+                    "point_cloud_num_points": None,
+                    "point_cloud_feature_dim": None,
+                    "rgb_shape": [2, 3, 3],
+                    "rgb_color_order": "rgb",
+                    "rgb_value_range": "uint8_0_255",
+                }
+            )
+            sidecar_path.write_text(
+                json.dumps(sidecar, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            artifact = resolve_policy_artifact(root)
+            with self.assertRaisesRegex(TypeError, "unknown"):
+                resolve_policy_runtime_config(
+                    artifact=artifact,
+                    runtime_config=resolve_runtime_config(),
+                    data={"pointcloud_num_points": 1024},
+                )
+            projection = resolve_policy_runtime_config(
+                artifact=artifact,
+                runtime_config=resolve_runtime_config(),
+                device="cpu",
+            )
+            runtime = DexManiPolicyRuntime(projection.runtime)
+            allocation = projection.runtime.artifact.allocation_contract
+            runtime._manifest = DeploymentManifest(
+                action_key="action",
+                n_obs_steps=allocation.n_obs_steps,
+                n_action_steps=allocation.n_action_steps,
+                action_dim=allocation.action_dim,
+                horizon=allocation.horizon,
+                hand_dim=12,
+                control_action_dim=19,
+                sensor_modalities=allocation.sensor_modalities,
+                point_cloud_num_points=None,
+                point_cloud_feature_dim=None,
+                rgb_shape=allocation.rgb_shape,
+                rgb_color_order="rgb",
+                rgb_value_range="uint8_0_255",
+            )
+            runtime._device = "cpu"
+            observation = preflight_module._synthetic_observation(projection.runtime)
+            encoded = runtime._encode(observation)
+
+            self.assertEqual(tuple(encoded["rgb"].shape), (1, 2, 3, 2, 3))
+            self.assertEqual(encoded["rgb"].dtype, torch.float32)
+            self.assertEqual(float(encoded["rgb"].max()), 0.0)
+
     def test_adapter_decodes_complete_ee_future_and_rejects_degenerate_tail(self):
         with tempfile.TemporaryDirectory() as directory:
             root = _write_experiment(Path(directory) / "experiment")
@@ -1455,7 +1568,7 @@ if loaded:
             projection.sha256,
         )
 
-    def test_cli_requires_device_and_rejects_removed_legacy_parameters(self):
+    def test_cli_defaults_to_cuda_and_rejects_removed_legacy_parameters(self):
         import runpy
 
         main = runpy.run_path(
@@ -1464,8 +1577,7 @@ if loaded:
 
         with tempfile.TemporaryDirectory() as directory:
             root = _write_experiment(Path(directory) / "experiment")
-            with self.assertRaises(SystemExit):
-                main(["--experiment-dir", str(root), "--print-config"])
+            self.assertEqual(main(["--experiment-dir", str(root), "--print-config"]), 0)
             with self.assertRaises(SystemExit):
                 main(
                     [

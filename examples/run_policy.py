@@ -108,8 +108,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--device",
-        required=True,
-        help="explicit operator-owned inference device, for example cuda:0 or cpu",
+        default="cuda:0",
+        help="inference device (default: cuda:0; use cpu only when explicitly requested)",
     )
     parser.add_argument(
         "--inference-seed",
