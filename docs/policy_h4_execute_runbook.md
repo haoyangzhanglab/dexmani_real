@@ -1,10 +1,14 @@
 # H4 首次物理 coupled execute Runbook
 
-> 状态：**当前 Python deployment tree 的 H2/H3 shadow 已完成；等待独立 H4 review 和授权。**
-> 当前 `cuda:0` 120 秒 zero-write baseline 是
+> 状态：`3488063` 的 H4 runtime receipt 虽显示 completed，但 hand shutdown counter 被 generation
+> revoke 清零，evidence sealer 已正确拒绝封存，详见
+> [`deployment_reference_h4_execute_unsealed_2026-08-31_3488063.json`](deployment_reference_h4_execute_unsealed_2026-08-31_3488063.json)。
+> 修复该证据缺口会改变 Python deployment tree；因此必须重新完成 H2/H3 shadow、独立 H4 review
+> 和新的明确 H4 授权，才能运行下一次 H4。
+> 上一个 `cuda:0` 120 秒 zero-write baseline 是
 > [`deployment_reference_h2h3_shadow_2026-08-31_dfad0e7.json`](deployment_reference_h2h3_shadow_2026-08-31_dfad0e7.json)：
 > 1,915/1,915 个 endpoint 完成 shadow validation，且所有 policy physical command 计数均为零。
-> `59503ad` receipt 保留为历史审计证据；它早于 H 期间 S/Q 的即时取消修复，不能替代当前 baseline。
+> 它保留为历史审计证据，但不能替代修复后的 current-tree baseline。
 > `3b2615f` 已完成 65 秒、1038 endpoint、zero-write 的短 H2/H3 shadow，见
 > [`deployment_reference_h2h3_shadow_2026-08-31_3b2615f_short.json`](deployment_reference_h2h3_shadow_2026-08-31_3b2615f_short.json)；
 > 它不替代当前 revision 所需的 120 秒 baseline。
@@ -59,7 +63,7 @@ shadow 证据解释成 execute 授权。
 | Gate | 需要的证据 | 失败处理 |
 |---|---|---|
 | reference identity | checkpoint SHA-256 与 [当前 H2/H3 artifact](deployment_reference_h2h3_shadow_2026-08-31_dfad0e7.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
-| H2/H3 baseline | `dfad0e7` 的 120 s shadow receipt 证明 1,915/1,915 endpoint validated、zero coupled writes、clean shutdown | Python deployment tree、runtime config 或 artifact 改变即停止并重跑 shadow |
+| H2/H3 baseline | `dfad0e7` 的 120 s shadow receipt 仅为历史证据；当前 Python deployment tree 必须重新完成 120 s shadow、zero coupled writes、clean shutdown | Python deployment tree、runtime config 或 artifact 改变即停止并重跑 shadow |
 | execute enablement diff | H4 保持 one-publication 与原 SafetyGate/worker limits；新增 seed receipt、H home 和 B 前 canonical arm-home gate，不修改 normalizer、collision、freshness 或 generation 语义 | 任一未解释差异都停止 |
 | bounded execute guard | execute 的 publication bound 固定为 `1`；ack timeout 与 B-relative duration 均为有限正值，并写入 coordinator receipt | 不允许用无界 execute 替代 |
 | offline publication | fake ring 的 full validation 成功只写一条 coherent arm+hand record；gate 后 generation 变化不得写入 | 停止并修复 |

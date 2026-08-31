@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "record_type": "dexmani_real.policy_deployment.h4_execute_unsealed_receipt",
+  "recorded_at": "2026-08-31T17:05:00+08:00",
+  "authorization_scope": {
+    "level": "H4",
+    "execution_mode": "execute",
+    "inference_device": "cuda:0",
+    "scene": "no personnel, objects, or obstacles; e-stop ready; xArm, XHand, and RealSense healthy",
+    "hand_behavior": "one startup reset_home, then one effective operator home attempt before B",
+    "arm_behavior": "one collision-checked canonical home after hand home acceptance",
+    "max_published_endpoints": 1,
+    "max_running_seconds": 30.0,
+    "acknowledgement_timeout_seconds": 2.0,
+    "automatic_retry": false,
+    "task_rollout": "forbidden"
+  },
+  "provenance": {
+    "dexmani_real_commit": "34880639b4217178925a1675837a6e78daed33be",
+    "dexmani_real_dirty": false,
+    "dexmani_real_python_tree_sha256": "0aa547a40b019c718e529066acc742bd124b542214064d5f1dfd7f1b01e4abbe",
+    "dexmani_policy_commit": "7e31d10e7a31ff3d12df31b8683c9c90b357cbc5",
+    "dexmani_policy_dirty": false,
+    "dexmani_policy_python_tree_sha256": "9f48ce9ce876be8aacadd38f3f7b1859b8a07f9660590a921043f5e389efa129",
+    "checkpoint_sha256": "b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c",
+    "index_sha256": "d67bf21394c8d79239dd0f116baf25a681c3e4d0964569ce47a520f62e047c6e",
+    "runtime_config_sha256": "186ec09369b4cd5b70b64b8d445123b9e72f10eaf08ea47df078141eb1d5a292",
+    "projection_sha256": "bb4d48dc1da89ed86863aa9f9af1f075271787d0b32d17e1a5e11e5ba4d9c48a"
+  },
+  "terminal_timeline": {
+    "startup_reset_home_accepted_at": "2026-08-31T16:54:11+08:00",
+    "armed_at": "2026-08-31T16:54:14+08:00",
+    "hand_home_accepted_at": "2026-08-31T16:57:25+08:00",
+    "hand_home_action_id": 1,
+    "arm_home_path": "direct",
+    "arm_home_milestones": 2,
+    "arm_home_reached_at": "2026-08-31T16:57:27+08:00",
+    "physical_home_completed_at": "2026-08-31T16:57:27+08:00",
+    "ignored_repeat_h_inputs": 3,
+    "running_at": "2026-08-31T16:57:52+08:00",
+    "running_generation": 5,
+    "published_action_id": 2,
+    "final_disarmed_at": "2026-08-31T16:57:53+08:00"
+  },
+  "runtime_receipt": {
+    "path": "/home/zhanghaoyang/.dexmani/receipts/h4_execute_1788166672286472260_3101889_a19f4b2cba804cb7ab3328cd45b3a6df.json",
+    "sha256": "f25245bee5d1d6ff4548bfe10d2036d89ba526d8a8ae4be37c5a3aa49d6a2a75",
+    "completed": true,
+    "acknowledged_action_id": 2,
+    "coupled_command_writes": 1,
+    "coupled_command_sequence": {
+      "start": 1,
+      "end": 2
+    },
+    "within_publication_bound": true,
+    "physical_home_completed": true,
+    "reason": "H4 publication bound reached"
+  },
+  "shutdown": {
+    "arm_servo_calls": 1,
+    "hand_sdk_send_attempts_reported": 0,
+    "hand_exact_target_accepts_reported": 0,
+    "hand_sdk_rejections_reported": 0,
+    "final_safety_state": "DISARMED",
+    "supervisor_normal": true,
+    "execute_completed": true,
+    "clean": true,
+    "workers": {
+      "inference": "graceful:0",
+      "arm": "graceful:0",
+      "camera": "graceful:0",
+      "pointcloud": "graceful:0",
+      "policy": "graceful:0",
+      "hand": "graceful:0"
+    }
+  },
+  "evidence_sealing": {
+    "state": "rejected",
+    "sealer": "examples/seal_h4_evidence.py",
+    "reason": "worker SDK evidence does not prove one successful coupled H4 endpoint",
+    "root_cause": "hand worker reset generation-scoped exit counters after the coordinator observed the action ACK and revoked motion, erasing the hand SDK summary before shutdown",
+    "operator_identity": "not separately recorded; no sealed operator record was created"
+  },
+  "source_log": {
+    "path": "/home/zhanghaoyang/.dexmani/receipts/h4-terminal-3488063-20260831_165404.log",
+    "size_bytes": 21581,
+    "line_count": 115,
+    "sha256": "a7dd8481d3aaff11b5738d49bc5db59a29828671129a3c1880fb8af48344d62d"
+  },
+  "disposition": {
+    "accepted_as_h4_pass": false,
+    "validated_only": [
+      "the authorized H home gate, one bounded publication, runtime arm/hand acknowledgement, and clean shutdown occurred",
+      "the runtime receipt retained one publication and acknowledged action_id 2"
+    ],
+    "not_validated": [
+      "a sealed terminal-log proof of the hand SDK exact-target acceptance",
+      "a complete operator record bound to the physical session",
+      "any task rollout or object interaction"
+    ],
+    "required_before_another_h4": [
+      "fix and validate hand worker shutdown evidence",
+      "rerun H2/H3 shadow because the Python deployment tree changes",
+      "repeat independent H4 review and obtain fresh, explicit H4 hardware authorization"
+    ]
+  }
+}

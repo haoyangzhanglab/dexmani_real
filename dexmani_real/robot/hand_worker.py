@@ -224,7 +224,6 @@ def hand_loop(shared: Any, config: HandParams) -> None:
         last_state = initial_state
         last_source_ns = time.monotonic_ns()
         accepted_target_action_id = 0
-        stats_generation = -1
         sdk_send_attempts = 0
         exact_target_accepts = 0
         crc_unconfirmed = 0
@@ -324,14 +323,12 @@ def hand_loop(shared: Any, config: HandParams) -> None:
             )
 
             permit = read_motion_permit(shared)
-            if permit.run_generation != stats_generation:
-                stats_generation = permit.run_generation
-                sdk_send_attempts = 0
-                exact_target_accepts = 0
-                crc_unconfirmed = 0
-                duplicate_skips = 0
-                sdk_rejections = 0
-                last_exact_target_sequence = 0
+            # Keep exit evidence for the worker lifetime.  H4 revokes motion
+            # immediately after both workers acknowledge its one endpoint,
+            # which advances the generation before this worker shuts down.
+            # Resetting here would erase the SDK-side acknowledgement that the
+            # coordinator had just observed.  Command tickets and sequences,
+            # rather than these diagnostics, fence execution across runs.
             if not permit.allows_motion:
                 rate_mgr.wait()
                 continue

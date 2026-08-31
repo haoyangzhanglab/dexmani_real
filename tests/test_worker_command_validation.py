@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 import types
 import unittest
@@ -393,6 +394,93 @@ class WorkerCommandValidationTest(unittest.TestCase):
                     result.hand_state_ring.write.call_args.args[0]["qpos"][0],
                     result.startup_qpos,
                 )
+
+    def test_hand_exit_stats_survive_post_ack_generation_revoke(self) -> None:
+        """H4 evidence must retain the SDK ACK after coordinator disarms."""
+        runtime = resolve_runtime_config()
+        qpos = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg))
+        state = SimpleNamespace(
+            qpos=qpos,
+            current_ma=np.zeros(HAND_JOINT_SHAPE),
+            tactile_sum=np.zeros(HAND_TACTILE_SUM_SHAPE),
+            tactile_sum_valid=True,
+            tactile_contact=np.zeros(HAND_CONTACT_SHAPE, dtype=bool),
+            tactile_force=np.zeros(HAND_TACTILE_FORCE_SHAPE),
+            tactile_valid=True,
+            commboard_err=np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
+            jointboard_err=np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
+            tipboard_err=np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
+        )
+        now_ns = time.monotonic_ns()
+        command = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
+        command["action_id"][0] = 2
+        command["hand_present"][0] = 1
+        command["run_generation"][0] = 5
+        command["created_monotonic_ns"][0] = now_ns
+        command["scheduled_target_monotonic_ns"][0] = now_ns
+        command["target_monotonic_ns"][0] = now_ns
+        command["valid_until_monotonic_ns"][0] = now_ns + 1_000_000_000
+        command["hand_qpos"][0] = qpos
+
+        shared = SimpleNamespace(
+            is_running=_Value(1),
+            error_state=_Value(0),
+            estop_request=_Value(0),
+            safety_state=_Value(int(SafetyState.RUNNING)),
+            run_generation=_Value(5),
+            active_coupled_command_sequence=_Value(1),
+            motion_lock=threading.RLock(),
+            hand_state_ring=SimpleNamespace(write=Mock()),
+            hand_tactile_ring=SimpleNamespace(write=Mock()),
+            coupled_cmd_ring=SimpleNamespace(
+                read_latest=Mock(return_value=(command, now_ns, 1))
+            ),
+            set_heartbeat=Mock(),
+            set_ready=Mock(),
+        )
+        state_reads = 0
+
+        def get_state() -> SimpleNamespace:
+            nonlocal state_reads
+            state_reads += 1
+            if state_reads == 3:
+                # Let the second loop observe the post-ACK disarm generation
+                # before it exits and writes its diagnostic summary.
+                shared.safety_state.value = int(SafetyState.ARMED)
+                shared.run_generation.value = 6
+                shared.active_coupled_command_sequence.value = 0
+                shared.is_running.value = 0
+            return state
+
+        hand = SimpleNamespace(
+            connect=Mock(),
+            calibrate_tactile=Mock(),
+            reset_home=Mock(return_value=_StartupSendStatus.ACCEPTED),
+            get_state=Mock(side_effect=get_state),
+            send_action=Mock(return_value=_StartupSendStatus.ACCEPTED),
+            disconnect=Mock(),
+            tactile_calibrated=True,
+            is_connected=True,
+        )
+        fake_xhand_module = types.ModuleType("dexmani_real.robot.xhand")
+        fake_xhand_module.XHand = Mock(return_value=hand)
+        fake_xhand_module.XHandSendStatus = _StartupSendStatus
+
+        with (
+            patch.dict(sys.modules, {"dexmani_real.robot.xhand": fake_xhand_module}),
+            patch("dexmani_real.robot.hand_worker.LoopRate.wait"),
+            self.assertLogs("dexmani_real.robot.hand_worker", level="INFO") as logs,
+        ):
+            hand_loop(shared, runtime.hand)
+
+        hand.send_action.assert_called_once()
+        np.testing.assert_array_equal(hand.send_action.call_args.args[0], qpos)
+        self.assertTrue(
+            any(
+                "sdk_send_attempts=1, exact_target_accepts=1" in line
+                for line in logs.output
+            )
+        )
 
 
 if __name__ == "__main__":
