@@ -589,7 +589,76 @@ class DeploymentPreflightTest(unittest.TestCase):
             )
 
         self.assertFalse(shared.physical_home_completed.value)
-        self.assertTrue(shared.start_request.value)
+        self.assertFalse(shared.start_request.value)
+
+    def test_physical_operator_requires_a_fresh_begin_after_home(self):
+        shared = SimpleNamespace(
+            is_running=SimpleNamespace(value=1),
+            start_request=SimpleNamespace(value=False),
+            stop_request=SimpleNamespace(value=False),
+            quit_requested=SimpleNamespace(value=False),
+            error_state=SimpleNamespace(value=False),
+            estop_request=SimpleNamespace(value=False),
+            physical_home_completed=SimpleNamespace(value=False),
+        )
+
+        class _Keyboard:
+            estop_latched = False
+            healthy = True
+
+            def __init__(self) -> None:
+                self.polls = 0
+                self.drained: list[ControlSignal] = []
+
+            @staticmethod
+            def start():
+                return None
+
+            @staticmethod
+            def stop():
+                return None
+
+            def poll(self, *, timeout):
+                del timeout
+                self.polls += 1
+                if self.polls == 1:
+                    # Both orderings are stale: B before H and B queued while
+                    # H is blocking must never authorize the later run.
+                    return (
+                        ControlSignal.BEGIN,
+                        ControlSignal.HOME,
+                        ControlSignal.BEGIN,
+                    )
+                shared.is_running.value = 0
+                return ()
+
+            def drain_signal(self, target):
+                self.drained.append(target)
+                return 0
+
+        keyboard = _Keyboard()
+        with (
+            patch(
+                "dexmani_real.deployment.operator.KeyboardHandler",
+                return_value=keyboard,
+            ),
+            patch("dexmani_real.deployment.operator._home", return_value=True),
+        ):
+            run_operator_control(
+                shared,
+                object(),
+                object(),
+                object(),
+                stop_event=threading.Event(),
+                execution_mode="execute",
+            )
+
+        self.assertTrue(shared.physical_home_completed.value)
+        self.assertFalse(shared.start_request.value)
+        self.assertEqual(
+            keyboard.drained,
+            [ControlSignal.HOME, ControlSignal.BEGIN],
+        )
 
     def test_table_plane_projection_is_null_when_disabled_and_exact_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory:

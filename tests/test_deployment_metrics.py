@@ -164,6 +164,42 @@ class DeploymentMetricsTest(unittest.TestCase):
         self.assertTrue(receipt["within_publication_bound"])
         self.assertTrue(receipt["completed"])
 
+    def test_bounded_receipt_preserves_a_validated_monotonic_timeline(self) -> None:
+        receipt = json.loads(
+            bounded_execute_run_receipt_json(
+                execution_mode="execute",
+                run_generation=9,
+                reason="H4 publication bound reached",
+                coupled_command_start_sequence=4,
+                coupled_command_end_sequence=5,
+                max_published_endpoints=1,
+                acknowledgement_timeout_s=2.0,
+                acknowledged_action_id=1,
+                completed=True,
+                metrics={},
+                timeline_monotonic_ns={
+                    "run_started": 10,
+                    "first_publication": 20,
+                    "receipt_emitted": 30,
+                },
+            )
+        )
+        self.assertEqual(receipt["timeline_monotonic_ns"]["first_publication"], 20)
+        with self.assertRaisesRegex(ValueError, "timeline event values"):
+            bounded_execute_run_receipt_json(
+                execution_mode="execute",
+                run_generation=9,
+                reason="invalid timeline",
+                coupled_command_start_sequence=4,
+                coupled_command_end_sequence=4,
+                max_published_endpoints=1,
+                acknowledgement_timeout_s=2.0,
+                acknowledged_action_id=None,
+                completed=False,
+                metrics={},
+                timeline_monotonic_ns={"run_started": True},
+            )
+
     def test_task_receipt_uses_a_distinct_filename(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = write_json_receipt(

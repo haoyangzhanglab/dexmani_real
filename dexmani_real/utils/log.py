@@ -8,6 +8,7 @@ __all__ = [
     "extract_native_diagnostics",
     "get_logger",
     "ThrottledWarner",
+    "write_json_evidence_manifest",
     "write_json_receipt",
 ]
 
@@ -72,19 +73,14 @@ def get_logger(name: str) -> logging.Logger:
     return logger
 
 
-def write_json_receipt(directory: str | Path, payload: str) -> Path:
-    """Atomically persist one already-canonical JSON receipt."""
-    parsed = json.loads(payload)
-    if not isinstance(parsed, dict):
-        raise ValueError("receipt payload must be a JSON object")
+def _write_json_payload(directory: str | Path, payload: str, *, prefix: str) -> Path:
+    """Atomically persist one already-canonical JSON object under *prefix*."""
     receipt_dir = Path(directory)
     receipt_dir.mkdir(parents=True, exist_ok=True)
     if not receipt_dir.is_dir():
         raise OSError(f"receipt path is not a directory: {receipt_dir}")
-    execution_mode = parsed.get("execution_mode", "execute")
-    receipt_prefix = "task_execute" if execution_mode == "task" else "h4_execute"
     destination = receipt_dir / (
-        f"{receipt_prefix}_{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex}.json"
+        f"{prefix}_{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex}.json"
     )
     temporary_path: Path | None = None
     try:
@@ -92,7 +88,7 @@ def write_json_receipt(directory: str | Path, payload: str) -> Path:
             mode="w",
             encoding="utf-8",
             dir=receipt_dir,
-            prefix=f".{receipt_prefix}_receipt_",
+            prefix=f".{prefix}_",
             suffix=".tmp",
             delete=False,
         ) as stream:
@@ -110,6 +106,27 @@ def write_json_receipt(directory: str | Path, payload: str) -> Path:
             except OSError:
                 pass
         raise
+
+
+def write_json_receipt(directory: str | Path, payload: str) -> Path:
+    """Atomically persist one already-canonical JSON receipt."""
+    parsed = json.loads(payload)
+    if not isinstance(parsed, dict):
+        raise ValueError("receipt payload must be a JSON object")
+    prefix = (
+        "task_execute"
+        if parsed.get("execution_mode", "execute") == "task"
+        else "h4_execute"
+    )
+    return _write_json_payload(directory, payload, prefix=prefix)
+
+
+def write_json_evidence_manifest(directory: str | Path, payload: str) -> Path:
+    """Atomically persist a post-shutdown H4 evidence manifest."""
+    parsed = json.loads(payload)
+    if not isinstance(parsed, dict):
+        raise ValueError("evidence manifest payload must be a JSON object")
+    return _write_json_payload(directory, payload, prefix="h4_evidence")
 
 
 # ThrottledWarner uses the project logger format for consistent diagnostics.

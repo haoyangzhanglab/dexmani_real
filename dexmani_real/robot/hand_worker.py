@@ -224,6 +224,13 @@ def hand_loop(shared: Any, config: HandParams) -> None:
         last_state = initial_state
         last_source_ns = time.monotonic_ns()
         accepted_target_action_id = 0
+        stats_generation = -1
+        sdk_send_attempts = 0
+        exact_target_accepts = 0
+        crc_unconfirmed = 0
+        duplicate_skips = 0
+        sdk_rejections = 0
+        last_exact_target_sequence = 0
         _publish_feedback(
             shared,
             qpos=initial_state.qpos,
@@ -317,6 +324,14 @@ def hand_loop(shared: Any, config: HandParams) -> None:
             )
 
             permit = read_motion_permit(shared)
+            if permit.run_generation != stats_generation:
+                stats_generation = permit.run_generation
+                sdk_send_attempts = 0
+                exact_target_accepts = 0
+                crc_unconfirmed = 0
+                duplicate_skips = 0
+                sdk_rejections = 0
+                last_exact_target_sequence = 0
             if not permit.allows_motion:
                 rate_mgr.wait()
                 continue
@@ -341,6 +356,13 @@ def hand_loop(shared: Any, config: HandParams) -> None:
             if command_generation != permit.run_generation or not (
                 coupled_command_ticket_allows_execution(shared, ticket=ticket)
             ):
+                rate_mgr.wait()
+                continue
+            if sequence_int == last_exact_target_sequence:
+                # An accepted exact target is an endpoint event, not a
+                # level-triggered command.  Retries remain allowed only until
+                # the SDK has accepted the exact endpoint.
+                duplicate_skips += 1
                 rate_mgr.wait()
                 continue
             issue = check_worker_hand_command(
@@ -391,13 +413,17 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                 )
                 shared.error_state.value = True
                 return
+            sdk_send_attempts += 1
             send_status = hand.send_action(bounded)
             if send_status is XHandSendStatus.ACCEPTED:
                 # ACK denotes SDK acceptance of the exact original endpoint,
                 # not physical convergence or acceptance of an intermediate step.
                 if np.array_equal(bounded, target):
                     accepted_target_action_id = action_id
+                    exact_target_accepts += 1
+                    last_exact_target_sequence = sequence_int
             elif send_status is XHandSendStatus.REJECTED:
+                sdk_rejections += 1
                 logger.error(
                     "hand_loop: SDK rejected action_id=%d; latching runtime fault",
                     action_id,
@@ -407,6 +433,8 @@ def hand_loop(shared: Any, config: HandParams) -> None:
             # CRC_UNCONFIRMED deliberately leaves the action unacknowledged.
             # The next tick starts from fresh measured state and the latest
             # still-authorized command instead of latching a runtime fault.
+            else:
+                crc_unconfirmed += 1
 
             rate_mgr.wait()
     finally:
@@ -415,4 +443,13 @@ def hand_loop(shared: Any, config: HandParams) -> None:
             shared.error_state.value = True
         elif ready:
             logger.debug("hand_loop: STOPPED")
-        logger.info("hand_loop: exited")
+            logger.info(
+                "hand_loop: exited (sdk_send_attempts=%d, "
+                "exact_target_accepts=%d, crc_unconfirmed=%d, "
+                "duplicate_skips=%d, sdk_rejections=%d)",
+                sdk_send_attempts,
+                exact_target_accepts,
+                crc_unconfirmed,
+                duplicate_skips,
+                sdk_rejections,
+            )

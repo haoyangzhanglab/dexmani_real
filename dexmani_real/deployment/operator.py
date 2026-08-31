@@ -188,8 +188,21 @@ def run_operator_control(
             if keyboard.estop_latched or not keyboard.healthy:
                 shared.estop_request.value = True
                 return
+            # A physical B must be a fresh, post-home confirmation.  H blocks
+            # this thread while the arm moves, so begin events from the same
+            # drained batch must not survive a successful home sequence.
+            discard_begin_in_batch = False
             for signal in keyboard.poll(timeout=_POLL_S):
                 if signal is ControlSignal.BEGIN:
+                    if planner is not None and (
+                        discard_begin_in_batch
+                        or not bool(shared.physical_home_completed.value)
+                    ):
+                        logger.warning(
+                            "operator: ignored B until a completed physical home "
+                            "sequence is followed by a fresh B"
+                        )
+                        continue
                     shared.start_request.value = True
                 elif signal is ControlSignal.STOP:
                     shared.stop_request.value = int(StopRequest.OPERATOR)
@@ -204,6 +217,9 @@ def run_operator_control(
                         )
                         continue
                     home_attempted = True
+                    # B may have been received before H in this same polling
+                    # batch.  It cannot authorize a run that follows home.
+                    shared.start_request.value = False
                     shared.physical_home_completed.value = False
                     completed = _home(
                         shared,
@@ -220,17 +236,21 @@ def run_operator_control(
                     )
                     shared.physical_home_completed.value = bool(completed)
                     if completed:
-                        logger.info("operator: physical home sequence completed")
+                        logger.info(
+                            "operator: physical home sequence completed; "
+                            "press B to start"
+                        )
                     else:
                         logger.warning(
                             "operator: physical home sequence did not complete; "
                             "B remains disabled for this process"
                         )
-                    # HOME blocks while hand/arm homing completes. Discard only
-                    # HOME events accumulated during that interval so one
-                    # operator key press cannot trigger repeated home commands;
-                    # preserve B/S/Q/ESC events for normal handling.
+                    # HOME blocks while hand/arm homing completes. Drop stale
+                    # H and B events, but preserve S/Q/ESC so an operator can
+                    # still stop, quit, or e-stop immediately afterwards.
                     keyboard.drain_signal(ControlSignal.HOME)
+                    keyboard.drain_signal(ControlSignal.BEGIN)
+                    discard_begin_in_batch = True
                 elif signal is ControlSignal.QUIT:
                     if not revoke_motion(shared, SafetyState.ARMED) and int(
                         shared.safety_state.value

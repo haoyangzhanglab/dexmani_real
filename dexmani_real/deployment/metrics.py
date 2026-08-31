@@ -320,6 +320,7 @@ def bounded_execute_run_receipt_json(
     completed: bool,
     provenance_json: str | None = None,
     metrics: Mapping[str, int | float],
+    timeline_monotonic_ns: Mapping[str, int] | None = None,
 ) -> str:
     """Render one bounded physical-execution receipt."""
     if execution_mode not in {"execute", "task"}:
@@ -369,6 +370,14 @@ def bounded_execute_run_receipt_json(
         normalized_metrics[name] = (
             int(value) if isinstance(value, int) else float(value)
         )
+    timeline: dict[str, int] = {}
+    if timeline_monotonic_ns is not None:
+        for name, value in timeline_monotonic_ns.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("timeline event names must be non-empty strings")
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError("timeline event values must be positive integers")
+            timeline[name] = value
     writes = int(coupled_command_end_sequence) - int(coupled_command_start_sequence)
     if completed and writes != max_published_endpoints:
         raise ValueError(
@@ -388,6 +397,7 @@ def bounded_execute_run_receipt_json(
         "provenance": provenance,
         "reason": reason,
         "run_generation": int(run_generation),
+        "timeline_monotonic_ns": timeline,
         "within_publication_bound": writes <= int(max_published_endpoints),
     }
     return json.dumps(receipt, sort_keys=True, separators=(",", ":"), allow_nan=False)

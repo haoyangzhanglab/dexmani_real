@@ -567,6 +567,8 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
     shadow_start_coupled_sequence: int | None = None
     execute_run_generation: int | None = None
     execute_start_coupled_sequence: int | None = None
+    execute_first_publication_ns: int | None = None
+    execute_last_publication_ns: int | None = None
     execute_published_endpoints = 0
     execute_acknowledged_action_id: int | None = None
     execute_pending_acknowledgement: _PendingExecuteAcknowledgement | None = None
@@ -626,6 +628,16 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 completed=bool(shared.execute_completed.value),
                 provenance_json=config.execute_receipt_provenance_json,
                 metrics=metrics.run_snapshot(),
+                timeline_monotonic_ns={
+                    name: value
+                    for name, value in (
+                        ("run_started", run_started_ns),
+                        ("first_publication", execute_first_publication_ns),
+                        ("last_publication", execute_last_publication_ns),
+                        ("receipt_emitted", time.monotonic_ns()),
+                    )
+                    if value is not None
+                },
             )
         except Exception:
             # Receipt rendering is part of the same acceptance boundary as
@@ -812,6 +824,8 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 execute_published_endpoints = 0
                 execute_acknowledged_action_id = None
                 execute_pending_acknowledgement = None
+                execute_first_publication_ns = None
+                execute_last_publication_ns = None
                 try:
                     start_coupled_sequence = _coupled_command_sequence(shared)
                 except Exception as exc:
@@ -1377,6 +1391,10 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         )
                         continue
                     execute_published_endpoints += 1
+                    publication_ns = time.monotonic_ns()
+                    if execute_first_publication_ns is None:
+                        execute_first_publication_ns = publication_ns
+                    execute_last_publication_ns = publication_ns
                     execute_bounds = config.physical_execute_bounds
                     assert execute_bounds is not None
                     if (

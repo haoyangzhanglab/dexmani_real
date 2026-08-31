@@ -114,14 +114,25 @@ CLI/lifecycle 与 receipt，并对同一 frozen reference 重跑 `--print-config
 停止后 coordinator 必须撤销 motion，worker 必须完成 verified shutdown。停止原因不是成功指标；
 只有完整 receipt 和日志能证明实际 publication 边界。
 
-## 7. H4 receipt 的最低验收内容
+## 7. H4 evidence bundle 的最低验收内容
 
-H4 coordinator receipt 会作为原子 JSON 文件写到 `$DEXMANI_RECEIPT_DIR`（默认
-`~/.dexmani/receipts`）；写入失败会把 session 标为 FAULT。它与启动时保存的
-`--print-config` / `--preflight-only` receipt 一起构成 H4 审计材料。至少须持久化以下内容：
+coordinator runtime receipt 会作为原子 JSON 文件写到 `$DEXMANI_RECEIPT_DIR`（默认
+`~/.dexmani/receipts`）；写入失败会把 session 标为 FAULT。它证明 coupled publication
+边界、ACK、metrics 和 monotonic B/publication/receipt timeline。verified shutdown、原始
+terminal log 和操作者确认发生在 coordinator 已退出之后，不能伪称由该子进程持久化。
+
+因此 H4 完成后必须运行无硬件的 `examples/seal_h4_evidence.py`，把 completed runtime
+receipt、已关闭的 terminal log 和单独准备的 operator-record JSON 原子封存为
+`h4_evidence_*.json`。该脚本会拒绝没有 home/run/publication/clean-session 标记、没有完整
+monotonic timeline、或没有 one-write/ACK/home gate 的 runtime receipt。runtime receipt、sealed
+evidence 和启动时保存的 `--print-config` / `--preflight-only` receipt 一起构成 H4 审计材料。
+
+sealed evidence bundle 至少须持久化以下内容：
 
 - frozen artifact checkpoint/index SHA-256、runtime/source/config identities、准确 argv；
-- reset-home accepted、ARMED、B/RUNNING、first/last publication、stop、DISARMED 的 monotonic/UTC 时间；
+- reset-home accepted、hand home accepted、arm path selected/home reached、B/RUNNING、first/last
+  publication、stop、DISARMED 的 terminal-log evidence；runtime receipt 的 B/publication/receipt
+  monotonic timeline 与 sealed evidence 的 UTC seal time；
 - publication 上限、实际 `coupled_command_writes`、sequence start/end、每个 worker 的 SDK-side
   accepted/executed/duplicate/rejected 计数；
 - endpoint due/committed/published/discarded/fatal、roundoff canonicalization、所有 safety reject code；
@@ -130,6 +141,20 @@ H4 coordinator receipt 会作为原子 JSON 文件写到 `$DEXMANI_RECEIPT_DIR`�
 - p50/p95/p99 observation/inference/plan/horizon，worker exit status 与 final safety state；
 - 原始日志的 path、size、SHA-256，及人员/设备/场地确认的操作者记录。
 
+操作者在启动前准备一个不含密钥的 JSON record，至少包含 `operator`、`scene`、
+`e_stop_ready: true` 和本次 `authorization`。H4 process 已退出、`tee` 已关闭后，执行：
+
+```bash
+python examples/seal_h4_evidence.py \
+  --runtime-receipt /absolute/path/to/h4_execute_*.json \
+  --terminal-log /absolute/path/to/terminal.log \
+  --operator-record /absolute/path/to/operator_record.json \
+  --output-dir "$DEXMANI_RECEIPT_DIR"
+```
+
+命令只读取既有证据并写入新的 `h4_evidence_*.json`，不导入硬件 SDK，也不连接设备。
+
 H4 的唯一通过判定是：实际 publication 数不超过授权上限、每条 publication 与 receipt/worker
-证据一致、没有 safety/freshness/checker/hardware fault、按授权正常停止并 verified clean shutdown。
+证据一致、没有 safety/freshness/checker/hardware fault、按授权正常停止并 verified clean shutdown，
+且 sealed evidence bundle 成功写入。
 这不自动放行 H5 或任务级实验；下一 level 仍需要独立 review 和授权。
