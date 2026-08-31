@@ -1,9 +1,10 @@
 # Learned Policy 单次任务执行 Runbook
 
 > 状态：**首次完整 task rollout 已在 58/331 次发布时 fail closed；其后的 observation 与
-> CPU inference 问题均已定位修复，`6349147` 的显式 `cuda:0` H2/H3 shadow 已通过。
-> 尚须重新通过 H4 one-endpoint 并获得新的 task 授权。** 本文给出独立于 H4
-> one-shot 的 bounded task profile；文档和既有硬件证据均不构成新的真机授权。
+> CPU inference 问题均已定位修复。current Python tree 已通过 `cuda:0` H2/H3 shadow，并在
+> `a697480` sealed 完成 H4 one-endpoint。** task profile 使用不同的 deterministic seed=1066，
+> 因此仍须在任务场景完成 seed=1066 的 zero-write shadow、独立 review 和新的 task 授权。
+> 本文给出独立于 H4 one-shot 的 bounded task profile；文档和既有硬件证据均不构成新的真机授权。
 
 ## 1. 根因与修复边界
 
@@ -111,6 +112,33 @@ PYTHONPATH=/home/zhanghaoyang/Desktop/dexmani_policy \
 确认 checkpoint SHA、projection SHA、Real commit/dirty、Policy package provenance、seed、task
 bounds 与 preflight prediction 全部符合本次批准内容。dirty/unknown Real revision会在连接硬件前
 拒绝物理模式。
+
+## 3.1 task seed 的场景 shadow
+
+H4 使用的默认 seed=0 只证明一个已封存的硬件 publication；它不证明 task 的 seed=1066
+diffusion sampling trajectory。获得单独的 H2/H3 shadow 授权后，在任务物体按训练场景摆放、但
+场地无人且无非任务障碍物时，运行以下 command。它只允许启动时的 XHand `reset_home`；B 后不
+发布 policy action、不触发 H/arm home，也不接触物体：
+
+```bash
+cd /home/zhanghaoyang/Desktop/dexmani_real
+
+PYTHONPATH=/home/zhanghaoyang/Desktop/dexmani_policy \
+PYTHONUNBUFFERED=1 \
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python \
+  examples/run_policy.py \
+    --experiment-dir /home/zhanghaoyang/Desktop/dexmani_policy/experiments/dp3/pick_place_toy/2026-08-28_13-59_42 \
+    --execution-mode shadow \
+    --hand \
+    --device cuda:0 \
+    --inference-seed 1066 \
+    --max-running-seconds 120
+```
+
+验收条件是：checkpoint/runtime/source identity 与本节 task profile 一致，warmup 通过，B-relative
+120 秒内 endpoint 均只完成 shadow validation，coupled writes、arm servo、hand policy SDK send、
+SafetyGate reject、motion discard 和 worker fault 均为零，并 clean shutdown。该 shadow 不替代
+task execute 的独立场景 checklist 或授权。
 
 ## 4. 单次完整 rollout 命令
 
