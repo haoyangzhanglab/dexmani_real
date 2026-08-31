@@ -8,8 +8,9 @@
 审查基线为支持 artifact schema v1/v2 的部署实现和 DP3 reference artifact。运行时
 行为和源码优先于本文；后续边界变化应同步更新本文。
 
-本实现仍需在可用的 CUDA 主机上完成干净提交的 GPU preflight，以及新的 H2/H3 shadow；
-旧 Real revision 的 shadow/H4 receipt 只能作历史证据，不能替代这些验证。
+当前 `837b5c7` 已在可用的 CUDA 主机完成干净提交的 GPU preflight，以及新的 120 秒 H2/H3
+shadow，见 [`deployment_reference_h2h3_shadow_2026-08-31_837b5c7.json`](deployment_reference_h2h3_shadow_2026-08-31_837b5c7.json)。
+旧 Real revision 的 shadow/H4 receipt 仍仅作历史证据，不能替代该 current-tree baseline。
 
 ## 1. 总览
 
@@ -346,7 +347,7 @@ device 写入 receipt。每次换 revision、命令、device 或 checkpoint 都�
 
 | 模型 | 当前判断 | 主要依据或阻塞项 |
 |---|---|---|
-| DP3 | 已验证模型兼容 | 当前 reference 已完成 strict restore 和 CPU preflight，并在旧 Real revision 上有 shadow/H4 记录；当前实现仍须通过 CUDA preflight 与新的 H2/H3 后才能进入 H4 |
+| DP3 | 已验证模型兼容 | current-tree reference 已完成 strict restore、CUDA preflight 和 120 秒 H2/H3 shadow；进入 H4 前仍须完成独立 review 并取得新的硬件授权 |
 | DQ-RISE | 结构上兼容，尚未实证 | point-cloud + joint-state、`num_points/pc_dim`、完整 `pred_action`、19/21 维均符合；adapter 已处理 checkpoint-owned codebook，但仍需专用 deployment-v2 artifact 与 preflight |
 | ActionFlow（默认 joint action） | 结构上兼容，尚未实证 | point-cloud contract、BaseAgent-style normalization 和完整 horizon output 符合；需验证 NFE/latency 与 artifact window。当前 config 将 `state_dim` 绑定到 `action_dim`，不能直接推导其 EE-action 变体也兼容 |
 | ManiFlow | 结构上兼容，尚未实证 | `joint_state + point_cloud`、显式 `num_points/pc_dim` 和 BaseAgent output 符合；需验证 GPU latency/显存与 checkpoint contract |

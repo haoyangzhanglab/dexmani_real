@@ -6,10 +6,10 @@
 > [`deployment_reference_h4_execute_unsealed_2026-08-31_3488063.json`](deployment_reference_h4_execute_unsealed_2026-08-31_3488063.json)。
 > [`deployment_reference_h4_execute_unsealed_2026-08-31_acba199.json`](deployment_reference_h4_execute_unsealed_2026-08-31_acba199.json)。
 > 当前修复将 exit evidence 限定为最新 RUNNING generation 的 policy commands，同时在 revoke 后
-> 保留该 generation 的摘要。它改变 Python deployment tree，因此必须先重跑 H2/H3 shadow、再完成
-> 独立 H4 review 并取得新的明确 H4 授权。修复前 `cuda:0` 120 秒 zero-write baseline 是
-> [`deployment_reference_h2h3_shadow_2026-08-31_42bb288.json`](deployment_reference_h2h3_shadow_2026-08-31_42bb288.json)：
-> 1,915/1,915 个 endpoint 完成 shadow validation，且所有 policy physical command 计数均为零。
+> 保留该 generation 的摘要。修复后的 `837b5c7` 已完成新的 `cuda:0` 120 秒 zero-write baseline：
+> [`deployment_reference_h2h3_shadow_2026-08-31_837b5c7.json`](deployment_reference_h2h3_shadow_2026-08-31_837b5c7.json)，
+> 1,916/1,916 个 endpoint 完成 shadow validation，且所有 policy physical command 计数均为零。
+> 下一步是独立 H4 review 和新的明确 H4 授权。
 > `dfad0e7` receipt 保留为修复前的历史审计证据，不能替代 current-tree baseline。
 > `3b2615f` 已完成 65 秒、1038 endpoint、zero-write 的短 H2/H3 shadow，见
 > [`deployment_reference_h2h3_shadow_2026-08-31_3b2615f_short.json`](deployment_reference_h2h3_shadow_2026-08-31_3b2615f_short.json)；
@@ -64,8 +64,8 @@ shadow 证据解释成 execute 授权。
 
 | Gate | 需要的证据 | 失败处理 |
 |---|---|---|
-| reference identity | checkpoint SHA-256 与 [当前 H2/H3 artifact](deployment_reference_h2h3_shadow_2026-08-31_42bb288.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
-| H2/H3 baseline | `42bb288` 的 120 s shadow receipt 证明 1,915/1,915 endpoint validated、zero coupled writes、clean shutdown | Python deployment tree、runtime config 或 artifact 改变即停止并重跑 shadow |
+| reference identity | checkpoint SHA-256 与 [当前 H2/H3 artifact](deployment_reference_h2h3_shadow_2026-08-31_837b5c7.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
+| H2/H3 baseline | `837b5c7` 的 120 s shadow receipt 证明 1,916/1,916 endpoint validated、zero coupled writes、clean shutdown | Python deployment tree、runtime config 或 artifact 改变即停止并重跑 shadow |
 | execute enablement diff | H4 保持 one-publication 与原 SafetyGate/worker limits；新增 seed receipt、H home 和 B 前 canonical arm-home gate，不修改 normalizer、collision、freshness 或 generation 语义 | 任一未解释差异都停止 |
 | bounded execute guard | execute 的 publication bound 固定为 `1`；ack timeout 与 B-relative duration 均为有限正值，并写入 coordinator receipt | 不允许用无界 execute 替代 |
 | offline publication | fake ring 的 full validation 成功只写一条 coherent arm+hand record；gate 后 generation 变化不得写入 | 停止并修复 |
