@@ -395,8 +395,8 @@ class WorkerCommandValidationTest(unittest.TestCase):
                     result.startup_qpos,
                 )
 
-    def test_hand_exit_stats_survive_post_ack_generation_revoke(self) -> None:
-        """H4 evidence must retain the SDK ACK after coordinator disarms."""
+    def test_hand_exit_stats_report_only_running_generation_after_home(self) -> None:
+        """H4 exit evidence excludes the pre-B hand-home command but keeps the ACK."""
         runtime = resolve_runtime_config()
         qpos = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg))
         state = SimpleNamespace(
@@ -412,40 +412,60 @@ class WorkerCommandValidationTest(unittest.TestCase):
             tipboard_err=np.zeros(HAND_JOINT_SHAPE, dtype=np.int32),
         )
         now_ns = time.monotonic_ns()
-        command = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
-        command["action_id"][0] = 2
-        command["hand_present"][0] = 1
-        command["run_generation"][0] = 5
-        command["created_monotonic_ns"][0] = now_ns
-        command["scheduled_target_monotonic_ns"][0] = now_ns
-        command["target_monotonic_ns"][0] = now_ns
-        command["valid_until_monotonic_ns"][0] = now_ns + 1_000_000_000
-        command["hand_qpos"][0] = qpos
+        home_command = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
+        home_command["action_id"][0] = 1
+        home_command["hand_present"][0] = 1
+        home_command["run_generation"][0] = 3
+        home_command["created_monotonic_ns"][0] = now_ns
+        home_command["scheduled_target_monotonic_ns"][0] = now_ns
+        home_command["target_monotonic_ns"][0] = now_ns
+        home_command["valid_until_monotonic_ns"][0] = now_ns + 1_000_000_000
+        home_command["hand_qpos"][0] = qpos
+        policy_command = home_command.copy()
+        policy_command["action_id"][0] = 2
+        policy_command["run_generation"][0] = 5
 
         shared = SimpleNamespace(
             is_running=_Value(1),
             error_state=_Value(0),
             estop_request=_Value(0),
-            safety_state=_Value(int(SafetyState.RUNNING)),
-            run_generation=_Value(5),
+            safety_state=_Value(int(SafetyState.ARMED)),
+            run_generation=_Value(3),
             active_coupled_command_sequence=_Value(1),
             motion_lock=threading.RLock(),
             hand_state_ring=SimpleNamespace(write=Mock()),
             hand_tactile_ring=SimpleNamespace(write=Mock()),
-            coupled_cmd_ring=SimpleNamespace(
-                read_latest=Mock(return_value=(command, now_ns, 1))
-            ),
+            coupled_cmd_ring=SimpleNamespace(),
             set_heartbeat=Mock(),
             set_ready=Mock(),
         )
         state_reads = 0
 
+        def read_latest() -> tuple[np.ndarray, int, int] | None:
+            if shared.run_generation.value == 3:
+                return home_command, now_ns, 1
+            if shared.run_generation.value == 5:
+                return policy_command, now_ns, 2
+            return None
+
+        shared.coupled_cmd_ring.read_latest = Mock(side_effect=read_latest)
+
         def get_state() -> SimpleNamespace:
             nonlocal state_reads
             state_reads += 1
             if state_reads == 3:
-                # Let the second loop observe the post-ACK disarm generation
-                # before it exits and writes its diagnostic summary.
+                # H completion revokes its ARMED command before B can start.
+                shared.safety_state.value = int(SafetyState.ARMED)
+                shared.run_generation.value = 4
+                shared.active_coupled_command_sequence.value = 0
+            elif state_reads == 4:
+                # B begins a separate RUNNING generation for the policy action.
+                shared.safety_state.value = int(SafetyState.RUNNING)
+                shared.run_generation.value = 5
+                shared.active_coupled_command_sequence.value = 2
+            elif state_reads == 5:
+                # Let the loop observe the post-ACK revoke before writing its
+                # summary.  It must retain only generation 5's policy ACK.
                 shared.safety_state.value = int(SafetyState.ARMED)
                 shared.run_generation.value = 6
                 shared.active_coupled_command_sequence.value = 0
@@ -473,7 +493,7 @@ class WorkerCommandValidationTest(unittest.TestCase):
         ):
             hand_loop(shared, runtime.hand)
 
-        hand.send_action.assert_called_once()
+        self.assertEqual(hand.send_action.call_count, 2)
         np.testing.assert_array_equal(hand.send_action.call_args.args[0], qpos)
         self.assertTrue(
             any(

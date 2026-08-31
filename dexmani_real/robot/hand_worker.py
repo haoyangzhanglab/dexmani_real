@@ -166,6 +166,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
     from dexmani_real.robot.xhand import XHand, XHandSendStatus
     from dexmani_real.runtime.safety import (
         CoupledCommandTicket,
+        SafetyState,
         coupled_command_ticket_allows_execution,
         read_motion_permit,
     )
@@ -230,6 +231,9 @@ def hand_loop(shared: Any, config: HandParams) -> None:
         duplicate_skips = 0
         sdk_rejections = 0
         last_exact_target_sequence = 0
+        stats_generation: int | None = None
+        stats_generation_was_running = False
+        last_running_stats: tuple[int, int, int, int, int] | None = None
         _publish_feedback(
             shared,
             qpos=initial_state.qpos,
@@ -323,12 +327,28 @@ def hand_loop(shared: Any, config: HandParams) -> None:
             )
 
             permit = read_motion_permit(shared)
-            # Keep exit evidence for the worker lifetime.  H4 revokes motion
-            # immediately after both workers acknowledge its one endpoint,
-            # which advances the generation before this worker shuts down.
-            # Resetting here would erase the SDK-side acknowledgement that the
-            # coordinator had just observed.  Command tickets and sequences,
-            # rather than these diagnostics, fence execution across runs.
+            if permit.run_generation != stats_generation:
+                # H4 uses an ARMED generation for the operator's physical-home
+                # command, then a new RUNNING generation for the one policy
+                # endpoint.  Preserve the completed RUNNING generation when
+                # the coordinator revokes motion, while keeping the two
+                # command classes distinct in the exit evidence.
+                if stats_generation_was_running:
+                    last_running_stats = (
+                        sdk_send_attempts,
+                        exact_target_accepts,
+                        crc_unconfirmed,
+                        duplicate_skips,
+                        sdk_rejections,
+                    )
+                sdk_send_attempts = 0
+                exact_target_accepts = 0
+                crc_unconfirmed = 0
+                duplicate_skips = 0
+                sdk_rejections = 0
+                last_exact_target_sequence = 0
+                stats_generation = permit.run_generation
+                stats_generation_was_running = permit.state is SafetyState.RUNNING
             if not permit.allows_motion:
                 rate_mgr.wait()
                 continue
@@ -440,13 +460,16 @@ def hand_loop(shared: Any, config: HandParams) -> None:
             shared.error_state.value = True
         elif ready:
             logger.debug("hand_loop: STOPPED")
-            logger.info(
-                "hand_loop: exited (sdk_send_attempts=%d, "
-                "exact_target_accepts=%d, crc_unconfirmed=%d, "
-                "duplicate_skips=%d, sdk_rejections=%d)",
+            exit_stats = last_running_stats or (
                 sdk_send_attempts,
                 exact_target_accepts,
                 crc_unconfirmed,
                 duplicate_skips,
                 sdk_rejections,
+            )
+            logger.info(
+                "hand_loop: exited (sdk_send_attempts=%d, "
+                "exact_target_accepts=%d, crc_unconfirmed=%d, "
+                "duplicate_skips=%d, sdk_rejections=%d)",
+                *exit_stats,
             )

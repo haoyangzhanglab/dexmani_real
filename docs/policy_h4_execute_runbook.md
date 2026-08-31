@@ -1,10 +1,13 @@
 # H4 首次物理 coupled execute Runbook
 
-> 状态：`3488063` 的 H4 runtime receipt 虽显示 completed，但 hand shutdown counter 被 generation
-> revoke 清零，evidence sealer 已正确拒绝封存，详见
+> 状态：历史 `3488063` H4 在 revoke 后清零 hand shutdown counter；历史 `acba199` H4 则把
+> B 前的 hand-home 与 B 后的 policy endpoint 合并为同一 counter。两次 runtime receipt 都显示
+> completed，但 evidence sealer 已正确拒绝封存，分别详见
 > [`deployment_reference_h4_execute_unsealed_2026-08-31_3488063.json`](deployment_reference_h4_execute_unsealed_2026-08-31_3488063.json)。
-> 修复后的当前 Python deployment tree 已完成 H2/H3 shadow；下一步是独立 H4 review 和新的明确
-> H4 授权。当前 `cuda:0` 120 秒 zero-write baseline 是
+> [`deployment_reference_h4_execute_unsealed_2026-08-31_acba199.json`](deployment_reference_h4_execute_unsealed_2026-08-31_acba199.json)。
+> 当前修复将 exit evidence 限定为最新 RUNNING generation 的 policy commands，同时在 revoke 后
+> 保留该 generation 的摘要。它改变 Python deployment tree，因此必须先重跑 H2/H3 shadow、再完成
+> 独立 H4 review 并取得新的明确 H4 授权。修复前 `cuda:0` 120 秒 zero-write baseline 是
 > [`deployment_reference_h2h3_shadow_2026-08-31_42bb288.json`](deployment_reference_h2h3_shadow_2026-08-31_42bb288.json)：
 > 1,915/1,915 个 endpoint 完成 shadow validation，且所有 policy physical command 计数均为零。
 > `dfad0e7` receipt 保留为修复前的历史审计证据，不能替代 current-tree baseline。
