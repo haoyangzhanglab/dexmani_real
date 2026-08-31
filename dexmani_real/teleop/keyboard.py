@@ -110,6 +110,8 @@ class KeyboardHandler:
         debounce_s: float = 0.0,
         *,
         estop_callback: Callable[[], None] | None = None,
+        stop_callback: Callable[[], None] | None = None,
+        quit_callback: Callable[[], None] | None = None,
         startup_timeout_s: float = 2.0,
     ) -> None:
         if not np.isfinite(debounce_s) or debounce_s < 0.0:
@@ -123,6 +125,8 @@ class KeyboardHandler:
         self._debounce_s = float(debounce_s)
         self._startup_timeout_s = float(startup_timeout_s)
         self._estop_callback = estop_callback
+        self._stop_callback = stop_callback
+        self._quit_callback = quit_callback
         self._estop_latched = threading.Event()
         self._listener_failure_reported = False
         self._last_signal_time: dict[ControlSignal, float] = {}
@@ -168,6 +172,20 @@ class KeyboardHandler:
             except Exception:
                 logger.error("keyboard emergency-stop callback failed", exc_info=True)
 
+    def _dispatch_immediate_callback(self, signal: ControlSignal) -> None:
+        """Run the optional non-e-stop callback for a newly pressed key."""
+        callback = (
+            self._stop_callback
+            if signal is ControlSignal.STOP
+            else self._quit_callback if signal is ControlSignal.QUIT else None
+        )
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            logger.error("keyboard %s callback failed", signal.value, exc_info=True)
+
     def start(self) -> None:
         """Start the global pynput keyboard listener in a daemon thread.
 
@@ -210,8 +228,10 @@ class KeyboardHandler:
                 if sig is None and key == keyboard.Key.esc:
                     self._latch_emergency_stop()
                     return
-                if sig is not None:
-                    self._accept_control_press(sig, time.perf_counter())
+                if sig is not None and self._accept_control_press(
+                    sig, time.perf_counter()
+                ):
+                    self._dispatch_immediate_callback(sig)
             except Exception:
                 logger.warning("keyboard press callback failed", exc_info=True)
 

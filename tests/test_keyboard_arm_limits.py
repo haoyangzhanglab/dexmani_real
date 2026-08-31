@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.keyboard_session import (
     _keyboard_action_was_accepted,
     _KeyboardMotionDiagnostics,
@@ -18,6 +19,19 @@ from dexmani_real.teleop.keyboard_session import (
 
 
 class KeyboardArmLimitsTest(unittest.TestCase):
+    def test_keyboard_dispatches_immediate_stop_and_quit_callbacks(self) -> None:
+        events: list[str] = []
+        handler = KeyboardHandler(
+            stop_callback=lambda: events.append("stop"),
+            quit_callback=lambda: events.append("quit"),
+        )
+
+        handler._dispatch_immediate_callback(ControlSignal.STOP)
+        handler._dispatch_immediate_callback(ControlSignal.QUIT)
+        handler._dispatch_immediate_callback(ControlSignal.BEGIN)
+
+        self.assertEqual(events, ["stop", "quit"])
+
     def test_release_waits_only_for_final_normal_action_acceptance(self) -> None:
         self.assertTrue(_keyboard_action_was_accepted(0, {"last_cmd_seq": 8}))
         self.assertFalse(_keyboard_action_was_accepted(9, {"last_cmd_seq": 8}))

@@ -44,6 +44,29 @@ _POLL_S = 0.05
 _HOME_WAIT_ARMED_TIMEOUT_S = 5.0
 
 
+def _request_immediate_stop(shared: RuntimeChannels) -> None:
+    """Fence live motion when S/Q arrives while this thread is blocked by H."""
+    shared.stop_request.value = int(StopRequest.OPERATOR)
+    try:
+        state = SafetyState(int(shared.safety_state.value))
+    except ValueError:
+        shared.error_state.value = True
+        return
+    # Do not convert an incompletely initialized DISARMED runtime into ARMED.
+    # H only runs from ARMED; a generation bump there makes the arm worker stop
+    # its blocking home request, while RUNNING stops a policy command promptly.
+    if state in {SafetyState.ARMED, SafetyState.RUNNING} and not revoke_motion(
+        shared, SafetyState.ARMED
+    ):
+        shared.error_state.value = True
+
+
+def _request_immediate_quit(shared: RuntimeChannels) -> None:
+    """Apply Q's motion fence before asking the supervisor to shut down."""
+    _request_immediate_stop(shared)
+    shared.quit_requested.value = True
+
+
 def build_home_planner(runtime: ResolvedRuntimeConfig) -> XArm7MotionPlanner:
     """Construct the collision-checked home planner (mirrors replay setup).
 
@@ -146,6 +169,7 @@ def _home(
         # Only the physical e-stop path may latch ESTOP. Ordinary shutdown,
         # faults, and quit requests are already observed by execute_arm_home.
         estop_requested=lambda: bool(shared.estop_request.value),
+        cancel_requested=abort_requested,
         progress=lambda message: print(f"  {message}", flush=True),
     )
     return result.succeeded
@@ -170,7 +194,9 @@ def run_operator_control(
     if execution_mode not in {"shadow", "execute", "task"}:
         raise ValueError("execution_mode must be 'shadow', 'execute', or 'task'")
     keyboard = KeyboardHandler(
-        estop_callback=lambda: setattr(shared.estop_request, "value", True)
+        estop_callback=lambda: setattr(shared.estop_request, "value", True),
+        stop_callback=lambda: _request_immediate_stop(shared),
+        quit_callback=lambda: _request_immediate_quit(shared),
     )
     try:
         keyboard.start()
@@ -232,6 +258,7 @@ def run_operator_control(
                             or shared.quit_requested.value
                             or shared.error_state.value
                             or shared.estop_request.value
+                            or int(shared.stop_request.value) != int(StopRequest.NONE)
                         ),
                     )
                     shared.physical_home_completed.value = bool(completed)
@@ -252,11 +279,8 @@ def run_operator_control(
                     keyboard.drain_signal(ControlSignal.BEGIN)
                     discard_begin_in_batch = True
                 elif signal is ControlSignal.QUIT:
-                    if not revoke_motion(shared, SafetyState.ARMED) and int(
-                        shared.safety_state.value
-                    ) != int(SafetyState.FAULT):
-                        shared.error_state.value = True
-                    shared.quit_requested.value = True
+                    if not shared.quit_requested.value:
+                        _request_immediate_quit(shared)
                     return
                 elif signal is ControlSignal.EMERGENCY_STOP:
                     shared.estop_request.value = True

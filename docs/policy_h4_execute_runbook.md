@@ -1,7 +1,10 @@
 # H4 首次物理 coupled execute Runbook
 
-> 状态：**等待独立 H4 review 和授权。** 当前 `cuda:0` 120 秒 zero-write baseline 见
+> 状态：**等待当前 Python deployment tree 的 H2/H3 shadow、独立 H4 review 和授权。** 最近一次
+> `cuda:0` 120 秒 zero-write 证据见
 > [`deployment_reference_h2h3_shadow_2026-08-31_59503ad.json`](deployment_reference_h2h3_shadow_2026-08-31_59503ad.json)。
+> 该 receipt 对应 `59503ad`；随后修复了 H 期间 S/Q 的即时取消链路，故它保留为审计证据，**不可**
+> 作为当前 revision 的 H4 baseline。
 > `3b2615f` 已完成 65 秒、1038 endpoint、zero-write 的短 H2/H3 shadow，见
 > [`deployment_reference_h2h3_shadow_2026-08-31_3b2615f_short.json`](deployment_reference_h2h3_shadow_2026-08-31_3b2615f_short.json)；
 > 它不替代当前 revision 所需的 120 秒 baseline。
@@ -55,8 +58,8 @@ shadow 证据解释成 execute 授权。
 
 | Gate | 需要的证据 | 失败处理 |
 |---|---|---|
-| reference identity | checkpoint SHA-256 与 [当前 H2/H3 reference artifact](deployment_reference_h2h3_shadow_2026-08-31_59503ad.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
-| H2/H3 baseline | `59503ad` 的 120 s shadow receipt：1916/1916 endpoint validated、zero coupled writes、clean shutdown | Python deployment tree、runtime config 或 artifact 改变即停止并重跑 shadow |
+| reference identity | checkpoint SHA-256 与 [冻结的 H2/H3 artifact](deployment_reference_h2h3_shadow_2026-08-31_59503ad.json) 均为 `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` | 停止，不选取“最新” checkpoint |
+| H2/H3 baseline | 当前 Python deployment tree 必须重新完成 120 s shadow、zero coupled writes、clean shutdown；`59503ad` receipt 不可复用 | Python deployment tree、runtime config 或 artifact 改变即停止并重跑 shadow |
 | execute enablement diff | H4 保持 one-publication 与原 SafetyGate/worker limits；新增 seed receipt、H home 和 B 前 canonical arm-home gate，不修改 normalizer、collision、freshness 或 generation 语义 | 任一未解释差异都停止 |
 | bounded execute guard | execute 的 publication bound 固定为 `1`；ack timeout 与 B-relative duration 均为有限正值，并写入 coordinator receipt | 不允许用无界 execute 替代 |
 | offline publication | fake ring 的 full validation 成功只写一条 coherent arm+hand record；gate 后 generation 变化不得写入 | 停止并修复 |

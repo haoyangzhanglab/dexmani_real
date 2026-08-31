@@ -60,6 +60,7 @@ class ArmHomeStatus(str, Enum):
     PLANNING_FAILED = "planning_failed"
     NO_SAFE_PATH = "no_safe_path"
     GENERATION_CHANGED = "generation_changed"
+    CANCELLED = "cancelled"
     QUEUE_FULL = "queue_full"
     QUEUE_ERROR = "queue_error"
     COMPLETION_TIMEOUT = "completion_timeout"
@@ -205,12 +206,14 @@ def _estimate_home_timeout_s(
 def _wait_for_prehome_state(
     shared: RuntimeChannels,
     *,
+    expected_run_generation: int,
     newer_than_ns: int,
     timeout_s: float,
     max_velocity_rad_s: float,
     heartbeat: bool,
     arm_heartbeat_max_age_s: float,
     estop_requested: Callable[[], bool] | None,
+    cancel_requested: Callable[[], bool] | None,
 ) -> tuple[np.ndarray | None, str]:
     """Wait for fresh stationary feedback after invalidating queued actions."""
     if not np.isfinite(timeout_s) or timeout_s <= 0.0:
@@ -224,6 +227,10 @@ def _wait_for_prehome_state(
         loop_now_s = time.monotonic()
         if heartbeat:
             shared.set_heartbeat("policy", loop_now_s)
+        if cancel_requested is not None and cancel_requested():
+            return None, "operator cancelled while waiting for stationary feedback"
+        if int(shared.run_generation.value) != expected_run_generation:
+            return None, "run generation changed while waiting for stationary feedback"
         if _latch_operator_estop(shared, estop_requested):
             return None, "e-stop requested while waiting for stationary feedback"
         if not shared.is_running.value:
@@ -334,12 +341,14 @@ def _wait_for_home_completion(
     shared: RuntimeChannels,
     home_qpos: np.ndarray,
     *,
+    expected_run_generation: int,
     newer_than_ns: int,
     timeout_s: float,
     tol_rad: float,
     settled_velocity_rad_s: float,
     heartbeat: bool,
     estop_requested: Callable[[], bool] | None,
+    cancel_requested: Callable[[], bool] | None,
     arm_heartbeat_max_age_s: float,
     progress: Callable[[str], None] | None,
 ) -> ArmHomeResult:
@@ -359,6 +368,12 @@ def _wait_for_home_completion(
         now_s = time.monotonic()
         if heartbeat:
             shared.set_heartbeat("policy", now_s)
+        if cancel_requested is not None and cancel_requested():
+            abort_reason = "operator cancelled homing"
+            break
+        if int(shared.run_generation.value) != expected_run_generation:
+            abort_reason = "run generation changed during homing"
+            break
         if _latch_operator_estop(shared, estop_requested):
             abort_reason = "e-stop requested by operator"
             break
@@ -400,6 +415,10 @@ def _wait_for_home_completion(
         time.sleep(_HOME_RESULT_POLL_S)
     if abort_reason is not None:
         _emit_progress(progress, f"arm: home wait aborted — {abort_reason}")
+        if cancel_requested is not None and cancel_requested():
+            return ArmHomeResult(ArmHomeStatus.CANCELLED, abort_reason)
+        if int(shared.run_generation.value) != expected_run_generation:
+            return ArmHomeResult(ArmHomeStatus.GENERATION_CHANGED, abort_reason)
         if shared.estop_request.value:
             return ArmHomeResult(ArmHomeStatus.ESTOP_REQUESTED, abort_reason)
         if not shared.is_running.value:
@@ -580,6 +599,7 @@ def execute_arm_home(
     table_z_surface_m: float = 0.0,
     current_qpos: np.ndarray | None = None,
     estop_requested: Callable[[], bool] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> ArmHomeResult:
     """Plan, publish, and observe one arm-home request with typed outcomes."""
@@ -597,6 +617,13 @@ def execute_arm_home(
             "e-stop requested before homing",
             progress=progress,
             operator_message="arm: homing cancelled — e-stop requested",
+        )
+    if cancel_requested is not None and cancel_requested():
+        return _home_failure(
+            ArmHomeStatus.CANCELLED,
+            "operator cancelled before homing",
+            progress=progress,
+            operator_message="arm: homing cancelled by operator",
         )
     if not shared.is_running.value:
         return _home_failure(
@@ -653,15 +680,21 @@ def execute_arm_home(
     generation_started_ns = time.monotonic_ns()
     fresh_qpos, prehome_issue = _wait_for_prehome_state(
         shared,
+        expected_run_generation=home_generation,
         newer_than_ns=generation_started_ns,
         timeout_s=max(config.prehome_timeout_s, config.state_max_age_s),
         max_velocity_rad_s=config.stationary_velocity_rad_s,
         heartbeat=config.publish_policy_heartbeat,
         arm_heartbeat_max_age_s=config.arm_heartbeat_max_age_s,
         estop_requested=estop_requested,
+        cancel_requested=cancel_requested,
     )
     if fresh_qpos is None:
-        if shared.estop_request.value:
+        if cancel_requested is not None and cancel_requested():
+            status = ArmHomeStatus.CANCELLED
+        elif int(shared.run_generation.value) != home_generation:
+            status = ArmHomeStatus.GENERATION_CHANGED
+        elif shared.estop_request.value:
             status = ArmHomeStatus.ESTOP_REQUESTED
         elif not shared.is_running.value:
             status = ArmHomeStatus.RUNTIME_STOPPED
@@ -694,6 +727,13 @@ def execute_arm_home(
         return planning_failure
     assert waypoints is not None
 
+    if cancel_requested is not None and cancel_requested():
+        return _home_failure(
+            ArmHomeStatus.CANCELLED,
+            "operator cancelled during home planning",
+            progress=progress,
+            operator_message="arm: homing cancelled by operator",
+        )
     if _latch_operator_estop(shared, estop_requested):
         return _home_failure(
             ArmHomeStatus.ESTOP_REQUESTED,
@@ -738,6 +778,7 @@ def execute_arm_home(
     return _wait_for_home_completion(
         shared,
         home_qpos,
+        expected_run_generation=home_generation,
         newer_than_ns=queued_monotonic_ns,
         timeout_s=_estimate_home_timeout_s(
             waypoints,
@@ -749,6 +790,7 @@ def execute_arm_home(
         settled_velocity_rad_s=config.stationary_velocity_rad_s,
         heartbeat=config.publish_policy_heartbeat,
         estop_requested=estop_requested,
+        cancel_requested=cancel_requested,
         arm_heartbeat_max_age_s=config.arm_heartbeat_max_age_s,
         progress=progress,
     )

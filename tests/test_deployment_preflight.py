@@ -22,6 +22,7 @@ import torch
 
 import dexmani_real.deployment.preflight as preflight_module
 from dexmani_real.config.runtime import resolve_runtime_config
+from dexmani_real.control.arm_home import ArmHomeStatus, execute_arm_home
 from dexmani_real.deployment.artifact import resolve_policy_artifact
 from dexmani_real.deployment.config import (
     DeploymentConfig,
@@ -37,7 +38,10 @@ from dexmani_real.deployment.lifecycle import (
     run_policy_deployment,
 )
 from dexmani_real.deployment.manifest import DeploymentManifest
-from dexmani_real.deployment.operator import run_operator_control
+from dexmani_real.deployment.operator import (
+    _request_immediate_stop,
+    run_operator_control,
+)
 from dexmani_real.deployment.preflight import (
     PreflightResult,
     _decode_child_message,
@@ -62,6 +66,7 @@ from dexmani_real.integrations.dexmani_policy import (
     precheck_policy_package_provenance,
     verify_imported_policy_provenance,
 )
+from dexmani_real.runtime.safety import SafetyState, StopRequest
 from dexmani_real.teleop.keyboard import ControlSignal
 
 
@@ -463,6 +468,45 @@ class DeploymentPreflightTest(unittest.TestCase):
         coupled_ring.write.assert_not_called()
         self.assertFalse(shared.start_request.value)
         self.assertFalse(shared.stop_request.value)
+
+    def test_immediate_stop_fences_an_armed_or_running_runtime(self):
+        shared = SimpleNamespace(
+            stop_request=SimpleNamespace(value=False),
+            safety_state=SimpleNamespace(value=int(SafetyState.RUNNING)),
+            error_state=SimpleNamespace(value=False),
+        )
+        with patch(
+            "dexmani_real.deployment.operator.revoke_motion", return_value=True
+        ) as revoke:
+            _request_immediate_stop(shared)
+
+        self.assertEqual(shared.stop_request.value, int(StopRequest.OPERATOR))
+        revoke.assert_called_once_with(shared, SafetyState.ARMED)
+
+    def test_immediate_stop_never_arms_a_disarmed_runtime(self):
+        shared = SimpleNamespace(
+            stop_request=SimpleNamespace(value=False),
+            safety_state=SimpleNamespace(value=int(SafetyState.DISARMED)),
+            error_state=SimpleNamespace(value=False),
+        )
+        with patch("dexmani_real.deployment.operator.revoke_motion") as revoke:
+            _request_immediate_stop(shared)
+
+        self.assertEqual(shared.stop_request.value, int(StopRequest.OPERATOR))
+        revoke.assert_not_called()
+
+    def test_arm_home_honors_operator_cancellation_before_motion_boundary(self):
+        shared = SimpleNamespace(estop_request=SimpleNamespace(value=False))
+        result = execute_arm_home(
+            shared,
+            np.zeros(7),
+            planner=None,
+            config=object(),
+            estop_requested=lambda: False,
+            cancel_requested=lambda: True,
+        )
+
+        self.assertEqual(result.status, ArmHomeStatus.CANCELLED)
 
     def test_physical_operator_drains_home_events_accumulated_while_homing(self):
         shared = SimpleNamespace(
