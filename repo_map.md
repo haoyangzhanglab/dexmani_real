@@ -31,6 +31,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `docs/data_schema.md` | Real raw v24、processed v11 与 Policy Zarr v5 的持久化字段和语义参考。 |
 | `docs/action_clip_mechanisms.md` | 动作 clip、限幅、拒绝与动作源差异的实现参数和数据审计说明。 |
 | `docs/deployment_review.md` | learned-policy 部署架构与安全审查结论、风险接受及整改优先级。 |
+| `docs/dexmani_policy_inference_chain.md` | 从 experiment artifact、GPU checkpoint restore、归一化/反归一化到 plan/coupled command 的完整部署链路，以及其他 Policy 模型的兼容边界。 |
 | `docs/dexmani_real_policy_deployment_refactor_plan.md` | Real-owned artifact decoder/strict restore、Policy 兼容边界、R0–R4 gate 与暂停条件的当前方案。 |
 | `docs/dexmani_policy_integration_followup.md` | 另一台机器 Policy 分支稳定后的兼容性 review、验证与版本化 artifact 合并清单。 |
 | `docs/deployment_reference_task_execute_failure_2026-08-30_77d8c44.json` | 首次 bounded task 在 58/331 次发布时因近截止动作被 worker 判为 expired 并触发 ACK-timeout FAULT 的失败证据、hash 与修复门槛。 |
