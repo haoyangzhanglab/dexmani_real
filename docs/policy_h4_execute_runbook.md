@@ -2,6 +2,9 @@
 
 > 状态：**等待重新验证。** 当前 `cuda:0` 120 秒 zero-write baseline 见
 > [`deployment_reference_h2h3_shadow_2026-08-30_6349147.json`](deployment_reference_h2h3_shadow_2026-08-30_6349147.json)。
+> `3b2615f` 已完成 65 秒、1038 endpoint、zero-write 的短 H2/H3 shadow，见
+> [`deployment_reference_h2h3_shadow_2026-08-31_3b2615f_short.json`](deployment_reference_h2h3_shadow_2026-08-31_3b2615f_short.json)；
+> 它不替代当前 revision 所需的 120 秒 baseline。
 > `02f88e6` 的单 endpoint 与双 worker ACK 均成功，但日志没有 H home 链路证据，因此不计为
 > H4 通过；事实见
 > [`deployment_reference_h4_execute_failure_2026-08-30_02f88e6.json`](deployment_reference_h4_execute_failure_2026-08-30_02f88e6.json)。
