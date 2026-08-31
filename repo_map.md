@@ -38,6 +38,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `docs/deployment_reference_h2h3_shadow_failure_2026-08-30_bf79d4f.json` | 近截止动作修复后的首次 H2/H3 revalidation 在首命令前超时、zero-write、缺少分类 observation-wait 指标的失败证据与诊断门槛。 |
 | `docs/deployment_reference_h2h3_shadow_failure_2026-08-30_acc2cc1.json` | observation-wait diagnostics revision 的 H2/H3 发现隐式 CPU 推理争用、两段 zero-write silence abort、正常 Q 退出，以及显式 CUDA device、inference-child warmup、单次 B 修复门槛。 |
 | `docs/deployment_reference_h2h3_shadow_2026-08-30_6349147.json` | 显式 `cuda:0` inference qualification revision 的 120 秒 H2/H3 shadow、1916 endpoint validation、zero-write、zero-servo 与 clean-shutdown 证据。 |
+| `docs/deployment_reference_h2h3_shadow_2026-08-31_2d29ffb.json` | 当前 GPU-first/RGB/R3D deployment revision 的 120 秒 H2/H3 shadow、1915 endpoint validation、zero-write、zero-servo 与 clean-shutdown evidence；是 H4 review 的当前 baseline。 |
 | `docs/deployment_reference_h2h3_shadow_2026-08-31_3b2615f_short.json` | 当前 GPU-first/RGB/R3D deployment revision 的 65 秒 H2/H3 shadow：1038 endpoint validation、zero-write、zero-servo 与 clean-shutdown 证据；明确不替代 120 秒 baseline。 |
 | `docs/deployment_reference_h4_execute_2026-08-30_2d37080.json` | 当前 HOME-event coalescing revision 的单 HOME、单 coupled endpoint、双 worker ACK 与 clean-shutdown H4 证据。 |
 | `docs/deployment_reference_h4_execute_failure_2026-08-30_02f88e6.json` | CUDA H4 单 endpoint/双 ACK 成功但缺少操作员 H home 链路证据的失败事实、hash、根因与重新验证门槛。 |
