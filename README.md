@@ -165,9 +165,9 @@ python examples/collect_teleop.py --print-config
 | 键盘遥操作 | `python examples/keyboard_teleop.py` | 连接并控制 xArm7，可选 XHand |
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 使用 raw episode 的精确已发送命令、配置和模型 provenance，预检后控制 xArm7/XHand；写 `replay_results/` |
 | 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取并校验 `data.h5` hash 后的原始 `float64` 已发送命令，继续执行完整配置/模型/几何预检；包含多个 source 连续段的产物拒绝物理回放 |
-| learned policy | `python examples/run_policy.py --experiment-dir <experiment> --device <device> --print-config` 或 `--preflight-only` | inference device 必须显式声明；Real-owned decoder/strict restore 已完成离线验证。连接硬件的 shadow 仍须使用干净、review 的 revision，并逐次取得新的 H2/H3 授权。当前方案见 [`dexmani_real_policy_deployment_refactor_plan.md`](docs/dexmani_real_policy_deployment_refactor_plan.md)。 |
-| H4 one-shot execute | `examples/run_policy.py --execution-mode execute ...` | bound 固定为 1；物理模式要求先按 H 完成 hand-command-accepted + canonical arm home，且须获得单次明确 H4 真机授权；详见 [`policy_h4_execute_runbook.md`](docs/policy_h4_execute_runbook.md)。 |
-| learned-policy 单次任务 rollout（未真机验证） | `examples/run_policy.py --execution-mode task ...` | 独立于 H4 的多 endpoint 有界执行；逐 endpoint 双 worker ACK、B 前 arm-home gate、确定性 seed 与 task receipt。必须先 review 并获得新的 task 真机授权；详见 [`policy_task_execute_runbook.md`](docs/policy_task_execute_runbook.md)。 |
+| learned policy | `python examples/run_policy.py --experiment-dir <experiment> --device <device> --print-config` 或 `--preflight-only` | artifact→GPU inference→coupled command 的唯一说明、当前验证事实和模型边界见 [`policy_deployment.md`](docs/policy_deployment.md)。 |
+| H4 one-shot execute | `examples/run_policy.py --execution-mode execute ...` | bound 固定为 1；物理模式要求先按 H 完成 hand-command-accepted + canonical arm home，且每次仍须获得单次明确 H4 真机授权；执行门与证据要求见 [`policy_deployment.md`](docs/policy_deployment.md)。 |
+| learned-policy 单次任务 rollout（物理成功未验证） | `examples/run_policy.py --execution-mode task ...` | 两次 331-endpoint transport rollout 均 clean 完成，但最近一次未完成抓取放置。下一次 task 运行前必须先完成诊断 review，并取得新的 task 真机授权；停止条件见 [`policy_deployment.md`](docs/policy_deployment.md)。 |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |
@@ -241,9 +241,10 @@ provenance 缺失均拒绝启动。
 EMA 选择和 denoise steps 从 checkpoint 内嵌配置读取。部署不加载训练 dataset 或 sim
 `env_runner`，当前也不启用 env-runner temporal ensemble。
 
-当前 `dexmani_policy` 尚未合入上述 checkpoint/data-contract 生产端改动，因此其现有 checkpoint
-会在硬件 worker 启动前被明确拒绝。后续实现顺序、字段合同和验收矩阵见
-[`docs/dexmani_policy_integration_followup.md`](docs/dexmani_policy_integration_followup.md)。
+当前 frozen deployment artifact 已通过 Real-owned decoder、strict restore 与硬件部署链路验证；
+它不是所有 `dexmani_policy` checkpoint 的通用兼容承诺。未来 Policy 分支的 additive contract
+变更仍按 [`docs/policy_deployment.md`](docs/policy_deployment.md) 的跨仓合并条件独立 review，
+不能改变已训练 sim checkpoint 的读取与评测语义。
 
 点云缺失、过期、shape/dtype 错误、非有限值或颜色越界时 inference fail closed，不发布
 新的 plan。实时路径当前仅支持静态 `eye_to_hand` 标定；`eye_in_hand` 需要另行建立与

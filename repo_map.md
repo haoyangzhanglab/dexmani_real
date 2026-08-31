@@ -30,25 +30,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `repo_map.md` | 当前文件与 owner 索引。 |
 | `docs/data_schema.md` | Real raw v24、processed v11 与 Policy Zarr v5 的持久化字段和语义参考。 |
 | `docs/action_clip_mechanisms.md` | 动作 clip、限幅、拒绝与动作源差异的实现参数和数据审计说明。 |
-| `docs/deployment_review.md` | learned-policy 部署架构与安全审查结论、风险接受及整改优先级。 |
-| `docs/dexmani_policy_inference_chain.md` | 从 experiment artifact、GPU checkpoint restore、归一化/反归一化到 plan/coupled command 的完整部署链路，以及其他 Policy 模型的兼容边界。 |
-| `docs/dexmani_real_policy_deployment_refactor_plan.md` | Real-owned artifact decoder/strict restore、Policy 兼容边界、R0–R4 gate 与暂停条件的当前方案。 |
-| `docs/dexmani_policy_integration_followup.md` | 另一台机器 Policy 分支稳定后的兼容性 review、验证与版本化 artifact 合并清单。 |
-| `docs/deployment_reference_task_execute_failure_2026-08-30_77d8c44.json` | 首次 bounded task 在 58/331 次发布时因近截止动作被 worker 判为 expired 并触发 ACK-timeout FAULT 的失败证据、hash 与修复门槛。 |
-| `docs/deployment_reference_h2h3_shadow_failure_2026-08-30_bf79d4f.json` | 近截止动作修复后的首次 H2/H3 revalidation 在首命令前超时、zero-write、缺少分类 observation-wait 指标的失败证据与诊断门槛。 |
-| `docs/deployment_reference_h2h3_shadow_failure_2026-08-30_acc2cc1.json` | observation-wait diagnostics revision 的 H2/H3 发现隐式 CPU 推理争用、两段 zero-write silence abort、正常 Q 退出，以及显式 CUDA device、inference-child warmup、单次 B 修复门槛。 |
-| `docs/deployment_reference_h2h3_shadow_2026-08-30_6349147.json` | 显式 `cuda:0` inference qualification revision 的 120 秒 H2/H3 shadow、1916 endpoint validation、zero-write、zero-servo 与 clean-shutdown 证据。 |
-| `docs/deployment_reference_h2h3_shadow_2026-08-31_2d29ffb.json` | 当前 GPU-first/RGB/R3D deployment revision 的 120 秒 H2/H3 shadow、1915 endpoint validation、zero-write、zero-servo 与 clean-shutdown evidence；是 H4 review 的当前 baseline。 |
-| `docs/deployment_reference_h2h3_shadow_2026-08-31_3b2615f_short.json` | 当前 GPU-first/RGB/R3D deployment revision 的 65 秒 H2/H3 shadow：1038 endpoint validation、zero-write、zero-servo 与 clean-shutdown 证据；明确不替代 120 秒 baseline。 |
-| `docs/deployment_reference_h4_execute_2026-08-30_2d37080.json` | 当前 HOME-event coalescing revision 的单 HOME、单 coupled endpoint、双 worker ACK 与 clean-shutdown H4 证据。 |
-| `docs/deployment_reference_h4_execute_failure_2026-08-30_02f88e6.json` | CUDA H4 单 endpoint/双 ACK 成功但缺少操作员 H home 链路证据的失败事实、hash、根因与重新验证门槛。 |
-| `docs/deployment_reference_h2h3_shadow_2026-08-30_506729e.json` | 当前 `506729e` HOME-event coalescing revision 的 120 秒 H2/H3 shadow provenance、1912 endpoint validation、zero-write 与 clean-shutdown 证据。 |
-| `docs/deployment_reference_h2h3_shadow_2026-08-30_a3a45e3.json` | `a3a45e3` home/seed revision 的 120 秒 H2/H3 shadow provenance、1913 endpoint validation、zero-write 与 clean-shutdown 回归证据。 |
-| `docs/deployment_reference_h2h3_shadow_2026-08-29_c9c3454.json` | 上一版 `c9c3454` revision 的 time-bounded H2/H3 shadow provenance、receipt、zero-write 与 clean-shutdown 回归证据。 |
-| `docs/deployment_reference_h2h3_shadow_2026-08-29.json` | 早期 frozen reference v2 的 H2/H3 shadow evidence；仅用于回归对比。 |
-| `docs/maniunicon_reference_design.md` | 从 ManiUniCon 静态审查提炼的 learned-policy 部署改进思路、采纳边界与验收要求。 |
-| `docs/policy_h4_execute_runbook.md` | 当前 H2/H3 已通过后等待独立授权的 H4 physical coupled execute gate、现场 stop 与 receipt 要求；不构成真机授权。 |
-| `docs/policy_task_execute_runbook.md` | 独立 bounded task rollout 的根因、arm-home 初态门、确定性推理、逐 endpoint ACK、完整命令与授权/验收要求。 |
+| `docs/policy_deployment.md` | learned-policy 的 artifact/观测/GPU 推理/动作发布链、模型兼容边界、H2/H3/H4/task 门、当前验证记录、task 诊断与跨仓 Policy 合并规则。 |
 | `docs/pointcloud_pipeline.md` | depth-to-color aligned 点云的采集、处理、时序与持久化契约。 |
 | `docs/teleop_jitter_incident.md` | 键盘遥操作卡顿、抖动、delta 拒绝与 coupled-command 修复复盘。 |
 | `docs/vr_coordinate_transform_followup.md` | VR wrist→EEF 坐标换算审查、证据边界、真实样本诊断与后续修正决策记录。 |
@@ -272,6 +254,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `collect_teleop.py` | VR teleop 数据采集入口。 |
 | `keyboard_teleop.py` | keyboard teleop 入口。 |
 | `run_policy.py` | experiment artifact receipt/preflight、shadow lifecycle、H4 one-shot execute，以及独立 bounded task rollout CLI；物理模式绑定 checkpoint SHA、seed、时长与 ACK/publication bounds。 |
+| `seal_h4_evidence.py` | 无硬件的 H4 evidence 封存工具；绑定 completed runtime receipt、terminal log 与操作者记录。 |
 | `replay_episode.py` | 物理回放入口。 |
 | `process_episodes.py` | raw → processed HDF5 离线处理。 |
 | `export_policy_zarr.py` | processed HDF5 → Policy Zarr 离线导出。 |
