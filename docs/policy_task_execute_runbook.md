@@ -2,8 +2,10 @@
 
 > 状态：**首次完整 task rollout 已在 58/331 次发布时 fail closed；其后的 observation 与
 > CPU inference 问题均已定位修复。current Python tree 已通过 `cuda:0` H2/H3 shadow，并在
-> `a697480` sealed 完成 H4 one-endpoint。** task profile 使用不同的 deterministic seed=1066，
-> 因此仍须在任务场景完成 seed=1066 的 zero-write shadow、独立 review 和新的 task 授权。
+> `a697480` sealed 完成 H4 one-endpoint。** task profile 的 deterministic seed=1066 也已在任务场景
+> 完成 zero-write shadow，见
+> [`deployment_reference_task_scene_h2h3_shadow_2026-08-31_6b976f8.json`](deployment_reference_task_scene_h2h3_shadow_2026-08-31_6b976f8.json)。
+> 剩余 gate 是独立 task review 和新的 task 授权。
 > 本文给出独立于 H4 one-shot 的 bounded task profile；文档和既有硬件证据均不构成新的真机授权。
 
 ## 1. 根因与修复边界
