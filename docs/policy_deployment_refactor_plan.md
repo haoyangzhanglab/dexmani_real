@@ -335,8 +335,8 @@ Old H4/task evidence was generated under old full-future semantics and cannot au
 
 # Phase R2 — Timing and readiness
 
-**Status**: UNBLOCKED — implementation on `codex/real-r2-timing-readiness`;
-not yet reviewed or DONE.
+**Status**: MERGED / REVIEWED — Real `main` =
+`effe745c68847a4b32ed1e4680041a350da4f4fe`.
 
 ## R2.1 Separate three timing concepts
 

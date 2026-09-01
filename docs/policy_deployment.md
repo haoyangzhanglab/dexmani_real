@@ -40,7 +40,7 @@ policy 唯一的 robot-command producer。
 | 字段 | 值 |
 |---|---|
 | experiment | `/home/zhanghaoyang/Desktop/dexmani_policy/experiments/dp3/pick_place_toy/2026-08-28_13-59_42` |
-| checkpoint | `epoch=1126-step=00080000-deployment-v2.pt` |
+| checkpoint | `epoch=1126-step=00080000-pr3-fc6b7df-deployment-v2.pt` |
 | checkpoint SHA-256 | `28ff79a6ca5d5b746bbde877ff96abbb88543539f4c73ef554348184f446effc` |
 | Policy producer commit | `fc6b7dfb45748f4187f2e82b5425721ed02b028e` |
 | action | 19-D absolute joint target：arm 7 + hand 12 |
