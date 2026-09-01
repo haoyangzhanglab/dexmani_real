@@ -5,6 +5,14 @@
     "checkpoint_sha256": "6fa0d49e044a281eec66133a140bdeee534986f2ebda4468d6bcd28bff720218",
     "direct_restore": "PASS",
     "inspect": "PASS",
+    "inspect_allocation": {
+      "control_action_dim": 19,
+      "horizon": 16,
+      "n_action_steps": 8,
+      "n_obs_steps": 2,
+      "required_action_steps": 15
+    },
+    "inspect_exit_code": 0,
     "preflight": "PASS",
     "producer_commit": "5994037db9d3a56d7bd0f807bd6df2cbca3adfcc",
     "sidecar_sha256": "b10defb759e2e06e6d2a44078a3fac23c4bc68bc3f02eafbb1d1f0861709ebf8"
@@ -32,9 +40,13 @@
     "coupled_sequence_after": 0,
     "coupled_sequence_before": 0,
     "coupled_sequence_delta": 0,
+    "feed_end": 20,
+    "feed_frame_count": 20,
+    "feed_start": 0,
     "hardware_sdk_imports": [],
     "hardware_workers_started": false,
     "inference_ready": true,
+    "inference_seed": 1066,
     "negative_checks": {
       "all_targets_expired_no_plan": true,
       "deadline_closed_no_validation": true,
@@ -49,13 +61,15 @@
       "replay_feeder"
     ],
     "shadow_validated_count": 1,
+    "source_segment_end": 140,
+    "source_segment_start": 0,
     "status": "PASS"
   },
   "operator_handoff": {
     "device": "cuda:0",
-    "fresh_h4": "git -C \"$REAL_ROOT\" switch --detach effe745c68847a4b32ed1e4680041a350da4f4fe && git -C \"$POLICY_ROOT\" switch --detach fc6b7dfb45748f4187f2e82b5425721ed02b028e && python \"$REAL_ROOT/examples/run_policy.py\" --experiment-dir \"$POLICY_ROOT/experiments/dp3/pick_place_toy/2026-08-28_13-59_42\" --device cuda:0 --inference-seed 0 --hand --execution-mode execute --max-running-seconds 10 --execute-max-published-endpoints 1 --execute-ack-timeout-seconds 2 --execute-expected-checkpoint-sha256 28ff79a6ca5d5b746bbde877ff96abbb88543539f4c73ef554348184f446effc",
-    "live_shadow": "git -C \"$REAL_ROOT\" switch --detach effe745c68847a4b32ed1e4680041a350da4f4fe && git -C \"$POLICY_ROOT\" switch --detach fc6b7dfb45748f4187f2e82b5425721ed02b028e && python \"$REAL_ROOT/examples/run_policy.py\" --experiment-dir \"$POLICY_ROOT/experiments/dp3/pick_place_toy/2026-08-28_13-59_42\" --device cuda:0 --inference-seed 0 --hand --execution-mode shadow --max-running-seconds 10",
-    "seed": 0
+    "fresh_h4": "git -C \"$REAL_ROOT\" switch --detach effe745c68847a4b32ed1e4680041a350da4f4fe && git -C \"$POLICY_ROOT\" switch --detach fc6b7dfb45748f4187f2e82b5425721ed02b028e && python \"$REAL_ROOT/examples/run_policy.py\" --experiment-dir \"$POLICY_ROOT/experiments/dp3/pick_place_toy/2026-08-28_13-59_42\" --device cuda:0 --inference-seed 1066 --hand --execution-mode execute --max-running-seconds 10 --execute-max-published-endpoints 1 --execute-ack-timeout-seconds 2 --execute-expected-checkpoint-sha256 28ff79a6ca5d5b746bbde877ff96abbb88543539f4c73ef554348184f446effc",
+    "live_shadow": "git -C \"$REAL_ROOT\" switch --detach effe745c68847a4b32ed1e4680041a350da4f4fe && git -C \"$POLICY_ROOT\" switch --detach fc6b7dfb45748f4187f2e82b5425721ed02b028e && python \"$REAL_ROOT/examples/run_policy.py\" --experiment-dir \"$POLICY_ROOT/experiments/dp3/pick_place_toy/2026-08-28_13-59_42\" --device cuda:0 --inference-seed 1066 --hand --execution-mode shadow --max-running-seconds 10",
+    "seed": 1066
   },
   "policy": {
     "current_main_change_kind": "docs_only",
@@ -89,7 +103,8 @@
     "episode_name": "episode_20260827_224527",
     "first_deliverable_index": 4,
     "grid_dt_s": 0.0625,
-    "model_latency_ms": 181.338352,
+    "inference_seed": 1066,
+    "model_latency_ms": 182.211538,
     "pred_action_conceptual_shape": [
       1,
       16,

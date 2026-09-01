@@ -111,6 +111,7 @@ FORBIDDEN_HARDWARE_MODULES = frozenset(
 RECEIPT_SCHEMA_VERSION = 1
 REPLAY_WINDOW_STEPS = 2
 MULTIPROCESS_TIMEOUT_S = 30.0
+EXPECTED_RECORDED_EPISODE = "episode_20260827_224527"
 
 
 @dataclass(frozen=True)
@@ -258,6 +259,71 @@ def _probe_restore(
     return value["result"]
 
 
+def _inspect_fixture(
+    *,
+    fixture_experiment: Path,
+    policy_commit: str,
+    policy_root: Path,
+    real_root: Path,
+    python: Path,
+) -> dict[str, int | str]:
+    """Run and validate the hardware-free Real CLI print-config boundary."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join((str(real_root), str(policy_root)))
+    command = [
+        str(python),
+        str(real_root / "examples/run_policy.py"),
+        "--experiment-dir",
+        str(fixture_experiment),
+        "--device",
+        "cpu",
+        "--print-config",
+    ]
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60.0,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "current fixture CLI inspect failed: "
+            f"{completed.stderr.strip() or completed.stdout.strip()}"
+        )
+    try:
+        receipt = json.loads(completed.stdout)
+        artifact = receipt["artifact"]
+        producer_commit = artifact["producer"]["commit"]
+        allocation = artifact["allocation"]
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("current fixture CLI inspect output is invalid") from exc
+    expected_allocation = {
+        "n_obs_steps": 2,
+        "n_action_steps": 8,
+        "horizon": 16,
+        "required_action_steps": 15,
+        # The print-config schema exposes action_dim. For this joint-only
+        # fixture it is the equivalent executable control_action_dim.
+        "action_dim": 19,
+    }
+    if producer_commit != policy_commit:
+        raise ValueError("current fixture CLI inspect producer mismatch")
+    if any(
+        allocation.get(name) != value for name, value in expected_allocation.items()
+    ):
+        raise ValueError("current fixture CLI inspect allocation mismatch")
+    return {
+        "producer_commit": producer_commit,
+        "n_obs_steps": allocation["n_obs_steps"],
+        "n_action_steps": allocation["n_action_steps"],
+        "horizon": allocation["horizon"],
+        "required_action_steps": allocation["required_action_steps"],
+        "control_action_dim": allocation["action_dim"],
+    }
+
+
 def _validate_current_fixture(
     *,
     fixture_experiment: Path,
@@ -278,6 +344,13 @@ def _validate_current_fixture(
         allocation.control_action_dim,
     ) != (2, 8, 16, 15, 19):
         raise ValueError("current fixture allocation contract is not O2/A8/H16/19D")
+    inspect = _inspect_fixture(
+        fixture_experiment=fixture_experiment,
+        policy_commit=policy_commit,
+        policy_root=policy_root,
+        real_root=real_root,
+        python=python,
+    )
     probe = policy_root / "tests/deployment/real_restore_probe.py"
     direct = _probe_restore(
         python=python,
@@ -312,6 +385,17 @@ def _validate_current_fixture(
         "checkpoint_sha256": direct["checkpoint_sha256"],
         "sidecar_sha256": artifact.index_sha256,
         "inspect": "PASS",
+        "inspect_exit_code": 0,
+        "inspect_allocation": {
+            name: inspect[name]
+            for name in (
+                "n_obs_steps",
+                "n_action_steps",
+                "horizon",
+                "required_action_steps",
+                "control_action_dim",
+            )
+        },
         "direct_restore": "PASS",
         "preflight": "PASS",
         "action_steps": 8,
@@ -1017,6 +1101,49 @@ def _coordinator_child(shared: RuntimeChannels, config: Any, diagnostics: Any) -
         )
 
 
+def _replay_feed_segment(
+    source_rows: np.ndarray,
+    segment_ends: np.ndarray,
+    *,
+    window_start: int,
+    window_steps: int,
+    max_frames: int,
+) -> tuple[int, int, int, int]:
+    """Select a bounded feed range containing one deterministic replay window."""
+    rows = np.asarray(source_rows)
+    ends = np.asarray(segment_ends)
+    if rows.ndim != 1:
+        raise ValueError("source_row_index must be 1-D")
+    if ends.ndim != 1 or ends.size == 0:
+        raise ValueError("source_segment_ends must be non-empty and 1-D")
+    if int(ends[0]) <= 0:
+        raise ValueError("source_segment_ends must start after compact index zero")
+    if np.any(np.diff(ends) <= 0):
+        raise ValueError("source_segment_ends must be strictly increasing")
+    if int(ends[-1]) > len(rows):
+        raise ValueError("source_segment_ends exceeds source_row_index")
+    if window_start < 0 or window_steps <= 0:
+        raise ValueError("replay window bounds must be positive")
+    window_end = window_start + window_steps
+    if window_end > len(rows):
+        raise ValueError("replay window exceeds source_row_index")
+    starts = np.concatenate((np.array([0], dtype=np.int64), ends[:-1]))
+    containing = [
+        (int(start), int(end))
+        for start, end in zip(starts, ends, strict=True)
+        if int(start) <= window_start and window_end <= int(end)
+    ]
+    if len(containing) != 1:
+        raise ValueError("replay window is not contained by exactly one source segment")
+    if max_frames <= 0:
+        raise ValueError("max_frames must be positive")
+    segment_start, segment_end = containing[0]
+    feed_end = min(segment_end, segment_start + max_frames)
+    if window_end > feed_end:
+        raise ValueError("replay window is outside the bounded feeder range")
+    return segment_start, segment_end, segment_start, feed_end
+
+
 def _replay_feeder_child(
     shared: RuntimeChannels,
     payload: ReplayPayload,
@@ -1035,14 +1162,38 @@ def _replay_feeder_child(
         original = payload.original_reference_ns
         replay_epoch_ns = run_started_ns + 1_000_000
         point_dtype = make_pointcloud_frame_dtype(payload.point_cloud.shape[1])
-        # Reuse the entire first contiguous recorded segment to keep feedback
-        # fresh while inference and coordinator consume the first deterministic window.
         with h5py.File(processed_path, "r") as processed:
-            available = min(int(processed.attrs["episode_steps"]), 20)
-            clouds = np.asarray(processed["point_cloud"][:available], dtype=np.float32)
-            compact_rows = np.asarray(
-                processed["provenance/source_row_index"][:available], dtype=np.int64
+            source_rows = np.asarray(
+                processed["provenance/source_row_index"][:], dtype=np.int64
             )
+            segment_ends = np.asarray(
+                processed["provenance/source_segment_ends"][:], dtype=np.int64
+            )
+            segment_start, segment_end, feed_start, feed_end = _replay_feed_segment(
+                source_rows,
+                segment_ends,
+                window_start=payload.window_start_index,
+                window_steps=len(payload.source_rows),
+                max_frames=20,
+            )
+            compact_rows = source_rows[feed_start:feed_end]
+            clouds = np.asarray(
+                processed["point_cloud"][feed_start:feed_end], dtype=np.float32
+            )
+        if len(compact_rows) != len(clouds):
+            raise ValueError(
+                "replay feeder source rows and point clouds differ in length"
+            )
+        diagnostics.put(
+            {
+                "event": "feeder_range",
+                "source_segment_start": segment_start,
+                "source_segment_end": segment_end,
+                "feed_start": feed_start,
+                "feed_end": feed_end,
+                "feed_frame_count": len(compact_rows),
+            }
+        )
         episode_dir = (
             Path(processed_path).parents[1]
             / "episodes"
@@ -1111,7 +1262,7 @@ def _replay_feeder_child(
                 cloud["color_frame_number"][0] = raw["camera_color_frame_number"][row]
                 cloud["point_cloud"][0] = clouds[index]
                 shared.pointcloud_ring.write(cloud)
-        diagnostics.put({"event": "feeder_complete", "frames": int(available)})
+        diagnostics.put({"event": "feeder_complete", "frames": int(len(compact_rows))})
     except BaseException as exc:
         diagnostics.put(
             {
@@ -1363,6 +1514,12 @@ def run_multiprocess_shadow(
         )
         if forbidden:
             raise RuntimeError(f"hardware module import audit failed: {forbidden}")
+        feeder_ranges = [
+            event for event in events if event.get("event") == "feeder_range"
+        ]
+        if len(feeder_ranges) != 1:
+            raise RuntimeError("multiprocess replay feeder range evidence is missing")
+        feeder_range = feeder_ranges[0]
         coupled_after = int(shared.coupled_cmd_ring.latest_sequence)
         plan_sequence = int(shared.policy_plan_ring.latest_sequence)
         shadow_validated = sum(
@@ -1452,6 +1609,12 @@ def run_multiprocess_shadow(
             "coupled_sequence_delta": coupled_after - coupled_before,
             "hardware_workers_started": False,
             "hardware_sdk_imports": [],
+            "inference_seed": policy_config.deployment.inference_seed,
+            "source_segment_start": feeder_range["source_segment_start"],
+            "source_segment_end": feeder_range["source_segment_end"],
+            "feed_start": feeder_range["feed_start"],
+            "feed_end": feeder_range["feed_end"],
+            "feed_frame_count": feeder_range["feed_frame_count"],
             "negative_checks": {
                 name: negative_receipt[name]
                 for name in (
@@ -1519,6 +1682,8 @@ CURRENT FIXTURE EVIDENCE uses current Policy main as producer.
 - Producer: `{current['producer_commit']}`
 - Checkpoint SHA-256: `{current['checkpoint_sha256']}`
 - Sidecar SHA-256: `{current['sidecar_sha256']}`
+- Inspect is a real `examples/run_policy.py --print-config` CLI subprocess check (exit {current['inspect_exit_code']}).
+- Inspect allocation: O{current['inspect_allocation']['n_obs_steps']} / A{current['inspect_allocation']['n_action_steps']} / H{current['inspect_allocation']['horizon']} / required {current['inspect_allocation']['required_action_steps']} / control {current['inspect_allocation']['control_action_dim']}D
 - Inspect / direct restore / isolated preflight: PASS / PASS / PASS
 
 ## Representative artifact qualification
@@ -1539,6 +1704,7 @@ RECORDED REPLAY uses recorded source-relative timing rebased onto a fresh monoto
 
 - Episode: `{recorded['episode_name']}` (schema v{recorded['schema_version']}, VALID, task `{recorded['task']}`)
 - Window: compact index {recorded['window_start_index']}, {recorded['window_steps']} consecutive observations
+- Gate A representative inference baseline seed: {recorded['inference_seed']}
 - Actual representative Policy inference: PASS
 - Model latency: {recorded['model_latency_ms']:.3f} ms
 - Prediction / control shapes: `{recorded['pred_action_conceptual_shape']}` / `{recorded['control_action_shape']}`
@@ -1553,6 +1719,8 @@ MULTIPROCESS SHADOW is a hardware-free shared-memory/process integration using o
 - Inference / coordinator ready: YES / YES
 - Policy plan ring advanced: YES (sequence {multi['policy_plan_sequence']})
 - Shadow validated count: {multi['shadow_validated_count']}
+- Replay feeder stayed within one persisted source segment: [{multi['source_segment_start']}, {multi['source_segment_end']}); fed [{multi['feed_start']}, {multi['feed_end']}) ({multi['feed_frame_count']} frames)
+- Multiprocess representative inference seed: {multi['inference_seed']}
 - Mandatory negative cross-process checks: PASS
 
 ## Timing evidence
@@ -1585,6 +1753,8 @@ Offline evidence cannot establish live sensor freshness under current load, phys
 ## Operator-only next steps
 
 DO NOT RUN FROM CODEX — OPERATOR ONLY — HARDWARE SIDE EFFECTS POSSIBLE
+
+Offline replay, multiprocess shadow, live shadow handoff, and fresh H4 handoff share representative inference seed `{receipt['operator_handoff']['seed']}`.
 
 Exact artifact producer `{representative['producer_commit']}`, Real `{receipt['real']['commit']}`, device `{receipt['operator_handoff']['device']}`, seed `{receipt['operator_handoff']['seed']}`, checkpoint SHA `{representative['checkpoint_sha256']}`.
 
@@ -1625,6 +1795,8 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         Path(args.desktop_root),
         task_name=artifact.allocation_contract.task_name,
     )
+    if discovered_episode.name != EXPECTED_RECORDED_EPISODE:
+        raise ValueError("recording set changed from the Gate A baseline")
     if discovered_episode != episode:
         raise ValueError("selected episode is not the newest VALID matching recording")
     current_fixture = _validate_current_fixture(
@@ -1676,6 +1848,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
             "resolved_config_sha256": payload.resolved_config_sha256,
             "candidate_count": discovery["candidate_count"],
             "valid_matching_count": discovery["valid_matching_count"],
+            "inference_seed": policy_resolved.runtime.deployment.inference_seed,
         }
     )
     multiprocess = run_multiprocess_shadow(
@@ -1766,7 +1939,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", required=True)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--live-device", default="cuda:0")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=1066)
     parser.add_argument("--real-pre-merge-commit", required=True)
     parser.add_argument("--real-commit", required=True)
     parser.add_argument("--policy-current-commit", required=True)

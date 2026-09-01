@@ -23,6 +23,8 @@ CURRENT FIXTURE EVIDENCE uses current Policy main as producer.
 - Producer: `5994037db9d3a56d7bd0f807bd6df2cbca3adfcc`
 - Checkpoint SHA-256: `6fa0d49e044a281eec66133a140bdeee534986f2ebda4468d6bcd28bff720218`
 - Sidecar SHA-256: `b10defb759e2e06e6d2a44078a3fac23c4bc68bc3f02eafbb1d1f0861709ebf8`
+- Inspect is a real `examples/run_policy.py --print-config` CLI subprocess check (exit 0).
+- Inspect allocation: O2 / A8 / H16 / required 15 / control 19D
 - Inspect / direct restore / isolated preflight: PASS / PASS / PASS
 
 ## Representative artifact qualification
@@ -43,8 +45,9 @@ RECORDED REPLAY uses recorded source-relative timing rebased onto a fresh monoto
 
 - Episode: `episode_20260827_224527` (schema v24, VALID, task `pick_place_toy`)
 - Window: compact index 0, 2 consecutive observations
+- Gate A representative inference baseline seed: 1066
 - Actual representative Policy inference: PASS
-- Model latency: 181.338 ms
+- Model latency: 182.212 ms
 - Prediction / control shapes: `[1, 16, 19]` / `[8, 19]`
 - First deliverable / transport-valid / usable: 4 / 4 / 4
 - ActionBuffer: PASS; target grid was not retimed
@@ -57,6 +60,8 @@ MULTIPROCESS SHADOW is a hardware-free shared-memory/process integration using o
 - Inference / coordinator ready: YES / YES
 - Policy plan ring advanced: YES (sequence 1)
 - Shadow validated count: 1
+- Replay feeder stayed within one persisted source segment: [0, 140); fed [0, 20) (20 frames)
+- Multiprocess representative inference seed: 1066
 - Mandatory negative cross-process checks: PASS
 
 ## Timing evidence
@@ -90,18 +95,20 @@ Offline evidence cannot establish live sensor freshness under current load, phys
 
 DO NOT RUN FROM CODEX — OPERATOR ONLY — HARDWARE SIDE EFFECTS POSSIBLE
 
-Exact artifact producer `fc6b7dfb45748f4187f2e82b5425721ed02b028e`, Real `effe745c68847a4b32ed1e4680041a350da4f4fe`, device `cuda:0`, seed `0`, checkpoint SHA `28ff79a6ca5d5b746bbde877ff96abbb88543539f4c73ef554348184f446effc`.
+Offline replay, multiprocess shadow, live shadow handoff, and fresh H4 handoff share representative inference seed `1066`.
+
+Exact artifact producer `fc6b7dfb45748f4187f2e82b5425721ed02b028e`, Real `effe745c68847a4b32ed1e4680041a350da4f4fe`, device `cuda:0`, seed `1066`, checkpoint SHA `28ff79a6ca5d5b746bbde877ff96abbb88543539f4c73ef554348184f446effc`.
 
 Live shadow:
 
 ```bash
-git -C "$REAL_ROOT" switch --detach effe745c68847a4b32ed1e4680041a350da4f4fe && git -C "$POLICY_ROOT" switch --detach fc6b7dfb45748f4187f2e82b5425721ed02b028e && python "$REAL_ROOT/examples/run_policy.py" --experiment-dir "$POLICY_ROOT/experiments/dp3/pick_place_toy/2026-08-28_13-59_42" --device cuda:0 --inference-seed 0 --hand --execution-mode shadow --max-running-seconds 10
+git -C "$REAL_ROOT" switch --detach effe745c68847a4b32ed1e4680041a350da4f4fe && git -C "$POLICY_ROOT" switch --detach fc6b7dfb45748f4187f2e82b5425721ed02b028e && python "$REAL_ROOT/examples/run_policy.py" --experiment-dir "$POLICY_ROOT/experiments/dp3/pick_place_toy/2026-08-28_13-59_42" --device cuda:0 --inference-seed 1066 --hand --execution-mode shadow --max-running-seconds 10
 ```
 
 Fresh H4, one endpoint:
 
 ```bash
-git -C "$REAL_ROOT" switch --detach effe745c68847a4b32ed1e4680041a350da4f4fe && git -C "$POLICY_ROOT" switch --detach fc6b7dfb45748f4187f2e82b5425721ed02b028e && python "$REAL_ROOT/examples/run_policy.py" --experiment-dir "$POLICY_ROOT/experiments/dp3/pick_place_toy/2026-08-28_13-59_42" --device cuda:0 --inference-seed 0 --hand --execution-mode execute --max-running-seconds 10 --execute-max-published-endpoints 1 --execute-ack-timeout-seconds 2 --execute-expected-checkpoint-sha256 28ff79a6ca5d5b746bbde877ff96abbb88543539f4c73ef554348184f446effc
+git -C "$REAL_ROOT" switch --detach effe745c68847a4b32ed1e4680041a350da4f4fe && git -C "$POLICY_ROOT" switch --detach fc6b7dfb45748f4187f2e82b5425721ed02b028e && python "$REAL_ROOT/examples/run_policy.py" --experiment-dir "$POLICY_ROOT/experiments/dp3/pick_place_toy/2026-08-28_13-59_42" --device cuda:0 --inference-seed 1066 --hand --execution-mode execute --max-running-seconds 10 --execute-max-published-endpoints 1 --execute-ack-timeout-seconds 2 --execute-expected-checkpoint-sha256 28ff79a6ca5d5b746bbde877ff96abbb88543539f4c73ef554348184f446effc
 ```
 
 ## Final decision
