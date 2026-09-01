@@ -1,0 +1,151 @@
+{
+  "current_fixture": {
+    "action_steps": 8,
+    "checkpoint": "tiny-dp3-deployment-v2.pt",
+    "checkpoint_sha256": "6fa0d49e044a281eec66133a140bdeee534986f2ebda4468d6bcd28bff720218",
+    "direct_restore": "PASS",
+    "inspect": "PASS",
+    "preflight": "PASS",
+    "producer_commit": "5994037db9d3a56d7bd0f807bd6df2cbca3adfcc",
+    "sidecar_sha256": "b10defb759e2e06e6d2a44078a3fac23c4bc68bc3f02eafbb1d1f0861709ebf8"
+  },
+  "fresh_h4": {
+    "status": "NOT_RUN_OPERATOR_REQUIRED"
+  },
+  "gate": "promotion_gate_a_offline",
+  "gate_decision": "READY_FOR_LIVE_GATE_A",
+  "hardware_audit": {
+    "arm_worker_started": false,
+    "camera_worker_started": false,
+    "forbidden_modules_imported": [],
+    "hand_worker_started": false,
+    "pointcloud_worker_started": false,
+    "realsense_opened": false,
+    "xarm_connected": false,
+    "xhand_connected": false
+  },
+  "live_shadow": {
+    "status": "NOT_RUN_OPERATOR_REQUIRED"
+  },
+  "multiprocess_shadow": {
+    "coordinator_ready": true,
+    "coupled_sequence_after": 0,
+    "coupled_sequence_before": 0,
+    "coupled_sequence_delta": 0,
+    "hardware_sdk_imports": [],
+    "hardware_workers_started": false,
+    "inference_ready": true,
+    "negative_checks": {
+      "all_targets_expired_no_plan": true,
+      "deadline_closed_no_validation": true,
+      "generation_change_plan_dropped": true,
+      "non_prefix_mask_failed_closed": true
+    },
+    "policy_plan_sequence": 1,
+    "policy_plan_sequence_advanced": true,
+    "processes": [
+      "inference",
+      "policy",
+      "replay_feeder"
+    ],
+    "shadow_validated_count": 1,
+    "status": "PASS"
+  },
+  "operator_handoff": {
+    "device": "cuda:0",
+    "fresh_h4": "git -C \"$REAL_ROOT\" switch --detach effe745c68847a4b32ed1e4680041a350da4f4fe && git -C \"$POLICY_ROOT\" switch --detach fc6b7dfb45748f4187f2e82b5425721ed02b028e && python \"$REAL_ROOT/examples/run_policy.py\" --experiment-dir \"$POLICY_ROOT/experiments/dp3/pick_place_toy/2026-08-28_13-59_42\" --device cuda:0 --inference-seed 0 --hand --execution-mode execute --max-running-seconds 10 --execute-max-published-endpoints 1 --execute-ack-timeout-seconds 2 --execute-expected-checkpoint-sha256 28ff79a6ca5d5b746bbde877ff96abbb88543539f4c73ef554348184f446effc",
+    "live_shadow": "git -C \"$REAL_ROOT\" switch --detach effe745c68847a4b32ed1e4680041a350da4f4fe && git -C \"$POLICY_ROOT\" switch --detach fc6b7dfb45748f4187f2e82b5425721ed02b028e && python \"$REAL_ROOT/examples/run_policy.py\" --experiment-dir \"$POLICY_ROOT/experiments/dp3/pick_place_toy/2026-08-28_13-59_42\" --device cuda:0 --inference-seed 0 --hand --execution-mode shadow --max-running-seconds 10",
+    "seed": 0
+  },
+  "policy": {
+    "current_main_change_kind": "docs_only",
+    "current_main_commit": "5994037db9d3a56d7bd0f807bd6df2cbca3adfcc",
+    "semantic_handoff_commit": "aa4a0a39dd5a69e3a4ad85ea8190d6889610d175"
+  },
+  "r2_merge": {
+    "merge_type": "fast-forward",
+    "post_merge_main": "effe745c68847a4b32ed1e4680041a350da4f4fe",
+    "pre_merge_main": "fd8195f757f341f99a50f232bf59820a0fb15ec6",
+    "push_result": "PASS",
+    "r2_commit": "effe745c68847a4b32ed1e4680041a350da4f4fe"
+  },
+  "real": {
+    "clean": true,
+    "commit": "effe745c68847a4b32ed1e4680041a350da4f4fe"
+  },
+  "recorded_replay": {
+    "actual_model_inference": "PASS",
+    "candidate_count": 60,
+    "control_action_shape": [
+      8,
+      19
+    ],
+    "control_hz": 16.0,
+    "coupled_sequence_after": 0,
+    "coupled_sequence_before": 0,
+    "data_sha256": "b7e31f5aea73180ead7131abdf81b1f847bfb13060440f45c42f5037461be535",
+    "deadline_relative_ns": 750000000,
+    "depth_sha256": "38dd204c91909fea603e71448102673723b5dd53293285e9a06648ce8824da59",
+    "episode_name": "episode_20260827_224527",
+    "first_deliverable_index": 4,
+    "grid_dt_s": 0.0625,
+    "model_latency_ms": 181.338352,
+    "pred_action_conceptual_shape": [
+      1,
+      16,
+      19
+    ],
+    "resolved_config_sha256": "186ec09369b4cd5b70b64b8d445123b9e72f10eaf08ea47df078141eb1d5a292",
+    "retimed_actions": false,
+    "rgb_sha256": "ff7d2124e7cfc1f8d5340a81eadb374c8b799868e950fc34d4a88f2adf649ee8",
+    "schema_version": 24,
+    "shadow_disposition": "SHADOW_VALIDATED",
+    "status": "PASS",
+    "task": "pick_place_toy",
+    "timing_basis": "recorded_relative_rebased",
+    "transport_valid_count": 4,
+    "usable_target_count": 4,
+    "valid_matching_count": 60,
+    "validity": "VALID",
+    "window_start_index": 0,
+    "window_steps": 2
+  },
+  "representative_artifact": {
+    "allocation": {
+      "action_dim": 19,
+      "action_key": "action",
+      "auxiliary_action_layout": "none",
+      "control_action_dim": 19,
+      "control_dt_s": 0.0625,
+      "horizon": 16,
+      "n_action_steps": 8,
+      "n_obs_steps": 2,
+      "observation_fields": [
+        "arm_qpos",
+        "hand_qpos",
+        "point_cloud"
+      ],
+      "point_cloud_feature_dim": 6,
+      "point_cloud_num_points": 1024,
+      "required_action_steps": 15,
+      "requires_hand": true,
+      "rgb_color_order": null,
+      "rgb_shape": null,
+      "rgb_value_range": null,
+      "sensor_modalities": [
+        "joint_state",
+        "point_cloud"
+      ],
+      "task_name": "pick_place_toy"
+    },
+    "checkpoint": "epoch=1126-step=00080000-pr3-fc6b7df-deployment-v2.pt",
+    "checkpoint_sha256": "28ff79a6ca5d5b746bbde877ff96abbb88543539f4c73ef554348184f446effc",
+    "direct_restore": "PASS",
+    "exact_producer_checkout": true,
+    "experiment_name": "2026-08-28_13-59_42",
+    "preflight": "PASS",
+    "producer_commit": "fc6b7dfb45748f4187f2e82b5425721ed02b028e",
+    "sidecar_index_sha256": "52683587a024a18d9251eb073a6290c1cc123d966edbaa7dc282097c38040b06"
+  },
+  "schema_version": 1
+}

@@ -278,6 +278,8 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `tests/test_deployment_timing.py` | immutable target grid、独立 lower/upper timing bounds、prefix-only transport mask、run epoch、watchdog、因果 observation grid 与 bounded physical control contracts。 |
 | `tests/test_deployment_manifest.py` | deployment manifest 模态去重与顺序规范化合同。 |
 | `tests/test_deployment_metrics.py` | bounded p50/p95/p99 timing、flush/run totals、shadow zero-write、H4 one-shot 与 task execute receipt 合同。 |
+| `tests/gate_a_offline.py` | NO-HARDWARE Policy Promotion Gate A：recorded replay、真实 restore/inference、production timing/ActionBuffer/SafetyGate 与三进程 shared-memory shadow qualification。 |
+| `tests/test_gate_a_offline.py` | Gate A recorded timing rebase、deterministic episode discovery、hardware-import guard 与 operator handoff command 合同。 |
 | `tests/test_policy_checkpoint.py` | Real-owned deployment-v2 `weights_only` decoder 的 exact schema、plain metadata 与 canonical tensor-key 拒绝路径。 |
 | `tests/test_keyboard_arm_limits.py` | keyboard 发布完整 IK endpoint、禁用通用 arm delta clip 的合同。 |
 | `tests/test_pointcloud_sampling.py` | 固定 N 分层采样、数值快速路径、网格键 fail-closed 与实时策略投影合同。 |
