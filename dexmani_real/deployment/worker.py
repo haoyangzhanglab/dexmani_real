@@ -58,6 +58,12 @@ from dexmani_real.deployment.observation import (
     RgbFrame,
     parse_observation_fields,
 )
+from dexmani_real.deployment.preflight import (
+    MIN_STARTUP_DELIVERABLE_TARGETS,
+    POLICY_WARMUP_SAMPLES,
+    qualify_policy_warmup,
+    theoretical_remaining_target_count,
+)
 from dexmani_real.deployment.timing import build_target_grid, first_deliverable_index
 from dexmani_real.ipc.channels import RuntimeChannels, new_frame
 from dexmani_real.ipc.schema import (
@@ -74,7 +80,6 @@ logger = get_logger(__name__)
 _NO_FEEDBACK_POLL_S = 0.005
 # Poll interval while ARMED (no inference) — gentler than the feedback poll.
 _ARMED_IDLE_POLL_S = 0.01
-_MIN_STARTUP_DELIVERABLE_TARGETS = 2
 
 
 def _load_inference_runtime(config: PolicyRuntimeConfig) -> PolicyRuntime:
@@ -108,20 +113,12 @@ def _startup_deliverable_target_count(
     command_lead_s: float,
 ) -> int:
     """Return theoretical targets remaining after model latency and command lead."""
-    # This arbitrary positive origin has no source-time meaning; warmup only
-    # qualifies latency against relative executable-grid spacing.
-    origin_ns = 1
-    targets = build_target_grid(origin_ns, steps, step_dt_ns)
-    finished_ns = origin_ns + _duration_s_to_ns_ceil(
-        model_latency_s,
-        name="model_latency_s",
+    return theoretical_remaining_target_count(
+        model_latency_s=model_latency_s,
+        steps=steps,
+        step_dt_ns=step_dt_ns,
+        command_lead_s=command_lead_s,
     )
-    first_index = first_deliverable_index(
-        targets,
-        finished_ns,
-        _duration_s_to_ns_ceil(command_lead_s, name="command_lead_s"),
-    )
-    return len(targets) - first_index
 
 
 def stamp_prediction_timing(
@@ -962,44 +959,22 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
 
     try:
         if config.artifact is not None:
-            warmup_samples = 5
-            stable_samples = 3
-            timings_s = runtime.warmup(samples=warmup_samples)
-            if len(timings_s) != warmup_samples:
-                raise RuntimeError(
-                    "policy runtime returned an incomplete warmup receipt"
-                )
-            if any(not np.isfinite(value) or value < 0.0 for value in timings_s):
-                raise RuntimeError("policy runtime returned invalid warmup timing")
+            timings_s = runtime.warmup(samples=POLICY_WARMUP_SAMPLES)
             allocation = config.artifact.allocation_contract
-            stable_timings_s = timings_s[-stable_samples:]
             step_dt_ns = int(round(1e9 / float(shared.action_control_hz)))
-            remaining_targets = tuple(
-                _startup_deliverable_target_count(
-                    model_latency_s=value,
-                    steps=allocation.n_action_steps,
-                    step_dt_ns=step_dt_ns,
-                    command_lead_s=config.deployment.command_lead_s,
-                )
-                for value in stable_timings_s
+            remaining_targets = qualify_policy_warmup(
+                timings_s,
+                steps=allocation.n_action_steps,
+                step_dt_ns=step_dt_ns,
+                command_lead_s=config.deployment.command_lead_s,
             )
-            logger.info(
+            logger.debug(
                 "inference warmup model-latency qualification: samples_ms=%s "
                 "stable_remaining_targets=%s minimum=%d",
                 ",".join(f"{value * 1e3:.3f}" for value in timings_s),
                 ",".join(str(value) for value in remaining_targets),
-                _MIN_STARTUP_DELIVERABLE_TARGETS,
+                MIN_STARTUP_DELIVERABLE_TARGETS,
             )
-            if any(
-                remaining < _MIN_STARTUP_DELIVERABLE_TARGETS
-                for remaining in remaining_targets
-            ):
-                raise RuntimeError(
-                    "policy inference warmup exceeds the viable action window: "
-                    f"stable_max_ms={max(stable_timings_s) * 1e3:.3f} "
-                    f"stable_remaining_targets={remaining_targets} "
-                    f"minimum={_MIN_STARTUP_DELIVERABLE_TARGETS}"
-                )
     except BaseException:
         try:
             runtime.close()

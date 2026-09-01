@@ -2194,7 +2194,7 @@ class DeploymentTimingTest(unittest.TestCase):
 
     def test_coordinator_records_bounded_shadow_stop_reason(self) -> None:
         with self.assertLogs(
-            "dexmani_real.deployment.coordinator", level="INFO"
+            "dexmani_real.deployment.coordinator", level="DEBUG"
         ) as logs:
             shared, coupled_cmd_ring, candidates = (
                 self._run_single_endpoint_coordinator(
@@ -2308,7 +2308,7 @@ class DeploymentTimingTest(unittest.TestCase):
 
     def test_h4_commits_exactly_one_endpoint_then_waits_for_dual_ack(self) -> None:
         with self.assertLogs(
-            "dexmani_real.deployment.coordinator", level="INFO"
+            "dexmani_real.deployment.coordinator", level="DEBUG"
         ) as logs:
             shared, coupled_cmd_ring, candidates = (
                 self._run_single_endpoint_coordinator(
@@ -2354,7 +2354,7 @@ class DeploymentTimingTest(unittest.TestCase):
 
     def test_task_commits_each_endpoint_only_after_previous_dual_ack(self) -> None:
         with self.assertLogs(
-            "dexmani_real.deployment.coordinator", level="INFO"
+            "dexmani_real.deployment.coordinator", level="DEBUG"
         ) as logs:
             shared, coupled_cmd_ring, candidates = (
                 self._run_single_endpoint_coordinator(

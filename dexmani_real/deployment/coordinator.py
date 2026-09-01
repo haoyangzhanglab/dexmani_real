@@ -625,7 +625,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
         except Exception:
             logger.critical("coordinator: cannot render shadow receipt", exc_info=True)
         else:
-            logger.info("shadow run receipt: %s", receipt)
+            logger.debug("shadow run receipt: %s", receipt)
             if end_sequence != shadow_start_coupled_sequence:
                 logger.critical(
                     "coordinator: shadow run changed coupled command sequence "
@@ -678,7 +678,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
             revoke_motion(shared, SafetyState.FAULT)
             logger.critical("coordinator: cannot render execute receipt", exc_info=True)
         else:
-            logger.info("execute run receipt: %s", receipt)
+            logger.debug("execute run receipt: %s", receipt)
             if config.execute_receipt_dir is not None:
                 try:
                     receipt_path = write_json_receipt(
@@ -1447,7 +1447,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                             + int(execute_bounds.acknowledgement_timeout_s * 1e9)
                         ),
                     )
-                    logger.info(
+                    logger.debug(
                         "coordinator: %s published action_id=%d (%d/%d); awaiting worker acknowledgement",
                         config.execution_mode,
                         published_candidate.action_id,

@@ -40,7 +40,7 @@ def _get_file_handler() -> logging.FileHandler | None:
     """Create (once) a shared file handler for on-disk session logs.
 
     Directory from $DEXMANI_LOG_DIR (default ~/.dexmani/logs/), file name is
-    date-stamped. Fail-safe: any error → return None (stdout logging unaffected).
+    date/PID-stamped. Fail-safe: any error → return None (stdout unaffected).
     """
     global _file_handler, _file_handler_init
     if _file_handler_init:
@@ -51,9 +51,12 @@ def _get_file_handler() -> logging.FileHandler | None:
             os.environ.get("DEXMANI_LOG_DIR", str(Path.home() / ".dexmani" / "logs"))
         )
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"dexmani_{time.strftime('%Y%m%d_%H%M%S')}.log"
+        log_path = log_dir / (
+            f"dexmani_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.log"
+        )
         handler = logging.FileHandler(str(log_path), encoding="utf-8")
         handler.setFormatter(_FORMATTER)
+        handler.setLevel(logging.DEBUG)
         _file_handler = handler
     except OSError:
         _file_handler = None  # read-only FS etc. — keep stdout only
@@ -65,11 +68,12 @@ def get_logger(name: str) -> logging.Logger:
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(_FORMATTER)
+        handler.setLevel(logging.INFO)
         logger.addHandler(handler)
         file_handler = _get_file_handler()
         if file_handler is not None:
             logger.addHandler(file_handler)
-        logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     return logger
 
 

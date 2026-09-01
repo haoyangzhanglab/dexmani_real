@@ -28,7 +28,7 @@
 |---|---|---|
 | `dexmani_policy` | agent class、训练/仿真、checkpoint 内嵌模型状态和 normalizer | Real hardware、lifecycle、SafetyGate、IPC、receipt |
 | `dexmani_real` | artifact 解析、strict restore、观测适配、命令验证/发布、workers 和物理生命周期 | 修改训练数据、sim checkpoint 或 Policy eval 语义 |
-| 操作者 | device/seed/mode/bounds 的显式 CLI 选择、物理现场确认、H/B/S/ESC/e-stop | 绕过 runtime 的 contract 或安全门 |
+| 操作者 | inspect/check/shadow 的显式 CLI 选择、strict physical profile、物理现场确认、H/B/S/ESC/e-stop | 绕过 runtime 的 contract 或安全门 |
 
 模型输出始终只是 proposal。inference worker 不能写 `coupled_cmd_ring`；coordinator 是 learned
 policy 唯一的 robot-command producer。
@@ -41,8 +41,8 @@ policy 唯一的 robot-command producer。
 |---|---|
 | experiment | `/home/zhanghaoyang/Desktop/dexmani_policy/experiments/dp3/pick_place_toy/2026-08-28_13-59_42` |
 | checkpoint | `epoch=1126-step=00080000-deployment-v2.pt` |
-| checkpoint SHA-256 | `b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c` |
-| Policy producer commit | `7e31d10e7a31ff3d12df31b8683c9c90b357cbc5` |
+| checkpoint SHA-256 | `28ff79a6ca5d5b746bbde877ff96abbb88543539f4c73ef554348184f446effc` |
+| Policy producer commit | `fc6b7dfb45748f4187f2e82b5425721ed02b028e` |
 | action | 19-D absolute joint target：arm 7 + hand 12 |
 | observation | 2 steps of arm/hand state and `1024 × 6` xyzrgb point cloud |
 | control | `16 Hz`、horizon 16；15-step prediction future、8-step executable control |
@@ -77,7 +77,39 @@ experiment directory + sidecar
     → arm/hand worker acknowledgement
 ```
 
-### 3.1 入口与不可变投影
+### 3.1 CLI 与 side-effect boundary
+
+入口仅转交 package CLI。无 subcommand 时打印简短 help、返回 0，且不导入 Torch、Policy、
+lifecycle 或 hardware owner，也不创建 session log。
+
+| command | Torch/GPU | hardware connection | learned coupled writes |
+|---|---:|---:|---:|
+| `inspect EXP` | no | no | no |
+| `check EXP --device ... --seed ... --benchmark-samples N` | yes | no | no |
+| `shadow EXP --device ... --seed ... --hand --max-running-seconds ...` | yes | yes | 0 expected |
+| `h4 PROFILE.yaml` | yes | yes | max 1 |
+| `run PROFILE.yaml` | yes | yes | bounded > 1 |
+
+`inspect` 只做 artifact/runtime/projection/Real source identity 并输出 canonical receipt。
+`check` 在一个 spawn child 中 verified-load 一次，执行与 production 相同的 5 次 warmup、last-3
+startup qualification，再对同一 synthetic observation 做 N 次 prediction，报告 model-path latency
+p50/p95/max、theoretical remaining-target min/p50/p95、zero-deliverable count 和可用时的 CUDA peak
+memory。量化采用 deterministic nearest rank。synthetic check 没有 camera source、真实 source age 或
+live lag，因此 receipt 必须写 `source_aware_schedulability=NOT_MEASURED`；偶发 zero target 只报告，
+不创建新的 correctness threshold。`shadow/h4/run` 仍由 inference child 各自做 authoritative verified
+load，`check` 不是在线启动前的重复 mandatory load。
+
+旧 flat CLI 迁移如下：`--print-config` → `inspect`，`--preflight-only` → `check`，
+`--execution-mode shadow` → `shadow`，`--execution-mode execute` → `h4 PROFILE.yaml`，
+`--execution-mode task` → `run PROFILE.yaml`；新 CLI 只暴露 `--seed`，不再暴露
+`--inference-seed`。
+
+console handler 保持 INFO，PID-stamped session file
+`dexmani_YYYYMMDD_HHMMSS_<pid>.log` 保留 DEBUG。周期 metrics、per-endpoint 明细和完整 JSON receipt
+进入 DEBUG；startup identity、ready/ARMED/RUNNING/STOPPED、operator prompt、重要 warning 与 physical
+receipt path 保持 INFO。
+
+### 3.2 入口与不可变投影
 
 `run_policy.py` 解析 CLI 后依次：
 
@@ -90,7 +122,7 @@ experiment directory + sidecar
 物理模式还要求可识别且干净的 Real source revision，以及 CLI 的 expected checkpoint SHA-256
 与 sidecar 精确一致。
 
-### 3.2 单次验证加载与 agent restore
+### 3.3 单次验证加载与 agent restore
 
 inference child 对同一个 held file descriptor 执行：
 
@@ -106,7 +138,7 @@ inference child 对同一个 held file descriptor 执行：
 不使用 fake policy、path-based second load 或宽松 key/normalizer fallback。agent 只允许来自
 `dexmani_policy.agents.*`；dataset 和 env runner 不会在部署时构造。
 
-### 3.3 GPU 启动与观测
+### 3.4 GPU 启动与观测
 
 核心模型推理默认在 `cuda:0`：CUDA 不可用或 index 不存在会启动失败，绝不静默回退 CPU；只有
 显式 `--device cpu` 才使用 CPU。loader/identity/hash、NumPy history assembly、timing、IPC 和 robot
@@ -135,7 +167,7 @@ rgb          [1, n_obs_steps, 3, H, W]  optional, float32 RGB [0,1]
 image normalization 由 checkpoint 的 image processor 决定。point-cloud-only、RGB-only 和联合输入
 均必须由 artifact 显式声明，不能由训练路径或缺字段推断。
 
-### 3.4 归一化、预测与动作解码
+### 3.5 归一化、预测与动作解码
 
 checkpoint 恢复的 agent 自己处理归一化与反归一化：
 
@@ -177,7 +209,7 @@ executable source 是 19-D `control_action`。EE action 的完整 prediction 同
 合法 control，退化的 executable control 必须拒绝。EE control 由 coordinator 做 IK；joint control
 不经过 IK。
 
-### 3.5 不可变 timing 与 readiness ownership
+### 3.6 不可变 timing 与 readiness ownership
 
 动作值、lower expiry、upper deadline 和调度分别由不同边界拥有：
 
@@ -226,7 +258,7 @@ online plan 的真实 source timestamp 与 coordinator deadline 才是 source-aw
 `usable_horizon_ms` 是从当前时刻到 latest actually usable target 的剩余时间，不是 raw
 prediction horizon，也不是 deadline 本身。deadline 前没有实际 usable target 时其值为 `0`。
 
-### 3.6 Plan、SafetyGate 与 worker ACK
+### 3.7 Plan、SafetyGate 与 worker ACK
 
 inference worker 把无时间的 `PolicyPrediction` 对齐到 Real control grid，屏蔽已过期 prefix；若
 没有可用 target，丢弃整个 prediction。它将 plan、observation/generation、timestamp、valid mask 和
@@ -287,10 +319,10 @@ generation、deadline、collision 或 worker validation。
 
 ### H4 single-endpoint sequence
 
-每次 H4 都需要当前干净 revision、同 artifact/device 的 H2/H3 evidence、`--print-config` 与
-`--preflight-only`。在场地无人、无物体/障碍、e-stop 就绪并获单次授权后：
+每次 H4 都需要当前干净 revision、同 artifact/device 的 H2/H3 evidence、`inspect` 与 `check`。
+在场地无人、无物体/障碍、e-stop 就绪并获单次授权后：
 
-1. 启动 `--execution-mode execute --hand --device cuda:0`，确认所有 subsystem 为 `ARMED`；
+1. 启动 `h4 PROFILE.yaml`，确认所有 subsystem 为 `ARMED`；
 2. 操作者按一次 H：SDK 接受一次 hand home command，然后执行 collision-checked arm canonical
    home。只要求 hand command accepted，不要求 hand feedback 进入 home tolerance；
 3. 日志出现 `physical home sequence completed` 且仍为 ARMED 后，操作者按一次 B；
@@ -302,26 +334,29 @@ H4 receipt 必须同时证明 `completed=true`、`max_published_endpoints=1`、
 evidence bundle 时，在进程退出后运行无硬件的 `examples/seal_h4_evidence.py`，绑定 runtime receipt、
 terminal log 和操作者记录。
 
-获得本次 H4 的明确授权后，受限 profile 为：
+physical profile 只拥有 Real run intent，unknown key（包括 horizon、action dimensions、EMA/NFE、
+solver 或 modality）全部拒绝；相对 path 以 profile 文件目录解析。H4 的
+`max_published_endpoints` 必须等于 1，run 必须大于 1。seed、hand acknowledgement、expected
+checkpoint SHA、positive running bound/ACK timeout 都必须显式存在，不能从 deployment default
+或示例继承：
 
-```bash
-PYTHONPATH=/home/zhanghaoyang/Desktop/dexmani_policy \
-PYTHONUNBUFFERED=1 \
-DEXMANI_RECEIPT_DIR=/home/zhanghaoyang/.dexmani/receipts \
-/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python \
-  examples/run_policy.py \
-  --experiment-dir /home/zhanghaoyang/Desktop/dexmani_policy/experiments/dp3/pick_place_toy/2026-08-28_13-59_42 \
-  --device cuda:0 \
-  --execution-mode execute \
-  --hand \
-  --max-running-seconds 30 \
-  --execute-max-published-endpoints 1 \
-  --execute-ack-timeout-seconds 2 \
-  --execute-expected-checkpoint-sha256 b174bd483b64090cd3f5dbe0a5bfadd10998f5d27d43fc9aca06efb82242484c
+```yaml
+schema_version: 1
+experiment_dir: /path/to/experiment
+runtime_config: null
+deployment_config: null
+device: cuda:0
+seed: 1066
+hand_acknowledged: true
+expected_checkpoint_sha256: "<64 lowercase hex>"
+max_running_seconds: 30.0
+acknowledgement_timeout_seconds: 2.0
+max_published_endpoints: 1
 ```
 
-任何 operational invocation 都连接硬件；本文、历史 receipt、`--print-config` 或 preflight
-都不是硬件授权。
+`shadow` 也会连接硬件；若 hand 启用，其 startup 可能 reset/home。它保证的是不应发布 learned
+coupled command，不是“无硬件副作用”。任何 operational invocation、本文、历史 receipt、
+`inspect` 或 `check` 都不是硬件授权。
 
 ## 6. Pre-R1 历史验证记录
 
@@ -381,7 +416,7 @@ loaded-checkpoint restore helper。不得把 Real lifecycle、SafetyGate、hardw
 - 旧 sim data 缺少 Real attrs 时保持原行为，未提交 checkpoint/dataset/experiment/W&B 生成物。
 
 新的 Policy artifact 必须使用新 selector 或明确版本，不能静默替换当前 reference。Real 先增加纯
-artifact/decoder tests，然后按 `--print-config` → CUDA preflight → recorded-observation replay → H2/H3
+artifact/decoder tests，然后按 `inspect` → CUDA `check` → recorded-observation replay → H2/H3
 shadow 的顺序验证；任何物理执行仍需新的独立 review 和授权。出现旧 eval/training 不兼容、padding
 再次硬编码、dirty/外部配置猜测 provenance、Policy 拥有 Real 安全逻辑或新旧 artifact 不能共存时，
 停止合并。

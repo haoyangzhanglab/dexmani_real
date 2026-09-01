@@ -414,7 +414,7 @@ No source-aware suffix invalidity needs to be serialized as `valid_mask`; schedu
 ## R2.4 Offline benchmark
 
 ```bash
-python examples/run_policy.py check EXP --benchmark-samples 100
+python examples/run_policy.py check EXP --device cuda:0 --seed 1066 --benchmark-samples 100
 ```
 
 Report separately:
@@ -464,7 +464,15 @@ Do not stack R5 scheduler changes on top of R1/R2 without first obtaining this b
 
 # Phase R3 — CLI and logging ergonomics
 
-**Status**: after R1/R2; behavior-preserving with respect to control data flow.
+**Status**: implementation on `codex/real-r3-cli-logging` — **READY FOR REVIEW**;
+behavior-preserving with respect to control data flow.
+
+```text
+Gate A offline: PASS on separate evidence branch a70df31aae6d00a004f927a679ece813efc1a4d7
+Gate A live: still pending on frozen effe745c68847a4b32ed1e4680041a350da4f4fe baseline
+```
+
+R4/R5 remain unchanged and are not part of this implementation.
 
 ## R3.1 Thin entry
 
@@ -481,7 +489,7 @@ Suggested UX:
 ```bash
 python examples/run_policy.py inspect EXP
 python examples/run_policy.py check EXP --device cuda:0 --seed 1066
-python examples/run_policy.py shadow EXP --device cuda:0 --seed 1066
+python examples/run_policy.py shadow EXP --device cuda:0 --seed 1066 --hand --max-running-seconds 10
 python examples/run_policy.py h4 PROFILE.yaml
 python examples/run_policy.py run PROFILE.yaml
 ```

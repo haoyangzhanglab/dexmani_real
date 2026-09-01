@@ -205,12 +205,14 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 |---|---|
 | `__init__.py` | learned-policy 部署子包标记。 |
 | `artifact.py` | 纯 experiment selector、schema v1/v2 sidecar index（point cloud/RGB/auxiliary-action contract）与 allocation contract 的 fail-closed 解析；不加载或哈希 checkpoint。 |
+| `cli.py` | `inspect/check/shadow/h4/run` 子命令解析、lazy import side-effect boundary 与 concise business errors。 |
 | `action_buffer.py` | 纯内存、有界 latest-wins policy endpoint scheduler；提供 stable token 与 commit/discard watermark。 |
 | `contracts.py` | 无时间 `PolicyPrediction`、publish context、timed action chunk 与 `PolicyRuntime` protocol。 |
 | `config.py` | artifact-owned/Real-owned deployment projection、确定性 seed、不可变 receipt、point-cloud contract，以及相互独立的 H4 one-shot/task execute bounds 校验。 |
 | `manifest.py` | checkpoint/config/runtime manifest（point cloud/RGB 与 full/control action layout）组装和 fail-closed 一致性检查。 |
 | `policy_checkpoint.py` | deployment-v2 checkpoint 的 Real-owned `weights_only` stream decoder、exact schema 与 canonical tensor-key 校验；不导入 Policy。 |
-| `preflight.py` | artifact-bound inference 与 spawn 预检共享的 no-follow/hash/provenance 单次 stream load；预检再执行 deterministic synthetic observation。 |
+| `preflight.py` | artifact-bound inference 与 spawn 预检/check 共享的 no-follow/hash/provenance 单次 stream load；offline check 复用 synthetic observation 做 startup qualification 与 bounded benchmark。 |
+| `profile.py` | exact-key schema-v1 physical run intent、explicit seed/checkpoint SHA/bounds 与 profile-relative path 解析。 |
 | `run_identity.py` | 纯标准库的 Real source provenance 与 print/preflight 共用 canonical run receipt。 |
 | `observation.py` | 因果不可变 arm/hand/tactile/pointcloud/RGB history batch。 |
 | `timing.py` | immutable policy target grid、inference-expired prefix、plan/source deadline 与 diagnostic usable-target composition 的纯计算。 |
@@ -254,7 +256,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 |---|---|
 | `collect_teleop.py` | VR teleop 数据采集入口。 |
 | `keyboard_teleop.py` | keyboard teleop 入口。 |
-| `run_policy.py` | experiment artifact receipt/preflight、shadow lifecycle、H4 one-shot execute，以及独立 bounded task rollout CLI；物理模式绑定 checkpoint SHA、seed、时长与 ACK/publication bounds。 |
+| `run_policy.py` | 仅做 repo-root bootstrap 并转交 `deployment.cli.main` 的 thin learned-policy 入口。 |
 | `seal_h4_evidence.py` | 无硬件的 H4 evidence 封存工具；绑定 completed runtime receipt、terminal log 与操作者记录。 |
 | `replay_episode.py` | 物理回放入口。 |
 | `process_episodes.py` | raw → processed HDF5 离线处理。 |
@@ -278,6 +280,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `tests/test_deployment_timing.py` | immutable target grid、独立 lower/upper timing bounds、prefix-only transport mask、run epoch、watchdog、因果 observation grid 与 bounded physical control contracts。 |
 | `tests/test_deployment_manifest.py` | deployment manifest 模态去重与顺序规范化合同。 |
 | `tests/test_deployment_metrics.py` | bounded p50/p95/p99 timing、flush/run totals、shadow zero-write、H4 one-shot 与 task execute receipt 合同。 |
+| `tests/test_policy_cli.py` | R3 subcommands、lazy import、strict physical profile、isolated check benchmark 与 INFO-console/DEBUG-file logging 合同。 |
 | `tests/test_policy_checkpoint.py` | Real-owned deployment-v2 `weights_only` decoder 的 exact schema、plain metadata 与 canonical tensor-key 拒绝路径。 |
 | `tests/test_keyboard_arm_limits.py` | keyboard 发布完整 IK endpoint、禁用通用 arm delta clip 的合同。 |
 | `tests/test_pointcloud_sampling.py` | 固定 N 分层采样、数值快速路径、网格键 fail-closed 与实时策略投影合同。 |

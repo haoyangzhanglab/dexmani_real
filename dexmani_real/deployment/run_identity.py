@@ -91,6 +91,7 @@ def canonical_run_receipt_json(
     runtime_sha256: str,
     real_source: RealSourceIdentity,
     preflight_result: Any | None,
+    check_result: Any | None = None,
 ) -> str:
     """Return the shared print/preflight receipt schema as canonical JSON."""
     verified = preflight_result is not None
@@ -183,6 +184,25 @@ def canonical_run_receipt_json(
         "policy_package": package,
         "preflight": preflight,
     }
+    if check_result is not None:
+        value["check"] = {
+            "benchmark_samples": check_result.benchmark_samples,
+            "device": check_result.device,
+            "gpu_peak_memory_bytes": check_result.gpu_peak_memory_bytes,
+            "latency_ms": {
+                "max": check_result.latency_max_ms,
+                "p50": check_result.latency_p50_ms,
+                "p95": check_result.latency_p95_ms,
+            },
+            "remaining_targets": {
+                "min": check_result.remaining_targets_min,
+                "p50": check_result.remaining_targets_p50,
+                "p95": check_result.remaining_targets_p95,
+                "zero_deliverable_samples": (check_result.zero_deliverable_samples),
+            },
+            "seed": check_result.seed,
+            "source_aware_schedulability": (check_result.source_aware_schedulability),
+        }
     return json.dumps(
         value, allow_nan=False, ensure_ascii=True, separators=(",", ":"), sort_keys=True
     )

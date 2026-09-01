@@ -165,9 +165,10 @@ python examples/collect_teleop.py --print-config
 | 键盘遥操作 | `python examples/keyboard_teleop.py` | 连接并控制 xArm7，可选 XHand |
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 使用 raw episode 的精确已发送命令、配置和模型 provenance，预检后控制 xArm7/XHand；写 `replay_results/` |
 | 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取并校验 `data.h5` hash 后的原始 `float64` 已发送命令，继续执行完整配置/模型/几何预检；包含多个 source 连续段的产物拒绝物理回放 |
-| learned policy | `python examples/run_policy.py --experiment-dir <experiment> --device <device> --print-config` 或 `--preflight-only` | artifact→GPU inference→coupled command 的唯一说明、当前验证事实和模型边界见 [`policy_deployment.md`](docs/policy_deployment.md)。 |
-| H4 one-shot execute | `examples/run_policy.py --execution-mode execute ...` | bound 固定为 1；物理模式要求先按 H 完成 hand-command-accepted + canonical arm home，且每次仍须获得单次明确 H4 真机授权；执行门与证据要求见 [`policy_deployment.md`](docs/policy_deployment.md)。 |
-| learned-policy 单次任务 rollout（物理成功未验证） | `examples/run_policy.py --execution-mode task ...` | 两次 331-endpoint transport rollout 均 clean 完成，但最近一次未完成抓取放置。下一次 task 运行前必须先完成诊断 review，并取得新的 task 真机授权；停止条件见 [`policy_deployment.md`](docs/policy_deployment.md)。 |
+| learned policy inspect/check | `python examples/run_policy.py inspect <experiment>` / `check <experiment> --device <device> --seed <seed> --benchmark-samples 100` | 两者均不连接硬件；inspect 不导入 Torch，check 在隔离 child 中 single-load、strict restore、synthetic qualification 和 benchmark。 |
+| learned policy shadow | `python examples/run_policy.py shadow <experiment> --device <device> --seed <seed> --hand --max-running-seconds <seconds>` | 会连接 arm/hand/camera；hand startup 可能 reset/home，但 learned coupled-command publication 应为 0。 |
+| H4 one-shot execute | `python examples/run_policy.py h4 <profile.yaml>` | strict profile 的 publication bound 必须为 1；要求独立 H4 真机授权和 H/B 操作。 |
+| learned-policy 单次任务 rollout（物理成功未验证） | `python examples/run_policy.py run <profile.yaml>` | strict profile 的 publication bound 必须大于 1；当前 task 仍暂停，先完成诊断 review 并取得新授权。 |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |
@@ -230,8 +231,9 @@ deployment:
 ```
 
 runtime 实现固定为 Real-owned `DexManiPolicyRuntime`，不能由 YAML 重定向；checkpoint、task、
-action、observation 与点云字段在 YAML 中只是 artifact expectation。推理 device 必须通过
-`examples/run_policy.py --device ...` 显式提供。
+action、observation 与点云字段在 YAML 中只是 artifact expectation。新 CLI 用 `inspect/check/shadow`
+的 `--device` 与 `--seed` 表达离线/影子意图；`h4/run` 的 device、seed 和 bounds 只来自 strict
+physical profile。旧 flat `--print-config/--preflight-only/--execution-mode/--inference-seed` 调用已移除。
 
 `dexmani_policy` 部署只接受包含 resolved inference config、完整 `train_params` 和训练数据合同的
 自描述 checkpoint。训练数据必须是 Real Policy Zarr v5，且 `task_name`、`dt`、

@@ -222,7 +222,7 @@ class Metrics:
         if not values:
             return
         rendered = " ".join(f"{key}={value}" for key, value in sorted(values.items()))
-        logger.info("%s: %s", prefix, rendered)
+        logger.debug("%s: %s", prefix, rendered)
         for name in list(self._counters):
             self._counters[name] = 0
 
