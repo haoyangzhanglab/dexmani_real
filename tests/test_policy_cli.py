@@ -111,12 +111,14 @@ except SystemExit as exc:
         raise
 forbidden = (
     "torch", "dexmani_policy", "dexmani_real.deployment.lifecycle",
-    "dexmani_real.robot.", "dexmani_real.sensor.", "xarm", "pyrealsense2",
+    "dexmani_real.robot.arm_worker", "dexmani_real.robot.hand_worker",
+    "dexmani_real.robot.xhand", "dexmani_real.sensor.camera_worker",
+    "dexmani_real.sensor.pointcloud_worker", "xarm", "xhand_controller",
+    "pyrealsense2",
 )
-loaded = [name for name in sys.modules if name in forbidden[:3] or
-          name.startswith(forbidden[1]) or name.startswith(forbidden[3]) or
-          name.startswith(forbidden[4]) or name.startswith(forbidden[5]) or
-          name.startswith(forbidden[6])]
+prefixes = ("torch", "dexmani_policy", "xarm", "xhand_controller", "pyrealsense2")
+loaded = [name for name in sys.modules if name in forbidden or
+          any(name.startswith(prefix + ".") for prefix in prefixes)]
 if loaded:
     raise SystemExit(",".join(sorted(loaded)))
 """
@@ -145,12 +147,14 @@ if main(["inspect", sys.argv[1], "--device", "cpu"]) != 0:
     raise SystemExit("inspect failed")
 forbidden = (
     "torch", "dexmani_policy", "dexmani_real.deployment.lifecycle",
-    "dexmani_real.robot.", "dexmani_real.sensor.", "xarm", "pyrealsense2",
+    "dexmani_real.robot.arm_worker", "dexmani_real.robot.hand_worker",
+    "dexmani_real.robot.xhand", "dexmani_real.sensor.camera_worker",
+    "dexmani_real.sensor.pointcloud_worker", "xarm", "xhand_controller",
+    "pyrealsense2",
 )
-loaded = [name for name in sys.modules if name in forbidden[:3] or
-          name.startswith(forbidden[1]) or name.startswith(forbidden[3]) or
-          name.startswith(forbidden[4]) or name.startswith(forbidden[5]) or
-          name.startswith(forbidden[6])]
+prefixes = ("torch", "dexmani_policy", "xarm", "xhand_controller", "pyrealsense2")
+loaded = [name for name in sys.modules if name in forbidden or
+          any(name.startswith(prefix + ".") for prefix in prefixes)]
 if loaded:
     raise SystemExit(",".join(sorted(loaded)))
 """
@@ -211,7 +215,67 @@ if loaded:
         self.assertEqual(resolve.call_args.kwargs["seed"], 1066)
         offline_check.assert_called_once_with(projection.runtime, benchmark_samples=3)
         self.assertNotIn("dexmani_real.robot.arm_worker", sys.modules)
+        self.assertNotIn("dexmani_real.robot.hand_worker", sys.modules)
+        self.assertNotIn("dexmani_real.robot.xhand", sys.modules)
         self.assertNotIn("dexmani_real.sensor.camera_worker", sys.modules)
+        self.assertNotIn("dexmani_real.sensor.pointcloud_worker", sys.modules)
+        self.assertFalse(
+            any(
+                name == "xarm"
+                or name.startswith("xarm.")
+                or name == "xhand_controller"
+                or name.startswith("xhand_controller.")
+                or name == "pyrealsense2"
+                or name.startswith("pyrealsense2.")
+                for name in sys.modules
+            )
+        )
+
+    def test_check_is_hardware_free_in_fresh_process(self) -> None:
+        script = r"""
+import io
+import sys
+from contextlib import redirect_stdout
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
+from dexmani_real.deployment import cli
+artifact = SimpleNamespace()
+runtime = SimpleNamespace(sha256="r" * 64)
+projection = SimpleNamespace(runtime=object(), sha256="p" * 64)
+preflight_module = ModuleType("dexmani_real.deployment.preflight")
+preflight_module.run_isolated_policy_check = Mock(return_value=SimpleNamespace())
+identity_module = ModuleType("dexmani_real.deployment.run_identity")
+identity_module.resolve_real_source_identity = Mock(return_value=object())
+identity_module.canonical_run_receipt_json = Mock(return_value='{"ok":true}')
+with (patch.object(cli, "_resolve_artifact_projection",
+                   return_value=(artifact, runtime, projection)),
+      patch.dict(sys.modules, {
+          "dexmani_real.deployment.preflight": preflight_module,
+          "dexmani_real.deployment.run_identity": identity_module,
+      }), redirect_stdout(io.StringIO())):
+    if cli.main(["check", "experiment", "--device", "cpu",
+                 "--seed", "1066", "--benchmark-samples", "1"]) != 0:
+        raise SystemExit("check failed")
+forbidden = (
+    "dexmani_real.deployment.lifecycle", "dexmani_real.robot.arm_worker",
+    "dexmani_real.robot.hand_worker", "dexmani_real.robot.xhand",
+    "dexmani_real.sensor.camera_worker", "dexmani_real.sensor.pointcloud_worker",
+    "xarm", "xhand_controller", "pyrealsense2",
+)
+prefixes = ("xarm", "xhand_controller", "pyrealsense2")
+loaded = [name for name in sys.modules if name in forbidden or
+          any(name.startswith(prefix + ".") for prefix in prefixes)]
+if loaded:
+    raise SystemExit(",".join(sorted(loaded)))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_shadow_propagates_projection_seed_bound_and_calls_lifecycle_once(self):
         artifact = SimpleNamespace(
@@ -390,6 +454,15 @@ class PolicyCheckTest(unittest.TestCase):
             device="cpu", inference_seed=1066, command_lead_s=0.01
         )
         return SimpleNamespace(artifact=artifact, deployment=deployment)
+
+    def test_check_import_sentinel_rejects_xhand_native_sdk_modules(self) -> None:
+        for module_name in ("xhand_controller", "xhand_controller.fake"):
+            with (
+                self.subTest(module_name=module_name),
+                patch.dict(sys.modules, {module_name: ModuleType(module_name)}),
+                self.assertRaisesRegex(RuntimeError, module_name.replace(".", r"\.")),
+            ):
+                preflight._require_hardware_free_check_imports()
 
     def test_tiny_cpu_check_loads_once_predicts_three_times_and_closes(self) -> None:
         runtime_config = self._runtime_config()

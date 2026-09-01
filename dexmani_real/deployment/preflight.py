@@ -57,9 +57,11 @@ _FORBIDDEN_CHECK_IMPORTS = (
     "dexmani_real.deployment.lifecycle",
     "dexmani_real.robot.arm_worker",
     "dexmani_real.robot.hand_worker",
+    "dexmani_real.robot.xhand",
     "dexmani_real.sensor.camera_worker",
     "dexmani_real.sensor.pointcloud_worker",
     "pyrealsense2",
+    "xhand_controller",
 )
 
 
@@ -719,6 +721,7 @@ def _require_hardware_free_check_imports() -> None:
         if name in _FORBIDDEN_CHECK_IMPORTS
         or name == "xarm"
         or name.startswith("xarm.")
+        or name.startswith("xhand_controller.")
     )
     if loaded:
         raise RuntimeError(f"policy check imported hardware owner modules: {loaded}")
