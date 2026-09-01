@@ -48,7 +48,7 @@ _COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 @dataclass(frozen=True)
 class PreflightResult:
-    """Small JSON-safe receipt; it deliberately carries no model or tensor."""
+    """Small JSON-safe receipt; ``action_steps`` is the executable chunk length."""
 
     checkpoint_sha256: str
     checkpoint_sha256_verified: bool
@@ -171,7 +171,7 @@ def run_isolated_preflight(
         if (
             result.checkpoint_sha256
             != runtime_config.artifact.checkpoint_sha256_from_index
-            or result.action_steps != allocation.required_action_steps
+            or result.action_steps != allocation.n_action_steps
             or result.action_dim != allocation.action_dim
         ):
             raise RuntimeError("policy preflight child receipt mismatches its request")
@@ -406,6 +406,13 @@ def _run_preflight_child(runtime_config: PolicyRuntimeConfig) -> PreflightResult
         # Runtime construction already initialized the checkpoint-bound RNG
         # streams. Do not replace them here: preflight must exercise the same
         # first prediction stream as the operational inference worker.
+        contract_warmup = runtime.warmup(samples=1)
+        if (
+            len(contract_warmup) != 1
+            or not np.isfinite(contract_warmup[0])
+            or contract_warmup[0] < 0.0
+        ):
+            raise RuntimeError("policy preflight returned invalid warmup timing")
         observation = _synthetic_observation(runtime_config)
         with torch.inference_mode():
             prediction = runtime.predict(observation)
@@ -417,7 +424,7 @@ def _run_preflight_child(runtime_config: PolicyRuntimeConfig) -> PreflightResult
     return PreflightResult(
         checkpoint_sha256=actual_sha256,
         checkpoint_sha256_verified=True,
-        action_steps=artifact.allocation_contract.required_action_steps,
+        action_steps=artifact.allocation_contract.n_action_steps,
         action_dim=artifact.allocation_contract.action_dim,
         package_origin=provenance["origin"],
         package_commit=provenance["commit"],
@@ -659,7 +666,7 @@ def _validate_prediction(prediction: Any, runtime_config: PolicyRuntimeConfig) -
         raise ValueError(
             f"synthetic preflight artifact has unsupported action_key={action_key!r}"
         )
-    expected_steps = artifact.allocation_contract.required_action_steps
+    expected_steps = artifact.allocation_contract.n_action_steps
     if prediction.hand_qpos is None or prediction.hand_qpos.shape != (
         expected_steps,
         _HAND_DOF,

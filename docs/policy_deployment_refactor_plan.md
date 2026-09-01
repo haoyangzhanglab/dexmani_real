@@ -205,7 +205,7 @@ They close different race windows.
 
 # Phase R1 — Execute Policy `control_action`
 
-**Status**: BLOCKED on Policy handoff  
+**Status**: UNBLOCKED — Policy PR-4 handoff accepted; implementation on `codex/real-r1-control-action`
 **This is the first Real semantic change.**
 
 ## R1.1 Adapter contract
@@ -266,7 +266,7 @@ Compare with `control_action` exactly where deterministic dtype permits, otherwi
 
 Hot path does not need an extra exact equality synchronization every tick; shape/finite checks remain mandatory.
 
-## R1.3 Fix all 15→8 preflight contracts
+## R1.3 Fix prediction-future → executable preflight contracts
 
 Current preflight uses sidecar `required_action_steps` as returned action length. R1 must update all executable-length checks to `allocation.n_action_steps`:
 
@@ -304,12 +304,19 @@ then route arm through collision-aware IK.
 
 ## R1.5 Docs
 
-Canonical wording:
+Canonical wording is formula-first:
 
 ```text
-prediction future steps = horizon - (n_obs_steps - 1) = 15
-executable control steps = n_action_steps = 8
+required_action_steps
+= prediction future steps
+= horizon - (n_obs_steps - 1)
+
+executable control steps
+= n_action_steps
 ```
+
+For the representative DP3 artifact only, these values are 15 prediction-future
+steps and 8 executable steps.
 
 Old H4/task evidence was generated under old full-future semantics and cannot authorize R1.
 
@@ -318,7 +325,7 @@ Old H4/task evidence was generated under old full-future semantics and cannot au
 - sentinel tail values never enter Real plan/scheduler;
 - control shape is exactly `n_action_steps`;
 - full pred shape/finite still checked;
-- preflight receipt says 8, not 15;
+- preflight receipt says artifact `n_action_steps`, not `required_action_steps`;
 - R3D full/control dimension case;
 - DQ-RISE EE decode;
 - DP3 joint path unchanged except executable horizon.

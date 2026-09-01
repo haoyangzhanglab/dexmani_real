@@ -4,10 +4,11 @@
 唯一说明：从 artifact 到 robot command 的数据链、支持边界、物理执行门、验证记录，以及未来
 `dexmani_policy` 合并条件均以此为准。源码、schema 和运行时配置优先于本文。
 
-> 当前基线：DexMani Real `d8854f6c5de33eb0c5cec30fc0ec8cc1fcf768d7`，DP3 reference
-> artifact，`cuda:0`，task seed `1066`。H2/H3 shadow、一次 H4 和两次 331-endpoint task
-> transport rollout 已通过；最近一次 rollout 未完成真实抓取与放置。部署/传输链已验证，
-> 物理任务能力尚未验证。
+> R1 集成基线：Policy handoff 已在 Policy `main`
+> `aa4a0a39dd5a69e3a4ad85ea8190d6889610d175` 接受；handoff receipt 中的 representative
+> artifact producer 仍是 `fc6b7dfb45748f4187f2e82b5425721ed02b028e`。下文 H2/H3、H4
+> 和 task rollout 是 full-future executable semantics 下产生的 pre-R1 历史证据，不能授权
+> R1 后的物理执行。物理任务能力仍未验证。
 
 ## 1. 状态、范围与所有权
 
@@ -42,7 +43,7 @@ policy 唯一的 robot-command producer。
 | Policy producer commit | `7e31d10e7a31ff3d12df31b8683c9c90b357cbc5` |
 | action | 19-D absolute joint target：arm 7 + hand 12 |
 | observation | 2 steps of arm/hand state and `1024 × 6` xyzrgb point cloud |
-| control | `16 Hz`、horizon 16、`n_action_steps=8`、15 actionable future steps |
+| control | `16 Hz`、horizon 16；15-step prediction future、8-step executable control |
 
 当前 artifact 的 sidecar 是 schema v1，因而 v1 parser 不是可删除的历史兼容分支。schema v2
 承载 `control_action_dim`、auxiliary action layout 和 RGB payload；它是 RGB/R3D 未来 artifact 的
@@ -108,10 +109,12 @@ inference child 对同一个 held file descriptor 执行：
 核心模型推理默认在 `cuda:0`：CUDA 不可用或 index 不存在会启动失败，绝不静默回退 CPU；只有
 显式 `--device cpu` 才使用 CPU。loader/identity/hash、NumPy history assembly、timing、IPC 和 robot
 workers 留在 CPU；`agent.to(device)` 之后，normalization、encoder、diffusion/flow decoder 和 action
-unnormalization 都在所选 GPU。`pred_action.detach().cpu().numpy()` 是回到 CPU 的唯一动作数据边界。
+unnormalization 都在所选 GPU。validated `control_action.detach().cpu().numpy()` 是回到 CPU 的唯一
+动作数据边界。
 
-启动时执行 5 次 synthetic warmup，最后 3 次必须落在 artifact 可用未来窗口内；随后恢复随机状态，
-不消耗 rollout 的第一组 diffusion sample。
+启动时执行 5 次 synthetic warmup，最后 3 次必须落在 artifact 的 `n_action_steps` executable
+window 内；warmup 同时精确验证 Policy 声明的 canonical control slice。随后恢复随机状态，
+不消耗 rollout 的第一组 diffusion sample。isolated preflight 也执行一次同样的 contract warmup。
 
 ARMED 只维护 worker readiness。B 使状态进入 RUNNING 后，worker 才从 current generation 的
 shared-memory history 构建 observation：
@@ -133,22 +136,41 @@ checkpoint 恢复的 agent 自己处理归一化与反归一化：
 
 ```text
 x_normalized = x_physical * scale + offset
-pred_action  = agent.predict_action(obs_dict)["pred_action"]
+result       = agent.predict_action(obs_dict)
+pred_action  = result["pred_action"]
+control_action = result["control_action"]
 x_physical   = (x_normalized - offset) / scale
 ```
 
 因此 Real 接收到的 `pred_action` 已处于物理动作空间，不应再次按 `[-1,1]` clip 或重拟合
-normalizer。adapter 从完整 horizon 而非短 control chunk 取未来区间：
+normalizer。temporal dimensions 全部来自 artifact：
 
-```python
-start = n_obs_steps - 1
-future = pred_action[:, start:horizon, :control_action_dim]
+```text
+control_start = n_obs_steps - 1
+prediction_future_steps = horizon - (n_obs_steps - 1)
+executable_control_steps = n_action_steps
 ```
 
-当前 DP3 生成 `[1,16,19]`，输出 `future=[15,19]`，再拆成 absolute `arm_qpos [15,7]` 和
-`hand_qpos [15,12]`。EE action 必须是 finite、非退化的 21-D `ee_pos + ee_rot6d + hand_qpos`，
-由 coordinator 做 IK；joint action 不经过 IK。`joint19_ee9` 必须先验证完整 28-D 输出，再只把
-joint 19-D control prefix 交给控制边界。
+adapter 要求完整 `pred_action` 与 executable `control_action` 同时存在。完整 prediction 必须精确满足
+`[1,horizon,action_dim]` 且所有维度 finite；control 必须精确满足
+`[1,n_action_steps,control_action_dim]` 且 finite。startup qualification 精确验证：
+
+```python
+expected_control = pred_action[
+    :, control_start:control_start + n_action_steps, :control_action_dim
+]
+```
+
+正常 inference tick 不重复做 exact-slice synchronization；它仍逐次检查两者的 shape/finite。
+Real 只从 `result["control_action"]` 构造 `PolicyPrediction`，不从 `pred_action` 重建 control，
+也不要求或读取 `tail`。representative DP3 的 prediction future 是 15 steps，但 executable control
+是 8 steps，解码为 `arm_qpos [8,7]` 与 `hand_qpos [8,12]`。
+
+R3D `joint19_ee9` 的完整 `pred_action` 是 28-D，28 个维度均做 shape/finite validation；唯一
+executable source 是 19-D `control_action`。EE action 的完整 prediction 同样做 shape/finite validation，
+但 rot6d geometry 只对 executable 21-D control 检查：finite 但退化的未执行 prediction tail 不阻止
+合法 control，退化的 executable control 必须拒绝。EE control 由 coordinator 做 IK；joint control
+不经过 IK。
 
 ### 3.5 Plan、SafetyGate 与 worker ACK
 
@@ -171,7 +193,8 @@ learned target 在接触下已物理到达。该流程没有放宽 limits、coll
 
 直接接入的模型必须同时具备：hash-bound deployment artifact、Real Policy Zarr v5 data contract、
 explicit modality metadata、19-D joint state、checkpoint-owned normalizer、完整 `[B,horizon,action_dim]`
-的 `pred_action`、兼容的 action layout、`dexmani_policy.agents.*` target 和适配可用窗口的 warmup
+的 `pred_action`、精确 `[B,n_action_steps,control_action_dim]` 的 `control_action`、兼容的 action
+layout、`dexmani_policy.agents.*` target 和适配 executable window 的 warmup
 latency。满足 API 不等于已获物理部署资格；每个新 artifact 都要独立完成 strict restore、CUDA
 preflight、H2/H3 shadow 和相应物理授权。
 
@@ -180,7 +203,7 @@ preflight、H2/H3 shadow 和相应物理授权。
 | DP3 | 已验证 reference | task 成功仍未验证。 |
 | DQ-RISE、ActionFlow、ManiFlow、SAT | 结构上兼容 | 专用 artifact、strict restore、latency 与 shadow。 |
 | R3D without auxiliary EE | schema v2 可接入 | 正确的 point-cloud/RGB contract、provenance、latency。 |
-| R3D with auxiliary EE | schema v2 `joint19_ee9` 可接入 | 28-D full-output validation；只有 19-D control prefix 进入控制。 |
+| R3D with auxiliary EE | schema v2 `joint19_ee9` 可接入 | 28-D full-output validation；只有 Policy 返回的 19-D `control_action` 进入控制。 |
 | DP / MoE DP with RGB | Real input boundary 已支持 | schema v2 RGB payload、image processor、strict restore 与 shadow。 |
 | MultiTask DiT | 不支持 | 显式且经训练数据验证的 task/text conditioning contract。 |
 
@@ -246,7 +269,11 @@ DEXMANI_RECEIPT_DIR=/home/zhanghaoyang/.dexmani/receipts \
 任何 operational invocation 都连接硬件；本文、历史 receipt、`--print-config` 或 preflight
 都不是硬件授权。
 
-## 6. 当前验证记录
+## 6. Pre-R1 历史验证记录
+
+本节所有 H2/H3、H4 和 task evidence 均产生于 Real 把完整 prediction future 当作 executable 的旧
+语义。它们只保留为历史 transport evidence，不授权 `control_action` R1 语义下的 physical shadow、
+H4 或 task；R1 后如需物理运行必须重新独立 review。
 
 | 级别 | 实际结果 | 可复核证据 |
 |---|---|---|

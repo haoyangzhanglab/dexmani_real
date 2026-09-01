@@ -52,7 +52,10 @@ from dexmani_real.deployment.preflight import (
     _validate_prediction,
     run_isolated_preflight,
 )
-from dexmani_real.deployment.run_identity import RealSourceIdentity
+from dexmani_real.deployment.run_identity import (
+    RealSourceIdentity,
+    canonical_run_receipt_json,
+)
 from dexmani_real.deployment.worker import (
     _load_inference_runtime,
     inference_loop,
@@ -70,7 +73,14 @@ from dexmani_real.runtime.safety import SafetyState, StopRequest
 from dexmani_real.teleop.keyboard import ControlSignal
 
 
-def _sidecar(checkpoint: Path, *, checkpoint_sha256: str) -> dict[str, object]:
+def _sidecar(
+    checkpoint: Path,
+    *,
+    checkpoint_sha256: str,
+    horizon: int = 16,
+    n_obs_steps: int = 2,
+    n_action_steps: int = 8,
+) -> dict[str, object]:
     return {
         "schema_version": 1,
         "checkpoint": {
@@ -83,10 +93,10 @@ def _sidecar(checkpoint: Path, *, checkpoint_sha256: str) -> dict[str, object]:
             "task_name": "pick_place_toy",
             "action_key": "action",
             "action_dim": 19,
-            "n_obs_steps": 2,
-            "n_action_steps": 8,
-            "horizon": 16,
-            "required_action_steps": 15,
+            "n_obs_steps": n_obs_steps,
+            "n_action_steps": n_action_steps,
+            "horizon": horizon,
+            "required_action_steps": horizon - (n_obs_steps - 1),
             "control_dt_s": 0.0625,
             "sensor_modalities": ["joint_state", "point_cloud"],
             "observation_fields": ["arm_qpos", "hand_qpos", "point_cloud"],
@@ -102,7 +112,14 @@ def _sidecar(checkpoint: Path, *, checkpoint_sha256: str) -> dict[str, object]:
     }
 
 
-def _write_experiment(root: Path, *, matching_hash: bool = False) -> Path:
+def _write_experiment(
+    root: Path,
+    *,
+    matching_hash: bool = False,
+    horizon: int = 16,
+    n_obs_steps: int = 2,
+    n_action_steps: int = 8,
+) -> Path:
     root.mkdir()
     (root / "config.yaml").write_text("name: synthetic\n", encoding="utf-8")
     checkpoints = root / "checkpoints"
@@ -111,7 +128,11 @@ def _write_experiment(root: Path, *, matching_hash: bool = False) -> Path:
     checkpoint.write_bytes(b"not-a-torch-checkpoint")
     digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     sidecar = _sidecar(
-        checkpoint, checkpoint_sha256=digest if matching_hash else "a" * 64
+        checkpoint,
+        checkpoint_sha256=digest if matching_hash else "a" * 64,
+        horizon=horizon,
+        n_obs_steps=n_obs_steps,
+        n_action_steps=n_action_steps,
     )
     sidecar_path = checkpoint.with_name(f"{checkpoint.name}.deployment.json")
     sidecar_path.write_text(
@@ -237,13 +258,44 @@ class DeploymentPreflightTest(unittest.TestCase):
         shared.set_ready.assert_not_called()
         runtime.close.assert_called_once_with()
 
+    def test_warmup_latency_uses_executable_n_action_steps_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = _write_experiment(Path(directory) / "experiment", matching_hash=True)
+            config = self._projection(root).runtime
+            runtime = SimpleNamespace(
+                warmup=Mock(return_value=(0.1, 0.1, 0.5, 0.5, 0.5)),
+                close=Mock(),
+            )
+            shared = SimpleNamespace(
+                is_running=SimpleNamespace(value=0),
+                action_control_hz=16.0,
+                set_heartbeat=Mock(),
+                set_ready=Mock(),
+            )
+            with patch(
+                "dexmani_real.deployment.preflight.load_verified_policy_runtime",
+                return_value=runtime,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "viable action window"):
+                    inference_loop(shared, config)
+
+        # 0.5 s fits the old 15-step allocation window but exceeds the
+        # artifact's 8-step executable window.
+        shared.set_ready.assert_not_called()
+        runtime.close.assert_called_once_with()
+
     def test_preflight_does_not_replace_checkpoint_bound_rng_streams(self):
         prediction = object()
-        runtime = SimpleNamespace(predict=Mock(return_value=prediction), close=Mock())
+        runtime = SimpleNamespace(
+            warmup=Mock(return_value=(0.0,)),
+            predict=Mock(return_value=prediction),
+            close=Mock(),
+        )
         runtime_config = SimpleNamespace(
             artifact=SimpleNamespace(
                 allocation_contract=SimpleNamespace(
                     required_action_steps=15,
+                    n_action_steps=8,
                     action_dim=19,
                 )
             ),
@@ -268,17 +320,20 @@ class DeploymentPreflightTest(unittest.TestCase):
                 return_value=object(),
             ),
             patch.object(preflight_module, "_validate_prediction") as validate,
+            patch.object(random, "seed") as python_seed,
             patch.object(torch, "manual_seed") as manual_seed,
             patch.object(np.random, "seed") as numpy_seed,
         ):
             result = _run_preflight_child(runtime_config)
 
+        python_seed.assert_not_called()
         manual_seed.assert_not_called()
         numpy_seed.assert_not_called()
+        runtime.warmup.assert_called_once_with(samples=1)
         runtime.predict.assert_called_once()
         validate.assert_called_once_with(prediction, runtime_config)
         runtime.close.assert_called_once_with()
-        self.assertEqual(result.action_steps, 15)
+        self.assertEqual(result.action_steps, 8)
         self.assertEqual(result.package_commit, "c" * 40)
 
     def test_physical_receipt_provenance_is_structured_and_complete(self):
@@ -1021,7 +1076,7 @@ class DeploymentPreflightTest(unittest.TestCase):
         receipt = PreflightResult(
             checkpoint_sha256="a" * 64,
             checkpoint_sha256_verified=True,
-            action_steps=15,
+            action_steps=8,
             action_dim=19,
             package_origin="/opt/dexmani_policy/__init__.py",
             package_commit="c" * 40,
@@ -1030,6 +1085,58 @@ class DeploymentPreflightTest(unittest.TestCase):
             package_version="0.1.0",
         )
         self.assertEqual(PreflightResult.from_wire(receipt.to_wire()), receipt)
+
+    def test_parent_rejects_prediction_future_length_as_executable_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = _write_experiment(Path(directory) / "experiment")
+            runtime_config = self._projection(root).runtime
+            receipt = PreflightResult(
+                checkpoint_sha256="a" * 64,
+                checkpoint_sha256_verified=True,
+                action_steps=15,
+                action_dim=19,
+                package_origin="/opt/dexmani_policy/__init__.py",
+                package_commit="c" * 40,
+                package_dirty="false",
+                package_source_tree_sha256="d" * 64,
+                package_version="0.1.0",
+            )
+            payload = _encode_child_message(
+                {"ok": True, "receipt": receipt.to_wire(), "error": None}
+            )
+
+            class _Connection:
+                def poll(self, _timeout_s: float) -> bool:
+                    return True
+
+                def recv_bytes(self, _max_bytes: int) -> bytes:
+                    return payload
+
+                def close(self) -> None:
+                    pass
+
+            class _Process:
+                exitcode = 0
+
+                def start(self) -> None:
+                    pass
+
+                def join(self, timeout: float) -> None:
+                    assert timeout > 0.0
+
+                def is_alive(self) -> bool:
+                    return False
+
+                def close(self) -> None:
+                    pass
+
+            context = SimpleNamespace(
+                Pipe=lambda duplex: (_Connection(), _Connection()),
+                Process=lambda **_kwargs: _Process(),
+            )
+            with patch.object(preflight_module.mp, "get_context", return_value=context):
+                with self.assertRaisesRegex(RuntimeError, "receipt mismatches"):
+                    run_isolated_preflight(runtime_config)
 
     def test_process_cleanup_kills_a_stubborn_child_before_closing(self):
         class _Process:
@@ -1069,7 +1176,7 @@ class DeploymentPreflightTest(unittest.TestCase):
             joint_runtime = self._projection(root).runtime
             with self.assertRaisesRegex(TypeError, "PolicyPrediction"):
                 _validate_prediction(object(), joint_runtime)
-            steps = joint_runtime.artifact.allocation_contract.required_action_steps
+            steps = joint_runtime.artifact.allocation_contract.n_action_steps
             joint = PolicyPrediction(
                 arm_qpos=np.zeros((steps, 7)),
                 hand_qpos=np.zeros((steps, 12)),
@@ -1106,7 +1213,7 @@ class DeploymentPreflightTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "geometry"):
                 _validate_prediction(invalid_ee, ee_runtime)
 
-    def test_adapter_uses_complete_future_pred_action_interval(self):
+    def test_adapter_executes_only_control_action_and_ignores_prediction_tail(self):
         with tempfile.TemporaryDirectory() as directory:
             root = _write_experiment(Path(directory) / "experiment")
             runtime_config = resolve_policy_runtime_config(
@@ -1131,22 +1238,17 @@ class DeploymentPreflightTest(unittest.TestCase):
             pred_action = torch.arange(
                 allocation.horizon * allocation.action_dim, dtype=torch.float32
             ).reshape(1, allocation.horizon, allocation.action_dim)
+            start = allocation.n_obs_steps - 1
             control_action = pred_action[
                 :,
-                allocation.n_obs_steps
-                - 1 : allocation.n_obs_steps
-                - 1
-                + allocation.n_action_steps,
+                start : start + allocation.n_action_steps,
                 :19,
-            ]
-            tail = pred_action[
-                :, allocation.n_obs_steps - 1 + allocation.n_action_steps :, :19
-            ]
+            ].clone()
+            pred_action[:, start + allocation.n_action_steps :, :] += 10_000.0
             runtime._agent = SimpleNamespace(
                 predict_action=lambda *_args, **_kwargs: {
                     "pred_action": pred_action,
                     "control_action": control_action,
-                    "tail": tail,
                 }
             )
 
@@ -1155,15 +1257,9 @@ class DeploymentPreflightTest(unittest.TestCase):
                 preflight_module._synthetic_observation(runtime_config)
             )
 
-            expected = pred_action[
-                :, allocation.n_obs_steps - 1 : allocation.horizon, :19
-            ].numpy()[0]
-            expected_from_policy_outputs = torch.cat(
-                (control_action, tail), dim=1
-            ).numpy()[0]
-            np.testing.assert_array_equal(expected, expected_from_policy_outputs)
-            self.assertEqual(prediction.arm_qpos.shape, (15, 7))
-            self.assertEqual(prediction.hand_qpos.shape, (15, 12))
+            expected = control_action.numpy()[0]
+            self.assertEqual(prediction.arm_qpos.shape, (8, 7))
+            self.assertEqual(prediction.hand_qpos.shape, (8, 12))
             np.testing.assert_array_equal(
                 prediction.arm_qpos, expected[:, :7].astype(np.float64)
             )
@@ -1171,14 +1267,13 @@ class DeploymentPreflightTest(unittest.TestCase):
                 prediction.hand_qpos, expected[:, 7:].astype(np.float64)
             )
             np.testing.assert_array_equal(
-                prediction.arm_qpos[0], pred_action.numpy()[0, 1, :7]
+                prediction.arm_qpos[0], pred_action.numpy()[0, start, :7]
             )
             np.testing.assert_array_equal(
-                prediction.arm_qpos[-1], pred_action.numpy()[0, 15, :7]
+                prediction.arm_qpos[-1],
+                pred_action.numpy()[0, start + allocation.n_action_steps - 1, :7],
             )
-            self.assertFalse(
-                np.array_equal(prediction.arm_qpos[0], pred_action.numpy()[0, 0, :7])
-            )
+            self.assertLess(float(np.max(prediction.arm_qpos)), 10_000.0)
 
             logical_step_ns = 1_000_000_000
             step_dt_ns = 62_500_000
@@ -1190,19 +1285,193 @@ class DeploymentPreflightTest(unittest.TestCase):
                 command_lead_ns=0,
             )
             assert chunk is not None
-            np.testing.assert_array_equal(chunk.arm_qpos[:8], expected[:8, :7])
-            np.testing.assert_array_equal(chunk.arm_qpos[8:], expected[8:, :7])
+            np.testing.assert_array_equal(chunk.arm_qpos, expected[:, :7])
             np.testing.assert_array_equal(
                 chunk.target_monotonic_ns,
                 logical_step_ns
-                + np.arange(allocation.required_action_steps, dtype=np.uint64)
-                * step_dt_ns,
+                + np.arange(allocation.n_action_steps, dtype=np.uint64) * step_dt_ns,
             )
 
             invalid_pred_action = pred_action.clone()
             invalid_pred_action[:, -1, 0] = float("nan")
             with self.assertRaisesRegex(ValueError, "NaN/Inf"):
-                runtime._decode(invalid_pred_action)
+                runtime._validate_policy_outputs(
+                    {
+                        "pred_action": invalid_pred_action,
+                        "control_action": control_action,
+                    },
+                    verify_control_slice=False,
+                )
+
+    def test_adapter_requires_exact_finite_control_action_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = _write_experiment(Path(directory) / "experiment")
+            runtime_config = self._projection(root).runtime
+            allocation = runtime_config.artifact.allocation_contract
+            runtime = DexManiPolicyRuntime(runtime_config)
+            runtime._manifest = DeploymentManifest(
+                action_key="action",
+                n_obs_steps=allocation.n_obs_steps,
+                n_action_steps=allocation.n_action_steps,
+                action_dim=allocation.action_dim,
+                horizon=allocation.horizon,
+                control_action_dim=allocation.control_action_dim,
+                sensor_modalities=allocation.sensor_modalities,
+                point_cloud_num_points=allocation.point_cloud_num_points,
+                point_cloud_feature_dim=allocation.point_cloud_feature_dim,
+            )
+            pred_action = torch.zeros(
+                (1, allocation.horizon, allocation.action_dim), dtype=torch.float32
+            )
+            control_action = torch.zeros(
+                (1, allocation.n_action_steps, allocation.control_action_dim),
+                dtype=torch.float32,
+            )
+            valid = {
+                "pred_action": pred_action,
+                "control_action": control_action,
+            }
+            runtime._validate_policy_outputs(valid, verify_control_slice=True)
+
+            with self.assertRaisesRegex(ValueError, "missing 'pred_action'"):
+                runtime._validate_policy_outputs(
+                    {"control_action": control_action}, verify_control_slice=False
+                )
+            with self.assertRaisesRegex(ValueError, "missing 'control_action'"):
+                runtime._validate_policy_outputs(
+                    {"pred_action": pred_action}, verify_control_slice=False
+                )
+            with self.assertRaisesRegex(ValueError, "pred_action must have shape"):
+                runtime._validate_policy_outputs(
+                    {
+                        "pred_action": pred_action[:, :-1, :],
+                        "control_action": control_action,
+                    },
+                    verify_control_slice=False,
+                )
+            for invalid in (
+                torch.zeros(
+                    (
+                        1,
+                        allocation.n_action_steps + 1,
+                        allocation.control_action_dim,
+                    )
+                ),
+                torch.zeros((1, allocation.n_action_steps, 18)),
+            ):
+                with self.subTest(shape=tuple(invalid.shape)):
+                    with self.assertRaisesRegex(ValueError, "must have shape"):
+                        runtime._validate_policy_outputs(
+                            {"pred_action": pred_action, "control_action": invalid},
+                            verify_control_slice=False,
+                        )
+            for nonfinite in (float("nan"), float("inf")):
+                invalid = control_action.clone()
+                invalid[0, 0, 0] = nonfinite
+                with self.subTest(nonfinite=nonfinite):
+                    with self.assertRaisesRegex(ValueError, "NaN/Inf"):
+                        runtime._validate_policy_outputs(
+                            {"pred_action": pred_action, "control_action": invalid},
+                            verify_control_slice=False,
+                        )
+
+    def test_nondefault_h11_o3_a4_temporal_contract_is_artifact_driven(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = _write_experiment(
+                Path(directory) / "experiment",
+                horizon=11,
+                n_obs_steps=3,
+                n_action_steps=4,
+            )
+            projection = self._projection(root)
+            runtime_config = projection.runtime
+            allocation = runtime_config.artifact.allocation_contract
+            self.assertEqual(
+                (
+                    allocation.horizon,
+                    allocation.n_obs_steps,
+                    allocation.n_action_steps,
+                    allocation.required_action_steps,
+                    runtime_config.deployment.observation_horizon,
+                ),
+                (11, 3, 4, 9, 3),
+            )
+
+            runtime = DexManiPolicyRuntime(runtime_config)
+            runtime._manifest = DeploymentManifest(
+                action_key="action",
+                n_obs_steps=allocation.n_obs_steps,
+                n_action_steps=allocation.n_action_steps,
+                action_dim=allocation.action_dim,
+                horizon=allocation.horizon,
+                control_action_dim=allocation.control_action_dim,
+                sensor_modalities=allocation.sensor_modalities,
+                point_cloud_num_points=allocation.point_cloud_num_points,
+                point_cloud_feature_dim=allocation.point_cloud_feature_dim,
+            )
+            pred_action = torch.arange(
+                allocation.horizon * allocation.action_dim, dtype=torch.float32
+            ).reshape(1, allocation.horizon, allocation.action_dim)
+            start = allocation.n_obs_steps - 1
+            control_action = pred_action[
+                :,
+                start : start + allocation.n_action_steps,
+                : allocation.control_action_dim,
+            ].clone()
+            runtime._agent = SimpleNamespace(
+                predict_action=lambda *_args, **_kwargs: {
+                    "pred_action": pred_action,
+                    "control_action": control_action,
+                }
+            )
+
+            observation = preflight_module._synthetic_observation(runtime_config)
+            prediction = runtime.predict(observation)
+            self.assertEqual(prediction.arm_qpos.shape, (4, 7))
+            self.assertEqual(prediction.hand_qpos.shape, (4, 12))
+            chunk = stamp_prediction_timing(
+                prediction,
+                logical_step_ns=1_000_000_000,
+                step_dt_ns=62_500_000,
+                inference_finished_ns=999_999_999,
+                command_lead_ns=0,
+            )
+            assert chunk is not None
+            self.assertEqual(chunk.target_monotonic_ns.shape, (4,))
+
+            provenance = {
+                "origin": "/policy/__init__.py",
+                "commit": "c" * 40,
+                "dirty": "false",
+                "source_tree_sha256": "d" * 64,
+                "version": "0.1.0",
+            }
+            with patch.object(
+                preflight_module,
+                "_load_verified_policy_runtime",
+                return_value=(runtime, "a" * 64, provenance),
+            ):
+                preflight_result = _run_preflight_child(runtime_config)
+            self.assertEqual(preflight_result.action_steps, 4)
+
+            receipt = json.loads(
+                canonical_run_receipt_json(
+                    artifact=runtime_config.artifact,
+                    projection=projection,
+                    runtime_sha256=resolve_runtime_config().sha256,
+                    real_source=RealSourceIdentity(
+                        availability="available",
+                        commit="e" * 40,
+                        dirty="false",
+                        python_tree_sha256="f" * 64,
+                    ),
+                    preflight_result=preflight_result,
+                )
+            )
+            self.assertEqual(
+                receipt["artifact"]["allocation"]["required_action_steps"], 9
+            )
+            self.assertEqual(receipt["preflight"]["action_steps"], 4)
 
     def test_adapter_warmup_restores_python_numpy_and_torch_rng(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1231,7 +1500,15 @@ class DeploymentPreflightTest(unittest.TestCase):
                     "pred_action": torch.zeros(
                         (1, allocation.horizon, allocation.action_dim),
                         dtype=torch.float32,
-                    )
+                    ),
+                    "control_action": torch.zeros(
+                        (
+                            1,
+                            allocation.n_action_steps,
+                            allocation.control_action_dim,
+                        ),
+                        dtype=torch.float32,
+                    ),
                 }
 
             runtime._agent = SimpleNamespace(predict_action=predict_action)
@@ -1251,6 +1528,40 @@ class DeploymentPreflightTest(unittest.TestCase):
             np.testing.assert_array_equal(restored_numpy_state[1], numpy_state[1])
             self.assertEqual(restored_numpy_state[2:], numpy_state[2:])
             torch.testing.assert_close(torch.random.get_rng_state(), torch_state)
+
+    def test_adapter_warmup_rejects_noncanonical_control_slice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = _write_experiment(Path(directory) / "experiment")
+            runtime_config = self._projection(root).runtime
+            allocation = runtime_config.artifact.allocation_contract
+            runtime = DexManiPolicyRuntime(runtime_config)
+            runtime._manifest = DeploymentManifest(
+                action_key="action",
+                n_obs_steps=allocation.n_obs_steps,
+                n_action_steps=allocation.n_action_steps,
+                action_dim=allocation.action_dim,
+                horizon=allocation.horizon,
+                control_action_dim=allocation.control_action_dim,
+                sensor_modalities=allocation.sensor_modalities,
+                point_cloud_num_points=allocation.point_cloud_num_points,
+                point_cloud_feature_dim=allocation.point_cloud_feature_dim,
+            )
+            pred_action = torch.zeros(
+                (1, allocation.horizon, allocation.action_dim), dtype=torch.float32
+            )
+            control_action = torch.ones(
+                (1, allocation.n_action_steps, allocation.control_action_dim),
+                dtype=torch.float32,
+            )
+            runtime._agent = SimpleNamespace(
+                predict_action=lambda *_args, **_kwargs: {
+                    "pred_action": pred_action,
+                    "control_action": control_action,
+                }
+            )
+
+            with self.assertRaisesRegex(ValueError, "canonical pred_action slice"):
+                runtime.warmup(samples=1)
 
     def test_adapter_discards_r3d_auxiliary_ee_tail_after_full_shape_validation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1291,12 +1602,37 @@ class DeploymentPreflightTest(unittest.TestCase):
             pred_action = torch.arange(
                 allocation.horizon * allocation.action_dim, dtype=torch.float32
             ).reshape(1, allocation.horizon, allocation.action_dim)
+            start = allocation.n_obs_steps - 1
+            control_action = pred_action[
+                :,
+                start : start + allocation.n_action_steps,
+                : allocation.control_action_dim,
+            ].clone()
 
-            prediction = runtime._decode(pred_action)
+            _pred, validated_control = runtime._validate_policy_outputs(
+                {
+                    "pred_action": pred_action,
+                    "control_action": control_action,
+                },
+                verify_control_slice=True,
+            )
+            prediction = runtime._decode_control_action(validated_control)
 
-            expected = pred_action[:, 1:16, :19].numpy()[0]
+            expected = control_action.numpy()[0]
             np.testing.assert_array_equal(prediction.arm_qpos, expected[:, :7])
             np.testing.assert_array_equal(prediction.hand_qpos, expected[:, 7:])
+            self.assertEqual(prediction.arm_qpos.shape[0], allocation.n_action_steps)
+
+            invalid_auxiliary = pred_action.clone()
+            invalid_auxiliary[0, -1, -1] = float("nan")
+            with self.assertRaisesRegex(ValueError, "pred_action contains NaN/Inf"):
+                runtime._validate_policy_outputs(
+                    {
+                        "pred_action": invalid_auxiliary,
+                        "control_action": control_action,
+                    },
+                    verify_control_slice=False,
+                )
 
     def test_adapter_encodes_causal_rgb_history_in_model_layout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1358,7 +1694,7 @@ class DeploymentPreflightTest(unittest.TestCase):
             self.assertEqual(encoded["rgb"].dtype, torch.float32)
             self.assertEqual(float(encoded["rgb"].max()), 0.0)
 
-    def test_adapter_decodes_complete_ee_future_and_rejects_degenerate_tail(self):
+    def test_adapter_validates_only_executable_ee_control_geometry(self):
         with tempfile.TemporaryDirectory() as directory:
             root = _write_experiment(Path(directory) / "experiment")
             sidecar_path = next((root / "checkpoints").glob("*.deployment.json"))
@@ -1392,22 +1728,33 @@ class DeploymentPreflightTest(unittest.TestCase):
             pred_action[:, :, 3:9] = torch.tensor(
                 (1.0, 0.0, 0.0, 0.0, 1.0, 0.0), dtype=torch.float32
             )
+            start = allocation.n_obs_steps - 1
+            control_action = pred_action[
+                :,
+                start : start + allocation.n_action_steps,
+                : allocation.control_action_dim,
+            ].clone()
+            pred_action[:, start + allocation.n_action_steps :, 3:9] = 0.0
 
-            prediction = runtime._decode(pred_action)
+            _pred, validated_control = runtime._validate_policy_outputs(
+                {
+                    "pred_action": pred_action,
+                    "control_action": control_action,
+                },
+                verify_control_slice=True,
+            )
+            prediction = runtime._decode_control_action(validated_control)
 
-            expected = pred_action[:, 1:16, :21].numpy()[0]
+            expected = control_action.numpy()[0]
             np.testing.assert_array_equal(prediction.ee_pos, expected[:, :3])
             np.testing.assert_array_equal(prediction.ee_rot6d, expected[:, 3:9])
             np.testing.assert_array_equal(prediction.hand_qpos, expected[:, 9:21])
-            np.testing.assert_array_equal(prediction.ee_pos[0], pred_action[0, 1, :3])
-            np.testing.assert_array_equal(
-                prediction.hand_qpos[-1], pred_action[0, 15, 9:21]
-            )
+            self.assertEqual(prediction.ee_pos.shape[0], allocation.n_action_steps)
 
-            invalid_tail = pred_action.clone()
-            invalid_tail[:, 15, 3:9] = 0.0
+            invalid_control = control_action.clone()
+            invalid_control[:, -1, 3:9] = 0.0
             with self.assertRaisesRegex(ValueError, "zero or near-collinear"):
-                runtime._decode(invalid_tail)
+                runtime._decode_control_action(invalid_control)
 
     def test_print_config_isolated_from_policy_torch_and_hardware_modules(self):
         with tempfile.TemporaryDirectory() as directory:

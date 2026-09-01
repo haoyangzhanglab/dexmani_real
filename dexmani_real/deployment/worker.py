@@ -956,7 +956,7 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
                 raise RuntimeError("policy runtime returned invalid warmup timing")
             allocation = config.artifact.allocation_contract
             max_viable_s = (
-                allocation.required_action_steps - 2
+                allocation.n_action_steps - 2
             ) * allocation.control_dt_s - config.deployment.command_lead_s
             if max_viable_s <= 0.0:
                 raise RuntimeError(

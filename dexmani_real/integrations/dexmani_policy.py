@@ -10,11 +10,11 @@ checkpoint restore, so the parent process never imports the model repository or
 initializes CUDA.
 
 The real ``dexmani_policy`` inference API is ``agent.predict_action(obs_dict)``
-returning a full ``pred_action`` horizon.  This adapter selects the complete
-future interval after the observation window in native 19-DoF joint (arm7 +
-hand12) or 21-DoF EE (pos3 + rot6d + hand12) space.  Joint action is decoded
-directly; an EE prediction carries ``ee_pos``/``ee_rot6d`` that the coordinator
-later resolves to joint space via collision-aware IK.
+returning a full ``pred_action`` horizon plus the executable ``control_action``.
+This adapter validates both outputs and decodes only ``control_action`` in native
+19-DoF joint (arm7 + hand12) or 21-DoF EE (pos3 + rot6d + hand12) space. Joint
+action is decoded directly; an EE prediction carries ``ee_pos``/``ee_rot6d``
+that the coordinator later resolves to joint space via collision-aware IK.
 """
 
 from __future__ import annotations
@@ -832,11 +832,11 @@ class DexManiPolicyRuntime:
                         obs_dict,
                         denoise_timesteps=self._denoise_steps,
                     )
-                    if not isinstance(result, Mapping) or "pred_action" not in result:
-                        raise ValueError(
-                            "DexMani agent warmup must return 'pred_action'"
-                        )
-                    self._decode(result["pred_action"])
+                    _pred_action, control_action = self._validate_policy_outputs(
+                        result,
+                        verify_control_slice=True,
+                    )
+                    self._decode_control_action(control_action)
                     timings_s.append((time.perf_counter_ns() - started_ns) / 1e9)
         finally:
             random.setstate(python_rng_state)
@@ -918,50 +918,77 @@ class DexManiPolicyRuntime:
             )
         return encoded
 
-    def _decode(self, pred_action: torch.Tensor) -> PolicyPrediction:
-        """Decode the full native prediction into an untimed future interval.
-
-        Joint (``action``): ``[N,19]`` = arm7 + hand12.  EE (``action_ee``):
-        ``[N,21]`` = pos3 + rot6d6 + hand12.  ``N`` is the artifact-authorized
-        complete future window, never the model's shorter scheduler chunk.
-        """
+    def _validate_policy_outputs(
+        self,
+        result: Mapping[str, Any],
+        *,
+        verify_control_slice: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Validate full model output and the artifact-sized executable chunk."""
         if self._manifest is None:
             raise RuntimeError("deployment manifest is unavailable")
-        if (
-            not isinstance(self.config, PolicyRuntimeConfig)
-            or self.config.artifact is None
-        ):
-            raise RuntimeError("deployment artifact is unavailable")
+        if not isinstance(result, Mapping):
+            raise ValueError("DexMani agent must return a mapping")
+        if "pred_action" not in result:
+            raise ValueError("DexMani agent result is missing 'pred_action'")
+        if "control_action" not in result:
+            raise ValueError("DexMani agent result is missing 'control_action'")
+
+        pred_action = result["pred_action"]
         if not isinstance(pred_action, torch.Tensor):
             raise ValueError("pred_action must be a torch.Tensor")
-        expected_shape = (
+        expected_pred_shape = (
             1,
             self._manifest.horizon,
             self._manifest.action_dim,
         )
-        if tuple(pred_action.shape) != expected_shape:
+        if tuple(pred_action.shape) != expected_pred_shape:
             raise ValueError(
-                f"pred_action must have shape {expected_shape}, got "
+                f"pred_action must have shape {expected_pred_shape}, got "
                 f"{tuple(pred_action.shape)}"
             )
         if not bool(torch.isfinite(pred_action).all()):
             raise ValueError("pred_action contains NaN/Inf")
-        start = self._manifest.n_obs_steps - 1
-        required_steps = self.config.artifact.allocation_contract.required_action_steps
-        if self._manifest.horizon - start != required_steps:
-            raise ValueError("artifact required action window mismatches model horizon")
-        future = pred_action[
-            :,
-            self._manifest.n_obs_steps - 1 : self._manifest.horizon,
-            : self._manifest.control_action_dim,
-        ]
-        expected_future_shape = (1, required_steps, self._manifest.control_action_dim)
-        if tuple(future.shape) != expected_future_shape:
+
+        control_action = result["control_action"]
+        if not isinstance(control_action, torch.Tensor):
+            raise ValueError("control_action must be a torch.Tensor")
+        expected_control_shape = (
+            1,
+            self._manifest.n_action_steps,
+            self._manifest.control_action_dim,
+        )
+        if tuple(control_action.shape) != expected_control_shape:
             raise ValueError(
-                f"pred_action future interval must have shape {expected_future_shape}, got "
-                f"{tuple(future.shape)}"
+                f"control_action must have shape {expected_control_shape}, got "
+                f"{tuple(control_action.shape)}"
             )
-        ctrl = future.detach().cpu().numpy()[0]
+        if not bool(torch.isfinite(control_action).all()):
+            raise ValueError("control_action contains NaN/Inf")
+
+        if verify_control_slice:
+            start = self._manifest.n_obs_steps - 1
+            expected_control = pred_action[
+                :,
+                start : start + self._manifest.n_action_steps,
+                : self._manifest.control_action_dim,
+            ]
+            if not torch.equal(control_action, expected_control):
+                raise ValueError(
+                    "control_action does not equal the canonical pred_action slice"
+                )
+        return pred_action, control_action
+
+    def _decode_control_action(self, control_action: torch.Tensor) -> PolicyPrediction:
+        """Decode one validated executable control chunk into Real action fields.
+
+        Joint (``action``): ``[N,19]`` = arm7 + hand12. EE (``action_ee``):
+        ``[N,21]`` = pos3 + rot6d6 + hand12. ``N`` is artifact-owned
+        ``n_action_steps``.
+        """
+        if self._manifest is None:
+            raise RuntimeError("deployment manifest is unavailable")
+        ctrl = control_action.detach().cpu().numpy()[0]
         n = ctrl.shape[0]
         dim = ctrl.shape[1]
         if self._action_key == "action":
@@ -1002,11 +1029,11 @@ class DexManiPolicyRuntime:
             obs_dict,
             denoise_timesteps=self._denoise_steps,
         )
-        if not isinstance(result, Mapping) or "pred_action" not in result:
-            raise ValueError(
-                "DexMani agent must return a mapping containing 'pred_action'"
-            )
-        return self._decode(result["pred_action"])
+        _pred_action, control_action = self._validate_policy_outputs(
+            result,
+            verify_control_slice=False,
+        )
+        return self._decode_control_action(control_action)
 
     def close(self) -> None:
         agent = self._agent

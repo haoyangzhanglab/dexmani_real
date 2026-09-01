@@ -166,12 +166,13 @@ class DeploymentArtifactTest(unittest.TestCase):
 
         self.assertEqual(artifact.selector_name, "deployment_latest.pt")
         self.assertEqual(
-            artifact.checkpoint_path.name, "epoch=1126-step=00080000-deployment-v2.pt"
+            artifact.checkpoint_path.name,
+            "epoch=1126-step=00080000-pr3-fc6b7df-deployment-v2.pt",
         )
-        self.assertEqual(artifact.checkpoint_size_bytes, 550_236_074)
+        self.assertEqual(artifact.checkpoint_size_bytes, 550_226_410)
         self.assertEqual(
             artifact.index_sha256,
-            "d67bf21394c8d79239dd0f116baf25a681c3e4d0964569ce47a520f62e047c6e",
+            "52683587a024a18d9251eb073a6290c1cc123d966edbaa7dc282097c38040b06",
         )
         self.assertFalse(artifact.checkpoint_sha256_verified)
 
