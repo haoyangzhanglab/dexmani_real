@@ -17,6 +17,7 @@ fd/hash/provenance stream loader. There is no configurable runtime loader.
 
 from __future__ import annotations
 
+import math
 import time
 
 import numpy as np
@@ -57,6 +58,7 @@ from dexmani_real.deployment.observation import (
     RgbFrame,
     parse_observation_fields,
 )
+from dexmani_real.deployment.timing import build_target_grid, first_deliverable_index
 from dexmani_real.ipc.channels import RuntimeChannels, new_frame
 from dexmani_real.ipc.schema import (
     MAX_POLICY_CHUNK_STEPS,
@@ -72,7 +74,7 @@ logger = get_logger(__name__)
 _NO_FEEDBACK_POLL_S = 0.005
 # Poll interval while ARMED (no inference) — gentler than the feedback poll.
 _ARMED_IDLE_POLL_S = 0.01
-_UINT64_MAX = int(np.iinfo(np.uint64).max)
+_MIN_STARTUP_DELIVERABLE_TARGETS = 2
 
 
 def _load_inference_runtime(config: PolicyRuntimeConfig) -> PolicyRuntime:
@@ -86,17 +88,40 @@ def _load_inference_runtime(config: PolicyRuntimeConfig) -> PolicyRuntime:
     return load_verified_policy_runtime(config)
 
 
-def _require_uint64_time(value: int, *, name: str, positive: bool) -> int:
-    """Validate a Python/NumPy integer before constructing uint64 wire data."""
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
-        raise TypeError(f"{name} must be an integer")
-    result = int(value)
-    if result < 0 or (positive and result == 0):
-        qualifier = "positive" if positive else "non-negative"
-        raise ValueError(f"{name} must be {qualifier}")
-    if result > _UINT64_MAX:
-        raise ValueError(f"{name} exceeds uint64")
-    return result
+def _duration_s_to_ns_ceil(duration_s: float, *, name: str) -> int:
+    """Convert a validated non-negative duration without understating latency."""
+    if isinstance(duration_s, bool) or not isinstance(
+        duration_s, (int, float, np.integer, np.floating)
+    ):
+        raise TypeError(f"{name} must be a number")
+    value = float(duration_s)
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return math.ceil(value * 1e9)
+
+
+def _startup_deliverable_target_count(
+    *,
+    model_latency_s: float,
+    steps: int,
+    step_dt_ns: int,
+    command_lead_s: float,
+) -> int:
+    """Return theoretical targets remaining after model latency and command lead."""
+    # This arbitrary positive origin has no source-time meaning; warmup only
+    # qualifies latency against relative executable-grid spacing.
+    origin_ns = 1
+    targets = build_target_grid(origin_ns, steps, step_dt_ns)
+    finished_ns = origin_ns + _duration_s_to_ns_ceil(
+        model_latency_s,
+        name="model_latency_s",
+    )
+    first_index = first_deliverable_index(
+        targets,
+        finished_ns,
+        _duration_s_to_ns_ceil(command_lead_s, name="command_lead_s"),
+    )
+    return len(targets) - first_index
 
 
 def stamp_prediction_timing(
@@ -115,29 +140,21 @@ def stamp_prediction_timing(
     """
     if not isinstance(prediction, PolicyPrediction):
         raise TypeError("prediction must be a PolicyPrediction")
-    logical = _require_uint64_time(
-        logical_step_ns, name="logical_step_ns", positive=True
-    )
-    step_dt = _require_uint64_time(step_dt_ns, name="step_dt_ns", positive=True)
-    finished = _require_uint64_time(
-        inference_finished_ns, name="inference_finished_ns", positive=True
-    )
-    lead = _require_uint64_time(command_lead_ns, name="command_lead_ns", positive=False)
-    if finished > _UINT64_MAX - lead:
-        raise ValueError("inference_finished_ns + command_lead_ns exceeds uint64")
-    earliest_target = finished + lead
-
     values = (
         prediction.arm_qpos if prediction.arm_qpos is not None else prediction.ee_pos
     )
     assert values is not None
     steps = int(values.shape[0])
-    if steps > 1 and logical > _UINT64_MAX - (steps - 1) * step_dt:
-        raise ValueError("prediction target grid exceeds uint64")
-    targets = logical + np.arange(steps, dtype=np.uint64) * np.uint64(step_dt)
-    valid_mask = (targets > np.uint64(earliest_target)).astype(np.uint8)
-    if not bool(np.any(valid_mask)):
+    targets = build_target_grid(logical_step_ns, steps, step_dt_ns)
+    first_index = first_deliverable_index(
+        targets,
+        inference_finished_ns,
+        command_lead_ns,
+    )
+    if first_index == steps:
         return None
+    valid_mask = np.zeros(steps, dtype=np.uint8)
+    valid_mask[first_index:] = 1
     return JointActionChunk(
         arm_qpos=prediction.arm_qpos,
         hand_qpos=prediction.hand_qpos,
@@ -955,25 +972,33 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
             if any(not np.isfinite(value) or value < 0.0 for value in timings_s):
                 raise RuntimeError("policy runtime returned invalid warmup timing")
             allocation = config.artifact.allocation_contract
-            max_viable_s = (
-                allocation.n_action_steps - 2
-            ) * allocation.control_dt_s - config.deployment.command_lead_s
-            if max_viable_s <= 0.0:
-                raise RuntimeError(
-                    "policy artifact has no viable post-inference action window"
-                )
             stable_timings_s = timings_s[-stable_samples:]
-            logger.info(
-                "inference warmup: samples_ms=%s stable_max_ms=%.3f limit_ms=%.3f",
-                ",".join(f"{value * 1e3:.3f}" for value in timings_s),
-                max(stable_timings_s) * 1e3,
-                max_viable_s * 1e3,
+            step_dt_ns = int(round(1e9 / float(shared.action_control_hz)))
+            remaining_targets = tuple(
+                _startup_deliverable_target_count(
+                    model_latency_s=value,
+                    steps=allocation.n_action_steps,
+                    step_dt_ns=step_dt_ns,
+                    command_lead_s=config.deployment.command_lead_s,
+                )
+                for value in stable_timings_s
             )
-            if any(value > max_viable_s for value in stable_timings_s):
+            logger.info(
+                "inference warmup model-latency qualification: samples_ms=%s "
+                "stable_remaining_targets=%s minimum=%d",
+                ",".join(f"{value * 1e3:.3f}" for value in timings_s),
+                ",".join(str(value) for value in remaining_targets),
+                _MIN_STARTUP_DELIVERABLE_TARGETS,
+            )
+            if any(
+                remaining < _MIN_STARTUP_DELIVERABLE_TARGETS
+                for remaining in remaining_targets
+            ):
                 raise RuntimeError(
                     "policy inference warmup exceeds the viable action window: "
                     f"stable_max_ms={max(stable_timings_s) * 1e3:.3f} "
-                    f"limit_ms={max_viable_s * 1e3:.3f}"
+                    f"stable_remaining_targets={remaining_targets} "
+                    f"minimum={_MIN_STARTUP_DELIVERABLE_TARGETS}"
                 )
     except BaseException:
         try:
@@ -1091,7 +1116,10 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
                 logical_step_ns=observation.logical_step_monotonic_ns,
                 step_dt_ns=step_dt_ns,
                 inference_finished_ns=finished_ns,
-                command_lead_ns=int(deployment.command_lead_s * 1e9),
+                command_lead_ns=_duration_s_to_ns_ceil(
+                    deployment.command_lead_s,
+                    name="command_lead_s",
+                ),
             )
             if chunk is None:
                 metrics.increment(INFERENCE_FAILURES)

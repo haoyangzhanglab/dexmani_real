@@ -19,6 +19,7 @@ from dexmani_real.control.publication import (
     classify_policy_endpoint_disposition,
 )
 from dexmani_real.control.safety_gate import GateRejectCode
+from dexmani_real.deployment.action_buffer import BufferedPlan
 from dexmani_real.deployment.config import (
     DeploymentConfig,
     H4ExecuteBounds,
@@ -35,15 +36,24 @@ from dexmani_real.deployment.coordinator import (
     _buffered_plan_from_record,
     _physical_start_pose_rejection,
     _plan_deadline_ns,
+    _usable_horizon_ms,
     coordinator_loop,
 )
 from dexmani_real.deployment.manifest import DeploymentManifest
 from dexmani_real.deployment.metrics import OBSERVATION_WAIT_POINTCLOUD_GRID, Metrics
 from dexmani_real.deployment.observation import PointCloudFrame, freeze_array
+from dexmani_real.deployment.timing import (
+    build_target_grid,
+    compute_plan_deadline_ns,
+    first_deliverable_index,
+    first_valid_index_from_prefix_mask,
+    usable_target_mask,
+)
 from dexmani_real.deployment.worker import (
     _build_observation,
     _read_state_history,
     _select_pointcloud_control_grid,
+    _startup_deliverable_target_count,
     inference_loop,
     publish_plan,
     stamp_prediction_timing,
@@ -226,6 +236,135 @@ def _plan() -> np.void:
 
 
 class DeploymentTimingTest(unittest.TestCase):
+    def test_build_target_grid_is_exact_and_fails_closed(self) -> None:
+        np.testing.assert_array_equal(
+            build_target_grid(1_000, 4, 100),
+            np.asarray((1_000, 1_100, 1_200, 1_300), dtype=np.uint64),
+        )
+        one_target = build_target_grid(1, 1, 1)
+        self.assertEqual(one_target.dtype, np.dtype(np.uint64))
+        self.assertFalse(one_target.flags.writeable)
+        for args in ((True, 2, 1), (1, True, 1), (1, 2, True)):
+            with self.subTest(args=args), self.assertRaises(TypeError):
+                build_target_grid(*args)
+        for args in ((-1, 2, 1), (1, 0, 1), (1, 2, 0)):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                build_target_grid(*args)
+        with self.assertRaisesRegex(ValueError, "target grid exceeds uint64"):
+            build_target_grid((1 << 64) - 1, 2, 1)
+
+    def test_first_deliverable_index_uses_strict_lower_bound(self) -> None:
+        targets = np.asarray((100, 200, 300, 400), dtype=np.uint64)
+        self.assertEqual(first_deliverable_index(targets, 99, 0), 0)
+        self.assertEqual(first_deliverable_index(targets, 100, 0), 1)
+        self.assertEqual(first_deliverable_index(targets, 150, 50), 2)
+        self.assertEqual(first_deliverable_index(targets, 400, 0), len(targets))
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            first_deliverable_index(
+                np.asarray((100, 300, 200), dtype=np.uint64),
+                1,
+                0,
+            )
+
+    def test_transport_prefix_topology_and_diagnostic_deadline_are_separate(
+        self,
+    ) -> None:
+        for mask, expected in (
+            ((1, 1, 1, 1), 0),
+            ((0, 1, 1, 1), 1),
+            ((0, 0, 1, 1), 2),
+            ((0, 0, 0, 0), 4),
+        ):
+            with self.subTest(mask=mask):
+                self.assertEqual(
+                    first_valid_index_from_prefix_mask(np.asarray(mask)),
+                    expected,
+                )
+        for mask in ((0, 1, 0, 1), (0, 0, 1, 0), (1, 1, 1, 0)):
+            with (
+                self.subTest(mask=mask),
+                self.assertRaisesRegex(ValueError, "topology"),
+            ):
+                first_valid_index_from_prefix_mask(np.asarray(mask))
+
+        targets = np.asarray((100, 200, 300, 400, 500, 600), dtype=np.uint64)
+        transport_mask = np.asarray((0, 0, 1, 1, 1, 1), dtype=np.uint8)
+        diagnostic_mask = usable_target_mask(targets, 2, 450)
+        np.testing.assert_array_equal(
+            diagnostic_mask,
+            np.asarray((0, 0, 1, 1, 0, 0), dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(
+            transport_mask,
+            np.asarray((0, 0, 1, 1, 1, 1), dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(
+            usable_target_mask(targets, 2, 1_000),
+            transport_mask,
+        )
+        np.testing.assert_array_equal(
+            usable_target_mask(targets, 2, 400),
+            np.asarray((0, 0, 1, 0, 0, 0), dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(
+            usable_target_mask(
+                np.asarray((399, 400), dtype=np.uint64),
+                0,
+                400,
+            ),
+            np.asarray((1, 0), dtype=np.uint8),
+        )
+
+    def test_compute_plan_deadline_selects_each_upper_bound(self) -> None:
+        self.assertEqual(compute_plan_deadline_ns(1_000, 900, 100, 500), 1_100)
+        self.assertEqual(compute_plan_deadline_ns(1_000, 900, 500, 100), 1_000)
+        for args in ((True, 900, 100, 500), (1_000, 900, 0, 500)):
+            with self.subTest(args=args), self.assertRaises((TypeError, ValueError)):
+                compute_plan_deadline_ns(*args)
+        with self.assertRaisesRegex(ValueError, "exceeds uint64"):
+            compute_plan_deadline_ns((1 << 64) - 1, 1, 1, 1)
+
+    def test_startup_qualification_counts_strict_theoretical_targets(self) -> None:
+        values = {
+            "steps": 4,
+            "step_dt_ns": 100_000_000,
+            "command_lead_s": 0.0,
+        }
+        self.assertEqual(
+            _startup_deliverable_target_count(model_latency_s=0.1, **values),
+            2,
+        )
+        self.assertEqual(
+            _startup_deliverable_target_count(model_latency_s=0.2, **values),
+            1,
+        )
+        self.assertEqual(
+            _startup_deliverable_target_count(model_latency_s=0.3, **values),
+            0,
+        )
+
+    def test_usable_horizon_is_zero_without_an_actual_usable_target(self) -> None:
+        transport_mask = np.asarray((0, 1, 1), dtype=np.uint8)
+        chunk = JointActionChunk(
+            arm_qpos=np.zeros((3, 7), dtype=np.float64),
+            hand_qpos=np.zeros((3, 12), dtype=np.float64),
+            target_monotonic_ns=np.asarray((300, 500, 600), dtype=np.uint64),
+            valid_mask=transport_mask,
+        )
+        plan = BufferedPlan(
+            plan_id=1,
+            run_generation=7,
+            observation_id=1,
+            observation_anchor_ns=200,
+            observation_latest_source_ns=100,
+            inference_finished_ns=250,
+            deadline_ns=400,
+            chunk=chunk,
+        )
+
+        self.assertEqual(_usable_horizon_ms(plan, now_ns=300), 0.0)
+        np.testing.assert_array_equal(plan.chunk.valid_mask, transport_mask)
+
     def test_h4_bounds_reject_noncanonical_or_untyped_values(self) -> None:
         with self.assertRaisesRegex(ValueError, "exactly equal to 1"):
             H4ExecuteBounds(
@@ -1065,6 +1204,20 @@ class DeploymentTimingTest(unittest.TestCase):
         )
         self.assertTrue(buffered.chunk.is_ee)
 
+    def test_ipc_plan_conversion_rejects_non_prefix_transport_masks(self) -> None:
+        for mask in ((0, 1, 0), (1, 1, 0), (0, 0, 0)):
+            plan = _plan()
+            plan["valid_mask"][:3] = mask
+            with (
+                self.subTest(mask=mask),
+                self.assertRaisesRegex(ValueError, "valid_mask"),
+            ):
+                _buffered_plan_from_record(
+                    plan,
+                    max_plan_age_ns=500_000_000,
+                    max_source_to_command_age_ns=400_000_000,
+                )
+
     def test_publish_plan_drops_after_generation_advances(self) -> None:
         chunk = JointActionChunk(
             arm_qpos=np.zeros((1, 7), dtype=np.float64),
@@ -1581,6 +1734,102 @@ class DeploymentTimingTest(unittest.TestCase):
             published_candidates[0].scheduled_target_monotonic_ns,
             int(plan["target_monotonic_ns"][0, 2]),
         )
+
+    def test_zero_usable_plan_publishes_nothing_and_hits_first_command_watchdog(
+        self,
+    ) -> None:
+        base_ns = 5_000_000_000
+        plan = np.zeros(1, dtype=POLICY_PLAN_DTYPE)
+        plan["plan_id"][0] = 1
+        plan["run_generation"][0] = 5
+        plan["observation_id"][0] = 1
+        plan["observation_latest_source_monotonic_ns"][0] = base_ns - 10
+        plan["observation_logical_step_monotonic_ns"][0] = base_ns - 8
+        plan["observation_anchor_monotonic_ns"][0] = base_ns - 6
+        plan["inference_started_monotonic_ns"][0] = base_ns - 4
+        plan["inference_finished_monotonic_ns"][0] = base_ns - 2
+        plan["num_steps"][0] = 2
+        plan["arm_present"][0] = 1
+        plan["hand_present"][0] = 1
+        plan["target_monotonic_ns"][0, :2] = (base_ns + 100, base_ns + 200)
+        plan["valid_mask"][0, :2] = 1
+
+        class _PlanRing:
+            def read_latest(self):
+                return plan.copy(), base_ns, 1
+
+        coupled_cmd_ring = SimpleNamespace(write=Mock(), latest_sequence=0)
+        shared = SimpleNamespace(
+            is_running=_Value(1),
+            safety_state=_Value(int(SafetyState.ARMED)),
+            run_generation=_Value(4),
+            run_started_monotonic_ns=_Value(0),
+            active_coupled_command_sequence=_Value(0),
+            motion_lock=threading.RLock(),
+            arm_command_seq=_LockedValue(0),
+            policy_plan_ring=_PlanRing(),
+            coupled_cmd_ring=coupled_cmd_ring,
+            quit_requested=_Value(0),
+            start_request=_Value(1),
+            stop_request=_Value(0),
+            execute_completed=_Value(0),
+            error_state=_Value(0),
+            estop_request=_Value(0),
+            set_heartbeat=Mock(),
+            set_ready=Mock(),
+        )
+        config = CoordinatorConfig(
+            deployment=DeploymentConfig(
+                observation_fields="arm_qpos",
+                command_lead_s=1e-9,
+                max_source_to_command_age_s=50e-9,
+                first_command_timeout_s=1e-9,
+            ),
+            arm_joint_lower_rad=tuple(np.full(7, -2.0)),
+            arm_joint_upper_rad=tuple(np.full(7, 2.0)),
+            workspace_bounds=((-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0)),
+            hand_joint_lower_rad=tuple(hand_defaults.qpos_min_rad),
+            hand_joint_upper_rad=tuple(hand_defaults.qpos_max_rad),
+            hand_mechanical_lower_rad=tuple(hand_defaults.mechanical_qpos_min_rad),
+            hand_mechanical_upper_rad=tuple(hand_defaults.mechanical_qpos_max_rad),
+            arm_feedback_max_age_s=0.5,
+            hand_feedback_max_age_s=0.5,
+            control_hz=100.0,
+            execution_mode="shadow",
+        )
+        clock = _Clock((base_ns, base_ns, base_ns + 1, base_ns + 3, base_ns + 4))
+        sleep_ticks = 0
+
+        def bounded_sleep(_period_s: float, _tick_start: float) -> None:
+            nonlocal sleep_ticks
+            sleep_ticks += 1
+            if sleep_ticks >= 4:
+                shared.is_running.value = 0
+
+        with (
+            self.assertLogs(
+                "dexmani_real.deployment.coordinator", level="INFO"
+            ) as logs,
+            patch("dexmani_real.deployment.coordinator.time", clock),
+            patch(
+                "dexmani_real.runtime.safety.time.monotonic_ns",
+                return_value=base_ns,
+            ),
+            patch("dexmani_real.deployment.coordinator.XArm7MotionPlanner"),
+            patch(
+                "dexmani_real.deployment.coordinator.validate_and_send_candidate"
+            ) as validate_and_send,
+            patch(
+                "dexmani_real.deployment.coordinator._sleep_tick",
+                side_effect=bounded_sleep,
+            ),
+        ):
+            coordinator_loop(shared, config)
+
+        validate_and_send.assert_not_called()
+        coupled_cmd_ring.write.assert_not_called()
+        self.assertEqual(shared.safety_state.value, int(SafetyState.ARMED))
+        self.assertTrue(any("first command timeout" in entry for entry in logs.output))
 
     def test_ee_feedback_uses_post_read_clock_for_freshness(self) -> None:
         base_ns = 8_000_000_000

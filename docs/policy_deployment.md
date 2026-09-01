@@ -4,8 +4,10 @@
 唯一说明：从 artifact 到 robot command 的数据链、支持边界、物理执行门、验证记录，以及未来
 `dexmani_policy` 合并条件均以此为准。源码、schema 和运行时配置优先于本文。
 
-> R1 集成基线：Policy handoff 已在 Policy `main`
-> `aa4a0a39dd5a69e3a4ad85ea8190d6889610d175` 接受；handoff receipt 中的 representative
+> R1 集成基线：Policy handoff 语义已在 `aa4a0a39dd5a69e3a4ad85ea8190d6889610d175`
+> 接受；当前只读 Policy `main` 是后续仅增加文档的
+> `5994037`。Real R1 已以 `fd8195f757f341f99a50f232bf59820a0fb15ec6` merge/reviewed。
+> handoff receipt 中的 representative
 > artifact producer 仍是 `fc6b7dfb45748f4187f2e82b5425721ed02b028e`。下文 H2/H3、H4
 > 和 task rollout 是 full-future executable semantics 下产生的 pre-R1 历史证据，不能授权
 > R1 后的物理执行。物理任务能力仍未验证。
@@ -112,9 +114,12 @@ workers 留在 CPU；`agent.to(device)` 之后，normalization、encoder、diffu
 unnormalization 都在所选 GPU。validated `control_action.detach().cpu().numpy()` 是回到 CPU 的唯一
 动作数据边界。
 
-启动时执行 5 次 synthetic warmup，最后 3 次必须落在 artifact 的 `n_action_steps` executable
-window 内；warmup 同时精确验证 Policy 声明的 canonical control slice。随后恢复随机状态，
-不消耗 rollout 的第一组 diffusion sample。isolated preflight 也执行一次同样的 contract warmup。
+启动时执行 5 次 synthetic warmup，最后 3 次中的每个样本必须在 artifact 的
+`n_action_steps` executable grid 上理论留下至少 2 个严格晚于 model finish + command lead 的
+target；warmup 同时精确验证 Policy 声明的 canonical control slice。该检查只限定 model-path
+latency，没有真实 observation source timestamp、camera lag 或 source age，因而不是 online
+source-aware schedulability 证明，也不会伪造 source deadline。随后恢复随机状态，不消耗 rollout
+的第一组 diffusion sample。isolated preflight 也执行一次同样的 contract warmup。
 
 ARMED 只维护 worker readiness。B 使状态进入 RUNNING 后，worker 才从 current generation 的
 shared-memory history 构建 observation：
@@ -172,7 +177,56 @@ executable source 是 19-D `control_action`。EE action 的完整 prediction 同
 合法 control，退化的 executable control 必须拒绝。EE control 由 coordinator 做 IK；joint control
 不经过 IK。
 
-### 3.5 Plan、SafetyGate 与 worker ACK
+### 3.5 不可变 timing 与 readiness ownership
+
+动作值、lower expiry、upper deadline 和调度分别由不同边界拥有：
+
+| Owner | Timing responsibility |
+|---|---|
+| Policy | 只产生 action values；不产生 Real timestamp。 |
+| Real inference / `deployment.timing` | 构造 immutable target grid，并把 inference 已错过的 prefix 标为 transport-invalid。 |
+| Real coordinator / `BufferedPlan` | 校验完整 source → logical → anchor → inference start → finish 因果链，并计算 source/plan upper deadline。 |
+| `ActionBuffer` | 保持 latest-wins/supersession，独立要求 `target < deadline`。 |
+
+canonical target grid 永远是：
+
+```text
+target_i
+= observation_logical_step_ns + i * control_dt_ns
+```
+
+inference lower bound 使用严格不等式：
+
+```text
+target_i > inference_finished_ns + command_lead_ns
+```
+
+因此 wire `valid_mask` 只表达 inference-expired prefix，拓扑必须是 `0*1*`，例如
+`00011111`。它不是“endpoint 不能执行的所有原因”，coordinator 不会把 upper deadline suffix
+写回 `JointActionChunk.valid_mask` 或 `policy_plan_ring.valid_mask`。
+
+真实 plan 的 source-aware upper bound 同样使用严格不等式：
+
+```text
+target_i < min(
+    inference_finished_ns + max_plan_age_ns,
+    observation_latest_source_ns + max_source_to_command_age_ns,
+)
+```
+
+deadline 是独立的 `BufferedPlan.deadline_ns`。例如 transport mask `001111` 遇到 deadline
+cut 后，diagnostic/qualification usable mask 可以是 `001100`，但 transport mask 仍是
+`001111`；`ActionBuffer` 只 expose deadline 前的 endpoints。
+
+late endpoint 直接 drop，expired prefix 直接 drop，全部 expired 则 drop 整个 prediction。
+系统绝不把过期 action 移动到新的 future slot，也不在 inference 后重建或平移 target grid。
+online plan 的真实 source timestamp 与 coordinator deadline 才是 source-aware readiness 的权威
+证据；startup warmup 不能替代它。
+
+`usable_horizon_ms` 是从当前时刻到 latest actually usable target 的剩余时间，不是 raw
+prediction horizon，也不是 deadline 本身。deadline 前没有实际 usable target 时其值为 `0`。
+
+### 3.6 Plan、SafetyGate 与 worker ACK
 
 inference worker 把无时间的 `PolicyPrediction` 对齐到 Real control grid，屏蔽已过期 prefix；若
 没有可用 target，丢弃整个 prediction。它将 plan、observation/generation、timestamp、valid mask 和

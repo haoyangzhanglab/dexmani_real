@@ -77,6 +77,11 @@ from dexmani_real.deployment.metrics import (
     reject_counter_name,
     shadow_run_receipt_json,
 )
+from dexmani_real.deployment.timing import (
+    compute_plan_deadline_ns,
+    first_valid_index_from_prefix_mask,
+    usable_target_mask,
+)
 from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
 from dexmani_real.ipc.schema import MAX_POLICY_CHUNK_STEPS
 from dexmani_real.planning import (
@@ -334,8 +339,9 @@ def _buffered_plan_from_record(
         raise ValueError("policy plan has non-causal timestamps")
     target = np.array(rec["target_monotonic_ns"][:n], dtype=np.uint64, copy=True)
     mask = np.array(rec["valid_mask"][:n], dtype=np.uint8, copy=True)
-    if not np.all((mask == 0) | (mask == 1)):
-        raise ValueError("policy plan valid_mask must contain only 0 or 1")
+    first_index = first_valid_index_from_prefix_mask(mask)
+    if first_index == n:
+        raise ValueError("policy plan valid_mask must contain a deliverable suffix")
     hand_qpos = np.array(rec["hand_qpos"][:n], dtype=np.float64, copy=True)
     if not np.all(np.isfinite(hand_qpos)):
         raise ValueError("policy plan hand targets must be finite")
@@ -385,9 +391,11 @@ def _plan_deadline_ns(
         or not source_ns <= logical_ns <= anchor_ns <= started_ns <= finished_ns
     ):
         return None
-    return min(
-        finished_ns + int(max_plan_age_ns),
-        source_ns + int(max_source_to_command_age_ns),
+    return compute_plan_deadline_ns(
+        finished_ns,
+        source_ns,
+        max_plan_age_ns,
+        max_source_to_command_age_ns,
     )
 
 
@@ -399,11 +407,16 @@ def _usable_horizon_ms(plan: BufferedPlan, *, now_ns: int) -> float:
     the raw model horizon, and cannot become negative for an already-expired
     endpoint.
     """
-    valid = np.asarray(plan.chunk.valid_mask, dtype=np.uint8) == 1
-    if not np.any(valid):
+    first_index = first_valid_index_from_prefix_mask(plan.chunk.valid_mask)
+    usable = usable_target_mask(
+        plan.chunk.target_monotonic_ns,
+        first_index,
+        plan.deadline_ns,
+    )
+    if not bool(np.any(usable)):
         return 0.0
-    latest_target_ns = int(np.max(plan.chunk.target_monotonic_ns[valid]))
-    return max(0.0, min(plan.deadline_ns, latest_target_ns) - int(now_ns)) / 1e6
+    latest_target_ns = int(np.max(plan.chunk.target_monotonic_ns[usable == 1]))
+    return max(0.0, latest_target_ns - int(now_ns)) / 1e6
 
 
 def _coupled_command_sequence(shared: RuntimeChannels) -> int:

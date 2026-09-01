@@ -247,6 +247,48 @@ class ActionBufferTest(unittest.TestCase):
         watermark = self.buffer.push(_plan(5, 5, (400,)), now_ns=1)
         self.assertEqual(watermark.status, PushStatus.ALL_FINALIZED)
 
+    def test_deadline_cuts_tail_without_mutating_transport_mask(self) -> None:
+        transport_mask = (0, 0, 1, 1, 1, 1)
+        plan = _plan(
+            1,
+            1,
+            (100, 200, 300, 400, 500, 600),
+            deadline_ns=450,
+            mask=transport_mask,
+        )
+
+        self.assertEqual(self.buffer.push(plan, now_ns=1).status, PushStatus.ACCEPTED)
+        first = self.buffer.peek_due(now_ns=300)
+        assert first.token is not None
+        self.assertEqual(first.token.target_ns, 300)
+        self.buffer.commit(first.token)
+        second = self.buffer.peek_due(now_ns=400)
+        assert second.token is not None
+        self.assertEqual(second.token.target_ns, 400)
+        self.buffer.commit(second.token)
+        self.assertEqual(self.buffer.coverage(now_ns=400), BufferCoverage.EXHAUSTED)
+        np.testing.assert_array_equal(
+            plan.chunk.valid_mask,
+            np.asarray(transport_mask, dtype=np.uint8),
+        )
+
+    def test_deadline_eliminating_every_transport_valid_target_is_not_admitted(
+        self,
+    ) -> None:
+        result = self.buffer.push(
+            _plan(
+                1,
+                1,
+                (100, 200, 300, 400),
+                deadline_ns=300,
+                mask=(0, 0, 1, 1),
+            ),
+            now_ns=1,
+        )
+
+        self.assertEqual(result.status, PushStatus.ALL_FINALIZED)
+        self.assertEqual(self.buffer.coverage(now_ns=1), BufferCoverage.EXHAUSTED)
+
     def test_generation_reset_invalidates_tokens_and_wrong_generation_is_typed(
         self,
     ) -> None:

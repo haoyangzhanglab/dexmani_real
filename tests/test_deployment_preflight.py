@@ -284,6 +284,66 @@ class DeploymentPreflightTest(unittest.TestCase):
         shared.set_ready.assert_not_called()
         runtime.close.assert_called_once_with()
 
+    def test_warmup_qualification_uses_only_the_last_three_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = _write_experiment(Path(directory) / "experiment", matching_hash=True)
+            config = self._projection(root).runtime
+            runtime = SimpleNamespace(
+                warmup=Mock(return_value=(0.9, 0.9, 0.1, 0.1, 0.1)),
+                close=Mock(),
+            )
+            shared = SimpleNamespace(
+                is_running=SimpleNamespace(value=0),
+                action_control_hz=16.0,
+                set_heartbeat=Mock(),
+                set_ready=Mock(),
+            )
+            with patch(
+                "dexmani_real.deployment.preflight.load_verified_policy_runtime",
+                return_value=runtime,
+            ):
+                inference_loop(shared, config)
+
+        shared.set_ready.assert_called_once_with("inference")
+        runtime.close.assert_called_once_with()
+
+    def test_warmup_exact_boundary_requires_two_theoretical_targets(self):
+        for latency_s, should_pass in ((0.3025, True), (0.365, False)):
+            with self.subTest(latency_s=latency_s):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = _write_experiment(
+                        Path(directory) / "experiment", matching_hash=True
+                    )
+                    config = self._projection(root).runtime
+                    runtime = SimpleNamespace(
+                        warmup=Mock(return_value=(latency_s,) * 5),
+                        close=Mock(),
+                    )
+                    shared = SimpleNamespace(
+                        is_running=SimpleNamespace(value=0),
+                        action_control_hz=16.0,
+                        set_heartbeat=Mock(),
+                        set_ready=Mock(),
+                    )
+                    load_path = (
+                        "dexmani_real.deployment.preflight."
+                        "load_verified_policy_runtime"
+                    )
+                    with patch(load_path, return_value=runtime):
+                        if should_pass:
+                            inference_loop(shared, config)
+                        else:
+                            with self.assertRaisesRegex(
+                                RuntimeError, "viable action window"
+                            ):
+                                inference_loop(shared, config)
+
+                if should_pass:
+                    shared.set_ready.assert_called_once_with("inference")
+                else:
+                    shared.set_ready.assert_not_called()
+                runtime.close.assert_called_once_with()
+
     def test_preflight_does_not_replace_checkpoint_bound_rng_streams(self):
         prediction = object()
         runtime = SimpleNamespace(
@@ -1528,6 +1588,46 @@ class DeploymentPreflightTest(unittest.TestCase):
             np.testing.assert_array_equal(restored_numpy_state[1], numpy_state[1])
             self.assertEqual(restored_numpy_state[2:], numpy_state[2:])
             torch.testing.assert_close(torch.random.get_rng_state(), torch_state)
+
+    def test_adapter_hot_predict_uses_torch_inference_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = _write_experiment(Path(directory) / "experiment")
+            runtime_config = self._projection(root).runtime
+            allocation = runtime_config.artifact.allocation_contract
+            runtime = DexManiPolicyRuntime(runtime_config)
+            runtime._manifest = DeploymentManifest(
+                action_key="action",
+                n_obs_steps=allocation.n_obs_steps,
+                n_action_steps=allocation.n_action_steps,
+                action_dim=allocation.action_dim,
+                horizon=allocation.horizon,
+                control_action_dim=allocation.control_action_dim,
+                sensor_modalities=allocation.sensor_modalities,
+                point_cloud_num_points=allocation.point_cloud_num_points,
+                point_cloud_feature_dim=allocation.point_cloud_feature_dim,
+            )
+            pred_action = torch.zeros(
+                (1, allocation.horizon, allocation.action_dim),
+                dtype=torch.float32,
+            )
+            control_action = torch.zeros(
+                (1, allocation.n_action_steps, allocation.control_action_dim),
+                dtype=torch.float32,
+            )
+
+            def predict_action(*_args, **_kwargs):
+                self.assertTrue(torch.is_inference_mode_enabled())
+                return {
+                    "pred_action": pred_action,
+                    "control_action": control_action,
+                }
+
+            runtime._agent = SimpleNamespace(predict_action=predict_action)
+            with patch.object(runtime, "_encode", return_value={}):
+                prediction = runtime.predict(object())  # type: ignore[arg-type]
+
+        self.assertEqual(prediction.arm_qpos.shape, (allocation.n_action_steps, 7))
+        self.assertEqual(prediction.hand_qpos.shape, (allocation.n_action_steps, 12))
 
     def test_adapter_warmup_rejects_noncanonical_control_slice(self):
         with tempfile.TemporaryDirectory() as directory:

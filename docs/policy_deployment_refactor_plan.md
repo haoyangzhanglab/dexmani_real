@@ -205,7 +205,8 @@ They close different race windows.
 
 # Phase R1 — Execute Policy `control_action`
 
-**Status**: UNBLOCKED — Policy PR-4 handoff accepted; implementation on `codex/real-r1-control-action`
+**Status**: MERGED / REVIEWED — Real `main` at
+`fd8195f757f341f99a50f232bf59820a0fb15ec6`; Policy handoff accepted.
 **This is the first Real semantic change.**
 
 ## R1.1 Adapter contract
@@ -334,7 +335,8 @@ Old H4/task evidence was generated under old full-future semantics and cannot au
 
 # Phase R2 — Timing and readiness
 
-**Status**: BLOCKED on R1
+**Status**: UNBLOCKED — implementation on `codex/real-r2-timing-readiness`;
+not yet reviewed or DONE.
 
 ## R2.1 Separate three timing concepts
 

@@ -213,6 +213,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `preflight.py` | artifact-bound inference 与 spawn 预检共享的 no-follow/hash/provenance 单次 stream load；预检再执行 deterministic synthetic observation。 |
 | `run_identity.py` | 纯标准库的 Real source provenance 与 print/preflight 共用 canonical run receipt。 |
 | `observation.py` | 因果不可变 arm/hand/tactile/pointcloud/RGB history batch。 |
+| `timing.py` | immutable policy target grid、inference-expired prefix、plan/source deadline 与 diagnostic usable-target composition 的纯计算。 |
 | `worker.py` | 固定 DexMani Policy adapter 的 artifact-bound verified stream load、camera-grid observation 校验、logical-grid timing stamp、bounded timing samples 与 plan 发布。 |
 | `coordinator.py` | learned-policy 唯一 command producer、plan scheduling、物理执行本进程 H 完成 + arm-home 初态双门、逐 endpoint coupled ACK、typed stop、shadow/execute receipt、命令连续性与 watchdog。 |
 | `lifecycle.py` | shadow/H4/task worker topology、hand acknowledgement、物理模式 collision-checked home、B-relative supervision、receipt provenance 与 verified shutdown。 |
@@ -274,7 +275,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `tests/test_coupled_command_publication.py` | coupled-command 非阻塞发布、active ticket 覆盖/撤销、ACK ownership 与运动准入合同。 |
 | `tests/test_data_segments.py` | source 缺口到 processed/Zarr episode 边界及跨缺口质量计算的合同。 |
 | `tests/test_recording_integrity.py` | raw v24 语义/sidecar manifest、旧 schema 拒绝与 recorder fail-closed 发布合同。 |
-| `tests/test_deployment_timing.py` | run epoch、B-relative bounded stop、物理 arm-home 初态门、H4 one-shot/task 逐 endpoint ACK/timeout、因果 observation grid、checkpoint 数据合同与 immutable plan deadline。 |
+| `tests/test_deployment_timing.py` | immutable target grid、独立 lower/upper timing bounds、prefix-only transport mask、run epoch、watchdog、因果 observation grid 与 bounded physical control contracts。 |
 | `tests/test_deployment_manifest.py` | deployment manifest 模态去重与顺序规范化合同。 |
 | `tests/test_deployment_metrics.py` | bounded p50/p95/p99 timing、flush/run totals、shadow zero-write、H4 one-shot 与 task execute receipt 合同。 |
 | `tests/test_policy_checkpoint.py` | Real-owned deployment-v2 `weights_only` decoder 的 exact schema、plain metadata 与 canonical tensor-key 拒绝路径。 |

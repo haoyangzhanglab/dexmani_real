@@ -1025,10 +1025,11 @@ class DexManiPolicyRuntime:
                 "DexManiPolicyRuntime.predict called before checkpoint restore"
             )
         obs_dict = self._encode(observation)
-        result = self._agent.predict_action(
-            obs_dict,
-            denoise_timesteps=self._denoise_steps,
-        )
+        with torch.inference_mode():
+            result = self._agent.predict_action(
+                obs_dict,
+                denoise_timesteps=self._denoise_steps,
+            )
         _pred_action, control_action = self._validate_policy_outputs(
             result,
             verify_control_slice=False,
