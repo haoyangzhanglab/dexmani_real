@@ -3,7 +3,7 @@
 Composes the runtime primitives (``WorkerSpec`` +
 ``build_processes``/``start_processes``/``wait_subsystem_ready``/
 ``run_supervisor``/``shutdown_processes``) into the policy workflow — resolve
-config -> create ``RuntimeChannels`` -> start the artifact-verified inference
+config -> create ``RuntimeChannels`` -> start the Policy-owned inference
 process -> spawn arm (+ optional hand and RGB-D / point-cloud workers) ->
 coordinator -> readiness -> ARMED -> supervise -> verified shutdown. There is
 no second health mechanism: the supervisor's heartbeat/readiness slots already
@@ -13,19 +13,12 @@ There is no VR worker or recorder. The camera worker is included whenever the
 explicit observation contract contains ``point_cloud`` or ``rgb``; the
 point-cloud worker is included only for ``point_cloud``.
 
-Also owns the one-time startup provenance log line (commit hashes +
-checkpoint SHA-256) via ``sha256_file`` and
-``log_deployment_provenance``.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
-import logging
 import multiprocessing as mp
 import os
-import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -39,7 +32,6 @@ from dexmani_real.deployment.config import (
 from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_loop
 from dexmani_real.deployment.observation import parse_observation_fields
 from dexmani_real.deployment.operator import build_home_planner, run_operator_control
-from dexmani_real.deployment.run_identity import RealSourceIdentity
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.robot.arm_worker import arm_loop
@@ -63,8 +55,6 @@ from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig, pointclo
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _prepare_execute_receipt_dir() -> str:
@@ -90,124 +80,12 @@ def _requires_camera(deployment: DeploymentConfig) -> bool:
     return "point_cloud" in requested or "rgb" in requested
 
 
-def sha256_file(path: str | Path) -> str:
-    """Return the hex SHA-256 of a file's contents ("" when unreadable/missing).
-
-    Best-effort: logs the checkpoint hash "if available"; an
-    unreadable file logs empty rather than failing startup (the verified
-    checkpoint restore is the authoritative check for a bad checkpoint).
-    """
-    try:
-        digest = hashlib.sha256()
-        with Path(path).open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1 << 20), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
-    except OSError:
-        return ""
-
-
-def log_deployment_provenance(
-    logger: logging.Logger,
-    *,
-    deployment: DeploymentConfig,
-    runtime_sha256: str,
-    dexmani_commit: str = "",
-    model_commit: str = "",
-    checkpoint_sha256: str = "",
-) -> None:
-    """Log one structured provenance line (no RuntimeChannels write).
-
-    Provenance is a one-time startup log line, never a shared-memory payload:
-    the full resolved config must not enter high-frequency IPC. Commit hashes
-    are optional; absence logs ``unknown`` rather than fabricating a value.
-    """
-    logger.info(
-        "deployment provenance: dexmani_commit=%s model_commit=%s "
-        "runtime_target=%s device=%s inference_seed=%d observation_fields=%s "
-        "pointcloud_num_points=%d checkpoint=%s "
-        "checkpoint_sha256=%s runtime_sha256=%s",
-        dexmani_commit or "unknown",
-        model_commit or "unknown",
-        FIXED_POLICY_RUNTIME_TARGET,
-        deployment.device,
-        deployment.inference_seed,
-        deployment.observation_fields,
-        deployment.pointcloud_num_points,
-        deployment.checkpoint or "",
-        checkpoint_sha256 or "",
-        runtime_sha256,
-    )
-
-
-def _physical_execute_provenance_json(
-    policy_runtime_config: PolicyRuntimeConfig,
-    *,
-    runtime_sha256: str,
-    real_source: RealSourceIdentity,
-    invocation_argv: tuple[str, ...] | None,
-    projection_sha256: str | None,
-) -> str:
-    """Render the immutable contract recorded by a physical-run receipt."""
-    artifact = policy_runtime_config.artifact
-    if artifact is None:
-        raise ValueError("physical execute requires a resolved policy artifact")
-    if (
-        not isinstance(projection_sha256, str)
-        or _SHA256_RE.fullmatch(projection_sha256) is None
-    ):
-        raise ValueError("physical execute requires a canonical projection SHA-256")
-    execute_bounds = policy_runtime_config.physical_execute_bounds
-    if execute_bounds is None:
-        raise ValueError("physical execute requires explicit bounds")
-    return json.dumps(
-        {
-            "artifact": {
-                "checkpoint_sha256": artifact.checkpoint_sha256_from_index,
-                "checkpoint": artifact.checkpoint_path.name,
-                "index_sha256": artifact.index_sha256,
-            },
-            "invocation_argv": list(invocation_argv or ()),
-            # The inference worker independently verifies that the imported,
-            # clean Policy source exactly matches this artifact-owned contract.
-            "policy_package_contract": {
-                "commit": artifact.producer.commit,
-                "metadata_provenance": artifact.producer.metadata_provenance,
-                "repository": artifact.producer.repository,
-            },
-            "policy_projection": {
-                "bounds": {
-                    "acknowledgement_timeout_s": (
-                        execute_bounds.acknowledgement_timeout_s
-                    ),
-                    "max_published_endpoints": execute_bounds.max_published_endpoints,
-                    "max_running_s": execute_bounds.max_running_s,
-                },
-                "execution_mode": policy_runtime_config.execution_mode,
-                "device": policy_runtime_config.deployment.device,
-                "inference_seed": policy_runtime_config.deployment.inference_seed,
-                "sha256": projection_sha256,
-            },
-            "real_source": {
-                "commit": real_source.commit,
-                "dirty": real_source.dirty,
-                "python_tree_sha256": real_source.python_tree_sha256,
-            },
-            "runtime": {"config_sha256": runtime_sha256},
-        },
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-
-
 def build_policy_worker_specs(
     shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     policy_runtime_config: PolicyRuntimeConfig,
     *,
     execute_receipt_dir: str | None = None,
-    execute_receipt_provenance_json: str | None = None,
 ) -> list[WorkerSpec]:
     """Build the workers required by the explicit deployment contract.
 
@@ -225,7 +103,6 @@ def build_policy_worker_specs(
         h4_execute_bounds=policy_runtime_config.h4_execute_bounds,
         task_execute_bounds=policy_runtime_config.task_execute_bounds,
         execute_receipt_dir=execute_receipt_dir,
-        execute_receipt_provenance_json=execute_receipt_provenance_json,
     )
     pointcloud_requested = _requires_pointcloud(deployment)
     camera_requested = _requires_camera(deployment)
@@ -300,9 +177,6 @@ def run_policy_deployment(
     *,
     prefix: str | None = None,
     max_running_s: float | None = None,
-    real_source: RealSourceIdentity | None = None,
-    invocation_argv: tuple[str, ...] | None = None,
-    projection_sha256: str | None = None,
 ) -> int:
     """Run one policy deployment lifecycle and return its exit code.
 
@@ -330,32 +204,12 @@ def run_policy_deployment(
     deployment = policy_runtime_config.deployment
     if deployment.hand_enabled and not policy_runtime_config.hand_acknowledged:
         raise ValueError("deployment with hand targets requires --hand")
-    execute_receipt_provenance_json: str | None = None
-    if policy_runtime_config.execution_mode in {"execute", "task"}:
-        if real_source is None or real_source.availability != "available":
-            raise ValueError("physical execute requires resolved Real source identity")
-        if real_source.dirty != "false":
-            raise ValueError("physical execute requires a clean Real source identity")
-        execute_receipt_provenance_json = _physical_execute_provenance_json(
-            policy_runtime_config,
-            runtime_sha256=runtime.sha256,
-            real_source=real_source,
-            invocation_argv=invocation_argv,
-            projection_sha256=projection_sha256,
-        )
-    log_deployment_provenance(
-        logger,
-        deployment=deployment,
-        runtime_sha256=runtime.sha256,
-        dexmani_commit=((real_source.commit or "") if real_source is not None else ""),
-        model_commit=(
-            policy_runtime_config.artifact.producer.commit
-            if policy_runtime_config.artifact is not None
-            else ""
-        ),
-        checkpoint_sha256=(
-            sha256_file(deployment.checkpoint) if deployment.checkpoint else ""
-        ),
+    logger.info(
+        "policy deployment: experiment=%s runtime=%s device=%s seed=%d",
+        deployment.experiment,
+        FIXED_POLICY_RUNTIME_TARGET,
+        deployment.device,
+        deployment.inference_seed,
     )
 
     execute_receipt_dir = (
@@ -394,7 +248,6 @@ def run_policy_deployment(
             runtime,
             policy_runtime_config,
             execute_receipt_dir=execute_receipt_dir,
-            execute_receipt_provenance_json=execute_receipt_provenance_json,
         )
         procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)

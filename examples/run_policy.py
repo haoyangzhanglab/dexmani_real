@@ -29,9 +29,8 @@ class _LegacyBridge:
     """Resolved inputs for a legacy lifecycle which Phase 2 must not start."""
 
     legacy_execution_mode: str
-    artifact: Any
     runtime: Any
-    projection: Any | None
+    projection: Any
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -76,21 +75,21 @@ def _parser() -> argparse.ArgumentParser:
 
 def _list_policy_experiments(filter_value: str | None) -> tuple[str, ...]:
     """Call the sole Policy API permitted by the ``list`` command."""
-    from dexmani_policy.deployment.runtime import list_experiments
+    from dexmani_policy.deployment import list_experiments
 
     return list_experiments(filter_value)
 
 
 def _inspect_policy_experiment(experiment: str) -> Any:
     """Inspect metadata through Policy without constructing a model."""
-    from dexmani_policy.deployment.runtime import inspect_experiment
+    from dexmani_policy.deployment import inspect_experiment
 
     return inspect_experiment(experiment)
 
 
 def _load_policy_experiment(experiment: str, device: str) -> Any:
     """Strictly restore one model through the Policy-owned runtime."""
-    from dexmani_policy.deployment.runtime import load_experiment
+    from dexmani_policy.deployment import load_experiment
 
     return load_experiment(experiment, device=device)
 
@@ -178,50 +177,33 @@ def _run_check(args: argparse.Namespace) -> int:
 
 
 def _prepare_legacy_bridge(
-    args: argparse.Namespace, *, legacy_execution_mode: str
+    args: argparse.Namespace, info: Any, *, legacy_execution_mode: str
 ) -> _LegacyBridge:
-    """Resolve the old artifact/config bridge without starting its lifecycle.
+    """Resolve the temporary Real config bridge without starting its lifecycle.
 
-    ``shadow`` can still be projected as the old shadow mode. ``run`` is
-    deliberately only labelled as the old task path here: constructing that
-    path requires the retired operator bounds and must remain impossible until
-    the later lifecycle migration owns the new execution contract.
+    Both commands use a no-publication projection for compatibility validation.
+    The requested command label is retained separately; constructing or starting
+    any physical lifecycle remains structurally impossible from this CLI phase.
     """
     from dexmani_real.config.runtime import resolve_runtime_config
-    from dexmani_real.deployment.artifact import resolve_policy_artifact
     from dexmani_real.deployment.config import resolve_policy_runtime_config
 
-    experiment_dir = _resolve_policy_experiment_directory(args.experiment)
-    artifact = resolve_policy_artifact(experiment_dir)
-    if artifact.selector_name != "deployment_latest.pt":
-        raise ValueError(
-            "legacy bridge requires the Policy deployment_latest.pt selector"
-        )
-    runtime = resolve_runtime_config(yaml_path=args.config)
-    if legacy_execution_mode == "shadow":
-        projection = resolve_policy_runtime_config(
-            artifact=artifact,
-            runtime_config=runtime,
-            device=args.device,
-            execution_mode="shadow",
-        )
-    elif legacy_execution_mode == "task":
-        projection = None
-    else:
+    if legacy_execution_mode not in {"shadow", "task"}:
         raise ValueError(f"unsupported legacy execution mode: {legacy_execution_mode}")
+    runtime = resolve_runtime_config(yaml_path=args.config)
+    projection = resolve_policy_runtime_config(
+        experiment=info.selector,
+        task_name=info.task_name,
+        policy_spec=info.spec,
+        runtime_config=runtime,
+        device=args.device,
+        execution_mode="shadow",
+    )
     return _LegacyBridge(
         legacy_execution_mode=legacy_execution_mode,
-        artifact=artifact,
         runtime=runtime,
         projection=projection,
     )
-
-
-def _resolve_policy_experiment_directory(experiment: str) -> Any:
-    """Resolve the Policy-selected ``deployment_latest`` experiment directory."""
-    from dexmani_policy.deployment.runtime import resolve_experiment
-
-    return resolve_experiment(experiment)
 
 
 def _run_staged_lifecycle(
@@ -239,15 +221,15 @@ def _run_staged_lifecycle(
     )
     try:
         bridge = _prepare_legacy_bridge(
-            args, legacy_execution_mode=legacy_execution_mode
+            args, info, legacy_execution_mode=legacy_execution_mode
         )
     except Exception as exc:
         _print_compatibility_error(f"legacy bridge validation failed: {exc}")
         return 1
 
     # Do not import or call ``run_policy_deployment`` here. The phase-two
-    # bridge proves that the Policy deployment_latest selection and Real
-    # artifact/config inputs still agree, while making a hardware start
+    # bridge proves that the PolicySpec and Real runtime inputs still agree,
+    # while making a hardware start
     # structurally impossible from this CLI revision.
     del bridge
     if legacy_execution_mode == "task":

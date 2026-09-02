@@ -654,7 +654,8 @@ read → check freshness/state → compute → validate → publish → rate con
 
 ```text
 typed observation (causal history windows + point-cloud T 历史)
-→ PolicyRuntime (load/predict/reset_episode)
+→ dexmani_policy public runtime (load/predict/reset_episode)
+→ Real NumPy adapter
 → joint/EE action chunk
 → scheduler/coordinator (active/pending + replan stride + EE→IK)
 → shared safety gate (limits + delta + collision)
@@ -663,12 +664,10 @@ typed observation (causal history windows + point-cloud T 历史)
 
 要求：
 
-- torch/model repository 的依赖留在 inference worker 或 integration module；
-- device、checkpoint、model config、observation fields 与 action_key 显式配置；
-- checkpoint 契约（n_obs_steps/n_action_steps/action_dim/horizon/control_action_dim/点云 N）
-  在 `DeploymentManifest` 中组装并在 `load` 时 fail-closed 校验（domain==real，杜绝 sim checkpoint）；
-- inference 使用适当的 no-grad/inference context；
-- normalization/denormalization 的 owner 唯一且在 `PolicyRuntime` 合同中说明；
+- checkpoint/Hydra/EMA/normalizer/Torch 只由 `dexmani_policy.deployment` public API 拥有；
+- device 与 experiment 是 session 输入；PolicySpec 是 model shape、modality、action 与 dt 的只读合同；
+- Real 只校验固定硬件、点云、控制周期与 IPC capacity 兼容，不解析 checkpoint 内部结构；
+- inference/no-grad、normalization/denormalization 与 model preprocessing 均由 Policy runtime 拥有；
 - EE action、joint action、degrees/radians 不做静默猜测或自动兼容；
 - 不允许模型代码直接访问 hardware SDK 或绕过 coordinator；
 - `FakePolicyRuntime` 保持确定性，用于验证 observation → plan 链路而非模拟真实性能。

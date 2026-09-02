@@ -150,7 +150,6 @@ class CoordinatorConfig:
     h4_execute_bounds: H4ExecuteBounds | None = None
     task_execute_bounds: TaskExecuteBounds | None = None
     execute_receipt_dir: str | None = None
-    execute_receipt_provenance_json: str | None = None
     # Full 19-DoF collision model (hand + static boxes) for EE->IK and the
     # transition collision gate (Phase 6/7); table clearance is not part of the
     # policy safety gate.
@@ -240,7 +239,6 @@ class CoordinatorConfig:
         h4_execute_bounds: H4ExecuteBounds | None,
         task_execute_bounds: TaskExecuteBounds | None = None,
         execute_receipt_dir: str | None = None,
-        execute_receipt_provenance_json: str | None = None,
     ) -> "CoordinatorConfig":
         return cls(
             deployment=deployment,
@@ -258,7 +256,6 @@ class CoordinatorConfig:
             h4_execute_bounds=h4_execute_bounds,
             task_execute_bounds=task_execute_bounds,
             execute_receipt_dir=execute_receipt_dir,
-            execute_receipt_provenance_json=execute_receipt_provenance_json,
             static_boxes=tuple(runtime.environment.static_boxes),
             ik_max_pose_error_pos_m=float(runtime.policy.ik_max_pose_error_pos_m),
             ik_max_pose_error_rot_rad=float(runtime.policy.ik_max_pose_error_rot_rad),
@@ -656,7 +653,6 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 acknowledgement_timeout_s=execute_bounds.acknowledgement_timeout_s,
                 acknowledged_action_id=execute_acknowledged_action_id,
                 completed=bool(shared.execute_completed.value),
-                provenance_json=config.execute_receipt_provenance_json,
                 metrics=metrics.run_snapshot(),
                 timeline_monotonic_ns={
                     name: value

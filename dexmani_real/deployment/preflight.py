@@ -1,127 +1,61 @@
-"""Isolated, hash-bound learned-policy preflight.
-
-The parent sends only a pickle-safe Real receipt to a fresh ``spawn`` child.
-The child reopens the fixed artifact entries through no-follow descriptors,
-checks the indexed digest, then performs the one safe stream deserialize and
-one synthetic-observation prediction. It never resolves a selector, creates
-runtime channels, or imports a hardware owner.
-"""
+"""Temporary isolated policy smoke test retained until lifecycle Phase 4."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import multiprocessing as mp
-import os
-import re
-import stat
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 
-from dexmani_real.deployment.artifact import DirectoryIdentity, FileLstatIdentity
 from dexmani_real.deployment.config import PolicyRuntimeConfig
-from dexmani_real.deployment.contracts import PolicyPrediction, PolicyRuntime
+from dexmani_real.deployment.contracts import PolicyPrediction
 from dexmani_real.deployment.observation import (
     FrameWindow,
     ObservationBatch,
     PointCloudFrame,
-    RgbFrame,
 )
 
 _ARM_DOF = 7
 _HAND_DOF = 12
-
-_DIRECTORY_OPEN_FLAGS = (
-    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-)
-_READ_NOFOLLOW_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-_HASH_CHUNK_BYTES = 1024 * 1024
 _MAX_CHILD_MESSAGE_BYTES = 16 * 1024
 _MAX_CHILD_ERROR_CHARS = 2 * 1024
 _CHILD_JOIN_TIMEOUT_S = 2.0
-_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
-_COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 
 @dataclass(frozen=True)
 class PreflightResult:
-    """Small JSON-safe receipt; ``action_steps`` is the executable chunk length."""
+    """Small smoke-test result containing no artifact or source identity."""
 
-    checkpoint_sha256: str
-    checkpoint_sha256_verified: bool
     action_steps: int
     action_dim: int
-    package_origin: str
-    package_commit: str
-    package_dirty: str
-    package_source_tree_sha256: str
-    package_version: str
 
     def __post_init__(self) -> None:
-        if not _SHA256_RE.fullmatch(self.checkpoint_sha256):
-            raise ValueError("preflight receipt checkpoint SHA-256 is invalid")
-        if self.checkpoint_sha256_verified is not True:
-            raise ValueError("preflight receipt must verify the checkpoint digest")
         for name in ("action_steps", "action_dim"):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"preflight receipt {name} is invalid")
-        if (
-            not isinstance(self.package_origin, str)
-            or not self.package_origin
-            or len(self.package_origin) > 4096
-        ):
-            raise ValueError("preflight receipt package origin is invalid")
-        if not _COMMIT_RE.fullmatch(self.package_commit):
-            raise ValueError("preflight receipt package commit is invalid")
-        if self.package_dirty not in {"true", "false", "unknown"}:
-            raise ValueError("preflight receipt package dirty marker is invalid")
-        if not _SHA256_RE.fullmatch(self.package_source_tree_sha256):
-            raise ValueError("preflight receipt package source tree SHA-256 is invalid")
-        if not isinstance(self.package_version, str) or len(self.package_version) > 256:
-            raise ValueError("preflight receipt package version is invalid")
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"preflight result {name} must be positive")
 
-    def to_wire(self) -> dict[str, Any]:
-        return {
-            "action_dim": self.action_dim,
-            "action_steps": self.action_steps,
-            "checkpoint_sha256": self.checkpoint_sha256,
-            "checkpoint_sha256_verified": self.checkpoint_sha256_verified,
-            "package_commit": self.package_commit,
-            "package_dirty": self.package_dirty,
-            "package_origin": self.package_origin,
-            "package_source_tree_sha256": self.package_source_tree_sha256,
-            "package_version": self.package_version,
-        }
+    def to_wire(self) -> dict[str, int]:
+        return {"action_steps": self.action_steps, "action_dim": self.action_dim}
 
     @classmethod
     def from_wire(cls, value: Any) -> "PreflightResult":
         if not isinstance(value, dict) or set(value) != {
-            "action_dim",
             "action_steps",
-            "checkpoint_sha256",
-            "checkpoint_sha256_verified",
-            "package_commit",
-            "package_dirty",
-            "package_origin",
-            "package_source_tree_sha256",
-            "package_version",
+            "action_dim",
         }:
-            raise ValueError("policy preflight child returned an invalid receipt")
+            raise ValueError("policy preflight child returned an invalid result")
         return cls(**value)
 
 
 def run_isolated_preflight(
     runtime_config: PolicyRuntimeConfig, *, timeout_s: float = 120.0
 ) -> PreflightResult:
-    """Run one bounded child preflight and propagate every failure fail-closed."""
+    """Run the temporary bounded child smoke test and propagate all failures."""
     if not isinstance(runtime_config, PolicyRuntimeConfig):
         raise TypeError("preflight requires PolicyRuntimeConfig")
-    if runtime_config.artifact is None:
-        raise ValueError("preflight requires an artifact-bound PolicyRuntimeConfig")
     if timeout_s <= 0.0:
         raise ValueError("preflight timeout_s must be positive")
     context = mp.get_context("spawn")
@@ -150,31 +84,29 @@ def run_isolated_preflight(
             payload = parent_connection.recv_bytes(_MAX_CHILD_MESSAGE_BYTES)
         except EOFError as exc:
             raise RuntimeError(
-                "policy preflight child exited without a receipt"
+                "policy preflight child exited without a result"
             ) from exc
         except OSError as exc:
             raise RuntimeError(
-                "policy preflight child receipt exceeds its bound"
+                "policy preflight child result exceeds its bound"
             ) from exc
         message = _decode_child_message(payload)
         process.join(timeout=_CHILD_JOIN_TIMEOUT_S)
         if process.is_alive():
-            raise RuntimeError("policy preflight child did not exit after its receipt")
+            raise RuntimeError("policy preflight child did not exit after its result")
         if process.exitcode != 0:
             raise RuntimeError(
                 f"policy preflight child exited with code {process.exitcode}"
             )
         if message["ok"] is not True:
             raise RuntimeError(f"policy preflight failed: {message['error']}")
-        result = PreflightResult.from_wire(message["receipt"])
-        allocation = runtime_config.artifact.allocation_contract
+        result = PreflightResult.from_wire(message["result"])
+        deployment = runtime_config.deployment
         if (
-            result.checkpoint_sha256
-            != runtime_config.artifact.checkpoint_sha256_from_index
-            or result.action_steps != allocation.n_action_steps
-            or result.action_dim != allocation.action_dim
+            result.action_steps != deployment.n_action_steps
+            or result.action_dim != deployment.control_action_dim
         ):
-            raise RuntimeError("policy preflight child receipt mismatches its request")
+            raise RuntimeError("policy preflight child result mismatches its request")
         return result
     finally:
         parent_connection.close()
@@ -189,17 +121,17 @@ def _decode_child_message(payload: bytes) -> dict[str, Any]:
         value = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError("policy preflight child returned invalid JSON") from exc
-    if not isinstance(value, dict) or set(value) != {"ok", "receipt", "error"}:
+    if not isinstance(value, dict) or set(value) != {"ok", "result", "error"}:
         raise RuntimeError("policy preflight child returned an invalid message schema")
     if (
         value["ok"] is True
         and value["error"] is None
-        and isinstance(value["receipt"], dict)
+        and isinstance(value["result"], dict)
     ):
         return value
     if (
         value["ok"] is False
-        and value["receipt"] is None
+        and value["result"] is None
         and isinstance(value["error"], str)
         and len(value["error"]) <= _MAX_CHILD_ERROR_CHARS
     ):
@@ -221,12 +153,12 @@ def _preflight_child(connection: Any, runtime_config: PolicyRuntimeConfig) -> No
         result = _run_preflight_child(runtime_config)
         message: dict[str, Any] = {
             "ok": True,
-            "receipt": result.to_wire(),
+            "result": result.to_wire(),
             "error": None,
         }
     except BaseException as exc:
         detail = f"{type(exc).__name__}: {exc}"[:_MAX_CHILD_ERROR_CHARS]
-        message = {"ok": False, "receipt": None, "error": detail}
+        message = {"ok": False, "result": None, "error": detail}
     try:
         connection.send_bytes(_encode_child_message(message))
     except (BrokenPipeError, EOFError, OSError, ValueError):
@@ -235,8 +167,98 @@ def _preflight_child(connection: Any, runtime_config: PolicyRuntimeConfig) -> No
         connection.close()
 
 
+def _run_preflight_child(runtime_config: PolicyRuntimeConfig) -> PreflightResult:
+    from dexmani_real.deployment.worker import _load_inference_runtime
+
+    runtime = _load_inference_runtime(runtime_config)
+    try:
+        timings = runtime.warmup(samples=1)
+        if len(timings) != 1 or not np.isfinite(timings[0]) or timings[0] < 0.0:
+            raise RuntimeError("policy preflight returned invalid warmup timing")
+        prediction = runtime.predict(_synthetic_observation(runtime_config))
+    finally:
+        runtime.close()
+    _validate_prediction(prediction, runtime_config)
+    return PreflightResult(
+        action_steps=runtime_config.deployment.n_action_steps,
+        action_dim=runtime_config.deployment.control_action_dim,
+    )
+
+
+def _synthetic_observation(runtime_config: PolicyRuntimeConfig) -> ObservationBatch:
+    deployment = runtime_config.deployment
+    count = deployment.observation_horizon
+    run_ns = 1_000_000_000
+    source_ns = run_ns + np.arange(1, count + 1, dtype=np.uint64) * 1_000_000
+    publish_ns = source_ns + 1
+    sequence = np.arange(1, count + 1, dtype=np.uint64)
+    valid = np.ones(count, dtype=np.uint8)
+    arm = FrameWindow(
+        values=np.zeros((count, _ARM_DOF), dtype=np.float64),
+        source_sequence=sequence,
+        source_monotonic_ns=source_ns,
+        publish_monotonic_ns=publish_ns,
+        valid_mask=valid,
+    )
+    hand = FrameWindow(
+        values=np.zeros((count, _HAND_DOF), dtype=np.float64),
+        source_sequence=sequence,
+        source_monotonic_ns=source_ns,
+        publish_monotonic_ns=publish_ns,
+        valid_mask=valid,
+    )
+    points = np.zeros(
+        (deployment.pointcloud_num_points, deployment.pointcloud_feature_dim),
+        dtype=np.float32,
+    )
+    points[:, 0] = 0.4
+    points[:, 3:] = 0.5
+    clouds = tuple(
+        PointCloudFrame(
+            values=points,
+            source_camera_sequence=int(index),
+            source_monotonic_ns=int(source),
+            publish_monotonic_ns=int(published),
+            camera_generation=1,
+        )
+        for index, source, published in zip(
+            sequence, source_ns, publish_ns, strict=True
+        )
+    )
+    latest_source_ns = int(source_ns[-1])
+    return ObservationBatch(
+        observation_id=1,
+        run_generation=1,
+        run_started_monotonic_ns=run_ns,
+        anchor_monotonic_ns=int(publish_ns[-1]) + 1_000_000,
+        latest_source_monotonic_ns=latest_source_ns,
+        logical_step_monotonic_ns=latest_source_ns,
+        arm_history=arm,
+        hand_history=hand,
+        pointcloud=clouds[-1],
+        pointcloud_history=clouds,
+    )
+
+
+def _validate_prediction(prediction: Any, runtime_config: PolicyRuntimeConfig) -> None:
+    if not isinstance(prediction, PolicyPrediction):
+        raise TypeError("synthetic preflight prediction must be a PolicyPrediction")
+    deployment = runtime_config.deployment
+    values = prediction.ee_pos if prediction.is_ee else prediction.arm_qpos
+    if values is None or values.shape[0] != deployment.n_action_steps:
+        raise ValueError("synthetic preflight prediction has an invalid chunk length")
+    if prediction.hand_qpos is None or prediction.hand_qpos.shape != (
+        deployment.n_action_steps,
+        _HAND_DOF,
+    ):
+        raise ValueError("synthetic preflight prediction is missing hand12 actions")
+    if prediction.is_ee != (deployment.action_key == "action_ee"):
+        raise ValueError(
+            "synthetic preflight prediction action space mismatches PolicySpec"
+        )
+
+
 def _terminate_join_kill_close(process: Any) -> None:
-    """Leave no child alive on timeout, EOF, receipt-hang, or parent failure."""
     try:
         if process.is_alive():
             process.terminate()
@@ -257,474 +279,3 @@ def _close_process(process: Any) -> None:
     close = getattr(process, "close", None)
     if callable(close):
         close()
-
-
-def load_verified_policy_runtime(runtime_config: PolicyRuntimeConfig) -> PolicyRuntime:
-    """Return a DexMani runtime from one verified checkpoint stream.
-
-    This is the inference-child counterpart to ``--preflight-only``. It uses
-    only the fixed artifact entries, verifies their no-follow identities and
-    digest before policy import/deserialization, and never calls the disabled
-    path-based ``PolicyRuntime.load`` API. The caller owns the returned runtime.
-    """
-    runtime, _actual_sha256, _provenance = _load_verified_policy_runtime(runtime_config)
-    return runtime
-
-
-def _load_verified_policy_runtime(
-    runtime_config: PolicyRuntimeConfig,
-) -> tuple[PolicyRuntime, str, Mapping[str, str]]:
-    """Build one runtime after the fd-bound artifact verification sequence."""
-    if not isinstance(runtime_config, PolicyRuntimeConfig):
-        raise TypeError("verified policy load requires PolicyRuntimeConfig")
-    artifact = runtime_config.artifact
-    if artifact is None:
-        raise ValueError("verified policy load requires a resolved artifact")
-    experiment_fd: int | None = None
-    checkpoints_fd: int | None = None
-    checkpoint_fd: int | None = None
-    runtime: PolicyRuntime | None = None
-    try:
-        experiment_fd = _open_directory(
-            artifact.experiment_dir,
-            artifact.experiment_directory_identity,
-            "experiment root",
-        )
-        checkpoints_fd = _open_directory_at(
-            experiment_fd,
-            "checkpoints",
-            artifact.checkpoints_directory_identity,
-            "checkpoints directory",
-        )
-        selector_name = _strict_basename(artifact.selector_path, ".pt")
-        checkpoint_name = _strict_basename(artifact.checkpoint_path, ".pt")
-        sidecar_entry_name = _strict_basename(
-            artifact.sidecar_entry_path, ".deployment.json"
-        )
-        sidecar_name = _strict_basename(artifact.sidecar_path, ".json")
-        _require_entry_lstat_identity(
-            checkpoints_fd,
-            selector_name,
-            artifact.selector_lstat_identity,
-            "checkpoint selector",
-        )
-        _require_lstat_identity(
-            checkpoints_fd,
-            checkpoint_name,
-            artifact.checkpoint_lstat_identity,
-            "checkpoint",
-        )
-        _require_entry_lstat_identity(
-            checkpoints_fd,
-            sidecar_entry_name,
-            artifact.sidecar_entry_lstat_identity,
-            "checkpoint sidecar entry",
-        )
-        _require_lstat_identity(
-            checkpoints_fd,
-            sidecar_name,
-            artifact.sidecar_lstat_identity,
-            "checkpoint sidecar",
-        )
-        checkpoint_fd = os.open(
-            checkpoint_name, _READ_NOFOLLOW_FLAGS, dir_fd=checkpoints_fd
-        )
-        _require_open_identity(
-            checkpoint_fd, artifact.checkpoint_lstat_identity, "checkpoint"
-        )
-        with os.fdopen(checkpoint_fd, "rb", closefd=False) as stream:
-            actual_sha256 = _sha256_stream(stream)
-            _recheck_artifact_identities(
-                artifact,
-                experiment_fd,
-                checkpoints_fd,
-                selector_name,
-                checkpoint_name,
-                sidecar_entry_name,
-                sidecar_name,
-                checkpoint_fd,
-            )
-            if actual_sha256 != artifact.checkpoint_sha256_from_index:
-                raise ValueError("checkpoint SHA-256 mismatches sidecar index")
-
-            # No Policy code is imported before this standard-library gate.
-            from dexmani_real.integrations.dexmani_policy import (
-                precheck_policy_package_provenance,
-            )
-
-            provenance = precheck_policy_package_provenance(runtime_config)
-            stream.seek(0)
-            # The deployment loader is the only torch deserialize in this child.
-            from dexmani_real.deployment.policy_checkpoint import (
-                load_deployment_checkpoint_stream,
-            )
-
-            checkpoint = load_deployment_checkpoint_stream(stream)
-            _recheck_artifact_identities(
-                artifact,
-                experiment_fd,
-                checkpoints_fd,
-                selector_name,
-                checkpoint_name,
-                sidecar_entry_name,
-                sidecar_name,
-                checkpoint_fd,
-            )
-        from dexmani_real.integrations.dexmani_policy import DexManiPolicyRuntime
-
-        runtime = DexManiPolicyRuntime(runtime_config)
-        try:
-            runtime.load_loaded_checkpoint(checkpoint, package_provenance=provenance)
-            _recheck_artifact_identities(
-                artifact,
-                experiment_fd,
-                checkpoints_fd,
-                selector_name,
-                checkpoint_name,
-                sidecar_entry_name,
-                sidecar_name,
-                checkpoint_fd,
-            )
-        except BaseException:
-            try:
-                runtime.close()
-            except Exception:
-                pass
-            raise
-        return runtime, actual_sha256, provenance
-    finally:
-        _close_fd(checkpoint_fd)
-        _close_fd(checkpoints_fd)
-        _close_fd(experiment_fd)
-
-
-def _run_preflight_child(runtime_config: PolicyRuntimeConfig) -> PreflightResult:
-    runtime, actual_sha256, provenance = _load_verified_policy_runtime(runtime_config)
-    try:
-        import torch
-
-        # Runtime construction already initialized the checkpoint-bound RNG
-        # streams. Do not replace them here: preflight must exercise the same
-        # first prediction stream as the operational inference worker.
-        contract_warmup = runtime.warmup(samples=1)
-        if (
-            len(contract_warmup) != 1
-            or not np.isfinite(contract_warmup[0])
-            or contract_warmup[0] < 0.0
-        ):
-            raise RuntimeError("policy preflight returned invalid warmup timing")
-        observation = _synthetic_observation(runtime_config)
-        with torch.inference_mode():
-            prediction = runtime.predict(observation)
-    finally:
-        runtime.close()
-    _validate_prediction(prediction, runtime_config)
-    artifact = runtime_config.artifact
-    assert artifact is not None
-    return PreflightResult(
-        checkpoint_sha256=actual_sha256,
-        checkpoint_sha256_verified=True,
-        action_steps=artifact.allocation_contract.n_action_steps,
-        action_dim=artifact.allocation_contract.action_dim,
-        package_origin=provenance["origin"],
-        package_commit=provenance["commit"],
-        package_dirty=provenance["dirty"],
-        package_source_tree_sha256=provenance["source_tree_sha256"],
-        package_version=provenance["version"],
-    )
-
-
-def _recheck_artifact_identities(
-    artifact: Any,
-    experiment_fd: int,
-    checkpoints_fd: int,
-    selector_name: str,
-    checkpoint_name: str,
-    sidecar_entry_name: str,
-    sidecar_name: str,
-    checkpoint_fd: int,
-) -> None:
-    _require_open_identity(
-        checkpoint_fd, artifact.checkpoint_lstat_identity, "checkpoint"
-    )
-    _require_entry_lstat_identity(
-        checkpoints_fd,
-        selector_name,
-        artifact.selector_lstat_identity,
-        "checkpoint selector",
-    )
-    _require_lstat_identity(
-        checkpoints_fd,
-        checkpoint_name,
-        artifact.checkpoint_lstat_identity,
-        "checkpoint",
-    )
-    _require_entry_lstat_identity(
-        checkpoints_fd,
-        sidecar_entry_name,
-        artifact.sidecar_entry_lstat_identity,
-        "checkpoint sidecar entry",
-    )
-    _require_lstat_identity(
-        checkpoints_fd,
-        sidecar_name,
-        artifact.sidecar_lstat_identity,
-        "checkpoint sidecar",
-    )
-    _require_directory_identity(
-        experiment_fd, artifact.experiment_directory_identity, "experiment root"
-    )
-    _require_directory_identity(
-        checkpoints_fd, artifact.checkpoints_directory_identity, "checkpoints directory"
-    )
-
-
-def _strict_basename(path: Path, suffix: str) -> str:
-    name = path.name
-    if (
-        path.parent.name != "checkpoints"
-        or name != str(path.name)
-        or not name.endswith(suffix)
-    ):
-        raise ValueError(f"artifact {suffix} path is not a fixed checkpoints basename")
-    return name
-
-
-def _open_directory(path: Path, identity: DirectoryIdentity, label: str) -> int:
-    try:
-        fd = os.open(path, _DIRECTORY_OPEN_FLAGS)
-    except OSError as exc:
-        raise ValueError(f"{label} cannot be opened safely") from exc
-    try:
-        _require_directory_identity(fd, identity, label)
-    except BaseException:
-        _close_fd(fd)
-        raise
-    return fd
-
-
-def _open_directory_at(
-    parent_fd: int, name: str, identity: DirectoryIdentity, label: str
-) -> int:
-    try:
-        fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
-    except OSError as exc:
-        raise ValueError(f"{label} cannot be opened safely") from exc
-    try:
-        _require_directory_identity(fd, identity, label)
-    except BaseException:
-        _close_fd(fd)
-        raise
-    return fd
-
-
-def _require_directory_identity(
-    fd: int, identity: DirectoryIdentity, label: str
-) -> None:
-    info = os.fstat(fd)
-    if not stat.S_ISDIR(info.st_mode) or not identity.matches_stat(info):
-        raise ValueError(f"{label} identity changed")
-
-
-def _require_entry_lstat_identity(
-    directory_fd: int, name: str, identity: FileLstatIdentity, label: str
-) -> None:
-    try:
-        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except OSError as exc:
-        raise ValueError(f"{label} cannot be inspected safely") from exc
-    if not identity.matches_stat(info):
-        raise ValueError(f"{label} identity changed")
-
-
-def _require_lstat_identity(
-    directory_fd: int, name: str, identity: FileLstatIdentity, label: str
-) -> None:
-    _require_entry_lstat_identity(directory_fd, name, identity, label)
-    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        raise ValueError(f"{label} identity changed")
-
-
-def _require_open_identity(fd: int, identity: FileLstatIdentity, label: str) -> None:
-    info = os.fstat(fd)
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_nlink != 1
-        or not identity.matches_stat(info)
-    ):
-        raise ValueError(f"{label} identity changed")
-
-
-def _sha256_stream(stream: Any) -> str:
-    digest = hashlib.sha256()
-    stream.seek(0)
-    while True:
-        block = stream.read(_HASH_CHUNK_BYTES)
-        if not block:
-            break
-        digest.update(block)
-    stream.seek(0)
-    return digest.hexdigest()
-
-
-def _synthetic_observation(runtime_config: PolicyRuntimeConfig) -> ObservationBatch:
-    allocation = (
-        runtime_config.artifact.allocation_contract if runtime_config.artifact else None
-    )
-    if allocation is None:
-        raise ValueError("synthetic observation requires an artifact")
-    count = allocation.n_obs_steps
-    run_ns = 1_000_000_000
-    source_ns = run_ns + np.arange(1, count + 1, dtype=np.uint64) * 1_000_000
-    publish_ns = source_ns + 1
-    sequence = np.arange(1, count + 1, dtype=np.uint64)
-    valid = np.ones(count, dtype=np.uint8)
-    arm = FrameWindow(
-        values=np.zeros((count, _ARM_DOF), dtype=np.float32),
-        source_sequence=sequence,
-        source_monotonic_ns=source_ns,
-        publish_monotonic_ns=publish_ns,
-        valid_mask=valid,
-    )
-    hand = FrameWindow(
-        values=np.zeros((count, _HAND_DOF), dtype=np.float32),
-        source_sequence=sequence,
-        source_monotonic_ns=source_ns,
-        publish_monotonic_ns=publish_ns,
-        valid_mask=valid,
-    )
-    pointcloud_history: tuple[PointCloudFrame, ...] = ()
-    if allocation.point_cloud_num_points is not None:
-        assert allocation.point_cloud_feature_dim is not None
-        points = np.zeros(
-            (allocation.point_cloud_num_points, allocation.point_cloud_feature_dim),
-            dtype=np.float32,
-        )
-        points[:, 0] = 0.4
-        points[:, 3:] = 0.5
-        pointcloud_history = tuple(
-            PointCloudFrame(
-                values=points,
-                source_camera_sequence=int(index),
-                source_monotonic_ns=int(source),
-                publish_monotonic_ns=int(published),
-                camera_generation=1,
-            )
-            for index, source, published in zip(
-                sequence, source_ns, publish_ns, strict=True
-            )
-        )
-    rgb_history: tuple[RgbFrame, ...] = ()
-    if allocation.rgb_shape is not None:
-        rgb = np.zeros(allocation.rgb_shape, dtype=np.uint8)
-        rgb_history = tuple(
-            RgbFrame(
-                values=rgb,
-                source_camera_sequence=int(index),
-                source_monotonic_ns=int(source),
-                publish_monotonic_ns=int(published),
-                camera_generation=1,
-            )
-            for index, source, published in zip(
-                sequence, source_ns, publish_ns, strict=True
-            )
-        )
-    latest_source_ns = int(source_ns[-1])
-    latest_publish_ns = int(publish_ns[-1])
-    latest_pointcloud = pointcloud_history[-1] if pointcloud_history else None
-    return ObservationBatch(
-        observation_id=1,
-        run_generation=1,
-        run_started_monotonic_ns=run_ns,
-        anchor_monotonic_ns=latest_publish_ns + 1_000_000,
-        latest_source_monotonic_ns=latest_source_ns,
-        logical_step_monotonic_ns=latest_source_ns,
-        arm_history=arm,
-        hand_history=hand,
-        pointcloud=latest_pointcloud,
-        pointcloud_history=pointcloud_history,
-        rgb_history=rgb_history,
-    )
-
-
-def _validate_prediction(prediction: Any, runtime_config: PolicyRuntimeConfig) -> None:
-    artifact = runtime_config.artifact
-    assert artifact is not None
-    if not isinstance(prediction, PolicyPrediction):
-        raise TypeError("synthetic preflight prediction must be a PolicyPrediction")
-    action_key = artifact.allocation_contract.action_key
-    if action_key == "action" and prediction.is_ee:
-        raise ValueError(
-            "synthetic preflight joint action artifact requires arm7 joint actions, not EE"
-        )
-    if action_key == "action_ee" and not prediction.is_ee:
-        raise ValueError(
-            "synthetic preflight EE action artifact requires ee_pos/ee_rot6d actions"
-        )
-    if action_key not in {"action", "action_ee"}:
-        raise ValueError(
-            f"synthetic preflight artifact has unsupported action_key={action_key!r}"
-        )
-    expected_steps = artifact.allocation_contract.n_action_steps
-    if prediction.hand_qpos is None or prediction.hand_qpos.shape != (
-        expected_steps,
-        _HAND_DOF,
-    ):
-        raise ValueError("synthetic preflight prediction is missing hand12 actions")
-    if prediction.arm_qpos is not None:
-        if prediction.arm_qpos.shape != (expected_steps, _ARM_DOF):
-            raise ValueError(
-                "synthetic preflight joint prediction has invalid arm7 actions"
-            )
-        if prediction.ee_pos is not None or prediction.ee_rot6d is not None:
-            raise ValueError(
-                "synthetic preflight joint prediction mixes joint and EE actions"
-            )
-        arrays = [prediction.arm_qpos, prediction.hand_qpos]
-    else:
-        if (
-            prediction.ee_pos is None
-            or prediction.ee_rot6d is None
-            or prediction.ee_pos.shape != (expected_steps, 3)
-            or prediction.ee_rot6d.shape != (expected_steps, 6)
-        ):
-            raise ValueError(
-                "synthetic preflight EE prediction has invalid geometry fields"
-            )
-        _validate_ee_rot6d(prediction.ee_rot6d)
-        arrays = [prediction.ee_pos, prediction.ee_rot6d, prediction.hand_qpos]
-    if any(not np.all(np.isfinite(array)) for array in arrays):
-        raise ValueError("synthetic preflight prediction contains NaN/Inf")
-
-
-def _validate_ee_rot6d(rot6d: np.ndarray) -> None:
-    """Reject degenerate 6D rotations without importing an IK/planning module."""
-    first = np.asarray(rot6d[:, :3], dtype=np.float64)
-    second = np.asarray(rot6d[:, 3:], dtype=np.float64)
-    first_norm = np.linalg.norm(first, axis=1)
-    if np.any(first_norm <= 1e-8):
-        raise ValueError(
-            "synthetic preflight EE prediction has degenerate rotation geometry"
-        )
-    second_orthogonal = (
-        second
-        - (
-            np.sum(first * second, axis=1, keepdims=True)
-            / np.square(first_norm)[:, None]
-        )
-        * first
-    )
-    if np.any(np.linalg.norm(second_orthogonal, axis=1) <= 1e-8):
-        raise ValueError(
-            "synthetic preflight EE prediction has degenerate rotation geometry"
-        )
-
-
-def _close_fd(fd: int | None) -> None:
-    if fd is None:
-        return
-    try:
-        os.close(fd)
-    except OSError:
-        pass

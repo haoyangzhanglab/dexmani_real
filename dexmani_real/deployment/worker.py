@@ -11,8 +11,8 @@ robot command.
 ``inference_loop`` is a plain ``*_loop(shared, config)`` function (not an
 ``mp.Process`` subclass); lifecycle and supervision stay in the runtime layer.
 
-Artifact-bound DexMani deployments load through the preflight module's checked
-fd/hash/provenance stream loader. There is no configurable runtime loader.
+The worker loads the selected experiment through the public DexMani Policy API,
+then wraps it with Real's NumPy observation/action adapter.
 """
 
 from __future__ import annotations
@@ -79,14 +79,23 @@ _MIN_STARTUP_DELIVERABLE_TARGETS = 2
 
 
 def _load_inference_runtime(config: PolicyRuntimeConfig) -> PolicyRuntime:
-    """Load the single Real-owned runtime through the verified stream boundary."""
-    if config.artifact is None:
-        raise ValueError("inference runtime requires a resolved artifact")
+    """Load Policy-owned model state and return the Real NumPy adapter."""
     # Deliberately imported inside the inference child: the parent must not
     # import torch/Policy or initialize CUDA, and model objects never cross spawn.
-    from dexmani_real.deployment.preflight import load_verified_policy_runtime
+    from dexmani_policy.deployment import load_experiment
 
-    return load_verified_policy_runtime(config)
+    from dexmani_real.integrations.dexmani_policy import DexManiPolicyRuntime
+
+    loaded_policy = load_experiment(
+        config.deployment.experiment,
+        device=config.deployment.device,
+        seed=config.deployment.inference_seed,
+    )
+    try:
+        return DexManiPolicyRuntime(loaded_policy, config)
+    except BaseException:
+        loaded_policy.close()
+        raise
 
 
 def _duration_s_to_ns_ceil(duration_s: float, *, name: str) -> int:
@@ -426,7 +435,7 @@ def _rgb_frame_from_camera_record(
     rgb = payload["rgb"]
     if rgb.shape != expected_shape:
         logger.warning(
-            "inference: RGB frame shape %s does not match artifact %s",
+            "inference: RGB frame shape %s does not match policy contract %s",
             rgb.shape,
             expected_shape,
         )
@@ -669,10 +678,7 @@ def _build_observation(
     rgb_history: tuple[RgbFrame, ...] = ()
     rgb_shape: tuple[int, int, int] | None = None
     if rgb_requested:
-        artifact = config.artifact
-        if artifact is None or artifact.allocation_contract.rgb_shape is None:
-            raise ValueError("RGB observation requires an artifact RGB contract")
-        rgb_shape = artifact.allocation_contract.rgb_shape
+        raise ValueError("current DexMani Policy deployment does not support RGB")
     state_history_len = shared.arm_state_ring.maxlen if camera_requested else horizon
     arm_history = _read_state_history(
         shared.arm_state_ring,
@@ -946,7 +952,7 @@ def observation_timing_ms(observation: ObservationBatch) -> tuple[float, float]:
 def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None:
     """Inference process entry point — produces proposals, never robot commands.
 
-    Startup order: heartbeat early -> verified artifact load -> mark ready.
+    Startup order: heartbeat early -> Policy-owned strict load -> mark ready.
     A load/import/instantiation failure raises out
     of this function and becomes a supervisor-observed process failure; there
     is no dummy safe mode. The main loop reads a fresh generation each tick and
@@ -962,45 +968,41 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
     runtime = _load_inference_runtime(config)
 
     try:
-        if config.artifact is not None:
-            warmup_samples = 5
-            stable_samples = 3
-            timings_s = runtime.warmup(samples=warmup_samples)
-            if len(timings_s) != warmup_samples:
-                raise RuntimeError(
-                    "policy runtime returned an incomplete warmup receipt"
-                )
-            if any(not np.isfinite(value) or value < 0.0 for value in timings_s):
-                raise RuntimeError("policy runtime returned invalid warmup timing")
-            allocation = config.artifact.allocation_contract
-            stable_timings_s = timings_s[-stable_samples:]
-            step_dt_ns = int(round(1e9 / float(shared.action_control_hz)))
-            remaining_targets = tuple(
-                _startup_deliverable_target_count(
-                    model_latency_s=value,
-                    steps=allocation.n_action_steps,
-                    step_dt_ns=step_dt_ns,
-                    command_lead_s=config.deployment.command_lead_s,
-                )
-                for value in stable_timings_s
+        warmup_samples = 5
+        stable_samples = 3
+        timings_s = runtime.warmup(samples=warmup_samples)
+        if len(timings_s) != warmup_samples:
+            raise RuntimeError("policy runtime returned incomplete warmup timings")
+        if any(not np.isfinite(value) or value < 0.0 for value in timings_s):
+            raise RuntimeError("policy runtime returned invalid warmup timing")
+        stable_timings_s = timings_s[-stable_samples:]
+        step_dt_ns = int(round(1e9 / float(shared.action_control_hz)))
+        remaining_targets = tuple(
+            _startup_deliverable_target_count(
+                model_latency_s=value,
+                steps=config.deployment.n_action_steps,
+                step_dt_ns=step_dt_ns,
+                command_lead_s=config.deployment.command_lead_s,
             )
-            logger.info(
-                "inference warmup model-latency qualification: samples_ms=%s "
-                "stable_remaining_targets=%s minimum=%d",
-                ",".join(f"{value * 1e3:.3f}" for value in timings_s),
-                ",".join(str(value) for value in remaining_targets),
-                _MIN_STARTUP_DELIVERABLE_TARGETS,
+            for value in stable_timings_s
+        )
+        logger.info(
+            "inference warmup model-latency qualification: samples_ms=%s "
+            "stable_remaining_targets=%s minimum=%d",
+            ",".join(f"{value * 1e3:.3f}" for value in timings_s),
+            ",".join(str(value) for value in remaining_targets),
+            _MIN_STARTUP_DELIVERABLE_TARGETS,
+        )
+        if any(
+            remaining < _MIN_STARTUP_DELIVERABLE_TARGETS
+            for remaining in remaining_targets
+        ):
+            raise RuntimeError(
+                "policy inference warmup exceeds the viable action window: "
+                f"stable_max_ms={max(stable_timings_s) * 1e3:.3f} "
+                f"stable_remaining_targets={remaining_targets} "
+                f"minimum={_MIN_STARTUP_DELIVERABLE_TARGETS}"
             )
-            if any(
-                remaining < _MIN_STARTUP_DELIVERABLE_TARGETS
-                for remaining in remaining_targets
-            ):
-                raise RuntimeError(
-                    "policy inference warmup exceeds the viable action window: "
-                    f"stable_max_ms={max(stable_timings_s) * 1e3:.3f} "
-                    f"stable_remaining_targets={remaining_targets} "
-                    f"minimum={_MIN_STARTUP_DELIVERABLE_TARGETS}"
-                )
     except BaseException:
         try:
             runtime.close()

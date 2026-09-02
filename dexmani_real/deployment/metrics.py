@@ -323,7 +323,6 @@ def execute_run_receipt_json(
     acknowledgement_timeout_s: float,
     acknowledged_action_id: int | None,
     completed: bool,
-    provenance_json: str | None = None,
     metrics: Mapping[str, int | float],
 ) -> str:
     """Render the bounded H4 execute receipt without hiding physical writes."""
@@ -339,7 +338,6 @@ def execute_run_receipt_json(
         acknowledgement_timeout_s=acknowledgement_timeout_s,
         acknowledged_action_id=acknowledged_action_id,
         completed=completed,
-        provenance_json=provenance_json,
         metrics=metrics,
     )
 
@@ -355,7 +353,6 @@ def bounded_execute_run_receipt_json(
     acknowledgement_timeout_s: float,
     acknowledged_action_id: int | None,
     completed: bool,
-    provenance_json: str | None = None,
     metrics: Mapping[str, int | float],
     timeline_monotonic_ns: Mapping[str, int] | None = None,
 ) -> str:
@@ -380,13 +377,6 @@ def bounded_execute_run_receipt_json(
         raise ValueError("acknowledged_action_id must be positive or None")
     if not isinstance(completed, bool):
         raise TypeError("completed must be a boolean")
-    provenance = None
-    if provenance_json is not None:
-        if not isinstance(provenance_json, str):
-            raise TypeError("provenance_json must be a string or None")
-        provenance = json.loads(provenance_json)
-        if not isinstance(provenance, dict):
-            raise ValueError("provenance_json must encode a JSON object")
     if isinstance(run_generation, bool) or int(run_generation) <= 0:
         raise ValueError("run_generation must be a positive integer")
     if (
@@ -423,7 +413,6 @@ def bounded_execute_run_receipt_json(
         "max_published_endpoints": int(max_published_endpoints),
         "metrics": normalized_metrics,
         "outcome": "completed" if completed else "not_completed",
-        "provenance": provenance,
         "reason": reason,
         "run_generation": int(run_generation),
         "timeline_monotonic_ns": timeline,

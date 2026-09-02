@@ -301,12 +301,12 @@ class JointActionChunk:
 
 
 class PolicyRuntime(Protocol):
-    """Model-side policy boundary after verified checkpoint restore.
+    """Real-side adapter boundary after Policy-owned strict restore.
 
     ``predict`` encodes an ``ObservationBatch`` into the model-native input,
     runs inference, and decodes the result into an untimed
     ``PolicyPrediction``.  The
-    implementation may import torch/checkpoint/CUDA; it never sees
+    implementation operates on NumPy at this boundary; it never sees
     RuntimeChannels or a robot command.
     """
 
