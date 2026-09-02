@@ -282,6 +282,111 @@ if loaded:
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_check_spawn_child_does_not_inherit_parent_hardware_modules(self) -> None:
+        """Exercise the real spawn child while its parent has a hardware import."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            experiment = _write_experiment(root / "experiment")
+            child_site = root / "child_site"
+            child_site.mkdir()
+            (child_site / "sitecustomize.py").write_text(
+                """
+import os
+import sys
+from types import ModuleType
+
+import numpy as np
+from dexmani_real.deployment.contracts import PolicyPrediction
+import dexmani_real.deployment.preflight as preflight
+
+
+class _FakePolicyRuntime:
+    def warmup(self, *, samples):
+        return (0.001,) * samples
+
+    def predict(self, _observation):
+        return PolicyPrediction(
+            arm_qpos=np.zeros((8, 7), dtype=np.float64),
+            hand_qpos=np.zeros((8, 12), dtype=np.float64),
+        )
+
+    def close(self):
+        pass
+
+
+def _fake_loader(config):
+    artifact = config.artifact
+    return (
+        _FakePolicyRuntime(),
+        artifact.checkpoint_sha256_from_index,
+        {
+            "origin": "/policy/__init__.py",
+            "commit": "c" * 40,
+            "dirty": "false",
+            "source_tree_sha256": "d" * 64,
+            "version": "0.1.0",
+        },
+    )
+
+
+preflight._load_verified_policy_runtime = _fake_loader
+if os.environ.get("DEXMANI_POLICY_CHECK_TEST_INJECT_HARDWARE") == "1":
+    sys.modules["xhand_controller"] = ModuleType("xhand_controller")
+""".lstrip(),
+                encoding="utf-8",
+            )
+            from dexmani_real.config.runtime import resolve_runtime_config
+            from dexmani_real.deployment.artifact import resolve_policy_artifact
+            from dexmani_real.deployment.config import resolve_policy_runtime_config
+
+            projection = resolve_policy_runtime_config(
+                artifact=resolve_policy_artifact(experiment),
+                runtime_config=resolve_runtime_config(),
+                device="cpu",
+                inference_seed=1066,
+                execution_mode="shadow",
+                hand_acknowledged=False,
+            )
+            candidate_root = Path(__file__).resolve().parents[1]
+            python_path = os.pathsep.join(
+                value
+                for value in (
+                    str(child_site),
+                    str(candidate_root),
+                    os.environ.get("PYTHONPATH"),
+                )
+                if value
+            )
+            parent_hardware_module = ModuleType("xhand_controller")
+            with (
+                patch.dict(os.environ, {"PYTHONPATH": python_path}),
+                patch.dict(
+                    sys.modules,
+                    {"xhand_controller": parent_hardware_module},
+                ),
+            ):
+                result = preflight.run_isolated_policy_check(
+                    projection.runtime,
+                    benchmark_samples=1,
+                    timeout_s=15.0,
+                )
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"DEXMANI_POLICY_CHECK_TEST_INJECT_HARDWARE": "1"},
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "xhand_controller"),
+                ):
+                    preflight.run_isolated_policy_check(
+                        projection.runtime,
+                        benchmark_samples=1,
+                        timeout_s=15.0,
+                    )
+
+        self.assertEqual(result.benchmark_samples, 1)
+        self.assertTrue(result.checkpoint_sha256_verified)
+        self.assertEqual(result.device, "cpu")
+
     def test_shadow_propagates_projection_seed_bound_and_calls_lifecycle_once(self):
         artifact = SimpleNamespace(
             allocation_contract=SimpleNamespace(requires_hand=True)
