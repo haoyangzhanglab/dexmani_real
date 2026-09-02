@@ -1,362 +1,295 @@
 #!/usr/bin/env python3
-"""Resolve one hash-bound DexMani Policy artifact and run a bounded policy lifecycle.
+"""Research-facing entry point for one DexMani Policy experiment.
 
-``shadow`` is the default operational mode. ``execute`` remains the deliberately
-one-publication H4 profile. ``task`` is a separate bounded full-episode profile.
-Both physical profiles need independent review and hardware authorization; this
-entry point never grants that authorization itself.
+The command line owns experiment selection and operator intent. Policy owns
+checkpoint inspection and restore; Real owns the temporary lifecycle bridge.
+All imports that can reach Policy, Torch, or Real runtime code remain inside
+their command handlers so ``list`` stays a filesystem-only Policy operation.
 """
 
 from __future__ import annotations
 
 import argparse
 import math
-import re
+import statistics
 import sys
-from pathlib import Path
-
-import yaml
-
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-from dexmani_real.config.runtime import resolve_runtime_config
-from dexmani_real.deployment.artifact import resolve_policy_artifact
-from dexmani_real.deployment.config import (
-    H4ExecuteBounds,
-    TaskExecuteBounds,
-    resolve_policy_runtime_config,
-)
-from dexmani_real.deployment.run_identity import (
-    canonical_run_receipt_json,
-    resolve_real_source_identity,
-)
+from dataclasses import dataclass
+from typing import Any, Callable
 
 
-def _positive_finite_seconds(raw: str) -> float:
-    """Parse one operator-supplied positive duration without lifecycle imports."""
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a finite positive number") from exc
-    if not math.isfinite(value) or value <= 0.0:
-        raise argparse.ArgumentTypeError("must be a finite positive number")
-    return value
+class _ArgumentParser(argparse.ArgumentParser):
+    """Render CLI-contract failures with the compatibility owner marker."""
+
+    def error(self, message: str) -> None:
+        self.exit(2, f"{self.prog}: error: [COMPAT] {message}\n")
 
 
-def _one_positive_endpoint(raw: str) -> int:
-    """Parse the deliberately fixed H4 physical-publication bound."""
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be exactly 1 for H4") from exc
-    if value != 1:
-        raise argparse.ArgumentTypeError("must be exactly 1 for H4")
-    return value
+@dataclass(frozen=True)
+class _LegacyBridge:
+    """Resolved inputs for a legacy lifecycle which Phase 2 must not start."""
 
-
-def _multiple_positive_endpoints(raw: str) -> int:
-    """Parse a bounded task publication count without widening H4."""
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be an integer greater than 1") from exc
-    if value <= 1:
-        raise argparse.ArgumentTypeError("must be an integer greater than 1")
-    return value
-
-
-def _inference_seed(raw: str) -> int:
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            "must be an integer in [0, 2**31 - 1]"
-        ) from exc
-    if not 0 <= value <= 2**31 - 1:
-        raise argparse.ArgumentTypeError("must be an integer in [0, 2**31 - 1]")
-    return value
-
-
-def _sha256_hex(raw: str) -> str:
-    """Parse one immutable H4 checkpoint digest."""
-    value = raw.lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", value):
-        raise argparse.ArgumentTypeError("must be a 64-character SHA-256 hex digest")
-    return value
+    legacy_execution_mode: str
+    artifact: Any
+    runtime: Any
+    projection: Any | None
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Resolve, preflight, shadow-validate, H4-test, or run one bounded DexMani Policy task"
-    )
-    parser.add_argument(
-        "--experiment-dir",
-        required=True,
-        help="experiment directory containing config.yaml and checkpoints/",
-    )
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="Real runtime YAML used after a shadow receipt is resolved",
-    )
-    parser.add_argument(
-        "--deployment-config",
-        default=None,
-        help="Real-owned deployment timing/readiness YAML or artifact expectations",
+    parser = _ArgumentParser(
+        description="Inspect, check, shadow, or stage one DexMani Policy experiment"
     )
     parser.add_argument(
         "--device",
         default="cuda:0",
-        help="inference device (default: cuda:0; use cpu only when explicitly requested)",
+        help="Policy inference device for check or a staged lifecycle (default: cuda:0)",
     )
     parser.add_argument(
-        "--inference-seed",
-        type=_inference_seed,
+        "--config",
         default=None,
-        help="Real-owned deterministic diffusion seed (set explicitly for receipts)",
+        help="optional Real runtime YAML for staged shadow/run compatibility",
     )
-    parser.add_argument(
-        "--hand",
-        action="store_true",
-        help="acknowledge XHand control required for hand startup/reset and H4 execute",
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    list_parser = subcommands.add_parser(
+        "list", help="list deployable Policy experiment selectors"
     )
-    parser.add_argument(
-        "--execution-mode",
-        choices=("shadow", "execute", "task"),
-        default="shadow",
-        help="shadow validates policy endpoints without actuator publication",
-    )
-    parser.add_argument(
-        "--max-running-seconds",
-        type=_positive_finite_seconds,
+    list_parser.add_argument(
+        "filter",
+        nargs="?",
         default=None,
-        help=(
-            "optional B-relative shadow-run limit; coordinator must acknowledge "
-            "the stop before shutdown"
-        ),
+        help="optional case-insensitive selector substring",
     )
-    parser.add_argument(
-        "--execute-max-published-endpoints",
-        type=_one_positive_endpoint,
-        default=None,
-        help="required H4 execute bound; currently must be exactly 1",
-    )
-    parser.add_argument(
-        "--execute-ack-timeout-seconds",
-        type=_positive_finite_seconds,
-        default=None,
-        help="required H4 execute arm+hand acknowledgement deadline",
-    )
-    parser.add_argument(
-        "--execute-expected-checkpoint-sha256",
-        type=_sha256_hex,
-        default=None,
-        help="required immutable H4 checkpoint SHA-256 from the approved reference",
-    )
-    parser.add_argument(
-        "--task-max-published-endpoints",
-        type=_multiple_positive_endpoints,
-        default=None,
-        help="required bounded full-episode coupled-publication count",
-    )
-    parser.add_argument(
-        "--task-ack-timeout-seconds",
-        type=_positive_finite_seconds,
-        default=None,
-        help="required per-endpoint arm+hand acknowledgement deadline",
-    )
-    parser.add_argument(
-        "--task-expected-checkpoint-sha256",
-        type=_sha256_hex,
-        default=None,
-        help="required immutable task checkpoint SHA-256",
-    )
-    modes = parser.add_mutually_exclusive_group()
-    modes.add_argument(
-        "--print-config",
-        action="store_true",
-        help="print pure resolved receipt and exit",
-    )
-    modes.add_argument(
-        "--preflight-only",
-        action="store_true",
-        help="hash, single-load, restore, and synthetic-observation check in a child",
-    )
+
+    for command, help_text in (
+        ("check", "strictly restore and smoke-test one Policy experiment"),
+        ("shadow", "stage the legacy no-publication lifecycle bridge"),
+        ("run", "stage the legacy physical-task lifecycle bridge"),
+    ):
+        command_parser = subcommands.add_parser(command, help=help_text)
+        command_parser.add_argument("experiment", metavar="EXPERIMENT")
+        # Accept shared advanced options after the subcommand as well as before it.
+        # SUPPRESS preserves a value supplied to the top-level parser.
+        command_parser.add_argument("--device", default=argparse.SUPPRESS)
+        command_parser.add_argument("--config", default=argparse.SUPPRESS)
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = _parser()
-    args = parser.parse_args(argv)
-    h4_execute_bounds = None
-    task_execute_bounds = None
-    execute_args_present = any(
-        value is not None
-        for value in (
-            args.execute_max_published_endpoints,
-            args.execute_ack_timeout_seconds,
-            args.execute_expected_checkpoint_sha256,
+def _list_policy_experiments(filter_value: str | None) -> tuple[str, ...]:
+    """Call the sole Policy API permitted by the ``list`` command."""
+    from dexmani_policy.deployment.runtime import list_experiments
+
+    return list_experiments(filter_value)
+
+
+def _inspect_policy_experiment(experiment: str) -> Any:
+    """Inspect metadata through Policy without constructing a model."""
+    from dexmani_policy.deployment.runtime import inspect_experiment
+
+    return inspect_experiment(experiment)
+
+
+def _load_policy_experiment(experiment: str, device: str) -> Any:
+    """Strictly restore one model through the Policy-owned runtime."""
+    from dexmani_policy.deployment.runtime import load_experiment
+
+    return load_experiment(experiment, device=device)
+
+
+def _print_policy_error(message: str) -> None:
+    print(f"[POLICY] {message}", file=sys.stderr)
+
+
+def _print_compatibility_error(message: str) -> None:
+    print(f"[COMPAT] {message}", file=sys.stderr)
+
+
+def _print_experiment_summary(info: Any, *, mode: str, device: str) -> None:
+    """Print the small operator-facing subset of a Policy experiment contract."""
+    spec = info.spec
+    point_cloud = "none"
+    if spec.point_cloud_num_points is not None:
+        point_cloud = (
+            f"{spec.point_cloud_num_points} \u00d7 {spec.point_cloud_feature_dim}"
         )
+    print("\u2500\u2500 Policy Experiment \u2500\u2500")
+    print(f"Mode        : {mode}")
+    print(f"Experiment  : {info.selector}")
+    print(f"Policy      : {info.policy_name}")
+    print(f"Checkpoint  : {info.checkpoint_name}")
+    print(f"Device      : {device}")
+    print(f"Observation : {' + '.join(spec.sensor_modalities)}")
+    print(f"History     : {spec.n_obs_steps}")
+    print(f"Point Cloud : {point_cloud}")
+    print(f"Action      : {spec.action_key} ({spec.control_action_dim}D)")
+    print(f"Chunk       : {spec.n_action_steps}")
+    print(f"Control     : {1.0 / spec.control_dt_s:g} Hz")
+    print(
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
     )
-    task_args_present = any(
-        value is not None
-        for value in (
-            args.task_max_published_endpoints,
-            args.task_ack_timeout_seconds,
-            args.task_expected_checkpoint_sha256,
-        )
-    )
-    if args.execution_mode == "shadow":
-        if execute_args_present or task_args_present:
-            parser.error("physical execution bounds require a physical execution mode")
-        if args.max_running_seconds is not None and (
-            args.print_config or args.preflight_only
-        ):
-            parser.error(
-                "--max-running-seconds is only valid for an operational shadow lifecycle"
-            )
-    elif args.execution_mode == "execute":
-        if task_args_present:
-            parser.error("--task-* bounds require --execution-mode task")
-        if not args.hand:
-            parser.error("H4 execute requires explicit --hand acknowledgement")
-        if args.max_running_seconds is None:
-            parser.error("H4 execute requires --max-running-seconds")
-        if args.execute_max_published_endpoints is None:
-            parser.error("H4 execute requires --execute-max-published-endpoints 1")
-        if args.execute_ack_timeout_seconds is None:
-            parser.error("H4 execute requires --execute-ack-timeout-seconds")
-        if args.execute_expected_checkpoint_sha256 is None:
-            parser.error("H4 execute requires --execute-expected-checkpoint-sha256")
-        try:
-            h4_execute_bounds = H4ExecuteBounds(
-                max_published_endpoints=args.execute_max_published_endpoints,
-                acknowledgement_timeout_s=args.execute_ack_timeout_seconds,
-                max_running_s=args.max_running_seconds,
-            )
-        except (TypeError, ValueError) as exc:
-            parser.error(f"invalid H4 execute bounds: {exc}")
-    else:
-        if execute_args_present:
-            parser.error("--execute-* bounds require --execution-mode execute")
-        if not args.hand:
-            parser.error("task execute requires explicit --hand acknowledgement")
-        if args.max_running_seconds is None:
-            parser.error("task execute requires --max-running-seconds")
-        if args.task_max_published_endpoints is None:
-            parser.error("task execute requires --task-max-published-endpoints")
-        if args.task_ack_timeout_seconds is None:
-            parser.error("task execute requires --task-ack-timeout-seconds")
-        if args.task_expected_checkpoint_sha256 is None:
-            parser.error("task execute requires --task-expected-checkpoint-sha256")
-        try:
-            task_execute_bounds = TaskExecuteBounds(
-                max_published_endpoints=args.task_max_published_endpoints,
-                acknowledgement_timeout_s=args.task_ack_timeout_seconds,
-                max_running_s=args.max_running_seconds,
-            )
-        except (TypeError, ValueError) as exc:
-            parser.error(f"invalid task execute bounds: {exc}")
+    sys.stdout.flush()
+
+
+def _validated_warmup_durations(raw: Any) -> tuple[float, ...]:
+    """Validate the tiny public warmup receipt before reporting timings."""
+    if not isinstance(raw, tuple) or not raw:
+        raise RuntimeError("Policy warmup returned no timing samples")
+    durations = tuple(float(value) for value in raw)
+    if any(not math.isfinite(value) or value < 0.0 for value in durations):
+        raise RuntimeError("Policy warmup returned invalid timing samples")
+    return durations
+
+
+def _run_check(args: argparse.Namespace) -> int:
     try:
-        artifact = resolve_policy_artifact(args.experiment_dir)
-        runtime = resolve_runtime_config(yaml_path=args.config)
+        info = _inspect_policy_experiment(args.experiment)
+    except Exception as exc:
+        _print_policy_error(f"experiment inspection failed: {exc}")
+        return 1
+    _print_experiment_summary(info, mode="CHECK", device=args.device)
+
+    policy = None
+    exit_code = 1
+    try:
+        policy = _load_policy_experiment(args.experiment, args.device)
+        print("restore .......... OK")
+        # Policy's strict restore performs its normalizer and metadata checks.
+        print("normalizer ....... OK")
+        # ``LoadedPolicy.warmup`` builds its deterministic synthetic observation,
+        # calls ``predict``, and validates the finite [N, D] control output.
+        durations = _validated_warmup_durations(policy.warmup(samples=3))
+        print("warmup ........... OK")
+        print("prediction ....... OK")
+        print()
+        print(f"inference warmup p50: {statistics.median(durations) * 1000.0:.0f} ms")
+        print(f"inference warmup max: {max(durations) * 1000.0:.0f} ms")
+        print()
+        print("READY")
+        exit_code = 0
+    except Exception as exc:
+        _print_policy_error(f"checkpoint restore or smoke test failed: {exc}")
+    finally:
+        if policy is not None:
+            try:
+                policy.close()
+            except Exception as exc:
+                _print_policy_error(f"runtime cleanup failed: {exc}")
+                exit_code = 1
+    return exit_code
+
+
+def _prepare_legacy_bridge(
+    args: argparse.Namespace, *, legacy_execution_mode: str
+) -> _LegacyBridge:
+    """Resolve the old artifact/config bridge without starting its lifecycle.
+
+    ``shadow`` can still be projected as the old shadow mode. ``run`` is
+    deliberately only labelled as the old task path here: constructing that
+    path requires the retired operator bounds and must remain impossible until
+    the later lifecycle migration owns the new execution contract.
+    """
+    from dexmani_real.config.runtime import resolve_runtime_config
+    from dexmani_real.deployment.artifact import resolve_policy_artifact
+    from dexmani_real.deployment.config import resolve_policy_runtime_config
+
+    experiment_dir = _resolve_policy_experiment_directory(args.experiment)
+    artifact = resolve_policy_artifact(experiment_dir)
+    if artifact.selector_name != "deployment_latest.pt":
+        raise ValueError(
+            "legacy bridge requires the Policy deployment_latest.pt selector"
+        )
+    runtime = resolve_runtime_config(yaml_path=args.config)
+    if legacy_execution_mode == "shadow":
         projection = resolve_policy_runtime_config(
             artifact=artifact,
             runtime_config=runtime,
-            yaml_path=args.deployment_config,
             device=args.device,
-            inference_seed=args.inference_seed,
-            execution_mode=args.execution_mode,
-            hand_acknowledged=args.hand,
-            h4_execute_bounds=h4_execute_bounds,
-            task_execute_bounds=task_execute_bounds,
+            execution_mode="shadow",
         )
-    except (
-        KeyError,
-        OSError,
-        TypeError,
-        UnicodeError,
-        ValueError,
-        yaml.YAMLError,
-    ) as exc:
-        parser.error(f"invalid deployment receipt/config: {exc}")
-
-    expected_checkpoint_sha256 = (
-        args.execute_expected_checkpoint_sha256
-        if args.execution_mode == "execute"
-        else (
-            args.task_expected_checkpoint_sha256
-            if args.execution_mode == "task"
-            else None
-        )
+    elif legacy_execution_mode == "task":
+        projection = None
+    else:
+        raise ValueError(f"unsupported legacy execution mode: {legacy_execution_mode}")
+    return _LegacyBridge(
+        legacy_execution_mode=legacy_execution_mode,
+        artifact=artifact,
+        runtime=runtime,
+        projection=projection,
     )
-    if expected_checkpoint_sha256 is not None and (
-        artifact.checkpoint_sha256_from_index != expected_checkpoint_sha256
-    ):
-        parser.error(
-            "selected checkpoint SHA-256 does not match "
-            "the expected physical-execution checkpoint SHA-256"
-        )
 
-    real_source = resolve_real_source_identity()
-    if args.print_config:
-        print(
-            canonical_run_receipt_json(
-                artifact=artifact,
-                projection=projection,
-                runtime_sha256=runtime.sha256,
-                real_source=real_source,
-                preflight_result=None,
-            )
-        )
-        return 0
-    if args.preflight_only:
-        # Deliberately lazy: print-config must not import torch, Policy, worker,
-        # lifecycle, camera, robot, or other hardware-owning modules.
-        from dexmani_real.deployment.preflight import run_isolated_preflight
 
-        try:
-            result = run_isolated_preflight(projection.runtime)
-        except (OSError, RuntimeError, TimeoutError, TypeError, ValueError) as exc:
-            print(f"policy preflight failed: {exc}", file=sys.stderr)
-            return 1
-        print(
-            canonical_run_receipt_json(
-                artifact=artifact,
-                projection=projection,
-                runtime_sha256=runtime.sha256,
-                real_source=real_source,
-                preflight_result=result,
-            )
-        )
-        return 0
-    if args.execution_mode in {"execute", "task"} and (
-        real_source.availability != "available" or real_source.dirty != "false"
-    ):
-        parser.error(
-            "physical execute requires a clean, identifiable DexMani Real revision"
-        )
-    # Deliberately lazy: receipt/preflight modes above must remain isolated
-    # from lifecycle, camera, robot, and hardware-owning imports.
-    from dexmani_real.deployment.lifecycle import run_policy_deployment
+def _resolve_policy_experiment_directory(experiment: str) -> Any:
+    """Resolve the Policy-selected ``deployment_latest`` experiment directory."""
+    from dexmani_policy.deployment.runtime import resolve_experiment
 
-    if args.execution_mode == "shadow":
-        return run_policy_deployment(
-            runtime,
-            projection.runtime,
-            max_running_s=args.max_running_seconds,
-            real_source=real_source,
-        )
-    return run_policy_deployment(
-        runtime,
-        projection.runtime,
-        max_running_s=None,
-        real_source=real_source,
-        invocation_argv=tuple(sys.argv if argv is None else [sys.argv[0], *argv]),
-        projection_sha256=projection.sha256,
+    return resolve_experiment(experiment)
+
+
+def _run_staged_lifecycle(
+    args: argparse.Namespace, *, legacy_execution_mode: str
+) -> int:
+    try:
+        info = _inspect_policy_experiment(args.experiment)
+    except Exception as exc:
+        _print_policy_error(f"experiment inspection failed: {exc}")
+        return 1
+    _print_experiment_summary(
+        info,
+        mode="SHADOW" if legacy_execution_mode == "shadow" else "RUN",
+        device=args.device,
     )
+    try:
+        bridge = _prepare_legacy_bridge(
+            args, legacy_execution_mode=legacy_execution_mode
+        )
+    except Exception as exc:
+        _print_compatibility_error(f"legacy bridge validation failed: {exc}")
+        return 1
+
+    # Do not import or call ``run_policy_deployment`` here. The phase-two
+    # bridge proves that the Policy deployment_latest selection and Real
+    # artifact/config inputs still agree, while making a hardware start
+    # structurally impossible from this CLI revision.
+    del bridge
+    if legacy_execution_mode == "task":
+        _print_compatibility_error(
+            "run is unavailable until runtime migration completes"
+        )
+        return 1
+    print(
+        "[COMPAT] Phase 2 bridge validated; legacy "
+        f"{legacy_execution_mode} lifecycle was not started."
+    )
+    return 0
+
+
+def _run_list(args: argparse.Namespace) -> int:
+    try:
+        experiments = _list_policy_experiments(args.filter)
+    except Exception as exc:
+        _print_policy_error(f"experiment listing failed: {exc}")
+        return 1
+    if not experiments:
+        print("No deployable Policy experiments found.")
+        return 0
+    print("Deployable Policy experiments:")
+    for experiment in experiments:
+        print(experiment)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    handlers: dict[str, Callable[[argparse.Namespace], int]] = {
+        "list": _run_list,
+        "check": _run_check,
+        "shadow": lambda parsed: _run_staged_lifecycle(
+            parsed, legacy_execution_mode="shadow"
+        ),
+        "run": lambda parsed: _run_staged_lifecycle(
+            parsed, legacy_execution_mode="task"
+        ),
+    }
+    return handlers[args.command](args)
 
 
 if __name__ == "__main__":
