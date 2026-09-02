@@ -7,10 +7,11 @@ counters are ordinary Python dicts:
 each worker loop is single-threaded, so no locking is needed (a mutex would be
 dead weight).
 
-Counters are per-flush deltas (``flush`` resets them to zero); gauges hold the
-last observed value (age/latency), which overwrites each tick.  Timing samples
-are retained in a fixed-size window and summarized with the nearest-rank
-p50/p95/p99 convention.
+Counters are per-flush deltas (``flush`` resets them to zero), while a second
+counter view accumulates one policy episode. Gauges hold the last observed
+value (age/latency), which overwrites each tick. Timing samples are retained in
+a fixed-size episode window and summarized with the nearest-rank p50/p95/p99
+convention.
 """
 
 from __future__ import annotations
@@ -89,23 +90,40 @@ class Metrics:
 
     def __init__(self) -> None:
         self._counters: dict[str, int] = {}
+        self._episode_counters: dict[str, int] = {}
         self._gauges: dict[str, float] = {}
         self._samples: dict[str, deque[float]] = {}
+        self._episode_generation: int | None = None
+        self._episode_started_monotonic_ns: int | None = None
 
-    def begin_run(self) -> None:
+    def begin_episode(self, *, generation: int, started_monotonic_ns: int) -> None:
         """Reset diagnostics at one B/epoch boundary.
 
         The interval counters are reset too: a new B epoch must not carry an
         unfinished previous-run logging interval into its first flush.
         """
+        if generation <= 0:
+            raise ValueError("episode generation must be positive")
+        if started_monotonic_ns <= 0:
+            raise ValueError("episode start timestamp must be positive")
+        self.begin_run()
+        self._episode_generation = int(generation)
+        self._episode_started_monotonic_ns = int(started_monotonic_ns)
+
+    def begin_run(self) -> None:
+        """Reset diagnostics for an epoch without opening an episode summary."""
         self._counters.clear()
+        self._episode_counters.clear()
         self._gauges.clear()
         self._samples.clear()
+        self._episode_generation = None
+        self._episode_started_monotonic_ns = None
 
     def increment(self, name: str, n: int = 1) -> None:
         """Add *n* to counter *name* (counters are per-flush deltas)."""
         increment = int(n)
         self._counters[name] = self._counters.get(name, 0) + increment
+        self._episode_counters[name] = self._episode_counters.get(name, 0) + increment
 
     def observe(self, name: str, value: float) -> None:
         """Record the latest value of gauge *name* (overwrites)."""
@@ -151,6 +169,38 @@ class Metrics:
         result.update(self._gauges)
         result.update(self._timing_snapshot())
         return result
+
+    def episode_snapshot(self) -> dict[str, int | float]:
+        """Return counters and bounded timing summaries since the current B."""
+        result: dict[str, int | float] = {}
+        result.update(self._episode_counters)
+        result.update(self._timing_snapshot())
+        return result
+
+    def log_episode_summary(self, *, status: str, reason: str) -> None:
+        """Log one compact, in-memory diagnostic summary for the active episode.
+
+        This intentionally writes no artifact. Calling it after an episode has
+        already been summarized is a no-op, so competing shutdown paths cannot
+        emit duplicate summaries.
+        """
+        generation = self._episode_generation
+        started_ns = self._episode_started_monotonic_ns
+        if generation is None or started_ns is None:
+            return
+        duration_s = max(0.0, (time.monotonic_ns() - started_ns) / 1e9)
+        values = self.episode_snapshot()
+        rendered = " ".join(f"{key}={value}" for key, value in sorted(values.items()))
+        logger.info(
+            "episode summary: generation=%d status=%s reason=%r duration_s=%.3f%s",
+            generation,
+            status,
+            reason,
+            duration_s,
+            f" {rendered}" if rendered else "",
+        )
+        self._episode_generation = None
+        self._episode_started_monotonic_ns = None
 
     def flush(self, *, prefix: str = "metrics") -> None:
         """Log one structured ``key=value`` line and reset the per-flush counters.

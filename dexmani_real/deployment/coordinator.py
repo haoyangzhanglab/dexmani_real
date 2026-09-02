@@ -531,8 +531,11 @@ def _end_policy_run(
             if metric is not None:
                 metrics.increment(metric)
             metrics.flush(prefix="coordinator metrics")
+            metrics.log_episode_summary(status="ABORTED", reason=reason)
     else:
         logger.info("coordinator: policy run stopped: %s", reason)
+        if metrics is not None:
+            metrics.log_episode_summary(status="STOPPED", reason=reason)
 
 
 def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None:
@@ -636,6 +639,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
         metrics.increment(POLICY_ABORTS)
         metrics.increment(metric)
         metrics.flush(prefix="coordinator metrics")
+        metrics.log_episode_summary(status="FAULTED", reason=reason)
         pending_acknowledgement = None
         action_buffer.reset(run_generation=int(shared.run_generation.value))
         buffer_generation = None
@@ -669,11 +673,29 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
 
             if bool(shared.quit_requested.value):
                 if int(shared.safety_state.value) == int(SafetyState.RUNNING):
-                    _end_policy_run(shared, "operator quit", abort=False)
+                    _end_policy_run(
+                        shared,
+                        "operator quit",
+                        abort=False,
+                        metrics=metrics,
+                    )
+                else:
+                    metrics.log_episode_summary(
+                        status="INTERRUPTED",
+                        reason="operator quit",
+                    )
                 pending_acknowledgement = None
                 return
 
             if bool(shared.error_state.value) or bool(shared.estop_request.value):
+                metrics.log_episode_summary(
+                    status="FAULTED",
+                    reason=(
+                        "emergency stop requested"
+                        if bool(shared.estop_request.value)
+                        else "runtime error state"
+                    ),
+                )
                 shared.physical_home_completed.value = False
                 pending_acknowledgement = None
                 last_valid_policy_command_ns = None
@@ -733,7 +755,10 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     continue
                 run_started_ns = run_epoch.started_monotonic_ns
                 previous_arm_command_qpos = None
-                metrics.begin_run()
+                metrics.begin_episode(
+                    generation=run_epoch.generation,
+                    started_monotonic_ns=run_epoch.started_monotonic_ns,
+                )
                 pending_acknowledgement = None
                 action_buffer.reset(run_generation=run_epoch.generation)
                 buffer_generation = run_epoch.generation
@@ -767,7 +792,12 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                             metric=ACK_TIMEOUT,
                         )
                         continue
-                _end_policy_run(shared, stop_reason, abort=False)
+                _end_policy_run(
+                    shared,
+                    stop_reason,
+                    abort=False,
+                    metrics=metrics,
+                )
                 pending_acknowledgement = None
                 action_buffer.reset(run_generation=int(shared.run_generation.value))
                 buffer_generation = None
@@ -1195,6 +1225,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 PolicyEndpointDisposition.DISCARD_STALE,
             }:
                 if publish_result.status is CommandPublishStatus.GATE_REJECTED:
+                    metrics.increment(reject_counter_name(None))
                     metrics.increment(
                         reject_counter_name(
                             publish_result.gate_code.value
@@ -1238,6 +1269,10 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
             )
             _sleep_tick(period_s, tick_start)
     finally:
+        metrics.log_episode_summary(
+            status="INTERRUPTED",
+            reason="coordinator loop exited",
+        )
         logger.info("coordinator_loop: exited")
 
 
