@@ -209,24 +209,6 @@ def hand_loop(shared: Any, config: HandParams) -> None:
         except Exception:
             logger.warning("hand_loop: tactile calibration raised", exc_info=True)
 
-        try:
-            reset_status = hand.reset_home()
-        except Exception:
-            logger.error("hand_loop: startup reset-home command raised", exc_info=True)
-            shared.error_state.value = True
-            return
-        if reset_status is XHandSendStatus.REJECTED:
-            logger.error("hand_loop: startup reset-home command was rejected")
-            shared.error_state.value = True
-            return
-        if reset_status is XHandSendStatus.CRC_UNCONFIRMED:
-            logger.warning(
-                "hand_loop: startup reset-home delivery is unconfirmed after CRC; "
-                "continuing with live state"
-            )
-        else:
-            logger.info("hand_loop: startup reset-home command accepted")
-
         initial_state = hand.get_state()
         if initial_state is None:
             logger.error("hand_loop: cannot publish a valid initial state")
