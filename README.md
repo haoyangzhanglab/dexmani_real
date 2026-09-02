@@ -165,8 +165,8 @@ python examples/collect_teleop.py --print-config
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 使用 raw episode 的精确已发送命令、配置和模型 provenance，预检后控制 xArm7/XHand；写 `replay_results/` |
 | 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取并校验 `data.h5` hash 后的原始 `float64` 已发送命令，继续执行完整配置/模型/几何预检；包含多个 source 连续段的产物拒绝物理回放 |
 | learned policy 检查 | `python examples/run_policy.py list`；`python examples/run_policy.py check <experiment> --device <device>` | 仅列出实验，或经 Policy public API strict restore + warmup + synthetic predict；不连接硬件 |
-| learned policy shadow | `python examples/run_policy.py shadow <experiment>` | 连接真实 sensor 与 arm/XHand feedback，执行 inference、IK 和 SafetyGate；结构性禁止 actuator publication 与 home |
-| learned policy run | `python examples/run_policy.py run <experiment>` | 连接并控制 xArm7/XHand；H 完成 hand + collision-checked arm home 后，新的 B 才允许 coupled publication |
+| learned policy shadow | `python examples/run_policy.py shadow <experiment>` | 连接真实 sensor 与 arm/XHand feedback，执行 inference、IK 和 SafetyGate；结构性禁止 actuator publication 与 home，同进程可 B→S→B→S |
+| learned policy run | `python examples/run_policy.py run <experiment>` | 连接并控制 xArm7/XHand；每个 episode 都需 H 完成 hand + collision-checked arm home，再以新 B 启动，S 后同进程回到 ARMED |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |

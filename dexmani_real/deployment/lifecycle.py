@@ -158,7 +158,7 @@ def run_policy_deployment(
     prefix: str | None = None,
     max_running_s: float | None = None,
 ) -> int:
-    """Run one policy deployment lifecycle and return its exit code.
+    """Run a multi-episode policy deployment lifecycle and return its exit code.
 
     ``execute=False`` validates candidates without publication;
     ``execute=True`` enables coupled arm/hand publication. The inference worker
@@ -305,7 +305,7 @@ def run_policy_deployment(
             heartbeat_timeouts_s=dict(runtime.safety.heartbeat_timeouts),
             supervisor_hz=float(runtime.safety.supervisor_hz),
             max_running_s=max_running_s,
-            exit_after_run_stops=policy_runtime_config.execute,
+            exit_after_run_stops=False,
         )
 
         if operator_stop is not None:

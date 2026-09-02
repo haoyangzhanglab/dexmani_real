@@ -209,9 +209,9 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `observation.py` | 因果不可变 arm/hand/tactile/pointcloud/RGB history batch。 |
 | `timing.py` | immutable policy target grid、inference-expired prefix、plan/source deadline 与 diagnostic usable-target composition 的纯计算。 |
 | `worker.py` | 经 Policy public API 直接 restore、camera-grid observation 校验、logical-grid timing stamp、bounded timing samples 与 plan 发布。 |
-| `coordinator.py` | learned-policy 唯一 command producer、plan scheduling、SafetyGate、物理运行的 home 初态门、逐 endpoint coupled 双 ACK、typed stop、命令连续性与 watchdog。 |
-| `lifecycle.py` | `execute` 布尔控制的 worker topology、物理模式 collision-checked home、supervision 与 verified shutdown。 |
-| `operator.py` | B/S/Q/ESC typed request；物理模式每进程最多一次 H，依次下发 hand home、执行 collision-checked arm home，并发布完成标志。 |
+| `coordinator.py` | learned-policy 唯一 command producer、generation-isolated multi-episode plan scheduling、SafetyGate、物理运行的 per-episode home 准入、逐 endpoint coupled 双 ACK、typed stop、命令连续性与 watchdog。 |
+| `lifecycle.py` | `execute` 布尔控制的 worker topology、同进程 multi-episode supervision、物理模式 collision-checked home 与 verified shutdown。 |
+| `operator.py` | B/S/Q/ESC typed request；物理模式每个 episode 从 ARMED 执行 hand + collision-checked arm home，并发布一次性 home 准入标志。 |
 | `metrics.py` | inference/coordinator experiment counters，以及固定窗口 p50/p95/p99 timing（含 ACK latency/failure）。 |
 
 ### `replay/`
@@ -270,6 +270,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `tests/test_dexmani_policy_adapter.py` | PolicySpec→Real 固定兼容门与 NumPy observation/joint/EE action adapter 的失败路径。 |
 | `tests/test_hand_worker_startup.py` | XHand startup no-motion，以及 `execute=False/True` publication seam 与 arm+hand 双 ACK 合同。 |
 | `tests/test_policy_lifecycle.py` | inference restore 失败时不启动任何 hardware worker 的顺序合同。 |
+| `tests/test_policy_multi_episode.py` | 同进程第二个 policy episode、per-episode H 门、generation 前进以及旧 plan/ticket 失效的离线合同。 |
 | `tests/test_run_policy_cli.py` | list/check/shadow/run 路由、最小 CLI 参数面与 lifecycle seam。 |
 | `tests/test_recording_integrity.py` | raw v24 语义/sidecar manifest、旧 schema 拒绝与 recorder fail-closed 发布合同。 |
 | `tests/test_keyboard_arm_limits.py` | keyboard 发布完整 IK endpoint、禁用通用 arm delta clip 的合同。 |

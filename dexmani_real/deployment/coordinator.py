@@ -384,7 +384,7 @@ def _physical_start_pose_rejection(
         return None
     if not bool(shared.physical_home_completed.value):
         return (
-            "physical home sequence has not completed in this process; "
+            "physical home sequence has not completed for the next episode; "
             "press H before B"
         )
     arm_state = read_arm_state_dict(shared)
@@ -442,6 +442,7 @@ def _end_policy_run(
         or bool(shared.estop_request.value)
         or int(shared.safety_state.value) == int(SafetyState.FAULT)
     )
+    shared.physical_home_completed.value = False
     if not lifecycle_faulted and not revoke_motion(shared, SafetyState.ARMED):
         logger.error("coordinator: failed to transition RUNNING->ARMED (%s)", reason)
     if abort:
@@ -542,16 +543,16 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
     # RUNNING start time, for the first-command timeout.
     run_started_ns: int | None = None
     pending_acknowledgement: _PendingAcknowledgement | None = None
-    # One process carries one operator-authorized policy session. Physical
-    # publication exits after it; validate-only remains ARMED for Q.
-    policy_session_started = False
     previous_arm_command_qpos: np.ndarray | None = None
     last_metrics_flush_ns = time.monotonic_ns()
 
     def fault_physical(reason: str, *, metric: str) -> None:
         """Latch FAULT for a physical publication or acknowledgement failure."""
         nonlocal buffer_generation, last_seen_plan_key, pending_acknowledgement
+        nonlocal last_valid_policy_command_ns, run_started_ns
+        nonlocal previous_arm_command_qpos
         shared.error_state.value = True
+        shared.physical_home_completed.value = False
         if not revoke_motion(shared, SafetyState.FAULT):
             logger.critical("coordinator: unable to latch FAULT after physical failure")
         logger.critical("coordinator: physical publication failure: %s", reason)
@@ -562,10 +563,15 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
         action_buffer.reset(run_generation=int(shared.run_generation.value))
         buffer_generation = None
         last_seen_plan_key = None
+        last_valid_policy_command_ns = None
+        run_started_ns = None
+        previous_arm_command_qpos = None
 
     def abort_and_reset(reason: str, *, metric: str) -> None:
         """Fail closed and synchronously invalidate every buffered endpoint."""
         nonlocal buffer_generation, last_seen_plan_key, pending_acknowledgement
+        nonlocal last_valid_policy_command_ns, run_started_ns
+        nonlocal previous_arm_command_qpos
         if config.execute:
             fault_physical(reason, metric=metric)
             return
@@ -574,6 +580,9 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
         action_buffer.reset(run_generation=int(shared.run_generation.value))
         buffer_generation = None
         last_seen_plan_key = None
+        last_valid_policy_command_ns = None
+        run_started_ns = None
+        previous_arm_command_qpos = None
 
     try:
         while shared.is_running.value:
@@ -588,6 +597,11 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 return
 
             if bool(shared.error_state.value) or bool(shared.estop_request.value):
+                shared.physical_home_completed.value = False
+                pending_acknowledgement = None
+                last_valid_policy_command_ns = None
+                run_started_ns = None
+                previous_arm_command_qpos = None
                 if buffer_generation is not None:
                     action_buffer.reset(run_generation=int(shared.run_generation.value))
                     buffer_generation = None
@@ -602,16 +616,13 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     buffer_generation = None
                     last_seen_plan_key = None
                 pending_acknowledgement = None
+                last_valid_policy_command_ns = None
+                run_started_ns = None
+                previous_arm_command_qpos = None
                 if not bool(shared.start_request.value):
                     _sleep_tick(period_s, tick_start)
                     continue
                 shared.start_request.value = False
-                if policy_session_started:
-                    logger.warning(
-                        "coordinator: ignored B after the policy session already started"
-                    )
-                    _sleep_tick(period_s, tick_start)
-                    continue
                 start_pose_rejection = _physical_start_pose_rejection(shared, config)
                 if start_pose_rejection is not None:
                     logger.warning("coordinator: ignored B: %s", start_pose_rejection)
@@ -629,7 +640,10 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     "coordinator_loop: RUNNING (run_generation=%d)",
                     int(shared.run_generation.value),
                 )
-                policy_session_started = True
+                if config.execute:
+                    # H authorizes exactly one physical episode. A subsequent B
+                    # remains disabled until another completed H.
+                    shared.physical_home_completed.value = False
                 last_valid_policy_command_ns = None
                 run_epoch = read_run_epoch(shared)
                 if (
@@ -681,6 +695,9 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 action_buffer.reset(run_generation=int(shared.run_generation.value))
                 buffer_generation = None
                 last_seen_plan_key = None
+                last_valid_policy_command_ns = None
+                run_started_ns = None
+                previous_arm_command_qpos = None
                 _sleep_tick(period_s, tick_start)
                 continue
 
