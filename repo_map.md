@@ -212,7 +212,9 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `manifest.py` | checkpoint/config/runtime manifest（point cloud/RGB 与 full/control action layout）组装和 fail-closed 一致性检查。 |
 | `policy_checkpoint.py` | deployment-v2 checkpoint 的 Real-owned `weights_only` stream decoder、exact schema 与 canonical tensor-key 校验；不导入 Policy。 |
 | `preflight.py` | artifact-bound inference 与 spawn 预检/check 共享的 no-follow/hash/provenance 单次 stream load；offline check 复用 synthetic observation 做 startup qualification 与 bounded benchmark。 |
-| `profile.py` | exact-key schema-v1 physical run intent、explicit seed/checkpoint SHA/bounds 与 profile-relative path 解析。 |
+| `profile.py` | exact-key physical run intent：schema v1 H4 与 schema v2 task scene-card binding、explicit seed/checkpoint SHA/bounds 与 profile-relative path 解析。 |
+| `task_scene.py` | operator-owned task scene card 的 exact JSON schema、source SHA-256、phase milestone 与 artifact task/bound validation。 |
+| `task_diagnostics.py` | task-only passive shared-memory observer；结束后保存 B-pre/phase scene、raw-plan→shaped endpoint、feedback/tactile 与 ACK evidence，绝不控制机器人。 |
 | `run_identity.py` | 纯标准库的 Real source provenance 与 print/preflight 共用 canonical run receipt。 |
 | `observation.py` | 因果不可变 arm/hand/tactile/pointcloud/RGB history batch。 |
 | `timing.py` | immutable policy target grid、inference-expired prefix、plan/source deadline 与 diagnostic usable-target composition 的纯计算。 |

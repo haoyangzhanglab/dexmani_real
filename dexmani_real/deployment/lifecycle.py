@@ -40,6 +40,8 @@ from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_l
 from dexmani_real.deployment.observation import parse_observation_fields
 from dexmani_real.deployment.operator import build_home_planner, run_operator_control
 from dexmani_real.deployment.run_identity import RealSourceIdentity
+from dexmani_real.deployment.task_diagnostics import TaskDiagnosticsObserver
+from dexmani_real.deployment.task_scene import TaskSceneCard
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.robot.arm_worker import arm_loop
@@ -147,6 +149,7 @@ def _physical_execute_provenance_json(
     real_source: RealSourceIdentity,
     invocation_argv: tuple[str, ...] | None,
     projection_sha256: str | None,
+    task_scene_card: TaskSceneCard | None,
 ) -> str:
     """Render the immutable contract recorded by a physical-run receipt."""
     artifact = policy_runtime_config.artifact
@@ -160,6 +163,10 @@ def _physical_execute_provenance_json(
     execute_bounds = policy_runtime_config.physical_execute_bounds
     if execute_bounds is None:
         raise ValueError("physical execute requires explicit bounds")
+    if policy_runtime_config.execution_mode == "task" and task_scene_card is None:
+        raise ValueError("task execute requires a validated task scene card")
+    if policy_runtime_config.execution_mode != "task" and task_scene_card is not None:
+        raise ValueError("only task execute may carry a task scene card")
     return json.dumps(
         {
             "artifact": {
@@ -194,6 +201,9 @@ def _physical_execute_provenance_json(
                 "python_tree_sha256": real_source.python_tree_sha256,
             },
             "runtime": {"config_sha256": runtime_sha256},
+            "task_scene_card": (
+                None if task_scene_card is None else task_scene_card.provenance()
+            ),
         },
         allow_nan=False,
         separators=(",", ":"),
@@ -303,6 +313,7 @@ def run_policy_deployment(
     real_source: RealSourceIdentity | None = None,
     invocation_argv: tuple[str, ...] | None = None,
     projection_sha256: str | None = None,
+    task_scene_card: TaskSceneCard | None = None,
 ) -> int:
     """Run one policy deployment lifecycle and return its exit code.
 
@@ -327,6 +338,21 @@ def run_policy_deployment(
         if execute_bounds is None:
             raise ValueError("physical execute lifecycle requires explicit bounds")
         max_running_s = execute_bounds.max_running_s
+    if policy_runtime_config.execution_mode == "task":
+        if task_scene_card is None:
+            raise ValueError("task lifecycle requires a validated task scene card")
+        artifact = policy_runtime_config.artifact
+        assert artifact is not None
+        task_scene_card.validate_for_task(
+            task_name=artifact.allocation_contract.task_name,
+            max_published_endpoints=(
+                policy_runtime_config.task_execute_bounds.max_published_endpoints
+                if policy_runtime_config.task_execute_bounds is not None
+                else 0
+            ),
+        )
+    elif task_scene_card is not None:
+        raise ValueError("only task lifecycle may carry a task scene card")
     deployment = policy_runtime_config.deployment
     if deployment.hand_enabled and not policy_runtime_config.hand_acknowledged:
         raise ValueError("deployment with hand targets requires --hand")
@@ -342,6 +368,7 @@ def run_policy_deployment(
             real_source=real_source,
             invocation_argv=invocation_argv,
             projection_sha256=projection_sha256,
+            task_scene_card=task_scene_card,
         )
     log_deployment_provenance(
         logger,
@@ -388,6 +415,9 @@ def run_policy_deployment(
     shutdown_report: ShutdownReport | None = None
     operator_thread: threading.Thread | None = None
     operator_stop: threading.Event | None = None
+    diagnostics_observer: TaskDiagnosticsObserver | None = None
+    diagnostics_stopped = False
+    diagnostics_persisted = False
     try:
         specs = build_policy_worker_specs(
             shared,
@@ -456,6 +486,20 @@ def run_policy_deployment(
             print(f"  {name}: ready", flush=True)
 
         require_transition(shared, SafetyState.ARMED)
+        if policy_runtime_config.execution_mode == "task":
+            assert execute_receipt_dir is not None and task_scene_card is not None
+            try:
+                diagnostics_observer = TaskDiagnosticsObserver(
+                    shared,
+                    receipt_dir=execute_receipt_dir,
+                    scene_card=task_scene_card,
+                )
+                diagnostics_observer.start()
+            except Exception:
+                # Diagnostics are passive evidence only. A failure here must
+                # not modify control, safety, worker readiness, or the task.
+                diagnostics_observer = None
+                logger.error("task diagnostics observer failed to start", exc_info=True)
         print(
             f"\nAll subsystems ready — safety=ARMED({int(SafetyState.ARMED)})",
             flush=True,
@@ -511,12 +555,18 @@ def run_policy_deployment(
                 )
             operator_thread = None
 
+        if diagnostics_observer is not None:
+            diagnostics_stopped = diagnostics_observer.stop()
+
         shutdown_report = shutdown_processes(
             shared,
             started_procs,
             graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
             disarm_if_clean=normal_exit,
         )
+        if diagnostics_observer is not None and diagnostics_stopped:
+            diagnostics_observer.persist()
+            diagnostics_persisted = True
         execute_completed = bool(shared.execute_completed.value)
         clean_exit = normal_exit and shutdown_report.clean
         if policy_runtime_config.execution_mode in {"execute", "task"}:
@@ -546,6 +596,8 @@ def run_policy_deployment(
     finally:
         if operator_stop is not None:
             operator_stop.set()
+        if diagnostics_observer is not None and not diagnostics_stopped:
+            diagnostics_stopped = diagnostics_observer.stop()
         operator_alive = False
         if operator_thread is not None:
             operator_thread.join(timeout=float(runtime.safety.shutdown_timeout_s))
@@ -584,3 +636,9 @@ def run_policy_deployment(
                     logger.warning("RuntimeChannels cleanup failed", exc_info=True)
                     shared.error_state.value = True
                     transition(shared, SafetyState.FAULT)
+        if (
+            diagnostics_observer is not None
+            and diagnostics_stopped
+            and not diagnostics_persisted
+        ):
+            diagnostics_observer.persist()

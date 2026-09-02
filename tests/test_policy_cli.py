@@ -95,6 +95,31 @@ def _write_profile(root: Path, payload: dict[str, object]) -> Path:
     return path
 
 
+def _write_task_scene_card(root: Path) -> Path:
+    path = root / "scene_card.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "task_name": "pick_place_toy",
+                "object_description": "fixture block",
+                "object_start_description": "fixture start pose",
+                "target_description": "fixture target",
+                "success_criterion": "fixture success",
+                "phase_endpoint_indices": {
+                    "approach": 1,
+                    "grasp": 2,
+                    "lift": 3,
+                    "place": 4,
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 class PolicyCliTest(unittest.TestCase):
     def test_no_command_prints_help_without_heavy_import_or_log(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -462,19 +487,46 @@ if os.environ.get("DEXMANI_POLICY_CHECK_TEST_INJECT_HARDWARE") == "1":
             with self.assertRaisesRegex(ValueError, "unknown=.*horizon"):
                 load_physical_run_profile(profile_path)
 
+    def test_task_run_rejects_a_schema_v1_profile_before_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile_path = _write_profile(
+                Path(directory), _profile_payload(endpoints=4)
+            )
+            with (
+                patch.object(cli, "_resolve_artifact_projection") as resolve,
+                redirect_stderr(io.StringIO()) as stderr,
+            ):
+                self.assertEqual(cli.main(["run", str(profile_path)]), 1)
+            resolve.assert_not_called()
+            self.assertIn("schema-v2 profile", stderr.getvalue())
+
     def test_h4_and_run_build_distinct_exact_bounds(self) -> None:
         for command, endpoints, bounds_type, execution_mode in (
             ("h4", 1, H4ExecuteBounds, "execute"),
-            ("run", 3, TaskExecuteBounds, "task"),
+            ("run", 4, TaskExecuteBounds, "task"),
         ):
             with (
                 self.subTest(command=command),
                 tempfile.TemporaryDirectory() as directory,
             ):
                 profile_path = _write_profile(
-                    Path(directory), _profile_payload(endpoints=endpoints)
+                    Path(directory),
+                    (
+                        _profile_payload(endpoints=endpoints)
+                        if command == "h4"
+                        else {
+                            **_profile_payload(endpoints=endpoints),
+                            "schema_version": 2,
+                            "task_scene_card": "scene_card.json",
+                        }
+                    ),
                 )
-                artifact = SimpleNamespace(checkpoint_sha256_from_index="a" * 64)
+                if command == "run":
+                    _write_task_scene_card(Path(directory))
+                artifact = SimpleNamespace(
+                    checkpoint_sha256_from_index="a" * 64,
+                    allocation_contract=SimpleNamespace(task_name="pick_place_toy"),
+                )
                 runtime = object()
                 projection = SimpleNamespace(runtime=object(), sha256="d" * 64)
                 lifecycle = ModuleType("dexmani_real.deployment.lifecycle")

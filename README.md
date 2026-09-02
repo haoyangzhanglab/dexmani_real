@@ -168,7 +168,7 @@ python examples/collect_teleop.py --print-config
 | learned policy inspect/check | `python examples/run_policy.py inspect <experiment>` / `check <experiment> --device <device> --seed <seed> --benchmark-samples 100` | 两者均不连接硬件；inspect 不导入 Torch，check 在隔离 child 中 single-load、strict restore、synthetic qualification 和 benchmark。 |
 | learned policy shadow | `python examples/run_policy.py shadow <experiment> --device <device> --seed <seed> --hand --max-running-seconds <seconds>` | 会连接 arm/hand/camera；hand startup 可能 reset/home，但 learned coupled-command publication 应为 0。 |
 | H4 one-shot execute | `python examples/run_policy.py h4 <profile.yaml>` | strict profile 的 publication bound 必须为 1；要求独立 H4 真机授权和 H/B 操作。 |
-| learned-policy 单次任务 rollout（物理成功未验证） | `python examples/run_policy.py run <profile.yaml>` | strict profile 的 publication bound 必须大于 1；当前 task 仍暂停，先完成诊断 review 并取得新授权。 |
+| learned-policy 单次任务 rollout（物理成功未验证） | `python examples/run_policy.py run <profile.yaml>` | task 必须使用 schema-v2 profile 绑定 scene card；完成 passive diagnostics review 后仍须取得新的 task 真机授权。 |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |

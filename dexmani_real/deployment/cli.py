@@ -241,6 +241,10 @@ def _physical(
             raise ValueError(
                 "run profile max_published_endpoints must be greater than 1"
             )
+        if profile.task_scene_card is None:
+            raise ValueError(
+                "task run requires a schema-v2 profile with a task_scene_card"
+            )
         h4_bounds = None
         task_bounds = TaskExecuteBounds(
             max_published_endpoints=profile.max_published_endpoints,
@@ -261,6 +265,12 @@ def _physical(
     )
     if artifact.checkpoint_sha256_from_index != profile.expected_checkpoint_sha256:
         raise ValueError("selected checkpoint SHA-256 does not match physical profile")
+    if execution_mode == "task":
+        assert profile.task_scene_card is not None
+        profile.task_scene_card.validate_for_task(
+            task_name=artifact.allocation_contract.task_name,
+            max_published_endpoints=profile.max_published_endpoints,
+        )
     from dexmani_real.deployment.run_identity import resolve_real_source_identity
 
     real_source = resolve_real_source_identity()
@@ -277,6 +287,7 @@ def _physical(
         real_source=real_source,
         invocation_argv=invocation_argv,
         projection_sha256=projection.sha256,
+        task_scene_card=profile.task_scene_card,
     )
 
 

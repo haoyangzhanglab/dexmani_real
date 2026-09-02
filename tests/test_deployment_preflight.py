@@ -56,6 +56,7 @@ from dexmani_real.deployment.run_identity import (
     RealSourceIdentity,
     canonical_run_receipt_json,
 )
+from dexmani_real.deployment.task_scene import TaskSceneCard
 from dexmani_real.deployment.worker import (
     _load_inference_runtime,
     inference_loop,
@@ -424,6 +425,21 @@ class DeploymentPreflightTest(unittest.TestCase):
                     ),
                     invocation_argv=("run_policy.py", "--execution-mode", "task"),
                     projection_sha256=projection.sha256,
+                    task_scene_card=TaskSceneCard(
+                        source_path=Path("/tmp/task_scene_card.json"),
+                        sha256="d" * 64,
+                        task_name="pick_place_toy",
+                        object_description="fixture object",
+                        object_start_description="fixture start",
+                        target_description="fixture target",
+                        success_criterion="fixture success",
+                        phase_endpoint_indices=(
+                            ("approach", 1),
+                            ("grasp", 2),
+                            ("lift", 3),
+                            ("place", 4),
+                        ),
+                    ),
                 )
             )
 
@@ -438,6 +454,7 @@ class DeploymentPreflightTest(unittest.TestCase):
             provenance["policy_package_contract"]["commit"],
             projection.runtime.artifact.producer.commit,
         )
+        self.assertEqual(provenance["task_scene_card"]["sha256"], "d" * 64)
 
     def test_hand_shadow_requires_acknowledgement_before_runtime_channels(self):
         runtime = resolve_runtime_config()

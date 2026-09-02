@@ -354,6 +354,14 @@ acknowledgement_timeout_seconds: 2.0
 max_published_endpoints: 1
 ```
 
+上述 schema v1 仅用于 H4。物理 `run` 必须使用 schema v2，额外绑定一个 `task_scene_card`
+JSON 文件；它是操作员声明的物体、起点、目标、成功条件和四个有限场景采集点，而不是模型参数。
+card 必须有精确字段 `schema_version=1`、`task_name`、`object_description`、
+`object_start_description`、`target_description`、`success_criterion`、
+`phase_endpoint_indices`。后者恰有 `approach`、`grasp`、`lift`、`place` 四项，取值必须严格
+递增且落在 profile 的 endpoint bound 内。card 原始 bytes 的 SHA-256 与 phase index 会进入 task
+receipt 的 provenance；因此不能在开始后替换 scene/target 描述。
+
 `shadow` 也会连接硬件；若 hand 启用，其 startup 可能 reset/home。它保证的是不应发布 learned
 coupled command，不是“无硬件副作用”。任何 operational invocation、本文、历史 receipt、
 `inspect` 或 `check` 都不是硬件授权。
@@ -390,6 +398,22 @@ publication bound 来“修复”物理任务。
    generation、deadline、publication 与 paired ACK timestamp；
 3. 接近、闭合、抬起和放置阶段的有限场景帧；诊断写失败不得阻塞 control loop 或改变命令；
 4. 与训练 episode 的 observation/action range、point-cloud frame 和 calibration identity 的离线比较。
+
+当前 `run` 会在 ARMED 后启动 task-only passive observer。它只读取既有
+`policy_plan_ring`、`coupled_cmd_ring`、arm/hand/tactile、camera 与 point-cloud rings；不加入
+readiness/heartbeat，不写 command，不改 safety state，且收集或落盘失败不改变控制循环。结束后，它在
+`DEXMANI_RECEIPT_DIR/task_diagnostics_*/` 写入 `manifest.json` 和有限场景 RGB-D/point-cloud archive：
+
+- `b_pre` 是 observer 在 ARMED 时缓存、B 后绑定到 run generation 的 scene snapshot；它同时保存
+  camera/arm/hand identity、camera geometry/profile、depth scale 和 `cameras.json` SHA-256。其 timestamp
+  必须由 review 检查，不把 cache 当作无条件实时事实。
+- 每个 coupled command 以 `(generation, observation_id, scheduled_target)` 关联其 raw policy plan，
+  并保留 shaped IPC endpoint、feedback/tactile、publication 与 paired ACK observation timestamps。
+- `raw_prediction_available=false`、任一 dropped record、pending ACK、缺失 `b_pre` 或缺失 card 指定
+  phase frame 都是诊断不完整，必须在 task review 中判为不可用于物理行为结论，而不是补写或忽略。
+
+这一诊断实现改变了物理 task 的 evidence boundary。因此它本身不授权 task：冻结该 revision 后仍必须重新
+完成 Gate A pre-live、fresh live shadow、task-specific diagnostic review，并取得下一段所列的单次现场授权。
 
 完成诊断 review 后，新的 task 授权仍须单独指定任务布置、人员/障碍物、e-stop、设备健康、
 device/seed、H/B、331 endpoint、25 秒、ACK timeout、接触/抓取/放置许可、单次无重试与 S/ESC/e-stop

@@ -10,7 +10,9 @@ from typing import Any, Mapping
 
 import yaml
 
-_PROFILE_KEYS = frozenset(
+from dexmani_real.deployment.task_scene import TaskSceneCard, load_task_scene_card
+
+_PROFILE_V1_KEYS = frozenset(
     {
         "schema_version",
         "experiment_dir",
@@ -25,6 +27,7 @@ _PROFILE_KEYS = frozenset(
         "max_published_endpoints",
     }
 )
+_PROFILE_V2_KEYS = _PROFILE_V1_KEYS | {"task_scene_card"}
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -43,6 +46,7 @@ class PhysicalRunProfile:
     max_running_seconds: float
     acknowledgement_timeout_seconds: float
     max_published_endpoints: int
+    task_scene_card: TaskSceneCard | None
 
 
 def _require_path(
@@ -69,7 +73,11 @@ def _require_positive_number(value: Any, *, name: str) -> float:
 
 
 def load_physical_run_profile(path: str | Path) -> PhysicalRunProfile:
-    """Load one exact-key schema-v1 profile with profile-relative paths."""
+    """Load one exact-key physical profile with profile-relative paths.
+
+    Schema v1 remains the H4-only historical profile. Schema v2 adds a frozen
+    task scene card; ``run`` requires it before any hardware lifecycle starts.
+    """
     source_path = Path(path).resolve(strict=True)
     if source_path.suffix.lower() not in {".yaml", ".yml"}:
         raise ValueError("physical profile path must use a .yaml or .yml suffix")
@@ -80,16 +88,17 @@ def load_physical_run_profile(path: str | Path) -> PhysicalRunProfile:
         raise ValueError(f"physical profile is invalid YAML: {exc}") from exc
     if not isinstance(loaded, Mapping):
         raise TypeError("physical profile root must be a mapping")
+    schema_version = loaded.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version not in {1, 2}:
+        raise ValueError("physical profile schema_version must be 1 or 2")
+    expected_keys = _PROFILE_V1_KEYS if schema_version == 1 else _PROFILE_V2_KEYS
     actual_keys = frozenset(str(key) for key in loaded)
-    if actual_keys != _PROFILE_KEYS:
-        missing = sorted(_PROFILE_KEYS - actual_keys)
-        unknown = sorted(actual_keys - _PROFILE_KEYS)
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        unknown = sorted(actual_keys - expected_keys)
         raise ValueError(
             f"physical profile keys mismatch: missing={missing}, unknown={unknown}"
         )
-    schema_version = loaded["schema_version"]
-    if isinstance(schema_version, bool) or schema_version != 1:
-        raise ValueError("physical profile schema_version must be exactly 1")
     device = loaded["device"]
     if not isinstance(device, str) or not device or device != device.strip():
         raise ValueError("profile device must be a non-empty trimmed string")
@@ -122,6 +131,16 @@ def load_physical_run_profile(path: str | Path) -> PhysicalRunProfile:
         optional=False,
     )
     assert experiment_dir is not None
+    task_scene_card: TaskSceneCard | None = None
+    if schema_version == 2:
+        scene_card_path = _require_path(
+            loaded["task_scene_card"],
+            name="task_scene_card",
+            profile_dir=profile_dir,
+            optional=False,
+        )
+        assert scene_card_path is not None
+        task_scene_card = load_task_scene_card(scene_card_path)
     return PhysicalRunProfile(
         source_path=source_path,
         experiment_dir=experiment_dir,
@@ -149,4 +168,5 @@ def load_physical_run_profile(path: str | Path) -> PhysicalRunProfile:
             name="acknowledgement_timeout_seconds",
         ),
         max_published_endpoints=endpoints,
+        task_scene_card=task_scene_card,
     )
