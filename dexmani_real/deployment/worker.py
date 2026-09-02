@@ -118,7 +118,7 @@ def _startup_deliverable_target_count(
 ) -> int:
     """Return theoretical targets remaining after model latency and command lead."""
     # This arbitrary positive origin has no source-time meaning; warmup only
-    # qualifies latency against relative executable-grid spacing.
+    # checks latency against relative executable-grid spacing.
     origin_ns = 1
     targets = build_target_grid(origin_ns, steps, step_dt_ns)
     finished_ns = origin_ns + _duration_s_to_ns_ceil(

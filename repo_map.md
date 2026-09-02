@@ -270,6 +270,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `tests/test_dexmani_policy_adapter.py` | PolicySpec→Real 固定兼容门与 NumPy observation/joint/EE action adapter 的失败路径。 |
 | `tests/test_hand_worker_startup.py` | XHand startup no-motion，以及 `execute=False/True` publication seam 与 arm+hand 双 ACK 合同。 |
 | `tests/test_policy_lifecycle.py` | inference restore 失败时不启动任何 hardware worker 的顺序合同。 |
+| `tests/test_policy_coordinator.py` | coordinator 的 generation/stale plan 准入、SafetyGate 丢弃、ACK/worker 失败、operator stop 与双 watchdog 语义。 |
 | `tests/test_policy_multi_episode.py` | 同进程第二个 policy episode、per-episode H 门、generation 前进以及旧 plan/ticket 失效的离线合同。 |
 | `tests/test_run_policy_cli.py` | list/check/shadow/run 路由、最小 CLI 参数面与 lifecycle seam。 |
 | `tests/test_recording_integrity.py` | raw v24 语义/sidecar manifest、旧 schema 拒绝与 recorder fail-closed 发布合同。 |

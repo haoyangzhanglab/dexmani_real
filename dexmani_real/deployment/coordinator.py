@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -115,6 +116,76 @@ class _PendingAcknowledgement:
     ticket: CoupledCommandTicket
     published_monotonic_ns: int
     deadline_monotonic_ns: int
+
+
+class _AcknowledgementAction(str, Enum):
+    """One bounded coordinator action after polling a pending command."""
+
+    APPLIED = "applied"
+    WAIT = "wait"
+    FAULT_TIMEOUT = "fault_timeout"
+    FAULT_REJECTED = "fault_rejected"
+
+
+@dataclass(frozen=True)
+class _AcknowledgementDecision:
+    """Pure interpretation of one arm/hand acknowledgement observation."""
+
+    action: _AcknowledgementAction
+    reason: str = ""
+    latency_ms: float | None = None
+
+
+def _classify_acknowledgement(
+    pending: _PendingAcknowledgement,
+    acknowledgement_status: CommandPublishStatus,
+    *,
+    poll_started_monotonic_ns: int,
+    observed_monotonic_ns: int,
+) -> _AcknowledgementDecision:
+    """Map one non-blocking ACK poll to the coordinator's next action."""
+    if acknowledgement_status is CommandPublishStatus.APPLIED:
+        if observed_monotonic_ns > pending.deadline_monotonic_ns:
+            return _AcknowledgementDecision(
+                _AcknowledgementAction.FAULT_TIMEOUT,
+                reason="worker acknowledgement arrived after deadline",
+            )
+        return _AcknowledgementDecision(
+            _AcknowledgementAction.APPLIED,
+            latency_ms=(observed_monotonic_ns - pending.published_monotonic_ns) / 1e6,
+        )
+    if acknowledgement_status is CommandPublishStatus.ACK_PENDING:
+        if poll_started_monotonic_ns < pending.deadline_monotonic_ns:
+            return _AcknowledgementDecision(_AcknowledgementAction.WAIT)
+        return _AcknowledgementDecision(
+            _AcknowledgementAction.FAULT_TIMEOUT,
+            reason="arm/hand acknowledgement timeout",
+        )
+    return _AcknowledgementDecision(
+        _AcknowledgementAction.FAULT_REJECTED,
+        reason=f"arm/hand acknowledgement failed: {acknowledgement_status.value}",
+    )
+
+
+def _command_watchdog_abort_reason(
+    *,
+    now_monotonic_ns: int,
+    run_started_monotonic_ns: int | None,
+    last_valid_command_monotonic_ns: int | None,
+    first_command_timeout_ns: int,
+    command_silence_timeout_ns: int,
+) -> str | None:
+    """Return the active command watchdog failure without reading shared state."""
+    if last_valid_command_monotonic_ns is None:
+        if (
+            run_started_monotonic_ns is not None
+            and now_monotonic_ns - run_started_monotonic_ns > first_command_timeout_ns
+        ):
+            return "first command timeout"
+        return None
+    if now_monotonic_ns - last_valid_command_monotonic_ns > command_silence_timeout_ns:
+        return "command silence timeout"
+    return None
 
 
 @dataclass(frozen=True)
@@ -434,8 +505,7 @@ def _end_policy_run(
     Both a clean operator STOP (``abort=False``) and a policy-semantic abort
     (``abort=True``) leave the robot ARMED (command quiescence), never FAULT.
     Abort counters are flushed immediately because the success-path
-    ``flush_every`` is never reached once a run ends (the loop idles in ARMED),
-    and the H0 gate reads these counters.
+    ``flush_every`` is never reached once a run ends (the loop idles in ARMED).
     """
     lifecycle_faulted = (
         bool(shared.error_state.value)
@@ -717,62 +787,57 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     hand_feedback_max_age_s=config.hand_feedback_max_age_s,
                 )
                 acknowledgement_observed_ns = time.monotonic_ns()
-                if acknowledgement.status is CommandPublishStatus.APPLIED:
-                    if (
-                        acknowledgement_observed_ns
-                        > pending_acknowledgement.deadline_monotonic_ns
-                    ):
-                        fault_physical(
-                            "worker acknowledgement arrived after deadline",
-                            metric=ACK_TIMEOUT,
-                        )
-                        _sleep_tick(period_s, tick_start)
-                        continue
-                    acknowledgement_latency_ms = (
-                        acknowledgement_observed_ns
-                        - pending_acknowledgement.published_monotonic_ns
-                    ) / 1e6
+                acknowledgement_decision = _classify_acknowledgement(
+                    pending_acknowledgement,
+                    acknowledgement.status,
+                    poll_started_monotonic_ns=now_ns,
+                    observed_monotonic_ns=acknowledgement_observed_ns,
+                )
+                if acknowledgement_decision.action is _AcknowledgementAction.APPLIED:
+                    assert acknowledgement_decision.latency_ms is not None
                     metrics.increment(ACKNOWLEDGED)
-                    metrics.observe(ACK_LATENCY_MS, acknowledgement_latency_ms)
-                    metrics.observe_timing(ACK_LATENCY_MS, acknowledgement_latency_ms)
+                    metrics.observe(ACK_LATENCY_MS, acknowledgement_decision.latency_ms)
+                    metrics.observe_timing(
+                        ACK_LATENCY_MS, acknowledgement_decision.latency_ms
+                    )
                     logger.info(
                         "coordinator: action_id=%d acknowledged by arm and hand",
                         pending_acknowledgement.candidate.action_id,
                     )
                     pending_acknowledgement = None
-                elif acknowledgement.status is CommandPublishStatus.ACK_PENDING:
-                    if now_ns < pending_acknowledgement.deadline_monotonic_ns:
-                        _sleep_tick(period_s, tick_start)
-                        continue
+                elif acknowledgement_decision.action is _AcknowledgementAction.WAIT:
+                    _sleep_tick(period_s, tick_start)
+                    continue
+                elif (
+                    acknowledgement_decision.action
+                    is _AcknowledgementAction.FAULT_TIMEOUT
+                ):
                     fault_physical(
-                        "arm/hand acknowledgement timeout",
+                        acknowledgement_decision.reason,
                         metric=ACK_TIMEOUT,
                     )
+                    if acknowledgement.status is CommandPublishStatus.APPLIED:
+                        _sleep_tick(period_s, tick_start)
                     continue
                 else:
                     fault_physical(
-                        "arm/hand acknowledgement failed: "
-                        f"{acknowledgement.status.value}",
+                        acknowledgement_decision.reason,
                         metric=ACK_FAILURE,
                     )
                     continue
 
-            # Abort a run that never produced its first command (the model
-            # dropped every plan); command-to-command silence is checked below.
-            if (
-                last_valid_policy_command_ns is None
-                and run_started_ns is not None
-                and now_ns - run_started_ns > first_command_timeout_ns
-            ):
-                abort_and_reset("first command timeout", metric=COMMAND_SILENCE_ABORT)
-                continue
-
-            # Watch command-to-command silence; first-inference latency is exempt.
-            if (
-                last_valid_policy_command_ns is not None
-                and now_ns - last_valid_policy_command_ns > max_silence_ns
-            ):
-                abort_and_reset("command silence timeout", metric=COMMAND_SILENCE_ABORT)
+            watchdog_abort_reason = _command_watchdog_abort_reason(
+                now_monotonic_ns=now_ns,
+                run_started_monotonic_ns=run_started_ns,
+                last_valid_command_monotonic_ns=last_valid_policy_command_ns,
+                first_command_timeout_ns=first_command_timeout_ns,
+                command_silence_timeout_ns=max_silence_ns,
+            )
+            if watchdog_abort_reason is not None:
+                abort_and_reset(
+                    watchdog_abort_reason,
+                    metric=COMMAND_SILENCE_ABORT,
+                )
                 continue
 
             rec = _read_latest_plan(shared)
