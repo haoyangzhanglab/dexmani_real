@@ -1,4 +1,4 @@
-"""Offline routing tests for the Phase 2 policy CLI."""
+"""Offline routing contracts for the learned-policy CLI."""
 
 from __future__ import annotations
 

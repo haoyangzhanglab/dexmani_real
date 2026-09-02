@@ -30,6 +30,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `repo_map.md` | 当前文件与 owner 索引。 |
 | `docs/data_schema.md` | Real raw v24、processed v11 与 Policy Zarr v5 的持久化字段和语义参考。 |
 | `docs/action_clip_mechanisms.md` | 动作 clip、限幅、拒绝与动作源差异的实现参数和数据审计说明。 |
+| `docs/policy_deployment.md` | Policy experiment 的 list/check/shadow/run、配置 ownership、按键、安全与诊断工作流。 |
 | `docs/pointcloud_pipeline.md` | depth-to-color aligned 点云的采集、处理、时序与持久化契约。 |
 | `docs/teleop_jitter_incident.md` | 键盘遥操作卡顿、抖动、delta 拒绝与 coupled-command 修复复盘。 |
 | `docs/vr_coordinate_transform_followup.md` | VR wrist→EEF 坐标换算审查、证据边界、真实样本诊断与后续修正决策记录。 |
@@ -212,7 +213,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `coordinator.py` | learned-policy 唯一 command producer、generation-isolated multi-episode plan scheduling、SafetyGate、物理运行的 per-episode home 准入、逐 endpoint coupled 双 ACK、typed stop、命令连续性与 watchdog。 |
 | `lifecycle.py` | `execute` 布尔控制的 worker topology、同进程 multi-episode supervision、物理模式 collision-checked home 与 verified shutdown。 |
 | `operator.py` | B/S/Q/ESC typed request；物理模式每个 episode 从 ARMED 执行 hand + collision-checked arm home，并发布一次性 home 准入标志。 |
-| `metrics.py` | inference/coordinator experiment counters，以及固定窗口 p50/p95/p99 timing（含 ACK latency/failure）。 |
+| `metrics.py` | inference/coordinator live counters、固定窗口 p50/p95/p99 timing，以及 log-only compact episode summary。 |
 
 ### `replay/`
 
@@ -264,23 +265,13 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 
 | 路径 | 主要职责 |
 |---|---|
-| `tests/test_arm_wrist_mapper.py` | 固定 VR→robot 标定、腕部旋转限幅状态与 tracking 毛刺恢复的纯几何合同。 |
-| `tests/test_coupled_command_publication.py` | coupled-command 非阻塞发布、active ticket 覆盖/撤销、ACK ownership 与运动准入合同。 |
-| `tests/test_data_segments.py` | source 缺口到 processed/Zarr episode 边界及跨缺口质量计算的合同。 |
 | `tests/test_dexmani_policy_adapter.py` | PolicySpec→Real 固定兼容门、runtime policy timing 的严格解析，以及 NumPy observation/joint/EE action adapter 失败路径。 |
+| `tests/test_deployment_metrics.py` | 跨周期 flush 的有界 episode counter/timing 累积与单次 log-only summary 合同。 |
 | `tests/test_hand_worker_startup.py` | XHand startup no-motion，以及 `execute=False/True` publication seam 与 arm+hand 双 ACK 合同。 |
 | `tests/test_policy_lifecycle.py` | inference restore 失败时不启动任何 hardware worker 的顺序合同。 |
 | `tests/test_policy_coordinator.py` | coordinator 的 generation/stale plan 准入、SafetyGate 丢弃、ACK/worker 失败、operator stop 与双 watchdog 语义。 |
 | `tests/test_policy_multi_episode.py` | 同进程第二个 policy episode、per-episode H 门、generation 前进以及旧 plan/ticket 失效的离线合同。 |
 | `tests/test_run_policy_cli.py` | list/check/shadow/run 路由、最小 CLI 参数面与 lifecycle seam。 |
-| `tests/test_recording_integrity.py` | raw v24 语义/sidecar manifest、旧 schema 拒绝与 recorder fail-closed 发布合同。 |
-| `tests/test_keyboard_arm_limits.py` | keyboard 发布完整 IK endpoint、禁用通用 arm delta clip 的合同。 |
-| `tests/test_pointcloud_sampling.py` | 固定 N 分层采样、数值快速路径、网格键 fail-closed 与实时策略投影合同。 |
-| `tests/test_runtime_channels_ticket_state.py` | RuntimeChannels 的 coupled-command ticket 分配、零初始化与真实 shared-memory round-trip 合同。 |
-| `tests/test_safety_gate_command_delta.py` | learned-policy 单步限幅使用命令历史、几何检查使用实测状态的合同。 |
-| `tests/test_worker_command_validation.py` | arm/hand 共用时效、限位、异常命令和 superseded snapshot 的 fail-closed 合同。 |
-| `tests/test_xhand_crc_policy.py` | XHand 发送 CRC 的未确认/非致命语义及 CRC 读取关节载荷完整性合同。 |
-| `tests/fixtures/contracts/` | 冻结的 architecture、IPC ABI 与 storage schema manifest。 |
 
 ## 6. 静态资源
 

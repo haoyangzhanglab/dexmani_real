@@ -64,16 +64,17 @@ XHand 采用位置控制抓取物体时，手指接触物体后无法继续到�
 这一取舍与 §1 一致，不表示机械臂或灵巧手与桌面发生碰撞在物理上没有风险。回放期间
 操作者仍应保持对真实场景的直接监督。
 
-## 4. XHand 连接后无条件发送 home reset
+## 4. XHand startup 不隐式运动
 
-每次 XHand worker 成功连接并完成触觉初始化后，在发布 ready 前向设备发送一次配置的
-`home_qpos`。该动作是设备初始化 reset，不执行桌面或碰撞规划，也不等待物理位置收敛；
-SDK 未接受命令时 worker 启动失败。操作者连接设备前必须确保手指周围无障碍物。
+XHand worker 成功连接并完成触觉初始化后，只读取初始状态并发布 ready，不发送
+`home_qpos` 或其他位置目标。ready 只表示 feedback/command 边界可用，不代表手部已回零。
+任何手部运动必须由拥有当前 workflow 的控制路径显式发起，并继续经过 freshness、generation、
+限位和 SDK acceptance 边界。
 
 物理回放以 episode 首帧的**实测 arm `qpos`** 作为物理起点，而不是将首帧 arm 命令
 误作实测姿态。xArm 必须在 replay 前由操作者通过独立受监督流程移动到该起点；若偏差超过
-5°，replay 在发送额外命令前拒绝。XHand 因连接 reset 无法在连接前保持录制姿态：replay
-在同一已连接会话内保持 xArm 当前姿态，先检查实时 arm/hand 状态到 frame 0 手部命令的
+5°，replay 在发送额外命令前拒绝。replay 在同一已连接会话内保持 xArm 当前姿态，
+先检查实时 arm/hand 状态到 frame 0 手部命令的
 自碰撞/静态障碍过渡，再发送该命令并维持 3 秒 warm-up。该 warm-up 不写入 replay 指标，
 随后仍从 frame 0 重放原始命令流。
 

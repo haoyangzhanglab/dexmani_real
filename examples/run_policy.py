@@ -36,7 +36,7 @@ class _LifecycleInputs:
 
 def _parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(
-        description="Inspect, check, shadow, or stage one DexMani Policy experiment"
+        description="Inspect, check, shadow, or run one DexMani Policy experiment"
     )
     parser.add_argument(
         "--device",

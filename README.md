@@ -22,10 +22,10 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
   fault、不退出，也不更新该 action 的 SDK-acceptance ACK；下一周期从新鲜实测状态和仍有效的
   latest target 继续。读取路径仅在 12 关节反馈完整且有限时继续，并将该帧触觉标为无效。
   其他未列入白名单的发送错误仍 fail closed。
-- XHand worker 每次成功连接并完成触觉初始化后，会在发布 ready 前无条件发送一次配置的
-  `home_qpos`；连接 XHand 会引起手指运动，该初始化 reset 不等待物理收敛。
+- XHand worker 成功连接并完成触觉初始化后只建立反馈与命令边界，不会在发布 ready 前
+  隐式发送 `home_qpos`。手部运动必须来自工作流 owner 显式发起的 home 或已校验命令。
 - physical replay 以记录的首帧**实测 arm**关节状态作为起点：xArm 需先由操作者受监督地
-  定位；XHand 在连接 reset 后，以首帧手部命令完成 3 秒安全 warm-up，并经实时
+  定位；XHand 连接后由 replay 显式发送首帧手部命令完成 3 秒安全 warm-up，并经实时
   自碰撞/静态障碍检查和新鲜反馈确认后才从 frame 0 开始重放。手部反馈不要求复现录制值。
 - RealSense 相机按设备原生频率连续采集；16 Hz 控制网格只选择最新严格因果帧，
   不再将相机发布节拍绑定到控制频率。
@@ -50,7 +50,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/hdf5_writer.py`](dexmani_real/recording/hdf5_writer.py)、[`recording/reader.py`](dexmani_real/recording/reader.py) |
 | 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`data/`](dexmani_real/data) |
 | 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v24、processed v11 与 Policy Zarr v5 的字段、dtype、shape 与语义 |
-| learned-policy 部署 | [`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`integrations/`](dexmani_real/integrations) |
+| learned-policy 部署 | [`docs/policy_deployment.md`](docs/policy_deployment.md)、[`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`integrations/`](dexmani_real/integrations) |
 | 相机、桌面与 VR 标定 | [`examples/`](examples) | [`calibration/`](dexmani_real/calibration)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
 | 点云完整链路 | [`docs/pointcloud_pipeline.md`](docs/pointcloud_pipeline.md) | [`sensor/pointcloud.py`](dexmani_real/sensor/pointcloud.py)、[`sensor/pointcloud_worker.py`](dexmani_real/sensor/pointcloud_worker.py) |
 
@@ -183,6 +183,10 @@ python examples/collect_teleop.py --print-config
 
 ### Learned policy 实时点云
 
+完整的 experiment 选择、`list/check/shadow/run` 边界、按键流程和诊断说明见
+[`docs/policy_deployment.md`](docs/policy_deployment.md)。其中 `list` 与 `check` 不连接硬件；
+`shadow` 虽然禁止 actuator publication，仍会连接相机、xArm 和 XHand，必须按硬件流程处理。
+
 `PolicySpec.sensor_modalities` 包含 `point_cloud` 时，lifecycle 才启动 camera 与独立
 point-cloud worker。worker 始终读取最新的 depth-to-color aligned RGB-D，旧帧不会排队；inference 仅在
 当前 RUNNING epoch 之后的点云 T 历史窗完整时才推理。窗口以因果截点前最新已过去的控制 tick 为末端，按策略控制网格选取严格递增、
@@ -217,6 +221,9 @@ hardware workers。内部只传播 `execute: bool`：`False` 走完整 candidate
 不会调用 publication；`True` 发布同一 generation/ticket 的 arm + hand command，并要求两个 worker
 在 Real-owned ACK timeout 内都确认，否则进入 FAULT。日常 inference seed 固定为 0，XHand 需求由
 `PolicySpec.requires_hand` 决定，不由 CLI 重复声明。
+
+coordinator 每秒输出 live metrics，并在每个 B→停止/中止/故障边界输出一条 compact episode
+summary。summary 只是在内存中累计的调试信息，不写 receipt、sidecar 或资格证明文件。
 
 点云缺失、过期、shape/dtype 错误、非有限值或颜色越界时 inference fail closed，不发布
 新的 plan。实时路径当前仅支持静态 `eye_to_hand` 标定；`eye_in_hand` 需要另行建立与
