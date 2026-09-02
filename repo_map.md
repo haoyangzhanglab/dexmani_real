@@ -207,7 +207,6 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `action_buffer.py` | 纯内存、有界 latest-wins policy endpoint scheduler；提供 stable token 与 commit/discard watermark。 |
 | `contracts.py` | 无时间 `PolicyPrediction`、publish context、timed action chunk 与 `PolicyRuntime` protocol。 |
 | `config.py` | PolicySpec/Real runtime 兼容投影、确定性 seed、point-cloud/IPC contract，以及相互独立的 H4 one-shot/task execute bounds 校验。 |
-| `preflight.py` | Phase 4 前暂留的隔离 restore/warmup/predict smoke test；只经 Policy public API 加载。 |
 | `observation.py` | 因果不可变 arm/hand/tactile/pointcloud/RGB history batch。 |
 | `timing.py` | immutable policy target grid、inference-expired prefix、plan/source deadline 与 diagnostic usable-target composition 的纯计算。 |
 | `worker.py` | 经 Policy public API 直接 restore、camera-grid observation 校验、logical-grid timing stamp、bounded timing samples 与 plan 发布。 |
