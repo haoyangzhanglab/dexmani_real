@@ -11,6 +11,7 @@ from dexmani_real.deployment.metrics import (
     Metrics,
     bounded_execute_run_receipt_json,
     execute_run_receipt_json,
+    inference_run_receipt_json,
     shadow_run_receipt_json,
 )
 from dexmani_real.utils.log import write_json_receipt
@@ -93,6 +94,25 @@ class DeploymentMetricsTest(unittest.TestCase):
                 coupled_command_end_sequence=2,
                 metrics={"inference_ms_p95": float("nan")},
             )
+
+    def test_inference_receipt_exposes_final_totals_and_explicit_zeroes(self) -> None:
+        receipt = json.loads(
+            inference_run_receipt_json(
+                run_generation=9,
+                reason="run generation advanced",
+                metrics={
+                    "plans_created": 98,
+                    "inference_ms_p95": 23.5,
+                },
+            )
+        )
+
+        self.assertEqual(receipt["worker"], "inference")
+        self.assertEqual(receipt["run_generation"], 9)
+        self.assertEqual(receipt["metrics"]["plans_created"], 98)
+        self.assertEqual(receipt["metrics"]["inference_failures"], 0)
+        self.assertEqual(receipt["metrics"]["plans_generation_dropped"], 0)
+        self.assertEqual(receipt["metrics"]["inference_ms_p95"], 23.5)
 
     def test_execute_receipt_exposes_one_publication_and_acknowledgement(self) -> None:
         receipt = json.loads(

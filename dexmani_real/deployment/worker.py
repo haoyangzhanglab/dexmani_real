@@ -50,6 +50,7 @@ from dexmani_real.deployment.metrics import (
     PLANS_GENERATION_DROPPED,
     Metrics,
     flush_every,
+    inference_run_receipt_json,
 )
 from dexmani_real.deployment.observation import (
     FrameWindow,
@@ -1020,8 +1021,22 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
     plan_id = 0
     observation_id = 0
     last_generation = -1
+    metrics_run_generation: int | None = None
     last_logical_step_ns = 0
     last_metrics_flush_ns = time.monotonic_ns()
+
+    def emit_inference_run_receipt(reason: str) -> None:
+        """Emit one complete receipt before this run's metrics are cleared."""
+        nonlocal metrics_run_generation
+        if metrics_run_generation is None:
+            return
+        receipt = inference_run_receipt_json(
+            run_generation=metrics_run_generation,
+            reason=reason,
+            metrics=metrics.run_snapshot(),
+        )
+        logger.info("inference run receipt: %s", receipt)
+        metrics_run_generation = None
 
     def wait_for_observation(reason: str | None = None) -> None:
         nonlocal last_metrics_flush_ns
@@ -1043,6 +1058,7 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
             epoch = read_run_epoch(shared)
             run_generation = epoch.generation
             if run_generation != last_generation:
+                emit_inference_run_receipt("run generation advanced")
                 runtime.reset_episode()
                 last_generation = run_generation
                 observation_id = 0  # new observation epoch for the new run
@@ -1055,6 +1071,8 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
                 continue
             if epoch.started_monotonic_ns <= 0:
                 raise RuntimeError("RUNNING state has no observation epoch")
+            if metrics_run_generation is None:
+                metrics_run_generation = run_generation
 
             anchor_ns = time.monotonic_ns()
             observation_id += 1
@@ -1162,7 +1180,10 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
                 time.sleep(sleep_s)
     finally:
         try:
-            runtime.close()
-        except Exception:
-            logger.warning("inference: runtime.close raised", exc_info=True)
+            emit_inference_run_receipt("worker exit")
+        finally:
+            try:
+                runtime.close()
+            except Exception:
+                logger.warning("inference: runtime.close raised", exc_info=True)
         logger.info("inference_loop: exited")
