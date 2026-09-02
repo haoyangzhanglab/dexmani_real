@@ -2,7 +2,7 @@
 """Research-facing entry point for one DexMani Policy experiment.
 
 The command line owns experiment selection and operator intent. Policy owns
-checkpoint inspection and restore; Real owns the temporary lifecycle bridge.
+checkpoint inspection and restore; Real owns validation and robot lifecycle.
 All imports that can reach Policy, Torch, or Real runtime code remain inside
 their command handlers so ``list`` stays a filesystem-only Policy operation.
 """
@@ -14,21 +14,21 @@ import math
 import statistics
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 
 
 class _ArgumentParser(argparse.ArgumentParser):
     """Render CLI-contract failures with the compatibility owner marker."""
 
-    def error(self, message: str) -> None:
+    def error(self, message: str) -> NoReturn:
         self.exit(2, f"{self.prog}: error: [COMPAT] {message}\n")
 
 
 @dataclass(frozen=True)
-class _LegacyBridge:
-    """Resolved inputs for a legacy lifecycle which Phase 2 must not start."""
+class _LifecycleInputs:
+    """Resolved inputs for one validate-only or physical lifecycle."""
 
-    legacy_execution_mode: str
+    execute: bool
     runtime: Any
     projection: Any
 
@@ -40,12 +40,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device",
         default="cuda:0",
-        help="Policy inference device for check or a staged lifecycle (default: cuda:0)",
+        help="Policy inference device for check or a lifecycle (default: cuda:0)",
     )
     parser.add_argument(
         "--config",
         default=None,
-        help="optional Real runtime YAML for staged shadow/run compatibility",
+        help="optional Real runtime YAML for shadow/run",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
 
@@ -61,8 +61,8 @@ def _parser() -> argparse.ArgumentParser:
 
     for command, help_text in (
         ("check", "strictly restore and smoke-test one Policy experiment"),
-        ("shadow", "stage the legacy no-publication lifecycle bridge"),
-        ("run", "stage the legacy physical-task lifecycle bridge"),
+        ("shadow", "run with full validation and no actuator publication"),
+        ("run", "run with physical coupled arm/hand publication"),
     ):
         command_parser = subcommands.add_parser(command, help=help_text)
         command_parser.add_argument("experiment", metavar="EXPERIMENT")
@@ -91,7 +91,7 @@ def _load_policy_experiment(experiment: str, device: str) -> Any:
     """Strictly restore one model through the Policy-owned runtime."""
     from dexmani_policy.deployment import load_experiment
 
-    return load_experiment(experiment, device=device)
+    return load_experiment(experiment, device=device, seed=0)
 
 
 def _print_policy_error(message: str) -> None:
@@ -129,7 +129,7 @@ def _print_experiment_summary(info: Any, *, mode: str, device: str) -> None:
 
 
 def _validated_warmup_durations(raw: Any) -> tuple[float, ...]:
-    """Validate the tiny public warmup receipt before reporting timings."""
+    """Validate the public warmup timings before reporting them."""
     if not isinstance(raw, tuple) or not raw:
         raise RuntimeError("Policy warmup returned no timing samples")
     durations = tuple(float(value) for value in raw)
@@ -176,20 +176,15 @@ def _run_check(args: argparse.Namespace) -> int:
     return exit_code
 
 
-def _prepare_legacy_bridge(
-    args: argparse.Namespace, info: Any, *, legacy_execution_mode: str
-) -> _LegacyBridge:
-    """Resolve the temporary Real config bridge without starting its lifecycle.
-
-    Both commands use a no-publication projection for compatibility validation.
-    The requested command label is retained separately; constructing or starting
-    any physical lifecycle remains structurally impossible from this CLI phase.
-    """
+def _prepare_lifecycle_inputs(
+    args: argparse.Namespace, info: Any, *, execute: bool
+) -> _LifecycleInputs:
+    """Resolve the PolicySpec/Real projection before lifecycle startup."""
     from dexmani_real.config.runtime import resolve_runtime_config
     from dexmani_real.deployment.config import resolve_policy_runtime_config
 
-    if legacy_execution_mode not in {"shadow", "task"}:
-        raise ValueError(f"unsupported legacy execution mode: {legacy_execution_mode}")
+    if not isinstance(execute, bool):
+        raise TypeError("execute must be a boolean")
     runtime = resolve_runtime_config(yaml_path=args.config)
     projection = resolve_policy_runtime_config(
         experiment=info.selector,
@@ -197,18 +192,23 @@ def _prepare_legacy_bridge(
         policy_spec=info.spec,
         runtime_config=runtime,
         device=args.device,
-        execution_mode="shadow",
+        execute=execute,
     )
-    return _LegacyBridge(
-        legacy_execution_mode=legacy_execution_mode,
+    return _LifecycleInputs(
+        execute=execute,
         runtime=runtime,
         projection=projection,
     )
 
 
-def _run_staged_lifecycle(
-    args: argparse.Namespace, *, legacy_execution_mode: str
-) -> int:
+def _start_lifecycle(inputs: _LifecycleInputs) -> int:
+    """Enter the hardware lifecycle after CLI-owned compatibility checks."""
+    from dexmani_real.deployment.lifecycle import run_policy_deployment
+
+    return run_policy_deployment(inputs.runtime, inputs.projection.runtime)
+
+
+def _run_lifecycle(args: argparse.Namespace, *, execute: bool) -> int:
     try:
         info = _inspect_policy_experiment(args.experiment)
     except Exception as exc:
@@ -216,32 +216,19 @@ def _run_staged_lifecycle(
         return 1
     _print_experiment_summary(
         info,
-        mode="SHADOW" if legacy_execution_mode == "shadow" else "RUN",
+        mode="RUN" if execute else "SHADOW",
         device=args.device,
     )
     try:
-        bridge = _prepare_legacy_bridge(
-            args, info, legacy_execution_mode=legacy_execution_mode
-        )
+        inputs = _prepare_lifecycle_inputs(args, info, execute=execute)
     except Exception as exc:
-        _print_compatibility_error(f"legacy bridge validation failed: {exc}")
+        _print_compatibility_error(f"runtime projection failed: {exc}")
         return 1
-
-    # Do not import or call ``run_policy_deployment`` here. The phase-two
-    # bridge proves that the PolicySpec and Real runtime inputs still agree,
-    # while making a hardware start
-    # structurally impossible from this CLI revision.
-    del bridge
-    if legacy_execution_mode == "task":
-        _print_compatibility_error(
-            "run is unavailable until runtime migration completes"
-        )
+    try:
+        return _start_lifecycle(inputs)
+    except Exception as exc:
+        _print_compatibility_error(f"lifecycle failed: {exc}")
         return 1
-    print(
-        "[COMPAT] Phase 2 bridge validated; legacy "
-        f"{legacy_execution_mode} lifecycle was not started."
-    )
-    return 0
 
 
 def _run_list(args: argparse.Namespace) -> int:
@@ -264,12 +251,8 @@ def main(argv: list[str] | None = None) -> int:
     handlers: dict[str, Callable[[argparse.Namespace], int]] = {
         "list": _run_list,
         "check": _run_check,
-        "shadow": lambda parsed: _run_staged_lifecycle(
-            parsed, legacy_execution_mode="shadow"
-        ),
-        "run": lambda parsed: _run_staged_lifecycle(
-            parsed, legacy_execution_mode="task"
-        ),
+        "shadow": lambda parsed: _run_lifecycle(parsed, execute=False),
+        "run": lambda parsed: _run_lifecycle(parsed, execute=True),
     }
     return handlers[args.command](args)
 

@@ -147,7 +147,7 @@ def usable_target_mask(
     first_index: int,
     deadline_ns: int,
 ) -> np.ndarray:
-    """Compose lower and upper timing bounds for diagnostics/qualification only.
+    """Compose lower and upper timing bounds for diagnostics only.
 
     This result may have both prefix and suffix zeros. It is not transport state
     and must never be written to ``JointActionChunk.valid_mask``.

@@ -30,7 +30,6 @@ class _FakeRuntimeChannels:
         self.run_generation = _Value(0)
         self.run_started_monotonic_ns = _Value(0)
         self.active_coupled_command_sequence = _Value(0)
-        self.execute_completed = _Value(False)
         self.motion_lock = threading.Lock()
         self._ready_names: set[str] = set()
         self._heartbeats: dict[str, float] = {}
@@ -93,7 +92,6 @@ def _policy_runtime_config() -> PolicyRuntimeConfig:
         point_cloud_table_plane_abcd_json="null",
         point_cloud_sampling="fake",
         point_cloud_transform="fake",
-        hand_acknowledged=True,
     )
 
 

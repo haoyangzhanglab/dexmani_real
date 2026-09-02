@@ -20,6 +20,7 @@ from dexmani_real.ipc.schema import (
     HAND_TACTILE_SUM_SHAPE,
 )
 from dexmani_real.robot.hand_worker import hand_loop
+from dexmani_real.runtime.safety import CoupledCommandTicket
 
 
 class _FakeRing:
@@ -104,10 +105,10 @@ class HandWorkerStartupTest(unittest.TestCase):
         )
 
 
-class ShadowPublicationTest(unittest.TestCase):
-    def test_shadow_validation_never_publishes_coupled_command(self) -> None:
+class CandidatePublicationTest(unittest.TestCase):
+    def _candidate(self) -> ActionCandidate:
         now_ns = time.monotonic_ns()
-        candidate = ActionCandidate(
+        return ActionCandidate(
             observation_id=1,
             run_generation=7,
             action_id=1,
@@ -117,6 +118,9 @@ class ShadowPublicationTest(unittest.TestCase):
             valid_until_monotonic_ns=now_ns + 1_000_000_000,
             arm_qpos=np.zeros(7, dtype=np.float64),
         )
+
+    def test_execute_false_never_invokes_publication(self) -> None:
+        candidate = self._candidate()
         gate = SimpleNamespace(
             validate=Mock(return_value=SimpleNamespace(accepted=True))
         )
@@ -148,12 +152,112 @@ class ShadowPublicationTest(unittest.TestCase):
                 gate=gate,
                 arm_feedback_max_age_s=0.1,
                 hand_feedback_max_age_s=0.1,
-                execution_mode="shadow",
+                execute=False,
             )
 
-        self.assertIs(result.status, publication.CommandPublishStatus.SHADOW_VALIDATED)
+        self.assertIs(result.status, publication.CommandPublishStatus.VALIDATED)
         send_command.assert_not_called()
         publish_coupled_command.assert_not_called()
+
+    def test_execute_true_invokes_publication_seam(self) -> None:
+        candidate = self._candidate()
+        gate = SimpleNamespace(
+            validate=Mock(return_value=SimpleNamespace(accepted=True))
+        )
+        arm_feedback = publication._ArmFeedbackSnapshot(
+            qpos=np.zeros(7, dtype=np.float64), last_cmd_seq=0
+        )
+        ticket = CoupledCommandTicket(run_generation=7, ring_sequence=1)
+        published = publication.CommandPublishResult(
+            publication.CommandPublishStatus.PUBLISHED,
+            candidate=candidate,
+            ticket=ticket,
+        )
+
+        with (
+            patch.object(publication, "check_runtime_gate", return_value=None),
+            patch.object(
+                publication,
+                "_arm_feedback_snapshot",
+                return_value=(arm_feedback, None),
+            ),
+            patch.object(
+                publication,
+                "read_motion_permit",
+                return_value=SimpleNamespace(run_generation=7),
+            ),
+            patch.object(publication, "send_command", return_value=published) as send,
+        ):
+            result = publication.validate_and_send_candidate(
+                object(),
+                candidate,
+                gate=gate,
+                arm_feedback_max_age_s=0.1,
+                hand_feedback_max_age_s=0.1,
+                execute=True,
+            )
+
+        self.assertIs(result.status, publication.CommandPublishStatus.PUBLISHED)
+        self.assertEqual(result.ticket, ticket)
+        send.assert_called_once()
+
+    def test_ack_requires_both_arm_and_hand_workers(self) -> None:
+        candidate = self._candidate()
+        candidate = ActionCandidate(
+            **{
+                **candidate.__dict__,
+                "hand_qpos": np.zeros(HAND_JOINT_SHAPE, dtype=np.float64),
+            }
+        )
+        ticket = CoupledCommandTicket(run_generation=7, ring_sequence=1)
+        arm_feedback = publication._ArmFeedbackSnapshot(
+            qpos=np.zeros(7, dtype=np.float64),
+            last_cmd_seq=candidate.action_id,
+        )
+        hand_pending = publication._HandFeedbackSnapshot(
+            qpos=np.zeros(HAND_JOINT_SHAPE, dtype=np.float64),
+            accepted_target_action_id=0,
+        )
+        hand_applied = publication._HandFeedbackSnapshot(
+            qpos=np.zeros(HAND_JOINT_SHAPE, dtype=np.float64),
+            accepted_target_action_id=candidate.action_id,
+        )
+
+        with (
+            patch.object(publication, "check_runtime_gate", return_value=None),
+            patch.object(
+                publication,
+                "_arm_feedback_snapshot",
+                return_value=(arm_feedback, None),
+            ),
+            patch.object(
+                publication,
+                "coupled_command_ticket_is_current",
+                return_value=True,
+            ),
+            patch.object(
+                publication,
+                "read_hand_feedback",
+                side_effect=((hand_pending, None), (hand_applied, None)),
+            ),
+        ):
+            pending = publication.poll_coupled_command_acknowledgement(
+                object(),
+                candidate,
+                ticket=ticket,
+                arm_feedback_max_age_s=0.1,
+                hand_feedback_max_age_s=0.1,
+            )
+            applied = publication.poll_coupled_command_acknowledgement(
+                object(),
+                candidate,
+                ticket=ticket,
+                arm_feedback_max_age_s=0.1,
+                hand_feedback_max_age_s=0.1,
+            )
+
+        self.assertIs(pending.status, publication.CommandPublishStatus.ACK_PENDING)
+        self.assertIs(applied.status, publication.CommandPublishStatus.APPLIED)
 
 
 if __name__ == "__main__":

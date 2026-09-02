@@ -30,7 +30,6 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `repo_map.md` | 当前文件与 owner 索引。 |
 | `docs/data_schema.md` | Real raw v24、processed v11 与 Policy Zarr v5 的持久化字段和语义参考。 |
 | `docs/action_clip_mechanisms.md` | 动作 clip、限幅、拒绝与动作源差异的实现参数和数据审计说明。 |
-| `docs/policy_deployment.md` | learned-policy 的实验选择/观测/GPU 推理/动作发布链、模型兼容边界、H2/H3/H4/task 门、当前验证记录与 task 诊断。 |
 | `docs/pointcloud_pipeline.md` | depth-to-color aligned 点云的采集、处理、时序与持久化契约。 |
 | `docs/teleop_jitter_incident.md` | 键盘遥操作卡顿、抖动、delta 拒绝与 coupled-command 修复复盘。 |
 | `docs/vr_coordinate_transform_followup.md` | VR wrist→EEF 坐标换算审查、证据边界、真实样本诊断与后续修正决策记录。 |
@@ -206,14 +205,14 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `__init__.py` | learned-policy 部署子包标记。 |
 | `action_buffer.py` | 纯内存、有界 latest-wins policy endpoint scheduler；提供 stable token 与 commit/discard watermark。 |
 | `contracts.py` | 无时间 `PolicyPrediction`、publish context、timed action chunk 与 `PolicyRuntime` protocol。 |
-| `config.py` | PolicySpec/Real runtime 兼容投影、确定性 seed、point-cloud/IPC contract，以及相互独立的 H4 one-shot/task execute bounds 校验。 |
+| `config.py` | PolicySpec/Real runtime 兼容投影、固定 seed=0、point-cloud/IPC contract，以及 validate-only/physical publication 布尔配置。 |
 | `observation.py` | 因果不可变 arm/hand/tactile/pointcloud/RGB history batch。 |
 | `timing.py` | immutable policy target grid、inference-expired prefix、plan/source deadline 与 diagnostic usable-target composition 的纯计算。 |
 | `worker.py` | 经 Policy public API 直接 restore、camera-grid observation 校验、logical-grid timing stamp、bounded timing samples 与 plan 发布。 |
-| `coordinator.py` | learned-policy 唯一 command producer、plan scheduling、物理执行本进程 H 完成 + arm-home 初态双门、逐 endpoint coupled ACK、typed stop、shadow/execute receipt、命令连续性与 watchdog。 |
-| `lifecycle.py` | shadow/H4/task worker topology、hand acknowledgement、物理模式 collision-checked home、B-relative supervision 与 verified shutdown。 |
+| `coordinator.py` | learned-policy 唯一 command producer、plan scheduling、SafetyGate、物理运行的 home 初态门、逐 endpoint coupled 双 ACK、typed stop、命令连续性与 watchdog。 |
+| `lifecycle.py` | `execute` 布尔控制的 worker topology、物理模式 collision-checked home、supervision 与 verified shutdown。 |
 | `operator.py` | B/S/Q/ESC typed request；物理模式每进程最多一次 H，依次下发 hand home、执行 collision-checked arm home，并发布完成标志。 |
-| `metrics.py` | inference/coordinator counters、bounded p50/p95/p99 timing 与 canonical shadow receipt。 |
+| `metrics.py` | inference/coordinator experiment counters，以及固定窗口 p50/p95/p99 timing（含 ACK latency/failure）。 |
 
 ### `replay/`
 
@@ -249,8 +248,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 |---|---|
 | `collect_teleop.py` | VR teleop 数据采集入口。 |
 | `keyboard_teleop.py` | keyboard teleop 入口。 |
-| `run_policy.py` | Policy experiment 的 list/check 与 shadow/run 临时 compatibility codepath validation CLI；后两者不启动 lifecycle。 |
-| `seal_h4_evidence.py` | 无硬件的 H4 evidence 封存工具；绑定 completed runtime receipt、terminal log 与操作者记录。 |
+| `run_policy.py` | Policy experiment 的 list/check 与 shadow/run CLI；shadow 为 validate-only lifecycle，run 为 physical coupled-publication lifecycle。 |
 | `replay_episode.py` | 物理回放入口。 |
 | `process_episodes.py` | raw → processed HDF5 离线处理。 |
 | `export_policy_zarr.py` | processed HDF5 → Policy Zarr 离线导出。 |
@@ -270,9 +268,10 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `tests/test_coupled_command_publication.py` | coupled-command 非阻塞发布、active ticket 覆盖/撤销、ACK ownership 与运动准入合同。 |
 | `tests/test_data_segments.py` | source 缺口到 processed/Zarr episode 边界及跨缺口质量计算的合同。 |
 | `tests/test_dexmani_policy_adapter.py` | PolicySpec→Real 固定兼容门与 NumPy observation/joint/EE action adapter 的失败路径。 |
+| `tests/test_hand_worker_startup.py` | XHand startup no-motion，以及 `execute=False/True` publication seam 与 arm+hand 双 ACK 合同。 |
+| `tests/test_policy_lifecycle.py` | inference restore 失败时不启动任何 hardware worker 的顺序合同。 |
+| `tests/test_run_policy_cli.py` | list/check/shadow/run 路由、最小 CLI 参数面与 lifecycle seam。 |
 | `tests/test_recording_integrity.py` | raw v24 语义/sidecar manifest、旧 schema 拒绝与 recorder fail-closed 发布合同。 |
-| `tests/test_deployment_timing.py` | immutable target grid、独立 lower/upper timing bounds、prefix-only transport mask、run epoch、watchdog、因果 observation grid 与 bounded physical control contracts。 |
-| `tests/test_deployment_metrics.py` | bounded p50/p95/p99 timing、flush/run totals、shadow zero-write、H4 one-shot 与 task execute receipt 合同。 |
 | `tests/test_keyboard_arm_limits.py` | keyboard 发布完整 IK endpoint、禁用通用 arm delta clip 的合同。 |
 | `tests/test_pointcloud_sampling.py` | 固定 N 分层采样、数值快速路径、网格键 fail-closed 与实时策略投影合同。 |
 | `tests/test_runtime_channels_ticket_state.py` | RuntimeChannels 的 coupled-command ticket 分配、零初始化与真实 shared-memory round-trip 合同。 |

@@ -75,8 +75,8 @@ def run_supervisor(
 
     Returns ``(exit_reason, normal_exit)``.  *exit_reason* describes why the
     supervisor stopped; *normal_exit* is True for user-requested clean exits
-    (Q key or KeyboardInterrupt) and an acknowledged optional B-relative run
-    time limit, or a bounded execute run returning to ARMED, False for faults.
+    (Q key or KeyboardInterrupt), an acknowledged optional B-relative run
+    time limit, or a configured session returning to ARMED, False for faults.
 
     The caller should have already transitioned to ARMED before calling this
     and must handle shutdown + DISARMED transition after it returns.
@@ -178,7 +178,7 @@ def run_supervisor(
                 and safety_state == int(SafetyState.ARMED)
             ):
                 normal_exit = True
-                exit_reason = "bounded execute run ended"
+                exit_reason = "policy run ended"
                 break
             if max_running_s is not None:
                 if time_limit_stop_deadline_s is not None:
@@ -196,8 +196,8 @@ def run_supervisor(
                     elapsed_s = (now_ns - started_ns) / 1e9
                     if elapsed_s >= max_running_s:
                         # The coordinator remains the normal RUNNING -> ARMED
-                        # owner and emits the run receipt. A missing policy
-                        # acknowledgement is escalated after its heartbeat SLA.
+                        # owner. A missing policy acknowledgement is escalated
+                        # after its heartbeat SLA.
                         shared.start_request.value = False
                         shared.stop_request.value = int(StopRequest.RUN_TIME_LIMIT)
                         time_limit_stop_deadline_s = now + time_limit_stop_grace_s

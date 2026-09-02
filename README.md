@@ -165,7 +165,8 @@ python examples/collect_teleop.py --print-config
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 使用 raw episode 的精确已发送命令、配置和模型 provenance，预检后控制 xArm7/XHand；写 `replay_results/` |
 | 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取并校验 `data.h5` hash 后的原始 `float64` 已发送命令，继续执行完整配置/模型/几何预检；包含多个 source 连续段的产物拒绝物理回放 |
 | learned policy 检查 | `python examples/run_policy.py list`；`python examples/run_policy.py check <experiment> --device <device>` | 仅列出实验，或经 Policy public API strict restore + warmup + synthetic predict；不连接硬件 |
-| learned policy codepath | `python examples/run_policy.py shadow <experiment>`；`python examples/run_policy.py run <experiment>` | 当前阶段仅验证 PolicySpec/Real 兼容路径，明确不启动 lifecycle 或硬件 |
+| learned policy shadow | `python examples/run_policy.py shadow <experiment>` | 连接真实 sensor 与 arm/XHand feedback，执行 inference、IK 和 SafetyGate；结构性禁止 actuator publication 与 home |
+| learned policy run | `python examples/run_policy.py run <experiment>` | 连接并控制 xArm7/XHand；H 完成 hand + collision-checked arm home 后，新的 B 才允许 coupled publication |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |
@@ -211,7 +212,10 @@ deployment lifecycle 从 Policy public API 取得只读 `PolicySpec`，Real 仅�
 和 IPC chunk capacity。checkpoint/Hydra/EMA/normalizer/denoise 配置及 strict restore 全部由
 `dexmani_policy.deployment.load_experiment()` 拥有；Real adapter 只转换 NumPy observation/action。
 inference worker 完成 restore、warmup 和延迟窗口检查后才置 ready，lifecycle 才允许启动其余
-hardware workers。当前 `run_policy.py shadow/run` 仍只是离线 codepath validation。
+hardware workers。内部只传播 `execute: bool`：`False` 走完整 candidate validation 后返回，
+不会调用 publication；`True` 发布同一 generation/ticket 的 arm + hand command，并要求两个 worker
+在 Real-owned ACK timeout 内都确认，否则进入 FAULT。日常 inference seed 固定为 0，XHand 需求由
+`PolicySpec.requires_hand` 决定，不由 CLI 重复声明。
 
 点云缺失、过期、shape/dtype 错误、非有限值或颜色越界时 inference fail closed，不发布
 新的 plan。实时路径当前仅支持静态 `eye_to_hand` 标定；`eye_in_hand` 需要另行建立与

@@ -144,6 +144,16 @@ class PolicyCompatibilityTest(unittest.TestCase):
             with self.subTest(policy_spec=policy_spec), self.assertRaises(ValueError):
                 _resolved_config(policy_spec)
 
+    def test_command_ack_timeout_cannot_outlive_command_validity(self) -> None:
+        with self.assertRaises(ValueError):
+            DeploymentConfig(
+                experiment="fake/model",
+                task_name="fake",
+                hand_enabled=True,
+                action_validity_s=0.5,
+                command_acknowledgement_timeout_s=0.6,
+            )
+
 
 class PolicyAdapterTest(unittest.TestCase):
     def test_joint_action_split_and_numpy_observation(self) -> None:

@@ -20,7 +20,6 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import threading
-from pathlib import Path
 from typing import Any
 
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
@@ -57,20 +56,6 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 
-def _prepare_execute_receipt_dir() -> str:
-    """Create the physical-execution receipt directory before hardware starts."""
-    receipt_dir = Path(
-        os.environ.get(
-            "DEXMANI_RECEIPT_DIR",
-            str(Path.home() / ".dexmani" / "receipts"),
-        )
-    )
-    receipt_dir.mkdir(parents=True, exist_ok=True)
-    if not receipt_dir.is_dir():
-        raise RuntimeError(f"execute receipt path is not a directory: {receipt_dir}")
-    return str(receipt_dir)
-
-
 def _requires_pointcloud(deployment: DeploymentConfig) -> bool:
     return "point_cloud" in parse_observation_fields(deployment.observation_fields)
 
@@ -84,8 +69,6 @@ def build_policy_worker_specs(
     shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     policy_runtime_config: PolicyRuntimeConfig,
-    *,
-    execute_receipt_dir: str | None = None,
 ) -> list[WorkerSpec]:
     """Build the workers required by the explicit deployment contract.
 
@@ -99,10 +82,7 @@ def build_policy_worker_specs(
     coordinator_config = CoordinatorConfig.from_runtime(
         deployment,
         runtime,
-        execution_mode=policy_runtime_config.execution_mode,
-        h4_execute_bounds=policy_runtime_config.h4_execute_bounds,
-        task_execute_bounds=policy_runtime_config.task_execute_bounds,
-        execute_receipt_dir=execute_receipt_dir,
+        execute=policy_runtime_config.execute,
     )
     pointcloud_requested = _requires_pointcloud(deployment)
     camera_requested = _requires_camera(deployment)
@@ -180,42 +160,22 @@ def run_policy_deployment(
 ) -> int:
     """Run one policy deployment lifecycle and return its exit code.
 
-    A frozen ``shadow`` projection, bounded H4 ``execute``, or independently
-    bounded ``task`` projection reaches this lifecycle. The inference worker must load
-    successfully before any hardware process is started. The runtime then
+    ``execute=False`` validates candidates without publication;
+    ``execute=True`` enables coupled arm/hand publication. The inference worker
+    must load successfully before any hardware process is started. The runtime then
     follows ``DISARMED -> hardware readiness -> ARMED -> supervision ->
     verified shutdown``.
     """
     if not isinstance(policy_runtime_config, PolicyRuntimeConfig):
         raise TypeError("policy_runtime_config must be a PolicyRuntimeConfig")
-    if policy_runtime_config.execution_mode == "shadow":
-        max_running_s = validate_max_running_s(max_running_s)
-        if policy_runtime_config.h4_execute_bounds is not None:
-            raise ValueError("shadow lifecycle must not carry H4 execute bounds")
-    else:
-        if max_running_s is not None:
-            raise ValueError(
-                "physical execute duration belongs to its immutable bounds"
-            )
-        execute_bounds = policy_runtime_config.physical_execute_bounds
-        if execute_bounds is None:
-            raise ValueError("physical execute lifecycle requires explicit bounds")
-        max_running_s = execute_bounds.max_running_s
+    max_running_s = validate_max_running_s(max_running_s)
     deployment = policy_runtime_config.deployment
-    if deployment.hand_enabled and not policy_runtime_config.hand_acknowledged:
-        raise ValueError("deployment with hand targets requires --hand")
     logger.info(
-        "policy deployment: experiment=%s runtime=%s device=%s seed=%d",
+        "policy deployment: experiment=%s runtime=%s device=%s seed=0 execute=%s",
         deployment.experiment,
         FIXED_POLICY_RUNTIME_TARGET,
         deployment.device,
-        deployment.inference_seed,
-    )
-
-    execute_receipt_dir = (
-        _prepare_execute_receipt_dir()
-        if policy_runtime_config.execution_mode in {"execute", "task"}
-        else None
+        policy_runtime_config.execute,
     )
 
     ctx = mp.get_context("spawn")
@@ -247,7 +207,6 @@ def run_policy_deployment(
             shared,
             runtime,
             policy_runtime_config,
-            execute_receipt_dir=execute_receipt_dir,
         )
         procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)
@@ -314,9 +273,7 @@ def run_policy_deployment(
             flush=True,
         )
         home_planner = (
-            build_home_planner(runtime)
-            if policy_runtime_config.execution_mode in {"execute", "task"}
-            else None
+            build_home_planner(runtime) if policy_runtime_config.execute else None
         )
         home_status = "return hand + arm home before B" if home_planner else "disabled"
         print(
@@ -331,7 +288,7 @@ def run_policy_deployment(
             args=(shared, runtime, deployment, home_planner),
             kwargs={
                 "stop_event": operator_stop,
-                "execution_mode": policy_runtime_config.execution_mode,
+                "execute": policy_runtime_config.execute,
             },
             name="policy-operator",
             daemon=True,
@@ -348,9 +305,7 @@ def run_policy_deployment(
             heartbeat_timeouts_s=dict(runtime.safety.heartbeat_timeouts),
             supervisor_hz=float(runtime.safety.supervisor_hz),
             max_running_s=max_running_s,
-            exit_after_run_stops=(
-                policy_runtime_config.execution_mode in {"execute", "task"}
-            ),
+            exit_after_run_stops=policy_runtime_config.execute,
         )
 
         if operator_stop is not None:
@@ -370,13 +325,7 @@ def run_policy_deployment(
             graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
             disarm_if_clean=normal_exit,
         )
-        execute_completed = bool(shared.execute_completed.value)
         clean_exit = normal_exit and shutdown_report.clean
-        if policy_runtime_config.execution_mode in {"execute", "task"}:
-            # A clean cancellation is operationally safe, but it is not a
-            # successful H4 execute.  Keep the process status unambiguous for
-            # runbooks and any calling automation.
-            clean_exit = clean_exit and execute_completed
         safety_name = (
             SafetyState(shutdown_report.safety_state).name
             if shutdown_report.safety_state is not None
@@ -385,8 +334,7 @@ def run_policy_deployment(
         print(f"\n── Session End ──")
         print(
             f"  exit_reason={exit_reason}  safety={safety_name}  "
-            f"supervisor_normal={normal_exit}  execute_completed={execute_completed}  "
-            f"clean={clean_exit}"
+            f"supervisor_normal={normal_exit}  clean={clean_exit}"
         )
         print("──")
         return 0 if clean_exit else 1

@@ -66,7 +66,7 @@ class CommandPublishStatus(str, Enum):
 
     PUBLISHED = "published"
     APPLIED = "applied"
-    SHADOW_VALIDATED = "shadow validated"
+    VALIDATED = "validated"
     NO_SAFETY_GATE = "no safety gate"
     INVALID_CANDIDATE = "invalid candidate"
     INVALID_OBSERVATION_ANCHOR = "invalid observation anchor"
@@ -114,7 +114,7 @@ class CommandPublishResult:
         return self.status in (
             CommandPublishStatus.PUBLISHED,
             CommandPublishStatus.APPLIED,
-            CommandPublishStatus.SHADOW_VALIDATED,
+            CommandPublishStatus.VALIDATED,
         )
 
     @property
@@ -599,15 +599,16 @@ def validate_and_send_candidate(
     hand_mechanical_upper_rad: np.ndarray | None = None,
     hand_command_max_delta_rad_per_tick: float | np.ndarray | None = None,
     canonicalize_policy_hand_roundoff: bool = False,
-    execution_mode: str,
+    execute: bool,
     minimum_delivery_window_s: float = 0.0,
 ) -> CommandPublishResult:
-    """Validate a pre-built candidate through the gate and publish it.
+    """Validate a pre-built candidate and optionally publish it.
 
     Checks runtime and actuator feedback, runs :meth:`SafetyGate.validate`,
     optionally shapes a learned hand endpoint into one measured-state-bounded
-    command, preflights that actual command, and publishes via
-    :func:`send_command`.
+    command and preflights that actual command. ``execute=False`` returns after
+    complete validation without calling :func:`send_command`; ``execute=True``
+    publishes through that seam.
     This is the publication tail shared by VR teleop, keyboard/replay, and the
     learned-policy coordinator.
 
@@ -619,8 +620,8 @@ def validate_and_send_candidate(
     validation, so time spent inside the safety gate consumes the same fixed
     source-owned deadline.
     """
-    if execution_mode not in {"shadow", "execute"}:
-        raise ValueError("execution_mode must be 'shadow' or 'execute'")
+    if not isinstance(execute, bool):
+        raise TypeError("execute must be a boolean")
     if hand_command_max_delta_rad_per_tick is not None:
         command_delta = np.asarray(
             hand_command_max_delta_rad_per_tick, dtype=np.float64
@@ -807,7 +808,7 @@ def validate_and_send_candidate(
                 hand_roundoff_canonicalized=hand_roundoff_canonicalized,
             )
 
-    if execution_mode == "shadow":
+    if not execute:
         delivery_rejection = _validate_command_delivery(
             shared,
             candidate,
@@ -820,7 +821,7 @@ def validate_and_send_candidate(
                 hand_roundoff_canonicalized=hand_roundoff_canonicalized,
             )
         return CommandPublishResult(
-            CommandPublishStatus.SHADOW_VALIDATED,
+            CommandPublishStatus.VALIDATED,
             candidate=candidate,
             hand_roundoff_canonicalized=hand_roundoff_canonicalized,
         )
@@ -913,7 +914,7 @@ def publish_joint_targets(
         hand_delta_reference_qpos=hand_delta_reference_qpos,
         hand_mechanical_lower_rad=hand_mechanical_lower_rad,
         hand_mechanical_upper_rad=hand_mechanical_upper_rad,
-        execution_mode="execute",
+        execute=True,
     )
     if not publish_result.succeeded:
         return publish_result

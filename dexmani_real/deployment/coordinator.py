@@ -38,44 +38,36 @@ from dexmani_real.deployment.action_buffer import (
     PushStatus,
     compute_max_buffered_plans,
 )
-from dexmani_real.deployment.config import (
-    DeploymentConfig,
-    H4ExecuteBounds,
-    TaskExecuteBounds,
-)
+from dexmani_real.deployment.config import DeploymentConfig
 from dexmani_real.deployment.contracts import JointActionChunk
 from dexmani_real.deployment.metrics import (
+    ACK_FAILURE,
+    ACK_LATENCY_MS,
+    ACK_TIMEOUT,
+    ACKNOWLEDGED,
     COMMAND_SILENCE_ABORT,
-    COUPLED_COMMAND_WRITES,
     ENDPOINTS_COALESCED,
     ENDPOINTS_COMMITTED,
     ENDPOINTS_DUE,
     ENDPOINTS_FATAL_REJECTED,
     ENDPOINTS_MOTION_DISCARDED,
     ENDPOINTS_PUBLISHED,
-    ENDPOINTS_SHADOW_VALIDATED,
     ENDPOINTS_STALE_DISCARDED,
     ENDPOINTS_TRANSIENT_DEFERRED,
-    EXECUTE_ACK_TIMEOUT,
-    EXECUTE_ACKNOWLEDGED,
-    EXECUTE_PUBLICATION_BOUND_REACHED,
+    ENDPOINTS_VALIDATED,
     HAND_POLICY_ENDPOINT_ROUNDOFF_CANONICALIZED,
     HAND_PREFLIGHT_REJECTIONS,
     IK_CHECKER_REJECTS,
-    PHYSICAL_HOME_COMPLETED,
     PLAN_AGE_MS,
     PLANS_EVICTED,
     PLANS_GENERATION_DROPPED,
     PLANS_INGESTED,
     PLANS_STALE,
     POLICY_ABORTS,
-    SHADOW_COUPLED_WRITE_VIOLATIONS,
     USABLE_HORIZON_MS,
     Metrics,
-    bounded_execute_run_receipt_json,
     flush_every,
     reject_counter_name,
-    shadow_run_receipt_json,
 )
 from dexmani_real.deployment.timing import (
     compute_plan_deadline_ns,
@@ -107,7 +99,7 @@ from dexmani_real.runtime.safety import (
 )
 from dexmani_real.utils.feedback import FeedbackIssueCode, diagnose_arm_feedback
 from dexmani_real.utils.limits import validate_hand_limit_nesting
-from dexmani_real.utils.log import get_logger, write_json_receipt
+from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
     from dexmani_real.config.runtime import ResolvedRuntimeConfig
@@ -116,11 +108,12 @@ logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
-class _PendingExecuteAcknowledgement:
+class _PendingAcknowledgement:
     """One physical command awaiting arm and hand worker acknowledgement."""
 
     candidate: ActionCandidate
     ticket: CoupledCommandTicket
+    published_monotonic_ns: int
     deadline_monotonic_ns: int
 
 
@@ -146,10 +139,8 @@ class CoordinatorConfig:
     arm_feedback_max_age_s: float
     hand_feedback_max_age_s: float
     control_hz: float
-    execution_mode: str
-    h4_execute_bounds: H4ExecuteBounds | None = None
-    task_execute_bounds: TaskExecuteBounds | None = None
-    execute_receipt_dir: str | None = None
+    execute: bool
+    command_acknowledgement_timeout_s: float
     # Full 19-DoF collision model (hand + static boxes) for EE->IK and the
     # transition collision gate (Phase 6/7); table clearance is not part of the
     # policy safety gate.
@@ -173,38 +164,23 @@ class CoordinatorConfig:
     start_arm_home_tolerance_rad: float | None = None
 
     def __post_init__(self) -> None:
-        if self.execution_mode not in {"shadow", "execute", "task"}:
-            raise ValueError("execution_mode must be 'shadow', 'execute', or 'task'")
-        if self.execution_mode == "execute" and self.h4_execute_bounds is None:
-            raise ValueError("execute coordinator requires explicit H4 execute bounds")
-        if self.h4_execute_bounds is not None and not isinstance(
-            self.h4_execute_bounds, H4ExecuteBounds
-        ):
-            raise TypeError("h4_execute_bounds must be H4ExecuteBounds or None")
-        if self.execution_mode == "shadow" and self.h4_execute_bounds is not None:
-            raise ValueError("shadow coordinator must not carry H4 execute bounds")
-        if self.execution_mode != "execute" and self.h4_execute_bounds is not None:
-            raise ValueError("only H4 execute may carry H4 execute bounds")
-        if self.execution_mode == "task" and self.task_execute_bounds is None:
-            raise ValueError("task coordinator requires explicit task execute bounds")
-        if self.task_execute_bounds is not None and not isinstance(
-            self.task_execute_bounds, TaskExecuteBounds
-        ):
-            raise TypeError("task_execute_bounds must be TaskExecuteBounds or None")
-        if self.execution_mode != "task" and self.task_execute_bounds is not None:
-            raise ValueError("only task execute may carry task execute bounds")
+        if not isinstance(self.execute, bool):
+            raise TypeError("execute must be a boolean")
+        if self.execute and not self.deployment.hand_enabled:
+            raise ValueError("physical publication requires hand-enabled deployment")
         if (
-            self.execution_mode in {"execute", "task"}
-            and not self.deployment.hand_enabled
+            not np.isfinite(self.command_acknowledgement_timeout_s)
+            or self.command_acknowledgement_timeout_s <= 0.0
+            or self.command_acknowledgement_timeout_s
+            > self.deployment.action_validity_s
         ):
             raise ValueError(
-                "physical execute coordinator requires hand-enabled deployment"
+                "command acknowledgement timeout must be positive and no greater "
+                "than action validity"
             )
-        if self.execution_mode in {"execute", "task"}:
+        if self.execute:
             if self.required_start_arm_qpos is None:
-                raise ValueError(
-                    "physical execute coordinator requires canonical arm home"
-                )
+                raise ValueError("physical publication requires canonical arm home")
             qpos = np.asarray(self.required_start_arm_qpos, dtype=np.float64)
             if qpos.shape != (7,) or not np.all(np.isfinite(qpos)):
                 raise ValueError("required_start_arm_qpos must be a finite 7-vector")
@@ -221,24 +197,13 @@ class CoordinatorConfig:
                 "hand command max delta per tick must be finite and positive"
             )
 
-    @property
-    def physical_execute_bounds(self) -> H4ExecuteBounds | TaskExecuteBounds | None:
-        if self.execution_mode == "execute":
-            return self.h4_execute_bounds
-        if self.execution_mode == "task":
-            return self.task_execute_bounds
-        return None
-
     @classmethod
     def from_runtime(
         cls,
         deployment: DeploymentConfig,
         runtime: "ResolvedRuntimeConfig",
         *,
-        execution_mode: str,
-        h4_execute_bounds: H4ExecuteBounds | None,
-        task_execute_bounds: TaskExecuteBounds | None = None,
-        execute_receipt_dir: str | None = None,
+        execute: bool,
     ) -> "CoordinatorConfig":
         return cls(
             deployment=deployment,
@@ -252,10 +217,10 @@ class CoordinatorConfig:
             arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
             hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
             control_hz=float(runtime.policy.control_hz),
-            execution_mode=execution_mode,
-            h4_execute_bounds=h4_execute_bounds,
-            task_execute_bounds=task_execute_bounds,
-            execute_receipt_dir=execute_receipt_dir,
+            execute=execute,
+            command_acknowledgement_timeout_s=(
+                deployment.command_acknowledgement_timeout_s
+            ),
             static_boxes=tuple(runtime.environment.static_boxes),
             ik_max_pose_error_pos_m=float(runtime.policy.ik_max_pose_error_pos_m),
             ik_max_pose_error_rot_rad=float(runtime.policy.ik_max_pose_error_rot_rad),
@@ -267,15 +232,9 @@ class CoordinatorConfig:
             endpoint_delta_tolerance_rad=float(
                 runtime.policy.endpoint_delta_tolerance_rad
             ),
-            required_start_arm_qpos=(
-                tuple(runtime.arm.home_qpos)
-                if execution_mode in {"execute", "task"}
-                else None
-            ),
+            required_start_arm_qpos=(tuple(runtime.arm.home_qpos) if execute else None),
             start_arm_home_tolerance_rad=(
-                float(runtime.arm.homing.convergence_rad)
-                if execution_mode in {"execute", "task"}
-                else None
+                float(runtime.arm.homing.convergence_rad) if execute else None
             ),
         )
 
@@ -416,20 +375,12 @@ def _usable_horizon_ms(plan: BufferedPlan, *, now_ns: int) -> float:
     return max(0.0, latest_target_ns - int(now_ns)) / 1e6
 
 
-def _coupled_command_sequence(shared: RuntimeChannels) -> int:
-    """Read the monotonic coupled-ring sequence used by a shadow receipt."""
-    sequence = int(shared.coupled_cmd_ring.latest_sequence)
-    if sequence < 0:
-        raise ValueError("coupled command ring sequence must be non-negative")
-    return sequence
-
-
 def _physical_start_pose_rejection(
     shared: RuntimeChannels,
     config: CoordinatorConfig,
 ) -> str | None:
     """Return why B cannot open a physical epoch, or ``None`` at arm home."""
-    if config.execution_mode not in {"execute", "task"}:
+    if not config.execute:
         return None
     if not bool(shared.physical_home_completed.value):
         return (
@@ -586,186 +537,43 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
     )
     buffer_generation: int | None = None
     last_seen_plan_key: tuple[int, int] | None = None
-    # Silence timeout starts at the first published command, not first inference.
+    # Silence timeout starts at the first valid endpoint, not first inference.
     last_valid_policy_command_ns: int | None = None
     # RUNNING start time, for the first-command timeout.
     run_started_ns: int | None = None
-    shadow_run_generation: int | None = None
-    shadow_start_coupled_sequence: int | None = None
-    execute_run_generation: int | None = None
-    execute_start_coupled_sequence: int | None = None
-    execute_first_publication_ns: int | None = None
-    execute_last_publication_ns: int | None = None
-    execute_published_endpoints = 0
-    execute_acknowledged_action_id: int | None = None
-    execute_pending_acknowledgement: _PendingExecuteAcknowledgement | None = None
+    pending_acknowledgement: _PendingAcknowledgement | None = None
     # One process carries one operator-authorized policy session. Physical
-    # modes exit after it; shadow remains ARMED for Q but cannot start again.
+    # publication exits after it; validate-only remains ARMED for Q.
     policy_session_started = False
     previous_arm_command_qpos: np.ndarray | None = None
     last_metrics_flush_ns = time.monotonic_ns()
 
-    def emit_shadow_receipt(reason: str) -> None:
-        """Log one run-total shadow receipt after B has opened an epoch."""
-        nonlocal shadow_run_generation, shadow_start_coupled_sequence
-        if shadow_run_generation is None or shadow_start_coupled_sequence is None:
-            return
-        try:
-            end_sequence = _coupled_command_sequence(shared)
-            receipt = shadow_run_receipt_json(
-                run_generation=shadow_run_generation,
-                reason=reason,
-                coupled_command_start_sequence=shadow_start_coupled_sequence,
-                coupled_command_end_sequence=end_sequence,
-                metrics=metrics.run_snapshot(),
-            )
-        except Exception:
-            logger.critical("coordinator: cannot render shadow receipt", exc_info=True)
-        else:
-            logger.info("shadow run receipt: %s", receipt)
-            if end_sequence != shadow_start_coupled_sequence:
-                logger.critical(
-                    "coordinator: shadow run changed coupled command sequence "
-                    "(%d -> %d)",
-                    shadow_start_coupled_sequence,
-                    end_sequence,
-                )
-        finally:
-            shadow_run_generation = None
-            shadow_start_coupled_sequence = None
-
-    def emit_execute_receipt(reason: str) -> None:
-        """Log one bounded physical-execution receipt after B opened an epoch."""
-        nonlocal execute_run_generation, execute_start_coupled_sequence
-        if execute_run_generation is None or execute_start_coupled_sequence is None:
-            return
-        execute_bounds = config.physical_execute_bounds
-        assert execute_bounds is not None
-        try:
-            end_sequence = _coupled_command_sequence(shared)
-            receipt = bounded_execute_run_receipt_json(
-                execution_mode=config.execution_mode,
-                run_generation=execute_run_generation,
-                reason=reason,
-                coupled_command_start_sequence=execute_start_coupled_sequence,
-                coupled_command_end_sequence=end_sequence,
-                max_published_endpoints=execute_bounds.max_published_endpoints,
-                acknowledgement_timeout_s=execute_bounds.acknowledgement_timeout_s,
-                acknowledged_action_id=execute_acknowledged_action_id,
-                completed=bool(shared.execute_completed.value),
-                metrics=metrics.run_snapshot(),
-                timeline_monotonic_ns={
-                    name: value
-                    for name, value in (
-                        ("run_started", run_started_ns),
-                        ("first_publication", execute_first_publication_ns),
-                        ("last_publication", execute_last_publication_ns),
-                        ("receipt_emitted", time.monotonic_ns()),
-                    )
-                    if value is not None
-                },
-            )
-        except Exception:
-            # Receipt rendering is part of the same acceptance boundary as
-            # persistence. Never leave a successful command marked complete
-            # when its terminal evidence cannot be produced.
-            shared.execute_completed.value = False
-            shared.error_state.value = True
-            revoke_motion(shared, SafetyState.FAULT)
-            logger.critical("coordinator: cannot render execute receipt", exc_info=True)
-        else:
-            logger.info("execute run receipt: %s", receipt)
-            if config.execute_receipt_dir is not None:
-                try:
-                    receipt_path = write_json_receipt(
-                        config.execute_receipt_dir, receipt
-                    )
-                except Exception:
-                    # Receipt persistence is part of the acceptance
-                    # boundary. Do not report a clean execute without it.
-                    shared.execute_completed.value = False
-                    shared.error_state.value = True
-                    revoke_motion(shared, SafetyState.FAULT)
-                    logger.critical(
-                        "coordinator: cannot persist physical execute receipt",
-                        exc_info=True,
-                    )
-                else:
-                    logger.info("physical execute receipt written: %s", receipt_path)
-        finally:
-            execute_run_generation = None
-            execute_start_coupled_sequence = None
-
-    def emit_run_receipt(reason: str) -> None:
-        """Emit the receipt appropriate for the active execution boundary."""
-        if config.execution_mode == "shadow":
-            emit_shadow_receipt(reason)
-        else:
-            emit_execute_receipt(reason)
-
-    def fault_execute(reason: str, *, metric: str) -> None:
-        """Latch FAULT for a physical acknowledgement/boundary failure."""
-        nonlocal buffer_generation, last_seen_plan_key, execute_pending_acknowledgement
-        shared.execute_completed.value = False
+    def fault_physical(reason: str, *, metric: str) -> None:
+        """Latch FAULT for a physical publication or acknowledgement failure."""
+        nonlocal buffer_generation, last_seen_plan_key, pending_acknowledgement
         shared.error_state.value = True
         if not revoke_motion(shared, SafetyState.FAULT):
-            logger.critical("coordinator: unable to latch FAULT after execute failure")
-        logger.critical("coordinator: physical execute failure: %s", reason)
+            logger.critical("coordinator: unable to latch FAULT after physical failure")
+        logger.critical("coordinator: physical publication failure: %s", reason)
         metrics.increment(POLICY_ABORTS)
         metrics.increment(metric)
         metrics.flush(prefix="coordinator metrics")
-        emit_execute_receipt(reason)
-        execute_pending_acknowledgement = None
+        pending_acknowledgement = None
         action_buffer.reset(run_generation=int(shared.run_generation.value))
         buffer_generation = None
         last_seen_plan_key = None
 
     def abort_and_reset(reason: str, *, metric: str) -> None:
         """Fail closed and synchronously invalidate every buffered endpoint."""
-        nonlocal buffer_generation, last_seen_plan_key, execute_pending_acknowledgement
-        if config.execution_mode in {"execute", "task"}:
-            fault_execute(reason, metric=metric)
+        nonlocal buffer_generation, last_seen_plan_key, pending_acknowledgement
+        if config.execute:
+            fault_physical(reason, metric=metric)
             return
         _end_policy_run(shared, reason, abort=True, metrics=metrics, metric=metric)
-        emit_run_receipt(reason)
-        execute_pending_acknowledgement = None
+        pending_acknowledgement = None
         action_buffer.reset(run_generation=int(shared.run_generation.value))
         buffer_generation = None
         last_seen_plan_key = None
-
-    def fault_shadow_integrity(*, reason: str, write_violation: bool) -> None:
-        """Latch FAULT when a shadow no-write proof is violated or unavailable.
-
-        Unlike an ordinary learned endpoint reject, this means either a
-        structural no-write invariant has already been broken or the runtime
-        cannot establish the ring-sequence evidence needed to prove it. Leaving
-        the runtime ARMED would permit a second B and hide the evidence, so this
-        path must revoke the permit directly to sticky FAULT.
-        """
-        nonlocal buffer_generation, last_seen_plan_key
-        shared.error_state.value = True
-        if not revoke_motion(shared, SafetyState.FAULT):
-            logger.critical("coordinator: unable to latch FAULT after shadow failure")
-        logger.critical("coordinator: shadow integrity failure: %s", reason)
-        if write_violation:
-            metrics.increment(SHADOW_COUPLED_WRITE_VIOLATIONS)
-        metrics.increment(POLICY_ABORTS)
-        metrics.increment(ENDPOINTS_FATAL_REJECTED)
-        metrics.flush(prefix="coordinator metrics")
-        if shadow_start_coupled_sequence is None:
-            logger.critical("coordinator: shadow receipt unavailable: %s", reason)
-        else:
-            emit_shadow_receipt(reason)
-        action_buffer.reset(run_generation=int(shared.run_generation.value))
-        buffer_generation = None
-        last_seen_plan_key = None
-
-    def fault_shadow_coupled_write() -> None:
-        """Latch FAULT after any post-B shadow coupled-ring mutation."""
-        fault_shadow_integrity(
-            reason="shadow coupled-command write detected",
-            write_violation=True,
-        )
 
     try:
         while shared.is_running.value:
@@ -776,18 +584,10 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
             if bool(shared.quit_requested.value):
                 if int(shared.safety_state.value) == int(SafetyState.RUNNING):
                     _end_policy_run(shared, "operator quit", abort=False)
-                if config.execution_mode in {"execute", "task"}:
-                    execute_pending_acknowledgement = None
-                    emit_run_receipt("operator quit")
+                pending_acknowledgement = None
                 return
 
             if bool(shared.error_state.value) or bool(shared.estop_request.value):
-                if config.execution_mode in {"execute", "task"}:
-                    emit_execute_receipt(
-                        "e-stop requested"
-                        if bool(shared.estop_request.value)
-                        else "error_state set"
-                    )
                 if buffer_generation is not None:
                     action_buffer.reset(run_generation=int(shared.run_generation.value))
                     buffer_generation = None
@@ -801,7 +601,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     action_buffer.reset(run_generation=int(shared.run_generation.value))
                     buffer_generation = None
                     last_seen_plan_key = None
-                execute_pending_acknowledgement = None
+                pending_acknowledgement = None
                 if not bool(shared.start_request.value):
                     _sleep_tick(period_s, tick_start)
                     continue
@@ -830,8 +630,6 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     int(shared.run_generation.value),
                 )
                 policy_session_started = True
-                if config.execution_mode in {"execute", "task"}:
-                    shared.execute_completed.value = False
                 last_valid_policy_command_ns = None
                 run_epoch = read_run_epoch(shared)
                 if (
@@ -845,46 +643,14 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 run_started_ns = run_epoch.started_monotonic_ns
                 previous_arm_command_qpos = None
                 metrics.begin_run()
-                if config.execution_mode in {"execute", "task"}:
-                    metrics.increment(PHYSICAL_HOME_COMPLETED)
-                execute_published_endpoints = 0
-                execute_acknowledged_action_id = None
-                execute_pending_acknowledgement = None
-                execute_first_publication_ns = None
-                execute_last_publication_ns = None
-                try:
-                    start_coupled_sequence = _coupled_command_sequence(shared)
-                except Exception as exc:
-                    if config.execution_mode == "shadow":
-                        fault_shadow_integrity(
-                            reason=(
-                                "cannot establish shadow coupled-write baseline: "
-                                f"{type(exc).__name__}"
-                            ),
-                            write_violation=False,
-                        )
-                        continue
-                    fault_execute(
-                        "cannot establish physical coupled-write baseline: "
-                        f"{type(exc).__name__}",
-                        metric=ENDPOINTS_FATAL_REJECTED,
-                    )
-                    continue
-                if config.execution_mode == "shadow":
-                    shadow_start_coupled_sequence = start_coupled_sequence
-                    shadow_run_generation = run_epoch.generation
-                else:
-                    execute_start_coupled_sequence = start_coupled_sequence
-                    execute_run_generation = run_epoch.generation
+                pending_acknowledgement = None
                 action_buffer.reset(run_generation=run_epoch.generation)
                 buffer_generation = run_epoch.generation
                 last_seen_plan_key = None
                 _sleep_tick(period_s, tick_start)
                 continue
 
-            # RUNNING: an operator stop ends cleanly; a bounded-run time-limit
-            # stop is clean for shadow and fail-closed for physical execute without proof of
-            # the required publication/acknowledgement boundary.
+            # RUNNING: operator stop or an optional run-time limit ends cleanly.
             raw_stop_request = int(shared.stop_request.value)
             try:
                 stop_request = StopRequest(raw_stop_request)
@@ -903,29 +669,15 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     if stop_request is StopRequest.RUN_TIME_LIMIT
                     else "operator stop"
                 )
-                if (
-                    stop_request is StopRequest.RUN_TIME_LIMIT
-                    and config.execution_mode in {"execute", "task"}
-                ):
-                    if execute_pending_acknowledgement is not None:
-                        fault_execute(
+                if stop_request is StopRequest.RUN_TIME_LIMIT and config.execute:
+                    if pending_acknowledgement is not None:
+                        fault_physical(
                             "run time limit reached before worker acknowledgement",
-                            metric=EXECUTE_ACK_TIMEOUT,
+                            metric=ACK_TIMEOUT,
                         )
-                    elif execute_published_endpoints == 0:
-                        fault_execute(
-                            "run time limit reached before first publication",
-                            metric=COMMAND_SILENCE_ABORT,
-                        )
-                    else:
-                        fault_execute(
-                            "publication bound not completed before run time limit",
-                            metric=ENDPOINTS_FATAL_REJECTED,
-                        )
-                    continue
+                        continue
                 _end_policy_run(shared, stop_reason, abort=False)
-                execute_pending_acknowledgement = None
-                emit_run_receipt(stop_reason)
+                pending_acknowledgement = None
                 action_buffer.reset(run_generation=int(shared.run_generation.value))
                 buffer_generation = None
                 last_seen_plan_key = None
@@ -939,27 +691,11 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 buffer_generation = int(shared.run_generation.value)
                 last_seen_plan_key = None
 
-            if shadow_start_coupled_sequence is not None:
-                try:
-                    current_coupled_sequence = _coupled_command_sequence(shared)
-                except Exception as exc:
-                    fault_shadow_integrity(
-                        reason=(
-                            "cannot inspect shadow coupled-command sequence: "
-                            f"{type(exc).__name__}"
-                        ),
-                        write_violation=False,
-                    )
-                    continue
-                if current_coupled_sequence != shadow_start_coupled_sequence:
-                    fault_shadow_coupled_write()
-                    continue
-
-            if execute_pending_acknowledgement is not None:
+            if pending_acknowledgement is not None:
                 acknowledgement = poll_coupled_command_acknowledgement(
                     shared,
-                    execute_pending_acknowledgement.candidate,
-                    ticket=execute_pending_acknowledgement.ticket,
+                    pending_acknowledgement.candidate,
+                    ticket=pending_acknowledgement.ticket,
                     arm_feedback_max_age_s=config.arm_feedback_max_age_s,
                     hand_feedback_max_age_s=config.hand_feedback_max_age_s,
                 )
@@ -967,74 +703,40 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 if acknowledgement.status is CommandPublishStatus.APPLIED:
                     if (
                         acknowledgement_observed_ns
-                        > execute_pending_acknowledgement.deadline_monotonic_ns
+                        > pending_acknowledgement.deadline_monotonic_ns
                     ):
-                        fault_execute(
+                        fault_physical(
                             "worker acknowledgement arrived after deadline",
-                            metric=EXECUTE_ACK_TIMEOUT,
+                            metric=ACK_TIMEOUT,
                         )
                         _sleep_tick(period_s, tick_start)
                         continue
-                    execute_acknowledged_action_id = int(
-                        execute_pending_acknowledgement.candidate.action_id
+                    acknowledgement_latency_ms = (
+                        acknowledgement_observed_ns
+                        - pending_acknowledgement.published_monotonic_ns
+                    ) / 1e6
+                    metrics.increment(ACKNOWLEDGED)
+                    metrics.observe(ACK_LATENCY_MS, acknowledgement_latency_ms)
+                    metrics.observe_timing(ACK_LATENCY_MS, acknowledgement_latency_ms)
+                    logger.info(
+                        "coordinator: action_id=%d acknowledged by arm and hand",
+                        pending_acknowledgement.candidate.action_id,
                     )
-                    metrics.increment(EXECUTE_ACKNOWLEDGED)
-                    execute_pending_acknowledgement = None
-                    execute_bounds = config.physical_execute_bounds
-                    assert execute_bounds is not None
-                    if (
-                        execute_published_endpoints
-                        >= execute_bounds.max_published_endpoints
-                    ):
-                        shared.execute_completed.value = True
-                        metrics.increment(EXECUTE_PUBLICATION_BOUND_REACHED)
-                        reason = (
-                            "H4 publication bound reached"
-                            if config.execution_mode == "execute"
-                            else "task publication bound reached"
-                        )
-                        _end_policy_run(shared, reason, abort=False)
-                        emit_execute_receipt(reason)
-                        action_buffer.reset(
-                            run_generation=int(shared.run_generation.value)
-                        )
-                        buffer_generation = None
-                        last_seen_plan_key = None
-                        _sleep_tick(period_s, tick_start)
-                        continue
-                    # A non-final task ACK permits the next due endpoint in
-                    # this same control tick; adding another sleep here would
-                    # halve the 16 Hz execution rate.
+                    pending_acknowledgement = None
                 elif acknowledgement.status is CommandPublishStatus.ACK_PENDING:
-                    if now_ns < execute_pending_acknowledgement.deadline_monotonic_ns:
+                    if now_ns < pending_acknowledgement.deadline_monotonic_ns:
                         _sleep_tick(period_s, tick_start)
                         continue
-                    fault_execute(
+                    fault_physical(
                         "arm/hand acknowledgement timeout",
-                        metric=EXECUTE_ACK_TIMEOUT,
+                        metric=ACK_TIMEOUT,
                     )
                     continue
                 else:
-                    fault_execute(
+                    fault_physical(
                         "arm/hand acknowledgement failed: "
                         f"{acknowledgement.status.value}",
-                        metric=ENDPOINTS_FATAL_REJECTED,
-                    )
-                    continue
-
-            if config.execution_mode in {"execute", "task"}:
-                execute_bounds = config.physical_execute_bounds
-                assert execute_bounds is not None
-                if (
-                    execute_published_endpoints
-                    >= execute_bounds.max_published_endpoints
-                ):
-                    # A successful final publication must leave a pending
-                    # acknowledgement. Reaching this branch means that invariant
-                    # was lost; do not permit another action to be built or sent.
-                    fault_execute(
-                        "publication bound reached without acknowledgement state",
-                        metric=ENDPOINTS_FATAL_REJECTED,
+                        metric=ACK_FAILURE,
                     )
                     continue
 
@@ -1312,9 +1014,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         config.hand_command_max_delta_rad_per_tick
                     ),
                     canonicalize_policy_hand_roundoff=True,
-                    execution_mode=(
-                        "shadow" if config.execution_mode == "shadow" else "execute"
-                    ),
+                    execute=config.execute,
                     # Leave one full policy tick for both 30 Hz workers to
                     # observe the coupled record. Near-expiry plans are stale;
                     # never extend their immutable source deadline.
@@ -1333,59 +1033,22 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 hand_limit_nesting_valid=True,
             )
             if disposition is PolicyEndpointDisposition.COMMIT:
-                shadow_validated = (
-                    publish_result.status is CommandPublishStatus.SHADOW_VALIDATED
-                )
-                if (config.execution_mode == "shadow") != shadow_validated:
+                validated_only = publish_result.status is CommandPublishStatus.VALIDATED
+                if (not config.execute) != validated_only:
                     abort_and_reset(
-                        "execution mode and publication result disagree",
+                        "execute flag and publication result disagree",
                         metric=ENDPOINTS_FATAL_REJECTED,
                     )
                     continue
                 if (
-                    config.execution_mode in {"execute", "task"}
+                    config.execute
                     and publish_result.status is not CommandPublishStatus.PUBLISHED
                 ):
                     abort_and_reset(
-                        "physical execution did not return a publication ticket",
+                        "physical publication did not return a command ticket",
                         metric=ENDPOINTS_FATAL_REJECTED,
                     )
                     continue
-                try:
-                    current_coupled_sequence = _coupled_command_sequence(shared)
-                except Exception as exc:
-                    if config.execution_mode == "shadow":
-                        fault_shadow_integrity(
-                            reason=(
-                                "cannot inspect coupled-command sequence after "
-                                f"validation: {type(exc).__name__}"
-                            ),
-                            write_violation=False,
-                        )
-                    else:
-                        fault_execute(
-                            "cannot inspect physical coupled-command sequence after "
-                            f"validation: {type(exc).__name__}",
-                            metric=ENDPOINTS_FATAL_REJECTED,
-                        )
-                    continue
-                if shadow_start_coupled_sequence is not None:
-                    if current_coupled_sequence != shadow_start_coupled_sequence:
-                        fault_shadow_coupled_write()
-                        continue
-                elif config.execution_mode in {"execute", "task"}:
-                    assert execute_start_coupled_sequence is not None
-                    expected_sequence = (
-                        execute_start_coupled_sequence + execute_published_endpoints + 1
-                    )
-                    if current_coupled_sequence != expected_sequence:
-                        fault_execute(
-                            "physical publication changed coupled-command sequence by "
-                            f"{current_coupled_sequence - execute_start_coupled_sequence}, "
-                            f"expected exactly {execute_published_endpoints + 1}",
-                            metric=ENDPOINTS_FATAL_REJECTED,
-                        )
-                        continue
                 published_candidate = publish_result.candidate
                 if published_candidate is None:
                     abort_and_reset(
@@ -1407,48 +1070,31 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         metric=ENDPOINTS_FATAL_REJECTED,
                     )
                     continue
-                if shadow_validated:
-                    metrics.increment(ENDPOINTS_SHADOW_VALIDATED)
+                if validated_only:
+                    metrics.increment(ENDPOINTS_VALIDATED)
                 else:
                     metrics.increment(ENDPOINTS_PUBLISHED)
-                    metrics.increment(COUPLED_COMMAND_WRITES)
                     ticket = publish_result.ticket
                     if ticket is None:
-                        fault_execute(
+                        fault_physical(
                             "physical publication omitted its coupled command ticket",
                             metric=ENDPOINTS_FATAL_REJECTED,
                         )
                         continue
-                    execute_published_endpoints += 1
                     publication_ns = time.monotonic_ns()
-                    if execute_first_publication_ns is None:
-                        execute_first_publication_ns = publication_ns
-                    execute_last_publication_ns = publication_ns
-                    execute_bounds = config.physical_execute_bounds
-                    assert execute_bounds is not None
-                    if (
-                        execute_published_endpoints
-                        > execute_bounds.max_published_endpoints
-                    ):
-                        fault_execute(
-                            "physical publication count exceeded immutable bound",
-                            metric=ENDPOINTS_FATAL_REJECTED,
-                        )
-                        continue
-                    execute_pending_acknowledgement = _PendingExecuteAcknowledgement(
+                    pending_acknowledgement = _PendingAcknowledgement(
                         candidate=published_candidate,
                         ticket=ticket,
-                        deadline_monotonic_ns=(
-                            time.monotonic_ns()
-                            + int(execute_bounds.acknowledgement_timeout_s * 1e9)
+                        published_monotonic_ns=publication_ns,
+                        deadline_monotonic_ns=min(
+                            int(published_candidate.valid_until_monotonic_ns),
+                            publication_ns
+                            + int(config.command_acknowledgement_timeout_s * 1e9),
                         ),
                     )
                     logger.info(
-                        "coordinator: %s published action_id=%d (%d/%d); awaiting worker acknowledgement",
-                        config.execution_mode,
+                        "coordinator: published action_id=%d; awaiting arm/hand acknowledgement",
                         published_candidate.action_id,
-                        execute_published_endpoints,
-                        execute_bounds.max_published_endpoints,
                     )
                 metrics.increment(ENDPOINTS_COMMITTED)
                 previous_arm_command_qpos = np.asarray(
@@ -1503,7 +1149,6 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
             )
             _sleep_tick(period_s, tick_start)
     finally:
-        emit_run_receipt("coordinator exit")
         logger.info("coordinator_loop: exited")
 
 

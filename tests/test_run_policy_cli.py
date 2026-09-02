@@ -39,6 +39,7 @@ def _experiment_info() -> SimpleNamespace:
     )
     return SimpleNamespace(
         selector="dp3/pick/seed0",
+        task_name="pick",
         policy_name="DP3",
         checkpoint_name="deployment_latest.pt",
         spec=spec,
@@ -82,7 +83,7 @@ class RunPolicyCommandTest(unittest.TestCase):
             ) as list_experiments,
             patch.object(self.cli, "_inspect_policy_experiment") as inspect,
             patch.object(self.cli, "_load_policy_experiment") as load,
-            patch.object(self.cli, "_prepare_legacy_bridge") as bridge,
+            patch.object(self.cli, "_prepare_lifecycle_inputs") as prepare,
             contextlib.redirect_stdout(stdout),
         ):
             result = self.cli.main(["list", "DP3"])
@@ -91,10 +92,10 @@ class RunPolicyCommandTest(unittest.TestCase):
         list_experiments.assert_called_once_with("DP3")
         inspect.assert_not_called()
         load.assert_not_called()
-        bridge.assert_not_called()
+        prepare.assert_not_called()
         self.assertIn("dp3/pick/seed0", stdout.getvalue())
 
-    def test_check_loads_warms_and_closes_without_legacy_bridge(self) -> None:
+    def test_check_loads_warms_and_closes_without_lifecycle_projection(self) -> None:
         info = _experiment_info()
         policy = SimpleNamespace(warmup=Mock(return_value=(0.010, 0.012, 0.011)))
         policy.close = Mock()
@@ -106,7 +107,7 @@ class RunPolicyCommandTest(unittest.TestCase):
             patch.object(
                 self.cli, "_load_policy_experiment", return_value=policy
             ) as load,
-            patch.object(self.cli, "_prepare_legacy_bridge") as bridge,
+            patch.object(self.cli, "_prepare_lifecycle_inputs") as prepare,
             contextlib.redirect_stdout(stdout),
         ):
             result = self.cli.main(["check", "dp3/pick/seed0", "--device", "cpu"])
@@ -116,47 +117,73 @@ class RunPolicyCommandTest(unittest.TestCase):
         load.assert_called_once_with("dp3/pick/seed0", "cpu")
         policy.warmup.assert_called_once_with(samples=3)
         policy.close.assert_called_once_with()
-        bridge.assert_not_called()
+        prepare.assert_not_called()
         self.assertIn("prediction ....... OK", stdout.getvalue())
         self.assertIn("READY", stdout.getvalue())
 
-    def test_shadow_stages_legacy_shadow_without_starting_lifecycle(self) -> None:
+    def test_lifecycle_projection_carries_only_execute_intent(self) -> None:
         info = _experiment_info()
-        bridge = SimpleNamespace(legacy_execution_mode="shadow")
-        stdout = io.StringIO()
+        args = self.cli._parser().parse_args(["run", info.selector])
+        runtime = object()
+        projection = object()
+        with (
+            patch(
+                "dexmani_real.config.runtime.resolve_runtime_config",
+                return_value=runtime,
+            ),
+            patch(
+                "dexmani_real.deployment.config.resolve_policy_runtime_config",
+                return_value=projection,
+            ) as resolve_projection,
+        ):
+            inputs = self.cli._prepare_lifecycle_inputs(args, info, execute=True)
+
+        self.assertIs(inputs.execute, True)
+        self.assertIs(inputs.runtime, runtime)
+        self.assertIs(inputs.projection, projection)
+        self.assertIs(resolve_projection.call_args.kwargs["execute"], True)
+        for retired_name in (
+            "execution_mode",
+            "hand_acknowledged",
+            "h4_execute_bounds",
+            "task_execute_bounds",
+            "inference_seed",
+        ):
+            self.assertNotIn(retired_name, resolve_projection.call_args.kwargs)
+
+    def test_shadow_projects_validate_only_and_starts_through_seam(self) -> None:
+        info = _experiment_info()
+        inputs = SimpleNamespace(execute=False)
         with (
             patch.object(self.cli, "_inspect_policy_experiment", return_value=info),
             patch.object(
-                self.cli, "_prepare_legacy_bridge", return_value=bridge
+                self.cli, "_prepare_lifecycle_inputs", return_value=inputs
             ) as prepare,
-            contextlib.redirect_stdout(stdout),
+            patch.object(self.cli, "_start_lifecycle", return_value=0) as start,
         ):
             result = self.cli.main(["shadow", "dp3/pick/seed0"])
 
         self.assertEqual(result, 0)
         prepare.assert_called_once()
-        self.assertEqual(prepare.call_args.kwargs["legacy_execution_mode"], "shadow")
-        self.assertIn("lifecycle was not started", stdout.getvalue())
+        self.assertIs(prepare.call_args.kwargs["execute"], False)
+        start.assert_called_once_with(inputs)
 
-    def test_run_routes_to_legacy_task_but_stays_unavailable(self) -> None:
+    def test_run_projects_physical_publication_and_starts_through_seam(self) -> None:
         info = _experiment_info()
-        bridge = SimpleNamespace(legacy_execution_mode="task")
-        stdout = io.StringIO()
-        stderr = io.StringIO()
+        inputs = SimpleNamespace(execute=True)
         with (
             patch.object(self.cli, "_inspect_policy_experiment", return_value=info),
             patch.object(
-                self.cli, "_prepare_legacy_bridge", return_value=bridge
+                self.cli, "_prepare_lifecycle_inputs", return_value=inputs
             ) as prepare,
-            contextlib.redirect_stdout(stdout),
-            contextlib.redirect_stderr(stderr),
+            patch.object(self.cli, "_start_lifecycle", return_value=0) as start,
         ):
             result = self.cli.main(["run", "dp3/pick/seed0"])
 
-        self.assertEqual(result, 1)
+        self.assertEqual(result, 0)
         prepare.assert_called_once()
-        self.assertEqual(prepare.call_args.kwargs["legacy_execution_mode"], "task")
-        self.assertIn("[COMPAT] run is unavailable", stderr.getvalue())
+        self.assertIs(prepare.call_args.kwargs["execute"], True)
+        start.assert_called_once_with(inputs)
 
 
 if __name__ == "__main__":

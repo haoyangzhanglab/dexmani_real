@@ -325,11 +325,10 @@ def hand_loop(shared: Any, config: HandParams) -> None:
 
             permit = read_motion_permit(shared)
             if permit.run_generation != stats_generation:
-                # H4 uses an ARMED generation for the operator's physical-home
-                # command, then a new RUNNING generation for the one policy
-                # endpoint.  Preserve the completed RUNNING generation when
-                # the coordinator revokes motion, while keeping the two
-                # command classes distinct in the exit evidence.
+                # Physical home uses an ARMED generation, then policy motion
+                # advances to a new RUNNING generation. Preserve the completed
+                # RUNNING generation when the coordinator revokes motion, while
+                # keeping the two command classes distinct in exit diagnostics.
                 if stats_generation_was_running:
                     last_running_stats = (
                         sdk_send_attempts,

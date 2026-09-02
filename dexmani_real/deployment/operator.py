@@ -6,7 +6,7 @@ request flags the coordinator and supervisor already consume (``start_request``,
 home lifecycle, H orchestrates a collision-checked return-home — stop the run
 if RUNNING, hand home, then arm home — using a Main-process planner that mirrors
 the replay collision setup (hand-dof + table + static boxes). Physical policy
-profiles supply that lifecycle; shadow keeps H disabled. The keyboard owns
+publication sessions supply that lifecycle; validate-only sessions keep H disabled. The keyboard owns
 the emergency-stop latch:
 ESC (or a dead listener) sets ``estop_request`` regardless of thread state, so
 e-stop never depends on this loop being scheduled.
@@ -182,7 +182,7 @@ def run_operator_control(
     planner: XArm7MotionPlanner | None,
     *,
     stop_event: threading.Event,
-    execution_mode: str,
+    execute: bool,
 ) -> None:
     """Keyboard thread target: map operator keys to shared flags / home.
 
@@ -191,8 +191,10 @@ def run_operator_control(
     planner. The thread exits when *stop_event*
     is set, when the runtime stops, or after a terminal Q/ESC.
     """
-    if execution_mode not in {"shadow", "execute", "task"}:
-        raise ValueError("execution_mode must be 'shadow', 'execute', or 'task'")
+    if not isinstance(execute, bool):
+        raise TypeError("execute must be a boolean")
+    if execute != (planner is not None):
+        raise ValueError("execute must match physical home availability")
     keyboard = KeyboardHandler(
         estop_callback=lambda: setattr(shared.estop_request, "value", True),
         stop_callback=lambda: _request_immediate_stop(shared),
