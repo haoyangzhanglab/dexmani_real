@@ -332,7 +332,7 @@ generation、deadline、collision 或 worker validation。
 H4 receipt 必须同时证明 `completed=true`、`max_published_endpoints=1`、
 `coupled_command_writes=1`、`physical_home_completed=1` 和 acknowledged action id。需要可移交
 evidence bundle 时，在进程退出后运行无硬件的 `examples/seal_h4_evidence.py`，绑定 runtime receipt、
-terminal log 和操作者记录。
+terminal log、包含 publication marker 的 coordinator PID log 和操作者记录。
 
 physical profile 只拥有 Real run intent，unknown key（包括 horizon、action dimensions、EMA/NFE、
 solver 或 modality）全部拒绝；相对 path 以 profile 文件目录解析。H4 的

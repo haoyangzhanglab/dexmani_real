@@ -24,20 +24,22 @@ if str(_REPO_ROOT) not in sys.path:
 
 from dexmani_real.utils.log import write_json_evidence_manifest
 
-_REQUIRED_LOG_MARKERS = {
+_TERMINAL_REQUIRED_LOG_MARKERS = {
     "startup_reset_home_accepted": "hand_loop: startup reset-home command accepted",
     "hand_home_accepted": "hand: home command accepted (action_id=",
     "arm_home_path_selected": "arm: home path selected=",
     "arm_home_reached": "arm: home reached",
     "physical_home_completed": "operator: physical home sequence completed; press B to start",
     "running": "coordinator_loop: RUNNING",
-    "h4_publication": "coordinator: execute published action_id=",
     "bounded_stop": "coordinator: policy run stopped: H4 publication bound reached",
     "session_end": "── Session End ──",
     "disarmed": "safety=DISARMED",
     "supervisor_normal": "supervisor_normal=True",
     "completed": "execute_completed=True",
     "clean_shutdown": "clean=True",
+}
+_COORDINATOR_REQUIRED_LOG_MARKERS = {
+    "h4_publication": "coordinator: execute published action_id=",
 }
 _ARM_EXIT_RE = re.compile(
     r"arm_loop: exited \(servo_calls=(\d+), duplicate_skips=(\d+)\)"
@@ -101,16 +103,21 @@ def _validate_runtime_receipt(receipt: dict[str, Any]) -> None:
         raise ValueError("H4 runtime receipt timeline is not monotonic")
 
 
-def _marker_lines(log_text: str) -> dict[str, int]:
+def _marker_lines(
+    log_text: str,
+    *,
+    required_markers: dict[str, str],
+    log_label: str,
+) -> dict[str, int]:
     markers: dict[str, int] = {}
     for line_number, line in enumerate(log_text.splitlines(), start=1):
-        for name, marker in _REQUIRED_LOG_MARKERS.items():
+        for name, marker in required_markers.items():
             if name not in markers and marker in line:
                 markers[name] = line_number
-    missing = sorted(set(_REQUIRED_LOG_MARKERS) - set(markers))
+    missing = sorted(set(required_markers) - set(markers))
     if missing:
         raise ValueError(
-            "terminal log is missing required H4 markers: " + ", ".join(missing)
+            f"{log_label} is missing required H4 markers: " + ", ".join(missing)
         )
     return markers
 
@@ -168,6 +175,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runtime-receipt", type=Path, required=True)
     parser.add_argument("--terminal-log", type=Path, required=True)
     parser.add_argument(
+        "--coordinator-log",
+        type=Path,
+        required=True,
+        help="PID-stamped coordinator log containing the publication marker",
+    )
+    parser.add_argument(
         "--operator-record",
         type=Path,
         required=True,
@@ -177,7 +190,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     receipt_path = args.runtime_receipt.resolve(strict=True)
-    log_path = args.terminal_log.resolve(strict=True)
+    terminal_log_path = args.terminal_log.resolve(strict=True)
+    coordinator_log_path = args.coordinator_log.resolve(strict=True)
     record_path = args.operator_record.resolve(strict=True)
     receipt = _read_json_object(receipt_path, label="runtime receipt")
     _validate_runtime_receipt(receipt)
@@ -187,11 +201,24 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
     try:
-        log_text = log_path.read_text(encoding="utf-8")
+        terminal_log_text = terminal_log_path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         parser.error(f"cannot read terminal log: {exc}")
-    marker_lines = _marker_lines(log_text)
-    worker_command_counts = _worker_command_counts(log_text)
+    try:
+        coordinator_log_text = coordinator_log_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        parser.error(f"cannot read coordinator log: {exc}")
+    terminal_marker_lines = _marker_lines(
+        terminal_log_text,
+        required_markers=_TERMINAL_REQUIRED_LOG_MARKERS,
+        log_label="terminal log",
+    )
+    coordinator_marker_lines = _marker_lines(
+        coordinator_log_text,
+        required_markers=_COORDINATOR_REQUIRED_LOG_MARKERS,
+        log_label="coordinator log",
+    )
+    worker_command_counts = _worker_command_counts(terminal_log_text)
 
     payload = json.dumps(
         {
@@ -207,10 +234,16 @@ def main(argv: list[str] | None = None) -> int:
                 "timeline_monotonic_ns": receipt["timeline_monotonic_ns"],
             },
             "terminal_log": {
-                "path": str(log_path),
-                "size_bytes": log_path.stat().st_size,
-                "sha256": _sha256(log_path),
-                "required_marker_lines": marker_lines,
+                "path": str(terminal_log_path),
+                "size_bytes": terminal_log_path.stat().st_size,
+                "sha256": _sha256(terminal_log_path),
+                "required_marker_lines": terminal_marker_lines,
+            },
+            "coordinator_log": {
+                "path": str(coordinator_log_path),
+                "size_bytes": coordinator_log_path.stat().st_size,
+                "sha256": _sha256(coordinator_log_path),
+                "required_marker_lines": coordinator_marker_lines,
             },
             "worker_command_counts": worker_command_counts,
             "operator_record": operator_record,

@@ -10,7 +10,9 @@ from pathlib import Path
 
 
 class H4EvidenceSealTest(unittest.TestCase):
-    def test_completed_runtime_receipt_and_terminal_log_are_sealed(self) -> None:
+    def test_completed_runtime_receipt_terminal_and_coordinator_logs_are_sealed(
+        self,
+    ) -> None:
         main = runpy.run_path(
             str(Path(__file__).resolve().parents[1] / "examples/seal_h4_evidence.py")
         )["main"]
@@ -48,7 +50,6 @@ class H4EvidenceSealTest(unittest.TestCase):
                         "arm: home reached",
                         "operator: physical home sequence completed; press B to start",
                         "coordinator_loop: RUNNING (run_generation=4)",
-                        "coordinator: execute published action_id=7 (1/1); awaiting worker acknowledgement",
                         "coordinator: policy run stopped: H4 publication bound reached",
                         "arm_loop: exited (servo_calls=1, duplicate_skips=0)",
                         "hand_loop: exited (sdk_send_attempts=1, exact_target_accepts=1, crc_unconfirmed=0, duplicate_skips=0, sdk_rejections=0)",
@@ -56,6 +57,11 @@ class H4EvidenceSealTest(unittest.TestCase):
                         "safety=DISARMED supervisor_normal=True execute_completed=True clean=True",
                     )
                 ),
+                encoding="utf-8",
+            )
+            coordinator_log = root / "coordinator.log"
+            coordinator_log.write_text(
+                "coordinator: execute published action_id=7 (1/1); awaiting worker acknowledgement\n",
                 encoding="utf-8",
             )
             operator_record = root / "operator.json"
@@ -78,6 +84,8 @@ class H4EvidenceSealTest(unittest.TestCase):
                         str(receipt_path),
                         "--terminal-log",
                         str(terminal_log),
+                        "--coordinator-log",
+                        str(coordinator_log),
                         "--operator-record",
                         str(operator_record),
                         "--output-dir",
@@ -94,6 +102,10 @@ class H4EvidenceSealTest(unittest.TestCase):
             )
             self.assertEqual(
                 manifest["worker_command_counts"]["hand"]["exact_target_accepts"], 1
+            )
+            self.assertEqual(
+                manifest["coordinator_log"]["required_marker_lines"]["h4_publication"],
+                1,
             )
 
 
