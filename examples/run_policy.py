@@ -30,7 +30,8 @@ class _LifecycleInputs:
 
     execute: bool
     runtime: Any
-    projection: Any
+    policy_spec: Any
+    worker_config: Any
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -181,23 +182,25 @@ def _prepare_lifecycle_inputs(
 ) -> _LifecycleInputs:
     """Resolve the PolicySpec/Real projection before lifecycle startup."""
     from dexmani_real.config.runtime import resolve_runtime_config
-    from dexmani_real.deployment.config import resolve_policy_runtime_config
+    from dexmani_real.deployment.config import (
+        PolicyWorkerConfig,
+        validate_policy_runtime_compatibility,
+    )
 
     if not isinstance(execute, bool):
         raise TypeError("execute must be a boolean")
     runtime = resolve_runtime_config(yaml_path=args.config)
-    projection = resolve_policy_runtime_config(
+    validate_policy_runtime_compatibility(info.spec, runtime)
+    worker_config = PolicyWorkerConfig(
         experiment=info.selector,
-        task_name=info.task_name,
-        policy_spec=info.spec,
-        runtime_config=runtime,
         device=args.device,
-        execute=execute,
+        spec=info.spec,
     )
     return _LifecycleInputs(
         execute=execute,
         runtime=runtime,
-        projection=projection,
+        policy_spec=info.spec,
+        worker_config=worker_config,
     )
 
 
@@ -205,7 +208,12 @@ def _start_lifecycle(inputs: _LifecycleInputs) -> int:
     """Enter the hardware lifecycle after CLI-owned compatibility checks."""
     from dexmani_real.deployment.lifecycle import run_policy_deployment
 
-    return run_policy_deployment(inputs.runtime, inputs.projection.runtime)
+    return run_policy_deployment(
+        inputs.runtime,
+        inputs.policy_spec,
+        inputs.worker_config,
+        inputs.execute,
+    )
 
 
 def _run_lifecycle(args: argparse.Namespace, *, execute: bool) -> int:

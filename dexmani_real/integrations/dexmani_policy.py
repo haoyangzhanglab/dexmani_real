@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.deployment.config import PolicyRuntimeConfig
+from dexmani_real.deployment.config import validate_policy_spec
 from dexmani_real.deployment.contracts import PolicyPrediction
 from dexmani_real.deployment.observation import ObservationBatch
 from dexmani_real.planning.poses import validate_rot6d_geometry
@@ -27,55 +27,38 @@ class DexManiPolicyRuntime:
     behavior. The inference worker loads those through the Policy public API.
     """
 
-    def __init__(self, loaded_policy: Any, config: PolicyRuntimeConfig) -> None:
-        if not isinstance(config, PolicyRuntimeConfig):
-            raise TypeError("DexManiPolicyRuntime requires PolicyRuntimeConfig")
+    def __init__(self, loaded_policy: Any, expected_spec: Any) -> None:
+        validate_policy_spec(expected_spec)
         for name in ("info", "spec", "warmup", "reset_episode", "predict", "close"):
             if not hasattr(loaded_policy, name):
                 raise TypeError(f"loaded Policy runtime is missing {name!r}")
         self._policy: Any | None = loaded_policy
-        self.config = config
-        if (
-            getattr(loaded_policy.info, "task_name", None)
-            != config.deployment.task_name
-        ):
-            raise ValueError(
-                "loaded Policy experiment task does not match Real projection"
-            )
+        self.spec = expected_spec
         self._validate_loaded_spec(loaded_policy.spec)
 
     def _validate_loaded_spec(self, spec: Any) -> None:
         """Reject inspect/load drift and unsupported Real embodiment contracts."""
-        deployment = self.config.deployment
         expected = {
-            "action_key": deployment.action_key,
-            "action_dim": deployment.action_dim,
-            "control_action_dim": deployment.control_action_dim,
-            "horizon": deployment.horizon,
-            "n_obs_steps": deployment.observation_horizon,
-            "n_action_steps": deployment.n_action_steps,
-            "control_dt_s": deployment.control_dt_s,
-            "point_cloud_num_points": deployment.pointcloud_num_points,
-            "point_cloud_feature_dim": deployment.pointcloud_feature_dim,
+            name: getattr(self.spec, name)
+            for name in (
+                "action_key",
+                "action_dim",
+                "control_action_dim",
+                "horizon",
+                "n_obs_steps",
+                "n_action_steps",
+                "control_dt_s",
+                "point_cloud_num_points",
+                "point_cloud_feature_dim",
+                "sensor_modalities",
+                "requires_hand",
+            )
         }
         mismatches = {
             name: (getattr(spec, name, None), value)
             for name, value in expected.items()
             if getattr(spec, name, None) != value
         }
-        if set(getattr(spec, "sensor_modalities", ())) != {
-            "joint_state",
-            "point_cloud",
-        }:
-            mismatches["sensor_modalities"] = (
-                getattr(spec, "sensor_modalities", None),
-                ("joint_state", "point_cloud"),
-            )
-        if getattr(spec, "requires_hand", None) is not True:
-            mismatches["requires_hand"] = (
-                getattr(spec, "requires_hand", None),
-                True,
-            )
         if mismatches:
             raise ValueError(
                 "loaded PolicySpec does not match the validated Real projection: "
@@ -112,7 +95,7 @@ class DexManiPolicyRuntime:
             raise TypeError("policy observation must be an ObservationBatch")
         if observation.arm_history is None or observation.hand_history is None:
             raise ValueError("DexMani Policy requires arm and hand joint history")
-        n_obs = self.config.deployment.observation_horizon
+        n_obs = self.spec.n_obs_steps
         arm = observation.arm_history.values
         hand = observation.hand_history.values
         if arm.shape != (n_obs, _ARM_DOF) or hand.shape != (n_obs, _HAND_DOF):
@@ -133,8 +116,8 @@ class DexManiPolicyRuntime:
         if len({frame.camera_generation for frame in frames}) != 1:
             raise ValueError("point-cloud history crosses a camera generation boundary")
         expected_point_shape = (
-            self.config.deployment.pointcloud_num_points,
-            self.config.deployment.pointcloud_feature_dim,
+            self.spec.point_cloud_num_points,
+            self.spec.point_cloud_feature_dim,
         )
         for frame in frames:
             if frame.values.shape != expected_point_shape:
@@ -158,8 +141,8 @@ class DexManiPolicyRuntime:
         if not isinstance(value, np.ndarray):
             raise TypeError("Policy predict must return a NumPy array")
         expected_shape = (
-            self.config.deployment.n_action_steps,
-            self.config.deployment.control_action_dim,
+            self.spec.n_action_steps,
+            self.spec.control_action_dim,
         )
         if value.shape != expected_shape or value.dtype != np.float64:
             raise ValueError(
@@ -170,7 +153,7 @@ class DexManiPolicyRuntime:
             raise ValueError("Policy control action contains NaN/Inf")
 
         control = np.array(value, dtype=np.float64, copy=True, order="C")
-        if self.config.deployment.action_key == "action":
+        if self.spec.action_key == "action":
             if control.shape[1] != _JOINT_ACTION_DIM:
                 raise ValueError("joint control action must be arm7 + hand12")
             return PolicyPrediction(

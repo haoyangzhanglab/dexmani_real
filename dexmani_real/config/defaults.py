@@ -615,6 +615,19 @@ class PolicyParams:
 
     control_hz: float = 16.0
     coordinator_hz: float = 64.0
+    # Learned-policy inference and causal observation timing. Model shape,
+    # history, and action horizon remain PolicySpec-owned.
+    inference_hz: float = 10.0
+    max_input_age_s: float = 0.15
+    max_observation_skew_s: float = 0.10
+    max_grid_lag_s: float = 0.08
+    max_plan_age_s: float = 1.0
+    max_source_to_command_age_s: float = 0.75
+    command_lead_s: float = 0.01
+    max_command_silence_s: float = 2.0
+    action_validity_s: float = 0.5
+    command_acknowledgement_timeout_s: float = 0.5
+    first_command_timeout_s: float = 5.0
     action_apply_timeout_s: float = 0.75
     arm_state_stale_threshold_s: float = 0.5
     quit_save_timeout_s: float = 30.0
@@ -661,6 +674,33 @@ class PolicyParams:
             or self.coordinator_hz < self.control_hz
         ):
             raise ValueError("coordinator_hz must be finite and >= control_hz")
+        deployment_timing = (
+            self.inference_hz,
+            self.max_input_age_s,
+            self.max_observation_skew_s,
+            self.max_grid_lag_s,
+            self.max_plan_age_s,
+            self.max_source_to_command_age_s,
+            self.command_lead_s,
+            self.max_command_silence_s,
+            self.action_validity_s,
+            self.command_acknowledgement_timeout_s,
+            self.first_command_timeout_s,
+        )
+        if not all(np.isfinite(value) and value > 0 for value in deployment_timing):
+            raise ValueError(
+                "policy deployment timing values must be finite and positive"
+            )
+        if self.command_lead_s >= self.max_source_to_command_age_s:
+            raise ValueError(
+                "policy.command_lead_s must be smaller than "
+                "policy.max_source_to_command_age_s"
+            )
+        if self.command_acknowledgement_timeout_s > self.action_validity_s:
+            raise ValueError(
+                "policy.command_acknowledgement_timeout_s must not exceed "
+                "policy.action_validity_s"
+            )
         timing = (
             self.action_apply_timeout_s,
             self.arm_state_stale_threshold_s,

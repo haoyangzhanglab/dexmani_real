@@ -143,9 +143,10 @@ RealSense SDK、HTS hand-tracking SDK、Pinocchio、MPlib、NLopt、
 CLI override > YAML file > dexmani_real/config/defaults.py
 ```
 
-运行时配置由 [`config/runtime.py`](dexmani_real/config/runtime.py) 校验、冻结并生成
-SHA-256；部署配置由 [`deployment/config.py`](dexmani_real/deployment/config.py)
-独立解析。`pointcloud` 是与 EEF `policy.workspace` 分离的感知配置段；实时 worker、离线
+运行时配置由 [`config/runtime.py`](dexmani_real/config/runtime.py) 唯一解析、校验、冻结并生成
+SHA-256；learned-policy 的 inference、freshness、plan、ACK 和 watchdog timing 都属于其
+`policy` 段，模型 shape、modality 和 horizon 则只来自 Policy public API 的 `PolicySpec`。
+`pointcloud` 是与 EEF `policy.workspace` 分离的感知配置段；实时 worker、离线
 重建和诊断入口只从该段派生参数，并把策略 ID 与配置 SHA-256 写入 processed/Zarr
 语义。可在不启动硬件的情况下查看遥操作解析结果：
 
@@ -182,7 +183,7 @@ python examples/collect_teleop.py --print-config
 
 ### Learned policy 实时点云
 
-部署配置的 `observation_fields` 包含 `point_cloud` 时，lifecycle 才启动 camera 与独立
+`PolicySpec.sensor_modalities` 包含 `point_cloud` 时，lifecycle 才启动 camera 与独立
 point-cloud worker。worker 始终读取最新的 depth-to-color aligned RGB-D，旧帧不会排队；inference 仅在
 当前 RUNNING epoch 之后的点云 T 历史窗完整时才推理。窗口以因果截点前最新已过去的控制 tick 为末端，按策略控制网格选取严格递增、
 不重复的 camera frame；每帧不得晚于对应逻辑 tick，lag 不超过 `max_grid_lag_s`，且跨帧

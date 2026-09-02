@@ -508,7 +508,7 @@ startup。不依赖 `__del__` 关闭硬件；如果 context manager 能显著让
 
 ```python
 def run_policy_deployment(
-    config: DeploymentConfig,
+    config: PolicyWorkflowConfig,
     stop_event: Event,
 ) -> None:
     with ExitStack() as cleanup:
@@ -544,7 +544,7 @@ def run_policy_deployment(
 class PolicyRuntime:
     """Own one loaded PyTorch policy; do not publish robot commands."""
 
-    def __init__(self, config: PolicyRuntimeConfig) -> None:
+    def __init__(self, config: PolicyModelConfig) -> None:
         self._config = config
         self._backend: TorchPolicyBackend | None = None
 
@@ -666,6 +666,7 @@ typed observation (causal history windows + point-cloud T 历史)
 
 - checkpoint/Hydra/EMA/normalizer/Torch 只由 `dexmani_policy.deployment` public API 拥有；
 - device 与 experiment 是 session 输入；PolicySpec 是 model shape、modality、action 与 dt 的只读合同；
+- Real-owned inference、freshness、plan、ACK 与 watchdog timing 只从 resolved runtime 的 `policy` 段读取；
 - Real 只校验固定硬件、点云、控制周期与 IPC capacity 兼容，不解析 checkpoint 内部结构；
 - inference/no-grad、normalization/denormalization 与 model preprocessing 均由 Policy runtime 拥有；
 - EE action、joint action、degrees/radians 不做静默猜测或自动兼容；

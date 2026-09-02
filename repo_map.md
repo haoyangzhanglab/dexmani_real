@@ -205,7 +205,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `__init__.py` | learned-policy 部署子包标记。 |
 | `action_buffer.py` | 纯内存、有界 latest-wins policy endpoint scheduler；提供 stable token 与 commit/discard watermark。 |
 | `contracts.py` | 无时间 `PolicyPrediction`、publish context、timed action chunk 与 `PolicyRuntime` protocol。 |
-| `config.py` | PolicySpec/Real runtime 兼容投影、固定 seed=0、point-cloud/IPC contract，以及 validate-only/physical publication 布尔配置。 |
+| `config.py` | PolicySpec/Real runtime 兼容门与 pickle-safe、固定 seed=0 的窄 inference-worker 配置；不拥有模型 shape/horizon 或 Real timing。 |
 | `observation.py` | 因果不可变 arm/hand/tactile/pointcloud/RGB history batch。 |
 | `timing.py` | immutable policy target grid、inference-expired prefix、plan/source deadline 与 diagnostic usable-target composition 的纯计算。 |
 | `worker.py` | 经 Policy public API 直接 restore、camera-grid observation 校验、logical-grid timing stamp、bounded timing samples 与 plan 发布。 |
@@ -267,7 +267,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `tests/test_arm_wrist_mapper.py` | 固定 VR→robot 标定、腕部旋转限幅状态与 tracking 毛刺恢复的纯几何合同。 |
 | `tests/test_coupled_command_publication.py` | coupled-command 非阻塞发布、active ticket 覆盖/撤销、ACK ownership 与运动准入合同。 |
 | `tests/test_data_segments.py` | source 缺口到 processed/Zarr episode 边界及跨缺口质量计算的合同。 |
-| `tests/test_dexmani_policy_adapter.py` | PolicySpec→Real 固定兼容门与 NumPy observation/joint/EE action adapter 的失败路径。 |
+| `tests/test_dexmani_policy_adapter.py` | PolicySpec→Real 固定兼容门、runtime policy timing 的严格解析，以及 NumPy observation/joint/EE action adapter 失败路径。 |
 | `tests/test_hand_worker_startup.py` | XHand startup no-motion，以及 `execute=False/True` publication seam 与 arm+hand 双 ACK 合同。 |
 | `tests/test_policy_lifecycle.py` | inference restore 失败时不启动任何 hardware worker 的顺序合同。 |
 | `tests/test_policy_coordinator.py` | coordinator 的 generation/stale plan 准入、SafetyGate 丢弃、ACK/worker 失败、operator stop 与双 watchdog 语义。 |

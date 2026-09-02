@@ -39,7 +39,6 @@ from dexmani_real.deployment.action_buffer import (
     PushStatus,
     compute_max_buffered_plans,
 )
-from dexmani_real.deployment.config import DeploymentConfig
 from dexmani_real.deployment.contracts import JointActionChunk
 from dexmani_real.deployment.metrics import (
     ACK_FAILURE,
@@ -190,14 +189,8 @@ def _command_watchdog_abort_reason(
 
 @dataclass(frozen=True)
 class CoordinatorConfig:
-    """Deployment config plus the safety/limits the coordinator needs to gate.
+    """Real-owned timing, safety, and limits required by the coordinator."""
 
-    Mirrors ``TeleopConfig.from_runtime``: the deployment namespace supplies the
-    model/boundary knobs, the runtime namespace supplies the joint limits, hand
-    mechanical envelope, and control rate.
-    """
-
-    deployment: DeploymentConfig
     arm_joint_lower_rad: tuple[float, ...]
     arm_joint_upper_rad: tuple[float, ...]
     workspace_bounds: tuple[
@@ -211,7 +204,13 @@ class CoordinatorConfig:
     hand_feedback_max_age_s: float
     control_hz: float
     execute: bool
+    inference_hz: float
+    max_plan_age_s: float
+    max_source_to_command_age_s: float
+    max_command_silence_s: float
+    action_validity_s: float
     command_acknowledgement_timeout_s: float
+    first_command_timeout_s: float
     # Full 19-DoF collision model (hand + static boxes) for EE->IK and the
     # transition collision gate (Phase 6/7); table clearance is not part of the
     # policy safety gate.
@@ -237,14 +236,18 @@ class CoordinatorConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.execute, bool):
             raise TypeError("execute must be a boolean")
-        if self.execute and not self.deployment.hand_enabled:
-            raise ValueError("physical publication requires hand-enabled deployment")
-        if (
-            not np.isfinite(self.command_acknowledgement_timeout_s)
-            or self.command_acknowledgement_timeout_s <= 0.0
-            or self.command_acknowledgement_timeout_s
-            > self.deployment.action_validity_s
-        ):
+        timing_values = (
+            self.inference_hz,
+            self.max_plan_age_s,
+            self.max_source_to_command_age_s,
+            self.max_command_silence_s,
+            self.action_validity_s,
+            self.command_acknowledgement_timeout_s,
+            self.first_command_timeout_s,
+        )
+        if not all(np.isfinite(value) and value > 0.0 for value in timing_values):
+            raise ValueError("coordinator timing values must be finite and positive")
+        if self.command_acknowledgement_timeout_s > self.action_validity_s:
             raise ValueError(
                 "command acknowledgement timeout must be positive and no greater "
                 "than action validity"
@@ -271,13 +274,11 @@ class CoordinatorConfig:
     @classmethod
     def from_runtime(
         cls,
-        deployment: DeploymentConfig,
         runtime: "ResolvedRuntimeConfig",
         *,
         execute: bool,
     ) -> "CoordinatorConfig":
         return cls(
-            deployment=deployment,
             arm_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
             arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
             workspace_bounds=runtime.policy.workspace.as_tuple(),
@@ -289,9 +290,17 @@ class CoordinatorConfig:
             hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
             control_hz=float(runtime.policy.control_hz),
             execute=execute,
-            command_acknowledgement_timeout_s=(
-                deployment.command_acknowledgement_timeout_s
+            inference_hz=float(runtime.policy.inference_hz),
+            max_plan_age_s=float(runtime.policy.max_plan_age_s),
+            max_source_to_command_age_s=float(
+                runtime.policy.max_source_to_command_age_s
             ),
+            max_command_silence_s=float(runtime.policy.max_command_silence_s),
+            action_validity_s=float(runtime.policy.action_validity_s),
+            command_acknowledgement_timeout_s=float(
+                runtime.policy.command_acknowledgement_timeout_s
+            ),
+            first_command_timeout_s=float(runtime.policy.first_command_timeout_s),
             static_boxes=tuple(runtime.environment.static_boxes),
             ik_max_pose_error_pos_m=float(runtime.policy.ik_max_pose_error_pos_m),
             ik_max_pose_error_rot_rad=float(runtime.policy.ik_max_pose_error_rot_rad),
@@ -594,16 +603,14 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
         return
 
     period_s = 1.0 / float(config.control_hz)
-    max_plan_age_ns = int(config.deployment.max_plan_age_s * 1e9)
-    max_source_to_command_age_ns = int(
-        config.deployment.max_source_to_command_age_s * 1e9
-    )
-    max_silence_ns = int(config.deployment.max_command_silence_s * 1e9)
-    first_command_timeout_ns = int(config.deployment.first_command_timeout_s * 1e9)
+    max_plan_age_ns = int(config.max_plan_age_s * 1e9)
+    max_source_to_command_age_ns = int(config.max_source_to_command_age_s * 1e9)
+    max_silence_ns = int(config.max_command_silence_s * 1e9)
+    first_command_timeout_ns = int(config.first_command_timeout_s * 1e9)
     action_buffer = ActionBuffer(
         max_buffered_plans=compute_max_buffered_plans(
-            config.deployment.max_plan_age_s,
-            config.deployment.inference_hz,
+            config.max_plan_age_s,
+            config.inference_hz,
         )
     )
     buffer_generation: int | None = None
@@ -1047,7 +1054,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     scheduled_target_monotonic_ns=int(
                         active_plan.chunk.target_monotonic_ns[step_index]
                     ),
-                    action_validity_s=float(config.deployment.action_validity_s),
+                    action_validity_s=float(config.action_validity_s),
                     valid_until_monotonic_ns=active_plan.deadline_ns,
                 )
             except (TypeError, ValueError) as exc:

@@ -31,11 +31,14 @@ def _experiment_info() -> SimpleNamespace:
         sensor_modalities=("joint_state", "point_cloud"),
         point_cloud_num_points=1024,
         point_cloud_feature_dim=6,
+        action_dim=19,
+        horizon=16,
         n_obs_steps=2,
         action_key="action",
         control_action_dim=19,
         n_action_steps=8,
         control_dt_s=0.0625,
+        requires_hand=True,
     )
     return SimpleNamespace(
         selector="dp3/pick/seed0",
@@ -125,23 +128,26 @@ class RunPolicyCommandTest(unittest.TestCase):
         info = _experiment_info()
         args = self.cli._parser().parse_args(["run", info.selector])
         runtime = object()
-        projection = object()
         with (
             patch(
                 "dexmani_real.config.runtime.resolve_runtime_config",
                 return_value=runtime,
-            ),
+            ) as resolve_runtime,
             patch(
-                "dexmani_real.deployment.config.resolve_policy_runtime_config",
-                return_value=projection,
-            ) as resolve_projection,
+                "dexmani_real.deployment.config.validate_policy_runtime_compatibility"
+            ) as validate_compatibility,
         ):
             inputs = self.cli._prepare_lifecycle_inputs(args, info, execute=True)
 
         self.assertIs(inputs.execute, True)
         self.assertIs(inputs.runtime, runtime)
-        self.assertIs(inputs.projection, projection)
-        self.assertIs(resolve_projection.call_args.kwargs["execute"], True)
+        self.assertIs(inputs.policy_spec, info.spec)
+        self.assertEqual(inputs.worker_config.experiment, info.selector)
+        self.assertEqual(inputs.worker_config.device, args.device)
+        self.assertEqual(inputs.worker_config.seed, 0)
+        self.assertIs(inputs.worker_config.spec, info.spec)
+        resolve_runtime.assert_called_once_with(yaml_path=args.config)
+        validate_compatibility.assert_called_once_with(info.spec, runtime)
         for retired_name in (
             "execution_mode",
             "hand_acknowledged",
@@ -149,7 +155,7 @@ class RunPolicyCommandTest(unittest.TestCase):
             "task_execute_bounds",
             "inference_seed",
         ):
-            self.assertNotIn(retired_name, resolve_projection.call_args.kwargs)
+            self.assertFalse(hasattr(inputs.worker_config, retired_name))
 
     def test_shadow_projects_validate_only_and_starts_through_seam(self) -> None:
         info = _experiment_info()

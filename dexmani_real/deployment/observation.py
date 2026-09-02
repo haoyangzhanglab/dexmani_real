@@ -13,38 +13,6 @@ import numpy as np
 
 from dexmani_real.ipc.schema import validate_point_cloud_array
 
-POLICY_OBSERVATION_FIELDS = frozenset(
-    {
-        "arm_qpos",
-        "hand_qpos",
-        "hand_current",
-        "hand_tactile_sum",
-        "hand_tactile_force",
-        "arm_joint_position",
-        "hand_joint_position",
-        "hand_joint_torque",
-        "fingertip_force",
-        "xhand_tactile",
-        "point_cloud",
-        "rgb",
-    }
-)
-
-
-def parse_observation_fields(spec: str) -> tuple[str, ...]:
-    """Parse and validate the comma-separated policy observation contract."""
-    if not isinstance(spec, str):
-        raise TypeError("observation_fields must be a comma-separated string")
-    fields = tuple(part.strip() for part in spec.split(",") if part.strip())
-    if not fields:
-        raise ValueError("observation_fields must contain at least one field")
-    unknown = sorted(set(fields) - POLICY_OBSERVATION_FIELDS)
-    if unknown:
-        raise ValueError(f"unknown observation field(s): {', '.join(unknown)}")
-    if len(set(fields)) != len(fields):
-        raise ValueError("observation_fields must not contain duplicates")
-    return fields
-
 
 def freeze_array(
     arr: Any,

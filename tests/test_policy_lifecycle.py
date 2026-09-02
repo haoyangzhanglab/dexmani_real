@@ -7,7 +7,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from dexmani_real.deployment.config import DeploymentConfig, PolicyRuntimeConfig
+from dexmani_real.config.runtime import resolve_runtime_config
+from dexmani_real.deployment.config import PolicyWorkerConfig
 from dexmani_real.deployment.lifecycle import run_policy_deployment
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.runtime.safety import SafetyState
@@ -74,48 +75,36 @@ class _FakeProcess:
         return self._alive
 
 
-def _policy_runtime_config() -> PolicyRuntimeConfig:
-    deployment = DeploymentConfig(
-        experiment="fake/model",
-        device="cpu",
-        task_name="fake",
+def _policy_spec() -> SimpleNamespace:
+    return SimpleNamespace(
+        action_key="action",
         action_dim=19,
         control_action_dim=19,
-        hand_enabled=True,
+        horizon=16,
+        n_obs_steps=2,
+        n_action_steps=8,
+        sensor_modalities=("joint_state", "point_cloud"),
+        point_cloud_num_points=1024,
+        point_cloud_feature_dim=6,
+        control_dt_s=0.0625,
+        requires_hand=True,
     )
-    return PolicyRuntimeConfig(
-        deployment=deployment,
-        control_dt_s=deployment.control_dt_s,
-        point_cloud_frame="xarm_base",
-        point_cloud_color_source="fake",
-        point_cloud_policy_id="fake",
-        point_cloud_table_plane_abcd_json="null",
-        point_cloud_sampling="fake",
-        point_cloud_transform="fake",
+
+
+def _policy_worker_config(spec: SimpleNamespace) -> PolicyWorkerConfig:
+    return PolicyWorkerConfig(
+        experiment="fake/model",
+        device="cpu",
+        spec=spec,
     )
 
 
 class PolicyLifecycleStartupTest(unittest.TestCase):
     def test_model_failure_blocks_all_non_inference_workers(self) -> None:
         shared = _FakeRuntimeChannels()
-        runtime = SimpleNamespace(
-            policy=SimpleNamespace(control_hz=16.0),
-            safety=SimpleNamespace(
-                readiness_timeouts_s={
-                    name: 1.0
-                    for name in (
-                        "arm",
-                        "camera",
-                        "pointcloud",
-                        "inference",
-                        "policy",
-                        "hand",
-                    )
-                },
-                shutdown_timeout_s=1.0,
-            ),
-        )
-        policy_runtime_config = _policy_runtime_config()
+        runtime = resolve_runtime_config()
+        spec = _policy_spec()
+        worker_config = _policy_worker_config(spec)
         specs = [
             WorkerSpec(name, _unexpected_worker_start, (), ready_name=name)
             for name in ("arm", "camera", "pointcloud")
@@ -125,7 +114,7 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
                 WorkerSpec(
                     "inference",
                     inference_loop,
-                    (shared, policy_runtime_config),
+                    (shared, runtime.policy, worker_config),
                     ready_name="inference",
                 ),
                 WorkerSpec("policy", _unexpected_worker_start, (), ready_name="policy"),
@@ -149,7 +138,7 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
             patch(
                 "dexmani_real.deployment.lifecycle.RuntimeChannelsConfig.from_runtime",
                 return_value=object(),
-            ),
+            ) as channel_config,
             patch(
                 "dexmani_real.deployment.lifecycle.build_policy_worker_specs",
                 return_value=specs,
@@ -164,7 +153,7 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
                 side_effect=RuntimeError("fake model restore failed"),
             ),
         ):
-            result = run_policy_deployment(runtime, policy_runtime_config)
+            result = run_policy_deployment(runtime, spec, worker_config, False)
 
         by_name = {process.name: process for process in processes}
         self.assertEqual(result, 1)
@@ -176,7 +165,20 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
             with self.subTest(worker=name):
                 self.assertFalse(by_name[name].started)
         shutdown.assert_called_once_with(
-            shared, [by_name["inference"]], graceful_timeout_s=1.0
+            shared,
+            [by_name["inference"]],
+            graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+        )
+        channel_config.assert_called_once_with(
+            runtime,
+            pointcloud_num_points=spec.point_cloud_num_points,
+            camera_requested=True,
+            pointcloud_requested=True,
+            observation_horizon=spec.n_obs_steps,
+            observation_dt_s=spec.control_dt_s,
+            max_input_age_s=runtime.policy.max_input_age_s,
+            max_observation_skew_s=runtime.policy.max_observation_skew_s,
+            max_grid_lag_s=runtime.policy.max_grid_lag_s,
         )
 
 

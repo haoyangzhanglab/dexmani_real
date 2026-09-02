@@ -21,7 +21,6 @@ import numpy as np
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
 from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
 from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
-from dexmani_real.deployment.config import DeploymentConfig
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import (
     Pose,
@@ -103,7 +102,6 @@ def build_home_planner(runtime: ResolvedRuntimeConfig) -> XArm7MotionPlanner:
 def _home(
     shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
-    deployment: DeploymentConfig,
     planner: XArm7MotionPlanner,
     *,
     abort_requested,
@@ -116,30 +114,29 @@ def _home(
         return False
     arm_config = ArmLoopConfig.from_runtime(runtime)
 
-    if deployment.hand_enabled:
-        hand_home = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
-        accepted = publish_hand_home_and_wait_applied(
-            shared,
-            hand_home,
-            command_lower_rad=np.asarray(runtime.hand.qpos_min_rad, dtype=np.float64),
-            command_upper_rad=np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64),
-            mechanical_lower_rad=np.asarray(
-                runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
-            ),
-            mechanical_upper_rad=np.asarray(
-                runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
-            ),
-            hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
-            timeout_s=float(runtime.hand.home_command_ack_timeout_s),
-            heartbeat=False,
-            check_is_running=True,
-            verbose=True,
-            abort_requested=abort_requested,
-        )
-        if not accepted:
-            logger.warning("operator: hand home not accepted; arm home skipped")
-            return False
-        planner.set_hand_qpos(hand_home)
+    hand_home = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
+    accepted = publish_hand_home_and_wait_applied(
+        shared,
+        hand_home,
+        command_lower_rad=np.asarray(runtime.hand.qpos_min_rad, dtype=np.float64),
+        command_upper_rad=np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64),
+        mechanical_lower_rad=np.asarray(
+            runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
+        ),
+        mechanical_upper_rad=np.asarray(
+            runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
+        ),
+        hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
+        timeout_s=float(runtime.hand.home_command_ack_timeout_s),
+        heartbeat=False,
+        check_is_running=True,
+        verbose=True,
+        abort_requested=abort_requested,
+    )
+    if not accepted:
+        logger.warning("operator: hand home not accepted; arm home skipped")
+        return False
+    planner.set_hand_qpos(hand_home)
 
     result = execute_arm_home(
         shared,
@@ -159,7 +156,6 @@ def _home(
 def run_operator_control(
     shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
-    deployment: DeploymentConfig,
     planner: XArm7MotionPlanner | None,
     *,
     stop_event: threading.Event,
@@ -242,7 +238,6 @@ def run_operator_control(
                     completed = _home(
                         shared,
                         runtime,
-                        deployment,
                         planner,
                         abort_requested=lambda: bool(
                             stop_event.is_set()

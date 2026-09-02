@@ -151,7 +151,6 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
             run_operator_control(
                 shared,
                 SimpleNamespace(),
-                SimpleNamespace(),
                 Mock(),
                 stop_event=threading.Event(),
                 execute=True,
@@ -179,7 +178,6 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
         ):
             run_operator_control(
                 shared,
-                SimpleNamespace(),
                 SimpleNamespace(),
                 Mock(),
                 stop_event=threading.Event(),
@@ -211,7 +209,6 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
                     run_operator_control(
                         shared,
                         SimpleNamespace(),
-                        SimpleNamespace(),
                         Mock(),
                         stop_event=threading.Event(),
                         execute=True,
@@ -239,7 +236,6 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
         ):
             run_operator_control(
                 shared,
-                SimpleNamespace(),
                 SimpleNamespace(),
                 Mock(),
                 stop_event=threading.Event(),

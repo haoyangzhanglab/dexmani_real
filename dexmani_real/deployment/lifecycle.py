@@ -25,11 +25,10 @@ from typing import Any
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
 from dexmani_real.deployment.config import (
     FIXED_POLICY_RUNTIME_TARGET,
-    DeploymentConfig,
-    PolicyRuntimeConfig,
+    PolicyWorkerConfig,
+    validate_policy_runtime_compatibility,
 )
 from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_loop
-from dexmani_real.deployment.observation import parse_observation_fields
 from dexmani_real.deployment.operator import build_home_planner, run_operator_control
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
@@ -56,19 +55,22 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 
-def _requires_pointcloud(deployment: DeploymentConfig) -> bool:
-    return "point_cloud" in parse_observation_fields(deployment.observation_fields)
+def _requires_pointcloud(policy_spec: Any) -> bool:
+    return "point_cloud" in tuple(policy_spec.sensor_modalities)
 
 
-def _requires_camera(deployment: DeploymentConfig) -> bool:
-    requested = parse_observation_fields(deployment.observation_fields)
+def _requires_camera(policy_spec: Any) -> bool:
+    requested = tuple(policy_spec.sensor_modalities)
     return "point_cloud" in requested or "rgb" in requested
 
 
 def build_policy_worker_specs(
     shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
-    policy_runtime_config: PolicyRuntimeConfig,
+    policy_spec: Any,
+    worker_config: PolicyWorkerConfig,
+    *,
+    execute: bool,
 ) -> list[WorkerSpec]:
     """Build the workers required by the explicit deployment contract.
 
@@ -78,18 +80,21 @@ def build_policy_worker_specs(
     ``policy`` control-source slot, the inference worker the new ``inference``
     slot).
     """
-    deployment = policy_runtime_config.deployment
+    validate_policy_runtime_compatibility(policy_spec, runtime)
+    if not isinstance(worker_config, PolicyWorkerConfig):
+        raise TypeError("worker_config must be a PolicyWorkerConfig")
+    if worker_config.spec is not policy_spec:
+        raise ValueError("worker PolicySpec must be the validated lifecycle PolicySpec")
     coordinator_config = CoordinatorConfig.from_runtime(
-        deployment,
         runtime,
-        execute=policy_runtime_config.execute,
+        execute=execute,
     )
-    pointcloud_requested = _requires_pointcloud(deployment)
-    camera_requested = _requires_camera(deployment)
+    pointcloud_requested = _requires_pointcloud(policy_spec)
+    camera_requested = _requires_camera(policy_spec)
     pointcloud_config = (
         PointCloudLoopConfig.from_runtime(
             runtime,
-            num_points=deployment.pointcloud_num_points,
+            num_points=policy_spec.point_cloud_num_points,
         )
         if pointcloud_requested
         else None
@@ -128,7 +133,7 @@ def build_policy_worker_specs(
             WorkerSpec(
                 "inference",
                 inference_loop,
-                (shared, policy_runtime_config),
+                (shared, runtime.policy, worker_config),
                 ready_name="inference",
             ),
             WorkerSpec(
@@ -139,7 +144,7 @@ def build_policy_worker_specs(
             ),
         ]
     )
-    if deployment.hand_enabled:
+    if policy_spec.requires_hand:
         specs.append(
             WorkerSpec(
                 "hand",
@@ -153,7 +158,9 @@ def build_policy_worker_specs(
 
 def run_policy_deployment(
     runtime: ResolvedRuntimeConfig,
-    policy_runtime_config: PolicyRuntimeConfig,
+    policy_spec: Any,
+    worker_config: PolicyWorkerConfig,
+    execute: bool,
     *,
     prefix: str | None = None,
     max_running_s: float | None = None,
@@ -166,33 +173,39 @@ def run_policy_deployment(
     follows ``DISARMED -> hardware readiness -> ARMED -> supervision ->
     verified shutdown``.
     """
-    if not isinstance(policy_runtime_config, PolicyRuntimeConfig):
-        raise TypeError("policy_runtime_config must be a PolicyRuntimeConfig")
+    if not isinstance(runtime, ResolvedRuntimeConfig):
+        raise TypeError("runtime must be a ResolvedRuntimeConfig")
+    if not isinstance(execute, bool):
+        raise TypeError("execute must be a boolean")
+    validate_policy_runtime_compatibility(policy_spec, runtime)
+    if not isinstance(worker_config, PolicyWorkerConfig):
+        raise TypeError("worker_config must be a PolicyWorkerConfig")
+    if worker_config.spec is not policy_spec:
+        raise ValueError("worker PolicySpec must be the validated lifecycle PolicySpec")
     max_running_s = validate_max_running_s(max_running_s)
-    deployment = policy_runtime_config.deployment
     logger.info(
         "policy deployment: experiment=%s runtime=%s device=%s seed=0 execute=%s",
-        deployment.experiment,
+        worker_config.experiment,
         FIXED_POLICY_RUNTIME_TARGET,
-        deployment.device,
-        policy_runtime_config.execute,
+        worker_config.device,
+        execute,
     )
 
     ctx = mp.get_context("spawn")
-    pointcloud_requested = _requires_pointcloud(deployment)
-    camera_requested = _requires_camera(deployment)
+    pointcloud_requested = _requires_pointcloud(policy_spec)
+    camera_requested = _requires_camera(policy_spec)
     shared = RuntimeChannels.create(
         prefix=prefix or f"dexmani_policy_{os.getpid()}",
         config=RuntimeChannelsConfig.from_runtime(
             runtime,
-            pointcloud_num_points=deployment.pointcloud_num_points,
+            pointcloud_num_points=policy_spec.point_cloud_num_points,
             camera_requested=camera_requested,
             pointcloud_requested=pointcloud_requested,
-            observation_horizon=deployment.observation_horizon,
-            observation_dt_s=1.0 / float(runtime.policy.control_hz),
-            max_input_age_s=deployment.max_input_age_s,
-            max_observation_skew_s=deployment.max_observation_skew_s,
-            max_grid_lag_s=deployment.max_grid_lag_s,
+            observation_horizon=policy_spec.n_obs_steps,
+            observation_dt_s=float(policy_spec.control_dt_s),
+            max_input_age_s=runtime.policy.max_input_age_s,
+            max_observation_skew_s=runtime.policy.max_observation_skew_s,
+            max_grid_lag_s=runtime.policy.max_grid_lag_s,
         ),
         mp_context=ctx,
     )
@@ -206,7 +219,9 @@ def run_policy_deployment(
         specs = build_policy_worker_specs(
             shared,
             runtime,
-            policy_runtime_config,
+            policy_spec,
+            worker_config,
+            execute=execute,
         )
         procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)
@@ -272,9 +287,7 @@ def run_policy_deployment(
             f"\nAll subsystems ready — safety=ARMED({int(SafetyState.ARMED)})",
             flush=True,
         )
-        home_planner = (
-            build_home_planner(runtime) if policy_runtime_config.execute else None
-        )
+        home_planner = build_home_planner(runtime) if execute else None
         home_status = "return hand + arm home before B" if home_planner else "disabled"
         print(
             "  [B] start run   [S] stop run   [Q] quit   [ESC] e-stop   "
@@ -285,10 +298,10 @@ def run_policy_deployment(
         operator_stop = threading.Event()
         operator_thread = threading.Thread(
             target=run_operator_control,
-            args=(shared, runtime, deployment, home_planner),
+            args=(shared, runtime, home_planner),
             kwargs={
                 "stop_event": operator_stop,
-                "execute": policy_runtime_config.execute,
+                "execute": execute,
             },
             name="policy-operator",
             daemon=True,
