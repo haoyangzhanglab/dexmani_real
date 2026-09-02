@@ -174,6 +174,7 @@ if loaded:
             self.assertIn("real_source", receipt)
 
     def test_check_calls_offline_api_without_hardware_owner_import(self) -> None:
+        modules_before = set(sys.modules)
         artifact = SimpleNamespace()
         runtime = SimpleNamespace(sha256="r" * 64)
         projection = SimpleNamespace(runtime=object(), sha256="p" * 64)
@@ -214,11 +215,15 @@ if loaded:
         self.assertEqual(code, 0)
         self.assertEqual(resolve.call_args.kwargs["seed"], 1066)
         offline_check.assert_called_once_with(projection.runtime, benchmark_samples=3)
-        self.assertNotIn("dexmani_real.robot.arm_worker", sys.modules)
-        self.assertNotIn("dexmani_real.robot.hand_worker", sys.modules)
-        self.assertNotIn("dexmani_real.robot.xhand", sys.modules)
-        self.assertNotIn("dexmani_real.sensor.camera_worker", sys.modules)
-        self.assertNotIn("dexmani_real.sensor.pointcloud_worker", sys.modules)
+        new_modules = set(sys.modules) - modules_before
+        for module_name in (
+            "dexmani_real.robot.arm_worker",
+            "dexmani_real.robot.hand_worker",
+            "dexmani_real.robot.xhand",
+            "dexmani_real.sensor.camera_worker",
+            "dexmani_real.sensor.pointcloud_worker",
+        ):
+            self.assertNotIn(module_name, new_modules)
         self.assertFalse(
             any(
                 name == "xarm"
@@ -227,7 +232,7 @@ if loaded:
                 or name.startswith("xhand_controller.")
                 or name == "pyrealsense2"
                 or name.startswith("pyrealsense2.")
-                for name in sys.modules
+                for name in new_modules
             )
         )
 
@@ -493,12 +498,16 @@ class PolicyCheckTest(unittest.TestCase):
             patch.object(
                 preflight.time, "perf_counter_ns", side_effect=lambda: next(clock)
             ),
+            patch.object(
+                preflight, "_require_hardware_free_check_imports"
+            ) as check_imports,
         ):
             result = preflight._run_policy_check_child(runtime_config, 3)
         load.assert_called_once_with(runtime_config)
         runtime.warmup.assert_called_once_with(samples=5)
         self.assertEqual(runtime.predict.call_count, 3)
         runtime.close.assert_called_once_with()
+        check_imports.assert_called_once_with()
         self.assertEqual(result.benchmark_samples, 3)
         self.assertEqual(result.latency_p50_ms, 20.0)
         self.assertEqual(result.latency_p95_ms, 30.0)

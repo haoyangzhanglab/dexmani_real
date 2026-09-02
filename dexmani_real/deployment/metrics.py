@@ -253,15 +253,7 @@ def shadow_run_receipt_json(
         raise ValueError("coupled command sequences must be monotonic integers")
     if not isinstance(reason, str) or not reason:
         raise ValueError("reason must be a non-empty string")
-    normalized_metrics: dict[str, int | float] = {}
-    for name, value in metrics.items():
-        if not isinstance(name, str) or not name:
-            raise ValueError("metric names must be non-empty strings")
-        if isinstance(value, bool) or not math.isfinite(float(value)):
-            raise ValueError("receipt metric values must be finite numbers")
-        normalized_metrics[name] = (
-            int(value) if isinstance(value, int) else float(value)
-        )
+    normalized_metrics = _normalize_receipt_metrics(metrics)
     writes = int(coupled_command_end_sequence) - int(coupled_command_start_sequence)
     receipt = {
         "coupled_command_end_sequence": int(coupled_command_end_sequence),
@@ -272,6 +264,29 @@ def shadow_run_receipt_json(
         "reason": reason,
         "run_generation": int(run_generation),
         "zero_coupled_command_writes": writes == 0,
+    }
+    return json.dumps(receipt, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def inference_run_receipt_json(
+    *,
+    run_generation: int,
+    reason: str,
+    metrics: Mapping[str, int | float],
+) -> str:
+    """Render final, per-run inference evidence before metrics are cleared."""
+    if isinstance(run_generation, bool) or int(run_generation) <= 0:
+        raise ValueError("run_generation must be a positive integer")
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("reason must be a non-empty string")
+    normalized_metrics = _normalize_receipt_metrics(metrics)
+    for name in (INFERENCE_FAILURES, PLANS_CREATED, PLANS_GENERATION_DROPPED):
+        normalized_metrics.setdefault(name, 0)
+    receipt = {
+        "metrics": normalized_metrics,
+        "reason": reason,
+        "run_generation": int(run_generation),
+        "worker": "inference",
     }
     return json.dumps(receipt, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -361,15 +376,7 @@ def bounded_execute_run_receipt_json(
         raise ValueError("coupled command sequences must be monotonic integers")
     if not isinstance(reason, str) or not reason:
         raise ValueError("reason must be a non-empty string")
-    normalized_metrics: dict[str, int | float] = {}
-    for name, value in metrics.items():
-        if not isinstance(name, str) or not name:
-            raise ValueError("metric names must be non-empty strings")
-        if isinstance(value, bool) or not math.isfinite(float(value)):
-            raise ValueError("receipt metric values must be finite numbers")
-        normalized_metrics[name] = (
-            int(value) if isinstance(value, int) else float(value)
-        )
+    normalized_metrics = _normalize_receipt_metrics(metrics)
     timeline: dict[str, int] = {}
     if timeline_monotonic_ns is not None:
         for name, value in timeline_monotonic_ns.items():
@@ -401,6 +408,22 @@ def bounded_execute_run_receipt_json(
         "within_publication_bound": writes <= int(max_published_endpoints),
     }
     return json.dumps(receipt, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _normalize_receipt_metrics(
+    metrics: Mapping[str, int | float],
+) -> dict[str, int | float]:
+    """Validate and normalize metric values shared by all receipt formats."""
+    normalized_metrics: dict[str, int | float] = {}
+    for name, value in metrics.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("metric names must be non-empty strings")
+        if isinstance(value, bool) or not math.isfinite(float(value)):
+            raise ValueError("receipt metric values must be finite numbers")
+        normalized_metrics[name] = (
+            int(value) if isinstance(value, int) else float(value)
+        )
+    return normalized_metrics
 
 
 def flush_every(

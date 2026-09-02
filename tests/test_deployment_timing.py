@@ -1610,6 +1610,10 @@ class DeploymentTimingTest(unittest.TestCase):
                 side_effect=lambda _metrics, *, last_ns, **_kwargs: last_ns,
             ) as flush_metrics,
             patch(
+                "dexmani_real.deployment.worker.inference_run_receipt_json",
+                return_value="{}",
+            ) as render_run_receipt,
+            patch(
                 "dexmani_real.deployment.worker.time.sleep",
                 side_effect=stop_after_wait,
             ),
@@ -1617,6 +1621,9 @@ class DeploymentTimingTest(unittest.TestCase):
             inference_loop(shared, config)
 
         flush_metrics.assert_called_once()
+        render_run_receipt.assert_called_once()
+        self.assertEqual(render_run_receipt.call_args.kwargs["run_generation"], 4)
+        self.assertEqual(render_run_receipt.call_args.kwargs["reason"], "worker exit")
         runtime.predict.assert_not_called()
 
     def test_coordinator_publishes_one_due_endpoint_through_its_safety_gate(

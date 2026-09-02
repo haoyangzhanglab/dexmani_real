@@ -469,7 +469,9 @@ behavior-preserving with respect to control data flow.
 
 ```text
 Gate A offline: PASS on separate evidence branch a70df31aae6d00a004f927a679ece813efc1a4d7
-Gate A live: still pending on frozen effe745c68847a4b32ed1e4680041a350da4f4fe baseline
+Gate A live and one-endpoint H4: PASS on frozen Real cc28cda511f58134c5566f7da85d65f0c1a86aac
+(`gate-a-h4-validated-20260902`). The R3 candidate is a different Real revision;
+it requires fresh Gate A before any physical authorization.
 ```
 
 R4/R5 remain unchanged and are not part of this implementation.
