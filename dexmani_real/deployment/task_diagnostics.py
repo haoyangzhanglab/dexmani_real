@@ -23,7 +23,7 @@ import numpy as np
 from dexmani_real.config.camera_calib import CameraCalib
 from dexmani_real.deployment.task_scene import TaskSceneCard
 from dexmani_real.ipc.channels import RuntimeChannels
-from dexmani_real.runtime.safety import SafetyState
+from dexmani_real.runtime.safety import SafetyState, read_run_epoch
 from dexmani_real.utils.atomic_io import atomic_json_dump
 from dexmani_real.utils.log import get_logger
 
@@ -105,6 +105,10 @@ class TaskDiagnosticsObserver:
         self._armed_camera_sequence = 0
         self._armed_pointcloud_sequence = 0
         self._seen_run_generation = int(shared.run_generation.value)
+        # H can publish a hand-only home target while the runtime is ARMED.
+        # Task evidence starts only at B's RUNNING epoch, so retain that
+        # generation once observed and reject all pre-B ring records.
+        self._task_run_generation: int | None = None
         self._publication_count = 0
         self._dropped_plan_records = 0
         self._evicted_cached_plan_endpoints = 0
@@ -210,12 +214,17 @@ class TaskDiagnosticsObserver:
             self._record_read_error("armed_scene", exc)
 
     def _capture_b_pre_scene(self) -> None:
-        generation = int(self._shared.run_generation.value)
-        if generation == self._seen_run_generation:
+        run_epoch = read_run_epoch(self._shared)
+        generation = run_epoch.generation
+        if (
+            generation == self._seen_run_generation
+            and self._task_run_generation is not None
+        ):
             return
         self._seen_run_generation = generation
-        if int(self._shared.run_started_monotonic_ns.value) <= 0:
+        if run_epoch.started_monotonic_ns <= 0:
             return
+        self._task_run_generation = generation
         # The cache was only populated while ARMED, so it cannot include B's
         # new observation epoch. Keep its capture timestamp for reviewer aging.
         if self._armed_scene is None:
@@ -224,9 +233,7 @@ class TaskDiagnosticsObserver:
             self._scene_frames["b_pre"] = {
                 "available": True,
                 "run_generation": generation,
-                "run_started_monotonic_ns": int(
-                    self._shared.run_started_monotonic_ns.value
-                ),
+                "run_started_monotonic_ns": run_epoch.started_monotonic_ns,
                 "device_and_calibration_identity": self._identity_snapshot(),
                 **self._armed_scene,
             }
@@ -266,6 +273,8 @@ class TaskDiagnosticsObserver:
             record = result[0][0]
             try:
                 generation = int(record["run_generation"])
+                if generation != self._task_run_generation:
+                    continue
                 observation_id = int(record["observation_id"])
                 plan_id = int(record["plan_id"])
                 steps = int(record["num_steps"])
@@ -326,6 +335,8 @@ class TaskDiagnosticsObserver:
                 if action_id <= 0 or bool(record["is_hold"]):
                     continue
                 generation = int(record["run_generation"])
+                if generation != self._task_run_generation:
+                    continue
                 observation_id = int(record["observation_id"])
                 scheduled_ns = int(record["scheduled_target_monotonic_ns"])
                 raw_prediction = self._plans.get(

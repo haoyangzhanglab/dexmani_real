@@ -21,7 +21,7 @@ from dexmani_real.ipc.schema import (
     HAND_TACTILE_DTYPE,
     POLICY_PLAN_DTYPE,
 )
-from dexmani_real.runtime.safety import SafetyState
+from dexmani_real.runtime.safety import SafetyState, begin_motion
 
 
 class TaskDiagnosticsObserverTest(unittest.TestCase):
@@ -91,8 +91,8 @@ class TaskDiagnosticsObserverTest(unittest.TestCase):
         shared = self._channels()
         try:
             shared.safety_state.value = int(SafetyState.ARMED)
-            generation = int(shared.run_generation.value) + 1
-            shared.run_generation.value = generation
+            self.assertTrue(begin_motion(shared))
+            generation = int(shared.run_generation.value)
             target_ns = time.monotonic_ns()
             plan = np.zeros(1, dtype=POLICY_PLAN_DTYPE)
             plan["plan_id"][0] = 3
@@ -117,6 +117,7 @@ class TaskDiagnosticsObserverTest(unittest.TestCase):
                     receipt_dir=directory,
                     scene_card=self._scene_card(),
                 )
+                observer._capture_b_pre_scene()
                 observer._drain_policy_plans()
                 self._write_feedback(shared, action_id=0)
                 command = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
@@ -149,5 +150,51 @@ class TaskDiagnosticsObserverTest(unittest.TestCase):
                 self.assertEqual(event["shaped_ipc_endpoint"]["arm_qpos"][0], 0.5)
                 self.assertTrue(event["acknowledgement"]["arm_acknowledged"])
                 self.assertTrue(event["acknowledgement"]["hand_acknowledged"])
+        finally:
+            self.assertTrue(shared.close())
+
+    def test_ignores_pre_b_hand_home_command_when_indexing_task_events(self) -> None:
+        shared = self._channels()
+        try:
+            shared.safety_state.value = int(SafetyState.ARMED)
+            home_generation = int(shared.run_generation.value)
+            with tempfile.TemporaryDirectory() as directory:
+                observer = TaskDiagnosticsObserver(
+                    shared,
+                    receipt_dir=directory,
+                    scene_card=self._scene_card(),
+                )
+                home = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
+                home["run_generation"][0] = home_generation
+                home["action_id"][0] = 1
+                home["hand_present"][0] = 1
+                shared.coupled_cmd_ring.write(home)
+                observer._drain_coupled_commands()
+
+                self.assertTrue(begin_motion(shared))
+                task_generation = int(shared.run_generation.value)
+                observer._capture_b_pre_scene()
+
+                target_ns = time.monotonic_ns()
+                task = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
+                task["run_generation"][0] = task_generation
+                task["action_id"][0] = 2
+                task["created_monotonic_ns"][0] = target_ns
+                task["scheduled_target_monotonic_ns"][0] = target_ns
+                task["target_monotonic_ns"][0] = target_ns
+                task["valid_until_monotonic_ns"][0] = target_ns + 1_000_000
+                task["arm_present"][0] = 1
+                task["hand_present"][0] = 1
+                shared.coupled_cmd_ring.write(task)
+                observer._drain_coupled_commands()
+
+                output = observer.persist()
+                assert output is not None
+                manifest = json.loads((output / "manifest.json").read_text("utf-8"))
+                self.assertEqual(manifest["collection"]["event_count"], 1)
+                event = manifest["events"][0]
+                self.assertEqual(event["action_id"], 2)
+                self.assertEqual(event["published_endpoint_index"], 1)
+                self.assertEqual(manifest["scene_frames"]["approach"]["action_id"], 2)
         finally:
             self.assertTrue(shared.close())
