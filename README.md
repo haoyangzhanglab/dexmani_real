@@ -22,10 +22,10 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
   fault、不退出，也不更新该 action 的 SDK-acceptance ACK；下一周期从新鲜实测状态和仍有效的
   latest target 继续。读取路径仅在 12 关节反馈完整且有限时继续，并将该帧触觉标为无效。
   其他未列入白名单的发送错误仍 fail closed。
-- XHand worker 每次成功连接并完成触觉初始化后，会在发布 ready 前无条件发送一次配置的
-  `home_qpos`；连接 XHand 会引起手指运动，该初始化 reset 不等待物理收敛。
+- XHand worker 成功连接并完成触觉初始化后只建立反馈与命令边界，不会在发布 ready 前
+  隐式发送 `home_qpos`。手部运动必须来自工作流 owner 显式发起的 home 或已校验命令。
 - physical replay 以记录的首帧**实测 arm**关节状态作为起点：xArm 需先由操作者受监督地
-  定位；XHand 在连接 reset 后，以首帧手部命令完成 3 秒安全 warm-up，并经实时
+  定位；XHand 连接后由 replay 显式发送首帧手部命令完成 3 秒安全 warm-up，并经实时
   自碰撞/静态障碍检查和新鲜反馈确认后才从 frame 0 开始重放。手部反馈不要求复现录制值。
 - RealSense 相机按设备原生频率连续采集；16 Hz 控制网格只选择最新严格因果帧，
   不再将相机发布节拍绑定到控制频率。
@@ -36,9 +36,8 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
   点云数据可导出 Policy Zarr v5。导出坚持一份 processed HDF5 对应一个训练 episode；
   删除过 source 行或存在时序缺口的 episode 整条拒绝，不在缺口处拆分。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
-- 通过 Real 固定拥有的 `dexmani_policy` adapter 运行 joint/EE-action learned policy。
-  启动时 `DeploymentManifest`
-  fail-closed 校验自描述 checkpoint 与部署配置（action/observation/点云/时序合同）。
+- 通过 Policy-owned public runtime 与 Real-owned NumPy adapter 运行 joint/EE-action learned
+  policy；Policy strict restore 模型，Real fail-closed 校验固定硬件、观测、IPC 与时序兼容。
 
 ## 导航
 
@@ -51,7 +50,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/hdf5_writer.py`](dexmani_real/recording/hdf5_writer.py)、[`recording/reader.py`](dexmani_real/recording/reader.py) |
 | 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`data/`](dexmani_real/data) |
 | 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v24、processed v11 与 Policy Zarr v5 的字段、dtype、shape 与语义 |
-| learned-policy 部署 | [`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`integrations/`](dexmani_real/integrations) |
+| learned-policy 部署 | [`docs/policy_deployment.md`](docs/policy_deployment.md)、[`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`integrations/`](dexmani_real/integrations) |
 | 相机、桌面与 VR 标定 | [`examples/`](examples) | [`calibration/`](dexmani_real/calibration)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
 | 点云完整链路 | [`docs/pointcloud_pipeline.md`](docs/pointcloud_pipeline.md) | [`sensor/pointcloud.py`](dexmani_real/sensor/pointcloud.py)、[`sensor/pointcloud_worker.py`](dexmani_real/sensor/pointcloud_worker.py) |
 
@@ -144,9 +143,10 @@ RealSense SDK、HTS hand-tracking SDK、Pinocchio、MPlib、NLopt、
 CLI override > YAML file > dexmani_real/config/defaults.py
 ```
 
-运行时配置由 [`config/runtime.py`](dexmani_real/config/runtime.py) 校验、冻结并生成
-SHA-256；部署配置由 [`deployment/config.py`](dexmani_real/deployment/config.py)
-独立解析。`pointcloud` 是与 EEF `policy.workspace` 分离的感知配置段；实时 worker、离线
+运行时配置由 [`config/runtime.py`](dexmani_real/config/runtime.py) 唯一解析、校验、冻结并生成
+SHA-256；learned-policy 的 inference、freshness、plan、ACK 和 watchdog timing 都属于其
+`policy` 段，模型 shape、modality 和 horizon 则只来自 Policy public API 的 `PolicySpec`。
+`pointcloud` 是与 EEF `policy.workspace` 分离的感知配置段；实时 worker、离线
 重建和诊断入口只从该段派生参数，并把策略 ID 与配置 SHA-256 写入 processed/Zarr
 语义。可在不启动硬件的情况下查看遥操作解析结果：
 
@@ -165,10 +165,9 @@ python examples/collect_teleop.py --print-config
 | 键盘遥操作 | `python examples/keyboard_teleop.py` | 连接并控制 xArm7，可选 XHand |
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 使用 raw episode 的精确已发送命令、配置和模型 provenance，预检后控制 xArm7/XHand；写 `replay_results/` |
 | 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取并校验 `data.h5` hash 后的原始 `float64` 已发送命令，继续执行完整配置/模型/几何预检；包含多个 source 连续段的产物拒绝物理回放 |
-| learned policy inspect/check | `python examples/run_policy.py inspect <experiment>` / `check <experiment> --device <device> --seed <seed> --benchmark-samples 100` | 两者均不连接硬件；inspect 不导入 Torch，check 在隔离 child 中 single-load、strict restore、synthetic qualification 和 benchmark。 |
-| learned policy shadow | `python examples/run_policy.py shadow <experiment> --device <device> --seed <seed> --hand --max-running-seconds <seconds>` | 会连接 arm/hand/camera；hand startup 可能 reset/home，但 learned coupled-command publication 应为 0。 |
-| H4 one-shot execute | `python examples/run_policy.py h4 <profile.yaml>` | strict profile 的 publication bound 必须为 1；要求独立 H4 真机授权和 H/B 操作。 |
-| learned-policy 单次任务 rollout（物理成功未验证） | `python examples/run_policy.py run <profile.yaml>` | task 必须使用 schema-v2 profile 绑定 scene card；完成 passive diagnostics review 后仍须取得新的 task 真机授权。 |
+| learned policy 检查 | `python examples/run_policy.py list`；`python examples/run_policy.py check <experiment> --device <device>` | 仅列出实验，或经 Policy public API strict restore + warmup + synthetic predict；不连接硬件 |
+| learned policy shadow | `python examples/run_policy.py shadow <experiment>` | 连接真实 sensor 与 arm/XHand feedback，执行 inference、IK 和 SafetyGate；结构性禁止 actuator publication 与 home，同进程可 B→S→B→S |
+| learned policy run | `python examples/run_policy.py run <experiment>` | 连接并控制 xArm7/XHand；每个 episode 都需 H 完成 hand + collision-checked arm home，再以新 B 启动，S 后同进程回到 ARMED |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |
@@ -184,14 +183,18 @@ python examples/collect_teleop.py --print-config
 
 ### Learned policy 实时点云
 
-部署配置的 `observation_fields` 包含 `point_cloud` 时，lifecycle 才启动 camera 与独立
+完整的 experiment 选择、`list/check/shadow/run` 边界、按键流程和诊断说明见
+[`docs/policy_deployment.md`](docs/policy_deployment.md)。其中 `list` 与 `check` 不连接硬件；
+`shadow` 虽然禁止 actuator publication，仍会连接相机、xArm 和 XHand，必须按硬件流程处理。
+
+`PolicySpec.sensor_modalities` 包含 `point_cloud` 时，lifecycle 才启动 camera 与独立
 point-cloud worker。worker 始终读取最新的 depth-to-color aligned RGB-D，旧帧不会排队；inference 仅在
 当前 RUNNING epoch 之后的点云 T 历史窗完整时才推理。窗口以因果截点前最新已过去的控制 tick 为末端，按策略控制网格选取严格递增、
 不重复的 camera frame；每帧不得晚于对应逻辑 tick，lag 不超过 `max_grid_lag_s`，且跨帧
 `camera_generation` 一致。每个点云均因果配对到不晚于它、并处于
 `max_observation_skew_s` 内的 arm/hand 状态，不插值、填充或复用旧 run 数据。每帧为 xArm-base
 `float32 (N, 6)`，列语义为 `xyzrgb`，RGB 范围为 `[0,1]`。`pointcloud_num_points` 只允许
-`1024`、`2048`、`4096`、`8192`，部署时必须与 artifact 和 Real runtime 精确一致。
+`1024`、`2048`、`4096`、`8192`，部署时必须与 PolicySpec 和 Real runtime 精确一致。
 
 coordinator 将通过安全门的策略 endpoint 原子写为单条 coupled command，并立即返回，不在控制热路径
 等待 worker 握手。ring sequence 是实际的传输 epoch；arm/hand worker 在各自 SDK 边界复核同一个
@@ -209,44 +212,18 @@ workspace 当前为 x `[0.0,0.8]`、y `[-0.5,0.5]`、z `[0.0,0.8]` m；体素 RG
 aligned 像素 RGB 的均值。processed HDF5 和 Policy Zarr 同时保存并校验算法、配置 SHA-256
 与桌面平面身份，禁止混合不同点云语义的数据。
 
-deployment lifecycle 从 resolved runtime 直接投影实时 worker 的完整点云配置，并将同一
-policy ID、采样/变换语义、配置哈希和桌面平面写入模型数据合同；worker 启动日志输出这些身份，
-不存在独立的生产参数副本或旧策略兼容分支。
+deployment lifecycle 从 Policy public API 取得只读 `PolicySpec`，Real 仅验证固定硬件兼容：
+`joint_state + point_cloud` 模态、19/21D control action、XHand、控制周期、点数、6D xyzrgb feature
+和 IPC chunk capacity。checkpoint/Hydra/EMA/normalizer/denoise 配置及 strict restore 全部由
+`dexmani_policy.deployment.load_experiment()` 拥有；Real adapter 只转换 NumPy observation/action。
+inference worker 完成 restore、warmup 和延迟窗口检查后才置 ready，lifecycle 才允许启动其余
+hardware workers。内部只传播 `execute: bool`：`False` 走完整 candidate validation 后返回，
+不会调用 publication；`True` 发布同一 generation/ticket 的 arm + hand command，并要求两个 worker
+在 Real-owned ACK timeout 内都确认，否则进入 FAULT。日常 inference seed 固定为 0，XHand 需求由
+`PolicySpec.requires_hand` 决定，不由 CLI 重复声明。
 
-示例 deployment YAML：
-
-```yaml
-deployment:
-  checkpoint: /path/to/checkpoints/best.pt
-  task_name: pick               # 须与训练数据合同 task_name 精确一致
-  action_key: action            # action | action_ee（须与 checkpoint 一致）
-  hand_enabled: true
-  observation_fields: arm_qpos,hand_qpos,point_cloud
-  observation_horizon: 2        # 须与 checkpoint n_obs_steps 一致
-  pointcloud_num_points: 2048
-  max_grid_lag_s: 0.08
-  max_source_to_command_age_s: 0.75
-  command_lead_s: 0.01
-  inference_seed: 1066
-```
-
-runtime 实现固定为 Real-owned `DexManiPolicyRuntime`，不能由 YAML 重定向；checkpoint、task、
-action、observation 与点云字段在 YAML 中只是 artifact expectation。新 CLI 用 `inspect/check/shadow`
-的 `--device` 与 `--seed` 表达离线/影子意图；`h4/run` 的 device、seed 和 bounds 只来自 strict
-physical profile。旧 flat `--print-config/--preflight-only/--execution-mode/--inference-seed` 调用已移除。
-
-`dexmani_policy` 部署只接受包含 resolved inference config、完整 `train_params` 和训练数据合同的
-自描述 checkpoint。训练数据必须是 Real Policy Zarr v5，且 `task_name`、`dt`、
-`obs[t]_before_action[t]`、camera-source state alignment、观测 skew、动作 endpoint 限速、
-点云 shape/算法/配置哈希与桌面平面必须和本次 realtime worker 完全一致；Sim、旧 schema 或
-provenance 缺失均拒绝启动。
-EMA 选择和 denoise steps 从 checkpoint 内嵌配置读取。部署不加载训练 dataset 或 sim
-`env_runner`，当前也不启用 env-runner temporal ensemble。
-
-当前 frozen deployment artifact 已通过 Real-owned decoder、strict restore 与硬件部署链路验证；
-它不是所有 `dexmani_policy` checkpoint 的通用兼容承诺。未来 Policy 分支的 additive contract
-变更仍按 [`docs/policy_deployment.md`](docs/policy_deployment.md) 的跨仓合并条件独立 review，
-不能改变已训练 sim checkpoint 的读取与评测语义。
+coordinator 每秒输出 live metrics，并在每个 B→停止/中止/故障边界输出一条 compact episode
+summary。summary 只是在内存中累计的调试信息，不写 receipt、sidecar 或资格证明文件。
 
 点云缺失、过期、shape/dtype 错误、非有限值或颜色越界时 inference fail closed，不发布
 新的 plan。实时路径当前仅支持静态 `eye_to_hand` 标定；`eye_in_hand` 需要另行建立与

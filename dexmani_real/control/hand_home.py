@@ -44,9 +44,9 @@ def publish_hand_home_and_wait_applied(
 
     The configured endpoint must lie inside both the operational command box
     and the rated mechanical box. Success means the worker accepted the exact
-    home endpoint. Measured qpos is deliberately
-    not compared with the target because contact and steady-state position
-    error are valid.
+    home endpoint. Measured qpos must be healthy and fresh, but it is neither
+    required to lie inside command bounds nor compared with the target because
+    encoder zero offsets, contact, and steady-state position error are valid.
     """
     if not np.isfinite(timeout_s) or timeout_s <= 0.0:
         raise ValueError(
@@ -69,8 +69,6 @@ def publish_hand_home_and_wait_applied(
             "hand home rejected by runtime gate: %s", runtime_rejection.reason
         )
         return False
-    mechanical_lower = np.asarray(mechanical_lower_rad, dtype=np.float64)
-    mechanical_upper = np.asarray(mechanical_upper_rad, dtype=np.float64)
     deadline_s = time.monotonic() + timeout_s
     hand_feedback, feedback_rejection = read_hand_feedback(
         shared, None, hand_feedback_max_age_s=hand_feedback_max_age_s
@@ -79,14 +77,8 @@ def publish_hand_home_and_wait_applied(
         logger.warning("hand home rejected: %s", feedback_rejection.reason)
         return False
     assert hand_feedback is not None
-    measured_qpos = hand_feedback.qpos
-    if np.any(measured_qpos < mechanical_lower - 1e-12) or np.any(
-        measured_qpos > mechanical_upper + 1e-12
-    ):
-        logger.warning(
-            "hand home rejected: measured hand qpos violates mechanical limits"
-        )
-        return False
+    # Feedback must be healthy, but its measured angle is not an outgoing
+    # command.  Encoder zero offsets must not block a legal home target.
 
     runtime_rejection = check_runtime_gate(shared, check_is_running=check_is_running)
     if runtime_rejection is not None:

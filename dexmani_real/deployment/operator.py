@@ -3,11 +3,11 @@
 Runs as a daemon thread in the Main process.  B/S/Q/ESC translate to the shared
 request flags the coordinator and supervisor already consume (``start_request``,
 ``stop_request``, ``quit_requested``, ``estop_request``). When a caller owns a
-home lifecycle, H orchestrates a collision-checked return-home — stop the run
-if RUNNING, hand home, then arm home — using a Main-process planner that mirrors
-the replay collision setup (hand-dof + table + static boxes). Physical policy
-profiles supply that lifecycle; shadow keeps H disabled. The keyboard owns
-the emergency-stop latch:
+home lifecycle, H orchestrates a collision-checked hand + arm return-home from
+ARMED using a Main-process planner that mirrors the replay collision setup
+(hand-dof + table + static boxes). Physical policy publication sessions require
+that lifecycle before every episode; validate-only sessions keep H disabled. The
+keyboard owns the emergency-stop latch:
 ESC (or a dead listener) sets ``estop_request`` regardless of thread state, so
 e-stop never depends on this loop being scheduled.
 """
@@ -15,14 +15,12 @@ e-stop never depends on this loop being scheduled.
 from __future__ import annotations
 
 import threading
-import time
 
 import numpy as np
 
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
 from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
 from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
-from dexmani_real.deployment.config import DeploymentConfig
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import (
     Pose,
@@ -41,11 +39,12 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 _POLL_S = 0.05
-_HOME_WAIT_ARMED_TIMEOUT_S = 5.0
 
 
 def _request_immediate_stop(shared: RuntimeChannels) -> None:
     """Fence live motion when S/Q arrives while this thread is blocked by H."""
+    shared.start_request.value = False
+    shared.physical_home_completed.value = False
     shared.stop_request.value = int(StopRequest.OPERATOR)
     try:
         state = SafetyState(int(shared.safety_state.value))
@@ -53,8 +52,8 @@ def _request_immediate_stop(shared: RuntimeChannels) -> None:
         shared.error_state.value = True
         return
     # Do not convert an incompletely initialized DISARMED runtime into ARMED.
-    # H only runs from ARMED; a generation bump there makes the arm worker stop
-    # its blocking home request, while RUNNING stops a policy command promptly.
+    # A generation bump in ARMED makes the arm worker stop a blocking home
+    # request, while a RUNNING revocation stops a policy command promptly.
     if state in {SafetyState.ARMED, SafetyState.RUNNING} and not revoke_motion(
         shared, SafetyState.ARMED
     ):
@@ -100,65 +99,44 @@ def build_home_planner(runtime: ResolvedRuntimeConfig) -> XArm7MotionPlanner:
     )
 
 
-def _stop_to_armed(
-    shared: RuntimeChannels,
-    *,
-    abort_requested,
-) -> bool:
-    """Stop a RUNNING run and wait for the coordinator to return to ARMED."""
-    if int(shared.safety_state.value) != int(SafetyState.RUNNING):
-        return int(shared.safety_state.value) == int(SafetyState.ARMED)
-    shared.stop_request.value = int(StopRequest.OPERATOR)
-    deadline = time.monotonic() + _HOME_WAIT_ARMED_TIMEOUT_S
-    while time.monotonic() < deadline:
-        if abort_requested():
-            return False
-        if int(shared.safety_state.value) == int(SafetyState.ARMED):
-            return True
-        time.sleep(_POLL_S)
-    logger.warning("operator: coordinator did not reach ARMED for home")
-    return False
-
-
 def _home(
     shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
-    deployment: DeploymentConfig,
     planner: XArm7MotionPlanner,
     *,
     abort_requested,
 ) -> bool:
-    """Stop the run, home hand + arm, and report full-sequence completion."""
-    if not _stop_to_armed(shared, abort_requested=abort_requested):
+    """Home hand + arm from ARMED and report full-sequence completion."""
+    if int(shared.safety_state.value) != int(SafetyState.ARMED):
+        logger.warning("operator: home requires ARMED; press S before H")
         return False
     if abort_requested():
         return False
     arm_config = ArmLoopConfig.from_runtime(runtime)
 
-    if deployment.hand_enabled:
-        hand_home = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
-        accepted = publish_hand_home_and_wait_applied(
-            shared,
-            hand_home,
-            command_lower_rad=np.asarray(runtime.hand.qpos_min_rad, dtype=np.float64),
-            command_upper_rad=np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64),
-            mechanical_lower_rad=np.asarray(
-                runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
-            ),
-            mechanical_upper_rad=np.asarray(
-                runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
-            ),
-            hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
-            timeout_s=float(runtime.hand.home_command_ack_timeout_s),
-            heartbeat=False,
-            check_is_running=True,
-            verbose=True,
-            abort_requested=abort_requested,
-        )
-        if not accepted:
-            logger.warning("operator: hand home not accepted; arm home skipped")
-            return False
-        planner.set_hand_qpos(hand_home)
+    hand_home = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
+    accepted = publish_hand_home_and_wait_applied(
+        shared,
+        hand_home,
+        command_lower_rad=np.asarray(runtime.hand.qpos_min_rad, dtype=np.float64),
+        command_upper_rad=np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64),
+        mechanical_lower_rad=np.asarray(
+            runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
+        ),
+        mechanical_upper_rad=np.asarray(
+            runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
+        ),
+        hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
+        timeout_s=float(runtime.hand.home_command_ack_timeout_s),
+        heartbeat=False,
+        check_is_running=True,
+        verbose=True,
+        abort_requested=abort_requested,
+    )
+    if not accepted:
+        logger.warning("operator: hand home not accepted; arm home skipped")
+        return False
+    planner.set_hand_qpos(hand_home)
 
     result = execute_arm_home(
         shared,
@@ -178,11 +156,10 @@ def _home(
 def run_operator_control(
     shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
-    deployment: DeploymentConfig,
     planner: XArm7MotionPlanner | None,
     *,
     stop_event: threading.Event,
-    execution_mode: str,
+    execute: bool,
 ) -> None:
     """Keyboard thread target: map operator keys to shared flags / home.
 
@@ -191,8 +168,10 @@ def run_operator_control(
     planner. The thread exits when *stop_event*
     is set, when the runtime stops, or after a terminal Q/ESC.
     """
-    if execution_mode not in {"shadow", "execute", "task"}:
-        raise ValueError("execution_mode must be 'shadow', 'execute', or 'task'")
+    if not isinstance(execute, bool):
+        raise TypeError("execute must be a boolean")
+    if execute != (planner is not None):
+        raise ValueError("execute must match physical home availability")
     keyboard = KeyboardHandler(
         estop_callback=lambda: setattr(shared.estop_request, "value", True),
         stop_callback=lambda: _request_immediate_stop(shared),
@@ -209,7 +188,6 @@ def run_operator_control(
         shared.error_state.value = True
         return
     try:
-        home_attempted = False
         while not stop_event.is_set() and shared.is_running.value:
             if keyboard.estop_latched or not keyboard.healthy:
                 shared.estop_request.value = True
@@ -218,7 +196,9 @@ def run_operator_control(
             # this thread while the arm moves, so begin events from the same
             # drained batch must not survive a successful home sequence.
             discard_begin_in_batch = False
-            for signal in keyboard.poll(timeout=_POLL_S):
+            signals = keyboard.poll(timeout=_POLL_S)
+            stop_in_batch = ControlSignal.STOP in signals
+            for signal in signals:
                 if signal is ControlSignal.BEGIN:
                     if planner is not None and (
                         discard_begin_in_batch
@@ -231,26 +211,33 @@ def run_operator_control(
                         continue
                     shared.start_request.value = True
                 elif signal is ControlSignal.STOP:
+                    shared.start_request.value = False
+                    shared.physical_home_completed.value = False
                     shared.stop_request.value = int(StopRequest.OPERATOR)
                 elif signal is ControlSignal.HOME:
                     if planner is None:
                         logger.warning("operator: H is disabled in policy deployment")
                         continue
-                    if home_attempted:
+                    if int(shared.safety_state.value) != int(SafetyState.ARMED):
+                        shared.physical_home_completed.value = False
+                        logger.warning("operator: ignored H unless safety is ARMED")
+                        continue
+                    if stop_in_batch:
                         logger.warning(
-                            "operator: ignored H after the physical home sequence "
-                            "was already attempted in this process"
+                            "operator: ignored H received in the same batch as S"
                         )
                         continue
-                    home_attempted = True
                     # B may have been received before H in this same polling
                     # batch.  It cannot authorize a run that follows home.
                     shared.start_request.value = False
                     shared.physical_home_completed.value = False
+                    # A prior S remains as a coordinator request until B.  Once
+                    # ARMED, it is stale and must not cancel the next H; a new S
+                    # still revokes the home generation from its callback.
+                    shared.stop_request.value = int(StopRequest.NONE)
                     completed = _home(
                         shared,
                         runtime,
-                        deployment,
                         planner,
                         abort_requested=lambda: bool(
                             stop_event.is_set()
@@ -261,16 +248,27 @@ def run_operator_control(
                             or int(shared.stop_request.value) != int(StopRequest.NONE)
                         ),
                     )
-                    shared.physical_home_completed.value = bool(completed)
-                    if completed:
+                    authorized = bool(
+                        completed
+                        and shared.is_running.value
+                        and not shared.quit_requested.value
+                        and not shared.error_state.value
+                        and not shared.estop_request.value
+                        and int(shared.stop_request.value) == int(StopRequest.NONE)
+                        and int(shared.safety_state.value) == int(SafetyState.ARMED)
+                    )
+                    # A callback may have fenced motion after _home succeeded;
+                    # never let this assignment resurrect a stale H permit.
+                    shared.physical_home_completed.value = authorized
+                    if authorized:
                         logger.info(
                             "operator: physical home sequence completed; "
                             "press B to start"
                         )
                     else:
                         logger.warning(
-                            "operator: physical home sequence did not complete; "
-                            "B remains disabled for this process"
+                            "operator: physical home sequence did not authorize; "
+                            "B remains disabled for the next episode"
                         )
                     # HOME blocks while hand/arm homing completes. Drop stale
                     # H and B events, but preserve S/Q/ESC so an operator can

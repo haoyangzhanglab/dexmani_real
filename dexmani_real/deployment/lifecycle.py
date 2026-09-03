@@ -3,7 +3,7 @@
 Composes the runtime primitives (``WorkerSpec`` +
 ``build_processes``/``start_processes``/``wait_subsystem_ready``/
 ``run_supervisor``/``shutdown_processes``) into the policy workflow — resolve
-config -> create ``RuntimeChannels`` -> start the artifact-verified inference
+config -> create ``RuntimeChannels`` -> start the Policy-owned inference
 process -> spawn arm (+ optional hand and RGB-D / point-cloud workers) ->
 coordinator -> readiness -> ARMED -> supervise -> verified shutdown. There is
 no second health mechanism: the supervisor's heartbeat/readiness slots already
@@ -13,35 +13,23 @@ There is no VR worker or recorder. The camera worker is included whenever the
 explicit observation contract contains ``point_cloud`` or ``rgb``; the
 point-cloud worker is included only for ``point_cloud``.
 
-Also owns the one-time startup provenance log line (commit hashes +
-checkpoint SHA-256) via ``sha256_file`` and
-``log_deployment_provenance``.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
-import logging
 import multiprocessing as mp
 import os
-import re
 import threading
-from pathlib import Path
 from typing import Any
 
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
 from dexmani_real.deployment.config import (
     FIXED_POLICY_RUNTIME_TARGET,
-    DeploymentConfig,
-    PolicyRuntimeConfig,
+    PolicyWorkerConfig,
+    validate_policy_runtime_compatibility,
 )
 from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_loop
-from dexmani_real.deployment.observation import parse_observation_fields
 from dexmani_real.deployment.operator import build_home_planner, run_operator_control
-from dexmani_real.deployment.run_identity import RealSourceIdentity
-from dexmani_real.deployment.task_diagnostics import TaskDiagnosticsObserver
-from dexmani_real.deployment.task_scene import TaskSceneCard
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.robot.arm_worker import arm_loop
@@ -66,158 +54,23 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+def _requires_pointcloud(policy_spec: Any) -> bool:
+    return "point_cloud" in tuple(policy_spec.sensor_modalities)
 
 
-def _prepare_execute_receipt_dir() -> str:
-    """Create the physical-execution receipt directory before hardware starts."""
-    receipt_dir = Path(
-        os.environ.get(
-            "DEXMANI_RECEIPT_DIR",
-            str(Path.home() / ".dexmani" / "receipts"),
-        )
-    )
-    receipt_dir.mkdir(parents=True, exist_ok=True)
-    if not receipt_dir.is_dir():
-        raise RuntimeError(f"execute receipt path is not a directory: {receipt_dir}")
-    return str(receipt_dir)
-
-
-def _requires_pointcloud(deployment: DeploymentConfig) -> bool:
-    return "point_cloud" in parse_observation_fields(deployment.observation_fields)
-
-
-def _requires_camera(deployment: DeploymentConfig) -> bool:
-    requested = parse_observation_fields(deployment.observation_fields)
+def _requires_camera(policy_spec: Any) -> bool:
+    requested = tuple(policy_spec.sensor_modalities)
     return "point_cloud" in requested or "rgb" in requested
-
-
-def sha256_file(path: str | Path) -> str:
-    """Return the hex SHA-256 of a file's contents ("" when unreadable/missing).
-
-    Best-effort: logs the checkpoint hash "if available"; an
-    unreadable file logs empty rather than failing startup (the verified
-    checkpoint restore is the authoritative check for a bad checkpoint).
-    """
-    try:
-        digest = hashlib.sha256()
-        with Path(path).open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1 << 20), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
-    except OSError:
-        return ""
-
-
-def log_deployment_provenance(
-    logger: logging.Logger,
-    *,
-    deployment: DeploymentConfig,
-    runtime_sha256: str,
-    dexmani_commit: str = "",
-    model_commit: str = "",
-    checkpoint_sha256: str = "",
-) -> None:
-    """Log one structured provenance line (no RuntimeChannels write).
-
-    Provenance is a one-time startup log line, never a shared-memory payload:
-    the full resolved config must not enter high-frequency IPC. Commit hashes
-    are optional; absence logs ``unknown`` rather than fabricating a value.
-    """
-    logger.info(
-        "deployment provenance: dexmani_commit=%s model_commit=%s "
-        "runtime_target=%s device=%s inference_seed=%d observation_fields=%s "
-        "pointcloud_num_points=%d checkpoint=%s "
-        "checkpoint_sha256=%s runtime_sha256=%s",
-        dexmani_commit or "unknown",
-        model_commit or "unknown",
-        FIXED_POLICY_RUNTIME_TARGET,
-        deployment.device,
-        deployment.inference_seed,
-        deployment.observation_fields,
-        deployment.pointcloud_num_points,
-        deployment.checkpoint or "",
-        checkpoint_sha256 or "",
-        runtime_sha256,
-    )
-
-
-def _physical_execute_provenance_json(
-    policy_runtime_config: PolicyRuntimeConfig,
-    *,
-    runtime_sha256: str,
-    real_source: RealSourceIdentity,
-    invocation_argv: tuple[str, ...] | None,
-    projection_sha256: str | None,
-    task_scene_card: TaskSceneCard | None,
-) -> str:
-    """Render the immutable contract recorded by a physical-run receipt."""
-    artifact = policy_runtime_config.artifact
-    if artifact is None:
-        raise ValueError("physical execute requires a resolved policy artifact")
-    if (
-        not isinstance(projection_sha256, str)
-        or _SHA256_RE.fullmatch(projection_sha256) is None
-    ):
-        raise ValueError("physical execute requires a canonical projection SHA-256")
-    execute_bounds = policy_runtime_config.physical_execute_bounds
-    if execute_bounds is None:
-        raise ValueError("physical execute requires explicit bounds")
-    if policy_runtime_config.execution_mode == "task" and task_scene_card is None:
-        raise ValueError("task execute requires a validated task scene card")
-    if policy_runtime_config.execution_mode != "task" and task_scene_card is not None:
-        raise ValueError("only task execute may carry a task scene card")
-    return json.dumps(
-        {
-            "artifact": {
-                "checkpoint_sha256": artifact.checkpoint_sha256_from_index,
-                "checkpoint": artifact.checkpoint_path.name,
-                "index_sha256": artifact.index_sha256,
-            },
-            "invocation_argv": list(invocation_argv or ()),
-            # The inference worker independently verifies that the imported,
-            # clean Policy source exactly matches this artifact-owned contract.
-            "policy_package_contract": {
-                "commit": artifact.producer.commit,
-                "metadata_provenance": artifact.producer.metadata_provenance,
-                "repository": artifact.producer.repository,
-            },
-            "policy_projection": {
-                "bounds": {
-                    "acknowledgement_timeout_s": (
-                        execute_bounds.acknowledgement_timeout_s
-                    ),
-                    "max_published_endpoints": execute_bounds.max_published_endpoints,
-                    "max_running_s": execute_bounds.max_running_s,
-                },
-                "execution_mode": policy_runtime_config.execution_mode,
-                "device": policy_runtime_config.deployment.device,
-                "inference_seed": policy_runtime_config.deployment.inference_seed,
-                "sha256": projection_sha256,
-            },
-            "real_source": {
-                "commit": real_source.commit,
-                "dirty": real_source.dirty,
-                "python_tree_sha256": real_source.python_tree_sha256,
-            },
-            "runtime": {"config_sha256": runtime_sha256},
-            "task_scene_card": (
-                None if task_scene_card is None else task_scene_card.provenance()
-            ),
-        },
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
 
 
 def build_policy_worker_specs(
     shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
-    policy_runtime_config: PolicyRuntimeConfig,
+    policy_spec: Any,
+    worker_config: PolicyWorkerConfig,
     *,
-    execute_receipt_dir: str | None = None,
-    execute_receipt_provenance_json: str | None = None,
+    execute: bool,
 ) -> list[WorkerSpec]:
     """Build the workers required by the explicit deployment contract.
 
@@ -227,22 +80,21 @@ def build_policy_worker_specs(
     ``policy`` control-source slot, the inference worker the new ``inference``
     slot).
     """
-    deployment = policy_runtime_config.deployment
+    validate_policy_runtime_compatibility(policy_spec, runtime)
+    if not isinstance(worker_config, PolicyWorkerConfig):
+        raise TypeError("worker_config must be a PolicyWorkerConfig")
+    if worker_config.spec is not policy_spec:
+        raise ValueError("worker PolicySpec must be the validated lifecycle PolicySpec")
     coordinator_config = CoordinatorConfig.from_runtime(
-        deployment,
         runtime,
-        execution_mode=policy_runtime_config.execution_mode,
-        h4_execute_bounds=policy_runtime_config.h4_execute_bounds,
-        task_execute_bounds=policy_runtime_config.task_execute_bounds,
-        execute_receipt_dir=execute_receipt_dir,
-        execute_receipt_provenance_json=execute_receipt_provenance_json,
+        execute=execute,
     )
-    pointcloud_requested = _requires_pointcloud(deployment)
-    camera_requested = _requires_camera(deployment)
+    pointcloud_requested = _requires_pointcloud(policy_spec)
+    camera_requested = _requires_camera(policy_spec)
     pointcloud_config = (
         PointCloudLoopConfig.from_runtime(
             runtime,
-            num_points=deployment.pointcloud_num_points,
+            num_points=policy_spec.point_cloud_num_points,
         )
         if pointcloud_requested
         else None
@@ -281,7 +133,7 @@ def build_policy_worker_specs(
             WorkerSpec(
                 "inference",
                 inference_loop,
-                (shared, policy_runtime_config),
+                (shared, runtime.policy, worker_config),
                 ready_name="inference",
             ),
             WorkerSpec(
@@ -292,7 +144,7 @@ def build_policy_worker_specs(
             ),
         ]
     )
-    if deployment.hand_enabled:
+    if policy_spec.requires_hand:
         specs.append(
             WorkerSpec(
                 "hand",
@@ -306,106 +158,54 @@ def build_policy_worker_specs(
 
 def run_policy_deployment(
     runtime: ResolvedRuntimeConfig,
-    policy_runtime_config: PolicyRuntimeConfig,
+    policy_spec: Any,
+    worker_config: PolicyWorkerConfig,
+    execute: bool,
     *,
     prefix: str | None = None,
     max_running_s: float | None = None,
-    real_source: RealSourceIdentity | None = None,
-    invocation_argv: tuple[str, ...] | None = None,
-    projection_sha256: str | None = None,
-    task_scene_card: TaskSceneCard | None = None,
 ) -> int:
-    """Run one policy deployment lifecycle and return its exit code.
+    """Run a multi-episode policy deployment lifecycle and return its exit code.
 
-    A frozen ``shadow`` projection, bounded H4 ``execute``, or independently
-    bounded ``task`` projection reaches this lifecycle. The inference worker must load
-    successfully before any hardware process is started. The runtime then
+    ``execute=False`` validates candidates without publication;
+    ``execute=True`` enables coupled arm/hand publication. The inference worker
+    must load successfully before any hardware process is started. The runtime then
     follows ``DISARMED -> hardware readiness -> ARMED -> supervision ->
     verified shutdown``.
     """
-    if not isinstance(policy_runtime_config, PolicyRuntimeConfig):
-        raise TypeError("policy_runtime_config must be a PolicyRuntimeConfig")
-    if policy_runtime_config.execution_mode == "shadow":
-        max_running_s = validate_max_running_s(max_running_s)
-        if policy_runtime_config.h4_execute_bounds is not None:
-            raise ValueError("shadow lifecycle must not carry H4 execute bounds")
-    else:
-        if max_running_s is not None:
-            raise ValueError(
-                "physical execute duration belongs to its immutable bounds"
-            )
-        execute_bounds = policy_runtime_config.physical_execute_bounds
-        if execute_bounds is None:
-            raise ValueError("physical execute lifecycle requires explicit bounds")
-        max_running_s = execute_bounds.max_running_s
-    if policy_runtime_config.execution_mode == "task":
-        if task_scene_card is None:
-            raise ValueError("task lifecycle requires a validated task scene card")
-        artifact = policy_runtime_config.artifact
-        assert artifact is not None
-        task_scene_card.validate_for_task(
-            task_name=artifact.allocation_contract.task_name,
-            max_published_endpoints=(
-                policy_runtime_config.task_execute_bounds.max_published_endpoints
-                if policy_runtime_config.task_execute_bounds is not None
-                else 0
-            ),
-        )
-    elif task_scene_card is not None:
-        raise ValueError("only task lifecycle may carry a task scene card")
-    deployment = policy_runtime_config.deployment
-    if deployment.hand_enabled and not policy_runtime_config.hand_acknowledged:
-        raise ValueError("deployment with hand targets requires --hand")
-    execute_receipt_provenance_json: str | None = None
-    if policy_runtime_config.execution_mode in {"execute", "task"}:
-        if real_source is None or real_source.availability != "available":
-            raise ValueError("physical execute requires resolved Real source identity")
-        if real_source.dirty != "false":
-            raise ValueError("physical execute requires a clean Real source identity")
-        execute_receipt_provenance_json = _physical_execute_provenance_json(
-            policy_runtime_config,
-            runtime_sha256=runtime.sha256,
-            real_source=real_source,
-            invocation_argv=invocation_argv,
-            projection_sha256=projection_sha256,
-            task_scene_card=task_scene_card,
-        )
-    log_deployment_provenance(
-        logger,
-        deployment=deployment,
-        runtime_sha256=runtime.sha256,
-        dexmani_commit=((real_source.commit or "") if real_source is not None else ""),
-        model_commit=(
-            policy_runtime_config.artifact.producer.commit
-            if policy_runtime_config.artifact is not None
-            else ""
-        ),
-        checkpoint_sha256=(
-            sha256_file(deployment.checkpoint) if deployment.checkpoint else ""
-        ),
-    )
-
-    execute_receipt_dir = (
-        _prepare_execute_receipt_dir()
-        if policy_runtime_config.execution_mode in {"execute", "task"}
-        else None
+    if not isinstance(runtime, ResolvedRuntimeConfig):
+        raise TypeError("runtime must be a ResolvedRuntimeConfig")
+    if not isinstance(execute, bool):
+        raise TypeError("execute must be a boolean")
+    validate_policy_runtime_compatibility(policy_spec, runtime)
+    if not isinstance(worker_config, PolicyWorkerConfig):
+        raise TypeError("worker_config must be a PolicyWorkerConfig")
+    if worker_config.spec is not policy_spec:
+        raise ValueError("worker PolicySpec must be the validated lifecycle PolicySpec")
+    max_running_s = validate_max_running_s(max_running_s)
+    logger.info(
+        "policy deployment: experiment=%s runtime=%s device=%s seed=0 execute=%s",
+        worker_config.experiment,
+        FIXED_POLICY_RUNTIME_TARGET,
+        worker_config.device,
+        execute,
     )
 
     ctx = mp.get_context("spawn")
-    pointcloud_requested = _requires_pointcloud(deployment)
-    camera_requested = _requires_camera(deployment)
+    pointcloud_requested = _requires_pointcloud(policy_spec)
+    camera_requested = _requires_camera(policy_spec)
     shared = RuntimeChannels.create(
         prefix=prefix or f"dexmani_policy_{os.getpid()}",
         config=RuntimeChannelsConfig.from_runtime(
             runtime,
-            pointcloud_num_points=deployment.pointcloud_num_points,
+            pointcloud_num_points=policy_spec.point_cloud_num_points,
             camera_requested=camera_requested,
             pointcloud_requested=pointcloud_requested,
-            observation_horizon=deployment.observation_horizon,
-            observation_dt_s=1.0 / float(runtime.policy.control_hz),
-            max_input_age_s=deployment.max_input_age_s,
-            max_observation_skew_s=deployment.max_observation_skew_s,
-            max_grid_lag_s=deployment.max_grid_lag_s,
+            observation_horizon=policy_spec.n_obs_steps,
+            observation_dt_s=float(policy_spec.control_dt_s),
+            max_input_age_s=runtime.policy.max_input_age_s,
+            max_observation_skew_s=runtime.policy.max_observation_skew_s,
+            max_grid_lag_s=runtime.policy.max_grid_lag_s,
         ),
         mp_context=ctx,
     )
@@ -415,16 +215,13 @@ def run_policy_deployment(
     shutdown_report: ShutdownReport | None = None
     operator_thread: threading.Thread | None = None
     operator_stop: threading.Event | None = None
-    diagnostics_observer: TaskDiagnosticsObserver | None = None
-    diagnostics_stopped = False
-    diagnostics_persisted = False
     try:
         specs = build_policy_worker_specs(
             shared,
             runtime,
-            policy_runtime_config,
-            execute_receipt_dir=execute_receipt_dir,
-            execute_receipt_provenance_json=execute_receipt_provenance_json,
+            policy_spec,
+            worker_config,
+            execute=execute,
         )
         procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)
@@ -486,29 +283,11 @@ def run_policy_deployment(
             print(f"  {name}: ready", flush=True)
 
         require_transition(shared, SafetyState.ARMED)
-        if policy_runtime_config.execution_mode == "task":
-            assert execute_receipt_dir is not None and task_scene_card is not None
-            try:
-                diagnostics_observer = TaskDiagnosticsObserver(
-                    shared,
-                    receipt_dir=execute_receipt_dir,
-                    scene_card=task_scene_card,
-                )
-                diagnostics_observer.start()
-            except Exception:
-                # Diagnostics are passive evidence only. A failure here must
-                # not modify control, safety, worker readiness, or the task.
-                diagnostics_observer = None
-                logger.error("task diagnostics observer failed to start", exc_info=True)
         print(
             f"\nAll subsystems ready — safety=ARMED({int(SafetyState.ARMED)})",
             flush=True,
         )
-        home_planner = (
-            build_home_planner(runtime)
-            if policy_runtime_config.execution_mode in {"execute", "task"}
-            else None
-        )
+        home_planner = build_home_planner(runtime) if execute else None
         home_status = "return hand + arm home before B" if home_planner else "disabled"
         print(
             "  [B] start run   [S] stop run   [Q] quit   [ESC] e-stop   "
@@ -519,10 +298,10 @@ def run_policy_deployment(
         operator_stop = threading.Event()
         operator_thread = threading.Thread(
             target=run_operator_control,
-            args=(shared, runtime, deployment, home_planner),
+            args=(shared, runtime, home_planner),
             kwargs={
                 "stop_event": operator_stop,
-                "execution_mode": policy_runtime_config.execution_mode,
+                "execute": execute,
             },
             name="policy-operator",
             daemon=True,
@@ -539,9 +318,7 @@ def run_policy_deployment(
             heartbeat_timeouts_s=dict(runtime.safety.heartbeat_timeouts),
             supervisor_hz=float(runtime.safety.supervisor_hz),
             max_running_s=max_running_s,
-            exit_after_run_stops=(
-                policy_runtime_config.execution_mode in {"execute", "task"}
-            ),
+            exit_after_run_stops=False,
         )
 
         if operator_stop is not None:
@@ -555,25 +332,13 @@ def run_policy_deployment(
                 )
             operator_thread = None
 
-        if diagnostics_observer is not None:
-            diagnostics_stopped = diagnostics_observer.stop()
-
         shutdown_report = shutdown_processes(
             shared,
             started_procs,
             graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
             disarm_if_clean=normal_exit,
         )
-        if diagnostics_observer is not None and diagnostics_stopped:
-            diagnostics_observer.persist()
-            diagnostics_persisted = True
-        execute_completed = bool(shared.execute_completed.value)
         clean_exit = normal_exit and shutdown_report.clean
-        if policy_runtime_config.execution_mode in {"execute", "task"}:
-            # A clean cancellation is operationally safe, but it is not a
-            # successful H4 execute.  Keep the process status unambiguous for
-            # runbooks and any calling automation.
-            clean_exit = clean_exit and execute_completed
         safety_name = (
             SafetyState(shutdown_report.safety_state).name
             if shutdown_report.safety_state is not None
@@ -582,8 +347,7 @@ def run_policy_deployment(
         print(f"\n── Session End ──")
         print(
             f"  exit_reason={exit_reason}  safety={safety_name}  "
-            f"supervisor_normal={normal_exit}  execute_completed={execute_completed}  "
-            f"clean={clean_exit}"
+            f"supervisor_normal={normal_exit}  clean={clean_exit}"
         )
         print("──")
         return 0 if clean_exit else 1
@@ -596,8 +360,6 @@ def run_policy_deployment(
     finally:
         if operator_stop is not None:
             operator_stop.set()
-        if diagnostics_observer is not None and not diagnostics_stopped:
-            diagnostics_stopped = diagnostics_observer.stop()
         operator_alive = False
         if operator_thread is not None:
             operator_thread.join(timeout=float(runtime.safety.shutdown_timeout_s))
@@ -636,9 +398,3 @@ def run_policy_deployment(
                     logger.warning("RuntimeChannels cleanup failed", exc_info=True)
                     shared.error_state.value = True
                     transition(shared, SafetyState.FAULT)
-        if (
-            diagnostics_observer is not None
-            and diagnostics_stopped
-            and not diagnostics_persisted
-        ):
-            diagnostics_observer.persist()

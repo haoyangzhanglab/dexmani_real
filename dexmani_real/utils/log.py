@@ -8,18 +8,14 @@ __all__ = [
     "extract_native_diagnostics",
     "get_logger",
     "ThrottledWarner",
-    "write_json_evidence_manifest",
-    "write_json_receipt",
 ]
 
 import ctypes
-import json
 import logging
 import os
 import sys
 import tempfile
 import time
-import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,62 +71,6 @@ def get_logger(name: str) -> logging.Logger:
             logger.addHandler(file_handler)
     logger.setLevel(logging.DEBUG)
     return logger
-
-
-def _write_json_payload(directory: str | Path, payload: str, *, prefix: str) -> Path:
-    """Atomically persist one already-canonical JSON object under *prefix*."""
-    receipt_dir = Path(directory)
-    receipt_dir.mkdir(parents=True, exist_ok=True)
-    if not receipt_dir.is_dir():
-        raise OSError(f"receipt path is not a directory: {receipt_dir}")
-    destination = receipt_dir / (
-        f"{prefix}_{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex}.json"
-    )
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=receipt_dir,
-            prefix=f".{prefix}_",
-            suffix=".tmp",
-            delete=False,
-        ) as stream:
-            temporary_path = Path(stream.name)
-            stream.write(payload)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_path, destination)
-        return destination
-    except Exception:
-        if temporary_path is not None:
-            try:
-                temporary_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        raise
-
-
-def write_json_receipt(directory: str | Path, payload: str) -> Path:
-    """Atomically persist one already-canonical JSON receipt."""
-    parsed = json.loads(payload)
-    if not isinstance(parsed, dict):
-        raise ValueError("receipt payload must be a JSON object")
-    prefix = (
-        "task_execute"
-        if parsed.get("execution_mode", "execute") == "task"
-        else "h4_execute"
-    )
-    return _write_json_payload(directory, payload, prefix=prefix)
-
-
-def write_json_evidence_manifest(directory: str | Path, payload: str) -> Path:
-    """Atomically persist a post-shutdown H4 evidence manifest."""
-    parsed = json.loads(payload)
-    if not isinstance(parsed, dict):
-        raise ValueError("evidence manifest payload must be a JSON object")
-    return _write_json_payload(directory, payload, prefix="h4_evidence")
 
 
 # ThrottledWarner uses the project logger format for consistent diagnostics.

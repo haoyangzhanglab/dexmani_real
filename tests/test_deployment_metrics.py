@@ -1,251 +1,85 @@
-"""Pure bounded observability and shadow-receipt contracts."""
+"""Offline contracts for bounded learned-policy episode diagnostics."""
 
 from __future__ import annotations
 
-import json
-import tempfile
 import unittest
-from pathlib import Path
+from unittest.mock import patch
 
 from dexmani_real.deployment.metrics import (
+    ENDPOINTS_PUBLISHED,
+    PLAN_AGE_MS,
     Metrics,
-    bounded_execute_run_receipt_json,
-    execute_run_receipt_json,
-    inference_run_receipt_json,
-    shadow_run_receipt_json,
 )
-from dexmani_real.utils.log import write_json_receipt
 
 
 class DeploymentMetricsTest(unittest.TestCase):
-    def test_timing_window_is_bounded_and_uses_nearest_rank_quantiles(self) -> None:
+    def test_debug_flush_preserves_metrics_without_info_output(self) -> None:
         metrics = Metrics()
-        for value in range(260):
-            metrics.observe_timing("inference_ms", float(value))
+        metrics.increment(ENDPOINTS_PUBLISHED)
 
-        snapshot = metrics.snapshot()
-        self.assertEqual(snapshot["inference_ms_samples"], 256)
-        self.assertEqual(snapshot["inference_ms_p50"], 131.0)
-        self.assertEqual(snapshot["inference_ms_p95"], 247.0)
-        self.assertEqual(snapshot["inference_ms_p99"], 257.0)
+        with patch("dexmani_real.deployment.metrics.logger") as logger:
+            metrics.flush(prefix="inference metrics", debug=True)
 
-    def test_flush_resets_interval_counter_but_not_run_receipt_totals(self) -> None:
+        logger.debug.assert_called_once()
+        logger.info.assert_not_called()
+        self.assertEqual(metrics.snapshot()[ENDPOINTS_PUBLISHED], 0)
+
+    def test_episode_counters_and_timings_survive_flush(self) -> None:
         metrics = Metrics()
-        metrics.begin_run()
-        metrics.increment("endpoints_shadow_validated", 2)
-        metrics.observe("plan_age_ms", 5.0)
-        metrics.observe_timing("usable_horizon_ms", 10.0)
+        metrics.begin_episode(generation=3, started_monotonic_ns=1)
+        metrics.increment(ENDPOINTS_PUBLISHED, 2)
+        metrics.observe_timing(PLAN_AGE_MS, 1.0)
+
         metrics.flush()
 
-        self.assertEqual(metrics.snapshot()["endpoints_shadow_validated"], 0)
-        run_snapshot = metrics.run_snapshot()
-        self.assertEqual(run_snapshot["endpoints_shadow_validated"], 2)
-        self.assertEqual(run_snapshot["usable_horizon_ms_samples"], 1)
+        metrics.increment(ENDPOINTS_PUBLISHED)
+        metrics.observe_timing(PLAN_AGE_MS, 5.0)
 
-        metrics.begin_run()
-        self.assertNotIn("plan_age_ms", metrics.run_snapshot())
-        self.assertNotIn("usable_horizon_ms_samples", metrics.run_snapshot())
-        self.assertNotIn("endpoints_shadow_validated", metrics.snapshot())
-
-    def test_shadow_receipt_exposes_zero_write_invariant(self) -> None:
-        receipt = json.loads(
-            shadow_run_receipt_json(
-                run_generation=7,
-                reason="operator stop",
-                coupled_command_start_sequence=13,
-                coupled_command_end_sequence=13,
-                metrics={"endpoints_shadow_validated": 4, "inference_ms_p95": 9.5},
-            )
-        )
-
-        self.assertEqual(receipt["execution_mode"], "shadow")
-        self.assertEqual(receipt["coupled_command_writes"], 0)
-        self.assertTrue(receipt["zero_coupled_command_writes"])
-        self.assertEqual(receipt["metrics"]["endpoints_shadow_validated"], 4)
-
-        violation = json.loads(
-            shadow_run_receipt_json(
-                run_generation=7,
-                reason="shadow coupled-command write detected",
-                coupled_command_start_sequence=13,
-                coupled_command_end_sequence=14,
-                metrics={"shadow_coupled_write_violations": 1},
-            )
-        )
-        self.assertEqual(violation["coupled_command_writes"], 1)
-        self.assertFalse(violation["zero_coupled_command_writes"])
-
-    def test_shadow_receipt_rejects_backward_sequence_and_nonfinite_metric(
-        self,
-    ) -> None:
-        with self.assertRaisesRegex(ValueError, "sequences"):
-            shadow_run_receipt_json(
-                run_generation=1,
-                reason="stop",
-                coupled_command_start_sequence=2,
-                coupled_command_end_sequence=1,
-                metrics={},
-            )
-        with self.assertRaisesRegex(ValueError, "finite"):
-            shadow_run_receipt_json(
-                run_generation=1,
-                reason="stop",
-                coupled_command_start_sequence=2,
-                coupled_command_end_sequence=2,
-                metrics={"inference_ms_p95": float("nan")},
-            )
-
-    def test_inference_receipt_exposes_final_totals_and_explicit_zeroes(self) -> None:
-        receipt = json.loads(
-            inference_run_receipt_json(
-                run_generation=9,
-                reason="run generation advanced",
-                metrics={"plans_created": 98, "inference_ms_p95": 23.5},
-            )
-        )
-
-        self.assertEqual(receipt["worker"], "inference")
-        self.assertEqual(receipt["run_generation"], 9)
-        self.assertEqual(receipt["metrics"]["plans_created"], 98)
-        self.assertEqual(receipt["metrics"]["inference_failures"], 0)
-        self.assertEqual(receipt["metrics"]["plans_generation_dropped"], 0)
-
-    def test_execute_receipt_exposes_one_publication_and_acknowledgement(self) -> None:
-        receipt = json.loads(
-            execute_run_receipt_json(
-                run_generation=8,
-                reason="H4 publication bound reached",
-                coupled_command_start_sequence=20,
-                coupled_command_end_sequence=21,
-                max_published_endpoints=1,
-                acknowledgement_timeout_s=2.0,
-                acknowledged_action_id=41,
-                completed=True,
-                provenance_json=json.dumps(
-                    {
-                        "artifact": {"checkpoint_sha256": "a" * 64},
-                        "real_source": {"commit": "b" * 40, "dirty": "false"},
-                    }
-                ),
-                metrics={
-                    "coupled_command_writes": 1,
-                    "execute_acknowledged": 1,
-                },
-            )
-        )
-
-        self.assertEqual(receipt["execution_mode"], "execute")
-        self.assertEqual(receipt["coupled_command_writes"], 1)
-        self.assertTrue(receipt["within_publication_bound"])
-        self.assertEqual(receipt["acknowledged_action_id"], 41)
-        self.assertTrue(receipt["completed"])
-        self.assertEqual(receipt["outcome"], "completed")
+        self.assertEqual(metrics.snapshot()[ENDPOINTS_PUBLISHED], 1)
         self.assertEqual(
-            receipt["provenance"]["artifact"]["checkpoint_sha256"], "a" * 64
-        )
-        self.assertEqual(receipt["provenance"]["real_source"]["dirty"], "false")
-
-    def test_execute_receipt_rejects_non_h4_bound(self) -> None:
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            execute_run_receipt_json(
-                run_generation=8,
-                reason="stop",
-                coupled_command_start_sequence=20,
-                coupled_command_end_sequence=20,
-                max_published_endpoints=2,
-                acknowledgement_timeout_s=2.0,
-                acknowledged_action_id=None,
-                completed=False,
-                metrics={},
-            )
-
-    def test_task_receipt_exposes_multiple_acknowledged_publications(self) -> None:
-        receipt = json.loads(
-            bounded_execute_run_receipt_json(
-                execution_mode="task",
-                run_generation=9,
-                reason="task publication bound reached",
-                coupled_command_start_sequence=4,
-                coupled_command_end_sequence=324,
-                max_published_endpoints=320,
-                acknowledgement_timeout_s=2.0,
-                acknowledged_action_id=320,
-                completed=True,
-                metrics={"execute_acknowledged": 320},
-            )
+            metrics.episode_snapshot(),
+            {
+                ENDPOINTS_PUBLISHED: 3,
+                f"{PLAN_AGE_MS}_samples": 2,
+                f"{PLAN_AGE_MS}_p50": 1.0,
+                f"{PLAN_AGE_MS}_p95": 5.0,
+                f"{PLAN_AGE_MS}_p99": 5.0,
+            },
         )
 
-        self.assertEqual(receipt["execution_mode"], "task")
-        self.assertEqual(receipt["coupled_command_writes"], 320)
-        self.assertTrue(receipt["within_publication_bound"])
-        self.assertTrue(receipt["completed"])
+    def test_episode_timing_summary_is_bounded(self) -> None:
+        metrics = Metrics()
+        metrics.begin_episode(generation=3, started_monotonic_ns=1)
 
-    def test_bounded_receipt_preserves_a_validated_monotonic_timeline(self) -> None:
-        receipt = json.loads(
-            bounded_execute_run_receipt_json(
-                execution_mode="execute",
-                run_generation=9,
-                reason="H4 publication bound reached",
-                coupled_command_start_sequence=4,
-                coupled_command_end_sequence=5,
-                max_published_endpoints=1,
-                acknowledgement_timeout_s=2.0,
-                acknowledged_action_id=1,
-                completed=True,
-                metrics={},
-                timeline_monotonic_ns={
-                    "run_started": 10,
-                    "first_publication": 20,
-                    "receipt_emitted": 30,
-                },
-            )
+        for value in range(300):
+            metrics.observe_timing(PLAN_AGE_MS, float(value))
+
+        summary = metrics.episode_snapshot()
+        self.assertEqual(summary[f"{PLAN_AGE_MS}_samples"], 256)
+        self.assertEqual(summary[f"{PLAN_AGE_MS}_p50"], 171.0)
+        self.assertEqual(summary[f"{PLAN_AGE_MS}_p95"], 287.0)
+        self.assertEqual(summary[f"{PLAN_AGE_MS}_p99"], 297.0)
+
+    def test_episode_summary_logs_once_without_receipt_artifact(self) -> None:
+        metrics = Metrics()
+        metrics.begin_episode(generation=7, started_monotonic_ns=1)
+        metrics.increment(ENDPOINTS_PUBLISHED)
+
+        with patch("dexmani_real.deployment.metrics.logger") as logger:
+            metrics.log_episode_summary(status="STOPPED", reason="operator stop")
+            metrics.log_episode_summary(status="STOPPED", reason="operator stop")
+
+        logger.info.assert_called_once()
+        message, generation, status, reason, duration_s, rendered = (
+            logger.info.call_args.args
         )
-        self.assertEqual(receipt["timeline_monotonic_ns"]["first_publication"], 20)
-        with self.assertRaisesRegex(ValueError, "timeline event values"):
-            bounded_execute_run_receipt_json(
-                execution_mode="execute",
-                run_generation=9,
-                reason="invalid timeline",
-                coupled_command_start_sequence=4,
-                coupled_command_end_sequence=4,
-                max_published_endpoints=1,
-                acknowledgement_timeout_s=2.0,
-                acknowledged_action_id=None,
-                completed=False,
-                metrics={},
-                timeline_monotonic_ns={"run_started": True},
-            )
-
-    def test_task_receipt_uses_a_distinct_filename(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = write_json_receipt(
-                directory, '{"execution_mode":"task","outcome":"completed"}'
-            )
-            self.assertTrue(path.name.startswith("task_execute_"))
-
-    def test_task_receipt_cannot_claim_completion_below_its_bound(self) -> None:
-        with self.assertRaisesRegex(ValueError, "bounded publication count"):
-            bounded_execute_run_receipt_json(
-                execution_mode="task",
-                run_generation=9,
-                reason="incorrect completion",
-                coupled_command_start_sequence=4,
-                coupled_command_end_sequence=5,
-                max_published_endpoints=2,
-                acknowledgement_timeout_s=2.0,
-                acknowledged_action_id=1,
-                completed=True,
-                metrics={},
-            )
-
-    def test_h4_receipt_is_written_as_one_json_file(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = write_json_receipt(directory, '{"outcome":"completed"}')
-            self.assertEqual(path.parent, Path(directory))
-            self.assertEqual(
-                json.loads(path.read_text(encoding="utf-8")), {"outcome": "completed"}
-            )
+        self.assertIn("episode summary", message)
+        self.assertEqual(generation, 7)
+        self.assertEqual(status, "STOPPED")
+        self.assertEqual(reason, "operator stop")
+        self.assertGreaterEqual(duration_s, 0.0)
+        self.assertIn(f"{ENDPOINTS_PUBLISHED}=1", rendered)
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     unittest.main()

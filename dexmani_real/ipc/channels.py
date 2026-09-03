@@ -363,9 +363,6 @@ class RuntimeChannels:
     physical_home_completed: Any
     # Main -> coordinator: StopRequest code (S or an explicit run-time limit).
     stop_request: Any
-    # Coordinator -> lifecycle: true only after the single H4 command was
-    # acknowledged by both workers before its deadline.
-    execute_completed: Any
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write
     # Serializes the motion permit and coupled-command ticket state. It is
@@ -535,7 +532,6 @@ class RuntimeChannels:
         storage.start_request = ctx.Value("b", False)
         storage.physical_home_completed = ctx.Value("b", False)
         storage.stop_request = ctx.Value("b", False)
-        storage.execute_completed = ctx.Value("b", False)
 
         storage.safety_state = ctx.Value("i", int(cfg.initial_safety_state))
         storage.motion_lock = ctx.RLock()

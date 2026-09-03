@@ -1,446 +1,124 @@
-# DexMani Policy 部署与推理
+# Learned-policy experiment workflow
 
-`examples/run_policy.py` 是 learned-policy 部署的唯一操作者入口。本文件是 Real 侧策略部署的
-唯一说明：从 artifact 到 robot command 的数据链、支持边界、物理执行门、验证记录，以及未来
-`dexmani_policy` 合并条件均以此为准。源码、schema 和运行时配置优先于本文。
+本文说明 DexMani Policy experiment 在 DexMani Real 中的检查、shadow 和物理运行流程。
+运行行为和安全边界以源码、`PolicySpec` 与 Real runtime config 为准。
 
-> R1 集成基线：Policy handoff 语义已在 `aa4a0a39dd5a69e3a4ad85ea8190d6889610d175`
-> 接受；当前只读 Policy `main` 是后续仅增加文档的
-> `5994037`。Real R1 已以 `fd8195f757f341f99a50f232bf59820a0fb15ec6` merge/reviewed。
-> handoff receipt 中的 representative
-> artifact producer 仍是 `fc6b7dfb45748f4187f2e82b5425721ed02b028e`。下文 H2/H3、H4
-> 和 task rollout 是 full-future executable semantics 下产生的 pre-R1 历史证据，不能授权
-> R1 后的物理执行。物理任务能力仍未验证。
+## 1. 边界与前提
 
-## 1. 状态、范围与所有权
+Policy 仓库拥有 experiment 解析、checkpoint 选择、模型构造、EMA/normalizer 恢复和推理；
+Real 仓库拥有传感器、因果 observation、控制时序、共享内存、SafetyGate、命令发布和设备 ACK。
+Real 不解析 Policy checkpoint，也不复制模型 shape、history 或 action horizon。
 
-| 项目 | 当前结论 |
+一个可部署 experiment 可以使用已有目录，或短 selector：
+
+```text
+policy/task/experiment
+```
+
+该目录必须包含 `config.yaml`，以及固定 selector
+`checkpoints/deployment_latest.pt`。没有隐式 `latest` experiment 或时间戳猜测。
+当前 Real 端只接受 `joint_state + point_cloud`、xArm7 + XHand，以及兼容的控制周期、
+点数、xyzrgb feature 和 IPC chunk 大小。
+
+## 2. 从离线检查到真机
+
+先在 Real 仓库列出 experiment：
+
+```bash
+python examples/run_policy.py list
+python examples/run_policy.py list <filter>
+```
+
+`list` 只做 Policy 文件系统发现，不加载 Torch、checkpoint 或硬件 SDK。
+
+再严格恢复并执行合成 observation smoke test：
+
+```bash
+python examples/run_policy.py check <experiment> --device cuda:0
+```
+
+`check` 验证 checkpoint restore、normalizer、warmup 和 prediction，不连接机器人或相机。
+无 GPU 的开发机可显式使用 `--device cpu` 做离线检查；这不能替代目标 GPU 的时延验证。
+
+以下两个命令都会进入真实设备 lifecycle：
+
+```bash
+python examples/run_policy.py shadow <experiment> [--config runtime.yaml]
+python examples/run_policy.py run <experiment> [--config runtime.yaml]
+```
+
+- `shadow` 连接相机、xArm 与 XHand feedback，运行 inference、IK 和 SafetyGate，但
+  `execute=False` 从结构上禁止 actuator publication，也禁用 H/home。
+- `run` 连接并控制 xArm/XHand；只有它设置 `execute=True`，并要求 coupled arm/hand
+  publication 与两个 worker 的同 ticket ACK。
+
+`shadow` 不是纯离线命令。首次真机回归必须人工确认连接阶段 arm 与 XHand 均不运动，
+再用 B/S 执行短 episode，并确认没有 actuator SDK command。
+
+## 3. Readiness 与操作者流程
+
+inference child 先 strict restore、warmup 并检查可用 action window。只有它 ready 后，
+lifecycle 才启动硬件 workers；任何模型加载失败都会在硬件连接前 fail closed。
+其余 workers ready 后系统从 DISARMED 进入 ARMED。
+
+按键语义：
+
+| 按键 | 行为 |
 |---|---|
-| checkpoint restore、normalizer、GPU inference | 已通过 strict restore、CUDA preflight 与真实运行验证。 |
-| H2/H3 shadow | 已通过；不发布策略动作。 |
-| H4 one-endpoint execute | 已通过一次；不代表 task rollout 授权。 |
-| task command path | 两次均完成 331 次 coupled publication/ACK 与 clean shutdown。 |
-| 真实 pick/place | 未验证成功；暂停新的 task rollout，先补只读诊断。 |
+| `B` | 从 ARMED 开始一个新 episode；推进 generation。 |
+| `S` | 立即撤销当前 motion permit，结束 episode 并回到 ARMED。 |
+| `H` | 仅 `run` 可用；在 ARMED 中执行 XHand home 与 collision-checked arm home。 |
+| `Q` | 结束 session 并执行有界 shutdown。 |
+| `ESC` | 锁存 emergency stop/fault。 |
 
-职责边界保持简单且单向：
+物理 `run` 中，每个 episode 都需要新的 `H → B`：H 成功只授权下一次新鲜 B，B 开始后
+授权立即消费。S 后可以在同一进程再次 H→B；旧 generation 的 plan、ticket 和 command
+不会进入新 episode。不要把 H 与 B 放在同一批键盘输入中。
 
-| Owner | 负责 | 不负责 |
-|---|---|---|
-| `dexmani_policy` | agent class、训练/仿真、checkpoint 内嵌模型状态和 normalizer | Real hardware、lifecycle、SafetyGate、IPC、receipt |
-| `dexmani_real` | artifact 解析、strict restore、观测适配、命令验证/发布、workers 和物理生命周期 | 修改训练数据、sim checkpoint 或 Policy eval 语义 |
-| 操作者 | inspect/check/shadow 的显式 CLI 选择、strict physical profile、物理现场确认、H/B/S/ESC/e-stop | 绕过 runtime 的 contract 或安全门 |
+推荐逐级真机验证：
 
-模型输出始终只是 proposal。inference worker 不能写 `coupled_cmd_ring`；coordinator 是 learned
-policy 唯一的 robot-command producer。
+1. `shadow` 启动并人工确认 startup no-motion。
+2. `shadow` 中 B→S，确认 arm/hand 均零发布。
+3. `run` 中 H→短 B→S，观察 SafetyGate、coupled ticket 和双 ACK。
+4. 同进程重复 H→B→S，确认每个 episode 都需要 home 且 generation 前进。
+5. 在安全条件下验证 S、Q、ESC；不要故意制造危险硬件故障。
 
-## 2. 固定 reference 与 artifact 合同
+## 4. 配置与因果 observation
 
-当前验证使用：
-
-| 字段 | 值 |
-|---|---|
-| experiment | `/home/zhanghaoyang/Desktop/dexmani_policy/experiments/dp3/pick_place_toy/2026-08-28_13-59_42` |
-| checkpoint | `epoch=1126-step=00080000-pr3-fc6b7df-deployment-v2.pt` |
-| checkpoint SHA-256 | `28ff79a6ca5d5b746bbde877ff96abbb88543539f4c73ef554348184f446effc` |
-| Policy producer commit | `fc6b7dfb45748f4187f2e82b5425721ed02b028e` |
-| action | 19-D absolute joint target：arm 7 + hand 12 |
-| observation | 2 steps of arm/hand state and `1024 × 6` xyzrgb point cloud |
-| control | `16 Hz`、horizon 16；15-step prediction future、8-step executable control |
-
-当前 artifact 的 sidecar 是 schema v1，因而 v1 parser 不是可删除的历史兼容分支。schema v2
-承载 `control_action_dim`、auxiliary action layout 和 RGB payload；它是 RGB/R3D 未来 artifact 的
-明确合同，也必须保留。两种 schema 都 fail closed，不猜测缺失字段。
-
-训练窗口与 Real runtime 的含义不同：
+Real 配置优先级固定为：
 
 ```text
-pad_before = n_obs_steps - 1
-pad_after  = n_action_steps - 1
-padding_semantics = repeat_edge
+CLI override > YAML file > dexmani_real/config/defaults.py
 ```
 
-当前实例为 `1/7`，但 Real 在 B 后仍必须收集两个不同、因果有效的 observation；不得用 B 前、
-上一 generation 或旧点云填充 history。
+inference rate、input freshness、observation skew、plan age、command lead、ACK timeout 和
+watchdog 都属于 `ResolvedRuntimeConfig.policy`。模型 action/observation shape、history、
+horizon 和 `control_dt_s` 只来自 Policy `PolicySpec`；lifecycle 启动前必须与 Real 配置精确兼容。
 
-## 3. 从 checkpoint 到动作的完整链路
+point-cloud observation 保留 `source <= publish <= anchor`、run-start 下界、camera generation、
+最大 age/skew、控制网格选择和 logical-grid advance。缺帧、过期、shape/dtype 错误、非有限值
+或颜色越界时不会推理或发布新 plan；这些门禁不能为提高运行通过率而放宽。
 
-```text
-experiment directory + sidecar
-    → immutable artifact/runtime projection
-    → isolated inference worker
-    → verified checkpoint decode + strict agent restore
-    → causal observation batch
-    → GPU prediction / PolicyPrediction
-    → timed policy plan
-    → coordinator validation and scheduling
-    → shadow validation or coupled command publication
-    → arm/hand worker acknowledgement
-```
+## 5. 运行诊断与失败语义
 
-### 3.1 CLI 与 side-effect boundary
+inference 和 coordinator 周期性输出 observation age/skew、inference、plan age、usable
+horizon、plan/drop、endpoint、SafetyGate/IK reject 与 ACK latency/failure 等 live metrics。
+coordinator 在每个 episode 结束时另输出一条 `episode summary`，包含 generation、状态、原因、
+duration、累计 counters 和固定容量 timing quantiles。
 
-入口仅转交 package CLI。无 subcommand 时打印简短 help、返回 0，且不导入 Torch、Policy、
-lifecycle 或 hardware owner，也不创建 session log。
+这些 summary 是 log-only experiment diagnostics：不落盘、不做 hash、不生成 receipt、sidecar
+或部署资格证明。是否允许运动仍只由当前 safety state、generation、freshness、SafetyGate、
+worker validation 和 ACK 决定。
 
-| command | Torch/GPU | hardware connection | learned coupled writes |
-|---|---:|---:|---:|
-| `inspect EXP` | no | no | no |
-| `check EXP --device ... --seed ... --benchmark-samples N` | yes | no | no |
-| `shadow EXP --device ... --seed ... --hand --max-running-seconds ...` | yes | yes | 0 expected |
-| `h4 PROFILE.yaml` | yes | yes | max 1 |
-| `run PROFILE.yaml` | yes | yes | bounded > 1 |
+语义性问题在 shadow 中中止当前 episode并回到 ARMED；物理 publication/ACK 失败进入 FAULT。
+S 是 episode stop，不要求重启进程。Q/ESC、worker 退出、heartbeat/readiness 失败和 shutdown
+异常仍由 lifecycle/supervisor fail closed 处理。
 
-`inspect` 只做 artifact/runtime/projection/Real source identity 并输出 canonical receipt。
-`check` 在一个 spawn child 中 verified-load 一次，执行与 production 相同的 5 次 warmup、last-3
-startup qualification，再对同一 synthetic observation 做 N 次 prediction，报告 model-path latency
-p50/p95/max、theoretical remaining-target min/p50/p95、zero-deliverable count 和可用时的 CUDA peak
-memory。量化采用 deterministic nearest rank。synthetic check 没有 camera source、真实 source age 或
-live lag，因此 receipt 必须写 `source_aware_schedulability=NOT_MEASURED`；偶发 zero target 只报告，
-不创建新的 correctness threshold。`shadow/h4/run` 仍由 inference child 各自做 authoritative verified
-load，`check` 不是在线启动前的重复 mandatory load。
+## 6. 验证状态
 
-旧 flat CLI 迁移如下：`--print-config` → `inspect`，`--preflight-only` → `check`，
-`--execution-mode shadow` → `shadow`，`--execution-mode execute` → `h4 PROFILE.yaml`，
-`--execution-mode task` → `run PROFILE.yaml`；新 CLI 只暴露 `--seed`，不再暴露
-`--inference-seed`。
+离线回归覆盖 startup no-motion、shadow no-publication、inference-first readiness、PolicySpec
+兼容、因果 observation、generation 隔离、SafetyGate/ACK/watchdog、重复 episode 和 diagnostics。
+离线测试不等于真机验证。
 
-console handler 保持 INFO，PID-stamped session file
-`dexmani_YYYYMMDD_HHMMSS_<pid>.log` 保留 DEBUG。周期 metrics、per-endpoint 明细和完整 JSON receipt
-进入 DEBUG；startup identity、ready/ARMED/RUNNING/STOPPED、operator prompt、重要 warning 与 physical
-receipt path 保持 INFO。
-
-### 3.2 入口与不可变投影
-
-`run_policy.py` 解析 CLI 后依次：
-
-1. `resolve_policy_artifact()` 用 directory fd 解析 selector 和 canonical sidecar，固定
-   checkpoint、producer、allocation contract 和 lstat identity；此时不反序列化或 hash 大文件。
-2. `resolve_runtime_config()` 解析 Real-owned runtime defaults/YAML。
-3. `resolve_policy_runtime_config()` 将 artifact、runtime 和 operator-owned device/seed/mode/bounds
-   投影成不可变配置。YAML 不能把 runtime loader 重定向到其他实现。
-
-物理模式还要求可识别且干净的 Real source revision，以及 CLI 的 expected checkpoint SHA-256
-与 sidecar 精确一致。
-
-### 3.3 单次验证加载与 agent restore
-
-inference child 对同一个 held file descriptor 执行：
-
-1. `O_NOFOLLOW` 打开并复核 experiment、selector、sidecar 和 file identity；
-2. 流式 SHA-256，并与 sidecar 精确比较；
-3. Policy import 前验证 package origin、producer commit、clean worktree 和 Python tree hash；
-4. `torch.load(stream, map_location="cpu", weights_only=True)`；
-5. Real-owned decoder 校验 deployment-v2 的 exact payload/state/weights schema、plain metadata 和
-   canonical tensor keys；
-6. 只实例化 resolved `cfg.agent`，strict restore model 或要求的 EMA 与 checkpoint-owned normalizer；
-7. restore 后重新检查持有对象 identity，防止 TOCTOU 替换。
-
-不使用 fake policy、path-based second load 或宽松 key/normalizer fallback。agent 只允许来自
-`dexmani_policy.agents.*`；dataset 和 env runner 不会在部署时构造。
-
-### 3.4 GPU 启动与观测
-
-核心模型推理默认在 `cuda:0`：CUDA 不可用或 index 不存在会启动失败，绝不静默回退 CPU；只有
-显式 `--device cpu` 才使用 CPU。loader/identity/hash、NumPy history assembly、timing、IPC 和 robot
-workers 留在 CPU；`agent.to(device)` 之后，normalization、encoder、diffusion/flow decoder 和 action
-unnormalization 都在所选 GPU。validated `control_action.detach().cpu().numpy()` 是回到 CPU 的唯一
-动作数据边界。
-
-启动时执行 5 次 synthetic warmup，最后 3 次中的每个样本必须在 artifact 的
-`n_action_steps` executable grid 上理论留下至少 2 个严格晚于 model finish + command lead 的
-target；warmup 同时精确验证 Policy 声明的 canonical control slice。该检查只限定 model-path
-latency，没有真实 observation source timestamp、camera lag 或 source age，因而不是 online
-source-aware schedulability 证明，也不会伪造 source deadline。随后恢复随机状态，不消耗 rollout
-的第一组 diffusion sample。isolated preflight 也执行一次同样的 contract warmup。
-
-ARMED 只维护 worker readiness。B 使状态进入 RUNNING 后，worker 才从 current generation 的
-shared-memory history 构建 observation：
-
-```text
-joint_state  [1, n_obs_steps, 19]       arm7 + hand12
-point_cloud  [1, n_obs_steps, N, 6]     xArm-base xyz + RGB [0,1]
-rgb          [1, n_obs_steps, 3, H, W]  optional, float32 RGB [0,1]
-```
-
-每个 state、camera/point-cloud sample 都必须满足 generation、source/publish freshness 与最大 skew
-约束。RGB 以 `uint8 [H,W,3]` 存在 camera ring，复制到 device 后才转为 CHW float；resize、crop 和
-image normalization 由 checkpoint 的 image processor 决定。point-cloud-only、RGB-only 和联合输入
-均必须由 artifact 显式声明，不能由训练路径或缺字段推断。
-
-### 3.5 归一化、预测与动作解码
-
-checkpoint 恢复的 agent 自己处理归一化与反归一化：
-
-```text
-x_normalized = x_physical * scale + offset
-result       = agent.predict_action(obs_dict)
-pred_action  = result["pred_action"]
-control_action = result["control_action"]
-x_physical   = (x_normalized - offset) / scale
-```
-
-因此 Real 接收到的 `pred_action` 已处于物理动作空间，不应再次按 `[-1,1]` clip 或重拟合
-normalizer。temporal dimensions 全部来自 artifact：
-
-```text
-control_start = n_obs_steps - 1
-prediction_future_steps = horizon - (n_obs_steps - 1)
-executable_control_steps = n_action_steps
-```
-
-adapter 要求完整 `pred_action` 与 executable `control_action` 同时存在。完整 prediction 必须精确满足
-`[1,horizon,action_dim]` 且所有维度 finite；control 必须精确满足
-`[1,n_action_steps,control_action_dim]` 且 finite。startup qualification 精确验证：
-
-```python
-expected_control = pred_action[
-    :, control_start:control_start + n_action_steps, :control_action_dim
-]
-```
-
-正常 inference tick 不重复做 exact-slice synchronization；它仍逐次检查两者的 shape/finite。
-Real 只从 `result["control_action"]` 构造 `PolicyPrediction`，不从 `pred_action` 重建 control，
-也不要求或读取 `tail`。representative DP3 的 prediction future 是 15 steps，但 executable control
-是 8 steps，解码为 `arm_qpos [8,7]` 与 `hand_qpos [8,12]`。
-
-R3D `joint19_ee9` 的完整 `pred_action` 是 28-D，28 个维度均做 shape/finite validation；唯一
-executable source 是 19-D `control_action`。EE action 的完整 prediction 同样做 shape/finite validation，
-但 rot6d geometry 只对 executable 21-D control 检查：finite 但退化的未执行 prediction tail 不阻止
-合法 control，退化的 executable control 必须拒绝。EE control 由 coordinator 做 IK；joint control
-不经过 IK。
-
-### 3.6 不可变 timing 与 readiness ownership
-
-动作值、lower expiry、upper deadline 和调度分别由不同边界拥有：
-
-| Owner | Timing responsibility |
-|---|---|
-| Policy | 只产生 action values；不产生 Real timestamp。 |
-| Real inference / `deployment.timing` | 构造 immutable target grid，并把 inference 已错过的 prefix 标为 transport-invalid。 |
-| Real coordinator / `BufferedPlan` | 校验完整 source → logical → anchor → inference start → finish 因果链，并计算 source/plan upper deadline。 |
-| `ActionBuffer` | 保持 latest-wins/supersession，独立要求 `target < deadline`。 |
-
-canonical target grid 永远是：
-
-```text
-target_i
-= observation_logical_step_ns + i * control_dt_ns
-```
-
-inference lower bound 使用严格不等式：
-
-```text
-target_i > inference_finished_ns + command_lead_ns
-```
-
-因此 wire `valid_mask` 只表达 inference-expired prefix，拓扑必须是 `0*1*`，例如
-`00011111`。它不是“endpoint 不能执行的所有原因”，coordinator 不会把 upper deadline suffix
-写回 `JointActionChunk.valid_mask` 或 `policy_plan_ring.valid_mask`。
-
-真实 plan 的 source-aware upper bound 同样使用严格不等式：
-
-```text
-target_i < min(
-    inference_finished_ns + max_plan_age_ns,
-    observation_latest_source_ns + max_source_to_command_age_ns,
-)
-```
-
-deadline 是独立的 `BufferedPlan.deadline_ns`。例如 transport mask `001111` 遇到 deadline
-cut 后，diagnostic/qualification usable mask 可以是 `001100`，但 transport mask 仍是
-`001111`；`ActionBuffer` 只 expose deadline 前的 endpoints。
-
-late endpoint 直接 drop，expired prefix 直接 drop，全部 expired 则 drop 整个 prediction。
-系统绝不把过期 action 移动到新的 future slot，也不在 inference 后重建或平移 target grid。
-online plan 的真实 source timestamp 与 coordinator deadline 才是 source-aware readiness 的权威
-证据；startup warmup 不能替代它。
-
-`usable_horizon_ms` 是从当前时刻到 latest actually usable target 的剩余时间，不是 raw
-prediction horizon，也不是 deadline 本身。deadline 前没有实际 usable target 时其值为 `0`。
-
-### 3.7 Plan、SafetyGate 与 worker ACK
-
-inference worker 把无时间的 `PolicyPrediction` 对齐到 Real control grid，屏蔽已过期 prefix；若
-没有可用 target，丢弃整个 prediction。它将 plan、observation/generation、timestamp、valid mask 和
-action 数组写入 `policy_plan_ring`。
-
-coordinator 从 latest plan 选择 due endpoint，并在 publication 前复核：RUNNING/generation、plan/
-feedback freshness、shape/finite/joint limit、per-tick delta、hand envelope、collision、delivery window
-和 deadline。只有 execute/task 才原子写入 `coupled_cmd_ring`；shadow 只完成同一套 validation，
-保证 zero coupled write。
-
-接触下 raw learned hand target 可能无法物理收敛。为保证 ACK 的语义与真实 IPC target 一致，先对
-raw endpoint 完整过 SafetyGate，再相对 fresh hand feedback 以 `0.3 rad/tick` 整形成 actual IPC
-endpoint，并再次完整过 SafetyGate。hand ACK 指 SDK 已接受这一 exact IPC endpoint，不声称 raw
-learned target 在接触下已物理到达。该流程没有放宽 limits、collision、freshness、generation、expiry
-或双 worker ACK。
-
-## 4. 支持边界与新模型接入
-
-直接接入的模型必须同时具备：hash-bound deployment artifact、Real Policy Zarr v5 data contract、
-explicit modality metadata、19-D joint state、checkpoint-owned normalizer、完整 `[B,horizon,action_dim]`
-的 `pred_action`、精确 `[B,n_action_steps,control_action_dim]` 的 `control_action`、兼容的 action
-layout、`dexmani_policy.agents.*` target 和适配 executable window 的 warmup
-latency。满足 API 不等于已获物理部署资格；每个新 artifact 都要独立完成 strict restore、CUDA
-preflight、H2/H3 shadow 和相应物理授权。
-
-| 模型 | 当前支持 | 还需的独立证据 |
-|---|---|---|
-| DP3 | 已验证 reference | task 成功仍未验证。 |
-| DQ-RISE、ActionFlow、ManiFlow、SAT | 结构上兼容 | 专用 artifact、strict restore、latency 与 shadow。 |
-| R3D without auxiliary EE | schema v2 可接入 | 正确的 point-cloud/RGB contract、provenance、latency。 |
-| R3D with auxiliary EE | schema v2 `joint19_ee9` 可接入 | 28-D full-output validation；只有 Policy 返回的 19-D `control_action` 进入控制。 |
-| DP / MoE DP with RGB | Real input boundary 已支持 | schema v2 RGB payload、image processor、strict restore 与 shadow。 |
-| MultiTask DiT | 不支持 | 显式且经训练数据验证的 task/text conditioning contract。 |
-
-不要为“通用兼容”引入 registry、factory 或缺字段 fallback。优先让 artifact 写清真实模型的输入、
-输出和语义，Real 只增加已经被具体 artifact 证明需要的显式读取。
-
-### 实验性扩展（当前不启用）
-
-只有明确的模型/任务证据表明需要时，才考虑以下优化；二者均不能绕过 coordinator、SafetyGate、
-generation、deadline、collision 或 worker validation。
-
-- **chunk conditioning：** 仅限模型原生支持该输入合同。缓存必须绑定 run generation、observation
-  identity、模型版本和原始 target timestamp；generation/observation 不连续、target 已消费或过期时
-  必须清空。它只可使用未消费的原始 model prediction，不能读取 command ring 或把执行 ACK 当作
-  condition。先用 recorded observation/replay 比较 jerk、过期率和 safety reject，再考虑 shadow。
-- **笛卡尔插补：** 仅作为 EE-action 的纯 candidate generator，不能直接调用 SDK。每个实际端点仍须
-  经 IK、工作空间、joint/delta limit、碰撞和时间预算检查；非法旋转、IK/碰撞不可判定、超速度或
-  过期 waypoint 一律拒绝。只有在测量表明 endpoint 控制确有连续性问题时才提出该项。
-
-## 5. 执行层级与物理门
-
-| mode | 允许的策略写入 | 目的 | 额外门 |
-|---|---:|---|---|
-| `shadow` | 0 | 验证 prediction、timing 和所有 publication validation | 明确 H2/H3 授权；B 后仍不发布动作。 |
-| `execute` / H4 | 1 | 验证一个 coupled physical endpoint | 空场地、独立 H4 授权、一次 H、一次 B、双 ACK。 |
-| `task` | 有界，当前 331 | 真正 task rollout | 独立 task 授权；当前暂停，先完成第 7 节诊断。 |
-
-### H4 single-endpoint sequence
-
-每次 H4 都需要当前干净 revision、同 artifact/device 的 H2/H3 evidence、`inspect` 与 `check`。
-在场地无人、无物体/障碍、e-stop 就绪并获单次授权后：
-
-1. 启动 `h4 PROFILE.yaml`，确认所有 subsystem 为 `ARMED`；
-2. 操作者按一次 H：SDK 接受一次 hand home command，然后执行 collision-checked arm canonical
-   home。只要求 hand command accepted，不要求 hand feedback 进入 home tolerance；
-3. 日志出现 `physical home sequence completed` 且仍为 ARMED 后，操作者按一次 B；
-4. bound 固定为一个 coupled endpoint、30 秒和有限 ACK timeout。任何 S/ESC/e-stop、worker/freshness/
-   generation/timeout/safety fault 都停止；不自动重试。
-
-H4 receipt 必须同时证明 `completed=true`、`max_published_endpoints=1`、
-`coupled_command_writes=1`、`physical_home_completed=1` 和 acknowledged action id。需要可移交
-evidence bundle 时，在进程退出后运行无硬件的 `examples/seal_h4_evidence.py`，绑定 runtime receipt、
-terminal log、包含 publication marker 的 coordinator PID log 和操作者记录。
-
-physical profile 只拥有 Real run intent，unknown key（包括 horizon、action dimensions、EMA/NFE、
-solver 或 modality）全部拒绝；相对 path 以 profile 文件目录解析。H4 的
-`max_published_endpoints` 必须等于 1，run 必须大于 1。seed、hand acknowledgement、expected
-checkpoint SHA、positive running bound/ACK timeout 都必须显式存在，不能从 deployment default
-或示例继承：
-
-```yaml
-schema_version: 1
-experiment_dir: /path/to/experiment
-runtime_config: null
-deployment_config: null
-device: cuda:0
-seed: 1066
-hand_acknowledged: true
-expected_checkpoint_sha256: "<64 lowercase hex>"
-max_running_seconds: 30.0
-acknowledgement_timeout_seconds: 2.0
-max_published_endpoints: 1
-```
-
-上述 schema v1 仅用于 H4。物理 `run` 必须使用 schema v2，额外绑定一个 `task_scene_card`
-JSON 文件；它是操作员声明的物体、起点、目标、成功条件和四个有限场景采集点，而不是模型参数。
-card 必须有精确字段 `schema_version=1`、`task_name`、`object_description`、
-`object_start_description`、`target_description`、`success_criterion`、
-`phase_endpoint_indices`。后者恰有 `approach`、`grasp`、`lift`、`place` 四项，取值必须严格
-递增且落在 profile 的 endpoint bound 内。card 原始 bytes 的 SHA-256 与 phase index 会进入 task
-receipt 的 provenance；因此不能在开始后替换 scene/target 描述。
-
-`shadow` 也会连接硬件；若 hand 启用，其 startup 可能 reset/home。它保证的是不应发布 learned
-coupled command，不是“无硬件副作用”。任何 operational invocation、本文、历史 receipt、
-`inspect` 或 `check` 都不是硬件授权。
-
-## 6. Pre-R1 历史验证记录
-
-本节所有 H2/H3、H4 和 task evidence 均产生于 Real 把完整 prediction future 当作 executable 的旧
-语义。它们只保留为历史 transport evidence，不授权 `control_action` R1 语义下的 physical shadow、
-H4 或 task；R1 后如需物理运行必须重新独立 review。
-
-| 级别 | 实际结果 | 可复核证据 |
-|---|---|---|
-| H2/H3 task-scene shadow | `120.033 s`、`1,916/1,916` endpoints 仅 shadow-validated；zero coupled write/arm servo/hand policy SDK send，clean shutdown。 | log `/tmp/dexmani-task-h2h3-shadow.ee0MrE/terminal.log`，SHA-256 `76e08c5033658dc98fb395a9e4160b76e84c36d35cc9b9ff2a03cc36db665051` |
-| H4 | 一次 physical home、一个 coupled endpoint 和 paired ACK。 | log SHA-256 `6eed6a15f4a2b0f3e1dace2940a0b08094e683b4e03572082becdf75549485ba`；receipt SHA-256 `5d99c8468f1fbf7df604f51b25f6ad891ce17f53f6af37898b2d7516a4ebc09f` |
-| task #1 | 331 endpoint、331 coupled write/ACK、clean shutdown；没有自动证明物理成功。 | log SHA-256 `213174c4e2f655b6311c22d3af89bb726e013994114769d7f9859b502ca0687f`；receipt SHA-256 `f6c3218cb0ba29ec0519ae2928f1d7a05e2d8dfd8d76c929a92fdd296d2c0dbc` |
-| task #2 | 同样 331 endpoint/write/ACK；操作者确认未完成抓取放置，未见传输、安全、expiry 或 ACK fault。 | log SHA-256 `277111c4431d74e2054b83e8cb9156bc6942150158f2e1dfb46a847199d9f352`；receipt SHA-256 `2670d9fd68350718d9d16bf8bce07d4db58eb95f813b3bd0ff97600fcd344506` |
-
-完整 runtime receipt 位于 `/home/zhanghaoyang/.dexmani/receipts/`；原始 `/tmp` logs 可能被系统清理。
-以上 source commit、路径和 SHA-256 固定了本次审阅输入。较旧 revision 的逐次 reference 已从
-工作树移除，但仍可从 Git history 恢复。
-
-## 7. Task 行为：当前停止条件与诊断
-
-第二次 task 的软件完成说明 transport path 正常，但不能区分 scene mismatch、视觉/点云偏差、
-arm/hand behavior、未闭合、滑落或放置失败。固定 seed 只固定 diffusion 随机流，不固定真实观测、
-物体初始状态或接触结果。因此不得通过放宽 SafetyGate、hand shaping 上限、expiry、ACK 或
-publication bound 来“修复”物理任务。
-
-下一次 task 授权前，诊断必须以只读方式补充：
-
-1. B 前的 aligned RGB-D、policy point cloud、camera/state timestamps、calibration identity 和
-   scene setup；
-2. 每个 endpoint 的 raw physical prediction、shaped IPC endpoint、arm/hand feedback、tactile/contact、
-   generation、deadline、publication 与 paired ACK timestamp；
-3. 接近、闭合、抬起和放置阶段的有限场景帧；诊断写失败不得阻塞 control loop 或改变命令；
-4. 与训练 episode 的 observation/action range、point-cloud frame 和 calibration identity 的离线比较。
-
-当前 `run` 会在 ARMED 后启动 task-only passive observer。它只读取既有
-`policy_plan_ring`、`coupled_cmd_ring`、arm/hand/tactile、camera 与 point-cloud rings；不加入
-readiness/heartbeat，不写 command，不改 safety state，且收集或落盘失败不改变控制循环。结束后，它在
-`DEXMANI_RECEIPT_DIR/task_diagnostics_*/` 写入 `manifest.json` 和有限场景 RGB-D/point-cloud archive：
-
-- `b_pre` 是 observer 在 ARMED 时缓存、B 后绑定到 run generation 的 scene snapshot；它同时保存
-  camera/arm/hand identity、camera geometry/profile、depth scale 和 `cameras.json` SHA-256。其 timestamp
-  必须由 review 检查，不把 cache 当作无条件实时事实。
-- 每个 coupled command 以 `(generation, observation_id, scheduled_target)` 关联其 raw policy plan，
-  并保留 shaped IPC endpoint、feedback/tactile、publication 与 paired ACK observation timestamps。
-- `raw_prediction_available=false`、任一 dropped record、pending ACK、缺失 `b_pre` 或缺失 card 指定
-  phase frame 都是诊断不完整，必须在 task review 中判为不可用于物理行为结论，而不是补写或忽略。
-
-这一诊断实现改变了物理 task 的 evidence boundary。因此它本身不授权 task：冻结该 revision 后仍必须重新
-完成 Gate A pre-live、fresh live shadow、task-specific diagnostic review，并取得下一段所列的单次现场授权。
-
-完成诊断 review 后，新的 task 授权仍须单独指定任务布置、人员/障碍物、e-stop、设备健康、
-device/seed、H/B、331 endpoint、25 秒、ACK timeout、接触/抓取/放置许可、单次无重试与 S/ESC/e-stop
-职责。`completed=true` 仅证明 bounded command path；物理 pick/place 必须由操作者或任务成功传感器
-单独记录。
-
-## 8. 未来 `dexmani_policy` 合并
-
-另一台机器上的 Policy 分支形成干净、可测试 commit 前，本仓不预先恢复、复制或修改其原型。合并
-必须保护所有现有 sim 行为：dataset、sampler、normalizer、agent、`simple.v1` load/eval、
-`CheckpointStore` selector 和已有 checkpoint/experiment 均不改变；Policy 不 import `dexmani_real`。
-
-允许的增量仅限于可审计的数据/provenance：versioned Real Zarr provenance、fully resolved inference
-config/data contract、canonical hashable artifact metadata、或在保持原 path-based API 的前提下增加
-loaded-checkpoint restore helper。不得把 Real lifecycle、SafetyGate、hardware config、point-cloud runtime
-或 receipt 迁入 Policy。
-
-合并 review 至少要求：
-
-- branch/HEAD/base/status，且 deployment/provenance diff 与训练改动分离；
-- existing Policy tests、DP3 和受影响架构 smoke、旧 `simple.v1` load/eval、新 metadata round trip；
-- `n_obs_steps=2/3 → pad_before=1/2` 参数化验证；
-- schema 字段 additive、plain finite metadata、真实 array shape/dtype 验证；
-- 旧 sim data 缺少 Real attrs 时保持原行为，未提交 checkpoint/dataset/experiment/W&B 生成物。
-
-新的 Policy artifact 必须使用新 selector 或明确版本，不能静默替换当前 reference。Real 先增加纯
-artifact/decoder tests，然后按 `inspect` → CUDA `check` → recorded-observation replay → H2/H3
-shadow 的顺序验证；任何物理执行仍需新的独立 review 和授权。出现旧 eval/training 不兼容、padding
-再次硬编码、dirty/外部配置猜测 provenance、Policy 拥有 Real 安全逻辑或新旧 artifact 不能共存时，
-停止合并。
+在记录过实际结果前，仍应视为未验证：目标 GPU 时延、真实相机到点云时延、shadow startup
+零运动/零命令、单次低风险物理 episode、同进程多 episode，以及真实 S/Q/ESC 行为。

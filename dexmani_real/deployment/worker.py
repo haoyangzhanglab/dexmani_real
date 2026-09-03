@@ -11,8 +11,8 @@ robot command.
 ``inference_loop`` is a plain ``*_loop(shared, config)`` function (not an
 ``mp.Process`` subclass); lifecycle and supervision stay in the runtime layer.
 
-Artifact-bound DexMani deployments load through the preflight module's checked
-fd/hash/provenance stream loader. There is no configurable runtime loader.
+The worker loads the selected experiment through the public DexMani Policy API,
+then wraps it with Real's NumPy observation/action adapter.
 """
 
 from __future__ import annotations
@@ -22,9 +22,10 @@ import time
 
 import numpy as np
 
+from dexmani_real.config.defaults import PolicyParams
 from dexmani_real.deployment.config import (
     FIXED_POLICY_RUNTIME_TARGET,
-    PolicyRuntimeConfig,
+    PolicyWorkerConfig,
 )
 from dexmani_real.deployment.contracts import (
     InferenceContext,
@@ -50,20 +51,12 @@ from dexmani_real.deployment.metrics import (
     PLANS_GENERATION_DROPPED,
     Metrics,
     flush_every,
-    inference_run_receipt_json,
 )
 from dexmani_real.deployment.observation import (
     FrameWindow,
     ObservationBatch,
     PointCloudFrame,
     RgbFrame,
-    parse_observation_fields,
-)
-from dexmani_real.deployment.preflight import (
-    MIN_STARTUP_DELIVERABLE_TARGETS,
-    POLICY_WARMUP_SAMPLES,
-    qualify_policy_warmup,
-    theoretical_remaining_target_count,
 )
 from dexmani_real.deployment.timing import build_target_grid, first_deliverable_index
 from dexmani_real.ipc.channels import RuntimeChannels, new_frame
@@ -81,17 +74,40 @@ logger = get_logger(__name__)
 _NO_FEEDBACK_POLL_S = 0.005
 # Poll interval while ARMED (no inference) — gentler than the feedback poll.
 _ARMED_IDLE_POLL_S = 0.01
+_MIN_STARTUP_DELIVERABLE_TARGETS = 2
 
 
-def _load_inference_runtime(config: PolicyRuntimeConfig) -> PolicyRuntime:
-    """Load the single Real-owned runtime through the verified stream boundary."""
-    if config.artifact is None:
-        raise ValueError("inference runtime requires a resolved artifact")
+def _project_sensor_fields(policy_spec: object) -> set[str]:
+    """Project Policy modality names onto Real's concrete sensor fields."""
+    requested: set[str] = set()
+    for modality in tuple(getattr(policy_spec, "sensor_modalities")):
+        if modality == "joint_state":
+            requested.update(("arm_qpos", "hand_qpos"))
+        elif modality == "point_cloud":
+            requested.add("point_cloud")
+        else:
+            raise ValueError(f"unsupported Policy sensor modality {modality!r}")
+    return requested
+
+
+def _load_inference_runtime(config: PolicyWorkerConfig) -> PolicyRuntime:
+    """Load Policy-owned model state and return the Real NumPy adapter."""
     # Deliberately imported inside the inference child: the parent must not
     # import torch/Policy or initialize CUDA, and model objects never cross spawn.
-    from dexmani_real.deployment.preflight import load_verified_policy_runtime
+    from dexmani_policy.deployment import load_experiment
 
-    return load_verified_policy_runtime(config)
+    from dexmani_real.integrations.dexmani_policy import DexManiPolicyRuntime
+
+    loaded_policy = load_experiment(
+        config.experiment,
+        device=config.device,
+        seed=config.seed,
+    )
+    try:
+        return DexManiPolicyRuntime(loaded_policy, config.spec)
+    except BaseException:
+        loaded_policy.close()
+        raise
 
 
 def _duration_s_to_ns_ceil(duration_s: float, *, name: str) -> int:
@@ -114,12 +130,20 @@ def _startup_deliverable_target_count(
     command_lead_s: float,
 ) -> int:
     """Return theoretical targets remaining after model latency and command lead."""
-    return theoretical_remaining_target_count(
-        model_latency_s=model_latency_s,
-        steps=steps,
-        step_dt_ns=step_dt_ns,
-        command_lead_s=command_lead_s,
+    # This arbitrary positive origin has no source-time meaning; warmup only
+    # checks latency against relative executable-grid spacing.
+    origin_ns = 1
+    targets = build_target_grid(origin_ns, steps, step_dt_ns)
+    finished_ns = origin_ns + _duration_s_to_ns_ceil(
+        model_latency_s,
+        name="model_latency_s",
     )
+    first_index = first_deliverable_index(
+        targets,
+        finished_ns,
+        _duration_s_to_ns_ceil(command_lead_s, name="command_lead_s"),
+    )
+    return len(targets) - first_index
 
 
 def stamp_prediction_timing(
@@ -423,7 +447,7 @@ def _rgb_frame_from_camera_record(
     rgb = payload["rgb"]
     if rgb.shape != expected_shape:
         logger.warning(
-            "inference: RGB frame shape %s does not match artifact %s",
+            "inference: RGB frame shape %s does not match policy contract %s",
             rgb.shape,
             expected_shape,
         )
@@ -630,7 +654,8 @@ def _align_state_history_to_camera_frames(
 
 def _build_observation(
     shared: RuntimeChannels,
-    config: PolicyRuntimeConfig,
+    policy: PolicyParams,
+    policy_spec: object,
     *,
     observation_id: int,
     run_generation: int,
@@ -641,15 +666,14 @@ def _build_observation(
 ) -> ObservationBatch | None:
     """Assemble requested causal modalities from the arm/hand rings.
 
-    The hand state and tactile rings are read only when their corresponding
-    ``observation_fields`` are requested. Every selected frame is additionally
+    Policy modalities are projected to their concrete Real sensor fields.
+    Every selected frame is additionally
     gated by its source/publish timestamps and modality-specific health flags.
     """
-    deployment = config.deployment
-    horizon = int(deployment.observation_horizon)
-    max_age_ns = int(deployment.max_input_age_s * 1e9)
-    max_skew_ns = int(deployment.max_observation_skew_s * 1e9)
-    max_grid_lag_ns = int(deployment.max_grid_lag_s * 1e9)
+    horizon = int(getattr(policy_spec, "n_obs_steps"))
+    max_age_ns = int(policy.max_input_age_s * 1e9)
+    max_skew_ns = int(policy.max_observation_skew_s * 1e9)
+    max_grid_lag_ns = int(policy.max_grid_lag_s * 1e9)
     history_span_ns = max(0, horizon - 1) * int(step_dt_ns)
     visual_history_max_age_ns = max_age_ns + history_span_ns + max_grid_lag_ns
     state_history_max_age_ns = visual_history_max_age_ns + max_skew_ns
@@ -659,17 +683,14 @@ def _build_observation(
     tactile_history: FrameWindow | None = None
     pointcloud: PointCloudFrame | None = None
     pointcloud_history: tuple[PointCloudFrame, ...] = ()
-    requested = set(parse_observation_fields(deployment.observation_fields))
+    requested = _project_sensor_fields(policy_spec)
     pointcloud_requested = "point_cloud" in requested
     rgb_requested = "rgb" in requested
     camera_requested = pointcloud_requested or rgb_requested
     rgb_history: tuple[RgbFrame, ...] = ()
     rgb_shape: tuple[int, int, int] | None = None
     if rgb_requested:
-        artifact = config.artifact
-        if artifact is None or artifact.allocation_contract.rgb_shape is None:
-            raise ValueError("RGB observation requires an artifact RGB contract")
-        rgb_shape = artifact.allocation_contract.rgb_shape
+        raise ValueError("current DexMani Policy deployment does not support RGB")
     state_history_len = shared.arm_state_ring.maxlen if camera_requested else horizon
     arm_history = _read_state_history(
         shared.arm_state_ring,
@@ -697,7 +718,7 @@ def _build_observation(
             shared,
             anchor_ns=anchor_ns,
             max_age_ns=visual_history_max_age_ns,
-            num_points=int(deployment.pointcloud_num_points),
+            num_points=int(getattr(policy_spec, "point_cloud_num_points")),
             history_len=shared.pointcloud_ring.maxlen,
             not_before_ns=run_started_ns,
         )
@@ -746,7 +767,7 @@ def _build_observation(
         )
     else:
         logical_step_ns = 0
-    if deployment.hand_enabled:
+    if getattr(policy_spec, "requires_hand") is True:
         if hand_state_requested:
             hand_history = _read_state_history(
                 shared.hand_state_ring,
@@ -940,17 +961,23 @@ def observation_timing_ms(observation: ObservationBatch) -> tuple[float, float]:
     )
 
 
-def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None:
+def inference_loop(
+    shared: RuntimeChannels,
+    policy: PolicyParams,
+    config: PolicyWorkerConfig,
+) -> None:
     """Inference process entry point — produces proposals, never robot commands.
 
-    Startup order: heartbeat early -> verified artifact load -> mark ready.
+    Startup order: heartbeat early -> Policy-owned strict load -> mark ready.
     A load/import/instantiation failure raises out
     of this function and becomes a supervisor-observed process failure; there
     is no dummy safe mode. The main loop reads a fresh generation each tick and
     calls ``runtime.reset_episode`` when it changes.
     """
-    if config is None:
-        raise ValueError("inference_loop requires a PolicyRuntimeConfig")
+    if not isinstance(policy, PolicyParams):
+        raise TypeError("inference_loop requires resolved runtime PolicyParams")
+    if not isinstance(config, PolicyWorkerConfig):
+        raise TypeError("inference_loop requires a PolicyWorkerConfig")
 
     # Heartbeat before any lazy import so the supervisor never sees a dead gap.
     shared.set_heartbeat("inference", time.monotonic())
@@ -959,22 +986,39 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
     runtime = _load_inference_runtime(config)
 
     try:
-        if config.artifact is not None:
-            timings_s = runtime.warmup(samples=POLICY_WARMUP_SAMPLES)
-            allocation = config.artifact.allocation_contract
-            step_dt_ns = int(round(1e9 / float(shared.action_control_hz)))
-            remaining_targets = qualify_policy_warmup(
-                timings_s,
-                steps=allocation.n_action_steps,
+        warmup_samples = 5
+        stable_samples = 3
+        timings_s = runtime.warmup(samples=warmup_samples)
+        if len(timings_s) != warmup_samples:
+            raise RuntimeError("policy runtime returned incomplete warmup timings")
+        if any(not np.isfinite(value) or value < 0.0 for value in timings_s):
+            raise RuntimeError("policy runtime returned invalid warmup timing")
+        stable_timings_s = timings_s[-stable_samples:]
+        step_dt_ns = int(round(1e9 / float(shared.action_control_hz)))
+        remaining_targets = tuple(
+            _startup_deliverable_target_count(
+                model_latency_s=value,
+                steps=config.spec.n_action_steps,
                 step_dt_ns=step_dt_ns,
-                command_lead_s=config.deployment.command_lead_s,
+                command_lead_s=policy.command_lead_s,
             )
-            logger.debug(
-                "inference warmup model-latency qualification: samples_ms=%s "
-                "stable_remaining_targets=%s minimum=%d",
-                ",".join(f"{value * 1e3:.3f}" for value in timings_s),
-                ",".join(str(value) for value in remaining_targets),
-                MIN_STARTUP_DELIVERABLE_TARGETS,
+            for value in stable_timings_s
+        )
+        logger.info(
+            "inference warmup: samples_ms=%s stable_remaining_targets=%s minimum=%d",
+            ",".join(f"{value * 1e3:.3f}" for value in timings_s),
+            ",".join(str(value) for value in remaining_targets),
+            _MIN_STARTUP_DELIVERABLE_TARGETS,
+        )
+        if any(
+            remaining < _MIN_STARTUP_DELIVERABLE_TARGETS
+            for remaining in remaining_targets
+        ):
+            raise RuntimeError(
+                "policy inference warmup exceeds the viable action window: "
+                f"stable_max_ms={max(stable_timings_s) * 1e3:.3f} "
+                f"stable_remaining_targets={remaining_targets} "
+                f"minimum={_MIN_STARTUP_DELIVERABLE_TARGETS}"
             )
     except BaseException:
         try:
@@ -989,29 +1033,14 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
     logger.info("inference_loop: ready (runtime=%s)", FIXED_POLICY_RUNTIME_TARGET)
 
     step_dt_ns = int(round(1e9 / float(shared.action_control_hz)))
-    deployment = config.deployment
-    period_s = 1.0 / float(deployment.inference_hz)
-    requested = set(parse_observation_fields(deployment.observation_fields))
+    period_s = 1.0 / float(policy.inference_hz)
+    requested = _project_sensor_fields(config.spec)
 
     plan_id = 0
     observation_id = 0
     last_generation = -1
-    metrics_run_generation: int | None = None
     last_logical_step_ns = 0
     last_metrics_flush_ns = time.monotonic_ns()
-
-    def emit_inference_run_receipt(reason: str) -> None:
-        """Emit complete per-run evidence before the next generation resets it."""
-        nonlocal metrics_run_generation
-        if metrics_run_generation is None:
-            return
-        receipt = inference_run_receipt_json(
-            run_generation=metrics_run_generation,
-            reason=reason,
-            metrics=metrics.run_snapshot(),
-        )
-        logger.info("inference run receipt: %s", receipt)
-        metrics_run_generation = None
 
     def wait_for_observation(reason: str | None = None) -> None:
         nonlocal last_metrics_flush_ns
@@ -1021,6 +1050,7 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
             metrics,
             last_ns=last_metrics_flush_ns,
             prefix="inference metrics",
+            debug=True,
         )
         time.sleep(_NO_FEEDBACK_POLL_S)
 
@@ -1033,7 +1063,6 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
             epoch = read_run_epoch(shared)
             run_generation = epoch.generation
             if run_generation != last_generation:
-                emit_inference_run_receipt("run generation advanced")
                 runtime.reset_episode()
                 last_generation = run_generation
                 observation_id = 0  # new observation epoch for the new run
@@ -1046,14 +1075,12 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
                 continue
             if epoch.started_monotonic_ns <= 0:
                 raise RuntimeError("RUNNING state has no observation epoch")
-            if metrics_run_generation is None:
-                metrics_run_generation = run_generation
-
             anchor_ns = time.monotonic_ns()
             observation_id += 1
             observation = _build_observation(
                 shared,
-                config,
+                policy,
+                config.spec,
                 observation_id=observation_id,
                 run_generation=run_generation,
                 run_started_ns=epoch.started_monotonic_ns,
@@ -1064,14 +1091,14 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
             if observation is None:
                 wait_for_observation()
                 continue
-            horizon = int(deployment.observation_horizon)
+            horizon = int(config.spec.n_obs_steps)
             if (
                 observation.arm_history is None
                 or observation.arm_history.values.shape[0] != horizon
             ):
                 wait_for_observation(OBSERVATION_WAIT_ARM_HISTORY)
                 continue  # no complete causal arm history yet — never infer
-            if deployment.hand_enabled and (
+            if config.spec.requires_hand and (
                 observation.hand_history is None
                 or observation.hand_history.values.shape[0] != horizon
             ):
@@ -1110,7 +1137,7 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
                 step_dt_ns=step_dt_ns,
                 inference_finished_ns=finished_ns,
                 command_lead_ns=_duration_s_to_ns_ceil(
-                    deployment.command_lead_s,
+                    policy.command_lead_s,
                     name="command_lead_s",
                 ),
             )
@@ -1146,7 +1173,10 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
                 )
 
             last_metrics_flush_ns = flush_every(
-                metrics, last_ns=last_metrics_flush_ns, prefix="inference metrics"
+                metrics,
+                last_ns=last_metrics_flush_ns,
+                prefix="inference metrics",
+                debug=True,
             )
 
             elapsed = time.monotonic() - tick_start
@@ -1155,10 +1185,7 @@ def inference_loop(shared: RuntimeChannels, config: PolicyRuntimeConfig) -> None
                 time.sleep(sleep_s)
     finally:
         try:
-            emit_inference_run_receipt("worker exit")
-        finally:
-            try:
-                runtime.close()
-            except Exception:
-                logger.warning("inference: runtime.close raised", exc_info=True)
+            runtime.close()
+        except Exception:
+            logger.warning("inference: runtime.close raised", exc_info=True)
         logger.info("inference_loop: exited")

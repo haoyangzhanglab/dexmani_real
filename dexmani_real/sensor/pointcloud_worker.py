@@ -197,7 +197,7 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
     if static_inputs is None:
         return
     geometry, depth_scale_m, base_from_color = static_inputs
-    logger.info(
+    logger.debug(
         "pointcloud policy: id=%s config_sha256=%s color_source=%s sampling=%s "
         "transform=%s config=%s table_plane_abcd=%s",
         POINT_CLOUD_POLICY_ID,
@@ -311,7 +311,7 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
                     if source_values.size
                     else 0.0
                 )
-                logger.info(
+                logger.debug(
                     "pointcloud_loop: processed=%d published=%d skipped=%d "
                     "empty=%d stale_after_compute=%d compute_ms_p50=%.2f p95=%.2f "
                     "source_to_publish_ms_p95=%.2f",

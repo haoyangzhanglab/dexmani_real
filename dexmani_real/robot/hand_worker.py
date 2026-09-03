@@ -209,24 +209,6 @@ def hand_loop(shared: Any, config: HandParams) -> None:
         except Exception:
             logger.warning("hand_loop: tactile calibration raised", exc_info=True)
 
-        try:
-            reset_status = hand.reset_home()
-        except Exception:
-            logger.error("hand_loop: startup reset-home command raised", exc_info=True)
-            shared.error_state.value = True
-            return
-        if reset_status is XHandSendStatus.REJECTED:
-            logger.error("hand_loop: startup reset-home command was rejected")
-            shared.error_state.value = True
-            return
-        if reset_status is XHandSendStatus.CRC_UNCONFIRMED:
-            logger.warning(
-                "hand_loop: startup reset-home delivery is unconfirmed after CRC; "
-                "continuing with live state"
-            )
-        else:
-            logger.info("hand_loop: startup reset-home command accepted")
-
         initial_state = hand.get_state()
         if initial_state is None:
             logger.error("hand_loop: cannot publish a valid initial state")
@@ -343,11 +325,10 @@ def hand_loop(shared: Any, config: HandParams) -> None:
 
             permit = read_motion_permit(shared)
             if permit.run_generation != stats_generation:
-                # H4 uses an ARMED generation for the operator's physical-home
-                # command, then a new RUNNING generation for the one policy
-                # endpoint.  Preserve the completed RUNNING generation when
-                # the coordinator revokes motion, while keeping the two
-                # command classes distinct in the exit evidence.
+                # Physical home uses an ARMED generation, then policy motion
+                # advances to a new RUNNING generation. Preserve the completed
+                # RUNNING generation when the coordinator revokes motion, while
+                # keeping the two command classes distinct in exit diagnostics.
                 if stats_generation_was_running:
                     last_running_stats = (
                         sdk_send_attempts,
