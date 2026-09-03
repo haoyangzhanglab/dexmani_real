@@ -28,6 +28,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `code_style.md` | 本研究代码库的具体编码与审查约定。 |
 | `README.md` | 面向使用者的能力、架构、环境与工作流。 |
 | `repo_map.md` | 当前文件与 owner 索引。 |
+| `runtime.yaml` | 当前完整 Real runtime 配置快照；覆盖全部配置段，真机前必须核对设备与标定字段。 |
 | `docs/data_schema.md` | Real raw v24、processed v11 与 Policy Zarr v5 的持久化字段和语义参考。 |
 | `docs/action_clip_mechanisms.md` | 动作 clip、限幅、拒绝与动作源差异的实现参数和数据审计说明。 |
 | `docs/policy_deployment.md` | Policy experiment 的 list/check/shadow/run、配置 ownership、按键、安全与诊断工作流。 |
