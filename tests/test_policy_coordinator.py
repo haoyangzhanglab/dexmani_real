@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from unittest.mock import Mock
 
 import numpy as np
 
@@ -24,7 +25,11 @@ from dexmani_real.deployment.coordinator import (
     _end_policy_run,
     _PendingAcknowledgement,
 )
-from dexmani_real.runtime.safety import CoupledCommandTicket, SafetyState
+from dexmani_real.runtime.safety import (
+    CoupledCommandTicket,
+    SafetyState,
+    revoke_motion,
+)
 
 
 class _Value:
@@ -236,6 +241,26 @@ class PolicyCoordinatorRegressionTest(unittest.TestCase):
         self.assertEqual(shared.active_coupled_command_sequence.value, 0)
         self.assertEqual(shared.run_started_monotonic_ns.value, 0)
         self.assertFalse(shared.physical_home_completed.value)
+
+    def test_operator_stop_summarizes_motion_already_revoked_by_keyboard(self) -> None:
+        shared = _FakeShared()
+        self.assertTrue(revoke_motion(shared, SafetyState.ARMED))
+        generation_after_keyboard_stop = int(shared.run_generation.value)
+        metrics = Mock()
+
+        _end_policy_run(
+            shared,
+            "operator stop",
+            abort=False,
+            metrics=metrics,
+        )
+
+        self.assertEqual(shared.safety_state.value, int(SafetyState.ARMED))
+        self.assertEqual(shared.run_generation.value, generation_after_keyboard_stop)
+        metrics.log_episode_summary.assert_called_once_with(
+            status="STOPPED",
+            reason="operator stop",
+        )
 
     def test_first_command_timeout_is_distinct_from_initial_wait(self) -> None:
         before_deadline = _command_watchdog_abort_reason(

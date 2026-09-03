@@ -509,10 +509,13 @@ def _end_policy_run(
     metrics: Metrics | None = None,
     metric: str | None = None,
 ) -> None:
-    """Advance the generation and drop RUNNING -> ARMED.
+    """End one policy run after ensuring motion is fenced in ARMED.
 
     Both a clean operator STOP (``abort=False``) and a policy-semantic abort
     (``abort=True``) leave the robot ARMED (command quiescence), never FAULT.
+    The keyboard may already have revoked RUNNING before the coordinator sees
+    its stop request; that ARMED state is complete and must not bump generation
+    a second time.
     Abort counters are flushed immediately because the success-path
     ``flush_every`` is never reached once a run ends (the loop idles in ARMED).
     """
@@ -522,8 +525,19 @@ def _end_policy_run(
         or int(shared.safety_state.value) == int(SafetyState.FAULT)
     )
     shared.physical_home_completed.value = False
-    if not lifecycle_faulted and not revoke_motion(shared, SafetyState.ARMED):
-        logger.error("coordinator: failed to transition RUNNING->ARMED (%s)", reason)
+    if not lifecycle_faulted:
+        state = int(shared.safety_state.value)
+        if state == int(SafetyState.RUNNING):
+            if not revoke_motion(shared, SafetyState.ARMED):
+                logger.error(
+                    "coordinator: failed to transition RUNNING->ARMED (%s)", reason
+                )
+        elif state != int(SafetyState.ARMED):
+            logger.error(
+                "coordinator: cannot finish policy run from safety_state=%d (%s)",
+                state,
+                reason,
+            )
     if abort:
         logger.warning("coordinator: policy run aborted: %s", reason)
         if metrics is not None:
@@ -672,7 +686,9 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
             shared.set_heartbeat("policy", time.monotonic())
 
             if bool(shared.quit_requested.value):
-                if int(shared.safety_state.value) == int(SafetyState.RUNNING):
+                if run_started_ns is not None or int(shared.safety_state.value) == int(
+                    SafetyState.RUNNING
+                ):
                     _end_policy_run(
                         shared,
                         "operator quit",
@@ -708,8 +724,61 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 _sleep_tick(period_s, tick_start)
                 continue
 
+            # S fences motion in the keyboard callback before this process can
+            # observe the request.  Settle the active episode before entering
+            # ARMED idle so its stop time, reason, and counters are not lost.
+            if run_started_ns is not None or int(shared.safety_state.value) == int(
+                SafetyState.RUNNING
+            ):
+                raw_stop_request = int(shared.stop_request.value)
+                try:
+                    stop_request = StopRequest(raw_stop_request)
+                except ValueError:
+                    abort_and_reset(
+                        f"invalid stop request code: {raw_stop_request}",
+                        metric=ENDPOINTS_FATAL_REJECTED,
+                    )
+                    continue
+                if stop_request is not StopRequest.NONE:
+                    shared.stop_request.value = int(StopRequest.NONE)
+                    # A stray B from RUNNING must not auto-restart after this stop.
+                    shared.start_request.value = False
+                    stop_reason = (
+                        "run time limit"
+                        if stop_request is StopRequest.RUN_TIME_LIMIT
+                        else "operator stop"
+                    )
+                    if stop_request is StopRequest.RUN_TIME_LIMIT and config.execute:
+                        if pending_acknowledgement is not None:
+                            fault_physical(
+                                "run time limit reached before worker acknowledgement",
+                                metric=ACK_TIMEOUT,
+                            )
+                            continue
+                    _end_policy_run(
+                        shared,
+                        stop_reason,
+                        abort=False,
+                        metrics=metrics,
+                    )
+                    pending_acknowledgement = None
+                    action_buffer.reset(run_generation=int(shared.run_generation.value))
+                    buffer_generation = None
+                    last_seen_plan_key = None
+                    last_valid_policy_command_ns = None
+                    run_started_ns = None
+                    previous_arm_command_qpos = None
+                    _sleep_tick(period_s, tick_start)
+                    continue
+
             # ARMED idle: wait for the operator to request a new run (B).
             if int(shared.safety_state.value) != int(SafetyState.RUNNING):
+                # An immediate keyboard fence can become visible just after
+                # the stop-request read above. Preserve the active episode and
+                # settle its request on the next tick instead of losing it.
+                if run_started_ns is not None:
+                    _sleep_tick(period_s, tick_start)
+                    continue
                 if buffer_generation is not None:
                     action_buffer.reset(run_generation=int(shared.run_generation.value))
                     buffer_generation = None
@@ -728,7 +797,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     _sleep_tick(period_s, tick_start)
                     continue
                 # A stray S from ARMED must not stop the freshly started run.
-                shared.stop_request.value = False
+                shared.stop_request.value = int(StopRequest.NONE)
                 if not begin_motion(shared):
                     logger.error(
                         "coordinator: cannot enter RUNNING (safety_state=%d)",
@@ -763,48 +832,6 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 action_buffer.reset(run_generation=run_epoch.generation)
                 buffer_generation = run_epoch.generation
                 last_seen_plan_key = None
-                _sleep_tick(period_s, tick_start)
-                continue
-
-            # RUNNING: operator stop or an optional run-time limit ends cleanly.
-            raw_stop_request = int(shared.stop_request.value)
-            try:
-                stop_request = StopRequest(raw_stop_request)
-            except ValueError:
-                abort_and_reset(
-                    f"invalid stop request code: {raw_stop_request}",
-                    metric=ENDPOINTS_FATAL_REJECTED,
-                )
-                continue
-            if stop_request is not StopRequest.NONE:
-                shared.stop_request.value = int(StopRequest.NONE)
-                # A stray B from RUNNING must not auto-restart after this stop.
-                shared.start_request.value = False
-                stop_reason = (
-                    "run time limit"
-                    if stop_request is StopRequest.RUN_TIME_LIMIT
-                    else "operator stop"
-                )
-                if stop_request is StopRequest.RUN_TIME_LIMIT and config.execute:
-                    if pending_acknowledgement is not None:
-                        fault_physical(
-                            "run time limit reached before worker acknowledgement",
-                            metric=ACK_TIMEOUT,
-                        )
-                        continue
-                _end_policy_run(
-                    shared,
-                    stop_reason,
-                    abort=False,
-                    metrics=metrics,
-                )
-                pending_acknowledgement = None
-                action_buffer.reset(run_generation=int(shared.run_generation.value))
-                buffer_generation = None
-                last_seen_plan_key = None
-                last_valid_policy_command_ns = None
-                run_started_ns = None
-                previous_arm_command_qpos = None
                 _sleep_tick(period_s, tick_start)
                 continue
 
