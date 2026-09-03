@@ -311,7 +311,7 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
                     if source_values.size
                     else 0.0
                 )
-                logger.info(
+                logger.debug(
                     "pointcloud_loop: processed=%d published=%d skipped=%d "
                     "empty=%d stale_after_compute=%d compute_ms_p50=%.2f p95=%.2f "
                     "source_to_publish_ms_p95=%.2f",

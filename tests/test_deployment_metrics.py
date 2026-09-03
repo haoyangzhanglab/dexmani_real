@@ -13,6 +13,17 @@ from dexmani_real.deployment.metrics import (
 
 
 class DeploymentMetricsTest(unittest.TestCase):
+    def test_debug_flush_preserves_metrics_without_info_output(self) -> None:
+        metrics = Metrics()
+        metrics.increment(ENDPOINTS_PUBLISHED)
+
+        with patch("dexmani_real.deployment.metrics.logger") as logger:
+            metrics.flush(prefix="inference metrics", debug=True)
+
+        logger.debug.assert_called_once()
+        logger.info.assert_not_called()
+        self.assertEqual(metrics.snapshot()[ENDPOINTS_PUBLISHED], 0)
+
     def test_episode_counters_and_timings_survive_flush(self) -> None:
         metrics = Metrics()
         metrics.begin_episode(generation=3, started_monotonic_ns=1)

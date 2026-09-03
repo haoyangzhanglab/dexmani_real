@@ -864,7 +864,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     metrics.observe_timing(
                         ACK_LATENCY_MS, acknowledgement_decision.latency_ms
                     )
-                    logger.info(
+                    logger.debug(
                         "coordinator: action_id=%d acknowledged by arm and hand",
                         pending_acknowledgement.candidate.action_id,
                     )
@@ -1238,7 +1238,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                             + int(config.command_acknowledgement_timeout_s * 1e9),
                         ),
                     )
-                    logger.info(
+                    logger.debug(
                         "coordinator: published action_id=%d; awaiting arm/hand acknowledgement",
                         published_candidate.action_id,
                     )

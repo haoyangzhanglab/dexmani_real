@@ -1050,6 +1050,7 @@ def inference_loop(
             metrics,
             last_ns=last_metrics_flush_ns,
             prefix="inference metrics",
+            debug=True,
         )
         time.sleep(_NO_FEEDBACK_POLL_S)
 
@@ -1172,7 +1173,10 @@ def inference_loop(
                 )
 
             last_metrics_flush_ns = flush_every(
-                metrics, last_ns=last_metrics_flush_ns, prefix="inference metrics"
+                metrics,
+                last_ns=last_metrics_flush_ns,
+                prefix="inference metrics",
+                debug=True,
             )
 
             elapsed = time.monotonic() - tick_start

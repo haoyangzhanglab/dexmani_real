@@ -202,23 +202,30 @@ class Metrics:
         self._episode_generation = None
         self._episode_started_monotonic_ns = None
 
-    def flush(self, *, prefix: str = "metrics") -> None:
+    def flush(self, *, prefix: str = "metrics", debug: bool = False) -> None:
         """Log one structured ``key=value`` line and reset the per-flush counters.
 
         Gauges (age/latency) are not reset — they are instantaneous and simply
-        keep their last observed value until the next ``observe``.
+        keep their last observed value until the next ``observe``. High-rate
+        producers may emit at DEBUG while retaining identical counter resets.
         """
         values = self.snapshot()
         if not values:
             return
         rendered = " ".join(f"{key}={value}" for key, value in sorted(values.items()))
-        logger.info("%s: %s", prefix, rendered)
+        log = logger.debug if debug else logger.info
+        log("%s: %s", prefix, rendered)
         for name in list(self._counters):
             self._counters[name] = 0
 
 
 def flush_every(
-    metrics: Metrics, *, last_ns: int, interval_s: float = 1.0, prefix: str = "metrics"
+    metrics: Metrics,
+    *,
+    last_ns: int,
+    interval_s: float = 1.0,
+    prefix: str = "metrics",
+    debug: bool = False,
 ) -> int:
     """Flush *metrics* if ``interval_s`` has elapsed since *last_ns* (monotonic ns).
 
@@ -227,6 +234,6 @@ def flush_every(
     """
     now_ns = time.monotonic_ns()
     if now_ns - last_ns >= int(interval_s * 1e9):
-        metrics.flush(prefix=prefix)
+        metrics.flush(prefix=prefix, debug=debug)
         return now_ns
     return last_ns
