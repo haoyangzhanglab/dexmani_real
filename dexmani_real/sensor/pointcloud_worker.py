@@ -197,7 +197,7 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
     if static_inputs is None:
         return
     geometry, depth_scale_m, base_from_color = static_inputs
-    logger.info(
+    logger.debug(
         "pointcloud policy: id=%s config_sha256=%s color_source=%s sampling=%s "
         "transform=%s config=%s table_plane_abcd=%s",
         POINT_CLOUD_POLICY_ID,
