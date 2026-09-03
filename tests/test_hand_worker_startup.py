@@ -1,4 +1,4 @@
-"""Offline regressions for non-moving hand startup and shadow publication."""
+"""Offline regressions for hand startup, shadow publication, and home commands."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from dexmani_real.control import publication
+from dexmani_real.config.defaults import hand as hand_defaults
+from dexmani_real.control import hand_home, publication
 from dexmani_real.control.action import ActionCandidate
 from dexmani_real.ipc.schema import (
     HAND_CONTACT_SHAPE,
@@ -258,6 +259,62 @@ class CandidatePublicationTest(unittest.TestCase):
 
         self.assertIs(pending.status, publication.CommandPublishStatus.ACK_PENDING)
         self.assertIs(applied.status, publication.CommandPublishStatus.APPLIED)
+
+
+class HandHomePublicationTest(unittest.TestCase):
+    def test_legal_home_allows_feedback_outside_command_bounds(self) -> None:
+        target = np.deg2rad(
+            np.asarray(hand_defaults.home_qpos_deg, dtype=np.float64)
+        )
+        measured = target.copy()
+        measured[4] = -0.03
+        pending = publication._HandFeedbackSnapshot(
+            qpos=measured,
+            accepted_target_action_id=0,
+        )
+        applied = publication._HandFeedbackSnapshot(
+            qpos=measured,
+            accepted_target_action_id=8,
+        )
+        candidate = SimpleNamespace(action_id=8)
+        ticket = CoupledCommandTicket(run_generation=7, ring_sequence=1)
+        published = publication.CommandPublishResult(
+            publication.CommandPublishStatus.PUBLISHED,
+            candidate=candidate,
+            ticket=ticket,
+        )
+
+        with (
+            patch.object(hand_home, "check_runtime_gate", return_value=None),
+            patch.object(
+                hand_home,
+                "read_hand_feedback",
+                side_effect=((pending, None), (applied, None)),
+            ),
+            patch.object(
+                hand_home,
+                "build_action_candidate",
+                return_value=candidate,
+            ),
+            patch.object(hand_home, "send_command", return_value=published) as send,
+        ):
+            accepted = hand_home.publish_hand_home_and_wait_applied(
+                object(),
+                target,
+                command_lower_rad=np.asarray(hand_defaults.qpos_min_rad),
+                command_upper_rad=np.asarray(hand_defaults.qpos_max_rad),
+                mechanical_lower_rad=np.asarray(
+                    hand_defaults.mechanical_qpos_min_rad
+                ),
+                mechanical_upper_rad=np.asarray(
+                    hand_defaults.mechanical_qpos_max_rad
+                ),
+                hand_feedback_max_age_s=0.1,
+                verbose=False,
+            )
+
+        self.assertTrue(accepted)
+        send.assert_called_once()
 
 
 if __name__ == "__main__":
