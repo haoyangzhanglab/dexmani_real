@@ -14,7 +14,7 @@ import dataclasses
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast, get_args, get_origin, get_type_hints
 
@@ -33,7 +33,6 @@ from dexmani_real.config.defaults import (
     TAGRetargetingParams,
     VRParams,
 )
-from dexmani_real.config.defaults import arm as arm_defaults
 from dexmani_real.config.pointcloud import PointCloudConfig
 
 _SECTION_NAMES = (
@@ -93,102 +92,6 @@ class ResolvedRuntimeConfig:
     canonical_json: str
     canonical_yaml: str
     sha256: str
-
-
-@dataclass
-class ArmLoopConfig:
-    """Arm-worker projection of :class:`ArmParams` with unit conversion.
-
-    Projects the frozen defaults into the units the arm worker and driver
-    consume (radians, Hz).  Transitional duplicate: ``runtime.arm`` remains
-    the source of truth.
-    """
-
-    joint_max_speed_rad_per_s: float = field(
-        default_factory=lambda: arm_defaults.max_joint_velocity_rad_per_s
-    )
-    joint_max_acc_rad_per_s2: float = field(
-        default_factory=lambda: arm_defaults.max_joint_acceleration_rad_per_s2
-    )
-    arm_loop_hz: float = field(default_factory=lambda: arm_defaults.loop_hz)
-    max_servo_command_jump_rad: float = field(
-        default_factory=lambda: arm_defaults.max_servo_command_jump_rad
-    )
-
-    joint_limit_lower: tuple[float, ...] = field(
-        default_factory=lambda: arm_defaults.joint_limit_lower
-    )
-    joint_limit_upper: tuple[float, ...] = field(
-        default_factory=lambda: arm_defaults.joint_limit_upper
-    )
-
-    arm_ip: str = field(default_factory=lambda: arm_defaults.ip)
-
-    home_qpos: tuple[float, ...] = field(default_factory=lambda: arm_defaults.home_qpos)
-
-    collision_sensitivity: int = field(
-        default_factory=lambda: arm_defaults.collision_sensitivity
-    )
-
-    expected_axis: int = field(default_factory=lambda: arm_defaults.expected_axis)
-    device_profile: str | None = field(
-        default_factory=lambda: arm_defaults.device_profile
-    )
-
-    homing_convergence_rad: float = field(
-        default_factory=lambda: arm_defaults.homing.convergence_rad
-    )
-    homing_step_interval_s: float = field(
-        default_factory=lambda: arm_defaults.homing.step_interval_s
-    )
-    homing_max_speed_rad_per_s: float = field(
-        default_factory=lambda: np.deg2rad(arm_defaults.homing.max_speed_deg_s)
-    )
-    homing_target_timeout_s: float = field(
-        default_factory=lambda: arm_defaults.homing.target_timeout_s
-    )
-    homing_velocity_convergence_rad_s: float = field(
-        default_factory=lambda: arm_defaults.homing.velocity_convergence_rad_s
-    )
-    homing_dwell_s: float = field(default_factory=lambda: arm_defaults.homing.dwell_s)
-
-    tcp_load_mass_kg: float = field(
-        default_factory=lambda: arm_defaults.tcp_load_mass_kg
-    )
-    tcp_load_cog_mm: tuple[float, float, float] = field(
-        default_factory=lambda: arm_defaults.tcp_load_cog_mm
-    )
-
-    @classmethod
-    def from_runtime(cls, runtime: Any) -> "ArmLoopConfig":
-        cfg = runtime.arm
-        return cls(
-            joint_max_speed_rad_per_s=float(
-                np.deg2rad(cfg.max_joint_velocity_deg_per_s)
-            ),
-            joint_max_acc_rad_per_s2=float(
-                np.deg2rad(cfg.max_joint_acceleration_deg_per_s2)
-            ),
-            arm_loop_hz=float(cfg.loop_hz),
-            max_servo_command_jump_rad=float(cfg.max_servo_command_jump_rad),
-            joint_limit_lower=tuple(cfg.joint_limit_lower),
-            joint_limit_upper=tuple(cfg.joint_limit_upper),
-            arm_ip=str(cfg.ip),
-            home_qpos=tuple(cfg.home_qpos),
-            collision_sensitivity=int(cfg.collision_sensitivity),
-            expected_axis=int(cfg.expected_axis),
-            device_profile=cfg.device_profile,
-            homing_convergence_rad=float(cfg.homing.convergence_rad),
-            homing_step_interval_s=float(cfg.homing.step_interval_s),
-            homing_max_speed_rad_per_s=float(np.deg2rad(cfg.homing.max_speed_deg_s)),
-            homing_target_timeout_s=float(cfg.homing.target_timeout_s),
-            homing_velocity_convergence_rad_s=float(
-                cfg.homing.velocity_convergence_rad_s
-            ),
-            homing_dwell_s=float(cfg.homing.dwell_s),
-            tcp_load_mass_kg=float(cfg.tcp_load_mass_kg),
-            tcp_load_cog_mm=tuple(cfg.tcp_load_cog_mm),
-        )
 
 
 def _merge(

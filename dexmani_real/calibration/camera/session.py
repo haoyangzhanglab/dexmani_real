@@ -78,7 +78,7 @@ from dexmani_real.calibration.camera.solver import (
     marker_corners_3d,
     save_camera_calibration,
 )
-from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
+from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.control.safety_gate import SafetyGate, planner_action_safety_gate
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
@@ -718,7 +718,7 @@ def run_camera_calibration(
         WorkerSpec(
             "arm-calib",
             arm_loop,
-            (shared, ArmLoopConfig.from_runtime(runtime)),
+            (shared, runtime.arm),
             ready_name="arm",
         )
     ]

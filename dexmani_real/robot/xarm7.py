@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from dexmani_real.config.runtime import ArmLoopConfig
+from dexmani_real.config.defaults import ArmParams
 from dexmani_real.robot_spec import ARM_JOINT_SHAPE
 from dexmani_real.utils.log import (
     capture_native_stdout,
@@ -135,12 +135,15 @@ def _decode_joint_states(
 
 
 def _estimate_segment_timeout_s(
-    start: np.ndarray, target: np.ndarray, cfg: ArmLoopConfig
+    start: np.ndarray, target: np.ndarray, cfg: ArmParams
 ) -> float:
     """Deadline for one firmware-planned home milestone, including settle time."""
     delta_rad = float(np.max(np.abs(np.asarray(target) - np.asarray(start))))
-    nominal_s = delta_rad / max(cfg.homing_max_speed_rad_per_s, 1e-6)
-    return max(cfg.homing_target_timeout_s, 2.0 * nominal_s + cfg.homing_target_timeout_s)
+    nominal_s = delta_rad / max(cfg.homing.max_speed_rad_per_s, 1e-6)
+    return max(
+        cfg.homing.target_timeout_s,
+        2.0 * nominal_s + cfg.homing.target_timeout_s,
+    )
 
 
 class HomeAborted(RuntimeError):
@@ -161,7 +164,7 @@ class XArm7:
     error, and cleanup does a best-effort stop.
     """
 
-    def __init__(self, cfg: ArmLoopConfig) -> None:
+    def __init__(self, cfg: ArmParams) -> None:
         self.cfg = cfg
         self._api: Any = None
 
@@ -179,7 +182,7 @@ class XArm7:
                 from xarm.wrapper import XArmAPI
 
                 logging.getLogger("origin.print").setLevel(logging.WARNING)
-                self._api = XArmAPI(self.cfg.arm_ip, is_radian=True)
+                self._api = XArmAPI(self.cfg.ip, is_radian=True)
         except Exception as exc:
             vendor_detail = (
                 sdk_connect_output.text if sdk_connect_output is not None else ""
@@ -239,8 +242,8 @@ class XArm7:
             self._api.set_servo_angle(
                 angle=qpos,
                 is_radian=True,
-                speed=self.cfg.joint_max_speed_rad_per_s,
-                mvacc=self.cfg.joint_max_acc_rad_per_s2,
+                speed=self.cfg.max_joint_velocity_rad_per_s,
+                mvacc=self.cfg.max_joint_acceleration_rad_per_s2,
                 wait=False,
             )
         )
@@ -289,7 +292,8 @@ class XArm7:
         def _converged(target: np.ndarray, q: np.ndarray, v: np.ndarray, tol_rad: float) -> bool:
             return (
                 float(np.max(np.abs(q - target))) <= tol_rad
-                and float(np.max(np.abs(v))) <= self.cfg.homing_velocity_convergence_rad_s
+                and float(np.max(np.abs(v)))
+                <= self.cfg.homing.velocity_convergence_rad_s
             )
 
         def _publish(target: np.ndarray, q: np.ndarray, v: np.ndarray, t: np.ndarray) -> None:
@@ -298,13 +302,15 @@ class XArm7:
 
         def _dwell(target: np.ndarray) -> None:
             stable_since = time.monotonic()
-            while time.monotonic() - stable_since < self.cfg.homing_dwell_s:
+            while time.monotonic() - stable_since < self.cfg.homing.dwell_s:
                 _raise_abort()
                 if on_poll is not None:
                     on_poll()
-                time.sleep(min(self.cfg.homing_step_interval_s, self.cfg.homing_dwell_s))
+                time.sleep(
+                    min(self.cfg.homing.step_interval_s, self.cfg.homing.dwell_s)
+                )
                 q, v, t = self.read()
-                if not _converged(target, q, v, self.cfg.homing_convergence_rad):
+                if not _converged(target, q, v, self.cfg.homing.convergence_rad):
                     raise RuntimeError("home dwell interrupted by position/velocity")
                 _publish(target, q, v, t)
 
@@ -312,12 +318,17 @@ class XArm7:
         qpos, qvel, _tau = self.read()
 
         if len(waypoints) == 0:
-            if not _converged(final_qpos, qpos, qvel, self.cfg.homing_convergence_rad):
+            if not _converged(
+                final_qpos, qpos, qvel, self.cfg.homing.convergence_rad
+            ):
                 raise RuntimeError("empty home path while away from canonical home")
             _dwell(final_qpos)
             return
 
-        if float(np.max(np.abs(qpos - waypoints[0]))) > self.cfg.homing_convergence_rad:
+        if (
+            float(np.max(np.abs(qpos - waypoints[0])))
+            > self.cfg.homing.convergence_rad
+        ):
             raise RuntimeError("current state moved too far from planned path start")
 
         targets = waypoints[1:]
@@ -326,7 +337,7 @@ class XArm7:
             return
 
         self.enter_mode0(on_poll=on_poll)
-        milestone_tol = min(self.cfg.homing_convergence_rad, np.deg2rad(0.5))
+        milestone_tol = min(self.cfg.homing.convergence_rad, np.deg2rad(0.5))
         current = qpos
         for index, target in enumerate(targets, start=1):
             _raise_abort()
@@ -336,8 +347,8 @@ class XArm7:
                 self._api.set_servo_angle(
                     angle=target,
                     is_radian=True,
-                    speed=self.cfg.homing_max_speed_rad_per_s,
-                    mvacc=self.cfg.joint_max_acc_rad_per_s2,
+                    speed=self.cfg.homing.max_speed_rad_per_s,
+                    mvacc=self.cfg.max_joint_acceleration_rad_per_s2,
                     wait=False,
                     radius=None,
                 )
@@ -359,11 +370,11 @@ class XArm7:
                 if _converged(target, q, v, milestone_tol):
                     if stable_since is None:
                         stable_since = time.monotonic()
-                    if time.monotonic() - stable_since >= self.cfg.homing_dwell_s:
+                    if time.monotonic() - stable_since >= self.cfg.homing.dwell_s:
                         break
                 else:
                     stable_since = None
-                time.sleep(self.cfg.homing_step_interval_s)
+                time.sleep(self.cfg.homing.step_interval_s)
             else:
                 error = np.abs(q - target)
                 joint = int(np.argmax(error))
@@ -374,7 +385,7 @@ class XArm7:
             current = q.copy()
 
         final_error = float(np.max(np.abs(current - final_qpos)))
-        if final_error > self.cfg.homing_convergence_rad:
+        if final_error > self.cfg.homing.convergence_rad:
             raise RuntimeError(f"home final error {np.rad2deg(final_error):.2f}deg")
         self.enter_mode6(on_poll=on_poll)
 
@@ -469,6 +480,9 @@ class XArm7:
             "set_tcp_load",
         )
         _check_sdk_return_code(
-            self._api.set_joint_maxacc(self.cfg.joint_max_acc_rad_per_s2, is_radian=True),
+            self._api.set_joint_maxacc(
+                self.cfg.max_joint_acceleration_rad_per_s2,
+                is_radian=True,
+            ),
             "set_joint_maxacc",
         )

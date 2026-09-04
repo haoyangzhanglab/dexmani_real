@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
+from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.ipc.schema import RECORD_OPERATOR_BYTES, RECORD_TASK_LABEL_BYTES
 from dexmani_real.recording.client import RecorderPhase, bounded_control_text
@@ -296,7 +296,7 @@ def _build_processes(
         WorkerSpec(
             "arm",
             _arm_loop,
-            (shared, ArmLoopConfig.from_runtime(runtime)),
+            (shared, runtime.arm),
             ready_name="arm",
         ),
         WorkerSpec(

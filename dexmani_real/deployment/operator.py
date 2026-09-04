@@ -18,7 +18,7 @@ import threading
 
 import numpy as np
 
-from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
+from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
 from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
 from dexmani_real.ipc.channels import RuntimeChannels
@@ -104,8 +104,6 @@ def _home(
         return False
     if abort_requested():
         return False
-    arm_config = ArmLoopConfig.from_runtime(runtime)
-
     hand_home = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
     accepted = publish_hand_home_and_wait_applied(
         shared,
@@ -132,7 +130,7 @@ def _home(
 
     result = execute_arm_home(
         shared,
-        np.asarray(arm_config.home_qpos, dtype=np.float64),
+        np.asarray(runtime.arm.home_qpos, dtype=np.float64),
         planner=planner,
         config=ArmHomeConfig.from_runtime(runtime, publish_policy_heartbeat=False),
         table_z_surface_m=float(runtime.arm.table_z_surface_m),

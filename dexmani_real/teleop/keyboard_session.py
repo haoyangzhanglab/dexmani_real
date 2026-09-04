@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
+from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
 from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
 from dexmani_real.control.publication import publish_joint_targets
@@ -187,7 +187,7 @@ def _start_workers(
     hand_requested: bool,
 ) -> tuple[Any, Any | None, bool]:
     arm_spec = WorkerSpec(
-        "arm", arm_loop, (shared, ArmLoopConfig.from_runtime(runtime)), ready_name="arm"
+        "arm", arm_loop, (shared, runtime.arm), ready_name="arm"
     )
     arm_process = build_processes(context, [arm_spec])[0]
     processes.append(arm_process)

@@ -26,7 +26,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.runtime import ArmLoopConfig
+from dexmani_real.config.defaults import ArmParams
 from dexmani_real.ipc.channels import new_frame
 from dexmani_real.ipc.schema import ARM_STATE_DTYPE, COUPLED_COMMAND_DTYPE
 from dexmani_real.robot.command_validation import check_worker_arm_command
@@ -63,7 +63,7 @@ class _LoopState:
     failures fail fast at the worker top level.
     """
 
-    cfg: ArmLoopConfig
+    cfg: ArmParams
     arm: XArm7
     frame: Any
     last_target: np.ndarray
@@ -155,7 +155,7 @@ def _write_arm_frame(
     shared.arm_state_ring.write(frame)
 
 
-def _publish_identity(shared: Any, arm: XArm7, cfg: ArmLoopConfig) -> None:
+def _publish_identity(shared: Any, arm: XArm7, cfg: ArmParams) -> None:
     """Publish device identity (the axis count is validated by ``XArm7.connect``)."""
     if not hasattr(shared, "arm_device_identity"):
         return
@@ -181,7 +181,7 @@ def _publish_identity(shared: Any, arm: XArm7, cfg: ArmLoopConfig) -> None:
     shared.arm_device_identity.value = encoded[:1023].ljust(1024, b"\x00")
 
 
-def _startup(shared: Any, arm: XArm7, cfg: ArmLoopConfig) -> _LoopState:
+def _startup(shared: Any, arm: XArm7, cfg: ArmParams) -> _LoopState:
     """Connect, enter Mode 6 once, publish the initial frame, signal ready.
 
     Returns a fully-initialized ``_LoopState``.  Any failure raises to the
@@ -219,8 +219,8 @@ def _startup(shared: Any, arm: XArm7, cfg: ArmLoopConfig) -> _LoopState:
     logger.debug("arm_loop: READY")
     logger.info(
         "arm_loop: ready and DISARMED (Mode 6 held, software disarm; ip=%s, hz=%.0f)",
-        cfg.arm_ip,
-        cfg.arm_loop_hz,
+        cfg.ip,
+        cfg.loop_hz,
     )
     return st
 
@@ -414,7 +414,7 @@ def _observe_and_publish(st: _LoopState, shared: Any) -> bool:
     return False
 
 
-def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
+def arm_loop(shared, config: ArmParams | None = None) -> None:
     """Arm process entry point — applies coupled servo endpoints via Mode 6.
 
     mp.Process target communicating exclusively through RuntimeChannels.  The
@@ -422,12 +422,12 @@ def arm_loop(shared, config: ArmLoopConfig | None = None) -> None:
     top-level handler below, which latches ``error_state``; cleanup always
     does a best-effort stop + disconnect.
     """
-    cfg = config or ArmLoopConfig()
+    cfg = config if config is not None else ArmParams()
     arm = XArm7(cfg)
     st: _LoopState | None = None
     try:
         st = _startup(shared, arm, cfg)
-        limiter = LoopRate(cfg.arm_loop_hz, label="arm")
+        limiter = LoopRate(cfg.loop_hz, label="arm")
         while shared.is_running.value:
             shared.set_heartbeat("arm", time.monotonic())
             if shared.estop_request.value:

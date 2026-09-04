@@ -29,7 +29,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
+from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
 from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
@@ -142,7 +142,6 @@ def _offer_return_home(
     shared: RuntimeChannels,
     replayer: EpisodeReplayer,
     runtime: ResolvedRuntimeConfig,
-    arm_config: ArmLoopConfig,
     *,
     hand_available: bool,
     health_check: Callable[[], str | None],
@@ -219,7 +218,7 @@ def _offer_return_home(
 
             home_result = execute_arm_home(
                 shared,
-                np.asarray(arm_config.home_qpos, dtype=np.float64),
+                np.asarray(runtime.arm.home_qpos, dtype=np.float64),
                 planner=replayer.planner,
                 config=ArmHomeConfig.from_runtime(
                     runtime,
@@ -297,9 +296,8 @@ def replay_episode(
     replayer: EpisodeReplayer | None = None
     outcome = ReplayOutcome(ReplayStatus.REJECTED, reason="replay did not start")
     try:
-        arm_config = ArmLoopConfig.from_runtime(runtime)
         hand_available = trajectory.has_hand
-        specs = [WorkerSpec("arm", _arm_loop, (shared, arm_config), ready_name="arm")]
+        specs = [WorkerSpec("arm", _arm_loop, (shared, runtime.arm), ready_name="arm")]
         if hand_available:
             specs.append(
                 WorkerSpec(
@@ -379,7 +377,6 @@ def replay_episode(
                         shared,
                         replayer,
                         runtime,
-                        arm_config,
                         hand_available=hand_available,
                         health_check=health_check,
                     )

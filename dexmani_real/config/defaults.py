@@ -57,6 +57,11 @@ class HomingParams:
         if not all(np.isfinite(value) and value > 0 for value in values):
             raise ValueError("all homing parameters must be finite and positive")
 
+    @property
+    def max_speed_rad_per_s(self) -> float:
+        """Maximum Mode-0 homing speed in radians per second."""
+        return float(np.deg2rad(self.max_speed_deg_s))
+
 
 @dataclass(frozen=True)
 class WorkspaceBounds:

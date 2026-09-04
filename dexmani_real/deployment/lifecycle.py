@@ -24,7 +24,7 @@ import threading
 from dataclasses import replace
 from typing import Any
 
-from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
+from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.deployment.config import (
     FIXED_POLICY_RUNTIME_TARGET,
     FingertipAssemblerConfig,
@@ -209,7 +209,7 @@ def build_policy_worker_specs(
         WorkerSpec(
             "arm",
             arm_loop,
-            (shared, ArmLoopConfig.from_runtime(runtime)),
+            (shared, runtime.arm),
             ready_name="arm",
         ),
     ]
