@@ -105,7 +105,8 @@ RealSense / Quest-HTS / xArm7 / XHand
   窄职责模块：[`teleop/operator_controls.py`](dexmani_real/teleop/operator_controls.py) 处理
   BEGIN/pause/home/quit 与录制决策，[`teleop/control_grid.py`](dexmani_real/teleop/control_grid.py)
   完成单个 causal tick 的读取、proposal、校验、发布和采样。pause、VR/hand feedback
-  异常、BEGIN audio gate 或录制终结进入 command-quiescence；恢复前必须重新锚定，期间不发布命令。
+  异常或录制终结进入 command-quiescence；BEGIN 音频只是 best-effort 操作者反馈，恢复运动前
+  必须等待 fresh causal feedback re-anchor，期间不发布命令。
   同步 home 是有意的控制静默区间，返回后由 loop 同时重锚 coordinator 和 control-grid
   时钟，不计作遥操作栅格丢失。
 - RecorderIO 从 fixed-size shared-memory record 按逻辑 sequence 严格、连续地取得所有权；

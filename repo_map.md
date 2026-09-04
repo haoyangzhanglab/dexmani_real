@@ -69,7 +69,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `ring.py` | 通用 seqlock shared-memory ring。 |
 | `camera_ring.py` | 大尺寸 RGB-D shared-memory ring。 |
 | `causal.py` | 按 observation anchor 读取 arm/hand/tactile/VR/camera。 |
-| `channels.py` | `RuntimeChannels`：rings、queues、typed stop request、heartbeat、readiness 的唯一 allocation owner。 |
+| `channels.py` | `RuntimeChannels`：按请求容量分配 rings、queues、typed stop request、heartbeat、readiness 的唯一 allocation owner。 |
 
 ### `runtime/`
 
@@ -140,7 +140,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `__init__.py` | 轻量控制子包标记。 |
 | `action.py` | backend-neutral `ActionCandidate` 与 representation 校验。 |
 | `safety_gate.py` | generation、limits、命令历史 delta、实测 workspace/collision 的 fail-closed gate。 |
-| `publication.py` | controller feedback/runtime gate、coupled record 非阻塞发布与 acknowledgement。 |
+| `publication.py` | 通用 controller feedback/runtime gate、command result/publication、coupled record 非阻塞发布与 acknowledgement。 |
 | `arm_home.py` | collision-checked arm homing 合同、排队、等待与 abort。 |
 | `hand_home.py` | exact hand-home 发布与 worker acknowledgement。 |
 
@@ -212,8 +212,8 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `observation.py` | 因果不可变 arm/hand/tactile/pointcloud/RGB history batch。 |
 | `timing.py` | async chunk future-step 选择与 absolute inference cadence 的纯计算。 |
 | `worker.py` | 经 Policy public API 直接 restore、camera-grid observation 校验、sync request/async cadence 与单 `ActionChunk` 发布。 |
-| `coordinator.py` | learned-policy 唯一 command producer、generation-isolated 单 chunk scheduling、SafetyGate、物理运行的 per-episode home 准入、逐 endpoint coupled 双 ACK、typed stop、action-step limit 与 watchdog。 |
-| `lifecycle.py` | `execute` 布尔控制的 worker topology、同进程 multi-episode supervision、物理模式 collision-checked home 与 verified shutdown。 |
+| `coordinator.py` | learned-policy 唯一 command producer、generation-isolated 单 chunk scheduling、endpoint disposition、SafetyGate、物理运行的 per-episode home 准入、逐 endpoint coupled 双 ACK、typed stop、action-step limit 与 watchdog。 |
+| `lifecycle.py` | policy observation history capacity sizing、`execute` 布尔控制的 worker topology、同进程 multi-episode supervision、物理模式 collision-checked home 与 verified shutdown。 |
 | `operator.py` | B/S/Q/ESC typed request；物理模式每个 episode 从 ARMED 执行 hand + collision-checked arm home，并发布一次性 home 准入标志。 |
 | `metrics.py` | inference/coordinator live counters、固定窗口 p50/p95/p99 timing，以及 log-only compact episode summary。 |
 
@@ -276,6 +276,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `tests/test_deployment_config.py` | policy deployment YAML、CLI 覆盖、默认 sync 与 max-action-steps 严格校验。 |
 | `tests/test_policy_chunk_ipc.py` | 单槽 latest-wins ActionChunk wire round-trip、严格 presence/shape/generation/capacity 校验与 inference request Event 合同。 |
 | `tests/test_policy_multimodal_observation.py` | canonical observation fields、causal alignment、tactile provenance、fingertip FK 与 worker/ring 依赖合同。 |
+| `tests/test_teleop_quiescence.py` | BEGIN/quiescence 边界的 stale/fresh causal feedback 合同，以及 audio 与 motion gate 解耦。 |
 | `tests/test_policy_offline_multimodal.py` | processed tactile/FK 等价语义与四 profile Policy Zarr admission 合同。 |
 | `tests/test_run_policy_cli.py` | list/check/shadow/run 路由、最小 CLI 参数面与 lifecycle seam。 |
 
