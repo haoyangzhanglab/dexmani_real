@@ -183,6 +183,50 @@ python examples/collect_teleop.py --print-config
 相机标定的 `--hand-geometry` 是物理事实声明：未安装 XHand 时使用 `absent`；已安装时，
 只有在它实际固定于配置的 home 姿态时才能使用 `secured-home`。它不绕过碰撞检查。
 
+### `run_policy.py` 用法
+
+先使用短 selector 列出或选择可部署 experiment：
+
+```bash
+python examples/run_policy.py list [filter]
+```
+
+`list` 只读取 Policy experiment 目录，不加载 checkpoint、Torch 或硬件 SDK。选择 experiment
+后，先做不连接硬件的严格恢复与合成 observation 检查：
+
+```bash
+python examples/run_policy.py check <policy/task/experiment> --device cuda:0
+```
+
+`check` 只接受 `--device`，默认 `cuda:0`；它验证 restore、normalizer、warmup 和 prediction。
+通过 `check` 不是硬件准入证明。
+
+`shadow` 使用真实相机、arm/XHand feedback、因果 observation、inference、IK 和 SafetyGate，
+但结构性禁止 actuator publication 和 H/home：
+
+```bash
+python examples/run_policy.py shadow <policy/task/experiment> \
+  --device cuda:0 --max-action-steps 16
+```
+
+`run` 才会发布 coupled arm/hand command。每个 episode 都必须在 ARMED 状态完成一次
+`H → B`：H 先执行 XHand home 与 collision-checked arm home，B 才开始执行。运行中 S 停止当前
+episode 并回到 ARMED；Q 有界退出；ESC 锁存 fault。下一 episode 必须重新 `H → B`：
+
+```bash
+python examples/run_policy.py run <policy/task/experiment> \
+  --device cuda:0 \
+  --runtime-config runtime.yaml \
+  --deployment-config policy_deployment.yaml \
+  --inference-mode sync \
+  --max-action-steps 96
+```
+
+`shadow` 和 `run` 都支持 `--runtime-config`、`--deployment-config`、`--inference-mode`
+（`sync` 或 `async`）和正整数 `--max-action-steps`；省略时分别使用默认 runtime、默认 deployment
+配置、`sync` 和无限 episode。子命令所属参数可放在子命令前或后。它们都会连接真实设备，运行前必须
+确认工作区、标定、急停和操作者授权；推荐顺序是 `check → shadow → run`。
+
 ### Learned policy 实时点云
 
 完整的 experiment 选择、`list/check/shadow/run` 边界、按键流程和诊断说明见
