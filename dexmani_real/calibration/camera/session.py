@@ -764,7 +764,18 @@ def run_camera_calibration(
                     graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
                     disarm_if_clean=clean_exit,
                 )
-                if clean_exit and not shutdown_report.clean:
+                worker_exit_clean = all(
+                    item.exitcode == 0 and item.escalation == "graceful"
+                    for item in shutdown_report.exits
+                )
+                shutdown_clean = (
+                    worker_exit_clean
+                    and shutdown_report.shared_closed
+                    and not bool(shared.error_state.value)
+                    and not bool(shared.estop_request.value)
+                    and int(shared.safety_state.value) == int(SafetyState.DISARMED)
+                )
+                if clean_exit and not shutdown_clean:
                     logger.error(
                         "verified shutdown invalidated the clean control exit: %s",
                         shutdown_report,

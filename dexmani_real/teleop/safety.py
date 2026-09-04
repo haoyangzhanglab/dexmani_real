@@ -10,70 +10,17 @@ import numpy as np
 
 from dexmani_real.config.defaults import arm, hand, safety
 from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
-from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
+from dexmani_real.control.hand_home import publish_hand_home_and_wait_accepted
 from dexmani_real.ipc.causal import read_arm_state_causal
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import XArm7MotionPlanner
-from dexmani_real.planning.arm_fk import make_arm_fk
-from dexmani_real.planning.poses import rot6d_to_quat_wxyz
-from dexmani_real.runtime.safety import invalidate_coupled_commands
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.config import TeleopConfig
-from dexmani_real.teleop.control_state import CommandQuiescence, TeleopLoopState
 from dexmani_real.teleop.hand_control import reset_hand_retargeter
 from dexmani_real.utils.feedback import validate_arm_feedback, validate_hand_feedback
-from dexmani_real.utils.log import ThrottledWarner, get_logger
+from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-
-def _reset_mapper_from_frames(
-    mapper: ArmWristMapper,
-    arm_state: np.ndarray | None,
-    vr_frame: dict[str, Any] | None,
-) -> bool:
-    """Atomically re-anchor wrist mapping from fresh measured arm/VR poses."""
-    if arm_state is None or vr_frame is None:
-        mapper.clear()
-        return False
-    names = arm_state.dtype.names or ()
-    if "state_valid" in names and not bool(arm_state["state_valid"][0]):
-        mapper.clear()
-        return False
-    if "connected" in names and not bool(arm_state["connected"][0]):
-        mapper.clear()
-        return False
-    try:
-        eef_pos, eef_rot6d = make_arm_fk().compute(
-            np.asarray(arm_state["qpos"][0], dtype=np.float64)
-        )
-    except Exception:
-        mapper.clear()
-        return False
-    c1 = eef_rot6d[:3]
-    c2 = eef_rot6d[3:]
-    if np.linalg.norm(c1) < 1e-12 or np.linalg.norm(np.cross(c1, c2)) < 1e-12:
-        mapper.clear()
-        return False
-
-    try:
-        wrist_pos = vr_frame.get("wrist_pos")
-        wrist_quat_wxyz = vr_frame.get("wrist_quat_wxyz")
-        if wrist_pos is None or wrist_quat_wxyz is None:
-            mapper.clear()
-            return False
-        wrist_pos_array = np.asarray(wrist_pos, dtype=np.float64)
-        wrist_quat_array = np.asarray(wrist_quat_wxyz, dtype=np.float64)
-    except (TypeError, ValueError):
-        mapper.clear()
-        return False
-    mapper.reset(
-        wrist_pos=wrist_pos_array,
-        wrist_quat_wxyz=wrist_quat_array,
-        eef_pos=eef_pos,
-        eef_quat_wxyz=rot6d_to_quat_wxyz(eef_rot6d),
-    )
-    return mapper.is_ready()
 
 
 def _do_teleop_home(
@@ -123,7 +70,7 @@ def _do_teleop_home(
         reset_hand_retargeter(hand_retargeter)
 
     if hand_available and not shared.error_state.value:
-        hand_accepted = publish_hand_home_and_wait_applied(
+        hand_accepted = publish_hand_home_and_wait_accepted(
             shared,
             np.asarray(hand_home_qpos, dtype=np.float64),
             command_lower_rad=np.asarray(hand_command_lower_rad, dtype=np.float64),
@@ -317,104 +264,3 @@ def hand_feedback_issue(
         max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
         qpos=np.asarray(state["qpos"][0]),
     )
-
-
-def enter_command_quiescence(
-    ctx: TeleopLoopState,
-    shared: RuntimeChannels,
-    quiescence: CommandQuiescence,
-    arm_mapper: ArmWristMapper,
-    reason: str,
-    *,
-    start_new_run: bool = False,
-    replace_existing_reason: bool = False,
-) -> None:
-    """Invalidate pending commands, then remain silent until re-anchored.
-
-    Repeated observations preserve the existing boundary and do not advance
-    the generation again. Explicit operator transitions may replace the reason
-    while retaining that boundary: C marks a resumable pause, whereas a
-    session-ending signal cancels that eligibility. A distinct BEGIN supersedes
-    the prior pause boundary and always creates a new run generation.
-    """
-    if start_new_run and replace_existing_reason:
-        raise ValueError("BEGIN cannot reuse an existing quiescence boundary")
-    if start_new_run:
-        previous_reason, _entered_ns = quiescence.clear()
-        if previous_reason is not None:
-            logger.info(
-                "teleop_loop: new run supersedes %s command quiescence",
-                previous_reason,
-            )
-    first_entry = quiescence.enter(
-        reason,
-        entered_monotonic_ns=time.monotonic_ns(),
-    )
-    if first_entry:
-        # ``begin_motion`` already created the generation for a new run. All
-        # other quiescence paths remain RUNNING but must still invalidate the
-        # active coupled-command ticket atomically.
-        run_generation = (
-            int(shared.run_generation.value)
-            if start_new_run
-            else invalidate_coupled_commands(shared)
-        )
-        logger.info(
-            "teleop_loop: entered %s command quiescence (run=%d)",
-            reason,
-            run_generation,
-        )
-    else:
-        previous_reason = quiescence.reason
-        if replace_existing_reason:
-            quiescence.relabel(reason)
-        logger.debug(
-            "teleop_loop: remaining in %s command quiescence "
-            "(observed %s; prior reason=%s)",
-            quiescence.reason,
-            reason,
-            previous_reason,
-        )
-    arm_mapper.clear()
-    ctx.ema_prev_pos = ctx.ema_prev_quat = None
-    ctx.hand_ramp_start = None
-    ctx.hand_ramp_step = 0
-    # No cached observation may cross a generation/quiescence boundary.
-    ctx.hand_retarget_cache.reset()
-
-
-def complete_reanchor(
-    ctx: TeleopLoopState,
-    arm_mapper: ArmWristMapper,
-    validate_warn: ThrottledWarner,
-    hand_available: bool,
-    current_arm_state: np.ndarray,
-    current_vr_frame: dict[str, Any],
-    current_hand_state: np.ndarray | None,
-) -> bool:
-    """Reset temporal state; the caller suppresses this grid's publication."""
-    if not _reset_mapper_from_frames(arm_mapper, current_arm_state, current_vr_frame):
-        validate_warn(
-            "teleop_loop: re-anchor inputs invalid — remaining command-silent"
-        )
-        return False
-    ctx.ema_prev_pos = ctx.ema_prev_quat = None
-    hand_anchor: np.ndarray | None = None
-    if hand_available:
-        if current_hand_state is not None and np.all(
-            np.isfinite(current_hand_state["qpos"][0])
-        ):
-            ctx.prev_hand_qpos = np.asarray(
-                current_hand_state["qpos"][0], dtype=np.float64
-            ).copy()
-        if ctx.prev_hand_qpos is None:
-            validate_warn(
-                "teleop_loop: hand re-anchor unavailable — remaining command-silent"
-            )
-            return False
-        hand_anchor = ctx.prev_hand_qpos.copy()
-    ctx.hand_ramp_start = hand_anchor
-    ctx.hand_ramp_step = 0
-    ctx.hand_retarget_cache.reset()
-    reset_hand_retargeter(ctx.hand_retargeter, hand_anchor)
-    return True

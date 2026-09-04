@@ -619,9 +619,10 @@ class PolicyParams:
     """Policy / teleop parameters — single source of truth."""
 
     control_hz: float = 16.0
-    # Polling is deliberately faster than the 16 Hz action grid: it shortens
-    # arm/hand progress and sync-result phase delay without raising command rate.
-    coordinator_hz: float = 128.0
+    # Executor polling is deliberately faster than the 16 Hz action grid: it
+    # shortens arm/hand progress and sync-result phase delay without raising
+    # command rate.
+    executor_poll_hz: float = 128.0
     # Learned-policy inference and causal observation timing. Model shape,
     # history, and action horizon remain PolicySpec-owned.
     max_input_age_s: float = 0.15
@@ -672,10 +673,10 @@ class PolicyParams:
         if not np.isfinite(self.control_hz) or self.control_hz <= 0:
             raise ValueError(f"control_hz={self.control_hz} must be > 0")
         if (
-            not np.isfinite(self.coordinator_hz)
-            or self.coordinator_hz < self.control_hz
+            not np.isfinite(self.executor_poll_hz)
+            or self.executor_poll_hz < self.control_hz
         ):
-            raise ValueError("coordinator_hz must be finite and >= control_hz")
+            raise ValueError("executor_poll_hz must be finite and >= control_hz")
         deployment_timing = (
             self.max_input_age_s,
             self.max_observation_skew_s,

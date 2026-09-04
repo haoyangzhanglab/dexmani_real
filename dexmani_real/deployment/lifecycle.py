@@ -5,9 +5,10 @@ Composes the runtime primitives (``WorkerSpec`` +
 ``run_supervisor``/``shutdown_processes``) into the policy workflow — resolve
 config -> create ``RuntimeChannels`` -> start the Policy-owned inference
 process -> spawn arm (+ optional hand and RGB-D / point-cloud workers) ->
-coordinator -> readiness -> ARMED -> supervise -> verified shutdown. There is
-no second health mechanism: the supervisor's heartbeat/readiness slots already
-carry ``arm``/``hand``/``camera``/``pointcloud``/``inference``/``policy``.
+executor -> readiness -> ARMED -> supervise -> verified shutdown. There is
+no second health mechanism: supervisor heartbeats cover the policy executor,
+actuator, and inference workers, while readiness covers asynchronous startup
+only.
 
 There is no VR worker or recorder. The camera worker is included whenever the
 explicit observation contract contains ``point_cloud`` or ``rgb``; the
@@ -31,9 +32,10 @@ from dexmani_real.deployment.config import (
     PolicyDeploymentConfig,
     PolicyWorkerConfig,
     policy_observation_fields,
+    validate_max_running_s,
     validate_policy_runtime_compatibility,
 )
-from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_loop
+from dexmani_real.deployment.executor import policy_executor_loop
 from dexmani_real.deployment.operator import build_home_planner, run_operator_control
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
@@ -43,7 +45,6 @@ from dexmani_real.runtime.safety import SafetyState, require_transition, transit
 from dexmani_real.runtime.supervisor import (
     run_supervisor,
     shutdown_processes,
-    validate_max_running_s,
     wait_subsystem_ready,
 )
 from dexmani_real.runtime.workers import (
@@ -164,14 +165,13 @@ def build_policy_worker_specs(
     *,
     execute: bool,
     deployment_config: PolicyDeploymentConfig | None = None,
+    max_running_s: float | None = None,
 ) -> list[WorkerSpec]:
     """Build the workers required by the explicit deployment contract.
 
     Readiness order is the single source of truth for build order and for the
-    readiness/heartbeat names derived from it. ``ready_name`` mirrors the
-    process ``name`` for every worker (the coordinator reuses the existing
-    ``policy`` control-source slot, the inference worker the new ``inference``
-    slot).
+    readiness names derived from it. ``ready_name`` exists only for workers
+    whose asynchronous initialization can fail; executor liveness is enough.
     """
     validate_policy_runtime_compatibility(policy_spec, runtime)
     if not isinstance(worker_config, PolicyWorkerConfig):
@@ -181,11 +181,7 @@ def build_policy_worker_specs(
     deployment = deployment_config or PolicyDeploymentConfig()
     if not isinstance(deployment, PolicyDeploymentConfig):
         raise TypeError("deployment_config must be a PolicyDeploymentConfig")
-    coordinator_config = CoordinatorConfig.from_runtime(
-        runtime,
-        execute=execute,
-        deployment_config=deployment,
-    )
+    max_running_s = validate_max_running_s(max_running_s)
     pointcloud_requested = _requires_pointcloud(policy_spec)
     camera_requested = _requires_camera(policy_spec)
     fingertip_config = (
@@ -244,9 +240,15 @@ def build_policy_worker_specs(
             ),
             WorkerSpec(
                 "policy",
-                coordinator_loop,
-                (shared, coordinator_config),
-                ready_name="policy",
+                policy_executor_loop,
+                (
+                    shared,
+                    runtime,
+                    policy_spec,
+                    deployment,
+                    execute,
+                    max_running_s,
+                ),
             ),
         ]
     )
@@ -343,6 +345,7 @@ def run_policy_deployment(
             worker_config,
             execute=execute,
             deployment_config=deployment,
+            max_running_s=max_running_s,
         )
         procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)
@@ -377,6 +380,19 @@ def run_policy_deployment(
             )
             return 1
         print("  inference: ready", flush=True)
+
+        # A ready flag is one-shot state. Recheck the process immediately before
+        # starting hardware so a post-ready inference crash cannot open devices.
+        if shared.error_state.value or not inference_process.is_alive():
+            logger.error("inference exited or faulted after reporting ready")
+            shared.error_state.value = True
+            require_transition(shared, SafetyState.FAULT)
+            shutdown_report = shutdown_processes(
+                shared,
+                started_procs,
+                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+            )
+            return 1
 
         remaining_pairs = [
             (spec, process)
@@ -430,7 +446,11 @@ def run_policy_deployment(
         operator_thread.start()
 
         process_names = [spec.name for spec in specs]
-        heartbeat_names = process_names
+        heartbeat_names = [
+            spec.name
+            for spec in specs
+            if spec.name in {"arm", "hand", "inference", "policy"}
+        ]
         exit_reason, normal_exit = run_supervisor(
             shared,
             started_procs,
@@ -438,8 +458,6 @@ def run_policy_deployment(
             heartbeat_names,
             heartbeat_timeouts_s=dict(runtime.safety.heartbeat_timeouts),
             supervisor_hz=float(runtime.safety.supervisor_hz),
-            max_running_s=max_running_s,
-            exit_after_run_stops=False,
         )
 
         if operator_stop is not None:
@@ -459,12 +477,19 @@ def run_policy_deployment(
             graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
             disarm_if_clean=normal_exit,
         )
-        clean_exit = normal_exit and shutdown_report.clean
-        safety_name = (
-            SafetyState(shutdown_report.safety_state).name
-            if shutdown_report.safety_state is not None
-            else "UNKNOWN"
+        worker_exit_clean = all(
+            item.exitcode == 0 and item.escalation == "graceful"
+            for item in shutdown_report.exits
         )
+        clean_exit = (
+            normal_exit
+            and worker_exit_clean
+            and shutdown_report.shared_closed
+            and not bool(shared.error_state.value)
+            and not bool(shared.estop_request.value)
+            and int(shared.safety_state.value) == int(SafetyState.DISARMED)
+        )
+        safety_name = SafetyState(int(shared.safety_state.value)).name
         print(f"\n── Session End ──")
         print(
             f"  exit_reason={exit_reason}  safety={safety_name}  "

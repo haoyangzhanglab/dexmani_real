@@ -182,8 +182,8 @@ class ProcessingConfig:
     handbase_quat_eef_wxyz: tuple[float, float, float, float] = (
         hand.T_eef_handbase_quat_wxyz
     )
-    # Learned-policy endpoints are rejected, never clipped, by the deployment
-    # coordinator.  Offline processing therefore applies the same per-grid
+    # Learned-policy endpoints are rejected, never clipped, by the policy
+    # executor. Offline processing therefore applies the same per-grid
     # contract before an episode can enter a deployment training set.
     arm_max_delta_rad_per_tick: float | None = policy.arm_max_delta_rad_per_tick
     hand_max_delta_rad_per_tick: float = hand.hand_max_delta_rad_per_tick

@@ -6,7 +6,6 @@ through it — no direct references, no RPC, no business logic.
 
 from __future__ import annotations
 
-import math
 import multiprocessing as mp
 import time
 from dataclasses import dataclass, field
@@ -14,16 +13,15 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import camera, hand, policy
+from dexmani_real.config.defaults import camera
 from dexmani_real.ipc.camera_ring import CameraRingBuffer
 from dexmani_real.ipc.ring import SharedMemoryRingBuffer
 from dexmani_real.ipc.schema import (
     ARM_STATE_DTYPE,
     COUPLED_COMMAND_DTYPE,
-    HAND_JOINT_SHAPE,
     HAND_STATE_DTYPE,
     HAND_TACTILE_DTYPE,
-    POLICY_CHUNK_DTYPE,
+    PREDICTION_DTYPE,
     RECORD_CONTROL_DTYPE,
     RECORD_STATUS_DTYPE,
     SUPPORTED_POINT_CLOUD_COUNTS,
@@ -38,12 +36,11 @@ logger = get_logger(__name__)
 
 @dataclass
 class RuntimeChannelsConfig:
-    """Centralized configuration for RuntimeChannels ring sizes, camera defaults,
-    and workspace bounds.
+    """Centralized configuration for RuntimeChannels ring sizes and camera defaults.
 
-    All ring ``maxlen`` values, camera resolution defaults, and workspace
-    boundary constants are gathered here so they have a single source of truth
-    rather than being scattered across entry points.
+    All ring ``maxlen`` values and camera resolution defaults are gathered here
+    so they have a single source of truth rather than being scattered across
+    entry points.
 
     Usage::
 
@@ -60,7 +57,7 @@ class RuntimeChannelsConfig:
     record_control_ring_maxlen: int = 1
     record_sample_ring_maxlen: int = 4
     record_status_ring_maxlen: int = 1
-    policy_chunk_ring_maxlen: int = 1
+    prediction_ring_maxlen: int = 1
     pointcloud_num_points: int = 1024
     camera_requested: bool = False
     pointcloud_requested: bool = False
@@ -71,13 +68,6 @@ class RuntimeChannelsConfig:
     # Zero is the stable DISARMED wire value defined by runtime.safety.
     initial_safety_state: int = 0
 
-    control_hz: float = field(default_factory=lambda: policy.control_hz)
-    hand_home_qpos_rad: tuple[float, ...] = field(
-        default_factory=lambda: tuple(
-            float(value) for value in np.deg2rad(hand.home_qpos_deg)
-        )
-    )
-
     camera_rgb_shape: tuple[int, int, int] = field(
         default_factory=lambda: camera.rgb_shape
     )
@@ -86,10 +76,6 @@ class RuntimeChannelsConfig:
     )
 
     arm_home_q_maxsize: int = 2
-
-    workspace_bounds: "np.ndarray" = field(
-        default_factory=lambda: policy.workspace.as_array()
-    )
 
     def __post_init__(self) -> None:
         capacities = (
@@ -102,16 +88,14 @@ class RuntimeChannelsConfig:
             self.record_control_ring_maxlen,
             self.record_sample_ring_maxlen,
             self.record_status_ring_maxlen,
-            self.policy_chunk_ring_maxlen,
+            self.prediction_ring_maxlen,
             self.pointcloud_ring_maxlen,
             self.arm_home_q_maxsize,
         )
         if any(int(value) <= 0 for value in capacities):
             raise ValueError("RuntimeChannels ring/queue capacities must be positive")
-        if int(self.policy_chunk_ring_maxlen) != 1:
-            raise ValueError("policy_chunk_ring_maxlen must remain exactly 1")
-        if not math.isfinite(self.control_hz) or self.control_hz <= 0:
-            raise ValueError("RuntimeChannels control_hz must be finite and positive")
+        if int(self.prediction_ring_maxlen) != 1:
+            raise ValueError("prediction_ring_maxlen must remain exactly 1")
         if (
             isinstance(self.pointcloud_num_points, bool)
             or int(self.pointcloud_num_points) not in SUPPORTED_POINT_CLOUD_COUNTS
@@ -134,20 +118,6 @@ class RuntimeChannelsConfig:
             raise ValueError(
                 "RuntimeChannels must start in the stable DISARMED wire state 0"
             )
-        bounds = np.asarray(self.workspace_bounds, dtype=np.float64)
-        if (
-            bounds.shape != (3, 2)
-            or not np.all(np.isfinite(bounds))
-            or np.any(bounds[:, 0] > bounds[:, 1])
-        ):
-            raise ValueError(
-                "RuntimeChannels workspace_bounds must be finite shape (3, 2)"
-            )
-        hand_home = np.asarray(self.hand_home_qpos_rad, dtype=np.float64)
-        if hand_home.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(hand_home)):
-            raise ValueError(
-                "RuntimeChannels hand_home_qpos_rad must be finite shape (12,)"
-            )
 
     @classmethod
     def from_runtime(
@@ -159,16 +129,6 @@ class RuntimeChannelsConfig:
         pointcloud_requested: bool = False,
     ) -> "RuntimeChannelsConfig":
         cam = getattr(runtime, "camera")
-        pol = getattr(runtime, "policy")
-        hand_cfg = getattr(runtime, "hand")
-        bounds = np.array(
-            [
-                [pol.workspace.x_min, pol.workspace.x_max],
-                [pol.workspace.y_min, pol.workspace.y_max],
-                [pol.workspace.z_min, pol.workspace.z_max],
-            ],
-            dtype=np.float64,
-        )
         return cls(
             camera_ring_maxlen=int(cam.ring_maxlen),
             camera_rgb_shape=(int(cam.height), int(cam.width), 3),
@@ -176,11 +136,6 @@ class RuntimeChannelsConfig:
             pointcloud_num_points=int(pointcloud_num_points),
             camera_requested=camera_requested,
             pointcloud_requested=pointcloud_requested,
-            control_hz=float(pol.control_hz),
-            hand_home_qpos_rad=tuple(
-                float(value) for value in np.deg2rad(hand_cfg.home_qpos_deg)
-            ),
-            workspace_bounds=bounds,
         )
 
 
@@ -194,7 +149,7 @@ _RING_RESOURCE_NAMES = (
     "record_control_ring",
     "record_sample_ring",
     "record_status_ring",
-    "policy_chunk_ring",
+    "prediction_ring",
     "pointcloud_ring",
 )
 _QUEUE_RESOURCE_NAMES = ("arm_home_q",)
@@ -254,7 +209,7 @@ class RuntimeChannels:
     record_control_ring: SharedMemoryRingBuffer  # policy -> RecorderIO episode boundary
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     record_status_ring: SharedMemoryRingBuffer  # RecorderIO -> controller/main
-    policy_chunk_ring: SharedMemoryRingBuffer  # inference -> coordinator, single latest
+    prediction_ring: SharedMemoryRingBuffer  # inference -> policy executor, single latest
     pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> inference
 
     arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, generation)
@@ -266,8 +221,6 @@ class RuntimeChannels:
     # The active ring sequence fences latest-wins commands at each SDK boundary.
     active_coupled_command_sequence: Any
     recorder_consumed_sequence: Any
-    action_control_hz: float
-    hand_home_qpos_rad: tuple[float, ...]
 
     is_running: Any  # Main -> all
     is_recording: Any  # policy -> arm/hand/camera
@@ -278,13 +231,13 @@ class RuntimeChannels:
         Any  # Main -> camera; keep native RGB-D payload publication active
     )
     pointcloud_requested: Any  # Main -> pointcloud worker
-    start_request: Any  # Main -> coordinator: B (start a new policy run)
-    # Main/operator -> coordinator: true only after this process completed the
+    start_request: Any  # Main -> policy executor: B (start a new policy run)
+    # Main/operator -> policy executor: true only after this process completed the
     # authorized hand-home + collision-checked arm-home sequence.
     physical_home_completed: Any
-    # Main -> coordinator: StopRequest code (S or an explicit run-time limit).
+    # Main/operator -> policy executor: explicit S request.
     stop_request: Any
-    inference_request: Any  # coordinator -> inference, sync one-chunk trigger
+    inference_request: Any  # policy executor -> inference, sync one-prediction trigger
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write
     # Serializes the motion permit and coupled-command ticket state. It is
@@ -420,10 +373,10 @@ class RuntimeChannels:
             maxlen=cfg.record_status_ring_maxlen,
             create=True,
         )
-        storage.policy_chunk_ring = SharedMemoryRingBuffer(
-            f"{prefix}_policy_chunk",
-            dtype=POLICY_CHUNK_DTYPE,
-            maxlen=cfg.policy_chunk_ring_maxlen,
+        storage.prediction_ring = SharedMemoryRingBuffer(
+            f"{prefix}_prediction",
+            dtype=PREDICTION_DTYPE,
+            maxlen=cfg.prediction_ring_maxlen,
             create=True,
         )
         storage.pointcloud_ring = SharedMemoryRingBuffer(
@@ -439,10 +392,6 @@ class RuntimeChannels:
         storage.run_started_monotonic_ns = ctx.Value("Q", 0)
         storage.active_coupled_command_sequence = ctx.Value("Q", 0)
         storage.recorder_consumed_sequence = ctx.Value("Q", 0)
-        storage.action_control_hz = float(cfg.control_hz)
-        storage.hand_home_qpos_rad = tuple(
-            float(value) for value in cfg.hand_home_qpos_rad
-        )
 
         storage.is_running = ctx.Value("b", True)
         storage.is_recording = ctx.Value("b", False)

@@ -19,8 +19,8 @@ from scipy.spatial.transform import Rotation
 
 from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
-from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
-from dexmani_real.control.publication import publish_joint_targets
+from dexmani_real.control.hand_home import publish_hand_home_and_wait_accepted
+from dexmani_real.control.publication import prepare_joint_command, publish_command
 from dexmani_real.control.safety_gate import planner_action_safety_gate
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
@@ -616,7 +616,7 @@ def _run_keyboard_home(
         hand_home_qpos_rad = np.deg2rad(
             np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)
         )
-        hand_home_accepted = publish_hand_home_and_wait_applied(
+        hand_home_accepted = publish_hand_home_and_wait_accepted(
             shared,
             hand_home_qpos_rad,
             command_lower_rad=np.asarray(
@@ -710,18 +710,27 @@ def _publish_keyboard_target(
     except (TypeError, ValueError):
         max_qpos_delta_to_measured_deg = float("nan")
 
-    publish_result = publish_joint_targets(
+    prepared = prepare_joint_command(
         shared,
         np.asarray(ik_result.qpos, dtype=np.float64).copy(),
-        safety_gate=safety_gate,
+        gate=safety_gate,
         arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
     )
-    candidate = publish_result.candidate
-    if not publish_result.succeeded or candidate is None or candidate.arm_qpos is None:
+    candidate = prepared.candidate
+    publish_result = (
+        publish_command(shared, candidate) if candidate is not None else None
+    )
+    if (
+        publish_result is None
+        or not publish_result.published
+        or candidate is None
+        or candidate.arm_qpos is None
+    ):
         return _KeyboardPublishResult(
             _KeyboardPublishStatus.SAFETY_REJECTED,
-            detail=publish_result.reason,
+            detail=prepared.reason
+            or (publish_result.reason if publish_result is not None else ""),
         )
     return _KeyboardPublishResult(
         _KeyboardPublishStatus.PUBLISHED,
@@ -1176,7 +1185,18 @@ def run_keyboard_experiment(
                 )
                 exit_code = 1
             else:
-                if exit_code == 0 and not shutdown_report.clean:
+                worker_exit_clean = all(
+                    item.exitcode == 0 and item.escalation == "graceful"
+                    for item in shutdown_report.exits
+                )
+                shutdown_clean = (
+                    worker_exit_clean
+                    and shutdown_report.shared_closed
+                    and not bool(shared.error_state.value)
+                    and not bool(shared.estop_request.value)
+                    and int(shared.safety_state.value) == int(SafetyState.DISARMED)
+                )
+                if exit_code == 0 and not shutdown_clean:
                     logger.error(
                         "verified shutdown invalidated the clean control exit: %s",
                         shutdown_report,

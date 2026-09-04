@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -14,8 +15,8 @@ from dexmani_real.runtime.safety import (
     StopRequest,
     begin_motion,
     begin_requested_motion,
+    coupled_command_ticket_allows_execution,
     coupled_command_ticket_is_current,
-    request_policy_run_time_limit,
     request_policy_start,
     request_policy_stop,
     revoke_motion,
@@ -106,25 +107,6 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
         shared.physical_home_completed.value = True
         self.assertTrue(request_policy_start(shared, require_physical_home=True))
 
-    def test_time_limit_request_is_generation_fenced(self) -> None:
-        shared = _FakeShared()
-        self.assertTrue(begin_motion(shared))
-        generation = int(shared.run_generation.value)
-        self.assertFalse(
-            request_policy_run_time_limit(
-                shared,
-                expected_run_generation=generation - 1,
-            )
-        )
-        self.assertTrue(
-            request_policy_run_time_limit(
-                shared,
-                expected_run_generation=generation,
-            )
-        )
-        self.assertEqual(shared.safety_state.value, int(SafetyState.RUNNING))
-        self.assertEqual(shared.stop_request.value, int(StopRequest.RUN_TIME_LIMIT))
-
     def test_second_episode_advances_generation_and_invalidates_old_ticket(
         self,
     ) -> None:
@@ -135,6 +117,7 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
         old_ticket = CoupledCommandTicket(
             run_generation=first_generation,
             ring_sequence=7,
+            valid_until_monotonic_ns=time.monotonic_ns() + 1_000_000_000,
         )
         shared.active_coupled_command_sequence.value = old_ticket.ring_sequence
         self.assertTrue(coupled_command_ticket_is_current(shared, ticket=old_ticket))
@@ -146,6 +129,31 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
         self.assertGreater(second_generation, first_generation)
 
         self.assertFalse(coupled_command_ticket_is_current(shared, ticket=old_ticket))
+
+    def test_stop_revokes_active_ticket_before_the_sdk_boundary(self) -> None:
+        shared = _FakeShared()
+        self.assertTrue(begin_motion(shared))
+        active_ticket = CoupledCommandTicket(
+            run_generation=int(shared.run_generation.value),
+            ring_sequence=7,
+            valid_until_monotonic_ns=time.monotonic_ns() + 1_000_000_000,
+        )
+        shared.active_coupled_command_sequence.value = active_ticket.ring_sequence
+        self.assertTrue(
+            coupled_command_ticket_allows_execution(
+                shared,
+                ticket=active_ticket,
+            )
+        )
+
+        self.assertTrue(request_policy_stop(shared))
+
+        self.assertFalse(
+            coupled_command_ticket_allows_execution(
+                shared,
+                ticket=active_ticket,
+            )
+        )
 
     def test_physical_operator_allows_home_before_each_episode(self) -> None:
         shared = _FakeShared()
@@ -182,6 +190,33 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
         self.assertEqual(shared.stop_request.value, int(StopRequest.NONE))
         self.assertTrue(keyboard.started)
         self.assertTrue(keyboard.stopped)
+
+    def test_physical_begin_requires_a_successful_home_sequence(self) -> None:
+        shared = _FakeShared()
+        keyboard = _FakeKeyboard(
+            shared,
+            [[ControlSignal.HOME], [ControlSignal.BEGIN]],
+        )
+        home = Mock(return_value=False)
+
+        with (
+            patch(
+                "dexmani_real.deployment.operator.KeyboardHandler",
+                return_value=keyboard,
+            ),
+            patch("dexmani_real.deployment.operator._home", home),
+        ):
+            run_operator_control(
+                shared,
+                SimpleNamespace(),
+                Mock(),
+                stop_event=threading.Event(),
+                execute=True,
+            )
+
+        home.assert_called_once()
+        self.assertFalse(shared.physical_home_completed.value)
+        self.assertFalse(shared.start_request.value)
 
     def test_home_is_rejected_while_running(self) -> None:
         shared = _FakeShared()

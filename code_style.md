@@ -86,7 +86,7 @@ entry point
 - `control/`：跨控制方式共用的 action contract、safety boundary、publication 与 homing。
 - `replay/`：物理回放的加载、调度、捕获、评估与 session。
 - `calibration/`：相机、桌面等标定算法与 side-effect lifecycle。
-- `deployment/`：模型 observation、inference、action chunk 和调度。
+- `deployment/`：模型 observation、inference、flat Prediction IPC 和调度。
 - `recording/`：raw episode schema、写入与读取。
 - `data/`：离线清洗和训练数据导出。
 - `runtime/`：进程生命周期、supervisor 与结构化退出状态。
@@ -317,9 +317,9 @@ def resample_joint_plan(
 再按数据流顺序调用下一层具体函数：
 
 ```python
-def control_tick(snapshot: ObservationSnapshot) -> CommandPublishResult:
+def control_tick(snapshot: ObservationSnapshot) -> PublishResult:
     if not snapshot.is_fresh:
-        return CommandPublishResult.skipped(SkipReason.STALE_OBSERVATION)
+        return PublishResult(published=False, reason="stale_observation")
 
     proposal = compute_action_proposal(snapshot)
     candidate = build_action_candidate(proposal, snapshot)
@@ -346,15 +346,15 @@ def control_tick(snapshot: ObservationSnapshot) -> CommandPublishResult:
 def run_policy_loop(
     observation_reader: PolicyObservationReader,
     policy_runtime: PolicyRuntime,
-    publish_chunk: Callable[[ActionChunk], bool],
+    publish_prediction: Callable[[np.ndarray], bool],
     stop_event: Event,
     *,
     read_timeout_s: float,
 ) -> None:
     while not stop_event.is_set():
         observation = observation_reader.read_fresh(timeout_s=read_timeout_s)
-        action_chunk = policy_runtime.infer(observation)
-        if not publish_chunk(action_chunk):
+        flat_actions = policy_runtime.predict(observation)
+        if not publish_prediction(flat_actions):
             return
 ```
 
@@ -510,7 +510,7 @@ startup。不依赖 `__del__` 关闭硬件；如果 context manager 能显著让
 ```python
 def run_policy_deployment(
     config: PolicyWorkflowConfig,
-    publish_chunk: Callable[[ActionChunk], bool],
+    publish_prediction: Callable[[np.ndarray], bool],
     stop_event: Event,
 ) -> None:
     with ExitStack() as cleanup:
@@ -526,7 +526,7 @@ def run_policy_deployment(
         run_policy_loop(
             observation_reader,
             policy_runtime,
-            publish_chunk,
+            publish_prediction,
             stop_event,
             read_timeout_s=config.read_timeout_s,
         )
@@ -554,10 +554,9 @@ class PolicyRuntime:
             return
         self._backend = TorchPolicyBackend.from_checkpoint(self._config)
 
-    def infer(self, observation: PolicyObservation) -> ActionChunk:
+    def predict(self, observation: PolicyObservation) -> np.ndarray:
         backend = self._require_backend()
-        raw_action = backend.predict(observation)
-        return decode_joint_action(raw_action, config=self._config.action)
+        return decode_joint_action(backend.predict(observation), config=self._config.action)
 
     def close(self) -> None:
         backend = self._backend
@@ -653,8 +652,8 @@ read → check freshness/state → compute → validate → publish → rate con
 typed observation (causal T-step multimodal history)
 → dexmani_policy public runtime (load/predict/reset_episode)
 → Real NumPy adapter
-→ joint/EE action chunk
-→ scheduler/coordinator (one active chunk + endpoint index + EE→IK)
+→ flat joint/EE prediction
+→ inference-to-executor transport (one latest prediction + endpoint index + EE→IK)
 → shared safety gate (limits + delta + collision)
 → actuator IPC
 ```
@@ -667,8 +666,8 @@ typed observation (causal T-step multimodal history)
 - Real 校验固定硬件、字段 shape/dtype/语义、控制周期与 IPC capacity，不解析 checkpoint 内部结构；
 - inference/no-grad、normalization/denormalization 与 model preprocessing 均由 Policy runtime 拥有；
 - EE action、joint action、degrees/radians 不做静默猜测或自动兼容；
-- 不允许模型代码直接访问 hardware SDK 或绕过 coordinator；
-- `FakePolicyRuntime` 保持确定性，用于验证 observation → action chunk 链路而非模拟真实性能。
+- 不允许模型代码直接访问 hardware SDK 或绕过 policy executor 或 shared safety gate；
+- `FakePolicyRuntime` 保持确定性，用于验证 observation → flat prediction 链路而非模拟真实性能。
 
 ## 13. 数据采集和离线处理
 

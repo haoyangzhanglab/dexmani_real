@@ -1,6 +1,6 @@
 """Compute bounded teleoperation action proposals without side effects.
 
-The coordinator supplies all observations and temporal state, then remains
+The control-grid owner supplies observations and temporal state, then remains
 responsible for safety-gated command publication and recording. Keeping this
 module pure makes proposal behavior testable without shared memory or hardware.
 """
@@ -140,7 +140,7 @@ def compute_hand_joint_proposal(
     """Retarget, shape, and validate one hand proposal without publishing it.
 
     The final target is bounded against the previously published hand endpoint,
-    matching the learned-policy coordinator's reject-only per-grid contract.
+    matching the reject-only per-grid contract for the published endpoint.
     The hand worker separately bounds from measured feedback before its SDK
     call, so this proposal limit never weakens the actuator safety boundary.
     """

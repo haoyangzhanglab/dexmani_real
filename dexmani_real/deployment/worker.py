@@ -1,10 +1,10 @@
-"""Inference worker: observations -> model proposals -> ``policy_chunk_ring``.
+"""Inference worker: observations -> flat predictions -> ``prediction_ring``.
 
 The inference worker is the *only* process that touches the model. It reads
 causal observations from the shared rings, runs
 :meth:`~dexmani_real.deployment.contracts.PolicyRuntime.predict`, and publishes
-the resulting :class:`~dexmani_real.deployment.contracts.ActionChunk` to the
-latest-wins ``policy_chunk_ring``. It never writes ``coupled_cmd_ring``, the
+the resulting :class:`~dexmani_real.deployment.contracts.Prediction` to the
+latest-wins ``prediction_ring``. It never writes ``coupled_cmd_ring``, the
 SDK, ``SafetyState``, or ``run_generation`` — model output is a proposal, not a
 robot command.
 
@@ -29,28 +29,8 @@ from dexmani_real.deployment.config import (
     PolicyWorkerConfig,
     policy_observation_fields,
 )
-from dexmani_real.deployment.contracts import (
-    ActionChunk,
-    InferenceContext,
-    PolicyPrediction,
-    PolicyRuntime,
-)
-from dexmani_real.deployment.metrics import (
-    CHUNKS_CREATED,
-    CHUNKS_GENERATION_DROPPED,
-    INFERENCE_MS,
-    OBSERVATION_AGE_MS,
-    OBSERVATION_SKEW_MS,
-    OBSERVATION_WAIT_ARM_HISTORY,
-    OBSERVATION_WAIT_GRID_ADVANCE,
-    OBSERVATION_WAIT_POINTCLOUD_GRID,
-    OBSERVATION_WAIT_POINTCLOUD_STALE,
-    OBSERVATION_WAIT_RGB_GRID,
-    OBSERVATION_WAIT_RGB_HISTORY,
-    OBSERVATIONS_BUILT,
-    Metrics,
-    flush_every,
-)
+from dexmani_real.deployment.contracts import PolicyRuntime, Prediction
+from dexmani_real.deployment.metrics import PolicyStats, flush_every
 from dexmani_real.deployment.observation import (
     FrameWindow,
     ObservationBatch,
@@ -60,11 +40,7 @@ from dexmani_real.deployment.observation import (
 )
 from dexmani_real.deployment.timing import next_periodic_deadline_ns
 from dexmani_real.ipc.channels import RuntimeChannels, new_frame
-from dexmani_real.ipc.schema import (
-    MAX_POLICY_CHUNK_STEPS,
-    POLICY_CHUNK_DTYPE,
-    validate_point_cloud_array,
-)
+from dexmani_real.ipc.schema import PREDICTION_DTYPE, validate_point_cloud_array
 from dexmani_real.planning.arm_fk import make_arm_fk
 from dexmani_real.planning.fingertip import compute_fingertip_points_xarm_base
 from dexmani_real.planning.hand_fk import HandKinematics
@@ -105,91 +81,31 @@ def _load_inference_runtime(config: PolicyWorkerConfig) -> PolicyRuntime:
         raise
 
 
-def serialize_action_chunk(chunk: ActionChunk) -> np.ndarray:
-    """Serialize one validated ActionChunk without publishing or scheduling it."""
-    if not isinstance(chunk, ActionChunk):
-        raise TypeError("chunk must be an ActionChunk")
-    frame = new_frame(POLICY_CHUNK_DTYPE)
-    frame["chunk_id"][0] = np.uint64(chunk.chunk_id)
-    frame["run_generation"][0] = np.uint64(chunk.run_generation)
-    frame["observation_id"][0] = np.uint64(chunk.observation_id)
-    frame["observation_anchor_monotonic_ns"][0] = np.uint64(
-        chunk.observation_anchor_monotonic_ns
+def serialize_prediction(prediction: Prediction) -> np.ndarray:
+    """Serialize one validated flat prediction without scheduling it."""
+    if not isinstance(prediction, Prediction):
+        raise TypeError("prediction must be a Prediction")
+    frame = new_frame(PREDICTION_DTYPE)
+    frame["run_generation"][0] = np.uint64(prediction.run_generation)
+    frame["source_monotonic_ns"][0] = np.uint64(prediction.source_monotonic_ns)
+    frame["logical_step_monotonic_ns"][0] = np.uint64(
+        prediction.logical_step_monotonic_ns
     )
-    frame["observation_latest_source_monotonic_ns"][0] = np.uint64(
-        chunk.observation_latest_source_monotonic_ns
+    frame["num_steps"][0] = np.uint32(prediction.num_steps)
+    frame["action_dim"][0] = np.uint32(prediction.actions.shape[1])
+    frame["actions"][0, : prediction.num_steps, : prediction.actions.shape[1]] = (
+        prediction.actions
     )
-    frame["observation_logical_step_monotonic_ns"][0] = np.uint64(
-        chunk.observation_logical_step_monotonic_ns
-    )
-    frame["inference_started_monotonic_ns"][0] = np.uint64(
-        chunk.inference_started_monotonic_ns
-    )
-    frame["inference_finished_monotonic_ns"][0] = np.uint64(
-        chunk.inference_finished_monotonic_ns
-    )
-    frame["num_steps"][0] = np.uint32(chunk.num_steps)
-    frame["arm_present"][0] = np.uint8(chunk.arm_present)
-    frame["ee_present"][0] = np.uint8(chunk.ee_present)
-    frame["hand_present"][0] = np.uint8(chunk.hand_present)
-    n = chunk.num_steps
-    if chunk.arm_qpos is not None:
-        frame["arm_qpos"][0, :n] = chunk.arm_qpos
-    if chunk.hand_qpos is not None:
-        frame["hand_qpos"][0, :n] = chunk.hand_qpos
-    if chunk.ee_pos is not None:
-        frame["ee_pos"][0, :n] = chunk.ee_pos
-    if chunk.ee_rot6d is not None:
-        frame["ee_rot6d"][0, :n] = chunk.ee_rot6d
     return frame
 
 
-def action_chunk_from_prediction(
-    prediction: PolicyPrediction,
-    *,
-    chunk_id: int,
-    context: InferenceContext,
-) -> ActionChunk:
-    """Combine one untimed prediction with its immutable inference provenance."""
-    if not isinstance(prediction, PolicyPrediction):
-        raise TypeError("prediction must be a PolicyPrediction")
-    if not isinstance(context, InferenceContext):
-        raise TypeError("context must be an InferenceContext")
-    values = (
-        prediction.arm_qpos if prediction.arm_qpos is not None else prediction.ee_pos
-    )
-    assert values is not None
-    return ActionChunk(
-        chunk_id=chunk_id,
-        run_generation=context.run_generation,
-        observation_id=context.observation_id,
-        observation_anchor_monotonic_ns=context.observation_anchor_monotonic_ns,
-        observation_latest_source_monotonic_ns=(
-            context.observation_latest_source_monotonic_ns
-        ),
-        observation_logical_step_monotonic_ns=(
-            context.observation_logical_step_monotonic_ns
-        ),
-        inference_started_monotonic_ns=context.inference_started_monotonic_ns,
-        inference_finished_monotonic_ns=context.inference_finished_monotonic_ns,
-        num_steps=int(values.shape[0]),
-        arm_present=prediction.arm_qpos is not None,
-        ee_present=prediction.ee_pos is not None,
-        hand_present=prediction.hand_qpos is not None,
-        arm_qpos=prediction.arm_qpos,
-        hand_qpos=prediction.hand_qpos,
-        ee_pos=prediction.ee_pos,
-        ee_rot6d=prediction.ee_rot6d,
-    )
-
-
-def publish_action_chunk(shared: RuntimeChannels, chunk: ActionChunk) -> bool:
-    """Generation-fence and publish one chunk to the parallel single-slot ring."""
-    if not isinstance(chunk, ActionChunk):
-        raise TypeError("chunk must be an ActionChunk")
-    if int(shared.run_generation.value) != chunk.run_generation:
+def publish_prediction(shared: RuntimeChannels, prediction: Prediction) -> bool:
+    """Generation-fence and publish one flat prediction to the single-slot ring."""
+    if not isinstance(prediction, Prediction):
+        raise TypeError("prediction must be a Prediction")
+    if int(shared.run_generation.value) != prediction.run_generation:
         return False
-    shared.policy_chunk_ring.write(serialize_action_chunk(chunk))
+    shared.prediction_ring.write(serialize_prediction(prediction))
     return True
 
 
@@ -714,7 +630,6 @@ def _build_observation(
     run_started_ns: int,
     anchor_ns: int,
     step_dt_ns: int,
-    metrics: Metrics | None = None,
 ) -> ObservationBatch | None:
     """Assemble requested causal modalities from the arm/hand rings.
 
@@ -897,27 +812,17 @@ def _build_observation(
             )
     if pointcloud_requested:
         if pointcloud is None or logical_step_ns <= 0:
-            if metrics is not None:
-                metrics.increment(OBSERVATION_WAIT_POINTCLOUD_GRID)
             return None
         latest_source_ns = int(pointcloud.source_monotonic_ns)
         if anchor_ns - latest_source_ns > max_age_ns:
-            if metrics is not None:
-                metrics.increment(OBSERVATION_WAIT_POINTCLOUD_STALE)
             return None
         if rgb_requested and len(rgb_history) != horizon:
-            if metrics is not None:
-                metrics.increment(OBSERVATION_WAIT_RGB_HISTORY)
             return None
     elif rgb_requested:
         if len(rgb_history) != horizon or logical_step_ns <= 0:
-            if metrics is not None:
-                metrics.increment(OBSERVATION_WAIT_RGB_GRID)
             return None
         latest_source_ns = int(rgb_history[-1].source_monotonic_ns)
         if anchor_ns - latest_source_ns > max_age_ns:
-            if metrics is not None:
-                metrics.increment(OBSERVATION_WAIT_RGB_GRID)
             return None
     elif (
         arm_history is not None
@@ -937,8 +842,6 @@ def _build_observation(
         if anchor_ns - latest_source_ns > max_age_ns:
             return None
     else:
-        if metrics is not None:
-            metrics.increment(OBSERVATION_WAIT_ARM_HISTORY)
         return None
     if arm_history is None or arm_history.values.shape[0] != horizon:
         return None
@@ -1114,7 +1017,7 @@ def inference_loop(
 
     # Heartbeat before any lazy import so the supervisor never sees a dead gap.
     shared.set_heartbeat("inference", time.monotonic())
-    metrics = Metrics()
+    stats = PolicyStats()
 
     runtime = _load_inference_runtime(config)
     try:
@@ -1155,7 +1058,6 @@ def inference_loop(
     step_dt_ns = int(round(float(config.spec.control_dt_s) * 1e9))
     async_period_ns = int(config.spec.n_action_steps) * step_dt_ns
 
-    chunk_id = 0
     observation_id = 0
     last_generation = -1
     last_logical_step_ns = 0
@@ -1163,12 +1065,10 @@ def inference_loop(
     async_deadline_ns: int | None = None
     last_metrics_flush_ns = time.monotonic_ns()
 
-    def wait_for_observation(reason: str | None = None) -> None:
+    def wait_for_observation() -> None:
         nonlocal last_metrics_flush_ns
-        if reason is not None:
-            metrics.increment(reason)
         last_metrics_flush_ns = flush_every(
-            metrics,
+            stats,
             last_ns=last_metrics_flush_ns,
             prefix="inference metrics",
             debug=True,
@@ -1189,9 +1089,8 @@ def inference_loop(
                 last_logical_step_ns = 0
                 sync_request_generation = None
                 async_deadline_ns = None
-                metrics.begin_run()
 
-            # ARMED = no inference; the coordinator gates RUNNING via B.
+            # ARMED = no inference; the policy executor gates RUNNING via B.
             if run_snapshot.state is not SafetyState.RUNNING:
                 if deployment.inference_mode == "sync":
                     _clear_sync_request_for_inactive_snapshot(
@@ -1263,20 +1162,16 @@ def inference_loop(
                 run_started_ns=run_snapshot.started_monotonic_ns,
                 anchor_ns=anchor_ns,
                 step_dt_ns=step_dt_ns,
-                metrics=metrics,
             )
             if observation is None:
                 wait_for_observation()
                 continue
             if observation.logical_step_monotonic_ns <= last_logical_step_ns:
-                wait_for_observation(OBSERVATION_WAIT_GRID_ADVANCE)
+                wait_for_observation()
                 continue
-            metrics.increment(OBSERVATIONS_BUILT)
             observation_age_ms, observation_skew_ms = observation_timing_ms(observation)
-            metrics.observe(OBSERVATION_AGE_MS, observation_age_ms)
-            metrics.observe_timing(OBSERVATION_AGE_MS, observation_age_ms)
-            metrics.observe(OBSERVATION_SKEW_MS, observation_skew_ms)
-            metrics.observe_timing(OBSERVATION_SKEW_MS, observation_skew_ms)
+            stats.observe_observation_age_ms(observation_age_ms)
+            stats.observe_observation_skew_ms(observation_skew_ms)
             last_logical_step_ns = observation.logical_step_monotonic_ns
 
             started_ns = time.monotonic_ns()
@@ -1285,39 +1180,19 @@ def inference_loop(
                 config.spec,
                 fingertip_runtime=fingertip_runtime,
             )
-            prediction = runtime.predict(policy_observation)
+            actions = runtime.predict(policy_observation)
             finished_ns = time.monotonic_ns()
             inference_ms = (finished_ns - started_ns) / 1e6
-            metrics.observe(INFERENCE_MS, inference_ms)
-            metrics.observe_timing(INFERENCE_MS, inference_ms)
+            stats.observe_inference_latency_ms(inference_ms)
 
-            context = InferenceContext(
+            prediction = Prediction(
                 run_generation=run_generation,
-                observation_id=observation_id,
-                observation_anchor_monotonic_ns=anchor_ns,
-                observation_latest_source_monotonic_ns=(
-                    observation.latest_source_monotonic_ns
-                ),
-                observation_logical_step_monotonic_ns=(
-                    observation.logical_step_monotonic_ns
-                ),
-                inference_started_monotonic_ns=started_ns,
-                inference_finished_monotonic_ns=finished_ns,
+                source_monotonic_ns=observation.latest_source_monotonic_ns,
+                logical_step_monotonic_ns=observation.logical_step_monotonic_ns,
+                actions=actions,
             )
-
-            chunk_id += 1
-            action_chunk = action_chunk_from_prediction(
-                prediction,
-                chunk_id=chunk_id,
-                context=context,
-            )
-            if publish_action_chunk(shared, action_chunk):
-                metrics.increment(CHUNKS_CREATED)
-            else:
-                metrics.increment(CHUNKS_GENERATION_DROPPED)
-                logger.debug(
-                    "inference: chunk %d dropped (generation advanced)", chunk_id
-                )
+            if not publish_prediction(shared, prediction):
+                logger.debug("inference: prediction dropped (generation advanced)")
             if deployment.inference_mode == "sync":
                 sync_request_generation = None
             else:
@@ -1329,7 +1204,7 @@ def inference_loop(
                 )
 
             last_metrics_flush_ns = flush_every(
-                metrics,
+                stats,
                 last_ns=last_metrics_flush_ns,
                 prefix="inference metrics",
                 debug=True,

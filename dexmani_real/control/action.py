@@ -50,9 +50,6 @@ class ActionCandidate:
     action_id: int = 0
     arm_qpos: np.ndarray | None = None
     hand_qpos: np.ndarray | None = None
-    representation: str = "joint_position"
-    units: str = "rad"
-    frame: str = "robot_joint"
     is_hold: bool = False
 
     def __post_init__(self) -> None:

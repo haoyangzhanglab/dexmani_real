@@ -4,6 +4,11 @@ approval_policy = "on-request"
 approvals_reviewer = "auto_review"
 web_search = "live"
 
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 3
+interrupt_message = true
+
 [sandbox_workspace_write]
 writable_roots = ["/home/zhanghaoyang/Desktop/dexmani_real"]
 network_access = true

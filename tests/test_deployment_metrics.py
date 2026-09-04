@@ -1,84 +1,52 @@
-"""Offline contracts for bounded learned-policy episode diagnostics."""
+"""Offline contracts for the bounded learned-policy diagnostics."""
 
 from __future__ import annotations
 
 import unittest
 from unittest.mock import patch
 
-from dexmani_real.deployment.metrics import (
-    ENDPOINTS_PUBLISHED,
-    PUBLICATION_INTERVAL_MS,
-    Metrics,
-)
+from dexmani_real.deployment.metrics import PolicyStats
 
 
 class DeploymentMetricsTest(unittest.TestCase):
-    def test_debug_flush_preserves_metrics_without_info_output(self) -> None:
-        metrics = Metrics()
-        metrics.increment(ENDPOINTS_PUBLISHED)
+    def test_snapshot_keeps_only_control_quality_diagnostics(self) -> None:
+        stats = PolicyStats()
+        stats.observe_inference_latency_ms(4.0)
+        stats.observe_observation_age_ms(2.0)
+        stats.observe_observation_skew_ms(0.5)
+        stats.observe_schedule_lateness_ms(1.0)
+        stats.observe_publication_interval_ms(62.5)
+        stats.safety_rejection_count = 2
+        stats.command_progress_timeout_count = 1
+        stats.ik_rejection_count = 3
+        stats.stale_prediction_count = 4
 
-        with patch("dexmani_real.deployment.metrics.logger") as logger:
-            metrics.flush(prefix="inference metrics", debug=True)
-
-        logger.debug.assert_called_once()
-        logger.info.assert_not_called()
-        self.assertEqual(metrics.snapshot()[ENDPOINTS_PUBLISHED], 0)
-
-    def test_episode_counters_and_timings_survive_flush(self) -> None:
-        metrics = Metrics()
-        metrics.begin_episode(generation=3, started_monotonic_ns=1)
-        metrics.increment(ENDPOINTS_PUBLISHED, 2)
-        metrics.observe_timing(PUBLICATION_INTERVAL_MS, 1.0)
-
-        metrics.flush()
-
-        metrics.increment(ENDPOINTS_PUBLISHED)
-        metrics.observe_timing(PUBLICATION_INTERVAL_MS, 5.0)
-
-        self.assertEqual(metrics.snapshot()[ENDPOINTS_PUBLISHED], 1)
         self.assertEqual(
-            metrics.episode_snapshot(),
+            stats.snapshot(),
             {
-                ENDPOINTS_PUBLISHED: 3,
-                f"{PUBLICATION_INTERVAL_MS}_samples": 2,
-                f"{PUBLICATION_INTERVAL_MS}_p50": 1.0,
-                f"{PUBLICATION_INTERVAL_MS}_p95": 5.0,
-                f"{PUBLICATION_INTERVAL_MS}_p99": 5.0,
+                "inference_latency_ms": 4.0,
+                "observation_age_ms": 2.0,
+                "observation_skew_ms": 0.5,
+                "schedule_lateness_ms": 1.0,
+                "publication_interval_ms": 62.5,
+                "safety_rejection_count": 2,
+                "command_progress_timeout_count": 1,
+                "ik_rejection_count": 3,
+                "stale_prediction_count": 4,
             },
         )
 
-    def test_episode_timing_summary_is_bounded(self) -> None:
-        metrics = Metrics()
-        metrics.begin_episode(generation=3, started_monotonic_ns=1)
-
-        for value in range(300):
-            metrics.observe_timing(PUBLICATION_INTERVAL_MS, float(value))
-
-        summary = metrics.episode_snapshot()
-        self.assertEqual(summary[f"{PUBLICATION_INTERVAL_MS}_samples"], 256)
-        self.assertEqual(summary[f"{PUBLICATION_INTERVAL_MS}_p50"], 171.0)
-        self.assertEqual(summary[f"{PUBLICATION_INTERVAL_MS}_p95"], 287.0)
-        self.assertEqual(summary[f"{PUBLICATION_INTERVAL_MS}_p99"], 297.0)
-
-    def test_episode_summary_logs_once_without_receipt_artifact(self) -> None:
-        metrics = Metrics()
-        metrics.begin_episode(generation=7, started_monotonic_ns=1)
-        metrics.increment(ENDPOINTS_PUBLISHED)
+    def test_flush_resets_counts_but_retains_bounded_recent_timings(self) -> None:
+        stats = PolicyStats()
+        stats.observe_publication_interval_ms(1.0)
+        stats.safety_rejection_count = 1
 
         with patch("dexmani_real.deployment.metrics.logger") as logger:
-            metrics.log_episode_summary(status="STOPPED", reason="operator stop")
-            metrics.log_episode_summary(status="STOPPED", reason="operator stop")
+            stats.flush(prefix="executor metrics", debug=True)
 
-        logger.info.assert_called_once()
-        message, generation, status, reason, duration_s, rendered = (
-            logger.info.call_args.args
-        )
-        self.assertIn("episode summary", message)
-        self.assertEqual(generation, 7)
-        self.assertEqual(status, "STOPPED")
-        self.assertEqual(reason, "operator stop")
-        self.assertGreaterEqual(duration_s, 0.0)
-        self.assertIn(f"{ENDPOINTS_PUBLISHED}=1", rendered)
+        logger.debug.assert_called_once()
+        self.assertEqual(stats.safety_rejection_count, 0)
+        self.assertEqual(stats.snapshot()["publication_interval_ms"], 1.0)
 
 
 if __name__ == "__main__":

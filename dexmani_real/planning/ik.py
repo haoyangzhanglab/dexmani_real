@@ -711,7 +711,7 @@ class TeleopIKSolver:
         except Exception:
             # A checker implementation failure is distinct from an actual
             # collision. Teleop retains its hold behavior; the learned-policy
-            # coordinator consumes ``failure_kind`` and aborts fail-closed.
+            # executor consumes ``failure_kind`` and aborts fail-closed.
             logger.warning(
                 "Collision check failed (NaN/Inf qpos likely) — holding position",
                 exc_info=True,

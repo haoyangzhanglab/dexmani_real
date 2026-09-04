@@ -113,10 +113,10 @@ q_cmd = q_prev + clip(q_ik - q_prev, -limit, +limit)
 | --- | --- | --- |
 | 键盘遥操作 | 发布完整 IK endpoint；不启用通用 arm delta clip/reject | 保留目标位姿语义，交给 30 Hz 目标生成和 Mode 6 跟踪 |
 | VR 遥操作 | producer 以“上一条命令 → 新 IK”执行 8°/tick joint shaping | VR 输入连续，整形属于 VR proposal owner；后续安全门不重复裁剪 |
-| learned policy | safety gate 以“上一条已发布命令 → 新 endpoint”执行默认 8°/tick reject，绝不 clip | 模型动作是提案；越界意味着 endpoint 合同无效，不能静默改写 |
+| learned policy | `PolicyExecutor` 的 SafetyGate 以 `20°` arm endpoint 阈值 reject；hand 以最新 measured state 做约 `0.3 rad` shaping | 模型动作是提案；arm 越界不能静默改写，hand shaping 是独立的 measured-state 边界 |
 | arm worker | 对所有来源执行默认 20°/accepted-command 的 command-to-command 异常跳变兜底，触发即 fail closed | 只防 IPC/IK 分支异常，不承担正常控制速率整形；latest-wins 允许中间 endpoint 被覆盖，因此它不是严格的 per-tick 速度限制 |
 
-8° 和 20° 的职责不同：前者是特定 producer 的连续性合同，后者是硬件边界的异常检测阈值。二者都不是 xArm 控制器声明的统一“每周期最大运动角”。
+8° 是 VR producer 的连续性合同；20° 同时是 PolicyExecutor arm reject 与 arm worker 的异常跳变阈值。二者都不是 xArm 控制器声明的统一“每周期最大运动角”。
 
 ### 4.4 键盘目标只限制 EEF lead，不裁剪关节解
 
@@ -126,7 +126,7 @@ q_cmd = q_prev + clip(q_ik - q_prev, -limit, +limit)
 
 ### 4.5 ACK 退出实时热路径
 
-正常遥操作发布不等待 ACK。只有 home、校准等明确需要“SDK 已接受精确 endpoint”语义的低频流程才等待 `accepted_target_action_id`。等待期间若 ticket 被覆盖则立即返回 superseded；timeout/失败只在该 ticket 仍为当前 owner 时定向取消，不能撤销较新的命令。
+正常遥操作发布不等待 ACK。只有 home、校准和 replay 等明确需要“SDK 已接受精确 endpoint”语义的低频流程才等待 `accepted_target_action_id`。等待期间若 ticket 被覆盖则立即返回 superseded；timeout/失败只在该 ticket 仍为当前 owner 时定向取消，不能撤销较新的命令。
 
 ACK 只表示 worker/SDK 接受目标，不表示关节已经物理到位，也不表示 arm 与 hand 同时到位。
 
@@ -149,9 +149,9 @@ ACK 只表示 worker/SDK 接受目标，不表示关节已经物理到位，也�
 - coupled record、atomic revoke 和 worker fencing 是共享基础设施修复，键盘、VR、回放和策略部署都受益；
 - 删除的是键盘路径错误启用的通用 arm delta，不是全局删除安全检查；
 - VR 仍保留 producer-side 8° command shaping，因此不会因键盘修复而失去原有平滑策略；
-- learned-policy 仍以 8° command-to-command 规则 reject 整个 endpoint，并在 rejection 时终止/静默该 action chunk endpoint，而不是发布变形动作；
+- learned-policy 由 PolicyExecutor 以 20° arm gate reject 当前 step，并以 measured-state 0.3 rad hand shaping 保持 hand target 可达；拒绝后不立即 abort，后续由 action-step limit 或 silence/progress watchdog 收束 episode；
 - 20° worker fallback 对所有来源生效，可阻止异常 IK 分支或损坏 record 直接跨越 SDK 边界；
-- 非阻塞发布避免推理/coordinator 因等待 actuator ACK 而破坏调度，但 latest-wins 可能覆盖未消费的旧 endpoint，这是实时遥操作的明确取舍。
+- 非阻塞发布避免推理/PolicyExecutor 因等待 actuator acceptance 而破坏调度，但 latest-wins 可能覆盖未消费的旧 endpoint，这是实时遥操作的明确取舍。
 
 ## 7. 验证状态
 
@@ -163,18 +163,18 @@ ACK 只表示 worker/SDK 接受目标，不表示关节已经物理到位，也�
 - timeout 取消不会撤销较新 ticket；
 - superseded 的异常 snapshot 不会调用 arm SDK 或锁存 fault；
 - keyboard 发布完整 IK solution，不执行 arm delta clip；
-- learned-policy delta 使用上一条命令，而 workspace/collision 使用实测反馈；
+- learned-policy arm gate 使用 20° endpoint reject，hand shaping 使用实测 hand qpos；
 - arm/hand 共用 generation 和 delivery-window 合同；
 - 默认 worker discontinuity fallback 为 20°。
 
-当前离线结果为 21 项回归测试通过，`compileall`、定向 `mypy`、Black、isort 和 `git diff --check` 通过。
+“21 项回归测试通过”是本故障复盘当时的历史基线，不代表当前 runtime simplification 的测试计数或验收结果。
 
 尚未完成的物理闭环：
 
 1. 受控低速环境下记录每周期 target、SDK accepted target、measured qpos 和 tracking error；
 2. 验证长按平移、方向反转、腕部旋转、松键/再按和 workspace 边界；
 3. 确认键盘日志不再出现 prepare rejection、arm delta rejection 或持续 60 ms loop overrun；
-4. 分别验证 VR 8° shaping 和 learned-policy 8° rejection，不以键盘结果替代；
+4. 分别验证 VR 8° shaping 和 learned-policy 20° arm rejection / 0.3 rad hand shaping，不以键盘结果替代；
 5. 验证 e-stop、worker 退出和 generation revoke 后没有后续 SDK command。
 
 在这些实机检查完成前，应表述为“软件根因已修复并完成离线验证”，不能声称物理抖动已经完全关闭。
@@ -196,11 +196,12 @@ ACK 只表示 worker/SDK 接受目标，不表示关节已经物理到位，也�
 - [`teleop/keyboard_session.py`](../dexmani_real/teleop/keyboard_session.py)：键盘目标、EEF lead、IK 与运行状态。
 - [`teleop/action_proposal.py`](../dexmani_real/teleop/action_proposal.py)：VR producer-side arm shaping。
 - [`control/safety_gate.py`](../dexmani_real/control/safety_gate.py)：几何检查与可选 command-delta reject。
-- [`control/publication.py`](../dexmani_real/control/publication.py)：candidate 校验、coupled publication 与 ACK。
+- [`deployment/executor.py`](../dexmani_real/deployment/executor.py)：PolicyExecutor 调度、step rejection 与 command-progress watchdog。
+- [`control/publication.py`](../dexmani_real/control/publication.py)：candidate 校验、non-blocking coupled publication 与显式 acceptance。
 - [`runtime/safety.py`](../dexmani_real/runtime/safety.py)：motion permit、generation、ticket 与撤销。
 - [`robot/command_validation.py`](../dexmani_real/robot/command_validation.py)：worker 共用的时效、限位和异常跳变合同。
 - [`robot/arm_worker.py`](../dexmani_real/robot/arm_worker.py)、[`robot/hand_worker.py`](../dexmani_real/robot/hand_worker.py)：最终 actuator 边界。
-- [`tests/test_keyboard_arm_limits.py`](../tests/test_keyboard_arm_limits.py)、[`tests/test_safety_gate_command_delta.py`](../tests/test_safety_gate_command_delta.py)、[`tests/test_coupled_command_publication.py`](../tests/test_coupled_command_publication.py)、[`tests/test_worker_command_validation.py`](../tests/test_worker_command_validation.py)：离线回归合同。
+- [`tests/test_teleop_pause_boundary.py`](../tests/test_teleop_pause_boundary.py)、[`tests/test_hand_worker_startup.py`](../tests/test_hand_worker_startup.py)、[`tests/test_prediction_ipc.py`](../tests/test_prediction_ipc.py)、[`tests/test_policy_executor.py`](../tests/test_policy_executor.py)：当前离线回归合同。
 
 ## 10. 2026-08-26 松键回撤事件
 

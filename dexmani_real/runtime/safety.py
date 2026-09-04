@@ -11,6 +11,13 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
+PUBLISH_REASON_RUNTIME_STOPPED = "runtime stopped"
+PUBLISH_REASON_ESTOP = "e-stop requested"
+PUBLISH_REASON_FAULT = "sticky fault"
+PUBLISH_REASON_SAFETY_STATE = "safety state does not permit motion"
+PUBLISH_REASON_GENERATION = "command generation no longer owns motion"
+PUBLISH_REASON_EXPIRED = "command validity window closed"
+
 
 class SafetyState(IntEnum):
     """Values stored in ``RuntimeChannels.safety_state``."""
@@ -22,11 +29,10 @@ class SafetyState(IntEnum):
 
 
 class StopRequest(IntEnum):
-    """Reason code carried by the Main-to-coordinator stop request."""
+    """Operator stop request carried from Main to the control owner."""
 
     NONE = 0
     OPERATOR = 1
-    RUN_TIME_LIMIT = 2
 
 
 _ALLOWED_TRANSITIONS = frozenset(
@@ -62,6 +68,7 @@ class CoupledCommandTicket:
 
     run_generation: int
     ring_sequence: int
+    valid_until_monotonic_ns: int
     published_monotonic_ns: int = 0
 
 
@@ -80,6 +87,7 @@ class RunStateSnapshot:
     state: SafetyState
     generation: int
     started_monotonic_ns: int
+    stop_request: int
 
 
 def _advance_run_generation_locked(shared: Any) -> int:
@@ -152,7 +160,7 @@ def _invalidate_coupled_commands_locked(shared: Any) -> int:
 def invalidate_coupled_commands(shared: Any) -> int:
     """Invalidate coupled commands while deliberately retaining lifecycle state.
 
-    This narrow primitive is for an already-established quiescence boundary
+    This narrow primitive is for an already-established pause boundary
     and for cancellation of a failed home command. Start/stop state changes
     must use :func:`begin_motion` or :func:`revoke_motion` instead.
     """
@@ -183,23 +191,15 @@ def read_motion_permit(shared: Any) -> MotionPermit:
         return _read_motion_permit_locked(shared)
 
 
-def read_run_epoch(shared: Any) -> RunEpoch:
-    """Read the run generation and observation boundary under one lock."""
-    with shared.motion_lock:
-        return RunEpoch(
-            generation=int(shared.run_generation.value),
-            started_monotonic_ns=int(shared.run_started_monotonic_ns.value),
-        )
-
-
 def read_run_state_snapshot(shared: Any) -> RunStateSnapshot:
-    """Read safety state, generation, and epoch start under one motion lock."""
+    """Read the run boundary state under one motion lock."""
     with shared.motion_lock:
         permit = _read_motion_permit_locked(shared)
         return RunStateSnapshot(
             state=permit.state,
             generation=permit.run_generation,
             started_monotonic_ns=int(shared.run_started_monotonic_ns.value),
+            stop_request=int(shared.stop_request.value),
         )
 
 
@@ -209,24 +209,33 @@ def publish_coupled_command_if_motion_permitted(
     expected_run_generation: int,
     frame: Any,
     required_state: SafetyState | None = None,
-) -> CoupledCommandTicket | None:
-    """Publish one coherent frame and return its unambiguous sequence ticket.
+    minimum_delivery_window_ns: int = 0,
+) -> tuple[CoupledCommandTicket | None, str]:
+    """Publish one frame or return its exact locked rejection reason.
 
     The ring sequence is recorded under the same lock as the motion permit and
     active sequence. A newer publication atomically supersedes the prior
     ticket, so delayed workers cannot execute an overwritten frame.
     """
+    if (
+        isinstance(minimum_delivery_window_ns, bool)
+        or not isinstance(minimum_delivery_window_ns, int)
+        or minimum_delivery_window_ns < 0
+    ):
+        raise ValueError("minimum_delivery_window_ns must be a non-negative integer")
     names = getattr(getattr(frame, "dtype", None), "names", None) or ()
     required_fields = {
         "run_generation",
         "action_id",
         "arm_present",
         "hand_present",
+        "valid_until_monotonic_ns",
     }
     if getattr(frame, "shape", None) != (1,) or not required_fields.issubset(names):
         raise ValueError("coupled command frame is malformed")
     frame_generation = int(frame["run_generation"][0])
     action_id = int(frame["action_id"][0])
+    valid_until_monotonic_ns = int(frame["valid_until_monotonic_ns"][0])
     controls_actuator = bool(frame["arm_present"][0]) or bool(frame["hand_present"][0])
     if frame_generation != int(expected_run_generation) or action_id <= 0:
         raise ValueError(
@@ -235,22 +244,38 @@ def publish_coupled_command_if_motion_permitted(
     if not controls_actuator:
         raise ValueError("coupled command must target at least one actuator")
     with shared.motion_lock:
+        if bool(shared.estop_request.value):
+            return None, PUBLISH_REASON_ESTOP
+        if bool(shared.error_state.value):
+            return None, PUBLISH_REASON_FAULT
+        if not bool(shared.is_running.value):
+            return None, PUBLISH_REASON_RUNTIME_STOPPED
         permit = _read_motion_permit_locked(shared)
-        if (
-            not permit.allows_motion
-            or permit.run_generation != int(expected_run_generation)
-            or (required_state is not None and permit.state is not required_state)
-        ):
-            return None
+        if not permit.allows_motion:
+            return None, f"{PUBLISH_REASON_SAFETY_STATE}: {permit.state.name}"
+        if required_state is not None and permit.state is not required_state:
+            return (
+                None,
+                f"{PUBLISH_REASON_SAFETY_STATE}: expected {required_state.name}, "
+                f"got {permit.state.name}",
+            )
+        if permit.run_generation != int(expected_run_generation):
+            return None, PUBLISH_REASON_GENERATION
+        if valid_until_monotonic_ns - time.monotonic_ns() <= minimum_delivery_window_ns:
+            return None, PUBLISH_REASON_EXPIRED
         sequence = int(shared.coupled_cmd_ring.write(frame))
         if sequence <= 0:
             raise RuntimeError("coupled command ring returned an invalid sequence")
         published_monotonic_ns = time.monotonic_ns()
         shared.active_coupled_command_sequence.value = sequence
-        return CoupledCommandTicket(
-            run_generation=permit.run_generation,
-            ring_sequence=sequence,
-            published_monotonic_ns=published_monotonic_ns,
+        return (
+            CoupledCommandTicket(
+                run_generation=permit.run_generation,
+                ring_sequence=sequence,
+                valid_until_monotonic_ns=valid_until_monotonic_ns,
+                published_monotonic_ns=published_monotonic_ns,
+            ),
+            "",
         )
 
 
@@ -286,8 +311,9 @@ def coupled_command_ticket_allows_execution(
     """Return whether *ticket* may still cross an actuator SDK boundary.
 
     This is the common final worker check: the record must still own the
-    latest-wins slot and the runtime must not be stopping or faulted.  The
-    lock is deliberately released before hardware IO.
+    latest-wins slot, remain inside its delivery window, and the runtime must
+    not be stopping or faulted. The lock is deliberately released before
+    hardware IO, so workers call this immediately before their SDK method.
     """
     with shared.motion_lock:
         return bool(
@@ -295,6 +321,7 @@ def coupled_command_ticket_allows_execution(
             and shared.is_running.value
             and not shared.error_state.value
             and not shared.estop_request.value
+            and time.monotonic_ns() < int(ticket.valid_until_monotonic_ns)
         )
 
 
@@ -388,25 +415,10 @@ def request_policy_stop(shared: Any) -> bool:
     return True
 
 
-def request_policy_run_time_limit(shared: Any, *, expected_run_generation: int) -> bool:
-    """Request a coordinator-owned timed stop for the same RUNNING epoch."""
-    with shared.motion_lock:
-        permit = _read_motion_permit_locked(shared)
-        if permit.state is not SafetyState.RUNNING or permit.run_generation != int(
-            expected_run_generation
-        ):
-            return False
-        if int(shared.stop_request.value) != int(StopRequest.NONE):
-            return False
-        shared.start_request.value = False
-        shared.stop_request.value = int(StopRequest.RUN_TIME_LIMIT)
-        return True
-
-
 def revoke_motion(shared: Any, new_state: SafetyState = SafetyState.ARMED) -> bool:
     """Atomically invalidate commands and leave the current motion state.
 
-    This is the required path for normal command quiescence and fault
+    This is the required path for a normal command pause boundary and fault
     escalation. The short critical section never includes hardware IO.
     """
     if new_state not in (SafetyState.ARMED, SafetyState.DISARMED, SafetyState.FAULT):

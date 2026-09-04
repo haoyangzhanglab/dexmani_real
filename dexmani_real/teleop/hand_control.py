@@ -28,7 +28,7 @@ class HandRetargetObservationCache:
     This keeps shaping control-rate driven without advancing TAG/DexPilot
     temporal state or retrying a partial failure on duplicate input.
 
-    Teleop clears this cache at command quiescence/reanchor boundaries before
+    Teleop clears this cache at pause/re-anchor boundaries before
     the reset solver is allowed to process another observation.
     """
 
@@ -59,7 +59,7 @@ def sanitize_hand_command(
     ``hand_cmd_valid=False`` and holds arm + hand together, instead of letting
     ``SafetyGate.validate`` turn an out-of-limit command into a sticky fault.
     (Other coupled paths — keyboard, replay, calibrate, return-home — still rely
-    on ``validate_hand_command_bounds`` inside ``publish_joint_targets`` to
+    on ``validate_hand_command_bounds`` during command preparation to
     reject, not clip.)
     """
     return validate_hand_command_bounds(

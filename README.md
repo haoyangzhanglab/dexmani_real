@@ -44,7 +44,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | 目标 | 入口 | 主要实现 |
 |---|---|---|
 | 理解仓库与修改约束 | [`AGENTS.md`](AGENTS.md)、[`code_style.md`](code_style.md) | [`repo_map.md`](repo_map.md)、[`user_design.md`](user_design.md) |
-| VR 遥操作与采集 | [`examples/collect_teleop.py`](examples/collect_teleop.py) | [`teleop/session.py`](dexmani_real/teleop/session.py)、[`teleop/loop.py`](dexmani_real/teleop/loop.py)、[`teleop/operator_controls.py`](dexmani_real/teleop/operator_controls.py)、[`teleop/control_grid.py`](dexmani_real/teleop/control_grid.py)、[`teleop/action_proposal.py`](dexmani_real/teleop/action_proposal.py) |
+| VR 遥操作与采集 | [`examples/collect_teleop.py`](examples/collect_teleop.py) | [`teleop/session.py`](dexmani_real/teleop/session.py)、[`teleop/loop.py`](dexmani_real/teleop/loop.py)、[`teleop/control_grid.py`](dexmani_real/teleop/control_grid.py)、[`teleop/action_proposal.py`](dexmani_real/teleop/action_proposal.py) |
 | 键盘遥操作 | [`examples/keyboard_teleop.py`](examples/keyboard_teleop.py) | [`teleop/keyboard_session.py`](dexmani_real/teleop/keyboard_session.py)、[`docs/teleop_jitter_incident.md`](docs/teleop_jitter_incident.md) |
 | 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`replay/`](dexmani_real/replay) |
 | raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/hdf5_writer.py`](dexmani_real/recording/hdf5_writer.py)、[`recording/reader.py`](dexmani_real/recording/reader.py) |
@@ -67,7 +67,7 @@ RealSense / Quest-HTS / xArm7 / XHand
                  ▼
  RuntimeChannels: typed rings + queues + lifecycle state
           │                         │
-          ├─ teleop coordinator     └─ inference worker → one-slot policy chunk ring
+          ├─ teleop control loop    └─ inference worker → prediction ring → policy executor
           │                                      │
           └──────────────────────────────────────┤
                                                  ▼
@@ -101,14 +101,12 @@ RealSense / Quest-HTS / xArm7 / XHand
 
 - [`teleop/action_proposal.py`](dexmani_real/teleop/action_proposal.py) 只计算并限幅
   EEF、arm 与 hand proposal；它不发布命令、不访问 shared memory，也不写录制数据。
-- [`teleop/loop.py`](dexmani_real/teleop/loop.py) 构造资源、等待 readiness 并调度两个
-  窄职责模块：[`teleop/operator_controls.py`](dexmani_real/teleop/operator_controls.py) 处理
-  BEGIN/pause/home/quit 与录制决策，[`teleop/control_grid.py`](dexmani_real/teleop/control_grid.py)
-  完成单个 causal tick 的读取、proposal、校验、发布和采样。pause、VR/hand feedback
-  异常或录制终结进入 command-quiescence；BEGIN 音频只是 best-effort 操作者反馈，恢复运动前
-  必须等待 fresh causal feedback re-anchor，期间不发布命令。
-  同步 home 是有意的控制静默区间，返回后由 loop 同时重锚 coordinator 和 control-grid
-  时钟，不计作遥操作栅格丢失。
+- [`teleop/loop.py`](dexmani_real/teleop/loop.py) 构造资源、等待 readiness，并由
+  [`teleop/control_grid.py`](dexmani_real/teleop/control_grid.py) 完成单个 causal tick 的读取、
+  proposal、校验、发布和采样。pause、VR/hand feedback 异常或录制终结进入 pause boundary；
+  BEGIN 音频只是 best-effort 操作者反馈，恢复运动前必须等待 fresh causal feedback re-anchor，
+  期间不发布命令。同步 home 是有意的控制静默区间，返回后由 loop 同时重锚控制 loop 和
+  control-grid 时钟，不计作遥操作栅格丢失。
 - RecorderIO 从 fixed-size shared-memory record 按逻辑 sequence 严格、连续地取得所有权；
   它只复制尚未确认的 slot，缺失或超出环容量时丢弃 active episode，绝不跳过样本。随后它将
   record 解码为不可变、拥有自身数组副本的 `EpisodeFrame`，并拥有 episode transaction、
@@ -241,11 +239,11 @@ point-cloud worker。worker 始终读取最新的 depth-to-color aligned RGB-D�
 `float32 (N, 6)`，列语义为 `xyzrgb`，RGB 范围为 `[0,1]`。`pointcloud_num_points` 只允许
 `1024`、`2048`、`4096`、`8192`，部署时必须与 PolicySpec 和 Real runtime 精确一致。
 
-coordinator 将通过安全门的策略 endpoint 原子写为单条 coupled command，并立即返回，不在控制热路径
+`PolicyExecutor` 将通过安全门的策略 endpoint 原子写为单条 coupled command，并立即返回，不在控制热路径
 等待 worker 握手。ring sequence 是实际的传输 epoch；arm/hand worker 在各自 SDK 边界复核同一个
-`(run_generation, ring_sequence)` ticket，已被新 record 覆盖或被 motion permit 撤销的 endpoint
-不再执行。B/S 请求与 RUNNING 状态转换由同一个 `motion_lock` 排序；candidate 保留其来源 chunk 的
-generation，policy publication 在写 ring 的原子边界还必须满足 RUNNING + 同 generation。
+`(run_generation, ring_sequence, valid_until_monotonic_ns)` ticket，已被新 record 覆盖、过期或被 motion
+permit 撤销的 endpoint 不再执行。B/S 请求与 RUNNING 状态转换由同一个 `motion_lock` 排序；candidate
+保留其来源 prediction 的 generation，policy publication 在写 ring 的原子边界还必须满足 RUNNING + 同 generation。
 `action_id` 保留在 record 与反馈中用于审计和 worker acceptance watermark，不参与 ownership 判定。这保证软件
 IPC 记录一致且保持 latest-wins 实时性，不表示两个执行器物理同步或已完成动作。
 
@@ -264,7 +262,7 @@ deployment lifecycle 从 Policy public API 取得只读 `PolicySpec`。唯一的
 `data_contract.observation_fields` 按顺序声明每个原始模型
 输入的名称、shape、dtype 与语义；训练 experiment 的 `dataset.sensor_modalities` 是导出时唯一的
 人工选择入口，artifact 不再持久化第二份模态列表。Real 只验证自己要投影的 raw shape/dtype、
-19/21D control action、XHand、控制周期与 IPC chunk capacity，并只启动所需 sensor worker。
+19/21D control action、XHand、控制周期与 Prediction IPC capacity，并只启动所需 sensor worker。
 checkpoint/Hydra/EMA/normalizer/denoise 与 RGB model preprocessing 全部由
 `dexmani_policy.deployment.load_experiment()` 拥有；Real adapter 只透传 canonical NumPy
 observation 并转换 action。Policy export/restore 会核对模型 encoder 实际消费的字段；没有对应
@@ -272,16 +270,17 @@ encoder 的字段组合会 fail closed，不会静默忽略输入。
 inference worker 完成 restore 与 warmup 后才置 ready，lifecycle 才允许启动其余
 hardware workers。内部只传播 `execute: bool`：`False` 走完整 candidate validation 后返回，
 不会调用 publication；`True` 发布同一 generation/ticket 的 arm + hand command，worker 仅在
-candidate validity window 内接受目标。coordinator 不逐 endpoint 等待 ACK，而是分别监控 arm
-`last_cmd_seq` 与 hand `accepted_target_action_id`；latest-wins 可跳过中间 ID，但持续存在已发布目标且
-任一水位在 `command_progress_timeout_s` 内不前进会 fail closed。日常 inference seed 固定为 0，
+candidate validity window 内接受目标。`PolicyExecutor` 的正常策略发布不逐 endpoint 等待 acceptance，
+而是分别监控 arm `last_cmd_seq` 与 hand `accepted_target_action_id`；latest-wins 可跳过中间 ID，但持续
+存在已发布目标且任一水位在 `command_progress_timeout_s` 内不前进会 fail closed。日常 inference seed 固定为 0，
 XHand 需求由 `PolicySpec.requires_hand` 决定，不由 CLI
 重复声明。
 
-inference 每次只发布一个带 observation provenance 的不可变 `ActionChunk` 到单槽 latest-wins
-ring。默认 `sync` 在 chunk 完成或因 source stale 丢弃后请求下一次推理；可选 `async` 按
-`n_action_steps * control_dt_s` 的绝对 cadence 推理，并让新 chunk 替换旧 suffix。coordinator 以
-`coordinator_hz`（默认 128 Hz）轮询且每轮至多处理一个 endpoint，endpoint 仍只在
+inference 每次只发布一个带 observation provenance 的不可变 flat `Prediction` IPC record 到单槽 latest-wins
+ring；动作数组为策略 representation 选择的有限 `float64[N,D]`。默认 `sync` 在 prediction
+完成或因 source stale 丢弃后请求下一次推理；可选 `async` 按
+`n_action_steps * control_dt_s` 的绝对 cadence 推理，并让新 prediction 替换旧 suffix。policy executor 以
+`executor_poll_hz`（默认 128 Hz）轮询且每轮至多处理一个 endpoint，endpoint 仍只在
 `control_hz` control grid（默认 16 Hz）到期时发布；
 `--max-action-steps N` 在 N 个 successful/rejected terminal steps 后停止发布；真机模式会等待
 最后一个已发布 action 被 arm/hand acceptance watermark 覆盖，再以 `TRUNCATED` 结束 episode。
@@ -290,11 +289,11 @@ ring。默认 `sync` 在 chunk 完成或因 source stale 丢弃后请求下一�
 机械臂控制器灵敏度与现场操作员负责。`H` 的 `return_home` 仍使用手部、静态环境和桌面的
 完整碰撞检查路径。
 
-coordinator 每秒输出 live metrics，并在每个 B→停止/中止/故障/截断边界输出一条 compact
+policy executor 每秒输出 live metrics，并在每个 B→停止/中止/故障/截断边界输出一条 compact
 episode summary。summary 只是在内存中累计的调试信息，不写 receipt、sidecar 或资格证明文件。
 
 点云缺失、过期、shape/dtype 错误、非有限值或颜色越界时 inference fail closed，不发布
-新的 chunk。实时路径当前仅支持静态 `eye_to_hand` 标定；`eye_in_hand` 需要另行建立与
+新的 Prediction。实时路径当前仅支持静态 `eye_to_hand` 标定；`eye_in_hand` 需要另行建立与
 相机帧同步的机械臂位姿合同。离线 IPC、合成 RGB-D 和已保存的真实 L515 帧均已验证；
 实时 worker 的 compute/source-to-publish p95 仍须在完整硬件部署中记录。
 `pointcloud_process_example.py` 同时报告纯构建与 capture-to-cloud 的 p50/p95/max，并报告

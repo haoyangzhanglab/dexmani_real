@@ -1,289 +1,113 @@
 # DexMani Real Repository Map
 
-本文件是当前版本控制树的职责索引。运行行为以源码、schema 与配置为准；新增、删除、
-移动文件或改变主要职责时必须同步更新本文件。被 `.gitignore` 排除的 episode、dataset、
-replay result 与缓存不在清单中。
+本文件只记录稳定的运行拓扑、数据流和安全边界。运行行为以源码、schema 与配置为准；
+本文件不维护逐文件职责清单。新增、删除或移动文件时，仅在改变下列边界时更新本文件。
 
-## 1. 架构总览
+## 仓库导航
 
-```text
-device input ──> sensor workers ──> ipc.RuntimeChannels ──> teleop/deployment/replay
-hardware SDK <── robot workers <── control publication <── safety gate/action candidate
-
-teleop sample ──> recording worker ──> raw episode
-raw episode ──> data process ──> processed HDF5 ──> data export ──> Policy Zarr
-```
-
-所有重要 mutable resource 只有一个 owner：SDK 只在对应 worker/driver 内，IPC allocation
-只在 `RuntimeChannels`，动作发布只在 `control/publication.py`，录制 transaction 只在
-recording worker/recorder。工程约束要求避免 package cycle、逆向依赖和跨模块私有 import；
-当前仓库没有独立的自动化架构门禁脚本。
-
-## 2. 顶层文件
-
-| 文件 | 主要职责 |
+| 文件 | 作用 |
 |---|---|
 | `AGENTS.md` | 仓库级工程、安全、范围与验收契约。 |
 | `CLAUDE.md` | Claude Code 精简入口，具体规则委托给 `AGENTS.md`。 |
 | `code_style.md` | 本研究代码库的具体编码与审查约定。 |
-| `README.md` | 面向使用者的能力、架构、环境与工作流。 |
-| `repo_map.md` | 当前文件与 owner 索引。 |
-| `docs/data_schema.md` | Real raw v24、processed v11 与 Policy Zarr v5 的持久化字段和语义参考。 |
-| `docs/action_clip_mechanisms.md` | 动作 clip、限幅、拒绝与动作源差异的实现参数和数据审计说明。 |
-| `docs/policy_deployment.md` | Policy experiment 的 list/check/shadow/run、配置 ownership、按键、安全与诊断工作流。 |
-| `docs/pointcloud_pipeline.md` | depth-to-color aligned 点云的采集、处理、时序与持久化契约。 |
-| `docs/teleop_jitter_incident.md` | 键盘遥操作卡顿、抖动、delta 拒绝与 coupled-command 修复复盘。 |
-| `docs/vr_coordinate_transform_followup.md` | VR wrist→EEF 坐标换算审查、证据边界、真实样本诊断与后续修正决策记录。 |
-| `user_design.md` | 已确认的机器人行为与安全取舍。 |
-| `.gitignore` | 生成物、本地环境、数据集与运行输出排除规则。 |
-| `pyproject.toml` | 包元数据、依赖、package data 与工具配置。 |
+| `README.md` | 面向使用者的能力、环境、工作流与稳定架构。 |
+| `repo_map.md` | 当前运行拓扑、核心数据流与边界索引。 |
+| `.codex/config.toml` | 项目级 Codex 权限、联网与子智能体并发配置。 |
 
-## 3. `dexmani_real/`
+## Process topology
 
-| 文件 | 主要职责 |
-|---|---|
-| `__init__.py` | 包说明及 `PACKAGE_DIR`/`ASSET_DIR` 解析。 |
-| `robot_spec.py` | 机器人 DoF/shape、XHand joint order、URDF/SRDF canonical 路径。 |
+```text
+hardware SDKs
+    │
+    ▼
+arm / hand / VR / camera / point-cloud / recorder workers
+    │ typed rings, queues, flags and lifecycle state
+    ▼
+RuntimeChannels
+    ├── teleop session + control loop
+    ├── policy inference worker → prediction ring → policy executor
+    └── replay / calibration control owner
+    │
+    ▼
+control safety gate → command publication → arm / hand workers
+```
 
-### `config/`
+- 每个硬件 SDK 只在其 owning worker 或 driver 内创建和使用；父进程只负责生命周期与监督。
+- `RuntimeChannels` 是跨进程状态的唯一 allocation owner；固定 wire shape、dtype 和持久化
+  record layout 由 `dexmani_real/ipc/schema.py` 定义。
+- learned-policy lifecycle 先等待 inference restore/warmup，再启动所需传感器和执行器 worker；
+  supervisor 只监督实际运行的 process heartbeat，readiness 只负责有界启动等待。
+- teleop lifecycle 按启用的 arm、hand、VR、camera、recorder worker 构造同一组 channels；
+  replay 与 calibration 复用相同的 safety、publication 和 worker 边界。
 
-| 文件 | 主要职责 |
-|---|---|
-| `__init__.py` | 配置子包出口。 |
-| `defaults.py` | arm、hand、policy、sensor 与 safety canonical defaults。 |
-| `runtime.py` | CLI > YAML > defaults 合并、校验、冻结与 SHA-256 identity。 |
-| `pointcloud.py` | 实时/离线共享的不可变点云策略、处理语义常量与 identity。 |
-| `camera_calib.py` | 校验并冻结相机序列号绑定的外参快照与来源 hash。 |
-| `cameras.json` | 相机序列号、安装类型与外参。 |
-| `desk_plane.json` | 桌面平面与 provenance。 |
-| `vr_transform.json` | VR 到机器人坐标系的标定与质量信息。 |
+## Policy flow
 
-### `ipc/`
+```text
+causal observation history
+    → Policy public runtime
+    → Real NumPy adapter
+    → flat Prediction IPC record [N, D] + provenance
+    → one-slot latest-wins prediction_ring
+    → PolicyExecutor (sync/async timing, endpoint decode, EE→IK)
+    → physical SafetyGate
+    → non-blocking coupled publication
+    → arm / hand worker final checks
+```
 
-| 文件 | 主要职责 |
-|---|---|
-| `__init__.py` | 轻量 IPC 子包标记。 |
-| `schema.py` | 稳定 NumPy wire dtype、record sample 与 point-cloud ABI。 |
-| `ring.py` | 通用 seqlock shared-memory ring。 |
-| `camera_ring.py` | 大尺寸 RGB-D shared-memory ring。 |
-| `causal.py` | 按 observation anchor 读取 arm/hand/tactile/VR/camera。 |
-| `channels.py` | `RuntimeChannels`：按请求容量分配 rings、queues、typed stop request、heartbeat、readiness 的唯一 allocation owner。 |
+- `Prediction` 是唯一的内部策略输出对象；动作是拥有自身内存的 finite `float64[N, D]`，
+  `run_generation`、source timestamp 和 logical-step timestamp 随对象传播。
+- inference worker 只负责 observation、策略调用和 prediction 发布；PolicyExecutor 独占动作
+  horizon 解码、control-grid 调度、EE→IK、候选校验和 command-progress watchdog。
+- 正常策略 tick 的路径是 `validate → publish → continue`；`execute=False` 完成同样的候选
+  校验但不产生 actuator side effect。需要确认 SDK 接受的 home、calibration 和 replay 操作，
+  才显式调用 blocking acceptance。
+- B 只在 ARMED、上一轮 S 已清理、physical home（物理运行）完成后进入 RUNNING；sync/async
+  都不追赶过期 deadline，也不制造超过 `control_hz` 的 command burst。
 
-### `runtime/`
+## Teleop flow
 
-| 文件 | 主要职责 |
-|---|---|
-| `__init__.py` | 轻量运行时子包标记。 |
-| `safety.py` | safety state、typed stop request、run generation、coupled-command sequence ticket 与可撤销状态转换。 |
-| `status.py` | worker/supervisor 共用的结构化退出原因。 |
-| `workers.py` | spawn-only worker spec、构建、启动、分阶段 verified stop/IPC cleanup 与退出优先级。 |
-| `supervisor.py` | readiness、heartbeat、进程健康、B-relative shadow time-limit、摘要与 verified shutdown。 |
+```text
+VR / keyboard input
+    → teleop session lifecycle
+    → control loop / causal fixed-grid tick
+    → TeleopController + action proposal
+    → SafetyGate + publication
+    → arm / hand workers
+    └→ fixed-grid record sample → RecorderIO
+```
 
-### `robot/`
+- `teleop/control_grid.py` 持有 proposal、EMA、hand ramp/retarget、IK hold 与上一 endpoint 等
+  算法状态；loop 持有 pause、recording、keyboard 和退出编排状态。
+- feedback 缺失、过期、断开或录制边界进入 pause boundary：先使 generation 失效并清除
+  controller reference，恢复时必须收到 pause 之后的新鲜因果 arm/VR/hand feedback，再重锚并
+  继续发布。静默期间不发布旧目标。
+- teleop 和 replay 的动作决策都必须经过共享 publication/safety 边界；worker 侧再次检查
+  state、generation、ticket、shape、finite、limits 和 freshness。
 
-| 文件 | 主要职责 |
-|---|---|
-| `__init__.py` | 轻量硬件子包标记。 |
-| `types.py` | 校验后的 `RobotState` 与 `RobotAction`。 |
-| `command_validation.py` | worker 在 SDK 调用前执行 generation/freshness/limits/异常跳变复核与 fault 分类。 |
-| `xarm7.py` | xArm Python SDK 的唯一 driver 边界。 |
-| `xhand.py` | XHand controller 的唯一 driver 边界。 |
-| `arm_worker.py` | xArm Mode-6 command/home consumer 与状态 publisher。 |
-| `hand_worker.py` | XHand latest-target servo、状态/触觉 publisher 与 fault latch。 |
+## Command safety invariants
 
-### `sensor/`
+- runtime safety state 只有 `DISARMED → ARMED → RUNNING` 与 `FAULT` 终态路径；共享的
+  `motion_lock` 同时保护 state、`run_generation` 和 active command ticket。
+- 每次开始、停止、暂停、故障或 supersede 都推进 `run_generation` 并清除 active ticket；
+  stale、过期、被覆盖或不再拥有 latest-wins slot 的命令不得跨 SDK 边界。
+- `SafetyGate` 校验 joint limits、workspace、collision 和 command delta；它不把 feedback
+  缺失当作安全，也不以隐式 clip 代替 reject。arm/hand worker 保留最后一道硬件调用前守卫。
+- STOP、e-stop、worker death、heartbeat timeout、command-progress stall 和 cleanup failure
+  都 fail closed；home 仍执行 hand + arm 的显式碰撞检查路径。
+- 命令发布与物理接受是两个边界：实时路径非阻塞发布，只有确实需要确认的 home、calibration
+  和 replay 路径等待明确 acceptance result。
 
-| 文件 | 主要职责 |
-|---|---|
-| `__init__.py` | 轻量传感器子包标记。 |
-| `camera_geometry.py` | native RGB-D intrinsics 与 `T_color_from_depth` 数据合同。 |
-| `clock_sync.py` | device clock 到 host monotonic 的保守映射。 |
-| `realsense.py` | RealSense driver、native frame ownership copy 与设备配置。 |
-| `camera_worker.py` | RealSense lifecycle、时序/健康信息与 camera ring 发布。 |
-| `pointcloud.py` | SDK-free depth-to-color aligned RGB-D 到 xArm-base 点云算法、桌面预裁减与体素 RGB 聚合。 |
-| `pointcloud_worker.py` | resolved 点云策略的 latest-only 固定 `float32[N,6]` publisher、freshness 与语义身份日志。 |
-| `vr_worker.py` | crash-isolated Quest/HTS receiver 与 VR ring publisher。 |
+## Recording/Data boundaries
 
-### `calibration/`
+- teleop 只把已经选择并校验的 causal fixed-grid sample 交给 RecorderIO；RecorderIO 独占
+  episode transaction、sidecar、sequence continuity、validation 和 atomic finalize，不决定
+  机器人动作。
+- raw episode 的 schema、字段语义和对齐保持单一来源：`recording/schema.py` 与
+  [`docs/data_schema.md`](docs/data_schema.md)。当前链路为 raw v24 → processed HDF5 v11 →
+  Policy Zarr v5；离线 `data/` 负责清洗、审计和导出，不改变 raw 字段含义。
+- `recording/hdf5_writer.py` 独占单个 `data.h5` handle；camera sidecar 和 video writer 不
+  反向拥有控制状态。缺口、失败或未完成 finalize 不伪装成完整 episode。
+- 物理回放读取已发布的 raw command/provenance，并重新经过当前 runtime 的 preflight、safety、
+  generation 与 worker 边界；processed 产物不能重新解释或替代 raw 命令事实。
 
-| 文件 | 主要职责 |
-|---|---|
-| `__init__.py` | 标定子包标记。 |
-| `table.py` | 桌面 RANSAC/最小二乘拟合与确认后的原子发布。 |
-| `camera/__init__.py` | 相机标定子包标记。 |
-| `camera/solver.py` | ArUco 检测、hand-eye 求解、残差筛选与标定持久化。 |
-| `camera/control.py` | 标定 arm state、workspace clipping、gated publish 与 homing。 |
-| `camera/session.py` | xArm/RealSense/GUI/采样 lifecycle 与失败 cleanup。 |
-
-### `planning/`
-
-| 文件 | 主要职责 |
-|---|---|
-| `__init__.py` | planner 与核心类型出口。 |
-| `types.py` | Pose、IK/path/collision result 与 planner profile。 |
-| `poses.py` | pose、quaternion、matrix 与 rot6d 纯运算。 |
-| `arm_fk.py` | xArm7 Pinocchio FK、Jacobian 与 pose transform。 |
-| `hand_fk.py` | XHand Pinocchio fingertip FK。 |
-| `fingertip.py` | 共享的 arm+hand FK 与 hand-mount transform，输出 xArm-base fingertip points。 |
-| `ik.py` | MPlib position IK、seed 与 null-space 优化。 |
-| `candidates.py` | IK candidate 生成、过滤、规范化、排序与选择。 |
-| `collision.py` | xArm7+XHand 自碰撞、环境碰撞与 transition 检查。 |
-| `paths.py` | 插值、wrap、densification 与 typed home path 结果。 |
-| `planner.py` | 组合 IK、路径与 collision 的 motion-planner facade。 |
-
-### `control/`
-
-| 文件 | 主要职责 |
-|---|---|
-| `__init__.py` | 轻量控制子包标记。 |
-| `action.py` | backend-neutral `ActionCandidate` 与 representation 校验。 |
-| `safety_gate.py` | generation、limits、命令历史 delta、实测 workspace/collision 的 fail-closed gate。 |
-| `publication.py` | 通用 controller feedback/runtime gate、command result/publication、coupled record 非阻塞发布与 acknowledgement。 |
-| `arm_home.py` | collision-checked arm homing 合同、排队、等待与 abort。 |
-| `hand_home.py` | exact hand-home 发布与 worker acknowledgement。 |
-
-### `teleop/`
-
-| 文件 | 主要职责 |
-|---|---|
-| `__init__.py` | 遥操作子包标记。 |
-| `config.py` | 从 resolved runtime 投影的窄 teleop 配置。 |
-| `session.py` | VR teleop 主进程 owner、预检、worker topology 与 cleanup。 |
-| `loop.py` | coordinator 资源构造、readiness 与 operator/grid 调度。 |
-| `control_grid.py` | 单个 causal grid 的读取、proposal、gate、publish 与 sample。 |
-| `control_state.py` | coordinator mutable state 与 command-quiescence 转换。 |
-| `operator_controls.py` | BEGIN/pause/home/quit 与录制 disposition。 |
-| `keyboard.py` | 全局快捷键、control signal 与 EEF delta。 |
-| `keyboard_session.py` | 键盘 teleop lifecycle 与实时控制流。 |
-| `action_proposal.py` | 纯 EEF/arm/hand proposal 计算。 |
-| `arm_mapper.py` | VR wrist 相对运动到 robot-frame EEF target。 |
-| `hand_control.py` | hand observation cache、ramp 与 command helper。 |
-| `safety.py` | pause/hold、re-anchor、feedback guard 与 configured home。 |
-| `episode_samples.py` | 因果 snapshot 到 typed fixed-grid record sample。 |
-| `recording_session.py` | 退出时有界保存/丢弃决策。 |
-| `camera_freshness.py` | camera duplicate/gap/generation/freshness 分类。 |
-| `vr_transform.py` | VR heading 标定 schema 与 rotation 校验。 |
-| `timing.py` | 控制网格分阶段 timing 统计。 |
-| `audio_feedback.py` | 非阻塞操作者语音反馈。 |
-| `retarget/__init__.py` | retargeting 子包出口。 |
-| `retarget/facade.py` | TAG/DexPilot 统一 facade、校验与状态。 |
-| `retarget/dexpilot.py` | 带 human-flexion prior 的 DexPilot wrapper。 |
-| `retarget/tag_optimizer.py` | 两阶段 NLopt TAG optimizer。 |
-| `retarget/pin_grad.py` | Pinocchio analytical gradient engine。 |
-
-### `recording/`
-
-| 文件 | 主要职责 |
-|---|---|
-| `__init__.py` | `EpisodeReader`/`EpisodeRecorder` 等稳定公开 facade。 |
-| `schema.py` | raw episode v24 persisted schema 与 sidecar/semantic validators。 |
-| `frame.py` | IPC record 到 immutable owned `EpisodeFrame` 的唯一 decode 边界。 |
-| `timeline.py` | 多速率输入到 fixed grid 的 timestamp 对齐与填充原因。 |
-| `recorder.py` | raw episode transaction、质量汇总、验证与原子发布。 |
-| `hdf5_writer.py` | 单个 `data.h5` handle、dataset append 与 offset owner。 |
-| `camera_writer.py` | RGB/depth sidecar 的有界后台 writer。 |
-| `video.py` | PyAV RGB 编解码与 codec 配置。 |
-| `client.py` | controller 侧 recorder protocol、sample publication 与 stop result。 |
-| `worker.py` | RecorderIO active generation、sequence continuity、transaction 与 finalize。 |
-| `reader.py` | published v24 校验、HDF5 merged view 与 RGB/depth 读取。 |
-
-### `data/`
-
-| 文件 | 主要职责 |
-|---|---|
-| `__init__.py` | 轻量离线数据子包标记。 |
-| `contracts.py` | output/quality policy、processing config、source 连续段与 decision。 |
-| `quality.py` | 停滞、抖动、突变等 temporal quality 纯函数审计。 |
-| `clean.py` | raw flags、limits、annotations 与质量结果到保留/拒绝决定。 |
-| `transforms.py` | RGB/depth/intrinsics 的确定性数值变换。 |
-| `raw_pointcloud.py` | raw v24 相机 metadata 到 canonical 点云输入的共享持久化边界。 |
-| `process.py` | aligned raw v24 到 processed HDF5 v11 的事务式管线。 |
-| `export.py` | processed HDF5 v11 到 Policy Zarr v5 的整 episode 准入与事务式导出。 |
-
-### `deployment/`
-
-| 文件 | 主要职责 |
-|---|---|
-| `__init__.py` | learned-policy 部署子包标记。 |
-| `contracts.py` | 无时间 `PolicyPrediction`、不可变 `ActionChunk` 与 `PolicyRuntime` protocol。 |
-| `config.py` | PolicySpec/Real runtime 兼容门与 pickle-safe、固定 seed=0 的窄 inference-worker 配置；不拥有模型 shape/horizon 或 Real timing。 |
-| `observation.py` | 因果不可变 arm/hand/tactile/pointcloud/RGB history batch。 |
-| `timing.py` | async chunk future-step 选择与 absolute inference cadence 的纯计算。 |
-| `worker.py` | 经 Policy public API 直接 restore、camera-grid observation 校验、sync request/async cadence 与单 `ActionChunk` 发布。 |
-| `coordinator.py` | learned-policy 唯一 command producer、generation-isolated 单 chunk scheduling、endpoint disposition、SafetyGate、物理运行的 per-episode home 准入、逐 endpoint coupled 双 ACK、typed stop、action-step limit 与 watchdog。 |
-| `lifecycle.py` | policy observation history capacity sizing、`execute` 布尔控制的 worker topology、同进程 multi-episode supervision、物理模式 collision-checked home 与 verified shutdown。 |
-| `operator.py` | B/S/Q/ESC typed request；物理模式每个 episode 从 ARMED 执行 hand + collision-checked arm home，并发布一次性 home 准入标志。 |
-| `metrics.py` | inference/coordinator live counters、固定窗口 p50/p95/p99 timing，以及 log-only compact episode summary。 |
-
-### `replay/`
-
-| 文件 | 主要职责 |
-|---|---|
-| `__init__.py` | 轻量回放子包标记。 |
-| `trajectory.py` | raw 命令加载；processed provenance 到已校验 raw 行选择；首帧状态与模型 preflight。 |
-| `controller.py` | XHand 首帧目标 warm-up、fixed-rate safety-gated physical replay 调度。 |
-| `capture.py` | measured state、sent command 与 rejection 的有界捕获。 |
-| `evaluation.py` | tracking/consistency 指标与结果持久化。 |
-| `session.py` | worker、safety transition、operator flow、评估与 cleanup owner。 |
-
-### `integrations/` 与 `utils/`
-
-| 文件 | 主要职责 |
-|---|---|
-| `integrations/__init__.py` | 外部集成子包标记。 |
-| `integrations/dexmani_policy.py` | 外部 `dexmani_policy` public runtime 的纯 NumPy canonical multimodal observation 编码与 joint/EE action 解码 adapter。 |
-| `utils/__init__.py` | 轻量通用工具子包标记。 |
-| `utils/atomic_io.py` | fsync、拒绝已有文件/目录/链接的 atomic publish 与 atomic JSON。 |
-| `utils/feedback.py` | arm/hand feedback freshness、finite 与 health predicate。 |
-| `utils/limits.py` | XHand rated/mechanical/command limit nesting。 |
-| `utils/log.py` | logging、native stdout capture 与 throttled warning。 |
-| `utils/rate.py` | absolute-deadline `LoopRate` 与 overrun 统计。 |
-| `utils/serialization.py` | dataclass mapping 恢复 helper。 |
-| `utils/smoothing.py` | quaternion-aware Cartesian pose EMA。 |
-
-## 4. 可执行入口
-
-`examples/` 是薄入口或诊断程序，不是测试；除明确离线工具外均按可能影响硬件处理。
-
-| 文件 | 主要职责 |
-|---|---|
-| `collect_teleop.py` | VR teleop 数据采集入口。 |
-| `keyboard_teleop.py` | keyboard teleop 入口。 |
-| `run_policy.py` | Policy experiment 的 list/check 与 shadow/run CLI；shadow 为 validate-only lifecycle，run 为 physical coupled-publication lifecycle。 |
-| `replay_episode.py` | 物理回放入口。 |
-| `process_episodes.py` | raw → processed HDF5 离线处理。 |
-| `export_policy_zarr.py` | processed HDF5 → Policy Zarr 离线导出。 |
-| `visualize_episode.py` | raw v24 离线可视化与 canonical 点云即时预览。 |
-| `visualize_episode_processed.py` | processed episode 离线可视化。 |
-| `calibrate_camera.py` | xArm+RealSense hand-eye 标定入口。 |
-| `calibrate_vr_heading.py` | VR heading 采集、质量门禁与 transform 发布。 |
-| `realsense_record_example.py` | RealSense RGB-D/point-cloud 交互诊断。 |
-| `pointcloud_process_example.py` | L515 点云处理分段/端到端时延诊断、raw/processed 离线快照，以及按需桌面标定与显式 plane 发布。 |
-| `xhand_control_example.py` | 使用 canonical hand 限位的 XHand 独立硬件诊断。 |
-
-## 5. 离线验证
-
-| 路径 | 主要职责 |
-|---|---|
-| `tests/test_dexmani_policy_adapter.py` | PolicySpec→Real 固定兼容门、runtime policy timing 的严格解析，以及 NumPy observation/joint/EE action adapter 失败路径。 |
-| `tests/test_deployment_metrics.py` | 跨周期 flush 的有界 episode counter/timing 累积与单次 log-only summary 合同。 |
-| `tests/test_hand_worker_startup.py` | XHand startup no-motion，以及 `execute=False/True` publication seam 与 arm+hand 双 ACK 合同。 |
-| `tests/test_policy_lifecycle.py` | inference restore 失败时不启动任何 hardware worker 的顺序合同。 |
-| `tests/test_policy_coordinator.py` | coordinator 的 generation/chunk freshness、sync/async 调度、action-step 上限、SafetyGate、ACK 与 watchdog 语义。 |
-| `tests/test_policy_multi_episode.py` | 同进程第二个 policy episode、per-episode H 门、generation 前进以及旧 ticket 失效的离线合同。 |
-| `tests/test_deployment_config.py` | policy deployment 默认 sync、action-step 上限与严格值校验。 |
-| `tests/test_policy_chunk_ipc.py` | 单槽 latest-wins ActionChunk wire round-trip、严格 presence/shape/generation/capacity 校验与 inference request Event 合同。 |
-| `tests/test_policy_multimodal_observation.py` | canonical observation fields、causal alignment、tactile provenance、fingertip FK 与 worker/ring 依赖合同。 |
-| `tests/test_teleop_quiescence.py` | BEGIN/quiescence 边界的 stale/fresh causal feedback 合同，以及 audio 与 motion gate 解耦。 |
-| `tests/test_policy_offline_multimodal.py` | processed tactile/FK 等价语义与四 profile Policy Zarr admission 合同。 |
-| `tests/test_run_policy_cli.py` | list/check/shadow/run 路由、最小 CLI 参数面与 lifecycle seam。 |
-
-## 6. 静态资源
-
-- `assets/robots/xarm7/`：xArm7 URDF、SRDF 与 visual/collision meshes。
-- `assets/robots/xhand/`：xArm7+XHand/standalone XHand URDF、SRDF 与 meshes。
-- `assets/retargeting/`：DexPilot XHand 配置。
-- `assets/audio/`：teleop 中文状态提示音。
-
-模型与标定资源路径必须通过 `robot_spec.py` 或 canonical config 解析，不在 worker、
-entry script 或文档中复制第二份默认值。
+源代码、schema 和 canonical config 是实现真相；本文件只帮助定位上述稳定边界。

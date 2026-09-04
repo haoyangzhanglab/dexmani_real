@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from dexmani_real.ipc.schema import (
-    MAX_POLICY_CHUNK_STEPS,
+    MAX_PREDICTION_STEPS,
     POINT_CLOUD_FEATURE_DIM,
     SUPPORTED_POINT_CLOUD_COUNTS,
 )
@@ -41,6 +41,18 @@ _REQUIRED_POLICY_SPEC_FIELDS = (
 _SUPPORTED_OBSERVATION_FIELDS = frozenset(
     {"joint_state", "point_cloud", "rgb", "contact_force", "fingertip_points"}
 )
+
+
+def validate_max_running_s(max_running_s: float | None) -> float | None:
+    """Validate the executor-owned B-relative episode duration limit."""
+    if max_running_s is None:
+        return None
+    if isinstance(max_running_s, bool):
+        raise TypeError("max_running_s must be a finite positive number or None")
+    value = float(max_running_s)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("max_running_s must be finite and positive")
+    return value
 
 
 def policy_observation_fields(policy_spec: Any) -> tuple[Any, ...]:
@@ -129,9 +141,9 @@ def validate_policy_spec(policy_spec: Any) -> None:
         value = getattr(policy_spec, name)
         if type(value) is not int or value <= 0:
             raise ValueError(f"Policy {name} must be a positive integer")
-    if policy_spec.n_action_steps > MAX_POLICY_CHUNK_STEPS:
+    if policy_spec.n_action_steps > MAX_PREDICTION_STEPS:
         raise ValueError(
-            f"Policy n_action_steps exceeds Real IPC capacity {MAX_POLICY_CHUNK_STEPS}"
+            f"Policy n_action_steps exceeds Real IPC capacity {MAX_PREDICTION_STEPS}"
         )
     if policy_spec.action_dim < policy_spec.control_action_dim:
         raise ValueError(
@@ -269,4 +281,5 @@ __all__ = [
     "policy_observation_fields",
     "validate_policy_runtime_compatibility",
     "validate_policy_spec",
+    "validate_max_running_s",
 ]

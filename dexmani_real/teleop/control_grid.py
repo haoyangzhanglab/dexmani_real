@@ -9,7 +9,13 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.control.action import ActionCandidate
-from dexmani_real.control.publication import CommandPublishStatus, publish_joint_targets
+from dexmani_real.control.publication import (
+    PUBLISH_REASON_SAFETY_STATE,
+    PreparedCommand,
+    PublishResult,
+    prepare_joint_command,
+    publish_command,
+)
 from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
 from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
@@ -23,7 +29,11 @@ from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.arm_fk import make_arm_fk
 from dexmani_real.planning.hand_fk import HandKinematics
-from dexmani_real.planning.poses import normalize_quat_wxyz, quat_wxyz_to_rot6d
+from dexmani_real.planning.poses import (
+    normalize_quat_wxyz,
+    quat_wxyz_to_rot6d,
+    rot6d_to_quat_wxyz,
+)
 from dexmani_real.recording.client import RecorderClient
 from dexmani_real.teleop.action_proposal import (
     compute_arm_joint_proposal,
@@ -33,11 +43,6 @@ from dexmani_real.teleop.action_proposal import (
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.camera_freshness import CameraFreshnessTracker
 from dexmani_real.teleop.config import TeleopCommandLimits, TeleopConfig
-from dexmani_real.teleop.control_state import (
-    CommandQuiescence,
-    CoordinatorDirective,
-    TeleopLoopState,
-)
 from dexmani_real.teleop.episode_samples import (
     FRAME_IK_FAIL,
     FRAME_OK,
@@ -47,11 +52,13 @@ from dexmani_real.teleop.episode_samples import (
     record_held,
     stop_recording,
 )
+from dexmani_real.teleop.hand_control import (
+    HandRetargetObservationCache,
+    reset_hand_retargeter,
+)
 from dexmani_real.teleop.safety import (
     advance_arm_feedback_error_count,
     arm_feedback_issue,
-    complete_reanchor,
-    enter_command_quiescence,
     hand_feedback_issue,
 )
 from dexmani_real.teleop.timing import StageTimer
@@ -60,23 +67,48 @@ from dexmani_real.utils.log import ThrottledWarner, get_logger
 logger = get_logger(__name__)
 
 
-@dataclass(frozen=True)
-class TeleopControlResources:
-    """Planning, mapping, safety, and recording resources for one policy process."""
-
-    planner: XArm7MotionPlanner
-    arm_mapper: ArmWristMapper
-    safety_gate: SafetyGate
-    recorder: RecorderClient | None
+def _prepare_and_publish_joint_command(
+    shared: RuntimeChannels,
+    arm_qpos: np.ndarray,
+    hand_qpos: np.ndarray | None,
+    *,
+    gate: SafetyGate,
+    arm_feedback_max_age_s: float,
+    hand_feedback_max_age_s: float,
+    is_hold: bool = False,
+    observation_id: int | None = None,
+    observation_anchor_monotonic_ns: int | None = None,
+    hand_mechanical_lower_rad: np.ndarray | None = None,
+    hand_mechanical_upper_rad: np.ndarray | None = None,
+) -> tuple[PreparedCommand, PublishResult | None]:
+    """Run the explicit non-blocking teleop safety/publication path."""
+    prepared = prepare_joint_command(
+        shared,
+        arm_qpos,
+        hand_qpos,
+        gate=gate,
+        is_hold=is_hold,
+        observation_id=observation_id,
+        observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
+        hand_mechanical_lower_rad=hand_mechanical_lower_rad,
+        hand_mechanical_upper_rad=hand_mechanical_upper_rad,
+        arm_feedback_max_age_s=arm_feedback_max_age_s,
+        hand_feedback_max_age_s=hand_feedback_max_age_s,
+    )
+    if not prepared.accepted:
+        return prepared, None
+    assert prepared.candidate is not None
+    return prepared, publish_command(shared, prepared.candidate)
 
 
 @dataclass(frozen=True)
 class TeleopGridResources:
     """Read-only dependencies used to execute one control-grid observation."""
 
-    control: TeleopControlResources
+    planner: XArm7MotionPlanner
+    safety_gate: SafetyGate
+    recorder: RecorderClient | None
     command_limits: TeleopCommandLimits
-    quiescence: CommandQuiescence
     camera_freshness: CameraFreshnessTracker
     stage_timer: StageTimer
     validation_warn: ThrottledWarner
@@ -122,6 +154,202 @@ class TeleopActionComputation:
     ik_solve_time_ms: float
     policy_map_time_ms: float
     policy_compute_started_s: float
+
+
+@dataclass(frozen=True)
+class TeleopGridTickResult:
+    """Session-owned state changes produced by one causal grid tick."""
+
+    keep_running: bool = True
+    pause_reason: str | None = None
+    pause_released: bool = False
+    recording_active: bool = False
+    arm_feedback_error_count: int = 0
+    hand_disconnected_at_s: float | None = None
+
+
+class TeleopController:
+    """Own only persistent arm/hand mapping and proposal state."""
+
+    def __init__(
+        self,
+        *,
+        planner: XArm7MotionPlanner,
+        arm_mapper: ArmWristMapper,
+        config: TeleopConfig,
+        command_limits: TeleopCommandLimits,
+        initial_arm_qpos_rad: np.ndarray,
+        initial_hand_qpos_rad: np.ndarray,
+        hand_retargeter: Any = None,
+    ) -> None:
+        self.planner = planner
+        self.arm_mapper = arm_mapper
+        self.command_limits = command_limits
+        self.hand_enabled = bool(config.runtime.policy.hand_enabled)
+        self.ema_alpha_position = float(config.runtime.policy.ema.alpha_pos)
+        self.ema_alpha_rotation = float(config.runtime.policy.ema.alpha_rot)
+        self.hand_retargeter = hand_retargeter
+        self.prev_qpos_cmd = np.asarray(initial_arm_qpos_rad, dtype=np.float64).copy()
+        self.prev_hand_qpos = np.asarray(initial_hand_qpos_rad, dtype=np.float64).copy()
+        self.ema_prev_pos: np.ndarray | None = None
+        self.ema_prev_quat: np.ndarray | None = None
+        self.hand_ramp_start: np.ndarray | None = None
+        self.hand_ramp_step = 0
+        self.hand_retarget_cache = HandRetargetObservationCache()
+        self.consecutive_ik_hold_frames = 0
+        self.ik_hold_started_s = 0.0
+        self.last_target_eef_pos = np.full(3, np.nan)
+        self.last_target_eef_rot6d = np.full(6, np.nan)
+        self.planner.set_hand_qpos(self.prev_hand_qpos)
+
+    def clear_reference(self) -> None:
+        """Drop temporal proposal state at a command-silent boundary."""
+        self.arm_mapper.clear()
+        self.ema_prev_pos = None
+        self.ema_prev_quat = None
+        self.hand_ramp_start = None
+        self.hand_ramp_step = 0
+        self.hand_retarget_cache.reset()
+
+    def reset_reference(
+        self,
+        arm_state: np.ndarray,
+        vr_frame: dict[str, Any],
+        hand_state: np.ndarray | None,
+    ) -> bool:
+        """Re-anchor mapping from fresh measured feedback after a pause."""
+        try:
+            eef_pos, eef_rot6d = make_arm_fk().compute(
+                np.asarray(arm_state["qpos"][0], dtype=np.float64)
+            )
+            wrist_pos = np.asarray(vr_frame["wrist_pos"], dtype=np.float64)
+            wrist_quat = np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64)
+            self.arm_mapper.reset(
+                wrist_pos=wrist_pos,
+                wrist_quat_wxyz=wrist_quat,
+                eef_pos=eef_pos,
+                eef_quat_wxyz=rot6d_to_quat_wxyz(eef_rot6d),
+            )
+        except Exception:
+            self.arm_mapper.clear()
+            return False
+        if not self.arm_mapper.is_ready():
+            return False
+        hand_anchor: np.ndarray | None = None
+        if self.hand_enabled:
+            if hand_state is None or not np.all(np.isfinite(hand_state["qpos"][0])):
+                self.arm_mapper.clear()
+                return False
+            hand_anchor = np.asarray(hand_state["qpos"][0], dtype=np.float64).copy()
+            self.prev_hand_qpos = hand_anchor
+        self.ema_prev_pos = None
+        self.ema_prev_quat = None
+        self.hand_ramp_start = hand_anchor
+        self.hand_ramp_step = 0
+        self.hand_retarget_cache.reset()
+        reset_hand_retargeter(self.hand_retargeter, hand_anchor)
+        return True
+
+    def compute(
+        self,
+        observation: TeleopGridObservation,
+        resources: TeleopGridResources,
+    ) -> TeleopActionComputation | None:
+        """Map one validated observation and solve its arm/hand proposal."""
+        compute_started_s = time.perf_counter()
+        map_started_s = time.perf_counter()
+        mapped = self.arm_mapper.map(
+            observation.vr_frame["wrist_pos"],
+            observation.vr_frame["wrist_quat_wxyz"],
+        )
+        if mapped is None:
+            return None
+        target = compute_target_eef_pose(
+            mapped["pos"],
+            mapped["quat_wxyz"],
+            previous_position_world_m=self.ema_prev_pos,
+            previous_quat_world_wxyz=self.ema_prev_quat,
+            workspace_bounds_world_m=self.command_limits.workspace_bounds_world_m,
+            ema_alpha_position=self.ema_alpha_position,
+            ema_alpha_rotation=self.ema_alpha_rotation,
+        )
+        if target.smoothing_state_incomplete:
+            logger.warning(
+                "teleop_loop: previous EEF quaternion is missing — skipping EMA"
+            )
+        policy_map_time_ms = (time.perf_counter() - map_started_s) * 1000.0
+        resources.stage_timer.mark("map")
+        hand = compute_hand_joint_proposal(
+            self.hand_retargeter,
+            observation.vr_frame,
+            self.prev_hand_qpos,
+            hand_available=self.hand_enabled,
+            retarget_cache=self.hand_retarget_cache,
+            ramp_start_qpos_rad=self.hand_ramp_start,
+            ramp_step=self.hand_ramp_step,
+            ramp_total_frames=resources.hand_ramp_total_frames,
+            command_lower_rad=self.command_limits.hand_command_lower_rad,
+            command_upper_rad=self.command_limits.hand_command_upper_rad,
+            max_delta_rad_per_tick=self.command_limits.hand_max_delta_rad_per_tick,
+            mechanical_lower_rad=self.command_limits.hand_mechanical_lower_rad,
+            mechanical_upper_rad=self.command_limits.hand_mechanical_upper_rad,
+        )
+        self.hand_ramp_start = hand.next_ramp_start_qpos_rad
+        self.hand_ramp_step = hand.next_ramp_step
+        if hand.validation_issue is not None:
+            resources.validation_warn(
+                "teleop_loop: invalid hand command — holding: %s",
+                hand.validation_issue,
+            )
+        self.planner.set_hand_qpos(hand.qpos_rad)
+        ik_started_s = time.perf_counter()
+        ik_result = self.planner.solve_teleop_ik(
+            Pose(p=target.position_world_m, q=target.quat_world_wxyz),
+            observation.arm_qpos_rad,
+            self.prev_qpos_cmd,
+        )
+        ik_solve_time_ms = (time.perf_counter() - ik_started_s) * 1000.0
+        resources.stage_timer.mark("ik")
+        return TeleopActionComputation(
+            target_position_world_m=target.position_world_m,
+            target_quat_world_wxyz=target.quat_world_wxyz,
+            raw_target_position_world_m=target.raw_position_world_m,
+            raw_target_quat_world_wxyz=target.raw_quat_world_wxyz,
+            position_before_workspace_clamp_world_m=(
+                target.position_before_workspace_clamp_world_m
+            ),
+            hand_qpos_rad=hand.qpos_rad,
+            raw_hand_qpos_rad=hand.raw_qpos_rad,
+            hand_retarget_succeeded=hand.retarget_succeeded,
+            hand_validation_issue=hand.validation_issue,
+            hand_retarget_time_ms=hand.compute_time_ms,
+            ik_qpos_rad=ik_result.qpos if ik_result.success else None,
+            ik_failure_reason=ik_result.reason,
+            ik_solve_time_ms=ik_solve_time_ms,
+            policy_map_time_ms=policy_map_time_ms,
+            policy_compute_started_s=compute_started_s,
+        )
+
+
+def feedback_is_newer_than_pause(
+    pause_since_ns: int,
+    *,
+    arm_source_monotonic_ns: int,
+    vr_receive_monotonic_ns: int,
+    hand_source_monotonic_ns: int | None,
+) -> bool:
+    """Require every enabled feedback source to strictly postdate a pause."""
+    boundary_ns = int(pause_since_ns)
+    if boundary_ns <= 0:
+        return False
+    return bool(
+        int(arm_source_monotonic_ns) > boundary_ns
+        and int(vr_receive_monotonic_ns) > boundary_ns
+        and (
+            hand_source_monotonic_ns is None
+            or int(hand_source_monotonic_ns) > boundary_ns
+        )
+    )
 
 
 def _empty_policy_observation_signals() -> dict[str, object]:
@@ -220,38 +448,37 @@ def _recording_policy_observation_signals(
 
 
 def _record_grid_hold(
-    ctx: TeleopLoopState,
+    controller: TeleopController,
     shared: RuntimeChannels,
     resources: TeleopGridResources,
     observation: TeleopGridObservation,
     *,
+    recording_active: bool,
     action_candidate: ActionCandidate | None = None,
     frame_status: int | None = None,
     retarget_ok: bool = False,
     diagnostics: dict[str, Any] | None = None,
 ) -> None:
     """Record one fallback command with the common causal grid provenance."""
-    if not ctx.recording_active:
+    if not recording_active:
         return
-    assert ctx.prev_qpos_cmd is not None
-    assert ctx.prev_hand_qpos is not None
     kwargs: dict[str, Any] = {}
     if frame_status is not None:
         kwargs["frame_status"] = frame_status
     record_held(
-        resources.control.recorder,
+        resources.recorder,
         observation.arm_state,
-        ctx.prev_qpos_cmd,
-        ctx.prev_hand_qpos,
+        controller.prev_qpos_cmd,
+        controller.prev_hand_qpos,
         observation.vr_frame,
         observation.camera_frame,
         hand_state=observation.hand_state,
         hand_tactile=observation.hand_tactile,
         retarget_ok=retarget_ok,
-        arm_qpos_sent=ctx.prev_qpos_cmd.copy(),
+        arm_qpos_sent=controller.prev_qpos_cmd.copy(),
         diagnostics=diagnostics,
-        target_eef_pos=ctx.last_target_eef_pos,
-        target_eef_rot6d=ctx.last_target_eef_rot6d,
+        target_eef_pos=controller.last_target_eef_pos,
+        target_eef_rot6d=controller.last_target_eef_rot6d,
         hand_fk=resources.hand_fk,
         T_eef_handbase_pos=resources.handbase_position_eef_m,
         T_eef_handbase_quat_wxyz=resources.handbase_quat_eef_wxyz,
@@ -266,52 +493,27 @@ def _record_grid_hold(
 
 
 def _read_control_grid_observation(
-    ctx: TeleopLoopState,
+    controller: TeleopController,
     shared: RuntimeChannels,
     cfg: TeleopConfig,
     resources: TeleopGridResources,
     *,
+    teleop_active: bool,
+    recording_active: bool,
+    pause_since_ns: int,
+    pause_reason: str | None,
+    arm_feedback_error_count: int,
+    hand_disconnected_at_s: float | None,
     loop_count: int,
     observation_anchor_monotonic_ns: int,
-) -> tuple[CoordinatorDirective, TeleopGridObservation | None]:
+) -> tuple[TeleopGridTickResult, TeleopGridObservation | None]:
     """Read and validate one causal sensor cut, remaining silent when unsafe."""
-    assert ctx.prev_qpos_cmd is not None
-    assert ctx.prev_hand_qpos is not None
-    arm_mapper = resources.control.arm_mapper
-    recorder = resources.control.recorder
-    _quiescence = resources.quiescence
+    recorder = resources.recorder
     _camera_freshness = resources.camera_freshness
     stage_timer = resources.stage_timer
     _validate_warn = resources.validation_warn
     _arm_feedback_warn = resources.arm_feedback_warn
-    _hand_fk = resources.hand_fk
-    _T_eef_handbase_pos = resources.handbase_position_eef_m
-    _T_eef_handbase_quat_wxyz = resources.handbase_quat_eef_wxyz
     _current_grid_anchor_ns = observation_anchor_monotonic_ns
-    def _enter_command_quiescence(reason: str) -> None:
-        enter_command_quiescence(
-            ctx,
-            shared,
-            _quiescence,
-            arm_mapper,
-            reason,
-        )
-
-    def _complete_reanchor(
-        current_arm_state: np.ndarray,
-        current_vr_frame: dict[str, Any],
-        current_hand_state: np.ndarray | None,
-    ) -> bool:
-        return complete_reanchor(
-            ctx,
-            arm_mapper,
-            _validate_warn,
-            ctx.hand_available,
-            current_arm_state,
-            current_vr_frame,
-            current_hand_state,
-        )
-
     arm_result = read_causal_structured_frame(
         shared.arm_state_ring,
         source_field="source_monotonic_ns",
@@ -324,25 +526,41 @@ def _read_control_grid_observation(
         now_monotonic_ns=time.monotonic_ns(),
         max_age_s=cfg.runtime.policy.arm_state_stale_threshold_s,
     )
-    ctx.arm_feedback_error_count, arm_feedback_fault = advance_arm_feedback_error_count(
-        ctx.arm_feedback_error_count,
+    arm_feedback_error_count, arm_feedback_fault = advance_arm_feedback_error_count(
+        arm_feedback_error_count,
         arm_issue,
         max_consecutive_errors=cfg.runtime.policy.max_consecutive_errors,
     )
     if arm_issue is not None:
         _arm_feedback_warn(
             "teleop_loop: invalid arm feedback (%d/%d): %s",
-            ctx.arm_feedback_error_count,
+            arm_feedback_error_count,
             cfg.runtime.policy.max_consecutive_errors,
             arm_issue,
         )
-        if ctx.teleop_active and not _quiescence.active:
-            _enter_command_quiescence("arm_feedback")
         if arm_feedback_fault:
             logger.error("teleop_loop: arm feedback fault: %s", arm_issue)
             shared.error_state.value = True
-            return CoordinatorDirective.BREAK, None
-        return CoordinatorDirective.CONTINUE, None
+            return (
+                TeleopGridTickResult(
+                    keep_running=False,
+                    recording_active=recording_active,
+                    arm_feedback_error_count=arm_feedback_error_count,
+                    hand_disconnected_at_s=hand_disconnected_at_s,
+                ),
+                None,
+            )
+        return (
+            TeleopGridTickResult(
+                pause_reason=(
+                    "arm_feedback" if teleop_active and pause_reason is None else None
+                ),
+                recording_active=recording_active,
+                arm_feedback_error_count=arm_feedback_error_count,
+                hand_disconnected_at_s=hand_disconnected_at_s,
+            ),
+            None,
+        )
     assert arm_state is not None  # validation above proved availability
     arm_qpos = arm_state["qpos"][0].copy()
 
@@ -357,10 +575,10 @@ def _read_control_grid_observation(
     # payload only while the policy-owned recorder requests it.
     cam = (
         read_camera_frame_causal(shared, anchor_monotonic_ns=_current_grid_anchor_ns)
-        if ctx.recording_active
+        if recording_active
         else None
     )
-    if ctx.recording_active:
+    if recording_active:
         cam, _camera_stalled = _camera_freshness.observe(cam)
         if _camera_stalled:
             logger.error(
@@ -370,12 +588,12 @@ def _read_control_grid_observation(
             print("  ⚠ 相机连续失帧超过阈值，当前 episode 已废弃；遥操作继续")
             stop_recording(
                 recorder,
-                ctx.recording_active,
+                True,
                 save=False,
                 shared=shared,
                 reason="camera_stall",
             )
-            ctx.recording_active = False
+            recording_active = False
     stage_timer.mark("cam")
 
     hand_result = read_causal_structured_frame(
@@ -392,12 +610,10 @@ def _read_control_grid_observation(
     hand_issue = hand_feedback_issue(cfg, hand_state)
     if cfg.runtime.policy.hand_enabled and hand_issue is not None:
         now_s = time.monotonic()
-        if ctx.hand_disconnected_at_s is None:
-            ctx.hand_disconnected_at_s = now_s
+        if hand_disconnected_at_s is None:
+            hand_disconnected_at_s = now_s
             logger.warning("Hand feedback unhealthy — pausing motion: %s", hand_issue)
-        if ctx.teleop_active and not _quiescence.active:
-            _enter_command_quiescence("hand_feedback")
-        unhealthy_duration_s = now_s - ctx.hand_disconnected_at_s
+        unhealthy_duration_s = now_s - hand_disconnected_at_s
         if unhealthy_duration_s >= cfg.runtime.policy.hand_disconnect_timeout_s:
             logger.error(
                 "Hand feedback remained unhealthy for %.1fs: %s",
@@ -405,10 +621,18 @@ def _read_control_grid_observation(
                 hand_issue,
             )
             shared.error_state.value = True
-            return CoordinatorDirective.BREAK, None
-    elif cfg.runtime.policy.hand_enabled and ctx.hand_disconnected_at_s is not None:
-        unhealthy_duration_s = time.monotonic() - ctx.hand_disconnected_at_s
-        ctx.hand_disconnected_at_s = None
+            return (
+                TeleopGridTickResult(
+                    keep_running=False,
+                    recording_active=recording_active,
+                    arm_feedback_error_count=arm_feedback_error_count,
+                    hand_disconnected_at_s=hand_disconnected_at_s,
+                ),
+                None,
+            )
+    elif cfg.runtime.policy.hand_enabled and hand_disconnected_at_s is not None:
+        unhealthy_duration_s = time.monotonic() - hand_disconnected_at_s
+        hand_disconnected_at_s = None
         logger.info(
             "Hand feedback recovered after %.1fs — waiting for fresh re-anchor",
             unhealthy_duration_s,
@@ -424,45 +648,73 @@ def _read_control_grid_observation(
             loop_count,
             arm_state,
             vr_frame,
-            ctx.teleop_active,
-            ctx.recording_active,
-            ctx.arm_feedback_error_count,
+            teleop_active,
+            recording_active,
+            arm_feedback_error_count,
             arm_state_age_s=_arm_age,
         )
 
-    if ctx.teleop_active and vr_stale and not _quiescence.active:
-        _enter_command_quiescence("vr_stale")
+    requested_pause_reason = None
+    if teleop_active and pause_reason is None:
+        if vr_stale:
+            requested_pause_reason = "vr_stale"
+        elif cfg.runtime.policy.hand_enabled and hand_issue is not None:
+            requested_pause_reason = "hand_feedback"
+    hand_source_ns = (
+        int(hand_state["source_monotonic_ns"][0])
+        if controller.hand_enabled and hand_state is not None
+        else None
+    )
 
-    if not ctx.teleop_active or vr_stale or _quiescence.active:
-        # Resume only with feedback newer than the quiescence boundary.
+    if (
+        not teleop_active
+        or vr_stale
+        or pause_reason is not None
+        or requested_pause_reason
+    ):
+        # Resume only with feedback newer than the pause boundary.
         if (
-            ctx.teleop_active
+            teleop_active
             and not vr_stale
-            and _quiescence.active
+            and pause_reason is not None
+            and pause_since_ns > 0
             and vr_frame is not None
-            and (not ctx.hand_available or hand_state is not None)
-            and (not ctx.hand_available or hand_issue is None)
-            and _quiescence.feedback_is_newer(
+            and (not controller.hand_enabled or hand_state is not None)
+            and (not controller.hand_enabled or hand_issue is None)
+            and feedback_is_newer_than_pause(
+                pause_since_ns,
                 arm_source_monotonic_ns=int(arm_state["source_monotonic_ns"][0]),
                 vr_receive_monotonic_ns=int(vr_frame["local_recv_ns"]),
-                hand_source_monotonic_ns=(
-                    int(hand_state["source_monotonic_ns"][0])
-                    if ctx.hand_available and hand_state is not None
-                    else None
-                ),
+                hand_source_monotonic_ns=hand_source_ns,
             )
         ):
-            if _complete_reanchor(arm_state, vr_frame, hand_state):
-                quiescence_reason = _quiescence.reason
-                _quiescence.clear()
+            if controller.reset_reference(arm_state, vr_frame, hand_state):
                 logger.info(
-                    "teleop_loop: released %s command quiescence after fresh re-anchor",
-                    quiescence_reason,
+                    "teleop_loop: released %s pause boundary after fresh re-anchor",
+                    pause_reason,
                 )
+                pause_released = True
+            else:
+                _validate_warn(
+                    "teleop_loop: re-anchor inputs invalid — remaining command-silent"
+                )
+                pause_released = False
+        else:
+            pause_released = False
         # Track measured position while silent without publishing a hold target.
-        ctx.prev_qpos_cmd = arm_qpos.copy()
-        ctx.ema_prev_pos = ctx.ema_prev_quat = None
-        return CoordinatorDirective.CONTINUE, None
+        controller.prev_qpos_cmd = arm_qpos.copy()
+        controller.ema_prev_pos = None
+        controller.ema_prev_quat = None
+        return (
+            TeleopGridTickResult(
+                pause_reason=requested_pause_reason,
+                pause_released=pause_released,
+                recording_active=recording_active,
+                arm_feedback_error_count=arm_feedback_error_count,
+                hand_disconnected_at_s=hand_disconnected_at_s,
+            ),
+            None,
+        )
 
     assert vr_frame is not None
     policy_observation_signals = (
@@ -471,11 +723,15 @@ def _read_control_grid_observation(
             cam,
             anchor_monotonic_ns=observation_anchor_monotonic_ns,
         )
-        if ctx.recording_active
+        if recording_active
         else None
     )
     return (
-        CoordinatorDirective.NORMAL,
+        TeleopGridTickResult(
+            recording_active=recording_active,
+            arm_feedback_error_count=arm_feedback_error_count,
+            hand_disconnected_at_s=hand_disconnected_at_s,
+        ),
         TeleopGridObservation(
             arm_state=arm_state,
             arm_ring_sequence=arm_ring_sequence,
@@ -491,192 +747,113 @@ def _read_control_grid_observation(
     )
 
 
-def _compute_action_computation(
-    ctx: TeleopLoopState,
-    cfg: TeleopConfig,
-    resources: TeleopGridResources,
-    observation: TeleopGridObservation,
-) -> TeleopActionComputation | None:
-    """Map one validated observation and solve its arm/hand proposal."""
-    assert ctx.prev_qpos_cmd is not None
-    assert ctx.prev_hand_qpos is not None
-    compute_started_s = time.perf_counter()
-    map_started_s = time.perf_counter()
-    mapped = resources.control.arm_mapper.map(
-        observation.vr_frame["wrist_pos"],
-        observation.vr_frame["wrist_quat_wxyz"],
-    )
-    if mapped is None:
-        return None
-
-    command_limits = resources.command_limits
-    target = compute_target_eef_pose(
-        mapped["pos"],
-        mapped["quat_wxyz"],
-        previous_position_world_m=ctx.ema_prev_pos,
-        previous_quat_world_wxyz=ctx.ema_prev_quat,
-        workspace_bounds_world_m=command_limits.workspace_bounds_world_m,
-        ema_alpha_position=cfg.runtime.policy.ema.alpha_pos,
-        ema_alpha_rotation=cfg.runtime.policy.ema.alpha_rot,
-    )
-    if target.smoothing_state_incomplete:
-        logger.warning("teleop_loop: previous EEF quaternion is missing — skipping EMA")
-    policy_map_time_ms = (time.perf_counter() - map_started_s) * 1000.0
-    resources.stage_timer.mark("map")
-
-    hand = compute_hand_joint_proposal(
-        ctx.hand_retargeter,
-        observation.vr_frame,
-        ctx.prev_hand_qpos,
-        hand_available=ctx.hand_available,
-        retarget_cache=ctx.hand_retarget_cache,
-        ramp_start_qpos_rad=ctx.hand_ramp_start,
-        ramp_step=ctx.hand_ramp_step,
-        ramp_total_frames=resources.hand_ramp_total_frames,
-        command_lower_rad=command_limits.hand_command_lower_rad,
-        command_upper_rad=command_limits.hand_command_upper_rad,
-        max_delta_rad_per_tick=command_limits.hand_max_delta_rad_per_tick,
-        mechanical_lower_rad=command_limits.hand_mechanical_lower_rad,
-        mechanical_upper_rad=command_limits.hand_mechanical_upper_rad,
-    )
-    ctx.hand_ramp_start = hand.next_ramp_start_qpos_rad
-    ctx.hand_ramp_step = hand.next_ramp_step
-    if hand.validation_issue is not None:
-        resources.validation_warn(
-            "teleop_loop: invalid hand command — holding: %s",
-            hand.validation_issue,
-        )
-
-    planner = resources.control.planner
-    # The arm collision model must see the hand pose from this same observation.
-    planner.set_hand_qpos(hand.qpos_rad)
-    ik_started_s = time.perf_counter()
-    ik_result = planner.solve_teleop_ik(
-        Pose(p=target.position_world_m, q=target.quat_world_wxyz),
-        observation.arm_qpos_rad,
-        ctx.prev_qpos_cmd,
-    )
-    ik_solve_time_ms = (time.perf_counter() - ik_started_s) * 1000.0
-    resources.stage_timer.mark("ik")
-    return TeleopActionComputation(
-        target_position_world_m=target.position_world_m,
-        target_quat_world_wxyz=target.quat_world_wxyz,
-        raw_target_position_world_m=target.raw_position_world_m,
-        raw_target_quat_world_wxyz=target.raw_quat_world_wxyz,
-        position_before_workspace_clamp_world_m=(
-            target.position_before_workspace_clamp_world_m
-        ),
-        hand_qpos_rad=hand.qpos_rad,
-        raw_hand_qpos_rad=hand.raw_qpos_rad,
-        hand_retarget_succeeded=hand.retarget_succeeded,
-        hand_validation_issue=hand.validation_issue,
-        hand_retarget_time_ms=hand.compute_time_ms,
-        ik_qpos_rad=ik_result.qpos if ik_result.success else None,
-        ik_failure_reason=ik_result.reason,
-        ik_solve_time_ms=ik_solve_time_ms,
-        policy_map_time_ms=policy_map_time_ms,
-        policy_compute_started_s=compute_started_s,
-    )
-
-
 def _publish_arm_safety_hold(
-    ctx: TeleopLoopState,
+    controller: TeleopController,
     shared: RuntimeChannels,
     cfg: TeleopConfig,
     resources: TeleopGridResources,
     observation: TeleopGridObservation,
     *,
+    recording_active: bool,
     failure_context: str,
     frame_status: int,
     retarget_ok: bool,
-) -> CoordinatorDirective:
+) -> bool:
     """Publish and record an arm-only hold after a rejected proposal."""
-    assert ctx.prev_qpos_cmd is not None
-    hold_result = publish_joint_targets(
+    prepared_hold, hold_result = _prepare_and_publish_joint_command(
         shared,
-        ctx.prev_qpos_cmd.copy(),
+        controller.prev_qpos_cmd.copy(),
         None,
+        gate=resources.safety_gate,
         is_hold=True,
         observation_id=int(observation.vr_frame["ring_sequence"]),
         observation_anchor_monotonic_ns=int(observation.vr_frame["local_recv_ns"]),
-        safety_gate=resources.control.safety_gate,
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
     )
-    published_hold = hold_result.candidate
-    if not hold_result.succeeded or published_hold is None:
+    published_hold = prepared_hold.candidate
+    if hold_result is None or not hold_result.published or published_hold is None:
+        reason = prepared_hold.reason or (hold_result.reason if hold_result else "")
         logger.error(
             "teleop_loop: %s hold publish failed: %s",
             failure_context,
-            hold_result.reason,
+            reason,
         )
         shared.error_state.value = True
-        return CoordinatorDirective.BREAK
+        return False
     _record_grid_hold(
-        ctx,
+        controller,
         shared,
         resources,
         observation,
+        recording_active=recording_active,
         action_candidate=published_hold,
         frame_status=frame_status,
         retarget_ok=retarget_ok,
     )
-    return CoordinatorDirective.CONTINUE
+    return True
 
 
 def _publish_ik_failure_hold(
-    ctx: TeleopLoopState,
+    controller: TeleopController,
     shared: RuntimeChannels,
     cfg: TeleopConfig,
     resources: TeleopGridResources,
     observation: TeleopGridObservation,
     computation: TeleopActionComputation,
-) -> CoordinatorDirective:
+    *,
+    recording_active: bool,
+) -> bool:
     """Publish a bounded hold while preserving independent safe hand motion."""
-    assert ctx.prev_qpos_cmd is not None
-    assert ctx.prev_hand_qpos is not None
-    if ctx.consecutive_ik_hold_frames == 0:
-        ctx.ik_hold_started_s = time.monotonic()
+    if controller.consecutive_ik_hold_frames == 0:
+        controller.ik_hold_started_s = time.monotonic()
         logger.warning(
             "teleop_loop: IK hold started: %s",
             computation.ik_failure_reason or "no feasible solution",
         )
-    ctx.consecutive_ik_hold_frames += 1
+    controller.consecutive_ik_hold_frames += 1
 
     safe_hand_qpos = (
         computation.hand_qpos_rad
-        if ctx.hand_available and computation.hand_validation_issue is None
+        if controller.hand_enabled and computation.hand_validation_issue is None
         else None
     )
-    publish_result = publish_joint_targets(
+    prepared_command, publish_result = _prepare_and_publish_joint_command(
         shared,
-        ctx.prev_qpos_cmd.copy(),
+        controller.prev_qpos_cmd.copy(),
         safe_hand_qpos,
+        gate=resources.safety_gate,
         is_hold=True,
         observation_id=int(observation.vr_frame["ring_sequence"]),
         observation_anchor_monotonic_ns=int(observation.vr_frame["local_recv_ns"]),
-        safety_gate=resources.control.safety_gate,
         hand_mechanical_lower_rad=resources.command_limits.hand_mechanical_lower_rad,
         hand_mechanical_upper_rad=resources.command_limits.hand_mechanical_upper_rad,
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
     )
 
-    published_candidate = publish_result.candidate
-    if not publish_result.succeeded or published_candidate is None:
+    published_candidate = prepared_command.candidate
+    if (
+        publish_result is None
+        or not publish_result.published
+        or published_candidate is None
+    ):
+        reason = prepared_command.reason or (
+            publish_result.reason if publish_result else ""
+        )
         logger.error(
             "teleop_loop: IK-failure hold publish failed: %s",
-            publish_result.reason,
+            reason,
         )
         shared.error_state.value = True
-        return CoordinatorDirective.BREAK
-    if ctx.hand_available:
+        return False
+    if controller.hand_enabled:
         if published_candidate.arm_qpos is not None:
-            ctx.prev_qpos_cmd = np.asarray(
+            controller.prev_qpos_cmd = np.asarray(
                 published_candidate.arm_qpos, dtype=np.float64
             )
         if published_candidate.hand_qpos is not None:
-            ctx.prev_hand_qpos = np.asarray(
+            controller.prev_hand_qpos = np.asarray(
                 published_candidate.hand_qpos, dtype=np.float64
             ).copy()
 
@@ -709,33 +886,34 @@ def _publish_ik_failure_hold(
         * 1000.0,
     }
     _record_grid_hold(
-        ctx,
+        controller,
         shared,
         resources,
         observation,
+        recording_active=recording_active,
         action_candidate=published_candidate,
         frame_status=FRAME_IK_FAIL,
         retarget_ok=computation.hand_retarget_succeeded,
         diagnostics=diagnostics,
     )
-    return CoordinatorDirective.CONTINUE
+    return True
 
 
 def _publish_solved_action(
-    ctx: TeleopLoopState,
+    controller: TeleopController,
     shared: RuntimeChannels,
     cfg: TeleopConfig,
     resources: TeleopGridResources,
     observation: TeleopGridObservation,
     computation: TeleopActionComputation,
-) -> CoordinatorDirective:
+    *,
+    recording_active: bool,
+) -> bool:
     """Validate, publish, and record one successful IK solution."""
-    assert ctx.prev_qpos_cmd is not None
-    assert ctx.prev_hand_qpos is not None
     assert computation.ik_qpos_rad is not None
-    planner = resources.control.planner
-    gate = resources.control.safety_gate
-    recorder = resources.control.recorder
+    planner = resources.planner
+    gate = resources.safety_gate
+    recorder = resources.recorder
     command_limits = resources.command_limits
     stage_timer = resources.stage_timer
     _hand_fk = resources.hand_fk
@@ -761,18 +939,18 @@ def _publish_solved_action(
     policy_map_time_ms = computation.policy_map_time_ms
     _policy_compute_t0 = computation.policy_compute_started_s
 
-    if ctx.consecutive_ik_hold_frames:
+    if controller.consecutive_ik_hold_frames:
         logger.info(
             "teleop_loop: IK recovered after %d frames (%.3fs)",
-            ctx.consecutive_ik_hold_frames,
-            time.monotonic() - ctx.ik_hold_started_s,
+            controller.consecutive_ik_hold_frames,
+            time.monotonic() - controller.ik_hold_started_s,
         )
-        ctx.consecutive_ik_hold_frames = 0
-        ctx.ik_hold_started_s = 0.0
+        controller.consecutive_ik_hold_frames = 0
+        controller.ik_hold_started_s = 0.0
 
     arm_proposal = compute_arm_joint_proposal(
         computation.ik_qpos_rad,
-        ctx.prev_qpos_cmd,
+        controller.prev_qpos_cmd,
         joint_lower_rad=command_limits.arm_joint_lower_rad,
         joint_upper_rad=command_limits.arm_joint_upper_rad,
         max_delta_rad_per_tick=(command_limits.arm_max_delta_rad_per_tick),
@@ -790,85 +968,98 @@ def _publish_solved_action(
             reject_reason,
         )
         return _publish_arm_safety_hold(
-            ctx,
+            controller,
             shared,
             cfg,
             resources,
             observation,
+            recording_active=recording_active,
             failure_context="rejected-action",
             frame_status=FRAME_SAFETY_REJECT,
             retarget_ok=computation.hand_retarget_succeeded,
         )
 
-    publish_result = publish_joint_targets(
+    prepared_command, publish_result = _prepare_and_publish_joint_command(
         shared,
         arm_cmd.copy(),
-        hand_cmd.copy() if ctx.hand_available else None,
+        hand_cmd.copy() if controller.hand_enabled else None,
+        gate=gate,
         observation_id=int(vr_frame["ring_sequence"]),
         observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-        safety_gate=gate,
         hand_mechanical_lower_rad=command_limits.hand_mechanical_lower_rad,
         hand_mechanical_upper_rad=command_limits.hand_mechanical_upper_rad,
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
     )
-    published_candidate = publish_result.candidate
-    workspace_rejected = (
-        publish_result.status == CommandPublishStatus.GATE_REJECTED
-        and publish_result.gate_code
-        in (GateRejectCode.WORKSPACE, GateRejectCode.WORKSPACE_CHECK_FAILED)
+    published_candidate = prepared_command.candidate
+    workspace_rejected = prepared_command.gate_code in (
+        GateRejectCode.WORKSPACE,
+        GateRejectCode.WORKSPACE_CHECK_FAILED,
     )
     if workspace_rejected:
         resources.validation_warn(
             "teleop_loop: action rejected — %s; publishing hold",
-            publish_result.reason,
+            prepared_command.reason,
         )
         return _publish_arm_safety_hold(
-            ctx,
+            controller,
             shared,
             cfg,
             resources,
             observation,
+            recording_active=recording_active,
             failure_context="workspace-rejection",
             frame_status=FRAME_SAFETY_REJECT,
             retarget_ok=computation.hand_retarget_succeeded,
         )
-    if not publish_result.succeeded or published_candidate is None:
+    if (
+        publish_result is None
+        or not publish_result.published
+        or published_candidate is None
+    ):
         # Recoverable holds keep arm and hand in place without latching a fault.
-        hold_status = publish_result.status in (
-            CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY,
-            CommandPublishStatus.HAND_FEEDBACK_UNAVAILABLE,
+        reason = prepared_command.reason or (
+            publish_result.reason if publish_result else ""
         )
-        if publish_result.runtime_gated:
+        hold_status = prepared_command.unavailable
+        if publish_result is not None and publish_result.reason:
             logger.info(
                 "teleop_loop: joint publication stopped by runtime gate: %s",
                 publish_result.reason,
             )
-            if publish_result.status != CommandPublishStatus.SAFETY_STATE_GATED:
-                return CoordinatorDirective.BREAK
+            if not publish_result.reason.startswith(PUBLISH_REASON_SAFETY_STATE):
+                return False
             hold_status = True
         if not hold_status:
-            logger.error("teleop_loop: joint publish failed: %s", publish_result.reason)
+            logger.error("teleop_loop: joint publish failed: %s", reason)
             shared.error_state.value = True
-            return CoordinatorDirective.BREAK
-        _record_grid_hold(ctx, shared, resources, observation)
-        return CoordinatorDirective.CONTINUE
+            return False
+        _record_grid_hold(
+            controller,
+            shared,
+            resources,
+            observation,
+            recording_active=recording_active,
+        )
+        return True
     stage_timer.mark("send")
 
     if published_candidate.arm_qpos is not None:
         arm_cmd = np.asarray(published_candidate.arm_qpos, dtype=np.float64)
     if published_candidate.hand_qpos is not None:
         hand_cmd = np.asarray(published_candidate.hand_qpos, dtype=np.float64)
-    ctx.prev_qpos_cmd = arm_cmd.copy()
-    ctx.prev_hand_qpos = hand_cmd.copy()
-    ctx.ema_prev_pos = target_pos.copy()
-    ctx.ema_prev_quat = target_quat.copy()
+    controller.prev_qpos_cmd = arm_cmd.copy()
+    controller.prev_hand_qpos = hand_cmd.copy()
+    controller.ema_prev_pos = target_pos.copy()
+    controller.ema_prev_quat = target_quat.copy()
 
-    if ctx.recording_active:
+    if recording_active:
         policy_compute_time_ms = (time.perf_counter() - _policy_compute_t0) * 1000.0
-        ctx.last_target_eef_pos = target_pos.copy()
-        ctx.last_target_eef_rot6d = quat_wxyz_to_rot6d(normalize_quat_wxyz(target_quat))
-        if not retarget_ok and ctx.hand_available:
+        controller.last_target_eef_pos = target_pos.copy()
+        controller.last_target_eef_rot6d = quat_wxyz_to_rot6d(
+            normalize_quat_wxyz(target_quat)
+        )
+        if not retarget_ok and controller.hand_enabled:
             _f_status = FRAME_RETARGET_FAIL
         else:
             _f_status = FRAME_OK
@@ -908,81 +1099,109 @@ def _publish_solved_action(
         )
     stage_timer.mark("rec")
 
-    return CoordinatorDirective.NORMAL
+    return True
 
 
 def run_control_grid_tick(
-    ctx: TeleopLoopState,
+    controller: TeleopController,
     shared: RuntimeChannels,
     cfg: TeleopConfig,
     resources: TeleopGridResources,
     *,
+    teleop_active: bool,
+    recording_active: bool,
+    pause_since_ns: int,
+    pause_reason: str | None,
+    arm_feedback_error_count: int,
+    hand_disconnected_at_s: float | None,
     loop_count: int,
     observation_anchor_monotonic_ns: int,
-) -> CoordinatorDirective:
+) -> TeleopGridTickResult:
     """Consume one causal observation and publish at most one action."""
-    assert ctx.prev_qpos_cmd is not None
-    gate = resources.control.safety_gate
-    observation_directive, observation = _read_control_grid_observation(
-        ctx,
+    gate = resources.safety_gate
+    tick_result, observation = _read_control_grid_observation(
+        controller,
         shared,
         cfg,
         resources,
+        teleop_active=teleop_active,
+        recording_active=recording_active,
+        pause_since_ns=pause_since_ns,
+        pause_reason=pause_reason,
+        arm_feedback_error_count=arm_feedback_error_count,
+        hand_disconnected_at_s=hand_disconnected_at_s,
         loop_count=loop_count,
         observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
     )
-    if observation_directive is not CoordinatorDirective.NORMAL:
-        return observation_directive
-    assert observation is not None
+    if observation is None:
+        return tick_result
     vr_frame = observation.vr_frame
-    computation = _compute_action_computation(ctx, cfg, resources, observation)
+    computation = controller.compute(observation, resources)
     if computation is None:
-        hold_result = publish_joint_targets(
+        prepared_hold, hold_result = _prepare_and_publish_joint_command(
             shared,
-            ctx.prev_qpos_cmd.copy(),
+            controller.prev_qpos_cmd.copy(),
+            None,
+            gate=gate,
             is_hold=True,
             observation_id=int(vr_frame["ring_sequence"]),
             observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
-            safety_gate=gate,
             arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
             hand_feedback_max_age_s=float(
                 cfg.runtime.safety.heartbeat_timeouts["hand"]
             ),
         )
-        published_hold = hold_result.candidate
-        if not hold_result.succeeded or published_hold is None:
+        published_hold = prepared_hold.candidate
+        if hold_result is None or not hold_result.published or published_hold is None:
+            reason = prepared_hold.reason or (hold_result.reason if hold_result else "")
             logger.error(
                 "teleop_loop: mapper hold publish failed: %s",
-                hold_result.reason,
+                reason,
             )
             shared.error_state.value = True
-            return CoordinatorDirective.BREAK
+            return TeleopGridTickResult(
+                keep_running=False,
+                recording_active=tick_result.recording_active,
+                arm_feedback_error_count=tick_result.arm_feedback_error_count,
+                hand_disconnected_at_s=tick_result.hand_disconnected_at_s,
+            )
         _record_grid_hold(
-            ctx,
+            controller,
             shared,
             resources,
             observation,
+            recording_active=tick_result.recording_active,
             action_candidate=published_hold,
         )
-        return CoordinatorDirective.CONTINUE
+        return tick_result
 
     if computation.ik_qpos_rad is None:
-        return _publish_ik_failure_hold(
-            ctx,
+        keep_running = _publish_ik_failure_hold(
+            controller,
             shared,
             cfg,
             resources,
             observation,
             computation,
+            recording_active=tick_result.recording_active,
         )
-
-    return _publish_solved_action(
-        ctx,
-        shared,
-        cfg,
-        resources,
-        observation,
-        computation,
+    else:
+        keep_running = _publish_solved_action(
+            controller,
+            shared,
+            cfg,
+            resources,
+            observation,
+            computation,
+            recording_active=tick_result.recording_active,
+        )
+    if keep_running:
+        return tick_result
+    return TeleopGridTickResult(
+        keep_running=False,
+        recording_active=tick_result.recording_active,
+        arm_feedback_error_count=tick_result.arm_feedback_error_count,
+        hand_disconnected_at_s=tick_result.hand_disconnected_at_s,
     )
 
 

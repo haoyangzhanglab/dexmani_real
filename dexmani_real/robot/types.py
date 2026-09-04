@@ -71,7 +71,7 @@ class RobotState:
     hand_current: np.ndarray | None = None  # (12,) float64 mA — per-motor current
 
     arm_last_cmd_seq: int = 0
-    # Safety/IK fallback endpoint marker; ordinary command quiescence publishes
+    # Safety/IK fallback endpoint marker; an ordinary pause boundary publishes
     # no endpoint.
     arm_last_cmd_is_hold: bool = False
 

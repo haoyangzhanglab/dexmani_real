@@ -13,7 +13,11 @@ from scipy.spatial.transform import Rotation
 from dexmani_real.calibration.camera.solver import CalibrationConfig, CalibrationSamples
 from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
-from dexmani_real.control.publication import publish_joint_targets
+from dexmani_real.control.publication import (
+    prepare_joint_command,
+    publish_command,
+    wait_command_accepted,
+)
 from dexmani_real.control.safety_gate import SafetyGate
 from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
 from dexmani_real.planning import Pose, XArm7MotionPlanner
@@ -145,20 +149,42 @@ def publish_calibration_quit_hold(
     if not revoke_motion(shared, SafetyState.ARMED):
         set_calibration_fault(shared, "failed to establish calibration quit boundary")
         return 1
-    published = publish_joint_targets(
+    prepared = prepare_joint_command(
         shared,
         current_qpos,
+        gate=safety_gate,
         is_hold=True,
-        safety_gate=safety_gate,
-        wait_applied=True,
-        apply_timeout_s=float(runtime.policy.action_apply_timeout_s),
         arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
     )
-    if not published.succeeded:
+    candidate = prepared.candidate
+    published = publish_command(shared, candidate) if candidate is not None else None
+    accepted = None
+    if (
+        candidate is not None
+        and published is not None
+        and published.published
+        and published.ticket is not None
+    ):
+        accepted = wait_command_accepted(
+            shared,
+            ticket=published.ticket,
+            action_id=candidate.action_id,
+            wait_for_arm=True,
+            wait_for_hand=False,
+            timeout_s=float(runtime.policy.action_apply_timeout_s),
+            arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
+            hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
+        )
+    if accepted is None or not accepted.accepted:
+        reason = prepared.reason
+        if not reason and published is not None:
+            reason = published.reason
+        if not reason and accepted is not None:
+            reason = accepted.reason
         set_calibration_fault(
             shared,
-            f"measured quit hold was not applied: {published.reason}",
+            f"measured quit hold was not accepted: {reason}",
         )
         return 1
     return 0 if calibration_saved else 2
@@ -312,20 +338,46 @@ def run_calibration_motion_tick(
         state.target_quat = measured_pose.q.copy()
         return
 
-    published = publish_joint_targets(
+    prepared = prepare_joint_command(
         shared,
         ik_result.qpos,
-        safety_gate=safety_gate,
-        wait_applied=True,
-        apply_timeout_s=float(runtime.policy.action_apply_timeout_s),
+        gate=safety_gate,
         arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
     )
-    candidate = published.candidate
-    if not published.succeeded or candidate is None or candidate.arm_qpos is None:
+    candidate = prepared.candidate
+    published = publish_command(shared, candidate) if candidate is not None else None
+    accepted = None
+    if (
+        candidate is not None
+        and published is not None
+        and published.published
+        and published.ticket is not None
+    ):
+        accepted = wait_command_accepted(
+            shared,
+            ticket=published.ticket,
+            action_id=candidate.action_id,
+            wait_for_arm=True,
+            wait_for_hand=False,
+            timeout_s=float(runtime.policy.action_apply_timeout_s),
+            arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
+            hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
+        )
+    if (
+        accepted is None
+        or not accepted.accepted
+        or candidate is None
+        or candidate.arm_qpos is None
+    ):
+        reason = prepared.reason
+        if not reason and published is not None:
+            reason = published.reason
+        if not reason and accepted is not None:
+            reason = accepted.reason
         logger.warning(
             "arm motion command rejected (%s) — blocked until keys change",
-            published.reason,
+            reason,
         )
         state.blocked_keys = active_keys
         return

@@ -12,11 +12,9 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.robot_spec import (
-    ARM_DOF,
     ARM_EE_SHAPE,
     ARM_JOINT_SHAPE,
     HAND_CONTACT_SHAPE,
-    HAND_DOF,
     HAND_FINGER_COUNT,
     HAND_FINGERTIP_SHAPE,
     HAND_JOINT_SHAPE,
@@ -32,12 +30,11 @@ RECORD_OPERATOR_BYTES = 128
 RECORD_STOP_REASON_BYTES = 512
 RECORD_STATUS_TEXT_BYTES = 2_048
 
-# EE arm-target decomposition carried by the policy chunk ring: position + rot6d.
-EE_POS_DIM = 3
-EE_ROT6D_DIM = 6
-
-# Runtime IPC capacity for learned-policy chunks; adapters must not truncate larger requests.
-MAX_POLICY_CHUNK_STEPS = 32
+# Runtime IPC capacity for flat learned-policy predictions. Adapters must not
+# truncate larger requests, and the executor decodes only the validated 19-D
+# joint or 21-D EE representations.
+MAX_PREDICTION_STEPS = 32
+MAX_POLICY_ACTION_DIM = 21
 
 # Realtime point-cloud transport is fixed-size per deployment. Keeping the
 # supported sizes explicit prevents a model/RuntimeChannels shape mismatch from
@@ -121,25 +118,17 @@ COUPLED_COMMAND_DTYPE = np.dtype(
     align=True,
 )
 
-# One payload is written per inference; the coordinator consumes only the latest.
-POLICY_CHUNK_DTYPE = np.dtype(
+# One flat policy prediction is written per inference; the executor consumes
+# only the latest. ``num_steps`` and ``action_dim`` describe the populated
+# prefix of the fixed-capacity payload for an independent IPC decoder.
+PREDICTION_DTYPE = np.dtype(
     [
-        ("chunk_id", "<u8"),
         ("run_generation", "<u8"),
-        ("observation_id", "<u8"),
-        ("observation_anchor_monotonic_ns", "<u8"),
-        ("observation_latest_source_monotonic_ns", "<u8"),
-        ("observation_logical_step_monotonic_ns", "<u8"),
-        ("inference_started_monotonic_ns", "<u8"),
-        ("inference_finished_monotonic_ns", "<u8"),
+        ("source_monotonic_ns", "<u8"),
+        ("logical_step_monotonic_ns", "<u8"),
         ("num_steps", "<u4"),
-        ("arm_present", "<u1"),
-        ("ee_present", "<u1"),
-        ("hand_present", "<u1"),
-        ("arm_qpos", "<f8", (MAX_POLICY_CHUNK_STEPS, ARM_DOF)),
-        ("hand_qpos", "<f8", (MAX_POLICY_CHUNK_STEPS, HAND_DOF)),
-        ("ee_pos", "<f8", (MAX_POLICY_CHUNK_STEPS, EE_POS_DIM)),
-        ("ee_rot6d", "<f8", (MAX_POLICY_CHUNK_STEPS, EE_ROT6D_DIM)),
+        ("action_dim", "<u4"),
+        ("actions", "<f8", (MAX_PREDICTION_STEPS, MAX_POLICY_ACTION_DIM)),
     ],
     align=True,
 )
@@ -439,9 +428,10 @@ __all__ = [
     "COUPLED_COMMAND_DTYPE",
     "HAND_STATE_DTYPE",
     "HAND_TACTILE_DTYPE",
-    "MAX_POLICY_CHUNK_STEPS",
+    "MAX_POLICY_ACTION_DIM",
+    "MAX_PREDICTION_STEPS",
     "POINT_CLOUD_FEATURE_DIM",
-    "POLICY_CHUNK_DTYPE",
+    "PREDICTION_DTYPE",
     "RECORD_CONTROL_DTYPE",
     "RECORD_OPERATOR_BYTES",
     "RECORD_STATUS_DTYPE",

@@ -15,7 +15,7 @@ from dexmani_real.deployment.config import (
 )
 from dexmani_real.deployment.observation import PolicyObservation
 from dexmani_real.integrations.dexmani_policy import DexManiPolicyRuntime
-from dexmani_real.ipc.schema import MAX_POLICY_CHUNK_STEPS
+from dexmani_real.ipc.schema import MAX_PREDICTION_STEPS
 
 
 def _field(name: str, shape: tuple[int, ...], dtype: str) -> SimpleNamespace:
@@ -96,7 +96,7 @@ class PolicyCompatibilityTest(unittest.TestCase):
                     _field("point_cloud", (1024, 3), "float32"),
                 )
             ),
-            _spec(n_action_steps=MAX_POLICY_CHUNK_STEPS + 1),
+            _spec(n_action_steps=MAX_PREDICTION_STEPS + 1),
             _spec(control_dt_s=0.05),
             _spec(
                 observation_fields=(
@@ -163,21 +163,20 @@ class PolicyAdapterTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             DexManiPolicyRuntime(loaded, inspected_spec)
 
-    def test_joint_action_split_and_numpy_observation(self) -> None:
+    def test_joint_action_remains_flat_and_observation_is_numpy(self) -> None:
         spec = _spec()
         _resolved_runtime(spec)
         output = np.arange(8 * 19, dtype=np.float64).reshape(8, 19)
         loaded = _FakeLoadedPolicy(spec, output)
         adapter = DexManiPolicyRuntime(loaded, spec)
 
-        prediction = adapter.predict(_observation(spec))
+        actions = adapter.predict(_observation(spec))
 
-        np.testing.assert_array_equal(prediction.arm_qpos, output[:, :7])
-        np.testing.assert_array_equal(prediction.hand_qpos, output[:, 7:])
+        np.testing.assert_array_equal(actions, output)
         self.assertEqual(set(loaded.observation), {"joint_state", "point_cloud"})
         self.assertEqual(loaded.observation["joint_state"].dtype, np.float32)
 
-    def test_ee_action_split_and_rotation_validation(self) -> None:
+    def test_ee_action_remains_flat_and_rotation_is_validated(self) -> None:
         spec = _spec(action_key="action_ee", action_dim=21, control_action_dim=21)
         _resolved_runtime(spec)
         output = np.zeros((8, 21), dtype=np.float64)
@@ -185,10 +184,8 @@ class PolicyAdapterTest(unittest.TestCase):
         output[:, 3] = 1.0
         output[:, 7] = 1.0
         adapter = DexManiPolicyRuntime(_FakeLoadedPolicy(spec, output), spec)
-        prediction = adapter.predict(_observation(spec))
-        self.assertEqual(prediction.ee_pos.shape, (8, 3))
-        self.assertEqual(prediction.ee_rot6d.shape, (8, 6))
-        self.assertEqual(prediction.hand_qpos.shape, (8, 12))
+        actions = adapter.predict(_observation(spec))
+        np.testing.assert_array_equal(actions, output)
 
         output[:, 3:9] = 0.0
         with self.assertRaises(ValueError):

@@ -11,7 +11,11 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.runtime import ResolvedRuntimeConfig
-from dexmani_real.control.publication import CommandPublishStatus, publish_joint_targets
+from dexmani_real.control.publication import (
+    prepare_joint_command,
+    publish_command,
+    wait_command_accepted,
+)
 from dexmani_real.control.safety_gate import SafetyGate, planner_action_safety_gate
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
@@ -342,12 +346,12 @@ class EpisodeReplayer:
             f"({self._format_arm_start_deviation(arm_max_deg, arm_joint_index)}; "
             "Q=quit  ESC=emergency_stop)"
         )
-        published = publish_joint_targets(
+        prepared = prepare_joint_command(
             self.shared,
             np.asarray(arm_state["qpos"], dtype=np.float64),
             self.traj.action_hand_joint[0],
+            gate=self._start_warmup_gate,
             is_hold=True,
-            safety_gate=self._start_warmup_gate,
             action_validity_s=_START_HAND_WARMUP_S,
             hand_mechanical_lower_rad=np.asarray(
                 self.runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
@@ -360,12 +364,14 @@ class EpisodeReplayer:
                 self.runtime.safety.heartbeat_timeouts["hand"]
             ),
         )
-        if not published.succeeded:
-            reason = f"XHand start warm-up was rejected: {published.reason}"
-            if published.status in (
-                CommandPublishStatus.GATE_REJECTED,
-                CommandPublishStatus.HAND_PREFLIGHT_REJECTED,
-            ):
+        candidate = prepared.candidate
+        published = (
+            publish_command(self.shared, candidate) if candidate is not None else None
+        )
+        if published is None or not published.published:
+            detail = prepared.reason or (published.reason if published else "")
+            reason = f"XHand start warm-up was rejected: {detail}"
+            if not prepared.unavailable and not prepared.fatal:
                 print(f"Replay rejected: {reason}")
                 self._reject(reason)
             else:
@@ -639,13 +645,12 @@ class EpisodeReplayer:
                     tuple(self.runtime.arm.joint_limit_upper),
                 )
                 is_final_frame = frame_idx == frame_count - 1
-                published = publish_joint_targets(
+                assert self._action_safety_gate is not None
+                prepared = prepare_joint_command(
                     self.shared,
                     arm_cmd,
                     hand_cmd,
-                    safety_gate=self._action_safety_gate,
-                    wait_applied=is_final_frame,
-                    apply_timeout_s=float(self.runtime.policy.action_apply_timeout_s),
+                    gate=self._action_safety_gate,
                     hand_mechanical_lower_rad=np.asarray(
                         self.runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
                     ),
@@ -659,13 +664,50 @@ class EpisodeReplayer:
                         self.runtime.safety.heartbeat_timeouts["hand"]
                     ),
                 )
-                if not published.succeeded or published.candidate is None:
-                    boundary = "publish/APPLIED" if is_final_frame else "publish"
+                candidate = prepared.candidate
+                published = (
+                    publish_command(self.shared, candidate)
+                    if candidate is not None
+                    else None
+                )
+                accepted = None
+                if (
+                    is_final_frame
+                    and candidate is not None
+                    and published is not None
+                    and published.published
+                    and published.ticket is not None
+                ):
+                    accepted = wait_command_accepted(
+                        self.shared,
+                        ticket=published.ticket,
+                        action_id=candidate.action_id,
+                        wait_for_arm=True,
+                        wait_for_hand=candidate.hand_qpos is not None,
+                        timeout_s=float(self.runtime.policy.action_apply_timeout_s),
+                        arm_feedback_max_age_s=float(
+                            self.runtime.safety.heartbeat_timeouts["arm"]
+                        ),
+                        hand_feedback_max_age_s=float(
+                            self.runtime.safety.heartbeat_timeouts["hand"]
+                        ),
+                    )
+                if (
+                    published is None
+                    or not published.published
+                    or candidate is None
+                    or (is_final_frame and (accepted is None or not accepted.accepted))
+                ):
+                    boundary = "publish/acceptance" if is_final_frame else "publish"
+                    reason = prepared.reason
+                    if not reason and published is not None:
+                        reason = published.reason
+                    if not reason and accepted is not None:
+                        reason = accepted.reason
                     self._fault(
-                        f"frame {frame_idx}: joint {boundary} boundary rejected: {published.reason}"
+                        f"frame {frame_idx}: joint {boundary} boundary rejected: {reason}"
                     )
                     break
-                candidate = published.candidate
                 assert candidate.arm_qpos is not None
                 sent_arm_cmd = np.asarray(candidate.arm_qpos, dtype=np.float64)
                 if candidate.hand_qpos is not None:

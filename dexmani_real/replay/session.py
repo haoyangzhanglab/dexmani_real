@@ -31,7 +31,7 @@ import numpy as np
 
 from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
-from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
+from dexmani_real.control.hand_home import publish_hand_home_and_wait_accepted
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.replay.controller import EpisodeReplayer, ReplayOutcome, ReplayStatus
 from dexmani_real.replay.evaluation import evaluate_replay
@@ -75,10 +75,10 @@ def _latched_fault_status(shared: RuntimeChannels) -> ReplayStatus | None:
 
 
 def _post_shutdown_outcome(
-    outcome: ReplayOutcome, report: ShutdownReport
+    shared: RuntimeChannels, outcome: ReplayOutcome, report: ShutdownReport
 ) -> ReplayOutcome:
     """Apply faults observed only after workers have reached a terminal state."""
-    if report.estop_requested:
+    if bool(shared.estop_request.value):
         shutdown_reason = "e-stop latched during replay shutdown"
         reason = (
             f"{outcome.reason}; {shutdown_reason}"
@@ -90,10 +90,20 @@ def _post_shutdown_outcome(
             outcome.replay_data,
             reason,
         )
-    if report.faulted:
+    abnormal_exits = tuple(
+        item
+        for item in report.exits
+        if item.exitcode != 0 or item.escalation != "graceful"
+    )
+    if (
+        not report.shared_closed
+        or bool(shared.error_state.value)
+        or int(shared.safety_state.value) == int(SafetyState.FAULT)
+        or abnormal_exits
+    ):
         failed = ", ".join(
             f"{item.name}={item.escalation}:{item.exitcode}"
-            for item in report.abnormal_exits
+            for item in abnormal_exits
         )
         shutdown_reason = (
             f"worker failed during replay shutdown: {failed}"
@@ -183,7 +193,7 @@ def _offer_return_home(
                 hand_home = np.deg2rad(
                     np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)
                 )
-                hand_accepted = publish_hand_home_and_wait_applied(
+                hand_accepted = publish_hand_home_and_wait_accepted(
                     shared,
                     hand_home,
                     command_lower_rad=np.asarray(
@@ -425,7 +435,7 @@ def replay_episode(
                 exc_info=True,
             )
             raise
-        outcome = _post_shutdown_outcome(outcome, shutdown_report)
+        outcome = _post_shutdown_outcome(shared, outcome, shutdown_report)
 
     if replayer is not None:
         evaluate_replay(

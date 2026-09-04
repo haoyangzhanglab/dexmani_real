@@ -410,8 +410,8 @@ def _deployment_action_limit_masks(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Check the exact endpoint-delta contract enforced by deployment.
 
-    At the start of every retained source-contiguous segment the coordinator
-    compares a model endpoint against measured feedback.  Later endpoints are
+    At the start of every retained source-contiguous segment the policy executor
+    compares a model endpoint against measured feedback. Later endpoints are
     compared against the previously published endpoint.  This mirrors that
     distinction so old teleop targets are never silently relabelled as
     deployment-safe data.

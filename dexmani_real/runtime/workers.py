@@ -25,8 +25,8 @@ class ProcessExit:
 class WorkerSpec:
     """One worker process to construct: name, target, args, readiness key.
 
-    ``ready_name`` is the RuntimeChannels readiness/heartbeat key (it may differ
-    from the OS process ``name``, e.g. a single "arm" worker named "arm-calib").
+    ``ready_name`` is optional because only asynchronous initialization belongs
+    in readiness checks. Heartbeats are selected independently by the lifecycle.
     """
 
     name: str
@@ -57,40 +57,6 @@ def start_processes(processes: Iterable[Any]) -> None:
 class ShutdownReport:
     exits: tuple[ProcessExit, ...]
     shared_closed: bool
-    error_latched: bool = False
-    estop_requested: bool = False
-    safety_state: int | None = None
-
-    @property
-    def all_stopped(self) -> bool:
-        return all(item.exitcode is not None for item in self.exits)
-
-    @property
-    def abnormal_exits(self) -> tuple[ProcessExit, ...]:
-        return tuple(
-            item
-            for item in self.exits
-            if item.exitcode != 0 or item.escalation != "graceful"
-        )
-
-    @property
-    def faulted(self) -> bool:
-        return (
-            self.error_latched
-            or self.estop_requested
-            or self.safety_state == int(SafetyState.FAULT)
-            or bool(self.abnormal_exits)
-        )
-
-    @property
-    def clean(self) -> bool:
-        safety_is_clean = self.safety_state in (None, int(SafetyState.DISARMED))
-        return (
-            self.all_stopped
-            and self.shared_closed
-            and safety_is_clean
-            and not self.faulted
-        )
 
 
 def _shared_value(shared: Any, name: str) -> Any | None:
@@ -103,7 +69,7 @@ def _finalize_shutdown_state(
     exits: tuple[ProcessExit, ...],
     *,
     disarm_if_clean: bool,
-) -> tuple[bool, bool, int | None]:
+) -> None:
     """Latch post-join failures, or disarm only after a verified clean stop."""
     error_latched = bool(_shared_value(shared, "error_state"))
     estop_requested = bool(_shared_value(shared, "estop_request"))
@@ -123,7 +89,6 @@ def _finalize_shutdown_state(
         error_field = getattr(shared, "error_state", None)
         if error_field is not None:
             error_field.value = True
-            error_latched = True
         if safety_state is not None:
             transition(shared, SafetyState.FAULT)
     elif disarm_if_clean and safety_state is not None:
@@ -131,13 +96,7 @@ def _finalize_shutdown_state(
             error_field = getattr(shared, "error_state", None)
             if error_field is not None:
                 error_field.value = True
-                error_latched = True
             transition(shared, SafetyState.FAULT)
-
-    final_safety_value = _shared_value(shared, "safety_state")
-    final_safety_state = None if final_safety_value is None else int(final_safety_value)
-    return error_latched, estop_requested, final_safety_state
-
 
 def _close_runtime_channels(shared: Any) -> bool:
     """Close IPC and convert cleanup exceptions into a failed shutdown report."""
@@ -146,6 +105,15 @@ def _close_runtime_channels(shared: Any) -> bool:
     except Exception:
         logger.error("RuntimeChannels cleanup raised", exc_info=True)
         return False
+
+
+def _latch_shutdown_fault(shared: Any) -> None:
+    """Fail closed when verified shutdown or IPC cleanup cannot complete."""
+    error_field = getattr(shared, "error_state", None)
+    if error_field is not None:
+        error_field.value = True
+    if _shared_value(shared, "safety_state") is not None:
+        transition(shared, SafetyState.FAULT)
 
 
 def supervisor_exit_reason(
@@ -163,13 +131,6 @@ def supervisor_exit_reason(
     explicit_quit = bool(shared.quit_requested.value) or not bool(
         shared.is_running.value
     )
-    # Accept an intentional zero exit without masking worker failures.
-    if (
-        stopped
-        and explicit_quit
-        and all(int(process.exitcode) == 0 for process in stopped)
-    ):
-        return ExitReason.EXPLICIT_QUIT
     if stopped:
         return ExitReason.WORKER_DEATH
     for name, timeout in heartbeat_timeouts_s.items():
@@ -213,6 +174,7 @@ def stop_processes_verified(
         if process.is_alive():
             escalation = "kill"
             if not hasattr(process, "kill"):
+                _latch_shutdown_fault(shared)
                 raise RuntimeError(
                     f"process {process.name} ignored SIGTERM and kill() is unavailable"
                 )
@@ -220,6 +182,7 @@ def stop_processes_verified(
             process.join(timeout=kill_timeout_s)
         if process.is_alive() or process.exitcode is None:
             # Never unlink shared memory while a child may still access it.
+            _latch_shutdown_fault(shared)
             raise RuntimeError(
                 f"process {process.name} could not be confirmed stopped; RuntimeChannels remains open"
             )
@@ -239,7 +202,7 @@ def shutdown_processes_verified(
     kill_timeout_s: float = 1.0,
     disarm_if_clean: bool = False,
 ) -> ShutdownReport:
-    """Stop workers, finalize safety from their terminal state, then close IPC."""
+    """Stop workers, close IPC only after verification, then finalize safety."""
     frozen_exits = stop_processes_verified(
         shared,
         processes,
@@ -248,29 +211,15 @@ def shutdown_processes_verified(
         kill_timeout_s=kill_timeout_s,
     )
 
-    error_latched, estop_requested, safety_state = _finalize_shutdown_state(
-        shared,
-        frozen_exits,
-        disarm_if_clean=disarm_if_clean,
-    )
     shared_closed = _close_runtime_channels(shared)
     if not shared_closed:
-        error_field = getattr(shared, "error_state", None)
-        if error_field is not None:
-            error_field.value = True
-            error_latched = True
-        if safety_state is not None:
-            transition(shared, SafetyState.FAULT)
-            final_safety_value = _shared_value(shared, "safety_state")
-            safety_state = (
-                None if final_safety_value is None else int(final_safety_value)
-            )
-    report = ShutdownReport(
-        frozen_exits,
-        shared_closed=shared_closed,
-        error_latched=error_latched,
-        estop_requested=estop_requested,
-        safety_state=safety_state,
-    )
+        _latch_shutdown_fault(shared)
+    else:
+        _finalize_shutdown_state(
+            shared,
+            frozen_exits,
+            disarm_if_clean=disarm_if_clean,
+        )
+    report = ShutdownReport(frozen_exits, shared_closed=shared_closed)
     logger.info("verified process shutdown: %s", report.exits)
     return report

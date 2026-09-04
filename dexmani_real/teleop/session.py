@@ -545,7 +545,19 @@ def run_teleop_experiment(
             disarm_if_clean=normal_exit,
         )
         shared_closed = shutdown_report.shared_closed
-        clean_exit = normal_exit and shutdown_report.clean and recording_issue is None
+        worker_exit_clean = all(
+            item.exitcode == 0 and item.escalation == "graceful"
+            for item in shutdown_report.exits
+        )
+        clean_exit = (
+            normal_exit
+            and worker_exit_clean
+            and shutdown_report.shared_closed
+            and not bool(shared.error_state.value)
+            and not bool(shared.estop_request.value)
+            and int(shared.safety_state.value) == int(SafetyState.DISARMED)
+            and recording_issue is None
+        )
         if normal_exit and not clean_exit:
             logger.error(
                 "verified session outcome invalidated the clean supervisor exit: shutdown=%s recording=%s",
@@ -554,11 +566,7 @@ def run_teleop_experiment(
             )
 
         runtime_m = (time.monotonic() - start_time) / 60.0
-        safety_name = (
-            SafetyState(shutdown_report.safety_state).name
-            if shutdown_report.safety_state is not None
-            else "UNKNOWN"
-        )
+        safety_name = SafetyState(int(shared.safety_state.value)).name
         print(f"\n── Session End ──")
         print(
             f"  exit_reason={exit_reason}  runtime={runtime_m:.1f}min  safety={safety_name}  "

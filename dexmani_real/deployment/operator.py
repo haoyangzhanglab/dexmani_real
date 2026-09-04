@@ -1,7 +1,7 @@
 """Operator keyboard control for learned-policy deployment (B/S/H/Q/ESC).
 
 Runs as a daemon thread in the Main process.  B/S/Q/ESC translate to the shared
-request flags the coordinator and supervisor already consume (``start_request``,
+request flags the executor and supervisor already consume (``start_request``,
 ``stop_request``, ``quit_requested``, ``estop_request``). When a caller owns a
 home lifecycle, H orchestrates a collision-checked hand + arm return-home from
 ARMED using a Main-process planner that mirrors the replay collision setup
@@ -20,7 +20,7 @@ import numpy as np
 
 from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
-from dexmani_real.control.hand_home import publish_hand_home_and_wait_applied
+from dexmani_real.control.hand_home import publish_hand_home_and_wait_accepted
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import (
     Pose,
@@ -61,7 +61,7 @@ def _request_immediate_quit(shared: RuntimeChannels) -> None:
 def build_home_planner(runtime: ResolvedRuntimeConfig) -> XArm7MotionPlanner:
     """Construct the collision-checked home planner (mirrors replay setup).
 
-    The coordinator's own planner only carries workspace bounds; a safe
+    The executor's own planner only carries workspace bounds; a safe
     return-home needs the full collision model (hand-dof + table + static
     boxes), so the Main process builds its own.
     """
@@ -105,7 +105,7 @@ def _home(
     if abort_requested():
         return False
     hand_home = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
-    accepted = publish_hand_home_and_wait_applied(
+    accepted = publish_hand_home_and_wait_accepted(
         shared,
         hand_home,
         command_lower_rad=np.asarray(runtime.hand.qpos_min_rad, dtype=np.float64),

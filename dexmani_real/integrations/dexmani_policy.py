@@ -10,17 +10,11 @@ from dexmani_real.deployment.config import (
     policy_observation_fields,
     validate_policy_spec,
 )
-from dexmani_real.deployment.contracts import PolicyPrediction
 from dexmani_real.deployment.observation import PolicyObservation
 from dexmani_real.planning.poses import validate_rot6d_geometry
-from dexmani_real.robot_spec import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
-_ARM_DOF = ARM_JOINT_SHAPE[0]
-_HAND_DOF = HAND_JOINT_SHAPE[0]
-_JOINT_ACTION_DIM = _ARM_DOF + _HAND_DOF
 _EE_POS_DIM = 3
 _EE_ROT6D_DIM = 6
-_EE_ACTION_DIM = _EE_POS_DIM + _EE_ROT6D_DIM + _HAND_DOF
 
 
 class DexManiPolicyRuntime:
@@ -80,10 +74,10 @@ class DexManiPolicyRuntime:
     def reset_episode(self) -> None:
         self._require_open().reset_episode()
 
-    def predict(self, observation: PolicyObservation) -> PolicyPrediction:
+    def predict(self, observation: PolicyObservation) -> np.ndarray:
         arrays = self._encode_observation(observation)
         control_action = self._require_open().predict(arrays)
-        return self._decode_control_action(control_action)
+        return self._validate_control_action(control_action)
 
     def close(self) -> None:
         policy = self._policy
@@ -118,7 +112,7 @@ class DexManiPolicyRuntime:
                 )
         return dict(observation.arrays)
 
-    def _decode_control_action(self, value: Any) -> PolicyPrediction:
+    def _validate_control_action(self, value: Any) -> np.ndarray:
         if not isinstance(value, np.ndarray):
             raise TypeError("Policy predict must return a NumPy array")
         expected_shape = (
@@ -133,23 +127,9 @@ class DexManiPolicyRuntime:
         if not np.isfinite(value).all():
             raise ValueError("Policy control action contains NaN/Inf")
 
-        control = np.array(value, dtype=np.float64, copy=True, order="C")
-        if self.spec.action_key == "action":
-            if control.shape[1] != _JOINT_ACTION_DIM:
-                raise ValueError("joint control action must be arm7 + hand12")
-            return PolicyPrediction(
-                arm_qpos=control[:, :_ARM_DOF],
-                hand_qpos=control[:, _ARM_DOF:],
+        if self.spec.action_key == "action_ee":
+            validate_rot6d_geometry(
+                value[:, _EE_POS_DIM : _EE_POS_DIM + _EE_ROT6D_DIM],
+                label="ee_rot6d",
             )
-
-        if control.shape[1] != _EE_ACTION_DIM:
-            raise ValueError("EE control action must be pos3 + rot6d6 + hand12")
-        ee_pos = control[:, :_EE_POS_DIM]
-        ee_rot6d = control[:, _EE_POS_DIM : _EE_POS_DIM + _EE_ROT6D_DIM]
-        validate_rot6d_geometry(ee_rot6d, label="ee_rot6d")
-        return PolicyPrediction(
-            arm_qpos=None,
-            hand_qpos=control[:, _EE_POS_DIM + _EE_ROT6D_DIM :],
-            ee_pos=ee_pos,
-            ee_rot6d=ee_rot6d,
-        )
+        return np.array(value, dtype=np.float64, copy=True, order="C")

@@ -95,14 +95,6 @@ def _joint_delta_limit_detail(
 class GateRejectCode(str, Enum):
     """Stable machine-readable rejection reasons from :class:`SafetyGate`."""
 
-    UNSUPPORTED_CONTRACT = "unsupported representation/units/frame"
-    RUN_GENERATION_MISMATCH = "run generation mismatch"
-    INVALID_CURRENT_ARM_SHAPE = "invalid current arm joint state shape"
-    NONFINITE_CURRENT_ARM = "current arm joint state contains NaN/Inf"
-    INVALID_CURRENT_HAND_SHAPE = "invalid current hand joint state shape"
-    NONFINITE_CURRENT_HAND = "current hand joint state contains NaN/Inf"
-    INVALID_CANDIDATE_SHAPE = "invalid candidate joint shape"
-    NONFINITE_CANDIDATE = "candidate contains NaN/Inf"
     ARM_JOINT_LIMIT = "arm joint limit violation"
     HAND_JOINT_LIMIT = "hand joint limit violation"
     ARM_DELTA_LIMIT = "arm per-tick delta limit violation"
@@ -127,7 +119,7 @@ class GateResult:
 
 
 class SafetyGate:
-    """Fail-closed validation of representation, limits, delta, and collision.
+    """Fail-closed validation of physical limits, delta, workspace, and collision.
 
     Delta and collision checks are opt-in (default ``None`` → disabled) so the
     shared gate used by teleop/replay/calibration keeps its existing behavior;
@@ -210,7 +202,6 @@ class SafetyGate:
         current_hand_qpos: np.ndarray | None = None,
         arm_delta_reference_qpos: np.ndarray | None = None,
         hand_delta_reference_qpos: np.ndarray | None = None,
-        run_generation: int,
     ) -> GateResult:
         """Validate one candidate without modifying it or external state.
 
@@ -218,75 +209,26 @@ class SafetyGate:
         delta references are the previous published targets, so actuator lag
         cannot turn a command-rate limit into an unintended tracking-error gate.
         """
-        if (
-            candidate.representation != "joint_position"
-            or candidate.units != "rad"
-            or candidate.frame != "robot_joint"
-        ):
-            return GateResult(False, GateRejectCode.UNSUPPORTED_CONTRACT)
-        if candidate.run_generation != run_generation:
-            return GateResult(False, GateRejectCode.RUN_GENERATION_MISMATCH)
-
-        arm_start = np.asarray(current_arm_qpos, dtype=np.float64)
-        if arm_start.shape != ARM_JOINT_SHAPE:
-            return GateResult(False, GateRejectCode.INVALID_CURRENT_ARM_SHAPE)
-        if not np.all(np.isfinite(arm_start)):
-            return GateResult(False, GateRejectCode.NONFINITE_CURRENT_ARM)
+        # ActionCandidate owns command structure. The feedback reader owns the
+        # shape/dtype/finite contract of these measured arrays.
+        arm_start = current_arm_qpos
         arm_delta_start = arm_start
         arm_delta_reference_kind = "measured_feedback"
         if arm_delta_reference_qpos is not None:
-            arm_delta_start = np.asarray(arm_delta_reference_qpos, dtype=np.float64)
-            if arm_delta_start.shape != ARM_JOINT_SHAPE:
-                return GateResult(False, GateRejectCode.INVALID_CURRENT_ARM_SHAPE)
-            if not np.all(np.isfinite(arm_delta_start)):
-                return GateResult(False, GateRejectCode.NONFINITE_CURRENT_ARM)
+            arm_delta_start = arm_delta_reference_qpos
             arm_delta_reference_kind = "previous_published_target"
-        arm_end = (
-            arm_start.copy()
-            if candidate.arm_qpos is None
-            else np.asarray(candidate.arm_qpos, dtype=np.float64).copy()
-        )
-        hand_end = (
-            None
-            if candidate.hand_qpos is None
-            else np.asarray(candidate.hand_qpos, dtype=np.float64).copy()
-        )
+        arm_end = arm_start.copy() if candidate.arm_qpos is None else candidate.arm_qpos
+        hand_end = candidate.hand_qpos
         hand_start: np.ndarray | None = None
         hand_delta_start: np.ndarray | None = None
         hand_delta_reference_kind = "measured_feedback"
         if hand_end is not None:
-            if current_hand_qpos is None:
-                # A hand target without a current hand state cannot be delta- or
-                # collision-checked; fail closed rather than silently skipping.
-                if (
-                    self.max_hand_delta_rad is not None
-                    or self.collision_check is not None
-                ):
-                    return GateResult(False, GateRejectCode.INVALID_CURRENT_HAND_SHAPE)
-            else:
-                hand_start = np.asarray(current_hand_qpos, dtype=np.float64)
-                if hand_start.shape != HAND_JOINT_SHAPE:
-                    return GateResult(False, GateRejectCode.INVALID_CURRENT_HAND_SHAPE)
-                if not np.all(np.isfinite(hand_start)):
-                    return GateResult(False, GateRejectCode.NONFINITE_CURRENT_HAND)
+            assert current_hand_qpos is not None
+            hand_start = current_hand_qpos
             hand_delta_start = hand_start
             if hand_delta_reference_qpos is not None:
-                hand_delta_start = np.asarray(
-                    hand_delta_reference_qpos, dtype=np.float64
-                )
-                if hand_delta_start.shape != HAND_JOINT_SHAPE:
-                    return GateResult(False, GateRejectCode.INVALID_CURRENT_HAND_SHAPE)
-                if not np.all(np.isfinite(hand_delta_start)):
-                    return GateResult(False, GateRejectCode.NONFINITE_CURRENT_HAND)
+                hand_delta_start = hand_delta_reference_qpos
                 hand_delta_reference_kind = "previous_published_target"
-        if arm_end.shape != ARM_JOINT_SHAPE or (
-            hand_end is not None and hand_end.shape != HAND_JOINT_SHAPE
-        ):
-            return GateResult(False, GateRejectCode.INVALID_CANDIDATE_SHAPE)
-        if not np.all(np.isfinite(arm_end)) or (
-            hand_end is not None and not np.all(np.isfinite(hand_end))
-        ):
-            return GateResult(False, GateRejectCode.NONFINITE_CANDIDATE)
         if candidate.arm_qpos is not None and (
             np.any(arm_end < self.arm_low) or np.any(arm_end > self.arm_high)
         ):
@@ -361,6 +303,70 @@ class SafetyGate:
             except Exception:
                 logger.warning(
                     "SafetyGate: collision transition check failed closed",
+                    exc_info=True,
+                )
+                return GateResult(False, GateRejectCode.COLLISION_CHECK_FAILED)
+        return GateResult(True)
+
+    def validate_shaped_hand(
+        self,
+        candidate: ActionCandidate,
+        *,
+        current_arm_qpos: np.ndarray,
+        current_hand_qpos: np.ndarray,
+        hand_delta_reference_qpos: np.ndarray | None = None,
+    ) -> GateResult:
+        """Recheck only physical predicates affected by hand rate shaping."""
+        assert candidate.hand_qpos is not None
+        hand_end = candidate.hand_qpos
+        if np.any(hand_end < self.hand_low - _JOINT_LIMIT_TOLERANCE_RAD) or np.any(
+            hand_end > self.hand_high + _JOINT_LIMIT_TOLERANCE_RAD
+        ):
+            return GateResult(
+                False,
+                GateRejectCode.HAND_JOINT_LIMIT,
+                _hand_joint_limit_detail(hand_end, self.hand_low, self.hand_high),
+            )
+        hand_delta_start = (
+            current_hand_qpos
+            if hand_delta_reference_qpos is None
+            else hand_delta_reference_qpos
+        )
+        if self.max_hand_delta_rad is not None and np.any(
+            np.abs(hand_end - hand_delta_start)
+            > self.max_hand_delta_rad + self.endpoint_delta_tolerance_rad
+        ):
+            return GateResult(
+                False,
+                GateRejectCode.HAND_DELTA_LIMIT,
+                _joint_delta_limit_detail(
+                    joint_group="hand",
+                    target_rad=hand_end,
+                    reference_rad=hand_delta_start,
+                    limit_rad=self.max_hand_delta_rad,
+                    tolerance_rad=self.endpoint_delta_tolerance_rad,
+                    reference_kind=(
+                        "measured_feedback"
+                        if hand_delta_reference_qpos is None
+                        else "previous_published_target"
+                    ),
+                ),
+            )
+        if self.collision_check is not None:
+            arm_end = (
+                current_arm_qpos if candidate.arm_qpos is None else candidate.arm_qpos
+            )
+            try:
+                if not self.collision_check(
+                    current_arm_qpos,
+                    arm_end,
+                    current_hand_qpos,
+                    hand_end,
+                ):
+                    return GateResult(False, GateRejectCode.COLLISION_TRANSITION)
+            except Exception:
+                logger.warning(
+                    "SafetyGate: shaped-hand collision check failed closed",
                     exc_info=True,
                 )
                 return GateResult(False, GateRejectCode.COLLISION_CHECK_FAILED)

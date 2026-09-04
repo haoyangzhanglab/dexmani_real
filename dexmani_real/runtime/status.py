@@ -12,6 +12,3 @@ class ExitReason(IntEnum):
     STICKY_FAULT = 3
     WORKER_DEATH = 4
     HEARTBEAT_TIMEOUT = 5
-    STARTUP_FAILURE = 6
-    SUPERVISOR_SHUTDOWN = 7
-    KILLED = 8

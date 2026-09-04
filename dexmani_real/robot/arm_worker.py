@@ -90,6 +90,7 @@ def _read_latest_arm_command(
     ticket = CoupledCommandTicket(
         run_generation=int(command["run_generation"][0]),
         ring_sequence=int(ring_sequence),
+        valid_until_monotonic_ns=int(command["valid_until_monotonic_ns"][0]),
     )
     return command, ticket
 
@@ -347,6 +348,8 @@ def _handle_servo_command(
         )
         return
     target = np.asarray(action["arm_qpos"][0], dtype=np.float64)
+    if not coupled_command_ticket_allows_execution(shared, ticket=ticket):
+        return
     code = st.arm.servo(target)
     if code != 0:
         # Setter code 1 only means that the controller has an error. Read the

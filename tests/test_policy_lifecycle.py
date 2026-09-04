@@ -78,6 +78,18 @@ class _FakeProcess:
         return self._alive
 
 
+class _ControllableProcess:
+    """Non-spawning process double for lifecycle ordering tests."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.started = False
+        self._alive = False
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+
 def _policy_spec() -> SimpleNamespace:
     return SimpleNamespace(
         action_key="action",
@@ -104,7 +116,7 @@ def _policy_worker_config(spec: SimpleNamespace) -> PolicyWorkerConfig:
 
 
 class PolicyLifecycleStartupTest(unittest.TestCase):
-    def test_deployment_mode_reaches_inference_and_coordinator(self) -> None:
+    def test_deployment_mode_reaches_inference_and_executor(self) -> None:
         runtime = resolve_runtime_config()
         spec = _policy_spec()
         worker_config = _policy_worker_config(spec)
@@ -120,22 +132,19 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
             worker_config,
             execute=False,
             deployment_config=deployment,
+            max_running_s=1.5,
         )
 
         by_name = {worker.name: worker for worker in specs}
         self.assertIs(by_name["arm"].args[1], runtime.arm)
         self.assertIs(by_name["inference"].args[-2], deployment)
         self.assertIsNone(by_name["inference"].args[-1])
-        self.assertEqual(by_name["policy"].args[-1].inference_mode, "async")
-        self.assertEqual(by_name["policy"].args[-1].max_action_steps, 3)
-        self.assertEqual(
-            by_name["policy"].args[-1].coordinator_hz,
-            runtime.policy.coordinator_hz,
-        )
-        self.assertEqual(
-            by_name["policy"].args[-1].command_progress_timeout_s,
-            runtime.policy.command_progress_timeout_s,
-        )
+        self.assertIs(by_name["policy"].args[1], runtime)
+        self.assertIs(by_name["policy"].args[2], spec)
+        self.assertIs(by_name["policy"].args[3], deployment)
+        self.assertFalse(by_name["policy"].args[4])
+        self.assertEqual(by_name["policy"].args[5], 1.5)
+        self.assertIsNone(by_name["policy"].ready_name)
 
     def test_model_failure_blocks_all_non_inference_workers(self) -> None:
         shared = _FakeRuntimeChannels()
@@ -154,7 +163,7 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
                     (shared, runtime.policy, worker_config),
                     ready_name="inference",
                 ),
-                WorkerSpec("policy", _unexpected_worker_start, (), ready_name="policy"),
+                WorkerSpec("policy", _unexpected_worker_start, ()),
                 WorkerSpec("hand", _unexpected_worker_start, (), ready_name="hand"),
             )
         )
@@ -219,6 +228,139 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
             ),
             (14, 14, 14, 11, 11),
         )
+
+    def test_inference_exit_after_ready_blocks_hardware_start(self) -> None:
+        shared = _FakeRuntimeChannels()
+        runtime = resolve_runtime_config()
+        spec = _policy_spec()
+        worker_config = _policy_worker_config(spec)
+        specs = (
+            WorkerSpec(
+                "inference", _unexpected_worker_start, (), ready_name="inference"
+            ),
+            WorkerSpec("arm", _unexpected_worker_start, (), ready_name="arm"),
+            WorkerSpec("hand", _unexpected_worker_start, (), ready_name="hand"),
+            WorkerSpec("policy", _unexpected_worker_start, ()),
+        )
+        processes = [_ControllableProcess(worker.name) for worker in specs]
+        by_name = {process.name: process for process in processes}
+
+        def start_fake(selected: list[_ControllableProcess]) -> None:
+            for process in selected:
+                process.started = True
+                process._alive = True
+            if by_name["inference"] in selected:
+                shared.set_ready("inference")
+
+        def ready_then_die(
+            _shared: _FakeRuntimeChannels,
+            ready_checks: list[tuple[str, float]],
+            _procs: list[_ControllableProcess],
+        ) -> bool:
+            self.assertEqual(ready_checks[0][0], "inference")
+            by_name["inference"]._alive = False
+            return True
+
+        shutdown = Mock(return_value=object())
+        with (
+            patch(
+                "dexmani_real.deployment.lifecycle.RuntimeChannels.create",
+                return_value=shared,
+            ),
+            patch(
+                "dexmani_real.deployment.lifecycle.build_policy_worker_specs",
+                return_value=specs,
+            ),
+            patch(
+                "dexmani_real.deployment.lifecycle.build_processes",
+                return_value=processes,
+            ),
+            patch("dexmani_real.deployment.lifecycle.start_processes", start_fake),
+            patch(
+                "dexmani_real.deployment.lifecycle.wait_subsystem_ready",
+                side_effect=ready_then_die,
+            ),
+            patch("dexmani_real.deployment.lifecycle.shutdown_processes", shutdown),
+        ):
+            result = run_policy_deployment(runtime, spec, worker_config, False)
+
+        self.assertEqual(result, 1)
+        self.assertTrue(shared.error_state.value)
+        self.assertEqual(shared.safety_state.value, int(SafetyState.FAULT))
+        self.assertTrue(by_name["inference"].started)
+        for name in ("arm", "hand", "policy"):
+            with self.subTest(worker=name):
+                self.assertFalse(by_name[name].started)
+        shutdown.assert_called_once_with(
+            shared,
+            [by_name["inference"]],
+            graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+        )
+
+    def test_lifecycle_supervises_policy_heartbeat(self) -> None:
+        shared = _FakeRuntimeChannels()
+        runtime = resolve_runtime_config()
+        spec = _policy_spec()
+        worker_config = _policy_worker_config(spec)
+        specs = (
+            WorkerSpec(
+                "inference", _unexpected_worker_start, (), ready_name="inference"
+            ),
+            WorkerSpec("arm", _unexpected_worker_start, (), ready_name="arm"),
+            WorkerSpec("hand", _unexpected_worker_start, (), ready_name="hand"),
+            WorkerSpec("policy", _unexpected_worker_start, ()),
+        )
+        processes = [_ControllableProcess(worker.name) for worker in specs]
+        by_name = {process.name: process for process in processes}
+        specs_by_name = {worker.name: worker for worker in specs}
+
+        def start_fake(selected: list[_ControllableProcess]) -> None:
+            for process in selected:
+                process.started = True
+                process._alive = True
+                ready_name = specs_by_name[process.name].ready_name
+                if ready_name is not None:
+                    shared.set_ready(ready_name)
+
+        def clean_shutdown(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            shared.is_running.value = False
+            shared.safety_state.value = int(SafetyState.DISARMED)
+            return SimpleNamespace(
+                exits=[
+                    SimpleNamespace(exitcode=0, escalation="graceful")
+                    for _process in processes
+                ],
+                shared_closed=True,
+            )
+
+        supervisor = Mock(return_value=("explicit quit", True))
+        with (
+            patch(
+                "dexmani_real.deployment.lifecycle.RuntimeChannels.create",
+                return_value=shared,
+            ),
+            patch(
+                "dexmani_real.deployment.lifecycle.build_policy_worker_specs",
+                return_value=specs,
+            ),
+            patch(
+                "dexmani_real.deployment.lifecycle.build_processes",
+                return_value=processes,
+            ),
+            patch("dexmani_real.deployment.lifecycle.start_processes", start_fake),
+            patch("dexmani_real.deployment.lifecycle.run_operator_control"),
+            patch("dexmani_real.deployment.lifecycle.run_supervisor", supervisor),
+            patch(
+                "dexmani_real.deployment.lifecycle.shutdown_processes",
+                side_effect=clean_shutdown,
+            ),
+        ):
+            result = run_policy_deployment(runtime, spec, worker_config, False)
+
+        self.assertEqual(result, 0)
+        heartbeat_names = supervisor.call_args.args[3]
+        self.assertIn("policy", heartbeat_names)
+        self.assertEqual(set(heartbeat_names), {"inference", "arm", "hand", "policy"})
 
 
 def _unexpected_worker_start() -> None:

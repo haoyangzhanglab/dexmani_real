@@ -249,8 +249,8 @@ def record_held(
 ) -> None:
     """Record an active safety-fallback frame and its optional hold command.
 
-    Ordinary ``CommandQuiescence`` never calls this helper: a command-silent
-    pause emits neither an actuator action nor a recording sample.
+    A command-silent pause never calls this helper: it emits neither an
+    actuator action nor a recording sample.
 
     Args:
         arm_qpos_sent: Last arm target published in the coupled command record.

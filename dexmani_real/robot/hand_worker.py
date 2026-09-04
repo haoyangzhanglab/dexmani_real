@@ -361,7 +361,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
             if permit.run_generation != stats_generation:
                 # Physical home uses an ARMED generation, then policy motion
                 # advances to a new RUNNING generation. Preserve the completed
-                # RUNNING generation when the coordinator revokes motion, while
+                # RUNNING generation when the policy executor revokes motion, while
                 # keeping the two command classes distinct in exit diagnostics.
                 if stats_generation_was_running:
                     last_running_stats = (
@@ -399,6 +399,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
             ticket = CoupledCommandTicket(
                 run_generation=int(command["run_generation"][0]),
                 ring_sequence=sequence_int,
+                valid_until_monotonic_ns=int(command["valid_until_monotonic_ns"][0]),
             )
             command_generation = int(command["run_generation"][0])
             if command_generation != permit.run_generation or not (
@@ -475,6 +476,9 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                 )
                 shared.error_state.value = True
                 return
+            if not coupled_command_ticket_allows_execution(shared, ticket=ticket):
+                rate_mgr.wait()
+                continue
             sdk_send_attempts += 1
             send_status = hand.send_action(bounded)
             if send_status is XHandSendStatus.ACCEPTED:
