@@ -24,6 +24,9 @@ if TYPE_CHECKING:
 # J1-J4 move first (arm repositioning), then J5-J7 (wrist orientation).
 _PROXIMAL_MASK = np.array([True, True, True, True, False, False, False], dtype=bool)
 
+# Allow a small outward tolerance for nonlinear FK interpolation at workspace edges.
+WORKSPACE_BOUNDS_TOLERANCE_M = 1e-3
+
 
 class HomePathStatus(str, Enum):
     """Explicit outcome of collision-checked home-path planning."""

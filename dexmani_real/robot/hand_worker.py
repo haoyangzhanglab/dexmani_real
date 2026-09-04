@@ -1,9 +1,11 @@
 """Single-owner XHand servo worker with latest-target, fixed-grid feedback.
 
 Each tick reads one state, publishes it (or a clearly stale previous state),
-then sends at most one measured-state-bounded target. A CRC response keeps the
-target unacknowledged and the worker running; other rejected SDK commands latch
-the shared fault so publishers cannot mistake silence for successful application.
+then sends at most one rate-bounded target. RUNNING motion advances from the
+last SDK-accepted setpoint; ARMED homing remains bounded from measurement. A
+CRC response keeps the target unacknowledged and the worker running; other
+rejected SDK commands latch the shared fault so publishers cannot mistake
+silence for successful application.
 """
 
 from __future__ import annotations
@@ -67,6 +69,29 @@ def expired_hand_command_diagnostics(
         allow_nan=False,
         separators=(",", ":"),
         sort_keys=True,
+    )
+
+
+def _limited_hand_setpoint(
+    target_qpos: np.ndarray,
+    *,
+    measured_qpos: np.ndarray,
+    last_sdk_accepted_qpos: np.ndarray,
+    is_running: bool,
+    max_delta_rad_per_tick: float | np.ndarray,
+) -> np.ndarray:
+    """Bound one SDK setpoint from command history or measured state.
+
+    A RUNNING endpoint may be held by contact, so its setpoint slew is
+    measured from the last SDK-accepted command rather than encoder tracking.
+    ARMED homing stays measured-state bounded because home acceptance is not
+    measured convergence.
+    """
+    reference_qpos = last_sdk_accepted_qpos if is_running else measured_qpos
+    return limit_hand_target_delta(
+        target_qpos,
+        reference_qpos,
+        max_delta_rad_per_tick,
     )
 
 
@@ -225,6 +250,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
 
         last_state = initial_state
         last_source_ns = time.monotonic_ns()
+        last_sdk_accepted_qpos = initial_state.qpos.copy()
         accepted_target_action_id = 0
         accepted_target_monotonic_ns = 0
         sdk_send_attempts = 0
@@ -351,6 +377,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                 duplicate_skips = 0
                 sdk_rejections = 0
                 last_exact_target_sequence = 0
+                last_sdk_accepted_qpos = state.qpos.copy()
                 stats_generation = permit.run_generation
                 stats_generation_was_running = permit.state is SafetyState.RUNNING
             if not permit.allows_motion:
@@ -429,10 +456,12 @@ def hand_loop(shared: Any, config: HandParams) -> None:
 
             action_id = int(command["action_id"][0])
             target = np.asarray(command["hand_qpos"][0], dtype=np.float64)
-            bounded = limit_hand_target_delta(
+            bounded = _limited_hand_setpoint(
                 target,
-                state.qpos,
-                config.hand_max_delta_rad_per_tick,
+                measured_qpos=state.qpos,
+                last_sdk_accepted_qpos=last_sdk_accepted_qpos,
+                is_running=permit.state is SafetyState.RUNNING,
+                max_delta_rad_per_tick=config.hand_max_delta_rad_per_tick,
             )
             if not coupled_command_ticket_allows_execution(shared, ticket=ticket):
                 rate_mgr.wait()
@@ -441,7 +470,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                 bounded > mechanical_upper + 1e-12
             ):
                 logger.error(
-                    "hand_loop: measured-state-bounded action_id=%d violates mechanical limits",
+                    "hand_loop: rate-bounded action_id=%d violates mechanical limits",
                     action_id,
                 )
                 shared.error_state.value = True
@@ -449,6 +478,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
             sdk_send_attempts += 1
             send_status = hand.send_action(bounded)
             if send_status is XHandSendStatus.ACCEPTED:
+                last_sdk_accepted_qpos = bounded.copy()
                 # ACK denotes SDK acceptance of the exact IPC endpoint, not
                 # physical convergence or acceptance of an intermediate step.
                 if np.array_equal(bounded, target):
@@ -464,9 +494,8 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                 )
                 shared.error_state.value = True
                 return
-            # CRC_UNCONFIRMED deliberately leaves the action unacknowledged.
-            # The next tick starts from fresh measured state and the latest
-            # still-authorized command instead of latching a runtime fault.
+            # CRC_UNCONFIRMED deliberately leaves both the action and its
+            # command-space reference unacknowledged.
             else:
                 crc_unconfirmed += 1
 

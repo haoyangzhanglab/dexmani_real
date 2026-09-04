@@ -128,6 +128,14 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
         self.assertIsNone(by_name["inference"].args[-1])
         self.assertEqual(by_name["policy"].args[-1].inference_mode, "async")
         self.assertEqual(by_name["policy"].args[-1].max_action_steps, 3)
+        self.assertEqual(
+            by_name["policy"].args[-1].coordinator_hz,
+            runtime.policy.coordinator_hz,
+        )
+        self.assertEqual(
+            by_name["policy"].args[-1].command_progress_timeout_s,
+            runtime.policy.command_progress_timeout_s,
+        )
 
     def test_model_failure_blocks_all_non_inference_workers(self) -> None:
         shared = _FakeRuntimeChannels()

@@ -477,17 +477,13 @@ def poll_coupled_command_acknowledgement(
                     candidate=candidate,
                     detail="hand acknowledgement has no SDK acceptance timestamp",
                 )
-            hand_accepted_monotonic_ns = (
-                hand_feedback.accepted_target_monotonic_ns
-            )
+            hand_accepted_monotonic_ns = hand_feedback.accepted_target_monotonic_ns
 
     if arm_acknowledged and hand_acknowledged:
         return CommandPublishResult(
             CommandPublishStatus.APPLIED,
             candidate=candidate,
-            arm_accepted_monotonic_ns=(
-                arm_feedback.last_cmd_accepted_monotonic_ns
-            ),
+            arm_accepted_monotonic_ns=(arm_feedback.last_cmd_accepted_monotonic_ns),
             hand_accepted_monotonic_ns=hand_accepted_monotonic_ns,
         )
     if not coupled_command_ticket_is_current(shared, ticket=ticket):
@@ -506,9 +502,7 @@ def poll_coupled_command_acknowledgement(
         candidate=candidate,
         detail=f"awaiting {', '.join(pending_workers)}",
         arm_accepted_monotonic_ns=(
-            arm_feedback.last_cmd_accepted_monotonic_ns
-            if arm_acknowledged
-            else None
+            arm_feedback.last_cmd_accepted_monotonic_ns if arm_acknowledged else None
         ),
         hand_accepted_monotonic_ns=hand_accepted_monotonic_ns,
     )
@@ -762,40 +756,41 @@ def validate_and_send_candidate(
         # The raw learned endpoint must pass the complete gate first.  The
         # physical hand command is then shaped from the same fresh feedback so
         # contact can produce an accepted torque-limited setpoint rather than
-        # waiting for unreachable joint convergence.  Revalidate the shaped
-        # target because componentwise clipping is not necessarily a point on
-        # the raw joint-space interpolation checked above.
-        candidate = replace(
-            candidate,
-            hand_qpos=limit_hand_target_delta(
-                candidate.hand_qpos,
-                hand_feedback.qpos,
-                hand_command_max_delta_rad_per_tick,
-            ),
+        # waiting for unreachable joint convergence.  Policy's gate has no
+        # hand-delta or collision callback, so its raw arm/workspace result
+        # remains valid; the hand preflight below validates the shaped command.
+        # Callers that opt into either shaped-target check must re-run the gate.
+        shaped_hand_qpos = limit_hand_target_delta(
+            candidate.hand_qpos,
+            hand_feedback.qpos,
+            hand_command_max_delta_rad_per_tick,
         )
-        shaped_gate_result = gate.validate(
-            candidate,
-            current_arm_qpos=arm_feedback.qpos,
-            current_hand_qpos=hand_feedback.qpos,
-            arm_delta_reference_qpos=arm_delta_reference_qpos,
-            hand_delta_reference_qpos=hand_delta_reference_qpos,
-            run_generation=permit.run_generation,
-        )
-        if not shaped_gate_result.accepted:
-            reason = shaped_gate_result.reason or "unspecified"
-            logger.warning(
-                "validate_and_send_candidate: action_id=%d rejected by safety gate "
-                "after hand rate shaping: %s",
-                action_id,
-                reason,
-            )
-            return CommandPublishResult(
-                CommandPublishStatus.GATE_REJECTED,
-                candidate=candidate,
-                detail=reason,
-                gate_code=shaped_gate_result.code,
-                hand_roundoff_canonicalized=hand_roundoff_canonicalized,
-            )
+        if not np.array_equal(shaped_hand_qpos, candidate.hand_qpos):
+            candidate = replace(candidate, hand_qpos=shaped_hand_qpos)
+            if gate.max_hand_delta_rad is not None or gate.collision_check is not None:
+                shaped_gate_result = gate.validate(
+                    candidate,
+                    current_arm_qpos=arm_feedback.qpos,
+                    current_hand_qpos=hand_feedback.qpos,
+                    arm_delta_reference_qpos=arm_delta_reference_qpos,
+                    hand_delta_reference_qpos=hand_delta_reference_qpos,
+                    run_generation=permit.run_generation,
+                )
+                if not shaped_gate_result.accepted:
+                    reason = shaped_gate_result.reason or "unspecified"
+                    logger.warning(
+                        "validate_and_send_candidate: action_id=%d rejected by safety gate "
+                        "after hand rate shaping: %s",
+                        action_id,
+                        reason,
+                    )
+                    return CommandPublishResult(
+                        CommandPublishStatus.GATE_REJECTED,
+                        candidate=candidate,
+                        detail=reason,
+                        gate_code=shaped_gate_result.code,
+                        hand_roundoff_canonicalized=hand_roundoff_canonicalized,
+                    )
 
     if candidate.hand_qpos is not None:
         assert hand_feedback is not None

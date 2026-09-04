@@ -43,9 +43,7 @@ from dexmani_real.deployment.metrics import (
     OBSERVATION_SKEW_MS,
     OBSERVATION_WAIT_ARM_HISTORY,
     OBSERVATION_WAIT_GRID_ADVANCE,
-    OBSERVATION_WAIT_HAND_HISTORY,
     OBSERVATION_WAIT_POINTCLOUD_GRID,
-    OBSERVATION_WAIT_POINTCLOUD_HISTORY,
     OBSERVATION_WAIT_POINTCLOUD_STALE,
     OBSERVATION_WAIT_RGB_GRID,
     OBSERVATION_WAIT_RGB_HISTORY,
@@ -1156,7 +1154,6 @@ def inference_loop(
 
     step_dt_ns = int(round(float(config.spec.control_dt_s) * 1e9))
     async_period_ns = int(config.spec.n_action_steps) * step_dt_ns
-    requested = _requested_observation_fields(config.spec)
 
     chunk_id = 0
     observation_id = 0
@@ -1270,28 +1267,6 @@ def inference_loop(
             )
             if observation is None:
                 wait_for_observation()
-                continue
-            horizon = int(config.spec.n_obs_steps)
-            if (
-                observation.arm_history is None
-                or observation.arm_history.values.shape[0] != horizon
-            ):
-                wait_for_observation(OBSERVATION_WAIT_ARM_HISTORY)
-                continue  # no complete causal arm history yet — never infer
-            if config.spec.requires_hand and (
-                observation.hand_history is None
-                or observation.hand_history.values.shape[0] != horizon
-            ):
-                wait_for_observation(OBSERVATION_WAIT_HAND_HISTORY)
-                continue
-            if (
-                "point_cloud" in requested
-                and len(observation.pointcloud_history) != horizon
-            ):
-                wait_for_observation(OBSERVATION_WAIT_POINTCLOUD_HISTORY)
-                continue
-            if "rgb" in requested and len(observation.rgb_history) != horizon:
-                wait_for_observation(OBSERVATION_WAIT_RGB_HISTORY)
                 continue
             if observation.logical_step_monotonic_ns <= last_logical_step_ns:
                 wait_for_observation(OBSERVATION_WAIT_GRID_ADVANCE)

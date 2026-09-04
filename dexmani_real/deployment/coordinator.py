@@ -7,7 +7,9 @@ candidate publication boundary (SafetyGate -> send_command), and owns the
 policy semantic watchdog and the ``RUNNING <-> ARMED`` control-source state.
 
 It never dumps a whole chunk into the arm queue or hand ring and never
-interpolates between model steps.
+interpolates between model steps. Coordination polling is separate from the
+policy control grid so worker progress polling and completed inference do not
+consume whole action slots.
 """
 
 from __future__ import annotations
@@ -28,23 +30,18 @@ from dexmani_real.control.publication import (
     CommandPublishResult,
     CommandPublishStatus,
     build_action_candidate,
-    poll_coupled_command_acknowledgement,
     validate_and_send_candidate,
 )
-from dexmani_real.control.safety_gate import GateRejectCode, planner_action_safety_gate
+from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
 from dexmani_real.deployment.config import PolicyDeploymentConfig
 from dexmani_real.deployment.contracts import ActionChunk
 from dexmani_real.deployment.metrics import (
-    ACK_FAILURE,
-    ACK_LATENCY_MS,
-    ACK_TIMEOUT,
-    ACKNOWLEDGED,
-    APPLIED_ACTION_STEPS,
     CHUNKS_GENERATION_DROPPED,
     CHUNKS_INGESTED,
     CHUNKS_STALE,
+    COMMAND_PROGRESS_TIMEOUT,
     COMMAND_SILENCE_ABORT,
-    ENDPOINTS_COMMITTED,
+    ENDPOINT_SCHEDULE_LATENESS_MS,
     ENDPOINTS_DUE,
     ENDPOINTS_FATAL_REJECTED,
     ENDPOINTS_MOTION_DISCARDED,
@@ -55,15 +52,20 @@ from dexmani_real.deployment.metrics import (
     EPISODE_ACTION_STEPS,
     HAND_POLICY_ENDPOINT_ROUNDOFF_CANONICALIZED,
     HAND_PREFLIGHT_REJECTIONS,
-    IK_CHECKER_REJECTS,
     POLICY_ABORTS,
+    PUBLICATION_INTERVAL_MS,
     SAFETY_REJECTED_STEPS,
+    SUCCESSFUL_ACTION_STEPS,
     Metrics,
     flush_every,
     reject_counter_name,
 )
 from dexmani_real.deployment.timing import first_future_step_index
-from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
+from dexmani_real.ipc.channels import (
+    RuntimeChannels,
+    read_arm_state_dict,
+    read_hand_state_dict,
+)
 from dexmani_real.ipc.schema import MAX_POLICY_CHUNK_STEPS, POLICY_CHUNK_DTYPE
 from dexmani_real.planning import (
     Pose,
@@ -71,7 +73,12 @@ from dexmani_real.planning import (
     XArm7MotionPlanner,
     XArm7PlannerConfig,
 )
-from dexmani_real.planning.paths import wrap_nearest_equivalent
+from dexmani_real.planning.arm_fk import make_arm_fk
+from dexmani_real.planning.paths import (
+    WORKSPACE_BOUNDS_TOLERANCE_M,
+    interpolate_waypoints,
+    wrap_nearest_equivalent,
+)
 from dexmani_real.planning.poses import rot6d_to_quat_wxyz, validate_rot6d_geometry
 from dexmani_real.planning.types import IKFailureKind
 from dexmani_real.robot_spec import (
@@ -79,22 +86,26 @@ from dexmani_real.robot_spec import (
     XARM7_XHAND_SRDF_PATH,
 )
 from dexmani_real.runtime.safety import (
-    CoupledCommandTicket,
     SafetyState,
     StopRequest,
     begin_requested_motion,
     revoke_motion,
 )
-from dexmani_real.utils.feedback import FeedbackIssueCode, diagnose_arm_feedback
+from dexmani_real.utils.feedback import (
+    FeedbackIssueCode,
+    diagnose_arm_feedback,
+    diagnose_hand_feedback,
+)
 from dexmani_real.utils.limits import validate_hand_limit_nesting
 from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.rate import LoopRate
 
 if TYPE_CHECKING:
     from dexmani_real.config.runtime import ResolvedRuntimeConfig
 
 logger = get_logger(__name__)
-_TARGET_WAIT_HEARTBEAT_S = 0.05
 _UINT64_MAX = int(np.iinfo(np.uint64).max)
+_POLICY_WORKSPACE_INTERPOLATION_MAX_STEP_RAD = 0.02
 
 
 class PolicyEndpointDisposition(str, Enum):
@@ -109,8 +120,6 @@ class PolicyEndpointDisposition(str, Enum):
 
 def classify_policy_endpoint_disposition(
     result: CommandPublishResult,
-    *,
-    hand_limit_nesting_valid: bool,
 ) -> PolicyEndpointDisposition:
     """Classify a publication result without interpreting diagnostic strings.
 
@@ -123,24 +132,19 @@ def classify_policy_endpoint_disposition(
     if result.status is CommandPublishStatus.TEMPORAL_WINDOW_CLOSED:
         return PolicyEndpointDisposition.DISCARD_STALE
     if result.status is CommandPublishStatus.HAND_PREFLIGHT_REJECTED:
-        return (
-            PolicyEndpointDisposition.DISCARD_MOTION
-            if hand_limit_nesting_valid
-            else PolicyEndpointDisposition.ABORT_FATAL
-        )
+        return PolicyEndpointDisposition.DISCARD_MOTION
     if result.status is CommandPublishStatus.GATE_REJECTED:
         if result.gate_code in {
             GateRejectCode.ARM_JOINT_LIMIT,
             GateRejectCode.HAND_JOINT_LIMIT,
             GateRejectCode.ARM_DELTA_LIMIT,
             GateRejectCode.WORKSPACE,
-            GateRejectCode.COLLISION_TRANSITION,
         }:
             return PolicyEndpointDisposition.DISCARD_MOTION
         if result.gate_code is GateRejectCode.RUN_GENERATION_MISMATCH:
             return PolicyEndpointDisposition.DEFER_TRANSIENT
-        # HAND_DELTA_LIMIT must never occur for learned policy (the coordinator
-        # disables this gate); all remaining gate/contract/checker failures are
+        # HAND_DELTA_LIMIT and collision transition checks are disabled for the
+        # learned-policy gate; remaining gate/contract/checker failures are
         # unsafe implementation or input faults.
         return PolicyEndpointDisposition.ABORT_FATAL
     if result.status in {
@@ -166,37 +170,125 @@ def classify_policy_endpoint_disposition(
         return PolicyEndpointDisposition.DEFER_TRANSIENT
     # ESTOP/STICKY are fatal but the coordinator leaves their lifecycle state
     # untouched. Missing gate, malformed candidates, future feedback time,
-    # acknowledgement failures, and all unknown outcomes fail closed.
+    # malformed candidates and all unknown outcomes fail closed.
     return PolicyEndpointDisposition.ABORT_FATAL
 
 
-@dataclass(frozen=True)
-class _PendingAcknowledgement:
-    """One physical command awaiting arm and hand worker acknowledgement."""
+@dataclass
+class _CommandProgressWatchdog:
+    """Track independent worker acceptance watermarks for one run generation."""
 
-    candidate: ActionCandidate
-    ticket: CoupledCommandTicket
-    published_monotonic_ns: int
-    acceptance_deadline_monotonic_ns: int
-    observation_deadline_monotonic_ns: int
+    run_generation: int | None = None
+    latest_published_action_id: int | None = None
+    arm_accepted_action_id: int | None = None
+    hand_accepted_action_id: int | None = None
+    arm_no_progress_since_monotonic_ns: int | None = None
+    hand_no_progress_since_monotonic_ns: int | None = None
 
+    def reset(self, *, run_generation: int | None) -> None:
+        if run_generation is not None and run_generation <= 0:
+            raise ValueError("run generation must be positive or null")
+        self.run_generation = run_generation
+        self.latest_published_action_id = None
+        self.arm_accepted_action_id = None
+        self.hand_accepted_action_id = None
+        self.arm_no_progress_since_monotonic_ns = None
+        self.hand_no_progress_since_monotonic_ns = None
 
-class _AcknowledgementAction(str, Enum):
-    """One bounded coordinator action after polling a pending command."""
+    def observe(
+        self,
+        *,
+        run_generation: int,
+        arm_accepted_action_id: int | None,
+        hand_accepted_action_id: int | None,
+        now_monotonic_ns: int,
+        timeout_ns: int,
+    ) -> str | None:
+        """Observe worker progress and return a bounded stall reason, if any."""
+        if self.run_generation != run_generation:
+            return "command progress generation does not match active run"
+        if now_monotonic_ns <= 0 or timeout_ns <= 0:
+            raise ValueError("command progress times must be positive")
+        for worker, observed_action_id in (
+            ("arm", arm_accepted_action_id),
+            ("hand", hand_accepted_action_id),
+        ):
+            if observed_action_id is None:
+                continue
+            if observed_action_id < 0:
+                return f"{worker} command progress is negative"
+            previous_action_id = getattr(self, f"{worker}_accepted_action_id")
+            if (
+                previous_action_id is not None
+                and observed_action_id < previous_action_id
+            ):
+                return f"{worker} command progress regressed"
+            setattr(self, f"{worker}_accepted_action_id", observed_action_id)
+            if previous_action_id is None:
+                continue
+            if observed_action_id > previous_action_id:
+                waiting_since = (
+                    None
+                    if self._worker_covers_latest(observed_action_id)
+                    else now_monotonic_ns
+                )
+                setattr(
+                    self,
+                    f"{worker}_no_progress_since_monotonic_ns",
+                    waiting_since,
+                )
 
-    APPLIED = "applied"
-    WAIT = "wait"
-    FAULT_TIMEOUT = "fault_timeout"
-    FAULT_REJECTED = "fault_rejected"
+        for worker in ("arm", "hand"):
+            waiting_since = getattr(self, f"{worker}_no_progress_since_monotonic_ns")
+            if (
+                waiting_since is not None
+                and now_monotonic_ns - waiting_since > timeout_ns
+            ):
+                return f"{worker} worker command progress timeout"
+        return None
 
+    def record_publication(
+        self,
+        *,
+        run_generation: int,
+        action_id: int,
+        published_monotonic_ns: int,
+    ) -> None:
+        """Extend the target watermark without hiding an existing stall."""
+        if self.run_generation != run_generation:
+            raise RuntimeError("publication does not match progress generation")
+        if action_id <= 0 or published_monotonic_ns <= 0:
+            raise ValueError("published action identity and time must be positive")
+        previous_published = self.latest_published_action_id
+        if previous_published is not None and action_id <= previous_published:
+            raise RuntimeError("published action IDs must increase")
+        for worker in ("arm", "hand"):
+            accepted_action_id = getattr(self, f"{worker}_accepted_action_id")
+            if accepted_action_id is None:
+                raise RuntimeError(f"{worker} command progress baseline is unavailable")
+            if action_id <= accepted_action_id:
+                raise RuntimeError(
+                    f"published action ID does not advance beyond {worker} baseline"
+                )
+            waiting_field = f"{worker}_no_progress_since_monotonic_ns"
+            if getattr(self, waiting_field) is None:
+                setattr(self, waiting_field, published_monotonic_ns)
+        self.latest_published_action_id = action_id
 
-@dataclass(frozen=True)
-class _AcknowledgementDecision:
-    """Pure interpretation of one arm/hand acknowledgement observation."""
+    @property
+    def latest_publication_is_accepted(self) -> bool:
+        latest_action_id = self.latest_published_action_id
+        return (
+            latest_action_id is not None
+            and self.arm_accepted_action_id is not None
+            and self.hand_accepted_action_id is not None
+            and self.arm_accepted_action_id >= latest_action_id
+            and self.hand_accepted_action_id >= latest_action_id
+        )
 
-    action: _AcknowledgementAction
-    reason: str = ""
-    latency_ms: float | None = None
+    def _worker_covers_latest(self, accepted_action_id: int) -> bool:
+        latest_action_id = self.latest_published_action_id
+        return latest_action_id is None or accepted_action_id >= latest_action_id
 
 
 @dataclass
@@ -205,7 +297,7 @@ class _EpisodeActionSteps:
 
     max_action_steps: int | None
     episode_action_steps: int = 0
-    applied_action_steps: int = 0
+    successful_action_steps: int = 0
     safety_rejected_steps: int = 0
 
     def __post_init__(self) -> None:
@@ -216,12 +308,12 @@ class _EpisodeActionSteps:
 
     def reset(self) -> None:
         self.episode_action_steps = 0
-        self.applied_action_steps = 0
+        self.successful_action_steps = 0
         self.safety_rejected_steps = 0
 
-    def record_applied(self) -> bool:
+    def record_successful(self) -> bool:
         self.episode_action_steps += 1
-        self.applied_action_steps += 1
+        self.successful_action_steps += 1
         return self.limit_reached
 
     def record_safety_rejected(self) -> bool:
@@ -360,6 +452,30 @@ def _selected_async_target_is_due(
     return target_ns <= now_ns < target_ns + step_dt_ns
 
 
+def _scheduled_endpoint_due_ns(
+    scheduled_target_ns: int,
+    next_endpoint_due_ns: int | None,
+) -> int:
+    """Combine a chunk target with the persistent policy publication grid."""
+    if next_endpoint_due_ns is None:
+        return scheduled_target_ns
+    return max(scheduled_target_ns, next_endpoint_due_ns)
+
+
+def _advance_endpoint_due_ns(
+    endpoint_due_ns: int,
+    terminal_monotonic_ns: int,
+    step_dt_ns: int,
+) -> int:
+    """Advance one terminal slot without accumulating jitter or catching up."""
+    if endpoint_due_ns <= 0 or terminal_monotonic_ns <= 0 or step_dt_ns <= 0:
+        raise ValueError("endpoint schedule times must be positive")
+    lateness_ns = max(0, terminal_monotonic_ns - endpoint_due_ns)
+    if lateness_ns >= step_dt_ns:
+        return terminal_monotonic_ns + step_dt_ns
+    return endpoint_due_ns + step_dt_ns
+
+
 def _chunk_source_is_stale(
     chunk: ActionChunk,
     *,
@@ -396,72 +512,6 @@ def _chunk_source_deadline_ns(
     return source_ns + max_age_ns
 
 
-def _classify_acknowledgement(
-    pending: _PendingAcknowledgement,
-    acknowledgement: CommandPublishResult,
-    *,
-    poll_started_monotonic_ns: int,
-    observed_monotonic_ns: int,
-) -> _AcknowledgementDecision:
-    """Map one non-blocking ACK poll to the coordinator's next action."""
-    acknowledgement_status = acknowledgement.status
-    if acknowledgement_status is CommandPublishStatus.APPLIED:
-        accepted_times = {
-            "arm": acknowledgement.arm_accepted_monotonic_ns,
-        }
-        if pending.candidate.hand_qpos is not None:
-            accepted_times["hand"] = acknowledgement.hand_accepted_monotonic_ns
-        if any(value is None or value <= 0 for value in accepted_times.values()):
-            return _AcknowledgementDecision(
-                _AcknowledgementAction.FAULT_REJECTED,
-                reason="applied acknowledgement omitted worker acceptance time",
-            )
-        if any(
-            value is not None
-            and (
-                value < pending.published_monotonic_ns
-                or value > observed_monotonic_ns
-            )
-            for value in accepted_times.values()
-        ):
-            return _AcknowledgementDecision(
-                _AcknowledgementAction.FAULT_REJECTED,
-                reason="worker acceptance timestamp is outside the observed interval",
-            )
-        late_workers = [
-            name
-            for name, value in accepted_times.items()
-            if value is not None
-            and value > pending.acceptance_deadline_monotonic_ns
-        ]
-        if late_workers:
-            return _AcknowledgementDecision(
-                _AcknowledgementAction.FAULT_TIMEOUT,
-                reason=(
-                    f"{'/'.join(late_workers)} worker accepted action after deadline"
-                ),
-            )
-        accepted_monotonic_ns = max(
-            value for value in accepted_times.values() if value is not None
-        )
-        return _AcknowledgementDecision(
-            _AcknowledgementAction.APPLIED,
-            latency_ms=(accepted_monotonic_ns - pending.published_monotonic_ns)
-            / 1e6,
-        )
-    if acknowledgement_status is CommandPublishStatus.ACK_PENDING:
-        if poll_started_monotonic_ns < pending.observation_deadline_monotonic_ns:
-            return _AcknowledgementDecision(_AcknowledgementAction.WAIT)
-        return _AcknowledgementDecision(
-            _AcknowledgementAction.FAULT_TIMEOUT,
-            reason=f"worker acknowledgement timeout: {acknowledgement.detail}",
-        )
-    return _AcknowledgementDecision(
-        _AcknowledgementAction.FAULT_REJECTED,
-        reason=f"arm/hand acknowledgement failed: {acknowledgement_status.value}",
-    )
-
-
 def _command_watchdog_abort_reason(
     *,
     now_monotonic_ns: int,
@@ -483,6 +533,48 @@ def _command_watchdog_abort_reason(
     return None
 
 
+def _read_healthy_command_progress(
+    shared: RuntimeChannels,
+    config: "CoordinatorConfig",
+    *,
+    now_monotonic_ns: int,
+) -> tuple[int | None, int | None, str | None]:
+    """Read healthy worker watermarks; stale/missing feedback counts as no progress."""
+    arm_state = read_arm_state_dict(shared)
+    hand_state = read_hand_state_dict(shared)
+    arm_action_id: int | None = None
+    hand_action_id: int | None = None
+    if arm_state is not None:
+        arm_issue = diagnose_arm_feedback(
+            connected=bool(arm_state["connected"]),
+            error_code=int(arm_state["error_code"]),
+            state_valid=bool(arm_state["state_valid"]),
+            source_monotonic_ns=int(arm_state["source_monotonic_ns"]),
+            now_monotonic_ns=now_monotonic_ns,
+            max_age_s=config.arm_feedback_max_age_s,
+            qpos=np.asarray(arm_state["qpos"], dtype=np.float64),
+            qvel=np.asarray(arm_state["qvel"], dtype=np.float64),
+        )
+        if arm_issue is None:
+            arm_action_id = int(arm_state["last_cmd_seq"])
+        elif arm_issue.code is not FeedbackIssueCode.STALE:
+            return None, None, f"fatal arm feedback: {arm_issue.code.value}"
+    if hand_state is not None:
+        hand_issue = diagnose_hand_feedback(
+            connected=bool(hand_state["connected"]),
+            state_valid=bool(hand_state["state_valid"]),
+            source_monotonic_ns=int(hand_state["source_monotonic_ns"]),
+            now_monotonic_ns=now_monotonic_ns,
+            max_age_s=config.hand_feedback_max_age_s,
+            qpos=np.asarray(hand_state["qpos"], dtype=np.float64),
+        )
+        if hand_issue is None:
+            hand_action_id = int(hand_state["accepted_target_action_id"])
+        elif hand_issue.code is not FeedbackIssueCode.STALE:
+            return None, None, f"fatal hand feedback: {hand_issue.code.value}"
+    return arm_action_id, hand_action_id, None
+
+
 @dataclass(frozen=True)
 class CoordinatorConfig:
     """Real-owned timing, safety, and limits required by the coordinator."""
@@ -499,18 +591,15 @@ class CoordinatorConfig:
     arm_feedback_max_age_s: float
     hand_feedback_max_age_s: float
     control_hz: float
+    coordinator_hz: float
     execute: bool
     max_source_to_command_age_s: float
     max_command_silence_s: float
     action_validity_s: float
-    command_acknowledgement_timeout_s: float
+    command_progress_timeout_s: float
     first_command_timeout_s: float
     inference_mode: str = "sync"
     max_action_steps: int | None = None
-    # Full 19-DoF collision model (hand + static boxes) for EE->IK and the
-    # transition collision gate; table clearance is not part of the policy
-    # safety gate.
-    static_boxes: tuple = ()
     ik_max_pose_error_pos_m: float = 0.008
     ik_max_pose_error_rot_rad: float = 0.08
     # The arm worker's canonical final command-jump bound. The learned hand
@@ -532,6 +621,13 @@ class CoordinatorConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.execute, bool):
             raise TypeError("execute must be a boolean")
+        if not np.isfinite(self.control_hz) or self.control_hz <= 0.0:
+            raise ValueError("control_hz must be finite and positive")
+        if (
+            not np.isfinite(self.coordinator_hz)
+            or self.coordinator_hz < self.control_hz
+        ):
+            raise ValueError("coordinator_hz must be finite and >= control_hz")
         if self.inference_mode not in {"sync", "async"}:
             raise ValueError("inference_mode must be 'sync' or 'async'")
         if self.max_action_steps is not None and (
@@ -542,14 +638,14 @@ class CoordinatorConfig:
             self.max_source_to_command_age_s,
             self.max_command_silence_s,
             self.action_validity_s,
-            self.command_acknowledgement_timeout_s,
+            self.command_progress_timeout_s,
             self.first_command_timeout_s,
         )
         if not all(np.isfinite(value) and value > 0.0 for value in timing_values):
             raise ValueError("coordinator timing values must be finite and positive")
-        if self.command_acknowledgement_timeout_s > self.action_validity_s:
+        if self.command_progress_timeout_s > self.action_validity_s:
             raise ValueError(
-                "command acknowledgement timeout must be positive and no greater "
+                "command progress timeout must be positive and no greater "
                 "than action validity"
             )
         if self.execute:
@@ -591,19 +687,17 @@ class CoordinatorConfig:
             arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
             hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
             control_hz=float(runtime.policy.control_hz),
+            coordinator_hz=float(runtime.policy.coordinator_hz),
             execute=execute,
             max_source_to_command_age_s=float(
                 runtime.policy.max_source_to_command_age_s
             ),
             max_command_silence_s=float(runtime.policy.max_command_silence_s),
             action_validity_s=float(runtime.policy.action_validity_s),
-            command_acknowledgement_timeout_s=float(
-                runtime.policy.command_acknowledgement_timeout_s
-            ),
+            command_progress_timeout_s=float(runtime.policy.command_progress_timeout_s),
             first_command_timeout_s=float(runtime.policy.first_command_timeout_s),
             inference_mode=deployment.inference_mode,
             max_action_steps=deployment.max_action_steps,
-            static_boxes=tuple(runtime.environment.static_boxes),
             ik_max_pose_error_pos_m=float(runtime.policy.ik_max_pose_error_pos_m),
             ik_max_pose_error_rot_rad=float(runtime.policy.ik_max_pose_error_rot_rad),
             arm_max_delta_rad_per_tick=float(runtime.arm.max_servo_command_jump_rad),
@@ -619,6 +713,91 @@ class CoordinatorConfig:
                 float(runtime.arm.homing.convergence_rad) if execute else None
             ),
         )
+
+
+def _build_policy_planner(config: CoordinatorConfig) -> XArm7MotionPlanner:
+    """Build policy kinematics without real-time software collision checks."""
+    return XArm7MotionPlanner(
+        XArm7PlannerConfig(
+            urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
+            srdf_path=str(XARM7_XHAND_SRDF_PATH),
+            base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
+            workspace_bounds=np.asarray(config.workspace_bounds, dtype=np.float64),
+        ),
+        teleop_profile=TeleopProfile(
+            max_pose_error_pos_m=config.ik_max_pose_error_pos_m,
+            max_pose_error_rot_rad=config.ik_max_pose_error_rot_rad,
+            check_self_collision=False,
+        ),
+        hand_dof=False,
+    )
+
+
+def _build_policy_workspace_check(
+    config: CoordinatorConfig,
+) -> Callable[[np.ndarray, np.ndarray], bool]:
+    """Build the learned-policy arm-base workspace segment predicate.
+
+    Joint policy keeps its hot-path workspace check independent of MPlib and
+    collision resources. ``ArmFK`` returns the EEF in arm-base coordinates,
+    which is the configured policy workspace frame.
+    """
+    workspace_bounds = np.asarray(config.workspace_bounds, dtype=np.float64)
+    if (
+        workspace_bounds.shape != (3, 2)
+        or not np.all(np.isfinite(workspace_bounds))
+        or np.any(workspace_bounds[:, 0] > workspace_bounds[:, 1])
+    ):
+        raise ValueError("workspace bounds must be finite shape (3, 2) and ordered")
+    arm_fk = make_arm_fk()
+
+    def is_workspace_segment_safe(
+        start_arm_qpos: np.ndarray,
+        end_arm_qpos: np.ndarray,
+    ) -> bool:
+        """Check every 0.02-rad interpolated EEF sample against workspace."""
+        try:
+            path = interpolate_waypoints(
+                np.stack([start_arm_qpos, end_arm_qpos]),
+                max_step=_POLICY_WORKSPACE_INTERPOLATION_MAX_STEP_RAD,
+            )
+            for arm_qpos in path:
+                eef_position_base, _ = arm_fk.compute(arm_qpos)
+                eef_position_base = np.asarray(eef_position_base, dtype=np.float64)
+                if (
+                    eef_position_base.shape != (3,)
+                    or not np.all(np.isfinite(eef_position_base))
+                    or np.any(
+                        eef_position_base
+                        < workspace_bounds[:, 0] - WORKSPACE_BOUNDS_TOLERANCE_M
+                    )
+                    or np.any(
+                        eef_position_base
+                        > workspace_bounds[:, 1] + WORKSPACE_BOUNDS_TOLERANCE_M
+                    )
+                ):
+                    return False
+        except Exception:
+            return False
+        return True
+
+    return is_workspace_segment_safe
+
+
+def _build_policy_safety_gate(
+    config: CoordinatorConfig,
+) -> SafetyGate:
+    """Build the real-time policy gate; return_home owns collision planning."""
+    return SafetyGate(
+        arm_joint_lower_rad=config.arm_joint_lower_rad,
+        arm_joint_upper_rad=config.arm_joint_upper_rad,
+        hand_joint_lower_rad=config.hand_joint_lower_rad,
+        hand_joint_upper_rad=config.hand_joint_upper_rad,
+        workspace_check=_build_policy_workspace_check(config),
+        max_arm_delta_rad=config.arm_max_delta_rad_per_tick,
+        max_hand_delta_rad=config.hand_max_delta_rad_per_tick,
+        endpoint_delta_tolerance_rad=config.endpoint_delta_tolerance_rad,
+    )
 
 
 def action_chunk_from_record(rec: np.void) -> ActionChunk:
@@ -806,34 +985,8 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
         label="coordinator hand",
     )
 
-    # Deployment uses the arm-base workspace gate + the full 19-DoF collision
-    # model (hand + static boxes) so EE->IK and the transition collision gate
-    # see the hand geometry.  Table clearance is not part of the policy gate.
-    planner = XArm7MotionPlanner(
-        XArm7PlannerConfig(
-            urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
-            srdf_path=str(XARM7_XHAND_SRDF_PATH),
-            base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
-            workspace_bounds=np.asarray(config.workspace_bounds, dtype=np.float64),
-        ),
-        teleop_profile=TeleopProfile(
-            max_pose_error_pos_m=config.ik_max_pose_error_pos_m,
-            max_pose_error_rot_rad=config.ik_max_pose_error_rot_rad,
-        ),
-        hand_dof=True,
-        static_boxes=config.static_boxes,
-    )
-    gate = planner_action_safety_gate(
-        planner=planner,
-        arm_joint_lower_rad=config.arm_joint_lower_rad,
-        arm_joint_upper_rad=config.arm_joint_upper_rad,
-        hand_joint_lower_rad=config.hand_joint_lower_rad,
-        hand_joint_upper_rad=config.hand_joint_upper_rad,
-        max_arm_delta_rad=config.arm_max_delta_rad_per_tick,
-        max_hand_delta_rad=config.hand_max_delta_rad_per_tick,
-        endpoint_delta_tolerance_rad=config.endpoint_delta_tolerance_rad,
-        collision_check=planner.collision_model.check_transition_collision_free,
-    )
+    gate = _build_policy_safety_gate(config)
+    ee_planner: XArm7MotionPlanner | None = None
     metrics = Metrics()
 
     shared.set_heartbeat("policy", time.monotonic())
@@ -853,10 +1006,11 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
     ):
         return
 
-    period_s = 1.0 / float(config.control_hz)
-    step_dt_ns = int(round(period_s * 1e9))
+    control_period_s = 1.0 / float(config.control_hz)
+    step_dt_ns = int(round(control_period_s * 1e9))
     max_source_to_command_age_ns = int(config.max_source_to_command_age_s * 1e9)
     max_silence_ns = int(config.max_command_silence_s * 1e9)
+    command_progress_timeout_ns = int(config.command_progress_timeout_s * 1e9)
     first_command_timeout_ns = int(config.first_command_timeout_s * 1e9)
     sync_mode = config.inference_mode == "sync"
     scheduler_generation: int | None = None
@@ -866,19 +1020,62 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
     last_valid_policy_command_ns: int | None = None
     # RUNNING start time, for the first-command timeout.
     run_started_ns: int | None = None
-    pending_acknowledgement: _PendingAcknowledgement | None = None
+    command_progress = _CommandProgressWatchdog()
+    pending_truncation_action_id: int | None = None
     previous_arm_command_qpos: np.ndarray | None = None
+    next_endpoint_due_ns: int | None = None
+    last_publication_monotonic_ns: int | None = None
     episode_steps = _EpisodeActionSteps(config.max_action_steps)
     last_metrics_flush_ns = time.monotonic_ns()
+    rate = LoopRate(
+        config.coordinator_hz,
+        label="policy coordinator",
+        busy_wait=False,
+    )
 
     def reset_scheduler(*, generation: int | None, clear_request: bool) -> None:
         """Clear ActionChunk scheduling state at a lifecycle fence."""
         nonlocal scheduler_generation, last_seen_chunk_key, active_execution
+        nonlocal next_endpoint_due_ns, last_publication_monotonic_ns
+        nonlocal pending_truncation_action_id
         scheduler_generation = generation
         last_seen_chunk_key = None
         active_execution = None
+        next_endpoint_due_ns = None
+        last_publication_monotonic_ns = None
+        pending_truncation_action_id = None
+        command_progress.reset(run_generation=generation)
         if sync_mode and clear_request:
             shared.inference_request.clear()
+
+    def consume_endpoint_slot(
+        *,
+        endpoint_due_ns: int,
+        terminal_monotonic_ns: int,
+        publication_monotonic_ns: int | None = None,
+    ) -> None:
+        """Advance one terminal policy slot and record its timing diagnostics."""
+        nonlocal next_endpoint_due_ns, last_publication_monotonic_ns
+        schedule_lateness_ms = max(0, terminal_monotonic_ns - endpoint_due_ns) / 1e6
+        metrics.observe(ENDPOINT_SCHEDULE_LATENESS_MS, schedule_lateness_ms)
+        metrics.observe_timing(ENDPOINT_SCHEDULE_LATENESS_MS, schedule_lateness_ms)
+        next_endpoint_due_ns = _advance_endpoint_due_ns(
+            endpoint_due_ns,
+            terminal_monotonic_ns,
+            step_dt_ns,
+        )
+        if publication_monotonic_ns is None:
+            return
+        if last_publication_monotonic_ns is not None:
+            publication_interval_ms = (
+                publication_monotonic_ns - last_publication_monotonic_ns
+            ) / 1e6
+            metrics.observe(PUBLICATION_INTERVAL_MS, publication_interval_ms)
+            metrics.observe_timing(
+                PUBLICATION_INTERVAL_MS,
+                publication_interval_ms,
+            )
+        last_publication_monotonic_ns = publication_monotonic_ns
 
     def finish_active_endpoint(candidate: ActionCandidate | None) -> None:
         """Finalize one endpoint; sync requests inference only at chunk end."""
@@ -907,20 +1104,33 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
         """Finalize one explicit motion/staleness rejection without a token."""
         finish_active_endpoint(None)
 
-    def record_terminal_step(*, applied: bool) -> bool:
+    def record_terminal_step(
+        *,
+        successful: bool,
+        wait_for_action_id: int | None = None,
+    ) -> bool:
         """Account one terminal endpoint and truncate before another selection."""
-        nonlocal pending_acknowledgement
+        nonlocal pending_truncation_action_id
         nonlocal last_valid_policy_command_ns, run_started_ns
         nonlocal previous_arm_command_qpos
         reached_limit = (
-            episode_steps.record_applied()
-            if applied
+            episode_steps.record_successful()
+            if successful
             else episode_steps.record_safety_rejected()
         )
         metrics.increment(EPISODE_ACTION_STEPS)
-        metrics.increment(APPLIED_ACTION_STEPS if applied else SAFETY_REJECTED_STEPS)
+        metrics.increment(
+            SUCCESSFUL_ACTION_STEPS if successful else SAFETY_REJECTED_STEPS
+        )
         if not reached_limit:
             return False
+        if config.execute and successful:
+            if wait_for_action_id is None or wait_for_action_id <= 0:
+                raise RuntimeError(
+                    "physical action-step limit requires its published action ID"
+                )
+            pending_truncation_action_id = wait_for_action_id
+            return True
         _end_policy_run(
             shared,
             "action_step_limit",
@@ -928,7 +1138,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
             metrics=metrics,
             summary_status="TRUNCATED",
         )
-        pending_acknowledgement = None
+        pending_truncation_action_id = None
         reset_scheduler(generation=None, clear_request=True)
         last_valid_policy_command_ns = None
         run_started_ns = None
@@ -936,8 +1146,8 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
         return True
 
     def fault_physical(reason: str, *, metric: str) -> None:
-        """Latch FAULT for a physical publication or acknowledgement failure."""
-        nonlocal pending_acknowledgement
+        """Latch FAULT for a physical publication or progress failure."""
+        nonlocal pending_truncation_action_id
         nonlocal last_valid_policy_command_ns, run_started_ns
         nonlocal previous_arm_command_qpos
         shared.error_state.value = True
@@ -949,7 +1159,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
         metrics.increment(metric)
         metrics.flush(prefix="coordinator metrics")
         metrics.log_episode_summary(status="FAULTED", reason=reason)
-        pending_acknowledgement = None
+        pending_truncation_action_id = None
         reset_scheduler(generation=None, clear_request=True)
         last_valid_policy_command_ns = None
         run_started_ns = None
@@ -957,14 +1167,14 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
 
     def abort_and_reset(reason: str, *, metric: str) -> None:
         """Fail closed and synchronously invalidate every buffered endpoint."""
-        nonlocal pending_acknowledgement
+        nonlocal pending_truncation_action_id
         nonlocal last_valid_policy_command_ns, run_started_ns
         nonlocal previous_arm_command_qpos
         if config.execute:
             fault_physical(reason, metric=metric)
             return
         _end_policy_run(shared, reason, abort=True, metrics=metrics, metric=metric)
-        pending_acknowledgement = None
+        pending_truncation_action_id = None
         reset_scheduler(generation=None, clear_request=True)
         last_valid_policy_command_ns = None
         run_started_ns = None
@@ -972,7 +1182,6 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
 
     try:
         while shared.is_running.value:
-            tick_start = time.monotonic()
             now_ns = time.monotonic_ns()
             shared.set_heartbeat("policy", time.monotonic())
 
@@ -991,7 +1200,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         status="INTERRUPTED",
                         reason="operator quit",
                     )
-                pending_acknowledgement = None
+                pending_truncation_action_id = None
                 reset_scheduler(generation=None, clear_request=True)
                 return
 
@@ -1005,12 +1214,12 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     ),
                 )
                 shared.physical_home_completed.value = False
-                pending_acknowledgement = None
+                pending_truncation_action_id = None
                 last_valid_policy_command_ns = None
                 run_started_ns = None
                 previous_arm_command_qpos = None
                 reset_scheduler(generation=None, clear_request=True)
-                _sleep_tick(period_s, tick_start)
+                rate.wait()
                 continue
 
             # S fences motion in the keyboard callback before this process can
@@ -1037,25 +1246,18 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         if stop_request is StopRequest.RUN_TIME_LIMIT
                         else "operator stop"
                     )
-                    if stop_request is StopRequest.RUN_TIME_LIMIT and config.execute:
-                        if pending_acknowledgement is not None:
-                            fault_physical(
-                                "run time limit reached before worker acknowledgement",
-                                metric=ACK_TIMEOUT,
-                            )
-                            continue
                     _end_policy_run(
                         shared,
                         stop_reason,
                         abort=False,
                         metrics=metrics,
                     )
-                    pending_acknowledgement = None
+                    pending_truncation_action_id = None
                     reset_scheduler(generation=None, clear_request=True)
                     last_valid_policy_command_ns = None
                     run_started_ns = None
                     previous_arm_command_qpos = None
-                    _sleep_tick(period_s, tick_start)
+                    rate.wait()
                     continue
 
             # ARMED idle: wait for the operator to request a new run (B).
@@ -1064,11 +1266,11 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 # the stop-request read above. Preserve the active episode and
                 # settle its request on the next tick instead of losing it.
                 if run_started_ns is not None:
-                    _sleep_tick(period_s, tick_start)
+                    rate.wait()
                     continue
                 if scheduler_generation is not None or active_execution is not None:
                     reset_scheduler(generation=None, clear_request=True)
-                pending_acknowledgement = None
+                pending_truncation_action_id = None
                 last_valid_policy_command_ns = None
                 run_started_ns = None
                 previous_arm_command_qpos = None
@@ -1085,19 +1287,19 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         ):
                             shared.stop_request.value = int(StopRequest.NONE)
                 if not bool(shared.start_request.value):
-                    _sleep_tick(period_s, tick_start)
+                    rate.wait()
                     continue
                 start_pose_rejection = _physical_start_pose_rejection(shared, config)
                 if start_pose_rejection is not None:
                     with shared.motion_lock:
                         shared.start_request.value = False
                     logger.warning("coordinator: ignored B: %s", start_pose_rejection)
-                    _sleep_tick(period_s, tick_start)
+                    rate.wait()
                     continue
                 run_epoch = begin_requested_motion(shared)
                 if run_epoch is None:
                     # A newer S or lifecycle transition won the same lock.
-                    _sleep_tick(period_s, tick_start)
+                    rate.wait()
                     continue
                 logger.info(
                     "coordinator_loop: RUNNING (run_generation=%d)",
@@ -1121,16 +1323,16 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 )
                 episode_steps.reset()
                 metrics.increment(EPISODE_ACTION_STEPS, 0)
-                metrics.increment(APPLIED_ACTION_STEPS, 0)
+                metrics.increment(SUCCESSFUL_ACTION_STEPS, 0)
                 metrics.increment(SAFETY_REJECTED_STEPS, 0)
-                pending_acknowledgement = None
+                pending_truncation_action_id = None
                 reset_scheduler(
                     generation=run_epoch.generation,
                     clear_request=True,
                 )
                 if sync_mode:
                     shared.inference_request.set()
-                _sleep_tick(period_s, tick_start)
+                rate.wait()
                 continue
 
             if scheduler_generation != int(shared.run_generation.value):
@@ -1141,66 +1343,38 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     clear_request=True,
                 )
 
-            if pending_acknowledgement is not None:
-                acknowledgement = poll_coupled_command_acknowledgement(
-                    shared,
-                    pending_acknowledgement.candidate,
-                    ticket=pending_acknowledgement.ticket,
-                    arm_feedback_max_age_s=config.arm_feedback_max_age_s,
-                    hand_feedback_max_age_s=config.hand_feedback_max_age_s,
-                )
-                acknowledgement_observed_ns = time.monotonic_ns()
-                acknowledgement_decision = _classify_acknowledgement(
-                    pending_acknowledgement,
-                    acknowledgement,
-                    poll_started_monotonic_ns=now_ns,
-                    observed_monotonic_ns=acknowledgement_observed_ns,
-                )
-                if acknowledgement_decision.action is _AcknowledgementAction.APPLIED:
-                    assert acknowledgement_decision.latency_ms is not None
-                    acknowledged_candidate = pending_acknowledgement.candidate
-                    metrics.increment(ACKNOWLEDGED)
-                    metrics.observe(ACK_LATENCY_MS, acknowledgement_decision.latency_ms)
-                    metrics.observe_timing(
-                        ACK_LATENCY_MS, acknowledgement_decision.latency_ms
-                    )
-                    logger.debug(
-                        "coordinator: action_id=%d acknowledged by arm and hand",
-                        acknowledged_candidate.action_id,
-                    )
-                    pending_acknowledgement = None
-                    metrics.increment(ENDPOINTS_COMMITTED)
-                    try:
-                        reached_limit = _record_terminal_before_finalize(
-                            lambda: record_terminal_step(applied=True),
-                            lambda: finish_active_endpoint(acknowledged_candidate),
+            if config.execute:
+                try:
+                    arm_progress_id, hand_progress_id, progress_feedback_fault = (
+                        _read_healthy_command_progress(
+                            shared,
+                            config,
+                            now_monotonic_ns=now_ns,
                         )
-                    except RuntimeError as exc:
-                        fault_physical(
-                            f"acknowledgement invariant failed: {exc}",
-                            metric=ENDPOINTS_FATAL_REJECTED,
-                        )
-                        continue
-                    if reached_limit:
-                        continue
-                elif acknowledgement_decision.action is _AcknowledgementAction.WAIT:
-                    _sleep_tick(period_s, tick_start)
-                    continue
-                elif (
-                    acknowledgement_decision.action
-                    is _AcknowledgementAction.FAULT_TIMEOUT
-                ):
-                    fault_physical(
-                        acknowledgement_decision.reason,
-                        metric=ACK_TIMEOUT,
                     )
-                    if acknowledgement.status is CommandPublishStatus.APPLIED:
-                        _sleep_tick(period_s, tick_start)
-                    continue
-                else:
+                except Exception as exc:
                     fault_physical(
-                        acknowledgement_decision.reason,
-                        metric=ACK_FAILURE,
+                        f"command progress feedback failed: {type(exc).__name__}",
+                        metric=ENDPOINTS_FATAL_REJECTED,
+                    )
+                    continue
+                if progress_feedback_fault is not None:
+                    fault_physical(
+                        progress_feedback_fault,
+                        metric=ENDPOINTS_FATAL_REJECTED,
+                    )
+                    continue
+                progress_fault = command_progress.observe(
+                    run_generation=int(shared.run_generation.value),
+                    arm_accepted_action_id=arm_progress_id,
+                    hand_accepted_action_id=hand_progress_id,
+                    now_monotonic_ns=now_ns,
+                    timeout_ns=command_progress_timeout_ns,
+                )
+                if progress_fault is not None:
+                    fault_physical(
+                        progress_fault,
+                        metric=COMMAND_PROGRESS_TIMEOUT,
                     )
                     continue
 
@@ -1216,6 +1390,40 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     watchdog_abort_reason,
                     metric=COMMAND_SILENCE_ABORT,
                 )
+                continue
+
+            if config.execute and (
+                command_progress.arm_accepted_action_id is None
+                or command_progress.hand_accepted_action_id is None
+            ):
+                rate.wait()
+                continue
+            if pending_truncation_action_id is not None:
+                if (
+                    command_progress.latest_published_action_id
+                    != pending_truncation_action_id
+                ):
+                    fault_physical(
+                        "action-step truncation watermark changed unexpectedly",
+                        metric=ENDPOINTS_FATAL_REJECTED,
+                    )
+                    continue
+                if not command_progress.latest_publication_is_accepted:
+                    rate.wait()
+                    continue
+                _end_policy_run(
+                    shared,
+                    "action_step_limit",
+                    abort=False,
+                    metrics=metrics,
+                    summary_status="TRUNCATED",
+                )
+                pending_truncation_action_id = None
+                reset_scheduler(generation=None, clear_request=True)
+                last_valid_policy_command_ns = None
+                run_started_ns = None
+                previous_arm_command_qpos = None
+                rate.wait()
                 continue
 
             try:
@@ -1272,7 +1480,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                             metrics.increment(CHUNKS_INGESTED)
 
             if active_execution is None:
-                _sleep_tick(period_s, tick_start)
+                rate.wait()
                 continue
             active_chunk = active_execution.chunk
             try:
@@ -1296,7 +1504,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 if was_sync:
                     shared.inference_request.set()
                 metrics.increment(CHUNKS_STALE)
-                _sleep_tick(period_s, tick_start)
+                rate.wait()
                 continue
 
             if isinstance(active_execution, _SyncExecution):
@@ -1308,22 +1516,21 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 ):
                     active_execution = None
                     metrics.increment(CHUNKS_STALE)
-                    _sleep_tick(period_s, tick_start)
+                    rate.wait()
                     continue
                 scheduled_target_ns = active_execution.scheduled_target_ns(step_dt_ns)
-            if now_ns < scheduled_target_ns:
+            endpoint_due_ns = _scheduled_endpoint_due_ns(
+                scheduled_target_ns,
+                next_endpoint_due_ns,
+            )
+            if now_ns < endpoint_due_ns:
                 if isinstance(active_execution, _AsyncExecution):
-                    time.sleep(
-                        min(
-                            (scheduled_target_ns - now_ns) / 1e9,
-                            _TARGET_WAIT_HEARTBEAT_S,
-                        )
-                    )
+                    rate.wait()
                     # Re-enter through chunk ingest so a newer async result can
                     # replace this selected endpoint before publication.
                     continue
                 else:
-                    _sleep_tick(period_s, tick_start)
+                    rate.wait()
                     continue
             step_index = active_execution.step_index
             active_observation_id = active_chunk.observation_id
@@ -1333,14 +1540,13 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
             assert active_chunk.hand_qpos is not None
             hand_qpos = np.asarray(active_chunk.hand_qpos[step_index], dtype=np.float64)
 
-            _arm_state = read_arm_state_dict(shared)
             if active_chunk.is_ee:
-                # EE -> joint via collision-aware IK.
-                # hand_qpos is loaded into the collision model first so the solve
-                # sees the full 19-DoF geometry.
+                # EE -> joint via kinematics-only IK.  Real-time policy motion
+                # intentionally does not run software collision checks.
+                _arm_state = read_arm_state_dict(shared)
                 if _arm_state is None:
                     metrics.increment(ENDPOINTS_TRANSIENT_DEFERRED)
-                    _sleep_tick(period_s, tick_start)
+                    rate.wait()
                     continue
                 try:
                     arm_issue = diagnose_arm_feedback(
@@ -1362,7 +1568,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 if arm_issue is not None:
                     if arm_issue.code is FeedbackIssueCode.STALE:
                         metrics.increment(ENDPOINTS_TRANSIENT_DEFERRED)
-                        _sleep_tick(period_s, tick_start)
+                        rate.wait()
                         continue
                     abort_and_reset(
                         f"fatal EE arm feedback: {arm_issue.code.value}",
@@ -1378,10 +1584,14 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 try:
                     validate_rot6d_geometry(ee_rot6d, label="policy ee_rot6d")
                 except ValueError:
+                    consume_endpoint_slot(
+                        endpoint_due_ns=endpoint_due_ns,
+                        terminal_monotonic_ns=time.monotonic_ns(),
+                    )
                     metrics.increment(ENDPOINTS_MOTION_DISCARDED)
                     try:
                         reached_limit = _record_terminal_before_finalize(
-                            lambda: record_terminal_step(applied=False),
+                            lambda: record_terminal_step(successful=False),
                             discard_selected_endpoint,
                         )
                     except RuntimeError:
@@ -1392,11 +1602,12 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         continue
                     if reached_limit:
                         continue
-                    _sleep_tick(period_s, tick_start)
+                    rate.wait()
                     continue
                 try:
-                    planner.set_hand_qpos(hand_qpos)
-                    ik_result = planner.solve_teleop_ik(
+                    if ee_planner is None:
+                        ee_planner = _build_policy_planner(config)
+                    ik_result = ee_planner.solve_teleop_ik(
                         Pose(p=ee_pos, q=rot6d_to_quat_wxyz(ee_rot6d)),
                         _arm_state["qpos"],
                         (
@@ -1413,13 +1624,6 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     continue
                 if not ik_result.success or ik_result.qpos is None:
                     failure_kind = getattr(ik_result, "failure_kind", None)
-                    if failure_kind is IKFailureKind.CHECKER_FAILURE:
-                        metrics.increment(IK_CHECKER_REJECTS)
-                        abort_and_reset(
-                            "EE IK collision checker failed",
-                            metric=ENDPOINTS_FATAL_REJECTED,
-                        )
-                        continue
                     if failure_kind is IKFailureKind.INVALID_OUTPUT:
                         abort_and_reset(
                             "EE IK returned non-finite output",
@@ -1429,17 +1633,20 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     if failure_kind not in {
                         IKFailureKind.NO_SOLUTION,
                         IKFailureKind.GEOMETRY_REJECTED,
-                        IKFailureKind.COLLISION,
                     }:
                         abort_and_reset(
                             "EE IK returned an untyped failure",
                             metric=ENDPOINTS_FATAL_REJECTED,
                         )
                         continue
+                    consume_endpoint_slot(
+                        endpoint_due_ns=endpoint_due_ns,
+                        terminal_monotonic_ns=time.monotonic_ns(),
+                    )
                     metrics.increment(ENDPOINTS_MOTION_DISCARDED)
                     try:
                         reached_limit = _record_terminal_before_finalize(
-                            lambda: record_terminal_step(applied=False),
+                            lambda: record_terminal_step(successful=False),
                             discard_selected_endpoint,
                         )
                     except RuntimeError:
@@ -1450,7 +1657,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         continue
                     if reached_limit:
                         continue
-                    _sleep_tick(period_s, tick_start)
+                    rate.wait()
                     continue
                 arm_qpos = np.asarray(ik_result.qpos, dtype=np.float64)
             else:
@@ -1460,12 +1667,12 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 )
                 # Preserve joint-wrap continuity against the command stream.
                 arm_reference = previous_arm_command_qpos
-                if (
-                    arm_reference is None
-                    and _arm_state is not None
-                    and np.all(np.isfinite(_arm_state["qpos"]))
-                ):
-                    arm_reference = _arm_state["qpos"]
+                if arm_reference is None:
+                    _arm_state = read_arm_state_dict(shared)
+                    if _arm_state is not None and np.all(
+                        np.isfinite(_arm_state["qpos"])
+                    ):
+                        arm_reference = _arm_state["qpos"]
                 if arm_reference is not None:
                     arm_qpos = wrap_nearest_equivalent(
                         arm_qpos,
@@ -1504,7 +1711,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         )
                         continue
                     metrics.increment(ENDPOINTS_STALE_DISCARDED)
-                    _sleep_tick(period_s, tick_start)
+                    rate.wait()
                     continue
                 abort_and_reset(
                     "invalid candidate or observation anchor",
@@ -1534,7 +1741,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     required_safety_state=SafetyState.RUNNING,
                     # Leave one full policy tick for both 30 Hz workers to
                     # observe the coupled record.
-                    minimum_delivery_window_s=period_s,
+                    minimum_delivery_window_s=control_period_s,
                 )
             except Exception as exc:
                 abort_and_reset(
@@ -1546,7 +1753,6 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 metrics.increment(HAND_POLICY_ENDPOINT_ROUNDOFF_CANONICALIZED)
             disposition = classify_policy_endpoint_disposition(
                 publish_result,
-                hand_limit_nesting_valid=True,
             )
             if disposition is PolicyEndpointDisposition.COMMIT:
                 validated_only = publish_result.status is CommandPublishStatus.VALIDATED
@@ -1579,11 +1785,17 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     )
                     continue
                 if validated_only:
+                    publication_ns = time.monotonic_ns()
+                    consume_endpoint_slot(
+                        endpoint_due_ns=endpoint_due_ns,
+                        terminal_monotonic_ns=publication_ns,
+                        publication_monotonic_ns=publication_ns,
+                    )
                     metrics.increment(ENDPOINTS_VALIDATED)
-                    metrics.increment(ENDPOINTS_COMMITTED)
                     try:
+                        last_valid_policy_command_ns = publication_ns
                         reached_limit = _record_terminal_before_finalize(
-                            lambda: record_terminal_step(applied=True),
+                            lambda: record_terminal_step(successful=True),
                             lambda: finish_active_endpoint(published_candidate),
                         )
                     except RuntimeError as exc:
@@ -1610,23 +1822,37 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                             metric=ENDPOINTS_FATAL_REJECTED,
                         )
                         continue
-                    pending_acknowledgement = _PendingAcknowledgement(
-                        candidate=published_candidate,
-                        ticket=ticket,
-                        published_monotonic_ns=publication_ns,
-                        acceptance_deadline_monotonic_ns=int(
-                            published_candidate.valid_until_monotonic_ns
-                        ),
-                        observation_deadline_monotonic_ns=(
-                            publication_ns
-                            + int(config.command_acknowledgement_timeout_s * 1e9)
-                        ),
+                    consume_endpoint_slot(
+                        endpoint_due_ns=endpoint_due_ns,
+                        terminal_monotonic_ns=publication_ns,
+                        publication_monotonic_ns=publication_ns,
                     )
+                    try:
+                        command_progress.record_publication(
+                            run_generation=published_candidate.run_generation,
+                            action_id=published_candidate.action_id,
+                            published_monotonic_ns=publication_ns,
+                        )
+                        last_valid_policy_command_ns = publication_ns
+                        reached_limit = _record_terminal_before_finalize(
+                            lambda: record_terminal_step(
+                                successful=True,
+                                wait_for_action_id=published_candidate.action_id,
+                            ),
+                            lambda: finish_active_endpoint(published_candidate),
+                        )
+                    except (RuntimeError, ValueError) as exc:
+                        fault_physical(
+                            f"command progress invariant failed: {exc}",
+                            metric=ENDPOINTS_FATAL_REJECTED,
+                        )
+                        continue
                     logger.debug(
-                        "coordinator: published action_id=%d; awaiting arm/hand acknowledgement",
+                        "coordinator: published action_id=%d; worker progress is asynchronous",
                         published_candidate.action_id,
                     )
-                last_valid_policy_command_ns = now_ns
+                    if reached_limit:
+                        continue
             elif disposition in {
                 PolicyEndpointDisposition.DISCARD_MOTION,
                 PolicyEndpointDisposition.DISCARD_STALE,
@@ -1646,10 +1872,14 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 ):
                     metrics.increment(HAND_PREFLIGHT_REJECTIONS)
                 if disposition is PolicyEndpointDisposition.DISCARD_MOTION:
+                    consume_endpoint_slot(
+                        endpoint_due_ns=endpoint_due_ns,
+                        terminal_monotonic_ns=time.monotonic_ns(),
+                    )
                     metrics.increment(ENDPOINTS_MOTION_DISCARDED)
                     try:
                         reached_limit = _record_terminal_before_finalize(
-                            lambda: record_terminal_step(applied=False),
+                            lambda: record_terminal_step(successful=False),
                             discard_selected_endpoint,
                         )
                     except RuntimeError:
@@ -1682,17 +1912,10 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
             last_metrics_flush_ns = flush_every(
                 metrics, last_ns=last_metrics_flush_ns, prefix="coordinator metrics"
             )
-            _sleep_tick(period_s, tick_start)
+            rate.wait()
     finally:
         metrics.log_episode_summary(
             status="INTERRUPTED",
             reason="coordinator loop exited",
         )
         logger.info("coordinator_loop: exited")
-
-
-def _sleep_tick(period_s: float, tick_start: float) -> None:
-    """Sleep for the remainder of one control tick, if any."""
-    sleep_s = period_s - (time.monotonic() - tick_start)
-    if sleep_s > 0:
-        time.sleep(sleep_s)

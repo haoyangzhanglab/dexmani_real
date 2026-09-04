@@ -109,15 +109,19 @@ class PolicyCompatibilityTest(unittest.TestCase):
             with self.subTest(policy_spec=policy_spec), self.assertRaises(ValueError):
                 _resolved_runtime(policy_spec)
 
-    def test_command_ack_timeout_cannot_outlive_command_validity(self) -> None:
+    def test_command_progress_timeout_cannot_outlive_command_validity(self) -> None:
         with self.assertRaises(ValueError):
             resolve_runtime_config(
                 data={
                     "policy": {
                         "action_validity_s": 0.5,
-                        "command_acknowledgement_timeout_s": 0.6,
+                        "command_progress_timeout_s": 0.6,
                     }
                 }
+            )
+        with self.assertRaises(TypeError):
+            resolve_runtime_config(
+                data={"policy": {"command_acknowledgement_timeout_s": 0.5}}
             )
 
     def test_runtime_timing_is_strictly_resolved_and_worker_config_pickles(
@@ -132,7 +136,7 @@ class PolicyCompatibilityTest(unittest.TestCase):
             "max_source_to_command_age_s",
             "max_command_silence_s",
             "action_validity_s",
-            "command_acknowledgement_timeout_s",
+            "command_progress_timeout_s",
             "first_command_timeout_s",
         )
         for name in timing_fields:

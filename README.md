@@ -145,7 +145,7 @@ CLI override > YAML file > dexmani_real/config/defaults.py
 ```
 
 Real runtime 配置由 [`config/runtime.py`](dexmani_real/config/runtime.py) 唯一解析、校验、冻结并生成
-SHA-256；learned-policy 的 observation freshness、ACK、action validity 和 watchdog timing
+SHA-256；learned-policy 的 observation freshness、command progress、action validity 和 watchdog timing
 属于其 `policy` 段，模型 shape、modality、horizon 和 inference cadence 则来自 Policy public
 API 的 `PolicySpec`。sync/async 调度模式与 episode action-step 上限由 `run_policy.py` CLI 明确提供。
 `pointcloud` 是与 EEF `policy.workspace` 分离的感知配置段；实时 worker、离线
@@ -246,7 +246,7 @@ coordinator 将通过安全门的策略 endpoint 原子写为单条 coupled comm
 `(run_generation, ring_sequence)` ticket，已被新 record 覆盖或被 motion permit 撤销的 endpoint
 不再执行。B/S 请求与 RUNNING 状态转换由同一个 `motion_lock` 排序；candidate 保留其来源 chunk 的
 generation，policy publication 在写 ring 的原子边界还必须满足 RUNNING + 同 generation。
-`action_id` 保留在 record 与反馈中用于审计和 ACK，不参与 ownership 判定。这保证软件
+`action_id` 保留在 record 与反馈中用于审计和 worker acceptance watermark，不参与 ownership 判定。这保证软件
 IPC 记录一致且保持 latest-wins 实时性，不表示两个执行器物理同步或已完成动作。
 
 实时、离线处理和诊断入口共用 `PointCloudConfig` 与同一个生产 builder。处理顺序为：
@@ -271,17 +271,24 @@ observation 并转换 action。Policy export/restore 会核对模型 encoder 实
 encoder 的字段组合会 fail closed，不会静默忽略输入。
 inference worker 完成 restore 与 warmup 后才置 ready，lifecycle 才允许启动其余
 hardware workers。内部只传播 `execute: bool`：`False` 走完整 candidate validation 后返回，
-不会调用 publication；`True` 发布同一 generation/ticket 的 arm + hand command，并要求两个 worker
-在 candidate validity window 内接受目标。coordinator 仅在匹配 ACK 未于 observation timeout
-内到达时进入 FAULT；实际 SDK acceptance timestamp 超过 candidate validity window 也会 fail
-closed。日常 inference seed 固定为 0，XHand 需求由 `PolicySpec.requires_hand` 决定，不由 CLI
+不会调用 publication；`True` 发布同一 generation/ticket 的 arm + hand command，worker 仅在
+candidate validity window 内接受目标。coordinator 不逐 endpoint 等待 ACK，而是分别监控 arm
+`last_cmd_seq` 与 hand `accepted_target_action_id`；latest-wins 可跳过中间 ID，但持续存在已发布目标且
+任一水位在 `command_progress_timeout_s` 内不前进会 fail closed。日常 inference seed 固定为 0，
+XHand 需求由 `PolicySpec.requires_hand` 决定，不由 CLI
 重复声明。
 
 inference 每次只发布一个带 observation provenance 的不可变 `ActionChunk` 到单槽 latest-wins
 ring。默认 `sync` 在 chunk 完成或因 source stale 丢弃后请求下一次推理；可选 `async` 按
-`n_action_steps * control_dt_s` 的绝对 cadence 推理，并让新 chunk 替换旧 suffix。coordinator 每个
-tick 至多处理一个 endpoint；`--max-action-steps N` 在 N 个 applied/rejected
-terminal steps 后以 `TRUNCATED` 结束 episode。
+`n_action_steps * control_dt_s` 的绝对 cadence 推理，并让新 chunk 替换旧 suffix。coordinator 以
+`coordinator_hz`（默认 128 Hz）轮询且每轮至多处理一个 endpoint，endpoint 仍只在
+`control_hz` control grid（默认 16 Hz）到期时发布；
+`--max-action-steps N` 在 N 个 successful/rejected terminal steps 后停止发布；真机模式会等待
+最后一个已发布 action 被 arm/hand acceptance watermark 覆盖，再以 `TRUNCATED` 结束 episode。
+
+实时策略发布不做软件碰撞插值，保留关节限位、工作空间、时效和 arm/hand 异步进度 watchdog；碰撞响应由
+机械臂控制器灵敏度与现场操作员负责。`H` 的 `return_home` 仍使用手部、静态环境和桌面的
+完整碰撞检查路径。
 
 coordinator 每秒输出 live metrics，并在每个 B→停止/中止/故障/截断边界输出一条 compact
 episode summary。summary 只是在内存中累计的调试信息，不写 receipt、sidecar 或资格证明文件。

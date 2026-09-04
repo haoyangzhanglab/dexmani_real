@@ -159,6 +159,14 @@ def _print_policy_error(message: str) -> None:
     print(f"[POLICY] {message}", file=sys.stderr)
 
 
+def _exception_detail(exc: Exception) -> str:
+    """Keep an owned error readable without hiding its immediate cause."""
+    cause = exc.__cause__
+    if cause is None or not str(cause):
+        return str(exc)
+    return f"{exc}: {cause}"
+
+
 def _print_compatibility_error(message: str) -> None:
     print(f"[COMPAT] {message}", file=sys.stderr)
 
@@ -231,7 +239,9 @@ def _run_check(args: argparse.Namespace) -> int:
         print("READY")
         exit_code = 0
     except Exception as exc:
-        _print_policy_error(f"checkpoint restore or smoke test failed: {exc}")
+        _print_policy_error(
+            f"checkpoint restore or smoke test failed: {_exception_detail(exc)}"
+        )
     finally:
         if policy is not None:
             try:

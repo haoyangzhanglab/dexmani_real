@@ -30,7 +30,7 @@ from dexmani_real.config.defaults import ArmParams
 from dexmani_real.ipc.channels import new_frame
 from dexmani_real.ipc.schema import ARM_STATE_DTYPE, COUPLED_COMMAND_DTYPE
 from dexmani_real.robot.command_validation import check_worker_arm_command
-from dexmani_real.robot.xarm7 import HomeAborted, XArm7
+from dexmani_real.robot.xarm7 import HomeAborted, XArm7, describe_controller_error
 from dexmani_real.runtime.safety import (
     CoupledCommandTicket,
     SafetyState,
@@ -349,7 +349,14 @@ def _handle_servo_command(
     target = np.asarray(action["arm_qpos"][0], dtype=np.float64)
     code = st.arm.servo(target)
     if code != 0:
-        # Non-zero setter return is terminal even if the cached error is 0.
+        # Setter code 1 only means that the controller has an error. Read the
+        # live register here so the terminal fault reports the physical cause.
+        controller_error = st.arm.read_live_error_code()
+        if controller_error != 0:
+            raise RuntimeError(
+                f"set_servo_angle failed (SDK code={code}, controller C{controller_error}: "
+                f"{describe_controller_error(controller_error)})"
+            )
         raise RuntimeError(f"set_servo_angle failed (SDK code={code})")
     accepted_monotonic_ns = time.monotonic_ns()
     st.servo_call_count += 1
@@ -362,7 +369,7 @@ def _handle_servo_command(
     )
 
 
-def _step(st: _LoopState, shared: Any) -> bool:
+def _step(st: _LoopState, shared: Any, limiter: LoopRate) -> bool:
     """Run one iteration; return True when the worker must exit.
 
     Apply at most one command per tick — a queued HOME request takes priority
@@ -378,6 +385,9 @@ def _step(st: _LoopState, shared: Any) -> bool:
             home_request = None
         if home_request is not None:
             _handle_home(st, shared, home_request)
+            # HOME is intentionally blocking; begin a fresh worker schedule
+            # instead of reporting its Mode 0/6 transition as loop overrun.
+            limiter.reset()
         else:
             latest = _read_latest_arm_command(shared)
             if latest is not None:
@@ -438,7 +448,7 @@ def arm_loop(shared, config: ArmParams | None = None) -> None:
                 # Best-effort: cleanup enforces the final state-4 stop.
                 arm.emergency_stop()
                 break
-            if _step(st, shared):
+            if _step(st, shared, limiter):
                 break
             limiter.wait()
     except Exception:

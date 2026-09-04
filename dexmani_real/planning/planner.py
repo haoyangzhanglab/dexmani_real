@@ -24,7 +24,7 @@ from .arm_fk import XArm7Kinematics
 from .candidates import IKCandidateManager, is_mplib_success
 from .collision import CollisionModel
 from .ik import TeleopIKSolver
-from .paths import interpolate_waypoints
+from .paths import WORKSPACE_BOUNDS_TOLERANCE_M, interpolate_waypoints
 from .poses import compute_pose_error, ensure_qpos
 from .types import (
     IKResult,
@@ -42,10 +42,6 @@ __all__ = [
 _PATH_SCORE_JOINT_LENGTH_WEIGHT = 1.0
 _PATH_SCORE_WAYPOINT_DELTA_WEIGHT = 2.0
 _PATH_SCORE_EEF_EFFICIENCY_WEIGHT = 3.0
-
-# Allow a small outward tolerance for nonlinear FK interpolation.
-_WORKSPACE_BOUNDS_TOLERANCE_M = 1e-3
-
 
 class XArm7MotionPlanner:
     """Arm-only xArm7 motion planner with MPlib backend.
@@ -610,8 +606,8 @@ class XArm7MotionPlanner:
                 position = np.full(3, np.nan)
             if (
                 not np.all(np.isfinite(position))
-                or np.any(position < self.workspace_bounds[:, 0] - _WORKSPACE_BOUNDS_TOLERANCE_M)
-                or np.any(position > self.workspace_bounds[:, 1] + _WORKSPACE_BOUNDS_TOLERANCE_M)
+                or np.any(position < self.workspace_bounds[:, 0] - WORKSPACE_BOUNDS_TOLERANCE_M)
+                or np.any(position > self.workspace_bounds[:, 1] + WORKSPACE_BOUNDS_TOLERANCE_M)
             ):
                 report["workspace_violation_index"] = index
                 report["workspace_violation_position_m"] = position.copy()
@@ -631,8 +627,8 @@ class XArm7MotionPlanner:
             if not np.all(np.isfinite(position)):
                 return False
             if (
-                np.any(position < self.workspace_bounds[:, 0] - _WORKSPACE_BOUNDS_TOLERANCE_M)
-                or np.any(position > self.workspace_bounds[:, 1] + _WORKSPACE_BOUNDS_TOLERANCE_M)
+                np.any(position < self.workspace_bounds[:, 0] - WORKSPACE_BOUNDS_TOLERANCE_M)
+                or np.any(position > self.workspace_bounds[:, 1] + WORKSPACE_BOUNDS_TOLERANCE_M)
             ):
                 return False
         return True

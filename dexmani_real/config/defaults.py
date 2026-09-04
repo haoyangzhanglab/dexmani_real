@@ -619,7 +619,9 @@ class PolicyParams:
     """Policy / teleop parameters — single source of truth."""
 
     control_hz: float = 16.0
-    coordinator_hz: float = 64.0
+    # Polling is deliberately faster than the 16 Hz action grid: it shortens
+    # arm/hand progress and sync-result phase delay without raising command rate.
+    coordinator_hz: float = 128.0
     # Learned-policy inference and causal observation timing. Model shape,
     # history, and action horizon remain PolicySpec-owned.
     max_input_age_s: float = 0.15
@@ -628,8 +630,8 @@ class PolicyParams:
     max_source_to_command_age_s: float = 0.75
     max_command_silence_s: float = 2.0
     action_validity_s: float = 0.5
-    # Maximum wait to observe timestamped arm/hand SDK acceptance feedback.
-    command_acknowledgement_timeout_s: float = 0.5
+    # Maximum interval with published work but no arm/hand acceptance progress.
+    command_progress_timeout_s: float = 0.5
     first_command_timeout_s: float = 5.0
     action_apply_timeout_s: float = 0.75
     arm_state_stale_threshold_s: float = 0.5
@@ -681,16 +683,16 @@ class PolicyParams:
             self.max_source_to_command_age_s,
             self.max_command_silence_s,
             self.action_validity_s,
-            self.command_acknowledgement_timeout_s,
+            self.command_progress_timeout_s,
             self.first_command_timeout_s,
         )
         if not all(np.isfinite(value) and value > 0 for value in deployment_timing):
             raise ValueError(
                 "policy deployment timing values must be finite and positive"
             )
-        if self.command_acknowledgement_timeout_s > self.action_validity_s:
+        if self.command_progress_timeout_s > self.action_validity_s:
             raise ValueError(
-                "policy.command_acknowledgement_timeout_s must not exceed "
+                "policy.command_progress_timeout_s must not exceed "
                 "policy.action_validity_s"
             )
         timing = (
