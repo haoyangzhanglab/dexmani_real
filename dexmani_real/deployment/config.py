@@ -9,12 +9,8 @@ identity into the spawned worker; it never imports Policy or Torch.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
-
-import yaml
 
 from dexmani_real.ipc.schema import (
     MAX_POLICY_CHUNK_STEPS,
@@ -29,9 +25,6 @@ FIXED_POLICY_RUNTIME_TARGET = (
 
 _DEPLOYMENT_DEFAULT_MODE = "sync"
 _DEPLOYMENT_MODES = frozenset({"sync", "async"})
-_DEPLOYMENT_SECTIONS = frozenset({"inference", "episode"})
-_DEPLOYMENT_INFERENCE_FIELDS = frozenset({"mode"})
-_DEPLOYMENT_EPISODE_FIELDS = frozenset({"max_action_steps"})
 
 _REQUIRED_POLICY_SPEC_FIELDS = (
     "action_key",
@@ -214,66 +207,6 @@ class PolicyDeploymentConfig:
             raise ValueError("max_action_steps must be a positive integer or null")
 
 
-def _deployment_section(
-    root: Mapping[object, object], name: str, allowed_fields: frozenset[str]
-) -> Mapping[object, object]:
-    """Read and validate one strict deployment YAML section."""
-    raw = root.get(name, {})
-    if not isinstance(raw, Mapping):
-        raise TypeError(f"deployment config section {name!r} must be an object")
-    unknown = set(raw) - allowed_fields
-    if unknown:
-        raise TypeError(
-            f"unknown deployment config field(s) in {name}: {sorted(map(str, unknown))}"
-        )
-    return raw
-
-
-def resolve_policy_deployment_config(
-    *,
-    yaml_path: str | Path | None = None,
-    inference_mode: str | None = None,
-    max_action_steps: int | None = None,
-) -> PolicyDeploymentConfig:
-    """Resolve ``CLI > deployment YAML > defaults``.
-
-    Deployment YAML intentionally has a narrow schema.  It must not be passed
-    to the broader Real runtime resolver because scheduler choices are not
-    hardware, calibration, or low-level safety configuration.
-    """
-    file_mode: Any = _DEPLOYMENT_DEFAULT_MODE
-    file_max_action_steps: Any = None
-    if yaml_path is not None:
-        path = Path(yaml_path)
-        with path.open("r", encoding="utf-8") as stream:
-            loaded = yaml.safe_load(stream)
-        if loaded is None:
-            loaded = {}
-        if not isinstance(loaded, Mapping):
-            raise TypeError("deployment config root must be an object")
-        unknown = set(loaded) - _DEPLOYMENT_SECTIONS
-        if unknown:
-            raise TypeError(
-                f"unknown deployment config section(s): {sorted(map(str, unknown))}"
-            )
-
-        inference = _deployment_section(
-            loaded, "inference", _DEPLOYMENT_INFERENCE_FIELDS
-        )
-        episode = _deployment_section(loaded, "episode", _DEPLOYMENT_EPISODE_FIELDS)
-        if "mode" in inference:
-            file_mode = inference["mode"]
-        if "max_action_steps" in episode:
-            file_max_action_steps = episode["max_action_steps"]
-
-    return PolicyDeploymentConfig(
-        inference_mode=(file_mode if inference_mode is None else inference_mode),
-        max_action_steps=(
-            file_max_action_steps if max_action_steps is None else max_action_steps
-        ),
-    )
-
-
 @dataclass(frozen=True)
 class PolicyWorkerConfig:
     """Narrow Policy-owned inputs required by the inference child."""
@@ -334,7 +267,6 @@ __all__ = [
     "PolicyDeploymentConfig",
     "PolicyWorkerConfig",
     "policy_observation_fields",
-    "resolve_policy_deployment_config",
     "validate_policy_runtime_compatibility",
     "validate_policy_spec",
 ]

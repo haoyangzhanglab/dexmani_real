@@ -33,7 +33,6 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 _LIFECYCLE_OPTION_FLAGS = {
     "runtime_config": "--runtime-config",
-    "deployment_config": "--deployment-config",
     "inference_mode": "--inference-mode",
     "max_action_steps": "--max-action-steps",
 }
@@ -76,11 +75,6 @@ def _add_lifecycle_options(parser: argparse.ArgumentParser, *, default: object) 
         dest="runtime_config",
         default=default,
         help="optional Real runtime YAML for shadow/run",
-    )
-    parser.add_argument(
-        "--deployment-config",
-        default=default,
-        help="optional Policy deployment YAML (sync/async and episode horizon)",
     )
     parser.add_argument(
         "--inference-mode",
@@ -254,18 +248,17 @@ def _prepare_lifecycle_inputs(
     """Resolve the PolicySpec/Real projection before lifecycle startup."""
     from dexmani_real.config.runtime import resolve_runtime_config
     from dexmani_real.deployment.config import (
+        PolicyDeploymentConfig,
         PolicyWorkerConfig,
-        resolve_policy_deployment_config,
         validate_policy_runtime_compatibility,
     )
 
     if not isinstance(execute, bool):
         raise TypeError("execute must be a boolean")
     runtime = resolve_runtime_config(yaml_path=args.runtime_config)
-    deployment_config = resolve_policy_deployment_config(
-        yaml_path=getattr(args, "deployment_config", None),
-        inference_mode=getattr(args, "inference_mode", None),
-        max_action_steps=getattr(args, "max_action_steps", None),
+    deployment_config = PolicyDeploymentConfig(
+        inference_mode=args.inference_mode,
+        max_action_steps=args.max_action_steps,
     )
     validate_policy_runtime_compatibility(info.spec, runtime)
     worker_config = PolicyWorkerConfig(
@@ -361,7 +354,8 @@ def _apply_command_defaults(args: argparse.Namespace) -> None:
     if args.command in {"shadow", "run"}:
         for destination in _LIFECYCLE_OPTION_FLAGS:
             if not hasattr(args, destination):
-                setattr(args, destination, None)
+                default = "sync" if destination == "inference_mode" else None
+                setattr(args, destination, default)
 
 
 def main(argv: list[str] | None = None) -> int:

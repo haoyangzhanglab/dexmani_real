@@ -1,4 +1,0 @@
-inference:
-  mode: sync
-episode:
-  max_action_steps: null

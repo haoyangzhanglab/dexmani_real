@@ -70,14 +70,12 @@ class RunPolicyParserTest(unittest.TestCase):
                 ["check", "dp3/pick/seed0", "--runtime-config", "real.yaml"]
             )
 
-    def test_deployment_options_work_before_and_after_subcommand(self) -> None:
+    def test_lifecycle_options_work_before_and_after_subcommand(self) -> None:
         cli = _load_cli_module()
         parser = cli._parser()
 
         before = parser.parse_args(
             [
-                "--deployment-config",
-                "policy.yaml",
                 "--inference-mode",
                 "async",
                 "--max-action-steps",
@@ -86,7 +84,6 @@ class RunPolicyParserTest(unittest.TestCase):
                 "dp3/pick/seed0",
             ]
         )
-        self.assertEqual(before.deployment_config, "policy.yaml")
         self.assertEqual(before.inference_mode, "async")
         self.assertEqual(before.max_action_steps, 12)
 
@@ -94,20 +91,17 @@ class RunPolicyParserTest(unittest.TestCase):
             [
                 "shadow",
                 "dp3/pick/seed0",
-                "--deployment-config",
-                "policy.yaml",
                 "--inference-mode",
                 "sync",
                 "--max-action-steps",
                 "3",
                 "--runtime-config",
-                "runtime.yaml",
+                "runtime-overrides.yaml",
             ]
         )
-        self.assertEqual(after.deployment_config, "policy.yaml")
         self.assertEqual(after.inference_mode, "sync")
         self.assertEqual(after.max_action_steps, 3)
-        self.assertEqual(after.runtime_config, "runtime.yaml")
+        self.assertEqual(after.runtime_config, "runtime-overrides.yaml")
 
     def test_precommand_options_are_rejected_when_unowned(self) -> None:
         cli = _load_cli_module()
@@ -116,11 +110,11 @@ class RunPolicyParserTest(unittest.TestCase):
             contextlib.redirect_stderr(stderr),
             self.assertRaises(SystemExit) as raised,
         ):
-            cli.main(["--deployment-config", "policy.yaml", "check", "dp3/pick/seed0"])
+            cli.main(["--inference-mode", "async", "check", "dp3/pick/seed0"])
 
         self.assertEqual(raised.exception.code, 2)
         self.assertIn(
-            "[CLI] check does not accept --deployment-config", stderr.getvalue()
+            "[CLI] check does not accept --inference-mode", stderr.getvalue()
         )
 
         stderr = io.StringIO()
@@ -188,7 +182,16 @@ class RunPolicyCommandTest(unittest.TestCase):
 
     def test_lifecycle_projection_carries_only_execute_intent(self) -> None:
         info = _experiment_info()
-        args = self.cli._parser().parse_args(["run", info.selector])
+        args = self.cli._parser().parse_args(
+            [
+                "run",
+                info.selector,
+                "--inference-mode",
+                "async",
+                "--max-action-steps",
+                "12",
+            ]
+        )
         runtime = object()
         with (
             patch(
@@ -208,6 +211,8 @@ class RunPolicyCommandTest(unittest.TestCase):
         self.assertEqual(inputs.worker_config.device, args.device)
         self.assertEqual(inputs.worker_config.seed, 0)
         self.assertIs(inputs.worker_config.spec, info.spec)
+        self.assertEqual(inputs.deployment_config.inference_mode, "async")
+        self.assertEqual(inputs.deployment_config.max_action_steps, 12)
         resolve_runtime.assert_called_once_with(yaml_path=args.runtime_config)
         validate_compatibility.assert_called_once_with(info.spec, runtime)
         for retired_name in (

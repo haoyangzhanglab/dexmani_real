@@ -43,15 +43,15 @@ python examples/run_policy.py check <experiment> --device cuda:0
 无 GPU 的开发机可显式使用 `--device cpu` 做离线检查；这不能替代目标 GPU 的时延验证。
 
 `--device` 只属于 `check`、`shadow` 和 `run`。`--runtime-config`、
-`--deployment-config`、`--inference-mode` 与 `--max-action-steps` 只属于
+`--inference-mode` 与 `--max-action-steps` 只属于
 `shadow/run`，不会被 `list/check` 静默接受。为兼容 shell wrapper，这些参数可置于其所属
 `check/shadow/run` 子命令之前或之后。
 
 以下两个命令都会进入真实设备 lifecycle：
 
 ```bash
-python examples/run_policy.py shadow <experiment> [--runtime-config runtime.yaml]
-python examples/run_policy.py run <experiment> [--runtime-config runtime.yaml]
+python examples/run_policy.py shadow <experiment> [--runtime-config <runtime-overrides.yaml>]
+python examples/run_policy.py run <experiment> [--runtime-config <runtime-overrides.yaml>]
 ```
 
 - `shadow` 连接相机、xArm 与 XHand feedback，运行 inference、IK 和 SafetyGate，但
@@ -102,7 +102,7 @@ input freshness、observation skew、source-to-command freshness、ACK timeout�
 watchdog 属于 `ResolvedRuntimeConfig.policy`。模型 action/observation shape、history、horizon 和
 `control_dt_s` 只来自 Policy `PolicySpec`；lifecycle 启动前必须与 Real 配置精确兼容。
 
-调度配置优先级为 CLI > `--deployment-config` YAML > 默认值。默认 `sync`：coordinator 在
+调度由 CLI 直接拥有。默认 `sync`：coordinator 在
 episode 开始和每个 chunk 结束后请求一次推理。可选 `--inference-mode async` 按
 `n_action_steps * control_dt_s` 的绝对 cadence 推理，较新的同 generation chunk latest-wins。
 `--max-action-steps N` 限制每个 episode 的 terminal action steps；达到 N 时以 `TRUNCATED`
@@ -111,7 +111,7 @@ episode 开始和每个 chunk 结束后请求一次推理。可选 `--inference-
 ```bash
 python examples/run_policy.py shadow <experiment> --max-action-steps 32
 python examples/run_policy.py run <experiment> \
-  --deployment-config policy_deployment.yaml --inference-mode async
+  --inference-mode async
 ```
 
 artifact 的唯一观测合同是有序 `observation_fields`。Policy export 从 experiment 的

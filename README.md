@@ -144,10 +144,10 @@ RealSense SDK、HTS hand-tracking SDK、Pinocchio、MPlib、NLopt、
 CLI override > YAML file > dexmani_real/config/defaults.py
 ```
 
-运行时配置由 [`config/runtime.py`](dexmani_real/config/runtime.py) 唯一解析、校验、冻结并生成
+Real runtime 配置由 [`config/runtime.py`](dexmani_real/config/runtime.py) 唯一解析、校验、冻结并生成
 SHA-256；learned-policy 的 observation freshness、ACK、action validity 和 watchdog timing
 属于其 `policy` 段，模型 shape、modality、horizon 和 inference cadence 则来自 Policy public
-API 的 `PolicySpec`。sync/async 调度模式与 episode action-step 上限由独立 deployment 配置拥有。
+API 的 `PolicySpec`。sync/async 调度模式与 episode action-step 上限由 `run_policy.py` CLI 明确提供。
 `pointcloud` 是与 EEF `policy.workspace` 分离的感知配置段；实时 worker、离线
 重建和诊断入口只从该段派生参数，并把策略 ID 与配置 SHA-256 写入 processed/Zarr
 语义。可在不启动硬件的情况下查看遥操作解析结果：
@@ -169,7 +169,7 @@ python examples/collect_teleop.py --print-config
 | 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取并校验 `data.h5` hash 后的原始 `float64` 已发送命令，继续执行完整配置/模型/几何预检；包含多个 source 连续段的产物拒绝物理回放 |
 | learned policy 检查 | `python examples/run_policy.py list`；`python examples/run_policy.py check <experiment> --device <device>` | 仅列出实验，或经 Policy public API strict restore + warmup + synthetic predict；不连接硬件 |
 | learned policy shadow | `python examples/run_policy.py shadow <experiment> [--inference-mode sync\|async] [--max-action-steps N]` | 连接真实 sensor 与 arm/XHand feedback，执行 inference、IK 和 SafetyGate；默认 sync，结构性禁止 actuator publication 与 home |
-| learned policy run | `python examples/run_policy.py run <experiment> [--deployment-config policy_deployment.yaml]` | 连接并控制 xArm7/XHand；默认 sync；每个 episode 都需 H 完成 hand + collision-checked arm home，再以新 B 启动 |
+| learned policy run | `python examples/run_policy.py run <experiment> [--inference-mode sync\|async]` | 连接并控制 xArm7/XHand；默认 sync；每个 episode 都需 H 完成 hand + collision-checked arm home，再以新 B 启动 |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |
@@ -216,15 +216,14 @@ episode 并回到 ARMED；Q 有界退出；ESC 锁存 fault。下一 episode 必
 ```bash
 python examples/run_policy.py run <policy/task/experiment> \
   --device cuda:0 \
-  --runtime-config runtime.yaml \
-  --deployment-config policy_deployment.yaml \
+  --runtime-config <runtime-overrides.yaml> \
   --inference-mode sync \
   --max-action-steps 96
 ```
 
-`shadow` 和 `run` 都支持 `--runtime-config`、`--deployment-config`、`--inference-mode`
-（`sync` 或 `async`）和正整数 `--max-action-steps`；省略时分别使用默认 runtime、默认 deployment
-配置、`sync` 和无限 episode。子命令所属参数可放在子命令前或后。它们都会连接真实设备，运行前必须
+`shadow` 和 `run` 都支持 `--runtime-config`、`--inference-mode`（`sync` 或 `async`）和正整数
+`--max-action-steps`；省略时分别使用 canonical runtime defaults、`sync` 和无限 episode。
+runtime YAML 只需写实际覆盖项。子命令所属参数可放在子命令前或后。它们都会连接真实设备，运行前必须
 确认工作区、标定、急停和操作者授权；推荐顺序是 `check → shadow → run`。
 
 ### Learned policy 实时点云
@@ -281,7 +280,7 @@ closed。日常 inference seed 固定为 0，XHand 需求由 `PolicySpec.require
 inference 每次只发布一个带 observation provenance 的不可变 `ActionChunk` 到单槽 latest-wins
 ring。默认 `sync` 在 chunk 完成或因 source stale 丢弃后请求下一次推理；可选 `async` 按
 `n_action_steps * control_dt_s` 的绝对 cadence 推理，并让新 chunk 替换旧 suffix。coordinator 每个
-tick 至多处理一个 endpoint；`--max-action-steps N`（或 deployment YAML）在 N 个 applied/rejected
+tick 至多处理一个 endpoint；`--max-action-steps N` 在 N 个 applied/rejected
 terminal steps 后以 `TRUNCATED` 结束 episode。
 
 coordinator 每秒输出 live metrics，并在每个 B→停止/中止/故障/截断边界输出一条 compact
