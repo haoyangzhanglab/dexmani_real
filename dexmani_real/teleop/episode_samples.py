@@ -18,6 +18,7 @@ from dexmani_real.ipc.schema import (
     HAND_TACTILE_SUM_SHAPE,
     nan_array,
 )
+from dexmani_real.planning.arm_fk import make_arm_fk
 from dexmani_real.planning.fingertip import compute_fingertip_points_xarm_base
 from dexmani_real.planning.hand_fk import HandKinematics
 from dexmani_real.planning.poses import (
