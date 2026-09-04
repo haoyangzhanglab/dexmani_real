@@ -17,9 +17,11 @@ point-cloud worker is included only for ``point_cloud``.
 
 from __future__ import annotations
 
+import math
 import multiprocessing as mp
 import os
 import threading
+from dataclasses import replace
 from typing import Any
 
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
@@ -58,6 +60,9 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 
+_OBSERVATION_READ_MARGIN = 2
+
+
 def _observation_field_names(policy_spec: Any) -> tuple[str, ...]:
     return tuple(field.name for field in policy_observation_fields(policy_spec))
 
@@ -74,6 +79,81 @@ def _requires_camera(policy_spec: Any) -> bool:
 def _requires_hand_sensor(policy_spec: Any) -> bool:
     requested = set(_observation_field_names(policy_spec))
     return bool(requested & {"joint_state", "contact_force", "fingertip_points"})
+
+
+def _compute_policy_observation_ring_capacities(
+    runtime: ResolvedRuntimeConfig,
+    policy_spec: Any,
+    channels_config: RuntimeChannelsConfig,
+) -> dict[str, int]:
+    """Return deployment-owned history capacities for a policy observation grid."""
+    observation_horizon = policy_spec.n_obs_steps
+    observation_dt_s = policy_spec.control_dt_s
+    max_input_age_s = runtime.policy.max_input_age_s
+    max_observation_skew_s = runtime.policy.max_observation_skew_s
+    max_grid_lag_s = runtime.policy.max_grid_lag_s
+    if (
+        observation_horizon is None
+        or isinstance(observation_horizon, bool)
+        or int(observation_horizon) <= 0
+    ):
+        raise ValueError("deployment observation_horizon must be positive")
+    if (
+        observation_dt_s is None
+        or not math.isfinite(float(observation_dt_s))
+        or float(observation_dt_s) <= 0.0
+    ):
+        raise ValueError("deployment observation_dt_s must be finite and positive")
+    if not math.isfinite(float(max_input_age_s)) or float(max_input_age_s) <= 0.0:
+        raise ValueError("max_input_age_s must be finite and positive")
+    if (
+        not math.isfinite(float(max_observation_skew_s))
+        or float(max_observation_skew_s) < 0.0
+    ):
+        raise ValueError("max_observation_skew_s must be finite and non-negative")
+    if not math.isfinite(float(max_grid_lag_s)) or float(max_grid_lag_s) < 0.0:
+        raise ValueError("max_grid_lag_s must be finite and non-negative")
+
+    horizon = int(observation_horizon)
+    # Observation history lives on the policy control grid. Camera FPS only
+    # determines source frames inside that span, not model temporal spacing.
+    history_span_s = (horizon - 1) * float(observation_dt_s)
+    visual_span_s = history_span_s + float(max_grid_lag_s) + float(max_input_age_s)
+    state_span_s = (
+        visual_span_s + float(max_observation_skew_s)
+        if channels_config.camera_requested
+        else history_span_s
+        + float(max_input_age_s)
+        + float(max_observation_skew_s)
+    )
+    arm_state_ring_maxlen = max(
+        channels_config.arm_state_ring_maxlen,
+        math.ceil(float(runtime.arm.loop_hz) * state_span_s)
+        + _OBSERVATION_READ_MARGIN,
+    )
+    hand_state_ring_maxlen = max(
+        channels_config.hand_state_ring_maxlen,
+        math.ceil(float(runtime.hand.loop_hz) * state_span_s)
+        + _OBSERVATION_READ_MARGIN,
+    )
+    capacities = {
+        "arm_state_ring_maxlen": arm_state_ring_maxlen,
+        "hand_state_ring_maxlen": hand_state_ring_maxlen,
+        "hand_tactile_ring_maxlen": hand_state_ring_maxlen,
+    }
+    if channels_config.camera_requested:
+        capacities["camera_ring_maxlen"] = max(
+            channels_config.camera_ring_maxlen,
+            math.ceil(float(runtime.camera.fps) * visual_span_s)
+            + _OBSERVATION_READ_MARGIN,
+        )
+    if channels_config.pointcloud_requested:
+        capacities["pointcloud_ring_maxlen"] = max(
+            channels_config.pointcloud_ring_maxlen,
+            math.ceil(float(runtime.camera.fps) * visual_span_s)
+            + _OBSERVATION_READ_MARGIN,
+        )
+    return capacities
 
 
 def build_policy_worker_specs(
@@ -225,26 +305,27 @@ def run_policy_deployment(
     ctx = mp.get_context("spawn")
     pointcloud_requested = _requires_pointcloud(policy_spec)
     camera_requested = _requires_camera(policy_spec)
+    channel_config = RuntimeChannelsConfig.from_runtime(
+        runtime,
+        pointcloud_num_points=(
+            next(
+                field.shape[0]
+                for field in policy_observation_fields(policy_spec)
+                if field.name == "point_cloud"
+            )
+            if pointcloud_requested
+            else runtime.pointcloud.num_points
+        ),
+        camera_requested=camera_requested,
+        pointcloud_requested=pointcloud_requested,
+    )
     shared = RuntimeChannels.create(
         prefix=prefix or f"dexmani_policy_{os.getpid()}",
-        config=RuntimeChannelsConfig.from_runtime(
-            runtime,
-            pointcloud_num_points=(
-                next(
-                    field.shape[0]
-                    for field in policy_observation_fields(policy_spec)
-                    if field.name == "point_cloud"
-                )
-                if pointcloud_requested
-                else runtime.pointcloud.num_points
+        config=replace(
+            channel_config,
+            **_compute_policy_observation_ring_capacities(
+                runtime, policy_spec, channel_config
             ),
-            camera_requested=camera_requested,
-            pointcloud_requested=pointcloud_requested,
-            observation_horizon=policy_spec.n_obs_steps,
-            observation_dt_s=float(policy_spec.control_dt_s),
-            max_input_age_s=runtime.policy.max_input_age_s,
-            max_observation_skew_s=runtime.policy.max_observation_skew_s,
-            max_grid_lag_s=runtime.policy.max_grid_lag_s,
         ),
         mp_context=ctx,
     )

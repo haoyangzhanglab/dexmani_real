@@ -123,6 +123,7 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
         )
 
         by_name = {worker.name: worker for worker in specs}
+        self.assertIs(by_name["arm"].args[1], runtime.arm)
         self.assertIs(by_name["inference"].args[-2], deployment)
         self.assertIsNone(by_name["inference"].args[-1])
         self.assertEqual(by_name["policy"].args[-1].inference_mode, "async")
@@ -162,11 +163,7 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
             patch(
                 "dexmani_real.deployment.lifecycle.RuntimeChannels.create",
                 return_value=shared,
-            ),
-            patch(
-                "dexmani_real.deployment.lifecycle.RuntimeChannelsConfig.from_runtime",
-                return_value=object(),
-            ) as channel_config,
+            ) as create_channels,
             patch(
                 "dexmani_real.deployment.lifecycle.build_policy_worker_specs",
                 return_value=specs,
@@ -197,16 +194,22 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
             [by_name["inference"]],
             graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
         )
-        channel_config.assert_called_once_with(
-            runtime,
-            pointcloud_num_points=spec.observation_fields[1].shape[0],
-            camera_requested=True,
-            pointcloud_requested=True,
-            observation_horizon=spec.n_obs_steps,
-            observation_dt_s=spec.control_dt_s,
-            max_input_age_s=runtime.policy.max_input_age_s,
-            max_observation_skew_s=runtime.policy.max_observation_skew_s,
-            max_grid_lag_s=runtime.policy.max_grid_lag_s,
+        final_config = create_channels.call_args.kwargs["config"]
+        self.assertTrue(final_config.camera_requested)
+        self.assertTrue(final_config.pointcloud_requested)
+        self.assertEqual(
+            final_config.pointcloud_num_points,
+            spec.observation_fields[1].shape[0],
+        )
+        self.assertEqual(
+            (
+                final_config.arm_state_ring_maxlen,
+                final_config.hand_state_ring_maxlen,
+                final_config.hand_tactile_ring_maxlen,
+                final_config.camera_ring_maxlen,
+                final_config.pointcloud_ring_maxlen,
+            ),
+            (14, 14, 14, 11, 11),
         )
 
 

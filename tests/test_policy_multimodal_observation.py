@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,7 +14,10 @@ from dexmani_real.deployment.config import (
     PolicyWorkerConfig,
     validate_policy_runtime_compatibility,
 )
-from dexmani_real.deployment.lifecycle import build_policy_worker_specs
+from dexmani_real.deployment.lifecycle import (
+    _compute_policy_observation_ring_capacities,
+    build_policy_worker_specs,
+)
 from dexmani_real.deployment.observation import (
     FrameWindow,
     ObservationBatch,
@@ -48,17 +52,37 @@ def _field(name: str, runtime) -> SimpleNamespace:
     return SimpleNamespace(name=name, shape=shape, dtype=dtype)
 
 
-def _policy_spec(fields: tuple[str, ...], runtime) -> SimpleNamespace:
+def _policy_spec(
+    fields: tuple[str, ...], runtime, *, n_obs_steps: int = 2
+) -> SimpleNamespace:
     return SimpleNamespace(
         action_key="action",
         action_dim=19,
         control_action_dim=19,
         horizon=16,
-        n_obs_steps=2,
+        n_obs_steps=n_obs_steps,
         n_action_steps=8,
         control_dt_s=1.0 / runtime.policy.control_hz,
         requires_hand=True,
         observation_fields=tuple(_field(name, runtime) for name in fields),
+    )
+
+
+def _policy_channels_config(
+    runtime,
+    policy_spec: SimpleNamespace,
+    *,
+    camera_requested: bool = False,
+    pointcloud_requested: bool = False,
+) -> RuntimeChannelsConfig:
+    base = RuntimeChannelsConfig.from_runtime(
+        runtime,
+        camera_requested=camera_requested,
+        pointcloud_requested=pointcloud_requested,
+    )
+    return replace(
+        base,
+        **_compute_policy_observation_ring_capacities(runtime, policy_spec, base),
     )
 
 
@@ -345,17 +369,47 @@ class MultimodalContractTest(unittest.TestCase):
                 rgb_history=mismatched_rgb,
             )
 
-    def test_nonvisual_ring_capacity_covers_history(self) -> None:
+    def test_policy_observation_ring_capacities(self) -> None:
         runtime = resolve_runtime_config()
-        config = RuntimeChannelsConfig.from_runtime(
+        large_windows_runtime = replace(
             runtime,
-            observation_horizon=8,
-            observation_dt_s=0.0625,
-            max_input_age_s=0.25,
-            max_observation_skew_s=0.10,
+            policy=replace(
+                runtime.policy,
+                max_input_age_s=0.8,
+                max_observation_skew_s=0.4,
+                max_grid_lag_s=0.3,
+            ),
         )
-        self.assertGreater(config.arm_state_ring_maxlen, 8)
-        self.assertGreater(config.hand_state_ring_maxlen, 8)
+        cases = (
+            (runtime, 1, False, False, (10, 10, 10, 5, 8)),
+            (runtime, 8, True, False, (26, 26, 26, 23, 8)),
+            (runtime, 8, True, True, (26, 26, 26, 23, 23)),
+            (large_windows_runtime, 8, True, True, (61, 61, 61, 49, 49)),
+        )
+        for (
+            case_runtime,
+            n_obs_steps,
+            camera_requested,
+            pointcloud_requested,
+            expected,
+        ) in cases:
+            with self.subTest(expected=expected):
+                config = _policy_channels_config(
+                    case_runtime,
+                    _policy_spec((), case_runtime, n_obs_steps=n_obs_steps),
+                    camera_requested=camera_requested,
+                    pointcloud_requested=pointcloud_requested,
+                )
+                self.assertEqual(
+                    (
+                        config.arm_state_ring_maxlen,
+                        config.hand_state_ring_maxlen,
+                        config.hand_tactile_ring_maxlen,
+                        config.camera_ring_maxlen,
+                        config.pointcloud_ring_maxlen,
+                    ),
+                    expected,
+                )
 
     def test_pointcloud_request_requires_explicit_camera_request(self) -> None:
         runtime = resolve_runtime_config()
@@ -363,10 +417,6 @@ class MultimodalContractTest(unittest.TestCase):
             RuntimeChannelsConfig.from_runtime(
                 runtime,
                 pointcloud_requested=True,
-                observation_horizon=2,
-                observation_dt_s=0.0625,
-                max_input_age_s=0.25,
-                max_observation_skew_s=0.10,
             )
 
 

@@ -157,15 +157,9 @@ class RuntimeChannelsConfig:
         pointcloud_num_points: int = 1024,
         camera_requested: bool = False,
         pointcloud_requested: bool = False,
-        observation_horizon: int | None = None,
-        observation_dt_s: float | None = None,
-        max_input_age_s: float = 0.0,
-        max_observation_skew_s: float = 0.0,
-        max_grid_lag_s: float = 0.0,
     ) -> "RuntimeChannelsConfig":
         cam = getattr(runtime, "camera")
         pol = getattr(runtime, "policy")
-        arm_cfg = getattr(runtime, "arm")
         hand_cfg = getattr(runtime, "hand")
         bounds = np.array(
             [
@@ -175,89 +169,13 @@ class RuntimeChannelsConfig:
             ],
             dtype=np.float64,
         )
-        arm_state_ring_maxlen = 8
-        hand_state_ring_maxlen = 8
-        hand_tactile_ring_maxlen = 8
-        camera_ring_maxlen = int(cam.ring_maxlen)
-        pointcloud_ring_maxlen = 8
-        if camera_requested or observation_horizon is not None:
-            if (
-                observation_horizon is None
-                or isinstance(observation_horizon, bool)
-                or int(observation_horizon) <= 0
-            ):
-                raise ValueError("deployment observation_horizon must be positive")
-            if (
-                observation_dt_s is None
-                or not math.isfinite(float(observation_dt_s))
-                or float(observation_dt_s) <= 0.0
-            ):
-                raise ValueError(
-                    "deployment observation_dt_s must be finite and positive"
-                )
-            if (
-                not math.isfinite(float(max_input_age_s))
-                or float(max_input_age_s) <= 0.0
-            ):
-                raise ValueError("max_input_age_s must be finite and positive")
-            if (
-                not math.isfinite(float(max_observation_skew_s))
-                or float(max_observation_skew_s) < 0.0
-            ):
-                raise ValueError(
-                    "max_observation_skew_s must be finite and non-negative"
-                )
-            if not math.isfinite(float(max_grid_lag_s)) or float(max_grid_lag_s) < 0.0:
-                raise ValueError("max_grid_lag_s must be finite and non-negative")
-            horizon = int(observation_horizon)
-            # Observation history lives on the policy control grid. Camera FPS
-            # only determines how many source frames may land inside that span;
-            # it is not the model's temporal spacing.
-            history_span_s = (horizon - 1) * float(observation_dt_s)
-            visual_span_s = (
-                history_span_s + float(max_grid_lag_s) + float(max_input_age_s)
-            )
-            state_span_s = (
-                visual_span_s + float(max_observation_skew_s)
-                if camera_requested
-                else history_span_s
-                + float(max_input_age_s)
-                + float(max_observation_skew_s)
-            )
-            arm_state_ring_maxlen = max(
-                arm_state_ring_maxlen,
-                math.ceil(float(arm_cfg.loop_hz) * state_span_s)
-                + _OBSERVATION_READ_MARGIN,
-            )
-            hand_state_ring_maxlen = max(
-                hand_state_ring_maxlen,
-                math.ceil(float(hand_cfg.loop_hz) * state_span_s)
-                + _OBSERVATION_READ_MARGIN,
-            )
-            hand_tactile_ring_maxlen = hand_state_ring_maxlen
-            if camera_requested:
-                camera_ring_maxlen = max(
-                    camera_ring_maxlen,
-                    math.ceil(float(cam.fps) * visual_span_s)
-                    + _OBSERVATION_READ_MARGIN,
-                )
-            if pointcloud_requested:
-                pointcloud_ring_maxlen = max(
-                    pointcloud_ring_maxlen,
-                    math.ceil(float(cam.fps) * visual_span_s)
-                    + _OBSERVATION_READ_MARGIN,
-                )
         return cls(
-            camera_ring_maxlen=camera_ring_maxlen,
+            camera_ring_maxlen=int(cam.ring_maxlen),
             camera_rgb_shape=(int(cam.height), int(cam.width), 3),
             camera_depth_shape=(int(cam.height), int(cam.width)),
             pointcloud_num_points=int(pointcloud_num_points),
             camera_requested=camera_requested,
             pointcloud_requested=pointcloud_requested,
-            arm_state_ring_maxlen=arm_state_ring_maxlen,
-            hand_state_ring_maxlen=hand_state_ring_maxlen,
-            hand_tactile_ring_maxlen=hand_tactile_ring_maxlen,
-            pointcloud_ring_maxlen=pointcloud_ring_maxlen,
             control_hz=float(pol.control_hz),
             hand_home_qpos_rad=tuple(
                 float(value) for value in np.deg2rad(hand_cfg.home_qpos_deg)
@@ -281,7 +199,6 @@ _RING_RESOURCE_NAMES = (
 )
 _QUEUE_RESOURCE_NAMES = ("arm_home_q",)
 _ALLOCATION_ROLLBACK_ATTEMPTS = 2
-_OBSERVATION_READ_MARGIN = 2
 
 # Heartbeat slots use a fixed process-stable order.
 HEARTBEAT_FIELDS: tuple[str, ...] = (
