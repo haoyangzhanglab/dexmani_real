@@ -508,8 +508,8 @@ class CoordinatorConfig:
     inference_mode: str = "sync"
     max_action_steps: int | None = None
     # Full 19-DoF collision model (hand + static boxes) for EE->IK and the
-    # transition collision gate (Phase 6/7); table clearance is not part of the
-    # policy safety gate.
+    # transition collision gate; table clearance is not part of the policy
+    # safety gate.
     static_boxes: tuple = ()
     ik_max_pose_error_pos_m: float = 0.008
     ik_max_pose_error_rot_rad: float = 0.08

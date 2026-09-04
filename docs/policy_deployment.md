@@ -17,10 +17,10 @@ policy/task/experiment
 
 该目录必须包含 `config.yaml`，以及固定 selector
 `checkpoints/deployment_latest.pt`。没有隐式 `latest` experiment 或时间戳猜测。
-所有 artifact 使用 `dexmani.deployment`；其有序
-`data_contract.observation_fields` 是观测输入的唯一持久化声明。每项记录名称、raw shape、
-dtype 和语义。它们都要求 xArm7 + XHand、兼容的控制周期与 IPC chunk 大小，使用 point
-cloud 时还必须匹配点数和 xyzrgb feature。
+所有 artifact 使用 `dexmani.deployment.v2`，根 payload 只有 `_format`、`contract` 和
+`weights`。其中有序 `data_contract.observation_fields` 是观测输入的唯一持久化声明；每项记录
+名称、raw shape、dtype 和语义。它们都要求 xArm7 + XHand、兼容的控制周期与 IPC chunk 大小，
+使用 point cloud 时还必须匹配点数和 xyzrgb feature。
 
 ## 2. 从离线检查到真机
 
@@ -116,7 +116,7 @@ python examples/run_policy.py run <experiment> \
 
 artifact 的唯一观测合同是有序 `observation_fields`。Policy export 从 experiment 的
 `dataset.sensor_modalities` 读取人工选择，并只在该选择、训练数据与 encoder 实际消费字段一致时
-导出；artifact 不再保留重复的 `sensor_modalities` 或版本字段。Real 按字段顺序构造精确的
+导出；artifact 不再保留重复的 `sensor_modalities` 或 contract 外版本字段。Real 按字段顺序构造精确的
 `PolicyObservation.arrays`：RGB 保持 causal raw HWC `uint8`，model-specific preprocessing
 只在 Policy runtime/encoder 内执行；RGB 与 point cloud 共存时必须来自同一 camera sequence、
 generation 与 source timestamp；contact 必须有 fresh/calibrated/unit/source-match 证明；
@@ -137,8 +137,10 @@ coordinator 在每个 episode 结束时另输出一条 `episode summary`，包�
 duration、累计 counters 和固定容量 timing quantiles。
 
 这些 summary 是 log-only experiment diagnostics：不落盘、不做 hash、不生成 receipt、sidecar
-或部署资格证明。是否允许运动仍只由当前 safety state、generation、freshness、SafetyGate、
-worker validation 和 ACK 决定。
+或部署资格证明。ACK 表示 worker 的 SDK 已接受目标，不表示物理到位；coordinator 用实际
+acceptance timestamp 校验 candidate validity window，并只以独立 observation timeout 等待匹配
+反馈。是否允许运动仍只由当前 safety state、generation、freshness、SafetyGate、worker validation
+和 ACK 决定。
 
 B/S 请求、run generation 与 RUNNING 转换在同一个 `motion_lock` 下排序；新鲜 S 不能被正在消费的
 B 覆盖。每个 candidate 固定继承来源 chunk 的 generation，最终 policy publication 仅在原子快照仍为

@@ -217,7 +217,8 @@ aligned 像素 RGB 的均值。processed HDF5 和 Policy Zarr 同时保存并校
 与桌面平面身份，禁止混合不同点云语义的数据。
 
 deployment lifecycle 从 Policy public API 取得只读 `PolicySpec`。唯一的
-`dexmani.deployment` artifact 在 `data_contract.observation_fields` 中按顺序声明每个原始模型
+`dexmani.deployment.v2` artifact 只包含 `_format`、`contract` 和 `weights`；其
+`data_contract.observation_fields` 按顺序声明每个原始模型
 输入的名称、shape、dtype 与语义；训练 experiment 的 `dataset.sensor_modalities` 是导出时唯一的
 人工选择入口，artifact 不再持久化第二份模态列表。Real 只验证自己要投影的 raw shape/dtype、
 19/21D control action、XHand、控制周期与 IPC chunk capacity，并只启动所需 sensor worker。
@@ -228,8 +229,10 @@ encoder 的字段组合会 fail closed，不会静默忽略输入。
 inference worker 完成 restore 与 warmup 后才置 ready，lifecycle 才允许启动其余
 hardware workers。内部只传播 `execute: bool`：`False` 走完整 candidate validation 后返回，
 不会调用 publication；`True` 发布同一 generation/ticket 的 arm + hand command，并要求两个 worker
-在 Real-owned ACK timeout 内都确认，否则进入 FAULT。日常 inference seed 固定为 0，XHand 需求由
-`PolicySpec.requires_hand` 决定，不由 CLI 重复声明。
+在 candidate validity window 内接受目标。coordinator 仅在匹配 ACK 未于 observation timeout
+内到达时进入 FAULT；实际 SDK acceptance timestamp 超过 candidate validity window 也会 fail
+closed。日常 inference seed 固定为 0，XHand 需求由 `PolicySpec.requires_hand` 决定，不由 CLI
+重复声明。
 
 inference 每次只发布一个带 observation provenance 的不可变 `ActionChunk` 到单槽 latest-wins
 ring。默认 `sync` 在 chunk 完成或因 source stale 丢弃后请求下一次推理；可选 `async` 按
