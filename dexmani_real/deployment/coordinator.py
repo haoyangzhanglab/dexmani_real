@@ -25,14 +25,13 @@ from dexmani_real.config.defaults import hand as hand_defaults
 from dexmani_real.config.defaults import policy as policy_defaults
 from dexmani_real.control.action import ActionCandidate
 from dexmani_real.control.publication import (
+    CommandPublishResult,
     CommandPublishStatus,
-    PolicyEndpointDisposition,
     build_action_candidate,
-    classify_policy_endpoint_disposition,
     poll_coupled_command_acknowledgement,
     validate_and_send_candidate,
 )
-from dexmani_real.control.safety_gate import planner_action_safety_gate
+from dexmani_real.control.safety_gate import GateRejectCode, planner_action_safety_gate
 from dexmani_real.deployment.config import PolicyDeploymentConfig
 from dexmani_real.deployment.contracts import ActionChunk
 from dexmani_real.deployment.metrics import (
@@ -96,6 +95,79 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 _TARGET_WAIT_HEARTBEAT_S = 0.05
 _UINT64_MAX = int(np.iinfo(np.uint64).max)
+
+
+class PolicyEndpointDisposition(str, Enum):
+    """Coordinator action for one typed policy endpoint result."""
+
+    COMMIT = "commit"
+    DISCARD_MOTION = "discard_motion"
+    DEFER_TRANSIENT = "defer_transient"
+    DISCARD_STALE = "discard_stale"
+    ABORT_FATAL = "abort_fatal"
+
+
+def classify_policy_endpoint_disposition(
+    result: CommandPublishResult,
+    *,
+    hand_limit_nesting_valid: bool,
+) -> PolicyEndpointDisposition:
+    """Classify a publication result without interpreting diagnostic strings.
+
+    The policy coordinator owns what a typed gate/transport outcome means for
+    one scheduled endpoint.  Existing teleop callers retain their own
+    behavior by not using this classifier.
+    """
+    if result.succeeded:
+        return PolicyEndpointDisposition.COMMIT
+    if result.status is CommandPublishStatus.TEMPORAL_WINDOW_CLOSED:
+        return PolicyEndpointDisposition.DISCARD_STALE
+    if result.status is CommandPublishStatus.HAND_PREFLIGHT_REJECTED:
+        return (
+            PolicyEndpointDisposition.DISCARD_MOTION
+            if hand_limit_nesting_valid
+            else PolicyEndpointDisposition.ABORT_FATAL
+        )
+    if result.status is CommandPublishStatus.GATE_REJECTED:
+        if result.gate_code in {
+            GateRejectCode.ARM_JOINT_LIMIT,
+            GateRejectCode.HAND_JOINT_LIMIT,
+            GateRejectCode.ARM_DELTA_LIMIT,
+            GateRejectCode.WORKSPACE,
+            GateRejectCode.COLLISION_TRANSITION,
+        }:
+            return PolicyEndpointDisposition.DISCARD_MOTION
+        if result.gate_code is GateRejectCode.RUN_GENERATION_MISMATCH:
+            return PolicyEndpointDisposition.DEFER_TRANSIENT
+        # HAND_DELTA_LIMIT must never occur for learned policy (the coordinator
+        # disables this gate); all remaining gate/contract/checker failures are
+        # unsafe implementation or input faults.
+        return PolicyEndpointDisposition.ABORT_FATAL
+    if result.status in {
+        CommandPublishStatus.ARM_FEEDBACK_UNAVAILABLE,
+        CommandPublishStatus.HAND_FEEDBACK_UNAVAILABLE,
+    }:
+        return PolicyEndpointDisposition.DEFER_TRANSIENT
+    if result.status in {
+        CommandPublishStatus.ARM_FEEDBACK_UNHEALTHY,
+        CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY,
+    }:
+        if (
+            result.feedback_issue is not None
+            and result.feedback_issue.code is FeedbackIssueCode.STALE
+        ):
+            return PolicyEndpointDisposition.DEFER_TRANSIENT
+        return PolicyEndpointDisposition.ABORT_FATAL
+    if result.status in {
+        CommandPublishStatus.RUNTIME_STOPPED,
+        CommandPublishStatus.SAFETY_STATE_GATED,
+        CommandPublishStatus.RUN_GENERATION_GATED,
+    }:
+        return PolicyEndpointDisposition.DEFER_TRANSIENT
+    # ESTOP/STICKY are fatal but the coordinator leaves their lifecycle state
+    # untouched. Missing gate, malformed candidates, future feedback time,
+    # acknowledgement failures, and all unknown outcomes fail closed.
+    return PolicyEndpointDisposition.ABORT_FATAL
 
 
 @dataclass(frozen=True)
