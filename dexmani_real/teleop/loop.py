@@ -325,8 +325,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig | None = None) -> 
 
     ctx.teleop_active = False
     ctx.recording_active = False
-    ctx.begin_audio_gate_deadline_s = None
-    ctx.ignore_begin_audio_until_silent = False
     _quiescence = CommandQuiescence()
 
     ctx.quit_pending = False
@@ -384,7 +382,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig | None = None) -> 
         handbase_position_eef_m=_T_eef_handbase_pos,
         handbase_quat_eef_wxyz=_T_eef_handbase_quat_wxyz,
         hand_ramp_total_frames=_hand_ramp_total_frames,
-        audio=audio,
     )
 
     def _transition_shared_or_fault(

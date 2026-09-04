@@ -658,9 +658,6 @@ class PolicyParams:
     hand_enabled: bool = True
     hand_retargeting_type: str = "tag"
     hand_ramp_duration_s: float = 0.5  # smoothstep startup ramp, rate-independent
-    begin_motion_gate_timeout_s: float = (
-        0.35  # begin voice may delay motion by at most this long
-    )
     hand_disconnect_timeout_s: float = 1.0
 
     def __post_init__(self) -> None:
@@ -706,11 +703,6 @@ class PolicyParams:
             raise ValueError(f"ema.alpha_rot={self.ema.alpha_rot} must be in [0, 1]")
         if not np.isfinite(self.hand_ramp_duration_s) or self.hand_ramp_duration_s < 0:
             raise ValueError("hand_ramp_duration_s must be finite and >= 0")
-        if (
-            not np.isfinite(self.begin_motion_gate_timeout_s)
-            or self.begin_motion_gate_timeout_s < 0
-        ):
-            raise ValueError("begin_motion_gate_timeout_s must be finite and >= 0")
         if (
             not np.isfinite(self.max_record_duration_s)
             or not np.isfinite(self.min_record_duration_s)

@@ -31,7 +31,6 @@ from dexmani_real.teleop.action_proposal import (
     compute_target_eef_pose,
 )
 from dexmani_real.teleop.arm_mapper import ArmWristMapper
-from dexmani_real.teleop.audio_feedback import AudioFeedback, update_motion_gate
 from dexmani_real.teleop.camera_freshness import CameraFreshnessTracker
 from dexmani_real.teleop.config import TeleopCommandLimits, TeleopConfig
 from dexmani_real.teleop.control_state import (
@@ -86,7 +85,6 @@ class TeleopGridResources:
     handbase_position_eef_m: np.ndarray
     handbase_quat_eef_wxyz: np.ndarray
     hand_ramp_total_frames: int
-    audio: AudioFeedback
 
 
 @dataclass(frozen=True)
@@ -290,8 +288,6 @@ def _read_control_grid_observation(
     _T_eef_handbase_pos = resources.handbase_position_eef_m
     _T_eef_handbase_quat_wxyz = resources.handbase_quat_eef_wxyz
     _current_grid_anchor_ns = observation_anchor_monotonic_ns
-    audio = resources.audio
-
     def _enter_command_quiescence(reason: str) -> None:
         enter_command_quiescence(
             ctx,
@@ -437,27 +433,11 @@ def _read_control_grid_observation(
     if ctx.teleop_active and vr_stale and not _quiescence.active:
         _enter_command_quiescence("vr_stale")
 
-    # BEGIN remains command-silent until its audio cue releases or times out.
-    _audio_playing = audio.is_playing
-    (
-        _hold_for_audio,
-        ctx.begin_audio_gate_deadline_s,
-        ctx.ignore_begin_audio_until_silent,
-    ) = update_motion_gate(
-        audio_playing=_audio_playing,
-        begin_deadline_s=ctx.begin_audio_gate_deadline_s,
-        ignore_begin_until_silent=ctx.ignore_begin_audio_until_silent,
-        now_s=time.monotonic(),
-    )
-    if ctx.teleop_active and _hold_for_audio and not _quiescence.active:
-        _enter_command_quiescence("audio_gate")
-
     if not ctx.teleop_active or vr_stale or _quiescence.active:
         # Resume only with feedback newer than the quiescence boundary.
         if (
             ctx.teleop_active
             and not vr_stale
-            and not _hold_for_audio
             and _quiescence.active
             and vr_frame is not None
             and (not ctx.hand_available or hand_state is not None)

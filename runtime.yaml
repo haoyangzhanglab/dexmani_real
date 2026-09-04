@@ -247,7 +247,6 @@ policy:
   action_validity_s: 0.5
   arm_max_delta_rad_per_tick: 0.13962634015954636
   arm_state_stale_threshold_s: 0.5
-  begin_motion_gate_timeout_s: 0.35
   command_acknowledgement_timeout_s: 0.5
   control_hz: 16.0
   coordinator_hz: 64.0

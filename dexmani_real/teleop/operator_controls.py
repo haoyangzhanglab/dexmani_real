@@ -388,12 +388,6 @@ def _apply_begin_signal(
     if seeded_qpos is not None:
         ctx.prev_hand_qpos = seeded_qpos
     resources.audio.play("begin")
-    control_period_s = 1.0 / cfg.runtime.policy.control_hz
-    ctx.begin_audio_gate_deadline_s = time.monotonic() + max(
-        0.0,
-        cfg.runtime.policy.begin_motion_gate_timeout_s - control_period_s,
-    )
-    ctx.ignore_begin_audio_until_silent = False
     print(begin_message)
     resources.limiter.reset()
     return True

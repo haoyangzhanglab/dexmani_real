@@ -29,8 +29,6 @@ class TeleopLoopState:
     hand_disconnected_at_s: float | None = None
     teleop_active: bool = False
     recording_active: bool = False
-    begin_audio_gate_deadline_s: float | None = None
-    ignore_begin_audio_until_silent: bool = False
     quit_pending: bool = False
     quit_after_recording: bool = False
     quit_recording_deadline_s: float = 0.0

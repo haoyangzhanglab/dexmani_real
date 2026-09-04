@@ -10,7 +10,7 @@ assets/audio/.  Missing player or file degrades silently to a log warning.
 
 from __future__ import annotations
 
-__all__ = ["AudioFeedback", "update_motion_gate"]
+__all__ = ["AudioFeedback"]
 
 import os
 import shutil
@@ -50,28 +50,6 @@ class _AudioRequest:
     event: str
     path: str
     generation: int
-
-
-def update_motion_gate(
-    *,
-    audio_playing: bool,
-    begin_deadline_s: float | None,
-    ignore_begin_until_silent: bool,
-    now_s: float,
-) -> tuple[bool, float | None, bool]:
-    """Bound how long the begin cue may hold robot motion."""
-    begin_active = begin_deadline_s is not None and now_s < begin_deadline_s
-    if begin_deadline_s is not None and not begin_active:
-        ignore_begin_until_silent = audio_playing
-        begin_deadline_s = None
-
-    if ignore_begin_until_silent:
-        if not audio_playing:
-            ignore_begin_until_silent = False
-        should_hold = False
-    else:
-        should_hold = begin_active or audio_playing
-    return should_hold, begin_deadline_s, ignore_begin_until_silent
 
 
 class AudioFeedback:
