@@ -155,6 +155,8 @@ ARM_STATE_DTYPE = np.dtype(
         ("connected", "<u1"),
         ("tracking_err", "<f8"),
         ("last_cmd_seq", "<u8"),
+        # Monotonic time immediately after the arm SDK accepted last_cmd_seq.
+        ("last_cmd_accepted_monotonic_ns", "<u8"),
         ("last_cmd_is_hold", "<u1"),
         ("source_monotonic_ns", "<u8"),
         # Load-bearing for causal consumer selection (ipc/causal.py,
@@ -180,6 +182,8 @@ HAND_STATE_DTYPE = np.dtype(
         # XHand.send_action(), including a configured-current overrun accepted
         # as grasp contact. This is not physical convergence.
         ("accepted_target_action_id", "<u8"),
+        # Monotonic time immediately after the XHand SDK accepted that target.
+        ("accepted_target_monotonic_ns", "<u8"),
         ("commboard_err", "<i4", HAND_JOINT_SHAPE),
         ("jointboard_err", "<i4", HAND_JOINT_SHAPE),
         ("tipboard_err", "<i4", HAND_JOINT_SHAPE),

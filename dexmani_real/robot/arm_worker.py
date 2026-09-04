@@ -49,10 +49,11 @@ class _CmdState:
 
     seq: int
     is_hold: bool
+    accepted_monotonic_ns: int
 
     @classmethod
     def idle(cls) -> "_CmdState":
-        return cls(0, False)
+        return cls(0, False, 0)
 
 
 @dataclass
@@ -148,6 +149,7 @@ def _write_arm_frame(
     frame["connected"][0] = 1 if connected else 0
     frame["tracking_err"][0] = tracking_err
     frame["last_cmd_seq"][0] = cmd.seq
+    frame["last_cmd_accepted_monotonic_ns"][0] = cmd.accepted_monotonic_ns
     frame["last_cmd_is_hold"][0] = int(cmd.is_hold)
     frame["source_monotonic_ns"][0] = source_ns
     frame["publish_monotonic_ns"][0] = time.monotonic_ns()
@@ -349,12 +351,14 @@ def _handle_servo_command(
     if code != 0:
         # Non-zero setter return is terminal even if the cached error is 0.
         raise RuntimeError(f"set_servo_angle failed (SDK code={code})")
+    accepted_monotonic_ns = time.monotonic_ns()
     st.servo_call_count += 1
     st.last_target = target.copy()  # producer owns 2π canonicalization
     st.last_command_generation = command_generation
     st.last_cmd = _CmdState(
         int(action["action_id"][0]),
         bool(action["is_hold"][0]),
+        accepted_monotonic_ns,
     )
 
 

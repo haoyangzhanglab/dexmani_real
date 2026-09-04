@@ -92,9 +92,30 @@ def _candidate(*, run_generation: int = 1, arm_value: float = 0.0) -> ActionCand
 def _pending_acknowledgement() -> _PendingAcknowledgement:
     return _PendingAcknowledgement(
         candidate=_candidate(),
-        ticket=CoupledCommandTicket(run_generation=1, ring_sequence=2),
+        ticket=CoupledCommandTicket(
+            run_generation=1,
+            ring_sequence=2,
+            published_monotonic_ns=100,
+        ),
         published_monotonic_ns=100,
-        deadline_monotonic_ns=200,
+        acceptance_deadline_monotonic_ns=200,
+        observation_deadline_monotonic_ns=250,
+    )
+
+
+def _acknowledgement(
+    status: CommandPublishStatus,
+    *,
+    arm_accepted_ns: int | None = 150,
+    hand_accepted_ns: int | None = 150,
+    detail: str = "",
+) -> CommandPublishResult:
+    return CommandPublishResult(
+        status,
+        candidate=_candidate(),
+        detail=detail,
+        arm_accepted_monotonic_ns=arm_accepted_ns,
+        hand_accepted_monotonic_ns=hand_accepted_ns,
     )
 
 
@@ -259,7 +280,10 @@ class PolicyCoordinatorRegressionTest(unittest.TestCase):
 
         waiting = _classify_acknowledgement(
             _pending_acknowledgement(),
-            CommandPublishStatus.ACK_PENDING,
+            _acknowledgement(
+                CommandPublishStatus.ACK_PENDING,
+                detail="awaiting hand(last_action_id=0)",
+            ),
             poll_started_monotonic_ns=150,
             observed_monotonic_ns=151,
         )
@@ -267,7 +291,7 @@ class PolicyCoordinatorRegressionTest(unittest.TestCase):
         self.assertEqual(steps.episode_action_steps, 1)
         applied = _classify_acknowledgement(
             _pending_acknowledgement(),
-            CommandPublishStatus.APPLIED,
+            _acknowledgement(CommandPublishStatus.APPLIED),
             poll_started_monotonic_ns=150,
             observed_monotonic_ns=151,
         )
@@ -435,7 +459,7 @@ class PolicyCoordinatorRegressionTest(unittest.TestCase):
         execution = _SyncExecution(_action_chunk(), chunk_start_monotonic_ns=100)
         waiting = _classify_acknowledgement(
             _pending_acknowledgement(),
-            CommandPublishStatus.ACK_PENDING,
+            _acknowledgement(CommandPublishStatus.ACK_PENDING),
             poll_started_monotonic_ns=150,
             observed_monotonic_ns=151,
         )
@@ -444,7 +468,7 @@ class PolicyCoordinatorRegressionTest(unittest.TestCase):
 
         applied = _classify_acknowledgement(
             _pending_acknowledgement(),
-            CommandPublishStatus.APPLIED,
+            _acknowledgement(CommandPublishStatus.APPLIED),
             poll_started_monotonic_ns=150,
             observed_monotonic_ns=151,
         )
@@ -459,7 +483,7 @@ class PolicyCoordinatorRegressionTest(unittest.TestCase):
         )
         waiting = _classify_acknowledgement(
             _pending_acknowledgement(),
-            CommandPublishStatus.ACK_PENDING,
+            _acknowledgement(CommandPublishStatus.ACK_PENDING),
             poll_started_monotonic_ns=150,
             observed_monotonic_ns=151,
         )
@@ -468,7 +492,7 @@ class PolicyCoordinatorRegressionTest(unittest.TestCase):
 
         applied = _classify_acknowledgement(
             _pending_acknowledgement(),
-            CommandPublishStatus.APPLIED,
+            _acknowledgement(CommandPublishStatus.APPLIED),
             poll_started_monotonic_ns=150,
             observed_monotonic_ns=151,
         )
@@ -556,30 +580,44 @@ class PolicyCoordinatorRegressionTest(unittest.TestCase):
             PolicyEndpointDisposition.DISCARD_MOTION,
         )
 
-    def test_ack_timeout_faults_at_deadline(self) -> None:
+    def test_ack_timeout_uses_worker_acceptance_and_observation_deadlines(self) -> None:
         waiting = _classify_acknowledgement(
             _pending_acknowledgement(),
-            CommandPublishStatus.ACK_PENDING,
-            poll_started_monotonic_ns=199,
-            observed_monotonic_ns=200,
+            _acknowledgement(
+                CommandPublishStatus.ACK_PENDING,
+                detail="awaiting hand(last_action_id=0)",
+            ),
+            poll_started_monotonic_ns=249,
+            observed_monotonic_ns=250,
         )
         deadline_timeout = _classify_acknowledgement(
             _pending_acknowledgement(),
-            CommandPublishStatus.ACK_PENDING,
-            poll_started_monotonic_ns=200,
-            observed_monotonic_ns=201,
+            _acknowledgement(
+                CommandPublishStatus.ACK_PENDING,
+                detail="awaiting hand(last_action_id=0)",
+            ),
+            poll_started_monotonic_ns=250,
+            observed_monotonic_ns=251,
         )
         late_applied = _classify_acknowledgement(
             _pending_acknowledgement(),
-            CommandPublishStatus.APPLIED,
-            poll_started_monotonic_ns=199,
-            observed_monotonic_ns=201,
+            _acknowledgement(
+                CommandPublishStatus.APPLIED,
+                arm_accepted_ns=199,
+                hand_accepted_ns=201,
+            ),
+            poll_started_monotonic_ns=249,
+            observed_monotonic_ns=260,
         )
         applied = _classify_acknowledgement(
             _pending_acknowledgement(),
-            CommandPublishStatus.APPLIED,
-            poll_started_monotonic_ns=199,
-            observed_monotonic_ns=200,
+            _acknowledgement(
+                CommandPublishStatus.APPLIED,
+                arm_accepted_ns=199,
+                hand_accepted_ns=200,
+            ),
+            poll_started_monotonic_ns=260,
+            observed_monotonic_ns=300,
         )
 
         self.assertIs(waiting.action, _AcknowledgementAction.WAIT)
@@ -589,12 +627,12 @@ class PolicyCoordinatorRegressionTest(unittest.TestCase):
         )
         self.assertEqual(
             deadline_timeout.reason,
-            "arm/hand acknowledgement timeout",
+            "worker acknowledgement timeout: awaiting hand(last_action_id=0)",
         )
         self.assertIs(late_applied.action, _AcknowledgementAction.FAULT_TIMEOUT)
         self.assertEqual(
             late_applied.reason,
-            "worker acknowledgement arrived after deadline",
+            "hand worker accepted action after deadline",
         )
         self.assertIs(applied.action, _AcknowledgementAction.APPLIED)
         self.assertEqual(applied.latency_ms, 0.0001)
@@ -608,7 +646,7 @@ class PolicyCoordinatorRegressionTest(unittest.TestCase):
             with self.subTest(status=status):
                 decision = _classify_acknowledgement(
                     _pending_acknowledgement(),
-                    status,
+                    _acknowledgement(status),
                     poll_started_monotonic_ns=150,
                     observed_monotonic_ns=151,
                 )

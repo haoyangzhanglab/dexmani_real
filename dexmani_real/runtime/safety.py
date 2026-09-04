@@ -62,6 +62,7 @@ class CoupledCommandTicket:
 
     run_generation: int
     ring_sequence: int
+    published_monotonic_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -244,10 +245,12 @@ def publish_coupled_command_if_motion_permitted(
         sequence = int(shared.coupled_cmd_ring.write(frame))
         if sequence <= 0:
             raise RuntimeError("coupled command ring returned an invalid sequence")
+        published_monotonic_ns = time.monotonic_ns()
         shared.active_coupled_command_sequence.value = sequence
         return CoupledCommandTicket(
             run_generation=permit.run_generation,
             ring_sequence=sequence,
+            published_monotonic_ns=published_monotonic_ns,
         )
 
 

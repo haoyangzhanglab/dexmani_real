@@ -98,6 +98,8 @@ class CommandPublishResult:
     ticket: CoupledCommandTicket | None = None
     feedback_issue: FeedbackIssue | None = None
     hand_roundoff_canonicalized: bool = False
+    arm_accepted_monotonic_ns: int | None = None
+    hand_accepted_monotonic_ns: int | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -164,12 +166,14 @@ def check_runtime_gate(
 class _ArmFeedbackSnapshot:
     qpos: np.ndarray
     last_cmd_seq: int
+    last_cmd_accepted_monotonic_ns: int = 0
 
 
 @dataclass(frozen=True)
 class _HandFeedbackSnapshot:
     qpos: np.ndarray
     accepted_target_action_id: int
+    accepted_target_monotonic_ns: int = 0
 
 
 def _arm_feedback_snapshot(
@@ -208,7 +212,14 @@ def _arm_feedback_snapshot(
             detail=f"arm feedback is unhealthy: {issue.detail}",
             feedback_issue=issue,
         )
-    return _ArmFeedbackSnapshot(qpos.copy(), int(record["last_cmd_seq"])), None
+    return (
+        _ArmFeedbackSnapshot(
+            qpos.copy(),
+            int(record["last_cmd_seq"]),
+            int(record["last_cmd_accepted_monotonic_ns"]),
+        ),
+        None,
+    )
 
 
 def read_hand_feedback(
@@ -257,6 +268,7 @@ def read_hand_feedback(
         _HandFeedbackSnapshot(
             qpos.copy(),
             int(record["accepted_target_action_id"]),
+            int(record["accepted_target_monotonic_ns"]),
         ),
         None,
     )
@@ -388,9 +400,11 @@ def poll_coupled_command_acknowledgement(
 
     The publication owner calls this after a successful coupled write.  It
     never publishes, sleeps, cancels, or changes lifecycle state: callers own
-    the timeout and cancellation policy.  Arm acknowledgement is its
+    the timeout and cancellation policy. Arm acknowledgement is its
     ``last_cmd_seq`` reaching the candidate action id; with a hand target the
-    XHand worker must additionally acknowledge the exact endpoint.
+    XHand worker must additionally acknowledge the exact endpoint. SDK
+    acceptance timestamps distinguish timely execution from delayed feedback
+    observation.
     """
     if (
         ticket.run_generation != int(candidate.run_generation)
@@ -428,7 +442,14 @@ def poll_coupled_command_acknowledgement(
             ),
         )
     arm_acknowledged = arm_feedback.last_cmd_seq == action_id
+    if arm_acknowledged and arm_feedback.last_cmd_accepted_monotonic_ns <= 0:
+        return CommandPublishResult(
+            CommandPublishStatus.ARM_FEEDBACK_UNHEALTHY,
+            candidate=candidate,
+            detail="arm acknowledgement has no SDK acceptance timestamp",
+        )
     hand_acknowledged = candidate.hand_qpos is None
+    hand_accepted_monotonic_ns: int | None = None
     if candidate.hand_qpos is not None:
         hand_feedback, feedback_rejection = read_hand_feedback(
             shared,
@@ -449,16 +470,48 @@ def poll_coupled_command_acknowledgement(
                 ),
             )
         hand_acknowledged = hand_action_id == action_id
+        if hand_acknowledged:
+            if hand_feedback.accepted_target_monotonic_ns <= 0:
+                return CommandPublishResult(
+                    CommandPublishStatus.HAND_FEEDBACK_UNHEALTHY,
+                    candidate=candidate,
+                    detail="hand acknowledgement has no SDK acceptance timestamp",
+                )
+            hand_accepted_monotonic_ns = (
+                hand_feedback.accepted_target_monotonic_ns
+            )
 
     if arm_acknowledged and hand_acknowledged:
-        return CommandPublishResult(CommandPublishStatus.APPLIED, candidate=candidate)
+        return CommandPublishResult(
+            CommandPublishStatus.APPLIED,
+            candidate=candidate,
+            arm_accepted_monotonic_ns=(
+                arm_feedback.last_cmd_accepted_monotonic_ns
+            ),
+            hand_accepted_monotonic_ns=hand_accepted_monotonic_ns,
+        )
     if not coupled_command_ticket_is_current(shared, ticket=ticket):
         return CommandPublishResult(
             CommandPublishStatus.ACK_SUPERSEDED,
             candidate=candidate,
             detail="published command was revoked or superseded before acknowledgement",
         )
-    return CommandPublishResult(CommandPublishStatus.ACK_PENDING, candidate=candidate)
+    pending_workers = []
+    if not arm_acknowledged:
+        pending_workers.append(f"arm(last_action_id={arm_feedback.last_cmd_seq})")
+    if not hand_acknowledged:
+        pending_workers.append(f"hand(last_action_id={hand_action_id})")
+    return CommandPublishResult(
+        CommandPublishStatus.ACK_PENDING,
+        candidate=candidate,
+        detail=f"awaiting {', '.join(pending_workers)}",
+        arm_accepted_monotonic_ns=(
+            arm_feedback.last_cmd_accepted_monotonic_ns
+            if arm_acknowledged
+            else None
+        ),
+        hand_accepted_monotonic_ns=hand_accepted_monotonic_ns,
+    )
 
 
 def build_action_candidate(

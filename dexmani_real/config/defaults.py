@@ -628,6 +628,7 @@ class PolicyParams:
     max_source_to_command_age_s: float = 0.75
     max_command_silence_s: float = 2.0
     action_validity_s: float = 0.5
+    # Maximum wait to observe timestamped arm/hand SDK acceptance feedback.
     command_acknowledgement_timeout_s: float = 0.5
     first_command_timeout_s: float = 5.0
     action_apply_timeout_s: float = 0.75

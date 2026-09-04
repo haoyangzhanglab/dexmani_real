@@ -177,7 +177,8 @@ class _PendingAcknowledgement:
     candidate: ActionCandidate
     ticket: CoupledCommandTicket
     published_monotonic_ns: int
-    deadline_monotonic_ns: int
+    acceptance_deadline_monotonic_ns: int
+    observation_deadline_monotonic_ns: int
 
 
 class _AcknowledgementAction(str, Enum):
@@ -397,28 +398,63 @@ def _chunk_source_deadline_ns(
 
 def _classify_acknowledgement(
     pending: _PendingAcknowledgement,
-    acknowledgement_status: CommandPublishStatus,
+    acknowledgement: CommandPublishResult,
     *,
     poll_started_monotonic_ns: int,
     observed_monotonic_ns: int,
 ) -> _AcknowledgementDecision:
     """Map one non-blocking ACK poll to the coordinator's next action."""
+    acknowledgement_status = acknowledgement.status
     if acknowledgement_status is CommandPublishStatus.APPLIED:
-        if observed_monotonic_ns > pending.deadline_monotonic_ns:
+        accepted_times = {
+            "arm": acknowledgement.arm_accepted_monotonic_ns,
+        }
+        if pending.candidate.hand_qpos is not None:
+            accepted_times["hand"] = acknowledgement.hand_accepted_monotonic_ns
+        if any(value is None or value <= 0 for value in accepted_times.values()):
+            return _AcknowledgementDecision(
+                _AcknowledgementAction.FAULT_REJECTED,
+                reason="applied acknowledgement omitted worker acceptance time",
+            )
+        if any(
+            value is not None
+            and (
+                value < pending.published_monotonic_ns
+                or value > observed_monotonic_ns
+            )
+            for value in accepted_times.values()
+        ):
+            return _AcknowledgementDecision(
+                _AcknowledgementAction.FAULT_REJECTED,
+                reason="worker acceptance timestamp is outside the observed interval",
+            )
+        late_workers = [
+            name
+            for name, value in accepted_times.items()
+            if value is not None
+            and value > pending.acceptance_deadline_monotonic_ns
+        ]
+        if late_workers:
             return _AcknowledgementDecision(
                 _AcknowledgementAction.FAULT_TIMEOUT,
-                reason="worker acknowledgement arrived after deadline",
+                reason=(
+                    f"{'/'.join(late_workers)} worker accepted action after deadline"
+                ),
             )
+        accepted_monotonic_ns = max(
+            value for value in accepted_times.values() if value is not None
+        )
         return _AcknowledgementDecision(
             _AcknowledgementAction.APPLIED,
-            latency_ms=(observed_monotonic_ns - pending.published_monotonic_ns) / 1e6,
+            latency_ms=(accepted_monotonic_ns - pending.published_monotonic_ns)
+            / 1e6,
         )
     if acknowledgement_status is CommandPublishStatus.ACK_PENDING:
-        if poll_started_monotonic_ns < pending.deadline_monotonic_ns:
+        if poll_started_monotonic_ns < pending.observation_deadline_monotonic_ns:
             return _AcknowledgementDecision(_AcknowledgementAction.WAIT)
         return _AcknowledgementDecision(
             _AcknowledgementAction.FAULT_TIMEOUT,
-            reason="arm/hand acknowledgement timeout",
+            reason=f"worker acknowledgement timeout: {acknowledgement.detail}",
         )
     return _AcknowledgementDecision(
         _AcknowledgementAction.FAULT_REJECTED,
@@ -1116,7 +1152,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 acknowledgement_observed_ns = time.monotonic_ns()
                 acknowledgement_decision = _classify_acknowledgement(
                     pending_acknowledgement,
-                    acknowledgement.status,
+                    acknowledgement,
                     poll_started_monotonic_ns=now_ns,
                     observed_monotonic_ns=acknowledgement_observed_ns,
                 )
@@ -1567,15 +1603,23 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                             metric=ENDPOINTS_FATAL_REJECTED,
                         )
                         continue
-                    publication_ns = time.monotonic_ns()
+                    publication_ns = int(ticket.published_monotonic_ns)
+                    if publication_ns <= 0:
+                        fault_physical(
+                            "physical publication omitted its monotonic timestamp",
+                            metric=ENDPOINTS_FATAL_REJECTED,
+                        )
+                        continue
                     pending_acknowledgement = _PendingAcknowledgement(
                         candidate=published_candidate,
                         ticket=ticket,
                         published_monotonic_ns=publication_ns,
-                        deadline_monotonic_ns=min(
-                            int(published_candidate.valid_until_monotonic_ns),
+                        acceptance_deadline_monotonic_ns=int(
+                            published_candidate.valid_until_monotonic_ns
+                        ),
+                        observation_deadline_monotonic_ns=(
                             publication_ns
-                            + int(config.command_acknowledgement_timeout_s * 1e9),
+                            + int(config.command_acknowledgement_timeout_s * 1e9)
                         ),
                     )
                     logger.debug(

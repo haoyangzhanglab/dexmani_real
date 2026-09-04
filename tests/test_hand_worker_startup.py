@@ -104,6 +104,14 @@ class HandWorkerStartupTest(unittest.TestCase):
         np.testing.assert_array_equal(
             shared.hand_state_ring.frames[0]["qpos"][0], state.qpos
         )
+        self.assertEqual(
+            int(
+                shared.hand_state_ring.frames[0][
+                    "accepted_target_monotonic_ns"
+                ][0]
+            ),
+            0,
+        )
 
 
 class CandidatePublicationTest(unittest.TestCase):
@@ -214,6 +222,7 @@ class CandidatePublicationTest(unittest.TestCase):
         arm_feedback = publication._ArmFeedbackSnapshot(
             qpos=np.zeros(7, dtype=np.float64),
             last_cmd_seq=candidate.action_id,
+            last_cmd_accepted_monotonic_ns=110,
         )
         hand_pending = publication._HandFeedbackSnapshot(
             qpos=np.zeros(HAND_JOINT_SHAPE, dtype=np.float64),
@@ -222,6 +231,7 @@ class CandidatePublicationTest(unittest.TestCase):
         hand_applied = publication._HandFeedbackSnapshot(
             qpos=np.zeros(HAND_JOINT_SHAPE, dtype=np.float64),
             accepted_target_action_id=candidate.action_id,
+            accepted_target_monotonic_ns=120,
         )
 
         with (
@@ -258,7 +268,12 @@ class CandidatePublicationTest(unittest.TestCase):
             )
 
         self.assertIs(pending.status, publication.CommandPublishStatus.ACK_PENDING)
+        self.assertEqual(pending.detail, "awaiting hand(last_action_id=0)")
+        self.assertEqual(pending.arm_accepted_monotonic_ns, 110)
+        self.assertIsNone(pending.hand_accepted_monotonic_ns)
         self.assertIs(applied.status, publication.CommandPublishStatus.APPLIED)
+        self.assertEqual(applied.arm_accepted_monotonic_ns, 110)
+        self.assertEqual(applied.hand_accepted_monotonic_ns, 120)
 
 
 class HandHomePublicationTest(unittest.TestCase):

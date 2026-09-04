@@ -172,6 +172,8 @@ class ActionChunkRuntimeChannelsTest(unittest.TestCase):
                 required_state=SafetyState.RUNNING,
             )
             self.assertIsNotNone(ticket)
+            assert ticket is not None
+            self.assertGreater(ticket.published_monotonic_ns, 0)
         finally:
             self.assertTrue(shared.close())
 

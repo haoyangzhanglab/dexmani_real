@@ -140,6 +140,7 @@ def _publish_feedback(
     connected: bool,
     read_failed: bool,
     accepted_target_action_id: int,
+    accepted_target_monotonic_ns: int,
     commboard_err: np.ndarray,
     jointboard_err: np.ndarray,
     tipboard_err: np.ndarray,
@@ -158,6 +159,9 @@ def _publish_feedback(
     frame["connected"][0] = int(connected)
     frame["qpos_stale"][0] = int(read_failed)
     frame["accepted_target_action_id"][0] = int(accepted_target_action_id)
+    frame["accepted_target_monotonic_ns"][0] = int(
+        accepted_target_monotonic_ns
+    )
     frame["commboard_err"][0] = commboard_err
     frame["jointboard_err"][0] = jointboard_err
     frame["tipboard_err"][0] = tipboard_err
@@ -222,6 +226,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
         last_state = initial_state
         last_source_ns = time.monotonic_ns()
         accepted_target_action_id = 0
+        accepted_target_monotonic_ns = 0
         sdk_send_attempts = 0
         exact_target_accepts = 0
         crc_unconfirmed = 0
@@ -244,6 +249,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
             connected=True,
             read_failed=False,
             accepted_target_action_id=accepted_target_action_id,
+            accepted_target_monotonic_ns=accepted_target_monotonic_ns,
             commboard_err=initial_state.commboard_err,
             jointboard_err=initial_state.jointboard_err,
             tipboard_err=initial_state.tipboard_err,
@@ -286,6 +292,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                     connected=hand.is_connected,
                     read_failed=True,
                     accepted_target_action_id=accepted_target_action_id,
+                    accepted_target_monotonic_ns=accepted_target_monotonic_ns,
                     commboard_err=last_state.commboard_err,
                     jointboard_err=last_state.jointboard_err,
                     tipboard_err=last_state.tipboard_err,
@@ -317,6 +324,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                 connected=hand.is_connected,
                 read_failed=False,
                 accepted_target_action_id=accepted_target_action_id,
+                accepted_target_monotonic_ns=accepted_target_monotonic_ns,
                 commboard_err=state.commboard_err,
                 jointboard_err=state.jointboard_err,
                 tipboard_err=state.tipboard_err,
@@ -445,6 +453,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                 # physical convergence or acceptance of an intermediate step.
                 if np.array_equal(bounded, target):
                     accepted_target_action_id = action_id
+                    accepted_target_monotonic_ns = time.monotonic_ns()
                     exact_target_accepts += 1
                     last_exact_target_sequence = sequence_int
             elif send_status is XHandSendStatus.REJECTED:
