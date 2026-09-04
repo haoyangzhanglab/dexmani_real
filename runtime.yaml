@@ -249,7 +249,6 @@ policy:
   arm_state_stale_threshold_s: 0.5
   begin_motion_gate_timeout_s: 0.35
   command_acknowledgement_timeout_s: 0.5
-  command_lead_s: 0.01
   control_hz: 16.0
   coordinator_hz: 64.0
   ema:
@@ -265,13 +264,11 @@ policy:
   ik_max_pose_error_pos_m: 0.02
   ik_max_pose_error_rot_rad: 0.08726646259971647
   ik_nullspace_step_rate_deg_s: 50.0
-  inference_hz: 10.0
   max_command_silence_s: 2.0
   max_consecutive_errors: 10
   max_grid_lag_s: 0.08
   max_input_age_s: 0.15
   max_observation_skew_s: 0.1
-  max_plan_age_s: 1.0
   max_record_duration_s: 60.0
   max_source_to_command_age_s: 0.75
   min_record_duration_s: 1.0

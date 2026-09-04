@@ -23,7 +23,7 @@ from dexmani_real.ipc.schema import (
     HAND_JOINT_SHAPE,
     HAND_STATE_DTYPE,
     HAND_TACTILE_DTYPE,
-    POLICY_PLAN_DTYPE,
+    POLICY_CHUNK_DTYPE,
     RECORD_CONTROL_DTYPE,
     RECORD_STATUS_DTYPE,
     SUPPORTED_POINT_CLOUD_COUNTS,
@@ -60,7 +60,7 @@ class RuntimeChannelsConfig:
     record_control_ring_maxlen: int = 1
     record_sample_ring_maxlen: int = 4
     record_status_ring_maxlen: int = 1
-    policy_plan_ring_maxlen: int = 3
+    policy_chunk_ring_maxlen: int = 1
     pointcloud_num_points: int = 1024
     camera_requested: bool = False
     pointcloud_requested: bool = False
@@ -102,12 +102,14 @@ class RuntimeChannelsConfig:
             self.record_control_ring_maxlen,
             self.record_sample_ring_maxlen,
             self.record_status_ring_maxlen,
-            self.policy_plan_ring_maxlen,
+            self.policy_chunk_ring_maxlen,
             self.pointcloud_ring_maxlen,
             self.arm_home_q_maxsize,
         )
         if any(int(value) <= 0 for value in capacities):
             raise ValueError("RuntimeChannels ring/queue capacities must be positive")
+        if int(self.policy_chunk_ring_maxlen) != 1:
+            raise ValueError("policy_chunk_ring_maxlen must remain exactly 1")
         if not math.isfinite(self.control_hz) or self.control_hz <= 0:
             raise ValueError("RuntimeChannels control_hz must be finite and positive")
         if (
@@ -161,10 +163,6 @@ class RuntimeChannelsConfig:
         max_observation_skew_s: float = 0.0,
         max_grid_lag_s: float = 0.0,
     ) -> "RuntimeChannelsConfig":
-        # Older callers only expressed the derived point-cloud requirement.
-        # A point-cloud worker always consumes camera frames, so preserve that
-        # valid contract while keeping RGB-only deployments explicit.
-        camera_requested = bool(camera_requested or pointcloud_requested)
         cam = getattr(runtime, "camera")
         pol = getattr(runtime, "policy")
         arm_cfg = getattr(runtime, "arm")
@@ -182,22 +180,20 @@ class RuntimeChannelsConfig:
         hand_tactile_ring_maxlen = 8
         camera_ring_maxlen = int(cam.ring_maxlen)
         pointcloud_ring_maxlen = 8
-        if camera_requested:
+        if camera_requested or observation_horizon is not None:
             if (
                 observation_horizon is None
                 or isinstance(observation_horizon, bool)
                 or int(observation_horizon) <= 0
             ):
-                raise ValueError(
-                    "camera-backed deployment requires a positive observation_horizon"
-                )
+                raise ValueError("deployment observation_horizon must be positive")
             if (
                 observation_dt_s is None
                 or not math.isfinite(float(observation_dt_s))
                 or float(observation_dt_s) <= 0.0
             ):
                 raise ValueError(
-                    "camera-backed deployment requires a finite positive observation_dt_s"
+                    "deployment observation_dt_s must be finite and positive"
                 )
             if (
                 not math.isfinite(float(max_input_age_s))
@@ -221,7 +217,13 @@ class RuntimeChannelsConfig:
             visual_span_s = (
                 history_span_s + float(max_grid_lag_s) + float(max_input_age_s)
             )
-            state_span_s = visual_span_s + float(max_observation_skew_s)
+            state_span_s = (
+                visual_span_s + float(max_observation_skew_s)
+                if camera_requested
+                else history_span_s
+                + float(max_input_age_s)
+                + float(max_observation_skew_s)
+            )
             arm_state_ring_maxlen = max(
                 arm_state_ring_maxlen,
                 math.ceil(float(arm_cfg.loop_hz) * state_span_s)
@@ -233,10 +235,12 @@ class RuntimeChannelsConfig:
                 + _OBSERVATION_READ_MARGIN,
             )
             hand_tactile_ring_maxlen = hand_state_ring_maxlen
-            camera_ring_maxlen = max(
-                camera_ring_maxlen,
-                math.ceil(float(cam.fps) * visual_span_s) + _OBSERVATION_READ_MARGIN,
-            )
+            if camera_requested:
+                camera_ring_maxlen = max(
+                    camera_ring_maxlen,
+                    math.ceil(float(cam.fps) * visual_span_s)
+                    + _OBSERVATION_READ_MARGIN,
+                )
             if pointcloud_requested:
                 pointcloud_ring_maxlen = max(
                     pointcloud_ring_maxlen,
@@ -272,7 +276,7 @@ _RING_RESOURCE_NAMES = (
     "record_control_ring",
     "record_sample_ring",
     "record_status_ring",
-    "policy_plan_ring",
+    "policy_chunk_ring",
     "pointcloud_ring",
 )
 _QUEUE_RESOURCE_NAMES = ("arm_home_q",)
@@ -333,7 +337,7 @@ class RuntimeChannels:
     record_control_ring: SharedMemoryRingBuffer  # policy -> RecorderIO episode boundary
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     record_status_ring: SharedMemoryRingBuffer  # RecorderIO -> controller/main
-    policy_plan_ring: SharedMemoryRingBuffer  # inference -> coordinator, latest-wins
+    policy_chunk_ring: SharedMemoryRingBuffer  # inference -> coordinator, single latest
     pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> inference
 
     arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, generation)
@@ -363,6 +367,7 @@ class RuntimeChannels:
     physical_home_completed: Any
     # Main -> coordinator: StopRequest code (S or an explicit run-time limit).
     stop_request: Any
+    inference_request: Any  # coordinator -> inference, sync one-chunk trigger
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write
     # Serializes the motion permit and coupled-command ticket state. It is
@@ -498,10 +503,10 @@ class RuntimeChannels:
             maxlen=cfg.record_status_ring_maxlen,
             create=True,
         )
-        storage.policy_plan_ring = SharedMemoryRingBuffer(
-            f"{prefix}_policy_plan",
-            dtype=POLICY_PLAN_DTYPE,
-            maxlen=cfg.policy_plan_ring_maxlen,
+        storage.policy_chunk_ring = SharedMemoryRingBuffer(
+            f"{prefix}_policy_chunk",
+            dtype=POLICY_CHUNK_DTYPE,
+            maxlen=cfg.policy_chunk_ring_maxlen,
             create=True,
         )
         storage.pointcloud_ring = SharedMemoryRingBuffer(
@@ -532,6 +537,7 @@ class RuntimeChannels:
         storage.start_request = ctx.Value("b", False)
         storage.physical_home_completed = ctx.Value("b", False)
         storage.stop_request = ctx.Value("b", False)
+        storage.inference_request = ctx.Event()
 
         storage.safety_state = ctx.Value("i", int(cfg.initial_safety_state))
         storage.motion_lock = ctx.RLock()

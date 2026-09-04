@@ -18,9 +18,17 @@ import zarr
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.data.contracts import OutputProfile
 from dexmani_real.data.process import (
+    _ACTION_EE_FRAME,
+    _CONTACT_FORCE_FRAME,
+    _CONTACT_FORCE_SI_VERIFIED,
+    _CONTACT_FORCE_UNIT,
+    _FINGERTIP_POINTS_FRAME,
+    _FINGERTIP_POINTS_UNIT,
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
     ProcessedProvenance,
+    _strict_bool_attr,
+    _strict_integer_attr,
     validate_processed_payload,
     validate_processed_provenance,
 )
@@ -188,10 +196,6 @@ def _inspect_artifact(
             profile = OutputProfile(_text(source.attrs.get("profile", "")))
         except ValueError as exc:
             raise ValueError(f"{path.name}: invalid profile") from exc
-        if not profile.needs_pointcloud:
-            raise ValueError(
-                f"{path.name}: Policy Zarr v5 requires a pointcloud processed profile"
-            )
         data_keys = {
             key for key, value in source.items() if isinstance(value, h5py.Dataset)
         }
@@ -243,23 +247,64 @@ def _inspect_artifact(
             "endpoint_delta_tolerance_rad": float(
                 source.attrs.get("endpoint_delta_tolerance_rad", np.nan)
             ),
-            "deployment_equivalent": bool(
-                source.attrs.get("deployment_equivalent", False)
+            "deployment_equivalent": _strict_bool_attr(
+                source.attrs, "deployment_equivalent"
             ),
             "contact_force_unit": _text(source.attrs.get("contact_force_unit", "")),
-            "contact_force_si_verified": bool(
-                source.attrs.get("contact_force_si_verified", False)
+            "contact_force_si_verified": _strict_bool_attr(
+                source.attrs, "contact_force_si_verified"
             ),
             "contact_force_frame": _text(source.attrs.get("contact_force_frame", "")),
+            "contact_force_source": _text(source.attrs.get("contact_force_source", "")),
+            "contact_force_alignment": _text(
+                source.attrs.get("contact_force_alignment", "")
+            ),
+            "contact_force_fresh_required": _strict_bool_attr(
+                source.attrs, "contact_force_fresh_required"
+            ),
+            "contact_force_calibrated_required": _strict_bool_attr(
+                source.attrs, "contact_force_calibrated_required"
+            ),
+            "contact_force_unit_code": _strict_integer_attr(
+                source.attrs, "contact_force_unit_code"
+            ),
+            "contact_force_causal_to_reference": _strict_bool_attr(
+                source.attrs, "contact_force_causal_to_reference"
+            ),
+            "contact_force_hand_source_match_required": _strict_bool_attr(
+                source.attrs, "contact_force_hand_source_match_required"
+            ),
             "fingertip_points_frame": _text(
                 source.attrs.get("fingertip_points_frame", "")
             ),
+            "fingertip_points_unit": _text(
+                source.attrs.get("fingertip_points_unit", "")
+            ),
             "action_ee_frame": _text(source.attrs.get("action_ee_frame", "")),
         }
+        visual_profile = profile.needs_rgb or profile.needs_pointcloud
+        expected_reference = (
+            "camera_source_monotonic_ns"
+            if visual_profile
+            else "grid_anchor_monotonic_ns"
+        )
+        expected_state_alignment = (
+            "camera_source_aligned_state" if visual_profile else "control_grid_state"
+        )
+        expected_contact_source = (
+            "camera_causal_tactile_sum"
+            if visual_profile
+            else "control_grid_tactile_sum"
+        )
+        expected_contact_alignment = (
+            "newest_source_not_after_camera_within_max_observation_skew"
+            if visual_profile
+            else "newest_source_not_after_grid_within_max_observation_skew"
+        )
         if (
             semantics["obs_alignment"] != "obs[t]_before_action[t]"
-            or semantics["observation_reference"] != "camera_source_monotonic_ns"
-            or semantics["state_alignment"] != "camera_source_aligned_state"
+            or semantics["observation_reference"] != expected_reference
+            or semantics["state_alignment"] != expected_state_alignment
             or not np.isfinite(semantics["max_observation_skew_s"])
             or semantics["max_observation_skew_s"] <= 0.0
             or semantics["action_semantics"] != "deployment_grid_rate_limited_target"
@@ -275,10 +320,19 @@ def _inspect_artifact(
             or not np.isfinite(semantics["endpoint_delta_tolerance_rad"])
             or semantics["endpoint_delta_tolerance_rad"] < 0.0
             or not semantics["deployment_equivalent"]
-            or not semantics["contact_force_unit"]
-            or not semantics["contact_force_frame"]
-            or semantics["fingertip_points_frame"] != "xarm_base"
-            or semantics["action_ee_frame"] != "xarm_base"
+            or semantics["contact_force_unit"] != _CONTACT_FORCE_UNIT
+            or semantics["contact_force_si_verified"] is not _CONTACT_FORCE_SI_VERIFIED
+            or semantics["contact_force_frame"] != _CONTACT_FORCE_FRAME
+            or semantics["contact_force_source"] != expected_contact_source
+            or semantics["contact_force_alignment"] != expected_contact_alignment
+            or not semantics["contact_force_fresh_required"]
+            or not semantics["contact_force_calibrated_required"]
+            or semantics["contact_force_unit_code"] != 0
+            or not semantics["contact_force_causal_to_reference"]
+            or not semantics["contact_force_hand_source_match_required"]
+            or semantics["fingertip_points_frame"] != _FINGERTIP_POINTS_FRAME
+            or semantics["fingertip_points_unit"] != _FINGERTIP_POINTS_UNIT
+            or semantics["action_ee_frame"] != _ACTION_EE_FRAME
         ):
             raise ValueError(f"{path.name}: invalid Real core modality semantics")
         if profile.needs_rgb:

@@ -72,6 +72,15 @@ class RunEpoch:
     started_monotonic_ns: int
 
 
+@dataclass(frozen=True)
+class RunStateSnapshot:
+    """Atomic safety state and observation epoch used by worker loops."""
+
+    state: SafetyState
+    generation: int
+    started_monotonic_ns: int
+
+
 def _advance_run_generation_locked(shared: Any) -> int:
     shared.run_generation.value = int(shared.run_generation.value) + 1
     return int(shared.run_generation.value)
@@ -84,6 +93,47 @@ def _read_motion_permit_locked(shared: Any) -> MotionPermit:
     except ValueError:
         state = SafetyState.FAULT
     return MotionPermit(state, int(shared.run_generation.value))
+
+
+def _begin_motion_locked(shared: Any) -> RunEpoch | None:
+    """Enter RUNNING while the caller owns ``motion_lock``."""
+    if (
+        int(shared.safety_state.value) != int(SafetyState.ARMED)
+        or not shared.is_running.value
+        or shared.error_state.value
+        or shared.estop_request.value
+    ):
+        return None
+    generation = _invalidate_coupled_commands_locked(shared)
+    started_ns = time.monotonic_ns()
+    shared.run_started_monotonic_ns.value = started_ns
+    shared.safety_state.value = int(SafetyState.RUNNING)
+    return RunEpoch(generation=generation, started_monotonic_ns=started_ns)
+
+
+def _revoke_motion_locked(
+    shared: Any, new_state: SafetyState
+) -> tuple[SafetyState, int] | None:
+    """Revoke motion while the caller owns ``motion_lock``."""
+    current_value = int(shared.safety_state.value)
+    try:
+        current = SafetyState(current_value)
+    except ValueError:
+        current = SafetyState.FAULT
+        shared.safety_state.value = int(current)
+    if current != new_state and (current, new_state) not in _ALLOWED_TRANSITIONS:
+        logger.error(
+            "safety: rejected revocation transition %s(%d) → %s(%d)",
+            current.name,
+            int(current),
+            new_state.name,
+            int(new_state),
+        )
+        return None
+    generation = _invalidate_coupled_commands_locked(shared)
+    shared.run_started_monotonic_ns.value = 0
+    shared.safety_state.value = int(new_state)
+    return current, generation
 
 
 def _clear_coupled_command_locked(shared: Any) -> None:
@@ -141,11 +191,23 @@ def read_run_epoch(shared: Any) -> RunEpoch:
         )
 
 
+def read_run_state_snapshot(shared: Any) -> RunStateSnapshot:
+    """Read safety state, generation, and epoch start under one motion lock."""
+    with shared.motion_lock:
+        permit = _read_motion_permit_locked(shared)
+        return RunStateSnapshot(
+            state=permit.state,
+            generation=permit.run_generation,
+            started_monotonic_ns=int(shared.run_started_monotonic_ns.value),
+        )
+
+
 def publish_coupled_command_if_motion_permitted(
     shared: Any,
     *,
     expected_run_generation: int,
     frame: Any,
+    required_state: SafetyState | None = None,
 ) -> CoupledCommandTicket | None:
     """Publish one coherent frame and return its unambiguous sequence ticket.
 
@@ -173,8 +235,10 @@ def publish_coupled_command_if_motion_permitted(
         raise ValueError("coupled command must target at least one actuator")
     with shared.motion_lock:
         permit = _read_motion_permit_locked(shared)
-        if not permit.allows_motion or permit.run_generation != int(
-            expected_run_generation
+        if (
+            not permit.allows_motion
+            or permit.run_generation != int(expected_run_generation)
+            or (required_state is not None and permit.state is not required_state)
         ):
             return None
         sequence = int(shared.coupled_cmd_ring.write(frame))
@@ -234,25 +298,106 @@ def coupled_command_ticket_allows_execution(
 def begin_motion(shared: Any) -> bool:
     """Atomically enter RUNNING and advance the command generation."""
     with shared.motion_lock:
+        epoch = _begin_motion_locked(shared)
+    if epoch is None:
+        return False
+    logger.info(
+        "safety: ARMED(%d) → RUNNING(%d), generation=%d epoch_ns=%d",
+        1,
+        2,
+        epoch.generation,
+        epoch.started_monotonic_ns,
+    )
+    return True
+
+
+def begin_requested_motion(shared: Any) -> RunEpoch | None:
+    """Consume one B request and enter RUNNING unless a newer S is pending."""
+    with shared.motion_lock:
+        if not bool(shared.start_request.value) or int(
+            shared.stop_request.value
+        ) != int(StopRequest.NONE):
+            return None
+        epoch = _begin_motion_locked(shared)
+        if epoch is None:
+            return None
+        shared.start_request.value = False
+    logger.info(
+        "safety: consumed B; ARMED(%d) → RUNNING(%d), generation=%d epoch_ns=%d",
+        1,
+        2,
+        epoch.generation,
+        epoch.started_monotonic_ns,
+    )
+    return epoch
+
+
+def request_policy_start(shared: Any, *, require_physical_home: bool) -> bool:
+    """Publish B only after the prior S has been acknowledged."""
+    if not isinstance(require_physical_home, bool):
+        raise TypeError("require_physical_home must be a boolean")
+    with shared.motion_lock:
+        raw_stop_request = int(shared.stop_request.value)
         if (
             int(shared.safety_state.value) != int(SafetyState.ARMED)
             or not shared.is_running.value
             or shared.error_state.value
             or shared.estop_request.value
+            or raw_stop_request != int(StopRequest.NONE)
+            or (
+                require_physical_home and not bool(shared.physical_home_completed.value)
+            )
         ):
             return False
-        generation = _invalidate_coupled_commands_locked(shared)
-        started_ns = time.monotonic_ns()
-        shared.run_started_monotonic_ns.value = started_ns
-        shared.safety_state.value = int(SafetyState.RUNNING)
+        shared.start_request.value = True
+        return True
+
+
+def request_policy_stop(shared: Any) -> bool:
+    """Publish S and revoke ARMED/RUNNING motion as one ordered operation."""
+    with shared.motion_lock:
+        already_requested = int(shared.stop_request.value) == int(
+            StopRequest.OPERATOR
+        ) and not bool(shared.start_request.value)
+        shared.start_request.value = False
+        shared.physical_home_completed.value = False
+        shared.stop_request.value = int(StopRequest.OPERATOR)
+        try:
+            current = SafetyState(int(shared.safety_state.value))
+        except ValueError:
+            shared.error_state.value = True
+            return False
+        if current not in {SafetyState.ARMED, SafetyState.RUNNING}:
+            return True
+        if current is SafetyState.ARMED and already_requested:
+            return True
+        revoked = _revoke_motion_locked(shared, SafetyState.ARMED)
+    if revoked is None:
+        return False
+    previous, generation = revoked
     logger.info(
-        "safety: ARMED(%d) → RUNNING(%d), generation=%d epoch_ns=%d",
-        1,
-        2,
+        "safety: policy S revoked motion %s(%d) → ARMED(%d), generation=%d",
+        previous.name,
+        int(previous),
+        int(SafetyState.ARMED),
         generation,
-        started_ns,
     )
     return True
+
+
+def request_policy_run_time_limit(shared: Any, *, expected_run_generation: int) -> bool:
+    """Request a coordinator-owned timed stop for the same RUNNING epoch."""
+    with shared.motion_lock:
+        permit = _read_motion_permit_locked(shared)
+        if permit.state is not SafetyState.RUNNING or permit.run_generation != int(
+            expected_run_generation
+        ):
+            return False
+        if int(shared.stop_request.value) != int(StopRequest.NONE):
+            return False
+        shared.start_request.value = False
+        shared.stop_request.value = int(StopRequest.RUN_TIME_LIMIT)
+        return True
 
 
 def revoke_motion(shared: Any, new_state: SafetyState = SafetyState.ARMED) -> bool:
@@ -264,24 +409,10 @@ def revoke_motion(shared: Any, new_state: SafetyState = SafetyState.ARMED) -> bo
     if new_state not in (SafetyState.ARMED, SafetyState.DISARMED, SafetyState.FAULT):
         raise ValueError("motion revocation must target ARMED, DISARMED, or FAULT")
     with shared.motion_lock:
-        current_value = int(shared.safety_state.value)
-        try:
-            current = SafetyState(current_value)
-        except ValueError:
-            current = SafetyState.FAULT
-            shared.safety_state.value = int(current)
-        if current != new_state and (current, new_state) not in _ALLOWED_TRANSITIONS:
-            logger.error(
-                "safety: rejected revocation transition %s(%d) → %s(%d)",
-                current.name,
-                int(current),
-                new_state.name,
-                int(new_state),
-            )
-            return False
-        generation = _invalidate_coupled_commands_locked(shared)
-        shared.run_started_monotonic_ns.value = 0
-        shared.safety_state.value = int(new_state)
+        revoked = _revoke_motion_locked(shared, new_state)
+    if revoked is None:
+        return False
+    current, generation = revoked
     logger.info(
         "safety: revoked motion %s(%d) → %s(%d), generation=%d",
         current.name,

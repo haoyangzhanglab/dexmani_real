@@ -35,6 +35,117 @@ def _as_f64(reader: EpisodeReader, name: str) -> np.ndarray:
     return np.asarray(reader.h5f[name][:], dtype=np.float64)
 
 
+def align_tactile_sum_rows_to_references(
+    contact_force: np.ndarray,
+    hand_source_monotonic_ns: np.ndarray,
+    tactile_source_monotonic_ns: np.ndarray,
+    tactile_fresh: np.ndarray,
+    tactile_calibrated: np.ndarray,
+    tactile_unit_code: np.ndarray,
+    reference_monotonic_ns: np.ndarray,
+    *,
+    max_observation_skew_s: float,
+) -> np.ndarray:
+    """Select the newest proven tactile-sum row causal to each reference.
+
+    Candidate rows are restricted to rows already recorded at the target row,
+    so a later persisted row can never repair an earlier observation. ``-1``
+    marks references without a fresh, calibrated, unit-proven sample in skew.
+    """
+    contact = np.asarray(contact_force)
+    hand_source_ns = np.asarray(hand_source_monotonic_ns, dtype=np.int64)
+    source_ns = np.asarray(tactile_source_monotonic_ns, dtype=np.int64)
+    fresh = np.asarray(tactile_fresh, dtype=bool)
+    calibrated = np.asarray(tactile_calibrated, dtype=bool)
+    unit_code = np.asarray(tactile_unit_code, dtype=np.int64)
+    references = np.asarray(reference_monotonic_ns, dtype=np.int64)
+    count = len(source_ns)
+    if contact.shape != (count, 5, 3):
+        raise ValueError("contact_force must have shape (frame_count, 5, 3)")
+    if any(
+        value.shape != (count,)
+        for value in (
+            hand_source_ns,
+            source_ns,
+            fresh,
+            calibrated,
+            unit_code,
+            references,
+        )
+    ):
+        raise ValueError("tactile provenance arrays must match frame_count")
+    if not np.isfinite(max_observation_skew_s) or max_observation_skew_s <= 0.0:
+        raise ValueError("max_observation_skew_s must be finite and positive")
+    max_skew_ns = int(round(float(max_observation_skew_s) * 1e9))
+    proven = (
+        fresh
+        & calibrated
+        & (unit_code == 0)
+        & (source_ns > 0)
+        & (hand_source_ns == source_ns)
+        & np.all(np.isfinite(contact), axis=(1, 2))
+    )
+    # Source clocks can reset or arrive out of order in malformed/partial raw
+    # captures. Coordinate compression plus a Fenwick occupancy tree keeps the
+    # prefix restriction exact without assuming monotonic input or scanning an
+    # ever-growing prefix for every output row.
+    source_coordinates = np.unique(source_ns[proven])
+    coordinate_count = len(source_coordinates)
+    occupied = np.zeros(coordinate_count, dtype=bool)
+    latest_row = np.full(coordinate_count, -1, dtype=np.int64)
+    occupancy_tree = np.zeros(coordinate_count + 1, dtype=np.int64)
+
+    def _add_coordinate(coordinate: int) -> None:
+        tree_index = coordinate + 1
+        while tree_index <= coordinate_count:
+            occupancy_tree[tree_index] += 1
+            tree_index += tree_index & -tree_index
+
+    def _prefix_count(end: int) -> int:
+        result = 0
+        tree_index = end
+        while tree_index:
+            result += int(occupancy_tree[tree_index])
+            tree_index -= tree_index & -tree_index
+        return result
+
+    def _coordinate_for_rank(rank: int) -> int:
+        coordinate = 0
+        accumulated = 0
+        step = 1 << (coordinate_count.bit_length() - 1)
+        while step:
+            candidate = coordinate + step
+            if (
+                candidate <= coordinate_count
+                and accumulated + int(occupancy_tree[candidate]) < rank
+            ):
+                coordinate = candidate
+                accumulated += int(occupancy_tree[candidate])
+            step >>= 1
+        return coordinate
+
+    selected = np.full(count, -1, dtype=np.int64)
+    for target_row, reference_ns in enumerate(references):
+        if proven[target_row]:
+            coordinate = int(np.searchsorted(source_coordinates, source_ns[target_row]))
+            latest_row[coordinate] = target_row
+            if not occupied[coordinate]:
+                occupied[coordinate] = True
+                _add_coordinate(coordinate)
+        if reference_ns <= 0:
+            continue
+        upper_bound = int(
+            np.searchsorted(source_coordinates, reference_ns, side="right")
+        )
+        available_count = _prefix_count(upper_bound)
+        if available_count == 0:
+            continue
+        coordinate = _coordinate_for_rank(available_count)
+        if reference_ns - source_coordinates[coordinate] <= max_skew_ns:
+            selected[target_row] = latest_row[coordinate]
+    return selected
+
+
 def recompute_observation_skew_s(
     source_timestamps_ns: np.ndarray, valid_mask: np.ndarray
 ) -> np.ndarray:
@@ -180,16 +291,6 @@ def _transient_ik_hold_masks(
         )
         target[start:end] = True
     return transient, persistent
-
-
-def _isolated_tactile_forward_fill_mask(tactile_valid: np.ndarray) -> np.ndarray:
-    """Admit only one bad tactile sample bracketed by valid samples."""
-
-    valid = np.asarray(tactile_valid, dtype=bool)
-    repair = np.zeros(valid.shape, dtype=bool)
-    if len(valid) >= 3:
-        repair[1:-1] = valid[:-2] & ~valid[1:-1] & valid[2:]
-    return repair
 
 
 def _empty_decision(
@@ -584,6 +685,11 @@ def analyze_episode(
         "fingertip_points": _as_f64(reader, "hand_fingertip"),
         "tracking_error": _as_f64(reader, "tracking_error"),
         "arm_last_cmd_seq": _as_i64(reader, "arm_last_cmd_seq"),
+        "observation_anchor_monotonic_ns": _as_i64(
+            reader, "observation_anchor_monotonic_ns"
+        ),
+        "arm_source_monotonic_ns": _as_i64(reader, "arm_source_monotonic_ns"),
+        "hand_source_monotonic_ns": _as_i64(reader, "hand_source_monotonic_ns"),
     }
     visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
     if visual_profile:
@@ -597,6 +703,9 @@ def analyze_episode(
                 _as_i64(reader, f"{name}_source_monotonic_ns")
                 for name in ("arm", "hand", "vr", "camera")
             ]
+        )
+        arrays["camera_source_monotonic_ns"] = _as_i64(
+            reader, "camera_source_monotonic_ns"
         )
     else:
         arrays["arm_qpos"] = arrays["control_arm_qpos"]
@@ -618,11 +727,37 @@ def analyze_episode(
         ),
         axis=1,
     )
-    real_modalities_finite = (
-        np.all(np.isfinite(arrays["action_arm_ee"]), axis=1)
-        & np.all(np.isfinite(arrays["contact_force"]), axis=(1, 2))
-        & np.all(np.isfinite(arrays["fingertip_points"]), axis=(1, 2))
+    tactile_reference_ns = (
+        arrays["camera_source_monotonic_ns"]
+        if visual_profile
+        else arrays["observation_anchor_monotonic_ns"]
     )
+    tactile_source_rows = align_tactile_sum_rows_to_references(
+        arrays["contact_force"],
+        arrays["hand_source_monotonic_ns"],
+        _as_i64(reader, "tactile_source_monotonic_ns"),
+        _as_bool(reader, "tactile_fresh"),
+        _as_bool(reader, "tactile_calibrated"),
+        _as_i64(reader, "tactile_unit_code"),
+        tactile_reference_ns,
+        max_observation_skew_s=config.max_observation_skew_s,
+    )
+    tactile_valid = tactile_source_rows >= 0
+    tactile_forward_fill = tactile_valid & (
+        tactile_source_rows != np.arange(frame_count, dtype=np.int64)
+    )
+    aligned_contact = np.full_like(arrays["contact_force"], np.nan)
+    aligned_contact[tactile_valid] = arrays["contact_force"][
+        tactile_source_rows[tactile_valid]
+    ]
+    arrays["contact_force"] = aligned_contact
+    real_modalities_finite = np.all(
+        np.isfinite(arrays["action_arm_ee"]), axis=1
+    ) & np.all(np.isfinite(arrays["contact_force"]), axis=(1, 2))
+    if not visual_profile:
+        real_modalities_finite &= np.all(
+            np.isfinite(arrays["fingertip_points"]), axis=(1, 2)
+        )
     arm_lower = np.asarray(config.arm_joint_limit_lower_rad, dtype=np.float64)
     arm_upper = np.asarray(config.arm_joint_limit_upper_rad, dtype=np.float64)
     hand_state_lower = np.asarray(config.hand_state_limit_lower_rad, dtype=np.float64)
@@ -663,12 +798,6 @@ def analyze_episode(
         hand_action_upper,
         config.joint_limit_tolerance_rad,
     )
-    tactile_valid = (
-        _as_bool(reader, "tactile_fresh")
-        & _as_bool(reader, "tactile_calibrated")
-        & (_as_i64(reader, "tactile_source_monotonic_ns") > 0)
-    )
-    tactile_forward_fill = _isolated_tactile_forward_fill_mask(tactile_valid)
     transient_ik_hold, long_ik_failure_hold = _transient_ik_hold_masks(
         arrays["held"], arrays["frame_status"]
     )
@@ -689,7 +818,7 @@ def analyze_episode(
             & ~arrays["hand_stale"]
             & arrays["history_valid"][:, 1]
         ),
-        "tactile_invalid": ~tactile_valid & ~tactile_forward_fill,
+        "tactile_invalid": ~tactile_valid,
         "action_timing_invalid": ~timing_valid,
         "nonfinite_joint_or_action": ~np.all(np.isfinite(joint_numeric), axis=1),
         "nonfinite_real_modality": ~real_modalities_finite,
@@ -702,6 +831,21 @@ def analyze_episode(
     repair_masks: dict[str, np.ndarray] = {
         "tactile_forward_fill": tactile_forward_fill,
     }
+
+    if not visual_profile:
+        anchor_ns = arrays["observation_anchor_monotonic_ns"]
+        arm_source_ns = arrays["arm_source_monotonic_ns"]
+        hand_source_ns = arrays["hand_source_monotonic_ns"]
+        max_skew_ns = int(round(config.max_observation_skew_s * 1e9))
+        reason_masks["control_grid_observation_invalid"] = ~(
+            (anchor_ns > 0)
+            & (arm_source_ns > 0)
+            & (hand_source_ns > 0)
+            & (arm_source_ns <= anchor_ns)
+            & (hand_source_ns <= anchor_ns)
+            & (anchor_ns - arm_source_ns <= max_skew_ns)
+            & (anchor_ns - hand_source_ns <= max_skew_ns)
+        )
 
     if visual_profile:
         arrays.update(
@@ -719,9 +863,7 @@ def analyze_episode(
                 "camera_color_frame_number": _as_i64(
                     reader, "camera_color_frame_number"
                 ),
-                "camera_source_monotonic_ns": _as_i64(
-                    reader, "camera_source_monotonic_ns"
-                ),
+                "camera_source_monotonic_ns": arrays["camera_source_monotonic_ns"],
                 "camera_clock_reset": _as_bool(reader, "camera_clock_reset"),
                 "camera_depth_device_timestamp_s": _as_f64(
                     reader, "camera_depth_device_timestamp_s"
@@ -966,7 +1108,6 @@ def analyze_episode(
         hard_invalid_reason_names=hard_invalid_reason_names,
         audit_reason_counts=quality["audit_reason_counts"],
         repair_reason_counts=quality["repair_reason_counts"],
-        tactile_forward_fill_mask=tactile_forward_fill,
         warnings=tuple(warnings),
         rejected_reason=rejected_reason,
     )

@@ -280,7 +280,8 @@ OpenCV 3×3 depth fast path 与逐步 SciPy 参考实现的 240 帧最终点云 
 
 录制 schema v24 保存 aligned raw depth、RGB、native depth/color 几何 provenance、帧号和时间
 信息，并持久化与 camera source 对齐的 arm/hand policy observation。离线处理只接受 raw v24；
-只有完整的对齐与动作限速合同的 pointcloud 产物可进入 Policy Zarr v5。
+四种 profile 中只有具备各自完整观测、对齐与动作限速合同的产物可进入 Policy Zarr v5，
+其中 pointcloud/rgb_pc 仍须满足本页的点云语义。
 
 每个 processed 点云产物记录并在导出/可视化时校验：
 

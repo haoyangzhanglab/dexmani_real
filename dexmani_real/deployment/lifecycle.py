@@ -25,7 +25,10 @@ from typing import Any
 from dexmani_real.config.runtime import ArmLoopConfig, ResolvedRuntimeConfig
 from dexmani_real.deployment.config import (
     FIXED_POLICY_RUNTIME_TARGET,
+    FingertipAssemblerConfig,
+    PolicyDeploymentConfig,
     PolicyWorkerConfig,
+    policy_observation_fields,
     validate_policy_runtime_compatibility,
 )
 from dexmani_real.deployment.coordinator import CoordinatorConfig, coordinator_loop
@@ -55,13 +58,22 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 
+def _observation_field_names(policy_spec: Any) -> tuple[str, ...]:
+    return tuple(field.name for field in policy_observation_fields(policy_spec))
+
+
 def _requires_pointcloud(policy_spec: Any) -> bool:
-    return "point_cloud" in tuple(policy_spec.sensor_modalities)
+    return "point_cloud" in _observation_field_names(policy_spec)
 
 
 def _requires_camera(policy_spec: Any) -> bool:
-    requested = tuple(policy_spec.sensor_modalities)
+    requested = _observation_field_names(policy_spec)
     return "point_cloud" in requested or "rgb" in requested
+
+
+def _requires_hand_sensor(policy_spec: Any) -> bool:
+    requested = set(_observation_field_names(policy_spec))
+    return bool(requested & {"joint_state", "contact_force", "fingertip_points"})
 
 
 def build_policy_worker_specs(
@@ -71,6 +83,7 @@ def build_policy_worker_specs(
     worker_config: PolicyWorkerConfig,
     *,
     execute: bool,
+    deployment_config: PolicyDeploymentConfig | None = None,
 ) -> list[WorkerSpec]:
     """Build the workers required by the explicit deployment contract.
 
@@ -85,16 +98,29 @@ def build_policy_worker_specs(
         raise TypeError("worker_config must be a PolicyWorkerConfig")
     if worker_config.spec is not policy_spec:
         raise ValueError("worker PolicySpec must be the validated lifecycle PolicySpec")
+    deployment = deployment_config or PolicyDeploymentConfig()
+    if not isinstance(deployment, PolicyDeploymentConfig):
+        raise TypeError("deployment_config must be a PolicyDeploymentConfig")
     coordinator_config = CoordinatorConfig.from_runtime(
         runtime,
         execute=execute,
+        deployment_config=deployment,
     )
     pointcloud_requested = _requires_pointcloud(policy_spec)
     camera_requested = _requires_camera(policy_spec)
+    fingertip_config = (
+        FingertipAssemblerConfig.from_runtime(runtime)
+        if "fingertip_points" in _observation_field_names(policy_spec)
+        else None
+    )
     pointcloud_config = (
         PointCloudLoopConfig.from_runtime(
             runtime,
-            num_points=policy_spec.point_cloud_num_points,
+            num_points=next(
+                field.shape[0]
+                for field in policy_observation_fields(policy_spec)
+                if field.name == "point_cloud"
+            ),
         )
         if pointcloud_requested
         else None
@@ -133,7 +159,7 @@ def build_policy_worker_specs(
             WorkerSpec(
                 "inference",
                 inference_loop,
-                (shared, runtime.policy, worker_config),
+                (shared, runtime.policy, worker_config, deployment, fingertip_config),
                 ready_name="inference",
             ),
             WorkerSpec(
@@ -144,7 +170,7 @@ def build_policy_worker_specs(
             ),
         ]
     )
-    if policy_spec.requires_hand:
+    if policy_spec.requires_hand or _requires_hand_sensor(policy_spec):
         specs.append(
             WorkerSpec(
                 "hand",
@@ -162,6 +188,7 @@ def run_policy_deployment(
     worker_config: PolicyWorkerConfig,
     execute: bool,
     *,
+    deployment_config: PolicyDeploymentConfig | None = None,
     prefix: str | None = None,
     max_running_s: float | None = None,
 ) -> int:
@@ -182,13 +209,17 @@ def run_policy_deployment(
         raise TypeError("worker_config must be a PolicyWorkerConfig")
     if worker_config.spec is not policy_spec:
         raise ValueError("worker PolicySpec must be the validated lifecycle PolicySpec")
+    deployment = deployment_config or PolicyDeploymentConfig()
+    if not isinstance(deployment, PolicyDeploymentConfig):
+        raise TypeError("deployment_config must be a PolicyDeploymentConfig")
     max_running_s = validate_max_running_s(max_running_s)
     logger.info(
-        "policy deployment: experiment=%s runtime=%s device=%s seed=0 execute=%s",
+        "policy deployment: experiment=%s runtime=%s device=%s seed=0 execute=%s mode=%s",
         worker_config.experiment,
         FIXED_POLICY_RUNTIME_TARGET,
         worker_config.device,
         execute,
+        deployment.inference_mode,
     )
 
     ctx = mp.get_context("spawn")
@@ -198,7 +229,15 @@ def run_policy_deployment(
         prefix=prefix or f"dexmani_policy_{os.getpid()}",
         config=RuntimeChannelsConfig.from_runtime(
             runtime,
-            pointcloud_num_points=policy_spec.point_cloud_num_points,
+            pointcloud_num_points=(
+                next(
+                    field.shape[0]
+                    for field in policy_observation_fields(policy_spec)
+                    if field.name == "point_cloud"
+                )
+                if pointcloud_requested
+                else runtime.pointcloud.num_points
+            ),
             camera_requested=camera_requested,
             pointcloud_requested=pointcloud_requested,
             observation_horizon=policy_spec.n_obs_steps,
@@ -222,6 +261,7 @@ def run_policy_deployment(
             policy_spec,
             worker_config,
             execute=execute,
+            deployment_config=deployment,
         )
         procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)

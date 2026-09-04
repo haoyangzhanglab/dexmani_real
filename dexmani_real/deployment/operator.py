@@ -32,7 +32,12 @@ from dexmani_real.robot_spec import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
-from dexmani_real.runtime.safety import SafetyState, StopRequest, revoke_motion
+from dexmani_real.runtime.safety import (
+    SafetyState,
+    StopRequest,
+    request_policy_start,
+    request_policy_stop,
+)
 from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.utils.log import get_logger
 
@@ -43,20 +48,7 @@ _POLL_S = 0.05
 
 def _request_immediate_stop(shared: RuntimeChannels) -> None:
     """Fence live motion when S/Q arrives while this thread is blocked by H."""
-    shared.start_request.value = False
-    shared.physical_home_completed.value = False
-    shared.stop_request.value = int(StopRequest.OPERATOR)
-    try:
-        state = SafetyState(int(shared.safety_state.value))
-    except ValueError:
-        shared.error_state.value = True
-        return
-    # Do not convert an incompletely initialized DISARMED runtime into ARMED.
-    # A generation bump in ARMED makes the arm worker stop a blocking home
-    # request, while a RUNNING revocation stops a policy command promptly.
-    if state in {SafetyState.ARMED, SafetyState.RUNNING} and not revoke_motion(
-        shared, SafetyState.ARMED
-    ):
+    if not request_policy_stop(shared):
         shared.error_state.value = True
 
 
@@ -200,41 +192,39 @@ def run_operator_control(
             stop_in_batch = ControlSignal.STOP in signals
             for signal in signals:
                 if signal is ControlSignal.BEGIN:
-                    if planner is not None and (
-                        discard_begin_in_batch
-                        or not bool(shared.physical_home_completed.value)
+                    if discard_begin_in_batch or not request_policy_start(
+                        shared,
+                        require_physical_home=planner is not None,
                     ):
                         logger.warning(
                             "operator: ignored B until a completed physical home "
                             "sequence is followed by a fresh B"
                         )
                         continue
-                    shared.start_request.value = True
                 elif signal is ControlSignal.STOP:
-                    shared.start_request.value = False
-                    shared.physical_home_completed.value = False
-                    shared.stop_request.value = int(StopRequest.OPERATOR)
+                    _request_immediate_stop(shared)
                 elif signal is ControlSignal.HOME:
                     if planner is None:
                         logger.warning("operator: H is disabled in policy deployment")
-                        continue
-                    if int(shared.safety_state.value) != int(SafetyState.ARMED):
-                        shared.physical_home_completed.value = False
-                        logger.warning("operator: ignored H unless safety is ARMED")
                         continue
                     if stop_in_batch:
                         logger.warning(
                             "operator: ignored H received in the same batch as S"
                         )
                         continue
-                    # B may have been received before H in this same polling
-                    # batch.  It cannot authorize a run that follows home.
-                    shared.start_request.value = False
-                    shared.physical_home_completed.value = False
-                    # A prior S remains as a coordinator request until B.  Once
-                    # ARMED, it is stale and must not cancel the next H; a new S
-                    # still revokes the home generation from its callback.
-                    shared.stop_request.value = int(StopRequest.NONE)
+                    with shared.motion_lock:
+                        home_allowed = int(shared.safety_state.value) == int(
+                            SafetyState.ARMED
+                        )
+                        shared.physical_home_completed.value = False
+                        if home_allowed:
+                            # H follows any older inactive S but cannot erase an
+                            # S arriving after this atomic preparation.
+                            shared.start_request.value = False
+                            shared.stop_request.value = int(StopRequest.NONE)
+                    if not home_allowed:
+                        logger.warning("operator: ignored H unless safety is ARMED")
+                        continue
                     completed = _home(
                         shared,
                         runtime,
@@ -248,18 +238,19 @@ def run_operator_control(
                             or int(shared.stop_request.value) != int(StopRequest.NONE)
                         ),
                     )
-                    authorized = bool(
-                        completed
-                        and shared.is_running.value
-                        and not shared.quit_requested.value
-                        and not shared.error_state.value
-                        and not shared.estop_request.value
-                        and int(shared.stop_request.value) == int(StopRequest.NONE)
-                        and int(shared.safety_state.value) == int(SafetyState.ARMED)
-                    )
-                    # A callback may have fenced motion after _home succeeded;
-                    # never let this assignment resurrect a stale H permit.
-                    shared.physical_home_completed.value = authorized
+                    with shared.motion_lock:
+                        authorized = bool(
+                            completed
+                            and shared.is_running.value
+                            and not shared.quit_requested.value
+                            and not shared.error_state.value
+                            and not shared.estop_request.value
+                            and int(shared.stop_request.value) == int(StopRequest.NONE)
+                            and int(shared.safety_state.value) == int(SafetyState.ARMED)
+                        )
+                        # Stop/start requests share this lock, so a completed H
+                        # cannot resurrect authorization after a newer S.
+                        shared.physical_home_completed.value = authorized
                     if authorized:
                         logger.info(
                             "operator: physical home sequence completed; "

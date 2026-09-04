@@ -19,6 +19,7 @@ from dexmani_real.ipc.schema import (
 )
 from dexmani_real.runtime.safety import (
     CoupledCommandTicket,
+    SafetyState,
     cancel_coupled_command_if_current,
     coupled_command_ticket_is_current,
     publish_coupled_command_if_motion_permitted,
@@ -199,12 +200,17 @@ def check_runtime_gate(
     shared: Any,
     *,
     check_is_running: bool = True,
+    required_safety_state: SafetyState | None = None,
 ) -> CommandPublishResult | None:
     """Reject publication outside an active, non-faulted runtime.
 
     This controller-side check reduces stale queue/ring traffic.  Workers still
     re-check the same lifecycle state immediately before their SDK boundary.
     """
+    if required_safety_state is not None and not isinstance(
+        required_safety_state, SafetyState
+    ):
+        raise TypeError("required_safety_state must be a SafetyState or None")
     if bool(shared.estop_request.value):
         return CommandPublishResult(CommandPublishStatus.ESTOP_REQUESTED)
     if bool(shared.error_state.value):
@@ -216,6 +222,14 @@ def check_runtime_gate(
         return CommandPublishResult(
             CommandPublishStatus.SAFETY_STATE_GATED,
             detail=f"safety state {permit.state.name} does not accept motion commands",
+        )
+    if required_safety_state is not None and permit.state is not required_safety_state:
+        return CommandPublishResult(
+            CommandPublishStatus.SAFETY_STATE_GATED,
+            detail=(
+                f"safety state {permit.state.name} does not match required "
+                f"{required_safety_state.name}"
+            ),
         )
     return None
 
@@ -347,6 +361,7 @@ def _validate_command_delivery(
     candidate: ActionCandidate,
     *,
     check_is_running: bool,
+    required_safety_state: SafetyState | None = None,
     minimum_delivery_window_s: float = 0.0,
 ) -> CommandPublishResult | None:
     """Return a typed final delivery rejection, or ``None`` when writable."""
@@ -355,6 +370,7 @@ def _validate_command_delivery(
     runtime_rejection = check_runtime_gate(
         shared,
         check_is_running=check_is_running,
+        required_safety_state=required_safety_state,
     )
     if runtime_rejection is not None:
         return CommandPublishResult(
@@ -393,6 +409,7 @@ def send_command(
     candidate: ActionCandidate,
     *,
     check_is_running: bool = True,
+    required_safety_state: SafetyState | None = None,
     minimum_delivery_window_s: float = 0.0,
 ) -> CommandPublishResult:
     """Publish one coherent arm/hand record to the actuator IPC ring.
@@ -406,6 +423,7 @@ def send_command(
         shared,
         candidate,
         check_is_running=check_is_running,
+        required_safety_state=required_safety_state,
         minimum_delivery_window_s=minimum_delivery_window_s,
     )
     if delivery_rejection is not None:
@@ -416,6 +434,7 @@ def send_command(
         shared,
         expected_run_generation=int(candidate.run_generation),
         frame=frame,
+        required_state=required_safety_state,
     )
     if ticket is None:
         return CommandPublishResult(
@@ -521,6 +540,7 @@ def build_action_candidate(
     arm_qpos: np.ndarray | None,
     hand_qpos: np.ndarray | None,
     *,
+    run_generation: int | None = None,
     is_hold: bool = False,
     observation_id: int | None = None,
     observation_anchor_monotonic_ns: int | None = None,
@@ -533,10 +553,16 @@ def build_action_candidate(
 
     Allocates a fresh monotonic ``action_id`` from ``shared.arm_command_seq``
     and stamps an immediate delivery target. ``scheduled_target_monotonic_ns``
-    retains the source plan's control-grid time even when the coordinator is
+    retains the source chunk's control-grid time even when the coordinator is
     publishing a due endpoint later. The delivery validity is the earlier of
     ``action_validity_s`` and an optional immutable caller deadline.
     """
+    if run_generation is not None and (
+        isinstance(run_generation, (bool, np.bool_))
+        or not isinstance(run_generation, (int, np.integer))
+        or int(run_generation) < 0
+    ):
+        raise ValueError("run_generation must be a non-negative integer or None")
     with shared.arm_command_seq.get_lock():
         action_id = int(shared.arm_command_seq.value) + 1
         shared.arm_command_seq.value = action_id
@@ -572,7 +598,11 @@ def build_action_candidate(
         return None
     return ActionCandidate(
         observation_id=action_id if observation_id is None else int(observation_id),
-        run_generation=int(shared.run_generation.value),
+        run_generation=(
+            int(shared.run_generation.value)
+            if run_generation is None
+            else int(run_generation)
+        ),
         action_id=action_id,
         created_monotonic_ns=now_ns,
         scheduled_target_monotonic_ns=scheduled_ns,
@@ -600,6 +630,7 @@ def validate_and_send_candidate(
     hand_command_max_delta_rad_per_tick: float | np.ndarray | None = None,
     canonicalize_policy_hand_roundoff: bool = False,
     execute: bool,
+    required_safety_state: SafetyState | None = None,
     minimum_delivery_window_s: float = 0.0,
 ) -> CommandPublishResult:
     """Validate a pre-built candidate and optionally publish it.
@@ -631,7 +662,10 @@ def validate_and_send_candidate(
                 "hand_command_max_delta_rad_per_tick must be finite and positive"
             )
     action_id = int(candidate.action_id)
-    runtime_rejection = check_runtime_gate(shared)
+    runtime_rejection = check_runtime_gate(
+        shared,
+        required_safety_state=required_safety_state,
+    )
     if runtime_rejection is not None:
         return CommandPublishResult(
             runtime_rejection.status,
@@ -813,6 +847,7 @@ def validate_and_send_candidate(
             shared,
             candidate,
             check_is_running=True,
+            required_safety_state=required_safety_state,
             minimum_delivery_window_s=minimum_delivery_window_s,
         )
         if delivery_rejection is not None:
@@ -829,6 +864,7 @@ def validate_and_send_candidate(
         send_command(
             shared,
             candidate,
+            required_safety_state=required_safety_state,
             minimum_delivery_window_s=minimum_delivery_window_s,
         ),
         hand_roundoff_canonicalized=hand_roundoff_canonicalized,

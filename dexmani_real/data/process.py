@@ -16,7 +16,10 @@ import h5py
 import numpy as np
 import yaml
 
-from dexmani_real.data.clean import analyze_episode
+from dexmani_real.data.clean import (
+    align_tactile_sum_rows_to_references,
+    analyze_episode,
+)
 from dexmani_real.data.contracts import (
     EpisodeAnnotation,
     EpisodeDecision,
@@ -34,8 +37,12 @@ from dexmani_real.data.transforms import (
     resize_depth,
     resize_rgb,
 )
+from dexmani_real.planning.arm_fk import make_arm_fk
+from dexmani_real.planning.fingertip import compute_fingertip_points_xarm_base
+from dexmani_real.planning.hand_fk import HandKinematics
 from dexmani_real.planning.poses import validate_canonical_rot6d
 from dexmani_real.recording.reader import EpisodeReader
+from dexmani_real.recording.schema import SEMANTIC_META_ATTRS
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
@@ -69,6 +76,34 @@ _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "fingertip_points": ((5, 3), np.dtype(np.float32)),
 }
 _FRAME_CHUNKED_DATASETS = frozenset(("rgb", "depth", "point_cloud"))
+_CONTACT_FORCE_UNIT = str(SEMANTIC_META_ATTRS["tactile_unit"])
+_CONTACT_FORCE_SI_VERIFIED = bool(SEMANTIC_META_ATTRS["tactile_si_unit_verified"])
+_CONTACT_FORCE_FRAME = "xhand_sensor_native_axes_per_finger"
+_FINGERTIP_POINTS_FRAME = str(SEMANTIC_META_ATTRS["hand_fingertip_frame"])
+_FINGERTIP_POINTS_UNIT = "m"
+_ACTION_EE_FRAME = str(SEMANTIC_META_ATTRS["action_arm_ee_frame"])
+
+
+def _strict_bool_attr(attrs: Any, name: str) -> bool:
+    """Read one schema boolean without accepting truthy strings or integers."""
+    try:
+        value = attrs[name]
+    except KeyError as exc:
+        raise ValueError(f"{name} is a required boolean HDF5 attribute") from exc
+    if not isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be a boolean HDF5 attribute")
+    return bool(value)
+
+
+def _strict_integer_attr(attrs: Any, name: str) -> int:
+    """Read one schema integer without truncating floats or accepting booleans."""
+    try:
+        value = attrs[name]
+    except KeyError as exc:
+        raise ValueError(f"{name} is a required integer HDF5 attribute") from exc
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{name} must be an integer HDF5 attribute")
+    return int(value)
 
 
 @dataclass(frozen=True)
@@ -679,23 +714,33 @@ def _write_attrs(
                 if endpoint_delta_tolerance_rad is None
                 else float(endpoint_delta_tolerance_rad)
             ),
-            "deployment_equivalent": bool(config.profile.needs_pointcloud),
+            "deployment_equivalent": True,
             "task_name": task_name,
             "point_cloud_frame": (
                 "xarm_base" if config.profile.needs_pointcloud else "omitted"
             ),
-            "fingertip_points_frame": "xarm_base",
-            "fingertip_points_unit": "m",
-            "action_ee_frame": "xarm_base",
+            "fingertip_points_frame": _FINGERTIP_POINTS_FRAME,
+            "fingertip_points_unit": _FINGERTIP_POINTS_UNIT,
+            "action_ee_frame": _ACTION_EE_FRAME,
             "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
-            "contact_force_source": "raw.hand_contact",
-            "contact_force_unit": str(
-                meta.get("tactile_unit", "sdk_scaled_unknown_si")
+            "contact_force_source": (
+                "camera_causal_tactile_sum"
+                if visual_profile
+                else "control_grid_tactile_sum"
             ),
-            "contact_force_si_verified": bool(
-                meta.get("tactile_si_unit_verified", False)
+            "contact_force_alignment": (
+                "newest_source_not_after_camera_within_max_observation_skew"
+                if visual_profile
+                else "newest_source_not_after_grid_within_max_observation_skew"
             ),
-            "contact_force_frame": "xhand_sensor_native_axes_per_finger",
+            "contact_force_unit": _CONTACT_FORCE_UNIT,
+            "contact_force_si_verified": _CONTACT_FORCE_SI_VERIFIED,
+            "contact_force_frame": _CONTACT_FORCE_FRAME,
+            "contact_force_fresh_required": True,
+            "contact_force_calibrated_required": True,
+            "contact_force_unit_code": 0,
+            "contact_force_causal_to_reference": True,
+            "contact_force_hand_source_match_required": True,
             "processing_config_json": _json(config.to_dict()),
             "quality_summary_json": _json(decision.quality),
             "source_decision_json": _json(decision.to_dict()),
@@ -782,6 +827,36 @@ def _processed_joint_state(
     return np.concatenate((arm_state, hand_state), axis=1)
 
 
+def compute_fingertip_history_xarm_base(
+    arm_qpos: np.ndarray,
+    hand_qpos: np.ndarray,
+    *,
+    arm_fk: Any,
+    hand_fk: Any,
+    handbase_position_eef_m: np.ndarray,
+    handbase_quat_eef_wxyz: np.ndarray,
+) -> np.ndarray:
+    """Recompute camera/control-grid aligned fingertip history from joint state."""
+    arm = np.asarray(arm_qpos, dtype=np.float64)
+    hand_state = np.asarray(hand_qpos, dtype=np.float64)
+    if arm.ndim != 2 or arm.shape[1] != 7 or hand_state.shape != (len(arm), 12):
+        raise ValueError("aligned arm/hand qpos histories have invalid shapes")
+    return np.asarray(
+        [
+            compute_fingertip_points_xarm_base(
+                arm[index],
+                hand_state[index],
+                arm_fk=arm_fk,
+                hand_fk=hand_fk,
+                handbase_position_eef_m=handbase_position_eef_m,
+                handbase_quat_eef_wxyz=handbase_quat_eef_wxyz,
+            )
+            for index in range(len(arm))
+        ],
+        dtype=np.float32,
+    )
+
+
 def _write_processed_episode(
     reader: EpisodeReader,
     decision: EpisodeDecision,
@@ -812,27 +887,58 @@ def _write_processed_episode(
         output["joint_state"][:] = _processed_joint_state(reader, selected, config)
         output["action"][:] = np.concatenate((arm_action, hand_action), axis=1)
         output["action_ee"][:] = np.concatenate((arm_action_ee, hand_action), axis=1)
+        visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
+        all_contact_force = np.asarray(reader.h5f["hand_contact"][:], dtype=np.float64)
+        reference_key = (
+            "camera_source_monotonic_ns"
+            if visual_profile
+            else "observation_anchor_monotonic_ns"
+        )
+        tactile_source_rows = align_tactile_sum_rows_to_references(
+            all_contact_force,
+            np.asarray(reader.h5f["hand_source_monotonic_ns"][:], dtype=np.int64),
+            np.asarray(reader.h5f["tactile_source_monotonic_ns"][:], dtype=np.int64),
+            np.asarray(reader.h5f["tactile_fresh"][:], dtype=bool),
+            np.asarray(reader.h5f["tactile_calibrated"][:], dtype=bool),
+            np.asarray(reader.h5f["tactile_unit_code"][:], dtype=np.int64),
+            np.asarray(reader.h5f[reference_key][:], dtype=np.int64),
+            max_observation_skew_s=config.max_observation_skew_s,
+        )
+        selected_tactile_rows = tactile_source_rows[selected]
+        if np.any(selected_tactile_rows < 0):
+            raise ValueError("selected row lacks causal tactile provenance")
         contact_force = np.asarray(
-            reader.h5f["hand_contact"][selected], dtype=np.float32
+            all_contact_force[selected_tactile_rows], dtype=np.float32
         )
-        tactile_forward_fill = decision.tactile_forward_fill_mask
-        if tactile_forward_fill is not None:
-            repair_rows = np.flatnonzero(
-                np.asarray(tactile_forward_fill, dtype=bool)[selected]
-            )
-            for compact_row in repair_rows:
-                source_row = int(selected[compact_row])
-                if source_row <= 0:
-                    raise ValueError(
-                        "tactile forward-fill requires a previous source row"
-                    )
-                contact_force[compact_row] = np.asarray(
-                    reader.h5f["hand_contact"][source_row - 1], dtype=np.float32
-                )
         output["contact_force"][:] = contact_force
-        output["fingertip_points"][:] = np.asarray(
-            reader.h5f["hand_fingertip"][selected], dtype=np.float32
-        )
+        if config.profile.needs_rgb or config.profile.needs_pointcloud:
+            hand_fk = HandKinematics(
+                config.hand_urdf_path, list(config.fingertip_link_names)
+            )
+            if not hand_fk.is_ready():
+                raise RuntimeError("processed fingertip FK startup failed")
+            output["fingertip_points"][:] = compute_fingertip_history_xarm_base(
+                np.asarray(
+                    reader.h5f["policy_observation_arm_qpos"][selected],
+                    dtype=np.float64,
+                ),
+                np.asarray(
+                    reader.h5f["policy_observation_hand_qpos"][selected],
+                    dtype=np.float64,
+                ),
+                arm_fk=make_arm_fk(),
+                hand_fk=hand_fk,
+                handbase_position_eef_m=np.asarray(
+                    config.handbase_position_eef_m, dtype=np.float64
+                ),
+                handbase_quat_eef_wxyz=np.asarray(
+                    config.handbase_quat_eef_wxyz, dtype=np.float64
+                ),
+            )
+        else:
+            output["fingertip_points"][:] = np.asarray(
+                reader.h5f["hand_fingertip"][selected], dtype=np.float32
+            )
 
         provenance = output.create_group("provenance")
         provenance.attrs["drop_reason_bit_names_json"] = _json(
@@ -1075,7 +1181,36 @@ def validate_processed_hdf5(
             if visual_profile
             else "grid_anchor_monotonic_ns"
         )
-        expected_deployment_equivalent = bool(config.profile.needs_pointcloud)
+        expected_deployment_equivalent = True
+        expected_contact_source = (
+            "camera_causal_tactile_sum"
+            if visual_profile
+            else "control_grid_tactile_sum"
+        )
+        expected_contact_alignment = (
+            "newest_source_not_after_camera_within_max_observation_skew"
+            if visual_profile
+            else "newest_source_not_after_grid_within_max_observation_skew"
+        )
+        deployment_equivalent = _strict_bool_attr(source.attrs, "deployment_equivalent")
+        contact_force_si_verified = _strict_bool_attr(
+            source.attrs, "contact_force_si_verified"
+        )
+        contact_force_fresh_required = _strict_bool_attr(
+            source.attrs, "contact_force_fresh_required"
+        )
+        contact_force_calibrated_required = _strict_bool_attr(
+            source.attrs, "contact_force_calibrated_required"
+        )
+        contact_force_unit_code = _strict_integer_attr(
+            source.attrs, "contact_force_unit_code"
+        )
+        contact_force_causal_to_reference = _strict_bool_attr(
+            source.attrs, "contact_force_causal_to_reference"
+        )
+        contact_force_hand_source_match_required = _strict_bool_attr(
+            source.attrs, "contact_force_hand_source_match_required"
+        )
         endpoint_delta_tolerance_rad = config.endpoint_delta_tolerance_rad
         persisted_endpoint_delta = float(
             source.attrs.get("endpoint_delta_tolerance_rad", np.nan)
@@ -1128,8 +1263,24 @@ def validate_processed_hdf5(
             )
             or str(source.attrs.get("action_semantics", ""))
             != "deployment_grid_rate_limited_target"
-            or bool(source.attrs.get("deployment_equivalent", False))
-            != expected_deployment_equivalent
+            or deployment_equivalent != expected_deployment_equivalent
+            or str(source.attrs.get("contact_force_unit", "")) != _CONTACT_FORCE_UNIT
+            or contact_force_si_verified is not _CONTACT_FORCE_SI_VERIFIED
+            or str(source.attrs.get("contact_force_frame", "")) != _CONTACT_FORCE_FRAME
+            or str(source.attrs.get("contact_force_source", ""))
+            != expected_contact_source
+            or str(source.attrs.get("contact_force_alignment", ""))
+            != expected_contact_alignment
+            or not contact_force_fresh_required
+            or not contact_force_calibrated_required
+            or contact_force_unit_code != 0
+            or not contact_force_causal_to_reference
+            or not contact_force_hand_source_match_required
+            or str(source.attrs.get("fingertip_points_frame", ""))
+            != _FINGERTIP_POINTS_FRAME
+            or str(source.attrs.get("fingertip_points_unit", ""))
+            != _FINGERTIP_POINTS_UNIT
+            or str(source.attrs.get("action_ee_frame", "")) != _ACTION_EE_FRAME
         ):
             raise ValueError(f"{artifact.name}: invalid deployment data contract")
         if str(source.attrs.get("source_contiguity", "")) != (

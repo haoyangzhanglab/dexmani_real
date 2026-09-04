@@ -1,10 +1,10 @@
-"""Inference worker: observations -> model proposals -> ``policy_plan_ring``.
+"""Inference worker: observations -> model proposals -> ``policy_chunk_ring``.
 
 The inference worker is the *only* process that touches the model. It reads
 causal observations from the shared rings, runs
 :meth:`~dexmani_real.deployment.contracts.PolicyRuntime.predict`, and publishes
-the resulting :class:`~dexmani_real.deployment.contracts.JointActionChunk` to
-the latest-wins ``policy_plan_ring``. It never writes ``coupled_cmd_ring``, the
+the resulting :class:`~dexmani_real.deployment.contracts.ActionChunk` to the
+latest-wins ``policy_chunk_ring``. It never writes ``coupled_cmd_ring``, the
 SDK, ``SafetyState``, or ``run_generation`` — model output is a proposal, not a
 robot command.
 
@@ -17,7 +17,6 @@ then wraps it with Real's NumPy observation/action adapter.
 
 from __future__ import annotations
 
-import math
 import time
 
 import numpy as np
@@ -25,16 +24,20 @@ import numpy as np
 from dexmani_real.config.defaults import PolicyParams
 from dexmani_real.deployment.config import (
     FIXED_POLICY_RUNTIME_TARGET,
+    FingertipAssemblerConfig,
+    PolicyDeploymentConfig,
     PolicyWorkerConfig,
+    policy_observation_fields,
 )
 from dexmani_real.deployment.contracts import (
+    ActionChunk,
     InferenceContext,
-    JointActionChunk,
     PolicyPrediction,
     PolicyRuntime,
 )
 from dexmani_real.deployment.metrics import (
-    INFERENCE_FAILURES,
+    CHUNKS_CREATED,
+    CHUNKS_GENERATION_DROPPED,
     INFERENCE_MS,
     OBSERVATION_AGE_MS,
     OBSERVATION_SKEW_MS,
@@ -47,8 +50,6 @@ from dexmani_real.deployment.metrics import (
     OBSERVATION_WAIT_RGB_GRID,
     OBSERVATION_WAIT_RGB_HISTORY,
     OBSERVATIONS_BUILT,
-    PLANS_CREATED,
-    PLANS_GENERATION_DROPPED,
     Metrics,
     flush_every,
 )
@@ -56,16 +57,20 @@ from dexmani_real.deployment.observation import (
     FrameWindow,
     ObservationBatch,
     PointCloudFrame,
+    PolicyObservation,
     RgbFrame,
 )
-from dexmani_real.deployment.timing import build_target_grid, first_deliverable_index
+from dexmani_real.deployment.timing import next_periodic_deadline_ns
 from dexmani_real.ipc.channels import RuntimeChannels, new_frame
 from dexmani_real.ipc.schema import (
     MAX_POLICY_CHUNK_STEPS,
-    POLICY_PLAN_DTYPE,
+    POLICY_CHUNK_DTYPE,
     validate_point_cloud_array,
 )
-from dexmani_real.runtime.safety import SafetyState, read_run_epoch
+from dexmani_real.planning.arm_fk import make_arm_fk
+from dexmani_real.planning.fingertip import compute_fingertip_points_xarm_base
+from dexmani_real.planning.hand_fk import HandKinematics
+from dexmani_real.runtime.safety import SafetyState, read_run_state_snapshot
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -74,20 +79,12 @@ logger = get_logger(__name__)
 _NO_FEEDBACK_POLL_S = 0.005
 # Poll interval while ARMED (no inference) — gentler than the feedback poll.
 _ARMED_IDLE_POLL_S = 0.01
-_MIN_STARTUP_DELIVERABLE_TARGETS = 2
+_SYNC_REQUEST_WAIT_S = 0.05
 
 
-def _project_sensor_fields(policy_spec: object) -> set[str]:
-    """Project Policy modality names onto Real's concrete sensor fields."""
-    requested: set[str] = set()
-    for modality in tuple(getattr(policy_spec, "sensor_modalities")):
-        if modality == "joint_state":
-            requested.update(("arm_qpos", "hand_qpos"))
-        elif modality == "point_cloud":
-            requested.add("point_cloud")
-        else:
-            raise ValueError(f"unsupported Policy sensor modality {modality!r}")
-    return requested
+def _requested_observation_fields(policy_spec: object) -> set[str]:
+    """Return source names directly from the validated ordered Policy fields."""
+    return {field.name for field in policy_observation_fields(policy_spec)}
 
 
 def _load_inference_runtime(config: PolicyWorkerConfig) -> PolicyRuntime:
@@ -110,151 +107,134 @@ def _load_inference_runtime(config: PolicyWorkerConfig) -> PolicyRuntime:
         raise
 
 
-def _duration_s_to_ns_ceil(duration_s: float, *, name: str) -> int:
-    """Convert a validated non-negative duration without understating latency."""
-    if isinstance(duration_s, bool) or not isinstance(
-        duration_s, (int, float, np.integer, np.floating)
-    ):
-        raise TypeError(f"{name} must be a number")
-    value = float(duration_s)
-    if not np.isfinite(value) or value < 0.0:
-        raise ValueError(f"{name} must be finite and non-negative")
-    return math.ceil(value * 1e9)
-
-
-def _startup_deliverable_target_count(
-    *,
-    model_latency_s: float,
-    steps: int,
-    step_dt_ns: int,
-    command_lead_s: float,
-) -> int:
-    """Return theoretical targets remaining after model latency and command lead."""
-    # This arbitrary positive origin has no source-time meaning; warmup only
-    # checks latency against relative executable-grid spacing.
-    origin_ns = 1
-    targets = build_target_grid(origin_ns, steps, step_dt_ns)
-    finished_ns = origin_ns + _duration_s_to_ns_ceil(
-        model_latency_s,
-        name="model_latency_s",
+def serialize_action_chunk(chunk: ActionChunk) -> np.ndarray:
+    """Serialize one validated ActionChunk without publishing or scheduling it."""
+    if not isinstance(chunk, ActionChunk):
+        raise TypeError("chunk must be an ActionChunk")
+    frame = new_frame(POLICY_CHUNK_DTYPE)
+    frame["chunk_id"][0] = np.uint64(chunk.chunk_id)
+    frame["run_generation"][0] = np.uint64(chunk.run_generation)
+    frame["observation_id"][0] = np.uint64(chunk.observation_id)
+    frame["observation_anchor_monotonic_ns"][0] = np.uint64(
+        chunk.observation_anchor_monotonic_ns
     )
-    first_index = first_deliverable_index(
-        targets,
-        finished_ns,
-        _duration_s_to_ns_ceil(command_lead_s, name="command_lead_s"),
+    frame["observation_latest_source_monotonic_ns"][0] = np.uint64(
+        chunk.observation_latest_source_monotonic_ns
     )
-    return len(targets) - first_index
+    frame["observation_logical_step_monotonic_ns"][0] = np.uint64(
+        chunk.observation_logical_step_monotonic_ns
+    )
+    frame["inference_started_monotonic_ns"][0] = np.uint64(
+        chunk.inference_started_monotonic_ns
+    )
+    frame["inference_finished_monotonic_ns"][0] = np.uint64(
+        chunk.inference_finished_monotonic_ns
+    )
+    frame["num_steps"][0] = np.uint32(chunk.num_steps)
+    frame["arm_present"][0] = np.uint8(chunk.arm_present)
+    frame["ee_present"][0] = np.uint8(chunk.ee_present)
+    frame["hand_present"][0] = np.uint8(chunk.hand_present)
+    n = chunk.num_steps
+    if chunk.arm_qpos is not None:
+        frame["arm_qpos"][0, :n] = chunk.arm_qpos
+    if chunk.hand_qpos is not None:
+        frame["hand_qpos"][0, :n] = chunk.hand_qpos
+    if chunk.ee_pos is not None:
+        frame["ee_pos"][0, :n] = chunk.ee_pos
+    if chunk.ee_rot6d is not None:
+        frame["ee_rot6d"][0, :n] = chunk.ee_rot6d
+    return frame
 
 
-def stamp_prediction_timing(
+def action_chunk_from_prediction(
     prediction: PolicyPrediction,
     *,
-    logical_step_ns: int,
-    step_dt_ns: int,
-    inference_finished_ns: int,
-    command_lead_ns: int,
-) -> JointActionChunk | None:
-    """Assign the fixed logical control grid, masking expired predictions only.
-
-    The model never controls timestamps.  Targets remain exactly
-    ``logical_step_ns + i * step_dt_ns``; a late inference may lose a prefix
-    or the whole prediction, but it is never shifted forward.
-    """
+    chunk_id: int,
+    context: InferenceContext,
+) -> ActionChunk:
+    """Combine one untimed prediction with its immutable inference provenance."""
     if not isinstance(prediction, PolicyPrediction):
         raise TypeError("prediction must be a PolicyPrediction")
+    if not isinstance(context, InferenceContext):
+        raise TypeError("context must be an InferenceContext")
     values = (
         prediction.arm_qpos if prediction.arm_qpos is not None else prediction.ee_pos
     )
     assert values is not None
-    steps = int(values.shape[0])
-    targets = build_target_grid(logical_step_ns, steps, step_dt_ns)
-    first_index = first_deliverable_index(
-        targets,
-        inference_finished_ns,
-        command_lead_ns,
-    )
-    if first_index == steps:
-        return None
-    valid_mask = np.zeros(steps, dtype=np.uint8)
-    valid_mask[first_index:] = 1
-    return JointActionChunk(
+    return ActionChunk(
+        chunk_id=chunk_id,
+        run_generation=context.run_generation,
+        observation_id=context.observation_id,
+        observation_anchor_monotonic_ns=context.observation_anchor_monotonic_ns,
+        observation_latest_source_monotonic_ns=(
+            context.observation_latest_source_monotonic_ns
+        ),
+        observation_logical_step_monotonic_ns=(
+            context.observation_logical_step_monotonic_ns
+        ),
+        inference_started_monotonic_ns=context.inference_started_monotonic_ns,
+        inference_finished_monotonic_ns=context.inference_finished_monotonic_ns,
+        num_steps=int(values.shape[0]),
+        arm_present=prediction.arm_qpos is not None,
+        ee_present=prediction.ee_pos is not None,
+        hand_present=prediction.hand_qpos is not None,
         arm_qpos=prediction.arm_qpos,
         hand_qpos=prediction.hand_qpos,
         ee_pos=prediction.ee_pos,
         ee_rot6d=prediction.ee_rot6d,
-        target_monotonic_ns=targets,
-        valid_mask=valid_mask,
     )
 
 
-def publish_plan(
+def publish_action_chunk(shared: RuntimeChannels, chunk: ActionChunk) -> bool:
+    """Generation-fence and publish one chunk to the parallel single-slot ring."""
+    if not isinstance(chunk, ActionChunk):
+        raise TypeError("chunk must be an ActionChunk")
+    if int(shared.run_generation.value) != chunk.run_generation:
+        return False
+    shared.policy_chunk_ring.write(serialize_action_chunk(chunk))
+    return True
+
+
+def _clear_sync_request_for_inactive_snapshot(
     shared: RuntimeChannels,
     *,
-    plan_id: int,
-    context: InferenceContext,
-    chunk: JointActionChunk,
+    observed_generation: int,
 ) -> bool:
-    """Publish a validated chunk to the latest-wins plan ring.
+    """Clear only while the lifecycle snapshot still names an inactive epoch.
 
-    Re-reads ``shared.run_generation`` at publish time; if the generation has
-    advanced since the observation was captured, the in-flight plan is dropped
-    (returns ``False`` without writing) rather than relabeled. An
-    over-capacity chunk raises ``ValueError`` (fail, never truncate).
+    The safety transition and this check share ``motion_lock``. If a B request
+    has already advanced the generation to RUNNING, its newly-set inference
+    request cannot be cleared using an older ARMED snapshot.
     """
-    if int(shared.run_generation.value) != int(context.run_generation):
-        return False
+    with shared.motion_lock:
+        if int(shared.run_generation.value) != int(observed_generation):
+            return False
+        if (
+            int(shared.safety_state.value) == int(SafetyState.RUNNING)
+            and not bool(shared.error_state.value)
+            and not bool(shared.estop_request.value)
+        ):
+            return False
+        shared.inference_request.clear()
+        return True
 
-    if chunk.hand_qpos is None:
-        raise ValueError(
-            "learned-policy output must contain a hand target for every step"
-        )
 
-    if chunk.arm_qpos is not None:
-        n = int(chunk.arm_qpos.shape[0])
-    elif chunk.ee_pos is not None:
-        n = int(chunk.ee_pos.shape[0])
-    else:
-        n = 0
-    if n <= 0 or n > MAX_POLICY_CHUNK_STEPS:
-        raise ValueError(
-            f"policy chunk has {n} steps; transport capacity is {MAX_POLICY_CHUNK_STEPS}"
-        )
-
-    frame = new_frame(POLICY_PLAN_DTYPE)
-    frame["plan_id"][0] = np.uint64(plan_id)
-    frame["run_generation"][0] = np.uint64(context.run_generation)
-    frame["observation_id"][0] = np.uint64(context.observation_id)
-    frame["observation_anchor_monotonic_ns"][0] = np.uint64(
-        context.observation_anchor_monotonic_ns
-    )
-    frame["observation_latest_source_monotonic_ns"][0] = np.uint64(
-        context.observation_latest_source_monotonic_ns
-    )
-    frame["observation_logical_step_monotonic_ns"][0] = np.uint64(
-        context.observation_logical_step_monotonic_ns
-    )
-    frame["inference_started_monotonic_ns"][0] = np.uint64(
-        context.inference_started_monotonic_ns
-    )
-    frame["inference_finished_monotonic_ns"][0] = np.uint64(
-        context.inference_finished_monotonic_ns
-    )
-    frame["num_steps"][0] = np.uint32(n)
-    frame["hand_present"][0] = 1
-    frame["target_monotonic_ns"][0, :n] = chunk.target_monotonic_ns
-    if chunk.arm_qpos is not None:
-        frame["arm_present"][0] = 1
-        frame["ee_present"][0] = 0
-        frame["arm_qpos"][0, :n] = chunk.arm_qpos
-    else:
-        frame["arm_present"][0] = 0
-        frame["ee_present"][0] = 1
-        frame["ee_pos"][0, :n] = chunk.ee_pos
-        frame["ee_rot6d"][0, :n] = chunk.ee_rot6d
-    frame["hand_qpos"][0, :n] = chunk.hand_qpos
-    frame["valid_mask"][0, :n] = chunk.valid_mask
-    shared.policy_plan_ring.write(frame)
-    return True
+def _consume_sync_request(
+    shared: RuntimeChannels,
+    *,
+    observed_generation: int,
+) -> int | None:
+    """Consume a request only if it still belongs to the observed RUNNING epoch."""
+    with shared.motion_lock:
+        current_generation = int(shared.run_generation.value)
+        if current_generation != int(observed_generation):
+            return None
+        if int(shared.safety_state.value) != int(SafetyState.RUNNING):
+            return None
+        if bool(shared.error_state.value) or bool(shared.estop_request.value):
+            return None
+        shared.inference_request.clear()
+        return current_generation
 
 
 def _read_state_history(
@@ -320,6 +300,96 @@ def _read_state_history(
         source_monotonic_ns=np.asarray(sources, dtype=np.uint64),
         publish_monotonic_ns=np.asarray(publishes, dtype=np.uint64),
         valid_mask=np.ones(t, dtype=np.uint8),
+    )
+
+
+def _read_tactile_provenance_history(
+    ring,
+    *,
+    anchor_ns: int,
+    history_len: int,
+    max_age_ns: int,
+    not_before_ns: int,
+) -> FrameWindow | None:
+    """Read only tactile provenance flags; never copy the full tactile tensor."""
+    try:
+        history = ring.get_last_k(min(int(history_len), ring.maxlen))
+    except Exception:
+        logger.warning("inference: tactile provenance read failed", exc_info=True)
+        return None
+    values, sequences, sources, publishes = [], [], [], []
+    for data, ring_publish_ns, sequence in history:
+        record = data[0]
+        source_ns = int(record["source_monotonic_ns"])
+        publish_ns = int(ring_publish_ns)
+        if not (
+            bool(record["fresh"])
+            and bool(record["calibrated"])
+            and int(record["unit_code"]) == 0
+        ):
+            continue
+        if not (not_before_ns <= source_ns <= publish_ns <= anchor_ns):
+            continue
+        if anchor_ns - source_ns > max_age_ns:
+            continue
+        values.append(np.array([int(record["unit_code"])], dtype=np.uint8))
+        sequences.append(int(sequence))
+        sources.append(source_ns)
+        publishes.append(publish_ns)
+    if not values:
+        return None
+    return FrameWindow(
+        values=np.stack(values),
+        source_sequence=np.asarray(sequences, dtype=np.uint64),
+        source_monotonic_ns=np.asarray(sources, dtype=np.uint64),
+        publish_monotonic_ns=np.asarray(publishes, dtype=np.uint64),
+        valid_mask=np.ones(len(values), dtype=np.uint8),
+    )
+
+
+def _select_control_grid_reference_ns(
+    *, run_started_ns: int, anchor_ns: int, history_len: int, step_dt_ns: int
+) -> tuple[np.ndarray, int]:
+    """Return the last T completed episode-grid times, oldest first."""
+    if history_len <= 0 or step_dt_ns <= 0 or anchor_ns < run_started_ns:
+        return np.empty(0, dtype=np.uint64), 0
+    latest_tick = (anchor_ns - run_started_ns) // step_dt_ns
+    if latest_tick < history_len - 1:
+        return np.empty(0, dtype=np.uint64), 0
+    logical_step_ns = run_started_ns + latest_tick * step_dt_ns
+    first_ns = logical_step_ns - (history_len - 1) * step_dt_ns
+    return (
+        np.arange(first_ns, logical_step_ns + 1, step_dt_ns, dtype=np.uint64),
+        logical_step_ns,
+    )
+
+
+def _align_state_history_to_reference_ns(
+    state_history: FrameWindow | None,
+    reference_ns: np.ndarray,
+    *,
+    max_skew_ns: int,
+) -> FrameWindow | None:
+    """Choose newest source <= each reference, within the explicit skew bound."""
+    if state_history is None or np.asarray(reference_ns).size == 0:
+        return None
+    sources = np.asarray(state_history.source_monotonic_ns, dtype=np.int64)
+    valid = np.asarray(state_history.valid_mask, dtype=np.uint8) == 1
+    selected: list[int] = []
+    for value in np.asarray(reference_ns, dtype=np.int64):
+        candidates = np.flatnonzero(
+            valid & (sources <= value) & (value - sources <= max_skew_ns)
+        )
+        if candidates.size == 0:
+            return None
+        selected.append(int(candidates[-1]))
+    indices = np.asarray(selected, dtype=np.intp)
+    return FrameWindow(
+        values=state_history.values[indices],
+        source_sequence=state_history.source_sequence[indices],
+        source_monotonic_ns=state_history.source_monotonic_ns[indices],
+        publish_monotonic_ns=state_history.publish_monotonic_ns[indices],
+        valid_mask=np.ones(len(indices), dtype=np.uint8),
     )
 
 
@@ -409,7 +479,7 @@ def _read_pointcloud_history(
 
 
 def _rgb_frame_from_camera_record(
-    shared: RuntimeChannels,
+    camera_ring,
     header: np.ndarray,
     ring_publish_ns: int,
     sequence: int,
@@ -434,7 +504,7 @@ def _rgb_frame_from_camera_record(
         and source_ns >= not_before_ns
     ):
         return None
-    payload = shared.camera_ring.read_sequence(sequence, modalities=("rgb",))
+    payload = camera_ring.read_sequence(sequence, modalities=("rgb",))
     if payload is None:
         return None
     payload_header = payload["header"][0]
@@ -487,7 +557,7 @@ def _read_rgb_history(
     frames: list[RgbFrame] = []
     for header, ring_publish_ns, sequence in records:
         frame = _rgb_frame_from_camera_record(
-            shared,
+            shared.camera_ring,
             header,
             int(ring_publish_ns),
             int(sequence),
@@ -507,7 +577,7 @@ def _read_rgb_history(
 
 
 def _read_rgb_for_pointcloud_history(
-    shared: RuntimeChannels,
+    camera_ring,
     pointcloud_history: tuple[PointCloudFrame, ...],
     *,
     anchor_ns: int,
@@ -519,8 +589,8 @@ def _read_rgb_for_pointcloud_history(
     try:
         metadata_by_sequence = {
             int(sequence): (header, int(ring_publish_ns))
-            for header, ring_publish_ns, sequence in shared.camera_ring.get_last_metadata(
-                shared.camera_ring.maxlen
+            for header, ring_publish_ns, sequence in camera_ring.get_last_metadata(
+                camera_ring.maxlen
             )
         }
     except Exception:
@@ -533,7 +603,7 @@ def _read_rgb_for_pointcloud_history(
             return ()
         header, ring_publish_ns = metadata
         frame = _rgb_frame_from_camera_record(
-            shared,
+            camera_ring,
             header,
             ring_publish_ns,
             pointcloud.source_camera_sequence,
@@ -627,28 +697,12 @@ def _align_state_history_to_camera_frames(
     before that time. Future state samples and pairs outside the explicit skew
     budget are rejected rather than interpolated or padded.
     """
-    if state_history is None or not camera_history:
-        return None
-    source_ns = np.asarray(state_history.source_monotonic_ns, dtype=np.int64)
-    valid = np.asarray(state_history.valid_mask, dtype=np.uint8) == 1
-    selected: list[int] = []
-    for camera_frame in camera_history:
-        reference_ns = np.int64(camera_frame.source_monotonic_ns)
-        candidates = np.flatnonzero(
-            valid
-            & (source_ns <= reference_ns)
-            & (reference_ns - source_ns <= int(max_skew_ns))
-        )
-        if candidates.size == 0:
-            return None
-        selected.append(int(candidates[-1]))
-    indices = np.asarray(selected, dtype=np.intp)
-    return FrameWindow(
-        values=state_history.values[indices],
-        source_sequence=state_history.source_sequence[indices],
-        source_monotonic_ns=state_history.source_monotonic_ns[indices],
-        publish_monotonic_ns=state_history.publish_monotonic_ns[indices],
-        valid_mask=np.ones(len(indices), dtype=np.uint8),
+    return _align_state_history_to_reference_ns(
+        state_history,
+        np.asarray(
+            [frame.source_monotonic_ns for frame in camera_history], dtype=np.uint64
+        ),
+        max_skew_ns=max_skew_ns,
     )
 
 
@@ -678,47 +732,37 @@ def _build_observation(
     visual_history_max_age_ns = max_age_ns + history_span_ns + max_grid_lag_ns
     state_history_max_age_ns = visual_history_max_age_ns + max_skew_ns
     hand_history: FrameWindow | None = None
-    hand_current_history: FrameWindow | None = None
     hand_tactile_sum_history: FrameWindow | None = None
-    tactile_history: FrameWindow | None = None
+    hand_tactile_provenance_history: FrameWindow | None = None
     pointcloud: PointCloudFrame | None = None
     pointcloud_history: tuple[PointCloudFrame, ...] = ()
-    requested = _project_sensor_fields(policy_spec)
+    requested = _requested_observation_fields(policy_spec)
     pointcloud_requested = "point_cloud" in requested
     rgb_requested = "rgb" in requested
     camera_requested = pointcloud_requested or rgb_requested
     rgb_history: tuple[RgbFrame, ...] = ()
-    rgb_shape: tuple[int, int, int] | None = None
-    if rgb_requested:
-        raise ValueError("current DexMani Policy deployment does not support RGB")
-    state_history_len = shared.arm_state_ring.maxlen if camera_requested else horizon
+    fields = {field.name: field for field in policy_observation_fields(policy_spec)}
+    rgb_shape = tuple(fields["rgb"].shape) if rgb_requested else None
+    state_history_len = shared.arm_state_ring.maxlen
     arm_history = _read_state_history(
         shared.arm_state_ring,
         history_len=state_history_len,
         anchor_ns=anchor_ns,
         values_field="qpos",
         required_true_fields=("state_valid",),
-        max_age_ns=(state_history_max_age_ns if camera_requested else max_age_ns),
+        max_age_ns=state_history_max_age_ns,
         not_before_ns=run_started_ns,
     )
     hand_state_requested = bool(
-        requested
-        & {
-            "hand_qpos",
-            "hand_joint_position",
-            "hand_current",
-            "hand_joint_torque",
-            "hand_tactile_sum",
-            "fingertip_force",
-        }
+        requested & {"joint_state", "contact_force", "fingertip_points"}
     )
-    tactile_requested = bool(requested & {"hand_tactile_force", "xhand_tactile"})
+    tactile_requested = "contact_force" in requested
     if pointcloud_requested:
         all_pointclouds = _read_pointcloud_history(
             shared,
             anchor_ns=anchor_ns,
             max_age_ns=visual_history_max_age_ns,
-            num_points=int(getattr(policy_spec, "point_cloud_num_points")),
+            num_points=int(fields["point_cloud"].shape[0]),
             history_len=shared.pointcloud_ring.maxlen,
             not_before_ns=run_started_ns,
         )
@@ -735,7 +779,7 @@ def _build_observation(
             if rgb_requested:
                 assert rgb_shape is not None
                 rgb_history = _read_rgb_for_pointcloud_history(
-                    shared,
+                    shared.camera_ring,
                     pointcloud_history,
                     anchor_ns=anchor_ns,
                     max_age_ns=visual_history_max_age_ns,
@@ -766,44 +810,28 @@ def _build_observation(
             frame for frame in selected_rgb if isinstance(frame, RgbFrame)
         )
     else:
-        logical_step_ns = 0
+        reference_ns, logical_step_ns = _select_control_grid_reference_ns(
+            run_started_ns=run_started_ns,
+            anchor_ns=anchor_ns,
+            history_len=horizon,
+            step_dt_ns=step_dt_ns,
+        )
     if getattr(policy_spec, "requires_hand") is True:
         if hand_state_requested:
             hand_history = _read_state_history(
                 shared.hand_state_ring,
-                history_len=(
-                    shared.hand_state_ring.maxlen if camera_requested else horizon
-                ),
+                history_len=(shared.hand_state_ring.maxlen),
                 anchor_ns=anchor_ns,
                 values_field="qpos",
                 required_true_fields=("state_valid",),
                 required_false_fields=("qpos_stale",),
-                max_age_ns=(
-                    state_history_max_age_ns if camera_requested else max_age_ns
-                ),
+                max_age_ns=state_history_max_age_ns,
                 not_before_ns=run_started_ns,
             )
-            if requested & {"hand_current", "hand_joint_torque"}:
-                hand_current_history = _read_state_history(
-                    shared.hand_state_ring,
-                    history_len=(
-                        shared.hand_state_ring.maxlen if camera_requested else horizon
-                    ),
-                    anchor_ns=anchor_ns,
-                    values_field="current",
-                    required_true_fields=("state_valid",),
-                    required_false_fields=("qpos_stale",),
-                    max_age_ns=(
-                        state_history_max_age_ns if camera_requested else max_age_ns
-                    ),
-                    not_before_ns=run_started_ns,
-                )
-            if requested & {"hand_tactile_sum", "fingertip_force"}:
+            if "contact_force" in requested:
                 hand_tactile_sum_history = _read_state_history(
                     shared.hand_state_ring,
-                    history_len=(
-                        shared.hand_state_ring.maxlen if camera_requested else horizon
-                    ),
+                    history_len=shared.hand_state_ring.maxlen,
                     anchor_ns=anchor_ns,
                     values_field="tactile_sum",
                     required_true_fields=(
@@ -811,23 +839,15 @@ def _build_observation(
                         "tactile_sum_valid",
                     ),
                     required_false_fields=("qpos_stale",),
-                    max_age_ns=(
-                        state_history_max_age_ns if camera_requested else max_age_ns
-                    ),
+                    max_age_ns=state_history_max_age_ns,
                     not_before_ns=run_started_ns,
                 )
         if tactile_requested:
-            tactile_history = _read_state_history(
+            hand_tactile_provenance_history = _read_tactile_provenance_history(
                 shared.hand_tactile_ring,
-                history_len=(
-                    shared.hand_tactile_ring.maxlen if camera_requested else horizon
-                ),
+                history_len=shared.hand_tactile_ring.maxlen,
                 anchor_ns=anchor_ns,
-                values_field="tactile_force",
-                required_true_fields=("fresh",),
-                max_age_ns=(
-                    state_history_max_age_ns if camera_requested else max_age_ns
-                ),
+                max_age_ns=state_history_max_age_ns,
                 not_before_ns=run_started_ns,
             )
     reference_history: tuple[PointCloudFrame | RgbFrame, ...]
@@ -847,22 +867,34 @@ def _build_observation(
                 reference_history,
                 max_skew_ns=max_skew_ns,
             )
-        if hand_current_history is not None:
-            hand_current_history = _align_state_history_to_camera_frames(
-                hand_current_history,
-                reference_history,
-                max_skew_ns=max_skew_ns,
-            )
         if hand_tactile_sum_history is not None:
             hand_tactile_sum_history = _align_state_history_to_camera_frames(
                 hand_tactile_sum_history,
                 reference_history,
                 max_skew_ns=max_skew_ns,
             )
-        if tactile_history is not None:
-            tactile_history = _align_state_history_to_camera_frames(
-                tactile_history,
+        if hand_tactile_provenance_history is not None:
+            hand_tactile_provenance_history = _align_state_history_to_camera_frames(
+                hand_tactile_provenance_history,
                 reference_history,
+                max_skew_ns=max_skew_ns,
+            )
+    elif not camera_requested and logical_step_ns > 0:
+        arm_history = _align_state_history_to_reference_ns(
+            arm_history, reference_ns, max_skew_ns=max_skew_ns
+        )
+        if hand_history is not None:
+            hand_history = _align_state_history_to_reference_ns(
+                hand_history, reference_ns, max_skew_ns=max_skew_ns
+            )
+        if hand_tactile_sum_history is not None:
+            hand_tactile_sum_history = _align_state_history_to_reference_ns(
+                hand_tactile_sum_history, reference_ns, max_skew_ns=max_skew_ns
+            )
+        if hand_tactile_provenance_history is not None:
+            hand_tactile_provenance_history = _align_state_history_to_reference_ns(
+                hand_tactile_provenance_history,
+                reference_ns,
                 max_skew_ns=max_skew_ns,
             )
     if pointcloud_requested:
@@ -889,13 +921,41 @@ def _build_observation(
             if metrics is not None:
                 metrics.increment(OBSERVATION_WAIT_RGB_GRID)
             return None
-    elif arm_history is not None and arm_history.values.shape[0] > 0:
-        latest_source_ns = int(arm_history.source_monotonic_ns[-1])
-        logical_step_ns = latest_source_ns
+    elif (
+        arm_history is not None
+        and arm_history.values.shape[0] == horizon
+        and logical_step_ns > 0
+    ):
+        latest_source_ns = max(
+            int(window.source_monotonic_ns[-1])
+            for window in (
+                arm_history,
+                hand_history,
+                hand_tactile_sum_history,
+                hand_tactile_provenance_history,
+            )
+            if window is not None
+        )
+        if anchor_ns - latest_source_ns > max_age_ns:
+            return None
     else:
         if metrics is not None:
             metrics.increment(OBSERVATION_WAIT_ARM_HISTORY)
         return None
+    if arm_history is None or arm_history.values.shape[0] != horizon:
+        return None
+    if hand_state_requested and (
+        hand_history is None or hand_history.values.shape[0] != horizon
+    ):
+        return None
+    if tactile_requested:
+        if hand_tactile_sum_history is None or hand_tactile_provenance_history is None:
+            return None
+        if not np.array_equal(
+            hand_tactile_sum_history.source_monotonic_ns,
+            hand_tactile_provenance_history.source_monotonic_ns,
+        ):
+            return None
     return ObservationBatch(
         observation_id=observation_id,
         run_generation=run_generation,
@@ -905,9 +965,8 @@ def _build_observation(
         logical_step_monotonic_ns=logical_step_ns,
         arm_history=arm_history,
         hand_history=hand_history,
-        hand_current_history=hand_current_history,
         hand_tactile_sum_history=hand_tactile_sum_history,
-        tactile_history=tactile_history,
+        hand_tactile_provenance_history=hand_tactile_provenance_history,
         pointcloud=pointcloud,
         pointcloud_history=pointcloud_history,
         rgb_history=rgb_history,
@@ -926,9 +985,8 @@ def observation_timing_ms(observation: ObservationBatch) -> tuple[float, float]:
     for window in (
         getattr(observation, "arm_history", None),
         getattr(observation, "hand_history", None),
-        getattr(observation, "hand_current_history", None),
         getattr(observation, "hand_tactile_sum_history", None),
-        getattr(observation, "tactile_history", None),
+        getattr(observation, "hand_tactile_provenance_history", None),
     ):
         if window is None:
             continue
@@ -961,10 +1019,84 @@ def observation_timing_ms(observation: ObservationBatch) -> tuple[float, float]:
     )
 
 
+def _to_policy_observation(
+    observation: ObservationBatch,
+    policy_spec: object,
+    *,
+    fingertip_runtime: (
+        tuple[object, HandKinematics, FingertipAssemblerConfig] | None
+    ) = None,
+) -> PolicyObservation:
+    """Project typed ring readers into the exact public Policy array mapping."""
+    field_names = tuple(field.name for field in policy_observation_fields(policy_spec))
+    horizon = int(getattr(policy_spec, "n_obs_steps"))
+    if observation.arm_history is None or observation.hand_history is None:
+        raise ValueError("joint_state requires aligned arm and hand histories")
+    arrays: dict[str, np.ndarray] = {}
+    joint = np.concatenate(
+        (observation.arm_history.values, observation.hand_history.values), axis=1
+    )
+    arrays["joint_state"] = np.ascontiguousarray(joint, dtype=np.float32)
+    if "point_cloud" in field_names:
+        arrays["point_cloud"] = np.ascontiguousarray(
+            np.stack([frame.values for frame in observation.pointcloud_history]),
+            dtype=np.float32,
+        )
+    if "rgb" in field_names:
+        arrays["rgb"] = np.ascontiguousarray(
+            np.stack([frame.values for frame in observation.rgb_history]),
+            dtype=np.uint8,
+        )
+    if "contact_force" in field_names:
+        if (
+            observation.hand_tactile_sum_history is None
+            or observation.hand_tactile_provenance_history is None
+        ):
+            raise ValueError("contact_force lacks calibrated tactile provenance")
+        arrays["contact_force"] = np.ascontiguousarray(
+            observation.hand_tactile_sum_history.values, dtype=np.float32
+        )
+    if "fingertip_points" in field_names:
+        if fingertip_runtime is None:
+            raise RuntimeError("fingertip_points requires local FK")
+        arm_fk, hand_fk, config = fingertip_runtime
+        arrays["fingertip_points"] = np.ascontiguousarray(
+            np.stack(
+                [
+                    compute_fingertip_points_xarm_base(
+                        observation.arm_history.values[index],
+                        observation.hand_history.values[index],
+                        arm_fk=arm_fk,
+                        hand_fk=hand_fk,
+                        handbase_position_eef_m=np.asarray(
+                            config.handbase_position_eef_m
+                        ),
+                        handbase_quat_eef_wxyz=np.asarray(
+                            config.handbase_quat_eef_wxyz
+                        ),
+                    )
+                    for index in range(horizon)
+                ]
+            ),
+            dtype=np.float32,
+        )
+    ordered = {name: arrays[name] for name in field_names}
+    return PolicyObservation(
+        observation_id=observation.observation_id,
+        run_generation=observation.run_generation,
+        anchor_monotonic_ns=observation.anchor_monotonic_ns,
+        latest_source_monotonic_ns=observation.latest_source_monotonic_ns,
+        logical_step_monotonic_ns=observation.logical_step_monotonic_ns,
+        arrays=ordered,
+    )
+
+
 def inference_loop(
     shared: RuntimeChannels,
     policy: PolicyParams,
     config: PolicyWorkerConfig,
+    deployment_config: PolicyDeploymentConfig | None = None,
+    fingertip_config: FingertipAssemblerConfig | None = None,
 ) -> None:
     """Inference process entry point — produces proposals, never robot commands.
 
@@ -978,48 +1110,38 @@ def inference_loop(
         raise TypeError("inference_loop requires resolved runtime PolicyParams")
     if not isinstance(config, PolicyWorkerConfig):
         raise TypeError("inference_loop requires a PolicyWorkerConfig")
+    deployment = deployment_config or PolicyDeploymentConfig()
+    if not isinstance(deployment, PolicyDeploymentConfig):
+        raise TypeError("inference_loop requires a PolicyDeploymentConfig")
 
     # Heartbeat before any lazy import so the supervisor never sees a dead gap.
     shared.set_heartbeat("inference", time.monotonic())
     metrics = Metrics()
 
     runtime = _load_inference_runtime(config)
-
     try:
+        fingertip_runtime = None
+        if "fingertip_points" in _requested_observation_fields(config.spec):
+            if not isinstance(fingertip_config, FingertipAssemblerConfig):
+                raise TypeError("fingertip_points requires FingertipAssemblerConfig")
+            hand_fk = HandKinematics(
+                fingertip_config.hand_urdf_path,
+                list(fingertip_config.fingertip_link_names),
+            )
+            if not hand_fk.is_ready():
+                raise RuntimeError("fingertip FK startup failed")
+            fingertip_runtime = (make_arm_fk(), hand_fk, fingertip_config)
         warmup_samples = 5
-        stable_samples = 3
         timings_s = runtime.warmup(samples=warmup_samples)
         if len(timings_s) != warmup_samples:
             raise RuntimeError("policy runtime returned incomplete warmup timings")
         if any(not np.isfinite(value) or value < 0.0 for value in timings_s):
             raise RuntimeError("policy runtime returned invalid warmup timing")
-        stable_timings_s = timings_s[-stable_samples:]
-        step_dt_ns = int(round(1e9 / float(shared.action_control_hz)))
-        remaining_targets = tuple(
-            _startup_deliverable_target_count(
-                model_latency_s=value,
-                steps=config.spec.n_action_steps,
-                step_dt_ns=step_dt_ns,
-                command_lead_s=policy.command_lead_s,
-            )
-            for value in stable_timings_s
-        )
         logger.info(
-            "inference warmup: samples_ms=%s stable_remaining_targets=%s minimum=%d",
+            "inference warmup: samples_ms=%s mode=%s",
             ",".join(f"{value * 1e3:.3f}" for value in timings_s),
-            ",".join(str(value) for value in remaining_targets),
-            _MIN_STARTUP_DELIVERABLE_TARGETS,
+            deployment.inference_mode,
         )
-        if any(
-            remaining < _MIN_STARTUP_DELIVERABLE_TARGETS
-            for remaining in remaining_targets
-        ):
-            raise RuntimeError(
-                "policy inference warmup exceeds the viable action window: "
-                f"stable_max_ms={max(stable_timings_s) * 1e3:.3f} "
-                f"stable_remaining_targets={remaining_targets} "
-                f"minimum={_MIN_STARTUP_DELIVERABLE_TARGETS}"
-            )
     except BaseException:
         try:
             runtime.close()
@@ -1032,14 +1154,16 @@ def inference_loop(
     shared.set_heartbeat("inference", time.monotonic())
     logger.info("inference_loop: ready (runtime=%s)", FIXED_POLICY_RUNTIME_TARGET)
 
-    step_dt_ns = int(round(1e9 / float(shared.action_control_hz)))
-    period_s = 1.0 / float(policy.inference_hz)
-    requested = _project_sensor_fields(config.spec)
+    step_dt_ns = int(round(float(config.spec.control_dt_s) * 1e9))
+    async_period_ns = int(config.spec.n_action_steps) * step_dt_ns
+    requested = _requested_observation_fields(config.spec)
 
-    plan_id = 0
+    chunk_id = 0
     observation_id = 0
     last_generation = -1
     last_logical_step_ns = 0
+    sync_request_generation: int | None = None
+    async_deadline_ns: int | None = None
     last_metrics_flush_ns = time.monotonic_ns()
 
     def wait_for_observation(reason: str | None = None) -> None:
@@ -1056,25 +1180,81 @@ def inference_loop(
 
     try:
         while shared.is_running.value:
-            tick_start = time.monotonic()
             # Heartbeat every tick, including no-feedback and slow-inference paths.
             shared.set_heartbeat("inference", time.monotonic())
 
-            epoch = read_run_epoch(shared)
-            run_generation = epoch.generation
+            run_snapshot = read_run_state_snapshot(shared)
+            run_generation = run_snapshot.generation
             if run_generation != last_generation:
                 runtime.reset_episode()
                 last_generation = run_generation
                 observation_id = 0  # new observation epoch for the new run
                 last_logical_step_ns = 0
+                sync_request_generation = None
+                async_deadline_ns = None
                 metrics.begin_run()
 
             # ARMED = no inference; the coordinator gates RUNNING via B.
-            if int(shared.safety_state.value) != int(SafetyState.RUNNING):
+            if run_snapshot.state is not SafetyState.RUNNING:
+                if deployment.inference_mode == "sync":
+                    _clear_sync_request_for_inactive_snapshot(
+                        shared,
+                        observed_generation=run_generation,
+                    )
+                    sync_request_generation = None
+                else:
+                    async_deadline_ns = None
                 time.sleep(_ARMED_IDLE_POLL_S)
                 continue
-            if epoch.started_monotonic_ns <= 0:
+            if bool(shared.error_state.value) or bool(shared.estop_request.value):
+                if deployment.inference_mode == "sync":
+                    _clear_sync_request_for_inactive_snapshot(
+                        shared,
+                        observed_generation=run_generation,
+                    )
+                    sync_request_generation = None
+                else:
+                    async_deadline_ns = None
+                time.sleep(_ARMED_IDLE_POLL_S)
+                continue
+            if run_snapshot.started_monotonic_ns <= 0:
                 raise RuntimeError("RUNNING state has no observation epoch")
+            if deployment.inference_mode == "sync":
+                if sync_request_generation is None:
+                    if not shared.inference_request.wait(timeout=_SYNC_REQUEST_WAIT_S):
+                        continue
+                    shared.set_heartbeat("inference", time.monotonic())
+                    request_generation = _consume_sync_request(
+                        shared,
+                        observed_generation=run_generation,
+                    )
+                    if request_generation is None:
+                        continue
+                    run_snapshot = read_run_state_snapshot(shared)
+                    if (
+                        run_snapshot.state is not SafetyState.RUNNING
+                        or run_snapshot.generation != request_generation
+                    ):
+                        continue
+                    if run_snapshot.started_monotonic_ns <= 0:
+                        raise RuntimeError("RUNNING state has no observation epoch")
+                    run_generation = run_snapshot.generation
+                    sync_request_generation = run_generation
+                elif sync_request_generation != run_generation:
+                    sync_request_generation = None
+                    continue
+            else:
+                now_ns = time.monotonic_ns()
+                if async_deadline_ns is None:
+                    async_deadline_ns = now_ns
+                if now_ns < async_deadline_ns:
+                    time.sleep(
+                        min(
+                            (async_deadline_ns - now_ns) / 1e9,
+                            _SYNC_REQUEST_WAIT_S,
+                        )
+                    )
+                    continue
             anchor_ns = time.monotonic_ns()
             observation_id += 1
             observation = _build_observation(
@@ -1083,7 +1263,7 @@ def inference_loop(
                 config.spec,
                 observation_id=observation_id,
                 run_generation=run_generation,
-                run_started_ns=epoch.started_monotonic_ns,
+                run_started_ns=run_snapshot.started_monotonic_ns,
                 anchor_ns=anchor_ns,
                 step_dt_ns=step_dt_ns,
                 metrics=metrics,
@@ -1125,28 +1305,16 @@ def inference_loop(
             last_logical_step_ns = observation.logical_step_monotonic_ns
 
             started_ns = time.monotonic_ns()
-            prediction = runtime.predict(observation)
+            policy_observation = _to_policy_observation(
+                observation,
+                config.spec,
+                fingertip_runtime=fingertip_runtime,
+            )
+            prediction = runtime.predict(policy_observation)
             finished_ns = time.monotonic_ns()
             inference_ms = (finished_ns - started_ns) / 1e6
             metrics.observe(INFERENCE_MS, inference_ms)
             metrics.observe_timing(INFERENCE_MS, inference_ms)
-
-            chunk = stamp_prediction_timing(
-                prediction,
-                logical_step_ns=observation.logical_step_monotonic_ns,
-                step_dt_ns=step_dt_ns,
-                inference_finished_ns=finished_ns,
-                command_lead_ns=_duration_s_to_ns_ceil(
-                    policy.command_lead_s,
-                    name="command_lead_s",
-                ),
-            )
-            if chunk is None:
-                metrics.increment(INFERENCE_FAILURES)
-                elapsed = time.monotonic() - tick_start
-                if period_s > elapsed:
-                    time.sleep(period_s - elapsed)
-                continue
 
             context = InferenceContext(
                 run_generation=run_generation,
@@ -1160,16 +1328,29 @@ def inference_loop(
                 ),
                 inference_started_monotonic_ns=started_ns,
                 inference_finished_monotonic_ns=finished_ns,
-                step_dt_ns=step_dt_ns,
             )
 
-            plan_id += 1
-            if publish_plan(shared, plan_id=plan_id, context=context, chunk=chunk):
-                metrics.increment(PLANS_CREATED)
+            chunk_id += 1
+            action_chunk = action_chunk_from_prediction(
+                prediction,
+                chunk_id=chunk_id,
+                context=context,
+            )
+            if publish_action_chunk(shared, action_chunk):
+                metrics.increment(CHUNKS_CREATED)
             else:
-                metrics.increment(PLANS_GENERATION_DROPPED)
+                metrics.increment(CHUNKS_GENERATION_DROPPED)
                 logger.debug(
-                    "inference: plan %d dropped (generation advanced)", plan_id
+                    "inference: chunk %d dropped (generation advanced)", chunk_id
+                )
+            if deployment.inference_mode == "sync":
+                sync_request_generation = None
+            else:
+                assert async_deadline_ns is not None
+                async_deadline_ns = next_periodic_deadline_ns(
+                    async_deadline_ns,
+                    async_period_ns,
+                    finished_ns,
                 )
 
             last_metrics_flush_ns = flush_every(
@@ -1178,11 +1359,6 @@ def inference_loop(
                 prefix="inference metrics",
                 debug=True,
             )
-
-            elapsed = time.monotonic() - tick_start
-            sleep_s = period_s - elapsed
-            if sleep_s > 0:
-                time.sleep(sleep_s)
     finally:
         try:
             runtime.close()

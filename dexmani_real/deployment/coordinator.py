@@ -1,8 +1,8 @@
 """Deployment coordinator — the sole learned-policy robot-action producer.
 
-The inference worker writes proposals to ``policy_plan_ring``; this coordinator
+The inference worker writes proposals to ``policy_chunk_ring``; this coordinator
 is the only process that turns a proposal into a robot command. It selects the
-plan, schedules the due endpoint (one per control tick), runs the shared
+chunk, schedules the due endpoint (one per control tick), runs the shared
 candidate publication boundary (SafetyGate -> send_command), and owns the
 policy semantic watchdog and the ``RUNNING <-> ARMED`` control-source state.
 
@@ -13,6 +13,7 @@ interpolates between model steps.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -32,21 +33,18 @@ from dexmani_real.control.publication import (
     validate_and_send_candidate,
 )
 from dexmani_real.control.safety_gate import planner_action_safety_gate
-from dexmani_real.deployment.action_buffer import (
-    ActionBuffer,
-    BufferCoverage,
-    BufferedPlan,
-    PushStatus,
-    compute_max_buffered_plans,
-)
-from dexmani_real.deployment.contracts import JointActionChunk
+from dexmani_real.deployment.config import PolicyDeploymentConfig
+from dexmani_real.deployment.contracts import ActionChunk
 from dexmani_real.deployment.metrics import (
     ACK_FAILURE,
     ACK_LATENCY_MS,
     ACK_TIMEOUT,
     ACKNOWLEDGED,
+    APPLIED_ACTION_STEPS,
+    CHUNKS_GENERATION_DROPPED,
+    CHUNKS_INGESTED,
+    CHUNKS_STALE,
     COMMAND_SILENCE_ABORT,
-    ENDPOINTS_COALESCED,
     ENDPOINTS_COMMITTED,
     ENDPOINTS_DUE,
     ENDPOINTS_FATAL_REJECTED,
@@ -55,27 +53,19 @@ from dexmani_real.deployment.metrics import (
     ENDPOINTS_STALE_DISCARDED,
     ENDPOINTS_TRANSIENT_DEFERRED,
     ENDPOINTS_VALIDATED,
+    EPISODE_ACTION_STEPS,
     HAND_POLICY_ENDPOINT_ROUNDOFF_CANONICALIZED,
     HAND_PREFLIGHT_REJECTIONS,
     IK_CHECKER_REJECTS,
-    PLAN_AGE_MS,
-    PLANS_EVICTED,
-    PLANS_GENERATION_DROPPED,
-    PLANS_INGESTED,
-    PLANS_STALE,
     POLICY_ABORTS,
-    USABLE_HORIZON_MS,
+    SAFETY_REJECTED_STEPS,
     Metrics,
     flush_every,
     reject_counter_name,
 )
-from dexmani_real.deployment.timing import (
-    compute_plan_deadline_ns,
-    first_valid_index_from_prefix_mask,
-    usable_target_mask,
-)
+from dexmani_real.deployment.timing import first_future_step_index
 from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
-from dexmani_real.ipc.schema import MAX_POLICY_CHUNK_STEPS
+from dexmani_real.ipc.schema import MAX_POLICY_CHUNK_STEPS, POLICY_CHUNK_DTYPE
 from dexmani_real.planning import (
     Pose,
     TeleopProfile,
@@ -93,8 +83,7 @@ from dexmani_real.runtime.safety import (
     CoupledCommandTicket,
     SafetyState,
     StopRequest,
-    begin_motion,
-    read_run_epoch,
+    begin_requested_motion,
     revoke_motion,
 )
 from dexmani_real.utils.feedback import FeedbackIssueCode, diagnose_arm_feedback
@@ -105,6 +94,8 @@ if TYPE_CHECKING:
     from dexmani_real.config.runtime import ResolvedRuntimeConfig
 
 logger = get_logger(__name__)
+_TARGET_WAIT_HEARTBEAT_S = 0.05
+_UINT64_MAX = int(np.iinfo(np.uint64).max)
 
 
 @dataclass(frozen=True)
@@ -133,6 +124,203 @@ class _AcknowledgementDecision:
     action: _AcknowledgementAction
     reason: str = ""
     latency_ms: float | None = None
+
+
+@dataclass
+class _EpisodeActionSteps:
+    """Pure per-episode terminal policy-step accounting."""
+
+    max_action_steps: int | None
+    episode_action_steps: int = 0
+    applied_action_steps: int = 0
+    safety_rejected_steps: int = 0
+
+    def __post_init__(self) -> None:
+        if self.max_action_steps is not None and (
+            type(self.max_action_steps) is not int or self.max_action_steps <= 0
+        ):
+            raise ValueError("max_action_steps must be a positive integer or null")
+
+    def reset(self) -> None:
+        self.episode_action_steps = 0
+        self.applied_action_steps = 0
+        self.safety_rejected_steps = 0
+
+    def record_applied(self) -> bool:
+        self.episode_action_steps += 1
+        self.applied_action_steps += 1
+        return self.limit_reached
+
+    def record_safety_rejected(self) -> bool:
+        self.episode_action_steps += 1
+        self.safety_rejected_steps += 1
+        return self.limit_reached
+
+    @property
+    def limit_reached(self) -> bool:
+        return (
+            self.max_action_steps is not None
+            and self.episode_action_steps >= self.max_action_steps
+        )
+
+
+def _record_terminal_before_finalize(
+    record_terminal: Callable[[], bool],
+    finalize_terminal: Callable[[], None],
+) -> bool:
+    """Record/check the limit before any cursor advance or sync request."""
+    if record_terminal():
+        return True
+    finalize_terminal()
+    return False
+
+
+@dataclass
+class _SyncExecution:
+    """Minimal mutable cursor for one sequential sync chunk."""
+
+    chunk: ActionChunk
+    chunk_start_monotonic_ns: int
+    step_index: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.chunk, ActionChunk):
+            raise TypeError("sync execution requires an ActionChunk")
+        if self.chunk_start_monotonic_ns <= 0:
+            raise ValueError("sync chunk start must be positive")
+        if not 0 <= self.step_index < self.chunk.num_steps:
+            raise ValueError("sync step index is outside the chunk")
+
+    def scheduled_target_ns(self, step_dt_ns: int) -> int:
+        if step_dt_ns <= 0:
+            raise ValueError("sync step_dt_ns must be positive")
+        return self.chunk_start_monotonic_ns + self.step_index * int(step_dt_ns)
+
+    def finalize_current(self) -> bool:
+        """Advance once and return whether the complete chunk is finalized."""
+        self.step_index += 1
+        return self.step_index >= self.chunk.num_steps
+
+
+@dataclass
+class _AsyncExecution:
+    """Minimal mutable cursor on one absolute logical ActionChunk timeline."""
+
+    chunk: ActionChunk
+    step_index: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.chunk, ActionChunk):
+            raise TypeError("async execution requires an ActionChunk")
+        if not 0 <= self.step_index < self.chunk.num_steps:
+            raise ValueError("async step index is outside the chunk")
+
+    def scheduled_target_ns(self, step_dt_ns: int) -> int:
+        if step_dt_ns <= 0:
+            raise ValueError("async step_dt_ns must be positive")
+        return self.chunk.observation_logical_step_monotonic_ns + self.step_index * int(
+            step_dt_ns
+        )
+
+    def advance_to_first_future(self, *, now_ns: int, step_dt_ns: int) -> bool:
+        """Keep a selected target due until its next logical boundary."""
+        target_ns = self.scheduled_target_ns(step_dt_ns)
+        if now_ns < target_ns or _selected_async_target_is_due(
+            target_ns=target_ns,
+            step_dt_ns=step_dt_ns,
+            now_ns=now_ns,
+        ):
+            return True
+        return self.align_to_first_future(now_ns=now_ns, step_dt_ns=step_dt_ns)
+
+    def align_to_first_future(self, *, now_ns: int, step_dt_ns: int) -> bool:
+        """Strictly skip every target before now."""
+        first_index = first_future_step_index(
+            self.chunk.observation_logical_step_monotonic_ns,
+            step_dt_ns,
+            now_ns,
+            self.chunk.num_steps,
+        )
+        if first_index is None:
+            return False
+        self.step_index = max(self.step_index, first_index)
+        return self.step_index < self.chunk.num_steps
+
+    def finalize_current(self) -> bool:
+        self.step_index += 1
+        return self.step_index >= self.chunk.num_steps
+
+
+def _newer_async_execution(
+    current: _AsyncExecution | None,
+    incoming: ActionChunk,
+    *,
+    run_generation: int,
+    now_ns: int,
+    step_dt_ns: int,
+) -> _AsyncExecution | None:
+    """Return a usable newer chunk execution, otherwise leave current unchanged."""
+    if incoming.run_generation != run_generation:
+        return current
+    if current is not None and incoming.chunk_id <= current.chunk.chunk_id:
+        return current
+    first_index = first_future_step_index(
+        incoming.observation_logical_step_monotonic_ns,
+        step_dt_ns,
+        now_ns,
+        incoming.num_steps,
+    )
+    if first_index is None:
+        return current
+    return _AsyncExecution(incoming, first_index)
+
+
+def _selected_async_target_is_due(
+    *,
+    target_ns: int,
+    step_dt_ns: int,
+    now_ns: int,
+) -> bool:
+    """Keep a target selected before sleep due until its next grid boundary."""
+    if target_ns <= 0 or step_dt_ns <= 0 or now_ns <= 0:
+        raise ValueError("async target times must be positive")
+    return target_ns <= now_ns < target_ns + step_dt_ns
+
+
+def _chunk_source_is_stale(
+    chunk: ActionChunk,
+    *,
+    now_monotonic_ns: int,
+    max_source_age_ns: int,
+) -> bool:
+    """Return whether source freshness has closed before endpoint publication."""
+    if now_monotonic_ns <= 0 or max_source_age_ns <= 0:
+        raise ValueError("source freshness times must be positive")
+    return (
+        now_monotonic_ns - chunk.observation_latest_source_monotonic_ns
+        > max_source_age_ns
+    )
+
+
+def _chunk_source_deadline_ns(
+    chunk: ActionChunk,
+    *,
+    max_source_age_ns: int,
+) -> int:
+    """Return the immutable source-freshness deadline without uint64 overflow."""
+    if not isinstance(chunk, ActionChunk):
+        raise TypeError("source deadline requires an ActionChunk")
+    if isinstance(max_source_age_ns, (bool, np.bool_)) or not isinstance(
+        max_source_age_ns, (int, np.integer)
+    ):
+        raise TypeError("max_source_age_ns must be an integer")
+    max_age_ns = int(max_source_age_ns)
+    if max_age_ns <= 0:
+        raise ValueError("max_source_age_ns must be positive")
+    source_ns = chunk.observation_latest_source_monotonic_ns
+    if source_ns > _UINT64_MAX - max_age_ns:
+        raise ValueError("source freshness deadline exceeds uint64")
+    return source_ns + max_age_ns
 
 
 def _classify_acknowledgement(
@@ -204,13 +392,13 @@ class CoordinatorConfig:
     hand_feedback_max_age_s: float
     control_hz: float
     execute: bool
-    inference_hz: float
-    max_plan_age_s: float
     max_source_to_command_age_s: float
     max_command_silence_s: float
     action_validity_s: float
     command_acknowledgement_timeout_s: float
     first_command_timeout_s: float
+    inference_mode: str = "sync"
+    max_action_steps: int | None = None
     # Full 19-DoF collision model (hand + static boxes) for EE->IK and the
     # transition collision gate (Phase 6/7); table clearance is not part of the
     # policy safety gate.
@@ -236,9 +424,13 @@ class CoordinatorConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.execute, bool):
             raise TypeError("execute must be a boolean")
+        if self.inference_mode not in {"sync", "async"}:
+            raise ValueError("inference_mode must be 'sync' or 'async'")
+        if self.max_action_steps is not None and (
+            type(self.max_action_steps) is not int or self.max_action_steps <= 0
+        ):
+            raise ValueError("max_action_steps must be a positive integer or null")
         timing_values = (
-            self.inference_hz,
-            self.max_plan_age_s,
             self.max_source_to_command_age_s,
             self.max_command_silence_s,
             self.action_validity_s,
@@ -277,7 +469,9 @@ class CoordinatorConfig:
         runtime: "ResolvedRuntimeConfig",
         *,
         execute: bool,
+        deployment_config: PolicyDeploymentConfig | None = None,
     ) -> "CoordinatorConfig":
+        deployment = deployment_config or PolicyDeploymentConfig()
         return cls(
             arm_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
             arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
@@ -290,8 +484,6 @@ class CoordinatorConfig:
             hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
             control_hz=float(runtime.policy.control_hz),
             execute=execute,
-            inference_hz=float(runtime.policy.inference_hz),
-            max_plan_age_s=float(runtime.policy.max_plan_age_s),
             max_source_to_command_age_s=float(
                 runtime.policy.max_source_to_command_age_s
             ),
@@ -301,6 +493,8 @@ class CoordinatorConfig:
                 runtime.policy.command_acknowledgement_timeout_s
             ),
             first_command_timeout_s=float(runtime.policy.first_command_timeout_s),
+            inference_mode=deployment.inference_mode,
+            max_action_steps=deployment.max_action_steps,
             static_boxes=tuple(runtime.environment.static_boxes),
             ik_max_pose_error_pos_m=float(runtime.policy.ik_max_pose_error_pos_m),
             ik_max_pose_error_rot_rad=float(runtime.policy.ik_max_pose_error_rot_rad),
@@ -319,140 +513,65 @@ class CoordinatorConfig:
         )
 
 
-def _read_latest_plan(shared: RuntimeChannels):
-    """Return the latest plan record (scalar structured array) or None."""
-    result = shared.policy_plan_ring.read_latest()
-    if result is None:
-        return None
-    return result[0][0]
-
-
-def _buffered_plan_from_record(
-    rec: np.void,
-    *,
-    max_plan_age_ns: int,
-    max_source_to_command_age_ns: int,
-) -> BufferedPlan:
-    """Copy and strictly validate one IPC plan at the scheduler boundary."""
-    required = {
-        "plan_id",
-        "run_generation",
-        "observation_id",
-        "observation_latest_source_monotonic_ns",
-        "observation_logical_step_monotonic_ns",
-        "observation_anchor_monotonic_ns",
-        "inference_started_monotonic_ns",
-        "inference_finished_monotonic_ns",
-        "num_steps",
-        "arm_present",
-        "ee_present",
-        "hand_present",
-        "arm_qpos",
-        "hand_qpos",
-        "ee_pos",
-        "ee_rot6d",
-        "target_monotonic_ns",
-        "valid_mask",
-    }
-    names = set(getattr(getattr(rec, "dtype", None), "names", ()) or ())
-    if not required.issubset(names):
-        raise ValueError("policy plan record has an invalid IPC schema")
+def action_chunk_from_record(rec: np.void) -> ActionChunk:
+    """Deserialize and ownership-copy one exact ActionChunk IPC record."""
+    if not isinstance(rec, np.void) or rec.dtype != POLICY_CHUNK_DTYPE:
+        raise ValueError("policy chunk record has an invalid IPC schema")
     n = int(rec["num_steps"])
     if not 0 < n <= MAX_POLICY_CHUNK_STEPS:
-        raise ValueError("policy plan has an invalid num_steps")
-    if int(rec["hand_present"]) != 1:
-        raise ValueError("learned-policy plan must include hand targets")
-    arm_present = int(rec["arm_present"])
-    ee_present = int(rec["ee_present"])
-    if (arm_present, ee_present) not in ((1, 0), (0, 1)):
-        raise ValueError("policy plan must contain exactly one arm representation")
-    deadline_ns = _plan_deadline_ns(
-        rec,
-        max_plan_age_ns=max_plan_age_ns,
-        max_source_to_command_age_ns=max_source_to_command_age_ns,
-    )
-    if deadline_ns is None:
-        raise ValueError("policy plan has non-causal timestamps")
-    target = np.array(rec["target_monotonic_ns"][:n], dtype=np.uint64, copy=True)
-    mask = np.array(rec["valid_mask"][:n], dtype=np.uint8, copy=True)
-    first_index = first_valid_index_from_prefix_mask(mask)
-    if first_index == n:
-        raise ValueError("policy plan valid_mask must contain a deliverable suffix")
-    hand_qpos = np.array(rec["hand_qpos"][:n], dtype=np.float64, copy=True)
-    if not np.all(np.isfinite(hand_qpos)):
-        raise ValueError("policy plan hand targets must be finite")
-    if arm_present:
-        arm_qpos = np.array(rec["arm_qpos"][:n], dtype=np.float64, copy=True)
-        if not np.all(np.isfinite(arm_qpos)):
-            raise ValueError("policy plan arm targets must be finite")
-        chunk = JointActionChunk(arm_qpos, hand_qpos, target, mask)
-    else:
-        ee_pos = np.array(rec["ee_pos"][:n], dtype=np.float64, copy=True)
-        ee_rot6d = np.array(rec["ee_rot6d"][:n], dtype=np.float64, copy=True)
-        if not np.all(np.isfinite(ee_pos)) or not np.all(np.isfinite(ee_rot6d)):
-            raise ValueError("policy plan EE targets must be finite")
-        chunk = JointActionChunk(
-            None, hand_qpos, target, mask, ee_pos=ee_pos, ee_rot6d=ee_rot6d
-        )
-    return BufferedPlan(
-        plan_id=int(rec["plan_id"]),
+        raise ValueError("policy chunk has an invalid num_steps")
+    presence: dict[str, bool] = {}
+    for name in ("arm_present", "ee_present", "hand_present"):
+        value = int(rec[name])
+        if value not in (0, 1):
+            raise ValueError(f"policy chunk {name} must be 0 or 1")
+        presence[name] = bool(value)
+    return ActionChunk(
+        chunk_id=int(rec["chunk_id"]),
         run_generation=int(rec["run_generation"]),
         observation_id=int(rec["observation_id"]),
-        observation_anchor_ns=int(rec["observation_anchor_monotonic_ns"]),
-        observation_latest_source_ns=int(rec["observation_latest_source_monotonic_ns"]),
-        inference_finished_ns=int(rec["inference_finished_monotonic_ns"]),
-        deadline_ns=deadline_ns,
-        chunk=chunk,
+        observation_anchor_monotonic_ns=int(rec["observation_anchor_monotonic_ns"]),
+        observation_latest_source_monotonic_ns=int(
+            rec["observation_latest_source_monotonic_ns"]
+        ),
+        observation_logical_step_monotonic_ns=int(
+            rec["observation_logical_step_monotonic_ns"]
+        ),
+        inference_started_monotonic_ns=int(rec["inference_started_monotonic_ns"]),
+        inference_finished_monotonic_ns=int(rec["inference_finished_monotonic_ns"]),
+        num_steps=n,
+        arm_present=presence["arm_present"],
+        ee_present=presence["ee_present"],
+        hand_present=presence["hand_present"],
+        arm_qpos=(
+            np.array(rec["arm_qpos"][:n], dtype=np.float64, copy=True)
+            if presence["arm_present"]
+            else None
+        ),
+        hand_qpos=(
+            np.array(rec["hand_qpos"][:n], dtype=np.float64, copy=True)
+            if presence["hand_present"]
+            else None
+        ),
+        ee_pos=(
+            np.array(rec["ee_pos"][:n], dtype=np.float64, copy=True)
+            if presence["ee_present"]
+            else None
+        ),
+        ee_rot6d=(
+            np.array(rec["ee_rot6d"][:n], dtype=np.float64, copy=True)
+            if presence["ee_present"]
+            else None
+        ),
     )
 
 
-def _plan_deadline_ns(
-    rec,
-    *,
-    max_plan_age_ns: int,
-    max_source_to_command_age_ns: int,
-) -> int | None:
-    """Return the immutable expiry shared by a plan and its source observation."""
-    finished_ns = int(rec["inference_finished_monotonic_ns"])
-    started_ns = int(rec["inference_started_monotonic_ns"])
-    source_ns = int(rec["observation_latest_source_monotonic_ns"])
-    logical_ns = int(rec["observation_logical_step_monotonic_ns"])
-    anchor_ns = int(rec["observation_anchor_monotonic_ns"])
-    if (
-        finished_ns <= 0
-        or started_ns <= 0
-        or source_ns <= 0
-        or logical_ns <= 0
-        or anchor_ns <= 0
-        or not source_ns <= logical_ns <= anchor_ns <= started_ns <= finished_ns
-    ):
+def read_latest_action_chunk(shared: RuntimeChannels) -> ActionChunk | None:
+    """Read and deserialize the newest parallel ActionChunk transport value."""
+    result = shared.policy_chunk_ring.read_latest()
+    if result is None:
         return None
-    return compute_plan_deadline_ns(
-        finished_ns,
-        source_ns,
-        max_plan_age_ns,
-        max_source_to_command_age_ns,
-    )
-
-
-def _usable_horizon_ms(plan: BufferedPlan, *, now_ns: int) -> float:
-    """Return the remaining actionable span of one immutable plan.
-
-    The result is bounded by both the plan/source deadline and its latest valid
-    logical target. It therefore measures useful future coverage rather than
-    the raw model horizon, and cannot become negative for an already-expired
-    endpoint.
-    """
-    first_index = first_valid_index_from_prefix_mask(plan.chunk.valid_mask)
-    usable = usable_target_mask(
-        plan.chunk.target_monotonic_ns,
-        first_index,
-        plan.deadline_ns,
-    )
-    if not bool(np.any(usable)):
-        return 0.0
-    latest_target_ns = int(np.max(plan.chunk.target_monotonic_ns[usable == 1]))
-    return max(0.0, latest_target_ns - int(now_ns)) / 1e6
+    return action_chunk_from_record(result[0][0])
 
 
 def _physical_start_pose_rejection(
@@ -508,6 +627,7 @@ def _end_policy_run(
     abort: bool,
     metrics: Metrics | None = None,
     metric: str | None = None,
+    summary_status: str | None = None,
 ) -> None:
     """End one policy run after ensuring motion is fenced in ARMED.
 
@@ -545,11 +665,17 @@ def _end_policy_run(
             if metric is not None:
                 metrics.increment(metric)
             metrics.flush(prefix="coordinator metrics")
-            metrics.log_episode_summary(status="ABORTED", reason=reason)
+            metrics.log_episode_summary(
+                status=summary_status or "ABORTED",
+                reason=reason,
+            )
     else:
         logger.info("coordinator: policy run stopped: %s", reason)
         if metrics is not None:
-            metrics.log_episode_summary(status="STOPPED", reason=reason)
+            metrics.log_episode_summary(
+                status=summary_status or "STOPPED",
+                reason=reason,
+            )
 
 
 def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None:
@@ -558,7 +684,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
     Idles in ARMED until the operator presses B (``start_request``), runs one
     policy episode in RUNNING, then returns to ARMED on S (``stop_request``) or
     a policy-semantic abort.  Each B advances the run generation, so any
-    in-flight plan or command from a previous run is invalid at the worker.
+    in-flight chunk or command from a previous run is invalid at the worker.
     """
     if config is None:
         raise ValueError("coordinator_loop requires a CoordinatorConfig")
@@ -620,29 +746,90 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
         return
 
     period_s = 1.0 / float(config.control_hz)
-    max_plan_age_ns = int(config.max_plan_age_s * 1e9)
+    step_dt_ns = int(round(period_s * 1e9))
     max_source_to_command_age_ns = int(config.max_source_to_command_age_s * 1e9)
     max_silence_ns = int(config.max_command_silence_s * 1e9)
     first_command_timeout_ns = int(config.first_command_timeout_s * 1e9)
-    action_buffer = ActionBuffer(
-        max_buffered_plans=compute_max_buffered_plans(
-            config.max_plan_age_s,
-            config.inference_hz,
-        )
-    )
-    buffer_generation: int | None = None
-    last_seen_plan_key: tuple[int, int] | None = None
+    sync_mode = config.inference_mode == "sync"
+    scheduler_generation: int | None = None
+    last_seen_chunk_key: tuple[int, int] | None = None
+    active_execution: _SyncExecution | _AsyncExecution | None = None
     # Silence timeout starts at the first valid endpoint, not first inference.
     last_valid_policy_command_ns: int | None = None
     # RUNNING start time, for the first-command timeout.
     run_started_ns: int | None = None
     pending_acknowledgement: _PendingAcknowledgement | None = None
     previous_arm_command_qpos: np.ndarray | None = None
+    episode_steps = _EpisodeActionSteps(config.max_action_steps)
     last_metrics_flush_ns = time.monotonic_ns()
+
+    def reset_scheduler(*, generation: int | None, clear_request: bool) -> None:
+        """Clear ActionChunk scheduling state at a lifecycle fence."""
+        nonlocal scheduler_generation, last_seen_chunk_key, active_execution
+        scheduler_generation = generation
+        last_seen_chunk_key = None
+        active_execution = None
+        if sync_mode and clear_request:
+            shared.inference_request.clear()
+
+    def finish_active_endpoint(candidate: ActionCandidate | None) -> None:
+        """Finalize one endpoint; sync requests inference only at chunk end."""
+        nonlocal active_execution, previous_arm_command_qpos
+        if active_execution is None:
+            raise RuntimeError("endpoint finalized without an active chunk")
+        if candidate is not None:
+            if candidate.arm_qpos is None:
+                raise RuntimeError("finalized candidate omitted its arm target")
+            previous_arm_command_qpos = np.asarray(
+                candidate.arm_qpos, dtype=np.float64
+            ).copy()
+        was_sync = isinstance(active_execution, _SyncExecution)
+        if active_execution.finalize_current():
+            active_execution = None
+            if was_sync:
+                shared.inference_request.set()
+        elif isinstance(active_execution, _AsyncExecution):
+            if not active_execution.align_to_first_future(
+                now_ns=time.monotonic_ns(),
+                step_dt_ns=step_dt_ns,
+            ):
+                active_execution = None
+
+    def discard_selected_endpoint() -> None:
+        """Finalize one explicit motion/staleness rejection without a token."""
+        finish_active_endpoint(None)
+
+    def record_terminal_step(*, applied: bool) -> bool:
+        """Account one terminal endpoint and truncate before another selection."""
+        nonlocal pending_acknowledgement
+        nonlocal last_valid_policy_command_ns, run_started_ns
+        nonlocal previous_arm_command_qpos
+        reached_limit = (
+            episode_steps.record_applied()
+            if applied
+            else episode_steps.record_safety_rejected()
+        )
+        metrics.increment(EPISODE_ACTION_STEPS)
+        metrics.increment(APPLIED_ACTION_STEPS if applied else SAFETY_REJECTED_STEPS)
+        if not reached_limit:
+            return False
+        _end_policy_run(
+            shared,
+            "action_step_limit",
+            abort=False,
+            metrics=metrics,
+            summary_status="TRUNCATED",
+        )
+        pending_acknowledgement = None
+        reset_scheduler(generation=None, clear_request=True)
+        last_valid_policy_command_ns = None
+        run_started_ns = None
+        previous_arm_command_qpos = None
+        return True
 
     def fault_physical(reason: str, *, metric: str) -> None:
         """Latch FAULT for a physical publication or acknowledgement failure."""
-        nonlocal buffer_generation, last_seen_plan_key, pending_acknowledgement
+        nonlocal pending_acknowledgement
         nonlocal last_valid_policy_command_ns, run_started_ns
         nonlocal previous_arm_command_qpos
         shared.error_state.value = True
@@ -655,16 +842,14 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
         metrics.flush(prefix="coordinator metrics")
         metrics.log_episode_summary(status="FAULTED", reason=reason)
         pending_acknowledgement = None
-        action_buffer.reset(run_generation=int(shared.run_generation.value))
-        buffer_generation = None
-        last_seen_plan_key = None
+        reset_scheduler(generation=None, clear_request=True)
         last_valid_policy_command_ns = None
         run_started_ns = None
         previous_arm_command_qpos = None
 
     def abort_and_reset(reason: str, *, metric: str) -> None:
         """Fail closed and synchronously invalidate every buffered endpoint."""
-        nonlocal buffer_generation, last_seen_plan_key, pending_acknowledgement
+        nonlocal pending_acknowledgement
         nonlocal last_valid_policy_command_ns, run_started_ns
         nonlocal previous_arm_command_qpos
         if config.execute:
@@ -672,9 +857,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
             return
         _end_policy_run(shared, reason, abort=True, metrics=metrics, metric=metric)
         pending_acknowledgement = None
-        action_buffer.reset(run_generation=int(shared.run_generation.value))
-        buffer_generation = None
-        last_seen_plan_key = None
+        reset_scheduler(generation=None, clear_request=True)
         last_valid_policy_command_ns = None
         run_started_ns = None
         previous_arm_command_qpos = None
@@ -701,6 +884,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         reason="operator quit",
                     )
                 pending_acknowledgement = None
+                reset_scheduler(generation=None, clear_request=True)
                 return
 
             if bool(shared.error_state.value) or bool(shared.estop_request.value):
@@ -717,10 +901,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 last_valid_policy_command_ns = None
                 run_started_ns = None
                 previous_arm_command_qpos = None
-                if buffer_generation is not None:
-                    action_buffer.reset(run_generation=int(shared.run_generation.value))
-                    buffer_generation = None
-                    last_seen_plan_key = None
+                reset_scheduler(generation=None, clear_request=True)
                 _sleep_tick(period_s, tick_start)
                 continue
 
@@ -762,9 +943,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         metrics=metrics,
                     )
                     pending_acknowledgement = None
-                    action_buffer.reset(run_generation=int(shared.run_generation.value))
-                    buffer_generation = None
-                    last_seen_plan_key = None
+                    reset_scheduler(generation=None, clear_request=True)
                     last_valid_policy_command_ns = None
                     run_started_ns = None
                     previous_arm_command_qpos = None
@@ -779,45 +958,49 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 if run_started_ns is not None:
                     _sleep_tick(period_s, tick_start)
                     continue
-                if buffer_generation is not None:
-                    action_buffer.reset(run_generation=int(shared.run_generation.value))
-                    buffer_generation = None
-                    last_seen_plan_key = None
+                if scheduler_generation is not None or active_execution is not None:
+                    reset_scheduler(generation=None, clear_request=True)
                 pending_acknowledgement = None
                 last_valid_policy_command_ns = None
                 run_started_ns = None
                 previous_arm_command_qpos = None
+                if not config.execute:
+                    # Shadow has no home lifecycle to acknowledge an S pressed
+                    # while already idle. Clear it only with no active episode;
+                    # a stop for a prior run is settled by the branch above.
+                    with shared.motion_lock:
+                        if (
+                            int(shared.safety_state.value) == int(SafetyState.ARMED)
+                            and not bool(shared.start_request.value)
+                            and int(shared.stop_request.value)
+                            == int(StopRequest.OPERATOR)
+                        ):
+                            shared.stop_request.value = int(StopRequest.NONE)
                 if not bool(shared.start_request.value):
                     _sleep_tick(period_s, tick_start)
                     continue
-                shared.start_request.value = False
                 start_pose_rejection = _physical_start_pose_rejection(shared, config)
                 if start_pose_rejection is not None:
+                    with shared.motion_lock:
+                        shared.start_request.value = False
                     logger.warning("coordinator: ignored B: %s", start_pose_rejection)
                     _sleep_tick(period_s, tick_start)
                     continue
-                # A stray S from ARMED must not stop the freshly started run.
-                shared.stop_request.value = int(StopRequest.NONE)
-                if not begin_motion(shared):
-                    logger.error(
-                        "coordinator: cannot enter RUNNING (safety_state=%d)",
-                        int(shared.safety_state.value),
-                    )
-                    return
+                run_epoch = begin_requested_motion(shared)
+                if run_epoch is None:
+                    # A newer S or lifecycle transition won the same lock.
+                    _sleep_tick(period_s, tick_start)
+                    continue
                 logger.info(
                     "coordinator_loop: RUNNING (run_generation=%d)",
-                    int(shared.run_generation.value),
+                    run_epoch.generation,
                 )
                 if config.execute:
                     # H authorizes exactly one physical episode. A subsequent B
                     # remains disabled until another completed H.
                     shared.physical_home_completed.value = False
                 last_valid_policy_command_ns = None
-                run_epoch = read_run_epoch(shared)
-                if (
-                    run_epoch.generation != int(shared.run_generation.value)
-                    or run_epoch.started_monotonic_ns <= 0
-                ):
+                if run_epoch.started_monotonic_ns <= 0:
                     abort_and_reset(
                         "invalid run epoch", metric=ENDPOINTS_FATAL_REJECTED
                     )
@@ -828,19 +1011,27 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     generation=run_epoch.generation,
                     started_monotonic_ns=run_epoch.started_monotonic_ns,
                 )
+                episode_steps.reset()
+                metrics.increment(EPISODE_ACTION_STEPS, 0)
+                metrics.increment(APPLIED_ACTION_STEPS, 0)
+                metrics.increment(SAFETY_REJECTED_STEPS, 0)
                 pending_acknowledgement = None
-                action_buffer.reset(run_generation=run_epoch.generation)
-                buffer_generation = run_epoch.generation
-                last_seen_plan_key = None
+                reset_scheduler(
+                    generation=run_epoch.generation,
+                    clear_request=True,
+                )
+                if sync_mode:
+                    shared.inference_request.set()
                 _sleep_tick(period_s, tick_start)
                 continue
 
-            if buffer_generation != int(shared.run_generation.value):
+            if scheduler_generation != int(shared.run_generation.value):
                 # A lifecycle epoch invalidated the previous scheduler before
                 # this tick; never let a stale endpoint survive the boundary.
-                action_buffer.reset(run_generation=int(shared.run_generation.value))
-                buffer_generation = int(shared.run_generation.value)
-                last_seen_plan_key = None
+                reset_scheduler(
+                    generation=int(shared.run_generation.value),
+                    clear_request=True,
+                )
 
             if pending_acknowledgement is not None:
                 acknowledgement = poll_coupled_command_acknowledgement(
@@ -859,6 +1050,7 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 )
                 if acknowledgement_decision.action is _AcknowledgementAction.APPLIED:
                     assert acknowledgement_decision.latency_ms is not None
+                    acknowledged_candidate = pending_acknowledgement.candidate
                     metrics.increment(ACKNOWLEDGED)
                     metrics.observe(ACK_LATENCY_MS, acknowledgement_decision.latency_ms)
                     metrics.observe_timing(
@@ -866,9 +1058,23 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     )
                     logger.debug(
                         "coordinator: action_id=%d acknowledged by arm and hand",
-                        pending_acknowledgement.candidate.action_id,
+                        acknowledged_candidate.action_id,
                     )
                     pending_acknowledgement = None
+                    metrics.increment(ENDPOINTS_COMMITTED)
+                    try:
+                        reached_limit = _record_terminal_before_finalize(
+                            lambda: record_terminal_step(applied=True),
+                            lambda: finish_active_endpoint(acknowledged_candidate),
+                        )
+                    except RuntimeError as exc:
+                        fault_physical(
+                            f"acknowledgement invariant failed: {exc}",
+                            metric=ENDPOINTS_FATAL_REJECTED,
+                        )
+                        continue
+                    if reached_limit:
+                        continue
                 elif acknowledgement_decision.action is _AcknowledgementAction.WAIT:
                     _sleep_tick(period_s, tick_start)
                     continue
@@ -904,65 +1110,123 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 )
                 continue
 
-            rec = _read_latest_plan(shared)
-            if rec is not None:
-                key = (int(rec["run_generation"]), int(rec["plan_id"]))
-                if key != last_seen_plan_key:
-                    last_seen_plan_key = key
-                    try:
-                        buffered_plan = _buffered_plan_from_record(
-                            rec,
-                            max_plan_age_ns=max_plan_age_ns,
-                            max_source_to_command_age_ns=max_source_to_command_age_ns,
+            try:
+                newest_chunk = read_latest_action_chunk(shared)
+            except Exception as exc:
+                abort_and_reset(
+                    f"invalid policy chunk IPC record: {exc}",
+                    metric=ENDPOINTS_FATAL_REJECTED,
+                )
+                continue
+            if newest_chunk is not None:
+                chunk_key = (newest_chunk.run_generation, newest_chunk.chunk_id)
+                if chunk_key != last_seen_chunk_key:
+                    last_seen_chunk_key = chunk_key
+                    if newest_chunk.run_generation != int(shared.run_generation.value):
+                        metrics.increment(CHUNKS_GENERATION_DROPPED)
+                    elif sync_mode:
+                        if active_execution is not None:
+                            abort_and_reset(
+                                "sync inference published before chunk completion",
+                                metric=ENDPOINTS_FATAL_REJECTED,
+                            )
+                            continue
+                        active_execution = _SyncExecution(
+                            newest_chunk,
+                            chunk_start_monotonic_ns=now_ns,
                         )
-                    except Exception as exc:
-                        abort_and_reset(
-                            f"invalid policy plan IPC record: {exc}",
-                            metric=ENDPOINTS_FATAL_REJECTED,
-                        )
-                        continue
-                    admitted = action_buffer.push(buffered_plan, now_ns=now_ns)
-                    if admitted.accepted:
-                        metrics.increment(PLANS_INGESTED)
-                        plan_age_ms = max(
-                            0.0,
-                            (now_ns - buffered_plan.inference_finished_ns) / 1e6,
-                        )
-                        metrics.observe(PLAN_AGE_MS, plan_age_ms)
-                        metrics.observe_timing(PLAN_AGE_MS, plan_age_ms)
-                        if admitted.evicted_count:
-                            metrics.increment(PLANS_EVICTED, admitted.evicted_count)
-                    elif admitted.status is PushStatus.WRONG_GENERATION:
-                        metrics.increment(PLANS_GENERATION_DROPPED)
+                        metrics.increment(CHUNKS_INGESTED)
                     else:
-                        metrics.increment(PLANS_STALE)
+                        current_async = active_execution
+                        if current_async is not None and not isinstance(
+                            current_async, _AsyncExecution
+                        ):
+                            abort_and_reset(
+                                "async scheduler retained a sync chunk",
+                                metric=ENDPOINTS_FATAL_REJECTED,
+                            )
+                            continue
+                        replacement = _newer_async_execution(
+                            current_async,
+                            newest_chunk,
+                            run_generation=int(shared.run_generation.value),
+                            now_ns=now_ns,
+                            step_dt_ns=step_dt_ns,
+                        )
+                        if replacement is current_async:
+                            if (
+                                current_async is None
+                                or newest_chunk.chunk_id > current_async.chunk.chunk_id
+                            ):
+                                metrics.increment(CHUNKS_STALE)
+                        else:
+                            active_execution = replacement
+                            metrics.increment(CHUNKS_INGESTED)
 
-            selected = action_buffer.peek_due(now_ns=now_ns)
-            if selected.coverage is not BufferCoverage.DUE:
+            if active_execution is None:
                 _sleep_tick(period_s, tick_start)
                 continue
-            assert (
-                selected.plan is not None
-                and selected.step_index is not None
-                and selected.token is not None
-            )
-            active_plan = selected.plan
-            step_index = selected.step_index
-            endpoint_token = selected.token
-            metrics.increment(ENDPOINTS_DUE)
-            usable_horizon_ms = _usable_horizon_ms(active_plan, now_ns=now_ns)
-            metrics.observe(USABLE_HORIZON_MS, usable_horizon_ms)
-            metrics.observe_timing(USABLE_HORIZON_MS, usable_horizon_ms)
-            if selected.coalesced_count:
-                metrics.increment(ENDPOINTS_COALESCED, selected.coalesced_count)
+            active_chunk = active_execution.chunk
+            try:
+                source_deadline_ns = _chunk_source_deadline_ns(
+                    active_chunk,
+                    max_source_age_ns=max_source_to_command_age_ns,
+                )
+            except (TypeError, ValueError) as exc:
+                abort_and_reset(
+                    f"invalid chunk source deadline: {exc}",
+                    metric=ENDPOINTS_FATAL_REJECTED,
+                )
+                continue
+            if _chunk_source_is_stale(
+                active_chunk,
+                now_monotonic_ns=now_ns,
+                max_source_age_ns=max_source_to_command_age_ns,
+            ):
+                was_sync = isinstance(active_execution, _SyncExecution)
+                active_execution = None
+                if was_sync:
+                    shared.inference_request.set()
+                metrics.increment(CHUNKS_STALE)
+                _sleep_tick(period_s, tick_start)
+                continue
 
-            assert active_plan.chunk.hand_qpos is not None
-            hand_qpos = np.asarray(
-                active_plan.chunk.hand_qpos[step_index], dtype=np.float64
-            )
+            if isinstance(active_execution, _SyncExecution):
+                scheduled_target_ns = active_execution.scheduled_target_ns(step_dt_ns)
+            else:
+                if not active_execution.advance_to_first_future(
+                    now_ns=now_ns,
+                    step_dt_ns=step_dt_ns,
+                ):
+                    active_execution = None
+                    metrics.increment(CHUNKS_STALE)
+                    _sleep_tick(period_s, tick_start)
+                    continue
+                scheduled_target_ns = active_execution.scheduled_target_ns(step_dt_ns)
+            if now_ns < scheduled_target_ns:
+                if isinstance(active_execution, _AsyncExecution):
+                    time.sleep(
+                        min(
+                            (scheduled_target_ns - now_ns) / 1e9,
+                            _TARGET_WAIT_HEARTBEAT_S,
+                        )
+                    )
+                    # Re-enter through chunk ingest so a newer async result can
+                    # replace this selected endpoint before publication.
+                    continue
+                else:
+                    _sleep_tick(period_s, tick_start)
+                    continue
+            step_index = active_execution.step_index
+            active_observation_id = active_chunk.observation_id
+            active_observation_anchor_ns = active_chunk.observation_anchor_monotonic_ns
+            metrics.increment(ENDPOINTS_DUE)
+
+            assert active_chunk.hand_qpos is not None
+            hand_qpos = np.asarray(active_chunk.hand_qpos[step_index], dtype=np.float64)
 
             _arm_state = read_arm_state_dict(shared)
-            if active_plan.chunk.is_ee:
+            if active_chunk.is_ee:
                 # EE -> joint via collision-aware IK.
                 # hand_qpos is loaded into the collision model first so the solve
                 # sees the full 19-DoF geometry.
@@ -997,21 +1261,20 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         metric=ENDPOINTS_FATAL_REJECTED,
                     )
                     continue
-                assert active_plan.chunk.ee_pos is not None
-                assert active_plan.chunk.ee_rot6d is not None
-                ee_pos = np.asarray(
-                    active_plan.chunk.ee_pos[step_index], dtype=np.float64
-                )
+                assert active_chunk.ee_pos is not None
+                assert active_chunk.ee_rot6d is not None
+                ee_pos = np.asarray(active_chunk.ee_pos[step_index], dtype=np.float64)
                 ee_rot6d = np.asarray(
-                    active_plan.chunk.ee_rot6d[step_index], dtype=np.float64
+                    active_chunk.ee_rot6d[step_index], dtype=np.float64
                 )
                 try:
                     validate_rot6d_geometry(ee_rot6d, label="policy ee_rot6d")
                 except ValueError:
+                    metrics.increment(ENDPOINTS_MOTION_DISCARDED)
                     try:
-                        action_buffer.discard(
-                            endpoint_token,
-                            reason_code="ee_rot6d_geometry",
+                        reached_limit = _record_terminal_before_finalize(
+                            lambda: record_terminal_step(applied=False),
+                            discard_selected_endpoint,
                         )
                     except RuntimeError:
                         abort_and_reset(
@@ -1019,7 +1282,8 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                             metric=ENDPOINTS_FATAL_REJECTED,
                         )
                         continue
-                    metrics.increment(ENDPOINTS_MOTION_DISCARDED)
+                    if reached_limit:
+                        continue
                     _sleep_tick(period_s, tick_start)
                     continue
                 try:
@@ -1064,10 +1328,11 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                             metric=ENDPOINTS_FATAL_REJECTED,
                         )
                         continue
+                    metrics.increment(ENDPOINTS_MOTION_DISCARDED)
                     try:
-                        action_buffer.discard(
-                            endpoint_token,
-                            reason_code=failure_kind.value,
+                        reached_limit = _record_terminal_before_finalize(
+                            lambda: record_terminal_step(applied=False),
+                            discard_selected_endpoint,
                         )
                     except RuntimeError:
                         abort_and_reset(
@@ -1075,14 +1340,15 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                             metric=ENDPOINTS_FATAL_REJECTED,
                         )
                         continue
-                    metrics.increment(ENDPOINTS_MOTION_DISCARDED)
+                    if reached_limit:
+                        continue
                     _sleep_tick(period_s, tick_start)
                     continue
                 arm_qpos = np.asarray(ik_result.qpos, dtype=np.float64)
             else:
-                assert active_plan.chunk.arm_qpos is not None
+                assert active_chunk.arm_qpos is not None
                 arm_qpos = np.asarray(
-                    active_plan.chunk.arm_qpos[step_index], dtype=np.float64
+                    active_chunk.arm_qpos[step_index], dtype=np.float64
                 )
                 # Preserve joint-wrap continuity against the command stream.
                 arm_reference = previous_arm_command_qpos
@@ -1105,14 +1371,13 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     shared,
                     arm_qpos,
                     hand_qpos,
+                    run_generation=active_chunk.run_generation,
                     is_hold=False,
-                    observation_id=active_plan.observation_id,
-                    observation_anchor_monotonic_ns=active_plan.observation_anchor_ns,
-                    scheduled_target_monotonic_ns=int(
-                        active_plan.chunk.target_monotonic_ns[step_index]
-                    ),
+                    observation_id=active_observation_id,
+                    observation_anchor_monotonic_ns=active_observation_anchor_ns,
+                    scheduled_target_monotonic_ns=scheduled_target_ns,
                     action_validity_s=float(config.action_validity_s),
-                    valid_until_monotonic_ns=active_plan.deadline_ns,
+                    valid_until_monotonic_ns=source_deadline_ns,
                 )
             except (TypeError, ValueError) as exc:
                 abort_and_reset(
@@ -1121,12 +1386,9 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                 )
                 continue
             if candidate is None:
-                if time.monotonic_ns() >= active_plan.deadline_ns:
+                if time.monotonic_ns() > source_deadline_ns:
                     try:
-                        action_buffer.discard(
-                            endpoint_token,
-                            reason_code="temporal_window_closed",
-                        )
+                        discard_selected_endpoint()
                     except RuntimeError:
                         abort_and_reset(
                             "stale endpoint could not be finalized",
@@ -1161,9 +1423,9 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     ),
                     canonicalize_policy_hand_roundoff=True,
                     execute=config.execute,
+                    required_safety_state=SafetyState.RUNNING,
                     # Leave one full policy tick for both 30 Hz workers to
-                    # observe the coupled record. Near-expiry plans are stale;
-                    # never extend their immutable source deadline.
+                    # observe the coupled record.
                     minimum_delivery_window_s=period_s,
                 )
             except Exception as exc:
@@ -1208,16 +1470,22 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         metric=ENDPOINTS_FATAL_REJECTED,
                     )
                     continue
-                try:
-                    action_buffer.commit(endpoint_token)
-                except RuntimeError:
-                    abort_and_reset(
-                        "published endpoint could not be committed",
-                        metric=ENDPOINTS_FATAL_REJECTED,
-                    )
-                    continue
                 if validated_only:
                     metrics.increment(ENDPOINTS_VALIDATED)
+                    metrics.increment(ENDPOINTS_COMMITTED)
+                    try:
+                        reached_limit = _record_terminal_before_finalize(
+                            lambda: record_terminal_step(applied=True),
+                            lambda: finish_active_endpoint(published_candidate),
+                        )
+                    except RuntimeError as exc:
+                        abort_and_reset(
+                            f"validation invariant failed: {exc}",
+                            metric=ENDPOINTS_FATAL_REJECTED,
+                        )
+                        continue
+                    if reached_limit:
+                        continue
                 else:
                     metrics.increment(ENDPOINTS_PUBLISHED)
                     ticket = publish_result.ticket
@@ -1242,10 +1510,6 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                         "coordinator: published action_id=%d; awaiting arm/hand acknowledgement",
                         published_candidate.action_id,
                     )
-                metrics.increment(ENDPOINTS_COMMITTED)
-                previous_arm_command_qpos = np.asarray(
-                    published_candidate.arm_qpos, dtype=np.float64
-                ).copy()
                 last_valid_policy_command_ns = now_ns
             elif disposition in {
                 PolicyEndpointDisposition.DISCARD_MOTION,
@@ -1265,22 +1529,30 @@ def coordinator_loop(shared: RuntimeChannels, config: CoordinatorConfig) -> None
                     is CommandPublishStatus.HAND_PREFLIGHT_REJECTED
                 ):
                     metrics.increment(HAND_PREFLIGHT_REJECTIONS)
-                reason_code = (
-                    publish_result.gate_code.value
-                    if publish_result.gate_code is not None
-                    else publish_result.status.value
-                )
-                try:
-                    action_buffer.discard(endpoint_token, reason_code=reason_code)
-                except RuntimeError:
-                    abort_and_reset(
-                        "rejected endpoint could not be finalized",
-                        metric=ENDPOINTS_FATAL_REJECTED,
-                    )
-                    continue
                 if disposition is PolicyEndpointDisposition.DISCARD_MOTION:
                     metrics.increment(ENDPOINTS_MOTION_DISCARDED)
+                    try:
+                        reached_limit = _record_terminal_before_finalize(
+                            lambda: record_terminal_step(applied=False),
+                            discard_selected_endpoint,
+                        )
+                    except RuntimeError:
+                        abort_and_reset(
+                            "rejected endpoint could not be finalized",
+                            metric=ENDPOINTS_FATAL_REJECTED,
+                        )
+                        continue
+                    if reached_limit:
+                        continue
                 else:
+                    try:
+                        discard_selected_endpoint()
+                    except RuntimeError:
+                        abort_and_reset(
+                            "stale endpoint could not be finalized",
+                            metric=ENDPOINTS_FATAL_REJECTED,
+                        )
+                        continue
                     metrics.increment(ENDPOINTS_STALE_DISCARDED)
             elif disposition is PolicyEndpointDisposition.DEFER_TRANSIENT:
                 metrics.increment(ENDPOINTS_TRANSIENT_DEFERRED)

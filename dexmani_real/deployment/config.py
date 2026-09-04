@@ -1,26 +1,37 @@
 """PolicySpec compatibility and narrow inference-worker configuration.
 
-Policy owns model shape, modality, and horizon. Real owns all control timing in
-``ResolvedRuntimeConfig.policy``. This module only validates their boundary and
-carries pickle-safe experiment identity into the spawned worker; it never
-imports Policy or Torch.
+Policy owns model shape, modality, horizon, and action-grid spacing. Real
+validates that spacing against its control frequency and owns safety timing.
+This module only validates their boundary and carries pickle-safe experiment
+identity into the spawned worker; it never imports Policy or Torch.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+import yaml
 
 from dexmani_real.ipc.schema import (
     MAX_POLICY_CHUNK_STEPS,
     POINT_CLOUD_FEATURE_DIM,
     SUPPORTED_POINT_CLOUD_COUNTS,
 )
+from dexmani_real.robot_spec import XHAND_RIGHT_URDF_PATH
 
 FIXED_POLICY_RUNTIME_TARGET = (
     "dexmani_real.integrations.dexmani_policy:DexManiPolicyRuntime"
 )
+
+_DEPLOYMENT_DEFAULT_MODE = "sync"
+_DEPLOYMENT_MODES = frozenset({"sync", "async"})
+_DEPLOYMENT_SECTIONS = frozenset({"inference", "episode"})
+_DEPLOYMENT_INFERENCE_FIELDS = frozenset({"mode"})
+_DEPLOYMENT_EPISODE_FIELDS = frozenset({"max_action_steps"})
 
 _REQUIRED_POLICY_SPEC_FIELDS = (
     "action_key",
@@ -29,12 +40,75 @@ _REQUIRED_POLICY_SPEC_FIELDS = (
     "horizon",
     "n_obs_steps",
     "n_action_steps",
-    "sensor_modalities",
-    "point_cloud_num_points",
-    "point_cloud_feature_dim",
+    "observation_fields",
     "control_dt_s",
     "requires_hand",
 )
+
+_SUPPORTED_OBSERVATION_FIELDS = frozenset(
+    {"joint_state", "point_cloud", "rgb", "contact_force", "fingertip_points"}
+)
+
+
+def policy_observation_fields(policy_spec: Any) -> tuple[Any, ...]:
+    """Return the ordered Policy-owned input contract without a fallback path."""
+    fields = getattr(policy_spec, "observation_fields", None)
+    if type(fields) is not tuple or not fields:
+        raise ValueError("Policy observation_fields must be a non-empty tuple")
+    return fields
+
+
+def _field_shape(field: Any, *, name: str) -> tuple[int, ...]:
+    shape = getattr(field, "shape", None)
+    if (
+        type(shape) is not tuple
+        or not shape
+        or any(type(value) is not int or value <= 0 for value in shape)
+    ):
+        raise ValueError(f"Policy observation field {name!r} has an invalid shape")
+    return shape
+
+
+def _validate_observation_fields(policy_spec: Any) -> tuple[Any, ...]:
+    """Validate only raw tensor projections that Real can produce safely."""
+    fields = policy_observation_fields(policy_spec)
+    names = tuple(getattr(field, "name", None) for field in fields)
+    if (
+        any(type(name) is not str or not name for name in names)
+        or len(set(names)) != len(names)
+        or not set(names) <= _SUPPORTED_OBSERVATION_FIELDS
+        or "joint_state" not in names
+    ):
+        raise ValueError(
+            "Policy observation_fields must be unique supported names including joint_state"
+        )
+
+    fixed_fields = {
+        "joint_state": ((19,), "float32"),
+        "contact_force": ((5, 3), "float32"),
+        "fingertip_points": ((5, 3), "float32"),
+    }
+    for field, name in zip(fields, names, strict=True):
+        shape = _field_shape(field, name=name)
+        dtype = getattr(field, "dtype", None)
+        if name in fixed_fields:
+            if (shape, dtype) != fixed_fields[name]:
+                raise ValueError(
+                    f"Policy observation field {name!r} does not match Real's raw tensor"
+                )
+        elif name == "point_cloud":
+            if (
+                len(shape) != 2
+                or shape[1] != POINT_CLOUD_FEATURE_DIM
+                or dtype != "float32"
+                or shape[0] not in SUPPORTED_POINT_CLOUD_COUNTS
+            ):
+                raise ValueError(
+                    "Policy point_cloud must be float32 [N, 6] with a supported N"
+                )
+        elif name == "rgb" and (len(shape) != 3 or shape[2] != 3 or dtype != "uint8"):
+            raise ValueError("Policy rgb must be uint8 [H, W, 3]")
+    return fields
 
 
 def validate_policy_spec(policy_spec: Any) -> None:
@@ -45,28 +119,12 @@ def validate_policy_spec(policy_spec: Any) -> None:
     if missing:
         raise TypeError(f"PolicySpec is missing required field(s): {missing}")
 
-    modalities = tuple(policy_spec.sensor_modalities)
-    if set(modalities) != {"joint_state", "point_cloud"} or len(modalities) != 2:
-        raise ValueError(
-            "Real deployment currently supports exactly joint_state + point_cloud"
-        )
+    _validate_observation_fields(policy_spec)
     if policy_spec.requires_hand is not True:
         raise ValueError(
             "Real deployment requires hand actions because its control schema is "
             "arm7 + hand12"
         )
-    if policy_spec.point_cloud_feature_dim != POINT_CLOUD_FEATURE_DIM:
-        raise ValueError(
-            "Policy point_cloud_feature_dim does not match Real's xyzrgb contract"
-        )
-    if (
-        isinstance(policy_spec.point_cloud_num_points, bool)
-        or policy_spec.point_cloud_num_points not in SUPPORTED_POINT_CLOUD_COUNTS
-    ):
-        raise ValueError(
-            "Policy point_cloud_num_points is unsupported by Real shared memory"
-        )
-
     integer_fields = (
         "action_dim",
         "control_action_dim",
@@ -114,10 +172,106 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
         abs_tol=1e-12,
     ):
         raise ValueError("Policy control_dt_s does not match Real policy.control_hz")
-    if runtime.pointcloud.num_points != policy_spec.point_cloud_num_points:
+    fields = {field.name: field for field in policy_observation_fields(policy_spec)}
+    point_cloud = fields.get("point_cloud")
+    if (
+        point_cloud is not None
+        and runtime.pointcloud.num_points != point_cloud.shape[0]
+    ):
         raise ValueError(
-            "Policy point_cloud_num_points does not match Real pointcloud config"
+            "Policy point_cloud shape does not match Real pointcloud config"
         )
+    rgb = fields.get("rgb")
+    if rgb is not None and rgb.shape != (
+        int(runtime.camera.height),
+        int(runtime.camera.width),
+        3,
+    ):
+        raise ValueError("Policy rgb shape does not match Real camera config")
+
+
+@dataclass(frozen=True)
+class PolicyDeploymentConfig:
+    """Small operator-owned policy deployment configuration.
+
+    Model structure and chunk length remain owned by ``PolicySpec``.  Real
+    runtime and safety parameters remain owned by ``ResolvedRuntimeConfig``;
+    this object only carries the explicit scheduler mode and episode horizon
+    requested by the deployment workflow.
+    """
+
+    inference_mode: str = _DEPLOYMENT_DEFAULT_MODE
+    max_action_steps: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.inference_mode, str) or (
+            self.inference_mode not in _DEPLOYMENT_MODES
+        ):
+            raise ValueError("inference_mode must be one of 'sync' or 'async'")
+        if self.max_action_steps is not None and (
+            type(self.max_action_steps) is not int or self.max_action_steps <= 0
+        ):
+            raise ValueError("max_action_steps must be a positive integer or null")
+
+
+def _deployment_section(
+    root: Mapping[object, object], name: str, allowed_fields: frozenset[str]
+) -> Mapping[object, object]:
+    """Read and validate one strict deployment YAML section."""
+    raw = root.get(name, {})
+    if not isinstance(raw, Mapping):
+        raise TypeError(f"deployment config section {name!r} must be an object")
+    unknown = set(raw) - allowed_fields
+    if unknown:
+        raise TypeError(
+            f"unknown deployment config field(s) in {name}: {sorted(map(str, unknown))}"
+        )
+    return raw
+
+
+def resolve_policy_deployment_config(
+    *,
+    yaml_path: str | Path | None = None,
+    inference_mode: str | None = None,
+    max_action_steps: int | None = None,
+) -> PolicyDeploymentConfig:
+    """Resolve ``CLI > deployment YAML > defaults``.
+
+    Deployment YAML intentionally has a narrow schema.  It must not be passed
+    to the broader Real runtime resolver because scheduler choices are not
+    hardware, calibration, or low-level safety configuration.
+    """
+    file_mode: Any = _DEPLOYMENT_DEFAULT_MODE
+    file_max_action_steps: Any = None
+    if yaml_path is not None:
+        path = Path(yaml_path)
+        with path.open("r", encoding="utf-8") as stream:
+            loaded = yaml.safe_load(stream)
+        if loaded is None:
+            loaded = {}
+        if not isinstance(loaded, Mapping):
+            raise TypeError("deployment config root must be an object")
+        unknown = set(loaded) - _DEPLOYMENT_SECTIONS
+        if unknown:
+            raise TypeError(
+                f"unknown deployment config section(s): {sorted(map(str, unknown))}"
+            )
+
+        inference = _deployment_section(
+            loaded, "inference", _DEPLOYMENT_INFERENCE_FIELDS
+        )
+        episode = _deployment_section(loaded, "episode", _DEPLOYMENT_EPISODE_FIELDS)
+        if "mode" in inference:
+            file_mode = inference["mode"]
+        if "max_action_steps" in episode:
+            file_max_action_steps = episode["max_action_steps"]
+
+    return PolicyDeploymentConfig(
+        inference_mode=(file_mode if inference_mode is None else inference_mode),
+        max_action_steps=(
+            file_max_action_steps if max_action_steps is None else max_action_steps
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -143,9 +297,44 @@ class PolicyWorkerConfig:
         validate_policy_spec(self.spec)
 
 
+@dataclass(frozen=True)
+class FingertipAssemblerConfig:
+    """Explicit pickle-safe geometry inputs for deployment-local FK."""
+
+    hand_urdf_path: str
+    fingertip_link_names: tuple[str, ...]
+    handbase_position_eef_m: tuple[float, float, float]
+    handbase_quat_eef_wxyz: tuple[float, float, float, float]
+
+    @classmethod
+    def from_runtime(cls, runtime: Any) -> "FingertipAssemblerConfig":
+        hand = runtime.hand
+        return cls(
+            hand_urdf_path=str(XHAND_RIGHT_URDF_PATH),
+            fingertip_link_names=tuple(hand.fingertip_link_names),
+            handbase_position_eef_m=tuple(hand.T_eef_handbase_pos_xyz),
+            handbase_quat_eef_wxyz=tuple(hand.T_eef_handbase_quat_wxyz),
+        )
+
+    def __post_init__(self) -> None:
+        if not self.hand_urdf_path or len(self.fingertip_link_names) != 5:
+            raise ValueError("fingertip FK requires one URDF and five link names")
+        values = (*self.handbase_position_eef_m, *self.handbase_quat_eef_wxyz)
+        if (
+            len(self.handbase_position_eef_m) != 3
+            or len(self.handbase_quat_eef_wxyz) != 4
+            or not all(math.isfinite(float(value)) for value in values)
+        ):
+            raise ValueError("fingertip mount transform is malformed")
+
+
 __all__ = [
     "FIXED_POLICY_RUNTIME_TARGET",
+    "FingertipAssemblerConfig",
+    "PolicyDeploymentConfig",
     "PolicyWorkerConfig",
+    "policy_observation_fields",
+    "resolve_policy_deployment_config",
     "validate_policy_runtime_compatibility",
     "validate_policy_spec",
 ]

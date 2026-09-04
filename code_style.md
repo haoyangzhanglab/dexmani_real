@@ -86,7 +86,7 @@ entry point
 - `control/`：跨控制方式共用的 action contract、safety boundary、publication 与 homing。
 - `replay/`：物理回放的加载、调度、捕获、评估与 session。
 - `calibration/`：相机、桌面等标定算法与 side-effect lifecycle。
-- `deployment/`：模型 observation、inference、plan 和调度。
+- `deployment/`：模型 observation、inference、action chunk 和调度。
 - `recording/`：raw episode schema、写入与读取。
 - `data/`：离线清洗和训练数据导出。
 - `runtime/`：进程生命周期、supervisor 与结构化退出状态。
@@ -346,7 +346,7 @@ def control_tick(snapshot: ObservationSnapshot) -> CommandPublishResult:
 def run_policy_loop(
     observation_reader: PolicyObservationReader,
     policy_runtime: PolicyRuntime,
-    plan_publisher: ActionPlanPublisher,
+    publish_chunk: Callable[[ActionChunk], bool],
     stop_event: Event,
     *,
     read_timeout_s: float,
@@ -354,7 +354,8 @@ def run_policy_loop(
     while not stop_event.is_set():
         observation = observation_reader.read_fresh(timeout_s=read_timeout_s)
         action_chunk = policy_runtime.infer(observation)
-        plan_publisher.publish(action_chunk)
+        if not publish_chunk(action_chunk):
+            return
 ```
 
 上例的 loop 只借用已 ready 的组件，不拥有它们，因此不负责启动或关闭。资源由创建它的
@@ -509,6 +510,7 @@ startup。不依赖 `__del__` 关闭硬件；如果 context manager 能显著让
 ```python
 def run_policy_deployment(
     config: PolicyWorkflowConfig,
+    publish_chunk: Callable[[ActionChunk], bool],
     stop_event: Event,
 ) -> None:
     with ExitStack() as cleanup:
@@ -521,15 +523,10 @@ def run_policy_deployment(
         cleanup.callback(policy_runtime.close)
         policy_runtime.load()
 
-        plan_publisher = ActionPlanPublisher(config.publisher)
-        cleanup.callback(plan_publisher.close)
-        plan_publisher.start()
-        plan_publisher.wait_until_ready(timeout_s=config.startup_timeout_s)
-
         run_policy_loop(
             observation_reader,
             policy_runtime,
-            plan_publisher,
+            publish_chunk,
             stop_event,
             read_timeout_s=config.read_timeout_s,
         )
@@ -557,7 +554,7 @@ class PolicyRuntime:
             return
         self._backend = TorchPolicyBackend.from_checkpoint(self._config)
 
-    def infer(self, observation: PolicyObservation) -> JointActionChunk:
+    def infer(self, observation: PolicyObservation) -> ActionChunk:
         backend = self._require_backend()
         raw_action = backend.predict(observation)
         return decode_joint_action(raw_action, config=self._config.action)
@@ -653,11 +650,11 @@ read → check freshness/state → compute → validate → publish → rate con
 模型输出是 proposal，不是机器人命令。部署边界保持：
 
 ```text
-typed observation (causal history windows + point-cloud T 历史)
+typed observation (causal T-step multimodal history)
 → dexmani_policy public runtime (load/predict/reset_episode)
 → Real NumPy adapter
 → joint/EE action chunk
-→ scheduler/coordinator (active/pending + replan stride + EE→IK)
+→ scheduler/coordinator (one active chunk + endpoint index + EE→IK)
 → shared safety gate (limits + delta + collision)
 → actuator IPC
 ```
@@ -666,12 +663,12 @@ typed observation (causal history windows + point-cloud T 历史)
 
 - checkpoint/Hydra/EMA/normalizer/Torch 只由 `dexmani_policy.deployment` public API 拥有；
 - device 与 experiment 是 session 输入；PolicySpec 是 model shape、modality、action 与 dt 的只读合同；
-- Real-owned inference、freshness、plan、ACK 与 watchdog timing 只从 resolved runtime 的 `policy` 段读取；
-- Real 只校验固定硬件、点云、控制周期与 IPC capacity 兼容，不解析 checkpoint 内部结构；
+- Real-owned observation freshness、ACK 与 watchdog timing 只从 resolved runtime 的 `policy` 段读取；调度模式与 episode action-step 上限由 deployment 配置拥有，inference cadence 来自 PolicySpec；
+- Real 校验固定硬件、字段 shape/dtype/语义、控制周期与 IPC capacity，不解析 checkpoint 内部结构；
 - inference/no-grad、normalization/denormalization 与 model preprocessing 均由 Policy runtime 拥有；
 - EE action、joint action、degrees/radians 不做静默猜测或自动兼容；
 - 不允许模型代码直接访问 hardware SDK 或绕过 coordinator；
-- `FakePolicyRuntime` 保持确定性，用于验证 observation → plan 链路而非模拟真实性能。
+- `FakePolicyRuntime` 保持确定性，用于验证 observation → action chunk 链路而非模拟真实性能。
 
 ## 13. 数据采集和离线处理
 

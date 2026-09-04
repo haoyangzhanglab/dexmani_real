@@ -236,8 +236,8 @@ detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal
 | `/joint_state` | `(N,19)` | float32 | 视觉 profile 为 `policy_observation_arm_qpos(7)+policy_observation_hand_qpos(12)`；`joint` profile 为 control-grid state，单位 rad。 |
 | `/action` | `(N,19)` | float32 | `action_arm_joint_sent(7)+action_hand_joint(12)`；arm 部分是实际提交命令，单位 rad。 |
 | `/action_ee` | `(N,21)` | float32 | `eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)`，EEF 在 `xarm_base`；rot6d 两列必须是 canonical 单位正交列。 |
-| `/contact_force` | `(N,5,3)` | float32 | raw `hand_contact` 的每指三轴 tactile sum；单帧、前后均有效的 SDK 通信错误使用上一帧值因果保持；单位/轴由 root attrs 指定。 |
-| `/fingertip_points` | `(N,5,3)` | float32 | 五指指尖坐标（m），`xarm_base`。 |
+| `/contact_force` | `(N,5,3)` | float32 | raw `hand_contact` 的每指三轴 tactile sum；选择不晚于 observation reference、skew 有界且 hand/tactile source 相等的最新 fresh+calibrated+unit-proven 行。单位/轴由 root attrs 指定。 |
+| `/fingertip_points` | `(N,5,3)` | float32 | 五指指尖坐标（m），`xarm_base`；视觉 profile 从同一 camera-aligned arm/hand qpos 通过共享 FK 重新计算。 |
 | `/rgb` | `(N,H_p,W_p,3)` | uint8 | 仅 RGB profile；resize、不裁剪。 |
 | `/depth` | `(N,H_p,W_p)` | uint16 | 仅 RGB profile；对齐到 RGB，nearest resize；0 无效，米值由 `depth_scale_m_per_unit` 给出。 |
 | `/camera_intrinsic` | `(N,9)` | float32 | resize 后 color K，row-major 展平的 3×3。 |
@@ -270,7 +270,7 @@ detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal
 |---|---|---|---|
 | schema 与来源 | `schema_name`、`schema_version`、`domain`、`source_episode`、`source_frames` | string / int | `dexmani-real-processed-hdf5`、`11`、`real`，以及 raw 输入身份。 |
 | 长度与训练标签 | `profile`、`episode_steps`、`dt`、`time_semantics`、`source_contiguity`、`source_contiguity_tolerance_s`、`obs_alignment`、`observation_reference`、`state_alignment`、`max_observation_skew_s`、`action_semantics`、`arm_max_delta_rad_per_tick`、`hand_max_delta_rad_per_tick`、`endpoint_delta_tolerance_rad`、`deployment_equivalent`、`task_name`、`action_dim`、`action_ee_dim`、`action_space` | string / int / float / bool | profile、压紧后长度、段边界 provenance、`obs[t]_before_action[t]`，以及 state/camera 对齐、观察 skew、动作 endpoint 限制、共享 endpoint tolerance 和是否可用于 deployment training 的显式合同。 |
-| Real core 语义 | `fingertip_points_frame`、`fingertip_points_unit`、`action_ee_frame`、`action_ee_components`、`contact_force_source`、`contact_force_unit`、`contact_force_si_verified`、`contact_force_frame` | string / bool | xarm-base 位置与 EEF frame；指尖单位 m；tactile 的来源、单位和原生轴。 |
+| Real core 语义 | `fingertip_points_frame`、`fingertip_points_unit`、`action_ee_frame`、`action_ee_components`、`contact_force_source`、`contact_force_alignment`、`contact_force_unit`、`contact_force_si_verified`、`contact_force_frame`、`contact_force_fresh_required`、`contact_force_calibrated_required`、`contact_force_unit_code`、`contact_force_causal_to_reference`、`contact_force_hand_source_match_required` | string / bool / int | xarm-base 位置与 EEF frame；指尖单位 m；tactile 的来源、因果选择、单位、原生轴与逐行 proof 要求。 |
 | 处理与审计 | `processing_config_json`、`quality_summary_json`、`source_decision_json`、`source_member_sha256_json`、`source_resolved_config_sha256` | JSON string / string | 处理配置、选择/拒绝结论、恰好 `data.h5`/`depth.h5`/`rgb.mp4` 三个 raw 成员的 64-hex 哈希与录制配置哈希。`source_decision_json.hard_invalid_reason_names` 是必填的硬无效 reason 名称列表。哈希格式检查不等于 raw 文件真实性证明。 |
 | RGB-D（仅 RGB/RGB-PC） | `rgb_transform`、`depth_transform`、`depth_unit`、`depth_scale_m_per_unit`、`depth_invalid_value`、`camera_intrinsic_semantics`、`camera_extrinsic_semantics` | string / float / int | 无裁剪 resize、aligned depth 的 nearest resize、depth 单位与无效值 `0`、K/T 语义。 |
 | RGB-D provenance（仅 RGB/RGB-PC） | `source_camera_depth_intrinsics_native`、`source_camera_depth_distortion_model`、`source_camera_depth_distortion_coeffs`、`camera_color_distortion_model`、`camera_color_distortion_coeffs`、`camera_T_color_from_depth` | float64 `(9,)`；string；float64 `(K_d,)`；float64 `(4,4)` | native depth K、depth/color 畸变与 native depth optical → color optical 外参。 |
@@ -315,12 +315,12 @@ Zarr root attrs 是最小运行语义，而不是 processed 全部 provenance：
 | 范围 | attrs | 类型 / 语义 |
 |---|---|---|
 | schema 与任务 | `schema_name`、`schema_version`、`domain`、`profile`、`task_name`、`dt`、`episode_start_policy`、`obs_alignment`、`observation_reference`、`state_alignment`、`max_observation_skew_s`、`action_semantics`、`arm_max_delta_rad_per_tick`、`hand_max_delta_rad_per_tick`、`endpoint_delta_tolerance_rad`、`deployment_equivalent` | string / int / float / bool；固定为 `dexmani-real-policy-zarr`、`5`、`real`、`full_history`、`obs[t]_before_action[t]`，并持久化 deployment observation、action endpoint 和共享 tolerance 的精确合同。训练不得用左侧 observation padding 构造 episode 起始样本。 |
-| pointcloud/RGB-PC core | `contact_force_unit`、`contact_force_si_verified`、`contact_force_frame`、`fingertip_points_frame`、`action_ee_frame` | string / bool；来自 processed 输入并要求全部 episode 一致。 |
+| Real core | `contact_force_*` proof attrs、`fingertip_points_frame`、`fingertip_points_unit`、`action_ee_frame` | string / bool / int；来自 processed 输入并要求全部 episode 一致。 |
 | RGB-PC profile | `depth_scale_m_per_unit`、`depth_invalid_value`、`camera_extrinsic_semantics` | float / int / string；depth 单位、无效像素值与 `T_xarm_base_from_color` 语义。 |
 | pointcloud/RGB-PC profile | `point_cloud_frame`、`point_cloud_color_source`、`point_cloud_policy_id`、`point_cloud_config_sha256`、`point_cloud_table_plane_abcd_json`、`point_cloud_sampling`、`point_cloud_transform` | string（其中 table plane 为 JSON string）；点云 frame、构建策略与处理身份。 |
 
-Policy Zarr v5 只接受 `deployment_equivalent=True`、未删除 source 行且只有一个连续段的
-`pointcloud` 或 `rgb_pc` processed v11 输入。存在无效行或时序缺口的文件整条拒绝；其他合格
+Policy Zarr v5 接受四种 profile 中 `deployment_equivalent=True`、未删除 source 行且只有一个连续段的
+processed v11 输入。存在无效行或时序缺口的文件整条拒绝；其他合格
 文件仍可进入同一批导出。Zarr
 **不保留** processed 的 `/provenance`、source 文件 hash、质量摘要、raw 选择原因、
 `action_ee_components` 或完整相机 calibration provenance；它保留 `obs_alignment` 和其他运行
@@ -334,8 +334,8 @@ Policy Zarr v5 只接受 `deployment_equivalent=True`、未删除 source 行且�
 | `policy_observation_arm_qpos + policy_observation_hand_qpos` | `joint_state` | `data/joint_state` | visual profile state，按 camera source 因果对齐后拼接 7+12，float64 → float32。 |
 | `action_arm_joint_sent + action_hand_joint` | `action` | `data/action` | 拼接 7+12，使用实际 arm 提交流。 |
 | `action_arm_ee + action_hand_joint` | `action_ee` | `data/action_ee` | 拼接 9+12。 |
-| `hand_contact` | `contact_force` | `data/contact_force` | 重命名，保留 `(5,3)` 轴语义。 |
-| `hand_fingertip` | `fingertip_points` | `data/fingertip_points` | 重命名，float64 → float32。 |
+| `hand_contact` + hand/tactile source proof | `contact_force` | `data/contact_force` | 按 observation reference 选择最新因果且 skew 有界的同-source fresh+calibrated tactile sum，保留 `(5,3)` 轴语义。 |
+| camera-aligned arm/hand qpos（视觉）或 `hand_fingertip`（非视觉） | `fingertip_points` | `data/fingertip_points` | 视觉 profile 通过共享 FK 重算；非视觉保留 control-grid 同源值；float64 → float32。 |
 | `rgb.mp4` + `depth.h5:/depth` + camera meta | `rgb/depth/K/T` | 对应 `data/*` | RGB/depth resize 到 processed 尺寸；depth 已对齐 RGB。 |
 | raw RGB-D 与 calibration | `point_cloud` | `data/point_cloud` | 使用 canonical builder，输出 xarm-base `xyzrgb`。 |
 | raw grid/provenance | `/provenance`（含 `source_segment_ends`） | `meta/episode_ends` | 只有完整且单一 source 连续段的 processed 文件进入一个训练 episode；Zarr 不保留逐行来源。 |

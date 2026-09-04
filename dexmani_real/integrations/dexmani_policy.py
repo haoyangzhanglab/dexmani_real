@@ -6,9 +6,12 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.deployment.config import validate_policy_spec
+from dexmani_real.deployment.config import (
+    policy_observation_fields,
+    validate_policy_spec,
+)
 from dexmani_real.deployment.contracts import PolicyPrediction
-from dexmani_real.deployment.observation import ObservationBatch
+from dexmani_real.deployment.observation import PolicyObservation
 from dexmani_real.planning.poses import validate_rot6d_geometry
 from dexmani_real.robot_spec import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
@@ -37,31 +40,37 @@ class DexManiPolicyRuntime:
         self._validate_loaded_spec(loaded_policy.spec)
 
     def _validate_loaded_spec(self, spec: Any) -> None:
-        """Reject inspect/load drift and unsupported Real embodiment contracts."""
-        expected = {
-            name: getattr(self.spec, name)
-            for name in (
-                "action_key",
-                "action_dim",
-                "control_action_dim",
-                "horizon",
-                "n_obs_steps",
-                "n_action_steps",
-                "control_dt_s",
-                "point_cloud_num_points",
-                "point_cloud_feature_dim",
-                "sensor_modalities",
-                "requires_hand",
-            )
-        }
+        """Reject inspect/load drift that would change Real's tensor or action boundary."""
+        validate_policy_spec(spec)
+        names = [
+            "action_key",
+            "action_dim",
+            "control_action_dim",
+            "horizon",
+            "n_obs_steps",
+            "n_action_steps",
+            "control_dt_s",
+            "requires_hand",
+        ]
+        expected = {name: getattr(self.spec, name) for name in names}
         mismatches = {
             name: (getattr(spec, name, None), value)
             for name, value in expected.items()
             if getattr(spec, name, None) != value
         }
+        expected_fields = tuple(
+            (field.name, field.shape, field.dtype)
+            for field in policy_observation_fields(self.spec)
+        )
+        loaded_fields = tuple(
+            (field.name, field.shape, field.dtype)
+            for field in policy_observation_fields(spec)
+        )
+        if loaded_fields != expected_fields:
+            mismatches["observation_fields"] = (loaded_fields, expected_fields)
         if mismatches:
             raise ValueError(
-                "loaded PolicySpec does not match the validated Real projection: "
+                "loaded PolicySpec does not match the Real tensor/action boundary: "
                 f"{mismatches}"
             )
 
@@ -71,7 +80,7 @@ class DexManiPolicyRuntime:
     def reset_episode(self) -> None:
         self._require_open().reset_episode()
 
-    def predict(self, observation: ObservationBatch) -> PolicyPrediction:
+    def predict(self, observation: PolicyObservation) -> PolicyPrediction:
         arrays = self._encode_observation(observation)
         control_action = self._require_open().predict(arrays)
         return self._decode_control_action(control_action)
@@ -89,53 +98,25 @@ class DexManiPolicyRuntime:
         return self._policy
 
     def _encode_observation(
-        self, observation: ObservationBatch
+        self, observation: PolicyObservation
     ) -> dict[str, np.ndarray]:
-        if not isinstance(observation, ObservationBatch):
-            raise TypeError("policy observation must be an ObservationBatch")
-        if observation.arm_history is None or observation.hand_history is None:
-            raise ValueError("DexMani Policy requires arm and hand joint history")
-        n_obs = self.spec.n_obs_steps
-        arm = observation.arm_history.values
-        hand = observation.hand_history.values
-        if arm.shape != (n_obs, _ARM_DOF) or hand.shape != (n_obs, _HAND_DOF):
-            raise ValueError(
-                f"joint history must be arm {(n_obs, _ARM_DOF)} and "
-                f"hand {(n_obs, _HAND_DOF)}"
-            )
-        if arm.dtype.kind != "f" or hand.dtype.kind != "f":
-            raise TypeError("joint history must use floating-point arrays")
-        if not np.isfinite(arm).all() or not np.isfinite(hand).all():
-            raise ValueError("joint history contains NaN/Inf")
-
-        frames = tuple(observation.pointcloud_history)
-        if len(frames) != n_obs:
-            raise ValueError(
-                f"need exactly {n_obs} causal point-cloud frames, got {len(frames)}"
-            )
-        if len({frame.camera_generation for frame in frames}) != 1:
-            raise ValueError("point-cloud history crosses a camera generation boundary")
-        expected_point_shape = (
-            self.spec.point_cloud_num_points,
-            self.spec.point_cloud_feature_dim,
-        )
-        for frame in frames:
-            if frame.values.shape != expected_point_shape:
+        if not isinstance(observation, PolicyObservation):
+            raise TypeError("policy observation must be a PolicyObservation")
+        fields = policy_observation_fields(self.spec)
+        field_names = tuple(field.name for field in fields)
+        if tuple(observation.arrays) != field_names:
+            raise ValueError("PolicyObservation fields do not match PolicySpec")
+        n_obs = int(self.spec.n_obs_steps)
+        for field in fields:
+            array = observation.arrays[field.name]
+            expected_dtype = np.dtype(field.dtype)
+            expected_shape = (n_obs, *field.shape)
+            if array.shape != expected_shape or array.dtype != expected_dtype:
                 raise ValueError(
-                    "point-cloud frame shape does not match the PolicySpec projection"
+                    f"PolicyObservation {field.name} must be {expected_dtype} "
+                    f"{expected_shape}, got dtype={array.dtype} shape={array.shape}"
                 )
-            if frame.values.dtype != np.float32:
-                raise TypeError("point-cloud frames must be float32")
-            if not np.isfinite(frame.values).all():
-                raise ValueError("point-cloud history contains NaN/Inf")
-
-        joint_state = np.ascontiguousarray(
-            np.concatenate((arm, hand), axis=1), dtype=np.float32
-        )
-        point_cloud = np.ascontiguousarray(
-            np.stack([frame.values for frame in frames]), dtype=np.float32
-        )
-        return {"joint_state": joint_state, "point_cloud": point_cloud}
+        return dict(observation.arrays)
 
     def _decode_control_action(self, value: Any) -> PolicyPrediction:
         if not isinstance(value, np.ndarray):

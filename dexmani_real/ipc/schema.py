@@ -32,11 +32,11 @@ RECORD_OPERATOR_BYTES = 128
 RECORD_STOP_REASON_BYTES = 512
 RECORD_STATUS_TEXT_BYTES = 2_048
 
-# EE arm-target decomposition carried by the policy plan ring: position + rot6d.
+# EE arm-target decomposition carried by the policy chunk ring: position + rot6d.
 EE_POS_DIM = 3
 EE_ROT6D_DIM = 6
 
-# Runtime IPC capacity for learned-policy plans; adapters must not truncate larger requests.
+# Runtime IPC capacity for learned-policy chunks; adapters must not truncate larger requests.
 MAX_POLICY_CHUNK_STEPS = 32
 
 # Realtime point-cloud transport is fixed-size per deployment. Keeping the
@@ -122,9 +122,9 @@ COUPLED_COMMAND_DTYPE = np.dtype(
 )
 
 # One payload is written per inference; the coordinator consumes only the latest.
-POLICY_PLAN_DTYPE = np.dtype(
+POLICY_CHUNK_DTYPE = np.dtype(
     [
-        ("plan_id", "<u8"),
+        ("chunk_id", "<u8"),
         ("run_generation", "<u8"),
         ("observation_id", "<u8"),
         ("observation_anchor_monotonic_ns", "<u8"),
@@ -134,14 +134,12 @@ POLICY_PLAN_DTYPE = np.dtype(
         ("inference_finished_monotonic_ns", "<u8"),
         ("num_steps", "<u4"),
         ("arm_present", "<u1"),
-        ("hand_present", "<u1"),
         ("ee_present", "<u1"),
-        ("target_monotonic_ns", "<u8", (MAX_POLICY_CHUNK_STEPS,)),
+        ("hand_present", "<u1"),
         ("arm_qpos", "<f8", (MAX_POLICY_CHUNK_STEPS, ARM_DOF)),
         ("hand_qpos", "<f8", (MAX_POLICY_CHUNK_STEPS, HAND_DOF)),
         ("ee_pos", "<f8", (MAX_POLICY_CHUNK_STEPS, EE_POS_DIM)),
         ("ee_rot6d", "<f8", (MAX_POLICY_CHUNK_STEPS, EE_ROT6D_DIM)),
-        ("valid_mask", "<u1", (MAX_POLICY_CHUNK_STEPS,)),
     ],
     align=True,
 )
@@ -439,7 +437,7 @@ __all__ = [
     "HAND_TACTILE_DTYPE",
     "MAX_POLICY_CHUNK_STEPS",
     "POINT_CLOUD_FEATURE_DIM",
-    "POLICY_PLAN_DTYPE",
+    "POLICY_CHUNK_DTYPE",
     "RECORD_CONTROL_DTYPE",
     "RECORD_OPERATOR_BYTES",
     "RECORD_STATUS_DTYPE",

@@ -29,6 +29,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `README.md` | 面向使用者的能力、架构、环境与工作流。 |
 | `repo_map.md` | 当前文件与 owner 索引。 |
 | `runtime.yaml` | 当前完整 Real runtime 配置快照；覆盖全部配置段，真机前必须核对设备与标定字段。 |
+| `policy_deployment.yaml` | 可选 policy 调度模式与 episode action-step 上限配置。 |
 | `docs/data_schema.md` | Real raw v24、processed v11 与 Policy Zarr v5 的持久化字段和语义参考。 |
 | `docs/action_clip_mechanisms.md` | 动作 clip、限幅、拒绝与动作源差异的实现参数和数据审计说明。 |
 | `docs/policy_deployment.md` | Policy experiment 的 list/check/shadow/run、配置 ownership、按键、安全与诊断工作流。 |
@@ -125,6 +126,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `poses.py` | pose、quaternion、matrix 与 rot6d 纯运算。 |
 | `arm_fk.py` | xArm7 Pinocchio FK、Jacobian 与 pose transform。 |
 | `hand_fk.py` | XHand Pinocchio fingertip FK。 |
+| `fingertip.py` | 共享的 arm+hand FK 与 hand-mount transform，输出 xArm-base fingertip points。 |
 | `ik.py` | MPlib position IK、seed 与 null-space 优化。 |
 | `candidates.py` | IK candidate 生成、过滤、规范化、排序与选择。 |
 | `collision.py` | xArm7+XHand 自碰撞、环境碰撞与 transition 检查。 |
@@ -205,13 +207,12 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | 文件 | 主要职责 |
 |---|---|
 | `__init__.py` | learned-policy 部署子包标记。 |
-| `action_buffer.py` | 纯内存、有界 latest-wins policy endpoint scheduler；提供 stable token 与 commit/discard watermark。 |
-| `contracts.py` | 无时间 `PolicyPrediction`、publish context、timed action chunk 与 `PolicyRuntime` protocol。 |
+| `contracts.py` | 无时间 `PolicyPrediction`、不可变 `ActionChunk` 与 `PolicyRuntime` protocol。 |
 | `config.py` | PolicySpec/Real runtime 兼容门与 pickle-safe、固定 seed=0 的窄 inference-worker 配置；不拥有模型 shape/horizon 或 Real timing。 |
 | `observation.py` | 因果不可变 arm/hand/tactile/pointcloud/RGB history batch。 |
-| `timing.py` | immutable policy target grid、inference-expired prefix、plan/source deadline 与 diagnostic usable-target composition 的纯计算。 |
-| `worker.py` | 经 Policy public API 直接 restore、camera-grid observation 校验、logical-grid timing stamp、bounded timing samples 与 plan 发布。 |
-| `coordinator.py` | learned-policy 唯一 command producer、generation-isolated multi-episode plan scheduling、SafetyGate、物理运行的 per-episode home 准入、逐 endpoint coupled 双 ACK、typed stop、命令连续性与 watchdog。 |
+| `timing.py` | async chunk future-step 选择与 absolute inference cadence 的纯计算。 |
+| `worker.py` | 经 Policy public API 直接 restore、camera-grid observation 校验、sync request/async cadence 与单 `ActionChunk` 发布。 |
+| `coordinator.py` | learned-policy 唯一 command producer、generation-isolated 单 chunk scheduling、SafetyGate、物理运行的 per-episode home 准入、逐 endpoint coupled 双 ACK、typed stop、action-step limit 与 watchdog。 |
 | `lifecycle.py` | `execute` 布尔控制的 worker topology、同进程 multi-episode supervision、物理模式 collision-checked home 与 verified shutdown。 |
 | `operator.py` | B/S/Q/ESC typed request；物理模式每个 episode 从 ARMED 执行 hand + collision-checked arm home，并发布一次性 home 准入标志。 |
 | `metrics.py` | inference/coordinator live counters、固定窗口 p50/p95/p99 timing，以及 log-only compact episode summary。 |
@@ -232,7 +233,7 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | 文件 | 主要职责 |
 |---|---|
 | `integrations/__init__.py` | 外部集成子包标记。 |
-| `integrations/dexmani_policy.py` | 外部 `dexmani_policy` public runtime 的纯 NumPy point-cloud observation 编码与 joint/EE action 解码 adapter。 |
+| `integrations/dexmani_policy.py` | 外部 `dexmani_policy` public runtime 的纯 NumPy canonical multimodal observation 编码与 joint/EE action 解码 adapter。 |
 | `utils/__init__.py` | 轻量通用工具子包标记。 |
 | `utils/atomic_io.py` | fsync、拒绝已有文件/目录/链接的 atomic publish 与 atomic JSON。 |
 | `utils/feedback.py` | arm/hand feedback freshness、finite 与 health predicate。 |
@@ -270,8 +271,12 @@ recording worker/recorder。工程约束要求避免 package cycle、逆向依�
 | `tests/test_deployment_metrics.py` | 跨周期 flush 的有界 episode counter/timing 累积与单次 log-only summary 合同。 |
 | `tests/test_hand_worker_startup.py` | XHand startup no-motion，以及 `execute=False/True` publication seam 与 arm+hand 双 ACK 合同。 |
 | `tests/test_policy_lifecycle.py` | inference restore 失败时不启动任何 hardware worker 的顺序合同。 |
-| `tests/test_policy_coordinator.py` | coordinator 的 generation/stale plan 准入、SafetyGate 丢弃、ACK/worker 失败、operator stop 与双 watchdog 语义。 |
-| `tests/test_policy_multi_episode.py` | 同进程第二个 policy episode、per-episode H 门、generation 前进以及旧 plan/ticket 失效的离线合同。 |
+| `tests/test_policy_coordinator.py` | coordinator 的 generation/chunk freshness、sync/async 调度、action-step 上限、SafetyGate、ACK 与 watchdog 语义。 |
+| `tests/test_policy_multi_episode.py` | 同进程第二个 policy episode、per-episode H 门、generation 前进以及旧 ticket 失效的离线合同。 |
+| `tests/test_deployment_config.py` | policy deployment YAML、CLI 覆盖、默认 sync 与 max-action-steps 严格校验。 |
+| `tests/test_policy_chunk_ipc.py` | 单槽 latest-wins ActionChunk wire round-trip、严格 presence/shape/generation/capacity 校验与 inference request Event 合同。 |
+| `tests/test_policy_multimodal_observation.py` | canonical observation fields、causal alignment、tactile provenance、fingertip FK 与 worker/ring 依赖合同。 |
+| `tests/test_policy_offline_multimodal.py` | processed tactile/FK 等价语义与四 profile Policy Zarr admission 合同。 |
 | `tests/test_run_policy_cli.py` | list/check/shadow/run 路由、最小 CLI 参数面与 lifecycle seam。 |
 
 ## 6. 静态资源

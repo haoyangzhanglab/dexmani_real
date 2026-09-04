@@ -13,13 +13,13 @@ from dexmani_real.deployment.config import (
     PolicyWorkerConfig,
     validate_policy_runtime_compatibility,
 )
-from dexmani_real.deployment.observation import (
-    FrameWindow,
-    ObservationBatch,
-    PointCloudFrame,
-)
+from dexmani_real.deployment.observation import PolicyObservation
 from dexmani_real.integrations.dexmani_policy import DexManiPolicyRuntime
 from dexmani_real.ipc.schema import MAX_POLICY_CHUNK_STEPS
+
+
+def _field(name: str, shape: tuple[int, ...], dtype: str) -> SimpleNamespace:
+    return SimpleNamespace(name=name, shape=shape, dtype=dtype)
 
 
 def _spec(**changes: object) -> SimpleNamespace:
@@ -30,9 +30,10 @@ def _spec(**changes: object) -> SimpleNamespace:
         "horizon": 16,
         "n_obs_steps": 2,
         "n_action_steps": 8,
-        "sensor_modalities": ("joint_state", "point_cloud"),
-        "point_cloud_num_points": 1024,
-        "point_cloud_feature_dim": 6,
+        "observation_fields": (
+            _field("joint_state", (19,), "float32"),
+            _field("point_cloud", (1024, 6), "float32"),
+        ),
         "control_dt_s": 0.0625,
         "requires_hand": True,
     }
@@ -47,50 +48,19 @@ def _resolved_runtime(spec: SimpleNamespace | None = None):
     return runtime
 
 
-def _observation(spec: SimpleNamespace) -> ObservationBatch:
+def _observation(spec: SimpleNamespace) -> PolicyObservation:
     count = spec.n_obs_steps
-    source = np.arange(2, count + 2, dtype=np.uint64)
-    published = source + 10
-    sequence = np.arange(1, count + 1, dtype=np.uint64)
-    valid = np.ones(count, dtype=np.uint8)
-    arm = FrameWindow(
-        values=np.zeros((count, 7), dtype=np.float64),
-        source_sequence=sequence,
-        source_monotonic_ns=source,
-        publish_monotonic_ns=published,
-        valid_mask=valid,
-    )
-    hand = FrameWindow(
-        values=np.zeros((count, 12), dtype=np.float64),
-        source_sequence=sequence,
-        source_monotonic_ns=source,
-        publish_monotonic_ns=published,
-        valid_mask=valid,
-    )
-    points = np.zeros((spec.point_cloud_num_points, 6), dtype=np.float32)
-    clouds = tuple(
-        PointCloudFrame(
-            values=points,
-            source_camera_sequence=int(index),
-            source_monotonic_ns=int(source_ns),
-            publish_monotonic_ns=int(published_ns),
-            camera_generation=1,
-        )
-        for index, source_ns, published_ns in zip(
-            sequence, source, published, strict=True
-        )
-    )
-    return ObservationBatch(
+    arrays = {
+        field.name: np.zeros((count, *field.shape), dtype=np.dtype(field.dtype))
+        for field in spec.observation_fields
+    }
+    return PolicyObservation(
         observation_id=1,
         run_generation=1,
-        run_started_monotonic_ns=1,
-        anchor_monotonic_ns=int(published[-1]) + 1,
-        latest_source_monotonic_ns=int(source[-1]),
-        logical_step_monotonic_ns=int(source[-1]),
-        arm_history=arm,
-        hand_history=hand,
-        pointcloud=clouds[-1],
-        pointcloud_history=clouds,
+        anchor_monotonic_ns=20,
+        latest_source_monotonic_ns=10,
+        logical_step_monotonic_ns=15,
+        arrays=arrays,
     )
 
 
@@ -119,11 +89,21 @@ class PolicyCompatibilityTest(unittest.TestCase):
     def test_fixed_real_contract_rejections(self) -> None:
         cases = (
             _spec(requires_hand=False),
-            _spec(sensor_modalities=("joint_state",)),
-            _spec(point_cloud_feature_dim=3),
+            _spec(observation_fields=(_field("point_cloud", (1024, 6), "float32"),)),
+            _spec(
+                observation_fields=(
+                    _field("joint_state", (19,), "float32"),
+                    _field("point_cloud", (1024, 3), "float32"),
+                )
+            ),
             _spec(n_action_steps=MAX_POLICY_CHUNK_STEPS + 1),
             _spec(control_dt_s=0.05),
-            _spec(point_cloud_num_points=2048),
+            _spec(
+                observation_fields=(
+                    _field("joint_state", (19,), "float32"),
+                    _field("point_cloud", (2048, 6), "float32"),
+                )
+            ),
         )
         for policy_spec in cases:
             with self.subTest(policy_spec=policy_spec), self.assertRaises(ValueError):
@@ -146,13 +126,10 @@ class PolicyCompatibilityTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             resolve_runtime_config(data={"policy": {"unknown_timing_s": 1.0}})
         timing_fields = (
-            "inference_hz",
             "max_input_age_s",
             "max_observation_skew_s",
             "max_grid_lag_s",
-            "max_plan_age_s",
             "max_source_to_command_age_s",
-            "command_lead_s",
             "max_command_silence_s",
             "action_validity_s",
             "command_acknowledgement_timeout_s",
@@ -227,35 +204,49 @@ class PolicyAdapterTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     adapter.predict(_observation(spec))
 
-    def test_rejects_history_length_and_camera_generation(self) -> None:
+    def test_rejects_history_length_and_extra_modality(self) -> None:
         spec = _spec()
         _resolved_runtime(spec)
         adapter = DexManiPolicyRuntime(
             _FakeLoadedPolicy(spec, np.zeros((8, 19), dtype=np.float64)), spec
         )
-        observation = _observation(spec)
-        object.__setattr__(
-            observation, "pointcloud_history", observation.pointcloud_history[:1]
+        missing = PolicyObservation(
+            observation_id=1,
+            run_generation=1,
+            anchor_monotonic_ns=20,
+            latest_source_monotonic_ns=10,
+            logical_step_monotonic_ns=15,
+            arrays={"joint_state": np.zeros((2, 19), dtype=np.float32)},
         )
         with self.assertRaises(ValueError):
-            adapter.predict(observation)
+            adapter.predict(missing)
+        short = PolicyObservation(
+            observation_id=1,
+            run_generation=1,
+            anchor_monotonic_ns=20,
+            latest_source_monotonic_ns=10,
+            logical_step_monotonic_ns=15,
+            arrays={
+                "joint_state": np.zeros((1, 19), dtype=np.float32),
+                "point_cloud": np.zeros((1, 1024, 6), dtype=np.float32),
+            },
+        )
+        with self.assertRaises(ValueError):
+            adapter.predict(short)
 
-        observation = _observation(spec)
-        second = observation.pointcloud_history[1]
-        mismatched = PointCloudFrame(
-            values=second.values,
-            source_camera_sequence=second.source_camera_sequence,
-            source_monotonic_ns=second.source_monotonic_ns,
-            publish_monotonic_ns=second.publish_monotonic_ns,
-            camera_generation=2,
-        )
-        object.__setattr__(
-            observation,
-            "pointcloud_history",
-            (observation.pointcloud_history[0], mismatched),
+        wrong_point_count = PolicyObservation(
+            observation_id=1,
+            run_generation=1,
+            anchor_monotonic_ns=20,
+            latest_source_monotonic_ns=10,
+            logical_step_monotonic_ns=15,
+            arrays={
+                "joint_state": np.zeros((2, 19), dtype=np.float32),
+                "point_cloud": np.zeros((2, 1, 6), dtype=np.float32),
+            },
         )
         with self.assertRaises(ValueError):
-            adapter.predict(observation)
+            adapter.predict(wrong_point_count)
 
 
 if __name__ == "__main__":

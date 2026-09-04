@@ -12,6 +12,7 @@ import numpy as np
 
 from dexmani_real.config.defaults import arm, environment, hand, policy
 from dexmani_real.config.pointcloud import PointCloudConfig
+from dexmani_real.robot_spec import XHAND_RIGHT_URDF_PATH
 
 
 class OutputProfile(str, Enum):
@@ -175,6 +176,12 @@ class ProcessingConfig:
     hand_state_limit_upper_rad: tuple[float, ...] = hand.mechanical_qpos_max_rad
     hand_action_limit_lower_rad: tuple[float, ...] = hand.qpos_min_rad
     hand_action_limit_upper_rad: tuple[float, ...] = hand.qpos_max_rad
+    hand_urdf_path: str = str(XHAND_RIGHT_URDF_PATH)
+    fingertip_link_names: tuple[str, ...] = hand.fingertip_link_names
+    handbase_position_eef_m: tuple[float, float, float] = hand.T_eef_handbase_pos_xyz
+    handbase_quat_eef_wxyz: tuple[float, float, float, float] = (
+        hand.T_eef_handbase_quat_wxyz
+    )
     # Learned-policy endpoints are rejected, never clipped, by the deployment
     # coordinator.  Offline processing therefore applies the same per-grid
     # contract before an episode can enter a deployment training set.
@@ -210,6 +217,10 @@ class ProcessingConfig:
             "hand_state_limit_upper_rad": tuple(hand_config.mechanical_qpos_max_rad),
             "hand_action_limit_lower_rad": tuple(hand_config.qpos_min_rad),
             "hand_action_limit_upper_rad": tuple(hand_config.qpos_max_rad),
+            "hand_urdf_path": str(XHAND_RIGHT_URDF_PATH),
+            "fingertip_link_names": tuple(hand_config.fingertip_link_names),
+            "handbase_position_eef_m": tuple(hand_config.T_eef_handbase_pos_xyz),
+            "handbase_quat_eef_wxyz": tuple(hand_config.T_eef_handbase_quat_wxyz),
             "arm_max_delta_rad_per_tick": getattr(
                 runtime, "policy"
             ).arm_max_delta_rad_per_tick,
@@ -234,6 +245,18 @@ class ProcessingConfig:
             raise TypeError("temporal_quality must be a TemporalQualityConfig")
         if not isinstance(self.pointcloud, PointCloudConfig):
             raise TypeError("pointcloud must be a PointCloudConfig")
+        if not self.hand_urdf_path or len(self.fingertip_link_names) != 5:
+            raise ValueError("fingertip geometry requires a URDF and five link names")
+        mount_values = (
+            *self.handbase_position_eef_m,
+            *self.handbase_quat_eef_wxyz,
+        )
+        if (
+            len(self.handbase_position_eef_m) != 3
+            or len(self.handbase_quat_eef_wxyz) != 4
+            or not np.all(np.isfinite(mount_values))
+        ):
+            raise ValueError("fingertip hand-mount transform is invalid")
         positive_ints = (
             self.horizon,
             self.min_full_windows,
@@ -356,6 +379,10 @@ class ProcessingConfig:
             "hand_state_limit_upper_rad": list(self.hand_state_limit_upper_rad),
             "hand_action_limit_lower_rad": list(self.hand_action_limit_lower_rad),
             "hand_action_limit_upper_rad": list(self.hand_action_limit_upper_rad),
+            "hand_urdf_path": self.hand_urdf_path,
+            "fingertip_link_names": list(self.fingertip_link_names),
+            "handbase_position_eef_m": list(self.handbase_position_eef_m),
+            "handbase_quat_eef_wxyz": list(self.handbase_quat_eef_wxyz),
             "arm_max_delta_rad_per_tick": self.arm_max_delta_rad_per_tick,
             "hand_max_delta_rad_per_tick": self.hand_max_delta_rad_per_tick,
             "endpoint_delta_tolerance_rad": self.endpoint_delta_tolerance_rad,
@@ -407,7 +434,6 @@ class EpisodeDecision:
     hard_invalid_reason_names: tuple[str, ...] = ()
     audit_reason_counts: dict[str, int] = field(default_factory=dict)
     repair_reason_counts: dict[str, int] = field(default_factory=dict)
-    tactile_forward_fill_mask: np.ndarray | None = None
     warnings: tuple[str, ...] = ()
     rejected_reason: str | None = None
 

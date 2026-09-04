@@ -28,9 +28,10 @@ def _load_cli_module() -> object:
 
 def _experiment_info() -> SimpleNamespace:
     spec = SimpleNamespace(
-        sensor_modalities=("joint_state", "point_cloud"),
-        point_cloud_num_points=1024,
-        point_cloud_feature_dim=6,
+        observation_fields=(
+            SimpleNamespace(name="joint_state", shape=(19,), dtype="float32"),
+            SimpleNamespace(name="point_cloud", shape=(1024, 6), dtype="float32"),
+        ),
         action_dim=19,
         horizon=16,
         n_obs_steps=2,
@@ -50,26 +51,87 @@ def _experiment_info() -> SimpleNamespace:
 
 
 class RunPolicyParserTest(unittest.TestCase):
-    def test_subcommands_only_expose_supported_advanced_options(self) -> None:
+    def test_check_exposes_only_its_device_option(self) -> None:
         cli = _load_cli_module()
         args = cli._parser().parse_args(
-            ["check", "dp3/pick/seed0", "--device", "cpu", "--config", "real.yaml"]
+            [
+                "check",
+                "dp3/pick/seed0",
+                "--device",
+                "cpu",
+            ]
         )
 
         self.assertEqual(args.command, "check")
         self.assertEqual(args.experiment, "dp3/pick/seed0")
         self.assertEqual(args.device, "cpu")
-        self.assertEqual(args.config, "real.yaml")
-        help_text = cli._parser().format_help()
-        for retired_flag in (
-            "--execution-mode",
-            "--print-config",
-            "--preflight-only",
-            "--execute-",
-            "--task-",
-            "--hand",
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli._parser().parse_args(
+                ["check", "dp3/pick/seed0", "--runtime-config", "real.yaml"]
+            )
+
+    def test_deployment_options_work_before_and_after_subcommand(self) -> None:
+        cli = _load_cli_module()
+        parser = cli._parser()
+
+        before = parser.parse_args(
+            [
+                "--deployment-config",
+                "policy.yaml",
+                "--inference-mode",
+                "async",
+                "--max-action-steps",
+                "12",
+                "run",
+                "dp3/pick/seed0",
+            ]
+        )
+        self.assertEqual(before.deployment_config, "policy.yaml")
+        self.assertEqual(before.inference_mode, "async")
+        self.assertEqual(before.max_action_steps, 12)
+
+        after = parser.parse_args(
+            [
+                "shadow",
+                "dp3/pick/seed0",
+                "--deployment-config",
+                "policy.yaml",
+                "--inference-mode",
+                "sync",
+                "--max-action-steps",
+                "3",
+                "--runtime-config",
+                "runtime.yaml",
+            ]
+        )
+        self.assertEqual(after.deployment_config, "policy.yaml")
+        self.assertEqual(after.inference_mode, "sync")
+        self.assertEqual(after.max_action_steps, 3)
+        self.assertEqual(after.runtime_config, "runtime.yaml")
+
+    def test_precommand_options_are_rejected_when_unowned(self) -> None:
+        cli = _load_cli_module()
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
         ):
-            self.assertNotIn(retired_flag, help_text)
+            cli.main(["--deployment-config", "policy.yaml", "check", "dp3/pick/seed0"])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn(
+            "[CLI] check does not accept --deployment-config", stderr.getvalue()
+        )
+
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            cli.main(["--device", "cpu", "list"])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("[CLI] list does not accept --device", stderr.getvalue())
 
 
 class RunPolicyCommandTest(unittest.TestCase):
@@ -146,7 +208,7 @@ class RunPolicyCommandTest(unittest.TestCase):
         self.assertEqual(inputs.worker_config.device, args.device)
         self.assertEqual(inputs.worker_config.seed, 0)
         self.assertIs(inputs.worker_config.spec, info.spec)
-        resolve_runtime.assert_called_once_with(yaml_path=args.config)
+        resolve_runtime.assert_called_once_with(yaml_path=args.runtime_config)
         validate_compatibility.assert_called_once_with(info.spec, runtime)
         for retired_name in (
             "execution_mode",
@@ -174,6 +236,30 @@ class RunPolicyCommandTest(unittest.TestCase):
         self.assertIs(prepare.call_args.kwargs["execute"], False)
         start.assert_called_once_with(inputs)
 
+    def test_start_lifecycle_forwards_deployment_config(self) -> None:
+        deployment_config = object()
+        inputs = SimpleNamespace(
+            runtime=object(),
+            policy_spec=object(),
+            worker_config=object(),
+            execute=False,
+            deployment_config=deployment_config,
+        )
+        with patch(
+            "dexmani_real.deployment.lifecycle.run_policy_deployment",
+            return_value=0,
+        ) as run:
+            result = self.cli._start_lifecycle(inputs)
+
+        self.assertEqual(result, 0)
+        run.assert_called_once_with(
+            inputs.runtime,
+            inputs.policy_spec,
+            inputs.worker_config,
+            inputs.execute,
+            deployment_config=deployment_config,
+        )
+
     def test_run_projects_physical_publication_and_starts_through_seam(self) -> None:
         info = _experiment_info()
         inputs = SimpleNamespace(execute=True)
@@ -190,6 +276,25 @@ class RunPolicyCommandTest(unittest.TestCase):
         prepare.assert_called_once()
         self.assertIs(prepare.call_args.kwargs["execute"], True)
         start.assert_called_once_with(inputs)
+
+    def test_lifecycle_failures_are_not_reported_as_compatibility_failures(
+        self,
+    ) -> None:
+        info = _experiment_info()
+        inputs = SimpleNamespace(execute=False)
+        stderr = io.StringIO()
+        with (
+            patch.object(self.cli, "_inspect_policy_experiment", return_value=info),
+            patch.object(self.cli, "_prepare_lifecycle_inputs", return_value=inputs),
+            patch.object(
+                self.cli, "_start_lifecycle", side_effect=RuntimeError("worker lost")
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = self.cli.main(["shadow", "dp3/pick/seed0"])
+
+        self.assertEqual(result, 1)
+        self.assertIn("[LIFECYCLE] lifecycle failed: worker lost", stderr.getvalue())
 
 
 if __name__ == "__main__":

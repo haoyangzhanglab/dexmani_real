@@ -9,6 +9,12 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from dexmani_real.ipc.channels import RuntimeChannels
+from dexmani_real.runtime.safety import (
+    SafetyState,
+    read_run_state_snapshot,
+    request_policy_run_time_limit,
+    transition,
+)
 from dexmani_real.utils.feedback import validate_hand_feedback
 from dexmani_real.utils.log import get_logger
 
@@ -82,7 +88,6 @@ def run_supervisor(
     and must handle shutdown + DISARMED transition after it returns.
     """
     from dexmani_real.config.defaults import safety
-    from dexmani_real.runtime.safety import SafetyState, StopRequest, transition
     from dexmani_real.runtime.status import ExitReason
     from dexmani_real.runtime.workers import supervisor_exit_reason
 
@@ -161,7 +166,8 @@ def run_supervisor(
                 exit_reason = "explicit quit"
                 break
 
-            safety_state = int(shared.safety_state.value)
+            run_snapshot = read_run_state_snapshot(shared)
+            safety_state = int(run_snapshot.state)
             if safety_state == int(SafetyState.RUNNING):
                 observed_running = True
             if (
@@ -186,8 +192,8 @@ def run_supervisor(
                         exit_reason = "run time limit stop was not acknowledged"
                         transition(shared, SafetyState.FAULT)
                         break
-                elif safety_state == int(SafetyState.RUNNING):
-                    started_ns = int(shared.run_started_monotonic_ns.value)
+                elif run_snapshot.state is SafetyState.RUNNING:
+                    started_ns = run_snapshot.started_monotonic_ns
                     now_ns = time.monotonic_ns()
                     if started_ns <= 0 or started_ns > now_ns:
                         exit_reason = "invalid RUNNING epoch for run time limit"
@@ -198,16 +204,18 @@ def run_supervisor(
                         # The coordinator remains the normal RUNNING -> ARMED
                         # owner. A missing policy acknowledgement is escalated
                         # after its heartbeat SLA.
-                        shared.start_request.value = False
-                        shared.stop_request.value = int(StopRequest.RUN_TIME_LIMIT)
-                        time_limit_stop_deadline_s = now + time_limit_stop_grace_s
-                        logger.info(
-                            "supervisor: requested B-relative run time limit "
-                            "after %.3fs (limit=%.3fs, stop_grace=%.3fs)",
-                            elapsed_s,
-                            max_running_s,
-                            time_limit_stop_grace_s,
-                        )
+                        if request_policy_run_time_limit(
+                            shared,
+                            expected_run_generation=run_snapshot.generation,
+                        ):
+                            time_limit_stop_deadline_s = now + time_limit_stop_grace_s
+                            logger.info(
+                                "supervisor: requested B-relative run time limit "
+                                "after %.3fs (limit=%.3fs, stop_grace=%.3fs)",
+                                elapsed_s,
+                                max_running_s,
+                                time_limit_stop_grace_s,
+                            )
 
             if now - last_status_s >= status_interval_s:
                 runtime_m = (now - start_time) / 60.0

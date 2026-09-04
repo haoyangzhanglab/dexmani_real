@@ -18,11 +18,9 @@ from dexmani_real.ipc.schema import (
     HAND_TACTILE_SUM_SHAPE,
     nan_array,
 )
-from dexmani_real.planning import Pose
-from dexmani_real.planning.arm_fk import make_arm_fk
+from dexmani_real.planning.fingertip import compute_fingertip_points_xarm_base
 from dexmani_real.planning.hand_fk import HandKinematics
 from dexmani_real.planning.poses import (
-    compose_pose,
     normalize_quat_wxyz,
     quat_wxyz_to_rot6d,
     rot6d_to_quat_wxyz,
@@ -548,34 +546,23 @@ def _build_robot_state(
     fingertip_pos = nan_array(HAND_FINGERTIP_SHAPE)
     if (
         hk is not None
-        and hk.is_ready()
         and hand_connected
-        and np.all(np.isfinite(hand_qpos))
+        and T_eef_handbase_pos is not None
+        and T_eef_handbase_quat_wxyz is not None
     ):
-        tips_in_handbase = hk.compute_tip_positions_in_handbase(hand_qpos)
-        if (
-            np.all(np.isfinite(tips_in_handbase))
-            and _eef_finite
-            and np.all(np.isfinite(eef_pos))
-        ):
-            T_base_eef = Pose(p=eef_pos, q=eef_quat_wxyz)
-            T_eef_handbase = Pose(
-                p=T_eef_handbase_pos if T_eef_handbase_pos is not None else np.zeros(3),
-                q=(
-                    T_eef_handbase_quat_wxyz
-                    if T_eef_handbase_quat_wxyz is not None
-                    else np.array([1.0, 0.0, 0.0, 0.0])
-                ),
+        try:
+            fingertip_pos = compute_fingertip_points_xarm_base(
+                arm_qpos,
+                hand_qpos,
+                arm_fk=None,
+                hand_fk=hk,
+                handbase_position_eef_m=T_eef_handbase_pos,
+                handbase_quat_eef_wxyz=T_eef_handbase_quat_wxyz,
+                eef_position_xarm_base_m=eef_pos,
+                eef_rot6d_xarm_base=eef_rot6d,
             )
-            T_base_handbase = compose_pose(T_base_eef, T_eef_handbase)
-            tips_base = np.zeros(HAND_FINGERTIP_SHAPE, dtype=np.float64)
-            _id_quat = np.array([1.0, 0.0, 0.0, 0.0])
-            for i in range(5):
-                T_base_tip = compose_pose(
-                    T_base_handbase, Pose(p=tips_in_handbase[i], q=_id_quat)
-                )
-                tips_base[i] = T_base_tip.p
-            fingertip_pos = tips_base
+        except Exception:
+            fingertip_pos = nan_array(HAND_FINGERTIP_SHAPE)
 
     return RobotState(
         arm_qpos=arm_qpos,

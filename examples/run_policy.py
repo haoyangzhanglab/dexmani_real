@@ -18,10 +18,25 @@ from typing import Any, Callable, NoReturn
 
 
 class _ArgumentParser(argparse.ArgumentParser):
-    """Render CLI-contract failures with the compatibility owner marker."""
+    """Render command-line contract failures with their owner marker."""
 
     def error(self, message: str) -> NoReturn:
-        self.exit(2, f"{self.prog}: error: [COMPAT] {message}\n")
+        self.exit(2, f"{self.prog}: error: [CLI] {message}\n")
+
+    def parse_args(
+        self, args: list[str] | None = None, namespace: argparse.Namespace | None = None
+    ) -> argparse.Namespace:
+        parsed = super().parse_args(args, namespace)
+        _apply_command_defaults(parsed)
+        return parsed
+
+
+_LIFECYCLE_OPTION_FLAGS = {
+    "runtime_config": "--runtime-config",
+    "deployment_config": "--deployment-config",
+    "inference_mode": "--inference-mode",
+    "max_action_steps": "--max-action-steps",
+}
 
 
 @dataclass(frozen=True)
@@ -32,22 +47,70 @@ class _LifecycleInputs:
     runtime: Any
     policy_spec: Any
     worker_config: Any
+    deployment_config: Any
+
+
+def _positive_action_steps(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
+
+
+def _add_device_option(parser: argparse.ArgumentParser, *, default: object) -> None:
+    """Add the inference-device option for a model-consuming command."""
+    parser.add_argument(
+        "--device",
+        default=default,
+        help="Policy inference device for check, shadow, or run (default: cuda:0)",
+    )
+
+
+def _add_lifecycle_options(parser: argparse.ArgumentParser, *, default: object) -> None:
+    """Add options consumed only by a Real deployment lifecycle."""
+    parser.add_argument(
+        "--runtime-config",
+        dest="runtime_config",
+        default=default,
+        help="optional Real runtime YAML for shadow/run",
+    )
+    parser.add_argument(
+        "--deployment-config",
+        default=default,
+        help="optional Policy deployment YAML (sync/async and episode horizon)",
+    )
+    parser.add_argument(
+        "--inference-mode",
+        choices=("sync", "async"),
+        default=default,
+        help="inference scheduling mode (default: sync)",
+    )
+    parser.add_argument(
+        "--max-action-steps",
+        type=_positive_action_steps,
+        default=default,
+        help="episode action-step limit (default: unlimited)",
+    )
+
+
+def _add_precommand_options(parser: argparse.ArgumentParser) -> None:
+    """Accept model/lifecycle options before their owning subcommand.
+
+    ``SUPPRESS`` preserves an explicitly pre-command value against the
+    subparser and lets ``main`` reject an option not owned by ``list/check``.
+    """
+    _add_device_option(parser, default=argparse.SUPPRESS)
+    _add_lifecycle_options(parser, default=argparse.SUPPRESS)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(
         description="Inspect, check, shadow, or run one DexMani Policy experiment"
     )
-    parser.add_argument(
-        "--device",
-        default="cuda:0",
-        help="Policy inference device for check or a lifecycle (default: cuda:0)",
-    )
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="optional Real runtime YAML for shadow/run",
-    )
+    _add_precommand_options(parser)
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     list_parser = subcommands.add_parser(
@@ -60,17 +123,20 @@ def _parser() -> argparse.ArgumentParser:
         help="optional case-insensitive selector substring",
     )
 
+    check_parser = subcommands.add_parser(
+        "check", help="strictly restore and smoke-test one Policy experiment"
+    )
+    check_parser.add_argument("experiment", metavar="EXPERIMENT")
+    _add_device_option(check_parser, default=argparse.SUPPRESS)
+
     for command, help_text in (
-        ("check", "strictly restore and smoke-test one Policy experiment"),
         ("shadow", "run with full validation and no actuator publication"),
         ("run", "run with physical coupled arm/hand publication"),
     ):
         command_parser = subcommands.add_parser(command, help=help_text)
         command_parser.add_argument("experiment", metavar="EXPERIMENT")
-        # Accept shared advanced options after the subcommand as well as before it.
-        # SUPPRESS preserves a value supplied to the top-level parser.
-        command_parser.add_argument("--device", default=argparse.SUPPRESS)
-        command_parser.add_argument("--config", default=argparse.SUPPRESS)
+        _add_device_option(command_parser, default=argparse.SUPPRESS)
+        _add_lifecycle_options(command_parser, default=argparse.SUPPRESS)
     return parser
 
 
@@ -103,21 +169,26 @@ def _print_compatibility_error(message: str) -> None:
     print(f"[COMPAT] {message}", file=sys.stderr)
 
 
+def _print_lifecycle_error(message: str) -> None:
+    print(f"[LIFECYCLE] {message}", file=sys.stderr)
+
+
 def _print_experiment_summary(info: Any, *, mode: str, device: str) -> None:
     """Print the small operator-facing subset of a Policy experiment contract."""
     spec = info.spec
+    fields = tuple(spec.observation_fields)
     point_cloud = "none"
-    if spec.point_cloud_num_points is not None:
-        point_cloud = (
-            f"{spec.point_cloud_num_points} \u00d7 {spec.point_cloud_feature_dim}"
-        )
+    for field in fields:
+        if field.name == "point_cloud":
+            point_cloud = " x ".join(str(value) for value in field.shape)
+            break
     print("\u2500\u2500 Policy Experiment \u2500\u2500")
     print(f"Mode        : {mode}")
     print(f"Experiment  : {info.selector}")
     print(f"Policy      : {info.policy_name}")
     print(f"Checkpoint  : {info.checkpoint_name}")
     print(f"Device      : {device}")
-    print(f"Observation : {' + '.join(spec.sensor_modalities)}")
+    print(f"Observation : {' + '.join(field.name for field in fields)}")
     print(f"History     : {spec.n_obs_steps}")
     print(f"Point Cloud : {point_cloud}")
     print(f"Action      : {spec.action_key} ({spec.control_action_dim}D)")
@@ -184,12 +255,18 @@ def _prepare_lifecycle_inputs(
     from dexmani_real.config.runtime import resolve_runtime_config
     from dexmani_real.deployment.config import (
         PolicyWorkerConfig,
+        resolve_policy_deployment_config,
         validate_policy_runtime_compatibility,
     )
 
     if not isinstance(execute, bool):
         raise TypeError("execute must be a boolean")
-    runtime = resolve_runtime_config(yaml_path=args.config)
+    runtime = resolve_runtime_config(yaml_path=args.runtime_config)
+    deployment_config = resolve_policy_deployment_config(
+        yaml_path=getattr(args, "deployment_config", None),
+        inference_mode=getattr(args, "inference_mode", None),
+        max_action_steps=getattr(args, "max_action_steps", None),
+    )
     validate_policy_runtime_compatibility(info.spec, runtime)
     worker_config = PolicyWorkerConfig(
         experiment=info.selector,
@@ -201,6 +278,7 @@ def _prepare_lifecycle_inputs(
         runtime=runtime,
         policy_spec=info.spec,
         worker_config=worker_config,
+        deployment_config=deployment_config,
     )
 
 
@@ -213,6 +291,7 @@ def _start_lifecycle(inputs: _LifecycleInputs) -> int:
         inputs.policy_spec,
         inputs.worker_config,
         inputs.execute,
+        deployment_config=inputs.deployment_config,
     )
 
 
@@ -235,7 +314,7 @@ def _run_lifecycle(args: argparse.Namespace, *, execute: bool) -> int:
     try:
         return _start_lifecycle(inputs)
     except Exception as exc:
-        _print_compatibility_error(f"lifecycle failed: {exc}")
+        _print_lifecycle_error(f"lifecycle failed: {exc}")
         return 1
 
 
@@ -254,8 +333,41 @@ def _run_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_command_options(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Reject pre-command options that no selected command consumes."""
+    if args.command == "list":
+        invalid_destinations = ("device", *_LIFECYCLE_OPTION_FLAGS)
+    elif args.command == "check":
+        invalid_destinations = tuple(_LIFECYCLE_OPTION_FLAGS)
+    else:
+        return
+    supplied = [
+        _LIFECYCLE_OPTION_FLAGS.get(destination, "--device")
+        for destination in invalid_destinations
+        if hasattr(args, destination)
+    ]
+    if supplied:
+        parser.error(f"{args.command} does not accept {', '.join(supplied)}")
+
+
+def _apply_command_defaults(args: argparse.Namespace) -> None:
+    """Fill defaults only after explicit options from both parser levels survive."""
+    if args.command == "list":
+        return
+    if not hasattr(args, "device"):
+        args.device = "cuda:0"
+    if args.command in {"shadow", "run"}:
+        for destination in _LIFECYCLE_OPTION_FLAGS:
+            if not hasattr(args, destination):
+                setattr(args, destination, None)
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    _validate_command_options(parser, args)
     handlers: dict[str, Callable[[argparse.Namespace], int]] = {
         "list": _run_list,
         "check": _run_check,

@@ -32,8 +32,8 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 - 事务式写入带 sidecar manifest 的 depth-to-color aligned RGB-D raw episode v24；除 native depth/color 几何与
   时序 provenance 外，还保存与 camera source 对齐的 arm/hand policy observation、hand SDK ACK
   与限速后的 hand target。
-- 将 aligned raw v24 episode 清洗为 processed HDF5 v11；deployment-equivalent 的
-  点云数据可导出 Policy Zarr v5。导出坚持一份 processed HDF5 对应一个训练 episode；
+- 将 aligned raw v24 episode 清洗为 processed HDF5 v11；四种 profile 的
+  deployment-equivalent 数据均可导出 Policy Zarr v5。导出坚持一份 processed HDF5 对应一个训练 episode；
   删除过 source 行或存在时序缺口的 episode 整条拒绝，不在缺口处拆分。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
 - 通过 Policy-owned public runtime 与 Real-owned NumPy adapter 运行 joint/EE-action learned
@@ -67,7 +67,7 @@ RealSense / Quest-HTS / xArm7 / XHand
                  ▼
  RuntimeChannels: typed rings + queues + lifecycle state
           │                         │
-          ├─ teleop coordinator     └─ inference worker → policy plan ring
+          ├─ teleop coordinator     └─ inference worker → one-slot policy chunk ring
           │                                      │
           └──────────────────────────────────────┤
                                                  ▼
@@ -144,8 +144,9 @@ CLI override > YAML file > dexmani_real/config/defaults.py
 ```
 
 运行时配置由 [`config/runtime.py`](dexmani_real/config/runtime.py) 唯一解析、校验、冻结并生成
-SHA-256；learned-policy 的 inference、freshness、plan、ACK 和 watchdog timing 都属于其
-`policy` 段，模型 shape、modality 和 horizon 则只来自 Policy public API 的 `PolicySpec`。
+SHA-256；learned-policy 的 observation freshness、ACK、action validity 和 watchdog timing
+属于其 `policy` 段，模型 shape、modality、horizon 和 inference cadence 则来自 Policy public
+API 的 `PolicySpec`。sync/async 调度模式与 episode action-step 上限由独立 deployment 配置拥有。
 `pointcloud` 是与 EEF `policy.workspace` 分离的感知配置段；实时 worker、离线
 重建和诊断入口只从该段派生参数，并把策略 ID 与配置 SHA-256 写入 processed/Zarr
 语义。可在不启动硬件的情况下查看遥操作解析结果：
@@ -166,8 +167,8 @@ python examples/collect_teleop.py --print-config
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 使用 raw episode 的精确已发送命令、配置和模型 provenance，预检后控制 xArm7/XHand；写 `replay_results/` |
 | 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取并校验 `data.h5` hash 后的原始 `float64` 已发送命令，继续执行完整配置/模型/几何预检；包含多个 source 连续段的产物拒绝物理回放 |
 | learned policy 检查 | `python examples/run_policy.py list`；`python examples/run_policy.py check <experiment> --device <device>` | 仅列出实验，或经 Policy public API strict restore + warmup + synthetic predict；不连接硬件 |
-| learned policy shadow | `python examples/run_policy.py shadow <experiment>` | 连接真实 sensor 与 arm/XHand feedback，执行 inference、IK 和 SafetyGate；结构性禁止 actuator publication 与 home，同进程可 B→S→B→S |
-| learned policy run | `python examples/run_policy.py run <experiment>` | 连接并控制 xArm7/XHand；每个 episode 都需 H 完成 hand + collision-checked arm home，再以新 B 启动，S 后同进程回到 ARMED |
+| learned policy shadow | `python examples/run_policy.py shadow <experiment> [--inference-mode sync\|async] [--max-action-steps N]` | 连接真实 sensor 与 arm/XHand feedback，执行 inference、IK 和 SafetyGate；默认 sync，结构性禁止 actuator publication 与 home |
+| learned policy run | `python examples/run_policy.py run <experiment> [--deployment-config policy_deployment.yaml]` | 连接并控制 xArm7/XHand；默认 sync；每个 episode 都需 H 完成 hand + collision-checked arm home，再以新 B 启动 |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |
@@ -187,7 +188,7 @@ python examples/collect_teleop.py --print-config
 [`docs/policy_deployment.md`](docs/policy_deployment.md)。其中 `list` 与 `check` 不连接硬件；
 `shadow` 虽然禁止 actuator publication，仍会连接相机、xArm 和 XHand，必须按硬件流程处理。
 
-`PolicySpec.sensor_modalities` 包含 `point_cloud` 时，lifecycle 才启动 camera 与独立
+`PolicySpec.observation_fields` 包含 `point_cloud` 时，lifecycle 才启动 camera 与独立
 point-cloud worker。worker 始终读取最新的 depth-to-color aligned RGB-D，旧帧不会排队；inference 仅在
 当前 RUNNING epoch 之后的点云 T 历史窗完整时才推理。窗口以因果截点前最新已过去的控制 tick 为末端，按策略控制网格选取严格递增、
 不重复的 camera frame；每帧不得晚于对应逻辑 tick，lag 不超过 `max_grid_lag_s`，且跨帧
@@ -199,7 +200,9 @@ point-cloud worker。worker 始终读取最新的 depth-to-color aligned RGB-D�
 coordinator 将通过安全门的策略 endpoint 原子写为单条 coupled command，并立即返回，不在控制热路径
 等待 worker 握手。ring sequence 是实际的传输 epoch；arm/hand worker 在各自 SDK 边界复核同一个
 `(run_generation, ring_sequence)` ticket，已被新 record 覆盖或被 motion permit 撤销的 endpoint
-不再执行。`action_id` 保留在 record 与反馈中用于审计和 ACK，不参与 ownership 判定。这保证软件
+不再执行。B/S 请求与 RUNNING 状态转换由同一个 `motion_lock` 排序；candidate 保留其来源 chunk 的
+generation，policy publication 在写 ring 的原子边界还必须满足 RUNNING + 同 generation。
+`action_id` 保留在 record 与反馈中用于审计和 ACK，不参与 ownership 判定。这保证软件
 IPC 记录一致且保持 latest-wins 实时性，不表示两个执行器物理同步或已完成动作。
 
 实时、离线处理和诊断入口共用 `PointCloudConfig` 与同一个生产 builder。处理顺序为：
@@ -212,21 +215,32 @@ workspace 当前为 x `[0.0,0.8]`、y `[-0.5,0.5]`、z `[0.0,0.8]` m；体素 RG
 aligned 像素 RGB 的均值。processed HDF5 和 Policy Zarr 同时保存并校验算法、配置 SHA-256
 与桌面平面身份，禁止混合不同点云语义的数据。
 
-deployment lifecycle 从 Policy public API 取得只读 `PolicySpec`，Real 仅验证固定硬件兼容：
-`joint_state + point_cloud` 模态、19/21D control action、XHand、控制周期、点数、6D xyzrgb feature
-和 IPC chunk capacity。checkpoint/Hydra/EMA/normalizer/denoise 配置及 strict restore 全部由
-`dexmani_policy.deployment.load_experiment()` 拥有；Real adapter 只转换 NumPy observation/action。
-inference worker 完成 restore、warmup 和延迟窗口检查后才置 ready，lifecycle 才允许启动其余
+deployment lifecycle 从 Policy public API 取得只读 `PolicySpec`。唯一的
+`dexmani.deployment` artifact 在 `data_contract.observation_fields` 中按顺序声明每个原始模型
+输入的名称、shape、dtype 与语义；训练 experiment 的 `dataset.sensor_modalities` 是导出时唯一的
+人工选择入口，artifact 不再持久化第二份模态列表。Real 只验证自己要投影的 raw shape/dtype、
+19/21D control action、XHand、控制周期与 IPC chunk capacity，并只启动所需 sensor worker。
+checkpoint/Hydra/EMA/normalizer/denoise 与 RGB model preprocessing 全部由
+`dexmani_policy.deployment.load_experiment()` 拥有；Real adapter 只透传 canonical NumPy
+observation 并转换 action。Policy export/restore 会核对模型 encoder 实际消费的字段；没有对应
+encoder 的字段组合会 fail closed，不会静默忽略输入。
+inference worker 完成 restore 与 warmup 后才置 ready，lifecycle 才允许启动其余
 hardware workers。内部只传播 `execute: bool`：`False` 走完整 candidate validation 后返回，
 不会调用 publication；`True` 发布同一 generation/ticket 的 arm + hand command，并要求两个 worker
 在 Real-owned ACK timeout 内都确认，否则进入 FAULT。日常 inference seed 固定为 0，XHand 需求由
 `PolicySpec.requires_hand` 决定，不由 CLI 重复声明。
 
-coordinator 每秒输出 live metrics，并在每个 B→停止/中止/故障边界输出一条 compact episode
-summary。summary 只是在内存中累计的调试信息，不写 receipt、sidecar 或资格证明文件。
+inference 每次只发布一个带 observation provenance 的不可变 `ActionChunk` 到单槽 latest-wins
+ring。默认 `sync` 在 chunk 完成或因 source stale 丢弃后请求下一次推理；可选 `async` 按
+`n_action_steps * control_dt_s` 的绝对 cadence 推理，并让新 chunk 替换旧 suffix。coordinator 每个
+tick 至多处理一个 endpoint；`--max-action-steps N`（或 deployment YAML）在 N 个 applied/rejected
+terminal steps 后以 `TRUNCATED` 结束 episode。
+
+coordinator 每秒输出 live metrics，并在每个 B→停止/中止/故障/截断边界输出一条 compact
+episode summary。summary 只是在内存中累计的调试信息，不写 receipt、sidecar 或资格证明文件。
 
 点云缺失、过期、shape/dtype 错误、非有限值或颜色越界时 inference fail closed，不发布
-新的 plan。实时路径当前仅支持静态 `eye_to_hand` 标定；`eye_in_hand` 需要另行建立与
+新的 chunk。实时路径当前仅支持静态 `eye_to_hand` 标定；`eye_in_hand` 需要另行建立与
 相机帧同步的机械臂位姿合同。离线 IPC、合成 RGB-D 和已保存的真实 L515 帧均已验证；
 实时 worker 的 compute/source-to-publish p95 仍须在完整硬件部署中记录。
 `pointcloud_process_example.py` 同时报告纯构建与 capture-to-cloud 的 p50/p95/max，并报告
@@ -282,9 +296,10 @@ python examples/process_episodes.py \
 ```
 
 确认后去掉 `--dry-run`。所有处理 profile 都审计动作 endpoint delta；视觉 profile 还校验
-camera-source 对齐的 arm/hand policy observation。`--task-name` 会统一写入每个 processed
-episode，并拒绝与逐 episode annotation 中 task_name 冲突的情况。`pointcloud` 与 `rgb_pc`
-profile 的输出标为 `deployment_equivalent=True`，是 Policy Zarr v5 唯一接受的输入。
+camera-source 对齐的 arm/hand policy observation、同 source 已校准 tactile sum 与重算的
+xArm-base fingertip。`--task-name` 会统一写入每个 processed episode，并拒绝与逐 episode
+annotation 中 task_name 冲突。四种 profile 在通过各自边界后均标为
+`deployment_equivalent=True`，并可进入 Policy Zarr v5。
 
 raw v24 episode 可视化默认使用当前 resolved runtime 中的点云策略和桌面标定即时生成 canonical
 `(N,6)` 点云；该路径与 offline processing、实时 deployment 共用同一个 `build_point_cloud()`
@@ -363,7 +378,7 @@ datasets/<task>.zarr/
 └── meta/episode_ends
 ```
 
-正式 raw writer 写 schema v24；depth 通过 SDK 对齐到 color 像素网格后保存，并同时保存两路帧号、设备时间戳、native intrinsics、distortion 与 `T_color_from_depth` 作为 provenance。它还持久化与 camera source 对齐的 state、其 source/publish provenance、有效性/skew 和 hand SDK ACK，并在 sidecar 关闭后写入 manifest。离线处理区分硬无效、软审计和有界修复：1–4 帧 IK hold 作为真实停顿保留，连续 5 帧起的长 IK hold 删除；单帧、前后有效的 tactile 通信错误因果保持上一触觉值；可重新验真的 Camera duplicate 保留；joint-state excursion 与 deployment action delta 只审计。`stall_window_frames=8` 表示包含 8 个样本的 inclusive stall window（端点差为 7）；只有 `strict` 才排除高置信时序异常，`audit` 只记录，`hard_only` 关闭 temporal detectors。Policy Zarr 不压紧或拆分有缺口的 episode，而是整条拒绝。
+正式 raw writer 写 schema v24；depth 通过 SDK 对齐到 color 像素网格后保存，并同时保存两路帧号、设备时间戳、native intrinsics、distortion 与 `T_color_from_depth` 作为 provenance。它还持久化与 camera source 对齐的 state、其 source/publish provenance、有效性/skew 和 hand SDK ACK，并在 sidecar 关闭后写入 manifest。离线处理区分硬无效、软审计和有界修复：1–4 帧 IK hold 作为真实停顿保留，连续 5 帧起的长 IK hold 删除；tactile sum 只可由不晚于 observation reference、在 skew 窗口内且 hand/tactile source 相等的已校准样本因果补齐；可重新验真的 Camera duplicate 保留；joint-state excursion 与 deployment action delta 只审计。`stall_window_frames=8` 表示包含 8 个样本的 inclusive stall window（端点差为 7）；只有 `strict` 才排除高置信时序异常，`audit` 只记录，`hard_only` 关闭 temporal detectors。Policy Zarr 不压紧或拆分有缺口的 episode，而是整条拒绝。
 
 ## 开发与验证
 
@@ -371,14 +386,13 @@ datasets/<task>.zarr/
 
 ```bash
 python -m compileall -q dexmani_real examples tests
-python -m pytest -q
+python -m unittest discover -s tests
 git diff --check
 git diff --stat
 git status --short
 ```
 
 `tests/` 提供纯函数、配置快照、IPC ABI、ring buffer、schema、生命周期、安全失败路径和
-架构边界的离线回归门禁；`tests/fixtures/contracts/` 冻结需要显式审查的 ABI/schema/架构
-基线。example 程序不是测试，测试和静态检查通过也不等于完成真实硬件验证。仓库级
+架构边界的离线回归门禁。example 程序不是测试，测试和静态检查通过也不等于完成真实硬件验证。仓库级
 agent 工作约定见 [`AGENTS.md`](AGENTS.md)，具体编码规范见
 [`code_style.md`](code_style.md)。

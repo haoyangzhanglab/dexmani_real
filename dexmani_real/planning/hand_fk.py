@@ -84,6 +84,8 @@ class HandKinematics:
         for name in fingertip_link_names:
             try:
                 fid = self._model.getFrameId(name)
+                if fid >= self._model.nframes:
+                    raise ValueError(f"frame {name!r} is missing")
                 self._fingertip_frame_ids.append(fid)
                 self._fingertip_frame_names.append(name)
             except (ValueError, RuntimeError):

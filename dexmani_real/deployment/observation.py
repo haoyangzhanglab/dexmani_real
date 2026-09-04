@@ -7,11 +7,96 @@ IPC dtype. They are the ``PolicyRuntime`` input contract.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 import numpy as np
 
 from dexmani_real.ipc.schema import validate_point_cloud_array
+
+_POLICY_MODALITIES = frozenset(
+    {"joint_state", "point_cloud", "rgb", "contact_force", "fingertip_points"}
+)
+
+
+@dataclass(frozen=True)
+class PolicyObservation:
+    """Narrow immutable NumPy boundary passed to a Policy runtime.
+
+    Mapping insertion order is the validated Policy modality order. Every array
+    is an owned, C-contiguous, read-only copy.
+    """
+
+    observation_id: int
+    run_generation: int
+    anchor_monotonic_ns: int
+    latest_source_monotonic_ns: int
+    logical_step_monotonic_ns: int
+    arrays: Mapping[str, np.ndarray]
+
+    def __post_init__(self) -> None:
+        if type(self.observation_id) is not int or self.observation_id <= 0:
+            raise ValueError("observation_id must be a positive integer")
+        if type(self.run_generation) is not int or self.run_generation < 0:
+            raise ValueError("run_generation must be a non-negative integer")
+        for name in (
+            "anchor_monotonic_ns",
+            "latest_source_monotonic_ns",
+            "logical_step_monotonic_ns",
+        ):
+            if type(getattr(self, name)) is not int:
+                raise TypeError(f"{name} must be an integer")
+        if not (
+            0
+            < self.latest_source_monotonic_ns
+            <= self.logical_step_monotonic_ns
+            <= self.anchor_monotonic_ns
+        ):
+            raise ValueError("PolicyObservation timestamps are inconsistent")
+        if not isinstance(self.arrays, Mapping):
+            raise TypeError("PolicyObservation arrays must be a mapping")
+        modalities = tuple(self.arrays)
+        if (
+            not modalities
+            or len(set(modalities)) != len(modalities)
+            or not set(modalities) <= _POLICY_MODALITIES
+            or "joint_state" not in modalities
+        ):
+            raise ValueError("PolicyObservation modalities are invalid")
+        frozen: dict[str, np.ndarray] = {}
+        horizon: int | None = None
+        for name in modalities:
+            raw = np.asarray(self.arrays[name])
+            expected_dtype = np.uint8 if name == "rgb" else np.float32
+            if raw.dtype != np.dtype(expected_dtype):
+                raise TypeError(f"{name} must have dtype {np.dtype(expected_dtype)}")
+            arr = freeze_array(raw, name=f"PolicyObservation.{name}")
+            assert arr is not None
+            expected_tail = {
+                "joint_state": (19,),
+                "contact_force": (5, 3),
+                "fingertip_points": (5, 3),
+            }.get(name)
+            if arr.ndim < 2 or (
+                expected_tail is not None and arr.shape[1:] != expected_tail
+            ):
+                raise ValueError(f"{name} has invalid shape {arr.shape}")
+            if name == "point_cloud" and (arr.ndim != 3 or arr.shape[2] != 6):
+                raise ValueError("point_cloud must be [T, N, 6]")
+            if name == "rgb" and (arr.ndim != 4 or arr.shape[3] != 3):
+                raise ValueError("rgb must be [T, H, W, 3]")
+            if name == "point_cloud" and arr.shape[1] <= 0:
+                raise ValueError("point_cloud N must be positive")
+            if name == "rgb" and min(arr.shape[1:3]) <= 0:
+                raise ValueError("rgb H and W must be positive")
+            if horizon is None:
+                horizon = int(arr.shape[0])
+            elif arr.shape[0] != horizon:
+                raise ValueError("PolicyObservation modalities must share T")
+            frozen[name] = arr
+        if horizon is None or horizon <= 0:
+            raise ValueError("PolicyObservation requires a non-empty history")
+        object.__setattr__(self, "arrays", MappingProxyType(frozen))
 
 
 def freeze_array(
@@ -173,10 +258,12 @@ class RgbFrame:
 class ObservationBatch:
     """One causal observation assembled from state and point-cloud rings.
 
-    Immutable and process-local. ``arm_history``/``hand_history``/
-    ``hand_current_history``/``hand_tactile_sum_history``/``tactile_history``
-    are ``FrameWindow`` values. ``pointcloud`` is the latest causally valid
-    ``PointCloudFrame``. Optional modalities are None when not requested.
+    Immutable and process-local. ``arm_history``/``hand_history`` and
+    ``hand_tactile_sum_history`` are sensor-value ``FrameWindow`` values.
+    ``hand_tactile_provenance_history`` contains only the unit-code proof
+    aligned to tactile sums; the full tactile tensor never enters deployment.
+    ``pointcloud`` is the latest causally valid ``PointCloudFrame``. Optional
+    modalities are None when not requested.
     ``anchor_monotonic_ns`` is the causal cut: no frame published after the
     anchor may be included.
     """
@@ -190,9 +277,8 @@ class ObservationBatch:
 
     arm_history: FrameWindow | None = None
     hand_history: FrameWindow | None = None
-    tactile_history: FrameWindow | None = None
-    hand_current_history: FrameWindow | None = None
     hand_tactile_sum_history: FrameWindow | None = None
+    hand_tactile_provenance_history: FrameWindow | None = None
     pointcloud: PointCloudFrame | None = None
     # Oldest-first causal window of recent point-cloud frames; ``pointcloud`` is
     # the latest (and last element) when non-empty.  ``point_cloud`` models use
@@ -227,9 +313,8 @@ class ObservationBatch:
         windows = {
             "arm_history": self.arm_history,
             "hand_history": self.hand_history,
-            "hand_current_history": self.hand_current_history,
             "hand_tactile_sum_history": self.hand_tactile_sum_history,
-            "tactile_history": self.tactile_history,
+            "hand_tactile_provenance_history": self.hand_tactile_provenance_history,
         }
         for name, window in windows.items():
             if window is None:

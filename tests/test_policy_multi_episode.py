@@ -7,17 +7,17 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import numpy as np
-
-from dexmani_real.deployment.action_buffer import ActionBuffer, BufferedPlan, PushStatus
-from dexmani_real.deployment.contracts import JointActionChunk
 from dexmani_real.deployment.operator import run_operator_control
 from dexmani_real.runtime.safety import (
     CoupledCommandTicket,
     SafetyState,
     StopRequest,
     begin_motion,
+    begin_requested_motion,
     coupled_command_ticket_is_current,
+    request_policy_run_time_limit,
+    request_policy_start,
+    request_policy_stop,
     revoke_motion,
 )
 from dexmani_real.teleop.keyboard import ControlSignal
@@ -68,10 +68,7 @@ class _FakeKeyboard:
     def poll(self, *, timeout: float) -> list[ControlSignal]:
         del timeout
         if self._batches:
-            batch = self._batches.pop(0)
-            if not self._batches:
-                self._shared.is_running.value = False
-            return batch
+            return self._batches.pop(0)
         self._shared.is_running.value = False
         return []
 
@@ -79,26 +76,58 @@ class _FakeKeyboard:
         return 0
 
 
-def _old_plan(run_generation: int) -> BufferedPlan:
-    return BufferedPlan(
-        plan_id=1,
-        run_generation=run_generation,
-        observation_id=1,
-        observation_anchor_ns=20,
-        observation_latest_source_ns=10,
-        inference_finished_ns=30,
-        deadline_ns=100,
-        chunk=JointActionChunk(
-            arm_qpos=np.zeros((1, 7), dtype=np.float64),
-            hand_qpos=np.zeros((1, 12), dtype=np.float64),
-            target_monotonic_ns=np.array([50], dtype=np.uint64),
-            valid_mask=np.array([1], dtype=np.uint8),
-        ),
-    )
-
-
 class PolicyMultiEpisodeTest(unittest.TestCase):
-    def test_second_episode_advances_generation_and_invalidates_old_work(self) -> None:
+    def test_newer_stop_prevents_pending_begin(self) -> None:
+        shared = _FakeShared()
+        self.assertTrue(request_policy_start(shared, require_physical_home=False))
+        self.assertTrue(request_policy_stop(shared))
+
+        self.assertIsNone(begin_requested_motion(shared))
+        self.assertEqual(shared.safety_state.value, int(SafetyState.ARMED))
+        self.assertFalse(shared.start_request.value)
+        self.assertEqual(shared.stop_request.value, int(StopRequest.OPERATOR))
+
+    def test_begin_requires_prior_stop_acknowledgement(self) -> None:
+        shared = _FakeShared()
+        self.assertTrue(request_policy_stop(shared))
+        self.assertFalse(request_policy_start(shared, require_physical_home=False))
+        shared.stop_request.value = int(StopRequest.NONE)
+        self.assertTrue(request_policy_start(shared, require_physical_home=False))
+
+        epoch = begin_requested_motion(shared)
+        self.assertIsNotNone(epoch)
+        self.assertEqual(shared.safety_state.value, int(SafetyState.RUNNING))
+        self.assertFalse(shared.start_request.value)
+        self.assertEqual(shared.stop_request.value, int(StopRequest.NONE))
+
+    def test_physical_begin_requires_home_inside_request_lock(self) -> None:
+        shared = _FakeShared()
+        self.assertFalse(request_policy_start(shared, require_physical_home=True))
+        shared.physical_home_completed.value = True
+        self.assertTrue(request_policy_start(shared, require_physical_home=True))
+
+    def test_time_limit_request_is_generation_fenced(self) -> None:
+        shared = _FakeShared()
+        self.assertTrue(begin_motion(shared))
+        generation = int(shared.run_generation.value)
+        self.assertFalse(
+            request_policy_run_time_limit(
+                shared,
+                expected_run_generation=generation - 1,
+            )
+        )
+        self.assertTrue(
+            request_policy_run_time_limit(
+                shared,
+                expected_run_generation=generation,
+            )
+        )
+        self.assertEqual(shared.safety_state.value, int(SafetyState.RUNNING))
+        self.assertEqual(shared.stop_request.value, int(StopRequest.RUN_TIME_LIMIT))
+
+    def test_second_episode_advances_generation_and_invalidates_old_ticket(
+        self,
+    ) -> None:
         shared = _FakeShared()
         self.assertTrue(begin_motion(shared))
         first_generation = int(shared.run_generation.value)
@@ -110,22 +139,13 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
         shared.active_coupled_command_sequence.value = old_ticket.ring_sequence
         self.assertTrue(coupled_command_ticket_is_current(shared, ticket=old_ticket))
 
-        action_buffer = ActionBuffer(max_buffered_plans=2)
-        old_plan = _old_plan(first_generation)
-        action_buffer.reset(run_generation=first_generation)
-        self.assertTrue(action_buffer.push(old_plan, now_ns=40).accepted)
-
         self.assertTrue(revoke_motion(shared, SafetyState.ARMED))
         self.assertFalse(coupled_command_ticket_is_current(shared, ticket=old_ticket))
         self.assertTrue(begin_motion(shared))
         second_generation = int(shared.run_generation.value)
         self.assertGreater(second_generation, first_generation)
 
-        action_buffer.reset(run_generation=second_generation)
-        self.assertIs(
-            action_buffer.push(old_plan, now_ns=40).status,
-            PushStatus.WRONG_GENERATION,
-        )
+        self.assertFalse(coupled_command_ticket_is_current(shared, ticket=old_ticket))
 
     def test_physical_operator_allows_home_before_each_episode(self) -> None:
         shared = _FakeShared()

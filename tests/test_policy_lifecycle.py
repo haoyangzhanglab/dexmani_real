@@ -8,8 +8,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from dexmani_real.config.runtime import resolve_runtime_config
-from dexmani_real.deployment.config import PolicyWorkerConfig
-from dexmani_real.deployment.lifecycle import run_policy_deployment
+from dexmani_real.deployment.config import PolicyDeploymentConfig, PolicyWorkerConfig
+from dexmani_real.deployment.lifecycle import (
+    build_policy_worker_specs,
+    run_policy_deployment,
+)
 from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.runtime.safety import SafetyState
 from dexmani_real.runtime.workers import WorkerSpec
@@ -83,9 +86,10 @@ def _policy_spec() -> SimpleNamespace:
         horizon=16,
         n_obs_steps=2,
         n_action_steps=8,
-        sensor_modalities=("joint_state", "point_cloud"),
-        point_cloud_num_points=1024,
-        point_cloud_feature_dim=6,
+        observation_fields=(
+            SimpleNamespace(name="joint_state", shape=(19,), dtype="float32"),
+            SimpleNamespace(name="point_cloud", shape=(1024, 6), dtype="float32"),
+        ),
         control_dt_s=0.0625,
         requires_hand=True,
     )
@@ -100,6 +104,30 @@ def _policy_worker_config(spec: SimpleNamespace) -> PolicyWorkerConfig:
 
 
 class PolicyLifecycleStartupTest(unittest.TestCase):
+    def test_deployment_mode_reaches_inference_and_coordinator(self) -> None:
+        runtime = resolve_runtime_config()
+        spec = _policy_spec()
+        worker_config = _policy_worker_config(spec)
+        deployment = PolicyDeploymentConfig(
+            inference_mode="async",
+            max_action_steps=3,
+        )
+
+        specs = build_policy_worker_specs(
+            object(),
+            runtime,
+            spec,
+            worker_config,
+            execute=False,
+            deployment_config=deployment,
+        )
+
+        by_name = {worker.name: worker for worker in specs}
+        self.assertIs(by_name["inference"].args[-2], deployment)
+        self.assertIsNone(by_name["inference"].args[-1])
+        self.assertEqual(by_name["policy"].args[-1].inference_mode, "async")
+        self.assertEqual(by_name["policy"].args[-1].max_action_steps, 3)
+
     def test_model_failure_blocks_all_non_inference_workers(self) -> None:
         shared = _FakeRuntimeChannels()
         runtime = resolve_runtime_config()
@@ -171,7 +199,7 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
         )
         channel_config.assert_called_once_with(
             runtime,
-            pointcloud_num_points=spec.point_cloud_num_points,
+            pointcloud_num_points=spec.observation_fields[1].shape[0],
             camera_requested=True,
             pointcloud_requested=True,
             observation_horizon=spec.n_obs_steps,

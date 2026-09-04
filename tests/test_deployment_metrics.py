@@ -6,8 +6,8 @@ import unittest
 from unittest.mock import patch
 
 from dexmani_real.deployment.metrics import (
+    ACK_LATENCY_MS,
     ENDPOINTS_PUBLISHED,
-    PLAN_AGE_MS,
     Metrics,
 )
 
@@ -28,22 +28,22 @@ class DeploymentMetricsTest(unittest.TestCase):
         metrics = Metrics()
         metrics.begin_episode(generation=3, started_monotonic_ns=1)
         metrics.increment(ENDPOINTS_PUBLISHED, 2)
-        metrics.observe_timing(PLAN_AGE_MS, 1.0)
+        metrics.observe_timing(ACK_LATENCY_MS, 1.0)
 
         metrics.flush()
 
         metrics.increment(ENDPOINTS_PUBLISHED)
-        metrics.observe_timing(PLAN_AGE_MS, 5.0)
+        metrics.observe_timing(ACK_LATENCY_MS, 5.0)
 
         self.assertEqual(metrics.snapshot()[ENDPOINTS_PUBLISHED], 1)
         self.assertEqual(
             metrics.episode_snapshot(),
             {
                 ENDPOINTS_PUBLISHED: 3,
-                f"{PLAN_AGE_MS}_samples": 2,
-                f"{PLAN_AGE_MS}_p50": 1.0,
-                f"{PLAN_AGE_MS}_p95": 5.0,
-                f"{PLAN_AGE_MS}_p99": 5.0,
+                f"{ACK_LATENCY_MS}_samples": 2,
+                f"{ACK_LATENCY_MS}_p50": 1.0,
+                f"{ACK_LATENCY_MS}_p95": 5.0,
+                f"{ACK_LATENCY_MS}_p99": 5.0,
             },
         )
 
@@ -52,13 +52,13 @@ class DeploymentMetricsTest(unittest.TestCase):
         metrics.begin_episode(generation=3, started_monotonic_ns=1)
 
         for value in range(300):
-            metrics.observe_timing(PLAN_AGE_MS, float(value))
+            metrics.observe_timing(ACK_LATENCY_MS, float(value))
 
         summary = metrics.episode_snapshot()
-        self.assertEqual(summary[f"{PLAN_AGE_MS}_samples"], 256)
-        self.assertEqual(summary[f"{PLAN_AGE_MS}_p50"], 171.0)
-        self.assertEqual(summary[f"{PLAN_AGE_MS}_p95"], 287.0)
-        self.assertEqual(summary[f"{PLAN_AGE_MS}_p99"], 297.0)
+        self.assertEqual(summary[f"{ACK_LATENCY_MS}_samples"], 256)
+        self.assertEqual(summary[f"{ACK_LATENCY_MS}_p50"], 171.0)
+        self.assertEqual(summary[f"{ACK_LATENCY_MS}_p95"], 287.0)
+        self.assertEqual(summary[f"{ACK_LATENCY_MS}_p99"], 297.0)
 
     def test_episode_summary_logs_once_without_receipt_artifact(self) -> None:
         metrics = Metrics()
