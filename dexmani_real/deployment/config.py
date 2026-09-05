@@ -17,10 +17,10 @@ from dexmani_real.ipc.schema import (
     POINT_CLOUD_FEATURE_DIM,
     SUPPORTED_POINT_CLOUD_COUNTS,
 )
-from dexmani_real.robot_spec import XHAND_RIGHT_URDF_PATH
+from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 
 FIXED_POLICY_RUNTIME_TARGET = (
-    "dexmani_real.integrations.dexmani_policy:DexManiPolicyRuntime"
+    "dexmani_real.deployment.inference.dexmani_policy:DexManiPolicyAdapter"
 )
 
 _DEPLOYMENT_DEFAULT_MODE = "sync"
@@ -129,7 +129,7 @@ class PolicyDeploymentConfig:
     """Small operator-owned policy deployment configuration.
 
     Model structure and chunk length remain owned by ``PolicySpec``.  Real
-    runtime and safety parameters remain owned by ``ResolvedRuntimeConfig``;
+    runtime and safety parameters remain owned by ``ExperimentConfig``;
     this object only carries the explicit scheduler mode and episode horizon
     requested by the deployment workflow.
     """
@@ -149,7 +149,7 @@ class PolicyDeploymentConfig:
 
 
 @dataclass(frozen=True)
-class PolicyWorkerConfig:
+class InferenceWorkerConfig:
     """Narrow Policy-owned inputs required by the inference child."""
 
     experiment: str
@@ -205,7 +205,7 @@ __all__ = [
     "FIXED_POLICY_RUNTIME_TARGET",
     "FingertipAssemblerConfig",
     "PolicyDeploymentConfig",
-    "PolicyWorkerConfig",
+    "InferenceWorkerConfig",
     "validate_policy_runtime_compatibility",
     "validate_max_running_s",
 ]

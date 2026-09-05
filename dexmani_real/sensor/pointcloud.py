@@ -27,7 +27,7 @@ from dexmani_real.config.pointcloud import (
     POINT_CLOUD_TRANSFORM,
     PointCloudConfig,
 )
-from dexmani_real.sensor.camera_geometry import CameraIntrinsics, RGBDGeometry
+from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry
 
 _KERNEL_3X3 = np.ones((3, 3), dtype=np.uint8)
 

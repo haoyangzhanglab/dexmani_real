@@ -61,8 +61,8 @@ def _convert_field_value(val: object, target_tp: object) -> object:
         >>> _convert_field_value([15.0, 8.0], tuple[float, ...])
         (15.0, 8.0)
 
-        >>> _convert_field_value({"path_dt": 0.066}, PlanningProfile)
-        PlanningProfile(path_dt=0.066, ...)
+        >>> _convert_field_value({"path_dt": 0.066}, MotionPlanningConfig)
+        MotionPlanningConfig(path_dt=0.066, ...)
     """
     if val is None:
         return None

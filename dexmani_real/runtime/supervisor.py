@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import time
 from collections.abc import Iterable, Mapping
@@ -11,11 +12,12 @@ import numpy as np
 
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.runtime.safety import SafetyState, transition
+from dexmani_real.runtime.status import ExitReason
 from dexmani_real.utils.feedback import validate_hand_feedback
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
-    from dexmani_real.runtime.workers import ShutdownReport, WorkerSpec
+    from dexmani_real.runtime.processes import ProcessSpec, ShutdownReport
 
 logger = get_logger(__name__)
 
@@ -30,7 +32,7 @@ def shutdown_processes(
     disarm_if_clean: bool = False,
 ) -> ShutdownReport:
     """Stop workers and return their verified post-join safety state."""
-    from dexmani_real.runtime.workers import shutdown_processes_verified
+    from dexmani_real.runtime.processes import shutdown_processes_verified
 
     report = shutdown_processes_verified(
         shared,
@@ -47,6 +49,39 @@ def shutdown_processes(
             )
         )
     return report
+
+
+def supervisor_exit_reason(
+    shared: Any,
+    processes: Iterable[Any],
+    heartbeat_ages_s: Mapping[str, float],
+    heartbeat_timeouts_s: Mapping[str, float],
+) -> ExitReason:
+    """Apply the fixed safety-first supervisor priority."""
+    if bool(shared.estop_request.value):
+        return ExitReason.ESTOP
+    if bool(shared.error_state.value):
+        return ExitReason.STICKY_FAULT
+    stopped = [process for process in processes if process.exitcode is not None]
+    explicit_quit = bool(shared.quit_requested.value) or not bool(
+        shared.is_running.value
+    )
+    if stopped:
+        return ExitReason.WORKER_DEATH
+    for name, timeout in heartbeat_timeouts_s.items():
+        age_s = float(heartbeat_ages_s.get(name, float("inf")))
+        timeout_s = float(timeout)
+        if (
+            not math.isfinite(age_s)
+            or age_s < 0.0
+            or not math.isfinite(timeout_s)
+            or timeout_s <= 0.0
+            or age_s > timeout_s
+        ):
+            return ExitReason.HEARTBEAT_TIMEOUT
+    if explicit_quit:
+        return ExitReason.EXPLICIT_QUIT
+    return ExitReason.NONE
 
 
 def run_supervisor(
@@ -67,9 +102,6 @@ def run_supervisor(
     and must handle shutdown + DISARMED transition after it returns.
     """
     from dexmani_real.config.defaults import safety
-    from dexmani_real.runtime.status import ExitReason
-    from dexmani_real.runtime.workers import supervisor_exit_reason
-
     start_time = time.monotonic()
     last_status_s = start_time
     exit_reason = "unknown"
@@ -160,7 +192,7 @@ def run_supervisor(
 
 def wait_subsystem_ready(
     shared: RuntimeChannels,
-    workers: Iterable[tuple["WorkerSpec", Any]],
+    workers: Iterable[tuple["ProcessSpec", Any]],
     readiness_timeouts_s: Mapping[str, float],
     *,
     monitored_processes: Iterable[Any] | None = None,

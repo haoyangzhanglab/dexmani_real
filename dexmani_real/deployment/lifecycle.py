@@ -1,6 +1,6 @@
 """Learned-policy deployment lifecycle.
 
-Composes the runtime primitives (``WorkerSpec`` +
+Composes the runtime primitives (``ProcessSpec`` +
 ``build_processes``/``start_processes``/``wait_subsystem_ready``/
 ``run_supervisor``/``shutdown_processes``) into the policy workflow — resolve
 config -> create ``RuntimeChannels`` -> start the Policy-owned inference
@@ -25,18 +25,18 @@ import threading
 from dataclasses import replace
 from typing import Any
 
-from dexmani_real.config.runtime import ResolvedRuntimeConfig
+from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.deployment.config import (
     FIXED_POLICY_RUNTIME_TARGET,
     FingertipAssemblerConfig,
+    InferenceWorkerConfig,
     PolicyDeploymentConfig,
-    PolicyWorkerConfig,
     validate_max_running_s,
     validate_policy_runtime_compatibility,
 )
 from dexmani_real.deployment.executor import policy_executor_loop
 from dexmani_real.deployment.operator import build_home_planner, run_operator_control
-from dexmani_real.deployment.worker import inference_loop
+from dexmani_real.deployment.inference.worker import inference_loop
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.robot.hand_worker import hand_loop
@@ -46,14 +46,14 @@ from dexmani_real.runtime.supervisor import (
     shutdown_processes,
     wait_subsystem_ready,
 )
-from dexmani_real.runtime.workers import (
+from dexmani_real.runtime.processes import (
     ShutdownReport,
-    WorkerSpec,
+    ProcessSpec,
     build_processes,
     start_processes,
     stop_processes_verified,
 )
-from dexmani_real.sensor.camera_worker import CameraLoopConfig, camera_loop
+from dexmani_real.sensor.camera.worker import CameraLoopConfig, camera_loop
 from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig, pointcloud_loop
 from dexmani_real.utils.log import get_logger
 
@@ -82,7 +82,7 @@ def _requires_hand_sensor(policy_spec: Any) -> bool:
 
 
 def _compute_policy_observation_ring_capacities(
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     policy_spec: Any,
     channels_config: RuntimeChannelsConfig,
 ) -> dict[str, int]:
@@ -155,22 +155,22 @@ def _compute_policy_observation_ring_capacities(
 
 def build_policy_worker_specs(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     policy_spec: Any,
-    worker_config: PolicyWorkerConfig,
+    worker_config: InferenceWorkerConfig,
     *,
     execute: bool,
     deployment_config: PolicyDeploymentConfig | None = None,
     max_running_s: float | None = None,
-) -> list[WorkerSpec]:
+) -> list[ProcessSpec]:
     """Build the workers required by the explicit deployment contract.
 
     Each spec owns its process and readiness names. ``ready_name`` exists only
     for workers whose asynchronous initialization can fail; executor liveness
     is enough.
     """
-    if not isinstance(worker_config, PolicyWorkerConfig):
-        raise TypeError("worker_config must be a PolicyWorkerConfig")
+    if not isinstance(worker_config, InferenceWorkerConfig):
+        raise TypeError("worker_config must be an InferenceWorkerConfig")
     deployment = deployment_config or PolicyDeploymentConfig()
     if not isinstance(deployment, PolicyDeploymentConfig):
         raise TypeError("deployment_config must be a PolicyDeploymentConfig")
@@ -194,8 +194,8 @@ def build_policy_worker_specs(
         if pointcloud_requested
         else None
     )
-    specs: list[WorkerSpec] = [
-        WorkerSpec(
+    specs: list[ProcessSpec] = [
+        ProcessSpec(
             "arm",
             arm_loop,
             (shared, runtime.arm),
@@ -204,7 +204,7 @@ def build_policy_worker_specs(
     ]
     if camera_requested:
         specs.append(
-            WorkerSpec(
+            ProcessSpec(
                 "camera",
                 camera_loop,
                 (shared, CameraLoopConfig.from_runtime(runtime)),
@@ -213,7 +213,7 @@ def build_policy_worker_specs(
         )
     if pointcloud_requested:
         specs.append(
-            WorkerSpec(
+            ProcessSpec(
                 "pointcloud",
                 pointcloud_loop,
                 (
@@ -225,13 +225,13 @@ def build_policy_worker_specs(
         )
     specs.extend(
         [
-            WorkerSpec(
+            ProcessSpec(
                 "inference",
                 inference_loop,
                 (shared, runtime.policy, worker_config, deployment, fingertip_config),
                 ready_name="inference",
             ),
-            WorkerSpec(
+            ProcessSpec(
                 "policy",
                 policy_executor_loop,
                 (
@@ -247,7 +247,7 @@ def build_policy_worker_specs(
     )
     if policy_spec.requires_hand or _requires_hand_sensor(policy_spec):
         specs.append(
-            WorkerSpec(
+            ProcessSpec(
                 "hand",
                 hand_loop,
                 (
@@ -262,9 +262,9 @@ def build_policy_worker_specs(
 
 
 def run_policy_deployment(
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     policy_spec: Any,
-    worker_config: PolicyWorkerConfig,
+    worker_config: InferenceWorkerConfig,
     execute: bool,
     *,
     deployment_config: PolicyDeploymentConfig | None = None,
@@ -279,13 +279,13 @@ def run_policy_deployment(
     follows ``DISARMED -> hardware readiness -> ARMED -> supervision ->
     verified shutdown``.
     """
-    if not isinstance(runtime, ResolvedRuntimeConfig):
-        raise TypeError("runtime must be a ResolvedRuntimeConfig")
+    if not isinstance(runtime, ExperimentConfig):
+        raise TypeError("runtime must be an ExperimentConfig")
     if not isinstance(execute, bool):
         raise TypeError("execute must be a boolean")
     validate_policy_runtime_compatibility(policy_spec, runtime)
-    if not isinstance(worker_config, PolicyWorkerConfig):
-        raise TypeError("worker_config must be a PolicyWorkerConfig")
+    if not isinstance(worker_config, InferenceWorkerConfig):
+        raise TypeError("worker_config must be an InferenceWorkerConfig")
     if worker_config.spec is not policy_spec:
         raise ValueError("worker PolicySpec must be the validated lifecycle PolicySpec")
     deployment = deployment_config or PolicyDeploymentConfig()
@@ -328,7 +328,7 @@ def run_policy_deployment(
         ),
         mp_context=ctx,
     )
-    specs: list[WorkerSpec] = []
+    specs: list[ProcessSpec] = []
     procs: list[Any] = []
     started_procs: list[Any] = []
     shutdown_report: ShutdownReport | None = None

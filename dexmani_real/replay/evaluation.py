@@ -8,9 +8,9 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.planning.poses import rot6d_to_rotmat
+from dexmani_real.planning.kinematics.pose import rot6d_to_rotmat
 from dexmani_real.replay.trajectory import TrajectoryData
-from dexmani_real.robot_spec import ARM_JOINT_SHAPE
+from dexmani_real.robot.model import ARM_JOINT_SHAPE
 from dexmani_real.utils.atomic_io import atomic_json_dump
 from dexmani_real.utils.log import get_logger
 

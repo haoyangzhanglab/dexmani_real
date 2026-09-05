@@ -12,15 +12,18 @@ import numpy as np
 
 from dexmani_real.config.defaults import hand as hand_defaults
 from dexmani_real.control.publication import validate_hand_command_bounds
-from dexmani_real.teleop.action_proposal import compute_hand_joint_proposal
-from dexmani_real.teleop.hand_control import (
+from dexmani_real.teleop.control_loop.action_proposal import compute_hand_joint_proposal
+from dexmani_real.teleop.control_loop.hand_control import (
     HandRetargetObservationCache,
     compute_hand_command,
     reset_hand_retargeter,
 )
-from dexmani_real.teleop.retarget.dexpilot import PriorDexPilotOptimizer
-from dexmani_real.teleop.retarget.facade import TAGHandRetargeter, XHandRetargeter
-from dexmani_real.teleop.retarget.tag_optimizer import HandOptimizer
+from dexmani_real.teleop.retargeting.dexpilot import PriorDexPilotOptimizer
+from dexmani_real.teleop.retargeting.retargeter import (
+    DexPilotHandRetargeter,
+    TAGHandRetargeter,
+)
+from dexmani_real.teleop.retargeting.tag_optimizer import HandOptimizer
 
 
 class _SentinelRuntimeError(RuntimeError):
@@ -174,11 +177,11 @@ class RetargetFailureSemanticsTest(unittest.TestCase):
 
         with (
             patch(
-                "dexmani_real.teleop.retarget.facade.validate_landmarks",
+                "dexmani_real.teleop.retargeting.retargeter.validate_landmarks",
                 return_value=(True, ""),
             ),
             patch(
-                "dexmani_real.teleop.retarget.facade._estimate_palm_frame",
+                "dexmani_real.teleop.retargeting.retargeter._estimate_palm_frame",
                 return_value=np.eye(3),
             ),
             self.assertRaisesRegex(_SentinelRuntimeError, "TAG sentinel"),
@@ -186,7 +189,7 @@ class RetargetFailureSemanticsTest(unittest.TestCase):
             retargeter.retarget(np.zeros((21, 3)))
 
     def test_xhand_facade_maps_only_roundoff_to_no_solution(self) -> None:
-        retargeter = object.__new__(XHandRetargeter)
+        retargeter = object.__new__(DexPilotHandRetargeter)
         retargeter._prior_weight = 0.0
         retargeter.fixed_joint_values = np.array([])
         retargeter.retargeted_joint_order = np.arange(12)
@@ -197,11 +200,11 @@ class RetargetFailureSemanticsTest(unittest.TestCase):
 
         with (
             patch(
-                "dexmani_real.teleop.retarget.facade.validate_landmarks",
+                "dexmani_real.teleop.retargeting.retargeter.validate_landmarks",
                 return_value=(True, ""),
             ),
             patch(
-                "dexmani_real.teleop.retarget.facade._estimate_palm_frame",
+                "dexmani_real.teleop.retargeting.retargeter._estimate_palm_frame",
                 return_value=np.eye(3),
             ),
         ):

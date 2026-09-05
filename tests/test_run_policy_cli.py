@@ -166,7 +166,7 @@ class RunPolicyCommandTest(unittest.TestCase):
         )
         runtime = object()
         with patch(
-            "dexmani_real.config.runtime.resolve_runtime_config",
+            "dexmani_real.config.experiment.resolve_experiment_config",
             return_value=runtime,
         ) as resolve_runtime:
             inputs = self.cli._prepare_lifecycle_inputs(args, info, execute=True)

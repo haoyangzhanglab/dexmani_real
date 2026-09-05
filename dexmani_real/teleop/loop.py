@@ -3,7 +3,7 @@
 This module builds policy-process resources, waits for readiness, schedules
 operator control and causal-grid work, and performs bounded cleanup.
 The loop directly owns operator transitions, pause boundaries, recording, and
-grid cadence; ``control_grid`` owns algorithm state and one causal tick. Hardware SDKs stay
+grid cadence; ``teleop/control_loop/grid.py`` owns algorithm state and one causal tick. Hardware SDKs stay
 inside the arm, hand, VR, camera, and RecorderIO workers.
 """
 
@@ -12,6 +12,7 @@ from __future__ import annotations
 import gc
 import signal
 import time
+from enum import Enum, auto
 from pathlib import Path
 
 import numpy as np
@@ -26,15 +27,15 @@ from dexmani_real.ipc.causal import (
 )
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import (
-    PlanningProfile,
+    MotionPlanningConfig,
+    OnlineIKConfig,
     Pose,
-    TeleopProfile,
     XArm7MotionPlanner,
     XArm7PlannerConfig,
 )
-from dexmani_real.planning.hand_fk import HandKinematics
+from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.client import RecorderClient, RecorderPhase
-from dexmani_real.robot_spec import (
+from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
@@ -43,31 +44,31 @@ from dexmani_real.runtime.safety import (
     invalidate_coupled_commands,
     transition,
 )
-from dexmani_real.teleop.arm_mapper import ArmWristMapper
 from dexmani_real.teleop.audio_feedback import AudioFeedback
-from dexmani_real.teleop.camera_freshness import CameraFreshnessTracker
 from dexmani_real.teleop.config import TeleopCommandLimits, TeleopConfig
-from dexmani_real.teleop.control_grid import (
+from dexmani_real.teleop.control_loop.camera_freshness import CameraFreshnessTracker
+from dexmani_real.teleop.control_loop.grid import (
     TeleopController,
     TeleopGridResources,
     run_control_grid_tick,
 )
+from dexmani_real.teleop.control_loop.hand_control import (
+    hand_ramp_frame_count,
+    seed_hand_retargeter,
+)
+from dexmani_real.teleop.control_loop.timing import StageTimer
+from dexmani_real.teleop.control_loop.vr_mapping import VRWristMapper
 from dexmani_real.teleop.episode_samples import (
     RECORDING_TACTILE_MAX_AGE_NS,
     stop_recording,
 )
-from dexmani_real.teleop.hand_control import hand_ramp_frame_count, seed_hand_retargeter
-from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
-from dexmani_real.teleop.recording_session import (
-    QuitRecordingDecision,
-    await_quit_recording_decision,
-)
-from dexmani_real.teleop.retarget.facade import (
+from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
+from dexmani_real.teleop.retargeting.retargeter import (
+    DexPilotHandRetargeter,
     TAGHandRetargeter,
-    XHandRetargeter,
 )
-from dexmani_real.teleop.safety import do_configured_teleop_home, hand_feedback_issue
-from dexmani_real.teleop.timing import StageTimer
+from dexmani_real.teleop.health import hand_feedback_issue
+from dexmani_real.teleop.homing import do_configured_teleop_home
 from dexmani_real.teleop.vr_transform import load_vr_transform
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 from dexmani_real.utils.rate import LoopRate
@@ -78,6 +79,44 @@ _END_AUDIO_GRACE_S = 2.0
 _NS_PER_SECOND = 1_000_000_000
 _VALIDATION_WARN_INTERVAL_S = 2.0
 _ARM_FEEDBACK_WARN_INTERVAL_S = 3.0
+
+
+class QuitRecordingDecision(Enum):
+    SAVE = auto()
+    DISCARD = auto()
+    SAVE_AND_HOME = auto()
+    ESTOP = auto()
+    SHUTDOWN = auto()
+    TIMEOUT = auto()
+
+
+def await_quit_recording_decision(
+    shared: RuntimeChannels,
+    keyboard: KeyboardInput,
+    *,
+    timeout_s: float,
+) -> QuitRecordingDecision:
+    """Wait for the bounded save/discard decision while keeping policy health live."""
+    deadline_s = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline_s:
+        if shared.estop_request.value:
+            return QuitRecordingDecision.ESTOP
+        shared.set_heartbeat("policy", time.monotonic())
+        for signal in keyboard.poll(timeout=0.1):
+            if signal is OperatorCommand.STOP:
+                return QuitRecordingDecision.SAVE
+            if signal is OperatorCommand.DISCARD:
+                return QuitRecordingDecision.DISCARD
+            if signal is OperatorCommand.HOME:
+                return QuitRecordingDecision.SAVE_AND_HOME
+            if signal is OperatorCommand.EMERGENCY_STOP:
+                shared.estop_request.value = True
+                return QuitRecordingDecision.ESTOP
+        if shared.estop_request.value:
+            return QuitRecordingDecision.ESTOP
+        if not shared.is_running.value:
+            return QuitRecordingDecision.SHUTDOWN
+    return QuitRecordingDecision.TIMEOUT
 
 
 def _build_safety_gate(config: TeleopConfig, planner: XArm7MotionPlanner) -> SafetyGate:
@@ -105,9 +144,9 @@ def _policy_exit_fault(
     return None
 
 
-def _start_keyboard(shared: RuntimeChannels) -> KeyboardHandler | None:
+def _start_keyboard(shared: RuntimeChannels) -> KeyboardInput | None:
     """Start the required operator input boundary, failing closed on startup errors."""
-    keyboard = KeyboardHandler(
+    keyboard = KeyboardInput(
         estop_callback=lambda: setattr(shared.estop_request, "value", True)
     )
     try:
@@ -126,7 +165,7 @@ def _load_control_resources(
     recording_enabled: bool,
 ) -> tuple[
     XArm7MotionPlanner,
-    ArmWristMapper,
+    VRWristMapper,
     SafetyGate,
     RecorderClient | None,
 ]:
@@ -143,8 +182,8 @@ def _load_control_resources(
                 config.runtime.policy.workspace.as_tuple(), dtype=np.float64
             ),
         ),
-        planning_profile=PlanningProfile(),
-        teleop_profile=TeleopProfile(
+        planning_profile=MotionPlanningConfig(),
+        teleop_profile=OnlineIKConfig(
             max_pose_error_pos_m=config.runtime.policy.ik_max_pose_error_pos_m,
             max_pose_error_rot_rad=config.runtime.policy.ik_max_pose_error_rot_rad,
             nullspace_step_size_deg=(
@@ -163,7 +202,7 @@ def _load_control_resources(
     vr_calibration = load_vr_transform(vr_config_path)
     vr_to_robot_rot = vr_calibration.transform
     logger.info("VR transform loaded: theta=%.6g°", vr_calibration.theta_deg)
-    arm_mapper = ArmWristMapper(
+    arm_mapper = VRWristMapper(
         pos_scale=config.runtime.policy.vr_mapping.pos_scale,
         rot_scale=config.runtime.policy.vr_mapping.rot_scale,
         vr_to_robot_rot=vr_to_robot_rot,
@@ -188,7 +227,7 @@ def _build_hand_retargeter(config: TeleopConfig):
             tag_config=config.runtime.tag_retargeting,
             urdf_path=config.hand_urdf_path,
         )
-    return XHandRetargeter(
+    return DexPilotHandRetargeter(
         hand_type="right",
         retargeting_type=config.runtime.policy.hand_retargeting_type,
         dexpilot_config=config.runtime.dexpilot_retargeting,
@@ -367,7 +406,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
     grid_period_ns = int(round(_NS_PER_SECOND / cfg.runtime.policy.control_hz))
     next_grid_ns = time.monotonic_ns() + grid_period_ns
     current_grid_anchor_ns = next_grid_ns
-    pending_controls: list[ControlSignal] = []
+    pending_controls: list[OperatorCommand] = []
     stage_timer = StageTimer(window=cfg.runtime.policy.status_print_interval)
     validate_warn = ThrottledWarner(interval_s=_VALIDATION_WARN_INTERVAL_S)
     arm_feedback_warn = ThrottledWarner(interval_s=_ARM_FEEDBACK_WARN_INTERVAL_S)
@@ -543,16 +582,16 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             if quit_pending:
                 home_handled = False
                 for control in kb.poll(timeout=0.1):
-                    if control is ControlSignal.HOME and not home_handled:
+                    if control is OperatorCommand.HOME and not home_handled:
                         home_handled = True
                         print("  H: return_home")
                         audio.play("home")
                         run_home()
-                        kb.drain_signal(ControlSignal.HOME)
+                        kb.drain_signal(OperatorCommand.HOME)
                         limiter.reset()
                         print("  [Q] quit", flush=True)
-                    elif control in (ControlSignal.QUIT, ControlSignal.EMERGENCY_STOP):
-                        if control is ControlSignal.EMERGENCY_STOP:
+                    elif control in (OperatorCommand.QUIT, OperatorCommand.EMERGENCY_STOP):
+                        if control is OperatorCommand.EMERGENCY_STOP:
                             shared.estop_request.value = True
                         elif recorder is not None and recorder.stop_pending:
                             if not quit_after_recording:
@@ -625,7 +664,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             reanchor_grid = False
             break_loop = False
             for control in controls:
-                if control is ControlSignal.EMERGENCY_STOP:
+                if control is OperatorCommand.EMERGENCY_STOP:
                     print("\nESC: emergency_stop")
                     audio.play("emergency")
                     shared.estop_request.value = True
@@ -635,7 +674,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     recording_active = False
                     break_loop = True
                     break
-                if control is ControlSignal.QUIT:
+                if control is OperatorCommand.QUIT:
                     print("\nQ: 退出")
                     audio.play("quit")
                     enter_pause("quit", relabel=True)
@@ -685,7 +724,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     )
                     skip_control_tick = True
                     break
-                if control is ControlSignal.HOME:
+                if control is OperatorCommand.HOME:
                     print("\nH: return_home")
                     audio.play("home")
                     stop_recording(recorder, recording_active, save=True, shared=shared)
@@ -695,12 +734,12 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         break_loop = True
                         break
                     run_home()
-                    kb.drain_signal(ControlSignal.HOME)
+                    kb.drain_signal(OperatorCommand.HOME)
                     reanchor_grid = True
                     skip_control_tick = True
                     break
-                if control in (ControlSignal.STOP, ControlSignal.DISCARD):
-                    save_episode = control is ControlSignal.STOP
+                if control in (OperatorCommand.STOP, OperatorCommand.DISCARD):
+                    save_episode = control is OperatorCommand.STOP
                     reason = "stop" if save_episode else "discard"
                     print("\nS: 停止录制" if save_episode else "\nD: 丢弃录制")
                     audio.play("save" if save_episode else "discard")
@@ -714,7 +753,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         break_loop = True
                         break
                     skip_control_tick = True
-                elif control is ControlSignal.PAUSE:
+                elif control is OperatorCommand.PAUSE:
                     pause_signal_applied = False
                     if teleop_active:
                         enter_pause("pause", relabel=True)
@@ -744,7 +783,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         print(f"\nC: {'恢复' if teleop_active else '暂停'}遥操作")
                         audio.play("resume" if teleop_active else "pause")
                     skip_control_tick = True
-                elif control is ControlSignal.BEGIN:
+                elif control is OperatorCommand.BEGIN:
                     if teleop_active or recording_active:
                         print(
                             "\nB: session already active — use C to pause/resume, S to save, or D to discard"
@@ -806,7 +845,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     else:
                         shared.is_recording.value = False
                         begin_message = "\nB: 遥操作开始（未启用录制 capability）"
-                    kb.drain_signal(ControlSignal.BEGIN)
+                    kb.drain_signal(OperatorCommand.BEGIN)
                     if not _transition_or_fault(shared, SafetyState.RUNNING, "begin"):
                         stop_recording(
                             recorder,

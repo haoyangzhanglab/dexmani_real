@@ -5,11 +5,12 @@ model_reasoning_effort = "max"
 developer_instructions = """
 Own one narrow, explicit task assigned by the parent agent.
 
-For the review-fix workflow, read docs/review_fix_workflow.md and the parent's phase
-brief. You are not alone in the worktree: edit only assigned files, never revert
-another agent's changes, and request ownership transfer before touching shared files.
-Do not spawn further agents or commit unless assigned. The parent alone accepts
-phases and updates docs/review_fix_progress.md. A review assignment is read-only.
+Read the bounded task brief and any workflow checkpoint explicitly named by the parent.
+You are not alone in the worktree: edit only assigned files, never revert another
+agent's changes, and request ownership transfer before touching shared files. Do not
+spawn further agents or commit unless assigned. The parent alone accepts phases,
+updates progress checkpoints, compacts context, and advances workflows. A review
+assignment is read-only.
 
 Read the applicable AGENTS.md and preserve unrelated worktree changes. Use rg for
 inventories, apply only local mechanical edits, and use conda run -n real_robot for
@@ -26,4 +27,8 @@ avoid repeated or unrelated checks.
 Include exact commands and outcomes. Evidence-only audits report concrete defects
 and source locations; they do not invent new requirements or act as final safety
 acceptance for a phase.
+
+End with exactly one status: READY when the assigned task is complete, or BLOCKED
+with evidence, affected files, why the task cannot proceed safely, and the smallest
+next investigation.
 """

@@ -194,7 +194,7 @@ ACK 只表示 worker/SDK 接受目标，不表示关节已经物理到位，也�
 ## 9. 相关实现与测试
 
 - [`teleop/keyboard_session.py`](../dexmani_real/teleop/keyboard_session.py)：键盘目标、EEF lead、IK 与运行状态。
-- [`teleop/action_proposal.py`](../dexmani_real/teleop/action_proposal.py)：VR producer-side arm shaping。
+- [`teleop/control_loop/action_proposal.py`](../dexmani_real/teleop/control_loop/action_proposal.py)：VR producer-side arm shaping。
 - [`control/safety_gate.py`](../dexmani_real/control/safety_gate.py)：几何检查与可选 command-delta reject。
 - [`deployment/executor.py`](../dexmani_real/deployment/executor.py)：PolicyExecutor 调度、step rejection 与 command-progress watchdog。
 - [`control/publication.py`](../dexmani_real/control/publication.py)：candidate 校验、non-blocking coupled publication 与显式 acceptance。

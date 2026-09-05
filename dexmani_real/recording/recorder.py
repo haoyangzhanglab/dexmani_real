@@ -25,15 +25,15 @@ from typing import Any
 import h5py  # type: ignore[import-untyped]
 import numpy as np
 
-from dexmani_real.config.camera_calib import CameraCalib
+from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.defaults import camera
-from dexmani_real.recording.camera_writer import (
+from dexmani_real.recording.storage.camera_writer import (
     CameraStreamWriter,
     CameraStreamWriterConfig,
 )
 from dexmani_real.recording.frame import EpisodeFrame, build_episode_frame
-from dexmani_real.recording.hdf5_writer import EpisodeDataWriter
-from dexmani_real.recording.schema import (
+from dexmani_real.recording.storage.hdf5_writer import EpisodeDataWriter
+from dexmani_real.recording.storage.schema import (
     ARM_SENT_MARKER,
     EPISODE_SCHEMA_VERSION,
     RAW_DEPTH_SHA256_ATTR,
@@ -50,9 +50,9 @@ from dexmani_real.recording.schema import (
     validate_source_frame_keys,
 )
 from dexmani_real.recording.timeline import TimestampAlignedBuffer
-from dexmani_real.recording.video import VideoDecoder
-from dexmani_real.robot.types import RobotAction, RobotState
-from dexmani_real.sensor.camera_geometry import RGBDGeometry
+from dexmani_real.recording.storage.video import VideoDecoder
+from dexmani_real.recording.sample import EpisodeAction, EpisodeState
+from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish, sha256_file
 from dexmani_real.utils.log import get_logger
 
@@ -194,7 +194,7 @@ class EpisodeRecorder:
         self,
         task_label: str = "",
         operator: str = "",
-        calib: CameraCalib | None = None,
+        calib: CameraExtrinsics | None = None,
         camera_geometry: RGBDGeometry | None = None,
         camera_name: str | None = None,
         camera_serial: str | None = None,
@@ -405,8 +405,8 @@ class EpisodeRecorder:
 
     def add_frame(
         self,
-        state: RobotState,
-        action: RobotAction,
+        state: EpisodeState,
+        action: EpisodeAction,
         vr_frame: Mapping[str, object],
         camera_frame: Mapping[str, object] | None = None,
         signals: Mapping[str, object] | None = None,

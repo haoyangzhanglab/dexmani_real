@@ -34,7 +34,7 @@ Intel RealSense
         aligned uint16 depth + RGB, 均为 color 像素网格
                  │
                  ▼
-        camera_worker → camera_ring
+        sensor/camera/worker.py → camera_ring
                  │  (最新帧、时钟/健康/generation 元数据)
                  ▼
         pointcloud_worker
@@ -59,7 +59,7 @@ generation、时钟重置、source/publish/now 因果关系和最大帧龄；构
 ## Raw episode 即时可视化
 
 `examples/visualize_episode.py` 对 raw v24 默认启用点云。持久化边界由
-`data/raw_pointcloud.py` 统一解析：它从 episode 读取 aligned RGB-D 几何、`depth_scale` 与
+`dataset/pointcloud.py` 统一解析：它从 episode 读取 aligned RGB-D 几何、`depth_scale` 与
 `T_xarm_base_from_color`，再调用和 offline processing、实时 worker 相同的
 `sensor.pointcloud.build_point_cloud()`。可视化入口不维护第二套反投影、裁减或采样实现。
 
@@ -299,14 +299,14 @@ OpenCV 3×3 depth fast path 与逐步 SciPy 参考实现的 240 帧最终点云 
 
 | 责任 | 位置 |
 |---|---|
-| RealSense 采集、对齐、原生 provenance | `sensor/realsense.py` |
-| aligned RGBD IPC 发布 | `sensor/camera_worker.py` |
+| RealSense 采集、对齐、原生 provenance | `sensor/camera/realsense.py` |
+| aligned RGBD IPC 发布 | `sensor/camera/worker.py` |
 | 纯几何/滤波/采样 | `sensor/pointcloud.py` |
 | 最新帧消费、freshness 与 point-cloud IPC 发布 | `sensor/pointcloud_worker.py` |
 | 点云参数与稳定 identity | `config/pointcloud.py` |
 | 桌面 RANSAC 与 plane 文件 | `calibration/table.py`、`config/desk_plane.json` |
-| raw v24 相机 metadata 与点云输入适配 | `data/raw_pointcloud.py` |
-| raw v24 → processed v12 | `data/process.py` |
+| raw v24 相机 metadata 与点云输入适配 | `dataset/pointcloud.py` |
+| raw v24 → processed v12 | `dataset/processing.py` |
 | raw current-config preview | `examples/visualize_episode.py` |
 
 核心数学不访问 SDK、共享内存、文件或可视化；硬件采集、IPC、标定写入和 GUI 均在外围 owner 中。

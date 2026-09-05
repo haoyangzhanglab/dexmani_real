@@ -1,8 +1,8 @@
 """ArUco eye-to-hand calibration math and persistence without device ownership.
 
 This module does not start cameras, open GUI windows, create worker processes,
-or publish robot commands. ``camera_calibration_control`` owns arm-motion
-state and command publication; ``camera_calibration_session`` owns the
+or publish robot commands. ``motion.py`` owns arm-motion state and command
+publication; ``session.py`` owns the
 interactive device, GUI, sampling, and cleanup lifecycle.
 """
 
@@ -19,7 +19,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real import PACKAGE_DIR
-from dexmani_real.planning.poses import rot6d_to_quat_wxyz
+from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
 from dexmani_real.utils.atomic_io import atomic_json_dump
 
 CAMERA_CALIBRATION_PATH = PACKAGE_DIR / "config" / "cameras.json"

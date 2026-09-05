@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.robot_spec import (
+from dexmani_real.robot.model import (
     ARM_JOINT_SHAPE,
     HAND_CONTACT_SHAPE,
     HAND_FINGERTIP_SHAPE,

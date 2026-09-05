@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from dexmani_real.config.runtime import resolve_runtime_config
+from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.control.action import ActionCandidate
 from dexmani_real.control.publication import (
     PUBLISH_REASON_GENERATION,
@@ -19,7 +19,7 @@ from dexmani_real.control.publication import (
 )
 from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
 from dexmani_real.deployment.config import PolicyDeploymentConfig
-from dexmani_real.deployment.contracts import Prediction
+from dexmani_real.deployment.prediction import Prediction
 from dexmani_real.deployment.executor import (
     PolicyExecutor,
     _advance_control_grid_ns,
@@ -131,7 +131,7 @@ def _executor(
     ):
         return PolicyExecutor(
             _FakeShared(),
-            resolve_runtime_config(data=runtime_data),
+            resolve_experiment_config(data=runtime_data),
             _policy_spec(action_key),
             PolicyDeploymentConfig(
                 inference_mode=mode,
@@ -226,7 +226,7 @@ def _attempt_policy_step(
 
 class PolicyExecutorBehaviorTest(unittest.TestCase):
     def test_joint_action_decodes_exact_arm_and_hand_targets(self) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         action = np.zeros(19, dtype=np.float64)
         action[:7] = 0.1
         action[7:] = np.arange(12, dtype=np.float64) / 20.0
@@ -244,7 +244,7 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
         self.assertEqual(reason, "")
 
     def test_ee_action_uses_ik_and_failure_remains_a_step_rejection(self) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         action = np.zeros(21, dtype=np.float64)
         action[3] = 1.0
         action[7] = 1.0
@@ -279,7 +279,7 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
         self.assertEqual(reason, "no solution")
 
     def test_ee_action_rejects_degenerate_rot6d_during_decode(self) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         action = np.zeros(21, dtype=np.float64)
         planner = Mock()
 
@@ -297,7 +297,7 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
         planner.solve_teleop_ik.assert_not_called()
 
     def test_workspace_check_rejects_without_clipping(self) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         arm_fk = Mock()
         bounds = np.asarray(runtime.policy.workspace.as_tuple(), dtype=np.float64)
         inside = np.mean(bounds, axis=1)
@@ -310,7 +310,7 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
         self.assertFalse(check(np.zeros(7), np.zeros(7)))
 
     def test_joint_gate_does_not_construct_the_ee_planner(self) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         arm_fk = Mock()
         arm_fk.compute.return_value = (np.zeros(3), np.zeros(4))
         with (
@@ -332,7 +332,7 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
         )
 
     def test_policy_arm_clip_is_independent_of_teleop_and_worker_guards(self) -> None:
-        defaults = resolve_runtime_config()
+        defaults = resolve_experiment_config()
         self.assertAlmostEqual(
             defaults.arm.max_servo_command_jump_rad, np.deg2rad(20.0)
         )
@@ -343,7 +343,7 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
             defaults.policy.arm_action_delta_clip_rad, np.deg2rad(20.0)
         )
         self.assertEqual(defaults.policy.hand_max_action_jump_rad, 1.0)
-        runtime = resolve_runtime_config(
+        runtime = resolve_experiment_config(
             data={
                 "arm": {"max_servo_command_jump_rad": 0.4},
                 "policy": {
@@ -366,7 +366,7 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
         )
 
     def test_policy_arm_spike_clip_is_wrap_aware_and_admits_before_clip(self) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         limit = runtime.policy.arm_action_delta_clip_rad
         reference = np.zeros(7, dtype=np.float64)
         target = reference.copy()
@@ -1012,7 +1012,7 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
         executor._fault.assert_called_once()
 
     def test_physical_begin_rechecks_measured_home_pose(self) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         shared = _FakeShared()
         shared.physical_home_completed.value = True
         state = {

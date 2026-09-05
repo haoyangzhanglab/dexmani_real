@@ -1,14 +1,13 @@
 """Motion planning — IK, path planning, collision checking, kinematics."""
 
-from __future__ import annotations
-
-from .planner import XArm7MotionPlanner
-from .types import PlanningProfile, Pose, TeleopProfile, XArm7PlannerConfig
+from .kinematics.ik import OnlineIKConfig
+from .kinematics.pose import Pose
+from .planner import MotionPlanningConfig, XArm7MotionPlanner, XArm7PlannerConfig
 
 __all__ = [
-    "PlanningProfile",
+    "MotionPlanningConfig",
     "Pose",
-    "TeleopProfile",
+    "OnlineIKConfig",
     "XArm7MotionPlanner",
     "XArm7PlannerConfig",
 ]

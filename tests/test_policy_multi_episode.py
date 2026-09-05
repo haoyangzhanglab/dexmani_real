@@ -22,7 +22,7 @@ from dexmani_real.runtime.safety import (
     request_policy_stop,
     revoke_motion,
 )
-from dexmani_real.teleop.keyboard import ControlSignal
+from dexmani_real.runtime.operator_input import OperatorCommand
 
 
 class _Value:
@@ -47,7 +47,7 @@ class _FakeShared:
 
 
 class _FakeKeyboard:
-    def __init__(self, shared: _FakeShared, batches: list[list[ControlSignal]]) -> None:
+    def __init__(self, shared: _FakeShared, batches: list[list[OperatorCommand]]) -> None:
         self._shared = shared
         self._batches = list(batches)
         self.started = False
@@ -67,14 +67,14 @@ class _FakeKeyboard:
     def stop(self) -> None:
         self.stopped = True
 
-    def poll(self, *, timeout: float) -> list[ControlSignal]:
+    def poll(self, *, timeout: float) -> list[OperatorCommand]:
         del timeout
         if self._batches:
             return self._batches.pop(0)
         self._shared.is_running.value = False
         return []
 
-    def drain_signal(self, _signal: ControlSignal) -> int:
+    def drain_signal(self, _signal: OperatorCommand) -> int:
         return 0
 
 
@@ -185,18 +185,18 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
         keyboard = _FakeKeyboard(
             shared,
             [
-                [ControlSignal.HOME],
-                [ControlSignal.BEGIN],
-                [ControlSignal.STOP],
-                [ControlSignal.HOME],
-                [ControlSignal.BEGIN],
+                [OperatorCommand.HOME],
+                [OperatorCommand.BEGIN],
+                [OperatorCommand.STOP],
+                [OperatorCommand.HOME],
+                [OperatorCommand.BEGIN],
             ],
         )
         home = Mock(side_effect=(True, True))
 
         with (
             patch(
-                "dexmani_real.deployment.operator.KeyboardHandler",
+                "dexmani_real.deployment.operator.KeyboardInput",
                 return_value=keyboard,
             ),
             patch("dexmani_real.deployment.operator._home", home),
@@ -220,13 +220,13 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
         shared = _FakeShared()
         keyboard = _FakeKeyboard(
             shared,
-            [[ControlSignal.HOME], [ControlSignal.BEGIN]],
+            [[OperatorCommand.HOME], [OperatorCommand.BEGIN]],
         )
         home = Mock(return_value=False)
 
         with (
             patch(
-                "dexmani_real.deployment.operator.KeyboardHandler",
+                "dexmani_real.deployment.operator.KeyboardInput",
                 return_value=keyboard,
             ),
             patch("dexmani_real.deployment.operator._home", home),
@@ -246,12 +246,12 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
     def test_home_is_rejected_while_running(self) -> None:
         shared = _FakeShared()
         shared.safety_state.value = int(SafetyState.RUNNING)
-        keyboard = _FakeKeyboard(shared, [[ControlSignal.HOME]])
+        keyboard = _FakeKeyboard(shared, [[OperatorCommand.HOME]])
         home = Mock(return_value=True)
 
         with (
             patch(
-                "dexmani_real.deployment.operator.KeyboardHandler",
+                "dexmani_real.deployment.operator.KeyboardInput",
                 return_value=keyboard,
             ),
             patch("dexmani_real.deployment.operator._home", home),
@@ -269,8 +269,8 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
 
     def test_home_begin_same_batch_cannot_start_an_episode(self) -> None:
         for signals in (
-            [ControlSignal.HOME, ControlSignal.BEGIN],
-            [ControlSignal.BEGIN, ControlSignal.HOME],
+            [OperatorCommand.HOME, OperatorCommand.BEGIN],
+            [OperatorCommand.BEGIN, OperatorCommand.HOME],
         ):
             with self.subTest(signals=signals):
                 shared = _FakeShared()
@@ -278,7 +278,7 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
 
                 with (
                     patch(
-                        "dexmani_real.deployment.operator.KeyboardHandler",
+                        "dexmani_real.deployment.operator.KeyboardInput",
                         return_value=keyboard,
                     ),
                     patch(
@@ -298,7 +298,7 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
 
     def test_stop_during_completed_home_cannot_restore_home_authorization(self) -> None:
         shared = _FakeShared()
-        keyboard = _FakeKeyboard(shared, [[ControlSignal.HOME]])
+        keyboard = _FakeKeyboard(shared, [[OperatorCommand.HOME]])
 
         def complete_after_stop(*_args: object, **_kwargs: object) -> bool:
             shared.stop_request.value = int(StopRequest.OPERATOR)
@@ -306,7 +306,7 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
 
         with (
             patch(
-                "dexmani_real.deployment.operator.KeyboardHandler",
+                "dexmani_real.deployment.operator.KeyboardInput",
                 return_value=keyboard,
             ),
             patch(

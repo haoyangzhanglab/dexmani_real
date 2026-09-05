@@ -15,13 +15,13 @@ from dexmani_real.calibration.camera.session import run_camera_calibration
 from dexmani_real.config.defaults import CameraParams
 from dexmani_real.runtime.safety import SafetyState
 from dexmani_real.runtime.status import ExitReason
-from dexmani_real.runtime.supervisor import run_supervisor, wait_subsystem_ready
-from dexmani_real.runtime.workers import (
-    WorkerSpec,
-    shutdown_processes_verified,
+from dexmani_real.runtime.processes import ProcessSpec, shutdown_processes_verified
+from dexmani_real.runtime.supervisor import (
+    run_supervisor,
     supervisor_exit_reason,
+    wait_subsystem_ready,
 )
-from dexmani_real.sensor.camera_worker import CameraLoopConfig, camera_loop
+from dexmani_real.sensor.camera.worker import CameraLoopConfig, camera_loop
 
 
 class _Value:
@@ -121,9 +121,9 @@ class RuntimeSupervisionTest(unittest.TestCase):
             def get_l515_depth_option_snapshot(self) -> dict[str, object]:
                 return {}
 
-        fake_realsense = types.ModuleType("dexmani_real.sensor.realsense")
-        fake_realsense.RealSense = FakeRealSense
-        fake_realsense.RealSenseConfig = FakeRealSenseConfig
+        fake_realsense = types.ModuleType("dexmani_real.sensor.camera.realsense")
+        fake_realsense.RealSenseCamera = FakeRealSense
+        fake_realsense.RealSenseCameraConfig = FakeRealSenseConfig
         fake_realsense.L515DepthConfig = lambda **_kwargs: object()
         shared = SimpleNamespace(
             camera_depth_scale=_Value(0.0),
@@ -143,9 +143,9 @@ class RuntimeSupervisionTest(unittest.TestCase):
 
         with (
             patch.dict(sys.modules, {fake_realsense.__name__: fake_realsense}),
-            patch("dexmani_real.sensor.camera_worker.time.sleep"),
+            patch("dexmani_real.sensor.camera.worker.time.sleep"),
             patch(
-                "dexmani_real.sensor.camera_worker.time.monotonic",
+                "dexmani_real.sensor.camera.worker.time.monotonic",
                 side_effect=lambda: next(monotonic_values),
             ),
         ):
@@ -340,10 +340,10 @@ class RuntimeSupervisionTest(unittest.TestCase):
                 shared,
                 [
                     (
-                        WorkerSpec("inference", lambda: None, (), "inference"),
+                        ProcessSpec("inference", lambda: None, (), "inference"),
                         processes[0],
                     ),
-                    (WorkerSpec("arm", lambda: None, (), "arm"), processes[1]),
+                    (ProcessSpec("arm", lambda: None, (), "arm"), processes[1]),
                 ],
                 {"inference": 0.1, "arm": 0.1},
                 monitored_processes=processes,
@@ -359,7 +359,7 @@ class RuntimeSupervisionTest(unittest.TestCase):
                 shared,
                 [
                     (
-                        WorkerSpec("inference", lambda: None, (), "inference"),
+                        ProcessSpec("inference", lambda: None, (), "inference"),
                         _Process("inference", alive=False, exitcode=1),
                     )
                 ],
@@ -368,7 +368,7 @@ class RuntimeSupervisionTest(unittest.TestCase):
         )
 
     def test_readiness_fails_on_sticky_fault_and_timeout(self) -> None:
-        worker = WorkerSpec("arm", lambda: None, (), "arm")
+        worker = ProcessSpec("arm", lambda: None, (), "arm")
         process = _Process("arm")
 
         faulted = _Shared()

@@ -12,7 +12,8 @@ from unittest.mock import MagicMock, patch
 import h5py
 import numpy as np
 
-from dexmani_real.replay.controller import ReplayOutcome, ReplayStatus
+from dexmani_real.dataset.processed import PROCESSED_SCHEMA_VERSION
+from dexmani_real.replay.replayer import ReplayOutcome, ReplayStatus
 from dexmani_real.replay.session import _post_shutdown_outcome
 from dexmani_real.replay.trajectory import (
     TrajectoryData,
@@ -21,7 +22,7 @@ from dexmani_real.replay.trajectory import (
     verify_replay_preflight,
 )
 from dexmani_real.runtime.safety import SafetyState
-from dexmani_real.runtime.workers import ProcessExit, ShutdownReport
+from dexmani_real.runtime.processes import ProcessExit, ShutdownReport
 
 
 class _Value:
@@ -293,7 +294,7 @@ class ReplayIntegritySeparationTest(unittest.TestCase):
                 artifact.attrs.update(
                     {
                         "schema_name": "dexmani-real-processed-hdf5",
-                        "schema_version": 11,
+                        "schema_version": PROCESSED_SCHEMA_VERSION,
                         "domain": "real",
                         "profile": "state_only",
                         "episode_steps": 1,

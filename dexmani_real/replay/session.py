@@ -29,24 +29,24 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.runtime import ResolvedRuntimeConfig
-from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
-from dexmani_real.control.hand_home import publish_hand_home_and_wait_accepted
+from dexmani_real.config.experiment import ExperimentConfig
+from dexmani_real.control.arm_homing import ArmHomeConfig, execute_arm_home
+from dexmani_real.control.hand_homing import publish_hand_home_and_wait_accepted
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
-from dexmani_real.replay.controller import EpisodeReplayer, ReplayOutcome, ReplayStatus
+from dexmani_real.replay.replayer import EpisodeReplayer, ReplayOutcome, ReplayStatus
 from dexmani_real.replay.evaluation import evaluate_replay
 from dexmani_real.replay.trajectory import TrajectoryData, verify_replay_preflight
 from dexmani_real.robot.arm_worker import arm_loop as _arm_loop
 from dexmani_real.robot.hand_worker import hand_loop as _hand_loop
 from dexmani_real.runtime.safety import SafetyState, require_transition
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
-from dexmani_real.runtime.workers import (
+from dexmani_real.runtime.processes import (
     ShutdownReport,
-    WorkerSpec,
+    ProcessSpec,
     build_processes,
     start_processes,
 )
-from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
+from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -158,14 +158,14 @@ def _worker_health_issue(
 def _offer_return_home(
     shared: RuntimeChannels,
     replayer: EpisodeReplayer,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     *,
     hand_available: bool,
     health_check: Callable[[], str | None],
 ) -> tuple[ReplayStatus, str] | None:
     """Post-replay prompt: press H to return arm/hand to home, Q to exit."""
     print("\nPress H to return_home, or Q to exit...")
-    keyboard = KeyboardHandler(
+    keyboard = KeyboardInput(
         estop_callback=lambda: setattr(shared.estop_request, "value", True)
     )
     keyboard.start()
@@ -173,7 +173,7 @@ def _offer_return_home(
         deadline = time.perf_counter() + float(runtime.policy.post_teleop_timeout_s)
         while time.perf_counter() < deadline:
             signals = set(keyboard.poll(timeout=0.1))
-            if ControlSignal.EMERGENCY_STOP in signals or shared.estop_request.value:
+            if OperatorCommand.EMERGENCY_STOP in signals or shared.estop_request.value:
                 shared.estop_request.value = True
                 shared.error_state.value = True
                 require_transition(shared, SafetyState.FAULT)
@@ -191,9 +191,9 @@ def _offer_return_home(
                 shared.error_state.value = True
                 require_transition(shared, SafetyState.FAULT)
                 return ReplayStatus.FAULT, health_issue
-            if ControlSignal.QUIT in signals:
+            if OperatorCommand.QUIT in signals:
                 return None
-            if ControlSignal.HOME not in signals:
+            if OperatorCommand.HOME not in signals:
                 continue
 
             if hand_available:
@@ -283,7 +283,7 @@ def _offer_return_home(
 
 def replay_episode(
     trajectory: TrajectoryData,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     config: EpisodeReplayConfig,
 ) -> ReplayOutcome:
     """Start arm/hand workers, run one replay, then shut the session down."""
@@ -314,10 +314,10 @@ def replay_episode(
     outcome = ReplayOutcome(ReplayStatus.REJECTED, reason="replay did not start")
     try:
         hand_available = trajectory.has_hand
-        specs = [WorkerSpec("arm", _arm_loop, (shared, runtime.arm), ready_name="arm")]
+        specs = [ProcessSpec("arm", _arm_loop, (shared, runtime.arm), ready_name="arm")]
         if hand_available:
             specs.append(
-                WorkerSpec(
+                ProcessSpec(
                     "hand",
                     _hand_loop,
                     (

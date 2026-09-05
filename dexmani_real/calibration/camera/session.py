@@ -1,7 +1,7 @@
 """Interactive xArm7/RealSense lifecycle for ArUco eye-to-hand calibration.
 
 This module owns worker topology, RealSense/GUI interaction, sample capture,
-and cleanup. ``camera_calibration_control`` owns the arm-motion state machine,
+and cleanup. ``motion.py`` owns the arm-motion state machine,
 gated command publication, quit hold, and homing actions.
 
 Computes T_world_camera by detecting ArUco markers on the end-effector from a
@@ -9,7 +9,7 @@ fixed tripod-mounted camera and solving the hand-eye transform across five
 OpenCV algorithms.
 
 Results are written to ``dexmani_real/config/cameras.json``, compatible with
-the ``CameraCalib`` config loader.
+the ``CameraExtrinsics`` config loader.
 
 Hardware preparation:
 
@@ -54,7 +54,7 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 
-from dexmani_real.calibration.camera.control import (
+from dexmani_real.calibration.camera.motion import (
     CalibrationLoopState,
     HomeKeyOutcome,
     handle_calibration_home_key,
@@ -78,20 +78,20 @@ from dexmani_real.calibration.camera.solver import (
     marker_corners_3d,
     save_camera_calibration,
 )
-from dexmani_real.config.runtime import ResolvedRuntimeConfig
+from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.control.safety_gate import SafetyGate, planner_action_safety_gate
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
     RuntimeChannelsConfig,
     read_arm_state_dict,
 )
-from dexmani_real.planning import TeleopProfile, XArm7MotionPlanner
-from dexmani_real.planning.arm_fk import make_arm_fk
+from dexmani_real.planning import OnlineIKConfig, XArm7MotionPlanner
+from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.runtime.safety import SafetyState, require_transition
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
-from dexmani_real.runtime.workers import WorkerSpec, build_processes, start_processes
-from dexmani_real.teleop.keyboard import GlobalKeyState
+from dexmani_real.runtime.operator_input import KeyboardState
+from dexmani_real.runtime.processes import ProcessSpec, build_processes, start_processes
 from dexmani_real.utils.feedback import validate_arm_feedback
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
@@ -180,7 +180,7 @@ def _start_camera(serial: str | None = None) -> tuple[Any, str, np.ndarray, np.n
     return pipeline, serial, intrinsics, distortion
 
 
-def _workspace_bounds(runtime: ResolvedRuntimeConfig) -> np.ndarray:
+def _workspace_bounds(runtime: ExperimentConfig) -> np.ndarray:
     w = runtime.policy.workspace
     return np.array(
         [[w.x_min, w.x_max], [w.y_min, w.y_max], [w.z_min, w.z_max]], dtype=np.float64
@@ -188,11 +188,11 @@ def _workspace_bounds(runtime: ResolvedRuntimeConfig) -> np.ndarray:
 
 
 def _build_planner_and_gate(
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
 ) -> tuple[XArm7MotionPlanner, SafetyGate, np.ndarray]:
     workspace = _workspace_bounds(runtime)
     planner = XArm7MotionPlanner.create_default(
-        teleop_profile=TeleopProfile(
+        teleop_profile=OnlineIKConfig(
             max_pose_error_pos_m=float(runtime.keyboard_teleop.ik_max_pose_error_pos_m),
             max_pose_error_rot_rad=float(
                 runtime.keyboard_teleop.ik_max_pose_error_rot_rad
@@ -241,7 +241,7 @@ def _runtime_issue(
 
 def _capture_calibration_sample(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     pipeline: Any,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
@@ -434,13 +434,13 @@ def _show_calibration_preview(
 
 def _handle_calibration_sample_events(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
     pipeline: Any,
     serial: str,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
-    keys: GlobalKeyState,
+    keys: KeyboardState,
     state: CalibrationLoopState,
     calib_cfg: CalibrationConfig,
     aruco_cfg: ArucoConfig,
@@ -489,7 +489,7 @@ def _handle_calibration_sample_events(
 
 def _run_calibration(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
     safety_gate: SafetyGate,
     workspace: np.ndarray,
@@ -505,7 +505,7 @@ def _run_calibration(
         return 1
 
     pipeline: Any | None = None
-    keys = GlobalKeyState(
+    keys = KeyboardState(
         suppress_echo=True,
         estop_callback=lambda: set_calibration_fault(
             shared, "operator e-stop callback", estop=True
@@ -567,7 +567,7 @@ def _run_calibration(
 
 def _run_calibration_control_loop(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
     safety_gate: SafetyGate,
     workspace: np.ndarray,
@@ -576,7 +576,7 @@ def _run_calibration_control_loop(
     serial: str,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
-    keys: GlobalKeyState,
+    keys: KeyboardState,
     initial_state: dict[str, Any],
     calib_cfg: CalibrationConfig,
     aruco_cfg: ArucoConfig,
@@ -693,7 +693,7 @@ def _run_calibration_control_loop(
 
 
 def run_camera_calibration(
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     *,
     camera_serial: str | None,
     hand_geometry: str,
@@ -718,7 +718,7 @@ def run_camera_calibration(
     exit_code = 1
     try:
         specs = [
-            WorkerSpec(
+            ProcessSpec(
                 "arm-calib",
                 arm_loop,
                 (shared, runtime.arm),

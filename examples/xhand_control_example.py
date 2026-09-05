@@ -24,7 +24,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from dexmani_real.config.defaults import hand as hand_defaults
-from dexmani_real.robot_spec import HAND_DOF
+from dexmani_real.robot.model import HAND_DOF
 
 _HOME_QPOS_DEG = hand_defaults.home_qpos_deg
 _COMMAND_QPOS_MIN_RAD = hand_defaults.qpos_min_rad

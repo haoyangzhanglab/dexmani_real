@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/realsense_record_example.py``.
 
-Self-contained interactive RealSense RGB-D and point-cloud diagnostic. The
-point-cloud window switches explicitly between the complete unprocessed
-depth-to-color cloud and the canonical processed production cloud.
+Hardware- and GUI-affecting interactive RealSense RGB-D and point-cloud
+diagnostic. It connects to a camera, opens OpenCV/Open3D windows, and restores
+the camera's initial auto-exposure-priority value on exit. The point-cloud window
+switches explicitly between the complete unprocessed depth-to-color cloud and the
+canonical processed production cloud.
 
 Keyboard controls::
 
@@ -40,12 +42,12 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 
-from dexmani_real.config.camera_calib import CameraCalib
+from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.config.runtime import resolve_runtime_config
-from dexmani_real.sensor.camera_geometry import RGBDGeometry
+from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.sensor.pointcloud import build_point_cloud, build_raw_point_cloud
-from dexmani_real.sensor.realsense import RealSense, RealSenseConfig
+from dexmani_real.sensor.camera.realsense import RealSenseCamera, RealSenseCameraConfig
 
 _WINDOW_NAME = "RealSense Test | RGB(left) Depth(right)"
 
@@ -213,7 +215,7 @@ def _list_cameras() -> list[dict[str, str]]:
     """Enumerate connected RealSense cameras with retry."""
     for attempt in range(3):
         try:
-            cameras = RealSense.list_cameras()
+            cameras = RealSenseCamera.list_cameras()
         except RuntimeError as e:
             if attempt < 2:
                 print(f"  Enumeration failed ({e}), retry {attempt + 2}/3...")
@@ -241,13 +243,13 @@ def _test_lifecycle(test_cfg: RealSenseDiagnosticConfig) -> bool:
     """Connect, verify intrinsics, disconnect (idempotent checks included)."""
     print("\n-- 1. connect/disconnect lifecycle --")
 
-    config = RealSenseConfig(
+    config = RealSenseCameraConfig(
         depth_resolution=test_cfg.depth_resolution,
         color_resolution=test_cfg.color_resolution,
         fps=test_cfg.fps,
         warmup_frames=test_cfg.warmup_frames,
     )
-    camera = RealSense(config)
+    camera = RealSenseCamera(config)
 
     # Connect with retry (L515 USB state can be flaky).
     ok = False
@@ -358,7 +360,7 @@ def _handle_keyboard(
     key: int,
     state: PointCloudDisplayState,
     viewer: NonBlockingPCDViewer,
-    camera: RealSense,
+    camera: RealSenseCamera,
     production: PointCloudConfig,
 ) -> bool:
     """Process keyboard input.  Returns False if quit requested."""
@@ -422,7 +424,7 @@ def _toggle_cmap(state: PointCloudDisplayState) -> None:
 
 
 def _compute_base_from_color(
-    serial: str | None, calibration: CameraCalib
+    serial: str | None, calibration: CameraExtrinsics
 ) -> np.ndarray:
     """Return T_xarm_base_from_color for aligned depth-to-color clouds."""
     if not serial:
@@ -432,7 +434,7 @@ def _compute_base_from_color(
     return base_from_color
 
 
-def _find_color_sensor(camera: RealSense) -> Any:
+def _find_color_sensor(camera: RealSenseCamera) -> Any:
     """Return the color sensor from the live pipeline profile."""
     if camera.profile is None:
         raise RuntimeError("camera pipeline profile is unavailable")
@@ -447,7 +449,7 @@ def _find_color_sensor(camera: RealSense) -> Any:
     raise RuntimeError("no color sensor with a color stream profile found")
 
 
-def _get_ae_priority(camera: RealSense) -> float | None:
+def _get_ae_priority(camera: RealSenseCamera) -> float | None:
     """Read auto_exposure_priority (0=OFF, 1=ON); None if unsupported."""
     try:
         sensor = _find_color_sensor(camera)
@@ -459,7 +461,7 @@ def _get_ae_priority(camera: RealSense) -> float | None:
     return None
 
 
-def _set_ae_priority(camera: RealSense, value: float) -> float | None:
+def _set_ae_priority(camera: RealSenseCamera, value: float) -> float | None:
     """Set auto_exposure_priority and return the readback; None if unsupported."""
     sensor = _find_color_sensor(camera)
     option = rs.option.auto_exposure_priority
@@ -469,7 +471,7 @@ def _set_ae_priority(camera: RealSense, value: float) -> float | None:
     return float(sensor.get_option(option))
 
 
-def _toggle_ae_priority(camera: RealSense) -> None:
+def _toggle_ae_priority(camera: RealSenseCamera) -> None:
     """Toggle auto_exposure_priority; OFF keeps the color stream near 30 Hz."""
     current = _get_ae_priority(camera)
     if current is None:
@@ -485,12 +487,12 @@ def _toggle_ae_priority(camera: RealSense) -> None:
 
 
 def _run_rgbd_test(
-    camera: RealSense,
+    camera: RealSenseCamera,
     test_cfg: RealSenseDiagnosticConfig,
     *,
     production: PointCloudConfig,
     table_plane_abcd: tuple[float, float, float, float] | None,
-    calibration: CameraCalib,
+    calibration: CameraExtrinsics,
 ) -> dict:
     """Run interactive RGB-D live capture + point cloud visualization."""
     print("\n-- 2. RGB-D live capture + point cloud --")
@@ -670,11 +672,11 @@ def main() -> int:
     test_cfg = RealSenseDiagnosticConfig()
 
     # Validate policy and calibration files before enumerating or opening a camera.
-    runtime = resolve_runtime_config()
+    runtime = resolve_experiment_config()
     production = runtime.pointcloud
     table = runtime.environment.table
     table_plane_abcd = table.plane_abcd if table.enabled else None
-    calibration = CameraCalib()
+    calibration = CameraExtrinsics()
 
     print("=" * 60)
     print("RealSense Test -- RGB-D Live Capture + Real-time Point Cloud")
@@ -697,13 +699,13 @@ def main() -> int:
         print("Lifecycle test failed, exiting.")
         return 1
 
-    config = RealSenseConfig(
+    config = RealSenseCameraConfig(
         depth_resolution=test_cfg.depth_resolution,
         color_resolution=test_cfg.color_resolution,
         fps=test_cfg.fps,
         warmup_frames=test_cfg.warmup_frames,
     )
-    camera = RealSense(config)
+    camera = RealSenseCamera(config)
     connect_ok = False
     for attempt in range(3):
         connect_ok = camera.connect()

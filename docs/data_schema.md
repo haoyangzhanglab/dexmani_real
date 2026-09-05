@@ -2,9 +2,9 @@
 
 本文是 DexMani Real 持久化数据的字段参考，覆盖当前 raw HDF5 v24、processed HDF5 v12 与
 Policy Zarr v6。运行行为和精确校验仍以
-[`recording/schema.py`](../dexmani_real/recording/schema.py)、
-[`data/process.py`](../dexmani_real/data/process.py) 与
-[`data/export.py`](../dexmani_real/data/export.py) 为准。
+[`recording/storage/schema.py`](../dexmani_real/recording/storage/schema.py)、
+[`dataset/processing.py`](../dexmani_real/dataset/processing.py) 与
+[`dataset/export.py`](../dexmani_real/dataset/export.py) 为准。
 
 本文只描述 Real 域。Sim 数据独立生成、训练和部署，不能与 Real 数据按同一坐标系或
 标签语义混用。
@@ -150,12 +150,13 @@ raw 的明确缺失值语义，不应被下游压紧为相邻 source。
 | `depth.h5:/depth` | `(N,H_raw,W_raw)` uint16 | `librealsense_align_depth_to_color_z16`；像素在 color optical frame，与同 index RGB 像素对齐；`0` 为无效值。米值为 `depth * meta.depth_scale`。 |
 | `rgb.mp4` frame | `(H_raw,W_raw,3)` uint8 | 与控制网格逐帧对应的 RGB。codec、pixel format、宽高和 fps 在 `meta`。 |
 
-v24 writer 在关闭两个 sidecar 后才计算并写入 manifest。`EpisodeReader` 普通构造会检查 schema、
-`data.h5` layout/semantic 以及 depth shape/dtype，不默认重算大型 sidecar hash 或完整解码 RGB。
-需要验证发布后的 RGB/depth 是否被替换或同长度重排时，使用
-`EpisodeReader(path, verify_hash=True)` 或 `audit_integrity()`；显式审计会重算 manifest 中
-`depth.h5`、`rgb.mp4` 的整文件 SHA-256，并核对完整 RGB 帧数。manifest 不包含 `data.h5`
-hash，也不是签名或真实性证明。若需要证明整个 episode 未被协调修改，仍需由外部
+v24 writer 在关闭两个 sidecar 后才计算并写入 manifest。新 writer 产物因此包含
+`raw_manifest_version`、`depth_sha256` 和 `rgb_sha256` 等 manifest attrs；`EpisodeReader` 普通构造
+只检查当前 raw v24 的必需文件、schema、`data.h5` layout/semantic 以及 depth shape/dtype，不要求
+manifest attrs，也不默认重算大型 sidecar hash 或完整解码 RGB。需要验证发布后的 RGB/depth 是否被
+替换或同长度重排时，使用 `EpisodeReader(path, verify_hash=True)` 或 `audit_integrity()`；显式审计
+才会重算 manifest 中 `depth.h5`、`rgb.mp4` 的整文件 SHA-256，并核对完整 RGB 帧数。manifest 不
+包含 `data.h5` hash，也不是签名或真实性证明。若需要证明整个 episode 未被协调修改，仍需由外部
 attestation 或可信 artifact 流程建立信任。
 
 ### `data.h5:/meta` attrs
@@ -198,6 +199,10 @@ processed 文件是 `episodes_processed/<task>/*.h5`。它从 raw v24 选择、�
 校验原始 `data.h5` hash，再从 raw episode 读取精确已发送命令和完整模型 provenance。根 attrs
 必须满足：
 `schema_name=dexmani-real-processed-hdf5`、`schema_version=12`、`domain=real`。
+
+处理入口在 discovery 边界将每个 raw episode 路径解析为 canonical absolute path；新生成的
+processed artifact 将它持久化在 `source_decision_json.source_path`。processed replay 只消费该路径，
+要求其下的 raw `data.h5` 存在并硬校验 SHA-256；不推断或 fallback 到其他 source path。
 
 删除无效 raw 行可能使压紧数组包含多个 source 连续段。v12 不把缺口两侧伪装成相邻时间步：
 `source_segment_ends` 明确记录每段边界，质量窗口只在段内计数。Policy Zarr 不再把这些段

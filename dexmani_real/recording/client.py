@@ -24,8 +24,8 @@ from dexmani_real.ipc.schema import (
     RECORD_STOP_REASON_BYTES,
     RECORD_TASK_LABEL_BYTES,
 )
-from dexmani_real.recording.schema import normalize_diagnostics
-from dexmani_real.robot.types import RobotAction, RobotState
+from dexmani_real.recording.storage.schema import normalize_diagnostics
+from dexmani_real.recording.sample import EpisodeAction, EpisodeState
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -75,7 +75,7 @@ def bounded_control_text(value: str, *, capacity: int, field: str) -> bytes:
 def _write_sample_metadata(
     frame: np.ndarray,
     *,
-    action: RobotAction,
+    action: EpisodeAction,
     camera_frame: dict[str, Any] | None,
     signals: dict[str, Any] | None,
     arm_qpos_sent: np.ndarray | None,
@@ -345,8 +345,8 @@ class RecorderClient:
 
     def add_frame(
         self,
-        state: RobotState,
-        action: RobotAction,
+        state: EpisodeState,
+        action: EpisodeAction,
         vr_frame: dict[str, Any],
         camera_frame: dict[str, Any] | None = None,
         signals: dict[str, Any] | None = None,

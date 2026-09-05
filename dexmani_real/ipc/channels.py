@@ -501,7 +501,7 @@ def read_arm_state_dict(shared: "RuntimeChannels") -> "dict | None":
             state_valid.
     Callers must validate fields they depend on (e.g. ``np.all(np.isfinite(d["qpos"]))``).
     The EEF pose is not published; derive it from ``qpos`` via
-    ``planning.arm_fk.make_arm_fk()`` when needed.
+    ``planning.kinematics.arm_fk.make_arm_fk()`` when needed.
     """
     data = read_arm_state(shared)
     if data is None:

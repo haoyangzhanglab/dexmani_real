@@ -1,20 +1,18 @@
 """DexMani configuration helpers."""
 
-from __future__ import annotations
-
 from dexmani_real.config.defaults import (
     EnvironmentConfig,
     StaticCollisionBox,
     TableCollisionConfig,
 )
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
+from dexmani_real.config.experiment import ExperimentConfig, resolve_experiment_config
 
 __all__ = [
     "EnvironmentConfig",
     "PointCloudConfig",
-    "ResolvedRuntimeConfig",
+    "ExperimentConfig",
     "StaticCollisionBox",
     "TableCollisionConfig",
-    "resolve_runtime_config",
+    "resolve_experiment_config",
 ]

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Research-facing entry point for one DexMani Policy experiment.
 
-The command line owns experiment selection and operator intent. Policy owns
-checkpoint inspection and restore; Real owns validation and robot lifecycle.
-All imports that can reach Policy, Torch, or Real runtime code remain inside
-their command handlers so ``list`` stays a filesystem-only Policy operation.
+``list`` reads Policy selectors only; ``check`` restores a checkpoint and warms
+inference without starting robot workers. ``shadow`` starts the Real hardware
+lifecycle while disabling command publication; ``run`` can physically command
+xArm7/XHand. The command line owns experiment selection and operator intent.
+Policy owns checkpoint inspection and restore; Real owns validation and robot
+lifecycle. All imports that can reach Policy, Torch, or Real runtime code remain
+inside their command handlers so ``list`` stays a filesystem-only Policy operation.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ class _ArgumentParser(argparse.ArgumentParser):
 
     def error(self, message: str) -> NoReturn:
         self.exit(2, f"{self.prog}: error: [CLI] {message}\n")
+
 
 @dataclass(frozen=True)
 class _LifecycleInputs:
@@ -230,20 +234,20 @@ def _prepare_lifecycle_inputs(
     args: argparse.Namespace, info: Any, *, execute: bool
 ) -> _LifecycleInputs:
     """Resolve CLI-owned inputs before lifecycle compatibility validation."""
-    from dexmani_real.config.runtime import resolve_runtime_config
+    from dexmani_real.config.experiment import resolve_experiment_config
     from dexmani_real.deployment.config import (
         PolicyDeploymentConfig,
-        PolicyWorkerConfig,
+        InferenceWorkerConfig,
     )
 
     if not isinstance(execute, bool):
         raise TypeError("execute must be a boolean")
-    runtime = resolve_runtime_config(yaml_path=args.runtime_config)
+    runtime = resolve_experiment_config(yaml_path=args.runtime_config)
     deployment_config = PolicyDeploymentConfig(
         inference_mode=args.inference_mode,
         max_action_steps=args.max_action_steps,
     )
-    worker_config = PolicyWorkerConfig(
+    worker_config = InferenceWorkerConfig(
         experiment=info.selector,
         device=args.device,
         spec=info.spec,

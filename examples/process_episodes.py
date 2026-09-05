@@ -54,17 +54,19 @@ if str(_REPO_ROOT) not in sys.path:
 import yaml
 from tqdm import tqdm
 
-from dexmani_real.config.runtime import resolve_runtime_config
-from dexmani_real.data.contracts import (
+from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.dataset.contracts import (
     EpisodeAnnotation,
     OutputProfile,
     ProcessingConfig,
     QualityPolicy,
     TemporalQualityConfig,
 )
-from dexmani_real.data.process import (
+from dexmani_real.dataset.processed import (
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
+)
+from dexmani_real.dataset.processing import (
     discover_episode_dirs,
     load_annotations,
     process_episode_root,
@@ -579,7 +581,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     try:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         print(f"error: failed to resolve runtime config: {exc}", file=sys.stderr)
         return 2

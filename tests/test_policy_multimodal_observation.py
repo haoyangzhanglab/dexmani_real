@@ -9,25 +9,25 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from dexmani_real.config.runtime import resolve_runtime_config
-from dexmani_real.data.transforms import resize_rgb
+from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.dataset.transforms import resize_rgb
 from dexmani_real.deployment.config import (
     FingertipAssemblerConfig,
-    PolicyWorkerConfig,
+    InferenceWorkerConfig,
     validate_policy_runtime_compatibility,
 )
 from dexmani_real.deployment.lifecycle import (
     _compute_policy_observation_ring_capacities,
     build_policy_worker_specs,
 )
-from dexmani_real.deployment.observation import (
+from dexmani_real.deployment.inference.observation import (
     FrameWindow,
     ObservationBatch,
     PointCloudFrame,
     PolicyObservation,
     RgbFrame,
 )
-from dexmani_real.deployment.worker import (
+from dexmani_real.deployment.inference.observation import (
     _align_state_history_to_reference_ns,
     _rgb_frame_from_camera_record,
     _resize_rgb_history,
@@ -42,7 +42,7 @@ from dexmani_real.ipc.schema import (
     HAND_STATE_DTYPE,
     HAND_TACTILE_DTYPE,
 )
-from dexmani_real.planning.fingertip import compute_fingertip_points_xarm_base
+from dexmani_real.planning.kinematics.fingertip import compute_fingertip_points_xarm_base
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.episode_samples import _build_robot_state
 from dexmani_real.teleop.loop import _load_hand_kinematics
@@ -207,13 +207,13 @@ class MultimodalContractTest(unittest.TestCase):
     def test_real_compatibility_accepts_rgb_policy_shape_distinct_from_camera(
         self,
     ) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         spec = _policy_spec(("joint_state", "rgb"), runtime)
         spec.observation_fields[1].shape = (240, 320, 3)
         validate_policy_runtime_compatibility(spec, runtime)
 
     def test_real_compatibility_rejects_invalid_rgb_policy_shape(self) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         for shape, dtype in (
             ((0, 320, 3), "uint8"),
             ((240, 0, 3), "uint8"),
@@ -335,7 +335,7 @@ class MultimodalContractTest(unittest.TestCase):
         np.testing.assert_array_equal(proof.source_monotonic_ns, [100])
 
     def test_seven_supported_modality_matrices_and_workers(self) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         matrices = (
             ("joint_state",),
             ("joint_state", "point_cloud"),
@@ -353,7 +353,7 @@ class MultimodalContractTest(unittest.TestCase):
                     object(),
                     runtime,
                     spec,
-                    PolicyWorkerConfig(
+                    InferenceWorkerConfig(
                         experiment="fake/model", device="cpu", spec=spec
                     ),
                     execute=False,
@@ -366,7 +366,7 @@ class MultimodalContractTest(unittest.TestCase):
                 self.assertIn("hand", names)
 
     def test_field_projection_checks_shape_and_dtype(self) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         for attribute, value in (
             ("shape", (18,)),
             ("dtype", "float64"),
@@ -478,7 +478,7 @@ class MultimodalContractTest(unittest.TestCase):
         )
 
     def test_exact_multimodal_projection_and_fingertip_frame(self) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         modalities = (
             "joint_state",
             "point_cloud",
@@ -580,7 +580,7 @@ class MultimodalContractTest(unittest.TestCase):
             )
 
     def test_policy_observation_ring_capacities(self) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         large_windows_runtime = replace(
             runtime,
             policy=replace(
@@ -622,7 +622,7 @@ class MultimodalContractTest(unittest.TestCase):
                 )
 
     def test_pointcloud_request_requires_explicit_camera_request(self) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         with self.assertRaisesRegex(ValueError, "requires camera_requested"):
             RuntimeChannelsConfig.from_runtime(
                 runtime,

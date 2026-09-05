@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.robot_spec import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 
 def _readonly_array(

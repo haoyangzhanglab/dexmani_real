@@ -18,16 +18,16 @@ from dexmani_real.ipc.schema import (
     HAND_TACTILE_SUM_SHAPE,
     nan_array,
 )
-from dexmani_real.planning.arm_fk import make_arm_fk
-from dexmani_real.planning.fingertip import compute_fingertip_points_xarm_base
-from dexmani_real.planning.hand_fk import HandKinematics
-from dexmani_real.planning.poses import (
+from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
+from dexmani_real.planning.kinematics.fingertip import compute_fingertip_points_xarm_base
+from dexmani_real.planning.kinematics.hand_fk import HandKinematics
+from dexmani_real.planning.kinematics.pose import (
     normalize_quat_wxyz,
     quat_wxyz_to_rot6d,
     rot6d_to_quat_wxyz,
 )
 from dexmani_real.recording.client import RecorderClient
-from dexmani_real.robot.types import RobotAction, RobotState
+from dexmani_real.recording.sample import EpisodeAction, EpisodeState
 
 FRAME_OK = 0
 _FRAME_HELD = 1
@@ -271,7 +271,7 @@ def record_held(
             "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
             "landmarks": np.full((21, 3), np.nan),
         }
-    action = RobotAction(
+    action = EpisodeAction(
         arm_qpos_cmd=hold_arm,
         hand_qpos_cmd=hold_hand,
         target_eef_pos=target_eef_pos.copy() if target_eef_pos is not None else None,
@@ -372,7 +372,7 @@ def record_frame(
     """
     if recorder is None:
         return
-    action = RobotAction(
+    action = EpisodeAction(
         arm_qpos_cmd=arm_cmd,
         hand_qpos_cmd=hand_cmd,
         target_eef_pos=target_pos.copy(),
@@ -481,15 +481,15 @@ def _build_robot_state(
     T_eef_handbase_pos: np.ndarray | None = None,
     T_eef_handbase_quat_wxyz: np.ndarray | None = None,
     timestamp_s: float | None = None,
-) -> RobotState:
-    """Build a RobotState from ring data for recording.
+) -> EpisodeState:
+    """Build an EpisodeState from ring data for recording.
 
     Reads arm_state_ring + hand_state_ring + hand_tactile_ring and assembles
-    a complete RobotState.  Computes arm-base-frame fingertip positions via the
+    a complete EpisodeState.  Computes arm-base-frame fingertip positions via the
     hand FK chain.  The standard runtime defines robot world == arm base, so this
     preserves the supported episode numeric convention without an extra transform.
 
-    Hand hardware/error flags are forwarded to RobotState for recording.
+    Hand hardware/error flags are forwarded to EpisodeState for recording.
     ``qpos_stale`` is set when the most recent single-frame read failed and the
     published qpos is the last-known (held) value; feedback *age* (staleness) is
     tracked separately via the source timestamp and read/state validity.
@@ -576,7 +576,7 @@ def _build_robot_state(
             eef_rot6d_xarm_base=eef_rot6d,
         )
 
-    return RobotState(
+    return EpisodeState(
         arm_qpos=arm_qpos,
         arm_qvel=arm_qvel,
         arm_tau=arm_tau,

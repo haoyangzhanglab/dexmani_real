@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from dexmani_real.robot_spec import HAND_JOINT_SHAPE
+from dexmani_real.robot.model import HAND_JOINT_SHAPE
 
 # Learned policy checkpoints run their forward/normalizer arithmetic in
 # float32, while the command path intentionally stores float64.  This narrow

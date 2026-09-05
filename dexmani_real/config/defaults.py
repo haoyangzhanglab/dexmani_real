@@ -13,7 +13,7 @@ from types import MappingProxyType
 import numpy as np
 
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.robot_spec import ARM_JOINT_SHAPE
+from dexmani_real.robot.model import ARM_JOINT_SHAPE
 from dexmani_real.utils.limits import validate_hand_limit_nesting
 
 _HEARTBEAT_SUBSYSTEMS = frozenset(

@@ -30,7 +30,7 @@ from dexmani_real.config.defaults import ArmParams
 from dexmani_real.ipc.channels import new_frame
 from dexmani_real.ipc.schema import ARM_STATE_DTYPE
 from dexmani_real.robot.command_validation import check_worker_arm_target
-from dexmani_real.robot.xarm7 import HomeAborted, XArm7, describe_controller_error
+from dexmani_real.robot.drivers.xarm7 import HomeAborted, XArm7, describe_controller_error
 from dexmani_real.runtime.safety import (
     CoupledCommandTicket,
     SafetyState,

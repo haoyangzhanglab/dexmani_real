@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.runtime import ResolvedRuntimeConfig
+from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.control.action import ActionCandidate
 from dexmani_real.control.publication import (
     PUBLISH_REASON_ESTOP,
@@ -33,7 +33,7 @@ from dexmani_real.control.publication import (
 )
 from dexmani_real.control.safety_gate import SafetyGate
 from dexmani_real.deployment.config import PolicyDeploymentConfig
-from dexmani_real.deployment.contracts import Prediction
+from dexmani_real.deployment.prediction import Prediction
 from dexmani_real.deployment.metrics import PolicyStats, flush_every
 from dexmani_real.deployment.timing import first_future_step_index
 from dexmani_real.ipc.channels import (
@@ -47,19 +47,19 @@ from dexmani_real.ipc.schema import (
     PREDICTION_DTYPE,
 )
 from dexmani_real.planning import (
+    OnlineIKConfig,
     Pose,
-    TeleopProfile,
     XArm7MotionPlanner,
     XArm7PlannerConfig,
 )
-from dexmani_real.planning.arm_fk import make_arm_fk
+from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.paths import (
     WORKSPACE_BOUNDS_TOLERANCE_M,
     interpolate_waypoints,
     wrap_nearest_equivalent,
 )
-from dexmani_real.planning.poses import rot6d_to_quat_wxyz
-from dexmani_real.robot_spec import (
+from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
+from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
@@ -254,7 +254,7 @@ def _advance_control_grid_ns(due_ns: int, terminal_ns: int, step_dt_ns: int) -> 
     return due_ns + step_dt_ns
 
 
-def _build_policy_planner(runtime: ResolvedRuntimeConfig) -> XArm7MotionPlanner:
+def _build_policy_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
     """Build kinematics-only policy IK; realtime collision checks stay disabled."""
     return XArm7MotionPlanner(
         XArm7PlannerConfig(
@@ -265,7 +265,7 @@ def _build_policy_planner(runtime: ResolvedRuntimeConfig) -> XArm7MotionPlanner:
                 runtime.policy.workspace.as_tuple(), dtype=np.float64
             ),
         ),
-        teleop_profile=TeleopProfile(
+        teleop_profile=OnlineIKConfig(
             max_pose_error_pos_m=float(runtime.policy.ik_max_pose_error_pos_m),
             max_pose_error_rot_rad=float(runtime.policy.ik_max_pose_error_rot_rad),
             check_self_collision=False,
@@ -275,7 +275,7 @@ def _build_policy_planner(runtime: ResolvedRuntimeConfig) -> XArm7MotionPlanner:
 
 
 def _build_policy_workspace_check(
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
 ) -> Callable[[np.ndarray, np.ndarray], bool]:
     """Return the reject-only interpolated joint-policy workspace predicate."""
     bounds = np.asarray(runtime.policy.workspace.as_tuple(), dtype=np.float64)
@@ -302,7 +302,7 @@ def _build_policy_workspace_check(
     return is_workspace_segment_safe
 
 
-def _build_policy_safety_gate(runtime: ResolvedRuntimeConfig) -> SafetyGate:
+def _build_policy_safety_gate(runtime: ExperimentConfig) -> SafetyGate:
     return SafetyGate(
         arm_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
         arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
@@ -355,7 +355,7 @@ def decode_policy_action(
 def _clip_policy_arm_action(
     target_arm_qpos: np.ndarray,
     reference_arm_qpos: np.ndarray,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
 ) -> tuple[np.ndarray | None, bool, str]:
     """Canonicalize, admit, then clip one learned-policy arm endpoint."""
     lower = np.asarray(runtime.arm.joint_limit_lower, dtype=np.float64)
@@ -385,7 +385,7 @@ def _clip_policy_arm_action(
 
 def _read_command_progress(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     *,
     now_ns: int,
 ) -> tuple[int | None, int | None, int | None, str | None]:
@@ -431,7 +431,7 @@ def _read_command_progress(
 
 def _physical_start_pose_rejection(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     *,
     execute: bool,
 ) -> str | None:
@@ -502,7 +502,7 @@ class PolicyExecutor:
     def __init__(
         self,
         shared: RuntimeChannels,
-        runtime: ResolvedRuntimeConfig,
+        runtime: ExperimentConfig,
         policy_spec: Any,
         deployment: PolicyDeploymentConfig,
         *,
@@ -1091,7 +1091,7 @@ class PolicyExecutor:
 
 def policy_executor_loop(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     policy_spec: Any,
     deployment: PolicyDeploymentConfig,
     execute: bool,

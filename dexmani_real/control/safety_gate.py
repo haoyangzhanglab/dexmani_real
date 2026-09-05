@@ -11,7 +11,7 @@ import numpy as np
 
 from dexmani_real.config.defaults import policy as policy_defaults
 from dexmani_real.control.action import ActionCandidate
-from dexmani_real.robot_spec import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)

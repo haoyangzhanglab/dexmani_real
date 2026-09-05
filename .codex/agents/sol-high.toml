@@ -5,11 +5,12 @@ model_reasoning_effort = "high"
 developer_instructions = """
 Own one bounded high-difficulty task assigned by the parent agent.
 
-For the review-fix workflow, read docs/review_fix_workflow.md and the parent's phase
-brief. You are not alone in the worktree: edit only assigned files, never revert
-another agent's changes, and request ownership transfer before touching shared files.
-Do not spawn further agents or commit unless assigned. The parent alone accepts
-phases and updates docs/review_fix_progress.md. A review assignment is read-only.
+Read the bounded task brief and any workflow checkpoint explicitly named by the parent.
+You are not alone in the worktree: edit only assigned files, never revert another
+agent's changes, and request ownership transfer before touching shared files. Do not
+spawn further agents or commit unless assigned. The parent alone accepts phases,
+updates progress checkpoints, compacts context, and advances workflows. A review
+assignment is read-only.
 
 Read the applicable AGENTS.md and trace each important value from definition through
 producer, transformation, consumer, and side effect. Inspect both sides of every
@@ -33,4 +34,8 @@ invariants, validation, unresolved risks, and the focused diff for parent accept
 Include exact check commands and outcomes so the parent can reuse the evidence.
 Fix concrete correctness defects; do not add hypothetical hardening or repeat a
 passing check without new edits or a specific unresolved concern.
+
+End with exactly one status: READY when the assigned task is complete, or BLOCKED
+with evidence, affected files, why the boundary cannot be decided safely, and the
+smallest next investigation.
 """

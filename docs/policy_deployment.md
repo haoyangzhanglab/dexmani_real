@@ -104,7 +104,7 @@ CLI override > YAML file > dexmani_real/config/defaults.py
 ```
 
 input freshness、observation skew、source-to-command freshness、command-progress timeout、action validity 和
-watchdog 属于 `ResolvedRuntimeConfig.policy`。模型 action/observation shape、history、horizon 和
+watchdog 属于 `ExperimentConfig.policy`。模型 action/observation shape、history、horizon 和
 `control_dt_s` 只来自 Policy `PolicySpec`；lifecycle 启动前必须与 Real 配置精确兼容。
 
 `PolicyExecutor` 独占调度。默认 `sync`：它在 episode 开始和当前 Prediction 完成或因 source stale
@@ -176,6 +176,7 @@ fail closed 处理。
 截至 2026-09-05，集中真机回归已完成：CUDA `check`、连接设备的 `shadow`（无执行器发布）、
 低风险 `run` 的 H→B→S、同进程重复 H→B→S、RUNNING 中 S，以及 RUNNING 中 ESC/e-stop。各次
 结束后 arm/hand worker 均已干净退出，没有遗留 actuator command。
+本次 namespace/integration cleanup 未重跑硬件；当前离线 gate 不能替代上述真机回归。
 
 尚未覆盖的边界包括：人为注入超过 policy hand jump 阈值的模型动作、SDK CRC/拒绝、持续 sensor
 失效、接触导致的 measured-feedback lag，以及真实相机/point-cloud 的端到端时延测量。这些需要在

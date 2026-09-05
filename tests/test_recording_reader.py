@@ -13,9 +13,9 @@ import numpy as np
 
 from dexmani_real.ipc.schema import make_record_sample_dtype
 from dexmani_real.recording.client import RecorderClient
-from dexmani_real.recording.reader import EpisodeReader, ValidityState
-from dexmani_real.recording.schema import EPISODE_SCHEMA_VERSION
-from dexmani_real.robot.types import RobotAction, RobotState
+from dexmani_real.recording.storage.reader import EpisodeReader, ValidityState
+from dexmani_real.recording.storage.schema import EPISODE_SCHEMA_VERSION
+from dexmani_real.recording.sample import EpisodeAction, EpisodeState
 
 
 class EpisodeReaderIntegrityTest(unittest.TestCase):
@@ -47,17 +47,17 @@ class EpisodeReaderIntegrityTest(unittest.TestCase):
             decoder = MagicMock()
             with (
                 patch(
-                    "dexmani_real.recording.reader.VideoDecoder", return_value=decoder
+                    "dexmani_real.recording.storage.reader.VideoDecoder", return_value=decoder
                 ),
                 patch(
-                    "dexmani_real.recording.reader.validate_data_layout",
+                    "dexmani_real.recording.storage.reader.validate_data_layout",
                     return_value=(),
                 ),
                 patch(
-                    "dexmani_real.recording.reader.validate_raw_semantics",
+                    "dexmani_real.recording.storage.reader.validate_raw_semantics",
                     return_value=(),
                 ),
-                patch("dexmani_real.recording.reader.sha256_file") as hash_file,
+                patch("dexmani_real.recording.storage.reader.sha256_file") as hash_file,
             ):
                 with EpisodeReader(
                     self._write_minimal_episode(Path(directory))
@@ -72,22 +72,22 @@ class EpisodeReaderIntegrityTest(unittest.TestCase):
             decoder.count_decoded_frames.return_value = 1
             with (
                 patch(
-                    "dexmani_real.recording.reader.VideoDecoder", return_value=decoder
+                    "dexmani_real.recording.storage.reader.VideoDecoder", return_value=decoder
                 ),
                 patch(
-                    "dexmani_real.recording.reader.validate_data_layout",
+                    "dexmani_real.recording.storage.reader.validate_data_layout",
                     return_value=(),
                 ),
                 patch(
-                    "dexmani_real.recording.reader.validate_raw_semantics",
+                    "dexmani_real.recording.storage.reader.validate_raw_semantics",
                     return_value=(),
                 ),
                 patch(
-                    "dexmani_real.recording.reader.validate_raw_member_hashes",
+                    "dexmani_real.recording.storage.reader.validate_raw_member_hashes",
                     return_value=(),
                 ),
                 patch(
-                    "dexmani_real.recording.reader.sha256_file",
+                    "dexmani_real.recording.storage.reader.sha256_file",
                     return_value="b" * 64,
                 ) as hash_file,
             ):
@@ -101,13 +101,13 @@ class EpisodeReaderIntegrityTest(unittest.TestCase):
     def test_default_read_rejects_raw_semantic_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with (
-                patch("dexmani_real.recording.reader.VideoDecoder"),
+                patch("dexmani_real.recording.storage.reader.VideoDecoder"),
                 patch(
-                    "dexmani_real.recording.reader.validate_data_layout",
+                    "dexmani_real.recording.storage.reader.validate_data_layout",
                     return_value=(),
                 ),
                 patch(
-                    "dexmani_real.recording.reader.validate_raw_semantics",
+                    "dexmani_real.recording.storage.reader.validate_raw_semantics",
                     return_value=("invalid source timestamps",),
                 ),
             ):
@@ -134,7 +134,7 @@ class EpisodeReaderIntegrityTest(unittest.TestCase):
             def run_generation(self):
                 raise AssertionError("RecorderClient must not reread global generation")
 
-        state = RobotState(
+        state = EpisodeState(
             arm_qpos=np.zeros(7),
             arm_qvel=np.zeros(7),
             arm_tau=np.zeros(7),
@@ -154,7 +154,7 @@ class EpisodeReaderIntegrityTest(unittest.TestCase):
             hand_connected=True,
             timestamp=1.0,
         )
-        action = RobotAction(np.zeros(7), np.zeros(12))
+        action = EpisodeAction(np.zeros(7), np.zeros(12))
         client = RecorderClient(Shared())
         client._recording = True
         client._generation = 1

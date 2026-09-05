@@ -15,15 +15,15 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.config.camera_calib import CameraCalib
+from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.ipc.schema import (
     SUPPORTED_POINT_CLOUD_COUNTS,
     make_pointcloud_frame_dtype,
     validate_point_cloud_array,
 )
-from dexmani_real.sensor.camera_geometry import RGBDGeometry
-from dexmani_real.sensor.camera_worker import CameraHealth
+from dexmani_real.sensor.camera.geometry import RGBDGeometry
+from dexmani_real.sensor.camera.worker import CameraHealth
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
@@ -34,7 +34,7 @@ from dexmani_real.sensor.pointcloud import (
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
-    from dexmani_real.config.runtime import ResolvedRuntimeConfig
+    from dexmani_real.config.experiment import ExperimentConfig
     from dexmani_real.ipc.channels import RuntimeChannels
 
 logger = get_logger(__name__)
@@ -64,16 +64,16 @@ class PointCloudLoopConfig:
     """Resolved processing and freshness policy for the realtime worker."""
 
     pointcloud: PointCloudConfig
-    camera_calibration: CameraCalib
+    camera_calibration: CameraExtrinsics
     table_plane_abcd: tuple[float, float, float, float] | None = None
     max_input_age_s: float = 0.25
 
     def __post_init__(self) -> None:
         if not isinstance(self.pointcloud, PointCloudConfig):
             raise TypeError("pointcloud must be a PointCloudConfig")
-        if not isinstance(self.camera_calibration, CameraCalib):
+        if not isinstance(self.camera_calibration, CameraExtrinsics):
             raise TypeError(
-                "camera_calibration must be a preloaded CameraCalib snapshot"
+                "camera_calibration must be a preloaded CameraExtrinsics snapshot"
             )
         if self.pointcloud.num_points not in SUPPORTED_POINT_CLOUD_COUNTS:
             raise ValueError(
@@ -94,14 +94,14 @@ class PointCloudLoopConfig:
     @classmethod
     def from_runtime(
         cls,
-        runtime: "ResolvedRuntimeConfig",
+        runtime: "ExperimentConfig",
         *,
         num_points: int,
     ) -> "PointCloudLoopConfig":
         table = runtime.environment.table
         return cls(
             pointcloud=replace(runtime.pointcloud, num_points=num_points),
-            camera_calibration=CameraCalib(),
+            camera_calibration=CameraExtrinsics(),
             table_plane_abcd=table.plane_abcd if table.enabled else None,
             max_input_age_s=float(runtime.camera.max_frame_age_s),
         )
@@ -115,7 +115,7 @@ def _shared_text(value: object) -> str:
 
 
 def _resolve_base_from_color(
-    shared: "RuntimeChannels", calibration: CameraCalib
+    shared: "RuntimeChannels", calibration: CameraExtrinsics
 ) -> np.ndarray:
     serial = _shared_text(shared.camera_serial).strip()
     if not serial:
@@ -137,7 +137,7 @@ def _resolve_base_from_color(
 
 def _load_static_inputs(
     shared: "RuntimeChannels",
-    calibration: CameraCalib,
+    calibration: CameraExtrinsics,
 ) -> tuple[RGBDGeometry, float, np.ndarray] | None:
     """Wait for camera-owned geometry and resolve the verified static transform."""
     while shared.is_running.value:

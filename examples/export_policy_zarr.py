@@ -8,7 +8,7 @@ the derived ``datasets/<task>.zarr`` output. The positional input
 task name. ``--dry-run`` performs the same input-contract and finite-payload
 checks without creating an output store. Progress bars and errors go to stderr;
 stdout stays empty. Argument parsing and terminal presentation live here; the
-export transaction itself stays in ``dexmani_real.data.export``.
+export transaction itself stays in ``dexmani_real.dataset.export``.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tqdm import tqdm
 
-from dexmani_real.data.export import (
+from dexmani_real.dataset.export import (
     PolicyZarrExportConfig,
     export_processed_hdf5_to_zarr,
     preflight_processed_hdf5_to_zarr,

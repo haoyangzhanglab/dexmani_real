@@ -18,17 +18,17 @@ import threading
 
 import numpy as np
 
-from dexmani_real.config.runtime import ResolvedRuntimeConfig
-from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
-from dexmani_real.control.hand_home import publish_hand_home_and_wait_accepted
+from dexmani_real.config.experiment import ExperimentConfig
+from dexmani_real.control.arm_homing import ArmHomeConfig, execute_arm_home
+from dexmani_real.control.hand_homing import publish_hand_home_and_wait_accepted
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import (
+    OnlineIKConfig,
     Pose,
-    TeleopProfile,
     XArm7MotionPlanner,
     XArm7PlannerConfig,
 )
-from dexmani_real.robot_spec import (
+from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
@@ -38,7 +38,7 @@ from dexmani_real.runtime.safety import (
     request_policy_start,
     request_policy_stop,
 )
-from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
+from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -58,7 +58,7 @@ def _request_immediate_quit(shared: RuntimeChannels) -> None:
     shared.quit_requested.value = True
 
 
-def build_home_planner(runtime: ResolvedRuntimeConfig) -> XArm7MotionPlanner:
+def build_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
     """Construct the collision-checked home planner (mirrors replay setup).
 
     The executor's own planner only carries workspace bounds; a safe
@@ -81,7 +81,7 @@ def build_home_planner(runtime: ResolvedRuntimeConfig) -> XArm7MotionPlanner:
             base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
             workspace_bounds=workspace,
         ),
-        teleop_profile=TeleopProfile(
+        teleop_profile=OnlineIKConfig(
             max_pose_error_pos_m=float(policy.ik_max_pose_error_pos_m),
             max_pose_error_rot_rad=float(policy.ik_max_pose_error_rot_rad),
         ),
@@ -93,7 +93,7 @@ def build_home_planner(runtime: ResolvedRuntimeConfig) -> XArm7MotionPlanner:
 
 def _home(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
     *,
     abort_requested,
@@ -145,7 +145,7 @@ def _home(
 
 def run_operator_control(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     planner: XArm7MotionPlanner | None,
     *,
     stop_event: threading.Event,
@@ -162,7 +162,7 @@ def run_operator_control(
         raise TypeError("execute must be a boolean")
     if execute != (planner is not None):
         raise ValueError("execute must match physical home availability")
-    keyboard = KeyboardHandler(
+    keyboard = KeyboardInput(
         estop_callback=lambda: setattr(shared.estop_request, "value", True),
         stop_callback=lambda: _request_immediate_stop(shared),
         quit_callback=lambda: _request_immediate_quit(shared),
@@ -187,9 +187,9 @@ def run_operator_control(
             # drained batch must not survive a successful home sequence.
             discard_begin_in_batch = False
             signals = keyboard.poll(timeout=_POLL_S)
-            stop_in_batch = ControlSignal.STOP in signals
+            stop_in_batch = OperatorCommand.STOP in signals
             for signal in signals:
-                if signal is ControlSignal.BEGIN:
+                if signal is OperatorCommand.BEGIN:
                     if discard_begin_in_batch or not request_policy_start(
                         shared,
                         require_physical_home=planner is not None,
@@ -199,9 +199,9 @@ def run_operator_control(
                             "sequence is followed by a fresh B"
                         )
                         continue
-                elif signal is ControlSignal.STOP:
+                elif signal is OperatorCommand.STOP:
                     _request_immediate_stop(shared)
-                elif signal is ControlSignal.HOME:
+                elif signal is OperatorCommand.HOME:
                     if planner is None:
                         logger.warning("operator: H is disabled in policy deployment")
                         continue
@@ -262,14 +262,14 @@ def run_operator_control(
                     # HOME blocks while hand/arm homing completes. Drop stale
                     # H and B events, but preserve S/Q/ESC so an operator can
                     # still stop, quit, or e-stop immediately afterwards.
-                    keyboard.drain_signal(ControlSignal.HOME)
-                    keyboard.drain_signal(ControlSignal.BEGIN)
+                    keyboard.drain_signal(OperatorCommand.HOME)
+                    keyboard.drain_signal(OperatorCommand.BEGIN)
                     discard_begin_in_batch = True
-                elif signal is ControlSignal.QUIT:
+                elif signal is OperatorCommand.QUIT:
                     if not shared.quit_requested.value:
                         _request_immediate_quit(shared)
                     return
-                elif signal is ControlSignal.EMERGENCY_STOP:
+                elif signal is OperatorCommand.EMERGENCY_STOP:
                     shared.estop_request.value = True
                     return
     finally:

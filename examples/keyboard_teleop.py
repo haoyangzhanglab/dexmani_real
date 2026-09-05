@@ -16,7 +16,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import yaml
 
-from dexmani_real.config.runtime import resolve_runtime_config
+from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.teleop.keyboard_session import run_keyboard_experiment
 
 
@@ -32,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        runtime = resolve_runtime_config(
+        runtime = resolve_experiment_config(
             yaml_path=args.config,
             cli_overrides={"policy.hand_enabled": False if args.no_hand else None},
         )

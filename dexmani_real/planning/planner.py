@@ -5,35 +5,29 @@ from __future__ import annotations
 import os
 import warnings
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
 from dexmani_real.utils.log import ThrottledWarner, get_logger
+from dexmani_real.utils.serialization import from_dict_helper
 
 logger = get_logger(__name__)
 
 _warn_hand_qpos_unset_teleop = ThrottledWarner(interval_s=30.0)
 
-from dexmani_real.robot_spec import (
+from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
 
-from .arm_fk import XArm7Kinematics
-from .candidates import IKCandidateManager, is_mplib_success
 from .collision import CollisionModel
-from .ik import TeleopIKSolver
-from .paths import WORKSPACE_BOUNDS_TOLERANCE_M, interpolate_waypoints
-from .poses import compute_pose_error, ensure_qpos
-from .types import (
-    IKResult,
-    PathResult,
-    PlanningProfile,
-    Pose,
-    TeleopProfile,
-    XArm7PlannerConfig,
-)
+from .kinematics.arm_fk import XArm7Kinematics
+from .kinematics.ik import IKResult, OnlineIKConfig, OnlineIKSolver
+from .kinematics.ik_candidates import IKCandidateSearch, is_mplib_success
+from .kinematics.pose import Pose, compute_pose_error, ensure_qpos
+from .paths import PathResult, WORKSPACE_BOUNDS_TOLERANCE_M, interpolate_waypoints
 
 __all__ = [
     "XArm7MotionPlanner",
@@ -43,12 +37,57 @@ _PATH_SCORE_JOINT_LENGTH_WEIGHT = 1.0
 _PATH_SCORE_WAYPOINT_DELTA_WEIGHT = 2.0
 _PATH_SCORE_EEF_EFFICIENCY_WEIGHT = 3.0
 
+
+@dataclass(kw_only=True)
+class XArm7PlannerConfig:
+    urdf_path: str
+    srdf_path: str
+    eef_link_name: str = "custom_eef_link"
+    base_pose_world: Pose = field(default_factory=Pose.identity)
+    use_convex: bool = False
+    joint_vel_limits_deg: tuple[float, ...] = (180, 180, 180, 180, 180, 180, 180)
+    joint_acc_scale: float = 2.0
+    workspace_bounds: np.ndarray | None = None
+
+
+@dataclass(kw_only=True)
+class MotionPlanningConfig:
+    """Offline path planning configuration."""
+
+    path_dt: float = 1 / 15
+    planning_limits_deg: tuple[tuple[float, float], ...] | None = None
+    max_ik_delta_deg: tuple[float, ...] = (120, 135, 120, 120, 180, 150, 180)
+    max_waypoint_delta_deg: float = 15.0
+    max_pose_error_pos_m: float = 0.005
+    max_pose_error_rot_rad: float = 0.05
+    rrt_time_limit: float = 2.0
+    rrt_range_options: tuple[float, ...] = (0.05, 0.12)
+    num_rrt_attempts: int = 2
+    simplify_path: bool = True
+    screw_qpos_step: float = 0.02
+    ik_seed_offsets_deg: tuple[float, ...] = (15.0, 8.0, 15.0, 3.0, 15.0, 8.0, 15.0)
+    num_random_ik_seeds: int = 15
+    num_ik_candidates: int = 6
+    n_init_qpos: int = 3
+    random_seed: int | None = None
+    check_self_collision: bool = True
+    neutral_qpos: np.ndarray | None = None
+    ik_score_manipulability_weight: float = 1.0
+    ik_score_neutral_weight: float = 0.5
+    ik_score_joint_delta_weight: float = 1.0
+    ik_score_pose_error_weight: float = 0.2
+    ik_score_joint_limit_weight: float = 0.2
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "MotionPlanningConfig":
+        return cls(**from_dict_helper(cls, d))  # type: ignore[arg-type]
+
 class XArm7MotionPlanner:
     """Arm-only xArm7 motion planner with MPlib backend.
 
     Three internal subsystems:
       - ``kin`` (:class:`XArm7Kinematics`): FK / Jacobian / pose transforms.
-      - ``ik_mgr`` (:class:`IKCandidateManager`): IK candidate generation,
+      - ``ik_mgr`` (:class:`IKCandidateSearch`): IK candidate generation,
         filtering, scoring, canonicalization.
       - ``mp_planner`` (:class:`mplib.Planner`): raw MPlib plan_screw /
         plan_qpos calls.
@@ -63,8 +102,8 @@ class XArm7MotionPlanner:
     def __init__(
         self,
         config: XArm7PlannerConfig,
-        planning_profile: PlanningProfile | None = None,
-        teleop_profile: TeleopProfile | None = None,
+        planning_profile: MotionPlanningConfig | None = None,
+        teleop_profile: OnlineIKConfig | None = None,
         hand_dof: bool = True,
         static_boxes: Iterable[Any] = (),
         table: Any | None = None,
@@ -73,8 +112,8 @@ class XArm7MotionPlanner:
 
         self.mplib = mplib
         self.config = config
-        self.planning_profile = planning_profile or PlanningProfile()
-        self.teleop_profile = teleop_profile or TeleopProfile()
+        self.planning_profile = planning_profile or MotionPlanningConfig()
+        self.teleop_profile = teleop_profile or OnlineIKConfig()
         self.workspace_bounds = None
         if config.workspace_bounds is not None:
             bounds = np.asarray(config.workspace_bounds, dtype=np.float64)
@@ -150,10 +189,10 @@ class XArm7MotionPlanner:
             static_boxes=static_boxes,
             table=table,
         )
-        self.ik_mgr = IKCandidateManager(self.kin, collision_model=self.collision_model)
+        self.ik_mgr = IKCandidateSearch(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
-        self.teleop_solver = TeleopIKSolver(
+        self.teleop_solver = OnlineIKSolver(
             self.kin,
             self.ik_mgr,
             self.teleop_profile,
@@ -167,8 +206,8 @@ class XArm7MotionPlanner:
     @classmethod
     def create_default(
         cls,
-        planning_profile: PlanningProfile | None = None,
-        teleop_profile: TeleopProfile | None = None,
+        planning_profile: MotionPlanningConfig | None = None,
+        teleop_profile: OnlineIKConfig | None = None,
         static_boxes: Iterable[Any] = (),
         table: Any | None = None,
     ) -> "XArm7MotionPlanner":
@@ -189,8 +228,8 @@ class XArm7MotionPlanner:
         )
         return cls(
             cfg,
-            planning_profile=planning_profile or PlanningProfile(),
-            teleop_profile=teleop_profile or TeleopProfile(),
+            planning_profile=planning_profile or MotionPlanningConfig(),
+            teleop_profile=teleop_profile or OnlineIKConfig(),
             static_boxes=static_boxes,
             table=table,
         )
@@ -344,7 +383,7 @@ class XArm7MotionPlanner:
     # __getattr__ to self.kin / self.ik_mgr / self.mplib_planner.
 
     def try_screw_plan(
-        self, target_eef_pose_world: Pose, current_qpos: np.ndarray, profile: PlanningProfile
+        self, target_eef_pose_world: Pose, current_qpos: np.ndarray, profile: MotionPlanningConfig
     ) -> PathResult:
         result = self.mplib_planner.plan_screw(
             goal_pose=self.to_mplib_pose(target_eef_pose_world),
@@ -360,7 +399,7 @@ class XArm7MotionPlanner:
         target_eef_pose_world: Pose,
         current_qpos: np.ndarray,
         candidates: list[tuple[np.ndarray, dict[str, Any]]],
-        profile: PlanningProfile,
+        profile: MotionPlanningConfig,
     ) -> list[PathResult]:
         goal_qposes = [qpos for qpos, report in candidates]
         results: list[PathResult] = []
@@ -389,7 +428,7 @@ class XArm7MotionPlanner:
         target_eef_pose_world: Pose,
         current_qpos: np.ndarray,
         source: str,
-        profile: PlanningProfile,
+        profile: MotionPlanningConfig,
     ) -> PathResult:
         if not isinstance(result, dict):
             return PathResult(
@@ -419,7 +458,7 @@ class XArm7MotionPlanner:
 
     # Path validation — each returns None on pass, PathResult on failure.
 
-    def shortcut_smooth_path(self, path: np.ndarray, current_qpos: np.ndarray, profile: PlanningProfile) -> np.ndarray:
+    def shortcut_smooth_path(self, path: np.ndarray, current_qpos: np.ndarray, profile: MotionPlanningConfig) -> np.ndarray:
         limits = self.resolve_planning_limits(profile, current_qpos)
         path = np.asarray(path, dtype=np.float64).copy()
         if len(path) <= 2:
@@ -445,7 +484,7 @@ class XArm7MotionPlanner:
         prev: np.ndarray,
         nxt: np.ndarray,
         limits: np.ndarray,
-        profile: PlanningProfile,
+        profile: MotionPlanningConfig,
     ) -> bool:
         """Check if the direct prev→nxt shortcut segment is collision-free.
 
@@ -483,7 +522,7 @@ class XArm7MotionPlanner:
         target_eef_pose_world: Pose,
         current_qpos: np.ndarray,
         source: str,
-        profile: PlanningProfile,
+        profile: MotionPlanningConfig,
     ) -> PathResult:
         """Validate a planned path through a chain of independent checks.
 
@@ -661,7 +700,7 @@ class XArm7MotionPlanner:
         return None
 
     def compute_path_metrics(
-        self, path: np.ndarray, target_eef_pose_world: Pose, current_qpos: np.ndarray, profile: PlanningProfile
+        self, path: np.ndarray, target_eef_pose_world: Pose, current_qpos: np.ndarray, profile: MotionPlanningConfig
     ) -> dict[str, Any]:
         diff = np.diff(path, axis=0) if len(path) > 1 else np.zeros((0, self.dof), dtype=np.float64)
         max_step = float(np.max(np.abs(diff))) if len(diff) > 0 else 0.0

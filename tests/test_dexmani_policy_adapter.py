@@ -8,13 +8,13 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from dexmani_real.config.runtime import resolve_runtime_config
+from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.deployment.config import (
-    PolicyWorkerConfig,
+    InferenceWorkerConfig,
     validate_policy_runtime_compatibility,
 )
-from dexmani_real.deployment.observation import PolicyObservation
-from dexmani_real.integrations.dexmani_policy import DexManiPolicyRuntime
+from dexmani_real.deployment.inference.observation import PolicyObservation
+from dexmani_real.deployment.inference.dexmani_policy import DexManiPolicyAdapter
 from dexmani_real.ipc.schema import MAX_PREDICTION_STEPS
 
 
@@ -43,7 +43,7 @@ def _spec(**changes: object) -> SimpleNamespace:
 
 def _resolved_runtime(spec: SimpleNamespace | None = None):
     policy_spec = spec or _spec()
-    runtime = resolve_runtime_config()
+    runtime = resolve_experiment_config()
     validate_policy_runtime_compatibility(policy_spec, runtime)
     return runtime
 
@@ -111,7 +111,7 @@ class PolicyCompatibilityTest(unittest.TestCase):
 
     def test_command_progress_timeout_cannot_outlive_command_validity(self) -> None:
         with self.assertRaises(ValueError):
-            resolve_runtime_config(
+            resolve_experiment_config(
                 data={
                     "policy": {
                         "action_validity_s": 0.5,
@@ -120,7 +120,7 @@ class PolicyCompatibilityTest(unittest.TestCase):
                 }
             )
         with self.assertRaises(TypeError):
-            resolve_runtime_config(
+            resolve_experiment_config(
                 data={"policy": {"command_acknowledgement_timeout_s": 0.5}}
             )
 
@@ -128,7 +128,7 @@ class PolicyCompatibilityTest(unittest.TestCase):
         self,
     ) -> None:
         with self.assertRaises(TypeError):
-            resolve_runtime_config(data={"policy": {"unknown_timing_s": 1.0}})
+            resolve_experiment_config(data={"policy": {"unknown_timing_s": 1.0}})
         timing_fields = (
             "max_input_age_s",
             "max_observation_skew_s",
@@ -141,10 +141,10 @@ class PolicyCompatibilityTest(unittest.TestCase):
         )
         for name in timing_fields:
             with self.subTest(name=name), self.assertRaises(ValueError):
-                resolve_runtime_config(data={"policy": {name: 0.0}})
+                resolve_experiment_config(data={"policy": {name: 0.0}})
 
         spec = _spec()
-        config = PolicyWorkerConfig(
+        config = InferenceWorkerConfig(
             experiment="dp3/pick/example", device="cpu", spec=spec
         )
         restored = pickle.loads(pickle.dumps(config))
@@ -163,14 +163,14 @@ class PolicyAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(
             RuntimeError, "PolicySpec changed between inspect and load"
         ):
-            DexManiPolicyRuntime(loaded, inspected_spec)
+            DexManiPolicyAdapter(loaded, inspected_spec)
 
     def test_joint_action_remains_flat_and_observation_is_numpy(self) -> None:
         spec = _spec()
         _resolved_runtime(spec)
         output = np.arange(8 * 19, dtype=np.float64).reshape(8, 19)
         loaded = _FakeLoadedPolicy(spec, output)
-        adapter = DexManiPolicyRuntime(loaded, spec)
+        adapter = DexManiPolicyAdapter(loaded, spec)
 
         actions = adapter.predict(_observation(spec))
 
@@ -186,7 +186,7 @@ class PolicyAdapterTest(unittest.TestCase):
         output[:, 0] = 0.2
         output[:, 3] = 1.0
         output[:, 7] = 1.0
-        adapter = DexManiPolicyRuntime(_FakeLoadedPolicy(spec, output), spec)
+        adapter = DexManiPolicyAdapter(_FakeLoadedPolicy(spec, output), spec)
         actions = adapter.predict(_observation(spec))
         self.assertIs(actions, output)
         np.testing.assert_array_equal(actions, output)

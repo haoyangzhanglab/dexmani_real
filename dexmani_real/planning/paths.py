@@ -7,14 +7,14 @@ explicit so callers cannot confuse an empty path with a rejected motion.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from dexmani_real.config.defaults import arm as _arm_cfg
-from dexmani_real.robot_spec import ARM_JOINT_SHAPE
+from dexmani_real.robot.model import ARM_JOINT_SHAPE
 
 if TYPE_CHECKING:
     from dexmani_real.planning.planner import XArm7MotionPlanner
@@ -26,6 +26,15 @@ _PROXIMAL_MASK = np.array([True, True, True, True, False, False, False], dtype=b
 
 # Allow a small outward tolerance for nonlinear FK interpolation at workspace edges.
 WORKSPACE_BOUNDS_TOLERANCE_M = 1e-3
+
+
+@dataclass(kw_only=True)
+class PathResult:
+    success: bool
+    qpos_path: np.ndarray | None
+    reason: str = ""
+    source: str = ""
+    report: dict[str, Any] = field(default_factory=dict)
 
 
 class HomePathStatus(str, Enum):

@@ -16,7 +16,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from dexmani_real.config.defaults import hand as hand_defaults
-from dexmani_real.control import hand_home, publication
+from dexmani_real.control import hand_homing, publication
 from dexmani_real.control.action import ActionCandidate
 from dexmani_real.control.safety_gate import SafetyGate
 from dexmani_real.ipc.schema import (
@@ -66,7 +66,7 @@ def _initial_hand_state() -> SimpleNamespace:
 
 class HandWorkerStartupTest(unittest.TestCase):
     def test_xhand_driver_module_imports(self) -> None:
-        from dexmani_real.robot.xhand import XHand
+        from dexmani_real.robot.drivers.xhand import XHand
 
         self.assertTrue(callable(XHand))
 
@@ -87,7 +87,7 @@ class HandWorkerStartupTest(unittest.TestCase):
                 self.is_connected = True
                 self.tactile_calibrated = False
 
-        fake_xhand_module = types.ModuleType("dexmani_real.robot.xhand")
+        fake_xhand_module = types.ModuleType("dexmani_real.robot.drivers.xhand")
         fake_xhand_module.XHand = FakeXHand
         fake_xhand_module.XHandSendStatus = object
         config = SimpleNamespace(
@@ -152,7 +152,7 @@ class HandWorkerStartupTest(unittest.TestCase):
             def wait(self) -> None:
                 pass
 
-        fake_xhand_module = types.ModuleType("dexmani_real.robot.xhand")
+        fake_xhand_module = types.ModuleType("dexmani_real.robot.drivers.xhand")
         fake_xhand_module.XHand = FakeXHand
         fake_xhand_module.XHandSendStatus = object
         config = SimpleNamespace(
@@ -302,7 +302,7 @@ class HandWorkerRampingTest(unittest.TestCase):
                 self.sent.append(action.copy())
                 return self.send_statuses[len(self.sent) - 1]
 
-        fake_xhand_module = types.ModuleType("dexmani_real.robot.xhand")
+        fake_xhand_module = types.ModuleType("dexmani_real.robot.drivers.xhand")
         fake_xhand_module.XHand = FakeXHand
         fake_xhand_module.XHandSendStatus = SendStatus
         config = SimpleNamespace(
@@ -434,7 +434,7 @@ class HandWorkerRampingTest(unittest.TestCase):
                 if hand is not None and len(hand.sent) == 2:
                     shared.is_running.value = False
 
-        fake_xhand_module = types.ModuleType("dexmani_real.robot.xhand")
+        fake_xhand_module = types.ModuleType("dexmani_real.robot.drivers.xhand")
         fake_xhand_module.XHand = FakeXHand
         fake_xhand_module.XHandSendStatus = SendStatus
         config = SimpleNamespace(
@@ -511,7 +511,7 @@ class HandWorkerRampingTest(unittest.TestCase):
                 self.is_connected = True
                 self.tactile_calibrated = False
 
-        fake_xhand_module = types.ModuleType("dexmani_real.robot.xhand")
+        fake_xhand_module = types.ModuleType("dexmani_real.robot.drivers.xhand")
         fake_xhand_module.XHand = FakeXHand
         fake_xhand_module.XHandSendStatus = object
         config = SimpleNamespace(
@@ -942,29 +942,29 @@ class HandHomePublicationTest(unittest.TestCase):
         )
 
         with (
-            patch.object(hand_home, "motion_rejection_reason", return_value=""),
+            patch.object(hand_homing, "motion_rejection_reason", return_value=""),
             patch.object(
-                hand_home,
+                hand_homing,
                 "read_hand_feedback",
                 return_value=(feedback, "", None),
             ),
             patch.object(
-                hand_home,
+                hand_homing,
                 "build_action_candidate",
                 return_value=candidate,
             ),
             patch.object(
-                hand_home,
+                hand_homing,
                 "publish_command",
                 return_value=publication.PublishResult(True, ticket=ticket),
             ) as publish,
             patch.object(
-                hand_home,
+                hand_homing,
                 "wait_command_accepted",
                 return_value=publication.AcceptanceResult(True),
             ) as wait,
         ):
-            accepted = hand_home.publish_hand_home_and_wait_accepted(
+            accepted = hand_homing.publish_hand_home_and_wait_accepted(
                 object(),
                 target,
                 command_lower_rad=np.asarray(hand_defaults.qpos_min_rad),

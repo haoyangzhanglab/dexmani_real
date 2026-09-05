@@ -1,1 +1,1 @@
-"""Camera calibration solver, control state, and interactive session."""
+"""Camera calibration solver, motion state, and interactive session."""

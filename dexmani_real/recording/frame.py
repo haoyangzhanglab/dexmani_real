@@ -13,10 +13,10 @@ from types import MappingProxyType
 
 import numpy as np
 
-from dexmani_real.planning.poses import quat_wxyz_to_rot6d
-from dexmani_real.recording.schema import ARM_SENT_DATASET, normalize_diagnostics
-from dexmani_real.robot.types import RobotAction, RobotState
-from dexmani_real.robot_spec import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d
+from dexmani_real.recording.storage.schema import ARM_SENT_DATASET, normalize_diagnostics
+from dexmani_real.recording.sample import EpisodeAction, EpisodeState
+from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 EpisodeValue = np.ndarray | np.generic | float | int | bool
 
@@ -59,7 +59,7 @@ class EpisodeFrame:
             object.__setattr__(self, "camera_depth", camera_depth)
 
 
-def _action_eef(action: RobotAction) -> np.ndarray:
+def _action_eef(action: EpisodeAction) -> np.ndarray:
     position = (
         np.asarray(action.target_eef_pos, dtype=np.float64)
         if action.target_eef_pos is not None
@@ -88,8 +88,8 @@ def _scalar_float(value: object) -> float:
 
 
 def build_episode_frame(
-    state: RobotState,
-    action: RobotAction,
+    state: EpisodeState,
+    action: EpisodeAction,
     vr_frame: Mapping[str, object],
     *,
     camera_frame: Mapping[str, object] | None = None,
@@ -327,7 +327,7 @@ def decode_record_sample(
     record: np.void, *, arm_sent_stream: bool = True
 ) -> EpisodeFrame:
     """Copy one fixed shared-memory record into an owned episode frame."""
-    state = RobotState(
+    state = EpisodeState(
         arm_qpos=np.array(record["arm_qpos"], copy=True),
         arm_qvel=np.array(record["arm_qvel"], copy=True),
         arm_tau=np.array(record["arm_tau"], copy=True),
@@ -350,7 +350,7 @@ def decode_record_sample(
         arm_last_cmd_seq=int(record["arm_last_cmd_seq"]),
         arm_last_cmd_is_hold=bool(record["arm_last_cmd_is_hold"]),
     )
-    action = RobotAction(
+    action = EpisodeAction(
         arm_qpos_cmd=np.array(record["action_arm_qpos"], copy=True),
         hand_qpos_cmd=np.array(record["action_hand_qpos"], copy=True),
         target_eef_pos=np.array(record["action_target_eef_pos"], copy=True),

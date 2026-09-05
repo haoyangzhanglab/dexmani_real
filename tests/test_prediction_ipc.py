@@ -13,14 +13,14 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 import dexmani_real.ipc.channels as channels
-from dexmani_real.config.runtime import resolve_runtime_config
-from dexmani_real.deployment.config import PolicyDeploymentConfig, PolicyWorkerConfig
-from dexmani_real.deployment.contracts import Prediction
+from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.deployment.config import PolicyDeploymentConfig, InferenceWorkerConfig
+from dexmani_real.deployment.prediction import Prediction
 from dexmani_real.deployment.executor import (
     prediction_from_record,
     read_latest_prediction,
 )
-from dexmani_real.deployment.worker import (
+from dexmani_real.deployment.inference.worker import (
     _clear_sync_request_for_inactive_snapshot,
     _consume_sync_request,
     inference_loop,
@@ -791,7 +791,7 @@ class SyncInferenceLoopTest(unittest.TestCase):
         shared.inference_request.set()
         runtime = _FakePolicyRuntime()
         spec = _policy_spec()
-        worker_config = PolicyWorkerConfig("fake/model", "cpu", spec)
+        worker_config = InferenceWorkerConfig("fake/model", "cpu", spec)
 
         def observation(*_args: object, **kwargs: object) -> SimpleNamespace:
             anchor_ns = int(kwargs["anchor_ns"])
@@ -806,25 +806,25 @@ class SyncInferenceLoopTest(unittest.TestCase):
 
         with (
             patch(
-                "dexmani_real.deployment.worker._load_inference_runtime",
+                "dexmani_real.deployment.inference.worker._load_inference_runtime",
                 return_value=runtime,
             ),
             patch(
-                "dexmani_real.deployment.worker._build_observation",
+                "dexmani_real.deployment.inference.worker._build_observation",
                 side_effect=observation,
             ),
             patch(
-                "dexmani_real.deployment.worker.observation_timing_ms",
+                "dexmani_real.deployment.inference.worker.observation_timing_ms",
                 return_value=(0.0, 0.0),
             ),
             patch(
-                "dexmani_real.deployment.worker._to_policy_observation",
+                "dexmani_real.deployment.inference.worker._to_policy_observation",
                 return_value=object(),
             ),
         ):
             inference_loop(
                 shared,
-                resolve_runtime_config().policy,
+                resolve_experiment_config().policy,
                 worker_config,
                 PolicyDeploymentConfig(inference_mode="sync"),
             )
@@ -858,26 +858,26 @@ class SyncInferenceLoopTest(unittest.TestCase):
 
         with (
             patch(
-                "dexmani_real.deployment.worker._load_inference_runtime",
+                "dexmani_real.deployment.inference.worker._load_inference_runtime",
                 return_value=runtime,
             ),
             patch(
-                "dexmani_real.deployment.worker._build_observation",
+                "dexmani_real.deployment.inference.worker._build_observation",
                 side_effect=observation,
             ),
             patch(
-                "dexmani_real.deployment.worker.observation_timing_ms",
+                "dexmani_real.deployment.inference.worker.observation_timing_ms",
                 return_value=(0.0, 0.0),
             ),
             patch(
-                "dexmani_real.deployment.worker._to_policy_observation",
+                "dexmani_real.deployment.inference.worker._to_policy_observation",
                 return_value=object(),
             ),
         ):
             inference_loop(
                 shared,
-                resolve_runtime_config().policy,
-                PolicyWorkerConfig("fake/model", "cpu", spec),
+                resolve_experiment_config().policy,
+                InferenceWorkerConfig("fake/model", "cpu", spec),
                 PolicyDeploymentConfig(inference_mode="async"),
             )
 

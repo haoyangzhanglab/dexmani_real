@@ -17,7 +17,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import yaml
 
-from dexmani_real.config.runtime import resolve_runtime_config
+from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.teleop.session import (
     DEFAULT_TASK_NAME,
     run_teleop_experiment,
@@ -91,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        runtime = resolve_runtime_config(
+        runtime = resolve_experiment_config(
             yaml_path=args.config,
             cli_overrides={
                 "arm.max_joint_acceleration_deg_per_s2": args.acc,

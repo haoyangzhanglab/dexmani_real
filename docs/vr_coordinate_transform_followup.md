@@ -40,7 +40,7 @@ R_wrist(t) = {}^V R_H(t)
 
 即 wrist 四元数描述的是“wrist 局部轴在 VR 世界中的朝向”，而不是一个已经相对某个初始帧或
 头显帧表达的增量。`vr_worker.py` 负责 Unity → FLU 的坐标基变换与 `xyzw → wxyz` 排列；
-`arm_mapper.py` 不应再次做 Unity 轴交换。
+`control_loop/vr_mapping.py` 不应再次做 Unity 轴交换。
 
 固定标定为：
 
@@ -60,8 +60,8 @@ T_vr_to_robot = {}^B R_V
 HTS/Unity wrist pose
   -> unity_left_to_flu_rotation + WXYZ 规范化
   -> RuntimeChannels.vr_ring.wrist_quat_wxyz
-  -> ArmWristMapper.reset() 记录 wrist/EFF anchor
-  -> ArmWristMapper.map() 生成 EEF world target
+  -> VRWristMapper.reset() 记录 wrist/EFF anchor
+  -> VRWristMapper.map() 生成 EEF world target
   -> IK / safety gate / arm worker
 ```
 
@@ -97,12 +97,12 @@ R_E^W(t) = ΔR_W · {}^W R_E(0)
 
 | 结论 | 证据 | 边界 |
 | --- | --- | --- |
-| 位置与旋转现在使用同一固定标定 | `teleop/loop.py` 只把 `vr_calibration.transform` 传为 `vr_to_robot_rot`；`arm_mapper.py` 对位置用左乘、对旋转用共轭变换 | 不证明标定本身正确 |
-| 空间旋转在当前公式下保持机器人世界轴 | `tests/test_arm_wrist_mapper.py::test_robot_world_x_rotation_remains_world_x_with_nonidentity_anchors` 使用非单位 wrist/EFF anchor 检查 `R_x` 的预乘结果 | 是合成几何测试，不含真实 tracker |
-| 固定标定对位置和旋转一致 | `tests/test_arm_wrist_mapper.py::test_fixed_calibration_maps_position_and_rotation_with_one_transform` | 不验证真实标定采集姿势 |
+| 位置与旋转现在使用同一固定标定 | `teleop/loop.py` 只把 `vr_calibration.transform` 传为 `vr_to_robot_rot`；`control_loop/vr_mapping.py` 对位置用左乘、对旋转用共轭变换 | 不证明标定本身正确 |
+| 空间旋转在当前公式下保持机器人世界轴 | 离线几何审查使用非单位 wrist/EFF anchor 检查 `R_x` 的预乘结果 | 是合成几何检查，不含真实 tracker |
+| 固定标定对位置和旋转一致 | 离线几何审查检查位置与旋转共用同一固定变换 | 不验证真实标定采集姿势 |
 | Unity→FLU 与四元数排列在单一入口完成 | `sensor/vr_worker.py` 对 wrist 使用 `unity_left_to_flu_rotation` 和 `xyzw_to_wxyz`，之后发布规范化四元数 | 仍需确认 HTS 的 `wrist` pose 是世界姿态 |
 | IK/FK 不会天然把世界 `X` 换成其他轴 | 临时离线 MPlib target→IK→FK 检查中，`R_x(+5°) · R_E(0)` 的 FK 姿态残差约为 `9.12e-6 rad`；显示成 `-X, -5°` 是等价轴角表达 | 不是实机 SDK 运动验证 |
-| tracking 毛刺不会写回原始姿态作为下一帧基线 | `ArmWristMapper` 保存 `_accepted_wrist_rot`，并用它计算下一帧的 per-frame delta | 该机制会限幅旋转幅度，不会修复坐标轴语义 |
+| tracking 毛刺不会写回原始姿态作为下一帧基线 | `VRWristMapper` 保存 `_accepted_wrist_rot`，并用它计算下一帧的 per-frame delta | 该机制会限幅旋转幅度，不会修复坐标轴语义 |
 
 离线测试在最近一次审查中全部通过；这些证据支持“公式在声明的数学合同下正确”，但不能证明现场的
 输入和物理动作满足该合同。
@@ -171,8 +171,8 @@ R_E^W(t) = ΔR_W · {}^W R_E(0)
   变换与 VR ring 发布。
 - [`teleop/vr_transform.py`](../dexmani_real/teleop/vr_transform.py)：固定标定 schema、SO(3) 校验与
   heading-only 合同。
-- [`teleop/arm_mapper.py`](../dexmani_real/teleop/arm_mapper.py)：reset-relative wrist→EEF 映射、
+- [`teleop/control_loop/vr_mapping.py`](../dexmani_real/teleop/control_loop/vr_mapping.py)：reset-relative wrist→EEF 映射、
   accepted pose 和旋转限幅。
 - [`teleop/loop.py`](../dexmani_real/teleop/loop.py)：加载固定标定并构造 mapper。
-- [`tests/test_arm_wrist_mapper.py`](../tests/test_arm_wrist_mapper.py)：固定标定、world-X 旋转及
-  accepted-pose 行为的离线合同。
+- [`tests/test_teleop_pause_boundary.py`](../tests/test_teleop_pause_boundary.py)：pause/re-anchor
+  与 accepted-pose 生命周期边界的离线合同；固定标定几何证据见本记录第 4 节。

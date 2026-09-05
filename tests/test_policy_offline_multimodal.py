@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,30 +16,33 @@ import zarr
 
 from examples import process_episodes
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.config.runtime import resolve_runtime_config
-from dexmani_real.data.clean import align_tactile_sum_rows_to_references
-from dexmani_real.data.contracts import (
+from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.dataset.clean import align_tactile_sum_rows_to_references
+from dexmani_real.dataset.contracts import (
     EpisodeAnnotation,
     EpisodeDecision,
     OutputProfile,
     ProcessingConfig,
     QualityPolicy,
 )
-from dexmani_real.data.export import (
+from dexmani_real.dataset.export import (
     PolicyZarrExportConfig,
     _Artifact,
     _inspect_artifact,
     export_processed_hdf5_to_zarr,
 )
-from dexmani_real.data.process import (
+from dexmani_real.dataset.processed import (
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
     _validate_processed_output_structure,
-    _write_processed_episode,
-    compute_fingertip_history_xarm_base,
     validate_processed_hdf5,
 )
-from dexmani_real.planning.fingertip import compute_fingertip_points_xarm_base
+from dexmani_real.dataset.processing import (
+    _write_processed_episode,
+    compute_fingertip_history_xarm_base,
+    discover_episode_dirs,
+)
+from dexmani_real.planning.kinematics.fingertip import compute_fingertip_points_xarm_base
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
@@ -167,13 +171,13 @@ class OfflineMultimodalTest(unittest.TestCase):
                     path = root / f"{profile.value}.h5"
                     self._write_processed_fixture(path, profile)
                     with (
-                        patch("dexmani_real.data.export.validate_processed_payload"),
+                        patch("dexmani_real.dataset.export.validate_processed_payload"),
                         patch(
-                            "dexmani_real.data.export.validate_processed_provenance",
+                            "dexmani_real.dataset.export.validate_processed_provenance",
                             return_value=object(),
                         ),
                         patch(
-                            "dexmani_real.data.export._whole_episode_rejection",
+                            "dexmani_real.dataset.export._whole_episode_rejection",
                             return_value=None,
                         ),
                     ):
@@ -204,7 +208,7 @@ class OfflineMultimodalTest(unittest.TestCase):
                 _inspect_artifact(path, PolicyZarrExportConfig())
 
     def test_processing_runtime_timing_defaults_and_cli_overrides(self) -> None:
-        runtime = resolve_runtime_config(
+        runtime = resolve_experiment_config(
             data={
                 "camera": {"max_frame_age_s": 0.4},
                 "policy": {"max_observation_skew_s": 0.2},
@@ -236,6 +240,31 @@ class OfflineMultimodalTest(unittest.TestCase):
         )
         self.assertEqual(config.max_camera_age_s, 0.3)
         self.assertEqual(config.max_observation_skew_s, 0.1)
+
+    def test_relative_input_produces_canonical_source_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            episode = root / "episode"
+            episode.mkdir()
+            (episode / "data.h5").touch()
+            relative_root = Path(os.path.relpath(root, Path.cwd()))
+
+            (source_path,) = discover_episode_dirs(relative_root)
+            decision = EpisodeDecision(
+                source_path=source_path,
+                source_frames=1,
+                profile=OutputProfile.JOINT,
+                selected_indices=np.asarray([0], dtype=np.int64),
+                keep_mask=np.asarray([True]),
+                drop_reason_bits=np.asarray([0], dtype=np.uint64),
+                drop_reason_names=(),
+                hard_reason_counts={},
+                boundary_counts={},
+                selected_frames=1,
+                quality={"full_window_count": 1},
+            )
+
+            self.assertEqual(decision.to_dict()["source_path"], str(episode.resolve()))
 
     def test_joint_writer_validator_and_zarr_export_keep_teleop_action_semantics(
         self,
@@ -365,13 +394,13 @@ class OfflineMultimodalTest(unittest.TestCase):
                         else:
                             output.attrs[name] = value
                     with (
-                        patch("dexmani_real.data.export.validate_processed_payload"),
+                        patch("dexmani_real.dataset.export.validate_processed_payload"),
                         patch(
-                            "dexmani_real.data.export.validate_processed_provenance",
+                            "dexmani_real.dataset.export.validate_processed_provenance",
                             return_value=object(),
                         ),
                         patch(
-                            "dexmani_real.data.export._whole_episode_rejection",
+                            "dexmani_real.dataset.export._whole_episode_rejection",
                             return_value=None,
                         ),
                     ):
@@ -407,7 +436,9 @@ class OfflineMultimodalTest(unittest.TestCase):
                             del output.attrs[name]
                         else:
                             output.attrs[name] = value
-                    with patch("dexmani_real.data.process.validate_processed_payload"):
+                    with patch(
+                        "dexmani_real.dataset.processed.validate_processed_payload"
+                    ):
                         with self.assertRaises(ValueError):
                             validate_processed_hdf5(path, config)
 

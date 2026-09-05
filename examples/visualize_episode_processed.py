@@ -42,7 +42,7 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.data.process import (
+from dexmani_real.dataset.processed import (
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
     validate_processed_admission,
@@ -69,7 +69,7 @@ _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
 
 _FINGER_NAMES: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
 
-# Processed core modalities are fixed by the v10 contract: joint_state/action are
+# Processed core modalities are fixed by the current schema contract: joint_state/action are
 # arm (7) + hand (12), action_ee is eef_position (3) + eef_rot6d (6) + hand (12),
 # and contact_force is one native-axis 3-vector per finger.
 _ARM_JOINT_LABELS = tuple(f"arm_j{i}" for i in range(7))
@@ -542,7 +542,10 @@ class ProcessedEpisodeVisualizer:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Visualize processed DexMani HDF5 v10 episodes with Rerun 3D."
+        description=(
+            f"Visualize processed DexMani HDF5 v{PROCESSED_SCHEMA_VERSION} episodes "
+            "with Rerun 3D."
+        )
     )
     parser.add_argument(
         "episode",

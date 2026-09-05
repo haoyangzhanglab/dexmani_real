@@ -25,10 +25,10 @@ if str(_REPO_ROOT) not in sys.path:
 
 from dexmani_real import PACKAGE_DIR
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
-from dexmani_real.planning.poses import forward_from_quat_wxyz, normalize_quat_wxyz
+from dexmani_real.planning.kinematics.pose import forward_from_quat_wxyz, normalize_quat_wxyz
 from dexmani_real.runtime.supervisor import wait_subsystem_ready
-from dexmani_real.runtime.workers import (
-    WorkerSpec,
+from dexmani_real.runtime.processes import (
+    ProcessSpec,
     build_processes,
     shutdown_processes_verified,
     start_processes,
@@ -260,7 +260,7 @@ def main(argv: list[str] | None = None) -> int:
         prefix="dexmani_vr_calib", config=RuntimeChannelsConfig(), mp_context=ctx
     )
     specs = [
-        WorkerSpec(
+        ProcessSpec(
             "vr-calib",
             vr_loop,
             (shared, VRReceiverConfig(port=args.port)),

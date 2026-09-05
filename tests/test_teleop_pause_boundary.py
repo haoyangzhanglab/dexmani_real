@@ -13,9 +13,9 @@ from dexmani_real.control.action import ActionCandidate
 from dexmani_real.control.publication import PreparedCommand, PublishResult
 from dexmani_real.ipc.causal import vr_frame_is_fresh
 from dexmani_real.ipc.schema import HAND_TACTILE_DTYPE
-from dexmani_real.teleop.action_proposal import compute_target_eef_pose
+from dexmani_real.teleop.control_loop.action_proposal import compute_target_eef_pose
 from dexmani_real.teleop.config import TeleopConfig
-from dexmani_real.teleop.control_grid import (
+from dexmani_real.teleop.control_loop.grid import (
     TeleopActionComputation,
     TeleopGridObservation,
     TeleopGridResources,
@@ -26,7 +26,7 @@ from dexmani_real.teleop.control_grid import (
     run_control_grid_tick,
 )
 from dexmani_real.teleop.episode_samples import FRAME_IK_FAIL, record_held
-from dexmani_real.teleop.hand_control import smoothstep_hand_ramp
+from dexmani_real.teleop.control_loop.hand_control import smoothstep_hand_ramp
 from dexmani_real.teleop.loop import _begin_feedback_issue
 
 
@@ -182,31 +182,31 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
 
         with (
             patch(
-                "dexmani_real.teleop.control_grid.read_causal_structured_frame",
+                "dexmani_real.teleop.control_loop.grid.read_causal_structured_frame",
                 side_effect=read_structured,
             ),
             patch(
-                "dexmani_real.teleop.control_grid.read_vr_frame_causal",
+                "dexmani_real.teleop.control_loop.grid.read_vr_frame_causal",
                 return_value=vr_frame,
             ),
             patch(
-                "dexmani_real.teleop.control_grid.read_hand_tactile_causal",
+                "dexmani_real.teleop.control_loop.grid.read_hand_tactile_causal",
                 return_value=None,
             ),
             patch(
-                "dexmani_real.teleop.control_grid.arm_feedback_issue",
+                "dexmani_real.teleop.control_loop.grid.arm_feedback_issue",
                 return_value=None,
             ),
             patch(
-                "dexmani_real.teleop.control_grid.hand_feedback_issue",
+                "dexmani_real.teleop.control_loop.grid.hand_feedback_issue",
                 return_value=None,
             ),
             patch(
-                "dexmani_real.teleop.control_grid.advance_arm_feedback_error_count",
+                "dexmani_real.teleop.control_loop.grid.advance_arm_feedback_error_count",
                 return_value=(0, False),
             ),
             patch(
-                "dexmani_real.teleop.control_grid.time.monotonic_ns", return_value=200
+                "dexmani_real.teleop.control_loop.grid.time.monotonic_ns", return_value=200
             ),
         ):
             first_result, first_observation = _read_control_grid_observation(
@@ -270,29 +270,29 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
         }
         with (
             patch(
-                "dexmani_real.teleop.control_grid.read_causal_structured_frame",
+                "dexmani_real.teleop.control_loop.grid.read_causal_structured_frame",
                 side_effect=lambda ring, **_kwargs: (
                     (arm_state, 0, 1) if ring is shared.arm_state_ring else None
                 ),
             ),
             patch(
-                "dexmani_real.teleop.control_grid.read_vr_frame_causal",
+                "dexmani_real.teleop.control_loop.grid.read_vr_frame_causal",
                 return_value=None,
             ),
             patch(
-                "dexmani_real.teleop.control_grid.read_hand_tactile_causal",
+                "dexmani_real.teleop.control_loop.grid.read_hand_tactile_causal",
                 return_value=None,
             ),
             patch(
-                "dexmani_real.teleop.control_grid.arm_feedback_issue",
+                "dexmani_real.teleop.control_loop.grid.arm_feedback_issue",
                 return_value=None,
             ),
             patch(
-                "dexmani_real.teleop.control_grid.hand_feedback_issue",
+                "dexmani_real.teleop.control_loop.grid.hand_feedback_issue",
                 return_value=None,
             ),
             patch(
-                "dexmani_real.teleop.control_grid._prepare_and_publish_joint_command"
+                "dexmani_real.teleop.control_loop.grid._prepare_and_publish_joint_command"
             ) as publish,
         ):
             result = run_control_grid_tick(
@@ -327,15 +327,15 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
         )
         with (
             patch(
-                "dexmani_real.teleop.control_grid.read_causal_structured_frame",
+                "dexmani_real.teleop.control_loop.grid.read_causal_structured_frame",
                 return_value=None,
             ),
             patch(
-                "dexmani_real.teleop.control_grid.arm_feedback_issue",
+                "dexmani_real.teleop.control_loop.grid.arm_feedback_issue",
                 return_value="arm feedback stale",
             ),
             patch(
-                "dexmani_real.teleop.control_grid._prepare_and_publish_joint_command"
+                "dexmani_real.teleop.control_loop.grid._prepare_and_publish_joint_command"
             ) as publish,
         ):
             result = run_control_grid_tick(
@@ -385,31 +385,31 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
 
         with (
             patch(
-                "dexmani_real.teleop.control_grid.read_causal_structured_frame",
+                "dexmani_real.teleop.control_loop.grid.read_causal_structured_frame",
                 side_effect=read_structured,
             ),
             patch(
-                "dexmani_real.teleop.control_grid.read_vr_frame_causal",
+                "dexmani_real.teleop.control_loop.grid.read_vr_frame_causal",
                 return_value={"recv_ts_ns": 101, "ring_sequence": 1},
             ),
             patch(
-                "dexmani_real.teleop.control_grid.read_hand_tactile_causal",
+                "dexmani_real.teleop.control_loop.grid.read_hand_tactile_causal",
                 return_value=None,
             ),
             patch(
-                "dexmani_real.teleop.control_grid.arm_feedback_issue",
+                "dexmani_real.teleop.control_loop.grid.arm_feedback_issue",
                 return_value=None,
             ),
             patch(
-                "dexmani_real.teleop.control_grid.hand_feedback_issue",
+                "dexmani_real.teleop.control_loop.grid.hand_feedback_issue",
                 return_value="hand feedback stale",
             ),
             patch(
-                "dexmani_real.teleop.control_grid.time.monotonic_ns", return_value=150
+                "dexmani_real.teleop.control_loop.grid.time.monotonic_ns", return_value=150
             ),
-            patch("dexmani_real.teleop.control_grid.time.monotonic", return_value=1.0),
+            patch("dexmani_real.teleop.control_loop.grid.time.monotonic", return_value=1.0),
             patch(
-                "dexmani_real.teleop.control_grid._prepare_and_publish_joint_command"
+                "dexmani_real.teleop.control_loop.grid._prepare_and_publish_joint_command"
             ) as publish,
         ):
             result = run_control_grid_tick(
@@ -503,17 +503,17 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
         )
         with (
             patch(
-                "dexmani_real.teleop.control_grid.compute_arm_joint_proposal",
+                "dexmani_real.teleop.control_loop.grid.compute_arm_joint_proposal",
                 return_value=arm_proposal,
             ),
             patch(
-                "dexmani_real.teleop.control_grid._prepare_and_publish_joint_command",
+                "dexmani_real.teleop.control_loop.grid._prepare_and_publish_joint_command",
                 return_value=(
                     PreparedCommand(candidate=candidate),
                     PublishResult(published=True),
                 ),
             ),
-            patch("dexmani_real.teleop.control_grid.record_frame") as record_frame,
+            patch("dexmani_real.teleop.control_loop.grid.record_frame") as record_frame,
         ):
             keep_running = _publish_solved_action(
                 controller,
@@ -577,13 +577,13 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
         resources.command_limits.hand_mechanical_upper_rad = np.full(12, 1.0)
         with (
             patch(
-                "dexmani_real.teleop.control_grid._prepare_and_publish_joint_command",
+                "dexmani_real.teleop.control_loop.grid._prepare_and_publish_joint_command",
                 return_value=(
                     PreparedCommand(candidate=candidate),
                     PublishResult(published=True),
                 ),
             ) as publish,
-            patch("dexmani_real.teleop.control_grid._record_grid_hold") as record_hold,
+            patch("dexmani_real.teleop.control_loop.grid._record_grid_hold") as record_hold,
         ):
             keep_running = _publish_ik_failure_hold(
                 controller,

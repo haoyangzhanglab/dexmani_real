@@ -7,10 +7,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from dexmani_real.config.runtime import resolve_runtime_config
+from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.deployment.config import (
     PolicyDeploymentConfig,
-    PolicyWorkerConfig,
+    InferenceWorkerConfig,
     validate_policy_runtime_compatibility,
 )
 from dexmani_real.deployment.lifecycle import (
@@ -18,7 +18,7 @@ from dexmani_real.deployment.lifecycle import (
     run_policy_deployment,
 )
 from dexmani_real.runtime.safety import SafetyState
-from dexmani_real.runtime.workers import WorkerSpec
+from dexmani_real.runtime.processes import ProcessSpec
 
 
 class _Value:
@@ -56,7 +56,7 @@ class _FakeRuntimeChannels:
 class _FakeProcess:
     """Synchronous process double that records a child startup failure."""
 
-    def __init__(self, spec: WorkerSpec) -> None:
+    def __init__(self, spec: ProcessSpec) -> None:
         self.name = spec.name
         self._target = spec.target
         self._args = spec.args
@@ -125,8 +125,8 @@ def _policy_spec() -> SimpleNamespace:
     )
 
 
-def _policy_worker_config(spec: SimpleNamespace) -> PolicyWorkerConfig:
-    return PolicyWorkerConfig(
+def _policy_worker_config(spec: SimpleNamespace) -> InferenceWorkerConfig:
+    return InferenceWorkerConfig(
         experiment="fake/model",
         device="cpu",
         spec=spec,
@@ -135,7 +135,7 @@ def _policy_worker_config(spec: SimpleNamespace) -> PolicyWorkerConfig:
 
 class PolicyLifecycleStartupTest(unittest.TestCase):
     def test_deployment_mode_reaches_inference_and_executor(self) -> None:
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         spec = _policy_spec()
         worker_config = _policy_worker_config(spec)
         deployment = PolicyDeploymentConfig(
@@ -166,14 +166,14 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
 
     def test_model_failure_blocks_all_non_inference_workers(self) -> None:
         shared = _FakeRuntimeChannels()
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         spec = _policy_spec()
         worker_config = _policy_worker_config(spec)
         processes: list[_FakeProcess] = []
         startup_order: list[str] = []
 
         def build_fake_processes(
-            _context: object, worker_specs: list[WorkerSpec]
+            _context: object, worker_specs: list[ProcessSpec]
         ) -> list[_FakeProcess]:
             processes.extend(_FakeProcess(spec) for spec in worker_specs)
             return processes
@@ -202,7 +202,7 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
             ),
             patch("dexmani_real.deployment.lifecycle.shutdown_processes", shutdown),
             patch(
-                "dexmani_real.deployment.worker._load_inference_runtime",
+                "dexmani_real.deployment.inference.worker._load_inference_runtime",
                 side_effect=RuntimeError("fake model restore failed"),
             ),
         ):
@@ -244,16 +244,16 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
 
     def test_ready_worker_death_before_armed_faults_deployment(self) -> None:
         shared = _FakeRuntimeChannels()
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         spec = _policy_spec()
         worker_config = _policy_worker_config(spec)
         specs = (
-            WorkerSpec(
+            ProcessSpec(
                 "inference", _unexpected_worker_start, (), ready_name="inference"
             ),
-            WorkerSpec("arm", _unexpected_worker_start, (), ready_name="arm"),
-            WorkerSpec("hand", _unexpected_worker_start, (), ready_name="hand"),
-            WorkerSpec("policy", _unexpected_worker_start, ()),
+            ProcessSpec("arm", _unexpected_worker_start, (), ready_name="arm"),
+            ProcessSpec("hand", _unexpected_worker_start, (), ready_name="hand"),
+            ProcessSpec("policy", _unexpected_worker_start, ()),
         )
         processes = [_ControllableProcess(worker.name) for worker in specs]
         by_name = {process.name: process for process in processes}
@@ -305,16 +305,16 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
         self,
     ) -> None:
         shared = _FakeRuntimeChannels()
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         spec = _policy_spec()
         worker_config = _policy_worker_config(spec)
         specs = (
-            WorkerSpec(
+            ProcessSpec(
                 "inference", _unexpected_worker_start, (), ready_name="inference"
             ),
-            WorkerSpec("arm", _unexpected_worker_start, (), ready_name="arm"),
-            WorkerSpec("hand", _unexpected_worker_start, (), ready_name="hand"),
-            WorkerSpec("policy", _unexpected_worker_start, ()),
+            ProcessSpec("arm", _unexpected_worker_start, (), ready_name="arm"),
+            ProcessSpec("hand", _unexpected_worker_start, (), ready_name="hand"),
+            ProcessSpec("policy", _unexpected_worker_start, ()),
         )
         events: list[str] = []
         processes = [
@@ -394,16 +394,16 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
 
     def test_lifecycle_supervises_policy_heartbeat(self) -> None:
         shared = _FakeRuntimeChannels()
-        runtime = resolve_runtime_config()
+        runtime = resolve_experiment_config()
         spec = _policy_spec()
         worker_config = _policy_worker_config(spec)
         specs = (
-            WorkerSpec(
+            ProcessSpec(
                 "inference", _unexpected_worker_start, (), ready_name="inference"
             ),
-            WorkerSpec("arm", _unexpected_worker_start, (), ready_name="arm"),
-            WorkerSpec("hand", _unexpected_worker_start, (), ready_name="hand"),
-            WorkerSpec("policy", _unexpected_worker_start, ()),
+            ProcessSpec("arm", _unexpected_worker_start, (), ready_name="arm"),
+            ProcessSpec("hand", _unexpected_worker_start, (), ready_name="hand"),
+            ProcessSpec("policy", _unexpected_worker_start, ()),
         )
         processes = [_ControllableProcess(worker.name) for worker in specs]
         by_name = {process.name: process for process in processes}

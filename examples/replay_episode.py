@@ -19,8 +19,8 @@ if str(_REPO_ROOT) not in sys.path:
 import numpy as np
 import yaml
 
-from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
-from dexmani_real.replay.controller import ReplayStatus
+from dexmani_real.config.experiment import ExperimentConfig, resolve_experiment_config
+from dexmani_real.replay.replayer import ReplayStatus
 from dexmani_real.replay.session import (
     DEFAULT_OUTPUT_DIR,
     EpisodeReplayConfig,
@@ -40,7 +40,7 @@ logger = get_logger(__name__)
 class ReplayRuntimeSelection:
     """Resolved runtime config and physical replay provenance."""
 
-    runtime: ResolvedRuntimeConfig
+    runtime: ExperimentConfig
     acceleration_deg_s2: float
     joint_speed_deg_s: float
     config_sha256: str
@@ -111,7 +111,7 @@ Controls:
 
 
 def _resolve_replay_runtime(args: argparse.Namespace) -> ReplayRuntimeSelection:
-    runtime = resolve_runtime_config(
+    runtime = resolve_experiment_config(
         yaml_path=args.config,
         cli_overrides={
             "arm.max_joint_acceleration_deg_per_s2": args.acc,

@@ -2,9 +2,10 @@
 """Usage: ``python examples/visualize_episode.py EPISODE [--info] [--max-frames N]``.
 
 Self-contained Rerun visualizer for raw schema-v24 DexMani episodes. Offline
-only: connects to no hardware and writes no files. Episodes display a canonical
-fixed-size ``(N, 6)`` point cloud derived with the same production implementation
-used by offline processing and deployment.
+only: connects to no hardware and writes no files; it opens a Rerun viewer unless
+``--info`` is selected. Episodes display a canonical fixed-size ``(N, 6)`` point
+cloud derived with the same production implementation used by offline processing
+and deployment.
 
 Examples::
 
@@ -35,8 +36,8 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.config.runtime import resolve_runtime_config
-from dexmani_real.data.raw_pointcloud import (
+from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.dataset.pointcloud import (
     RawEpisodePointCloudDeriver,
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
@@ -46,7 +47,7 @@ from dexmani_real.ipc.schema import (
     validate_point_cloud_array,
 )
 from dexmani_real.recording import EpisodeReader, MergedH5File
-from dexmani_real.robot_spec import HAND_FINGERTIP_SHAPE
+from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -94,7 +95,7 @@ def _classify_datasets(h5f: MergedH5File) -> dict[str, list[str]]:
 def print_episode_info(h5_path: str) -> None:
     """Print a human-readable summary of the episode structure without opening Rerun."""
     with EpisodeReader(h5_path) as reader:
-        if not reader.meets_min_duration:
+        if not reader.min_frames_met:
             print(
                 "WARNING: episode is below the configured minimum recording duration (quality label only)"
             )
@@ -179,7 +180,7 @@ class EpisodeVisualizer:
         self._h5_path = Path(h5_path)
         self._reader = EpisodeReader(h5_path)
         try:
-            if not self._reader.meets_min_duration:
+            if not self._reader.min_frames_met:
                 logger.warning(
                     "Episode is below the configured minimum recording duration"
                 )
@@ -610,7 +611,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.pointcloud_num_points is not None and not point_cloud_enabled:
         parser.error("--pointcloud-num-points requires an enabled point cloud")
 
-    runtime = resolve_runtime_config() if point_cloud_enabled else None
+    runtime = resolve_experiment_config() if point_cloud_enabled else None
     pointcloud_config = None
     table_plane_abcd = None
     runtime_config_sha256 = None

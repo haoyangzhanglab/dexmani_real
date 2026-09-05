@@ -78,7 +78,7 @@ VR / keyboard input
     └→ fixed-grid record sample → RecorderIO
 ```
 
-- `teleop/control_grid.py` 持有 proposal、EMA、hand ramp/retarget、IK hold 与上一 endpoint 等
+- `teleop/control_loop/grid.py` 持有 proposal、EMA、hand ramp/retarget、IK hold 与上一 endpoint 等
   算法状态；loop 持有 pause、recording、keyboard 和退出编排状态。
 - feedback 缺失、过期、断开或录制边界进入 pause boundary：先使 generation 失效并清除
   controller reference，恢复时必须收到 pause 之后的新鲜因果 arm/VR/hand feedback，再重锚并
@@ -106,15 +106,15 @@ VR / keyboard input
 - teleop 只把已经选择并校验的 causal fixed-grid sample 交给 RecorderIO；RecorderIO 独占
   episode transaction、sidecar、sequence continuity、validation 和 atomic finalize，不决定
   机器人动作。
-- raw episode 的 schema、字段语义和对齐保持单一来源：`recording/schema.py` 与
+- raw episode 的 schema、字段语义和对齐保持单一来源：`recording/storage/schema.py` 与
   [`docs/data_schema.md`](docs/data_schema.md)。当前链路为 raw v24 → processed HDF5 v12 →
-  Policy Zarr v6；离线 `data/` 负责清洗、审计和导出，不改变 raw 字段含义。
+  Policy Zarr v6；离线 `dataset/` 负责清洗、审计和导出，不改变 raw 字段含义。
 - `EpisodeReader` 的普通 read 严格检查 raw schema、layout 和基本语义，但不重算大型
   sidecar hash 或完整解码视频；这些 artifact attestation 检查只在显式 integrity audit 中执行。
 - processed writer 只在原子发布前重开并确认 HDF5 结构；`--verify-output` 才执行完整写后
   自检。processed consumer/export 边界仍严格验证 payload finite、shape/dtype、alignment 和
   semantic attrs。
-- `recording/hdf5_writer.py` 独占单个 `data.h5` handle；camera sidecar 和 video writer 不
+- `recording/storage/hdf5_writer.py` 独占单个 `data.h5` handle；camera sidecar 和 video writer 不
   反向拥有控制状态。缺口、失败或未完成 finalize 不伪装成完整 episode。
 - 物理回放读取已发布的 raw command/provenance，并重新经过当前 runtime 的 preflight、safety、
   generation 与 worker 边界；processed 产物不能重新解释或替代 raw 命令事实。processed replay

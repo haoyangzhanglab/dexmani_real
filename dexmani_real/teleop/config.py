@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
-from dexmani_real.robot_spec import XHAND_RIGHT_URDF_PATH
+from dexmani_real.config.experiment import ExperimentConfig, resolve_experiment_config
+from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 
 
 @dataclass(frozen=True)
@@ -80,7 +80,7 @@ class TeleopConfig:
     session-only fields plus that reference.
     """
 
-    runtime: ResolvedRuntimeConfig = field(default_factory=resolve_runtime_config)
+    runtime: ExperimentConfig = field(default_factory=resolve_experiment_config)
     task_label: str = ""
     operator: str = ""
     hand_urdf_path: str = field(default_factory=lambda: str(XHAND_RIGHT_URDF_PATH))
@@ -93,7 +93,7 @@ class TeleopConfig:
     @classmethod
     def from_runtime(
         cls,
-        runtime: ResolvedRuntimeConfig,
+        runtime: ExperimentConfig,
         *,
         task_label: str = "",
         operator: str = "",

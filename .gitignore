@@ -5,7 +5,7 @@ outputs
 /experiments
 episodes/
 episodes_processed/
-dataset/
+/dataset/
 .vscode
 _wandb
 

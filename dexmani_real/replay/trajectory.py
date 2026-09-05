@@ -10,11 +10,11 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from dexmani_real.config.runtime import ResolvedRuntimeConfig
+from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.planning import Pose, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.paths import wrap_nearest_equivalent
-from dexmani_real.recording.reader import EpisodeReader
-from dexmani_real.robot_spec import (
+from dexmani_real.recording.storage.reader import EpisodeReader
+from dexmani_real.robot.model import (
     ARM_EE_SHAPE,
     ARM_JOINT_SHAPE,
     HAND_JOINT_SHAPE,
@@ -104,7 +104,7 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
         raise FileNotFoundError(f"Episode not found: {episode_path}")
 
     with EpisodeReader(resolved_path) as reader:
-        if not reader.meets_min_duration:
+        if not reader.min_frames_met:
             logger.warning(
                 "Episode %s is internally readable but below the configured minimum recording duration",
                 resolved_path,
@@ -221,7 +221,7 @@ def _processed_replay_source(
     artifact_path: Path,
 ) -> tuple[Path, np.ndarray, str, int, str]:
     """Read the raw-source identity and retained rows from one processed artifact."""
-    from dexmani_real.data.process import (
+    from dexmani_real.dataset.processed import (
         PROCESSED_SCHEMA_NAME,
         PROCESSED_SCHEMA_VERSION,
         validate_processed_provenance,
@@ -440,7 +440,7 @@ def _verify_trajectory_input(trajectory: TrajectoryData) -> None:
 
 def _canonicalize_replay_arm_actions(
     trajectory: TrajectoryData,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
 ) -> np.ndarray:
     """Return the nearest-equivalent arm stream used for physical preflight.
 
@@ -474,7 +474,7 @@ def _canonicalize_replay_arm_actions(
 def _validate_replay_hand_limits(
     hand_actions: np.ndarray,
     recorded_hand_start: np.ndarray,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
 ) -> None:
     """Reject hand states or commands outside their physical replay envelopes."""
     mechanical_lower = np.asarray(
@@ -552,7 +552,7 @@ def _reproducibility_warnings(
 
 def verify_replay_preflight(
     trajectory: TrajectoryData,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     *,
     provenance_sha256: str,
 ) -> None:

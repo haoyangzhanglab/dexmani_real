@@ -16,17 +16,18 @@ Usage::
 
     cm = CollisionModel()
     cm.check_self_collision(qpos)           # bool
-    cm.check_self_collision_details(qpos)   # CollisionInfo (from types.py)
+    cm.check_self_collision_details(qpos)   # CollisionInfo
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import Any, ClassVar
 
 import numpy as np
 
-from dexmani_real.robot_spec import (
+from dexmani_real.robot.model import (
     ARM_JOINT_SHAPE,
     HAND_DOF,
     HAND_SDK_TO_URDF_IDX,
@@ -36,9 +37,6 @@ from dexmani_real.robot_spec import (
     XHAND_MODEL_DIR,
 )
 from dexmani_real.utils.log import ThrottledWarner, get_logger
-
-if TYPE_CHECKING:
-    from .types import CollisionInfo
 
 logger = get_logger(__name__)
 
@@ -50,8 +48,71 @@ _COLLISION_SRDF = str(XARM7_XHAND_SRDF_PATH)  # unified SRDF (single source)
 
 _HAND_DOF_COUNT = HAND_DOF
 
-# Hand order mapping is defined in robot_spec and shared with kinematics.
+# Hand order mapping is defined in robot.model and shared with kinematics.
 _HAND_USER_TO_URDF = HAND_SDK_TO_URDF_IDX
+
+
+@dataclass(frozen=True, slots=True)
+class CollisionPair:
+    """A single self-collision contact suitable for diagnostics and logs."""
+
+    link_name1: str
+    link_name2: str
+    object_name1: str
+    object_name2: str
+    collision_type: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "link1": self.link_name1,
+            "link2": self.link_name2,
+            "obj1": self.object_name1,
+            "obj2": self.object_name2,
+            "type": self.collision_type,
+        }
+
+
+@dataclass
+class CollisionInfo:
+    """Structured self-collision diagnostic result."""
+
+    in_collision: bool
+    collision_pairs: tuple[CollisionPair, ...] = ()
+    num_contacts: int = 0
+    sample_qpos_rad: tuple[float, ...] | None = None
+
+    _NO_COLLISION: ClassVar["CollisionInfo"]
+
+    @classmethod
+    def no_collision(cls) -> "CollisionInfo":
+        return cls._NO_COLLISION
+
+    def __bool__(self) -> bool:
+        return self.in_collision
+
+    def to_dict(self) -> dict[str, Any]:
+        if not self.in_collision:
+            return {"in_collision": False}
+        result: dict[str, Any] = {
+            "in_collision": True,
+            "num_contacts": self.num_contacts,
+            "collision_pairs": [pair.to_dict() for pair in self.collision_pairs],
+        }
+        if self.sample_qpos_rad is not None:
+            result["sample_qpos_rad"] = list(self.sample_qpos_rad)
+        return result
+
+    @property
+    def summary(self) -> str:
+        if not self.in_collision:
+            return "no collision"
+        pairs = [f"{pair.link_name1}↔{pair.link_name2}" for pair in self.collision_pairs]
+        if not pairs:
+            return f"{self.num_contacts} contact(s), pair details unavailable"
+        return f"{self.num_contacts} contact(s): " + ", ".join(pairs)
+
+
+CollisionInfo._NO_COLLISION = CollisionInfo(in_collision=False)
 
 
 class CollisionModel:
@@ -378,8 +439,6 @@ class CollisionModel:
         Only allocates on collision; returns cached ``CollisionInfo.no_collision()``
         on the common (no-collision) path.
         """
-        from .types import CollisionInfo, CollisionPair
-
         has_any = self._pin_update(qpos, stop_at_first=False)
         if not has_any:
             return CollisionInfo.no_collision()
@@ -470,8 +529,6 @@ class CollisionModel:
 
     def check_environment_collision_details(self, qpos: np.ndarray) -> "CollisionInfo":
         """Return robot link, obstacle name, and sampled qpos for a scene contact."""
-        from .types import CollisionInfo, CollisionPair
-
         full_qpos = self._to_full_qpos(qpos)
         if not self.has_static_environment:
             return CollisionInfo.no_collision()

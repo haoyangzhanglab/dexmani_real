@@ -16,15 +16,15 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.runtime import ResolvedRuntimeConfig
+from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.ipc.causal import vr_frame_is_fresh
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.ipc.schema import RECORD_OPERATOR_BYTES, RECORD_TASK_LABEL_BYTES
 from dexmani_real.recording.client import RecorderPhase, bounded_control_text
-from dexmani_real.recording.worker import RecorderIOConfig, recorder_io_loop
+from dexmani_real.recording.io_worker import RecorderIOConfig, recorder_io_loop
 from dexmani_real.robot.arm_worker import arm_loop as _arm_loop
 from dexmani_real.robot.hand_worker import hand_loop as _hand_loop
-from dexmani_real.robot_spec import (
+from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_RIGHT_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
@@ -37,14 +37,14 @@ from dexmani_real.runtime.supervisor import (
     shutdown_processes,
     wait_subsystem_ready,
 )
-from dexmani_real.runtime.workers import (
+from dexmani_real.runtime.processes import (
     ShutdownReport,
-    WorkerSpec,
+    ProcessSpec,
     build_processes,
     start_processes,
 )
-from dexmani_real.sensor.camera_worker import CameraHealth, CameraLoopConfig
-from dexmani_real.sensor.camera_worker import camera_loop as _camera_loop
+from dexmani_real.sensor.camera.worker import CameraHealth, CameraLoopConfig
+from dexmani_real.sensor.camera.worker import camera_loop as _camera_loop
 from dexmani_real.sensor.vr_worker import VRReceiverConfig
 from dexmani_real.sensor.vr_worker import vr_loop as _vr_loop
 from dexmani_real.teleop.config import TeleopConfig
@@ -244,7 +244,7 @@ def _preflight_health_issues(
 
 
 def _print_session_header(
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     *,
     task_name: str,
     operator: str,
@@ -278,7 +278,7 @@ def _print_session_header(
 
 def _build_processes(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     *,
     repo_root: Path,
     task_name: str,
@@ -286,7 +286,7 @@ def _build_processes(
     provenance: tuple[tuple[str, str], ...],
     hand_enabled: bool,
     recording_enabled: bool,
-) -> list[WorkerSpec]:
+) -> list[ProcessSpec]:
     policy_config = TeleopConfig.from_runtime(
         runtime,
         task_label=task_name,
@@ -295,24 +295,24 @@ def _build_processes(
     )
     # Worker specs are the single source of process and readiness names.
     specs = [
-        WorkerSpec(
+        ProcessSpec(
             "arm",
             _arm_loop,
             (shared, runtime.arm),
             ready_name="arm",
         ),
-        WorkerSpec(
+        ProcessSpec(
             "vr",
             _vr_loop,
             (shared, VRReceiverConfig.from_runtime(runtime)),
             ready_name="vr",
         ),
-        WorkerSpec("policy", teleop_loop, (shared, policy_config), ready_name="policy"),
+        ProcessSpec("policy", teleop_loop, (shared, policy_config), ready_name="policy"),
     ]
     if recording_enabled:
         camera_config = CameraLoopConfig.from_runtime(runtime)
         specs.append(
-            WorkerSpec(
+            ProcessSpec(
                 "camera", _camera_loop, (shared, camera_config), ready_name="camera"
             )
         )
@@ -340,7 +340,7 @@ def _build_processes(
             writer_queue_size=int(runtime.camera.writer_queue_size),
         )
         specs.append(
-            WorkerSpec(
+            ProcessSpec(
                 "recorder",
                 recorder_io_loop,
                 (shared, recorder_config),
@@ -349,7 +349,7 @@ def _build_processes(
         )
     if hand_enabled:
         specs.append(
-            WorkerSpec(
+            ProcessSpec(
                 "hand",
                 _hand_loop,
                 (
@@ -387,7 +387,7 @@ def _recording_session_issue(shared: RuntimeChannels) -> str | None:
 
 
 def run_teleop_experiment(
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     *,
     task_name: str = DEFAULT_TASK_NAME,
     operator: str = "",
@@ -438,7 +438,7 @@ def run_teleop_experiment(
         config=RuntimeChannelsConfig.from_runtime(runtime),
         mp_context=ctx,
     )
-    specs: list[WorkerSpec] = []
+    specs: list[ProcessSpec] = []
     procs: list[Any] = []
     started_procs: list[Any] = []
     shutdown_report: ShutdownReport | None = None

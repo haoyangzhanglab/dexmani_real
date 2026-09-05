@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.planning.poses import rot6d_to_rotmat
-from dexmani_real.robot_spec import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.planning.kinematics.pose import rot6d_to_rotmat
+from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 _SAFETY_REASON_BYTES = 256
 

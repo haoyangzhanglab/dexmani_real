@@ -21,7 +21,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from dexmani_real.calibration.camera.session import run_camera_calibration
 from dexmani_real.calibration.camera.solver import ARUCO_DICT_NAME, ArucoConfig
-from dexmani_real.config.runtime import resolve_runtime_config
+from dexmani_real.config.experiment import resolve_experiment_config
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 60)
 
     try:
-        runtime = resolve_runtime_config(
+        runtime = resolve_experiment_config(
             yaml_path=args.config,
             cli_overrides={"camera.serial": args.serial},
         )

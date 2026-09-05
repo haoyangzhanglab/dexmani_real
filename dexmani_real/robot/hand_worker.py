@@ -175,7 +175,7 @@ def hand_loop(
     state_read_failure_timeout_s: float,
 ) -> None:
     """Run one XHand worker; all SDK objects remain in this process."""
-    from dexmani_real.robot.xhand import XHand, XHandSendStatus
+    from dexmani_real.robot.drivers.xhand import XHand, XHandSendStatus
     from dexmani_real.runtime.safety import (
         CoupledCommandTicket,
         SafetyState,

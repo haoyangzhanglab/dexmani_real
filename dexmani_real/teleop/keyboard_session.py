@@ -17,9 +17,10 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.config.runtime import ResolvedRuntimeConfig
-from dexmani_real.control.arm_home import ArmHomeConfig, execute_arm_home
-from dexmani_real.control.hand_home import publish_hand_home_and_wait_accepted
+from dexmani_real.config.experiment import ExperimentConfig
+from dexmani_real.control.arm_homing import ArmHomeConfig, execute_arm_home
+from dexmani_real.control.hand_homing import publish_hand_home_and_wait_accepted
+from dexmani_real.control.jog import compute_cartesian_jog_delta
 from dexmani_real.control.publication import prepare_joint_command, publish_command
 from dexmani_real.control.safety_gate import planner_action_safety_gate
 from dexmani_real.ipc.channels import (
@@ -28,14 +29,14 @@ from dexmani_real.ipc.channels import (
     read_arm_state_dict,
     read_hand_state_dict,
 )
-from dexmani_real.planning import Pose, TeleopProfile, XArm7MotionPlanner
-from dexmani_real.planning.poses import quat_multiply
+from dexmani_real.planning import OnlineIKConfig, Pose, XArm7MotionPlanner
+from dexmani_real.planning.kinematics.pose import quat_multiply
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.robot.hand_worker import hand_loop
 from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
-from dexmani_real.runtime.workers import WorkerSpec, build_processes, start_processes
-from dexmani_real.teleop.keyboard import GlobalKeyState, eef_delta_from_keys
+from dexmani_real.runtime.operator_input import KeyboardState
+from dexmani_real.runtime.processes import ProcessSpec, build_processes, start_processes
 from dexmani_real.utils.feedback import validate_arm_feedback, validate_hand_feedback
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate, LoopRateStats
@@ -61,7 +62,7 @@ def _fmt_keys(keys: tuple[str, ...]) -> str:
     return "".join(short.get(k, k.upper()) for k in keys)
 
 
-def _workspace(runtime: ResolvedRuntimeConfig) -> np.ndarray:
+def _workspace(runtime: ExperimentConfig) -> np.ndarray:
     bounds = runtime.policy.workspace
     return np.array(
         [
@@ -74,10 +75,10 @@ def _workspace(runtime: ResolvedRuntimeConfig) -> np.ndarray:
 
 
 def _build_planner_and_gate(
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
 ) -> tuple[XArm7MotionPlanner, Any]:
     planner = XArm7MotionPlanner.create_default(
-        teleop_profile=TeleopProfile(
+        teleop_profile=OnlineIKConfig(
             max_pose_error_pos_m=float(runtime.keyboard_teleop.ik_max_pose_error_pos_m),
             max_pose_error_rot_rad=float(
                 runtime.keyboard_teleop.ik_max_pose_error_rot_rad
@@ -156,7 +157,7 @@ def _hand_feedback_issue(
 
 
 def read_initial_arm(
-    shared: RuntimeChannels, runtime: ResolvedRuntimeConfig
+    shared: RuntimeChannels, runtime: ExperimentConfig
 ) -> dict[str, Any] | None:
     deadline_s = time.monotonic() + float(runtime.safety.readiness_timeouts_s["arm"])
     while time.monotonic() < deadline_s:
@@ -180,13 +181,13 @@ def read_initial_arm(
 
 def _start_workers(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     context: Any,
     processes: list[Any],
     *,
     hand_requested: bool,
 ) -> tuple[Any, Any | None, bool]:
-    arm_spec = WorkerSpec(
+    arm_spec = ProcessSpec(
         "arm", arm_loop, (shared, runtime.arm), ready_name="arm"
     )
     arm_process = build_processes(context, [arm_spec])[0]
@@ -203,7 +204,7 @@ def _start_workers(
     if not hand_requested:
         return arm_process, None, False
 
-    hand_spec = WorkerSpec(
+    hand_spec = ProcessSpec(
         "hand",
         hand_loop,
         (
@@ -465,7 +466,7 @@ class _KeyboardMotionDiagnostics:
 
 def _read_keyboard_feedback(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     *,
     hand_enabled: bool,
 ) -> _KeyboardFeedback:
@@ -604,9 +605,9 @@ def _compute_keyboard_target_update(
 
 def _run_keyboard_home(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
-    keys: GlobalKeyState,
+    keys: KeyboardState,
     current_qpos_rad: np.ndarray,
     *,
     hand_enabled: bool,
@@ -683,7 +684,7 @@ def _run_keyboard_home(
 
 def _publish_keyboard_target(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
     safety_gate: Any,
     target_pos_world_m: np.ndarray,
@@ -752,10 +753,10 @@ def _publish_keyboard_target(
 
 def _run_control_loop(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
     safety_gate: Any,
-    keys: GlobalKeyState,
+    keys: KeyboardState,
     arm_process: Any,
     hand_process: Any | None,
     *,
@@ -885,7 +886,7 @@ def _run_control_loop(
         home_key_down = home_pressed
 
         active_keys = keys.pressed_keys()
-        dx, drpy = eef_delta_from_keys(
+        dx, drpy = compute_cartesian_jog_delta(
             keys, float(cfg.delta_pos_m), float(cfg.delta_rpy_rad)
         )
         if active_keys != previous_active_keys:
@@ -1070,10 +1071,10 @@ def _run_control_loop(
 
 def _run_keyboard_session(
     shared: RuntimeChannels,
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     context: Any,
     processes: list[Any],
-    keys: GlobalKeyState,
+    keys: KeyboardState,
     planner: XArm7MotionPlanner,
     safety_gate: Any,
     *,
@@ -1127,7 +1128,7 @@ def _run_keyboard_session(
 
 
 def run_keyboard_experiment(
-    runtime: ResolvedRuntimeConfig,
+    runtime: ExperimentConfig,
     *,
     no_hand: bool,
 ) -> int:
@@ -1142,7 +1143,7 @@ def run_keyboard_experiment(
         mp_context=context,
     )
     processes: list[Any] = []
-    keys = GlobalKeyState(
+    keys = KeyboardState(
         suppress_echo=True,
         estop_callback=lambda: set_keyboard_fault(
             shared, "operator e-stop callback", estop=True

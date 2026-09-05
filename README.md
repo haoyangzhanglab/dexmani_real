@@ -44,17 +44,17 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | 目标 | 入口 | 主要实现 |
 |---|---|---|
 | 理解仓库与修改约束 | [`AGENTS.md`](AGENTS.md)、[`code_style.md`](code_style.md) | [`repo_map.md`](repo_map.md)、[`user_design.md`](user_design.md) |
-| VR 遥操作与采集 | [`examples/collect_teleop.py`](examples/collect_teleop.py) | [`teleop/session.py`](dexmani_real/teleop/session.py)、[`teleop/loop.py`](dexmani_real/teleop/loop.py)、[`teleop/control_grid.py`](dexmani_real/teleop/control_grid.py)、[`teleop/action_proposal.py`](dexmani_real/teleop/action_proposal.py) |
+| VR 遥操作与采集 | [`examples/collect_teleop.py`](examples/collect_teleop.py) | [`teleop/session.py`](dexmani_real/teleop/session.py)、[`teleop/loop.py`](dexmani_real/teleop/loop.py)、[`teleop/control_loop/grid.py`](dexmani_real/teleop/control_loop/grid.py)、[`teleop/control_loop/action_proposal.py`](dexmani_real/teleop/control_loop/action_proposal.py) |
 | 键盘遥操作 | [`examples/keyboard_teleop.py`](examples/keyboard_teleop.py) | [`teleop/keyboard_session.py`](dexmani_real/teleop/keyboard_session.py)、[`docs/teleop_jitter_incident.md`](docs/teleop_jitter_incident.md) |
 | 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`replay/`](dexmani_real/replay) |
-| raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/hdf5_writer.py`](dexmani_real/recording/hdf5_writer.py)、[`recording/reader.py`](dexmani_real/recording/reader.py) |
-| 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`data/`](dexmani_real/data) |
+| raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/storage/hdf5_writer.py`](dexmani_real/recording/storage/hdf5_writer.py)、[`recording/storage/reader.py`](dexmani_real/recording/storage/reader.py) |
+| 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`dataset/`](dexmani_real/dataset) |
 | 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v24、processed v12 与 Policy Zarr v6 的字段、dtype、shape 与语义 |
-| learned-policy 部署 | [`docs/policy_deployment.md`](docs/policy_deployment.md)、[`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`integrations/`](dexmani_real/integrations) |
+| learned-policy 部署 | [`docs/policy_deployment.md`](docs/policy_deployment.md)、[`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`deployment/inference/dexmani_policy.py`](dexmani_real/deployment/inference/dexmani_policy.py) |
 | 相机、桌面与 VR 标定 | [`examples/`](examples) | [`calibration/`](dexmani_real/calibration)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
 | 点云完整链路 | [`docs/pointcloud_pipeline.md`](docs/pointcloud_pipeline.md) | [`sensor/pointcloud.py`](dexmani_real/sensor/pointcloud.py)、[`sensor/pointcloud_worker.py`](dexmani_real/sensor/pointcloud_worker.py) |
 
-完整的逐文件职责见 [`repo_map.md`](repo_map.md)。
+稳定的运行拓扑、数据流和安全边界导航见 [`repo_map.md`](repo_map.md)。
 
 ## 核心架构
 
@@ -85,26 +85,26 @@ RealSense / Quest-HTS / xArm7 / XHand
 
 - 跨进程状态通过 `RuntimeChannels`；固定 wire shape/dtype 由
   [`ipc/schema.py`](dexmani_real/ipc/schema.py) 定义，机器人模型 shape 与关节顺序由
-  [`robot_spec.py`](dexmani_real/robot_spec.py) 定义。
+  [`robot/model.py`](dexmani_real/robot/model.py) 定义。
 - xArm、XHand、RealSense 和 HTS SDK 对象只存在于各自 owner/worker 内。
 - teleop、replay 和 deployment 负责动作决策；候选先由
   [`control/safety_gate.py`](dexmani_real/control/safety_gate.py) fail-closed 校验，再由
   [`control/publication.py`](dexmani_real/control/publication.py) 发布；设备
   worker 在 [`robot/command_validation.py`](dexmani_real/robot/command_validation.py) 再次校验。
-  arm/hand homing 分别由 [`control/arm_home.py`](dexmani_real/control/arm_home.py) 和
-  [`control/hand_home.py`](dexmani_real/control/hand_home.py) 拥有。
+  arm/hand homing 分别由 [`control/arm_homing.py`](dexmani_real/control/arm_homing.py) 和
+  [`control/hand_homing.py`](dexmani_real/control/hand_homing.py) 拥有。
 - Recorder 只持久化选定的固定网格样本，不拥有机器人控制。
 - `run_generation`、freshness、heartbeat、safety state 与 worker 侧检查共同使
   暂停、回零或故障前的旧命令失效。
 
 ### 控制与录制边界
 
-- [`teleop/action_proposal.py`](dexmani_real/teleop/action_proposal.py) 只计算并限幅
+- [`teleop/control_loop/action_proposal.py`](dexmani_real/teleop/control_loop/action_proposal.py) 只计算并限幅
   EEF、arm 与 hand proposal；它不发布命令、不访问 shared memory，也不写录制数据。
 - [`teleop/session.py`](dexmani_real/teleop/session.py) 在父进程中分阶段启动 worker，并以
   ready、fault、liveness 和 timeout 组成有界启动屏障；[`teleop/loop.py`](dexmani_real/teleop/loop.py)
   构造控制资源，并由
-  [`teleop/control_grid.py`](dexmani_real/teleop/control_grid.py) 完成单个 causal tick 的读取、
+  [`teleop/control_loop/grid.py`](dexmani_real/teleop/control_loop/grid.py) 完成单个 causal tick 的读取、
   proposal、校验、发布和采样。pause、VR/hand feedback 异常或录制终结进入 pause boundary；
   BEGIN 音频只是 best-effort 操作者反馈，恢复运动前必须等待 fresh causal feedback re-anchor，
   期间不发布命令。同步 home 是有意的控制静默区间，返回后由 loop 同时重锚控制 loop 和
@@ -115,12 +115,12 @@ RealSense / Quest-HTS / xArm7 / XHand
   camera sidecar、验证和有界 finalize。其轮询是非执行器的服务循环；周期性批量持久化允许
   超过单次轮询周期，健康性以 sample backlog、sequence 连续性和 writer 状态为准，而不是
   轮询相位。其中
-  [`recording/hdf5_writer.py`](dexmani_real/recording/hdf5_writer.py) 是单个
+  [`recording/storage/hdf5_writer.py`](dexmani_real/recording/storage/hdf5_writer.py) 是单个
   `data.h5` handle、dataset append 与 offset 的唯一 owner。两者都不拥有机器人命令或
   episode 的开始/停止决策。
 - 相机标定的纯 ArUco/hand-eye 计算、运动控制与 side-effect lifecycle 分别位于
   [`calibration/camera/solver.py`](dexmani_real/calibration/camera/solver.py)、
-  [`calibration/camera/control.py`](dexmani_real/calibration/camera/control.py) 与
+  [`calibration/camera/motion.py`](dexmani_real/calibration/camera/motion.py) 与
   [`calibration/camera/session.py`](dexmani_real/calibration/camera/session.py)。
 
 ## 环境
@@ -144,7 +144,7 @@ RealSense SDK、HTS hand-tracking SDK、Pinocchio、MPlib、NLopt、
 CLI override > YAML file > dexmani_real/config/defaults.py
 ```
 
-Real runtime 配置由 [`config/runtime.py`](dexmani_real/config/runtime.py) 唯一解析、校验、冻结并生成
+Real runtime 配置由 [`config/experiment.py`](dexmani_real/config/experiment.py) 唯一解析、校验、冻结并生成
 SHA-256；learned-policy 的 observation freshness、command progress、action validity 和 watchdog timing
 属于其 `policy` 段，模型 shape、modality、horizon 和 inference cadence 则来自 Policy public
 API 的 `PolicySpec`。sync/async 调度模式与 episode action-step 上限由 `run_policy.py` CLI 明确提供。
@@ -307,7 +307,7 @@ RGB-D、完整 raw 点云、canonical processed 点云、相机几何、外参�
 ### L515 RGB/Depth 时序限制
 
 暗场下 RGB 曾因 Auto-Exposure Priority=ON 把曝光拉到 ~60 ms 而降帧到 ~16.7 Hz。
-根因已确认并修复：`RealSenseConfig.auto_exposure_priority` 默认 `0.0`（OFF，Auto
+根因已确认并修复：`RealSenseCameraConfig.auto_exposure_priority` 默认 `0.0`（OFF，Auto
 Exposure 仍 ON），RGB 恢复 30 Hz，亮度由增益补偿、几乎不变（暗场噪声上升）。
 
 深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew）。processed v12 的点云将
@@ -338,8 +338,13 @@ python examples/process_episodes.py \
 `--profile` 选择 `joint`、`rgb`、`pointcloud` 或 `rgb_pc`。后两种 profile 可用
 `--pointcloud-num-points` 选择 `1024`、`2048`、`4096` 或 `8192`，默认 `1024`。
 
-运行时只接受带 manifest 的 raw v24。旧录制不属于当前数据契约，不能由 reader、处理器、
-回放或可视化器重解释；需要先在运行时外迁移或重新采集，才能进入训练链。
+普通读取、处理、回放和可视化只接受通过当前 raw v24 admission 的 episode：必需文件、schema、
+`data.h5` dataset layout、depth shape/dtype 和基本 semantic 都必须有效。writer 对新产物在 sidecar
+关闭后写入 manifest；普通 admission 不要求 manifest attrs、重算 sidecar hash 或完整解码 RGB。
+需要 artifact attestation 时显式使用 `EpisodeReader(path, verify_hash=True)`（或 `audit_integrity()`），
+才会校验 sidecar manifest、SHA-256 和完整 RGB frame count。
+旧录制不属于当前数据契约，不能由 reader、处理器、回放或可视化器重解释；需要先在运行时外迁移或
+重新采集，才能进入训练链。
 要生成 learned-policy 训练数据，在发布
 前先使用明确的 task identity 做 dry-run：
 
@@ -369,11 +374,6 @@ processed HDF5 v12，再运行 `python examples/visualize_episode_processed.py <
 会在读取或渲染 payload 前调用共享的 processed payload/provenance admission，再校验
 `(N,6)`、`float32`、xArm-base 坐标系、RGB 范围、算法/采样语义、配置哈希与桌面标定身份；
 `rgb`/`rgb_pc` 还要求 RGB 与 depth 的 `N/H/W` 完全一致。
-
-普通 `EpisodeReader(path)` 会验证 raw v24 的必需文件、schema、dataset layout 和基本语义，
-但不会重算大型 sidecar SHA-256 或完整解码视频。需要 artifact attestation 时使用
-`EpisodeReader(path, verify_hash=True)`（或已打开 reader 的 `audit_integrity()`）；该 explicit
-audit 会校验 sidecar manifest、SHA-256 和完整 RGB frame count。
 
 物理回放始终以当前 geometry 和 runtime 完整验证 live start、joint limits、recorded
 start→first target、workspace、collision 及全部相邻 transition。只有这一步成功后，记录的

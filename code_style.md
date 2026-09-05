@@ -82,16 +82,15 @@ entry point
 - `sensor/`：设备输入、点云和时钟映射。
 - `robot/`：硬件 driver、worker 与 SDK 边界。
 - `planning/`：FK、IK、collision 和 path 等纯计算优先的能力。
-- `teleop/`：操作者输入到 action proposal 的映射与采集决策。
+- `teleop/`：操作者输入到 action proposal 的映射与采集决策；`teleop/control_loop/` 收拢因果实时控制算法，`teleop/retargeting/` 收拢手部 retargeting backend。
 - `control/`：跨控制方式共用的 action contract、safety boundary、publication 与 homing。
 - `replay/`：物理回放的加载、调度、捕获、评估与 session。
 - `calibration/`：相机、桌面等标定算法与 side-effect lifecycle。
-- `deployment/`：模型 observation、inference、flat Prediction IPC 和调度。
-- `recording/`：raw episode schema、写入与读取。
-- `data/`：离线清洗和训练数据导出。
+- `deployment/`：模型 observation、inference、flat Prediction IPC 和调度；`deployment/inference/` 拥有模型 adapter 与 inference child。
+- `recording/`：raw episode transaction、schema、写入与读取；`recording/storage/` 拥有 persisted artifact 实现。
+- `dataset/`：离线清洗和训练数据导出。
 - `runtime/`：进程生命周期、supervisor 与结构化退出状态。
 - `ipc/`：跨进程 typed channels、wire schema、ring buffer 与 causal read。
-- `integrations/`：外部模型仓库适配器，满足 deployment 的三个 Protocol；依赖方向为 integrations → deployment。
 - `examples/`：薄入口和自包含的诊断/可视化/离线分析程序。
 
 不要轻易新增顶层包。新模块应先回答“它属于哪个现有领域”。
@@ -137,7 +136,7 @@ logger = get_logger(__name__)
 ```python
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    runtime = resolve_runtime_config(yaml_path=args.config)
+    runtime = resolve_experiment_config(yaml_path=args.config)
     return run_experiment(runtime)
 
 
@@ -239,7 +238,7 @@ elapsed time、deadline、heartbeat 和 freshness 使用 monotonic clock；wall 
 特别避免下面这种“验证实际上是修改”的写法：
 
 ```python
-def validate_action(action: RobotAction) -> bool:
+def validate_action(action: EpisodeAction) -> bool:
     action.arm_qpos_rad = np.clip(action.arm_qpos_rad, LOWER_RAD, UPPER_RAD)
     return True
 ```

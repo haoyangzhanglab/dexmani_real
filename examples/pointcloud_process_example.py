@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/pointcloud_process_example.py [--save-dir DIR]``.
 
-Self-contained L515 tabletop point-cloud and table-plane diagnostic. It uses
-the resolved table plane by default and enters deterministic multi-frame table
-calibration only after operator confirmation. A new fit is used immediately;
-publishing ``desk_plane.json`` requires separate confirmation and affects both
-perception cropping and table-aware collision geometry on the next runtime
-resolution. ``--save-dir`` atomically saves the aligned RGB-D source, raw and
-processed xArm-base clouds, and complete offline reconstruction metadata.
+Hardware- and GUI-affecting L515 tabletop point-cloud and table-plane diagnostic.
+It connects to RealSense and opens OpenCV/Open3D windows. It uses the resolved
+table plane by default and enters deterministic multi-frame table calibration
+only after operator confirmation. A new fit is used immediately; publishing
+``desk_plane.json`` requires separate confirmation and affects both perception
+cropping and table-aware collision geometry on the next runtime resolution.
+``--save-dir`` atomically saves the aligned RGB-D source, raw and processed
+xArm-base clouds, and complete offline reconstruction metadata.
 """
 
 from __future__ import annotations
@@ -32,10 +33,10 @@ import pyrealsense2 as rs
 from scipy.spatial.transform import Rotation as R
 
 from dexmani_real.calibration.table import fit_table_plane, publish_table_plane
-from dexmani_real.config.camera_calib import CameraCalib
+from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.config.runtime import ResolvedRuntimeConfig, resolve_runtime_config
-from dexmani_real.sensor.camera_geometry import RGBDGeometry
+from dexmani_real.config.experiment import ExperimentConfig, resolve_experiment_config
+from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
@@ -45,7 +46,11 @@ from dexmani_real.sensor.pointcloud import (
     build_point_cloud_with_stats,
     build_raw_point_cloud,
 )
-from dexmani_real.sensor.realsense import L515DepthConfig, RealSense, RealSenseConfig
+from dexmani_real.sensor.camera.realsense import (
+    L515DepthConfig,
+    RealSenseCamera,
+    RealSenseCameraConfig,
+)
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
 
 if TYPE_CHECKING:
@@ -376,15 +381,15 @@ def _print_build_stage_timings(prefix: str, values: dict[str, float]) -> None:
         print(f"    {field.removesuffix('_ms'):<24s} {values[field]:5.1f} ms")
 
 
-def _connect_camera(cfg: PointCloudDiagnosticConfig) -> RealSense:
+def _connect_camera(cfg: PointCloudDiagnosticConfig) -> RealSenseCamera:
     """Connect camera and return it.
 
     Connection time is deliberately not timed: it is a one-time hardware
     init (pipeline start + warmup frames), not a per-frame pipeline stage, and
     its multi-second duration would dominate the per-stage timing chart.
     """
-    camera = RealSense(
-        RealSenseConfig(
+    camera = RealSenseCamera(
+        RealSenseCameraConfig(
             depth_resolution=cfg.depth_resolution,
             color_resolution=cfg.rgb_resolution,
             fps=cfg.fps,
@@ -400,7 +405,7 @@ def _connect_camera(cfg: PointCloudDiagnosticConfig) -> RealSense:
     return camera
 
 
-def _print_device_info(camera: RealSense) -> dict:
+def _print_device_info(camera: RealSenseCamera) -> dict:
     """Print device info and read back sensor options.  Returns info dict with 'serial'."""
     info = camera.get_device_info()
     print("=" * 60)
@@ -437,7 +442,7 @@ def _print_device_info(camera: RealSense) -> dict:
 
 
 def _capture_frame(
-    camera: RealSense,
+    camera: RealSenseCamera,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """Capture one aligned frame and return RGB, raw/metric depth, and elapsed ms."""
     print("\nCapturing depth-to-color aligned RGBD frame...")
@@ -469,7 +474,7 @@ def _load_extrinsics(camera_info: dict) -> tuple[np.ndarray, float]:
     """Load T_xarm_base_from_color for aligned depth-to-color samples."""
     print("\nLoading extrinsics from cameras.json...")
     t0 = time.perf_counter()
-    calib = CameraCalib()
+    calib = CameraExtrinsics()
     cam_name = calib.resolve_name_by_serial(str(camera_info.get("serial", "")))
     base_from_color = np.asarray(calib.get_extrinsics(cam_name), dtype=np.float64)
 
@@ -487,7 +492,7 @@ def _load_extrinsics(camera_info: dict) -> tuple[np.ndarray, float]:
     return base_from_color, elapsed
 
 
-def _resolve_table_plane_path(runtime: ResolvedRuntimeConfig) -> Path:
+def _resolve_table_plane_path(runtime: ExperimentConfig) -> Path:
     """Resolve the shared table calibration path from runtime configuration."""
     table = runtime.environment.table
     if not table.enabled or table.plane_path is None:
@@ -500,7 +505,7 @@ def _resolve_table_plane_path(runtime: ResolvedRuntimeConfig) -> Path:
 
 def _calibrate_table(
     *,
-    camera: RealSense,
+    camera: RealSenseCamera,
     geometry: RGBDGeometry,
     T_xarm_base_from_color: np.ndarray,
     config: PointCloudConfig,
@@ -562,7 +567,7 @@ def _calibrate_table(
         backup = publish_table_plane(plane_path, fit, confirmed=True)
         if backup is not None:
             print(f"  Backup: {backup}")
-        resolved_plane = resolve_runtime_config().environment.table.plane_abcd
+        resolved_plane = resolve_experiment_config().environment.table.plane_abcd
         if not np.allclose(resolved_plane, fit.plane_abcd, rtol=0.0, atol=1e-12):
             raise RuntimeError("published plane failed runtime-config round-trip")
         print("  Published and runtime-config round-trip verified.")
@@ -656,7 +661,7 @@ def _build_cloud(
 
 def _benchmark_production_pipeline(
     *,
-    camera: RealSense,
+    camera: RealSenseCamera,
     geometry: RGBDGeometry,
     T_xarm_base_from_color: np.ndarray,
     config: PointCloudConfig,
@@ -831,7 +836,7 @@ def main(argv: list[str] | None = None) -> int:
     all_timings: dict[str, float] = {}
 
     # Resolve and validate file-backed policy before connecting to hardware.
-    runtime = resolve_runtime_config()
+    runtime = resolve_experiment_config()
     pcd_config = runtime.pointcloud
 
     camera = _connect_camera(cfg)
