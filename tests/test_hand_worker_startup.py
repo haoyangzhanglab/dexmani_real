@@ -82,7 +82,6 @@ class HandWorkerStartupTest(unittest.TestCase):
                 self.connect = Mock()
                 self.calibrate_tactile = Mock()
                 self.get_state = Mock(return_value=state)
-                self.reset_home = Mock()
                 self.send_action = Mock()
                 self.disconnect = Mock()
                 self.is_connected = True
@@ -107,7 +106,6 @@ class HandWorkerStartupTest(unittest.TestCase):
         hand.connect.assert_called_once_with()
         hand.calibrate_tactile.assert_called_once_with()
         hand.get_state.assert_called_once_with()
-        hand.reset_home.assert_not_called()
         hand.send_action.assert_not_called()
         hand.disconnect.assert_called_once_with()
         shared.set_ready.assert_called_once_with("hand")
@@ -708,7 +706,7 @@ class CandidatePublicationTest(unittest.TestCase):
 
         prepared = self._prepare_policy_hand(raw, measured)
         self.assertFalse(prepared.accepted)
-        self.assertIn("operational joint limits", prepared.reason)
+        self.assertEqual(prepared.gate_code, publication.GateRejectCode.HAND_JOINT_LIMIT)
 
     def test_policy_raw_hand_target_slightly_beyond_tolerance_is_rejected(
         self,
@@ -720,7 +718,7 @@ class CandidatePublicationTest(unittest.TestCase):
         prepared = self._prepare_policy_hand(raw, lower)
 
         self.assertFalse(prepared.accepted)
-        self.assertIn("operational joint limits", prepared.reason)
+        self.assertEqual(prepared.gate_code, publication.GateRejectCode.HAND_JOINT_LIMIT)
 
     def test_policy_float32_endpoint_roundoff_is_canonicalized_exactly(self) -> None:
         lower = np.asarray(hand_defaults.qpos_min_rad, dtype=np.float64)

@@ -511,11 +511,6 @@ class XHand:
             return XHandSendStatus.REJECTED
         return XHandSendStatus.ACCEPTED
 
-    def reset_home(self) -> XHandSendStatus:
-        """Send the configured home endpoint once after device initialization."""
-        home_qpos_rad = np.deg2rad(np.asarray(self.cfg.home_qpos_deg, dtype=np.float64))
-        return self.send_action(home_qpos_rad)
-
     def _make_command(self, qpos: np.ndarray) -> Any:
         command = xhc.HandCommand_t()
         for index in range(HAND_DOF):

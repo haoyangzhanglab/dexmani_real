@@ -128,18 +128,6 @@ def limit_hand_target_delta(
     return measured + np.clip(target - measured, -max_delta, max_delta)
 
 
-def hand_target_within_operational_bounds(
-    target_qpos: np.ndarray,
-    operational_lower: np.ndarray,
-    operational_upper: np.ndarray,
-) -> bool:
-    """Return whether one already-canonical hand target is operationally valid."""
-    return bool(
-        np.all(target_qpos >= operational_lower)
-        and np.all(target_qpos <= operational_upper)
-    )
-
-
 def canonicalize_policy_hand_endpoint_roundoff(
     hand_cmd: object,
     operational_lower: object,

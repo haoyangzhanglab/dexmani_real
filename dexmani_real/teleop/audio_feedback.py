@@ -77,17 +77,6 @@ class AudioFeedback:
         )
         self._worker.start()
 
-    @property
-    def is_playing(self) -> bool:
-        """True if a voice prompt is currently playing or queued."""
-        with self._condition:
-            return self._active_request is not None or bool(self._pending)
-
-    @property
-    def worker_alive(self) -> bool:
-        """Whether the serialization worker is alive."""
-        return self._worker.is_alive()
-
     def _ensure_worker_locked(self) -> None:
         """Restart an unexpectedly terminated worker while holding the condition."""
         if self._worker.is_alive() or self._closed:

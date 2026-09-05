@@ -239,13 +239,3 @@ class ArmWristMapper:
             )
             return clipped
         return delta_rot
-
-    def continuous_quat(self, quat_wxyz: np.ndarray) -> np.ndarray:
-        quat_wxyz = normalize_quat_wxyz(quat_wxyz)
-        if (
-            self.last_quat_wxyz is not None
-            and np.dot(quat_wxyz, self.last_quat_wxyz) < 0
-        ):
-            quat_wxyz = -quat_wxyz
-        self.last_quat_wxyz = quat_wxyz.copy()
-        return quat_wxyz

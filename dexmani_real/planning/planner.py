@@ -68,7 +68,6 @@ class XArm7MotionPlanner:
         hand_dof: bool = True,
         static_boxes: Iterable[Any] = (),
         table: Any | None = None,
-        allow_unset_hand_qpos: bool = False,
     ) -> None:
         import mplib
 
@@ -150,7 +149,6 @@ class XArm7MotionPlanner:
             hand_dof=hand_dof,
             static_boxes=static_boxes,
             table=table,
-            allow_unset_hand_qpos=allow_unset_hand_qpos,
         )
         self.ik_mgr = IKCandidateManager(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))

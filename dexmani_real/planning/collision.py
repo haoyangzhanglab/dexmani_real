@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import hand
 from dexmani_real.robot_spec import (
     ARM_JOINT_SHAPE,
     HAND_DOF,
@@ -43,9 +42,6 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# Open-hand home posture is available only for explicitly opted-in offline use.
-_HAND_HOME_QPOS: np.ndarray = np.deg2rad(np.asarray(hand.home_qpos_deg, dtype=np.float64))
-_warn_hand_qpos_unset = ThrottledWarner(interval_s=30.0)  # warn every 30s if hand_qpos never set
 _collision_detail_warn = ThrottledWarner(interval_s=60.0)
 
 _COLLISION_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)  # 7-DOF (hand fixed)
@@ -56,7 +52,6 @@ _HAND_DOF_COUNT = HAND_DOF
 
 # Hand order mapping is defined in robot_spec and shared with kinematics.
 _HAND_USER_TO_URDF = HAND_SDK_TO_URDF_IDX
-_HAND_HOME_QPOS_URDF: np.ndarray = _HAND_HOME_QPOS[list(_HAND_USER_TO_URDF)]
 
 
 class CollisionModel:
@@ -90,13 +85,11 @@ class CollisionModel:
         package_dir: str | None = None,
         static_boxes: Iterable[Any] = (),
         table: Any | None = None,
-        allow_unset_hand_qpos: bool = False,
     ) -> None:
         import pinocchio as pin
 
         self._pin = pin
         self._hand_dof = hand_dof
-        self._allow_unset_hand_qpos = bool(allow_unset_hand_qpos)
 
         pkg = package_dir or str(XHAND_MODEL_DIR)
         _urdf = urdf_path or (_FULL_URDF if hand_dof else _COLLISION_URDF)
@@ -328,15 +321,10 @@ class CollisionModel:
             raise ValueError("qpos contains NaN or Inf — collision FK requires finite values")
         if self._hand_dof and qpos.shape == ARM_JOINT_SHAPE:
             if self._hand_qpos is None:
-                if not self._allow_unset_hand_qpos:
-                    raise RuntimeError(
-                        "hand_qpos is required for 19-DOF collision checks; "
-                        "call set_hand_qpos() before checking an arm-only qpos"
-                    )
-                _warn_hand_qpos_unset(
-                    "hand_qpos not set; explicit offline fallback uses home position"
+                raise RuntimeError(
+                    "hand_qpos is required for 19-DOF collision checks; "
+                    "call set_hand_qpos() before checking an arm-only qpos"
                 )
-                return np.concatenate([qpos, _HAND_HOME_QPOS_URDF])
             return np.concatenate([qpos, self._hand_qpos])
         if qpos.shape != self._expected_qpos_shape:
             raise ValueError(

@@ -40,7 +40,7 @@ from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.robot.hand_worker import hand_loop
-from dexmani_real.runtime.safety import SafetyState, require_transition, transition
+from dexmani_real.runtime.safety import SafetyState, require_transition
 from dexmani_real.runtime.supervisor import (
     run_supervisor,
     shutdown_processes,

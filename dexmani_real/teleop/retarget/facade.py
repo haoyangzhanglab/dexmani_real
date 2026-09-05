@@ -20,9 +20,6 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-_palm_fallback_warn = None  # lazy ThrottledWarner — initialized on first fallback
-
-
 class _TAGRuntimeOverrides:
     """Private policy-to-TAG wiring that leaves the public constructor stable."""
 

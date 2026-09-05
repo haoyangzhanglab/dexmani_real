@@ -14,7 +14,6 @@
 | `repo_map.md` | 当前运行拓扑、核心数据流与边界索引。 |
 | `.codex/config.toml` | 项目级 Codex 权限、联网与子智能体并发配置。 |
 | `.codex/agents/*.toml` | 项目级难度分档子智能体：`sol-high`、`terra-xhigh`、`luna-max`。 |
-| `.agents/skills/dexmani-refactor/SKILL.md` | 删简重构的分阶段执行、验收、压缩与续跑工作流。 |
 
 ## Process topology
 

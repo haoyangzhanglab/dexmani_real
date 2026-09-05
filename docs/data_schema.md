@@ -28,7 +28,7 @@ episodes/<task>/episode_*          raw v24 directory
 episodes_processed/<task>/*.h5     processed v11, one file per raw episode
                 │ export_policy_zarr.py
                 ▼
-dataset/<task>.zarr                Policy Zarr v5, one profile per store
+datasets/<task>.zarr               Policy Zarr v5, one profile per store
 ```
 
 - `N` 是单个 raw 或 processed episode 的帧数；`T` 是 Zarr 中全部 episode 的总帧数；

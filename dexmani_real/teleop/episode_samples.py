@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Mapping
+from typing import Mapping
 
 import numpy as np
 

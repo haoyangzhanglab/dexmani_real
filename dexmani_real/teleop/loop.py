@@ -233,13 +233,13 @@ def _try_load_hand_kinematics(
     return hand_fk
 
 
-def teleop_loop(shared: RuntimeChannels, config: TeleopConfig | None = None) -> None:
+def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
     """Teleoperation process entry point used by ``collect_teleop.py``.
 
     Reads from rings (vr, arm_state, hand_state, camera), writes actions
     to the coherent actuator command ring, owns recording.
     """
-    cfg = config or TeleopConfig()
+    cfg = config
     logger.debug("teleop_loop: LOADING")
     command_limits = TeleopCommandLimits.from_config(cfg)
     recording_enabled = bool(cfg.runtime.policy.recording_enabled)

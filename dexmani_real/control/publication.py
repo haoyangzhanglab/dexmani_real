@@ -35,7 +35,6 @@ from dexmani_real.utils.feedback import (
 )
 from dexmani_real.utils.limits import (
     canonicalize_policy_hand_endpoint_roundoff,
-    hand_target_within_operational_bounds,
 )
 from dexmani_real.utils.limits import (
     validate_hand_command_bounds as _validate_hand_bounds,
@@ -338,15 +337,6 @@ def prepare_command(
             return PreparedCommand(reason=str(exc))
         if hand_roundoff_canonicalized:
             candidate = replace(candidate, hand_qpos=hand_qpos)
-        if not hand_target_within_operational_bounds(
-            candidate.hand_qpos,
-            gate.hand_low,
-            gate.hand_high,
-        ):
-            return PreparedCommand(
-                reason="hand policy endpoint violates operational joint limits",
-                hand_roundoff_canonicalized=hand_roundoff_canonicalized,
-            )
 
     gate_result = gate.validate(
         candidate,

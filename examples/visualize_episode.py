@@ -37,7 +37,6 @@ import rerun.blueprint as rrb
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.data.raw_pointcloud import (
-    RawEpisodeCameraModel,
     RawEpisodePointCloudDeriver,
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,

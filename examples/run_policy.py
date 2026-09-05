@@ -23,21 +23,6 @@ class _ArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> NoReturn:
         self.exit(2, f"{self.prog}: error: [CLI] {message}\n")
 
-    def parse_args(
-        self, args: list[str] | None = None, namespace: argparse.Namespace | None = None
-    ) -> argparse.Namespace:
-        parsed = super().parse_args(args, namespace)
-        _apply_command_defaults(parsed)
-        return parsed
-
-
-_LIFECYCLE_OPTION_FLAGS = {
-    "runtime_config": "--runtime-config",
-    "inference_mode": "--inference-mode",
-    "max_action_steps": "--max-action-steps",
-}
-
-
 @dataclass(frozen=True)
 class _LifecycleInputs:
     """Resolved inputs for one validate-only or physical lifecycle."""
@@ -59,52 +44,41 @@ def _positive_action_steps(raw: str) -> int:
     return value
 
 
-def _add_device_option(parser: argparse.ArgumentParser, *, default: object) -> None:
+def _add_device_option(parser: argparse.ArgumentParser) -> None:
     """Add the inference-device option for a model-consuming command."""
     parser.add_argument(
         "--device",
-        default=default,
+        default="cuda:0",
         help="Policy inference device for check, shadow, or run (default: cuda:0)",
     )
 
 
-def _add_lifecycle_options(parser: argparse.ArgumentParser, *, default: object) -> None:
+def _add_lifecycle_options(parser: argparse.ArgumentParser) -> None:
     """Add options consumed only by a Real deployment lifecycle."""
     parser.add_argument(
         "--runtime-config",
         dest="runtime_config",
-        default=default,
+        default=None,
         help="optional Real runtime YAML for shadow/run",
     )
     parser.add_argument(
         "--inference-mode",
         choices=("sync", "async"),
-        default=default,
+        default="sync",
         help="inference scheduling mode (default: sync)",
     )
     parser.add_argument(
         "--max-action-steps",
         type=_positive_action_steps,
-        default=default,
+        default=None,
         help="episode action-step limit (default: unlimited)",
     )
-
-
-def _add_precommand_options(parser: argparse.ArgumentParser) -> None:
-    """Accept model/lifecycle options before their owning subcommand.
-
-    ``SUPPRESS`` preserves an explicitly pre-command value against the
-    subparser and lets ``main`` reject an option not owned by ``list/check``.
-    """
-    _add_device_option(parser, default=argparse.SUPPRESS)
-    _add_lifecycle_options(parser, default=argparse.SUPPRESS)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(
         description="Inspect, check, shadow, or run one DexMani Policy experiment"
     )
-    _add_precommand_options(parser)
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     list_parser = subcommands.add_parser(
@@ -121,7 +95,7 @@ def _parser() -> argparse.ArgumentParser:
         "check", help="strictly restore and smoke-test one Policy experiment"
     )
     check_parser.add_argument("experiment", metavar="EXPERIMENT")
-    _add_device_option(check_parser, default=argparse.SUPPRESS)
+    _add_device_option(check_parser)
 
     for command, help_text in (
         ("shadow", "run with full validation and no actuator publication"),
@@ -129,8 +103,8 @@ def _parser() -> argparse.ArgumentParser:
     ):
         command_parser = subcommands.add_parser(command, help=help_text)
         command_parser.add_argument("experiment", metavar="EXPERIMENT")
-        _add_device_option(command_parser, default=argparse.SUPPRESS)
-        _add_lifecycle_options(command_parser, default=argparse.SUPPRESS)
+        _add_device_option(command_parser)
+        _add_lifecycle_options(command_parser)
     return parser
 
 
@@ -334,42 +308,9 @@ def _run_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _validate_command_options(
-    parser: argparse.ArgumentParser, args: argparse.Namespace
-) -> None:
-    """Reject pre-command options that no selected command consumes."""
-    if args.command == "list":
-        invalid_destinations = ("device", *_LIFECYCLE_OPTION_FLAGS)
-    elif args.command == "check":
-        invalid_destinations = tuple(_LIFECYCLE_OPTION_FLAGS)
-    else:
-        return
-    supplied = [
-        _LIFECYCLE_OPTION_FLAGS.get(destination, "--device")
-        for destination in invalid_destinations
-        if hasattr(args, destination)
-    ]
-    if supplied:
-        parser.error(f"{args.command} does not accept {', '.join(supplied)}")
-
-
-def _apply_command_defaults(args: argparse.Namespace) -> None:
-    """Fill defaults only after explicit options from both parser levels survive."""
-    if args.command == "list":
-        return
-    if not hasattr(args, "device"):
-        args.device = "cuda:0"
-    if args.command in {"shadow", "run"}:
-        for destination in _LIFECYCLE_OPTION_FLAGS:
-            if not hasattr(args, destination):
-                default = "sync" if destination == "inference_mode" else None
-                setattr(args, destination, default)
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    _validate_command_options(parser, args)
     handlers: dict[str, Callable[[argparse.Namespace], int]] = {
         "list": _run_list,
         "check": _run_check,

@@ -11,11 +11,13 @@ import h5py
 import numpy as np
 
 from dexmani_real.config.runtime import ResolvedRuntimeConfig
-from dexmani_real.ipc.schema import ARM_EE_SHAPE, ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.planning import Pose, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.recording.reader import EpisodeReader
 from dexmani_real.robot_spec import (
+    ARM_EE_SHAPE,
+    ARM_JOINT_SHAPE,
+    HAND_JOINT_SHAPE,
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_RIGHT_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,

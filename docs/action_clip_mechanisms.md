@@ -209,4 +209,5 @@ Replay:
                        → replay/SafetyGate/worker preflight → SDK
 ```
 
-本文只做源码和配置审计，没有连接真实硬件、发送机器人动作或执行 physical replay。
+本文描述源码与配置语义，不能替代真机回归。learned-policy 的真机验证状态见
+[`policy_deployment.md`](policy_deployment.md)；physical replay 仍须按其 preflight 单独验证。

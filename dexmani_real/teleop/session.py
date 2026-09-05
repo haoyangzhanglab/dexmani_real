@@ -29,7 +29,7 @@ from dexmani_real.robot_spec import (
     XARM7_XHAND_SRDF_PATH,
     XHAND_RIGHT_URDF_PATH,
 )
-from dexmani_real.runtime.safety import SafetyState, require_transition, transition
+from dexmani_real.runtime.safety import SafetyState, require_transition
 from dexmani_real.runtime.supervisor import (
     print_health_summary,
     run_supervisor,

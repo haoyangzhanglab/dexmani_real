@@ -19,7 +19,6 @@ import numpy as np
 from dexmani_real.config.defaults import HandParams
 from dexmani_real.ipc.schema import (
     HAND_CONTACT_SHAPE,
-    HAND_JOINT_SHAPE,
     HAND_STATE_DTYPE,
     HAND_TACTILE_DTYPE,
     HAND_TACTILE_FORCE_SHAPE,

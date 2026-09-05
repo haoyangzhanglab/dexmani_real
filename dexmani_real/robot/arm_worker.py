@@ -1,6 +1,6 @@
 """Arm worker — Mode 6 joint online trajectory planning for xArm7.
 
-``arm_loop(shared)`` is the mp.Process entry point (RuntimeChannels only). It
+``arm_loop(shared, config)`` is the mp.Process entry point (RuntimeChannels only). It
 connects and enters servo Mode 6 once at startup, then runs a fixed-rate
 loop: consume at most one command (HOME or servo), observe, publish.
 
@@ -28,7 +28,7 @@ import numpy as np
 
 from dexmani_real.config.defaults import ArmParams
 from dexmani_real.ipc.channels import new_frame
-from dexmani_real.ipc.schema import ARM_STATE_DTYPE, COUPLED_COMMAND_DTYPE
+from dexmani_real.ipc.schema import ARM_STATE_DTYPE
 from dexmani_real.robot.command_validation import check_worker_arm_target
 from dexmani_real.robot.xarm7 import HomeAborted, XArm7, describe_controller_error
 from dexmani_real.runtime.safety import (
@@ -415,7 +415,7 @@ def _observe_and_publish(st: _LoopState, shared: Any) -> bool:
     return False
 
 
-def arm_loop(shared, config: ArmParams | None = None) -> None:
+def arm_loop(shared: Any, config: ArmParams) -> None:
     """Arm process entry point — applies coupled servo endpoints via Mode 6.
 
     mp.Process target communicating exclusively through RuntimeChannels.  The
@@ -423,7 +423,7 @@ def arm_loop(shared, config: ArmParams | None = None) -> None:
     top-level handler below, which latches ``error_state``; cleanup always
     does a best-effort stop + disconnect.
     """
-    cfg = config if config is not None else ArmParams()
+    cfg = config
     arm = XArm7(cfg)
     st: _LoopState | None = None
     try:

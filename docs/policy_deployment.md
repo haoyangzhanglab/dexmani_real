@@ -44,8 +44,7 @@ python examples/run_policy.py check <experiment> --device cuda:0
 
 `--device` 只属于 `check`、`shadow` 和 `run`。`--runtime-config`、
 `--inference-mode` 与 `--max-action-steps` 只属于
-`shadow/run`，不会被 `list/check` 静默接受。为兼容 shell wrapper，这些参数可置于其所属
-`check/shadow/run` 子命令之前或之后。
+`shadow/run`，不会被 `list/check` 静默接受。选项必须跟在其所属子命令之后，不能置于子命令前。
 
 以下两个命令都会进入真实设备 lifecycle：
 
@@ -165,5 +164,10 @@ fail closed 处理。
 兼容、因果 observation、generation 隔离、SafetyGate、command-progress/watchdog、重复 episode 和 diagnostics。
 离线测试不等于真机验证。
 
-在记录过实际结果前，仍应视为未验证：目标 GPU 时延、真实相机到点云时延、shadow startup
-零运动/零命令、单次低风险物理 episode、同进程多 episode，以及真实 S/Q/ESC 行为。
+截至 2026-09-05，集中真机回归已完成：CUDA `check`、连接设备的 `shadow`（无执行器发布）、
+低风险 `run` 的 H→B→S、同进程重复 H→B→S、RUNNING 中 S，以及 RUNNING 中 ESC/e-stop。各次
+结束后 arm/hand worker 均已干净退出，没有遗留 actuator command。
+
+尚未覆盖的边界包括：人为注入超过 policy hand jump 阈值的模型动作、SDK CRC/拒绝、持续 sensor
+失效、接触导致的 measured-feedback lag，以及真实相机/point-cloud 的端到端时延测量。这些需要在
+受控实验条件下单独验证，不能由上述常规回归替代。

@@ -70,22 +70,19 @@ class RunPolicyParserTest(unittest.TestCase):
                 ["check", "dp3/pick/seed0", "--runtime-config", "real.yaml"]
             )
 
-    def test_lifecycle_options_work_before_and_after_subcommand(self) -> None:
+    def test_lifecycle_options_require_their_owning_subcommand(self) -> None:
         cli = _load_cli_module()
         parser = cli._parser()
 
-        before = parser.parse_args(
-            [
-                "--inference-mode",
-                "async",
-                "--max-action-steps",
-                "12",
-                "run",
-                "dp3/pick/seed0",
-            ]
-        )
-        self.assertEqual(before.inference_mode, "async")
-        self.assertEqual(before.max_action_steps, 12)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "--inference-mode",
+                    "async",
+                    "run",
+                    "dp3/pick/seed0",
+                ]
+            )
 
         after = parser.parse_args(
             [
@@ -102,31 +99,6 @@ class RunPolicyParserTest(unittest.TestCase):
         self.assertEqual(after.inference_mode, "sync")
         self.assertEqual(after.max_action_steps, 3)
         self.assertEqual(after.runtime_config, "runtime-overrides.yaml")
-
-    def test_precommand_options_are_rejected_when_unowned(self) -> None:
-        cli = _load_cli_module()
-        stderr = io.StringIO()
-        with (
-            contextlib.redirect_stderr(stderr),
-            self.assertRaises(SystemExit) as raised,
-        ):
-            cli.main(["--inference-mode", "async", "check", "dp3/pick/seed0"])
-
-        self.assertEqual(raised.exception.code, 2)
-        self.assertIn(
-            "[CLI] check does not accept --inference-mode", stderr.getvalue()
-        )
-
-        stderr = io.StringIO()
-        with (
-            contextlib.redirect_stderr(stderr),
-            self.assertRaises(SystemExit) as raised,
-        ):
-            cli.main(["--device", "cpu", "list"])
-
-        self.assertEqual(raised.exception.code, 2)
-        self.assertIn("[CLI] list does not accept --device", stderr.getvalue())
-
 
 class RunPolicyCommandTest(unittest.TestCase):
     def setUp(self) -> None:
