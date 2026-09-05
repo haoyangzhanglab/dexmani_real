@@ -145,16 +145,9 @@ def _revoke_motion_locked(
     return current, generation
 
 
-def _clear_coupled_command_locked(shared: Any) -> None:
-    """Clear the active coupled-command ticket under ``motion_lock``."""
-    shared.active_coupled_command_sequence.value = 0
-
-
 def _invalidate_coupled_commands_locked(shared: Any) -> int:
-    """Advance the generation and clear the active ticket under ``motion_lock``."""
-    generation = _advance_run_generation_locked(shared)
-    _clear_coupled_command_locked(shared)
-    return generation
+    """Advance the generation to invalidate every prior coupled command."""
+    return _advance_run_generation_locked(shared)
 
 
 def invalidate_coupled_commands(shared: Any) -> int:
@@ -213,9 +206,9 @@ def publish_coupled_command_if_motion_permitted(
 ) -> tuple[CoupledCommandTicket | None, str]:
     """Publish one frame or return its exact locked rejection reason.
 
-    The ring sequence is recorded under the same lock as the motion permit and
-    active sequence. A newer publication atomically supersedes the prior
-    ticket, so delayed workers cannot execute an overwritten frame.
+    The ring sequence is recorded under the same lock as the motion permit.
+    A newer publication atomically supersedes the prior ticket, so delayed
+    workers cannot execute an overwritten frame.
     """
     if (
         isinstance(minimum_delivery_window_ns, bool)
@@ -267,7 +260,6 @@ def publish_coupled_command_if_motion_permitted(
         if sequence <= 0:
             raise RuntimeError("coupled command ring returned an invalid sequence")
         published_monotonic_ns = time.monotonic_ns()
-        shared.active_coupled_command_sequence.value = sequence
         return (
             CoupledCommandTicket(
                 run_generation=permit.run_generation,
@@ -288,8 +280,7 @@ def _ticket_is_current_locked(
     return bool(
         permit.allows_motion
         and permit.run_generation == int(ticket.run_generation)
-        and int(shared.active_coupled_command_sequence.value)
-        == int(ticket.ring_sequence)
+        and int(shared.coupled_cmd_ring.latest_sequence) == int(ticket.ring_sequence)
     )
 
 

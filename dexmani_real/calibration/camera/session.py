@@ -714,34 +714,38 @@ def run_camera_calibration(
         config=RuntimeChannelsConfig.from_runtime(runtime),
         mp_context=ctx,
     )
-    specs = [
-        WorkerSpec(
-            "arm-calib",
-            arm_loop,
-            (shared, runtime.arm),
-            ready_name="arm",
-        )
-    ]
-    processes = build_processes(ctx, specs)
-    start_processes(processes)
-    arm_process = processes[0]
-    arm_timeout_s = float(runtime.safety.readiness_timeouts_s["arm"])
-    if not wait_subsystem_ready(shared, [("arm", arm_timeout_s)], processes):
-        set_calibration_fault(shared, "arm worker did not become ready")
-        shutdown_processes(shared, processes)
-        return 1
-
-    initial_state = read_initial_arm(shared, runtime)
-    if initial_state is None:
-        set_calibration_fault(shared, "initial arm feedback is unavailable or unhealthy")
-        shutdown_processes(shared, processes)
-        return 1
-
-    require_transition(shared, SafetyState.ARMED)
-    print(f"  arm worker ready (Mode 6, {runtime.arm.loop_hz}Hz)")
-
+    processes: list[Any] = []
     exit_code = 1
     try:
+        specs = [
+            WorkerSpec(
+                "arm-calib",
+                arm_loop,
+                (shared, runtime.arm),
+                ready_name="arm",
+            )
+        ]
+        processes = build_processes(ctx, specs)
+        start_processes(processes)
+        arm_process = processes[0]
+        if not wait_subsystem_ready(
+            shared,
+            list(zip(specs, processes)),
+            runtime.safety.readiness_timeouts_s,
+        ):
+            set_calibration_fault(shared, "arm worker did not become ready")
+            return 1
+
+        initial_state = read_initial_arm(shared, runtime)
+        if initial_state is None:
+            set_calibration_fault(
+                shared, "initial arm feedback is unavailable or unhealthy"
+            )
+            return 1
+
+        require_transition(shared, SafetyState.ARMED)
+        print(f"  arm worker ready (Mode 6, {runtime.arm.loop_hz}Hz)")
+
         exit_code = _run_calibration(
             shared,
             runtime,
@@ -790,10 +794,10 @@ def run_camera_calibration(
         else:
             try:
                 if not shared.close():
-                    set_calibration_fault(shared, "RuntimeChannels cleanup was incomplete")
+                    logger.error("RuntimeChannels cleanup was incomplete")
                     exit_code = 1
             except Exception:
-                set_calibration_fault(shared, "RuntimeChannels cleanup failed")
+                logger.error("RuntimeChannels cleanup failed", exc_info=True)
                 exit_code = 1
 
     print(f"  calibration session exit code: {exit_code}")

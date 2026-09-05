@@ -291,7 +291,7 @@ def _build_processes(
         operator=operator,
         hand_urdf_path=str(XHAND_RIGHT_URDF_PATH),
     )
-    # Readiness order drives process startup and heartbeat names.
+    # Worker specs are the single source of process and readiness names.
     specs = [
         WorkerSpec(
             "arm",
@@ -347,7 +347,16 @@ def _build_processes(
         )
     if hand_enabled:
         specs.append(
-            WorkerSpec("hand", _hand_loop, (shared, runtime.hand), ready_name="hand")
+            WorkerSpec(
+                "hand",
+                _hand_loop,
+                (
+                    shared,
+                    runtime.hand,
+                    float(runtime.policy.hand_disconnect_timeout_s),
+                ),
+                ready_name="hand",
+            )
         )
     return specs
 
@@ -429,6 +438,7 @@ def run_teleop_experiment(
     )
     specs: list[WorkerSpec] = []
     procs: list[Any] = []
+    started_procs: list[Any] = []
     shutdown_report: ShutdownReport | None = None
     shared_closed = False
     try:
@@ -444,50 +454,82 @@ def run_teleop_experiment(
         )
         procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)
-        start_processes(procs)
-
         timeouts = runtime.safety.readiness_timeouts_s
-        ready_checks = [
-            (spec.ready_name, float(timeouts[spec.ready_name]))
-            for spec in specs
-            if spec.ready_name
+        spec_processes = list(zip(specs, procs))
+        dependency_pairs = [
+            pair
+            for pair in spec_processes
+            if pair[0].ready_name not in {"policy", "vr"}
         ]
+        policy_pairs = [
+            pair for pair in spec_processes if pair[0].ready_name == "policy"
+        ]
+        vr_pairs = [pair for pair in spec_processes if pair[0].ready_name == "vr"]
 
-        # Independent workers must be ready before policy.  VR stays last so
-        # its full timeout begins only after the operator sees the prompt.
-        worker_checks = [rc for rc in ready_checks if rc[0] not in {"policy", "vr"}]
-        policy_checks = [rc for rc in ready_checks if rc[0] == "policy"]
-        pre_vr_checks = worker_checks + policy_checks
-        vr_checks = [rc for rc in ready_checks if rc[0] == "vr"]
-
-        if not wait_subsystem_ready(shared, pre_vr_checks, procs):
+        dependency_procs = [process for _spec, process in dependency_pairs]
+        start_processes(dependency_procs)
+        started_procs.extend(dependency_procs)
+        if not wait_subsystem_ready(
+            shared,
+            dependency_pairs,
+            timeouts,
+            monitored_processes=started_procs,
+        ):
             shared.error_state.value = True
             require_transition(shared, SafetyState.FAULT)
             shutdown_report = shutdown_processes(
                 shared,
-                procs,
+                started_procs,
                 graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
             )
             shared_closed = shutdown_report.shared_closed
             return 1
 
-        for name, _timeout in pre_vr_checks:
-            print(f"  {name}: ready", flush=True)
+        for spec, _process in dependency_pairs:
+            print(f"  {spec.ready_name}: ready", flush=True)
 
-        if vr_checks:
-            _, vr_timeout = vr_checks[0]
+        policy_procs = [process for _spec, process in policy_pairs]
+        start_processes(policy_procs)
+        started_procs.extend(policy_procs)
+        if not wait_subsystem_ready(
+            shared,
+            policy_pairs,
+            timeouts,
+            monitored_processes=started_procs,
+        ):
+            shared.error_state.value = True
+            require_transition(shared, SafetyState.FAULT)
+            shutdown_report = shutdown_processes(
+                shared,
+                started_procs,
+                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+            )
+            shared_closed = shutdown_report.shared_closed
+            return 1
+        print("  policy: ready", flush=True)
+
+        if vr_pairs:
+            vr_procs = [process for _spec, process in vr_pairs]
+            start_processes(vr_procs)
+            started_procs.extend(vr_procs)
+            vr_timeout = float(timeouts["vr"])
             print(
                 f"\n  Non-VR subsystems ready — waiting for VR tracking "
                 f"(up to {vr_timeout}s) — "
                 f"put on Quest headset...",
                 flush=True,
             )
-            if not wait_subsystem_ready(shared, vr_checks, procs):
+            if not wait_subsystem_ready(
+                shared,
+                vr_pairs,
+                timeouts,
+                monitored_processes=started_procs,
+            ):
                 shared.error_state.value = True
                 require_transition(shared, SafetyState.FAULT)
                 shutdown_report = shutdown_processes(
                     shared,
-                    procs,
+                    started_procs,
                     graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
                 )
                 shared_closed = shutdown_report.shared_closed
@@ -522,16 +564,19 @@ def run_teleop_experiment(
             f"Controls: B={begin_label}  C=pause  S=stop  D=discard  H=home  Q=quit  ESC=estop\n"
         )
 
-        process_names = [spec.name for spec in specs]
-        heartbeat_names = process_names
+        # VR heartbeat advances with source events, so its freshness remains a
+        # teleop-loop concern rather than a supervisor liveness signal.
+        heartbeat_timeouts = {
+            process.name: float(runtime.safety.heartbeat_timeouts[process.name])
+            for process in started_procs
+            if process.name != "vr"
+        }
 
         start_time = time.monotonic()
         exit_reason, normal_exit = run_supervisor(
             shared,
-            procs,
-            process_names,
-            heartbeat_names,
-            heartbeat_timeouts_s=dict(runtime.safety.heartbeat_timeouts),
+            started_procs,
+            heartbeat_timeouts_s=heartbeat_timeouts,
             supervisor_hz=float(runtime.safety.supervisor_hz),
         )
 
@@ -540,7 +585,7 @@ def run_teleop_experiment(
         )
         shutdown_report = shutdown_processes(
             shared,
-            procs,
+            started_procs,
             graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
             disarm_if_clean=normal_exit,
         )
@@ -604,10 +649,6 @@ def run_teleop_experiment(
                 try:
                     shared_closed = bool(shared.close())
                     if not shared_closed:
-                        shared.error_state.value = True
-                        transition(shared, SafetyState.FAULT)
                         logger.error("RuntimeChannels cleanup was incomplete")
                 except Exception:
                     logger.warning("RuntimeChannels cleanup failed", exc_info=True)
-                    shared.error_state.value = True
-                    transition(shared, SafetyState.FAULT)

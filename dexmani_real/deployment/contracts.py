@@ -71,8 +71,8 @@ class PolicyRuntime(Protocol):
     """Model boundary owned by the inference process.
 
     ``predict`` returns exactly one finite, flat ``float64[N,D]`` array. The
-    adapter validates the Policy API result against its ``PolicySpec`` before
-    the inference worker adds runtime provenance and publishes it.
+    Policy runtime owns its tensor contract before the inference worker adds
+    runtime provenance and publishes it.
     """
 
     def warmup(self, *, samples: int) -> tuple[float, ...]: ...

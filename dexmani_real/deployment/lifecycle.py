@@ -31,7 +31,6 @@ from dexmani_real.deployment.config import (
     FingertipAssemblerConfig,
     PolicyDeploymentConfig,
     PolicyWorkerConfig,
-    policy_observation_fields,
     validate_max_running_s,
     validate_policy_runtime_compatibility,
 )
@@ -65,7 +64,7 @@ _OBSERVATION_READ_MARGIN = 2
 
 
 def _observation_field_names(policy_spec: Any) -> tuple[str, ...]:
-    return tuple(field.name for field in policy_observation_fields(policy_spec))
+    return tuple(field.name for field in policy_spec.observation_fields)
 
 
 def _requires_pointcloud(policy_spec: Any) -> bool:
@@ -123,14 +122,11 @@ def _compute_policy_observation_ring_capacities(
     state_span_s = (
         visual_span_s + float(max_observation_skew_s)
         if channels_config.camera_requested
-        else history_span_s
-        + float(max_input_age_s)
-        + float(max_observation_skew_s)
+        else history_span_s + float(max_input_age_s) + float(max_observation_skew_s)
     )
     arm_state_ring_maxlen = max(
         channels_config.arm_state_ring_maxlen,
-        math.ceil(float(runtime.arm.loop_hz) * state_span_s)
-        + _OBSERVATION_READ_MARGIN,
+        math.ceil(float(runtime.arm.loop_hz) * state_span_s) + _OBSERVATION_READ_MARGIN,
     )
     hand_state_ring_maxlen = max(
         channels_config.hand_state_ring_maxlen,
@@ -169,15 +165,12 @@ def build_policy_worker_specs(
 ) -> list[WorkerSpec]:
     """Build the workers required by the explicit deployment contract.
 
-    Readiness order is the single source of truth for build order and for the
-    readiness names derived from it. ``ready_name`` exists only for workers
-    whose asynchronous initialization can fail; executor liveness is enough.
+    Each spec owns its process and readiness names. ``ready_name`` exists only
+    for workers whose asynchronous initialization can fail; executor liveness
+    is enough.
     """
-    validate_policy_runtime_compatibility(policy_spec, runtime)
     if not isinstance(worker_config, PolicyWorkerConfig):
         raise TypeError("worker_config must be a PolicyWorkerConfig")
-    if worker_config.spec is not policy_spec:
-        raise ValueError("worker PolicySpec must be the validated lifecycle PolicySpec")
     deployment = deployment_config or PolicyDeploymentConfig()
     if not isinstance(deployment, PolicyDeploymentConfig):
         raise TypeError("deployment_config must be a PolicyDeploymentConfig")
@@ -194,7 +187,7 @@ def build_policy_worker_specs(
             runtime,
             num_points=next(
                 field.shape[0]
-                for field in policy_observation_fields(policy_spec)
+                for field in policy_spec.observation_fields
                 if field.name == "point_cloud"
             ),
         )
@@ -257,7 +250,11 @@ def build_policy_worker_specs(
             WorkerSpec(
                 "hand",
                 hand_loop,
-                (shared, runtime.hand),
+                (
+                    shared,
+                    runtime.hand,
+                    float(runtime.policy.hand_disconnect_timeout_s),
+                ),
                 ready_name="hand",
             )
         )
@@ -312,7 +309,7 @@ def run_policy_deployment(
         pointcloud_num_points=(
             next(
                 field.shape[0]
-                for field in policy_observation_fields(policy_spec)
+                for field in policy_spec.observation_fields
                 if field.name == "point_cloud"
             )
             if pointcloud_requested
@@ -359,18 +356,15 @@ def run_policy_deployment(
         ]
         if len(inference_pairs) != 1:
             raise RuntimeError("deployment requires exactly one inference worker")
-        inference_spec, inference_process = inference_pairs[0]
-        if inference_spec.ready_name is None:
-            raise RuntimeError("inference worker requires a readiness name")
+        _inference_spec, inference_process = inference_pairs[0]
         start_processes([inference_process])
         started_procs.append(inference_process)
-        inference_ready = [
-            (
-                inference_spec.ready_name,
-                float(timeouts[inference_spec.ready_name]),
-            )
-        ]
-        if not wait_subsystem_ready(shared, inference_ready, started_procs):
+        if not wait_subsystem_ready(
+            shared,
+            inference_pairs,
+            timeouts,
+            monitored_processes=started_procs,
+        ):
             shared.error_state.value = True
             require_transition(shared, SafetyState.FAULT)
             shutdown_report = shutdown_processes(
@@ -381,32 +375,24 @@ def run_policy_deployment(
             return 1
         print("  inference: ready", flush=True)
 
-        # A ready flag is one-shot state. Recheck the process immediately before
-        # starting hardware so a post-ready inference crash cannot open devices.
-        if shared.error_state.value or not inference_process.is_alive():
-            logger.error("inference exited or faulted after reporting ready")
-            shared.error_state.value = True
-            require_transition(shared, SafetyState.FAULT)
-            shutdown_report = shutdown_processes(
-                shared,
-                started_procs,
-                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-            )
-            return 1
-
         remaining_pairs = [
             (spec, process)
             for spec, process in spec_processes
             if process is not inference_process
         ]
         remaining_procs = [process for _spec, process in remaining_pairs]
-        start_processes(remaining_procs)
-        started_procs.extend(remaining_procs)
-        ready_checks: list[tuple[str, float]] = []
-        for spec, _process in remaining_pairs:
-            if spec.ready_name is not None:
-                ready_checks.append((spec.ready_name, float(timeouts[spec.ready_name])))
-        if not wait_subsystem_ready(shared, ready_checks, started_procs):
+        # Register each successful start immediately.  If a later Process.start()
+        # raises, verified shutdown must still stop every earlier child before IPC
+        # is closed or unlinked.
+        for process in remaining_procs:
+            start_processes([process])
+            started_procs.append(process)
+        if not wait_subsystem_ready(
+            shared,
+            remaining_pairs,
+            timeouts,
+            monitored_processes=started_procs,
+        ):
             shared.error_state.value = True
             require_transition(shared, SafetyState.FAULT)
             shutdown_report = shutdown_processes(
@@ -416,8 +402,9 @@ def run_policy_deployment(
             )
             return 1
 
-        for name, _timeout in ready_checks:
-            print(f"  {name}: ready", flush=True)
+        for spec, _process in remaining_pairs:
+            if spec.ready_name is not None:
+                print(f"  {spec.ready_name}: ready", flush=True)
 
         require_transition(shared, SafetyState.ARMED)
         print(
@@ -445,18 +432,15 @@ def run_policy_deployment(
         )
         operator_thread.start()
 
-        process_names = [spec.name for spec in specs]
-        heartbeat_names = [
-            spec.name
-            for spec in specs
-            if spec.name in {"arm", "hand", "inference", "policy"}
-        ]
+        heartbeat_timeouts = {
+            process.name: float(runtime.safety.heartbeat_timeouts[process.name])
+            for process in started_procs
+            if process.name in {"arm", "hand", "inference", "policy"}
+        }
         exit_reason, normal_exit = run_supervisor(
             shared,
             started_procs,
-            process_names,
-            heartbeat_names,
-            heartbeat_timeouts_s=dict(runtime.safety.heartbeat_timeouts),
+            heartbeat_timeouts_s=heartbeat_timeouts,
             supervisor_hz=float(runtime.safety.supervisor_hz),
         )
 
@@ -538,9 +522,6 @@ def run_policy_deployment(
             elif not operator_alive:
                 try:
                     if not shared.close():
-                        shared.error_state.value = True
-                        transition(shared, SafetyState.FAULT)
+                        logger.error("RuntimeChannels cleanup was incomplete")
                 except Exception:
                     logger.warning("RuntimeChannels cleanup failed", exc_info=True)
-                    shared.error_state.value = True
-                    transition(shared, SafetyState.FAULT)

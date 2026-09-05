@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -43,6 +44,9 @@ class CameraLoopConfig:
     fps: int = field(default_factory=lambda: camera.fps)
     warmup_frames: int = field(default_factory=lambda: camera.warmup_frames)
     max_frame_age_s: float = field(default_factory=lambda: camera.max_frame_age_s)
+    read_failure_timeout_s: float = field(
+        default_factory=lambda: camera.recording_stall_abort_s
+    )
     frame_gap_stall_threshold: int = field(
         default_factory=lambda: camera.frame_gap_stall_threshold
     )
@@ -55,13 +59,18 @@ class CameraLoopConfig:
     )
 
     def __post_init__(self) -> None:
-        if (
-            self.width <= 0
-            or self.height <= 0
-            or self.fps <= 0
-            or self.max_frame_age_s <= 0
-        ):
+        if self.width <= 0 or self.height <= 0 or self.fps <= 0:
             raise ValueError("camera dimensions/rates must be positive")
+        if (
+            not math.isfinite(self.max_frame_age_s)
+            or self.max_frame_age_s <= 0
+            or not math.isfinite(self.read_failure_timeout_s)
+            or self.read_failure_timeout_s <= self.max_frame_age_s
+        ):
+            raise ValueError(
+                "camera frame age and read-failure thresholds must be finite and "
+                "positive, with read-failure timeout greater than max frame age"
+            )
         if self.warmup_frames < 0:
             raise ValueError("warmup_frames must be non-negative")
         if self.frame_gap_stall_threshold < 0:
@@ -103,6 +112,7 @@ class CameraLoopConfig:
             fps=int(cam.fps),
             warmup_frames=int(cam.warmup_frames),
             max_frame_age_s=float(cam.max_frame_age_s),
+            read_failure_timeout_s=float(cam.recording_stall_abort_s),
             frame_gap_stall_threshold=int(cam.frame_gap_stall_threshold),
             l515_visual_preset=int(cam.l515_visual_preset),
             l515_confidence_threshold=(
@@ -318,6 +328,7 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
         shared.camera_profile.value = _profile_payload.ljust(2048, b"\x00")
 
         ready_published = False
+        read_failure_started_s: float | None = None
         frame_gap_warn = ThrottledWarner(interval_s=5.0, logger=_logger)
 
         while shared.is_running.value:
@@ -330,12 +341,22 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
             try:
                 frame = cam.read(timeout_ms=300, compute_depth=False)
             except (RuntimeError, OSError):
+                now_s = time.monotonic()
+                if read_failure_started_s is None:
+                    read_failure_started_s = now_s
                 _logger.warning("camera_loop: frame read failed", exc_info=True)
                 # ``wait_for_frames`` normally provides the device-rate pacing.
                 # Back off only after a failure so repeated errors cannot spin.
-                shared.set_heartbeat("camera", time.monotonic())
+                shared.set_heartbeat("camera", now_s)
+                if now_s - read_failure_started_s >= cfg.read_failure_timeout_s:
+                    shared.error_state.value = True
+                    raise RuntimeError(
+                        "camera frame reads failed for "
+                        f"{now_s - read_failure_started_s:.3f}s"
+                    )
                 time.sleep(_READ_FAILURE_BACKOFF_S)
                 continue
+            read_failure_started_s = None
             shared.set_heartbeat("camera", time.monotonic())
 
             if _publish_payload:

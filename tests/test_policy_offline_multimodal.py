@@ -22,6 +22,7 @@ from dexmani_real.data.export import (
 from dexmani_real.data.process import (
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
+    _validate_processed_output_structure,
     compute_fingertip_history_xarm_base,
     validate_processed_hdf5,
 )
@@ -249,6 +250,27 @@ class OfflineMultimodalTest(unittest.TestCase):
                     with patch("dexmani_real.data.process.validate_processed_payload"):
                         with self.assertRaises(ValueError):
                             validate_processed_hdf5(path, config)
+
+    def test_writer_structural_sanity_skips_payload_scan_but_full_verify_does_not(
+        self,
+    ) -> None:
+        config = ProcessingConfig(
+            profile=OutputProfile.JOINT,
+            horizon=1,
+            min_full_windows=1,
+            arm_max_delta_rad_per_tick=0.1,
+            hand_max_delta_rad_per_tick=0.3,
+            endpoint_delta_tolerance_rad=1e-6,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "output.h5"
+            self._write_processed_fixture(path, OutputProfile.JOINT)
+            with h5py.File(path, "r+") as output:
+                output["action"][0, 0] = np.nan
+            sanity = _validate_processed_output_structure(path, config)
+            self.assertEqual(sanity["level"], "structural")
+            with self.assertRaisesRegex(ValueError, "action contains NaN/Inf"):
+                validate_processed_hdf5(path, config)
 
     def _write_processed_fixture(self, path: Path, profile: OutputProfile) -> None:
         visual = profile.needs_rgb or profile.needs_pointcloud

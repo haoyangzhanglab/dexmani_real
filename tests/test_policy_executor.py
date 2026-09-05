@@ -50,7 +50,6 @@ class _FakeShared:
         self.safety_state = _Value(int(SafetyState.ARMED))
         self.run_generation = _Value(0)
         self.run_started_monotonic_ns = _Value(0)
-        self.active_coupled_command_sequence = _Value(0)
         self.motion_lock = threading.Lock()
         self.inference_request = threading.Event()
         self.heartbeats: list[tuple[str, float]] = []
@@ -182,6 +181,25 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
         )
         self.assertIsNone(arm)
         self.assertEqual(reason, "no solution")
+
+    def test_ee_action_rejects_degenerate_rot6d_during_decode(self) -> None:
+        runtime = resolve_runtime_config()
+        action = np.zeros(21, dtype=np.float64)
+        planner = Mock()
+
+        arm, hand, reason = decode_policy_action(
+            action,
+            _policy_spec("action_ee"),
+            np.zeros(7, dtype=np.float64),
+            previous_arm_command_qpos=None,
+            planner=planner,
+            runtime=runtime,
+        )
+
+        self.assertIsNone(arm)
+        np.testing.assert_array_equal(hand, action[9:])
+        self.assertIn("EE IK failed: ValueError", reason)
+        planner.solve_teleop_ik.assert_not_called()
 
     def test_workspace_check_rejects_without_clipping(self) -> None:
         runtime = resolve_runtime_config()
@@ -545,6 +563,37 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
             "first command timeout",
         )
 
+    def test_stale_prediction_never_publishes_a_physical_command(self) -> None:
+        executor = _executor()
+        executor.execute = True
+        executor.run_generation = 1
+        executor.run_started_ns = 100
+        executor.shared.safety_state.value = int(SafetyState.RUNNING)
+        executor.shared.run_generation.value = 1
+        executor.active_prediction = _prediction(source_ns=100, logical_ns=100)
+        executor.schedule_base_ns = 100
+        executor.max_source_age_ns = 10
+        executor.progress.reset(1)
+        executor.progress.observe(
+            generation=1,
+            arm_action_id=0,
+            hand_action_id=0,
+            now_ns=100,
+            timeout_ns=50,
+        )
+
+        with (
+            patch(
+                "dexmani_real.deployment.executor.read_latest_prediction",
+                return_value=None,
+            ),
+            patch("dexmani_real.deployment.executor.publish_command") as publish,
+        ):
+            executor._run_active_tick(111)
+
+        publish.assert_not_called()
+        self.assertIsNone(executor.active_prediction)
+
     def test_latest_wins_progress_allows_skipped_ids_and_stall_faults(self) -> None:
         progress = _CommandProgress()
         progress.reset(1)
@@ -576,6 +625,32 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
                 arm_action_id=8,
                 hand_action_id=9,
                 now_ns=181,
+                timeout_ns=50,
+            ),
+            "arm worker command progress timeout",
+        )
+
+    def test_continuous_publication_cannot_mask_stalled_worker_progress(self) -> None:
+        progress = _CommandProgress()
+        progress.reset(1)
+        self.assertIsNone(
+            progress.observe(
+                generation=1,
+                arm_action_id=0,
+                hand_action_id=0,
+                now_ns=100,
+                timeout_ns=50,
+            )
+        )
+        progress.record_publication(1, 110)
+        progress.record_publication(2, 130)
+
+        self.assertEqual(
+            progress.observe(
+                generation=1,
+                arm_action_id=0,
+                hand_action_id=0,
+                now_ns=161,
                 timeout_ns=50,
             ),
             "arm worker command progress timeout",

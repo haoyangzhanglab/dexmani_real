@@ -192,8 +192,12 @@ def _start_workers(
     arm_process = build_processes(context, [arm_spec])[0]
     processes.append(arm_process)
     start_processes([arm_process])
-    arm_timeout_s = float(runtime.safety.readiness_timeouts_s["arm"])
-    if not wait_subsystem_ready(shared, [("arm", arm_timeout_s)], processes):
+    if not wait_subsystem_ready(
+        shared,
+        [(arm_spec, arm_process)],
+        runtime.safety.readiness_timeouts_s,
+        monitored_processes=processes,
+    ):
         return arm_process, None, False
 
     if not hand_requested:
@@ -202,21 +206,22 @@ def _start_workers(
     hand_spec = WorkerSpec(
         "hand",
         hand_loop,
-        (shared, runtime.hand),
+        (
+            shared,
+            runtime.hand,
+            float(runtime.policy.hand_disconnect_timeout_s),
+        ),
         ready_name="hand",
     )
     hand_process = build_processes(context, [hand_spec])[0]
     processes.append(hand_process)
     start_processes([hand_process])
-    deadline_s = time.monotonic() + float(runtime.safety.readiness_timeouts_s["hand"])
-    while (
-        hand_process.is_alive()
-        and not shared.is_ready("hand")
-        and time.monotonic() < deadline_s
+    if not wait_subsystem_ready(
+        shared,
+        [(hand_spec, hand_process)],
+        runtime.safety.readiness_timeouts_s,
+        monitored_processes=processes,
     ):
-        time.sleep(_INITIAL_STATE_POLL_S)
-
-    if not shared.is_ready("hand"):
         return arm_process, hand_process, False
 
     hand_state = read_hand_state_dict(shared)
@@ -1205,10 +1210,9 @@ def run_keyboard_experiment(
         else:
             try:
                 if not shared.close():
-                    set_keyboard_fault(shared, "RuntimeChannels cleanup was incomplete")
+                    logger.error("RuntimeChannels cleanup was incomplete")
                     exit_code = 1
             except Exception:
-                set_keyboard_fault(shared, "RuntimeChannels cleanup failed")
                 logger.error("RuntimeChannels cleanup failed", exc_info=True)
                 exit_code = 1
         try:

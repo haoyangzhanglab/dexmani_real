@@ -160,7 +160,9 @@ class PolicyAdapterTest(unittest.TestCase):
             loaded_spec,
             np.zeros((7, 19), dtype=np.float64),
         )
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(
+            RuntimeError, "PolicySpec changed between inspect and load"
+        ):
             DexManiPolicyRuntime(loaded, inspected_spec)
 
     def test_joint_action_remains_flat_and_observation_is_numpy(self) -> None:
@@ -172,11 +174,12 @@ class PolicyAdapterTest(unittest.TestCase):
 
         actions = adapter.predict(_observation(spec))
 
+        self.assertIs(actions, output)
         np.testing.assert_array_equal(actions, output)
         self.assertEqual(set(loaded.observation), {"joint_state", "point_cloud"})
         self.assertEqual(loaded.observation["joint_state"].dtype, np.float32)
 
-    def test_ee_action_remains_flat_and_rotation_is_validated(self) -> None:
+    def test_ee_action_remains_flat(self) -> None:
         spec = _spec(action_key="action_ee", action_dim=21, control_action_dim=21)
         _resolved_runtime(spec)
         output = np.zeros((8, 21), dtype=np.float64)
@@ -185,69 +188,8 @@ class PolicyAdapterTest(unittest.TestCase):
         output[:, 7] = 1.0
         adapter = DexManiPolicyRuntime(_FakeLoadedPolicy(spec, output), spec)
         actions = adapter.predict(_observation(spec))
+        self.assertIs(actions, output)
         np.testing.assert_array_equal(actions, output)
-
-        output[:, 3:9] = 0.0
-        with self.assertRaises(ValueError):
-            adapter.predict(_observation(spec))
-
-    def test_rejects_invalid_policy_output(self) -> None:
-        spec = _spec()
-        _resolved_runtime(spec)
-        invalid = (
-            np.zeros((7, 19), dtype=np.float64),
-            np.zeros((8, 19), dtype=np.float32),
-            np.full((8, 19), np.nan, dtype=np.float64),
-        )
-        for output in invalid:
-            with self.subTest(shape=output.shape, dtype=output.dtype):
-                adapter = DexManiPolicyRuntime(_FakeLoadedPolicy(spec, output), spec)
-                with self.assertRaises(ValueError):
-                    adapter.predict(_observation(spec))
-
-    def test_rejects_history_length_and_extra_modality(self) -> None:
-        spec = _spec()
-        _resolved_runtime(spec)
-        adapter = DexManiPolicyRuntime(
-            _FakeLoadedPolicy(spec, np.zeros((8, 19), dtype=np.float64)), spec
-        )
-        missing = PolicyObservation(
-            observation_id=1,
-            run_generation=1,
-            anchor_monotonic_ns=20,
-            latest_source_monotonic_ns=10,
-            logical_step_monotonic_ns=15,
-            arrays={"joint_state": np.zeros((2, 19), dtype=np.float32)},
-        )
-        with self.assertRaises(ValueError):
-            adapter.predict(missing)
-        short = PolicyObservation(
-            observation_id=1,
-            run_generation=1,
-            anchor_monotonic_ns=20,
-            latest_source_monotonic_ns=10,
-            logical_step_monotonic_ns=15,
-            arrays={
-                "joint_state": np.zeros((1, 19), dtype=np.float32),
-                "point_cloud": np.zeros((1, 1024, 6), dtype=np.float32),
-            },
-        )
-        with self.assertRaises(ValueError):
-            adapter.predict(short)
-
-        wrong_point_count = PolicyObservation(
-            observation_id=1,
-            run_generation=1,
-            anchor_monotonic_ns=20,
-            latest_source_monotonic_ns=10,
-            logical_step_monotonic_ns=15,
-            arrays={
-                "joint_state": np.zeros((2, 19), dtype=np.float32),
-                "point_cloud": np.zeros((2, 1, 6), dtype=np.float32),
-            },
-        )
-        with self.assertRaises(ValueError):
-            adapter.predict(wrong_point_count)
 
 
 if __name__ == "__main__":

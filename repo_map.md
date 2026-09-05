@@ -13,6 +13,8 @@
 | `README.md` | 面向使用者的能力、环境、工作流与稳定架构。 |
 | `repo_map.md` | 当前运行拓扑、核心数据流与边界索引。 |
 | `.codex/config.toml` | 项目级 Codex 权限、联网与子智能体并发配置。 |
+| `.codex/agents/*.toml` | 项目级难度分档子智能体：`sol-high`、`terra-xhigh`、`luna-max`。 |
+| `.agents/skills/dexmani-refactor/SKILL.md` | 删简重构的分阶段执行、验收、压缩与续跑工作流。 |
 
 ## Process topology
 
@@ -37,8 +39,9 @@ control safety gate → command publication → arm / hand workers
   record layout 由 `dexmani_real/ipc/schema.py` 定义。
 - learned-policy lifecycle 先等待 inference restore/warmup，再启动所需传感器和执行器 worker；
   supervisor 只监督实际运行的 process heartbeat，readiness 只负责有界启动等待。
-- teleop lifecycle 按启用的 arm、hand、VR、camera、recorder worker 构造同一组 channels；
-  replay 与 calibration 复用相同的 safety、publication 和 worker 边界。
+- teleop lifecycle 按 dependency → policy → VR 分阶段启动启用的 worker；父进程 readiness
+  屏障同时检查 ready、sticky fault、所有已启动进程的 liveness 与 timeout。replay 与
+  calibration 复用相同的 safety、publication 和 worker 边界。
 
 ## Policy flow
 
@@ -87,13 +90,15 @@ VR / keyboard input
 ## Command safety invariants
 
 - runtime safety state 只有 `DISARMED → ARMED → RUNNING` 与 `FAULT` 终态路径；共享的
-  `motion_lock` 同时保护 state、`run_generation` 和 active command ticket。
-- 每次开始、停止、暂停、故障或 supersede 都推进 `run_generation` 并清除 active ticket；
-  stale、过期、被覆盖或不再拥有 latest-wins slot 的命令不得跨 SDK 边界。
+  `motion_lock` 同时保护 state、`run_generation` 与 coupled-command ring 的串行发布。
+- 开始、停止、暂停和故障通过推进 `run_generation` 使旧命令失效；当前 ticket 由
+  current generation 与 `coupled_cmd_ring.latest_sequence` 直接判定。stale、过期、被覆盖或不再拥有
+  latest-wins slot 的命令不得跨 SDK 边界。
 - `SafetyGate` 校验 joint limits、workspace、collision 和 command delta；它不把 feedback
   缺失当作安全，也不以隐式 clip 代替 reject。arm/hand worker 保留最后一道硬件调用前守卫。
-- STOP、e-stop、worker death、heartbeat timeout、command-progress stall 和 cleanup failure
-  都 fail closed；home 仍执行 hand + arm 的显式碰撞检查路径。
+- STOP、e-stop、worker death、heartbeat timeout 和 command-progress stall 都 fail closed；在所有
+  child 已确认停止后发生的 IPC/resource cleanup error 仍记录为失败，但不重新赋予 physical `FAULT`。
+  home 仍执行 hand + arm 的显式碰撞检查路径。
 - 命令发布与物理接受是两个边界：实时路径非阻塞发布，只有确实需要确认的 home、calibration
   和 replay 路径等待明确 acceptance result。
 
@@ -105,9 +110,16 @@ VR / keyboard input
 - raw episode 的 schema、字段语义和对齐保持单一来源：`recording/schema.py` 与
   [`docs/data_schema.md`](docs/data_schema.md)。当前链路为 raw v24 → processed HDF5 v11 →
   Policy Zarr v5；离线 `data/` 负责清洗、审计和导出，不改变 raw 字段含义。
+- `EpisodeReader` 的普通 read 严格检查 raw schema、layout 和基本语义，但不重算大型
+  sidecar hash 或完整解码视频；这些 artifact attestation 检查只在显式 integrity audit 中执行。
+- processed writer 只在原子发布前重开并确认 HDF5 结构；`--verify-output` 才执行完整写后
+  自检。processed consumer/export 边界仍严格验证 payload finite、shape/dtype、alignment 和
+  semantic attrs。
 - `recording/hdf5_writer.py` 独占单个 `data.h5` handle；camera sidecar 和 video writer 不
   反向拥有控制状态。缺口、失败或未完成 finalize 不伪装成完整 episode。
 - 物理回放读取已发布的 raw command/provenance，并重新经过当前 runtime 的 preflight、safety、
-  generation 与 worker 边界；processed 产物不能重新解释或替代 raw 命令事实。
+  generation 与 worker 边界；processed 产物不能重新解释或替代 raw 命令事实。processed replay
+  的 raw `data.h5` identity mismatch 是硬拒绝；config/URDF/SRDF hash 只在完整当前 physical
+  preflight 成功后报告为 reproducibility warning。
 
 源代码、schema 和 canonical config 是实现真相；本文件只帮助定位上述稳定边界。

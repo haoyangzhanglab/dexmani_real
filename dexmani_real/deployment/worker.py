@@ -18,6 +18,7 @@ then wraps it with Real's NumPy observation/action adapter.
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import numpy as np
 
@@ -27,7 +28,6 @@ from dexmani_real.deployment.config import (
     FingertipAssemblerConfig,
     PolicyDeploymentConfig,
     PolicyWorkerConfig,
-    policy_observation_fields,
 )
 from dexmani_real.deployment.contracts import PolicyRuntime, Prediction
 from dexmani_real.deployment.metrics import PolicyStats, flush_every
@@ -56,9 +56,9 @@ _ARMED_IDLE_POLL_S = 0.01
 _SYNC_REQUEST_WAIT_S = 0.05
 
 
-def _requested_observation_fields(policy_spec: object) -> set[str]:
+def _requested_observation_fields(policy_spec: Any) -> set[str]:
     """Return source names directly from the validated ordered Policy fields."""
-    return {field.name for field in policy_observation_fields(policy_spec)}
+    return {field.name for field in policy_spec.observation_fields}
 
 
 def _load_inference_runtime(config: PolicyWorkerConfig) -> PolicyRuntime:
@@ -623,7 +623,7 @@ def _align_state_history_to_camera_frames(
 def _build_observation(
     shared: RuntimeChannels,
     policy: PolicyParams,
-    policy_spec: object,
+    policy_spec: Any,
     *,
     observation_id: int,
     run_generation: int,
@@ -654,7 +654,7 @@ def _build_observation(
     rgb_requested = "rgb" in requested
     camera_requested = pointcloud_requested or rgb_requested
     rgb_history: tuple[RgbFrame, ...] = ()
-    fields = {field.name: field for field in policy_observation_fields(policy_spec)}
+    fields = {field.name: field for field in policy_spec.observation_fields}
     rgb_shape = tuple(fields["rgb"].shape) if rgb_requested else None
     state_history_len = shared.arm_state_ring.maxlen
     arm_history = _read_state_history(
@@ -922,14 +922,14 @@ def observation_timing_ms(observation: ObservationBatch) -> tuple[float, float]:
 
 def _to_policy_observation(
     observation: ObservationBatch,
-    policy_spec: object,
+    policy_spec: Any,
     *,
     fingertip_runtime: (
         tuple[object, HandKinematics, FingertipAssemblerConfig] | None
     ) = None,
 ) -> PolicyObservation:
     """Project typed ring readers into the exact public Policy array mapping."""
-    field_names = tuple(field.name for field in policy_observation_fields(policy_spec))
+    field_names = tuple(field.name for field in policy_spec.observation_fields)
     horizon = int(getattr(policy_spec, "n_obs_steps"))
     if observation.arm_history is None or observation.hand_history is None:
         raise ValueError("joint_state requires aligned arm and hand histories")

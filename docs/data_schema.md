@@ -150,12 +150,13 @@ raw 的明确缺失值语义，不应被下游压紧为相邻 source。
 | `depth.h5:/depth` | `(N,H_raw,W_raw)` uint16 | `librealsense_align_depth_to_color_z16`；像素在 color optical frame，与同 index RGB 像素对齐；`0` 为无效值。米值为 `depth * meta.depth_scale`。 |
 | `rgb.mp4` frame | `(H_raw,W_raw,3)` uint8 | 与控制网格逐帧对应的 RGB。codec、pixel format、宽高和 fps 在 `meta`。 |
 
-v24 writer 在关闭两个 sidecar 后才计算并写入 manifest。`EpisodeReader` 构造时检查 schema
-以及 v24 sidecar manifest；`.validity`/`.require_valid()` 还会执行完整的 `data.h5` layout、
-semantic、depth shape/dtype 和 RGB 解码帧数校验。因此发布后对 RGB/depth 做同长度重排或替换，
-会在 manifest 或完整 validity 检查中失败。manifest 只记录并重算 `depth.h5`、`rgb.mp4` 的
-整文件 SHA-256；它不包含 `data.h5` hash，也不是签名或真实性证明。若需要证明整个 episode
-未被协调修改，仍需由外部 attestation 或可信 artifact 流程建立信任。
+v24 writer 在关闭两个 sidecar 后才计算并写入 manifest。`EpisodeReader` 普通构造会检查 schema、
+`data.h5` layout/semantic 以及 depth shape/dtype，不默认重算大型 sidecar hash 或完整解码 RGB。
+需要验证发布后的 RGB/depth 是否被替换或同长度重排时，使用
+`EpisodeReader(path, verify_hash=True)` 或 `audit_integrity()`；显式审计会重算 manifest 中
+`depth.h5`、`rgb.mp4` 的整文件 SHA-256，并核对完整 RGB 帧数。manifest 不包含 `data.h5`
+hash，也不是签名或真实性证明。若需要证明整个 episode 未被协调修改，仍需由外部
+attestation 或可信 artifact 流程建立信任。
 
 ### `data.h5:/meta` attrs
 
@@ -170,7 +171,7 @@ semantic、depth shape/dtype 和 RGB 解码帧数校验。因此发布后对 RGB
 | 录制配置 | `resolved_config_sha256`、`skip_initial_frames`、`arm_sent_stream` | string / int / bool | 解析配置哈希与跳过帧数；`arm_sent_stream` 仅在 true 时写入，决定条件数据集是否存在。 |
 | 坐标、触觉与相机时序语义 | `robot_world_frame`、`robot_world_equals_xarm_base`、`arm_ee_frame`、`action_arm_ee_frame`、`hand_fingertip_frame`、`action_*_raw_validity_expression`、`tactile_*`、`arm_tau_*`、`camera_payload_mode`、`camera_health_taxonomy_json`、`camera_*_semantics`、`camera_frame_gap_semantics`、`camera_frame_gap_admission_policy`、`source_timestamp_semantics`、`source_sample_index_semantics`、`policy_observation_*_semantics` | string / bool / float | `SEMANTIC_META_ATTRS` 写入的固定语义；包括 `xarm_base` frame、raw action 有效性、tactile 单位/标定/接触、arm effort、camera 时间/时钟、frame-gap 数值与 admission policy，以及 camera-source policy observation 配对定义。 |
 | 视频与 writer | `camera_writer_queue_size`、`camera_encoding_codec`、`camera_encoding_crf`、`camera_encoding_preset`、`camera_encoding_pixel_format`、`camera_encoding_width/height/fps`、`camera_depth_storage`、`camera_depth_payload_semantics`、`camera_stream_frames`、`camera_writer_error` | int / string / float | MP4 编码、payload 定义、camera writer 状态与健康 telemetry。 |
-| sidecar 完整性 manifest | `raw_manifest_version`、`depth_sha256`、`rgb_sha256`、`raw_member_sha256_json` | int / string | v24 固定为 manifest version `1`；记录最终 `depth.h5` 与 `rgb.mp4` 整文件 SHA-256，reader 在读取时重算并拒绝替换或同长度重排。JSON 是同一 manifest 的审计镜像，必须与两个固定 digest 一致。 |
+| sidecar 完整性 manifest | `raw_manifest_version`、`depth_sha256`、`rgb_sha256`、`raw_member_sha256_json` | int / string | v24 固定为 manifest version `1`；记录最终 `depth.h5` 与 `rgb.mp4` 整文件 SHA-256，显式 `verify_hash`/`audit_integrity()` 时重算并拒绝替换或同长度重排。JSON 是同一 manifest 的审计镜像，必须与两个固定 digest 一致。 |
 | writer 性能汇总 | `camera_writer_queue_high_watermark`、`camera_writer_queue_capacity`、`camera_writer_close_s`、`camera_encode_{p50,p95,p99,max}_s`、`camera_hdf5_{p50,p95,p99,max}_s` | int / float | 相机 writer 队列、关闭和编码/HDF5 写入耗时。 |
 | 调用方扩展 | `provenance_<key>`、`camera_metadata` mapping 中的每个 key | string；调用方给定 dtype | 非固定 key；固定 attrs 与 `provenance_` namespace 被 recorder 保留，`camera_metadata` 不能覆盖它们。扩展值不属于稳定 schema。 |
 

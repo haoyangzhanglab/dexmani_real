@@ -6,11 +6,13 @@ import os
 import threading
 import time
 import unittest
+from multiprocessing import shared_memory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
 
+import dexmani_real.ipc.channels as channels
 from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.deployment.config import PolicyDeploymentConfig, PolicyWorkerConfig
 from dexmani_real.deployment.contracts import Prediction
@@ -25,13 +27,19 @@ from dexmani_real.deployment.worker import (
     publish_prediction,
     serialize_prediction,
 )
-from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig, new_frame
+from dexmani_real.ipc.channels import (
+    PREDICTION_RING_MAXLEN,
+    RuntimeChannels,
+    RuntimeChannelsConfig,
+    new_frame,
+)
 from dexmani_real.ipc.schema import (
     COUPLED_COMMAND_DTYPE,
     MAX_PREDICTION_STEPS,
     PREDICTION_DTYPE,
 )
 from dexmani_real.robot.arm_worker import _handle_servo_command, _LoopState
+from dexmani_real.robot.command_validation import check_worker_arm_target
 from dexmani_real.runtime.safety import (
     PUBLISH_REASON_EXPIRED,
     PUBLISH_REASON_FAULT,
@@ -39,9 +47,11 @@ from dexmani_real.runtime.safety import (
     CoupledCommandTicket,
     SafetyState,
     begin_motion,
+    cancel_coupled_command_if_current,
     coupled_command_ticket_allows_execution,
     publish_coupled_command_if_motion_permitted,
     read_run_state_snapshot,
+    request_policy_stop,
     transition,
 )
 
@@ -228,6 +238,17 @@ class PredictionRuntimeChannelsTest(unittest.TestCase):
                     ticket=newer_ticket,
                 )
             )
+            generation_before_cancel = int(shared.run_generation.value)
+            self.assertFalse(
+                cancel_coupled_command_if_current(shared, ticket=older_ticket)
+            )
+            self.assertEqual(shared.run_generation.value, generation_before_cancel)
+            self.assertTrue(
+                coupled_command_ticket_allows_execution(
+                    shared,
+                    ticket=newer_ticket,
+                )
+            )
         finally:
             self.assertTrue(shared.close())
 
@@ -244,6 +265,10 @@ class PredictionRuntimeChannelsTest(unittest.TestCase):
                 self.writes += 1
                 return self.writes
 
+            @property
+            def latest_sequence(self) -> int:
+                return self.writes
+
         ring = CaptureRing()
         shared = SimpleNamespace(
             is_running=_Value(True),
@@ -251,7 +276,6 @@ class PredictionRuntimeChannelsTest(unittest.TestCase):
             estop_request=_Value(False),
             safety_state=_Value(int(SafetyState.RUNNING)),
             run_generation=_Value(4),
-            active_coupled_command_sequence=_Value(0),
             coupled_cmd_ring=ring,
         )
 
@@ -317,7 +341,8 @@ class PredictionRuntimeChannelsTest(unittest.TestCase):
             camera_depth_shape=(2, 2),
         )
         try:
-            self.assertEqual(shared.prediction_ring.maxlen, 1)
+            self.assertEqual(shared.prediction_ring.maxlen, PREDICTION_RING_MAXLEN)
+            self.assertEqual(shared.safety_state.value, int(SafetyState.DISARMED))
             self.assertFalse(shared.inference_request.is_set())
             shared.inference_request.set()
             self.assertTrue(shared.inference_request.wait(timeout=0.01))
@@ -337,60 +362,263 @@ class PredictionRuntimeChannelsTest(unittest.TestCase):
         finally:
             self.assertTrue(shared.close())
 
-    def test_prediction_ring_capacity_is_fixed(self) -> None:
-        with self.assertRaisesRegex(ValueError, "must remain exactly 1"):
+    def test_prediction_ring_capacity_is_not_a_runtime_setting(self) -> None:
+        with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
             RuntimeChannelsConfig(prediction_ring_maxlen=2)
+
+    def test_close_is_idempotent_after_partial_resource_cleanup(self) -> None:
+        prefix = f"dexmani_test_partial_close_{os.getpid()}_{time.monotonic_ns()}"
+        shared = RuntimeChannels.create(
+            prefix=prefix,
+            config=RuntimeChannelsConfig(camera_ring_maxlen=1),
+            camera_rgb_shape=(2, 2, 3),
+            camera_depth_shape=(2, 2),
+        )
+        try:
+            shared.camera_ring.close()
+            shared.camera_ring.unlink()
+            shared.arm_home_q.close()
+            shared.arm_home_q.join_thread()
+
+            self.assertTrue(shared.close())
+            self.assertTrue(shared.close())
+        finally:
+            shared.close()
+
+    def test_partial_allocation_rolls_back_created_shared_memory(self) -> None:
+        prefix = f"dexmani_test_partial_allocation_{os.getpid()}_{time.monotonic_ns()}"
+        original_ring = channels.SharedMemoryRingBuffer
+        allocation_calls = 0
+
+        def allocate_ring(*args: object, **kwargs: object) -> object:
+            nonlocal allocation_calls
+            allocation_calls += 1
+            if allocation_calls == 2:
+                raise OSError("injected allocation failure")
+            return original_ring(*args, **kwargs)
+
+        with patch.object(
+            channels,
+            "SharedMemoryRingBuffer",
+            side_effect=allocate_ring,
+        ):
+            with self.assertRaisesRegex(OSError, "injected allocation failure"):
+                RuntimeChannels.create(
+                    prefix=prefix,
+                    config=RuntimeChannelsConfig(camera_ring_maxlen=1),
+                    camera_rgb_shape=(2, 2, 3),
+                    camera_depth_shape=(2, 2),
+                )
+
+        self.assertEqual(allocation_calls, 2)
+        for name in (f"{prefix}_camera", f"{prefix}_vr"):
+            with self.assertRaises(FileNotFoundError):
+                shared_memory.SharedMemory(name=name)
 
 
 class ArmWorkerDeadlineGuardTest(unittest.TestCase):
-    def test_deadline_crossed_during_validation_prevents_servo(self) -> None:
+    @staticmethod
+    def _command(
+        target: np.ndarray,
+        *,
+        generation: int = 1,
+        action_id: int = 1,
+    ) -> np.ndarray:
         command = new_frame(COUPLED_COMMAND_DTYPE)
-        command["run_generation"][0] = 1
-        command["action_id"][0] = 1
+        command["run_generation"][0] = generation
+        command["action_id"][0] = action_id
         command["created_monotonic_ns"][0] = 100
         command["scheduled_target_monotonic_ns"][0] = 100
         command["target_monotonic_ns"][0] = 100
-        command["valid_until_monotonic_ns"][0] = 200
+        command["valid_until_monotonic_ns"][0] = 1_000
         command["arm_present"][0] = 1
+        command["arm_qpos"][0] = target
+        return command
 
-        arm = SimpleNamespace(servo=Mock())
-        st = _LoopState(
+    @staticmethod
+    def _loop_state(*, max_jump: float = 0.2) -> _LoopState:
+        return _LoopState(
             cfg=SimpleNamespace(
                 joint_limit_lower=np.full(7, -1.0),
                 joint_limit_upper=np.full(7, 1.0),
-                max_servo_command_jump_rad=1.0,
+                max_servo_command_jump_rad=max_jump,
             ),
-            arm=arm,
+            arm=SimpleNamespace(servo=Mock(return_value=0)),
             frame=None,
             last_target=np.zeros(7),
             last_measured_qpos=np.zeros(7),
             last_command_generation=1,
         )
-        shared = SimpleNamespace(
+
+    @staticmethod
+    def _shared(*, generation: int = 1) -> SimpleNamespace:
+        return SimpleNamespace(
             is_running=_Value(True),
             error_state=_Value(False),
             estop_request=_Value(False),
+            start_request=_Value(False),
+            stop_request=_Value(0),
+            physical_home_completed=_Value(False),
             safety_state=_Value(int(SafetyState.RUNNING)),
-            run_generation=_Value(1),
-            active_coupled_command_sequence=_Value(1),
+            run_generation=_Value(generation),
+            run_started_monotonic_ns=_Value(100),
+            coupled_cmd_ring=SimpleNamespace(latest_sequence=1),
             motion_lock=threading.RLock(),
         )
-        ticket = CoupledCommandTicket(
-            run_generation=1,
-            ring_sequence=1,
-            valid_until_monotonic_ns=200,
+
+    def test_stale_generation_never_reaches_arm_sdk(self) -> None:
+        st = self._loop_state()
+        shared = self._shared(generation=2)
+        ticket = CoupledCommandTicket(1, 1, 1_000)
+
+        with patch("dexmani_real.runtime.safety.time.monotonic_ns", return_value=150):
+            _handle_servo_command(
+                st,
+                shared,
+                self._command(np.zeros(7), generation=1),
+                ticket,
+            )
+
+        st.arm.servo.assert_not_called()
+
+    def test_stop_or_newer_publication_after_read_never_reaches_arm_sdk(
+        self,
+    ) -> None:
+        class CommandRing:
+            def __init__(self) -> None:
+                self.sequence = 1
+
+            def write(self, _frame: np.ndarray) -> int:
+                self.sequence += 1
+                return self.sequence
+
+            @property
+            def latest_sequence(self) -> int:
+                return self.sequence
+
+        def stop_after_read(shared: SimpleNamespace) -> None:
+            self.assertTrue(request_policy_stop(shared))
+
+        def supersede_after_read(shared: SimpleNamespace) -> None:
+            newer = self._command(np.full(7, 0.1), action_id=2)
+            ticket, reason = publish_coupled_command_if_motion_permitted(
+                shared,
+                expected_run_generation=1,
+                frame=newer,
+                required_state=SafetyState.RUNNING,
+            )
+            self.assertIsNotNone(ticket)
+            self.assertEqual(reason, "")
+
+        for label, race in (
+            ("stop", stop_after_read),
+            ("newer command", supersede_after_read),
+        ):
+            with self.subTest(race=label):
+                st = self._loop_state()
+                shared = self._shared()
+                shared.coupled_cmd_ring = CommandRing()
+                ticket = CoupledCommandTicket(1, 1, 1_000)
+
+                def validate_then_race(*_args: object, **_kwargs: object) -> None:
+                    race(shared)
+                    return None
+
+                with (
+                    patch(
+                        "dexmani_real.robot.arm_worker.check_worker_arm_target",
+                        side_effect=validate_then_race,
+                    ),
+                    patch(
+                        "dexmani_real.runtime.safety.time.monotonic_ns",
+                        return_value=150,
+                    ),
+                ):
+                    _handle_servo_command(
+                        st,
+                        shared,
+                        self._command(np.zeros(7)),
+                        ticket,
+                    )
+
+                st.arm.servo.assert_not_called()
+
+    def test_nonfinite_limit_and_jump_violations_never_reach_arm_sdk(self) -> None:
+        cases = (
+            ("nan", np.array([np.nan] + [0.0] * 6)),
+            ("inf", np.array([np.inf] + [0.0] * 6)),
+            ("hard limit", np.array([1.01] + [0.0] * 6)),
+            ("final jump", np.array([0.21] + [0.0] * 6)),
         )
+        for label, target in cases:
+            with self.subTest(rejection=label):
+                st = self._loop_state()
+                shared = self._shared()
+                with (
+                    patch(
+                        "dexmani_real.robot.arm_worker.time.monotonic_ns",
+                        return_value=150,
+                    ),
+                    patch(
+                        "dexmani_real.runtime.safety.time.monotonic_ns",
+                        return_value=150,
+                    ),
+                    self.assertRaises(RuntimeError),
+                ):
+                    _handle_servo_command(
+                        st,
+                        shared,
+                        self._command(target),
+                        CoupledCommandTicket(1, 1, 1_000),
+                    )
+                st.arm.servo.assert_not_called()
+
+    def test_valid_arm_command_reaches_sdk_exactly_once(self) -> None:
+        st = self._loop_state()
+        shared = self._shared()
+        command = self._command(np.full(7, 0.1))
+        ticket = CoupledCommandTicket(1, 1, 1_000)
+
+        with (
+            patch("dexmani_real.robot.arm_worker.time.monotonic_ns", return_value=150),
+            patch("dexmani_real.runtime.safety.time.monotonic_ns", return_value=150),
+        ):
+            _handle_servo_command(st, shared, command, ticket)
+            _handle_servo_command(st, shared, command, ticket)
+
+        st.arm.servo.assert_called_once()
+        np.testing.assert_array_equal(st.arm.servo.call_args.args[0], np.full(7, 0.1))
+
+    def test_deadline_crossed_during_validation_prevents_servo(self) -> None:
+        command = self._command(np.zeros(7))
+        command["valid_until_monotonic_ns"][0] = 200
+        st = self._loop_state(max_jump=1.0)
+        shared = self._shared()
+
+        clock = {"now_ns": 150}
+
+        def validate_then_expire(*args: object, **kwargs: object):
+            issue = check_worker_arm_target(*args, **kwargs)
+            clock["now_ns"] = 200
+            return issue
 
         with (
             patch(
+                "dexmani_real.robot.arm_worker.check_worker_arm_target",
+                side_effect=validate_then_expire,
+            ),
+            patch(
+                "dexmani_real.robot.arm_worker.time.monotonic_ns",
+                side_effect=lambda: clock["now_ns"],
+            ),
+            patch(
                 "dexmani_real.runtime.safety.time.monotonic_ns",
-                side_effect=(150, 150, 150, 200),
-            ) as safety_clock,
+                side_effect=lambda: clock["now_ns"],
+            ),
         ):
-            _handle_servo_command(st, shared, command, ticket)
+            _handle_servo_command(st, shared, command, CoupledCommandTicket(1, 1, 200))
 
-        self.assertEqual(safety_clock.call_count, 4)
-        arm.servo.assert_not_called()
+        st.arm.servo.assert_not_called()
         self.assertFalse(shared.error_state.value)
 
 

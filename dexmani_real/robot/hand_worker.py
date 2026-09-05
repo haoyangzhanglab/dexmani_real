@@ -25,51 +25,12 @@ from dexmani_real.ipc.schema import (
     HAND_TACTILE_FORCE_SHAPE,
     HAND_TACTILE_SUM_SHAPE,
 )
-from dexmani_real.robot.command_validation import check_worker_hand_command
+from dexmani_real.robot.command_validation import check_worker_hand_target
 from dexmani_real.utils.limits import limit_hand_target_delta
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
 logger = get_logger(__name__)
-
-
-def expired_hand_command_diagnostics(
-    command: np.ndarray,
-    measured_qpos: np.ndarray,
-    *,
-    now_monotonic_ns: int,
-    max_delta_rad_per_tick: float | np.ndarray,
-) -> str:
-    """Render bounded numeric context for one already-validated expired command."""
-    target = np.asarray(command["hand_qpos"][0], dtype=np.float64)
-    measured = np.asarray(measured_qpos, dtype=np.float64)
-    max_delta = np.broadcast_to(
-        np.asarray(max_delta_rad_per_tick, dtype=np.float64), HAND_JOINT_SHAPE
-    )
-    delta = np.abs(target - measured)
-    worst_joint = int(np.argmax(delta))
-    created_ns = int(command["created_monotonic_ns"][0])
-    valid_until_ns = int(command["valid_until_monotonic_ns"][0])
-    now_ns = int(now_monotonic_ns)
-    return json.dumps(
-        {
-            "action_id": int(command["action_id"][0]),
-            "age_ms": round((now_ns - created_ns) / 1e6, 3),
-            "delivery_window_ms": round((valid_until_ns - created_ns) / 1e6, 3),
-            "overdue_ms": round((now_ns - valid_until_ns) / 1e6, 3),
-            "max_delta_rad_per_tick": float(max_delta[worst_joint]),
-            "max_target_minus_measured_rad": round(float(delta[worst_joint]), 6),
-            "minimum_ramp_ticks": int(
-                np.ceil(delta[worst_joint] / max_delta[worst_joint])
-            ),
-            "worst_joint_index": worst_joint,
-            "worst_joint_measured_rad": round(float(measured[worst_joint]), 6),
-            "worst_joint_target_rad": round(float(target[worst_joint]), 6),
-        },
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
 
 
 def _limited_hand_setpoint(
@@ -205,7 +166,11 @@ def _publish_feedback(
     )
 
 
-def hand_loop(shared: Any, config: HandParams) -> None:
+def hand_loop(
+    shared: Any,
+    config: HandParams,
+    state_read_failure_timeout_s: float,
+) -> None:
     """Run one XHand worker; all SDK objects remain in this process."""
     from dexmani_real.robot.xhand import XHand, XHandSendStatus
     from dexmani_real.runtime.safety import (
@@ -250,6 +215,7 @@ def hand_loop(shared: Any, config: HandParams) -> None:
 
         last_state = initial_state
         last_source_ns = time.monotonic_ns()
+        read_failure_started_s: float | None = None
         last_sdk_accepted_qpos = initial_state.qpos.copy()
         accepted_target_action_id = 0
         accepted_target_monotonic_ns = 0
@@ -292,11 +258,8 @@ def hand_loop(shared: Any, config: HandParams) -> None:
         logger.info("hand_loop: ready")
 
         rate_mgr = LoopRate(config.loop_hz, label="hand")
-        operational_lower = np.asarray(config.qpos_min_rad, dtype=np.float64)
-        operational_upper = np.asarray(config.qpos_max_rad, dtype=np.float64)
         mechanical_lower = np.asarray(config.mechanical_qpos_min_rad, dtype=np.float64)
         mechanical_upper = np.asarray(config.mechanical_qpos_max_rad, dtype=np.float64)
-        last_rejected_ring_sequence = 0
 
         while shared.is_running.value:
             shared.set_heartbeat("hand", time.monotonic())
@@ -305,6 +268,9 @@ def hand_loop(shared: Any, config: HandParams) -> None:
 
             state = hand.get_state()
             if state is None:
+                now_s = time.monotonic()
+                if read_failure_started_s is None:
+                    read_failure_started_s = now_s
                 _publish_feedback(
                     shared,
                     qpos=last_state.qpos,
@@ -324,9 +290,16 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                     tipboard_err=last_state.tipboard_err,
                     source_monotonic_ns=last_source_ns,
                 )
+                if now_s - read_failure_started_s >= state_read_failure_timeout_s:
+                    shared.error_state.value = True
+                    raise RuntimeError(
+                        "hand state reads failed for "
+                        f"{now_s - read_failure_started_s:.3f}s"
+                    )
                 rate_mgr.wait()
                 continue
 
+            read_failure_started_s = None
             last_state = state
             last_source_ns = time.monotonic_ns()
             previous_board_errors = _log_board_error_transitions(
@@ -380,13 +353,6 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                 last_sdk_accepted_qpos = state.qpos.copy()
                 stats_generation = permit.run_generation
                 stats_generation_was_running = permit.state is SafetyState.RUNNING
-            if not permit.allows_motion:
-                rate_mgr.wait()
-                continue
-            if shared.error_state.value:
-                rate_mgr.wait()
-                continue
-
             result = shared.coupled_cmd_ring.read_latest()
             if result is None:
                 rate_mgr.wait()
@@ -401,12 +367,6 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                 ring_sequence=sequence_int,
                 valid_until_monotonic_ns=int(command["valid_until_monotonic_ns"][0]),
             )
-            command_generation = int(command["run_generation"][0])
-            if command_generation != permit.run_generation or not (
-                coupled_command_ticket_allows_execution(shared, ticket=ticket)
-            ):
-                rate_mgr.wait()
-                continue
             if sequence_int == last_exact_target_sequence:
                 # An accepted exact target is an endpoint event, not a
                 # level-triggered command.  Retries remain allowed only until
@@ -414,71 +374,41 @@ def hand_loop(shared: Any, config: HandParams) -> None:
                 duplicate_skips += 1
                 rate_mgr.wait()
                 continue
-            issue = check_worker_hand_command(
-                command,
-                operational_lower_rad=operational_lower,
-                operational_upper_rad=operational_upper,
+            action_id = int(command["action_id"][0])
+            target = np.asarray(command["hand_qpos"][0], dtype=np.float64)
+            issue = check_worker_hand_target(
+                target,
                 mechanical_lower_rad=mechanical_lower,
                 mechanical_upper_rad=mechanical_upper,
-                expected_run_generation=permit.run_generation,
-                now_monotonic_ns=time.monotonic_ns(),
             )
-            # A superseded/revoked snapshot has no authority to move hardware
-            # or latch a fault, even if its contents fail validation.
+            bounded: np.ndarray | None = None
+            if issue is None:
+                bounded = _limited_hand_setpoint(
+                    target,
+                    measured_qpos=state.qpos,
+                    last_sdk_accepted_qpos=last_sdk_accepted_qpos,
+                    is_running=permit.state is SafetyState.RUNNING,
+                    max_delta_rad_per_tick=config.hand_max_delta_rad_per_tick,
+                )
+                issue = check_worker_hand_target(
+                    bounded,
+                    mechanical_lower_rad=mechanical_lower,
+                    mechanical_upper_rad=mechanical_upper,
+                )
+            # This is the sole command-authority fence and the final operation
+            # before an otherwise valid setpoint crosses the XHand SDK boundary.
             if not coupled_command_ticket_allows_execution(shared, ticket=ticket):
                 rate_mgr.wait()
                 continue
             if issue is not None:
-                if issue.fault:
-                    logger.error(
-                        "hand_loop: unsafe action_id=%d: %s; latching runtime fault",
-                        int(command["action_id"][0]),
-                        issue.reason,
-                    )
-                    shared.error_state.value = True
-                    return
-                if sequence_int != last_rejected_ring_sequence:
-                    if issue.reason == "expired command":
-                        logger.info(
-                            "hand_loop: discarded command: %s diagnostics=%s",
-                            issue.reason,
-                            expired_hand_command_diagnostics(
-                                command,
-                                state.qpos,
-                                now_monotonic_ns=time.monotonic_ns(),
-                                max_delta_rad_per_tick=config.hand_max_delta_rad_per_tick,
-                            ),
-                        )
-                    else:
-                        logger.info("hand_loop: discarded command: %s", issue.reason)
-                    last_rejected_ring_sequence = sequence_int
-                rate_mgr.wait()
-                continue
-
-            action_id = int(command["action_id"][0])
-            target = np.asarray(command["hand_qpos"][0], dtype=np.float64)
-            bounded = _limited_hand_setpoint(
-                target,
-                measured_qpos=state.qpos,
-                last_sdk_accepted_qpos=last_sdk_accepted_qpos,
-                is_running=permit.state is SafetyState.RUNNING,
-                max_delta_rad_per_tick=config.hand_max_delta_rad_per_tick,
-            )
-            if not coupled_command_ticket_allows_execution(shared, ticket=ticket):
-                rate_mgr.wait()
-                continue
-            if np.any(bounded < mechanical_lower - 1e-12) or np.any(
-                bounded > mechanical_upper + 1e-12
-            ):
                 logger.error(
-                    "hand_loop: rate-bounded action_id=%d violates mechanical limits",
+                    "hand_loop: unsafe action_id=%d: %s; latching runtime fault",
                     action_id,
+                    issue,
                 )
                 shared.error_state.value = True
                 return
-            if not coupled_command_ticket_allows_execution(shared, ticket=ticket):
-                rate_mgr.wait()
-                continue
+            assert bounded is not None
             sdk_send_attempts += 1
             send_status = hand.send_action(bounded)
             if send_status is XHandSendStatus.ACCEPTED:

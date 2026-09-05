@@ -248,24 +248,8 @@ def _validated_defaults_snapshot(data: Mapping[str, Any]) -> dict[str, Any]:
     for name in _SECTION_NAMES:
         rebuilt[name] = rebuild(getattr(defaults, name), data[name], name)
 
-    # Cross-section validation belongs here rather than in a worker.
-    if rebuilt["camera"].recording_stall_abort_s <= rebuilt["camera"].max_frame_age_s:
-        raise ValueError(
-            "camera.recording_stall_abort_s must exceed camera.max_frame_age_s"
-        )
-    if (
-        rebuilt["policy"].control_hz <= 0
-        or rebuilt["arm"].loop_hz <= 0
-        or rebuilt["hand"].loop_hz <= 0
-    ):
-        raise ValueError("all configured control rates must be positive")
+    # Only relationships between independently-owned sections belong here.
     workspace = rebuilt["policy"].workspace
-    if (
-        workspace.x_min > workspace.x_max
-        or workspace.y_min > workspace.y_max
-        or workspace.z_min > workspace.z_max
-    ):
-        raise ValueError("policy.workspace lower bounds must not exceed upper bounds")
     workspace_widths = np.array(
         [
             workspace.x_max - workspace.x_min,

@@ -26,6 +26,7 @@ if str(_REPO_ROOT) not in sys.path:
 from dexmani_real import PACKAGE_DIR
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.planning.poses import forward_from_quat_wxyz, normalize_quat_wxyz
+from dexmani_real.runtime.supervisor import wait_subsystem_ready
 from dexmani_real.runtime.workers import (
     WorkerSpec,
     build_processes,
@@ -277,7 +278,11 @@ def main(argv: list[str] | None = None) -> int:
             "\n  Waiting for VR connection (up to 120 s) — put on Quest headset...",
             flush=True,
         )
-        if not shared.wait_ready("vr", cfg.vr_ready_timeout_s):
+        if not wait_subsystem_ready(
+            shared,
+            [(specs[0], vr_proc)],
+            {"vr": cfg.vr_ready_timeout_s},
+        ):
             print("  ERROR: VR receiver startup timeout", flush=True)
             return 1
         print("  VR connected", flush=True)

@@ -255,12 +255,11 @@ def _run_check(args: argparse.Namespace) -> int:
 def _prepare_lifecycle_inputs(
     args: argparse.Namespace, info: Any, *, execute: bool
 ) -> _LifecycleInputs:
-    """Resolve the PolicySpec/Real projection before lifecycle startup."""
+    """Resolve CLI-owned inputs before lifecycle compatibility validation."""
     from dexmani_real.config.runtime import resolve_runtime_config
     from dexmani_real.deployment.config import (
         PolicyDeploymentConfig,
         PolicyWorkerConfig,
-        validate_policy_runtime_compatibility,
     )
 
     if not isinstance(execute, bool):
@@ -270,7 +269,6 @@ def _prepare_lifecycle_inputs(
         inference_mode=args.inference_mode,
         max_action_steps=args.max_action_steps,
     )
-    validate_policy_runtime_compatibility(info.spec, runtime)
     worker_config = PolicyWorkerConfig(
         experiment=info.selector,
         device=args.device,
@@ -286,7 +284,7 @@ def _prepare_lifecycle_inputs(
 
 
 def _start_lifecycle(inputs: _LifecycleInputs) -> int:
-    """Enter the hardware lifecycle after CLI-owned compatibility checks."""
+    """Enter the lifecycle that owns Real/Policy compatibility validation."""
     from dexmani_real.deployment.lifecycle import run_policy_deployment
 
     return run_policy_deployment(

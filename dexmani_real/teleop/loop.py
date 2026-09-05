@@ -233,27 +233,6 @@ def _try_load_hand_kinematics(
     return hand_fk
 
 
-def _wait_for_policy_dependencies(
-    shared: RuntimeChannels,
-    config: TeleopConfig,
-    *,
-    recording_enabled: bool,
-) -> tuple[str, float] | None:
-    """Wait for non-interactive policy dependencies and return a timeout."""
-    capability_names = ["arm"]
-    if config.runtime.policy.hand_enabled:
-        capability_names.append("hand")
-    if recording_enabled:
-        capability_names += ["camera", "recorder"]
-    for capability_name in capability_names:
-        timeout_s = float(
-            dict(config.runtime.safety.readiness_timeouts_s)[capability_name]
-        )
-        if not shared.wait_ready(capability_name, timeout_s):
-            return capability_name, timeout_s
-    return None
-
-
 def teleop_loop(shared: RuntimeChannels, config: TeleopConfig | None = None) -> None:
     """Teleoperation process entry point used by ``collect_teleop.py``.
 
@@ -284,18 +263,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig | None = None) -> 
     handbase_quat_eef_wxyz = np.asarray(
         cfg.runtime.hand.T_eef_handbase_quat_wxyz, dtype=np.float64
     )
-    logger.info("Teleop: waiting for policy dependencies...")
-    readiness_timeout = _wait_for_policy_dependencies(
-        shared, cfg, recording_enabled=recording_enabled
-    )
-    if readiness_timeout is not None:
-        capability_name, timeout_s = readiness_timeout
-        logger.error("Teleop: %s startup timeout (%.1fs)", capability_name, timeout_s)
-        shared.error_state.value = True
-        kb.stop()
-        return
-    logger.info("Teleop: policy dependencies ready")
-
     arm_state = read_arm_state_causal(shared)
     hand_state = read_hand_state_causal(shared)
     if cfg.runtime.policy.hand_enabled:

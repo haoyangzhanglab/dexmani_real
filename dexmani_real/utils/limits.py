@@ -128,14 +128,24 @@ def limit_hand_target_delta(
     return measured + np.clip(target - measured, -max_delta, max_delta)
 
 
+def hand_target_within_operational_bounds(
+    target_qpos: np.ndarray,
+    operational_lower: np.ndarray,
+    operational_upper: np.ndarray,
+) -> bool:
+    """Return whether one already-canonical hand target is operationally valid."""
+    return bool(
+        np.all(target_qpos >= operational_lower)
+        and np.all(target_qpos <= operational_upper)
+    )
+
+
 def canonicalize_policy_hand_endpoint_roundoff(
     hand_cmd: object,
     operational_lower: object,
     operational_upper: object,
     mechanical_lower: object,
     mechanical_upper: object,
-    rated_lower: object,
-    rated_upper: object,
 ) -> tuple[np.ndarray, bool]:
     """Canonicalize only a learned policy's tiny operational-bound roundoff.
 
@@ -143,60 +153,29 @@ def canonicalize_policy_hand_endpoint_roundoff(
     before its safety checks.  A value one or a few float32 ULPs beyond a
     *narrower operational* limit is not a meaningful physical command.  This
     helper maps it to the exact operational boundary, but first keeps the
-    mechanical/rated envelope strict.  Manual, teleoperation, and replay paths
-    remain reject-only through :func:`validate_hand_command_bounds`.
+    mechanical envelope strict. Manual, teleoperation, and replay paths remain
+    reject-only through :func:`validate_hand_command_bounds`.
     """
     command = np.asarray(hand_cmd, dtype=np.float64)
     op_lower = np.asarray(operational_lower, dtype=np.float64)
     op_upper = np.asarray(operational_upper, dtype=np.float64)
     mech_lower = np.asarray(mechanical_lower, dtype=np.float64)
     mech_upper = np.asarray(mechanical_upper, dtype=np.float64)
-    rated_low = np.asarray(rated_lower, dtype=np.float64)
-    rated_high = np.asarray(rated_upper, dtype=np.float64)
     if command.shape != HAND_JOINT_SHAPE:
         raise ValueError(
             f"hand policy endpoint must have shape {HAND_JOINT_SHAPE}, got {command.shape}"
         )
     if not np.all(np.isfinite(command)):
         raise ValueError("hand policy endpoint must be finite")
-    validate_hand_limit_nesting(
-        op_lower,
-        op_upper,
-        mech_lower,
-        mech_upper,
-        rated_low,
-        rated_high,
-        label="hand policy endpoint",
-    )
-    if np.any(command < mech_lower - 1e-12) or np.any(command > mech_upper + 1e-12):
+    if np.any(command < mech_lower) or np.any(command > mech_upper):
         raise ValueError("hand policy endpoint violates rated mechanical joint limits")
-    below = np.flatnonzero(
-        command < op_lower - POLICY_HAND_ENDPOINT_ROUNDOFF_TOLERANCE_RAD
+    canonical = command.copy()
+    lower_roundoff = (command < op_lower) & (
+        command >= op_lower - POLICY_HAND_ENDPOINT_ROUNDOFF_TOLERANCE_RAD
     )
-    above = np.flatnonzero(
-        command > op_upper + POLICY_HAND_ENDPOINT_ROUNDOFF_TOLERANCE_RAD
+    upper_roundoff = (command > op_upper) & (
+        command <= op_upper + POLICY_HAND_ENDPOINT_ROUNDOFF_TOLERANCE_RAD
     )
-    if below.size or above.size:
-        detail: list[str] = []
-        detail.extend(
-            (
-                f"j{index}: target={command[index]:.17g}, "
-                f"lower={op_lower[index]:.17g}, "
-                f"delta={command[index] - op_lower[index]:+.3e}"
-            )
-            for index in below
-        )
-        detail.extend(
-            (
-                f"j{index}: target={command[index]:.17g}, "
-                f"upper={op_upper[index]:.17g}, "
-                f"delta={command[index] - op_upper[index]:+.3e}"
-            )
-            for index in above
-        )
-        raise ValueError(
-            "hand policy endpoint violates operational joint limits: "
-            + ", ".join(detail)
-        )
-    canonical = np.clip(command, op_lower, op_upper)
+    canonical[lower_roundoff] = op_lower[lower_roundoff]
+    canonical[upper_roundoff] = op_upper[upper_roundoff]
     return canonical, not np.array_equal(canonical, command)

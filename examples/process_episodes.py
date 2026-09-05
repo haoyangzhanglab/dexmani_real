@@ -28,6 +28,10 @@ codes: 0 at least one episode was published
 or an audit completed; 1 nothing was published or the publish failed; 2 usage
 or environment error (bad input root, existing output root, unreadable
 annotations).
+
+Writer publication reopens each output for bounded HDF5 structural sanity.
+Pass ``--verify-output`` to also rescan every written payload and semantic
+contract before the batch is published.
 """
 
 from __future__ import annotations
@@ -211,6 +215,14 @@ def _parser() -> argparse.ArgumentParser:
             "episode_<name>.json in addition to the always-written invalid-frame "
             "summary (off by default; "
             "ignored in --dry-run and --compare-profiles)."
+        ),
+    )
+    parser.add_argument(
+        "--verify-output",
+        action="store_true",
+        help=(
+            "Before publication, fully rescan each written processed HDF5 payload "
+            "and semantic contract (slow; normal consumers/exporters remain strict)."
         ),
     )
     return parser
@@ -652,6 +664,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_root,
                 config,
                 annotations_path=merged_path,
+                verify_output=args.verify_output,
             )
         except Exception as exc:
             # A publish-only failure (validation, transform, or h5py error)

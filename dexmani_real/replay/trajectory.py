@@ -32,6 +32,7 @@ _MODEL_PROVENANCE_KEYS = (
     "arm_hand_urdf_sha256",
     "arm_hand_srdf_sha256",
 )
+_JOINT_LIMIT_TOLERANCE_RAD = 1e-12
 
 
 def _is_sha256(value: str | None) -> bool:
@@ -70,6 +71,7 @@ class TrajectoryData:
     action_source: str | None = None
     resolved_config_sha256: str | None = None
     model_provenance: tuple[tuple[str, str], ...] = ()
+    provenance_warnings: tuple[str, ...] = ()
     send_mask: np.ndarray | None = None
 
     @property
@@ -94,8 +96,7 @@ def resolve_episode_path(raw_path: str) -> tuple[str, str]:
 
 
 def load_trajectory(episode_path: str) -> TrajectoryData:
-    """Load the exact submitted command stream for physical replay.
-    """
+    """Load the exact submitted command stream for physical replay."""
     resolved_path, _episode_name = resolve_episode_path(episode_path)
     if not Path(resolved_path).exists():
         raise FileNotFoundError(f"Episode not found: {episode_path}")
@@ -106,7 +107,6 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
                 "Episode %s is internally readable but below the configured minimum recording duration",
                 resolved_path,
             )
-        reader.require_valid(purpose="physical replay")
         h5 = reader.h5f
         meta = h5.get("meta")
         num_frames_attr = (
@@ -222,6 +222,7 @@ def _processed_replay_source(
     from dexmani_real.data.process import (
         PROCESSED_SCHEMA_NAME,
         PROCESSED_SCHEMA_VERSION,
+        validate_processed_provenance,
     )
 
     if not artifact_path.is_file():
@@ -237,6 +238,10 @@ def _processed_replay_source(
             raise ValueError(
                 f"processed episode {artifact_path.name} must have domain='real'"
             )
+        provenance = validate_processed_provenance(
+            artifact,
+            label=f"processed episode {artifact_path.name}",
+        )
 
         try:
             decision = json.loads(str(artifact.attrs["source_decision_json"]))
@@ -262,47 +267,18 @@ def _processed_replay_source(
                 f"processed episode {artifact_path.name} lacks a valid raw data.h5 hash"
             )
 
-        try:
-            processed_frames = int(artifact.attrs["episode_steps"])
-            source_frames = int(artifact.attrs["source_frames"])
-            retained_rows = np.asarray(
-                artifact["provenance/source_row_index"][:], dtype=np.int64
-            )
-            source_segment_ends = np.asarray(
-                artifact["provenance/source_segment_ends"][:], dtype=np.int64
-            )
-            source_keep_mask = np.asarray(
-                artifact["provenance/source_keep_mask"][:], dtype=bool
-            )
-            source_drop_reason_bits = np.asarray(
-                artifact["provenance/source_drop_reason_bits"][:], dtype=np.uint64
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"processed episode {artifact_path.name} has invalid row provenance"
-            ) from exc
-        if (
-            processed_frames <= 0
-            or source_frames <= 0
-            or retained_rows.shape != (processed_frames,)
-            or retained_rows.size == 0
-            or not np.array_equal(
-                source_segment_ends, np.asarray([processed_frames], dtype=np.int64)
-            )
-            or np.any(np.diff(retained_rows) != 1)
-            or source_keep_mask.shape != (source_frames,)
-            or source_drop_reason_bits.shape != (source_frames,)
-            or not np.array_equal(retained_rows, np.flatnonzero(source_keep_mask))
-            or np.any(source_drop_reason_bits[source_keep_mask] != 0)
-            or np.any(source_drop_reason_bits[~source_keep_mask] == 0)
-        ):
-            raise ValueError(
-                f"processed episode {artifact_path.name} has inconsistent row provenance"
-            )
-
         source_config_sha256 = str(
             artifact.attrs.get("source_resolved_config_sha256", "")
         )
+        retained_rows = provenance.source_rows
+        source_frames = int(provenance.keep_mask.shape[0])
+        if not np.array_equal(
+            provenance.segment_ends,
+            np.asarray([retained_rows.size], dtype=np.int64),
+        ) or np.any(np.diff(retained_rows) != 1):
+            raise ValueError(
+                f"processed episode {artifact_path.name} has inconsistent row provenance"
+            )
 
     return (
         Path(source_path_text),
@@ -352,6 +328,7 @@ def _select_raw_trajectory_rows(
         action_source=raw_trajectory.action_source,
         resolved_config_sha256=raw_trajectory.resolved_config_sha256,
         model_provenance=raw_trajectory.model_provenance,
+        provenance_warnings=raw_trajectory.provenance_warnings,
         send_mask=(
             None
             if raw_trajectory.send_mask is None
@@ -392,8 +369,8 @@ def load_processed_trajectory(episode_path: str) -> TrajectoryData:
             f"processed episode {artifact_path.name} source frame count does not match raw source"
         )
     if raw_trajectory.resolved_config_sha256 != source_config_sha256:
-        raise ValueError(
-            f"processed episode {artifact_path.name} source config hash does not match raw source"
+        raw_trajectory.provenance_warnings += (
+            "processed source config hash does not match the raw source",
         )
     trajectory = _select_raw_trajectory_rows(raw_trajectory, retained_rows)
     logger.info(
@@ -443,12 +420,8 @@ def replay_start_state(trajectory: TrajectoryData) -> tuple[np.ndarray, np.ndarr
     return arm_qpos.copy(), hand_qpos.copy()
 
 
-def _verify_trajectory_provenance(
-    trajectory: TrajectoryData,
-    *,
-    provenance_sha256: str,
-) -> None:
-    """Fail-closed provenance gate: source stream, config hash, and model hashes."""
+def _verify_trajectory_input(trajectory: TrajectoryData) -> None:
+    """Fail closed on the exact source stream needed for physical preflight."""
     if trajectory.action_source != "sent":
         raise ValueError(
             "physical replay requires the exact submitted action stream ('sent')"
@@ -461,15 +434,91 @@ def _verify_trajectory_provenance(
         raise ValueError(
             f"physical replay arm actions must be finite shape {expected_arm_shape}"
         )
-    if not _is_sha256(trajectory.resolved_config_sha256):
-        raise ValueError(
-            "physical replay recording provenance lacks a valid resolved_config_sha256"
+
+
+def _canonicalize_replay_arm_actions(
+    trajectory: TrajectoryData,
+    runtime: ResolvedRuntimeConfig,
+) -> np.ndarray:
+    """Return the nearest-equivalent arm stream used for physical preflight.
+
+    Each target is mapped to the nearest limit-valid 2π equivalent relative to
+    the preceding target, beginning at the recorded start state.  This models
+    replay's measured-pose canonicalization without rejecting equivalent xArm
+    angles or checking geometry on discontinuous raw angle representatives.
+    """
+    arm_actions = np.asarray(trajectory.action_arm_joint, dtype=np.float64)
+    canonical_actions = np.empty_like(arm_actions)
+    lower = np.asarray(runtime.arm.joint_limit_lower, dtype=np.float64)
+    upper = np.asarray(runtime.arm.joint_limit_upper, dtype=np.float64)
+    reference = np.asarray(trajectory.arm_qpos[0], dtype=np.float64)
+    for frame_index, action in enumerate(arm_actions):
+        canonical = wrap_nearest_equivalent(
+            action,
+            reference,
+            tuple(runtime.arm.joint_limit_lower),
+            tuple(runtime.arm.joint_limit_upper),
         )
-    if trajectory.resolved_config_sha256 != provenance_sha256:
+        if np.any(canonical < lower) or np.any(canonical > upper):
+            raise ValueError(
+                "physical replay arm action at frame "
+                f"{frame_index} violates joint limits"
+            )
+        canonical_actions[frame_index] = canonical
+        reference = canonical
+    return canonical_actions
+
+
+def _validate_replay_hand_limits(
+    hand_actions: np.ndarray,
+    recorded_hand_start: np.ndarray,
+    runtime: ResolvedRuntimeConfig,
+) -> None:
+    """Reject hand states or commands outside their physical replay envelopes."""
+    mechanical_lower = np.asarray(
+        runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
+    )
+    mechanical_upper = np.asarray(
+        runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
+    )
+    if np.any(recorded_hand_start < mechanical_lower) or np.any(
+        recorded_hand_start > mechanical_upper
+    ):
+        raise ValueError("physical replay first hand_qpos violates mechanical limits")
+
+    command_lower = np.asarray(runtime.hand.qpos_min_rad, dtype=np.float64)
+    command_upper = np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64)
+    violation_rows = np.flatnonzero(
+        np.any(
+            (hand_actions < command_lower - _JOINT_LIMIT_TOLERANCE_RAD)
+            | (hand_actions > command_upper + _JOINT_LIMIT_TOLERANCE_RAD),
+            axis=1,
+        )
+    )
+    if violation_rows.size:
         raise ValueError(
-            "physical replay config provenance mismatch: recorded config differs from replay config"
+            "physical replay hand action at frame "
+            f"{int(violation_rows[0])} violates command joint limits"
         )
 
+
+def _reproducibility_warnings(
+    trajectory: TrajectoryData,
+    *,
+    provenance_sha256: str,
+) -> tuple[str, ...]:
+    """Return non-safety provenance differences after physical validation.
+
+    The caller must only use this after the complete trajectory has passed the
+    current geometry and runtime preflight.  At that point the stored hashes
+    remain useful reproducibility evidence, but are not a substitute for the
+    successful physical validation that just occurred.
+    """
+    warnings = list(trajectory.provenance_warnings)
+    if not _is_sha256(trajectory.resolved_config_sha256):
+        warnings.append("recording lacks a valid resolved_config_sha256")
+    elif trajectory.resolved_config_sha256 != provenance_sha256:
+        warnings.append("recorded config hash differs from the replay config")
     recorded_models = dict(trajectory.model_provenance)
     missing_models = [
         name
@@ -477,22 +526,26 @@ def _verify_trajectory_provenance(
         if not _is_sha256(recorded_models.get(name))
     ]
     if missing_models:
-        raise ValueError(
-            f"physical replay model provenance is incomplete: {missing_models}"
+        warnings.append(f"recorded model provenance is incomplete: {missing_models}")
+    try:
+        current_models = {
+            name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in zip(_MODEL_PROVENANCE_KEYS, preflight_model_paths())
+        }
+    except OSError as exc:
+        warnings.append(
+            f"could not audit current URDF/SRDF provenance: {type(exc).__name__}: {exc}"
         )
-    current_models = {
-        name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for name, path in zip(_MODEL_PROVENANCE_KEYS, preflight_model_paths())
-    }
+        return tuple(warnings)
     mismatched_models = [
         name
         for name in _MODEL_PROVENANCE_KEYS
-        if recorded_models[name] != current_models[name]
+        if _is_sha256(recorded_models.get(name))
+        and recorded_models[name] != current_models[name]
     ]
     if mismatched_models:
-        raise ValueError(
-            f"physical replay model provenance mismatch: {mismatched_models}"
-        )
+        warnings.append(f"recorded model hashes differ: {mismatched_models}")
+    return tuple(warnings)
 
 
 def verify_replay_preflight(
@@ -503,8 +556,8 @@ def verify_replay_preflight(
 ) -> None:
     """Fail-closed validation immediately before spawning hardware workers.
 
-    Checks: recorded first measured state, hand-data attestation, provenance
-    (source/config/models), the recorded-state-to-first-command transition, and
+    Checks: recorded first measured state, hand-data attestation, full arm/hand
+    command hard limits, the recorded-state-to-first-command transition, and
     every adjacent command pair for workspace bounds and collision
     (self-collision plus static obstacle boxes). Robot-table contact is
     deliberately not a replay rejection condition (user_design.md §3): replayed
@@ -515,16 +568,15 @@ def verify_replay_preflight(
     require_hand_actions(trajectory)
     if not bool(runtime.policy.hand_enabled):
         raise ValueError("physical replay requires policy.hand_enabled=true")
-    _verify_trajectory_provenance(
-        trajectory,
-        provenance_sha256=provenance_sha256,
-    )
+    _verify_trajectory_input(trajectory)
     modeled_hand = modeled_hand_actions(trajectory)
     recorded_arm_start, recorded_hand_start = replay_start_state(trajectory)
     arm_lower = np.asarray(runtime.arm.joint_limit_lower, dtype=np.float64)
     arm_upper = np.asarray(runtime.arm.joint_limit_upper, dtype=np.float64)
     if np.any(recorded_arm_start < arm_lower) or np.any(recorded_arm_start > arm_upper):
         raise ValueError("physical replay first arm_qpos violates joint limits")
+    arm_actions = _canonicalize_replay_arm_actions(trajectory, runtime)
+    _validate_replay_hand_limits(modeled_hand, recorded_hand_start, runtime)
     workspace = np.array(
         [
             [runtime.policy.workspace.x_min, runtime.policy.workspace.x_max],
@@ -547,13 +599,7 @@ def verify_replay_preflight(
         # replay controller's own planner (see replay_controller.setup).
         table=None,
     )
-    arm_actions = np.asarray(trajectory.action_arm_joint, dtype=np.float64)
-    first_arm_cmd = wrap_nearest_equivalent(
-        arm_actions[0],
-        recorded_arm_start,
-        tuple(runtime.arm.joint_limit_lower),
-        tuple(runtime.arm.joint_limit_upper),
-    )
+    first_arm_cmd = arm_actions[0]
     if not planner.is_workspace_segment_safe(recorded_arm_start, first_arm_cmd):
         raise ValueError("physical replay workspace rejection at recorded start->0")
     if not planner.collision_model.check_transition_collision_free(
@@ -578,3 +624,11 @@ def verify_replay_preflight(
             raise ValueError(
                 f"physical replay collision rejection at transition {start}->{end}"
             )
+    for warning in _reproducibility_warnings(
+        trajectory,
+        provenance_sha256=provenance_sha256,
+    ):
+        logger.warning(
+            "physical replay passed current geometry preflight; reproducibility warning: %s",
+            warning,
+        )

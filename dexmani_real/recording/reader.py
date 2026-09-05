@@ -115,7 +115,14 @@ class EpisodeReader:
     (``f["arm_qpos"]``, ``f["depth"]``).
     """
 
-    def __init__(self, h5_path: str | Path) -> None:
+    def __init__(self, h5_path: str | Path, *, verify_hash: bool = False) -> None:
+        """Open one published episode.
+
+        Normal reads validate the raw schema and its data semantics when
+        :attr:`validity` or :meth:`require_valid` is used.  They deliberately do
+        not rescan large sidecars.  Set ``verify_hash=True`` or call
+        :meth:`audit_integrity` for the slower artifact-integrity audit.
+        """
         self._path = Path(h5_path)
         self._closed = False
         self._cache: dict[str, np.ndarray] = {}
@@ -147,13 +154,15 @@ class EpisodeReader:
                 f"unsupported episode schema v{schema_version}; expected v"
                 f"{EPISODE_SCHEMA_VERSION}"
             )
-        manifest_errors = self._sidecar_manifest_errors()
-        if manifest_errors:
-            self.close()
-            raise ValueError(
-                "raw sidecar manifest validation failed: " + "; ".join(manifest_errors)
-            )
         self._rgb_decoder = VideoDecoder(paths["rgb"])
+        try:
+            if verify_hash:
+                self.audit_integrity()
+            else:
+                self.require_valid(purpose="episode read")
+        except Exception:
+            self.close()
+            raise
 
     @property
     def h5f(self) -> MergedH5File:
@@ -174,11 +183,7 @@ class EpisodeReader:
         return 0 if meta is None else int(meta.attrs.get("schema_version", 0) or 0)
 
     def _sidecar_manifest_errors(self) -> tuple[str, ...]:
-        """Recompute sidecar hashes and compare them with data.h5 metadata.
-
-        Do not cache this result: callers may ask for ``validity`` after a
-        sidecar has been modified while the reader is open.
-        """
+        """Return full sidecar-manifest audit errors without caching results."""
         meta = self._h5f.get("meta")
         if meta is None:
             return ("data.h5 is missing /meta",)
@@ -190,6 +195,34 @@ class EpisodeReader:
         except (FileNotFoundError, OSError) as exc:
             return (f"failed to hash raw sidecars: {type(exc).__name__}: {exc}",)
         return validate_raw_member_hashes(meta.attrs, member_sha256)
+
+    def audit_integrity(self) -> None:
+        """Run the explicit, expensive raw-artifact integrity audit.
+
+        This verifies ordinary raw validity first, then recomputes both sidecar
+        SHA-256 values against the manifest and fully decodes the RGB stream to
+        attest its frame count.  It is intentionally separate from ordinary
+        episode reads and processing admission.
+        """
+        self.require_valid(purpose="artifact integrity audit")
+        manifest_errors = self._sidecar_manifest_errors()
+        if manifest_errors:
+            raise ValueError(
+                "raw sidecar manifest validation failed: " + "; ".join(manifest_errors)
+            )
+        meta = self._h5f.get("meta")
+        frame_count = int(meta.attrs.get("num_frames", -1)) if meta else -1
+        if self._rgb_decoder is None:
+            raise ValueError("episode RGB decoder is unavailable for integrity audit")
+        try:
+            decoded_frames = self._rgb_decoder.count_decoded_frames()
+        except Exception as exc:
+            raise ValueError("failed to decode RGB stream for integrity audit") from exc
+        if decoded_frames != frame_count:
+            raise ValueError(
+                "RGB decoded frame count does not match data.h5 metadata: "
+                f"{decoded_frames} != {frame_count}"
+            )
 
     @property
     def min_frames_met(self) -> bool:
@@ -266,15 +299,13 @@ class EpisodeReader:
         if layout_errors:
             return ValidityState.INVALID
         try:
-            if self._sidecar_manifest_errors():
-                return ValidityState.INVALID
             semantic_errors = validate_raw_semantics(
                 datasets,
                 frame_count=frame_count,
                 attrs=meta.attrs,
             )
         except Exception:
-            logger.warning("failed raw semantic/integrity validation", exc_info=True)
+            logger.warning("failed raw semantic validation", exc_info=True)
             return ValidityState.INVALID
         if semantic_errors:
             return ValidityState.INVALID
@@ -295,12 +326,6 @@ class EpisodeReader:
             or depth.dtype != np.dtype(np.uint16)
             or depth.shape[0] != frame_count
         ):
-            return ValidityState.INVALID
-        try:
-            if self._rgb_decoder.count_decoded_frames() != frame_count:
-                return ValidityState.INVALID
-        except Exception:
-            logger.warning("failed to decode episode RGB stream", exc_info=True)
             return ValidityState.INVALID
         return ValidityState.VALID
 

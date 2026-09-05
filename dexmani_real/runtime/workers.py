@@ -98,8 +98,9 @@ def _finalize_shutdown_state(
                 error_field.value = True
             transition(shared, SafetyState.FAULT)
 
+
 def _close_runtime_channels(shared: Any) -> bool:
-    """Close IPC and convert cleanup exceptions into a failed shutdown report."""
+    """Close IPC and record resource-cleanup errors without changing safety state."""
     try:
         return bool(shared.close())
     except Exception:
@@ -107,8 +108,8 @@ def _close_runtime_channels(shared: Any) -> bool:
         return False
 
 
-def _latch_shutdown_fault(shared: Any) -> None:
-    """Fail closed when verified shutdown or IPC cleanup cannot complete."""
+def _latch_unverified_shutdown_fault(shared: Any) -> None:
+    """Fail closed when a child might still access live IPC resources."""
     error_field = getattr(shared, "error_state", None)
     if error_field is not None:
         error_field.value = True
@@ -174,7 +175,7 @@ def stop_processes_verified(
         if process.is_alive():
             escalation = "kill"
             if not hasattr(process, "kill"):
-                _latch_shutdown_fault(shared)
+                _latch_unverified_shutdown_fault(shared)
                 raise RuntimeError(
                     f"process {process.name} ignored SIGTERM and kill() is unavailable"
                 )
@@ -182,7 +183,7 @@ def stop_processes_verified(
             process.join(timeout=kill_timeout_s)
         if process.is_alive() or process.exitcode is None:
             # Never unlink shared memory while a child may still access it.
-            _latch_shutdown_fault(shared)
+            _latch_unverified_shutdown_fault(shared)
             raise RuntimeError(
                 f"process {process.name} could not be confirmed stopped; RuntimeChannels remains open"
             )
@@ -202,7 +203,7 @@ def shutdown_processes_verified(
     kill_timeout_s: float = 1.0,
     disarm_if_clean: bool = False,
 ) -> ShutdownReport:
-    """Stop workers, close IPC only after verification, then finalize safety."""
+    """Stop workers, finalize physical safety, then close IPC after verification."""
     frozen_exits = stop_processes_verified(
         shared,
         processes,
@@ -211,15 +212,12 @@ def shutdown_processes_verified(
         kill_timeout_s=kill_timeout_s,
     )
 
+    _finalize_shutdown_state(
+        shared,
+        frozen_exits,
+        disarm_if_clean=disarm_if_clean,
+    )
     shared_closed = _close_runtime_channels(shared)
-    if not shared_closed:
-        _latch_shutdown_fault(shared)
-    else:
-        _finalize_shutdown_state(
-            shared,
-            frozen_exits,
-            disarm_if_clean=disarm_if_clean,
-        )
     report = ShutdownReport(frozen_exits, shared_closed=shared_closed)
     logger.info("verified process shutdown: %s", report.exits)
     return report

@@ -31,7 +31,6 @@ from dexmani_real.deployment.worker import (
     _select_control_grid_reference_ns,
     _to_policy_observation,
 )
-from dexmani_real.integrations.dexmani_policy import DexManiPolicyRuntime
 from dexmani_real.ipc.channels import RuntimeChannelsConfig
 from dexmani_real.ipc.schema import HAND_TACTILE_DTYPE
 from dexmani_real.planning.fingertip import compute_fingertip_points_xarm_base
@@ -114,42 +113,38 @@ class _HandFk:
 
 
 class MultimodalContractTest(unittest.TestCase):
-    def test_adapter_rejects_rgb_shape_drift(self) -> None:
-        runtime = resolve_runtime_config()
-        spec = _policy_spec(("joint_state", "rgb"), runtime)
-
-        class Loaded:
-            info = object()
-
-            def __init__(self):
-                self.spec = spec
-
-            def warmup(self, *, samples):
-                return (0.0,) * samples
-
-            def reset_episode(self):
-                pass
-
-            def predict(self, _observation):
-                return np.zeros((spec.n_action_steps, 19), dtype=np.float64)
-
-            def close(self):
-                pass
-
-        adapter = DexManiPolicyRuntime(Loaded(), spec)
-        observation = PolicyObservation(
+    def test_observation_rejects_future_frames_and_camera_restart_mixing(self) -> None:
+        kwargs = dict(
             observation_id=1,
             run_generation=1,
-            anchor_monotonic_ns=30,
-            latest_source_monotonic_ns=10,
-            logical_step_monotonic_ns=20,
-            arrays={
-                "joint_state": np.zeros((2, 19), dtype=np.float32),
-                "rgb": np.zeros((2, 1, 1, 3), dtype=np.uint8),
-            },
+            run_started_monotonic_ns=50,
+            anchor_monotonic_ns=220,
+            latest_source_monotonic_ns=200,
+            logical_step_monotonic_ns=200,
         )
+        future = FrameWindow(
+            values=np.zeros((2, 7)),
+            source_sequence=np.array([1, 2], dtype=np.uint64),
+            source_monotonic_ns=np.array([90, 210], dtype=np.uint64),
+            publish_monotonic_ns=np.array([95, 221], dtype=np.uint64),
+            valid_mask=np.ones(2, dtype=np.uint8),
+        )
+        with self.assertRaisesRegex(ValueError, "causal cut"):
+            ObservationBatch(**kwargs, arm_history=future)
+
+        rgbs = tuple(
+            RgbFrame(np.zeros((2, 2, 3), np.uint8), seq, source, source + 5, gen)
+            for seq, source, gen in ((1, 100, 1), (2, 200, 2))
+        )
+        with self.assertRaisesRegex(ValueError, "camera generation"):
+            ObservationBatch(**kwargs, rgb_history=rgbs)
+
+    def test_real_compatibility_rejects_rgb_shape_drift(self) -> None:
+        runtime = resolve_runtime_config()
+        spec = _policy_spec(("joint_state", "rgb"), runtime)
+        spec.observation_fields[1].shape = (1, 1, 3)
         with self.assertRaises(ValueError):
-            adapter.predict(observation)
+            validate_policy_runtime_compatibility(spec, runtime)
 
     def test_fingertip_eef_pose_reuse_matches_without_second_arm_fk(self) -> None:
         arm_fk = _ArmFk()
@@ -247,20 +242,45 @@ class MultimodalContractTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_policy_runtime_compatibility(spec, runtime)
 
-    def test_policy_observation_exact_arrays_are_owned_and_read_only(self) -> None:
+    def test_policy_observation_keeps_final_arrays_writable_without_a_recopy(
+        self,
+    ) -> None:
         source = np.zeros((2, 19), dtype=np.float32)
+        arrays = {"joint_state": source}
         observation = PolicyObservation(
             observation_id=1,
             run_generation=2,
             anchor_monotonic_ns=30,
             latest_source_monotonic_ns=10,
             logical_step_monotonic_ns=20,
-            arrays={"joint_state": source},
+            arrays=arrays,
         )
         source[0, 0] = 1.0
-        self.assertEqual(observation.arrays["joint_state"][0, 0], 0.0)
+        self.assertIs(observation.arrays, arrays)
+        self.assertIs(observation.arrays["joint_state"], source)
+        self.assertEqual(observation.arrays["joint_state"][0, 0], 1.0)
         self.assertTrue(observation.arrays["joint_state"].flags.c_contiguous)
-        self.assertFalse(observation.arrays["joint_state"].flags.writeable)
+        self.assertTrue(observation.arrays["joint_state"].flags.writeable)
+        with self.assertRaisesRegex(ValueError, "C-contiguous"):
+            PolicyObservation(
+                observation_id=1,
+                run_generation=1,
+                anchor_monotonic_ns=30,
+                latest_source_monotonic_ns=10,
+                logical_step_monotonic_ns=20,
+                arrays={"joint_state": np.asfortranarray(source)},
+            )
+        readonly = source.copy()
+        readonly.flags.writeable = False
+        with self.assertRaisesRegex(ValueError, "writeable"):
+            PolicyObservation(
+                observation_id=1,
+                run_generation=1,
+                anchor_monotonic_ns=30,
+                latest_source_monotonic_ns=10,
+                logical_step_monotonic_ns=20,
+                arrays={"joint_state": readonly},
+            )
         with self.assertRaises(ValueError):
             PolicyObservation(
                 observation_id=1,
@@ -270,6 +290,35 @@ class MultimodalContractTest(unittest.TestCase):
                 logical_step_monotonic_ns=20,
                 arrays={"joint_state": source, "unknown": source},
             )
+
+    def test_observation_containers_keep_ring_owned_payloads(self) -> None:
+        window_values = np.zeros((2, 7), dtype=np.float64)
+        sequences = np.array([1, 2], dtype=np.uint64)
+        sources = np.array([100, 200], dtype=np.uint64)
+        publishes = np.array([110, 210], dtype=np.uint64)
+        mask = np.ones(2, dtype=np.uint8)
+        window = FrameWindow(
+            values=window_values,
+            source_sequence=sequences,
+            source_monotonic_ns=sources,
+            publish_monotonic_ns=publishes,
+            valid_mask=mask,
+        )
+        self.assertIs(window.values, window_values)
+        self.assertIs(window.source_sequence, sequences)
+        self.assertIs(window.source_monotonic_ns, sources)
+        self.assertIs(window.publish_monotonic_ns, publishes)
+        self.assertIs(window.valid_mask, mask)
+
+        cloud_values = np.zeros((4, 6), dtype=np.float32)
+        cloud = PointCloudFrame(cloud_values, 1, 100, 110, 1)
+        self.assertIs(cloud.values, cloud_values)
+        self.assertTrue(cloud.values.flags.writeable)
+
+        rgb_values = np.zeros((2, 2, 3), dtype=np.uint8)
+        rgb = RgbFrame(rgb_values, 1, 100, 110, 1)
+        self.assertIs(rgb.values, rgb_values)
+        self.assertTrue(rgb.values.flags.writeable)
 
     def test_nonvisual_grid_is_causal_and_skew_bounded(self) -> None:
         references, logical = _select_control_grid_reference_ns(
@@ -342,8 +391,34 @@ class MultimodalContractTest(unittest.TestCase):
             batch, spec, fingertip_runtime=(_ArmFk(), _HandFk(), config)
         )
         self.assertEqual(tuple(result.arrays), modalities)
-        self.assertEqual(result.arrays["joint_state"].shape, (2, 19))
-        self.assertEqual(result.arrays["contact_force"].shape, (2, 5, 3))
+        expected = {
+            "joint_state": np.concatenate(
+                (batch.arm_history.values, batch.hand_history.values), axis=1
+            ).astype(np.float32),
+            "point_cloud": np.stack([frame.values for frame in clouds]),
+            "rgb": np.stack([frame.values for frame in rgbs]),
+            "contact_force": batch.hand_tactile_sum_history.values.astype(np.float32),
+        }
+        for name, value in result.arrays.items():
+            self.assertEqual(value.dtype, np.uint8 if name == "rgb" else np.float32)
+            self.assertTrue(value.flags.c_contiguous)
+            self.assertTrue(value.flags.writeable)
+            if name in expected:
+                np.testing.assert_array_equal(value, expected[name])
+        self.assertEqual(
+            tuple(
+                (frame.source_camera_sequence, frame.source_monotonic_ns)
+                for frame in batch.pointcloud_history
+            ),
+            ((1, 100), (2, 200)),
+        )
+        self.assertEqual(
+            tuple(
+                (frame.source_camera_sequence, frame.source_monotonic_ns)
+                for frame in batch.rgb_history
+            ),
+            ((1, 100), (2, 200)),
+        )
         np.testing.assert_allclose(
             result.arrays["fingertip_points"][0, 0], [1.0, 0.01, 0.02]
         )

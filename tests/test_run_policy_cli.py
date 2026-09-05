@@ -193,15 +193,10 @@ class RunPolicyCommandTest(unittest.TestCase):
             ]
         )
         runtime = object()
-        with (
-            patch(
-                "dexmani_real.config.runtime.resolve_runtime_config",
-                return_value=runtime,
-            ) as resolve_runtime,
-            patch(
-                "dexmani_real.deployment.config.validate_policy_runtime_compatibility"
-            ) as validate_compatibility,
-        ):
+        with patch(
+            "dexmani_real.config.runtime.resolve_runtime_config",
+            return_value=runtime,
+        ) as resolve_runtime:
             inputs = self.cli._prepare_lifecycle_inputs(args, info, execute=True)
 
         self.assertIs(inputs.execute, True)
@@ -214,7 +209,6 @@ class RunPolicyCommandTest(unittest.TestCase):
         self.assertEqual(inputs.deployment_config.inference_mode, "async")
         self.assertEqual(inputs.deployment_config.max_action_steps, 12)
         resolve_runtime.assert_called_once_with(yaml_path=args.runtime_config)
-        validate_compatibility.assert_called_once_with(info.spec, runtime)
         for retired_name in (
             "execution_mode",
             "hand_acknowledged",

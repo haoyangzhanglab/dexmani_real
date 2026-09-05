@@ -7,7 +7,6 @@ through it — no direct references, no RPC, no business logic.
 from __future__ import annotations
 
 import multiprocessing as mp
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,14 +32,19 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
+PREDICTION_RING_MAXLEN = 1
+# ``runtime.safety.SafetyState`` owns the enum; IPC carries this stable wire value
+# without importing the runtime state machine back into the data plane.
+DISARMED_SAFETY_STATE_WIRE_VALUE = 0
+
 
 @dataclass
 class RuntimeChannelsConfig:
-    """Centralized configuration for RuntimeChannels ring sizes and camera defaults.
+    """Centralized configuration for RuntimeChannels variable sizes and camera defaults.
 
-    All ring ``maxlen`` values and camera resolution defaults are gathered here
-    so they have a single source of truth rather than being scattered across
-    entry points.
+    Variable ring ``maxlen`` values and camera resolution defaults are gathered
+    here so they have a single source of truth rather than being scattered across
+    entry points. Fixed wire details remain module constants.
 
     Usage::
 
@@ -57,16 +61,12 @@ class RuntimeChannelsConfig:
     record_control_ring_maxlen: int = 1
     record_sample_ring_maxlen: int = 4
     record_status_ring_maxlen: int = 1
-    prediction_ring_maxlen: int = 1
     pointcloud_num_points: int = 1024
     camera_requested: bool = False
     pointcloud_requested: bool = False
     # Point-cloud ring capacity must cover the observation horizon so the
     # per-step point-cloud history is a real window, not a broadcast.
     pointcloud_ring_maxlen: int = 8
-    # IPC transports the integer state but does not own its runtime semantics.
-    # Zero is the stable DISARMED wire value defined by runtime.safety.
-    initial_safety_state: int = 0
 
     camera_rgb_shape: tuple[int, int, int] = field(
         default_factory=lambda: camera.rgb_shape
@@ -88,14 +88,11 @@ class RuntimeChannelsConfig:
             self.record_control_ring_maxlen,
             self.record_sample_ring_maxlen,
             self.record_status_ring_maxlen,
-            self.prediction_ring_maxlen,
             self.pointcloud_ring_maxlen,
             self.arm_home_q_maxsize,
         )
         if any(int(value) <= 0 for value in capacities):
             raise ValueError("RuntimeChannels ring/queue capacities must be positive")
-        if int(self.prediction_ring_maxlen) != 1:
-            raise ValueError("prediction_ring_maxlen must remain exactly 1")
         if (
             isinstance(self.pointcloud_num_points, bool)
             or int(self.pointcloud_num_points) not in SUPPORTED_POINT_CLOUD_COUNTS
@@ -110,14 +107,6 @@ class RuntimeChannelsConfig:
             raise TypeError("RuntimeChannels pointcloud_requested must be boolean")
         if self.pointcloud_requested and not self.camera_requested:
             raise ValueError("pointcloud_requested requires camera_requested")
-        if (
-            isinstance(self.initial_safety_state, bool)
-            or not isinstance(self.initial_safety_state, int)
-            or self.initial_safety_state != 0
-        ):
-            raise ValueError(
-                "RuntimeChannels must start in the stable DISARMED wire state 0"
-            )
 
     @classmethod
     def from_runtime(
@@ -153,7 +142,6 @@ _RING_RESOURCE_NAMES = (
     "pointcloud_ring",
 )
 _QUEUE_RESOURCE_NAMES = ("arm_home_q",)
-_ALLOCATION_ROLLBACK_ATTEMPTS = 2
 
 # Heartbeat slots use a fixed process-stable order.
 HEARTBEAT_FIELDS: tuple[str, ...] = (
@@ -182,9 +170,6 @@ READY_FIELDS: tuple[str, ...] = (
     "inference",
 )
 READY_INDEX: dict[str, int] = {name: index for index, name in enumerate(READY_FIELDS)}
-
-# Short polling keeps one-shot readiness waits responsive without busy looping.
-_READY_POLL_INTERVAL_S = 0.01
 
 
 def new_frame(dtype: np.dtype) -> np.ndarray:
@@ -218,8 +203,6 @@ class RuntimeChannels:
     )
     run_generation: Any  # controller advances it to invalidate old policy proposals
     run_started_monotonic_ns: Any  # start of the current RUNNING observation epoch
-    # The active ring sequence fences latest-wins commands at each SDK boundary.
-    active_coupled_command_sequence: Any
     recorder_consumed_sequence: Any
 
     is_running: Any  # Main -> all
@@ -240,8 +223,8 @@ class RuntimeChannels:
     inference_request: Any  # policy executor -> inference, sync one-prediction trigger
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write
-    # Serializes the motion permit and coupled-command ticket state. It is
-    # never held across hardware SDK calls.
+    # Serializes the motion permit and coupled-command ring writer. It is never
+    # held across hardware SDK calls.
     motion_lock: Any
 
     heartbeats: Any  # fixed-order array of per-subsystem heartbeat timestamps (s)
@@ -257,9 +240,6 @@ class RuntimeChannels:
     camera_profile: Any  # active stream/profile and L515 setting JSON
     camera_geometry: Any  # static native RGB-D geometry JSON
     _closed: bool = field(init=False, repr=False, default=False)
-    _close_completed_operations: set[str] = field(
-        init=False, repr=False, default_factory=set
-    )
 
     @classmethod
     def create(
@@ -283,23 +263,18 @@ class RuntimeChannels:
 
         storage = cls.__new__(cls)
         storage._closed = False
-        storage._close_completed_operations = set()
         try:
             cls._allocate_resources(storage, prefix, cfg, ctx, _rgb_shape, _depth_shape)
         except BaseException as allocation_error:
-            cleanup_succeeded = False
-            for _ in range(_ALLOCATION_ROLLBACK_ATTEMPTS):
-                try:
-                    cleanup_succeeded = storage.close()
-                except BaseException:
-                    logger.critical(
-                        "RuntimeChannels allocation rollback raised", exc_info=True
-                    )
-                    raise RuntimeError(
-                        "RuntimeChannels allocation failed and rollback raised"
-                    ) from allocation_error
-                if cleanup_succeeded:
-                    break
+            try:
+                cleanup_succeeded = storage.close()
+            except BaseException:
+                logger.critical(
+                    "RuntimeChannels allocation rollback raised", exc_info=True
+                )
+                raise RuntimeError(
+                    "RuntimeChannels allocation failed and rollback raised"
+                ) from allocation_error
             if not cleanup_succeeded:
                 raise RuntimeError(
                     "RuntimeChannels allocation failed and rollback was incomplete"
@@ -376,7 +351,7 @@ class RuntimeChannels:
         storage.prediction_ring = SharedMemoryRingBuffer(
             f"{prefix}_prediction",
             dtype=PREDICTION_DTYPE,
-            maxlen=cfg.prediction_ring_maxlen,
+            maxlen=PREDICTION_RING_MAXLEN,
             create=True,
         )
         storage.pointcloud_ring = SharedMemoryRingBuffer(
@@ -390,7 +365,6 @@ class RuntimeChannels:
         storage.arm_command_seq = ctx.Value("Q", 0)
         storage.run_generation = ctx.Value("Q", 1)
         storage.run_started_monotonic_ns = ctx.Value("Q", 0)
-        storage.active_coupled_command_sequence = ctx.Value("Q", 0)
         storage.recorder_consumed_sequence = ctx.Value("Q", 0)
 
         storage.is_running = ctx.Value("b", True)
@@ -405,7 +379,7 @@ class RuntimeChannels:
         storage.stop_request = ctx.Value("b", False)
         storage.inference_request = ctx.Event()
 
-        storage.safety_state = ctx.Value("i", int(cfg.initial_safety_state))
+        storage.safety_state = ctx.Value("i", DISARMED_SAFETY_STATE_WIRE_VALUE)
         storage.motion_lock = ctx.RLock()
 
         storage.heartbeats = ctx.Array("d", [0.0] * len(HEARTBEAT_FIELDS))
@@ -426,8 +400,9 @@ class RuntimeChannels:
 
         ``unlink()`` destroys the POSIX shared-memory segment, preventing
         Python's resource tracker "leaked shared_memory objects" warning.
-        Cleanup is best-effort across every resource.  A failed operation is
-        retryable, while operations that already succeeded are not repeated.
+        Cleanup is best-effort across every resource. Underlying close calls are
+        idempotent and an already-unlinked shared-memory segment raises
+        ``FileNotFoundError``, so a retry can simply repeat the full sequence.
 
         Returns:
             Whether every owned resource was closed and unlinked successfully.
@@ -435,35 +410,26 @@ class RuntimeChannels:
         if bool(getattr(self, "_closed", False)):
             return True
 
-        completed: set[str] = getattr(self, "_close_completed_operations", set())
-        if not isinstance(completed, set):
-            completed = set()
-        self._close_completed_operations = completed
-        expected: set[str] = set()
-        _close_errors: list[str] = []
+        errors: list[str] = []
 
         def _attempt(
             operation: str, callback: Any, *, missing_ok: bool = False
         ) -> bool:
-            expected.add(operation)
-            if operation in completed:
-                return True
             try:
                 callback()
             except FileNotFoundError:
                 if not missing_ok:
-                    _close_errors.append(operation)
+                    errors.append(operation)
                     logger.warning(
                         "RuntimeChannels close: %s failed", operation, exc_info=True
                     )
                     return False
             except Exception:
-                _close_errors.append(operation)
+                errors.append(operation)
                 logger.warning(
                     "RuntimeChannels close: %s failed", operation, exc_info=True
                 )
                 return False
-            completed.add(operation)
             return True
 
         for ring_name in _RING_RESOURCE_NAMES:
@@ -477,19 +443,14 @@ class RuntimeChannels:
             queue = getattr(self, queue_name, None)
             if queue is None:
                 continue
-            queue_close = f"{queue_name}.close"
-            queue_join = f"{queue_name}.join_thread"
-            expected.add(queue_join)
-            if _attempt(queue_close, queue.close):
-                _attempt(queue_join, queue.join_thread)
+            if _attempt(f"{queue_name}.close", queue.close):
+                _attempt(f"{queue_name}.join_thread", queue.join_thread)
 
-        self._closed = not _close_errors and expected.issubset(completed)
+        self._closed = not errors
         if self._closed:
             logger.info("RuntimeChannels closed cleanly")
         else:
-            logger.error(
-                "RuntimeChannels close incomplete: %s", ", ".join(_close_errors)
-            )
+            logger.error("RuntimeChannels close incomplete: %s", ", ".join(errors))
         return self._closed
 
     def set_heartbeat(self, name: str, value_s: float) -> None:
@@ -507,20 +468,6 @@ class RuntimeChannels:
     def is_ready(self, name: str) -> bool:
         """Return True when *name* is ready."""
         return bool(self.ready_flags[READY_INDEX[name]])
-
-    def wait_ready(self, name: str, timeout: float) -> bool:
-        """Block until *name* is ready or *timeout* seconds elapse; True if ready.
-
-        Equivalent to ``Event.wait(timeout)`` in its return value. Readiness is a
-        one-shot startup wait, so a short poll replaces the kernel-level event
-        wait without any observable latency difference.
-        """
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.is_ready(name):
-                return True
-            time.sleep(_READY_POLL_INTERVAL_S)
-        return self.is_ready(name)
 
 
 def vr_frame_dtype() -> np.dtype:

@@ -8,12 +8,15 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from dexmani_real.config.runtime import resolve_runtime_config
-from dexmani_real.deployment.config import PolicyDeploymentConfig, PolicyWorkerConfig
+from dexmani_real.deployment.config import (
+    PolicyDeploymentConfig,
+    PolicyWorkerConfig,
+    validate_policy_runtime_compatibility,
+)
 from dexmani_real.deployment.lifecycle import (
     build_policy_worker_specs,
     run_policy_deployment,
 )
-from dexmani_real.deployment.worker import inference_loop
 from dexmani_real.runtime.safety import SafetyState
 from dexmani_real.runtime.workers import WorkerSpec
 
@@ -33,7 +36,6 @@ class _FakeRuntimeChannels:
         self.safety_state = _Value(int(SafetyState.DISARMED))
         self.run_generation = _Value(0)
         self.run_started_monotonic_ns = _Value(0)
-        self.active_coupled_command_sequence = _Value(0)
         self.motion_lock = threading.Lock()
         self._ready_names: set[str] = set()
         self._heartbeats: dict[str, float] = {}
@@ -88,6 +90,22 @@ class _ControllableProcess:
 
     def is_alive(self) -> bool:
         return self._alive
+
+
+class _StartFailProcess(_ControllableProcess):
+    """Process double whose start can fail before the child is launched."""
+
+    def __init__(self, name: str, events: list[str], *, fail: bool = False) -> None:
+        super().__init__(name)
+        self._events = events
+        self._fail = fail
+
+    def start(self) -> None:
+        self._events.append(f"start:{self.name}")
+        if self._fail:
+            raise RuntimeError(f"could not start {self.name}")
+        self.started = True
+        self._alive = True
 
 
 def _policy_spec() -> SimpleNamespace:
@@ -151,23 +169,8 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
         runtime = resolve_runtime_config()
         spec = _policy_spec()
         worker_config = _policy_worker_config(spec)
-        specs = [
-            WorkerSpec(name, _unexpected_worker_start, (), ready_name=name)
-            for name in ("arm", "camera", "pointcloud")
-        ]
-        specs.extend(
-            (
-                WorkerSpec(
-                    "inference",
-                    inference_loop,
-                    (shared, runtime.policy, worker_config),
-                    ready_name="inference",
-                ),
-                WorkerSpec("policy", _unexpected_worker_start, ()),
-                WorkerSpec("hand", _unexpected_worker_start, (), ready_name="hand"),
-            )
-        )
         processes: list[_FakeProcess] = []
+        startup_order: list[str] = []
 
         def build_fake_processes(
             _context: object, worker_specs: list[WorkerSpec]
@@ -175,16 +178,24 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
             processes.extend(_FakeProcess(spec) for spec in worker_specs)
             return processes
 
+        def validate_once(policy_spec: object, resolved_runtime: object) -> None:
+            startup_order.append("validate")
+            validate_policy_runtime_compatibility(policy_spec, resolved_runtime)
+
+        def create_channels_side_effect(**_kwargs: object) -> _FakeRuntimeChannels:
+            startup_order.append("create")
+            return shared
+
         shutdown = Mock(return_value=object())
         with (
             patch(
                 "dexmani_real.deployment.lifecycle.RuntimeChannels.create",
-                return_value=shared,
+                side_effect=create_channels_side_effect,
             ) as create_channels,
             patch(
-                "dexmani_real.deployment.lifecycle.build_policy_worker_specs",
-                return_value=specs,
-            ),
+                "dexmani_real.deployment.lifecycle.validate_policy_runtime_compatibility",
+                side_effect=validate_once,
+            ) as validate_compatibility,
             patch(
                 "dexmani_real.deployment.lifecycle.build_processes",
                 side_effect=build_fake_processes,
@@ -202,6 +213,8 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
         self.assertFalse(shared.is_ready("inference"))
         self.assertTrue(shared.error_state.value)
         self.assertEqual(shared.safety_state.value, int(SafetyState.FAULT))
+        self.assertEqual(startup_order, ["validate", "create"])
+        validate_compatibility.assert_called_once_with(spec, runtime)
         self.assertTrue(by_name["inference"].started)
         for name in ("arm", "hand", "camera", "pointcloud", "policy"):
             with self.subTest(worker=name):
@@ -229,7 +242,7 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
             (14, 14, 14, 11, 11),
         )
 
-    def test_inference_exit_after_ready_blocks_hardware_start(self) -> None:
+    def test_ready_worker_death_before_armed_faults_deployment(self) -> None:
         shared = _FakeRuntimeChannels()
         runtime = resolve_runtime_config()
         spec = _policy_spec()
@@ -244,22 +257,17 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
         )
         processes = [_ControllableProcess(worker.name) for worker in specs]
         by_name = {process.name: process for process in processes}
+        specs_by_name = {worker.name: worker for worker in specs}
 
         def start_fake(selected: list[_ControllableProcess]) -> None:
+            if by_name["inference"].started and by_name["inference"] not in selected:
+                by_name["inference"]._alive = False
             for process in selected:
                 process.started = True
                 process._alive = True
-            if by_name["inference"] in selected:
-                shared.set_ready("inference")
-
-        def ready_then_die(
-            _shared: _FakeRuntimeChannels,
-            ready_checks: list[tuple[str, float]],
-            _procs: list[_ControllableProcess],
-        ) -> bool:
-            self.assertEqual(ready_checks[0][0], "inference")
-            by_name["inference"]._alive = False
-            return True
+                ready_name = specs_by_name[process.name].ready_name
+                if ready_name is not None:
+                    shared.set_ready(ready_name)
 
         shutdown = Mock(return_value=object())
         with (
@@ -276,10 +284,6 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
                 return_value=processes,
             ),
             patch("dexmani_real.deployment.lifecycle.start_processes", start_fake),
-            patch(
-                "dexmani_real.deployment.lifecycle.wait_subsystem_ready",
-                side_effect=ready_then_die,
-            ),
             patch("dexmani_real.deployment.lifecycle.shutdown_processes", shutdown),
         ):
             result = run_policy_deployment(runtime, spec, worker_config, False)
@@ -290,10 +294,101 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
         self.assertTrue(by_name["inference"].started)
         for name in ("arm", "hand", "policy"):
             with self.subTest(worker=name):
-                self.assertFalse(by_name[name].started)
+                self.assertTrue(by_name[name].started)
         shutdown.assert_called_once_with(
             shared,
-            [by_name["inference"]],
+            [by_name[name] for name in ("inference", "arm", "hand", "policy")],
+            graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+        )
+
+    def test_partial_remaining_start_failure_shuts_down_only_started_children(
+        self,
+    ) -> None:
+        shared = _FakeRuntimeChannels()
+        runtime = resolve_runtime_config()
+        spec = _policy_spec()
+        worker_config = _policy_worker_config(spec)
+        specs = (
+            WorkerSpec(
+                "inference", _unexpected_worker_start, (), ready_name="inference"
+            ),
+            WorkerSpec("arm", _unexpected_worker_start, (), ready_name="arm"),
+            WorkerSpec("hand", _unexpected_worker_start, (), ready_name="hand"),
+            WorkerSpec("policy", _unexpected_worker_start, ()),
+        )
+        events: list[str] = []
+        processes = [
+            _StartFailProcess("inference", events),
+            _StartFailProcess("arm", events),
+            _StartFailProcess("hand", events, fail=True),
+            _StartFailProcess("policy", events),
+        ]
+        by_name = {process.name: process for process in processes}
+
+        def close_channels() -> bool:
+            events.append("close")
+            return True
+
+        shared.close = close_channels  # type: ignore[method-assign]
+
+        def verified_shutdown(
+            channels: _FakeRuntimeChannels,
+            selected: list[_StartFailProcess],
+            **_kwargs: object,
+        ) -> object:
+            self.assertIs(channels, shared)
+            self.assertEqual(
+                selected,
+                [by_name["inference"], by_name["arm"]],
+            )
+            self.assertNotIn("close", events)
+            events.append("shutdown")
+            channels.close()
+            return object()
+
+        with (
+            patch(
+                "dexmani_real.deployment.lifecycle.RuntimeChannels.create",
+                return_value=shared,
+            ),
+            patch(
+                "dexmani_real.deployment.lifecycle.build_policy_worker_specs",
+                return_value=specs,
+            ),
+            patch(
+                "dexmani_real.deployment.lifecycle.build_processes",
+                return_value=processes,
+            ),
+            patch(
+                "dexmani_real.deployment.lifecycle.wait_subsystem_ready",
+                return_value=True,
+            ) as wait_ready,
+            patch(
+                "dexmani_real.deployment.lifecycle.shutdown_processes",
+                side_effect=verified_shutdown,
+            ) as shutdown,
+        ):
+            result = run_policy_deployment(runtime, spec, worker_config, False)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            events,
+            [
+                "start:inference",
+                "start:arm",
+                "start:hand",
+                "shutdown",
+                "close",
+            ],
+        )
+        self.assertTrue(by_name["inference"].started)
+        self.assertTrue(by_name["arm"].started)
+        self.assertFalse(by_name["hand"].started)
+        self.assertFalse(by_name["policy"].started)
+        wait_ready.assert_called_once()
+        shutdown.assert_called_once_with(
+            shared,
+            [by_name["inference"], by_name["arm"]],
             graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
         )
 
@@ -358,9 +453,11 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
             result = run_policy_deployment(runtime, spec, worker_config, False)
 
         self.assertEqual(result, 0)
-        heartbeat_names = supervisor.call_args.args[3]
-        self.assertIn("policy", heartbeat_names)
-        self.assertEqual(set(heartbeat_names), {"inference", "arm", "hand", "policy"})
+        heartbeat_timeouts = supervisor.call_args.kwargs["heartbeat_timeouts_s"]
+        self.assertIn("policy", heartbeat_timeouts)
+        self.assertEqual(
+            set(heartbeat_timeouts), {"inference", "arm", "hand", "policy"}
+        )
 
 
 def _unexpected_worker_start() -> None:

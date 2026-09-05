@@ -12,7 +12,7 @@ import numpy as np
 from dexmani_real.config.defaults import hand as hand_defaults
 from dexmani_real.control.action import ActionCandidate
 from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
-from dexmani_real.ipc.schema import COUPLED_COMMAND_DTYPE, HAND_JOINT_SHAPE
+from dexmani_real.ipc.schema import COUPLED_COMMAND_DTYPE
 from dexmani_real.runtime.safety import (
     PUBLISH_REASON_ESTOP,
     PUBLISH_REASON_EXPIRED,
@@ -35,6 +35,7 @@ from dexmani_real.utils.feedback import (
 )
 from dexmani_real.utils.limits import (
     canonicalize_policy_hand_endpoint_roundoff,
+    hand_target_within_operational_bounds,
     limit_hand_target_delta,
 )
 from dexmani_real.utils.limits import (
@@ -193,8 +194,6 @@ def read_hand_feedback(
     )
     if issue is not None:
         return None, f"hand feedback is unhealthy: {issue.detail}", issue
-    if qpos.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(qpos)):
-        return None, "hand measured qpos is malformed", None
     return (
         _HandFeedbackSnapshot(
             qpos=qpos.copy(),
@@ -335,14 +334,34 @@ def prepare_command(
                     gate.hand_high,
                     mechanical_lower,
                     mechanical_upper,
-                    hand_defaults.mechanical_qpos_min_rad,
-                    hand_defaults.mechanical_qpos_max_rad,
                 )
             )
         except ValueError as exc:
             return PreparedCommand(reason=str(exc))
         if hand_roundoff_canonicalized:
             candidate = replace(candidate, hand_qpos=hand_qpos)
+        if not hand_target_within_operational_bounds(
+            candidate.hand_qpos,
+            gate.hand_low,
+            gate.hand_high,
+        ):
+            return PreparedCommand(
+                reason="hand policy endpoint violates operational joint limits",
+                hand_roundoff_canonicalized=hand_roundoff_canonicalized,
+            )
+
+    if (
+        candidate.hand_qpos is not None
+        and hand_command_max_delta_rad_per_tick is not None
+    ):
+        assert hand_feedback is not None
+        shaped_hand_qpos = limit_hand_target_delta(
+            candidate.hand_qpos,
+            hand_feedback.qpos,
+            hand_command_max_delta_rad_per_tick,
+        )
+        if not np.array_equal(shaped_hand_qpos, candidate.hand_qpos):
+            candidate = replace(candidate, hand_qpos=shaped_hand_qpos)
 
     gate_result = gate.validate(
         candidate,
@@ -363,33 +382,7 @@ def prepare_command(
             hand_roundoff_canonicalized=hand_roundoff_canonicalized,
         )
 
-    if (
-        candidate.hand_qpos is not None
-        and hand_command_max_delta_rad_per_tick is not None
-    ):
-        assert hand_feedback is not None
-        shaped_hand_qpos = limit_hand_target_delta(
-            candidate.hand_qpos,
-            hand_feedback.qpos,
-            hand_command_max_delta_rad_per_tick,
-        )
-        if not np.array_equal(shaped_hand_qpos, candidate.hand_qpos):
-            candidate = replace(candidate, hand_qpos=shaped_hand_qpos)
-            shaped_result = gate.validate_shaped_hand(
-                candidate,
-                current_arm_qpos=arm_feedback.qpos,
-                current_hand_qpos=hand_feedback.qpos,
-                hand_delta_reference_qpos=hand_delta_reference_qpos,
-            )
-            if not shaped_result.accepted:
-                return PreparedCommand(
-                    reason=shaped_result.reason,
-                    gate_code=shaped_result.code,
-                    fatal=shaped_result.code is GateRejectCode.COLLISION_CHECK_FAILED,
-                    hand_roundoff_canonicalized=hand_roundoff_canonicalized,
-                )
-
-    if candidate.hand_qpos is not None:
+    if candidate.hand_qpos is not None and not canonicalize_policy_hand_roundoff:
         try:
             validate_hand_command_bounds(
                 candidate.hand_qpos,
@@ -532,21 +525,11 @@ def publish_command(
     shared: Any,
     candidate: ActionCandidate,
     *,
-    check_is_running: bool = True,
     required_safety_state: SafetyState | None = None,
     minimum_delivery_window_s: float = 0.0,
 ) -> PublishResult:
     """Publish one checked command without waiting for worker acknowledgement."""
     minimum_delivery_window_ns = _minimum_delivery_window_ns(minimum_delivery_window_s)
-    reason = _command_publishability_reason(
-        shared,
-        candidate,
-        check_is_running=check_is_running,
-        required_safety_state=required_safety_state,
-        minimum_delivery_window_ns=minimum_delivery_window_ns,
-    )
-    if reason:
-        return PublishResult(False, reason=reason)
     ticket, rejection_reason = publish_coupled_command_if_motion_permitted(
         shared,
         expected_run_generation=int(candidate.run_generation),

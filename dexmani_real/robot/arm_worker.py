@@ -29,7 +29,7 @@ import numpy as np
 from dexmani_real.config.defaults import ArmParams
 from dexmani_real.ipc.channels import new_frame
 from dexmani_real.ipc.schema import ARM_STATE_DTYPE, COUPLED_COMMAND_DTYPE
-from dexmani_real.robot.command_validation import check_worker_arm_command
+from dexmani_real.robot.command_validation import check_worker_arm_target
 from dexmani_real.robot.xarm7 import HomeAborted, XArm7, describe_controller_error
 from dexmani_real.runtime.safety import (
     CoupledCommandTicket,
@@ -311,45 +311,29 @@ def _handle_servo_command(
     # it consumed before validation so a superseded or rejected snapshot cannot
     # be retried on every worker tick. A newer ring sequence remains eligible.
     st.last_processed_ring_sequence = ticket.ring_sequence
-    permit = read_motion_permit(shared)
     command_generation = int(action["run_generation"][0])
-    if command_generation != permit.run_generation or not (
-        coupled_command_ticket_allows_execution(shared, ticket=ticket)
-    ):
-        return
     jump_reference = (
         st.last_target
         if command_generation == st.last_command_generation
         else st.last_measured_qpos
     )
-    issue = check_worker_arm_command(
-        action,
-        expected_run_generation=permit.run_generation,
-        now_monotonic_ns=time.monotonic_ns(),
+    target = np.asarray(action["arm_qpos"][0], dtype=np.float64)
+    issue = check_worker_arm_target(
+        target,
+        previous_target_qpos_rad=jump_reference,
         joint_limit_lower_rad=np.asarray(st.cfg.joint_limit_lower, dtype=np.float64),
         joint_limit_upper_rad=np.asarray(st.cfg.joint_limit_upper, dtype=np.float64),
-        previous_command_qpos_rad=jump_reference,
         max_command_jump_rad=st.cfg.max_servo_command_jump_rad,
     )
-    # A newer command or a stop/fault may arrive while validation is running.
-    # Do not execute or fault on a snapshot that no longer owns the slot.
+    # This is the sole command-authority fence and the final operation before
+    # an otherwise valid target crosses the xArm SDK boundary.
     if not coupled_command_ticket_allows_execution(shared, ticket=ticket):
         return
     if issue is not None:
-        if issue.fault:
-            raise RuntimeError(
-                "unsafe servo action_id="
-                f"{int(action['action_id'][0])}: {issue.reason}"
-            )
-        logger.info(
-            "arm_loop: discarded action_id=%d: %s",
-            int(action["action_id"][0]),
-            issue.reason,
+        raise RuntimeError(
+            "unsafe servo action_id="
+            f"{int(action['action_id'][0])}: {issue}"
         )
-        return
-    target = np.asarray(action["arm_qpos"][0], dtype=np.float64)
-    if not coupled_command_ticket_allows_execution(shared, ticket=ticket):
-        return
     code = st.arm.servo(target)
     if code != 0:
         # Setter code 1 only means that the controller has an error. Read the

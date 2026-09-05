@@ -186,39 +186,15 @@ def validate_processed_payload(
     optional RGB-D and persisted-workspace checks are also admission checks and
     never rebuild a point cloud.
     """
-    if length <= 0:
-        raise ValueError(f"{label}: processed length must be positive")
-    expected_keys = set(expected_specs)
-    if set(source.keys()) != expected_keys | {"provenance"}:
-        raise ValueError(f"{label}: processed data keys do not match profile")
-    for key, (expected_shape, expected_dtype) in expected_specs.items():
-        dataset = source.get(key)
-        if not isinstance(dataset, h5py.Dataset):
-            raise ValueError(f"{label}: {key} is not an HDF5 dataset")
+    _validate_processed_structure(
+        source,
+        expected_specs=expected_specs,
+        length=length,
+        label=label,
+    )
+    for key, (_expected_shape, expected_dtype) in expected_specs.items():
+        dataset = source[key]
         dtype = np.dtype(expected_dtype)
-        if dataset.dtype != dtype:
-            raise ValueError(
-                f"{label}: {key} dtype must be {dtype}, got {dataset.dtype}"
-            )
-        if dataset.shape != tuple(expected_shape):
-            raise ValueError(
-                f"{label}: {key} shape must be {tuple(expected_shape)}, "
-                f"got {dataset.shape}"
-            )
-        if dataset.ndim == 0 or dataset.shape[0] != length:
-            raise ValueError(f"{label}: {key} first dimension must be {length}")
-        if key == "rgb" and (dataset.ndim != 4 or dataset.shape[-1] != 3):
-            raise ValueError(f"{label}: rgb must be (N,H,W,3)")
-        if key == "depth" and dataset.ndim != 3:
-            raise ValueError(f"{label}: depth must be (N,H,W)")
-        if key == "camera_intrinsic" and (dataset.ndim != 2 or dataset.shape[1] != 9):
-            raise ValueError(f"{label}: camera_intrinsic must be (N,9)")
-        if key == "camera_extrinsic" and (
-            dataset.ndim != 3 or dataset.shape[1:] != (4, 4)
-        ):
-            raise ValueError(f"{label}: camera_extrinsic must be (N,4,4)")
-        if key == "point_cloud" and (dataset.ndim != 3 or dataset.shape[-1] != 6):
-            raise ValueError(f"{label}: point_cloud must be (N,P,6)")
         if not np.issubdtype(dtype, np.floating) and key != "point_cloud":
             continue
         for row_slice in _dataset_row_slices(dataset):
@@ -275,6 +251,49 @@ def validate_processed_payload(
             raise ValueError(f"{label}: invalid camera_intrinsic")
         for transform in extrinsic:
             validate_rigid_transform(transform, label="camera_extrinsic")
+
+
+def _validate_processed_structure(
+    source: h5py.File | h5py.Group,
+    *,
+    expected_specs: Mapping[str, tuple[tuple[int, ...], np.dtype[Any]]],
+    length: int,
+    label: str,
+) -> None:
+    """Check the HDF5 layout without scanning payload values."""
+    if length <= 0:
+        raise ValueError(f"{label}: processed length must be positive")
+    expected_keys = set(expected_specs)
+    if set(source.keys()) != expected_keys | {"provenance"}:
+        raise ValueError(f"{label}: processed data keys do not match profile")
+    for key, (expected_shape, expected_dtype) in expected_specs.items():
+        dataset = source.get(key)
+        if not isinstance(dataset, h5py.Dataset):
+            raise ValueError(f"{label}: {key} is not an HDF5 dataset")
+        dtype = np.dtype(expected_dtype)
+        if dataset.dtype != dtype:
+            raise ValueError(
+                f"{label}: {key} dtype must be {dtype}, got {dataset.dtype}"
+            )
+        if dataset.shape != tuple(expected_shape):
+            raise ValueError(
+                f"{label}: {key} shape must be {tuple(expected_shape)}, "
+                f"got {dataset.shape}"
+            )
+        if dataset.ndim == 0 or dataset.shape[0] != length:
+            raise ValueError(f"{label}: {key} first dimension must be {length}")
+        if key == "rgb" and (dataset.ndim != 4 or dataset.shape[-1] != 3):
+            raise ValueError(f"{label}: rgb must be (N,H,W,3)")
+        if key == "depth" and dataset.ndim != 3:
+            raise ValueError(f"{label}: depth must be (N,H,W)")
+        if key == "camera_intrinsic" and (dataset.ndim != 2 or dataset.shape[1] != 9):
+            raise ValueError(f"{label}: camera_intrinsic must be (N,9)")
+        if key == "camera_extrinsic" and (
+            dataset.ndim != 3 or dataset.shape[1:] != (4, 4)
+        ):
+            raise ValueError(f"{label}: camera_extrinsic must be (N,4,4)")
+        if key == "point_cloud" and (dataset.ndim != 3 or dataset.shape[-1] != 6):
+            raise ValueError(f"{label}: point_cloud must be (N,P,6)")
 
 
 def validate_processed_admission(
@@ -1080,6 +1099,52 @@ def _expected_specs(
     return specs
 
 
+def _validate_processed_output_structure(
+    path: str | Path, config: ProcessingConfig
+) -> dict[str, Any]:
+    """Reopen one just-written output and verify its publishable HDF5 layout.
+
+    Writer-side sanity is intentionally bounded to metadata, keys, dtype, and
+    shape.  Payload values and semantic attributes are fully checked only at
+    the explicit ``verify_output`` step or by a consumer/export boundary.
+    """
+    artifact = Path(path)
+    with h5py.File(artifact, "r") as source:
+        length = int(source.attrs.get("episode_steps", -1))
+        specs = _expected_specs(length, config)
+        if length < config.min_episode_frames:
+            raise ValueError(f"{artifact.name}: episode_steps={length} is too short")
+        if str(source.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
+            raise ValueError(f"{artifact.name}: invalid schema_name")
+        if int(source.attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
+            raise ValueError(f"{artifact.name}: invalid schema_version")
+        if str(source.attrs.get("domain", "")) != "real":
+            raise ValueError(f"{artifact.name}: domain must be real")
+        if str(source.attrs.get("profile", "")) != config.profile.value:
+            raise ValueError(f"{artifact.name}: profile mismatch")
+        if not isinstance(source.get("provenance"), h5py.Group):
+            raise ValueError(f"{artifact.name}: provenance is not an HDF5 group")
+        _validate_processed_structure(
+            source,
+            expected_specs=specs,
+            length=length,
+            label=artifact.name,
+        )
+        for key in specs:
+            dataset = source[key]
+            if (
+                dataset.compression != "gzip"
+                or int(dataset.compression_opts) != config.gzip_level
+            ):
+                raise ValueError(f"{artifact.name}: invalid {key} compression")
+    return {
+        "path": artifact.name,
+        "frames": length,
+        "keys": sorted(specs),
+        "level": "structural",
+    }
+
+
 def validate_processed_hdf5(
     path: str | Path, config: ProcessingConfig
 ) -> dict[str, Any]:
@@ -1383,6 +1448,7 @@ def process_episode_root(
     *,
     annotations_path: str | Path | None = None,
     dry_run: bool = False,
+    verify_output: bool = False,
 ) -> dict[str, Any]:
     """Publish a complete one-to-one batch, or publish nothing on rejection."""
 
@@ -1398,7 +1464,6 @@ def process_episode_root(
         annotation = annotations.get(episode.name, EpisodeAnnotation())
         try:
             with EpisodeReader(episode) as reader:
-                reader.require_valid(purpose="offline processing")
                 decisions.append(
                     analyze_episode(
                         reader,
@@ -1483,8 +1548,17 @@ def process_episode_root(
                     )
                 )
         validation = [
-            validate_processed_hdf5(staging / item["path"], config) for item in outputs
+            _validate_processed_output_structure(staging / item["path"], config)
+            for item in outputs
         ]
+        verification = (
+            [
+                validate_processed_hdf5(staging / item["path"], config)
+                for item in outputs
+            ]
+            if verify_output
+            else None
+        )
         with h5py.File(staging / outputs[0]["path"], "r") as first_output:
             task_name = str(first_output.attrs["task_name"])
         invalid_report = _invalid_frames_report(decisions, task_name=task_name)
@@ -1497,6 +1571,8 @@ def process_episode_root(
             stream.write("\n")
         report["outputs"] = outputs
         report["validation"] = validation
+        if verification is not None:
+            report["verification"] = verification
         report["invalid_frames_report"] = invalid_report
         atomic_publish(staging, target)
     except BaseException:

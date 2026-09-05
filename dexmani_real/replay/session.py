@@ -77,7 +77,7 @@ def _latched_fault_status(shared: RuntimeChannels) -> ReplayStatus | None:
 def _post_shutdown_outcome(
     shared: RuntimeChannels, outcome: ReplayOutcome, report: ShutdownReport
 ) -> ReplayOutcome:
-    """Apply faults observed only after workers have reached a terminal state."""
+    """Classify physical faults and post-stop resource cleanup failures."""
     if bool(shared.estop_request.value):
         shutdown_reason = "e-stop latched during replay shutdown"
         reason = (
@@ -96,8 +96,7 @@ def _post_shutdown_outcome(
         if item.exitcode != 0 or item.escalation != "graceful"
     )
     if (
-        not report.shared_closed
-        or bool(shared.error_state.value)
+        bool(shared.error_state.value)
         or int(shared.safety_state.value) == int(SafetyState.FAULT)
         or abnormal_exits
     ):
@@ -116,6 +115,14 @@ def _post_shutdown_outcome(
             else shutdown_reason
         )
         return ReplayOutcome(ReplayStatus.FAULT, outcome.replay_data, reason)
+    if not report.shared_closed:
+        shutdown_reason = "RuntimeChannels cleanup failed after workers stopped"
+        reason = (
+            f"{outcome.reason}; {shutdown_reason}"
+            if outcome.reason
+            else shutdown_reason
+        )
+        return ReplayOutcome(ReplayStatus.CLEANUP_FAILED, outcome.replay_data, reason)
     return outcome
 
 
@@ -311,7 +318,14 @@ def replay_episode(
         if hand_available:
             specs.append(
                 WorkerSpec(
-                    "hand", _hand_loop, (shared, runtime.hand), ready_name="hand"
+                    "hand",
+                    _hand_loop,
+                    (
+                        shared,
+                        runtime.hand,
+                        float(runtime.policy.hand_disconnect_timeout_s),
+                    ),
+                    ready_name="hand",
                 )
             )
 
@@ -319,13 +333,11 @@ def replay_episode(
         processes = build_processes(context, specs)
         start_processes(processes)
 
-        timeouts = runtime.safety.readiness_timeouts_s
-        ready_checks = [
-            (spec.ready_name, float(timeouts[spec.ready_name]))
-            for spec in specs
-            if spec.ready_name
-        ]
-        workers_ready = wait_subsystem_ready(shared, ready_checks, processes)
+        workers_ready = wait_subsystem_ready(
+            shared,
+            list(zip(specs, processes)),
+            runtime.safety.readiness_timeouts_s,
+        )
         if not workers_ready:
             shared.error_state.value = True
             require_transition(shared, SafetyState.FAULT)

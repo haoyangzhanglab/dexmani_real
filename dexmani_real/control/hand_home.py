@@ -93,7 +93,6 @@ def publish_hand_home_and_wait_accepted(
     publish_result = publish_command(
         shared,
         candidate,
-        check_is_running=check_is_running,
     )
     if not publish_result.published:
         logger.warning("hand home publish failed: %s", publish_result.reason)

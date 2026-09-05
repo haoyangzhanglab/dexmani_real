@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import time
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -14,7 +15,7 @@ from dexmani_real.utils.feedback import validate_hand_feedback
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
-    from dexmani_real.runtime.workers import ShutdownReport
+    from dexmani_real.runtime.workers import ShutdownReport, WorkerSpec
 
 logger = get_logger(__name__)
 
@@ -51,11 +52,9 @@ def shutdown_processes(
 def run_supervisor(
     shared: RuntimeChannels,
     procs: list[Any],
-    proc_names: list[str],
-    heartbeat_names: list[str],
     *,
     status_interval_s: float = 30.0,
-    heartbeat_timeouts_s: dict[str, float] | None = None,
+    heartbeat_timeouts_s: Mapping[str, float],
     supervisor_hz: float | None = None,
 ) -> tuple[str, bool]:
     """Run the standard supervisor loop with resolved heartbeat settings.
@@ -80,31 +79,24 @@ def run_supervisor(
         raise ValueError("supervisor_hz must be finite and positive")
     if not np.isfinite(status_interval_s) or status_interval_s <= 0:
         raise ValueError("status_interval_s must be finite and positive")
-    configured_timeouts = (
-        safety.heartbeat_timeouts
-        if heartbeat_timeouts_s is None
-        else heartbeat_timeouts_s
-    )
-    if len(procs) != len(proc_names) or len(set(proc_names)) != len(proc_names):
-        raise ValueError("proc_names must contain one unique name per process")
-    if len(set(heartbeat_names)) != len(heartbeat_names):
-        raise ValueError("heartbeat_names must be unique")
-    extra_heartbeats = set(heartbeat_names) - set(proc_names)
+    process_names = [process.name for process in procs]
+    if any(not name for name in process_names) or len(set(process_names)) != len(
+        process_names
+    ):
+        raise ValueError("processes must have unique non-empty names")
+    extra_heartbeats = set(heartbeat_timeouts_s) - set(process_names)
     if extra_heartbeats:
         raise ValueError(
-            "heartbeat_names must name running processes; "
+            "heartbeat timeouts must name running processes; "
             f"unknown={sorted(extra_heartbeats)}"
         )
-    missing_timeouts = set(heartbeat_names) - set(configured_timeouts)
-    if missing_timeouts:
-        raise ValueError(f"missing heartbeat timeouts for {sorted(missing_timeouts)}")
-    timeouts = {name: float(configured_timeouts[name]) for name in heartbeat_names}
+    timeouts = {name: float(timeout) for name, timeout in heartbeat_timeouts_s.items()}
     if any(not np.isfinite(timeout) or timeout <= 0 for timeout in timeouts.values()):
         raise ValueError("heartbeat timeouts must be finite and positive")
     try:
         while True:
             heartbeat_timestamps = {
-                name: shared.get_heartbeat(name) for name in heartbeat_names
+                name: shared.get_heartbeat(name) for name in timeouts
             }
             now = time.monotonic()
             heartbeat_ages = {
@@ -147,7 +139,7 @@ def run_supervisor(
                 runtime_m = (now - start_time) / 60.0
                 safety_state = shared.safety_state.value
                 heartbeat_text = ", ".join(
-                    f"{name}={heartbeat_ages[name]:.1f}s" for name in heartbeat_names
+                    f"{name}={heartbeat_ages[name]:.1f}s" for name in timeouts
                 )
                 print(
                     f"  [supervisor]  runtime={runtime_m:.1f}min  safety={safety_state}  hb_age=({heartbeat_text})",
@@ -168,18 +160,38 @@ def run_supervisor(
 
 def wait_subsystem_ready(
     shared: RuntimeChannels,
-    ready_checks: list[tuple[str, float]],
-    procs: list[Any],
+    workers: Iterable[tuple["WorkerSpec", Any]],
+    readiness_timeouts_s: Mapping[str, float],
+    *,
+    monitored_processes: Iterable[Any] | None = None,
 ) -> bool:
-    """Wait for each ``(name, timeout_s)`` subsystem to become ready.
+    """Wait boundedly for worker readiness while supervising startup health.
 
-    Checks ``error_state`` and process liveness on every poll tick.
-    Returns True if all subsystems are ready, False if any fail.
+    Worker specs own readiness names, while the runtime configuration owns their
+    timeouts. ``monitored_processes`` lets staged startup keep earlier workers in
+    the same fault/liveness barrier.
 
     The caller is responsible for printing pre-wait user messages
     (e.g. "put on Quest headset") before calling this function.
     """
-    for name, timeout in ready_checks:
+    worker_pairs = list(workers)
+    monitored = (
+        [process for _spec, process in worker_pairs]
+        if monitored_processes is None
+        else list(monitored_processes)
+    )
+    ready_names = [
+        spec.ready_name
+        for spec, _process in worker_pairs
+        if spec.ready_name is not None
+    ]
+    if len(set(ready_names)) != len(ready_names):
+        raise ValueError("worker readiness names must be unique")
+
+    for name in ready_names:
+        if name not in readiness_timeouts_s:
+            raise ValueError(f"missing readiness timeout for {name!r}")
+        timeout = float(readiness_timeouts_s[name])
         if not np.isfinite(timeout) or timeout <= 0:
             raise ValueError(
                 f"readiness timeout for {name!r} must be finite and positive"
@@ -192,8 +204,10 @@ def wait_subsystem_ready(
                 logger.error("subsystem=%s init failed: error_state set", name)
                 failure_logged = True
                 break
-            if not all(p.is_alive() for p in procs):
-                dead_names = [p.name for p in procs if not p.is_alive()]
+            if not all(process.is_alive() for process in monitored):
+                dead_names = [
+                    process.name for process in monitored if not process.is_alive()
+                ]
                 logger.error(
                     "subsystem=%s init failed: process(es) %s exited prematurely",
                     name,
@@ -209,6 +223,16 @@ def wait_subsystem_ready(
             logger.error("subsystem=%s ready_timeout=%ds", name, timeout)
         if not ready:
             return False
+
+    if shared.error_state.value:
+        logger.error("startup failed after readiness: error_state set")
+        return False
+    dead_names = [process.name for process in monitored if not process.is_alive()]
+    if dead_names:
+        logger.error(
+            "startup failed after readiness: process(es) %s exited", dead_names
+        )
+        return False
     return True
 
 

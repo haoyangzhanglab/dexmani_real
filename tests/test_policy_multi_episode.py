@@ -15,6 +15,7 @@ from dexmani_real.runtime.safety import (
     StopRequest,
     begin_motion,
     begin_requested_motion,
+    cancel_coupled_command_if_current,
     coupled_command_ticket_allows_execution,
     coupled_command_ticket_is_current,
     request_policy_start,
@@ -41,7 +42,7 @@ class _FakeShared:
         self.safety_state = _Value(int(SafetyState.ARMED))
         self.run_generation = _Value(0)
         self.run_started_monotonic_ns = _Value(0)
-        self.active_coupled_command_sequence = _Value(0)
+        self.coupled_cmd_ring = SimpleNamespace(latest_sequence=0)
         self.motion_lock = threading.Lock()
 
 
@@ -119,7 +120,7 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
             ring_sequence=7,
             valid_until_monotonic_ns=time.monotonic_ns() + 1_000_000_000,
         )
-        shared.active_coupled_command_sequence.value = old_ticket.ring_sequence
+        shared.coupled_cmd_ring.latest_sequence = old_ticket.ring_sequence
         self.assertTrue(coupled_command_ticket_is_current(shared, ticket=old_ticket))
 
         self.assertTrue(revoke_motion(shared, SafetyState.ARMED))
@@ -138,7 +139,7 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
             ring_sequence=7,
             valid_until_monotonic_ns=time.monotonic_ns() + 1_000_000_000,
         )
-        shared.active_coupled_command_sequence.value = active_ticket.ring_sequence
+        shared.coupled_cmd_ring.latest_sequence = active_ticket.ring_sequence
         self.assertTrue(
             coupled_command_ticket_allows_execution(
                 shared,
@@ -153,6 +154,30 @@ class PolicyMultiEpisodeTest(unittest.TestCase):
                 shared,
                 ticket=active_ticket,
             )
+        )
+
+    def test_cancel_only_invalidates_the_latest_current_ticket(self) -> None:
+        shared = _FakeShared()
+        self.assertTrue(begin_motion(shared))
+        generation = int(shared.run_generation.value)
+        older_ticket = CoupledCommandTicket(generation, 6, 10**18)
+        newer_ticket = CoupledCommandTicket(generation, 7, 10**18)
+        shared.coupled_cmd_ring.latest_sequence = newer_ticket.ring_sequence
+
+        self.assertFalse(
+            cancel_coupled_command_if_current(shared, ticket=older_ticket)
+        )
+        self.assertEqual(shared.run_generation.value, generation)
+        self.assertTrue(
+            coupled_command_ticket_is_current(shared, ticket=newer_ticket)
+        )
+
+        self.assertTrue(
+            cancel_coupled_command_if_current(shared, ticket=newer_ticket)
+        )
+        self.assertEqual(shared.run_generation.value, generation + 1)
+        self.assertFalse(
+            coupled_command_ticket_is_current(shared, ticket=newer_ticket)
         )
 
     def test_physical_operator_allows_home_before_each_episode(self) -> None:

@@ -101,7 +101,9 @@ RealSense / Quest-HTS / xArm7 / XHand
 
 - [`teleop/action_proposal.py`](dexmani_real/teleop/action_proposal.py) 只计算并限幅
   EEF、arm 与 hand proposal；它不发布命令、不访问 shared memory，也不写录制数据。
-- [`teleop/loop.py`](dexmani_real/teleop/loop.py) 构造资源、等待 readiness，并由
+- [`teleop/session.py`](dexmani_real/teleop/session.py) 在父进程中分阶段启动 worker，并以
+  ready、fault、liveness 和 timeout 组成有界启动屏障；[`teleop/loop.py`](dexmani_real/teleop/loop.py)
+  构造控制资源，并由
   [`teleop/control_grid.py`](dexmani_real/teleop/control_grid.py) 完成单个 causal tick 的读取、
   proposal、校验、发布和采样。pause、VR/hand feedback 异常或录制终结进入 pause boundary；
   BEGIN 音频只是 best-effort 操作者反馈，恢复运动前必须等待 fresh causal feedback re-anchor，
@@ -163,8 +165,8 @@ python examples/collect_teleop.py --print-config
 | VR 遥操作采集 | `python examples/collect_teleop.py --task-name <task>` | 连接 arm/hand/VR/camera；写 raw episode |
 | VR 遥操作但不录制 | `python examples/collect_teleop.py --task-name <task> --no-record` | 连接 arm/hand/VR；不启动 camera/recorder |
 | 键盘遥操作 | `python examples/keyboard_teleop.py` | 连接并控制 xArm7，可选 XHand |
-| 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 使用 raw episode 的精确已发送命令、配置和模型 provenance，预检后控制 xArm7/XHand；写 `replay_results/` |
-| 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取并校验 `data.h5` hash 后的原始 `float64` 已发送命令，继续执行完整配置/模型/几何预检；包含多个 source 连续段的产物拒绝物理回放 |
+| 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 使用 raw episode 的精确已发送命令；当前 runtime/geometry 完整预检后控制 xArm7/XHand；写 `replay_results/` |
+| 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取并**硬校验** `data.h5` hash 后的原始 `float64` 已发送命令，再执行完整的 live-start、limits、workspace 与 collision 预检；包含多个 source 连续段的产物拒绝物理回放 |
 | learned policy 检查 | `python examples/run_policy.py list`；`python examples/run_policy.py check <experiment> --device <device>` | 仅列出实验，或经 Policy public API strict restore + warmup + synthetic predict；不连接硬件 |
 | learned policy shadow | `python examples/run_policy.py shadow <experiment> [--inference-mode sync\|async] [--max-action-steps N]` | 连接真实 sensor 与 arm/XHand feedback，执行 inference、IK 和 SafetyGate；默认 sync，结构性禁止 actuator publication 与 home |
 | learned policy run | `python examples/run_policy.py run <experiment> [--inference-mode sync\|async]` | 连接并控制 xArm7/XHand；默认 sync；每个 episode 都需 H 完成 hand + collision-checked arm home，再以新 B 启动 |
@@ -348,7 +350,10 @@ python examples/process_episodes.py \
   --dry-run
 ```
 
-确认后去掉 `--dry-run`。所有处理 profile 都审计动作 endpoint delta；视觉 profile 还校验
+确认后去掉 `--dry-run`。默认写入后只重新打开每个 processed HDF5，确认 schema、key、shape
+和 dtype 的结构完整性，再原子发布；如需在发布前完整扫描有限值、alignment 和 semantic
+attributes，显式加 `--verify-output`。所有 consumer/export 边界始终保持完整 validation。
+所有处理 profile 都审计动作 endpoint delta；视觉 profile 还校验
 camera-source 对齐的 arm/hand policy observation、同 source 已校准 tactile sum 与重算的
 xArm-base fingertip。`--task-name` 会统一写入每个 processed episode，并拒绝与逐 episode
 annotation 中 task_name 冲突。四种 profile 在通过各自边界后均标为
@@ -364,6 +369,16 @@ processed HDF5 v11，再运行 `python examples/visualize_episode_processed.py <
 会在读取或渲染 payload 前调用共享的 processed payload/provenance admission，再校验
 `(N,6)`、`float32`、xArm-base 坐标系、RGB 范围、算法/采样语义、配置哈希与桌面标定身份；
 `rgb`/`rgb_pc` 还要求 RGB 与 depth 的 `N/H/W` 完全一致。
+
+普通 `EpisodeReader(path)` 会验证 raw v24 的必需文件、schema、dataset layout 和基本语义，
+但不会重算大型 sidecar SHA-256 或完整解码视频。需要 artifact attestation 时使用
+`EpisodeReader(path, verify_hash=True)`（或已打开 reader 的 `audit_integrity()`）；该 explicit
+audit 会校验 sidecar manifest、SHA-256 和完整 RGB frame count。
+
+物理回放始终以当前 geometry 和 runtime 完整验证 live start、joint limits、recorded
+start→first target、workspace、collision 及全部相邻 transition。只有这一步成功后，记录的
+config/URDF/SRDF hash 差异才作为 reproducibility warning；processed replay 的 raw `data.h5`
+身份不匹配仍是硬拒绝。
 
 发布时逐 episode 显示 tqdm 进度（stderr），终端只打印精简汇总，不再向 stdout 输出 JSON。
 发布成功后总会生成 `episodes_processed/<task>/process_log/invalid_frames_report.json`；

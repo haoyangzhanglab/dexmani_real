@@ -1,14 +1,16 @@
-"""Process-local immutable observation windows for the deployment runtime.
+"""Process-local observation windows for the deployment runtime.
 
 These types never enter RuntimeChannels and therefore carry no
 IPC dtype. They are the ``PolicyRuntime`` input contract.
+
+Shared-memory readers already take ownership copies.  These containers validate
+those process-local arrays without copying their payloads again.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Mapping
 
 import numpy as np
 
@@ -21,10 +23,10 @@ _POLICY_MODALITIES = frozenset(
 
 @dataclass(frozen=True)
 class PolicyObservation:
-    """Narrow immutable NumPy boundary passed to a Policy runtime.
+    """Narrow NumPy boundary passed to a Policy runtime.
 
-    Mapping insertion order is the validated Policy modality order. Every array
-    is an owned, C-contiguous, read-only copy.
+    Mapping insertion order is the validated Policy modality order. Arrays are
+    C-contiguous, writeable, inference-process-owned model inputs.
     """
 
     observation_id: int
@@ -63,15 +65,17 @@ class PolicyObservation:
             or "joint_state" not in modalities
         ):
             raise ValueError("PolicyObservation modalities are invalid")
-        frozen: dict[str, np.ndarray] = {}
         horizon: int | None = None
         for name in modalities:
-            raw = np.asarray(self.arrays[name])
+            arr = np.asarray(self.arrays[name])
             expected_dtype = np.uint8 if name == "rgb" else np.float32
-            if raw.dtype != np.dtype(expected_dtype):
+            if arr.dtype != np.dtype(expected_dtype):
                 raise TypeError(f"{name} must have dtype {np.dtype(expected_dtype)}")
-            arr = freeze_array(raw, name=f"PolicyObservation.{name}")
-            assert arr is not None
+            _validate_finite(arr, name=f"PolicyObservation.{name}")
+            if not arr.flags.c_contiguous:
+                raise ValueError(f"{name} must be C-contiguous")
+            if not arr.flags.writeable:
+                raise ValueError(f"{name} must be writeable")
             expected_tail = {
                 "joint_state": (19,),
                 "contact_force": (5, 3),
@@ -93,41 +97,13 @@ class PolicyObservation:
                 horizon = int(arr.shape[0])
             elif arr.shape[0] != horizon:
                 raise ValueError("PolicyObservation modalities must share T")
-            frozen[name] = arr
         if horizon is None or horizon <= 0:
             raise ValueError("PolicyObservation requires a non-empty history")
-        object.__setattr__(self, "arrays", MappingProxyType(frozen))
 
 
-def freeze_array(
-    arr: Any,
-    *,
-    name: str,
-    dtype: Any = None,
-) -> np.ndarray | None:
-    """Return a read-only C-order copy of *arr* (or None), validating finiteness.
-
-    Finiteness is checked on the raw input (before any integer dtype cast) so a
-    NaN timestamp cannot silently collapse to 0/INT_MAX.
-    """
-    if arr is None:
-        return None
-    raw = np.asarray(arr)
-    if raw.dtype.kind in "fc" and not np.all(np.isfinite(raw)):
+def _validate_finite(array: np.ndarray, *, name: str) -> None:
+    if array.dtype.kind in "fc" and not np.all(np.isfinite(array)):
         raise ValueError(f"{name} contains NaN/Inf")
-    target_dtype = np.dtype(dtype) if dtype is not None else None
-    if target_dtype is not None and target_dtype.kind in "iu":
-        if raw.dtype.kind not in "iu":
-            raise TypeError(f"{name} must contain integers before {target_dtype} cast")
-        info = np.iinfo(target_dtype)
-        if raw.size and (np.any(raw < info.min) or np.any(raw > info.max)):
-            raise ValueError(f"{name} is out of range for {target_dtype}")
-    elif target_dtype is not None and target_dtype.kind == "b":
-        if raw.dtype.kind != "b":
-            raise TypeError(f"{name} must contain booleans before bool cast")
-    out = np.array(raw, dtype=dtype, copy=True, order="C")
-    out.flags.writeable = False
-    return out
 
 
 @dataclass(frozen=True)
@@ -147,23 +123,24 @@ class FrameWindow:
     valid_mask: np.ndarray
 
     def __post_init__(self) -> None:
-        values = freeze_array(self.values, name="FrameWindow.values")
-        if values is None:
+        if self.values is None:
             raise ValueError("FrameWindow.values must not be None")
+        values = np.asarray(self.values)
+        _validate_finite(values, name="FrameWindow.values")
         if values.ndim < 2:
             raise ValueError("FrameWindow.values must be [T, ...]")
         t = values.shape[0]
         for name in ("source_sequence", "source_monotonic_ns", "publish_monotonic_ns"):
-            arr = freeze_array(
-                getattr(self, name), name=f"FrameWindow.{name}", dtype=np.uint64
-            )
-            if arr is None or arr.shape != (t,):
+            arr = np.asarray(getattr(self, name))
+            if arr.dtype != np.uint64:
+                raise TypeError(f"FrameWindow.{name} must have dtype uint64")
+            if arr.shape != (t,):
                 raise ValueError(f"FrameWindow.{name} must be a ({t},) uint64 array")
             object.__setattr__(self, name, arr)
-        mask = freeze_array(
-            self.valid_mask, name="FrameWindow.valid_mask", dtype=np.uint8
-        )
-        if mask is None or mask.shape != (t,):
+        mask = np.asarray(self.valid_mask)
+        if mask.dtype != np.uint8:
+            raise TypeError("FrameWindow.valid_mask must have dtype uint8")
+        if mask.shape != (t,):
             raise ValueError(f"FrameWindow.valid_mask must be a ({t},) uint8 array")
         if not np.all((mask == 0) | (mask == 1)):
             raise ValueError("FrameWindow.valid_mask must be 0 or 1")
@@ -188,8 +165,6 @@ class PointCloudFrame:
             num_points=raw_values.shape[0] if raw_values.ndim == 2 else 1,
             label="PointCloudFrame.values",
         )
-        values = np.array(values, copy=True, order="C")
-        values.flags.writeable = False
         provenance = (
             self.source_camera_sequence,
             self.source_monotonic_ns,
@@ -226,8 +201,8 @@ class RgbFrame:
     camera_generation: int
 
     def __post_init__(self) -> None:
-        values = freeze_array(self.values, name="RgbFrame.values", dtype=np.uint8)
-        if values is None or values.ndim != 3 or values.shape[2] != 3:
+        values = np.asarray(self.values)
+        if values.dtype != np.uint8 or values.ndim != 3 or values.shape[2] != 3:
             raise ValueError("RgbFrame.values must be uint8 [H, W, 3]")
         provenance = (
             self.source_camera_sequence,
@@ -258,7 +233,7 @@ class RgbFrame:
 class ObservationBatch:
     """One causal observation assembled from state and point-cloud rings.
 
-    Immutable and process-local. ``arm_history``/``hand_history`` and
+    Process-local. ``arm_history``/``hand_history`` and
     ``hand_tactile_sum_history`` are sensor-value ``FrameWindow`` values.
     ``hand_tactile_provenance_history`` contains only the unit-code proof
     aligned to tactile sums; the full tactile tensor never enters deployment.

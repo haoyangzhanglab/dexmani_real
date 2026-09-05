@@ -26,18 +26,6 @@ FIXED_POLICY_RUNTIME_TARGET = (
 _DEPLOYMENT_DEFAULT_MODE = "sync"
 _DEPLOYMENT_MODES = frozenset({"sync", "async"})
 
-_REQUIRED_POLICY_SPEC_FIELDS = (
-    "action_key",
-    "action_dim",
-    "control_action_dim",
-    "horizon",
-    "n_obs_steps",
-    "n_action_steps",
-    "observation_fields",
-    "control_dt_s",
-    "requires_hand",
-)
-
 _SUPPORTED_OBSERVATION_FIELDS = frozenset(
     {"joint_state", "point_cloud", "rgb", "contact_force", "fingertip_points"}
 )
@@ -55,37 +43,13 @@ def validate_max_running_s(max_running_s: float | None) -> float | None:
     return value
 
 
-def policy_observation_fields(policy_spec: Any) -> tuple[Any, ...]:
-    """Return the ordered Policy-owned input contract without a fallback path."""
-    fields = getattr(policy_spec, "observation_fields", None)
-    if type(fields) is not tuple or not fields:
-        raise ValueError("Policy observation_fields must be a non-empty tuple")
-    return fields
-
-
-def _field_shape(field: Any, *, name: str) -> tuple[int, ...]:
-    shape = getattr(field, "shape", None)
-    if (
-        type(shape) is not tuple
-        or not shape
-        or any(type(value) is not int or value <= 0 for value in shape)
-    ):
-        raise ValueError(f"Policy observation field {name!r} has an invalid shape")
-    return shape
-
-
-def _validate_observation_fields(policy_spec: Any) -> tuple[Any, ...]:
-    """Validate only raw tensor projections that Real can produce safely."""
-    fields = policy_observation_fields(policy_spec)
-    names = tuple(getattr(field, "name", None) for field in fields)
-    if (
-        any(type(name) is not str or not name for name in names)
-        or len(set(names)) != len(names)
-        or not set(names) <= _SUPPORTED_OBSERVATION_FIELDS
-        or "joint_state" not in names
-    ):
+def _validate_real_observation_capability(policy_spec: Any) -> tuple[Any, ...]:
+    """Validate the Policy observation projection that Real can produce."""
+    fields = policy_spec.observation_fields
+    names = tuple(field.name for field in fields)
+    if not set(names) <= _SUPPORTED_OBSERVATION_FIELDS or "joint_state" not in names:
         raise ValueError(
-            "Policy observation_fields must be unique supported names including joint_state"
+            "Real supports only configured modalities including joint_state"
         )
 
     fixed_fields = {
@@ -94,8 +58,8 @@ def _validate_observation_fields(policy_spec: Any) -> tuple[Any, ...]:
         "fingertip_points": ((5, 3), "float32"),
     }
     for field, name in zip(fields, names, strict=True):
-        shape = _field_shape(field, name=name)
-        dtype = getattr(field, "dtype", None)
+        shape = field.shape
+        dtype = field.dtype
         if name in fixed_fields:
             if (shape, dtype) != fixed_fields[name]:
                 raise ValueError(
@@ -116,59 +80,23 @@ def _validate_observation_fields(policy_spec: Any) -> tuple[Any, ...]:
     return fields
 
 
-def validate_policy_spec(policy_spec: Any) -> None:
-    """Validate the public model contract supported by the fixed Real setup."""
-    missing = [
-        name for name in _REQUIRED_POLICY_SPEC_FIELDS if not hasattr(policy_spec, name)
-    ]
-    if missing:
-        raise TypeError(f"PolicySpec is missing required field(s): {missing}")
-
-    _validate_observation_fields(policy_spec)
+def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> None:
+    """Validate only whether Real can run the Policy-owned public contract."""
+    fields = _validate_real_observation_capability(policy_spec)
     if policy_spec.requires_hand is not True:
         raise ValueError(
             "Real deployment requires hand actions because its control schema is "
             "arm7 + hand12"
         )
-    integer_fields = (
-        "action_dim",
-        "control_action_dim",
-        "horizon",
-        "n_obs_steps",
-        "n_action_steps",
-    )
-    for name in integer_fields:
-        value = getattr(policy_spec, name)
-        if type(value) is not int or value <= 0:
-            raise ValueError(f"Policy {name} must be a positive integer")
     if policy_spec.n_action_steps > MAX_PREDICTION_STEPS:
         raise ValueError(
             f"Policy n_action_steps exceeds Real IPC capacity {MAX_PREDICTION_STEPS}"
         )
-    if policy_spec.action_dim < policy_spec.control_action_dim:
-        raise ValueError(
-            "Policy action_dim must not be smaller than control_action_dim"
-        )
-    if policy_spec.n_obs_steps - 1 + policy_spec.n_action_steps > policy_spec.horizon:
-        raise ValueError("Policy observation/action window exceeds its horizon")
-
     if policy_spec.action_key not in {"action", "action_ee"}:
         raise ValueError("Policy action_key is unsupported by Real")
     expected_control_dim = 21 if policy_spec.action_key == "action_ee" else 19
     if policy_spec.control_action_dim != expected_control_dim:
         raise ValueError("Policy control_action_dim conflicts with its action_key")
-    if (
-        isinstance(policy_spec.control_dt_s, bool)
-        or not isinstance(policy_spec.control_dt_s, (int, float))
-        or not math.isfinite(float(policy_spec.control_dt_s))
-        or float(policy_spec.control_dt_s) <= 0.0
-    ):
-        raise ValueError("Policy control_dt_s must be finite and positive")
-
-
-def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> None:
-    """Validate Policy-owned structure against Real-owned runtime semantics."""
-    validate_policy_spec(policy_spec)
     control_dt_s = 1.0 / float(runtime.policy.control_hz)
     if not math.isclose(
         control_dt_s,
@@ -177,8 +105,8 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
         abs_tol=1e-12,
     ):
         raise ValueError("Policy control_dt_s does not match Real policy.control_hz")
-    fields = {field.name: field for field in policy_observation_fields(policy_spec)}
-    point_cloud = fields.get("point_cloud")
+    fields_by_name = {field.name: field for field in fields}
+    point_cloud = fields_by_name.get("point_cloud")
     if (
         point_cloud is not None
         and runtime.pointcloud.num_points != point_cloud.shape[0]
@@ -186,7 +114,7 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
         raise ValueError(
             "Policy point_cloud shape does not match Real pointcloud config"
         )
-    rgb = fields.get("rgb")
+    rgb = fields_by_name.get("rgb")
     if rgb is not None and rgb.shape != (
         int(runtime.camera.height),
         int(runtime.camera.width),
@@ -239,7 +167,6 @@ class PolicyWorkerConfig:
             raise ValueError("device must not have leading or trailing whitespace")
         if type(self.seed) is not int or self.seed != 0:
             raise ValueError("policy inference seed is fixed to 0")
-        validate_policy_spec(self.spec)
 
 
 @dataclass(frozen=True)
@@ -278,8 +205,6 @@ __all__ = [
     "FingertipAssemblerConfig",
     "PolicyDeploymentConfig",
     "PolicyWorkerConfig",
-    "policy_observation_fields",
     "validate_policy_runtime_compatibility",
-    "validate_policy_spec",
     "validate_max_running_s",
 ]

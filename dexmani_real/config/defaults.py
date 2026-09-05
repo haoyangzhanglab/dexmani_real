@@ -1071,11 +1071,14 @@ class CameraParams:
         if self.warmup_frames < 0:
             raise ValueError("camera warmup_frames must be >= 0")
         if (
-            self.max_frame_age_s <= 0
+            not np.isfinite(self.max_frame_age_s)
+            or self.max_frame_age_s <= 0
+            or not np.isfinite(self.recording_stall_abort_s)
             or self.recording_stall_abort_s <= self.max_frame_age_s
         ):
             raise ValueError(
-                "camera stall abort threshold must be greater than max frame age"
+                "camera frame age and stall thresholds must be finite and positive, "
+                "with stall abort greater than max frame age"
             )
         if self.frame_gap_stall_threshold < 0:
             raise ValueError("camera frame_gap_stall_threshold must be >= 0")
