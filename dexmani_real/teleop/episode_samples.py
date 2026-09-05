@@ -34,8 +34,7 @@ _FRAME_HELD = 1
 FRAME_IK_FAIL = 2
 FRAME_SAFETY_REJECT = 3
 FRAME_RETARGET_FAIL = 4
-_OBSERVATION_MAX_SKEW_S = 0.10
-_TACTILE_MAX_AGE_NS = 250_000_000
+RECORDING_TACTILE_MAX_AGE_NS = 250_000_000
 _NS_PER_SECOND = 1_000_000_000
 
 
@@ -65,6 +64,7 @@ def _recording_provenance(
     arm_ring_sequence: int = 0,
     hand_ring_sequence: int = 0,
     action_candidate: ActionCandidate | None = None,
+    max_observation_skew_s: float,
 ) -> dict[str, object]:
     """Correlate one policy-grid sample with causal sources and send metadata."""
     anchor_ns = (
@@ -86,7 +86,7 @@ def _recording_provenance(
     hand_publish_ns = _field(hand_state, "publish_monotonic_ns")
     arm_source_sequence = int(arm_ring_sequence)
     hand_source_sequence = int(hand_ring_sequence)
-    vr_source_ns = int(vr_frame.get("local_recv_ns", 0)) if vr_frame is not None else 0
+    vr_source_ns = int(vr_frame.get("recv_ts_ns", 0)) if vr_frame is not None else 0
     vr_source_sequence = (
         int(vr_frame.get("ring_sequence", 0)) if vr_frame is not None else 0
     )
@@ -153,7 +153,7 @@ def _recording_provenance(
     if hand_state is not None:
         required_mask = np.concatenate([required_mask, source_valid[1:2]])
     observation_valid = bool(np.all(required_mask)) and bool(
-        np.nanmax(skew_s, initial=0.0) <= _OBSERVATION_MAX_SKEW_S
+        np.nanmax(skew_s, initial=0.0) <= float(max_observation_skew_s)
     )
 
     action_id = action_candidate.action_id if action_candidate is not None else 0
@@ -170,7 +170,7 @@ def _recording_provenance(
     tactile_fresh = (
         _field(hand_tactile, "fresh") == 1
         and 0 < tactile_source_ns <= anchor_ns
-        and anchor_ns - tactile_source_ns <= _TACTILE_MAX_AGE_NS
+        and anchor_ns - tactile_source_ns <= RECORDING_TACTILE_MAX_AGE_NS
     )
     return {
         "observation_id": observation_id,
@@ -245,6 +245,8 @@ def record_held(
     hand_ring_sequence: int = 0,
     shared: RuntimeChannels | None = None,
     action_candidate: ActionCandidate | None = None,
+    control_run_generation: int,
+    max_observation_skew_s: float,
     policy_observation: Mapping[str, object] | None = None,
 ) -> None:
     """Record an active safety-fallback frame and its optional hold command.
@@ -310,6 +312,7 @@ def record_held(
                 arm_ring_sequence=arm_ring_sequence,
                 hand_ring_sequence=hand_ring_sequence,
                 action_candidate=action_candidate,
+                max_observation_skew_s=max_observation_skew_s,
             )
         )
     if policy_observation is not None:
@@ -322,6 +325,7 @@ def record_held(
         signals=signals,
         arm_qpos_sent=arm_qpos_sent,
         diagnostics=diagnostics,
+        control_run_generation=control_run_generation,
     )
 
 
@@ -356,6 +360,8 @@ def record_frame(
     hand_ring_sequence: int = 0,
     shared: RuntimeChannels | None = None,
     action_candidate: ActionCandidate | None = None,
+    control_run_generation: int,
+    max_observation_skew_s: float,
     policy_observation: Mapping[str, object] | None = None,
 ) -> None:
     """Record a normal (active teleop) frame.
@@ -420,6 +426,7 @@ def record_frame(
                 arm_ring_sequence=arm_ring_sequence,
                 hand_ring_sequence=hand_ring_sequence,
                 action_candidate=action_candidate,
+                max_observation_skew_s=max_observation_skew_s,
             )
         )
     if policy_observation is not None:
@@ -431,6 +438,7 @@ def record_frame(
         camera_frame=cam,
         signals=signals,
         arm_qpos_sent=arm_cmd.copy(),
+        control_run_generation=control_run_generation,
         diagnostics={
             "tracking_error": (
                 float(arm_state["tracking_err"][0])
@@ -491,9 +499,10 @@ def _build_robot_state(
         arm_qpos = np.asarray(r["qpos"], dtype=np.float64)
         arm_qvel = np.asarray(r["qvel"], dtype=np.float64)
         arm_tau = np.asarray(r["tau"], dtype=np.float64)
-        try:
+        arm_state_valid = bool(r["state_valid"])
+        if arm_state_valid:
             eef_pos, eef_rot6d = make_arm_fk().compute(arm_qpos)
-        except Exception:
+        else:
             eef_pos = nan_array(3)
             eef_rot6d = nan_array(6)
         arm_connected = bool(r["connected"])
@@ -508,6 +517,7 @@ def _build_robot_state(
         arm_connected = False
         arm_last_cmd_seq = 0
         arm_last_cmd_is_hold = False
+        arm_state_valid = False
 
     if hand_state is not None:
         h = hand_state[0]
@@ -520,6 +530,7 @@ def _build_robot_state(
         hand_commboard_err = np.asarray(h["commboard_err"], dtype=np.int32)
         hand_jointboard_err = np.asarray(h["jointboard_err"], dtype=np.int32)
         hand_tipboard_err = np.asarray(h["tipboard_err"], dtype=np.int32)
+        hand_state_valid = bool(h["state_valid"])
     else:
         hand_qpos = nan_array(HAND_JOINT_SHAPE)
         hand_current = nan_array(HAND_JOINT_SHAPE)
@@ -530,6 +541,7 @@ def _build_robot_state(
         hand_commboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
         hand_jointboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
         hand_tipboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
+        hand_state_valid = False
 
     if hand_tactile is not None:
         hand_tactile_force = np.asarray(
@@ -547,23 +559,22 @@ def _build_robot_state(
     fingertip_pos = nan_array(HAND_FINGERTIP_SHAPE)
     if (
         hk is not None
+        and arm_state_valid
+        and hand_state_valid
         and hand_connected
         and T_eef_handbase_pos is not None
         and T_eef_handbase_quat_wxyz is not None
     ):
-        try:
-            fingertip_pos = compute_fingertip_points_xarm_base(
-                arm_qpos,
-                hand_qpos,
-                arm_fk=None,
-                hand_fk=hk,
-                handbase_position_eef_m=T_eef_handbase_pos,
-                handbase_quat_eef_wxyz=T_eef_handbase_quat_wxyz,
-                eef_position_xarm_base_m=eef_pos,
-                eef_rot6d_xarm_base=eef_rot6d,
-            )
-        except Exception:
-            fingertip_pos = nan_array(HAND_FINGERTIP_SHAPE)
+        fingertip_pos = compute_fingertip_points_xarm_base(
+            arm_qpos,
+            hand_qpos,
+            arm_fk=None,
+            hand_fk=hk,
+            handbase_position_eef_m=T_eef_handbase_pos,
+            handbase_quat_eef_wxyz=T_eef_handbase_quat_wxyz,
+            eef_position_xarm_base_m=eef_pos,
+            eef_rot6d_xarm_base=eef_rot6d,
+        )
 
     return RobotState(
         arm_qpos=arm_qpos,

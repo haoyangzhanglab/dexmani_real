@@ -97,7 +97,6 @@ class GateRejectCode(str, Enum):
 
     ARM_JOINT_LIMIT = "arm joint limit violation"
     HAND_JOINT_LIMIT = "hand joint limit violation"
-    ARM_DELTA_LIMIT = "arm per-tick delta limit violation"
     HAND_DELTA_LIMIT = "hand per-tick delta limit violation"
     COLLISION_TRANSITION = "collision on arm/hand transition"
     COLLISION_CHECK_FAILED = "collision transition check failed"
@@ -119,14 +118,11 @@ class GateResult:
 
 
 class SafetyGate:
-    """Fail-closed validation of physical limits, delta, workspace, and collision.
+    """Fail-closed validation of physical limits, workspace, and collision.
 
-    Delta and collision checks are opt-in (default ``None`` → disabled) so the
-    shared gate used by teleop/replay/calibration keeps its existing behavior;
-    only the learned-policy deployment enables them.  Delta limits *reject*
-    whole (never clip): clipping a learned action silently rewrites the model's
-    intent (plan §9).  ``endpoint_delta_tolerance_rad`` is a shared numerical
-    slack applied to both arm and hand endpoint predicates.
+    The optional hand delta check rejects the whole coupled endpoint; learned
+    arm spike shaping belongs to its producer. ``endpoint_delta_tolerance_rad``
+    is numerical slack for the hand endpoint-delta predicate.
     """
 
     def __init__(
@@ -137,7 +133,6 @@ class SafetyGate:
         hand_joint_lower_rad: tuple[float, ...],
         hand_joint_upper_rad: tuple[float, ...],
         workspace_check: Callable[[np.ndarray, np.ndarray], bool] | None = None,
-        max_arm_delta_rad: Any = None,
         max_hand_delta_rad: Any = None,
         endpoint_delta_tolerance_rad: float = (
             policy_defaults.endpoint_delta_tolerance_rad
@@ -166,9 +161,6 @@ class SafetyGate:
         self.hand_low = hand_low
         self.hand_high = hand_high
         self.workspace_check = workspace_check
-        self.max_arm_delta_rad = self._coerce_delta(
-            max_arm_delta_rad, ARM_JOINT_SHAPE, "max_arm_delta_rad"
-        )
         self.max_hand_delta_rad = self._coerce_delta(
             max_hand_delta_rad, HAND_JOINT_SHAPE, "max_hand_delta_rad"
         )
@@ -200,23 +192,17 @@ class SafetyGate:
         *,
         current_arm_qpos: np.ndarray,
         current_hand_qpos: np.ndarray | None = None,
-        arm_delta_reference_qpos: np.ndarray | None = None,
         hand_delta_reference_qpos: np.ndarray | None = None,
     ) -> GateResult:
         """Validate one candidate without modifying it or external state.
 
-        Workspace and collision transitions start at measured feedback. Optional
-        delta references are the previous published targets, so actuator lag
-        cannot turn a command-rate limit into an unintended tracking-error gate.
+        Workspace and collision transitions start at measured feedback. The
+        optional hand delta reference is the previous published target, so
+        actuator lag cannot become an unintended tracking-error gate.
         """
         # ActionCandidate owns command structure. The feedback reader owns the
         # shape/dtype/finite contract of these measured arrays.
         arm_start = current_arm_qpos
-        arm_delta_start = arm_start
-        arm_delta_reference_kind = "measured_feedback"
-        if arm_delta_reference_qpos is not None:
-            arm_delta_start = arm_delta_reference_qpos
-            arm_delta_reference_kind = "previous_published_target"
         arm_end = arm_start.copy() if candidate.arm_qpos is None else candidate.arm_qpos
         hand_end = candidate.hand_qpos
         hand_start: np.ndarray | None = None
@@ -242,24 +228,6 @@ class SafetyGate:
                 GateRejectCode.HAND_JOINT_LIMIT,
                 _hand_joint_limit_detail(hand_end, self.hand_low, self.hand_high),
             )
-        # Per-tick delta limits (reject, never clip).
-        if self.max_arm_delta_rad is not None and candidate.arm_qpos is not None:
-            if np.any(
-                np.abs(arm_end - arm_delta_start)
-                > self.max_arm_delta_rad + self.endpoint_delta_tolerance_rad
-            ):
-                return GateResult(
-                    False,
-                    GateRejectCode.ARM_DELTA_LIMIT,
-                    _joint_delta_limit_detail(
-                        joint_group="arm",
-                        target_rad=arm_end,
-                        reference_rad=arm_delta_start,
-                        limit_rad=self.max_arm_delta_rad,
-                        tolerance_rad=self.endpoint_delta_tolerance_rad,
-                        reference_kind=arm_delta_reference_kind,
-                    ),
-                )
         if (
             self.max_hand_delta_rad is not None
             and hand_end is not None
@@ -308,6 +276,7 @@ class SafetyGate:
                 return GateResult(False, GateRejectCode.COLLISION_CHECK_FAILED)
         return GateResult(True)
 
+
 def planner_action_safety_gate(
     *,
     planner: Any,
@@ -315,7 +284,6 @@ def planner_action_safety_gate(
     arm_joint_upper_rad: tuple[float, ...],
     hand_joint_lower_rad: tuple[float, ...],
     hand_joint_upper_rad: tuple[float, ...],
-    max_arm_delta_rad: Any = None,
     max_hand_delta_rad: Any = None,
     endpoint_delta_tolerance_rad: float = (
         policy_defaults.endpoint_delta_tolerance_rad
@@ -326,8 +294,8 @@ def planner_action_safety_gate(
 ) -> SafetyGate:
     """Build a safety gate using the planner's segment workspace check.
 
-    ``max_arm_delta_rad`` / ``max_hand_delta_rad`` / ``collision_check`` are
-    opt-in; each caller enables only the checks owned by its command path.
+    ``max_hand_delta_rad`` / ``collision_check`` are opt-in; each caller enables
+    only the checks owned by its command path.
     The endpoint tolerance defaults to the canonical policy runtime default.
     """
     return SafetyGate(
@@ -336,7 +304,6 @@ def planner_action_safety_gate(
         hand_joint_lower_rad=hand_joint_lower_rad,
         hand_joint_upper_rad=hand_joint_upper_rad,
         workspace_check=planner.is_workspace_segment_safe,
-        max_arm_delta_rad=max_arm_delta_rad,
         max_hand_delta_rad=max_hand_delta_rad,
         endpoint_delta_tolerance_rad=endpoint_delta_tolerance_rad,
         collision_check=collision_check,

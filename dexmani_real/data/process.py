@@ -1,4 +1,4 @@
-"""Transactional depth-to-color aligned raw-v24 to processed-v11 processing."""
+"""Transactional depth-to-color aligned raw-v24 to processed-v12 processing."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 11
+PROCESSED_SCHEMA_VERSION = 12
 _SOURCE_MEMBERS = ("data.h5", "depth.h5", "rgb.mp4")
 _PROVENANCE_DATASETS = (
     "source_row_index",
@@ -689,7 +689,6 @@ def _write_attrs(
         annotation.task_name or str(meta.get("task_label", "")).strip() or "unknown"
     )
     visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
-    endpoint_delta_tolerance_rad = config.endpoint_delta_tolerance_rad
     output.attrs.update(
         {
             "schema_name": PROCESSED_SCHEMA_NAME,
@@ -721,19 +720,7 @@ def _write_attrs(
                 else "control_grid_state"
             ),
             "max_observation_skew_s": config.max_observation_skew_s,
-            "action_semantics": "deployment_grid_rate_limited_target",
-            "arm_max_delta_rad_per_tick": (
-                np.nan
-                if config.arm_max_delta_rad_per_tick is None
-                else float(config.arm_max_delta_rad_per_tick)
-            ),
-            "hand_max_delta_rad_per_tick": config.hand_max_delta_rad_per_tick,
-            "endpoint_delta_tolerance_rad": (
-                np.nan
-                if endpoint_delta_tolerance_rad is None
-                else float(endpoint_delta_tolerance_rad)
-            ),
-            "deployment_equivalent": True,
+            "action_semantics": "teleop_published_joint_target",
             "task_name": task_name,
             "point_cloud_frame": (
                 "xarm_base" if config.profile.needs_pointcloud else "omitted"
@@ -1148,7 +1135,7 @@ def _validate_processed_output_structure(
 def validate_processed_hdf5(
     path: str | Path, config: ProcessingConfig
 ) -> dict[str, Any]:
-    """Fail closed on a processed Real HDF5 v11 artifact."""
+    """Fail closed on a processed Real HDF5 v12 artifact."""
 
     artifact = Path(path)
     with h5py.File(artifact, "r") as source:
@@ -1246,7 +1233,6 @@ def validate_processed_hdf5(
             if visual_profile
             else "grid_anchor_monotonic_ns"
         )
-        expected_deployment_equivalent = True
         expected_contact_source = (
             "camera_causal_tactile_sum"
             if visual_profile
@@ -1257,7 +1243,6 @@ def validate_processed_hdf5(
             if visual_profile
             else "newest_source_not_after_grid_within_max_observation_skew"
         )
-        deployment_equivalent = _strict_bool_attr(source.attrs, "deployment_equivalent")
         contact_force_si_verified = _strict_bool_attr(
             source.attrs, "contact_force_si_verified"
         )
@@ -1276,10 +1261,6 @@ def validate_processed_hdf5(
         contact_force_hand_source_match_required = _strict_bool_attr(
             source.attrs, "contact_force_hand_source_match_required"
         )
-        endpoint_delta_tolerance_rad = config.endpoint_delta_tolerance_rad
-        persisted_endpoint_delta = float(
-            source.attrs.get("endpoint_delta_tolerance_rad", np.nan)
-        )
         if (
             str(source.attrs.get("state_alignment", "")) != expected_state_alignment
             or str(source.attrs.get("observation_reference", "")) != expected_reference
@@ -1289,46 +1270,8 @@ def validate_processed_hdf5(
                 rtol=0.0,
                 atol=1e-15,
             )
-            or (
-                config.arm_max_delta_rad_per_tick is None
-                and not np.isnan(
-                    float(source.attrs.get("arm_max_delta_rad_per_tick", np.nan))
-                )
-            )
-            or (
-                config.arm_max_delta_rad_per_tick is not None
-                and not np.isclose(
-                    float(source.attrs.get("arm_max_delta_rad_per_tick", np.nan)),
-                    config.arm_max_delta_rad_per_tick,
-                    rtol=0.0,
-                    atol=1e-15,
-                )
-            )
-            or not np.isclose(
-                float(source.attrs.get("hand_max_delta_rad_per_tick", np.nan)),
-                config.hand_max_delta_rad_per_tick,
-                rtol=0.0,
-                atol=1e-15,
-            )
-            or (
-                endpoint_delta_tolerance_rad is None
-                and not np.isnan(persisted_endpoint_delta)
-            )
-            or (
-                endpoint_delta_tolerance_rad is not None
-                and (
-                    not np.isfinite(persisted_endpoint_delta)
-                    or not np.isclose(
-                        persisted_endpoint_delta,
-                        endpoint_delta_tolerance_rad,
-                        rtol=0.0,
-                        atol=1e-15,
-                    )
-                )
-            )
             or str(source.attrs.get("action_semantics", ""))
-            != "deployment_grid_rate_limited_target"
-            or deployment_equivalent != expected_deployment_equivalent
+            != "teleop_published_joint_target"
             or str(source.attrs.get("contact_force_unit", "")) != _CONTACT_FORCE_UNIT
             or contact_force_si_verified is not _CONTACT_FORCE_SI_VERIFIED
             or str(source.attrs.get("contact_force_frame", "")) != _CONTACT_FORCE_FRAME
@@ -1347,7 +1290,7 @@ def validate_processed_hdf5(
             != _FINGERTIP_POINTS_UNIT
             or str(source.attrs.get("action_ee_frame", "")) != _ACTION_EE_FRAME
         ):
-            raise ValueError(f"{artifact.name}: invalid deployment data contract")
+            raise ValueError(f"{artifact.name}: invalid processed data contract")
         if str(source.attrs.get("source_contiguity", "")) != (
             "segment_ends_in_provenance"
         ):

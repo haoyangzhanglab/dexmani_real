@@ -6,23 +6,35 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import h5py
 import numpy as np
+import zarr
 
+from examples import process_episodes
 from dexmani_real.config.pointcloud import PointCloudConfig
+from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.data.clean import align_tactile_sum_rows_to_references
-from dexmani_real.data.contracts import OutputProfile, ProcessingConfig
+from dexmani_real.data.contracts import (
+    EpisodeAnnotation,
+    EpisodeDecision,
+    OutputProfile,
+    ProcessingConfig,
+    QualityPolicy,
+)
 from dexmani_real.data.export import (
     PolicyZarrExportConfig,
     _Artifact,
     _inspect_artifact,
+    export_processed_hdf5_to_zarr,
 )
 from dexmani_real.data.process import (
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
     _validate_processed_output_structure,
+    _write_processed_episode,
     compute_fingertip_history_xarm_base,
     validate_processed_hdf5,
 )
@@ -147,7 +159,7 @@ class OfflineMultimodalTest(unittest.TestCase):
         ).astype(np.float32)
         np.testing.assert_array_equal(history, expected)
 
-    def test_policy_zarr_v5_admits_all_four_processed_profiles(self) -> None:
+    def test_policy_zarr_v6_admits_all_four_processed_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for profile in OutputProfile:
@@ -174,11 +186,163 @@ class OfflineMultimodalTest(unittest.TestCase):
                     self.assertEqual(
                         artifact.semantic_attrs["fingertip_points_unit"], "m"
                     )
+                    self.assertEqual(
+                        artifact.semantic_attrs["action_semantics"],
+                        "teleop_published_joint_target",
+                    )
+                    self.assertNotIn("deployment_equivalent", artifact.semantic_attrs)
+
+    def test_processed_v11_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.h5"
+            self._write_processed_fixture(path, OutputProfile.JOINT)
+            with h5py.File(path, "r+") as output:
+                output.attrs["schema_version"] = PROCESSED_SCHEMA_VERSION - 1
+            with self.assertRaisesRegex(
+                ValueError, "unsupported processed schema version"
+            ):
+                _inspect_artifact(path, PolicyZarrExportConfig())
+
+    def test_processing_runtime_timing_defaults_and_cli_overrides(self) -> None:
+        runtime = resolve_runtime_config(
+            data={
+                "camera": {"max_frame_age_s": 0.4},
+                "policy": {"max_observation_skew_s": 0.2},
+            }
+        )
+        defaults = ProcessingConfig.from_runtime(runtime, profile=OutputProfile.JOINT)
+        self.assertEqual(defaults.max_camera_age_s, 0.4)
+        self.assertEqual(defaults.max_observation_skew_s, 0.2)
+
+        parser = process_episodes._parser()
+        args = parser.parse_args(["episodes/pick"])
+        config = process_episodes._config(
+            args, OutputProfile.JOINT, QualityPolicy.AUDIT, runtime
+        )
+        self.assertEqual(config.max_camera_age_s, 0.4)
+        self.assertEqual(config.max_observation_skew_s, 0.2)
+
+        args = parser.parse_args(
+            [
+                "episodes/pick",
+                "--max-camera-age-s",
+                "0.3",
+                "--max-observation-skew-s",
+                "0.1",
+            ]
+        )
+        config = process_episodes._config(
+            args, OutputProfile.JOINT, QualityPolicy.AUDIT, runtime
+        )
+        self.assertEqual(config.max_camera_age_s, 0.3)
+        self.assertEqual(config.max_observation_skew_s, 0.1)
+
+    def test_joint_writer_validator_and_zarr_export_keep_teleop_action_semantics(
+        self,
+    ) -> None:
+        """Exercise the real processed writer and both persisted consumers."""
+        config = ProcessingConfig(
+            profile=OutputProfile.JOINT,
+            horizon=2,
+            min_full_windows=1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            episode = root / "episode"
+            episode.mkdir()
+            (episode / "rgb.mp4").write_bytes(b"synthetic-rgb")
+            with h5py.File(episode / "depth.h5", "w"):
+                pass
+            source_path = episode / "data.h5"
+            with h5py.File(source_path, "w") as source:
+                source.create_group("meta").attrs.update(
+                    {
+                        "task_label": "pick",
+                        "resolved_config_sha256": "a" * 64,
+                    }
+                )
+                source.create_dataset(
+                    "action_arm_joint_sent",
+                    data=np.full((2, 7), 0.1, dtype=np.float64),
+                )
+                source.create_dataset(
+                    "action_hand_joint", data=np.zeros((2, 12), dtype=np.float64)
+                )
+                action_ee = np.zeros((2, 9), dtype=np.float64)
+                action_ee[:, 3] = 1.0
+                action_ee[:, 7] = 1.0
+                source.create_dataset("action_arm_ee", data=action_ee)
+                source.create_dataset("arm_qpos", data=np.zeros((2, 7)))
+                source.create_dataset("hand_qpos", data=np.zeros((2, 12)))
+                source.create_dataset("hand_fingertip", data=np.zeros((2, 5, 3)))
+                source.create_dataset("hand_contact", data=np.zeros((2, 5, 3)))
+                source_times_ns = np.array(
+                    [1_000_000_000, 1_062_500_000], dtype=np.int64
+                )
+                for key in (
+                    "hand_source_monotonic_ns",
+                    "tactile_source_monotonic_ns",
+                    "observation_anchor_monotonic_ns",
+                ):
+                    source.create_dataset(key, data=source_times_ns)
+                source.create_dataset("tactile_fresh", data=np.ones(2, dtype=bool))
+                source.create_dataset("tactile_calibrated", data=np.ones(2, dtype=bool))
+                source.create_dataset("tactile_unit_code", data=np.zeros(2, np.int64))
+                source.create_dataset(
+                    "source_sample_index", data=np.arange(2, dtype=np.int64)
+                )
+                source.create_dataset(
+                    "timestamp", data=np.array([1.0, 1.0625], dtype=np.float64)
+                )
+
+            decision = EpisodeDecision(
+                source_path=episode,
+                source_frames=2,
+                profile=OutputProfile.JOINT,
+                selected_indices=np.arange(2, dtype=np.int64),
+                keep_mask=np.ones(2, dtype=bool),
+                drop_reason_bits=np.zeros(2, dtype=np.uint64),
+                drop_reason_names=(),
+                hard_reason_counts={},
+                boundary_counts={},
+                selected_frames=2,
+                quality={"full_window_count": 1},
+            )
+            processed_root = root / "processed"
+            processed_root.mkdir()
+            with h5py.File(source_path, "r") as source:
+                reader = SimpleNamespace(
+                    h5_path=episode,
+                    h5f=source,
+                    timing=SimpleNamespace(grid_dt_s=0.0625),
+                )
+                output = _write_processed_episode(
+                    reader,
+                    decision,
+                    processed_root,
+                    config,
+                    EpisodeAnnotation(),
+                )
+
+            processed_path = processed_root / output["path"]
+            validate_processed_hdf5(processed_path, config)
+            zarr_path = root / "policy.zarr"
+            report = export_processed_hdf5_to_zarr(
+                processed_root,
+                zarr_path,
+                PolicyZarrExportConfig(expected_task_name="pick"),
+            )
+            self.assertEqual(report["episode_count"], 1)
+            exported = zarr.open_group(str(zarr_path), mode="r")
+            self.assertEqual(
+                exported.attrs["action_semantics"],
+                "teleop_published_joint_target",
+            )
+            self.assertNotIn("deployment_equivalent", exported.attrs)
 
     def test_export_rejects_non_boolean_and_non_integer_semantic_attrs(self) -> None:
         cases = (
-            ("deployment_equivalent", "false"),
-            ("deployment_equivalent", 0),
+            ("action_semantics", "deployment_grid_rate_limited_target"),
             ("contact_force_unit_code", 0.9),
             ("contact_force_si_verified", None),
             ("contact_force_si_verified", True),
@@ -216,8 +380,7 @@ class OfflineMultimodalTest(unittest.TestCase):
 
     def test_process_rejects_non_boolean_and_non_integer_semantic_attrs(self) -> None:
         cases = (
-            ("deployment_equivalent", "false"),
-            ("deployment_equivalent", 0),
+            ("action_semantics", "deployment_grid_rate_limited_target"),
             ("contact_force_unit_code", 0.9),
             ("contact_force_si_verified", None),
             ("contact_force_si_verified", True),
@@ -232,9 +395,6 @@ class OfflineMultimodalTest(unittest.TestCase):
             profile=OutputProfile.JOINT,
             horizon=1,
             min_full_windows=1,
-            arm_max_delta_rad_per_tick=0.1,
-            hand_max_delta_rad_per_tick=0.3,
-            endpoint_delta_tolerance_rad=1e-6,
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -258,9 +418,6 @@ class OfflineMultimodalTest(unittest.TestCase):
             profile=OutputProfile.JOINT,
             horizon=1,
             min_full_windows=1,
-            arm_max_delta_rad_per_tick=0.1,
-            hand_max_delta_rad_per_tick=0.3,
-            endpoint_delta_tolerance_rad=1e-6,
         )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "output.h5"
@@ -318,11 +475,7 @@ class OfflineMultimodalTest(unittest.TestCase):
                         else "control_grid_state"
                     ),
                     "max_observation_skew_s": 0.1,
-                    "action_semantics": "deployment_grid_rate_limited_target",
-                    "arm_max_delta_rad_per_tick": 0.1,
-                    "hand_max_delta_rad_per_tick": 0.3,
-                    "endpoint_delta_tolerance_rad": 1e-6,
-                    "deployment_equivalent": True,
+                    "action_semantics": "teleop_published_joint_target",
                     "contact_force_unit": "sdk_scaled_unknown_si",
                     "contact_force_si_verified": False,
                     "contact_force_frame": "xhand_sensor_native_axes_per_finger",

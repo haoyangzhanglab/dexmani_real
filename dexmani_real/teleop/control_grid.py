@@ -23,6 +23,7 @@ from dexmani_real.ipc.causal import (
     read_hand_tactile_causal,
     read_structured_frame_aligned_to_source,
     read_vr_frame_causal,
+    vr_frame_is_fresh,
 )
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
@@ -117,6 +118,7 @@ class TeleopGridResources:
     handbase_position_eef_m: np.ndarray
     handbase_quat_eef_wxyz: np.ndarray
     hand_ramp_total_frames: int
+    max_observation_skew_s: float
 
 
 @dataclass(frozen=True)
@@ -132,6 +134,7 @@ class TeleopGridObservation:
     hand_ring_sequence: int
     hand_tactile: np.ndarray | None
     anchor_monotonic_ns: int
+    control_run_generation: int
     policy_observation_signals: dict[str, object] | None
 
 
@@ -147,7 +150,6 @@ class TeleopActionComputation:
     hand_qpos_rad: np.ndarray
     raw_hand_qpos_rad: np.ndarray
     hand_retarget_succeeded: bool
-    hand_validation_issue: str | None
     hand_retarget_time_ms: float
     ik_qpos_rad: np.ndarray | None
     ik_failure_reason: str
@@ -291,16 +293,9 @@ class TeleopController:
             command_lower_rad=self.command_limits.hand_command_lower_rad,
             command_upper_rad=self.command_limits.hand_command_upper_rad,
             max_delta_rad_per_tick=self.command_limits.hand_max_delta_rad_per_tick,
-            mechanical_lower_rad=self.command_limits.hand_mechanical_lower_rad,
-            mechanical_upper_rad=self.command_limits.hand_mechanical_upper_rad,
         )
         self.hand_ramp_start = hand.next_ramp_start_qpos_rad
         self.hand_ramp_step = hand.next_ramp_step
-        if hand.validation_issue is not None:
-            resources.validation_warn(
-                "teleop_loop: invalid hand command — holding: %s",
-                hand.validation_issue,
-            )
         self.planner.set_hand_qpos(hand.qpos_rad)
         ik_started_s = time.perf_counter()
         ik_result = self.planner.solve_teleop_ik(
@@ -321,7 +316,6 @@ class TeleopController:
             hand_qpos_rad=hand.qpos_rad,
             raw_hand_qpos_rad=hand.raw_qpos_rad,
             hand_retarget_succeeded=hand.retarget_succeeded,
-            hand_validation_issue=hand.validation_issue,
             hand_retarget_time_ms=hand.compute_time_ms,
             ik_qpos_rad=ik_result.qpos if ik_result.success else None,
             ik_failure_reason=ik_result.reason,
@@ -487,6 +481,8 @@ def _record_grid_hold(
         hand_ring_sequence=observation.hand_ring_sequence,
         shared=shared,
         action_candidate=action_candidate,
+        control_run_generation=observation.control_run_generation,
+        max_observation_skew_s=resources.max_observation_skew_s,
         policy_observation=observation.policy_observation_signals,
         **kwargs,
     )
@@ -506,6 +502,7 @@ def _read_control_grid_observation(
     hand_disconnected_at_s: float | None,
     loop_count: int,
     observation_anchor_monotonic_ns: int,
+    control_run_generation: int,
 ) -> tuple[TeleopGridTickResult, TeleopGridObservation | None]:
     """Read and validate one causal sensor cut, remaining silent when unsafe."""
     recorder = resources.recorder
@@ -565,9 +562,10 @@ def _read_control_grid_observation(
     arm_qpos = arm_state["qpos"][0].copy()
 
     vr_frame = read_vr_frame_causal(shared, anchor_monotonic_ns=_current_grid_anchor_ns)
-    vr_stale = vr_frame is None or (
-        (time.monotonic_ns() - vr_frame.get("local_recv_ns", 0))
-        > cfg.runtime.policy.vr_mapping.stale_threshold_s * 1e9
+    vr_stale = not vr_frame_is_fresh(
+        vr_frame,
+        now_monotonic_ns=time.monotonic_ns(),
+        max_age_s=cfg.runtime.policy.vr_mapping.stale_threshold_s,
     )
     stage_timer.mark("vr")
 
@@ -684,7 +682,7 @@ def _read_control_grid_observation(
             and feedback_is_newer_than_pause(
                 pause_since_ns,
                 arm_source_monotonic_ns=int(arm_state["source_monotonic_ns"][0]),
-                vr_receive_monotonic_ns=int(vr_frame["local_recv_ns"]),
+                vr_receive_monotonic_ns=int(vr_frame["recv_ts_ns"]),
                 hand_source_monotonic_ns=hand_source_ns,
             )
         ):
@@ -742,6 +740,7 @@ def _read_control_grid_observation(
             hand_ring_sequence=hand_ring_sequence,
             hand_tactile=hand_tactile,
             anchor_monotonic_ns=observation_anchor_monotonic_ns,
+            control_run_generation=control_run_generation,
             policy_observation_signals=policy_observation_signals,
         ),
     )
@@ -767,7 +766,7 @@ def _publish_arm_safety_hold(
         gate=resources.safety_gate,
         is_hold=True,
         observation_id=int(observation.vr_frame["ring_sequence"]),
-        observation_anchor_monotonic_ns=int(observation.vr_frame["local_recv_ns"]),
+        observation_anchor_monotonic_ns=int(observation.vr_frame["recv_ts_ns"]),
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
     )
@@ -813,11 +812,7 @@ def _publish_ik_failure_hold(
         )
     controller.consecutive_ik_hold_frames += 1
 
-    safe_hand_qpos = (
-        computation.hand_qpos_rad
-        if controller.hand_enabled and computation.hand_validation_issue is None
-        else None
-    )
+    safe_hand_qpos = computation.hand_qpos_rad if controller.hand_enabled else None
     prepared_command, publish_result = _prepare_and_publish_joint_command(
         shared,
         controller.prev_qpos_cmd.copy(),
@@ -825,7 +820,7 @@ def _publish_ik_failure_hold(
         gate=resources.safety_gate,
         is_hold=True,
         observation_id=int(observation.vr_frame["ring_sequence"]),
-        observation_anchor_monotonic_ns=int(observation.vr_frame["local_recv_ns"]),
+        observation_anchor_monotonic_ns=int(observation.vr_frame["recv_ts_ns"]),
         hand_mechanical_lower_rad=resources.command_limits.hand_mechanical_lower_rad,
         hand_mechanical_upper_rad=resources.command_limits.hand_mechanical_upper_rad,
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
@@ -933,7 +928,6 @@ def _publish_solved_action(
     hand_cmd = computation.hand_qpos_rad
     hand_cmd_raw = computation.raw_hand_qpos_rad
     retarget_ok = computation.hand_retarget_succeeded
-    hand_cmd_valid = computation.hand_validation_issue is None
     hand_retarget_time_ms = computation.hand_retarget_time_ms
     ik_solve_time_ms = computation.ik_solve_time_ms
     policy_map_time_ms = computation.policy_map_time_ms
@@ -953,15 +947,13 @@ def _publish_solved_action(
         controller.prev_qpos_cmd,
         joint_lower_rad=command_limits.arm_joint_lower_rad,
         joint_upper_rad=command_limits.arm_joint_upper_rad,
-        max_delta_rad_per_tick=(command_limits.arm_max_delta_rad_per_tick),
+        max_delta_rad_per_tick=(command_limits.teleop_arm_max_delta_rad_per_tick),
         compute_qpos_delta=planner.compute_qpos_delta,
     )
     arm_cmd = arm_proposal.qpos_rad
     arm_cmd_raw = arm_proposal.raw_qpos_rad
 
     reject_reason = arm_proposal.validation_issue
-    if reject_reason is None and not hand_cmd_valid:
-        reject_reason = "hand command validation failed"
     if reject_reason is not None:
         resources.validation_warn(
             "teleop_loop: action rejected — %s",
@@ -985,7 +977,7 @@ def _publish_solved_action(
         hand_cmd.copy() if controller.hand_enabled else None,
         gate=gate,
         observation_id=int(vr_frame["ring_sequence"]),
-        observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+        observation_anchor_monotonic_ns=int(vr_frame["recv_ts_ns"]),
         hand_mechanical_lower_rad=command_limits.hand_mechanical_lower_rad,
         hand_mechanical_upper_rad=command_limits.hand_mechanical_upper_rad,
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
@@ -1095,6 +1087,8 @@ def _publish_solved_action(
             hand_ring_sequence=observation.hand_ring_sequence,
             shared=shared,
             action_candidate=published_candidate,
+            control_run_generation=published_candidate.run_generation,
+            max_observation_skew_s=resources.max_observation_skew_s,
             policy_observation=observation.policy_observation_signals,
         )
     stage_timer.mark("rec")
@@ -1119,6 +1113,7 @@ def run_control_grid_tick(
 ) -> TeleopGridTickResult:
     """Consume one causal observation and publish at most one action."""
     gate = resources.safety_gate
+    control_run_generation = int(shared.run_generation.value)
     tick_result, observation = _read_control_grid_observation(
         controller,
         shared,
@@ -1132,6 +1127,7 @@ def run_control_grid_tick(
         hand_disconnected_at_s=hand_disconnected_at_s,
         loop_count=loop_count,
         observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
+        control_run_generation=control_run_generation,
     )
     if observation is None:
         return tick_result
@@ -1145,7 +1141,7 @@ def run_control_grid_tick(
             gate=gate,
             is_hold=True,
             observation_id=int(vr_frame["ring_sequence"]),
-            observation_anchor_monotonic_ns=int(vr_frame["local_recv_ns"]),
+            observation_anchor_monotonic_ns=int(vr_frame["recv_ts_ns"]),
             arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
             hand_feedback_max_age_s=float(
                 cfg.runtime.safety.heartbeat_timeouts["hand"]
@@ -1226,7 +1222,7 @@ def _print_status(
     else:
         eef_str = "eef=?,?,?"
     if vr_frame is not None:
-        vr_age_ms = (time.monotonic_ns() - vr_frame.get("local_recv_ns", 0)) / 1e6
+        vr_age_ms = (time.monotonic_ns() - vr_frame.get("recv_ts_ns", 0)) / 1e6
         vr_str = f"vr={vr_age_ms:.0f}ms"
     else:
         vr_str = "vr=?ms"

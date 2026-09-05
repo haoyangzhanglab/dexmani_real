@@ -16,6 +16,7 @@ class DeploymentMetricsTest(unittest.TestCase):
         stats.observe_observation_skew_ms(0.5)
         stats.observe_schedule_lateness_ms(1.0)
         stats.observe_publication_interval_ms(62.5)
+        stats.arm_action_clip_count = 5
         stats.safety_rejection_count = 2
         stats.command_progress_timeout_count = 1
         stats.ik_rejection_count = 3
@@ -29,6 +30,7 @@ class DeploymentMetricsTest(unittest.TestCase):
                 "observation_skew_ms": 0.5,
                 "schedule_lateness_ms": 1.0,
                 "publication_interval_ms": 62.5,
+                "arm_action_clip_count": 5,
                 "safety_rejection_count": 2,
                 "command_progress_timeout_count": 1,
                 "ik_rejection_count": 3,
@@ -39,12 +41,14 @@ class DeploymentMetricsTest(unittest.TestCase):
     def test_flush_resets_counts_but_retains_bounded_recent_timings(self) -> None:
         stats = PolicyStats()
         stats.observe_publication_interval_ms(1.0)
+        stats.arm_action_clip_count = 2
         stats.safety_rejection_count = 1
 
         with patch("dexmani_real.deployment.metrics.logger") as logger:
             stats.flush(prefix="executor metrics", debug=True)
 
         logger.debug.assert_called_once()
+        self.assertEqual(stats.arm_action_clip_count, 0)
         self.assertEqual(stats.safety_rejection_count, 0)
         self.assertEqual(stats.snapshot()["publication_interval_ms"], 1.0)
 

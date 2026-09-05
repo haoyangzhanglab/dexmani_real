@@ -107,8 +107,8 @@ VR / keyboard input
   episode transaction、sidecar、sequence continuity、validation 和 atomic finalize，不决定
   机器人动作。
 - raw episode 的 schema、字段语义和对齐保持单一来源：`recording/schema.py` 与
-  [`docs/data_schema.md`](docs/data_schema.md)。当前链路为 raw v24 → processed HDF5 v11 →
-  Policy Zarr v5；离线 `data/` 负责清洗、审计和导出，不改变 raw 字段含义。
+  [`docs/data_schema.md`](docs/data_schema.md)。当前链路为 raw v24 → processed HDF5 v12 →
+  Policy Zarr v6；离线 `data/` 负责清洗、审计和导出，不改变 raw 字段含义。
 - `EpisodeReader` 的普通 read 严格检查 raw schema、layout 和基本语义，但不重算大型
   sidecar hash 或完整解码视频；这些 artifact attestation 检查只在显式 integrity audit 中执行。
 - processed writer 只在原子发布前重开并确认 HDF5 结构；`--verify-output` 才执行完整写后

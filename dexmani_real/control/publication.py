@@ -99,15 +99,13 @@ def validate_hand_command_bounds(
     mechanical_lower: np.ndarray,
     mechanical_upper: np.ndarray,
 ) -> np.ndarray:
-    """Reject a target outside the operational or rated XHand envelope."""
+    """Reject a malformed target outside the configured command envelopes."""
     return _validate_hand_bounds(
         hand_cmd,
         operational_lower,
         operational_upper,
         mechanical_lower,
         mechanical_upper,
-        hand_defaults.mechanical_qpos_min_rad,
-        hand_defaults.mechanical_qpos_max_rad,
     )
 
 
@@ -272,7 +270,6 @@ def prepare_command(
     gate: SafetyGate,
     arm_feedback_max_age_s: float,
     hand_feedback_max_age_s: float,
-    arm_delta_reference_qpos: np.ndarray | None = None,
     hand_delta_reference_qpos: np.ndarray | None = None,
     hand_mechanical_lower_rad: np.ndarray | None = None,
     hand_mechanical_upper_rad: np.ndarray | None = None,
@@ -342,7 +339,6 @@ def prepare_command(
         candidate,
         current_arm_qpos=arm_feedback.qpos,
         current_hand_qpos=(hand_feedback.qpos if hand_feedback is not None else None),
-        arm_delta_reference_qpos=arm_delta_reference_qpos,
         hand_delta_reference_qpos=hand_delta_reference_qpos,
     )
     if not gate_result.accepted:
@@ -387,7 +383,6 @@ def prepare_joint_command(
     observation_id: int | None = None,
     observation_anchor_monotonic_ns: int | None = None,
     action_validity_s: float = 0.5,
-    arm_delta_reference_qpos: np.ndarray | None = None,
     hand_delta_reference_qpos: np.ndarray | None = None,
     hand_mechanical_lower_rad: np.ndarray | None = None,
     hand_mechanical_upper_rad: np.ndarray | None = None,
@@ -417,7 +412,6 @@ def prepare_joint_command(
         gate=gate,
         arm_feedback_max_age_s=arm_feedback_max_age_s,
         hand_feedback_max_age_s=hand_feedback_max_age_s,
-        arm_delta_reference_qpos=arm_delta_reference_qpos,
         hand_delta_reference_qpos=hand_delta_reference_qpos,
         hand_mechanical_lower_rad=hand_mechanical_lower_rad,
         hand_mechanical_upper_rad=hand_mechanical_upper_rad,

@@ -1,7 +1,7 @@
 # Real 数据集 schema 参考
 
-本文是 DexMani Real 持久化数据的字段参考，覆盖当前 raw HDF5 v24、processed HDF5 v11 与
-Policy Zarr v5。运行行为和精确校验仍以
+本文是 DexMani Real 持久化数据的字段参考，覆盖当前 raw HDF5 v24、processed HDF5 v12 与
+Policy Zarr v6。运行行为和精确校验仍以
 [`recording/schema.py`](../dexmani_real/recording/schema.py)、
 [`data/process.py`](../dexmani_real/data/process.py) 与
 [`data/export.py`](../dexmani_real/data/export.py) 为准。
@@ -13,8 +13,8 @@ Policy Zarr v5。运行行为和精确校验仍以
 
 - [约定与数据流](#约定与数据流)
 - [raw episode HDF5 v24](#1-raw-episode-hdf5-v24)
-- [processed HDF5 v11](#2-processed-hdf5-v11)
-- [Policy Zarr v5](#3-policy-zarr-v5)
+- [processed HDF5 v12](#2-processed-hdf5-v12)
+- [Policy Zarr v6](#3-policy-zarr-v6)
 - [字段映射摘要](#字段映射摘要)
 - [读取与训练注意事项](#读取与训练注意事项)
 
@@ -25,10 +25,10 @@ episodes/<task>/episode_*          raw v24 directory
     data.h5 + depth.h5 + rgb.mp4
                 │ process_episodes.py
                 ▼
-episodes_processed/<task>/*.h5     processed v11, one file per raw episode
+episodes_processed/<task>/*.h5     processed v12, one file per raw episode
                 │ export_policy_zarr.py
                 ▼
-datasets/<task>.zarr               Policy Zarr v5, one profile per store
+datasets/<task>.zarr               Policy Zarr v6, one profile per store
 ```
 
 - `N` 是单个 raw 或 processed episode 的帧数；`T` 是 Zarr 中全部 episode 的总帧数；
@@ -61,7 +61,7 @@ datasets/<task>.zarr               Policy Zarr v5, one profile per store
 ### 处理前提
 
 raw v24 可以是 `meta.arm_sent_stream=False` 的有效录制；这时
-`/action_arm_joint_sent` 合法地不存在。但当前 processed v11 writer 无条件以该字段生成
+`/action_arm_joint_sent` 合法地不存在。但当前 processed v12 writer 无条件以该字段生成
 `/action[:,:7]`，所以要生成 processed HDF5 或 Policy Zarr，原始 episode **必须**有
 `meta.arm_sent_stream=True` 与 `/action_arm_joint_sent`。这是处理链的输入前提，不是 raw
 schema 的通用必填条件。
@@ -100,7 +100,7 @@ raw 的明确缺失值语义，不应被下游压紧为相邻 source。
 | `/tactile_source_monotonic_ns`, `/tactile_unit_code` | `(N,)` | int64 | 触觉 source 时间与设备单位代码。 |
 | `/action_arm_joint_raw` | `(N,7)` | float64 | arm IK 原始候选；仅在 `flag_sample_valid & ~flag_held & flag_ik_ok` 时有保守有效语义。 |
 | `/action_arm_joint` | `(N,7)` | float64 | grid row 的 arm joint action。 |
-| `/action_arm_joint_sent` | `(N,7)` | float64 | 条件字段；仅 `meta.arm_sent_stream=True` 时存在，是实际提交给 arm 的命令流。processed 的 `action[:,:7]` 使用它。 |
+| `/action_arm_joint_sent` | `(N,7)` | float64 | 条件字段；仅 `meta.arm_sent_stream=True` 时存在，是成功发布到 coupled command ring 的 arm target。它不表示 physical convergence 或 SDK accepted state；processed 的 `action[:,:7]` 使用它。 |
 | `/action_hand_joint_raw` | `(N,12)` | float64 | 手部 retarget 原始候选；仅在 `flag_sample_valid & ~flag_held & flag_retarget_ok` 时有保守有效语义。 |
 | `/action_hand_joint` | `(N,12)` | float64 | grid row 的 XHand target（rad）；首帧相对初始反馈、后续相对前一已发布 endpoint 限速。 |
 | `/action_arm_ee` | `(N,9)` | float64 | arm EEF target：`position_m(3)+rot6d(6)`，`xarm_base`；有限行的 rot6d 必须是 canonical 单位正交列，active 非 held 行必须为有限 payload，不可用行可使用整行 all-NaN sentinel。 |
@@ -190,16 +190,16 @@ attestation 或可信 artifact 流程建立信任。
 | `camera_T_eef_from_depth` | float64-like `(16,)` | calibration 提供 EEF-camera 外参时写入。 |
 | `camera_type`、`camera_calibration_source_optical_frame` | string | calibration 与 camera name 可解析时写入；后者固定为 `camera_color_optical`。 |
 
-## 2. processed HDF5 v11
+## 2. processed HDF5 v12
 
 processed 文件是 `episodes_processed/<task>/*.h5`。它从 raw v24 选择、清洗和压紧行；其 `N`
 因此不一定等于 raw 的 `num_frames`。它用于离线训练、导出与可视化；物理回放可将其作为
 保留 raw 行的 provenance 清单，但绝不发送其 `float32` 动作。回放必须在 `source_path` 找到并
 校验原始 `data.h5` hash，再从 raw episode 读取精确已发送命令和完整模型 provenance。根 attrs
 必须满足：
-`schema_name=dexmani-real-processed-hdf5`、`schema_version=11`、`domain=real`。
+`schema_name=dexmani-real-processed-hdf5`、`schema_version=12`、`domain=real`。
 
-删除无效 raw 行可能使压紧数组包含多个 source 连续段。v11 不把缺口两侧伪装成相邻时间步：
+删除无效 raw 行可能使压紧数组包含多个 source 连续段。v12 不把缺口两侧伪装成相邻时间步：
 `source_segment_ends` 明确记录每段边界，质量窗口只在段内计数。Policy Zarr 不再把这些段
 展开为多个训练 episode；一份 processed 文件只允许对应一个完整训练 episode，存在任何删除
 或内部连续性缺口时整份文件拒绝。
@@ -207,8 +207,8 @@ processed 文件是 `episodes_processed/<task>/*.h5`。它从 raw v24 选择、�
 处理入口只接受通过 raw reader 校验的 v24 episode，并适用前述 `arm_sent_stream` 前提。RGB 与
 点云 profile 还要求 raw RGB-D 几何、depth scale 与 `T_xarm_base_from_color` 完整有效。视觉
 profile 使用 `/policy_observation_*_qpos` 生成 `joint_state`；`joint` profile 使用 control-grid
-state。每个 retained source segment 的首个 action 仍以 raw `/arm_qpos` 与 `/hand_qpos` 的
-control-grid feedback 校验 endpoint delta，与 deployment safety gate 的首命令语义一致。
+state。processed action 是已发布的 teleop joint target；离线处理不模拟或审计 learned-policy
+endpoint 约束。
 
 ### temporal quality 与 stall window
 
@@ -217,8 +217,7 @@ control-grid feedback 校验 endpoint delta，与 deployment safety gate 的首�
 `start` 与 `start+7`（不是 8 个 index 的差值），且窗口不能跨越 source-contiguous segment；
 detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal findings，`strict` 只
 排除高置信的 reversible impulse、arm feedback stall 与 command-apply stall，`hard_only` 则
-关闭 temporal detectors。deployment endpoint delta 也只作审计；机械 action 硬边界仍独立
-执行 hard-invalid 判定。
+关闭 temporal detectors。机械 action 硬边界仍独立执行 hard-invalid 判定。
 
 ### profile 与数据集集合
 
@@ -235,7 +234,7 @@ detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal
 | 路径 | shape | dtype | 语义 |
 |---|---:|---|---|
 | `/joint_state` | `(N,19)` | float32 | 视觉 profile 为 `policy_observation_arm_qpos(7)+policy_observation_hand_qpos(12)`；`joint` profile 为 control-grid state，单位 rad。 |
-| `/action` | `(N,19)` | float32 | `action_arm_joint_sent(7)+action_hand_joint(12)`；arm 部分是实际提交命令，单位 rad。 |
+| `/action` | `(N,19)` | float32 | `action_arm_joint_sent(7)+action_hand_joint(12)`；是 teleop 已发布 target，单位 rad；arm 部分不表示 SDK accepted state 或物理到位。 |
 | `/action_ee` | `(N,21)` | float32 | `eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)`，EEF 在 `xarm_base`；rot6d 两列必须是 canonical 单位正交列。 |
 | `/contact_force` | `(N,5,3)` | float32 | raw `hand_contact` 的每指三轴 tactile sum；选择不晚于 observation reference、skew 有界且 hand/tactile source 相等的最新 fresh+calibrated+unit-proven 行。单位/轴由 root attrs 指定。 |
 | `/fingertip_points` | `(N,5,3)` | float32 | 五指指尖坐标（m），`xarm_base`；视觉 profile 从同一 camera-aligned arm/hand qpos 通过共享 FK 重新计算。 |
@@ -269,8 +268,8 @@ detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal
 
 | 分组 | keys | 类型 / shape | 固定值或语义 |
 |---|---|---|---|
-| schema 与来源 | `schema_name`、`schema_version`、`domain`、`source_episode`、`source_frames` | string / int | `dexmani-real-processed-hdf5`、`11`、`real`，以及 raw 输入身份。 |
-| 长度与训练标签 | `profile`、`episode_steps`、`dt`、`time_semantics`、`source_contiguity`、`source_contiguity_tolerance_s`、`obs_alignment`、`observation_reference`、`state_alignment`、`max_observation_skew_s`、`action_semantics`、`arm_max_delta_rad_per_tick`、`hand_max_delta_rad_per_tick`、`endpoint_delta_tolerance_rad`、`deployment_equivalent`、`task_name`、`action_dim`、`action_ee_dim`、`action_space` | string / int / float / bool | profile、压紧后长度、段边界 provenance、`obs[t]_before_action[t]`，以及 state/camera 对齐、观察 skew、动作 endpoint 限制、共享 endpoint tolerance 和是否可用于 deployment training 的显式合同。 |
+| schema 与来源 | `schema_name`、`schema_version`、`domain`、`source_episode`、`source_frames` | string / int | `dexmani-real-processed-hdf5`、`12`、`real`，以及 raw 输入身份。 |
+| 长度与训练标签 | `profile`、`episode_steps`、`dt`、`time_semantics`、`source_contiguity`、`source_contiguity_tolerance_s`、`obs_alignment`、`observation_reference`、`state_alignment`、`max_observation_skew_s`、`action_semantics`、`task_name`、`action_dim`、`action_ee_dim`、`action_space` | string / int / float | profile、压紧后长度、段边界 provenance、`obs[t]_before_action[t]`，以及 state/camera 对齐、观察 skew 和唯一的 `teleop_published_joint_target` 动作语义。 |
 | Real core 语义 | `fingertip_points_frame`、`fingertip_points_unit`、`action_ee_frame`、`action_ee_components`、`contact_force_source`、`contact_force_alignment`、`contact_force_unit`、`contact_force_si_verified`、`contact_force_frame`、`contact_force_fresh_required`、`contact_force_calibrated_required`、`contact_force_unit_code`、`contact_force_causal_to_reference`、`contact_force_hand_source_match_required` | string / bool / int | xarm-base 位置与 EEF frame；指尖单位 m；tactile 的来源、因果选择、单位、原生轴与逐行 proof 要求。 |
 | 处理与审计 | `processing_config_json`、`quality_summary_json`、`source_decision_json`、`source_member_sha256_json`、`source_resolved_config_sha256` | JSON string / string | 处理配置、选择/拒绝结论、恰好 `data.h5`/`depth.h5`/`rgb.mp4` 三个 raw 成员的 64-hex 哈希与录制配置哈希。`source_decision_json.hard_invalid_reason_names` 是必填的硬无效 reason 名称列表。哈希格式检查不等于 raw 文件真实性证明。 |
 | RGB-D（仅 RGB/RGB-PC） | `rgb_transform`、`depth_transform`、`depth_unit`、`depth_scale_m_per_unit`、`depth_invalid_value`、`camera_intrinsic_semantics`、`camera_extrinsic_semantics` | string / float / int | 无裁剪 resize、aligned depth 的 nearest resize、depth 单位与无效值 `0`、K/T 语义。 |
@@ -290,7 +289,7 @@ attestation；它只检查内部 schema、payload、provenance 以及 source has
 若要把这些哈希当作 raw/processed 完整性证据，必须由调用方或可信处理流程独立建立
 artifact trust/attestation；文件内哈希本身不会构成签名。
 
-## 3. Policy Zarr v5
+## 3. Policy Zarr v6
 
 Zarr 是同一 `task_name`、同一 profile、同一 `dt`、同一 tail shape/dtype 与同一 Real
 语义 attrs 的 processed episode 拼接结果：
@@ -315,13 +314,13 @@ Zarr root attrs 是最小运行语义，而不是 processed 全部 provenance：
 
 | 范围 | attrs | 类型 / 语义 |
 |---|---|---|
-| schema 与任务 | `schema_name`、`schema_version`、`domain`、`profile`、`task_name`、`dt`、`episode_start_policy`、`obs_alignment`、`observation_reference`、`state_alignment`、`max_observation_skew_s`、`action_semantics`、`arm_max_delta_rad_per_tick`、`hand_max_delta_rad_per_tick`、`endpoint_delta_tolerance_rad`、`deployment_equivalent` | string / int / float / bool；固定为 `dexmani-real-policy-zarr`、`5`、`real`、`full_history`、`obs[t]_before_action[t]`，并持久化 deployment observation、action endpoint 和共享 tolerance 的精确合同。训练不得用左侧 observation padding 构造 episode 起始样本。 |
+| schema 与任务 | `schema_name`、`schema_version`、`domain`、`profile`、`task_name`、`dt`、`episode_start_policy`、`obs_alignment`、`observation_reference`、`state_alignment`、`max_observation_skew_s`、`action_semantics` | string / int / float；固定为 `dexmani-real-policy-zarr`、`6`、`real`、`full_history`、`obs[t]_before_action[t]` 和 `teleop_published_joint_target`。训练不得用左侧 observation padding 构造 episode 起始样本。 |
 | Real core | `contact_force_*` proof attrs、`fingertip_points_frame`、`fingertip_points_unit`、`action_ee_frame` | string / bool / int；来自 processed 输入并要求全部 episode 一致。 |
 | RGB-PC profile | `depth_scale_m_per_unit`、`depth_invalid_value`、`camera_extrinsic_semantics` | float / int / string；depth 单位、无效像素值与 `T_xarm_base_from_color` 语义。 |
 | pointcloud/RGB-PC profile | `point_cloud_frame`、`point_cloud_color_source`、`point_cloud_policy_id`、`point_cloud_config_sha256`、`point_cloud_table_plane_abcd_json`、`point_cloud_sampling`、`point_cloud_transform` | string（其中 table plane 为 JSON string）；点云 frame、构建策略与处理身份。 |
 
-Policy Zarr v5 接受四种 profile 中 `deployment_equivalent=True`、未删除 source 行且只有一个连续段的
-processed v11 输入。存在无效行或时序缺口的文件整条拒绝；其他合格
+Policy Zarr v6 接受四种 profile 中语义 attrs 一致、未删除 source 行且只有一个连续段的
+processed v12 输入。存在无效行或时序缺口的文件整条拒绝；其他合格
 文件仍可进入同一批导出。Zarr
 **不保留** processed 的 `/provenance`、source 文件 hash、质量摘要、raw 选择原因、
 `action_ee_components` 或完整相机 calibration provenance；它保留 `obs_alignment` 和其他运行
@@ -330,7 +329,7 @@ processed v11 输入。存在无效行或时序缺口的文件整条拒绝；其
 
 ## 字段映射摘要
 
-| raw v24 | processed v11 | Policy Zarr v5 | 变换 |
+| raw v24 | processed v12 | Policy Zarr v6 | 变换 |
 |---|---|---|---|
 | `policy_observation_arm_qpos + policy_observation_hand_qpos` | `joint_state` | `data/joint_state` | visual profile state，按 camera source 因果对齐后拼接 7+12，float64 → float32。 |
 | `action_arm_joint_sent + action_hand_joint` | `action` | `data/action` | 拼接 7+12，使用实际 arm 提交流。 |
@@ -348,8 +347,8 @@ processed v11 输入。存在无效行或时序缺口的文件整条拒绝；其
 - 读取 depth 时必须应用 `depth_scale_m_per_unit`；不要假定所有设备的 Z16 单位相同。
 - `contact_force` 的 SI 单位仅在 `contact_force_si_verified=True` 时成立。
 - 训练 Zarr 前应保留其对应 processed HDF5；Zarr 是训练传输格式，不是完整审计归档。
-- Real 训练 loader 必须校验 `schema_version=5`、`episode_start_policy=full_history`、camera-source
-  state alignment 与 deployment action 合同，并使用
+- Real 训练 loader 必须校验 `schema_version=6`、`episode_start_policy=full_history`、camera-source
+  state alignment 与 `teleop_published_joint_target` 动作语义，并使用
   `pad_before=n_obs_steps-1`、`pad_after=n_action_steps-1` 和 repeat-edge padding。当前 DP3 的
   `n_obs_steps=2`、`n_action_steps=8`，实例值为 `1/7`；不得把实例值写成通用常数。
 - 训练 checkpoint 必须复制 Zarr root 语义及实际 point-cloud shape 作为数据合同。Real 部署

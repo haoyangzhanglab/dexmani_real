@@ -401,67 +401,6 @@ def _revalidate_camera_duplicates(
     return revalidated
 
 
-def _deployment_action_limit_masks(
-    arrays: Mapping[str, np.ndarray],
-    candidate_mask: np.ndarray,
-    config: ProcessingConfig,
-    *,
-    grid_dt_s: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Check the exact endpoint-delta contract enforced by deployment.
-
-    At the start of every retained source-contiguous segment the policy executor
-    compares a model endpoint against measured feedback. Later endpoints are
-    compared against the previously published endpoint.  This mirrors that
-    distinction so old teleop targets are never silently relabelled as
-    deployment-safe data.
-    """
-    candidate = np.asarray(candidate_mask, dtype=bool)
-    action_invalid = np.zeros(candidate.shape, dtype=bool)
-    arm_invalid = np.zeros(candidate.shape, dtype=bool)
-    hand_invalid = np.zeros(candidate.shape, dtype=bool)
-    previous_index: int | None = None
-    arm_limit = config.arm_max_delta_rad_per_tick
-    hand_limit = float(config.hand_max_delta_rad_per_tick)
-    endpoint_delta_tolerance = float(config.endpoint_delta_tolerance_rad)
-
-    for index, candidate_row in enumerate(candidate):
-        if not candidate_row:
-            previous_index = None
-            continue
-        starts_segment = previous_index is None or not _rows_are_source_contiguous(
-            arrays,
-            previous_index,
-            index,
-            grid_dt_s=grid_dt_s,
-            grid_dt_relative_tolerance=config.grid_dt_relative_tolerance,
-        )
-        if starts_segment:
-            arm_reference = arrays["control_arm_qpos"][index]
-            hand_reference = arrays["control_hand_qpos"][index]
-        else:
-            assert previous_index is not None
-            arm_reference = arrays["action_arm"][previous_index]
-            hand_reference = arrays["action_hand"][previous_index]
-
-        if arm_limit is not None and np.any(
-            np.abs(arrays["action_arm"][index] - arm_reference)
-            > arm_limit + endpoint_delta_tolerance
-        ):
-            arm_invalid[index] = True
-        if np.any(
-            np.abs(arrays["action_hand"][index] - hand_reference)
-            > hand_limit + endpoint_delta_tolerance
-        ):
-            hand_invalid[index] = True
-        action_invalid[index] = arm_invalid[index] or hand_invalid[index]
-        # An excluded endpoint starts a new candidate segment.  Its successor
-        # must be safe from contemporaneous feedback, not from an action that
-        # will not exist in the exported stream.
-        previous_index = None if action_invalid[index] else index
-    return action_invalid, arm_invalid, hand_invalid
-
-
 def _quality_summary(
     arrays: Mapping[str, np.ndarray],
     selected: np.ndarray,
@@ -1007,22 +946,6 @@ def analyze_episode(
         tracking_error_warn_rad=config.tracking_error_warn_rad,
     )
 
-    # Deployment endpoint deltas are audit telemetry.  Collection commands have
-    # already crossed the live safety boundary; a large offline delta must not
-    # relabel a finite, mechanically valid recorded action as corrupt data.
-    candidate_mask = pre_action_base_valid & ~temporal_assessment.excluded_mask
-    (
-        deployment_action_invalid,
-        deployment_arm_action_invalid,
-        deployment_hand_action_invalid,
-    ) = _deployment_action_limit_masks(
-        arrays,
-        candidate_mask,
-        config,
-        grid_dt_s=timing.grid_dt_s,
-    )
-    audit_masks["deployment_action_limit"] = deployment_action_invalid
-
     hard_invalid = np.zeros(frame_count, dtype=bool)
     for mask in reason_masks.values():
         hard_invalid |= mask
@@ -1069,11 +992,6 @@ def analyze_episode(
     )
     quality["source_gap_count"] = len(source_gaps)
     quality["segment_count"] = len(segment_ends)
-    quality["deployment_action_limits"] = {
-        "arm_invalid_row_count": int(np.count_nonzero(deployment_arm_action_invalid)),
-        "hand_invalid_row_count": int(np.count_nonzero(deployment_hand_action_invalid)),
-        "invalid_row_count": int(np.count_nonzero(deployment_action_invalid)),
-    }
     quality["audit_reason_counts"] = {
         name: int(np.count_nonzero(mask)) for name, mask in audit_masks.items()
     }

@@ -539,6 +539,9 @@ def read_hand_state_dict(shared: "RuntimeChannels") -> "dict | None":
         "connected": bool(data["connected"][0]),
         "qpos_stale": bool(data["qpos_stale"][0]),
         "accepted_target_action_id": int(data["accepted_target_action_id"][0]),
+        "last_sdk_setpoint_accepted_monotonic_ns": int(
+            data["last_sdk_setpoint_accepted_monotonic_ns"][0]
+        ),
         "source_monotonic_ns": int(data["source_monotonic_ns"][0]),
         "publish_monotonic_ns": int(data["publish_monotonic_ns"][0]),
         "state_valid": bool(data["state_valid"][0]),

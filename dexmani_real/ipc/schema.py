@@ -168,6 +168,9 @@ HAND_STATE_DTYPE = np.dtype(
         ("accepted_target_action_id", "<u8"),
         # Monotonic time immediately after the XHand SDK accepted that target.
         ("accepted_target_monotonic_ns", "<u8"),
+        # Monotonic time after the most recent accepted SDK setpoint, including
+        # intermediate slew setpoints that have not reached the exact target.
+        ("last_sdk_setpoint_accepted_monotonic_ns", "<u8"),
         ("commboard_err", "<i4", HAND_JOINT_SHAPE),
         ("jointboard_err", "<i4", HAND_JOINT_SHAPE),
         ("tipboard_err", "<i4", HAND_JOINT_SHAPE),
@@ -200,7 +203,6 @@ VR_FRAME_DTYPE = np.dtype(
         ("source_ts_ns", "<u8"),
         ("sequence_id", "<u8"),
         ("source_frame_seq", "<u8"),
-        ("local_recv_ns", "<u8"),
         ("side", "<i4"),
         ("head_sequence_id", "<u8"),
         ("head_recv_ts_ns", "<u8"),

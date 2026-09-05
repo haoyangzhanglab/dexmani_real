@@ -352,6 +352,8 @@ class RecorderClient:
         signals: dict[str, Any] | None = None,
         arm_qpos_sent: np.ndarray | None = None,
         diagnostics: dict[str, Any] | None = None,
+        *,
+        control_run_generation: int,
     ) -> bool:
         if not self._recording:
             return False
@@ -365,7 +367,7 @@ class RecorderClient:
         dtype = self.shared.record_sample_ring.dtype
         frame = np.zeros(1, dtype=dtype)
         frame["generation"][0] = self._generation
-        frame["control_run_generation"][0] = int(self.shared.run_generation.value)
+        frame["control_run_generation"][0] = int(control_run_generation)
         frame["sample_sequence"][0] = self._frame_count + 1
         for name in (
             "arm_qpos",

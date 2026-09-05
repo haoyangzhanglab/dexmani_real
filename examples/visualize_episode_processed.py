@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/visualize_episode_processed.py PROCESSED.h5 [--info] [--max-frames N]``.
 
-Self-contained Rerun-based visualizer for processed HDF5 v11
+Self-contained Rerun-based visualizer for processed HDF5 v12
 (``dexmani-real-processed-hdf5``) artifacts written by
 ``examples/process_episodes.py``.  Offline only: connects to no hardware, writes
 no files; opens a Rerun viewer window (or prints a structure summary with
@@ -269,7 +269,7 @@ def print_episode_info(h5_path: str) -> None:
 
 
 class ProcessedEpisodeVisualizer:
-    """Load a processed HDF5 v11 file and stream it into Rerun for interactive viewing."""
+    """Load a processed HDF5 v12 file and stream it into Rerun for interactive viewing."""
 
     def __init__(
         self,
@@ -286,7 +286,7 @@ class ProcessedEpisodeVisualizer:
                 != PROCESSED_SCHEMA_VERSION
             ):
                 raise ValueError(
-                    f"{self._h5_path.name} is not a processed HDF5 v11 artifact"
+                    f"{self._h5_path.name} is not a processed HDF5 v12 artifact"
                 )
             validate_processed_admission(self._h5f, label=self._h5_path.name)
             self._keys = _present_keys(self._h5f)

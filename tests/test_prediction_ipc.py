@@ -589,6 +589,39 @@ class ArmWorkerDeadlineGuardTest(unittest.TestCase):
         st.arm.servo.assert_called_once()
         np.testing.assert_array_equal(st.arm.servo.call_args.args[0], np.full(7, 0.1))
 
+    def test_worker_keeps_exact_boundary_and_latest_wins_jump_guard(self) -> None:
+        max_jump = float(np.deg2rad(20.0))
+        shared = self._shared()
+        exact = self._loop_state(max_jump=max_jump)
+        target = np.zeros(7, dtype=np.float64)
+        target[0] = max_jump
+        with (
+            patch("dexmani_real.robot.arm_worker.time.monotonic_ns", return_value=150),
+            patch("dexmani_real.runtime.safety.time.monotonic_ns", return_value=150),
+        ):
+            _handle_servo_command(
+                exact,
+                shared,
+                self._command(target),
+                CoupledCommandTicket(1, 1, 1_000),
+            )
+        exact.arm.servo.assert_called_once()
+
+        skipped = self._loop_state(max_jump=max_jump)
+        skipped_target = np.zeros(7, dtype=np.float64)
+        skipped_target[0] = 2.0 * max_jump
+        with (
+            patch("dexmani_real.runtime.safety.time.monotonic_ns", return_value=150),
+            self.assertRaisesRegex(RuntimeError, "command jump limit violation"),
+        ):
+            _handle_servo_command(
+                skipped,
+                self._shared(),
+                self._command(skipped_target),
+                CoupledCommandTicket(1, 1, 1_000),
+            )
+        skipped.arm.servo.assert_not_called()
+
     def test_deadline_crossed_during_validation_prevents_servo(self) -> None:
         command = self._command(np.zeros(7))
         command["valid_until_monotonic_ns"][0] = 200

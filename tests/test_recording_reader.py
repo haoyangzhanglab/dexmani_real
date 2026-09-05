@@ -5,13 +5,17 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import h5py
 import numpy as np
 
+from dexmani_real.ipc.schema import make_record_sample_dtype
+from dexmani_real.recording.client import RecorderClient
 from dexmani_real.recording.reader import EpisodeReader, ValidityState
 from dexmani_real.recording.schema import EPISODE_SCHEMA_VERSION
+from dexmani_real.robot.types import RobotAction, RobotState
 
 
 class EpisodeReaderIntegrityTest(unittest.TestCase):
@@ -109,6 +113,67 @@ class EpisodeReaderIntegrityTest(unittest.TestCase):
             ):
                 with self.assertRaises(ValueError):
                     EpisodeReader(self._write_minimal_episode(Path(directory)))
+
+    def test_recorder_sample_uses_explicit_control_generation(self) -> None:
+        class SampleRing:
+            latest_sequence = 0
+            maxlen = 8
+            dtype = make_record_sample_dtype((1, 1, 3), (1, 1))
+
+            def __init__(self) -> None:
+                self.frame = None
+
+            def write(self, frame) -> None:
+                self.frame = frame.copy()
+
+        class Shared:
+            record_sample_ring = SampleRing()
+            recorder_consumed_sequence = SimpleNamespace(value=0)
+
+            @property
+            def run_generation(self):
+                raise AssertionError("RecorderClient must not reread global generation")
+
+        state = RobotState(
+            arm_qpos=np.zeros(7),
+            arm_qvel=np.zeros(7),
+            arm_tau=np.zeros(7),
+            eef_pos=np.zeros(3),
+            eef_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+            eef_rot6d=np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            hand_qpos=np.zeros(12),
+            hand_tactile_sum=np.zeros((5, 3)),
+            hand_tactile_force=np.zeros((5, 120, 3)),
+            hand_tactile_contact=np.zeros(5, dtype=bool),
+            hand_tipboard_err=np.zeros(12, dtype=np.int32),
+            hand_commboard_err=np.zeros(12, dtype=np.int32),
+            hand_jointboard_err=np.zeros(12, dtype=np.int32),
+            hand_qpos_stale=False,
+            fingertip_pos=np.zeros((5, 3)),
+            arm_connected=True,
+            hand_connected=True,
+            timestamp=1.0,
+        )
+        action = RobotAction(np.zeros(7), np.zeros(12))
+        client = RecorderClient(Shared())
+        client._recording = True
+        client._generation = 1
+        self.assertTrue(
+            client.add_frame(
+                state,
+                action,
+                {
+                    "wrist_pos": np.zeros(3),
+                    "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
+                    "landmarks": np.zeros((21, 3)),
+                },
+                control_run_generation=7,
+            )
+        )
+        self.assertEqual(
+            int(client.shared.record_sample_ring.frame["control_run_generation"][0]),
+            7,
+        )
 
 
 if __name__ == "__main__":

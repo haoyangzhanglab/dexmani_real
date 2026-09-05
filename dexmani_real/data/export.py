@@ -1,4 +1,4 @@
-"""Transactional export of processed HDF5 v11 episodes to Policy Zarr v5."""
+"""Transactional export of processed HDF5 v12 episodes to Policy Zarr v6."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ from dexmani_real.sensor.pointcloud import (
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 
 POLICY_ZARR_SCHEMA_NAME = "dexmani-real-policy-zarr"
-POLICY_ZARR_SCHEMA_VERSION = 5
+POLICY_ZARR_SCHEMA_VERSION = 6
 ExportProgressCallback = Callable[[str, int, int], None]
 
 
@@ -232,24 +232,6 @@ def _inspect_artifact(
                 source.attrs.get("max_observation_skew_s", np.nan)
             ),
             "action_semantics": _text(source.attrs.get("action_semantics", "")),
-            "arm_max_delta_rad_per_tick": (
-                None
-                if np.isnan(
-                    float(source.attrs.get("arm_max_delta_rad_per_tick", np.nan))
-                )
-                else float(source.attrs["arm_max_delta_rad_per_tick"])
-            ),
-            "hand_max_delta_rad_per_tick": float(
-                source.attrs.get("hand_max_delta_rad_per_tick", np.nan)
-            ),
-            # This field is part of the processed deployment contract.  A
-            # missing/NaN value must not silently downgrade the endpoint gate.
-            "endpoint_delta_tolerance_rad": float(
-                source.attrs.get("endpoint_delta_tolerance_rad", np.nan)
-            ),
-            "deployment_equivalent": _strict_bool_attr(
-                source.attrs, "deployment_equivalent"
-            ),
             "contact_force_unit": _text(source.attrs.get("contact_force_unit", "")),
             "contact_force_si_verified": _strict_bool_attr(
                 source.attrs, "contact_force_si_verified"
@@ -307,19 +289,7 @@ def _inspect_artifact(
             or semantics["state_alignment"] != expected_state_alignment
             or not np.isfinite(semantics["max_observation_skew_s"])
             or semantics["max_observation_skew_s"] <= 0.0
-            or semantics["action_semantics"] != "deployment_grid_rate_limited_target"
-            or (
-                semantics["arm_max_delta_rad_per_tick"] is not None
-                and (
-                    not np.isfinite(semantics["arm_max_delta_rad_per_tick"])
-                    or semantics["arm_max_delta_rad_per_tick"] <= 0.0
-                )
-            )
-            or not np.isfinite(semantics["hand_max_delta_rad_per_tick"])
-            or semantics["hand_max_delta_rad_per_tick"] <= 0.0
-            or not np.isfinite(semantics["endpoint_delta_tolerance_rad"])
-            or semantics["endpoint_delta_tolerance_rad"] < 0.0
-            or not semantics["deployment_equivalent"]
+            or semantics["action_semantics"] != "teleop_published_joint_target"
             or semantics["contact_force_unit"] != _CONTACT_FORCE_UNIT
             or semantics["contact_force_si_verified"] is not _CONTACT_FORCE_SI_VERIFIED
             or semantics["contact_force_frame"] != _CONTACT_FORCE_FRAME

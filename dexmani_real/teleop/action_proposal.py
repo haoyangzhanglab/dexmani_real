@@ -17,7 +17,6 @@ from dexmani_real.teleop.hand_control import (
     HandRetargetObservationCache,
     compute_hand_command,
     get_raw_hand_command,
-    sanitize_hand_command,
     smoothstep_hand_ramp,
 )
 from dexmani_real.utils.limits import limit_hand_target_delta
@@ -43,7 +42,6 @@ class HandJointProposal:
     qpos_rad: np.ndarray
     raw_qpos_rad: np.ndarray
     retarget_succeeded: bool
-    validation_issue: str | None
     next_ramp_start_qpos_rad: np.ndarray | None
     next_ramp_step: int
     compute_time_ms: float
@@ -134,10 +132,8 @@ def compute_hand_joint_proposal(
     command_lower_rad: np.ndarray,
     command_upper_rad: np.ndarray,
     max_delta_rad_per_tick: np.ndarray | float,
-    mechanical_lower_rad: np.ndarray,
-    mechanical_upper_rad: np.ndarray,
 ) -> HandJointProposal:
-    """Retarget, shape, and validate one hand proposal without publishing it.
+    """Retarget and shape one hand proposal without publishing it.
 
     The final target is bounded against the previously published hand endpoint,
     matching the reject-only per-grid contract for the published endpoint.
@@ -178,24 +174,6 @@ def compute_hand_joint_proposal(
         np.asarray(command_lower_rad, dtype=np.float64),
         np.asarray(command_upper_rad, dtype=np.float64),
     )
-    validation_issue: str | None = None
-    try:
-        hand_qpos_rad = sanitize_hand_command(
-            hand_qpos_rad,
-            command_lower_rad,
-            command_upper_rad,
-            mechanical_lower_rad,
-            mechanical_upper_rad,
-        )
-    except ValueError as exc:
-        validation_issue = str(exc)
-        hand_qpos_rad = _finite_vector(
-            previous_hand_qpos_rad,
-            hand_qpos_rad.shape,
-            "previous_hand_qpos_rad",
-        )
-        retarget_succeeded = False
-
     hand_qpos_rad = limit_hand_target_delta(
         hand_qpos_rad,
         previous_hand_qpos_rad,
@@ -206,7 +184,6 @@ def compute_hand_joint_proposal(
         qpos_rad=np.asarray(hand_qpos_rad, dtype=np.float64).copy(),
         raw_qpos_rad=np.asarray(raw_qpos_rad, dtype=np.float64).copy(),
         retarget_succeeded=retarget_succeeded,
-        validation_issue=validation_issue,
         next_ramp_start_qpos_rad=(
             None
             if next_ramp_start_qpos_rad is None

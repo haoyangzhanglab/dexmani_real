@@ -16,7 +16,7 @@ class TeleopCommandLimits:
 
     arm_joint_lower_rad: np.ndarray
     arm_joint_upper_rad: np.ndarray
-    arm_max_delta_rad_per_tick: np.ndarray | None
+    teleop_arm_max_delta_rad_per_tick: np.ndarray | None
     hand_home_qpos_rad: np.ndarray
     hand_command_lower_rad: np.ndarray
     hand_command_upper_rad: np.ndarray
@@ -31,7 +31,7 @@ class TeleopCommandLimits:
     def from_config(cls, config: "TeleopConfig") -> "TeleopCommandLimits":
         arm_lower = np.asarray(config.runtime.arm.joint_limit_lower, dtype=np.float64)
         arm_upper = np.asarray(config.runtime.arm.joint_limit_upper, dtype=np.float64)
-        configured_delta = config.runtime.policy.arm_max_delta_rad_per_tick
+        configured_delta = config.runtime.policy.teleop_arm_max_delta_rad_per_tick
         max_delta = (
             None
             if configured_delta is None
@@ -50,7 +50,7 @@ class TeleopCommandLimits:
         return cls(
             arm_joint_lower_rad=arm_lower.copy(),
             arm_joint_upper_rad=arm_upper.copy(),
-            arm_max_delta_rad_per_tick=max_delta,
+            teleop_arm_max_delta_rad_per_tick=max_delta,
             hand_home_qpos_rad=np.deg2rad(
                 np.asarray(config.runtime.hand.home_qpos_deg, dtype=np.float64)
             ),

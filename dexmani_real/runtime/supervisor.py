@@ -303,8 +303,8 @@ def print_health_summary(
     if vr_result is not None:
         vr_data, _, _ = vr_result
         vr_age_s = (
-            (time.monotonic_ns() - int(vr_data["local_recv_ns"][0])) / 1e9
-            if vr_data["local_recv_ns"][0] > 0
+            (time.monotonic_ns() - int(vr_data["recv_ts_ns"][0])) / 1e9
+            if vr_data["recv_ts_ns"][0] > 0
             else -1
         )
         print(

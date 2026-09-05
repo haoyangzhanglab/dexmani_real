@@ -24,6 +24,26 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
+_NS_PER_SECOND = 1_000_000_000
+
+
+def vr_frame_is_fresh(
+    frame: Any | None,
+    *,
+    now_monotonic_ns: int,
+    max_age_s: float,
+) -> bool:
+    """Return whether a VR frame has a recent host-monotonic receive time."""
+    if frame is None:
+        return False
+    try:
+        recv_ns = int(np.asarray(frame["recv_ts_ns"]).reshape(-1)[0])
+    except (KeyError, TypeError, ValueError, IndexError):
+        return False
+    now_ns = int(now_monotonic_ns)
+    max_age_ns = int(float(max_age_s) * _NS_PER_SECOND)
+    return 0 < recv_ns <= now_ns and now_ns - recv_ns <= max_age_ns
+
 
 def read_causal_structured_frame(
     ring: Any,
@@ -137,7 +157,7 @@ def read_vr_frame_causal(
         if anchor_monotonic_ns is None
         else read_causal_structured_frame(
             shared.vr_ring,
-            source_field="local_recv_ns",
+            source_field="recv_ts_ns",
             anchor_monotonic_ns=int(anchor_monotonic_ns),
         )
     )
@@ -157,7 +177,6 @@ def read_vr_frame_causal(
         "source_ts_ns": int(rec["source_ts_ns"]),
         "sequence_id": int(rec["sequence_id"]),
         "source_frame_seq": int(rec["source_frame_seq"]),
-        "local_recv_ns": int(rec["local_recv_ns"]),
         "publish_monotonic_ns": int(publish_ns),
         "ring_sequence": int(sequence),
         "side": int(rec["side"]),

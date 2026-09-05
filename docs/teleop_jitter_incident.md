@@ -50,7 +50,7 @@
 
 ### 3.2 delta 门禁的 owner 和参考状态错误
 
-8° 默认值在检查的旧提交 `b0a2603`、`26e6ff9` 中已经存在于 `PolicyParams.arm_max_delta_rad_per_tick`。它是策略/VR 命令连续性参数，不是 xArm SDK、Mode 6 或机械臂额定能力给出的统一限制。旧提交中的键盘 safety gate 没有启用该限制。
+8° 默认值在检查的旧提交 `b0a2603`、`26e6ff9` 中已经存在于当时命名的 `PolicyParams.arm_max_delta_rad_per_tick`（当前 runtime 名称为 `teleop_arm_max_delta_rad_per_tick`）。它是策略/VR 命令连续性参数，不是 xArm SDK、Mode 6 或机械臂额定能力给出的统一限制。旧提交中的键盘 safety gate 没有启用该限制。
 
 现场中间版本曾从 keyboard gate 读取不存在的 `ArmParams.max_command_delta_rad_per_tick`，随后又出现 `arm per-tick delta limit violation`，证明策略级限制被错误扩展到了键盘共享路径。
 
@@ -150,7 +150,7 @@ ACK 只表示 worker/SDK 接受目标，不表示关节已经物理到位，也�
 - 删除的是键盘路径错误启用的通用 arm delta，不是全局删除安全检查；
 - VR 仍保留 producer-side 8° command shaping，因此不会因键盘修复而失去原有平滑策略；
 - learned-policy 由 PolicyExecutor 对 arm/hand endpoint jump 做 reject-only 检查；通过后精确发布 coupled target，hand worker 再负责 SDK-level slew；拒绝后不立即 abort，后续由 action-step limit 或 silence/progress watchdog 收束 episode；
-- 20° worker fallback 对所有来源生效，可阻止异常 IK 分支或损坏 record 直接跨越 SDK 边界；
+- 20° worker guard 对所有来源生效，可阻止异常 IK 分支或损坏 record 直接跨越 SDK 边界；
 - 非阻塞发布避免推理/PolicyExecutor 因等待 actuator acceptance 而破坏调度，但 latest-wins 可能覆盖未消费的旧 endpoint，这是实时遥操作的明确取舍。
 
 ## 7. 验证状态
@@ -165,7 +165,7 @@ ACK 只表示 worker/SDK 接受目标，不表示关节已经物理到位，也�
 - keyboard 发布完整 IK solution，不执行 arm delta clip；
 - learned-policy arm gate 使用 20° endpoint reject；hand 首条相对 measured、后续相对上一条成功发布 target 做独立 jump reject；
 - arm/hand 共用 generation 和 delivery-window 合同；
-- 默认 worker discontinuity fallback 为 20°。
+- 默认 worker discontinuity guard 为 20°。
 
 “21 项回归测试通过”是本故障复盘当时的历史基线，不代表当前 runtime simplification 的测试计数或验收结果。
 

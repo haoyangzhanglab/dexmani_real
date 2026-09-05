@@ -11,6 +11,8 @@ import numpy as np
 
 from dexmani_real.control.action import ActionCandidate
 from dexmani_real.control.publication import PreparedCommand, PublishResult
+from dexmani_real.ipc.causal import vr_frame_is_fresh
+from dexmani_real.ipc.schema import HAND_TACTILE_DTYPE
 from dexmani_real.teleop.action_proposal import compute_target_eef_pose
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.control_grid import (
@@ -23,8 +25,9 @@ from dexmani_real.teleop.control_grid import (
     feedback_is_newer_than_pause,
     run_control_grid_tick,
 )
-from dexmani_real.teleop.episode_samples import FRAME_IK_FAIL
+from dexmani_real.teleop.episode_samples import FRAME_IK_FAIL, record_held
 from dexmani_real.teleop.hand_control import smoothstep_hand_ramp
+from dexmani_real.teleop.loop import _begin_feedback_issue
 
 
 class TeleopPauseBoundaryTest(unittest.TestCase):
@@ -43,6 +46,7 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
             handbase_position_eef_m=np.zeros(3, dtype=np.float64),
             handbase_quat_eef_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
             hand_ramp_total_frames=1,
+            max_observation_skew_s=0.1,
         )
 
     def test_resume_requires_all_enabled_feedback_after_pause(self) -> None:
@@ -69,6 +73,70 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
                 vr_receive_monotonic_ns=101,
                 hand_source_monotonic_ns=101,
             )
+        )
+
+    def test_vr_freshness_uses_sdk_receive_time_not_processing_time(self) -> None:
+        self.assertFalse(
+            vr_frame_is_fresh(
+                {"recv_ts_ns": 100},
+                now_monotonic_ns=600_000_101,
+                max_age_s=0.5,
+            )
+        )
+
+    def test_begin_recording_requires_fresh_calibrated_tactile(self) -> None:
+        cfg = TeleopConfig()
+        now_ns = 1_000_000_000
+        vr_frame = {"recv_ts_ns": now_ns - 1_000_000}
+        tactile = np.zeros(1, dtype=HAND_TACTILE_DTYPE)
+        tactile["source_monotonic_ns"][0] = now_ns - 1_000_000
+        tactile["fresh"][0] = 1
+        with patch("dexmani_real.teleop.loop.hand_feedback_issue", return_value=None):
+            self.assertEqual(
+                _begin_feedback_issue(
+                    cfg,
+                    vr_frame,
+                    Mock(),
+                    tactile,
+                    recording_enabled=True,
+                    now_monotonic_ns=now_ns,
+                ),
+                "tactile feedback is not calibrated",
+            )
+            tactile["calibrated"][0] = 1
+            self.assertIsNone(
+                _begin_feedback_issue(
+                    cfg,
+                    vr_frame,
+                    Mock(),
+                    tactile,
+                    recording_enabled=True,
+                    now_monotonic_ns=now_ns,
+                )
+            )
+
+    def test_held_sample_uses_tick_generation_snapshot(self) -> None:
+        recorder = Mock()
+        with patch(
+            "dexmani_real.teleop.episode_samples._build_robot_state",
+            return_value=Mock(),
+        ):
+            record_held(
+                recorder,
+                None,
+                np.zeros(7),
+                np.zeros(12),
+                {
+                    "wrist_pos": np.zeros(3),
+                    "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
+                    "landmarks": np.zeros((21, 3)),
+                },
+                None,
+                control_run_generation=7,
+                max_observation_skew_s=0.1,
+            )
+        self.assertEqual(
+            recorder.add_frame.call_args.kwargs["control_run_generation"], 7
         )
 
     def test_hand_ramp_still_reaches_target_on_last_step(self) -> None:
@@ -107,7 +175,7 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
             "qpos": np.zeros((1, 7), dtype=np.float64),
             "source_monotonic_ns": np.array([101], dtype=np.int64),
         }
-        vr_frame = {"local_recv_ns": 101, "ring_sequence": 1}
+        vr_frame = {"recv_ts_ns": 101, "ring_sequence": 1}
 
         def read_structured(ring, **_kwargs):
             return (arm_state, 0, 1) if ring is shared.arm_state_ring else None
@@ -154,6 +222,7 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
                 hand_disconnected_at_s=None,
                 loop_count=1,
                 observation_anchor_monotonic_ns=200,
+                control_run_generation=3,
             )
             second_result, second_observation = _read_control_grid_observation(
                 controller,
@@ -168,6 +237,7 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
                 hand_disconnected_at_s=None,
                 loop_count=2,
                 observation_anchor_monotonic_ns=200,
+                control_run_generation=3,
             )
 
         self.assertTrue(first_result.pause_released)
@@ -189,7 +259,11 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
             ema_prev_quat=None,
             compute=Mock(),
         )
-        shared = SimpleNamespace(arm_state_ring=object(), hand_state_ring=object())
+        shared = SimpleNamespace(
+            arm_state_ring=object(),
+            hand_state_ring=object(),
+            run_generation=SimpleNamespace(value=3),
+        )
         arm_state = {
             "qpos": np.zeros((1, 7), dtype=np.float64),
             "source_monotonic_ns": np.array([101], dtype=np.int64),
@@ -246,7 +320,11 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
             prev_qpos_cmd=np.zeros(7, dtype=np.float64),
             compute=Mock(),
         )
-        shared = SimpleNamespace(arm_state_ring=object(), hand_state_ring=object())
+        shared = SimpleNamespace(
+            arm_state_ring=object(),
+            hand_state_ring=object(),
+            run_generation=SimpleNamespace(value=3),
+        )
         with (
             patch(
                 "dexmani_real.teleop.control_grid.read_causal_structured_frame",
@@ -287,7 +365,11 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
             ema_prev_quat=None,
             compute=Mock(),
         )
-        shared = SimpleNamespace(arm_state_ring=object(), hand_state_ring=object())
+        shared = SimpleNamespace(
+            arm_state_ring=object(),
+            hand_state_ring=object(),
+            run_generation=SimpleNamespace(value=3),
+        )
         arm_state = {
             "qpos": np.zeros((1, 7), dtype=np.float64),
             "source_monotonic_ns": np.array([101], dtype=np.int64),
@@ -308,7 +390,7 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
             ),
             patch(
                 "dexmani_real.teleop.control_grid.read_vr_frame_causal",
-                return_value={"local_recv_ns": 101, "ring_sequence": 1},
+                return_value={"recv_ts_ns": 101, "ring_sequence": 1},
             ),
             patch(
                 "dexmani_real.teleop.control_grid.read_hand_tactile_causal",
@@ -380,7 +462,7 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
         limits = SimpleNamespace(
             arm_joint_lower_rad=np.full(7, -10.0),
             arm_joint_upper_rad=np.full(7, 10.0),
-            arm_max_delta_rad_per_tick=np.ones(7),
+            teleop_arm_max_delta_rad_per_tick=np.ones(7),
             hand_mechanical_lower_rad=np.full(12, -10.0),
             hand_mechanical_upper_rad=np.full(12, 10.0),
         )
@@ -389,12 +471,13 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
             arm_state=np.zeros(1, dtype=[("tracking_err", "f8")]),
             arm_ring_sequence=4,
             arm_qpos_rad=np.zeros(7),
-            vr_frame={"ring_sequence": 1, "local_recv_ns": 8},
+            vr_frame={"ring_sequence": 1, "recv_ts_ns": 8},
             camera_frame=None,
             hand_state=None,
             hand_ring_sequence=5,
             hand_tactile=None,
             anchor_monotonic_ns=8,
+            control_run_generation=2,
             policy_observation_signals=None,
         )
         computation = TeleopActionComputation(
@@ -406,7 +489,6 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
             hand_qpos_rad=np.zeros(12),
             raw_hand_qpos_rad=np.zeros(12),
             hand_retarget_succeeded=True,
-            hand_validation_issue=None,
             hand_retarget_time_ms=1.0,
             ik_qpos_rad=np.zeros(7),
             ik_failure_reason="",
@@ -448,6 +530,7 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
         np.testing.assert_array_equal(args[3], arm_published)
         np.testing.assert_array_equal(args[4], hand_published)
         self.assertIs(kwargs["action_candidate"], candidate)
+        self.assertEqual(kwargs["control_run_generation"], 2)
         np.testing.assert_array_equal(
             kwargs["action_arm_joint_raw"], arm_proposal.raw_qpos_rad
         )
@@ -475,7 +558,6 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
         computation = SimpleNamespace(
             ik_failure_reason="infeasible",
             hand_qpos_rad=np.ones(12) * 0.1,
-            hand_validation_issue=None,
             ik_solve_time_ms=2.0,
             position_before_workspace_clamp_world_m=np.zeros(3),
             raw_target_position_world_m=np.zeros(3),
@@ -488,7 +570,7 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
         )
         observation = SimpleNamespace(
             arm_state=np.zeros(1, dtype=[("tracking_err", "f8")]),
-            vr_frame={"ring_sequence": 1, "local_recv_ns": 8},
+            vr_frame={"ring_sequence": 1, "recv_ts_ns": 8},
         )
         resources = self._resources()
         resources.command_limits.hand_mechanical_lower_rad = np.full(12, -1.0)

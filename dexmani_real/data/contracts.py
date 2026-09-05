@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import arm, environment, hand, policy
+from dexmani_real.config.defaults import arm, environment, hand
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.robot_spec import XHAND_RIGHT_URDF_PATH
 
@@ -182,13 +182,6 @@ class ProcessingConfig:
     handbase_quat_eef_wxyz: tuple[float, float, float, float] = (
         hand.T_eef_handbase_quat_wxyz
     )
-    # Learned-policy endpoints are rejected, never clipped, by the policy
-    # executor. Offline processing therefore applies the same per-grid
-    # contract before an episode can enter a deployment training set.
-    arm_max_delta_rad_per_tick: float | None = policy.arm_max_delta_rad_per_tick
-    hand_max_delta_rad_per_tick: float = hand.hand_max_delta_rad_per_tick
-    # Shared numerical slack for the reject-only endpoint-delta predicate.
-    endpoint_delta_tolerance_rad: float = policy.endpoint_delta_tolerance_rad
     tracking_error_warn_rad: float = arm.tracking_error_warn_rad
     temporal_quality: TemporalQualityConfig = field(
         default_factory=TemporalQualityConfig
@@ -205,12 +198,16 @@ class ProcessingConfig:
         """Project one resolved runtime snapshot into offline processing policy."""
         arm_config = getattr(runtime, "arm")
         hand_config = getattr(runtime, "hand")
+        policy_config = getattr(runtime, "policy")
+        camera_config = getattr(runtime, "camera")
         environment_config = getattr(runtime, "environment")
         table = environment_config.table
         values: dict[str, Any] = {
             "profile": profile,
             "pointcloud": getattr(runtime, "pointcloud"),
             "table_plane_abcd": table.plane_abcd if table.enabled else None,
+            "max_camera_age_s": float(camera_config.max_frame_age_s),
+            "max_observation_skew_s": float(policy_config.max_observation_skew_s),
             "arm_joint_limit_lower_rad": tuple(arm_config.joint_limit_lower),
             "arm_joint_limit_upper_rad": tuple(arm_config.joint_limit_upper),
             "hand_state_limit_lower_rad": tuple(hand_config.mechanical_qpos_min_rad),
@@ -221,15 +218,6 @@ class ProcessingConfig:
             "fingertip_link_names": tuple(hand_config.fingertip_link_names),
             "handbase_position_eef_m": tuple(hand_config.T_eef_handbase_pos_xyz),
             "handbase_quat_eef_wxyz": tuple(hand_config.T_eef_handbase_quat_wxyz),
-            "arm_max_delta_rad_per_tick": getattr(
-                runtime, "policy"
-            ).arm_max_delta_rad_per_tick,
-            "hand_max_delta_rad_per_tick": float(
-                hand_config.hand_max_delta_rad_per_tick
-            ),
-            "endpoint_delta_tolerance_rad": float(
-                getattr(runtime, "policy").endpoint_delta_tolerance_rad
-            ),
             "tracking_error_warn_rad": float(arm_config.tracking_error_warn_rad),
         }
         unknown = set(overrides) - {field.name for field in dataclasses.fields(cls)}
@@ -285,26 +273,6 @@ class ProcessingConfig:
         if not all(np.isfinite(value) and value > 0 for value in finite_positive):
             raise ValueError(
                 "camera age, grid tolerance, and joint tolerance must be finite and positive"
-            )
-        if self.arm_max_delta_rad_per_tick is not None and (
-            not np.isfinite(self.arm_max_delta_rad_per_tick)
-            or self.arm_max_delta_rad_per_tick <= 0.0
-        ):
-            raise ValueError(
-                "arm_max_delta_rad_per_tick must be finite and positive or None"
-            )
-        if (
-            not np.isfinite(self.hand_max_delta_rad_per_tick)
-            or self.hand_max_delta_rad_per_tick <= 0.0
-        ):
-            raise ValueError("hand_max_delta_rad_per_tick must be finite and positive")
-        if (
-            isinstance(self.endpoint_delta_tolerance_rad, bool)
-            or not np.isfinite(self.endpoint_delta_tolerance_rad)
-            or self.endpoint_delta_tolerance_rad < 0.0
-        ):
-            raise ValueError(
-                "endpoint_delta_tolerance_rad must be finite and non-negative"
             )
         if not 0 <= self.gzip_level <= 9:
             raise ValueError("gzip_level must be in [0, 9]")
@@ -383,9 +351,6 @@ class ProcessingConfig:
             "fingertip_link_names": list(self.fingertip_link_names),
             "handbase_position_eef_m": list(self.handbase_position_eef_m),
             "handbase_quat_eef_wxyz": list(self.handbase_quat_eef_wxyz),
-            "arm_max_delta_rad_per_tick": self.arm_max_delta_rad_per_tick,
-            "hand_max_delta_rad_per_tick": self.hand_max_delta_rad_per_tick,
-            "endpoint_delta_tolerance_rad": self.endpoint_delta_tolerance_rad,
             "tracking_error_warn_rad": self.tracking_error_warn_rad,
             "temporal_quality": self.temporal_quality.to_dict(),
         }

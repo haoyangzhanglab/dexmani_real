@@ -20,7 +20,9 @@ from dexmani_real.control.safety_gate import SafetyGate, planner_action_safety_g
 from dexmani_real.ipc.causal import (
     read_arm_state_causal,
     read_hand_state_causal,
+    read_hand_tactile_causal,
     read_vr_frame_causal,
+    vr_frame_is_fresh,
 )
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import (
@@ -50,7 +52,10 @@ from dexmani_real.teleop.control_grid import (
     TeleopGridResources,
     run_control_grid_tick,
 )
-from dexmani_real.teleop.episode_samples import stop_recording
+from dexmani_real.teleop.episode_samples import (
+    RECORDING_TACTILE_MAX_AGE_NS,
+    stop_recording,
+)
 from dexmani_real.teleop.hand_control import hand_ramp_frame_count, seed_hand_retargeter
 from dexmani_real.teleop.keyboard import ControlSignal, KeyboardHandler
 from dexmani_real.teleop.recording_session import (
@@ -60,7 +65,6 @@ from dexmani_real.teleop.recording_session import (
 from dexmani_real.teleop.retarget.facade import (
     TAGHandRetargeter,
     XHandRetargeter,
-    tag_config_with_urdf,
 )
 from dexmani_real.teleop.safety import do_configured_teleop_home, hand_feedback_issue
 from dexmani_real.teleop.timing import StageTimer
@@ -180,11 +184,9 @@ def _build_hand_retargeter(config: TeleopConfig):
         return None
     if config.runtime.policy.hand_retargeting_type == "tag":
         return TAGHandRetargeter(
-            hand_type="right",
             fingertip_link_names=config.runtime.hand.fingertip_link_names,
-            tag_config=tag_config_with_urdf(
-                config.runtime.tag_retargeting, config.hand_urdf_path
-            ),
+            tag_config=config.runtime.tag_retargeting,
+            urdf_path=config.hand_urdf_path,
         )
     return XHandRetargeter(
         hand_type="right",
@@ -210,27 +212,58 @@ def _transition_or_fault(
     return False
 
 
-def _try_load_hand_kinematics(
+def _load_hand_kinematics(
     config: TeleopConfig,
     *,
     recording_enabled: bool,
 ) -> HandKinematics | None:
-    """Load optional recording-only hand FK, falling back to NaN fingertips."""
-    if not recording_enabled or not config.hand_urdf_path:
+    """Load the hand FK required to produce valid hand recording samples."""
+    if not recording_enabled or not config.runtime.policy.hand_enabled:
         return None
-    try:
-        hand_fk = HandKinematics(
-            config.hand_urdf_path,
-            list(config.runtime.hand.fingertip_link_names),
-        )
-    except Exception:
-        logger.warning("Hand FK initialization failed", exc_info=True)
-        return None
-    if hand_fk.is_ready():
-        logger.info("Hand FK ready")
-    else:
-        logger.warning("Hand FK not ready — fingertips will be NaN")
+    hand_fk = HandKinematics(
+        config.hand_urdf_path,
+        list(config.runtime.hand.fingertip_link_names),
+    )
+    if not hand_fk.is_ready():
+        raise RuntimeError("Hand FK is not ready")
+    logger.info("Hand FK ready")
     return hand_fk
+
+
+def _begin_feedback_issue(
+    cfg: TeleopConfig,
+    vr_frame: dict | None,
+    hand_state: np.ndarray | None,
+    hand_tactile: np.ndarray | None,
+    *,
+    recording_enabled: bool,
+    now_monotonic_ns: int,
+) -> str | None:
+    """Return the first data-admission issue before beginning a session."""
+    if not vr_frame_is_fresh(
+        vr_frame,
+        now_monotonic_ns=now_monotonic_ns,
+        max_age_s=cfg.runtime.policy.vr_mapping.stale_threshold_s,
+    ):
+        return "VR hand feedback is unavailable or stale"
+    hand_issue = hand_feedback_issue(cfg, hand_state)
+    if hand_issue is not None:
+        return hand_issue
+    if not recording_enabled or not cfg.runtime.policy.hand_enabled:
+        return None
+    if hand_tactile is None:
+        return "tactile feedback is unavailable"
+    tactile = hand_tactile[0]
+    tactile_source_ns = int(tactile["source_monotonic_ns"])
+    if not (
+        bool(tactile["fresh"])
+        and 0 < tactile_source_ns <= now_monotonic_ns
+        and now_monotonic_ns - tactile_source_ns <= RECORDING_TACTILE_MAX_AGE_NS
+    ):
+        return "tactile feedback is stale"
+    if not bool(tactile["calibrated"]):
+        return "tactile feedback is not calibrated"
+    return None
 
 
 def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
@@ -247,6 +280,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
         planner, arm_mapper, safety_gate, recorder = _load_control_resources(
             shared, cfg, recording_enabled=recording_enabled
         )
+        hand_fk = _load_hand_kinematics(cfg, recording_enabled=recording_enabled)
     except Exception:
         logger.error("teleop_loop: init failed", exc_info=True)
         shared.error_state.value = True
@@ -256,7 +290,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
         return
     audio = AudioFeedback()
 
-    hand_fk = _try_load_hand_kinematics(cfg, recording_enabled=recording_enabled)
     handbase_position_eef_m = np.asarray(
         cfg.runtime.hand.T_eef_handbase_pos_xyz, dtype=np.float64
     )
@@ -360,6 +393,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
         hand_ramp_total_frames=hand_ramp_frame_count(
             cfg.runtime.policy.hand_ramp_duration_s, cfg.runtime.policy.control_hz
         ),
+        max_observation_skew_s=cfg.runtime.policy.max_observation_skew_s,
     )
 
     def enter_pause(
@@ -723,15 +757,28 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         )
                         skip_control_tick = True
                         continue
+                    begin_now_ns = time.monotonic_ns()
                     vr_frame = read_vr_frame_causal(shared)
                     begin_hand_state = (
                         read_hand_state_causal(shared)
                         if cfg.runtime.policy.hand_enabled
                         else None
                     )
-                    begin_hand_issue = hand_feedback_issue(cfg, begin_hand_state)
-                    if vr_frame is None or begin_hand_issue is not None:
-                        print("\nB: fresh VR/hand feedback unavailable — cannot begin")
+                    begin_hand_tactile = (
+                        read_hand_tactile_causal(shared)
+                        if recorder is not None and cfg.runtime.policy.hand_enabled
+                        else None
+                    )
+                    begin_issue = _begin_feedback_issue(
+                        cfg,
+                        vr_frame,
+                        begin_hand_state,
+                        begin_hand_tactile,
+                        recording_enabled=recorder is not None,
+                        now_monotonic_ns=begin_now_ns,
+                    )
+                    if begin_issue is not None:
+                        print(f"\nB: {begin_issue} — cannot begin")
                         skip_control_tick = True
                         continue
                     wrist_pos = vr_frame["wrist_pos"]

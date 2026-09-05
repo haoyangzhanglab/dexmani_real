@@ -12,7 +12,11 @@ import numpy as np
 
 from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.control.action import ActionCandidate
-from dexmani_real.control.publication import PreparedCommand, PublishResult
+from dexmani_real.control.publication import (
+    PUBLISH_REASON_GENERATION,
+    PreparedCommand,
+    PublishResult,
+)
 from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
 from dexmani_real.deployment.config import PolicyDeploymentConfig
 from dexmani_real.deployment.contracts import Prediction
@@ -22,6 +26,7 @@ from dexmani_real.deployment.executor import (
     _build_policy_planner,
     _build_policy_safety_gate,
     _build_policy_workspace_check,
+    _clip_policy_arm_action,
     _command_watchdog_reason,
     _CommandProgress,
     _end_policy_run,
@@ -150,7 +155,6 @@ def _policy_step_executor(
         arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
         hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
         hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
-        max_arm_delta_rad=runtime.arm.max_servo_command_jump_rad,
         max_hand_delta_rad=runtime.policy.hand_max_action_jump_rad,
         endpoint_delta_tolerance_rad=runtime.policy.endpoint_delta_tolerance_rad,
     )
@@ -233,7 +237,6 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
             np.zeros(7, dtype=np.float64),
             previous_arm_command_qpos=None,
             planner=None,
-            runtime=runtime,
         )
 
         np.testing.assert_allclose(arm, action[:7])
@@ -257,7 +260,6 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
             np.zeros(7, dtype=np.float64),
             previous_arm_command_qpos=None,
             planner=planner,
-            runtime=runtime,
         )
         np.testing.assert_array_equal(arm, expected)
         np.testing.assert_array_equal(hand, action[9:])
@@ -272,7 +274,6 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
             np.zeros(7, dtype=np.float64),
             previous_arm_command_qpos=None,
             planner=planner,
-            runtime=runtime,
         )
         self.assertIsNone(arm)
         self.assertEqual(reason, "no solution")
@@ -288,7 +289,6 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
             np.zeros(7, dtype=np.float64),
             previous_arm_command_qpos=None,
             planner=planner,
-            runtime=runtime,
         )
 
         self.assertIsNone(arm)
@@ -331,20 +331,24 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
             planner_factory.call_args.kwargs["teleop_profile"].check_self_collision
         )
 
-    def test_policy_gate_uses_arm_jump_guard_not_teleop_delta(self) -> None:
+    def test_policy_arm_clip_is_independent_of_teleop_and_worker_guards(self) -> None:
         defaults = resolve_runtime_config()
         self.assertAlmostEqual(
             defaults.arm.max_servo_command_jump_rad, np.deg2rad(20.0)
         )
         self.assertAlmostEqual(
-            defaults.policy.arm_max_delta_rad_per_tick, np.deg2rad(8.0)
+            defaults.policy.teleop_arm_max_delta_rad_per_tick, np.deg2rad(8.0)
+        )
+        self.assertAlmostEqual(
+            defaults.policy.arm_action_delta_clip_rad, np.deg2rad(20.0)
         )
         self.assertEqual(defaults.policy.hand_max_action_jump_rad, 1.0)
         runtime = resolve_runtime_config(
             data={
                 "arm": {"max_servo_command_jump_rad": 0.4},
                 "policy": {
-                    "arm_max_delta_rad_per_tick": 0.05,
+                    "teleop_arm_max_delta_rad_per_tick": 0.05,
+                    "arm_action_delta_clip_rad": 0.2,
                     "hand_max_action_jump_rad": 0.45,
                 },
             }
@@ -355,11 +359,220 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
         ):
             gate = _build_policy_safety_gate(runtime)
 
-        np.testing.assert_array_equal(gate.max_arm_delta_rad, np.full(7, 0.4))
         np.testing.assert_array_equal(gate.max_hand_delta_rad, np.full(12, 0.45))
         self.assertNotEqual(
             runtime.arm.max_servo_command_jump_rad,
-            runtime.policy.arm_max_delta_rad_per_tick,
+            runtime.policy.arm_action_delta_clip_rad,
+        )
+
+    def test_policy_arm_spike_clip_is_wrap_aware_and_admits_before_clip(self) -> None:
+        runtime = resolve_runtime_config()
+        limit = runtime.policy.arm_action_delta_clip_rad
+        reference = np.zeros(7, dtype=np.float64)
+        target = reference.copy()
+        target[0] = np.deg2rad(30.0)
+
+        clipped_target, clipped, reason = _clip_policy_arm_action(
+            target, reference, runtime
+        )
+
+        self.assertEqual(reason, "")
+        self.assertTrue(clipped)
+        assert clipped_target is not None
+        self.assertAlmostEqual(clipped_target[0], limit)
+
+        boundary_target = reference.copy()
+        boundary_target[0] = limit
+        exact_target, clipped, reason = _clip_policy_arm_action(
+            boundary_target, reference, runtime
+        )
+        self.assertEqual(reason, "")
+        self.assertFalse(clipped)
+        np.testing.assert_array_equal(exact_target, boundary_target)
+
+        wrap_reference = reference.copy()
+        wrap_reference[0] = 6.1
+        wrap_target = reference.copy()
+        wrap_target[0] = -0.1
+        canonical, clipped, reason = _clip_policy_arm_action(
+            wrap_target, wrap_reference, runtime
+        )
+        self.assertEqual(reason, "")
+        self.assertFalse(clipped)
+        assert canonical is not None
+        self.assertAlmostEqual(canonical[0], 2.0 * np.pi - 0.1)
+
+        invalid = reference.copy()
+        invalid[1] = runtime.arm.joint_limit_upper[1] + 0.1
+        rejected, clipped, reason = _clip_policy_arm_action(invalid, reference, runtime)
+        self.assertIsNone(rejected)
+        self.assertFalse(clipped)
+        self.assertEqual(reason, "arm joint limit violation")
+
+    def test_ee_policy_clips_before_workspace_segment_admission(self) -> None:
+        executor = _executor(action_key="action_ee", execute=True)
+        runtime = executor.runtime
+        measured_arm = np.zeros(7, dtype=np.float64)
+        measured_hand = (
+            np.asarray(runtime.hand.qpos_min_rad, dtype=np.float64)
+            + np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64)
+        ) / 2.0
+        arm_state = {
+            "connected": True,
+            "error_code": 0,
+            "state_valid": True,
+            "source_monotonic_ns": time.monotonic_ns(),
+            "qpos": measured_arm,
+            "qvel": np.zeros(7, dtype=np.float64),
+        }
+        workspace_segments: list[tuple[np.ndarray, np.ndarray]] = []
+
+        def workspace_check(start: np.ndarray, end: np.ndarray) -> bool:
+            workspace_segments.append((start.copy(), end.copy()))
+            return True
+
+        executor.gate = SafetyGate(
+            arm_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
+            arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
+            hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
+            hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
+            workspace_check=workspace_check,
+            max_hand_delta_rad=runtime.policy.hand_max_action_jump_rad,
+        )
+        ik_target = measured_arm.copy()
+        ik_target[0] = np.deg2rad(30.0)
+        executor.ee_planner.solve_teleop_ik.return_value = SimpleNamespace(
+            success=True, qpos=ik_target, reason=""
+        )
+        executor.shared.safety_state.value = int(SafetyState.RUNNING)
+        executor.shared.run_generation.value = 1
+        executor.run_generation = 1
+        executor.run_started_ns = time.monotonic_ns()
+        executor.progress.reset(1)
+        executor.progress.observe(
+            generation=1,
+            arm_action_id=0,
+            hand_action_id=0,
+            now_ns=executor.run_started_ns,
+            timeout_ns=executor.command_progress_timeout_ns,
+        )
+        prediction_ns = time.monotonic_ns()
+        executor.active_prediction = _prediction(
+            source_ns=prediction_ns, logical_ns=prediction_ns, action_dim=21
+        )
+        executor.max_source_age_ns = 10**12
+        action = np.zeros(21, dtype=np.float64)
+        action[3] = 1.0
+        action[7] = 1.0
+        action[9:] = measured_hand
+        publication_ns = time.monotonic_ns()
+        publish = Mock(
+            return_value=PublishResult(
+                True,
+                ticket=CoupledCommandTicket(
+                    run_generation=1,
+                    ring_sequence=1,
+                    valid_until_monotonic_ns=publication_ns + 10**9,
+                    published_monotonic_ns=publication_ns,
+                ),
+            )
+        )
+        with (
+            patch(
+                "dexmani_real.deployment.executor.read_arm_state_dict",
+                return_value=arm_state,
+            ),
+            patch(
+                "dexmani_real.control.publication._read_arm_feedback",
+                return_value=(SimpleNamespace(qpos=measured_arm), "", None),
+            ),
+            patch(
+                "dexmani_real.control.publication.read_hand_feedback",
+                return_value=(SimpleNamespace(qpos=measured_hand), "", None),
+            ),
+            patch("dexmani_real.deployment.executor.publish_command", publish),
+        ):
+            executor._publish_due_action(
+                action,
+                scheduled_target_ns=publication_ns,
+                due_ns=publication_ns,
+            )
+
+        publish.assert_called_once()
+        self.assertEqual(executor.stats.arm_action_clip_count, 1)
+        self.assertEqual(len(workspace_segments), 1)
+        np.testing.assert_array_equal(workspace_segments[0][0], measured_arm)
+        self.assertAlmostEqual(
+            workspace_segments[0][1][0], runtime.policy.arm_action_delta_clip_rad
+        )
+        published = publish.call_args.args[1]
+        np.testing.assert_array_equal(published.arm_qpos, workspace_segments[0][1])
+
+    def test_shadow_and_execute_advance_the_same_accepted_references(self) -> None:
+        execute = _policy_step_executor()
+        shadow = _policy_step_executor()
+        shadow.execute = False
+        runtime = execute.runtime
+        hand = (
+            np.asarray(runtime.hand.qpos_min_rad, dtype=np.float64)
+            + np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64)
+        ) / 2.0
+        arm_targets = (
+            np.full(7, 0.1, dtype=np.float64),
+            np.full(7, 0.2, dtype=np.float64),
+        )
+        hand_targets = (hand, hand + 0.1)
+
+        with patch(
+            "dexmani_real.deployment.executor.command_publishability_reason",
+            return_value="",
+        ):
+            for arm_target, hand_target in zip(arm_targets, hand_targets):
+                _attempt_policy_step(
+                    execute,
+                    arm_target=arm_target,
+                    hand_target=hand_target,
+                    measured_hand=hand,
+                )
+                _attempt_policy_step(
+                    shadow,
+                    arm_target=arm_target,
+                    hand_target=hand_target,
+                    measured_hand=hand,
+                )
+
+        np.testing.assert_array_equal(
+            shadow.previous_arm_command_qpos, execute.previous_arm_command_qpos
+        )
+        np.testing.assert_array_equal(
+            shadow.previous_hand_command_qpos, execute.previous_hand_command_qpos
+        )
+
+    def test_shadow_publication_rejection_does_not_advance_references(self) -> None:
+        executor = _policy_step_executor()
+        executor.execute = False
+        previous_arm = np.full(7, 0.1, dtype=np.float64)
+        previous_hand = (
+            np.asarray(executor.runtime.hand.qpos_min_rad, dtype=np.float64)
+            + np.asarray(executor.runtime.hand.qpos_max_rad, dtype=np.float64)
+        ) / 2.0
+        executor.previous_arm_command_qpos = previous_arm.copy()
+        executor.previous_hand_command_qpos = previous_hand.copy()
+
+        with patch(
+            "dexmani_real.deployment.executor.command_publishability_reason",
+            return_value=PUBLISH_REASON_GENERATION,
+        ):
+            _attempt_policy_step(
+                executor,
+                arm_target=np.full(7, 0.2, dtype=np.float64),
+                hand_target=previous_hand + 0.1,
+                measured_hand=previous_hand,
+            )
+
+        np.testing.assert_array_equal(executor.previous_arm_command_qpos, previous_arm)
+        np.testing.assert_array_equal(
+            executor.previous_hand_command_qpos, previous_hand
         )
 
     def test_policy_hand_target_is_published_exactly_without_teleop_shaping(
@@ -935,12 +1148,95 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
         self.assertEqual(
             progress.observe(
                 generation=1,
-                arm_action_id=0,
+                arm_action_id=2,
                 hand_action_id=0,
                 now_ns=161,
                 timeout_ns=50,
             ),
-            "arm worker command progress timeout",
+            "hand worker command progress timeout",
+        )
+
+    def test_intermediate_hand_acceptance_keeps_outstanding_target_healthy(
+        self,
+    ) -> None:
+        progress = _CommandProgress()
+        progress.reset(1)
+        self.assertIsNone(
+            progress.observe(
+                generation=1,
+                arm_action_id=0,
+                hand_action_id=0,
+                hand_setpoint_accepted_ns=90,
+                now_ns=100,
+                timeout_ns=50,
+            )
+        )
+        progress.record_publication(1, 110)
+
+        self.assertIsNone(
+            progress.observe(
+                generation=1,
+                arm_action_id=1,
+                hand_action_id=0,
+                hand_setpoint_accepted_ns=150,
+                now_ns=170,
+                timeout_ns=50,
+            )
+        )
+        self.assertFalse(progress.covers(1))
+        self.assertEqual(
+            progress.observe(
+                generation=1,
+                arm_action_id=1,
+                hand_action_id=0,
+                hand_setpoint_accepted_ns=150,
+                now_ns=201,
+                timeout_ns=50,
+            ),
+            "hand worker command progress timeout",
+        )
+
+    def test_old_generation_hand_timestamp_does_not_refresh_new_wait(self) -> None:
+        progress = _CommandProgress()
+        progress.reset(2)
+        self.assertIsNone(
+            progress.observe(
+                generation=2,
+                arm_action_id=1,
+                hand_action_id=1,
+                hand_setpoint_accepted_ns=1_000,
+                now_ns=1_010,
+                timeout_ns=50,
+            )
+        )
+        progress.record_publication(2, 1_020)
+
+        self.assertEqual(
+            progress.observe(
+                generation=2,
+                arm_action_id=2,
+                hand_action_id=1,
+                hand_setpoint_accepted_ns=1_000,
+                now_ns=1_071,
+                timeout_ns=50,
+            ),
+            "hand worker command progress timeout",
+        )
+
+    def test_future_hand_progress_timestamp_is_rejected(self) -> None:
+        progress = _CommandProgress()
+        progress.reset(1)
+
+        self.assertEqual(
+            progress.observe(
+                generation=1,
+                arm_action_id=0,
+                hand_action_id=0,
+                hand_setpoint_accepted_ns=101,
+                now_ns=100,
+                timeout_ns=50,
+            ),
+            "hand SDK setpoint progress is in the future",
         )
 
     def test_worker_acceptance_stall_escalates_to_runtime_fault(self) -> None:
@@ -960,7 +1256,7 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
         executor._fault = Mock()
         with patch(
             "dexmani_real.deployment.executor._read_command_progress",
-            return_value=(0, 0, None),
+            return_value=(0, 0, 0, None),
         ):
             self.assertFalse(executor._observe_worker_progress(161))
         executor._fault.assert_called_once_with(

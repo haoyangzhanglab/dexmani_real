@@ -32,8 +32,8 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 - 事务式写入带 sidecar manifest 的 depth-to-color aligned RGB-D raw episode v24；除 native depth/color 几何与
   时序 provenance 外，还保存与 camera source 对齐的 arm/hand policy observation、hand SDK ACK
   与限速后的 hand target。
-- 将 aligned raw v24 episode 清洗为 processed HDF5 v11；四种 profile 的
-  deployment-equivalent 数据均可导出 Policy Zarr v5。导出坚持一份 processed HDF5 对应一个训练 episode；
+- 将 aligned raw v24 episode 清洗为 processed HDF5 v12；四种 profile 的
+  teleop 已发布 target 数据均可导出 Policy Zarr v6。导出坚持一份 processed HDF5 对应一个训练 episode；
   删除过 source 行或存在时序缺口的 episode 整条拒绝，不在缺口处拆分。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
 - 通过 Policy-owned public runtime 与 Real-owned NumPy adapter 运行 joint/EE-action learned
@@ -49,7 +49,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`replay/`](dexmani_real/replay) |
 | raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/hdf5_writer.py`](dexmani_real/recording/hdf5_writer.py)、[`recording/reader.py`](dexmani_real/recording/reader.py) |
 | 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`data/`](dexmani_real/data) |
-| 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v24、processed v11 与 Policy Zarr v5 的字段、dtype、shape 与语义 |
+| 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v24、processed v12 与 Policy Zarr v6 的字段、dtype、shape 与语义 |
 | learned-policy 部署 | [`docs/policy_deployment.md`](docs/policy_deployment.md)、[`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`integrations/`](dexmani_real/integrations) |
 | 相机、桌面与 VR 标定 | [`examples/`](examples) | [`calibration/`](dexmani_real/calibration)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
 | 点云完整链路 | [`docs/pointcloud_pipeline.md`](docs/pointcloud_pipeline.md) | [`sensor/pointcloud.py`](dexmani_real/sensor/pointcloud.py)、[`sensor/pointcloud_worker.py`](dexmani_real/sensor/pointcloud_worker.py) |
@@ -260,7 +260,7 @@ aligned 像素 RGB 的均值。processed HDF5 和 Policy Zarr 同时保存并校
 与桌面平面身份，禁止混合不同点云语义的数据。
 
 deployment lifecycle 从 Policy public API 取得只读 `PolicySpec`。唯一的
-`dexmani.deployment.v2` artifact 只包含 `_format`、`contract` 和 `weights`；其
+`dexmani.deployment.v3` artifact 只包含 `_format`、`contract` 和 `weights`；其
 `data_contract.observation_fields` 按顺序声明每个原始模型
 输入的名称、shape、dtype 与语义；训练 experiment 的 `dataset.sensor_modalities` 是导出时唯一的
 人工选择入口，artifact 不再持久化第二份模态列表。Real 只验证自己要投影的 raw shape/dtype、
@@ -310,7 +310,7 @@ RGB-D、完整 raw 点云、canonical processed 点云、相机几何、外参�
 根因已确认并修复：`RealSenseConfig.auto_exposure_priority` 默认 `0.0`（OFF，Auto
 Exposure 仍 ON），RGB 恢复 30 Hz，亮度由增益补偿、几乎不变（暗场噪声上升）。
 
-深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew）。processed v11 的点云将
+深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew）。processed v12 的点云将
 depth-to-color aligned 像素 RGB 聚合为体素颜色，但这不表示同步曝光；运动物体仍可能出现
 颜色时间错位。
 
@@ -353,11 +353,11 @@ python examples/process_episodes.py \
 确认后去掉 `--dry-run`。默认写入后只重新打开每个 processed HDF5，确认 schema、key、shape
 和 dtype 的结构完整性，再原子发布；如需在发布前完整扫描有限值、alignment 和 semantic
 attributes，显式加 `--verify-output`。所有 consumer/export 边界始终保持完整 validation。
-所有处理 profile 都审计动作 endpoint delta；视觉 profile 还校验
+所有处理 profile 都校验自身的 raw 时序与质量；视觉 profile 还校验
 camera-source 对齐的 arm/hand policy observation、同 source 已校准 tactile sum 与重算的
 xArm-base fingertip。`--task-name` 会统一写入每个 processed episode，并拒绝与逐 episode
-annotation 中 task_name 冲突。四种 profile 在通过各自边界后均标为
-`deployment_equivalent=True`，并可进入 Policy Zarr v5。
+annotation 中 task_name 冲突。四种 profile 在通过各自边界后使用
+`teleop_published_joint_target` 语义，并可进入 Policy Zarr v6。
 
 raw v24 episode 可视化默认使用当前 resolved runtime 中的点云策略和桌面标定即时生成 canonical
 `(N,6)` 点云；该路径与 offline processing、实时 deployment 共用同一个 `build_point_cloud()`
@@ -365,7 +365,7 @@ raw v24 episode 可视化默认使用当前 resolved runtime 中的点云策略�
 `--pointcloud-num-points` 可选择 `1024`、`2048`、`4096` 或 `8192`。
 
 需要检查已清洗、持久化及 provenance 完整的点云时，仍应先用 `process_episodes.py` 生成
-processed HDF5 v11，再运行 `python examples/visualize_episode_processed.py <processed.h5>`；该入口
+processed HDF5 v12，再运行 `python examples/visualize_episode_processed.py <processed.h5>`；该入口
 会在读取或渲染 payload 前调用共享的 processed payload/provenance admission，再校验
 `(N,6)`、`float32`、xArm-base 坐标系、RGB 范围、算法/采样语义、配置哈希与桌面标定身份；
 `rgb`/`rgb_pc` 还要求 RGB 与 depth 的 `N/H/W` 完全一致。

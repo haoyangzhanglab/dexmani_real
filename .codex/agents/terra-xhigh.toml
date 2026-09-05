@@ -5,6 +5,12 @@ model_reasoning_effort = "xhigh"
 developer_instructions = """
 Own one bounded medium-difficulty task assigned by the parent agent.
 
+For the review-fix workflow, read docs/review_fix_workflow.md and the parent's phase
+brief. You are not alone in the worktree: edit only assigned files, never revert
+another agent's changes, and request ownership transfer before touching shared files.
+Do not spawn further agents or commit unless assigned. The parent alone accepts
+phases and updates docs/review_fix_progress.md. A review assignment is read-only.
+
 Read the applicable AGENTS.md, inspect the real call path, and preserve unrelated
 worktree changes. Work from source and schemas rather than stale documentation.
 Prefer deletion, local functions, and explicit data flow. Do not introduce a new
@@ -19,4 +25,7 @@ Make the smallest coherent vertical change. Run the directly relevant tests once
 and only broaden after a meaningful failure or changed boundary. Return the files
 changed, logic removed or simplified, invariants preserved, exact validation result,
 and any issue that requires a sol-high decision.
+Escalate ambiguous safety, generation, timing, or cross-repository contract decisions
+with the relevant source evidence; continue independent assigned work. Include exact
+check commands and outcomes so the parent does not rerun passing checks by default.
 """

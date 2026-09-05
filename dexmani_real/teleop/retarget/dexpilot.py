@@ -13,8 +13,9 @@ This module restores a prior without touching site-packages: it subclasses
 search sees it) and the gradient.  ``q_ref`` is the *per-frame* human flexion
 reference (set via ``set_prior_reference`` before each ``retarget``), masked to
 the 10 flexion joints — this matches the robot's flexion to the operator's
-actual per-frame hand shape rather than a fixed pose.  At ``prior_weight == 0``
-the behavior is bit-identical to the vanilla optimizer.
+actual per-frame hand shape rather than a fixed pose. At ``prior_weight == 0``
+successful solves are numerically identical to the vanilla optimizer; solver
+errors propagate instead of returning the stale warm start.
 """
 
 from __future__ import annotations
@@ -77,6 +78,27 @@ class PriorDexPilotOptimizer(DexPilotOptimizer):
             return result + float(np.sum(weighted_mask * diff * diff))
 
         return objective
+
+    def retarget(
+        self,
+        ref_value: np.ndarray,
+        fixed_qpos: np.ndarray,
+        last_qpos: np.ndarray,
+    ) -> np.ndarray:
+        """Optimize one frame without upstream's broad RuntimeError fallback."""
+        if len(fixed_qpos) != len(self.idx_pin2fixed):
+            raise ValueError(
+                f"Optimizer has {len(self.idx_pin2fixed)} joints but "
+                f"non_target_qpos {fixed_qpos} is given"
+            )
+        objective_fn = self.get_objective_function(
+            ref_value,
+            fixed_qpos,
+            np.asarray(last_qpos, dtype=np.float32),
+        )
+        self.opt.set_min_objective(objective_fn)
+        qpos = self.opt.optimize(last_qpos)
+        return np.asarray(qpos, dtype=np.float32)
 
 
 def build_dexpilot_retargeting(

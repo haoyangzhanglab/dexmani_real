@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.runtime import ResolvedRuntimeConfig
+from dexmani_real.ipc.causal import vr_frame_is_fresh
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.ipc.schema import RECORD_OPERATOR_BYTES, RECORD_TASK_LABEL_BYTES
 from dexmani_real.recording.client import RecorderPhase, bounded_control_text
@@ -191,15 +192,16 @@ def _preflight_health_issues(
         issues.append("VR hand feedback is unavailable")
     else:
         vr, _timestamp_ns, _sequence = vr_result
-        local_recv_ns = int(vr["local_recv_ns"][0])
         current_ns = time.monotonic_ns() if now_ns is None else now_ns
         vr_ok = (
             np.all(np.isfinite(vr["wrist_pos"][0]))
             and np.all(np.isfinite(vr["wrist_quat_wxyz"][0]))
             and np.all(np.isfinite(vr["landmarks"][0]))
-            and 0 < local_recv_ns <= current_ns
-            and current_ns - local_recv_ns
-            <= int(float(runtime.policy.vr_mapping.stale_threshold_s) * 1e9)
+            and vr_frame_is_fresh(
+                vr,
+                now_monotonic_ns=current_ns,
+                max_age_s=float(runtime.policy.vr_mapping.stale_threshold_s),
+            )
         )
         if not vr_ok:
             issues.append("VR hand feedback is invalid or stale")

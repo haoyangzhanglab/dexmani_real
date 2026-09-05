@@ -118,6 +118,14 @@ class HandWorkerStartupTest(unittest.TestCase):
             int(shared.hand_state_ring.frames[0]["accepted_target_monotonic_ns"][0]),
             0,
         )
+        self.assertEqual(
+            int(
+                shared.hand_state_ring.frames[0][
+                    "last_sdk_setpoint_accepted_monotonic_ns"
+                ][0]
+            ),
+            0,
+        )
 
     def test_sustained_state_read_failure_faults_worker(self) -> None:
         shared = _StartupShared()
@@ -318,6 +326,135 @@ class HandWorkerRampingTest(unittest.TestCase):
         self.assertAlmostEqual(hand.sent[0][0], 0.3)
         np.testing.assert_array_equal(hand.sent[1], hand.sent[0])
         np.testing.assert_array_equal(hand.sent[2], command["hand_qpos"][0])
+        # CRC does not advance progress; the following intermediate ACCEPTED
+        # does, without claiming exact endpoint acceptance.
+        self.assertEqual(
+            int(
+                shared.hand_state_ring.frames[-3][
+                    "last_sdk_setpoint_accepted_monotonic_ns"
+                ][0]
+            ),
+            0,
+        )
+        self.assertGreater(
+            int(
+                shared.hand_state_ring.frames[-2][
+                    "last_sdk_setpoint_accepted_monotonic_ns"
+                ][0]
+            ),
+            0,
+        )
+        self.assertEqual(
+            int(shared.hand_state_ring.frames[-2]["accepted_target_action_id"][0]),
+            0,
+        )
+        self.assertEqual(
+            int(shared.hand_state_ring.frames[-1]["accepted_target_action_id"][0]),
+            1,
+        )
+
+    def test_generation_race_uses_current_armed_measured_reference(self) -> None:
+        now_ns = time.monotonic_ns()
+        measured = np.asarray(hand_defaults.qpos_min_rad, dtype=np.float64)
+        commands = []
+        for generation, action_id, delta in ((1, 1, 0.3), (2, 2, 0.6)):
+            command = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
+            command["run_generation"][0] = generation
+            command["action_id"][0] = action_id
+            command["created_monotonic_ns"][0] = now_ns
+            command["scheduled_target_monotonic_ns"][0] = now_ns
+            command["target_monotonic_ns"][0] = now_ns
+            command["valid_until_monotonic_ns"][0] = now_ns + 1_000_000_000
+            command["hand_present"][0] = 1
+            command["hand_qpos"][0] = measured
+            command["hand_qpos"][0, 0] += delta
+            commands.append(command)
+
+        shared = SimpleNamespace(
+            error_state=SimpleNamespace(value=False),
+            is_running=SimpleNamespace(value=True),
+            estop_request=SimpleNamespace(value=False),
+            safety_state=SimpleNamespace(value=int(SafetyState.RUNNING)),
+            run_generation=SimpleNamespace(value=1),
+            motion_lock=threading.Lock(),
+            hand_state_ring=_FakeRing(),
+            hand_tactile_ring=_FakeRing(),
+            set_heartbeat=Mock(),
+            set_ready=Mock(),
+        )
+
+        class CommandRing:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def read_latest(self) -> tuple[np.ndarray, int, int]:
+                self.reads += 1
+                if self.reads == 1:
+                    return commands[0], now_ns, 1
+                shared.run_generation.value = 2
+                shared.safety_state.value = int(SafetyState.ARMED)
+                return commands[1], now_ns, 2
+
+            @property
+            def latest_sequence(self) -> int:
+                return min(self.reads, 2)
+
+        shared.coupled_cmd_ring = CommandRing()
+        state = _initial_hand_state()
+        state.qpos = measured.copy()
+
+        class SendStatus:
+            ACCEPTED = object()
+            CRC_UNCONFIRMED = object()
+            REJECTED = object()
+
+        class FakeXHand:
+            instance: "FakeXHand | None" = None
+
+            def __init__(self, _config: object) -> None:
+                type(self).instance = self
+                self.connect = Mock()
+                self.calibrate_tactile = Mock()
+                self.get_state = Mock(return_value=state)
+                self.disconnect = Mock()
+                self.is_connected = True
+                self.tactile_calibrated = False
+                self.sent: list[np.ndarray] = []
+
+            def send_action(self, action: np.ndarray) -> object:
+                self.sent.append(action.copy())
+                return SendStatus.ACCEPTED
+
+        class FakeRate:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def wait(self) -> None:
+                hand = FakeXHand.instance
+                if hand is not None and len(hand.sent) == 2:
+                    shared.is_running.value = False
+
+        fake_xhand_module = types.ModuleType("dexmani_real.robot.xhand")
+        fake_xhand_module.XHand = FakeXHand
+        fake_xhand_module.XHandSendStatus = SendStatus
+        config = SimpleNamespace(
+            loop_hz=30.0,
+            mechanical_qpos_min_rad=np.asarray(hand_defaults.mechanical_qpos_min_rad),
+            mechanical_qpos_max_rad=np.asarray(hand_defaults.mechanical_qpos_max_rad),
+            hand_max_delta_rad_per_tick=0.3,
+        )
+
+        with (
+            patch.dict(sys.modules, {fake_xhand_module.__name__: fake_xhand_module}),
+            patch("dexmani_real.robot.hand_worker.LoopRate", FakeRate),
+        ):
+            hand_loop(shared, config, 1.0)
+
+        hand = FakeXHand.instance
+        assert hand is not None
+        self.assertEqual(len(hand.sent), 2)
+        self.assertAlmostEqual(hand.sent[0][0] - measured[0], 0.3)
+        self.assertAlmostEqual(hand.sent[1][0] - measured[0], 0.3)
 
     def test_invalid_commands_never_invoke_hand_sdk(self) -> None:
         now_ns = time.monotonic_ns()

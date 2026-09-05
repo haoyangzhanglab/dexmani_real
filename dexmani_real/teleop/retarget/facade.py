@@ -7,11 +7,17 @@ constant per-backend ``pinky_scale`` (plus an optional palm-baseline offset).
 
 from __future__ import annotations
 
-__all__ = ["XHandRetargeter", "TAGHandRetargeter", "adaptive_retargeting_xhand", "validate_landmarks"]
+__all__ = [
+    "XHandRetargeter",
+    "TAGHandRetargeter",
+    "adaptive_retargeting_xhand",
+    "validate_landmarks",
+]
 
 import time
 from typing import Any
 
+import nlopt
 import numpy as np
 
 from dexmani_real import ASSET_DIR
@@ -20,26 +26,11 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-class _TAGRuntimeOverrides:
-    """Private policy-to-TAG wiring that leaves the public constructor stable."""
-
-    def __init__(self, config: Any | None, urdf_path: str) -> None:
-        self.config = config
-        self.urdf_path = str(urdf_path)
-
-
-def tag_config_with_urdf(config: Any | None, urdf_path: str) -> _TAGRuntimeOverrides:
-    return _TAGRuntimeOverrides(config, urdf_path)
-
 
 _PINKY_MCP = 17
 _PINKY_PIP = 18
 _PINKY_DIP = 19
 _PINKY_TIP = 20
-
-# Per-backend config supplies this value; keep a stable no-config fallback.
-
-_PINKY_SCALE_FALLBACK = 1.15
 
 _CONTIGUOUS_BONES = tuple(
     (parent, child)
@@ -63,11 +54,16 @@ _FINGER_CHAINS = (
 
 # Human flexion feature index → SDK joint index; unmapped joints are excluded.
 _HUMAN_FLEXION_JOINT_PAIRS = (
-    (0, 0), (1, 2),  # thumb CMC→bend, MCP+IP→rota2
-    (2, 4), (3, 5),  # index MCP→j1, PIP+DIP→j2
-    (4, 6), (5, 7),  # middle
-    (6, 8), (7, 9),  # ring
-    (8, 10), (9, 11),  # pinky
+    (0, 0),
+    (1, 2),  # thumb CMC→bend, MCP+IP→rota2
+    (2, 4),
+    (3, 5),  # index MCP→j1, PIP+DIP→j2
+    (4, 6),
+    (5, 7),  # middle
+    (6, 8),
+    (7, 9),  # ring
+    (8, 10),
+    (9, 11),  # pinky
 )
 _SDK_FLEXION_MASK = np.zeros(12, dtype=np.float64)
 for _feature_index, _sdk_index in _HUMAN_FLEXION_JOINT_PAIRS:
@@ -92,7 +88,9 @@ def _human_flexion_rad(landmarks: np.ndarray) -> np.ndarray:
             denominator = np.linalg.norm(first) * np.linalg.norm(second)
             if denominator <= 1e-12:
                 raise ValueError("landmarks contain a degenerate hand bone")
-            ang[joint_index] = np.arccos(np.clip(np.sum(first * second) / denominator, -1.0, 1.0))
+            ang[joint_index] = np.arccos(
+                np.clip(np.sum(first * second) / denominator, -1.0, 1.0)
+            )
         if finger_index == 0:
             flex[0] = ang[0]
             flex[1] = ang[1] + ang[2]
@@ -135,10 +133,16 @@ def validate_landmarks(keypoint_3d_array: np.ndarray) -> tuple[bool, str]:
     pinky_length = float(np.linalg.norm(pinky_basis))
     if index_length < 0.01 or pinky_length < 0.01:
         return False, "wrist-to-index/pinky MCP baseline is shorter than 1 cm"
-    palm_sine = float(np.linalg.norm(np.cross(index_basis, pinky_basis)) / (index_length * pinky_length))
+    palm_sine = float(
+        np.linalg.norm(np.cross(index_basis, pinky_basis))
+        / (index_length * pinky_length)
+    )
     if palm_sine < 0.1:
         return False, "palm basis is collinear"
-    shortest_bone = min(float(np.linalg.norm(points[child] - points[parent])) for parent, child in _CONTIGUOUS_BONES)
+    shortest_bone = min(
+        float(np.linalg.norm(points[child] - points[parent]))
+        for parent, child in _CONTIGUOUS_BONES
+    )
     if shortest_bone < 0.002:
         return False, "a retargeting bone is shorter than 2 mm"
     return True, ""
@@ -154,7 +158,9 @@ def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
     """
     keypoint_3d_array = np.asarray(keypoint_3d_array, dtype=np.float64)
     if keypoint_3d_array.shape != (21, 3):
-        raise ValueError(f"keypoint_3d_array must have shape (21, 3), got {keypoint_3d_array.shape}")
+        raise ValueError(
+            f"keypoint_3d_array must have shape (21, 3), got {keypoint_3d_array.shape}"
+        )
 
     eps = 1e-8
     points = keypoint_3d_array[[0, 5, 9], :].copy()
@@ -196,8 +202,8 @@ def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
 def adaptive_retargeting_xhand(
     landmarks: np.ndarray,
     *,
-    scale: float = _PINKY_SCALE_FALLBACK,
-    palm_scale: float = 1.0,
+    scale: float,
+    palm_scale: float,
 ) -> np.ndarray:
     """Scale the pinky chain and optional wrist-to-MCP baseline on a copy.
 
@@ -216,7 +222,9 @@ def adaptive_retargeting_xhand(
 
     # Scale the wrist→MCP baseline independently.
     if palm_scale != 1.0:
-        landmarks[_PINKY_MCP] = landmarks[0] + (raw[_PINKY_MCP] - landmarks[0]) * palm_scale
+        landmarks[_PINKY_MCP] = (
+            landmarks[0] + (raw[_PINKY_MCP] - landmarks[0]) * palm_scale
+        )
 
     # Apply uniform scaling along MCP→PIP→DIP→TIP.
     mcp_to_pip = raw[_PINKY_PIP] - raw[_PINKY_MCP]
@@ -234,23 +242,21 @@ def adaptive_retargeting_xhand(
 class XHandRetargeter:
     def __init__(
         self,
+        dexpilot_config: Any,
         fixed_joint_values: np.ndarray | None = None,
         hand_type: str = "right",
         retargeting_type: str = "dexpilot",
         debug_adapters: bool = False,
-        dexpilot_config: Any | None = None,
     ):
         self.hand_type = hand_type
         self.retargeting_type = retargeting_type
-        self.fixed_joint_values = np.array([]) if fixed_joint_values is None else np.array(fixed_joint_values)
+        self.fixed_joint_values = (
+            np.array([]) if fixed_joint_values is None else np.array(fixed_joint_values)
+        )
         self.debug_adapters = bool(debug_adapters)
         self._dexpilot_config = dexpilot_config
-        if dexpilot_config is not None:
-            self._pinky_scale = float(dexpilot_config.pinky_scale)
-            self._pinky_palm_scale = float(dexpilot_config.pinky_palm_scale)
-        else:
-            self._pinky_scale = _PINKY_SCALE_FALLBACK
-            self._pinky_palm_scale = 1.0
+        self._pinky_scale = float(dexpilot_config.pinky_scale)
+        self._pinky_palm_scale = float(dexpilot_config.pinky_palm_scale)
         self.last_debug: dict[str, float | str] = {}
 
         # Keep the public output in the schema-owned SDK order.
@@ -264,7 +270,11 @@ class XHandRetargeter:
 
         from dexmani_real.teleop.retarget.dexpilot import build_dexpilot_retargeting
 
-        config_path = ASSET_DIR / "retargeting" / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
+        config_path = (
+            ASSET_DIR
+            / "retargeting"
+            / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
+        )
 
         with open(str(config_path), "r") as f:
             yaml_config = yaml.load(f, Loader=yaml.FullLoader)
@@ -286,7 +296,11 @@ class XHandRetargeter:
                 escape_dist=float(self._dexpilot_config.escape_dist_m),
             )
 
-        self._prior_weight = float(self._dexpilot_config.prior_weight) if self._dexpilot_config is not None else 0.0
+        self._prior_weight = (
+            float(self._dexpilot_config.prior_weight)
+            if self._dexpilot_config is not None
+            else 0.0
+        )
         prior_mask = _SDK_FLEXION_MASK  # target order == SDK order
 
         RetargetingConfig.set_default_urdf_dir(str(ASSET_DIR / "robots"))
@@ -329,15 +343,17 @@ class XHandRetargeter:
         origin_indices = self.indices[0, :]
         task_indices = self.indices[1, :]
 
-        ref_value = scaled_landmarks[task_indices, :] - scaled_landmarks[origin_indices, :]
+        ref_value = (
+            scaled_landmarks[task_indices, :] - scaled_landmarks[origin_indices, :]
+        )
         return ref_value
 
     def retarget(self, landmarks: np.ndarray | None) -> np.ndarray | None:
         """Retarget raw VR landmarks (operator-frame, 21x3) to XHand joint qpos.
 
         Handles coordinate transform (operator → MANO), input validation,
-        and NLP optimization.  Returns None on any failure; caller falls
-        back to the previous hand command.
+        and NLP optimization. Expected invalid input or solver roundoff returns
+        ``None``; unexpected optimizer errors propagate to the session owner.
         """
         if landmarks is None:
             return None
@@ -357,10 +373,18 @@ class XHandRetargeter:
 
         # Use the unscaled landmarks for the human-flexion prior.
         if self._prior_weight > 0:
-            self.retargeter.optimizer.set_prior_reference(_human_flexion_sdk_reference(mano_landmarks))
+            self.retargeter.optimizer.set_prior_reference(
+                _human_flexion_sdk_reference(mano_landmarks)
+            )
 
         ref_value = self._build_ref_value(mano_landmarks)
-        qpos = self.retargeter.retarget(ref_value, fixed_qpos=self.fixed_joint_values)
+        try:
+            qpos = self.retargeter.retarget(
+                ref_value, fixed_qpos=self.fixed_joint_values
+            )
+        except nlopt.RoundoffLimited:
+            logger.warning("Retargeting roundoff limit reached — holding hand position")
+            return None
 
         if qpos is None:
             logger.warning("Retargeting returned None.")
@@ -395,7 +419,9 @@ class XHandRetargeter:
                 idx = self.retargeter.optimizer.idx_pin2target
                 self.retargeter.last_qpos = qpos_retargeter[idx]
             else:
-                logger.warning("initial_qpos contains NaN/Inf — falling back to neutral seed")
+                logger.warning(
+                    "initial_qpos contains NaN/Inf — falling back to neutral seed"
+                )
 
 
 _FINGERTIP_INDICES = np.array([4, 8, 12, 16, 20], dtype=np.intp)
@@ -428,32 +454,19 @@ class TAGHandRetargeter:
 
     def __init__(
         self,
+        fingertip_link_names: tuple[str, ...],
+        tag_config: Any,
+        urdf_path: str,
         hand_type: str = "right",
         debug: bool = False,
-        fingertip_link_names: tuple[str, ...] | None = None,
-        tag_config: Any | None = None,
     ) -> None:
         from scipy.spatial.transform import Rotation
 
-        from dexmani_real.config.defaults import hand as hand_d
-        from dexmani_real.config.defaults import tag_retargeting as default_tag_cfg
         from dexmani_real.teleop.retarget.pin_grad import validate_fingertip_frame_names
         from dexmani_real.teleop.retarget.tag_optimizer import HandOptimizer
 
-        runtime_urdf_path: str | None = None
-        if isinstance(tag_config, _TAGRuntimeOverrides):
-            runtime_urdf_path = tag_config.urdf_path
-            tag_config = tag_config.config
-        tag_cfg = default_tag_cfg if tag_config is None else tag_config
-
-        resolved_urdf_path = (
-            str(ASSET_DIR / "robots" / "xhand" / f"xhand_{hand_type}.urdf")
-            if runtime_urdf_path is None
-            else runtime_urdf_path
-        )
-        resolved_tip_names = validate_fingertip_frame_names(
-            hand_d.fingertip_link_names if fingertip_link_names is None else fingertip_link_names
-        )
+        resolved_urdf_path = str(urdf_path)
+        resolved_tip_names = validate_fingertip_frame_names(fingertip_link_names)
         model = pin_loading(resolved_urdf_path)
         joint_lo = model.lowerPositionLimit[7:].copy()
         joint_hi = model.upperPositionLimit[7:].copy()
@@ -471,29 +484,35 @@ class TAGHandRetargeter:
             fingertip_frame_names=list(resolved_tip_names),
             joint_limits_lower=joint_lo,
             joint_limits_upper=joint_hi,
-            finger_lengths_robot=np.array(tag_cfg.robot_finger_lengths, dtype=np.float64),
-            finger_lengths_human=np.array(tag_cfg.human_finger_lengths, dtype=np.float64),
-            finger_scale_boost=tag_cfg.finger_scale_boost,
-            smooth_weight=tag_cfg.smooth_weight,
-            ftol_abs_s1=tag_cfg.ftol_abs_s1,
-            maxeval_s1=tag_cfg.maxeval_s1,
-            ftol_abs_s2=tag_cfg.ftol_abs_s2,
-            maxeval_s2=tag_cfg.maxeval_s2,
-            pinch_base_weight=tag_cfg.pinch_base_weight,
-            pinch_start_dist_m=tag_cfg.pinch_start_dist_m,
-            pinch_full_dist_m=tag_cfg.pinch_full_dist_m,
-            pinch_ema_alpha=tag_cfg.pinch_ema_alpha,
-            pinch_skip_threshold=tag_cfg.pinch_skip_threshold,
-            reg_stage1_weight=tag_cfg.reg_stage1_weight,
-            reg_last_weight=tag_cfg.reg_last_weight,
-            prior_weight=tag_cfg.prior_weight,
+            finger_lengths_robot=np.array(
+                tag_config.robot_finger_lengths, dtype=np.float64
+            ),
+            finger_lengths_human=np.array(
+                tag_config.human_finger_lengths, dtype=np.float64
+            ),
+            finger_scale_boost=tag_config.finger_scale_boost,
+            smooth_weight=tag_config.smooth_weight,
+            ftol_abs_s1=tag_config.ftol_abs_s1,
+            maxeval_s1=tag_config.maxeval_s1,
+            ftol_abs_s2=tag_config.ftol_abs_s2,
+            maxeval_s2=tag_config.maxeval_s2,
+            pinch_base_weight=tag_config.pinch_base_weight,
+            pinch_start_dist_m=tag_config.pinch_start_dist_m,
+            pinch_full_dist_m=tag_config.pinch_full_dist_m,
+            pinch_ema_alpha=tag_config.pinch_ema_alpha,
+            pinch_skip_threshold=tag_config.pinch_skip_threshold,
+            reg_stage1_weight=tag_config.reg_stage1_weight,
+            reg_last_weight=tag_config.reg_last_weight,
+            prior_weight=tag_config.prior_weight,
             prior_mask=_SDK_FLEXION_MASK[self._mapping_sdk_to_model],
         )
 
-        self._R_mano_to_urdf: np.ndarray = Rotation.from_euler("xyz", tag_cfg.mano_to_urdf_euler).as_matrix()
-        self._pinky_scale = float(tag_cfg.pinky_scale)
-        self._pinky_palm_scale = float(tag_cfg.pinky_palm_scale)
-        self._prior_weight = float(tag_cfg.prior_weight)
+        self._R_mano_to_urdf: np.ndarray = Rotation.from_euler(
+            "xyz", tag_config.mano_to_urdf_euler
+        ).as_matrix()
+        self._pinky_scale = float(tag_config.pinky_scale)
+        self._pinky_palm_scale = float(tag_config.pinky_palm_scale)
+        self._prior_weight = float(tag_config.prior_weight)
 
         self._last_raw_qpos: np.ndarray | None = None
         self.debug = bool(debug)
@@ -501,19 +520,22 @@ class TAGHandRetargeter:
         logger.info(
             "TAGHandRetargeter ready (urdf=%s, mano→urdf=%s)",
             resolved_urdf_path,
-            tag_cfg.mano_to_urdf_euler,
+            tag_config.mano_to_urdf_euler,
         )
 
     def retarget(self, landmarks: np.ndarray | None) -> np.ndarray | None:
         """Retarget VR landmarks (operator-frame, 21×3) to XHand joint qpos (12,).
 
-        Returns None on any failure — caller falls back to previous hand command.
+        Expected invalid input or Stage 1 roundoff returns ``None``. Unexpected
+        optimizer errors propagate to the session owner.
         """
         if landmarks is None:
             return None
         valid, reason = validate_landmarks(landmarks)
         if not valid:
-            logger.warning("TAGHandRetargeter: landmarks rejected (%s) — holding position", reason)
+            logger.warning(
+                "TAGHandRetargeter: landmarks rejected (%s) — holding position", reason
+            )
             return None
 
         t0 = time.perf_counter() if self.debug else 0.0
@@ -522,13 +544,17 @@ class TAGHandRetargeter:
             wrist_rot = _estimate_palm_frame(landmarks)
             mano = landmarks @ wrist_rot @ _OPERATOR2MANO_RIGHT
         except (ValueError, np.linalg.LinAlgError):
-            logger.warning("TAGHandRetargeter: coordinate transform failed — holding position")
+            logger.warning(
+                "TAGHandRetargeter: coordinate transform failed — holding position"
+            )
             return None
 
         # Use the unscaled landmarks for the human-flexion prior.
         q_prior_model = None
         if self._prior_weight > 0:
-            q_prior_model = _human_flexion_sdk_reference(mano)[self._mapping_sdk_to_model]
+            q_prior_model = _human_flexion_sdk_reference(mano)[
+                self._mapping_sdk_to_model
+            ]
 
         mano = adaptive_retargeting_xhand(
             mano,
@@ -540,11 +566,9 @@ class TAGHandRetargeter:
         tips -= mano[0]  # center at wrist
         tips_urdf = tips @ self._R_mano_to_urdf.T  # (5, 3) in URDF frame
 
-        try:
-            qpos_model = self._optimizer.solve(tips_urdf, q_prior=q_prior_model)  # (12,) in Pinocchio model order
-        except Exception:
-            logger.warning("TAGHandRetargeter: optimizer.solve() crashed — holding position", exc_info=True)
-            return None
+        qpos_model = self._optimizer.solve(
+            tips_urdf, q_prior=q_prior_model
+        )  # (12,) in Pinocchio model order
 
         if qpos_model is None:
             return None
@@ -562,7 +586,11 @@ class TAGHandRetargeter:
         """Reset optimizer state and optional SDK-order warm start."""
         self._last_raw_qpos = None
 
-        if initial_qpos is not None and initial_qpos.shape == HAND_JOINT_SHAPE and np.all(np.isfinite(initial_qpos)):
+        if (
+            initial_qpos is not None
+            and initial_qpos.shape == HAND_JOINT_SHAPE
+            and np.all(np.isfinite(initial_qpos))
+        ):
             # SDK order → model order for optimizer warm-start
             qpos_model = initial_qpos[self._mapping_sdk_to_model]
             self._optimizer.reset(qpos_model)
@@ -573,8 +601,6 @@ class TAGHandRetargeter:
     def last_raw_qpos(self) -> np.ndarray | None:
         """Latest SDK-order retarget output."""
         return self._last_raw_qpos.copy() if self._last_raw_qpos is not None else None
-
-
 
 
 def pin_loading(urdf_path: str):

@@ -6,13 +6,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.control.publication import validate_hand_command_bounds
 from dexmani_real.robot_spec import HAND_JOINT_SHAPE
 from dexmani_real.teleop.retarget.facade import TAGHandRetargeter, XHandRetargeter
-from dexmani_real.utils.log import ThrottledWarner, get_logger
-
-logger = get_logger(__name__)
-
+from dexmani_real.utils.log import ThrottledWarner
 
 _retarget_fail_warn = ThrottledWarner()
 
@@ -42,35 +38,6 @@ class HandRetargetObservationCache:
         self.succeeded = False
 
 
-def sanitize_hand_command(
-    hand_cmd: np.ndarray,
-    lower: np.ndarray,
-    upper: np.ndarray,
-    mechanical_lower: np.ndarray,
-    mechanical_upper: np.ndarray,
-) -> np.ndarray:
-    """Backstop validation of an already-clipped hand target; never clips.
-
-    The VR-teleop caller clips the command into the operator-set anti-clogging
-    command box (loop.py) before calling here, so the operational bound should
-    never fire on that path.  This preflight remains as the *graceful-hold*
-    backstop for well-formed shape, finite values, the rated mechanical
-    envelope, and limit-array consistency: a violation raises so the loop marks
-    ``hand_cmd_valid=False`` and holds arm + hand together, instead of letting
-    ``SafetyGate.validate`` turn an out-of-limit command into a sticky fault.
-    (Other coupled paths — keyboard, replay, calibrate, return-home — still rely
-    on ``validate_hand_command_bounds`` during command preparation to
-    reject, not clip.)
-    """
-    return validate_hand_command_bounds(
-        hand_cmd,
-        lower,
-        upper,
-        mechanical_lower,
-        mechanical_upper,
-    )
-
-
 def hand_ramp_frame_count(duration_s: float, control_hz: float) -> int:
     if not np.isfinite(duration_s) or duration_s < 0:
         raise ValueError("duration_s must be finite and >= 0")
@@ -89,7 +56,9 @@ def smoothstep_hand_ramp(
     start_arr = np.asarray(start, dtype=np.float64)
     target_arr = np.asarray(target, dtype=np.float64)
     if start_arr.shape != target_arr.shape:
-        raise ValueError(f"ramp arrays must have matching shapes, got {start_arr.shape} and {target_arr.shape}")
+        raise ValueError(
+            f"ramp arrays must have matching shapes, got {start_arr.shape} and {target_arr.shape}"
+        )
     if total_steps <= 0:
         return target_arr.copy()
     if not 0 <= step_index < total_steps:
@@ -105,14 +74,16 @@ def get_raw_hand_command(
     retarget_ok: bool,
 ) -> np.ndarray:
     """Return the TAG optimizer output when available, otherwise the retargeter output."""
-    fallback = np.asarray(filtered_command, dtype=np.float64).copy()
+    command = np.asarray(filtered_command, dtype=np.float64).copy()
     if not retarget_ok or retargeter is None:
-        return fallback
+        return command
     raw = getattr(retargeter, "last_raw_qpos", None)
     if raw is None:
-        return fallback
+        return command
     raw_arr = np.asarray(raw, dtype=np.float64)
-    return raw_arr.copy() if raw_arr.shape == HAND_JOINT_SHAPE and np.all(np.isfinite(raw_arr)) else fallback
+    if raw_arr.shape == HAND_JOINT_SHAPE and np.all(np.isfinite(raw_arr)):
+        return raw_arr.copy()
+    return command
 
 
 def compute_hand_command(
@@ -161,26 +132,19 @@ def compute_hand_command(
     observation_cache.target_qpos = None
     observation_cache.succeeded = False
 
-    try:
-        target = retargeter.retarget(landmarks)  # validates shape + finiteness internally
-        if target is None:
-            _retarget_fail_warn("Hand retargeting: retargeter.retarget() returned None")
-            return prev_hand_cmd.copy(), False
-        target_arr = np.asarray(target, dtype=np.float64)
-        if target_arr.shape == HAND_JOINT_SHAPE and np.all(
-            np.isfinite(target_arr)
-        ):
-            observation_cache.target_qpos = target_arr.copy()
-            observation_cache.succeeded = True
-            return target_arr, True
-        _retarget_fail_warn(
-            "Hand retargeting: retargeter.retarget() returned invalid shape/values (%s)",
-            target_arr.shape,
+    target = retargeter.retarget(landmarks)
+    if target is None:
+        _retarget_fail_warn("Hand retargeting: retargeter.retarget() returned None")
+        return prev_hand_cmd.copy(), False
+    target_arr = np.asarray(target, dtype=np.float64)
+    if target_arr.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(target_arr)):
+        raise ValueError(
+            "retargeter.retarget() must return a finite hand target with shape "
+            f"{HAND_JOINT_SHAPE}, got {target_arr.shape}"
         )
-    except Exception:
-        logger.warning("Hand retargeting failed — holding position", exc_info=True)
-
-    return prev_hand_cmd.copy(), False
+    observation_cache.target_qpos = target_arr.copy()
+    observation_cache.succeeded = True
+    return target_arr, True
 
 
 def reset_hand_retargeter(
@@ -195,10 +159,7 @@ def reset_hand_retargeter(
     with this reset backend.
     """
     if retargeter is not None:
-        try:
-            retargeter.reset(initial_qpos=hand_qpos)
-        except Exception:
-            logger.warning("Hand retargeter reset failed — previous optimizer state retained", exc_info=True)
+        retargeter.reset(initial_qpos=hand_qpos)
 
 
 def seed_hand_retargeter(

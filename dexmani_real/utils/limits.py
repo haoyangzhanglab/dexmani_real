@@ -73,36 +73,23 @@ def validate_hand_command_bounds(
     operational_upper: object,
     mechanical_lower: object,
     mechanical_upper: object,
-    rated_lower: object,
-    rated_upper: object,
 ) -> np.ndarray:
-    """Reject one hand endpoint outside its nested command/mechanical limits."""
+    """Reject one malformed or out-of-bounds hand endpoint."""
     command = np.asarray(hand_cmd, dtype=np.float64)
     op_lower = np.asarray(operational_lower, dtype=np.float64)
     op_upper = np.asarray(operational_upper, dtype=np.float64)
     mech_lower = np.asarray(mechanical_lower, dtype=np.float64)
     mech_upper = np.asarray(mechanical_upper, dtype=np.float64)
-    rated_low = np.asarray(rated_lower, dtype=np.float64)
-    rated_high = np.asarray(rated_upper, dtype=np.float64)
     if command.shape != HAND_JOINT_SHAPE:
         raise ValueError(
             f"hand command must have shape {HAND_JOINT_SHAPE}, got {command.shape}"
         )
     if not np.all(np.isfinite(command)):
         raise ValueError("hand command must be finite")
-    validate_hand_limit_nesting(
-        op_lower,
-        op_upper,
-        mech_lower,
-        mech_upper,
-        rated_low,
-        rated_high,
-        label="hand command",
-    )
     if np.any(command < op_lower - 1e-12) or np.any(command > op_upper + 1e-12):
         raise ValueError("hand command violates operational joint limits")
     if np.any(command < mech_lower - 1e-12) or np.any(command > mech_upper + 1e-12):
-        raise ValueError("hand command violates rated mechanical joint limits")
+        raise ValueError("hand command violates mechanical joint limits")
     return command.copy()
 
 

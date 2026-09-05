@@ -203,20 +203,14 @@ class HandOptimizer:
         self.last_qpos = warm_start.copy()
         try:
             q_s1 = self.opt_s1.optimize(warm_start)
-        except Exception:
+        except nlopt.RoundoffLimited:
             self._stage1_warn(
-                "HandOptimizer: Stage 1 NLopt failed — caller will hold last command",
+                "HandOptimizer: Stage 1 reached the NLopt roundoff limit — "
+                "caller will hold last command",
                 exc_info=True,
             )
             return None
-        try:
-            q_s1 = self._bounded_qpos(q_s1, "Stage 1 result")
-        except ValueError:
-            self._stage1_warn(
-                "HandOptimizer: Stage 1 returned invalid qpos — caller will hold last command",
-                exc_info=True,
-            )
-            return None
+        q_s1 = self._bounded_qpos(q_s1, "Stage 1 result")
 
         vecs = fingertip_positions[1:] - fingertip_positions[0]  # (finger_num-1, 3)
         dists = np.linalg.norm(vecs, axis=1)  # (finger_num-1,)
@@ -236,17 +230,14 @@ class HandOptimizer:
         self.qpos_stage1 = q_s1
         try:
             q_s2 = self.opt_s2.optimize(q_s1)
-        except Exception:
-            self._stage2_warn("HandOptimizer: Stage 2 NLopt failed — falling back to Stage 1", exc_info=True)
-            q_s2 = q_s1.copy()
-        try:
-            q_s2 = self._bounded_qpos(q_s2, "Stage 2 result")
-        except ValueError:
+        except nlopt.RoundoffLimited:
             self._stage2_warn(
-                "HandOptimizer: Stage 2 returned invalid qpos — falling back to Stage 1",
+                "HandOptimizer: Stage 2 reached the NLopt roundoff limit — "
+                "falling back to Stage 1",
                 exc_info=True,
             )
             q_s2 = q_s1.copy()
+        q_s2 = self._bounded_qpos(q_s2, "Stage 2 result")
 
         self.last_qpos = q_s2.copy()
         return q_s2

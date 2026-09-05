@@ -5,10 +5,12 @@ from __future__ import annotations
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
 
 from dexmani_real.config.runtime import resolve_runtime_config
+from dexmani_real.data.transforms import resize_rgb
 from dexmani_real.deployment.config import (
     FingertipAssemblerConfig,
     PolicyWorkerConfig,
@@ -27,13 +29,23 @@ from dexmani_real.deployment.observation import (
 )
 from dexmani_real.deployment.worker import (
     _align_state_history_to_reference_ns,
+    _rgb_frame_from_camera_record,
+    _resize_rgb_history,
     _read_tactile_provenance_history,
     _select_control_grid_reference_ns,
     _to_policy_observation,
 )
 from dexmani_real.ipc.channels import RuntimeChannelsConfig
-from dexmani_real.ipc.schema import HAND_TACTILE_DTYPE
+from dexmani_real.ipc.schema import (
+    ARM_STATE_DTYPE,
+    CAMERA_FRAME_HEADER_DTYPE,
+    HAND_STATE_DTYPE,
+    HAND_TACTILE_DTYPE,
+)
 from dexmani_real.planning.fingertip import compute_fingertip_points_xarm_base
+from dexmani_real.teleop.config import TeleopConfig
+from dexmani_real.teleop.episode_samples import _build_robot_state
+from dexmani_real.teleop.loop import _load_hand_kinematics
 
 
 def _field(name: str, runtime) -> SimpleNamespace:
@@ -113,6 +125,59 @@ class _HandFk:
 
 
 class MultimodalContractTest(unittest.TestCase):
+    def test_recording_hand_fk_must_be_ready_before_policy_ready(self) -> None:
+        hand_fk = Mock()
+        hand_fk.is_ready.return_value = False
+        with (
+            patch("dexmani_real.teleop.loop.HandKinematics", return_value=hand_fk),
+            self.assertRaisesRegex(RuntimeError, "not ready"),
+        ):
+            _load_hand_kinematics(TeleopConfig(), recording_enabled=True)
+
+    def test_valid_state_fk_errors_propagate_but_invalid_state_skips_fk(self) -> None:
+        arm_state = np.zeros(1, dtype=ARM_STATE_DTYPE)
+        arm_state["state_valid"][0] = 1
+        with patch(
+            "dexmani_real.teleop.episode_samples.make_arm_fk",
+            return_value=Mock(compute=Mock(side_effect=RuntimeError("arm fk failed"))),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "arm fk failed"):
+                _build_robot_state(arm_state, None)
+
+        arm_state["state_valid"][0] = 0
+        with patch("dexmani_real.teleop.episode_samples.make_arm_fk") as make_fk:
+            state = _build_robot_state(arm_state, None)
+        make_fk.assert_not_called()
+        self.assertTrue(np.all(np.isnan(state.eef_pos)))
+
+        arm_state["state_valid"][0] = 1
+        hand_state = np.zeros(1, dtype=HAND_STATE_DTYPE)
+        hand_state["connected"][0] = 1
+        hand_state["state_valid"][0] = 1
+        arm_fk = Mock()
+        arm_fk.compute.return_value = (
+            np.zeros(3),
+            np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+        )
+        with (
+            patch(
+                "dexmani_real.teleop.episode_samples.make_arm_fk",
+                return_value=arm_fk,
+            ),
+            patch(
+                "dexmani_real.teleop.episode_samples.compute_fingertip_points_xarm_base",
+                side_effect=RuntimeError("hand fk failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "hand fk failed"),
+        ):
+            _build_robot_state(
+                arm_state,
+                hand_state,
+                hk=Mock(),
+                T_eef_handbase_pos=np.zeros(3),
+                T_eef_handbase_quat_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+            )
+
     def test_observation_rejects_future_frames_and_camera_restart_mixing(self) -> None:
         kwargs = dict(
             observation_id=1,
@@ -139,12 +204,82 @@ class MultimodalContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "camera generation"):
             ObservationBatch(**kwargs, rgb_history=rgbs)
 
-    def test_real_compatibility_rejects_rgb_shape_drift(self) -> None:
+    def test_real_compatibility_accepts_rgb_policy_shape_distinct_from_camera(
+        self,
+    ) -> None:
         runtime = resolve_runtime_config()
         spec = _policy_spec(("joint_state", "rgb"), runtime)
-        spec.observation_fields[1].shape = (1, 1, 3)
-        with self.assertRaises(ValueError):
-            validate_policy_runtime_compatibility(spec, runtime)
+        spec.observation_fields[1].shape = (240, 320, 3)
+        validate_policy_runtime_compatibility(spec, runtime)
+
+    def test_real_compatibility_rejects_invalid_rgb_policy_shape(self) -> None:
+        runtime = resolve_runtime_config()
+        for shape, dtype in (
+            ((0, 320, 3), "uint8"),
+            ((240, 0, 3), "uint8"),
+            ((240, 320, 1), "uint8"),
+            ((240, 320, 3), "float32"),
+        ):
+            with self.subTest(shape=shape, dtype=dtype):
+                spec = _policy_spec(("joint_state", "rgb"), runtime)
+                spec.observation_fields[1].shape = shape
+                spec.observation_fields[1].dtype = dtype
+                with self.assertRaisesRegex(ValueError, "Policy rgb"):
+                    validate_policy_runtime_compatibility(spec, runtime)
+
+    def test_selected_rgb_resize_matches_offline_and_preserves_provenance(
+        self,
+    ) -> None:
+        raw = RgbFrame(
+            np.arange(4 * 6 * 3, dtype=np.uint8).reshape(4, 6, 3),
+            source_camera_sequence=7,
+            source_monotonic_ns=100,
+            publish_monotonic_ns=110,
+            camera_generation=2,
+        )
+        for height, width in ((4, 6), (2, 3)):
+            with self.subTest(height=height, width=width):
+                resized = _resize_rgb_history((raw,), height=height, width=width)[0]
+                np.testing.assert_array_equal(
+                    resized.values,
+                    resize_rgb(raw.values, height=height, width=width),
+                )
+                self.assertEqual(
+                    (
+                        resized.source_camera_sequence,
+                        resized.source_monotonic_ns,
+                        resized.publish_monotonic_ns,
+                        resized.camera_generation,
+                    ),
+                    (7, 100, 110, 2),
+                )
+
+    def test_rgb_reader_drops_invalid_camera_payload(self) -> None:
+        header = np.zeros(1, dtype=CAMERA_FRAME_HEADER_DTYPE)
+        header["source_monotonic_ns"][0] = 100
+        header["publish_monotonic_ns"][0] = 110
+        header["camera_generation"][0] = 1
+
+        class CameraRing:
+            def read_sequence(self, _sequence, *, modalities):
+                if modalities != ("rgb",):
+                    raise AssertionError(modalities)
+                return {
+                    "header": header.copy(),
+                    "rgb": np.zeros((4, 4, 4), dtype=np.uint8),
+                }
+
+        self.assertIsNone(
+            _rgb_frame_from_camera_record(
+                CameraRing(),
+                header,
+                ring_publish_ns=115,
+                sequence=1,
+                anchor_ns=120,
+                max_age_ns=30,
+                not_before_ns=50,
+            )
+        )
 
     def test_fingertip_eef_pose_reuse_matches_without_second_arm_fk(self) -> None:
         arm_fk = _ArmFk()

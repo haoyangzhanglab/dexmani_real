@@ -126,6 +126,7 @@ def _publish_feedback(
     read_failed: bool,
     accepted_target_action_id: int,
     accepted_target_monotonic_ns: int,
+    last_sdk_setpoint_accepted_monotonic_ns: int,
     commboard_err: np.ndarray,
     jointboard_err: np.ndarray,
     tipboard_err: np.ndarray,
@@ -146,6 +147,9 @@ def _publish_feedback(
     frame["accepted_target_action_id"][0] = int(accepted_target_action_id)
     frame["accepted_target_monotonic_ns"][0] = int(
         accepted_target_monotonic_ns
+    )
+    frame["last_sdk_setpoint_accepted_monotonic_ns"][0] = int(
+        last_sdk_setpoint_accepted_monotonic_ns
     )
     frame["commboard_err"][0] = commboard_err
     frame["jointboard_err"][0] = jointboard_err
@@ -218,6 +222,7 @@ def hand_loop(
         last_sdk_accepted_qpos = initial_state.qpos.copy()
         accepted_target_action_id = 0
         accepted_target_monotonic_ns = 0
+        last_sdk_setpoint_accepted_monotonic_ns = 0
         sdk_send_attempts = 0
         exact_target_accepts = 0
         crc_unconfirmed = 0
@@ -241,6 +246,9 @@ def hand_loop(
             read_failed=False,
             accepted_target_action_id=accepted_target_action_id,
             accepted_target_monotonic_ns=accepted_target_monotonic_ns,
+            last_sdk_setpoint_accepted_monotonic_ns=(
+                last_sdk_setpoint_accepted_monotonic_ns
+            ),
             commboard_err=initial_state.commboard_err,
             jointboard_err=initial_state.jointboard_err,
             tipboard_err=initial_state.tipboard_err,
@@ -284,6 +292,9 @@ def hand_loop(
                     read_failed=True,
                     accepted_target_action_id=accepted_target_action_id,
                     accepted_target_monotonic_ns=accepted_target_monotonic_ns,
+                    last_sdk_setpoint_accepted_monotonic_ns=(
+                        last_sdk_setpoint_accepted_monotonic_ns
+                    ),
                     commboard_err=last_state.commboard_err,
                     jointboard_err=last_state.jointboard_err,
                     tipboard_err=last_state.tipboard_err,
@@ -323,13 +334,33 @@ def hand_loop(
                 read_failed=False,
                 accepted_target_action_id=accepted_target_action_id,
                 accepted_target_monotonic_ns=accepted_target_monotonic_ns,
+                last_sdk_setpoint_accepted_monotonic_ns=(
+                    last_sdk_setpoint_accepted_monotonic_ns
+                ),
                 commboard_err=state.commboard_err,
                 jointboard_err=state.jointboard_err,
                 tipboard_err=state.tipboard_err,
                 source_monotonic_ns=last_source_ns,
             )
 
+            result = shared.coupled_cmd_ring.read_latest()
+            if result is None:
+                rate_mgr.wait()
+                continue
+            command, _published_ns, sequence = result
+            sequence_int = int(sequence)
+            if not bool(command["hand_present"][0]):
+                rate_mgr.wait()
+                continue
+            ticket = CoupledCommandTicket(
+                run_generation=int(command["run_generation"][0]),
+                ring_sequence=sequence_int,
+                valid_until_monotonic_ns=int(command["valid_until_monotonic_ns"][0]),
+            )
             permit = read_motion_permit(shared)
+            if permit.run_generation != ticket.run_generation:
+                rate_mgr.wait()
+                continue
             if permit.run_generation != stats_generation:
                 # Physical home uses an ARMED generation, then policy motion
                 # advances to a new RUNNING generation. Preserve the completed
@@ -352,20 +383,6 @@ def hand_loop(
                 last_sdk_accepted_qpos = state.qpos.copy()
                 stats_generation = permit.run_generation
                 stats_generation_was_running = permit.state is SafetyState.RUNNING
-            result = shared.coupled_cmd_ring.read_latest()
-            if result is None:
-                rate_mgr.wait()
-                continue
-            command, _published_ns, sequence = result
-            sequence_int = int(sequence)
-            if not bool(command["hand_present"][0]):
-                rate_mgr.wait()
-                continue
-            ticket = CoupledCommandTicket(
-                run_generation=int(command["run_generation"][0]),
-                ring_sequence=sequence_int,
-                valid_until_monotonic_ns=int(command["valid_until_monotonic_ns"][0]),
-            )
             if sequence_int == last_exact_target_sequence:
                 # An accepted exact target is an endpoint event, not a
                 # level-triggered command.  Retries remain allowed only until
@@ -411,12 +428,14 @@ def hand_loop(
             sdk_send_attempts += 1
             send_status = hand.send_action(bounded)
             if send_status is XHandSendStatus.ACCEPTED:
+                accepted_now_ns = time.monotonic_ns()
                 last_sdk_accepted_qpos = bounded.copy()
+                last_sdk_setpoint_accepted_monotonic_ns = accepted_now_ns
                 # ACK denotes SDK acceptance of the exact IPC endpoint, not
                 # physical convergence or acceptance of an intermediate step.
                 if np.array_equal(bounded, target):
                     accepted_target_action_id = action_id
-                    accepted_target_monotonic_ns = time.monotonic_ns()
+                    accepted_target_monotonic_ns = accepted_now_ns
                     exact_target_accepts += 1
                     last_exact_target_sequence = sequence_int
             elif send_status is XHandSendStatus.REJECTED:

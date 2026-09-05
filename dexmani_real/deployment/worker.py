@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.defaults import PolicyParams
+from dexmani_real.data.transforms import resize_rgb
 from dexmani_real.deployment.config import (
     FIXED_POLICY_RUNTIME_TARGET,
     FingertipAssemblerConfig,
@@ -401,7 +402,6 @@ def _rgb_frame_from_camera_record(
     anchor_ns: int,
     max_age_ns: int,
     not_before_ns: int,
-    expected_shape: tuple[int, int, int],
 ) -> RgbFrame | None:
     """Copy one verified, causal raw RGB frame from the camera ring."""
     record = header[0]
@@ -429,13 +429,6 @@ def _rgb_frame_from_camera_record(
     ):
         return None
     rgb = payload["rgb"]
-    if rgb.shape != expected_shape:
-        logger.warning(
-            "inference: RGB frame shape %s does not match policy contract %s",
-            rgb.shape,
-            expected_shape,
-        )
-        return None
     try:
         return RgbFrame(
             values=rgb,
@@ -456,7 +449,6 @@ def _read_rgb_history(
     max_age_ns: int,
     history_len: int,
     not_before_ns: int,
-    expected_shape: tuple[int, int, int],
 ) -> tuple[RgbFrame, ...]:
     """Read the verified causal RGB frames still resident in camera shared memory."""
     if history_len <= 0:
@@ -478,7 +470,6 @@ def _read_rgb_history(
             anchor_ns=anchor_ns,
             max_age_ns=max_age_ns,
             not_before_ns=not_before_ns,
-            expected_shape=expected_shape,
         )
         if frame is not None:
             frames.append(frame)
@@ -497,7 +488,6 @@ def _read_rgb_for_pointcloud_history(
     anchor_ns: int,
     max_age_ns: int,
     not_before_ns: int,
-    expected_shape: tuple[int, int, int],
 ) -> tuple[RgbFrame, ...]:
     """Read RGB frames with exactly the camera provenance selected for clouds."""
     try:
@@ -524,7 +514,6 @@ def _read_rgb_for_pointcloud_history(
             anchor_ns=anchor_ns,
             max_age_ns=max_age_ns,
             not_before_ns=not_before_ns,
-            expected_shape=expected_shape,
         )
         if frame is None or (
             frame.source_monotonic_ns != pointcloud.source_monotonic_ns
@@ -533,6 +522,22 @@ def _read_rgb_for_pointcloud_history(
             return ()
         frames.append(frame)
     return tuple(frames)
+
+
+def _resize_rgb_history(
+    frames: tuple[RgbFrame, ...], *, height: int, width: int
+) -> tuple[RgbFrame, ...]:
+    """Resize selected causal RGB frames into the Policy input shape."""
+    return tuple(
+        RgbFrame(
+            values=resize_rgb(frame.values, height=height, width=width),
+            source_camera_sequence=frame.source_camera_sequence,
+            source_monotonic_ns=frame.source_monotonic_ns,
+            publish_monotonic_ns=frame.publish_monotonic_ns,
+            camera_generation=frame.camera_generation,
+        )
+        for frame in frames
+    )
 
 
 def _select_camera_control_grid(
@@ -697,7 +702,6 @@ def _build_observation(
                     anchor_ns=anchor_ns,
                     max_age_ns=visual_history_max_age_ns,
                     not_before_ns=run_started_ns,
-                    expected_shape=rgb_shape,
                 )
     elif rgb_requested:
         assert rgb_shape is not None
@@ -707,7 +711,6 @@ def _build_observation(
             max_age_ns=visual_history_max_age_ns,
             history_len=shared.camera_ring.maxlen,
             not_before_ns=run_started_ns,
-            expected_shape=rgb_shape,
         )
         selected_rgb, logical_step_ns = _select_camera_control_grid(
             all_rgb,
@@ -728,6 +731,13 @@ def _build_observation(
             anchor_ns=anchor_ns,
             history_len=horizon,
             step_dt_ns=step_dt_ns,
+        )
+    if rgb_requested and len(rgb_history) == horizon:
+        assert rgb_shape is not None
+        rgb_history = _resize_rgb_history(
+            rgb_history,
+            height=int(rgb_shape[0]),
+            width=int(rgb_shape[1]),
         )
     if getattr(policy_spec, "requires_hand") is True:
         if hand_state_requested:

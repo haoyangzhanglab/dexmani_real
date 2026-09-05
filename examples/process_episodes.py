@@ -2,7 +2,7 @@
 """Usage: ``python examples/process_episodes.py INPUT_ROOT [--profile PROFILE]``.
 
 Offline CLI that audits and compacts one task's depth-to-color aligned raw-v24
-episodes into processed HDF5 v11 files, one per source episode.
+episodes into processed HDF5 v12 files, one per source episode.
 
 Directory mapping: ``episodes/<task>/episode_*`` (raw) is published to
 ``episodes_processed/<task>/episode_*.h5``.  Passing a single episode
@@ -101,7 +101,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Audit and compact depth-to-color aligned raw-v24 Real episodes into one "
-            "processed-v11 "
+            "processed-v12 "
             "HDF5 per source; seriously broken episodes are skipped with a warning."
         )
     )
@@ -155,23 +155,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument("--min-full-windows", type=int, default=1)
-    parser.add_argument("--max-camera-age-s", type=float, default=0.25)
+    parser.add_argument(
+        "--max-camera-age-s",
+        type=float,
+        default=None,
+        help="Override runtime.camera.max_frame_age_s for this processing run.",
+    )
     parser.add_argument(
         "--max-observation-skew-s",
         type=float,
-        default=0.10,
-        help=(
-            "Maximum source-time skew for visual observations; must match the "
-            "deployment observation contract (default: 0.10)."
-        ),
-    )
-    parser.add_argument(
-        "--endpoint-delta-tolerance-rad",
-        type=float,
         default=None,
         help=(
-            "Numerical slack for the reject-only endpoint delta contract; "
-            "defaults to runtime.policy.endpoint_delta_tolerance_rad."
+            "Override runtime.policy.max_observation_skew_s for visual observations."
         ),
     )
     parser.add_argument(
@@ -237,8 +232,6 @@ def _config(
     overrides: dict[str, object] = {
         "horizon": args.horizon,
         "min_full_windows": args.min_full_windows,
-        "max_camera_age_s": args.max_camera_age_s,
-        "max_observation_skew_s": args.max_observation_skew_s,
         "temporal_quality": TemporalQualityConfig(
             policy=policy,
             abrupt_arm_step_rad=args.abrupt_arm_step_rad,
@@ -248,9 +241,10 @@ def _config(
             runtime.pointcloud, num_points=args.pointcloud_num_points
         ),
     }
-    endpoint_delta_tolerance_rad = args.endpoint_delta_tolerance_rad
-    if endpoint_delta_tolerance_rad is not None:
-        overrides["endpoint_delta_tolerance_rad"] = endpoint_delta_tolerance_rad
+    if args.max_camera_age_s is not None:
+        overrides["max_camera_age_s"] = args.max_camera_age_s
+    if args.max_observation_skew_s is not None:
+        overrides["max_observation_skew_s"] = args.max_observation_skew_s
     return ProcessingConfig.from_runtime(
         runtime,
         profile=profile,
@@ -313,9 +307,6 @@ def _rejection_detail(decision: dict) -> str:
             "; camera-source policy observation is invalid on "
             f"{invalid_alignment} row(s)"
         )
-    action_limit = int(counts.get("deployment_action_limit", 0))
-    if action_limit:
-        return f"; action endpoint delta limit is exceeded on {action_limit} row(s)"
     return ""
 
 

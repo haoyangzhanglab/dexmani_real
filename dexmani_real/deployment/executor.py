@@ -15,7 +15,6 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import hand as hand_defaults
 from dexmani_real.config.runtime import ResolvedRuntimeConfig
 from dexmani_real.control.action import ActionCandidate
 from dexmani_real.control.publication import (
@@ -76,7 +75,6 @@ from dexmani_real.utils.feedback import (
     diagnose_arm_feedback,
     diagnose_hand_feedback,
 )
-from dexmani_real.utils.limits import validate_hand_limit_nesting
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
@@ -96,6 +94,7 @@ class _CommandProgress:
     latest_published_action_id: int | None = None
     arm_accepted_action_id: int | None = None
     hand_accepted_action_id: int | None = None
+    hand_last_sdk_setpoint_accepted_ns: int | None = None
     arm_last_progress_ns: int | None = None
     hand_last_progress_ns: int | None = None
 
@@ -104,6 +103,7 @@ class _CommandProgress:
         self.latest_published_action_id = None
         self.arm_accepted_action_id = None
         self.hand_accepted_action_id = None
+        self.hand_last_sdk_setpoint_accepted_ns = None
         self.arm_last_progress_ns = None
         self.hand_last_progress_ns = None
 
@@ -115,20 +115,45 @@ class _CommandProgress:
         hand_action_id: int | None,
         now_ns: int,
         timeout_ns: int,
+        hand_setpoint_accepted_ns: int | None = None,
     ) -> str | None:
         if generation != self.generation:
             return "command progress generation does not match active run"
-        for worker, action_id in (("arm", arm_action_id), ("hand", hand_action_id)):
-            if action_id is None:
-                continue
-            previous = getattr(self, f"{worker}_accepted_action_id")
-            if action_id < 0:
-                return f"{worker} command progress is negative"
-            if previous is not None and action_id < previous:
-                return f"{worker} command progress regressed"
-            setattr(self, f"{worker}_accepted_action_id", action_id)
-            if previous is None or action_id > previous:
-                setattr(self, f"{worker}_last_progress_ns", now_ns)
+        if arm_action_id is not None:
+            previous_arm_id = self.arm_accepted_action_id
+            if arm_action_id < 0:
+                return "arm command progress is negative"
+            if previous_arm_id is not None and arm_action_id < previous_arm_id:
+                return "arm command progress regressed"
+            self.arm_accepted_action_id = arm_action_id
+            if previous_arm_id is None or arm_action_id > previous_arm_id:
+                self.arm_last_progress_ns = now_ns
+
+        if hand_action_id is not None:
+            previous_hand_id = self.hand_accepted_action_id
+            if hand_action_id < 0:
+                return "hand command progress is negative"
+            if previous_hand_id is not None and hand_action_id < previous_hand_id:
+                return "hand command progress regressed"
+            self.hand_accepted_action_id = hand_action_id
+
+        if hand_setpoint_accepted_ns is not None:
+            previous_setpoint_ns = self.hand_last_sdk_setpoint_accepted_ns
+            if hand_setpoint_accepted_ns < 0:
+                return "hand SDK setpoint progress is negative"
+            if hand_setpoint_accepted_ns > now_ns:
+                return "hand SDK setpoint progress is in the future"
+            if (
+                previous_setpoint_ns is not None
+                and hand_setpoint_accepted_ns < previous_setpoint_ns
+            ):
+                return "hand SDK setpoint progress regressed"
+            self.hand_last_sdk_setpoint_accepted_ns = hand_setpoint_accepted_ns
+            if (
+                previous_setpoint_ns is not None
+                and hand_setpoint_accepted_ns > previous_setpoint_ns
+            ):
+                self.hand_last_progress_ns = hand_setpoint_accepted_ns
 
         latest = self.latest_published_action_id
         if latest is None:
@@ -284,7 +309,6 @@ def _build_policy_safety_gate(runtime: ResolvedRuntimeConfig) -> SafetyGate:
         hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
         hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
         workspace_check=_build_policy_workspace_check(runtime),
-        max_arm_delta_rad=float(runtime.arm.max_servo_command_jump_rad),
         max_hand_delta_rad=float(runtime.policy.hand_max_action_jump_rad),
         endpoint_delta_tolerance_rad=float(runtime.policy.endpoint_delta_tolerance_rad),
     )
@@ -297,7 +321,6 @@ def decode_policy_action(
     *,
     previous_arm_command_qpos: np.ndarray | None,
     planner: XArm7MotionPlanner | None,
-    runtime: ResolvedRuntimeConfig,
 ) -> tuple[np.ndarray | None, np.ndarray, str]:
     """Interpret one already-validated flat action and perform EE IK when needed.
 
@@ -311,13 +334,7 @@ def decode_policy_action(
         else previous_arm_command_qpos
     )
     if policy_spec.action_key == "action":
-        arm_qpos = wrap_nearest_equivalent(
-            action[:7],
-            reference,
-            runtime.arm.joint_limit_lower,
-            runtime.arm.joint_limit_upper,
-        )
-        return arm_qpos, action[7:19], ""
+        return np.asarray(action[:7], dtype=np.float64), action[7:19], ""
 
     hand_qpos = action[9:21]
     if planner is None:
@@ -335,17 +352,49 @@ def decode_policy_action(
     return np.asarray(result.qpos, dtype=np.float64), hand_qpos, ""
 
 
+def _clip_policy_arm_action(
+    target_arm_qpos: np.ndarray,
+    reference_arm_qpos: np.ndarray,
+    runtime: ResolvedRuntimeConfig,
+) -> tuple[np.ndarray | None, bool, str]:
+    """Canonicalize, admit, then clip one learned-policy arm endpoint."""
+    lower = np.asarray(runtime.arm.joint_limit_lower, dtype=np.float64)
+    upper = np.asarray(runtime.arm.joint_limit_upper, dtype=np.float64)
+    canonical = wrap_nearest_equivalent(
+        target_arm_qpos,
+        reference_arm_qpos,
+        runtime.arm.joint_limit_lower,
+        runtime.arm.joint_limit_upper,
+    )
+    if np.any(canonical < lower) or np.any(canonical > upper):
+        return None, False, "arm joint limit violation"
+
+    delta = canonical - reference_arm_qpos
+    limit = float(runtime.policy.arm_action_delta_clip_rad)
+    clipped_delta = np.clip(delta, -limit, limit)
+    clipped = bool(np.any(clipped_delta != delta))
+    if clipped:
+        logger.debug(
+            "executor: clipped policy arm spike raw_max_delta=%.6f "
+            "clipped_max_delta=%.6f",
+            float(np.max(np.abs(delta))),
+            float(np.max(np.abs(clipped_delta))),
+        )
+    return reference_arm_qpos + clipped_delta, clipped, ""
+
+
 def _read_command_progress(
     shared: RuntimeChannels,
     runtime: ResolvedRuntimeConfig,
     *,
     now_ns: int,
-) -> tuple[int | None, int | None, str | None]:
+) -> tuple[int | None, int | None, int | None, str | None]:
     """Read healthy worker watermarks; stale feedback means no new progress."""
     arm_state = read_arm_state_dict(shared)
     hand_state = read_hand_state_dict(shared)
     arm_action_id: int | None = None
     hand_action_id: int | None = None
+    hand_setpoint_accepted_ns: int | None = None
     if arm_state is not None:
         issue = diagnose_arm_feedback(
             connected=bool(arm_state["connected"]),
@@ -360,7 +409,7 @@ def _read_command_progress(
         if issue is None:
             arm_action_id = int(arm_state["last_cmd_seq"])
         elif issue.code is not FeedbackIssueCode.STALE:
-            return None, None, f"fatal arm feedback: {issue.code.value}"
+            return None, None, None, f"fatal arm feedback: {issue.code.value}"
     if hand_state is not None:
         issue = diagnose_hand_feedback(
             connected=bool(hand_state["connected"]),
@@ -372,9 +421,12 @@ def _read_command_progress(
         )
         if issue is None:
             hand_action_id = int(hand_state["accepted_target_action_id"])
+            hand_setpoint_accepted_ns = int(
+                hand_state["last_sdk_setpoint_accepted_monotonic_ns"]
+            )
         elif issue.code is not FeedbackIssueCode.STALE:
-            return None, None, f"fatal hand feedback: {issue.code.value}"
-    return arm_action_id, hand_action_id, None
+            return None, None, None, f"fatal hand feedback: {issue.code.value}"
+    return arm_action_id, hand_action_id, hand_setpoint_accepted_ns, None
 
 
 def _physical_start_pose_rejection(
@@ -611,8 +663,10 @@ class PolicyExecutor:
         if not self.execute:
             return True
         try:
-            arm_id, hand_id, feedback_fault = _read_command_progress(
-                self.shared, self.runtime, now_ns=now_ns
+            arm_id, hand_id, hand_setpoint_accepted_ns, feedback_fault = (
+                _read_command_progress(
+                    self.shared, self.runtime, now_ns=now_ns
+                )
             )
         except Exception as exc:
             self._fault(f"command progress feedback failed: {type(exc).__name__}")
@@ -625,6 +679,7 @@ class PolicyExecutor:
             generation=self.run_generation,
             arm_action_id=arm_id,
             hand_action_id=hand_id,
+            hand_setpoint_accepted_ns=hand_setpoint_accepted_ns,
             now_ns=now_ns,
             timeout_ns=self.command_progress_timeout_ns,
         )
@@ -802,12 +857,23 @@ class PolicyExecutor:
             np.asarray(arm_state["qpos"], dtype=np.float64),
             previous_arm_command_qpos=self.previous_arm_command_qpos,
             planner=self.ee_planner,
-            runtime=self.runtime,
         )
         if arm_qpos is None:
             if self.policy_spec.action_key == "action_ee":
                 self.stats.ik_rejection_count += 1
             return None, rejection or "EE action has no usable IK solution"
+        reference_arm_qpos = (
+            np.asarray(arm_state["qpos"], dtype=np.float64)
+            if self.previous_arm_command_qpos is None
+            else self.previous_arm_command_qpos
+        )
+        arm_qpos, clipped, rejection = _clip_policy_arm_action(
+            arm_qpos, reference_arm_qpos, self.runtime
+        )
+        if arm_qpos is None:
+            return None, rejection
+        if clipped:
+            self.stats.arm_action_clip_count += 1
         return (arm_qpos, hand_qpos), None
 
     def _publish_due_action(
@@ -851,7 +917,6 @@ class PolicyExecutor:
             hand_feedback_max_age_s=float(
                 self.runtime.safety.heartbeat_timeouts["hand"]
             ),
-            arm_delta_reference_qpos=self.previous_arm_command_qpos,
             hand_delta_reference_qpos=self.previous_hand_command_qpos,
             hand_mechanical_lower_rad=np.asarray(
                 self.runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
@@ -899,10 +964,10 @@ class PolicyExecutor:
             self.progress.record_publication(
                 published_candidate.action_id, publication_ns
             )
-            assert published_candidate.arm_qpos is not None
-            assert published_candidate.hand_qpos is not None
-            self.previous_arm_command_qpos = published_candidate.arm_qpos.copy()
-            self.previous_hand_command_qpos = published_candidate.hand_qpos.copy()
+        assert published_candidate.arm_qpos is not None
+        assert published_candidate.hand_qpos is not None
+        self.previous_arm_command_qpos = published_candidate.arm_qpos.copy()
+        self.previous_hand_command_qpos = published_candidate.hand_qpos.copy()
         self._consume_control_slot(due_ns, publication_ns)
         if self.last_publication_ns is not None:
             interval_ms = (publication_ns - self.last_publication_ns) / 1e6
@@ -1033,15 +1098,6 @@ def policy_executor_loop(
     max_running_s: float | None = None,
 ) -> None:
     """Process entry point for one lightweight policy executor."""
-    validate_hand_limit_nesting(
-        runtime.hand.qpos_min_rad,
-        runtime.hand.qpos_max_rad,
-        runtime.hand.mechanical_qpos_min_rad,
-        runtime.hand.mechanical_qpos_max_rad,
-        hand_defaults.mechanical_qpos_min_rad,
-        hand_defaults.mechanical_qpos_max_rad,
-        label="policy executor hand",
-    )
     PolicyExecutor(
         shared,
         runtime,

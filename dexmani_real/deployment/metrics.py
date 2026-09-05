@@ -32,6 +32,7 @@ class PolicyStats:
     observation_skew_ms: deque[float] = field(default_factory=_samples)
     schedule_lateness_ms: deque[float] = field(default_factory=_samples)
     publication_interval_ms: deque[float] = field(default_factory=_samples)
+    arm_action_clip_count: int = 0
     safety_rejection_count: int = 0
     command_progress_timeout_count: int = 0
     ik_rejection_count: int = 0
@@ -66,6 +67,7 @@ class PolicyStats:
     def snapshot(self) -> dict[str, int | float]:
         """Return latest timings and the failure counts since the last report."""
         result: dict[str, int | float] = {
+            "arm_action_clip_count": self.arm_action_clip_count,
             "safety_rejection_count": self.safety_rejection_count,
             "command_progress_timeout_count": self.command_progress_timeout_count,
         }
@@ -93,6 +95,7 @@ class PolicyStats:
         )
         log = logger.debug if debug else logger.info
         log("%s: %s", prefix, rendered)
+        self.arm_action_clip_count = 0
         self.safety_rejection_count = 0
         self.command_progress_timeout_count = 0
         self.ik_rejection_count = 0

@@ -75,8 +75,16 @@ def _validate_real_observation_capability(policy_spec: Any) -> tuple[Any, ...]:
                 raise ValueError(
                     "Policy point_cloud must be float32 [N, 6] with a supported N"
                 )
-        elif name == "rgb" and (len(shape) != 3 or shape[2] != 3 or dtype != "uint8"):
-            raise ValueError("Policy rgb must be uint8 [H, W, 3]")
+        elif name == "rgb" and (
+            len(shape) != 3
+            or shape[2] != 3
+            or dtype != "uint8"
+            or shape[0] <= 0
+            or shape[1] <= 0
+        ):
+            raise ValueError(
+                "Policy rgb must be uint8 [H, W, 3] with positive H and W"
+            )
     return fields
 
 
@@ -114,13 +122,6 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
         raise ValueError(
             "Policy point_cloud shape does not match Real pointcloud config"
         )
-    rgb = fields_by_name.get("rgb")
-    if rgb is not None and rgb.shape != (
-        int(runtime.camera.height),
-        int(runtime.camera.width),
-        3,
-    ):
-        raise ValueError("Policy rgb shape does not match Real camera config")
 
 
 @dataclass(frozen=True)

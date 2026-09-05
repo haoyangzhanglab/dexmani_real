@@ -17,10 +17,15 @@ policy/task/experiment
 
 该目录必须包含 `config.yaml`，以及固定 selector
 `checkpoints/deployment_latest.pt`。没有隐式 `latest` experiment 或时间戳猜测。
-所有 artifact 使用 `dexmani.deployment.v2`，根 payload 只有 `_format`、`contract` 和
+所有 artifact 使用 `dexmani.deployment.v3`，根 payload 只有 `_format`、`contract` 和
 `weights`。其中有序 `data_contract.observation_fields` 是观测输入的唯一持久化声明；每项记录
 名称、raw shape、dtype 和语义。它们都要求 xArm7 + XHand、兼容的控制周期与单槽 Prediction IPC，
 使用 point cloud 时还必须匹配点数和 xyzrgb feature。
+
+RGB 有三个明确的尺寸 owner：相机 ring 保存原生帧；Real 在完成因果历史选择和跨模态
+provenance 配对后 resize 到 PolicySpec 的 raw RGB shape；Policy 再执行 artifact 记录的
+validation resize/center crop，最后交给模型 ImageProcessor。训练随机增强不进入部署路径。
+v2 artifact 不受支持，必须用当前 exporter 重新导出。
 
 ## 2. 从离线检查到真机
 
@@ -107,10 +112,14 @@ watchdog 属于 `ResolvedRuntimeConfig.policy`。模型 action/observation shape
 推理，较新的同 generation Prediction latest-wins 替换尚未消费的 suffix。executor 以
 `executor_poll_hz=128` 轮询，每轮最多发布一个到期 endpoint，绝不追赶过期 slot。
 
-策略 arm endpoint 经过 `arm.max_servo_command_jump_rad=20°` 的 reject-only SafetyGate；hand target
-经过独立的 `policy.hand_max_action_jump_rad=1.0 rad` reject-only 检查。首条动作以 measured feedback 为
-reference，后续动作以上一条成功发布的 target 为 reference；通过后原样发布。hand worker 仍在 SDK
-边界用 `hand.hand_max_delta_rad_per_tick` 生成受限中间 setpoint。任一 coupled target 被拒绝时均不发布。
+策略 arm endpoint 在 decode/IK 后先选择限位内最近的 `2π` 等价表示，非法绝对限位仍拒绝，
+再按 `policy.arm_action_delta_clip_rad=20°` 抑制 neural spike。workspace 检查从 measured
+feedback 到实际 clipped endpoint 的插值路径。hand target 经过独立的
+`policy.hand_max_action_jump_rad=1.0 rad` reject-only 检查。首条动作以 measured feedback 为
+reference，后续动作以上一条成功物理发布（run）或完整 publishability 通过（shadow）的
+logical target 为 reference。hand worker 仍在 SDK 边界用 `hand.hand_max_delta_rad_per_tick`
+生成受限中间 setpoint；arm worker 仍以独立的 `arm.max_servo_command_jump_rad=20°`
+拒绝 latest-wins 等情形留下的过大物理 jump。任一 coupled target 被拒绝时均不发布，reference 不推进。
 `--max-action-steps N` 限制每个 episode 的 terminal action steps；达到 N 时以 `TRUNCATED`
 结束，而不是触发 FAULT。示例：
 
@@ -138,7 +147,7 @@ point-cloud observation 保留 `source <= publish <= anchor`、run-start 下界�
 ## 5. 运行诊断与失败语义
 
 inference 和 `PolicyExecutor` 周期性输出 observation age/skew、inference、Prediction publish/ingest/
-stale/drop、endpoint、SafetyGate/IK reject、publication 与 command-progress 等 live metrics。
+stale/drop、arm spike clip 次数、endpoint、SafetyGate/IK reject、publication 与 command-progress 等 live metrics。
 `PolicyExecutor` 在每个 episode 结束时另输出一条 `episode summary`，包含 generation、状态、原因、
 duration、累计 counters 和固定容量 timing quantiles。
 

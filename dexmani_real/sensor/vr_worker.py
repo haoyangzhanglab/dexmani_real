@@ -167,7 +167,6 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
             frame["source_ts_ns"][0] = np.uint64(event.source_ts_ns or 0)
             frame["sequence_id"][0] = np.uint64(event.sequence_id)
             frame["source_frame_seq"][0] = np.uint64(event.source_frame_seq or 0)
-            frame["local_recv_ns"][0] = np.uint64(time.monotonic_ns())
             frame["side"][0] = np.int32(0 if "right" in _side_str else -1)
 
             shared.vr_ring.write(frame)
