@@ -12,8 +12,8 @@ import numpy as np
 
 from dexmani_real.config.runtime import resolve_runtime_config
 from dexmani_real.control.action import ActionCandidate
-from dexmani_real.control.publication import PreparedCommand
-from dexmani_real.control.safety_gate import GateRejectCode
+from dexmani_real.control.publication import PreparedCommand, PublishResult
+from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
 from dexmani_real.deployment.config import PolicyDeploymentConfig
 from dexmani_real.deployment.contracts import Prediction
 from dexmani_real.deployment.executor import (
@@ -30,12 +30,21 @@ from dexmani_real.deployment.executor import (
     decode_policy_action,
 )
 from dexmani_real.deployment.metrics import PolicyStats
-from dexmani_real.runtime.safety import SafetyState, StopRequest, request_policy_stop
+from dexmani_real.runtime.safety import (
+    CoupledCommandTicket,
+    SafetyState,
+    StopRequest,
+    request_policy_stop,
+)
 
 
 class _Value:
     def __init__(self, value: int | bool) -> None:
         self.value = value
+        self._lock = threading.Lock()
+
+    def get_lock(self) -> threading.Lock:
+        return self._lock
 
 
 class _FakeShared:
@@ -50,6 +59,7 @@ class _FakeShared:
         self.safety_state = _Value(int(SafetyState.ARMED))
         self.run_generation = _Value(0)
         self.run_started_monotonic_ns = _Value(0)
+        self.arm_command_seq = _Value(0)
         self.motion_lock = threading.Lock()
         self.inference_request = threading.Event()
         self.heartbeats: list[tuple[str, float]] = []
@@ -101,6 +111,8 @@ def _executor(
     action_key: str = "action",
     max_action_steps: int | None = None,
     max_running_s: float | None = None,
+    runtime_data: dict[str, object] | None = None,
+    execute: bool = False,
 ) -> PolicyExecutor:
     with (
         patch(
@@ -114,15 +126,98 @@ def _executor(
     ):
         return PolicyExecutor(
             _FakeShared(),
-            resolve_runtime_config(),
+            resolve_runtime_config(data=runtime_data),
             _policy_spec(action_key),
             PolicyDeploymentConfig(
                 inference_mode=mode,
                 max_action_steps=max_action_steps,
             ),
-            execute=False,
+            execute=execute,
             max_running_s=max_running_s,
         )
+
+
+def _policy_step_executor(
+    *, hand_max_action_jump_rad: float = 0.3, prediction_steps: int = 8
+) -> PolicyExecutor:
+    executor = _executor(
+        runtime_data={"policy": {"hand_max_action_jump_rad": hand_max_action_jump_rad}},
+        execute=True,
+    )
+    runtime = executor.runtime
+    executor.gate = SafetyGate(
+        arm_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
+        arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
+        hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
+        hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
+        max_arm_delta_rad=runtime.arm.max_servo_command_jump_rad,
+        max_hand_delta_rad=runtime.policy.hand_max_action_jump_rad,
+        endpoint_delta_tolerance_rad=runtime.policy.endpoint_delta_tolerance_rad,
+    )
+    now_ns = time.monotonic_ns()
+    executor.shared.safety_state.value = int(SafetyState.RUNNING)
+    executor.shared.run_generation.value = 1
+    executor.run_generation = 1
+    executor.run_started_ns = now_ns
+    executor.progress.reset(1)
+    executor.progress.observe(
+        generation=1,
+        arm_action_id=0,
+        hand_action_id=0,
+        now_ns=now_ns,
+        timeout_ns=executor.command_progress_timeout_ns,
+    )
+    executor.max_source_age_ns = 10**12
+    executor.active_prediction = _prediction(
+        source_ns=now_ns,
+        logical_ns=now_ns,
+        steps=prediction_steps,
+    )
+    executor.schedule_base_ns = now_ns
+    return executor
+
+
+def _attempt_policy_step(
+    executor: PolicyExecutor,
+    *,
+    arm_target: np.ndarray,
+    hand_target: np.ndarray,
+    measured_hand: np.ndarray,
+) -> Mock:
+    executor._decode_due_action = Mock(
+        return_value=((arm_target.copy(), hand_target.copy()), None)
+    )
+    arm_feedback = SimpleNamespace(qpos=np.zeros(7, dtype=np.float64))
+    hand_feedback = SimpleNamespace(qpos=measured_hand.copy())
+    publication_ns = time.monotonic_ns()
+    publish = Mock(
+        return_value=PublishResult(
+            True,
+            ticket=CoupledCommandTicket(
+                run_generation=1,
+                ring_sequence=1,
+                valid_until_monotonic_ns=publication_ns + 10**9,
+                published_monotonic_ns=publication_ns,
+            ),
+        )
+    )
+    with (
+        patch(
+            "dexmani_real.control.publication._read_arm_feedback",
+            return_value=(arm_feedback, "", None),
+        ),
+        patch(
+            "dexmani_real.control.publication.read_hand_feedback",
+            return_value=(hand_feedback, "", None),
+        ),
+        patch("dexmani_real.deployment.executor.publish_command", publish),
+    ):
+        executor._publish_due_action(
+            np.zeros(19, dtype=np.float64),
+            scheduled_target_ns=publication_ns,
+            due_ns=publication_ns,
+        )
+    return publish
 
 
 class PolicyExecutorBehaviorTest(unittest.TestCase):
@@ -236,6 +331,194 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
             planner_factory.call_args.kwargs["teleop_profile"].check_self_collision
         )
 
+    def test_policy_gate_uses_arm_jump_guard_not_teleop_delta(self) -> None:
+        defaults = resolve_runtime_config()
+        self.assertAlmostEqual(
+            defaults.arm.max_servo_command_jump_rad, np.deg2rad(20.0)
+        )
+        self.assertAlmostEqual(
+            defaults.policy.arm_max_delta_rad_per_tick, np.deg2rad(8.0)
+        )
+        self.assertEqual(defaults.policy.hand_max_action_jump_rad, 1.0)
+        runtime = resolve_runtime_config(
+            data={
+                "arm": {"max_servo_command_jump_rad": 0.4},
+                "policy": {
+                    "arm_max_delta_rad_per_tick": 0.05,
+                    "hand_max_action_jump_rad": 0.45,
+                },
+            }
+        )
+        with patch(
+            "dexmani_real.deployment.executor._build_policy_workspace_check",
+            return_value=lambda _start, _end: True,
+        ):
+            gate = _build_policy_safety_gate(runtime)
+
+        np.testing.assert_array_equal(gate.max_arm_delta_rad, np.full(7, 0.4))
+        np.testing.assert_array_equal(gate.max_hand_delta_rad, np.full(12, 0.45))
+        self.assertNotEqual(
+            runtime.arm.max_servo_command_jump_rad,
+            runtime.policy.arm_max_delta_rad_per_tick,
+        )
+
+    def test_policy_hand_target_is_published_exactly_without_teleop_shaping(
+        self,
+    ) -> None:
+        executor = _policy_step_executor(hand_max_action_jump_rad=0.5)
+        lower = np.asarray(executor.runtime.hand.qpos_min_rad, dtype=np.float64)
+        upper = np.asarray(executor.runtime.hand.qpos_max_rad, dtype=np.float64)
+        measured = (lower + upper) / 2.0
+        target = measured.copy()
+        target[0] += 0.4
+
+        publish = _attempt_policy_step(
+            executor,
+            arm_target=np.zeros(7, dtype=np.float64),
+            hand_target=target,
+            measured_hand=measured,
+        )
+
+        publish.assert_called_once()
+        published = publish.call_args.args[1]
+        np.testing.assert_array_equal(published.hand_qpos, target)
+        self.assertEqual(executor.runtime.hand.hand_max_delta_rad_per_tick, 0.3)
+
+    def test_first_policy_hand_action_uses_measured_feedback(self) -> None:
+        executor = _policy_step_executor()
+        lower = np.asarray(executor.runtime.hand.qpos_min_rad, dtype=np.float64)
+        upper = np.asarray(executor.runtime.hand.qpos_max_rad, dtype=np.float64)
+        measured = (lower + upper) / 2.0
+        target = measured.copy()
+        target[0] += 0.31
+
+        publish = _attempt_policy_step(
+            executor,
+            arm_target=np.zeros(7, dtype=np.float64),
+            hand_target=target,
+            measured_hand=measured,
+        )
+
+        publish.assert_not_called()
+        self.assertIsNone(executor.previous_hand_command_qpos)
+
+    def test_later_policy_hand_action_uses_previous_published_target(self) -> None:
+        executor = _policy_step_executor()
+        lower = np.asarray(executor.runtime.hand.qpos_min_rad, dtype=np.float64)
+        upper = np.asarray(executor.runtime.hand.qpos_max_rad, dtype=np.float64)
+        previous = (lower + upper) / 2.0
+        first_publish = _attempt_policy_step(
+            executor,
+            arm_target=np.zeros(7, dtype=np.float64),
+            hand_target=previous,
+            measured_hand=previous,
+        )
+        first_publish.assert_called_once()
+
+        measured_lag = previous.copy()
+        measured_lag[0] -= 0.2
+        target = previous.copy()
+        target[0] += 0.2
+        self.assertGreater(abs(target[0] - measured_lag[0]), 0.3)
+        second_publish = _attempt_policy_step(
+            executor,
+            arm_target=np.zeros(7, dtype=np.float64),
+            hand_target=target,
+            measured_hand=measured_lag,
+        )
+
+        second_publish.assert_called_once()
+        published = second_publish.call_args.args[1]
+        np.testing.assert_array_equal(published.hand_qpos, target)
+        np.testing.assert_array_equal(executor.previous_hand_command_qpos, target)
+
+    def test_rejected_policy_step_does_not_advance_hand_reference(self) -> None:
+        executor = _policy_step_executor()
+        lower = np.asarray(executor.runtime.hand.qpos_min_rad, dtype=np.float64)
+        upper = np.asarray(executor.runtime.hand.qpos_max_rad, dtype=np.float64)
+        accepted = (lower + upper) / 2.0
+        _attempt_policy_step(
+            executor,
+            arm_target=np.zeros(7, dtype=np.float64),
+            hand_target=accepted,
+            measured_hand=accepted,
+        )
+
+        rejected = accepted.copy()
+        rejected[0] += 0.31
+        rejected_publish = _attempt_policy_step(
+            executor,
+            arm_target=np.zeros(7, dtype=np.float64),
+            hand_target=rejected,
+            measured_hand=accepted,
+        )
+        rejected_publish.assert_not_called()
+        np.testing.assert_array_equal(executor.previous_hand_command_qpos, accepted)
+
+        next_target = accepted.copy()
+        next_target[0] -= 0.1
+        self.assertGreater(abs(next_target[0] - rejected[0]), 0.3)
+        next_publish = _attempt_policy_step(
+            executor,
+            arm_target=np.zeros(7, dtype=np.float64),
+            hand_target=next_target,
+            measured_hand=rejected,
+        )
+        next_publish.assert_called_once()
+
+    def test_policy_hand_reference_continues_across_prediction_chunks(self) -> None:
+        executor = _policy_step_executor(prediction_steps=1)
+        lower = np.asarray(executor.runtime.hand.qpos_min_rad, dtype=np.float64)
+        upper = np.asarray(executor.runtime.hand.qpos_max_rad, dtype=np.float64)
+        chunk_a_last = (lower + upper) / 2.0
+        _attempt_policy_step(
+            executor,
+            arm_target=np.zeros(7, dtype=np.float64),
+            hand_target=chunk_a_last,
+            measured_hand=chunk_a_last,
+        )
+        self.assertIsNone(executor.active_prediction)
+
+        now_ns = time.monotonic_ns()
+        executor.active_prediction = _prediction(
+            source_ns=now_ns, logical_ns=now_ns, steps=2
+        )
+        executor.schedule_base_ns = now_ns
+        measured_lag = chunk_a_last.copy()
+        measured_lag[0] -= 0.2
+        chunk_b_first = chunk_a_last.copy()
+        chunk_b_first[0] += 0.2
+        publish = _attempt_policy_step(
+            executor,
+            arm_target=np.zeros(7, dtype=np.float64),
+            hand_target=chunk_b_first,
+            measured_hand=measured_lag,
+        )
+
+        publish.assert_called_once()
+        np.testing.assert_array_equal(
+            executor.previous_hand_command_qpos, chunk_b_first
+        )
+
+    def test_hand_jump_rejects_the_whole_coupled_policy_step(self) -> None:
+        executor = _policy_step_executor()
+        lower = np.asarray(executor.runtime.hand.qpos_min_rad, dtype=np.float64)
+        upper = np.asarray(executor.runtime.hand.qpos_max_rad, dtype=np.float64)
+        measured = (lower + upper) / 2.0
+        unsafe_hand = measured.copy()
+        unsafe_hand[0] += 0.31
+
+        publish = _attempt_policy_step(
+            executor,
+            arm_target=np.full(7, 0.1, dtype=np.float64),
+            hand_target=unsafe_hand,
+            measured_hand=measured,
+        )
+
+        publish.assert_not_called()
+        self.assertIsNone(executor.previous_arm_command_qpos)
+        self.assertIsNone(executor.previous_hand_command_qpos)
+
     def test_sync_prediction_is_sequential_and_requests_next_at_completion(
         self,
     ) -> None:
@@ -327,7 +610,7 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
             self.assertEqual(scheduled_target_ns, 100)
             published()
             executor._consume_control_slot(due_ns, terminal_ns=125)
-            executor._advance_prediction(None)
+            executor._advance_prediction()
 
         executor._publish_due_action = Mock(side_effect=finish_late_slot)
         with (
@@ -475,6 +758,8 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
         shared = executor.shared
         executor.active_prediction = _prediction(generation=1)
         executor.step_index = 2
+        executor.previous_arm_command_qpos = np.ones(7, dtype=np.float64)
+        executor.previous_hand_command_qpos = np.ones(12, dtype=np.float64)
         shared.start_request.value = True
 
         executor._start_requested_episode()
@@ -483,6 +768,8 @@ class PolicyExecutorBehaviorTest(unittest.TestCase):
         self.assertEqual(executor.run_generation, shared.run_generation.value)
         self.assertIsNone(executor.active_prediction)
         self.assertEqual(executor.step_index, 0)
+        self.assertIsNone(executor.previous_arm_command_qpos)
+        self.assertIsNone(executor.previous_hand_command_qpos)
         self.assertTrue(shared.inference_request.is_set())
 
     def test_safety_rejection_is_terminal_but_checker_failure_faults(self) -> None:

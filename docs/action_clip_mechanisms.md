@@ -16,8 +16,8 @@ teleop、learned-policy、replay 和数据清洗路径中的限幅机制。这�
 最容易混淆的三点：
 
 1. VR teleop 的 arm/hand proposal 确实会做 joint bound 和每 tick delta clip。
-2. learned-policy 的 `PolicyExecutor` 对 arm 超限 endpoint 是 reject，不是 clip；hand target 会以最新
-   measured state 做约 `0.3 rad` 的受限整形，之后仍由 hand worker 在 SDK 边界复核。
+2. learned-policy 的 `PolicyExecutor` 对 arm/hand 超限 endpoint 都是 reject，不是 clip；首条动作
+   相对 measured feedback，后续动作相对上一条成功发布 target 检查。
 3. EMA、smoothstep ramp、IK nullspace 优化、xArm 速度/加速度是动作整形或轨迹参数，不应统称为 clip。
 
 ## 2. 运行时会真正修改候选动作的机制
@@ -34,7 +34,7 @@ teleop、learned-policy、replay 和数据清洗路径中的限幅机制。这�
 | Keyboard / camera calibration EEF command | EEF position | 工作空间 clip，并留出 command margin | `workspace_command_margin_m=0.005 m`；默认有效范围为 `x=[0.255,0.715]`、`y=[-0.495,0.495]`、`z=[0.055,0.495] m` | 这是相对 nominal workspace 向内收缩 `5 mm` 后的 command workspace | [`keyboard_session.py:539`](../dexmani_real/teleop/keyboard_session.py#L539)、[`control.py:286`](../dexmani_real/calibration/camera/control.py#L286) |
 | Keyboard EEF command | position lookahead | 限制目标相对当前 EEF 的 lead；超限时按向量比例缩放 | `command_lookahead_frames=5`、`delta_pos_m=0.008 m/frame`，所以最大 position lead 为 `0.040 m` | 这是 lead cap/scaling，不是 arm joint-space clip；用于限制键盘命令的前视目标 | [`keyboard_session.py:561`](../dexmani_real/teleop/keyboard_session.py#L561) |
 | Keyboard EEF command | rotation lookahead | 限制目标相对当前 EEF 的旋转 lead；超限时按向量比例缩放 | `delta_rpy_rad=0.03 rad/frame`、`command_lookahead_frames=5`，所以最大 rotation lead 为 `0.15 rad` | 这是旋转目标的 lead cap；不等于 arm joint delta limit | [`keyboard_session.py:561`](../dexmani_real/teleop/keyboard_session.py#L561) |
-| PolicyExecutor / hand worker → SDK | hand joint target | 以最新测得 hand qpos 为基准做约 `0.3 rad` 的每 tick shaping | `0.3 rad/tick` | PolicyExecutor 先在 publication preparation 中整形；worker 在 SDK 前以其 own measured/accepted state 再复核，目标在一步可达范围内时保持原值 | [`executor.py`](../dexmani_real/deployment/executor.py)、[`publication.py`](../dexmani_real/control/publication.py)、[`hand_worker.py`](../dexmani_real/robot/hand_worker.py) |
+| hand worker → SDK | hand joint target | 对 SDK setpoint 做每 servo tick slew limiting | `hand.hand_max_delta_rad_per_tick=0.3 rad/tick` | RUNNING 以上一条 SDK accepted setpoint 为参考；ARMED/homing 以 measured qpos 为参考；可用中间 setpoint 接近原 endpoint | [`hand_worker.py`](../dexmani_real/robot/hand_worker.py) |
 
 ### 2.1 VR arm proposal 的顺序
 
@@ -58,7 +58,7 @@ IK q candidate
 | 层 | 参考状态 | 用途 |
 |---|---|---|
 | VR hand proposal | 上一条 published hand endpoint | 控制网格内的连续动作 proposal |
-| hand worker | 最新测量 hand qpos | 防止 stale target 或进程调度抖动导致 SDK 单 tick 跳变 |
+| hand worker | RUNNING：上一条 SDK accepted setpoint；ARMED：measured qpos | SDK-level actuator slew protection |
 
 ## 3. 参数总表
 
@@ -69,7 +69,8 @@ IK q candidate
 | `policy.control_hz` | `16` | Hz | learned-policy/control grid 的目标频率；`hand_ramp_duration_s=0.5` 对应约 8 个 policy grid frame |
 | `policy.executor_poll_hz` | `128` | Hz | PolicyExecutor 的发布/检查轮询；高于 16 Hz control grid，但每轮最多处理一个到期 endpoint，不制造 burst |
 | `policy.arm_max_delta_rad_per_tick` | `0.139626` | rad，等于 `8°` | VR arm proposal 的单 tick delta clip |
-| `hand.hand_max_delta_rad_per_tick` | `0.3` | rad | VR hand proposal 的单 tick delta clip；也是 PolicyExecutor measured-state shaping 与 hand worker SDK 前复核的界限 |
+| `policy.hand_max_action_jump_rad` | `1.0` | rad | learned-policy hand 每 joint endpoint jump 的独立 reject 阈值 |
+| `hand.hand_max_delta_rad_per_tick` | `0.3` | rad | VR hand proposal shaping 与 hand worker SDK setpoint slew 的界限；不用于 PolicyExecutor shaping |
 | `max_per_frame_rot_rad` | `0.52` | rad，约 `29.8°` | VR wrist mapper 相邻接受姿态的单帧旋转 clip；构造器默认，不是独立 runtime field |
 | `vr_mapping.max_delta_rot_rad` | `3.0` | rad，约 `171.9°` | VR wrist 相对 reset anchor 的累计旋转 clip |
 | `workspace` | `x=[0.25,0.72]`、`y=[-0.50,0.50]`、`z=[0.05,0.50]` | m | VR nominal EEF workspace |
@@ -129,7 +130,7 @@ upper = ( 6.28318530718,  2.0944,  6.28318530718,  3.927,
 | Teleop IK candidate | 相邻 IK q candidate 的 joint jump | `max_ik_jump_deg=(30,30,30,35,40,40,40)°` | reject candidate；不会把 q 改成边界值 | [`types.py:190`](../dexmani_real/planning/types.py#L190)、[`ik.py:265`](../dexmani_real/planning/ik.py#L265) |
 | Teleop IK pose validation | EEF position/orientation error | VR 默认 `0.02 m`、`5°`；keyboard/calibration 默认 `0.002 m`、`2°` | reject candidate | [`defaults.py:637`](../dexmani_real/config/defaults.py#L637)、[`defaults.py:749`](../dexmani_real/config/defaults.py#L749)、[`ik.py:269`](../dexmani_real/planning/ik.py#L269) |
 | `SafetyGate` | representation、generation、shape、finite、joint limits、workspace、可选 endpoint delta、collision | endpoint delta 使用 `endpoint_delta_tolerance_rad=1e-12`；其余由 safety config、robot bounds 和 collision model 决定 | reject candidate；不做 silent clip | [`safety_gate.py:219`](../dexmani_real/control/safety_gate.py#L219) |
-| learned-policy `PolicyExecutor` | arm endpoint delta、hand target delta | arm SafetyGate 使用 `20°=0.349066 rad` 的 reject 阈值；hand 以最新 measured qpos 做 `0.3 rad` shaping | arm/安全门 rejection 只终结当前 step，不发布变形 arm endpoint；随后由 action-step limit 或 command silence/progress watchdog 结束 episode，不走立即 abort | [`executor.py`](../dexmani_real/deployment/executor.py)、[`publication.py`](../dexmani_real/control/publication.py) |
+| learned-policy `PolicyExecutor` | arm/hand endpoint delta | arm 使用 `20°=0.349066 rad`；hand 使用独立 `policy.hand_max_action_jump_rad`；首条相对 measured、后续相对上一条成功发布 target | 任一超限则拒绝整个 coupled step；target 不 clip、不 shaping，reference 不推进 | [`executor.py`](../dexmani_real/deployment/executor.py)、[`safety_gate.py`](../dexmani_real/control/safety_gate.py) |
 | hand publication preflight | hand operational/mechanical bounds | 必须同时满足 operational command bounds 和机械/额定硬边界 | reject publication | [`publication.py:489`](../dexmani_real/control/publication.py#L489)、[`limits.py:64`](../dexmani_real/utils/limits.py#L64) |
 | arm worker | joint bounds、相邻 accepted command target jump | `max_servo_command_jump_rad=20°=0.349066 rad` | fail closed；保持/故障退出取决于 worker lifecycle，不会按 20°自动重写目标 | [`arm_worker.py`](../dexmani_real/robot/arm_worker.py) |
 | offline data cleaning | deployment action endpoint delta | 使用部署时的 arm/hand endpoint limit contract；首段以 measured state 为基准，后续使用保留的上一条 action | 删除/标记 `deployment_action_limit` 无效行，不把行内动作 clip 后继续使用 | [`clean.py:210`](../dexmani_real/data/clean.py#L210)、[`clean.py:722`](../dexmani_real/data/clean.py#L722) |
@@ -141,10 +142,10 @@ upper = ( 6.28318530718,  2.0944,  6.28318530718,  3.927,
 
 | 动作源 | producer-side 修改 | reject-only 检查 | worker 最后边界 |
 |---|---|---|---|
-| VR teleop | wrist rotation clip、EEF workspace clip、arm joint/delta clip、hand operational/delta clip | IK jump/pose、SafetyGate、worker guards | arm worker jump/bounds；hand worker measured-qpos `0.3 rad/tick` clip |
+| VR teleop | wrist rotation clip、EEF workspace clip、arm joint/delta clip、hand operational/delta clip | IK jump/pose、SafetyGate、worker guards | arm worker jump/bounds；hand worker SDK setpoint `0.3 rad/tick` slew |
 | Keyboard teleop | EEF workspace clip、position/rotation lookahead scaling | IK jump/pose、SafetyGate、worker guards | 同上；键盘自身没有独立的 arm joint `8°/tick` producer clip |
 | Camera calibration control | EEF workspace clip（5 mm margin） | IK/控制 preflight、SafetyGate 及 worker guards | 同上 |
-| Learned policy | PolicyExecutor 只对 hand 做 measured-state `0.3 rad` shaping，不 clip arm endpoint | arm SafetyGate reject current step、worker guards、action-step/silence/progress watchdog | arm worker 对过大 jump reject；hand worker再以 measured/accepted state 复核 `0.3 rad/tick` |
+| Learned policy | 无 producer-side smoothing；仅允许 tiny float32 hand endpoint roundoff canonicalization | arm/hand SafetyGate reject current coupled step、action-step/silence/progress watchdog | arm worker jump guard；hand worker SDK setpoint slew limiting |
 | Physical replay | 不做一般 action clip；只做角度等价表示转换 | replay preflight、SafetyGate、worker guards | 同上 |
 
 因此，“项目有动作 clip”不能简化为“所有路径都会 clip”：同一个超限动作在 VR producer、PolicyExecutor、offline cleaning 和 replay 中的处理语义不同。
@@ -198,10 +199,10 @@ Keyboard / calibration:
                               → worker bounds/jump checks → SDK
 
 Learned policy:
-  model Prediction → PolicyExecutor decode → SafetyGate arm reject
-                   → measured-state hand shaping + shaped-hand validation
-                   → non-blocking publication
-                   → arm worker reject + hand worker 0.3 rad/tick recheck → SDK
+  model Prediction → PolicyExecutor decode
+                   → arm/hand reject-only jump + joint/workspace checks
+                   → exact coupled non-blocking publication
+                   → arm worker reject + hand worker 0.3 rad/tick SDK slew → SDK
 
 Replay:
   recorded sent action → angle-equivalent representation (if needed)

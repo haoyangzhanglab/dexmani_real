@@ -28,10 +28,7 @@ from dexmani_real.ipc.schema import (
 )
 from dexmani_real.robot.hand_worker import _limited_hand_setpoint, hand_loop
 from dexmani_real.runtime.safety import CoupledCommandTicket, SafetyState
-from dexmani_real.utils.limits import (
-    POLICY_HAND_ENDPOINT_ROUNDOFF_TOLERANCE_RAD,
-    limit_hand_target_delta,
-)
+from dexmani_real.utils.limits import POLICY_HAND_ENDPOINT_ROUNDOFF_TOLERANCE_RAD
 
 
 class _FakeRing:
@@ -68,6 +65,11 @@ def _initial_hand_state() -> SimpleNamespace:
 
 
 class HandWorkerStartupTest(unittest.TestCase):
+    def test_xhand_driver_module_imports(self) -> None:
+        from dexmani_real.robot.xhand import XHand
+
+        self.assertTrue(callable(XHand))
+
     def test_startup_publishes_live_state_without_command(self) -> None:
         shared = _StartupShared()
         state = _initial_hand_state()
@@ -657,57 +659,6 @@ class CandidatePublicationTest(unittest.TestCase):
                 self.assertEqual(ring.writes, 0)
                 self.assertEqual(lock.entries, 1)
 
-    def test_valid_policy_hand_target_is_shaped_before_one_final_gate(self) -> None:
-        hand_qpos = np.asarray(hand_defaults.qpos_min_rad, dtype=np.float64)
-        hand_qpos[0] += 0.6
-        candidate = self._candidate(hand_qpos=hand_qpos)
-        measured_hand = np.asarray(hand_defaults.qpos_min_rad, dtype=np.float64)
-        gate = SimpleNamespace(
-            hand_low=np.asarray(hand_defaults.qpos_min_rad, dtype=np.float64),
-            hand_high=np.asarray(hand_defaults.qpos_max_rad, dtype=np.float64),
-            validate=Mock(return_value=SimpleNamespace(accepted=True)),
-        )
-        arm_feedback = publication._ArmFeedbackSnapshot(
-            qpos=np.zeros(7, dtype=np.float64),
-            accepted_action_id=0,
-        )
-        hand_feedback = publication._HandFeedbackSnapshot(
-            qpos=measured_hand,
-            accepted_action_id=0,
-        )
-
-        with (
-            patch.object(
-                publication,
-                "_read_arm_feedback",
-                return_value=(arm_feedback, "", None),
-            ),
-            patch.object(
-                publication,
-                "read_hand_feedback",
-                return_value=(hand_feedback, "", None),
-            ),
-        ):
-            result = publication.prepare_command(
-                object(),
-                candidate,
-                gate=gate,
-                arm_feedback_max_age_s=0.1,
-                hand_feedback_max_age_s=0.1,
-                hand_mechanical_lower_rad=hand_defaults.mechanical_qpos_min_rad,
-                hand_mechanical_upper_rad=hand_defaults.mechanical_qpos_max_rad,
-                hand_command_max_delta_rad_per_tick=0.3,
-                canonicalize_policy_hand_roundoff=True,
-            )
-
-        self.assertTrue(result.accepted)
-        gate.validate.assert_called_once()
-        assert result.candidate is not None
-        expected = measured_hand + np.array([0.3] + [0.0] * 11)
-        np.testing.assert_array_equal(result.candidate.hand_qpos, expected)
-        validated_candidate = gate.validate.call_args.args[0]
-        np.testing.assert_array_equal(validated_candidate.hand_qpos, expected)
-
     def _prepare_policy_hand(
         self, raw_hand: np.ndarray, measured_hand: np.ndarray
     ) -> publication.PreparedCommand:
@@ -745,19 +696,15 @@ class CandidatePublicationTest(unittest.TestCase):
                 hand_feedback_max_age_s=0.1,
                 hand_mechanical_lower_rad=hand_defaults.mechanical_qpos_min_rad,
                 hand_mechanical_upper_rad=hand_defaults.mechanical_qpos_max_rad,
-                hand_command_max_delta_rad_per_tick=0.3,
                 canonicalize_policy_hand_roundoff=True,
             )
 
-    def test_policy_raw_hand_violation_is_rejected_before_safe_shaping(self) -> None:
+    def test_policy_raw_hand_violation_is_rejected(self) -> None:
         lower = np.asarray(hand_defaults.qpos_min_rad, dtype=np.float64)
-        upper = np.asarray(hand_defaults.qpos_max_rad, dtype=np.float64)
         measured = lower.copy()
         measured[2] += 0.5
         raw = lower.copy()
         raw[2] -= 0.01
-        shaped = limit_hand_target_delta(raw, measured, 0.3)
-        self.assertTrue(np.all((lower <= shaped) & (shaped <= upper)))
 
         prepared = self._prepare_policy_hand(raw, measured)
         self.assertFalse(prepared.accepted)
@@ -785,18 +732,6 @@ class CandidatePublicationTest(unittest.TestCase):
         self.assertTrue(prepared.accepted)
         assert prepared.candidate is not None
         self.assertEqual(prepared.candidate.hand_qpos[2], lower[2])
-
-    def test_policy_shaped_hand_mechanical_violation_is_rejected(self) -> None:
-        lower = np.asarray(hand_defaults.qpos_min_rad, dtype=np.float64)
-        raw = lower.copy()
-        raw[0] += 0.6
-        measured = lower.copy()
-        measured[0] = -1.0
-
-        prepared = self._prepare_policy_hand(raw, measured)
-
-        self.assertFalse(prepared.accepted)
-        self.assertIs(prepared.gate_code, publication.GateRejectCode.HAND_JOINT_LIMIT)
 
     def test_blocking_acceptance_requires_both_workers(self) -> None:
         ticket = CoupledCommandTicket(

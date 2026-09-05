@@ -285,7 +285,7 @@ def _build_policy_safety_gate(runtime: ResolvedRuntimeConfig) -> SafetyGate:
         hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
         workspace_check=_build_policy_workspace_check(runtime),
         max_arm_delta_rad=float(runtime.arm.max_servo_command_jump_rad),
-        max_hand_delta_rad=None,
+        max_hand_delta_rad=float(runtime.policy.hand_max_action_jump_rad),
         endpoint_delta_tolerance_rad=float(runtime.policy.endpoint_delta_tolerance_rad),
     )
 
@@ -501,6 +501,7 @@ class PolicyExecutor:
         self.last_publication_ns: int | None = None
         self.last_valid_command_ns: int | None = None
         self.previous_arm_command_qpos: np.ndarray | None = None
+        self.previous_hand_command_qpos: np.ndarray | None = None
         self.episode_steps = 0
         self.pending_truncation_action_id: int | None = None
         self.last_metrics_flush_ns = time.monotonic_ns()
@@ -515,6 +516,7 @@ class PolicyExecutor:
         self.last_publication_ns = None
         self.last_valid_command_ns = None
         self.previous_arm_command_qpos = None
+        self.previous_hand_command_qpos = None
         self.pending_truncation_action_id = None
         self.progress.reset(generation)
         if self.sync_mode:
@@ -719,13 +721,10 @@ class PolicyExecutor:
             due_ns, terminal_ns, self.step_dt_ns
         )
 
-    def _advance_prediction(self, candidate: ActionCandidate | None) -> None:
+    def _advance_prediction(self) -> None:
         prediction = self.active_prediction
         if prediction is None:
             raise RuntimeError("cannot advance without an active prediction")
-        if candidate is not None:
-            assert candidate.arm_qpos is not None
-            self.previous_arm_command_qpos = candidate.arm_qpos.copy()
         self.step_index += 1
         if self.step_index >= prediction.num_steps:
             self.active_prediction = None
@@ -760,7 +759,7 @@ class PolicyExecutor:
                 return
             self._finish_episode("action_step_limit", aborted=False)
             return
-        self._advance_prediction(candidate)
+        self._advance_prediction()
 
     def _reject_due_step(self, due_ns: int, reason: str) -> None:
         terminal_ns = time.monotonic_ns()
@@ -841,7 +840,7 @@ class PolicyExecutor:
             valid_until_monotonic_ns=source_deadline_ns,
         )
         if candidate is None:
-            self._advance_prediction(None)
+            self._advance_prediction()
             self.stats.stale_prediction_count += 1
             return
         prepared = prepare_command(
@@ -853,14 +852,12 @@ class PolicyExecutor:
                 self.runtime.safety.heartbeat_timeouts["hand"]
             ),
             arm_delta_reference_qpos=self.previous_arm_command_qpos,
+            hand_delta_reference_qpos=self.previous_hand_command_qpos,
             hand_mechanical_lower_rad=np.asarray(
                 self.runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
             ),
             hand_mechanical_upper_rad=np.asarray(
                 self.runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
-            ),
-            hand_command_max_delta_rad_per_tick=float(
-                self.runtime.hand.hand_max_delta_rad_per_tick
             ),
             canonicalize_policy_hand_roundoff=True,
         )
@@ -902,6 +899,10 @@ class PolicyExecutor:
             self.progress.record_publication(
                 published_candidate.action_id, publication_ns
             )
+            assert published_candidate.arm_qpos is not None
+            assert published_candidate.hand_qpos is not None
+            self.previous_arm_command_qpos = published_candidate.arm_qpos.copy()
+            self.previous_hand_command_qpos = published_candidate.hand_qpos.copy()
         self._consume_control_slot(due_ns, publication_ns)
         if self.last_publication_ns is not None:
             interval_ms = (publication_ns - self.last_publication_ns) / 1e6
@@ -927,7 +928,7 @@ class PolicyExecutor:
 
     def _handle_publication_rejection(self, result: PublishResult) -> None:
         if result.reason == PUBLISH_REASON_EXPIRED:
-            self._advance_prediction(None)
+            self._advance_prediction()
             self.stats.stale_prediction_count += 1
             return
         if result.reason in {PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT}:

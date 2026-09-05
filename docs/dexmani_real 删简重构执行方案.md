@@ -106,7 +106,7 @@ PolicyExecutor
       ├─ validate representation where needed
       ├─ canonicalize tiny XHand roundoff
       ├─ reject raw policy-domain violation
-      ├─ hand slew shaping
+      ├─ reject abnormal arm/hand target jumps
       └─ one final SafetyGate
       │
       ▼
@@ -1872,21 +1872,13 @@ Risk: medium-high
 Hardware regression required: yes
 ```
 
-目标是把：
-
-```text
-gate
-→ shape
-→ partial gate
-→ bounds
-```
-
-改成逻辑清晰的：
+目标是把 learned-policy hand safety 从 measured-state shaping 改为独立的
+reject-only jump contract：
 
 ```text
 raw semantic check
-→ shaping
-→ one final physical gate
+→ arm/hand jump check
+→ exact coupled publication
 ```
 
 ---
@@ -1902,25 +1894,14 @@ tiny float32 roundoff canonicalization
     ↓
 RAW operational envelope validation
     ↓
-hand slew shaping
-    ↓
-ONE final SafetyGate
+ONE reject-only SafetyGate
     ↓
 atomic publication
 ```
 
-注意：
-
-> raw operational validation 必须在 shaping 前。
-
-否则：
-
-```text
-Policy outputs illegal target
-→ slew shaping happens to pull it inside bound
-```
-
-会静默掩盖 model-domain violation。
+SafetyGate 对 arm 使用 `arm.max_servo_command_jump_rad`，对 hand 使用独立的
+`policy.hand_max_action_jump_rad`。首条 action 以 measured feedback 为 delta
+reference，后续 action 以上一条成功发布的 target 为 reference。
 
 ---
 
@@ -1967,33 +1948,18 @@ def hand_target_within_operational_bounds(
 
 ---
 
-# 14.4 Shaping
+# 14.4 Reject-only jump check
 
-```python
-shaped = limit_hand_target_delta(
-    raw_target,
-    measured_hand_qpos,
-    max_delta_per_tick,
-)
-```
-
-如果 `limit_hand_target_delta` 继续在每 tick 验证 static `max_delta`：
-
-可以在后续把：
-
-```text
-max delta positive/finite
-```
-
-移动 startup。
-
-但本 Phase 不需要同时过度重构。
+PolicyExecutor 不得调用 `limit_hand_target_delta`，也不得把
+`hand.hand_max_delta_rad_per_tick` 传给 publication preparation。任一 arm/hand
+jump 超限时拒绝整个 coupled step，不修改 target，也不推进 previous-command
+reference。
 
 ---
 
 # 14.5 Final SafetyGate exactly once
 
-在 final shaped candidate 上：
+在原始（仅可能做 tiny roundoff canonicalization）candidate 上：
 
 ```python
 gate.validate(...)
@@ -2041,25 +2007,30 @@ raw target tiny float32 roundoff
 ```
 
 ```text
-raw target illegal but shaped target legal
-→ still rejected
+raw target illegal
+→ directly rejected; no shaping branch
 ```
 
 ```text
 valid raw target
-→ shaped
+→ unchanged
 → final gate called once
 ```
 
 ```text
-shaped target hard-mechanically invalid
-→ rejected
+publish A successfully → reject B → evaluate C
+→ C remains relative to A
+```
+
+```text
+new prediction first action
+→ relative to previous prediction's last successful publication
 ```
 
 ## 推荐 commit
 
 ```text
-refactor(hand): separate policy-domain bounds from final physical safety
+fix(policy): reject learned-policy hand jumps without shaping
 ```
 
 ---
@@ -2626,13 +2597,10 @@ Policy output
     ├─ policy-domain operational validity
     │
     ▼
-shaping
-    │
-    ▼
 SafetyGate
     │
     ├─ operational joint bounds
-    ├─ arm delta
+    ├─ arm/hand delta
     ├─ workspace
     └─ optional collision
     │
@@ -2688,8 +2656,7 @@ SHM ownership copy
 
 ```text
 raw semantic check
-→ optional shaping
-→ exactly one full SafetyGate
+→ exactly one SafetyGate with reject-only arm/hand jump checks
 ```
 
 ---

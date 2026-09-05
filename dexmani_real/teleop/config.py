@@ -20,9 +20,8 @@ class TeleopCommandLimits:
     hand_home_qpos_rad: np.ndarray
     hand_command_lower_rad: np.ndarray
     hand_command_upper_rad: np.ndarray
-    # Policy-grid endpoint bound shared with learned-policy deployment.  The
-    # hand worker keeps its measured-state limiter as an independent hardware
-    # backstop.
+    # Teleop endpoint shaping bound. The hand worker independently reuses this
+    # value for SDK-level slew protection.
     hand_max_delta_rad_per_tick: np.ndarray
     hand_mechanical_lower_rad: np.ndarray
     hand_mechanical_upper_rad: np.ndarray

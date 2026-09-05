@@ -113,7 +113,7 @@ q_cmd = q_prev + clip(q_ik - q_prev, -limit, +limit)
 | --- | --- | --- |
 | 键盘遥操作 | 发布完整 IK endpoint；不启用通用 arm delta clip/reject | 保留目标位姿语义，交给 30 Hz 目标生成和 Mode 6 跟踪 |
 | VR 遥操作 | producer 以“上一条命令 → 新 IK”执行 8°/tick joint shaping | VR 输入连续，整形属于 VR proposal owner；后续安全门不重复裁剪 |
-| learned policy | `PolicyExecutor` 的 SafetyGate 以 `20°` arm endpoint 阈值 reject；hand 以最新 measured state 做约 `0.3 rad` shaping | 模型动作是提案；arm 越界不能静默改写，hand shaping 是独立的 measured-state 边界 |
+| learned policy | `PolicyExecutor` 对 arm 使用 `20°`、对 hand 使用独立 policy 参数做 endpoint jump reject | 模型动作只接受或拒绝，不做 smoothing；首条相对 measured，后续相对上一条成功发布 target |
 | arm worker | 对所有来源执行默认 20°/accepted-command 的 command-to-command 异常跳变兜底，触发即 fail closed | 只防 IPC/IK 分支异常，不承担正常控制速率整形；latest-wins 允许中间 endpoint 被覆盖，因此它不是严格的 per-tick 速度限制 |
 
 8° 是 VR producer 的连续性合同；20° 同时是 PolicyExecutor arm reject 与 arm worker 的异常跳变阈值。二者都不是 xArm 控制器声明的统一“每周期最大运动角”。
@@ -149,7 +149,7 @@ ACK 只表示 worker/SDK 接受目标，不表示关节已经物理到位，也�
 - coupled record、atomic revoke 和 worker fencing 是共享基础设施修复，键盘、VR、回放和策略部署都受益；
 - 删除的是键盘路径错误启用的通用 arm delta，不是全局删除安全检查；
 - VR 仍保留 producer-side 8° command shaping，因此不会因键盘修复而失去原有平滑策略；
-- learned-policy 由 PolicyExecutor 以 20° arm gate reject 当前 step，并以 measured-state 0.3 rad hand shaping 保持 hand target 可达；拒绝后不立即 abort，后续由 action-step limit 或 silence/progress watchdog 收束 episode；
+- learned-policy 由 PolicyExecutor 对 arm/hand endpoint jump 做 reject-only 检查；通过后精确发布 coupled target，hand worker 再负责 SDK-level slew；拒绝后不立即 abort，后续由 action-step limit 或 silence/progress watchdog 收束 episode；
 - 20° worker fallback 对所有来源生效，可阻止异常 IK 分支或损坏 record 直接跨越 SDK 边界；
 - 非阻塞发布避免推理/PolicyExecutor 因等待 actuator acceptance 而破坏调度，但 latest-wins 可能覆盖未消费的旧 endpoint，这是实时遥操作的明确取舍。
 
@@ -163,7 +163,7 @@ ACK 只表示 worker/SDK 接受目标，不表示关节已经物理到位，也�
 - timeout 取消不会撤销较新 ticket；
 - superseded 的异常 snapshot 不会调用 arm SDK 或锁存 fault；
 - keyboard 发布完整 IK solution，不执行 arm delta clip；
-- learned-policy arm gate 使用 20° endpoint reject，hand shaping 使用实测 hand qpos；
+- learned-policy arm gate 使用 20° endpoint reject；hand 首条相对 measured、后续相对上一条成功发布 target 做独立 jump reject；
 - arm/hand 共用 generation 和 delivery-window 合同；
 - 默认 worker discontinuity fallback 为 20°。
 
@@ -174,7 +174,7 @@ ACK 只表示 worker/SDK 接受目标，不表示关节已经物理到位，也�
 1. 受控低速环境下记录每周期 target、SDK accepted target、measured qpos 和 tracking error；
 2. 验证长按平移、方向反转、腕部旋转、松键/再按和 workspace 边界；
 3. 确认键盘日志不再出现 prepare rejection、arm delta rejection 或持续 60 ms loop overrun；
-4. 分别验证 VR 8° shaping 和 learned-policy 20° arm rejection / 0.3 rad hand shaping，不以键盘结果替代；
+4. 分别验证 VR arm/hand shaping、learned-policy arm/hand jump rejection，以及 hand worker SDK slew，不以键盘结果替代；
 5. 验证 e-stop、worker 退出和 generation revoke 后没有后续 SDK command。
 
 在这些实机检查完成前，应表述为“软件根因已修复并完成离线验证”，不能声称物理抖动已经完全关闭。

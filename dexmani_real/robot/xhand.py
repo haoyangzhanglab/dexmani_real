@@ -18,7 +18,7 @@ import numpy as np
 from xhand_controller import xhand_control as xhc  # type: ignore[import-untyped]
 
 from dexmani_real.config.defaults import HandParams
-from dexmani_real.ipc.schema import (
+from dexmani_real.robot_spec import (
     HAND_CONTACT_SHAPE,
     HAND_DOF,
     HAND_FINGER_COUNT,

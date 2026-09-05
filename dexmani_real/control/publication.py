@@ -36,7 +36,6 @@ from dexmani_real.utils.feedback import (
 from dexmani_real.utils.limits import (
     canonicalize_policy_hand_endpoint_roundoff,
     hand_target_within_operational_bounds,
-    limit_hand_target_delta,
 )
 from dexmani_real.utils.limits import (
     validate_hand_command_bounds as _validate_hand_bounds,
@@ -278,10 +277,9 @@ def prepare_command(
     hand_delta_reference_qpos: np.ndarray | None = None,
     hand_mechanical_lower_rad: np.ndarray | None = None,
     hand_mechanical_upper_rad: np.ndarray | None = None,
-    hand_command_max_delta_rad_per_tick: float | np.ndarray | None = None,
     canonicalize_policy_hand_roundoff: bool = False,
 ) -> PreparedCommand:
-    """Read valid feedback, check physical safety, and shape a learned hand target."""
+    """Read valid feedback and check one candidate without shaping it."""
     arm_feedback, reason, issue = _read_arm_feedback(
         shared, max_age_s=arm_feedback_max_age_s
     )
@@ -349,19 +347,6 @@ def prepare_command(
                 reason="hand policy endpoint violates operational joint limits",
                 hand_roundoff_canonicalized=hand_roundoff_canonicalized,
             )
-
-    if (
-        candidate.hand_qpos is not None
-        and hand_command_max_delta_rad_per_tick is not None
-    ):
-        assert hand_feedback is not None
-        shaped_hand_qpos = limit_hand_target_delta(
-            candidate.hand_qpos,
-            hand_feedback.qpos,
-            hand_command_max_delta_rad_per_tick,
-        )
-        if not np.array_equal(shaped_hand_qpos, candidate.hand_qpos):
-            candidate = replace(candidate, hand_qpos=shaped_hand_qpos)
 
     gate_result = gate.validate(
         candidate,

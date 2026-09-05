@@ -109,8 +109,9 @@ watchdog 属于 `ResolvedRuntimeConfig.policy`。模型 action/observation shape
 `executor_poll_hz=128` 轮询，每轮最多发布一个到期 endpoint，绝不追赶过期 slot。
 
 策略 arm endpoint 经过 `arm.max_servo_command_jump_rad=20°` 的 reject-only SafetyGate；hand target
-则以最新测得 hand qpos 做约 `0.3 rad` 的 shaping，并在 worker SDK 边界再次复核。arm gate 或 IK
-拒绝当前 step 时不发布变形 endpoint，也不立即终止 episode。
+经过独立的 `policy.hand_max_action_jump_rad=1.0 rad` reject-only 检查。首条动作以 measured feedback 为
+reference，后续动作以上一条成功发布的 target 为 reference；通过后原样发布。hand worker 仍在 SDK
+边界用 `hand.hand_max_delta_rad_per_tick` 生成受限中间 setpoint。任一 coupled target 被拒绝时均不发布。
 `--max-action-steps N` 限制每个 episode 的 terminal action steps；达到 N 时以 `TRUNCATED`
 结束，而不是触发 FAULT。示例：
 
