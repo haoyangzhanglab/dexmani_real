@@ -1,4 +1,4 @@
-"""Teleoperation IK solver — position IK (MPlib) with deterministic seeding."""
+"""Online IK solver — position IK with deterministic MPlib seeding."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ class IKFailureKind(str, Enum):
 
 @dataclass(kw_only=True)
 class OnlineIKConfig:
-    """Online teleoperation IK/servo configuration."""
+    """Online IK/servo configuration."""
 
     max_ik_jump_deg: tuple[float, ...] = (30, 30, 30, 35, 40, 40, 40)
     max_pose_error_pos_m: float = 0.008

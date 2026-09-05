@@ -15,7 +15,6 @@ from typing import Any, Mapping
 import numpy as np
 
 from dexmani_real.config.defaults import PolicyParams
-from dexmani_real.dataset.transforms import resize_rgb
 from dexmani_real.deployment.config import FingertipAssemblerConfig
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.ipc.schema import validate_point_cloud_array
@@ -24,6 +23,7 @@ from dexmani_real.planning.kinematics.fingertip import (
     compute_fingertip_points_xarm_base,
 )
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
+from dexmani_real.sensor.camera.transforms import resize_rgb
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)

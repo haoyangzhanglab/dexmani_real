@@ -10,7 +10,6 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from dexmani_real.config.experiment import resolve_experiment_config
-from dexmani_real.dataset.transforms import resize_rgb
 from dexmani_real.deployment.config import (
     FingertipAssemblerConfig,
     InferenceWorkerConfig,
@@ -43,6 +42,7 @@ from dexmani_real.ipc.schema import (
     HAND_TACTILE_DTYPE,
 )
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_points_xarm_base
+from dexmani_real.sensor.camera.transforms import resize_rgb
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.episode_samples import _build_robot_state
 from dexmani_real.teleop.loop import _load_hand_kinematics

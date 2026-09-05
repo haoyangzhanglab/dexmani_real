@@ -45,15 +45,15 @@ from dexmani_real.dataset.processed import (
     _validate_processed_output_structure,
     validate_processed_hdf5,
 )
-from dexmani_real.dataset.transforms import (
-    resize_camera_intrinsic,
-    resize_depth,
-    resize_rgb,
-)
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_points_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.storage.reader import EpisodeReader
+from dexmani_real.sensor.camera.transforms import (
+    resize_camera_intrinsic,
+    resize_depth,
+    resize_rgb,
+)
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,

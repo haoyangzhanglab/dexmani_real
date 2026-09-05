@@ -1,4 +1,4 @@
-"""Deterministic numerical transforms for the processed episode view."""
+"""Pure deterministic RGB-D resize transforms for online and offline use."""
 
 from __future__ import annotations
 

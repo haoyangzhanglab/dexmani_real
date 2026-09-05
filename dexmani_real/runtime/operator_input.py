@@ -1,4 +1,4 @@
-"""pynput-based global keyboard handler for teleop control (B/C/S/D/H/Q/ESC)."""
+"""Shared pynput-based operator keyboard input for interactive robot workflows."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Safety holds, re-anchoring, contact guards, and homing for teleoperation."""
+"""Hand-first homing orchestration for teleoperation."""
 
 from __future__ import annotations
 

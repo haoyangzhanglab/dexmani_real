@@ -1,4 +1,4 @@
-"""Spawn-only worker construction, supervision priority, and shutdown."""
+"""Spawn-only process construction and verified shutdown."""
 
 from __future__ import annotations
 
