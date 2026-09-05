@@ -83,20 +83,3 @@ XHand worker 成功连接并完成触觉初始化后，只读取初始状态并�
 手部状态仅用于离线 preflight 的录制状态到首命令碰撞校验。运行时继续要求新鲜有效的手部
 反馈、首帧命令的操作/机械限位校验，以及实时起点过渡的碰撞检查；这些任一项失败仍
 fail-closed。
-
-## 5. Learned-policy rollout 不执行软件实时碰撞查询
-
-Learned-policy 的实时运行不对策略 endpoint 或 current→target 轨迹执行 MPlib/FCL
-软件碰撞查询。这是刻意选择的 latency 与实现复杂度取舍，而不是遗漏：当前 rollout 始终有
-现场操作者监督，xArm firmware collision protection 仍保持启用。
-
-此选择不放宽既有的 joint limits、workspace、输入/命令 freshness、run generation、
-watchdog、SDK/worker failure 和 e-stop 边界。策略异常仍在这些边界 fail-closed；`H` 的
-return_home 也继续走完整的碰撞检查路径。
-
-## 6. Teleoperation 只检查在线 IK 候选终点
-
-Online IK 继续拒绝 self / arm-hand collision 的候选终点。候选被接受后，teleop 不对
-current→target servo trajectory 执行每 control tick 的 realtime swept collision query。
-这一运动过程由直接监督的操作者负责；它不改变 joint limits、workspace、freshness、
-lifecycle、SDK protection 或 e-stop。
