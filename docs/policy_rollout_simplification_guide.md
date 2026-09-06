@@ -1,14 +1,14 @@
-# DexMani Real — Policy Rollout Correctness Cleanup Guide
+# DexMani Real — Canonical Policy Rollout Cleanup Guide
 
-> Repository: `haoyangzhanglab/dexmani_real`  
+> Repository: `dexmani_real`  
 > Intended executor: Claude Code / Codex  
-> Scope: personal PhD real-robot research. Make the learned-policy rollout path logically correct and easier to reason about. Preserve working robot infrastructure; do not redesign the runtime into a general framework.
+> Scope: personal PhD real-robot research. Keep one current runtime contract. Do not add compatibility layers, schema versions, or historical migration logic.
 
 ---
 
 ## 1. Goal
 
-The target learned-policy execution path is:
+Make the learned-policy rollout path logically correct and easy to reason about:
 
 ```text
 Timestamped sensors
@@ -17,112 +17,93 @@ Causal Observation Builder
         ↓
 Policy inference worker
         ↓
-Prediction / ActionChunk
+ActionChunk [N,D]
         ↓
-Timestamp-based stale action filtering
+timestamp-based action selection
         ↓
-Joint decode or EE→IK
+joint decode / EE→IK
         ↓
-Safety validation
+safety validation
         ↓
-Coupled arm + hand command
+arm + hand command
         ↓
-Robot workers
+robot workers
 ```
 
-The goal is semantic cleanup, not a new scheduler.
+This is a semantic cleanup, not a runtime rewrite.
 
-Preserve:
+---
+
+## 2. Preserve existing infrastructure
+
+Do not redesign:
 
 ```text
-causal observation alignment
 shared-memory rings
+sensor workers
+causal observation alignment
 inference worker separation
-prediction ownership
-run_generation protection
-timestamped action execution
+Prediction ownership
+run_generation
 stale-prefix skipping
-no catch-up
+whole-stale discard
+no catch-up behavior
 coupled arm+hand publication
-e-stop boundary
-worker supervision
-```
-
----
-
-## 2. Do not redesign existing infrastructure
-
-Do not rewrite:
-
-```text
-IPC implementation
-sensor drivers
-teleoperation
-RecorderIO process architecture
-worker supervision
-heartbeat system
+sync/async modes
+executor polling
+worker heartbeat
+supervisor
+home lifecycle
+RecorderIO
+SafetyGate
 robot SDK workers
-```
-
-The current process separation and safety boundaries are useful. Simplify only the learned-policy semantics.
-
----
-
-## 3. Remove obsolete Policy compatibility fields
-
-Current Real deployment validates obsolete generic temporal semantics.
-
-Remove:
-
-```text
-temporal_ensemble_coeff
-Generic temporal blending assumptions
-```
-
-from:
-
-```text
-deployment/config.py
-Policy compatibility checks
-CLI/config plumbing where only this field is used
 ```
 
 Do not add:
 
 ```text
 Temporal Ensemble
-ChunkOverlapBlender
 RTC
-previous-action conditioning
+steps_per_inference
+new scheduler
+chunk blending
+adaptive horizon
+latency compensation
+new recorder framework
 ```
-
-If a future experiment needs these, they belong to an explicit Policy algorithm variant, not generic Real runtime behavior.
 
 ---
 
-## 4. Keep current timestamped ActionChunk execution
+## 3. Remove obsolete Policy compatibility dependency
 
-Do not replace the current scheduling design.
+After `dexmani_policy` cleanup, Real should consume only the current public Policy API.
 
-The executor should keep the standard semantics:
-
-For:
+Remove all Real-side use of:
 
 ```text
-A=[a0,...,aN]
+temporal_ensemble_coeff
 ```
 
-with:
+Do not add:
 
 ```text
-t_i=t_chunk+i*control_dt
+artifact version parser
+legacy config loader
+v1/v2/v3 compatibility branches
+migration framework
 ```
 
-execute:
+If old metadata exists, update or regenerate it once before use. Runtime code should support only the current contract.
+
+---
+
+## 4. Preserve timestamped ActionChunk semantics
+
+Keep current execution semantics:
 
 ```text
 future action
-    wait until target time
+    execute at target time
 
 past action
     skip
@@ -135,21 +116,29 @@ Do not:
 
 ```text
 retime stale actions
-execute catch-up bursts
-blend chunks
+catch-up execute old actions
+blend old/new chunks
 ```
 
-Current mechanisms such as prediction ring, run generation, and executor polling are implementation details; keep them unless a concrete bug requires change.
+Keep:
+
+```text
+prediction ring
+run_generation
+executor polling
+```
+
+unless a concrete correctness bug requires change.
 
 ---
 
-## 5. Timing cleanup: remove only duplicated action validity
+## 5. Timing cleanup
 
-Separate:
+Separate three concepts.
 
 ### Observation validity
 
-Used before inference:
+Responsible for:
 
 ```text
 sensor age
@@ -157,29 +146,31 @@ sensor skew
 causal alignment
 ```
 
-Keep.
+Keep in observation construction.
 
 ### Command delivery validity
 
-Used between executor and robot workers:
+Responsible for:
 
 ```text
-command TTL / worker acceptance timeout
+worker acceptance timeout
+command watchdog
+hardware delivery safety
 ```
 
 Keep.
 
-### Remove duplicated prediction invalidation
+### Remove duplicated action invalidation
 
-Review:
+Audit:
 
 ```text
 max_source_to_command_age_s
 ```
 
-If it only re-checks the age of the observation after a Policy chunk has already been produced, remove that dependency from action execution.
+Remove it only if it duplicates observation freshness after Policy already produced a valid ActionChunk.
 
-Do not remove worker safety timeouts:
+Do not remove:
 
 ```text
 first command timeout
@@ -188,68 +179,13 @@ command progress timeout
 action apply timeout
 ```
 
-Those protect physical execution, not Policy semantics.
-
 ---
 
-## 6. Safety semantics: make failures interpretable
+## 6. IK and safety attribution
 
-The goal is not to build a planner. Keep simple validation.
+Keep failure categories minimal and correct.
 
-Keep:
-
-```text
-joint limits
-hand limits
-per-step delta limits
-EEF workspace limits
-hardware feedback health
-e-stop
-```
-
-Do not add:
-
-```text
-online trajectory optimization
-adaptive safety correction
-new collision planner
-```
-
-### Action modification
-
-Do not silently change learned actions.
-
-Current learned-policy arm spike clipping should be reviewed:
-
-Preferred semantics:
-
-```text
-unsafe action
-    ↓
-SAFETY_REJECT
-    ↓
-record rejection
-```
-
-not:
-
-```text
-unsafe action
-    ↓
-modified action
-    ↓
-execute silently
-```
-
-If a future experiment studies command limiting, make it an explicit experiment variable and record both raw/executed actions.
-
----
-
-## 7. Separate IK failure and safety rejection
-
-Maintain clear attribution.
-
-### Joint action policy
+### Joint policy
 
 ```text
 joint action
@@ -259,19 +195,25 @@ safety
         SAFETY_REJECT
 ```
 
-### EE action policy
+### EE policy
 
 ```text
 EE action
     ↓
 IK
-        IK_FAIL
+    ↓
+    IK_FAIL
+
+or
+
+IK success
     ↓
 safety
-        SAFETY_REJECT
+    ↓
+    SAFETY_REJECT
 ```
 
-Do not label:
+Do not classify:
 
 ```text
 joint limit
@@ -281,63 +223,59 @@ large action jump
 
 as IK failure.
 
-Modify only the metadata path; do not change the raw data schema unless unavoidable.
+Do not create a large exception hierarchy.
 
 ---
 
-## 8. Formal evaluation: decouple recording metadata from command validity
+## 7. Evaluation recording must not change control semantics
 
-Current formal evaluation has valuable concepts:
+Keep the episode lifecycle:
 
 ```text
 B
+↓
 Recorder START
+↓
 RUNNING
-SUCCESS/FAILURE/INVALID
-Recorder STOP
+↓
+rollout
+↓
+outcome
+↓
+Recorder STOP/save
 ```
 
-Keep them.
+Recorder remains an observer, not a controller.
 
-However, evaluation-only evidence collection must not decide whether a valid Policy command can be published.
-
-Required behavior:
+During RUNNING:
 
 ```text
-Policy observation valid
-        ↓
-execute normal control path
-        ↓
-record rollout metadata/evidence when available
+Policy observation validity
 ```
 
-### Initial episode boundary
+may affect control.
 
-Keep the initial recording/start handshake. It is reasonable that recording must be ready before an episode begins.
+But evaluation-only evidence should not block a valid action.
 
-### During RUNNING
-
-Do not require every action publication to wait for:
+Example:
 
 ```text
-camera read
-FK reconstruction
-EpisodeState assembly
-Recorder write
+state-only policy
+camera recording problem
 ```
 
-A missing recording-only source should become a recording/evaluation issue, not silently change Policy control semantics.
+should become an evaluation/recording issue, not a policy action rejection.
 
-Do not create a new recorder architecture. Modify the existing executor/evaluation path minimally.
+Do not create a new recorder architecture. Modify the current executor/evaluation path minimally.
 
 ---
 
-## 9. Recorder outcome semantics
+## 8. Episode storage
 
 Separate:
 
 ```text
-episode outcome
+outcome
 ```
 
 from:
@@ -346,7 +284,7 @@ from:
 storage integrity
 ```
 
-Recommended:
+Normal outcomes:
 
 ```text
 SUCCESS
@@ -354,102 +292,44 @@ FAILURE
 INVALID
 ```
 
-are saved normally when the rollout reached a valid recording state.
+should be preserved when recorder data is healthy.
 
-However, unrecoverable recorder/storage failures such as:
+Unrecoverable recorder/storage corruption may fail saving, but must have an explicit reason.
 
-```text
-sample ring overflow
-writer corruption
-cannot finalize artifact
-```
-
-may abort saving. They must be explicitly reported as recorder failures.
-
-Do not silently discard ordinary failed/invalid trials.
+Do not delete ordinary failed rollouts.
 
 ---
 
-## 10. Home/start lifecycle
+## 9. Do not redesign safety or lifecycle
 
-Do not remove `physical_home_completed` blindly.
-
-It currently represents that a complete home procedure occurred, not just a convenience flag.
-
-If simplifying it:
-
-1. First ensure B checks the complete measured start condition:
+Do not remove:
 
 ```text
-arm state near home
-hand state near home
-feedback healthy
+physical_home_completed
+home sequence
+workspace checks
+collision hooks
+supervisor
+heartbeat
 ```
 
-2. Then remove redundant historical authorization state.
+unless a direct bug is found.
 
-Do not replace a known-safe check with arm-only qpos checking.
+A cleanup task should not become a robot infrastructure rewrite.
 
 ---
 
-## 11. PolicySpec boundary
-
-Real should consume only the public Policy API.
-
-Current Real compatibility should continue validating the fields it genuinely uses:
-
-```text
-action_key
-control_action_dim
-n_obs_steps
-n_action_steps
-observation_fields
-control timing
-```
-
-Do not perform a broad PolicySpec redesign in this task.
-
----
-
-## 12. Tests / checks
-
-The repository currently does not establish a pytest test suite. Do not create a large test framework only for this patch.
-
-Prefer:
-
-```text
-small deterministic unittest/script checks
-```
-
-covering:
-
-```text
-partial stale chunk
-whole stale chunk
-old run_generation ignored
-IK_FAIL attribution
-SAFETY_REJECT attribution
-recording-only evidence missing does not change command semantics
-```
-
-No hardware tests.
-
----
-
-## 13. Expected files
+## 10. Patch scope
 
 Search first. Expected areas:
 
 ```text
 dexmani_real/deployment/config.py
 dexmani_real/deployment/executor.py
-
 dexmani_real/control/publication.py
 dexmani_real/control/safety_gate.py
-
 dexmani_real/deployment/evaluation.py
-
-dexmani_real/examples/run_policy.py
+examples/run_policy.py
 README.md
 repo_map.md
 ```
@@ -463,124 +343,112 @@ robot workers
 IPC implementation
 ```
 
-unless required by a direct dependency.
+unless directly required.
 
 ---
 
-## 14. Implementation order
+## 11. Validation
 
-### Phase A — Policy compatibility cleanup
+Do not build a large test framework.
 
-1. Remove obsolete temporal field checks.
-2. Verify Real loads the new Policy public contract.
+Use small deterministic offline checks if appropriate:
 
-### Phase B — executor semantics cleanup
-
-1. Remove duplicated prediction source-age invalidation if it duplicates observation validity.
-2. Fix IK vs safety attribution.
-3. Replace hidden action modification with explicit rejection where applicable.
-
-### Phase C — evaluation cleanup
-
-1. Keep episode boundaries.
-2. Stop evaluation-only evidence from gating every action.
-3. Preserve normal rollout artifacts and explicit recorder failures.
-
-### Phase D — docs/checks
-
-Update durable docs only after behavior is verified.
-
----
-
-## 15. Validation
-
-Before editing:
-
-```bash
-git status --short
-git rev-parse HEAD
+```text
+partial stale chunk → skip prefix
+whole stale chunk → discard
+old run_generation ignored
+joint rejection → SAFETY_REJECT
+EE IK failure → IK_FAIL
+EE IK success + safety failure → SAFETY_REJECT
+evaluation-only evidence missing does not alter valid action scheduling
 ```
 
-After editing:
+No hardware tests.
+
+Run:
 
 ```bash
 python -m compileall -q dexmani_real
 
-# use repository's existing lightweight check style if present
-
-
 git diff --check
-git diff --stat
 ```
-
-Do not run real robot commands without explicit authorization.
 
 ---
 
-## 16. Definition of Done
+## 12. Implementation order
 
-Complete when:
+### Phase A
 
-```text
-Policy rollout uses canonical timestamped action chunks
-```
+Remove obsolete Policy compatibility checks.
 
-```text
-Normal deployment and formal evaluation share control semantics
-```
+### Phase B
+
+Fix executor semantics:
 
 ```text
-IK failure != safety rejection
+IK vs safety attribution
+recording not gating action publication
 ```
 
-```text
-Recording does not silently alter valid Policy commands
-```
+### Phase C
 
-```text
-No generic temporal blending exists in Real runtime
-```
+Update durable docs.
 
-and:
-
-- existing robot infrastructure remains intact;
-- focused offline checks pass;
-- no RTC/Temporal Ensemble/scheduler framework was added.
+Do not mix new research algorithms into this cleanup.
 
 ---
 
-## 17. Final Claude Code / Codex report
+## 13. Definition of Done
+
+The final runtime should satisfy:
+
+```text
+canonical timestamped ActionChunk execution
+```
+
+```text
+normal deployment == evaluation control semantics
+```
+
+```text
+IK_FAIL != SAFETY_REJECT
+```
+
+```text
+no generic temporal blending mechanism
+```
+
+```text
+one current runtime contract
+no compatibility/version framework
+```
+
+---
+
+## 14. Final report
 
 Return:
 
 ### Changed
-- files changed;
-- semantic contracts modified.
+Exact files and semantic changes.
 
 ### Preserved
 Confirm:
 
 ```text
-causal observations
+sensor alignment
 prediction ownership
-timestamp scheduling
-robot safety boundary
-worker architecture
+timestamp scheduler
+SafetyGate
+RecorderIO
+lifecycle
 ```
 
 ### Verified
-- compile result;
-- focused checks;
-- diff check.
+Compile/check commands and offline checks.
 
 ### Not Verified
-Explicitly list:
+Hardware execution and real task success.
 
-```text
-real robot execution
-hardware timing
-task success rate
-```
-
-### Remaining risk
-Only concrete discovered risks. Do not propose generic temporal smoothing or new deployment frameworks.
+### Remaining Risk
+Only concrete discovered risks. Do not propose RTC, temporal smoothing, or a new deployment framework.
