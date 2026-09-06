@@ -10,9 +10,10 @@ no second health mechanism: supervisor heartbeats cover the policy executor,
 actuator, and inference workers, while readiness covers asynchronous startup
 only.
 
-There is no VR worker or recorder. The camera worker is included whenever the
-explicit observation contract contains ``point_cloud`` or ``rgb``; the
-point-cloud worker is included only for ``point_cloud``.
+There is no VR worker. Ordinary deployment starts the camera only when the
+explicit observation contract contains ``point_cloud`` or ``rgb``. Formal
+evaluation additionally starts camera and RecorderIO for audit evidence, while
+keeping camera payload out of a state-only policy observation.
 
 """
 
@@ -22,6 +23,7 @@ import math
 import multiprocessing as mp
 import os
 import threading
+import time
 from dataclasses import replace
 from typing import Any
 
@@ -34,24 +36,27 @@ from dexmani_real.deployment.config import (
     validate_max_running_s,
     validate_policy_runtime_compatibility,
 )
+from dexmani_real.deployment.evaluation import PolicyEvaluationConfig
 from dexmani_real.deployment.executor import policy_executor_loop
-from dexmani_real.deployment.operator import build_home_planner, run_operator_control
 from dexmani_real.deployment.inference.worker import inference_loop
+from dexmani_real.deployment.operator import build_home_planner, run_operator_control
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
+from dexmani_real.recording.io_worker import RecorderIOConfig, recorder_io_loop
+from dexmani_real.recording.client import RecorderCommand, RecorderPhase
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.robot.hand_worker import hand_loop
+from dexmani_real.runtime.processes import (
+    ProcessSpec,
+    ShutdownReport,
+    build_processes,
+    start_processes,
+    stop_processes_verified,
+)
 from dexmani_real.runtime.safety import SafetyState, require_transition
 from dexmani_real.runtime.supervisor import (
     run_supervisor,
     shutdown_processes,
     wait_subsystem_ready,
-)
-from dexmani_real.runtime.processes import (
-    ShutdownReport,
-    ProcessSpec,
-    build_processes,
-    start_processes,
-    stop_processes_verified,
 )
 from dexmani_real.sensor.camera.worker import CameraLoopConfig, camera_loop
 from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig, pointcloud_loop
@@ -61,6 +66,9 @@ logger = get_logger(__name__)
 
 
 _OBSERVATION_READ_MARGIN = 2
+_EVALUATION_RECORDER_FRAME_MARGIN = 4
+_EVALUATION_RECORDER_STOP_ACK_TIMEOUT_S = 1.0
+_EVALUATION_RECORDER_STOP_ACK_POLL_S = 0.01
 
 
 def _observation_field_names(policy_spec: Any) -> tuple[str, ...]:
@@ -79,6 +87,75 @@ def _requires_camera(policy_spec: Any) -> bool:
 def _requires_hand_sensor(policy_spec: Any) -> bool:
     requested = set(_observation_field_names(policy_spec))
     return bool(requested & {"joint_state", "contact_force", "fingertip_points"})
+
+
+def _evaluation_recorder_config(
+    runtime: ExperimentConfig,
+    evaluation: PolicyEvaluationConfig,
+) -> RecorderIOConfig:
+    """Build the recorder-only capacity contract for one formal eval session."""
+    control_hz = float(runtime.policy.control_hz)
+    max_frames = (
+        math.ceil(float(evaluation.max_running_s) * control_hz)
+        + _EVALUATION_RECORDER_FRAME_MARGIN
+    )
+    return RecorderIOConfig(
+        data_dir=evaluation.data_dir,
+        max_frames=max_frames,
+        control_hz=control_hz,
+        min_frames=1,
+        writer_queue_size=int(runtime.camera.writer_queue_size),
+        provenance=evaluation.provenance,
+    )
+
+
+def _evaluation_recorder_phase(shared: RuntimeChannels) -> RecorderPhase | None:
+    """Read the latest recorder phase without assigning it controller meaning."""
+    result = shared.record_status_ring.read_latest()
+    if result is None:
+        return None
+    try:
+        return RecorderPhase(int(result[0][0]["phase"]))
+    except (TypeError, ValueError):
+        return None
+
+
+def _evaluation_recorder_stop_is_queued(shared: RuntimeChannels) -> bool:
+    """Return whether RecorderIO has a STOP/finalize decision for this session."""
+    try:
+        control_result = shared.record_control_ring.read_latest()
+        if control_result is not None:
+            command = int(control_result[0][0]["command"])
+            if command == int(RecorderCommand.STOP):
+                return True
+        phase = _evaluation_recorder_phase(shared)
+    except Exception:
+        logger.warning("could not inspect formal-eval recorder stop state", exc_info=True)
+        return False
+    return phase in {
+        RecorderPhase.FINALIZING,
+        RecorderPhase.COMPLETED,
+        RecorderPhase.ERROR,
+    }
+
+
+def _wait_for_evaluation_recorder_stop(shared: RuntimeChannels) -> bool:
+    """Give executor a bounded chance to queue STOP before process shutdown.
+
+    The wait covers only the small cross-process handoff from executor to
+    RecorderIO.  It never waits for HDF5/video finalization; RecorderIO owns
+    that bounded transaction after the STOP control has been published.
+    """
+    phase = _evaluation_recorder_phase(shared)
+    needs_ack = bool(shared.is_recording.value) or phase is RecorderPhase.RECORDING
+    if not needs_ack:
+        return True
+    deadline = time.monotonic() + _EVALUATION_RECORDER_STOP_ACK_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if _evaluation_recorder_stop_is_queued(shared):
+            return True
+        time.sleep(_EVALUATION_RECORDER_STOP_ACK_POLL_S)
+    return _evaluation_recorder_stop_is_queued(shared)
 
 
 def _compute_policy_observation_ring_capacities(
@@ -162,6 +239,7 @@ def build_policy_worker_specs(
     execute: bool,
     deployment_config: PolicyDeploymentConfig | None = None,
     max_running_s: float | None = None,
+    evaluation_config: PolicyEvaluationConfig | None = None,
 ) -> list[ProcessSpec]:
     """Build the workers required by the explicit deployment contract.
 
@@ -175,8 +253,17 @@ def build_policy_worker_specs(
     if not isinstance(deployment, PolicyDeploymentConfig):
         raise TypeError("deployment_config must be a PolicyDeploymentConfig")
     max_running_s = validate_max_running_s(max_running_s)
+    if evaluation_config is not None:
+        if not isinstance(evaluation_config, PolicyEvaluationConfig):
+            raise TypeError("evaluation_config must be a PolicyEvaluationConfig")
+        if not execute:
+            raise ValueError("formal policy evaluation requires execute=True")
+        if max_running_s != evaluation_config.max_running_s:
+            raise ValueError(
+                "formal evaluation max_running_s must match its evaluation contract"
+            )
     pointcloud_requested = _requires_pointcloud(policy_spec)
-    camera_requested = _requires_camera(policy_spec)
+    camera_requested = _requires_camera(policy_spec) or evaluation_config is not None
     fingertip_config = (
         FingertipAssemblerConfig.from_runtime(runtime)
         if "fingertip_points" in _observation_field_names(policy_spec)
@@ -223,6 +310,15 @@ def build_policy_worker_specs(
                 ready_name="pointcloud",
             )
         )
+    if evaluation_config is not None:
+        specs.append(
+            ProcessSpec(
+                "recorder",
+                recorder_io_loop,
+                (shared, _evaluation_recorder_config(runtime, evaluation_config)),
+                ready_name="recorder",
+            )
+        )
     specs.extend(
         [
             ProcessSpec(
@@ -241,6 +337,7 @@ def build_policy_worker_specs(
                     deployment,
                     execute,
                     max_running_s,
+                    evaluation_config,
                 ),
             ),
         ]
@@ -270,6 +367,7 @@ def run_policy_deployment(
     deployment_config: PolicyDeploymentConfig | None = None,
     prefix: str | None = None,
     max_running_s: float | None = None,
+    evaluation_config: PolicyEvaluationConfig | None = None,
 ) -> int:
     """Run a multi-episode policy deployment lifecycle and return its exit code.
 
@@ -283,6 +381,11 @@ def run_policy_deployment(
         raise TypeError("runtime must be an ExperimentConfig")
     if not isinstance(execute, bool):
         raise TypeError("execute must be a boolean")
+    if evaluation_config is not None:
+        if not isinstance(evaluation_config, PolicyEvaluationConfig):
+            raise TypeError("evaluation_config must be a PolicyEvaluationConfig")
+        if not execute:
+            raise ValueError("formal policy evaluation requires execute=True")
     validate_policy_runtime_compatibility(policy_spec, runtime)
     if not isinstance(worker_config, InferenceWorkerConfig):
         raise TypeError("worker_config must be an InferenceWorkerConfig")
@@ -292,6 +395,15 @@ def run_policy_deployment(
     if not isinstance(deployment, PolicyDeploymentConfig):
         raise TypeError("deployment_config must be a PolicyDeploymentConfig")
     max_running_s = validate_max_running_s(max_running_s)
+    if evaluation_config is not None:
+        if (
+            max_running_s is not None
+            and max_running_s != evaluation_config.max_running_s
+        ):
+            raise ValueError(
+                "formal evaluation max_running_s must match its evaluation contract"
+            )
+        max_running_s = evaluation_config.max_running_s
     logger.info(
         "policy deployment: experiment=%s runtime=%s device=%s seed=0 execute=%s mode=%s",
         worker_config.experiment,
@@ -303,7 +415,7 @@ def run_policy_deployment(
 
     ctx = mp.get_context("spawn")
     pointcloud_requested = _requires_pointcloud(policy_spec)
-    camera_requested = _requires_camera(policy_spec)
+    camera_requested = _requires_camera(policy_spec) or evaluation_config is not None
     channel_config = RuntimeChannelsConfig.from_runtime(
         runtime,
         pointcloud_num_points=(
@@ -343,6 +455,7 @@ def run_policy_deployment(
             execute=execute,
             deployment_config=deployment,
             max_running_s=max_running_s,
+            evaluation_config=evaluation_config,
         )
         procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)
@@ -413,11 +526,18 @@ def run_policy_deployment(
         )
         home_planner = build_home_planner(runtime) if execute else None
         home_status = "return hand + arm home before B" if home_planner else "disabled"
-        print(
-            "  [B] start run   [S] stop run   [Q] quit   [ESC] e-stop   "
-            f"[H] {home_status}",
-            flush=True,
-        )
+        if evaluation_config is not None:
+            print(
+                "  [B] begin eval   [S] success   [C] failure   [D] invalid   "
+                f"[Q] quit   [ESC] e-stop   [H] {home_status}",
+                flush=True,
+            )
+        else:
+            print(
+                "  [B] start run   [S] stop run   [Q] quit   [ESC] e-stop   "
+                f"[H] {home_status}",
+                flush=True,
+            )
 
         operator_stop = threading.Event()
         operator_thread = threading.Thread(
@@ -426,16 +546,20 @@ def run_policy_deployment(
             kwargs={
                 "stop_event": operator_stop,
                 "execute": execute,
+                "evaluation": evaluation_config is not None,
             },
             name="policy-operator",
             daemon=True,
         )
         operator_thread.start()
 
+        heartbeat_names = {"arm", "hand", "inference", "policy"}
+        if evaluation_config is not None:
+            heartbeat_names.update({"camera", "pointcloud", "recorder"})
         heartbeat_timeouts = {
             process.name: float(runtime.safety.heartbeat_timeouts[process.name])
             for process in started_procs
-            if process.name in {"arm", "hand", "inference", "policy"}
+            if process.name in heartbeat_names
         }
         exit_reason, normal_exit = run_supervisor(
             shared,
@@ -443,6 +567,17 @@ def run_policy_deployment(
             heartbeat_timeouts_s=heartbeat_timeouts,
             supervisor_hz=float(runtime.safety.supervisor_hz),
         )
+
+        if evaluation_config is not None and not _wait_for_evaluation_recorder_stop(
+            shared
+        ):
+            # Motion has already been fenced by the supervisor's fault/stop
+            # path.  Do not block on finalization, but make an unacknowledged
+            # formal recorder transaction visible as a failed session.
+            logger.error(
+                "formal eval recorder STOP was not queued before shutdown"
+            )
+            shared.error_state.value = True
 
         if operator_stop is not None:
             operator_stop.set()

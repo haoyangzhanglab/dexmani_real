@@ -31,6 +31,8 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 RECORDER_STOP_TIMEOUT_S = 60.0
+RECORDER_START_TIMEOUT_S = 10.0
+RECORDER_START_CANCEL_REASON = "recorder_start_timeout"
 _STOP_POLL_INTERVAL_S = 0.01
 
 
@@ -235,6 +237,7 @@ class RecorderClient:
         self._generation = 0
         self._frame_count = 0
         self._recording = False
+        self._start_pending = False
         self._stop_requested = False
         self._last_poll_status_sequence = 0
         self._last_stop_result: RecorderStopResult | None = None
@@ -246,6 +249,11 @@ class RecorderClient:
     @property
     def is_recording(self) -> bool:
         return self._recording
+
+    @property
+    def start_pending(self) -> bool:
+        """Whether a START generation awaits acknowledgement or cancellation."""
+        return self._start_pending
 
     @property
     def stop_pending(self) -> bool:
@@ -303,6 +311,7 @@ class RecorderClient:
     def start_episode(self, *, task_label: str = "", operator: str = "") -> bool:
         if (
             self._recording
+            or self._start_pending
             or self._stop_requested
             or not self.shared.is_ready("recorder")
         ):
@@ -322,26 +331,48 @@ class RecorderClient:
             return False
         self._generation += 1
         self._last_stop_result = None
+        self._start_pending = True
         self._write_control(
             RecorderCommand.START, task_label=task_label, operator=operator
         )
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + RECORDER_START_TIMEOUT_S
         while time.monotonic() < deadline and self.shared.is_running.value:
             status = self._read_status()
             if status is not None and int(status["generation"]) == self._generation:
                 phase = RecorderPhase(int(status["phase"]))
                 if phase is RecorderPhase.RECORDING:
                     self._recording = True
+                    self._start_pending = False
                     self._stop_requested = False
                     self._frame_count = 0
                     return True
                 if phase is RecorderPhase.ERROR:
+                    self._start_pending = False
                     return False
             # Starting is bounded but may span more than one supervisor tick.
             # RecorderClient is policy-owned, so keep that owner's heartbeat live.
             self.shared.set_heartbeat("policy", time.monotonic())
             time.sleep(0.005)
+        self.cancel_pending_start()
         return False
+
+    def cancel_pending_start(
+        self,
+        *,
+        reason: str = RECORDER_START_CANCEL_REASON,
+    ) -> bool:
+        """Cancel an unacknowledged START without allowing a late recording.
+
+        The control ring is latest-only.  A recorder that has not yet observed
+        START may therefore see only this STOP; RecorderIO recognizes this
+        bounded cancel reason and publishes a terminal, unsaved transaction.
+        """
+        if not self._start_pending:
+            return False
+        self._write_control(RecorderCommand.STOP, save=False, stop_reason=reason)
+        self._start_pending = False
+        self._stop_requested = True
+        return True
 
     def add_frame(
         self,
@@ -442,6 +473,11 @@ class RecorderClient:
         return True
 
     def stop_episode(self, success: bool = True, reason: str = "") -> str | None:
+        if self._start_pending:
+            # There is no recorder transaction to save yet; use the one
+            # protocol reason that RecorderIO accepts before START.
+            self.cancel_pending_start()
+            return None
         if not self._recording or self._stop_requested:
             return None
         self._write_control(RecorderCommand.STOP, save=success, stop_reason=reason)
@@ -483,6 +519,7 @@ class RecorderClient:
         phase = RecorderPhase(int(status["phase"]))
         if phase is RecorderPhase.FINALIZING:
             self._recording = False
+            self._start_pending = False
             self._stop_requested = True
             return self._status_result(status, done=False)
         if phase not in (RecorderPhase.COMPLETED, RecorderPhase.ERROR):
@@ -490,6 +527,7 @@ class RecorderClient:
                 done=False, phase=phase, generation=self._generation
             )
         self._recording = False
+        self._start_pending = False
         self._stop_requested = False
         result = self._status_result(status, done=True)
         self._last_stop_result = result
@@ -509,6 +547,7 @@ class RecorderClient:
                 phase = RecorderPhase(int(status["phase"]))
                 if phase in (RecorderPhase.COMPLETED, RecorderPhase.ERROR):
                     self._recording = False
+                    self._start_pending = False
                     self._stop_requested = False
                     result = self._status_result(status, done=True)
                     self._last_stop_result = result

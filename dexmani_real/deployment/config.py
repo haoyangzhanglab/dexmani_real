@@ -37,6 +37,10 @@ FIXED_POLICY_RUNTIME_TARGET = (
 
 _DEPLOYMENT_DEFAULT_MODE = "sync"
 _DEPLOYMENT_MODES = frozenset({"sync", "async"})
+_GENERIC_TEMPORAL_ENSEMBLE_ERROR = (
+    "Generic chunk deployment does not support temporal_ensemble_coeff.\n"
+    "Re-export this experiment with temporal_ensemble_coeff=null."
+)
 
 _SUPPORTED_OBSERVATION_FIELDS = frozenset(
     {"joint_state", "point_cloud", "rgb", "contact_force", "fingertip_points"}
@@ -147,6 +151,14 @@ def _expected_fingertip_semantics(runtime: Any) -> dict[str, str]:
 
 def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> None:
     """Validate only whether Real can run the Policy-owned public contract."""
+    try:
+        temporal_ensemble_coeff = policy_spec.temporal_ensemble_coeff
+    except AttributeError as exc:
+        raise ValueError(
+            "PolicySpec must declare temporal_ensemble_coeff for generic deployment"
+        ) from exc
+    if temporal_ensemble_coeff is not None:
+        raise ValueError(_GENERIC_TEMPORAL_ENSEMBLE_ERROR)
     fields = _validate_real_observation_capability(policy_spec)
     if policy_spec.requires_hand is not True:
         raise ValueError(

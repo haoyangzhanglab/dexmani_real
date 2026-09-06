@@ -52,7 +52,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/storage/hdf5_writer.py`](dexmani_real/recording/storage/hdf5_writer.py)、[`recording/storage/reader.py`](dexmani_real/recording/storage/reader.py) |
 | 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`dataset/`](dexmani_real/dataset) |
 | 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v24、processed v13 与 Policy Zarr v7 的字段、dtype、shape 与语义 |
-| learned-policy 部署 | [`docs/policy_deployment.md`](docs/policy_deployment.md)、[`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`deployment/inference/dexmani_policy.py`](dexmani_real/deployment/inference/dexmani_policy.py) |
+| learned-policy 部署与正式评估 | [`examples/run_policy.py`](examples/run_policy.py)、[`docs/policy_eval_workflow.md`](docs/policy_eval_workflow.md) | [`deployment/`](dexmani_real/deployment)、[`deployment/inference/dexmani_policy.py`](dexmani_real/deployment/inference/dexmani_policy.py) |
 | 相机、桌面与 VR 标定 | [`examples/`](examples) | [`calibration/`](dexmani_real/calibration)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
 | 点云完整链路 | [`docs/pointcloud_pipeline.md`](docs/pointcloud_pipeline.md) | [`sensor/pointcloud.py`](dexmani_real/sensor/pointcloud.py)、[`sensor/pointcloud_worker.py`](dexmani_real/sensor/pointcloud_worker.py) |
 
@@ -151,7 +151,10 @@ CLI override > YAML file > dexmani_real/config/defaults.py
 
 Real runtime 配置由 [`config/experiment.py`](dexmani_real/config/experiment.py) 唯一解析、校验和冻结；learned-policy 的 observation freshness、command progress、action validity 和 watchdog timing
 属于其 `policy` 段，模型 shape、modality、horizon 和 inference cadence 则来自 Policy public
-API 的 `PolicySpec`。sync/async 调度模式与 episode action-step 上限由 `run_policy.py` CLI 明确提供。
+API 的 `PolicySpec`。generic artifact 必须声明 `temporal_ensemble_coeff: null`，否则在
+Real lifecycle 前明确拒绝；调度不会额外对 action chunk 做 temporal blending。`shadow`/`run` 的
+sync/async 调度模式与 episode action-step 上限由 `run_policy.py` CLI 明确提供；formal `eval`
+则使用必填的 wall-clock budget `max_running_s`。
 `pointcloud` 是与 EEF `policy.workspace` 分离的感知配置段；实时 worker、离线
 重建和诊断入口只从该段派生参数，并把点云策略与桌面语义写入 processed/Zarr。
 可在不启动硬件的情况下查看遥操作解析结果：
@@ -175,6 +178,7 @@ python examples/collect_teleop.py --print-config
 | learned policy 检查 | `python examples/run_policy.py list`；`python examples/run_policy.py check <experiment> --device <device>` | 仅列出实验，或经 Policy public API strict restore + warmup + synthetic predict；不连接硬件 |
 | learned policy shadow | `python examples/run_policy.py shadow <experiment> [--inference-mode sync\|async] [--max-action-steps N]` | 连接真实 sensor 与 arm/XHand feedback，执行 inference、IK 和 SafetyGate；默认 sync，结构性禁止 actuator publication 与 home |
 | learned policy run | `python examples/run_policy.py run <experiment> [--inference-mode sync\|async]` | 连接并控制 xArm7/XHand；默认 sync；每个 episode 都需 H 完成 hand + collision-checked arm home，再以新 B 启动 |
+| learned policy formal eval | `python examples/run_policy.py eval <experiment> --max-running-s S --task-label TASK --operator NAME` | 连接并控制 xArm7/XHand；默认 async，强制 camera + RecorderIO，写入隔离的 `evaluations/`，并保存 SUCCESS/FAILURE/INVALID trial |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |
@@ -233,11 +237,35 @@ python examples/run_policy.py run <policy/task/experiment> \
 runtime YAML 只需写实际覆盖项。子命令所属参数可放在子命令前或后。它们都会连接真实设备，运行前必须
 确认工作区、标定、急停和操作者授权；推荐顺序是 `check → shadow → run`。
 
+`eval` 是正式研究 rollout，不是 `run` 的录制开关。它要求固定的 wall-clock timeout、task label
+和 operator，默认使用 `async`（可以显式用 `--inference-mode sync` 做 mode ablation），不提供
+`--max-action-steps` 作为第二个实验预算：
+
+```bash
+python examples/run_policy.py eval <policy/task/experiment> \
+  --device cuda:0 \
+  --max-running-s 60 \
+  --task-label pick_cube \
+  --operator researcher
+```
+
+启动前会计算 checkpoint SHA-256 并打印 selector、checkpoint、observation/action contract、control
+rate、mode、timeout、task、operator 和输出目录。默认输出为
+`evaluations/<policy>/<task>/<experiment>/`；`--output-dir` 可以改变组织方式，但其 resolved path
+不得与 demonstration `episodes/` namespace 重叠。formal eval 即使对 state-only policy 也启动 camera
+作为审计证据，camera payload 不会因此自动进入 model observation。
+
+每个 B 在完成 `H → B` 的物理 home 前置条件后，必须先获得 RecorderIO 的 `RECORDING` 确认，才进入
+RUNNING；第一条 policy command 前会记录一个真实的 held initial sample。按键为 B（开始）、S（SUCCESS）、
+C（FAILURE）、D（INVALID）、H（home）、Q（以 INVALID 结束并有界退出）、ESC（即时 e-stop）。正常
+SUCCESS/FAILURE/INVALID 都保存现有 recorder transaction；recorder/storage/camera integrity failure 仍按
+fail-closed 语义中止，绝不把不完整数据伪装成完整 episode。
+
 ### Learned policy 实时点云
 
-完整的 experiment 选择、`list/check/shadow/run` 边界、按键流程和诊断说明见
-[`docs/policy_deployment.md`](docs/policy_deployment.md)。其中 `list` 与 `check` 不连接硬件；
-`shadow` 虽然禁止 actuator publication，仍会连接相机、xArm 和 XHand，必须按硬件流程处理。
+完整的 experiment 选择与按键边界由 [`examples/run_policy.py`](examples/run_policy.py) 定义；其中
+`list` 与 `check` 不连接硬件，`shadow`、`run` 与 `eval` 都会连接真实设备。`shadow` 虽然禁止
+actuator publication，仍会连接相机、xArm 和 XHand，必须按硬件流程处理。
 
 `PolicySpec.observation_fields` 包含 `point_cloud` 时，lifecycle 才启动 camera 与独立
 point-cloud worker。worker 始终读取最新的 depth-to-color aligned RGB-D，旧帧不会排队；inference 仅在

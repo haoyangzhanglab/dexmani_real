@@ -18,6 +18,10 @@ def _samples() -> deque[float]:
     return deque(maxlen=_SAMPLE_CAPACITY)
 
 
+def _step_samples() -> deque[int]:
+    return deque(maxlen=_SAMPLE_CAPACITY)
+
+
 @dataclass
 class PolicyStats:
     """Bounded timings and the few failure counts useful to an operator.
@@ -32,6 +36,7 @@ class PolicyStats:
     observation_skew_ms: deque[float] = field(default_factory=_samples)
     schedule_lateness_ms: deque[float] = field(default_factory=_samples)
     publication_interval_ms: deque[float] = field(default_factory=_samples)
+    skipped_prefix_steps: deque[int] = field(default_factory=_step_samples)
     arm_action_clip_count: int = 0
     safety_rejection_count: int = 0
     command_progress_timeout_count: int = 0
@@ -60,8 +65,15 @@ class PolicyStats:
     def observe_publication_interval_ms(self, value: float) -> None:
         self._append(self.publication_interval_ms, value)
 
+    def observe_skipped_prefix_steps(self, value: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("skipped_prefix_steps must be a non-negative integer")
+        if value < 0:
+            raise ValueError("skipped_prefix_steps must be non-negative")
+        self.skipped_prefix_steps.append(value)
+
     @staticmethod
-    def _latest(samples: deque[float]) -> float | None:
+    def _latest(samples: deque[float] | deque[int]) -> float | int | None:
         return samples[-1] if samples else None
 
     def snapshot(self) -> dict[str, int | float]:
@@ -82,6 +94,7 @@ class PolicyStats:
             ("observation_skew_ms", self.observation_skew_ms),
             ("schedule_lateness_ms", self.schedule_lateness_ms),
             ("publication_interval_ms", self.publication_interval_ms),
+            ("skipped_prefix_steps", self.skipped_prefix_steps),
         ):
             latest = self._latest(samples)
             if latest is not None:

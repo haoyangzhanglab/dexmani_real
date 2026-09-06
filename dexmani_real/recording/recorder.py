@@ -9,7 +9,7 @@ shared memory or controls hardware.
 
 from __future__ import annotations
 
-__all__ = ["EpisodeRecorder", "StopResult"]
+__all__ = ["EpisodeRecorder", "StopResult", "normalize_provenance_metadata"]
 
 import atexit
 import shutil
@@ -55,10 +55,49 @@ DEFAULT_MAX_RECORD_FRAMES: int = 10000
 _CAMERA_WRITER_CLOSE_TIMEOUT_S = 60.0
 _PREVIOUS_EPISODE_STOP_TIMEOUT_S = 15.0
 _PROCESS_EXIT_STOP_TIMEOUT_S = 60.0
+_MAX_PROVENANCE_VALUE_BYTES = 4096
 
 
 # The episode-stop thread is non-daemon so transaction finalization is not abandoned.
 _LIVE_RECORDERS: weakref.WeakSet = weakref.WeakSet()
+
+
+def normalize_provenance_metadata(
+    provenance: Mapping[str, object] | None,
+) -> dict[str, str]:
+    """Validate recorder-owned, scalar episode provenance attributes.
+
+    Provenance is deliberately separate from camera metadata: the recorder
+    owns the ``provenance_*`` namespace and callers may not repurpose it to
+    override schema or camera fields.
+    """
+    if provenance is None:
+        return {}
+    if not isinstance(provenance, Mapping):
+        raise TypeError("provenance must be a mapping of string keys and values")
+
+    normalized: dict[str, str] = {}
+    for key, value in provenance.items():
+        if (
+            not isinstance(key, str)
+            or not key
+            or not key.isascii()
+            or not key.isidentifier()
+            or key.startswith("provenance_")
+        ):
+            raise ValueError(
+                "provenance keys must be non-empty ASCII identifiers without "
+                "the provenance_ prefix"
+            )
+        if not isinstance(value, str):
+            raise TypeError("provenance values must be strings")
+        if len(value.encode("utf-8")) > _MAX_PROVENANCE_VALUE_BYTES:
+            raise ValueError(
+                "provenance values must be at most "
+                f"{_MAX_PROVENANCE_VALUE_BYTES} UTF-8 bytes"
+            )
+        normalized[key] = value
+    return normalized
 
 
 def _flush_all_recorders() -> None:
@@ -186,6 +225,7 @@ class EpisodeRecorder:
         camera_serial: str | None = None,
         depth_scale: float | None = None,
         camera_metadata: dict[str, Any] | None = None,
+        provenance: Mapping[str, object] | None = None,
         skip_initial_frames: int = 0,
     ) -> bool:
         metadata_errors = validate_camera_metadata_keys(camera_metadata)
@@ -193,6 +233,7 @@ class EpisodeRecorder:
             raise ValueError(
                 "episode camera metadata rejected: " + "; ".join(metadata_errors)
             )
+        normalized_provenance = normalize_provenance_metadata(provenance)
         if not self.join_stop(timeout=_PREVIOUS_EPISODE_STOP_TIMEOUT_S):
             if self._stop_error is not None:
                 logger.warning(
@@ -244,6 +285,7 @@ class EpisodeRecorder:
             "camera_serial": camera_serial,
             "depth_scale": depth_scale,
             "camera_metadata": dict(camera_metadata or {}),
+            "provenance": normalized_provenance,
             "skip_initial_frames": self._skip_initial_frames,
         }
 
@@ -276,6 +318,10 @@ class EpisodeRecorder:
             meta.attrs[ARM_SENT_MARKER] = True
 
         self._write_camera_meta_attrs(meta)
+
+        provenance = p.get("provenance") or {}
+        for key, value in provenance.items():
+            meta.attrs[f"provenance_{key}"] = value
 
         meta.attrs["skip_initial_frames"] = int(p.get("skip_initial_frames", 0))
         camera_metadata = p.get("camera_metadata") or {}

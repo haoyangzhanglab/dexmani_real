@@ -13,9 +13,9 @@
 | `README.md` | 面向使用者的能力、环境、工作流与稳定架构。 |
 | `repo_map.md` | 当前运行拓扑、核心数据流与边界索引。 |
 | `.codex/config.toml` | 项目级 Codex 权限、联网与子智能体并发配置。 |
-| `.codex/agents/*.toml` | 项目级难度分档子智能体：`sol-high`、`terra-xhigh`、`luna-max`。 |
-| `docs/repair_workflow.md` | 本轮分阶段 correctness 修复的顺序、三档 agent 分工与验收协议。 |
-| `docs/repair_progress.md` | 本轮修复的基线、阶段状态、测试证据与最终 acceptance。 |
+| `.codex/agents/*.toml` | 项目级难度分档子智能体：`sol-high`、`terra-max`、`luna-max`。 |
+| [Policy eval implementation guide](<docs/DexMani Policy Deployment & Real-World Eval — Codex Implementation Guide.md>) | Policy canonical action、Real 调度与正式评估录制的目标合同。 |
+| [Policy eval workflow](docs/policy_eval_workflow.md) | 本轮实施的基线、阶段依赖、三档 agent 分工、离线验收与紧凑执行状态。 |
 
 ## Process topology
 
@@ -60,6 +60,8 @@ causal observation history
 
 - `Prediction` 是唯一的内部策略输出对象；动作是拥有自身内存的 finite `float64[N, D]`，
   `run_generation`、source timestamp 和 logical-step timestamp 随对象传播。
+- generic Policy artifact 的 `temporal_ensemble_coeff` 必须为 `null`；Real 和 Policy generic runtime
+  都只调度 Policy 给出的 canonical `control_action`，不在 deployment/sim runner 追加 overlap blending。
 - inference worker 只负责 observation、策略调用和 prediction 发布；PolicyExecutor 独占动作
   horizon 解码、control-grid 调度、EE→IK、候选校验和 command-progress watchdog。
 - 正常策略 tick 的路径是 `validate → publish → continue`；`execute=False` 完成同样的候选
@@ -67,6 +69,34 @@ causal observation history
   才显式调用 blocking acceptance。
 - B 只在 ARMED、上一轮 S 已清理、physical home（物理运行）完成后进入 RUNNING；sync/async
   都不追赶过期 deadline，也不制造超过 `control_hz` 的 command burst。
+- `tests/test_policy_executor_timing.py` 用离线 fake 覆盖 generic artifact compatibility、
+  async stale-prefix/latest-wins、sync 与 no-catch-up 合同，不启动 worker 或硬件。
+
+## Formal policy evaluation flow
+
+```text
+B + completed H
+    → RecorderIO START acknowledged as RECORDING
+    → RUNNING generation
+    → causal initial held sample
+    → existing PolicyExecutor schedule / coupled publication
+    → SUCCESS | FAILURE | INVALID
+    → motion fence
+    → RecorderIO STOP(save=True) → asynchronous finalize
+    → evaluations/<policy>/<task>/<experiment>/episode_...
+```
+
+- `deployment/evaluation.py` 只携带 eval 的绝对隔离输出路径、task/operator、固定 wall-clock timeout
+  和 recorder-owned provenance；它不是第二个 lifecycle 或 recorder。
+- formal eval 强制启动 camera 与 RecorderIO，即使 policy 是 state-only；camera 仍只在 `PolicySpec`
+  请求 RGB/pointcloud 时进入 inference observation。`RuntimeChannels.evaluation_outcome` 仅传递
+  `NONE/SUCCESS/FAILURE/INVALID`，operator 在同一 `motion_lock` 内先写 outcome 再请求 stop。
+- Recorder 必须在 RUNNING 之前确认，初始 causal sample 必须在第一条 policy command 之前入队。正常
+  success/failure/invalid outcome 使用 `stop_episode(success=True)`；只有 recording integrity/storage
+  失败或尚无真实 source evidence 的 aborted transaction 才 discard。FINALIZING 时拒绝新 B。
+- `tests/test_policy_evaluation.py` 与 `tests/test_run_policy_cli.py` 以 fake/shared-memory boundary
+  覆盖 recorder ordering、outcome race、raw-v24 sentinel semantics、provenance、topology、CLI timeout
+  和 output isolation；不启动任何 worker 或设备。
 
 ## Teleop flow
 
@@ -109,7 +139,9 @@ VR / keyboard input
   episode transaction、sidecar、sequence continuity、validation 和 atomic finalize，不决定
   机器人动作。
 - recording startup 在创建 channel/worker 前使用已解析的运行时配置；录制数据只保留运行所需的
-  source/publish provenance，不新增 episode sidecar 或进入 realtime loop。
+  source/publish provenance，不新增 episode sidecar 或进入 realtime loop。formal eval 的 policy
+  selector、checkpoint name/SHA-256、inference mode 和 wall-clock budget 通过 recorder-owned
+  `provenance_*` metadata attrs 保存，不与 camera metadata 混用。
 - raw episode 的 schema、字段语义和对齐保持单一来源：`recording/storage/schema.py` 与
   [`docs/data_schema.md`](docs/data_schema.md)。当前链路为 raw v24 → processed HDF5 v13 →
   Policy Zarr v7；离线 `dataset/` 负责清洗、审计和导出，不改变 raw 字段含义。所有 processed

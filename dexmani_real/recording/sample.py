@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -13,7 +14,14 @@ from dexmani_real.ipc.schema import (
     HAND_JOINT_SHAPE,
     HAND_TACTILE_FORCE_SHAPE,
     HAND_TACTILE_SUM_SHAPE,
+    nan_array,
 )
+from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
+from dexmani_real.planning.kinematics.fingertip import (
+    compute_fingertip_points_xarm_base,
+)
+from dexmani_real.planning.kinematics.hand_fk import HandKinematics
+from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
 
 
 def _validate_field_shapes(
@@ -123,3 +131,126 @@ class EpisodeAction:
                 ("target_eef_rot6d", (6,)),
             ],
         )
+
+
+def build_episode_state(
+    arm_state: np.ndarray | None,
+    hand_state: np.ndarray | None,
+    hand_tactile: np.ndarray | None = None,
+    hand_fk: HandKinematics | None = None,
+    handbase_position_eef_m: np.ndarray | None = None,
+    handbase_quat_eef_wxyz: np.ndarray | None = None,
+    timestamp_s: float | None = None,
+) -> EpisodeState:
+    """Assemble one generic recording state from arm, hand, and tactile rings.
+
+    The returned values retain the raw episode convention: all geometry is in
+    the xArm-base frame and feedback validity remains represented by the
+    original fields/sentinels.  Both teleoperation and policy evaluation own
+    their action semantics; this helper owns only state assembly.
+    """
+    if arm_state is not None:
+        arm = arm_state[0]
+        arm_qpos = np.asarray(arm["qpos"], dtype=np.float64)
+        arm_qvel = np.asarray(arm["qvel"], dtype=np.float64)
+        arm_tau = np.asarray(arm["tau"], dtype=np.float64)
+        arm_state_valid = bool(arm["state_valid"])
+        if arm_state_valid:
+            eef_pos, eef_rot6d = make_arm_fk().compute(arm_qpos)
+        else:
+            eef_pos = nan_array(3)
+            eef_rot6d = nan_array(6)
+        arm_connected = bool(arm["connected"])
+        arm_last_cmd_seq = int(arm["last_cmd_seq"])
+        arm_last_cmd_is_hold = bool(arm["last_cmd_is_hold"])
+    else:
+        arm_qpos = nan_array(ARM_JOINT_SHAPE)
+        arm_qvel = nan_array(ARM_JOINT_SHAPE)
+        arm_tau = nan_array(ARM_JOINT_SHAPE)
+        eef_pos = nan_array(3)
+        eef_rot6d = nan_array(6)
+        arm_connected = False
+        arm_last_cmd_seq = 0
+        arm_last_cmd_is_hold = False
+        arm_state_valid = False
+
+    if hand_state is not None:
+        hand = hand_state[0]
+        hand_qpos = np.asarray(hand["qpos"], dtype=np.float64)
+        hand_current = np.asarray(hand["current"], dtype=np.float64)
+        hand_tactile_sum = np.asarray(hand["tactile_sum"], dtype=np.float64)
+        hand_tactile_contact = np.asarray(hand["tactile_contact"], dtype=bool)
+        hand_connected = bool(hand["connected"])
+        hand_qpos_stale = bool(hand["qpos_stale"])
+        hand_commboard_err = np.asarray(hand["commboard_err"], dtype=np.int32)
+        hand_jointboard_err = np.asarray(hand["jointboard_err"], dtype=np.int32)
+        hand_tipboard_err = np.asarray(hand["tipboard_err"], dtype=np.int32)
+        hand_state_valid = bool(hand["state_valid"])
+    else:
+        hand_qpos = nan_array(HAND_JOINT_SHAPE)
+        hand_current = nan_array(HAND_JOINT_SHAPE)
+        hand_tactile_sum = nan_array(HAND_TACTILE_SUM_SHAPE)
+        hand_tactile_contact = np.zeros(HAND_CONTACT_SHAPE, dtype=bool)
+        hand_connected = False
+        hand_qpos_stale = False
+        hand_commboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
+        hand_jointboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
+        hand_tipboard_err = np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
+        hand_state_valid = False
+
+    if hand_tactile is not None:
+        hand_tactile_force = np.asarray(
+            hand_tactile[0]["tactile_force"], dtype=np.float64
+        )
+    else:
+        hand_tactile_force = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
+
+    eef_quat_wxyz = (
+        rot6d_to_quat_wxyz(eef_rot6d)
+        if np.all(np.isfinite(eef_rot6d))
+        else np.array([1.0, 0.0, 0.0, 0.0])
+    )
+
+    fingertip_pos = nan_array(HAND_FINGERTIP_SHAPE)
+    if (
+        hand_fk is not None
+        and arm_state_valid
+        and hand_state_valid
+        and hand_connected
+        and handbase_position_eef_m is not None
+        and handbase_quat_eef_wxyz is not None
+    ):
+        fingertip_pos = compute_fingertip_points_xarm_base(
+            arm_qpos,
+            hand_qpos,
+            arm_fk=None,
+            hand_fk=hand_fk,
+            handbase_position_eef_m=handbase_position_eef_m,
+            handbase_quat_eef_wxyz=handbase_quat_eef_wxyz,
+            eef_position_xarm_base_m=eef_pos,
+            eef_rot6d_xarm_base=eef_rot6d,
+        )
+
+    return EpisodeState(
+        arm_qpos=arm_qpos,
+        arm_qvel=arm_qvel,
+        arm_tau=arm_tau,
+        eef_pos=eef_pos,
+        eef_quat_wxyz=eef_quat_wxyz,
+        eef_rot6d=eef_rot6d,
+        hand_qpos=hand_qpos,
+        hand_current=hand_current,
+        hand_tactile_sum=hand_tactile_sum,
+        hand_tactile_force=hand_tactile_force,
+        hand_tactile_contact=hand_tactile_contact,
+        hand_tipboard_err=hand_tipboard_err,
+        hand_commboard_err=hand_commboard_err,
+        hand_jointboard_err=hand_jointboard_err,
+        hand_qpos_stale=hand_qpos_stale,
+        arm_last_cmd_seq=arm_last_cmd_seq,
+        arm_last_cmd_is_hold=arm_last_cmd_is_hold,
+        fingertip_pos=fingertip_pos,
+        arm_connected=arm_connected,
+        hand_connected=hand_connected,
+        timestamp=time.perf_counter() if timestamp_s is None else float(timestamp_s),
+    )

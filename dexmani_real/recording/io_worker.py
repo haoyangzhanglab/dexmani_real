@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,6 +26,7 @@ from dexmani_real.ipc.schema import (
 )
 from dexmani_real.recording.storage.camera_writer import CameraStreamWriterConfig
 from dexmani_real.recording.client import (
+    RECORDER_START_CANCEL_REASON,
     RECORDER_STOP_TIMEOUT_S,
     RecorderCommand,
     RecorderPhase,
@@ -33,6 +35,7 @@ from dexmani_real.recording.client import (
 from dexmani_real.recording.frame import decode_record_sample
 from dexmani_real.recording.recorder import EpisodeRecorder
 from dexmani_real.recording.recorder import StopResult as EpisodeStopResult
+from dexmani_real.recording.recorder import normalize_provenance_metadata
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
@@ -63,6 +66,7 @@ class RecorderIOConfig:
     camera_calibration: CameraExtrinsics = field(default_factory=CameraExtrinsics)
     poll_hz: float = 128.0
     writer_queue_size: int = 8
+    provenance: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if (
@@ -79,6 +83,11 @@ class RecorderIOConfig:
             raise TypeError(
                 "camera_calibration must be a preloaded CameraExtrinsics snapshot"
             )
+        object.__setattr__(
+            self,
+            "provenance",
+            normalize_provenance_metadata(self.provenance),
+        )
 
 
 def _control_text(record: np.void, field: str) -> str:
@@ -111,6 +120,7 @@ def _build_start_metadata(
     task_label: str,
     operator: str,
     calibration: CameraExtrinsics,
+    provenance: Mapping[str, str],
 ) -> dict[str, Any]:
     """Snapshot only essential recording metadata at the immutable START boundary."""
     depth_scale = (
@@ -160,6 +170,7 @@ def _build_start_metadata(
         "camera_name": camera_name,
         "camera_serial": camera_serial,
         "depth_scale": depth_scale,
+        "provenance": dict(provenance),
         "camera_metadata": {
             "camera_firmware": camera_firmware,
             "camera_sdk_version": camera_sdk_version,
@@ -332,6 +343,7 @@ class _RecorderIOSession:
                 task_label=_control_text(control, "task_label"),
                 operator=_control_text(control, "operator"),
                 calibration=self.config.camera_calibration,
+                provenance=self.config.provenance,
             )
             if not self.recorder.start_episode(**metadata):
                 raise RuntimeError("EpisodeRecorder refused start")
@@ -490,8 +502,8 @@ class _RecorderIOSession:
 
     def _handle_stop(self, control: np.void) -> None:
         generation = int(control["generation"])
+        stop_reason = _control_text(control, "stop_reason") or "manual"
         if generation == self.active_generation and self.recorder.is_recording:
-            stop_reason = _control_text(control, "stop_reason") or "manual"
             forced_error = (
                 f"recording aborted: {stop_reason}"
                 if stop_reason
@@ -503,6 +515,26 @@ class _RecorderIOSession:
                 save=bool(control["save"]),
                 reason=stop_reason,
                 forced_error=forced_error,
+            )
+        elif (
+            generation > self.active_generation
+            and not self.recorder.is_recording
+            and self.pending_finalization is None
+            and stop_reason == RECORDER_START_CANCEL_REASON
+        ):
+            # The client timed out while waiting for START acknowledgement.
+            # ``record_control_ring`` is latest-only, so this STOP may be the
+            # only control RecorderIO sees for this generation.  Claim it and
+            # publish a terminal unsaved result rather than later accepting a
+            # stale START or allowing the client to begin another transaction.
+            self.active_generation = generation
+            _publish_status(
+                self.shared,
+                RecorderPhase.COMPLETED,
+                generation,
+                saved=False,
+                reason=stop_reason,
+                failure_count=self.failure_count,
             )
         elif generation != self.active_generation:
             logger.warning(

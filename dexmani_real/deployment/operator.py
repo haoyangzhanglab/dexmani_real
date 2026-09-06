@@ -15,12 +15,14 @@ e-stop never depends on this loop being scheduled.
 from __future__ import annotations
 
 import threading
+import time
 
 import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.control.arm_homing import ArmHomeConfig, execute_arm_home
 from dexmani_real.control.hand_homing import publish_hand_home_and_wait_accepted
+from dexmani_real.deployment.evaluation import EvaluationOutcome
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import (
     OnlineIKConfig,
@@ -32,18 +34,19 @@ from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
+from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.safety import (
     SafetyState,
     StopRequest,
     request_policy_start,
     request_policy_stop,
 )
-from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
 _POLL_S = 0.05
+_EVALUATION_QUIT_STOP_ACK_TIMEOUT_S = 1.0
 
 
 def _request_immediate_stop(shared: RuntimeChannels) -> None:
@@ -56,6 +59,55 @@ def _request_immediate_quit(shared: RuntimeChannels) -> None:
     """Apply Q's motion fence before asking the supervisor to shut down."""
     _request_immediate_stop(shared)
     shared.quit_requested.value = True
+
+
+def _request_evaluation_outcome_and_stop(
+    shared: RuntimeChannels,
+    outcome: EvaluationOutcome,
+) -> bool:
+    """Publish a formal outcome before its ordered motion fence.
+
+    ``motion_lock`` is an RLock, so ``request_policy_stop`` preserves this
+    write-before-stop ordering while it revokes RUNNING.  The executor can
+    therefore consume a stable outcome rather than observing an ordinary S
+    first and guessing how the trial ended.
+    """
+    with shared.motion_lock:
+        was_running = int(shared.safety_state.value) == int(SafetyState.RUNNING)
+        if was_running:
+            try:
+                current = EvaluationOutcome(int(shared.evaluation_outcome.value))
+            except ValueError:
+                shared.error_state.value = True
+                return
+            if current is EvaluationOutcome.NONE:
+                shared.evaluation_outcome.value = int(outcome)
+        if not request_policy_stop(shared):
+            shared.error_state.value = True
+    return was_running
+
+
+def _await_evaluation_stop_ack(
+    shared: RuntimeChannels,
+    *,
+    stop_event: threading.Event,
+) -> bool:
+    """Wait briefly until executor has queued STOP for an active eval trial.
+
+    Q must not let the supervisor close RecorderIO before the executor has
+    fenced motion and handed it a save/discard decision.  This waits only for
+    the executor's existing STOP acknowledgement; RecorderIO finalization
+    remains asynchronous and continues under its normal shutdown path.
+    """
+    deadline = time.monotonic() + _EVALUATION_QUIT_STOP_ACK_TIMEOUT_S
+    while time.monotonic() < deadline:
+        with shared.motion_lock:
+            if int(shared.stop_request.value) == int(StopRequest.NONE):
+                return True
+        if stop_event.is_set() or not bool(shared.is_running.value):
+            return False
+        time.sleep(_POLL_S)
+    return False
 
 
 def build_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
@@ -150,6 +202,7 @@ def run_operator_control(
     *,
     stop_event: threading.Event,
     execute: bool,
+    evaluation: bool = False,
 ) -> None:
     """Keyboard thread target: map operator keys to shared flags / home.
 
@@ -160,13 +213,22 @@ def run_operator_control(
     """
     if not isinstance(execute, bool):
         raise TypeError("execute must be a boolean")
+    if not isinstance(evaluation, bool):
+        raise TypeError("evaluation must be a boolean")
     if execute != (planner is not None):
         raise ValueError("execute must match physical home availability")
-    keyboard = KeyboardInput(
-        estop_callback=lambda: setattr(shared.estop_request, "value", True),
-        stop_callback=lambda: _request_immediate_stop(shared),
-        quit_callback=lambda: _request_immediate_quit(shared),
-    )
+    if evaluation:
+        # S/C/D/Q must be consumed by this loop so outcome writes happen
+        # before their stop fence. ESC stays an immediate callback.
+        keyboard = KeyboardInput(
+            estop_callback=lambda: setattr(shared.estop_request, "value", True),
+        )
+    else:
+        keyboard = KeyboardInput(
+            estop_callback=lambda: setattr(shared.estop_request, "value", True),
+            stop_callback=lambda: _request_immediate_stop(shared),
+            quit_callback=lambda: _request_immediate_quit(shared),
+        )
     try:
         keyboard.start()
     except Exception:
@@ -187,7 +249,16 @@ def run_operator_control(
             # drained batch must not survive a successful home sequence.
             discard_begin_in_batch = False
             signals = keyboard.poll(timeout=_POLL_S)
-            stop_in_batch = OperatorCommand.STOP in signals
+            stop_in_batch = any(
+                signal
+                in {
+                    OperatorCommand.STOP,
+                    OperatorCommand.PAUSE,
+                    OperatorCommand.DISCARD,
+                    OperatorCommand.QUIT,
+                }
+                for signal in signals
+            )
             for signal in signals:
                 if signal is OperatorCommand.BEGIN:
                     if discard_begin_in_batch or not request_policy_start(
@@ -200,7 +271,33 @@ def run_operator_control(
                         )
                         continue
                 elif signal is OperatorCommand.STOP:
-                    _request_immediate_stop(shared)
+                    if evaluation:
+                        _request_evaluation_outcome_and_stop(
+                            shared,
+                            EvaluationOutcome.SUCCESS,
+                        )
+                    else:
+                        _request_immediate_stop(shared)
+                elif signal is OperatorCommand.PAUSE:
+                    if evaluation:
+                        _request_evaluation_outcome_and_stop(
+                            shared,
+                            EvaluationOutcome.FAILURE,
+                        )
+                    else:
+                        logger.warning(
+                            "operator: C is only a formal-evaluation failure marker"
+                        )
+                elif signal is OperatorCommand.DISCARD:
+                    if evaluation:
+                        _request_evaluation_outcome_and_stop(
+                            shared,
+                            EvaluationOutcome.INVALID,
+                        )
+                    else:
+                        logger.warning(
+                            "operator: D is only a formal-evaluation invalid marker"
+                        )
                 elif signal is OperatorCommand.HOME:
                     if planner is None:
                         logger.warning("operator: H is disabled in policy deployment")
@@ -267,7 +364,23 @@ def run_operator_control(
                     discard_begin_in_batch = True
                 elif signal is OperatorCommand.QUIT:
                     if not shared.quit_requested.value:
-                        _request_immediate_quit(shared)
+                        if evaluation:
+                            was_running = _request_evaluation_outcome_and_stop(
+                                shared,
+                                EvaluationOutcome.INVALID,
+                            )
+                            if was_running and not _await_evaluation_stop_ack(
+                                shared,
+                                stop_event=stop_event,
+                            ):
+                                logger.error(
+                                    "operator: eval Q timed out before executor "
+                                    "acknowledged recorder stop"
+                                )
+                                shared.error_state.value = True
+                            shared.quit_requested.value = True
+                        else:
+                            _request_immediate_quit(shared)
                     return
                 elif signal is OperatorCommand.EMERGENCY_STOP:
                     shared.estop_request.value = True
