@@ -1,124 +1,93 @@
-# DexMani Real — Policy Rollout Simplification Guide
+# DexMani Real — Policy Rollout Correctness Cleanup Guide
 
-> Repository: `haoyangzhanglab/dexmani_real`
-> Intended executor: Claude Code / Codex
-> Scope: personal PhD real-robot research.
+> Repository: `haoyangzhanglab/dexmani_real`  
+> Intended executor: Claude Code / Codex  
+> Scope: personal PhD real-robot research. Make the learned-policy rollout path logically correct and easier to reason about. Preserve working robot infrastructure; do not redesign the runtime into a general framework.
+
+---
 
 ## 1. Goal
 
-Simplify the learned-policy deployment path while preserving the mechanisms that are directly required for correct robot-learning experiments:
+The target learned-policy execution path is:
 
 ```text
-timestamped observation
+Timestamped sensors
         ↓
-Policy inference
+Causal Observation Builder
         ↓
-ActionChunk [N, D]
+Policy inference worker
         ↓
-stale-action filtering
+Prediction / ActionChunk
         ↓
-joint / EE decode
+Timestamp-based stale action filtering
         ↓
-IK when required
+Joint decode or EE→IK
         ↓
-simple safety validation
+Safety validation
         ↓
-coupled arm + hand command
+Coupled arm + hand command
         ↓
-robot
+Robot workers
 ```
 
-Do not turn this repository into a general robotics serving framework.
+The goal is semantic cleanup, not a new scheduler.
 
-The implementation must optimize for:
-
-- correct experiment semantics;
-- identical deployment and evaluation control paths;
-- simple debugging;
-- minimal hidden runtime behavior.
-
----
-
-## 2. Preserve these invariants
-
-Do not redesign:
+Preserve:
 
 ```text
 causal observation alignment
-shared-memory sensor rings
+shared-memory rings
 inference worker separation
-Prediction / ActionChunk ownership
-run_generation stale-result protection
-logical timestamped action execution
+prediction ownership
+run_generation protection
+timestamped action execution
 stale-prefix skipping
-no catch-up behavior
-arm+hand coupled command publication
-hardware e-stop boundary
-```
-
-These are core correctness mechanisms.
-
-The following are implementation details, not new architecture concepts:
-
-```text
-run_generation
-prediction ring
-executor polling
-worker heartbeat
-RecorderIO process
+no catch-up
+coupled arm+hand publication
+e-stop boundary
+worker supervision
 ```
 
 ---
 
-## 3. Policy boundary
+## 2. Do not redesign existing infrastructure
 
-Real should depend only on the public Policy contract:
-
-```text
-PolicySpec
-    action_key
-    control_action_dim
-    n_obs_steps
-    n_action_steps
-    observation_fields
-    control_dt_s
-
-predict(observation)
-    -> float64 ActionChunk [N, D]
-```
-
-Real must not understand:
+Do not rewrite:
 
 ```text
-Diffusion
-Flow Matching
-solver details
-normalizer internals
-model preprocessing
-EMA
+IPC implementation
+sensor drivers
+teleoperation
+RecorderIO process architecture
+worker supervision
+heartbeat system
+robot SDK workers
 ```
 
-Remove all Real-side assumptions about generic temporal blending.
+The current process separation and safety boundaries are useful. Simplify only the learned-policy semantics.
 
 ---
 
-## 4. Remove obsolete generic temporal semantics
+## 3. Remove obsolete Policy compatibility fields
 
-Current code contains compatibility checks for:
+Current Real deployment validates obsolete generic temporal semantics.
+
+Remove:
 
 ```text
 temporal_ensemble_coeff
+Generic temporal blending assumptions
 ```
 
-This is not a supported Real runtime feature.
+from:
 
-Required:
+```text
+deployment/config.py
+Policy compatibility checks
+CLI/config plumbing where only this field is used
+```
 
-- remove active `temporal_ensemble_coeff` dependency from Real deployment config;
-- remove runtime validation whose only purpose is checking this obsolete field;
-- keep canonical Policy action execution only.
-
-Do not implement:
+Do not add:
 
 ```text
 Temporal Ensemble
@@ -127,127 +96,160 @@ RTC
 previous-action conditioning
 ```
 
-If a future experiment studies these methods, they must be explicit Policy algorithms, not hidden Real runtime behavior.
+If a future experiment needs these, they belong to an explicit Policy algorithm variant, not generic Real runtime behavior.
 
 ---
 
-## 5. Action execution semantics
+## 4. Keep current timestamped ActionChunk execution
 
-The executor should implement standard timestamped action chunk execution:
+Do not replace the current scheduling design.
 
-For chunk:
+The executor should keep the standard semantics:
+
+For:
 
 ```text
-A = [a0, a1, ..., aN]
+A=[a0,...,aN]
 ```
 
 with:
 
 ```text
-t_i = t_chunk + i * control_dt
+t_i=t_chunk+i*control_dt
 ```
 
-Rules:
+execute:
 
 ```text
 future action
-    execute at target time
+    wait until target time
 
 past action
     skip
 
-entire chunk stale
-    discard chunk
+whole chunk stale
+    discard
 ```
 
 Do not:
 
 ```text
 retime stale actions
-execute old actions faster to catch up
-blend old/new chunks
+execute catch-up bursts
+blend chunks
 ```
+
+Current mechanisms such as prediction ring, run generation, and executor polling are implementation details; keep them unless a concrete bug requires change.
 
 ---
 
-## 6. Remove hidden duplicated timing semantics
+## 5. Timing cleanup: remove only duplicated action validity
 
-Observation freshness and command freshness are different concepts.
+Separate:
 
-Keep:
+### Observation validity
 
-```text
-observation age
-observation modality skew
-```
-
-for building valid Policy input.
-
-Keep one command delivery timeout for:
+Used before inference:
 
 ```text
-executor → robot worker
+sensor age
+sensor skew
+causal alignment
 ```
 
-Avoid using sensor source age again after Policy already produced an ActionChunk.
+Keep.
 
-Remove or simplify duplicated concepts such as:
+### Command delivery validity
+
+Used between executor and robot workers:
+
+```text
+command TTL / worker acceptance timeout
+```
+
+Keep.
+
+### Remove duplicated prediction invalidation
+
+Review:
 
 ```text
 max_source_to_command_age_s
 ```
 
-if they only revalidate the already-created action chunk.
+If it only re-checks the age of the observation after a Policy chunk has already been produced, remove that dependency from action execution.
+
+Do not remove worker safety timeouts:
+
+```text
+first command timeout
+command silence timeout
+command progress timeout
+action apply timeout
+```
+
+Those protect physical execution, not Policy semantics.
 
 ---
 
-## 7. Safety policy
+## 6. Safety semantics: make failures interpretable
 
-Safety should be reject-oriented.
+The goal is not to build a planner. Keep simple validation.
 
-Recommended learned-policy checks:
+Keep:
 
 ```text
-arm joint limits
-hand joint limits
-per-step joint delta limits
+joint limits
+hand limits
+per-step delta limits
 EEF workspace limits
 hardware feedback health
+e-stop
 ```
 
-Do not silently modify learned actions.
-
-Change:
+Do not add:
 
 ```text
-arm spike clipping
-```
-
-into:
-
-```text
-SAFETY_REJECT
-```
-
-unless a later experiment explicitly studies a command limiter.
-
-Do not make PolicyExecutor an online motion planner.
-
-Avoid adding:
-
-```text
-online collision planner
-trajectory optimizer
+online trajectory optimization
 adaptive safety correction
+new collision planner
 ```
+
+### Action modification
+
+Do not silently change learned actions.
+
+Current learned-policy arm spike clipping should be reviewed:
+
+Preferred semantics:
+
+```text
+unsafe action
+    ↓
+SAFETY_REJECT
+    ↓
+record rejection
+```
+
+not:
+
+```text
+unsafe action
+    ↓
+modified action
+    ↓
+execute silently
+```
+
+If a future experiment studies command limiting, make it an explicit experiment variable and record both raw/executed actions.
 
 ---
 
-## 8. IK and safety attribution
+## 7. Separate IK failure and safety rejection
 
-Maintain clear failure semantics:
+Maintain clear attribution.
 
-### Joint policy
+### Joint action policy
 
 ```text
 joint action
@@ -257,7 +259,7 @@ safety
         SAFETY_REJECT
 ```
 
-### EE policy
+### EE action policy
 
 ```text
 EE action
@@ -269,176 +271,224 @@ safety
         SAFETY_REJECT
 ```
 
-Do not record joint-limit/action-admission failures as IK failures.
+Do not label:
+
+```text
+joint limit
+workspace rejection
+large action jump
+```
+
+as IK failure.
+
+Modify only the metadata path; do not change the raw data schema unless unavoidable.
 
 ---
 
-## 9. Formal evaluation redesign
+## 8. Formal evaluation: decouple recording metadata from command validity
 
-Formal evaluation must execute the same control path as normal deployment.
-
-Current desired structure:
+Current formal evaluation has valuable concepts:
 
 ```text
 B
-↓
 Recorder START
-↓
 RUNNING
-↓
-normal policy rollout
-↓
-outcome
-↓
-Recorder STOP/save
+SUCCESS/FAILURE/INVALID
+Recorder STOP
 ```
 
-Recorder is an observer, not a controller.
+Keep them.
 
-Do not allow evaluation-only evidence collection to block action publication.
+However, evaluation-only evidence collection must not decide whether a valid Policy command can be published.
 
-Example:
+Required behavior:
 
 ```text
-state-only policy
-camera recording failure
+Policy observation valid
+        ↓
+execute normal control path
+        ↓
+record rollout metadata/evidence when available
 ```
 
-should not change policy control semantics.
+### Initial episode boundary
 
-Recording failure may produce:
+Keep the initial recording/start handshake. It is reasonable that recording must be ready before an episode begins.
+
+### During RUNNING
+
+Do not require every action publication to wait for:
 
 ```text
-INVALID episode
+camera read
+FK reconstruction
+EpisodeState assembly
+Recorder write
 ```
 
-but should not automatically become a robot control fault.
+A missing recording-only source should become a recording/evaluation issue, not silently change Policy control semantics.
+
+Do not create a new recorder architecture. Modify the existing executor/evaluation path minimally.
 
 ---
 
-## 10. Episode storage semantics
-
-Every episode that enters RUNNING should be preserved.
+## 9. Recorder outcome semantics
 
 Separate:
 
 ```text
-save episode
+episode outcome
 ```
 
 from:
 
 ```text
-outcome
+storage integrity
 ```
 
-Store:
+Recommended:
 
 ```text
 SUCCESS
 FAILURE
 INVALID
-reason
 ```
 
-Invalid episodes are valuable debugging data and should not disappear.
+are saved normally when the rollout reached a valid recording state.
+
+However, unrecoverable recorder/storage failures such as:
+
+```text
+sample ring overflow
+writer corruption
+cannot finalize artifact
+```
+
+may abort saving. They must be explicitly reported as recorder failures.
+
+Do not silently discard ordinary failed/invalid trials.
 
 ---
 
-## 11. Home/start lifecycle
+## 10. Home/start lifecycle
 
-Avoid redundant authorization state.
+Do not remove `physical_home_completed` blindly.
+
+It currently represents that a complete home procedure occurred, not just a convenience flag.
+
+If simplifying it:
+
+1. First ensure B checks the complete measured start condition:
+
+```text
+arm state near home
+hand state near home
+feedback healthy
+```
+
+2. Then remove redundant historical authorization state.
+
+Do not replace a known-safe check with arm-only qpos checking.
+
+---
+
+## 11. PolicySpec boundary
+
+Real should consume only the public Policy API.
+
+Current Real compatibility should continue validating the fields it genuinely uses:
+
+```text
+action_key
+control_action_dim
+n_obs_steps
+n_action_steps
+observation_fields
+control timing
+```
+
+Do not perform a broad PolicySpec redesign in this task.
+
+---
+
+## 12. Tests / checks
+
+The repository currently does not establish a pytest test suite. Do not create a large test framework only for this patch.
 
 Prefer:
 
 ```text
-H
-↓
-robot moves home
-
-B
-↓
-check current robot state
-↓
-start if valid
+small deterministic unittest/script checks
 ```
 
-The current measured robot state is the source of truth.
-
-Do not rely on a long-lived flag whose meaning is "home was completed previously" unless required by a specific hardware constraint.
-
----
-
-## 12. Files expected to change
-
-Expected areas:
-
-```text
-dexmani_real/deployment/config.py
-dexmani_real/deployment/inference/*
-dexmani_real/deployment/executor.py
-
-dexmani_real/control/publication.py
-dexmani_real/control/safety_gate.py
-
-dexmani_real/runtime/safety.py
-
-dexmani_real/deployment/evaluation.py
-
-dexmani_real/recording/*
-
-examples/run_policy.py
-README.md
-repo_map.md
-```
-
-Do not rewrite:
-
-```text
-teleop
-robot workers
-IPC implementation
-sensor drivers
-```
-
-unless a direct dependency requires it.
-
----
-
-## 13. Focused tests
-
-Add only deterministic tests for semantics:
+covering:
 
 ```text
 partial stale chunk
 whole stale chunk
-old run_generation discarded
-IK failure classification
-safety rejection classification
-evaluation recording does not alter action scheduling
+old run_generation ignored
+IK_FAIL attribution
+SAFETY_REJECT attribution
+recording-only evidence missing does not change command semantics
 ```
 
 No hardware tests.
 
 ---
 
-## 14. Explicit non-goals
+## 13. Expected files
 
-Do not implement:
+Search first. Expected areas:
 
 ```text
-RTC
-Temporal Ensemble
-adaptive horizon
-latency compensation
-steps_per_inference
-new scheduler framework
-new recorder architecture
-metrics dashboard
-industrial deployment framework
+dexmani_real/deployment/config.py
+dexmani_real/deployment/executor.py
+
+dexmani_real/control/publication.py
+dexmani_real/control/safety_gate.py
+
+dexmani_real/deployment/evaluation.py
+
+dexmani_real/examples/run_policy.py
+README.md
+repo_map.md
 ```
 
-If later experiments require these, add them as explicit research variants.
+Do not modify:
+
+```text
+teleop
+sensor drivers
+robot workers
+IPC implementation
+```
+
+unless required by a direct dependency.
+
+---
+
+## 14. Implementation order
+
+### Phase A — Policy compatibility cleanup
+
+1. Remove obsolete temporal field checks.
+2. Verify Real loads the new Policy public contract.
+
+### Phase B — executor semantics cleanup
+
+1. Remove duplicated prediction source-age invalidation if it duplicates observation validity.
+2. Fix IK vs safety attribution.
+3. Replace hidden action modification with explicit rejection where applicable.
+
+### Phase C — evaluation cleanup
+
+1. Keep episode boundaries.
+2. Stop evaluation-only evidence from gating every action.
+3. Preserve normal rollout artifacts and explicit recorder failures.
+
+### Phase D — docs/checks
+
+Update durable docs only after behavior is verified.
 
 ---
 
@@ -455,12 +505,15 @@ After editing:
 
 ```bash
 python -m compileall -q dexmani_real
-python -m pytest -q <focused tests>
+
+# use repository's existing lightweight check style if present
+
+
 git diff --check
 git diff --stat
 ```
 
-Do not run real robot commands unless explicitly authorized.
+Do not run real robot commands without explicit authorization.
 
 ---
 
@@ -469,23 +522,65 @@ Do not run real robot commands unless explicitly authorized.
 Complete when:
 
 ```text
-Policy execution path is simple and timestamp-correct
+Policy rollout uses canonical timestamped action chunks
 ```
 
 ```text
-Normal deployment and eval share the same control semantics
+Normal deployment and formal evaluation share control semantics
 ```
 
 ```text
-IK failures and safety failures are distinguishable
+IK failure != safety rejection
 ```
 
 ```text
-Recording no longer silently changes policy behavior
+Recording does not silently alter valid Policy commands
 ```
 
 ```text
-No generic temporal blending mechanism exists in Real runtime
+No generic temporal blending exists in Real runtime
 ```
 
-Report changed files, verified tests, and remaining unverified hardware items only.
+and:
+
+- existing robot infrastructure remains intact;
+- focused offline checks pass;
+- no RTC/Temporal Ensemble/scheduler framework was added.
+
+---
+
+## 17. Final Claude Code / Codex report
+
+Return:
+
+### Changed
+- files changed;
+- semantic contracts modified.
+
+### Preserved
+Confirm:
+
+```text
+causal observations
+prediction ownership
+timestamp scheduling
+robot safety boundary
+worker architecture
+```
+
+### Verified
+- compile result;
+- focused checks;
+- diff check.
+
+### Not Verified
+Explicitly list:
+
+```text
+real robot execution
+hardware timing
+task success rate
+```
+
+### Remaining risk
+Only concrete discovered risks. Do not propose generic temporal smoothing or new deployment frameworks.
