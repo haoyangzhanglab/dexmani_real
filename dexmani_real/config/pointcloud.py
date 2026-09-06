@@ -7,8 +7,6 @@ same immutable policy without importing camera or geometry dependencies.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,7 +66,7 @@ class PointCloudConfig:
     outlier_min_component_points: int = 10
     outlier_candidate_multiplier: int = 8
     # Select one fine-voxel representative per coarse 3x3x3 cell before the
-    # final hash fill. At the default 5 mm voxel size this stratifies sampling
+    # final deterministic fill. At the default 5 mm voxel size this stratifies sampling
     # over 15 mm cells without the runtime cost of farthest-point sampling.
     sampling_coarse_voxel_stride: int = 3
 
@@ -153,11 +151,3 @@ class PointCloudConfig:
             "outlier_candidate_multiplier": self.outlier_candidate_multiplier,
             "sampling_coarse_voxel_stride": self.sampling_coarse_voxel_stride,
         }
-
-    @property
-    def sha256(self) -> str:
-        """Stable identity for boundary checks and persisted provenance."""
-        canonical = json.dumps(
-            self.to_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False
-        )
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

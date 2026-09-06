@@ -1119,7 +1119,7 @@ def _run_keyboard_session(
         return False
     print(
         f"Keyboard teleop: {runtime.keyboard_teleop.control_hz:g}Hz, "
-        f"hand={'measured' if hand_enabled else 'assumed-home'}, config={runtime.sha256[:12]}"
+        f"hand={'measured' if hand_enabled else 'assumed-home'}"
     )
     return _run_control_loop(
         shared,

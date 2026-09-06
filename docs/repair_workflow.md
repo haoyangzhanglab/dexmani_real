@@ -101,7 +101,7 @@ READY 只表示子任务可验收。
 | 3B | terra-xhigh | sol-high 核查启动边界 | no-hand recording 在任何 worker/camera/recorder 启动前拒绝 |
 | 3C | sol-high 定状态表并收紧边界 | luna-max 清单；terra-xhigh 显式 callsite 迁移 | callsites 先全绿，再收紧签名并回归 |
 | 4 | terra-xhigh | 主 agent 核对两侧 freshness | 两个 min 路径、显式 override 拒绝、JOINT 无新增限制 |
-| 5 | terra-xhigh | sol-high 复核 startup/storage 边界 | canonical hash、git clean/dirty、原 provenance/reader 回归 |
+| 5 | terra-xhigh | sol-high 复核 startup/storage 边界 | 原 provenance/reader 回归 |
 | 6A/6B | terra-xhigh | sol-high 核查 6B spawn 前拒绝 | lag/tie tests、output occupancy 和 no-spawn tests |
 | 6C | luna-max 或主 agent | 主 agent | hand logical target 与 arm published target 措辞正确 |
 | 7（可选） | luna-max | 主 agent 限定 diff | 0–6 全过；只做已列明的低风险清理 |
@@ -122,12 +122,10 @@ envelope，以及 teleop 保留 endpoint collision rejection、不执行逐 tick
 
 - 先补三种 profile regression，刻意提供错误 raw `hand_fingertip`；证明所有 profile 都
   从各自 processed `joint_state` 计算 fingertip，joint_state 只生成一次。
-- 纯 geometry helper 接受 caller 提供的 arm/hand URDF SHA，不读文件；identity 覆盖
-  arm EEF frame、SDK→URDF mapping、finger link 顺序、mount position 和 rotation matrix。
-- quaternion 先归一化再转 matrix；测试 q、-q、scaled q 同旋转 identity 相同，以及每项
-  geometry 依赖变化改变 SHA。canonical JSON 使用 sorted keys、紧凑分隔符、禁 NaN。
-- 在生成 fingertip 的同一次 processing 操作冻结 derivation、policy ID、geometry SHA。
-  export 只能传播已冻结值，不能读取当前 URDF 重算历史 geometry。
+- fingertip 计算只使用 caller 提供的 FK、mapping、link 顺序和安装变换，不读取文件或持久化
+  几何摘要。
+- quaternion 先归一化再转 matrix；测试 q、-q、scaled q 表示同一旋转，并覆盖各项几何依赖。
+- 在生成 fingertip 的同一次 processing 操作记录 derivation 与 policy ID，export 只传播这些值。
 - processed v13 → Zarr v7：required attrs 严格校验，多 episode 三项不一致即拒绝。
   同时确认已有 point-cloud attrs 的完整性及 export 传播；不修改点云生成算法。
 - 更新直接相关的 schema 文档和导航。A 的 targeted/related tests 通过后进入 B；
@@ -139,18 +137,18 @@ envelope，以及 teleop 保留 endpoint collision rejection、不执行逐 tick
 - 从 Zarr attrs 返回一次验证完成的 mapping，写入 `ObservationFieldSpec.semantics`；
   不从训练 config 推断缺失值，不二次读取/解析相同 attrs。
 - point-cloud 包含 frame、position_units、color_order、color_source、policy_id、
-  config_sha256、table_plane_abcd_json、sampling、transform。
-- fingertip 包含 frame、units、finger_order、derivation、policy_id、geometry_sha256。
+  table_plane_abcd_json、sampling、transform。
+- fingertip 包含 frame、units、finger_order、derivation、policy_id。
 - deployment artifact 保持 v3；更新相应 export/contract fixtures 和 tests。
 
 **C — Real startup compatibility：**
 
 - 从 runtime.pointcloud、runtime.environment.table 和 canonical constants 构建 expected
   point-cloud semantics；table plane JSON 使用 `separators=(",", ":")`、`allow_nan=False`。
-- 当前 arm/hand URDF、EEF frame、mapping、finger links、mount 构建 fingertip identity。
+- 当前 runtime 的点云策略、桌面平面和 fingertip policy 常量构建 expected semantics。
 - 按请求 modality 严格逐项比较，缺失/mismatch 在 motion 前拒绝，报错指出具体字段。
 - 覆盖同 N 下 voxel/workspace/table 改动、policy ID、sampling/transform mismatch；
-  覆盖 fingertip 匹配、geometry/policy mismatch、缺失 identity。
+  覆盖 fingertip policy mismatch 与缺失 identity。
 - 最后执行 Real Zarr v7 → Policy export → Real parse/compatibility 的纯软件 smoke。
   可通过临时目录在两种 Conda 环境间传递 artifact，不引入跨环境 runtime framework。
 
@@ -196,11 +194,8 @@ visual 显式 override 超过 policy 上限则 ValueError，不 silent clamp；J
 
 ### Phase 5：minimal provenance
 
-experiment startup 一次采集 canonical resolved config、git commit 和 dirty 状态，
-通过已有 HDF5 provenance namespace 持久化；git 查询不进入 realtime loop。
-测试 JSON SHA 等于 resolved_config_sha256、commit 是 40 位 lowercase SHA、dirty 为
-字符串 0/1、原 resource provenance 和 raw reader 合同不变。
-不加 sidecar 或 raw schema；dirty 时 commit 只表示 base revision，不声称完整重建源码。
+实验 startup 不再采集或持久化配置/源码摘要；git 查询也不进入 realtime loop。
+原有 raw reader 与逐行 provenance 合同保持不变，来源管理由调用方负责。
 
 ### Phase 6：deterministic replay
 

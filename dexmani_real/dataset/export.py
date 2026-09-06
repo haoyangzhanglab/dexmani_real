@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import tempfile
@@ -200,10 +199,10 @@ def _inspect_artifact(
         data_keys = {
             key for key, value in source.items() if isinstance(value, h5py.Dataset)
         }
-        if data_keys != set(profile.dataset_keys) or set(source.keys()) != data_keys | {
-            "provenance"
-        }:
-            raise ValueError(f"{path.name}: processed data keys do not match profile")
+        if not set(profile.dataset_keys).issubset(data_keys) or not isinstance(
+            source.get("provenance"), h5py.Group
+        ):
+            raise ValueError(f"{path.name}: required processed data is incomplete")
         length = int(source.attrs.get("episode_steps", -1))
         if length <= 0:
             raise ValueError(f"{path.name}: episode_steps must be positive")
@@ -268,7 +267,6 @@ def _inspect_artifact(
             ),
             "fingertip_points_derivation": fingertip_semantics["derivation"],
             "fingertip_points_policy_id": fingertip_semantics["policy_id"],
-            "fingertip_points_geometry_sha256": fingertip_semantics["geometry_sha256"],
             "action_ee_frame": _text(source.attrs.get("action_ee_frame", "")),
         }
         visual_profile = profile.needs_rgb or profile.needs_pointcloud
@@ -369,14 +367,10 @@ def _inspect_artifact(
                 raise ValueError(
                     f"{path.name}: invalid persisted point-cloud config"
                 ) from exc
-            pointcloud_config_sha256 = resolved_pointcloud.sha256
             point_cloud_semantics = {
                 "frame": _text(source.attrs.get("point_cloud_frame", "")),
                 "color_source": _text(source.attrs.get("point_cloud_color_source", "")),
                 "policy_id": _text(source.attrs.get("point_cloud_policy_id", "")),
-                "config_sha256": _text(
-                    source.attrs.get("point_cloud_config_sha256", "")
-                ),
                 "table_plane_abcd_json": _text(
                     source.attrs.get("point_cloud_table_plane_abcd_json", "")
                 ),
@@ -387,7 +381,6 @@ def _inspect_artifact(
                 "frame": "xarm_base",
                 "color_source": POINT_CLOUD_COLOR_SOURCE,
                 "policy_id": POINT_CLOUD_POLICY_ID,
-                "config_sha256": pointcloud_config_sha256,
                 "table_plane_abcd_json": canonical_table_plane,
                 "sampling": POINT_CLOUD_SAMPLING,
                 "transform": POINT_CLOUD_TRANSFORM,
@@ -437,7 +430,6 @@ def _inspect_artifact(
         )
         provenance = validate_processed_provenance(
             source,
-            expected_profile=profile.value,
             label=path.name,
         )
         rejection = _whole_episode_rejection(path, provenance)
@@ -474,7 +466,6 @@ def _validate_uniform(artifacts: tuple[_Artifact, ...]) -> None:
         for key in (
             "fingertip_points_derivation",
             "fingertip_points_policy_id",
-            "fingertip_points_geometry_sha256",
         ):
             if artifact.semantic_attrs[key] != first.semantic_attrs[key]:
                 raise ValueError(f"{artifact.path.name}: {key} mismatch")
@@ -582,8 +573,7 @@ def _copy_data(
     *,
     chunk_frames: int,
     progress_callback: ExportProgressCallback | None = None,
-) -> dict[str, str]:
-    digests = {key: hashlib.sha256() for key in artifacts[0].dataset_shapes}
+) -> None:
     offset = 0
     total_frames = sum(artifact.length for artifact in artifacts)
     _report_progress(progress_callback, "write", 0, total_frames)
@@ -592,7 +582,7 @@ def _copy_data(
             for row_start in range(0, artifact.length, chunk_frames):
                 row_end = min(artifact.length, row_start + chunk_frames)
                 target_slice = slice(offset + row_start, offset + row_end)
-                for key, digest in digests.items():
+                for key in artifacts[0].dataset_shapes:
                     block = np.asarray(source[key][row_start:row_end])
                     if np.issubdtype(block.dtype, np.floating) and not np.all(
                         np.isfinite(block)
@@ -601,7 +591,6 @@ def _copy_data(
                             f"{artifact.path.name}: {key} contains NaN/Inf"
                         )
                     data_group[key][target_slice] = block
-                    digest.update(np.ascontiguousarray(block).tobytes())
                 _report_progress(
                     progress_callback,
                     "write",
@@ -609,15 +598,12 @@ def _copy_data(
                     total_frames,
                 )
         offset += artifact.length
-    return {key: digest.hexdigest() for key, digest in digests.items()}
 
 
 def _validate_zarr(
     path: Path,
     artifacts: tuple[_Artifact, ...],
-    expected_digests: dict[str, str],
     *,
-    chunk_frames: int,
     progress_callback: ExportProgressCallback | None = None,
 ) -> None:
     root = zarr.open_group(str(path), mode="r")
@@ -651,10 +637,8 @@ def _validate_zarr(
     if not np.array_equal(root["meta"]["episode_ends"][:], expected_ends):
         raise ValueError("Zarr episode_ends mismatch")
     total = int(expected_ends[-1])
-    chunks_per_dataset = (total + chunk_frames - 1) // chunk_frames
-    total_chunks = len(expected_keys) * chunks_per_dataset
-    completed_chunks = 0
-    _report_progress(progress_callback, "verify", 0, total_chunks)
+    _report_progress(progress_callback, "verify", 0, len(expected_keys))
+    completed_keys = 0
     for key in sorted(expected_keys):
         array = root["data"][key]
         expected_shape = (total,) + artifacts[0].dataset_shapes[key]
@@ -663,19 +647,10 @@ def _validate_zarr(
             or np.dtype(array.dtype) != artifacts[0].dataset_dtypes[key]
         ):
             raise ValueError(f"Zarr {key} shape/dtype mismatch")
-        digest = hashlib.sha256()
-        for start in range(0, total, chunk_frames):
-            block = np.asarray(array[start : min(total, start + chunk_frames)])
-            digest.update(np.ascontiguousarray(block).tobytes())
-            completed_chunks += 1
-            _report_progress(
-                progress_callback,
-                "verify",
-                completed_chunks,
-                total_chunks,
-            )
-        if digest.hexdigest() != expected_digests[key]:
-            raise ValueError(f"Zarr {key} checksum mismatch")
+        completed_keys += 1
+        _report_progress(
+            progress_callback, "verify", completed_keys, len(expected_keys)
+        )
 
 
 def export_processed_hdf5_to_zarr(
@@ -688,7 +663,7 @@ def export_processed_hdf5_to_zarr(
     """Atomically publish data/* + meta/episode_ends, without HDF provenance.
 
     ``progress_callback`` receives ``(phase, completed, total)`` for validation,
-    Zarr writing, and Zarr checksum verification. It does not affect export
+    Zarr writing, and structural verification. It does not affect export
     admission or publication behavior.
     """
 
@@ -760,7 +735,7 @@ def export_processed_hdf5_to_zarr(
             compressor=compressor,
             overwrite=False,
         )
-        digests = _copy_data(
+        _copy_data(
             artifacts,
             data_group,
             chunk_frames=resolved.chunk_frames,
@@ -769,8 +744,6 @@ def export_processed_hdf5_to_zarr(
         _validate_zarr(
             staging,
             artifacts,
-            digests,
-            chunk_frames=resolved.chunk_frames,
             progress_callback=progress_callback,
         )
         atomic_publish(staging, target)

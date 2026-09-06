@@ -63,10 +63,9 @@ generation、时钟重置、source/publish/now 因果关系和最大帧龄；构
 `T_xarm_base_from_color`，再调用和 offline processing、实时 worker 相同的
 `sensor.pointcloud.build_point_cloud()`。可视化入口不维护第二套反投影、裁减或采样实现。
 
-raw episode 保存记录期 resolved config 的 SHA-256，但不复制可反序列化的完整点云策略与桌面
-平面。因此即时点云使用当前 resolved runtime 的 `PointCloudConfig` 和桌面标定；哈希与记录期不一致
-时入口会 warning，结果应视为 current-config preview。需要可持久复现和完整 provenance 时，应生成
-processed HDF5；其文件内保存 processing config、点云配置哈希与桌面平面身份。
+raw episode 不保存可反序列化的完整点云策略与桌面平面。因此即时点云使用当前 resolved runtime
+的 `PointCloudConfig` 和桌面标定，结果应视为 current-config preview。需要可持久复现和完整
+provenance 时，应生成 processed HDF5；其文件内保存 processing config、点云策略与桌面平面身份。
 
 运行时只读取 raw v24。`--no-point-cloud` 可关闭即时推导。
 单帧构建结果为空时 Rerun 会显式清除该时间点的点云，避免沿用上一帧。eye-in-hand 仍会 fail closed，因为 raw schema 没有保存相机曝光
@@ -240,8 +239,8 @@ Run table calibration? [y/N]
 post-calibration 同帧诊断快照：
 `rgb.npy`、`depth_aligned_to_color_raw.npy`、`raw_point_cloud.npy`、
 `processed_point_cloud.npy`、`T_xarm_base_from_color.npy` 与 `metadata.json`。metadata 保存 aligned
-几何、`depth_scale_m`、桌面平面及来源、完整 `PointCloudConfig` 与 SHA-256、runtime SHA-256 和算法
-语义。所有 `.npy` 均禁用 pickle；即使 processed 构建为空，原始 RGB-D、raw 点云和空输出仍会保存，
+几何、`depth_scale_m`、桌面平面及来源、完整 `PointCloudConfig` 和算法语义。所有 `.npy` 均禁用
+pickle；即使 processed 构建为空，原始 RGB-D、raw 点云和空输出仍会保存，
 用于离线复现失败帧。该快照是算法诊断产物，不属于 raw episode 或 processed HDF5 schema。
 
 纯 build 不包含等待相机帧、SDK 对齐和共享内存发布；capture-to-cloud 包含 `camera.read()`
@@ -264,7 +263,7 @@ worker 的 `source_to_publish_ms_p95` 日志。当前纯构建目标是 p95 < 40
 | 纯构建吞吐 | 56.8--57.5 FPS |
 | `depth_filter` p50 | 2.54--2.58 ms |
 
-OpenCV 3×3 depth fast path 与逐步 SciPy 参考实现的 240 帧最终点云 SHA-256 全部一致；五个
+OpenCV 3×3 depth fast path 与逐步 SciPy 参考实现的 240 帧最终点云逐元素一致；五个
 诊断快照的可信深度掩码和当前策略点云也逐元素一致。上述数字不包含相机采集、IPC 和系统调度
 尾延迟；部署性能仍以实时 worker 的 `source_to_publish_ms_p95` 为准，真实硬件尚未按当前默认
 参数重新测试。
@@ -293,10 +292,9 @@ policy 上限会被拒绝，而 `joint` profile 不因此引入相机 freshness 
 - `rgb`/`rgb_pc` profile 中 RGB 与 depth 的 `N/H/W` 完全一致，mismatch 在 admission 阶段拒绝；
 - `point_cloud_color_source`；
 - `point_cloud_policy_id`；
-- `PointCloudConfig` 的 SHA-256；
 - 桌面平面、采样和变换语义。
 
-导出、可视化和部署只接受与当前 policy ID、配置哈希及桌面标定身份完全一致的产物；其他产物
+导出、可视化和部署只接受与当前 policy ID、点云策略及桌面标定身份一致的产物；其他产物
 必须从受支持的 raw v24 episode 重新处理。
 
 ## 代码所有权

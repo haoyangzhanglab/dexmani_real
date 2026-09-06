@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,42 +18,15 @@ from dexmani_real.robot.model import (
     ARM_JOINT_SHAPE,
     HAND_JOINT_SHAPE,
     XARM7_XHAND_COLLISION_URDF_PATH,
-    XARM7_XHAND_RIGHT_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
-from dexmani_real.utils.atomic_io import sha256_file
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
 _MIN_EPISODE_RATE_HZ = 1.0
 _MAX_EPISODE_RATE_HZ = 100.0
-_MODEL_PROVENANCE_KEYS = (
-    "arm_hand_collision_urdf_sha256",
-    "arm_hand_urdf_sha256",
-    "arm_hand_srdf_sha256",
-)
 _JOINT_LIMIT_TOLERANCE_RAD = 1e-12
-
-
-def _is_sha256(value: str | None) -> bool:
-    """Return True if *value* is a 64-character hex SHA-256 string."""
-    if not isinstance(value, str) or len(value) != 64:
-        return False
-    try:
-        int(value, 16)
-    except ValueError:
-        return False
-    return True
-
-
-def preflight_model_paths() -> tuple[Path, ...]:
-    """Return the three URDF/SRDF model paths used for geometry provenance checks."""
-    return (
-        XARM7_XHAND_COLLISION_URDF_PATH,
-        XARM7_XHAND_RIGHT_URDF_PATH,
-        XARM7_XHAND_SRDF_PATH,
-    )
 
 
 @dataclass
@@ -71,9 +43,6 @@ class TrajectoryData:
     hand_qpos: np.ndarray | None
     arm_ee: np.ndarray | None
     action_source: str | None = None
-    resolved_config_sha256: str | None = None
-    model_provenance: tuple[tuple[str, str], ...] = ()
-    provenance_warnings: tuple[str, ...] = ()
     send_mask: np.ndarray | None = None
 
     @property
@@ -120,18 +89,6 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
                 f"physical replay requires a valid episode rate, got {fps!r} Hz"
             )
         task_label = str(meta.attrs.get("task_label", "")) if meta is not None else ""
-        resolved_config_sha256 = None
-        model_provenance: tuple[tuple[str, str], ...] = ()
-        if meta is not None:
-            raw_hash = meta.attrs.get("resolved_config_sha256")
-            resolved_config_sha256 = None if raw_hash is None else str(raw_hash)
-            model_provenance = tuple(
-                sorted(
-                    (name.removeprefix("provenance_"), str(meta.attrs[name]))
-                    for name in meta.attrs
-                    if name.startswith("provenance_arm_hand_")
-                )
-            )
 
         arm_action_key = "action_arm_joint_sent"
         action_source = "sent"
@@ -202,8 +159,6 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
         hand_qpos=hand_qpos,
         arm_ee=arm_ee,
         action_source=action_source,
-        resolved_config_sha256=resolved_config_sha256,
-        model_provenance=model_provenance,
         send_mask=send_mask,
     )
     logger.info(
@@ -219,7 +174,7 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
 
 def _processed_replay_source(
     artifact_path: Path,
-) -> tuple[Path, np.ndarray, str, int, str]:
+) -> tuple[Path, np.ndarray, int]:
     """Read the raw-source identity and retained rows from one processed artifact."""
     from dexmani_real.dataset.processed import (
         PROCESSED_SCHEMA_NAME,
@@ -247,31 +202,19 @@ def _processed_replay_source(
 
         try:
             decision = json.loads(str(artifact.attrs["source_decision_json"]))
-            member_hashes = json.loads(str(artifact.attrs["source_member_sha256_json"]))
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise ValueError(
                 f"processed episode {artifact_path.name} has invalid source provenance"
             ) from exc
-        if not isinstance(decision, dict) or not isinstance(member_hashes, dict):
+        if not isinstance(decision, dict):
             raise ValueError(
                 f"processed episode {artifact_path.name} has invalid source provenance"
             )
         source_path_text = decision.get("source_path")
-        expected_data_sha256 = member_hashes.get("data.h5")
         if not isinstance(source_path_text, str) or not source_path_text:
             raise ValueError(
                 f"processed episode {artifact_path.name} lacks its raw source path"
             )
-        if not isinstance(expected_data_sha256, str) or not _is_sha256(
-            expected_data_sha256
-        ):
-            raise ValueError(
-                f"processed episode {artifact_path.name} lacks a valid raw data.h5 hash"
-            )
-
-        source_config_sha256 = str(
-            artifact.attrs.get("source_resolved_config_sha256", "")
-        )
         retained_rows = provenance.source_rows
         source_frames = int(provenance.keep_mask.shape[0])
         if not np.array_equal(
@@ -285,9 +228,7 @@ def _processed_replay_source(
     return (
         Path(source_path_text),
         retained_rows,
-        source_config_sha256,
         source_frames,
-        expected_data_sha256,
     )
 
 
@@ -328,9 +269,6 @@ def _select_raw_trajectory_rows(
             else raw_trajectory.arm_ee[rows].copy()
         ),
         action_source=raw_trajectory.action_source,
-        resolved_config_sha256=raw_trajectory.resolved_config_sha256,
-        model_provenance=raw_trajectory.model_provenance,
-        provenance_warnings=raw_trajectory.provenance_warnings,
         send_mask=(
             None
             if raw_trajectory.send_mask is None
@@ -343,36 +281,19 @@ def load_processed_trajectory(episode_path: str) -> TrajectoryData:
     """Load raw arm and logical hand targets selected by one processed artifact.
 
     Processed ``float32`` action arrays are training data, not physical commands.
-    This loader uses their provenance only: it hashes the recorded raw ``data.h5``
-    and selects retained rows from raw ``float64`` arm and logical hand targets.
+    This loader uses their row provenance to select retained rows from raw
+    ``float64`` arm and logical hand targets.
     """
     artifact_path = Path(episode_path)
     (
         source_path,
         retained_rows,
-        source_config_sha256,
         source_frames,
-        expected_data_sha256,
     ) = _processed_replay_source(artifact_path)
-    source_data_path = source_path / "data.h5"
-    if not source_data_path.is_file():
-        raise ValueError(
-            f"processed episode {artifact_path.name} requires raw source data.h5 at {source_path}"
-        )
-
-    if sha256_file(source_data_path) != expected_data_sha256:
-        raise ValueError(
-            f"processed episode {artifact_path.name} raw source data.h5 hash mismatch"
-        )
-
     raw_trajectory = load_trajectory(str(source_path))
     if raw_trajectory.num_frames != source_frames:
         raise ValueError(
             f"processed episode {artifact_path.name} source frame count does not match raw source"
-        )
-    if raw_trajectory.resolved_config_sha256 != source_config_sha256:
-        raw_trajectory.provenance_warnings += (
-            "processed source config hash does not match the raw source",
         )
     trajectory = _select_raw_trajectory_rows(raw_trajectory, retained_rows)
     logger.info(
@@ -504,61 +425,13 @@ def _validate_replay_hand_limits(
         )
 
 
-def _reproducibility_warnings(
-    trajectory: TrajectoryData,
-    *,
-    provenance_sha256: str,
-) -> tuple[str, ...]:
-    """Return non-safety provenance differences after physical validation.
-
-    The caller must only use this after the complete trajectory has passed the
-    current geometry and runtime preflight.  At that point the stored hashes
-    remain useful reproducibility evidence, but are not a substitute for the
-    successful physical validation that just occurred.
-    """
-    warnings = list(trajectory.provenance_warnings)
-    if not _is_sha256(trajectory.resolved_config_sha256):
-        warnings.append("recording lacks a valid resolved_config_sha256")
-    elif trajectory.resolved_config_sha256 != provenance_sha256:
-        warnings.append("recorded config hash differs from the replay config")
-    recorded_models = dict(trajectory.model_provenance)
-    missing_models = [
-        name
-        for name in _MODEL_PROVENANCE_KEYS
-        if not _is_sha256(recorded_models.get(name))
-    ]
-    if missing_models:
-        warnings.append(f"recorded model provenance is incomplete: {missing_models}")
-    try:
-        current_models = {
-            name: hashlib.sha256(path.read_bytes()).hexdigest()
-            for name, path in zip(_MODEL_PROVENANCE_KEYS, preflight_model_paths())
-        }
-    except OSError as exc:
-        warnings.append(
-            f"could not audit current URDF/SRDF provenance: {type(exc).__name__}: {exc}"
-        )
-        return tuple(warnings)
-    mismatched_models = [
-        name
-        for name in _MODEL_PROVENANCE_KEYS
-        if _is_sha256(recorded_models.get(name))
-        and recorded_models[name] != current_models[name]
-    ]
-    if mismatched_models:
-        warnings.append(f"recorded model hashes differ: {mismatched_models}")
-    return tuple(warnings)
-
-
 def verify_replay_preflight(
     trajectory: TrajectoryData,
     runtime: ExperimentConfig,
-    *,
-    provenance_sha256: str,
 ) -> None:
     """Fail-closed validation immediately before spawning hardware workers.
 
-    Checks: recorded first measured state, hand-data attestation, full arm/hand
+    Checks: recorded first measured state, hand-data availability, full arm/hand
     command hard limits, the recorded-state-to-first-command transition, and
     every adjacent command pair for workspace bounds and collision
     (self-collision plus static obstacle boxes). Robot-table contact is
@@ -626,11 +499,3 @@ def verify_replay_preflight(
             raise ValueError(
                 f"physical replay collision rejection at transition {start}->{end}"
             )
-    for warning in _reproducibility_warnings(
-        trajectory,
-        provenance_sha256=provenance_sha256,
-    ):
-        logger.warning(
-            "physical replay passed current geometry preflight; reproducibility warning: %s",
-            warning,
-        )

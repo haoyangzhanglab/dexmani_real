@@ -272,7 +272,6 @@ def _save_diagnostic_snapshot(
     table_plane_abcd: tuple[float, float, float, float] | None,
     table_plane_source: str,
     pointcloud_config: PointCloudConfig,
-    runtime_config_sha256: str,
     camera_info: dict,
 ) -> Path:
     """Durably publish one self-contained offline point-cloud tuning snapshot."""
@@ -344,9 +343,7 @@ def _save_diagnostic_snapshot(
         "aligned_geometry": geometry.to_dict(),
         "table_plane_abcd": table_plane_json,
         "table_plane_source": table_plane_source,
-        "runtime_config_sha256": runtime_config_sha256,
         "pointcloud_config": pointcloud_config.to_dict(),
-        "pointcloud_config_sha256": pointcloud_config.sha256,
         "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
         "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
         "point_cloud_sampling": POINT_CLOUD_SAMPLING,
@@ -921,7 +918,6 @@ def main(argv: list[str] | None = None) -> int:
                 table_plane_abcd=table_plane_abcd,
                 table_plane_source=table_plane_source,
                 pointcloud_config=pcd_config,
-                runtime_config_sha256=runtime.sha256,
                 camera_info=camera_info,
             )
             print(f"\nSaved point-cloud diagnostic snapshot: {snapshot_path}")

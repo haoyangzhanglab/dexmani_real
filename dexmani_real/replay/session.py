@@ -5,7 +5,7 @@ and the SafetyState machine. Commands flow through coupled_cmd_ring; state is
 read from arm_state_ring / hand_state_ring. No direct SDK access from
 the main process.
 
-Replay reruns dense geometry and provenance preflight, spawns arm/hand workers,
+Replay reruns dense geometry preflight, spawns arm/hand workers,
 replays recorded published arm targets and recorded logical hand targets,
 captures measured robot state, and evaluates joint, EEF, and tracking-lag
 consistency metrics. The current hand worker derives bounded intermediate SDK
@@ -16,7 +16,7 @@ This module owns replay lifecycle, worker topology, and terminal outcome.
 ``ReplayRecorder`` owns the bounded in-memory measurement buffer.
 
 If the episode was recorded with non-default ``--acc``/``--speed``, pass the
-same values here so the resolved-config provenance matches.
+same values here when reproducing the run.
 """
 
 from __future__ import annotations
@@ -62,7 +62,6 @@ class EpisodeReplayConfig:
 
     output_dir: str
     evaluate_consistency: bool
-    config_sha256: str
 
 
 def _validate_replay_output_dir(output_dir: str | Path) -> None:
@@ -309,7 +308,6 @@ def replay_episode(
         verify_replay_preflight(
             trajectory,
             runtime,
-            provenance_sha256=config.config_sha256,
         )
     except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
         return ReplayOutcome(

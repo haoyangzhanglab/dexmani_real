@@ -60,9 +60,7 @@ class RecorderIOConfig:
     max_frames: int
     control_hz: float
     min_frames: int
-    resolved_config_sha256: str
     camera_calibration: CameraExtrinsics = field(default_factory=CameraExtrinsics)
-    provenance: tuple[tuple[str, str], ...] = ()
     poll_hz: float = 128.0
     writer_queue_size: int = 8
 
@@ -77,17 +75,10 @@ class RecorderIOConfig:
             or self.writer_queue_size <= 0
         ):
             raise ValueError("invalid RecorderIO capacity/rate configuration")
-        if len(self.resolved_config_sha256) != 64:
-            raise ValueError("RecorderIO requires the resolved config SHA-256")
         if not isinstance(self.camera_calibration, CameraExtrinsics):
             raise TypeError(
                 "camera_calibration must be a preloaded CameraExtrinsics snapshot"
             )
-        provenance_names = [name for name, _value in self.provenance]
-        if len(set(provenance_names)) != len(provenance_names):
-            raise ValueError("RecorderIO provenance keys must be unique")
-        if any(not name or not value for name, value in self.provenance):
-            raise ValueError("RecorderIO provenance keys and values must be non-empty")
 
 
 def _control_text(record: np.void, field: str) -> str:
@@ -233,8 +224,6 @@ def _create_episode_recorder(shared: Any, config: RecorderIOConfig) -> EpisodeRe
         control_hz=config.control_hz,
         min_frames=config.min_frames,
         arm_sent_stream=True,
-        resolved_config_hash=config.resolved_config_sha256,
-        provenance=dict(config.provenance),
         camera_writer_config=CameraStreamWriterConfig(
             rgb_shape=rgb_shape,
             depth_shape=depth_shape,

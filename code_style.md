@@ -617,7 +617,7 @@ CLI override > YAML experiment file > config/defaults.py
 - component 接收它拥有的窄配置，而不是随处传递巨大配置对象；
 - 简单 derived value 在 owner 附近计算，不再成为独立配置项；
 - calibration 是带 provenance 的外部事实，不与普通超参数混放；
-- 每次采集或部署保存/记录 resolved config identity 与关键资源 hash。
+- 每次采集或部署保存/记录会影响行为的 resolved config 与资源语义；不额外引入摘要或签名机制。
 
 只有会被实验修改、需要记录或影响行为的值才应配置化。内部循环里不会调整的实现细节，
 用靠近 owner 的常量即可。

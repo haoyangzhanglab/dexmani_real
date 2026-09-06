@@ -31,11 +31,9 @@ from dexmani_real.recording.storage.schema import (
     ARM_SENT_MARKER,
     EPISODE_SCHEMA_VERSION,
     validate_data_layout,
-    validate_raw_member_hashes,
     validate_raw_semantics,
 )
 from dexmani_real.recording.storage.video import VideoDecoder
-from dexmani_real.utils.atomic_io import sha256_file
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -115,13 +113,11 @@ class EpisodeReader:
     (``f["arm_qpos"]``, ``f["depth"]``).
     """
 
-    def __init__(self, h5_path: str | Path, *, verify_hash: bool = False) -> None:
+    def __init__(self, h5_path: str | Path) -> None:
         """Open one published episode.
 
-        Normal reads validate the raw schema and its data semantics when
-        :attr:`validity` or :meth:`require_valid` is used.  They deliberately do
-        not rescan large sidecars.  Set ``verify_hash=True`` or call
-        :meth:`audit_integrity` for the slower artifact-integrity audit.
+        Reads validate the raw schema and its data semantics when
+        :attr:`validity` or :meth:`require_valid` is used.
         """
         self._path = Path(h5_path)
         self._closed = False
@@ -156,10 +152,7 @@ class EpisodeReader:
             )
         self._rgb_decoder = VideoDecoder(paths["rgb"])
         try:
-            if verify_hash:
-                self.audit_integrity()
-            else:
-                self.require_valid(purpose="episode read")
+            self.require_valid(purpose="episode read")
         except Exception:
             self.close()
             raise
@@ -181,48 +174,6 @@ class EpisodeReader:
     def schema_version(self) -> int:
         meta = self._h5f.get("meta")
         return 0 if meta is None else int(meta.attrs.get("schema_version", 0) or 0)
-
-    def _sidecar_manifest_errors(self) -> tuple[str, ...]:
-        """Return full sidecar-manifest audit errors without caching results."""
-        meta = self._h5f.get("meta")
-        if meta is None:
-            return ("data.h5 is missing /meta",)
-        try:
-            member_sha256 = {
-                "depth.h5": sha256_file(self._path / "depth.h5"),
-                "rgb.mp4": sha256_file(self._path / "rgb.mp4"),
-            }
-        except (FileNotFoundError, OSError) as exc:
-            return (f"failed to hash raw sidecars: {type(exc).__name__}: {exc}",)
-        return validate_raw_member_hashes(meta.attrs, member_sha256)
-
-    def audit_integrity(self) -> None:
-        """Run the explicit, expensive raw-artifact integrity audit.
-
-        This verifies ordinary raw validity first, then recomputes both sidecar
-        SHA-256 values against the manifest and fully decodes the RGB stream to
-        attest its frame count.  It is intentionally separate from ordinary
-        episode reads and processing admission.
-        """
-        self.require_valid(purpose="artifact integrity audit")
-        manifest_errors = self._sidecar_manifest_errors()
-        if manifest_errors:
-            raise ValueError(
-                "raw sidecar manifest validation failed: " + "; ".join(manifest_errors)
-            )
-        meta = self._h5f.get("meta")
-        frame_count = int(meta.attrs.get("num_frames", -1)) if meta else -1
-        if self._rgb_decoder is None:
-            raise ValueError("episode RGB decoder is unavailable for integrity audit")
-        try:
-            decoded_frames = self._rgb_decoder.count_decoded_frames()
-        except Exception as exc:
-            raise ValueError("failed to decode RGB stream for integrity audit") from exc
-        if decoded_frames != frame_count:
-            raise ValueError(
-                "RGB decoded frame count does not match data.h5 metadata: "
-                f"{decoded_frames} != {frame_count}"
-            )
 
     @property
     def min_frames_met(self) -> bool:
@@ -303,9 +254,6 @@ class EpisodeReader:
             logger.warning("failed raw semantic validation", exc_info=True)
             return ValidityState.INVALID
         if semantic_errors:
-            return ValidityState.INVALID
-        config_hash = str(meta.attrs.get("resolved_config_sha256", ""))
-        if len(config_hash) != 64:
             return ValidityState.INVALID
         if not bool(meta.attrs.get("success", False)) or str(
             meta.attrs.get("camera_writer_error", "")

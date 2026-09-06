@@ -111,7 +111,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"invalid experiment config: {exc}")
     if args.print_config:
         print(runtime.canonical_yaml, end="")
-        print(f"sha256={runtime.sha256}")
         return 0
     if not bool(runtime.policy.hand_enabled) and not args.no_hand:
         parser.error(

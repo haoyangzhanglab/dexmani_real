@@ -201,10 +201,9 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
         return
     geometry, depth_scale_m, base_from_color = static_inputs
     logger.debug(
-        "pointcloud policy: id=%s config_sha256=%s color_source=%s sampling=%s "
+        "pointcloud policy: id=%s color_source=%s sampling=%s "
         "transform=%s config=%s table_plane_abcd=%s",
         POINT_CLOUD_POLICY_ID,
-        cfg.pointcloud.sha256,
         POINT_CLOUD_COLOR_SOURCE,
         POINT_CLOUD_SAMPLING,
         POINT_CLOUD_TRANSFORM,

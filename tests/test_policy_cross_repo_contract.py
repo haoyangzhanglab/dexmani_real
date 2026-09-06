@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import zarr
 
-from dexmani_policy.deployment import export as policy_export
 from dexmani_policy.deployment.contract import (
     DEPLOYMENT_FORMAT,
     DEPLOYMENT_SCHEMA_VERSION,
@@ -28,32 +28,16 @@ from dexmani_real.deployment.config import validate_policy_runtime_compatibility
 from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
-    compute_fingertip_geometry_sha256,
 )
-from dexmani_real.robot.model import (
-    HAND_SDK_TO_URDF_IDX,
-    XARM7_XHAND_COLLISION_URDF_PATH,
-    XHAND_RIGHT_URDF_PATH,
-)
-from dexmani_real.utils.atomic_io import sha256_file
 
 
 class PolicyCrossRepositoryContractTest(unittest.TestCase):
-    def test_real_zarr_v7_policy_contract_and_real_runtime_agree(self) -> None:
+    def test_real_zarr_policy_contract_and_real_runtime_agree(self) -> None:
         runtime = resolve_experiment_config()
         table = runtime.environment.table
-        geometry_sha256 = compute_fingertip_geometry_sha256(
-            arm_fk_urdf_sha256=sha256_file(XARM7_XHAND_COLLISION_URDF_PATH),
-            arm_eef_frame="custom_eef_link",
-            hand_fk_urdf_sha256=sha256_file(XHAND_RIGHT_URDF_PATH),
-            hand_sdk_to_urdf_idx=HAND_SDK_TO_URDF_IDX,
-            fingertip_link_names=runtime.hand.fingertip_link_names,
-            handbase_position_eef_m=runtime.hand.T_eef_handbase_pos_xyz,
-            handbase_quat_eef_wxyz=runtime.hand.T_eef_handbase_quat_wxyz,
-        )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "task.zarr"
-            root = policy_export.zarr.open_group(str(path), mode="w")
+            root = zarr.open_group(str(path), mode="w")
             root.attrs.update(
                 {
                     "schema_name": "dexmani-real-policy-zarr",
@@ -70,7 +54,6 @@ class PolicyCrossRepositoryContractTest(unittest.TestCase):
                     "point_cloud_frame": "xarm_base",
                     "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
                     "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
-                    "point_cloud_config_sha256": runtime.pointcloud.sha256,
                     "point_cloud_table_plane_abcd_json": json.dumps(
                         table.plane_abcd if table.enabled else None,
                         separators=(",", ":"),
@@ -82,7 +65,6 @@ class PolicyCrossRepositoryContractTest(unittest.TestCase):
                     "fingertip_points_unit": "m",
                     "fingertip_points_derivation": FINGERTIP_POINTS_DERIVATION,
                     "fingertip_points_policy_id": FINGERTIP_POLICY_ID,
-                    "fingertip_points_geometry_sha256": geometry_sha256,
                 }
             )
             data = root.create_group("data")
@@ -96,19 +78,62 @@ class PolicyCrossRepositoryContractTest(unittest.TestCase):
             data.create_dataset(
                 "fingertip_points", data=np.zeros((1, 5, 3), np.float32)
             )
-            data_contract = policy_export._build_observation_contract(
-                path,
-                {
-                    "task_name": "task",
-                    "action_key": "action",
-                    "dt": 1.0 / runtime.policy.control_hz,
-                    "agent": {
-                        "num_points": runtime.pointcloud.num_points,
-                        "pc_dim": 6,
+            data_contract = {
+                "schema_name": "dexmani-real-policy-zarr",
+                "schema_version": 7,
+                "domain": "real",
+                "profile": "pointcloud",
+                "task_name": "task",
+                "dt": 1.0 / runtime.policy.control_hz,
+                "obs_alignment": "obs[t]_before_action[t]",
+                "observation_reference": "camera_source_monotonic_ns",
+                "state_alignment": "camera_source_aligned_state",
+                "action_semantics": "teleop_published_joint_target",
+                "requires_hand": True,
+                "observation_fields": {
+                    "joint_state": {
+                        "shape": [19],
+                        "dtype": "float32",
+                        "semantics": {
+                            "representation": "joint_position",
+                            "frame": "robot_joint",
+                            "units": "rad",
+                            "joint_order": "xarm7_xhand12",
+                        },
+                    },
+                    "point_cloud": {
+                        "shape": [runtime.pointcloud.num_points, 6],
+                        "dtype": "float32",
+                        "semantics": {
+                            "representation": "xyzrgb",
+                            "frame": "xarm_base",
+                            "position_units": "m",
+                            "color_order": "rgb",
+                            "color_source": POINT_CLOUD_COLOR_SOURCE,
+                            "policy_id": POINT_CLOUD_POLICY_ID,
+                            "table_plane_abcd_json": json.dumps(
+                                table.plane_abcd if table.enabled else None,
+                                separators=(",", ":"),
+                                allow_nan=False,
+                            ),
+                            "sampling": POINT_CLOUD_SAMPLING,
+                            "transform": POINT_CLOUD_TRANSFORM,
+                        },
+                    },
+                    "fingertip_points": {
+                        "shape": [5, 3],
+                        "dtype": "float32",
+                        "semantics": {
+                            "representation": "point_xyz",
+                            "frame": "xarm_base",
+                            "units": "m",
+                            "finger_order": "thumb_index_mid_ring_pinky",
+                            "derivation": FINGERTIP_POINTS_DERIVATION,
+                            "policy_id": FINGERTIP_POLICY_ID,
+                        },
                     },
                 },
-                ["joint_state", "point_cloud", "fingertip_points"],
-            )
+            }
 
         deployment_spec = parse_deployment_contract(
             {

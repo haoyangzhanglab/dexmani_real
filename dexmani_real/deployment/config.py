@@ -28,14 +28,8 @@ from dexmani_real.ipc.schema import (
 from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
-    compute_fingertip_geometry_sha256,
 )
-from dexmani_real.robot.model import (
-    HAND_SDK_TO_URDF_IDX,
-    XARM7_XHAND_COLLISION_URDF_PATH,
-    XHAND_RIGHT_URDF_PATH,
-)
-from dexmani_real.utils.atomic_io import sha256_file
+from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 
 FIXED_POLICY_RUNTIME_TARGET = (
     "dexmani_real.deployment.inference.dexmani_policy:DexManiPolicyAdapter"
@@ -130,7 +124,6 @@ def _expected_pointcloud_semantics(runtime: Any) -> dict[str, str]:
         "color_order": "rgb",
         "color_source": POINT_CLOUD_COLOR_SOURCE,
         "policy_id": POINT_CLOUD_POLICY_ID,
-        "config_sha256": runtime.pointcloud.sha256,
         "table_plane_abcd_json": json.dumps(
             table_plane,
             separators=(",", ":"),
@@ -142,16 +135,6 @@ def _expected_pointcloud_semantics(runtime: Any) -> dict[str, str]:
 
 
 def _expected_fingertip_semantics(runtime: Any) -> dict[str, str]:
-    hand = runtime.hand
-    geometry_sha256 = compute_fingertip_geometry_sha256(
-        arm_fk_urdf_sha256=sha256_file(XARM7_XHAND_COLLISION_URDF_PATH),
-        arm_eef_frame="custom_eef_link",
-        hand_fk_urdf_sha256=sha256_file(XHAND_RIGHT_URDF_PATH),
-        hand_sdk_to_urdf_idx=HAND_SDK_TO_URDF_IDX,
-        fingertip_link_names=hand.fingertip_link_names,
-        handbase_position_eef_m=hand.T_eef_handbase_pos_xyz,
-        handbase_quat_eef_wxyz=hand.T_eef_handbase_quat_wxyz,
-    )
     return {
         "representation": "point_xyz",
         "frame": "xarm_base",
@@ -159,7 +142,6 @@ def _expected_fingertip_semantics(runtime: Any) -> dict[str, str]:
         "finger_order": "thumb_index_mid_ring_pinky",
         "derivation": FINGERTIP_POINTS_DERIVATION,
         "policy_id": FINGERTIP_POLICY_ID,
-        "geometry_sha256": geometry_sha256,
     }
 
 

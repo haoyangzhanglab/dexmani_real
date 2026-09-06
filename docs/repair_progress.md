@@ -9,6 +9,10 @@
   Phase 4、Phase 5、完整 Phase 6（A → B → C）和 Phase 7 已完成。
 - 所有未进入 red-test gate 的计划 finding 仍不视为已证实的当前缺陷。
 
+> 说明：本文下方 Phase 1/5 段落保留当时的历史验收记录。随后为个人研究用途做了
+> 简化清理，配置、资源、sidecar、fingertip geometry 和点云配置的 hash 不再生成、持久化或校验；
+> 当前行为以源码、README 和 `docs/data_schema.md` 为准。
+
 ## Execution baseline — 2026-09-06
 
 | Repository | HEAD | Worktree before Phase 0 | Software baseline |

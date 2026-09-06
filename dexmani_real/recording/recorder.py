@@ -12,7 +12,6 @@ from __future__ import annotations
 __all__ = ["EpisodeRecorder", "StopResult"]
 
 import atexit
-import json
 import shutil
 import threading
 import time
@@ -36,16 +35,10 @@ from dexmani_real.recording.storage.hdf5_writer import EpisodeDataWriter
 from dexmani_real.recording.storage.schema import (
     ARM_SENT_MARKER,
     EPISODE_SCHEMA_VERSION,
-    RAW_DEPTH_SHA256_ATTR,
-    RAW_MANIFEST_VERSION,
-    RAW_MANIFEST_VERSION_ATTR,
-    RAW_MEMBER_SHA256_JSON_ATTR,
-    RAW_RGB_SHA256_ATTR,
     SEMANTIC_META_ATTRS,
     compute_episode_quality_metrics,
     validate_camera_metadata_keys,
     validate_data_layout,
-    validate_raw_member_hashes,
     validate_raw_semantics,
     validate_source_frame_keys,
 )
@@ -53,7 +46,7 @@ from dexmani_real.recording.timeline import TimestampAlignedBuffer
 from dexmani_real.recording.storage.video import VideoDecoder
 from dexmani_real.recording.sample import EpisodeAction, EpisodeState
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
-from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish, sha256_file
+from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -114,20 +107,13 @@ class EpisodeRecorder:
         min_frames: int = 50,
         arm_sent_stream: bool = False,
         camera_writer_config: CameraStreamWriterConfig | None = None,
-        resolved_config_hash: str | None = None,
-        provenance: dict[str, str] | None = None,
     ) -> None:
         if control_hz <= 0:
             raise ValueError(f"control_hz must be positive, got {control_hz}")
-        if resolved_config_hash is None or len(resolved_config_hash) != 64:
-            raise ValueError("EpisodeRecorder requires a resolved config SHA-256")
         self.data_dir = Path(data_dir)
         self.max_frames = max_frames
         self.control_hz = float(control_hz)
         self.min_frames = int(min_frames)
-        self._resolved_config_hash = resolved_config_hash
-        self._provenance = dict(provenance or {})
-
         self.arm_sent_stream: bool = bool(arm_sent_stream)
 
         self._data_writer: EpisodeDataWriter | None = None
@@ -283,11 +269,6 @@ class EpisodeRecorder:
             self.control_hz
         )  # nominal grid rate; dt = 1/control_hz
         meta.attrs["fps"] = self.control_hz
-        if self._resolved_config_hash is not None:
-            meta.attrs["resolved_config_sha256"] = self._resolved_config_hash
-        for key, value in sorted(self._provenance.items()):
-            meta.attrs[f"provenance_{key}"] = str(value)
-
         for key, semantic_value in SEMANTIC_META_ATTRS.items():
             meta.attrs[key] = semantic_value
 
@@ -828,12 +809,9 @@ class EpisodeRecorder:
         ]
         if missing_sidecars:
             raise RuntimeError(
-                "episode finalization missing sidecars before manifest: "
+                "episode finalization missing sidecars: "
                 + str(missing_sidecars)
             )
-        sidecar_hashes = {
-            name: sha256_file(path) for name, path in sidecar_paths.items()
-        }
 
         def _write_final_meta(meta: h5py.Group) -> None:
             grid_dt_s = 1.0 / self.control_hz
@@ -857,12 +835,6 @@ class EpisodeRecorder:
             meta.attrs["has_timestamps"] = "timestamp" in data_writer.datasets
             meta.attrs["camera_stream_frames"] = camera_frame_count
             meta.attrs["camera_writer_error"] = ""
-            meta.attrs[RAW_MANIFEST_VERSION_ATTR] = RAW_MANIFEST_VERSION
-            meta.attrs[RAW_DEPTH_SHA256_ATTR] = sidecar_hashes["depth.h5"]
-            meta.attrs[RAW_RGB_SHA256_ATTR] = sidecar_hashes["rgb.mp4"]
-            meta.attrs[RAW_MEMBER_SHA256_JSON_ATTR] = json.dumps(
-                sidecar_hashes, sort_keys=True, separators=(",", ":")
-            )
             for metric_name, metric_value in self._camera_writer_metrics.items():
                 meta.attrs[metric_name] = metric_value
             for metric_name, metric_value in quality_metrics.items():
@@ -933,7 +905,6 @@ class EpisodeRecorder:
             "error": error,
             "frame_count_before_abort": int(self._frame_count),
             "created_wall_time_ns": time.time_ns(),
-            "resolved_config_sha256": self._resolved_config_hash or "",
         }
         return atomic_json_dump(payload, target, indent=2, ensure_ascii=False)
 
@@ -948,7 +919,6 @@ class EpisodeRecorder:
         missing = [name for name, path in paths.items() if not path.is_file()]
         if missing:
             raise RuntimeError(f"episode finalization missing modalities: {missing}")
-        meta_attrs: dict[str, Any]
         with h5py.File(paths["data"], "r") as data_h5:
             meta = data_h5.get("meta")
             if meta is None or int(meta.attrs.get("num_frames", -1)) != expected_frames:
@@ -985,7 +955,6 @@ class EpisodeRecorder:
                 raise RuntimeError(
                     "raw semantic validation failed: " + "; ".join(semantic_errors)
                 )
-            meta_attrs = {key: value for key, value in meta.attrs.items()}
         for key in ("depth",):
             with h5py.File(paths[key], "r") as sidecar:
                 if key not in sidecar or int(sidecar[key].shape[0]) != expected_frames:
@@ -996,17 +965,6 @@ class EpisodeRecorder:
                 raise RuntimeError(
                     f"RGB decoded frame count {decoded_frames} != {expected_frames}"
                 )
-        manifest_errors = validate_raw_member_hashes(
-            meta_attrs,
-            {
-                "depth.h5": sha256_file(paths["depth"]),
-                "rgb.mp4": sha256_file(paths["rgb"]),
-            },
-        )
-        if manifest_errors:
-            raise RuntimeError(
-                "raw sidecar manifest validation failed: " + "; ".join(manifest_errors)
-            )
 
     @staticmethod
     def _discard_temp_files(tmp: str) -> None:

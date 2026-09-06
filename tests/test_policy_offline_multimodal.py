@@ -35,6 +35,7 @@ from dexmani_real.dataset.processed import (
     PROCESSED_SCHEMA_VERSION,
     _validate_processed_output_structure,
     validate_processed_hdf5,
+    validate_processed_provenance,
 )
 from dexmani_real.dataset.processing import (
     _write_processed_episode,
@@ -44,7 +45,6 @@ from dexmani_real.dataset.processing import (
 from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
-    compute_fingertip_geometry_sha256,
     compute_fingertip_points_xarm_base,
 )
 from dexmani_real.sensor.pointcloud import (
@@ -203,7 +203,6 @@ class OfflineMultimodalTest(unittest.TestCase):
                 source.create_group("meta").attrs.update(
                     {
                         "task_label": "pick",
-                        "resolved_config_sha256": "a" * 64,
                         "depth_scale": 0.001,
                         "camera_depth_intrinsics": np.eye(3).reshape(-1),
                         "camera_depth_distortion_model": "none",
@@ -317,60 +316,7 @@ class OfflineMultimodalTest(unittest.TestCase):
                             hand_input, expected_state[:, 7:19]
                         )
 
-    def test_fingertip_geometry_sha256_tracks_every_fk_dependency(self) -> None:
-        mapping = (3, 4, 5, 6, 7, 10, 11, 8, 9, 0, 1, 2)
-        links = (
-            "thumb_tip",
-            "index_tip",
-            "mid_tip",
-            "ring_tip",
-            "pinky_tip",
-        )
-        values = {
-            "arm_fk_urdf_sha256": "a" * 64,
-            "arm_eef_frame": "custom_eef_link",
-            "hand_fk_urdf_sha256": "b" * 64,
-            "hand_sdk_to_urdf_idx": mapping,
-            "fingertip_link_names": links,
-            "handbase_position_eef_m": np.array([0.01, -0.02, 0.03]),
-            "handbase_quat_eef_wxyz": np.array([0.5, 0.5, 0.5, 0.5]),
-        }
-
-        reference = compute_fingertip_geometry_sha256(**values)
-        self.assertEqual(reference, compute_fingertip_geometry_sha256(**values))
-        self.assertEqual(
-            reference,
-            compute_fingertip_geometry_sha256(
-                **{
-                    **values,
-                    "handbase_quat_eef_wxyz": -values["handbase_quat_eef_wxyz"],
-                }
-            ),
-        )
-        self.assertEqual(
-            reference,
-            compute_fingertip_geometry_sha256(
-                **{
-                    **values,
-                    "handbase_quat_eef_wxyz": 3.0 * values["handbase_quat_eef_wxyz"],
-                }
-            ),
-        )
-        for key, value in (
-            ("arm_fk_urdf_sha256", "c" * 64),
-            ("hand_fk_urdf_sha256", "d" * 64),
-            ("hand_sdk_to_urdf_idx", tuple(reversed(mapping))),
-            ("fingertip_link_names", tuple(reversed(links))),
-            ("handbase_position_eef_m", np.array([0.02, -0.02, 0.03])),
-            ("handbase_quat_eef_wxyz", np.array([1.0, 0.0, 0.0, 0.0])),
-        ):
-            with self.subTest(key=key):
-                self.assertNotEqual(
-                    reference,
-                    compute_fingertip_geometry_sha256(**{**values, key: value}),
-                )
-
-    def test_policy_zarr_v7_admits_all_four_processed_profiles(self) -> None:
+    def test_policy_zarr_admits_all_four_processed_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for profile in OutputProfile:
@@ -547,7 +493,6 @@ class OfflineMultimodalTest(unittest.TestCase):
                 source.create_group("meta").attrs.update(
                     {
                         "task_label": "pick",
-                        "resolved_config_sha256": "a" * 64,
                     }
                 )
                 source.create_dataset(
@@ -665,10 +610,6 @@ class OfflineMultimodalTest(unittest.TestCase):
                 self.assertEqual(
                     processed.attrs["fingertip_points_policy_id"], FINGERTIP_POLICY_ID
                 )
-                self.assertRegex(
-                    processed.attrs["fingertip_points_geometry_sha256"],
-                    r"^[0-9a-f]{64}$",
-                )
             validate_processed_hdf5(processed_path, config)
             zarr_path = root / "policy.zarr"
             report = export_processed_hdf5_to_zarr(
@@ -699,7 +640,6 @@ class OfflineMultimodalTest(unittest.TestCase):
                 for name in (
                     "fingertip_points_derivation",
                     "fingertip_points_policy_id",
-                    "fingertip_points_geometry_sha256",
                 ):
                     if name in output.attrs:
                         del output.attrs[name]
@@ -716,31 +656,6 @@ class OfflineMultimodalTest(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "fingertip"),
             ):
                 _inspect_artifact(path, PolicyZarrExportConfig())
-
-    def test_export_rejects_non_uniform_fingertip_geometry_identity(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            first = root / "first.h5"
-            second = root / "second.h5"
-            self._write_processed_fixture(first, OutputProfile.JOINT)
-            self._write_processed_fixture(second, OutputProfile.JOINT)
-            with h5py.File(second, "r+") as output:
-                output.attrs["fingertip_points_geometry_sha256"] = "b" * 64
-            with (
-                patch("dexmani_real.dataset.export.validate_processed_payload"),
-                patch(
-                    "dexmani_real.dataset.export.validate_processed_provenance",
-                    return_value=object(),
-                ),
-                patch(
-                    "dexmani_real.dataset.export._whole_episode_rejection",
-                    return_value=None,
-                ),
-                self.assertRaisesRegex(
-                    ValueError, "fingertip_points_geometry_sha256 mismatch"
-                ),
-            ):
-                export_processed_hdf5_to_zarr(root, root / "policy.zarr")
 
     def test_export_rejects_non_boolean_and_non_integer_semantic_attrs(self) -> None:
         cases = (
@@ -833,7 +748,105 @@ class OfflineMultimodalTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "action contains NaN/Inf"):
                 validate_processed_hdf5(path, config)
 
-    def _write_processed_fixture(self, path: Path, profile: OutputProfile) -> None:
+    def test_processed_layout_allows_research_extensions_and_uncompressed_data(
+        self,
+    ) -> None:
+        config = ProcessingConfig(
+            profile=OutputProfile.JOINT,
+            horizon=1,
+            min_full_windows=1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "extended.h5"
+            self._write_processed_fixture(path, OutputProfile.JOINT, compression=None)
+            with h5py.File(path, "r+") as output:
+                output.create_dataset(
+                    "research_score", data=np.zeros(1, dtype=np.float32)
+                )
+                output.create_group("research_notes")
+                output.attrs["research_tag"] = "offline"
+
+            sanity = _validate_processed_output_structure(path, config)
+            self.assertEqual(sanity["level"], "structural")
+            with (
+                patch("dexmani_real.dataset.export.validate_processed_payload"),
+                patch(
+                    "dexmani_real.dataset.export.validate_processed_provenance",
+                    return_value=object(),
+                ),
+                patch(
+                    "dexmani_real.dataset.export._whole_episode_rejection",
+                    return_value=None,
+                ),
+            ):
+                artifact = _inspect_artifact(path, PolicyZarrExportConfig())
+            self.assertIsInstance(artifact, _Artifact)
+
+    def test_provenance_uses_compact_arrays_without_rechecking_summary_counts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "provenance.h5"
+            with h5py.File(path, "w") as output:
+                output.attrs.update(
+                    {
+                        "episode_steps": 2,
+                        "source_frames": 3,
+                        "dt": 0.1,
+                        "source_contiguity_tolerance_s": 1e-6,
+                        "source_decision_json": json.dumps(
+                            {
+                                "profile": "stale-summary",
+                                "source_frames": 99,
+                                "selected_frames": 99,
+                                "dropped_frames": 0,
+                                "accepted": False,
+                                "selected_source_ranges": [],
+                                "selected_segment_ends": [],
+                                "hard_invalid_reason_names": [],
+                                "source_path": str(path.parent),
+                            }
+                        ),
+                    }
+                )
+                provenance = output.create_group("provenance")
+                provenance.attrs["drop_reason_bit_names_json"] = json.dumps(
+                    {"0": "dropped"}
+                )
+                provenance.attrs["research_note"] = "derived summary is optional"
+                provenance.create_dataset(
+                    "source_row_index", data=np.asarray([0, 1], dtype=np.int64)
+                )
+                provenance.create_dataset(
+                    "source_sample_index", data=np.asarray([10, 11], dtype=np.int64)
+                )
+                provenance.create_dataset(
+                    "source_timestamp_s", data=np.asarray([1.0, 1.1], dtype=np.float64)
+                )
+                provenance.create_dataset(
+                    "source_segment_ends", data=np.asarray([2], dtype=np.int64)
+                )
+                provenance.create_dataset(
+                    "source_keep_mask",
+                    data=np.asarray([True, True, False], dtype=np.bool_),
+                )
+                provenance.create_dataset(
+                    "source_drop_reason_bits",
+                    data=np.asarray([0, 0, 1], dtype=np.uint64),
+                )
+                provenance.create_dataset("research_marker", data=np.asarray([1]))
+
+            with h5py.File(path, "r") as output:
+                result = validate_processed_provenance(output)
+            np.testing.assert_array_equal(result.source_rows, [0, 1])
+
+    def _write_processed_fixture(
+        self,
+        path: Path,
+        profile: OutputProfile,
+        *,
+        compression: str | None = "gzip",
+    ) -> None:
         visual = profile.needs_rgb or profile.needs_pointcloud
         pointcloud = PointCloudConfig()
         with h5py.File(path, "w") as output:
@@ -851,11 +864,13 @@ class OfflineMultimodalTest(unittest.TestCase):
             }
             for key in profile.dataset_keys:
                 shape, dtype = shapes[key]
+                kwargs = {}
+                if compression is not None:
+                    kwargs = {"compression": compression, "compression_opts": 4}
                 output.create_dataset(
                     key,
                     data=np.zeros(shape, dtype=dtype),
-                    compression="gzip",
-                    compression_opts=4,
+                    **kwargs,
                 )
             output.create_group("provenance")
             output.attrs.update(
@@ -902,7 +917,6 @@ class OfflineMultimodalTest(unittest.TestCase):
                     "fingertip_points_unit": "m",
                     "fingertip_points_derivation": FINGERTIP_POINTS_DERIVATION,
                     "fingertip_points_policy_id": FINGERTIP_POLICY_ID,
-                    "fingertip_points_geometry_sha256": "a" * 64,
                     "action_ee_frame": "xarm_base",
                 }
             )
@@ -925,7 +939,6 @@ class OfflineMultimodalTest(unittest.TestCase):
                         "point_cloud_frame": "xarm_base",
                         "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
                         "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
-                        "point_cloud_config_sha256": pointcloud.sha256,
                         "point_cloud_table_plane_abcd_json": "null",
                         "point_cloud_sampling": POINT_CLOUD_SAMPLING,
                         "point_cloud_transform": POINT_CLOUD_TRANSFORM,

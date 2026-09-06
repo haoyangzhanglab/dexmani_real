@@ -43,7 +43,6 @@ class ReplayRuntimeSelection:
     runtime: ExperimentConfig
     acceleration_deg_s2: float
     joint_speed_deg_s: float
-    config_sha256: str
 
 
 def _positive_float(value: str) -> float:
@@ -104,7 +103,7 @@ Controls:
         action="store_true",
         help=(
             "Use a processed HDF5 only as a retained-row manifest. Physical commands "
-            "come from its hash-verified raw source episode."
+            "come from its raw source episode."
         ),
     )
     return parser.parse_args(argv)
@@ -124,7 +123,6 @@ def _resolve_replay_runtime(args: argparse.Namespace) -> ReplayRuntimeSelection:
         runtime=runtime,
         acceleration_deg_s2=float(runtime.arm.max_joint_acceleration_deg_per_s2),
         joint_speed_deg_s=float(runtime.arm.max_joint_velocity_deg_per_s),
-        config_sha256=runtime.sha256,
     )
 
 
@@ -165,10 +163,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  EE data: {'yes' if trajectory.arm_ee is not None else 'no'}")
     print(f"  Acc: {selection.acceleration_deg_s2:.0f}°/s²")
     print(f"  Joint speed: {selection.joint_speed_deg_s:.0f}°/s")
-    print(f"  Replay config: {selection.config_sha256[:12]}")
     if args.processed:
         print(
-            "  Processed selection: verified raw source commands; "
+            "  Processed selection: using retained rows from raw source commands; "
             "the processed float32 action array is not sent to hardware."
         )
 
@@ -193,7 +190,6 @@ def main(argv: list[str] | None = None) -> int:
             EpisodeReplayConfig(
                 output_dir=output_dir,
                 evaluate_consistency=evaluate_consistency,
-                config_sha256=selection.config_sha256,
             ),
         )
     except Exception as exc:

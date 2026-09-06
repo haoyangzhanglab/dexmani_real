@@ -23,7 +23,6 @@ Examples::
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -41,11 +40,9 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
-from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.dataset.processed import (
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
-    validate_processed_admission,
 )
 from dexmani_real.ipc.schema import POINT_CLOUD_FEATURE_DIM, validate_point_cloud_array
 from dexmani_real.sensor.pointcloud import (
@@ -143,51 +140,17 @@ def _validate_pointcloud_dataset(h5f: h5py.File) -> int | None:
         actual = str(h5f.attrs.get(name, ""))
         if actual != expected:
             raise ValueError(f"{name} must be {expected!r}, got {actual!r}")
-    try:
-        processing_config = json.loads(str(h5f.attrs.get("processing_config_json", "")))
-        pointcloud_config = processing_config["pointcloud"]
-        table_plane_abcd = processing_config["table_plane_abcd"]
-        if not isinstance(pointcloud_config, dict):
-            raise TypeError("pointcloud config must be an object")
-        resolved_pointcloud = PointCloudConfig(**pointcloud_config)
-        if resolved_pointcloud.to_dict() != pointcloud_config:
-            raise ValueError("persisted point-cloud config is not canonical")
-        if resolved_pointcloud.num_points != num_points:
-            raise ValueError("persisted point-cloud count does not match dataset")
-        if table_plane_abcd is not None:
-            plane = np.asarray(table_plane_abcd, dtype=np.float64)
-            norm = float(np.linalg.norm(plane[:3])) if plane.shape == (4,) else 0.0
-            if (
-                plane.shape != (4,)
-                or not np.all(np.isfinite(plane))
-                or norm <= 0.0
-                or plane[2] / norm <= 0.0
-            ):
-                raise ValueError("persisted point-cloud table plane is invalid")
-        canonical_table_plane = json.dumps(
-            table_plane_abcd,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-    except (KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
-        raise ValueError(
-            "processing_config_json has no valid pointcloud policy"
-        ) from exc
-    expected_hash = resolved_pointcloud.sha256
-    actual_hash = str(h5f.attrs.get("point_cloud_config_sha256", ""))
-    if actual_hash != expected_hash:
-        raise ValueError("point_cloud_config_sha256 does not match persisted policy")
-    actual_table_plane = str(h5f.attrs.get("point_cloud_table_plane_abcd_json", ""))
-    if actual_table_plane != canonical_table_plane:
-        raise ValueError("persisted point-cloud table plane is inconsistent")
     return num_points
 
 
 def print_episode_info(h5_path: str) -> None:
     """Print a human-readable summary of the processed file without opening Rerun."""
     with h5py.File(h5_path, "r") as f:
-        validate_processed_admission(f, label=Path(h5_path).name)
         attrs = f.attrs
+        if str(attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
+            raise ValueError(f"{Path(h5_path).name}: invalid processed schema_name")
+        if int(attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
+            raise ValueError(f"{Path(h5_path).name}: invalid processed schema_version")
         steps = int(attrs.get("episode_steps", -1))
         source_frames = int(attrs.get("source_frames", -1))
 
@@ -229,12 +192,14 @@ def print_episode_info(h5_path: str) -> None:
 
         if "provenance" in f:
             prov = f["provenance"]
-            keep = np.asarray(prov["source_keep_mask"][:], dtype=bool)
+            kept = prov.get("source_row_index")
+            total = prov.get("source_keep_mask")
             names = prov.attrs.get("drop_reason_bit_names_json", "")
-            print(
-                f"provenance: retained {keep.sum()}/{keep.size} source rows "
-                f"(drop reasons: {names})"
-            )
+            if isinstance(kept, h5py.Dataset) and isinstance(total, h5py.Dataset):
+                print(
+                    f"provenance: retained {kept.shape[0]}/{total.shape[0]} source rows "
+                    f"(drop reasons: {names})"
+                )
             print()
 
         if "joint_state" in f:
@@ -288,7 +253,6 @@ class ProcessedEpisodeVisualizer:
                 raise ValueError(
                     f"{self._h5_path.name} is not a processed HDF5 v13 artifact"
                 )
-            validate_processed_admission(self._h5f, label=self._h5_path.name)
             self._keys = _present_keys(self._h5f)
             if "joint_state" not in self._keys and "action" not in self._keys:
                 raise ValueError(
@@ -297,6 +261,27 @@ class ProcessedEpisodeVisualizer:
 
             self._T = self._resolve_frame_count(max_frames)
             self._has_rgb = {"rgb", "depth"} <= self._keys
+            if ("rgb" in self._keys) != ("depth" in self._keys):
+                raise ValueError("rgb and depth must be provided together")
+            if self._has_rgb:
+                rgb = self._h5f["rgb"]
+                depth = self._h5f["depth"]
+                episode_steps = int(self._h5f.attrs.get("episode_steps", -1))
+                if (
+                    rgb.dtype != np.dtype(np.uint8)
+                    or rgb.ndim != 4
+                    or rgb.shape[-1] != 3
+                    or depth.dtype != np.dtype(np.uint16)
+                    or depth.ndim != 3
+                    or rgb.shape[0] != episode_steps
+                    or depth.shape[0] != episode_steps
+                    or rgb.shape[1:3] != depth.shape[1:]
+                ):
+                    raise ValueError(
+                        "rgb/depth must be aligned uint8 (T,H,W,3) and "
+                        f"uint16 (T,H,W), got {rgb.shape}/{rgb.dtype} and "
+                        f"{depth.shape}/{depth.dtype}"
+                    )
             self._pointcloud_num_points = _validate_pointcloud_dataset(self._h5f)
             self._has_pointcloud = self._pointcloud_num_points is not None
 
@@ -343,13 +328,39 @@ class ProcessedEpisodeVisualizer:
     def _preload_state(self) -> dict[str, np.ndarray]:
         """Read small non-camera, non-pointcloud datasets into memory, truncated to T."""
         state: dict[str, np.ndarray] = {}
-        for key in ("joint_state", "action", "action_ee", "fingertip_points"):
+        expected_tails = {
+            "joint_state": (19,),
+            "action": (19,),
+            "action_ee": (21,),
+            "fingertip_points": (5, 3),
+        }
+        for key, expected_tail in expected_tails.items():
             if key in self._keys:
-                state[key] = np.asarray(self._h5f[key][: self._T])
+                dataset = self._h5f[key]
+                if (
+                    dataset.dtype != np.dtype(np.float32)
+                    or dataset.ndim != len(expected_tail) + 1
+                    or tuple(dataset.shape[1:]) != expected_tail
+                    or dataset.shape[0] < self._T
+                ):
+                    raise ValueError(
+                        f"{key} must be float32 with tail shape {expected_tail}, "
+                        f"got shape={dataset.shape} dtype={dataset.dtype}"
+                    )
+                state[key] = np.asarray(dataset[: self._T])
         if "contact_force" in self._keys:
-            contact = np.asarray(
-                self._h5f["contact_force"][: self._T], dtype=np.float32
-            )
+            dataset = self._h5f["contact_force"]
+            if (
+                dataset.dtype != np.dtype(np.float32)
+                or dataset.ndim != 3
+                or tuple(dataset.shape[1:]) != (5, 3)
+                or dataset.shape[0] < self._T
+            ):
+                raise ValueError(
+                    "contact_force must be float32 with shape (T, 5, 3), "
+                    f"got shape={dataset.shape} dtype={dataset.dtype}"
+                )
+            contact = np.asarray(dataset[: self._T], dtype=np.float32)
             state["contact_force_mag"] = np.linalg.norm(contact, axis=2)  # (T, 5)
         return state
 

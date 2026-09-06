@@ -7,10 +7,8 @@ construction, readiness, supervision, and cleanup. The CLI remains in
 
 from __future__ import annotations
 
-import hashlib
 import multiprocessing as mp
 import os
-import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -92,77 +90,18 @@ def validate_operator(value: str) -> str:
     return value
 
 
-def _resource_provenance(repo_root: Path) -> tuple[tuple[str, str], ...]:
-    """Hash static planning/calibration resources without importing a device SDK."""
-    resources = {
-        "arm_hand_collision_urdf_sha256": XARM7_XHAND_COLLISION_URDF_PATH,
-        "arm_hand_urdf_sha256": XARM7_XHAND_RIGHT_URDF_PATH,
-        "arm_hand_srdf_sha256": XARM7_XHAND_SRDF_PATH,
-        "camera_calibration_sha256": repo_root
-        / "dexmani_real"
-        / "config"
-        / "cameras.json",
-        "vr_heading_calibration_sha256": repo_root
-        / "dexmani_real"
-        / "config"
-        / "vr_transform.json",
-    }
-    result: list[tuple[str, str]] = []
-    for name, path in resources.items():
-        if not path.is_file():
-            raise FileNotFoundError(f"required experiment resource is missing: {path}")
-        result.append((name, hashlib.sha256(path.read_bytes()).hexdigest()))
-    return tuple(sorted(result))
-
-
-def _git_stdout(repo_root: Path, *args: str) -> str:
-    """Run one bounded Git query during experiment startup."""
-    try:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError(
-            f"failed to collect Git provenance: git {' '.join(args)}"
-        ) from exc
-    return result.stdout
-
-
-def _recording_provenance(
-    runtime: ExperimentConfig,
-    repo_root: Path,
-) -> tuple[tuple[str, str], ...]:
-    """Freeze config, source revision, and resource identity before recorder startup."""
-    canonical_json = runtime.canonical_json
-    canonical_sha256 = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
-    if canonical_sha256 != runtime.sha256:
-        raise ValueError(
-            "runtime canonical config SHA-256 does not match runtime.sha256"
-        )
-
-    git_commit = _git_stdout(repo_root, "rev-parse", "HEAD").strip()
-    if len(git_commit) != 40 or any(
-        character not in "0123456789abcdef" for character in git_commit
-    ):
-        raise ValueError(
-            "expected a 40-character lowercase Git SHA from git rev-parse HEAD"
-        )
-    git_dirty = "1" if _git_stdout(repo_root, "status", "--porcelain") else "0"
-
-    return tuple(
-        sorted(
-            (
-                *_resource_provenance(repo_root),
-                ("resolved_config_json", canonical_json),
-                ("dexmani_real_git_commit", git_commit),
-                ("dexmani_real_git_dirty", git_dirty),
-            )
-        )
+def _validate_recording_resources(repo_root: Path) -> None:
+    """Ensure files needed by recording and FK workers exist before startup."""
+    required = (
+        XARM7_XHAND_COLLISION_URDF_PATH,
+        XARM7_XHAND_RIGHT_URDF_PATH,
+        XARM7_XHAND_SRDF_PATH,
+        repo_root / "dexmani_real" / "config" / "cameras.json",
+        repo_root / "dexmani_real" / "config" / "vr_transform.json",
     )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"required recording resources are missing: {missing}")
 
 
 def _preflight_health_issues(
@@ -317,7 +256,6 @@ def _print_session_header(
             f"speed={float(runtime.arm.max_joint_velocity_deg_per_s)}deg/s",
             f"hand={'ON' if hand_enabled else 'OFF'}",
             f"record={'ON' if recording_enabled else 'OFF'}",
-            f"config={runtime.sha256[:12]}",
         )
     )
     print("=" * 60)
@@ -334,7 +272,6 @@ def _build_processes(
     repo_root: Path,
     task_name: str,
     operator: str,
-    provenance: tuple[tuple[str, str], ...],
     hand_enabled: bool,
     recording_enabled: bool,
 ) -> list[ProcessSpec]:
@@ -386,8 +323,6 @@ def _build_processes(
                     * policy_config.runtime.policy.control_hz
                 )
             ),
-            resolved_config_sha256=runtime.sha256,
-            provenance=provenance,
             writer_queue_size=int(runtime.camera.writer_queue_size),
         )
         specs.append(
@@ -469,19 +404,17 @@ def run_teleop_experiment(
 
     repo_root = Path(__file__).resolve().parents[2]
     vr_transform_path = repo_root / "dexmani_real" / "config" / "vr_transform.json"
+    if recording_enabled:
+        try:
+            _validate_recording_resources(repo_root)
+        except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+            print(f"Preflight failed: recording resources: {exc}")
+            return 1
     try:
         load_vr_transform(vr_transform_path)
     except (OSError, TypeError, ValueError) as exc:
         print(f"Preflight failed: invalid VR transform: {exc}")
         return 1
-    try:
-        provenance = (
-            _recording_provenance(runtime, repo_root) if recording_enabled else ()
-        )
-    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
-        print(f"Preflight failed: {exc}")
-        return 1
-
     _print_session_header(
         runtime,
         task_name=task_name,
@@ -508,7 +441,6 @@ def run_teleop_experiment(
             repo_root=repo_root,
             task_name=task_name,
             operator=operator,
-            provenance=provenance,
             hand_enabled=hand_enabled,
             recording_enabled=recording_enabled,
         )

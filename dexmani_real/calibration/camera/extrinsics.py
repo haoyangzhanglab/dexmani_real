@@ -37,7 +37,6 @@ from __future__ import annotations
 
 __all__ = ["CameraExtrinsics", "CameraExtrinsicsEntry"]
 
-import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -133,7 +132,6 @@ class CameraExtrinsics:
             calib_path = self._resolve_default_path()
         self.calib_path = Path(calib_path).resolve()
         self._entries: dict[str, CameraExtrinsicsEntry] = {}
-        self.source_sha256 = ""
         self._load()
 
     @classmethod
@@ -150,7 +148,6 @@ class CameraExtrinsics:
                 '"pose": {"position": [x,y,z], "orientation": [w,x,y,z]}}}'
             )
         payload = self.calib_path.read_bytes()
-        self.source_sha256 = hashlib.sha256(payload).hexdigest()
         raw = json.loads(payload)
         if not isinstance(raw, dict):
             raise TypeError("camera calibration root must be an object")
@@ -270,4 +267,4 @@ class CameraExtrinsics:
         cameras = ", ".join(
             f"{n} ({e.type}, {e.serial})" for n, e in self._entries.items()
         )
-        return f"CameraExtrinsics(sha256={self.source_sha256[:12]}, {cameras})"
+        return f"CameraExtrinsics({cameras})"

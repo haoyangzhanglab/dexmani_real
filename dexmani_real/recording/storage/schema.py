@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -19,16 +18,6 @@ from dexmani_real.ipc.schema import (
 )
 
 EPISODE_SCHEMA_VERSION = 24
-RAW_MANIFEST_VERSION = 1
-RAW_MANIFEST_VERSION_ATTR = "raw_manifest_version"
-RAW_DEPTH_SHA256_ATTR = "depth_sha256"
-RAW_RGB_SHA256_ATTR = "rgb_sha256"
-RAW_MEMBER_SHA256_JSON_ATTR = "raw_member_sha256_json"
-_RAW_MEMBER_ATTRS = {
-    "depth.h5": RAW_DEPTH_SHA256_ATTR,
-    "rgb.mp4": RAW_RGB_SHA256_ATTR,
-}
-RAW_MEMBER_NAMES = tuple(_RAW_MEMBER_ATTRS)
 CAMERA_HEALTH_TAXONOMY: dict[int, str] = {
     0: "OK",
     1: "CLOCK_RESET",
@@ -281,7 +270,6 @@ RAW_RESERVED_META_KEYS = frozenset(
         "operator",
         "control_hz",
         "fps",
-        "resolved_config_sha256",
         ARM_SENT_MARKER,
         "skip_initial_frames",
         "camera_serial",
@@ -346,14 +334,9 @@ RAW_RESERVED_META_KEYS = frozenset(
         "sample_invalid_frame_count",
         "safety_reject_frame_count",
         "command_quiescence_count",
-        RAW_MANIFEST_VERSION_ATTR,
-        RAW_DEPTH_SHA256_ATTR,
-        RAW_RGB_SHA256_ATTR,
-        RAW_MEMBER_SHA256_JSON_ATTR,
     }
 )
 
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CAMERA_HEALTH_VALUES = frozenset(CAMERA_HEALTH_TAXONOMY)
 _FLOAT_ROW_SENTINEL_EXCEPTIONS = frozenset(
     {
@@ -417,72 +400,6 @@ def validate_semantic_meta_attrs(attrs: Mapping[str, Any]) -> tuple[str, ...]:
                 matches = False
             if not matches:
                 errors.append(f"metadata attr {key!r} != fixed value {expected!r}")
-    return tuple(errors)
-
-
-def validate_raw_member_hashes(
-    attrs: Mapping[str, Any],
-    member_sha256: Mapping[str, str],
-) -> tuple[str, ...]:
-    """Validate the v24 sidecar manifest against hashes computed by a caller."""
-    errors: list[str] = []
-    try:
-        version = int(_attr_scalar(attrs.get(RAW_MANIFEST_VERSION_ATTR, -1)))
-    except (TypeError, ValueError):
-        version = -1
-    if version != RAW_MANIFEST_VERSION:
-        errors.append(
-            f"{RAW_MANIFEST_VERSION_ATTR} must be {RAW_MANIFEST_VERSION}, got {version}"
-        )
-    expected_member_names = set(RAW_MEMBER_NAMES)
-    parsed_json_manifest: dict[str, Any] | None = None
-    if RAW_MEMBER_SHA256_JSON_ATTR not in attrs:
-        errors.append(f"metadata attr {RAW_MEMBER_SHA256_JSON_ATTR!r} is missing")
-    else:
-        try:
-            decoded = json.loads(_attr_scalar(attrs[RAW_MEMBER_SHA256_JSON_ATTR]))
-            if not isinstance(decoded, dict):
-                raise ValueError("manifest JSON must be an object")
-            actual_member_names = set(decoded)
-            if actual_member_names != expected_member_names:
-                missing = sorted(expected_member_names - actual_member_names)
-                extra = sorted(actual_member_names - expected_member_names)
-                errors.append(
-                    f"metadata attr {RAW_MEMBER_SHA256_JSON_ATTR!r} must contain "
-                    f"exactly {sorted(expected_member_names)!r}; "
-                    f"missing={missing!r}, extra={extra!r}"
-                )
-            else:
-                parsed_json_manifest = decoded
-        except (TypeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
-            errors.append(
-                f"metadata attr {RAW_MEMBER_SHA256_JSON_ATTR!r} is invalid: {exc}"
-            )
-    for member_name, attr_name in _RAW_MEMBER_ATTRS.items():
-        if attr_name not in attrs:
-            errors.append(f"metadata attr {attr_name!r} is missing")
-            expected = ""
-        else:
-            expected = str(_attr_scalar(attrs[attr_name])).lower()
-        if not _SHA256_RE.fullmatch(expected):
-            errors.append(f"metadata attr {attr_name!r} is not a SHA-256 digest")
-        actual = str(member_sha256.get(member_name, "")).lower()
-        if not _SHA256_RE.fullmatch(actual):
-            errors.append(f"computed hash for {member_name!r} is invalid")
-        elif actual != expected:
-            errors.append(
-                f"{member_name} SHA-256 mismatch: metadata={expected}, computed={actual}"
-            )
-        if parsed_json_manifest is not None:
-            json_expected = str(parsed_json_manifest.get(member_name, "")).lower()
-            if not _SHA256_RE.fullmatch(json_expected):
-                errors.append(
-                    f"manifest JSON hash for {member_name!r} is not a SHA-256 digest"
-                )
-            elif json_expected != expected:
-                errors.append(
-                    f"manifest JSON hash for {member_name!r} disagrees with its fixed attr"
-                )
     return tuple(errors)
 
 
@@ -1316,13 +1233,7 @@ __all__ = [
     "DatasetSpec",
     "EPISODE_SCHEMA_VERSION",
     "HAND_RAW_ACTION_VALIDITY_EXPRESSION",
-    "RAW_DEPTH_SHA256_ATTR",
-    "RAW_MANIFEST_VERSION",
-    "RAW_MANIFEST_VERSION_ATTR",
-    "RAW_MEMBER_SHA256_JSON_ATTR",
-    "RAW_MEMBER_NAMES",
     "RAW_RESERVED_META_KEYS",
-    "RAW_RGB_SHA256_ATTR",
     "SEMANTIC_META_ATTRS",
     "SOURCE_FRAME_DATASET_NAMES",
     "compute_episode_quality_metrics",
@@ -1331,7 +1242,6 @@ __all__ = [
     "required_dataset_names",
     "validate_camera_metadata_keys",
     "validate_data_layout",
-    "validate_raw_member_hashes",
     "validate_raw_semantics",
     "validate_semantic_meta_attrs",
     "validate_source_frame_keys",

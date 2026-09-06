@@ -54,8 +54,8 @@ datasets/<task>.zarr               Policy Zarr v7, one profile per store
 | `depth.h5` | `/depth`，已由 depth-to-color 对齐的 Z16 depth | gzip level 1 |
 | `rgb.mp4` | 与控制网格一一对应的 RGB 帧 | 编码视频，不是 HDF5 dataset |
 
-`data.h5/meta.attrs["schema_version"] == 24`。v24 在发布前验证完整的 data/sidecar 语义，并将
-`depth.h5` 与 `rgb.mp4` 的 SHA-256 写入 `/meta`。reader、处理、回放与可视化只接受该契约；
+`data.h5/meta.attrs["schema_version"] == 24`。v24 在发布前验证完整的 data/sidecar 语义。
+reader、处理、回放与可视化只接受该契约；
 其他版本必须在运行时外迁移或重新采集，不能补出缺失的因果 policy observation。
 
 ### 处理前提
@@ -150,14 +150,9 @@ raw 的明确缺失值语义，不应被下游压紧为相邻 source。
 | `depth.h5:/depth` | `(N,H_raw,W_raw)` uint16 | `librealsense_align_depth_to_color_z16`；像素在 color optical frame，与同 index RGB 像素对齐；`0` 为无效值。米值为 `depth * meta.depth_scale`。 |
 | `rgb.mp4` frame | `(H_raw,W_raw,3)` uint8 | 与控制网格逐帧对应的 RGB。codec、pixel format、宽高和 fps 在 `meta`。 |
 
-v24 writer 在关闭两个 sidecar 后才计算并写入 manifest。新 writer 产物因此包含
-`raw_manifest_version`、`depth_sha256` 和 `rgb_sha256` 等 manifest attrs；`EpisodeReader` 普通构造
-只检查当前 raw v24 的必需文件、schema、`data.h5` layout/semantic 以及 depth shape/dtype，不要求
-manifest attrs，也不默认重算大型 sidecar hash 或完整解码 RGB。需要验证发布后的 RGB/depth 是否被
-替换或同长度重排时，使用 `EpisodeReader(path, verify_hash=True)` 或 `audit_integrity()`；显式审计
-才会重算 manifest 中 `depth.h5`、`rgb.mp4` 的整文件 SHA-256，并核对完整 RGB 帧数。manifest 不
-包含 `data.h5` hash，也不是签名或真实性证明。若需要证明整个 episode 未被协调修改，仍需由外部
-attestation 或可信 artifact 流程建立信任。
+v24 writer 在关闭两个 sidecar 后执行结构和帧数校验。`EpisodeReader` 只检查当前 raw v24 的必需
+文件、schema、`data.h5` layout/semantic 以及 depth shape/dtype，不执行额外的文件完整性扫描。
+如果需要更强的来源保证，应由调用方在文件系统或版本控制层面管理。
 
 ### `data.h5:/meta` attrs
 
@@ -169,13 +164,11 @@ attestation 或可信 artifact 流程建立信任。
 | schema 与录制 | `schema_version`、`task_label`、`operator`、`control_hz`、`fps`、`grid_dt_s`、`num_frames`、`success`、`truncated`、`stop_reason` | int / string / float / bool | episode 身份、控制网格与终止结果；当前 writer 的 `schema_version=24`。 |
 | 时长与基本质量 | `duration`、`wall_duration_s`、`grid_duration_s`、`non_sampled_duration_s`、`wall_fps`、`min_frames_met`、`has_camera`、`has_timestamps` | float / bool | 录制耗时、网格覆盖、实际帧率与基本可用性。 |
 | 逐行汇总质量 | `ik_hold_frame_count`、`camera_invalid_frame_count`、`observation_invalid_frame_count`、`sample_invalid_frame_count`、`safety_reject_frame_count`、`command_quiescence_count` | int scalar | 由 raw flags 与 grid timestamp 汇总；诊断用途，不替代逐行 flags。 |
-| 录制配置 | `resolved_config_sha256`、`skip_initial_frames`、`arm_sent_stream` | string / int / bool | 解析配置哈希与跳过帧数；`arm_sent_stream` 仅在 true 时写入，决定条件数据集是否存在。 |
-| 实验 provenance（当前 teleop writer） | `provenance_resolved_config_json`、`provenance_dexmani_real_git_commit`、`provenance_dexmani_real_git_dirty` | string | startup 冻结 canonical resolved config、40 位小写 Git commit 与 `"0"`/`"1"` dirty 标记；JSON 的 UTF-8 SHA-256 必须等于 `resolved_config_sha256`。dirty=`"1"` 时 commit 只定位 base revision，不表示可完整重建 source。 |
+| 录制配置 | `skip_initial_frames`、`arm_sent_stream` | int / bool | 跳过帧数；`arm_sent_stream` 仅在 true 时写入，决定条件数据集是否存在。 |
 | 坐标、触觉与相机时序语义 | `robot_world_frame`、`robot_world_equals_xarm_base`、`arm_ee_frame`、`action_arm_ee_frame`、`hand_fingertip_frame`、`action_*_raw_validity_expression`、`tactile_*`、`arm_tau_*`、`camera_payload_mode`、`camera_health_taxonomy_json`、`camera_*_semantics`、`camera_frame_gap_semantics`、`camera_frame_gap_admission_policy`、`source_timestamp_semantics`、`source_sample_index_semantics`、`policy_observation_*_semantics` | string / bool / float | `SEMANTIC_META_ATTRS` 写入的固定语义；包括 `xarm_base` frame、raw action 有效性、tactile 单位/标定/接触、arm effort、camera 时间/时钟、frame-gap 数值与 admission policy，以及 camera-source policy observation 配对定义。 |
 | 视频与 writer | `camera_writer_queue_size`、`camera_encoding_codec`、`camera_encoding_crf`、`camera_encoding_preset`、`camera_encoding_pixel_format`、`camera_encoding_width/height/fps`、`camera_depth_storage`、`camera_depth_payload_semantics`、`camera_stream_frames`、`camera_writer_error` | int / string / float | MP4 编码、payload 定义、camera writer 状态与健康 telemetry。 |
-| sidecar 完整性 manifest | `raw_manifest_version`、`depth_sha256`、`rgb_sha256`、`raw_member_sha256_json` | int / string | v24 固定为 manifest version `1`；记录最终 `depth.h5` 与 `rgb.mp4` 整文件 SHA-256，显式 `verify_hash`/`audit_integrity()` 时重算并拒绝替换或同长度重排。JSON 是同一 manifest 的审计镜像，必须与两个固定 digest 一致。 |
 | writer 性能汇总 | `camera_writer_queue_high_watermark`、`camera_writer_queue_capacity`、`camera_writer_close_s`、`camera_encode_{p50,p95,p99,max}_s`、`camera_hdf5_{p50,p95,p99,max}_s` | int / float | 相机 writer 队列、关闭和编码/HDF5 写入耗时。 |
-| 调用方扩展 | 其他 `provenance_<key>`、`camera_metadata` mapping 中的每个 key | string；调用方给定 dtype | 非固定 key；固定 attrs 与 `provenance_` namespace 被 recorder 保留，`camera_metadata` 不能覆盖它们。扩展值不属于稳定 schema。 |
+| 调用方扩展 | `camera_metadata` mapping 中的每个 key | string；调用方给定 dtype | 非固定 key；固定 attrs 由 recorder 保留，扩展值不属于稳定 schema。 |
 
 以下相机 attrs 不是任意 raw v24 都具备；处理 RGB 或点云 profile 时，reader 会在几何边界
 要求所需字段存在且有效。
@@ -196,15 +189,14 @@ attestation 或可信 artifact 流程建立信任。
 
 processed 文件是 `episodes_processed/<task>/*.h5`。它从 raw v24 选择、清洗和压紧行；其 `N`
 因此不一定等于 raw 的 `num_frames`。它用于离线训练、导出与可视化；物理回放可将其作为
-保留 raw 行的 provenance 清单，但绝不发送其 `float32` 动作。回放必须在 `source_path` 找到并
-校验原始 `data.h5` hash，再从 raw episode 读取 recorded published arm target、recorded logical
-hand target 和完整模型 provenance。根 attrs
+保留 raw 行的 provenance 清单，但绝不发送其 `float32` 动作。回放在 `source_path` 找到 raw episode
+后，从中读取 recorded published arm target 与 recorded logical hand target。根 attrs
 必须满足：
 `schema_name=dexmani-real-processed-hdf5`、`schema_version=13`、`domain=real`。
 
 处理入口在 discovery 边界将每个 raw episode 路径解析为 canonical absolute path；新生成的
 processed artifact 将它持久化在 `source_decision_json.source_path`。processed replay 只消费该路径，
-要求其下的 raw `data.h5` 存在并硬校验 SHA-256；不推断或 fallback 到其他 source path。
+要求其下的 raw `data.h5` 存在；不推断或 fallback 到其他 source path。
 
 删除无效 raw 行可能使压紧数组包含多个 source 连续段。v13 不把缺口两侧伪装成相邻时间步：
 `source_segment_ends` 明确记录每段边界，质量窗口只在段内计数。Policy Zarr 不再把这些段
@@ -228,8 +220,9 @@ detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal
 
 ### profile 与数据集集合
 
-所有 profile 都包含 core 五项；RGB 与点云字段由 profile 决定，不能在一个 processed 文件
-中任意增删。
+所有 profile 都包含 core 五项；RGB 与点云字段由 profile 决定。校验器只要求 profile 声明的
+字段与 `/provenance` 必须存在，文件可以保留额外的研究字段、group 或 attrs；Policy Zarr
+导出只复制 profile 声明的字段。
 
 | profile | 固定数据集 | 附加数据集 |
 |---|---|---|
@@ -251,11 +244,11 @@ detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal
 | `/camera_extrinsic` | `(N,4,4)` | float32 | `T_xarm_base_from_color`；native color optical → xarm base。 |
 | `/point_cloud` | `(N,P,6)` | float32 | 仅 pointcloud profile；`xyz_m(3)+rgb_[0,1](3)`，`xarm_base`。 |
 
-`rgb` 与 `rgb_pc` profile 的 admission 强制 `/rgb` 与 `/depth` 具有相同的帧数和空间尺寸：
+`rgb` 与 `rgb_pc` profile 的完整校验强制 `/rgb` 与 `/depth` 具有相同的帧数和空间尺寸：
 `rgb` 必须为 `(N,H,W,3)`、`depth` 必须为 `(N,H,W)`，且两者的 `N/H/W` 必须逐项一致；
-不一致的文件在 payload 读取、导出或可视化前拒绝。`visualize_episode_processed.py` 在读取
-或渲染 processed payload 前调用共享 `validate_processed_admission()`，该 admission 同时
-校验 profile/schema、payload、RGB-D geometry 与 `/provenance`。
+不一致的文件在完整 payload 读取或导出时拒绝。`visualize_episode_processed.py` 只在实际
+启用 RGB/点云时读取对应的 shape、dtype 和必要元数据，不再为 `--info` 或打开窗口执行完整
+payload/provenance 扫描。
 
 `/provenance` 只存在于 processed HDF5：
 
@@ -277,11 +270,11 @@ detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal
 |---|---|---|---|
 | schema 与来源 | `schema_name`、`schema_version`、`domain`、`source_episode`、`source_frames` | string / int | `dexmani-real-processed-hdf5`、`13`、`real`，以及 raw 输入身份。 |
 | 长度与训练标签 | `profile`、`episode_steps`、`dt`、`time_semantics`、`source_contiguity`、`source_contiguity_tolerance_s`、`obs_alignment`、`observation_reference`、`state_alignment`、`max_observation_skew_s`、`action_semantics`、`task_name`、`action_dim`、`action_ee_dim`、`action_space` | string / int / float | profile、压紧后长度、段边界 provenance、`obs[t]_before_action[t]`，以及 state/camera 对齐、观察 skew 和唯一的 `teleop_published_joint_target` 动作语义。 |
-| Real core 语义 | `fingertip_points_frame`、`fingertip_points_unit`、`fingertip_points_derivation`、`fingertip_points_policy_id`、`fingertip_points_geometry_sha256`、`action_ee_frame`、`action_ee_components`、`contact_force_source`、`contact_force_alignment`、`contact_force_unit`、`contact_force_si_verified`、`contact_force_frame`、`contact_force_fresh_required`、`contact_force_calibrated_required`、`contact_force_unit_code`、`contact_force_causal_to_reference`、`contact_force_hand_source_match_required` | string / bool / int | xarm-base 位置与 EEF frame；指尖单位 m；`fk_from_processed_joint_state`、FK algorithm identity 与在处理时冻结的 geometry SHA-256。geometry 覆盖 arm FK URDF/EEF、hand FK URDF、SDK→URDF mapping、finger link 顺序与 EEF→handbase mount。tactile attrs 保留来源、因果选择、单位、原生轴与逐行 proof 要求。 |
-| 处理与审计 | `processing_config_json`、`quality_summary_json`、`source_decision_json`、`source_member_sha256_json`、`source_resolved_config_sha256` | JSON string / string | 处理配置、选择/拒绝结论、恰好 `data.h5`/`depth.h5`/`rgb.mp4` 三个 raw 成员的 64-hex 哈希与录制配置哈希。`source_decision_json.hard_invalid_reason_names` 是必填的硬无效 reason 名称列表。哈希格式检查不等于 raw 文件真实性证明。 |
+| Real core 语义 | `fingertip_points_frame`、`fingertip_points_unit`、`fingertip_points_derivation`、`fingertip_points_policy_id`、`action_ee_frame`、`action_ee_components`、`contact_force_source`、`contact_force_alignment`、`contact_force_unit`、`contact_force_si_verified`、`contact_force_frame`、`contact_force_fresh_required`、`contact_force_calibrated_required`、`contact_force_unit_code`、`contact_force_causal_to_reference`、`contact_force_hand_source_match_required` | string / bool / int | xarm-base 位置与 EEF frame；指尖单位 m；`fk_from_processed_joint_state` 与 FK algorithm identity。tactile attrs 保留来源、因果选择、单位、原生轴与逐行 proof 要求。 |
+| 处理与审计 | `processing_config_json`、`quality_summary_json`、`source_decision_json` | JSON string | 处理配置、选择/拒绝结论和 raw 行来源；`source_decision_json.hard_invalid_reason_names` 是必填的硬无效 reason 名称列表。 |
 | RGB-D（仅 RGB/RGB-PC） | `rgb_transform`、`depth_transform`、`depth_unit`、`depth_scale_m_per_unit`、`depth_invalid_value`、`camera_intrinsic_semantics`、`camera_extrinsic_semantics` | string / float / int | 无裁剪 resize、aligned depth 的 nearest resize、depth 单位与无效值 `0`、K/T 语义。 |
 | RGB-D provenance（仅 RGB/RGB-PC） | `source_camera_depth_intrinsics_native`、`source_camera_depth_distortion_model`、`source_camera_depth_distortion_coeffs`、`camera_color_distortion_model`、`camera_color_distortion_coeffs`、`camera_T_color_from_depth` | float64 `(9,)`；string；float64 `(K_d,)`；float64 `(4,4)` | native depth K、depth/color 畸变与 native depth optical → color optical 外参。 |
-| 点云（仅 pointcloud/RGB-PC） | `point_cloud_frame`、`point_cloud_shape`、`point_cloud_color_source`、`point_cloud_policy_id`、`point_cloud_config_sha256`、`point_cloud_table_plane_abcd_json`、`point_cloud_sampling`、`point_cloud_transform` | string；int64 `(2,)`；JSON string | `xarm_base`、`(P,6)` 与可复现的点云策略、桌面和变换身份。 |
+| 点云（仅 pointcloud/RGB-PC） | `point_cloud_frame`、`point_cloud_shape`、`point_cloud_color_source`、`point_cloud_policy_id`、`point_cloud_table_plane_abcd_json`、`point_cloud_sampling`、`point_cloud_transform` | string；int64 `(2,)`；JSON string | `xarm_base`、`(P,6)` 与点云策略、桌面和变换身份。 |
 
 `/provenance.attrs["drop_reason_bit_names_json"]` 是 JSON object：键是 `uint64`
 `source_drop_reason_bits` 的 bit 编号，值是对应拒绝原因名称。
@@ -291,10 +284,8 @@ RGB 范围、每帧非零 XYZ、持久化 workspace 边界、canonical action_ee
 profile/config/provenance 的完整性。`source_row_index`、`source_sample_index`、
 `source_segment_ends` 必须是实际 HDF5 `int64`，`source_timestamp_s` 是 `float64`，
 `source_keep_mask` 是 `bool`，`source_drop_reason_bits` 是 `uint64`；row mapping 与段边界会
-从这些数组重新计算。导出 admission 不建立 processed 文件的信任，也不接收或验证外部
-attestation；它只检查内部 schema、payload、provenance 以及 source hash 的成员名和格式。
-若要把这些哈希当作 raw/processed 完整性证据，必须由调用方或可信处理流程独立建立
-artifact trust/attestation；文件内哈希本身不会构成签名。
+从这些数组重新计算。导出 admission 不负责建立 processed 文件的来源信任；它只检查内部
+schema、payload 与 provenance。
 
 ## 3. Policy Zarr v7
 
@@ -315,21 +306,21 @@ Zarr 是同一 `task_name`、同一 profile、同一 `dt`、同一 tail shape/dt
 | `/meta/episode_ends` | `(E,)` | int64 | 所有合格 processed 文件完整长度的累积结束下标（exclusive）；第 `i` 个训练 episode 是 `[0 if i=0 else ends[i-1], ends[i])`。`E` 等于被准入的 processed 文件数。 |
 
 数组使用 Zstd（默认 level 3）；时间 chunk 默认为 100 帧，最后 chunk 可更短。导出会逐数组
-校验 shape、dtype、episode ends 和内容 SHA-256。
+校验 shape、dtype、episode ends 和浮点值。
 
 Zarr root attrs 是最小运行语义，而不是 processed 全部 provenance：
 
 | 范围 | attrs | 类型 / 语义 |
 |---|---|---|
 | schema 与任务 | `schema_name`、`schema_version`、`domain`、`profile`、`task_name`、`dt`、`episode_start_policy`、`obs_alignment`、`observation_reference`、`state_alignment`、`max_observation_skew_s`、`action_semantics` | string / int / float；固定为 `dexmani-real-policy-zarr`、`7`、`real`、`full_history`、`obs[t]_before_action[t]` 和 `teleop_published_joint_target`。训练不得用左侧 observation padding 构造 episode 起始样本。 |
-| Real core | `contact_force_*` proof attrs、`fingertip_points_frame`、`fingertip_points_unit`、`fingertip_points_derivation`、`fingertip_points_policy_id`、`fingertip_points_geometry_sha256`、`action_ee_frame` | string / bool / int；来自 processed 输入并要求全部 episode 一致。 |
+| Real core | `contact_force_*` proof attrs、`fingertip_points_frame`、`fingertip_points_unit`、`fingertip_points_derivation`、`fingertip_points_policy_id`、`action_ee_frame` | string / bool / int；来自 processed 输入并要求全部 episode 一致。 |
 | RGB-PC profile | `depth_scale_m_per_unit`、`depth_invalid_value`、`camera_extrinsic_semantics` | float / int / string；depth 单位、无效像素值与 `T_xarm_base_from_color` 语义。 |
-| pointcloud/RGB-PC profile | `point_cloud_frame`、`point_cloud_color_source`、`point_cloud_policy_id`、`point_cloud_config_sha256`、`point_cloud_table_plane_abcd_json`、`point_cloud_sampling`、`point_cloud_transform` | string（其中 table plane 为 JSON string）；点云 frame、构建策略与处理身份。 |
+| pointcloud/RGB-PC profile | `point_cloud_frame`、`point_cloud_color_source`、`point_cloud_policy_id`、`point_cloud_table_plane_abcd_json`、`point_cloud_sampling`、`point_cloud_transform` | string（其中 table plane 为 JSON string）；点云 frame、构建策略与处理身份。 |
 
 Policy Zarr v7 接受四种 profile 中语义 attrs 一致、未删除 source 行且只有一个连续段的
 processed v13 输入。存在无效行或时序缺口的文件整条拒绝；其他合格
 文件仍可进入同一批导出。Zarr
-**不保留** processed 的 `/provenance`、source 文件 hash、质量摘要、raw 选择原因、
+**不保留** processed 的 `/provenance`、质量摘要、raw 选择原因、
 `action_ee_components` 或完整相机 calibration provenance；它保留 `obs_alignment` 和其他运行
 语义 root attrs。需要审计、可视化
 或重新处理时，应回到 processed HDF5。
@@ -359,6 +350,6 @@ processed v13 输入。存在无效行或时序缺口的文件整条拒绝；其
   `pad_before=n_obs_steps-1`、`pad_after=n_action_steps-1` 和 repeat-edge padding。当前 DP3 的
   `n_obs_steps=2`、`n_action_steps=8`，实例值为 `1/7`；不得把实例值写成通用常数。
 - 训练 checkpoint 必须复制 Zarr root 语义及实际 point-cloud shape 作为数据合同。Real 部署
-  在模型构造前核对 domain/schema、`dt`、point-cloud 的完整 preprocessing identity 与实时 worker，
-  并在请求 fingertip 时核对其 derivation、algorithm ID 与当前 arm/hand geometry identity；
+  在模型构造前核对 domain/schema、`dt`、point-cloud 的 preprocessing identity 与实时 worker，
+  并在请求 fingertip 时核对其 derivation 与 algorithm ID；
   不能仅凭模型权重或配置文件名推断数据域。

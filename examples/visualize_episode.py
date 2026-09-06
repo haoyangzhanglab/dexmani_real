@@ -175,7 +175,6 @@ class EpisodeVisualizer:
         point_cloud: bool = True,
         pointcloud_config: PointCloudConfig | None = None,
         table_plane_abcd: tuple[float, float, float, float] | None = None,
-        runtime_config_sha256: str | None = None,
     ):
         self._h5_path = Path(h5_path)
         self._reader = EpisodeReader(h5_path)
@@ -232,21 +231,9 @@ class EpisodeVisualizer:
                     pointcloud=pointcloud_config,
                     table_plane_abcd=table_plane_abcd,
                 )
-                source_config_sha256 = str(meta.attrs.get("resolved_config_sha256", ""))
-                if (
-                    runtime_config_sha256 is not None
-                    and source_config_sha256 != runtime_config_sha256
-                ):
-                    logger.warning(
-                        "Point cloud uses current runtime config %s, which differs "
-                        "from recorded config %s",
-                        runtime_config_sha256,
-                        source_config_sha256 or "missing",
-                    )
                 logger.info(
-                    "Canonical point cloud enabled: N=%d config=%s table=%s",
+                    "Canonical point cloud enabled: N=%d table=%s",
                     pointcloud_config.num_points,
-                    pointcloud_config.sha256,
                     "enabled" if table_plane_abcd is not None else "disabled",
                 )
 
@@ -614,7 +601,6 @@ def main(argv: list[str] | None = None) -> int:
     runtime = resolve_experiment_config() if point_cloud_enabled else None
     pointcloud_config = None
     table_plane_abcd = None
-    runtime_config_sha256 = None
     if runtime is not None:
         pointcloud_config = runtime.pointcloud
         if args.pointcloud_num_points is not None:
@@ -623,7 +609,6 @@ def main(argv: list[str] | None = None) -> int:
             )
         table = runtime.environment.table
         table_plane_abcd = table.plane_abcd if table.enabled else None
-        runtime_config_sha256 = runtime.sha256
 
     viz = EpisodeVisualizer(
         str(h5_path),
@@ -631,7 +616,6 @@ def main(argv: list[str] | None = None) -> int:
         point_cloud=point_cloud_enabled,
         pointcloud_config=pointcloud_config,
         table_plane_abcd=table_plane_abcd,
-        runtime_config_sha256=runtime_config_sha256,
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.num_steps)

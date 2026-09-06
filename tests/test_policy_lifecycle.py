@@ -140,12 +140,12 @@ def _policy_worker_config(spec: SimpleNamespace) -> InferenceWorkerConfig:
 
 
 class PolicyLifecycleStartupTest(unittest.TestCase):
-    def test_observation_identity_mismatch_rejects_before_channel_creation(
+    def test_observation_semantics_mismatch_rejects_before_channel_creation(
         self,
     ) -> None:
         runtime = resolve_experiment_config()
         spec = _policy_spec(runtime)
-        spec.observation_fields[1].semantics["config_sha256"] = "wrong"
+        spec.observation_fields[1].semantics["policy_id"] = "wrong"
         worker_config = _policy_worker_config(spec)
 
         with patch(
@@ -153,7 +153,7 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
             side_effect=AssertionError("channels must not be created"),
         ):
             with self.assertRaisesRegex(
-                ValueError, "point_cloud config_sha256 mismatch"
+                ValueError, "point_cloud policy_id mismatch"
             ):
                 run_policy_deployment(runtime, spec, worker_config, False)
 

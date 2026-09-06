@@ -80,7 +80,6 @@ class ReplayOutputAdmissionTest(unittest.TestCase):
         return replay_session.EpisodeReplayConfig(
             output_dir=str(output_dir),
             evaluate_consistency=True,
-            config_sha256="a" * 64,
         )
 
     def test_existing_output_rejects_before_preflight_or_channel_creation(self) -> None:
@@ -135,7 +134,7 @@ class ReplayOutputAdmissionTest(unittest.TestCase):
             self.assertTrue(empty_output.is_dir())
 
 
-class ReplayIntegritySeparationTest(unittest.TestCase):
+class ReplayPhysicalPreflightTest(unittest.TestCase):
     def _trajectory(self) -> TrajectoryData:
         return TrajectoryData(
             episode_path="episode",
@@ -148,12 +147,6 @@ class ReplayIntegritySeparationTest(unittest.TestCase):
             hand_qpos=np.zeros((2, 12), dtype=np.float64),
             arm_ee=None,
             action_source="sent",
-            resolved_config_sha256="a" * 64,
-            model_provenance=(
-                ("arm_hand_collision_urdf_sha256", "b" * 64),
-                ("arm_hand_urdf_sha256", "b" * 64),
-                ("arm_hand_srdf_sha256", "b" * 64),
-            ),
         )
 
     @staticmethod
@@ -192,44 +185,7 @@ class ReplayIntegritySeparationTest(unittest.TestCase):
         trajectory.hand_qpos = np.zeros((3, 12), dtype=np.float64)
         return trajectory
 
-    def test_model_hash_mismatch_warns_only_after_complete_physical_preflight(
-        self,
-    ) -> None:
-        planner = MagicMock()
-        planner.is_workspace_segment_safe.return_value = True
-        planner.collision_model.check_transition_collision_free.return_value = True
-        with tempfile.TemporaryDirectory() as directory:
-            model_paths = []
-            for name in ("collision.urdf", "hand.urdf", "robot.srdf"):
-                path = Path(directory) / name
-                path.write_text(name, encoding="utf-8")
-                model_paths.append(path)
-            with (
-                patch(
-                    "dexmani_real.replay.trajectory.XArm7MotionPlanner",
-                    return_value=planner,
-                ),
-                patch(
-                    "dexmani_real.replay.trajectory.preflight_model_paths",
-                    return_value=tuple(model_paths),
-                ),
-                patch("dexmani_real.replay.trajectory.logger.warning") as warning,
-            ):
-                verify_replay_preflight(
-                    self._trajectory(),
-                    self._runtime(),
-                    provenance_sha256="a" * 64,
-                )
-        self.assertEqual(planner.is_workspace_segment_safe.call_count, 2)
-        self.assertEqual(
-            planner.collision_model.check_transition_collision_free.call_count, 2
-        )
-        warning.assert_called_once()
-        self.assertIn("reproducibility warning", warning.call_args.args[0])
-
-    def test_failed_physical_preflight_never_downgrades_hash_mismatch_to_warning(
-        self,
-    ) -> None:
+    def test_failed_physical_preflight_rejects_before_warning(self) -> None:
         planner = MagicMock()
         planner.is_workspace_segment_safe.return_value = False
         with (
@@ -243,7 +199,6 @@ class ReplayIntegritySeparationTest(unittest.TestCase):
                 verify_replay_preflight(
                     self._trajectory(),
                     self._runtime(),
-                    provenance_sha256="different" * 8,
                 )
         warning.assert_not_called()
 
@@ -262,7 +217,6 @@ class ReplayIntegritySeparationTest(unittest.TestCase):
                 verify_replay_preflight(
                     trajectory,
                     self._runtime(),
-                    provenance_sha256="different" * 8,
                 )
         planner.assert_not_called()
         warning.assert_not_called()
@@ -282,7 +236,6 @@ class ReplayIntegritySeparationTest(unittest.TestCase):
                 verify_replay_preflight(
                     trajectory,
                     self._runtime(),
-                    provenance_sha256="different" * 8,
                 )
         planner.assert_not_called()
         warning.assert_not_called()
@@ -302,16 +255,8 @@ class ReplayIntegritySeparationTest(unittest.TestCase):
                 "dexmani_real.replay.trajectory.XArm7MotionPlanner",
                 return_value=planner,
             ),
-            patch(
-                "dexmani_real.replay.trajectory._reproducibility_warnings",
-                return_value=(),
-            ),
         ):
-            verify_replay_preflight(
-                trajectory,
-                runtime,
-                provenance_sha256="a" * 64,
-            )
+            verify_replay_preflight(trajectory, runtime)
 
         canonical_middle = planner.is_workspace_segment_safe.call_args_list[1].args[1]
         self.assertAlmostEqual(float(canonical_middle[0]), 0.2)
@@ -321,33 +266,6 @@ class ReplayIntegritySeparationTest(unittest.TestCase):
             ].args[1]
         )
         self.assertAlmostEqual(float(collision_middle[0]), 0.2)
-
-    def test_processed_raw_data_hash_mismatch_remains_a_hard_rejection(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            source_path = Path(directory)
-            (source_path / "data.h5").touch()
-            with (
-                patch(
-                    "dexmani_real.replay.trajectory._processed_replay_source",
-                    return_value=(
-                        source_path,
-                        np.asarray((0,), dtype=np.int64),
-                        "a" * 64,
-                        1,
-                        "b" * 64,
-                    ),
-                ),
-                patch(
-                    "dexmani_real.replay.trajectory.sha256_file",
-                    return_value="c" * 64,
-                ),
-                patch("dexmani_real.replay.trajectory.load_trajectory") as load_raw,
-            ):
-                with self.assertRaisesRegex(
-                    ValueError, "raw source data.h5 hash mismatch"
-                ):
-                    load_processed_trajectory("selection.h5")
-                load_raw.assert_not_called()
 
     def test_processed_replay_rejects_tampered_sample_provenance_dtype(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -377,14 +295,6 @@ class ReplayIntegritySeparationTest(unittest.TestCase):
                                 "source_path": directory,
                             }
                         ),
-                        "source_member_sha256_json": json.dumps(
-                            {
-                                "data.h5": "a" * 64,
-                                "depth.h5": "b" * 64,
-                                "rgb.mp4": "c" * 64,
-                            }
-                        ),
-                        "source_resolved_config_sha256": "d" * 64,
                     }
                 )
                 provenance = artifact.create_group("provenance")
@@ -415,38 +325,6 @@ class ReplayIntegritySeparationTest(unittest.TestCase):
                 ValueError, "source_sample_index dtype must be int64"
             ):
                 _processed_replay_source(artifact_path)
-
-    def test_processed_config_hash_mismatch_is_deferred_to_post_preflight_warning(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            source_path = Path(directory)
-            (source_path / "data.h5").touch()
-            with (
-                patch(
-                    "dexmani_real.replay.trajectory._processed_replay_source",
-                    return_value=(
-                        source_path,
-                        np.asarray((0, 1), dtype=np.int64),
-                        "d" * 64,
-                        2,
-                        "b" * 64,
-                    ),
-                ),
-                patch(
-                    "dexmani_real.replay.trajectory.sha256_file",
-                    return_value="b" * 64,
-                ),
-                patch(
-                    "dexmani_real.replay.trajectory.load_trajectory",
-                    return_value=self._trajectory(),
-                ),
-            ):
-                trajectory = load_processed_trajectory("selection.h5")
-        self.assertEqual(
-            trajectory.provenance_warnings,
-            ("processed source config hash does not match the raw source",),
-        )
 
 
 if __name__ == "__main__":

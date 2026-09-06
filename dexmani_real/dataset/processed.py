@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +11,13 @@ from typing import Any, Iterator
 import h5py
 import numpy as np
 
-from dexmani_real.dataset.contracts import OutputProfile, ProcessingConfig
+from dexmani_real.config.pointcloud import (
+    POINT_CLOUD_COLOR_SOURCE,
+    POINT_CLOUD_POLICY_ID,
+    POINT_CLOUD_SAMPLING,
+    POINT_CLOUD_TRANSFORM,
+)
+from dexmani_real.dataset.contracts import ProcessingConfig
 from dexmani_real.dataset.pointcloud import validate_rigid_transform
 from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
@@ -23,7 +28,6 @@ from dexmani_real.recording.storage.schema import SEMANTIC_META_ATTRS
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
 PROCESSED_SCHEMA_VERSION = 13
-_SOURCE_MEMBERS = ("data.h5", "depth.h5", "rgb.mp4")
 _PROVENANCE_DATASETS = (
     "source_row_index",
     "source_sample_index",
@@ -33,7 +37,6 @@ _PROVENANCE_DATASETS = (
     "source_drop_reason_bits",
 )
 _PROVENANCE_ATTRS = ("drop_reason_bit_names_json",)
-_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _VALIDATION_CHUNK_BYTES = 64 * 1024 * 1024
 _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "joint_state": ((19,), np.dtype(np.float32)),
@@ -56,9 +59,9 @@ def validate_fingertip_points_semantics(
     *,
     label: str,
 ) -> dict[str, str]:
-    """Return the required persisted derivation and frozen geometry identity."""
+    """Return the required persisted fingertip derivation and policy identity."""
     values: dict[str, str] = {}
-    for key in ("derivation", "policy_id", "geometry_sha256"):
+    for key in ("derivation", "policy_id"):
         value = attrs.get(f"fingertip_points_{key}", "")
         if isinstance(value, bytes):
             value = value.decode("utf-8")
@@ -67,11 +70,6 @@ def validate_fingertip_points_semantics(
         raise ValueError(f"{label}: invalid fingertip_points_derivation")
     if values["policy_id"] != FINGERTIP_POLICY_ID:
         raise ValueError(f"{label}: invalid fingertip_points_policy_id")
-    geometry_sha256 = values["geometry_sha256"]
-    if len(geometry_sha256) != 64 or any(
-        character not in "0123456789abcdef" for character in geometry_sha256
-    ):
-        raise ValueError(f"{label}: invalid fingertip_points_geometry_sha256")
     return values
 
 
@@ -128,19 +126,6 @@ def _json_object_attr(
     if not isinstance(value, dict):
         raise ValueError(f"{label}: {key} must encode an object")
     return value
-
-
-def _indices_to_ranges(indices: np.ndarray) -> list[list[int]]:
-    """Return half-open source-index ranges for a strictly increasing array."""
-    values = np.asarray(indices, dtype=np.int64)
-    if values.size == 0:
-        return []
-    starts = np.r_[0, np.flatnonzero(np.diff(values) != 1) + 1]
-    ends = np.r_[starts[1:], values.size]
-    return [
-        [int(values[start]), int(values[end - 1] + 1)]
-        for start, end in zip(starts, ends, strict=True)
-    ]
 
 
 def _validate_pointcloud_workspace(
@@ -255,8 +240,9 @@ def _validate_processed_structure(
     if length <= 0:
         raise ValueError(f"{label}: processed length must be positive")
     expected_keys = set(expected_specs)
-    if set(source.keys()) != expected_keys | {"provenance"}:
-        raise ValueError(f"{label}: processed data keys do not match profile")
+    present_keys = set(source.keys())
+    if not expected_keys.issubset(present_keys) or "provenance" not in present_keys:
+        raise ValueError(f"{label}: processed data keys are incomplete")
     for key, (expected_shape, expected_dtype) in expected_specs.items():
         dataset = source.get(key)
         if not isinstance(dataset, h5py.Dataset):
@@ -287,69 +273,6 @@ def _validate_processed_structure(
             raise ValueError(f"{label}: point_cloud must be (N,P,6)")
 
 
-def validate_processed_admission(
-    source: h5py.File | h5py.Group, *, label: str = "processed"
-) -> ProcessedProvenance:
-    """Validate a persisted processed artifact without a runtime config.
-
-    Consumers that only inspect or display processed artifacts do not have a
-    resolved processing configuration to compare against.  They still need
-    the persisted profile to select the fixed core contract and the optional
-    modality contracts before reading any payload.  RGB-D tail shapes are
-    intentionally taken from the artifact only after profile/key selection;
-    the shared validator then enforces their cross-field geometry.
-    """
-    schema_name = source.attrs.get("schema_name", "")
-    if isinstance(schema_name, bytes):
-        schema_name = schema_name.decode("utf-8")
-    if str(schema_name) != PROCESSED_SCHEMA_NAME:
-        raise ValueError(f"{label}: invalid processed schema_name")
-    if int(source.attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
-        raise ValueError(f"{label}: invalid processed schema_version")
-    profile_value = source.attrs.get("profile", "")
-    if isinstance(profile_value, bytes):
-        profile_value = profile_value.decode("utf-8")
-    try:
-        profile = OutputProfile(str(profile_value))
-    except ValueError as exc:
-        raise ValueError(f"{label}: invalid processed profile") from exc
-    length = int(source.attrs.get("episode_steps", -1))
-    expected_specs: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
-        name: ((length, *tail_shape), dtype)
-        for name, (tail_shape, dtype) in _CORE_DATASET_SPECS.items()
-    }
-    optional_dtypes: dict[str, np.dtype[Any]] = {
-        "rgb": np.dtype(np.uint8),
-        "depth": np.dtype(np.uint16),
-        "camera_intrinsic": np.dtype(np.float32),
-        "camera_extrinsic": np.dtype(np.float32),
-        "point_cloud": np.dtype(np.float32),
-    }
-    for key in profile.dataset_keys:
-        if key in expected_specs:
-            continue
-        dataset = source.get(key)
-        if not isinstance(dataset, h5py.Dataset):
-            raise ValueError(f"{label}: missing processed dataset {key}")
-        expected_specs[key] = (
-            (length, *tuple(int(value) for value in dataset.shape[1:])),
-            optional_dtypes[key],
-        )
-    validate_processed_payload(
-        source,
-        expected_specs=expected_specs,
-        length=length,
-        label=label,
-        validate_rgbd=profile.needs_rgb,
-    )
-    return validate_processed_provenance(
-        source,
-        length=length,
-        expected_profile=profile.value,
-        label=label,
-    )
-
-
 def validate_processed_provenance(
     source: h5py.File | h5py.Group,
     *,
@@ -357,15 +280,13 @@ def validate_processed_provenance(
     source_frames: int | None = None,
     dt: float | None = None,
     contiguity_tolerance_s: float | None = None,
-    expected_profile: str | None = None,
     label: str = "processed",
 ) -> ProcessedProvenance:
-    """Validate exact processed provenance and return its compact mapping.
+    """Validate processed provenance and return its compact mapping.
 
-    This is intentionally an internal provenance contract, not an authenticity
-    mechanism: source member hashes are checked for exact names and hex shape,
-    but callers still need a trusted processed artifact or an external raw-data
-    attestation before treating those hashes as evidence.
+    This is an internal row-selection provenance contract. It records how
+    processed rows map back to the source episode; it is not an authenticity
+    mechanism.
     """
     attrs = source.attrs
     if length is None:
@@ -388,10 +309,10 @@ def validate_processed_provenance(
     provenance = source.get("provenance")
     if not isinstance(provenance, h5py.Group):
         raise ValueError(f"{label}: provenance group is missing")
-    if set(provenance.keys()) != set(_PROVENANCE_DATASETS):
-        raise ValueError(f"{label}: invalid provenance keys")
-    if set(provenance.attrs.keys()) != set(_PROVENANCE_ATTRS):
-        raise ValueError(f"{label}: invalid provenance attributes")
+    if not set(_PROVENANCE_DATASETS).issubset(provenance.keys()):
+        raise ValueError(f"{label}: required provenance datasets are missing")
+    if not set(_PROVENANCE_ATTRS).issubset(provenance.attrs.keys()):
+        raise ValueError(f"{label}: required provenance attributes are missing")
 
     expected_dtypes: dict[str, np.dtype[Any]] = {
         "source_row_index": np.dtype(np.int64),
@@ -488,24 +409,13 @@ def validate_processed_provenance(
     if not np.array_equal(segment_ends, expected_segment_ends):
         raise ValueError(f"{label}: source segment boundaries mismatch")
 
+    # The compact arrays above are the authoritative row-selection record.
+    # Keep the JSON decision for source identity and hard-invalid reasons, but
+    # do not rescan its derived counts/ranges against the same arrays.
     source_decision = _json_object_attr(source, "source_decision_json", label=label)
-    if expected_profile is None:
-        expected_profile = str(attrs.get("profile", ""))
-    expected_decision = {
-        "profile": expected_profile,
-        "source_frames": source_frames,
-        "selected_frames": length,
-        "dropped_frames": source_frames - length,
-        "accepted": True,
-        "rejected_reason": None,
-        "selected_source_ranges": _indices_to_ranges(rows),
-        "selected_segment_ends": segment_ends.tolist(),
-    }
-    for key, expected in expected_decision.items():
-        if key not in source_decision or source_decision[key] != expected:
-            raise ValueError(
-                f"{label}: source_decision_json {key!r} disagrees with provenance"
-            )
+    source_path = source_decision.get("source_path")
+    if not isinstance(source_path, str) or not source_path:
+        raise ValueError(f"{label}: source_decision_json source_path is required")
     hard_invalid_value = source_decision.get("hard_invalid_reason_names")
     if (
         not isinstance(hard_invalid_value, list)
@@ -516,15 +426,6 @@ def validate_processed_provenance(
         raise ValueError(f"{label}: invalid hard-invalid reason names")
     hard_invalid_reason_names = tuple(hard_invalid_value)
 
-    source_hashes = _json_object_attr(source, "source_member_sha256_json", label=label)
-    if set(source_hashes) != set(_SOURCE_MEMBERS) or any(
-        not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None
-        for value in source_hashes.values()
-    ):
-        raise ValueError(
-            f"{label}: source_member_sha256_json must contain exactly "
-            f"{_SOURCE_MEMBERS} with 64-hex values"
-        )
     return ProcessedProvenance(
         source_rows=rows,
         source_samples=samples,
@@ -606,13 +507,6 @@ def _validate_processed_output_structure(
             length=length,
             label=artifact.name,
         )
-        for key in specs:
-            dataset = source[key]
-            if (
-                dataset.compression != "gzip"
-                or int(dataset.compression_opts) != config.gzip_level
-            ):
-                raise ValueError(f"{artifact.name}: invalid {key} compression")
     return {
         "path": artifact.name,
         "frames": length,
@@ -642,13 +536,6 @@ def validate_processed_hdf5(
                 config.pointcloud.workspace if config.profile.needs_pointcloud else None
             ),
         )
-        for key, (shape, dtype) in specs.items():
-            dataset = source[key]
-            if (
-                dataset.compression != "gzip"
-                or int(dataset.compression_opts) != config.gzip_level
-            ):
-                raise ValueError(f"{artifact.name}: invalid {key} compression")
         if config.profile.needs_rgb:
             scale = float(source.attrs.get("depth_scale_m_per_unit", np.nan))
             if not np.isfinite(scale) or scale <= 0.0:
@@ -687,8 +574,6 @@ def validate_processed_hdf5(
                 != POINT_CLOUD_COLOR_SOURCE
                 or str(source.attrs.get("point_cloud_policy_id", ""))
                 != POINT_CLOUD_POLICY_ID
-                or str(source.attrs.get("point_cloud_config_sha256", ""))
-                != config.pointcloud.sha256
                 or str(source.attrs.get("point_cloud_table_plane_abcd_json", ""))
                 != _json(
                     None
@@ -801,7 +686,6 @@ def validate_processed_hdf5(
             raise ValueError(f"{artifact.name}: processing config mismatch")
         provenance = validate_processed_provenance(
             source,
-            expected_profile=config.profile.value,
             label=artifact.name,
         )
         segment_ends = provenance.segment_ends

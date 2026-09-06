@@ -1,8 +1,7 @@
 """Canonical robot-model resources and joint mappings used across the repository.
 
-The resource paths are also consumed by lifecycle and provenance code. Keeping
-them here ensures that planning, replay, deployment, and recording hash the
-same static models.
+The resource paths are shared by planning, replay, deployment, and recording so
+all components use the same static models.
 """
 
 from __future__ import annotations

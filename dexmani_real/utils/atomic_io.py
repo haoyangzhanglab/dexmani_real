@@ -2,20 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import tempfile
 from pathlib import Path
-
-
-def sha256_file(path: str | Path) -> str:
-    """Return a file's SHA-256 digest without changing its contents."""
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def target_is_occupied(path: str | Path) -> bool:

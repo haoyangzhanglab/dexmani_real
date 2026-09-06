@@ -108,15 +108,13 @@ VR / keyboard input
 - teleop 只把已经选择并校验的 causal fixed-grid sample 交给 RecorderIO；RecorderIO 独占
   episode transaction、sidecar、sequence continuity、validation 和 atomic finalize，不决定
   机器人动作。
-- recording startup 在创建 channel/worker 前一次性冻结 canonical resolved config、Git base
-  revision/dirty 标记和既有 resource hashes；它们通过 `provenance_*` 写入 raw `data.h5`，而不
-  新增 episode sidecar 或进入 realtime loop。
+- recording startup 在创建 channel/worker 前使用已解析的运行时配置；录制数据只保留运行所需的
+  source/publish provenance，不新增 episode sidecar 或进入 realtime loop。
 - raw episode 的 schema、字段语义和对齐保持单一来源：`recording/storage/schema.py` 与
   [`docs/data_schema.md`](docs/data_schema.md)。当前链路为 raw v24 → processed HDF5 v13 →
   Policy Zarr v7；离线 `dataset/` 负责清洗、审计和导出，不改变 raw 字段含义。所有 processed
-  profile 的 fingertip 都由自身 `joint_state` FK 推导，并在处理时冻结 geometry identity。
-- `EpisodeReader` 的普通 read 严格检查 raw schema、layout 和基本语义，但不重算大型
-  sidecar hash 或完整解码视频；这些 artifact attestation 检查只在显式 integrity audit 中执行。
+  profile 的 fingertip 都由自身 `joint_state` FK 推导，并在处理时记录 derivation 与 policy identity。
+- `EpisodeReader` 的普通 read 严格检查 raw schema、layout 和基本语义，不执行额外的文件完整性扫描。
 - processed writer 只在原子发布前重开并确认 HDF5 结构；`--verify-output` 才执行完整写后
   自检。processed consumer/export 边界仍严格验证 payload finite、shape/dtype、alignment 和
   semantic attrs。
@@ -125,8 +123,7 @@ VR / keyboard input
 - 物理回放读取 recorded published arm target 与 recorded logical hand target/provenance，并重新经过
   当前 runtime 的 preflight、safety、generation 与 worker 边界；当前 hand worker 由 logical
   hand target 生成受限 SDK intermediate setpoint，而不是回放 exact actuator setpoint。processed
-  产物不能重新解释或替代 raw 命令事实；其 raw `data.h5` identity mismatch 是硬拒绝，config/URDF/
-  SRDF hash 只在完整当前 physical preflight 成功后报告为 reproducibility warning。已有非空 replay
+  产物不能重新解释或替代 raw 命令事实；processed replay 只按 `source_path` 读取 raw 命令数据。已有非空 replay
   output 在创建 channel 或 worker 前拒绝，避免覆盖实验结果。
 
 源代码、schema 和 canonical config 是实现真相；本文件只帮助定位上述稳定边界。

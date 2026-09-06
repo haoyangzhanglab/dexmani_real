@@ -36,7 +36,6 @@ from dexmani_real.dataset.processed import (
     _FINGERTIP_POINTS_FRAME,
     _FINGERTIP_POINTS_UNIT,
     _FRAME_CHUNKED_DATASETS,
-    _SOURCE_MEMBERS,
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
     _dataset_row_slices,
@@ -49,15 +48,10 @@ from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
-    compute_fingertip_geometry_sha256,
     compute_fingertip_points_xarm_base,
 )
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.storage.reader import EpisodeReader
-from dexmani_real.robot.model import (
-    HAND_SDK_TO_URDF_IDX,
-    XARM7_XHAND_COLLISION_URDF_PATH,
-)
 from dexmani_real.sensor.camera.transforms import (
     resize_camera_intrinsic,
     resize_depth,
@@ -69,7 +63,7 @@ from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_SAMPLING,
     POINT_CLOUD_TRANSFORM,
 )
-from dexmani_real.utils.atomic_io import atomic_publish, sha256_file
+from dexmani_real.utils.atomic_io import atomic_publish
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -213,7 +207,6 @@ def _write_attrs(
     decision: EpisodeDecision,
     config: ProcessingConfig,
     annotation: EpisodeAnnotation,
-    fingertip_geometry_sha256: str,
 ) -> None:
     meta = reader.h5f["meta"].attrs
     task_name = (
@@ -260,7 +253,6 @@ def _write_attrs(
             "fingertip_points_unit": _FINGERTIP_POINTS_UNIT,
             "fingertip_points_derivation": FINGERTIP_POINTS_DERIVATION,
             "fingertip_points_policy_id": FINGERTIP_POLICY_ID,
-            "fingertip_points_geometry_sha256": fingertip_geometry_sha256,
             "action_ee_frame": _ACTION_EE_FRAME,
             "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
             "contact_force_source": (
@@ -284,15 +276,6 @@ def _write_attrs(
             "processing_config_json": _json(config.to_dict()),
             "quality_summary_json": _json(decision.quality),
             "source_decision_json": _json(decision.to_dict()),
-            "source_member_sha256_json": _json(
-                {
-                    member: sha256_file(reader.h5_path / member)
-                    for member in _SOURCE_MEMBERS
-                }
-            ),
-            "source_resolved_config_sha256": str(
-                meta.get("resolved_config_sha256", "unknown")
-            ),
         }
     )
     if config.profile.needs_rgb:
@@ -337,7 +320,6 @@ def _write_attrs(
                 ),
                 "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
                 "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
-                "point_cloud_config_sha256": config.pointcloud.sha256,
                 "point_cloud_table_plane_abcd_json": _json(
                     None
                     if config.table_plane_abcd is None
@@ -397,23 +379,6 @@ def compute_fingertip_history_xarm_base(
     )
 
 
-def _fingertip_geometry_sha256(config: ProcessingConfig) -> str:
-    """Freeze the exact arm/hand FK geometry used for one processed artifact."""
-    return compute_fingertip_geometry_sha256(
-        arm_fk_urdf_sha256=sha256_file(XARM7_XHAND_COLLISION_URDF_PATH),
-        arm_eef_frame="custom_eef_link",
-        hand_fk_urdf_sha256=sha256_file(config.hand_urdf_path),
-        hand_sdk_to_urdf_idx=HAND_SDK_TO_URDF_IDX,
-        fingertip_link_names=config.fingertip_link_names,
-        handbase_position_eef_m=np.asarray(
-            config.handbase_position_eef_m, dtype=np.float64
-        ),
-        handbase_quat_eef_wxyz=np.asarray(
-            config.handbase_quat_eef_wxyz, dtype=np.float64
-        ),
-    )
-
-
 def _write_processed_episode(
     reader: EpisodeReader,
     decision: EpisodeDecision,
@@ -423,7 +388,6 @@ def _write_processed_episode(
 ) -> dict[str, Any]:
     path = output_root / f"{reader.h5_path.name}.h5"
     selected = decision.selected_indices
-    fingertip_geometry_sha256 = _fingertip_geometry_sha256(config)
     camera_model = None
     T_xarm_base_from_color = None
     if config.profile.needs_rgb or config.profile.needs_pointcloud:
@@ -437,7 +401,6 @@ def _write_processed_episode(
             decision,
             config,
             annotation,
-            fingertip_geometry_sha256,
         )
         _create_data_datasets(output, decision.selected_frames, config)
         arm_action = np.asarray(

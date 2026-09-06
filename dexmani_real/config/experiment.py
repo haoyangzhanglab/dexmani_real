@@ -4,14 +4,13 @@ The module-level objects in :mod:`dexmani_real.config.defaults` are convenient
 templates, but they are not a safe runtime configuration transport: mutating a
 template after another module imported it makes process startup order affect
 the effective configuration. This module resolves a fresh snapshot using the
-single precedence rule ``CLI > file > defaults`` and gives that snapshot a
-stable canonical-JSON SHA-256 identity.
+single precedence rule ``CLI > file > defaults`` and exposes canonical JSON/YAML
+snapshots for diagnostics.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -91,7 +90,6 @@ class ExperimentConfig:
     environment: EnvironmentConfig
     canonical_json: str
     canonical_yaml: str
-    sha256: str
 
 
 def _merge(
@@ -328,10 +326,8 @@ def resolve_experiment_config(
         allow_nan=False,
     )
     canonical_yaml = yaml.safe_dump(validated, allow_unicode=True, sort_keys=True)
-    digest = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
     return ExperimentConfig(
         **sections,
         canonical_json=canonical_json,
         canonical_yaml=canonical_yaml,
-        sha256=digest,
     )

@@ -51,19 +51,12 @@ from dexmani_real.ipc.schema import (
 from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
-    compute_fingertip_geometry_sha256,
     compute_fingertip_points_xarm_base,
-)
-from dexmani_real.robot.model import (
-    HAND_SDK_TO_URDF_IDX,
-    XARM7_XHAND_COLLISION_URDF_PATH,
-    XHAND_RIGHT_URDF_PATH,
 )
 from dexmani_real.sensor.camera.transforms import resize_rgb
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.episode_samples import _build_robot_state
 from dexmani_real.teleop.loop import _load_hand_kinematics
-from dexmani_real.utils.atomic_io import sha256_file
 
 
 def _pointcloud_semantics(runtime) -> dict[str, str]:
@@ -76,7 +69,6 @@ def _pointcloud_semantics(runtime) -> dict[str, str]:
         "color_order": "rgb",
         "color_source": POINT_CLOUD_COLOR_SOURCE,
         "policy_id": POINT_CLOUD_POLICY_ID,
-        "config_sha256": runtime.pointcloud.sha256,
         "table_plane_abcd_json": json.dumps(
             table_plane,
             separators=(",", ":"),
@@ -88,7 +80,6 @@ def _pointcloud_semantics(runtime) -> dict[str, str]:
 
 
 def _fingertip_semantics(runtime) -> dict[str, str]:
-    hand = runtime.hand
     return {
         "representation": "point_xyz",
         "frame": "xarm_base",
@@ -96,19 +87,6 @@ def _fingertip_semantics(runtime) -> dict[str, str]:
         "finger_order": "thumb_index_mid_ring_pinky",
         "derivation": FINGERTIP_POINTS_DERIVATION,
         "policy_id": FINGERTIP_POLICY_ID,
-        "geometry_sha256": compute_fingertip_geometry_sha256(
-            arm_fk_urdf_sha256=sha256_file(XARM7_XHAND_COLLISION_URDF_PATH),
-            arm_eef_frame="custom_eef_link",
-            hand_fk_urdf_sha256=sha256_file(XHAND_RIGHT_URDF_PATH),
-            hand_sdk_to_urdf_idx=HAND_SDK_TO_URDF_IDX,
-            fingertip_link_names=hand.fingertip_link_names,
-            handbase_position_eef_m=np.asarray(
-                hand.T_eef_handbase_pos_xyz, dtype=np.float64
-            ),
-            handbase_quat_eef_wxyz=np.asarray(
-                hand.T_eef_handbase_quat_wxyz, dtype=np.float64
-            ),
-        ),
     }
 
 
@@ -298,24 +276,12 @@ class MultimodalContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "Policy rgb"):
                     validate_policy_runtime_compatibility(spec, runtime)
 
-    def test_real_compatibility_rejects_pointcloud_runtime_identity_mismatches(
+    def test_real_compatibility_rejects_pointcloud_table_mismatch(
         self,
     ) -> None:
         training_runtime = resolve_experiment_config()
         spec = _policy_spec(("joint_state", "point_cloud"), training_runtime)
         runtime_cases = (
-            (
-                "config_sha256",
-                {"pointcloud": {"voxel_size_m": 0.006}},
-            ),
-            (
-                "config_sha256",
-                {
-                    "pointcloud": {
-                        "workspace": [0.01, -0.50, 0.0, 0.80, 0.50, 0.80],
-                    }
-                },
-            ),
             (
                 "table_plane_abcd_json",
                 {
@@ -336,7 +302,7 @@ class MultimodalContractTest(unittest.TestCase):
                 ):
                     validate_policy_runtime_compatibility(spec, runtime)
 
-    def test_real_compatibility_rejects_pointcloud_policy_identity_mismatches(
+    def test_real_compatibility_rejects_pointcloud_policy_semantics_mismatches(
         self,
     ) -> None:
         runtime = resolve_experiment_config()
@@ -349,7 +315,6 @@ class MultimodalContractTest(unittest.TestCase):
             "color_order",
             "color_source",
             "policy_id",
-            "config_sha256",
             "table_plane_abcd_json",
             "sampling",
             "transform",
@@ -360,7 +325,7 @@ class MultimodalContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, f"point_cloud {key} mismatch"):
                     validate_policy_runtime_compatibility(spec, runtime)
                 field.semantics[key] = original
-        for key in ("config_sha256", "table_plane_abcd_json", "policy_id"):
+        for key in ("table_plane_abcd_json", "policy_id"):
             with self.subTest(missing=key):
                 value = field.semantics.pop(key)
                 with self.assertRaisesRegex(ValueError, f"point_cloud {key} mismatch"):
@@ -371,7 +336,7 @@ class MultimodalContractTest(unittest.TestCase):
         runtime = resolve_experiment_config()
         spec = _policy_spec(("joint_state", "fingertip_points"), runtime)
         field = spec.observation_fields[1]
-        for key in ("derivation", "policy_id", "geometry_sha256"):
+        for key in ("derivation", "policy_id"):
             with self.subTest(key=key):
                 original = field.semantics[key]
                 field.semantics[key] = f"wrong-{key}"
@@ -380,7 +345,7 @@ class MultimodalContractTest(unittest.TestCase):
                 ):
                     validate_policy_runtime_compatibility(spec, runtime)
                 field.semantics[key] = original
-        for key in ("derivation", "policy_id", "geometry_sha256"):
+        for key in ("derivation", "policy_id"):
             with self.subTest(missing=key):
                 value = field.semantics.pop(key)
                 with self.assertRaisesRegex(
