@@ -177,7 +177,8 @@ def compute_metrics(
         )
         joint_lags: list[int] = []
         for joint_index in range(ARM_JOINT_SHAPE[0]):
-            best_lag, best_rmse = 0, float("inf")
+            best_lag = 0
+            best_key = (float("inf"), float("inf"), 0)
             for lag in range(-max_lag, max_lag + 1):
                 if lag < 0:
                     original = orig_q[-lag:, joint_index]
@@ -194,8 +195,9 @@ def compute_metrics(
                 rmse = float(
                     np.sqrt(np.mean((original[finite] - replayed[finite]) ** 2))
                 )
-                if rmse < best_rmse:
-                    best_rmse = rmse
+                candidate_key = (rmse, abs(lag), lag)
+                if candidate_key < best_key:
+                    best_key = candidate_key
                     best_lag = lag
             joint_lags.append(best_lag)
         peak_lag = int(np.median(joint_lags))

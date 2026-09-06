@@ -1,4 +1,4 @@
-"""Safety-gated command scheduling for one preflighted physical replay."""
+"""Safety-gated scheduling of recorded arm and logical hand replay targets."""
 
 from __future__ import annotations
 
@@ -145,7 +145,7 @@ def hand_feedback_is_healthy(
 
 
 class EpisodeReplayer:
-    """Replay one preflight-validated command stream through arm and hand workers."""
+    """Replay recorded arm targets and logical hand targets through current workers."""
 
     START_POSE_TOLERANCE_DEG = 5.0
 
@@ -367,7 +367,13 @@ class EpisodeReplayer:
         )
         candidate = prepared.candidate
         published = (
-            publish_command(self.shared, candidate) if candidate is not None else None
+            publish_command(
+                self.shared,
+                candidate,
+                required_safety_state=SafetyState.ARMED,
+            )
+            if candidate is not None
+            else None
         )
         if published is None or not published.published:
             detail = prepared.reason or (published.reason if published else "")
@@ -667,7 +673,11 @@ class EpisodeReplayer:
                 )
                 candidate = prepared.candidate
                 published = (
-                    publish_command(self.shared, candidate)
+                    publish_command(
+                        self.shared,
+                        candidate,
+                        required_safety_state=SafetyState.RUNNING,
+                    )
                     if candidate is not None
                     else None
                 )

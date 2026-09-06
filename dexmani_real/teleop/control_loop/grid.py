@@ -36,6 +36,7 @@ from dexmani_real.planning.kinematics.pose import (
     rot6d_to_quat_wxyz,
 )
 from dexmani_real.recording.client import RecorderClient
+from dexmani_real.runtime.safety import SafetyState
 from dexmani_real.teleop.control_loop.action_proposal import (
     compute_arm_joint_proposal,
     compute_hand_joint_proposal,
@@ -99,7 +100,11 @@ def _prepare_and_publish_joint_command(
     if not prepared.accepted:
         return prepared, None
     assert prepared.candidate is not None
-    return prepared, publish_command(shared, prepared.candidate)
+    return prepared, publish_command(
+        shared,
+        prepared.candidate,
+        required_safety_state=SafetyState.RUNNING,
+    )
 
 
 @dataclass(frozen=True)

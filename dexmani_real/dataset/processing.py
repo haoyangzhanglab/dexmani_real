@@ -1,4 +1,4 @@
-"""Transactional depth-to-color aligned raw-v24 to processed-v12 processing."""
+"""Transactional depth-to-color aligned raw-v24 to processed-v13 processing."""
 
 from __future__ import annotations
 
@@ -29,16 +29,16 @@ from dexmani_real.dataset.pointcloud import (
     load_raw_episode_camera_model,
 )
 from dexmani_real.dataset.processed import (
-    PROCESSED_SCHEMA_NAME,
-    PROCESSED_SCHEMA_VERSION,
     _ACTION_EE_FRAME,
     _CONTACT_FORCE_FRAME,
     _CONTACT_FORCE_SI_VERIFIED,
     _CONTACT_FORCE_UNIT,
-    _FRAME_CHUNKED_DATASETS,
-    _SOURCE_MEMBERS,
     _FINGERTIP_POINTS_FRAME,
     _FINGERTIP_POINTS_UNIT,
+    _FRAME_CHUNKED_DATASETS,
+    _SOURCE_MEMBERS,
+    PROCESSED_SCHEMA_NAME,
+    PROCESSED_SCHEMA_VERSION,
     _dataset_row_slices,
     _expected_specs,
     _json,
@@ -46,9 +46,18 @@ from dexmani_real.dataset.processed import (
     validate_processed_hdf5,
 )
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
-from dexmani_real.planning.kinematics.fingertip import compute_fingertip_points_xarm_base
+from dexmani_real.planning.kinematics.fingertip import (
+    FINGERTIP_POINTS_DERIVATION,
+    FINGERTIP_POLICY_ID,
+    compute_fingertip_geometry_sha256,
+    compute_fingertip_points_xarm_base,
+)
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.storage.reader import EpisodeReader
+from dexmani_real.robot.model import (
+    HAND_SDK_TO_URDF_IDX,
+    XARM7_XHAND_COLLISION_URDF_PATH,
+)
 from dexmani_real.sensor.camera.transforms import (
     resize_camera_intrinsic,
     resize_depth,
@@ -204,6 +213,7 @@ def _write_attrs(
     decision: EpisodeDecision,
     config: ProcessingConfig,
     annotation: EpisodeAnnotation,
+    fingertip_geometry_sha256: str,
 ) -> None:
     meta = reader.h5f["meta"].attrs
     task_name = (
@@ -248,6 +258,9 @@ def _write_attrs(
             ),
             "fingertip_points_frame": _FINGERTIP_POINTS_FRAME,
             "fingertip_points_unit": _FINGERTIP_POINTS_UNIT,
+            "fingertip_points_derivation": FINGERTIP_POINTS_DERIVATION,
+            "fingertip_points_policy_id": FINGERTIP_POLICY_ID,
+            "fingertip_points_geometry_sha256": fingertip_geometry_sha256,
             "action_ee_frame": _ACTION_EE_FRAME,
             "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
             "contact_force_source": (
@@ -384,6 +397,23 @@ def compute_fingertip_history_xarm_base(
     )
 
 
+def _fingertip_geometry_sha256(config: ProcessingConfig) -> str:
+    """Freeze the exact arm/hand FK geometry used for one processed artifact."""
+    return compute_fingertip_geometry_sha256(
+        arm_fk_urdf_sha256=sha256_file(XARM7_XHAND_COLLISION_URDF_PATH),
+        arm_eef_frame="custom_eef_link",
+        hand_fk_urdf_sha256=sha256_file(config.hand_urdf_path),
+        hand_sdk_to_urdf_idx=HAND_SDK_TO_URDF_IDX,
+        fingertip_link_names=config.fingertip_link_names,
+        handbase_position_eef_m=np.asarray(
+            config.handbase_position_eef_m, dtype=np.float64
+        ),
+        handbase_quat_eef_wxyz=np.asarray(
+            config.handbase_quat_eef_wxyz, dtype=np.float64
+        ),
+    )
+
+
 def _write_processed_episode(
     reader: EpisodeReader,
     decision: EpisodeDecision,
@@ -393,6 +423,7 @@ def _write_processed_episode(
 ) -> dict[str, Any]:
     path = output_root / f"{reader.h5_path.name}.h5"
     selected = decision.selected_indices
+    fingertip_geometry_sha256 = _fingertip_geometry_sha256(config)
     camera_model = None
     T_xarm_base_from_color = None
     if config.profile.needs_rgb or config.profile.needs_pointcloud:
@@ -400,7 +431,14 @@ def _write_processed_episode(
         camera_model = load_raw_episode_camera_model(reader)
         T_xarm_base_from_color = load_raw_episode_base_from_color(reader)
     with h5py.File(path, "w") as output:
-        _write_attrs(output, reader, decision, config, annotation)
+        _write_attrs(
+            output,
+            reader,
+            decision,
+            config,
+            annotation,
+            fingertip_geometry_sha256,
+        )
         _create_data_datasets(output, decision.selected_frames, config)
         arm_action = np.asarray(
             reader.h5f["action_arm_joint_sent"][selected], dtype=np.float32
@@ -411,7 +449,8 @@ def _write_processed_episode(
         arm_action_ee = np.asarray(
             reader.h5f["action_arm_ee"][selected], dtype=np.float32
         )
-        output["joint_state"][:] = _processed_joint_state(reader, selected, config)
+        joint_state = _processed_joint_state(reader, selected, config)
+        output["joint_state"][:] = joint_state
         output["action"][:] = np.concatenate((arm_action, hand_action), axis=1)
         output["action_ee"][:] = np.concatenate((arm_action_ee, hand_action), axis=1)
         visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
@@ -438,34 +477,23 @@ def _write_processed_episode(
             all_contact_force[selected_tactile_rows], dtype=np.float32
         )
         output["contact_force"][:] = contact_force
-        if config.profile.needs_rgb or config.profile.needs_pointcloud:
-            hand_fk = HandKinematics(
-                config.hand_urdf_path, list(config.fingertip_link_names)
-            )
-            if not hand_fk.is_ready():
-                raise RuntimeError("processed fingertip FK startup failed")
-            output["fingertip_points"][:] = compute_fingertip_history_xarm_base(
-                np.asarray(
-                    reader.h5f["policy_observation_arm_qpos"][selected],
-                    dtype=np.float64,
-                ),
-                np.asarray(
-                    reader.h5f["policy_observation_hand_qpos"][selected],
-                    dtype=np.float64,
-                ),
-                arm_fk=make_arm_fk(),
-                hand_fk=hand_fk,
-                handbase_position_eef_m=np.asarray(
-                    config.handbase_position_eef_m, dtype=np.float64
-                ),
-                handbase_quat_eef_wxyz=np.asarray(
-                    config.handbase_quat_eef_wxyz, dtype=np.float64
-                ),
-            )
-        else:
-            output["fingertip_points"][:] = np.asarray(
-                reader.h5f["hand_fingertip"][selected], dtype=np.float32
-            )
+        hand_fk = HandKinematics(
+            config.hand_urdf_path, list(config.fingertip_link_names)
+        )
+        if not hand_fk.is_ready():
+            raise RuntimeError("processed fingertip FK startup failed")
+        output["fingertip_points"][:] = compute_fingertip_history_xarm_base(
+            joint_state[:, :7],
+            joint_state[:, 7:19],
+            arm_fk=make_arm_fk(),
+            hand_fk=hand_fk,
+            handbase_position_eef_m=np.asarray(
+                config.handbase_position_eef_m, dtype=np.float64
+            ),
+            handbase_quat_eef_wxyz=np.asarray(
+                config.handbase_quat_eef_wxyz, dtype=np.float64
+            ),
+        )
 
         provenance = output.create_group("provenance")
         provenance.attrs["drop_reason_bit_names_json"] = _json(

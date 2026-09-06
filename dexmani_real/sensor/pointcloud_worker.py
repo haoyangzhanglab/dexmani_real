@@ -103,7 +103,10 @@ class PointCloudLoopConfig:
             pointcloud=replace(runtime.pointcloud, num_points=num_points),
             camera_calibration=CameraExtrinsics(),
             table_plane_abcd=table.plane_abcd if table.enabled else None,
-            max_input_age_s=float(runtime.camera.max_frame_age_s),
+            max_input_age_s=min(
+                float(runtime.camera.max_frame_age_s),
+                float(runtime.policy.max_input_age_s),
+            ),
         )
 
 

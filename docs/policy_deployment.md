@@ -19,8 +19,11 @@ policy/task/experiment
 `checkpoints/deployment_latest.pt`。没有隐式 `latest` experiment 或时间戳猜测。
 所有 artifact 使用 `dexmani.deployment.v3`，根 payload 只有 `_format`、`contract` 和
 `weights`。其中有序 `data_contract.observation_fields` 是观测输入的唯一持久化声明；每项记录
-名称、raw shape、dtype 和语义。它们都要求 xArm7 + XHand、兼容的控制周期与单槽 Prediction IPC，
-使用 point cloud 时还必须匹配点数和 xyzrgb feature。
+名称、raw shape、dtype 和语义。它们都要求 xArm7 + XHand、兼容的控制周期与单槽 Prediction IPC。
+使用 point cloud 时，Real 在创建 channel/worker 前逐项核对点数、xyzrgb representation、frame、颜色
+来源/顺序、policy ID、`PointCloudConfig` SHA-256、canonical table plane、sampling 和 transform；使用
+fingertip 时，同一边界核对 FK derivation、algorithm policy ID 与当前 arm/hand geometry SHA-256。
+任一缺失或 mismatch 都在动作前拒绝，deployment artifact schema 仍为 v3。
 
 RGB 有三个明确的尺寸 owner：相机 ring 保存原生帧；Real 在完成因果历史选择和跨模态
 provenance 配对后 resize 到 PolicySpec 的 raw RGB shape；Policy 再执行 artifact 记录的
@@ -135,7 +138,8 @@ artifact 的唯一观测合同是有序 `observation_fields`。Policy export 从
 `PolicyObservation.arrays`：RGB 保持 causal raw HWC `uint8`，model-specific preprocessing
 只在 Policy runtime/encoder 内执行；RGB 与 point cloud 共存时必须来自同一 camera sequence、
 generation 与 source timestamp；contact 必须有 fresh/calibrated/unit/source-match 证明；
-fingertip 使用同步 arm/hand state 和本地 FK 输出 `xarm_base` 米制坐标。
+fingertip 使用同步 arm/hand state 和本地 FK 输出 `xarm_base` 米制坐标；其 artifact 语义还必须与
+处理数据冻结的 derivation、algorithm ID 和 arm/hand geometry identity 一致。
 
 字段组合的可用性由实际 encoder 决定。一个 encoder 未消费的字段不能被导出或部署，避免静默
 转发、忽略或填充输入。

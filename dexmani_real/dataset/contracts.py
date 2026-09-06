@@ -202,11 +202,22 @@ class ProcessingConfig:
         camera_config = getattr(runtime, "camera")
         environment_config = getattr(runtime, "environment")
         table = environment_config.table
+        camera_max_age_s = float(camera_config.max_frame_age_s)
+        policy_max_input_age_s = float(policy_config.max_input_age_s)
+        visual_profile = isinstance(profile, OutputProfile) and (
+            profile.needs_rgb or profile.needs_pointcloud
+        )
         values: dict[str, Any] = {
             "profile": profile,
             "pointcloud": getattr(runtime, "pointcloud"),
             "table_plane_abcd": table.plane_abcd if table.enabled else None,
-            "max_camera_age_s": float(camera_config.max_frame_age_s),
+            # The default visual admission matches both the current camera and
+            # deployment observation freshness ceilings.
+            "max_camera_age_s": (
+                min(camera_max_age_s, policy_max_input_age_s)
+                if visual_profile
+                else camera_max_age_s
+            ),
             "max_observation_skew_s": float(policy_config.max_observation_skew_s),
             "arm_joint_limit_lower_rad": tuple(arm_config.joint_limit_lower),
             "arm_joint_limit_upper_rad": tuple(arm_config.joint_limit_upper),
@@ -223,6 +234,14 @@ class ProcessingConfig:
         unknown = set(overrides) - {field.name for field in dataclasses.fields(cls)}
         if unknown:
             raise TypeError(f"unknown ProcessingConfig override(s): {sorted(unknown)}")
+        if (
+            visual_profile
+            and "max_camera_age_s" in overrides
+            and float(overrides["max_camera_age_s"]) > policy_max_input_age_s
+        ):
+            raise ValueError(
+                "visual max_camera_age_s may not exceed runtime.policy.max_input_age_s"
+            )
         values.update(overrides)
         return cls(**values)
 

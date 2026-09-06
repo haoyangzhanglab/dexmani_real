@@ -48,7 +48,7 @@ Intel RealSense
                  ├─ pointcloud_ring → deployment / policy observation
                  └─ raw v24
                       ├─ raw visualizer → Rerun canonical preview
-                      └─ offline process → processed HDF5 v12 → Policy Zarr v6
+                      └─ offline process → processed HDF5 v13 → Policy Zarr v7
 ```
 
 实时 worker 不排队旧帧：它只读取 `camera_ring` 的最新 sequence。构建前检查候选帧的相机健康、
@@ -280,8 +280,12 @@ OpenCV 3×3 depth fast path 与逐步 SciPy 参考实现的 240 帧最终点云 
 
 录制 schema v24 保存 aligned raw depth、RGB、native depth/color 几何 provenance、帧号和时间
 信息，并持久化与 camera source 对齐的 arm/hand policy observation。离线处理只接受 raw v24；
-四种 profile 中只有具备各自完整观测、对齐与 teleop 已发布动作语义的产物可进入 Policy Zarr v6，
+四种 profile 中只有具备各自完整观测、对齐与 teleop 已发布动作语义的产物可进入 Policy Zarr v7，
 其中 pointcloud/rgb_pc 仍须满足本页的点云语义。
+
+视觉 profile 默认的离线 `max_camera_age_s` 与 deployment point-cloud worker 都取
+`min(runtime.camera.max_frame_age_s, runtime.policy.max_input_age_s)`；显式 visual override 超过
+policy 上限会被拒绝，而 `joint` profile 不因此引入相机 freshness 依赖。
 
 每个 processed 点云产物记录并在导出/可视化时校验：
 
@@ -306,7 +310,7 @@ OpenCV 3×3 depth fast path 与逐步 SciPy 参考实现的 240 帧最终点云 
 | 点云参数与稳定 identity | `config/pointcloud.py` |
 | 桌面 RANSAC 与 plane 文件 | `calibration/table.py`、`config/desk_plane.json` |
 | raw v24 相机 metadata 与点云输入适配 | `dataset/pointcloud.py` |
-| raw v24 → processed v12 | `dataset/processing.py` |
+| raw v24 → processed v13 | `dataset/processing.py` |
 | raw current-config preview | `examples/visualize_episode.py` |
 
 核心数学不访问 SDK、共享内存、文件或可视化；硬件采集、IPC、标定写入和 GUI 均在外围 owner 中。

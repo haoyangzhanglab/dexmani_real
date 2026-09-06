@@ -11,6 +11,7 @@ import numpy as np
 from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.deployment.config import (
     InferenceWorkerConfig,
+    _expected_pointcloud_semantics,
     validate_policy_runtime_compatibility,
 )
 from dexmani_real.deployment.inference.observation import PolicyObservation
@@ -23,6 +24,7 @@ def _field(name: str, shape: tuple[int, ...], dtype: str) -> SimpleNamespace:
 
 
 def _spec(**changes: object) -> SimpleNamespace:
+    runtime = resolve_experiment_config()
     values = {
         "action_key": "action",
         "action_dim": 19,
@@ -32,7 +34,12 @@ def _spec(**changes: object) -> SimpleNamespace:
         "n_action_steps": 8,
         "observation_fields": (
             _field("joint_state", (19,), "float32"),
-            _field("point_cloud", (1024, 6), "float32"),
+            SimpleNamespace(
+                name="point_cloud",
+                shape=(1024, 6),
+                dtype="float32",
+                semantics=_expected_pointcloud_semantics(runtime),
+            ),
         ),
         "control_dt_s": 0.0625,
         "requires_hand": True,

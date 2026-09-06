@@ -159,7 +159,15 @@ def publish_calibration_quit_hold(
         hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
     )
     candidate = prepared.candidate
-    published = publish_command(shared, candidate) if candidate is not None else None
+    published = (
+        publish_command(
+            shared,
+            candidate,
+            required_safety_state=SafetyState.ARMED,
+        )
+        if candidate is not None
+        else None
+    )
     accepted = None
     if (
         candidate is not None
@@ -349,7 +357,15 @@ def run_calibration_motion_tick(
         hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
     )
     candidate = prepared.candidate
-    published = publish_command(shared, candidate) if candidate is not None else None
+    published = (
+        publish_command(
+            shared,
+            candidate,
+            required_safety_state=SafetyState.RUNNING,
+        )
+        if candidate is not None
+        else None
+    )
     accepted = None
     if (
         candidate is not None

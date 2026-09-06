@@ -15,6 +15,7 @@ from dexmani_real.control.publication import (
     validate_hand_command_bounds,
     wait_command_accepted,
 )
+from dexmani_real.runtime.safety import SafetyState
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -93,6 +94,7 @@ def publish_hand_home_and_wait_accepted(
     publish_result = publish_command(
         shared,
         candidate,
+        required_safety_state=SafetyState.ARMED,
     )
     if not publish_result.published:
         logger.warning("hand home publish failed: %s", publish_result.reason)

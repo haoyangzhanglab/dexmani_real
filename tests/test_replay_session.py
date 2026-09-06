@@ -13,6 +13,7 @@ import h5py
 import numpy as np
 
 from dexmani_real.dataset.processed import PROCESSED_SCHEMA_VERSION
+from dexmani_real.replay import session as replay_session
 from dexmani_real.replay.replayer import ReplayOutcome, ReplayStatus
 from dexmani_real.replay.session import _post_shutdown_outcome
 from dexmani_real.replay.trajectory import (
@@ -21,8 +22,8 @@ from dexmani_real.replay.trajectory import (
     load_processed_trajectory,
     verify_replay_preflight,
 )
-from dexmani_real.runtime.safety import SafetyState
 from dexmani_real.runtime.processes import ProcessExit, ShutdownReport
+from dexmani_real.runtime.safety import SafetyState
 
 
 class _Value:
@@ -71,6 +72,67 @@ class ReplayShutdownOutcomeTest(unittest.TestCase):
         )
 
         self.assertIs(outcome.status, ReplayStatus.FAULT)
+
+
+class ReplayOutputAdmissionTest(unittest.TestCase):
+    @staticmethod
+    def _config(output_dir: Path) -> replay_session.EpisodeReplayConfig:
+        return replay_session.EpisodeReplayConfig(
+            output_dir=str(output_dir),
+            evaluate_consistency=True,
+            config_sha256="a" * 64,
+        )
+
+    def test_existing_output_rejects_before_preflight_or_channel_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_file = root / "replay.npz"
+            output_file.write_bytes(b"prior-result")
+            output_dir = root / "replay"
+            output_dir.mkdir()
+            (output_dir / "metrics.json").write_text("{}", encoding="utf-8")
+            dangling_output = root / "dangling-replay"
+            dangling_output.symlink_to(
+                root / "missing-target", target_is_directory=True
+            )
+
+            for occupied_path in (output_file, output_dir, dangling_output):
+                with self.subTest(path=occupied_path):
+                    with (
+                        patch(
+                            "dexmani_real.replay.session.verify_replay_preflight",
+                            side_effect=AssertionError("preflight must not run"),
+                        ) as preflight,
+                        patch(
+                            "dexmani_real.replay.session.RuntimeChannels.create"
+                        ) as create_channels,
+                    ):
+                        outcome = replay_session.replay_episode(
+                            object(),
+                            object(),
+                            self._config(occupied_path),
+                        )
+
+                    self.assertIs(outcome.status, ReplayStatus.REJECTED)
+                    self.assertEqual(
+                        outcome.reason,
+                        "Replay output already exists; choose another --output directory.",
+                    )
+                    preflight.assert_not_called()
+                    create_channels.assert_not_called()
+
+    def test_missing_and_empty_output_directories_are_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing_output = root / "missing"
+            empty_output = root / "empty"
+            empty_output.mkdir()
+
+            replay_session._validate_replay_output_dir(missing_output)
+            replay_session._validate_replay_output_dir(empty_output)
+
+            self.assertFalse(missing_output.exists())
+            self.assertTrue(empty_output.is_dir())
 
 
 class ReplayIntegritySeparationTest(unittest.TestCase):

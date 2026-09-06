@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -410,8 +411,26 @@ class CalibrationSamples:
         )
 
 
+def _finite_json_object(value: Mapping[str, object]) -> dict[str, object]:
+    """Return a JSON-compatible diagnostic object without NaN or infinity."""
+    if not isinstance(value, Mapping):
+        raise TypeError("calibration_capture must be an object")
+    try:
+        encoded = json.dumps(value, allow_nan=False)
+        decoded = json.loads(encoded)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("calibration_capture must contain finite JSON values") from exc
+    if not isinstance(decoded, dict):
+        raise TypeError("calibration_capture must be an object")
+    return decoded
+
+
 def save_camera_calibration(
-    T_world_camera: np.ndarray, serial: str, json_path: Path
+    T_world_camera: np.ndarray,
+    serial: str,
+    json_path: Path,
+    *,
+    calibration_capture: Mapping[str, object] | None = None,
 ) -> None:
     """Write calibration result to cameras.json, preserving other entries."""
     T_world_camera = np.asarray(T_world_camera, dtype=np.float64)
@@ -442,6 +461,8 @@ def save_camera_calibration(
             ],
         },
     }
+    if calibration_capture is not None:
+        entry["calibration_capture"] = _finite_json_object(calibration_capture)
 
     if json_path.exists():
         with open(json_path) as f:
@@ -469,5 +490,11 @@ def save_camera_calibration(
         print(f"  backed up previous config → {backup.name}")
 
     existing[cam_name] = entry
+    try:
+        json.dumps(existing, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "camera calibration payload must contain finite JSON values"
+        ) from exc
     atomic_json_dump(existing, json_path, ensure_ascii=False)
     print(f"  calibration written → {json_path} (camera: {cam_name})")

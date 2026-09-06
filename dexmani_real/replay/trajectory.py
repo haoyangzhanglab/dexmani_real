@@ -1,4 +1,4 @@
-"""Load exact raw commands and fail-closed validate physical replay trajectories."""
+"""Load raw arm and logical hand targets and validate physical replay trajectories."""
 
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ def resolve_episode_path(raw_path: str) -> tuple[str, str]:
 
 
 def load_trajectory(episode_path: str) -> TrajectoryData:
-    """Load the exact submitted command stream for physical replay."""
+    """Load recorded published arm targets and logical hand targets for replay."""
     resolved_path, _episode_name = resolve_episode_path(episode_path)
     if not Path(resolved_path).exists():
         raise FileNotFoundError(f"Episode not found: {episode_path}")
@@ -295,7 +295,7 @@ def _select_raw_trajectory_rows(
     raw_trajectory: TrajectoryData,
     retained_rows: np.ndarray,
 ) -> TrajectoryData:
-    """Build a replay trajectory from exact raw commands at retained source rows."""
+    """Build a replay trajectory from retained raw arm and logical hand targets."""
     rows = np.asarray(retained_rows, dtype=np.int64)
     if (
         rows.ndim != 1
@@ -340,11 +340,11 @@ def _select_raw_trajectory_rows(
 
 
 def load_processed_trajectory(episode_path: str) -> TrajectoryData:
-    """Load exact raw commands selected and attested by one processed artifact.
+    """Load raw arm and logical hand targets selected by one processed artifact.
 
     Processed ``float32`` action arrays are training data, not physical commands.
     This loader uses their provenance only: it hashes the recorded raw ``data.h5``
-    and selects the retained rows from the raw ``float64`` submitted command stream.
+    and selects retained rows from raw ``float64`` arm and logical hand targets.
     """
     artifact_path = Path(episode_path)
     (
@@ -385,7 +385,7 @@ def load_processed_trajectory(episode_path: str) -> TrajectoryData:
 
 
 def modeled_hand_actions(trajectory: TrajectoryData) -> np.ndarray:
-    """Return the recorded hand action stream used for geometry preflight."""
+    """Return recorded logical hand targets used for geometry preflight."""
     if trajectory.action_hand_joint is None:
         raise ValueError(
             "episode has no hand action stream; physical replay requires recorded hand data"
@@ -426,7 +426,7 @@ def _verify_trajectory_input(trajectory: TrajectoryData) -> None:
     """Fail closed on the exact source stream needed for physical preflight."""
     if trajectory.action_source != "sent":
         raise ValueError(
-            "physical replay requires the exact submitted action stream ('sent')"
+            "physical replay requires recorded published arm targets ('sent')"
         )
     if trajectory.num_frames <= 0:
         raise ValueError("physical replay trajectory is empty")
@@ -598,7 +598,7 @@ def verify_replay_preflight(
         static_boxes=tuple(runtime.environment.static_boxes),
         # user_design.md §3: replay does not reject on robot-table contact.
         # Table clearance stays enforced on the return-home path, which uses the
-        # replay controller's own planner (see replay_controller.setup).
+        # replayer's own planner (see EpisodeReplayer.setup()).
         table=None,
     )
     first_arm_cmd = arm_actions[0]

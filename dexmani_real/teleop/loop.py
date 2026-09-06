@@ -573,11 +573,16 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
 
             if (
                 shared.estop_request.value
-                or shared.quit_requested.value
                 or shared.error_state.value
                 or not shared.is_running.value
             ):
                 break
+            if shared.quit_requested.value:
+                # The supervisor owns global shutdown.  Do not let a clean Q
+                # make this child look dead before the parent observes it.
+                # This branch is command/recording-start silent; the loop only
+                # continues its heartbeat until parent shutdown clears is_running.
+                continue
 
             if quit_pending:
                 home_handled = False
@@ -606,10 +611,11 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                             break
                 if (
                     shared.estop_request.value
-                    or shared.quit_requested.value
                     or not shared.is_running.value
                 ):
                     break
+                if shared.quit_requested.value:
+                    continue
                 recording_stop_pending = recorder is not None and recorder.stop_pending
                 if (
                     quit_after_recording
@@ -618,7 +624,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 ):
                     print("  录制终结超时 — 退出并将本会话标记为失败")
                     shared.quit_requested.value = True
-                    break
+                    continue
                 if time.perf_counter() <= post_teleop_deadline_s:
                     continue
                 if recording_stop_pending:
@@ -631,7 +637,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     continue
                 print("  timeout — auto exit")
                 shared.quit_requested.value = True
-                break
+                continue
 
             pending_controls.extend(kb.poll(timeout=0.0))
             loop_now_ns = time.monotonic_ns()

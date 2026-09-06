@@ -1,4 +1,4 @@
-"""Transactional export of processed HDF5 v12 episodes to Policy Zarr v6."""
+"""Transactional export of processed HDF5 v13 episodes to Policy Zarr v7."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from dexmani_real.dataset.processed import (
     ProcessedProvenance,
     _strict_bool_attr,
     _strict_integer_attr,
+    validate_fingertip_points_semantics,
     validate_processed_payload,
     validate_processed_provenance,
 )
@@ -41,7 +42,7 @@ from dexmani_real.sensor.pointcloud import (
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 
 POLICY_ZARR_SCHEMA_NAME = "dexmani-real-policy-zarr"
-POLICY_ZARR_SCHEMA_VERSION = 6
+POLICY_ZARR_SCHEMA_VERSION = 7
 ExportProgressCallback = Callable[[str, int, int], None]
 
 
@@ -222,6 +223,9 @@ def _inspect_artifact(
         resolved_pointcloud: PointCloudConfig | None = None
         shapes: dict[str, tuple[int, ...]] = {}
         dtypes: dict[str, np.dtype[Any]] = {}
+        fingertip_semantics = validate_fingertip_points_semantics(
+            source.attrs, label=path.name
+        )
         semantics: dict[str, Any] = {
             "obs_alignment": _text(source.attrs.get("obs_alignment", "")),
             "observation_reference": _text(
@@ -262,6 +266,9 @@ def _inspect_artifact(
             "fingertip_points_unit": _text(
                 source.attrs.get("fingertip_points_unit", "")
             ),
+            "fingertip_points_derivation": fingertip_semantics["derivation"],
+            "fingertip_points_policy_id": fingertip_semantics["policy_id"],
+            "fingertip_points_geometry_sha256": fingertip_semantics["geometry_sha256"],
             "action_ee_frame": _text(source.attrs.get("action_ee_frame", "")),
         }
         visual_profile = profile.needs_rgb or profile.needs_pointcloud
@@ -464,6 +471,13 @@ def _validate_uniform(artifacts: tuple[_Artifact, ...]) -> None:
             raise ValueError(f"{artifact.path.name}: non-uniform dataset shapes")
         if artifact.dataset_dtypes != first.dataset_dtypes:
             raise ValueError(f"{artifact.path.name}: non-uniform dataset dtypes")
+        for key in (
+            "fingertip_points_derivation",
+            "fingertip_points_policy_id",
+            "fingertip_points_geometry_sha256",
+        ):
+            if artifact.semantic_attrs[key] != first.semantic_attrs[key]:
+                raise ValueError(f"{artifact.path.name}: {key} mismatch")
         if artifact.semantic_attrs != first.semantic_attrs:
             raise ValueError(
                 f"{artifact.path.name}: non-uniform Real modality semantics"

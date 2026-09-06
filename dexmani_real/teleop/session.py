@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import multiprocessing as mp
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -112,6 +113,56 @@ def _resource_provenance(repo_root: Path) -> tuple[tuple[str, str], ...]:
             raise FileNotFoundError(f"required experiment resource is missing: {path}")
         result.append((name, hashlib.sha256(path.read_bytes()).hexdigest()))
     return tuple(sorted(result))
+
+
+def _git_stdout(repo_root: Path, *args: str) -> str:
+    """Run one bounded Git query during experiment startup."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            f"failed to collect Git provenance: git {' '.join(args)}"
+        ) from exc
+    return result.stdout
+
+
+def _recording_provenance(
+    runtime: ExperimentConfig,
+    repo_root: Path,
+) -> tuple[tuple[str, str], ...]:
+    """Freeze config, source revision, and resource identity before recorder startup."""
+    canonical_json = runtime.canonical_json
+    canonical_sha256 = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+    if canonical_sha256 != runtime.sha256:
+        raise ValueError(
+            "runtime canonical config SHA-256 does not match runtime.sha256"
+        )
+
+    git_commit = _git_stdout(repo_root, "rev-parse", "HEAD").strip()
+    if len(git_commit) != 40 or any(
+        character not in "0123456789abcdef" for character in git_commit
+    ):
+        raise ValueError(
+            "expected a 40-character lowercase Git SHA from git rev-parse HEAD"
+        )
+    git_dirty = "1" if _git_stdout(repo_root, "status", "--porcelain") else "0"
+
+    return tuple(
+        sorted(
+            (
+                *_resource_provenance(repo_root),
+                ("resolved_config_json", canonical_json),
+                ("dexmani_real_git_commit", git_commit),
+                ("dexmani_real_git_dirty", git_dirty),
+            )
+        )
+    )
 
 
 def _preflight_health_issues(
@@ -396,6 +447,11 @@ def run_teleop_experiment(
     """Run one resolved teleoperation experiment lifecycle."""
     hand_enabled = bool(runtime.policy.hand_enabled)
     recording_enabled = bool(runtime.policy.recording_enabled)
+    if recording_enabled and not hand_enabled:
+        logger.error(
+            "recording requires hand_enabled; --no-hand is only for arm bring-up/debug"
+        )
+        return 1
     try:
         task_name = validate_task_name(task_name)
     except ValueError as exc:
@@ -419,8 +475,10 @@ def run_teleop_experiment(
         print(f"Preflight failed: invalid VR transform: {exc}")
         return 1
     try:
-        provenance = _resource_provenance(repo_root) if recording_enabled else ()
-    except (FileNotFoundError, OSError) as exc:
+        provenance = (
+            _recording_provenance(runtime, repo_root) if recording_enabled else ()
+        )
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         print(f"Preflight failed: {exc}")
         return 1
 

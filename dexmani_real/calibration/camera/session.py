@@ -29,7 +29,7 @@ Controls:
   ← →              roll (about X)
   I / K            pitch (about Y)
   J / L            yaw (about Z)
-  SPACE            capture calibration sample (requires ArUco detection)
+  SPACE            capture stationary calibration sample (requires ArUco detection)
   BACKSPACE         undo last sample
   X                 delete worst-residual frame (after ENTER evaluation)
   ENTER             compute calibration and write cameras.json (min 10 samples)
@@ -48,6 +48,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import cv2
@@ -248,8 +249,12 @@ def _capture_calibration_sample(
     samples: CalibrationSamples,
     aruco_config: ArucoConfig,
 ) -> None:
-    """Capture one synchronized marker/arm observation into ``samples``."""
+    """Append one marker/arm observation only when the arm stayed stationary."""
     print(f"\n  [{len(samples) + 1}] capturing ArUco pose...", end=" ", flush=True)
+    arm_before, feedback_issue = _read_stationary_calibration_arm_state(shared, runtime)
+    if arm_before is None:
+        print(f"FAILED — before capture: {feedback_issue}, skipped")
+        return
     try:
         aruco_pose = _detect_aruco_stable(
             pipeline,
@@ -263,32 +268,27 @@ def _capture_calibration_sample(
         logger.warning("capture failed", exc_info=True)
         print(f"FAILED — {exc}, skipped")
         return
+
+    arm_after, feedback_issue = _read_stationary_calibration_arm_state(shared, runtime)
+    if arm_after is None:
+        print(f"FAILED — after capture: {feedback_issue}, skipped")
+        return
+    arm_before_qpos = np.asarray(arm_before["qpos"], dtype=np.float64)
+    arm_after_qpos = np.asarray(arm_after["qpos"], dtype=np.float64)
+    drift_rad = float(np.max(np.abs(arm_after_qpos - arm_before_qpos)))
+    convergence_rad = float(runtime.arm.homing.convergence_rad)
+    if drift_rad > convergence_rad:
+        print(
+            "FAILED — arm moved during capture "
+            f"({drift_rad:.4f}rad > {convergence_rad:.4f}rad), skipped"
+        )
+        return
     if aruco_pose is None:
         print("FAILED — marker not detected, skipped")
         return
 
-    arm_state = read_arm_state_dict(shared)
-    if arm_state is None:
-        print("FAILED — arm state unavailable, skipped")
-        return
-    feedback_issue = validate_arm_feedback(
-        connected=arm_state["connected"],
-        error_code=arm_state["error_code"],
-        state_valid=arm_state["state_valid"],
-        source_monotonic_ns=arm_state["source_monotonic_ns"],
-        now_monotonic_ns=time.monotonic_ns(),
-        max_age_s=float(runtime.policy.arm_state_stale_threshold_s),
-        qpos=np.asarray(arm_state["qpos"], dtype=np.float64),
-        qvel=arm_state["qvel"],
-    )
-    if feedback_issue is not None:
-        print(f"FAILED — {feedback_issue}, skipped")
-        return
-
     marker_rvec, marker_tvec = aruco_pose
-    eef_pos_base_m, eef_rot6d_base = make_arm_fk().compute(
-        np.asarray(arm_state["qpos"], dtype=np.float64)
-    )
+    eef_pos_base_m, eef_rot6d_base = make_arm_fk().compute(arm_after_qpos)
     eef_rpy_base_rad = eef_rpy_from_rot6d(eef_rot6d_base)
     samples.append(
         eef_pos_base_m,
@@ -302,11 +302,97 @@ def _capture_calibration_sample(
     )
 
 
+def _read_stationary_calibration_arm_state(
+    shared: RuntimeChannels,
+    runtime: ExperimentConfig,
+) -> tuple[dict[str, Any] | None, str]:
+    """Read fresh arm feedback and apply the existing homing stationary bound."""
+    arm_state = read_arm_state_dict(shared)
+    if arm_state is None:
+        return None, "arm state unavailable"
+    feedback_issue = validate_arm_feedback(
+        connected=arm_state["connected"],
+        error_code=arm_state["error_code"],
+        state_valid=arm_state["state_valid"],
+        source_monotonic_ns=arm_state["source_monotonic_ns"],
+        now_monotonic_ns=time.monotonic_ns(),
+        max_age_s=float(runtime.policy.arm_state_stale_threshold_s),
+        qpos=np.asarray(arm_state["qpos"], dtype=np.float64),
+        qvel=arm_state["qvel"],
+    )
+    if feedback_issue is not None:
+        return None, feedback_issue
+    max_velocity_rad_s = float(np.max(np.abs(np.asarray(arm_state["qvel"]))))
+    velocity_convergence_rad_s = float(runtime.arm.homing.velocity_convergence_rad_s)
+    if max_velocity_rad_s > velocity_convergence_rad_s:
+        return (
+            None,
+            "arm velocity exceeds stationary bound "
+            f"({max_velocity_rad_s:.4f}rad/s > "
+            f"{velocity_convergence_rad_s:.4f}rad/s)",
+        )
+    return arm_state, ""
+
+
+def _calibration_capture_metadata(
+    *,
+    intrinsics: np.ndarray,
+    distortion: np.ndarray,
+    method: str,
+    sample_count: int,
+    position_errors_mm: np.ndarray,
+    rotation_errors_deg: np.ndarray,
+) -> dict[str, object]:
+    """Build diagnostic-only camera capture provenance with finite JSON values."""
+    intrinsic_matrix = np.asarray(intrinsics, dtype=np.float64)
+    distortion_values = np.asarray(distortion, dtype=np.float64)
+    position_errors = np.asarray(position_errors_mm, dtype=np.float64)
+    rotation_errors = np.asarray(rotation_errors_deg, dtype=np.float64)
+    if intrinsic_matrix.shape != (3, 3) or not np.all(np.isfinite(intrinsic_matrix)):
+        raise ValueError("calibration intrinsics must be finite shape (3, 3)")
+    if distortion_values.ndim != 1 or not np.all(np.isfinite(distortion_values)):
+        raise ValueError("calibration distortion must be a finite vector")
+    if (
+        type(sample_count) is not int
+        or sample_count <= 0
+        or position_errors.shape != (sample_count,)
+        or rotation_errors.shape != (sample_count,)
+        or not np.all(np.isfinite(position_errors))
+        or not np.all(np.isfinite(rotation_errors))
+    ):
+        raise ValueError("calibration residuals must be finite per-sample vectors")
+    if not isinstance(method, str) or not method.strip():
+        raise ValueError("calibration method must be non-empty")
+
+    def _summary(values: np.ndarray) -> dict[str, float]:
+        return {
+            "mean": float(values.mean()),
+            "std": float(values.std()),
+            "max": float(values.max()),
+        }
+
+    return {
+        "width": _CAMERA_WIDTH,
+        "height": _CAMERA_HEIGHT,
+        "fps": _CAMERA_FPS,
+        "intrinsics": intrinsic_matrix.tolist(),
+        "distortion": distortion_values.tolist(),
+        "method": method,
+        "sample_count": sample_count,
+        "position_error_mm": _summary(position_errors),
+        "rotation_error_deg": _summary(rotation_errors),
+        "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def _solve_and_save_calibration(
     samples: CalibrationSamples,
     planner: XArm7MotionPlanner,
     camera_serial: str,
     config: CalibrationConfig,
+    *,
+    intrinsics: np.ndarray,
+    distortion: np.ndarray,
 ) -> np.ndarray | None:
     """Solve, report, quality-gate, and explicitly persist accepted samples."""
     sample_count = len(samples)
@@ -386,6 +472,14 @@ def _solve_and_save_calibration(
             T_world_camera,
             camera_serial,
             CAMERA_CALIBRATION_PATH,
+            calibration_capture=_calibration_capture_metadata(
+                intrinsics=intrinsics,
+                distortion=distortion,
+                method=method,
+                sample_count=sample_count,
+                position_errors_mm=errors_mm,
+                rotation_errors_deg=errors_deg,
+            ),
         )
     except Exception as exc:
         logger.warning("save failed", exc_info=True)
@@ -482,6 +576,8 @@ def _handle_calibration_sample_events(
                 planner,
                 serial,
                 calib_cfg,
+                intrinsics=intrinsics,
+                distortion=distortion,
             )
             state.calibration_saved = transform is not None
         event = keys.pop_event()

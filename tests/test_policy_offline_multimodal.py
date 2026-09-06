@@ -14,9 +14,8 @@ import h5py
 import numpy as np
 import zarr
 
-from examples import process_episodes
-from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.dataset.clean import align_tactile_sum_rows_to_references
 from dexmani_real.dataset.contracts import (
     EpisodeAnnotation,
@@ -42,13 +41,20 @@ from dexmani_real.dataset.processing import (
     compute_fingertip_history_xarm_base,
     discover_episode_dirs,
 )
-from dexmani_real.planning.kinematics.fingertip import compute_fingertip_points_xarm_base
+from dexmani_real.planning.kinematics.fingertip import (
+    FINGERTIP_POINTS_DERIVATION,
+    FINGERTIP_POLICY_ID,
+    compute_fingertip_geometry_sha256,
+    compute_fingertip_points_xarm_base,
+)
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
     POINT_CLOUD_SAMPLING,
     POINT_CLOUD_TRANSFORM,
 )
+from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig
+from examples import process_episodes
 
 
 class _ArmFk:
@@ -163,7 +169,208 @@ class OfflineMultimodalTest(unittest.TestCase):
         ).astype(np.float32)
         np.testing.assert_array_equal(history, expected)
 
-    def test_policy_zarr_v6_admits_all_four_processed_profiles(self) -> None:
+    def test_every_profile_derives_fingertips_from_its_processed_joint_state(
+        self,
+    ) -> None:
+        class _StopAfterFingertipArguments(RuntimeError):
+            pass
+
+        control_arm = np.array(
+            [
+                [0.01, 0.02, 0.03, 0.0, 0.0, 0.0, 0.0],
+                [0.04, 0.05, 0.06, 0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        control_hand = np.array(
+            [
+                [0.10, 0.11, 0.12, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.13, 0.14, 0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        camera_arm = control_arm + 0.20
+        camera_hand = control_hand + 0.20
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            episode = root / "episode"
+            episode.mkdir()
+            (episode / "rgb.mp4").write_bytes(b"synthetic-rgb")
+            with h5py.File(episode / "depth.h5", "w"):
+                pass
+            source_path = episode / "data.h5"
+            with h5py.File(source_path, "w") as source:
+                source.create_group("meta").attrs.update(
+                    {
+                        "task_label": "pick",
+                        "resolved_config_sha256": "a" * 64,
+                        "depth_scale": 0.001,
+                        "camera_depth_intrinsics": np.eye(3).reshape(-1),
+                        "camera_depth_distortion_model": "none",
+                        "camera_depth_distortion_coeffs": np.zeros(5),
+                        "camera_color_distortion_model": "none",
+                        "camera_color_distortion_coeffs": np.zeros(5),
+                        "camera_T_color_from_depth": np.eye(4),
+                    }
+                )
+                source.create_dataset("arm_qpos", data=control_arm)
+                source.create_dataset("hand_qpos", data=control_hand)
+                source.create_dataset("policy_observation_arm_qpos", data=camera_arm)
+                source.create_dataset("policy_observation_hand_qpos", data=camera_hand)
+                source.create_dataset("hand_fingertip", data=np.full((2, 5, 3), -7.0))
+                source.create_dataset("action_arm_joint_sent", data=np.zeros((2, 7)))
+                source.create_dataset("action_hand_joint", data=np.zeros((2, 12)))
+                action_ee = np.zeros((2, 9))
+                action_ee[:, 3] = 1.0
+                action_ee[:, 7] = 1.0
+                source.create_dataset("action_arm_ee", data=action_ee)
+                source.create_dataset("hand_contact", data=np.zeros((2, 5, 3)))
+                source_times_ns = np.array(
+                    [1_000_000_000, 1_062_500_000], dtype=np.int64
+                )
+                for key in (
+                    "hand_source_monotonic_ns",
+                    "tactile_source_monotonic_ns",
+                    "observation_anchor_monotonic_ns",
+                    "camera_source_monotonic_ns",
+                ):
+                    source.create_dataset(key, data=source_times_ns)
+                source.create_dataset("tactile_fresh", data=np.ones(2, dtype=bool))
+                source.create_dataset("tactile_calibrated", data=np.ones(2, dtype=bool))
+                source.create_dataset("tactile_unit_code", data=np.zeros(2, np.int64))
+                source.create_dataset(
+                    "source_sample_index", data=np.arange(2, dtype=np.int64)
+                )
+                source.create_dataset(
+                    "timestamp", data=np.array([1.0, 1.0625], dtype=np.float64)
+                )
+
+            processed_root = root / "processed"
+            processed_root.mkdir()
+            with h5py.File(source_path, "r") as source:
+                reader = SimpleNamespace(
+                    h5_path=episode,
+                    h5f=source,
+                    timing=SimpleNamespace(grid_dt_s=0.0625),
+                )
+                for profile in OutputProfile:
+                    with self.subTest(profile=profile.value):
+                        config = ProcessingConfig(
+                            profile=profile,
+                            horizon=1,
+                            min_full_windows=1,
+                        )
+                        decision = EpisodeDecision(
+                            source_path=episode,
+                            source_frames=2,
+                            profile=profile,
+                            selected_indices=np.arange(2, dtype=np.int64),
+                            keep_mask=np.ones(2, dtype=bool),
+                            drop_reason_bits=np.zeros(2, dtype=np.uint64),
+                            drop_reason_names=(),
+                            hard_reason_counts={},
+                            boundary_counts={},
+                            selected_frames=2,
+                            quality={"full_window_count": 1},
+                        )
+                        expected_state = np.concatenate(
+                            (
+                                (camera_arm, camera_hand)
+                                if profile.needs_rgb or profile.needs_pointcloud
+                                else (control_arm, control_hand)
+                            ),
+                            axis=1,
+                        ).astype(np.float32)
+                        with (
+                            patch(
+                                "dexmani_real.dataset.processing.HandKinematics",
+                                return_value=_HandFk(),
+                            ),
+                            patch(
+                                "dexmani_real.dataset.processing.make_arm_fk",
+                                return_value=_ArmFk(),
+                            ),
+                            patch(
+                                "dexmani_real.dataset.processing.load_raw_episode_camera_model",
+                                return_value=object(),
+                            ),
+                            patch(
+                                "dexmani_real.dataset.processing.load_raw_episode_base_from_color",
+                                return_value=np.eye(4),
+                            ),
+                            patch(
+                                "dexmani_real.dataset.processing.compute_fingertip_history_xarm_base",
+                                side_effect=_StopAfterFingertipArguments,
+                            ) as compute_fingertips,
+                            self.assertRaises(_StopAfterFingertipArguments),
+                        ):
+                            _write_processed_episode(
+                                reader,
+                                decision,
+                                processed_root,
+                                config,
+                                EpisodeAnnotation(),
+                            )
+                        arm_input, hand_input = compute_fingertips.call_args.args[:2]
+                        np.testing.assert_array_equal(arm_input, expected_state[:, :7])
+                        np.testing.assert_array_equal(
+                            hand_input, expected_state[:, 7:19]
+                        )
+
+    def test_fingertip_geometry_sha256_tracks_every_fk_dependency(self) -> None:
+        mapping = (3, 4, 5, 6, 7, 10, 11, 8, 9, 0, 1, 2)
+        links = (
+            "thumb_tip",
+            "index_tip",
+            "mid_tip",
+            "ring_tip",
+            "pinky_tip",
+        )
+        values = {
+            "arm_fk_urdf_sha256": "a" * 64,
+            "arm_eef_frame": "custom_eef_link",
+            "hand_fk_urdf_sha256": "b" * 64,
+            "hand_sdk_to_urdf_idx": mapping,
+            "fingertip_link_names": links,
+            "handbase_position_eef_m": np.array([0.01, -0.02, 0.03]),
+            "handbase_quat_eef_wxyz": np.array([0.5, 0.5, 0.5, 0.5]),
+        }
+
+        reference = compute_fingertip_geometry_sha256(**values)
+        self.assertEqual(reference, compute_fingertip_geometry_sha256(**values))
+        self.assertEqual(
+            reference,
+            compute_fingertip_geometry_sha256(
+                **{
+                    **values,
+                    "handbase_quat_eef_wxyz": -values["handbase_quat_eef_wxyz"],
+                }
+            ),
+        )
+        self.assertEqual(
+            reference,
+            compute_fingertip_geometry_sha256(
+                **{
+                    **values,
+                    "handbase_quat_eef_wxyz": 3.0 * values["handbase_quat_eef_wxyz"],
+                }
+            ),
+        )
+        for key, value in (
+            ("arm_fk_urdf_sha256", "c" * 64),
+            ("hand_fk_urdf_sha256", "d" * 64),
+            ("hand_sdk_to_urdf_idx", tuple(reversed(mapping))),
+            ("fingertip_link_names", tuple(reversed(links))),
+            ("handbase_position_eef_m", np.array([0.02, -0.02, 0.03])),
+            ("handbase_quat_eef_wxyz", np.array([1.0, 0.0, 0.0, 0.0])),
+        ):
+            with self.subTest(key=key):
+                self.assertNotEqual(
+                    reference,
+                    compute_fingertip_geometry_sha256(**{**values, key: value}),
+                )
+
+    def test_policy_zarr_v7_admits_all_four_processed_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for profile in OutputProfile:
@@ -241,6 +448,59 @@ class OfflineMultimodalTest(unittest.TestCase):
         self.assertEqual(config.max_camera_age_s, 0.3)
         self.assertEqual(config.max_observation_skew_s, 0.1)
 
+    def test_visual_processing_and_realtime_pointcloud_share_freshness_limit(
+        self,
+    ) -> None:
+        for camera_max_age_s, policy_max_age_s, expected_max_age_s in (
+            (0.25, 0.15, 0.15),
+            (0.10, 0.15, 0.10),
+        ):
+            runtime = resolve_experiment_config(
+                data={
+                    "camera": {"max_frame_age_s": camera_max_age_s},
+                    "policy": {"max_input_age_s": policy_max_age_s},
+                }
+            )
+            for profile in (
+                OutputProfile.RGB,
+                OutputProfile.POINTCLOUD,
+                OutputProfile.RGB_PC,
+            ):
+                config = ProcessingConfig.from_runtime(runtime, profile=profile)
+                self.assertEqual(config.max_camera_age_s, expected_max_age_s)
+
+            pointcloud_config = PointCloudLoopConfig.from_runtime(
+                runtime,
+                num_points=1024,
+            )
+            self.assertEqual(pointcloud_config.max_input_age_s, expected_max_age_s)
+
+    def test_visual_camera_age_override_cannot_exceed_deployment_limit(self) -> None:
+        runtime = resolve_experiment_config(
+            data={
+                "camera": {"max_frame_age_s": 0.25},
+                "policy": {"max_input_age_s": 0.15},
+            }
+        )
+        for profile in (
+            OutputProfile.RGB,
+            OutputProfile.POINTCLOUD,
+            OutputProfile.RGB_PC,
+        ):
+            with self.assertRaisesRegex(ValueError, "max_input_age_s"):
+                ProcessingConfig.from_runtime(
+                    runtime,
+                    profile=profile,
+                    max_camera_age_s=0.20,
+                )
+
+        joint_config = ProcessingConfig.from_runtime(
+            runtime,
+            profile=OutputProfile.JOINT,
+            max_camera_age_s=0.20,
+        )
+        self.assertEqual(joint_config.max_camera_age_s, 0.20)
+
     def test_relative_input_produces_canonical_source_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -266,10 +526,10 @@ class OfflineMultimodalTest(unittest.TestCase):
 
             self.assertEqual(decision.to_dict()["source_path"], str(episode.resolve()))
 
-    def test_joint_writer_validator_and_zarr_export_keep_teleop_action_semantics(
+    def test_joint_writer_recomputes_fingertips_from_processed_joint_state(
         self,
     ) -> None:
-        """Exercise the real processed writer and both persisted consumers."""
+        """A JOINT artifact cannot inherit the raw fingertip representation."""
         config = ProcessingConfig(
             profile=OutputProfile.JOINT,
             horizon=2,
@@ -301,9 +561,24 @@ class OfflineMultimodalTest(unittest.TestCase):
                 action_ee[:, 3] = 1.0
                 action_ee[:, 7] = 1.0
                 source.create_dataset("action_arm_ee", data=action_ee)
-                source.create_dataset("arm_qpos", data=np.zeros((2, 7)))
-                source.create_dataset("hand_qpos", data=np.zeros((2, 12)))
-                source.create_dataset("hand_fingertip", data=np.zeros((2, 5, 3)))
+                arm_qpos = np.array(
+                    [
+                        [0.01, 0.02, 0.03, 0.0, 0.0, 0.0, 0.0],
+                        [0.04, 0.05, 0.06, 0.0, 0.0, 0.0, 0.0],
+                    ],
+                    dtype=np.float64,
+                )
+                hand_qpos = np.array(
+                    [
+                        [0.10, 0.11, 0.12, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.13, 0.14, 0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    ],
+                    dtype=np.float64,
+                )
+                source.create_dataset("arm_qpos", data=arm_qpos)
+                source.create_dataset("hand_qpos", data=hand_qpos)
+                raw_fingertips = np.full((2, 5, 3), -7.0, dtype=np.float64)
+                source.create_dataset("hand_fingertip", data=raw_fingertips)
                 source.create_dataset("hand_contact", data=np.zeros((2, 5, 3)))
                 source_times_ns = np.array(
                     [1_000_000_000, 1_062_500_000], dtype=np.int64
@@ -345,15 +620,55 @@ class OfflineMultimodalTest(unittest.TestCase):
                     h5f=source,
                     timing=SimpleNamespace(grid_dt_s=0.0625),
                 )
-                output = _write_processed_episode(
-                    reader,
-                    decision,
-                    processed_root,
-                    config,
-                    EpisodeAnnotation(),
-                )
+                with (
+                    patch(
+                        "dexmani_real.dataset.processing.HandKinematics",
+                        return_value=_HandFk(),
+                    ),
+                    patch(
+                        "dexmani_real.dataset.processing.make_arm_fk",
+                        return_value=_ArmFk(),
+                    ),
+                ):
+                    output = _write_processed_episode(
+                        reader,
+                        decision,
+                        processed_root,
+                        config,
+                        EpisodeAnnotation(),
+                    )
 
             processed_path = processed_root / output["path"]
+            with h5py.File(processed_path, "r") as processed:
+                expected_fingertips = compute_fingertip_history_xarm_base(
+                    arm_qpos,
+                    hand_qpos,
+                    arm_fk=_ArmFk(),
+                    hand_fk=_HandFk(),
+                    handbase_position_eef_m=np.asarray(
+                        config.handbase_position_eef_m, dtype=np.float64
+                    ),
+                    handbase_quat_eef_wxyz=np.asarray(
+                        config.handbase_quat_eef_wxyz, dtype=np.float64
+                    ),
+                )
+                np.testing.assert_allclose(
+                    processed["fingertip_points"][:], expected_fingertips
+                )
+                self.assertFalse(
+                    np.array_equal(processed["fingertip_points"][:], raw_fingertips)
+                )
+                self.assertEqual(
+                    processed.attrs["fingertip_points_derivation"],
+                    FINGERTIP_POINTS_DERIVATION,
+                )
+                self.assertEqual(
+                    processed.attrs["fingertip_points_policy_id"], FINGERTIP_POLICY_ID
+                )
+                self.assertRegex(
+                    processed.attrs["fingertip_points_geometry_sha256"],
+                    r"^[0-9a-f]{64}$",
+                )
             validate_processed_hdf5(processed_path, config)
             zarr_path = root / "policy.zarr"
             report = export_processed_hdf5_to_zarr(
@@ -368,6 +683,64 @@ class OfflineMultimodalTest(unittest.TestCase):
                 "teleop_published_joint_target",
             )
             self.assertNotIn("deployment_equivalent", exported.attrs)
+            self.assertEqual(
+                exported.attrs["fingertip_points_derivation"],
+                FINGERTIP_POINTS_DERIVATION,
+            )
+            self.assertEqual(
+                exported.attrs["fingertip_points_policy_id"], FINGERTIP_POLICY_ID
+            )
+
+    def test_export_requires_fingertip_identity_attrs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing_identity.h5"
+            self._write_processed_fixture(path, OutputProfile.JOINT)
+            with h5py.File(path, "r+") as output:
+                for name in (
+                    "fingertip_points_derivation",
+                    "fingertip_points_policy_id",
+                    "fingertip_points_geometry_sha256",
+                ):
+                    if name in output.attrs:
+                        del output.attrs[name]
+            with (
+                patch("dexmani_real.dataset.export.validate_processed_payload"),
+                patch(
+                    "dexmani_real.dataset.export.validate_processed_provenance",
+                    return_value=object(),
+                ),
+                patch(
+                    "dexmani_real.dataset.export._whole_episode_rejection",
+                    return_value=None,
+                ),
+                self.assertRaisesRegex(ValueError, "fingertip"),
+            ):
+                _inspect_artifact(path, PolicyZarrExportConfig())
+
+    def test_export_rejects_non_uniform_fingertip_geometry_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.h5"
+            second = root / "second.h5"
+            self._write_processed_fixture(first, OutputProfile.JOINT)
+            self._write_processed_fixture(second, OutputProfile.JOINT)
+            with h5py.File(second, "r+") as output:
+                output.attrs["fingertip_points_geometry_sha256"] = "b" * 64
+            with (
+                patch("dexmani_real.dataset.export.validate_processed_payload"),
+                patch(
+                    "dexmani_real.dataset.export.validate_processed_provenance",
+                    return_value=object(),
+                ),
+                patch(
+                    "dexmani_real.dataset.export._whole_episode_rejection",
+                    return_value=None,
+                ),
+                self.assertRaisesRegex(
+                    ValueError, "fingertip_points_geometry_sha256 mismatch"
+                ),
+            ):
+                export_processed_hdf5_to_zarr(root, root / "policy.zarr")
 
     def test_export_rejects_non_boolean_and_non_integer_semantic_attrs(self) -> None:
         cases = (
@@ -527,6 +900,9 @@ class OfflineMultimodalTest(unittest.TestCase):
                     "contact_force_hand_source_match_required": True,
                     "fingertip_points_frame": "xarm_base",
                     "fingertip_points_unit": "m",
+                    "fingertip_points_derivation": FINGERTIP_POINTS_DERIVATION,
+                    "fingertip_points_policy_id": FINGERTIP_POLICY_ID,
+                    "fingertip_points_geometry_sha256": "a" * 64,
                     "action_ee_frame": "xarm_base",
                 }
             )

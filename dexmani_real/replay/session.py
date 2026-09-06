@@ -6,16 +6,17 @@ read from arm_state_ring / hand_state_ring. No direct SDK access from
 the main process.
 
 Replay reruns dense geometry and provenance preflight, spawns arm/hand workers,
-replays the exact submitted ``sent`` joint-command stream, captures measured
-robot state, and evaluates joint, EEF, and tracking-lag consistency metrics.
+replays recorded published arm targets and recorded logical hand targets,
+captures measured robot state, and evaluates joint, EEF, and tracking-lag
+consistency metrics. The current hand worker derives bounded intermediate SDK
+setpoints from each logical hand target.
 
 This module owns replay lifecycle, worker topology, and terminal outcome.
-``replay_controller`` owns safety-gated frame scheduling, while
-``replay_capture`` owns the bounded in-memory measurement buffer.
+``EpisodeReplayer`` owns safety-gated frame scheduling, while
+``ReplayRecorder`` owns the bounded in-memory measurement buffer.
 
-Replay always replays the recorded hand command stream. If the episode was
-recorded with non-default ``--acc``/``--speed``, pass the same values here so the
-resolved-config provenance matches.
+If the episode was recorded with non-default ``--acc``/``--speed``, pass the
+same values here so the resolved-config provenance matches.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -33,20 +35,20 @@ from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.control.arm_homing import ArmHomeConfig, execute_arm_home
 from dexmani_real.control.hand_homing import publish_hand_home_and_wait_accepted
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
-from dexmani_real.replay.replayer import EpisodeReplayer, ReplayOutcome, ReplayStatus
 from dexmani_real.replay.evaluation import evaluate_replay
+from dexmani_real.replay.replayer import EpisodeReplayer, ReplayOutcome, ReplayStatus
 from dexmani_real.replay.trajectory import TrajectoryData, verify_replay_preflight
 from dexmani_real.robot.arm_worker import arm_loop as _arm_loop
 from dexmani_real.robot.hand_worker import hand_loop as _hand_loop
-from dexmani_real.runtime.safety import SafetyState, require_transition
-from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
+from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.processes import (
-    ShutdownReport,
     ProcessSpec,
+    ShutdownReport,
     build_processes,
     start_processes,
 )
-from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
+from dexmani_real.runtime.safety import SafetyState, require_transition
+from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -61,6 +63,17 @@ class EpisodeReplayConfig:
     output_dir: str
     evaluate_consistency: bool
     config_sha256: str
+
+
+def _validate_replay_output_dir(output_dir: str | Path) -> None:
+    """Reject output targets that could overwrite a previous replay result."""
+    path = Path(output_dir)
+    if (path.exists() or path.is_symlink()) and (
+        not path.is_dir() or any(path.iterdir())
+    ):
+        raise ValueError(
+            "Replay output already exists; choose another --output directory."
+        )
 
 
 def _latched_fault_status(shared: RuntimeChannels) -> ReplayStatus | None:
@@ -287,6 +300,11 @@ def replay_episode(
     config: EpisodeReplayConfig,
 ) -> ReplayOutcome:
     """Start arm/hand workers, run one replay, then shut the session down."""
+    try:
+        _validate_replay_output_dir(config.output_dir)
+    except (OSError, ValueError) as exc:
+        return ReplayOutcome(ReplayStatus.REJECTED, reason=str(exc))
+
     try:
         verify_replay_preflight(
             trajectory,

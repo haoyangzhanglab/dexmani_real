@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import sys
 import threading
 import time
@@ -621,7 +622,11 @@ class CandidatePublicationTest(unittest.TestCase):
             "publish_coupled_command_if_motion_permitted",
             return_value=(None, publication.PUBLISH_REASON_GENERATION),
         ) as publish_coupled:
-            result = publication.publish_command(object(), candidate)
+            result = publication.publish_command(
+                object(),
+                candidate,
+                required_safety_state=SafetyState.RUNNING,
+            )
 
         self.assertFalse(result.published)
         self.assertEqual(result.reason, publication.PUBLISH_REASON_GENERATION)
@@ -643,7 +648,11 @@ class CandidatePublicationTest(unittest.TestCase):
             ) as publish_coupled,
             patch.object(publication, "wait_command_accepted") as wait,
         ):
-            result = publication.publish_command(object(), candidate)
+            result = publication.publish_command(
+                object(),
+                candidate,
+                required_safety_state=SafetyState.RUNNING,
+            )
 
         self.assertTrue(result.published)
         self.assertEqual(result.ticket, ticket)
@@ -926,6 +935,12 @@ class CandidatePublicationTest(unittest.TestCase):
 
 
 class HandHomePublicationTest(unittest.TestCase):
+    def test_publish_command_requires_explicit_safety_state(self) -> None:
+        required_state = inspect.signature(publication.publish_command).parameters[
+            "required_safety_state"
+        ]
+        self.assertIs(required_state.default, inspect.Parameter.empty)
+
     def test_legal_home_allows_feedback_outside_command_bounds(self) -> None:
         target = np.deg2rad(np.asarray(hand_defaults.home_qpos_deg, dtype=np.float64))
         measured = target.copy()
@@ -941,6 +956,7 @@ class HandHomePublicationTest(unittest.TestCase):
             valid_until_monotonic_ns=10**18,
         )
 
+        shared = object()
         with (
             patch.object(hand_homing, "motion_rejection_reason", return_value=""),
             patch.object(
@@ -965,7 +981,7 @@ class HandHomePublicationTest(unittest.TestCase):
             ) as wait,
         ):
             accepted = hand_homing.publish_hand_home_and_wait_accepted(
-                object(),
+                shared,
                 target,
                 command_lower_rad=np.asarray(hand_defaults.qpos_min_rad),
                 command_upper_rad=np.asarray(hand_defaults.qpos_max_rad),
@@ -976,7 +992,11 @@ class HandHomePublicationTest(unittest.TestCase):
             )
 
         self.assertTrue(accepted)
-        publish.assert_called_once()
+        publish.assert_called_once_with(
+            shared,
+            candidate,
+            required_safety_state=SafetyState.ARMED,
+        )
         wait.assert_called_once()
 
 

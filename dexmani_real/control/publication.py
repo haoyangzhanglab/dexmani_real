@@ -494,7 +494,7 @@ def publish_command(
     shared: Any,
     candidate: ActionCandidate,
     *,
-    required_safety_state: SafetyState | None = None,
+    required_safety_state: SafetyState,
     minimum_delivery_window_s: float = 0.0,
 ) -> PublishResult:
     """Publish one checked command without waiting for worker acknowledgement."""

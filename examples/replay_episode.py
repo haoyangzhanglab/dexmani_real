@@ -85,7 +85,7 @@ Controls:
         "--output",
         type=str,
         default=None,
-        help="Directory for captured replay data and consistency metrics.",
+        help="Missing or empty directory for replay data and consistency metrics.",
     )
     parser.add_argument(
         "--acc",

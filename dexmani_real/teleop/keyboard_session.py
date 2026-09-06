@@ -725,7 +725,13 @@ def _publish_keyboard_target(
     )
     candidate = prepared.candidate
     publish_result = (
-        publish_command(shared, candidate) if candidate is not None else None
+        publish_command(
+            shared,
+            candidate,
+            required_safety_state=SafetyState.RUNNING,
+        )
+        if candidate is not None
+        else None
     )
     if (
         publish_result is None

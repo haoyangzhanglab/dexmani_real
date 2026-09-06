@@ -11,6 +11,7 @@ from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.deployment.config import (
     PolicyDeploymentConfig,
     InferenceWorkerConfig,
+    _expected_pointcloud_semantics,
     validate_policy_runtime_compatibility,
 )
 from dexmani_real.deployment.lifecycle import (
@@ -108,7 +109,7 @@ class _StartFailProcess(_ControllableProcess):
         self._alive = True
 
 
-def _policy_spec() -> SimpleNamespace:
+def _policy_spec(runtime: object) -> SimpleNamespace:
     return SimpleNamespace(
         action_key="action",
         action_dim=19,
@@ -118,7 +119,12 @@ def _policy_spec() -> SimpleNamespace:
         n_action_steps=8,
         observation_fields=(
             SimpleNamespace(name="joint_state", shape=(19,), dtype="float32"),
-            SimpleNamespace(name="point_cloud", shape=(1024, 6), dtype="float32"),
+            SimpleNamespace(
+                name="point_cloud",
+                shape=(1024, 6),
+                dtype="float32",
+                semantics=_expected_pointcloud_semantics(runtime),
+            ),
         ),
         control_dt_s=0.0625,
         requires_hand=True,
@@ -134,9 +140,26 @@ def _policy_worker_config(spec: SimpleNamespace) -> InferenceWorkerConfig:
 
 
 class PolicyLifecycleStartupTest(unittest.TestCase):
+    def test_observation_identity_mismatch_rejects_before_channel_creation(
+        self,
+    ) -> None:
+        runtime = resolve_experiment_config()
+        spec = _policy_spec(runtime)
+        spec.observation_fields[1].semantics["config_sha256"] = "wrong"
+        worker_config = _policy_worker_config(spec)
+
+        with patch(
+            "dexmani_real.deployment.lifecycle.RuntimeChannels.create",
+            side_effect=AssertionError("channels must not be created"),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "point_cloud config_sha256 mismatch"
+            ):
+                run_policy_deployment(runtime, spec, worker_config, False)
+
     def test_deployment_mode_reaches_inference_and_executor(self) -> None:
         runtime = resolve_experiment_config()
-        spec = _policy_spec()
+        spec = _policy_spec(runtime)
         worker_config = _policy_worker_config(spec)
         deployment = PolicyDeploymentConfig(
             inference_mode="async",
@@ -167,7 +190,7 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
     def test_model_failure_blocks_all_non_inference_workers(self) -> None:
         shared = _FakeRuntimeChannels()
         runtime = resolve_experiment_config()
-        spec = _policy_spec()
+        spec = _policy_spec(runtime)
         worker_config = _policy_worker_config(spec)
         processes: list[_FakeProcess] = []
         startup_order: list[str] = []
@@ -245,7 +268,7 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
     def test_ready_worker_death_before_armed_faults_deployment(self) -> None:
         shared = _FakeRuntimeChannels()
         runtime = resolve_experiment_config()
-        spec = _policy_spec()
+        spec = _policy_spec(runtime)
         worker_config = _policy_worker_config(spec)
         specs = (
             ProcessSpec(
@@ -306,7 +329,7 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
     ) -> None:
         shared = _FakeRuntimeChannels()
         runtime = resolve_experiment_config()
-        spec = _policy_spec()
+        spec = _policy_spec(runtime)
         worker_config = _policy_worker_config(spec)
         specs = (
             ProcessSpec(
@@ -395,7 +418,7 @@ class PolicyLifecycleStartupTest(unittest.TestCase):
     def test_lifecycle_supervises_policy_heartbeat(self) -> None:
         shared = _FakeRuntimeChannels()
         runtime = resolve_experiment_config()
-        spec = _policy_spec()
+        spec = _policy_spec(runtime)
         worker_config = _policy_worker_config(spec)
         specs = (
             ProcessSpec(

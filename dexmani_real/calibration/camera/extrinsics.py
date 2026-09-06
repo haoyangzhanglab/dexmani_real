@@ -20,9 +20,10 @@ The storage format is a human-readable pose::
    Converted to a 4×4 homogeneous matrix at load time.
 
 Intrinsics (K matrix) are read from the RealSense hardware at runtime and stored
-into HDF5 /meta for self-contained episodes.  New calibration entries may also
-carry a ``calibration_capture`` snapshot (profile, distortion, firmware, SDK)
-for provenance; it is diagnostic and is not used as runtime intrinsics.
+into HDF5 /meta for self-contained episodes. New calibration entries may also
+carry a ``calibration_capture`` snapshot (stream geometry, intrinsics,
+distortion, solver residuals, and timestamp) for provenance; it is diagnostic
+and is not used as runtime intrinsics.
 
 Usage:
     calib = CameraExtrinsics()

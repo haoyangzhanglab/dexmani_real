@@ -1,4 +1,4 @@
-"""Processed-v12 schema, provenance, specifications, and strict validation."""
+"""Processed-v13 schema, provenance, specifications, and strict validation."""
 
 from __future__ import annotations
 
@@ -14,12 +14,15 @@ import numpy as np
 
 from dexmani_real.dataset.contracts import OutputProfile, ProcessingConfig
 from dexmani_real.dataset.pointcloud import validate_rigid_transform
+from dexmani_real.planning.kinematics.fingertip import (
+    FINGERTIP_POINTS_DERIVATION,
+    FINGERTIP_POLICY_ID,
+)
 from dexmani_real.planning.kinematics.pose import validate_canonical_rot6d
 from dexmani_real.recording.storage.schema import SEMANTIC_META_ATTRS
 
-
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 12
+PROCESSED_SCHEMA_VERSION = 13
 _SOURCE_MEMBERS = ("data.h5", "depth.h5", "rgb.mp4")
 _PROVENANCE_DATASETS = (
     "source_row_index",
@@ -46,6 +49,30 @@ _CONTACT_FORCE_FRAME = "xhand_sensor_native_axes_per_finger"
 _FINGERTIP_POINTS_FRAME = str(SEMANTIC_META_ATTRS["hand_fingertip_frame"])
 _FINGERTIP_POINTS_UNIT = "m"
 _ACTION_EE_FRAME = str(SEMANTIC_META_ATTRS["action_arm_ee_frame"])
+
+
+def validate_fingertip_points_semantics(
+    attrs: Any,
+    *,
+    label: str,
+) -> dict[str, str]:
+    """Return the required persisted derivation and frozen geometry identity."""
+    values: dict[str, str] = {}
+    for key in ("derivation", "policy_id", "geometry_sha256"):
+        value = attrs.get(f"fingertip_points_{key}", "")
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        values[key] = str(value).strip()
+    if values["derivation"] != FINGERTIP_POINTS_DERIVATION:
+        raise ValueError(f"{label}: invalid fingertip_points_derivation")
+    if values["policy_id"] != FINGERTIP_POLICY_ID:
+        raise ValueError(f"{label}: invalid fingertip_points_policy_id")
+    geometry_sha256 = values["geometry_sha256"]
+    if len(geometry_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in geometry_sha256
+    ):
+        raise ValueError(f"{label}: invalid fingertip_points_geometry_sha256")
+    return values
 
 
 def _strict_bool_attr(attrs: Any, name: str) -> bool:
@@ -570,6 +597,7 @@ def _validate_processed_output_structure(
             raise ValueError(f"{artifact.name}: domain must be real")
         if str(source.attrs.get("profile", "")) != config.profile.value:
             raise ValueError(f"{artifact.name}: profile mismatch")
+        validate_fingertip_points_semantics(source.attrs, label=artifact.name)
         if not isinstance(source.get("provenance"), h5py.Group):
             raise ValueError(f"{artifact.name}: provenance is not an HDF5 group")
         _validate_processed_structure(
@@ -596,7 +624,7 @@ def _validate_processed_output_structure(
 def validate_processed_hdf5(
     path: str | Path, config: ProcessingConfig
 ) -> dict[str, Any]:
-    """Fail closed on a processed Real HDF5 v12 artifact."""
+    """Fail closed on a processed Real HDF5 v13 artifact."""
 
     artifact = Path(path)
     with h5py.File(artifact, "r") as source:
@@ -724,6 +752,7 @@ def validate_processed_hdf5(
         contact_force_hand_source_match_required = _strict_bool_attr(
             source.attrs, "contact_force_hand_source_match_required"
         )
+        validate_fingertip_points_semantics(source.attrs, label=artifact.name)
         if (
             str(source.attrs.get("state_alignment", "")) != expected_state_alignment
             or str(source.attrs.get("observation_reference", "")) != expected_reference

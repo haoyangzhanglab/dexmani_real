@@ -13,12 +13,14 @@ from dexmani_real.control.action import ActionCandidate
 from dexmani_real.control.publication import PreparedCommand, PublishResult
 from dexmani_real.ipc.causal import vr_frame_is_fresh
 from dexmani_real.ipc.schema import HAND_TACTILE_DTYPE
+from dexmani_real.runtime.safety import SafetyState
 from dexmani_real.teleop.control_loop.action_proposal import compute_target_eef_pose
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.control_loop.grid import (
     TeleopActionComputation,
     TeleopGridObservation,
     TeleopGridResources,
+    _prepare_and_publish_joint_command,
     _publish_ik_failure_hold,
     _publish_solved_action,
     _read_control_grid_observation,
@@ -250,6 +252,34 @@ class TeleopPauseBoundaryTest(unittest.TestCase):
         resource_fields = {field.name for field in fields(TeleopGridResources)}
         self.assertNotIn("quiescence", resource_fields)
         self.assertNotIn("audio", resource_fields)
+
+    def test_grid_publication_requires_running_state(self) -> None:
+        shared = object()
+        candidate = object()
+        with (
+            patch(
+                "dexmani_real.teleop.control_loop.grid.prepare_joint_command",
+                return_value=PreparedCommand(candidate=candidate),
+            ),
+            patch(
+                "dexmani_real.teleop.control_loop.grid.publish_command",
+                return_value=PublishResult(published=True),
+            ) as publish,
+        ):
+            _prepare_and_publish_joint_command(
+                shared,
+                np.zeros(7, dtype=np.float64),
+                None,
+                gate=Mock(),
+                arm_feedback_max_age_s=0.1,
+                hand_feedback_max_age_s=0.1,
+            )
+
+        publish.assert_called_once_with(
+            shared,
+            candidate,
+            required_safety_state=SafetyState.RUNNING,
+        )
 
     def test_vr_stale_requests_pause_without_computing_or_publishing(self) -> None:
         controller = SimpleNamespace(
