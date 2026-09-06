@@ -14,8 +14,6 @@
 | `repo_map.md` | 当前运行拓扑、核心数据流与边界索引。 |
 | `.codex/config.toml` | 项目级 Codex 权限、联网与子智能体并发配置。 |
 | `.codex/agents/*.toml` | 项目级难度分档子智能体：`sol-high`、`terra-max`、`luna-max`。 |
-| [Policy eval implementation guide](<docs/DexMani Policy Deployment & Real-World Eval — Codex Implementation Guide.md>) | Policy canonical action、Real 调度与正式评估录制的目标合同。 |
-| [Policy eval workflow](docs/policy_eval_workflow.md) | 本轮实施的基线、阶段依赖、三档 agent 分工、离线验收与紧凑执行状态。 |
 
 ## Process topology
 
@@ -60,17 +58,24 @@ causal observation history
 
 - `Prediction` 是唯一的内部策略输出对象；动作是拥有自身内存的 finite `float64[N, D]`，
   `run_generation`、source timestamp 和 logical-step timestamp 随对象传播。
-- generic Policy artifact 的 `temporal_ensemble_coeff` 必须为 `null`；Real 和 Policy generic runtime
-  都只调度 Policy 给出的 canonical `control_action`，不在 deployment/sim runner 追加 overlap blending。
+- Real 只校验 Policy 公开契约字段（observation fields/shape/dtype、`requires_hand`、
+  `n_action_steps`、`action_key`、`control_action_dim`、`control_dt_s`），不解析 artifact 内部或
+  `temporal_ensemble_coeff` 等历史字段；Real 和 Policy generic runtime 都只调度 Policy 给出的
+  canonical `control_action`，不在 deployment/sim runner 追加 overlap blending。
 - inference worker 只负责 observation、策略调用和 prediction 发布；PolicyExecutor 独占动作
   horizon 解码、control-grid 调度、EE→IK、候选校验和 command-progress watchdog。
 - 正常策略 tick 的路径是 `validate → publish → continue`；`execute=False` 完成同样的候选
   校验但不产生 actuator side effect。需要确认 SDK 接受的 home、calibration 和 replay 操作，
   才显式调用 blocking acceptance。
+- learned-policy arm 动作是 reject-only：`wrap_nearest_equivalent` 只做关节表示 canonicalization，
+  超 joint limit 或 per-joint jump 阈值直接拒绝，绝不 clip。observation freshness 在 inference
+  边界检查，action 有效性由 logical target timestamp 的 stale 过滤决定，command 有效性由
+  `action_validity_s` + worker guards 决定。
 - B 只在 ARMED、上一轮 S 已清理、physical home（物理运行）完成后进入 RUNNING；sync/async
   都不追赶过期 deadline，也不制造超过 `control_hz` 的 command burst。
-- `tests/test_policy_executor_timing.py` 用离线 fake 覆盖 generic artifact compatibility、
-  async stale-prefix/latest-wins、sync 与 no-catch-up 合同，不启动 worker 或硬件。
+- `tests/test_policy_rollout.py` 用离线 fake 覆盖 Policy 公开契约兼容、timestamp 调度
+  （stale-prefix/whole-stale/no-catch-up）、IK/SAFETY 归属、reject-only arm 与
+  control-first formal eval 合同，不启动 worker 或硬件。
 
 ## Formal policy evaluation flow
 
@@ -93,10 +98,12 @@ B + completed H
   `NONE/SUCCESS/FAILURE/INVALID`，operator 在同一 `motion_lock` 内先写 outcome 再请求 stop。
 - Recorder 必须在 RUNNING 之前确认，初始 causal sample 必须在第一条 policy command 之前入队。正常
   success/failure/invalid outcome 使用 `stop_episode(success=True)`；只有 recording integrity/storage
-  失败或尚无真实 source evidence 的 aborted transaction 才 discard。FINALIZING 时拒绝新 B。
-- `tests/test_policy_evaluation.py` 与 `tests/test_run_policy_cli.py` 以 fake/shared-memory boundary
-  覆盖 recorder ordering、outcome race、raw-v24 sentinel semantics、provenance、topology、CLI timeout
-  和 output isolation；不启动任何 worker 或设备。
+  失败或尚无真实 source evidence 的 aborted transaction 才 discard。FINALIZING 时拒绝新 B。初始 sample
+  之后，per-command evidence 在 command 提交后采集；evidence/recording 失败只把 trial 判为 INVALID，
+  不撤销已提交的 command，也不触发全局 FAULT；`max_frames` 记为 `eval:invalid:max_frames`。
+- `tests/test_policy_rollout.py` 用 fake/shared-memory boundary 覆盖 Policy 公开契约、timestamp 调度、
+  IK/SAFETY 归属、reject-only arm 与 control-first formal-eval/recorder 语义（含 max_frames→INVALID
+  与 eval-invalid 不触发全局 FAULT）；不启动任何 worker 或设备。
 
 ## Teleop flow
 

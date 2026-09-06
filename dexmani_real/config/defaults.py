@@ -628,7 +628,6 @@ class PolicyParams:
     max_input_age_s: float = 0.15
     max_observation_skew_s: float = 0.10
     max_grid_lag_s: float = 0.08
-    max_source_to_command_age_s: float = 0.75
     max_command_silence_s: float = 2.0
     action_validity_s: float = 0.5
     # Maximum interval with published work but no arm/hand acceptance progress.
@@ -659,9 +658,9 @@ class PolicyParams:
 
     # Teleop endpoint shaping bound per control tick; this is not arm interpolation.
     teleop_arm_max_delta_rad_per_tick: float | None = np.deg2rad(8.0)
-    # Learned-policy-only neural spike clip. The arm worker owns its separate
-    # final command-jump guard at the SDK boundary.
-    arm_action_delta_clip_rad: float = np.deg2rad(20.0)
+    # Learned-policy-only arm endpoint jump reject threshold. The arm worker owns
+    # its separate final command-jump guard at the SDK boundary.
+    arm_max_action_jump_rad: float = np.deg2rad(20.0)
     # Learned-policy hand actions are rejected, never shaped, when any joint
     # jumps farther than this experimentally selected threshold.
     hand_max_action_jump_rad: float = 1.0
@@ -687,7 +686,6 @@ class PolicyParams:
             self.max_input_age_s,
             self.max_observation_skew_s,
             self.max_grid_lag_s,
-            self.max_source_to_command_age_s,
             self.max_command_silence_s,
             self.action_validity_s,
             self.command_progress_timeout_s,
@@ -760,10 +758,10 @@ class PolicyParams:
                 "teleop_arm_max_delta_rad_per_tick must be finite and > 0 or None"
             )
         if (
-            not np.isfinite(self.arm_action_delta_clip_rad)
-            or self.arm_action_delta_clip_rad <= 0
+            not np.isfinite(self.arm_max_action_jump_rad)
+            or self.arm_max_action_jump_rad <= 0
         ):
-            raise ValueError("arm_action_delta_clip_rad must be finite and positive")
+            raise ValueError("arm_max_action_jump_rad must be finite and positive")
         if (
             not np.isfinite(self.hand_max_action_jump_rad)
             or self.hand_max_action_jump_rad <= 0

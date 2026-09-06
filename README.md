@@ -151,10 +151,11 @@ CLI override > YAML file > dexmani_real/config/defaults.py
 
 Real runtime 配置由 [`config/experiment.py`](dexmani_real/config/experiment.py) 唯一解析、校验和冻结；learned-policy 的 observation freshness、command progress、action validity 和 watchdog timing
 属于其 `policy` 段，模型 shape、modality、horizon 和 inference cadence 则来自 Policy public
-API 的 `PolicySpec`。generic artifact 必须声明 `temporal_ensemble_coeff: null`，否则在
-Real lifecycle 前明确拒绝；调度不会额外对 action chunk 做 temporal blending。`shadow`/`run` 的
-sync/async 调度模式与 episode action-step 上限由 `run_policy.py` CLI 明确提供；formal `eval`
-则使用必填的 wall-clock budget `max_running_s`。
+API 的 `PolicySpec`。Real 只校验 `PolicySpec` 的公开契约字段（observation fields / shape /
+dtype、`requires_hand`、`n_action_steps`、`action_key`、`control_action_dim`、`control_dt_s`），
+不解析 Policy artifact 内部、`best_ckpt.json` 或历史格式；调度也不会对 action chunk 做
+temporal blending。`shadow`/`run` 的 sync/async 调度模式与 episode action-step 上限由
+`run_policy.py` CLI 明确提供；formal `eval` 则使用必填的 wall-clock budget `max_running_s`。
 `pointcloud` 是与 EEF `policy.workspace` 分离的感知配置段；实时 worker、离线
 重建和诊断入口只从该段派生参数，并把点云策略与桌面语义写入 processed/Zarr。
 可在不启动硬件的情况下查看遥操作解析结果：
