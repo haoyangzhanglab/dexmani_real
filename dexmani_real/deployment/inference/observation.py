@@ -18,9 +18,12 @@ from dexmani_real.config.defaults import PolicyParams
 from dexmani_real.deployment.config import FingertipAssemblerConfig
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.ipc.schema import validate_point_cloud_array
-from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
+from dexmani_real.planning.kinematics.arm_fk import (
+    compute_eef_pose_history_xarm_base,
+    make_arm_fk,
+)
 from dexmani_real.planning.kinematics.fingertip import (
-    compute_fingertip_points_xarm_base,
+    compute_fingertip_history_xarm_base,
 )
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.sensor.camera.transforms import resize_rgb
@@ -29,7 +32,15 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 _POLICY_MODALITIES = frozenset(
-    {"joint_state", "point_cloud", "rgb", "contact_force", "fingertip_points"}
+    {
+        "joint_state",
+        "point_cloud",
+        "rgb",
+        "contact_force",
+        "fingertip_points",
+        "eef_pose",
+        "tactile_force",
+    }
 )
 
 
@@ -92,6 +103,8 @@ class PolicyObservation:
                 "joint_state": (19,),
                 "contact_force": (5, 3),
                 "fingertip_points": (5, 3),
+                "eef_pose": (9,),
+                "tactile_force": (5, 120, 3),
             }.get(name)
             if arr.ndim < 2 or (
                 expected_tail is not None and arr.shape[1:] != expected_tail
@@ -247,8 +260,11 @@ class ObservationBatch:
 
     Process-local. ``arm_history``/``hand_history`` and
     ``hand_tactile_sum_history`` are sensor-value ``FrameWindow`` values.
+    ``hand_tactile_force_history`` carries the full ``[T,5,120,3]`` tactile
+    tensor and is read only when the PolicySpec requests ``tactile_force``;
     ``hand_tactile_provenance_history`` contains only the unit-code proof
-    aligned to tactile sums; the full tactile tensor never enters deployment.
+    aligned to tactile sums, so contact-only policies never copy the full
+    tactile tensor.
     ``pointcloud`` is the latest causally valid ``PointCloudFrame``. Optional
     modalities are None when not requested.
     ``anchor_monotonic_ns`` is the causal cut: no frame published after the
@@ -266,6 +282,7 @@ class ObservationBatch:
     hand_history: FrameWindow | None = None
     hand_tactile_sum_history: FrameWindow | None = None
     hand_tactile_provenance_history: FrameWindow | None = None
+    hand_tactile_force_history: FrameWindow | None = None
     pointcloud: PointCloudFrame | None = None
     # Oldest-first causal window of recent point-cloud frames; ``pointcloud`` is
     # the latest (and last element) when non-empty.  ``point_cloud`` models use
@@ -302,6 +319,7 @@ class ObservationBatch:
             "hand_history": self.hand_history,
             "hand_tactile_sum_history": self.hand_tactile_sum_history,
             "hand_tactile_provenance_history": self.hand_tactile_provenance_history,
+            "hand_tactile_force_history": self.hand_tactile_force_history,
         }
         for name, window in windows.items():
             if window is None:
@@ -414,10 +432,19 @@ def _requested_observation_fields(policy_spec: Any) -> set[str]:
 def build_fingertip_runtime(
     policy_spec: Any,
     fingertip_config: FingertipAssemblerConfig | None,
-) -> tuple[object, HandKinematics, FingertipAssemblerConfig] | None:
-    """Construct the local FK resources only when the observation requests them."""
-    if "fingertip_points" not in _requested_observation_fields(policy_spec):
+) -> tuple[object, HandKinematics | None, FingertipAssemblerConfig | None] | None:
+    """Construct the local FK resources only when the observation requests them.
+
+    ``eef_pose`` needs just the cached canonical ``ArmFK``; the hand FK and
+    mount config are built only for ``fingertip_points``.  Both derive from
+    the aligned arm qpos history, never from a second realtime EEF source.
+    """
+    requested = _requested_observation_fields(policy_spec)
+    needs_hand_fk = "fingertip_points" in requested
+    if not needs_hand_fk and "eef_pose" not in requested:
         return None
+    if not needs_hand_fk:
+        return make_arm_fk(), None, None
     if not isinstance(fingertip_config, FingertipAssemblerConfig):
         raise TypeError("fingertip_points requires FingertipAssemblerConfig")
     hand_fk = HandKinematics(
@@ -526,6 +553,56 @@ def _read_tactile_provenance_history(
         if anchor_ns - source_ns > max_age_ns:
             continue
         values.append(np.array([int(record["unit_code"])], dtype=np.uint8))
+        sequences.append(int(sequence))
+        sources.append(source_ns)
+        publishes.append(publish_ns)
+    if not values:
+        return None
+    return FrameWindow(
+        values=np.stack(values),
+        source_sequence=np.asarray(sequences, dtype=np.uint64),
+        source_monotonic_ns=np.asarray(sources, dtype=np.uint64),
+        publish_monotonic_ns=np.asarray(publishes, dtype=np.uint64),
+        valid_mask=np.ones(len(values), dtype=np.uint8),
+    )
+
+
+def _read_tactile_force_history(
+    ring,
+    *,
+    anchor_ns: int,
+    history_len: int,
+    max_age_ns: int,
+    not_before_ns: int,
+) -> FrameWindow | None:
+    """Read the full ``[T,5,120,3]`` tactile history behind identical gates.
+
+    Called only when the PolicySpec requests ``tactile_force``; the contact-only
+    path keeps using ``_read_tactile_provenance_history`` and never copies the
+    full tensor.  Provenance gates match the provenance reader exactly: fresh,
+    calibrated, unit_code == 0, causal to the anchor, within the age bound.
+    """
+    try:
+        history = ring.get_last_k(min(int(history_len), ring.maxlen))
+    except Exception:
+        logger.warning("inference: tactile force read failed", exc_info=True)
+        return None
+    values, sequences, sources, publishes = [], [], [], []
+    for data, ring_publish_ns, sequence in history:
+        record = data[0]
+        source_ns = int(record["source_monotonic_ns"])
+        publish_ns = int(ring_publish_ns)
+        if not (
+            bool(record["fresh"])
+            and bool(record["calibrated"])
+            and int(record["unit_code"]) == 0
+        ):
+            continue
+        if not (not_before_ns <= source_ns <= publish_ns <= anchor_ns):
+            continue
+        if anchor_ns - source_ns > max_age_ns:
+            continue
+        values.append(np.array(record["tactile_force"], dtype=np.float64))
         sequences.append(int(sequence))
         sources.append(source_ns)
         publishes.append(publish_ns)
@@ -930,6 +1007,7 @@ def _build_observation(
     hand_history: FrameWindow | None = None
     hand_tactile_sum_history: FrameWindow | None = None
     hand_tactile_provenance_history: FrameWindow | None = None
+    hand_tactile_force_history: FrameWindow | None = None
     pointcloud: PointCloudFrame | None = None
     pointcloud_history: tuple[PointCloudFrame, ...] = ()
     requested = _requested_observation_fields(policy_spec)
@@ -953,6 +1031,7 @@ def _build_observation(
         requested & {"joint_state", "contact_force", "fingertip_points"}
     )
     tactile_requested = "contact_force" in requested
+    tactile_force_requested = "tactile_force" in requested
     if pointcloud_requested:
         all_pointclouds = _read_pointcloud_history(
             shared,
@@ -1051,6 +1130,14 @@ def _build_observation(
                 max_age_ns=state_history_max_age_ns,
                 not_before_ns=run_started_ns,
             )
+        if tactile_force_requested:
+            hand_tactile_force_history = _read_tactile_force_history(
+                shared.hand_tactile_ring,
+                history_len=shared.hand_tactile_ring.maxlen,
+                anchor_ns=anchor_ns,
+                max_age_ns=state_history_max_age_ns,
+                not_before_ns=run_started_ns,
+            )
     reference_history: tuple[PointCloudFrame | RgbFrame, ...]
     if pointcloud_requested:
         reference_history = pointcloud_history
@@ -1080,6 +1167,12 @@ def _build_observation(
                 reference_history,
                 max_skew_ns=max_skew_ns,
             )
+        if hand_tactile_force_history is not None:
+            hand_tactile_force_history = _align_state_history_to_camera_frames(
+                hand_tactile_force_history,
+                reference_history,
+                max_skew_ns=max_skew_ns,
+            )
     elif not camera_requested and logical_step_ns > 0:
         arm_history = _align_state_history_to_reference_ns(
             arm_history, reference_ns, max_skew_ns=max_skew_ns
@@ -1095,6 +1188,12 @@ def _build_observation(
         if hand_tactile_provenance_history is not None:
             hand_tactile_provenance_history = _align_state_history_to_reference_ns(
                 hand_tactile_provenance_history,
+                reference_ns,
+                max_skew_ns=max_skew_ns,
+            )
+        if hand_tactile_force_history is not None:
+            hand_tactile_force_history = _align_state_history_to_reference_ns(
+                hand_tactile_force_history,
                 reference_ns,
                 max_skew_ns=max_skew_ns,
             )
@@ -1124,6 +1223,7 @@ def _build_observation(
                 hand_history,
                 hand_tactile_sum_history,
                 hand_tactile_provenance_history,
+                hand_tactile_force_history,
             )
             if window is not None
         )
@@ -1145,6 +1245,25 @@ def _build_observation(
             hand_tactile_provenance_history.source_monotonic_ns,
         ):
             return None
+    if tactile_force_requested:
+        if (
+            hand_tactile_force_history is None
+            or hand_tactile_force_history.values.shape[0] != horizon
+        ):
+            return None
+        # contact_force and tactile_force must come from identical raw tactile
+        # samples; any source-timestamp divergence fails the observation closed.
+        if tactile_requested and not (
+            np.array_equal(
+                hand_tactile_sum_history.source_monotonic_ns,
+                hand_tactile_force_history.source_monotonic_ns,
+            )
+            and np.array_equal(
+                hand_tactile_provenance_history.source_monotonic_ns,
+                hand_tactile_force_history.source_monotonic_ns,
+            )
+        ):
+            return None
     return ObservationBatch(
         observation_id=observation_id,
         run_generation=run_generation,
@@ -1156,6 +1275,7 @@ def _build_observation(
         hand_history=hand_history,
         hand_tactile_sum_history=hand_tactile_sum_history,
         hand_tactile_provenance_history=hand_tactile_provenance_history,
+        hand_tactile_force_history=hand_tactile_force_history,
         pointcloud=pointcloud,
         pointcloud_history=pointcloud_history,
         rgb_history=rgb_history,
@@ -1176,6 +1296,7 @@ def observation_timing_ms(observation: ObservationBatch) -> tuple[float, float]:
         getattr(observation, "hand_history", None),
         getattr(observation, "hand_tactile_sum_history", None),
         getattr(observation, "hand_tactile_provenance_history", None),
+        getattr(observation, "hand_tactile_force_history", None),
     ):
         if window is None:
             continue
@@ -1213,12 +1334,11 @@ def _to_policy_observation(
     policy_spec: Any,
     *,
     fingertip_runtime: (
-        tuple[object, HandKinematics, FingertipAssemblerConfig] | None
+        tuple[object, HandKinematics | None, FingertipAssemblerConfig | None] | None
     ) = None,
 ) -> PolicyObservation:
     """Project typed ring readers into the exact public Policy array mapping."""
     field_names = tuple(field.name for field in policy_spec.observation_fields)
-    horizon = int(getattr(policy_spec, "n_obs_steps"))
     if observation.arm_history is None or observation.hand_history is None:
         raise ValueError("joint_state requires aligned arm and hand histories")
     arrays: dict[str, np.ndarray] = {}
@@ -1245,30 +1365,45 @@ def _to_policy_observation(
         arrays["contact_force"] = np.ascontiguousarray(
             observation.hand_tactile_sum_history.values, dtype=np.float32
         )
-    if "fingertip_points" in field_names:
-        if fingertip_runtime is None:
-            raise RuntimeError("fingertip_points requires local FK")
-        arm_fk, hand_fk, config = fingertip_runtime
-        arrays["fingertip_points"] = np.ascontiguousarray(
-            np.stack(
-                [
-                    compute_fingertip_points_xarm_base(
-                        observation.arm_history.values[index],
-                        observation.hand_history.values[index],
-                        arm_fk=arm_fk,
-                        hand_fk=hand_fk,
-                        handbase_position_eef_m=np.asarray(
-                            config.handbase_position_eef_m
-                        ),
-                        handbase_quat_eef_wxyz=np.asarray(
-                            config.handbase_quat_eef_wxyz
-                        ),
-                    )
-                    for index in range(horizon)
-                ]
-            ),
-            dtype=np.float32,
+    if "tactile_force" in field_names:
+        if observation.hand_tactile_force_history is None:
+            raise ValueError("tactile_force lacks calibrated full-tactile history")
+        arrays["tactile_force"] = np.ascontiguousarray(
+            observation.hand_tactile_force_history.values, dtype=np.float32
         )
+    if "eef_pose" in field_names or "fingertip_points" in field_names:
+        if fingertip_runtime is None:
+            raise RuntimeError("eef_pose/fingertip_points require local FK")
+        arm_fk, hand_fk, config = fingertip_runtime
+        eef_pose_history: np.ndarray | None = None
+        if "eef_pose" in field_names:
+            # One canonical Arm FK per aligned timestep; the same history is
+            # reused below so fingertip_points never repeats the FK.
+            eef_pose_history = compute_eef_pose_history_xarm_base(
+                observation.arm_history.values, arm_fk=arm_fk
+            )
+            arrays["eef_pose"] = np.ascontiguousarray(
+                eef_pose_history, dtype=np.float32
+            )
+        if "fingertip_points" in field_names:
+            if hand_fk is None or config is None:
+                raise RuntimeError("fingertip_points requires local hand FK")
+            arrays["fingertip_points"] = np.ascontiguousarray(
+                compute_fingertip_history_xarm_base(
+                    observation.arm_history.values,
+                    observation.hand_history.values,
+                    hand_fk=hand_fk,
+                    handbase_position_eef_m=np.asarray(
+                        config.handbase_position_eef_m
+                    ),
+                    handbase_quat_eef_wxyz=np.asarray(
+                        config.handbase_quat_eef_wxyz
+                    ),
+                    arm_fk=arm_fk,
+                    eef_pose_history=eef_pose_history,
+                ),
+                dtype=np.float32,
+            )
     ordered = {name: arrays[name] for name in field_names}
     return PolicyObservation(
         observation_id=observation.observation_id,

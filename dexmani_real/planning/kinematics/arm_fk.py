@@ -18,6 +18,13 @@ from .pose import Pose, compose_pose, compute_pose_error, invert_pose, quat_wxyz
 
 _ARM_FK_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)
 
+# Persisted identity of the canonical EEF observation.  Train-time (processed
+# HDF5) and deploy-time derivation must both resolve to these constants.
+EEF_POSE_FRAME = "xarm_base"
+EEF_POSE_COMPONENTS = "position_m(3)+rot6d(6)"
+EEF_POSE_DERIVATION = "canonical_arm_fk_from_aligned_qpos"
+EEF_POSE_ALGORITHM_ID = "xarm7_custom_eef_pinocchio_fk_v1"
+
 
 @lru_cache(maxsize=1)
 def make_arm_fk() -> "ArmFK":
@@ -74,6 +81,39 @@ class ArmFK:
             )
         eef_rot6d = np.concatenate([R[:, 0], R[:, 1]]).astype(np.float64)
         return eef_pos, eef_rot6d
+
+
+def compute_eef_pose_history_xarm_base(
+    arm_qpos: np.ndarray,
+    *,
+    arm_fk: "ArmFK | None" = None,
+) -> np.ndarray:
+    """Return finite ``[T,9]`` position+rot6d poses from aligned arm qpos.
+
+    Shared canonical EEF history helper for the processed dataset writer and
+    deployment observation assembly: exactly one ``ArmFK.compute()`` per
+    timestep, reusing its rot6d without a second rotation conversion.  The
+    result is float64; callers cast to float32 at their storage/model
+    boundary.  ``eef_pose(t)`` must be derived from causally aligned measured
+    qpos, never from the xArm firmware Cartesian pose.
+    """
+    qpos_history = np.asarray(arm_qpos, dtype=np.float64)
+    if qpos_history.ndim != 2 or qpos_history.shape[1] != ARM_JOINT_SHAPE[0]:
+        raise ValueError(
+            f"arm qpos history must have shape (T, {ARM_JOINT_SHAPE[0]}), "
+            f"got {qpos_history.shape}"
+        )
+    if not np.all(np.isfinite(qpos_history)):
+        raise ValueError("arm qpos history contains non-finite values")
+    fk = make_arm_fk() if arm_fk is None else arm_fk
+    poses = np.empty((len(qpos_history), 9), dtype=np.float64)
+    for index, qpos in enumerate(qpos_history):
+        eef_pos, eef_rot6d = fk.compute(qpos)
+        poses[index, :3] = eef_pos
+        poses[index, 3:] = eef_rot6d
+    if not np.all(np.isfinite(poses)):
+        raise RuntimeError("EEF pose history contains non-finite values")
+    return poses
 
 
 class XArm7Kinematics:

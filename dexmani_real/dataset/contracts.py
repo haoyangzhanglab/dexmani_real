@@ -36,9 +36,11 @@ class OutputProfile(str, Enum):
         # Robot and tactile modalities form the processed core of every raw episode.
         keys = [
             "joint_state",
+            "eef_pose",
             "action",
             "action_ee",
             "contact_force",
+            "tactile_force",
             "fingertip_points",
         ]
         if self.needs_rgb:

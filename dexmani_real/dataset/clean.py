@@ -38,8 +38,7 @@ def _as_f64(reader: EpisodeReader, name: str) -> np.ndarray:
     return np.asarray(reader.h5f[name][:], dtype=np.float64)
 
 
-def align_tactile_sum_rows_to_references(
-    contact_force: np.ndarray,
+def select_tactile_rows_to_references(
     hand_source_monotonic_ns: np.ndarray,
     tactile_source_monotonic_ns: np.ndarray,
     tactile_fresh: np.ndarray,
@@ -49,13 +48,19 @@ def align_tactile_sum_rows_to_references(
     *,
     max_observation_skew_s: float,
 ) -> np.ndarray:
-    """Select the newest proven tactile-sum row causal to each reference.
+    """Select the newest proven raw tactile row causal to each reference.
 
-    Candidate rows are restricted to rows already recorded at the target row,
-    so a later persisted row can never repair an earlier observation. ``-1``
-    marks references without a fresh, calibrated, unit-proven sample in skew.
+    This is the single payload-independent tactile source selector: the chosen
+    row feeds both ``hand_contact`` (contact_force) and ``hand_tactile_force``
+    (tactile_force), so both observations share one raw source row.  Candidate
+    rows are restricted to rows already recorded at the target row, so a later
+    persisted row can never repair an earlier observation.  ``-1`` marks
+    references without a fresh, calibrated, unit-proven sample in skew.
+
+    Only provenance is judged here.  Payload finiteness for fresh rows is a
+    raw-v24 validation guarantee, and the analysis/payload gates downstream
+    remain the fail-closed authority for non-finite contact data.
     """
-    contact = np.asarray(contact_force)
     hand_source_ns = np.asarray(hand_source_monotonic_ns, dtype=np.int64)
     source_ns = np.asarray(tactile_source_monotonic_ns, dtype=np.int64)
     fresh = np.asarray(tactile_fresh, dtype=bool)
@@ -63,8 +68,6 @@ def align_tactile_sum_rows_to_references(
     unit_code = np.asarray(tactile_unit_code, dtype=np.int64)
     references = np.asarray(reference_monotonic_ns, dtype=np.int64)
     count = len(source_ns)
-    if contact.shape != (count, 5, 3):
-        raise ValueError("contact_force must have shape (frame_count, 5, 3)")
     if any(
         value.shape != (count,)
         for value in (
@@ -86,7 +89,6 @@ def align_tactile_sum_rows_to_references(
         & (unit_code == 0)
         & (source_ns > 0)
         & (hand_source_ns == source_ns)
-        & np.all(np.isfinite(contact), axis=(1, 2))
     )
     # Source clocks can reset or arrive out of order in malformed/partial raw
     # captures. Coordinate compression plus a Fenwick occupancy tree keeps the
@@ -674,8 +676,7 @@ def analyze_episode(
         if visual_profile
         else arrays["observation_anchor_monotonic_ns"]
     )
-    tactile_source_rows = align_tactile_sum_rows_to_references(
-        arrays["contact_force"],
+    tactile_source_rows = select_tactile_rows_to_references(
         arrays["hand_source_monotonic_ns"],
         _as_i64(reader, "tactile_source_monotonic_ns"),
         _as_bool(reader, "tactile_fresh"),

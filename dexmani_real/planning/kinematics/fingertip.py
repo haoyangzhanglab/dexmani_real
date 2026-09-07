@@ -80,8 +80,60 @@ def compute_fingertip_points_xarm_base(
     return tips
 
 
+def compute_fingertip_history_xarm_base(
+    arm_qpos: np.ndarray,
+    hand_qpos: np.ndarray,
+    *,
+    hand_fk: Any,
+    handbase_position_eef_m: np.ndarray,
+    handbase_quat_eef_wxyz: np.ndarray,
+    arm_fk: Any | None = None,
+    eef_pose_history: np.ndarray | None = None,
+) -> np.ndarray:
+    """Recompute aligned fingertip history ``[T,5,3]`` float32 in xArm base.
+
+    When ``eef_pose_history`` (finite ``[T,9]`` position+rot6d from
+    ``compute_eef_pose_history_xarm_base``) is provided, no Arm FK runs: the
+    caller's one-per-timestep FK result is reused, keeping ``eef_pose`` and
+    ``fingertip_points`` on the identical derivation.  Otherwise ``arm_fk`` is
+    required and drives exactly one FK per timestep internally.
+    """
+    arm = np.asarray(arm_qpos, dtype=np.float64)
+    hand = np.asarray(hand_qpos, dtype=np.float64)
+    if (
+        arm.ndim != 2
+        or arm.shape[1] != ARM_JOINT_SHAPE[0]
+        or hand.shape != (len(arm), HAND_JOINT_SHAPE[0])
+    ):
+        raise ValueError("aligned arm/hand qpos histories have invalid shapes")
+    poses: np.ndarray | None = None
+    if eef_pose_history is not None:
+        poses = np.asarray(eef_pose_history, dtype=np.float64)
+        if poses.shape != (len(arm), 9) or not np.all(np.isfinite(poses)):
+            raise ValueError("eef_pose_history must be finite with shape (T, 9)")
+    elif arm_fk is None:
+        raise ValueError("arm_fk is required when eef_pose_history is not provided")
+    return np.asarray(
+        [
+            compute_fingertip_points_xarm_base(
+                arm[index],
+                hand[index],
+                arm_fk=arm_fk,
+                hand_fk=hand_fk,
+                handbase_position_eef_m=handbase_position_eef_m,
+                handbase_quat_eef_wxyz=handbase_quat_eef_wxyz,
+                eef_position_xarm_base_m=None if poses is None else poses[index, :3],
+                eef_rot6d_xarm_base=None if poses is None else poses[index, 3:],
+            )
+            for index in range(len(arm))
+        ],
+        dtype=np.float32,
+    )
+
+
 __all__ = [
     "FINGERTIP_POINTS_DERIVATION",
     "FINGERTIP_POLICY_ID",
+    "compute_fingertip_history_xarm_base",
     "compute_fingertip_points_xarm_base",
 ]

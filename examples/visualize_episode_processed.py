@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/visualize_episode_processed.py PROCESSED.h5 [--info] [--max-frames N]``.
 
-Self-contained Rerun-based visualizer for processed HDF5 v13
+Self-contained Rerun-based visualizer for processed HDF5 v14
 (``dexmani-real-processed-hdf5``) artifacts written by
 ``examples/process_episodes.py``.  Offline only: connects to no hardware, writes
 no files; opens a Rerun viewer window (or prints a structure summary with
@@ -66,6 +66,35 @@ _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
 
 _FINGER_NAMES: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
 
+# Fixed, easily distinguishable from the five finger colors.
+_EEF_COLOR = (255, 255, 255)
+
+
+def _eef_position_or_none(eef_pose_row: np.ndarray) -> np.ndarray | None:
+    """Return the processed ``eef_pose`` position when finite, else None.
+
+    ``None`` marks a row that must not be rendered; the caller clears the EEF
+    entity instead of leaving a stale sphere.  Processed v14 rows are validated
+    finite, so this is a fail-safe guard, not an admission path.
+    """
+    row = np.asarray(eef_pose_row, dtype=np.float64)
+    if row.shape != (9,) or not np.all(np.isfinite(row)):
+        return None
+    return row[:3]
+
+
+def _fingertip_positions_or_none(fingertip_row: np.ndarray) -> np.ndarray | None:
+    """Return the processed fingertip positions when renderable, else None.
+
+    Processed v14 validates finiteness at admission, so ``None`` is a
+    fail-safe guard; the caller clears the fingertips entity rather than
+    leaving the previous frame's spheres visible at the new timestep.
+    """
+    row = np.asarray(fingertip_row, dtype=np.float32)
+    if row.ndim != 2 or row.shape != (5, 3) or not np.all(np.isfinite(row)):
+        return None
+    return row
+
 # Processed core modalities are fixed by the current schema contract: joint_state/action are
 # arm (7) + hand (12), action_ee is eef_position (3) + eef_rot6d (6) + hand (12),
 # and contact_force is one native-axis 3-vector per finger.
@@ -83,6 +112,8 @@ def _series_labels(key: str, dim: int) -> list[str]:
             + [f"ee_r{i}" for i in range(6)]
             + list(_HAND_JOINT_LABELS)
         )
+    if key == "eef_pose" and dim == 9:
+        return ["ee_x", "ee_y", "ee_z"] + [f"ee_r{i}" for i in range(6)]
     if key == "contact_force_mag" and dim == 5:
         return list(_FINGER_NAMES)
     return [str(i) for i in range(dim)]
@@ -234,7 +265,7 @@ def print_episode_info(h5_path: str) -> None:
 
 
 class ProcessedEpisodeVisualizer:
-    """Load a processed HDF5 v13 file and stream it into Rerun for interactive viewing."""
+    """Load a processed HDF5 v14 file and stream it into Rerun for interactive viewing."""
 
     def __init__(
         self,
@@ -251,7 +282,7 @@ class ProcessedEpisodeVisualizer:
                 != PROCESSED_SCHEMA_VERSION
             ):
                 raise ValueError(
-                    f"{self._h5_path.name} is not a processed HDF5 v13 artifact"
+                    f"{self._h5_path.name} is not a processed HDF5 v14 artifact"
                 )
             self._keys = _present_keys(self._h5f)
             if "joint_state" not in self._keys and "action" not in self._keys:
@@ -328,8 +359,11 @@ class ProcessedEpisodeVisualizer:
     def _preload_state(self) -> dict[str, np.ndarray]:
         """Read small non-camera, non-pointcloud datasets into memory, truncated to T."""
         state: dict[str, np.ndarray] = {}
+        # eef_pose is small and preloaded; tactile_force (T,5,120,3) is never
+        # preloaded into RAM by this viewer.
         expected_tails = {
             "joint_state": (19,),
+            "eef_pose": (9,),
             "action": (19,),
             "action_ee": (21,),
             "fingertip_points": (5, 3),
@@ -393,6 +427,8 @@ class ProcessedEpisodeVisualizer:
         groups: list[tuple[str, str]] = []
         if "joint_state" in self._state:
             groups.append(("state", "joint_state"))
+        if "eef_pose" in self._state:
+            groups.append(("state", "eef_pose"))
         for key in ("action", "action_ee"):
             if key in self._state:
                 groups.append(("action", key))
@@ -412,7 +448,11 @@ class ProcessedEpisodeVisualizer:
         if cam_views:
             columns.append(rrb.Vertical(contents=cam_views, name="Camera"))
 
-        has_3d = self._pc_enabled or "fingertip_points" in self._state
+        has_3d = (
+            self._pc_enabled
+            or "fingertip_points" in self._state
+            or "eef_pose" in self._state
+        )
         if has_3d:
             columns.append(
                 rrb.Spatial3DView(
@@ -473,6 +513,7 @@ class ProcessedEpisodeVisualizer:
         self._log_camera(step_idx)
         self._log_pointcloud(step_idx)
         self._log_fingertips(step_idx)
+        self._log_eef(step_idx)
         self._log_time_series(step_idx)
 
     def _log_camera(self, step_idx: int) -> None:
@@ -517,8 +558,10 @@ class ProcessedEpisodeVisualizer:
         fp_data = self._state.get("fingertip_points")
         if fp_data is None:
             return
-        fp = np.asarray(fp_data[step_idx], dtype=np.float32)
-        if fp.ndim != 2 or fp.shape != (5, 3) or not np.all(np.isfinite(fp)):
+        fp = _fingertip_positions_or_none(fp_data[step_idx])
+        if fp is None:
+            # Never leave the previous frame's spheres behind on invalid rows.
+            rr.log("fingertips", rr.Clear(recursive=False))
             return
         rr.log(
             "fingertips",
@@ -526,6 +569,24 @@ class ProcessedEpisodeVisualizer:
                 positions=fp,
                 colors=np.array(_FINGERTIP_COLORS, dtype=np.uint8),
                 radii=0.012,
+            ),
+        )
+
+    def _log_eef(self, step_idx: int) -> None:
+        """Render the processed eef_pose position as one larger sphere."""
+        ee_data = self._state.get("eef_pose")
+        if ee_data is None:
+            return
+        position = _eef_position_or_none(ee_data[step_idx])
+        if position is None:
+            rr.log("eef", rr.Clear(recursive=False))
+            return
+        rr.log(
+            "eef",
+            rr.Points3D(
+                positions=position[None, :],
+                colors=np.array([_EEF_COLOR], dtype=np.uint8),
+                radii=0.020,  # EEF sphere is intentionally larger than fingertips
             ),
         )
 

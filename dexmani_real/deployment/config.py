@@ -25,6 +25,10 @@ from dexmani_real.ipc.schema import (
     POINT_CLOUD_FEATURE_DIM,
     SUPPORTED_POINT_CLOUD_COUNTS,
 )
+from dexmani_real.planning.kinematics.arm_fk import (
+    EEF_POSE_ALGORITHM_ID,
+    EEF_POSE_DERIVATION,
+)
 from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
@@ -39,7 +43,15 @@ _DEPLOYMENT_DEFAULT_MODE = "sync"
 _DEPLOYMENT_MODES = frozenset({"sync", "async"})
 
 _SUPPORTED_OBSERVATION_FIELDS = frozenset(
-    {"joint_state", "point_cloud", "rgb", "contact_force", "fingertip_points"}
+    {
+        "joint_state",
+        "point_cloud",
+        "rgb",
+        "contact_force",
+        "fingertip_points",
+        "eef_pose",
+        "tactile_force",
+    }
 )
 
 
@@ -68,6 +80,8 @@ def _validate_real_observation_capability(policy_spec: Any) -> tuple[Any, ...]:
         "joint_state": ((19,), "float32"),
         "contact_force": ((5, 3), "float32"),
         "fingertip_points": ((5, 3), "float32"),
+        "eef_pose": ((9,), "float32"),
+        "tactile_force": ((5, 120, 3), "float32"),
     }
     for field, name in zip(fields, names, strict=True):
         shape = field.shape
@@ -145,6 +159,17 @@ def _expected_fingertip_semantics(runtime: Any) -> dict[str, str]:
     }
 
 
+def _expected_eef_pose_semantics() -> dict[str, str]:
+    return {
+        "representation": "position_m_rot6d",
+        "frame": "xarm_base",
+        "position_units": "m",
+        "rotation_representation": "rot6d",
+        "derivation": EEF_POSE_DERIVATION,
+        "algorithm_id": EEF_POSE_ALGORITHM_ID,
+    }
+
+
 def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> None:
     """Validate only whether Real can run the Policy-owned public contract."""
     fields = _validate_real_observation_capability(policy_spec)
@@ -191,6 +216,13 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
             fingertip_points,
             field_name="fingertip_points",
             expected=_expected_fingertip_semantics(runtime),
+        )
+    eef_pose = fields_by_name.get("eef_pose")
+    if eef_pose is not None:
+        _validate_field_semantics(
+            eef_pose,
+            field_name="eef_pose",
+            expected=_expected_eef_pose_semantics(),
         )
 
 

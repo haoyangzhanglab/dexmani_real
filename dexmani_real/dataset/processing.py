@@ -1,4 +1,4 @@
-"""Transactional depth-to-color aligned raw-v24 to processed-v13 processing."""
+"""Transactional depth-to-color aligned raw-v24 to processed-v14 processing."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ import numpy as np
 import yaml
 
 from dexmani_real.dataset.clean import (
-    align_tactile_sum_rows_to_references,
     analyze_episode,
+    select_tactile_rows_to_references,
 )
 from dexmani_real.dataset.contracts import (
     EpisodeAnnotation,
@@ -38,17 +38,30 @@ from dexmani_real.dataset.processed import (
     _FRAME_CHUNKED_DATASETS,
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
+    _TACTILE_FORCE_AXIS_LABELS,
+    _TACTILE_FORCE_POINT_ORDER,
+    _TACTILE_FORCE_REPRESENTATION,
+    _TACTILE_FORCE_SENSOR_ORDER,
+    _TACTILE_FORCE_SI_VERIFIED,
+    _TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED,
+    _TACTILE_FORCE_UNIT,
     _dataset_row_slices,
     _expected_specs,
     _json,
     _validate_processed_output_structure,
     validate_processed_hdf5,
 )
-from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
+from dexmani_real.planning.kinematics.arm_fk import (
+    EEF_POSE_ALGORITHM_ID,
+    EEF_POSE_COMPONENTS,
+    EEF_POSE_DERIVATION,
+    EEF_POSE_FRAME,
+    compute_eef_pose_history_xarm_base,
+)
 from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
-    compute_fingertip_points_xarm_base,
+    compute_fingertip_history_xarm_base,
 )
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.storage.reader import EpisodeReader
@@ -255,6 +268,10 @@ def _write_attrs(
             "fingertip_points_policy_id": FINGERTIP_POLICY_ID,
             "action_ee_frame": _ACTION_EE_FRAME,
             "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
+            "eef_pose_frame": EEF_POSE_FRAME,
+            "eef_pose_components": EEF_POSE_COMPONENTS,
+            "eef_pose_derivation": EEF_POSE_DERIVATION,
+            "eef_pose_algorithm_id": EEF_POSE_ALGORITHM_ID,
             "contact_force_source": (
                 "camera_causal_tactile_sum"
                 if visual_profile
@@ -273,6 +290,22 @@ def _write_attrs(
             "contact_force_unit_code": 0,
             "contact_force_causal_to_reference": True,
             "contact_force_hand_source_match_required": True,
+            # Full tactile records only source-provable SDK facts; SI units and
+            # taxel spatial geometry stay explicitly unverified.
+            "tactile_force_representation": _TACTILE_FORCE_REPRESENTATION,
+            "tactile_force_sensor_order": _TACTILE_FORCE_SENSOR_ORDER,
+            "tactile_force_point_order": _TACTILE_FORCE_POINT_ORDER,
+            "tactile_force_axis_labels": _TACTILE_FORCE_AXIS_LABELS,
+            "tactile_force_unit": _TACTILE_FORCE_UNIT,
+            "tactile_force_si_verified": _TACTILE_FORCE_SI_VERIFIED,
+            "tactile_force_spatial_geometry_verified": (
+                _TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED
+            ),
+            "tactile_force_fresh_required": True,
+            "tactile_force_calibrated_required": True,
+            "tactile_force_unit_code": 0,
+            "tactile_force_causal_to_reference": True,
+            "tactile_force_hand_source_match_required": True,
             "processing_config_json": _json(config.to_dict()),
             "quality_summary_json": _json(decision.quality),
             "source_decision_json": _json(decision.to_dict()),
@@ -349,34 +382,16 @@ def _processed_joint_state(
     return np.concatenate((arm_state, hand_state), axis=1)
 
 
-def compute_fingertip_history_xarm_base(
-    arm_qpos: np.ndarray,
-    hand_qpos: np.ndarray,
-    *,
-    arm_fk: Any,
-    hand_fk: Any,
-    handbase_position_eef_m: np.ndarray,
-    handbase_quat_eef_wxyz: np.ndarray,
-) -> np.ndarray:
-    """Recompute camera/control-grid aligned fingertip history from joint state."""
-    arm = np.asarray(arm_qpos, dtype=np.float64)
-    hand_state = np.asarray(hand_qpos, dtype=np.float64)
-    if arm.ndim != 2 or arm.shape[1] != 7 or hand_state.shape != (len(arm), 12):
-        raise ValueError("aligned arm/hand qpos histories have invalid shapes")
-    return np.asarray(
-        [
-            compute_fingertip_points_xarm_base(
-                arm[index],
-                hand_state[index],
-                arm_fk=arm_fk,
-                hand_fk=hand_fk,
-                handbase_position_eef_m=handbase_position_eef_m,
-                handbase_quat_eef_wxyz=handbase_quat_eef_wxyz,
-            )
-            for index in range(len(arm))
-        ],
-        dtype=np.float32,
-    )
+def _gather_dataset_rows(dataset: h5py.Dataset, indices: np.ndarray) -> np.ndarray:
+    """Gather raw rows in ``indices`` order, safe for duplicate indices.
+
+    Causal forward-fill repeats raw source rows, and h5py fancy indexing must
+    not be relied on for duplicate point selections; unique+inverse keeps the
+    read both correct and minimal.
+    """
+    unique_rows, inverse = np.unique(indices, return_inverse=True)
+    values = np.asarray(dataset[unique_rows])
+    return values[inverse]
 
 
 def _write_processed_episode(
@@ -417,14 +432,12 @@ def _write_processed_episode(
         output["action"][:] = np.concatenate((arm_action, hand_action), axis=1)
         output["action_ee"][:] = np.concatenate((arm_action_ee, hand_action), axis=1)
         visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
-        all_contact_force = np.asarray(reader.h5f["hand_contact"][:], dtype=np.float64)
         reference_key = (
             "camera_source_monotonic_ns"
             if visual_profile
             else "observation_anchor_monotonic_ns"
         )
-        tactile_source_rows = align_tactile_sum_rows_to_references(
-            all_contact_force,
+        tactile_source_rows = select_tactile_rows_to_references(
             np.asarray(reader.h5f["hand_source_monotonic_ns"][:], dtype=np.int64),
             np.asarray(reader.h5f["tactile_source_monotonic_ns"][:], dtype=np.int64),
             np.asarray(reader.h5f["tactile_fresh"][:], dtype=bool),
@@ -436,10 +449,19 @@ def _write_processed_episode(
         selected_tactile_rows = tactile_source_rows[selected]
         if np.any(selected_tactile_rows < 0):
             raise ValueError("selected row lacks causal tactile provenance")
-        contact_force = np.asarray(
-            all_contact_force[selected_tactile_rows], dtype=np.float32
-        )
-        output["contact_force"][:] = contact_force
+        # contact_force and tactile_force are gathered from the identical
+        # selected raw rows; only those T rows are read, never the full
+        # (N,5,120,3) source dataset.
+        output["contact_force"][:] = _gather_dataset_rows(
+            reader.h5f["hand_contact"], selected_tactile_rows
+        ).astype(np.float32, copy=False)
+        output["tactile_force"][:] = _gather_dataset_rows(
+            reader.h5f["hand_tactile_force"], selected_tactile_rows
+        ).astype(np.float32, copy=False)
+        # Exactly one canonical Arm FK per processed row; the same EEF history
+        # feeds both eef_pose and fingertip_points.
+        eef_pose_history = compute_eef_pose_history_xarm_base(joint_state[:, :7])
+        output["eef_pose"][:] = eef_pose_history.astype(np.float32, copy=False)
         hand_fk = HandKinematics(
             config.hand_urdf_path, list(config.fingertip_link_names)
         )
@@ -448,7 +470,6 @@ def _write_processed_episode(
         output["fingertip_points"][:] = compute_fingertip_history_xarm_base(
             joint_state[:, :7],
             joint_state[:, 7:19],
-            arm_fk=make_arm_fk(),
             hand_fk=hand_fk,
             handbase_position_eef_m=np.asarray(
                 config.handbase_position_eef_m, dtype=np.float64
@@ -456,6 +477,7 @@ def _write_processed_episode(
             handbase_quat_eef_wxyz=np.asarray(
                 config.handbase_quat_eef_wxyz, dtype=np.float64
             ),
+            eef_pose_history=eef_pose_history,
         )
 
         provenance = output.create_group("provenance")
@@ -473,6 +495,15 @@ def _write_processed_episode(
             "source_segment_ends": decision.segment_ends,
             "source_keep_mask": decision.keep_mask,
             "source_drop_reason_bits": decision.drop_reason_bits,
+            "tactile_source_row_index": np.asarray(
+                selected_tactile_rows, dtype=np.int64
+            ),
+            "observation_reference_monotonic_ns": np.asarray(
+                reader.h5f[reference_key][selected], dtype=np.int64
+            ),
+            "tactile_source_monotonic_ns": _gather_dataset_rows(
+                reader.h5f["tactile_source_monotonic_ns"], selected_tactile_rows
+            ).astype(np.int64, copy=False),
         }
         for name, values in provenance_values.items():
             provenance.create_dataset(

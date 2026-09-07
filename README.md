@@ -32,10 +32,12 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 - 事务式写入 depth-to-color aligned RGB-D raw episode v24；除 native depth/color 几何与
   时序 provenance 外，还保存与 camera source 对齐的 arm/hand policy observation、hand SDK ACK
   与限速后的 hand target。
-- 将 aligned raw v24 episode 清洗为 processed HDF5 v13；四种 profile 的
-  teleop 已发布 target 数据均可导出 Policy Zarr v7。所有 profile 的 `fingertip_points` 都由自身
-  `joint_state` 经同一 arm+hand FK 重新计算，并在处理时记录 derivation 与 algorithm identity。
-  导出坚持一份 processed HDF5 对应一个训练 episode；
+- 将 aligned raw v24 episode 清洗为 processed HDF5 v14；四种 profile 的
+  teleop 已发布 target 数据均可导出 Policy Zarr v7（v7 是 v14 的显式 legacy 投影，
+  `eef_pose`/`tactile_force` 不进入 Zarr）。所有 profile 的 `eef_pose` 与 `fingertip_points`
+  都由自身 `joint_state` 推导，每 timestep 只执行一次 canonical Arm FK，并在处理时记录
+  derivation 与 algorithm identity。`contact_force` 与 `tactile_force` 来自同一条因果选择的
+  raw tactile source row。导出坚持一份 processed HDF5 对应一个训练 episode；
   删除过 source 行或存在时序缺口的 episode 整条拒绝，不在缺口处拆分。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
 - 通过 Policy-owned public runtime 与 Real-owned NumPy adapter 运行 joint/EE-action learned
@@ -51,7 +53,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`replay/`](dexmani_real/replay) |
 | raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/storage/hdf5_writer.py`](dexmani_real/recording/storage/hdf5_writer.py)、[`recording/storage/reader.py`](dexmani_real/recording/storage/reader.py) |
 | 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`dataset/`](dexmani_real/dataset) |
-| 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v24、processed v13 与 Policy Zarr v7 的字段、dtype、shape 与语义 |
+| 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v24、processed v14 与 Policy Zarr v7 的字段、dtype、shape 与语义 |
 | learned-policy 部署与正式评估 | [`examples/run_policy.py`](examples/run_policy.py)、[`docs/policy_eval_workflow.md`](docs/policy_eval_workflow.md) | [`deployment/`](dexmani_real/deployment)、[`deployment/inference/dexmani_policy.py`](dexmani_real/deployment/inference/dexmani_policy.py) |
 | 相机、桌面与 VR 标定 | [`examples/`](examples) | [`calibration/`](dexmani_real/calibration)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
 | 点云完整链路 | [`docs/pointcloud_pipeline.md`](docs/pointcloud_pipeline.md) | [`sensor/pointcloud.py`](dexmani_real/sensor/pointcloud.py)、[`sensor/pointcloud_worker.py`](dexmani_real/sensor/pointcloud_worker.py) |
@@ -349,7 +351,7 @@ RGB-D、完整 raw 点云、canonical processed 点云、相机几何、外参�
 根因已确认并修复：`RealSenseCameraConfig.auto_exposure_priority` 默认 `0.0`（OFF，Auto
 Exposure 仍 ON），RGB 恢复 30 Hz，亮度由增益补偿、几乎不变（暗场噪声上升）。
 
-深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew）。processed v13 的点云将
+深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew）。processed v14 的点云将
 depth-to-color aligned 像素 RGB 聚合为体素颜色，但这不表示同步曝光；运动物体仍可能出现
 颜色时间错位。
 
@@ -408,7 +410,7 @@ raw v24 episode 可视化默认使用当前 resolved runtime 中的点云策略�
 `--pointcloud-num-points` 可选择 `1024`、`2048`、`4096` 或 `8192`。
 
 需要检查已清洗、持久化及 provenance 完整的点云时，仍应先用 `process_episodes.py` 生成
-processed HDF5 v13，再运行 `python examples/visualize_episode_processed.py <processed.h5>`；该入口
+processed HDF5 v14，再运行 `python examples/visualize_episode_processed.py <processed.h5>`；该入口
 按实际使用的模态读取并校验必要的 shape、dtype 与点云坐标/采样语义，点云帧在渲染时再检查
 有限值与 RGB 范围；`rgb`/`rgb_pc` 还要求 RGB 与 depth 的 `N/H/W` 完全一致。可视化不会执行
 完整 payload/provenance 扫描，完整检查仍由 `--verify-output` 或 export 边界负责。

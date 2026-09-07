@@ -1,4 +1,4 @@
-"""Processed-v13 schema, provenance, specifications, and strict validation."""
+"""Processed-v14 schema, provenance, specifications, and strict validation."""
 
 from __future__ import annotations
 
@@ -19,6 +19,12 @@ from dexmani_real.config.pointcloud import (
 )
 from dexmani_real.dataset.contracts import ProcessingConfig
 from dexmani_real.dataset.pointcloud import validate_rigid_transform
+from dexmani_real.planning.kinematics.arm_fk import (
+    EEF_POSE_ALGORITHM_ID,
+    EEF_POSE_COMPONENTS,
+    EEF_POSE_DERIVATION,
+    EEF_POSE_FRAME,
+)
 from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
@@ -27,7 +33,7 @@ from dexmani_real.planning.kinematics.pose import validate_canonical_rot6d
 from dexmani_real.recording.storage.schema import SEMANTIC_META_ATTRS
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 13
+PROCESSED_SCHEMA_VERSION = 14
 _PROVENANCE_DATASETS = (
     "source_row_index",
     "source_sample_index",
@@ -35,14 +41,19 @@ _PROVENANCE_DATASETS = (
     "source_segment_ends",
     "source_keep_mask",
     "source_drop_reason_bits",
+    "tactile_source_row_index",
+    "observation_reference_monotonic_ns",
+    "tactile_source_monotonic_ns",
 )
 _PROVENANCE_ATTRS = ("drop_reason_bit_names_json",)
 _VALIDATION_CHUNK_BYTES = 64 * 1024 * 1024
 _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "joint_state": ((19,), np.dtype(np.float32)),
+    "eef_pose": ((9,), np.dtype(np.float32)),
     "action": ((19,), np.dtype(np.float32)),
     "action_ee": ((21,), np.dtype(np.float32)),
     "contact_force": ((5, 3), np.dtype(np.float32)),
+    "tactile_force": ((5, 120, 3), np.dtype(np.float32)),
     "fingertip_points": ((5, 3), np.dtype(np.float32)),
 }
 _FRAME_CHUNKED_DATASETS = frozenset(("rgb", "depth", "point_cloud"))
@@ -52,6 +63,16 @@ _CONTACT_FORCE_FRAME = "xhand_sensor_native_axes_per_finger"
 _FINGERTIP_POINTS_FRAME = str(SEMANTIC_META_ATTRS["hand_fingertip_frame"])
 _FINGERTIP_POINTS_UNIT = "m"
 _ACTION_EE_FRAME = str(SEMANTIC_META_ATTRS["action_arm_ee_frame"])
+# Only source-provable tactile semantics are persisted: SDK orders and axis
+# labels are facts of the xhand driver; SI units and taxel spatial geometry
+# are explicitly unverified.
+_TACTILE_FORCE_REPRESENTATION = "xhand_sdk_raw_force_fx_fy_fz"
+_TACTILE_FORCE_SENSOR_ORDER = "xhand_sdk_sensor_data_order"
+_TACTILE_FORCE_POINT_ORDER = "xhand_sdk_sensor_data_raw_force_order"
+_TACTILE_FORCE_AXIS_LABELS = "fx_fy_fz"
+_TACTILE_FORCE_UNIT = str(SEMANTIC_META_ATTRS["tactile_unit"])
+_TACTILE_FORCE_SI_VERIFIED = bool(SEMANTIC_META_ATTRS["tactile_si_unit_verified"])
+_TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED = False
 
 
 def validate_fingertip_points_semantics(
@@ -71,6 +92,80 @@ def validate_fingertip_points_semantics(
     if values["policy_id"] != FINGERTIP_POLICY_ID:
         raise ValueError(f"{label}: invalid fingertip_points_policy_id")
     return values
+
+
+def validate_eef_pose_semantics(
+    attrs: Any,
+    *,
+    label: str,
+) -> dict[str, str]:
+    """Return the required persisted EEF frame and derivation identity."""
+    values: dict[str, str] = {}
+    for key in ("frame", "components", "derivation", "algorithm_id"):
+        value = attrs.get(f"eef_pose_{key}", "")
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        values[key] = str(value).strip()
+    expected = {
+        "frame": EEF_POSE_FRAME,
+        "components": EEF_POSE_COMPONENTS,
+        "derivation": EEF_POSE_DERIVATION,
+        "algorithm_id": EEF_POSE_ALGORITHM_ID,
+    }
+    for key, expected_value in expected.items():
+        if values[key] != expected_value:
+            raise ValueError(f"{label}: invalid eef_pose_{key}")
+    return values
+
+
+def validate_tactile_force_semantics(
+    attrs: Any,
+    *,
+    label: str,
+) -> None:
+    """Check the persisted full-tactile contract; only provable facts exist.
+
+    The validator pins the XHand SDK representation/order/axis identity and
+    the conservative ``si_verified``/``spatial_geometry_verified`` negatives,
+    plus the same provenance gates the causal selector enforces.  It never
+    re-derives payload values and never assumes a contact-sum equivalence.
+    """
+    def _text(name: str) -> str:
+        value = attrs.get(name, "")
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        return str(value).strip()
+
+    expected_text = {
+        "tactile_force_representation": _TACTILE_FORCE_REPRESENTATION,
+        "tactile_force_sensor_order": _TACTILE_FORCE_SENSOR_ORDER,
+        "tactile_force_point_order": _TACTILE_FORCE_POINT_ORDER,
+        "tactile_force_axis_labels": _TACTILE_FORCE_AXIS_LABELS,
+        "tactile_force_unit": _TACTILE_FORCE_UNIT,
+    }
+    for name, expected in expected_text.items():
+        if _text(name) != expected:
+            raise ValueError(f"{label}: invalid {name}")
+    if _strict_bool_attr(attrs, "tactile_force_si_verified") is not (
+        _TACTILE_FORCE_SI_VERIFIED
+    ):
+        raise ValueError(f"{label}: invalid tactile_force_si_verified")
+    if _strict_bool_attr(attrs, "tactile_force_spatial_geometry_verified") is not (
+        _TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED
+    ):
+        raise ValueError(
+            f"{label}: invalid tactile_force_spatial_geometry_verified"
+        )
+    for name in (
+        "tactile_force_fresh_required",
+        "tactile_force_calibrated_required",
+        "tactile_force_causal_to_reference",
+        "tactile_force_hand_source_match_required",
+    ):
+        if not _strict_bool_attr(attrs, name):
+            raise ValueError(f"{label}: {name} must be true")
+    if _strict_integer_attr(attrs, "tactile_force_unit_code") != 0:
+        raise ValueError(f"{label}: tactile_force_unit_code must be 0")
 
 
 def _strict_bool_attr(attrs: Any, name: str) -> bool:
@@ -107,6 +202,9 @@ class ProcessedProvenance:
     drop_reason_bits: np.ndarray
     drop_reason_names: tuple[str, ...]
     hard_invalid_reason_names: tuple[str, ...]
+    tactile_source_rows: np.ndarray
+    observation_reference_ns: np.ndarray
+    tactile_source_ns: np.ndarray
 
 
 def _json(value: Any) -> str:
@@ -180,6 +278,10 @@ def validate_processed_payload(
             if key == "action_ee":
                 validate_canonical_rot6d(
                     block[:, 3:9], label=f"{label}: action_ee rot6d"
+                )
+            if key == "eef_pose":
+                validate_canonical_rot6d(
+                    block[:, 3:9], label=f"{label}: eef_pose rot6d"
                 )
             if key == "point_cloud":
                 if np.any(block[..., 3:] < 0.0) or np.any(block[..., 3:] > 1.0):
@@ -321,6 +423,9 @@ def validate_processed_provenance(
         "source_segment_ends": np.dtype(np.int64),
         "source_keep_mask": np.dtype(np.bool_),
         "source_drop_reason_bits": np.dtype(np.uint64),
+        "tactile_source_row_index": np.dtype(np.int64),
+        "observation_reference_monotonic_ns": np.dtype(np.int64),
+        "tactile_source_monotonic_ns": np.dtype(np.int64),
     }
     expected_shapes = {
         "source_row_index": (length,),
@@ -329,6 +434,9 @@ def validate_processed_provenance(
         "source_segment_ends": None,
         "source_keep_mask": (source_frames,),
         "source_drop_reason_bits": (source_frames,),
+        "tactile_source_row_index": (length,),
+        "observation_reference_monotonic_ns": (length,),
+        "tactile_source_monotonic_ns": (length,),
     }
     values: dict[str, np.ndarray] = {}
     for key in _PROVENANCE_DATASETS:
@@ -373,6 +481,27 @@ def validate_processed_provenance(
         or np.any(reasons[~keep_mask] == 0)
     ):
         raise ValueError(f"{label}: provenance row mapping mismatch")
+
+    # Tactile proof: contact_force[t] and tactile_force[t] must come from one
+    # raw row that was already persisted at the processed source row and whose
+    # sample time is causal to the observation reference within the skew cap.
+    tactile_rows = values["tactile_source_row_index"]
+    reference_ns = values["observation_reference_monotonic_ns"]
+    tactile_ns = values["tactile_source_monotonic_ns"]
+    max_observation_skew_s = float(attrs.get("max_observation_skew_s", np.nan))
+    if not np.isfinite(max_observation_skew_s) or max_observation_skew_s <= 0.0:
+        raise ValueError(f"{label}: invalid max_observation_skew_s")
+    max_skew_ns = int(round(max_observation_skew_s * 1e9))
+    if (
+        np.any(tactile_rows < 0)
+        or np.any(tactile_rows >= source_frames)
+        or np.any(tactile_rows > rows)
+        or np.any(reference_ns <= 0)
+        or np.any(tactile_ns <= 0)
+        or np.any(tactile_ns > reference_ns)
+        or np.any(reference_ns - tactile_ns > max_skew_ns)
+    ):
+        raise ValueError(f"{label}: tactile provenance causality mismatch")
 
     reason_names_value = _json_object_attr(
         provenance, "drop_reason_bit_names_json", label=label
@@ -435,6 +564,9 @@ def validate_processed_provenance(
         drop_reason_bits=reasons,
         drop_reason_names=reason_names,
         hard_invalid_reason_names=hard_invalid_reason_names,
+        tactile_source_rows=tactile_rows,
+        observation_reference_ns=reference_ns,
+        tactile_source_ns=tactile_ns,
     )
 
 
@@ -499,6 +631,8 @@ def _validate_processed_output_structure(
         if str(source.attrs.get("profile", "")) != config.profile.value:
             raise ValueError(f"{artifact.name}: profile mismatch")
         validate_fingertip_points_semantics(source.attrs, label=artifact.name)
+        validate_eef_pose_semantics(source.attrs, label=artifact.name)
+        validate_tactile_force_semantics(source.attrs, label=artifact.name)
         if not isinstance(source.get("provenance"), h5py.Group):
             raise ValueError(f"{artifact.name}: provenance is not an HDF5 group")
         _validate_processed_structure(
@@ -518,7 +652,7 @@ def _validate_processed_output_structure(
 def validate_processed_hdf5(
     path: str | Path, config: ProcessingConfig
 ) -> dict[str, Any]:
-    """Fail closed on a processed Real HDF5 v13 artifact."""
+    """Fail closed on a processed Real HDF5 v14 artifact."""
 
     artifact = Path(path)
     with h5py.File(artifact, "r") as source:
@@ -638,6 +772,8 @@ def validate_processed_hdf5(
             source.attrs, "contact_force_hand_source_match_required"
         )
         validate_fingertip_points_semantics(source.attrs, label=artifact.name)
+        validate_eef_pose_semantics(source.attrs, label=artifact.name)
+        validate_tactile_force_semantics(source.attrs, label=artifact.name)
         if (
             str(source.attrs.get("state_alignment", "")) != expected_state_alignment
             or str(source.attrs.get("observation_reference", "")) != expected_reference

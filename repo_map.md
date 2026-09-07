@@ -155,9 +155,12 @@ VR / keyboard input
   selector、checkpoint name/SHA-256、inference mode 和 wall-clock budget 通过 recorder-owned
   `provenance_*` metadata attrs 保存，不与 camera metadata 混用。
 - raw episode 的 schema、字段语义和对齐保持单一来源：`recording/storage/schema.py` 与
-  [`docs/data_schema.md`](docs/data_schema.md)。当前链路为 raw v24 → processed HDF5 v13 →
-  Policy Zarr v7；离线 `dataset/` 负责清洗、审计和导出，不改变 raw 字段含义。所有 processed
-  profile 的 fingertip 都由自身 `joint_state` FK 推导，并在处理时记录 derivation 与 policy identity。
+  [`docs/data_schema.md`](docs/data_schema.md)。当前链路为 raw v24 → processed HDF5 v14 →
+  Policy Zarr v7；离线 `dataset/` 负责清洗、审计和导出，不改变 raw 字段含义。Policy Zarr v7
+  是 processed v14 的显式 legacy 投影：`eef_pose`/`tactile_force` 只存在于 processed，不进入
+  Zarr keys 或 root attrs。所有 processed profile 的 `eef_pose` 与 fingertip 都由自身
+  `joint_state` FK 推导（每 timestep 一次 canonical Arm FK，两者共用），`contact_force` 与
+  `tactile_force` 共用同一因果 tactile source row，并在处理时记录 derivation 与 policy identity。
 - `EpisodeReader` 的普通 read 严格检查 raw schema、layout 和基本语义，不执行额外的文件完整性扫描。
 - processed writer 只在原子发布前重开并确认 HDF5 结构；`--verify-output` 才执行完整写后
   自检。processed consumer/export 边界仍严格验证 payload finite、shape/dtype、alignment 和

@@ -88,8 +88,17 @@ def _requires_camera(policy_spec: Any) -> bool:
 
 
 def _requires_hand_sensor(policy_spec: Any) -> bool:
+    # eef_pose derives from arm qpos only and never triggers the hand sensor.
     requested = set(_observation_field_names(policy_spec))
-    return bool(requested & {"joint_state", "contact_force", "fingertip_points"})
+    return bool(
+        requested
+        & {
+            "joint_state",
+            "contact_force",
+            "fingertip_points",
+            "tactile_force",
+        }
+    )
 
 
 def _evaluation_recorder_config(

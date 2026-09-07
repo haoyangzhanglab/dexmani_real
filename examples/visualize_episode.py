@@ -77,6 +77,38 @@ _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
     (255, 200, 40),  # ring   — gold
     (220, 60, 255),  # pinky  — magenta
 )
+# Fixed, easily distinguishable from the five finger colors.
+_EEF_COLOR = (255, 255, 255)
+
+
+def _eef_position_or_none(eef_row: np.ndarray) -> np.ndarray | None:
+    """Return the recorded raw arm_ee position when finite, else None.
+
+    The raw viewer shows the actually recorded value; it never re-derives FK.
+    ``None`` means the row carries the all-NaN invalid sentinel and the EEF
+    entity must be cleared instead of leaving a stale sphere.
+    """
+    row = np.asarray(eef_row, dtype=np.float64)
+    if row.shape != (9,) or not np.all(np.isfinite(row)):
+        return None
+    return row[:3]
+
+
+def _fingertip_positions_or_none(fingertip_row: np.ndarray) -> np.ndarray | None:
+    """Return the recorded hand_fingertip positions when renderable, else None.
+
+    ``None`` means the row is the all-NaN invalid sentinel (or malformed); the
+    caller clears the fingertips entity instead of leaving the previous
+    frame's spheres visible at the new timestep.
+    """
+    row = np.asarray(fingertip_row, dtype=np.float32)
+    if (
+        row.ndim != 2
+        or row.shape != HAND_FINGERTIP_SHAPE
+        or not np.all(np.isfinite(row))
+    ):
+        return None
+    return row
 
 
 def _classify_datasets(h5f: MergedH5File) -> dict[str, list[str]]:
@@ -309,7 +341,11 @@ class EpisodeVisualizer:
         if cam_views:
             columns.append(rrb.Vertical(contents=cam_views, name="Camera"))
 
-        if self._pc_enabled or "hand_fingertip" in self._state:
+        if (
+            self._pc_enabled
+            or "hand_fingertip" in self._state
+            or "arm_ee" in self._state
+        ):
             columns.append(
                 rrb.Spatial3DView(
                     origin="/",
@@ -437,6 +473,7 @@ class EpisodeVisualizer:
         self._log_camera(step_idx)
         self._log_pointcloud(step_idx)
         self._log_fingertips(step_idx)
+        self._log_eef(step_idx)
         self._log_time_series(step_idx)
 
     def _log_camera(self, step_idx: int) -> None:
@@ -483,10 +520,10 @@ class EpisodeVisualizer:
         fp_data = self._state.get("hand_fingertip")
         if fp_data is None:
             return
-        fp = np.asarray(fp_data[step_idx], dtype=np.float32)
-        if fp.ndim != 2 or fp.shape != HAND_FINGERTIP_SHAPE:
-            return
-        if not np.all(np.isfinite(fp)):
+        fp = _fingertip_positions_or_none(fp_data[step_idx])
+        if fp is None:
+            # Never leave the previous frame's spheres behind on invalid rows.
+            rr.log("fingertips", rr.Clear(recursive=False))
             return
 
         rr.log(
@@ -495,6 +532,25 @@ class EpisodeVisualizer:
                 positions=fp,
                 colors=np.array(_FINGERTIP_COLORS, dtype=np.uint8),
                 radii=0.012,
+            ),
+        )
+
+    def _log_eef(self, step_idx: int) -> None:
+        """Render the raw arm_ee position; clear the entity on NaN sentinels."""
+        ee_data = self._state.get("arm_ee")
+        if ee_data is None:
+            return
+        position = _eef_position_or_none(ee_data[step_idx])
+        if position is None:
+            # Never leave the previous frame's sphere behind on invalid rows.
+            rr.log("eef", rr.Clear(recursive=False))
+            return
+        rr.log(
+            "eef",
+            rr.Points3D(
+                positions=position[None, :],
+                colors=np.array([_EEF_COLOR], dtype=np.uint8),
+                radii=0.020,  # EEF sphere is intentionally larger than fingertips
             ),
         )
 
