@@ -11,6 +11,9 @@ from pathlib import Path
 from dexmani_real.recording.recorder import normalize_provenance_metadata
 
 
+EVALUATION_MAX_FRAMES_STOP_REASON = "eval:invalid:max_frames"
+
+
 class EvaluationOutcome(IntEnum):
     """The only operator-visible outcome labels for a formal rollout."""
 
@@ -80,6 +83,7 @@ class PolicyEvaluationConfig:
 
 
 __all__ = [
+    "EVALUATION_MAX_FRAMES_STOP_REASON",
     "EvaluationOutcome",
     "PolicyEvaluationConfig",
     "evaluation_outcome_stop_reason",

@@ -99,8 +99,13 @@ B + completed H
 - Recorder 必须在 RUNNING 之前确认，初始 causal sample 必须在第一条 policy command 之前入队。正常
   success/failure/invalid outcome 使用 `stop_episode(success=True)`；只有 recording integrity/storage
   失败或尚无真实 source evidence 的 aborted transaction 才 discard。FINALIZING 时拒绝新 B。初始 sample
-  之后，per-command evidence 在 command 提交后采集；evidence/recording 失败只把 trial 判为 INVALID，
-  不撤销已提交的 command，也不触发全局 FAULT；`max_frames` 记为 `eval:invalid:max_frames`。
+  之后，per-command evidence 在 command 提交后采集；evidence 失败按类型归属——arm/hand 控制级故障仍走
+  `_fault`，camera/FK 等 evaluation-only 证据失败只把 trial 判为 INVALID，并等待已发布 command 被
+  arm+hand 接受后才 fence（acceptance-fenced），不触发全局 FAULT。INVALID 的 stop_reason 按证据域由
+  typed enum 派生（`eval:invalid:camera_evidence` / `eval:invalid:state_assembly` /
+  `eval:invalid:evidence_unavailable`），不解析 reason 字符串。initial sample 超时记为
+  `eval:invalid:initial_evidence_timeout`；`max_frames` 由 RecorderIO 在 owner 边界以
+  `eval:invalid:max_frames` 持久化。
 - `tests/test_policy_rollout.py` 用 fake/shared-memory boundary 覆盖 Policy 公开契约、timestamp 调度、
   IK/SAFETY 归属、reject-only arm 与 control-first formal-eval/recorder 语义（含 max_frames→INVALID
   与 eval-invalid 不触发全局 FAULT）；不启动任何 worker 或设备。

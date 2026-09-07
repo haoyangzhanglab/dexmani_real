@@ -67,6 +67,7 @@ class RecorderIOConfig:
     poll_hz: float = 128.0
     writer_queue_size: int = 8
     provenance: Mapping[str, str] = field(default_factory=dict)
+    max_frames_stop_reason: str = "max_frames"
 
     def __post_init__(self) -> None:
         if (
@@ -83,6 +84,13 @@ class RecorderIOConfig:
             raise TypeError(
                 "camera_calibration must be a preloaded CameraExtrinsics snapshot"
             )
+        if not self.max_frames_stop_reason.strip():
+            raise ValueError("max_frames_stop_reason must be non-empty")
+        bounded_control_text(
+            self.max_frames_stop_reason,
+            capacity=RECORD_STOP_REASON_BYTES,
+            field="max_frames_stop_reason",
+        )
         object.__setattr__(
             self,
             "provenance",
@@ -488,7 +496,7 @@ class _RecorderIOSession:
                     self._begin_finalization(
                         generation=self.active_generation,
                         save=True,
-                        reason="max_frames",
+                        reason=self.config.max_frames_stop_reason,
                     )
             except Exception as exc:
                 logger.error("RecorderIO sample write failed", exc_info=True)

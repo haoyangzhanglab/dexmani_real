@@ -36,7 +36,10 @@ from dexmani_real.deployment.config import (
     validate_max_running_s,
     validate_policy_runtime_compatibility,
 )
-from dexmani_real.deployment.evaluation import PolicyEvaluationConfig
+from dexmani_real.deployment.evaluation import (
+    EVALUATION_MAX_FRAMES_STOP_REASON,
+    PolicyEvaluationConfig,
+)
 from dexmani_real.deployment.executor import policy_executor_loop
 from dexmani_real.deployment.inference.worker import inference_loop
 from dexmani_real.deployment.operator import build_home_planner, run_operator_control
@@ -106,6 +109,7 @@ def _evaluation_recorder_config(
         min_frames=1,
         writer_queue_size=int(runtime.camera.writer_queue_size),
         provenance=evaluation.provenance,
+        max_frames_stop_reason=EVALUATION_MAX_FRAMES_STOP_REASON,
     )
 
 
