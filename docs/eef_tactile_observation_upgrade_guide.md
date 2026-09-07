@@ -1,8 +1,16 @@
 # EEF + Full Tactile Observation Upgrade Guide
 
-> 面向 Claude Code 的实现指南。本文只指导 `dexmani_real` 修改，不修改 `dexmani_policy`。
+> Status: IMPLEMENTED in `4056e13631478a37a4477a018f4f94f220a527dd`.
+> Original design baseline: `064a6fb1d5ab263e4d82e01197c8253fe258cf0f`.
 >
-> 本方案已按 `main@064a6fb1d5ab263e4d82e01197c8253fe258cf0f` 核查。开始编码前必须重新确认 `main` 是否前进；若相关文件发生变化，先重新追踪 source-of-truth 再改代码。
+> 本文是已实施升级的 historical implementation plan，保留原设计步骤供审计，
+> 不是待执行任务或 current schema reference。当前合同以源码和
+> [`data_schema.md`](data_schema.md) 为准；本升级未修改 `dexmani_policy`。
+>
+> 后续 targeted repair 收敛了 canonical anatomical order、部署 tactile semantic 校验、
+> 真正的 metadata-only SHM projection、单次 full tactile snapshot，以及从 policy-visible
+> float32 joint_state 派生 EEF/fingertips 和 canonical rot6d 验证。raw v24、processed v14、
+> Policy Zarr v7 与既有 v14 required attrs 保持不变。
 
 ## 0. 开始前必须遵守
 
@@ -60,9 +68,9 @@ tactile_force  [T, 5, 120, 3]  = XHand SDK raw_force fx/fy/fz
 
 ---
 
-# 2. 当前源码事实
+# 2. Pre-upgrade 源码事实（原设计基线）
 
-以下是实现必须尊重的 source facts。
+本节描述原设计基线，不代表当前尚未实现的功能。
 
 ## 2.1 Raw v24 已经包含全部源信息
 
@@ -145,9 +153,9 @@ contact_force 与 tactile_force 来自同一次 sensor sample
 contact_force == sum(tactile_force)
 ```
 
-## 2.4 Current processed HDF5 仍是 v13
+## 2.4 Pre-upgrade baseline was processed HDF5 v13
 
-当前 core：
+Current implementation is processed HDF5 v14。升级前 core：
 
 ```text
 joint_state       [19]
@@ -157,16 +165,16 @@ contact_force     [5,3]
 fingertip_points  [5,3]
 ```
 
-当前缺失：
+升级前缺失（现已实现）：
 
 ```text
 eef_pose
 tactile_force
 ```
 
-## 2.5 Current deployment 尚不支持这两个 field
+## 2.5 Pre-upgrade deployment 尚不支持这两个 field
 
-当前 `deployment/config.py` 与 `deployment/inference/observation.py` 只接受：
+升级前 `deployment/config.py` 与 `deployment/inference/observation.py` 只接受：
 
 ```text
 joint_state
@@ -309,7 +317,8 @@ point order  = XHand SDK sensor_data[i].raw_force order
 axis labels  = fx, fy, fz
 ```
 
-不要声明 anatomical finger order、taxel adjacency 或 physical XYZ，除非以后有独立 vendor/calibration source-of-truth。
+已核实 anatomical finger order 为 thumb、index、middle、ring、pinky，见
+`robot/model.py` 的 canonical sensor ID 映射。taxel adjacency 与 physical XYZ 仍未验证。
 
 ## 3.8 Policy Zarr v7 必须保持完全兼容
 
@@ -450,7 +459,9 @@ tactile_force_hand_source_match_required
     = True
 ```
 
-不要新增 `finger_order=thumb_...` 之类未经 XHand sensor-list contract 独立证明的字段。
+`xhand_sdk_sensor_data_order` 已唯一解析为 thumb、index、middle、ring、pinky。
+无需给已有 processed v14 增加 required finger-order attr；部署 PolicySpec 则显式校验
+`finger_order=thumb_index_mid_ring_pinky`，保留已序列化的 `mid` 拼写。
 
 ---
 
@@ -848,7 +859,7 @@ algorithm_id = xarm7_custom_eef_pinocchio_fk_v1
 在 `_to_policy_observation()`：
 
 ```text
-aligned observation.arm_history.values
+policy-visible joint_state(float32)[:, :7]
   -> shared compute_eef_pose_history_xarm_base
   -> float32 C-contiguous
   -> arrays["eef_pose"]
@@ -886,7 +897,10 @@ shared.hand_tactile_ring
 
 ## 12.2 Preserve contact-only performance
 
-当前 `contact_force` policy 只从 `hand_tactile_ring` 读取轻量 provenance，不复制 full tensor。这一点要保留。
+原方案误判了 contact-only 的复制成本：旧 `get_last_k()` 仍复制完整 structured record，
+包括 full tactile tensor。这是 pre-existing performance bug；后续 repair 使用
+`get_last_k_fields()` 直接从 live record 只复制 source/fresh/calibrated/unit metadata，
+并在复制前后验证同一 seqlock marker。
 
 增加独立：
 
@@ -923,11 +937,14 @@ age <= max_age
 
 ```text
 hand_tactile_sum_history.source_monotonic_ns
-== hand_tactile_provenance_history.source_monotonic_ns
 == hand_tactile_force_history.source_monotonic_ns
 ```
 
 否则 observation fail closed (`return None`)。
+
+请求 full tactile 时，一次 full history snapshot 同时提供 payload 和 provenance proof，
+不额外读取 metadata，`hand_tactile_provenance_history=None`。仅 contact-only 使用 metadata
+projection，并对齐后比较 sum/provenance source identity。
 
 ## 12.4 `ObservationBatch`
 

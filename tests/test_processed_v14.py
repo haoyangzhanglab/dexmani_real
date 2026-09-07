@@ -32,6 +32,7 @@ from dexmani_real.dataset.processed import (
 )
 from dexmani_real.dataset.processing import (
     _gather_dataset_rows,
+    _processed_joint_state,
     _write_processed_episode,
 )
 from dexmani_real.config.defaults import hand as hand_defaults
@@ -164,6 +165,34 @@ def _process_fixture(
     _write_processed_episode(reader, decision, out_root, config, annotation)
     out_path = out_root / f"{raw_path.name}.h5"
     return out_path, reader, decision, config
+
+
+class TestVisualProfileEef(unittest.TestCase):
+    def test_rgb_geometry_uses_policy_observation_state(self):
+        arm_raw = np.zeros((4, 7), dtype=np.float64)
+        arm_policy = np.random.default_rng(43).uniform(-0.4, 0.4, (4, 7))
+        hand_policy = np.full((4, 12), 0.123456789, dtype=np.float64)
+        raw_arm_ee = compute_eef_pose_history_xarm_base(arm_raw)
+        selected = np.asarray([0, 2, 3])
+        with tempfile.TemporaryDirectory() as directory:
+            with h5py.File(Path(directory) / "visual.h5", "w") as raw:
+                raw["arm_qpos"] = arm_raw
+                raw["hand_qpos"] = np.zeros((4, 12))
+                raw["arm_ee"] = raw_arm_ee
+                raw["policy_observation_arm_qpos"] = arm_policy
+                raw["policy_observation_hand_qpos"] = hand_policy
+                joint = _processed_joint_state(
+                    SimpleNamespace(h5f=raw), selected,
+                    ProcessingConfig(profile=OutputProfile.RGB),
+                )
+                processed_eef = compute_eef_pose_history_xarm_base(joint[:, :7]).astype(np.float32)
+                expected_eef = compute_eef_pose_history_xarm_base(
+                    arm_policy[selected].astype(np.float32)
+                ).astype(np.float32)
+                np.testing.assert_array_equal(joint[:, :7], arm_policy[selected].astype(np.float32))
+                np.testing.assert_array_equal(joint[:, 7:19], hand_policy[selected].astype(np.float32))
+                np.testing.assert_array_equal(processed_eef, expected_eef)
+                self.assertFalse(np.allclose(processed_eef, raw["arm_ee"][selected]))
 
 
 class TestGatherDatasetRows(unittest.TestCase):

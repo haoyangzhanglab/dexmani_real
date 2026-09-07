@@ -45,6 +45,7 @@ from dexmani_real.dataset.processed import (
     PROCESSED_SCHEMA_VERSION,
 )
 from dexmani_real.ipc.schema import POINT_CLOUD_FEATURE_DIM, validate_point_cloud_array
+from dexmani_real.robot.model import HAND_FINGER_NAMES
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
@@ -64,7 +65,6 @@ _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
     (220, 60, 255),  # pinky  — magenta
 )
 
-_FINGER_NAMES: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
 
 # Fixed, easily distinguishable from the five finger colors.
 _EEF_COLOR = (255, 255, 255)
@@ -115,7 +115,7 @@ def _series_labels(key: str, dim: int) -> list[str]:
     if key == "eef_pose" and dim == 9:
         return ["ee_x", "ee_y", "ee_z"] + [f"ee_r{i}" for i in range(6)]
     if key == "contact_force_mag" and dim == 5:
-        return list(_FINGER_NAMES)
+        return list(HAND_FINGER_NAMES)
     return [str(i) for i in range(dim)]
 
 

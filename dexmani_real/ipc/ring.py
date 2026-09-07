@@ -337,6 +337,47 @@ class SharedMemoryRingBuffer:
             self._warn_torn_read_k(k, len(frames))
         return frames
 
+    def get_last_k_fields(
+        self, k: int, fields: tuple[str, ...]
+    ) -> list[tuple[dict[str, np.ndarray | np.generic], int, int]]:
+        """Copy only requested structured fields, with get_last_k history semantics."""
+        if not fields or len(set(fields)) != len(fields):
+            raise ValueError("fields must be non-empty and unique")
+        if any(name not in (self.dtype.names or ()) for name in fields):
+            raise ValueError("requested field is absent from ring dtype")
+        if k <= 0:
+            return []
+        if k > self.maxlen:
+            raise ValueError(f"k ({k}) exceeds ring capacity maxlen ({self.maxlen})")
+        latest_seq = int(self._write_seq[0])
+        frames: list[tuple[dict[str, np.ndarray | np.generic], int, int]] = []
+        dropped = False
+        for target_seq in range(latest_seq - min(k, latest_seq) + 1, latest_seq + 1):
+            slot = self._data_buf[target_seq % self.maxlen]
+            seqlock = SeqlockSlot(
+                self._shm.buf,
+                self._HEADER_SIZE + (target_seq % self.maxlen) * self._slot_size,
+            )
+            accepted = False
+            for _attempt in range(2):
+                marker_before = seqlock.marker
+                if not seqlock_is_complete(marker_before):
+                    continue
+                if seqlock_to_logical(marker_before) != target_seq:
+                    break
+                timestamp_ns = seqlock.timestamp_ns
+                record = slot["data"]
+                projected = {name: record[name].copy() for name in fields}
+                if seqlock.verify(marker_before):
+                    frames.append((projected, timestamp_ns, target_seq))
+                    accepted = True
+                    break
+            if not accepted:
+                dropped = True
+        if dropped:
+            self._warn_torn_read_k(k, len(frames))
+        return frames
+
     @property
     def latest_sequence(self) -> int:
         return int(self._write_seq[0])

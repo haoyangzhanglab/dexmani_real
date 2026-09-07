@@ -33,7 +33,7 @@ from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
 )
-from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
+from dexmani_real.robot.model import HAND_FINGER_ORDER_ID, XHAND_RIGHT_URDF_PATH
 
 FIXED_POLICY_RUNTIME_TARGET = (
     "dexmani_real.deployment.inference.dexmani_policy:DexManiPolicyAdapter"
@@ -118,13 +118,14 @@ def _validate_field_semantics(
     field: Any,
     *,
     field_name: str,
-    expected: Mapping[str, str],
+    expected: Mapping[str, object],
 ) -> None:
     semantics = getattr(field, "semantics", None)
     if not isinstance(semantics, Mapping):
         raise ValueError(f"{field_name} semantics mismatch")
     for key, value in expected.items():
-        if semantics.get(key) != value:
+        actual = semantics.get(key)
+        if actual != value or (isinstance(value, bool) and type(actual) is not bool):
             raise ValueError(f"{field_name} {key} mismatch")
 
 
@@ -153,9 +154,22 @@ def _expected_fingertip_semantics(runtime: Any) -> dict[str, str]:
         "representation": "point_xyz",
         "frame": "xarm_base",
         "units": "m",
-        "finger_order": "thumb_index_mid_ring_pinky",
+        "finger_order": HAND_FINGER_ORDER_ID,
         "derivation": FINGERTIP_POINTS_DERIVATION,
         "policy_id": FINGERTIP_POLICY_ID,
+    }
+
+
+def _expected_tactile_force_semantics() -> dict[str, object]:
+    return {
+        "representation": "xhand_sdk_raw_force_fx_fy_fz",
+        "finger_order": HAND_FINGER_ORDER_ID,
+        "sensor_order": "xhand_sdk_sensor_data_order",
+        "point_order": "xhand_sdk_sensor_data_raw_force_order",
+        "axis_labels": "fx_fy_fz",
+        "unit": "sdk_scaled_unknown_si",
+        "si_verified": False,
+        "spatial_geometry_verified": False,
     }
 
 
@@ -196,6 +210,13 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
     ):
         raise ValueError("Policy control_dt_s does not match Real policy.control_hz")
     fields_by_name = {field.name: field for field in fields}
+    tactile_force = fields_by_name.get("tactile_force")
+    if tactile_force is not None:
+        _validate_field_semantics(
+            tactile_force,
+            field_name="tactile_force",
+            expected=_expected_tactile_force_semantics(),
+        )
     point_cloud = fields_by_name.get("point_cloud")
     if (
         point_cloud is not None

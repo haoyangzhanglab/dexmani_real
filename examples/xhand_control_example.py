@@ -24,7 +24,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from dexmani_real.config.defaults import hand as hand_defaults
-from dexmani_real.robot.model import HAND_DOF
+from dexmani_real.robot.model import (
+    HAND_DOF,
+    XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID,
+)
 
 _HOME_QPOS_DEG = hand_defaults.home_qpos_deg
 _COMMAND_QPOS_MIN_RAD = hand_defaults.qpos_min_rad
@@ -56,8 +59,6 @@ _RS485_SENSOR_VERIFY_RETRY_COUNT = 2
 _RS485_CRC_RETRY_BACKOFF_S = 0.08
 _HARDWARE_WORKER_ARG = "--_xhand-hardware-worker"
 
-_FINGERTIP_IDS = frozenset({2, 5, 7, 9, 11})
-_FINGERTIP_TO_SENSOR_IDX = {2: 0, 5: 1, 7: 2, 9: 3, 11: 4}
 
 
 def _validate_qpos_deg(values: tuple[float, ...] | list[float], *, label: str) -> None:
@@ -368,9 +369,9 @@ class XHandControlExample:
             f"  comm_err={f.commboard_err}  joint_err={f.jonitboard_err}  tip_err={f.tipboard_err}"
         )
 
-        if f.id in _FINGERTIP_IDS:
+        if f.id in XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID:
             try:
-                sensor = state.sensor_data[_FINGERTIP_TO_SENSOR_IDX[f.id]]
+                sensor = state.sensor_data[XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID[f.id]]
                 if combined_force_valid:
                     calc = sensor.calc_force
                     print(
@@ -446,7 +447,7 @@ class XHandControlExample:
 
         try:
             finger = state.finger_state[finger_id]
-            sensor_index = _FINGERTIP_TO_SENSOR_IDX[int(finger.id)]
+            sensor_index = XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID[int(finger.id)]
             sensor = state.sensor_data[sensor_index]
             calc_values = tuple(
                 float(value)

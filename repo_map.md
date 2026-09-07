@@ -64,6 +64,11 @@ causal observation history
   canonical `control_action`，不在 deployment/sim runner 追加 overlap blending。
 - inference worker 只负责 observation、策略调用和 prediction 发布；PolicyExecutor 独占动作
   horizon 解码、control-grid 调度、EE→IK、候选校验和 command-progress watchdog。
+- `robot/model.py` 统一 anatomical finger、SDK tactile sensor ID 和 fingertip link 顺序；
+  `tests/test_hand_finger_order.py` 固定其映射。部署 EEF/fingertips 从 policy-visible float32
+  joint_state 派生；tactile full snapshot 同时提供 provenance，contact-only 使用
+  `ipc/ring.py::get_last_k_fields()` 投影 metadata。`tests/test_ring_projection.py` 使用真实
+  SHM 验证投影、副本所有权与 seqlock rejection，不启动硬件。
 - 正常策略 tick 的路径是 `validate → publish → continue`；`execute=False` 完成同样的候选
   校验但不产生 actuator side effect。需要确认 SDK 接受的 home、calibration 和 replay 操作，
   才显式调用 blocking acceptance。

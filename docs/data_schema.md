@@ -363,9 +363,18 @@ processed v14 输入。存在无效行或时序缺口的文件整条拒绝；其
 - `camera_intrinsic` 是 9 值展平矩阵；使用要求 `(...,3,3)` 的视觉组件前必须显式 reshape。
 - 读取 depth 时必须应用 `depth_scale_m_per_unit`；不要假定所有设备的 Z16 单位相同。
 - `contact_force` 的 SI 单位仅在 `contact_force_si_verified=True` 时成立。
-- `tactile_force` 当前 `si_verified=False`、`spatial_geometry_verified=False`：只有 SDK
-  sensor/point 顺序与 fx/fy/fz 轴标签是可证明事实；不要假设解剖学手指顺序、taxel 邻接或
-  物理 XYZ，也不要假设它逐 taxel 求和等于 `contact_force`。
+- `fingertip_points`、`contact_force`、`tactile_force` 的每帧 first axis（history 的 axis 1）
+  一致为 **thumb, index, middle, ring, pinky**。这是 `xhand_sdk_sensor_data_order` 的
+  anatomical resolution：sensor indices `0..4` 对应 finger IDs `(2,5,7,9,11)`，canonical
+  定义位于 `robot/model.py`。已有 serialized identifier 保留 `thumb_index_mid_ring_pinky`。
+  processed v14 的既有 `tactile_force_sensor_order` 已表达该顺序，无需新增 required attr。
+- Real 部署对请求的 `tactile_force` 同时校验 shape/dtype 与 PolicySpec semantics：
+  `representation=xhand_sdk_raw_force_fx_fy_fz`、`finger_order=thumb_index_mid_ring_pinky`、
+  `sensor_order=xhand_sdk_sensor_data_order`、`point_order=xhand_sdk_sensor_data_raw_force_order`、
+  `axis_labels=fx_fy_fz`、`unit=sdk_scaled_unknown_si`，并严格要求两个 verification flags 为
+  boolean `False`。缺失或不匹配直接拒绝。
+- `tactile_force` 当前 `si_verified=False`、`spatial_geometry_verified=False`：不要假设
+  SI Newton、120-point spatial XYZ、taxel 邻接，也不要假设逐 taxel 求和等于 `contact_force`。
 - `eef_pose` 与 `tactile_force` 只存在于 processed v14 与 Real 部署能力中；Policy Zarr v7
   不包含它们，训练 loader 不应在 v7 store 里寻找这两个 key。
 - 训练 Zarr 前应保留其对应 processed HDF5；Zarr 是训练传输格式，不是完整审计归档。

@@ -11,6 +11,30 @@ from dexmani_real import ASSET_DIR
 ARM_DOF = 7
 HAND_DOF = 12
 HAND_FINGER_COUNT = 5
+HAND_FINGER_NAMES: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
+HAND_FINGER_ORDER_ID = "thumb_index_mid_ring_pinky"
+XHAND_TACTILE_SENSOR_FINGER_IDS: tuple[int, ...] = (2, 5, 7, 9, 11)
+XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID = {
+    finger_id: index
+    for index, finger_id in enumerate(XHAND_TACTILE_SENSOR_FINGER_IDS)
+}
+XHAND_FINGERTIP_LINK_NAMES: tuple[str, ...] = (
+    "right_hand_thumb_rota_tip",
+    "right_hand_index_rota_tip",
+    "right_hand_mid_tip",
+    "right_hand_ring_tip",
+    "right_hand_pinky_tip",
+)
+if (
+    len(HAND_FINGER_NAMES) != HAND_FINGER_COUNT
+    or HAND_FINGER_COUNT != 5
+    or len(XHAND_TACTILE_SENSOR_FINGER_IDS) != HAND_FINGER_COUNT
+    or len(set(XHAND_TACTILE_SENSOR_FINGER_IDS)) != HAND_FINGER_COUNT
+    or set(XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID.values())
+    != set(range(HAND_FINGER_COUNT))
+    or len(XHAND_FINGERTIP_LINK_NAMES) != HAND_FINGER_COUNT
+):
+    raise RuntimeError("XHand finger and tactile sensor orders must match five fingers")
 TACTILE_POINTS_PER_FINGER = 120
 TACTILE_AXIS_COUNT = 3
 

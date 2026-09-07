@@ -13,7 +13,7 @@ from types import MappingProxyType
 import numpy as np
 
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.robot.model import ARM_JOINT_SHAPE
+from dexmani_real.robot.model import ARM_JOINT_SHAPE, XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.utils.limits import validate_hand_limit_nesting
 
 _HEARTBEAT_SUBSYSTEMS = frozenset(
@@ -506,13 +506,7 @@ class HandParams:
     # Homing waits for command acceptance, not measured joint convergence.
     home_command_ack_timeout_s: float = 1.0
 
-    fingertip_link_names: tuple[str, ...] = (
-        "right_hand_thumb_rota_tip",
-        "right_hand_index_rota_tip",
-        "right_hand_mid_tip",
-        "right_hand_ring_tip",
-        "right_hand_pinky_tip",
-    )
+    fingertip_link_names: tuple[str, ...] = XHAND_FINGERTIP_LINK_NAMES
     T_eef_handbase_pos_xyz: tuple[float, float, float] = (-0.015, 0.0, 0.0)
     T_eef_handbase_quat_wxyz: tuple[float, float, float, float] = (
         0.707107,

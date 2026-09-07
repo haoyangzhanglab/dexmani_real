@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import types
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 import numpy as np
@@ -21,6 +22,7 @@ import dexmani_real.deployment.inference.observation as observation_mod
 from dexmani_real.config.defaults import PolicyParams
 from dexmani_real.deployment.config import (
     _SUPPORTED_OBSERVATION_FIELDS,
+    _expected_tactile_force_semantics,
     validate_policy_runtime_compatibility,
 )
 from dexmani_real.deployment.inference.observation import (
@@ -41,7 +43,10 @@ from dexmani_real.ipc.schema import (
 from dexmani_real.planning.kinematics.arm_fk import (
     EEF_POSE_ALGORITHM_ID,
     EEF_POSE_DERIVATION,
+    compute_eef_pose_history_xarm_base,
+    make_arm_fk,
 )
+from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 
 _T0_NS = 10**15
 _DT_NS = 62_500_000  # 16 Hz control grid
@@ -90,6 +95,12 @@ class _FakeRing:
 
     def get_last_k(self, k: int):
         return self._records[-int(k):]
+
+    def get_last_k_fields(self, k: int, fields: tuple[str, ...]):
+        return [
+            ({name: data[0][name].copy() for name in fields}, timestamp, sequence)
+            for data, timestamp, sequence in self._records[-int(k):]
+        ]
 
 
 def _arm_record(tick: int, qpos: np.ndarray) -> tuple[np.ndarray, int, int]:
@@ -211,6 +222,7 @@ class TestFieldGates(unittest.TestCase):
             "eef_pose": np.zeros((_HORIZON, 9), dtype=np.float32),
             "tactile_force": np.zeros((_HORIZON, 5, 120, 3), dtype=np.float32),
         }
+        arrays["eef_pose"][:, 3:] = [1, 0, 0, 0, 1, 0]
         observation = PolicyObservation(
             observation_id=1,
             run_generation=0,
@@ -222,6 +234,12 @@ class TestFieldGates(unittest.TestCase):
         self.assertEqual(
             tuple(observation.arrays), ("joint_state", "eef_pose", "tactile_force")
         )
+        for rotation in ([0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 1, 0],
+                         [1, 0, 0, 1, 0, 0]):
+            with self.subTest(rotation=rotation):
+                arrays["eef_pose"][:, 3:] = rotation
+                with self.assertRaises(ValueError):
+                    replace(observation, arrays=arrays)
 
     def test_policy_observation_rejects_wrong_tail_and_dtype(self) -> None:
         base = {
@@ -278,10 +296,21 @@ class TestBuildObservation(unittest.TestCase):
 
     def test_contact_only_does_not_copy_full_tactile(self) -> None:
         spec = _fake_policy_spec(_Field("contact_force", (5, 3), "float32"))
+        shared = _fake_shared()
+        ring = shared.hand_tactile_ring
         with mock.patch.object(
             observation_mod, "_read_tactile_force_history"
-        ) as force_reader:
-            observation = _build(_fake_shared(), spec)
+        ) as force_reader, mock.patch.object(
+            ring, "get_last_k", wraps=ring.get_last_k
+        ) as full, mock.patch.object(
+            ring, "get_last_k_fields", wraps=ring.get_last_k_fields
+        ) as projected:
+            observation = _build(shared, spec)
+        full.assert_not_called()
+        projected.assert_called_once_with(
+            ring.maxlen,
+            fields=("source_monotonic_ns", "fresh", "calibrated", "unit_code"),
+        )
         force_reader.assert_not_called()
         self.assertIsNotNone(observation)
         self.assertIsNotNone(observation.hand_tactile_sum_history)
@@ -301,12 +330,40 @@ class TestBuildObservation(unittest.TestCase):
             force_history.source_monotonic_ns,
             observation.hand_tactile_sum_history.source_monotonic_ns,
         )
-        np.testing.assert_array_equal(
-            force_history.source_monotonic_ns,
-            observation.hand_tactile_provenance_history.source_monotonic_ns,
-        )
+        self.assertIsNone(observation.hand_tactile_provenance_history)
         for index, tick in enumerate(_REF_TICKS):
             self.assertTrue(np.all(force_history.values[index] == float(tick)))
+
+    def test_full_tactile_snapshot_once_with_or_without_contact(self):
+        for contact_requested in (False, True):
+            with self.subTest(contact=contact_requested):
+                fields = [_Field("tactile_force", (5, 120, 3), "float32")]
+                if contact_requested:
+                    fields.append(_Field("contact_force", (5, 3), "float32"))
+                spec = _fake_policy_spec(*fields)
+                shared = _fake_shared()
+                ring = shared.hand_tactile_ring
+                with mock.patch.object(
+                    ring, "get_last_k", wraps=ring.get_last_k
+                ) as full, mock.patch.object(
+                    ring, "get_last_k_fields", wraps=ring.get_last_k_fields
+                ) as projected, mock.patch.object(
+                    observation_mod, "_read_tactile_provenance_history"
+                ) as provenance:
+                    observation = _build(shared, spec)
+                self.assertIsNotNone(observation)
+                full.assert_called_once_with(ring.maxlen)
+                projected.assert_not_called()
+                provenance.assert_not_called()
+                self.assertIsNone(observation.hand_tactile_provenance_history)
+                self.assertIn("tactile_force", _to_policy_observation(observation, spec).arrays)
+
+    def test_contact_only_source_mismatch_fails_closed(self):
+        shared = _fake_shared()
+        for data, _, _ in shared.hand_tactile_ring._records:
+            data["source_monotonic_ns"] -= 1
+        spec = _fake_policy_spec(_Field("contact_force", (5, 3), "float32"))
+        self.assertIsNone(_build(shared, spec))
 
     def test_contact_and_force_source_identity_is_enforced(self) -> None:
         spec = _fake_policy_spec(
@@ -389,6 +446,43 @@ class TestBuildObservation(unittest.TestCase):
 
 
 class TestToPolicyObservation(unittest.TestCase):
+    def test_geometry_uses_policy_visible_float32_joints(self):
+        spec = _fake_policy_spec(
+            _Field("eef_pose", (9,), "float32"),
+            _Field("fingertip_points", (5, 3), "float32"),
+        )
+        arm64 = np.random.default_rng(29).uniform(-0.5, 0.5, (6, 7))
+        self.assertFalse(np.array_equal(arm64, arm64.astype(np.float32).astype(np.float64)))
+        observation = _build(_fake_shared(arm_qpos=arm64), spec)
+        arm_fk = mock.Mock(wraps=make_arm_fk())
+        hand_fk = mock.Mock(wraps=_FakeHandFK())
+        with mock.patch.object(
+            observation_mod, "compute_fingertip_history_xarm_base",
+            wraps=compute_fingertip_history_xarm_base,
+        ) as fingertips:
+            result = _to_policy_observation(
+                observation, spec,
+                fingertip_runtime=(arm_fk, hand_fk, _fake_fingertip_config()),
+            )
+        joint = result.arrays["joint_state"]
+        expected_eef = compute_eef_pose_history_xarm_base(joint[:, :7])
+        np.testing.assert_array_equal(result.arrays["eef_pose"], expected_eef.astype(np.float32))
+        original_eef = compute_eef_pose_history_xarm_base(observation.arm_history.values)
+        self.assertFalse(np.array_equal(original_eef.astype(np.float32), result.arrays["eef_pose"]))
+        self.assertEqual(arm_fk.compute.call_count, _HORIZON)
+        for index, call in enumerate(arm_fk.compute.call_args_list):
+            np.testing.assert_array_equal(call.args[0], joint[index, :7])
+        for index, call in enumerate(hand_fk.compute_tip_positions_in_handbase.call_args_list):
+            np.testing.assert_array_equal(call.args[0], joint[index, 7:19])
+        np.testing.assert_array_equal(fingertips.call_args.kwargs["eef_pose_history"], expected_eef)
+        expected_tips = compute_fingertip_history_xarm_base(
+            joint[:, :7], joint[:, 7:19], hand_fk=_FakeHandFK(),
+            handbase_position_eef_m=np.asarray(_MOUNT_P),
+            handbase_quat_eef_wxyz=np.asarray(_MOUNT_Q),
+            eef_pose_history=expected_eef,
+        )
+        np.testing.assert_array_equal(result.arrays["fingertip_points"], expected_tips)
+
     def _observation(self, spec) -> ObservationBatch:
         observation = _build(_fake_shared(arm_qpos=_distinct_arm_qpos()), spec)
         self.assertIsNotNone(observation)
@@ -503,9 +597,40 @@ class TestRuntimeCompatibility(unittest.TestCase):
                     "algorithm_id": EEF_POSE_ALGORITHM_ID,
                 },
             ),
-            _Field("tactile_force", (5, 120, 3), "float32"),
+            _Field("tactile_force", (5, 120, 3), "float32",
+                   semantics=_expected_tactile_force_semantics()),
         )
         validate_policy_runtime_compatibility(spec, self._runtime())
+
+    def test_tactile_semantic_contract(self) -> None:
+        expected = {
+            "representation": "xhand_sdk_raw_force_fx_fy_fz",
+            "finger_order": "thumb_index_mid_ring_pinky",
+            "sensor_order": "xhand_sdk_sensor_data_order",
+            "point_order": "xhand_sdk_sensor_data_raw_force_order",
+            "axis_labels": "fx_fy_fz",
+            "unit": "sdk_scaled_unknown_si",
+            "si_verified": False,
+            "spatial_geometry_verified": False,
+        }
+        def validate(semantics):
+            spec = _fake_policy_spec(_Field(
+                "tactile_force", (5, 120, 3), "float32", semantics=semantics
+            ))
+            validate_policy_runtime_compatibility(spec, self._runtime())
+
+        validate(expected)
+        with self.assertRaises(ValueError):
+            validate({})
+        for key, value in expected.items():
+            for replacement in ([True, 0, "false"] if isinstance(value, bool)
+                                else ["wrong"]):
+                with self.subTest(key=key, replacement=replacement):
+                    with self.assertRaises(ValueError):
+                        validate({**expected, key: replacement})
+            with self.subTest(missing=key):
+                with self.assertRaises(ValueError):
+                    validate({name: item for name, item in expected.items() if name != key})
 
     def test_eef_pose_wrong_semantics_rejected(self) -> None:
         spec = _fake_policy_spec(
