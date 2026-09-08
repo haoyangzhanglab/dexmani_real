@@ -891,8 +891,9 @@ class PolicyExecutor:
         """Record a completed control decision, or an ordinary idle grid sample.
 
         Command rows are observed immediately so S/Q cannot lose an already
-        published command in a second event buffer. The recorder owns raw-grid
-        alignment; no source read here admits or rejects a robot command.
+        published command in a second event buffer. The controller emits the
+        recording sample; RecorderIO preserves that source row without creating
+        a second time grid. No source read here admits or rejects a robot command.
         """
         if self.recorder is None or self.run_started_ns is None:
             return

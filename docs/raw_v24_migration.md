@@ -21,6 +21,15 @@ are range-checked and converted losslessly from the v24 signed representation;
 other datasets are copied directly. Missing fields, including the authoritative
 `action_arm_joint_sent`, are errors. No action is reconstructed or invented.
 
+Converted v25 also retains existing transaction/quality metadata: `duration`,
+`fps`, `wall_fps`, `min_frames_met`, `success`, `truncated`, `stop_reason`,
+`has_camera`, `has_timestamps`, and `camera_stream_frames`. All `provenance_*`
+attributes are copied, alongside the existing task, timing, calibration and code
+metadata. Values are copied only when present; missing values are not synthesized.
+Runtime camera/action audit metadata is not restored. Previously converted
+episodes must be regenerated from original v24 into a new destination to receive
+these attributes; the converter never overwrites an existing destination.
+
 ## Regression baseline
 
 Before removing v24 runtime support, use the v24 implementation at `958fcf2`
@@ -74,3 +83,12 @@ rejections matched. Diagnostic drop-reason bits were intentionally excluded;
 their runtime-proof categories no longer exist. New local outputs are under
 `/tmp/dexmani_v25_golden_after_verified`, from `/tmp/dexmani_v25_converted`.
 Original v24 episodes were not changed or deleted.
+
+The targeted metadata/selector repair was verified by regenerating all 60 source
+episodes into `episodes/pick_place_toy_v25_repaired` (the previous v25 directory
+was not overwritten). All 2,460 retained raw arrays and 28,082 tactile selections
+matched; preserved metadata matched the original attributes. Rebuilding the two
+golden episodes in all three profiles under `/tmp/dexmani_v25_golden_repaired`
+produced 135 exactly matching processed/Zarr arrays against the pre-repair v25
+baseline, including selection provenance and segment boundaries. Zarr admission
+was unchanged. No hardware was exercised.

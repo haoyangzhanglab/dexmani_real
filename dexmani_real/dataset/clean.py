@@ -55,6 +55,8 @@ def select_tactile_rows_to_references(
 
     Payload finiteness is checked by the cleaner after selection. A malformed
     selected sample is rejected, not repaired with a different payload.
+    Coordinate-compressed prefix maxima keep selection O(N log N), even when
+    source timestamps are non-monotonic or repeated.
     """
     hand_source_ns = np.asarray(hand_source_monotonic_ns, dtype=np.int64)
     source_ns = np.asarray(tactile_source_monotonic_ns, dtype=np.int64)
@@ -86,18 +88,27 @@ def select_tactile_rows_to_references(
         & (hand_source_ns == source_ns)
     )
     selected = np.full(count, -1, dtype=np.int64)
+    coords = np.unique(source_ns[proven])
+    latest_row = np.full(len(coords), -1, dtype=np.int64)
+    # Each Fenwick node stores the largest active coordinate, not a row rank.
+    prefix_max = np.full(len(coords) + 1, -1, dtype=np.int64)
     for row, reference_ns in enumerate(references):
+        if proven[row]:
+            coordinate = int(np.searchsorted(coords, source_ns[row]))
+            latest_row[coordinate] = row
+            index = coordinate + 1
+            while index < len(prefix_max):
+                prefix_max[index] = max(prefix_max[index], coordinate)
+                index += index & -index
         if reference_ns <= 0:
             continue
-        candidates = np.flatnonzero(
-            proven[: row + 1]
-            & (source_ns[: row + 1] <= reference_ns)
-            & (reference_ns - source_ns[: row + 1] <= max_skew_ns)
-        )
-        if candidates.size:
-            # Latest source wins; repeated source samples use the latest row.
-            newest_source_ns = np.max(source_ns[candidates])
-            selected[row] = candidates[source_ns[candidates] == newest_source_ns][-1]
+        index = int(np.searchsorted(coords, reference_ns, side="right"))
+        coordinate = -1
+        while index > 0:
+            coordinate = max(coordinate, int(prefix_max[index]))
+            index -= index & -index
+        if coordinate >= 0 and reference_ns - coords[coordinate] <= max_skew_ns:
+            selected[row] = latest_row[coordinate]
     return selected
 
 

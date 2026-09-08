@@ -1306,14 +1306,16 @@ IK_FAIL -> existing short-transient-vs-long-run policy may remain, based only on
 HELD / SAFETY_REJECT / RETARGET_FAIL -> reject unless an existing explicit behavior is required
 ```
 
-Simplify `select_tactile_rows_to_references()`. The current Fenwick-tree implementation is unnecessary for a single-machine monotonic-clock research recorder. Use a simple prefix/causal latest-row scan. Preserve:
+Keep `select_tactile_rows_to_references()` exact and O(N log N); do not rescan each persisted prefix (O(N²)) or assume source timestamps are monotonic. A small coordinate-compressed Fenwick prefix-max can track the largest active source coordinate, with a separate latest-row array for duplicate timestamps. Activate only rows reached in persisted order, then query coordinates at or before the reference. Do not introduce occupancy/rank machinery. Preserve:
 
 ```text
 chosen tactile row <= current persisted row
+largest proven source timestamp; ties choose the latest persisted row
+source > 0 and hand_source == tactile_source
 source <= reference
 fresh
 calibrated
-unit_code expected
+unit_code == 0
 max skew
 ```
 

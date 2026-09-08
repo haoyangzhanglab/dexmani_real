@@ -121,6 +121,16 @@ class TestTactileSelectorProvenanceGates(unittest.TestCase):
 
 
 class TestTactileSelectorOrdering(unittest.TestCase):
+    def test_duplicate_source_uses_latest_proven_persisted_row(self) -> None:
+        selected = _select(
+            _provenance(
+                [300, 100, 300, 300],
+                references=[0, 350, 350, 350],
+                fresh=[True, True, True, False],
+            )
+        )
+        np.testing.assert_array_equal(selected, [-1, 0, 2, 2])
+
     def test_non_monotonic_source_timestamps(self) -> None:
         # Source clock steps backward at row 1.  Selection is timestamp-based:
         # the reference at row 1 (350) must select the newest proven source
@@ -177,6 +187,44 @@ class TestTactileSelectorInputValidation(unittest.TestCase):
         selected = _select(_provenance([100, 200, 300]))
         self.assertEqual(selected.dtype, np.int64)
         self.assertEqual(selected.shape, (3,))
+
+
+def test_randomized_small_arrays_match_prefix_scan():
+    rng = np.random.default_rng(20260908)
+    for count in range(65):
+        for _ in range(8):
+            # Small timestamp domain deliberately produces duplicates and reversals.
+            sources = rng.integers(-2, 13, size=count) * 1_000_000
+            hand_sources = sources + rng.choice([0, 0, 0, 1], size=count)
+            fresh = rng.random(count) < 0.8
+            calibrated = rng.random(count) < 0.8
+            units = rng.choice([0, 0, 0, 1, 3], size=count)
+            references = rng.integers(-2, 18, size=count) * 1_000_000
+            max_skew_ns = int(rng.integers(1, 8)) * 1_000_000
+            expected = np.full(count, -1, dtype=np.int64)
+            for row, reference in enumerate(references):
+                candidates = [
+                    (int(sources[candidate]), candidate)
+                    for candidate in range(row + 1)
+                    if fresh[candidate]
+                    and calibrated[candidate]
+                    and units[candidate] == 0
+                    and hand_sources[candidate] == sources[candidate]
+                    and 0 < sources[candidate] <= reference
+                    and reference - sources[candidate] <= max_skew_ns
+                ]
+                if candidates:
+                    expected[row] = max(candidates)[1]
+            actual = select_tactile_rows_to_references(
+                hand_sources,
+                sources,
+                fresh,
+                calibrated,
+                units,
+                references,
+                max_observation_skew_s=max_skew_ns / 1e9,
+            )
+            np.testing.assert_array_equal(actual, expected)
 
 
 if __name__ == "__main__":

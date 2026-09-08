@@ -65,6 +65,16 @@ UNSIGNED_DTYPES = {
 }
 KEEP_METADATA = (
     "num_frames",
+    "duration",
+    "fps",
+    "wall_fps",
+    "min_frames_met",
+    "success",
+    "truncated",
+    "stop_reason",
+    "has_camera",
+    "has_timestamps",
+    "camera_stream_frames",
     "control_hz",
     "task_label",
     "operator",
@@ -138,8 +148,8 @@ def convert_episode(source: Path, destination: Path) -> Path:
             h5py.File(staging / "data.h5", "w") as dst,
         ):
             meta = dst.create_group("meta")
-            for name in KEEP_METADATA:
-                if name in src["meta"].attrs:
+            for name in src["meta"].attrs:
+                if name in KEEP_METADATA or name.startswith("provenance_"):
                     meta.attrs[name] = src["meta"].attrs[name]
             meta.attrs["schema_version"] = 25
             meta.attrs["converted_from_schema"] = 24

@@ -140,6 +140,15 @@ class TestRawV24ToV25Conversion(unittest.TestCase):
             "operator": "fixture_operator",
             "control_hz": 20.0,
             "fps": 20.0,
+            "duration": 0.15,
+            "wall_fps": 15.0,
+            "min_frames_met": False,
+            "success": True,
+            "truncated": True,
+            "stop_reason": "fixture:operator_stop",
+            "has_camera": True,
+            "has_timestamps": True,
+            "camera_stream_frames": _FRAME_COUNT,
             "camera_name": "fixture_camera",
             "camera_serial": "SERIAL-001",
             "camera_type": "synthetic",
@@ -155,6 +164,7 @@ class TestRawV24ToV25Conversion(unittest.TestCase):
             "real_git_commit": "fixture-commit",
             "camera_health_taxonomy_json": "runtime-audit-only",
             "provenance_fixture": "compact-provenance",
+            "provenance_seed": np.int64(42),
         }
         with h5py.File(episode / "data.h5", "w") as data:
             meta = data.create_group("meta")
@@ -225,6 +235,26 @@ class TestRawV24ToV25Conversion(unittest.TestCase):
             self.assertEqual(int(after["meta"].attrs["num_frames"]), _FRAME_COUNT)
             self.assertEqual(after["meta"].attrs["task_label"], "fixture_task")
             self.assertEqual(after["meta"].attrs["operator"], "fixture_operator")
+            for name in (
+                "duration",
+                "fps",
+                "wall_fps",
+                "min_frames_met",
+                "success",
+                "truncated",
+                "stop_reason",
+                "has_camera",
+                "has_timestamps",
+                "camera_stream_frames",
+                "provenance_fixture",
+                "provenance_seed",
+            ):
+                np.testing.assert_array_equal(
+                    after["meta"].attrs[name], before["meta"].attrs[name]
+                )
+            self.assertNotIn("camera_health_taxonomy_json", after["meta"].attrs)
+            self.assertEqual(before["meta"].attrs["schema_version"], 24)
+            self.assertNotIn("converted_from_schema", before["meta"].attrs)
         self.assertEqual(
             (source / "rgb.mp4").read_bytes(), (destination / "rgb.mp4").read_bytes()
         )
@@ -247,6 +277,24 @@ class TestRawV24ToV25Conversion(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, missing_name):
                     self._convert(source, destination)
                 self.assertFalse(destination.exists())
+
+    def test_missing_optional_metadata_is_not_synthesized(self) -> None:
+        source = self._write_episode()
+        absent = (
+            "min_frames_met",
+            "success",
+            "truncated",
+            "stop_reason",
+            "provenance_fixture",
+            "provenance_seed",
+        )
+        with h5py.File(source / "data.h5", "a") as raw:
+            for name in absent:
+                del raw["meta"].attrs[name]
+        destination = self._convert(source, self.root / "converted")
+        with h5py.File(destination / "data.h5", "r") as raw:
+            for name in absent:
+                self.assertNotIn(name, raw["meta"].attrs)
 
     def test_unsigned_conversion_rejects_negative_and_overflow_without_wrapping(self) -> None:
         negative_name = "observation_anchor_monotonic_ns"
