@@ -194,6 +194,9 @@ VR / keyboard input
   `joint_state` FK 推导（每 timestep 一次 canonical Arm FK，两者共用），`contact_force` 与
   `tactile_force` 共用同一因果 tactile source row，并在处理时记录 derivation 与 policy identity。
 - `EpisodeReader` 只接受 raw v25 并检查必需文件、layout 和 sidecar 帧数；不重放 runtime proof、不完整解码 RGB。
+- `dataset/processing.py::process_episode_root` 独占 batch 准入与 publication transaction；
+  CLI 只调用一次 batch processing（compare 每 profile 一次 dry-run），task-name override
+  与用户 annotation 来源分开，报告在 staging 中完成。temporal detectors 仅审计。
 - processed writer 只在原子发布前重开并确认 HDF5 结构；`--verify-output` 才执行完整写后
   自检。processed consumer/export 边界仍严格验证 payload finite、shape/dtype、alignment 和
   semantic attrs。

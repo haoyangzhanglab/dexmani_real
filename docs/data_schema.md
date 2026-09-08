@@ -153,8 +153,7 @@ endpoint 约束。
 `processing_config_json.temporal_quality` 默认使用 `policy=audit`。其中
 `stall_window_frames=8` 表示每个 stall window 包含 8 个样本，端点为
 `start` 与 `start+7`（不是 8 个 index 的差值），且窗口不能跨越 source-contiguous segment；
-detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal findings，`strict` 只
-排除高置信的 reversible impulse、arm feedback stall 与 command-apply stall，`hard_only` 则
+detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal findings，`hard_only` 则
 关闭 temporal detectors。机械 action 硬边界仍独立执行 hard-invalid 判定。
 
 ### profile 与数据集集合

@@ -429,15 +429,18 @@ processed HDF5 v14，再运行 `python examples/visualize_episode_processed.py <
 物理回放始终以当前 geometry 和 runtime 完整验证 live start、joint limits、recorded
 start→first target、workspace、collision 及全部相邻 transition。
 
-发布时逐 episode 显示 tqdm 进度（stderr），终端只打印精简汇总，不再向 stdout 输出 JSON。
-发布成功后总会生成 `episodes_processed/<task>/process_log/invalid_frames_report.json`；
+处理入口对整个 batch 分析一次，终端打印精简汇总。
+发布前在 staging 中生成 `episodes_processed/<task>/process_log/invalid_frames_report.json`；
 它只列存在真正无效帧的 episode、半开行范围和原因，没有无效帧时 `episodes` 为空。
-需要每条 episode 的完整机器可读审计时加 `--write-report`，随后还会在
-`episodes_processed/<task>/process_log/episode_*.json` 为每个 episode 落一份（含 config、
-决策、输出与校验）。损坏或审计失败（硬无效帧过多、各 source 连续段均不足以
-形成完整训练窗口等）的
-episode 会自动跳过并打印 warning 与原因；`--annotations` 显式 `include: true` 的 episode
-不会被自动跳过，其失败会阻断整批。先对待导出的 processed HDF5 执行只读预检；它会检查
+未标注的损坏或不满足准入条件的 episode（硬无效帧过多、各 source 连续段均不足以
+形成完整训练窗口等）会自动跳过；`--annotations` 中 `include: false` 的 episode 显式跳过。
+用户 YAML 中存在 episode 条目时，省略 `include` 仍默认 `include: true`，其失败会阻断整批。
+`--task-name` 只覆盖 task 名称，并保留原有名称冲突校验，不会将未标注 episode 变为显式 include。
+直接调用 library 默认仍阻断未标注 rejected episode；需显式传入
+`skip_rejected_unannotated=True` 才采用 CLI 的跳过策略。temporal quality 只提供
+`audit` 与 `hard_only`，不再依据 temporal heuristic 删除 otherwise-valid rows。
+保留 `--dry-run`、`--compare-profiles` 和 `--verify-output`；不再支持 `--write-report`。
+先对待导出的 processed HDF5 执行只读预检；它会检查
 deployment data contract、跨文件一致性、完整 provenance、canonical action_ee/相机几何、
 点云 RGB/XYZ 与持久化 workspace 边界及浮点 payload 是否有限，但不会创建 Zarr。processed
 输入的来源与信任由调用方或可信处理流程负责；export preflight 只检查内部 provenance 与 payload：
@@ -486,8 +489,7 @@ episodes/<task>/episode_<timestamp>/
 episodes_processed/<task>/
 ├── episode_<timestamp>.h5
 └── process_log/
-    ├── invalid_frames_report.json  # always written
-    └── episode_<timestamp>.json    # only with --write-report
+    └── invalid_frames_report.json  # staged before publication
 
 datasets/<task>.zarr/
 ├── data/*
