@@ -36,14 +36,19 @@ from dexmani_real.planning.kinematics.pose import (
 )
 from dexmani_real.recording.client import RecorderClient
 from dexmani_real.runtime.safety import SafetyState
+from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.control_loop.action_proposal import (
     compute_arm_joint_proposal,
     compute_hand_joint_proposal,
     compute_target_eef_pose,
 )
 from dexmani_real.teleop.control_loop.camera_freshness import CameraFreshnessTracker
+from dexmani_real.teleop.control_loop.hand_control import (
+    HandRetargetObservationCache,
+    reset_hand_retargeter,
+)
+from dexmani_real.teleop.control_loop.timing import StageTimer
 from dexmani_real.teleop.control_loop.vr_mapping import VRWristMapper
-from dexmani_real.teleop.config import TeleopCommandLimits, TeleopConfig
 from dexmani_real.teleop.episode_samples import (
     FRAME_IK_FAIL,
     FRAME_OK,
@@ -53,19 +58,76 @@ from dexmani_real.teleop.episode_samples import (
     record_held,
     stop_recording,
 )
-from dexmani_real.teleop.control_loop.hand_control import (
-    HandRetargetObservationCache,
-    reset_hand_retargeter,
-)
-from dexmani_real.teleop.health import (
-    advance_arm_feedback_error_count,
-    arm_feedback_issue,
-    hand_feedback_issue,
-)
-from dexmani_real.teleop.control_loop.timing import StageTimer
+from dexmani_real.utils.feedback import validate_arm_feedback, validate_hand_feedback
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _TeleopCommandLimits:
+    """Resolved command bounds owned by the teleoperation control loop."""
+
+    arm_joint_lower_rad: np.ndarray
+    arm_joint_upper_rad: np.ndarray
+    teleop_arm_max_delta_rad_per_tick: np.ndarray | None
+    hand_home_qpos_rad: np.ndarray
+    hand_command_lower_rad: np.ndarray
+    hand_command_upper_rad: np.ndarray
+    # Teleop endpoint shaping bound. The hand worker independently reuses this
+    # value for SDK-level slew protection.
+    hand_max_delta_rad_per_tick: np.ndarray
+    workspace_bounds_world_m: np.ndarray
+
+    @classmethod
+    def from_config(cls, config: TeleopConfig) -> "_TeleopCommandLimits":
+        arm_lower = np.asarray(config.runtime.arm.joint_limit_lower, dtype=np.float64)
+        arm_upper = np.asarray(config.runtime.arm.joint_limit_upper, dtype=np.float64)
+        configured_delta = config.runtime.policy.teleop_arm_max_delta_rad_per_tick
+        max_delta = (
+            None
+            if configured_delta is None
+            else np.broadcast_to(
+                np.asarray(configured_delta, dtype=np.float64), arm_lower.shape
+            ).copy()
+        )
+        hand_lower = np.asarray(config.runtime.hand.qpos_min_rad, dtype=np.float64)
+        hand_max_delta = np.broadcast_to(
+            np.asarray(
+                config.runtime.hand.hand_max_delta_rad_per_tick,
+                dtype=np.float64,
+            ),
+            hand_lower.shape,
+        ).copy()
+        return cls(
+            arm_joint_lower_rad=arm_lower.copy(),
+            arm_joint_upper_rad=arm_upper.copy(),
+            teleop_arm_max_delta_rad_per_tick=max_delta,
+            hand_home_qpos_rad=np.deg2rad(
+                np.asarray(config.runtime.hand.home_qpos_deg, dtype=np.float64)
+            ),
+            hand_command_lower_rad=hand_lower.copy(),
+            hand_command_upper_rad=np.asarray(
+                config.runtime.hand.qpos_max_rad, dtype=np.float64
+            ).copy(),
+            hand_max_delta_rad_per_tick=hand_max_delta,
+            workspace_bounds_world_m=np.asarray(
+                config.runtime.policy.workspace.as_tuple(), dtype=np.float64
+            ).copy(),
+        )
+
+
+def _advance_arm_feedback_error_count(
+    current_count: int,
+    issue: str | None,
+    *,
+    max_consecutive_errors: int,
+) -> tuple[int, bool]:
+    """Reset on valid feedback; fault at the configured invalid-frame limit."""
+    if issue is None:
+        return 0, False
+    next_count = current_count + 1
+    return next_count, next_count >= max_consecutive_errors
 
 
 def _prepare_and_publish_joint_command(
@@ -109,7 +171,7 @@ class TeleopGridResources:
     planner: XArm7MotionPlanner
     safety_gate: SafetyGate
     recorder: RecorderClient | None
-    command_limits: TeleopCommandLimits
+    command_limits: _TeleopCommandLimits
     camera_freshness: CameraFreshnessTracker
     stage_timer: StageTimer
     validation_warn: ThrottledWarner
@@ -168,7 +230,7 @@ class TeleopController:
         planner: XArm7MotionPlanner,
         arm_mapper: VRWristMapper,
         config: TeleopConfig,
-        command_limits: TeleopCommandLimits,
+        command_limits: _TeleopCommandLimits,
         initial_arm_qpos_rad: np.ndarray,
         initial_hand_qpos_rad: np.ndarray,
         hand_retargeter: Any = None,
@@ -466,12 +528,20 @@ def _read_control_grid_observation(
     )
     arm_state = None if arm_result is None else arm_result[0]
     arm_ring_sequence = 0 if arm_result is None else int(arm_result[2])
-    arm_issue = arm_feedback_issue(
-        arm_state,
-        now_monotonic_ns=time.monotonic_ns(),
-        max_age_s=cfg.runtime.policy.arm_state_stale_threshold_s,
-    )
-    arm_feedback_error_count, arm_feedback_fault = advance_arm_feedback_error_count(
+    if arm_state is None:
+        arm_issue = "arm feedback unavailable"
+    else:
+        arm_issue = validate_arm_feedback(
+            connected=bool(arm_state["connected"][0]),
+            error_code=int(arm_state["error_code"][0]),
+            state_valid=bool(arm_state["state_valid"][0]),
+            source_monotonic_ns=int(arm_state["source_monotonic_ns"][0]),
+            now_monotonic_ns=time.monotonic_ns(),
+            max_age_s=cfg.runtime.policy.arm_state_stale_threshold_s,
+            qpos=np.asarray(arm_state["qpos"][0]),
+            qvel=np.asarray(arm_state["qvel"][0]),
+        )
+    arm_feedback_error_count, arm_feedback_fault = _advance_arm_feedback_error_count(
         arm_feedback_error_count,
         arm_issue,
         max_consecutive_errors=cfg.runtime.policy.max_consecutive_errors,
@@ -553,7 +623,19 @@ def _read_control_grid_observation(
         shared, anchor_monotonic_ns=_current_grid_anchor_ns
     )
 
-    hand_issue = hand_feedback_issue(cfg, hand_state)
+    if not cfg.runtime.policy.hand_enabled:
+        hand_issue = None
+    elif hand_state is None:
+        hand_issue = "hand feedback unavailable"
+    else:
+        hand_issue = validate_hand_feedback(
+            connected=bool(hand_state["connected"][0]),
+            state_valid=bool(hand_state["state_valid"][0]),
+            source_monotonic_ns=int(hand_state["source_monotonic_ns"][0]),
+            now_monotonic_ns=time.monotonic_ns(),
+            max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
+            qpos=np.asarray(hand_state["qpos"][0]),
+        )
     if cfg.runtime.policy.hand_enabled and hand_issue is not None:
         now_s = time.monotonic()
         if hand_disconnected_at_s is None:
