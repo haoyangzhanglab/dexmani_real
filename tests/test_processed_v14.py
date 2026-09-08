@@ -3,8 +3,7 @@
 No hardware.  A synthetic JOINT-profile raw fixture drives ``analyze_episode``
 and ``_write_processed_episode`` end to end, then the v14 validators pin keys,
 shapes, dtypes, semantic attrs, tactile provenance causality, and fail-closed
-behavior.  Historical admission is pinned by the missing-``action_arm_joint_sent``
-rejection.  Run with:
+behavior, SOURCE-only cleaning and camera/tactile admission. Run with:
 
     python -m unittest discover -s tests -p 'test_processed_v14.py'
 """
@@ -37,7 +36,7 @@ from dexmani_real.dataset.processing import (
 )
 from dexmani_real.config.defaults import hand as hand_defaults
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
-from dexmani_real.recording.timeline import FillReason
+from dexmani_real.recording.storage.schema import FillReason
 
 _FRAME_COUNT = 24
 _GRID_DT_S = 0.05
@@ -54,7 +53,6 @@ def _write_raw_fixture(
     *,
     frames: int = _FRAME_COUNT,
     stale_tactile_rows: tuple[int, ...] = (),
-    include_sent_arm_action: bool = True,
     seed: int = 17,
 ) -> dict[str, np.ndarray]:
     """Create a minimal JOINT-profile raw episode and return its arrays."""
@@ -65,8 +63,7 @@ def _write_raw_fixture(
     # Hand action limits have strictly positive minima on several joints; the
     # fixture sits at the action-limit midpoint, inside the mechanical range.
     hand_mid = 0.5 * (
-        np.asarray(hand_defaults.qpos_min_rad)
-        + np.asarray(hand_defaults.qpos_max_rad)
+        np.asarray(hand_defaults.qpos_min_rad) + np.asarray(hand_defaults.qpos_max_rad)
     )
     hand_qpos = np.tile(hand_mid, (frames, 1))
     action_arm = arm_qpos + 1e-4
@@ -76,7 +73,6 @@ def _write_raw_fixture(
     action_arm_ee[:, 7] = 1.0
     hand_contact = rng.normal(scale=0.5, size=(frames, 5, 3))
     hand_tactile_force = rng.normal(scale=0.5, size=(frames, 5, 120, 3))
-    hand_fingertip = rng.normal(scale=0.05, size=(frames, 5, 3))
     fresh = np.ones(frames, dtype=bool)
     for row in stale_tactile_rows:
         fresh[row] = False
@@ -94,27 +90,18 @@ def _write_raw_fixture(
         put("fill_reason", np.full(frames, int(FillReason.SOURCE), dtype=np.int64))
         put("flag_sample_valid", np.ones(frames, dtype=bool))
         put("flag_action_queued", np.ones(frames, dtype=bool))
-        put("flag_held", np.zeros(frames, dtype=bool))
-        put("flag_safety_reject", np.zeros(frames, dtype=bool))
+        put("observation_valid", np.ones(frames, dtype=bool))
         put("flag_frame_status", np.zeros(frames, dtype=np.int64))
-        put("flag_ik_ok", np.ones(frames, dtype=bool))
-        put("flag_retarget_ok", np.ones(frames, dtype=bool))
         put("arm_connected", np.ones(frames, dtype=bool))
         put("hand_connected", np.ones(frames, dtype=bool))
         put("hand_qpos_stale", np.zeros(frames, dtype=bool))
-        put("observation_history_valid_mask", np.ones((frames, 4, 1), dtype=bool))
-        put("action_created_monotonic_ns", anchor_ns - 2 * _DT_NS)
-        put("action_target_monotonic_ns", anchor_ns - _DT_NS)
-        put("action_valid_until_monotonic_ns", anchor_ns + 10 * _DT_NS)
         put("arm_qpos", arm_qpos)
         put("hand_qpos", hand_qpos)
-        if include_sent_arm_action:
-            put("action_arm_joint_sent", action_arm)
+        put("action_arm_joint_sent", action_arm)
         put("action_hand_joint", action_hand)
         put("action_arm_ee", action_arm_ee)
         put("hand_contact", hand_contact)
         put("hand_tactile_force", hand_tactile_force)
-        put("hand_fingertip", hand_fingertip)
         put("tracking_error", np.zeros(frames))
         put("arm_last_cmd_seq", np.arange(1, frames + 1, dtype=np.int64))
         put("observation_anchor_monotonic_ns", anchor_ns)
@@ -146,13 +133,11 @@ def _process_fixture(
     workdir: Path,
     *,
     stale_tactile_rows: tuple[int, ...] = (),
-    include_sent_arm_action: bool = True,
 ) -> tuple[Path, SimpleNamespace, object, ProcessingConfig]:
     raw_path = workdir / "episode_fixture.h5"
     _write_raw_fixture(
         raw_path,
         stale_tactile_rows=stale_tactile_rows,
-        include_sent_arm_action=include_sent_arm_action,
     )
     reader = _fake_reader(raw_path)
     config = _joint_config()
@@ -178,21 +163,27 @@ class TestVisualProfileEef(unittest.TestCase):
             with h5py.File(Path(directory) / "visual.h5", "w") as raw:
                 raw["arm_qpos"] = arm_raw
                 raw["hand_qpos"] = np.zeros((4, 12))
-                raw["arm_ee"] = raw_arm_ee
                 raw["policy_observation_arm_qpos"] = arm_policy
                 raw["policy_observation_hand_qpos"] = hand_policy
                 joint = _processed_joint_state(
-                    SimpleNamespace(h5f=raw), selected,
+                    SimpleNamespace(h5f=raw),
+                    selected,
                     ProcessingConfig(profile=OutputProfile.RGB),
                 )
-                processed_eef = compute_eef_pose_history_xarm_base(joint[:, :7]).astype(np.float32)
+                processed_eef = compute_eef_pose_history_xarm_base(joint[:, :7]).astype(
+                    np.float32
+                )
                 expected_eef = compute_eef_pose_history_xarm_base(
                     arm_policy[selected].astype(np.float32)
                 ).astype(np.float32)
-                np.testing.assert_array_equal(joint[:, :7], arm_policy[selected].astype(np.float32))
-                np.testing.assert_array_equal(joint[:, 7:19], hand_policy[selected].astype(np.float32))
+                np.testing.assert_array_equal(
+                    joint[:, :7], arm_policy[selected].astype(np.float32)
+                )
+                np.testing.assert_array_equal(
+                    joint[:, 7:19], hand_policy[selected].astype(np.float32)
+                )
                 np.testing.assert_array_equal(processed_eef, expected_eef)
-                self.assertFalse(np.allclose(processed_eef, raw["arm_ee"][selected]))
+                self.assertFalse(np.allclose(processed_eef, raw_arm_ee[selected]))
 
 
 class TestGatherDatasetRows(unittest.TestCase):
@@ -314,6 +305,7 @@ class TestProcessedV14Writer(unittest.TestCase):
     def test_semantic_attrs(self) -> None:
         with h5py.File(self.out_path, "r") as f:
             attrs = dict(f.attrs)
+
         def _text(name: str) -> str:
             value = attrs[name]
             return value.decode("utf-8") if isinstance(value, bytes) else str(value)
@@ -408,9 +400,7 @@ class TestProcessedV14FailClosed(unittest.TestCase):
 
     def test_noncanonical_eef_rot6d_rejected(self) -> None:
         def mutate(f: h5py.File) -> None:
-            f["eef_pose"][3, 3:9] = np.float32(2.0) * np.asarray(
-                f["eef_pose"][3, 3:9]
-            )
+            f["eef_pose"][3, 3:9] = np.float32(2.0) * np.asarray(f["eef_pose"][3, 3:9])
 
         self._mutate_and_expect_failure(mutate)
 
@@ -440,36 +430,113 @@ class TestProcessedV14FailClosed(unittest.TestCase):
     def test_skew_violation_rejected(self) -> None:
         def mutate(f: h5py.File) -> None:
             f["provenance/observation_reference_monotonic_ns"][0] = (
-                int(np.asarray(f["provenance/tactile_source_monotonic_ns"][0]))
-                + 10**12
+                int(np.asarray(f["provenance/tactile_source_monotonic_ns"][0])) + 10**12
             )
 
         self._mutate_and_expect_failure(mutate)
 
 
-class TestHistoricalRaw24Gate(unittest.TestCase):
-    def test_missing_sent_arm_action_fails_closed(self) -> None:
+class TestV25Cleaning(unittest.TestCase):
+    def _decision(self, mutate, *, visual=False):
         with tempfile.TemporaryDirectory() as tmp:
-            raw_path = Path(tmp) / "episode_no_sent.h5"
-            _write_raw_fixture(raw_path, include_sent_arm_action=False)
-            reader = _fake_reader(raw_path)
+            path = Path(tmp) / "raw.h5"
+            _write_raw_fixture(path)
+            with h5py.File(path, "r+") as raw:
+                if visual:
+                    raw["policy_observation_arm_qpos"] = raw["arm_qpos"][:]
+                    raw["policy_observation_hand_qpos"] = raw["hand_qpos"][:]
+                    raw["policy_observation_valid"] = np.ones(_FRAME_COUNT, dtype=bool)
+                    raw["camera_source_monotonic_ns"] = raw[
+                        "observation_anchor_monotonic_ns"
+                    ][:]
+                    raw["flag_camera_fresh"] = np.ones(_FRAME_COUNT, dtype=bool)
+                mutate(raw)
+            reader = _fake_reader(path)
             try:
-                decision = analyze_episode(
+                return analyze_episode(
                     reader,
-                    _joint_config(),
-                    EpisodeAnnotation(task_name="fixture_task"),
+                    ProcessingConfig(
+                        profile=OutputProfile.RGB if visual else OutputProfile.JOINT
+                    ),
                     source_already_validated=True,
+                    depth_valid_mask=(
+                        np.ones(_FRAME_COUNT, dtype=bool) if visual else None
+                    ),
                 )
             finally:
                 reader.h5f.close()
-        self.assertFalse(decision.accepted)
-        self.assertEqual(int(decision.selected_frames), 0)
-        self.assertIn("action_arm_joint_sent", str(decision.rejected_reason))
-        self.assertIn("unsafe fallback is disabled", str(decision.rejected_reason))
+
+    def test_historical_non_source_rows_are_excluded(self):
+        def mutate(raw):
+            raw["fill_reason"][1:3] = [
+                FillReason.CAUSAL_HOLD_LAST,
+                FillReason.LEADING_PLACEHOLDER,
+            ]
+            raw["flag_sample_valid"][1:3] = False
+
+        decision = self._decision(mutate)
+        self.assertFalse(np.any(decision.keep_mask[1:3]))
+        self.assertEqual(decision.hard_reason_counts["not_source_sample"], 2)
+
+    def test_timestamp_gap_remains_a_segment_boundary(self):
+        def mutate(raw):
+            raw["timestamp"][12:] += _GRID_DT_S
+
+        decision = self._decision(mutate)
+        self.assertEqual(decision.boundary_counts["timestamp_discontinuity"], 1)
+        np.testing.assert_array_equal(decision.segment_ends, [12, 24])
+
+    def test_selected_full_tactile_nonfinite_is_not_repaired(self):
+        def mutate(raw):
+            raw["hand_tactile_force"][4, 0, 0, 0] = np.nan
+
+        decision = self._decision(mutate)
+        self.assertFalse(decision.keep_mask[4])
+        self.assertEqual(decision.hard_reason_counts["nonfinite_real_modality"], 1)
+
+    def test_frame_status_alone_controls_short_ik_admission(self):
+        def mutate(raw):
+            raw["flag_frame_status"][2:4] = 2
+            raw["flag_frame_status"][10:15] = 2
+            raw["flag_frame_status"][18:21] = [1, 3, 4]
+
+        decision = self._decision(mutate)
+        self.assertTrue(np.all(decision.keep_mask[2:4]))
+        self.assertFalse(np.any(decision.keep_mask[10:15]))
+        self.assertFalse(np.any(decision.keep_mask[18:21]))
+
+    def test_observation_valid_is_required(self):
+        def mutate(raw):
+            raw["observation_valid"][0] = False
+
+        self.assertFalse(self._decision(mutate).keep_mask[0])
+
+    def test_joint_dataset_age_remains_tighter_than_live_stale_threshold(self):
+        def mutate(raw):
+            raw["arm_source_monotonic_ns"][0] -= 150_000_000
+
+        decision = self._decision(mutate)
+        self.assertFalse(decision.keep_mask[0])
         self.assertEqual(
-            decision.to_dict()["hard_reason_counts"].get("missing_arm_sent_stream"),
-            _FRAME_COUNT,
+            decision.hard_reason_counts["control_grid_observation_invalid"], 1
         )
+
+    def test_visual_fresh_and_policy_valid_are_required(self):
+        def mutate(raw):
+            raw["flag_camera_fresh"][0] = False
+            raw["policy_observation_valid"][1] = False
+
+        decision = self._decision(mutate, visual=True)
+        self.assertFalse(np.any(decision.keep_mask[:2]))
+        self.assertTrue(np.all(decision.keep_mask[2:]))
+
+    def test_visual_future_camera_source_is_rejected_without_unsigned_wrap(self):
+        def mutate(raw):
+            raw["camera_source_monotonic_ns"][0] += _DT_NS
+
+        decision = self._decision(mutate, visual=True)
+        self.assertFalse(decision.keep_mask[0])
+        self.assertEqual(decision.hard_reason_counts["camera_invalid"], 1)
 
 
 if __name__ == "__main__":

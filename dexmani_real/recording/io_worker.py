@@ -242,7 +242,6 @@ def _create_episode_recorder(shared: Any, config: RecorderIOConfig) -> EpisodeRe
         max_frames=config.max_frames,
         control_hz=config.control_hz,
         min_frames=config.min_frames,
-        arm_sent_stream=True,
         camera_writer_config=CameraStreamWriterConfig(
             rgb_shape=rgb_shape,
             depth_shape=depth_shape,
@@ -486,10 +485,7 @@ class _RecorderIOSession:
             ):
                 continue
             try:
-                frame = decode_record_sample(
-                    record,
-                    arm_sent_stream=self.recorder.arm_sent_stream,
-                )
+                frame = decode_record_sample(record)
                 added = self.recorder.add_episode_frame(frame)
                 if self.recorder.camera_writer_error:
                     raise RuntimeError(self.recorder.camera_writer_error)

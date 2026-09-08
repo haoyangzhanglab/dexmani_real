@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/visualize_episode.py EPISODE [--info] [--max-frames N]``.
 
-Self-contained Rerun visualizer for raw schema-v24 DexMani episodes. Offline
+Self-contained Rerun visualizer for raw schema-v25 DexMani episodes. Offline
 only: connects to no hardware and writes no files; it opens a Rerun viewer unless
 ``--info`` is selected. Episodes display a canonical fixed-size ``(N, 6)`` point
 cloud derived with the same production implementation used by offline processing
@@ -37,6 +37,12 @@ import rerun.blueprint as rrb
 
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.dataset.contracts import ProcessingConfig
+from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
+from dexmani_real.planning.kinematics.fingertip import (
+    compute_fingertip_history_xarm_base,
+)
+from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.dataset.pointcloud import (
     RawEpisodePointCloudDeriver,
     load_raw_episode_base_from_color,
@@ -54,18 +60,17 @@ logger = get_logger(__name__)
 
 
 _KNOWN_CATEGORIES: dict[str, set[str]] = {
-    "arm": {"arm_qpos", "arm_ee"},
-    "hand": {"hand_qpos", "hand_fingertip", "hand_contact"},
-    "action": {"action_arm_joint", "action_arm_ee", "action_hand_joint"},
+    "arm": {"arm_qpos"},
+    "hand": {"hand_qpos", "hand_contact"},
+    "action": {"action_arm_joint_sent", "action_arm_ee", "action_hand_joint"},
     "vr": {"vr_wrist_pos", "vr_wrist_rot6d", "vr_landmarks"},
     "camera": {"rgb", "depth"},
     "flags": {
-        "flag_ik_ok",
-        "flag_retarget_ok",
-        "flag_held",
+        "flag_frame_status",
+        "flag_action_queued",
         "flag_camera_fresh",
-        "camera_age_s",
-        "camera_frame_number",
+        "camera_depth_frame_number",
+        "camera_color_frame_number",
     },
     "meta": {"timestamp"},
 }
@@ -82,12 +87,7 @@ _EEF_COLOR = (255, 255, 255)
 
 
 def _eef_position_or_none(eef_row: np.ndarray) -> np.ndarray | None:
-    """Return the recorded raw arm_ee position when finite, else None.
-
-    The raw viewer shows the actually recorded value; it never re-derives FK.
-    ``None`` means the row carries the all-NaN invalid sentinel and the EEF
-    entity must be cleared instead of leaving a stale sphere.
-    """
+    """Return a finite derived EEF position, or clear an invalid row."""
     row = np.asarray(eef_row, dtype=np.float64)
     if row.shape != (9,) or not np.all(np.isfinite(row)):
         return None
@@ -95,12 +95,7 @@ def _eef_position_or_none(eef_row: np.ndarray) -> np.ndarray | None:
 
 
 def _fingertip_positions_or_none(fingertip_row: np.ndarray) -> np.ndarray | None:
-    """Return the recorded hand_fingertip positions when renderable, else None.
-
-    ``None`` means the row is the all-NaN invalid sentinel (or malformed); the
-    caller clears the fingertips entity instead of leaving the previous
-    frame's spheres visible at the new timestep.
-    """
+    """Return finite derived fingertips, or clear an invalid row."""
     row = np.asarray(fingertip_row, dtype=np.float32)
     if (
         row.ndim != 2
@@ -170,14 +165,6 @@ def print_episode_info(h5_path: str) -> None:
             print(
                 f"                    [{np.array2string(q.max(axis=0), precision=3, suppress_small=True)}]"
             )
-        if "arm_ee" in f:
-            ee = f["arm_ee"][:]
-            print(
-                f"arm_ee    pos range (m):  [{np.array2string(ee[:, :3].min(axis=0), precision=3, suppress_small=True)}]"
-            )
-            print(
-                f"                    [{np.array2string(ee[:, :3].max(axis=0), precision=3, suppress_small=True)}]"
-            )
         if "hand_qpos" in f:
             hq = f["hand_qpos"][:]
             print(
@@ -186,12 +173,9 @@ def print_episode_info(h5_path: str) -> None:
             print(
                 f"                    [{np.array2string(hq.max(axis=0), precision=3, suppress_small=True)}]"
             )
-        if "flag_ik_ok" in f:
-            ik = f["flag_ik_ok"][:]
-            print(f"flag_ik_ok success rate: {ik.mean():.2%}")
-        if "flag_held" in f:
-            held = f["flag_held"][:]
-            print(f"flag_held  engaged rate: {held.mean():.2%}")
+        status = f["flag_frame_status"][:]
+        print(f"frame OK rate: {np.mean(status == 0):.2%}")
+        print(f"action queued rate: {f['flag_action_queued'][:].mean():.2%}")
         if "flag_camera_fresh" in f:
             fresh = f["flag_camera_fresh"][:]
             print(f"flag_camera_fresh rate: {fresh.mean():.2%}")
@@ -316,6 +300,31 @@ class EpisodeVisualizer:
                 if data.ndim == 0:
                     data = data[()]
                 state[key] = np.asarray(data)
+
+        # Raw stores physical joints; geometry is derived only for this viewer.
+        geometry = ProcessingConfig()
+        arm = state["arm_qpos"]
+        hand = state["hand_qpos"]
+        arm_valid = np.all(np.isfinite(arm), axis=1)
+        hand_valid = arm_valid & np.all(np.isfinite(hand), axis=1)
+        state["arm_ee"] = np.full((self._T, 9), np.nan)
+        state["hand_fingertip"] = np.full((self._T, 5, 3), np.nan, dtype=np.float32)
+        if np.any(arm_valid):
+            state["arm_ee"][arm_valid] = compute_eef_pose_history_xarm_base(
+                arm[arm_valid]
+            )
+        if np.any(hand_valid):
+            hand_fk = HandKinematics(
+                geometry.hand_urdf_path, list(geometry.fingertip_link_names)
+            )
+            state["hand_fingertip"][hand_valid] = compute_fingertip_history_xarm_base(
+                arm[hand_valid],
+                hand[hand_valid],
+                hand_fk=hand_fk,
+                handbase_position_eef_m=np.asarray(geometry.handbase_position_eef_m),
+                handbase_quat_eef_wxyz=np.asarray(geometry.handbase_quat_eef_wxyz),
+                eef_pose_history=state["arm_ee"][hand_valid],
+            )
 
         if "hand_contact" in state:
             contact = state["hand_contact"]
@@ -536,7 +545,7 @@ class EpisodeVisualizer:
         )
 
     def _log_eef(self, step_idx: int) -> None:
-        """Render the raw arm_ee position; clear the entity on NaN sentinels."""
+        """Render derived EEF position; clear the entity for invalid joint state."""
         ee_data = self._state.get("arm_ee")
         if ee_data is None:
             return
@@ -610,7 +619,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "episode",
         type=str,
-        help="Path to a raw schema-v24 episodes/<task_name>/episode_* directory.",
+        help="Path to a raw schema-v25 episodes/<task_name>/episode_* directory.",
     )
     parser.add_argument(
         "--max-frames",

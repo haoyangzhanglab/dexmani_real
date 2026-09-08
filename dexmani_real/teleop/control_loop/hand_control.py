@@ -71,24 +71,6 @@ def smoothstep_hand_ramp(
     return start_arr + smooth * (target_arr - start_arr)
 
 
-def get_raw_hand_command(
-    retargeter: TAGHandRetargeter | DexPilotHandRetargeter | None,
-    filtered_command: np.ndarray,
-    retarget_ok: bool,
-) -> np.ndarray:
-    """Return the TAG optimizer output when available, otherwise the retargeter output."""
-    command = np.asarray(filtered_command, dtype=np.float64).copy()
-    if not retarget_ok or retargeter is None:
-        return command
-    raw = getattr(retargeter, "last_raw_qpos", None)
-    if raw is None:
-        return command
-    raw_arr = np.asarray(raw, dtype=np.float64)
-    if raw_arr.shape == HAND_JOINT_SHAPE and np.all(np.isfinite(raw_arr)):
-        return raw_arr.copy()
-    return command
-
-
 def compute_hand_command(
     retargeter: TAGHandRetargeter | DexPilotHandRetargeter | None,
     vr_frame: dict | None,

@@ -7,7 +7,6 @@ module pure makes proposal behavior testable without shared memory or hardware.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -16,7 +15,6 @@ import numpy as np
 from dexmani_real.teleop.control_loop.hand_control import (
     HandRetargetObservationCache,
     compute_hand_command,
-    get_raw_hand_command,
     smoothstep_hand_ramp,
 )
 from dexmani_real.utils.limits import limit_hand_target_delta
@@ -29,9 +27,6 @@ class EefTargetProposal:
 
     position_world_m: np.ndarray
     quat_world_wxyz: np.ndarray
-    raw_position_world_m: np.ndarray
-    raw_quat_world_wxyz: np.ndarray
-    position_before_workspace_clamp_world_m: np.ndarray
     smoothing_state_incomplete: bool
 
 
@@ -40,11 +35,9 @@ class HandJointProposal:
     """One hand proposal plus the next ramp state; no command is published."""
 
     qpos_rad: np.ndarray
-    raw_qpos_rad: np.ndarray
     retarget_succeeded: bool
     next_ramp_start_qpos_rad: np.ndarray | None
     next_ramp_step: int
-    compute_time_ms: float
 
 
 @dataclass(frozen=True)
@@ -52,7 +45,6 @@ class ArmJointProposal:
     """One IK result after firmware limits and command-to-command step limits."""
 
     qpos_rad: np.ndarray
-    raw_qpos_rad: np.ndarray
     validation_issue: str | None
 
 
@@ -105,16 +97,10 @@ def compute_target_eef_pose(
             ema_alpha_rotation,
         )
 
-    position_before_workspace_clamp_world_m = position_world_m.copy()
     position_world_m = np.clip(position_world_m, workspace[:, 0], workspace[:, 1])
     return EefTargetProposal(
         position_world_m=position_world_m,
         quat_world_wxyz=quat_world_wxyz,
-        raw_position_world_m=raw_position_world_m,
-        raw_quat_world_wxyz=raw_quat_world_wxyz,
-        position_before_workspace_clamp_world_m=(
-            position_before_workspace_clamp_world_m
-        ),
         smoothing_state_incomplete=smoothing_state_incomplete,
     )
 
@@ -140,7 +126,6 @@ def compute_hand_joint_proposal(
     The hand worker separately bounds from measured feedback before its SDK
     call, so this proposal limit never weakens the actuator safety boundary.
     """
-    compute_started_s = time.perf_counter()
     hand_qpos_rad, retarget_succeeded = compute_hand_command(
         hand_retargeter,
         vr_frame,
@@ -148,10 +133,6 @@ def compute_hand_joint_proposal(
         hand_available,
         retarget_cache,
     )
-    compute_time_ms = (time.perf_counter() - compute_started_s) * 1000.0
-    raw_qpos_rad = get_raw_hand_command(
-        hand_retargeter, hand_qpos_rad, retarget_succeeded
-    ).copy()
 
     next_ramp_start_qpos_rad = ramp_start_qpos_rad
     next_ramp_step = ramp_step
@@ -182,7 +163,6 @@ def compute_hand_joint_proposal(
 
     return HandJointProposal(
         qpos_rad=np.asarray(hand_qpos_rad, dtype=np.float64).copy(),
-        raw_qpos_rad=np.asarray(raw_qpos_rad, dtype=np.float64).copy(),
         retarget_succeeded=retarget_succeeded,
         next_ramp_start_qpos_rad=(
             None
@@ -190,7 +170,6 @@ def compute_hand_joint_proposal(
             else np.asarray(next_ramp_start_qpos_rad, dtype=np.float64).copy()
         ),
         next_ramp_step=next_ramp_step,
-        compute_time_ms=compute_time_ms,
     )
 
 
@@ -204,8 +183,8 @@ def compute_arm_joint_proposal(
     compute_qpos_delta: Callable[[np.ndarray, np.ndarray], np.ndarray],
 ) -> ArmJointProposal:
     """Clamp one IK result to joint and command-to-command delta limits."""
-    raw_qpos_rad = np.asarray(ik_qpos_rad, dtype=np.float64).copy()
-    arm_qpos_rad = np.clip(raw_qpos_rad, joint_lower_rad, joint_upper_rad)
+    arm_qpos_rad = np.asarray(ik_qpos_rad, dtype=np.float64).copy()
+    arm_qpos_rad = np.clip(arm_qpos_rad, joint_lower_rad, joint_upper_rad)
 
     if (
         max_delta_rad_per_tick is not None
@@ -226,6 +205,5 @@ def compute_arm_joint_proposal(
     validation_issue = None if np.all(np.isfinite(arm_qpos_rad)) else "arm_cmd NaN/Inf"
     return ArmJointProposal(
         qpos_rad=np.asarray(arm_qpos_rad, dtype=np.float64).copy(),
-        raw_qpos_rad=raw_qpos_rad,
         validation_issue=validation_issue,
     )

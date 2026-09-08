@@ -1,5 +1,7 @@
 # EEF + Full Tactile Observation Upgrade Guide
 
+> 历史实施记录：本文涉及的 raw v24 保持约束已由后续 [raw v25 contract](raw_v25_runtime_simplification_guide.md) 取代；当前 schema 与工作流见 [data_schema.md](data_schema.md)。
+
 > Status: IMPLEMENTED in `4056e13631478a37a4477a018f4f94f220a527dd`.
 > Original design baseline: `064a6fb1d5ab263e4d82e01197c8253fe258cf0f`.
 >

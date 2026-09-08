@@ -17,14 +17,12 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.ipc.schema import (
-    ARM_JOINT_SHAPE,
-    HAND_JOINT_SHAPE,
     RECORD_CONTROL_DTYPE,
     RECORD_OPERATOR_BYTES,
     RECORD_STOP_REASON_BYTES,
     RECORD_TASK_LABEL_BYTES,
 )
-from dexmani_real.recording.storage.schema import normalize_diagnostics
+from dexmani_real.recording.frame import episode_source_values
 from dexmani_real.recording.sample import EpisodeAction, EpisodeState
 from dexmani_real.utils.log import get_logger
 
@@ -72,161 +70,6 @@ def bounded_control_text(value: str, *, capacity: int, field: str) -> bytes:
     if len(payload) > capacity:
         raise ValueError(f"RecorderIO {field} exceeds fixed capacity {capacity}")
     return payload
-
-
-def _write_sample_metadata(
-    frame: np.ndarray,
-    *,
-    action: EpisodeAction,
-    camera_frame: dict[str, Any] | None,
-    signals: dict[str, Any] | None,
-    arm_qpos_sent: np.ndarray | None,
-    diagnostics: dict[str, Any] | None,
-) -> None:
-    """Populate fixed metadata at the command-producer/recorder boundary."""
-    signal_data = signals or {}
-    diagnostic_data = normalize_diagnostics(diagnostics)
-
-    frame["arm_qpos_sent"][0] = (
-        np.asarray(arm_qpos_sent, dtype=np.float64)
-        if arm_qpos_sent is not None
-        else np.full(ARM_JOINT_SHAPE, np.nan)
-    )
-    uint64_fields = (
-        "observation_id",
-        "observation_anchor_monotonic_ns",
-        "arm_source_sequence",
-        "hand_source_sequence",
-        "vr_source_sequence",
-        "camera_source_sequence",
-        "arm_source_monotonic_ns",
-        "hand_source_monotonic_ns",
-        "vr_source_monotonic_ns",
-        "camera_source_monotonic_ns",
-        "arm_publish_monotonic_ns",
-        "hand_publish_monotonic_ns",
-        "vr_publish_monotonic_ns",
-        "camera_publish_monotonic_ns",
-        "policy_observation_reference_monotonic_ns",
-        "policy_observation_arm_source_sequence",
-        "policy_observation_hand_source_sequence",
-        "policy_observation_arm_source_monotonic_ns",
-        "policy_observation_hand_source_monotonic_ns",
-        "policy_observation_arm_publish_monotonic_ns",
-        "policy_observation_hand_publish_monotonic_ns",
-        "hand_accepted_target_action_id",
-        "action_id",
-        "action_created_monotonic_ns",
-        "action_target_monotonic_ns",
-        "action_valid_until_monotonic_ns",
-        "tactile_source_monotonic_ns",
-    )
-    for name in uint64_fields:
-        frame[name][0] = int(signal_data.get(name, 0))
-    bool_fields = {
-        "observation_valid": "observation_valid",
-        "policy_observation_valid": "policy_observation_valid",
-        "flag_action_queued": "action_queued",
-        "tactile_fresh": "tactile_fresh",
-        "tactile_calibrated": "tactile_calibrated",
-        "flag_ik_ok": "ik_ok",
-        "flag_ik_attempted": "ik_attempted",
-        "flag_retarget_ok": "retarget_ok",
-        "flag_held": "held",
-        "flag_safety_reject": "flag_safety_reject",
-    }
-    for field_name, signal_name in bool_fields.items():
-        default = field_name == "flag_ik_attempted"
-        frame[field_name][0] = int(bool(signal_data.get(signal_name, default)))
-    frame["tactile_unit_code"][0] = int(signal_data.get("tactile_unit_code", 0))
-    frame["flag_frame_status"][0] = int(signal_data.get("frame_status", 0))
-    frame["observation_source_receive_monotonic_ns"][0] = np.asarray(
-        signal_data.get("observation_source_receive_monotonic_ns", np.zeros(4)),
-        dtype=np.uint64,
-    )
-    frame["observation_source_age_s"][0] = np.asarray(
-        signal_data.get("observation_source_age_s", np.full(4, np.nan)),
-        dtype=np.float64,
-    )
-    frame["observation_source_skew_s"][0] = np.asarray(
-        signal_data.get("observation_source_skew_s", np.full(4, np.nan)),
-        dtype=np.float64,
-    )
-    frame["observation_history_valid_mask"][0] = np.asarray(
-        signal_data.get("observation_history_valid_mask", np.zeros((4, 1), dtype=bool)),
-        dtype=np.uint8,
-    )
-    for name in (
-        "observation_skew_s",
-        "policy_observation_skew_s",
-        "pointcloud_valid_depth_ratio",
-    ):
-        frame[name][0] = float(signal_data.get(name, np.nan))
-    frame["policy_observation_arm_qpos"][0] = np.asarray(
-        signal_data.get(
-            "policy_observation_arm_qpos", np.full(ARM_JOINT_SHAPE, np.nan)
-        ),
-        dtype=np.float64,
-    )
-    frame["policy_observation_hand_qpos"][0] = np.asarray(
-        signal_data.get(
-            "policy_observation_hand_qpos", np.full(HAND_JOINT_SHAPE, np.nan)
-        ),
-        dtype=np.float64,
-    )
-    frame["action_arm_joint_raw"][0] = np.asarray(
-        signal_data.get("action_arm_joint_raw", action.arm_qpos_cmd), dtype=np.float64
-    )
-    frame["action_hand_joint_raw"][0] = np.asarray(
-        diagnostic_data.get("action_hand_joint_raw", action.hand_qpos_cmd),
-        dtype=np.float64,
-    )
-
-    cam = camera_frame or {}
-    frame["camera_health"][0] = int(cam.get("camera_health", 1))
-    frame["camera_fresh"][0] = int(bool(cam.get("camera_fresh", False)))
-    camera_integer_fields = {
-        "camera_depth_frame_number": "depth_frame_number",
-        "camera_color_frame_number": "color_frame_number",
-        "camera_ring_sequence": "ring_sequence",
-        "camera_generation": "camera_generation",
-        "camera_wait_return_monotonic_ns": "wait_return_monotonic_ns",
-        "camera_payload_ready_monotonic_ns": "payload_ready_monotonic_ns",
-        "camera_depth_timestamp_domain": "depth_timestamp_domain",
-        "camera_color_timestamp_domain": "color_timestamp_domain",
-    }
-    for field_name, camera_name in camera_integer_fields.items():
-        frame[field_name][0] = int(cam.get(camera_name, 0))
-    frame["camera_clock_reset"][0] = int(bool(cam.get("clock_reset", False)))
-    frame["camera_duplicate"][0] = int(bool(cam.get("duplicate", False)))
-    frame["camera_frame_gap"][0] = int(cam.get("frame_gap", 0))
-    for name, source_name in (
-        ("camera_depth_device_timestamp_s", "depth_device_timestamp_s"),
-        ("camera_color_device_timestamp_s", "color_device_timestamp_s"),
-        ("camera_age_s", "camera_age_s"),
-        ("camera_backlog_s", "backlog_s"),
-        ("camera_delivery_delay_above_floor_s", "delivery_delay_above_floor_s"),
-    ):
-        frame[name][0] = float(cam.get(source_name, np.nan))
-
-    for name in (
-        "tracking_error",
-        "ik_solve_time_ms",
-        "policy_map_time_ms",
-        "hand_retarget_time_ms",
-        "transition_check_time_ms",
-        "policy_compute_time_ms",
-    ):
-        frame[name][0] = float(diagnostic_data.get(name, np.nan))
-    for name, shape in (
-        ("target_pos_before_clamp", (3,)),
-        ("head_quat_wxyz", (4,)),
-        ("target_eef_pos_raw", (3,)),
-        ("target_eef_rot6d_raw", (6,)),
-    ):
-        frame[name][0] = np.asarray(
-            diagnostic_data.get(name, np.full(shape, np.nan)), dtype=np.float64
-        )
 
 
 class RecorderClient:
@@ -385,9 +228,6 @@ class RecorderClient:
         camera_frame: dict[str, Any] | None = None,
         signals: dict[str, Any] | None = None,
         arm_qpos_sent: np.ndarray | None = None,
-        diagnostics: dict[str, Any] | None = None,
-        *,
-        control_run_generation: int,
     ) -> bool:
         if not self._recording:
             return False
@@ -401,60 +241,17 @@ class RecorderClient:
         dtype = self.shared.record_sample_ring.dtype
         frame = np.zeros(1, dtype=dtype)
         frame["generation"][0] = self._generation
-        frame["control_run_generation"][0] = int(control_run_generation)
         frame["sample_sequence"][0] = self._frame_count + 1
-        for name in (
-            "arm_qpos",
-            "arm_qvel",
-            "arm_tau",
-            "eef_pos",
-            "eef_quat_wxyz",
-            "eef_rot6d",
-            "hand_qpos",
-        ):
-            frame[name][0] = getattr(state, name)
-        frame["hand_current"][0] = (
-            state.hand_current
-            if state.hand_current is not None
-            else np.full(HAND_JOINT_SHAPE, np.nan)
-        )
-        for name in (
-            "hand_tactile_sum",
-            "hand_tactile_force",
-            "hand_tactile_contact",
-            "hand_tipboard_err",
-            "hand_commboard_err",
-            "hand_jointboard_err",
-            "fingertip_pos",
-        ):
-            frame[name][0] = getattr(state, name)
-        for name in (
-            "hand_qpos_stale",
-            "arm_connected",
-            "hand_connected",
-            "arm_last_cmd_is_hold",
-        ):
-            frame[name][0] = int(bool(getattr(state, name)))
-        frame["state_timestamp"][0] = state.timestamp
-        frame["arm_last_cmd_seq"][0] = state.arm_last_cmd_seq
-        frame["action_arm_qpos"][0] = action.arm_qpos_cmd
-        frame["action_hand_qpos"][0] = action.hand_qpos_cmd
-        frame["action_target_eef_pos"][0] = (
-            action.target_eef_pos
-            if action.target_eef_pos is not None
-            else np.full(3, np.nan)
-        )
-        frame["action_target_eef_rot6d"][0] = (
-            action.target_eef_rot6d
-            if action.target_eef_rot6d is not None
-            else np.full(6, np.nan)
-        )
-        frame["vr_wrist_pos"][0] = vr_frame["wrist_pos"]
-        frame["vr_wrist_quat_wxyz"][0] = vr_frame["wrist_quat_wxyz"]
-        frame["vr_landmarks"][0] = vr_frame["landmarks"]
-        frame["vr_head_quat_wxyz"][0] = vr_frame.get(
-            "head_quat_wxyz", np.full(4, np.nan)
-        )
+        frame["timestamp"][0] = state.timestamp
+        for name, value in episode_source_values(
+            state,
+            action,
+            vr_frame,
+            camera_frame=camera_frame,
+            signals=signals,
+            arm_qpos_sent=arm_qpos_sent,
+        ).items():
+            frame[name][0] = value
         if camera_frame is not None:
             frame["camera_present"][0] = 1
             frame["camera_rgb"][0] = camera_frame.get(
@@ -463,14 +260,6 @@ class RecorderClient:
             frame["camera_depth"][0] = camera_frame.get(
                 "depth", np.zeros(frame["camera_depth"][0].shape, np.uint16)
             )
-        _write_sample_metadata(
-            frame,
-            action=action,
-            camera_frame=camera_frame,
-            signals=signals,
-            arm_qpos_sent=arm_qpos_sent,
-            diagnostics=diagnostics,
-        )
         self.shared.record_sample_ring.write(frame)
         self._frame_count += 1
         return True

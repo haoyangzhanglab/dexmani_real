@@ -33,7 +33,6 @@ from dexmani_real.planning import (
     XArm7MotionPlanner,
     XArm7PlannerConfig,
 )
-from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.client import RecorderClient, RecorderPhase
 from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
@@ -251,24 +250,6 @@ def _transition_or_fault(
     return False
 
 
-def _load_hand_kinematics(
-    config: TeleopConfig,
-    *,
-    recording_enabled: bool,
-) -> HandKinematics | None:
-    """Load the hand FK required to produce valid hand recording samples."""
-    if not recording_enabled or not config.runtime.policy.hand_enabled:
-        return None
-    hand_fk = HandKinematics(
-        config.hand_urdf_path,
-        list(config.runtime.hand.fingertip_link_names),
-    )
-    if not hand_fk.is_ready():
-        raise RuntimeError("Hand FK is not ready")
-    logger.info("Hand FK ready")
-    return hand_fk
-
-
 def _begin_feedback_issue(
     cfg: TeleopConfig,
     vr_frame: dict | None,
@@ -319,7 +300,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
         planner, arm_mapper, safety_gate, recorder = _load_control_resources(
             shared, cfg, recording_enabled=recording_enabled
         )
-        hand_fk = _load_hand_kinematics(cfg, recording_enabled=recording_enabled)
     except Exception:
         logger.error("teleop_loop: init failed", exc_info=True)
         shared.error_state.value = True
@@ -329,12 +309,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
         return
     audio = AudioFeedback()
 
-    handbase_position_eef_m = np.asarray(
-        cfg.runtime.hand.T_eef_handbase_pos_xyz, dtype=np.float64
-    )
-    handbase_quat_eef_wxyz = np.asarray(
-        cfg.runtime.hand.T_eef_handbase_quat_wxyz, dtype=np.float64
-    )
     arm_state = read_arm_state_causal(shared)
     hand_state = read_hand_state_causal(shared)
     if cfg.runtime.policy.hand_enabled:
@@ -426,9 +400,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
         stage_timer=stage_timer,
         validation_warn=validate_warn,
         arm_feedback_warn=arm_feedback_warn,
-        hand_fk=hand_fk,
-        handbase_position_eef_m=handbase_position_eef_m,
-        handbase_quat_eef_wxyz=handbase_quat_eef_wxyz,
         hand_ramp_total_frames=hand_ramp_frame_count(
             cfg.runtime.policy.hand_ramp_duration_s, cfg.runtime.policy.control_hz
         ),

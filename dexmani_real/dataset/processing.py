@@ -1,4 +1,4 @@
-"""Transactional depth-to-color aligned raw-v24 to processed-v14 processing."""
+"""Transactional depth-to-color aligned raw-v25 to processed-v14 processing."""
 
 from __future__ import annotations
 
@@ -406,7 +406,7 @@ def _write_processed_episode(
     camera_model = None
     T_xarm_base_from_color = None
     if config.profile.needs_rgb or config.profile.needs_pointcloud:
-        # Resolve the raw-v24 geometry boundary before creating output.
+        # Resolve the raw RGB-D geometry boundary before creating output.
         camera_model = load_raw_episode_camera_model(reader)
         T_xarm_base_from_color = load_raw_episode_base_from_color(reader)
     with h5py.File(path, "w") as output:

@@ -28,10 +28,8 @@ import h5py
 import numpy as np
 
 from dexmani_real.recording.storage.schema import (
-    ARM_SENT_MARKER,
     EPISODE_SCHEMA_VERSION,
     validate_data_layout,
-    validate_raw_semantics,
 )
 from dexmani_real.recording.storage.video import VideoDecoder
 from dexmani_real.utils.log import get_logger
@@ -116,8 +114,8 @@ class EpisodeReader:
     def __init__(self, h5_path: str | Path) -> None:
         """Open one published episode.
 
-        Reads validate the raw schema and its data semantics when
-        :attr:`validity` or :meth:`require_valid` is used.
+        Check the supported schema and structural layout without decoding RGB
+        or replaying the runtime's admission proofs.
         """
         self._path = Path(h5_path)
         self._closed = False
@@ -136,22 +134,25 @@ class EpisodeReader:
                 f"episode is missing required files {missing}: {self._path}"
             )
 
+        self._rgb_decoder: VideoDecoder | None = None
         self._data_h5f = h5py.File(paths["data"], "r")
-        depth_h5f = h5py.File(paths["depth"], "r")
+        try:
+            depth_h5f = h5py.File(paths["depth"], "r")
+        except Exception:
+            self._data_h5f.close()
+            raise
         self._h5f = MergedH5File(
             self._data_h5f,
             {"depth": depth_h5f},
         )
-        self._rgb_decoder: VideoDecoder | None = None
-        schema_version = self.schema_version
-        if schema_version != EPISODE_SCHEMA_VERSION:
-            self.close()
-            raise ValueError(
-                f"unsupported episode schema v{schema_version}; expected v"
-                f"{EPISODE_SCHEMA_VERSION}"
-            )
-        self._rgb_decoder = VideoDecoder(paths["rgb"])
         try:
+            schema_version = self.schema_version
+            if schema_version != EPISODE_SCHEMA_VERSION:
+                raise ValueError(
+                    f"unsupported episode schema v{schema_version}; expected v"
+                    f"{EPISODE_SCHEMA_VERSION}"
+                )
+            self._rgb_decoder = VideoDecoder(paths["rgb"])
             self.require_valid(purpose="episode read")
         except Exception:
             self.close()
@@ -181,45 +182,6 @@ class EpisodeReader:
         meta = self._h5f.get("meta")
         return bool(meta is not None and meta.attrs.get("min_frames_met", False))
 
-    def _raw_action_valid_mask(self, quality_key: str) -> np.ndarray:
-        """Return a conservative source-row mask for one stored raw action."""
-
-        names = ("flag_sample_valid", "flag_held", quality_key)
-        missing = [name for name in names if name not in self._data_h5f]
-        if missing:
-            raise ValueError(
-                f"episode is missing raw-action validity fields: {missing}"
-            )
-        values = [np.asarray(self._data_h5f[name][:], dtype=bool) for name in names]
-        if (
-            any(value.ndim != 1 for value in values)
-            or len({value.shape for value in values}) != 1
-        ):
-            shapes = {name: value.shape for name, value in zip(names, values)}
-            raise ValueError(
-                f"raw-action validity fields have inconsistent shapes: {shapes}"
-            )
-        sample_valid, held, quality_ok = values
-        return sample_valid & ~held & quality_ok
-
-    @property
-    def action_arm_joint_raw_valid_mask(self) -> np.ndarray:
-        """Rows with a conservative, explicit arm IK raw value.
-
-        Equivalent to ``flag_sample_valid & ~flag_held & flag_ik_ok``.
-        """
-
-        return self._raw_action_valid_mask("flag_ik_ok")
-
-    @property
-    def action_hand_joint_raw_valid_mask(self) -> np.ndarray:
-        """Rows with a conservative, explicit hand retarget raw value.
-
-        Equivalent to ``flag_sample_valid & ~flag_held & flag_retarget_ok``.
-        """
-
-        return self._raw_action_valid_mask("flag_retarget_ok")
-
     @property
     def validity(self) -> ValidityState:
         """Return whether the current supported episode is internally consistent."""
@@ -237,38 +199,12 @@ class EpisodeReader:
         }
         dataset_dtypes = {key: dataset.dtype for key, dataset in datasets.items()}
         layout_errors = validate_data_layout(
-            dataset_shapes,
-            dataset_dtypes,
-            frame_count=frame_count,
-            arm_sent_stream=bool(meta.attrs.get(ARM_SENT_MARKER, False)),
+            dataset_shapes, dataset_dtypes, frame_count=frame_count
         )
-        if layout_errors:
-            return ValidityState.INVALID
-        try:
-            semantic_errors = validate_raw_semantics(
-                datasets,
-                frame_count=frame_count,
-                attrs=meta.attrs,
-            )
-        except Exception:
-            logger.warning("failed raw semantic validation", exc_info=True)
-            return ValidityState.INVALID
-        if semantic_errors:
-            return ValidityState.INVALID
-        if not bool(meta.attrs.get("success", False)) or str(
-            meta.attrs.get("camera_writer_error", "")
-        ):
-            return ValidityState.INVALID
-        if self._rgb_decoder is None or "depth" not in self._h5f:
+        if layout_errors or "depth" not in self._h5f:
             return ValidityState.INVALID
         depth = self._h5f["depth"]
-        height = int(meta.attrs.get("camera_encoding_height", -1))
-        width = int(meta.attrs.get("camera_encoding_width", -1))
-        if (
-            depth.shape != (frame_count, height, width)
-            or depth.dtype != np.dtype(np.uint16)
-            or depth.shape[0] != frame_count
-        ):
+        if not isinstance(depth, h5py.Dataset) or depth.shape[:1] != (frame_count,):
             return ValidityState.INVALID
         return ValidityState.VALID
 
@@ -282,67 +218,22 @@ class EpisodeReader:
 
     @property
     def timing(self) -> EpisodeTiming:
-        """Return timing recorded by the episode's fixed control grid."""
-        meta = self._h5f.get("meta")
-        attrs = meta.attrs if meta is not None else {}
-
-        def _positive(value: Any) -> float | None:
-            try:
-                result = float(value)
-            except (TypeError, ValueError):
-                return None
-            return result if np.isfinite(result) and result > 0 else None
-
-        timestamps = np.asarray(self._h5f["timestamp"][:], dtype=np.float64)
-        timestamp_dt_s: float | None = None
-        timestamp_duration_s: float | None = None
-        if timestamps is not None and timestamps.size >= 2:
-            finite = timestamps[np.isfinite(timestamps)]
-            if finite.size >= 2:
-                positive_deltas = np.diff(finite)
-                positive_deltas = positive_deltas[positive_deltas > 0]
-                if positive_deltas.size:
-                    timestamp_dt_s = float(np.median(positive_deltas))
-                span = float(finite[-1] - finite[0])
-                if span >= 0:
-                    timestamp_duration_s = span
-
-        control_hz = _positive(attrs.get("control_hz"))
-        grid_dt_s = _positive(attrs.get("grid_dt_s"))
-        if control_hz is None or grid_dt_s is None:
-            raise ValueError("episode has invalid control-grid metadata")
-        rate_hz = control_hz
-        explicit_grid_duration_s = attrs.get("grid_duration_s")
-        try:
-            grid_duration_s = (
-                float(explicit_grid_duration_s)
-                if explicit_grid_duration_s is not None
-                else float("nan")
-            )
-        except (TypeError, ValueError):
-            grid_duration_s = float("nan")
-        if not np.isfinite(grid_duration_s) or grid_duration_s < 0:
-            if timestamp_duration_s is None:
-                raise ValueError("episode has invalid grid_duration_s")
-            grid_duration_s = timestamp_duration_s
-
-        wall_duration_s = float(attrs.get("wall_duration_s", grid_duration_s))
-        if not np.isfinite(wall_duration_s) or wall_duration_s < 0:
-            wall_duration_s = grid_duration_s
-        non_sampled_duration_s = float(
-            attrs.get(
-                "non_sampled_duration_s", max(0.0, wall_duration_s - grid_duration_s)
-            )
-        )
-        if not np.isfinite(non_sampled_duration_s) or non_sampled_duration_s < 0:
-            non_sampled_duration_s = max(0.0, wall_duration_s - grid_duration_s)
-
+        """Nominal controller period and actual recorded timestamp span."""
+        attrs = self._h5f["meta"].attrs
+        control_hz = float(attrs["control_hz"])
+        if not np.isfinite(control_hz) or control_hz <= 0:
+            raise ValueError("episode control_hz must be finite and positive")
+        timestamps = self._h5f["timestamp"]
+        span = float(timestamps[-1] - timestamps[0]) if len(timestamps) > 1 else 0.0
+        wall_duration = float(attrs.get("wall_duration_s", span))
         return EpisodeTiming(
-            rate_hz=rate_hz,
-            grid_dt_s=grid_dt_s,
-            grid_duration_s=grid_duration_s,
-            wall_duration_s=wall_duration_s,
-            non_sampled_duration_s=non_sampled_duration_s,
+            rate_hz=control_hz,
+            grid_dt_s=1.0 / control_hz,
+            grid_duration_s=span,
+            wall_duration_s=wall_duration,
+            non_sampled_duration_s=max(
+                0.0, span - max(0, len(timestamps) - 1) / control_hz
+            ),
         )
 
     def read_camera_frame(self, key: str, index: int) -> np.ndarray:

@@ -66,7 +66,6 @@ from dexmani_real.planning import (
     XArm7PlannerConfig,
 )
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
-from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.planning.paths import (
     WORKSPACE_BOUNDS_TOLERANCE_M,
@@ -86,7 +85,6 @@ from dexmani_real.recording.sample import (
 from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
-    XHAND_RIGHT_URDF_PATH,
 )
 from dexmani_real.runtime.safety import (
     SafetyState,
@@ -291,11 +289,6 @@ def _advance_control_grid_ns(due_ns: int, terminal_ns: int, step_dt_ns: int) -> 
     if lateness_ns >= step_dt_ns:
         return terminal_ns + step_dt_ns
     return due_ns + step_dt_ns
-
-
-def _rejection_ik_metadata(is_ee: bool, kind: _RejectKind) -> tuple[bool, bool]:
-    """Return ``(ik_attempted, ik_ok)`` for a rejected step from its explicit kind."""
-    return is_ee, bool(is_ee and kind is _RejectKind.SAFETY)
 
 
 def _build_policy_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
@@ -564,7 +557,6 @@ class PolicyExecutor:
         )
         self.last_recorded_action: EpisodeAction | None = None
         self.next_record_ns = 0
-        self.recording_hand_fk: HandKinematics | None = None
         self.control_period_s = 1.0 / float(runtime.policy.control_hz)
         self.step_dt_ns = int(round(self.control_period_s * 1e9))
         self.first_command_timeout_ns = int(
@@ -702,22 +694,15 @@ class PolicyExecutor:
             "landmarks": np.full((21, 3), np.nan),
         }
 
-    def _recording_hand_kinematics(self) -> HandKinematics:
-        if self.recording_hand_fk is None:
-            self.recording_hand_fk = HandKinematics(
-                str(XHAND_RIGHT_URDF_PATH),
-                list(self.runtime.hand.fingertip_link_names),
-            )
-        return self.recording_hand_fk
-
     def _recorded_hold_action(self, state: EpisodeState) -> EpisodeAction:
         if self.last_recorded_action is not None:
             return self.last_recorded_action
+        target_eef_pos, target_eef_rot6d = make_arm_fk().compute(state.arm_qpos)
         return EpisodeAction(
             arm_qpos_cmd=np.asarray(state.arm_qpos, dtype=np.float64),
             hand_qpos_cmd=np.asarray(state.hand_qpos, dtype=np.float64),
-            target_eef_pos=np.asarray(state.eef_pos, dtype=np.float64),
-            target_eef_rot6d=np.asarray(state.eef_rot6d, dtype=np.float64),
+            target_eef_pos=np.asarray(target_eef_pos, dtype=np.float64),
+            target_eef_rot6d=np.asarray(target_eef_rot6d, dtype=np.float64),
         )
 
     def _recorded_action_from_command(
@@ -747,7 +732,6 @@ class PolicyExecutor:
         action: EpisodeAction,
         *,
         signals: dict[str, Any],
-        diagnostics: dict[str, Any] | None = None,
         arm_qpos_sent: np.ndarray | None = None,
     ) -> bool:
         if self.recorder is None or self.run_generation is None:
@@ -760,8 +744,6 @@ class PolicyExecutor:
                 camera_frame=inputs[1],
                 signals={**inputs[2], **signals},
                 arm_qpos_sent=arm_qpos_sent,
-                diagnostics=diagnostics,
-                control_run_generation=self.run_generation,
             )
         except Exception:
             logger.error(
@@ -853,58 +835,26 @@ class PolicyExecutor:
             self.shared.is_recording.value = False
             self.rollout_result = None
 
-    def _recorded_raw_action_parts(
-        self,
-        raw_action: np.ndarray,
-        *,
-        fallback_action: EpisodeAction,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Keep finite policy raw fields without relabelling their semantics."""
-        if self.policy_spec.action_key == "action":
-            raw_arm = np.asarray(raw_action[:7], dtype=np.float64)
-            raw_hand = np.asarray(raw_action[7:19], dtype=np.float64)
-        else:
-            raw_arm = np.asarray(fallback_action.arm_qpos_cmd, dtype=np.float64)
-            raw_hand = np.asarray(raw_action[9:21], dtype=np.float64)
-        if raw_arm.shape != (7,) or not np.all(np.isfinite(raw_arm)):
-            raw_arm = np.asarray(fallback_action.arm_qpos_cmd, dtype=np.float64)
-        if raw_hand.shape != (12,) or not np.all(np.isfinite(raw_hand)):
-            raw_hand = np.asarray(fallback_action.hand_qpos_cmd, dtype=np.float64)
-        return raw_arm, raw_hand
-
     def _record_rejection(
         self,
         inputs: tuple[EpisodeState, dict, dict],
-        raw_action: np.ndarray,
         *,
-        ik_attempted: bool,
-        ik_ok: bool,
         kind: _RejectKind,
     ) -> bool:
         action = self._recorded_hold_action(inputs[0])
-        raw_arm, raw_hand = self._recorded_raw_action_parts(
-            raw_action,
-            fallback_action=action,
-        )
         safety_reject = kind is _RejectKind.SAFETY
         return self._record_frame(
             inputs,
             action,
             signals={
                 "action_queued": False,
-                "ik_attempted": ik_attempted,
-                "ik_ok": ik_ok,
-                "retarget_ok": False,
-                "held": True,
-                "flag_safety_reject": safety_reject,
                 "frame_status": (
                     _RECORD_FRAME_SAFETY_REJECT
                     if safety_reject
                     else _RECORD_FRAME_IK_FAIL
                 ),
-                "action_arm_joint_raw": raw_arm,
             },
-            diagnostics={"action_hand_joint_raw": raw_hand},
+            arm_qpos_sent=action.arm_qpos_cmd,
         )
 
     def _record_command(
@@ -926,30 +876,14 @@ class PolicyExecutor:
                 "executor: failed to build rollout action record", exc_info=True
             )
             return False
-        raw_arm, raw_hand = self._recorded_raw_action_parts(
-            raw_action,
-            fallback_action=action,
-        )
-        is_ee_action = self.policy_spec.action_key == "action_ee"
         self.last_recorded_action = action
         return self._record_frame(
             inputs,
             action,
             signals={
-                "action_id": candidate.action_id,
-                "action_created_monotonic_ns": candidate.created_monotonic_ns,
-                "action_target_monotonic_ns": candidate.target_monotonic_ns,
-                "action_valid_until_monotonic_ns": candidate.valid_until_monotonic_ns,
                 "action_queued": True,
-                "ik_attempted": is_ee_action,
-                "ik_ok": is_ee_action,
-                "retarget_ok": False,
-                "held": False,
-                "flag_safety_reject": False,
                 "frame_status": _RECORD_FRAME_OK,
-                "action_arm_joint_raw": raw_arm,
             },
-            diagnostics={"action_hand_joint_raw": raw_hand},
             arm_qpos_sent=candidate.arm_qpos,
         )
 
@@ -986,8 +920,8 @@ class PolicyExecutor:
                 )
             if sources["arm"] is None or sources["hand"] is None:
                 raise RuntimeError("recording arm/hand feedback unavailable")
-            arm, arm_publish_ns, arm_sequence = sources["arm"]
-            hand, hand_publish_ns, hand_sequence = sources["hand"]
+            arm, _arm_publish_ns, _arm_sequence = sources["arm"]
+            hand, _hand_publish_ns, _hand_sequence = sources["hand"]
             camera = read_camera_frame_causal(self.shared, anchor_monotonic_ns=now_ns)
             if camera is None:
                 raise RuntimeError("recording camera unavailable")
@@ -1011,59 +945,21 @@ class PolicyExecutor:
                 arm,
                 hand,
                 tactile if tactile_fresh else None,
-                hand_fk=self._recording_hand_kinematics(),
-                handbase_position_eef_m=np.asarray(
-                    self.runtime.hand.T_eef_handbase_pos_xyz
-                ),
-                handbase_quat_eef_wxyz=np.asarray(
-                    self.runtime.hand.T_eef_handbase_quat_wxyz
-                ),
                 timestamp_s=now_ns / 1e9,
             )
-            source_ns = np.array(
-                [
-                    arm["source_monotonic_ns"][0],
-                    hand["source_monotonic_ns"][0],
-                    0,
-                    camera["source_monotonic_ns"],
-                ],
-                dtype=np.uint64,
-            )
-            valid = np.array(
-                [bool(arm["state_valid"][0]), bool(hand["state_valid"][0]), False, True]
-            )
-            ages = np.full(4, np.nan)
-            ages[valid] = (now_ns - source_ns[valid].astype(np.int64)) / 1e9
-            skew = np.full(4, np.nan)
-            skew[valid] = (
-                int(source_ns[valid].max()) - source_ns[valid].astype(np.int64)
-            ) / 1e9
             signals = {
-                "observation_id": now_ns,
                 "observation_anchor_monotonic_ns": now_ns,
-                "arm_source_sequence": arm_sequence,
-                "hand_source_sequence": hand_sequence,
-                "camera_source_sequence": camera["ring_sequence"],
-                "arm_publish_monotonic_ns": arm_publish_ns,
-                "hand_publish_monotonic_ns": hand_publish_ns,
-                "camera_publish_monotonic_ns": camera["publish_monotonic_ns"],
-                "observation_source_receive_monotonic_ns": np.array(
-                    [
-                        arm_publish_ns,
-                        hand_publish_ns,
-                        0,
-                        camera["receive_monotonic_ns"],
-                    ],
-                    dtype=np.uint64,
-                ),
-                "observation_source_age_s": ages,
-                "observation_source_skew_s": skew,
-                "observation_history_valid_mask": valid[:, None],
                 "observation_valid": False,
                 "policy_observation_valid": False,
-                "hand_accepted_target_action_id": int(
-                    hand["accepted_target_action_id"][0]
+                "tracking_error": (
+                    float(arm["tracking_err"][0])
+                    if "tracking_err" in (arm.dtype.names or ())
+                    else np.nan
                 ),
+                "arm_source_monotonic_ns": int(arm["source_monotonic_ns"][0]),
+                "hand_source_monotonic_ns": int(hand["source_monotonic_ns"][0]),
+                "vr_source_monotonic_ns": 0,
+                "camera_source_monotonic_ns": int(camera["source_monotonic_ns"]),
                 "tactile_fresh": tactile_fresh,
                 "tactile_source_monotonic_ns": (
                     0 if tactile is None else int(tactile["source_monotonic_ns"][0])
@@ -1075,8 +971,6 @@ class PolicyExecutor:
                     0 if tactile is None else int(tactile["unit_code"][0])
                 ),
             }
-            for index, name in enumerate(("arm", "hand", "vr", "camera")):
-                signals[f"{name}_source_monotonic_ns"] = int(source_ns[index])
             inputs = (state, camera, signals)
             if raw_action is None:
                 action = self._recorded_hold_action(state)
@@ -1084,26 +978,18 @@ class PolicyExecutor:
                     inputs,
                     action,
                     signals={
-                        "held": True,
                         "action_queued": False,
-                        "ik_attempted": False,
-                        "ik_ok": False,
                         "frame_status": _RECORD_FRAME_HELD,
                     },
+                    arm_qpos_sent=action.arm_qpos_cmd,
                 )
             else:
                 if candidate is not None:
                     recorded = self._record_command(inputs, candidate, raw_action)
                 else:
                     assert reject_kind is not None
-                    attempted, ok = _rejection_ik_metadata(
-                        self.policy_spec.action_key == "action_ee", reject_kind
-                    )
                     recorded = self._record_rejection(
                         inputs,
-                        raw_action,
-                        ik_attempted=attempted,
-                        ik_ok=ok,
                         kind=reject_kind,
                     )
             if not recorded:

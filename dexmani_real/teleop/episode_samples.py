@@ -7,12 +7,10 @@ from typing import Mapping
 
 import numpy as np
 
-from dexmani_real.control.action import ActionCandidate
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning.kinematics.pose import (
     normalize_quat_wxyz,
     quat_wxyz_to_rot6d,
-    rot6d_to_quat_wxyz,
 )
 from dexmani_real.recording.client import RecorderClient
 from dexmani_real.recording.sample import EpisodeAction, build_episode_state
@@ -49,12 +47,9 @@ def _recording_provenance(
     cam: dict | None,
     *,
     anchor_monotonic_ns: int | None = None,
-    arm_ring_sequence: int = 0,
-    hand_ring_sequence: int = 0,
-    action_candidate: ActionCandidate | None = None,
     max_observation_skew_s: float,
 ) -> dict[str, object]:
-    """Correlate one policy-grid sample with causal sources and send metadata."""
+    """Correlate one policy-grid sample with causal source timestamps."""
     anchor_ns = (
         time.monotonic_ns() if anchor_monotonic_ns is None else int(anchor_monotonic_ns)
     )
@@ -72,12 +67,7 @@ def _recording_provenance(
     arm_publish_ns = _field(arm_state, "publish_monotonic_ns")
     hand_source_ns = _field(hand_state, "source_monotonic_ns")
     hand_publish_ns = _field(hand_state, "publish_monotonic_ns")
-    arm_source_sequence = int(arm_ring_sequence)
-    hand_source_sequence = int(hand_ring_sequence)
     vr_source_ns = int(vr_frame.get("recv_ts_ns", 0)) if vr_frame is not None else 0
-    vr_source_sequence = (
-        int(vr_frame.get("ring_sequence", 0)) if vr_frame is not None else 0
-    )
     vr_publish_ns = (
         int(vr_frame.get("publish_monotonic_ns", 0)) if vr_frame is not None else 0
     )
@@ -103,12 +93,10 @@ def _recording_provenance(
     source_valid = np.array(
         [
             arm_source_ns > 0
-            and arm_source_sequence > 0
             and _field(arm_state, "state_valid") == 1,
             hand_source_ns > 0
-            and hand_source_sequence > 0
             and _field(hand_state, "state_valid") == 1,
-            vr_source_ns > 0 and vr_source_sequence > 0,
+            vr_source_ns > 0,
             (
                 camera_source_ns > 0 and bool(cam.get("camera_fresh", False))
                 if cam is not None
@@ -126,34 +114,19 @@ def _recording_provenance(
         & (publish_ns <= anchor_ns)
     )
     source_valid &= time_valid
-    ages_s = np.full(4, np.nan, dtype=np.float64)
-    ages_s[source_valid] = (
-        anchor_ns - source_ns[source_valid].astype(np.int64)
-    ) / _NS_PER_SECOND
     valid_times = source_ns[source_valid]
-    newest_source_ns = int(np.max(valid_times)) if valid_times.size else 0
-    skew_s = np.full(4, np.nan, dtype=np.float64)
-    if newest_source_ns:
-        skew_s[source_valid] = (
-            newest_source_ns - source_ns[source_valid].astype(np.int64)
-        ) / _NS_PER_SECOND
+    source_span_s = (
+        (int(np.max(valid_times)) - int(np.min(valid_times))) / _NS_PER_SECOND
+        if valid_times.size
+        else np.inf
+    )
     required_mask = source_valid[[0, 2, 3]]
     if hand_state is not None:
         required_mask = np.concatenate([required_mask, source_valid[1:2]])
-    observation_valid = bool(np.all(required_mask)) and bool(
-        np.nanmax(skew_s, initial=0.0) <= float(max_observation_skew_s)
+    observation_valid = bool(np.all(required_mask)) and source_span_s <= float(
+        max_observation_skew_s
     )
 
-    action_id = action_candidate.action_id if action_candidate is not None else 0
-    observation_id = (
-        action_candidate.observation_id
-        if action_candidate is not None
-        else int(vr_frame.get("ring_sequence", 0)) if vr_frame is not None else 0
-    )
-    if observation_id <= 0:
-        observation_id = anchor_ns
-
-    # Fire-and-forget worker status is omitted because there is no same-tick ACK.
     tactile_source_ns = _field(hand_tactile, "source_monotonic_ns")
     tactile_fresh = (
         _field(hand_tactile, "fresh") == 1
@@ -161,51 +134,16 @@ def _recording_provenance(
         and anchor_ns - tactile_source_ns <= RECORDING_TACTILE_MAX_AGE_NS
     )
     return {
-        "observation_id": observation_id,
         "observation_anchor_monotonic_ns": anchor_ns,
-        "arm_source_sequence": arm_source_sequence,
-        "hand_source_sequence": hand_source_sequence,
-        "vr_source_sequence": vr_source_sequence,
-        "camera_source_sequence": (
-            int(cam.get("ring_sequence", 0)) if cam is not None else 0
-        ),
         "arm_source_monotonic_ns": arm_source_ns,
         "hand_source_monotonic_ns": hand_source_ns,
         "vr_source_monotonic_ns": vr_source_ns,
         "camera_source_monotonic_ns": camera_source_ns,
-        "arm_publish_monotonic_ns": arm_publish_ns,
-        "hand_publish_monotonic_ns": hand_publish_ns,
-        "vr_publish_monotonic_ns": vr_publish_ns,
-        "camera_publish_monotonic_ns": camera_publish_ns,
-        "observation_source_receive_monotonic_ns": receive_ns,
-        "observation_source_age_s": ages_s,
-        "observation_source_skew_s": skew_s,
-        "observation_history_valid_mask": source_valid[:, None],
         "observation_valid": observation_valid,
-        "observation_skew_s": float(np.nanmax(skew_s, initial=0.0)),
-        "hand_accepted_target_action_id": _field(
-            hand_state, "accepted_target_action_id"
-        ),
-        "action_id": action_id,
-        "action_created_monotonic_ns": (
-            action_candidate.created_monotonic_ns if action_candidate is not None else 0
-        ),
-        "action_target_monotonic_ns": (
-            action_candidate.target_monotonic_ns if action_candidate is not None else 0
-        ),
-        "action_valid_until_monotonic_ns": (
-            action_candidate.valid_until_monotonic_ns
-            if action_candidate is not None
-            else 0
-        ),
-        "action_queued": action_candidate is not None,
         "tactile_fresh": tactile_fresh,
         "tactile_source_monotonic_ns": tactile_source_ns,
         "tactile_calibrated": _field(hand_tactile, "calibrated") == 1,
         "tactile_unit_code": _field(hand_tactile, "unit_code"),
-        "pointcloud_valid_depth_ratio": (
-            float(cam.get("valid_depth_ratio", np.nan)) if cam is not None else np.nan
-        ),
     }
 
 
@@ -220,20 +158,12 @@ def record_held(
     hand_state: np.ndarray | None = None,
     hand_tactile: np.ndarray | None = None,
     frame_status: int = _FRAME_HELD,
-    retarget_ok: bool = False,
-    arm_qpos_sent: np.ndarray | None = None,
-    diagnostics: dict | None = None,
+    arm_qpos_sent: np.ndarray,
+    action_queued: bool = False,
     target_eef_pos: np.ndarray | None = None,
     target_eef_rot6d: np.ndarray | None = None,
-    hand_fk=None,
-    T_eef_handbase_pos: np.ndarray | None = None,
-    T_eef_handbase_quat_wxyz: np.ndarray | None = None,
     observation_anchor_monotonic_ns: int | None = None,
-    arm_ring_sequence: int = 0,
-    hand_ring_sequence: int = 0,
     shared: RuntimeChannels | None = None,
-    action_candidate: ActionCandidate | None = None,
-    control_run_generation: int,
     max_observation_skew_s: float,
     policy_observation: Mapping[str, object] | None = None,
 ) -> None:
@@ -245,11 +175,8 @@ def record_held(
     Args:
         arm_qpos_sent: Last arm target published in the coupled command record.
             Persists the exact command sent so held-frame samples stay consistent.
-        diagnostics: Per-frame diagnostics (tracking_error, ik_solve_time_ms, etc.).
         target_eef_pos/rot6d: Last valid IK target — prevents NaN gaps in
             ``action_arm_ee`` in the recorded sample.
-        action_candidate: Exact hold candidate published for this observation,
-            or ``None`` when the grid intentionally emitted no new command.
     """
     if recorder is None:
         return
@@ -271,9 +198,6 @@ def record_held(
         arm_state,
         hand_state,
         hand_tactile,
-        hand_fk=hand_fk,
-        handbase_position_eef_m=T_eef_handbase_pos,
-        handbase_quat_eef_wxyz=T_eef_handbase_quat_wxyz,
         timestamp_s=(
             None
             if observation_anchor_monotonic_ns is None
@@ -281,12 +205,13 @@ def record_held(
         ),
     )
     signals: dict[str, object] = {
-        "ik_ok": False,
-        "ik_attempted": frame_status != _FRAME_HELD,
-        "retarget_ok": retarget_ok,
-        "held": True,
-        "flag_safety_reject": frame_status == FRAME_SAFETY_REJECT,
+        "action_queued": action_queued,
         "frame_status": frame_status,
+        "tracking_error": (
+            float(arm_state["tracking_err"][0])
+            if arm_state is not None and "tracking_err" in arm_state.dtype.names
+            else np.nan
+        ),
     }
     if shared is not None:
         signals.update(
@@ -297,9 +222,6 @@ def record_held(
                 vr_frame,
                 cam,
                 anchor_monotonic_ns=observation_anchor_monotonic_ns,
-                arm_ring_sequence=arm_ring_sequence,
-                hand_ring_sequence=hand_ring_sequence,
-                action_candidate=action_candidate,
                 max_observation_skew_s=max_observation_skew_s,
             )
         )
@@ -312,8 +234,6 @@ def record_held(
         camera_frame=cam,
         signals=signals,
         arm_qpos_sent=arm_qpos_sent,
-        diagnostics=diagnostics,
-        control_run_generation=control_run_generation,
     )
 
 
@@ -327,28 +247,11 @@ def record_frame(
     target_quat: np.ndarray,
     vr_frame: dict | None,
     cam: dict | None,
-    ik_solve_time_ms: float,
-    target_pos_before_clamp: np.ndarray,
     hand_tactile: np.ndarray | None = None,
     *,
-    retarget_ok: bool = False,
     frame_status: int = FRAME_OK,
-    target_eef_pos_raw: np.ndarray | None = None,
-    target_eef_rot6d_raw: np.ndarray | None = None,
-    action_arm_joint_raw: np.ndarray | None = None,
-    action_hand_joint_raw: np.ndarray | None = None,
-    policy_map_time_ms: float = np.nan,
-    hand_retarget_time_ms: float = np.nan,
-    policy_compute_time_ms: float = np.nan,
-    hand_fk=None,
-    T_eef_handbase_pos: np.ndarray | None = None,
-    T_eef_handbase_quat_wxyz: np.ndarray | None = None,
     observation_anchor_monotonic_ns: int | None = None,
-    arm_ring_sequence: int = 0,
-    hand_ring_sequence: int = 0,
     shared: RuntimeChannels | None = None,
-    action_candidate: ActionCandidate | None = None,
-    control_run_generation: int,
     max_observation_skew_s: float,
     policy_observation: Mapping[str, object] | None = None,
 ) -> None:
@@ -370,16 +273,12 @@ def record_frame(
         arm_state,
         hand_state,
         hand_tactile,
-        hand_fk=hand_fk,
-        handbase_position_eef_m=T_eef_handbase_pos,
-        handbase_quat_eef_wxyz=T_eef_handbase_quat_wxyz,
         timestamp_s=(
             None
             if observation_anchor_monotonic_ns is None
             else int(observation_anchor_monotonic_ns) / 1e9
         ),
     )
-    head_quat = vr_frame.get("head_quat_wxyz") if vr_frame is not None else None
     _vr = (
         vr_frame
         if vr_frame is not None
@@ -390,16 +289,12 @@ def record_frame(
         }
     )
     signals: dict[str, object] = {
-        "ik_ok": True,
-        "ik_attempted": True,
-        "retarget_ok": retarget_ok,
-        "held": False,
-        "flag_safety_reject": frame_status == FRAME_SAFETY_REJECT,
         "frame_status": frame_status,
-        "action_arm_joint_raw": (
-            np.asarray(action_arm_joint_raw, dtype=np.float64)
-            if action_arm_joint_raw is not None
-            else arm_cmd.copy()
+        "action_queued": True,
+        "tracking_error": (
+            float(arm_state["tracking_err"][0])
+            if arm_state is not None and "tracking_err" in arm_state.dtype.names
+            else np.nan
         ),
     }
     if shared is not None:
@@ -411,9 +306,6 @@ def record_frame(
                 vr_frame,
                 cam,
                 anchor_monotonic_ns=observation_anchor_monotonic_ns,
-                arm_ring_sequence=arm_ring_sequence,
-                hand_ring_sequence=hand_ring_sequence,
-                action_candidate=action_candidate,
                 max_observation_skew_s=max_observation_skew_s,
             )
         )
@@ -426,36 +318,4 @@ def record_frame(
         camera_frame=cam,
         signals=signals,
         arm_qpos_sent=arm_cmd.copy(),
-        control_run_generation=control_run_generation,
-        diagnostics={
-            "tracking_error": (
-                float(arm_state["tracking_err"][0])
-                if arm_state is not None and "tracking_err" in arm_state.dtype.names
-                else 0.0
-            ),
-            "ik_solve_time_ms": ik_solve_time_ms,
-            "target_pos_before_clamp": target_pos_before_clamp,
-            "head_quat_wxyz": (
-                head_quat if head_quat is not None else np.full(4, np.nan)
-            ),
-            "target_eef_pos_raw": (
-                np.asarray(target_eef_pos_raw, dtype=np.float64)
-                if target_eef_pos_raw is not None
-                else np.full(3, np.nan)
-            ),
-            "target_eef_rot6d_raw": (
-                np.asarray(target_eef_rot6d_raw, dtype=np.float64)
-                if target_eef_rot6d_raw is not None
-                else np.full(6, np.nan)
-            ),
-            "action_hand_joint_raw": (
-                np.asarray(action_hand_joint_raw, dtype=np.float64)
-                if action_hand_joint_raw is not None
-                else hand_cmd.copy()
-            ),
-            "policy_map_time_ms": policy_map_time_ms,
-            "hand_retarget_time_ms": hand_retarget_time_ms,
-            "transition_check_time_ms": 0.0,
-            "policy_compute_time_ms": policy_compute_time_ms,
-        },
     )

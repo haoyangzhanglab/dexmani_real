@@ -28,7 +28,6 @@ from dexmani_real.deployment.executor import (
     PolicyExecutor,
     _CommandProgress,
     _RejectKind,
-    _rejection_ik_metadata,
     _validate_policy_arm_action,
     decode_policy_action,
 )
@@ -284,33 +283,22 @@ class TestRejectAttribution(unittest.TestCase):
         executor = PolicyExecutor.__new__(PolicyExecutor)
         executor.policy_spec = _fake_policy_spec(action_key="action")
         inputs = [mock.Mock(), {}, {}]
-        inputs_state = mock.Mock(arm_qpos=np.zeros(7), hand_qpos=np.zeros(12))
-        action = np.zeros(19)
         with (
             mock.patch.object(
                 executor, "_recorded_hold_action", return_value=mock.Mock()
             ),
-            mock.patch.object(
-                executor,
-                "_recorded_raw_action_parts",
-                return_value=(np.zeros(7), np.zeros(12)),
-            ),
             mock.patch.object(executor, "_record_frame") as record_frame,
         ):
             record_frame.return_value = True
-            executor._record_rejection(
-                inputs, action, ik_attempted=False, ik_ok=False, kind=_RejectKind.SAFETY
-            )
+            executor._record_rejection(inputs, kind=_RejectKind.SAFETY)
             safety_signals = record_frame.call_args.kwargs["signals"]
-            executor._record_rejection(
-                inputs, action, ik_attempted=True, ik_ok=False, kind=_RejectKind.IK
-            )
+            executor._record_rejection(inputs, kind=_RejectKind.IK)
             ik_signals = record_frame.call_args.kwargs["signals"]
-        self.assertTrue(safety_signals["flag_safety_reject"])
+        self.assertFalse(safety_signals["action_queued"])
         self.assertEqual(
             safety_signals["frame_status"], executor_mod._RECORD_FRAME_SAFETY_REJECT
         )
-        self.assertFalse(ik_signals["flag_safety_reject"])
+        self.assertFalse(ik_signals["action_queued"])
         self.assertEqual(ik_signals["frame_status"], executor_mod._RECORD_FRAME_IK_FAIL)
 
 
@@ -336,19 +324,6 @@ class TestPreparedCommandUnavailableParity(unittest.TestCase):
 
     def test_unavailable_with_recorder_is_noop(self):
         self._assert_unavailable_is_noop(mock.Mock())
-
-
-class TestRejectionIKMetadata(unittest.TestCase):
-    def test_joint_safety_reject_never_attempts_ik(self):
-        self.assertEqual(
-            _rejection_ik_metadata(False, _RejectKind.SAFETY), (False, False)
-        )
-
-    def test_ee_ik_failure_marks_attempted_not_ok(self):
-        self.assertEqual(_rejection_ik_metadata(True, _RejectKind.IK), (True, False))
-
-    def test_ee_safety_after_ik_marks_ok(self):
-        self.assertEqual(_rejection_ik_metadata(True, _RejectKind.SAFETY), (True, True))
 
 
 class TestCommandProgressDrain(unittest.TestCase):
@@ -1257,22 +1232,17 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         self.assertEqual(executor.shared.safety_state.value, SafetyState.ARMED)
 
     def test_ordinary_held_row_needs_no_initial_evidence_transaction(self):
+        from dexmani_real.ipc.schema import ARM_STATE_DTYPE, HAND_STATE_DTYPE
+
         executor = self.executor()
         self.begin(executor)
         now = executor.next_record_ns
         source_ns = now - 1
-        arm = np.array(
-            [(source_ns, True)],
-            dtype=[("source_monotonic_ns", "u8"), ("state_valid", "?")],
-        )
-        hand = np.array(
-            [(source_ns, True, 0)],
-            dtype=[
-                ("source_monotonic_ns", "u8"),
-                ("state_valid", "?"),
-                ("accepted_target_action_id", "u8"),
-            ],
-        )
+        arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
+        hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
+        for frame in (arm, hand):
+            frame["source_monotonic_ns"] = source_ns
+            frame["state_valid"] = True
         camera = dict(
             source_monotonic_ns=source_ns,
             camera_health=0,
@@ -1284,8 +1254,6 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         state = types.SimpleNamespace(
             arm_qpos=np.zeros(7),
             hand_qpos=np.zeros(12),
-            eef_pos=np.zeros(3),
-            eef_rot6d=np.array([1, 0, 0, 0, 1, 0]),
         )
         with (
             mock.patch.object(
@@ -1297,12 +1265,14 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
                 executor_mod, "read_camera_frame_causal", return_value=camera
             ),
             mock.patch.object(executor_mod, "build_episode_state", return_value=state),
-            mock.patch.object(executor, "_recording_hand_kinematics"),
             mock.patch.object(executor, "_record_frame", return_value=True) as record,
         ):
             executor._record_rollout_tick(now)
         record.assert_called_once()
-        self.assertTrue(record.call_args.kwargs["signals"]["held"])
+        self.assertEqual(
+            record.call_args.kwargs["signals"]["frame_status"],
+            executor_mod._RECORD_FRAME_HELD,
+        )
         self.assertFalse(record.call_args.kwargs["signals"]["action_queued"])
         self.assertEqual(executor.shared.safety_state.value, SafetyState.RUNNING)
 

@@ -8,21 +8,19 @@ from pathlib import Path
 import h5py  # type: ignore[import-untyped]
 import numpy as np
 
-from dexmani_real.recording.storage.schema import validate_data_layout
+from dexmani_real.recording.storage.schema import DATASET_SPECS, validate_data_layout
 
 
 class EpisodeDataWriter:
-    """Own and append aligned control rows to one lazy HDF5 transaction."""
+    """Own and append controller source rows to one lazy HDF5 transaction."""
 
     def __init__(
         self,
         path: str | Path,
         *,
-        arm_sent_stream: bool,
         write_initial_meta: Callable[[h5py.Group], None],
     ) -> None:
         self.path = Path(path)
-        self.arm_sent_stream = bool(arm_sent_stream)
         self._write_initial_meta = write_initial_meta
         self._file: h5py.File | None = None
         self._datasets: dict[str, h5py.Dataset] = {}
@@ -40,54 +38,31 @@ class EpisodeDataWriter:
         if self._file is None:
             self._file = h5py.File(self.path, "w")
             self._write_initial_meta(self._file.create_group("meta"))
-        return self._file
-
-    def append(self, data: Mapping[str, np.ndarray], timestamps: np.ndarray) -> None:
-        """Validate and append the unflushed prefix of one aligned buffer."""
-        frame_count = int(timestamps.shape[0])
-        if frame_count == self._flushed_frames:
-            return
-        shapes = {name: tuple(values.shape) for name, values in data.items()}
-        dtypes = {name: values.dtype for name, values in data.items()}
-        shapes["timestamp"] = tuple(timestamps.shape)
-        dtypes["timestamp"] = timestamps.dtype
-        errors = validate_data_layout(
-            shapes,
-            dtypes,
-            frame_count=frame_count,
-            arm_sent_stream=self.arm_sent_stream,
-        )
-        if errors:
-            raise RuntimeError("episode recorder buffer mismatch: " + "; ".join(errors))
-
-        data_h5 = self._ensure_open()
-        new_start = self._flushed_frames
-        for name, values in data.items():
-            if name not in self._datasets:
-                self._datasets[name] = data_h5.create_dataset(
-                    name,
-                    data=values[:frame_count].copy(),
-                    maxshape=(None,) + values.shape[1:],
-                    dtype=values.dtype,
+            for name, spec in DATASET_SPECS.items():
+                self._datasets[name] = self._file.create_dataset(
+                    name, shape=(0,) + spec.tail_shape,
+                    maxshape=(None,) + spec.tail_shape, dtype=spec.dtype,
                     compression="gzip",
                 )
-            else:
-                dataset = self._datasets[name]
-                dataset.resize(frame_count, axis=0)
-                dataset[new_start:frame_count] = values[new_start:frame_count]
-        if "timestamp" not in self._datasets:
-            self._datasets["timestamp"] = data_h5.create_dataset(
-                "timestamp",
-                data=timestamps[:frame_count].copy(),
-                maxshape=(None,),
-                dtype=np.float64,
-                compression="gzip",
-            )
-        else:
-            timestamp_dataset = self._datasets["timestamp"]
-            timestamp_dataset.resize(frame_count, axis=0)
-            timestamp_dataset[new_start:frame_count] = timestamps[new_start:frame_count]
-        self._flushed_frames = frame_count
+        return self._file
+
+    def append(self, data: Mapping[str, np.ndarray]) -> None:
+        """Append exactly this batch of newly emitted rows."""
+        count = len(data["timestamp"])
+        errors = validate_data_layout(
+            {name: values.shape for name, values in data.items()},
+            {name: values.dtype for name, values in data.items()},
+            frame_count=count,
+        )
+        if errors:
+            raise RuntimeError("episode row batch mismatch: " + "; ".join(errors))
+        self._ensure_open()
+        end = self._flushed_frames + count
+        for name, values in data.items():
+            dataset = self._datasets[name]
+            dataset.resize(end, axis=0)
+            dataset[self._flushed_frames:end] = values
+        self._flushed_frames = end
 
     def update_meta(self, write_meta: Callable[[h5py.Group], None]) -> None:
         """Apply final transaction metadata while retaining handle ownership."""

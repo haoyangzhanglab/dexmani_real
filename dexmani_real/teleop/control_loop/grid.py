@@ -29,7 +29,6 @@ from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
-from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.planning.kinematics.pose import (
     normalize_quat_wxyz,
     quat_wxyz_to_rot6d,
@@ -115,9 +114,6 @@ class TeleopGridResources:
     stage_timer: StageTimer
     validation_warn: ThrottledWarner
     arm_feedback_warn: ThrottledWarner
-    hand_fk: HandKinematics | None
-    handbase_position_eef_m: np.ndarray
-    handbase_quat_eef_wxyz: np.ndarray
     hand_ramp_total_frames: int
     max_observation_skew_s: float
 
@@ -141,22 +137,14 @@ class TeleopGridObservation:
 
 @dataclass(frozen=True)
 class TeleopActionComputation:
-    """Mapped targets, solver result, and diagnostics for one grid tick."""
+    """Mapped targets and solver result for one grid tick."""
 
     target_position_world_m: np.ndarray
     target_quat_world_wxyz: np.ndarray
-    raw_target_position_world_m: np.ndarray
-    raw_target_quat_world_wxyz: np.ndarray
-    position_before_workspace_clamp_world_m: np.ndarray
     hand_qpos_rad: np.ndarray
-    raw_hand_qpos_rad: np.ndarray
     hand_retarget_succeeded: bool
-    hand_retarget_time_ms: float
     ik_qpos_rad: np.ndarray | None
     ik_failure_reason: str
-    ik_solve_time_ms: float
-    policy_map_time_ms: float
-    policy_compute_started_s: float
 
 
 @dataclass(frozen=True)
@@ -259,8 +247,6 @@ class TeleopController:
         resources: TeleopGridResources,
     ) -> TeleopActionComputation | None:
         """Map one validated observation and solve its arm/hand proposal."""
-        compute_started_s = time.perf_counter()
-        map_started_s = time.perf_counter()
         mapped = self.arm_mapper.map(
             observation.vr_frame["wrist_pos"],
             observation.vr_frame["wrist_quat_wxyz"],
@@ -280,8 +266,6 @@ class TeleopController:
             logger.warning(
                 "teleop_loop: previous EEF quaternion is missing — skipping EMA"
             )
-        policy_map_time_ms = (time.perf_counter() - map_started_s) * 1000.0
-        resources.stage_timer.mark("map")
         hand = compute_hand_joint_proposal(
             self.hand_retargeter,
             observation.vr_frame,
@@ -298,31 +282,18 @@ class TeleopController:
         self.hand_ramp_start = hand.next_ramp_start_qpos_rad
         self.hand_ramp_step = hand.next_ramp_step
         self.planner.set_hand_qpos(hand.qpos_rad)
-        ik_started_s = time.perf_counter()
         ik_result = self.planner.solve_teleop_ik(
             Pose(p=target.position_world_m, q=target.quat_world_wxyz),
             observation.arm_qpos_rad,
             self.prev_qpos_cmd,
         )
-        ik_solve_time_ms = (time.perf_counter() - ik_started_s) * 1000.0
-        resources.stage_timer.mark("ik")
         return TeleopActionComputation(
             target_position_world_m=target.position_world_m,
             target_quat_world_wxyz=target.quat_world_wxyz,
-            raw_target_position_world_m=target.raw_position_world_m,
-            raw_target_quat_world_wxyz=target.raw_quat_world_wxyz,
-            position_before_workspace_clamp_world_m=(
-                target.position_before_workspace_clamp_world_m
-            ),
             hand_qpos_rad=hand.qpos_rad,
-            raw_hand_qpos_rad=hand.raw_qpos_rad,
             hand_retarget_succeeded=hand.retarget_succeeded,
-            hand_retarget_time_ms=hand.compute_time_ms,
             ik_qpos_rad=ik_result.qpos if ik_result.success else None,
             ik_failure_reason=ik_result.reason,
-            ik_solve_time_ms=ik_solve_time_ms,
-            policy_map_time_ms=policy_map_time_ms,
-            policy_compute_started_s=compute_started_s,
         )
 
 
@@ -352,15 +323,7 @@ def _empty_policy_observation_signals() -> dict[str, object]:
     return {
         "policy_observation_arm_qpos": np.full(ARM_JOINT_SHAPE, np.nan),
         "policy_observation_hand_qpos": np.full(HAND_JOINT_SHAPE, np.nan),
-        "policy_observation_reference_monotonic_ns": 0,
-        "policy_observation_arm_source_sequence": 0,
-        "policy_observation_hand_source_sequence": 0,
-        "policy_observation_arm_source_monotonic_ns": 0,
-        "policy_observation_hand_source_monotonic_ns": 0,
-        "policy_observation_arm_publish_monotonic_ns": 0,
-        "policy_observation_hand_publish_monotonic_ns": 0,
         "policy_observation_valid": False,
-        "policy_observation_skew_s": np.nan,
     }
 
 
@@ -369,6 +332,7 @@ def _recording_policy_observation_signals(
     camera_frame: dict[str, Any] | None,
     *,
     anchor_monotonic_ns: int,
+    max_observation_skew_s: float,
 ) -> dict[str, object]:
     """Pair causal arm/hand feedback with the recorded camera source time.
 
@@ -395,8 +359,8 @@ def _recording_policy_observation_signals(
     )
     if arm_result is None or hand_result is None:
         return signals
-    arm_state, arm_publish_ns, arm_sequence = arm_result
-    hand_state, hand_publish_ns, hand_sequence = hand_result
+    arm_state, _arm_publish_ns, _arm_sequence = arm_result
+    hand_state, _hand_publish_ns, _hand_sequence = hand_result
     arm_names = arm_state.dtype.names or ()
     hand_names = hand_state.dtype.names or ()
     if (
@@ -421,22 +385,15 @@ def _recording_policy_observation_signals(
         or min(reference_ns, arm_source_ns, hand_source_ns) <= 0
     ):
         return signals
+    if (
+        reference_ns - min(arm_source_ns, hand_source_ns)
+    ) > int(round(float(max_observation_skew_s) * 1e9)):
+        return signals
     signals.update(
         {
             "policy_observation_arm_qpos": arm_qpos.copy(),
             "policy_observation_hand_qpos": hand_qpos.copy(),
-            "policy_observation_reference_monotonic_ns": reference_ns,
-            "policy_observation_arm_source_sequence": int(arm_sequence),
-            "policy_observation_hand_source_sequence": int(hand_sequence),
-            "policy_observation_arm_source_monotonic_ns": arm_source_ns,
-            "policy_observation_hand_source_monotonic_ns": hand_source_ns,
-            "policy_observation_arm_publish_monotonic_ns": int(arm_publish_ns),
-            "policy_observation_hand_publish_monotonic_ns": int(hand_publish_ns),
             "policy_observation_valid": True,
-            "policy_observation_skew_s": (
-                reference_ns - min(arm_source_ns, hand_source_ns)
-            )
-            / 1e9,
         }
     )
     return signals
@@ -449,10 +406,8 @@ def _record_grid_hold(
     observation: TeleopGridObservation,
     *,
     recording_active: bool,
-    action_candidate: ActionCandidate | None = None,
+    action_queued: bool = False,
     frame_status: int | None = None,
-    retarget_ok: bool = False,
-    diagnostics: dict[str, Any] | None = None,
 ) -> None:
     """Record one fallback command with the common causal grid provenance."""
     if not recording_active:
@@ -469,20 +424,12 @@ def _record_grid_hold(
         observation.camera_frame,
         hand_state=observation.hand_state,
         hand_tactile=observation.hand_tactile,
-        retarget_ok=retarget_ok,
         arm_qpos_sent=controller.prev_qpos_cmd.copy(),
-        diagnostics=diagnostics,
+        action_queued=action_queued,
         target_eef_pos=controller.last_target_eef_pos,
         target_eef_rot6d=controller.last_target_eef_rot6d,
-        hand_fk=resources.hand_fk,
-        T_eef_handbase_pos=resources.handbase_position_eef_m,
-        T_eef_handbase_quat_wxyz=resources.handbase_quat_eef_wxyz,
         observation_anchor_monotonic_ns=observation.anchor_monotonic_ns,
-        arm_ring_sequence=observation.arm_ring_sequence,
-        hand_ring_sequence=observation.hand_ring_sequence,
         shared=shared,
-        action_candidate=action_candidate,
-        control_run_generation=observation.control_run_generation,
         max_observation_skew_s=resources.max_observation_skew_s,
         policy_observation=observation.policy_observation_signals,
         **kwargs,
@@ -721,6 +668,7 @@ def _read_control_grid_observation(
             shared,
             cam,
             anchor_monotonic_ns=observation_anchor_monotonic_ns,
+            max_observation_skew_s=resources.max_observation_skew_s,
         )
         if recording_active
         else None
@@ -757,7 +705,6 @@ def _publish_arm_safety_hold(
     recording_active: bool,
     failure_context: str,
     frame_status: int,
-    retarget_ok: bool,
 ) -> bool:
     """Publish and record an arm-only hold after a rejected proposal."""
     prepared_hold, hold_result = _prepare_and_publish_joint_command(
@@ -787,9 +734,8 @@ def _publish_arm_safety_hold(
         resources,
         observation,
         recording_active=recording_active,
-        action_candidate=published_hold,
+        action_queued=True,
         frame_status=frame_status,
-        retarget_ok=retarget_ok,
     )
     return True
 
@@ -851,44 +797,14 @@ def _publish_ik_failure_hold(
                 published_candidate.hand_qpos, dtype=np.float64
             ).copy()
 
-    arm_names = observation.arm_state.dtype.names or ()
-    diagnostics = {
-        "tracking_error": (
-            float(observation.arm_state["tracking_err"][0])
-            if "tracking_err" in arm_names
-            else 0.0
-        ),
-        "ik_solve_time_ms": computation.ik_solve_time_ms,
-        "target_pos_before_clamp": (
-            computation.position_before_workspace_clamp_world_m.copy()
-        ),
-        "head_quat_wxyz": np.asarray(
-            observation.vr_frame.get("head_quat_wxyz", np.full(4, np.nan)),
-            dtype=np.float64,
-        ),
-        "target_eef_pos_raw": computation.raw_target_position_world_m.copy(),
-        "target_eef_rot6d_raw": quat_wxyz_to_rot6d(
-            normalize_quat_wxyz(computation.raw_target_quat_world_wxyz)
-        ),
-        "action_hand_joint_raw": computation.raw_hand_qpos_rad.copy(),
-        "policy_map_time_ms": computation.policy_map_time_ms,
-        "hand_retarget_time_ms": computation.hand_retarget_time_ms,
-        "transition_check_time_ms": 0.0,
-        "policy_compute_time_ms": (
-            time.perf_counter() - computation.policy_compute_started_s
-        )
-        * 1000.0,
-    }
     _record_grid_hold(
         controller,
         shared,
         resources,
         observation,
         recording_active=recording_active,
-        action_candidate=published_candidate,
+        action_queued=True,
         frame_status=FRAME_IK_FAIL,
-        retarget_ok=computation.hand_retarget_succeeded,
-        diagnostics=diagnostics,
     )
     return True
 
@@ -910,9 +826,6 @@ def _publish_solved_action(
     recorder = resources.recorder
     command_limits = resources.command_limits
     stage_timer = resources.stage_timer
-    _hand_fk = resources.hand_fk
-    _T_eef_handbase_pos = resources.handbase_position_eef_m
-    _T_eef_handbase_quat_wxyz = resources.handbase_quat_eef_wxyz
     _current_grid_anchor_ns = observation.anchor_monotonic_ns
     arm_state = observation.arm_state
     vr_frame = observation.vr_frame
@@ -921,16 +834,8 @@ def _publish_solved_action(
     hand_tactile = observation.hand_tactile
     target_pos = computation.target_position_world_m
     target_quat = computation.target_quat_world_wxyz
-    target_pos_raw = computation.raw_target_position_world_m
-    target_quat_raw = computation.raw_target_quat_world_wxyz
-    target_pos_before_clamp = computation.position_before_workspace_clamp_world_m
     hand_cmd = computation.hand_qpos_rad
-    hand_cmd_raw = computation.raw_hand_qpos_rad
     retarget_ok = computation.hand_retarget_succeeded
-    hand_retarget_time_ms = computation.hand_retarget_time_ms
-    ik_solve_time_ms = computation.ik_solve_time_ms
-    policy_map_time_ms = computation.policy_map_time_ms
-    _policy_compute_t0 = computation.policy_compute_started_s
 
     if controller.consecutive_ik_hold_frames:
         logger.info(
@@ -950,7 +855,6 @@ def _publish_solved_action(
         compute_qpos_delta=planner.compute_qpos_delta,
     )
     arm_cmd = arm_proposal.qpos_rad
-    arm_cmd_raw = arm_proposal.raw_qpos_rad
 
     reject_reason = arm_proposal.validation_issue
     if reject_reason is not None:
@@ -967,7 +871,6 @@ def _publish_solved_action(
             recording_active=recording_active,
             failure_context="rejected-action",
             frame_status=FRAME_SAFETY_REJECT,
-            retarget_ok=computation.hand_retarget_succeeded,
         )
 
     prepared_command, publish_result = _prepare_and_publish_joint_command(
@@ -999,7 +902,6 @@ def _publish_solved_action(
             recording_active=recording_active,
             failure_context="workspace-rejection",
             frame_status=FRAME_SAFETY_REJECT,
-            retarget_ok=computation.hand_retarget_succeeded,
         )
     if (
         publish_result is None
@@ -1043,7 +945,6 @@ def _publish_solved_action(
     controller.ema_prev_quat = target_quat.copy()
 
     if recording_active:
-        policy_compute_time_ms = (time.perf_counter() - _policy_compute_t0) * 1000.0
         controller.last_target_eef_pos = target_pos.copy()
         controller.last_target_eef_rot6d = quat_wxyz_to_rot6d(
             normalize_quat_wxyz(target_quat)
@@ -1062,29 +963,10 @@ def _publish_solved_action(
             target_quat,
             vr_frame,
             cam,
-            ik_solve_time_ms,
-            target_pos_before_clamp,
             hand_tactile,
-            retarget_ok=retarget_ok,
             frame_status=_f_status,
-            target_eef_pos_raw=target_pos_raw,
-            target_eef_rot6d_raw=quat_wxyz_to_rot6d(
-                normalize_quat_wxyz(target_quat_raw)
-            ),
-            action_hand_joint_raw=hand_cmd_raw,
-            action_arm_joint_raw=arm_cmd_raw,
-            policy_map_time_ms=policy_map_time_ms,
-            hand_retarget_time_ms=hand_retarget_time_ms,
-            policy_compute_time_ms=policy_compute_time_ms,
-            hand_fk=_hand_fk,
-            T_eef_handbase_pos=_T_eef_handbase_pos,
-            T_eef_handbase_quat_wxyz=_T_eef_handbase_quat_wxyz,
             observation_anchor_monotonic_ns=_current_grid_anchor_ns,
-            arm_ring_sequence=observation.arm_ring_sequence,
-            hand_ring_sequence=observation.hand_ring_sequence,
             shared=shared,
-            action_candidate=published_candidate,
-            control_run_generation=published_candidate.run_generation,
             max_observation_skew_s=resources.max_observation_skew_s,
             policy_observation=observation.policy_observation_signals,
         )
@@ -1164,7 +1046,7 @@ def run_control_grid_tick(
             resources,
             observation,
             recording_active=tick_result.recording_active,
-            action_candidate=published_hold,
+            action_queued=True,
         )
         return tick_result
 

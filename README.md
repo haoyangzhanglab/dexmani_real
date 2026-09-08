@@ -29,10 +29,10 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
   自碰撞/静态障碍检查和新鲜反馈确认后才从 frame 0 开始重放。手部反馈不要求复现录制值。
 - RealSense 相机按设备原生频率连续采集；16 Hz 控制网格只选择最新严格因果帧，
   不再将相机发布节拍绑定到控制频率。
-- 事务式写入 depth-to-color aligned RGB-D raw episode v24；除 native depth/color 几何与
-  时序 provenance 外，还保存与 camera source 对齐的 arm/hand policy observation、hand SDK ACK
-  与限速后的 hand target。
-- 将 aligned raw v24 episode 清洗为 processed HDF5 v14；四种 profile 的
+- 事务式写入 depth-to-color aligned RGB-D raw episode v25；除 native depth/color 几何与
+  calibration 外，保留与 camera source 对齐的 arm/hand policy observation、必要 source timestamp
+  和实际发送的 arm target / logical hand target；不持久化 runtime proof 或 SDK ACK。
+- 将 aligned raw v25 episode 清洗为 processed HDF5 v14；四种 profile 的
   teleop 已发布 target 数据均可导出 Policy Zarr v7（v7 是 v14 的显式 legacy 投影，
   `eef_pose`/`tactile_force` 不进入 Zarr）。所有 profile 的 `eef_pose` 与 `fingertip_points`
   都由自身 `joint_state` 推导，每 timestep 只执行一次 canonical Arm FK，并在处理时记录
@@ -53,7 +53,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`replay/`](dexmani_real/replay) |
 | raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/storage/hdf5_writer.py`](dexmani_real/recording/storage/hdf5_writer.py)、[`recording/storage/reader.py`](dexmani_real/recording/storage/reader.py) |
 | 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`dataset/`](dexmani_real/dataset) |
-| 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v24、processed v14 与 Policy Zarr v7 的字段、dtype、shape 与语义 |
+| 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v25、processed v14 与 Policy Zarr v7 的字段、dtype、shape 与语义 |
 | learned-policy 部署与正式评估 | [`examples/run_policy.py`](examples/run_policy.py)、[`docs/policy_eval_workflow.md`](docs/policy_eval_workflow.md) | [`deployment/`](dexmani_real/deployment)、[`deployment/inference/dexmani_policy.py`](dexmani_real/deployment/inference/dexmani_policy.py) |
 | 相机、桌面与 VR 标定 | [`examples/`](examples) | [`calibration/`](dexmani_real/calibration)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
 | 点云完整链路 | [`docs/pointcloud_pipeline.md`](docs/pointcloud_pipeline.md) | [`sensor/pointcloud.py`](dexmani_real/sensor/pointcloud.py)、[`sensor/pointcloud_worker.py`](dexmani_real/sensor/pointcloud_worker.py) |
@@ -97,7 +97,7 @@ RealSense / Quest-HTS / xArm7 / XHand
   worker 在 [`robot/command_validation.py`](dexmani_real/robot/command_validation.py) 再次校验。
   arm/hand homing 分别由 [`control/arm_homing.py`](dexmani_real/control/arm_homing.py) 和
   [`control/hand_homing.py`](dexmani_real/control/hand_homing.py) 拥有。
-- Recorder 只持久化选定的固定网格样本，不拥有机器人控制。
+- Recorder 每个 controller sample 写一行，保留实际时间缺口，不二次对齐或生成 HOLD；不拥有机器人控制。
 - `run_generation`、freshness、heartbeat、safety state 与 worker 侧检查共同使
   暂停、回零或故障前的旧命令失效。
 
@@ -260,7 +260,7 @@ eval 按键为 B（开始）、S（SUCCESS）、
 C（FAILURE）、D（INVALID）、H（home）、Q（以 INVALID 结束并有界退出）、ESC（即时 e-stop）。正常
 SUCCESS/FAILURE/INVALID 都使用 `stop_episode(save=True)`；task outcome 独立保存到 `result.json`。
 recording integrity failure 立即标记 INVALID 并撤销未来 motion generation，不等待 arm/hand acceptance。
-正常结束后继续允许 H 回家和 Q 退出。raw-v24 的 `/meta/success` 仅是 legacy storage commit flag。
+正常结束后继续允许 H 回家和 Q 退出。raw 的 `/meta/success` 仅表示 storage transaction 提交成功。
 
 ### Learned policy 实时点云
 
@@ -386,11 +386,10 @@ python examples/process_episodes.py \
 `--profile` 选择 `joint`、`rgb`、`pointcloud` 或 `rgb_pc`。后两种 profile 可用
 `--pointcloud-num-points` 选择 `1024`、`2048`、`4096` 或 `8192`，默认 `1024`。
 
-普通读取、处理、回放和可视化只接受通过当前 raw v24 admission 的 episode：必需文件、schema、
-`data.h5` dataset layout、depth shape/dtype 和基本 semantic 都必须有效。writer 在 sidecar
-关闭后完成结构校验；reader、处理器和回放器不执行额外的文件完整性扫描。
-旧录制不属于当前数据契约，不能由 reader、处理器、回放或可视化器重解释；需要先在运行时外迁移或
-重新采集，才能进入训练链。
+普通读取、处理、回放和可视化只接受 raw v25：必需文件、schema、dataset shape/dtype
+和 sidecar 帧数必须有效。Reader 和 finalize 不重放 runtime proof，也不完整解码 RGB。
+历史 v24 仅通过[一次性 frozen converter](docs/raw_v24_migration.md)迁移；没有 compatibility Reader。
+
 要生成 learned-policy 训练数据，在发布
 前先使用明确的 task identity 做 dry-run：
 
@@ -411,7 +410,7 @@ camera-source 对齐的 arm/hand policy observation 与同 source 已校准 tact
 annotation 中 task_name 冲突。四种 profile 在通过各自边界后使用
 `teleop_published_joint_target` 语义，并可进入 Policy Zarr v7。
 
-raw v24 episode 可视化默认使用当前 resolved runtime 中的点云策略和桌面标定即时生成 canonical
+raw v25 episode 可视化默认使用当前 resolved runtime 中的点云策略和桌面标定即时生成 canonical
 `(N,6)` 点云；该路径与 offline processing、实时 deployment 共用同一个 `build_point_cloud()`
 实现。使用 `--no-point-cloud` 可关闭即时点云，
 `--pointcloud-num-points` 可选择 `1024`、`2048`、`4096` 或 `8192`。
@@ -489,7 +488,14 @@ datasets/<task>.zarr/
 └── meta/episode_ends
 ```
 
-正式 raw writer 写 schema v24；depth 通过 SDK 对齐到 color 像素网格后保存，并同时保存两路帧号、设备时间戳、native intrinsics、distortion 与 `T_color_from_depth` 作为 provenance。它还持久化与 camera source 对齐的 state、其 source/publish provenance、有效性/skew 和 hand SDK ACK。离线处理区分硬无效、软审计和有界修复：1–4 帧 IK hold 作为真实停顿保留，连续 5 帧起的长 IK hold 删除；tactile sum 只可由不晚于 observation reference、在 skew 窗口内且 hand/tactile source 相等的已校准样本因果补齐；可重新验真的 Camera duplicate 保留；joint-state excursion 与 deployment action delta 只审计。`stall_window_frames=8` 表示包含 8 个样本的 inclusive stall window（端点差为 7）；只有 `strict` 才排除高置信时序异常，`audit` 只记录，`hard_only` 关闭 temporal detectors。Policy Zarr 不压紧或拆分有缺口的 episode，而是整条拒绝。
+正式 raw writer 写 schema v25：保留 physical/human source、useful command、必要 timestamp、
+最小 validity 与 calibration；不保存 runtime proof/ACK/device-clock/profiling。
+新采集每个 controller sample 写一行，timestamp gaps 保持缺口；迁移行保留 row/media identity，
+cleaner 排除非 SOURCE 行。1–4 行 IK_FAIL 暂停可保留，连续 5 行起删除。
+tactile 只能从已持久化前缀中选择 source 不晚于 reference、skew 有界、fresh/calibrated 的同-source 样本；
+完整选中 payload 非有限即拒绝。camera fresh、observation valid 与视觉 policy state valid 必须成立，
+不恢复 duplicate forensic 记录。状态机械越界保留审计，动作机械越界硬拒绝。
+temporal quality 行为和 processed v14 / Policy Zarr v7 contract 不变；Zarr 整条拒绝有缺口的 episode。
 
 ## 开发与验证
 

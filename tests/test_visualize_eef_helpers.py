@@ -2,7 +2,7 @@
 
 No Rerun GUI is started and no hardware is touched: these tests import the two
 example visualizer modules by path and pin their pure render-admission helpers
-— finite raw ``arm_ee`` / processed ``eef_pose`` rows yield the position and
+— finite derived raw EEF / processed ``eef_pose`` rows yield the position and
 finite ``fingertip`` rows yield the (5,3) positions, while invalid rows yield
 None (the clear-entity path that prevents stale spheres), and the processed
 time-series labels are the frozen ``ee_x..ee_r5`` set.  Run with:

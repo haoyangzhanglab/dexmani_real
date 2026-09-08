@@ -8,7 +8,7 @@ no files; opens a Rerun viewer window (or prints a structure summary with
 ``--info``).
 
 Unlike ``examples/visualize_episode.py``, which derives a current-config point
-cloud preview from raw v24 RGB-D, this reads a single ``.h5`` file whose RGB,
+cloud preview from raw v25 RGB-D, this reads a single ``.h5`` file whose RGB,
 depth, and point cloud are already stored grid-aligned at ``(T, ...)`` with
 processing provenance. The point cloud is precomputed in the xArm base frame,
 so nothing is back-projected here.

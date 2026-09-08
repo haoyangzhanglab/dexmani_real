@@ -514,7 +514,6 @@ class TAGHandRetargeter:
         self._pinky_palm_scale = float(tag_config.pinky_palm_scale)
         self._prior_weight = float(tag_config.prior_weight)
 
-        self._last_raw_qpos: np.ndarray | None = None
         self.debug = bool(debug)
 
         logger.info(
@@ -574,7 +573,6 @@ class TAGHandRetargeter:
             return None
 
         qpos_sdk = qpos_model[self._mapping_model_to_sdk]
-        self._last_raw_qpos = qpos_sdk.copy()
 
         if self.debug:
             dt_ms = 1000.0 * (time.perf_counter() - t0)
@@ -584,8 +582,6 @@ class TAGHandRetargeter:
 
     def reset(self, initial_qpos: np.ndarray | None = None) -> None:
         """Reset optimizer state and optional SDK-order warm start."""
-        self._last_raw_qpos = None
-
         if (
             initial_qpos is not None
             and initial_qpos.shape == HAND_JOINT_SHAPE
@@ -596,11 +592,6 @@ class TAGHandRetargeter:
             self._optimizer.reset(qpos_model)
         else:
             self._optimizer.reset(None)
-
-    @property
-    def last_raw_qpos(self) -> np.ndarray | None:
-        """Latest SDK-order retarget output."""
-        return self._last_raw_qpos.copy() if self._last_raw_qpos is not None else None
 
 
 def pin_loading(urdf_path: str):

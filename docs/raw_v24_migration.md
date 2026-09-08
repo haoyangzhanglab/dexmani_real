@@ -64,3 +64,13 @@ that result alongside successful exports. The local baseline lives under
 `/tmp/dexmani_v25_golden_before`; it is not tracked source data. All 60 available
 episodes have SOURCE rows only, so converter tests cover historical synthetic
 HOLD/PLACEHOLDER rows separately. No hardware was exercised.
+
+Phase 6 golden comparison passed against that baseline: 129 processed/Zarr
+arrays matched (discrete values exactly, floating values with
+`allclose(equal_nan=True)`), including shapes/dtypes, EEF/fingertips, tactile,
+RGB/depth/pointcloud, source selection/segment boundaries and episode ends.
+Task labels, all six processed lengths and the two existing visual export
+rejections matched. Diagnostic drop-reason bits were intentionally excluded;
+their runtime-proof categories no longer exist. New local outputs are under
+`/tmp/dexmani_v25_golden_after_verified`, from `/tmp/dexmani_v25_converted`.
+Original v24 episodes were not changed or deleted.

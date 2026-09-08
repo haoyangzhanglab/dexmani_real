@@ -118,7 +118,7 @@ class TestAutoFinalizationReason(unittest.TestCase):
 
 
 class TestSaveOutcome(unittest.TestCase):
-    def test_failure_commits_real_raw_v24_transaction(self):
+    def test_failure_commits_real_raw_v25_transaction(self):
         """Exercise disk IO and codec validation, with no sensors or SDKs."""
         import json
         import tempfile
@@ -163,12 +163,11 @@ class TestSaveOutcome(unittest.TestCase):
                             "landmarks": np.full((21, 3), np.nan),
                         },
                         signals={
-                            "held": True,
+                            "frame_status": 1,
                             "action_queued": False,
-                            "observation_id": 1,
                             "observation_anchor_monotonic_ns": 1_000_000_000,
                         },
-                        control_run_generation=1,
+                        arm_qpos_sent=np.zeros(7),
                     )
                 )
                 recorder.stop_episode(save=True, reason="eval:failure:operator")
@@ -177,7 +176,7 @@ class TestSaveOutcome(unittest.TestCase):
                 self.assertTrue((episode_path / "rgb.mp4").is_file())
                 self.assertTrue((episode_path / "depth.h5").is_file())
                 with h5py.File(episode_path / "data.h5", "r") as raw:
-                    self.assertEqual(raw["meta"].attrs["schema_version"], 24)
+                    self.assertEqual(raw["meta"].attrs["schema_version"], 25)
                     self.assertEqual(raw["meta"].attrs["num_frames"], 1)
                     self.assertTrue(raw["meta"].attrs["success"])
                     self.assertEqual(

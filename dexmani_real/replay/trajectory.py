@@ -11,6 +11,7 @@ import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.planning import Pose, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.robot.model import (
@@ -119,11 +120,7 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
             if "hand_qpos" in h5
             else None
         )
-        arm_ee = (
-            np.asarray(h5["arm_ee"][:total_frames], dtype=np.float64)
-            if "arm_ee" in h5
-            else None
-        )
+        arm_ee = compute_eef_pose_history_xarm_base(arm_qpos)
         send_mask = (
             np.asarray(h5["flag_action_queued"][:total_frames], dtype=bool)
             if "flag_action_queued" in h5

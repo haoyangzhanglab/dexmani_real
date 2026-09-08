@@ -1,5 +1,7 @@
 # DexMani Real — Canonical Policy Rollout Simplification Guide
 
+> 历史实施记录：本文涉及的 raw v24 保持约束已由后续 [raw v25 contract](raw_v25_runtime_simplification_guide.md) 取代；当前 schema 与工作流见 [data_schema.md](data_schema.md)。
+
 > Repository: `haoyangzhanglab/dexmani_real`  
 > Intended executor: Claude Code / Codex  
 > Cross-repository Policy baseline: `haoyangzhanglab/dexmani_policy@8fb7bac7a898433f290404e2a0567ab215c0e4ba`

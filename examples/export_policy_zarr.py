@@ -77,7 +77,7 @@ def _format_export_failure(exc: Exception) -> str:
         return (
             f"{message}\n"
             "hint: Policy Zarr v7 requires teleop-published-target processed "
-            "v13 data; reprocess raw v24 with --task-name <task>"
+            "v13 data; reprocess raw v25 with --task-name <task>"
         )
     return message
 

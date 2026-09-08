@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/process_episodes.py INPUT_ROOT [--profile PROFILE]``.
 
-Offline CLI that audits and compacts one task's depth-to-color aligned raw-v24
+Offline CLI that audits and compacts one task's depth-to-color aligned raw-v25
 episodes into processed HDF5 v14 files, one per source episode.
 
 Directory mapping: ``episodes/<task>/episode_*`` (raw) is published to
@@ -102,7 +102,7 @@ def _route_library_logging_to_stderr() -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Audit and compact depth-to-color aligned raw-v24 Real episodes into one "
+            "Audit and compact depth-to-color aligned raw-v25 Real episodes into one "
             "processed-v14 "
             "HDF5 per source; seriously broken episodes are skipped with a warning."
         )

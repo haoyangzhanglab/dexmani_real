@@ -30,7 +30,6 @@ from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POLICY_ID,
 )
 from dexmani_real.planning.kinematics.pose import validate_canonical_rot6d
-from dexmani_real.recording.storage.schema import SEMANTIC_META_ATTRS
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
 PROCESSED_SCHEMA_VERSION = 14
@@ -57,12 +56,12 @@ _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "fingertip_points": ((5, 3), np.dtype(np.float32)),
 }
 _FRAME_CHUNKED_DATASETS = frozenset(("rgb", "depth", "point_cloud"))
-_CONTACT_FORCE_UNIT = str(SEMANTIC_META_ATTRS["tactile_unit"])
-_CONTACT_FORCE_SI_VERIFIED = bool(SEMANTIC_META_ATTRS["tactile_si_unit_verified"])
+_CONTACT_FORCE_UNIT = "sdk_scaled_unknown_si"
+_CONTACT_FORCE_SI_VERIFIED = False
 _CONTACT_FORCE_FRAME = "xhand_sensor_native_axes_per_finger"
-_FINGERTIP_POINTS_FRAME = str(SEMANTIC_META_ATTRS["hand_fingertip_frame"])
+_FINGERTIP_POINTS_FRAME = "xarm_base"
 _FINGERTIP_POINTS_UNIT = "m"
-_ACTION_EE_FRAME = str(SEMANTIC_META_ATTRS["action_arm_ee_frame"])
+_ACTION_EE_FRAME = "xarm_base"
 # Only source-provable tactile semantics are persisted: SDK orders and axis
 # labels are facts of the xhand driver; SI units and taxel spatial geometry
 # are explicitly unverified.
@@ -70,8 +69,8 @@ _TACTILE_FORCE_REPRESENTATION = "xhand_sdk_raw_force_fx_fy_fz"
 _TACTILE_FORCE_SENSOR_ORDER = "xhand_sdk_sensor_data_order"
 _TACTILE_FORCE_POINT_ORDER = "xhand_sdk_sensor_data_raw_force_order"
 _TACTILE_FORCE_AXIS_LABELS = "fx_fy_fz"
-_TACTILE_FORCE_UNIT = str(SEMANTIC_META_ATTRS["tactile_unit"])
-_TACTILE_FORCE_SI_VERIFIED = bool(SEMANTIC_META_ATTRS["tactile_si_unit_verified"])
+_TACTILE_FORCE_UNIT = "sdk_scaled_unknown_si"
+_TACTILE_FORCE_SI_VERIFIED = False
 _TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED = False
 
 

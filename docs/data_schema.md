@@ -1,6 +1,6 @@
 # Real 数据集 schema 参考
 
-本文是 DexMani Real 持久化数据的字段参考，覆盖当前 raw HDF5 v24、processed HDF5 v14 与
+本文是 DexMani Real 持久化数据的字段参考，覆盖当前 raw HDF5 v25、processed HDF5 v14 与
 Policy Zarr v7。运行行为和精确校验仍以
 [`recording/storage/schema.py`](../dexmani_real/recording/storage/schema.py)、
 [`dataset/processing.py`](../dexmani_real/dataset/processing.py) 与
@@ -12,7 +12,7 @@ Policy Zarr v7。运行行为和精确校验仍以
 ## 目录
 
 - [约定与数据流](#约定与数据流)
-- [raw episode HDF5 v24](#1-raw-episode-hdf5-v24)
+- [raw episode HDF5 v25](#1-raw-episode-hdf5-v25)
 - [processed HDF5 v14](#2-processed-hdf5-v14)
 - [Policy Zarr v7](#3-policy-zarr-v7)
 - [字段映射摘要](#字段映射摘要)
@@ -21,7 +21,7 @@ Policy Zarr v7。运行行为和精确校验仍以
 ## 约定与数据流
 
 ```text
-episodes/<task>/episode_*          raw v24 directory
+episodes/<task>/episode_*          raw v25 directory
     data.h5 + depth.h5 + rgb.mp4
                 │ process_episodes.py
                 ▼
@@ -41,153 +41,87 @@ datasets/<task>.zarr               Policy Zarr v7, one profile per store
   都包含时间维，除非特别说明为 attribute。
 - `xarm_base` 是 Real 的机器人世界坐标系。位置、点云 XYZ 与 fingertip 坐标单位为 m；
   关节与手部目标单位为 rad；rot6d 是无单位旋转表示；点云 RGB 是 `[0,1]` 的 float32。
-- 逐行动作对齐语义为 `obs[t]_before_action[t]`。raw 的时间网格允许 causal hold 与
-  leading placeholder，必须结合 `fill_reason`、`flag_sample_valid` 和 source 索引解释。
+- 逐行动作对齐语义为 `obs[t]_before_action[t]`。新采集 raw 不补时间网格；
+  迁移行结合 `fill_reason`、`flag_sample_valid` 和 source 索引解释。
 
-## 1. raw episode HDF5 v24
+## 1. raw episode HDF5 v25
 
-一个 raw episode 是原子发布的目录，而不是一个单文件：
+发布目录仍是 `data.h5 + depth.h5 + rgb.mp4`。所有 dataset 的第一维等于
+`meta.num_frames`，depth 是与 RGB 对齐的 uint16 图像。Reader 只接受 schema 25，
+检查必需文件、dataset shape/dtype 与帧数；构造和 finalize 不完整解码 RGB，也不重放 runtime proof。
+历史 v24 必须先运行[冻结转换器](raw_v24_migration.md)，没有 compatibility Reader。
 
-| 成员 | 内容 | 存储 |
+### 必需的 41 个 dataset
+
+| 字段 | 每行 shape | dtype |
 |---|---|---|
-| `data.h5` | 控制网格状态、动作、质量与相机时序；根下有 `meta` group | 每个 dataset gzip 压缩 |
-| `depth.h5` | `/depth`，已由 depth-to-color 对齐的 Z16 depth | gzip level 1 |
-| `rgb.mp4` | 与控制网格一一对应的 RGB 帧 | 编码视频，不是 HDF5 dataset |
+| timestamp | scalar | float64 |
+| source_sample_index | scalar | int64 |
+| fill_reason | scalar | uint8 |
+| flag_sample_valid | scalar | bool |
+| arm_qpos, arm_qvel, arm_tau | (7,) | float64 |
+| hand_qpos, hand_current | (12,) | float64 |
+| hand_contact | (5,3) | float64 |
+| hand_tactile_force | (5,120,3) | float64 |
+| arm_connected, hand_connected, hand_qpos_stale | scalar | bool |
+| tracking_error | scalar | float64 |
+| arm_last_cmd_seq | scalar | int64 |
+| action_arm_joint_sent | (7,) | float64 |
+| action_hand_joint | (12,) | float64 |
+| action_arm_ee | (9,) | float64 |
+| flag_action_queued | scalar | bool |
+| flag_frame_status | scalar | uint8 |
+| observation_anchor_monotonic_ns | scalar | uint64 |
+| observation_valid | scalar | bool |
+| arm_source_monotonic_ns, hand_source_monotonic_ns, tactile_source_monotonic_ns, vr_source_monotonic_ns, camera_source_monotonic_ns | scalar | uint64 |
+| tactile_fresh, tactile_calibrated | scalar | bool |
+| tactile_unit_code | scalar | uint8 |
+| flag_camera_fresh | scalar | bool |
+| camera_depth_frame_number, camera_color_frame_number | scalar | uint64 |
+| policy_observation_arm_qpos | (7,) | float64 |
+| policy_observation_hand_qpos | (12,) | float64 |
+| policy_observation_valid | scalar | bool |
+| vr_wrist_pos | (3,) | float64 |
+| vr_wrist_rot6d | (6,) | float64 |
+| vr_landmarks | (21,3) | float64 |
+| head_quat_wxyz | (4,) | float64 |
 
-`data.h5/meta.attrs["schema_version"] == 24`。v24 在发布前验证完整的 data/sidecar 语义。
-reader、处理、回放与可视化只接受该契约；
-其他版本必须在运行时外迁移或重新采集，不能补出缺失的因果 policy observation。
+每个 controller-emitted sample 恰好写一行；timestamp 是实际 observation/controller anchor（秒）。
+`source_sample_index=0,1,...`、`fill_reason=0 (SOURCE)`、`flag_sample_valid=True`。
+漏掉的 tick 保持时间缺口，不生成 HOLD/PLACEHOLDER。32 行磁盘 batch 只有 IO 职责。
+迁移数据保留历史 row/media identity，`fill_reason=1 (CAUSAL_HOLD_LAST)` 与
+`2 (LEADING_PLACEHOLDER)` 由 cleaner 排除。
 
-### 处理前提
+动作训练使用必需的 `action_arm_joint_sent`，不得用未发送的候选替代。
+`action_arm_ee` 是不能从 joint target 精确重建的控制意图：xarm_base position(m)+rot6d。
+`flag_frame_status` 为 0 OK、1 HELD、2 IK_FAIL、3 SAFETY_REJECT、4 RETARGET_FAIL。
+1–4 行的连续 IK_FAIL 保留为短暂暂停，长连续失败拒绝。独立 held/IK/retarget proof flags 不再持久化。
 
-raw v24 可以是 `meta.arm_sent_stream=False` 的有效录制；这时
-`/action_arm_joint_sent` 合法地不存在。但当前 processed v14 writer 无条件以该字段生成
-`/action[:,:7]`，所以要生成 processed HDF5 或 Policy Zarr，原始 episode **必须**有
-`meta.arm_sent_stream=True` 与 `/action_arm_joint_sent`。这是处理链的输入前提，不是 raw
-schema 的通用必填条件。
+`hand_contact` 是 tactile sum，`hand_tactile_force` 是完整 SDK force；
+单位为 sdk_scaled_unknown_si，不能当作已验证 SI 力。
+cleaner 选择 persisted row <= 当前行、source <= reference、hand/tactile source 相等、
+fresh/calibrated/unit_code=0 且 skew 有界的最新 source；重复 source 取最近行。
+选中 payload 非有限就拒绝，不用别的 payload 修复。视觉 reference 是 camera source，
+JOINT reference 是 observation anchor。
+JOINT profile 仍要求 arm/hand 相对 anchor 的年龄不超过处理配置的 max skew；
+该数据集质量阈值比在线硬件 stale 阈值更严格。视觉配对状态的 freshness 在生产者中保证。
 
-### `data.h5`：对齐与因果来源
+机器人 joint state 保留物理来源；EEF/fingertip 只在 processing/viewer 中派生。
+视觉 `policy_observation_*_qpos` 保留 camera-source 因果对齐后的状态，其他 runtime
+sequence/publish/receive/history/skew proof、SDK ACK、device clock、profiling 均不属于 raw schema。
 
-| 路径 | shape | dtype | 语义 |
-|---|---:|---|---|
-| `/timestamp` | `(N,)` | float64 | 单调递增的逻辑控制网格时间（s）。 |
-| `/flag_sample_valid` | `(N,)` | bool | 此 grid row 是否直接来自 source sample；等价于 `fill_reason=SOURCE`。 |
-| `/source_sample_index` | `(N,)` | int64 | recorder 接收的 source row 序号；SOURCE 严格递增，CAUSAL_HOLD_LAST 重复最近 source，leading placeholder 为 -1。 |
-| `/source_timestamp` | `(N,)` | float64 | 选中 recorder source row 的逻辑控制网格 anchor（s），SOURCE 等于该 row 的 `/timestamp`；CAUSAL_HOLD_LAST 重复此前 source anchor，leading placeholder 为 NaN；不是 modality producer timestamp。 |
-| `/fill_reason` | `(N,)` | uint8 | `SOURCE`、`CAUSAL_HOLD_LAST` 或 `LEADING_PLACEHOLDER` 的枚举值。 |
+### Metadata 与 RGB-D 几何
 
-`SOURCE` 行的 `source_sample_index` 与 `source_timestamp` 都必须严格递增；
-`CAUSAL_HOLD_LAST` 只能重复最近一个 source，`LEADING_PLACEHOLDER` 使用
-`source_sample_index=-1` 与 `source_timestamp=NaN`。这些 hold/placeholder 规则是
-raw 的明确缺失值语义，不应被下游压紧为相邻 source。
-
-### `data.h5`：机器人、触觉与动作
-
-| 路径 | shape | dtype | 语义 |
-|---|---:|---|---|
-| `/arm_qpos`, `/arm_qvel`, `/arm_tau` | `(N,7)` | float64 | xArm 关节位置（rad）、速度（rad/s）与 effort；`arm_tau` 单位未验证。 |
-| `/arm_ee` | `(N,9)` | float64 | 末端位姿：`position_m(3)+rot6d(6)`，`xarm_base`；有限行的 rot6d 必须是 canonical 单位正交列，在对应 disconnected/placeholder 语义下可使用整行 all-NaN sentinel。 |
-| `/arm_connected` | `(N,)` | bool | arm state 连通标记。 |
-| `/arm_last_cmd_seq` | `(N,)` | int64 | arm worker 最近命令序号。 |
-| `/arm_last_cmd_is_hold` | `(N,)` | bool | 最近 arm 命令是否为 hold。 |
-| `/hand_qpos`, `/hand_current` | `(N,12)` | float64 | XHand 关节位置（rad）与电流。关节顺序由 `XHAND_SDK_JOINT_NAMES` 固定。 |
-| `/hand_fingertip` | `(N,5,3)` | float64 | 五指指尖位置（m），`xarm_base`。 |
-| `/hand_contact` | `(N,5,3)` | float64 | 每指传感器原生三轴 tactile sum；单位见 `meta.tactile_unit`，默认不是已验证 SI force。 |
-| `/hand_tactile_force` | `(N,5,120,3)` | float64 | 五指、每指 120 个触点、三轴的原生 tactile force。 |
-| `/hand_tactile_contact` | `(N,5)` | bool | 每指接触判定。 |
-| `/hand_tipboard_err`, `/hand_commboard_err`, `/hand_jointboard_err` | `(N,12)` | int32 | 对应 XHand board 错误码。 |
-| `/hand_connected`, `/hand_qpos_stale`, `/tactile_fresh`, `/tactile_calibrated` | `(N,)` | bool | hand 连通、位置是否沿用旧值、触觉新鲜度与 bias 校准状态。 |
-| `/tactile_source_monotonic_ns`, `/tactile_unit_code` | `(N,)` | int64 | 触觉 source 时间与设备单位代码。 |
-| `/action_arm_joint_raw` | `(N,7)` | float64 | arm IK 原始候选；仅在 `flag_sample_valid & ~flag_held & flag_ik_ok` 时有保守有效语义。 |
-| `/action_arm_joint` | `(N,7)` | float64 | grid row 的 arm joint action。 |
-| `/action_arm_joint_sent` | `(N,7)` | float64 | 条件字段；仅 `meta.arm_sent_stream=True` 时存在，是成功发布到 coupled command ring 的 arm target。它不表示 physical convergence 或 SDK accepted state；processed 的 `action[:,:7]` 使用它。 |
-| `/action_hand_joint_raw` | `(N,12)` | float64 | 手部 retarget 原始候选；仅在 `flag_sample_valid & ~flag_held & flag_retarget_ok` 时有保守有效语义。 |
-| `/action_hand_joint` | `(N,12)` | float64 | grid row 的 XHand target（rad）；首帧相对初始反馈、后续相对前一已发布 endpoint 限速。 |
-| `/action_arm_ee` | `(N,9)` | float64 | arm EEF target：`position_m(3)+rot6d(6)`，`xarm_base`；有限行的 rot6d 必须是 canonical 单位正交列，active 非 held 行必须为有限 payload，不可用行可使用整行 all-NaN sentinel。 |
-| `/target_eef_pos_raw`, `/target_pos_before_clamp` | `(N,3)` | float64 | 限制前 EEF 位置候选（m）。 |
-| `/target_eef_rot6d_raw` | `(N,6)` | float64 | 限制前 EEF rot6d 候选。 |
-
-### `data.h5`：观测来源、VR、相机与质量
-
-| 路径 | shape | dtype | 语义 |
-|---|---:|---|---|
-| `/observation_id`, `/action_id` | `(N,)` | int64 | 观测和动作身份号。 |
-| `/observation_anchor_monotonic_ns` | `(N,)` | int64 | 因果观测锚点时间。 |
-| `/arm_source_sequence`, `/hand_source_sequence`, `/vr_source_sequence`, `/camera_source_sequence` | `(N,)` | int64 | 各输入 ring 的被选 sequence。 |
-| `/arm_source_monotonic_ns`, `/hand_source_monotonic_ns`, `/vr_source_monotonic_ns`, `/camera_source_monotonic_ns` | `(N,)` | int64 | 各输入 source 时间。 |
-| `/arm_publish_monotonic_ns`, `/hand_publish_monotonic_ns`, `/vr_publish_monotonic_ns`, `/camera_publish_monotonic_ns` | `(N,)` | int64 | 各输入 publish 时间。 |
-| `/observation_source_receive_monotonic_ns` | `(N,4)` | uint64 | arm、hand、VR、camera 的 receive 时间。 |
-| `/observation_source_age_s`, `/observation_source_skew_s` | `(N,4)` | float64 | 四类输入相对锚点的 age/skew（s）。 |
-| `/observation_history_valid_mask` | `(N,4,1)` | bool | 四类输入的 history 有效性。 |
-| `/observation_valid` | `(N,)` | bool | 当前观测能否作为有效因果观测。 |
-| `/observation_skew_s` | `(N,)` | float64 | 观测总体 skew（s）。 |
-| `/policy_observation_arm_qpos`, `/policy_observation_hand_qpos` | `(N,7)`, `(N,12)` | float64 | 供视觉 policy 使用的 arm/hand state；各自选择 `source_time <= camera_source_time` 的最新有效反馈，不等同于 grid-cut 最新 state。 |
-| `/policy_observation_reference_monotonic_ns` | `(N,)` | int64 | 等于该 row 的 `camera_source_monotonic_ns`。 |
-| `/policy_observation_arm_source_sequence`, `/policy_observation_hand_source_sequence` | `(N,)` | int64 | 所选 arm/hand state ring sequence。 |
-| `/policy_observation_arm_source_monotonic_ns`, `/policy_observation_hand_source_monotonic_ns` | `(N,)` | int64 | 所选 state source 时间；不得晚于 reference。 |
-| `/policy_observation_arm_publish_monotonic_ns`, `/policy_observation_hand_publish_monotonic_ns` | `(N,)` | int64 | 所选 state publish 时间；不得晚于 grid anchor。 |
-| `/policy_observation_valid`, `/policy_observation_skew_s` | `(N,)`, `(N,)` | bool, float64 | 完整 source/publish 因果链是否有效，以及 `reference - min(arm_source, hand_source)`（s）。 |
-| `/hand_accepted_target_action_id` | `(N,)` | int64 | hand worker 已由 SDK 接受的精确 target action id；不代表物理到位或 arm/hand 同步到位。 |
-| `/action_created_monotonic_ns`, `/action_target_monotonic_ns`, `/action_valid_until_monotonic_ns` | `(N,)` | int64 | 动作创建、目标和失效时间。 |
-| `/flag_action_queued` | `(N,)` | bool | 动作是否进入发布队列。 |
-| `/vr_wrist_pos`, `/vr_wrist_rot6d` | `(N,3)`, `(N,6)` | float64 | VR wrist 位置与 rot6d。 |
-| `/vr_landmarks` | `(N,21,3)` | float64 | VR 手部 landmark。 |
-| `/head_quat_wxyz` | `(N,4)` | float64 | 头部四元数，顺序 wxyz。 |
-| `/camera_health` | `(N,)` | int64 | 相机健康枚举。 |
-| `/flag_camera_fresh`, `/camera_clock_reset`, `/camera_duplicate` | `(N,)` | bool | 相机新鲜度、时钟 reset 与重复帧标记。 |
-| `/camera_depth_frame_number`, `/camera_color_frame_number`, `/camera_ring_sequence`, `/camera_generation`, `/camera_frame_gap` | `(N,)` | int64 | depth/color frame number、ring sequence、时钟 generation 与 frame gap telemetry。 |
-| `/camera_depth_device_timestamp_s`, `/camera_color_device_timestamp_s`, `/camera_age_s`, `/camera_backlog_s`, `/pointcloud_valid_depth_ratio` | `(N,)` | float64 | 相机设备时间、age/backlog 与有效 depth 比率。 |
-| `/camera_wait_return_monotonic_ns`, `/camera_payload_ready_monotonic_ns`, `/camera_depth_timestamp_domain`, `/camera_color_timestamp_domain` | `(N,)` | int64 | 相机取帧、payload ready 与 native 时间戳 domain telemetry。 |
-| `/camera_delivery_delay_above_floor_s` | `(N,)` | float64 | 相机 delivery delay telemetry。 |
-| `/flag_ik_ok`, `/flag_ik_attempted`, `/flag_retarget_ok`, `/flag_held`, `/flag_safety_reject` | `(N,)` | bool | IK、retarget、hold 与 safety gate 质量标记。 |
-| `/flag_frame_status` | `(N,)` | int64 | 录制 frame status 枚举。 |
-| `/tracking_error`, `/ik_solve_time_ms`, `/policy_map_time_ms`, `/hand_retarget_time_ms`, `/transition_check_time_ms`, `/policy_compute_time_ms` | `(N,)` | float64 | 控制质量和耗时诊断；`*_ms` 单位为 ms。 |
-
-### raw camera payload
-
-| 位置 | shape / dtype | 语义 |
-|---|---|---|
-| `depth.h5:/depth` | `(N,H_raw,W_raw)` uint16 | `librealsense_align_depth_to_color_z16`；像素在 color optical frame，与同 index RGB 像素对齐；`0` 为无效值。米值为 `depth * meta.depth_scale`。 |
-| `rgb.mp4` frame | `(H_raw,W_raw,3)` uint8 | 与控制网格逐帧对应的 RGB。codec、pixel format、宽高和 fps 在 `meta`。 |
-
-v24 writer 在关闭两个 sidecar 后执行结构和帧数校验。`EpisodeReader` 只检查当前 raw v24 的必需
-文件、schema、`data.h5` layout/semantic 以及 depth shape/dtype，不执行额外的文件完整性扫描。
-如果需要更强的来源保证，应由调用方在文件系统或版本控制层面管理。
-
-### `data.h5:/meta` attrs
-
-下表的类型是 writer 写入时的逻辑 HDF5 attribute 类型；字符串由 h5py 以其支持的字符串
-编码保存。固定 attrs 与调用方可扩展 attrs 分开列出，后者不能当作稳定 schema。
-
-| 分组 | keys | 类型 / shape | 含义与条件 |
-|---|---|---|---|
-| schema 与录制 | `schema_version`、`task_label`、`operator`、`control_hz`、`fps`、`grid_dt_s`、`num_frames`、`success`、`truncated`、`stop_reason` | int / string / float / bool | episode 身份、控制网格与终止结果；当前 writer 的 `schema_version=24`。 |
-| 时长与基本质量 | `duration`、`wall_duration_s`、`grid_duration_s`、`non_sampled_duration_s`、`wall_fps`、`min_frames_met`、`has_camera`、`has_timestamps` | float / bool | 录制耗时、网格覆盖、实际帧率与基本可用性。 |
-| 逐行汇总质量 | `ik_hold_frame_count`、`camera_invalid_frame_count`、`observation_invalid_frame_count`、`sample_invalid_frame_count`、`safety_reject_frame_count`、`command_quiescence_count` | int scalar | 由 raw flags 与 grid timestamp 汇总；诊断用途，不替代逐行 flags。 |
-| 录制配置 | `skip_initial_frames`、`arm_sent_stream` | int / bool | 跳过帧数；`arm_sent_stream` 仅在 true 时写入，决定条件数据集是否存在。 |
-| 坐标、触觉与相机时序语义 | `robot_world_frame`、`robot_world_equals_xarm_base`、`arm_ee_frame`、`action_arm_ee_frame`、`hand_fingertip_frame`、`action_*_raw_validity_expression`、`tactile_*`、`arm_tau_*`、`camera_payload_mode`、`camera_health_taxonomy_json`、`camera_*_semantics`、`camera_frame_gap_semantics`、`camera_frame_gap_admission_policy`、`source_timestamp_semantics`、`source_sample_index_semantics`、`policy_observation_*_semantics` | string / bool / float | `SEMANTIC_META_ATTRS` 写入的固定语义；包括 `xarm_base` frame、raw action 有效性、tactile 单位/标定/接触、arm effort、camera 时间/时钟、frame-gap 数值与 admission policy，以及 camera-source policy observation 配对定义。 |
-| 视频与 writer | `camera_writer_queue_size`、`camera_encoding_codec`、`camera_encoding_crf`、`camera_encoding_preset`、`camera_encoding_pixel_format`、`camera_encoding_width/height/fps`、`camera_depth_storage`、`camera_depth_payload_semantics`、`camera_stream_frames`、`camera_writer_error` | int / string / float | MP4 编码、payload 定义、camera writer 状态与健康 telemetry。 |
-| writer 性能汇总 | `camera_writer_queue_high_watermark`、`camera_writer_queue_capacity`、`camera_writer_close_s`、`camera_encode_{p50,p95,p99,max}_s`、`camera_hdf5_{p50,p95,p99,max}_s` | int / float | 相机 writer 队列、关闭和编码/HDF5 写入耗时。 |
-| 调用方扩展 | `camera_metadata` mapping 中的每个 key | string；调用方给定 dtype | 非固定 key；固定 attrs 由 recorder 保留，扩展值不属于稳定 schema。 |
-
-以下相机 attrs 不是任意 raw v24 都具备；处理 RGB 或点云 profile 时，reader 会在几何边界
-要求所需字段存在且有效。
-
-| 条件 attrs | 类型 / shape | 写入条件与语义 |
-|---|---|---|
-| `camera_serial`、`camera_name` | string | 对应 pending metadata 提供时写入。 |
-| `camera_depth_intrinsics`、`camera_color_intrinsics` | float64-like `(9,)` | 提供 `camera_geometry` 时写入；row-major 3×3 native K。 |
-| `camera_depth_width/height`、`camera_color_width/height` | int scalar | 提供 `camera_geometry` 时写入。 |
-| `camera_*_distortion_model`、`camera_*_distortion_coeffs` | string；float64-like `(K_d,)` | 提供 `camera_geometry` 时写入。 |
-| `camera_T_color_from_depth` | float64-like `(16,)` | 提供 `camera_geometry` 时写入；native depth optical → color optical。 |
-| `depth_scale` | float scalar | pending `depth_scale` 非空时写入；Z16 unit 到 m 的乘数。 |
-| `camera_T_xarm_base_from_color`、`camera_T_xarm_base_from_depth` | float64-like `(16,)` | 同时有 calibration、camera name 与 world-camera 外参时写入；color/depth optical → `xarm_base`。 |
-| `camera_T_eef_from_depth` | float64-like `(16,)` | calibration 提供 EEF-camera 外参时写入。 |
-| `camera_type`、`camera_calibration_source_optical_frame` | string | calibration 与 camera name 可解析时写入；后者固定为 `camera_color_optical`。 |
+保留 schema_version=25、num_frames、control_hz、task_label、operator；
+`grid_dt_s=1/control_hz` 只表示名义采样周期。保留必要 camera_name/serial/type/payload_mode、
+depth_scale、depth/color 原生 intrinsics、width/height、distortion_model/coeffs、
+`camera_T_color_from_depth`，以及适用的 `camera_T_xarm_base_from_color`、
+`camera_T_xarm_base_from_depth`、`camera_T_eef_from_depth`。可保留廉价 code provenance。
+RGB/pointcloud processing 在几何边界验证 calibration、serial 与 rigid transforms。
 
 ## 2. processed HDF5 v14
 
-processed 文件是 `episodes_processed/<task>/*.h5`。它从 raw v24 选择、清洗和压紧行；其 `N`
+processed 文件是 `episodes_processed/<task>/*.h5`。它从 raw v25 选择、清洗和压紧行；其 `N`
 因此不一定等于 raw 的 `num_frames`。它用于离线训练、导出与可视化；物理回放可将其作为
 保留 raw 行的 provenance 清单，但绝不发送其 `float32` 动作。回放在 `source_path` 找到 raw episode
 后，从中读取 recorded published arm target 与 recorded logical hand target。根 attrs
@@ -195,7 +129,7 @@ processed 文件是 `episodes_processed/<task>/*.h5`。它从 raw v24 选择、�
 `schema_name=dexmani-real-processed-hdf5`、`schema_version=14`、`domain=real`。
 
 v14 在 v13 之上增加 `eef_pose` 与 `tactile_force` 两个 core observation，以及对应的
-tactile/reference provenance；v13 文件不做伪迁移，必须由 raw v24 重新处理生成 v14。
+tactile/reference provenance；v13 文件不做伪迁移，必须由已迁移的 raw v25 重新处理生成 v14。
 
 处理入口在 discovery 边界将每个 raw episode 路径解析为 canonical absolute path；新生成的
 processed artifact 将它持久化在 `source_decision_json.source_path`。processed replay 只消费该路径，
@@ -206,7 +140,7 @@ processed artifact 将它持久化在 `source_decision_json.source_path`。proce
 展开为多个训练 episode；一份 processed 文件只允许对应一个完整训练 episode，存在任何删除
 或内部连续性缺口时整份文件拒绝。
 
-处理入口只接受通过 raw reader 校验的 v24 episode，并适用前述 `arm_sent_stream` 前提。RGB 与
+处理入口只接受通过 raw reader 结构校验的 v25 episode，sent action 必需。RGB 与
 点云 profile 还要求 raw RGB-D 几何、depth scale 与 `T_xarm_base_from_color` 完整有效。视觉
 profile 使用 `/policy_observation_*_qpos` 生成 `joint_state`；`joint` profile 使用 control-grid
 state。processed action 是已发布的 teleop joint target；离线处理不模拟或审计 learned-policy
@@ -238,12 +172,12 @@ detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal
 | 路径 | shape | dtype | 语义 |
 |---|---:|---|---|
 | `/joint_state` | `(N,19)` | float32 | 视觉 profile 为 `policy_observation_arm_qpos(7)+policy_observation_hand_qpos(12)`；`joint` profile 为 control-grid state，单位 rad。 |
-| `/eef_pose` | `(N,9)` | float32 | `position_m(3)+rot6d(6)`，`xarm_base`；由本 artifact 的 `/joint_state[:,:7]`（已因果对齐的 measured arm qpos）经 canonical Arm FK 推导，rot6d 必须 canonical；绝不复制 raw `/arm_ee` 或 xArm firmware Cartesian pose。每 timestep 只执行一次 Arm FK，`/fingertip_points` 复用同一 EEF 结果。processed-only，不进入 Zarr v7。 |
+| `/eef_pose` | `(N,9)` | float32 | `position_m(3)+rot6d(6)`，`xarm_base`；由本 artifact 的 `/joint_state[:,:7]`（已因果对齐的 measured arm qpos）经 canonical Arm FK 推导，rot6d 必须 canonical；不使用 xArm firmware Cartesian pose。每 timestep 只执行一次 Arm FK，`/fingertip_points` 复用同一 EEF 结果。processed-only，不进入 Zarr v7。 |
 | `/action` | `(N,19)` | float32 | `action_arm_joint_sent(7)+action_hand_joint(12)`；是 teleop 已发布 target，单位 rad；arm 部分不表示 SDK accepted state 或物理到位。 |
 | `/action_ee` | `(N,21)` | float32 | `eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)`，EEF 在 `xarm_base`；rot6d 两列必须是 canonical 单位正交列。 |
 | `/contact_force` | `(N,5,3)` | float32 | raw `hand_contact` 的每指三轴 tactile sum（SDK `calc_force`）；选择不晚于 observation reference、skew 有界且 hand/tactile source 相等的最新 fresh+calibrated+unit-proven 行。单位/轴由 root attrs 指定。 |
 | `/tactile_force` | `(N,5,120,3)` | float32 | raw `hand_tactile_force` 的 XHand SDK `raw_force` 每指 120 点 fx/fy/fz；与同行 `/contact_force` 来自**同一条** causally selected raw tactile source row（同一 `tactile_source_row_index`）。不假设 `contact_force == tactile_force.sum(...)`；sensor/point 顺序只是 SDK `sensor_data`/`raw_force` 顺序，SI 单位与 taxel 空间几何未验证。processed-only，不进入 Zarr v7。 |
-| `/fingertip_points` | `(N,5,3)` | float32 | 五指指尖坐标（m），`xarm_base`；所有 profile 均从本 artifact 的 `/joint_state` 经共享 arm+hand FK 重新计算（与 `/eef_pose` 共用同一次 Arm FK），绝不复制 raw `/hand_fingertip`。 |
+| `/fingertip_points` | `(N,5,3)` | float32 | 五指指尖坐标（m），`xarm_base`；所有 profile 均从本 artifact 的 `/joint_state` 经共享 arm+hand FK 重新计算（与 `/eef_pose` 共用同一次 Arm FK）。 |
 | `/rgb` | `(N,H_p,W_p,3)` | uint8 | 仅 RGB profile；resize、不裁剪。 |
 | `/depth` | `(N,H_p,W_p)` | uint16 | 仅 RGB profile；对齐到 RGB，nearest resize；0 无效，米值由 `depth_scale_m_per_unit` 给出。 |
 | `/camera_intrinsic` | `(N,9)` | float32 | resize 后 color K，row-major 展平的 3×3。 |
@@ -262,7 +196,7 @@ payload/provenance 扫描。
 |---|---:|---|---|
 | `/provenance/source_row_index` | `(N,)` | int64 | processed row 对应的 raw grid row。 |
 | `/provenance/source_sample_index` | `(N,)` | int64 | 对应 raw source sample。 |
-| `/provenance/source_timestamp_s` | `(N,)` | float64 | 对应保留 raw grid row 的 `/timestamp`（逻辑控制网格时间，s）；**不是** raw `/source_timestamp` 的 producer sample 时间。 |
+| `/provenance/source_timestamp_s` | `(N,)` | float64 | 对应保留 raw row 的 `/timestamp`（实际 controller anchor，s）。 |
 | `/provenance/source_segment_ends` | `(S,)` | int64 | 各 source 连续段在 processed 紧凑数组中的累积结束下标（exclusive）；严格递增，末值为 `N`。连续性同时要求 raw row/source sample 各加一且 timestamp 差为 `dt`（允许记录的容差）。 |
 | `/provenance/source_keep_mask` | `(source_frames,)` | bool | 所有 raw row 的保留掩码。 |
 | `/provenance/source_drop_reason_bits` | `(source_frames,)` | uint64 | 每个 raw row 的拒绝原因位图；位名在 provenance attrs。 |
@@ -344,10 +278,10 @@ processed v14 输入。存在无效行或时序缺口的文件整条拒绝；其
 
 ## 字段映射摘要
 
-| raw v24 | processed v14 | Policy Zarr v7 | 变换 |
+| raw v25 | processed v14 | Policy Zarr v7 | 变换 |
 |---|---|---|---|
 | `policy_observation_arm_qpos + policy_observation_hand_qpos` | `joint_state` | `data/joint_state` | visual profile state，按 camera source 因果对齐后拼接 7+12，float64 → float32。 |
-| `joint_state[:,:7]`（因果对齐的 measured arm qpos） | `eef_pose` | —（processed-only） | canonical Arm FK 一次计算 `position_m(3)+rot6d(6)`；不复制 raw `arm_ee`，不使用 firmware pose。 |
+| `joint_state[:,:7]`（因果对齐的 measured arm qpos） | `eef_pose` | —（processed-only） | canonical Arm FK 一次计算 `position_m(3)+rot6d(6)`；不使用 firmware pose。 |
 | `action_arm_joint_sent + action_hand_joint` | `action` | `data/action` | 拼接 7+12，使用实际 arm 提交流。 |
 | `action_arm_ee + action_hand_joint` | `action_ee` | `data/action_ee` | 拼接 9+12。 |
 | `hand_contact` + hand/tactile source proof | `contact_force` | `data/contact_force` | 按 observation reference 选择最新因果且 skew 有界的同-source fresh+calibrated tactile sum，保留 `(5,3)` 轴语义。 |

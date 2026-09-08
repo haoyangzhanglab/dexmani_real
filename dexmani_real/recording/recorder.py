@@ -1,6 +1,6 @@
-"""Transactional raw-v24 episode serialization from owned ``EpisodeFrame`` rows.
+"""Transactional raw-v25 episode serialization from owned ``EpisodeFrame`` rows.
 
-State, action, VR, and camera rows are causally aligned to the policy grid.
+Each controller-emitted source sample becomes exactly one persisted row.
 The recorder owns transaction lifecycle, camera sidecar coordination, metadata,
 verification, and atomic publication. ``EpisodeDataWriter`` is the sole owner
 of the ``data.h5`` handle, datasets, and append offset. Neither component reads
@@ -33,17 +33,13 @@ from dexmani_real.recording.storage.camera_writer import (
 from dexmani_real.recording.frame import EpisodeFrame, build_episode_frame
 from dexmani_real.recording.storage.hdf5_writer import EpisodeDataWriter
 from dexmani_real.recording.storage.schema import (
-    ARM_SENT_MARKER,
     EPISODE_SCHEMA_VERSION,
-    SEMANTIC_META_ATTRS,
-    compute_episode_quality_metrics,
+    DATASET_SPECS,
+    SOURCE_FRAME_DATASET_NAMES,
+    FillReason,
     validate_camera_metadata_keys,
     validate_data_layout,
-    validate_raw_semantics,
-    validate_source_frame_keys,
 )
-from dexmani_real.recording.timeline import TimestampAlignedBuffer
-from dexmani_real.recording.storage.video import VideoDecoder
 from dexmani_real.recording.sample import EpisodeAction, EpisodeState
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
@@ -144,21 +140,17 @@ class EpisodeRecorder:
         max_frames: int = DEFAULT_MAX_RECORD_FRAMES,
         control_hz: float = 16.0,
         min_frames: int = 50,
-        arm_sent_stream: bool = False,
         camera_writer_config: CameraStreamWriterConfig | None = None,
     ) -> None:
-        if control_hz <= 0:
+        if not np.isfinite(control_hz) or control_hz <= 0:
             raise ValueError(f"control_hz must be positive, got {control_hz}")
         self.data_dir = Path(data_dir)
         self.max_frames = max_frames
         self.control_hz = float(control_hz)
         self.min_frames = int(min_frames)
-        self.arm_sent_stream: bool = bool(arm_sent_stream)
 
         self._data_writer: EpisodeDataWriter | None = None
         self._camera_writer: CameraStreamWriter | None = None
-        self._camera_writer_metrics: dict[str, float | int] = {}
-        self._last_camera_payload: tuple[np.ndarray, np.ndarray] | None = None
         self._camera_writer_config = camera_writer_config or CameraStreamWriterConfig(
             rgb_shape=camera.rgb_shape,
             depth_shape=camera.depth_shape,
@@ -175,12 +167,10 @@ class EpisodeRecorder:
         self._temp_dir: str | None = None  # .tmp_episode_XXX/ directory
         self._pending_meta: dict[str, Any] = {}
 
-        self._buffer: TimestampAlignedBuffer | None = None
-        self._flush_interval: int = max(1, int(round(10.0 * self.control_hz)))
+        self._pending_rows: list[dict[str, Any]] = []
+        self._last_timestamp_s: float | None = None
+        self._flush_interval = 32
 
-        self._skip_initial_frames: int = 0
-        self._skipped_so_far: int = 0
-        self._last_control_run_generation: int | None = None
 
         self._stop_thread: threading.Thread | None = None
 
@@ -231,7 +221,6 @@ class EpisodeRecorder:
         depth_scale: float | None = None,
         camera_metadata: dict[str, Any] | None = None,
         provenance: Mapping[str, object] | None = None,
-        skip_initial_frames: int = 0,
     ) -> bool:
         metadata_errors = validate_camera_metadata_keys(camera_metadata)
         if metadata_errors:
@@ -275,11 +264,6 @@ class EpisodeRecorder:
         self._stop_error = None
         self._data_writer = None
 
-        self._skip_initial_frames = max(
-            0, min(int(skip_initial_frames), self.max_frames - 1)
-        )
-        self._skipped_so_far = 0
-        self._last_control_run_generation = None
 
         self._pending_meta = {
             "task_label": task_label,
@@ -291,20 +275,11 @@ class EpisodeRecorder:
             "depth_scale": depth_scale,
             "camera_metadata": dict(camera_metadata or {}),
             "provenance": normalized_provenance,
-            "skip_initial_frames": self._skip_initial_frames,
         }
 
-        # Defer data.h5 creation until the first flush or stop.
-        dt = 1.0 / self.control_hz
-        self._buffer = TimestampAlignedBuffer(
-            start_time=self._start_time,
-            dt=dt,
-            max_record_steps=self.max_frames,
-            # Only tolerate floating-point error at an exact grid boundary.
-            eps=1e-5,
-        )
+        self._pending_rows.clear()
+        self._last_timestamp_s = None
         self._camera_writer = CameraStreamWriter(tmp_dir, self._camera_writer_config)
-        self._last_camera_payload = None
         return True
 
     def _write_meta_attrs(self, meta: h5py.Group) -> None:
@@ -316,37 +291,12 @@ class EpisodeRecorder:
             self.control_hz
         )  # nominal grid rate; dt = 1/control_hz
         meta.attrs["fps"] = self.control_hz
-        for key, semantic_value in SEMANTIC_META_ATTRS.items():
-            meta.attrs[key] = semantic_value
-
-        if self.arm_sent_stream:
-            meta.attrs[ARM_SENT_MARKER] = True
-
+        meta.attrs["camera_payload_mode"] = "depth_to_color_aligned_rgbd"
         self._write_camera_meta_attrs(meta)
 
         provenance = p.get("provenance") or {}
         for key, value in provenance.items():
             meta.attrs[f"provenance_{key}"] = value
-
-        meta.attrs["skip_initial_frames"] = int(p.get("skip_initial_frames", 0))
-        camera_metadata = p.get("camera_metadata") or {}
-        for key, val in camera_metadata.items():
-            meta.attrs[key] = val
-
-        video = self._camera_writer_config.video
-        meta.attrs["camera_writer_queue_size"] = self._camera_writer_config.queue_size
-        meta.attrs["camera_encoding_codec"] = video.codec
-        meta.attrs["camera_encoding_crf"] = video.crf
-        meta.attrs["camera_encoding_preset"] = video.preset
-        meta.attrs["camera_encoding_pixel_format"] = video.pixel_format
-        meta.attrs["camera_encoding_width"] = self._camera_writer_config.rgb_shape[1]
-        meta.attrs["camera_encoding_height"] = self._camera_writer_config.rgb_shape[0]
-        meta.attrs["camera_encoding_fps"] = self._camera_writer_config.fps
-        meta.attrs["camera_depth_storage"] = "uint16/gzip-1"
-        meta.attrs["camera_depth_payload_semantics"] = (
-            "v24: librealsense_align_depth_to_color_z16; depth pixels are in "
-            "camera_color_optical and match camera_rgb pixels"
-        )
 
     def _write_camera_meta_attrs(self, meta: h5py.Group) -> None:
         """Camera identity/geometry attrs from _pending_meta (None entries skipped).
@@ -443,8 +393,6 @@ class EpisodeRecorder:
         camera_frame: Mapping[str, object] | None = None,
         signals: Mapping[str, object] | None = None,
         arm_qpos_sent: np.ndarray | None = None,
-        diagnostics: Mapping[str, object] | None = None,
-        control_run_generation: int = 0,
     ) -> bool:
         """Build and add one :class:`EpisodeFrame` from component inputs."""
         if not self._accept_source_frame():
@@ -456,21 +404,18 @@ class EpisodeRecorder:
             camera_frame=camera_frame,
             signals=signals,
             arm_qpos_sent=arm_qpos_sent,
-            diagnostics=diagnostics,
-            control_run_generation=control_run_generation,
-            arm_sent_stream=self.arm_sent_stream,
         )
         return self._add_episode_frame(frame)
 
     def add_episode_frame(self, frame: EpisodeFrame) -> bool:
-        """Align and serialize one already-normalized recording frame."""
+        """Append one owned controller source frame."""
         if not self._accept_source_frame():
             return False
         return self._add_episode_frame(frame)
 
     def _accept_source_frame(self) -> bool:
-        """Apply lifecycle, capacity, and initial-skip admission policy."""
-        if not self._recording or self._buffer is None:
+        """Admit source frames only during the active episode and below capacity."""
+        if not self._recording:
             return False
 
         if self._frame_count >= self.max_frames:
@@ -480,145 +425,40 @@ class EpisodeRecorder:
             self._max_frames_reached = True
             return False
 
-        if self._skipped_so_far < self._skip_initial_frames:
-            self._skipped_so_far += 1
-            return False
         return True
 
     def _add_episode_frame(self, frame: EpisodeFrame) -> bool:
-        """Write an admitted typed frame to the aligned control grid."""
-        assert self._buffer is not None
-        ts = frame.timestamp_s
-        run_generation = frame.control_run_generation
-        # The first source and each quiescence boundary start a wall-time segment.
-        if (
-            self._last_control_run_generation is None
-            or run_generation != self._last_control_run_generation
+        """Store one emitted source row without aligning or filling timestamps."""
+        ts = float(frame.timestamp_s)
+        if not np.isfinite(ts) or (
+            self._last_timestamp_s is not None and ts <= self._last_timestamp_s
         ):
-            self._buffer.reanchor(ts)
-
-        data = frame.data
-        source_layout_errors = validate_source_frame_keys(
-            set(data), arm_sent_stream=self.arm_sent_stream
+            raise ValueError("recording timestamps must be finite and increasing")
+        if set(frame.data) != SOURCE_FRAME_DATASET_NAMES:
+            raise ValueError("episode source frame fields do not match raw v25")
+        row = dict(frame.data)
+        row.update(
+            timestamp=ts, source_sample_index=self._frame_count,
+            fill_reason=FillReason.SOURCE, flag_sample_valid=True,
         )
-        if source_layout_errors:
-            raise RuntimeError(
-                "episode source frame mismatch: " + "; ".join(source_layout_errors)
-            )
-
-        add_result = self._buffer.add(data, timestamp=ts)
-        if add_result.source_written:
-            self._last_control_run_generation = run_generation
-
-        self._frame_count = add_result.size
-        prev_size = add_result.previous_size
-        k = add_result.slots_written  # grid slots advanced (usually 1; 0 = dup bucket)
-
-        # A live camera observation may cross skipped deadlines; only its causal slot is fresh.
-        if k > 0:
-            self._update_aligned_causality(slice(prev_size, self._buffer.size))
-
-        flushed_frames = (
-            0 if self._data_writer is None else self._data_writer.flushed_frames
-        )
-        if self._buffer.size - flushed_frames >= self._flush_interval:
-            self._ensure_hdf5()
-            self._flush_buffered()
-
-        if k > 0:
-            if not self._submit_aligned_camera_frames(frame, prev_size):
-                return False
-
-        if add_result.capacity_reached:
-            self._max_frames_reached = True
-            logger.info(
-                "Episode reached max_frames=%d after aligned camera submission",
-                self.max_frames,
-            )
-            return False
-        return True
-
-    def _update_aligned_causality(self, new_slice: slice) -> None:
-        """Recompute causal metadata for source and synthetic grid slots."""
-        assert self._buffer is not None
-        buffer_data = self._buffer.data
-        source_valid = np.asarray(
-            buffer_data["flag_sample_valid"][new_slice], dtype=bool
-        )
-        grid_anchor_ns = np.rint(self._buffer.timestamps[new_slice] * 1e9).astype(
-            np.uint64
-        )
-        buffer_data["observation_anchor_monotonic_ns"][new_slice] = grid_anchor_ns
-        history_valid = np.asarray(
-            buffer_data["observation_history_valid_mask"][new_slice, :, 0],
-            dtype=bool,
-        )
-        source_monotonic_ns = np.column_stack(
-            [
-                buffer_data[f"{name}_source_monotonic_ns"][new_slice]
-                for name in ("arm", "hand", "vr", "camera")
-            ]
-        ).astype(np.uint64)
-        source_age_s = np.full(history_valid.shape, np.nan, dtype=np.float64)
-        causal = history_valid & (source_monotonic_ns <= grid_anchor_ns[:, None])
-        age_delta_ns = grid_anchor_ns[:, None].astype(
-            np.float64
-        ) - source_monotonic_ns.astype(np.float64)
-        source_age_s[causal] = age_delta_ns[causal] / 1e9
-        buffer_data["observation_source_age_s"][new_slice] = source_age_s
-        buffer_data["observation_valid"][new_slice] &= source_valid
-        buffer_data["tactile_fresh"][new_slice] &= source_valid
-        buffer_data["flag_camera_fresh"][new_slice] &= source_valid
-
-        # Synthetic slots inherit the effective target but do not claim a send.
-        hold_slots = ~source_valid
-        buffer_data["flag_action_queued"][new_slice] &= source_valid
-        for name in (
-            "action_id",
-            "action_created_monotonic_ns",
-            "action_target_monotonic_ns",
-            "action_valid_until_monotonic_ns",
-        ):
-            buffer_data[name][new_slice][hold_slots] = 0
-
-    def _submit_aligned_camera_frames(
-        self, frame: EpisodeFrame, previous_size: int
-    ) -> bool:
-        """Submit one payload per newly materialized causal grid slot."""
-        assert self._buffer is not None
+        self._pending_rows.append(row)
+        self._frame_count += 1
+        self._last_timestamp_s = ts
         writer = self._camera_writer
-        if writer is None:
-            logger.error("EpisodeRecorder: camera writer missing during add_frame")
+        if writer is None or not writer.submit(*self._camera_payload(frame)):
+            raise RuntimeError("camera writer failed to accept the source row")
+        if len(self._pending_rows) >= self._flush_interval:
+            self._flush_buffered()
+        if self._frame_count >= self.max_frames:
+            self._max_frames_reached = True
             return False
-        current_payload = self._camera_payload(frame)
-        zero_payload = self._camera_payload(None)
-        sample_valid_slots = self._buffer.data["flag_sample_valid"][
-            previous_size : self._buffer.size
-        ]
-        for sample_valid in sample_valid_slots:
-            if sample_valid:
-                payload = current_payload
-                self._last_camera_payload = (
-                    np.array(current_payload[0], copy=True),
-                    np.array(current_payload[1], copy=True),
-                )
-            else:
-                payload = self._last_camera_payload or zero_payload
-            if not writer.submit(*payload):
-                return False
         return True
 
     def _camera_payload(
-        self, frame: EpisodeFrame | None
+        self, frame: EpisodeFrame
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return shape-stable camera arrays, using explicit zero placeholders."""
         cfg = self._camera_writer_config
-        if frame is None:
-            return (
-                np.zeros(cfg.rgb_shape, dtype=np.uint8),
-                np.zeros(cfg.depth_shape, dtype=np.uint16),
-            )
-
         rgb = frame.camera_rgb
         depth = frame.camera_depth
         if rgb is None:
@@ -635,24 +475,21 @@ class EpisodeRecorder:
             raise RuntimeError("EpisodeRecorder: _temp_dir is None during HDF5 open")
         self._data_writer = EpisodeDataWriter(
             Path(self._temp_dir) / "data.h5",
-            arm_sent_stream=self.arm_sent_stream,
             write_initial_meta=self._write_meta_attrs,
         )
 
     def _flush_buffered(self) -> None:
-        """Pass buffered non-camera streams to the resizable data writer.
-
-        Called periodically during recording (every ``_flush_interval`` frames)
-        and finally at :meth:`stop_episode`.  On first call the datasets are
-        created with ``maxshape=(None, ...)``; subsequent calls resize and
-        append only the new frames.
-        """
-        if self._buffer is None:
+        """Append pending rows; the batch has no temporal semantics."""
+        if not self._pending_rows:
             return
-
         self._ensure_hdf5()
+        batch = {
+            name: np.asarray([row[name] for row in self._pending_rows], dtype=spec.dtype)
+            for name, spec in DATASET_SPECS.items()
+        }
         assert self._data_writer is not None
-        self._data_writer.append(self._buffer.data, self._buffer.timestamps)
+        self._data_writer.append(batch)
+        self._pending_rows.clear()
 
     def stop_episode(self, save: bool = True, reason: str = "") -> str | None:
         """Signal end of episode; return path immediately, flush in background.
@@ -826,28 +663,18 @@ class EpisodeRecorder:
             raise RuntimeError("camera writer missing at episode stop")
         writer.close(timeout=_CAMERA_WRITER_CLOSE_TIMEOUT_S)
         camera_frame_count = writer.frame_count
-        self._camera_writer_metrics = writer.metrics
         self._camera_writer = None
 
         self._flush_buffered()
-        buf_size = self._buffer.size if self._buffer is not None else 0
         self._ensure_hdf5()
 
-        if camera_frame_count != buf_size:
+        if camera_frame_count != self._frame_count:
             raise RuntimeError(
-                f"camera/control grid length mismatch: camera={camera_frame_count}, control={buf_size}"
+                f"camera/source row count mismatch: camera={camera_frame_count}, source={self._frame_count}"
             )
 
-        self._buffer = None
-        self._frame_count = buf_size
         assert self._data_writer is not None
         data_writer = self._data_writer
-        quality_metrics = compute_episode_quality_metrics(
-            dict(data_writer.datasets),
-            frame_count=self._frame_count,
-            control_hz=self.control_hz,
-        )
-
         _had_rgb = camera_frame_count > 0
         if self._temp_dir is None:
             raise RuntimeError("episode temp directory missing during finalization")
@@ -865,18 +692,11 @@ class EpisodeRecorder:
             )
 
         def _write_final_meta(meta: h5py.Group) -> None:
-            grid_dt_s = 1.0 / self.control_hz
-            grid_duration_s = max(0, self._frame_count - 1) * grid_dt_s
             meta.attrs["schema_version"] = EPISODE_SCHEMA_VERSION
-            # ``duration`` remains wall-clock time; explicit grid fields keep
-            # pauses and other non-sampled time distinct from the control rate.
             meta.attrs["duration"] = duration
             meta.attrs["wall_duration_s"] = duration
-            meta.attrs["grid_duration_s"] = grid_duration_s
-            meta.attrs["grid_dt_s"] = grid_dt_s
-            meta.attrs["non_sampled_duration_s"] = max(0.0, duration - grid_duration_s)
             meta.attrs["num_frames"] = self._frame_count
-            meta.attrs["success"] = save  # Legacy raw-v24 storage/commit flag.
+            meta.attrs["success"] = save
             meta.attrs["fps"] = self.control_hz
             meta.attrs["wall_fps"] = (
                 self._frame_count / duration if duration > 0 else self.control_hz
@@ -886,10 +706,6 @@ class EpisodeRecorder:
             meta.attrs["has_timestamps"] = "timestamp" in data_writer.datasets
             meta.attrs["camera_stream_frames"] = camera_frame_count
             meta.attrs["camera_writer_error"] = ""
-            for metric_name, metric_value in self._camera_writer_metrics.items():
-                meta.attrs[metric_name] = metric_value
-            for metric_name, metric_value in quality_metrics.items():
-                meta.attrs[metric_name] = int(metric_value)
             meta.attrs["truncated"] = bool(truncated)
             meta.attrs["stop_reason"] = reason or (
                 "max_frames" if truncated else "manual"
@@ -907,19 +723,7 @@ class EpisodeRecorder:
             if save:
                 self._validate_temp_episode(Path(_tmp), self._frame_count)
                 atomic_publish(_tmp, _final)
-                logger.info(
-                    "Episode quality: path=%s frames=%d ik_hold=%d camera_invalid=%d "
-                    "observation_invalid=%d "
-                    "sample_invalid=%d safety_reject=%d quiescence=%d",
-                    _final,
-                    self._frame_count,
-                    quality_metrics["ik_hold_frame_count"],
-                    quality_metrics["camera_invalid_frame_count"],
-                    quality_metrics["observation_invalid_frame_count"],
-                    quality_metrics["sample_invalid_frame_count"],
-                    quality_metrics["safety_reject_frame_count"],
-                    quality_metrics["command_quiescence_count"],
-                )
+                logger.info("Episode saved: %s frames=%d", _final, self._frame_count)
             else:
                 self._write_aborted_manifest(reason=reason or "discarded", error="")
 
@@ -933,11 +737,9 @@ class EpisodeRecorder:
         self._start_time = None
         self._episode_dir = None
         self._temp_dir = None
-        self._buffer = None
+        self._pending_rows.clear()
         self._camera_writer = None
-        self._camera_writer_metrics = {}
-        self._last_camera_payload = None
-        self._last_control_run_generation = None
+        self._last_timestamp_s = None
 
     # ── Atomic file finalisation ──────────────────────────────────────
 
@@ -961,7 +763,7 @@ class EpisodeRecorder:
 
     @staticmethod
     def _validate_temp_episode(temp_dir: Path, expected_frames: int) -> None:
-        """Reopen and decode all three modalities before durable publication."""
+        """Verify closed files structurally before publication, without RGB decoding."""
         paths = {
             "data": temp_dir / "data.h5",
             "depth": temp_dir / "depth.h5",
@@ -991,31 +793,17 @@ class EpisodeRecorder:
                 dataset_shapes,
                 dataset_dtypes,
                 frame_count=expected_frames,
-                arm_sent_stream=bool(meta.attrs.get(ARM_SENT_MARKER, False)),
             )
             if layout_errors:
                 raise RuntimeError(
                     "data.h5 episode layout mismatch: " + "; ".join(layout_errors)
                 )
-            semantic_errors = validate_raw_semantics(
-                datasets,
-                frame_count=expected_frames,
-                attrs=meta.attrs,
-            )
-            if semantic_errors:
-                raise RuntimeError(
-                    "raw semantic validation failed: " + "; ".join(semantic_errors)
-                )
         for key in ("depth",):
             with h5py.File(paths[key], "r") as sidecar:
                 if key not in sidecar or int(sidecar[key].shape[0]) != expected_frames:
                     raise RuntimeError(f"{key} sidecar length mismatch")
-        with VideoDecoder(paths["rgb"]) as decoder:
-            decoded_frames = decoder.count_decoded_frames()
-            if decoded_frames != expected_frames:
-                raise RuntimeError(
-                    f"RGB decoded frame count {decoded_frames} != {expected_frames}"
-                )
+        if paths["rgb"].stat().st_size == 0:
+            raise RuntimeError("RGB sidecar is empty")
 
     @staticmethod
     def _discard_temp_files(tmp: str) -> None:
