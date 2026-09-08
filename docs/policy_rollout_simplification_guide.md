@@ -661,13 +661,14 @@ Live logging does not reset rollout rejection counts. The current result stores
 executor counts and latest timing samples; it does not claim episode-wide
 inference-latency percentiles. The optional action-gap metric remains deferred.
 
-Each immutable Prediction carries required finite, non-negative real scalar
+Each internal Prediction carries scalar diagnostics
 `inference_latency_ms`, `observation_age_ms`, and `observation_skew_ms` from its
 exact observation/inference pair. The existing prediction IPC carries them as
-three float64 scalars. Executor PolicyStats observes each new, current-generation
+three float64 scalars. Executor PolicyStats stores the latest values from each new, current-generation
 prediction, including wholly stale chunks, and its snapshot reaches
 `result.json.metrics`. These are latest received samples, not full-episode
-percentiles; no received prediction means no inference timing fields.
+percentiles; no received prediction means no inference timing fields. Non-finite
+or negative diagnostics are omitted from snapshots and cannot fault a valid rollout.
 
 Run operator stop and duration timeout are STOPPED (`run:stopped:operator` and
 `run:stopped:timeout`). Run first-command and command-silence timeouts are INVALID

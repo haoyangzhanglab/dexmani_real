@@ -1379,18 +1379,11 @@ class PolicyExecutor:
         self.last_seen_prediction_sequence = sequence
         if prediction.run_generation != self.run_generation:
             return True
-        if prediction.actions.shape != (
-            self.policy_spec.chunk_size,
-            self.policy_spec.control_action_dim,
-        ):
-            self._fault("prediction chunk shape conflicts with PolicySpec")
-            return False
-
         # Include even wholly stale chunks: their timing explains the discard.
         # Old generations and repeated ring reads never add samples.
-        self.stats.observe_inference_latency_ms(prediction.inference_latency_ms)
-        self.stats.observe_observation_age_ms(prediction.observation_age_ms)
-        self.stats.observe_observation_skew_ms(prediction.observation_skew_ms)
+        self.stats.inference_latency_ms = float(prediction.inference_latency_ms)
+        self.stats.observation_age_ms = float(prediction.observation_age_ms)
+        self.stats.observation_skew_ms = float(prediction.observation_skew_ms)
 
         first_index = first_future_step_index(
             prediction.logical_step_monotonic_ns,
@@ -1404,7 +1397,7 @@ class PolicyExecutor:
         self.active_prediction = prediction
         self.step_index = first_index
         self.schedule_base_ns = prediction.logical_step_monotonic_ns
-        self.stats.observe_skipped_prefix_steps(first_index)
+        self.stats.skipped_prefix_steps = first_index
         return True
 
     def _next_due_action(self, now_ns: int) -> tuple[np.ndarray, int, int] | None:
@@ -1443,7 +1436,7 @@ class PolicyExecutor:
 
     def _consume_control_slot(self, due_ns: int, terminal_ns: int) -> None:
         lateness_ms = max(0, terminal_ns - due_ns) / 1e6
-        self.stats.observe_schedule_lateness_ms(lateness_ms)
+        self.stats.schedule_lateness_ms = lateness_ms
         self.next_command_due_ns = _advance_control_grid_ns(
             due_ns, terminal_ns, self.step_dt_ns
         )
@@ -1644,7 +1637,7 @@ class PolicyExecutor:
         self._consume_control_slot(due_ns, publication_ns)
         if self.last_publication_ns is not None:
             interval_ms = (publication_ns - self.last_publication_ns) / 1e6
-            self.stats.observe_publication_interval_ms(interval_ms)
+            self.stats.publication_interval_ms = interval_ms
         self.last_publication_ns = publication_ns
         self.last_valid_command_ns = publication_ns
         self._commit_terminal_step()

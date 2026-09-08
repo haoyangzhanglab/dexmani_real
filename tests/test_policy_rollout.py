@@ -501,11 +501,11 @@ class TestFutureChunkBoundary(unittest.TestCase):
         loaded.predict_action_chunk.assert_called_once_with(observation.arrays)
         loaded.predict.assert_not_called()
         prediction = Prediction(1, 10, 20, actions, 12.5, 3.25, 0.125)
+        frame = serialize_prediction(prediction)
         chunk[:] = -1
-        restored = prediction_from_record(serialize_prediction(prediction)[0])
+        restored = prediction_from_record(frame[0])
         self.assertEqual(restored.num_steps, spec.chunk_size)
         self.assertEqual(restored.actions.dtype, np.float64)
-        self.assertFalse(restored.actions.flags.writeable)
         self.assertEqual(restored.actions[-1, -1], 284)
 
     def test_full_chunk_capacity_is_checked(self):
@@ -517,6 +517,24 @@ class TestFutureChunkBoundary(unittest.TestCase):
             validate_policy_runtime_compatibility(
                 _fake_policy_spec(chunk_size=MAX_PREDICTION_STEPS + 1), _fake_runtime()
             )
+
+    def test_prediction_ipc_rejects_malformed_dimensions(self):
+        from dexmani_real.ipc.schema import MAX_PREDICTION_STEPS
+
+        frame = serialize_prediction(
+            Prediction(1, 10, 20, np.zeros((15, 19)), 12.5, 3.25, 0.125)
+        )
+        for field, value in (
+            ("num_steps", 0),
+            ("num_steps", MAX_PREDICTION_STEPS + 1),
+            ("action_dim", 0),
+            ("action_dim", 22),
+        ):
+            with self.subTest(field=field, value=value):
+                malformed = frame.copy()
+                malformed[field][0] = value
+                with self.assertRaises(ValueError):
+                    executor_mod.prediction_from_record(malformed[0])
 
 
 class TestPredictionTiming(unittest.TestCase):
@@ -612,25 +630,28 @@ class TestPredictionTiming(unittest.TestCase):
         ):
             self.assertEqual(getattr(restored, name), getattr(prediction, name))
 
-    def test_malformed_timing_rejected_at_construction_and_ipc(self):
-        prediction = Prediction(1, 10, 20, np.zeros((15, 19)), 12.5, 3.25, 0.125)
-        for name in (
-            "inference_latency_ms",
-            "observation_age_ms",
-            "observation_skew_ms",
-        ):
-            for value in (float("nan"), float("inf"), -1.0):
-                with self.subTest(name=name, value=value):
-                    with self.assertRaises(ValueError):
-                        replace(prediction, **{name: value})
-                    frame = serialize_prediction(prediction)
-                    frame[name][0] = value
-                    with self.assertRaises(ValueError):
-                        executor_mod.prediction_from_record(frame[0])
-            for value in (True, np.bool_(False), "1", None, 1j, np.array(1.0)):
-                with self.subTest(name=name, value=value):
-                    with self.assertRaises(TypeError):
-                        replace(prediction, **{name: value})
+    def test_stats_filter_bad_diagnostics_and_preserve_counters(self):
+        stats = PolicyStats(
+            inference_latency_ms=float("nan"),
+            observation_age_ms=-1.0,
+            observation_skew_ms=1.25,
+            schedule_lateness_ms=float("inf"),
+            publication_interval_ms=0.0,
+            skipped_prefix_steps=-1,
+            safety_rejection_count=2,
+            command_progress_timeout_count=1,
+            ik_rejection_count=3,
+        )
+        metrics = stats.snapshot()
+        self.assertNotIn("inference_latency_ms", metrics)
+        self.assertNotIn("observation_age_ms", metrics)
+        self.assertNotIn("schedule_lateness_ms", metrics)
+        self.assertNotIn("skipped_prefix_steps", metrics)
+        self.assertEqual(metrics["observation_skew_ms"], 1.25)
+        self.assertEqual(metrics["publication_interval_ms"], 0.0)
+        self.assertEqual(metrics["safety_rejection_count"], 2)
+        self.assertEqual(metrics["command_progress_timeout_count"], 1)
+        self.assertEqual(metrics["ik_rejection_count"], 3)
 
 
 class TestFutureTail(unittest.TestCase):
@@ -1002,7 +1023,7 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
                     )
                     self.assertEqual(executor.shared.safety_state.value, expected_state)
 
-    def test_malformed_ipc_timing_fences_rollout(self):
+    def test_malformed_ipc_timing_is_passive_diagnostic(self):
         executor = self.executor("run")
         self.begin(executor)
         now = executor.run_started_ns
@@ -1020,10 +1041,10 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         frame["inference_latency_ms"][0] = np.nan
         executor.shared.prediction_ring = mock.Mock()
         executor.shared.prediction_ring.read_latest.return_value = (frame, now, 1)
-        self.assertFalse(executor._ingest_latest_prediction(now))
-        self.assertEqual(executor.shared.safety_state.value, SafetyState.FAULT)
-        self.assertEqual(executor.rollout_result["outcome"], EvaluationOutcome.INVALID)
-        self.assertNotIn("inference_latency_ms", executor.rollout_result["metrics"])
+        self.assertTrue(executor._ingest_latest_prediction(now))
+        self.assertEqual(executor.shared.safety_state.value, SafetyState.RUNNING)
+        self.assertIsNotNone(executor.active_prediction)
+        self.assertNotIn("inference_latency_ms", executor.stats.snapshot())
 
     def test_recording_failure_fences_without_worker_acceptance(self):
         executor = self.executor()

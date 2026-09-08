@@ -60,10 +60,10 @@ causal observation history
     → arm / hand worker final checks
 ```
 
-- `Prediction` 是唯一的内部策略输出对象；动作是拥有自身内存的 finite
-  `float64[chunk_size, D]`，
+- `Prediction` 是简单的内部策略输出容器；动作在 inference 输出边界校验为 finite
+  `float64[chunk_size, D]`，序列化和 SHM 读取建立传输副本，
   `run_generation`、source timestamp 和 logical-step timestamp 随对象传播。
-  三个 finite、非负 timing（inference latency、observation age/skew，单位 ms）
+  三个 timing（inference latency、observation age/skew，单位 ms；无效诊断值忽略）
   随 exact chunk 经 IPC 进入 executor-owned `PolicyStats` 和 `result.json.metrics`，
   表示当前 generation 最新收到的样本（含全过期 chunk），不是 full-episode percentile。
 - Real 只校验 Policy 公开契约字段（observation fields/shape/dtype、`requires_hand`、
@@ -89,6 +89,7 @@ causal observation history
 - `tests/test_policy_rollout.py` 用离线 fake 覆盖 Policy 公开契约兼容、timestamp 调度
   （stale-prefix/whole-stale/no-catch-up）、IK/SAFETY 归属、reject-only arm 与
   publish-then-record rollout 合同，不启动 worker 或硬件。
+  `tests/test_prediction_boundary.py` 覆盖 inference 动作 shape/finite 准入，以及 warmup 失败与无效诊断的区别。
 
 ## Recorded policy rollout flow
 

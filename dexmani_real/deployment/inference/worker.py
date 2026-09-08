@@ -75,8 +75,6 @@ def _load_inference_runtime(config: InferenceWorkerConfig) -> PolicyRuntime:
 
 def serialize_prediction(prediction: Prediction) -> np.ndarray:
     """Serialize one validated prediction, including its timing metadata."""
-    if not isinstance(prediction, Prediction):
-        raise TypeError("prediction must be a Prediction")
     frame = new_frame(PREDICTION_DTYPE)
     frame["run_generation"][0] = np.uint64(prediction.run_generation)
     frame["source_monotonic_ns"][0] = np.uint64(prediction.source_monotonic_ns)
@@ -96,12 +94,22 @@ def serialize_prediction(prediction: Prediction) -> np.ndarray:
 
 def publish_prediction(shared: RuntimeChannels, prediction: Prediction) -> bool:
     """Generation-fence and publish one flat prediction to the single-slot ring."""
-    if not isinstance(prediction, Prediction):
-        raise TypeError("prediction must be a Prediction")
     if int(shared.run_generation.value) != prediction.run_generation:
         return False
     shared.prediction_ring.write(serialize_prediction(prediction))
     return True
+
+
+def _predict_action_chunk(
+    runtime: PolicyRuntime, observation: Any, spec: Any
+) -> np.ndarray:
+    """Convert and admit model output before it can enter prediction IPC."""
+    actions = np.asarray(runtime.predict_action_chunk(observation), dtype=np.float64)
+    if actions.shape != (spec.chunk_size, spec.control_action_dim):
+        raise ValueError("Policy future chunk shape conflicts with PolicySpec")
+    if not np.all(np.isfinite(actions)):
+        raise ValueError("Policy future chunk contains NaN/Inf")
+    return actions
 
 
 def inference_loop(
@@ -132,13 +140,13 @@ def inference_loop(
         fingertip_runtime = build_fingertip_runtime(config.spec, fingertip_config)
         warmup_samples = 5
         timings_s = runtime.warmup(samples=warmup_samples)
-        if len(timings_s) != warmup_samples:
-            raise RuntimeError("policy runtime returned incomplete warmup timings")
-        if any(not np.isfinite(value) or value < 0.0 for value in timings_s):
-            raise RuntimeError("policy runtime returned invalid warmup timing")
         logger.info(
             "inference warmup: samples_ms=%s",
-            ",".join(f"{value * 1e3:.3f}" for value in timings_s),
+            ",".join(
+                f"{value * 1e3:.3f}"
+                for value in timings_s
+                if np.isfinite(value) and value >= 0
+            ),
         )
     except BaseException:
         try:
@@ -227,8 +235,8 @@ def inference_loop(
                 wait_for_observation()
                 continue
             observation_age_ms, observation_skew_ms = observation_timing_ms(observation)
-            stats.observe_observation_age_ms(observation_age_ms)
-            stats.observe_observation_skew_ms(observation_skew_ms)
+            stats.observation_age_ms = observation_age_ms
+            stats.observation_skew_ms = observation_skew_ms
             last_logical_step_ns = observation.logical_step_monotonic_ns
 
             started_ns = time.monotonic_ns()
@@ -237,15 +245,10 @@ def inference_loop(
                 config.spec,
                 fingertip_runtime=fingertip_runtime,
             )
-            actions = runtime.predict_action_chunk(policy_observation)
-            if actions.shape != (
-                config.spec.chunk_size,
-                config.spec.control_action_dim,
-            ):
-                raise ValueError("Policy future chunk shape conflicts with PolicySpec")
+            actions = _predict_action_chunk(runtime, policy_observation, config.spec)
             finished_ns = time.monotonic_ns()
             inference_ms = (finished_ns - started_ns) / 1e6
-            stats.observe_inference_latency_ms(inference_ms)
+            stats.inference_latency_ms = inference_ms
 
             prediction = Prediction(
                 run_generation=run_generation,

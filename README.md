@@ -318,10 +318,10 @@ eval 通过 `--eval-seed` 明确选择并写入结果元数据，
 XHand 需求由 `PolicySpec.requires_hand` 决定，不由 CLI
 重复声明。
 
-inference 每次只发布一个带 observation provenance 和 inference timing 的不可变 flat `Prediction` IPC record 到单槽 latest-wins
-ring；动作数组为有限 `float64[chunk_size,D]`，来自 `predict_action_chunk()`。
+inference 每次只发布一个带 observation provenance 和 inference timing 的 flat `Prediction` IPC record 到单槽 latest-wins
+ring；`predict_action_chunk()` 的输出在 inference 边界转换并检查为有限 `float64[chunk_size,D]`。
 三个必填 timing 字段 `inference_latency_ms`、`observation_age_ms`、`observation_skew_ms`
-对应生成该 chunk 的同一次 observation / inference，均为有限、非负的 real scalar（不接受 bool），IPC 使用 `float64`。
+对应生成该 chunk 的同一次 observation / inference，IPC 使用 `float64`。metrics 只保存最新标量和计数器；无效诊断值不进入结果，也不使有效 rollout 失败。
 inference 按 `n_action_steps * control_dt_s` 的绝对 cadence 查询，计算期间旧 future tail 继续可用。
 新 prediction 的 `target_time <= now` 前缀直接丢弃；全过期 prediction 丢弃并保留已有合法计划或 hold。
 executor 在每个 target 前一个控制周期内发布该未来目标，以 control grid 限制发布频率；

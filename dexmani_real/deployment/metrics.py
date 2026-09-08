@@ -4,78 +4,27 @@ from __future__ import annotations
 
 import math
 import time
-from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-_SAMPLE_CAPACITY = 256
-
-
-def _samples() -> deque[float]:
-    return deque(maxlen=_SAMPLE_CAPACITY)
-
-
-def _step_samples() -> deque[int]:
-    return deque(maxlen=_SAMPLE_CAPACITY)
-
 
 @dataclass
 class PolicyStats:
-    """Bounded timings and the few failure counts useful to an operator.
+    """Latest control-quality diagnostics and cumulative rejection counts."""
 
-    Each deployment worker owns one instance. It deliberately has explicit
-    fields instead of a named metric registry: these values are the supported
-    diagnostics for learned-policy execution, not a generic observability API.
-    In the executor, inference and observation timings are the latest received
-    samples carried by a current-generation Prediction, not episode percentiles.
-    """
-
-    inference_latency_ms: deque[float] = field(default_factory=_samples)
-    observation_age_ms: deque[float] = field(default_factory=_samples)
-    observation_skew_ms: deque[float] = field(default_factory=_samples)
-    schedule_lateness_ms: deque[float] = field(default_factory=_samples)
-    publication_interval_ms: deque[float] = field(default_factory=_samples)
-    skipped_prefix_steps: deque[int] = field(default_factory=_step_samples)
+    inference_latency_ms: float | None = None
+    observation_age_ms: float | None = None
+    observation_skew_ms: float | None = None
+    schedule_lateness_ms: float | None = None
+    publication_interval_ms: float | None = None
+    skipped_prefix_steps: int | None = None
     safety_rejection_count: int = 0
     command_progress_timeout_count: int = 0
     ik_rejection_count: int = 0
     stale_prediction_count: int = 0
-
-    @staticmethod
-    def _append(samples: deque[float], value: float) -> None:
-        sample = float(value)
-        if not math.isfinite(sample):
-            raise ValueError("deployment diagnostic sample must be finite")
-        samples.append(sample)
-
-    def observe_inference_latency_ms(self, value: float) -> None:
-        self._append(self.inference_latency_ms, value)
-
-    def observe_observation_age_ms(self, value: float) -> None:
-        self._append(self.observation_age_ms, value)
-
-    def observe_observation_skew_ms(self, value: float) -> None:
-        self._append(self.observation_skew_ms, value)
-
-    def observe_schedule_lateness_ms(self, value: float) -> None:
-        self._append(self.schedule_lateness_ms, value)
-
-    def observe_publication_interval_ms(self, value: float) -> None:
-        self._append(self.publication_interval_ms, value)
-
-    def observe_skipped_prefix_steps(self, value: int) -> None:
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise TypeError("skipped_prefix_steps must be a non-negative integer")
-        if value < 0:
-            raise ValueError("skipped_prefix_steps must be non-negative")
-        self.skipped_prefix_steps.append(value)
-
-    @staticmethod
-    def _latest(samples: deque[float] | deque[int]) -> float | int | None:
-        return samples[-1] if samples else None
 
     def snapshot(self) -> dict[str, int | float]:
         """Return latest timings and cumulative counts for this rollout."""
@@ -88,17 +37,17 @@ class PolicyStats:
             "stale_prediction_count": self.stale_prediction_count,
         }
         result.update({name: count for name, count in optional_counts.items() if count})
-        for name, samples in (
-            ("inference_latency_ms", self.inference_latency_ms),
-            ("observation_age_ms", self.observation_age_ms),
-            ("observation_skew_ms", self.observation_skew_ms),
-            ("schedule_lateness_ms", self.schedule_lateness_ms),
-            ("publication_interval_ms", self.publication_interval_ms),
-            ("skipped_prefix_steps", self.skipped_prefix_steps),
+        for name in (
+            "inference_latency_ms",
+            "observation_age_ms",
+            "observation_skew_ms",
+            "schedule_lateness_ms",
+            "publication_interval_ms",
+            "skipped_prefix_steps",
         ):
-            latest = self._latest(samples)
-            if latest is not None:
-                result[name] = latest
+            value = getattr(self, name)
+            if value is not None and math.isfinite(value) and value >= 0:
+                result[name] = value
         return result
 
     def flush(self, *, prefix: str, debug: bool = False) -> None:
