@@ -151,6 +151,8 @@ as desired behavior.
 - Base: `afe387f3f7a0fb017b25f0216e06b49082f373fa`.
 - Branch: `codex/refactor-pr4-recorder`.
 - Implementation: astra-medium; independent reviewer: a separate astra-medium.
+- PR: https://github.com/haoyangzhanglab/dexmani_real/pull/6 (merged).
+- Integrated SHA: `2316bf0c129c145716a954664f9791cbae28a715`.
 - 4A commit `eb0b053`: additive synchronous `finish_episode` returns reserved
   paths for save/discard, returns None without active work, and raises after
   failure cleanup. Legacy async API remains for this migration checkpoint.
@@ -187,6 +189,23 @@ as desired behavior.
   classification, directory cleanup failure retention, real-thread test entry
   synchronization, explicit-join proof and terminal transport failure coverage.
   No separate unrelated bugfix; no hardware run.
+
+### PR5 — contract audit
+
+- Base: `2316bf0c129c145716a954664f9791cbae28a715`.
+- Branch: `codex/refactor-pr5-contract-audit`.
+- Implementation/audit: astra-medium; independent reviewer: a separate astra-medium.
+- Decision: KEEP all inspected validators; production diff is zero. Full
+  five-category check-level classification and producer/consumer evidence:
+  [refactor_contract_audit.md](refactor_contract_audit.md).
+- README/repo map explicitly identify applicable PolicySpec field semantics as
+  Real public compatibility contract; fingertip uses policy ID, EEF algorithm ID.
+- Independent review approved; 14 local audit links resolve. Author targeted
+  **183 passed, 48 subtests passed**; independent focused **40 passed, 22 subtests**;
+  full **344 passed, 94 subtests passed**, compileall/diff check passed.
+- No FIXED_SCHEMA_IDENTITY candidate met all five deletion conditions. No
+  production/examples/test changes, size change, bugfix or new validator;
+  gap tolerance and all protected boundaries unchanged. Hardware not exercised.
 
 ## Hardware gate
 

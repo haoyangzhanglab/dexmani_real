@@ -75,10 +75,14 @@ causal observation history
   三个 timing（inference latency、observation age/skew，单位 ms；无效诊断值忽略）
   随 exact chunk 经 IPC 进入 executor-owned `PolicyStats` 和 `result.json.metrics`，
   表示当前 generation 最新收到的样本（含全过期 chunk），不是 full-episode percentile。
-- Real 只校验 Policy 公开契约字段（observation fields/shape/dtype、`requires_hand`、
+- Real 只校验 Policy 公开契约字段（observation fields/shape/dtype/相应 semantics、`requires_hand`、
   `chunk_size`、`n_action_steps`、`action_key`、`control_action_dim`、`control_dt_s`），不解析
   artifact 内部或 `temporal_ensemble_coeff` 等历史字段；Real 直接调度 Policy 给出的完整
   future action chunk，不在 deployment/sim runner 追加 overlap blending。
+- `PolicySpec.observation_fields[*].semantics` 是 Real public compatibility contract 的一部分；
+  EEF、tactile、fingertip 的 interpretation 和 point-cloud preprocessing identity 在
+  `deployment/config.py` 校验，不能仅依据固定 shape/dtype 删除。逐类审计见
+  [`docs/refactor_contract_audit.md`](docs/refactor_contract_audit.md)。
 - inference worker 只负责 observation、策略调用和 prediction 发布；PolicyExecutor 独占动作
   horizon 解码、control-grid 调度、EE→IK、候选校验和 command-progress watchdog。
 - `robot/model.py` 统一 anatomical finger、SDK tactile sensor ID 和 fingertip link 顺序；

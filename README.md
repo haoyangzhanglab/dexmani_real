@@ -159,7 +159,7 @@ CLI override > YAML file > dexmani_real/config/defaults.py
 Real runtime 配置由 [`config/experiment.py`](dexmani_real/config/experiment.py) 加载为独立的 nested dataclass，并在加载边界统一校验；未知 YAML 字段会报错，`--print-config` 现场输出实际配置。learned-policy 的 observation freshness、command progress、action validity 和 watchdog timing
 属于其 `policy` 段，模型 shape、modality、horizon 和 inference cadence 则来自 Policy public
 API 的 `PolicySpec`。Real 只校验 `PolicySpec` 的公开契约字段（observation fields / shape /
-dtype、`requires_hand`、`chunk_size`、`n_action_steps`、`action_key`、`control_action_dim`、`control_dt_s`），
+dtype / 相应字段的 semantics、`requires_hand`、`chunk_size`、`n_action_steps`、`action_key`、`control_action_dim`、`control_dt_s`），
 不解析 Policy artifact 内部、`best_ckpt.json` 或历史格式；调度也不会对 action chunk 做
 temporal blending。`shadow`/`run`/`eval` 共用唯一周期调度；physical rollout 使用
 `--max-duration`，formal eval 必填。
@@ -308,10 +308,13 @@ deployment lifecycle 从 Policy public API 取得只读 `PolicySpec`。唯一的
 `dexmani.deployment.v3` artifact 只包含 `_format`、`contract` 和 `weights`；其
 `data_contract.observation_fields` 按顺序声明每个原始模型
 输入的名称、shape、dtype 与语义；训练 experiment 的 `dataset.sensor_modalities` 是导出时唯一的
-人工选择入口，artifact 不再持久化第二份模态列表。Real 只验证自己要投影的 raw shape/dtype、
+人工选择入口，artifact 不再持久化第二份模态列表。`PolicySpec.observation_fields[*].semantics`
+属于 Real public compatibility contract：EEF 的 frame/rotation/derivation、tactile 的
+sensor/point/finger 顺序与单位声明、fingertip derivation，以及 point-cloud preprocessing
+identity 都参与 fail-closed 兼容性校验。Real 验证自己要投影的 raw shape/dtype 和相应 semantics、
 19/21D control action、XHand、控制周期、`chunk_size` 与 Prediction IPC capacity，并只启动所需 sensor worker。
 若请求 point cloud，还会在 channel/worker 创建前逐项校验 preprocessing identity（frame、颜色来源、
-policy/table/sampling/transform）；若请求 fingertip，则校验 derivation 与 algorithm ID。任一 mismatch
+policy/table/sampling/transform）；若请求 fingertip，则校验 derivation 与 policy ID。任一 mismatch
 fail closed，deployment schema 仍保持 v3。
 checkpoint/Hydra/EMA/normalizer/denoise 与 RGB model preprocessing 全部由
 `dexmani_policy.deployment.load_experiment()` 拥有；Real adapter 只透传 canonical NumPy
