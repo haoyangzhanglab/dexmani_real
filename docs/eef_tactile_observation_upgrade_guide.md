@@ -852,7 +852,7 @@ algorithm_id = xarm7_custom_eef_pinocchio_fk_v1
 
 ## 11.2 `deployment/inference/observation.py`
 
-`_POLICY_MODALITIES` 加 `eef_pose`，`PolicyObservation` shape validator 加 `(9,)`。
+`eef_pose` 的 `(9,)` shape 由 builder/FK 投影构造；内部 `PolicyObservation` 不重复验证容器内容。
 
 不要给 `ObservationBatch` 新增 EEF SHM history；它是 arm qpos 的 deterministic derived modality。
 
@@ -1179,7 +1179,7 @@ tactile_force only when requested
 contact-only path 不读取/copy full tactile
 tactile_force causal/calibrated/unit gates
 contact + tactile_force source timestamps must match
-PolicyObservation shape/dtype/C-contiguous
+builder 输出的 PolicyObservation shape/dtype/C-contiguous
 ```
 
 ## 15.8 Visualization helper

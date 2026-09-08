@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import types
 import unittest
-from dataclasses import replace
 from unittest import mock
 
 import numpy as np
@@ -28,7 +27,6 @@ from dexmani_real.deployment.config import (
 from dexmani_real.deployment.inference.observation import (
     FrameWindow,
     ObservationBatch,
-    PolicyObservation,
     _align_state_history_to_camera_frames,
     _build_observation,
     _to_policy_observation,
@@ -217,56 +215,6 @@ class TestFieldGates(unittest.TestCase):
         self.assertIn("eef_pose", _SUPPORTED_OBSERVATION_FIELDS)
         self.assertIn("tactile_force", _SUPPORTED_OBSERVATION_FIELDS)
 
-    def test_policy_observation_accepts_new_tails(self) -> None:
-        arrays = {
-            "joint_state": np.zeros((_HORIZON, 19), dtype=np.float32),
-            "eef_pose": np.zeros((_HORIZON, 9), dtype=np.float32),
-            "tactile_force": np.zeros((_HORIZON, 5, 120, 3), dtype=np.float32),
-        }
-        arrays["eef_pose"][:, 3:] = [1, 0, 0, 0, 1, 0]
-        observation = PolicyObservation(
-            observation_id=1,
-            run_generation=0,
-            anchor_monotonic_ns=_ANCHOR_NS,
-            latest_source_monotonic_ns=_ref_ns(5),
-            logical_step_monotonic_ns=_ref_ns(5),
-            arrays=arrays,
-        )
-        self.assertEqual(
-            tuple(observation.arrays), ("joint_state", "eef_pose", "tactile_force")
-        )
-        for rotation in ([0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 1, 0],
-                         [1, 0, 0, 1, 0, 0]):
-            with self.subTest(rotation=rotation):
-                arrays["eef_pose"][:, 3:] = rotation
-                with self.assertRaises(ValueError):
-                    replace(observation, arrays=arrays)
-
-    def test_policy_observation_rejects_wrong_tail_and_dtype(self) -> None:
-        base = {
-            "observation_id": 1,
-            "run_generation": 0,
-            "anchor_monotonic_ns": _ANCHOR_NS,
-            "latest_source_monotonic_ns": _ref_ns(5),
-            "logical_step_monotonic_ns": _ref_ns(5),
-        }
-        with self.assertRaises(ValueError):
-            PolicyObservation(
-                arrays={
-                    "joint_state": np.zeros((_HORIZON, 19), dtype=np.float32),
-                    "eef_pose": np.zeros((_HORIZON, 8), dtype=np.float32),
-                },
-                **base,
-            )
-        with self.assertRaises(TypeError):
-            PolicyObservation(
-                arrays={
-                    "joint_state": np.zeros((_HORIZON, 19), dtype=np.float32),
-                    "tactile_force": np.zeros((_HORIZON, 5, 120, 3), dtype=np.float64),
-                },
-                **base,
-            )
-
     def test_requires_hand_sensor(self) -> None:
         self.assertTrue(
             _requires_hand_sensor(
@@ -395,39 +343,13 @@ class TestBuildObservation(unittest.TestCase):
         self.assertIsNone(_build(shared, spec))
 
     def test_force_window_respects_causal_cut(self) -> None:
-        window = FrameWindow(
-            values=np.zeros((_HORIZON, 5, 120, 3)),
-            source_sequence=np.ones(_HORIZON, dtype=np.uint64),
-            source_monotonic_ns=np.asarray(
-                [_ref_ns(tick) for tick in _REF_TICKS], dtype=np.uint64
-            ),
-            publish_monotonic_ns=np.asarray(
-                [_ANCHOR_NS + 1] * _HORIZON, dtype=np.uint64
-            ),
-            valid_mask=np.ones(_HORIZON, dtype=np.uint8),
-        )
-        arm = FrameWindow(
-            values=np.zeros((_HORIZON, 7)),
-            source_sequence=np.ones(_HORIZON, dtype=np.uint64),
-            source_monotonic_ns=np.asarray(
-                [_ref_ns(tick) for tick in _REF_TICKS], dtype=np.uint64
-            ),
-            publish_monotonic_ns=np.asarray(
-                [_ref_ns(tick) for tick in _REF_TICKS], dtype=np.uint64
-            ),
-            valid_mask=np.ones(_HORIZON, dtype=np.uint8),
-        )
-        with self.assertRaises(ValueError):
-            ObservationBatch(
-                observation_id=1,
-                run_generation=0,
-                run_started_monotonic_ns=_T0_NS,
-                anchor_monotonic_ns=_ANCHOR_NS,
-                latest_source_monotonic_ns=_ref_ns(5),
-                logical_step_monotonic_ns=_ref_ns(5),
-                arm_history=arm,
-                hand_tactile_force_history=window,
-            )
+        shared = _fake_shared()
+        shared.hand_tactile_ring._records = [
+            (data, _ANCHOR_NS + 1, sequence)
+            for data, _ring_publish_ns, sequence in shared.hand_tactile_ring._records
+        ]
+        spec = _fake_policy_spec(_Field("tactile_force", (5, 120, 3), "float32"))
+        self.assertIsNone(_build(shared, spec))
 
     def test_camera_alignment_parity_for_force_history(self) -> None:
         spec = _fake_policy_spec(_Field("tactile_force", (5, 120, 3), "float32"))

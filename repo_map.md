@@ -60,6 +60,7 @@ causal observation history
     → arm / hand worker final checks
 ```
 
+- `deployment/inference/observation.py` 的 builder 拥有 causal/freshness/history/skew/generation 准入；内部 window/batch 只承载结果。SHM reader 保留复制与 seqlock 检查，模型输入转换后检查有限值。
 - `Prediction` 是简单的内部策略输出容器；动作在 inference 输出边界校验为 finite
   `float64[chunk_size, D]`，序列化和 SHM 读取建立传输副本，
   `run_generation`、source timestamp 和 logical-step timestamp 随对象传播。
@@ -90,6 +91,7 @@ causal observation history
   （stale-prefix/whole-stale/no-catch-up）、IK/SAFETY 归属、reject-only arm 与
   publish-then-record rollout 合同，不启动 worker 或硬件。
   `tests/test_prediction_boundary.py` 覆盖 inference 动作 shape/finite 准入，以及 warmup 失败与无效诊断的区别。
+  `tests/test_observation_builder.py` 覆盖 sensor/camera 因果、freshness、generation、payload 与模型转换边界。
 
 ## Recorded policy rollout flow
 

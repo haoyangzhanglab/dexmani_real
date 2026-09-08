@@ -3,8 +3,8 @@
 These types never enter RuntimeChannels and therefore carry no
 IPC dtype. They are the ``PolicyRuntime`` input contract.
 
-Shared-memory readers already take ownership copies.  These containers validate
-those process-local arrays without copying their payloads again.
+Shared-memory readers take ownership copies. The builder owns temporal and
+payload admission; these process-local containers only carry assembled values.
 """
 
 from __future__ import annotations
@@ -26,23 +26,10 @@ from dexmani_real.planning.kinematics.fingertip import (
     compute_fingertip_history_xarm_base,
 )
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
-from dexmani_real.planning.kinematics.pose import validate_canonical_rot6d
 from dexmani_real.sensor.camera.transforms import resize_rgb
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-_POLICY_MODALITIES = frozenset(
-    {
-        "joint_state",
-        "point_cloud",
-        "rgb",
-        "contact_force",
-        "fingertip_points",
-        "eef_pose",
-        "tactile_force",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -59,76 +46,6 @@ class PolicyObservation:
     latest_source_monotonic_ns: int
     logical_step_monotonic_ns: int
     arrays: Mapping[str, np.ndarray]
-
-    def __post_init__(self) -> None:
-        if type(self.observation_id) is not int or self.observation_id <= 0:
-            raise ValueError("observation_id must be a positive integer")
-        if type(self.run_generation) is not int or self.run_generation < 0:
-            raise ValueError("run_generation must be a non-negative integer")
-        for name in (
-            "anchor_monotonic_ns",
-            "latest_source_monotonic_ns",
-            "logical_step_monotonic_ns",
-        ):
-            if type(getattr(self, name)) is not int:
-                raise TypeError(f"{name} must be an integer")
-        if not (
-            0
-            < self.latest_source_monotonic_ns
-            <= self.logical_step_monotonic_ns
-            <= self.anchor_monotonic_ns
-        ):
-            raise ValueError("PolicyObservation timestamps are inconsistent")
-        if not isinstance(self.arrays, Mapping):
-            raise TypeError("PolicyObservation arrays must be a mapping")
-        modalities = tuple(self.arrays)
-        if (
-            not modalities
-            or len(set(modalities)) != len(modalities)
-            or not set(modalities) <= _POLICY_MODALITIES
-            or "joint_state" not in modalities
-        ):
-            raise ValueError("PolicyObservation modalities are invalid")
-        horizon: int | None = None
-        for name in modalities:
-            arr = np.asarray(self.arrays[name])
-            expected_dtype = np.uint8 if name == "rgb" else np.float32
-            if arr.dtype != np.dtype(expected_dtype):
-                raise TypeError(f"{name} must have dtype {np.dtype(expected_dtype)}")
-            _validate_finite(arr, name=f"PolicyObservation.{name}")
-            if not arr.flags.c_contiguous:
-                raise ValueError(f"{name} must be C-contiguous")
-            if not arr.flags.writeable:
-                raise ValueError(f"{name} must be writeable")
-            expected_tail = {
-                "joint_state": (19,),
-                "contact_force": (5, 3),
-                "fingertip_points": (5, 3),
-                "eef_pose": (9,),
-                "tactile_force": (5, 120, 3),
-            }.get(name)
-            if arr.ndim < 2 or (
-                expected_tail is not None and arr.shape[1:] != expected_tail
-            ):
-                raise ValueError(f"{name} has invalid shape {arr.shape}")
-            if name == "point_cloud" and (arr.ndim != 3 or arr.shape[2] != 6):
-                raise ValueError("point_cloud must be [T, N, 6]")
-            if name == "eef_pose":
-                validate_canonical_rot6d(
-                    arr[:, 3:9], label="PolicyObservation.eef_pose rot6d"
-                )
-            if name == "rgb" and (arr.ndim != 4 or arr.shape[3] != 3):
-                raise ValueError("rgb must be [T, H, W, 3]")
-            if name == "point_cloud" and arr.shape[1] <= 0:
-                raise ValueError("point_cloud N must be positive")
-            if name == "rgb" and min(arr.shape[1:3]) <= 0:
-                raise ValueError("rgb H and W must be positive")
-            if horizon is None:
-                horizon = int(arr.shape[0])
-            elif arr.shape[0] != horizon:
-                raise ValueError("PolicyObservation modalities must share T")
-        if horizon is None or horizon <= 0:
-            raise ValueError("PolicyObservation requires a non-empty history")
 
 
 def _validate_finite(array: np.ndarray, *, name: str) -> None:
@@ -152,31 +69,6 @@ class FrameWindow:
     publish_monotonic_ns: np.ndarray
     valid_mask: np.ndarray
 
-    def __post_init__(self) -> None:
-        if self.values is None:
-            raise ValueError("FrameWindow.values must not be None")
-        values = np.asarray(self.values)
-        _validate_finite(values, name="FrameWindow.values")
-        if values.ndim < 2:
-            raise ValueError("FrameWindow.values must be [T, ...]")
-        t = values.shape[0]
-        for name in ("source_sequence", "source_monotonic_ns", "publish_monotonic_ns"):
-            arr = np.asarray(getattr(self, name))
-            if arr.dtype != np.uint64:
-                raise TypeError(f"FrameWindow.{name} must have dtype uint64")
-            if arr.shape != (t,):
-                raise ValueError(f"FrameWindow.{name} must be a ({t},) uint64 array")
-            object.__setattr__(self, name, arr)
-        mask = np.asarray(self.valid_mask)
-        if mask.dtype != np.uint8:
-            raise TypeError("FrameWindow.valid_mask must have dtype uint8")
-        if mask.shape != (t,):
-            raise ValueError(f"FrameWindow.valid_mask must be a ({t},) uint8 array")
-        if not np.all((mask == 0) | (mask == 1)):
-            raise ValueError("FrameWindow.valid_mask must be 0 or 1")
-        object.__setattr__(self, "values", values)
-        object.__setattr__(self, "valid_mask", mask)
-
 
 @dataclass(frozen=True)
 class PointCloudFrame:
@@ -188,37 +80,6 @@ class PointCloudFrame:
     publish_monotonic_ns: int
     camera_generation: int
 
-    def __post_init__(self) -> None:
-        raw_values = np.asarray(self.values)
-        values = validate_point_cloud_array(
-            raw_values,
-            num_points=raw_values.shape[0] if raw_values.ndim == 2 else 1,
-            label="PointCloudFrame.values",
-        )
-        provenance = (
-            self.source_camera_sequence,
-            self.source_monotonic_ns,
-            self.publish_monotonic_ns,
-            self.camera_generation,
-        )
-        if any(
-            isinstance(value, (bool, np.bool_))
-            or not isinstance(value, (int, np.integer))
-            or int(value) <= 0
-            for value in provenance
-        ):
-            raise ValueError("PointCloudFrame provenance values must be positive")
-        if int(self.source_monotonic_ns) > int(self.publish_monotonic_ns):
-            raise ValueError("PointCloudFrame source time cannot exceed publish time")
-        object.__setattr__(self, "values", values)
-        for name in (
-            "source_camera_sequence",
-            "source_monotonic_ns",
-            "publish_monotonic_ns",
-            "camera_generation",
-        ):
-            object.__setattr__(self, name, int(getattr(self, name)))
-
 
 @dataclass(frozen=True)
 class RgbFrame:
@@ -229,34 +90,6 @@ class RgbFrame:
     source_monotonic_ns: int
     publish_monotonic_ns: int
     camera_generation: int
-
-    def __post_init__(self) -> None:
-        values = np.asarray(self.values)
-        if values.dtype != np.uint8 or values.ndim != 3 or values.shape[2] != 3:
-            raise ValueError("RgbFrame.values must be uint8 [H, W, 3]")
-        provenance = (
-            self.source_camera_sequence,
-            self.source_monotonic_ns,
-            self.publish_monotonic_ns,
-            self.camera_generation,
-        )
-        if any(
-            isinstance(value, (bool, np.bool_))
-            or not isinstance(value, (int, np.integer))
-            or int(value) <= 0
-            for value in provenance
-        ):
-            raise ValueError("RgbFrame provenance values must be positive")
-        if int(self.source_monotonic_ns) > int(self.publish_monotonic_ns):
-            raise ValueError("RgbFrame source time cannot exceed publish time")
-        object.__setattr__(self, "values", values)
-        for name in (
-            "source_camera_sequence",
-            "source_monotonic_ns",
-            "publish_monotonic_ns",
-            "camera_generation",
-        ):
-            object.__setattr__(self, name, int(getattr(self, name)))
 
 
 @dataclass(frozen=True)
@@ -297,137 +130,6 @@ class ObservationBatch:
     # requested jointly, the point-cloud history.
     rgb_history: tuple[RgbFrame, ...] = ()
 
-    def __post_init__(self) -> None:
-        if self.observation_id < 0 or self.run_generation < 0:
-            raise ValueError("observation_id and run_generation must be non-negative")
-        if (
-            min(
-                self.run_started_monotonic_ns,
-                self.anchor_monotonic_ns,
-                self.latest_source_monotonic_ns,
-                self.logical_step_monotonic_ns,
-            )
-            <= 0
-        ):
-            raise ValueError("observation timestamps must be positive")
-        if not (
-            self.run_started_monotonic_ns
-            <= self.latest_source_monotonic_ns
-            <= self.logical_step_monotonic_ns
-            <= self.anchor_monotonic_ns
-        ):
-            raise ValueError(
-                "observation time order must be epoch <= source <= logical step <= cut"
-            )
-        windows = {
-            "arm_history": self.arm_history,
-            "hand_history": self.hand_history,
-            "hand_tactile_sum_history": self.hand_tactile_sum_history,
-            "hand_tactile_provenance_history": self.hand_tactile_provenance_history,
-            "hand_tactile_force_history": self.hand_tactile_force_history,
-        }
-        for name, window in windows.items():
-            if window is None:
-                continue
-            valid = window.valid_mask == 1
-            sources = window.source_monotonic_ns[valid]
-            publishes = window.publish_monotonic_ns[valid]
-            if np.any(sources < self.run_started_monotonic_ns) or np.any(
-                (sources > publishes) | (publishes > self.anchor_monotonic_ns)
-            ):
-                raise ValueError(f"{name} crosses the observation causal cut")
-        history = self.pointcloud_history
-        if history:
-            if not all(isinstance(frame, PointCloudFrame) for frame in history):
-                raise TypeError(
-                    "pointcloud_history must contain PointCloudFrame values"
-                )
-            sources = [frame.source_monotonic_ns for frame in history]
-            sequences = [frame.source_camera_sequence for frame in history]
-            generations = {frame.camera_generation for frame in history}
-            if any(
-                frame.source_monotonic_ns < self.run_started_monotonic_ns
-                or frame.publish_monotonic_ns > self.anchor_monotonic_ns
-                for frame in history
-            ):
-                raise ValueError(
-                    "pointcloud history crosses the observation causal cut"
-                )
-            if any(right <= left for left, right in zip(sources, sources[1:])):
-                raise ValueError("pointcloud source times must be strictly increasing")
-            if any(right <= left for left, right in zip(sequences, sequences[1:])):
-                raise ValueError(
-                    "pointcloud camera sequences must be strictly increasing"
-                )
-            if len(generations) != 1:
-                raise ValueError("pointcloud history crosses a camera generation")
-            latest = history[-1]
-            if self.pointcloud is None or (
-                self.pointcloud.source_camera_sequence,
-                self.pointcloud.source_monotonic_ns,
-                self.pointcloud.publish_monotonic_ns,
-                self.pointcloud.camera_generation,
-            ) != (
-                latest.source_camera_sequence,
-                latest.source_monotonic_ns,
-                latest.publish_monotonic_ns,
-                latest.camera_generation,
-            ):
-                raise ValueError("pointcloud must match the last history frame")
-            if sources[-1] != self.latest_source_monotonic_ns:
-                raise ValueError("latest_source_monotonic_ns must match pointcloud")
-            for name, window in windows.items():
-                if window is not None and window.values.shape[0] != len(history):
-                    raise ValueError(
-                        f"{name} must align one-to-one with pointcloud_history"
-                    )
-        rgb_history = self.rgb_history
-        if rgb_history:
-            if not all(isinstance(frame, RgbFrame) for frame in rgb_history):
-                raise TypeError("rgb_history must contain RgbFrame values")
-            sources = [frame.source_monotonic_ns for frame in rgb_history]
-            sequences = [frame.source_camera_sequence for frame in rgb_history]
-            generations = {frame.camera_generation for frame in rgb_history}
-            if any(
-                frame.source_monotonic_ns < self.run_started_monotonic_ns
-                or frame.publish_monotonic_ns > self.anchor_monotonic_ns
-                for frame in rgb_history
-            ):
-                raise ValueError("rgb history crosses the observation causal cut")
-            if any(right <= left for left, right in zip(sources, sources[1:])):
-                raise ValueError("rgb source times must be strictly increasing")
-            if any(right <= left for left, right in zip(sequences, sequences[1:])):
-                raise ValueError("rgb camera sequences must be strictly increasing")
-            if len(generations) != 1:
-                raise ValueError("rgb history crosses a camera generation")
-            if history:
-                paired = zip(history, rgb_history, strict=True)
-                if len(history) != len(rgb_history) or any(
-                    (
-                        pointcloud.source_camera_sequence,
-                        pointcloud.source_monotonic_ns,
-                        pointcloud.camera_generation,
-                    )
-                    != (
-                        rgb.source_camera_sequence,
-                        rgb.source_monotonic_ns,
-                        rgb.camera_generation,
-                    )
-                    for pointcloud, rgb in paired
-                ):
-                    raise ValueError(
-                        "rgb history must match pointcloud camera provenance"
-                    )
-            else:
-                if sources[-1] != self.latest_source_monotonic_ns:
-                    raise ValueError("latest_source_monotonic_ns must match rgb")
-                for name, window in windows.items():
-                    if window is not None and window.values.shape[0] != len(
-                        rgb_history
-                    ):
-                        raise ValueError(
-                            f"{name} must align one-to-one with rgb_history"
-                        )
 
 def _requested_observation_fields(policy_spec: Any) -> set[str]:
     """Return source names directly from the validated ordered Policy fields."""
@@ -459,7 +161,6 @@ def build_fingertip_runtime(
     if not hand_fk.is_ready():
         raise RuntimeError("fingertip FK startup failed")
     return make_arm_fk(), hand_fk, fingertip_config
-
 
 
 def _read_state_history(
@@ -507,11 +208,14 @@ def _read_state_history(
             and int(data["publish_monotonic_ns"][0]) > 0
             else int(ring_publish_ns)
         )
-        if not (max(0, int(not_before_ns)) <= source_ns <= publish_ns <= anchor_ns):
+        if not (max(1, int(not_before_ns)) <= source_ns <= publish_ns <= anchor_ns):
             continue
         if max_age_ns is not None and anchor_ns - source_ns > max_age_ns:
             continue
-        values.append(np.asarray(data[values_field][0], dtype=np.float64))
+        value = np.asarray(data[values_field][0], dtype=np.float64)
+        if not np.all(np.isfinite(value)):
+            continue
+        values.append(value)
         sequences.append(int(sequence))
         sources.append(source_ns)
         publishes.append(publish_ns)
@@ -555,7 +259,7 @@ def _read_tactile_provenance_history(
             and int(record["unit_code"]) == 0
         ):
             continue
-        if not (not_before_ns <= source_ns <= publish_ns <= anchor_ns):
+        if not (max(1, not_before_ns) <= source_ns <= publish_ns <= anchor_ns):
             continue
         if anchor_ns - source_ns > max_age_ns:
             continue
@@ -605,11 +309,14 @@ def _read_tactile_force_history(
             and int(record["unit_code"]) == 0
         ):
             continue
-        if not (not_before_ns <= source_ns <= publish_ns <= anchor_ns):
+        if not (max(1, not_before_ns) <= source_ns <= publish_ns <= anchor_ns):
             continue
         if anchor_ns - source_ns > max_age_ns:
             continue
-        values.append(np.array(record["tactile_force"], dtype=np.float64))
+        value = np.array(record["tactile_force"], dtype=np.float64)
+        if not np.all(np.isfinite(value)):
+            continue
+        values.append(value)
         sequences.append(int(sequence))
         sources.append(source_ns)
         publishes.append(publish_ns)
@@ -768,6 +475,7 @@ def _rgb_frame_from_camera_record(
     """Copy one verified, causal raw RGB frame from the camera ring."""
     record = header[0]
     source_ns = int(record["source_monotonic_ns"])
+    receive_ns = int(record["receive_monotonic_ns"])
     camera_publish_ns = int(record["publish_monotonic_ns"])
     camera_generation = int(record["camera_generation"])
     if not (
@@ -775,7 +483,12 @@ def _rgb_frame_from_camera_record(
         and camera_generation > 0
         and int(record["camera_health"]) == 0
         and not bool(record["clock_reset"])
-        and 0 < source_ns <= camera_publish_ns <= ring_publish_ns <= anchor_ns
+        and 0
+        < source_ns
+        <= receive_ns
+        <= camera_publish_ns
+        <= ring_publish_ns
+        <= anchor_ns
         and anchor_ns - source_ns <= max_age_ns
         and source_ns >= not_before_ns
     ):
@@ -791,17 +504,20 @@ def _rgb_frame_from_camera_record(
     ):
         return None
     rgb = payload["rgb"]
-    try:
-        return RgbFrame(
-            values=rgb,
-            source_camera_sequence=sequence,
-            source_monotonic_ns=source_ns,
-            publish_monotonic_ns=camera_publish_ns,
-            camera_generation=camera_generation,
-        )
-    except ValueError:
-        logger.warning("inference: invalid RGB payload dropped", exc_info=True)
+    if (
+        rgb.dtype != np.uint8
+        or rgb.ndim != 3
+        or rgb.shape[2] != 3
+        or min(rgb.shape[:2]) <= 0
+    ):
         return None
+    return RgbFrame(
+        values=rgb,
+        source_camera_sequence=sequence,
+        source_monotonic_ns=source_ns,
+        publish_monotonic_ns=camera_publish_ns,
+        camera_generation=camera_generation,
+    )
 
 
 def _read_rgb_history(
@@ -922,6 +638,7 @@ def _select_camera_control_grid(
     logical_step_ns = run_started_ns + latest_tick * step_dt_ns
     selected: list[PointCloudFrame | RgbFrame] = []
     previous_sequence = 0
+    previous_source_ns = 0
     for offset in range(history_len - 1, -1, -1):
         desired_ns = logical_step_ns - offset * step_dt_ns
         candidates = [
@@ -933,37 +650,15 @@ def _select_camera_control_grid(
         if not candidates:
             return (), 0
         frame = candidates[-1]
-        if frame.source_camera_sequence <= previous_sequence:
+        if (
+            frame.source_camera_sequence <= previous_sequence
+            or frame.source_monotonic_ns <= previous_source_ns
+        ):
             return (), 0
         selected.append(frame)
         previous_sequence = frame.source_camera_sequence
+        previous_source_ns = frame.source_monotonic_ns
     return tuple(selected), logical_step_ns
-
-
-def _select_pointcloud_control_grid(
-    frames: tuple[PointCloudFrame, ...],
-    *,
-    run_started_ns: int,
-    anchor_ns: int,
-    history_len: int,
-    step_dt_ns: int,
-    max_grid_lag_ns: int,
-) -> tuple[tuple[PointCloudFrame, ...], int]:
-    """Point-cloud typed wrapper retained for the existing worker boundary."""
-    selected, logical_step_ns = _select_camera_control_grid(
-        frames,
-        run_started_ns=run_started_ns,
-        anchor_ns=anchor_ns,
-        history_len=history_len,
-        step_dt_ns=step_dt_ns,
-        max_grid_lag_ns=max_grid_lag_ns,
-    )
-    if not all(isinstance(frame, PointCloudFrame) for frame in selected):
-        raise RuntimeError("point-cloud selection returned a non-point-cloud frame")
-    return (
-        tuple(frame for frame in selected if isinstance(frame, PointCloudFrame)),
-        logical_step_ns,
-    )
 
 
 def _align_state_history_to_camera_frames(
@@ -1048,7 +743,7 @@ def _build_observation(
             history_len=shared.pointcloud_ring.maxlen,
             not_before_ns=run_started_ns,
         )
-        pointcloud_history, logical_step_ns = _select_pointcloud_control_grid(
+        pointcloud_history, logical_step_ns = _select_camera_control_grid(
             all_pointclouds,
             run_started_ns=run_started_ns,
             anchor_ns=anchor_ns,
@@ -1084,11 +779,7 @@ def _build_observation(
             step_dt_ns=step_dt_ns,
             max_grid_lag_ns=max_grid_lag_ns,
         )
-        if not all(isinstance(frame, RgbFrame) for frame in selected_rgb):
-            raise RuntimeError("RGB selection returned a non-RGB camera frame")
-        rgb_history = tuple(
-            frame for frame in selected_rgb if isinstance(frame, RgbFrame)
-        )
+        rgb_history = selected_rgb
     else:
         reference_ns, logical_step_ns = _select_control_grid_reference_ns(
             run_started_ns=run_started_ns,
@@ -1359,12 +1050,9 @@ def _to_policy_observation(
             dtype=np.uint8,
         )
     if "contact_force" in field_names:
-        if (
-            observation.hand_tactile_sum_history is None
-            or (
-                observation.hand_tactile_force_history is None
-                and observation.hand_tactile_provenance_history is None
-            )
+        if observation.hand_tactile_sum_history is None or (
+            observation.hand_tactile_force_history is None
+            and observation.hand_tactile_provenance_history is None
         ):
             raise ValueError("contact_force lacks calibrated tactile provenance")
         arrays["contact_force"] = np.ascontiguousarray(
@@ -1398,18 +1086,16 @@ def _to_policy_observation(
                     arm_qpos_policy,
                     hand_qpos_policy,
                     hand_fk=hand_fk,
-                    handbase_position_eef_m=np.asarray(
-                        config.handbase_position_eef_m
-                    ),
-                    handbase_quat_eef_wxyz=np.asarray(
-                        config.handbase_quat_eef_wxyz
-                    ),
+                    handbase_position_eef_m=np.asarray(config.handbase_position_eef_m),
+                    handbase_quat_eef_wxyz=np.asarray(config.handbase_quat_eef_wxyz),
                     arm_fk=arm_fk,
                     eef_pose_history=eef_pose_history,
                 ),
                 dtype=np.float32,
             )
     ordered = {name: arrays[name] for name in field_names}
+    for name, values in ordered.items():
+        _validate_finite(values, name=f"PolicyObservation.{name}")
     return PolicyObservation(
         observation_id=observation.observation_id,
         run_generation=observation.run_generation,
