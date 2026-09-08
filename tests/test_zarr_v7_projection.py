@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 
 import h5py
@@ -23,8 +24,10 @@ from dexmani_real.dataset.export import (
     POLICY_ZARR_SCHEMA_NAME,
     POLICY_ZARR_SCHEMA_VERSION,
     _policy_zarr_v7_keys,
+    _whole_episode_rejection,
     export_processed_hdf5_to_zarr,
 )
+from dexmani_real.dataset.processed import ProcessedProvenance
 from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
@@ -227,6 +230,121 @@ class TestZarrV7AdmissionFailClosed(unittest.TestCase):
         self._expect_export_rejects(
             "tactile_force_representation", "wrong_representation"
         )
+
+
+class TestWholeEpisodeGapTolerance(unittest.TestCase):
+    """Pin _whole_episode_rejection gap tolerance on synthetic provenance.
+
+    Leading source-row trims and interior gaps of at most two missing rows
+    with lockstep samples and grid-consistent source time are accepted; any
+    larger row gap or unexplained time/sample jump rejects the whole episode.
+    """
+
+    _DT_S = 0.0625
+    _TOL_S = 0.0625 * 0.05
+
+    def _provenance(
+        self,
+        kept_rows: Sequence[int],
+        source_frames: int,
+        *,
+        samples: Sequence[int] | None = None,
+        timestamps: Sequence[float] | None = None,
+    ) -> ProcessedProvenance:
+        rows = np.asarray(kept_rows, dtype=np.int64)
+        row_samples = (
+            rows.copy() if samples is None else np.asarray(samples, dtype=np.int64)
+        )
+        row_timestamps = (
+            rows.astype(np.float64) * self._DT_S
+            if timestamps is None
+            else np.asarray(timestamps, dtype=np.float64)
+        )
+        keep_mask = np.zeros(source_frames, dtype=bool)
+        keep_mask[rows] = True
+        drop_reason_bits = np.zeros(source_frames, dtype=np.uint64)
+        drop_reason_bits[~keep_mask] = np.uint64(1)
+        # Mirror the discontinuity predicate of validate_processed_provenance so
+        # segment_ends marks exactly the boundaries export must classify.
+        discontinuity = (
+            (np.diff(rows) != 1)
+            | (np.diff(row_samples) != 1)
+            | (np.abs(np.diff(row_timestamps) - self._DT_S) > self._TOL_S)
+        )
+        segment_ends = np.concatenate(
+            (np.flatnonzero(discontinuity).astype(np.int64) + 1, [len(rows)])
+        ).astype(np.int64)
+        return ProcessedProvenance(
+            source_rows=rows,
+            source_samples=row_samples,
+            source_timestamps=row_timestamps,
+            segment_ends=segment_ends,
+            keep_mask=keep_mask,
+            drop_reason_bits=drop_reason_bits,
+            drop_reason_names=("camera_invalid",),
+            hard_invalid_reason_names=("camera_invalid",),
+            tactile_source_rows=rows.copy(),
+            observation_reference_ns=np.zeros(len(rows), dtype=np.int64),
+            tactile_source_ns=np.zeros(len(rows), dtype=np.int64),
+        )
+
+    def _rejection(
+        self,
+        kept_rows: Sequence[int],
+        source_frames: int,
+        *,
+        samples: Sequence[int] | None = None,
+        timestamps: Sequence[float] | None = None,
+    ):
+        return _whole_episode_rejection(
+            Path("episode_fixture.h5"),
+            self._provenance(
+                kept_rows, source_frames, samples=samples, timestamps=timestamps
+            ),
+            dt=self._DT_S,
+            contiguity_tolerance_s=self._TOL_S,
+        )
+
+    def test_contiguous_episode_accepted(self) -> None:
+        self.assertIsNone(self._rejection(range(10), 10))
+
+    def test_leading_trim_accepted(self) -> None:
+        # Structural frame-0 drop: kept rows stay contiguous from row 1.
+        self.assertIsNone(self._rejection(range(1, 10), 10))
+
+    def test_one_missing_interior_row_tolerated(self) -> None:
+        self.assertIsNone(self._rejection([0, 1, 2, 3, 4, 6, 7, 8, 9], 10))
+
+    def test_two_missing_interior_rows_tolerated(self) -> None:
+        self.assertIsNone(self._rejection([0, 1, 2, 5, 6, 7], 8))
+
+    def test_three_missing_interior_rows_rejected(self) -> None:
+        rejection = self._rejection([0, 1, 2, 6, 7], 8)
+        self.assertIsNotNone(rejection)
+        self.assertEqual(rejection.invalid_frame_count, 3)
+        self.assertEqual(rejection.invalid_ranges, [[3, 6]])
+        reasons = {entry["reason"] for entry in rejection.reasons}
+        self.assertIn("camera_invalid", reasons)
+        self.assertIn("source_discontinuity", reasons)
+
+    def test_timestamp_only_break_rejected(self) -> None:
+        # No dropped rows: kept rows 0..7, but source time jumps one extra dt.
+        timestamps = np.arange(8, dtype=np.float64) * self._DT_S
+        timestamps[4:] += self._DT_S
+        rejection = self._rejection(range(8), 8, timestamps=timestamps)
+        self.assertIsNotNone(rejection)
+        self.assertEqual(rejection.invalid_frame_count, 0)
+        self.assertEqual(
+            [entry["reason"] for entry in rejection.reasons], ["source_discontinuity"]
+        )
+
+    def test_sample_desync_rejected(self) -> None:
+        # One-row gap whose sample step disagrees with the row step rejects,
+        # even though rows and source time are otherwise consistent.
+        rejection = self._rejection(
+            [0, 1, 2, 3, 4, 6, 7], 8, samples=[0, 1, 2, 3, 4, 7, 8]
+        )
+        self.assertIsNotNone(rejection)
 
 
 if __name__ == "__main__":

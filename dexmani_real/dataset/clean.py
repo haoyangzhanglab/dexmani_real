@@ -280,7 +280,8 @@ def _source_gap_findings(
 ) -> tuple[dict[str, Any], ...]:
     """Audit every adjacency that differs from the original one-step grid.
 
-    Every finding becomes an episode boundary during policy export.
+    Every finding becomes a recorded source-segment boundary; policy export
+    independently decides whether each gap is within its tolerance.
     """
 
     findings: list[dict[str, Any]] = []
@@ -629,8 +630,8 @@ def analyze_episode(
     warnings: list[str] = []
     if source_gaps:
         warnings.append(
-            f"policy export will reject this episode: {len(source_gaps)} source "
-            "discontinuity boundary(s)"
+            f"{len(source_gaps)} source discontinuity boundary(s); policy "
+            "export applies its own gap tolerance"
         )
     segment_ends = build_source_segment_ends(selected, source_gaps)
     quality = _quality_summary(

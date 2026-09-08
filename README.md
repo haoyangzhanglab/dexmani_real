@@ -38,7 +38,8 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
   都由自身 `joint_state` 推导，每 timestep 只执行一次 canonical Arm FK，并在处理时记录
   derivation 与 algorithm identity。`contact_force` 与 `tactile_force` 来自同一条因果选择的
   raw tactile source row。导出坚持一份 processed HDF5 对应一个训练 episode；
-  删除过 source 行或存在时序缺口的 episode 整条拒绝，不在缺口处拆分。
+  首部删除的 source 行与 ≤2 行且 source 时间吻合的内部瞬态缺口可容忍，
+  更大的缺口或无法解释的时间/样本跳变整条拒绝，不在缺口处拆分。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
 - 通过 Policy-owned public runtime 与 Real-owned NumPy adapter 运行 joint/EE-action learned
   policy；Policy strict restore 模型，Real fail-closed 校验固定硬件、观测、IPC 与时序兼容。
@@ -457,9 +458,10 @@ python examples/export_policy_zarr.py \
 输入目录名决定导出任务名，且会与每个 processed HDF5 中的 `task_name` 校验；已有
 `datasets/<task>.zarr` 文件、目录或符号链接（包括悬空链接）都会拒绝覆盖。
 导出时在 stderr 显示输入校验、Zarr 写入的 tqdm 进度条；不会向 stdout
-打印 JSON 报告。每个 processed HDF5 只能贡献一个完整训练 episode；只要 provenance 表明
-删除过 source 行或存在内部 source/timestamp 缺口，导出器就在 stderr 打印 episode、范围和
-原因并整条拒绝，同时继续导出其他合格 episode。全部 episode 被拒绝时不创建 Zarr，并返回失败。
+打印 JSON 报告。每个 processed HDF5 只能贡献一个完整训练 episode；首部删除的 source 行
+（如结构性帧 0 触觉丢弃）与至多 2 行、source 时间与缺失网格步吻合的内部瞬态缺口可以
+容忍；更大的行缺口或无法用缺失行解释的时间/样本跳变会让导出器在 stderr 打印 episode、
+范围和原因并整条拒绝，同时继续导出其他合格 episode。全部 episode 被拒绝时不创建 Zarr，并返回失败。
 可视化 raw episode：
 
 ```bash
@@ -499,7 +501,9 @@ cleaner 排除非 SOURCE 行。1–4 行 IK_FAIL 暂停可保留，连续 5 行�
 tactile 只能从已持久化前缀中选择 source 不晚于 reference、skew 有界、fresh/calibrated 的同-source 样本；
 完整选中 payload 非有限即拒绝。camera fresh、observation valid 与视觉 policy state valid 必须成立，
 不恢复 duplicate forensic 记录。状态机械越界保留审计，动作机械越界硬拒绝。
-temporal quality 行为和 processed v14 / Policy Zarr v7 contract 不变；Zarr 整条拒绝有缺口的 episode。
+temporal quality 行为和 processed v14 / Policy Zarr v7 contract 不变；Zarr 容忍首部删除与
+≤2 行、样本同步且 source 时间吻合的内部瞬态缺口，更大的缺口或无法解释的时间/样本跳变
+整条拒绝 episode。
 
 ## 开发与验证
 

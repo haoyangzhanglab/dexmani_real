@@ -137,8 +137,10 @@ processed artifact 将它持久化在 `source_decision_json.source_path`。proce
 
 删除无效 raw 行可能使压紧数组包含多个 source 连续段。v14 不把缺口两侧伪装成相邻时间步：
 `source_segment_ends` 明确记录每段边界，质量窗口只在段内计数。Policy Zarr 不再把这些段
-展开为多个训练 episode；一份 processed 文件只允许对应一个完整训练 episode，存在任何删除
-或内部连续性缺口时整份文件拒绝。
+展开为多个训练 episode；一份 processed 文件只允许对应一个完整训练 episode。首部删除不
+破坏压紧行的连续性、始终可导出；内部边界仅在缺失 ≤2 个连续 source 行、样本索引随行
+同步推进、且 source 时间差与缺失网格步在 `source_contiguity_tolerance_s` 内一致时容忍，
+否则整份文件拒绝。
 
 处理入口只接受通过 raw reader 结构校验的 v25 episode，sent action 必需。RGB 与
 点云 profile 还要求 raw RGB-D 几何、depth scale 与 `T_xarm_base_from_color` 完整有效。视觉
@@ -268,8 +270,9 @@ Zarr root attrs 是最小运行语义，而不是 processed 全部 provenance：
 | RGB-PC profile | `depth_scale_m_per_unit`、`depth_invalid_value`、`camera_extrinsic_semantics` | float / int / string；depth 单位、无效像素值与 `T_xarm_base_from_color` 语义。 |
 | pointcloud/RGB-PC profile | `point_cloud_frame`、`point_cloud_color_source`、`point_cloud_policy_id`、`point_cloud_table_plane_abcd_json`、`point_cloud_sampling`、`point_cloud_transform` | string（其中 table plane 为 JSON string）；点云 frame、构建策略与处理身份。 |
 
-Policy Zarr v7 接受四种 profile 中语义 attrs 一致、未删除 source 行且只有一个连续段的
-processed v14 输入。存在无效行或时序缺口的文件整条拒绝；其他合格
+Policy Zarr v7 接受四种 profile 中语义 attrs 一致、压紧行保持网格连续的 processed v14
+输入：首部删除的 source 行与至多 2 行、source 时间吻合的内部瞬态缺口可以容忍；更大的
+行缺口或无法解释的时间/样本跳变整条拒绝。其他合格
 文件仍可进入同一批导出。Zarr
 **不保留** processed 的 `/provenance`、质量摘要、raw 选择原因、
 `action_ee_components` 或完整相机 calibration provenance；它保留 `obs_alignment` 和其他运行

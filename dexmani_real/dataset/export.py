@@ -151,12 +151,52 @@ def _indices_to_ranges(indices: np.ndarray) -> list[list[int]]:
     ]
 
 
-def _whole_episode_rejection(
-    path: Path, provenance: ProcessedProvenance
-) -> _ArtifactRejection | None:
-    """Reject compaction or a source-time break instead of splitting an episode."""
+# Consecutive missing source rows an interior segment boundary may span while
+# the kept rows still export as one contiguous training episode. Longer gaps
+# (e.g. persistent IK-failure holds) reject the whole episode.
+_MAX_TOLERATED_INTERIOR_GAP_ROWS = 2
 
-    has_internal_break = len(provenance.segment_ends) != 1
+
+def _whole_episode_rejection(
+    path: Path,
+    provenance: ProcessedProvenance,
+    *,
+    dt: float,
+    contiguity_tolerance_s: float,
+) -> _ArtifactRejection | None:
+    """Reject a source-grid break beyond a tolerated transient instead of
+    splitting an episode.
+
+    Leading source-row trims (e.g. the structural first-frame tactile drop)
+    keep the kept rows contiguous and are accepted. An interior boundary is
+    tolerated while at most _MAX_TOLERATED_INTERIOR_GAP_ROWS consecutive
+    source rows are missing, samples advance in lockstep with rows, and the
+    elapsed source time matches the missing grid steps within
+    contiguity_tolerance_s. Any larger row gap or unexplained time/sample
+    jump rejects the whole episode.
+    """
+
+    boundaries = provenance.segment_ends[:-1]
+    if boundaries.size == 0:
+        return None
+    rows = provenance.source_rows
+    samples = provenance.source_samples
+    timestamps = provenance.source_timestamps
+    row_delta = rows[boundaries] - rows[boundaries - 1]
+    tolerated = (
+        (row_delta - 1 <= _MAX_TOLERATED_INTERIOR_GAP_ROWS)
+        & (samples[boundaries] - samples[boundaries - 1] == row_delta)
+        & (
+            np.abs(
+                timestamps[boundaries]
+                - timestamps[boundaries - 1]
+                - row_delta * dt
+            )
+            <= contiguity_tolerance_s
+        )
+    )
+    if bool(np.all(tolerated)):
+        return None
     hard_reason_names = provenance.hard_invalid_reason_names
     reason_rows: dict[str, np.ndarray] = {}
     hard_invalid = np.zeros(provenance.keep_mask.shape, dtype=bool)
@@ -164,25 +204,21 @@ def _whole_episode_rejection(
         mask = (provenance.drop_reason_bits & (np.uint64(1) << np.uint64(bit))) != 0
         if name in hard_reason_names:
             hard_invalid |= mask
-        if name in hard_reason_names or has_internal_break:
-            reason_rows[name] = np.flatnonzero(mask).astype(np.int64)
+        reason_rows[name] = np.flatnonzero(mask).astype(np.int64)
     hard_invalid_rows = np.flatnonzero(hard_invalid).astype(np.int64)
-    if hard_invalid_rows.size == 0 and not has_internal_break:
-        return None
     reasons: list[dict[str, Any]] = []
-    for name, rows in reason_rows.items():
-        if rows.size:
+    for name, reason_indices in reason_rows.items():
+        if reason_indices.size:
             reasons.append(
                 {
                     "reason": name,
-                    "frame_count": int(rows.size),
-                    "ranges": _indices_to_ranges(rows),
+                    "frame_count": int(reason_indices.size),
+                    "ranges": _indices_to_ranges(reason_indices),
                 }
             )
-    if has_internal_break:
-        reasons.append(
-            {"reason": "source_discontinuity", "frame_count": 0, "ranges": []}
-        )
+    reasons.append(
+        {"reason": "source_discontinuity", "frame_count": 0, "ranges": []}
+    )
     return _ArtifactRejection(
         episode=path.stem,
         source_file=path.name,
@@ -467,7 +503,16 @@ def _inspect_artifact(
             source,
             label=path.name,
         )
-        rejection = _whole_episode_rejection(path, provenance)
+        # validate_processed_provenance has already required this attr to be
+        # finite and positive, so the direct read cannot raise on valid input.
+        rejection = _whole_episode_rejection(
+            path,
+            provenance,
+            dt=dt,
+            contiguity_tolerance_s=float(
+                source.attrs["source_contiguity_tolerance_s"]
+            ),
+        )
         if rejection is not None:
             return rejection
         # Explicit legacy projection: only the frozen Zarr v7 keys are carried
