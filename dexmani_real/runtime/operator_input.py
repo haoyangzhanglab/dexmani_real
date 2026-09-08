@@ -128,6 +128,9 @@ class KeyboardInput:
         self._lock = threading.Lock()
         self._listener: Any = None  # pynput.keyboard.Listener
         self._running: bool = False
+        # A daemon listener can outlive bounded shutdown.  Its callbacks must
+        # not reach a session after this owner has stopped it.
+        self._callbacks_active: bool = False
         self._debounce_s = float(debounce_s)
         self._startup_timeout_s = float(startup_timeout_s)
         self._estop_callback = estop_callback
@@ -153,6 +156,8 @@ class KeyboardInput:
         operator latency.
         """
         with self._lock:
+            if not self._callbacks_active:
+                return False
             if signal in self._pressed_signals:
                 return False
             self._pressed_signals.add(signal)
@@ -166,11 +171,15 @@ class KeyboardInput:
     def _release_control(self, signal: OperatorCommand) -> None:
         """Mark the matching physical key as released."""
         with self._lock:
+            if not self._callbacks_active:
+                return
             self._pressed_signals.discard(signal)
 
     def _latch_emergency_stop(self) -> None:
         callback: Callable[[], None] | None = None
         with self._lock:
+            if not self._callbacks_active:
+                return
             already_latched = self._estop_latched.is_set()
             if not already_latched:
                 self._estop_latched.set()
@@ -186,6 +195,8 @@ class KeyboardInput:
     def _dispatch_immediate_callback(self, signal: OperatorCommand) -> None:
         """Run the optional non-e-stop callback for a newly pressed key."""
         with self._lock:
+            if not self._callbacks_active:
+                return
             callback = (
                 self._stop_callback
                 if signal is OperatorCommand.STOP
@@ -226,15 +237,21 @@ class KeyboardInput:
 
         def on_press(key: object) -> None:
             try:
+                with self._lock:
+                    if not self._callbacks_active:
+                        return
                 name = key_name(key)
                 if name is None:
                     return
                 if name in _EVENT_ONLY_KEYS:
                     if self._capture_raw_events:
                         with self._lock:
-                            self._events.append(name)
+                            if self._callbacks_active:
+                                self._events.append(name)
                     return
                 with self._lock:
+                    if not self._callbacks_active:
+                        return
                     self._keys.add(name)
                 if name == "esc":
                     self._latch_emergency_stop()
@@ -251,6 +268,9 @@ class KeyboardInput:
 
         def on_release(key: object) -> None:
             try:
+                with self._lock:
+                    if not self._callbacks_active:
+                        return
                 name = key_name(key)
                 if name is None:
                     return
@@ -272,6 +292,11 @@ class KeyboardInput:
         """
         if self._running:
             return
+        if self._listener is not None:
+            raise RuntimeError(
+                "keyboard listener is retained from a prior shutdown; "
+                "refusing to start a replacement"
+            )
 
         if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
             raise RuntimeError(
@@ -298,6 +323,7 @@ class KeyboardInput:
             self._keys.clear()
             self._last_signal_time.clear()
             self._pressed_signals.clear()
+            self._callbacks_active = True
         on_press, on_release = self._callbacks(keyboard)
 
         try:
@@ -337,6 +363,8 @@ class KeyboardInput:
             if not self._listener.is_alive():
                 raise RuntimeError("keyboard listener exited during startup")
         except Exception:
+            with self._lock:
+                self._callbacks_active = False
             listener = self._listener
             try:
                 if listener is not None:
@@ -366,6 +394,8 @@ class KeyboardInput:
         Safe to call from finally blocks.
         """
         listener = self._listener
+        with self._lock:
+            self._callbacks_active = False
         self._running = False
         try:
             if _stop_listener_bounded(listener, label="keyboard"):

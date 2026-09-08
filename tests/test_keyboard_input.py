@@ -339,3 +339,98 @@ def test_keyboard_input_listener_start_failure_is_reported(
     assert not keyboard._running
     assert _FakeListener.latest is not None
     assert not _FakeListener.latest.alive
+
+
+def test_keyboard_input_refuses_restart_after_live_stop(
+    fake_pynput: ModuleType,
+) -> None:
+    class StubbornListener(_FakeListener):
+        def stop(self) -> None:
+            return None
+
+    fake_pynput.keyboard.Listener = StubbornListener
+    estop = mock.Mock()
+    keyboard = KeyboardInput(capture_raw_events=True, estop_callback=estop)
+    keyboard.start()
+    listener = _FakeListener.latest
+    assert listener is not None
+
+    keyboard.stop()
+    assert keyboard._listener is listener
+
+    listener.on_press(_char("b"))
+    listener.on_press(_char("w"))
+    listener.on_press(_FakeKeyboard.Key.space)
+    listener.on_press(_FakeKeyboard.Key.esc)
+    assert keyboard.poll(0.0) == []
+    assert not keyboard.is_pressed("w")
+    assert keyboard.pop_event() is None
+    assert not keyboard.estop_latched
+    estop.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="retained from a prior shutdown"):
+        keyboard.start()
+    assert _FakeListener.latest is listener
+
+    listener.alive = False
+    keyboard.stop()
+    assert keyboard._listener is None
+
+    fake_pynput.keyboard.Listener = _FakeListener
+    keyboard.start()
+    replacement = _FakeListener.latest
+    assert replacement is not listener
+    replacement.on_press(_char("b"))
+    replacement.on_press(_FakeKeyboard.Key.esc)
+    assert keyboard.poll(0.0) == [
+        OperatorCommand.BEGIN,
+        OperatorCommand.EMERGENCY_STOP,
+    ]
+    estop.assert_called_once_with()
+    keyboard.stop()
+
+
+def test_keyboard_input_refuses_restart_after_live_startup_rollback(
+    fake_pynput: ModuleType,
+) -> None:
+    class FailingStubbornListener(_FakeListener):
+        def wait(self) -> None:
+            raise RuntimeError("listener startup failed")
+
+        def stop(self) -> None:
+            return None
+
+    fake_pynput.keyboard.Listener = FailingStubbornListener
+    estop = mock.Mock()
+    keyboard = KeyboardInput(estop_callback=estop, startup_timeout_s=0.1)
+    with pytest.raises(RuntimeError, match="listener failed during startup"):
+        keyboard.start()
+
+    listener = _FakeListener.latest
+    assert listener is not None
+    assert listener.alive
+    assert keyboard._listener is listener
+    listener.on_press(_FakeKeyboard.Key.esc)
+    assert not keyboard.estop_latched
+    estop.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="retained from a prior shutdown"):
+        keyboard.start()
+    assert _FakeListener.latest is listener
+
+    listener.alive = False
+    keyboard.stop()
+    assert keyboard._listener is None
+
+    fake_pynput.keyboard.Listener = _FakeListener
+    keyboard.start()
+    replacement = _FakeListener.latest
+    assert replacement is not listener
+    replacement.on_press(_char("b"))
+    replacement.on_press(_FakeKeyboard.Key.esc)
+    assert keyboard.poll(0.0) == [
+        OperatorCommand.BEGIN,
+        OperatorCommand.EMERGENCY_STOP,
+    ]
+    estop.assert_called_once_with()
+    keyboard.stop()
