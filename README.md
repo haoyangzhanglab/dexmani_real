@@ -266,6 +266,10 @@ C（FAILURE）、D（INVALID）、H（home）、Q（以 INVALID 结束并有界�
 SUCCESS/FAILURE/INVALID 都使用 `stop_episode(save=True)`；task outcome 独立保存到 `result.json`。
 recording integrity failure 立即标记 INVALID 并撤销未来 motion generation，不等待 arm/hand acceptance。
 正常结束后继续允许 H 回家和 Q 退出。raw 的 `/meta/success` 仅表示 storage transaction 提交成功。
+RecorderIO 独占录制 lifecycle，并在后台 finalization 时继续 heartbeat/control polling。
+只有线程和文件资源已安全回收、完成消息已发布，才允许下一次 START；episode-local failure
+不会污染之后的 clean shutdown。无法回收的资源、finalization timeout 和结果传输失败仍保持
+fatal。失败或 discard 的预留路径继续用于保存独立的 `result.json`。
 
 ### Learned policy 实时点云
 

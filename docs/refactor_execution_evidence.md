@@ -106,6 +106,8 @@ as desired behavior.
 - Base: `918a1719b92df43e0311cd68d8cbd74d1c92302e`.
 - Branch: `codex/refactor-pr3-workflow`.
 - Implementation: terra-max; independent reviewer: astra-medium.
+- PR: https://github.com/haoyangzhanglab/dexmani_real/pull/5 (merged).
+- Integrated SHA: `afe387f3f7a0fb017b25f0216e06b49082f373fa`.
 - Homing → pointcloud → keyboard completed in separate commits.
 - Homing commit: `6088496`; stable configured caller API preserved. Independent
   review approved with **35 targeted tests passed**. Hand-first SDK acceptance,
@@ -143,6 +145,48 @@ as desired behavior.
   passed. Production: 127 files, 40,301 → 40,129 lines (−172); examples unchanged
   at 13 files / 5,822 lines. No protected safety/IPC/schema/threshold, pointcloud
   algorithm or action/observation research semantics changed; no hardware run.
+
+### PR4 — Recorder ownership
+
+- Base: `afe387f3f7a0fb017b25f0216e06b49082f373fa`.
+- Branch: `codex/refactor-pr4-recorder`.
+- Implementation: astra-medium; independent reviewer: a separate astra-medium.
+- 4A commit `eb0b053`: additive synchronous `finish_episode` returns reserved
+  paths for save/discard, returns None without active work, and raises after
+  failure cleanup. Legacy async API remains for this migration checkpoint.
+- Independent 4A review approved; **46 targeted tests, 2 subtests passed**;
+  diff check passed. Unsafe old cleanup paths are not treated as recoverable
+  until 4B establishes explicit resource-release evidence.
+- Resource audit: camera thread termination alone cannot prove closure;
+  encoder/depth close errors must retain failure/handles, including an encoder
+  whose old close method can return early after a prior failed close.
+- 4B commit `65d9d0d`: RecorderIO-owned local-Queue finalizer with pending state
+  before launch, main-thread quarantine/heartbeat/control polling, explicit reap
+  before terminal publication, and one shutdown owner. Typed transaction errors
+  are recoverable only after resource release; timeout/unexpected errors remain
+  fatal. Failed camera/HDF5/directory cleanup retains ownership and paths.
+- Independent 4B review approved: **56 targeted tests, 2 subtests passed**;
+  full checkpoint **343 passed, 94 subtests passed**, compileall/diff check passed.
+  Real Event-blocked threads verify queued-result-before-exit and explicit join;
+  missing results, thread-start failure, unsafe cleanup and original-deadline
+  shutdown are covered. Legacy async remains only until the next checkpoint.
+- 4C commit `601d468`: removed serializer async lifecycle, previous-stop state,
+  registry/atexit and obsolete StopResult export; migrated direct tests. Final
+  transaction is camera close/count → flush → final metadata → HDF5 close →
+  one artifact validation → atomic publication. RecorderClient poll/join remain.
+- Final independent review approved: **57 targeted tests, 2 subtests passed**;
+  full **344 passed, 94 subtests passed**, compileall/diff check passed. Tests
+  cover each missing/overflow/decode/write/camera failure → next START/save →
+  clean worker exit, terminal transport failure with one send attempt/no second
+  finalization, and partial START allocation failure remaining fatal.
+- Production: 127 files, 40,129 → 40,036 lines (−93). Examples unchanged.
+- Protected source diffs are empty for RecorderClient, IPC/raw schema,
+  supervisor/process shutdown, dataset and atomic I/O; thresholds unchanged.
+  Reserved failed/discard paths remain available for evaluation result.json.
+- Review findings resolved: pending-first shutdown checks, unexpected-error
+  classification, directory cleanup failure retention, real-thread test entry
+  synchronization, explicit-join proof and terminal transport failure coverage.
+  No separate unrelated bugfix; no hardware run.
 
 ## Hardware gate
 

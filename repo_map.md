@@ -180,6 +180,11 @@ VR / keyboard input
   phase/generation；局部 pending finalization 不跨 IPC。`tests/test_recorder_queue_client.py`、
   `tests/test_recorder_queue_io.py`、`tests/test_recorder_queue_channels.py` 覆盖生产停止边界、
   FIFO/error/next episode 以及真实 spawn Queue；worker 非零退出由现有 session lifecycle 汇总。
+- RecorderIO 是 episode lifecycle 的唯一 owner；`EpisodeRecorder.finish_episode()` 同步
+  序列化/关闭/验证/发布。RecorderIO 的 finalizer 使用进程内 Queue 返回结果，主线程保持
+  heartbeat/control polling，确认线程退出并 reap 后发布唯一完成消息，再允许 next START。
+  `RecorderClient` 的 poll/join API 保留。安全回收的 episode-local failure 可恢复；
+  timeout、transport failure、未回收 writer/文件资源保持 fatal，交由既有 verified shutdown 回收。
 - Camera IPC 只携带 source/receive/publish 时间、generation、帧号和 health；保留 payload
   尺寸字段以支持 name-only ring attach。设备时钟映射留在 driver/worker，不作为录制审计传输。
   static shared metadata 只保留 serial、RGB-D geometry 和 depth scale；校准与研究 provenance
