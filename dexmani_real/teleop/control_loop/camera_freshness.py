@@ -41,12 +41,8 @@ class CameraFreshnessTracker:
             sequence = int(frame.get("ring_sequence", 0))
             frame_number = int(frame.get("depth_frame_number", 0))
             source_ns = int(frame.get("source_monotonic_ns", 0))
-            source_s = (
-                source_ns / 1e9
-                if source_ns > 0
-                else float(frame.get("payload_ready_monotonic_ns", 0)) / 1e9
-            )
-            age_s = max(0.0, now - source_s) if np.isfinite(source_s) else float("inf")
+            source_s = source_ns / 1e9
+            age_s = now - source_s
             is_new = (
                 sequence > 0
                 and sequence != self.last_ring_sequence
@@ -58,7 +54,11 @@ class CameraFreshnessTracker:
             )
             healthy = int(frame.get("camera_health", 1)) == 0
             fresh = (
-                is_new and after_episode_start and healthy and age_s <= self.max_age_s
+                is_new
+                and source_ns > 0
+                and after_episode_start
+                and healthy
+                and 0.0 <= age_s <= self.max_age_s
             )
             if sequence > 0 and sequence != self.last_ring_sequence:
                 self.last_ring_sequence = sequence

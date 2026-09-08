@@ -216,24 +216,12 @@ VR_FRAME_DTYPE = np.dtype(
 
 CAMERA_FRAME_HEADER_DTYPE = np.dtype(
     [
-        ("depth_device_timestamp_s", "<f8"),
-        ("color_device_timestamp_s", "<f8"),
         ("source_monotonic_ns", "<u8"),
         ("receive_monotonic_ns", "<u8"),
-        # ``receive`` is immediately after frame_queue.wait_for_frame returns;
-        # payload readiness is after owned RGB and depth-to-color Z16 copies.
-        ("payload_ready_monotonic_ns", "<u8"),
-        ("depth_timestamp_domain", "<u1"),
-        # 255 denotes that no color stream is present.
-        ("color_timestamp_domain", "<u1"),
         ("publish_monotonic_ns", "<u8"),
         ("camera_generation", "<u8"),
         ("depth_frame_number", "<u8"),
         ("color_frame_number", "<u8"),
-        ("frame_gap", "<u4"),
-        ("clock_reset", "<u1"),
-        ("duplicate", "<u1"),
-        ("backlog_s", "<f8"),
         ("rgb_size", "<u8"),
         ("depth_size", "<u8"),
         ("rgb_shape_h", "<u4"),
@@ -241,9 +229,7 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
         ("rgb_shape_c", "<u4"),
         ("depth_shape_h", "<u4"),
         ("depth_shape_w", "<u4"),
-        ("pc_valid_depth_ratio", "<f4"),
         ("camera_health", "<u1"),
-        ("pad", "<u1", (4,)),
     ],
     align=True,
 )

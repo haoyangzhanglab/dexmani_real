@@ -219,9 +219,6 @@ class CameraRingBuffer:
             raise ValueError("camera header RGB shape does not match payload")
         if (int(h["depth_shape_h"]), int(h["depth_shape_w"])) != depth.shape:
             raise ValueError("camera header depth shape does not match payload")
-        valid_depth_ratio = float(h["pc_valid_depth_ratio"])
-        if not np.isfinite(valid_depth_ratio) or not 0.0 <= valid_depth_ratio <= 1.0:
-            raise ValueError("pc_valid_depth_ratio must be finite and in [0, 1]")
 
         seq = int(self._write_seq[0]) + 1
 

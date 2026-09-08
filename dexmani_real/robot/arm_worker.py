@@ -17,7 +17,6 @@ no error-classification framework.
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, field
 from functools import partial
@@ -158,32 +157,6 @@ def _write_arm_frame(
     shared.arm_state_ring.write(frame)
 
 
-def _publish_identity(shared: Any, arm: XArm7, cfg: ArmParams) -> None:
-    """Publish device identity (the axis count is validated by ``XArm7.connect``)."""
-    if not hasattr(shared, "arm_device_identity"):
-        return
-    api = arm.api
-    device_type = str(getattr(api, "device_type", "") or "")
-    sn = str(getattr(api, "sn", "") or "")
-    firmware = tuple(getattr(api, "version_number", ()) or ())
-    firmware_str = (
-        ".".join(str(v) for v in firmware)
-        if firmware
-        else str(getattr(api, "version", "unavailable") or "unavailable")
-    )
-    identity = {
-        "axis": arm.axis,
-        "device_type": device_type or "unavailable",
-        "model": cfg.device_profile or device_type or "unavailable",
-        "serial_number": sn or "unavailable",
-        "firmware_version": firmware_str,
-    }
-    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
-    shared.arm_device_identity.value = encoded[:1023].ljust(1024, b"\x00")
-
-
 def _startup(shared: Any, arm: XArm7, cfg: ArmParams) -> _LoopState:
     """Connect, enter Mode 6 once, publish the initial frame, signal ready.
 
@@ -194,7 +167,6 @@ def _startup(shared: Any, arm: XArm7, cfg: ArmParams) -> _LoopState:
     heartbeat = lambda: shared.set_heartbeat("arm", time.monotonic())
     logger.debug("arm_loop: LOADING")
     arm.connect(on_poll=heartbeat)
-    _publish_identity(shared, arm, cfg)
     qpos, qvel, tau = arm.read()
     st = _LoopState(
         cfg=cfg,

@@ -930,7 +930,6 @@ class PolicyExecutor:
             camera["camera_fresh"] = (
                 int(camera["camera_health"]) == int(CameraHealth.OK)
                 and camera["camera_age_s"] <= self.runtime.camera.max_frame_age_s
-                and not camera["clock_reset"]
             )
             if not camera["camera_fresh"]:
                 raise RuntimeError("recording camera unhealthy or stale")

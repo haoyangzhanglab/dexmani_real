@@ -1246,7 +1246,6 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         camera = dict(
             source_monotonic_ns=source_ns,
             camera_health=0,
-            clock_reset=False,
             ring_sequence=1,
             publish_monotonic_ns=source_ns,
             receive_monotonic_ns=source_ns,

@@ -1,6 +1,8 @@
 """Offline raw-v25 source-row recording and storage regressions."""
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import h5py
@@ -99,6 +101,48 @@ def _save(recorder):
     destination = Path(recorder.stop_episode(save=True))
     assert recorder.join_stop(timeout=10), recorder.stop_error
     return destination
+
+
+def test_camera_calibration_survives_minimal_shared_metadata(tmp_path):
+    from dexmani_real.recording.io_worker import _build_start_metadata
+    from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry
+
+    intrinsics = CameraIntrinsics(16, 16, 20, 21, 8, 8, "none", (0, 0, 0, 0, 0))
+    geometry = RGBDGeometry(intrinsics, intrinsics, np.eye(4))
+    shared = SimpleNamespace(
+        camera_depth_scale=SimpleNamespace(value=0.001),
+        camera_serial=SimpleNamespace(value=b"offline-serial"),
+        camera_geometry=SimpleNamespace(value=json.dumps(geometry.to_dict()).encode()),
+    )
+    calibration = mock.Mock()
+    calibration.resolve_name_by_serial.return_value = "offline-camera"
+    calibration.to_meta_dict.return_value = {
+        "camera_serial": "offline-serial",
+        "camera_type": "eye_to_hand",
+        "camera_T_world_camera": np.eye(4).reshape(-1).tolist(),
+    }
+    metadata = _build_start_metadata(
+        shared,
+        task_label="fixture",
+        operator="offline",
+        calibration=calibration,
+        provenance={"eval_seed": "1"},
+    )
+    recorder = _recorder(tmp_path)
+    assert recorder.start_episode(**metadata)
+    assert recorder.add_episode_frame(_frame(1))
+    with h5py.File(_save(recorder) / "data.h5", "r") as raw:
+        attrs = raw["meta"].attrs
+        assert attrs["camera_serial"] == "offline-serial"
+        assert attrs["depth_scale"] == 0.001
+        assert attrs["provenance_eval_seed"] == "1"
+        np.testing.assert_array_equal(
+            attrs["camera_depth_intrinsics"], intrinsics.matrix().ravel()
+        )
+        np.testing.assert_array_equal(
+            attrs["camera_T_xarm_base_from_depth"], np.eye(4).ravel()
+        )
+        assert not any("firmware" in key or "device_identity" in key for key in attrs)
 
 
 def test_direct_rows_cross_batch_and_preserve_gap(tmp_path):

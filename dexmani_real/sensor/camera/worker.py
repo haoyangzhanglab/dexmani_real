@@ -124,27 +124,31 @@ class CameraLoopConfig:
         )
 
 
+def _camera_health(
+    *, clock_reset: bool, duplicate: bool, backlog_s: float, max_age_s: float
+) -> CameraHealth:
+    """Classify live admission; skipped older frames do not invalidate this one."""
+    if clock_reset:
+        return CameraHealth.CLOCK_RESET
+    if duplicate:
+        return CameraHealth.DUPLICATE
+    if not math.isfinite(backlog_s) or not 0.0 <= backlog_s <= max_age_s:
+        return CameraHealth.DELIVERY_DELAY
+    return CameraHealth.OK
+
+
 def pack_camera_frame(
     rgb: "np.ndarray",
     depth_raw: "np.ndarray",
-    depth_device_timestamp_s: float,
-    color_device_timestamp_s: float | None,
+    *,
     depth_frame_number: int,
-    color_frame_number: int | None,
-    pc_valid_depth_ratio: float = 0.0,
-    camera_health: int = 0,
-    source_monotonic_ns: int = 0,
-    camera_generation: int = 0,
-    frame_gap: int = 0,
-    clock_reset: bool = False,
-    duplicate: bool = False,
-    backlog_s: float = 0.0,
-    wait_return_monotonic_ns: int = 0,
-    payload_ready_monotonic_ns: int = 0,
-    depth_timestamp_domain: int = 0,
-    color_timestamp_domain: int | None = None,
+    color_frame_number: int,
+    camera_health: int,
+    source_monotonic_ns: int,
+    receive_monotonic_ns: int,
+    camera_generation: int,
 ) -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
-    """Pack one depth-to-color aligned RGB-D frame with explicit timing."""
+    """Pack the live camera admission fields and fixed RGB-D layout."""
     import numpy as np
 
     from dexmani_real.ipc.schema import CAMERA_FRAME_HEADER_DTYPE
@@ -155,84 +159,27 @@ def pack_camera_frame(
         raise ValueError(f"RGB frame must have shape (H, W, 3), got {rgb_arr.shape}")
     if depth_arr.ndim != 2:
         raise ValueError(f"depth frame must have shape (H, W), got {depth_arr.shape}")
-    numeric: tuple[float, ...] = (
-        depth_device_timestamp_s,
-        pc_valid_depth_ratio,
-        backlog_s,
-    )
-    if color_device_timestamp_s is not None:
-        numeric = (*numeric, color_device_timestamp_s)
-    if (
-        not all(np.isfinite(value) for value in numeric)
-        or depth_device_timestamp_s < 0
-        or backlog_s < 0
-    ):
-        raise ValueError(
-            "camera frame timestamps/ratios/backlog must be finite and non-negative"
-        )
-    if not 0.0 <= pc_valid_depth_ratio <= 1.0:
-        raise ValueError("pc_valid_depth_ratio must be in [0, 1]")
-    integers = (
-        depth_frame_number,
-        source_monotonic_ns,
-        camera_generation,
-        wait_return_monotonic_ns,
-        payload_ready_monotonic_ns,
-    )
-    if any(int(value) < 0 for value in integers) or frame_gap < 0:
-        raise ValueError("camera frame identifiers/counts must be non-negative")
-    if not 0 <= int(depth_timestamp_domain) <= 255:
-        raise ValueError("depth timestamp_domain must fit uint8")
-    if (
-        color_timestamp_domain is not None
-        and not 0 <= int(color_timestamp_domain) <= 254
-    ):
-        raise ValueError("color timestamp_domain must fit uint8")
-    if color_frame_number is not None and int(color_frame_number) < 0:
-        raise ValueError("color_frame_number must be non-negative")
+    if not 0 < source_monotonic_ns <= receive_monotonic_ns:
+        raise ValueError("camera requires positive source time no later than receive")
+    if min(depth_frame_number, color_frame_number, camera_generation) < 0:
+        raise ValueError("camera frame identifiers must be non-negative")
     if int(camera_health) not in {int(item) for item in CameraHealth}:
         raise ValueError("camera_health is not a known CameraHealth value")
-    receive_monotonic_ns = int(wait_return_monotonic_ns)
-    payload_ready_ns = int(payload_ready_monotonic_ns)
-    if receive_monotonic_ns <= 0 or payload_ready_ns <= 0:
-        raise ValueError("camera timing stages must be positive")
-    if source_monotonic_ns > receive_monotonic_ns:
-        raise ValueError("camera source time cannot be later than host receive time")
-    if payload_ready_ns < receive_monotonic_ns:
-        raise ValueError("camera payload readiness cannot precede host receive time")
 
     header = np.zeros(1, dtype=CAMERA_FRAME_HEADER_DTYPE)
-    header["depth_device_timestamp_s"] = np.float64(depth_device_timestamp_s)
-    header["color_device_timestamp_s"] = np.float64(
-        np.nan if color_device_timestamp_s is None else color_device_timestamp_s
-    )
-    header["source_monotonic_ns"] = np.uint64(source_monotonic_ns)
-    header["receive_monotonic_ns"] = np.uint64(receive_monotonic_ns)
-    header["payload_ready_monotonic_ns"] = np.uint64(payload_ready_ns)
-    header["depth_timestamp_domain"] = np.uint8(depth_timestamp_domain)
-    header["color_timestamp_domain"] = np.uint8(
-        255 if color_timestamp_domain is None else color_timestamp_domain
-    )
-    header["camera_generation"] = np.uint64(camera_generation)
-    header["depth_frame_number"] = np.uint64(depth_frame_number)
-    header["color_frame_number"] = np.uint64(
-        0 if color_frame_number is None else color_frame_number
-    )
-    header["frame_gap"] = np.uint32(frame_gap)
-    header["clock_reset"] = np.uint8(clock_reset)
-    header["duplicate"] = np.uint8(duplicate)
-    header["backlog_s"] = np.float64(backlog_s)
-    header["pc_valid_depth_ratio"] = np.float32(pc_valid_depth_ratio)
-    header["camera_health"] = np.uint8(camera_health)
-
-    header["rgb_size"] = np.uint64(rgb_arr.nbytes)
-    header["depth_size"] = np.uint64(depth_arr.nbytes)
-    header["rgb_shape_h"] = np.uint32(rgb_arr.shape[0])
-    header["rgb_shape_w"] = np.uint32(rgb_arr.shape[1])
-    header["rgb_shape_c"] = np.uint32(rgb_arr.shape[2])
-    header["depth_shape_h"] = np.uint32(depth_arr.shape[0])
-    header["depth_shape_w"] = np.uint32(depth_arr.shape[1])
-
+    header["source_monotonic_ns"] = source_monotonic_ns
+    header["receive_monotonic_ns"] = receive_monotonic_ns
+    header["camera_generation"] = camera_generation
+    header["depth_frame_number"] = depth_frame_number
+    header["color_frame_number"] = color_frame_number
+    header["camera_health"] = camera_health
+    header["rgb_size"] = rgb_arr.nbytes
+    header["depth_size"] = depth_arr.nbytes
+    header["rgb_shape_h"] = rgb_arr.shape[0]
+    header["rgb_shape_w"] = rgb_arr.shape[1]
+    header["rgb_shape_c"] = rgb_arr.shape[2]
+    header["depth_shape_h"] = depth_arr.shape[0]
+    header["depth_shape_w"] = depth_arr.shape[1]
     return header, rgb_arr, depth_arr
 
 
@@ -245,8 +192,6 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
     On init failure, logs the error and returns without setting the camera
     ready flag — Main detects this via ready timeout.
     """
-    import numpy as np
-
     _logger = get_logger("camera_loop")
     if not isinstance(config, CameraLoopConfig):
         raise TypeError("camera_loop requires a CameraLoopConfig")
@@ -293,40 +238,11 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
         shared.camera_depth_scale.value = float(cam.get_depth_scale())
         _serial_raw = str(cam.active_serial or "")
         shared.camera_serial.value = _serial_raw[:31].ljust(32, "\x00").encode()
-        _device_info = cam.get_device_info()
-        _firmware = str(_device_info.get("firmware", ""))
-        shared.camera_firmware.value = _firmware[:63].ljust(64, "\x00").encode()
-        try:
-            import pyrealsense2 as rs
-
-            _sdk_version = str(getattr(rs, "__version__", "unknown"))
-        except Exception:
-            _sdk_version = "unknown"
-        shared.camera_sdk_version.value = _sdk_version[:63].ljust(64, "\x00").encode()
         _geometry_json = json.dumps(cam.get_geometry().to_dict(), separators=(",", ":"))
         _geometry_payload = _geometry_json.encode("utf-8")
         if len(_geometry_payload) >= 2048:
             raise RuntimeError("camera geometry exceeds shared metadata capacity")
         shared.camera_geometry.value = _geometry_payload.ljust(2048, b"\x00")
-        _profile_json = json.dumps(
-            {
-                "streams": cam.get_active_profiles(),
-                "payload_mode": "depth_to_color_aligned_rgbd",
-                "depth_payload_frame": "color",
-                "native_depth_retained_by_driver": True,
-                "frame_queue_capacity": cam.config.frame_queue_capacity,
-                "l515_depth_options": cam.get_l515_depth_option_snapshot(),
-                "geometry": json.loads(_geometry_json),
-            },
-            separators=(",", ":"),
-        )
-        _profile_payload = _profile_json.encode("utf-8")
-        if len(_profile_payload) >= 2048:
-            raise RuntimeError(
-                "camera profile and L515 option snapshot exceed shared metadata capacity"
-            )
-        shared.camera_profile.value = _profile_payload.ljust(2048, b"\x00")
-
         ready_published = False
         read_failure_started_s: float | None = None
         frame_gap_warn = ThrottledWarner(interval_s=5.0, logger=_logger)
@@ -364,18 +280,12 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
                     raise RuntimeError(
                         "camera configured with color must publish aligned RGB-D"
                     )
-                pc_valid_depth_ratio = float(
-                    np.count_nonzero(frame.depth_aligned_to_color_raw)
-                    / frame.depth_aligned_to_color_raw.size
+                camera_health = _camera_health(
+                    clock_reset=frame.clock_reset,
+                    duplicate=frame.duplicate,
+                    backlog_s=frame.backlog_s,
+                    max_age_s=cfg.max_frame_age_s,
                 )
-                if frame.clock_reset:
-                    camera_health = CameraHealth.CLOCK_RESET
-                elif frame.duplicate:
-                    camera_health = CameraHealth.DUPLICATE
-                elif frame.backlog_s > cfg.max_frame_age_s:
-                    camera_health = CameraHealth.DELIVERY_DELAY
-                else:
-                    camera_health = CameraHealth.OK
                 if frame.frame_gap > cfg.resolved_frame_gap_stall_threshold:
                     frame_gap_warn(
                         "camera_loop: device frame gap=%d (current frame retained; threshold=%d)",
@@ -386,22 +296,12 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
                     header, rgb, depth = pack_camera_frame(
                         frame.rgb,
                         frame.depth_aligned_to_color_raw,
-                        frame.depth_device_timestamp_s,
-                        frame.color_device_timestamp_s,
-                        frame.depth_frame_number,
-                        frame.color_frame_number,
-                        pc_valid_depth_ratio=pc_valid_depth_ratio,
+                        depth_frame_number=frame.depth_frame_number,
+                        color_frame_number=frame.color_frame_number or 0,
                         camera_health=int(camera_health),
                         source_monotonic_ns=frame.source_monotonic_ns,
+                        receive_monotonic_ns=frame.wait_return_monotonic_ns,
                         camera_generation=frame.camera_generation,
-                        frame_gap=frame.frame_gap,
-                        clock_reset=frame.clock_reset,
-                        duplicate=frame.duplicate,
-                        backlog_s=frame.backlog_s,
-                        wait_return_monotonic_ns=frame.wait_return_monotonic_ns,
-                        payload_ready_monotonic_ns=frame.payload_ready_monotonic_ns,
-                        depth_timestamp_domain=frame.depth_timestamp_domain,
-                        color_timestamp_domain=frame.color_timestamp_domain,
                     )
                     shared.camera_ring.write(header, rgb, depth)
                     if not ready_published:

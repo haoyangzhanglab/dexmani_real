@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Mapping
 
 import numpy as np
 
@@ -97,19 +96,3 @@ def validate_data_layout(shapes, dtypes, *, frame_count: int) -> tuple[str, ...]
     for name in set(shapes) - DATASET_SPECS.keys():
         errors.append(f"unexpected data.h5 dataset: {name}")
     return tuple(errors)
-
-
-def validate_camera_metadata_keys(
-    metadata: Mapping[str, Any] | None,
-) -> tuple[str, ...]:
-    if metadata is None:
-        return ()
-    reserved = {"schema_version", "num_frames", "control_hz", "task_label", "operator"}
-    return tuple(
-        f"reserved or invalid camera metadata key: {key}"
-        for key in metadata
-        if not isinstance(key, str)
-        or not key
-        or key in reserved
-        or key.startswith("provenance_")
-    )

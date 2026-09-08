@@ -10,7 +10,6 @@ silence for successful application.
 
 from __future__ import annotations
 
-import json
 import time
 from typing import Any
 
@@ -190,12 +189,6 @@ def hand_loop(
         try:
             hand = XHand(config)
             hand.connect()
-            if hasattr(shared, "hand_device_identity"):
-                identity = getattr(hand, "device_identity", {"backend": "unavailable"})
-                encoded = json.dumps(
-                    identity, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
-                shared.hand_device_identity.value = encoded[:1023].ljust(1024, b"\x00")
         except Exception:
             logger.error("hand_loop: init failed", exc_info=True)
             shared.error_state.value = True

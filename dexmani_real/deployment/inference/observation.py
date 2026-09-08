@@ -482,7 +482,6 @@ def _rgb_frame_from_camera_record(
         sequence > 0
         and camera_generation > 0
         and int(record["camera_health"]) == 0
-        and not bool(record["clock_reset"])
         and 0
         < source_ns
         <= receive_ns

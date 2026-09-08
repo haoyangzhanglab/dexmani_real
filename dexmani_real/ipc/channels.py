@@ -234,13 +234,8 @@ class RuntimeChannels:
 
     ready_flags: Any  # fixed-order array of per-subsystem readiness flags (0/1)
 
-    arm_device_identity: Any  # worker-reported canonical identity JSON
-    hand_device_identity: Any  # worker-reported canonical identity JSON
     camera_depth_scale: Any  # depth scale (mm to meters)
     camera_serial: Any  # serial number string
-    camera_firmware: Any  # firmware version string
-    camera_sdk_version: Any  # pyrealsense2/librealsense version string
-    camera_profile: Any  # active stream/profile and L515 setting JSON
     camera_geometry: Any  # static native RGB-D geometry JSON
     _closed: bool = field(init=False, repr=False, default=False)
 
@@ -389,13 +384,8 @@ class RuntimeChannels:
 
         storage.ready_flags = ctx.Array("b", len(READY_FIELDS))
 
-        storage.arm_device_identity = ctx.Array("c", b"\x00" * 1024)
-        storage.hand_device_identity = ctx.Array("c", b"\x00" * 1024)
         storage.camera_depth_scale = ctx.Value("d", 0.0)
         storage.camera_serial = ctx.Array("c", b"\x00" * 32)
-        storage.camera_firmware = ctx.Array("c", b"\x00" * 64)
-        storage.camera_sdk_version = ctx.Array("c", b"\x00" * 64)
-        storage.camera_profile = ctx.Array("c", b"\x00" * 2048)
         storage.camera_geometry = ctx.Array("c", b"\x00" * 2048)
 
     def close(self) -> bool:

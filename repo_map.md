@@ -167,6 +167,10 @@ VR / keyboard input
 
 ## Recording/Data boundaries
 
+- Camera IPC 只携带 source/receive/publish 时间、generation、帧号和 health；保留 payload
+  尺寸字段以支持 name-only ring attach。设备时钟映射留在 driver/worker，不作为录制审计传输。
+  static shared metadata 只保留 serial、RGB-D geometry 和 depth scale；校准与研究 provenance
+  继续写入 raw v25。`tests/test_camera_v25_telemetry.py` 覆盖 health、causality 与 seqlock 边界。
 - teleop 只把已经选择并校验的 causal fixed-grid sample 交给 RecorderIO；RecorderIO 独占
   episode transaction、sidecar、sequence continuity、validation 和 atomic finalize，不决定
   机器人动作。

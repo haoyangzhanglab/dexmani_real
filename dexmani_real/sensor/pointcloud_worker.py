@@ -176,7 +176,6 @@ def _camera_frame_is_usable(
     return bool(
         int(record["camera_generation"]) > 0
         and int(record["camera_health"]) == int(CameraHealth.OK)
-        and not bool(record["clock_reset"])
         and 0 < source_ns <= camera_publish_ns <= now_ns
         and now_ns - source_ns <= max_input_age_ns
     )

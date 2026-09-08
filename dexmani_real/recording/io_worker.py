@@ -137,28 +137,10 @@ def _build_start_metadata(
         else None
     )
     camera_serial = _shared_text(shared.camera_serial.value, default=None)
-    camera_firmware = (
-        _shared_text(shared.camera_firmware.value, default="unknown") or "unknown"
-    )
-    camera_sdk_version = (
-        _shared_text(shared.camera_sdk_version.value, default="unknown") or "unknown"
-    )
-    camera_profile_json = (
-        _shared_text(shared.camera_profile.value, default="{}") or "{}"
-    )
     camera_geometry_json = (
         _shared_text(shared.camera_geometry.value, default="{}") or "{}"
     )
     camera_geometry = _camera_geometry_from_shared(camera_geometry_json)
-    arm_identity_json = (
-        _shared_text(
-            shared.arm_device_identity.value, default='{"status":"unavailable"}'
-        )
-        or '{"status":"unavailable"}'
-    )
-    hand_identity_json = _shared_text(
-        shared.hand_device_identity.value, default='{"status":"unavailable"}'
-    )
     try:
         camera_name = (
             calibration.resolve_name_by_serial(camera_serial) if camera_serial else None
@@ -179,14 +161,6 @@ def _build_start_metadata(
         "camera_serial": camera_serial,
         "depth_scale": depth_scale,
         "provenance": dict(provenance),
-        "camera_metadata": {
-            "camera_firmware": camera_firmware,
-            "camera_sdk_version": camera_sdk_version,
-            "camera_actual_profile_json": camera_profile_json,
-            "camera_geometry_json": camera_geometry_json,
-            "arm_device_identity_json": arm_identity_json,
-            "hand_device_identity_json": hand_identity_json or '{"status":"disabled"}',
-        },
     }
 
 

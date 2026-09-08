@@ -148,7 +148,6 @@ class RGBDFrame:
     alignment_elapsed_ns: int
     host_time: float
     wait_return_monotonic_ns: int
-    payload_ready_monotonic_ns: int
     depth_frame_number: int
     color_frame_number: int | None
     depth_device_timestamp_s: float
@@ -670,7 +669,6 @@ class RealSenseCamera:
         if color_frame is not None:
             bgr = np.array(color_frame.get_data(), dtype=np.uint8, copy=True, order="C")
             rgb = np.ascontiguousarray(bgr[..., ::-1].copy())
-        payload_ready_monotonic_ns = time.monotonic_ns()
 
         # Preserve the device-provided frame number.  Unlike a local counter,
         # this exposes device/pipeline stalls and dropped frames end-to-end.
@@ -708,7 +706,6 @@ class RealSenseCamera:
             alignment_elapsed_ns=alignment_elapsed_ns,
             host_time=host_time,
             wait_return_monotonic_ns=wait_return_monotonic_ns,
-            payload_ready_monotonic_ns=payload_ready_monotonic_ns,
             depth_frame_number=self.frame_id,
             color_frame_number=color_frame_number,
             depth_device_timestamp_s=depth_timestamp_s,

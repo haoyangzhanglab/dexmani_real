@@ -37,7 +37,6 @@ from dexmani_real.recording.storage.schema import (
     DATASET_SPECS,
     SOURCE_FRAME_DATASET_NAMES,
     FillReason,
-    validate_camera_metadata_keys,
     validate_data_layout,
 )
 from dexmani_real.recording.sample import EpisodeAction, EpisodeState
@@ -219,14 +218,8 @@ class EpisodeRecorder:
         camera_name: str | None = None,
         camera_serial: str | None = None,
         depth_scale: float | None = None,
-        camera_metadata: dict[str, Any] | None = None,
         provenance: Mapping[str, object] | None = None,
     ) -> bool:
-        metadata_errors = validate_camera_metadata_keys(camera_metadata)
-        if metadata_errors:
-            raise ValueError(
-                "episode camera metadata rejected: " + "; ".join(metadata_errors)
-            )
         normalized_provenance = normalize_provenance_metadata(provenance)
         if not self.join_stop(timeout=_PREVIOUS_EPISODE_STOP_TIMEOUT_S):
             if self._stop_error is not None:
@@ -273,7 +266,6 @@ class EpisodeRecorder:
             "camera_name": camera_name,
             "camera_serial": camera_serial,
             "depth_scale": depth_scale,
-            "camera_metadata": dict(camera_metadata or {}),
             "provenance": normalized_provenance,
         }
 

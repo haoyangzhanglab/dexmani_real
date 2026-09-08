@@ -246,23 +246,11 @@ def read_camera_frame_causal(
                 "ring_sequence": ring_sequence,
                 "depth_frame_number": int(rec["depth_frame_number"]),
                 "color_frame_number": int(rec["color_frame_number"]),
-                "depth_device_timestamp_s": float(rec["depth_device_timestamp_s"]),
-                "color_device_timestamp_s": float(rec["color_device_timestamp_s"]),
                 "source_monotonic_ns": int(rec["source_monotonic_ns"]),
                 "receive_monotonic_ns": int(rec["receive_monotonic_ns"]),
-                "wait_return_monotonic_ns": int(rec["receive_monotonic_ns"]),
-                "payload_ready_monotonic_ns": int(rec["payload_ready_monotonic_ns"]),
-                "depth_timestamp_domain": int(rec["depth_timestamp_domain"]),
-                "color_timestamp_domain": int(rec["color_timestamp_domain"]),
                 "publish_monotonic_ns": int(rec["publish_monotonic_ns"]),
                 "camera_generation": int(rec["camera_generation"]),
-                "clock_reset": bool(rec["clock_reset"]),
-                "duplicate": bool(rec["duplicate"]),
-                "frame_gap": int(rec["frame_gap"]),
-                "backlog_s": float(rec["backlog_s"]),
-                "delivery_delay_above_floor_s": float(rec["backlog_s"]),
                 "camera_health": int(rec["camera_health"]),
-                "valid_depth_ratio": float(rec["pc_valid_depth_ratio"]),
             }
     except Exception:
         logger.warning("causal_reader: camera ring read failed", exc_info=True)
