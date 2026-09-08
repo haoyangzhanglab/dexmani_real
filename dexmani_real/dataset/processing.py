@@ -7,7 +7,7 @@ import shutil
 import tempfile
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import h5py
 import numpy as np
@@ -36,8 +36,6 @@ from dexmani_real.dataset.processed import (
     _FINGERTIP_POINTS_FRAME,
     _FINGERTIP_POINTS_UNIT,
     _FRAME_CHUNKED_DATASETS,
-    PROCESSED_SCHEMA_NAME,
-    PROCESSED_SCHEMA_VERSION,
     _TACTILE_FORCE_AXIS_LABELS,
     _TACTILE_FORCE_POINT_ORDER,
     _TACTILE_FORCE_REPRESENTATION,
@@ -45,6 +43,8 @@ from dexmani_real.dataset.processed import (
     _TACTILE_FORCE_SI_VERIFIED,
     _TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED,
     _TACTILE_FORCE_UNIT,
+    PROCESSED_SCHEMA_NAME,
+    PROCESSED_SCHEMA_VERSION,
     _dataset_row_slices,
     _expected_specs,
     _json,
@@ -155,6 +155,25 @@ def load_annotations(path: str | Path | None) -> dict[str, EpisodeAnnotation]:
     return result
 
 
+def validate_annotation_task_name_override(
+    annotations: Mapping[str, EpisodeAnnotation], task_name: str | None
+) -> None:
+    """Reject a batch task override that conflicts with an audited annotation."""
+
+    if task_name is None:
+        return
+    if not isinstance(task_name, str):
+        raise TypeError("task_name must be a string or None")
+    if not task_name.strip():
+        raise ValueError("task_name must be non-empty when provided")
+    for episode_name, annotation in sorted(annotations.items()):
+        if annotation.task_name is not None and annotation.task_name != task_name:
+            raise ValueError(
+                f"--task-name={task_name!r} conflicts with annotation task_name="
+                f"{annotation.task_name!r} for {episode_name}"
+            )
+
+
 # Reserved subdirectory names under a task root that are never raw episode
 # directories.  ``process_log`` holds per-episode process reports written into
 # the processed output root, so it must not be rediscovered as an episode.
@@ -220,10 +239,15 @@ def _write_attrs(
     decision: EpisodeDecision,
     config: ProcessingConfig,
     annotation: EpisodeAnnotation,
+    *,
+    task_name: str | None = None,
 ) -> None:
     meta = reader.h5f["meta"].attrs
-    task_name = (
-        annotation.task_name or str(meta.get("task_label", "")).strip() or "unknown"
+    resolved_task_name = (
+        task_name
+        or annotation.task_name
+        or str(meta.get("task_label", "")).strip()
+        or "unknown"
     )
     visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
     output.attrs.update(
@@ -258,7 +282,7 @@ def _write_attrs(
             ),
             "max_observation_skew_s": config.max_observation_skew_s,
             "action_semantics": "teleop_published_joint_target",
-            "task_name": task_name,
+            "task_name": resolved_task_name,
             "point_cloud_frame": (
                 "xarm_base" if config.profile.needs_pointcloud else "omitted"
             ),
@@ -400,6 +424,8 @@ def _write_processed_episode(
     output_root: Path,
     config: ProcessingConfig,
     annotation: EpisodeAnnotation,
+    *,
+    task_name: str | None = None,
 ) -> dict[str, Any]:
     path = output_root / f"{reader.h5_path.name}.h5"
     selected = decision.selected_indices
@@ -416,6 +442,7 @@ def _write_processed_episode(
             decision,
             config,
             annotation,
+            task_name=task_name,
         )
         _create_data_datasets(output, decision.selected_frames, config)
         arm_action = np.asarray(
@@ -638,6 +665,20 @@ def _invalid_frames_report(
     }
 
 
+def _rejection_is_blocking(
+    decision: EpisodeDecision,
+    annotations: Mapping[str, EpisodeAnnotation],
+    *,
+    skip_rejected_unannotated: bool,
+) -> bool:
+    """Keep explicit annotation intent separate from absent annotation metadata."""
+
+    annotation = annotations.get(decision.source_path.name)
+    if annotation is None:
+        return not skip_rejected_unannotated
+    return annotation.include
+
+
 def process_episode_root(
     input_root: str | Path,
     output_root: str | Path,
@@ -646,9 +687,17 @@ def process_episode_root(
     annotations_path: str | Path | None = None,
     dry_run: bool = False,
     verify_output: bool = False,
+    skip_rejected_unannotated: bool = False,
+    task_name: str | None = None,
 ) -> dict[str, Any]:
-    """Publish a complete one-to-one batch, or publish nothing on rejection."""
+    """Publish accepted episodes, preserving explicit annotation intent.
 
+    Rejected unannotated episodes block direct library callers by default. The
+    canonical CLI opts into skipping them with ``skip_rejected_unannotated``.
+    """
+
+    if not isinstance(skip_rejected_unannotated, bool):
+        raise TypeError("skip_rejected_unannotated must be boolean")
     episodes = discover_episode_dirs(input_root)
     annotations = load_annotations(annotations_path)
     unknown_annotations = set(annotations) - {episode.name for episode in episodes}
@@ -656,23 +705,31 @@ def process_episode_root(
         raise ValueError(
             f"annotations reference unknown episodes: {sorted(unknown_annotations)}"
         )
+    validate_annotation_task_name_override(annotations, task_name)
     decisions: list[EpisodeDecision] = []
     for episode in episodes:
-        annotation = annotations.get(episode.name, EpisodeAnnotation())
+        annotation = annotations.get(episode.name)
+        if annotation is not None and not annotation.include:
+            # Do not require an excluded episode to remain readable. Its
+            # exclusion is operator-owned and needs no source inspection.
+            decisions.append(
+                _rejected_decision(episode, config, "excluded by annotation")
+            )
+            continue
+        analysis_annotation = annotation or EpisodeAnnotation()
         try:
             with EpisodeReader(episode) as reader:
                 decisions.append(
                     analyze_episode(
                         reader,
                         config,
-                        annotation,
+                        analysis_annotation,
                         depth_valid_mask=(
                             _derive_depth_valid_mask(reader)
                             if (
                                 config.profile.needs_rgb
                                 or config.profile.needs_pointcloud
                             )
-                            and annotation.include
                             else None
                         ),
                         source_already_validated=True,
@@ -713,7 +770,11 @@ def process_episode_root(
         decision
         for decision in decisions
         if not decision.accepted
-        and annotations.get(decision.source_path.name, EpisodeAnnotation()).include
+        and _rejection_is_blocking(
+            decision,
+            annotations,
+            skip_rejected_unannotated=skip_rejected_unannotated,
+        )
     ]
     if blocking_rejections:
         details = "; ".join(
@@ -741,7 +802,12 @@ def process_episode_root(
             with EpisodeReader(decision.source_path) as reader:
                 outputs.append(
                     _write_processed_episode(
-                        reader, decision, staging, config, annotation
+                        reader,
+                        decision,
+                        staging,
+                        config,
+                        annotation,
+                        task_name=task_name,
                     )
                 )
         validation = [
@@ -757,8 +823,8 @@ def process_episode_root(
             else None
         )
         with h5py.File(staging / outputs[0]["path"], "r") as first_output:
-            task_name = str(first_output.attrs["task_name"])
-        invalid_report = _invalid_frames_report(decisions, task_name=task_name)
+            report_task_name = str(first_output.attrs["task_name"])
+        invalid_report = _invalid_frames_report(decisions, task_name=report_task_name)
         process_log = staging / "process_log"
         process_log.mkdir()
         with (process_log / "invalid_frames_report.json").open(

@@ -9,25 +9,19 @@ Directory mapping: ``episodes/<task>/episode_*`` (raw) is published to
 directory resolves the task level from its parent directory, so the same
 mapping holds for one episode.
 
-Processing is two-pass.  A per-episode audit pass (a dry-run analysis per
-episode, progress on stderr via tqdm) decides accept or skip per episode.
-Episodes with serious problems — unreadable files, schema validation failure, or
-no source-contiguous segment long enough for training — are then automatically
-skipped with a warning and the reason. The surviving batch is
-published in one transactional pass.  An episode whose annotation explicitly
-sets ``include: true`` is never auto-skipped: its rejection stays blocking and
-aborts the batch, so explicit operator intent is not silently overridden.
+Each profile is analyzed once per invocation. Unannotated episodes rejected by
+the library are skipped with a warning; an explicit annotation whose ``include``
+value is true remains batch-blocking. Explicit ``include: false`` skips its
+episode before raw files are opened.
 
 Connects to no hardware, opens no GUI, and writes only the resolved
 ``episodes_processed/`` output.  No JSON is printed to stdout; progress,
-warnings, and a concise summary go to stderr.  A concise
-``process_log/invalid_frames_report.json`` is always published; it lists only
-episodes with genuinely invalid source frames.  With ``--write-report``, one
-additional JSON per source episode is written in the same directory.  Exit
-codes: 0 at least one episode was published
-or an audit completed; 1 nothing was published or the publish failed; 2 usage
-or environment error (bad input root, existing output root, unreadable
-annotations).
+warnings, and a concise summary go to stderr. A concise
+``process_log/invalid_frames_report.json`` is always published from staging; it
+lists only episodes with genuinely invalid source frames. Exit codes: 0 at least
+one episode was published or an audit completed; 1 nothing was published or the
+publish failed; 2 usage or environment error (bad input root, existing output
+root, unreadable annotations).
 
 Writer publication reopens each output for bounded HDF5 structural sanity.
 Pass ``--verify-output`` to also rescan every written payload and semantic
@@ -37,8 +31,8 @@ contract before the batch is published.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
-import json
 import logging
 import os
 import sys
@@ -52,7 +46,6 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import yaml
-from tqdm import tqdm
 
 from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.dataset.contracts import (
@@ -62,17 +55,13 @@ from dexmani_real.dataset.contracts import (
     QualityPolicy,
     TemporalQualityConfig,
 )
-from dexmani_real.dataset.processed import (
-    PROCESSED_SCHEMA_NAME,
-    PROCESSED_SCHEMA_VERSION,
-)
 from dexmani_real.dataset.processing import (
     discover_episode_dirs,
     load_annotations,
     process_episode_root,
+    validate_annotation_task_name_override,
 )
 from dexmani_real.ipc.schema import SUPPORTED_POINT_CLOUD_COUNTS
-from dexmani_real.utils.atomic_io import atomic_json_dump
 
 
 def _route_library_logging_to_stderr() -> None:
@@ -178,12 +167,7 @@ def _parser() -> argparse.ArgumentParser:
         "--quality-policy",
         choices=[policy.value for policy in QualityPolicy],
         default=None,
-        help="hard_only disables temporal detectors; audit reports findings; strict excludes only high-confidence findings (default audit)",
-    )
-    parser.add_argument(
-        "--strict",
-        action="store_true",
-        help="Shorthand for --quality-policy strict.",
+        help="hard_only disables temporal detectors; audit reports findings (default audit).",
     )
     parser.add_argument(
         "--abrupt-arm-step-rad",
@@ -206,16 +190,6 @@ def _parser() -> argparse.ArgumentParser:
         "--compare-profiles",
         action="store_true",
         help="Audit all profiles so modality-dependent retention can be compared.",
-    )
-    parser.add_argument(
-        "--write-report",
-        action="store_true",
-        help=(
-            "Write one detailed JSON per source episode to <output_root>/process_log/"
-            "episode_<name>.json in addition to the always-written invalid-frame "
-            "summary (off by default; "
-            "ignored in --dry-run and --compare-profiles)."
-        ),
     )
     parser.add_argument(
         "--verify-output",
@@ -279,42 +253,6 @@ def _validate_task_name(parser: argparse.ArgumentParser, task_name: str | None) 
         )
 
 
-def _apply_task_name(
-    annotations: dict[str, EpisodeAnnotation],
-    episode_names: set[str],
-    task_name: str | None,
-) -> dict[str, EpisodeAnnotation]:
-    """Apply one explicit task identity without overriding audited conflicts."""
-
-    if task_name is None:
-        return annotations
-    resolved = dict(annotations)
-    for episode_name in sorted(episode_names):
-        annotation = resolved.get(episode_name, EpisodeAnnotation())
-        if annotation.task_name is not None and annotation.task_name != task_name:
-            raise ValueError(
-                f"--task-name={task_name!r} conflicts with annotation task_name="
-                f"{annotation.task_name!r} for {episode_name}"
-            )
-        resolved[episode_name] = dataclasses.replace(annotation, task_name=task_name)
-    return resolved
-
-
-def _rejection_detail(decision: dict) -> str:
-    """Make common processed-data admission failures actionable in terminal output."""
-
-    counts = decision.get("hard_reason_counts", {})
-    if not isinstance(counts, dict):
-        return ""
-    invalid_alignment = int(counts.get("policy_observation_invalid", 0))
-    if invalid_alignment:
-        return (
-            "; camera-source policy observation is invalid on "
-            f"{invalid_alignment} row(s)"
-        )
-    return ""
-
-
 def _write_annotations_yaml(
     annotations: dict[str, EpisodeAnnotation], directory: Path
 ) -> Path | None:
@@ -334,215 +272,57 @@ def _write_annotations_yaml(
     return Path(name)
 
 
-def _audit_episode(
-    episode: Path,
-    output_root: Path,
-    config: ProcessingConfig,
-    annotation: EpisodeAnnotation | None,
-    tmp_dir: Path,
-) -> tuple[dict, str | None] | tuple[None, str]:
-    """Analyze one episode without writing; return (decision, error)."""
+def _print_report_summary(report: dict) -> None:
+    """Print the one completed batch decision without reanalyzing sources."""
 
-    annotations_path = None
-    if annotation is not None:
-        annotations_path = _write_annotations_yaml({episode.name: annotation}, tmp_dir)
-    try:
-        report = process_episode_root(
-            episode,
-            output_root,
-            config,
-            annotations_path=annotations_path,
-            dry_run=True,
-        )
-        return report["episodes"][0], None
-    except Exception as exc:
-        # Isolate any per-episode analysis failure (missing dataset KeyError,
-        # unexpected h5py/transform errors) so one bad episode never crashes
-        # the whole audit; it is reported as a skipped "error" episode instead.
-        return None, f"{type(exc).__name__}: {exc}"
-
-
-def _audit_episodes(
-    episodes: tuple[Path, ...],
-    config: ProcessingConfig,
-    user_annotations: dict[str, EpisodeAnnotation],
-    output_root: Path,
-    tmp_dir: Path,
-) -> list[dict]:
-    results: list[dict] = []
-    bar = tqdm(
-        episodes,
-        desc=f"audit [{config.profile.value}]",
-        unit="ep",
-        file=sys.stderr,
-        dynamic_ncols=True,
+    source_count = int(report["source_episode_count"])
+    accepted = int(report["accepted_source_episode_count"])
+    rejected = int(report["rejected_source_episode_count"])
+    excluded = sum(
+        1
+        for decision in report["episodes"]
+        if decision["rejected_reason"] == "excluded by annotation"
     )
-    for episode in bar:
-        annotation = user_annotations.get(episode.name)
-        bar.set_postfix_str(episode.name)
-        decision, error = _audit_episode(
-            episode,
-            output_root,
-            config,
-            annotation,
-            tmp_dir,
-        )
-        if annotation is not None and not annotation.include:
-            status = "user-excluded"
-        elif error is not None:
-            status = "error"
-            tqdm.write(
-                f"WARNING: skipping episode {episode.name}: analysis failed: {error}",
-                file=sys.stderr,
-            )
-        elif decision is not None and decision["accepted"]:
-            status = "ok"
-        else:
-            assert decision is not None
-            status = "SKIP"
-            tqdm.write(
-                f"WARNING: skipping episode {episode.name}: "
-                f"{decision['rejected_reason']}{_rejection_detail(decision)}",
-                file=sys.stderr,
-            )
-        results.append(
-            {
-                "name": episode.name,
-                "path": episode,
-                "decision": decision,
-                "error": error,
-                "status": status,
-            }
-        )
-        bar.set_postfix_str(status)
-    bar.close()
-    return results
-
-
-def _print_audit_summary(results: list[dict]) -> None:
-    """One concise per-batch line; full detail is in per-episode reports (--write-report)."""
-
-    accepted = sum(1 for item in results if item["status"] == "ok")
-    skipped = sum(1 for item in results if item["status"] in ("SKIP", "error"))
-    user_excluded = sum(1 for item in results if item["status"] == "user-excluded")
+    skipped = rejected - excluded
     parts = [f"{accepted} accepted"]
     if skipped:
         parts.append(f"{skipped} skipped")
-    if user_excluded:
-        parts.append(f"{user_excluded} user-excluded")
-    print(f"audit: {len(results)} episode(s) -> {', '.join(parts)}", file=sys.stderr)
+    if excluded:
+        parts.append(f"{excluded} user-excluded")
+    print(
+        f"processing: {source_count} episode(s) -> {', '.join(parts)}", file=sys.stderr
+    )
+    for decision in report["episodes"]:
+        reason = decision["rejected_reason"]
+        if reason is not None and reason != "excluded by annotation":
+            print(
+                f"WARNING: skipping episode {decision['source_episode']}: {reason}",
+                file=sys.stderr,
+            )
 
 
-def _write_process_logs(
-    output_root: Path,
-    results: list[dict],
-    report: dict,
+def _filtered_annotations_path(
+    annotations: dict[str, EpisodeAnnotation],
     *,
-    task_name: str | None,
-) -> None:
-    """Write one JSON per source episode under ``output_root/process_log/``.
+    original_path: Path | None,
+    has_unknown_entries: bool,
+    temporary_directory: Path | None,
+) -> Path | None:
+    """Keep CLI-only unknown-entry filtering out of the library boundary."""
 
-    Runs after a successful publish, so the batch config, the per-episode
-    decision (including the real skip reason for auto-skipped episodes), and
-    the written output/validation entries are all available.  Rejected episodes
-    keep their ``decision`` (or ``error``) and a null ``output``/``validation``.
-    """
-
-    log_dir = output_root / "process_log"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    outputs_by_episode = {
-        item["source_episode"]: item for item in report.get("outputs", [])
-    }
-    validation_by_episode = {
-        Path(item["path"]).stem: item for item in report.get("validation", [])
-    }
-    for item in results:
-        entry = {
-            "schema_name": PROCESSED_SCHEMA_NAME,
-            "schema_version": PROCESSED_SCHEMA_VERSION,
-            "task_name": task_name or output_root.name,
-            "dry_run": False,
-            "config": report["config"],
-            "source_episode": item["name"],
-            "status": item["status"],
-            "decision": item["decision"],
-            "error": item["error"],
-            "output": outputs_by_episode.get(item["name"]),
-            "validation": validation_by_episode.get(item["name"]),
-        }
-        with (log_dir / f"{item['name']}.json").open("w", encoding="utf-8") as stream:
-            json.dump(entry, stream, ensure_ascii=False, indent=2)
-            stream.flush()
-
-
-def _write_invalid_frames_report(
-    output_root: Path,
-    results: list[dict],
-    *,
-    task_name: str,
-) -> dict:
-    """Persist the concise invalid-row report from the original audit decisions."""
-
-    episodes = []
-    for item in results:
-        decision = item["decision"]
-        if decision is None or not decision["hard_invalid_frame_count"]:
-            continue
-        episodes.append(
-            {
-                "episode": item["name"],
-                "invalid_frame_count": decision["hard_invalid_frame_count"],
-                "invalid_ranges": decision["hard_invalid_ranges"],
-                "reasons": decision["hard_invalid_reasons"],
-            }
-        )
-    report = {
-        "schema_name": "dexmani-real-invalid-frames-report",
-        "schema_version": 1,
-        "task_name": task_name,
-        "episodes": episodes,
-    }
-    path = output_root / "process_log" / "invalid_frames_report.json"
-    atomic_json_dump(report, path, ensure_ascii=False)
-    return report
-
-
-def _merge_exclusions(
-    user_annotations: dict[str, EpisodeAnnotation], results: list[dict]
-) -> tuple[dict[str, EpisodeAnnotation], list[tuple[str, str]]]:
-    """Add include=False for auto-skipped episodes; keep explicit includes blocking."""
-
-    merged = dict(user_annotations)
-    kept_blocking: list[tuple[str, str]] = []
-    for item in results:
-        if item["status"] not in ("SKIP", "error"):
-            continue
-        reason = (
-            item["decision"]["rejected_reason"]
-            if item["decision"] is not None
-            else f"analysis failed: {item['error']}"
-        )
-        annotation = merged.get(item["name"])
-        if annotation is not None and annotation.include:
-            kept_blocking.append((item["name"], reason))
-            continue
-        merged[item["name"]] = EpisodeAnnotation(include=False)
-    return merged, kept_blocking
+    if not has_unknown_entries:
+        return original_path
+    assert temporary_directory is not None
+    return _write_annotations_yaml(annotations, temporary_directory)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     _route_library_logging_to_stderr()
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.strict and args.quality_policy is not None:
-        parser.error("--strict is mutually exclusive with --quality-policy")
     _validate_task_name(parser, args.task_name)
     selected_profile = OutputProfile(args.profile)
-    policy = (
-        QualityPolicy.STRICT
-        if args.strict
-        else QualityPolicy(args.quality_policy or QualityPolicy.AUDIT.value)
-    )
+    policy = QualityPolicy(args.quality_policy or QualityPolicy.AUDIT.value)
 
     input_root = args.input_root
     if not input_root.is_dir():
@@ -567,12 +347,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         name: annotation for name, annotation in annotations.items() if name in known
     }
     try:
-        user_annotations = _apply_task_name(
-            user_annotations,
-            known,
-            args.task_name,
-        )
-    except ValueError as exc:
+        validate_annotation_task_name_override(user_annotations, args.task_name)
+    except (TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if not args.dry_run and not args.compare_profiles and output_root.exists():
@@ -589,113 +365,78 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: failed to resolve runtime config: {exc}", file=sys.stderr)
         return 2
 
-    if args.compare_profiles:
-        print("profile retention (selected/source frames):", file=sys.stderr)
-        with tempfile.TemporaryDirectory(prefix="process_episodes-") as tmp_name:
-            tmp_dir = Path(tmp_name)
+    temporary_context = (
+        tempfile.TemporaryDirectory(prefix="process_episodes-")
+        if unknown
+        else contextlib.nullcontext(None)
+    )
+    with temporary_context as temporary_name:
+        annotations_path = _filtered_annotations_path(
+            user_annotations,
+            original_path=args.annotations,
+            has_unknown_entries=bool(unknown),
+            temporary_directory=(
+                Path(temporary_name) if temporary_name is not None else None
+            ),
+        )
+        if args.compare_profiles:
+            print("profile retention (selected/source frames):", file=sys.stderr)
             for profile in OutputProfile:
                 try:
                     profile_config = _config(args, profile, policy, runtime)
                 except (TypeError, ValueError) as exc:
                     print(f"error: invalid processing config: {exc}", file=sys.stderr)
                     return 2
-                results = _audit_episodes(
-                    episodes,
-                    profile_config,
-                    user_annotations,
-                    output_root,
-                    tmp_dir,
-                )
-                decided = [
-                    item["decision"]
-                    for item in results
-                    if item["decision"] is not None
-                    and item["status"] != "user-excluded"
-                ]
-                source = sum(decision["source_frames"] for decision in decided)
-                selected = sum(decision["selected_frames"] for decision in decided)
+                try:
+                    report = process_episode_root(
+                        input_root,
+                        output_root,
+                        profile_config,
+                        annotations_path=annotations_path,
+                        dry_run=True,
+                        skip_rejected_unannotated=True,
+                        task_name=args.task_name,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    print(f"error: profile audit failed: {exc}", file=sys.stderr)
+                    return 1
+                source = int(report["source_frame_count"])
+                selected = int(report["selected_frame_count"])
                 retention = 100.0 * selected / source if source else 0.0
                 print(
                     f"  {profile.value:<11} {selected}/{source} ({retention:.1f}%)",
                     file=sys.stderr,
                 )
-        return 0
-
-    try:
-        config = _config(args, selected_profile, policy, runtime)
-    except (TypeError, ValueError) as exc:
-        print(f"error: invalid processing config: {exc}", file=sys.stderr)
-        return 2
-    with tempfile.TemporaryDirectory(prefix="process_episodes-") as tmp_name:
-        tmp_dir = Path(tmp_name)
-        results = _audit_episodes(
-            episodes,
-            config,
-            user_annotations,
-            output_root,
-            tmp_dir,
-        )
-        _print_audit_summary(results)
-        if args.dry_run:
             return 0
-        accepted_count = sum(1 for item in results if item["status"] == "ok")
-        if accepted_count == 0:
-            print("error: no episodes accepted; nothing to publish", file=sys.stderr)
-            return 1
-        merged, kept_blocking = _merge_exclusions(user_annotations, results)
-        for name, reason in kept_blocking:
-            print(
-                f"WARNING: episode {name} is explicitly included via annotations but fails "
-                f"analysis ({reason}); the batch will abort unless this is resolved",
-                file=sys.stderr,
-            )
-        merged_path = _write_annotations_yaml(merged, tmp_dir)
-        print(
-            f"publishing {accepted_count} episode(s) to {output_root} ...",
-            file=sys.stderr,
-        )
+
+        try:
+            config = _config(args, selected_profile, policy, runtime)
+        except (TypeError, ValueError) as exc:
+            print(f"error: invalid processing config: {exc}", file=sys.stderr)
+            return 2
         try:
             report = process_episode_root(
                 input_root,
                 output_root,
                 config,
-                annotations_path=merged_path,
+                annotations_path=annotations_path,
+                dry_run=args.dry_run,
                 verify_output=args.verify_output,
+                skip_rejected_unannotated=True,
+                task_name=args.task_name,
             )
         except Exception as exc:
-            # A publish-only failure (validation, transform, or h5py error)
-            # aborts cleanly; staging was already removed by the pipeline.
-            print(f"error: batch publish failed: {exc}", file=sys.stderr)
+            print(f"error: batch processing failed: {exc}", file=sys.stderr)
             return 1
-        try:
-            report["invalid_frames_report"] = _write_invalid_frames_report(
-                output_root,
-                results,
-                task_name=report["invalid_frames_report"]["task_name"],
-            )
-        except OSError as exc:
-            print(
-                f"error: failed to write invalid-frame report: {exc}", file=sys.stderr
-            )
-            return 1
-        if args.write_report:
-            try:
-                _write_process_logs(
-                    output_root,
-                    results,
-                    report,
-                    task_name=args.task_name,
-                )
-            except OSError as exc:
-                print(
-                    f"warning: failed to write process reports: {exc}", file=sys.stderr
-                )
+
+    _print_report_summary(report)
+    if args.dry_run:
+        return 0
     print(
         f"published {report['output_episode_count']} episode(s) -> {output_root}",
         file=sys.stderr,
     )
-    invalid_report = report["invalid_frames_report"]
-    invalid_episodes = invalid_report["episodes"]
+    invalid_episodes = report["invalid_frames_report"]["episodes"]
     if invalid_episodes:
         print(
             f"invalid-frame report: {len(invalid_episodes)} episode(s) -> "

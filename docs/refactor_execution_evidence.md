@@ -55,6 +55,9 @@ as desired behavior.
 - Base: `5f0417639a5f4aa8c4e91633228fdec88669f721`.
 - Branch: `codex/refactor-pr1-leaf`.
 - Implementation: luna-max; independent reviewer: terra-max.
+- Independent review: approved; reviewer targeted suite **38 passed** plus
+  compile/import and diff checks. PR: https://github.com/haoyangzhanglab/dexmani_real/pull/3
+  (merged), integrated SHA `d2494cdf2840ec3a6ac120203f00eeb55040040d`.
 - Commits: `ae16888` keyboard diagnostics; `9094855` rate stats;
   `efeaae6` unused profile; `4a0d323` EMA ownership; `f0ab11d` grid ownership.
 - Targeted boundary suite: **119 passed, 26 subtests passed**.
@@ -70,6 +73,30 @@ as desired behavior.
   validation/count thresholds, TeleopConfig process DTO, startup-only numeric
   cache construction, EMA computation, all protected source/schema/IPC boundaries.
 - No bugfix or design-policy change; hardware validation pending.
+
+### PR2 — dataset single-pass
+
+- Base: `d2494cdf2840ec3a6ac120203f00eeb55040040d`.
+- Branch: `codex/refactor-pr2-dataset`.
+- Implementation: terra-max; independent reviewer: astra-medium.
+- Independent review: approved. Targeted suite **50 passed**; full suite
+  **318 passed, 94 subtests passed**; compileall and diff check passed.
+- Numeric golden: 32 clean/stale-tactile AUDIT processed datasets match baseline
+  exactly in dtype, shape and values. Existing processed/Zarr tests pass.
+- Production: 127 files, 40,286 → 40,301 lines (+15); examples: 13 files,
+  6,081 → 5,822 lines (−259). Combined production/examples decrease: 244 lines.
+- Library defaults still block unannotated rejection; canonical CLI skips it.
+  YAML membership (including omitted include) remains independent of task-name
+  override; explicit excludes bypass unreadable raw sources.
+- Tests cover default/skip/include/exclude/task-name admission, conflicting names,
+  one real analysis per episode, one batch call per CLI/profile, user annotation
+  filtering, AUDIT row retention, removed CLI flags, and report-before-publish.
+- Review findings resolved: restore skipped names/reasons from the report;
+  retain compare invalid-config exit 2; make the analysis spy reject duplicates.
+- Removed STRICT and repeated audit/exclusion/report orchestration. All reports
+  are produced in staging; Zarr export source and gap tests are unchanged.
+- No independent pre-existing bugfix; no protected schema/version/IPC/threshold,
+  research-array or durability changes. Hardware not exercised.
 
 ## Hardware gate
 
