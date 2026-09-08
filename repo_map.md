@@ -48,7 +48,7 @@ control safety gate → command publication → arm / hand workers
 causal observation history
     → Policy public runtime
     → Real NumPy adapter
-    → flat Prediction IPC record [N, D] + provenance
+    → flat Prediction IPC record [chunk_size, D] + provenance
     → one-slot latest-wins prediction_ring
     → PolicyExecutor (timestamped future targets, endpoint decode, EE→IK)
     → physical SafetyGate
@@ -56,12 +56,13 @@ causal observation history
     → arm / hand worker final checks
 ```
 
-- `Prediction` 是唯一的内部策略输出对象；动作是拥有自身内存的 finite `float64[N, D]`，
+- `Prediction` 是唯一的内部策略输出对象；动作是拥有自身内存的 finite
+  `float64[chunk_size, D]`，
   `run_generation`、source timestamp 和 logical-step timestamp 随对象传播。
 - Real 只校验 Policy 公开契约字段（observation fields/shape/dtype、`requires_hand`、
-  `n_action_steps`、`action_key`、`control_action_dim`、`control_dt_s`），不解析 artifact 内部或
-  `temporal_ensemble_coeff` 等历史字段；Real 和 Policy generic runtime 都只调度 Policy 给出的
-  canonical `control_action`，不在 deployment/sim runner 追加 overlap blending。
+  `chunk_size`、`n_action_steps`、`action_key`、`control_action_dim`、`control_dt_s`），不解析
+  artifact 内部或 `temporal_ensemble_coeff` 等历史字段；Real 直接调度 Policy 给出的完整
+  future action chunk，不在 deployment/sim runner 追加 overlap blending。
 - inference worker 只负责 observation、策略调用和 prediction 发布；PolicyExecutor 独占动作
   horizon 解码、control-grid 调度、EE→IK、候选校验和 command-progress watchdog。
 - `robot/model.py` 统一 anatomical finger、SDK tactile sensor ID 和 fingertip link 顺序；
@@ -80,9 +81,9 @@ causal observation history
   不追赶过期 deadline，也不制造超过 `control_hz` 的 command burst。
 - `tests/test_policy_rollout.py` 用离线 fake 覆盖 Policy 公开契约兼容、timestamp 调度
   （stale-prefix/whole-stale/no-catch-up）、IK/SAFETY 归属、reject-only arm 与
-  control-first formal eval 合同，不启动 worker 或硬件。
+  publish-then-record rollout 合同，不启动 worker 或硬件。
 
-## Formal policy evaluation flow
+## Recorded policy rollout flow
 
 ```text
 B + completed H
@@ -92,7 +93,7 @@ B + completed H
     → ordinary raw sample after publish/reject, or held control tick
     → SUCCESS | FAILURE | INVALID | STOPPED
     → motion fence
-    → RecorderIO STOP(save=True) → asynchronous finalize
+    → RecorderIO STOP(save=outcome-dependent) → asynchronous finalize
     → rollouts/<policy>/<task>/<experiment>/<run|eval>/seed_NNN/episode_...
     → result.json
 ```
@@ -110,8 +111,8 @@ B + completed H
   `_CommandProgress` 继续承担 worker/SDK progress watchdog；SDK final fence 和 supervisor 保留。
   每次 invocation 最多一个 rollout，结束后 H/Q 可用，第二次 B 拒绝。
 - `tests/test_policy_rollout.py` 用 fake/shared-memory boundary 覆盖 Policy 公开契约、timestamp 调度、
-  IK/SAFETY 归属、reject-only arm 与 control-first formal-eval/recorder 语义（含 max_frames→INVALID
-  与 eval-invalid 不触发全局 FAULT）；不启动任何 worker 或设备。
+  IK/SAFETY 归属、reject-only arm 与 publish-then-record run/eval 语义（含 max_frames→INVALID
+  与 recording-invalid 不触发全局 FAULT）；不启动任何 worker 或设备。
 - `tests/test_recorder_io_boundary.py` 覆盖 Recorder STOP save/outcome 边界，并用临时目录与合成
   held sample 实际写入、验证 raw-v24 HDF5/depth/video 和 FAILURE result.json；不连接设备。
 
@@ -156,8 +157,8 @@ VR / keyboard input
   episode transaction、sidecar、sequence continuity、validation 和 atomic finalize，不决定
   机器人动作。
 - recording startup 在创建 channel/worker 前使用已解析的运行时配置；录制数据只保留运行所需的
-  source/publish provenance，不新增 episode sidecar 或进入 realtime loop。formal eval 的 policy
-  selector、checkpoint name/SHA-256、inference mode 和 wall-clock budget 通过 recorder-owned
+  source/publish provenance，不新增 episode sidecar 或进入 realtime loop。run/eval 的 policy
+  selector、checkpoint name/SHA-256、eval seed 和 wall-clock budget 通过 recorder-owned
   `provenance_*` metadata attrs 保存，不与 camera metadata 混用。
 - raw episode 的 schema、字段语义和对齐保持单一来源：`recording/storage/schema.py` 与
   [`docs/data_schema.md`](docs/data_schema.md)。当前链路为 raw v24 → processed HDF5 v14 →

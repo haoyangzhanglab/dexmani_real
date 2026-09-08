@@ -2,7 +2,7 @@
 
 No hardware, no trained checkpoint.  These tests pin the owner-boundary contract:
 RecorderIO auto-finalizes capacity exhaustion with the configured stop reason, and
-the formal-evaluation config threads ``eval:invalid:max_frames`` through it.  They
+the rollout recording config threads ``eval:invalid:max_frames`` through it. They
 exercise the io_worker path directly rather than mocking the executor's intent.
 """
 

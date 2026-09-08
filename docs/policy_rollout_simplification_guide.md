@@ -169,16 +169,15 @@ Those duplicate Policy semantics.
 
 ---
 
-# 5. Inference scheduling
+# 5. Inference scheduling (implemented)
 
-Remove the conceptual distinction:
+Production has one scheduling path; the former mode labels are retired:
 
 ```text
-sync rollout
-async rollout
+sync rollout / async rollout  →  one periodic rollout path
 ```
 
-The worker should run one periodic schedule:
+The inference worker runs one periodic schedule:
 
 ```text
 period = n_action_steps * control_dt
@@ -328,9 +327,9 @@ The Policy runtime already supports arbitrary non-negative seeds.
 
 ---
 
-# 10. run_policy.py redesign
+# 10. run_policy.py command contract
 
-## Keep commands
+## Available commands
 
 ```text
 list
@@ -353,7 +352,7 @@ Policy discovery only.
 ```text
 restore
 warmup
-synthetic prediction
+full action-chunk smoke test
 ```
 
 No hardware.
@@ -372,9 +371,9 @@ One physical paper rollout.
 
 ---
 
-# 11. Remove unnecessary CLI complexity
+# 11. CLI boundary
 
-Remove:
+The following implementation controls are intentionally absent:
 
 ```text
 --inference-mode
@@ -387,7 +386,7 @@ Reason:
 
 They expose implementation details rather than experiment identity.
 
-The experiment identity should be:
+The experiment identity is:
 
 ```text
 Policy selector
@@ -400,7 +399,7 @@ task
 
 # 12. Single rollout per invocation
 
-`run_policy.py` should execute:
+`run_policy.py` executes:
 
 ```text
 process start
@@ -420,7 +419,7 @@ H return home
 Q exit
 ```
 
-Do not support:
+The invocation does not support:
 
 ```text
 trial 1
@@ -467,11 +466,9 @@ ESC emergency stop
 
 ---
 
-# 14. Recording policy
+# 14. Recording policy (implemented)
 
-Physical execution is expensive.
-
-Therefore:
+Physical rollout recording is explicit:
 
 ```text
 shadow
@@ -564,7 +561,7 @@ Keep raw-v24 compatibility. Do not migrate dataset schema in this task.
 The Formal Eval transaction cleanup is implemented. The following removal list
 describes the retired design, not mechanisms to restore.
 
-## Remove
+## Retired mechanisms
 
 ```text
 per-action evaluation evidence gate
@@ -574,10 +571,9 @@ evaluation-specific observation builder
 multi-episode evaluation session
 ```
 
-## Keep
+## Retained mechanisms
 
 ```text
-Recorder START acknowledgement
 Recorder START / RECORDING ACK as the sole startup recording barrier
 Recorder transactional finalization
 supervisor/lifecycle fault handling
@@ -656,56 +652,21 @@ inference-latency percentiles. The optional action-gap metric remains deferred.
 
 ---
 
-# 20. Historical implementation outline
+# 20. Completed migration milestones
 
-This outline records the earlier plan. Do not restart the migration or restore
-its intermediate paths; current source and the contract above are authoritative.
-
-## Phase 0
-
-Fix obvious correctness:
+The coordinated migration is complete for the offline implementation:
 
 ```text
-eval seed support
-Recorder outcome semantics
+PolicySpec.chunk_size + predict_action_chunk()
+absolute n_action_steps cadence
+full future-chunk transport and timestamped execution
+single rollout CLI and automatic rollouts/ output
+shared run/eval recording with separate result.json outcome
+Formal Eval transaction removal
 ```
 
-## Phase 1
-
-Policy chunk API migration:
-
-```text
-dexmani_policy.predict_action_chunk()
-```
-
-## Phase 2
-
-Real rollout migration:
-
-```text
-remove sync/async public mode
-consume full future chunk
-unify inference schedule
-```
-
-## Phase 3
-
-run_policy simplification:
-
-```text
-single rollout
-simpler CLI
-automatic output
-```
-
-## Phase 4
-
-Formal Eval simplification:
-
-```text
-remove per-action evidence transaction
-keep startup/recording safety
-```
+Hardware-only validation remains a separate operator procedure: `check`,
+`shadow`, a low-risk `run`, raw inspection, then `eval`.
 
 ---
 
@@ -731,7 +692,7 @@ model changes
 
 # 22. Definition of Done
 
-The final system should satisfy:
+The current system satisfies:
 
 ```text
 one rollout path

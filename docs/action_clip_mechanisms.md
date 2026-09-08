@@ -147,7 +147,7 @@ upper = ( 6.28318530718,  2.0944,  6.28318530718,  3.927,
 | VR teleop | wrist rotation clip、EEF workspace clip、arm joint/delta clip、hand operational/delta clip | IK jump/pose、SafetyGate、worker guards | arm worker jump/bounds；hand worker SDK setpoint `0.3 rad/tick` slew |
 | Keyboard teleop | EEF workspace clip、position/rotation lookahead scaling | IK jump/pose、SafetyGate、worker guards | 同上；键盘自身没有独立的 arm joint `8°/tick` producer clip |
 | Camera calibration control | EEF workspace clip（5 mm margin） | IK/控制 preflight、SafetyGate 及 worker guards | 同上 |
-| Learned policy | wrap-aware arm joint canonicalization + reject-only jump admission；仅允许 tiny float32 hand endpoint roundoff canonicalization | arm joint/workspace、hand jump/SafetyGate、action-step/silence/progress watchdog | arm worker jump guard；hand worker SDK setpoint slew limiting |
+| Learned policy | wrap-aware arm joint canonicalization + reject-only jump admission；仅允许 tiny float32 hand endpoint roundoff canonicalization | arm joint/workspace、hand jump/SafetyGate、rollout-time/silence/progress watchdog | arm worker jump guard；hand worker SDK setpoint slew limiting |
 | Physical replay | 不做一般 action clip；只做角度等价表示转换 | replay preflight、SafetyGate、worker guards | 同上 |
 
 因此，“项目有动作 clip”不能简化为“所有路径都会 clip”：VR producer、PolicyExecutor 与 replay 的处理语义不同；offline cleaning 不模拟 learned-policy endpoint 行为。

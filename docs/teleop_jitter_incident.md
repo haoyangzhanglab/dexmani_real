@@ -149,7 +149,7 @@ ACK 只表示 worker/SDK 接受目标，不表示关节已经物理到位，也�
 - coupled record、atomic revoke 和 worker fencing 是共享基础设施修复，键盘、VR、回放和策略部署都受益；
 - 删除的是键盘路径错误启用的通用 arm delta，不是全局删除安全检查；
 - VR 仍保留 producer-side 8° command shaping，因此不会因键盘修复而失去原有平滑策略；
-- learned-policy 由 PolicyExecutor 对 arm/hand endpoint jump 做 reject-only 检查；通过后精确发布 coupled target，hand worker 再负责 SDK-level slew；拒绝后不立即 abort，后续由 action-step limit 或 silence/progress watchdog 收束 episode；
+- learned-policy 由 PolicyExecutor 对 arm/hand endpoint jump 做 reject-only 检查；通过后精确发布 coupled target，hand worker 再负责 SDK-level slew；拒绝后不立即 abort，后续由 rollout wall-clock、silence 或 progress watchdog 收束 episode；
 - 20° worker guard 对所有来源生效，可阻止异常 IK 分支或损坏 record 直接跨越 SDK 边界；
 - 非阻塞发布避免推理/PolicyExecutor 因等待 actuator acceptance 而破坏调度，但 latest-wins 可能覆盖未消费的旧 endpoint，这是实时遥操作的明确取舍。
 

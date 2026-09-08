@@ -146,7 +146,7 @@ def build_episode_state(
 
     The returned values retain the raw episode convention: all geometry is in
     the xArm-base frame and feedback validity remains represented by the
-    original fields/sentinels.  Both teleoperation and policy evaluation own
+    original fields/sentinels.  Both teleoperation and policy rollout own
     their action semantics; this helper owns only state assembly.
     """
     if arm_state is not None:

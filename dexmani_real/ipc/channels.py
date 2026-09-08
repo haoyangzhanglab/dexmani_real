@@ -220,8 +220,9 @@ class RuntimeChannels:
     physical_home_completed: Any
     # Main/operator -> policy executor: explicit S request.
     stop_request: Any
-    # Main/operator -> policy executor: formal-eval outcome wire value
-    # (0 NONE, 1 SUCCESS, 2 FAILURE, 3 INVALID).  Normal deployment leaves 0.
+    # Main/operator -> policy executor: recorded-rollout outcome wire value
+    # (0 NONE, 1 SUCCESS, 2 FAILURE, 3 INVALID, 4 STOPPED). Shadow deployment
+    # leaves 0 because it does not create a recorded rollout.
     evaluation_outcome: Any
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write

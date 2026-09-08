@@ -536,9 +536,9 @@ class PolicyExecutor:
             if not isinstance(evaluation_config, RolloutRecordingConfig):
                 raise TypeError("evaluation_config must be a RolloutRecordingConfig")
             if not execute:
-                raise ValueError("formal policy evaluation requires execute=True")
+                raise ValueError("recorded rollout requires execute=True")
             if self.max_running_s != evaluation_config.max_running_s:
-                raise ValueError("formal evaluation timeout must match max_running_s")
+                raise ValueError("rollout timeout must match max_running_s")
         self.recording_config = evaluation_config
         self.recorder = (
             RecorderClient(shared) if evaluation_config is not None else None
@@ -739,7 +739,7 @@ class PolicyExecutor:
             )
         except Exception:
             logger.error(
-                "executor: evaluation sample construction failed", exc_info=True
+                "executor: rollout sample construction failed", exc_info=True
             )
             return False
 
@@ -778,7 +778,7 @@ class PolicyExecutor:
         ):
             if result.reason == EVALUATION_MAX_FRAMES_STOP_REASON:
                 ended = self._invalidate_rollout(
-                    "RecorderIO reached its formal-eval frame capacity",
+                    "RecorderIO reached its rollout frame capacity",
                     stop_reason=EVALUATION_MAX_FRAMES_STOP_REASON,
                     recorder_save=True,
                 )
@@ -897,7 +897,7 @@ class PolicyExecutor:
             )
         except Exception:
             logger.error(
-                "executor: failed to build evaluation action record", exc_info=True
+                "executor: failed to build rollout action record", exc_info=True
             )
             return False
         raw_arm, raw_hand = self._recorded_raw_action_parts(
@@ -1264,7 +1264,7 @@ class PolicyExecutor:
                     )
                 except ValueError:
                     self._fault(
-                        "invalid formal evaluation outcome wire value",
+                        "invalid rollout outcome wire value",
                         stop_reason="eval:invalid:recorder_fault",
                         recorder_save=False,
                     )

@@ -178,7 +178,7 @@ python examples/collect_teleop.py --print-config
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 回放 recorded published arm target 与 recorded logical hand target；当前 runtime/geometry 完整预检后控制 xArm7/XHand，hand worker 生成受限 SDK 中间 setpoint；output target 必须缺失或为空目录，默认写入 `replay_results/` |
 | 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取原始 `float64` arm target 与 logical hand target，再执行完整的 live-start、limits、workspace 与 collision 预检；包含多个 source 连续段的产物拒绝物理回放 |
 
-| learned policy 检查 | `python examples/run_policy.py list`；`python examples/run_policy.py check <experiment> --device <device>` | 仅列出实验，或经 Policy public API strict restore + warmup + synthetic predict；不连接硬件 |
+| learned policy 检查 | `python examples/run_policy.py list`；`python examples/run_policy.py check <experiment> --device <device>` | 仅列出实验，或经 Policy public API strict restore + warmup + full action-chunk smoke test；不连接硬件 |
 | learned policy shadow | `python examples/run_policy.py shadow <experiment> [--eval-seed N]` | 连接真实 sensor 与 arm/XHand feedback，执行 inference、IK 和 SafetyGate；禁止 actuator publication 与 home |
 | learned policy run | `python examples/run_policy.py run <experiment> [--eval-seed N] [--max-duration S]` | 连接并控制 xArm7/XHand；H 后 B 启动单次 rollout，并录制 camera/raw episode |
 | learned policy formal eval | `python examples/run_policy.py eval <experiment> --eval-seed N --max-duration S` | 共用 run 控制与录制路径，写入 `rollouts/`，标注 SUCCESS/FAILURE/INVALID |
@@ -300,7 +300,7 @@ deployment lifecycle 从 Policy public API 取得只读 `PolicySpec`。唯一的
 `data_contract.observation_fields` 按顺序声明每个原始模型
 输入的名称、shape、dtype 与语义；训练 experiment 的 `dataset.sensor_modalities` 是导出时唯一的
 人工选择入口，artifact 不再持久化第二份模态列表。Real 只验证自己要投影的 raw shape/dtype、
-19/21D control action、XHand、控制周期与 Prediction IPC capacity，并只启动所需 sensor worker。
+19/21D control action、XHand、控制周期、`chunk_size` 与 Prediction IPC capacity，并只启动所需 sensor worker。
 若请求 point cloud，还会在 channel/worker 创建前逐项校验 preprocessing identity（frame、颜色来源、
 policy/table/sampling/transform）；若请求 fingertip，则校验 derivation 与 algorithm ID。任一 mismatch
 fail closed，deployment schema 仍保持 v3。
@@ -313,7 +313,8 @@ hardware workers。内部只传播 `execute: bool`：`False` 走完整 candidate
 不会调用 publication；`True` 发布同一 generation/ticket 的 arm + hand command，worker 仅在
 candidate validity window 内接受目标。`PolicyExecutor` 的正常策略发布不逐 endpoint 等待 acceptance，
 而是分别监控 arm `last_cmd_seq` 与 hand `accepted_target_action_id`；latest-wins 可跳过中间 ID，但持续
-存在已发布目标且任一水位在 `command_progress_timeout_s` 内不前进会 fail closed。日常 inference seed 固定为 0，
+存在已发布目标且任一水位在 `command_progress_timeout_s` 内不前进会 fail closed。run/shadow 默认 seed 为 0；
+eval 通过 `--eval-seed` 明确选择并写入结果元数据，
 XHand 需求由 `PolicySpec.requires_hand` 决定，不由 CLI
 重复声明。
 

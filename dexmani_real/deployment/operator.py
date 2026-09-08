@@ -261,7 +261,7 @@ def run_operator_control(
                         )
                     else:
                         logger.warning(
-                            "operator: C is only a formal-evaluation failure marker"
+                            "operator: C is available only in eval mode"
                         )
                 elif signal is OperatorCommand.DISCARD:
                     if evaluation:
@@ -271,7 +271,7 @@ def run_operator_control(
                         )
                     else:
                         logger.warning(
-                            "operator: D is only a formal-evaluation invalid marker"
+                            "operator: D is available only in eval mode"
                         )
                 elif signal is OperatorCommand.HOME:
                     if planner is None:

@@ -3,9 +3,9 @@
 
 ``list`` reads Policy selectors only; ``check`` restores a checkpoint and warms
 inference without starting robot workers. ``shadow`` starts the Real hardware
-lifecycle while disabling command publication; ``run`` can physically command
-xArm7/XHand; ``eval`` is the formally recorded physical protocol. The command
-line owns experiment selection and operator intent. Policy owns checkpoint
+lifecycle while disabling command publication; ``run`` and ``eval`` can
+physically command xArm7/XHand and record one rollout. The command line owns
+experiment selection and operator intent. Policy owns checkpoint
 inspection and restore; Real owns validation and robot lifecycle. All imports
 that can reach Policy, Torch, or Real runtime code remain inside their command
 handlers so ``list`` stays a filesystem-only Policy operation.
@@ -204,13 +204,13 @@ def _print_experiment_summary(info: Any, *, mode: str, device: str) -> None:
 
 
 def _print_evaluation_summary(info: Any, inputs: _LifecycleInputs) -> None:
-    """Print formal-protocol facts after preflight has fixed their values."""
+    """Print recorded-rollout facts after preflight has fixed their values."""
     evaluation = inputs.evaluation_config
     if evaluation is None:
-        raise ValueError("formal evaluation summary requires an evaluation contract")
+        raise ValueError("recorded rollout summary requires a recording contract")
     checkpoint_sha256 = evaluation.provenance.get("checkpoint_sha256")
     if checkpoint_sha256 is None:
-        raise ValueError("formal evaluation provenance lacks checkpoint_sha256")
+        raise ValueError("recorded rollout provenance lacks checkpoint_sha256")
     print("── Recorded Rollout ──")
     print(f"Eval seed             : {inputs.worker_config.seed}")
     print(f"Policy selector       : {info.selector}")
@@ -227,7 +227,7 @@ def _print_evaluation_summary(info: Any, inputs: _LifecycleInputs) -> None:
     print(f"n_action_steps        : {info.spec.n_action_steps}")
     print(f"Control Hz            : {1.0 / info.spec.control_dt_s:g}")
     print(f"Max running seconds   : {evaluation.max_running_s:g}")
-    print(f"Evaluation output dir : {evaluation.data_dir}")
+    print(f"Rollout output dir    : {evaluation.data_dir}")
     print(f"Task                  : {evaluation.task_label}")
     print(f"Operator              : {evaluation.operator}")
     print("──────────────────────")
@@ -270,7 +270,7 @@ def _safe_selector_parts(selector: Any) -> tuple[str, str, str]:
         for part in parts
     ):
         raise ValueError(
-            "formal eval requires canonical selector policy/task/experiment"
+            "eval requires canonical selector policy/task/experiment"
         )
     return parts[0], parts[1], parts[2]
 
@@ -311,8 +311,8 @@ def _run_check(args: argparse.Namespace) -> int:
         print("restore .......... OK")
         # Policy's strict restore performs its normalizer and metadata checks.
         print("normalizer ....... OK")
-        # ``LoadedPolicy.warmup`` builds its deterministic synthetic observation,
-        # calls ``predict``, and validates the finite [N, D] control output.
+        # ``LoadedPolicy.warmup`` checks the model's deterministic path; the
+        # explicit smoke test below checks the production full-chunk API.
         durations = _validated_warmup_durations(policy.warmup(samples=3))
         print("warmup ........... OK")
         _check_action_chunk(policy, info.spec)

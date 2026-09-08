@@ -614,7 +614,7 @@ class PolicyParams:
 
     control_hz: float = 16.0
     # Executor polling is deliberately faster than the 16 Hz action grid: it
-    # shortens arm/hand progress and sync-result phase delay without raising
+    # shortens arm/hand progress and publication-result phase delay without raising
     # command rate.
     executor_poll_hz: float = 128.0
     # Learned-policy inference and causal observation timing. Model shape,

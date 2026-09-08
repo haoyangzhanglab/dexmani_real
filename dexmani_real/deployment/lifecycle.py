@@ -10,10 +10,11 @@ no second health mechanism: supervisor heartbeats cover the policy executor,
 actuator, and inference workers, while readiness covers asynchronous startup
 only.
 
-There is no VR worker. Ordinary deployment starts the camera only when the
-explicit observation contract contains ``point_cloud`` or ``rgb``. Formal
-evaluation additionally starts camera and RecorderIO for audit evidence, while
-keeping camera payload out of a state-only policy observation.
+There is no VR worker. A shadow session starts the camera only when the
+explicit observation contract contains ``point_cloud`` or ``rgb``. Physical
+``run`` and ``eval`` sessions always start camera and RecorderIO so the raw
+rollout is retained, while camera payload stays out of a state-only policy
+observation.
 
 """
 
@@ -102,7 +103,7 @@ def _evaluation_recorder_config(
     runtime: ExperimentConfig,
     evaluation: RolloutRecordingConfig,
 ) -> RecorderIOConfig:
-    """Build the recorder-only capacity contract for one formal eval session."""
+    """Build the recorder capacity contract for one physical rollout."""
     control_hz = float(runtime.policy.control_hz)
     max_frames = (
         math.ceil(float(evaluation.max_running_s) * control_hz)
@@ -235,10 +236,10 @@ def build_policy_worker_specs(
         if not isinstance(evaluation_config, RolloutRecordingConfig):
             raise TypeError("evaluation_config must be a RolloutRecordingConfig")
         if not execute:
-            raise ValueError("formal policy evaluation requires execute=True")
+            raise ValueError("recorded rollout requires execute=True")
         if max_running_s != evaluation_config.max_running_s:
             raise ValueError(
-                "formal evaluation max_running_s must match its evaluation contract"
+                "rollout max_running_s must match its recording contract"
             )
     pointcloud_requested = _requires_pointcloud(policy_spec)
     camera_requested = _requires_camera(policy_spec) or evaluation_config is not None
@@ -361,7 +362,7 @@ def run_policy_deployment(
         if not isinstance(evaluation_config, RolloutRecordingConfig):
             raise TypeError("evaluation_config must be a RolloutRecordingConfig")
         if not execute:
-            raise ValueError("formal policy evaluation requires execute=True")
+            raise ValueError("recorded rollout requires execute=True")
     validate_policy_runtime_compatibility(policy_spec, runtime)
     if not isinstance(worker_config, InferenceWorkerConfig):
         raise TypeError("worker_config must be an InferenceWorkerConfig")
@@ -374,7 +375,7 @@ def run_policy_deployment(
             and max_running_s != evaluation_config.max_running_s
         ):
             raise ValueError(
-                "formal evaluation max_running_s must match its evaluation contract"
+                "rollout max_running_s must match its recording contract"
             )
         max_running_s = evaluation_config.max_running_s
     logger.info(

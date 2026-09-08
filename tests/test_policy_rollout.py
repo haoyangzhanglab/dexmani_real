@@ -2,8 +2,8 @@
 
 No hardware, no trained checkpoint, no GPU.  These tests pin the public Policy
 contract boundary, timestamp-based scheduling, the explicit IK-vs-SAFETY
-attribution, reject-only arm admission, and the control-first formal-eval
-recording semantics.  Run with:
+attribution, reject-only arm admission, and the publish-then-record rollout
+semantics.  Run with:
 
     python -m unittest discover -s tests -p 'test_policy_rollout.py'
 """

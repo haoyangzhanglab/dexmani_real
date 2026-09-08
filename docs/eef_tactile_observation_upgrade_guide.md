@@ -59,7 +59,7 @@ tactile_force  [T, 5, 120, 3]  = XHand SDK raw_force fx/fy/fz
 - 修改 raw v24 recording schema。
 - 修改 `dexmani_policy`。
 - 升级 Policy Zarr v7。
-- 改变 robot control / safety / formal-eval semantics。
+- 改变 robot control / safety / learned-policy rollout semantics。
 - 从 xArm firmware API 直接读取 Cartesian EEF pose。
 - 假设 `contact_force == tactile_force.sum(axis=taxel)`。
 - 假设 120 个 tactile point 已有 verified 2D/3D taxel geometry。

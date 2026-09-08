@@ -35,7 +35,7 @@ def evaluation_outcome_stop_reason(outcome: EvaluationOutcome) -> str:
     try:
         return reasons[outcome]
     except KeyError as exc:
-        raise ValueError("NONE is not a terminal evaluation outcome") from exc
+        raise ValueError("NONE is not a terminal rollout outcome") from exc
 
 
 @dataclass(frozen=True)
@@ -58,26 +58,26 @@ class RolloutRecordingConfig:
         if self.mode not in {"run", "eval"}:
             raise ValueError("recorded rollout mode must be run or eval")
         if not isinstance(self.data_dir, str) or not self.data_dir.strip():
-            raise ValueError("evaluation data_dir must be a non-empty path")
+            raise ValueError("rollout data_dir must be a non-empty path")
         raw_data_dir = Path(self.data_dir)
         if not raw_data_dir.is_absolute():
-            raise ValueError("evaluation data_dir must be absolute")
+            raise ValueError("rollout data_dir must be absolute")
         resolved_data_dir = raw_data_dir.resolve(strict=False)
         if resolved_data_dir == resolved_data_dir.parent:
-            raise ValueError("evaluation data_dir must not be a filesystem root")
+            raise ValueError("rollout data_dir must not be a filesystem root")
         for field_name in ("task_label", "operator"):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"evaluation {field_name} must be non-empty")
+                raise ValueError(f"rollout {field_name} must be non-empty")
             if value != value.strip():
                 raise ValueError(
-                    f"evaluation {field_name} must not have surrounding whitespace"
+                    f"rollout {field_name} must not have surrounding whitespace"
                 )
         if isinstance(self.max_running_s, bool):
-            raise TypeError("evaluation max_running_s must be a finite positive number")
+            raise TypeError("rollout max_running_s must be a finite positive number")
         timeout_s = float(self.max_running_s)
         if not math.isfinite(timeout_s) or timeout_s <= 0.0:
-            raise ValueError("evaluation max_running_s must be finite and positive")
+            raise ValueError("rollout max_running_s must be finite and positive")
         object.__setattr__(self, "data_dir", str(resolved_data_dir))
         object.__setattr__(self, "max_running_s", timeout_s)
         object.__setattr__(
