@@ -79,6 +79,9 @@ as desired behavior.
 - Base: `d2494cdf2840ec3a6ac120203f00eeb55040040d`.
 - Branch: `codex/refactor-pr2-dataset`.
 - Implementation: terra-max; independent reviewer: astra-medium.
+- Commits: `32f8d2e` implementation/tests; `235b277` docs/evidence.
+- PR: https://github.com/haoyangzhanglab/dexmani_real/pull/4 (merged).
+- Integrated SHA: `918a1719b92df43e0311cd68d8cbd74d1c92302e`.
 - Independent review: approved. Targeted suite **50 passed**; full suite
   **318 passed, 94 subtests passed**; compileall and diff check passed.
 - Numeric golden: 32 clean/stale-tactile AUDIT processed datasets match baseline
@@ -97,6 +100,31 @@ as desired behavior.
   are produced in staging; Zarr export source and gap tests are unchanged.
 - No independent pre-existing bugfix; no protected schema/version/IPC/threshold,
   research-array or durability changes. Hardware not exercised.
+
+### PR3 — workflow
+
+- Base: `918a1719b92df43e0311cd68d8cbd74d1c92302e`.
+- Branch: `codex/refactor-pr3-workflow`.
+- Implementation: terra-max; independent reviewer: astra-medium.
+- Status: homing → pointcloud → keyboard in progress, separate commits.
+- Homing commit: `6088496`; stable configured caller API preserved. Independent
+  review approved with **35 targeted tests passed**. Hand-first SDK acceptance,
+  config projection, fresh feedback, cancellation, reset, fallback and audio
+  ordering are covered; protected control/arm_homing implementation unchanged.
+- Pointcloud source audit refined the implementation plan: reported builds and
+  fresh-frame benchmarks already share `build_point_cloud_with_stats`;
+  calibration deliberately uses `aligned_depth_points_in_base` before table
+  cropping/outlier filtering/sampling. Diagnostic capture needs RGB/raw/metric
+  depth, benchmark capture needs RGB/raw, calibration needs depth only. A
+  forwarding helper or mode-based capture abstraction would add complexity or
+  change validation/timing. Production remains unchanged; stronger offline
+  characterization verifies these existing shared boundaries and distinct
+  capture contracts. This is an already-satisfied design target, not an
+  unfinished refactor or a deferred defect.
+- Pointcloud independent review approved; **8 targeted tests passed**. New
+  checks pin warmup/build arguments, calibration depth-only admission, both
+  calibration branches, post-calibration frame/plane snapshot identity,
+  disconnect and exact benchmark timing ranges. Production diff is zero.
 
 ## Hardware gate
 

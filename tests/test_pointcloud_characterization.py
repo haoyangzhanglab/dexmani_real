@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -10,6 +11,7 @@ import pytest
 
 import examples.pointcloud_process_example as diagnostic
 from dexmani_real.calibration.table import fit_table_plane
+from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry
 from dexmani_real.sensor.pointcloud import (
@@ -135,9 +137,7 @@ def test_table_fit_is_deterministic_and_recovers_upward_plane() -> None:
         + rng.normal(0.0, 0.0005, size=xy.shape[0])
     )
     table_points = np.column_stack((xy, z))
-    outliers = rng.uniform(
-        [-0.5, -0.4, 0.1], [0.5, 0.4, 1.2], size=(100, 3)
-    )
+    outliers = rng.uniform([-0.5, -0.4, 0.1], [0.5, 0.4, 1.2], size=(100, 3))
     points = np.concatenate((table_points, outliers), axis=0)
     options = dict(
         distance_threshold_m=0.003,
@@ -201,7 +201,7 @@ def test_benchmark_reports_processing_and_capture_to_cloud_ranges() -> None:
             diagnostic,
             "build_point_cloud_with_stats",
             return_value=(np.ones((1, 6), dtype=np.float32), stats),
-        ),
+        ) as build_cloud,
     ):
         _cloud, timings = diagnostic._benchmark_production_pipeline(
             camera=Camera(),
@@ -220,3 +220,228 @@ def test_benchmark_reports_processing_and_capture_to_cloud_ranges() -> None:
     assert timings["end_to_end_p95"] == pytest.approx(10.85)
     assert timings["end_to_end_max"] == pytest.approx(11.0)
     assert timings["depth_filter_ms_p95"] == pytest.approx(0.1)
+    assert build_cloud.call_count == 2
+    for call in build_cloud.call_args_list:
+        assert call.kwargs["color"] is frame.rgb
+        assert call.kwargs["depth_raw"] is frame.depth_aligned_to_color_raw
+
+
+def test_reported_cloud_warms_up_then_builds_canonical_output() -> None:
+    geometry = _small_geometry()
+    depth_raw, rgb = _synthetic_rgbd()
+    config = PointCloudConfig()
+    stats = PointCloudBuildStats(candidate_points=1)
+    expected = np.ones((1, 6), dtype=np.float32)
+
+    with mock.patch.object(
+        diagnostic,
+        "build_point_cloud_with_stats",
+        side_effect=[(None, stats), (expected, stats)],
+    ) as build_cloud:
+        result = diagnostic._build_cloud(
+            depth_raw=depth_raw,
+            rgb=rgb,
+            depth_scale_m=0.001,
+            geometry=geometry,
+            T_xarm_base_from_color=np.eye(4),
+            config=config,
+            table_plane_abcd=None,
+        )
+
+    np.testing.assert_array_equal(result, expected)
+    assert build_cloud.call_count == 2
+    for call in build_cloud.call_args_list:
+        assert call.kwargs["color"] is rgb
+        assert call.kwargs["depth_raw"] is depth_raw
+        assert call.kwargs["table_plane_abcd"] is None
+
+
+def test_table_calibration_stays_separate_from_production() -> None:
+    geometry = _small_geometry()
+    depth_raw = np.full((7, 7), 1000, dtype=np.uint16)
+    frame = SimpleNamespace(depth_aligned_to_color_raw=depth_raw)
+    points = np.asarray(
+        [[0.4, 0.0, 0.3], [0.5, 0.1, 0.3], [0.6, -0.1, 0.3]],
+        dtype=np.float32,
+    )
+    fit = SimpleNamespace(
+        plane_abcd=(0.0, 0.0, 1.0, -0.3),
+        inlier_points=3,
+        evaluated_points=3,
+        inlier_ratio=1.0,
+        rms_residual_m=0.0,
+        tilt_deg=0.0,
+    )
+
+    class Camera:
+        def read(self):
+            return frame
+
+        def get_depth_scale(self) -> float:
+            return 0.001
+
+    with (
+        mock.patch("builtins.input", side_effect=["", "n"]),
+        mock.patch.object(
+            diagnostic,
+            "aligned_depth_points_in_base",
+            return_value=points,
+        ) as calibration_points,
+        mock.patch.object(diagnostic, "fit_table_plane", return_value=fit),
+        mock.patch.object(
+            diagnostic,
+            "build_point_cloud_with_stats",
+            side_effect=AssertionError(
+                "table calibration must not use production filtering"
+            ),
+        ),
+    ):
+        plane, _elapsed_ms = diagnostic._calibrate_table(
+            camera=Camera(),
+            geometry=geometry,
+            T_xarm_base_from_color=np.eye(4),
+            config=PointCloudConfig(),
+            plane_path=Path("desk_plane.json"),
+            frame_count=2,
+        )
+
+    assert plane == fit.plane_abcd
+    assert calibration_points.call_count == 2
+    for call in calibration_points.call_args_list:
+        np.testing.assert_array_equal(call.kwargs["depth_raw"], depth_raw)
+        assert call.kwargs["aligned_depth_intrinsics"] is geometry.depth
+
+
+@pytest.mark.parametrize(
+    ("calibrate_table", "expected_table_source"),
+    [(False, "resolved_runtime"), (True, "calibrated_this_run")],
+)
+def test_main_uses_post_calibration_capture_for_processing_and_snapshot(
+    tmp_path,
+    calibrate_table: bool,
+    expected_table_source: str,
+) -> None:
+    runtime = resolve_experiment_config()
+    assert runtime.environment.table.enabled
+    geometry = _small_geometry()
+    preview_rgb = np.zeros((7, 7, 3), dtype=np.uint8)
+    preview_depth = np.full((7, 7), 1000, dtype=np.uint16)
+    processed_rgb = np.full((7, 7, 3), 17, dtype=np.uint8)
+    processed_depth = np.full((7, 7), 1200, dtype=np.uint16)
+    processed_cloud = np.ones((runtime.pointcloud.num_points, 6), dtype=np.float32)
+    raw_cloud = np.full((2, 6), 0.5, dtype=np.float32)
+    calibrated_plane = (0.0, 0.0, 1.0, -0.4)
+    events: list[str] = []
+
+    class Camera:
+        def __init__(self) -> None:
+            self.disconnected = False
+
+        def get_geometry(self):
+            return SimpleNamespace(aligned_depth_to_color=lambda: geometry)
+
+        def get_depth_scale(self) -> float:
+            return 0.001
+
+        def disconnect(self) -> None:
+            self.disconnected = True
+
+    camera = Camera()
+    diagnostic_config = diagnostic.PointCloudDiagnosticConfig(
+        show_rgbd_panels=False,
+        show_o3d=False,
+    )
+
+    def capture_frame(_camera):
+        if not events:
+            events.append("preview_capture")
+            return (
+                preview_rgb,
+                preview_depth,
+                preview_depth.astype(np.float32) * 0.001,
+                1.0,
+            )
+        events.append("processed_capture")
+        return (
+            processed_rgb,
+            processed_depth,
+            processed_depth.astype(np.float32) * 0.001,
+            1.0,
+        )
+
+    def calibrate(**_kwargs):
+        events.append("calibrate")
+        return calibrated_plane, 2.0
+
+    with (
+        mock.patch.object(
+            diagnostic,
+            "PointCloudDiagnosticConfig",
+            return_value=diagnostic_config,
+        ),
+        mock.patch.object(
+            diagnostic, "resolve_experiment_config", return_value=runtime
+        ),
+        mock.patch.object(diagnostic, "_connect_camera", return_value=camera),
+        mock.patch.object(diagnostic, "_print_device_info", return_value={}),
+        mock.patch.object(
+            diagnostic,
+            "_capture_frame",
+            side_effect=capture_frame,
+        ),
+        mock.patch.object(diagnostic, "_print_depth_stats"),
+        mock.patch.object(diagnostic, "_show_rgbd_panels") as show_rgbd,
+        mock.patch.object(
+            diagnostic, "_load_extrinsics", return_value=(np.eye(4), 1.0)
+        ),
+        mock.patch.object(
+            diagnostic,
+            "_resolve_table_plane_path",
+            return_value=tmp_path / "desk_plane.json",
+        ),
+        mock.patch("builtins.input", return_value="y" if calibrate_table else "n"),
+        mock.patch.object(
+            diagnostic, "_calibrate_table", side_effect=calibrate
+        ) as calibrate_plane,
+        mock.patch.object(
+            diagnostic, "_build_cloud", return_value=processed_cloud
+        ) as build_cloud,
+        mock.patch.object(
+            diagnostic, "build_raw_point_cloud", return_value=raw_cloud
+        ) as build_raw,
+        mock.patch.object(
+            diagnostic,
+            "_save_diagnostic_snapshot",
+            return_value=tmp_path / "snapshot",
+        ) as save_snapshot,
+        mock.patch.object(
+            diagnostic,
+            "_benchmark_production_pipeline",
+            return_value=(np.zeros((0, 6), dtype=np.float32), {"pipeline_total": 1.0}),
+        ),
+        mock.patch.object(diagnostic, "_print_timing_summary"),
+    ):
+        assert diagnostic.main(["--save-dir", str(tmp_path)]) == 0
+
+    assert camera.disconnected
+    assert events == (
+        ["preview_capture", "calibrate", "processed_capture"]
+        if calibrate_table
+        else ["preview_capture", "processed_capture"]
+    )
+    assert calibrate_plane.call_count == int(calibrate_table)
+    assert show_rgbd.call_args.args[0] is preview_rgb
+    assert build_cloud.call_args.kwargs["rgb"] is processed_rgb
+    assert build_cloud.call_args.kwargs["depth_raw"] is processed_depth
+    expected_plane = (
+        calibrated_plane if calibrate_table else runtime.environment.table.plane_abcd
+    )
+    assert build_cloud.call_args.kwargs["table_plane_abcd"] == expected_plane
+    assert build_raw.call_args.kwargs["color"] is processed_rgb
+    assert build_raw.call_args.kwargs["depth_raw"] is processed_depth
+    assert save_snapshot.call_args.kwargs["rgb"] is processed_rgb
+    assert save_snapshot.call_args.kwargs["depth_raw"] is processed_depth
+    assert save_snapshot.call_args.kwargs["processed_point_cloud"] is processed_cloud
+    assert save_snapshot.call_args.kwargs["raw_point_cloud"] is raw_cloud
+    assert save_snapshot.call_args.kwargs["table_plane_abcd"] == expected_plane
+    assert save_snapshot.call_args.kwargs["table_plane_source"] == expected_table_source

@@ -43,6 +43,8 @@ control safety gate → command publication → arm / hand workers
   record layout 由 `dexmani_real/ipc/schema.py` 定义。
 - `teleop/control_loop/grid.py` 拥有 feedback 连续错误计数和启动时解析的私有 command-limit
   cache；`action_proposal.py` 拥有 EMA pose smoothing。独立 health/smoothing 包装模块已移除。
+- `teleop/homing.py::do_configured_teleop_home` 直接读取 immutable runtime 并编排 hand-first
+  homing；`tests/test_teleop_homing.py` 离线覆盖接受顺序、配置、freshness、取消和 completion audio。
 - learned-policy lifecycle 先等待 inference restore/warmup，再启动所需传感器和执行器 worker；
   supervisor 只监督实际运行的 process heartbeat，readiness 只负责有界启动等待。
 - teleop lifecycle 按 dependency → policy → VR 分阶段启动启用的 worker；父进程 readiness
