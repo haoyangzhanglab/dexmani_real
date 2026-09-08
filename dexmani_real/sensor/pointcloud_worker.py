@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import time
-from collections import deque
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -40,7 +39,6 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 _IDLE_POLL_S = 0.001
-_METRICS_LOG_INTERVAL_S = 5.0
 
 
 def _validate_transform(value: np.ndarray, *, label: str) -> np.ndarray:
@@ -211,14 +209,6 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
     )
 
     last_camera_sequence = 0
-    frames_processed = 0
-    frames_published = 0
-    frames_skipped = 0
-    empty_clouds = 0
-    stale_after_compute = 0
-    compute_ms: deque[float] = deque(maxlen=2048)
-    source_to_publish_ms: deque[float] = deque(maxlen=2048)
-    last_log_s = time.monotonic()
     ready = False
     max_input_age_ns = int(cfg.max_input_age_s * 1e9)
 
@@ -236,7 +226,6 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
             header, color, depth_raw, camera_sequence = result
             if camera_sequence <= last_camera_sequence:
                 continue
-            frames_skipped += max(0, camera_sequence - last_camera_sequence - 1)
             last_camera_sequence = camera_sequence
             now_ns = time.monotonic_ns()
             if not _camera_frame_is_usable(
@@ -246,7 +235,6 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
             ):
                 continue
 
-            started_ns = time.monotonic_ns()
             cloud = build_point_cloud(
                 depth_raw=depth_raw,
                 color=color,
@@ -256,11 +244,7 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
                 table_plane_abcd=cfg.table_plane_abcd,
                 config=cfg.pointcloud,
             )
-            finished_ns = time.monotonic_ns()
-            compute_ms.append((finished_ns - started_ns) / 1e6)
-            frames_processed += 1
             if cloud is None:
-                empty_clouds += 1
                 continue
             validate_point_cloud_array(
                 cloud,
@@ -270,7 +254,6 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
 
             publish_ns = time.monotonic_ns()
             if publish_ns - int(header[0]["source_monotonic_ns"]) > max_input_age_ns:
-                stale_after_compute += 1
                 continue
             record = np.zeros(1, dtype=expected_dtype)
             camera_header = header[0]
@@ -285,11 +268,6 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
             record["color_frame_number"][0] = camera_header["color_frame_number"]
             record["point_cloud"][0] = cloud
             shared.pointcloud_ring.write(record)
-            committed_ns = time.monotonic_ns()
-            source_to_publish_ms.append(
-                (committed_ns - int(camera_header["source_monotonic_ns"])) / 1e6
-            )
-            frames_published += 1
             if not ready:
                 shared.set_ready("pointcloud")
                 ready = True
@@ -297,45 +275,8 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
                     "pointcloud_loop: ready (shape=(%d,6), frame=xarm_base)",
                     cfg.pointcloud.num_points,
                 )
-
-            now_s = time.monotonic()
-            if now_s - last_log_s >= _METRICS_LOG_INTERVAL_S:
-                values = np.asarray(compute_ms, dtype=np.float64)
-                source_values = np.asarray(
-                    source_to_publish_ms,
-                    dtype=np.float64,
-                )
-                p50 = float(np.percentile(values, 50)) if values.size else 0.0
-                p95 = float(np.percentile(values, 95)) if values.size else 0.0
-                source_p95 = (
-                    float(np.percentile(source_values, 95))
-                    if source_values.size
-                    else 0.0
-                )
-                logger.debug(
-                    "pointcloud_loop: processed=%d published=%d skipped=%d "
-                    "empty=%d stale_after_compute=%d compute_ms_p50=%.2f p95=%.2f "
-                    "source_to_publish_ms_p95=%.2f",
-                    frames_processed,
-                    frames_published,
-                    frames_skipped,
-                    empty_clouds,
-                    stale_after_compute,
-                    p50,
-                    p95,
-                    source_p95,
-                )
-                last_log_s = now_s
     finally:
-        logger.info(
-            "pointcloud_loop: exited processed=%d published=%d skipped=%d empty=%d "
-            "stale_after_compute=%d",
-            frames_processed,
-            frames_published,
-            frames_skipped,
-            empty_clouds,
-            stale_after_compute,
-        )
+        logger.info("pointcloud_loop: exited")
 
 
 __all__ = ["PointCloudLoopConfig", "pointcloud_loop"]

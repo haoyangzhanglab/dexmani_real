@@ -57,7 +57,6 @@ from dexmani_real.teleop.control_loop.hand_control import (
     hand_ramp_frame_count,
     seed_hand_retargeter,
 )
-from dexmani_real.teleop.control_loop.timing import StageTimer
 from dexmani_real.teleop.control_loop.vr_mapping import VRWristMapper
 from dexmani_real.teleop.episode_samples import (
     RECORDING_TACTILE_MAX_AGE_NS,
@@ -404,7 +403,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
     next_grid_ns = time.monotonic_ns() + grid_period_ns
     current_grid_anchor_ns = next_grid_ns
     pending_controls: list[OperatorCommand] = []
-    stage_timer = StageTimer(window=cfg.runtime.policy.status_print_interval)
     validate_warn = ThrottledWarner(interval_s=_VALIDATION_WARN_INTERVAL_S)
     arm_feedback_warn = ThrottledWarner(interval_s=_ARM_FEEDBACK_WARN_INTERVAL_S)
     grid_overrun_warn = ThrottledWarner(interval_s=_VALIDATION_WARN_INTERVAL_S)
@@ -420,7 +418,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
         recorder=recorder,
         command_limits=command_limits,
         camera_freshness=camera_freshness,
-        stage_timer=stage_timer,
         validation_warn=validate_warn,
         arm_feedback_warn=arm_feedback_warn,
         hand_ramp_total_frames=hand_ramp_frame_count(
@@ -646,8 +643,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 )
                 next_grid_ns += int(missed_periods) * grid_period_ns
                 loop_count += 1
-                stage_timer.tick()
-                stage_timer.mark("control_loop")
             if not grid_due and not pending_controls:
                 continue
 
