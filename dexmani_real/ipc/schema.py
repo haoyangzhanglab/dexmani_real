@@ -19,11 +19,6 @@ from dexmani_real.robot.model import (
     HAND_TACTILE_SUM_SHAPE,
 )
 
-RECORD_TASK_LABEL_BYTES = 128
-RECORD_OPERATOR_BYTES = 128
-RECORD_STOP_REASON_BYTES = 512
-RECORD_STATUS_TEXT_BYTES = 2_048
-
 # Runtime IPC capacity for flat learned-policy predictions. Adapters must not
 # truncate larger requests, and the executor decodes only the validated 19-D
 # joint or 21-D EE representations.
@@ -234,54 +229,13 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
     align=True,
 )
 
-RECORD_CONTROL_DTYPE = np.dtype(
-    [
-        ("command", "<u1"),
-        ("generation", "<u8"),
-        ("save", "<u1"),
-        ("created_monotonic_ns", "<u8"),
-        ("task_label", f"S{RECORD_TASK_LABEL_BYTES}"),
-        ("operator", f"S{RECORD_OPERATOR_BYTES}"),
-        ("stop_reason", f"S{RECORD_STOP_REASON_BYTES}"),
-    ],
-    align=True,
-)
-
-RECORD_STATUS_DTYPE = np.dtype(
-    [
-        ("phase", "<u1"),
-        ("saved", "<u1"),
-        ("min_frames_met", "<u1"),
-        ("generation", "<u8"),
-        ("frame_count", "<u8"),
-        ("failure_count", "<u8"),
-        ("updated_monotonic_ns", "<u8"),
-        ("reason_length", "<u4"),
-        ("reason", f"S{RECORD_STOP_REASON_BYTES}"),
-        ("error_length", "<u4"),
-        ("error", f"S{RECORD_STATUS_TEXT_BYTES}"),
-        ("path_length", "<u4"),
-        ("path", f"S{RECORD_STATUS_TEXT_BYTES}"),
-    ],
-    align=True,
-)
-
-
 def make_record_sample_dtype(
     rgb_shape: tuple[int, int, int],
     depth_shape: tuple[int, int],
 ) -> np.dtype:
-    """Return the v25 source row plus its recorder-owned lifecycle fields.
-
-    ``generation`` and ``sample_sequence`` belong to the current SHM transport;
-    all other scalar/array fields mirror the 37 v25 source datasets.  Timeline
-    fields such as ``source_sample_index`` and ``fill_reason`` are assigned by
-    RecorderIO when the owned row is appended, not by this producer boundary.
-    """
+    """Return the v25 source row and fixed camera payload for the sample ring."""
     return np.dtype(
         [
-            ("generation", "<u8"),
-            ("sample_sequence", "<u8"),
             ("timestamp", "<f8"),
             ("arm_qpos", "<f8", ARM_JOINT_SHAPE),
             ("arm_qvel", "<f8", ARM_JOINT_SHAPE),
@@ -347,11 +301,6 @@ __all__ = [
     "MAX_PREDICTION_STEPS",
     "POINT_CLOUD_FEATURE_DIM",
     "PREDICTION_DTYPE",
-    "RECORD_CONTROL_DTYPE",
-    "RECORD_OPERATOR_BYTES",
-    "RECORD_STATUS_DTYPE",
-    "RECORD_STOP_REASON_BYTES",
-    "RECORD_TASK_LABEL_BYTES",
     "SUPPORTED_POINT_CLOUD_COUNTS",
     "VR_FRAME_DTYPE",
     "make_pointcloud_frame_dtype",

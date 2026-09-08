@@ -1,7 +1,7 @@
 """Focused RecorderIO-boundary regressions for mode-specific max_frames reasons.
 
 No hardware, no trained checkpoint.  These tests pin the owner-boundary contract:
-RecorderIO auto-finalizes capacity exhaustion with the configured stop reason, and
+RecorderIO announces capacity and its configured stop reason, and
 the rollout recording config threads the run/eval namespace through it. They
 exercise the io_worker path directly rather than mocking the executor's intent.
 """
@@ -14,13 +14,11 @@ from unittest import mock
 
 import numpy as np
 
-import dexmani_real.recording.io_worker as io_worker
 from dexmani_real.deployment.evaluation import (
-    EVALUATION_MAX_FRAMES_STOP_REASON,
     RolloutRecordingConfig,
 )
 from dexmani_real.deployment.lifecycle import _evaluation_recorder_config
-from dexmani_real.recording.io_worker import RecorderIOConfig, _RecorderIOSession
+from dexmani_real.recording.io_worker import RecorderIOConfig
 
 
 class TestMaxFramesStopReason(unittest.TestCase):
@@ -38,16 +36,6 @@ class TestMaxFramesStopReason(unittest.TestCase):
                 control_hz=16.0,
                 min_frames=1,
                 max_frames_stop_reason="   ",
-            )
-
-    def test_oversized_reason_is_rejected(self):
-        with self.assertRaises(ValueError):
-            RecorderIOConfig(
-                data_dir="/tmp/r",
-                max_frames=10,
-                control_hz=16.0,
-                min_frames=1,
-                max_frames_stop_reason="x" * 600,
             )
 
     def test_evaluation_recorder_config_threads_formal_reason(self):
@@ -68,53 +56,6 @@ class TestMaxFramesStopReason(unittest.TestCase):
                 self.assertEqual(
                     config.max_frames_stop_reason, f"{mode}:invalid:max_frames"
                 )
-
-
-class TestAutoFinalizationReason(unittest.TestCase):
-    def test_auto_finalization_uses_configured_reason(self):
-        config = RecorderIOConfig(
-            data_dir="/tmp/r",
-            max_frames=10,
-            control_hz=16.0,
-            min_frames=1,
-            max_frames_stop_reason=EVALUATION_MAX_FRAMES_STOP_REASON,
-        )
-        session = _RecorderIOSession.__new__(_RecorderIOSession)
-        session.config = config
-        session.recorder = mock.Mock()
-        session.recorder.is_recording = True
-        session.recorder.add_episode_frame.return_value = False
-        session.recorder.max_frames_reached = True
-        session.recorder.camera_writer_error = None
-        session.recorder.frame_count = 3
-        session.recorder.stop_episode.return_value = "/tmp/r/episode"
-        session.active_generation = 1
-        session.last_sample_sequence = 0
-        session.sample_backlog_high_watermark = 0
-        session.pending_finalization = None
-        session.failure_count = 0
-
-        ring = mock.Mock()
-        ring.latest_sequence = 1
-        ring.maxlen = 8
-        record = np.zeros(1, dtype=[("generation", "<i8")])
-        record["generation"] = 1
-        ring.read_sequence.return_value = (record, 1000, 1)
-        shared = mock.Mock()
-        shared.record_sample_ring = ring
-        shared.recorder_consumed_sequence = mock.Mock()
-        session.shared = shared
-
-        with mock.patch.object(
-            io_worker, "decode_record_sample", return_value=mock.Mock()
-        ):
-            session._drain_samples()
-
-        session.recorder.stop_episode.assert_called_once()
-        self.assertEqual(
-            session.recorder.stop_episode.call_args.kwargs["reason"],
-            EVALUATION_MAX_FRAMES_STOP_REASON,
-        )
 
 
 class TestSaveOutcome(unittest.TestCase):
@@ -208,15 +149,16 @@ class TestSaveOutcome(unittest.TestCase):
             EvaluationOutcome,
             write_rollout_result,
         )
-        from dexmani_real.recording.client import RecorderClient, RecorderCommand
+        from dexmani_real.recording.client import RecorderClient, StopRecording
 
         shared = mock.Mock()
         client = RecorderClient(shared)
         client._recording = True
-        with mock.patch.object(client, "_write_control") as write:
+        shared.record_sample_ring.latest_sequence = 7
+        with mock.patch.object(client, "_send_control") as write:
             client.stop_episode(save=True, reason="eval:failure:operator")
         write.assert_called_once_with(
-            RecorderCommand.STOP, save=True, stop_reason="eval:failure:operator"
+            StopRecording(save=True, reason="eval:failure:operator", through_sequence=7)
         )
         with tempfile.TemporaryDirectory() as directory:
             config = RolloutRecordingConfig(

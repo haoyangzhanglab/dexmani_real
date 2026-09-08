@@ -18,8 +18,6 @@ import numpy as np
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.ipc.causal import vr_frame_is_fresh
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
-from dexmani_real.ipc.schema import RECORD_OPERATOR_BYTES, RECORD_TASK_LABEL_BYTES
-from dexmani_real.recording.client import RecorderPhase, bounded_control_text
 from dexmani_real.recording.io_worker import RecorderIOConfig, recorder_io_loop
 from dexmani_real.robot.arm_worker import arm_loop as _arm_loop
 from dexmani_real.robot.hand_worker import hand_loop as _hand_loop
@@ -59,7 +57,7 @@ DEFAULT_TASK_NAME = "test"
 
 
 def validate_task_name(value: str) -> str:
-    """Validate one task name for both a directory component and fixed metadata."""
+    """Validate one task name as a safe directory component."""
     if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError(
             "task_name must be a non-empty string without surrounding whitespace"
@@ -68,10 +66,6 @@ def validate_task_name(value: str) -> str:
         raise ValueError("task_name must not be a hidden or relative directory name")
     if "/" in value or "\\" in value or any(ord(char) < 32 for char in value):
         raise ValueError("task_name must be one safe directory component")
-    if len(value.encode("utf-8")) > RECORD_TASK_LABEL_BYTES:
-        raise ValueError(
-            f"task_name exceeds the {RECORD_TASK_LABEL_BYTES}-byte recording metadata limit"
-        )
     return value
 
 
@@ -80,11 +74,7 @@ def validate_operator(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("operator must be a string")
     try:
-        bounded_control_text(
-            value,
-            capacity=RECORD_OPERATOR_BYTES,
-            field="operator",
-        )
+        value.encode("utf-8")
     except UnicodeError as exc:
         raise ValueError("operator must be valid UTF-8 text") from exc
     return value
@@ -349,29 +339,6 @@ def _build_processes(
     return specs
 
 
-def _recording_session_issue(shared: RuntimeChannels) -> str | None:
-    """Return a data-session failure independently of robot safety state."""
-    result = shared.record_status_ring.read_latest()
-    if result is None:
-        return "recorder status is unavailable"
-    status = result[0][0]
-    try:
-        phase = RecorderPhase(int(status["phase"]))
-    except ValueError:
-        return f"recorder reported unknown phase {int(status['phase'])}"
-    failure_count = int(status["failure_count"])
-    error_length = int(status["error_length"])
-    error = bytes(status["error"])[:error_length].decode("utf-8", errors="replace")
-    if failure_count > 0:
-        detail = f": {error}" if error else ""
-        return f"recorder reported {failure_count} failure(s){detail}"
-    if phase in (RecorderPhase.RECORDING, RecorderPhase.FINALIZING):
-        return f"recorder exited with transaction still {phase.name.lower()}"
-    if phase is RecorderPhase.ERROR:
-        return f"recorder terminal error: {error or 'unknown error'}"
-    return None
-
-
 def run_teleop_experiment(
     runtime: ExperimentConfig,
     *,
@@ -572,9 +539,6 @@ def run_teleop_experiment(
             supervisor_hz=float(runtime.safety.supervisor_hz),
         )
 
-        recording_issue = (
-            _recording_session_issue(shared) if recording_enabled else None
-        )
         shutdown_report = shutdown_processes(
             shared,
             started_procs,
@@ -593,13 +557,11 @@ def run_teleop_experiment(
             and not bool(shared.error_state.value)
             and not bool(shared.estop_request.value)
             and int(shared.safety_state.value) == int(SafetyState.DISARMED)
-            and recording_issue is None
         )
         if normal_exit and not clean_exit:
             logger.error(
-                "verified session outcome invalidated the clean supervisor exit: shutdown=%s recording=%s",
+                "verified session outcome invalidated the clean supervisor exit: shutdown=%s",
                 shutdown_report,
-                recording_issue,
             )
 
         runtime_m = (time.monotonic() - start_time) / 60.0
@@ -609,8 +571,6 @@ def run_teleop_experiment(
             f"  exit_reason={exit_reason}  runtime={runtime_m:.1f}min  safety={safety_name}  "
             f"supervisor_normal={normal_exit}  clean={clean_exit}"
         )
-        if recording_issue is not None:
-            print(f"  recording_failure={recording_issue}")
         print("──")
         return 0 if clean_exit else 1
 

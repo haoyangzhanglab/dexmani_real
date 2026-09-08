@@ -167,6 +167,11 @@ VR / keyboard input
 
 ## Recording/Data boundaries
 
+- `recording/client.py` 定义四个低频 Queue 消息并独占结果消费；`recording/io_worker.py`
+  按 STOP 的 `through_sequence` 排空 sample SHM 后关闭并原子发布。没有 recorder wire
+  phase/generation；局部 pending finalization 不跨 IPC。`tests/test_recorder_queue_client.py`、
+  `tests/test_recorder_queue_io.py`、`tests/test_recorder_queue_channels.py` 覆盖生产停止边界、
+  FIFO/error/next episode 以及真实 spawn Queue；worker 非零退出由现有 session lifecycle 汇总。
 - Camera IPC 只携带 source/receive/publish 时间、generation、帧号和 health；保留 payload
   尺寸字段以支持 name-only ring attach。设备时钟映射留在 driver/worker，不作为录制审计传输。
   static shared metadata 只保留 serial、RGB-D geometry 和 depth scale；校准与研究 provenance

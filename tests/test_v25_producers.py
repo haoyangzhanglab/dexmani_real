@@ -54,7 +54,7 @@ def _client():
         recorder_consumed_sequence=SimpleNamespace(value=0),
     )
     client._recording = True
-    client._generation = 1
+    client._max_frames = 0
     client._frame_count = 0
     return client
 

@@ -36,7 +36,7 @@ from dexmani_real.deployment.metrics import PolicyStats
 from dexmani_real.deployment.prediction import Prediction
 from dexmani_real.deployment.timing import first_future_step_index
 from dexmani_real.deployment.evaluation import EvaluationOutcome, RolloutRecordingConfig
-from dexmani_real.recording.client import RecorderPhase, RecorderStopResult
+from dexmani_real.recording.client import RecorderStopResult
 from dexmani_real.runtime.safety import SafetyState, StopRequest, request_policy_stop
 
 # xArm7 joint bounds (rad), matching the defaults documented in
@@ -797,7 +797,6 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
                 evaluation_config=config,
             )
         recorder = mock.Mock()
-        recorder.start_pending = False
         recorder.stop_pending = False
         recorder.is_recording = False
         recorder.start_episode.return_value = True
@@ -922,7 +921,6 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
             executor._complete_recording(
                 RecorderStopResult(
                     done=True,
-                    phase=RecorderPhase.COMPLETED,
                     saved=True,
                     path=directory,
                 )
@@ -974,9 +972,9 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
                         executor.shared.estop_request.value = True
                         executor._handle_run_boundary()
                     else:
+                        executor.recorder.stop_pending = True
                         executor.recorder.poll_stop.return_value = RecorderStopResult(
                             done=False,
-                            phase=RecorderPhase.FINALIZING,
                             reason=(
                                 f"{mode}:invalid:max_frames"
                                 if event == "max_frames"
@@ -1053,7 +1051,6 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         self.begin(executor)
         executor.recorder.poll_stop.return_value = RecorderStopResult(
             done=True,
-            phase=RecorderPhase.ERROR,
             error="disk full",
             path="/tmp/rollout-test/episode",
             saved=False,
@@ -1123,16 +1120,13 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         executor = self.executor()
         self.begin(executor)
         executor._finish_episode("failure", outcome=EvaluationOutcome.FAILURE)
-        executor.recorder.poll_stop.return_value = RecorderStopResult(
-            done=False, phase=RecorderPhase.FINALIZING
-        )
+        executor.recorder.poll_stop.return_value = RecorderStopResult(done=False)
         with mock.patch.object(executor_mod, "write_rollout_result") as write:
             executor._poll_recorder()
             write.assert_not_called()
             self.assertTrue(executor.shared.is_recording.value)
             executor.recorder.poll_stop.return_value = RecorderStopResult(
                 done=True,
-                phase=RecorderPhase.COMPLETED,
                 saved=True,
                 path="/tmp/rollout-test/episode",
             )

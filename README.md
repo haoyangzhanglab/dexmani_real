@@ -115,13 +115,17 @@ RealSense / Quest-HTS / xArm7 / XHand
   control-grid 时钟，不计作遥操作栅格丢失。
 - RecorderIO 从 fixed-size shared-memory record 按逻辑 sequence 严格、连续地取得所有权；
   它只复制尚未确认的 slot，缺失或超出环容量时丢弃 active episode，绝不跳过样本。随后它将
-  record 解码为不可变、拥有自身数组副本的 `EpisodeFrame`，并拥有 episode transaction、
+  record 解码为拥有自身数组副本的 `EpisodeFrame`，并拥有 episode transaction、
   camera sidecar、验证和有界 finalize。其轮询是非执行器的服务循环；周期性批量持久化允许
   超过单次轮询周期，健康性以 sample backlog、sequence 连续性和 writer 状态为准，而不是
   轮询相位。其中
   [`recording/storage/hdf5_writer.py`](dexmani_real/recording/storage/hdf5_writer.py) 是单个
   `data.h5` handle、dataset append 与 offset 的唯一 owner。两者都不拥有机器人命令或
   episode 的开始/停止决策。
+- 录制 START/STOP 与 Started/Finished 通过低频 Queue 传递，`RecorderClient` 是结果的唯一
+  消费者。START 确认后才生产样本；STOP 先停止生产、快照 `through_sequence`，RecorderIO
+  排空该边界内的全部样本后 flush、close、原子发布，再返回一个 Finished。启动超时由现有
+  supervisor 中止会话，不建立迟到取消或 generation/FSM 协议。
 - 相机标定的纯 ArUco/hand-eye 计算、运动控制与 side-effect lifecycle 分别位于
   [`calibration/camera/solver.py`](dexmani_real/calibration/camera/solver.py)、
   [`calibration/camera/motion.py`](dexmani_real/calibration/camera/motion.py) 与
@@ -253,7 +257,7 @@ rate、mode、timeout、task、operator 和输出目录。默认输出为
 run/eval 即使对 state-only policy 也启动 camera
 作为审计证据，camera payload 不会因此自动进入 model observation。
 
-每个 B 在完成 `H → B` 的物理 home 前置条件后，必须先获得 RecorderIO 的 `RECORDING` 确认，才进入
+每个 B 在完成 `H → B` 的物理 home 前置条件后，必须先获得 RecorderIO 的 `RecordingStarted` 确认，才进入
 RUNNING；这是唯一 startup recording barrier，第一条正常 control-grid sample 即为首条记录。
 控制先完成 publish/reject，再记录结果，不另建 evaluation observation 或证据准入事务。
 eval 按键为 B（开始）、S（SUCCESS）、

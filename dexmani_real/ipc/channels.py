@@ -21,8 +21,6 @@ from dexmani_real.ipc.schema import (
     HAND_STATE_DTYPE,
     HAND_TACTILE_DTYPE,
     PREDICTION_DTYPE,
-    RECORD_CONTROL_DTYPE,
-    RECORD_STATUS_DTYPE,
     SUPPORTED_POINT_CLOUD_COUNTS,
     VR_FRAME_DTYPE,
     make_pointcloud_frame_dtype,
@@ -58,9 +56,7 @@ class RuntimeChannelsConfig:
     hand_state_ring_maxlen: int = 8
     hand_tactile_ring_maxlen: int = 8
     coupled_cmd_ring_maxlen: int = 8
-    record_control_ring_maxlen: int = 1
     record_sample_ring_maxlen: int = 4
-    record_status_ring_maxlen: int = 1
     pointcloud_num_points: int = 1024
     camera_requested: bool = False
     pointcloud_requested: bool = False
@@ -85,9 +81,7 @@ class RuntimeChannelsConfig:
             self.hand_state_ring_maxlen,
             self.hand_tactile_ring_maxlen,
             self.coupled_cmd_ring_maxlen,
-            self.record_control_ring_maxlen,
             self.record_sample_ring_maxlen,
-            self.record_status_ring_maxlen,
             self.pointcloud_ring_maxlen,
             self.arm_home_q_maxsize,
         )
@@ -135,13 +129,12 @@ _RING_RESOURCE_NAMES = (
     "hand_state_ring",
     "hand_tactile_ring",
     "coupled_cmd_ring",
-    "record_control_ring",
     "record_sample_ring",
-    "record_status_ring",
     "prediction_ring",
     "pointcloud_ring",
 )
 _QUEUE_RESOURCE_NAMES = ("arm_home_q",)
+_RECORDER_QUEUE_RESOURCE_NAMES = ("record_control_q", "record_result_q")
 
 # Heartbeat slots use a fixed process-stable order.
 HEARTBEAT_FIELDS: tuple[str, ...] = (
@@ -191,13 +184,13 @@ class RuntimeChannels:
     hand_state_ring: SharedMemoryRingBuffer  # hand -> policy
     hand_tactile_ring: SharedMemoryRingBuffer  # hand -> policy (sparse)
     coupled_cmd_ring: SharedMemoryRingBuffer  # serialized control -> arm/hand endpoint
-    record_control_ring: SharedMemoryRingBuffer  # policy -> RecorderIO episode boundary
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
-    record_status_ring: SharedMemoryRingBuffer  # RecorderIO -> controller/main
     prediction_ring: SharedMemoryRingBuffer  # inference -> policy executor, single latest
     pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> inference
 
     arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, generation)
+    record_control_q: mp.Queue  # policy -> RecorderIO episode boundaries
+    record_result_q: mp.Queue  # RecorderIO -> RecorderClient (sole consumer)
     arm_command_seq: (
         Any  # all actuator-action producers -> globally unique monotonic IDs
     )
@@ -328,22 +321,10 @@ class RuntimeChannels:
             maxlen=cfg.coupled_cmd_ring_maxlen,
             create=True,
         )
-        storage.record_control_ring = SharedMemoryRingBuffer(
-            f"{prefix}_record_control",
-            dtype=RECORD_CONTROL_DTYPE,
-            maxlen=cfg.record_control_ring_maxlen,
-            create=True,
-        )
         storage.record_sample_ring = SharedMemoryRingBuffer(
             f"{prefix}_record_sample",
             dtype=make_record_sample_dtype(rgb_shape, depth_shape),
             maxlen=cfg.record_sample_ring_maxlen,
-            create=True,
-        )
-        storage.record_status_ring = SharedMemoryRingBuffer(
-            f"{prefix}_record_status",
-            dtype=RECORD_STATUS_DTYPE,
-            maxlen=cfg.record_status_ring_maxlen,
             create=True,
         )
         storage.prediction_ring = SharedMemoryRingBuffer(
@@ -360,6 +341,8 @@ class RuntimeChannels:
         )
 
         storage.arm_home_q = ctx.Queue(maxsize=cfg.arm_home_q_maxsize)
+        storage.record_control_q = ctx.Queue(maxsize=8)
+        storage.record_result_q = ctx.Queue(maxsize=8)
         storage.arm_command_seq = ctx.Value("Q", 0)
         storage.run_generation = ctx.Value("Q", 1)
         storage.run_started_monotonic_ns = ctx.Value("Q", 0)
@@ -438,6 +421,13 @@ class RuntimeChannels:
                 continue
             if _attempt(f"{queue_name}.close", queue.close):
                 _attempt(f"{queue_name}.join_thread", queue.join_thread)
+
+        for queue_name in _RECORDER_QUEUE_RESOURCE_NAMES:
+            queue = getattr(self, queue_name, None)
+            if queue is None:
+                continue
+            _attempt(f"{queue_name}.cancel_join_thread", queue.cancel_join_thread)
+            _attempt(f"{queue_name}.close", queue.close)
 
         self._closed = not errors
         if self._closed:

@@ -1,88 +1,80 @@
-"""Controller-side recorder client and shared control-plane protocol types.
-
-``RecorderClient`` is the policy-side owner of recording decisions and fixed
-sample construction.  This module also holds the control-plane types shared
-with the RecorderIO process (``recorder_io_loop`` in ``io_process.py``), which
-imports them from here.  This module never imports ``io_process``, keeping the
-dependency one-way.
-"""
+"""Controller-owned recording decisions, sample publication and Queue results."""
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from enum import IntEnum
+from queue import Empty, Full
 from typing import Any
 
 import numpy as np
 
-from dexmani_real.ipc.schema import (
-    RECORD_CONTROL_DTYPE,
-    RECORD_OPERATOR_BYTES,
-    RECORD_STOP_REASON_BYTES,
-    RECORD_TASK_LABEL_BYTES,
-)
 from dexmani_real.recording.frame import episode_source_values
 from dexmani_real.recording.sample import EpisodeAction, EpisodeState
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
 RECORDER_STOP_TIMEOUT_S = 60.0
 RECORDER_START_TIMEOUT_S = 10.0
-RECORDER_START_CANCEL_REASON = "recorder_start_timeout"
 _STOP_POLL_INTERVAL_S = 0.01
 
 
-class RecorderCommand(IntEnum):
-    START = 1
-    STOP = 2
+@dataclass
+class StartRecording:
+    task: str
+    operator: str
+    start_sequence: int
 
 
-class RecorderPhase(IntEnum):
-    READY = 1
-    RECORDING = 2
-    FINALIZING = 3
-    COMPLETED = 4
-    ERROR = 5
-    STOPPED = 6
+@dataclass
+class StopRecording:
+    save: bool
+    reason: str
+    through_sequence: int
 
 
-@dataclass(frozen=True)
+@dataclass
+class RecordingStarted:
+    path: str
+    max_frames: int
+    max_frames_stop_reason: str
+
+
+@dataclass
+class RecordingFinished:
+    saved: bool
+    path: str | None
+    frame_count: int
+    reason: str
+    error: str | None = None
+    min_frames_met: bool = False
+
+
+@dataclass
 class RecorderStopResult:
-    """Policy-visible outcome of one recorder transaction."""
+    """Local result, consumed once by the controller."""
 
     done: bool
-    phase: RecorderPhase | None = None
-    generation: int = 0
     saved: bool = False
     error: str | None = None
     path: str | None = None
     frame_count: int = 0
     reason: str = ""
     min_frames_met: bool = False
-    failure_count: int = 0
-
-
-def bounded_control_text(value: str, *, capacity: int, field: str) -> bytes:
-    """Encode a control-plane text field without an unbounded JSON side channel."""
-    payload = value.encode("utf-8")
-    if len(payload) > capacity:
-        raise ValueError(f"RecorderIO {field} exceeds fixed capacity {capacity}")
-    return payload
 
 
 class RecorderClient:
-    """Policy-side owner of recording decisions and fixed sample construction."""
+    """Sole result-queue consumer; at most one recording is in flight."""
 
     def __init__(self, shared: Any) -> None:
         self.shared = shared
-        self._generation = 0
         self._frame_count = 0
         self._recording = False
-        self._start_pending = False
         self._stop_requested = False
-        self._last_poll_status_sequence = 0
+        self._unavailable = False
+        self._max_frames = 0
+        self._max_frames_stop_reason = "max_frames"
+        self._stop_reason = ""
         self._last_stop_result: RecorderStopResult | None = None
         self.episode_path: str | None = None
 
@@ -95,130 +87,79 @@ class RecorderClient:
         return self._recording
 
     @property
-    def start_pending(self) -> bool:
-        """Whether a START generation awaits acknowledgement or cancellation."""
-        return self._start_pending
-
-    @property
     def stop_pending(self) -> bool:
         return self._stop_requested
 
     @property
     def camera_writer_error(self) -> str | None:
-        status = self._read_status()
-        if status is None or int(status["generation"]) != self._generation:
-            return None
-        return (
-            self._text(status, "error")
-            if int(status["phase"]) == int(RecorderPhase.ERROR)
-            else None
+        return self._last_stop_result.error if self._last_stop_result else None
+
+    def _fail_transport(self, error: str) -> None:
+        logger.error("RecorderIO unavailable: %s", error)
+        self._unavailable = True
+        self._recording = False
+        self.shared.error_state.value = True
+        self._last_stop_result = RecorderStopResult(
+            done=False,
+            error=error,
+            reason=self._stop_reason,
+            path=self.episode_path,
+            frame_count=self._frame_count,
         )
 
-    def _read_status_with_sequence(self) -> tuple[np.void, int] | None:
-        result = self.shared.record_status_ring.read_latest()
-        return (result[0][0], int(result[2])) if result is not None else None
-
-    def _read_status(self) -> np.void | None:
-        result = self._read_status_with_sequence()
-        return result[0] if result is not None else None
-
-    @staticmethod
-    def _text(status: np.void, field: str) -> str:
-        length = int(status[f"{field}_length"])
-        return bytes(status[field])[:length].decode("utf-8", errors="replace")
-
-    def _write_control(
-        self,
-        command: RecorderCommand,
-        *,
-        save: bool = False,
-        task_label: str = "",
-        operator: str = "",
-        stop_reason: str = "",
-    ) -> None:
-        frame = np.zeros(1, dtype=RECORD_CONTROL_DTYPE)
-        frame["command"][0] = int(command)
-        frame["generation"][0] = self._generation
-        frame["save"][0] = int(save)
-        frame["created_monotonic_ns"][0] = time.monotonic_ns()
-        frame["task_label"][0] = bounded_control_text(
-            task_label, capacity=RECORD_TASK_LABEL_BYTES, field="task_label"
-        )
-        frame["operator"][0] = bounded_control_text(
-            operator, capacity=RECORD_OPERATOR_BYTES, field="operator"
-        )
-        frame["stop_reason"][0] = bounded_control_text(
-            stop_reason, capacity=RECORD_STOP_REASON_BYTES, field="stop_reason"
-        )
-        self.shared.record_control_ring.write(frame)
+    def _send_control(self, message: StartRecording | StopRecording) -> bool:
+        try:
+            self.shared.record_control_q.put_nowait(message)
+            return True
+        except (Full, OSError, ValueError) as exc:
+            self._fail_transport(f"control queue failed: {exc}")
+            return False
 
     def start_episode(self, *, task_label: str = "", operator: str = "") -> bool:
         if (
             self._recording
-            or self._start_pending
             or self._stop_requested
+            or self._unavailable
             or not self.shared.is_ready("recorder")
         ):
             return False
-        try:
-            bounded_control_text(
-                task_label, capacity=RECORD_TASK_LABEL_BYTES, field="task_label"
-            )
-            bounded_control_text(
-                operator, capacity=RECORD_OPERATOR_BYTES, field="operator"
-            )
-        except ValueError:
-            logger.error(
-                "RecorderIO start metadata exceeds its fixed control boundary",
-                exc_info=True,
-            )
-            return False
-        self._generation += 1
         self.episode_path = None
         self._last_stop_result = None
-        self._start_pending = True
-        self._write_control(
-            RecorderCommand.START, task_label=task_label, operator=operator
+        self._stop_reason = ""
+        start = StartRecording(
+            task_label,
+            operator,
+            int(self.shared.record_sample_ring.latest_sequence) + 1,
         )
+        if not self._send_control(start):
+            return False
         deadline = time.monotonic() + RECORDER_START_TIMEOUT_S
         while time.monotonic() < deadline and self.shared.is_running.value:
-            status = self._read_status()
-            if status is not None and int(status["generation"]) == self._generation:
-                phase = RecorderPhase(int(status["phase"]))
-                if phase is RecorderPhase.RECORDING:
-                    self.episode_path = self._text(status, "path") or None
-                    self._recording = True
-                    self._start_pending = False
-                    self._stop_requested = False
-                    self._frame_count = 0
-                    return True
-                if phase is RecorderPhase.ERROR:
-                    self._start_pending = False
-                    return False
-            # Starting is bounded but may span more than one supervisor tick.
-            # RecorderClient is policy-owned, so keep that owner's heartbeat live.
             self.shared.set_heartbeat("policy", time.monotonic())
-            time.sleep(0.005)
-        self.cancel_pending_start()
-        return False
-
-    def cancel_pending_start(
-        self,
-        *,
-        reason: str = RECORDER_START_CANCEL_REASON,
-    ) -> bool:
-        """Cancel an unacknowledged START without allowing a late recording.
-
-        The control ring is latest-only.  A recorder that has not yet observed
-        START may therefore see only this STOP; RecorderIO recognizes this
-        bounded cancel reason and publishes a terminal, unsaved transaction.
-        """
-        if not self._start_pending:
+            try:
+                result = self.shared.record_result_q.get(timeout=_STOP_POLL_INTERVAL_S)
+            except Empty:
+                continue
+            except (EOFError, OSError, ValueError) as exc:
+                self._fail_transport(f"start result queue failed: {exc}")
+                return False
+            if isinstance(result, RecordingStarted):
+                self.episode_path = result.path
+                self._max_frames = result.max_frames
+                self._max_frames_stop_reason = result.max_frames_stop_reason
+                self._frame_count = 0
+                self._recording = True
+                return True
+            if isinstance(result, RecordingFinished):
+                self._finish(result)
+                return False
+            self._fail_transport("unexpected start result")
             return False
-        self._write_control(RecorderCommand.STOP, save=False, stop_reason=reason)
-        self._start_pending = False
-        self._stop_requested = True
-        return True
+        # Supervisor owns failed-worker shutdown, not a cancellation protocol.
+        self._fail_transport(
+            "recorder start acknowledgement timed out or runtime stopped"
+        )
+        return False
 
     def add_frame(
         self,
@@ -240,8 +181,6 @@ class RecorderClient:
 
         dtype = self.shared.record_sample_ring.dtype
         frame = np.zeros(1, dtype=dtype)
-        frame["generation"][0] = self._generation
-        frame["sample_sequence"][0] = self._frame_count + 1
         frame["timestamp"][0] = state.timestamp
         for name, value in episode_source_values(
             state,
@@ -262,71 +201,52 @@ class RecorderClient:
             )
         self.shared.record_sample_ring.write(frame)
         self._frame_count += 1
+        if self._max_frames and self._frame_count >= self._max_frames:
+            self.stop_episode(save=True, reason=self._max_frames_stop_reason)
         return True
 
     def stop_episode(self, save: bool = True, reason: str = "") -> str | None:
-        if self._start_pending:
-            # There is no recorder transaction to save yet; use the one
-            # protocol reason that RecorderIO accepts before START.
-            self.cancel_pending_start()
-            return None
         if not self._recording or self._stop_requested:
             return None
-        self._write_control(RecorderCommand.STOP, save=save, stop_reason=reason)
+        # Revoke production before capturing the final committed sequence.
         self._recording = False
         self._stop_requested = True
+        self._stop_reason = reason or "manual"
+        through = int(self.shared.record_sample_ring.latest_sequence)
+        self._send_control(StopRecording(save, self._stop_reason, through))
         return None
 
-    def _status_result(self, status: np.void, *, done: bool) -> RecorderStopResult:
-        phase = RecorderPhase(int(status["phase"]))
-        error = self._text(status, "error") or None
-        path = self._text(status, "path") or None
-        return RecorderStopResult(
-            done=done,
-            phase=phase,
-            generation=int(status["generation"]),
-            saved=phase is RecorderPhase.COMPLETED
-            and error is None
-            and bool(status["saved"]),
-            error=error,
-            path=path,
-            frame_count=int(status["frame_count"]),
-            reason=self._text(status, "reason"),
-            min_frames_met=bool(status["min_frames_met"]),
-            failure_count=int(status["failure_count"]),
-        )
-
-    def poll_stop(self) -> RecorderStopResult:
-        """Return each newly published recorder status once, including max-stop."""
-        status_result = self._read_status_with_sequence()
-        if status_result is None:
-            return RecorderStopResult(done=False)
-        status, sequence = status_result
-        if (
-            sequence == self._last_poll_status_sequence
-            or int(status["generation"]) != self._generation
-        ):
-            return RecorderStopResult(done=False)
-        self._last_poll_status_sequence = sequence
-        phase = RecorderPhase(int(status["phase"]))
-        if phase is RecorderPhase.FINALIZING:
-            self._recording = False
-            self._start_pending = False
-            self._stop_requested = True
-            return self._status_result(status, done=False)
-        if phase not in (RecorderPhase.COMPLETED, RecorderPhase.ERROR):
-            return RecorderStopResult(
-                done=False, phase=phase, generation=self._generation
-            )
+    def _finish(self, event: RecordingFinished) -> RecorderStopResult:
         self._recording = False
-        self._start_pending = False
         self._stop_requested = False
-        result = self._status_result(status, done=True)
+        result = RecorderStopResult(
+            done=True,
+            saved=event.saved,
+            error=event.error,
+            path=event.path,
+            frame_count=event.frame_count,
+            reason=event.reason,
+            min_frames_met=event.min_frames_met,
+        )
         self._last_stop_result = result
         return result
 
+    def poll_stop(self) -> RecorderStopResult:
+        try:
+            event = self.shared.record_result_q.get_nowait()
+        except Empty:
+            if self._unavailable and self._last_stop_result:
+                return self._last_stop_result
+            return RecorderStopResult(done=False, reason=self._stop_reason)
+        except (EOFError, OSError, ValueError) as exc:
+            self._fail_transport(f"result queue failed: {exc}")
+            return self._last_stop_result
+        if not isinstance(event, RecordingFinished):
+            self._fail_transport("unexpected recording result")
+            return self._last_stop_result
+        return self._finish(event)
+
     def join_stop(self, timeout: float | None = None) -> RecorderStopResult:
-        """Wait for a terminal status without conflating ERROR with success."""
         if not self._stop_requested:
             return self._last_stop_result or RecorderStopResult(done=True)
         timeout_s = RECORDER_STOP_TIMEOUT_S if timeout is None else float(timeout)
@@ -334,21 +254,10 @@ class RecorderClient:
             raise ValueError("recorder stop timeout must be finite and non-negative")
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            status = self._read_status()
-            if status is not None and int(status["generation"]) == self._generation:
-                phase = RecorderPhase(int(status["phase"]))
-                if phase in (RecorderPhase.COMPLETED, RecorderPhase.ERROR):
-                    self._recording = False
-                    self._start_pending = False
-                    self._stop_requested = False
-                    result = self._status_result(status, done=True)
-                    self._last_stop_result = result
-                    return result
+            result = self.poll_stop()
+            if result.done or result.error:
+                return result
             self.shared.set_heartbeat("policy", time.monotonic())
             time.sleep(_STOP_POLL_INTERVAL_S)
-        return RecorderStopResult(
-            done=False,
-            phase=RecorderPhase.FINALIZING,
-            generation=self._generation,
-            reason="finalization_timeout",
-        )
+        self._fail_transport("recorder finalization timed out")
+        return self._last_stop_result

@@ -33,7 +33,7 @@ from dexmani_real.planning import (
     XArm7MotionPlanner,
     XArm7PlannerConfig,
 )
-from dexmani_real.recording.client import RecorderClient, RecorderPhase
+from dexmani_real.recording.client import RecorderClient
 from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
@@ -487,12 +487,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             if recorder is not None:
                 stop_result = recorder.poll_stop()
                 reached_limit = (
-                    stop_result.phase
-                    in (
-                        RecorderPhase.FINALIZING,
-                        RecorderPhase.COMPLETED,
-                        RecorderPhase.ERROR,
-                    )
+                    (recorder.stop_pending or stop_result.done)
                     and stop_result.reason == "max_frames"
                     and (teleop_active or recording_active)
                 )
@@ -524,9 +519,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     gc.collect()
                     if quit_after_recording:
                         shared.quit_requested.value = True
-                elif (
-                    stop_result.phase is RecorderPhase.FINALIZING and stop_result.error
-                ):
+                elif stop_result.error:
                     print("  ⚠ 录制终结超过时限；仍在安全回收，本会话将标记为失败")
                 if recording_active and recorder.camera_writer_error is not None:
                     logger.error(

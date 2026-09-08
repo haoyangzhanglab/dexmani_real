@@ -74,7 +74,6 @@ from dexmani_real.planning.paths import (
 )
 from dexmani_real.recording.client import (
     RecorderClient,
-    RecorderPhase,
     RecorderStopResult,
 )
 from dexmani_real.recording.sample import (
@@ -765,7 +764,7 @@ class PolicyExecutor:
             )
             return not finished
         ended = False
-        if result.phase is RecorderPhase.ERROR or result.error:
+        if result.error:
             if (
                 self.run_started_ns is None
                 and not was_stop_pending
@@ -782,8 +781,8 @@ class PolicyExecutor:
                 recorder_save=False,
             )
         elif (
-            result.phase is RecorderPhase.FINALIZING and self.run_started_ns is not None
-        ):
+            self.recorder.stop_pending or result.done
+        ) and self.run_started_ns is not None:
             if result.reason == self._invalid_stop_reason("max_frames"):
                 ended = self._invalidate_rollout(
                     "RecorderIO reached its rollout frame capacity",
@@ -797,12 +796,6 @@ class PolicyExecutor:
                     stop_reason=self._invalid_stop_reason("recorder_fault"),
                     recorder_save=False,
                 )
-        elif result.done and self.run_started_ns is not None:
-            ended = self._invalidate_rollout(
-                "RecorderIO completed before rollout stopped",
-                stop_reason=self._invalid_stop_reason("recorder_fault"),
-                recorder_save=False,
-            )
         if result.done:
             self._complete_recording(result)
         return not ended
@@ -1009,9 +1002,7 @@ class PolicyExecutor:
                 self.shared.start_request.value = False
             logger.warning("rollout already completed; restart run_policy.py")
             return
-        if self.recorder is not None and (
-            self.recorder.start_pending or self.recorder.stop_pending
-        ):
+        if self.recorder is not None and self.recorder.stop_pending:
             with self.shared.motion_lock:
                 self.shared.start_request.value = False
             logger.warning("executor: ignored B while RecorderIO is finalizing")
@@ -1037,9 +1028,7 @@ class PolicyExecutor:
                 task_label=self.recording_config.task_label,
                 operator=self.recording_config.operator,
             ):
-                self.shared.is_recording.value = bool(
-                    self.recorder.start_pending or self.recorder.stop_pending
-                )
+                self.shared.is_recording.value = self.recorder.stop_pending
                 with self.shared.motion_lock:
                     self.shared.start_request.value = False
                     self.shared.evaluation_outcome.value = int(
