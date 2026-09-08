@@ -2,7 +2,7 @@
 
 The inference worker is the *only* process that touches the model. It reads
 causal observations from the shared rings, runs
-:meth:`~dexmani_real.deployment.inference.runtime.PolicyRuntime.predict`, and publishes
+:meth:`~dexmani_real.deployment.inference.runtime.PolicyRuntime.predict_action_chunk`, and publishes
 the resulting :class:`~dexmani_real.deployment.prediction.Prediction` to the
 latest-wins ``prediction_ring``. It never writes ``coupled_cmd_ring``, the
 SDK, ``SafetyState``, or ``run_generation`` — model output is a proposal, not a
@@ -27,7 +27,6 @@ from dexmani_real.deployment.config import (
     FIXED_POLICY_RUNTIME_TARGET,
     FingertipAssemblerConfig,
     InferenceWorkerConfig,
-    PolicyDeploymentConfig,
 )
 from dexmani_real.deployment.inference.observation import (
     _build_observation,
@@ -50,7 +49,7 @@ logger = get_logger(__name__)
 _NO_FEEDBACK_POLL_S = 0.005
 # Poll interval while ARMED (no inference) — gentler than the feedback poll.
 _ARMED_IDLE_POLL_S = 0.01
-_SYNC_REQUEST_WAIT_S = 0.05
+_CADENCE_POLL_S = 0.05
 
 
 def _load_inference_runtime(config: InferenceWorkerConfig) -> PolicyRuntime:
@@ -85,9 +84,9 @@ def serialize_prediction(prediction: Prediction) -> np.ndarray:
     )
     frame["num_steps"][0] = np.uint32(prediction.num_steps)
     frame["action_dim"][0] = np.uint32(prediction.actions.shape[1])
-    frame["actions"][0, : prediction.num_steps, : prediction.actions.shape[1]] = (
-        prediction.actions
-    )
+    frame["actions"][
+        0, : prediction.num_steps, : prediction.actions.shape[1]
+    ] = prediction.actions
     return frame
 
 
@@ -101,53 +100,10 @@ def publish_prediction(shared: RuntimeChannels, prediction: Prediction) -> bool:
     return True
 
 
-def _clear_sync_request_for_inactive_snapshot(
-    shared: RuntimeChannels,
-    *,
-    observed_generation: int,
-) -> bool:
-    """Clear only while the lifecycle snapshot still names an inactive epoch.
-
-    The safety transition and this check share ``motion_lock``. If a B request
-    has already advanced the generation to RUNNING, its newly-set inference
-    request cannot be cleared using an older ARMED snapshot.
-    """
-    with shared.motion_lock:
-        if int(shared.run_generation.value) != int(observed_generation):
-            return False
-        if (
-            int(shared.safety_state.value) == int(SafetyState.RUNNING)
-            and not bool(shared.error_state.value)
-            and not bool(shared.estop_request.value)
-        ):
-            return False
-        shared.inference_request.clear()
-        return True
-
-
-def _consume_sync_request(
-    shared: RuntimeChannels,
-    *,
-    observed_generation: int,
-) -> int | None:
-    """Consume a request only if it still belongs to the observed RUNNING epoch."""
-    with shared.motion_lock:
-        current_generation = int(shared.run_generation.value)
-        if current_generation != int(observed_generation):
-            return None
-        if int(shared.safety_state.value) != int(SafetyState.RUNNING):
-            return None
-        if bool(shared.error_state.value) or bool(shared.estop_request.value):
-            return None
-        shared.inference_request.clear()
-        return current_generation
-
-
 def inference_loop(
     shared: RuntimeChannels,
     policy: PolicyParams,
     config: InferenceWorkerConfig,
-    deployment_config: PolicyDeploymentConfig | None = None,
     fingertip_config: FingertipAssemblerConfig | None = None,
 ) -> None:
     """Inference process entry point — produces proposals, never robot commands.
@@ -162,9 +118,6 @@ def inference_loop(
         raise TypeError("inference_loop requires resolved runtime PolicyParams")
     if not isinstance(config, InferenceWorkerConfig):
         raise TypeError("inference_loop requires an InferenceWorkerConfig")
-    deployment = deployment_config or PolicyDeploymentConfig()
-    if not isinstance(deployment, PolicyDeploymentConfig):
-        raise TypeError("inference_loop requires a PolicyDeploymentConfig")
 
     # Heartbeat before any lazy import so the supervisor never sees a dead gap.
     shared.set_heartbeat("inference", time.monotonic())
@@ -180,9 +133,8 @@ def inference_loop(
         if any(not np.isfinite(value) or value < 0.0 for value in timings_s):
             raise RuntimeError("policy runtime returned invalid warmup timing")
         logger.info(
-            "inference warmup: samples_ms=%s mode=%s",
+            "inference warmup: samples_ms=%s",
             ",".join(f"{value * 1e3:.3f}" for value in timings_s),
-            deployment.inference_mode,
         )
     except BaseException:
         try:
@@ -197,13 +149,12 @@ def inference_loop(
     logger.info("inference_loop: ready (runtime=%s)", FIXED_POLICY_RUNTIME_TARGET)
 
     step_dt_ns = int(round(float(config.spec.control_dt_s) * 1e9))
-    async_period_ns = int(config.spec.n_action_steps) * step_dt_ns
+    inference_period_ns = int(config.spec.n_action_steps) * step_dt_ns
 
     observation_id = 0
     last_generation = -1
     last_logical_step_ns = 0
-    sync_request_generation: int | None = None
-    async_deadline_ns: int | None = None
+    deadline_ns: int | None = None
     last_metrics_flush_ns = time.monotonic_ns()
 
     def wait_for_observation() -> None:
@@ -225,73 +176,34 @@ def inference_loop(
             run_generation = run_snapshot.generation
             if run_generation != last_generation:
                 runtime.reset_episode()
+                stats = PolicyStats()
                 last_generation = run_generation
                 observation_id = 0  # new observation epoch for the new run
                 last_logical_step_ns = 0
-                sync_request_generation = None
-                async_deadline_ns = None
+                deadline_ns = None
 
             # ARMED = no inference; the policy executor gates RUNNING via B.
             if run_snapshot.state is not SafetyState.RUNNING:
-                if deployment.inference_mode == "sync":
-                    _clear_sync_request_for_inactive_snapshot(
-                        shared,
-                        observed_generation=run_generation,
-                    )
-                    sync_request_generation = None
-                else:
-                    async_deadline_ns = None
+                deadline_ns = None
                 time.sleep(_ARMED_IDLE_POLL_S)
                 continue
             if bool(shared.error_state.value) or bool(shared.estop_request.value):
-                if deployment.inference_mode == "sync":
-                    _clear_sync_request_for_inactive_snapshot(
-                        shared,
-                        observed_generation=run_generation,
-                    )
-                    sync_request_generation = None
-                else:
-                    async_deadline_ns = None
+                deadline_ns = None
                 time.sleep(_ARMED_IDLE_POLL_S)
                 continue
             if run_snapshot.started_monotonic_ns <= 0:
                 raise RuntimeError("RUNNING state has no observation epoch")
-            if deployment.inference_mode == "sync":
-                if sync_request_generation is None:
-                    if not shared.inference_request.wait(timeout=_SYNC_REQUEST_WAIT_S):
-                        continue
-                    shared.set_heartbeat("inference", time.monotonic())
-                    request_generation = _consume_sync_request(
-                        shared,
-                        observed_generation=run_generation,
+            now_ns = time.monotonic_ns()
+            if deadline_ns is None:
+                deadline_ns = run_snapshot.started_monotonic_ns
+            if now_ns < deadline_ns:
+                time.sleep(
+                    min(
+                        (deadline_ns - now_ns) / 1e9,
+                        _CADENCE_POLL_S,
                     )
-                    if request_generation is None:
-                        continue
-                    run_snapshot = read_run_state_snapshot(shared)
-                    if (
-                        run_snapshot.state is not SafetyState.RUNNING
-                        or run_snapshot.generation != request_generation
-                    ):
-                        continue
-                    if run_snapshot.started_monotonic_ns <= 0:
-                        raise RuntimeError("RUNNING state has no observation epoch")
-                    run_generation = run_snapshot.generation
-                    sync_request_generation = run_generation
-                elif sync_request_generation != run_generation:
-                    sync_request_generation = None
-                    continue
-            else:
-                now_ns = time.monotonic_ns()
-                if async_deadline_ns is None:
-                    async_deadline_ns = now_ns
-                if now_ns < async_deadline_ns:
-                    time.sleep(
-                        min(
-                            (async_deadline_ns - now_ns) / 1e9,
-                            _SYNC_REQUEST_WAIT_S,
-                        )
-                    )
-                    continue
+                )
+                continue
             anchor_ns = time.monotonic_ns()
             observation_id += 1
             observation = _build_observation(
@@ -321,7 +233,12 @@ def inference_loop(
                 config.spec,
                 fingertip_runtime=fingertip_runtime,
             )
-            actions = runtime.predict(policy_observation)
+            actions = runtime.predict_action_chunk(policy_observation)
+            if actions.shape != (
+                config.spec.chunk_size,
+                config.spec.control_action_dim,
+            ):
+                raise ValueError("Policy future chunk shape conflicts with PolicySpec")
             finished_ns = time.monotonic_ns()
             inference_ms = (finished_ns - started_ns) / 1e6
             stats.observe_inference_latency_ms(inference_ms)
@@ -334,15 +251,12 @@ def inference_loop(
             )
             if not publish_prediction(shared, prediction):
                 logger.debug("inference: prediction dropped (generation advanced)")
-            if deployment.inference_mode == "sync":
-                sync_request_generation = None
-            else:
-                assert async_deadline_ns is not None
-                async_deadline_ns = next_periodic_deadline_ns(
-                    async_deadline_ns,
-                    async_period_ns,
-                    finished_ns,
-                )
+            assert deadline_ns is not None
+            deadline_ns = next_periodic_deadline_ns(
+                deadline_ns,
+                inference_period_ns,
+                finished_ns,
+            )
 
             last_metrics_flush_ns = flush_every(
                 stats,

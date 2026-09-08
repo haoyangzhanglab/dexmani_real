@@ -79,6 +79,7 @@ def _fake_policy_spec(*fields: _Field, n_obs_steps: int = _HORIZON):
         observation_fields=fields,
         n_obs_steps=n_obs_steps,
         n_action_steps=4,
+        chunk_size=15,
         requires_hand=True,
         action_key="action",
         control_action_dim=19,

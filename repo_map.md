@@ -50,7 +50,7 @@ causal observation history
     → Real NumPy adapter
     → flat Prediction IPC record [N, D] + provenance
     → one-slot latest-wins prediction_ring
-    → PolicyExecutor (sync/async timing, endpoint decode, EE→IK)
+    → PolicyExecutor (timestamped future targets, endpoint decode, EE→IK)
     → physical SafetyGate
     → non-blocking coupled publication
     → arm / hand worker final checks
@@ -76,8 +76,8 @@ causal observation history
   超 joint limit 或 per-joint jump 阈值直接拒绝，绝不 clip。observation freshness 在 inference
   边界检查，action 有效性由 logical target timestamp 的 stale 过滤决定，command 有效性由
   `action_validity_s` + worker guards 决定。
-- B 只在 ARMED、上一轮 S 已清理、physical home（物理运行）完成后进入 RUNNING；sync/async
-  都不追赶过期 deadline，也不制造超过 `control_hz` 的 command burst。
+- B 只在 ARMED、尚未开始过 rollout、physical home（物理运行）完成后进入 RUNNING；唯一周期执行路径
+  不追赶过期 deadline，也不制造超过 `control_hz` 的 command burst。
 - `tests/test_policy_rollout.py` 用离线 fake 覆盖 Policy 公开契约兼容、timestamp 调度
   （stale-prefix/whole-stale/no-catch-up）、IK/SAFETY 归属、reject-only arm 与
   control-first formal eval 合同，不启动 worker 或硬件。
@@ -88,32 +88,32 @@ causal observation history
 B + completed H
     → RecorderIO START acknowledged as RECORDING
     → RUNNING generation
-    → causal initial held sample
     → existing PolicyExecutor schedule / coupled publication
-    → SUCCESS | FAILURE | INVALID
+    → ordinary raw sample after publish/reject, or held control tick
+    → SUCCESS | FAILURE | INVALID | STOPPED
     → motion fence
     → RecorderIO STOP(save=True) → asynchronous finalize
-    → evaluations/<policy>/<task>/<experiment>/episode_...
+    → rollouts/<policy>/<task>/<experiment>/<run|eval>/seed_NNN/episode_...
+    → result.json
 ```
 
-- `deployment/evaluation.py` 只携带 eval 的绝对隔离输出路径、task/operator、固定 wall-clock timeout
-  和 recorder-owned provenance；它不是第二个 lifecycle 或 recorder。
-- formal eval 强制启动 camera 与 RecorderIO，即使 policy 是 state-only；camera 仍只在 `PolicySpec`
+- `deployment/evaluation.py` 携带 run/eval 的输出路径、task/operator、wall-clock timeout、provenance
+  和独立 task outcome，并写入 result.json；它不是第二个 lifecycle 或 recorder。
+- run/eval 强制启动 camera 与 RecorderIO，即使 policy 是 state-only；camera 仍只在 `PolicySpec`
   请求 RGB/pointcloud 时进入 inference observation。`RuntimeChannels.evaluation_outcome` 仅传递
-  `NONE/SUCCESS/FAILURE/INVALID`，operator 在同一 `motion_lock` 内先写 outcome 再请求 stop。
-- Recorder 必须在 RUNNING 之前确认，初始 causal sample 必须在第一条 policy command 之前入队。正常
-  success/failure/invalid outcome 使用 `stop_episode(success=True)`；只有 recording integrity/storage
-  失败或尚无真实 source evidence 的 aborted transaction 才 discard。FINALIZING 时拒绝新 B。初始 sample
-  之后，per-command evidence 在 command 提交后采集；evidence 失败按类型归属——arm/hand 控制级故障仍走
-  `_fault`，camera/FK 等 evaluation-only 证据失败只把 trial 判为 INVALID，并等待已发布 command 被
-  arm+hand 接受后才 fence（acceptance-fenced），不触发全局 FAULT。INVALID 的 stop_reason 按证据域由
-  typed enum 派生（`eval:invalid:camera_evidence` / `eval:invalid:state_assembly` /
-  `eval:invalid:evidence_unavailable`），不解析 reason 字符串。initial sample 超时记为
-  `eval:invalid:initial_evidence_timeout`；`max_frames` 由 RecorderIO 在 owner 边界以
-  `eval:invalid:max_frames` 持久化。
+  `NONE/SUCCESS/FAILURE/INVALID/STOPPED`，operator 在同一 `motion_lock` 内先写 outcome 再请求 stop。
+- START/RECORDING ACK 是唯一启动录制屏障。首条普通控制网格 sample 开始 raw evidence；没有 initial
+  sample gate、evaluation observation builder 或 pending termination。recording failure 立即 INVALID
+  并撤销 generation，不等待 command acceptance，也不单独触发全局 FAULT。
+- 正常 outcome 调用 `stop_episode(save=True)`，storage commit 与 task success 分离。
+  motion 已撤销后，普通 Recorder STOP/finalization 和 result.json 写入有界完成。
+  `_CommandProgress` 继续承担 worker/SDK progress watchdog；SDK final fence 和 supervisor 保留。
+  每次 invocation 最多一个 rollout，结束后 H/Q 可用，第二次 B 拒绝。
 - `tests/test_policy_rollout.py` 用 fake/shared-memory boundary 覆盖 Policy 公开契约、timestamp 调度、
   IK/SAFETY 归属、reject-only arm 与 control-first formal-eval/recorder 语义（含 max_frames→INVALID
   与 eval-invalid 不触发全局 FAULT）；不启动任何 worker 或设备。
+- `tests/test_recorder_io_boundary.py` 覆盖 Recorder STOP save/outcome 边界，并用临时目录与合成
+  held sample 实际写入、验证 raw-v24 HDF5/depth/video 和 FAILURE result.json；不连接设备。
 
 ## Teleop flow
 

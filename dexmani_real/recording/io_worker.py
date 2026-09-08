@@ -316,7 +316,7 @@ class _RecorderIOSession:
         if self.pending_finalization is not None or not self.recorder.is_recording:
             return
         frame_count = self.recorder.frame_count
-        path = self.recorder.stop_episode(success=save, reason=reason) or ""
+        path = self.recorder.stop_episode(save=save, reason=reason) or ""
         self.pending_finalization = _PendingFinalization(
             generation=generation,
             save=save,
@@ -362,6 +362,7 @@ class _RecorderIOSession:
                 self.shared,
                 RecorderPhase.RECORDING,
                 generation,
+                path=self.recorder.episode_path or "",
                 failure_count=self.failure_count,
             )
         except Exception as exc:
@@ -646,7 +647,7 @@ def _shutdown_episode_recorder(recorder: EpisodeRecorder) -> None:
     """Discard active work and reap any pending stop thread at process exit."""
     if recorder.is_recording:
         recorder.stop_episode(
-            success=False,
+            save=False,
             reason="recorder_process_shutdown",
         )
     if recorder.join_stop(timeout=RECORDER_STOP_TIMEOUT_S):

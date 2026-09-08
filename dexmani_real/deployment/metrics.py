@@ -36,8 +36,6 @@ class PolicyStats:
     observation_skew_ms: deque[float] = field(default_factory=_samples)
     schedule_lateness_ms: deque[float] = field(default_factory=_samples)
     publication_interval_ms: deque[float] = field(default_factory=_samples)
-    evaluation_state_build_ms: deque[float] = field(default_factory=_samples)
-    evaluation_record_ms: deque[float] = field(default_factory=_samples)
     skipped_prefix_steps: deque[int] = field(default_factory=_step_samples)
     safety_rejection_count: int = 0
     command_progress_timeout_count: int = 0
@@ -66,12 +64,6 @@ class PolicyStats:
     def observe_publication_interval_ms(self, value: float) -> None:
         self._append(self.publication_interval_ms, value)
 
-    def observe_evaluation_state_build_ms(self, value: float) -> None:
-        self._append(self.evaluation_state_build_ms, value)
-
-    def observe_evaluation_record_ms(self, value: float) -> None:
-        self._append(self.evaluation_record_ms, value)
-
     def observe_skipped_prefix_steps(self, value: int) -> None:
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError("skipped_prefix_steps must be a non-negative integer")
@@ -84,7 +76,7 @@ class PolicyStats:
         return samples[-1] if samples else None
 
     def snapshot(self) -> dict[str, int | float]:
-        """Return latest timings and the failure counts since the last report."""
+        """Return latest timings and cumulative counts for this rollout."""
         result: dict[str, int | float] = {
             "safety_rejection_count": self.safety_rejection_count,
             "command_progress_timeout_count": self.command_progress_timeout_count,
@@ -100,34 +92,20 @@ class PolicyStats:
             ("observation_skew_ms", self.observation_skew_ms),
             ("schedule_lateness_ms", self.schedule_lateness_ms),
             ("publication_interval_ms", self.publication_interval_ms),
-            ("evaluation_state_build_ms", self.evaluation_state_build_ms),
-            ("evaluation_record_ms", self.evaluation_record_ms),
             ("skipped_prefix_steps", self.skipped_prefix_steps),
         ):
             latest = self._latest(samples)
             if latest is not None:
                 result[name] = latest
-        # A rare slow evidence frame is the exact schedule-slip failure mode, so
-        # surface the window max (cheap O(256), once per flush) alongside latest.
-        for name, samples in (
-            ("evaluation_state_build_max_ms", self.evaluation_state_build_ms),
-            ("evaluation_record_max_ms", self.evaluation_record_ms),
-        ):
-            if samples:
-                result[name] = max(samples)
         return result
 
     def flush(self, *, prefix: str, debug: bool = False) -> None:
-        """Log current diagnostics and reset only interval failure counts."""
+        """Log without consuming the counts needed by the rollout result."""
         rendered = " ".join(
             f"{key}={value}" for key, value in sorted(self.snapshot().items())
         )
         log = logger.debug if debug else logger.info
         log("%s: %s", prefix, rendered)
-        self.safety_rejection_count = 0
-        self.command_progress_timeout_count = 0
-        self.ik_rejection_count = 0
-        self.stale_prediction_count = 0
 
 
 def flush_every(

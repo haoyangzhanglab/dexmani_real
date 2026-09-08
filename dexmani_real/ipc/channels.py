@@ -223,7 +223,6 @@ class RuntimeChannels:
     # Main/operator -> policy executor: formal-eval outcome wire value
     # (0 NONE, 1 SUCCESS, 2 FAILURE, 3 INVALID).  Normal deployment leaves 0.
     evaluation_outcome: Any
-    inference_request: Any  # policy executor -> inference, sync one-prediction trigger
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write
     # Serializes the motion permit and coupled-command ring writer. It is never
@@ -381,7 +380,6 @@ class RuntimeChannels:
         storage.physical_home_completed = ctx.Value("b", False)
         storage.stop_request = ctx.Value("b", False)
         storage.evaluation_outcome = ctx.Value("i", 0)
-        storage.inference_request = ctx.Event()
 
         storage.safety_state = ctx.Value("i", DISARMED_SAFETY_STATE_WIRE_VALUE)
         storage.motion_lock = ctx.RLock()

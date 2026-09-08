@@ -30,7 +30,7 @@ def first_future_step_index(
     now_ns: int,
     num_steps: int,
 ) -> int | None:
-    """Return the first action index whose logical target is not in the past."""
+    """Return the first action index whose logical target is strictly future."""
     logical_start = _require_uint64_integer(
         logical_start_ns,
         name="logical_start_ns",
@@ -46,9 +46,9 @@ def first_future_step_index(
     final_offset = (count - 1) * step_dt
     if final_offset > _UINT64_MAX or logical_start > _UINT64_MAX - final_offset:
         raise ValueError("action timeline exceeds uint64")
-    if now <= logical_start:
+    if now < logical_start:
         return 0
-    index = (now - logical_start + step_dt - 1) // step_dt
+    index = (now - logical_start) // step_dt + 1
     return int(index) if index < count else None
 
 

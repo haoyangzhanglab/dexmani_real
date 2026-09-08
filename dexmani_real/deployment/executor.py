@@ -33,16 +33,19 @@ from dexmani_real.control.publication import (
     publish_command,
 )
 from dexmani_real.control.safety_gate import SafetyGate
-from dexmani_real.deployment.config import PolicyDeploymentConfig
 from dexmani_real.deployment.evaluation import (
     EVALUATION_MAX_FRAMES_STOP_REASON,
     EvaluationOutcome,
-    PolicyEvaluationConfig,
+    RolloutRecordingConfig,
     evaluation_outcome_stop_reason,
+    write_rollout_result,
 )
 from dexmani_real.deployment.metrics import PolicyStats, flush_every
 from dexmani_real.deployment.prediction import Prediction
-from dexmani_real.deployment.timing import first_future_step_index
+from dexmani_real.deployment.timing import (
+    first_future_step_index,
+    next_periodic_deadline_ns,
+)
 from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
     read_causal_structured_frame,
@@ -71,7 +74,11 @@ from dexmani_real.planning.paths import (
     interpolate_waypoints,
     wrap_nearest_equivalent,
 )
-from dexmani_real.recording.client import RecorderClient, RecorderPhase
+from dexmani_real.recording.client import (
+    RecorderClient,
+    RecorderPhase,
+    RecorderStopResult,
+)
 from dexmani_real.recording.sample import (
     EpisodeAction,
     EpisodeState,
@@ -103,16 +110,11 @@ logger = get_logger(__name__)
 _POLICY_WORKSPACE_INTERPOLATION_MAX_STEP_RAD = 0.02
 _JOINT_ACTION_DIM = 19
 _EE_ACTION_DIM = 21
-_EVALUATION_TACTILE_MAX_AGE_NS = 250_000_000
-_EVALUATION_FRAME_OK = 0
-_EVALUATION_FRAME_HELD = 1
-_EVALUATION_FRAME_IK_FAIL = 2
-_EVALUATION_FRAME_SAFETY_REJECT = 3
-_OPERATOR_STOP_REASONS = {
-    "eval:success:operator",
-    "eval:failure:operator",
-    "eval:invalid:operator",
-}
+_RECORDING_TACTILE_MAX_AGE_NS = 250_000_000
+_RECORD_FRAME_OK = 0
+_RECORD_FRAME_HELD = 1
+_RECORD_FRAME_IK_FAIL = 2
+_RECORD_FRAME_SAFETY_REJECT = 3
 
 
 class _RejectKind(Enum):
@@ -120,39 +122,6 @@ class _RejectKind(Enum):
 
     IK = auto()
     SAFETY = auto()
-
-
-class _EvaluationEvidenceIssueKind(Enum):
-    """Typed disposition of a failed evaluation-evidence source read.
-
-    Ownership decides the caller action: control-critical failures stay
-    ``_fault``, source conditions that can become valid on a later tick are
-    retried, and the two ``*_INVALID`` members invalidate the trial without a
-    robot fault.  The invalid members carry their source domain (camera
-    evidence vs evaluation-only state assembly) so the persisted stop reason is
-    derived from the typed value, never by parsing the diagnostic reason.
-    """
-
-    RETRYABLE = auto()
-    CAMERA_INVALID = auto()
-    STATE_INVALID = auto()
-    CONTROL_FAULT = auto()
-
-
-_EVALUATION_INVALID_STOP_REASONS = {
-    _EvaluationEvidenceIssueKind.RETRYABLE: "eval:invalid:evidence_unavailable",
-    _EvaluationEvidenceIssueKind.CAMERA_INVALID: "eval:invalid:camera_evidence",
-    _EvaluationEvidenceIssueKind.STATE_INVALID: "eval:invalid:state_assembly",
-}
-
-
-@dataclass(frozen=True)
-class _EvaluationFrameInputs:
-    """One causal, post-RUNNING recorder input assembled by PolicyExecutor."""
-
-    state: EpisodeState
-    camera_frame: dict[str, Any]
-    signals: dict[str, Any]
 
 
 @dataclass
@@ -247,24 +216,6 @@ class _CommandProgress:
             if previous_latest is None or accepted >= previous_latest:
                 setattr(self, f"{worker}_last_progress_ns", published_ns)
         self.latest_published_action_id = action_id
-
-    def covers(self, action_id: int) -> bool:
-        return bool(
-            self.arm_accepted_action_id is not None
-            and self.hand_accepted_action_id is not None
-            and self.arm_accepted_action_id >= action_id
-            and self.hand_accepted_action_id >= action_id
-        )
-
-
-@dataclass
-class _PendingEvaluationTermination:
-    """Acceptance-fenced INVALID that waits for one outstanding published action."""
-
-    reason: str
-    stop_reason: str
-    recorder_save: bool
-    wait_for_action_id: int
 
 
 def prediction_from_record(record: np.void) -> Prediction:
@@ -571,33 +522,30 @@ class PolicyExecutor:
         shared: RuntimeChannels,
         runtime: ExperimentConfig,
         policy_spec: Any,
-        deployment: PolicyDeploymentConfig,
         *,
         execute: bool,
         max_running_s: float | None,
-        evaluation_config: PolicyEvaluationConfig | None = None,
+        evaluation_config: RolloutRecordingConfig | None = None,
     ) -> None:
         self.shared = shared
         self.runtime = runtime
         self.policy_spec = policy_spec
-        self.deployment = deployment
         self.execute = execute
         self.max_running_s = max_running_s
         if evaluation_config is not None:
-            if not isinstance(evaluation_config, PolicyEvaluationConfig):
-                raise TypeError("evaluation_config must be a PolicyEvaluationConfig")
+            if not isinstance(evaluation_config, RolloutRecordingConfig):
+                raise TypeError("evaluation_config must be a RolloutRecordingConfig")
             if not execute:
                 raise ValueError("formal policy evaluation requires execute=True")
             if self.max_running_s != evaluation_config.max_running_s:
                 raise ValueError("formal evaluation timeout must match max_running_s")
-        self.evaluation_config = evaluation_config
+        self.recording_config = evaluation_config
         self.recorder = (
             RecorderClient(shared) if evaluation_config is not None else None
         )
-        self.evaluation_hand_fk: HandKinematics | None = None
-        self.evaluation_initial_sample_pending = False
-        self.evaluation_initial_deadline_ns: int | None = None
-        self.sync_mode = deployment.inference_mode == "sync"
+        self.last_recorded_action: EpisodeAction | None = None
+        self.next_record_ns = 0
+        self.recording_hand_fk: HandKinematics | None = None
         self.control_period_s = 1.0 / float(runtime.policy.control_hz)
         self.step_dt_ns = int(round(self.control_period_s * 1e9))
         self.first_command_timeout_ns = int(
@@ -634,8 +582,8 @@ class PolicyExecutor:
         self.previous_arm_command_qpos: np.ndarray | None = None
         self.previous_hand_command_qpos: np.ndarray | None = None
         self.episode_steps = 0
-        self.pending_truncation_action_id: int | None = None
-        self.pending_evaluation_termination: _PendingEvaluationTermination | None = None
+        self.rollout_started = False
+        self.rollout_result = None
         self.last_metrics_flush_ns = time.monotonic_ns()
 
     def _clear_execution(self, generation: int | None) -> None:
@@ -649,22 +597,21 @@ class PolicyExecutor:
         self.last_valid_command_ns = None
         self.previous_arm_command_qpos = None
         self.previous_hand_command_qpos = None
-        self.pending_truncation_action_id = None
-        self.pending_evaluation_termination = None
-        self.evaluation_initial_sample_pending = False
-        self.evaluation_initial_deadline_ns = None
+        self.last_recorded_action = None
         self.progress.reset(generation)
-        if self.sync_mode:
-            self.shared.inference_request.clear()
 
     def _finish_episode(
         self,
         reason: str,
         *,
         aborted: bool = True,
-        evaluation_stop_reason: str | None = None,
+        stop_reason: str = "executor_boundary",
+        outcome: EvaluationOutcome = EvaluationOutcome.INVALID,
         recorder_save: bool = True,
     ) -> None:
+        if self.run_started_ns is None:
+            return
+        metrics = self.stats.snapshot()
         _end_policy_run(
             self.shared,
             reason,
@@ -672,133 +619,56 @@ class PolicyExecutor:
             aborted=aborted,
         )
         if self.recorder is not None:
-            self.shared.is_recording.value = False
+            self.rollout_result = dict(
+                outcome=outcome,
+                stop_reason=stop_reason,
+                duration_s=max(0.0, (time.monotonic_ns() - self.run_started_ns) / 1e9),
+                metrics=metrics,
+            )
             self.recorder.stop_episode(
-                success=recorder_save,
-                reason=(
-                    evaluation_stop_reason
-                    if evaluation_stop_reason is not None
-                    else "eval:invalid:executor_boundary"
-                ),
+                save=recorder_save,
+                reason=stop_reason,
             )
         self.run_started_ns = None
         self._clear_execution(None)
 
-    def _sticky_recorder_save(self, proposed: bool) -> bool:
-        """Never upgrade an already-unsound storage decision back to save=True."""
-        pending = self.pending_evaluation_termination
-        if pending is not None and not pending.recorder_save:
-            return False
-        return proposed
-
-    def _finish_evaluation_episode(
-        self,
-        reason: str,
-        *,
-        stop_reason: str,
-        recorder_save: bool = True,
-        aborted: bool = False,
-    ) -> None:
-        """Fence a formal trial before asynchronously finalizing its recorder.
-
-        A pending automatic INVALID keeps its classification against a later
-        operator stop, and an unsound storage decision stays sticky.
-        """
-        pending = self.pending_evaluation_termination
-        if pending is not None:
-            recorder_save = self._sticky_recorder_save(recorder_save)
-            if stop_reason in _OPERATOR_STOP_REASONS:
-                stop_reason = pending.stop_reason
-        self._finish_episode(
-            reason,
-            aborted=aborted,
-            evaluation_stop_reason=stop_reason,
-            recorder_save=recorder_save,
-        )
-
-    def _request_evaluation_invalid(
-        self,
-        reason: str,
-        *,
-        stop_reason: str,
-        recorder_save: bool,
-        wait_for_action_id: int | None = None,
+    def _invalidate_rollout(
+        self, reason: str, *, stop_reason: str, recorder_save: bool
     ) -> bool:
-        """End a formal trial as INVALID, fenced on any outstanding published action.
-
-        Returns ``True`` when the episode finished now and ``False`` when the
-        request latched into ``pending_evaluation_termination`` while the
-        outstanding command is still awaiting arm+hand acceptance.  Never raises a
-        robot runtime fault; recorder-integrity ``save=False`` stays sticky.
-        """
-        if self.run_started_ns is None:
-            return True
-        pending = self.pending_evaluation_termination
-        if pending is not None:
-            if pending.recorder_save and not recorder_save:
-                self.pending_evaluation_termination = _PendingEvaluationTermination(
-                    reason=reason,
-                    stop_reason=stop_reason,
-                    recorder_save=False,
-                    wait_for_action_id=pending.wait_for_action_id,
-                )
-            return False
-        if wait_for_action_id is None or self.progress.covers(wait_for_action_id):
-            self._finish_evaluation_episode(
+        if self.run_started_ns is not None:
+            self._finish_episode(
                 reason,
                 stop_reason=stop_reason,
                 recorder_save=recorder_save,
                 aborted=True,
             )
-            return True
-        self.pending_evaluation_termination = _PendingEvaluationTermination(
-            reason=reason,
-            stop_reason=stop_reason,
-            recorder_save=recorder_save,
-            wait_for_action_id=wait_for_action_id,
-        )
-        return False
-
-    def _drain_pending_evaluation_termination(self) -> bool:
-        """Finish the latched INVALID once acceptance covers its action, else keep RUNNING."""
-        pending = self.pending_evaluation_termination
-        if pending is None:
-            return False
-        if self.progress.covers(pending.wait_for_action_id):
-            self._finish_evaluation_episode(
-                pending.reason,
-                stop_reason=pending.stop_reason,
-                recorder_save=pending.recorder_save,
-                aborted=True,
-            )
-            return True
-        return False
+        return True
 
     def _fault(
         self,
         reason: str,
         *,
-        evaluation_stop_reason: str = "eval:invalid:hardware_fault",
+        stop_reason: str = "eval:invalid:hardware_fault",
         recorder_save: bool | None = None,
     ) -> None:
         self.shared.error_state.value = True
         self.shared.physical_home_completed.value = False
         revoke_motion(self.shared, SafetyState.FAULT)
-        if self.recorder is not None:
-            self.shared.is_recording.value = False
-            if recorder_save is None:
-                recorder_save = not self.evaluation_initial_sample_pending
-            self.recorder.stop_episode(
-                success=self._sticky_recorder_save(recorder_save),
-                reason=evaluation_stop_reason,
+        if self.run_started_ns is not None:
+            self._finish_episode(
+                reason,
+                stop_reason=stop_reason,
+                recorder_save=True if recorder_save is None else recorder_save,
             )
+        elif self.recorder is not None and self.recorder.is_recording:
+            self.recorder.stop_episode(save=False, reason=stop_reason)
         self.stats.flush(prefix="executor metrics")
         logger.critical("executor: runtime fault: %s", reason)
         self.run_started_ns = None
         self._clear_execution(None)
 
     @staticmethod
-    def _evaluation_vr_sentinel() -> dict[str, np.ndarray]:
+    def _recording_vr_sentinel() -> dict[str, np.ndarray]:
         """Return the existing raw-schema sentinel for a non-VR rollout."""
         return {
             "wrist_pos": np.full(3, np.nan),
@@ -806,346 +676,17 @@ class PolicyExecutor:
             "landmarks": np.full((21, 3), np.nan),
         }
 
-    def _evaluation_hand_kinematics(self) -> HandKinematics:
-        if self.evaluation_hand_fk is None:
-            self.evaluation_hand_fk = HandKinematics(
+    def _recording_hand_kinematics(self) -> HandKinematics:
+        if self.recording_hand_fk is None:
+            self.recording_hand_fk = HandKinematics(
                 str(XHAND_RIGHT_URDF_PATH),
                 list(self.runtime.hand.fingertip_link_names),
             )
-        return self.evaluation_hand_fk
+        return self.recording_hand_fk
 
-    def _build_evaluation_frame_inputs(
-        self,
-        anchor_ns: int,
-    ) -> tuple[_EvaluationFrameInputs | None, str, _EvaluationEvidenceIssueKind | None]:
-        """Select a causal post-RUNNING state/camera cut for recorder evidence.
-
-        Returns ``(inputs, reason, issue_kind)``.  ``issue_kind`` is ``None`` on
-        success and otherwise names the ownership of the failure: control-critical
-        feedback faults, retryable source-availability gaps, or evaluation-only
-        audit-integrity failures.
-        """
-        if self.run_started_ns is None:
-            return (
-                None,
-                "hardware: no active RUNNING epoch",
-                _EvaluationEvidenceIssueKind.CONTROL_FAULT,
-            )
-        try:
-            arm_result = read_causal_structured_frame(
-                self.shared.arm_state_ring,
-                source_field="source_monotonic_ns",
-                anchor_monotonic_ns=anchor_ns,
-            )
-            hand_result = read_causal_structured_frame(
-                self.shared.hand_state_ring,
-                source_field="source_monotonic_ns",
-                anchor_monotonic_ns=anchor_ns,
-            )
-        except Exception as exc:
-            return (
-                None,
-                f"hardware: causal feedback read failed ({type(exc).__name__})",
-                _EvaluationEvidenceIssueKind.CONTROL_FAULT,
-            )
-        if arm_result is None or hand_result is None:
-            return (
-                None,
-                "hardware: waiting for causal arm/hand feedback",
-                _EvaluationEvidenceIssueKind.RETRYABLE,
-            )
-
-        arm_state, arm_publish_ns, arm_sequence = arm_result
-        hand_state, hand_publish_ns, hand_sequence = hand_result
-        arm = arm_state[0]
-        hand = hand_state[0]
-        arm_source_ns = int(arm["source_monotonic_ns"])
-        hand_source_ns = int(hand["source_monotonic_ns"])
-        if arm_source_ns < self.run_started_ns or hand_source_ns < self.run_started_ns:
-            return (
-                None,
-                "hardware: waiting for post-RUNNING arm/hand feedback",
-                _EvaluationEvidenceIssueKind.RETRYABLE,
-            )
-        try:
-            arm_issue = diagnose_arm_feedback(
-                connected=bool(arm["connected"]),
-                error_code=int(arm["error_code"]),
-                state_valid=bool(arm["state_valid"]),
-                source_monotonic_ns=arm_source_ns,
-                now_monotonic_ns=anchor_ns,
-                max_age_s=float(self.runtime.safety.heartbeat_timeouts["arm"]),
-                qpos=np.asarray(arm["qpos"], dtype=np.float64),
-                qvel=np.asarray(arm["qvel"], dtype=np.float64),
-            )
-            hand_issue = diagnose_hand_feedback(
-                connected=bool(hand["connected"]),
-                state_valid=bool(hand["state_valid"]),
-                source_monotonic_ns=hand_source_ns,
-                now_monotonic_ns=anchor_ns,
-                max_age_s=float(self.runtime.safety.heartbeat_timeouts["hand"]),
-                qpos=np.asarray(hand["qpos"], dtype=np.float64),
-            )
-        except Exception as exc:
-            return (
-                None,
-                f"hardware: malformed feedback ({type(exc).__name__})",
-                _EvaluationEvidenceIssueKind.CONTROL_FAULT,
-            )
-        if arm_issue is not None:
-            return (
-                None,
-                f"hardware: arm feedback unhealthy ({arm_issue.detail})",
-                (
-                    _EvaluationEvidenceIssueKind.CONTROL_FAULT
-                    if arm_issue.code is not FeedbackIssueCode.STALE
-                    else _EvaluationEvidenceIssueKind.RETRYABLE
-                ),
-            )
-        if hand_issue is not None:
-            return (
-                None,
-                f"hardware: hand feedback unhealthy ({hand_issue.detail})",
-                (
-                    _EvaluationEvidenceIssueKind.CONTROL_FAULT
-                    if hand_issue.code is not FeedbackIssueCode.STALE
-                    else _EvaluationEvidenceIssueKind.RETRYABLE
-                ),
-            )
-
-        try:
-            camera_frame = read_camera_frame_causal(
-                self.shared,
-                anchor_monotonic_ns=anchor_ns,
-            )
-        except Exception as exc:
-            return (
-                None,
-                f"camera: causal read failed ({type(exc).__name__})",
-                _EvaluationEvidenceIssueKind.CAMERA_INVALID,
-            )
-        if camera_frame is None:
-            return (
-                None,
-                "camera: waiting for causal RGB-D evidence",
-                _EvaluationEvidenceIssueKind.RETRYABLE,
-            )
-        camera_source_ns = int(camera_frame.get("source_monotonic_ns", 0))
-        if camera_source_ns < self.run_started_ns:
-            return (
-                None,
-                "camera: waiting for post-RUNNING RGB-D evidence",
-                _EvaluationEvidenceIssueKind.RETRYABLE,
-            )
-        camera_age_s = (anchor_ns - camera_source_ns) / 1e9
-        if camera_age_s < 0.0:
-            return (
-                None,
-                "camera: source timestamp is in the future",
-                _EvaluationEvidenceIssueKind.RETRYABLE,
-            )
-        if camera_age_s > float(self.runtime.camera.max_frame_age_s):
-            return (
-                None,
-                "camera: RGB-D evidence is stale",
-                _EvaluationEvidenceIssueKind.RETRYABLE,
-            )
-        try:
-            camera_health = CameraHealth(int(camera_frame.get("camera_health", -1)))
-        except ValueError:
-            return (
-                None,
-                "camera: health enum is invalid",
-                _EvaluationEvidenceIssueKind.CAMERA_INVALID,
-            )
-        if camera_health is not CameraHealth.OK:
-            return (
-                None,
-                f"camera: health={camera_health.name}",
-                _EvaluationEvidenceIssueKind.CAMERA_INVALID,
-            )
-        if bool(camera_frame.get("clock_reset", False)) or bool(
-            camera_frame.get("duplicate", False)
-        ):
-            return (
-                None,
-                "camera: reset or duplicate frame",
-                _EvaluationEvidenceIssueKind.RETRYABLE,
-            )
-        for field_name in (
-            "camera_generation",
-            "receive_monotonic_ns",
-            "publish_monotonic_ns",
-            "wait_return_monotonic_ns",
-            "payload_ready_monotonic_ns",
-        ):
-            if int(camera_frame.get(field_name, 0)) <= 0:
-                return (
-                    None,
-                    f"camera: missing {field_name}",
-                    _EvaluationEvidenceIssueKind.CAMERA_INVALID,
-                )
-        valid_depth_ratio = float(camera_frame.get("valid_depth_ratio", np.nan))
-        if not np.isfinite(valid_depth_ratio) or not 0.0 <= valid_depth_ratio <= 1.0:
-            return (
-                None,
-                "camera: valid depth ratio is invalid",
-                _EvaluationEvidenceIssueKind.CAMERA_INVALID,
-            )
-        for field_name in (
-            "backlog_s",
-            "delivery_delay_above_floor_s",
-            "depth_device_timestamp_s",
-            "color_device_timestamp_s",
-        ):
-            value = float(camera_frame.get(field_name, np.nan))
-            if not np.isfinite(value) or value < 0.0:
-                return (
-                    None,
-                    f"camera: {field_name} is invalid",
-                    _EvaluationEvidenceIssueKind.CAMERA_INVALID,
-                )
-        camera_frame = dict(camera_frame)
-        camera_frame["camera_age_s"] = camera_age_s
-        camera_frame["camera_fresh"] = True
-
-        tactile_state: np.ndarray | None = None
-        tactile_fresh = False
-        tactile_source_ns = 0
-        tactile_calibrated = False
-        tactile_unit_code = 0
-        try:
-            tactile_result = read_causal_structured_frame(
-                self.shared.hand_tactile_ring,
-                source_field="source_monotonic_ns",
-                anchor_monotonic_ns=anchor_ns,
-            )
-        except Exception:
-            tactile_result = None
-        if tactile_result is not None:
-            candidate_tactile, _tactile_publish_ns, _tactile_sequence = tactile_result
-            tactile = candidate_tactile[0]
-            tactile_source_ns = int(tactile["source_monotonic_ns"])
-            tactile_calibrated = bool(tactile["calibrated"])
-            tactile_unit_code = int(tactile["unit_code"])
-            tactile_fresh = bool(
-                bool(tactile["fresh"])
-                and 0 < tactile_source_ns <= anchor_ns
-                and anchor_ns - tactile_source_ns <= _EVALUATION_TACTILE_MAX_AGE_NS
-                and np.all(
-                    np.isfinite(np.asarray(tactile["tactile_force"], dtype=np.float64))
-                )
-            )
-            if tactile_fresh:
-                tactile_state = candidate_tactile
-
-        try:
-            hand_fk = self._evaluation_hand_kinematics()
-            if not hand_fk.is_ready():
-                return (
-                    None,
-                    "hardware: fingertip kinematics is unavailable",
-                    _EvaluationEvidenceIssueKind.STATE_INVALID,
-                )
-            state = build_episode_state(
-                arm_state,
-                hand_state,
-                tactile_state,
-                hand_fk=hand_fk,
-                handbase_position_eef_m=np.asarray(
-                    self.runtime.hand.T_eef_handbase_pos_xyz,
-                    dtype=np.float64,
-                ),
-                handbase_quat_eef_wxyz=np.asarray(
-                    self.runtime.hand.T_eef_handbase_quat_wxyz,
-                    dtype=np.float64,
-                ),
-                timestamp_s=anchor_ns / 1e9,
-            )
-        except Exception as exc:
-            return (
-                None,
-                f"hardware: state assembly failed ({type(exc).__name__})",
-                _EvaluationEvidenceIssueKind.STATE_INVALID,
-            )
-        for field_name in (
-            "arm_qpos",
-            "arm_qvel",
-            "arm_tau",
-            "eef_pos",
-            "eef_rot6d",
-            "hand_qpos",
-            "hand_current",
-            "hand_tactile_sum",
-            "hand_tactile_force",
-            "fingertip_pos",
-        ):
-            if not np.all(np.isfinite(np.asarray(getattr(state, field_name)))):
-                return (
-                    None,
-                    f"hardware: {field_name} is non-finite",
-                    _EvaluationEvidenceIssueKind.STATE_INVALID,
-                )
-
-        source_ns = np.array(
-            [arm_source_ns, hand_source_ns, 0, camera_source_ns],
-            dtype=np.uint64,
-        )
-        receive_ns = np.array(
-            [
-                int(arm_publish_ns),
-                int(hand_publish_ns),
-                0,
-                int(camera_frame["receive_monotonic_ns"]),
-            ],
-            dtype=np.uint64,
-        )
-        source_valid = np.array([True, True, False, True], dtype=bool)
-        source_ages_s = np.full(4, np.nan, dtype=np.float64)
-        source_ages_s[source_valid] = (
-            anchor_ns - source_ns[source_valid].astype(np.int64)
-        ) / 1e9
-        source_skew_s = np.full(4, np.nan, dtype=np.float64)
-        newest_source_ns = int(np.max(source_ns[source_valid]))
-        source_skew_s[source_valid] = (
-            newest_source_ns - source_ns[source_valid].astype(np.int64)
-        ) / 1e9
-        signals = {
-            "observation_id": anchor_ns,
-            "observation_anchor_monotonic_ns": anchor_ns,
-            "arm_source_sequence": int(arm_sequence),
-            "hand_source_sequence": int(hand_sequence),
-            "vr_source_sequence": 0,
-            "camera_source_sequence": int(camera_frame["ring_sequence"]),
-            "arm_source_monotonic_ns": arm_source_ns,
-            "hand_source_monotonic_ns": hand_source_ns,
-            "vr_source_monotonic_ns": 0,
-            "camera_source_monotonic_ns": camera_source_ns,
-            "arm_publish_monotonic_ns": int(arm_publish_ns),
-            "hand_publish_monotonic_ns": int(hand_publish_ns),
-            "vr_publish_monotonic_ns": 0,
-            "camera_publish_monotonic_ns": int(camera_frame["publish_monotonic_ns"]),
-            "observation_source_receive_monotonic_ns": receive_ns,
-            "observation_source_age_s": source_ages_s,
-            "observation_source_skew_s": source_skew_s,
-            "observation_history_valid_mask": source_valid[:, None],
-            # The raw recording observation includes VR provenance.  Policy
-            # observation provenance has separate camera-aligned semantics, so
-            # state-only evaluation keeps both contracts explicitly invalid.
-            "observation_valid": False,
-            "observation_skew_s": float(np.nanmax(source_skew_s, initial=0.0)),
-            "policy_observation_valid": False,
-            "policy_observation_skew_s": np.nan,
-            "hand_accepted_target_action_id": int(hand["accepted_target_action_id"]),
-            "tactile_fresh": tactile_fresh,
-            "tactile_source_monotonic_ns": tactile_source_ns,
-            "tactile_calibrated": tactile_calibrated,
-            "tactile_unit_code": tactile_unit_code,
-            "pointcloud_valid_depth_ratio": valid_depth_ratio,
-        }
-        return _EvaluationFrameInputs(state, camera_frame, signals), "", None
-
-    def _evaluation_hold_action(self, state: EpisodeState) -> EpisodeAction:
+    def _recorded_hold_action(self, state: EpisodeState) -> EpisodeAction:
+        if self.last_recorded_action is not None:
+            return self.last_recorded_action
         return EpisodeAction(
             arm_qpos_cmd=np.asarray(state.arm_qpos, dtype=np.float64),
             hand_qpos_cmd=np.asarray(state.hand_qpos, dtype=np.float64),
@@ -1153,7 +694,7 @@ class PolicyExecutor:
             target_eef_rot6d=np.asarray(state.eef_rot6d, dtype=np.float64),
         )
 
-    def _evaluation_action_from_command(
+    def _recorded_action_from_command(
         self,
         *,
         arm_qpos: np.ndarray,
@@ -1174,9 +715,9 @@ class PolicyExecutor:
             target_eef_rot6d=np.asarray(target_eef_rot6d, dtype=np.float64),
         )
 
-    def _record_evaluation_frame(
+    def _record_frame(
         self,
-        inputs: _EvaluationFrameInputs,
+        inputs: tuple[EpisodeState, dict, dict],
         action: EpisodeAction,
         *,
         signals: dict[str, Any],
@@ -1187,11 +728,11 @@ class PolicyExecutor:
             return False
         try:
             return self.recorder.add_frame(
-                inputs.state,
+                inputs[0],
                 action,
-                self._evaluation_vr_sentinel(),
-                camera_frame=inputs.camera_frame,
-                signals={**inputs.signals, **signals},
+                self._recording_vr_sentinel(),
+                camera_frame=inputs[1],
+                signals={**inputs[2], **signals},
                 arm_qpos_sent=arm_qpos_sent,
                 diagnostics=diagnostics,
                 control_run_generation=self.run_generation,
@@ -1202,79 +743,21 @@ class PolicyExecutor:
             )
             return False
 
-    def _record_initial_evaluation_sample(self, now_ns: int) -> bool:
-        build_start_ns = time.monotonic_ns()
-        inputs, reason, issue_kind = self._build_evaluation_frame_inputs(now_ns)
-        self.stats.observe_evaluation_state_build_ms(
-            (time.monotonic_ns() - build_start_ns) / 1e6
-        )
-        if inputs is None:
-            deadline_ns = self.evaluation_initial_deadline_ns
-            if issue_kind is _EvaluationEvidenceIssueKind.CONTROL_FAULT:
-                self._fault(reason)
-            elif issue_kind in (
-                _EvaluationEvidenceIssueKind.CAMERA_INVALID,
-                _EvaluationEvidenceIssueKind.STATE_INVALID,
-            ):
-                self._request_evaluation_invalid(
-                    reason,
-                    stop_reason=_EVALUATION_INVALID_STOP_REASONS[issue_kind],
-                    recorder_save=False,
-                )
-            elif deadline_ns is not None and now_ns >= deadline_ns:
-                self._finish_evaluation_episode(
-                    "initial evaluation evidence timeout",
-                    stop_reason="eval:invalid:initial_evidence_timeout",
-                    recorder_save=False,
-                    aborted=True,
-                )
-            return False
-        action = self._evaluation_hold_action(inputs.state)
-        record_start_ns = time.monotonic_ns()
-        recorded = self._record_evaluation_frame(
-            inputs,
-            action,
-            signals={
-                "action_queued": False,
-                "ik_attempted": False,
-                "ik_ok": False,
-                "retarget_ok": False,
-                "held": True,
-                "flag_safety_reject": False,
-                "frame_status": _EVALUATION_FRAME_HELD,
-            },
-        )
-        self.stats.observe_evaluation_record_ms(
-            (time.monotonic_ns() - record_start_ns) / 1e6
-        )
-        if not recorded:
-            self._request_evaluation_invalid(
-                "evaluation initial sample could not enter RecorderIO",
-                stop_reason="eval:invalid:recorder_fault",
-                recorder_save=False,
-            )
-            return False
-        self.evaluation_initial_sample_pending = False
-        self.evaluation_initial_deadline_ns = None
-        if self.sync_mode:
-            self.shared.inference_request.set()
-        return True
-
-    def _poll_evaluation_recorder(self) -> bool:
+    def _poll_recorder(self) -> bool:
         if self.recorder is None:
             return True
         was_stop_pending = self.recorder.stop_pending
         try:
             result = self.recorder.poll_stop()
         except Exception:
-            finished = self._request_evaluation_invalid(
+            finished = self._invalidate_rollout(
                 "RecorderIO status polling failed",
                 stop_reason="eval:invalid:recorder_fault",
                 recorder_save=False,
-                wait_for_action_id=self.progress.latest_published_action_id,
             )
             return not finished
-        if result.phase is RecorderPhase.ERROR or (result.done and result.error):
+        ended = False
+        if result.phase is RecorderPhase.ERROR or result.error:
             if (
                 self.run_started_ns is None
                 and not was_stop_pending
@@ -1285,33 +768,66 @@ class PolicyExecutor:
                     result.error or "unknown error",
                 )
                 return True
-            finished = self._request_evaluation_invalid(
+            ended = self._invalidate_rollout(
                 f"RecorderIO failed: {result.error or 'unknown error'}",
                 stop_reason="eval:invalid:recorder_fault",
                 recorder_save=False,
-                wait_for_action_id=self.progress.latest_published_action_id,
             )
-            return not finished
-        if result.phase is RecorderPhase.FINALIZING and self.run_started_ns is not None:
+        elif (
+            result.phase is RecorderPhase.FINALIZING and self.run_started_ns is not None
+        ):
             if result.reason == EVALUATION_MAX_FRAMES_STOP_REASON:
-                finished = self._request_evaluation_invalid(
+                ended = self._invalidate_rollout(
                     "RecorderIO reached its formal-eval frame capacity",
                     stop_reason=EVALUATION_MAX_FRAMES_STOP_REASON,
                     recorder_save=True,
-                    wait_for_action_id=self.progress.latest_published_action_id,
                 )
             else:
-                finished = self._request_evaluation_invalid(
+                ended = self._invalidate_rollout(
                     "RecorderIO finalized unexpectedly: "
                     f"{result.reason or 'unknown reason'}",
                     stop_reason="eval:invalid:recorder_fault",
                     recorder_save=False,
-                    wait_for_action_id=self.progress.latest_published_action_id,
                 )
-            return not finished
-        return True
+        elif result.done and self.run_started_ns is not None:
+            ended = self._invalidate_rollout(
+                "RecorderIO completed before rollout stopped",
+                stop_reason="eval:invalid:recorder_fault",
+                recorder_save=False,
+            )
+        if result.done:
+            self._complete_recording(result)
+        return not ended
 
-    def _evaluation_raw_action_parts(
+    def _complete_recording(self, result: RecorderStopResult) -> None:
+        """Consume terminal storage status once, after the motion fence."""
+        if self.rollout_result is None:
+            self.shared.is_recording.value = False
+            return
+        if result.error or not result.saved:
+            self.rollout_result.update(
+                outcome=EvaluationOutcome.INVALID, stop_reason="recording_failure"
+            )
+        try:
+            episode_path = result.path or self.recorder.episode_path
+            if episode_path is None:
+                raise RuntimeError("Recorder returned no episode path")
+            path = write_rollout_result(
+                self.recording_config,
+                episode_path,
+                saved=result.saved,
+                **self.rollout_result,
+            )
+            logger.info("rollout result: %s", path)
+        except Exception:
+            logger.error(
+                "rollout INVALID: result metadata could not be saved", exc_info=True
+            )
+        finally:
+            self.shared.is_recording.value = False
+            self.rollout_result = None
+
+    def _recorded_raw_action_parts(
         self,
         raw_action: np.ndarray,
         *,
@@ -1330,22 +846,22 @@ class PolicyExecutor:
             raw_hand = np.asarray(fallback_action.hand_qpos_cmd, dtype=np.float64)
         return raw_arm, raw_hand
 
-    def _record_evaluation_rejection(
+    def _record_rejection(
         self,
-        inputs: _EvaluationFrameInputs,
+        inputs: tuple[EpisodeState, dict, dict],
         raw_action: np.ndarray,
         *,
         ik_attempted: bool,
         ik_ok: bool,
         kind: _RejectKind,
     ) -> bool:
-        action = self._evaluation_hold_action(inputs.state)
-        raw_arm, raw_hand = self._evaluation_raw_action_parts(
+        action = self._recorded_hold_action(inputs[0])
+        raw_arm, raw_hand = self._recorded_raw_action_parts(
             raw_action,
             fallback_action=action,
         )
         safety_reject = kind is _RejectKind.SAFETY
-        return self._record_evaluation_frame(
+        return self._record_frame(
             inputs,
             action,
             signals={
@@ -1356,25 +872,25 @@ class PolicyExecutor:
                 "held": True,
                 "flag_safety_reject": safety_reject,
                 "frame_status": (
-                    _EVALUATION_FRAME_SAFETY_REJECT
+                    _RECORD_FRAME_SAFETY_REJECT
                     if safety_reject
-                    else _EVALUATION_FRAME_IK_FAIL
+                    else _RECORD_FRAME_IK_FAIL
                 ),
                 "action_arm_joint_raw": raw_arm,
             },
             diagnostics={"action_hand_joint_raw": raw_hand},
         )
 
-    def _record_evaluation_command(
+    def _record_command(
         self,
-        inputs: _EvaluationFrameInputs,
+        inputs: tuple[EpisodeState, dict, dict],
         candidate: ActionCandidate,
         raw_action: np.ndarray,
     ) -> bool:
         assert candidate.arm_qpos is not None
         assert candidate.hand_qpos is not None
         try:
-            action = self._evaluation_action_from_command(
+            action = self._recorded_action_from_command(
                 arm_qpos=candidate.arm_qpos,
                 hand_qpos=candidate.hand_qpos,
                 raw_action=raw_action,
@@ -1384,12 +900,13 @@ class PolicyExecutor:
                 "executor: failed to build evaluation action record", exc_info=True
             )
             return False
-        raw_arm, raw_hand = self._evaluation_raw_action_parts(
+        raw_arm, raw_hand = self._recorded_raw_action_parts(
             raw_action,
             fallback_action=action,
         )
         is_ee_action = self.policy_spec.action_key == "action_ee"
-        return self._record_evaluation_frame(
+        self.last_recorded_action = action
+        return self._record_frame(
             inputs,
             action,
             signals={
@@ -1403,105 +920,183 @@ class PolicyExecutor:
                 "retarget_ok": False,
                 "held": False,
                 "flag_safety_reject": False,
-                "frame_status": _EVALUATION_FRAME_OK,
+                "frame_status": _RECORD_FRAME_OK,
                 "action_arm_joint_raw": raw_arm,
             },
             diagnostics={"action_hand_joint_raw": raw_hand},
             arm_qpos_sent=candidate.arm_qpos,
         )
 
-    def _record_evaluation_command_evidence(
+    def _record_rollout_tick(
         self,
-        raw_action: np.ndarray,
-        candidate: ActionCandidate,
+        now_ns: int,
         *,
-        anchor_ns: int,
+        candidate: ActionCandidate | None = None,
+        raw_action: np.ndarray | None = None,
+        reject_kind: _RejectKind | None = None,
     ) -> None:
-        """Record a successful command's evidence after control has committed."""
-        if self.recorder is None:
-            return
-        build_start_ns = time.monotonic_ns()
-        inputs, source_reason, issue_kind = self._build_evaluation_frame_inputs(
-            anchor_ns
-        )
-        self.stats.observe_evaluation_state_build_ms(
-            (time.monotonic_ns() - build_start_ns) / 1e6
-        )
-        if inputs is None:
-            if issue_kind is _EvaluationEvidenceIssueKind.CONTROL_FAULT:
-                self._fault(source_reason)
-            else:
-                self._request_evaluation_invalid(
-                    source_reason,
-                    stop_reason=_EVALUATION_INVALID_STOP_REASONS[issue_kind],
-                    recorder_save=True,
-                    wait_for_action_id=candidate.action_id,
-                )
-            return
-        record_start_ns = time.monotonic_ns()
-        recorded = self._record_evaluation_command(inputs, candidate, raw_action)
-        self.stats.observe_evaluation_record_ms(
-            (time.monotonic_ns() - record_start_ns) / 1e6
-        )
-        if not recorded:
-            self._request_evaluation_invalid(
-                "evaluation command sample could not enter RecorderIO",
-                stop_reason="eval:invalid:recorder_fault",
-                recorder_save=False,
-                wait_for_action_id=candidate.action_id,
-            )
+        """Record a completed control decision, or an ordinary idle grid sample.
 
-    def _record_evaluation_rejection_evidence(
-        self,
-        raw_action: np.ndarray,
-        *,
-        kind: _RejectKind,
-        ik_attempted: bool,
-        ik_ok: bool,
-        anchor_ns: int,
-    ) -> None:
-        """Record a rejected step's evidence after its control slot is committed."""
-        if self.recorder is None:
+        Command rows are observed immediately so S/Q cannot lose an already
+        published command in a second event buffer. The recorder owns raw-grid
+        alignment; no source read here admits or rejects a robot command.
+        """
+        if self.recorder is None or self.run_started_ns is None:
             return
-        build_start_ns = time.monotonic_ns()
-        inputs, source_reason, issue_kind = self._build_evaluation_frame_inputs(
-            anchor_ns
+        if raw_action is None and now_ns < self.next_record_ns:
+            return
+        self.next_record_ns = next_periodic_deadline_ns(
+            self.next_record_ns, self.step_dt_ns, now_ns
         )
-        self.stats.observe_evaluation_state_build_ms(
-            (time.monotonic_ns() - build_start_ns) / 1e6
-        )
-        if inputs is None:
-            if issue_kind is _EvaluationEvidenceIssueKind.CONTROL_FAULT:
-                self._fault(source_reason)
-            else:
-                self._request_evaluation_invalid(
-                    source_reason,
-                    stop_reason=_EVALUATION_INVALID_STOP_REASONS[issue_kind],
-                    recorder_save=True,
-                    wait_for_action_id=self.progress.latest_published_action_id,
+        try:
+            sources = {}
+            for name, ring in (
+                ("arm", self.shared.arm_state_ring),
+                ("hand", self.shared.hand_state_ring),
+                ("tactile", self.shared.hand_tactile_ring),
+            ):
+                sources[name] = read_causal_structured_frame(
+                    ring, source_field="source_monotonic_ns", anchor_monotonic_ns=now_ns
                 )
-            return
-        record_start_ns = time.monotonic_ns()
-        recorded = self._record_evaluation_rejection(
-            inputs,
-            raw_action,
-            ik_attempted=ik_attempted,
-            ik_ok=ik_ok,
-            kind=kind,
-        )
-        self.stats.observe_evaluation_record_ms(
-            (time.monotonic_ns() - record_start_ns) / 1e6
-        )
-        if not recorded:
-            self._request_evaluation_invalid(
-                "evaluation rejection sample could not enter RecorderIO",
-                stop_reason="eval:invalid:recorder_fault",
+            if sources["arm"] is None or sources["hand"] is None:
+                raise RuntimeError("recording arm/hand feedback unavailable")
+            arm, arm_publish_ns, arm_sequence = sources["arm"]
+            hand, hand_publish_ns, hand_sequence = sources["hand"]
+            camera = read_camera_frame_causal(self.shared, anchor_monotonic_ns=now_ns)
+            if camera is None:
+                raise RuntimeError("recording camera unavailable")
+            camera = dict(camera)
+            camera["camera_age_s"] = (now_ns - int(camera["source_monotonic_ns"])) / 1e9
+            camera["camera_fresh"] = (
+                int(camera["camera_health"]) == int(CameraHealth.OK)
+                and camera["camera_age_s"] <= self.runtime.camera.max_frame_age_s
+                and not camera["clock_reset"]
+            )
+            if not camera["camera_fresh"]:
+                raise RuntimeError("recording camera unhealthy or stale")
+            tactile = None if sources["tactile"] is None else sources["tactile"][0]
+            tactile_fresh = bool(
+                tactile is not None
+                and tactile["fresh"][0]
+                and now_ns - int(tactile["source_monotonic_ns"][0])
+                <= _RECORDING_TACTILE_MAX_AGE_NS
+            )
+            state = build_episode_state(
+                arm,
+                hand,
+                tactile if tactile_fresh else None,
+                hand_fk=self._recording_hand_kinematics(),
+                handbase_position_eef_m=np.asarray(
+                    self.runtime.hand.T_eef_handbase_pos_xyz
+                ),
+                handbase_quat_eef_wxyz=np.asarray(
+                    self.runtime.hand.T_eef_handbase_quat_wxyz
+                ),
+                timestamp_s=now_ns / 1e9,
+            )
+            source_ns = np.array(
+                [
+                    arm["source_monotonic_ns"][0],
+                    hand["source_monotonic_ns"][0],
+                    0,
+                    camera["source_monotonic_ns"],
+                ],
+                dtype=np.uint64,
+            )
+            valid = np.array(
+                [bool(arm["state_valid"][0]), bool(hand["state_valid"][0]), False, True]
+            )
+            ages = np.full(4, np.nan)
+            ages[valid] = (now_ns - source_ns[valid].astype(np.int64)) / 1e9
+            skew = np.full(4, np.nan)
+            skew[valid] = (
+                int(source_ns[valid].max()) - source_ns[valid].astype(np.int64)
+            ) / 1e9
+            signals = {
+                "observation_id": now_ns,
+                "observation_anchor_monotonic_ns": now_ns,
+                "arm_source_sequence": arm_sequence,
+                "hand_source_sequence": hand_sequence,
+                "camera_source_sequence": camera["ring_sequence"],
+                "arm_publish_monotonic_ns": arm_publish_ns,
+                "hand_publish_monotonic_ns": hand_publish_ns,
+                "camera_publish_monotonic_ns": camera["publish_monotonic_ns"],
+                "observation_source_receive_monotonic_ns": np.array(
+                    [
+                        arm_publish_ns,
+                        hand_publish_ns,
+                        0,
+                        camera["receive_monotonic_ns"],
+                    ],
+                    dtype=np.uint64,
+                ),
+                "observation_source_age_s": ages,
+                "observation_source_skew_s": skew,
+                "observation_history_valid_mask": valid[:, None],
+                "observation_valid": False,
+                "policy_observation_valid": False,
+                "hand_accepted_target_action_id": int(
+                    hand["accepted_target_action_id"][0]
+                ),
+                "tactile_fresh": tactile_fresh,
+                "tactile_source_monotonic_ns": (
+                    0 if tactile is None else int(tactile["source_monotonic_ns"][0])
+                ),
+                "tactile_calibrated": (
+                    False if tactile is None else bool(tactile["calibrated"][0])
+                ),
+                "tactile_unit_code": (
+                    0 if tactile is None else int(tactile["unit_code"][0])
+                ),
+            }
+            for index, name in enumerate(("arm", "hand", "vr", "camera")):
+                signals[f"{name}_source_monotonic_ns"] = int(source_ns[index])
+            inputs = (state, camera, signals)
+            if raw_action is None:
+                action = self._recorded_hold_action(state)
+                recorded = self._record_frame(
+                    inputs,
+                    action,
+                    signals={
+                        "held": True,
+                        "action_queued": False,
+                        "ik_attempted": False,
+                        "ik_ok": False,
+                        "frame_status": _RECORD_FRAME_HELD,
+                    },
+                )
+            else:
+                if candidate is not None:
+                    recorded = self._record_command(inputs, candidate, raw_action)
+                else:
+                    assert reject_kind is not None
+                    attempted, ok = _rejection_ik_metadata(
+                        self.policy_spec.action_key == "action_ee", reject_kind
+                    )
+                    recorded = self._record_rejection(
+                        inputs,
+                        raw_action,
+                        ik_attempted=attempted,
+                        ik_ok=ok,
+                        kind=reject_kind,
+                    )
+            if not recorded:
+                raise RuntimeError("rollout sample rejected by RecorderIO")
+        except Exception as exc:
+            logger.error("rollout recording failed", exc_info=True)
+            self._invalidate_rollout(
+                str(exc),
+                stop_reason="eval:invalid:recording_failure",
                 recorder_save=False,
-                wait_for_action_id=self.progress.latest_published_action_id,
             )
 
     def _start_requested_episode(self) -> None:
         if not bool(self.shared.start_request.value):
+            return
+        if self.rollout_started:
+            with self.shared.motion_lock:
+                self.shared.start_request.value = False
+            logger.warning("rollout already completed; restart run_policy.py")
             return
         if self.recorder is not None and (
             self.recorder.start_pending or self.recorder.stop_pending
@@ -1523,11 +1118,17 @@ class PolicyExecutor:
             logger.warning("executor: ignored B: %s", rejection)
             return
         if self.recorder is not None:
-            assert self.evaluation_config is not None
+            assert self.recording_config is not None
+            # Reserve the transaction before the bounded START wait so Q cannot
+            # let lifecycle shutdown race an in-flight recorder acknowledgement.
+            self.shared.is_recording.value = True
             if not self.recorder.start_episode(
-                task_label=self.evaluation_config.task_label,
-                operator=self.evaluation_config.operator,
+                task_label=self.recording_config.task_label,
+                operator=self.recording_config.operator,
             ):
+                self.shared.is_recording.value = bool(
+                    self.recorder.start_pending or self.recorder.stop_pending
+                )
                 with self.shared.motion_lock:
                     self.shared.start_request.value = False
                     self.shared.evaluation_outcome.value = int(
@@ -1545,9 +1146,8 @@ class PolicyExecutor:
                     self.shared.evaluation_outcome.value = int(
                         EvaluationOutcome.INVALID
                     )
-                self.shared.is_recording.value = False
                 self.recorder.stop_episode(
-                    success=False,
+                    save=False,
                     reason="eval:invalid:start_recheck_failed",
                 )
                 logger.warning("executor: cancelled eval START: %s", rejection)
@@ -1574,36 +1174,40 @@ class PolicyExecutor:
                     epoch = begin_requested_motion(self.shared)
         if epoch is None:
             if self.recorder is not None:
-                self.shared.is_recording.value = False
                 self.recorder.stop_episode(
-                    success=False,
+                    save=False,
                     reason="eval:invalid:start_cancelled",
                 )
             return
         if self.execute:
             self.shared.physical_home_completed.value = False
         self.run_started_ns = epoch.started_monotonic_ns
+        self.rollout_started = True
+        self.stats = PolicyStats()
+        self.next_record_ns = epoch.started_monotonic_ns + self.step_dt_ns
         self.episode_steps = 0
         self._clear_execution(epoch.generation)
-        if self.recorder is not None:
-            self.evaluation_initial_sample_pending = True
-            self.evaluation_initial_deadline_ns = (
-                epoch.started_monotonic_ns + self.first_command_timeout_ns
-            )
-        elif self.sync_mode:
-            self.shared.inference_request.set()
         logger.info("policy_executor_loop: RUNNING generation=%d", epoch.generation)
 
     def _handle_run_boundary(self) -> None:
-        if not self._poll_evaluation_recorder():
+        if not self._poll_recorder():
             return
-        if bool(self.shared.quit_requested.value):
+        if bool(self.shared.quit_requested.value) and not (
+            self.shared.error_state.value
+            or self.shared.estop_request.value
+            or int(self.shared.safety_state.value) == int(SafetyState.FAULT)
+        ):
             if self.run_started_ns is not None:
                 if self.recorder is not None:
-                    self._finish_evaluation_episode(
+                    self._finish_episode(
                         "operator quit",
-                        stop_reason="eval:invalid:operator",
-                        recorder_save=not self.evaluation_initial_sample_pending,
+                        stop_reason="operator_abort",
+                        outcome=(
+                            EvaluationOutcome.INVALID
+                            if self.recording_config.mode == "eval"
+                            else EvaluationOutcome.STOPPED
+                        ),
+                        recorder_save=True,
                         aborted=False,
                     )
                 else:
@@ -1612,27 +1216,28 @@ class PolicyExecutor:
             # otherwise a clean executor exit can be misclassified as worker death.
             return
         if bool(self.shared.error_state.value) or bool(self.shared.estop_request.value):
+            revoke_motion(self.shared, SafetyState.FAULT)
             if self.run_started_ns is not None and self.recorder is not None:
                 stop_reason = (
-                    "eval:failure:estop"
+                    "eval:invalid:estop"
                     if bool(self.shared.estop_request.value)
                     else "eval:invalid:hardware_fault"
                 )
-                self._finish_evaluation_episode(
+                self._finish_episode(
                     (
                         "emergency stop"
                         if bool(self.shared.estop_request.value)
                         else "hardware fault"
                     ),
                     stop_reason=stop_reason,
-                    recorder_save=not self.evaluation_initial_sample_pending,
+                    recorder_save=True,
                     aborted=False,
                 )
             elif self.recorder is not None and self.recorder.is_recording:
                 self._fault(
                     "formal recorder was active before a motion epoch faulted",
-                    evaluation_stop_reason=(
-                        "eval:failure:estop"
+                    stop_reason=(
+                        "eval:invalid:estop"
                         if bool(self.shared.estop_request.value)
                         else "eval:invalid:hardware_fault"
                     ),
@@ -1660,18 +1265,28 @@ class PolicyExecutor:
                 except ValueError:
                     self._fault(
                         "invalid formal evaluation outcome wire value",
-                        evaluation_stop_reason="eval:invalid:recorder_fault",
+                        stop_reason="eval:invalid:recorder_fault",
                         recorder_save=False,
                     )
                     return
                 if outcome is EvaluationOutcome.NONE:
-                    stop_reason = "eval:invalid:operator"
+                    outcome = (
+                        EvaluationOutcome.STOPPED
+                        if self.recording_config.mode == "run"
+                        else EvaluationOutcome.INVALID
+                    )
+                    stop_reason = (
+                        "run:stopped:operator"
+                        if self.recording_config.mode == "run"
+                        else "eval:invalid:operator"
+                    )
                 else:
                     stop_reason = evaluation_outcome_stop_reason(outcome)
-                self._finish_evaluation_episode(
+                self._finish_episode(
                     "operator evaluation stop",
                     stop_reason=stop_reason,
-                    recorder_save=not self.evaluation_initial_sample_pending,
+                    outcome=outcome,
+                    recorder_save=True,
                     aborted=False,
                 )
             else:
@@ -1688,10 +1303,10 @@ class PolicyExecutor:
             if self.run_started_ns is not None:
                 # Operator S revokes motion before this process observes its flag.
                 if self.recorder is not None:
-                    self._finish_evaluation_episode(
+                    self._finish_episode(
                         "motion revoked outside formal stop request",
                         stop_reason="eval:invalid:hardware_fault",
-                        recorder_save=not self.evaluation_initial_sample_pending,
+                        recorder_save=True,
                         aborted=True,
                     )
                 return
@@ -1709,9 +1324,7 @@ class PolicyExecutor:
             return True
         try:
             arm_id, hand_id, hand_setpoint_accepted_ns, feedback_fault = (
-                _read_command_progress(
-                    self.shared, self.runtime, now_ns=now_ns
-                )
+                _read_command_progress(self.shared, self.runtime, now_ns=now_ns)
             )
         except Exception as exc:
             self._fault(f"command progress feedback failed: {type(exc).__name__}")
@@ -1748,17 +1361,12 @@ class PolicyExecutor:
         self.last_seen_prediction_sequence = sequence
         if prediction.run_generation != self.run_generation:
             return True
-        if prediction.actions.shape[1] != int(self.policy_spec.control_action_dim):
-            self._fault("prediction action dimension conflicts with PolicySpec")
+        if prediction.actions.shape != (
+            self.policy_spec.chunk_size,
+            self.policy_spec.control_action_dim,
+        ):
+            self._fault("prediction chunk shape conflicts with PolicySpec")
             return False
-        if self.sync_mode:
-            if self.active_prediction is not None:
-                self._fault("sync inference published before prediction completion")
-                return False
-            self.active_prediction = prediction
-            self.step_index = 0
-            self.schedule_base_ns = now_ns
-            return True
 
         first_index = first_future_step_index(
             prediction.logical_step_monotonic_ns,
@@ -1780,28 +1388,30 @@ class PolicyExecutor:
         if prediction is None or self.schedule_base_ns is None:
             return None
 
-        if not self.sync_mode:
-            target_ns = self.schedule_base_ns + self.step_index * self.step_dt_ns
-            if now_ns >= target_ns + self.step_dt_ns:
-                first_index = first_future_step_index(
-                    self.schedule_base_ns,
-                    self.step_dt_ns,
-                    now_ns,
-                    prediction.num_steps,
-                )
-                if first_index is None:
-                    self.active_prediction = None
-                    self.stats.stale_prediction_count += 1
-                    return None
-                self.step_index = max(self.step_index, first_index)
+        target_ns = self.schedule_base_ns + self.step_index * self.step_dt_ns
+        if now_ns >= target_ns:
+            first_index = first_future_step_index(
+                self.schedule_base_ns,
+                self.step_dt_ns,
+                now_ns,
+                prediction.num_steps,
+            )
+            if first_index is None:
+                self.active_prediction = None
+                self.stats.stale_prediction_count += 1
+                return None
+            self.step_index = max(self.step_index, first_index)
 
         target_ns = self.schedule_base_ns + self.step_index * self.step_dt_ns
+        # Publish the upcoming target during its preceding control interval.
+        # Waiting until target_ns would make every target stale at admission.
+        slot_ns = max(1, target_ns - self.step_dt_ns)
         due_ns = (
-            target_ns
+            slot_ns
             if self.next_command_due_ns is None
-            else max(target_ns, self.next_command_due_ns)
+            else max(slot_ns, self.next_command_due_ns)
         )
-        if not self.sync_mode and due_ns >= target_ns + self.step_dt_ns:
+        if due_ns >= target_ns:
             return None
         if now_ns < due_ns:
             return None
@@ -1822,49 +1432,29 @@ class PolicyExecutor:
         if self.step_index >= prediction.num_steps:
             self.active_prediction = None
             self.schedule_base_ns = None
-            if self.sync_mode:
-                self.shared.inference_request.set()
             return
-        if not self.sync_mode:
-            first_index = first_future_step_index(
-                prediction.logical_step_monotonic_ns,
-                self.step_dt_ns,
-                time.monotonic_ns(),
-                prediction.num_steps,
-            )
-            if first_index is None:
-                self.active_prediction = None
-            else:
-                self.step_index = max(self.step_index, first_index)
-
-    def _commit_terminal_step(self) -> bool:
-        """Commit step/prediction bookkeeping; never finish the episode here.
-
-        Returns ``True`` when this step reached the action-step limit, so the
-        caller can record evidence before applying any termination.
-        """
-        self.episode_steps += 1
-        limit = self.deployment.max_action_steps
-        limit_reached = limit is not None and self.episode_steps >= limit
-        if not limit_reached:
-            self._advance_prediction()
-        return limit_reached
-
-    def _finish_action_step_limit(self) -> None:
-        if self.recorder is not None:
-            self._finish_evaluation_episode(
-                "action_step_limit",
-                stop_reason="eval:failure:action_step_limit",
-                aborted=False,
-            )
+        first_index = first_future_step_index(
+            prediction.logical_step_monotonic_ns,
+            self.step_dt_ns,
+            time.monotonic_ns(),
+            prediction.num_steps,
+        )
+        if first_index is None:
+            self.active_prediction = None
         else:
-            self._finish_episode("action_step_limit", aborted=False)
+            self.step_index = max(self.step_index, first_index)
 
-    def _reject_due_step(self, due_ns: int, reason: str) -> tuple[int, bool]:
+    def _commit_terminal_step(self) -> None:
+        """Advance after a published or rejected control step."""
+        self.episode_steps += 1
+        self._advance_prediction()
+
+    def _reject_due_step(self, due_ns: int, reason: str) -> int:
         terminal_ns = time.monotonic_ns()
         self._consume_control_slot(due_ns, terminal_ns)
         logger.warning("executor: rejected policy step: %s", reason)
-        return terminal_ns, self._commit_terminal_step()
+        self._commit_terminal_step()
+        return terminal_ns
 
     def _decode_due_action(
         self, action: np.ndarray
@@ -1935,25 +1525,12 @@ class PolicyExecutor:
             if bool(self.shared.error_state.value):
                 return
             if decode_rejection is not None:
-                terminal_ns, limit_reached = self._reject_due_step(
-                    due_ns, decode_rejection
+                terminal_ns = self._reject_due_step(due_ns, decode_rejection)
+                self._record_rollout_tick(
+                    terminal_ns,
+                    raw_action=action,
+                    reject_kind=reject_kind,
                 )
-                ik_attempted, ik_ok = _rejection_ik_metadata(
-                    self.policy_spec.action_key == "action_ee", reject_kind
-                )
-                self._record_evaluation_rejection_evidence(
-                    action,
-                    kind=reject_kind,
-                    ik_attempted=ik_attempted,
-                    ik_ok=ik_ok,
-                    anchor_ns=terminal_ns,
-                )
-                if (
-                    limit_reached
-                    and self.run_started_ns is not None
-                    and self.pending_evaluation_termination is None
-                ):
-                    self._finish_action_step_limit()
             return
         arm_qpos, hand_qpos = decoded
         assert self.active_prediction is not None
@@ -1997,6 +1574,12 @@ class PolicyExecutor:
             return
         published_candidate = prepared.candidate
         assert published_candidate is not None
+        # Decode/IK can consume the remaining future window. Never publish an
+        # elapsed policy target, even if the transport validity window remains.
+        if time.monotonic_ns() >= scheduled_target_ns:
+            self._advance_prediction()
+            self.stats.stale_prediction_count += 1
+            return
         publish_result: PublishResult | None = None
         if self.execute:
             publish_result = publish_command(
@@ -2040,14 +1623,12 @@ class PolicyExecutor:
             self.stats.observe_publication_interval_ms(interval_ms)
         self.last_publication_ns = publication_ns
         self.last_valid_command_ns = publication_ns
-        limit_reached = self._commit_terminal_step()
-        if limit_reached and self.execute:
-            self.pending_truncation_action_id = published_candidate.action_id
-        self._record_evaluation_command_evidence(
-            action, published_candidate, anchor_ns=publication_ns
+        self._commit_terminal_step()
+        self._record_rollout_tick(
+            publication_ns,
+            candidate=published_candidate,
+            raw_action=action,
         )
-        if limit_reached and not self.execute and self.run_started_ns is not None:
-            self._finish_action_step_limit()
 
     def _handle_preparation_rejection(
         self,
@@ -2064,25 +1645,14 @@ class PolicyExecutor:
             return
         if prepared.gate_code is not None or candidate.hand_qpos is not None:
             self.stats.safety_rejection_count += 1
-        terminal_ns, limit_reached = self._reject_due_step(
+        terminal_ns = self._reject_due_step(
             due_ns, prepared.reason or "physical safety rejection"
         )
-        ik_attempted, ik_ok = _rejection_ik_metadata(
-            self.policy_spec.action_key == "action_ee", _RejectKind.SAFETY
+        self._record_rollout_tick(
+            terminal_ns,
+            raw_action=raw_action,
+            reject_kind=_RejectKind.SAFETY,
         )
-        self._record_evaluation_rejection_evidence(
-            raw_action,
-            kind=_RejectKind.SAFETY,
-            ik_attempted=ik_attempted,
-            ik_ok=ik_ok,
-            anchor_ns=terminal_ns,
-        )
-        if (
-            limit_reached
-            and self.run_started_ns is not None
-            and self.pending_evaluation_termination is None
-        ):
-            self._finish_action_step_limit()
 
     def _handle_publication_rejection(self, result: PublishResult) -> None:
         if result.reason == PUBLISH_REASON_EXPIRED:
@@ -2115,37 +1685,21 @@ class PolicyExecutor:
                 return
             self._fault("RUNNING generation changed outside an episode boundary")
             return
-        if self.evaluation_initial_sample_pending:
-            # Formal evaluation has one wall-clock budget.  Waiting for the
-            # first causal evidence row must not let a short configured trial
-            # exceed that budget merely because the first-command watchdog is
-            # longer.
-            if (
-                self.max_running_ns is not None
-                and now_ns - self.run_started_ns >= self.max_running_ns
-            ):
-                self._finish_evaluation_episode(
-                    "run time limit before initial evidence",
-                    stop_reason="eval:invalid:initial_evidence_timeout",
-                    recorder_save=False,
-                    aborted=False,
-                )
-                return
-            self._record_initial_evaluation_sample(now_ns)
-            return
         if not self._observe_worker_progress(now_ns):
-            return
-        if self.pending_evaluation_termination is not None:
-            self._drain_pending_evaluation_termination()
             return
         if (
             self.max_running_ns is not None
             and now_ns - self.run_started_ns >= self.max_running_ns
         ):
             if self.recorder is not None:
-                self._finish_evaluation_episode(
+                self._finish_episode(
                     "run time limit",
                     stop_reason="eval:failure:timeout",
+                    outcome=(
+                        EvaluationOutcome.FAILURE
+                        if self.recording_config.mode == "eval"
+                        else EvaluationOutcome.STOPPED
+                    ),
                     aborted=False,
                 )
             else:
@@ -2165,9 +1719,10 @@ class PolicyExecutor:
                     if watchdog_reason == "first command timeout"
                     else "eval:failure:command_silence_timeout"
                 )
-                self._finish_evaluation_episode(
+                self._finish_episode(
                     watchdog_reason,
                     stop_reason=stop_reason,
+                    outcome=EvaluationOutcome.FAILURE,
                 )
             else:
                 self._finish_episode(watchdog_reason)
@@ -2176,17 +1731,6 @@ class PolicyExecutor:
             self.progress.arm_accepted_action_id is None
             or self.progress.hand_accepted_action_id is None
         ):
-            return
-        if self.pending_truncation_action_id is not None:
-            if self.progress.covers(self.pending_truncation_action_id):
-                if self.recorder is not None:
-                    self._finish_evaluation_episode(
-                        "action_step_limit",
-                        stop_reason="eval:failure:action_step_limit",
-                        aborted=False,
-                    )
-                else:
-                    self._finish_episode("action_step_limit", aborted=False)
             return
         if not self._ingest_latest_prediction(now_ns):
             return
@@ -2218,6 +1762,8 @@ class PolicyExecutor:
                     and run_snapshot.state is SafetyState.RUNNING
                 ):
                     self._run_active_tick(time.monotonic_ns())
+                    if self.run_started_ns is not None:
+                        self._record_rollout_tick(time.monotonic_ns())
                 self.last_metrics_flush_ns = flush_every(
                     self.stats,
                     last_ns=self.last_metrics_flush_ns,
@@ -2225,6 +1771,18 @@ class PolicyExecutor:
                 )
                 rate.wait()
         finally:
+            # A runtime stop can end the loop before its next boundary poll.
+            # Storage finalization remains owned by RecorderIO.
+            if self.run_started_ns is not None:
+                self._finish_episode("runtime shutdown", stop_reason="runtime_shutdown")
+            if self.recorder is not None and (
+                self.recorder.stop_pending or self.rollout_result is not None
+            ):
+                result = self.recorder.join_stop()
+                if result.done:
+                    self._complete_recording(result)
+                else:
+                    logger.error("rollout recording finalization timed out")
             self.stats.flush(prefix="executor metrics")
 
 
@@ -2232,17 +1790,15 @@ def policy_executor_loop(
     shared: RuntimeChannels,
     runtime: ExperimentConfig,
     policy_spec: Any,
-    deployment: PolicyDeploymentConfig,
     execute: bool,
     max_running_s: float | None = None,
-    evaluation_config: PolicyEvaluationConfig | None = None,
+    evaluation_config: RolloutRecordingConfig | None = None,
 ) -> None:
     """Process entry point for one lightweight policy executor."""
     PolicyExecutor(
         shared,
         runtime,
         policy_spec,
-        deployment,
         execute=execute,
         max_running_s=max_running_s,
         evaluation_config=evaluation_config,

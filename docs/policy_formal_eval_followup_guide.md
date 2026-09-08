@@ -1,12 +1,18 @@
 # DexMani Real — Formal Policy Eval Follow-up Repair Guide
 
+> **SUPERSEDED — do not use for implementation.** This document records the old
+> Formal Eval transaction design. Follow `policy_rollout_simplification_guide.md`
+> and current source instead: Recorder START/RECORDING ACK is the only startup
+> recording barrier; recording observes control and never waits for command
+> acceptance before invalidating a rollout.
+
 > Repository: `haoyangzhanglab/dexmani_real`  
 > Reviewed code baseline: `cfa446fe536c95078e28a663ef919e13f1fc0b07`  
 > Review-hardened guide baseline: `dd2f3d6ac4304b93415fcfc43b07ae3890e8839c`  
 > Intended executor: Claude Code / Codex  
 > Scope: finish the remaining **formal real-eval transaction correctness** work after the canonical rollout cleanup. Keep the patch local, deterministic, non-blocking, and hardware-independent.
 >
-> This guide supersedes the formal-eval follow-up details in `docs/policy_rollout_simplification_guide.md`. The earlier guide remains authoritative for the already-stable Policy contract, causal observation path, ActionChunk scheduling, and learned-policy reject-only arm semantics.
+> Historical scope only; the implementation instructions below are no longer active.
 
 ---
 

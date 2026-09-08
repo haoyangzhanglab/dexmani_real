@@ -241,6 +241,7 @@ class RecorderClient:
         self._stop_requested = False
         self._last_poll_status_sequence = 0
         self._last_stop_result: RecorderStopResult | None = None
+        self.episode_path: str | None = None
 
     @property
     def frame_count(self) -> int:
@@ -330,6 +331,7 @@ class RecorderClient:
             )
             return False
         self._generation += 1
+        self.episode_path = None
         self._last_stop_result = None
         self._start_pending = True
         self._write_control(
@@ -341,6 +343,7 @@ class RecorderClient:
             if status is not None and int(status["generation"]) == self._generation:
                 phase = RecorderPhase(int(status["phase"]))
                 if phase is RecorderPhase.RECORDING:
+                    self.episode_path = self._text(status, "path") or None
                     self._recording = True
                     self._start_pending = False
                     self._stop_requested = False
@@ -392,7 +395,7 @@ class RecorderClient:
         consumed = int(self.shared.recorder_consumed_sequence.value)
         if latest - consumed >= self.shared.record_sample_ring.maxlen:
             logger.error("RecorderIO sample ring overflow — aborting episode")
-            self.stop_episode(success=False, reason="sample_ring_overflow")
+            self.stop_episode(save=False, reason="sample_ring_overflow")
             return False
 
         dtype = self.shared.record_sample_ring.dtype
@@ -472,7 +475,7 @@ class RecorderClient:
         self._frame_count += 1
         return True
 
-    def stop_episode(self, success: bool = True, reason: str = "") -> str | None:
+    def stop_episode(self, save: bool = True, reason: str = "") -> str | None:
         if self._start_pending:
             # There is no recorder transaction to save yet; use the one
             # protocol reason that RecorderIO accepts before START.
@@ -480,7 +483,7 @@ class RecorderClient:
             return None
         if not self._recording or self._stop_requested:
             return None
-        self._write_control(RecorderCommand.STOP, save=success, stop_reason=reason)
+        self._write_control(RecorderCommand.STOP, save=save, stop_reason=reason)
         self._recording = False
         self._stop_requested = True
         return None

@@ -104,7 +104,7 @@ def _flush_all_recorders() -> None:
     for rec in list(_LIVE_RECORDERS):  # snapshot — WeakSet may mutate under GC
         try:
             if rec._recording:
-                rec.stop_episode(success=False, reason="atexit")
+                rec.stop_episode(save=False, reason="atexit")
             if not rec.join_stop(timeout=_PROCESS_EXIT_STOP_TIMEOUT_S):
                 logger.error("recorder did not finish before interpreter shutdown")
         except Exception:
@@ -121,11 +121,11 @@ class StopResult:
     """Outcome of a background stop_episode daemon, returned by poll_stop()."""
 
     done: bool
-    """True when the daemon finished (success or crash)."""
+    """True when the daemon finished (save or crash)."""
     error: str | None = None
     """Error message if the daemon crashed, None otherwise."""
-    success: bool = False
-    """Whether stop_episode was called with success=True (save vs discard)."""
+    save: bool = False
+    """Whether stop_episode was called with save=True (save vs discard)."""
     path: str | None = None
     """Episode directory path, or None if no stop was pending."""
     frame_count: int = 0
@@ -187,7 +187,7 @@ class EpisodeRecorder:
         # Error from the last stop operation; callers read it after join_stop().
         self._stop_error: str | None = None
 
-        self._stop_success: bool = False
+        self._stop_save: bool = False
         self._stop_path: str | None = None
         self._stop_frame_count: int = 0
 
@@ -196,6 +196,11 @@ class EpisodeRecorder:
     @property
     def is_recording(self) -> bool:
         return self._recording
+
+    @property
+    def episode_path(self) -> str | None:
+        """Reserved final path; raw data is published only after validation."""
+        return self._episode_dir
 
     @property
     def frame_count(self) -> int:
@@ -649,7 +654,7 @@ class EpisodeRecorder:
         assert self._data_writer is not None
         self._data_writer.append(self._buffer.data, self._buffer.timestamps)
 
-    def stop_episode(self, success: bool = True, reason: str = "") -> str | None:
+    def stop_episode(self, save: bool = True, reason: str = "") -> str | None:
         """Signal end of episode; return path immediately, flush in background.
 
         The heavy work (camera-writer drain, buffer flush, metadata write,
@@ -658,7 +663,7 @@ class EpisodeRecorder:
         the file (or before process exit).
 
         Args:
-            success: stored as /meta success.
+            save: stored as /meta save.
             reason: stored as /meta stop_reason; empty → "max_frames" when
                     the episode hit the frame cap, else "manual".
         """
@@ -674,12 +679,12 @@ class EpisodeRecorder:
 
         # Snapshot stop metadata BEFORE spawning the worker (it overwrites
         # self._frame_count during _stop_episode_impl_inner).
-        self._stop_success = success
+        self._stop_save = save
         self._stop_path = path
         self._stop_frame_count = self._frame_count
         t = threading.Thread(
             target=self._stop_episode_impl,
-            args=(success, reason, truncated),
+            args=(save, reason, truncated),
             daemon=False,
             name="episode-stop",
         )
@@ -715,7 +720,7 @@ class EpisodeRecorder:
         if self._stop_error is not None:
             logger.error("episode-stop failed: %s", self._stop_error)
         self._stop_thread = None
-        self._stop_success = False
+        self._stop_save = False
         self._stop_path = None
         self._stop_frame_count = 0
         return ok
@@ -730,14 +735,14 @@ class EpisodeRecorder:
         ``stop_episode()``.
 
         The terminal payload is consumptive: only the first completed poll
-        carries its path, frame count, success flag, and error.
+        carries its path, frame count, save flag, and error.
         """
         t = self._stop_thread
         if t is None:
             return StopResult(
                 done=True,
                 error=self._stop_error,
-                success=self._stop_success,
+                save=self._stop_save,
                 path=self._stop_path,
                 frame_count=self._stop_frame_count,
             )
@@ -746,20 +751,20 @@ class EpisodeRecorder:
         result = StopResult(
             done=True,
             error=self._stop_error,
-            success=self._stop_success,
+            save=self._stop_save,
             path=self._stop_path,
             frame_count=self._stop_frame_count,
         )
         self._stop_thread = None
         self._stop_error = None
-        self._stop_success = False
+        self._stop_save = False
         self._stop_path = None
         self._stop_frame_count = 0
         return result
 
     def _stop_episode_impl(
         self,
-        success: bool,
+        save: bool,
         reason: str,
         truncated: bool,
     ) -> None:
@@ -770,7 +775,7 @@ class EpisodeRecorder:
         or announcing a truncated episode.
         """
         try:
-            self._stop_episode_impl_inner(success, reason, truncated)
+            self._stop_episode_impl_inner(save, reason, truncated)
         except Exception as exc:
             self._stop_error = f"{type(exc).__name__}: {exc}"
             logger.error(
@@ -808,7 +813,7 @@ class EpisodeRecorder:
 
     def _stop_episode_impl_inner(
         self,
-        success: bool,
+        save: bool,
         reason: str,
         truncated: bool,
     ) -> None:
@@ -871,7 +876,7 @@ class EpisodeRecorder:
             meta.attrs["grid_dt_s"] = grid_dt_s
             meta.attrs["non_sampled_duration_s"] = max(0.0, duration - grid_duration_s)
             meta.attrs["num_frames"] = self._frame_count
-            meta.attrs["success"] = success
+            meta.attrs["success"] = save  # Legacy raw-v24 storage/commit flag.
             meta.attrs["fps"] = self.control_hz
             meta.attrs["wall_fps"] = (
                 self._frame_count / duration if duration > 0 else self.control_hz
@@ -899,7 +904,7 @@ class EpisodeRecorder:
         _final = self._episode_dir
         _tmp = self._temp_dir
         if _tmp is not None and _final is not None:
-            if success:
+            if save:
                 self._validate_temp_episode(Path(_tmp), self._frame_count)
                 atomic_publish(_tmp, _final)
                 logger.info(
@@ -920,7 +925,7 @@ class EpisodeRecorder:
 
     def _reset_episode_state(self) -> None:
         """Reset all mutable episode state to defaults (called from both the
-        success path and the crash-handler in _stop_episode_impl)."""
+        save path and the crash-handler in _stop_episode_impl)."""
         self._data_writer = None
         self._recording = False
         self._max_frames_reached = False

@@ -2,10 +2,16 @@
 
 > Repository: `haoyangzhanglab/dexmani_real`  
 > Intended executor: Claude Code / Codex  
-> Cross-repository Policy baseline: `haoyangzhanglab/dexmani_policy@main`  
+> Cross-repository Policy baseline: `haoyangzhanglab/dexmani_policy@8fb7bac7a898433f290404e2a0567ab215c0e4ba`
 > Scope: simplify and correct learned-policy real deployment for personal PhD robot-learning experiments.
 >
 > This guide supersedes previous rollout/formal-evaluation cleanup plans. It is the current implementation contract.
+
+Implementation status: the coordinated API, periodic full-chunk rollout, single
+physical rollout, shared run/eval recording, separate task outcome, and Formal
+Eval transaction removal are implemented. Validation is offline only. Verify
+hardware in order: check, shadow, low-risk run, raw inspection, then eval.
+Retired mechanisms below are removal history, not compatibility requirements.
 
 ---
 
@@ -138,21 +144,12 @@ Real must not parse Policy artifact internals.
 
 # 4. Policy API migration
 
-Current Policy already computes:
+Policy exposes `PolicySpec.chunk_size = horizon - n_obs_steps + 1` and
+`LoadedPolicy.predict_action_chunk(observation)` returning finite
+`float64[chunk_size, control_action_dim]`. Real's runtime protocol and NumPy
+adapter use this public method directly. There is no old-API fallback.
 
-```text
-pred_action [horizon, action_dim]
-```
-
-and exposes only:
-
-```text
-control_action [n_action_steps, control_action_dim]
-```
-
-The migration should expose the complete future chunk.
-
-Required Real-side assumption after migration:
+Real-side contract:
 
 ```text
 prediction length = chunk_size
@@ -564,9 +561,8 @@ Keep raw-v24 compatibility. Do not migrate dataset schema in this task.
 
 # 17. Formal evaluation simplification
 
-Current Formal Eval contains mechanisms for production audit.
-
-For personal PhD experiments, simplify.
+The Formal Eval transaction cleanup is implemented. The following removal list
+describes the retired design, not mechanisms to restore.
 
 ## Remove
 
@@ -582,13 +578,22 @@ multi-episode evaluation session
 
 ```text
 Recorder START acknowledgement
-initial startup barrier
+Recorder START / RECORDING ACK as the sole startup recording barrier
 Recorder transactional finalization
 supervisor/lifecycle fault handling
 hardware safety
 ```
 
 After startup barrier:
+
+The first ordinary recorded control-grid sample starts the episode evidence.
+There is no mandatory initial held frame, second observation builder, or
+per-command evidence admission transaction. A recording failure marks the
+rollout INVALID and immediately revokes future motion generation; it does not
+wait for arm/hand acceptance. CommandProgress remains a hardware liveness guard.
+Normal STOP/finalization and result.json completion remain bounded, with motion
+already fenced. Task FAILURE can still save raw data; the recorder's `save`
+argument describes storage commitment, not task success.
 
 Control order:
 
@@ -645,9 +650,16 @@ command_progress_timeout
 
 Do not add scheduler research metrics.
 
+Live logging does not reset rollout rejection counts. The current result stores
+executor counts and latest timing samples; it does not claim episode-wide
+inference-latency percentiles. The optional action-gap metric remains deferred.
+
 ---
 
-# 20. Implementation order
+# 20. Historical implementation outline
+
+This outline records the earlier plan. Do not restart the migration or restore
+its intermediate paths; current source and the contract above are authoritative.
 
 ## Phase 0
 
@@ -730,7 +742,7 @@ one Policy deployment boundary
 A researcher can run:
 
 ```bash
-python examples/run_policy.py eval policy/task/experiment --eval-seed 1
+python examples/run_policy.py eval policy/task/experiment --eval-seed 1 --max-duration 60
 ```
 
 and obtain:

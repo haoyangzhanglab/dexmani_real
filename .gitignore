@@ -156,3 +156,5 @@ tmp_docs/
 tmp_code/
 
 datasets/
+
+rollouts/

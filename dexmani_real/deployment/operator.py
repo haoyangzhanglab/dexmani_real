@@ -15,7 +15,6 @@ e-stop never depends on this loop being scheduled.
 from __future__ import annotations
 
 import threading
-import time
 
 import numpy as np
 
@@ -46,7 +45,6 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 _POLL_S = 0.05
-_EVALUATION_QUIT_STOP_ACK_TIMEOUT_S = 1.0
 
 
 def _request_immediate_stop(shared: RuntimeChannels) -> None:
@@ -79,35 +77,12 @@ def _request_evaluation_outcome_and_stop(
                 current = EvaluationOutcome(int(shared.evaluation_outcome.value))
             except ValueError:
                 shared.error_state.value = True
-                return
+                return False
             if current is EvaluationOutcome.NONE:
                 shared.evaluation_outcome.value = int(outcome)
         if not request_policy_stop(shared):
             shared.error_state.value = True
     return was_running
-
-
-def _await_evaluation_stop_ack(
-    shared: RuntimeChannels,
-    *,
-    stop_event: threading.Event,
-) -> bool:
-    """Wait briefly until executor has queued STOP for an active eval trial.
-
-    Q must not let the supervisor close RecorderIO before the executor has
-    fenced motion and handed it a save/discard decision.  This waits only for
-    the executor's existing STOP acknowledgement; RecorderIO finalization
-    remains asynchronous and continues under its normal shutdown path.
-    """
-    deadline = time.monotonic() + _EVALUATION_QUIT_STOP_ACK_TIMEOUT_S
-    while time.monotonic() < deadline:
-        with shared.motion_lock:
-            if int(shared.stop_request.value) == int(StopRequest.NONE):
-                return True
-        if stop_event.is_set() or not bool(shared.is_running.value):
-            return False
-        time.sleep(_POLL_S)
-    return False
 
 
 def build_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
@@ -365,19 +340,10 @@ def run_operator_control(
                 elif signal is OperatorCommand.QUIT:
                     if not shared.quit_requested.value:
                         if evaluation:
-                            was_running = _request_evaluation_outcome_and_stop(
+                            _request_evaluation_outcome_and_stop(
                                 shared,
                                 EvaluationOutcome.INVALID,
                             )
-                            if was_running and not _await_evaluation_stop_ack(
-                                shared,
-                                stop_event=stop_event,
-                            ):
-                                logger.error(
-                                    "operator: eval Q timed out before executor "
-                                    "acknowledged recorder stop"
-                                )
-                                shared.error_state.value = True
                             shared.quit_requested.value = True
                         else:
                             _request_immediate_quit(shared)

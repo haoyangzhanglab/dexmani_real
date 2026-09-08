@@ -39,8 +39,6 @@ FIXED_POLICY_RUNTIME_TARGET = (
     "dexmani_real.deployment.inference.dexmani_policy:DexManiPolicyAdapter"
 )
 
-_DEPLOYMENT_DEFAULT_MODE = "sync"
-_DEPLOYMENT_MODES = frozenset({"sync", "async"})
 
 _SUPPORTED_OBSERVATION_FIELDS = frozenset(
     {
@@ -108,9 +106,7 @@ def _validate_real_observation_capability(policy_spec: Any) -> tuple[Any, ...]:
             or shape[0] <= 0
             or shape[1] <= 0
         ):
-            raise ValueError(
-                "Policy rgb must be uint8 [H, W, 3] with positive H and W"
-            )
+            raise ValueError("Policy rgb must be uint8 [H, W, 3] with positive H and W")
     return fields
 
 
@@ -192,9 +188,9 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
             "Real deployment requires hand actions because its control schema is "
             "arm7 + hand12"
         )
-    if policy_spec.n_action_steps > MAX_PREDICTION_STEPS:
+    if policy_spec.chunk_size > MAX_PREDICTION_STEPS:
         raise ValueError(
-            f"Policy n_action_steps exceeds Real IPC capacity {MAX_PREDICTION_STEPS}"
+            f"Policy chunk_size exceeds Real IPC capacity {MAX_PREDICTION_STEPS}"
         )
     if policy_spec.action_key not in {"action", "action_ee"}:
         raise ValueError("Policy action_key is unsupported by Real")
@@ -248,30 +244,6 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
 
 
 @dataclass(frozen=True)
-class PolicyDeploymentConfig:
-    """Small operator-owned policy deployment configuration.
-
-    Model structure and chunk length remain owned by ``PolicySpec``.  Real
-    runtime and safety parameters remain owned by ``ExperimentConfig``;
-    this object only carries the explicit scheduler mode and episode horizon
-    requested by the deployment workflow.
-    """
-
-    inference_mode: str = _DEPLOYMENT_DEFAULT_MODE
-    max_action_steps: int | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.inference_mode, str) or (
-            self.inference_mode not in _DEPLOYMENT_MODES
-        ):
-            raise ValueError("inference_mode must be one of 'sync' or 'async'")
-        if self.max_action_steps is not None and (
-            type(self.max_action_steps) is not int or self.max_action_steps <= 0
-        ):
-            raise ValueError("max_action_steps must be a positive integer or null")
-
-
-@dataclass(frozen=True)
 class InferenceWorkerConfig:
     """Narrow Policy-owned inputs required by the inference child."""
 
@@ -289,8 +261,8 @@ class InferenceWorkerConfig:
             raise ValueError("device must be a non-empty torch device string")
         if self.device != self.device.strip():
             raise ValueError("device must not have leading or trailing whitespace")
-        if type(self.seed) is not int or self.seed != 0:
-            raise ValueError("policy inference seed is fixed to 0")
+        if type(self.seed) is not int or self.seed < 0:
+            raise ValueError("policy inference seed must be a non-negative integer")
 
 
 @dataclass(frozen=True)
@@ -327,7 +299,6 @@ class FingertipAssemblerConfig:
 __all__ = [
     "FIXED_POLICY_RUNTIME_TARGET",
     "FingertipAssemblerConfig",
-    "PolicyDeploymentConfig",
     "InferenceWorkerConfig",
     "validate_policy_runtime_compatibility",
     "validate_max_running_s",

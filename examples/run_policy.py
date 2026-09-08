@@ -38,18 +38,7 @@ class _LifecycleInputs:
     runtime: Any
     policy_spec: Any
     worker_config: Any
-    deployment_config: Any
     evaluation_config: Any | None = None
-
-
-def _positive_action_steps(raw: str) -> int:
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a positive integer") from exc
-    if value <= 0:
-        raise argparse.ArgumentTypeError("must be a positive integer")
-    return value
 
 
 def _positive_running_seconds(raw: str) -> float:
@@ -59,6 +48,16 @@ def _positive_running_seconds(raw: str) -> float:
         raise argparse.ArgumentTypeError("must be a finite positive number") from exc
     if not math.isfinite(value) or value <= 0.0:
         raise argparse.ArgumentTypeError("must be a finite positive number")
+    return value
+
+
+def _eval_seed(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
     return value
 
 
@@ -72,31 +71,20 @@ def _add_device_option(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_lifecycle_options(
-    parser: argparse.ArgumentParser,
-    *,
-    inference_mode_default: str = "sync",
-    include_max_action_steps: bool = True,
+    parser: argparse.ArgumentParser, *, evaluation: bool = False, physical: bool = True
 ) -> None:
-    """Add options consumed only by a Real deployment lifecycle."""
+    parser.add_argument("--eval-seed", type=_eval_seed, default=0, required=evaluation)
+    if not physical:
+        return
     parser.add_argument(
-        "--runtime-config",
-        dest="runtime_config",
-        default=None,
-        help="optional Real runtime YAML for shadow/run/eval",
+        "--max-duration",
+        dest="max_running_s",
+        type=_positive_running_seconds,
+        default=None if evaluation else 60.0,
+        required=evaluation,
     )
-    parser.add_argument(
-        "--inference-mode",
-        choices=("sync", "async"),
-        default=inference_mode_default,
-        help=f"inference scheduling mode (default: {inference_mode_default})",
-    )
-    if include_max_action_steps:
-        parser.add_argument(
-            "--max-action-steps",
-            type=_positive_action_steps,
-            default=None,
-            help="episode action-step limit (default: unlimited)",
-        )
+    parser.add_argument("--task-label", default=None)
+    parser.add_argument("--operator", default=None, help="optional metadata only")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -131,7 +119,7 @@ def _parser() -> argparse.ArgumentParser:
         command_parser = subcommands.add_parser(command, help=help_text)
         command_parser.add_argument("experiment", metavar="EXPERIMENT")
         _add_device_option(command_parser)
-        _add_lifecycle_options(command_parser)
+        _add_lifecycle_options(command_parser, physical=command == "run")
 
     eval_parser = subcommands.add_parser(
         "eval",
@@ -139,32 +127,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     eval_parser.add_argument("experiment", metavar="EXPERIMENT")
     _add_device_option(eval_parser)
-    _add_lifecycle_options(
-        eval_parser,
-        inference_mode_default="async",
-        include_max_action_steps=False,
-    )
-    eval_parser.add_argument(
-        "--max-running-s",
-        type=_positive_running_seconds,
-        required=True,
-        help="required wall-clock trial timeout in seconds",
-    )
-    eval_parser.add_argument(
-        "--task-label",
-        required=True,
-        help="non-empty task label persisted in the episode metadata",
-    )
-    eval_parser.add_argument(
-        "--operator",
-        required=True,
-        help="non-empty operator name persisted in the episode metadata",
-    )
-    eval_parser.add_argument(
-        "--output-dir",
-        default=None,
-        help="isolated eval output directory (default: evaluations/<selector>)",
-    )
+    _add_lifecycle_options(eval_parser, evaluation=True)
     return parser
 
 
@@ -228,7 +191,11 @@ def _print_experiment_summary(info: Any, *, mode: str, device: str) -> None:
     print(f"History     : {spec.n_obs_steps}")
     print(f"Point Cloud : {point_cloud}")
     print(f"Action      : {spec.action_key} ({spec.control_action_dim}D)")
-    print(f"Chunk       : {spec.n_action_steps}")
+    print(f"Chunk size  : {spec.chunk_size}")
+    print(f"Query steps : {spec.n_action_steps}")
+    print(
+        f"Future tail : {spec.chunk_size - spec.n_action_steps} steps / {(spec.chunk_size - spec.n_action_steps) * spec.control_dt_s * 1000:g} ms"
+    )
     print(f"Control     : {1.0 / spec.control_dt_s:g} Hz")
     print(
         "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
@@ -244,7 +211,8 @@ def _print_evaluation_summary(info: Any, inputs: _LifecycleInputs) -> None:
     checkpoint_sha256 = evaluation.provenance.get("checkpoint_sha256")
     if checkpoint_sha256 is None:
         raise ValueError("formal evaluation provenance lacks checkpoint_sha256")
-    print("── Formal Evaluation ──")
+    print("── Recorded Rollout ──")
+    print(f"Eval seed             : {inputs.worker_config.seed}")
     print(f"Policy selector       : {info.selector}")
     print(f"Checkpoint            : {info.checkpoint_name}")
     print(f"Checkpoint SHA-256    : {checkpoint_sha256}")
@@ -258,7 +226,6 @@ def _print_evaluation_summary(info: Any, inputs: _LifecycleInputs) -> None:
     )
     print(f"n_action_steps        : {info.spec.n_action_steps}")
     print(f"Control Hz            : {1.0 / info.spec.control_dt_s:g}")
-    print(f"Inference mode        : {inputs.deployment_config.inference_mode}")
     print(f"Max running seconds   : {evaluation.max_running_s:g}")
     print(f"Evaluation output dir : {evaluation.data_dir}")
     print(f"Task                  : {evaluation.task_label}")
@@ -308,44 +275,25 @@ def _safe_selector_parts(selector: Any) -> tuple[str, str, str]:
     return parts[0], parts[1], parts[2]
 
 
-def _is_within(path: Path, parent: Path) -> bool:
-    try:
-        path.relative_to(parent)
-    except ValueError:
-        return False
-    return True
+def _check_action_chunk(policy: Any, spec: Any) -> None:
+    """Smoke-test the production NumPy boundary without starting hardware."""
+    import numpy as np
 
-
-def _resolve_evaluation_output_dir(
-    raw_output_dir: str | None,
-    *,
-    selector: Any,
-    episodes_dir: Any,
-) -> Path:
-    """Resolve a non-overlapping formal-evaluation output namespace."""
-    repo_root = Path(__file__).resolve().parents[1]
-    policy_name, task_name, experiment_name = _safe_selector_parts(selector)
-    if raw_output_dir is None:
-        output_dir = (
-            repo_root / "evaluations" / policy_name / task_name / experiment_name
+    observation = {
+        field.name: np.zeros((spec.n_obs_steps, *field.shape), dtype=field.dtype)
+        for field in spec.observation_fields
+    }
+    policy.reset_episode()
+    actions = policy.predict_action_chunk(observation)
+    if (
+        not isinstance(actions, np.ndarray)
+        or actions.shape != (spec.chunk_size, spec.control_action_dim)
+        or actions.dtype != np.float64
+        or not np.all(np.isfinite(actions))
+    ):
+        raise RuntimeError(
+            "Policy action chunk violates finite float64 [chunk_size, D] contract"
         )
-    else:
-        candidate = Path(raw_output_dir)
-        output_dir = candidate if candidate.is_absolute() else repo_root / candidate
-    output_dir = output_dir.resolve(strict=False)
-    configured_episodes = Path(episodes_dir)
-    episode_root = (
-        configured_episodes
-        if configured_episodes.is_absolute()
-        else repo_root / configured_episodes
-    ).resolve(strict=False)
-    if _is_within(output_dir, episode_root) or _is_within(episode_root, output_dir):
-        raise ValueError(
-            "formal eval output must not contain or be contained by the demonstration episodes directory"
-        )
-    if output_dir == output_dir.parent:
-        raise ValueError("formal eval output must not be a filesystem root")
-    return output_dir
 
 
 def _run_check(args: argparse.Namespace) -> int:
@@ -367,7 +315,8 @@ def _run_check(args: argparse.Namespace) -> int:
         # calls ``predict``, and validates the finite [N, D] control output.
         durations = _validated_warmup_durations(policy.warmup(samples=3))
         print("warmup ........... OK")
-        print("prediction ....... OK")
+        _check_action_chunk(policy, info.spec)
+        print("action chunk ..... OK")
         print()
         print(f"inference warmup p50: {statistics.median(durations) * 1000.0:.0f} ms")
         print(f"inference warmup max: {max(durations) * 1000.0:.0f} ms")
@@ -399,43 +348,44 @@ def _prepare_lifecycle_inputs(
     from dexmani_real.config.experiment import resolve_experiment_config
     from dexmani_real.deployment.config import (
         InferenceWorkerConfig,
-        PolicyDeploymentConfig,
     )
-    from dexmani_real.deployment.evaluation import PolicyEvaluationConfig
+    from dexmani_real.deployment.evaluation import RolloutRecordingConfig
 
     if not isinstance(execute, bool):
         raise TypeError("execute must be a boolean")
-    runtime = resolve_experiment_config(yaml_path=args.runtime_config)
-    deployment_config = PolicyDeploymentConfig(
-        inference_mode=args.inference_mode,
-        max_action_steps=getattr(args, "max_action_steps", None),
-    )
+    runtime = resolve_experiment_config()
     worker_config = InferenceWorkerConfig(
         experiment=info.selector,
         device=args.device,
         spec=info.spec,
+        seed=args.eval_seed,
     )
     evaluation_config = None
-    if evaluation:
-        if not execute:
-            raise ValueError("formal policy evaluation requires physical execution")
-        output_dir = _resolve_evaluation_output_dir(
-            args.output_dir,
-            selector=info.selector,
-            episodes_dir=runtime.policy.episodes_dir,
+    if execute:
+        import getpass
+
+        mode = "eval" if evaluation else "run"
+        output_dir = (
+            Path(__file__).resolve().parents[1]
+            / "rollouts"
+            / Path(*_safe_selector_parts(info.selector))
+            / mode
+            / f"seed_{args.eval_seed:03d}"
         )
         checkpoint_sha256 = _checkpoint_sha256(info.checkpoint_path)
-        evaluation_config = PolicyEvaluationConfig(
+        evaluation_config = RolloutRecordingConfig(
+            mode=mode,
             data_dir=str(output_dir),
-            task_label=args.task_label,
-            operator=args.operator,
+            task_label=args.task_label or info.task_name,
+            operator=args.operator or getpass.getuser(),
             max_running_s=args.max_running_s,
             provenance={
-                "workflow": "policy_eval",
+                "workflow": f"policy_{mode}",
+                "eval_seed": str(args.eval_seed),
+                "device": args.device,
                 "policy_selector": info.selector,
                 "checkpoint_name": str(info.checkpoint_name),
                 "checkpoint_sha256": checkpoint_sha256,
-                "inference_mode": args.inference_mode,
                 "max_running_s": f"{float(args.max_running_s):.17g}",
             },
         )
@@ -444,7 +394,6 @@ def _prepare_lifecycle_inputs(
         runtime=runtime,
         policy_spec=info.spec,
         worker_config=worker_config,
-        deployment_config=deployment_config,
         evaluation_config=evaluation_config,
     )
 
@@ -458,7 +407,6 @@ def _start_lifecycle(inputs: _LifecycleInputs) -> int:
         inputs.policy_spec,
         inputs.worker_config,
         inputs.execute,
-        deployment_config=inputs.deployment_config,
         max_running_s=(
             None
             if inputs.evaluation_config is None
@@ -494,7 +442,7 @@ def _run_lifecycle(
     except Exception as exc:
         _print_compatibility_error(f"runtime projection failed: {exc}")
         return 1
-    if evaluation:
+    if execute:
         _print_evaluation_summary(info, inputs)
     try:
         return _start_lifecycle(inputs)

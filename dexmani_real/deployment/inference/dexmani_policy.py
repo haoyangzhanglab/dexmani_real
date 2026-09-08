@@ -28,8 +28,8 @@ class DexManiPolicyAdapter:
     def reset_episode(self) -> None:
         self._policy.reset_episode()
 
-    def predict(self, observation: PolicyObservation) -> np.ndarray:
-        return self._policy.predict(observation.arrays)
+    def predict_action_chunk(self, observation: PolicyObservation) -> np.ndarray:
+        return self._policy.predict_action_chunk(observation.arrays)
 
     def close(self) -> None:
         self._policy.close()

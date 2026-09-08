@@ -154,10 +154,10 @@ CLI override > YAML file > dexmani_real/config/defaults.py
 Real runtime 配置由 [`config/experiment.py`](dexmani_real/config/experiment.py) 唯一解析、校验和冻结；learned-policy 的 observation freshness、command progress、action validity 和 watchdog timing
 属于其 `policy` 段，模型 shape、modality、horizon 和 inference cadence 则来自 Policy public
 API 的 `PolicySpec`。Real 只校验 `PolicySpec` 的公开契约字段（observation fields / shape /
-dtype、`requires_hand`、`n_action_steps`、`action_key`、`control_action_dim`、`control_dt_s`），
+dtype、`requires_hand`、`chunk_size`、`n_action_steps`、`action_key`、`control_action_dim`、`control_dt_s`），
 不解析 Policy artifact 内部、`best_ckpt.json` 或历史格式；调度也不会对 action chunk 做
-temporal blending。`shadow`/`run` 的 sync/async 调度模式与 episode action-step 上限由
-`run_policy.py` CLI 明确提供；formal `eval` 则使用必填的 wall-clock budget `max_running_s`。
+temporal blending。`shadow`/`run`/`eval` 共用唯一周期调度；physical rollout 使用
+`--max-duration`，formal eval 必填。
 `pointcloud` 是与 EEF `policy.workspace` 分离的感知配置段；实时 worker、离线
 重建和诊断入口只从该段派生参数，并把点云策略与桌面语义写入 processed/Zarr。
 可在不启动硬件的情况下查看遥操作解析结果：
@@ -179,9 +179,9 @@ python examples/collect_teleop.py --print-config
 | 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取原始 `float64` arm target 与 logical hand target，再执行完整的 live-start、limits、workspace 与 collision 预检；包含多个 source 连续段的产物拒绝物理回放 |
 
 | learned policy 检查 | `python examples/run_policy.py list`；`python examples/run_policy.py check <experiment> --device <device>` | 仅列出实验，或经 Policy public API strict restore + warmup + synthetic predict；不连接硬件 |
-| learned policy shadow | `python examples/run_policy.py shadow <experiment> [--inference-mode sync\|async] [--max-action-steps N]` | 连接真实 sensor 与 arm/XHand feedback，执行 inference、IK 和 SafetyGate；默认 sync，结构性禁止 actuator publication 与 home |
-| learned policy run | `python examples/run_policy.py run <experiment> [--inference-mode sync\|async]` | 连接并控制 xArm7/XHand；默认 sync；每个 episode 都需 H 完成 hand + collision-checked arm home，再以新 B 启动 |
-| learned policy formal eval | `python examples/run_policy.py eval <experiment> --max-running-s S --task-label TASK --operator NAME` | 连接并控制 xArm7/XHand；默认 async，强制 camera + RecorderIO，写入隔离的 `evaluations/`，并保存 SUCCESS/FAILURE/INVALID trial |
+| learned policy shadow | `python examples/run_policy.py shadow <experiment> [--eval-seed N]` | 连接真实 sensor 与 arm/XHand feedback，执行 inference、IK 和 SafetyGate；禁止 actuator publication 与 home |
+| learned policy run | `python examples/run_policy.py run <experiment> [--eval-seed N] [--max-duration S]` | 连接并控制 xArm7/XHand；H 后 B 启动单次 rollout，并录制 camera/raw episode |
+| learned policy formal eval | `python examples/run_policy.py eval <experiment> --eval-seed N --max-duration S` | 共用 run 控制与录制路径，写入 `rollouts/`，标注 SUCCESS/FAILURE/INVALID |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |
@@ -220,49 +220,47 @@ python examples/run_policy.py check <policy/task/experiment> --device cuda:0
 
 ```bash
 python examples/run_policy.py shadow <policy/task/experiment> \
-  --device cuda:0 --max-action-steps 16
+  --device cuda:0 --eval-seed 0
 ```
 
-`run` 才会发布 coupled arm/hand command。每个 episode 都必须在 ARMED 状态完成一次
+`run` 会发布 coupled arm/hand command 并录制 raw episode。开始前必须在 ARMED 状态完成一次
 `H → B`：H 先执行 XHand home 与 collision-checked arm home，B 才开始执行。运行中 S 停止当前
-episode 并回到 ARMED；Q 有界退出；ESC 锁存 fault。下一 episode 必须重新 `H → B`：
+episode 并回到 ARMED；Q 有界退出；ESC 锁存 fault。结束后可 H 回家，但再次 B 被拒绝；下一次 rollout 需要重新启动命令：
 
 ```bash
 python examples/run_policy.py run <policy/task/experiment> \
-  --device cuda:0 \
-  --runtime-config <runtime-overrides.yaml> \
-  --inference-mode sync \
-  --max-action-steps 96
+  --device cuda:0 --eval-seed 0 --max-duration 60
 ```
 
-`shadow` 和 `run` 都支持 `--runtime-config`、`--inference-mode`（`sync` 或 `async`）和正整数
-`--max-action-steps`；省略时分别使用 canonical runtime defaults、`sync` 和无限 episode。
-runtime YAML 只需写实际覆盖项。子命令所属参数可放在子命令前或后。它们都会连接真实设备，运行前必须
+`shadow`、`run`、`eval` 共用周期推理和带时间戳的执行路径，使用 canonical runtime defaults。
+它们都会连接真实设备，运行前必须
 确认工作区、标定、急停和操作者授权；推荐顺序是 `check → shadow → run`。
 
-`eval` 是正式研究 rollout，不是 `run` 的录制开关。它要求固定的 wall-clock timeout、task label
-和 operator，默认使用 `async`（可以显式用 `--inference-mode sync` 做 mode ablation），不提供
-`--max-action-steps` 作为第二个实验预算：
+`eval` 与 `run` 共用控制和录制路径，增加正式 outcome 标注，并要求 eval seed 和 wall-clock duration。
+task label 默认来自 experiment，operator 仅为 metadata：
 
 ```bash
 python examples/run_policy.py eval <policy/task/experiment> \
   --device cuda:0 \
-  --max-running-s 60 \
+  --eval-seed 0 --max-duration 60 \
   --task-label pick_cube \
   --operator researcher
 ```
 
 启动前会计算 checkpoint SHA-256 并打印 selector、checkpoint、observation/action contract、control
 rate、mode、timeout、task、operator 和输出目录。默认输出为
-`evaluations/<policy>/<task>/<experiment>/`；`--output-dir` 可以改变组织方式，但其 resolved path
-不得与 demonstration `episodes/` namespace 重叠。formal eval 即使对 state-only policy 也启动 camera
+`rollouts/<policy>/<task>/<experiment>/<run|eval>/seed_NNN/`，每次生成独立 episode 目录。
+run/eval 即使对 state-only policy 也启动 camera
 作为审计证据，camera payload 不会因此自动进入 model observation。
 
 每个 B 在完成 `H → B` 的物理 home 前置条件后，必须先获得 RecorderIO 的 `RECORDING` 确认，才进入
-RUNNING；第一条 policy command 前会记录一个真实的 held initial sample。按键为 B（开始）、S（SUCCESS）、
+RUNNING；这是唯一 startup recording barrier，第一条正常 control-grid sample 即为首条记录。
+控制先完成 publish/reject，再记录结果，不另建 evaluation observation 或证据准入事务。
+eval 按键为 B（开始）、S（SUCCESS）、
 C（FAILURE）、D（INVALID）、H（home）、Q（以 INVALID 结束并有界退出）、ESC（即时 e-stop）。正常
-SUCCESS/FAILURE/INVALID 都保存现有 recorder transaction；recorder/storage/camera integrity failure 仍按
-fail-closed 语义中止，绝不把不完整数据伪装成完整 episode。
+SUCCESS/FAILURE/INVALID 都使用 `stop_episode(save=True)`；task outcome 独立保存到 `result.json`。
+recording integrity failure 立即标记 INVALID 并撤销未来 motion generation，不等待 arm/hand acceptance。
+正常结束后继续允许 H 回家和 Q 退出。raw-v24 的 `/meta/success` 仅是 legacy storage commit flag。
 
 ### Learned policy 实时点云
 
@@ -320,20 +318,20 @@ XHand 需求由 `PolicySpec.requires_hand` 决定，不由 CLI
 重复声明。
 
 inference 每次只发布一个带 observation provenance 的不可变 flat `Prediction` IPC record 到单槽 latest-wins
-ring；动作数组为策略 representation 选择的有限 `float64[N,D]`。默认 `sync` 在 prediction
-完成或因 source stale 丢弃后请求下一次推理；可选 `async` 按
-`n_action_steps * control_dt_s` 的绝对 cadence 推理，并让新 prediction 替换旧 suffix。policy executor 以
-`executor_poll_hz`（默认 128 Hz）轮询且每轮至多处理一个 endpoint，endpoint 仍只在
-`control_hz` control grid（默认 16 Hz）到期时发布；
-`--max-action-steps N` 在 N 个 successful/rejected terminal steps 后停止发布；真机模式会等待
-最后一个已发布 action 被 arm/hand acceptance watermark 覆盖，再以 `TRUNCATED` 结束 episode。
+ring；动作数组为有限 `float64[chunk_size,D]`，来自 `predict_action_chunk()`。
+inference 按 `n_action_steps * control_dt_s` 的绝对 cadence 查询，计算期间旧 future tail 继续可用。
+新 prediction 的 `target_time <= now` 前缀直接丢弃；全过期 prediction 丢弃并保留已有合法计划或 hold。
+executor 在每个 target 前一个控制周期内发布该未来目标，以 control grid 限制发布频率；
+错过的 target 不补发，decode/IK 后再次检查 target 尚未过期，不产生 catch-up burst。
+SDK 边界仍使用原有 command validity、generation 和最新命令检查。
 
 实时策略发布不做软件碰撞插值，保留关节限位、工作空间、时效和 arm/hand 异步进度 watchdog；碰撞响应由
 机械臂控制器灵敏度与现场操作员负责。`H` 的 `return_home` 仍使用手部、静态环境和桌面的
 完整碰撞检查路径。
 
-policy executor 每秒输出 live metrics，并在每个 B→停止/中止/故障/截断边界输出一条 compact
-episode summary。summary 只是在内存中累计的调试信息，不写 receipt、sidecar 或资格证明文件。
+policy executor 每秒输出 live metrics，并在每个 B→停止/中止/故障边界输出 compact
+episode summary。physical rollout 的结果和 metrics snapshot 写入 `result.json`；rejection 等计数
+覆盖本次 rollout，不会被每秒日志清零。timing snapshot 是最近样本，不是全 episode 的 latency 分位数。
 
 点云缺失、过期、shape/dtype 错误、非有限值或颜色越界时 inference fail closed，不发布
 新的 Prediction。实时路径当前仅支持静态 `eye_to_hand` 标定；`eye_in_hand` 需要另行建立与

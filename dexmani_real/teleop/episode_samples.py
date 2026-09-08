@@ -36,7 +36,7 @@ def stop_recording(
 ) -> None:
     """Stop recording if active. Non-blocking — poll completion in main loop."""
     if was_active and recorder is not None:
-        recorder.stop_episode(success=save, reason=reason)
+        recorder.stop_episode(save=save, reason=reason)
         if shared is not None:
             shared.is_recording.value = False
 
