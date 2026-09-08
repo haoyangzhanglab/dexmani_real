@@ -41,6 +41,8 @@ control safety gate → command publication → arm / hand workers
 - `config/experiment.py` 拥有 YAML/CLI patch 和统一 runtime validation；每次加载得到独立配置，打印时才生成 YAML。
 - `RuntimeChannels` 是跨进程状态的唯一 allocation owner；固定 wire shape、dtype 和持久化
   record layout 由 `dexmani_real/ipc/schema.py` 定义。
+- `teleop/control_loop/grid.py` 拥有 feedback 连续错误计数和启动时解析的私有 command-limit
+  cache；`action_proposal.py` 拥有 EMA pose smoothing。独立 health/smoothing 包装模块已移除。
 - learned-policy lifecycle 先等待 inference restore/warmup，再启动所需传感器和执行器 worker；
   supervisor 只监督实际运行的 process heartbeat，readiness 只负责有界启动等待。
 - teleop lifecycle 按 dependency → policy → VR 分阶段启动启用的 worker；父进程 readiness

@@ -4,27 +4,11 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
 from typing import Callable
 
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-
-@dataclass(frozen=True)
-class LoopRateStats:
-    """Immutable snapshot of one rate manager's accumulated loop health."""
-
-    target_period_s: float
-    loop_count: int
-    last_work_duration_s: float
-    max_work_duration_s: float
-    deadline_overrun_count: int
-    missed_slot_count: int
-    long_block_reanchor_count: int
-    elapsed_s: float
-    actual_hz: float
 
 
 class LoopRate:
@@ -68,33 +52,9 @@ class LoopRate:
         self._busy_wait = clock is None if busy_wait is None else bool(busy_wait)
         self._warn_on_overrun = warn_on_overrun
         started = self._clock()
-        self._started_at = started
-        self._cycle_started_at = started
-        self._last_completed_at = started
         self._next_deadline = started + self.period
         self._overdue_throttle: int = 0
-        self._loop_count = 0
-        self._last_work_duration_s = 0.0
-        self._max_work_duration_s = 0.0
-        self._deadline_overrun_count = 0
         self._missed_slot_count = 0
-        self._long_block_reanchor_count = 0
-
-    @property
-    def stats(self) -> LoopRateStats:
-        """Return a read-only point-in-time copy of accumulated statistics."""
-        elapsed = max(0.0, self._last_completed_at - self._started_at)
-        return LoopRateStats(
-            target_period_s=self.period,
-            loop_count=self._loop_count,
-            last_work_duration_s=self._last_work_duration_s,
-            max_work_duration_s=self._max_work_duration_s,
-            deadline_overrun_count=self._deadline_overrun_count,
-            missed_slot_count=self._missed_slot_count,
-            long_block_reanchor_count=self._long_block_reanchor_count,
-            elapsed_s=elapsed,
-            actual_hz=(self._loop_count / elapsed if elapsed > 0.0 else 0.0),
-        )
 
     def wait(self) -> None:
         """Sleep until the next absolute cycle deadline with precision.
@@ -109,9 +69,6 @@ class LoopRate:
           3. Busy-wait for the final precision window
         """
         now = self._clock()
-        work_duration_s = max(0.0, now - self._cycle_started_at)
-        self._last_work_duration_s = work_duration_s
-        self._max_work_duration_s = max(self._max_work_duration_s, work_duration_s)
         remaining = self._next_deadline - now
 
         if remaining > 0:
@@ -127,13 +84,11 @@ class LoopRate:
             self._next_deadline += self.period
         else:
             lateness = -remaining
-            self._deadline_overrun_count += 1
             self._missed_slot_count += int(
                 (lateness + self.period * 1e-12) // self.period
             )
 
             if lateness > 1.0:
-                self._long_block_reanchor_count += 1
                 self._next_deadline = now + self.period
                 self._overdue_throttle = 0
             else:
@@ -159,11 +114,6 @@ class LoopRate:
                     # Small overrun: keep the absolute grid, next tick absorbs it
                     self._next_deadline += self.period
 
-        completed = self._clock()
-        self._loop_count += 1
-        self._last_completed_at = completed
-        self._cycle_started_at = completed
-
     def reset(self) -> None:
         """Reset the deadline and overdue throttle to the current time.
 
@@ -173,5 +123,4 @@ class LoopRate:
         """
         now = self._clock()
         self._next_deadline = now + self.period
-        self._cycle_started_at = now
         self._overdue_throttle = 0

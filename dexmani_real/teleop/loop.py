@@ -38,17 +38,19 @@ from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
+from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.safety import (
     SafetyState,
     invalidate_coupled_commands,
     transition,
 )
 from dexmani_real.teleop.audio_feedback import AudioFeedback
-from dexmani_real.teleop.config import TeleopCommandLimits, TeleopConfig
+from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.control_loop.camera_freshness import CameraFreshnessTracker
 from dexmani_real.teleop.control_loop.grid import (
     TeleopController,
     TeleopGridResources,
+    _TeleopCommandLimits,
     run_control_grid_tick,
 )
 from dexmani_real.teleop.control_loop.hand_control import (
@@ -61,14 +63,13 @@ from dexmani_real.teleop.episode_samples import (
     RECORDING_TACTILE_MAX_AGE_NS,
     stop_recording,
 )
-from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
+from dexmani_real.teleop.homing import do_configured_teleop_home
 from dexmani_real.teleop.retargeting.retargeter import (
     DexPilotHandRetargeter,
     TAGHandRetargeter,
 )
-from dexmani_real.teleop.health import hand_feedback_issue
-from dexmani_real.teleop.homing import do_configured_teleop_home
 from dexmani_real.teleop.vr_transform import load_vr_transform
+from dexmani_real.utils.feedback import validate_hand_feedback
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 from dexmani_real.utils.rate import LoopRate
 
@@ -266,7 +267,19 @@ def _begin_feedback_issue(
         max_age_s=cfg.runtime.policy.vr_mapping.stale_threshold_s,
     ):
         return "VR hand feedback is unavailable or stale"
-    hand_issue = hand_feedback_issue(cfg, hand_state)
+    if not cfg.runtime.policy.hand_enabled:
+        hand_issue = None
+    elif hand_state is None:
+        hand_issue = "hand feedback unavailable"
+    else:
+        hand_issue = validate_hand_feedback(
+            connected=bool(hand_state["connected"][0]),
+            state_valid=bool(hand_state["state_valid"][0]),
+            source_monotonic_ns=int(hand_state["source_monotonic_ns"][0]),
+            now_monotonic_ns=time.monotonic_ns(),
+            max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
+            qpos=np.asarray(hand_state["qpos"][0]),
+        )
     if hand_issue is not None:
         return hand_issue
     if not recording_enabled or not cfg.runtime.policy.hand_enabled:
@@ -294,7 +307,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
     """
     cfg = config
     logger.debug("teleop_loop: LOADING")
-    command_limits = TeleopCommandLimits.from_config(cfg)
+    command_limits = _TeleopCommandLimits.from_config(cfg)
     recording_enabled = bool(cfg.runtime.policy.recording_enabled)
     try:
         planner, arm_mapper, safety_gate, recorder = _load_control_resources(
@@ -312,7 +325,17 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
     arm_state = read_arm_state_causal(shared)
     hand_state = read_hand_state_causal(shared)
     if cfg.runtime.policy.hand_enabled:
-        initial_hand_issue = hand_feedback_issue(cfg, hand_state)
+        if hand_state is None:
+            initial_hand_issue = "hand feedback unavailable"
+        else:
+            initial_hand_issue = validate_hand_feedback(
+                connected=bool(hand_state["connected"][0]),
+                state_valid=bool(hand_state["state_valid"][0]),
+                source_monotonic_ns=int(hand_state["source_monotonic_ns"][0]),
+                now_monotonic_ns=time.monotonic_ns(),
+                max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
+                qpos=np.asarray(hand_state["qpos"][0]),
+            )
         if initial_hand_issue is not None:
             logger.error(
                 "Teleop: initial hand feedback rejected: %s", initial_hand_issue

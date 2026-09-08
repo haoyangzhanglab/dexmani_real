@@ -4,63 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import numpy as np
-
 from dexmani_real.config.experiment import ExperimentConfig, resolve_experiment_config
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
-
-
-@dataclass(frozen=True)
-class TeleopCommandLimits:
-    """Resolved command bounds used by the teleoperation process."""
-
-    arm_joint_lower_rad: np.ndarray
-    arm_joint_upper_rad: np.ndarray
-    teleop_arm_max_delta_rad_per_tick: np.ndarray | None
-    hand_home_qpos_rad: np.ndarray
-    hand_command_lower_rad: np.ndarray
-    hand_command_upper_rad: np.ndarray
-    # Teleop endpoint shaping bound. The hand worker independently reuses this
-    # value for SDK-level slew protection.
-    hand_max_delta_rad_per_tick: np.ndarray
-    workspace_bounds_world_m: np.ndarray
-
-    @classmethod
-    def from_config(cls, config: "TeleopConfig") -> "TeleopCommandLimits":
-        arm_lower = np.asarray(config.runtime.arm.joint_limit_lower, dtype=np.float64)
-        arm_upper = np.asarray(config.runtime.arm.joint_limit_upper, dtype=np.float64)
-        configured_delta = config.runtime.policy.teleop_arm_max_delta_rad_per_tick
-        max_delta = (
-            None
-            if configured_delta is None
-            else np.broadcast_to(
-                np.asarray(configured_delta, dtype=np.float64), arm_lower.shape
-            ).copy()
-        )
-        hand_lower = np.asarray(config.runtime.hand.qpos_min_rad, dtype=np.float64)
-        hand_max_delta = np.broadcast_to(
-            np.asarray(
-                config.runtime.hand.hand_max_delta_rad_per_tick,
-                dtype=np.float64,
-            ),
-            hand_lower.shape,
-        ).copy()
-        return cls(
-            arm_joint_lower_rad=arm_lower.copy(),
-            arm_joint_upper_rad=arm_upper.copy(),
-            teleop_arm_max_delta_rad_per_tick=max_delta,
-            hand_home_qpos_rad=np.deg2rad(
-                np.asarray(config.runtime.hand.home_qpos_deg, dtype=np.float64)
-            ),
-            hand_command_lower_rad=hand_lower.copy(),
-            hand_command_upper_rad=np.asarray(
-                config.runtime.hand.qpos_max_rad, dtype=np.float64
-            ).copy(),
-            hand_max_delta_rad_per_tick=hand_max_delta,
-            workspace_bounds_world_m=np.asarray(
-                config.runtime.policy.workspace.as_tuple(), dtype=np.float64
-            ).copy(),
-        )
 
 
 @dataclass(frozen=True)

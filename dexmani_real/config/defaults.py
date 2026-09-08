@@ -288,7 +288,6 @@ class ArmParams:
     ip: str = "192.168.1.111"
 
     expected_axis: int = 7
-    device_profile: str | None = None
 
     table_z_surface_m: float = 0.022
     hand_safety_margin_m: float = 0.05
@@ -366,8 +365,6 @@ class ArmParams:
             )
         if not isinstance(self.expected_axis, int) or self.expected_axis <= 0:
             raise ValueError("expected_axis must be a positive integer")
-        if self.device_profile is not None and not self.device_profile:
-            raise ValueError("device_profile must be non-empty when set")
         if not np.isfinite(self.tcp_load_mass_kg) or self.tcp_load_mass_kg <= 0:
             raise ValueError("tcp_load_mass_kg must be finite and positive")
         cog = np.asarray(self.tcp_load_cog_mm, dtype=np.float64)
