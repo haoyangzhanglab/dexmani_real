@@ -273,7 +273,6 @@ def _source_gap_findings(
     arrays: Mapping[str, np.ndarray],
     selected: np.ndarray,
     reason_masks: Mapping[str, np.ndarray],
-    temporal_excluded: np.ndarray,
     config: ProcessingConfig,
     *,
     grid_dt_s: float,
@@ -313,8 +312,6 @@ def _source_gap_findings(
             for name, mask in reason_masks.items()
             if right > left + 1 and np.any(mask[removed_slice])
         ]
-        if right > left + 1 and np.any(temporal_excluded[removed_slice]):
-            removed_reasons.append("temporal_high_confidence")
         risky = bool(
             sample_delta != row_delta
             or abs(timestamp_delta_s - row_delta * grid_dt_s)
@@ -339,22 +336,18 @@ def _source_gap_findings(
 
 
 def _reason_bits(
-    reason_masks: Mapping[str, np.ndarray], temporal_excluded: np.ndarray
+    reason_masks: Mapping[str, np.ndarray], frame_count: int
 ) -> tuple[np.ndarray, tuple[str, ...]]:
     """Encode all source-row deletion reasons; kept rows remain exactly zero."""
 
-    names = tuple(reason_masks) + ("temporal_high_confidence",)
+    names = tuple(reason_masks)
     if len(names) > 64:
         raise ValueError("drop-reason contract exceeds uint64 capacity")
-    length = len(temporal_excluded)
-    bits = np.zeros(length, dtype=np.uint64)
-    for bit, name in enumerate(names[:-1]):
+    bits = np.zeros(frame_count, dtype=np.uint64)
+    for bit, name in enumerate(names):
         bits[np.asarray(reason_masks[name], dtype=bool)] |= np.uint64(1) << np.uint64(
             bit
         )
-    bits[np.asarray(temporal_excluded, dtype=bool)] |= np.uint64(1) << np.uint64(
-        len(names) - 1
-    )
     return bits, names
 
 
@@ -611,22 +604,19 @@ def analyze_episode(
     for mask in reason_masks.values():
         hard_invalid |= mask
     base_valid = ~hard_invalid
-    keep_mask = base_valid & ~temporal_assessment.excluded_mask
+    keep_mask = base_valid
     selected = np.flatnonzero(keep_mask).astype(np.int64)
-    bits, reason_names = _reason_bits(reason_masks, temporal_assessment.excluded_mask)
+    bits, reason_names = _reason_bits(reason_masks, frame_count)
     source_gaps = _source_gap_findings(
         arrays,
         selected,
         reason_masks,
-        temporal_assessment.excluded_mask,
         config,
         grid_dt_s=timing.grid_dt_s,
     )
     hard_invalid_reason_names = tuple(
         name for name in reason_masks if name != "annotation_excluded_row"
     )
-    if np.any(temporal_assessment.excluded_mask):
-        hard_invalid_reason_names += ("temporal_high_confidence",)
     warnings: list[str] = []
     if source_gaps:
         warnings.append(

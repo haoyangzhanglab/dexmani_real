@@ -86,38 +86,24 @@ def _mark_persistent_runs(
             destination[run_start:range_end] = True
 
 
-def _guard_within_ranges(
-    mask: np.ndarray,
-    ranges: list[tuple[int, int]],
-    *,
-    before: int,
-    after: int,
-) -> np.ndarray:
-    guarded = np.zeros_like(mask, dtype=bool)
-    for range_start, range_end in ranges:
-        indices = np.flatnonzero(mask[range_start:range_end]) + range_start
-        for index in indices:
-            guarded[
-                max(range_start, index - before) : min(range_end, index + after + 1)
-            ] = True
-    return guarded
-
-
 @dataclass(frozen=True)
 class TemporalQualityAssessment:
-    """Auditable temporal findings and the policy-selected exclusion mask."""
+    """Auditable temporal findings that do not alter source-row admission."""
 
     suspect_masks: Mapping[str, np.ndarray]
     high_confidence_masks: Mapping[str, np.ndarray]
-    excluded_mask: np.ndarray
     score_statistics: Mapping[str, dict[str, float | int | None]]
     detectors_run: bool
 
     def to_dict(self, policy: QualityPolicy) -> dict[str, Any]:
-        suspect_union = np.zeros_like(self.excluded_mask, dtype=bool)
+        all_masks = tuple(self.suspect_masks.values()) + tuple(
+            self.high_confidence_masks.values()
+        )
+        frame_count = len(all_masks[0]) if all_masks else 0
+        suspect_union = np.zeros(frame_count, dtype=bool)
         for mask in self.suspect_masks.values():
             suspect_union |= mask
-        high_confidence_union = np.zeros_like(self.excluded_mask, dtype=bool)
+        high_confidence_union = np.zeros(frame_count, dtype=bool)
         for mask in self.high_confidence_masks.values():
             high_confidence_union |= mask
         return {
@@ -143,8 +129,6 @@ class TemporalQualityAssessment:
                 if np.any(mask)
             },
             "high_confidence_union_count": int(np.count_nonzero(high_confidence_union)),
-            "excluded_count": int(np.count_nonzero(self.excluded_mask)),
-            "excluded_ranges": _mask_ranges(self.excluded_mask),
             "score_statistics": dict(self.score_statistics),
         }
 
@@ -157,16 +141,15 @@ def assess_temporal_quality(
     *,
     tracking_error_warn_rad: float,
 ) -> TemporalQualityAssessment:
-    """Detect anomalies locally; only STRICT excludes high-confidence rows."""
+    """Detect temporal anomalies locally without changing source-row admission."""
 
     base = np.asarray(base_valid, dtype=bool)
     boundaries = np.asarray(break_before, dtype=bool)
     if base.ndim != 1 or boundaries.shape != base.shape:
         raise ValueError("base_valid and break_before must be same-shape 1-D masks")
     frame_count = len(base)
-    empty = np.zeros(frame_count, dtype=bool)
     if config.policy is QualityPolicy.HARD_ONLY:
-        return TemporalQualityAssessment({}, {}, empty, {}, False)
+        return TemporalQualityAssessment({}, {}, {}, False)
 
     action_arm = np.asarray(arrays["action_arm"], dtype=np.float64)
     action_hand = np.asarray(arrays["action_hand"], dtype=np.float64)
@@ -301,23 +284,9 @@ def assess_temporal_quality(
         "arm_feedback_stall": feedback_stall,
         "arm_command_apply_stall": command_apply_stall,
     }
-    high_confidence = np.zeros(frame_count, dtype=bool)
-    for mask in high_confidence_masks.values():
-        high_confidence |= mask
-    excluded = (
-        _guard_within_ranges(
-            high_confidence,
-            ranges,
-            before=config.strict_guard_before_frames,
-            after=config.strict_guard_after_frames,
-        )
-        if config.policy is QualityPolicy.STRICT
-        else np.zeros(frame_count, dtype=bool)
-    )
     return TemporalQualityAssessment(
         suspect_masks=suspect_masks,
         high_confidence_masks=high_confidence_masks,
-        excluded_mask=excluded,
         score_statistics={
             "arm_action_step_rad": _finite_stats(arm_step_score),
             "hand_action_step_rad": _finite_stats(hand_step_score),

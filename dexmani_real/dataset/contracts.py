@@ -55,16 +55,13 @@ class QualityPolicy(str, Enum):
 
     HARD_ONLY = "hard_only"
     AUDIT = "audit"
-    STRICT = "strict"
 
 
 @dataclass(frozen=True)
 class TemporalQualityConfig:
     """Resolved thresholds for conservative temporal anomaly detection.
 
-    Abrupt steps and persistent tracking error are audit-only evidence.  Strict
-    processing excludes only reversible one-frame command impulses and
-    high-confidence arm command/feedback stalls.
+    Findings are audit evidence only. They never exclude otherwise-valid rows.
     """
 
     policy: QualityPolicy = QualityPolicy.AUDIT
@@ -82,8 +79,6 @@ class TemporalQualityConfig:
     stall_arm_command_delta_rad: float = 0.15
     stall_arm_state_delta_rad: float = 0.02
     stall_max_applied_command_advance: int = 1
-    strict_guard_before_frames: int = 0
-    strict_guard_after_frames: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.policy, QualityPolicy):
@@ -117,14 +112,12 @@ class TemporalQualityConfig:
             or self.stall_window_frames < 2
         ):
             raise ValueError("stall_window_frames must be an integer >= 2")
-        nonnegative_ints = (
-            self.stall_max_applied_command_advance,
-            self.strict_guard_before_frames,
-            self.strict_guard_after_frames,
-        )
-        if any(not isinstance(value, int) or value < 0 for value in nonnegative_ints):
+        if (
+            not isinstance(self.stall_max_applied_command_advance, int)
+            or self.stall_max_applied_command_advance < 0
+        ):
             raise ValueError(
-                "temporal quality counts and guards must be non-negative integers"
+                "stall_max_applied_command_advance must be a non-negative integer"
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -140,8 +133,6 @@ class TemporalQualityConfig:
             "stall_arm_command_delta_rad": self.stall_arm_command_delta_rad,
             "stall_arm_state_delta_rad": self.stall_arm_state_delta_rad,
             "stall_max_applied_command_advance": self.stall_max_applied_command_advance,
-            "strict_guard_before_frames": self.strict_guard_before_frames,
-            "strict_guard_after_frames": self.strict_guard_after_frames,
         }
 
 
@@ -149,9 +140,8 @@ class TemporalQualityConfig:
 class ProcessingConfig:
     """Resolved, immutable processing policy.
 
-    Soft quality metrics never remove individual rows.  An explicit strict
-    temporal policy may exclude only its high-confidence findings before
-    ``horizon`` and ``min_full_windows`` admit the compact episode.
+    Temporal quality metrics never remove individual rows. Hard validity,
+    ``horizon``, and ``min_full_windows`` admit the compact episode.
     """
 
     profile: OutputProfile
