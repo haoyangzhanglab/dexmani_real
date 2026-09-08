@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from types import MappingProxyType
 
 import numpy as np
 
@@ -42,7 +41,7 @@ class HomingParams:
     request_queue_timeout_s: float = 0.2
     state_max_age_s: float = 0.5
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         values = (
             self.convergence_rad,
             self.step_interval_s,
@@ -74,9 +73,9 @@ class WorkspaceBounds:
     z_min: float = 0.05
     z_max: float = 0.50
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         bounds = np.asarray(self.as_tuple(), dtype=np.float64)
-        if not np.all(np.isfinite(bounds)) or np.any(bounds[:, 0] > bounds[:, 1]):
+        if not np.all(np.isfinite(bounds)) or np.any(bounds[:, 0] >= bounds[:, 1]):
             raise ValueError("workspace bounds must be finite and ordered")
 
     def as_tuple(
@@ -108,7 +107,7 @@ class EMAParams:
     alpha_pos: float = 0.5
     alpha_rot: float = 0.5
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         if not (np.isfinite(self.alpha_pos) and np.isfinite(self.alpha_rot)):
             raise ValueError("EMA alphas must be finite")
         if not (0.0 <= self.alpha_pos <= 1.0 and 0.0 <= self.alpha_rot <= 1.0):
@@ -124,7 +123,7 @@ class VRMappingParams:
     max_delta_rot_rad: float = 3.0  # total-from-reset rotation cap
     stale_threshold_s: float = 0.5
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         values = (
             self.pos_scale,
             self.rot_scale,
@@ -150,7 +149,7 @@ class StaticCollisionBox:
     size_xyz_m: tuple[float, float, float] = (1.0, 1.0, 1.0)
     quat_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         if (
             not isinstance(self.name, str)
             or not self.name.strip()
@@ -160,11 +159,6 @@ class StaticCollisionBox:
             raise ValueError(
                 "static collision box name must be non-empty and must not use reserved name 'table'"
             )
-        for field_name in ("center_xyz_m", "size_xyz_m", "quat_wxyz"):
-            if not isinstance(getattr(self, field_name), tuple):
-                raise TypeError(
-                    f"static collision box {field_name} must be an immutable tuple"
-                )
         center = np.asarray(self.center_xyz_m, dtype=np.float64)
         size = np.asarray(self.size_xyz_m, dtype=np.float64)
         quat = np.asarray(self.quat_wxyz, dtype=np.float64)
@@ -202,7 +196,7 @@ class TableCollisionConfig:
     soft_clearance_m: float = 0.02
     allowed_contact_links: tuple[str, ...] = ("link_base",)
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         if self.plane_path is not None and (
             not isinstance(self.plane_path, str) or not self.plane_path.strip()
         ):
@@ -226,12 +220,12 @@ class TableCollisionConfig:
             raise ValueError("table size and thickness must be finite and positive")
         if not np.isfinite(self.soft_clearance_m) or self.soft_clearance_m < 0.0:
             raise ValueError("table soft_clearance_m must be finite and non-negative")
-        if not isinstance(self.allowed_contact_links, tuple) or any(
+        if any(
             not isinstance(name, str) or not name.strip()
             for name in self.allowed_contact_links
         ):
             raise TypeError(
-                "table allowed_contact_links must be a tuple of non-empty link names"
+                "table allowed_contact_links must contain non-empty link names"
             )
         if len(self.allowed_contact_links) != len(set(self.allowed_contact_links)):
             raise ValueError("table allowed_contact_links must be unique")
@@ -244,15 +238,7 @@ class EnvironmentConfig:
     table: TableCollisionConfig = field(default_factory=TableCollisionConfig)
     static_boxes: tuple[StaticCollisionBox, ...] = ()
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.table, TableCollisionConfig):
-            raise TypeError("environment.table must be a TableCollisionConfig value")
-        if not isinstance(self.static_boxes, tuple) or any(
-            not isinstance(box, StaticCollisionBox) for box in self.static_boxes
-        ):
-            raise TypeError(
-                "environment.static_boxes must be a tuple of StaticCollisionBox values"
-            )
+    def validate(self) -> None:
         names = [box.name for box in self.static_boxes]
         if len(names) != len(set(names)):
             raise ValueError("environment.static_boxes names must be unique")
@@ -326,7 +312,7 @@ class ArmParams:
     def max_joint_acceleration_rad_per_s2(self) -> float:
         return float(np.deg2rad(self.max_joint_acceleration_deg_per_s2))
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         home = np.asarray(self.home_qpos, dtype=np.float64)
         lower = np.asarray(self.joint_limit_lower, dtype=np.float64)
         upper = np.asarray(self.joint_limit_upper, dtype=np.float64)
@@ -337,7 +323,7 @@ class ArmParams:
         ):
             raise ValueError("arm home and joint limits must have 7 elements")
         if not np.all(np.isfinite(np.concatenate((home, lower, upper)))) or np.any(
-            lower > upper
+            lower >= upper
         ):
             raise ValueError("arm home and joint limits must be finite and ordered")
         if np.any(home < lower) or np.any(home > upper):
@@ -515,7 +501,7 @@ class HandParams:
         0.0,
     )
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         if self.ethercat_slave_position < -1:
             raise ValueError(
                 "hand ethercat_slave_position must be -1 (unknown) or non-negative"
@@ -556,6 +542,16 @@ class HandParams:
             _XHAND_RATED_QPOS_MAX_RAD,
             label="hand",
         )
+        for label, lower, upper in (
+            ("command", command_lower, command_upper),
+            (
+                "mechanical",
+                np.asarray(self.mechanical_qpos_min_rad, dtype=np.float64),
+                np.asarray(self.mechanical_qpos_max_rad, dtype=np.float64),
+            ),
+        ):
+            if np.any(lower >= upper):
+                raise ValueError(f"hand {label} limits must have lower < upper")
         home_rad = np.deg2rad(np.asarray(self.home_qpos_deg, dtype=np.float64))
         limit_tolerance_rad = 1e-9
         if (
@@ -668,7 +664,7 @@ class PolicyParams:
     hand_ramp_duration_s: float = 0.5  # smoothstep startup ramp, rate-independent
     hand_disconnect_timeout_s: float = 1.0
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         if not np.isfinite(self.control_hz) or self.control_hz <= 0:
             raise ValueError(f"control_hz={self.control_hz} must be > 0")
         if (
@@ -704,10 +700,6 @@ class PolicyParams:
             raise ValueError(
                 "policy action, freshness, and operator timeouts must be finite and positive"
             )
-        if not (0.0 <= self.ema.alpha_pos <= 1.0):
-            raise ValueError(f"ema.alpha_pos={self.ema.alpha_pos} must be in [0, 1]")
-        if not (0.0 <= self.ema.alpha_rot <= 1.0):
-            raise ValueError(f"ema.alpha_rot={self.ema.alpha_rot} must be in [0, 1]")
         if not np.isfinite(self.hand_ramp_duration_s) or self.hand_ramp_duration_s < 0:
             raise ValueError("hand_ramp_duration_s must be finite and >= 0")
         if (
@@ -789,7 +781,7 @@ class KeyboardTeleopParams:
     status_interval_frames: int = 50
     idle_interval_frames: int = 150
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         numeric = (
             self.control_hz,
             self.delta_pos_m,
@@ -859,7 +851,7 @@ class TAGRetargetingParams:
     prior_weight: float = 0.01
     """Weight for the optional human-flexion prior in both NLopt stages."""
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         robot = np.asarray(self.robot_finger_lengths, dtype=np.float64)
         human = np.asarray(self.human_finger_lengths, dtype=np.float64)
         euler = np.asarray(self.mano_to_urdf_euler, dtype=np.float64)
@@ -920,7 +912,7 @@ class DexPilotRetargetingParams:
     prior_weight: float = 0.05
     """Weight for the optional human-flexion prior."""
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         numeric = (
             self.scaling_factor,
             self.pinky_scale,
@@ -959,7 +951,7 @@ class VRParams:
     port: int = 8000
     hand_side: str = "both"  # "both" needed for HeadFrame
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         if not self.transport or not self.host or not self.hand_side:
             raise ValueError("VR transport, host, and hand_side must be non-empty")
         if not (1 <= self.port <= 65535):
@@ -998,7 +990,7 @@ class SafetyParams:
 
     supervisor_hz: float = 10.0
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         if not self.heartbeat_timeouts or any(
             not name or not np.isfinite(value) or value <= 0
             for name, value in self.heartbeat_timeouts.items()
@@ -1021,26 +1013,6 @@ class SafetyParams:
             raise ValueError("shutdown_timeout_s must be finite and positive")
         if not np.isfinite(self.supervisor_hz) or self.supervisor_hz <= 0:
             raise ValueError(f"supervisor_hz={self.supervisor_hz} must be > 0")
-        object.__setattr__(
-            self, "heartbeat_timeouts", MappingProxyType(dict(self.heartbeat_timeouts))
-        )
-        object.__setattr__(
-            self,
-            "readiness_timeouts_s",
-            MappingProxyType(dict(self.readiness_timeouts_s)),
-        )
-
-    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
-        """Keep the read-only mappings compatible with multiprocessing spawn."""
-        return (
-            type(self),
-            (
-                dict(self.heartbeat_timeouts),
-                dict(self.readiness_timeouts_s),
-                self.shutdown_timeout_s,
-                self.supervisor_hz,
-            ),
-        )
 
 
 @dataclass(frozen=True)
@@ -1073,7 +1045,7 @@ class CameraParams:
     def depth_shape(self) -> tuple[int, int]:
         return (self.height, self.width)
 
-    def __post_init__(self) -> None:
+    def validate(self) -> None:
         if self.width <= 0 or self.height <= 0 or self.fps <= 0:
             raise ValueError("camera width, height, and fps must be > 0")
         if self.warmup_frames < 0:

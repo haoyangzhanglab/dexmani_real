@@ -37,6 +37,7 @@ control safety gate → command publication → arm / hand workers
 
 - 每个硬件 SDK 只在其 owning worker 或 driver 内创建和使用；父进程只负责生命周期与监督。
 - planning 配置由调用方直接构造 dataclass；不提供通用字典反序列化入口。
+- `config/experiment.py` 拥有 YAML/CLI patch 和统一 runtime validation；每次加载得到独立配置，打印时才生成 YAML。
 - `RuntimeChannels` 是跨进程状态的唯一 allocation owner；固定 wire shape、dtype 和持久化
   record layout 由 `dexmani_real/ipc/schema.py` 定义。
 - learned-policy lifecycle 先等待 inference restore/warmup，再启动所需传感器和执行器 worker；

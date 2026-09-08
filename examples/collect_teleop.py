@@ -17,7 +17,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import yaml
 
-from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.config.experiment import config_as_dict, resolve_experiment_config
 from dexmani_real.teleop.session import (
     DEFAULT_TASK_NAME,
     run_teleop_experiment,
@@ -110,7 +110,10 @@ def main(argv: list[str] | None = None) -> int:
     ) as exc:
         parser.error(f"invalid experiment config: {exc}")
     if args.print_config:
-        print(runtime.canonical_yaml, end="")
+        print(
+            yaml.safe_dump(config_as_dict(runtime), allow_unicode=True, sort_keys=True),
+            end="",
+        )
         return 0
     if not bool(runtime.policy.hand_enabled) and not args.no_hand:
         parser.error(

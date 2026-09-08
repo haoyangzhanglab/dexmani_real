@@ -151,7 +151,7 @@ RealSense SDK、HTS hand-tracking SDK、Pinocchio、MPlib、NLopt、
 CLI override > YAML file > dexmani_real/config/defaults.py
 ```
 
-Real runtime 配置由 [`config/experiment.py`](dexmani_real/config/experiment.py) 唯一解析、校验和冻结；learned-policy 的 observation freshness、command progress、action validity 和 watchdog timing
+Real runtime 配置由 [`config/experiment.py`](dexmani_real/config/experiment.py) 加载为独立的 nested dataclass，并在加载边界统一校验；未知 YAML 字段会报错，`--print-config` 现场输出实际配置。learned-policy 的 observation freshness、command progress、action validity 和 watchdog timing
 属于其 `policy` 段，模型 shape、modality、horizon 和 inference cadence 则来自 Policy public
 API 的 `PolicySpec`。Real 只校验 `PolicySpec` 的公开契约字段（observation fields / shape /
 dtype、`requires_hand`、`chunk_size`、`n_action_steps`、`action_key`、`control_action_dim`、`control_dt_s`），
