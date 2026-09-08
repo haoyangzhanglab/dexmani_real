@@ -103,6 +103,42 @@ def _save(recorder):
     return destination
 
 
+@pytest.mark.parametrize("save", [True, False])
+def test_synchronous_finish_returns_reserved_path_and_resets(tmp_path, save):
+    recorder = _recorder(tmp_path)
+    assert recorder.finish_episode() is None
+    assert recorder.start_episode()
+    assert recorder.add_episode_frame(_frame(1))
+    reserved = recorder.episode_path
+    assert recorder.finish_episode(save=save, reason="synchronous") == reserved
+    assert Path(reserved).is_dir() is save
+    assert not recorder.is_recording
+    assert recorder.frame_count == 0
+    assert recorder.finish_episode() is None
+    assert recorder.start_episode()
+    assert recorder.add_episode_frame(_frame(2))
+    assert Path(recorder.finish_episode()).is_dir()
+
+
+def test_synchronous_finish_raises_after_failed_validation_cleanup(tmp_path):
+    recorder = _recorder(tmp_path)
+    assert recorder.start_episode()
+    assert recorder.add_episode_frame(_frame(1))
+    reserved = Path(recorder.episode_path)
+    with mock.patch.object(
+        recorder, "_validate_temp_episode", side_effect=OSError("invalid sidecar")
+    ):
+        with pytest.raises(RuntimeError, match="invalid sidecar"):
+            recorder.finish_episode()
+    assert not reserved.exists()
+    assert not list(tmp_path.glob(".tmp_episode_*"))
+    assert not recorder.is_recording
+    assert recorder._camera_writer is None and recorder._data_writer is None
+    assert recorder.start_episode()
+    assert recorder.add_episode_frame(_frame(2))
+    assert Path(recorder.finish_episode()).is_dir()
+
+
 def test_camera_calibration_survives_minimal_shared_metadata(tmp_path):
     from dexmani_real.recording.io_worker import _build_start_metadata
     from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry

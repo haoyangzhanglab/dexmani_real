@@ -483,6 +483,26 @@ class EpisodeRecorder:
         self._data_writer.append(batch)
         self._pending_rows.clear()
 
+    def finish_episode(self, save: bool = True, reason: str = "") -> str | None:
+        """Synchronously finish one episode and return its reserved final path.
+
+        Discard also returns the reserved path, although no raw episode is
+        published there. Failure raises after transaction cleanup. The caller
+        must serialize this operation with all other recorder access.
+        """
+        if self._stop_thread is not None and self._stop_thread.is_alive():
+            raise RuntimeError("previous episode finalization is still active")
+        if not self._recording:
+            return None
+        path = self._episode_dir
+        truncated = self._max_frames_reached
+        self._recording = False
+        self._max_frames_reached = False
+        self._stop_episode_impl(save, reason, truncated)
+        if self._stop_error is not None:
+            raise RuntimeError(self._stop_error)
+        return path
+
     def stop_episode(self, save: bool = True, reason: str = "") -> str | None:
         """Signal end of episode; return path immediately, flush in background.
 
