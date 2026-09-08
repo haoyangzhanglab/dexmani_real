@@ -36,9 +36,6 @@ from dexmani_real.utils.feedback import (
 from dexmani_real.utils.limits import (
     canonicalize_policy_hand_endpoint_roundoff,
 )
-from dexmani_real.utils.limits import (
-    validate_hand_command_bounds as _validate_hand_bounds,
-)
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -90,23 +87,6 @@ class _HandFeedbackSnapshot:
     qpos: np.ndarray
     accepted_action_id: int
     accepted_monotonic_ns: int = 0
-
-
-def validate_hand_command_bounds(
-    hand_cmd: np.ndarray,
-    operational_lower: np.ndarray,
-    operational_upper: np.ndarray,
-    mechanical_lower: np.ndarray,
-    mechanical_upper: np.ndarray,
-) -> np.ndarray:
-    """Reject a malformed target outside the configured command envelopes."""
-    return _validate_hand_bounds(
-        hand_cmd,
-        operational_lower,
-        operational_upper,
-        mechanical_lower,
-        mechanical_upper,
-    )
 
 
 def motion_rejection_reason(
@@ -215,7 +195,7 @@ def build_action_candidate(
     action_validity_s: float = 0.5,
     valid_until_monotonic_ns: int | None = None,
 ) -> ActionCandidate | None:
-    """Build one immutable, structurally valid joint command."""
+    """Assign command identity and delivery timing before semantic admission."""
     if run_generation is not None and (
         isinstance(run_generation, (bool, np.bool_))
         or not isinstance(run_generation, (int, np.integer))
@@ -238,7 +218,7 @@ def build_action_candidate(
         if scheduled_target_monotonic_ns is None
         else scheduled_target_monotonic_ns
     )
-    if scheduled_ns <= 0:
+    if not 0 < scheduled_ns <= now_ns:
         return None
     delivery_deadline_ns = now_ns + int(float(action_validity_s) * 1e9)
     if valid_until_monotonic_ns is not None:
@@ -257,8 +237,8 @@ def build_action_candidate(
         scheduled_target_monotonic_ns=scheduled_ns,
         target_monotonic_ns=target_ns,
         valid_until_monotonic_ns=delivery_deadline_ns,
-        arm_qpos=arm_qpos,
-        hand_qpos=hand_qpos,
+        arm_qpos=None if arm_qpos is None else np.asarray(arm_qpos, dtype=np.float64),
+        hand_qpos=None if hand_qpos is None else np.asarray(hand_qpos, dtype=np.float64),
         is_hold=is_hold,
     )
 
@@ -302,24 +282,24 @@ def prepare_command(
                 fatal=not unavailable,
             )
 
-    mechanical_lower = np.asarray(
-        (
-            hand_defaults.mechanical_qpos_min_rad
-            if hand_mechanical_lower_rad is None
-            else hand_mechanical_lower_rad
-        ),
-        dtype=np.float64,
-    )
-    mechanical_upper = np.asarray(
-        (
-            hand_defaults.mechanical_qpos_max_rad
-            if hand_mechanical_upper_rad is None
-            else hand_mechanical_upper_rad
-        ),
-        dtype=np.float64,
-    )
     hand_roundoff_canonicalized = False
     if candidate.hand_qpos is not None and canonicalize_policy_hand_roundoff:
+        mechanical_lower = np.asarray(
+            (
+                hand_defaults.mechanical_qpos_min_rad
+                if hand_mechanical_lower_rad is None
+                else hand_mechanical_lower_rad
+            ),
+            dtype=np.float64,
+        )
+        mechanical_upper = np.asarray(
+            (
+                hand_defaults.mechanical_qpos_max_rad
+                if hand_mechanical_upper_rad is None
+                else hand_mechanical_upper_rad
+            ),
+            dtype=np.float64,
+        )
         try:
             hand_qpos, hand_roundoff_canonicalized = (
                 canonicalize_policy_hand_endpoint_roundoff(
@@ -353,20 +333,6 @@ def prepare_command(
             hand_roundoff_canonicalized=hand_roundoff_canonicalized,
         )
 
-    if candidate.hand_qpos is not None and not canonicalize_policy_hand_roundoff:
-        try:
-            validate_hand_command_bounds(
-                candidate.hand_qpos,
-                gate.hand_low,
-                gate.hand_high,
-                mechanical_lower,
-                mechanical_upper,
-            )
-        except ValueError as exc:
-            return PreparedCommand(
-                reason=str(exc),
-                hand_roundoff_canonicalized=hand_roundoff_canonicalized,
-            )
     return PreparedCommand(
         candidate=candidate,
         hand_roundoff_canonicalized=hand_roundoff_canonicalized,
@@ -384,8 +350,6 @@ def prepare_joint_command(
     observation_anchor_monotonic_ns: int | None = None,
     action_validity_s: float = 0.5,
     hand_delta_reference_qpos: np.ndarray | None = None,
-    hand_mechanical_lower_rad: np.ndarray | None = None,
-    hand_mechanical_upper_rad: np.ndarray | None = None,
     arm_feedback_max_age_s: float,
     hand_feedback_max_age_s: float,
 ) -> PreparedCommand:
@@ -413,8 +377,6 @@ def prepare_joint_command(
         arm_feedback_max_age_s=arm_feedback_max_age_s,
         hand_feedback_max_age_s=hand_feedback_max_age_s,
         hand_delta_reference_qpos=hand_delta_reference_qpos,
-        hand_mechanical_lower_rad=hand_mechanical_lower_rad,
-        hand_mechanical_upper_rad=hand_mechanical_upper_rad,
     )
 
 

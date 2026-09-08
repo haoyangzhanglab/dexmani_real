@@ -80,8 +80,6 @@ def _prepare_and_publish_joint_command(
     is_hold: bool = False,
     observation_id: int | None = None,
     observation_anchor_monotonic_ns: int | None = None,
-    hand_mechanical_lower_rad: np.ndarray | None = None,
-    hand_mechanical_upper_rad: np.ndarray | None = None,
 ) -> tuple[PreparedCommand, PublishResult | None]:
     """Run the explicit non-blocking teleop safety/publication path."""
     prepared = prepare_joint_command(
@@ -92,8 +90,6 @@ def _prepare_and_publish_joint_command(
         is_hold=is_hold,
         observation_id=observation_id,
         observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
-        hand_mechanical_lower_rad=hand_mechanical_lower_rad,
-        hand_mechanical_upper_rad=hand_mechanical_upper_rad,
         arm_feedback_max_age_s=arm_feedback_max_age_s,
         hand_feedback_max_age_s=hand_feedback_max_age_s,
     )
@@ -826,8 +822,6 @@ def _publish_ik_failure_hold(
         is_hold=True,
         observation_id=int(observation.vr_frame["ring_sequence"]),
         observation_anchor_monotonic_ns=int(observation.vr_frame["recv_ts_ns"]),
-        hand_mechanical_lower_rad=resources.command_limits.hand_mechanical_lower_rad,
-        hand_mechanical_upper_rad=resources.command_limits.hand_mechanical_upper_rad,
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
     )
@@ -983,8 +977,6 @@ def _publish_solved_action(
         gate=gate,
         observation_id=int(vr_frame["ring_sequence"]),
         observation_anchor_monotonic_ns=int(vr_frame["recv_ts_ns"]),
-        hand_mechanical_lower_rad=command_limits.hand_mechanical_lower_rad,
-        hand_mechanical_upper_rad=command_limits.hand_mechanical_upper_rad,
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
     )

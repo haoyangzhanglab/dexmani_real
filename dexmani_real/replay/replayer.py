@@ -354,12 +354,6 @@ class EpisodeReplayer:
             gate=self._start_warmup_gate,
             is_hold=True,
             action_validity_s=_START_HAND_WARMUP_S,
-            hand_mechanical_lower_rad=np.asarray(
-                self.runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
-            ),
-            hand_mechanical_upper_rad=np.asarray(
-                self.runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
-            ),
             arm_feedback_max_age_s=float(self.runtime.safety.heartbeat_timeouts["arm"]),
             hand_feedback_max_age_s=float(
                 self.runtime.safety.heartbeat_timeouts["hand"]
@@ -658,12 +652,6 @@ class EpisodeReplayer:
                     arm_cmd,
                     hand_cmd,
                     gate=self._action_safety_gate,
-                    hand_mechanical_lower_rad=np.asarray(
-                        self.runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
-                    ),
-                    hand_mechanical_upper_rad=np.asarray(
-                        self.runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
-                    ),
                     arm_feedback_max_age_s=float(
                         self.runtime.safety.heartbeat_timeouts["arm"]
                     ),

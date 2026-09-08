@@ -23,8 +23,6 @@ class TeleopCommandLimits:
     # Teleop endpoint shaping bound. The hand worker independently reuses this
     # value for SDK-level slew protection.
     hand_max_delta_rad_per_tick: np.ndarray
-    hand_mechanical_lower_rad: np.ndarray
-    hand_mechanical_upper_rad: np.ndarray
     workspace_bounds_world_m: np.ndarray
 
     @classmethod
@@ -59,12 +57,6 @@ class TeleopCommandLimits:
                 config.runtime.hand.qpos_max_rad, dtype=np.float64
             ).copy(),
             hand_max_delta_rad_per_tick=hand_max_delta,
-            hand_mechanical_lower_rad=np.asarray(
-                config.runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
-            ).copy(),
-            hand_mechanical_upper_rad=np.asarray(
-                config.runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
-            ).copy(),
             workspace_bounds_world_m=np.asarray(
                 config.runtime.policy.workspace.as_tuple(), dtype=np.float64
             ).copy(),

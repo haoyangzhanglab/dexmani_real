@@ -20,81 +20,30 @@ _JOINT_LIMIT_TOLERANCE_RAD = 1e-12
 
 
 def _hand_joint_limit_detail(
-    hand_qpos_rad: np.ndarray,
-    lower_rad: np.ndarray,
-    upper_rad: np.ndarray,
+    hand_qpos_rad: np.ndarray, lower_rad: np.ndarray, upper_rad: np.ndarray
 ) -> str:
-    """Render the exact hand endpoint components outside the gate envelope.
-
-    This is diagnostic-only: it does not modify the rejected target or relax
-    the operational limit.  Keeping the values in the gate result makes a
-    shadow log sufficient to distinguish a slightly-open policy endpoint from
-    a mechanically unsafe one in the subsequent review.
-    """
-    below = np.flatnonzero(hand_qpos_rad < lower_rad - _JOINT_LIMIT_TOLERANCE_RAD)
-    above = np.flatnonzero(hand_qpos_rad > upper_rad + _JOINT_LIMIT_TOLERANCE_RAD)
-    violations: list[str] = []
-    violations.extend(
-        (
-            f"j{index}: target={hand_qpos_rad[index]:.17g}, "
-            f"lower={lower_rad[index]:.17g}, "
-            f"delta={hand_qpos_rad[index] - lower_rad[index]:+.3e}"
-        )
-        for index in below
+    outside = (hand_qpos_rad < lower_rad - _JOINT_LIMIT_TOLERANCE_RAD) | (
+        hand_qpos_rad > upper_rad + _JOINT_LIMIT_TOLERANCE_RAD
     )
-    violations.extend(
-        (
-            f"j{index}: target={hand_qpos_rad[index]:.17g}, "
-            f"upper={upper_rad[index]:.17g}, "
-            f"delta={hand_qpos_rad[index] - upper_rad[index]:+.3e}"
-        )
-        for index in above
-    )
-    if not violations:
-        raise ValueError("hand joint-limit diagnostic requires an out-of-bounds target")
-    return "hand joint limit violation (rad): " + ", ".join(violations)
+    return f"hand_joint_limit:j{np.flatnonzero(outside)[0]}"
 
 
 def _joint_delta_limit_detail(
     *,
-    joint_group: str,
     target_rad: np.ndarray,
     reference_rad: np.ndarray,
     limit_rad: np.ndarray,
     tolerance_rad: float,
-    reference_kind: str,
 ) -> str:
-    """Render the exact components that exceed a reject-only delta envelope."""
-    delta_rad = target_rad - reference_rad
-    abs_delta_rad = np.abs(delta_rad)
-    effective_limit_rad = limit_rad + tolerance_rad
-    violating = np.flatnonzero(abs_delta_rad > effective_limit_rad)
-    if violating.size == 0:
-        raise ValueError("delta-limit diagnostic requires an exceeded component")
-    max_index = int(np.argmax(abs_delta_rad))
-    violations = ", ".join(
-        (
-            f"j{index}: reference={reference_rad[index]:.17g}, "
-            f"target={target_rad[index]:.17g}, "
-            f"delta={delta_rad[index]:+.17g}, "
-            f"abs_delta={abs_delta_rad[index]:.17g}, "
-            f"limit={limit_rad[index]:.17g}, "
-            f"excess={abs_delta_rad[index] - effective_limit_rad[index]:+.3e}"
-        )
-        for index in violating
-    )
-    return (
-        f"{joint_group} per-tick delta limit violation "
-        f"(rad; reference={reference_kind}; "
-        f"tolerance={tolerance_rad:.3e}; "
-        f"max_abs_delta={abs_delta_rad[max_index]:.17g} at j{max_index}): "
-        f"{violations}"
-    )
+    delta = np.abs(target_rad - reference_rad)
+    index = int(np.flatnonzero(delta > limit_rad + tolerance_rad)[0])
+    return f"hand_delta_limit:j{index}:{delta[index]:.3f}>{limit_rad[index]:.3f}"
 
 
 class GateRejectCode(str, Enum):
     """Stable machine-readable rejection reasons from :class:`SafetyGate`."""
 
+    INVALID_TARGET = "invalid joint target"
     ARM_JOINT_LIMIT = "arm joint limit violation"
     HAND_JOINT_LIMIT = "hand joint limit violation"
     HAND_DELTA_LIMIT = "hand per-tick delta limit violation"
@@ -200,21 +149,32 @@ class SafetyGate:
         optional hand delta reference is the previous published target, so
         actuator lag cannot become an unintended tracking-error gate.
         """
-        # ActionCandidate owns command structure. The feedback reader owns the
-        # shape/dtype/finite contract of these measured arrays.
+        # Sensor readers own measured feedback; this gate admits outgoing targets.
+        if candidate.arm_qpos is None and candidate.hand_qpos is None:
+            return GateResult(
+                False, GateRejectCode.INVALID_TARGET, "no actuator target"
+            )
+        for name, target, shape in (
+            ("arm", candidate.arm_qpos, ARM_JOINT_SHAPE),
+            ("hand", candidate.hand_qpos, HAND_JOINT_SHAPE),
+        ):
+            if target is not None and (
+                target.shape != shape or not np.all(np.isfinite(target))
+            ):
+                return GateResult(
+                    False, GateRejectCode.INVALID_TARGET, f"{name} target shape/finite"
+                )
         arm_start = current_arm_qpos
         arm_end = arm_start.copy() if candidate.arm_qpos is None else candidate.arm_qpos
         hand_end = candidate.hand_qpos
         hand_start: np.ndarray | None = None
         hand_delta_start: np.ndarray | None = None
-        hand_delta_reference_kind = "measured_feedback"
         if hand_end is not None:
             assert current_hand_qpos is not None
             hand_start = current_hand_qpos
             hand_delta_start = hand_start
             if hand_delta_reference_qpos is not None:
                 hand_delta_start = hand_delta_reference_qpos
-                hand_delta_reference_kind = "previous_published_target"
         if candidate.arm_qpos is not None and (
             np.any(arm_end < self.arm_low) or np.any(arm_end > self.arm_high)
         ):
@@ -241,12 +201,10 @@ class SafetyGate:
                     False,
                     GateRejectCode.HAND_DELTA_LIMIT,
                     _joint_delta_limit_detail(
-                        joint_group="hand",
                         target_rad=hand_end,
                         reference_rad=hand_delta_start,
                         limit_rad=self.max_hand_delta_rad,
                         tolerance_rad=self.endpoint_delta_tolerance_rad,
-                        reference_kind=hand_delta_reference_kind,
                     ),
                 )
         if self.workspace_check is not None and candidate.arm_qpos is not None:

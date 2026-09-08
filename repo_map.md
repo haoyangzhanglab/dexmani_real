@@ -92,6 +92,7 @@ causal observation history
   publish-then-record rollout 合同，不启动 worker 或硬件。
   `tests/test_prediction_boundary.py` 覆盖 inference 动作 shape/finite 准入，以及 warmup 失败与无效诊断的区别。
   `tests/test_observation_builder.py` 覆盖 sensor/camera 因果、freshness、generation、payload 与模型转换边界。
+  `tests/test_control_safety.py` 覆盖 SafetyGate 目标准入、workspace/collision fail-closed，以及 worker mechanical/finite/jump、ticket/expiry 和 hand-home 边界。
 
 ## Recorded policy rollout flow
 

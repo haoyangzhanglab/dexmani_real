@@ -12,10 +12,10 @@ from dexmani_real.control.publication import (
     motion_rejection_reason,
     publish_command,
     read_hand_feedback,
-    validate_hand_command_bounds,
     wait_command_accepted,
 )
 from dexmani_real.runtime.safety import SafetyState
+from dexmani_real.utils.limits import validate_hand_command_bounds
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
