@@ -11,7 +11,6 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.utils.log import ThrottledWarner, get_logger
-from dexmani_real.utils.serialization import from_dict_helper
 
 logger = get_logger(__name__)
 
@@ -78,9 +77,6 @@ class MotionPlanningConfig:
     ik_score_pose_error_weight: float = 0.2
     ik_score_joint_limit_weight: float = 0.2
 
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "MotionPlanningConfig":
-        return cls(**from_dict_helper(cls, d))  # type: ignore[arg-type]
 
 class XArm7MotionPlanner:
     """Arm-only xArm7 motion planner with MPlib backend.

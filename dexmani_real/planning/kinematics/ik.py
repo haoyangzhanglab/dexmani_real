@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.serialization import from_dict_helper
 
 if TYPE_CHECKING:
     from .ik_candidates import IKCandidateSearch
@@ -73,10 +72,6 @@ class OnlineIKConfig:
     enable_nullspace_optimization: bool = True
     nullspace_step_size_deg: float = 1.0
     nullspace_joint_limit_margin_deg: float = 15.0
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "OnlineIKConfig":
-        return cls(**from_dict_helper(cls, d))  # type: ignore[arg-type]
 
 
 class OnlineIKSolver:
