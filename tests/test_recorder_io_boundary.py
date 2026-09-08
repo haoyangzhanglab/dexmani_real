@@ -111,8 +111,10 @@ class TestSaveOutcome(unittest.TestCase):
                         arm_qpos_sent=np.zeros(7),
                     )
                 )
-                recorder.stop_episode(save=True, reason="eval:failure:operator")
-                self.assertTrue(recorder.join_stop(timeout=10.0), recorder.stop_error)
+                self.assertEqual(
+                    recorder.finish_episode(save=True, reason="eval:failure:operator"),
+                    str(episode_path),
+                )
                 self.assertTrue(episode_path.is_dir())
                 self.assertTrue((episode_path / "rgb.mp4").is_file())
                 self.assertTrue((episode_path / "depth.h5").is_file())
@@ -138,8 +140,7 @@ class TestSaveOutcome(unittest.TestCase):
                 self.assertEqual(json.loads(result.read_text())["outcome"], "failure")
             finally:
                 if recorder.is_recording:
-                    recorder.stop_episode(save=False, reason="test_cleanup")
-                recorder.join_stop(timeout=10.0)
+                    recorder.finish_episode(save=False, reason="test_cleanup")
 
     def test_task_failure_is_saved_and_result_is_failure(self):
         import json

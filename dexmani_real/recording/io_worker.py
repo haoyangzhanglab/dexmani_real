@@ -229,6 +229,8 @@ class _RecorderIOSession:
                     save=False, reason="start_error", error=str(exc)
                 )
                 return
+            if not self.recorder.resources_released:
+                raise RuntimeError("episode start retained unreleased resources") from exc
             self._send_result(
                 RecordingFinished(
                     saved=False,

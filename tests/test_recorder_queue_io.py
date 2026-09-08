@@ -160,6 +160,22 @@ def _start(session):
     return result
 
 
+def _assert_clean_worker_exit(session):
+    session.shared.is_running.value = False
+    with (
+        mock.patch(
+            "dexmani_real.recording.io_worker._create_episode_recorder",
+            return_value=session.recorder,
+        ),
+        mock.patch(
+            "dexmani_real.recording.io_worker._RecorderIOSession.create",
+            return_value=session,
+        ),
+    ):
+        recorder_io_loop(session.shared, session.config)
+    assert not session.shared.error_state.value
+
+
 def test_start_ack_precedes_samples(session):
     result = _start(session)
     assert result.max_frames == 8
@@ -188,6 +204,18 @@ def test_partial_start_failure_is_discarded_before_finished(session):
     _step(session)
     result = session.shared.record_result_q.get_nowait()
     assert result.error == "camera constructor failed" and not result.saved
+
+
+def test_start_failure_with_retained_resource_cannot_report_recovery(session):
+    session.recorder.resources_released = False
+    with mock.patch.object(
+        session.recorder, "start_episode", side_effect=OSError("partial allocation")
+    ):
+        session.shared.record_control_q.put(StartRecording("task", "operator", 1))
+        with pytest.raises(RuntimeError, match="start retained unreleased resources"):
+            session.step()
+    assert not session.shutdown()
+    assert session.shared.record_result_q.empty()
 
 
 def test_stop_drains_exact_boundary_before_finish_and_next_start(session):
@@ -262,6 +290,7 @@ def test_sample_failure_discards_then_releases_capacity_once(session, damage):
     recovered = session.shared.record_result_q.get_nowait()
     assert recovered.saved and not recovered.error and recovered.frame_count == 1
     assert [row.timestamp_s for row in session.recorder.rows] == [ring.latest_sequence]
+    _assert_clean_worker_exit(session)
 
 
 def test_frame_decoded_before_shared_consumption_ack(session):
@@ -481,6 +510,7 @@ def test_idle_async_camera_error_is_finalized(session):
     _step(session)
     result = session.shared.record_result_q.get_nowait()
     assert result.saved and not result.error and result.frame_count == 1
+    _assert_clean_worker_exit(session)
 
 
 def test_finalization_timeout_faults_session_without_premature_finished(session):
@@ -543,19 +573,7 @@ def test_prior_recording_failure_allows_clean_worker_exit(session):
     session.shared.record_sample_ring.rows.clear()
     _step(session)
     assert session.shared.record_result_q.get_nowait().error
-    session.shared.is_running.value = False
-    with (
-        mock.patch(
-            "dexmani_real.recording.io_worker._create_episode_recorder",
-            return_value=session.recorder,
-        ),
-        mock.patch(
-            "dexmani_real.recording.io_worker._RecorderIOSession.create",
-            return_value=session,
-        ),
-    ):
-        recorder_io_loop(session.shared, session.config)
-    assert not session.shared.error_state.value
+    _assert_clean_worker_exit(session)
 
 
 def test_result_transport_failure_faults_worker_and_reaps_recorder(session):
@@ -584,6 +602,42 @@ def test_result_transport_failure_faults_worker_and_reaps_recorder(session):
     assert session.shared.record_result_q.empty()
 
 
+def test_terminal_transport_failure_reaps_without_refinalizing_or_resending(session):
+    _start(session)
+    session.recorder.finished = False
+    session.shared.record_control_q.put(StopRecording(True, "manual", 0))
+    session.step()
+    pending = session.pending_finalization
+    assert session.recorder._finish_entered.wait(timeout=2)
+    session.recorder.finished = True
+    pending.thread.join(timeout=2)
+    with (
+        mock.patch.object(pending.thread, "join", wraps=pending.thread.join) as join,
+        mock.patch.object(
+            session.shared.record_result_q, "put", side_effect=OSError("broken result queue")
+        ) as put,
+        mock.patch(
+            "dexmani_real.recording.io_worker._create_episode_recorder",
+            return_value=session.recorder,
+        ),
+        mock.patch(
+            "dexmani_real.recording.io_worker._RecorderIOSession.create",
+            return_value=session,
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="recording failure"):
+            recorder_io_loop(session.shared, session.config)
+        assert join.call_args_list[0] == mock.call(timeout=0)
+        assert join.call_count == 2  # Main poll, then the same shutdown owner.
+        put.assert_called_once()
+        assert isinstance(put.call_args.args[0], RecordingFinished)
+    assert session.fatal and session.shared.error_state.value
+    assert session.pending_finalization is pending
+    assert not pending.thread.is_alive()
+    assert session.recorder.stops == [(True, "manual", 0)]
+    assert session.shared.record_result_q.empty()
+
+
 def test_unreleased_resources_exit_nonzero_without_prior_failure(session):
     session.shared.is_running.value = False
     session.recorder.resources_released = False
@@ -603,27 +657,6 @@ def test_unreleased_resources_exit_nonzero_without_prior_failure(session):
     assert session.shared.error_state.value
     assert session.shared.record_result_q.empty()
 
-
-def test_live_episode_finalizer_retains_handle_and_refuses_start(tmp_path):
-    from dexmani_real.recording.recorder import EpisodeRecorder
-
-    recorder = EpisodeRecorder(str(tmp_path / "recordings"))
-    finalizer = mock.Mock()
-    finalizer.is_alive.return_value = True
-    recorder._stop_thread = finalizer
-    try:
-        assert not recorder.join_stop(timeout=0)
-        assert recorder._stop_thread is finalizer
-        assert not recorder.poll_stop().done
-        assert recorder._stop_thread is finalizer
-        assert not recorder.start_episode(task_label="must refuse")
-        assert recorder._stop_thread is finalizer
-        assert not recorder.is_recording
-        assert not recorder.data_dir.exists()
-        assert finalizer.join.call_count == 1
-    finally:
-        finalizer.is_alive.return_value = False
-        assert recorder.join_stop(timeout=0)
 
 
 def test_client_shm_recorder_disk_roundtrip_at_capacity(tmp_path):

@@ -99,9 +99,7 @@ def _frame(timestamp, value=0):
 
 
 def _save(recorder):
-    destination = Path(recorder.stop_episode(save=True))
-    assert recorder.join_stop(timeout=10), recorder.stop_error
-    return destination
+    return Path(recorder.finish_episode(save=True))
 
 
 @pytest.mark.parametrize("save", [True, False])
@@ -186,7 +184,7 @@ def test_finish_retains_unsafe_resource_and_refuses_restart(tmp_path, failed_res
         data_writer.close.side_effect = OSError("HDF5 remains open")
     with (
         mock.patch.object(
-            recorder, "_stop_episode_impl_inner", side_effect=OSError("transaction failed")
+            recorder, "_finalize_episode_files", side_effect=OSError("transaction failed")
         ),
         mock.patch.object(
             recorder, "_discard_temp_files",
@@ -303,11 +301,11 @@ def test_camera_close_failure_never_publishes(tmp_path):
         raise OSError("injected camera close failure")
 
     with mock.patch.object(writer, "close", side_effect=close_then_fail):
-        destination = Path(recorder.stop_episode(save=True))
-        assert not recorder.join_stop(timeout=10)
+        destination = Path(recorder.episode_path)
+        with pytest.raises(RuntimeError, match="injected camera close failure"):
+            recorder.finish_episode(save=True)
     assert not destination.exists()
     assert not list(tmp_path.glob(".tmp_episode_*"))
-    assert "injected" in recorder.stop_error
 
 
 @pytest.mark.parametrize("damage", ["missing_sent", "wrong_shape", "wrong_dtype"])
@@ -330,8 +328,7 @@ def test_discard_then_next_episode(tmp_path):
     recorder = _recorder(tmp_path)
     recorder.start_episode()
     recorder.add_episode_frame(_frame(1))
-    destination = Path(recorder.stop_episode(save=False))
-    assert recorder.join_stop(timeout=10)
+    destination = Path(recorder.finish_episode(save=False))
     assert not destination.exists()
     assert recorder.start_episode()
     recorder.add_episode_frame(_frame(2))
