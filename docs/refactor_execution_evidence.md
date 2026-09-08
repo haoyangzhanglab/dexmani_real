@@ -26,6 +26,9 @@ taking precedence. Hardware execution is excluded from this software run.
 
 - Base: `668e1e9065d51fd85b52c3e0a8ce6a59db469f0d`.
 - Branch: `codex/refactor-phase0-guardrails`.
+- Commit: `65c32d24e97ca0cc71e62f7841e546e1dcdae7c0`.
+- PR: https://github.com/haoyangzhanglab/dexmani_real/pull/2 (merged).
+- Integrated SHA: `5f0417639a5f4aa8c4e91633228fdec88669f721`.
 - Ordinary implementation: luna-max; independent review: terra-max, approved.
 - Ordinary focused tests: **12 passed** (keyboard, dataset admission, pointcloud).
 - Full gate: **310 passed, 94 subtests passed**; compileall and diff check passed.
@@ -46,6 +49,27 @@ PR4 repair requirements confirmed during review: failed camera cleanup must
 retain any live writer handle; a live finalizer must block START even when an
 error has already been recorded. Phase 0 does not lock these unsafe old paths
 as desired behavior.
+
+### PR1 — leaf cleanup
+
+- Base: `5f0417639a5f4aa8c4e91633228fdec88669f721`.
+- Branch: `codex/refactor-pr1-leaf`.
+- Implementation: luna-max; independent reviewer: terra-max.
+- Commits: `ae16888` keyboard diagnostics; `9094855` rate stats;
+  `efeaae6` unused profile; `4a0d323` EMA ownership; `f0ab11d` grid ownership.
+- Targeted boundary suite: **119 passed, 26 subtests passed**.
+- Full gate: **310 passed, 94 subtests passed**; compileall and diff check passed.
+- Differential checks: EMA bitwise identical for 100 seeded inputs; all resolved
+  command-limit fields identical; rate sleep/clock/deadline identical over 30
+  normal/overdue/long-block/reset steps at 16/60/128 Hz.
+- Production: 129 → 127 Python files; 40,587 → 40,286 physical lines (−301).
+  Examples unchanged (13 files / 6,081 lines).
+- Deleted mechanisms: passive keyboard motion diagnostics, rate-stat snapshots,
+  unused arm device profile, health/smoothing modules, public limits cache DTO.
+- Preserved: keyboard dispositions/action IDs, deadline behavior, feedback
+  validation/count thresholds, TeleopConfig process DTO, startup-only numeric
+  cache construction, EMA computation, all protected source/schema/IPC boundaries.
+- No bugfix or design-policy change; hardware validation pending.
 
 ## Hardware gate
 
