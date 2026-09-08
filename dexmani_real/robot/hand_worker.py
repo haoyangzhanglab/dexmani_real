@@ -216,15 +216,8 @@ def hand_loop(
         accepted_target_action_id = 0
         accepted_target_monotonic_ns = 0
         last_sdk_setpoint_accepted_monotonic_ns = 0
-        sdk_send_attempts = 0
-        exact_target_accepts = 0
-        crc_unconfirmed = 0
-        duplicate_skips = 0
-        sdk_rejections = 0
         last_exact_target_sequence = 0
-        stats_generation: int | None = None
-        stats_generation_was_running = False
-        last_running_stats: tuple[int, int, int, int, int] | None = None
+        command_generation: int | None = None
         _publish_feedback(
             shared,
             qpos=initial_state.qpos,
@@ -354,33 +347,14 @@ def hand_loop(
             if permit.run_generation != ticket.run_generation:
                 rate_mgr.wait()
                 continue
-            if permit.run_generation != stats_generation:
-                # Physical home uses an ARMED generation, then policy motion
-                # advances to a new RUNNING generation. Preserve the completed
-                # RUNNING generation when the policy executor revokes motion, while
-                # keeping the two command classes distinct in exit diagnostics.
-                if stats_generation_was_running:
-                    last_running_stats = (
-                        sdk_send_attempts,
-                        exact_target_accepts,
-                        crc_unconfirmed,
-                        duplicate_skips,
-                        sdk_rejections,
-                    )
-                sdk_send_attempts = 0
-                exact_target_accepts = 0
-                crc_unconfirmed = 0
-                duplicate_skips = 0
-                sdk_rejections = 0
+            if permit.run_generation != command_generation:
                 last_exact_target_sequence = 0
                 last_sdk_accepted_qpos = state.qpos.copy()
-                stats_generation = permit.run_generation
-                stats_generation_was_running = permit.state is SafetyState.RUNNING
+                command_generation = permit.run_generation
             if sequence_int == last_exact_target_sequence:
                 # An accepted exact target is an endpoint event, not a
                 # level-triggered command.  Retries remain allowed only until
                 # the SDK has accepted the exact endpoint.
-                duplicate_skips += 1
                 rate_mgr.wait()
                 continue
             action_id = int(command["action_id"][0])
@@ -418,7 +392,6 @@ def hand_loop(
                 shared.error_state.value = True
                 return
             assert bounded is not None
-            sdk_send_attempts += 1
             send_status = hand.send_action(bounded)
             if send_status is XHandSendStatus.ACCEPTED:
                 accepted_now_ns = time.monotonic_ns()
@@ -429,10 +402,8 @@ def hand_loop(
                 if np.array_equal(bounded, target):
                     accepted_target_action_id = action_id
                     accepted_target_monotonic_ns = accepted_now_ns
-                    exact_target_accepts += 1
                     last_exact_target_sequence = sequence_int
             elif send_status is XHandSendStatus.REJECTED:
-                sdk_rejections += 1
                 logger.error(
                     "hand_loop: SDK rejected action_id=%d; latching runtime fault",
                     action_id,
@@ -441,8 +412,6 @@ def hand_loop(
                 return
             # CRC_UNCONFIRMED deliberately leaves both the action and its
             # command-space reference unacknowledged.
-            else:
-                crc_unconfirmed += 1
 
             rate_mgr.wait()
     finally:
@@ -451,16 +420,3 @@ def hand_loop(
             shared.error_state.value = True
         elif ready:
             logger.debug("hand_loop: STOPPED")
-            exit_stats = last_running_stats or (
-                sdk_send_attempts,
-                exact_target_accepts,
-                crc_unconfirmed,
-                duplicate_skips,
-                sdk_rejections,
-            )
-            logger.info(
-                "hand_loop: exited (sdk_send_attempts=%d, "
-                "exact_target_accepts=%d, crc_unconfirmed=%d, "
-                "duplicate_skips=%d, sdk_rejections=%d)",
-                *exit_stats,
-            )

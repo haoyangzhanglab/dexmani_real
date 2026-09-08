@@ -244,8 +244,8 @@ pickle；即使 processed 构建为空，原始 RGB-D、raw 点云和空输出�
 用于离线复现失败帧。该快照是算法诊断产物，不属于 raw episode 或 processed HDF5 schema。
 
 纯 build 不包含等待相机帧、SDK 对齐和共享内存发布；capture-to-cloud 包含 `camera.read()`
-及对齐/数组准备，但不包含实时 worker 的 ring 发布。需要评价部署总时延时，应同时读取实时
-worker 的 `source_to_publish_ms_p95` 日志。当前纯构建目标是 p95 < 40 ms。
+及对齐/数组准备，但不包含实时 worker 的 ring 发布。实时 worker 不再收集滚动延迟分位数；
+部署总时延需要单独测量，不能由这两个 benchmark 推断。当前纯构建目标是 p95 < 40 ms。
 
 ### 2026-08-26 当前离线验证
 
@@ -265,8 +265,7 @@ worker 的 `source_to_publish_ms_p95` 日志。当前纯构建目标是 p95 < 40
 
 OpenCV 3×3 depth fast path 与逐步 SciPy 参考实现的 240 帧最终点云逐元素一致；五个
 诊断快照的可信深度掩码和当前策略点云也逐元素一致。上述数字不包含相机采集、IPC 和系统调度
-尾延迟；部署性能仍以实时 worker 的 `source_to_publish_ms_p95` 为准，真实硬件尚未按当前默认
-参数重新测试。
+尾延迟；部署总时延仍待单独测量，真实硬件尚未按当前默认参数重新测试。
 
 [`examples/realsense_record_example.py`](../examples/realsense_record_example.py) 提供两种可视化：
 

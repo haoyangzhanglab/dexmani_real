@@ -71,8 +71,6 @@ class _LoopState:
     last_command_generation: int
     last_cmd: _CmdState = field(default_factory=_CmdState.idle)
     last_processed_ring_sequence: int = 0
-    servo_call_count: int = 0
-    duplicate_command_skip_count: int = 0
     last_state_source_ns: int = field(default_factory=time.monotonic_ns)
 
 
@@ -276,7 +274,6 @@ def _handle_servo_command(
     controller in cleanup.
     """
     if ticket.ring_sequence <= st.last_processed_ring_sequence:
-        st.duplicate_command_skip_count += 1
         return
 
     # A coupled-ring endpoint is an event, not a level-triggered setpoint. Mark
@@ -318,7 +315,6 @@ def _handle_servo_command(
             )
         raise RuntimeError(f"set_servo_angle failed (SDK code={code})")
     accepted_monotonic_ns = time.monotonic_ns()
-    st.servo_call_count += 1
     st.last_target = target.copy()  # producer owns 2π canonicalization
     st.last_command_generation = command_generation
     st.last_cmd = _CmdState(
@@ -420,8 +416,4 @@ def arm_loop(shared: Any, config: ArmParams) -> None:
         if st is None:
             logger.info("arm_loop: exited before loop startup")
         else:
-            logger.info(
-                "arm_loop: exited (servo_calls=%d, duplicate_skips=%d)",
-                st.servo_call_count,
-                st.duplicate_command_skip_count,
-            )
+            logger.info("arm_loop: exited")

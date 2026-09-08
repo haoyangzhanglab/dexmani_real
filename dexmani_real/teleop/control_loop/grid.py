@@ -47,7 +47,6 @@ from dexmani_real.teleop.control_loop.hand_control import (
     HandRetargetObservationCache,
     reset_hand_retargeter,
 )
-from dexmani_real.teleop.control_loop.timing import StageTimer
 from dexmani_real.teleop.control_loop.vr_mapping import VRWristMapper
 from dexmani_real.teleop.episode_samples import (
     FRAME_IK_FAIL,
@@ -173,7 +172,6 @@ class TeleopGridResources:
     recorder: RecorderClient | None
     command_limits: _TeleopCommandLimits
     camera_freshness: CameraFreshnessTracker
-    stage_timer: StageTimer
     validation_warn: ThrottledWarner
     arm_feedback_warn: ThrottledWarner
     hand_ramp_total_frames: int
@@ -517,7 +515,6 @@ def _read_control_grid_observation(
     """Read and validate one causal sensor cut, remaining silent when unsafe."""
     recorder = resources.recorder
     _camera_freshness = resources.camera_freshness
-    stage_timer = resources.stage_timer
     _validate_warn = resources.validation_warn
     _arm_feedback_warn = resources.arm_feedback_warn
     _current_grid_anchor_ns = observation_anchor_monotonic_ns
@@ -585,8 +582,6 @@ def _read_control_grid_observation(
         now_monotonic_ns=time.monotonic_ns(),
         max_age_s=cfg.runtime.policy.vr_mapping.stale_threshold_s,
     )
-    stage_timer.mark("vr")
-
     # VR control does not consume camera pixels.  Scan/copy the large
     # payload only while the policy-owned recorder requests it.
     cam = (
@@ -610,8 +605,6 @@ def _read_control_grid_observation(
                 reason="camera_stall",
             )
             recording_active = False
-    stage_timer.mark("cam")
-
     hand_result = read_causal_structured_frame(
         shared.hand_state_ring,
         source_field="source_monotonic_ns",
@@ -907,7 +900,6 @@ def _publish_solved_action(
     gate = resources.safety_gate
     recorder = resources.recorder
     command_limits = resources.command_limits
-    stage_timer = resources.stage_timer
     _current_grid_anchor_ns = observation.anchor_monotonic_ns
     arm_state = observation.arm_state
     vr_frame = observation.vr_frame
@@ -1015,8 +1007,6 @@ def _publish_solved_action(
             recording_active=recording_active,
         )
         return True
-    stage_timer.mark("send")
-
     if published_candidate.arm_qpos is not None:
         arm_cmd = np.asarray(published_candidate.arm_qpos, dtype=np.float64)
     if published_candidate.hand_qpos is not None:
@@ -1052,8 +1042,6 @@ def _publish_solved_action(
             max_observation_skew_s=resources.max_observation_skew_s,
             policy_observation=observation.policy_observation_signals,
         )
-    stage_timer.mark("rec")
-
     return True
 
 

@@ -194,6 +194,8 @@ as desired behavior.
 
 - Base: `2316bf0c129c145716a954664f9791cbae28a715`.
 - Branch: `codex/refactor-pr5-contract-audit`.
+- Commit: `5747fdf`; PR: https://github.com/haoyangzhanglab/dexmani_real/pull/7 (merged).
+- Integrated SHA: `34291eb68d5677c28f2c9b9bdb7650e13d518f6d`.
 - Implementation/audit: astra-medium; independent reviewer: a separate astra-medium.
 - Decision: KEEP all inspected validators; production diff is zero. Full
   five-category check-level classification and producer/consumer evidence:
@@ -206,6 +208,43 @@ as desired behavior.
 - No FIXED_SCHEMA_IDENTITY candidate met all five deletion conditions. No
   production/examples/test changes, size change, bugfix or new validator;
   gap tolerance and all protected boundaries unchanged. Hardware not exercised.
+
+### PR6 — unused telemetry and historical documentation
+
+- Base: `34291eb68d5677c28f2c9b9bdb7650e13d518f6d`.
+- Branch: `codex/refactor-pr6-cleanup`.
+- Production commit: `d4cd915`.
+- Implementation: luna-max; independent reviewer: terra-max.
+- Removed StageTimer and its module/wiring, arm/hand log-only counters,
+  CameraStreamWriter percentile/high-watermark collection, and pointcloud
+  worker rolling performance buffers/counters. Whole-repository consumer
+  searches found only those collectors/logs; no formal result consumers.
+- Kept arm endpoint sequence fences and hand generation-change resets of
+  accepted command references. Kept camera frame counts, errors, retained close
+  resources and repeated-close joins; pointcloud source/sequence/freshness,
+  publication and readiness; standalone builder/benchmark/snapshot statistics.
+- Kept PolicyStats and result.json.metrics, feedback taxonomy (STALE has a
+  distinct control disposition), status_print_interval (live grid consumer),
+  all safety/IPC/schema/thresholds and fsync_tree/durability without profiling.
+- Deleted four superseded implementation guides (3,931 lines):
+  eef_tactile_observation_upgrade_guide.md, policy_rollout_simplification_guide.md,
+  policy_formal_eval_followup_guide.md, raw_v25_runtime_simplification_guide.md.
+  Their only filename references were within that group. Canonical schema,
+  raw v24 migration, action-clipping and pointcloud docs and both incident
+  records remain. Removed a pre-existing README link to an absent evaluation
+  guide; current run_policy navigation/workflow remains.
+- Updated active pointcloud documentation to remove claims that the deleted
+  rolling worker percentile is available. Pure-build and capture-to-cloud
+  benchmark scopes/numbers remain; total deployment latency requires a separate
+  measurement and is not inferred from those benchmarks.
+- Review findings resolved: restored unconditional repeated camera-writer join
+  after an intermediate indentation mistake; corrected obsolete pointcloud
+  telemetry documentation. No final lifecycle behavior change or separate code bugfix.
+- Independent review approved: **111 passed, 28 subtests**; local documentation
+  links resolve. Author targeted **109 passed, 2 subtests**; full **344 passed, 94 subtests**;
+  compileall and diff check passed. No tests changed or hardware run.
+- Production: 127 → 126 files; 40,036 → 39,797 lines (−239).
+  Examples unchanged: 13 files / 5,822 lines. All conditional Phase 7 items DEFER.
 
 ## Hardware gate
 
