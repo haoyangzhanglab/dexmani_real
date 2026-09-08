@@ -5,8 +5,9 @@ causal observations from the shared rings, runs
 :meth:`~dexmani_real.deployment.inference.runtime.PolicyRuntime.predict_action_chunk`, and publishes
 the resulting :class:`~dexmani_real.deployment.prediction.Prediction` to the
 latest-wins ``prediction_ring``. It never writes ``coupled_cmd_ring``, the
-SDK, ``SafetyState``, or ``run_generation`` — model output is a proposal, not a
-robot command.
+SDK, ``SafetyState``, or the shared ``run_generation``. Each Prediction carries
+the source/logical timestamps and timing samples for the exact observation and
+inference that produced its action chunk; model output is still only a proposal.
 
 ``inference_loop`` is a plain ``*_loop(shared, config)`` function (not an
 ``mp.Process`` subclass); lifecycle and supervision stay in the runtime layer.
@@ -73,7 +74,7 @@ def _load_inference_runtime(config: InferenceWorkerConfig) -> PolicyRuntime:
 
 
 def serialize_prediction(prediction: Prediction) -> np.ndarray:
-    """Serialize one validated flat prediction without scheduling it."""
+    """Serialize one validated prediction, including its timing metadata."""
     if not isinstance(prediction, Prediction):
         raise TypeError("prediction must be a Prediction")
     frame = new_frame(PREDICTION_DTYPE)
@@ -83,6 +84,9 @@ def serialize_prediction(prediction: Prediction) -> np.ndarray:
         prediction.logical_step_monotonic_ns
     )
     frame["num_steps"][0] = np.uint32(prediction.num_steps)
+    frame["inference_latency_ms"][0] = prediction.inference_latency_ms
+    frame["observation_age_ms"][0] = prediction.observation_age_ms
+    frame["observation_skew_ms"][0] = prediction.observation_skew_ms
     frame["action_dim"][0] = np.uint32(prediction.actions.shape[1])
     frame["actions"][
         0, : prediction.num_steps, : prediction.actions.shape[1]
@@ -248,6 +252,9 @@ def inference_loop(
                 source_monotonic_ns=observation.latest_source_monotonic_ns,
                 logical_step_monotonic_ns=observation.logical_step_monotonic_ns,
                 actions=actions,
+                inference_latency_ms=inference_ms,
+                observation_age_ms=observation_age_ms,
+                observation_skew_ms=observation_skew_ms,
             )
             if not publish_prediction(shared, prediction):
                 logger.debug("inference: prediction dropped (generation advanced)")

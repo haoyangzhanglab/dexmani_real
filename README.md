@@ -318,8 +318,10 @@ eval 通过 `--eval-seed` 明确选择并写入结果元数据，
 XHand 需求由 `PolicySpec.requires_hand` 决定，不由 CLI
 重复声明。
 
-inference 每次只发布一个带 observation provenance 的不可变 flat `Prediction` IPC record 到单槽 latest-wins
+inference 每次只发布一个带 observation provenance 和 inference timing 的不可变 flat `Prediction` IPC record 到单槽 latest-wins
 ring；动作数组为有限 `float64[chunk_size,D]`，来自 `predict_action_chunk()`。
+三个必填 timing 字段 `inference_latency_ms`、`observation_age_ms`、`observation_skew_ms`
+对应生成该 chunk 的同一次 observation / inference，均为有限、非负的 real scalar（不接受 bool），IPC 使用 `float64`。
 inference 按 `n_action_steps * control_dt_s` 的绝对 cadence 查询，计算期间旧 future tail 继续可用。
 新 prediction 的 `target_time <= now` 前缀直接丢弃；全过期 prediction 丢弃并保留已有合法计划或 hold。
 executor 在每个 target 前一个控制周期内发布该未来目标，以 control grid 限制发布频率；
@@ -333,6 +335,12 @@ SDK 边界仍使用原有 command validity、generation 和最新命令检查。
 policy executor 每秒输出 live metrics，并在每个 B→停止/中止/故障边界输出 compact
 episode summary。physical rollout 的结果和 metrics snapshot 写入 `result.json`；rejection 等计数
 覆盖本次 rollout，不会被每秒日志清零。timing snapshot 是最近样本，不是全 episode 的 latency 分位数。
+`result.json.metrics` 中的三个 inference/observation timing 来自 executor 收到的当前 generation
+最新 prediction（包括全过期 chunk）；未收到有效 prediction 时不包含这些 timing。
+run 的操作员停止和时长上限分别记为 `STOPPED / run:stopped:operator`、
+`STOPPED / run:stopped:timeout`；首次命令和命令静默超时记为 `INVALID / run:invalid:*`。
+eval 的三种超时均为 `FAILURE / eval:failure:*`；操作员 SUCCESS/FAILURE/INVALID 使用
+`eval:<outcome>:operator`。共用故障和 recorder capacity 路径的 INVALID 前缀也跟随当前 mode。
 
 点云缺失、过期、shape/dtype 错误、非有限值或颜色越界时 inference fail closed，不发布
 新的 Prediction。实时路径当前仅支持静态 `eye_to_hand` 标定；`eye_in_hand` 需要另行建立与

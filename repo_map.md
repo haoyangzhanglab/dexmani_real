@@ -48,7 +48,7 @@ control safety gate → command publication → arm / hand workers
 causal observation history
     → Policy public runtime
     → Real NumPy adapter
-    → flat Prediction IPC record [chunk_size, D] + provenance
+    → flat Prediction IPC record [chunk_size, D] + provenance + inference timing
     → one-slot latest-wins prediction_ring
     → PolicyExecutor (timestamped future targets, endpoint decode, EE→IK)
     → physical SafetyGate
@@ -59,6 +59,9 @@ causal observation history
 - `Prediction` 是唯一的内部策略输出对象；动作是拥有自身内存的 finite
   `float64[chunk_size, D]`，
   `run_generation`、source timestamp 和 logical-step timestamp 随对象传播。
+  三个 finite、非负 timing（inference latency、observation age/skew，单位 ms）
+  随 exact chunk 经 IPC 进入 executor-owned `PolicyStats` 和 `result.json.metrics`，
+  表示当前 generation 最新收到的样本（含全过期 chunk），不是 full-episode percentile。
 - Real 只校验 Policy 公开契约字段（observation fields/shape/dtype、`requires_hand`、
   `chunk_size`、`n_action_steps`、`action_key`、`control_action_dim`、`control_dt_s`），不解析
   artifact 内部或 `temporal_ensemble_coeff` 等历史字段；Real 直接调度 Policy 给出的完整
@@ -100,6 +103,8 @@ B + completed H
 
 - `deployment/evaluation.py` 携带 run/eval 的输出路径、task/operator、wall-clock timeout、provenance
   和独立 task outcome，并写入 result.json；它不是第二个 lifecycle 或 recorder。
+- executor 的时限映射区分 run STOPPED（时长上限）/INVALID（命令 watchdog）与 eval FAILURE；
+  stop_reason 使用当前 mode 前缀，共用 INVALID 故障路径保持原有 motion fence 和录制语义。
 - run/eval 强制启动 camera 与 RecorderIO，即使 policy 是 state-only；camera 仍只在 `PolicySpec`
   请求 RGB/pointcloud 时进入 inference observation。`RuntimeChannels.evaluation_outcome` 仅传递
   `NONE/SUCCESS/FAILURE/INVALID/STOPPED`，operator 在同一 `motion_lock` 内先写 outcome 再请求 stop。
@@ -111,7 +116,8 @@ B + completed H
   `_CommandProgress` 继续承担 worker/SDK progress watchdog；SDK final fence 和 supervisor 保留。
   每次 invocation 最多一个 rollout，结束后 H/Q 可用，第二次 B 拒绝。
 - `tests/test_policy_rollout.py` 用 fake/shared-memory boundary 覆盖 Policy 公开契约、timestamp 调度、
-  IK/SAFETY 归属、reject-only arm 与 publish-then-record run/eval 语义（含 max_frames→INVALID
+  IK/SAFETY 归属、reject-only arm 与 publish-then-record run/eval 语义（含 mode-specific
+  max_frames→INVALID
   与 recording-invalid 不触发全局 FAULT）；不启动任何 worker 或设备。
 - `tests/test_recorder_io_boundary.py` 覆盖 Recorder STOP save/outcome 边界，并用临时目录与合成
   held sample 实际写入、验证 raw-v24 HDF5/depth/video 和 FAILURE result.json；不连接设备。

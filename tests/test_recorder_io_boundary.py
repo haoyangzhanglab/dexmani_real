@@ -1,8 +1,8 @@
-"""Focused RecorderIO-boundary regressions for the formal max_frames stop reason.
+"""Focused RecorderIO-boundary regressions for mode-specific max_frames reasons.
 
 No hardware, no trained checkpoint.  These tests pin the owner-boundary contract:
 RecorderIO auto-finalizes capacity exhaustion with the configured stop reason, and
-the rollout recording config threads ``eval:invalid:max_frames`` through it. They
+the rollout recording config threads the run/eval namespace through it. They
 exercise the io_worker path directly rather than mocking the executor's intent.
 """
 
@@ -55,16 +55,19 @@ class TestMaxFramesStopReason(unittest.TestCase):
             policy=types.SimpleNamespace(control_hz=16.0),
             camera=types.SimpleNamespace(writer_queue_size=8),
         )
-        evaluation = RolloutRecordingConfig(
-            data_dir="/tmp/eval_data",
-            task_label="task",
-            operator="op",
-            max_running_s=30.0,
-        )
-        config = _evaluation_recorder_config(runtime, evaluation)
-        self.assertEqual(
-            config.max_frames_stop_reason, EVALUATION_MAX_FRAMES_STOP_REASON
-        )
+        for mode in ("run", "eval"):
+            with self.subTest(mode=mode):
+                evaluation = RolloutRecordingConfig(
+                    data_dir="/tmp/eval_data",
+                    task_label="task",
+                    operator="op",
+                    max_running_s=30.0,
+                    mode=mode,
+                )
+                config = _evaluation_recorder_config(runtime, evaluation)
+                self.assertEqual(
+                    config.max_frames_stop_reason, f"{mode}:invalid:max_frames"
+                )
 
 
 class TestAutoFinalizationReason(unittest.TestCase):

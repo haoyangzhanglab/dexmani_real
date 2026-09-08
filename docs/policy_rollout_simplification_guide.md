@@ -545,12 +545,23 @@ Example:
 
 ```json
 {
+  "mode": "eval",
   "outcome": "success",
   "eval_seed": 1,
   "duration_s": 18.4,
-  "stop_reason": "operator"
+  "stop_reason": "eval:success:operator",
+  "metrics": {
+    "inference_latency_ms": 12.5,
+    "observation_age_ms": 3.25,
+    "observation_skew_ms": 0.125
+  }
 }
 ```
+
+The three timing values are the latest samples received for the current
+generation; they are absent when no prediction was received and are not
+episode-wide percentiles. A run result uses `run:stopped:*` or `run:invalid:*`
+reasons according to the event rather than the `eval:*` namespace.
 
 Keep raw-v24 compatibility. Do not migrate dataset schema in this task.
 
@@ -649,6 +660,22 @@ Do not add scheduler research metrics.
 Live logging does not reset rollout rejection counts. The current result stores
 executor counts and latest timing samples; it does not claim episode-wide
 inference-latency percentiles. The optional action-gap metric remains deferred.
+
+Each immutable Prediction carries required finite, non-negative real scalar
+`inference_latency_ms`, `observation_age_ms`, and `observation_skew_ms` from its
+exact observation/inference pair. The existing prediction IPC carries them as
+three float64 scalars. Executor PolicyStats observes each new, current-generation
+prediction, including wholly stale chunks, and its snapshot reaches
+`result.json.metrics`. These are latest received samples, not full-episode
+percentiles; no received prediction means no inference timing fields.
+
+Run operator stop and duration timeout are STOPPED (`run:stopped:operator` and
+`run:stopped:timeout`). Run first-command and command-silence timeouts are INVALID
+(`run:invalid:first_command_timeout`, `run:invalid:command_silence_timeout`).
+Eval duration and both command timeouts remain FAILURE with `eval:failure:`
+prefixes. Explicit eval operator outcomes retain `eval:<outcome>:operator`.
+Shared INVALID fault/capacity reasons use the current mode's namespace without
+changing motion fencing or recorder finalization.
 
 ---
 

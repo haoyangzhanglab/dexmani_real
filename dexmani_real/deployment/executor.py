@@ -34,7 +34,6 @@ from dexmani_real.control.publication import (
 )
 from dexmani_real.control.safety_gate import SafetyGate
 from dexmani_real.deployment.evaluation import (
-    EVALUATION_MAX_FRAMES_STOP_REASON,
     EvaluationOutcome,
     RolloutRecordingConfig,
     evaluation_outcome_stop_reason,
@@ -219,7 +218,7 @@ class _CommandProgress:
 
 
 def prediction_from_record(record: np.void) -> Prediction:
-    """Deserialize and ownership-copy one exact flat prediction IPC record."""
+    """Deserialize one IPC prediction and validate its timing metadata."""
     if not isinstance(record, np.void) or record.dtype != PREDICTION_DTYPE:
         raise ValueError("prediction record has an invalid IPC schema")
     num_steps = int(record["num_steps"])
@@ -235,6 +234,9 @@ def prediction_from_record(record: np.void) -> Prediction:
         run_generation=int(record["run_generation"]),
         source_monotonic_ns=int(record["source_monotonic_ns"]),
         logical_step_monotonic_ns=int(record["logical_step_monotonic_ns"]),
+        inference_latency_ms=record["inference_latency_ms"],
+        observation_age_ms=record["observation_age_ms"],
+        observation_skew_ms=record["observation_skew_ms"],
         actions=np.array(
             record["actions"][:num_steps, :action_dim], dtype=np.float64, copy=True
         ),
@@ -264,6 +266,23 @@ def _command_watchdog_reason(
     if now_ns - last_valid_command_ns > command_silence_timeout_ns:
         return "command silence timeout"
     return None
+
+
+def _rollout_timeout_result(mode: str, reason: str) -> tuple[EvaluationOutcome, str]:
+    """Map the three rollout time limits to the run/eval metadata contract."""
+    if mode not in {"run", "eval"}:
+        raise ValueError("rollout mode must be run or eval")
+    events = {
+        "run time limit": "timeout",
+        "first command timeout": "first_command_timeout",
+        "command silence timeout": "command_silence_timeout",
+    }
+    event = events[reason]
+    if mode == "eval":
+        return EvaluationOutcome.FAILURE, f"eval:failure:{event}"
+    if event == "timeout":
+        return EvaluationOutcome.STOPPED, "run:stopped:timeout"
+    return EvaluationOutcome.INVALID, f"run:invalid:{event}"
 
 
 def _advance_control_grid_ns(due_ns: int, terminal_ns: int, step_dt_ns: int) -> int:
@@ -644,13 +663,20 @@ class PolicyExecutor:
             )
         return True
 
+    def _invalid_stop_reason(self, reason: str) -> str:
+        """Keep shared fault metadata in the current rollout namespace."""
+        mode = self.recording_config.mode if self.recording_config is not None else "run"
+        return f"{mode}:invalid:{reason}"
+
     def _fault(
         self,
         reason: str,
         *,
-        stop_reason: str = "eval:invalid:hardware_fault",
+        stop_reason: str | None = None,
         recorder_save: bool | None = None,
     ) -> None:
+        if stop_reason is None:
+            stop_reason = self._invalid_stop_reason("hardware_fault")
         self.shared.error_state.value = True
         self.shared.physical_home_completed.value = False
         revoke_motion(self.shared, SafetyState.FAULT)
@@ -752,7 +778,7 @@ class PolicyExecutor:
         except Exception:
             finished = self._invalidate_rollout(
                 "RecorderIO status polling failed",
-                stop_reason="eval:invalid:recorder_fault",
+                stop_reason=self._invalid_stop_reason("recorder_fault"),
                 recorder_save=False,
             )
             return not finished
@@ -770,29 +796,29 @@ class PolicyExecutor:
                 return True
             ended = self._invalidate_rollout(
                 f"RecorderIO failed: {result.error or 'unknown error'}",
-                stop_reason="eval:invalid:recorder_fault",
+                stop_reason=self._invalid_stop_reason("recorder_fault"),
                 recorder_save=False,
             )
         elif (
             result.phase is RecorderPhase.FINALIZING and self.run_started_ns is not None
         ):
-            if result.reason == EVALUATION_MAX_FRAMES_STOP_REASON:
+            if result.reason == self._invalid_stop_reason("max_frames"):
                 ended = self._invalidate_rollout(
                     "RecorderIO reached its rollout frame capacity",
-                    stop_reason=EVALUATION_MAX_FRAMES_STOP_REASON,
+                    stop_reason=self._invalid_stop_reason("max_frames"),
                     recorder_save=True,
                 )
             else:
                 ended = self._invalidate_rollout(
                     "RecorderIO finalized unexpectedly: "
                     f"{result.reason or 'unknown reason'}",
-                    stop_reason="eval:invalid:recorder_fault",
+                    stop_reason=self._invalid_stop_reason("recorder_fault"),
                     recorder_save=False,
                 )
         elif result.done and self.run_started_ns is not None:
             ended = self._invalidate_rollout(
                 "RecorderIO completed before rollout stopped",
-                stop_reason="eval:invalid:recorder_fault",
+                stop_reason=self._invalid_stop_reason("recorder_fault"),
                 recorder_save=False,
             )
         if result.done:
@@ -1086,7 +1112,7 @@ class PolicyExecutor:
             logger.error("rollout recording failed", exc_info=True)
             self._invalidate_rollout(
                 str(exc),
-                stop_reason="eval:invalid:recording_failure",
+                stop_reason=self._invalid_stop_reason("recording_failure"),
                 recorder_save=False,
             )
 
@@ -1148,7 +1174,7 @@ class PolicyExecutor:
                     )
                 self.recorder.stop_episode(
                     save=False,
-                    reason="eval:invalid:start_recheck_failed",
+                    reason=self._invalid_stop_reason("start_recheck_failed"),
                 )
                 logger.warning("executor: cancelled eval START: %s", rejection)
                 return
@@ -1176,7 +1202,7 @@ class PolicyExecutor:
             if self.recorder is not None:
                 self.recorder.stop_episode(
                     save=False,
-                    reason="eval:invalid:start_cancelled",
+                    reason=self._invalid_stop_reason("start_cancelled"),
                 )
             return
         if self.execute:
@@ -1219,9 +1245,9 @@ class PolicyExecutor:
             revoke_motion(self.shared, SafetyState.FAULT)
             if self.run_started_ns is not None and self.recorder is not None:
                 stop_reason = (
-                    "eval:invalid:estop"
+                    self._invalid_stop_reason("estop")
                     if bool(self.shared.estop_request.value)
-                    else "eval:invalid:hardware_fault"
+                    else self._invalid_stop_reason("hardware_fault")
                 )
                 self._finish_episode(
                     (
@@ -1237,9 +1263,9 @@ class PolicyExecutor:
                 self._fault(
                     "formal recorder was active before a motion epoch faulted",
                     stop_reason=(
-                        "eval:invalid:estop"
+                        self._invalid_stop_reason("estop")
                         if bool(self.shared.estop_request.value)
-                        else "eval:invalid:hardware_fault"
+                        else self._invalid_stop_reason("hardware_fault")
                     ),
                     recorder_save=False,
                 )
@@ -1265,23 +1291,15 @@ class PolicyExecutor:
                 except ValueError:
                     self._fault(
                         "invalid rollout outcome wire value",
-                        stop_reason="eval:invalid:recorder_fault",
+                        stop_reason=self._invalid_stop_reason("recorder_fault"),
                         recorder_save=False,
                     )
                     return
-                if outcome is EvaluationOutcome.NONE:
-                    outcome = (
-                        EvaluationOutcome.STOPPED
-                        if self.recording_config.mode == "run"
-                        else EvaluationOutcome.INVALID
-                    )
-                    stop_reason = (
-                        "run:stopped:operator"
-                        if self.recording_config.mode == "run"
-                        else "eval:invalid:operator"
-                    )
-                else:
-                    stop_reason = evaluation_outcome_stop_reason(outcome)
+                if self.recording_config.mode == "run":
+                    outcome = EvaluationOutcome.STOPPED
+                elif outcome is EvaluationOutcome.NONE:
+                    outcome = EvaluationOutcome.INVALID
+                stop_reason = evaluation_outcome_stop_reason(outcome)
                 self._finish_episode(
                     "operator evaluation stop",
                     stop_reason=stop_reason,
@@ -1305,7 +1323,7 @@ class PolicyExecutor:
                 if self.recorder is not None:
                     self._finish_episode(
                         "motion revoked outside formal stop request",
-                        stop_reason="eval:invalid:hardware_fault",
+                        stop_reason=self._invalid_stop_reason("hardware_fault"),
                         recorder_save=True,
                         aborted=True,
                     )
@@ -1367,6 +1385,12 @@ class PolicyExecutor:
         ):
             self._fault("prediction chunk shape conflicts with PolicySpec")
             return False
+
+        # Include even wholly stale chunks: their timing explains the discard.
+        # Old generations and repeated ring reads never add samples.
+        self.stats.observe_inference_latency_ms(prediction.inference_latency_ms)
+        self.stats.observe_observation_age_ms(prediction.observation_age_ms)
+        self.stats.observe_observation_skew_ms(prediction.observation_skew_ms)
 
         first_index = first_future_step_index(
             prediction.logical_step_monotonic_ns,
@@ -1692,14 +1716,13 @@ class PolicyExecutor:
             and now_ns - self.run_started_ns >= self.max_running_ns
         ):
             if self.recorder is not None:
+                outcome, stop_reason = _rollout_timeout_result(
+                    self.recording_config.mode, "run time limit"
+                )
                 self._finish_episode(
                     "run time limit",
-                    stop_reason="eval:failure:timeout",
-                    outcome=(
-                        EvaluationOutcome.FAILURE
-                        if self.recording_config.mode == "eval"
-                        else EvaluationOutcome.STOPPED
-                    ),
+                    stop_reason=stop_reason,
+                    outcome=outcome,
                     aborted=False,
                 )
             else:
@@ -1714,15 +1737,13 @@ class PolicyExecutor:
         )
         if watchdog_reason is not None:
             if self.recorder is not None:
-                stop_reason = (
-                    "eval:failure:first_command_timeout"
-                    if watchdog_reason == "first command timeout"
-                    else "eval:failure:command_silence_timeout"
+                outcome, stop_reason = _rollout_timeout_result(
+                    self.recording_config.mode, watchdog_reason
                 )
                 self._finish_episode(
                     watchdog_reason,
                     stop_reason=stop_reason,
-                    outcome=EvaluationOutcome.FAILURE,
+                    outcome=outcome,
                 )
             else:
                 self._finish_episode(watchdog_reason)

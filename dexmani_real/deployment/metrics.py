@@ -29,6 +29,8 @@ class PolicyStats:
     Each deployment worker owns one instance. It deliberately has explicit
     fields instead of a named metric registry: these values are the supported
     diagnostics for learned-policy execution, not a generic observability API.
+    In the executor, inference and observation timings are the latest received
+    samples carried by a current-generation Prediction, not episode percentiles.
     """
 
     inference_latency_ms: deque[float] = field(default_factory=_samples)

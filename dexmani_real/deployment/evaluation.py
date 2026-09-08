@@ -42,6 +42,9 @@ def evaluation_outcome_stop_reason(outcome: EvaluationOutcome) -> str:
 class RolloutRecordingConfig:
     """Resolved recording inputs shared by physical run and eval.
 
+    ``mode`` also owns the result namespace: ``run`` is a debugging rollout,
+    while ``eval`` carries formal task outcome semantics.
+
     ``data_dir`` is already an isolated absolute output directory.  The CLI
     owns selector/path validation and checkpoint hashing before workers start;
     this pickle-safe object carries only recording and result inputs.

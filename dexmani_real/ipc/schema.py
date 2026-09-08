@@ -114,13 +114,18 @@ COUPLED_COMMAND_DTYPE = np.dtype(
 )
 
 # One flat policy prediction is written per inference; the executor consumes
-# only the latest. ``num_steps`` and ``action_dim`` describe the populated
-# prefix of the fixed-capacity payload for an independent IPC decoder.
+# only the latest. The three timing fields are required float64 milliseconds
+# for the exact observation/inference pair and must be finite and non-negative.
+# ``num_steps`` and ``action_dim`` describe the populated prefix of the
+# fixed-capacity payload for an independent IPC decoder.
 PREDICTION_DTYPE = np.dtype(
     [
         ("run_generation", "<u8"),
         ("source_monotonic_ns", "<u8"),
         ("logical_step_monotonic_ns", "<u8"),
+        ("inference_latency_ms", "<f8"),
+        ("observation_age_ms", "<f8"),
+        ("observation_skew_ms", "<f8"),
         ("num_steps", "<u4"),
         ("action_dim", "<u4"),
         ("actions", "<f8", (MAX_PREDICTION_STEPS, MAX_POLICY_ACTION_DIM)),

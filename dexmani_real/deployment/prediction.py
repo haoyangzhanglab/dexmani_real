@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from numbers import Real
 
 import numpy as np
 
@@ -15,15 +17,31 @@ class Prediction:
 
     ``actions`` remains in the representation selected by the validated
     ``PolicySpec``. The inference process never slices it; the executor is its
-    sole decoder.
+    sole decoder. Required timings describe this exact observation/inference
+    pair and are transported as finite, non-negative float64 milliseconds.
     """
 
     run_generation: int
     source_monotonic_ns: int
     logical_step_monotonic_ns: int
     actions: np.ndarray
+    inference_latency_ms: float
+    observation_age_ms: float
+    observation_skew_ms: float
 
     def __post_init__(self) -> None:
+        for name in (
+            "inference_latency_ms",
+            "observation_age_ms",
+            "observation_skew_ms",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+                raise TypeError(f"{name} must be a real scalar")
+            sample = float(value)
+            if not math.isfinite(sample) or sample < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+            object.__setattr__(self, name, sample)
         if type(self.run_generation) is not int or self.run_generation < 0:
             raise ValueError("run_generation must be a non-negative integer")
         for name in ("source_monotonic_ns", "logical_step_monotonic_ns"):

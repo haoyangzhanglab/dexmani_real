@@ -103,7 +103,7 @@ def _evaluation_recorder_config(
     runtime: ExperimentConfig,
     evaluation: RolloutRecordingConfig,
 ) -> RecorderIOConfig:
-    """Build the recorder capacity contract for one physical rollout."""
+    """Build the mode-specific recorder capacity contract for one rollout."""
     control_hz = float(runtime.policy.control_hz)
     max_frames = (
         math.ceil(float(evaluation.max_running_s) * control_hz)
@@ -116,7 +116,11 @@ def _evaluation_recorder_config(
         min_frames=1,
         writer_queue_size=int(runtime.camera.writer_queue_size),
         provenance=evaluation.provenance,
-        max_frames_stop_reason=EVALUATION_MAX_FRAMES_STOP_REASON,
+        max_frames_stop_reason=(
+            EVALUATION_MAX_FRAMES_STOP_REASON
+            if evaluation.mode == "eval"
+            else "run:invalid:max_frames"
+        ),
     )
 
 

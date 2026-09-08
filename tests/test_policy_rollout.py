@@ -10,9 +10,13 @@ semantics.  Run with:
 
 from __future__ import annotations
 
-import types
+import json
+import tempfile
 import threading
+import types
 import unittest
+from dataclasses import replace
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -28,6 +32,7 @@ from dexmani_real.deployment.executor import (
     _validate_policy_arm_action,
     decode_policy_action,
 )
+from dexmani_real.deployment.inference.worker import serialize_prediction
 from dexmani_real.deployment.metrics import PolicyStats
 from dexmani_real.deployment.prediction import Prediction
 from dexmani_real.deployment.timing import first_future_step_index
@@ -185,6 +190,9 @@ class TestScheduling(unittest.TestCase):
             source_monotonic_ns=1,  # far older than any source-age threshold
             logical_step_monotonic_ns=now_ns - step_dt_ns,
             actions=np.zeros((num_steps, 19)),
+            inference_latency_ms=12.5,
+            observation_age_ms=3.25,
+            observation_skew_ms=0.125,
         )
         executor = PolicyExecutor.__new__(PolicyExecutor)
         executor.active_prediction = prediction
@@ -492,7 +500,7 @@ class TestFutureChunkBoundary(unittest.TestCase):
         actions = DexManiPolicyAdapter(loaded, spec).predict_action_chunk(observation)
         loaded.predict_action_chunk.assert_called_once_with(observation.arrays)
         loaded.predict.assert_not_called()
-        prediction = Prediction(1, 10, 20, actions)
+        prediction = Prediction(1, 10, 20, actions, 12.5, 3.25, 0.125)
         chunk[:] = -1
         restored = prediction_from_record(serialize_prediction(prediction)[0])
         self.assertEqual(restored.num_steps, spec.chunk_size)
@@ -511,6 +519,120 @@ class TestFutureChunkBoundary(unittest.TestCase):
             )
 
 
+class TestPredictionTiming(unittest.TestCase):
+    def test_inference_attaches_exact_observation_and_duration(self):
+        import dexmani_real.deployment.inference.worker as worker
+        from dexmani_real.config.defaults import PolicyParams
+        from dexmani_real.deployment.config import InferenceWorkerConfig
+
+        shared = mock.Mock()
+        shared.is_running.value = True
+        shared.run_generation.value = 2
+        shared.error_state.value = False
+        shared.estop_request.value = False
+        clock_ns = 2_000_000_000
+        observation = types.SimpleNamespace(
+            latest_source_monotonic_ns=1_995_000_000,
+            logical_step_monotonic_ns=clock_ns,
+            anchor_monotonic_ns=clock_ns,
+            arm_history=types.SimpleNamespace(
+                valid_mask=np.array([1]),
+                source_monotonic_ns=np.array([1_994_000_000]),
+            ),
+            hand_history=types.SimpleNamespace(
+                valid_mask=np.array([1]),
+                source_monotonic_ns=np.array([1_995_000_000]),
+            ),
+        )
+        actions = np.arange(15 * 19, dtype=np.float64).reshape(15, 19)
+        runtime = mock.Mock()
+        runtime.warmup.return_value = [0.0] * 5
+        policy_observation = object()
+
+        def predict(value):
+            nonlocal clock_ns
+            self.assertIs(value, policy_observation)
+            clock_ns += 12_500_000
+            shared.is_running.value = False
+            return actions
+
+        runtime.predict_action_chunk.side_effect = predict
+        with (
+            mock.patch.object(worker, "_load_inference_runtime", return_value=runtime),
+            mock.patch.object(worker, "build_fingertip_runtime", return_value=None),
+            mock.patch.object(
+                worker,
+                "read_run_state_snapshot",
+                return_value=types.SimpleNamespace(
+                    generation=2,
+                    state=SafetyState.RUNNING,
+                    started_monotonic_ns=1_000_000_000,
+                ),
+            ),
+            mock.patch.object(worker, "_build_observation", return_value=observation),
+            mock.patch.object(
+                worker, "_to_policy_observation", return_value=policy_observation
+            ),
+            mock.patch.object(
+                worker.time, "monotonic_ns", side_effect=lambda: clock_ns
+            ),
+        ):
+            worker.inference_loop(
+                shared,
+                PolicyParams(),
+                InferenceWorkerConfig("fake", "cpu", _fake_policy_spec()),
+            )
+        shared.prediction_ring.write.assert_called_once()
+        prediction = executor_mod.prediction_from_record(
+            shared.prediction_ring.write.call_args.args[0][0]
+        )
+        self.assertEqual(prediction.inference_latency_ms, 12.5)
+        self.assertEqual(prediction.observation_age_ms, 5.0)
+        self.assertEqual(prediction.observation_skew_ms, 1.0)
+        self.assertEqual(
+            prediction.source_monotonic_ns, observation.latest_source_monotonic_ns
+        )
+        self.assertEqual(
+            prediction.logical_step_monotonic_ns, observation.logical_step_monotonic_ns
+        )
+        np.testing.assert_array_equal(prediction.actions, actions)
+        runtime.close.assert_called_once()
+
+    def test_timing_round_trip(self):
+        prediction = Prediction(
+            1, 10, 20, np.zeros((15, 19)), 12.123456789012345, np.float64(3.2), 0
+        )
+        restored = executor_mod.prediction_from_record(
+            serialize_prediction(prediction)[0]
+        )
+        for name in (
+            "inference_latency_ms",
+            "observation_age_ms",
+            "observation_skew_ms",
+        ):
+            self.assertEqual(getattr(restored, name), getattr(prediction, name))
+
+    def test_malformed_timing_rejected_at_construction_and_ipc(self):
+        prediction = Prediction(1, 10, 20, np.zeros((15, 19)), 12.5, 3.25, 0.125)
+        for name in (
+            "inference_latency_ms",
+            "observation_age_ms",
+            "observation_skew_ms",
+        ):
+            for value in (float("nan"), float("inf"), -1.0):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaises(ValueError):
+                        replace(prediction, **{name: value})
+                    frame = serialize_prediction(prediction)
+                    frame[name][0] = value
+                    with self.assertRaises(ValueError):
+                        executor_mod.prediction_from_record(frame[0])
+            for value in (True, np.bool_(False), "1", None, 1j, np.array(1.0)):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaises(TypeError):
+                        replace(prediction, **{name: value})
+
+
 class TestFutureTail(unittest.TestCase):
     def executor(self):
         executor = PolicyExecutor.__new__(PolicyExecutor)
@@ -524,11 +646,31 @@ class TestFutureTail(unittest.TestCase):
         executor.stats = PolicyStats()
         return executor
 
+    def test_timing_ignores_repeated_reads_and_old_generations(self):
+        executor = self.executor()
+        prediction = Prediction(1, 1, 2, np.zeros((15, 19)), 12.5, 3.25, 0.125)
+        ring = executor.shared.prediction_ring
+        ring.read_latest.return_value = (serialize_prediction(prediction), 1, 1)
+        executor._ingest_latest_prediction(1_000_000_000)
+        self.assertIsNone(executor.active_prediction)
+        self.assertEqual(executor.stats.snapshot()["inference_latency_ms"], 12.5)
+        changed = replace(prediction, inference_latency_ms=99.0)
+        # A repeated sequence must not overwrite the latest sample.
+        ring.read_latest.return_value = (serialize_prediction(changed), 1, 1)
+        executor._ingest_latest_prediction(1_000_000_000)
+        ring.read_latest.return_value = (
+            serialize_prediction(replace(changed, run_generation=0)),
+            1,
+            2,
+        )
+        executor._ingest_latest_prediction(1_000_000_000)
+        self.assertEqual(executor.stats.snapshot()["inference_latency_ms"], 12.5)
+
     def test_old_tail_survives_next_inference_until_new_plan(self):
         executor = self.executor()
         start = 1_000_000_000
         chunk = np.repeat(np.arange(15, dtype=np.float64)[:, None], 19, axis=1)
-        old = Prediction(1, start, start, chunk)
+        old = Prediction(1, start, start, chunk, 12.5, 3.25, 0.125)
         with mock.patch.object(
             executor_mod, "read_latest_prediction", return_value=(old, 1)
         ):
@@ -547,7 +689,9 @@ class TestFutureTail(unittest.TestCase):
                 ):
                     executor._commit_terminal_step()
             self.assertIsNone(executor.active_prediction)
-        new = Prediction(1, start, start + 8 * executor.step_dt_ns, chunk + 100)
+        new = Prediction(
+            1, start, start + 8 * executor.step_dt_ns, chunk + 100, 12.5, 3.25, 0.125
+        )
         with mock.patch.object(
             executor_mod, "read_latest_prediction", return_value=(new, 2)
         ):
@@ -558,10 +702,14 @@ class TestFutureTail(unittest.TestCase):
     def test_whole_stale_and_old_generation_do_not_replace_future_plan(self):
         executor = self.executor()
         chunk = np.zeros((15, 19))
-        active = Prediction(1, 1, 2_000_000_000, chunk)
+        active = Prediction(1, 1, 2_000_000_000, chunk, 12.5, 3.25, 0.125)
         executor.active_prediction = active
         for seq, prediction in enumerate(
-            (Prediction(1, 1, 2, chunk), Prediction(0, 1, 3_000_000_000, chunk)), 1
+            (
+                Prediction(1, 1, 2, chunk, 12.5, 3.25, 0.125),
+                Prediction(0, 1, 3_000_000_000, chunk, 12.5, 3.25, 0.125),
+            ),
+            1,
         ):
             with mock.patch.object(
                 executor_mod, "read_latest_prediction", return_value=(prediction, seq)
@@ -574,7 +722,9 @@ class TestFutureTail(unittest.TestCase):
         start = 1_000_000_000
         dt = executor.step_dt_ns
         chunk = np.repeat(np.arange(15, dtype=np.float64)[:, None], 19, axis=1)
-        executor.active_prediction = Prediction(1, start, start, chunk)
+        executor.active_prediction = Prediction(
+            1, start, start, chunk, 12.5, 3.25, 0.125
+        )
         executor.schedule_base_ns = start
         executor.step_index = 0
         now = start + 3 * dt
@@ -724,6 +874,157 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         )
         self.assertEqual(executor.rollout_result["metrics"]["ik_rejection_count"], 2)
 
+    def test_prediction_timing_reaches_result_json(self):
+        executor = self.executor("eval")
+        self.begin(executor)
+        now = executor.run_started_ns
+        prediction = Prediction(
+            executor.run_generation, now, now, np.zeros((15, 19)), 12.5, 3.25, 0.125
+        )
+        ring = mock.Mock()
+        executor.shared.prediction_ring = ring
+        for sequence, current in enumerate(
+            (
+                prediction,
+                replace(
+                    prediction,
+                    inference_latency_ms=18.123456789012345,
+                    observation_age_ms=4.125,
+                    observation_skew_ms=0.25,
+                ),
+            ),
+            1,
+        ):
+            ring.read_latest.return_value = (
+                serialize_prediction(current),
+                now,
+                sequence,
+            )
+            self.assertTrue(executor._ingest_latest_prediction(now))
+            for name in (
+                "inference_latency_ms",
+                "observation_age_ms",
+                "observation_skew_ms",
+            ):
+                self.assertEqual(
+                    executor.stats.snapshot()[name], getattr(current, name)
+                )
+        executor.stats.flush(prefix="test")
+        executor._finish_episode(
+            "stop",
+            outcome=EvaluationOutcome.SUCCESS,
+            stop_reason="eval:success:operator",
+        )
+        metrics = dict(executor.rollout_result["metrics"])
+        for name in (
+            "inference_latency_ms",
+            "observation_age_ms",
+            "observation_skew_ms",
+        ):
+            self.assertEqual(metrics[name], getattr(current, name))
+        with tempfile.TemporaryDirectory() as directory:
+            executor._complete_recording(
+                RecorderStopResult(
+                    done=True,
+                    phase=RecorderPhase.COMPLETED,
+                    saved=True,
+                    path=directory,
+                )
+            )
+            payload = json.loads((Path(directory) / "result.json").read_text())
+            self.assertEqual(payload["metrics"], metrics)
+
+    def test_timeout_termination_matrix(self):
+        for mode, event, expected in (
+            ("run", "timeout", EvaluationOutcome.STOPPED),
+            ("run", "first_command_timeout", EvaluationOutcome.INVALID),
+            ("run", "command_silence_timeout", EvaluationOutcome.INVALID),
+            ("eval", "timeout", EvaluationOutcome.FAILURE),
+            ("eval", "first_command_timeout", EvaluationOutcome.FAILURE),
+            ("eval", "command_silence_timeout", EvaluationOutcome.FAILURE),
+        ):
+            with self.subTest(mode=mode, event=event):
+                executor = self.executor(mode)
+                self.begin(executor)
+                start = executor.run_started_ns
+                if event == "timeout":
+                    now = start + executor.max_running_ns
+                elif event == "first_command_timeout":
+                    now = start + executor.first_command_timeout_ns + 1
+                else:
+                    executor.last_valid_command_ns = start + 1
+                    now = start + executor.command_silence_timeout_ns + 2
+                with mock.patch.object(
+                    executor, "_observe_worker_progress", return_value=True
+                ):
+                    executor._run_active_tick(now)
+                reason = f"{mode}:{expected.name.lower()}:{event}"
+                self.assertEqual(executor.rollout_result["outcome"], expected)
+                self.assertEqual(executor.rollout_result["stop_reason"], reason)
+                executor.recorder.stop_episode.assert_called_once_with(
+                    save=True, reason=reason
+                )
+                self.assertEqual(executor.shared.safety_state.value, SafetyState.ARMED)
+
+    def test_shared_invalid_paths_follow_mode(self):
+        for mode in ("run", "eval"):
+            for event in ("hardware_fault", "estop", "recorder_fault", "max_frames"):
+                with self.subTest(mode=mode, event=event):
+                    executor = self.executor(mode)
+                    self.begin(executor)
+                    if event == "hardware_fault":
+                        executor._fault("offline fault")
+                    elif event == "estop":
+                        executor.shared.estop_request.value = True
+                        executor._handle_run_boundary()
+                    else:
+                        executor.recorder.poll_stop.return_value = RecorderStopResult(
+                            done=False,
+                            phase=RecorderPhase.FINALIZING,
+                            reason=(
+                                f"{mode}:invalid:max_frames"
+                                if event == "max_frames"
+                                else "unexpected"
+                            ),
+                        )
+                        executor._poll_recorder()
+                    self.assertEqual(
+                        executor.rollout_result["outcome"], EvaluationOutcome.INVALID
+                    )
+                    self.assertEqual(
+                        executor.rollout_result["stop_reason"],
+                        f"{mode}:invalid:{event}",
+                    )
+                    expected_state = (
+                        SafetyState.FAULT
+                        if event in {"hardware_fault", "estop"}
+                        else SafetyState.ARMED
+                    )
+                    self.assertEqual(executor.shared.safety_state.value, expected_state)
+
+    def test_malformed_ipc_timing_fences_rollout(self):
+        executor = self.executor("run")
+        self.begin(executor)
+        now = executor.run_started_ns
+        frame = serialize_prediction(
+            Prediction(
+                executor.run_generation,
+                now,
+                now,
+                np.zeros((15, 19)),
+                12.5,
+                3.25,
+                0.125,
+            )
+        )
+        frame["inference_latency_ms"][0] = np.nan
+        executor.shared.prediction_ring = mock.Mock()
+        executor.shared.prediction_ring.read_latest.return_value = (frame, now, 1)
+        self.assertFalse(executor._ingest_latest_prediction(now))
+        self.assertEqual(executor.shared.safety_state.value, SafetyState.FAULT)
+        self.assertEqual(executor.rollout_result["outcome"], EvaluationOutcome.INVALID)
+        self.assertNotIn("inference_latency_ms", executor.rollout_result["metrics"])
+
     def test_recording_failure_fences_without_worker_acceptance(self):
         executor = self.executor()
         self.begin(executor)
@@ -774,6 +1075,7 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
             ("eval", EvaluationOutcome.FAILURE),
             ("eval", EvaluationOutcome.INVALID),
             ("run", EvaluationOutcome.NONE),
+            ("run", EvaluationOutcome.FAILURE),
         ):
             with self.subTest(mode=mode, outcome=outcome):
                 executor = self.executor(mode)
@@ -786,6 +1088,10 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
                 self.assertTrue(executor.recorder.stop_episode.call_args.kwargs["save"])
                 expected = EvaluationOutcome.STOPPED if mode == "run" else outcome
                 self.assertEqual(executor.rollout_result["outcome"], expected)
+                self.assertEqual(
+                    executor.rollout_result["stop_reason"],
+                    f"{mode}:{expected.name.lower()}:operator",
+                )
                 self.assertEqual(executor.shared.stop_request.value, StopRequest.NONE)
 
     def test_timeout_quit_and_estop_labels(self):
@@ -843,7 +1149,7 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         executor = self.executor()
         self.begin(executor)
         executor.active_prediction = Prediction(
-            executor.run_generation, 1, 100, np.zeros((15, 19))
+            executor.run_generation, 1, 100, np.zeros((15, 19)), 12.5, 3.25, 0.125
         )
         candidate = types.SimpleNamespace(arm_qpos=np.zeros(7), hand_qpos=np.zeros(12))
         with (
@@ -879,7 +1185,7 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         executor.progress.arm_accepted_action_id = 0
         executor.progress.hand_accepted_action_id = 0
         executor.active_prediction = Prediction(
-            executor.run_generation, now, now, np.zeros((15, 19))
+            executor.run_generation, now, now, np.zeros((15, 19)), 12.5, 3.25, 0.125
         )
         executor.schedule_base_ns = now
         candidate = types.SimpleNamespace(
