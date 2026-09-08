@@ -91,7 +91,7 @@ from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.runtime.safety import SafetyState, require_transition
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
-from dexmani_real.runtime.operator_input import KeyboardState
+from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import ProcessSpec, build_processes, start_processes
 from dexmani_real.utils.feedback import validate_arm_feedback
 from dexmani_real.utils.log import get_logger
@@ -534,7 +534,7 @@ def _handle_calibration_sample_events(
     serial: str,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
-    keys: KeyboardState,
+    keys: KeyboardInput,
     state: CalibrationLoopState,
     calib_cfg: CalibrationConfig,
     aruco_cfg: ArucoConfig,
@@ -601,8 +601,11 @@ def _run_calibration(
         return 1
 
     pipeline: Any | None = None
-    keys = KeyboardState(
+    keys = KeyboardInput(
         suppress_echo=True,
+        capture_commands=False,
+        capture_raw_events=True,
+        repeat_estop_callback=True,
         estop_callback=lambda: set_calibration_fault(
             shared, "operator e-stop callback", estop=True
         ),
@@ -672,7 +675,7 @@ def _run_calibration_control_loop(
     serial: str,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
-    keys: KeyboardState,
+    keys: KeyboardInput,
     initial_state: dict[str, Any],
     calib_cfg: CalibrationConfig,
     aruco_cfg: ArucoConfig,

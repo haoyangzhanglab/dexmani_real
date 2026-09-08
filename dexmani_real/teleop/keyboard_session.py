@@ -33,7 +33,7 @@ from dexmani_real.planning import OnlineIKConfig, Pose, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.pose import quat_multiply
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.robot.hand_worker import hand_loop
-from dexmani_real.runtime.operator_input import KeyboardState
+from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import ProcessSpec, build_processes, start_processes
 from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
@@ -439,7 +439,7 @@ def _run_keyboard_home(
     shared: RuntimeChannels,
     runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
-    keys: KeyboardState,
+    keys: KeyboardInput,
     current_qpos_rad: np.ndarray,
     *,
     hand_enabled: bool,
@@ -576,7 +576,7 @@ def _run_control_loop(
     runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
     safety_gate: Any,
-    keys: KeyboardState,
+    keys: KeyboardInput,
     arm_process: Any,
     hand_process: Any | None,
     *,
@@ -856,7 +856,7 @@ def _run_keyboard_session(
     runtime: ExperimentConfig,
     context: Any,
     processes: list[Any],
-    keys: KeyboardState,
+    keys: KeyboardInput,
     planner: XArm7MotionPlanner,
     safety_gate: Any,
     *,
@@ -925,8 +925,10 @@ def run_keyboard_experiment(
         mp_context=context,
     )
     processes: list[Any] = []
-    keys = KeyboardState(
+    keys = KeyboardInput(
         suppress_echo=True,
+        capture_commands=False,
+        repeat_estop_callback=True,
         estop_callback=lambda: set_keyboard_fault(
             shared, "operator e-stop callback", estop=True
         ),
