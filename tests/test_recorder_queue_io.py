@@ -222,6 +222,16 @@ def test_sample_failure_discards_then_releases_capacity_once(session, damage):
     with pytest.raises(Empty):
         session.shared.record_result_q.get_nowait()
 
+    _start(session)
+    ring.write()
+    session.shared.record_control_q.put(
+        StopRecording(True, "recovered", ring.latest_sequence)
+    )
+    session.step()
+    recovered = session.shared.record_result_q.get_nowait()
+    assert recovered.saved and not recovered.error and recovered.frame_count == 1
+    assert [row.timestamp_s for row in session.recorder.rows] == [ring.latest_sequence]
+
 
 def test_frame_decoded_before_shared_consumption_ack(session):
     _start(session)
@@ -237,6 +247,75 @@ def test_frame_decoded_before_shared_consumption_ack(session):
     ):
         session.step()
     assert session.shared.recorder_consumed_sequence.value == 1
+
+
+def test_frame_arrays_are_owned_before_ack_releases_producer(session):
+    _start(session)
+    ring = session.shared.record_sample_ring
+    ring.write()
+    source = ring.rows[1]
+    source["camera_present"] = True
+    source["arm_qpos"] = 3
+    source["camera_rgb"] = 17
+    source["camera_depth"] = 23
+
+    class OverwriteOnAck:
+        value_before_ack = 0
+
+        @property
+        def value(self):
+            return self.value_before_ack
+
+        @value.setter
+        def value(self, sequence):
+            self.value_before_ack = sequence
+            source["arm_qpos"] = 99
+            source["camera_rgb"] = 99
+            source["camera_depth"] = 99
+
+    session.shared.recorder_consumed_sequence = OverwriteOnAck()
+    # Return a shared view so the ring fake cannot mask a missing decode copy.
+    with mock.patch.object(ring, "read_sequence", return_value=(source, 0, 1)):
+        session.step()
+    frame = session.recorder.rows[0]
+    np.testing.assert_array_equal(frame.data["arm_qpos"], np.full(7, 3))
+    np.testing.assert_array_equal(frame.camera_rgb, np.full((2, 2, 3), 17))
+    np.testing.assert_array_equal(frame.camera_depth, np.full((2, 2), 23))
+    assert session.shared.recorder_consumed_sequence.value == 1
+
+
+def test_pending_finalization_keeps_heartbeat_and_owns_shutdown(session):
+    _start(session)
+    ring = session.shared.record_sample_ring
+    ring.write()
+    session.recorder.finished = False
+    session.shared.record_control_q.put(StopRecording(True, "manual", 1))
+    session.step()
+    heartbeat_count = session.shared.set_heartbeat.call_count
+    ring.write()
+    session.shared.record_control_q.put(StopRecording(False, "duplicate", 2))
+    session.shared.is_running.value = False
+    for _ in range(3):
+        session.step()
+    assert session.shared.set_heartbeat.call_count == heartbeat_count + 3
+    assert session.shared.record_control_q.empty()
+    assert session.should_run
+    assert ring.reads == [1]
+    assert session.recorder.stops == [(True, "manual", 1)]
+    with pytest.raises(Empty):
+        session.shared.record_result_q.get_nowait()
+
+    session.shared.record_control_q.put(StartRecording("task", "operator", 3))
+    with pytest.raises(RuntimeError, match="previous recording is active"):
+        session.step()
+    session.recorder.finished = True
+    session.step()
+    result = session.shared.record_result_q.get_nowait()
+    assert result.saved and result.frame_count == 1 and result.reason == "manual"
+    assert not session.should_run
+    session.step()
+    with pytest.raises(Empty):
+        session.shared.record_result_q.get_nowait()
 
 
 def test_last_capacity_row_is_accepted_before_producer_stop(session):
@@ -258,6 +337,13 @@ def test_idle_async_camera_error_is_finalized(session):
     session.step()
     result = session.shared.record_result_q.get_nowait()
     assert result.error == "encoder failed" and not result.saved
+    session.recorder.camera_writer_error = None
+    _start(session)
+    session.shared.record_sample_ring.write()
+    session.shared.record_control_q.put(StopRecording(True, "recovered", 1))
+    session.step()
+    result = session.shared.record_result_q.get_nowait()
+    assert result.saved and not result.error and result.frame_count == 1
 
 
 def test_finalization_timeout_faults_session_without_premature_finished(session):
@@ -326,6 +412,78 @@ def test_prior_recording_failure_keeps_nonzero_worker_exit(session):
         with pytest.raises(RuntimeError, match="recording failure"):
             recorder_io_loop(session.shared, session.config)
     assert not session.shared.error_state.value
+
+
+def test_result_transport_failure_faults_worker_and_reaps_recorder(session):
+    session.shared.record_control_q.put(StartRecording("task", "operator", 1))
+    with (
+        mock.patch(
+            "dexmani_real.recording.io_worker._create_episode_recorder",
+            return_value=session.recorder,
+        ),
+        mock.patch(
+            "dexmani_real.recording.io_worker._RecorderIOSession.create",
+            return_value=session,
+        ),
+        mock.patch.object(
+            session.shared.record_result_q, "put", side_effect=OSError("broken queue")
+        ),
+        mock.patch.object(
+            session.recorder, "join_stop", wraps=session.recorder.join_stop
+        ) as join,
+    ):
+        with pytest.raises(RuntimeError, match="recording failure"):
+            recorder_io_loop(session.shared, session.config)
+    assert session.shared.error_state.value
+    assert session.recorder.stops == [(False, "recorder_process_shutdown", 0)]
+    join.assert_called_once()
+    assert session.shared.record_result_q.empty()
+
+
+def test_unreaped_finalization_exits_nonzero_without_prior_failure(session):
+    session.shared.is_running.value = False
+    session.recorder.finished = False
+    assert not session.had_failure
+    with (
+        mock.patch(
+            "dexmani_real.recording.io_worker._create_episode_recorder",
+            return_value=session.recorder,
+        ),
+        mock.patch(
+            "dexmani_real.recording.io_worker._RecorderIOSession.create",
+            return_value=session,
+        ),
+        mock.patch.object(
+            session.recorder, "join_stop", wraps=session.recorder.join_stop
+        ) as join,
+    ):
+        with pytest.raises(RuntimeError, match="recording failure"):
+            recorder_io_loop(session.shared, session.config)
+    join.assert_called_once()
+    assert not session.had_failure
+    assert session.shared.record_result_q.empty()
+
+
+def test_live_episode_finalizer_retains_handle_and_refuses_start(tmp_path):
+    from dexmani_real.recording.recorder import EpisodeRecorder
+
+    recorder = EpisodeRecorder(str(tmp_path / "recordings"))
+    finalizer = mock.Mock()
+    finalizer.is_alive.return_value = True
+    recorder._stop_thread = finalizer
+    try:
+        assert not recorder.join_stop(timeout=0)
+        assert recorder._stop_thread is finalizer
+        assert not recorder.poll_stop().done
+        assert recorder._stop_thread is finalizer
+        assert not recorder.start_episode(task_label="must refuse")
+        assert recorder._stop_thread is finalizer
+        assert not recorder.is_recording
+        assert not recorder.data_dir.exists()
+        assert finalizer.join.call_count == 2
+    finally:
+        finalizer.is_alive.return_value = False
+        assert recorder.join_stop(timeout=0)
 
 
 def test_client_shm_recorder_disk_roundtrip_at_capacity(tmp_path):

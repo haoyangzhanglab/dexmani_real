@@ -14,6 +14,7 @@
 | `repo_map.md` | 当前运行拓扑、核心数据流与边界索引。 |
 | `tools/convert_raw_v24_to_v25.py` | 冻结的一次性历史 raw v24 → v25 转换器；不依赖当前 runtime。 |
 | `docs/raw_v24_migration.md` | 历史数据迁移与 processed/Zarr golden 回归步骤。 |
+| `docs/refactor_execution_evidence.md` | 本轮分阶段重构的 baseline、审查、离线验证和交付记录。 |
 | `.codex/config.toml` | 项目级 Codex 权限、联网与子智能体并发配置。 |
 | `.codex/agents/*.toml` | 项目级难度分档子智能体：`sol-high`、`terra-max`、`luna-max`。 |
 
