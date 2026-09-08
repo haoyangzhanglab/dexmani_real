@@ -106,7 +106,7 @@ as desired behavior.
 - Base: `918a1719b92df43e0311cd68d8cbd74d1c92302e`.
 - Branch: `codex/refactor-pr3-workflow`.
 - Implementation: terra-max; independent reviewer: astra-medium.
-- Status: homing → pointcloud → keyboard in progress, separate commits.
+- Homing → pointcloud → keyboard completed in separate commits.
 - Homing commit: `6088496`; stable configured caller API preserved. Independent
   review approved with **35 targeted tests passed**. Hand-first SDK acceptance,
   config projection, fresh feedback, cancellation, reset, fallback and audio
@@ -125,6 +125,24 @@ as desired behavior.
   checks pin warmup/build arguments, calibration depth-only admission, both
   calibration branches, post-calibration frame/plane snapshot identity,
   disconnect and exact benchmark timing ranges. Production diff is zero.
+- Pointcloud tests/audit commit: `1b82b0e`.
+- Keyboard owner merge commit: `608850b`; independent refactor review approved,
+  **9 targeted tests passed**, full checkpoint **328 passed, 94 subtests passed**.
+  Command edges, held chars/arrows, repeatable raw events, sticky ESC/callback
+  variants, listener health, release/quiesce and echo handling are covered.
+  Command and raw-event capture are enabled only by consumers that drain them.
+  `KeyboardState` is removed; camera and teleop callers share `KeyboardInput`.
+- Review found a directly touched, pre-existing B1 bug: bounded stop/rollback
+  could retain a live listener, but a subsequent start could overwrite its
+  handle. Separate fix commit `5ea5615` retains ownership, refuses replacement,
+  and gates subsequent callbacks after shutdown/rollback. In-flight external
+  callbacks already dispatched before stop are not synchronously cancelled.
+- B1 independent review approved: **11 targeted tests passed**, including
+  explicit reap and same-owner restart; workflow target **30 passed**.
+- Final full gate: **330 passed, 94 subtests passed**; compileall and diff check
+  passed. Production: 127 files, 40,301 → 40,129 lines (−172); examples unchanged
+  at 13 files / 5,822 lines. No protected safety/IPC/schema/threshold, pointcloud
+  algorithm or action/observation research semantics changed; no hardware run.
 
 ## Hardware gate
 

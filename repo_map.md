@@ -45,6 +45,9 @@ control safety gate → command publication → arm / hand workers
   cache；`action_proposal.py` 拥有 EMA pose smoothing。独立 health/smoothing 包装模块已移除。
 - `teleop/homing.py::do_configured_teleop_home` 直接读取 immutable runtime 并编排 hand-first
   homing；`tests/test_teleop_homing.py` 离线覆盖接受顺序、配置、freshness、取消和 completion audio。
+- `runtime/operator_input.py::KeyboardInput` 统一拥有 listener、held keys 和原始事件；
+  command workflow 使用 edge-triggered `poll()`，keyboard teleop/camera calibration
+  关闭 command capture 并读取 held/event 状态，保留各自 repeat/release 语义。
 - learned-policy lifecycle 先等待 inference restore/warmup，再启动所需传感器和执行器 worker；
   supervisor 只监督实际运行的 process heartbeat，readiness 只负责有界启动等待。
 - teleop lifecycle 按 dependency → policy → VR 分阶段启动启用的 worker；父进程 readiness
