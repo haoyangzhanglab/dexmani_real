@@ -14,6 +14,7 @@
 | `repo_map.md` | 当前运行拓扑、核心数据流与边界索引。 |
 | `tools/convert_raw_v24_to_v25.py` | 冻结的一次性历史 raw v24 → v25 转换器；不依赖当前 runtime。 |
 | `docs/raw_v24_migration.md` | 历史数据迁移与 processed/Zarr golden 回归步骤。 |
+| `docs/refactor_contract_audit.md` | 验证器分类、producer/consumer 证据与 KEEP 决策。 |
 | `docs/refactor_execution_evidence.md` | 本轮分阶段重构的 baseline、审查、离线验证和交付记录。 |
 | `.codex/config.toml` | 项目级 Codex 权限、联网与子智能体并发配置。 |
 | `.codex/agents/*.toml` | 项目级难度分档子智能体：`sol-high`、`terra-max`、`luna-max`。 |
@@ -42,7 +43,7 @@ control safety gate → command publication → arm / hand workers
 - `RuntimeChannels` 是跨进程状态的唯一 allocation owner；固定 wire shape、dtype 和持久化
   record layout 由 `dexmani_real/ipc/schema.py` 定义。
 - `teleop/control_loop/grid.py` 拥有 feedback 连续错误计数和启动时解析的私有 command-limit
-  cache；`action_proposal.py` 拥有 EMA pose smoothing。独立 health/smoothing 包装模块已移除。
+  cache；`action_proposal.py` 拥有 EMA pose smoothing。独立 health/smoothing 包装模块与无消费者的 StageTimer 模块已移除。
 - `teleop/homing.py::do_configured_teleop_home` 直接读取 immutable runtime 并编排 hand-first
   homing；`tests/test_teleop_homing.py` 离线覆盖接受顺序、配置、freshness、取消和 completion audio。
 - `runtime/operator_input.py::KeyboardInput` 统一拥有 listener、held keys 和原始事件；
