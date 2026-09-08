@@ -213,7 +213,9 @@ as desired behavior.
 
 - Base: `34291eb68d5677c28f2c9b9bdb7650e13d518f6d`.
 - Branch: `codex/refactor-pr6-cleanup`.
-- Production commit: `d4cd915`.
+- Production commit: `d4cd915`; documentation commit: `a7710cc`.
+- PR: https://github.com/haoyangzhanglab/dexmani_real/pull/8 (merged).
+- Integrated SHA: `174170b703feed42dd4740368da16c58f6ddd7c9`.
 - Implementation: luna-max; independent reviewer: terra-max.
 - Removed StageTimer and its module/wiring, arm/hand log-only counters,
   CameraStreamWriter percentile/high-watermark collection, and pointcloud
@@ -245,6 +247,204 @@ as desired behavior.
   compileall and diff check passed. No tests changed or hardware run.
 - Production: 127 → 126 files; 40,036 → 39,797 lines (−239).
   Examples unchanged: 13 files / 5,822 lines. All conditional Phase 7 items DEFER.
+
+## Integrated delivery
+
+- Integrated software revision: `174170b703feed42dd4740368da16c58f6ddd7c9`.
+  Final evidence changes after this revision affect only this document.
+- Phase 0 and PR1–PR6 are merged sequentially into main: PRs #2–#8. Each branch
+  was based on the preceding merged SHA recorded above; no stacked/unmerged
+  dependency remains. GitHub reported CLEAN merge state and no status checks.
+  CI remains **not configured**, not CI green.
+- Final main offline gate: **344 passed, 94 subtests passed** (baseline 293/94);
+  compileall for package/examples/tests and diff check passed. Source worktree
+  was clean before this evidence update. No hardware or example program run.
+
+| Scope | Baseline files / physical lines | Integrated files / physical lines | Line change |
+|---|---:|---:|---:|
+| Production package | 129 / 40,587 | 126 / 39,797 | −790 |
+| Examples | 13 / 6,081 | 13 / 5,822 | −259 |
+| Package + examples | 142 / 46,668 | 139 / 45,619 | −1,049 |
+| Offline tests | 21 / 5,990 | 25 / 8,017 | +2,027 |
+
+Counts use tracked Python files at baseline and integrated revisions; historical
+Markdown deletions are excluded from production savings. Four obsolete guides
+account for 3,931 separately removed documentation lines.
+
+### Commit sequence
+
+Merge commits and stage base SHAs are recorded above. Changes within each stage
+are listed in order here, including evidence commits:
+
+| Stage | Commits |
+|---|---|
+| Phase 0 | `65c32d2` |
+| PR1 | `ae16888`, `9094855`, `efeaae6`, `4a0d323`, `f0ab11d`, `13d5639` |
+| PR2 | `32f8d2e`, `235b277` |
+| PR3 | `6088496`, `1b82b0e`, `608850b`, `5ea5615`, `840ca49` |
+| PR4 | `eb0b053`, `65d9d0d`, `601d468`, `ab13bc4` |
+| PR5 | `5747fdf` |
+| PR6 | `d4cd915`, `a7710cc` |
+
+### Removed and retained mechanisms
+
+Removed passive diagnostics, unused profile/health/smoothing/timing wrappers,
+public teleop limit projection, STRICT-only analysis, duplicate CLI audit/batch
+orchestration and report rewrite, homing passthrough, duplicate keyboard state
+owner, serializer async lifecycle/registry/atexit/previous-stop ceremony,
+historical-failure exit poisoning and duplicate final artifact existence gate.
+RecorderIO owns the one pending finalizer and retains fatal resource failures.
+
+Intentionally retained TeleopConfig, grid startup numeric cache, KeyboardInput
+held/event/repeat/release/ESC behavior, RecorderClient poll/join and failed/discard
+reserved paths, AUDIT/HARD_ONLY temporal analysis and whole-episode Zarr gap
+admission, formal result metrics, effective incidents, validators, feedback
+failure distinctions and fsync durability. Existing shared pointcloud builder
+and calibration preprocessing already met the Phase 3 target; additional
+forwarding wrappers were rejected and numeric/CLI/benchmark tests expanded.
+
+A full baseline-to-integrated diff is empty for protected control action,
+publication/SafetyGate, deployment (including adapter/prediction/timing), IPC,
+safety/supervisor/process shutdown, planning/assets, replay, AudioFeedback,
+camera clock/source code, pointcloud algorithms, Zarr export, RecorderClient,
+atomic I/O, historical v24 converter, `.claude/settings.local.json` and
+`examples/xhand_control_example.py`. Changed worker/grid paths retain their
+safety, generation, sequence and freshness decisions. No external dexmani_policy
+repository was modified; no schema/version/IPC/threshold change was made.
+
+No new design blocker was deferred. Conditional Phase 7 backend/hardware/legacy
+compatibility cleanup remains DEFER because its prerequisite decisions were
+not made; it is outside the software completion scope. The one local B1 listener
+ownership fix is isolated in `5ea5615`. Hardware smoke, trained-policy execution
+and deployment latency measurement remain outside the offline evidence.
+
+### Final independent integration review
+
+- **APPROVED** for `174170b703feed42dd4740368da16c58f6ddd7c9`; no blocking findings.
+  **SOFTWARE COMPLETE**; **MANUAL-HARDWARE-GATE PENDING**.
+- Reviewer: independent astra-medium, separate from the Recorder/contract
+  implementation agent. Reviewed actual integrated source at `174170b`,
+  aggregate baseline diff and final evidence; no production edits by reviewer.
+- Independent offline boundary suite: **239 passed, 50 subtests passed**.
+  Covers control safety, policy rollout/prediction/observation/tactile/producers,
+  Recorder actual-thread and retained-resource guards, dataset admission/Zarr/
+  deployment semantics, keyboard/homing and pointcloud.
+- Re-traced publication → worker final SDK fence, generation resets, visual
+  freshness/causal history, Recorder pending → thread → join → result and
+  close → validate → atomic publication, and dataset single analysis → staged
+  reports. Replay/audio/deployment protected behavior is retained across changed
+  callers. PR6 hand reset and camera resource-release proofs remain intact.
+- Reviewer independently confirmed the protected-path diff is empty and moved
+  smoothing functions are AST-identical to baseline.
+- Root final gate and protected-path comparison are recorded above. All 74 local
+  links across README, repo map, evidence, contract audit and pointcloud docs
+  resolve. CI and hardware limitations remain explicit.
+
+### Changed files by stage
+
+`A` = added, `M` = modified, `D` = removed. Git PR diffs retain full content.
+
+**Phase 0**
+
+```text
+A	docs/refactor_execution_evidence.md
+M	repo_map.md
+A	tests/test_dataset_admission.py
+A	tests/test_keyboard_input.py
+A	tests/test_pointcloud_characterization.py
+M	tests/test_recorder_queue_io.py
+```
+
+**PR1**
+
+```text
+M	dexmani_real/config/defaults.py
+M	dexmani_real/teleop/config.py
+M	dexmani_real/teleop/control_loop/action_proposal.py
+M	dexmani_real/teleop/control_loop/grid.py
+D	dexmani_real/teleop/control_loop/smoothing.py
+D	dexmani_real/teleop/health.py
+M	dexmani_real/teleop/keyboard_session.py
+M	dexmani_real/teleop/loop.py
+M	dexmani_real/utils/rate.py
+M	docs/refactor_execution_evidence.md
+M	repo_map.md
+```
+
+**PR2**
+
+```text
+M	README.md
+M	dexmani_real/dataset/clean.py
+M	dexmani_real/dataset/contracts.py
+M	dexmani_real/dataset/processing.py
+M	dexmani_real/dataset/quality.py
+M	docs/data_schema.md
+M	docs/refactor_execution_evidence.md
+M	examples/process_episodes.py
+M	repo_map.md
+M	tests/test_dataset_admission.py
+```
+
+**PR3**
+
+```text
+M	dexmani_real/calibration/camera/motion.py
+M	dexmani_real/calibration/camera/session.py
+M	dexmani_real/control/jog.py
+M	dexmani_real/runtime/operator_input.py
+M	dexmani_real/teleop/homing.py
+M	dexmani_real/teleop/keyboard_session.py
+M	docs/refactor_execution_evidence.md
+M	repo_map.md
+M	tests/test_keyboard_input.py
+M	tests/test_pointcloud_characterization.py
+A	tests/test_teleop_homing.py
+```
+
+**PR4**
+
+```text
+M	README.md
+M	dexmani_real/recording/__init__.py
+M	dexmani_real/recording/io_worker.py
+M	dexmani_real/recording/recorder.py
+M	dexmani_real/recording/storage/camera_writer.py
+M	docs/refactor_execution_evidence.md
+M	repo_map.md
+M	tests/test_raw_v25_recording.py
+M	tests/test_recorder_io_boundary.py
+M	tests/test_recorder_queue_io.py
+```
+
+**PR5**
+
+```text
+M	README.md
+A	docs/refactor_contract_audit.md
+M	docs/refactor_execution_evidence.md
+M	repo_map.md
+```
+
+**PR6**
+
+```text
+M	README.md
+M	dexmani_real/recording/storage/camera_writer.py
+M	dexmani_real/robot/arm_worker.py
+M	dexmani_real/robot/hand_worker.py
+M	dexmani_real/sensor/pointcloud_worker.py
+M	dexmani_real/teleop/control_loop/grid.py
+D	dexmani_real/teleop/control_loop/timing.py
+M	dexmani_real/teleop/loop.py
+D	docs/eef_tactile_observation_upgrade_guide.md
+M	docs/pointcloud_pipeline.md
+D	docs/policy_formal_eval_followup_guide.md
+D	docs/policy_rollout_simplification_guide.md
+D	docs/raw_v25_runtime_simplification_guide.md
+M	docs/refactor_execution_evidence.md
+M	repo_map.md
+```
 
 ## Hardware gate
 
