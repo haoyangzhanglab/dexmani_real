@@ -79,6 +79,9 @@ as desired behavior.
 - Base: `d2494cdf2840ec3a6ac120203f00eeb55040040d`.
 - Branch: `codex/refactor-pr2-dataset`.
 - Implementation: terra-max; independent reviewer: astra-medium.
+- Commits: `32f8d2e` implementation/tests; `235b277` docs/evidence.
+- PR: https://github.com/haoyangzhanglab/dexmani_real/pull/4 (merged).
+- Integrated SHA: `918a1719b92df43e0311cd68d8cbd74d1c92302e`.
 - Independent review: approved. Targeted suite **50 passed**; full suite
   **318 passed, 94 subtests passed**; compileall and diff check passed.
 - Numeric golden: 32 clean/stale-tactile AUDIT processed datasets match baseline
@@ -97,6 +100,49 @@ as desired behavior.
   are produced in staging; Zarr export source and gap tests are unchanged.
 - No independent pre-existing bugfix; no protected schema/version/IPC/threshold,
   research-array or durability changes. Hardware not exercised.
+
+### PR3 — workflow
+
+- Base: `918a1719b92df43e0311cd68d8cbd74d1c92302e`.
+- Branch: `codex/refactor-pr3-workflow`.
+- Implementation: terra-max; independent reviewer: astra-medium.
+- Homing → pointcloud → keyboard completed in separate commits.
+- Homing commit: `6088496`; stable configured caller API preserved. Independent
+  review approved with **35 targeted tests passed**. Hand-first SDK acceptance,
+  config projection, fresh feedback, cancellation, reset, fallback and audio
+  ordering are covered; protected control/arm_homing implementation unchanged.
+- Pointcloud source audit refined the implementation plan: reported builds and
+  fresh-frame benchmarks already share `build_point_cloud_with_stats`;
+  calibration deliberately uses `aligned_depth_points_in_base` before table
+  cropping/outlier filtering/sampling. Diagnostic capture needs RGB/raw/metric
+  depth, benchmark capture needs RGB/raw, calibration needs depth only. A
+  forwarding helper or mode-based capture abstraction would add complexity or
+  change validation/timing. Production remains unchanged; stronger offline
+  characterization verifies these existing shared boundaries and distinct
+  capture contracts. This is an already-satisfied design target, not an
+  unfinished refactor or a deferred defect.
+- Pointcloud independent review approved; **8 targeted tests passed**. New
+  checks pin warmup/build arguments, calibration depth-only admission, both
+  calibration branches, post-calibration frame/plane snapshot identity,
+  disconnect and exact benchmark timing ranges. Production diff is zero.
+- Pointcloud tests/audit commit: `1b82b0e`.
+- Keyboard owner merge commit: `608850b`; independent refactor review approved,
+  **9 targeted tests passed**, full checkpoint **328 passed, 94 subtests passed**.
+  Command edges, held chars/arrows, repeatable raw events, sticky ESC/callback
+  variants, listener health, release/quiesce and echo handling are covered.
+  Command and raw-event capture are enabled only by consumers that drain them.
+  `KeyboardState` is removed; camera and teleop callers share `KeyboardInput`.
+- Review found a directly touched, pre-existing B1 bug: bounded stop/rollback
+  could retain a live listener, but a subsequent start could overwrite its
+  handle. Separate fix commit `5ea5615` retains ownership, refuses replacement,
+  and gates subsequent callbacks after shutdown/rollback. In-flight external
+  callbacks already dispatched before stop are not synchronously cancelled.
+- B1 independent review approved: **11 targeted tests passed**, including
+  explicit reap and same-owner restart; workflow target **30 passed**.
+- Final full gate: **330 passed, 94 subtests passed**; compileall and diff check
+  passed. Production: 127 files, 40,301 → 40,129 lines (−172); examples unchanged
+  at 13 files / 5,822 lines. No protected safety/IPC/schema/threshold, pointcloud
+  algorithm or action/observation research semantics changed; no hardware run.
 
 ## Hardware gate
 

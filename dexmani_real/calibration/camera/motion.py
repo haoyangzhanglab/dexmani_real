@@ -24,7 +24,7 @@ from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
 from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.pose import quat_multiply
 from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
-from dexmani_real.runtime.operator_input import KeyboardState
+from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.utils.feedback import validate_arm_feedback
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
@@ -203,7 +203,7 @@ def handle_calibration_home_key(
     shared: RuntimeChannels,
     runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
-    keys: KeyboardState,
+    keys: KeyboardInput,
     rate: LoopRate,
     state: CalibrationLoopState,
 ) -> HomeKeyOutcome:
@@ -281,7 +281,7 @@ def run_calibration_motion_tick(
     planner: XArm7MotionPlanner,
     safety_gate: SafetyGate,
     workspace: np.ndarray,
-    keys: KeyboardState,
+    keys: KeyboardInput,
     state: CalibrationLoopState,
     calib_cfg: CalibrationConfig,
 ) -> None:

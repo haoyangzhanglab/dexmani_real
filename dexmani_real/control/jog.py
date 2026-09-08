@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from dexmani_real.runtime.operator_input import KeyboardState
+    from dexmani_real.runtime.operator_input import KeyboardInput
 
 
 def compute_cartesian_jog_delta(
-    keys: KeyboardState,
+    keys: KeyboardInput,
     delta_pos: float,
     delta_rpy: float,
 ) -> tuple[np.ndarray, np.ndarray]:
