@@ -18,6 +18,7 @@ from dexmani_real.recording.frame import (
 from dexmani_real.recording.sample import EpisodeAction, build_episode_state
 from dexmani_real.recording.recorder import EpisodeRecorder
 from dexmani_real.recording.storage.camera_writer import CameraStreamWriterConfig
+from dexmani_real.recording.storage.camera_writer import CameraStreamWriter
 from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.recording.storage.schema import (
     DATASET_SPECS,
@@ -98,9 +99,107 @@ def _frame(timestamp, value=0):
 
 
 def _save(recorder):
-    destination = Path(recorder.stop_episode(save=True))
-    assert recorder.join_stop(timeout=10), recorder.stop_error
-    return destination
+    return Path(recorder.finish_episode(save=True))
+
+
+@pytest.mark.parametrize("save", [True, False])
+def test_synchronous_finish_returns_reserved_path_and_resets(tmp_path, save):
+    recorder = _recorder(tmp_path)
+    assert recorder.finish_episode() is None
+    assert recorder.start_episode()
+    assert recorder.add_episode_frame(_frame(1))
+    reserved = recorder.episode_path
+    assert recorder.finish_episode(save=save, reason="synchronous") == reserved
+    assert Path(reserved).is_dir() is save
+    assert not recorder.is_recording
+    assert recorder.frame_count == 0
+    assert recorder.finish_episode() is None
+    assert recorder.start_episode()
+    assert recorder.add_episode_frame(_frame(2))
+    assert Path(recorder.finish_episode()).is_dir()
+
+
+def test_synchronous_finish_raises_after_failed_validation_cleanup(tmp_path):
+    recorder = _recorder(tmp_path)
+    assert recorder.start_episode()
+    assert recorder.add_episode_frame(_frame(1))
+    reserved = Path(recorder.episode_path)
+    with mock.patch.object(
+        recorder, "_validate_temp_episode", side_effect=OSError("invalid sidecar")
+    ):
+        with pytest.raises(RuntimeError, match="invalid sidecar"):
+            recorder.finish_episode()
+    assert not reserved.exists()
+    assert not list(tmp_path.glob(".tmp_episode_*"))
+    assert not recorder.is_recording
+    assert recorder._camera_writer is None and recorder._data_writer is None
+    assert recorder.start_episode()
+    assert recorder.add_episode_frame(_frame(2))
+    assert Path(recorder.finish_episode()).is_dir()
+
+
+@pytest.mark.parametrize("failed_resource", ["encoder", "depth"])
+def test_camera_close_failure_retains_resource_after_thread_exit(tmp_path, failed_resource):
+    encoder = mock.Mock()
+    depth_file = mock.Mock()
+    resource = encoder if failed_resource == "encoder" else depth_file
+    resource.close.side_effect = OSError("resource close failed")
+    with mock.patch(
+        "dexmani_real.recording.storage.camera_writer.h5py.File",
+        return_value=depth_file,
+    ):
+        writer = CameraStreamWriter(
+            tmp_path,
+            CameraStreamWriterConfig(
+                rgb_shape=(16, 16, 3), depth_shape=(16, 16), fps=16, queue_size=8
+            ),
+            encoder_factory=mock.Mock(return_value=encoder),
+        )
+        with pytest.raises(RuntimeError, match="resource close failed"):
+            writer.close(timeout=2)
+    assert not writer._thread.is_alive()
+    assert not writer.resources_released
+    assert writer._unreleased_resources == [resource]
+    with pytest.raises(RuntimeError):
+        writer.close(timeout=0)
+    assert writer._unreleased_resources == [resource]
+    resource.close.assert_called_once()
+
+
+@pytest.mark.parametrize("failed_resource", ["camera", "hdf5", "staging"])
+def test_finish_retains_unsafe_resource_and_refuses_restart(tmp_path, failed_resource):
+    recorder = _recorder(tmp_path)
+    staging = tmp_path / ".tmp_episode_test"
+    staging.mkdir()
+    recorder._recording = True
+    recorder._episode_dir = str(tmp_path / "episode_test")
+    recorder._temp_dir = str(staging)
+    camera_writer = mock.Mock(resources_released=failed_resource != "camera")
+    data_writer = mock.Mock()
+    recorder._camera_writer = camera_writer
+    recorder._data_writer = data_writer
+    if failed_resource == "camera":
+        camera_writer.close.side_effect = OSError("camera remains live")
+    if failed_resource == "hdf5":
+        data_writer.close.side_effect = OSError("HDF5 remains open")
+    with (
+        mock.patch.object(
+            recorder, "_finalize_episode_files", side_effect=OSError("transaction failed")
+        ),
+        mock.patch.object(
+            recorder, "_discard_temp_files",
+            side_effect=OSError("staging remains") if failed_resource == "staging" else None,
+        ),
+    ):
+        with pytest.raises(RuntimeError):
+            recorder.finish_episode()
+    assert not recorder.resources_released
+    assert recorder._temp_dir == str(staging) and staging.exists()
+    assert not recorder.start_episode()
+    if failed_resource == "camera":
+        assert recorder._camera_writer is camera_writer
+    if failed_resource == "hdf5":
+        assert recorder._data_writer is data_writer
 
 
 def test_camera_calibration_survives_minimal_shared_metadata(tmp_path):
@@ -202,11 +301,11 @@ def test_camera_close_failure_never_publishes(tmp_path):
         raise OSError("injected camera close failure")
 
     with mock.patch.object(writer, "close", side_effect=close_then_fail):
-        destination = Path(recorder.stop_episode(save=True))
-        assert not recorder.join_stop(timeout=10)
+        destination = Path(recorder.episode_path)
+        with pytest.raises(RuntimeError, match="injected camera close failure"):
+            recorder.finish_episode(save=True)
     assert not destination.exists()
     assert not list(tmp_path.glob(".tmp_episode_*"))
-    assert "injected" in recorder.stop_error
 
 
 @pytest.mark.parametrize("damage", ["missing_sent", "wrong_shape", "wrong_dtype"])
@@ -229,8 +328,7 @@ def test_discard_then_next_episode(tmp_path):
     recorder = _recorder(tmp_path)
     recorder.start_episode()
     recorder.add_episode_frame(_frame(1))
-    destination = Path(recorder.stop_episode(save=False))
-    assert recorder.join_stop(timeout=10)
+    destination = Path(recorder.finish_episode(save=False))
     assert not destination.exists()
     assert recorder.start_episode()
     recorder.add_episode_frame(_frame(2))

@@ -9,15 +9,11 @@ shared memory or controls hardware.
 
 from __future__ import annotations
 
-__all__ = ["EpisodeRecorder", "StopResult", "normalize_provenance_metadata"]
+__all__ = ["EpisodeRecorder", "EpisodeFinalizationError", "normalize_provenance_metadata"]
 
-import atexit
 import shutil
-import threading
 import time
-import weakref
 from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -48,13 +44,7 @@ logger = get_logger(__name__)
 
 DEFAULT_MAX_RECORD_FRAMES: int = 10000
 _CAMERA_WRITER_CLOSE_TIMEOUT_S = 60.0
-_PREVIOUS_EPISODE_STOP_TIMEOUT_S = 15.0
-_PROCESS_EXIT_STOP_TIMEOUT_S = 60.0
 _MAX_PROVENANCE_VALUE_BYTES = 4096
-
-
-# The episode-stop thread is non-daemon so transaction finalization is not abandoned.
-_LIVE_RECORDERS: weakref.WeakSet = weakref.WeakSet()
 
 
 def normalize_provenance_metadata(
@@ -95,42 +85,14 @@ def normalize_provenance_metadata(
     return normalized
 
 
-def _flush_all_recorders() -> None:
-    for rec in list(_LIVE_RECORDERS):  # snapshot — WeakSet may mutate under GC
-        try:
-            if rec._recording:
-                rec.stop_episode(save=False, reason="atexit")
-            if not rec.join_stop(timeout=_PROCESS_EXIT_STOP_TIMEOUT_S):
-                logger.error("recorder did not finish before interpreter shutdown")
-        except Exception:
-            logger.warning(
-                "recorder cleanup failed during interpreter shutdown", exc_info=True
-            )
-
-
-atexit.register(_flush_all_recorders)
-
-
-@dataclass
-class StopResult:
-    """Outcome of a background stop_episode daemon, returned by poll_stop()."""
-
-    done: bool
-    """True when the daemon finished (save or crash)."""
-    error: str | None = None
-    """Error message if the daemon crashed, None otherwise."""
-    save: bool = False
-    """Whether stop_episode was called with save=True (save vs discard)."""
-    path: str | None = None
-    """Episode directory path, or None if no stop was pending."""
-    frame_count: int = 0
-    """Frame count at the moment stop_episode was called."""
+class EpisodeFinalizationError(RuntimeError):
+    """An episode transaction failed; callers must also check resource release."""
 
 
 class EpisodeRecorder:
     """Coordinate one transactional episode around a dedicated data writer.
 
-    Lifecycle: start_episode() → add_frame() × N → stop_episode()
+    Lifecycle: start_episode() → add_frame() × N → finish_episode()
     """
 
     def __init__(
@@ -170,17 +132,16 @@ class EpisodeRecorder:
         self._last_timestamp_s: float | None = None
         self._flush_interval = 32
 
+        self._finishing = False
 
-        self._stop_thread: threading.Thread | None = None
-
-        # Error from the last stop operation; callers read it after join_stop().
-        self._stop_error: str | None = None
-
-        self._stop_save: bool = False
-        self._stop_path: str | None = None
-        self._stop_frame_count: int = 0
-
-        _LIVE_RECORDERS.add(self)  # atexit flush net
+    @property
+    def resources_released(self) -> bool:
+        """Whether storage owners and temporary transaction files were released."""
+        return (
+            self._camera_writer is None
+            and self._data_writer is None
+            and self._temp_dir is None
+        )
 
     @property
     def is_recording(self) -> bool:
@@ -200,11 +161,6 @@ class EpisodeRecorder:
         return self._max_frames_reached
 
     @property
-    def stop_error(self) -> str | None:
-        """Error message from the last _stop_episode_impl, or None if clean."""
-        return self._stop_error
-
-    @property
     def camera_writer_error(self) -> str | None:
         """Latched camera sidecar error requiring episode discard."""
         return self._camera_writer.error if self._camera_writer is not None else None
@@ -221,19 +177,8 @@ class EpisodeRecorder:
         provenance: Mapping[str, object] | None = None,
     ) -> bool:
         normalized_provenance = normalize_provenance_metadata(provenance)
-        if not self.join_stop(timeout=_PREVIOUS_EPISODE_STOP_TIMEOUT_S):
-            if self._stop_error is not None:
-                logger.warning(
-                    "Previous stop crashed (%s) — state was reset, allowing new start",
-                    self._stop_error,
-                )
-                self._stop_thread = None
-            else:
-                logger.error(
-                    "Previous episode still flushing — refusing to start a new one"
-                )
-                return False
-
+        if self._finishing or not self.resources_released:
+            return False
         if self._recording:
             return False
 
@@ -254,9 +199,7 @@ class EpisodeRecorder:
         self._max_frames_reached = False
         self._start_time = time.perf_counter()
         self._recording = True
-        self._stop_error = None
         self._data_writer = None
-
 
         self._pending_meta = {
             "task_label": task_label,
@@ -293,7 +236,7 @@ class EpisodeRecorder:
     def _write_camera_meta_attrs(self, meta: h5py.Group) -> None:
         """Camera identity/geometry attrs from _pending_meta (None entries skipped).
 
-        Idempotent — _stop_episode_impl re-runs it so values supplied late
+        Idempotent — finalization re-runs it so values supplied late
         still reach /meta after the initial lazy write.
         """
         p = self._pending_meta
@@ -483,135 +426,45 @@ class EpisodeRecorder:
         self._data_writer.append(batch)
         self._pending_rows.clear()
 
-    def stop_episode(self, save: bool = True, reason: str = "") -> str | None:
-        """Signal end of episode; return path immediately, flush in background.
+    def finish_episode(self, save: bool = True, reason: str = "") -> str | None:
+        """Synchronously finish one episode and return its reserved final path.
 
-        The heavy work (camera-writer drain, buffer flush, metadata write,
-        file close) runs on a joinable thread so the control
-        loop stays responsive.  Callers must join_stop() before relying on
-        the file (or before process exit).
-
-        Args:
-            save: stored as /meta save.
-            reason: stored as /meta stop_reason; empty → "max_frames" when
-                    the episode hit the frame cap, else "manual".
+        Discard also returns the reserved path, although no raw episode is
+        published there. Failure raises after transaction cleanup. The caller
+        must serialize this operation with all other recorder access.
         """
+        if self._finishing:
+            raise RuntimeError("episode finalization is still active")
         if not self._recording:
             return None
-
+        path = self._episode_dir
         truncated = self._max_frames_reached
-
-        # Mark stopped before spawning the thread so add_frame() rejects new frames.
         self._recording = False
         self._max_frames_reached = False
-        path = self._episode_dir
-
-        # Snapshot stop metadata BEFORE spawning the worker (it overwrites
-        # self._frame_count during _stop_episode_impl_inner).
-        self._stop_save = save
-        self._stop_path = path
-        self._stop_frame_count = self._frame_count
-        t = threading.Thread(
-            target=self._stop_episode_impl,
-            args=(save, reason, truncated),
-            daemon=False,
-            name="episode-stop",
-        )
-        t.start()
-        self._stop_thread = t
+        self._finishing = True
+        try:
+            self._finish_episode_transaction(save, reason, truncated)
+        finally:
+            self._finishing = False
         return path
 
-    def join_stop(self, timeout: float = 30.0) -> bool:
-        """Wait for the background stop daemon (HDF5 fully written + closed).
-
-        Returns True when the flush completed cleanly.  Returns False on timeout
-        (thread still alive — handle KEPT so start_episode() keeps refusing) OR
-        when the stop thread crashed (handle cleared, _stop_error set — caller
-        must inspect stop_error to distinguish).
-
-        The entry MUST consult stop_error after a join_stop() that returned True:
-        a True from a crashed thread means "no pending flush" (the daemon is dead
-        and can't be re-joined), NOT "file written successfully".
-        """
-        if not np.isfinite(timeout) or timeout < 0:
-            raise ValueError("episode stop timeout must be finite and non-negative")
-        t = self._stop_thread
-        if t is None:
-            return self._stop_error is None
-        if t.is_alive():
-            t.join(timeout=timeout)
-            if t.is_alive():
-                logger.warning(
-                    "episode-stop still flushing after %.0fs — keeping handle", timeout
-                )
-                return False
-        ok = self._stop_error is None
-        if self._stop_error is not None:
-            logger.error("episode-stop failed: %s", self._stop_error)
-        self._stop_thread = None
-        self._stop_save = False
-        self._stop_path = None
-        self._stop_frame_count = 0
-        return ok
-
-    def poll_stop(self) -> StopResult:
-        """Non-blocking check: has the background stop daemon finished?
-
-        Safe to call once per configured control-grid tick. Returns immediately
-        — never blocks on I/O. After the first call that returns
-        ``done=True``, the internal state is reset and subsequent calls
-        return a clean sentinel (``done=True, path=None``) until the next
-        ``stop_episode()``.
-
-        The terminal payload is consumptive: only the first completed poll
-        carries its path, frame count, save flag, and error.
-        """
-        t = self._stop_thread
-        if t is None:
-            return StopResult(
-                done=True,
-                error=self._stop_error,
-                save=self._stop_save,
-                path=self._stop_path,
-                frame_count=self._stop_frame_count,
-            )
-        if t.is_alive():
-            return StopResult(done=False)
-        result = StopResult(
-            done=True,
-            error=self._stop_error,
-            save=self._stop_save,
-            path=self._stop_path,
-            frame_count=self._stop_frame_count,
-        )
-        self._stop_thread = None
-        self._stop_error = None
-        self._stop_save = False
-        self._stop_path = None
-        self._stop_frame_count = 0
-        return result
-
-    def _stop_episode_impl(
+    def _finish_episode_transaction(
         self,
         save: bool,
         reason: str,
         truncated: bool,
     ) -> None:
-        """Background: finalize sidecars, flush buffers, write metadata, and publish.
-
-        ENOSPC / OSError at any h5py call site is captured into ``_stop_error``
-        so ``join_stop()`` and RecorderIO report failure instead of publishing
-        or announcing a truncated episode.
-        """
+        """Finalize one transaction; retain any resource that failed cleanup."""
+        failure = None
         try:
-            self._stop_episode_impl_inner(save, reason, truncated)
+            self._finalize_episode_files(save, reason, truncated)
         except Exception as exc:
-            self._stop_error = f"{type(exc).__name__}: {exc}"
-            logger.error(
-                "stop_episode failed: %s — HDF5 may be truncated", self._stop_error
-            )
+            failure = exc
+            logger.error("episode finalization failed", exc_info=True)
             try:
-                self._write_aborted_manifest(reason=reason, error=self._stop_error)
+                self._write_aborted_manifest(
+                    reason=reason, error=f"{type(exc).__name__}: {exc}"
+                )
             except Exception:
                 logger.error(
                     "failed to publish aborted episode manifest", exc_info=True
@@ -620,68 +473,64 @@ class EpisodeRecorder:
                 if self._camera_writer is not None:
                     self._camera_writer.close(timeout=5.0)
             except Exception:
-                logger.warning(
-                    "camera writer cleanup failed after episode stop error",
-                    exc_info=True,
-                )
-            self._camera_writer = None
+                logger.warning("camera writer cleanup failed", exc_info=True)
+            if (
+                self._camera_writer is not None
+                and self._camera_writer.resources_released
+            ):
+                self._camera_writer = None
             try:
                 if self._data_writer is not None:
                     self._data_writer.close()
+                    self._data_writer = None
             except Exception:
-                logger.warning(
-                    "HDF5 cleanup failed after episode stop error", exc_info=True
-                )
-            self._data_writer = None
+                logger.warning("HDF5 cleanup failed", exc_info=True)
         finally:
-            # Always clean up the temp directory and reset state after stopping.
-            _tmp = self._temp_dir
-            if _tmp is not None:
-                self._discard_temp_files(_tmp)
-            self._reset_episode_state()
+            # Retain handles and staging while an owner may still access them.
+            if self._camera_writer is None and self._data_writer is None:
+                try:
+                    if self._temp_dir is not None:
+                        self._discard_temp_files(self._temp_dir)
+                except Exception as exc:
+                    failure = exc
+                    logger.error("temporary episode cleanup failed", exc_info=True)
+                else:
+                    self._reset_episode_state()
+        if failure is not None:
+            raise EpisodeFinalizationError(
+                f"{type(failure).__name__}: {failure}"
+            ) from failure
 
-    def _stop_episode_impl_inner(
+    def _finalize_episode_files(
         self,
         save: bool,
         reason: str,
         truncated: bool,
     ) -> None:
-        """Inner body of _stop_episode_impl — extracted so the try/except wrapper
-        can reset state on any exception without duplicating the reset list."""
+        """Close, validate, and publish files before releasing staging ownership."""
         duration = time.perf_counter() - (self._start_time or 0.0)
 
         writer = self._camera_writer
         if writer is None:
             raise RuntimeError("camera writer missing at episode stop")
         writer.close(timeout=_CAMERA_WRITER_CLOSE_TIMEOUT_S)
+        if not writer.resources_released:
+            raise RuntimeError("camera writer resources were not released")
         camera_frame_count = writer.frame_count
         self._camera_writer = None
-
-        self._flush_buffered()
-        self._ensure_hdf5()
-
         if camera_frame_count != self._frame_count:
             raise RuntimeError(
                 f"camera/source row count mismatch: camera={camera_frame_count}, source={self._frame_count}"
             )
+
+        self._flush_buffered()
+        self._ensure_hdf5()
 
         assert self._data_writer is not None
         data_writer = self._data_writer
         _had_rgb = camera_frame_count > 0
         if self._temp_dir is None:
             raise RuntimeError("episode temp directory missing during finalization")
-        sidecar_paths = {
-            "depth.h5": Path(self._temp_dir) / "depth.h5",
-            "rgb.mp4": Path(self._temp_dir) / "rgb.mp4",
-        }
-        missing_sidecars = [
-            name for name, path in sidecar_paths.items() if not path.is_file()
-        ]
-        if missing_sidecars:
-            raise RuntimeError(
-                "episode finalization missing sidecars: "
-                + str(missing_sidecars)
-            )
 
         def _write_final_meta(meta: h5py.Group) -> None:
             meta.attrs["schema_version"] = EPISODE_SCHEMA_VERSION
@@ -720,8 +569,7 @@ class EpisodeRecorder:
                 self._write_aborted_manifest(reason=reason or "discarded", error="")
 
     def _reset_episode_state(self) -> None:
-        """Reset all mutable episode state to defaults (called from both the
-        save path and the crash-handler in _stop_episode_impl)."""
+        """Reset episode state only after all resources and staging are released."""
         self._data_writer = None
         self._recording = False
         self._max_frames_reached = False
@@ -799,5 +647,6 @@ class EpisodeRecorder:
 
     @staticmethod
     def _discard_temp_files(tmp: str) -> None:
-        """Remove temp directory and all contents. Never raises."""
-        shutil.rmtree(tmp, ignore_errors=True)
+        """Remove staging after resource release; expose incomplete cleanup."""
+        if Path(tmp).exists():
+            shutil.rmtree(tmp)

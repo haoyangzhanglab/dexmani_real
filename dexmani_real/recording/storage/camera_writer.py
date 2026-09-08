@@ -77,8 +77,15 @@ class CameraStreamWriter:
         self._hdf5_durations_s: deque[float] = deque(maxlen=4096)
         self._close_duration_s = 0.0
         self._closed = False
+        # A terminated writer can still own a resource whose close failed.
+        self._unreleased_resources: list[Any] = []
         self._thread = threading.Thread(target=self._run, name="camera-stream-writer", daemon=False)
         self._thread.start()
+
+    @property
+    def resources_released(self) -> bool:
+        """True only after the worker exits and every resource closed safely."""
+        return not self._thread.is_alive() and not self._unreleased_resources
 
     @property
     def error(self) -> str | None:
@@ -235,4 +242,5 @@ class CameraStreamWriter:
                 try:
                     resource.close()
                 except Exception as exc:
+                    self._unreleased_resources.append(resource)
                     self._set_error(f"close failed: {type(exc).__name__}: {exc}")
