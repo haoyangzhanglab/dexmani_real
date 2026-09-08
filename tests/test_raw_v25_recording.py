@@ -18,6 +18,7 @@ from dexmani_real.recording.frame import (
 from dexmani_real.recording.sample import EpisodeAction, build_episode_state
 from dexmani_real.recording.recorder import EpisodeRecorder
 from dexmani_real.recording.storage.camera_writer import CameraStreamWriterConfig
+from dexmani_real.recording.storage.camera_writer import CameraStreamWriter
 from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.recording.storage.schema import (
     DATASET_SPECS,
@@ -137,6 +138,70 @@ def test_synchronous_finish_raises_after_failed_validation_cleanup(tmp_path):
     assert recorder.start_episode()
     assert recorder.add_episode_frame(_frame(2))
     assert Path(recorder.finish_episode()).is_dir()
+
+
+@pytest.mark.parametrize("failed_resource", ["encoder", "depth"])
+def test_camera_close_failure_retains_resource_after_thread_exit(tmp_path, failed_resource):
+    encoder = mock.Mock()
+    depth_file = mock.Mock()
+    resource = encoder if failed_resource == "encoder" else depth_file
+    resource.close.side_effect = OSError("resource close failed")
+    with mock.patch(
+        "dexmani_real.recording.storage.camera_writer.h5py.File",
+        return_value=depth_file,
+    ):
+        writer = CameraStreamWriter(
+            tmp_path,
+            CameraStreamWriterConfig(
+                rgb_shape=(16, 16, 3), depth_shape=(16, 16), fps=16, queue_size=8
+            ),
+            encoder_factory=mock.Mock(return_value=encoder),
+        )
+        with pytest.raises(RuntimeError, match="resource close failed"):
+            writer.close(timeout=2)
+    assert not writer._thread.is_alive()
+    assert not writer.resources_released
+    assert writer._unreleased_resources == [resource]
+    with pytest.raises(RuntimeError):
+        writer.close(timeout=0)
+    assert writer._unreleased_resources == [resource]
+    resource.close.assert_called_once()
+
+
+@pytest.mark.parametrize("failed_resource", ["camera", "hdf5", "staging"])
+def test_finish_retains_unsafe_resource_and_refuses_restart(tmp_path, failed_resource):
+    recorder = _recorder(tmp_path)
+    staging = tmp_path / ".tmp_episode_test"
+    staging.mkdir()
+    recorder._recording = True
+    recorder._episode_dir = str(tmp_path / "episode_test")
+    recorder._temp_dir = str(staging)
+    camera_writer = mock.Mock(resources_released=failed_resource != "camera")
+    data_writer = mock.Mock()
+    recorder._camera_writer = camera_writer
+    recorder._data_writer = data_writer
+    if failed_resource == "camera":
+        camera_writer.close.side_effect = OSError("camera remains live")
+    if failed_resource == "hdf5":
+        data_writer.close.side_effect = OSError("HDF5 remains open")
+    with (
+        mock.patch.object(
+            recorder, "_stop_episode_impl_inner", side_effect=OSError("transaction failed")
+        ),
+        mock.patch.object(
+            recorder, "_discard_temp_files",
+            side_effect=OSError("staging remains") if failed_resource == "staging" else None,
+        ),
+    ):
+        with pytest.raises(RuntimeError):
+            recorder.finish_episode()
+    assert not recorder.resources_released
+    assert recorder._temp_dir == str(staging) and staging.exists()
+    assert not recorder.start_episode()
+    if failed_resource == "camera":
+        assert recorder._camera_writer is camera_writer
+    if failed_resource == "hdf5":
+        assert recorder._data_writer is data_writer
 
 
 def test_camera_calibration_survives_minimal_shared_metadata(tmp_path):

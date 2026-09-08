@@ -127,6 +127,10 @@ class StopResult:
     """Frame count at the moment stop_episode was called."""
 
 
+class EpisodeFinalizationError(RuntimeError):
+    """An episode transaction failed; callers must also check resource release."""
+
+
 class EpisodeRecorder:
     """Coordinate one transactional episode around a dedicated data writer.
 
@@ -179,8 +183,18 @@ class EpisodeRecorder:
         self._stop_save: bool = False
         self._stop_path: str | None = None
         self._stop_frame_count: int = 0
+        self._finishing = False
 
         _LIVE_RECORDERS.add(self)  # atexit flush net
+
+    @property
+    def resources_released(self) -> bool:
+        """Whether storage owners and temporary transaction files were released."""
+        return (
+            self._camera_writer is None
+            and self._data_writer is None
+            and self._temp_dir is None
+        )
 
     @property
     def is_recording(self) -> bool:
@@ -221,6 +235,10 @@ class EpisodeRecorder:
         provenance: Mapping[str, object] | None = None,
     ) -> bool:
         normalized_provenance = normalize_provenance_metadata(provenance)
+        if self._finishing or not self.resources_released:
+            return False
+        if self._stop_thread is not None and self._stop_thread.is_alive():
+            return False
         if not self.join_stop(timeout=_PREVIOUS_EPISODE_STOP_TIMEOUT_S):
             if self._stop_error is not None:
                 logger.warning(
@@ -492,15 +510,21 @@ class EpisodeRecorder:
         """
         if self._stop_thread is not None and self._stop_thread.is_alive():
             raise RuntimeError("previous episode finalization is still active")
+        if self._finishing:
+            raise RuntimeError("episode finalization is still active")
         if not self._recording:
             return None
         path = self._episode_dir
         truncated = self._max_frames_reached
         self._recording = False
         self._max_frames_reached = False
-        self._stop_episode_impl(save, reason, truncated)
+        self._finishing = True
+        try:
+            self._stop_episode_impl(save, reason, truncated)
+        finally:
+            self._finishing = False
         if self._stop_error is not None:
-            raise RuntimeError(self._stop_error)
+            raise EpisodeFinalizationError(self._stop_error)
         return path
 
     def stop_episode(self, save: bool = True, reason: str = "") -> str | None:
@@ -644,21 +668,31 @@ class EpisodeRecorder:
                     "camera writer cleanup failed after episode stop error",
                     exc_info=True,
                 )
-            self._camera_writer = None
+            if (
+                self._camera_writer is not None
+                and self._camera_writer.resources_released
+            ):
+                self._camera_writer = None
             try:
                 if self._data_writer is not None:
                     self._data_writer.close()
+                    self._data_writer = None
             except Exception:
                 logger.warning(
                     "HDF5 cleanup failed after episode stop error", exc_info=True
                 )
-            self._data_writer = None
         finally:
-            # Always clean up the temp directory and reset state after stopping.
-            _tmp = self._temp_dir
-            if _tmp is not None:
-                self._discard_temp_files(_tmp)
-            self._reset_episode_state()
+            # Retain handles and staging while an owner may still access them.
+            if self._camera_writer is None and self._data_writer is None:
+                _tmp = self._temp_dir
+                try:
+                    if _tmp is not None:
+                        self._discard_temp_files(_tmp)
+                except Exception as exc:
+                    self._stop_error = f"temporary episode cleanup failed: {exc}"
+                    logger.error(self._stop_error, exc_info=True)
+                else:
+                    self._reset_episode_state()
 
     def _stop_episode_impl_inner(
         self,
@@ -674,16 +708,17 @@ class EpisodeRecorder:
         if writer is None:
             raise RuntimeError("camera writer missing at episode stop")
         writer.close(timeout=_CAMERA_WRITER_CLOSE_TIMEOUT_S)
+        if not writer.resources_released:
+            raise RuntimeError("camera writer resources were not released")
         camera_frame_count = writer.frame_count
         self._camera_writer = None
-
-        self._flush_buffered()
-        self._ensure_hdf5()
-
         if camera_frame_count != self._frame_count:
             raise RuntimeError(
                 f"camera/source row count mismatch: camera={camera_frame_count}, source={self._frame_count}"
             )
+
+        self._flush_buffered()
+        self._ensure_hdf5()
 
         assert self._data_writer is not None
         data_writer = self._data_writer
@@ -819,5 +854,6 @@ class EpisodeRecorder:
 
     @staticmethod
     def _discard_temp_files(tmp: str) -> None:
-        """Remove temp directory and all contents. Never raises."""
-        shutil.rmtree(tmp, ignore_errors=True)
+        """Remove staging after resource release; expose incomplete cleanup."""
+        if Path(tmp).exists():
+            shutil.rmtree(tmp)
