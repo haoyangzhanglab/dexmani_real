@@ -1,8 +1,8 @@
-"""Offline regressions for the frozen Policy Zarr v8 projection boundary.
+"""Offline regressions for the frozen Policy Zarr projection boundary.
 
-No hardware.  Exports a processed-v15 fixture and pins the Zarr v8 contract:
-schema_version stays 8, the data-key set and root semantic attrs are exactly
-the legacy v8 projection, and the processed-v15-only fields (``eef_pose``,
+No hardware.  Exports a processed-v16 fixture and pins the Zarr v9 contract:
+schema_version stays 9, the data-key set and root semantic attrs are exactly
+the legacy core projection, and the processed-v16-only fields (``eef_pose``,
 ``tactile_force``) plus their attrs never leak into the store.  Run with:
 
     python -m unittest discover -s tests -p 'test_zarr_v8_projection.py'
@@ -99,10 +99,10 @@ class TestPolicyZarrV8Projection(unittest.TestCase):
         self.assertEqual(self.report["profile"], "joint")
         self.assertEqual(sorted(self.report["dataset_keys"]), sorted(_EXPECTED_V8_DATA_KEYS))
 
-    def test_schema_version_remains_eight(self) -> None:
+    def test_schema_version_remains_nine(self) -> None:
         root = zarr.open_group(str(self.zarr_path), mode="r")
-        self.assertEqual(int(root.attrs["schema_version"]), 8)
-        self.assertEqual(POLICY_ZARR_SCHEMA_VERSION, 8)
+        self.assertEqual(int(root.attrs["schema_version"]), 9)
+        self.assertEqual(POLICY_ZARR_SCHEMA_VERSION, 9)
         self.assertEqual(str(root.attrs["schema_name"]), POLICY_ZARR_SCHEMA_NAME)
 
     def test_data_keys_are_exactly_the_legacy_projection(self) -> None:
@@ -235,12 +235,13 @@ class TestZarrV8AdmissionFailClosed(unittest.TestCase):
         self._expect_export_rejects("task_name", "unknown")
 
 
-class TestWholeEpisodeGapTolerance(unittest.TestCase):
-    """Pin _whole_episode_rejection gap tolerance on synthetic provenance.
+class TestWholeEpisodeStrictAdmission(unittest.TestCase):
+    """Pin _whole_episode_rejection strict source-complete admission.
 
-    Leading source-row trims and interior gaps of at most two missing rows
-    with lockstep samples and grid-consistent source time are accepted; any
-    larger row gap or unexplained time/sample jump rejects the whole episode.
+    Exactly one Zarr episode is admitted per processed HDF5, and only when the
+    HDF5 retains every source row as one contiguous sequence. Any dropped row,
+    leading/suffix trim, interior gap, or timestamp/sample discontinuity rejects
+    the whole HDF5; the exporter never splits or compacts across a gap.
     """
 
     _DT_S = 0.0625
@@ -304,24 +305,18 @@ class TestWholeEpisodeGapTolerance(unittest.TestCase):
             self._provenance(
                 kept_rows, source_frames, samples=samples, timestamps=timestamps
             ),
-            dt=self._DT_S,
-            contiguity_tolerance_s=self._TOL_S,
         )
 
-    def test_contiguous_episode_accepted(self) -> None:
+    def test_complete_episode_accepted(self) -> None:
         self.assertIsNone(self._rejection(range(10), 10))
 
-    def test_leading_trim_accepted(self) -> None:
-        # Structural frame-0 drop: kept rows stay contiguous from row 1.
-        self.assertIsNone(self._rejection(range(1, 10), 10))
+    def test_one_interior_removed_row_rejects(self) -> None:
+        self.assertIsNotNone(self._rejection([0, 1, 2, 3, 4, 6, 7, 8, 9], 10))
 
-    def test_one_missing_interior_row_tolerated(self) -> None:
-        self.assertIsNone(self._rejection([0, 1, 2, 3, 4, 6, 7, 8, 9], 10))
+    def test_two_interior_removed_rows_reject(self) -> None:
+        self.assertIsNotNone(self._rejection([0, 1, 2, 5, 6, 7], 8))
 
-    def test_two_missing_interior_rows_tolerated(self) -> None:
-        self.assertIsNone(self._rejection([0, 1, 2, 5, 6, 7], 8))
-
-    def test_three_missing_interior_rows_rejected(self) -> None:
+    def test_long_interior_gap_rejects(self) -> None:
         rejection = self._rejection([0, 1, 2, 6, 7], 8)
         self.assertIsNotNone(rejection)
         self.assertEqual(rejection.invalid_frame_count, 3)
@@ -330,7 +325,14 @@ class TestWholeEpisodeGapTolerance(unittest.TestCase):
         self.assertIn("camera_invalid", reasons)
         self.assertIn("source_discontinuity", reasons)
 
-    def test_timestamp_only_break_rejected(self) -> None:
+    def test_leading_trim_rejects(self) -> None:
+        # A dropped frame-0 row must no longer be silently tolerated.
+        self.assertIsNotNone(self._rejection(range(1, 10), 10))
+
+    def test_suffix_trim_rejects(self) -> None:
+        self.assertIsNotNone(self._rejection(range(9), 10))
+
+    def test_timestamp_only_break_rejects(self) -> None:
         # No dropped rows: kept rows 0..7, but source time jumps one extra dt.
         timestamps = np.arange(8, dtype=np.float64) * self._DT_S
         timestamps[4:] += self._DT_S
@@ -341,9 +343,7 @@ class TestWholeEpisodeGapTolerance(unittest.TestCase):
             [entry["reason"] for entry in rejection.reasons], ["source_discontinuity"]
         )
 
-    def test_sample_desync_rejected(self) -> None:
-        # One-row gap whose sample step disagrees with the row step rejects,
-        # even though rows and source time are otherwise consistent.
+    def test_sample_desync_rejects(self) -> None:
         rejection = self._rejection(
             [0, 1, 2, 3, 4, 6, 7], 8, samples=[0, 1, 2, 3, 4, 7, 8]
         )

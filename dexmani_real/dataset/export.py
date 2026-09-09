@@ -1,10 +1,16 @@
-"""Transactional export of processed HDF5 v15 episodes to Policy Zarr v8.
+"""Transactional export of processed HDF5 v16 episodes to Policy Zarr v9.
 
-The Zarr v8 data-key and root-attr contract keeps the legacy core projection:
-the exporter fully validates the v15 artifact first, then explicitly projects
-the v8 keys.  Processed-v15-only fields (``eef_pose``, ``tactile_force``) and
+The Zarr v9 data-key and root-attr contract keeps the legacy core projection:
+the exporter fully validates the v16 artifact first, then explicitly projects
+the v9 keys.  Processed-v16-only fields (``eef_pose``, ``tactile_force``) and
 their semantic attrs never enter the Zarr store.  ``contact_force`` numeric
-semantics follow processed v15 (SDK-native, bias-corrected units).
+semantics follow processed v16 (SDK-native, bias-corrected units).
+
+A Policy Zarr episode is exactly one source-complete physical demonstration:
+one processed HDF5 that retains every source row as a single contiguous
+sequence.  Any dropped source row, interior gap, or timestamp/sample
+discontinuity rejects the whole HDF5 — no splitting, no compaction, no
+interior-gap tolerance.
 """
 
 from __future__ import annotations
@@ -25,9 +31,13 @@ from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.dataset.contracts import OutputProfile, validate_processed_task_name
 from dexmani_real.dataset.processed import (
     _ACTION_EE_FRAME,
+    _CONTACT_FORCE_ALIGNMENT_JOINT,
+    _CONTACT_FORCE_ALIGNMENT_VISUAL,
     _CONTACT_FORCE_FRAME,
     _CONTACT_FORCE_REPRESENTATION,
     _CONTACT_FORCE_SI_VERIFIED,
+    _CONTACT_FORCE_SOURCE_JOINT,
+    _CONTACT_FORCE_SOURCE_VISUAL,
     _CONTACT_FORCE_UNIT,
     _FINGERTIP_POINTS_FRAME,
     _FINGERTIP_POINTS_UNIT,
@@ -51,8 +61,8 @@ from dexmani_real.sensor.pointcloud import (
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 
 POLICY_ZARR_SCHEMA_NAME = "dexmani-real-policy-zarr"
-POLICY_ZARR_SCHEMA_VERSION = 8
-# Legacy core projection of the processed core into Zarr v8.  Processed v14+
+POLICY_ZARR_SCHEMA_VERSION = 9
+# Legacy core projection of the processed core into Zarr v9.  Processed v14+
 # added eef_pose/tactile_force; they are deliberately absent here.
 _POLICY_ZARR_CORE_KEYS = (
     "joint_state",
@@ -153,51 +163,31 @@ def _indices_to_ranges(indices: np.ndarray) -> list[list[int]]:
     ]
 
 
-# Consecutive missing source rows an interior segment boundary may span while
-# the kept rows still export as one contiguous training episode. Longer gaps
-# (e.g. persistent IK-failure holds) reject the whole episode.
-_MAX_TOLERATED_INTERIOR_GAP_ROWS = 2
-
-
 def _whole_episode_rejection(
     path: Path,
     provenance: ProcessedProvenance,
-    *,
-    dt: float,
-    contiguity_tolerance_s: float,
 ) -> _ArtifactRejection | None:
-    """Reject a source-grid break beyond a tolerated transient instead of
-    splitting an episode.
+    """Reject any processed HDF5 that is not one source-complete episode.
 
-    Leading source-row trims (e.g. the structural first-frame tactile drop)
-    keep the kept rows contiguous and are accepted. An interior boundary is
-    tolerated while at most _MAX_TOLERATED_INTERIOR_GAP_ROWS consecutive
-    source rows are missing, samples advance in lockstep with rows, and the
-    elapsed source time matches the missing grid steps within
-    contiguity_tolerance_s. Any larger row gap or unexplained time/sample
-    jump rejects the whole episode.
+    The canonical exporter admits exactly one Zarr episode per processed HDF5,
+    and only when the HDF5 retains every source row as one contiguous sequence.
+    A leading trim, an interior gap, a suffix truncation, or a timestamp/sample
+    discontinuity each reject the whole HDF5 — never split, never compacted,
+    never bridged.  ``validate_processed_provenance`` already guarantees
+    ``source_rows == flatnonzero(keep_mask)`` and that ``segment_ends`` matches
+    the row/sample/timestamp discontinuities, so the complete proof is
+    ``keep_mask`` all true plus a single contiguous segment.
     """
 
-    boundaries = provenance.segment_ends[:-1]
-    if boundaries.size == 0:
-        return None
-    rows = provenance.source_rows
-    samples = provenance.source_samples
-    timestamps = provenance.source_timestamps
-    row_delta = rows[boundaries] - rows[boundaries - 1]
-    tolerated = (
-        (row_delta - 1 <= _MAX_TOLERATED_INTERIOR_GAP_ROWS)
-        & (samples[boundaries] - samples[boundaries - 1] == row_delta)
-        & (
-            np.abs(
-                timestamps[boundaries]
-                - timestamps[boundaries - 1]
-                - row_delta * dt
-            )
-            <= contiguity_tolerance_s
+    source_frames = int(provenance.keep_mask.shape[0])
+    complete = (
+        bool(np.all(provenance.keep_mask))
+        and np.array_equal(
+            provenance.source_rows, np.arange(source_frames, dtype=np.int64)
         )
+        and provenance.segment_ends.size == 1
     )
-    if bool(np.all(tolerated)):
+    if complete:
         return None
     hard_reason_names = provenance.hard_invalid_reason_names
     reason_rows: dict[str, np.ndarray] = {}
@@ -356,14 +346,14 @@ def _inspect_artifact(
             "camera_source_aligned_state" if visual_profile else "control_grid_state"
         )
         expected_contact_source = (
-            "camera_causal_tactile_sum"
+            _CONTACT_FORCE_SOURCE_VISUAL
             if visual_profile
-            else "control_grid_tactile_sum"
+            else _CONTACT_FORCE_SOURCE_JOINT
         )
         expected_contact_alignment = (
-            "newest_source_not_after_camera_within_max_observation_skew"
+            _CONTACT_FORCE_ALIGNMENT_VISUAL
             if visual_profile
-            else "newest_source_not_after_grid_within_max_observation_skew"
+            else _CONTACT_FORCE_ALIGNMENT_JOINT
         )
         if (
             semantics["obs_alignment"] != "obs[t]_before_action[t]"
@@ -513,16 +503,9 @@ def _inspect_artifact(
             source,
             label=path.name,
         )
-        # validate_processed_provenance has already required this attr to be
-        # finite and positive, so the direct read cannot raise on valid input.
-        rejection = _whole_episode_rejection(
-            path,
-            provenance,
-            dt=dt,
-            contiguity_tolerance_s=float(
-                source.attrs["source_contiguity_tolerance_s"]
-            ),
-        )
+        # validate_processed_provenance has already established the row mapping
+        # and segment boundaries that the whole-episode admission proof uses.
+        rejection = _whole_episode_rejection(path, provenance)
         if rejection is not None:
             return rejection
         # Explicit legacy projection: only the Zarr v8 keys are carried into
