@@ -1,7 +1,7 @@
 # Refactor execution evidence
 
-Execution follows the canonical plan on
-`origin/docs/refactor-plan-final-20260909:docs/refactor_execution_plan.md`, with
+Execution follows the repository-local canonical plan
+[`docs/refactor_execution_plan.md`](refactor_execution_plan.md), with
 the user's 2026-09-09 updated agent assignments and Recorder/admission rules
 taking precedence. Hardware execution is excluded from this software run.
 
