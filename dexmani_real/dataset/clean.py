@@ -17,6 +17,7 @@ from dexmani_real.dataset.contracts import (
 from dexmani_real.dataset.quality import assess_temporal_quality
 from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.recording.storage.schema import FillReason
+from dexmani_real.sensor.camera.worker import CameraHealth
 
 _FRAME_IK_FAIL = 2
 _MAX_TRANSIENT_IK_HOLD_FRAMES = 4
@@ -437,30 +438,44 @@ def analyze_episode(
         if visual_profile
         else arrays["observation_anchor_monotonic_ns"]
     )
-    # processed v15 requires both tactile payloads, so a paired source row must
-    # have both the aggregate (tactile_sum_fresh) and dense (tactile_fresh)
-    # payloads valid; a row valid for only one payload is not a paired source.
-    tactile_pair_fresh = _as_bool(reader, "tactile_sum_fresh") & _as_bool(
-        reader, "tactile_fresh"
-    )
-    tactile_source_rows = select_tactile_rows_to_references(
-        arrays["hand_source_monotonic_ns"],
-        _as_i64(reader, "tactile_source_monotonic_ns"),
-        tactile_pair_fresh,
-        _as_bool(reader, "tactile_calibrated"),
-        _as_i64(reader, "tactile_unit_code"),
-        tactile_reference_ns,
-        max_observation_skew_s=config.max_observation_skew_s,
-    )
-    tactile_valid = tactile_source_rows >= 0
-    tactile_forward_fill = tactile_valid & (
-        tactile_source_rows != np.arange(frame_count, dtype=np.int64)
-    )
-    aligned_contact = np.full_like(arrays["contact_force"], np.nan)
-    aligned_contact[tactile_valid] = arrays["contact_force"][
-        tactile_source_rows[tactile_valid]
-    ]
-    arrays["contact_force"] = aligned_contact
+    if visual_profile:
+        # New-schema visual profile consumes the recording-time camera-aligned
+        # tactile directly: contact_force and tactile_force were selected from
+        # the high-rate hand rings at camera source time and persisted with
+        # their source/calibration/unit provenance. No cross-row re-selection.
+        arrays["contact_force"] = _as_f64(reader, "policy_observation_contact_force")
+        arrays["tactile_force"] = _as_f64(reader, "policy_observation_tactile_force")
+        tactile_valid = _as_bool(
+            reader, "policy_observation_contact_force_valid"
+        ) & _as_bool(reader, "policy_observation_tactile_force_valid")
+        tactile_source_rows = np.arange(frame_count, dtype=np.int64)
+        tactile_forward_fill = np.zeros(frame_count, dtype=bool)
+    else:
+        # JOINT profile keeps the legacy grid-anchor persisted-row selector;
+        # processed still requires both tactile payloads, so a paired source
+        # row must have both aggregate (tactile_sum_fresh) and dense
+        # (tactile_fresh) validity.
+        tactile_pair_fresh = _as_bool(reader, "tactile_sum_fresh") & _as_bool(
+            reader, "tactile_fresh"
+        )
+        tactile_source_rows = select_tactile_rows_to_references(
+            arrays["hand_source_monotonic_ns"],
+            _as_i64(reader, "tactile_source_monotonic_ns"),
+            tactile_pair_fresh,
+            _as_bool(reader, "tactile_calibrated"),
+            _as_i64(reader, "tactile_unit_code"),
+            tactile_reference_ns,
+            max_observation_skew_s=config.max_observation_skew_s,
+        )
+        tactile_valid = tactile_source_rows >= 0
+        tactile_forward_fill = tactile_valid & (
+            tactile_source_rows != np.arange(frame_count, dtype=np.int64)
+        )
+        aligned_contact = np.full_like(arrays["contact_force"], np.nan)
+        aligned_contact[tactile_valid] = arrays["contact_force"][
+            tactile_source_rows[tactile_valid]
+        ]
+        arrays["contact_force"] = aligned_contact
     real_modalities_finite = np.all(
         np.isfinite(arrays["action_arm_ee"]), axis=1
     ) & np.all(np.isfinite(arrays["contact_force"]), axis=(1, 2))
@@ -520,7 +535,6 @@ def analyze_episode(
         "not_source_sample": ~(arrays["sample_valid"] & is_source),
         "action_not_queued": ~arrays["queued"],
         "timestamp_invalid": ~np.isfinite(arrays["timestamp"]),
-        "observation_invalid": ~arrays["observation_valid"],
         "frame_status_not_ok": non_ik_frame_failure,
         "long_ik_failure_hold": long_ik_failure_hold,
         "arm_source_invalid": ~arrays["arm_connected"],
@@ -530,7 +544,11 @@ def analyze_episode(
         "nonfinite_real_modality": ~real_modalities_finite,
         "action_mechanical_limit_violation": ~action_mechanical_limits_valid,
     }
+    # ``observation_valid`` is a teleop recording-health composite (VR/camera
+    # runtime conditions); it is audit evidence, not a hard-invalid gate. The
+    # direct modality conditions above still gate training admission.
     audit_masks: dict[str, np.ndarray] = {
+        "observation_invalid": ~arrays["observation_valid"],
         "joint_state_limit_excursion": ~state_limits_valid,
         "transient_ik_hold": transient_ik_hold,
     }
@@ -559,15 +577,29 @@ def analyze_episode(
             arrays["observation_anchor_monotonic_ns"]
             - arrays["camera_source_monotonic_ns"]
         ) / 1e9
-        reason_masks["camera_invalid"] = ~(
-            _as_bool(reader, "flag_camera_fresh")
-            & (arrays["camera_source_monotonic_ns"] > 0)
-            & (arrays["camera_age_s"] >= 0.0)
-            & (arrays["camera_age_s"] <= config.max_camera_age_s)
+        # Camera hard-invalid now comes only from direct usable conditions:
+        # missing/future source, age beyond budget, clock reset, delivery delay,
+        # or a malformed health code. ``flag_camera_fresh=False`` on a recent,
+        # causal, healthy payload is audit-only, not corruption.
+        camera_health = _as_i64(reader, "camera_health")
+        known_health = np.asarray([int(v) for v in CameraHealth], dtype=np.int64)
+        camera_hard = (
+            (arrays["camera_source_monotonic_ns"] <= 0)
+            | (arrays["camera_age_s"] < 0.0)
+            | (arrays["camera_age_s"] > config.max_camera_age_s)
+            | (camera_health == int(CameraHealth.CLOCK_RESET))
+            | (camera_health == int(CameraHealth.DELIVERY_DELAY))
+            | ~np.isin(camera_health, known_health)
         )
+        reason_masks["camera_invalid"] = camera_hard
         reason_masks["policy_observation_invalid"] = ~_as_bool(
             reader, "policy_observation_valid"
         )
+        camera_not_new = ~_as_bool(reader, "flag_camera_fresh") & ~camera_hard
+        audit_masks["camera_reused_on_grid"] = camera_not_new
+        audit_masks["camera_duplicate"] = (
+            camera_health == int(CameraHealth.DUPLICATE)
+        ) & ~camera_hard
     if visual_profile:
         if depth_valid_mask is None:
             raise ValueError("RGB/pointcloud profile requires a depth_valid_mask")

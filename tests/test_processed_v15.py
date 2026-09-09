@@ -37,6 +37,7 @@ from dexmani_real.dataset.processing import (
 from dexmani_real.config.defaults import hand as hand_defaults
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 from dexmani_real.recording.storage.schema import FillReason
+from dexmani_real.sensor.camera.worker import CameraHealth
 
 _FRAME_COUNT = 24
 _GRID_DT_S = 0.05
@@ -266,9 +267,9 @@ class TestProcessedV15Writer(unittest.TestCase):
                         reader.h5f.close()
 
     def test_schema_version_and_keys(self) -> None:
-        self.assertEqual(PROCESSED_SCHEMA_VERSION, 15)
+        self.assertEqual(PROCESSED_SCHEMA_VERSION, 16)
         with h5py.File(self.out_path, "r") as f:
-            self.assertEqual(int(f.attrs["schema_version"]), 15)
+            self.assertEqual(int(f.attrs["schema_version"]), 16)
             expected = set(OutputProfile.JOINT.dataset_keys) | {"provenance"}
             self.assertTrue(expected.issubset(set(f.keys())))
             self.assertIn("eef_pose", f)
@@ -539,6 +540,26 @@ class TestV26Cleaning(unittest.TestCase):
                         "observation_anchor_monotonic_ns"
                     ][:]
                     raw["flag_camera_fresh"] = np.ones(_FRAME_COUNT, dtype=bool)
+                    raw["camera_health"] = np.zeros(_FRAME_COUNT, dtype=np.int64)
+                    raw["policy_observation_contact_force"] = raw["hand_contact"][:]
+                    raw["policy_observation_contact_force_valid"] = np.ones(
+                        _FRAME_COUNT, dtype=bool
+                    )
+                    raw["policy_observation_tactile_force"] = raw[
+                        "hand_tactile_force"
+                    ][:]
+                    raw["policy_observation_tactile_force_valid"] = np.ones(
+                        _FRAME_COUNT, dtype=bool
+                    )
+                    raw["policy_observation_tactile_source_monotonic_ns"] = raw[
+                        "camera_source_monotonic_ns"
+                    ][:]
+                    raw["policy_observation_tactile_calibrated"] = np.ones(
+                        _FRAME_COUNT, dtype=bool
+                    )
+                    raw["policy_observation_tactile_unit_code"] = np.zeros(
+                        _FRAME_COUNT, dtype=np.int64
+                    )
                 mutate(raw)
             reader = _fake_reader(path)
             try:
@@ -594,11 +615,15 @@ class TestV26Cleaning(unittest.TestCase):
         self.assertFalse(np.any(decision.keep_mask[10:15]))
         self.assertFalse(np.any(decision.keep_mask[18:21]))
 
-    def test_observation_valid_is_required(self):
+    def test_observation_valid_alone_does_not_drop_row(self):
+        # ``observation_valid`` is now audit-only telemetry; it must not remove
+        # an otherwise valid training row by itself.
         def mutate(raw):
             raw["observation_valid"][0] = False
 
-        self.assertFalse(self._decision(mutate).keep_mask[0])
+        decision = self._decision(mutate)
+        self.assertTrue(decision.keep_mask[0])
+        self.assertEqual(decision.audit_reason_counts["observation_invalid"], 1)
 
     def test_joint_dataset_age_remains_tighter_than_live_stale_threshold(self):
         def mutate(raw):
@@ -610,14 +635,18 @@ class TestV26Cleaning(unittest.TestCase):
             decision.hard_reason_counts["control_grid_observation_invalid"], 1
         )
 
-    def test_visual_fresh_and_policy_valid_are_required(self):
+    def test_visual_camera_reuse_is_audit_and_policy_valid_is_required(self):
+        # A recent, healthy, causal camera payload with ``flag_camera_fresh``
+        # false is audit-only; a false policy observation is still hard-invalid.
         def mutate(raw):
             raw["flag_camera_fresh"][0] = False
             raw["policy_observation_valid"][1] = False
 
         decision = self._decision(mutate, visual=True)
-        self.assertFalse(np.any(decision.keep_mask[:2]))
+        self.assertTrue(decision.keep_mask[0])
+        self.assertFalse(decision.keep_mask[1])
         self.assertTrue(np.all(decision.keep_mask[2:]))
+        self.assertEqual(decision.audit_reason_counts["camera_reused_on_grid"], 1)
 
     def test_visual_future_camera_source_is_rejected_without_unsigned_wrap(self):
         def mutate(raw):
@@ -626,6 +655,59 @@ class TestV26Cleaning(unittest.TestCase):
         decision = self._decision(mutate, visual=True)
         self.assertFalse(decision.keep_mask[0])
         self.assertEqual(decision.hard_reason_counts["camera_invalid"], 1)
+
+    def test_visual_clock_reset_camera_is_hard_invalid(self):
+        def mutate(raw):
+            raw["camera_health"][0] = int(CameraHealth.CLOCK_RESET)
+
+        decision = self._decision(mutate, visual=True)
+        self.assertFalse(decision.keep_mask[0])
+        self.assertEqual(decision.hard_reason_counts["camera_invalid"], 1)
+
+    def test_visual_delivery_delay_camera_is_hard_invalid(self):
+        def mutate(raw):
+            raw["camera_health"][0] = int(CameraHealth.DELIVERY_DELAY)
+
+        decision = self._decision(mutate, visual=True)
+        self.assertFalse(decision.keep_mask[0])
+        self.assertEqual(decision.hard_reason_counts["camera_invalid"], 1)
+
+    def test_visual_duplicate_camera_is_audit_only(self):
+        def mutate(raw):
+            raw["camera_health"][0] = int(CameraHealth.DUPLICATE)
+
+        decision = self._decision(mutate, visual=True)
+        self.assertTrue(decision.keep_mask[0])
+        self.assertEqual(decision.audit_reason_counts["camera_duplicate"], 1)
+
+    def test_visual_frame_gap_with_healthy_current_frame_is_kept(self):
+        def mutate(raw):
+            raw["camera_health"][0] = int(CameraHealth.FRAME_GAP)
+
+        decision = self._decision(mutate, visual=True)
+        self.assertTrue(decision.keep_mask[0])
+        self.assertEqual(decision.hard_reason_counts.get("camera_invalid", 0), 0)
+
+    def test_visual_stale_camera_age_is_hard_invalid(self):
+        def mutate(raw):
+            raw["camera_source_monotonic_ns"][0] -= 10**9  # age ~1s > budget
+
+        decision = self._decision(mutate, visual=True)
+        self.assertFalse(decision.keep_mask[0])
+        self.assertEqual(decision.hard_reason_counts["camera_invalid"], 1)
+
+    def test_visual_uses_recording_time_tactile_not_legacy_selector(self):
+        # The grid tactile source is in the camera's future at frame 0 (the
+        # legacy persisted-row selector would fail), but the recording-time
+        # policy-observation tactile is already camera-aligned and valid.
+        def mutate(raw):
+            raw["tactile_source_monotonic_ns"][0] = (
+                raw["camera_source_monotonic_ns"][0] + _DT_NS
+            )
+
+        decision = self._decision(mutate, visual=True)
+        self.assertTrue(decision.keep_mask[0])
+        self.assertEqual(decision.hard_reason_counts.get("tactile_invalid", 0), 0)
 
 
 if __name__ == "__main__":

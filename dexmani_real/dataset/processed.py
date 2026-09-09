@@ -1,4 +1,4 @@
-"""Processed-v15 schema, provenance, specifications, and strict validation."""
+"""Processed-v16 schema, provenance, specifications, and strict validation."""
 
 from __future__ import annotations
 
@@ -35,7 +35,18 @@ from dexmani_real.planning.kinematics.fingertip import (
 from dexmani_real.planning.kinematics.pose import validate_canonical_rot6d
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 15
+PROCESSED_SCHEMA_VERSION = 16
+# Visual profile contact_force/tactile_force are now selected at recording time
+# from the high-rate hand rings at camera source time (matching deployment),
+# instead of being re-selected offline from the persisted 16 Hz rows.
+_CONTACT_FORCE_SOURCE_VISUAL = "recording_time_camera_aligned_tactile_sum"
+_CONTACT_FORCE_SOURCE_JOINT = "control_grid_tactile_sum"
+_CONTACT_FORCE_ALIGNMENT_VISUAL = (
+    "recording_time_newest_source_not_after_camera_within_max_observation_skew"
+)
+_CONTACT_FORCE_ALIGNMENT_JOINT = (
+    "newest_source_not_after_grid_within_max_observation_skew"
+)
 _PROVENANCE_DATASETS = (
     "source_row_index",
     "source_sample_index",
@@ -758,14 +769,14 @@ def validate_processed_hdf5(
             else "grid_anchor_monotonic_ns"
         )
         expected_contact_source = (
-            "camera_causal_tactile_sum"
+            _CONTACT_FORCE_SOURCE_VISUAL
             if visual_profile
-            else "control_grid_tactile_sum"
+            else _CONTACT_FORCE_SOURCE_JOINT
         )
         expected_contact_alignment = (
-            "newest_source_not_after_camera_within_max_observation_skew"
+            _CONTACT_FORCE_ALIGNMENT_VISUAL
             if visual_profile
-            else "newest_source_not_after_grid_within_max_observation_skew"
+            else _CONTACT_FORCE_ALIGNMENT_JOINT
         )
         contact_force_si_verified = _strict_bool_attr(
             source.attrs, "contact_force_si_verified"

@@ -31,9 +31,13 @@ from dexmani_real.dataset.pointcloud import (
 )
 from dexmani_real.dataset.processed import (
     _ACTION_EE_FRAME,
+    _CONTACT_FORCE_ALIGNMENT_JOINT,
+    _CONTACT_FORCE_ALIGNMENT_VISUAL,
     _CONTACT_FORCE_FRAME,
     _CONTACT_FORCE_REPRESENTATION,
     _CONTACT_FORCE_SI_VERIFIED,
+    _CONTACT_FORCE_SOURCE_JOINT,
+    _CONTACT_FORCE_SOURCE_VISUAL,
     _CONTACT_FORCE_UNIT,
     _FINGERTIP_POINTS_FRAME,
     _FINGERTIP_POINTS_UNIT,
@@ -320,14 +324,14 @@ def _write_attrs(
             "eef_pose_derivation": EEF_POSE_DERIVATION,
             "eef_pose_algorithm_id": EEF_POSE_ALGORITHM_ID,
             "contact_force_source": (
-                "camera_causal_tactile_sum"
+                _CONTACT_FORCE_SOURCE_VISUAL
                 if visual_profile
-                else "control_grid_tactile_sum"
+                else _CONTACT_FORCE_SOURCE_JOINT
             ),
             "contact_force_alignment": (
-                "newest_source_not_after_camera_within_max_observation_skew"
+                _CONTACT_FORCE_ALIGNMENT_VISUAL
                 if visual_profile
-                else "newest_source_not_after_grid_within_max_observation_skew"
+                else _CONTACT_FORCE_ALIGNMENT_JOINT
             ),
             "contact_force_representation": _CONTACT_FORCE_REPRESENTATION,
             "contact_force_unit": _CONTACT_FORCE_UNIT,
@@ -486,31 +490,63 @@ def _write_processed_episode(
             if visual_profile
             else "observation_anchor_monotonic_ns"
         )
-        tactile_pair_fresh = (
-            np.asarray(reader.h5f["tactile_sum_fresh"][:], dtype=bool)
-            & np.asarray(reader.h5f["tactile_fresh"][:], dtype=bool)
-        )
-        tactile_source_rows = select_tactile_rows_to_references(
-            np.asarray(reader.h5f["hand_source_monotonic_ns"][:], dtype=np.int64),
-            np.asarray(reader.h5f["tactile_source_monotonic_ns"][:], dtype=np.int64),
-            tactile_pair_fresh,
-            np.asarray(reader.h5f["tactile_calibrated"][:], dtype=bool),
-            np.asarray(reader.h5f["tactile_unit_code"][:], dtype=np.int64),
-            np.asarray(reader.h5f[reference_key][:], dtype=np.int64),
-            max_observation_skew_s=config.max_observation_skew_s,
-        )
-        selected_tactile_rows = tactile_source_rows[selected]
-        if np.any(selected_tactile_rows < 0):
-            raise ValueError("selected row lacks causal tactile provenance")
-        # contact_force and tactile_force are gathered from the identical
-        # selected raw rows; only those T rows are read, never the full
-        # (N,5,120,3) source dataset.
-        output["contact_force"][:] = _gather_dataset_rows(
-            reader.h5f["hand_contact"], selected_tactile_rows
-        ).astype(np.float32, copy=False)
-        output["tactile_force"][:] = _gather_dataset_rows(
-            reader.h5f["hand_tactile_force"], selected_tactile_rows
-        ).astype(np.float32, copy=False)
+        if visual_profile:
+            # Recording-time camera-aligned tactile is consumed directly: no
+            # cross-row re-selection, no forward-fill. contact_force/tactile_force
+            # are the exact persisted policy-observation payloads.
+            contact_valid = np.asarray(
+                reader.h5f["policy_observation_contact_force_valid"][:], dtype=bool
+            )
+            dense_valid = np.asarray(
+                reader.h5f["policy_observation_tactile_force_valid"][:], dtype=bool
+            )
+            if not np.all((contact_valid & dense_valid)[selected]):
+                raise ValueError(
+                    "selected visual row lacks recording-time tactile provenance"
+                )
+            selected_tactile_rows = selected.copy()
+            output["contact_force"][:] = np.asarray(
+                reader.h5f["policy_observation_contact_force"][selected],
+                dtype=np.float32,
+            )
+            output["tactile_force"][:] = np.asarray(
+                reader.h5f["policy_observation_tactile_force"][selected],
+                dtype=np.float32,
+            )
+            tactile_source_ns = np.asarray(
+                reader.h5f["policy_observation_tactile_source_monotonic_ns"][selected],
+                dtype=np.int64,
+            )
+        else:
+            # JOINT profile keeps the legacy grid-anchor persisted-row selector;
+            # contact_force and tactile_force are gathered from the identical
+            # selected raw rows, only those T rows are read, never the full
+            # (N,5,120,3) source dataset.
+            tactile_pair_fresh = (
+                np.asarray(reader.h5f["tactile_sum_fresh"][:], dtype=bool)
+                & np.asarray(reader.h5f["tactile_fresh"][:], dtype=bool)
+            )
+            tactile_source_rows = select_tactile_rows_to_references(
+                np.asarray(reader.h5f["hand_source_monotonic_ns"][:], dtype=np.int64),
+                np.asarray(reader.h5f["tactile_source_monotonic_ns"][:], dtype=np.int64),
+                tactile_pair_fresh,
+                np.asarray(reader.h5f["tactile_calibrated"][:], dtype=bool),
+                np.asarray(reader.h5f["tactile_unit_code"][:], dtype=np.int64),
+                np.asarray(reader.h5f[reference_key][:], dtype=np.int64),
+                max_observation_skew_s=config.max_observation_skew_s,
+            )
+            selected_tactile_rows = tactile_source_rows[selected]
+            if np.any(selected_tactile_rows < 0):
+                raise ValueError("selected row lacks causal tactile provenance")
+            output["contact_force"][:] = _gather_dataset_rows(
+                reader.h5f["hand_contact"], selected_tactile_rows
+            ).astype(np.float32, copy=False)
+            output["tactile_force"][:] = _gather_dataset_rows(
+                reader.h5f["hand_tactile_force"], selected_tactile_rows
+            ).astype(np.float32, copy=False)
+            tactile_source_ns = _gather_dataset_rows(
+                reader.h5f["tactile_source_monotonic_ns"], selected_tactile_rows
+            ).astype(np.int64, copy=False)
         # Exactly one canonical Arm FK per processed row; the same EEF history
         # feeds both eef_pose and fingertip_points.
         eef_pose_history = compute_eef_pose_history_xarm_base(joint_state[:, :7])
@@ -554,9 +590,9 @@ def _write_processed_episode(
             "observation_reference_monotonic_ns": np.asarray(
                 reader.h5f[reference_key][selected], dtype=np.int64
             ),
-            "tactile_source_monotonic_ns": _gather_dataset_rows(
-                reader.h5f["tactile_source_monotonic_ns"], selected_tactile_rows
-            ).astype(np.int64, copy=False),
+            "tactile_source_monotonic_ns": np.asarray(
+                tactile_source_ns, dtype=np.int64
+            ),
         }
         for name, values in provenance_values.items():
             provenance.create_dataset(
