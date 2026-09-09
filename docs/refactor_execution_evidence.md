@@ -5,6 +5,81 @@ Execution follows the repository-local canonical plan
 the user's 2026-09-09 updated agent assignments and Recorder/admission rules
 taking precedence. Hardware execution is excluded from this software run.
 
+## Final correctness follow-up — 2026-09-09
+
+- `BASE_SHA`: `537c8e9f723c4038fc7790bd7649b7f7dea8f397`; fetch/prune and
+  ff-only pull confirmed this was the latest `origin/main`. Initial worktree clean.
+- Branch: `fix/final-refactor-followup`. Implementation: `terra-max`;
+  independent source review: `luna-max`.
+- Baseline in the `real_robot` Python environment: **344 passed, 94 subtests
+  passed**; package/examples/tests compileall and diff check passed. The default
+  shell has no `python` command; checks use the absolute interpreter below.
+- Scope: restore per-episode analysis failure isolation; enforce one valid
+  processed task identity before publication across producer, structural gate,
+  full validator and Zarr inspection; repair the two stale current-format v13
+  references; publish the canonical plan locally.
+- The plan was restored from
+  `origin/docs/refactor-plan-final-20260909:docs/refactor_execution_plan.md`.
+  Its content is unchanged; Markdown hard breaks use backslashes instead of
+  trailing spaces so the complete branch diff passes `git diff --check`.
+  Superseded implementation guides were not restored. The planning branch's
+  Codex workflow and bugfix policy duplicate rules already covered by the plan;
+  neither was added.
+
+### Fixes and final software gate
+
+- Analysis isolation enumerates `FileNotFoundError`, `OSError`, `ValueError`,
+  `KeyError`, `RuntimeError`, and `IndexError` only around the source analysis
+  boundary. `recording/storage/reader.py` exposes missing files/datasets and
+  invalid source structure; `recording/storage/video.py` exposes decoder
+  runtime failures and frame-index errors; `dataset/clean.py` consumes HDF5
+  keys and NumPy shapes/indices. Each rejection retains exception type/message.
+  Program-control exceptions propagate. CLI auto-skip, direct-library blocking,
+  explicit include blocking and explicit exclude-without-open remain distinct.
+- Dataset task validation rejects non-strings, empty/untrimmed names, `unknown`
+  and ASCII C0/DEL. Accepted task identities are resolved before writing; invalid
+  raw identities, mixed accepted tasks and CLI output-task mismatch fail before
+  staging. Writers and the invalid-frame report use the resolved identity.
+  Library callers retain arbitrary output directory names. The export CLI's
+  existing `.`/`..` path guard remains in place, with a regression test.
+- Added regressions cover RuntimeError isolation and disposition, termination
+  exception propagation, invalid global/annotation/raw task identity, mixed
+  batches, expected-root mismatch, structural/full/export rejection, and both
+  CLI task-path boundaries. Existing valid artifact/golden checks remain green.
+- Final targeted checks: `test_dataset_admission.py` **31 passed**;
+  `test_processed_v14.py` **26 passed, 4 subtests passed**;
+  `test_zarr_v7_projection.py` **17 passed**. Combined: **74 passed, 4 subtests**.
+  Export CLI regression is included in dataset admission tests.
+- Final full suite: **368 passed, 98 subtests passed**. `compileall -q
+  dexmani_real examples tests`, worktree diff check and complete BASE-to-final
+  branch diff check: passed.
+- Independent `luna-max` review: **APPROVE**, no blocker or major findings.
+  Reviewer re-traced the source boundaries, reran the targeted/full gates and
+  independently reopened the real Zarr described below.
+- Protected areas unchanged: Safety, Freshness, Recorder lifecycle/protocol,
+  IPC, Zarr gap tolerance and `dexmani_policy`; all explicit KEEP paths retained.
+- Deferred findings: none. **MANUAL-HARDWARE-GATE PENDING**.
+
+### Real Zarr actual-write gate
+
+- Read-only source: `episodes_processed/pick_place_toy`, **61** processed-v14
+  HDF5 files, all carrying task identity `pick_place_toy`.
+- Existing `export_processed_hdf5_to_zarr` wrote an actual temporary store at
+  `/tmp/dexmani-final-followup-zarr-ymk4454t/pick_place_toy.zarr`; the formal
+  `datasets/pick_place_toy.zarr` was not modified.
+- **60 accepted / 1 rejected**, **14,063 frames**. The only rejection remains
+  `episode_20260827_224527`, under the unchanged whole-episode gap policy.
+- Reopened the published store and ran `_validate_zarr`: passed. Its 60
+  `episode_ends` are strictly increasing and exactly equal the cumulative
+  accepted source lengths; final end is 14,063. Task identity is `pick_place_toy`.
+- All ten expected arrays have length 14,063: `action`, `action_ee`,
+  `camera_extrinsic`, `camera_intrinsic`, `contact_force`, `depth`,
+  `fingertip_points`, `joint_state`, `point_cloud`, `rgb`. Shapes/dtypes and
+  frozen v7 keys/attrs passed the existing validator.
+- Local detailed evidence: `/tmp/dexmani-final-followup-zarr-ymk4454t/verification.json`.
+  Temporary artifacts are software verification output, not committed datasets.
+- No hardware was exercised: **MANUAL-HARDWARE-GATE PENDING**.
+
 ## Baseline
 
 - Fetch, checkout main, and ff-only pull completed on 2026-09-09.

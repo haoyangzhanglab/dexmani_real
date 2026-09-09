@@ -1,9 +1,9 @@
 # dexmani_real 最终简化与可靠性重构实施方案
 
-> Status: canonical execution plan  
-> Repository: `haoyangzhanglab/dexmani_real`  
-> Reviewed branch: `main`  
-> Reviewed SHA: `668e1e9065d51fd85b52c3e0a8ce6a59db469f0d`  
+> Status: canonical execution plan\
+> Repository: `haoyangzhanglab/dexmani_real`\
+> Reviewed branch: `main`\
+> Reviewed SHA: `668e1e9065d51fd85b52c3e0a8ce6a59db469f0d`\
 > Review date: 2026-09-09
 
 本文档是后续 Codex/人工实施 `dexmani_real` 重构时的唯一主计划。若 `main` 已前进，实施者必须先重新搜索相关 callsites、tests 和 contracts，再执行对应 phase，不能机械套用旧 patch。
@@ -164,7 +164,7 @@ Canonical truth 是 `ExperimentConfig`。允许 process-boundary immutable confi
 
 ### R5 — Complexity must protect something
 
-可以复杂：physical safety、causality、IPC correctness、recording integrity。  
+可以复杂：physical safety、causality、IPC correctness、recording integrity。\
 优先删除：passive diagnostics、duplicate validation、duplicate lifecycle、config projection、diagnostic-only taxonomy、duplicate CLI orchestration。
 
 ### R6 — Async requires a blocking reason
@@ -820,8 +820,8 @@ fix: <specific bug>
 
 ### Step 5 — Targeted tests first
 
-Recorder：`test_recorder_queue_io.py`、`test_recorder_queue_client.py`、`test_recorder_io_boundary.py`、`test_raw_v25_recording.py`。  
-Deployment：`test_policy_rollout.py`、`test_prediction_boundary.py`、`test_observation_builder.py`、`test_deployment_eef_tactile.py`。  
+Recorder：`test_recorder_queue_io.py`、`test_recorder_queue_client.py`、`test_recorder_io_boundary.py`、`test_raw_v25_recording.py`。\
+Deployment：`test_policy_rollout.py`、`test_prediction_boundary.py`、`test_observation_builder.py`、`test_deployment_eef_tactile.py`。\
 Dataset：`test_processed_v14.py`、`test_zarr_v7_projection.py` 以及 dataset processing/quality tests。
 
 ### Step 6 — Full gate
@@ -847,7 +847,7 @@ git diff --check
 - production LOC；
 - tests。
 
-好的 simplification：dependency/owners/duplicate passes/public surface下降，tests稳定。  
+好的 simplification：dependency/owners/duplicate passes/public surface下降，tests稳定。\
 危险 simplification：LOC下降但 safety、causality、data contract 变弱。
 
 ---
