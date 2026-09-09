@@ -21,7 +21,6 @@ from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
     read_causal_structured_frame,
     read_hand_tactile_causal,
-    read_structured_frame_aligned_to_source,
     read_valid_structured_frame_aligned_to_source,
     read_vr_frame_causal,
     vr_frame_is_fresh,
@@ -428,17 +427,24 @@ def _recording_policy_observation_signals(
     reference_ns = int(camera_frame.get("source_monotonic_ns", 0))
     anchor_ns = int(anchor_monotonic_ns)
     max_skew_ns = int(round(float(max_observation_skew_s) * 1e9))
-    arm_result = read_structured_frame_aligned_to_source(
+    # arm/hand qpos use the validity-gated read so a transient read-failure
+    # frame (state_valid=False / qpos_stale=True re-published with the previous
+    # source) falls back to the previous valid sample instead of failing the
+    # observation — matching deployment's skip-invalid-then-align.
+    arm_result = read_valid_structured_frame_aligned_to_source(
         shared.arm_state_ring,
         source_field="source_monotonic_ns",
         reference_source_monotonic_ns=reference_ns,
         anchor_monotonic_ns=anchor_ns,
+        required_true_fields=("state_valid",),
     )
-    hand_result = read_structured_frame_aligned_to_source(
+    hand_result = read_valid_structured_frame_aligned_to_source(
         shared.hand_state_ring,
         source_field="source_monotonic_ns",
         reference_source_monotonic_ns=reference_ns,
         anchor_monotonic_ns=anchor_ns,
+        required_true_fields=("state_valid",),
+        required_false_fields=("qpos_stale",),
     )
     if arm_result is None or hand_result is None:
         return signals

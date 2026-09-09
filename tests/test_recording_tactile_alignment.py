@@ -167,25 +167,19 @@ class TestRecordingTactileAlignment(unittest.TestCase):
             hand_state_ring=object(),
             hand_tactile_ring=object(),
         )
-        aligned_side_effect = [
+        # arm/hand qpos, then aggregate and dense tactile, all go through the
+        # validity-gated read after the qpos fallback fix.
+        valid_side_effect = [
             (arm, arm["source_monotonic_ns"][0], 1),
             (hand, hand["source_monotonic_ns"][0], 1),
-        ]
-        valid_side_effect = [
             None
             if aggregate is None
             else (aggregate, aggregate["source_monotonic_ns"][0], 1),
             None if dense is None else (dense, dense["source_monotonic_ns"][0], 1),
         ]
-        with (
-            mock.patch(
-                "dexmani_real.teleop.control_loop.grid.read_structured_frame_aligned_to_source",
-                side_effect=aligned_side_effect,
-            ),
-            mock.patch(
-                "dexmani_real.teleop.control_loop.grid.read_valid_structured_frame_aligned_to_source",
-                side_effect=valid_side_effect,
-            ),
+        with mock.patch(
+            "dexmani_real.teleop.control_loop.grid.read_valid_structured_frame_aligned_to_source",
+            side_effect=valid_side_effect,
         ):
             return _recording_policy_observation_signals(
                 shared,
