@@ -619,7 +619,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "episode",
         type=str,
-        help="Path to a raw schema-v25 episodes/<task_name>/episode_* directory.",
+        help="Path to a raw schema-v26 episodes/<task_name>/episode_* directory.",
     )
     parser.add_argument(
         "--max-frames",

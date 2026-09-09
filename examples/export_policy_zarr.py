@@ -85,8 +85,8 @@ def _format_export_failure(exc: Exception) -> str:
     if "invalid Real core modality semantics" in message:
         return (
             f"{message}\n"
-            "hint: Policy Zarr v7 requires teleop-published-target processed "
-            f"v{PROCESSED_SCHEMA_VERSION} data; reprocess raw v25 with --task-name <task>"
+            "hint: Policy Zarr v8 requires teleop-published-target processed "
+            f"v{PROCESSED_SCHEMA_VERSION} data; reprocess raw v26 with --task-name <task>"
         )
     return message
 

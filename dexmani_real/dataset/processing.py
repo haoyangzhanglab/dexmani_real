@@ -486,10 +486,14 @@ def _write_processed_episode(
             if visual_profile
             else "observation_anchor_monotonic_ns"
         )
+        tactile_pair_fresh = (
+            np.asarray(reader.h5f["tactile_sum_fresh"][:], dtype=bool)
+            & np.asarray(reader.h5f["tactile_fresh"][:], dtype=bool)
+        )
         tactile_source_rows = select_tactile_rows_to_references(
             np.asarray(reader.h5f["hand_source_monotonic_ns"][:], dtype=np.int64),
             np.asarray(reader.h5f["tactile_source_monotonic_ns"][:], dtype=np.int64),
-            np.asarray(reader.h5f["tactile_fresh"][:], dtype=bool),
+            tactile_pair_fresh,
             np.asarray(reader.h5f["tactile_calibrated"][:], dtype=bool),
             np.asarray(reader.h5f["tactile_unit_code"][:], dtype=np.int64),
             np.asarray(reader.h5f[reference_key][:], dtype=np.int64),

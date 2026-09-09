@@ -169,6 +169,16 @@ def _expected_tactile_force_semantics() -> dict[str, object]:
     }
 
 
+def _expected_contact_force_semantics() -> dict[str, object]:
+    return {
+        "representation": "per_finger_sensor_axes",
+        "frame": "xhand_sensor_native_axes_per_finger",
+        "units": "xhand_sdk_native_unknown_si",
+        "si_verified": False,
+        "finger_order": HAND_FINGER_ORDER_ID,
+    }
+
+
 def _expected_eef_pose_semantics() -> dict[str, str]:
     return {
         "representation": "position_m_rot6d",
@@ -206,6 +216,13 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
     ):
         raise ValueError("Policy control_dt_s does not match Real policy.control_hz")
     fields_by_name = {field.name: field for field in fields}
+    contact_force = fields_by_name.get("contact_force")
+    if contact_force is not None:
+        _validate_field_semantics(
+            contact_force,
+            field_name="contact_force",
+            expected=_expected_contact_force_semantics(),
+        )
     tactile_force = fields_by_name.get("tactile_force")
     if tactile_force is not None:
         _validate_field_semantics(

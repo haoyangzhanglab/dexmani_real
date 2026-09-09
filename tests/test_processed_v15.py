@@ -53,6 +53,7 @@ def _write_raw_fixture(
     *,
     frames: int = _FRAME_COUNT,
     stale_tactile_rows: tuple[int, ...] = (),
+    sum_fresh_rows: tuple[int, ...] = (),
     seed: int = 17,
 ) -> dict[str, np.ndarray]:
     """Create a minimal JOINT-profile raw episode and return its arrays."""
@@ -76,6 +77,9 @@ def _write_raw_fixture(
     fresh = np.ones(frames, dtype=bool)
     for row in stale_tactile_rows:
         fresh[row] = False
+    sum_fresh = fresh.copy()
+    for row in sum_fresh_rows:
+        sum_fresh[row] = False
 
     with h5py.File(path, "w") as f:
         meta = f.create_group("meta")
@@ -108,6 +112,7 @@ def _write_raw_fixture(
         put("arm_source_monotonic_ns", anchor_ns)
         put("hand_source_monotonic_ns", anchor_ns)
         put("tactile_source_monotonic_ns", anchor_ns)
+        put("tactile_sum_fresh", sum_fresh)
         put("tactile_fresh", fresh)
         put("tactile_calibrated", np.ones(frames, dtype=bool))
         put("tactile_unit_code", np.zeros(frames, dtype=np.int64))
@@ -117,6 +122,7 @@ def _write_raw_fixture(
         "hand_qpos": hand_qpos,
         "hand_contact": hand_contact,
         "hand_tactile_force": hand_tactile_force,
+        "tactile_sum_fresh": sum_fresh,
         "tactile_fresh": fresh,
     }
 
@@ -403,6 +409,60 @@ class TestProcessedV15ForwardFill(unittest.TestCase):
                 np.testing.assert_allclose(
                     tactile, raw_tactile[rows].astype(np.float32), rtol=0.0, atol=0.0
                 )
+            finally:
+                reader.h5f.close()
+
+
+class TestProcessedV15PairedValidity(unittest.TestCase):
+    def test_aggregate_invalid_row_is_not_a_paired_tactile_source(self) -> None:
+        # Row 0 has aggregate-invalid (tactile_sum_fresh=False) but dense-valid
+        # (tactile_fresh=True) payloads; it must never become the paired source
+        # for processed contact_force/tactile_force. Row 1 is fully valid.
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp) / "paired"
+            workdir.mkdir(parents=True)
+            raw_path = workdir / "episode_fixture.h5"
+            _write_raw_fixture(raw_path, sum_fresh_rows=(0,))
+            with h5py.File(raw_path, "r+") as raw:
+                # A distinctive finite aggregate value that must not reach output.
+                raw["hand_contact"][0] = 777.0
+            reader = _fake_reader(raw_path)
+            config = _joint_config()
+            annotation = EpisodeAnnotation(task_name="fixture_task")
+            try:
+                decision = analyze_episode(
+                    reader, config, annotation, source_already_validated=True
+                )
+                out_root = workdir / "processed"
+                out_root.mkdir(parents=True, exist_ok=True)
+                _write_processed_episode(
+                    reader, decision, out_root, config, task_name="fixture_task"
+                )
+                out_path = out_root / f"{raw_path.name}.h5"
+                self.assertFalse(decision.keep_mask[0])
+                self.assertEqual(decision.hard_reason_counts["tactile_invalid"], 1)
+                self.assertEqual(decision.selected_frames, _FRAME_COUNT - 1)
+                validate_processed_hdf5(out_path, config)
+                with h5py.File(out_path, "r") as f:
+                    rows = np.asarray(f["provenance/tactile_source_row_index"][:])
+                    source_rows = np.asarray(f["provenance/source_row_index"][:])
+                    contact = np.asarray(f["contact_force"][:])
+                    tactile = np.asarray(f["tactile_force"][:])
+                self.assertTrue(np.all(rows != 0))
+                np.testing.assert_array_equal(rows, source_rows)
+                np.testing.assert_allclose(
+                    contact,
+                    reader.h5f["hand_contact"][:][rows].astype(np.float32),
+                    rtol=0.0,
+                    atol=0.0,
+                )
+                np.testing.assert_allclose(
+                    tactile,
+                    reader.h5f["hand_tactile_force"][:][rows].astype(np.float32),
+                    rtol=0.0,
+                    atol=0.0,
+                )
+                self.assertFalse(np.any(contact == np.float32(777.0)))
             finally:
                 reader.h5f.close()
 

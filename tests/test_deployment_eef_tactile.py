@@ -21,6 +21,7 @@ import dexmani_real.deployment.inference.observation as observation_mod
 from dexmani_real.config.defaults import PolicyParams
 from dexmani_real.deployment.config import (
     _SUPPORTED_OBSERVATION_FIELDS,
+    _expected_contact_force_semantics,
     _expected_tactile_force_semantics,
     validate_policy_runtime_compatibility,
 )
@@ -576,6 +577,35 @@ class TestRuntimeCompatibility(unittest.TestCase):
             with self.subTest(missing=key):
                 with self.assertRaises(ValueError):
                     validate({name: item for name, item in expected.items() if name != key})
+
+    def test_contact_force_native_semantics_accepted(self) -> None:
+        spec = _fake_policy_spec(
+            _Field(
+                "contact_force",
+                (5, 3),
+                "float32",
+                semantics=_expected_contact_force_semantics(),
+            )
+        )
+        validate_policy_runtime_compatibility(spec, self._runtime())
+
+    def test_contact_force_legacy_scaled_units_rejected(self) -> None:
+        semantics = _expected_contact_force_semantics()
+        semantics["units"] = "sdk_scaled_unknown_si"
+        spec = _fake_policy_spec(
+            _Field("contact_force", (5, 3), "float32", semantics=semantics)
+        )
+        with self.assertRaises(ValueError):
+            validate_policy_runtime_compatibility(spec, self._runtime())
+
+    def test_contact_force_wrong_representation_rejected(self) -> None:
+        semantics = _expected_contact_force_semantics()
+        semantics["representation"] = "sdk_scaled_calc_force"
+        spec = _fake_policy_spec(
+            _Field("contact_force", (5, 3), "float32", semantics=semantics)
+        )
+        with self.assertRaises(ValueError):
+            validate_policy_runtime_compatibility(spec, self._runtime())
 
     def test_eef_pose_wrong_semantics_rejected(self) -> None:
         spec = _fake_policy_spec(

@@ -437,10 +437,16 @@ def analyze_episode(
         if visual_profile
         else arrays["observation_anchor_monotonic_ns"]
     )
+    # processed v15 requires both tactile payloads, so a paired source row must
+    # have both the aggregate (tactile_sum_fresh) and dense (tactile_fresh)
+    # payloads valid; a row valid for only one payload is not a paired source.
+    tactile_pair_fresh = _as_bool(reader, "tactile_sum_fresh") & _as_bool(
+        reader, "tactile_fresh"
+    )
     tactile_source_rows = select_tactile_rows_to_references(
         arrays["hand_source_monotonic_ns"],
         _as_i64(reader, "tactile_source_monotonic_ns"),
-        _as_bool(reader, "tactile_fresh"),
+        tactile_pair_fresh,
         _as_bool(reader, "tactile_calibrated"),
         _as_i64(reader, "tactile_unit_code"),
         tactile_reference_ns,

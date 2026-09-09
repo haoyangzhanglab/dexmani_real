@@ -20,6 +20,8 @@ from unittest import mock
 import h5py
 import numpy as np
 
+from dexmani_real.recording.storage.schema import validate_data_layout
+
 _CONVERTER_PATH = (
     Path(__file__).resolve().parents[1]
     / "tools"
@@ -59,7 +61,6 @@ _SCALAR_DATASETS = {
     "camera_depth_frame_number",
     "camera_color_frame_number",
     "policy_observation_valid",
-    "head_quat_wxyz",
 }
 _TAIL_SHAPES = {
     "hand_contact": (5, 3),
@@ -77,18 +78,51 @@ _TAIL_SHAPES = {
     "vr_wrist_pos": (3,),
     "vr_wrist_rot6d": (6,),
     "vr_landmarks": (21, 3),
+    "head_quat_wxyz": (4,),
 }
-_BOOL_DATASETS = {
-    "flag_sample_valid",
-    "arm_connected",
-    "hand_connected",
-    "hand_qpos_stale",
-    "flag_action_queued",
-    "observation_valid",
-    "tactile_fresh",
-    "tactile_calibrated",
-    "flag_camera_fresh",
-    "policy_observation_valid",
+# Frozen v25 dtype contract: explicit, not derived from the current v26 schema.
+V25_DTYPES = {
+    "timestamp": np.float64,
+    "source_sample_index": np.int64,
+    "fill_reason": np.uint8,
+    "flag_sample_valid": np.bool_,
+    "arm_qpos": np.float64,
+    "arm_qvel": np.float64,
+    "arm_tau": np.float64,
+    "hand_qpos": np.float64,
+    "hand_current": np.float64,
+    "hand_contact": np.float64,
+    "hand_tactile_force": np.float64,
+    "arm_connected": np.bool_,
+    "hand_connected": np.bool_,
+    "hand_qpos_stale": np.bool_,
+    "tracking_error": np.float64,
+    "arm_last_cmd_seq": np.int64,
+    "action_arm_joint_sent": np.float64,
+    "action_hand_joint": np.float64,
+    "action_arm_ee": np.float64,
+    "flag_action_queued": np.bool_,
+    "flag_frame_status": np.uint8,
+    "observation_anchor_monotonic_ns": np.uint64,
+    "observation_valid": np.bool_,
+    "arm_source_monotonic_ns": np.uint64,
+    "hand_source_monotonic_ns": np.uint64,
+    "tactile_source_monotonic_ns": np.uint64,
+    "vr_source_monotonic_ns": np.uint64,
+    "camera_source_monotonic_ns": np.uint64,
+    "tactile_fresh": np.bool_,
+    "tactile_calibrated": np.bool_,
+    "tactile_unit_code": np.uint8,
+    "flag_camera_fresh": np.bool_,
+    "camera_depth_frame_number": np.uint64,
+    "camera_color_frame_number": np.uint64,
+    "policy_observation_arm_qpos": np.float64,
+    "policy_observation_hand_qpos": np.float64,
+    "policy_observation_valid": np.bool_,
+    "vr_wrist_pos": np.float64,
+    "vr_wrist_rot6d": np.float64,
+    "vr_landmarks": np.float64,
+    "head_quat_wxyz": np.float64,
 }
 
 
@@ -134,23 +168,26 @@ class TestRawV25ToV26Conversion(unittest.TestCase):
                 if name == missing:
                     continue
                 shape = (_FRAME_COUNT,) + _tail_shape(name)
+                dtype = V25_DTYPES[name]
                 if name == "timestamp":
                     values = np.arange(_FRAME_COUNT, dtype=np.float64) + 1.25
-                elif name == "source_sample_index":
-                    values = np.arange(_FRAME_COUNT, dtype=np.int64)
-                elif name in _BOOL_DATASETS:
-                    values = np.array([True, False, True], dtype=bool)
                 elif name == "hand_contact":
-                    values = np.full(shape, 1.0, dtype=np.float64)
+                    values = np.full(shape, 1.0, dtype=dtype)
                 elif name == "hand_tactile_force":
-                    values = np.full(shape, 2.0, dtype=np.float64)
+                    values = np.full(shape, 2.0, dtype=dtype)
                 elif name == "tactile_unit_code":
-                    values = np.zeros(_FRAME_COUNT, dtype=np.uint8)
+                    values = np.zeros(_FRAME_COUNT, dtype=dtype)
                 elif name == "flag_frame_status":
-                    values = np.zeros(_FRAME_COUNT, dtype=np.uint8)
+                    values = np.zeros(_FRAME_COUNT, dtype=dtype)
+                elif np.issubdtype(dtype, np.bool_):
+                    values = np.array([True, False, True], dtype=dtype)
+                elif np.issubdtype(dtype, np.integer):
+                    values = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
                 else:
-                    values = np.arange(np.prod(shape), dtype=np.float64).reshape(shape)
-                    values += 0.5
+                    values = (
+                        np.arange(np.prod(shape), dtype=np.float64).reshape(shape)
+                        + 0.5
+                    ).astype(dtype)
                 data.create_dataset(name, data=values)
         with h5py.File(episode / "depth.h5", "w") as depth_file:
             depth_file.create_dataset(
@@ -194,6 +231,21 @@ class TestRawV25ToV26Conversion(unittest.TestCase):
                 if name in ("hand_contact", "hand_tactile_force"):
                     continue
                 np.testing.assert_array_equal(after[name][:], before[name][:])
+        # The migrated destination must satisfy the current v26 layout exactly.
+        with h5py.File(destination / "data.h5", "r") as migrated:
+            shapes = {
+                name: migrated[name].shape
+                for name in migrated
+                if isinstance(migrated[name], h5py.Dataset)
+            }
+            dtypes = {
+                name: migrated[name].dtype
+                for name in migrated
+                if isinstance(migrated[name], h5py.Dataset)
+            }
+        self.assertEqual(
+            validate_data_layout(shapes, dtypes, frame_count=_FRAME_COUNT), ()
+        )
         # Source unchanged and media hard-linked.
         self.assertEqual(
             (source / "rgb.mp4").read_bytes(), (destination / "rgb.mp4").read_bytes()
