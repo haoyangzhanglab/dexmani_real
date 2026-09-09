@@ -248,9 +248,15 @@ def test_visual_record_builder_owns_causal_feedback_freshness(source_ns, valid):
         hand_state_ring=object(),
         hand_tactile_ring=object(),
     )
-    with mock.patch(
-        "dexmani_real.teleop.control_loop.grid.read_structured_frame_aligned_to_source",
-        side_effect=[(arm, source_ns, 1), (hand, source_ns, 1), None],
+    with (
+        mock.patch(
+            "dexmani_real.teleop.control_loop.grid.read_structured_frame_aligned_to_source",
+            side_effect=[(arm, source_ns, 1), (hand, source_ns, 1)],
+        ),
+        mock.patch(
+            "dexmani_real.teleop.control_loop.grid.read_valid_structured_frame_aligned_to_source",
+            side_effect=[None, None],
+        ),
     ):
         signals = _recording_policy_observation_signals(
             shared,

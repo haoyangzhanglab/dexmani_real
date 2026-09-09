@@ -122,6 +122,60 @@ def read_structured_frame_aligned_to_source(
     return selected
 
 
+def read_valid_structured_frame_aligned_to_source(
+    ring: Any,
+    *,
+    source_field: str,
+    reference_source_monotonic_ns: int,
+    anchor_monotonic_ns: int,
+    required_true_fields: tuple[str, ...] = (),
+    required_false_fields: tuple[str, ...] = (),
+) -> tuple[np.ndarray, int, int] | None:
+    """Return the newest *valid* frame at or before a causal reference source time.
+
+    Same causality contract as ``read_structured_frame_aligned_to_source``, but
+    a frame missing (or failing) any ``required_true_fields`` /
+    ``required_false_fields`` gate is skipped, so an older valid frame can still
+    be selected.  This mirrors the deployment observation history reader, which
+    drops gate-failing frames before the causal alignment: e.g. a tactile read
+    whose aggregate sum or dense force is invalid on the newest sample falls
+    back to the previous valid sample instead of failing the whole observation.
+    """
+    reference_ns = int(reference_source_monotonic_ns)
+    anchor_ns = int(anchor_monotonic_ns)
+    if reference_ns <= 0 or anchor_ns <= 0 or reference_ns > anchor_ns:
+        return None
+    latest_sequence = int(ring.latest_sequence)
+    oldest_sequence = max(1, latest_sequence - int(ring.maxlen) + 1)
+    for target_sequence in range(latest_sequence, oldest_sequence - 1, -1):
+        result = ring.read_sequence(target_sequence)
+        if result is None:
+            continue
+        data, ring_publish_ns, sequence = result
+        names = data.dtype.names or ()
+        if any(
+            field not in names or not bool(data[field][0])
+            for field in required_true_fields
+        ):
+            continue
+        if any(
+            field not in names or bool(data[field][0])
+            for field in required_false_fields
+        ):
+            continue
+        source_ns = int(data[source_field][0])
+        publish_ns = (
+            int(data["publish_monotonic_ns"][0])
+            if "publish_monotonic_ns" in names
+            and int(data["publish_monotonic_ns"][0]) > 0
+            else int(ring_publish_ns)
+        )
+        if not (0 < source_ns <= reference_ns and source_ns <= publish_ns <= anchor_ns):
+            continue
+        return data, publish_ns, int(sequence)
+    return None
+
+
 def read_arm_state_causal(
     shared: RuntimeChannels, *, anchor_monotonic_ns: int | None = None
 ) -> np.ndarray | None:

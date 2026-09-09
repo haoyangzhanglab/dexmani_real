@@ -678,7 +678,7 @@ def _validate_processed_output_structure(
 def validate_processed_hdf5(
     path: str | Path, config: ProcessingConfig
 ) -> dict[str, Any]:
-    """Fail closed on a processed Real HDF5 v15 artifact."""
+    """Fail closed on a processed Real HDF5 v16 artifact."""
 
     artifact = Path(path)
     with h5py.File(artifact, "r") as source:

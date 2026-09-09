@@ -659,7 +659,7 @@ def analyze_episode(
     if source_gaps:
         warnings.append(
             f"{len(source_gaps)} source discontinuity boundary(s); policy "
-            "export applies its own gap tolerance"
+            "export admits only source-complete episodes and will reject this one"
         )
     segment_ends = build_source_segment_ends(selected, source_gaps)
     quality = _quality_summary(

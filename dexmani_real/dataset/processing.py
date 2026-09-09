@@ -1,4 +1,4 @@
-"""Transactional depth-to-color aligned raw-v26 to processed-v15 processing."""
+"""Transactional depth-to-color aligned raw-v27 to processed-v16 processing."""
 
 from __future__ import annotations
 

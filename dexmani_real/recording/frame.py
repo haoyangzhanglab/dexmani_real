@@ -1,4 +1,4 @@
-"""Owned raw-v26 source rows assembled at the recording boundary."""
+"""Owned raw-v27 source rows assembled at the recording boundary."""
 
 from __future__ import annotations
 

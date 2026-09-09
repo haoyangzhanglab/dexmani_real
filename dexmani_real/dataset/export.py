@@ -75,7 +75,7 @@ ExportProgressCallback = Callable[[str, int, int], None]
 
 
 def _policy_zarr_keys(profile: OutputProfile) -> tuple[str, ...]:
-    """Return the Zarr v8 data-key projection for one processed profile."""
+    """Return the Zarr v9 data-key projection for one processed profile."""
     keys = list(_POLICY_ZARR_CORE_KEYS)
     if profile.needs_rgb:
         keys.extend(("rgb", "depth", "camera_intrinsic", "camera_extrinsic"))
@@ -281,7 +281,7 @@ def _inspect_artifact(
         fingertip_semantics = validate_fingertip_points_semantics(
             source.attrs, label=path.name
         )
-        # Full v15 semantic admission runs before the v8 projection; these
+        # Full v16 semantic admission runs before the v9 projection; these
         # identities are validated but never copied into the Zarr root attrs.
         validate_eef_pose_semantics(source.attrs, label=path.name)
         validate_tactile_force_semantics(source.attrs, label=path.name)
@@ -459,8 +459,8 @@ def _inspect_artifact(
                     for key, value in point_cloud_semantics.items()
                 }
             )
-        # Full processed-v15 admission specs: the complete artifact, including
-        # the processed-only fields, is validated before the v8 projection.
+        # Full processed-v16 admission specs: the complete artifact, including
+        # the processed-only fields, is validated before the v9 projection.
         expected_specs: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
             "joint_state": ((length, 19), np.dtype(np.float32)),
             "eef_pose": ((length, 9), np.dtype(np.float32)),
@@ -508,7 +508,7 @@ def _inspect_artifact(
         rejection = _whole_episode_rejection(path, provenance)
         if rejection is not None:
             return rejection
-        # Explicit legacy projection: only the Zarr v8 keys are carried into
+        # Explicit legacy projection: only the Zarr v9 keys are carried into
         # the artifact metadata that drives the data copy and validation.
         for key in _policy_zarr_keys(profile):
             shapes[key] = tuple(int(value) for value in source[key].shape[1:])

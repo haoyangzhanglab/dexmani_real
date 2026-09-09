@@ -22,6 +22,7 @@ from dexmani_real.ipc.causal import (
     read_causal_structured_frame,
     read_hand_tactile_causal,
     read_structured_frame_aligned_to_source,
+    read_valid_structured_frame_aligned_to_source,
     read_vr_frame_causal,
     vr_frame_is_fresh,
 )
@@ -439,12 +440,6 @@ def _recording_policy_observation_signals(
         reference_source_monotonic_ns=reference_ns,
         anchor_monotonic_ns=anchor_ns,
     )
-    tactile_result = read_structured_frame_aligned_to_source(
-        shared.hand_tactile_ring,
-        source_field="source_monotonic_ns",
-        reference_source_monotonic_ns=reference_ns,
-        anchor_monotonic_ns=anchor_ns,
-    )
     if arm_result is None or hand_result is None:
         return signals
     arm_state, _arm_publish_ns, _arm_sequence = arm_result
@@ -478,61 +473,81 @@ def _recording_policy_observation_signals(
     ) > max_skew_ns:
         return signals
 
-    # Aggregate ``contact_force`` comes from the hand-state aggregate flag; the
-    # dense ``tactile_force`` and calibration/unit provenance come from the
-    # tactile ring.  Both rings are published together with one source time, so
+    # Tactile pair: aggregate ``contact_force`` comes from the hand-state
+    # aggregate flag, the dense ``tactile_force`` and calibration/unit
+    # provenance from the tactile ring.  Each side is read with the same
+    # validity-gated fallback the deployment observer uses (the newest *valid*
+    # frame at or before the camera source), so a transient invalid tactile
+    # sample falls back to the previous valid sample instead of failing the
+    # observation.  Both rings are published together with one source time, so
     # the deployment source-match contract reduces to an equality check.
-    tactile_state = tactile_result[0] if tactile_result is not None else None
-    tactile_names = (
-        tactile_state.dtype.names or () if tactile_state is not None else ()
+    aggregate_result = read_valid_structured_frame_aligned_to_source(
+        shared.hand_state_ring,
+        source_field="source_monotonic_ns",
+        reference_source_monotonic_ns=reference_ns,
+        anchor_monotonic_ns=anchor_ns,
+        required_true_fields=("state_valid", "tactile_sum_valid"),
+        required_false_fields=("qpos_stale",),
     )
-    tactile_source_ns = (
-        int(tactile_state["source_monotonic_ns"][0])
-        if tactile_state is not None
+    dense_result = read_valid_structured_frame_aligned_to_source(
+        shared.hand_tactile_ring,
+        source_field="source_monotonic_ns",
+        reference_source_monotonic_ns=reference_ns,
+        anchor_monotonic_ns=anchor_ns,
+        required_true_fields=("fresh", "calibrated"),
+    )
+    aggregate_state = aggregate_result[0] if aggregate_result is not None else None
+    dense_state = dense_result[0] if dense_result is not None else None
+    aggregate_names = (
+        aggregate_state.dtype.names or () if aggregate_state is not None else ()
+    )
+    dense_names = dense_state.dtype.names or () if dense_state is not None else ()
+    aggregate_source_ns = (
+        int(aggregate_state["source_monotonic_ns"][0])
+        if aggregate_state is not None
         else 0
     )
+    dense_source_ns = (
+        int(dense_state["source_monotonic_ns"][0]) if dense_state is not None else 0
+    )
     tactile_calibrated = (
-        bool(tactile_state["calibrated"][0])
-        if tactile_state is not None and "calibrated" in tactile_names
+        bool(dense_state["calibrated"][0])
+        if dense_state is not None and "calibrated" in dense_names
         else False
     )
     tactile_unit_code = (
-        int(tactile_state["unit_code"][0])
-        if tactile_state is not None and "unit_code" in tactile_names
+        int(dense_state["unit_code"][0])
+        if dense_state is not None and "unit_code" in dense_names
         else 0
     )
-    tactile_fresh = (
-        bool(tactile_state["fresh"][0])
-        if tactile_state is not None and "fresh" in tactile_names
-        else False
-    )
     tactile_force = (
-        np.asarray(tactile_state["tactile_force"][0], dtype=np.float64)
-        if tactile_state is not None and "tactile_force" in tactile_names
+        np.asarray(dense_state["tactile_force"][0], dtype=np.float64)
+        if dense_state is not None and "tactile_force" in dense_names
         else np.full((5, 120, 3), np.nan)
     )
     tactile_sum = (
-        np.asarray(hand_state["tactile_sum"][0], dtype=np.float64)
-        if "tactile_sum" in hand_names
+        np.asarray(aggregate_state["tactile_sum"][0], dtype=np.float64)
+        if aggregate_state is not None and "tactile_sum" in aggregate_names
         else np.full((5, 3), np.nan)
     )
     aggregate_valid = (
-        "tactile_sum" in hand_names
-        and "tactile_sum_valid" in hand_names
-        and bool(hand_state["tactile_sum_valid"][0])
+        aggregate_state is not None
         and tactile_sum.shape == (5, 3)
         and np.all(np.isfinite(tactile_sum))
     )
     provenance_valid = (
         tactile_calibrated and tactile_unit_code == TACTILE_UNIT_CODE_XHAND_SDK_NATIVE
     )
-    source_match = tactile_source_ns > 0 and tactile_source_ns == hand_source_ns
+    source_match = (
+        aggregate_source_ns > 0 and aggregate_source_ns == dense_source_ns
+    )
     skew_ok = (
-        tactile_source_ns > 0 and reference_ns - tactile_source_ns <= max_skew_ns
+        aggregate_source_ns > 0
+        and reference_ns - aggregate_source_ns <= max_skew_ns
     )
     contact_valid = aggregate_valid and provenance_valid and source_match and skew_ok
     dense_valid = (
-        tactile_fresh
+        dense_state is not None
         and provenance_valid
         and source_match
         and skew_ok
@@ -553,7 +568,9 @@ def _recording_policy_observation_signals(
                 tactile_force.copy() if dense_valid else np.full((5, 120, 3), np.nan)
             ),
             "policy_observation_tactile_force_valid": bool(dense_valid),
-            "policy_observation_tactile_source_monotonic_ns": tactile_source_ns,
+            "policy_observation_tactile_source_monotonic_ns": (
+                aggregate_source_ns if source_match else 0
+            ),
             "policy_observation_tactile_calibrated": tactile_calibrated,
             "policy_observation_tactile_unit_code": tactile_unit_code,
         }

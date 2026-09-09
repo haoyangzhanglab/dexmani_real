@@ -1,4 +1,4 @@
-"""Transactional raw-v26 episode serialization from owned ``EpisodeFrame`` rows.
+"""Transactional raw-v27 episode serialization from owned ``EpisodeFrame`` rows.
 
 Each controller-emitted source sample becomes exactly one persisted row.
 The recorder owns transaction lifecycle, camera sidecar coordination, metadata,
@@ -370,7 +370,7 @@ class EpisodeRecorder:
         ):
             raise ValueError("recording timestamps must be finite and increasing")
         if set(frame.data) != SOURCE_FRAME_DATASET_NAMES:
-            raise ValueError("episode source frame fields do not match raw v26")
+            raise ValueError("episode source frame fields do not match raw v27")
         row = dict(frame.data)
         row.update(
             timestamp=ts, source_sample_index=self._frame_count,

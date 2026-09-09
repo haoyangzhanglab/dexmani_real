@@ -236,7 +236,7 @@ def make_record_sample_dtype(
     rgb_shape: tuple[int, int, int],
     depth_shape: tuple[int, int],
 ) -> np.dtype:
-    """Return the v26 source row and fixed camera payload for the sample ring."""
+    """Return the v27 source row and fixed camera payload for the sample ring."""
     return np.dtype(
         [
             ("timestamp", "<f8"),
