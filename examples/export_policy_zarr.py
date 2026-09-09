@@ -30,6 +30,7 @@ from dexmani_real.dataset.export import (
     export_processed_hdf5_to_zarr,
     preflight_processed_hdf5_to_zarr,
 )
+from dexmani_real.dataset.processed import PROCESSED_SCHEMA_VERSION
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -85,7 +86,7 @@ def _format_export_failure(exc: Exception) -> str:
         return (
             f"{message}\n"
             "hint: Policy Zarr v7 requires teleop-published-target processed "
-            "v13 data; reprocess raw v25 with --task-name <task>"
+            f"v{PROCESSED_SCHEMA_VERSION} data; reprocess raw v25 with --task-name <task>"
         )
     return message
 
