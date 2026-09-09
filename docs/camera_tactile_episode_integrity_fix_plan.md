@@ -1348,7 +1348,7 @@ real success rate
 
 ```text
 Baseline commit:        b5128927d920cca09dde40d910bcde037ad70ba7 (main @ 2026-09-09)
-Implementation commits: 见 git log（本任务 5 个 phase commit）
+Implementation commits: 见 git log（本任务 5 个 phase commit + 1 个对抗评审修复 commit）
 Schema versions:        raw v26 -> v27；processed v15 -> v16；Policy Zarr v8 -> v9
 Focused tests:          tests/test_recording_tactile_alignment.py (T1-T5)
                         tests/test_processed_v15.py (C1-C5, P1-P3 camera/tactile)
