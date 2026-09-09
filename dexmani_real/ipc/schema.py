@@ -30,6 +30,9 @@ MAX_POLICY_ACTION_DIM = 21
 # reaching the inference boundary.
 POINT_CLOUD_FEATURE_DIM = 6
 SUPPORTED_POINT_CLOUD_COUNTS = frozenset({1024, 2048, 4096, 8192})
+# Canonical tactile unit identity persisted in ``tactile_unit_code``:
+# XHand SDK-native numeric scale whose SI conversion is not yet verified.
+TACTILE_UNIT_CODE_XHAND_SDK_NATIVE = 0
 
 
 def make_pointcloud_frame_dtype(num_points: int) -> np.dtype:
@@ -233,7 +236,7 @@ def make_record_sample_dtype(
     rgb_shape: tuple[int, int, int],
     depth_shape: tuple[int, int],
 ) -> np.dtype:
-    """Return the v25 source row and fixed camera payload for the sample ring."""
+    """Return the v26 source row and fixed camera payload for the sample ring."""
     return np.dtype(
         [
             ("timestamp", "<f8"),
@@ -261,6 +264,7 @@ def make_record_sample_dtype(
             ("tactile_source_monotonic_ns", "<u8"),
             ("vr_source_monotonic_ns", "<u8"),
             ("camera_source_monotonic_ns", "<u8"),
+            ("tactile_sum_fresh", "<u1"),
             ("tactile_fresh", "<u1"),
             ("tactile_calibrated", "<u1"),
             ("tactile_unit_code", "<u1"),

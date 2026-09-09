@@ -1,7 +1,7 @@
 # Real 数据集 schema 参考
 
-本文是 DexMani Real 持久化数据的字段参考，覆盖当前 raw HDF5 v25、processed HDF5 v14 与
-Policy Zarr v7。运行行为和精确校验仍以
+本文是 DexMani Real 持久化数据的字段参考，覆盖当前 raw HDF5 v26、processed HDF5 v15 与
+Policy Zarr v8。运行行为和精确校验仍以
 [`recording/storage/schema.py`](../dexmani_real/recording/storage/schema.py)、
 [`dataset/processing.py`](../dexmani_real/dataset/processing.py) 与
 [`dataset/export.py`](../dexmani_real/dataset/export.py) 为准。
@@ -12,23 +12,23 @@ Policy Zarr v7。运行行为和精确校验仍以
 ## 目录
 
 - [约定与数据流](#约定与数据流)
-- [raw episode HDF5 v25](#1-raw-episode-hdf5-v25)
-- [processed HDF5 v14](#2-processed-hdf5-v14)
-- [Policy Zarr v7](#3-policy-zarr-v7)
+- [raw episode HDF5 v26](#1-raw-episode-hdf5-v26)
+- [processed HDF5 v15](#2-processed-hdf5-v15)
+- [Policy Zarr v8](#3-policy-zarr-v8)
 - [字段映射摘要](#字段映射摘要)
 - [读取与训练注意事项](#读取与训练注意事项)
 
 ## 约定与数据流
 
 ```text
-episodes/<task>/episode_*          raw v25 directory
+episodes/<task>/episode_*          raw v26 directory
     data.h5 + depth.h5 + rgb.mp4
                 │ process_episodes.py
                 ▼
-episodes_processed/<task>/*.h5     processed v14, one file per raw episode
+episodes_processed/<task>/*.h5     processed v15, one file per raw episode
                 │ export_policy_zarr.py
                 ▼
-datasets/<task>.zarr               Policy Zarr v7, one profile per store
+datasets/<task>.zarr               Policy Zarr v8, one profile per store
 ```
 
 - `N` 是单个 raw 或 processed episode 的帧数；`T` 是 Zarr 中全部 episode 的总帧数；
@@ -44,14 +44,16 @@ datasets/<task>.zarr               Policy Zarr v7, one profile per store
 - 逐行动作对齐语义为 `obs[t]_before_action[t]`。新采集 raw 不补时间网格；
   迁移行结合 `fill_reason`、`flag_sample_valid` 和 source 索引解释。
 
-## 1. raw episode HDF5 v25
+## 1. raw episode HDF5 v26
 
 发布目录仍是 `data.h5 + depth.h5 + rgb.mp4`。所有 dataset 的第一维等于
-`meta.num_frames`，depth 是与 RGB 对齐的 uint16 图像。Reader 只接受 schema 25，
+`meta.num_frames`，depth 是与 RGB 对齐的 uint16 图像。Reader 只接受 schema 26，
 检查必需文件、dataset shape/dtype 与帧数；构造和 finalize 不完整解码 RGB，也不重放 runtime proof。
-历史 v24 必须先运行[冻结转换器](raw_v24_migration.md)，没有 compatibility Reader。
+历史 v24 必须先运行[冻结转换器](raw_v24_migration.md) 得到 v25，再运行
+`tools/convert_raw_v25_to_v26_tactile.py` 迁移到 v26（直接录制的 v25 按 `* 10` 还原
+SDK 原生刻度，v24 派生的 v25 需要显式 `--converted-v24-scale`），没有 compatibility Reader。
 
-### 必需的 41 个 dataset
+### 必需的 42 个 dataset
 
 | 字段 | 每行 shape | dtype |
 |---|---|---|
@@ -74,7 +76,7 @@ datasets/<task>.zarr               Policy Zarr v7, one profile per store
 | observation_anchor_monotonic_ns | scalar | uint64 |
 | observation_valid | scalar | bool |
 | arm_source_monotonic_ns, hand_source_monotonic_ns, tactile_source_monotonic_ns, vr_source_monotonic_ns, camera_source_monotonic_ns | scalar | uint64 |
-| tactile_fresh, tactile_calibrated | scalar | bool |
+| tactile_sum_fresh, tactile_fresh, tactile_calibrated | scalar | bool |
 | tactile_unit_code | scalar | uint8 |
 | flag_camera_fresh | scalar | bool |
 | camera_depth_frame_number, camera_color_frame_number | scalar | uint64 |
@@ -97,8 +99,11 @@ datasets/<task>.zarr               Policy Zarr v7, one profile per store
 `flag_frame_status` 为 0 OK、1 HELD、2 IK_FAIL、3 SAFETY_REJECT、4 RETARGET_FAIL。
 1–4 行的连续 IK_FAIL 保留为短暂暂停，长连续失败拒绝。独立 held/IK/retarget proof flags 不再持久化。
 
-`hand_contact` 是 tactile sum，`hand_tactile_force` 是完整 SDK force；
-单位为 sdk_scaled_unknown_si，不能当作已验证 SI 力。
+`hand_contact` 是 XHand SDK `calc_force`（每指 fx/fy/fz，软件 bias 校正），
+`hand_tactile_force` 是 SDK `raw_force`（每指 120 点 fx/fy/fz，软件 bias 校正）；
+单位为 xhand_sdk_native_unknown_si（SDK 原生数值刻度），不能当作已验证 SI 力。
+`tactile_sum_fresh` 标记 `hand_contact`（aggregate）有效，`tactile_fresh` 标记
+`hand_tactile_force`（dense）有效，二者共享 `tactile_calibrated`/`tactile_unit_code`。
 cleaner 选择 persisted row <= 当前行、source <= reference、hand/tactile source 相等、
 fresh/calibrated/unit_code=0 且 skew 有界的最新 source；重复 source 取最近行。
 选中 payload 非有限就拒绝，不用别的 payload 修复。视觉 reference 是 camera source，
@@ -112,24 +117,24 @@ sequence/publish/receive/history/skew proof、SDK ACK、device clock、profiling
 
 ### Metadata 与 RGB-D 几何
 
-保留 schema_version=25、num_frames、control_hz、task_label、operator；
+保留 schema_version=26、num_frames、control_hz、task_label、operator；
 `grid_dt_s=1/control_hz` 只表示名义采样周期。保留必要 camera_name/serial/type/payload_mode、
 depth_scale、depth/color 原生 intrinsics、width/height、distortion_model/coeffs、
 `camera_T_color_from_depth`，以及适用的 `camera_T_xarm_base_from_color`、
 `camera_T_xarm_base_from_depth`、`camera_T_eef_from_depth`。可保留廉价 code provenance。
 RGB/pointcloud processing 在几何边界验证 calibration、serial 与 rigid transforms。
 
-## 2. processed HDF5 v14
+## 2. processed HDF5 v15
 
-processed 文件是 `episodes_processed/<task>/*.h5`。它从 raw v25 选择、清洗和压紧行；其 `N`
+processed 文件是 `episodes_processed/<task>/*.h5`。它从 raw v26 选择、清洗和压紧行；其 `N`
 因此不一定等于 raw 的 `num_frames`。它用于离线训练、导出与可视化；物理回放可将其作为
 保留 raw 行的 provenance 清单，但绝不发送其 `float32` 动作。回放在 `source_path` 找到 raw episode
 后，从中读取 recorded published arm target 与 recorded logical hand target。根 attrs
 必须满足：
-`schema_name=dexmani-real-processed-hdf5`、`schema_version=14`、`domain=real`。
+`schema_name=dexmani-real-processed-hdf5`、`schema_version=15`、`domain=real`。
 
-v14 在 v13 之上增加 `eef_pose` 与 `tactile_force` 两个 core observation，以及对应的
-tactile/reference provenance；v13 文件不做伪迁移，必须由已迁移的 raw v25 重新处理生成 v14。
+v15 在 v14 之上增加 `eef_pose` 与 `tactile_force` 两个 core observation，以及对应的
+tactile/reference provenance；v13 文件不做伪迁移，必须由已迁移的 raw v26 重新处理生成 v15。
 
 处理入口在 discovery 边界将每个 raw episode 路径解析为 canonical absolute path；新生成的
 processed artifact 将它持久化在 `source_decision_json.source_path`。processed replay 只消费该路径，
@@ -143,14 +148,14 @@ gate、完整 processed validator 和 Zarr artifact inspection 均验证该合�
 CLI 还要求 output root basename 与 task identity 相同，以满足 Zarr CLI 的 expected task；
 direct library 仍可使用任意临时输出目录。
 
-删除无效 raw 行可能使压紧数组包含多个 source 连续段。v14 不把缺口两侧伪装成相邻时间步：
+删除无效 raw 行可能使压紧数组包含多个 source 连续段。v15 不把缺口两侧伪装成相邻时间步：
 `source_segment_ends` 明确记录每段边界，质量窗口只在段内计数。Policy Zarr 不再把这些段
 展开为多个训练 episode；一份 processed 文件只允许对应一个完整训练 episode。首部删除不
 破坏压紧行的连续性、始终可导出；内部边界仅在缺失 ≤2 个连续 source 行、样本索引随行
 同步推进、且 source 时间差与缺失网格步在 `source_contiguity_tolerance_s` 内一致时容忍，
 否则整份文件拒绝。
 
-处理入口只接受通过 raw reader 结构校验的 v25 episode，sent action 必需。RGB 与
+处理入口只接受通过 raw reader 结构校验的 v26 episode，sent action 必需。RGB 与
 点云 profile 还要求 raw RGB-D 几何、depth scale 与 `T_xarm_base_from_color` 完整有效。视觉
 profile 使用 `/policy_observation_*_qpos` 生成 `joint_state`；`joint` profile 使用 control-grid
 state。processed action 是已发布的 teleop joint target；离线处理不模拟或审计 learned-policy
@@ -168,7 +173,7 @@ detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal
 
 所有 profile 都包含 core 七项；RGB 与点云字段由 profile 决定。校验器只要求 profile 声明的
 字段与 `/provenance` 必须存在，文件可以保留额外的研究字段、group 或 attrs；Policy Zarr
-导出只复制显式 v7 legacy 投影字段（见第 3 节），processed-only 的 `eef_pose` 与
+导出只复制显式 v8 legacy 投影字段（见第 3 节），processed-only 的 `eef_pose` 与
 `tactile_force` 不进入 Zarr。
 
 | profile | 固定数据集 | 附加数据集 |
@@ -181,11 +186,11 @@ detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal
 | 路径 | shape | dtype | 语义 |
 |---|---:|---|---|
 | `/joint_state` | `(N,19)` | float32 | 视觉 profile 为 `policy_observation_arm_qpos(7)+policy_observation_hand_qpos(12)`；`joint` profile 为 control-grid state，单位 rad。 |
-| `/eef_pose` | `(N,9)` | float32 | `position_m(3)+rot6d(6)`，`xarm_base`；由本 artifact 的 `/joint_state[:,:7]`（已因果对齐的 measured arm qpos）经 canonical Arm FK 推导，rot6d 必须 canonical；不使用 xArm firmware Cartesian pose。每 timestep 只执行一次 Arm FK，`/fingertip_points` 复用同一 EEF 结果。processed-only，不进入 Zarr v7。 |
+| `/eef_pose` | `(N,9)` | float32 | `position_m(3)+rot6d(6)`，`xarm_base`；由本 artifact 的 `/joint_state[:,:7]`（已因果对齐的 measured arm qpos）经 canonical Arm FK 推导，rot6d 必须 canonical；不使用 xArm firmware Cartesian pose。每 timestep 只执行一次 Arm FK，`/fingertip_points` 复用同一 EEF 结果。processed-only，不进入 Zarr v8。 |
 | `/action` | `(N,19)` | float32 | `action_arm_joint_sent(7)+action_hand_joint(12)`；是 teleop 已发布 target，单位 rad；arm 部分不表示 SDK accepted state 或物理到位。 |
 | `/action_ee` | `(N,21)` | float32 | `eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)`，EEF 在 `xarm_base`；rot6d 两列必须是 canonical 单位正交列。 |
-| `/contact_force` | `(N,5,3)` | float32 | raw `hand_contact` 的每指三轴 tactile sum（SDK `calc_force`）；选择不晚于 observation reference、skew 有界且 hand/tactile source 相等的最新 fresh+calibrated+unit-proven 行。单位/轴由 root attrs 指定。 |
-| `/tactile_force` | `(N,5,120,3)` | float32 | raw `hand_tactile_force` 的 XHand SDK `raw_force` 每指 120 点 fx/fy/fz；与同行 `/contact_force` 来自**同一条** causally selected raw tactile source row（同一 `tactile_source_row_index`）。不假设 `contact_force == tactile_force.sum(...)`；sensor/point 顺序只是 SDK `sensor_data`/`raw_force` 顺序，SI 单位与 taxel 空间几何未验证。processed-only，不进入 Zarr v7。 |
+| `/contact_force` | `(N,5,3)` | float32 | raw `hand_contact` 的 XHand SDK `calc_force` 每指 fx/fy/fz（软件 bias 校正）；选择不晚于 observation reference、skew 有界且 hand/tactile source 相等的最新 fresh+calibrated+unit-proven 行。单位/轴由 root attrs 指定。 |
+| `/tactile_force` | `(N,5,120,3)` | float32 | raw `hand_tactile_force` 的 XHand SDK `raw_force` 每指 120 点 fx/fy/fz（软件 bias 校正）；与同行 `/contact_force` 来自**同一条** causally selected raw tactile source row（同一 `tactile_source_row_index`）。不假设 `contact_force == tactile_force.sum(...)`；sensor/point 顺序只是 SDK `sensor_data`/`raw_force` 顺序，SI 单位与 taxel 空间几何未验证。processed-only，不进入 Zarr v8。 |
 | `/fingertip_points` | `(N,5,3)` | float32 | 五指指尖坐标（m），`xarm_base`；所有 profile 均从本 artifact 的 `/joint_state` 经共享 arm+hand FK 重新计算（与 `/eef_pose` 共用同一次 Arm FK）。 |
 | `/rgb` | `(N,H_p,W_p,3)` | uint8 | 仅 RGB profile；resize、不裁剪。 |
 | `/depth` | `(N,H_p,W_p)` | uint16 | 仅 RGB profile；对齐到 RGB，nearest resize；0 无效，米值由 `depth_scale_m_per_unit` 给出。 |
@@ -220,11 +225,11 @@ payload/provenance 扫描。
 
 | 分组 | keys | 类型 / shape | 固定值或语义 |
 |---|---|---|---|
-| schema 与来源 | `schema_name`、`schema_version`、`domain`、`source_episode`、`source_frames` | string / int | `dexmani-real-processed-hdf5`、`14`、`real`，以及 raw 输入身份。 |
+| schema 与来源 | `schema_name`、`schema_version`、`domain`、`source_episode`、`source_frames` | string / int | `dexmani-real-processed-hdf5`、`15`、`real`，以及 raw 输入身份。 |
 | 长度与训练标签 | `profile`、`episode_steps`、`dt`、`time_semantics`、`source_contiguity`、`source_contiguity_tolerance_s`、`obs_alignment`、`observation_reference`、`state_alignment`、`max_observation_skew_s`、`action_semantics`、`task_name`、`action_dim`、`action_ee_dim`、`action_space` | string / int / float | profile、压紧后长度、段边界 provenance、`obs[t]_before_action[t]`，以及 state/camera 对齐、观察 skew 和唯一的 `teleop_published_joint_target` 动作语义。 |
-| Real core 语义 | `fingertip_points_frame`、`fingertip_points_unit`、`fingertip_points_derivation`、`fingertip_points_policy_id`、`action_ee_frame`、`action_ee_components`、`contact_force_source`、`contact_force_alignment`、`contact_force_unit`、`contact_force_si_verified`、`contact_force_frame`、`contact_force_fresh_required`、`contact_force_calibrated_required`、`contact_force_unit_code`、`contact_force_causal_to_reference`、`contact_force_hand_source_match_required` | string / bool / int | xarm-base 位置与 EEF frame；指尖单位 m；`fk_from_processed_joint_state` 与 FK algorithm identity。tactile attrs 保留来源、因果选择、单位、原生轴与逐行 proof 要求。 |
+| Real core 语义 | `fingertip_points_frame`、`fingertip_points_unit`、`fingertip_points_derivation`、`fingertip_points_policy_id`、`action_ee_frame`、`action_ee_components`、`contact_force_representation`、`contact_force_source`、`contact_force_alignment`、`contact_force_unit`、`contact_force_si_verified`、`contact_force_frame`、`contact_force_fresh_required`、`contact_force_calibrated_required`、`contact_force_unit_code`、`contact_force_causal_to_reference`、`contact_force_hand_source_match_required` | string / bool / int | xarm-base 位置与 EEF frame；指尖单位 m；`fk_from_processed_joint_state` 与 FK algorithm identity。tactile attrs 保留来源、因果选择、单位、原生轴与逐行 proof 要求。 |
 | EEF 语义 | `eef_pose_frame`、`eef_pose_components`、`eef_pose_derivation`、`eef_pose_algorithm_id` | string | 固定为 `xarm_base`、`position_m(3)+rot6d(6)`、`canonical_arm_fk_from_aligned_qpos` 与 `xarm7_custom_eef_pinocchio_fk_v1`；常量由 `planning/kinematics/arm_fk.py` 拥有，训练与部署共用同一 identity。 |
-| full tactile 语义 | `tactile_force_representation`、`tactile_force_sensor_order`、`tactile_force_point_order`、`tactile_force_axis_labels`、`tactile_force_unit`、`tactile_force_si_verified`、`tactile_force_spatial_geometry_verified`、`tactile_force_fresh_required`、`tactile_force_calibrated_required`、`tactile_force_unit_code`、`tactile_force_causal_to_reference`、`tactile_force_hand_source_match_required` | string / bool / int | 只记录源码可证明事实：`xhand_sdk_raw_force_fx_fy_fz`、SDK `sensor_data`/`raw_force` 顺序、`fx_fy_fz` 轴标签、`sdk_scaled_unknown_si` 单位；`si_verified=False`、`spatial_geometry_verified=False`；gating attrs 与 `contact_force` 相同（fresh/calibrated/unit_code=0/因果/hand-source 一致）。 |
+| full tactile 语义 | `tactile_force_representation`、`tactile_force_sensor_order`、`tactile_force_point_order`、`tactile_force_axis_labels`、`tactile_force_unit`、`tactile_force_si_verified`、`tactile_force_spatial_geometry_verified`、`tactile_force_fresh_required`、`tactile_force_calibrated_required`、`tactile_force_unit_code`、`tactile_force_causal_to_reference`、`tactile_force_hand_source_match_required` | string / bool / int | 只记录源码可证明事实：`xhand_sdk_raw_force_fx_fy_fz_bias_corrected`、SDK `sensor_data`/`raw_force` 顺序、`fx_fy_fz` 轴标签、`xhand_sdk_native_unknown_si` 单位；`si_verified=False`、`spatial_geometry_verified=False`；gating attrs 与 `contact_force` 相同（fresh/calibrated/unit_code=0/因果/hand-source 一致）。 |
 | 处理与审计 | `processing_config_json`、`quality_summary_json`、`source_decision_json` | JSON string | 处理配置、选择/拒绝结论和 raw 行来源；`source_decision_json.hard_invalid_reason_names` 是必填的硬无效 reason 名称列表。 |
 | RGB-D（仅 RGB/RGB-PC） | `rgb_transform`、`depth_transform`、`depth_unit`、`depth_scale_m_per_unit`、`depth_invalid_value`、`camera_intrinsic_semantics`、`camera_extrinsic_semantics` | string / float / int | 无裁剪 resize、aligned depth 的 nearest resize、depth 单位与无效值 `0`、K/T 语义。 |
 | RGB-D provenance（仅 RGB/RGB-PC） | `source_camera_depth_intrinsics_native`、`source_camera_depth_distortion_model`、`source_camera_depth_distortion_coeffs`、`camera_color_distortion_model`、`camera_color_distortion_coeffs`、`camera_T_color_from_depth` | float64 `(9,)`；string；float64 `(K_d,)`；float64 `(4,4)` | native depth K、depth/color 畸变与 native depth optical → color optical 外参。 |
@@ -244,7 +249,7 @@ profile/config/provenance 的完整性。`source_row_index`、`source_sample_ind
 导出 admission 不负责建立 processed 文件的来源信任；它只检查内部
 schema、payload 与 provenance。
 
-## 3. Policy Zarr v7
+## 3. Policy Zarr v8
 
 Zarr 是同一 `task_name`、同一 profile、同一 `dt`、同一 tail shape/dtype 与同一 Real
 语义 attrs 的 processed episode 拼接结果：
@@ -259,25 +264,25 @@ Zarr 是同一 `task_name`、同一 profile、同一 `dt`、同一 tail shape/dt
 
 | 路径 | shape | dtype | 语义 |
 |---|---:|---|---|
-| `/data/<key>` | `(T, *processed_tail_shape)` | 与 processed 相同 | 逐 episode 按文件名字典序拼接；key 集合是显式的 v7 legacy 投影：core 五项 `joint_state/action/action_ee/contact_force/fingertip_points` 加 profile 的 RGB/点云字段。processed v14 的 `eef_pose`/`tactile_force` 及其 attrs 不进入 Zarr。 |
+| `/data/<key>` | `(T, *processed_tail_shape)` | 与 processed 相同 | 逐 episode 按文件名字典序拼接；key 集合是显式的 v8 legacy 投影：core 五项 `joint_state/action/action_ee/contact_force/fingertip_points` 加 profile 的 RGB/点云字段。processed v15 的 `eef_pose`/`tactile_force` 及其 attrs 不进入 Zarr。 |
 | `/meta/episode_ends` | `(E,)` | int64 | 所有合格 processed 文件完整长度的累积结束下标（exclusive）；第 `i` 个训练 episode 是 `[0 if i=0 else ends[i-1], ends[i])`。`E` 等于被准入的 processed 文件数。 |
 
 数组使用 Zstd（默认 level 3）；时间 chunk 默认为 100 帧，最后 chunk 可更短。导出会逐数组
 校验 shape、dtype、episode ends 和浮点值。
 
-导出顺序是先完整验证 processed v14（包括 `eef_pose`/`tactile_force` payload 与新 tactile
-provenance），再显式投影 v7 keys 与 v7 attrs；不允许让 v14 新字段自动泄漏进 v7 输出。
+导出顺序是先完整验证 processed v15（包括 `eef_pose`/`tactile_force` payload 与新 tactile
+provenance），再显式投影 v8 keys 与 v8 attrs；不允许让 v15 新字段自动泄漏进 v8 输出。
 
 Zarr root attrs 是最小运行语义，而不是 processed 全部 provenance：
 
 | 范围 | attrs | 类型 / 语义 |
 |---|---|---|
-| schema 与任务 | `schema_name`、`schema_version`、`domain`、`profile`、`task_name`、`dt`、`episode_start_policy`、`obs_alignment`、`observation_reference`、`state_alignment`、`max_observation_skew_s`、`action_semantics` | string / int / float；固定为 `dexmani-real-policy-zarr`、`7`、`real`、`full_history`、`obs[t]_before_action[t]` 和 `teleop_published_joint_target`。训练不得用左侧 observation padding 构造 episode 起始样本。 |
-| Real core | `contact_force_*` proof attrs、`fingertip_points_frame`、`fingertip_points_unit`、`fingertip_points_derivation`、`fingertip_points_policy_id`、`action_ee_frame` | string / bool / int；来自 processed 输入并要求全部 episode 一致。`eef_pose_*` 与 `tactile_force_*` attrs 是 processed-v14-only 语义，**不属于** v7 root attrs。 |
+| schema 与任务 | `schema_name`、`schema_version`、`domain`、`profile`、`task_name`、`dt`、`episode_start_policy`、`obs_alignment`、`observation_reference`、`state_alignment`、`max_observation_skew_s`、`action_semantics` | string / int / float；固定为 `dexmani-real-policy-zarr`、`8`、`real`、`full_history`、`obs[t]_before_action[t]` 和 `teleop_published_joint_target`。训练不得用左侧 observation padding 构造 episode 起始样本。 |
+| Real core | `contact_force_*` proof attrs、`fingertip_points_frame`、`fingertip_points_unit`、`fingertip_points_derivation`、`fingertip_points_policy_id`、`action_ee_frame` | string / bool / int；来自 processed 输入并要求全部 episode 一致。`eef_pose_*` 与 `tactile_force_*` attrs 是 processed-v15-only 语义，**不属于** v8 root attrs。 |
 | RGB-PC profile | `depth_scale_m_per_unit`、`depth_invalid_value`、`camera_extrinsic_semantics` | float / int / string；depth 单位、无效像素值与 `T_xarm_base_from_color` 语义。 |
 | pointcloud/RGB-PC profile | `point_cloud_frame`、`point_cloud_color_source`、`point_cloud_policy_id`、`point_cloud_table_plane_abcd_json`、`point_cloud_sampling`、`point_cloud_transform` | string（其中 table plane 为 JSON string）；点云 frame、构建策略与处理身份。 |
 
-Policy Zarr v7 接受四种 profile 中语义 attrs 一致、压紧行保持网格连续的 processed v14
+Policy Zarr v8 接受四种 profile 中语义 attrs 一致、压紧行保持网格连续的 processed v15
 输入：首部删除的 source 行与至多 2 行、source 时间吻合的内部瞬态缺口可以容忍；更大的
 行缺口或无法解释的时间/样本跳变整条拒绝。其他合格
 文件仍可进入同一批导出。Zarr
@@ -288,14 +293,14 @@ Policy Zarr v7 接受四种 profile 中语义 attrs 一致、压紧行保持网�
 
 ## 字段映射摘要
 
-| raw v25 | processed v14 | Policy Zarr v7 | 变换 |
+| raw v26 | processed v15 | Policy Zarr v8 | 变换 |
 |---|---|---|---|
 | `policy_observation_arm_qpos + policy_observation_hand_qpos` | `joint_state` | `data/joint_state` | visual profile state，按 camera source 因果对齐后拼接 7+12，float64 → float32。 |
 | `joint_state[:,:7]`（因果对齐的 measured arm qpos） | `eef_pose` | —（processed-only） | canonical Arm FK 一次计算 `position_m(3)+rot6d(6)`；不使用 firmware pose。 |
 | `action_arm_joint_sent + action_hand_joint` | `action` | `data/action` | 拼接 7+12，使用实际 arm 提交流。 |
 | `action_arm_ee + action_hand_joint` | `action_ee` | `data/action_ee` | 拼接 9+12。 |
-| `hand_contact` + hand/tactile source proof | `contact_force` | `data/contact_force` | 按 observation reference 选择最新因果且 skew 有界的同-source fresh+calibrated tactile sum，保留 `(5,3)` 轴语义。 |
-| `hand_tactile_force` + 同一 tactile source proof | `tactile_force` | —（processed-only） | 与 `contact_force` 共用同一 selected raw row（safe unique+inverse gather），保留 `(5,120,3)` SDK raw_force；无插值、无零填充。 |
+| `hand_contact` + hand/tactile source proof | `contact_force` | `data/contact_force` | 按 observation reference 选择最新因果且 skew 有界的同-source fresh+calibrated calc_force（软件 bias 校正），保留 `(5,3)` 轴语义。 |
+| `hand_tactile_force` + 同一 tactile source proof | `tactile_force` | —（processed-only） | 与 `contact_force` 共用同一 selected raw row（safe unique+inverse gather），保留 `(5,120,3)` SDK raw_force（软件 bias 校正）；无插值、无零填充。 |
 | visual profile 的 camera-aligned arm/hand qpos 或 joint profile 的 control-grid arm/hand qpos | `joint_state` → `fingertip_points` | `data/joint_state`、`data/fingertip_points` | 每个 profile 先持久化自己的 7+12 `joint_state`，再通过共享 arm+hand FK 计算指尖，复用 `eef_pose` 的同一次 Arm FK；float64 → float32。 |
 | `rgb.mp4` + `depth.h5:/depth` + camera meta | `rgb/depth/K/T` | 对应 `data/*` | RGB/depth resize 到 processed 尺寸；depth 已对齐 RGB。 |
 | raw RGB-D 与 calibration | `point_cloud` | `data/point_cloud` | 使用 canonical builder，输出 xarm-base `xyzrgb`。 |
@@ -311,18 +316,18 @@ Policy Zarr v7 接受四种 profile 中语义 attrs 一致、压紧行保持网�
   一致为 **thumb, index, middle, ring, pinky**。这是 `xhand_sdk_sensor_data_order` 的
   anatomical resolution：sensor indices `0..4` 对应 finger IDs `(2,5,7,9,11)`，canonical
   定义位于 `robot/model.py`。已有 serialized identifier 保留 `thumb_index_mid_ring_pinky`。
-  processed v14 的既有 `tactile_force_sensor_order` 已表达该顺序，无需新增 required attr。
+  processed v15 的既有 `tactile_force_sensor_order` 已表达该顺序，无需新增 required attr。
 - Real 部署对请求的 `tactile_force` 同时校验 shape/dtype 与 PolicySpec semantics：
-  `representation=xhand_sdk_raw_force_fx_fy_fz`、`finger_order=thumb_index_mid_ring_pinky`、
+  `representation=xhand_sdk_raw_force_fx_fy_fz_bias_corrected`、`finger_order=thumb_index_mid_ring_pinky`、
   `sensor_order=xhand_sdk_sensor_data_order`、`point_order=xhand_sdk_sensor_data_raw_force_order`、
-  `axis_labels=fx_fy_fz`、`unit=sdk_scaled_unknown_si`，并严格要求两个 verification flags 为
+  `axis_labels=fx_fy_fz`、`unit=xhand_sdk_native_unknown_si`，并严格要求两个 verification flags 为
   boolean `False`。缺失或不匹配直接拒绝。
 - `tactile_force` 当前 `si_verified=False`、`spatial_geometry_verified=False`：不要假设
   SI Newton、120-point spatial XYZ、taxel 邻接，也不要假设逐 taxel 求和等于 `contact_force`。
-- `eef_pose` 与 `tactile_force` 只存在于 processed v14 与 Real 部署能力中；Policy Zarr v7
-  不包含它们，训练 loader 不应在 v7 store 里寻找这两个 key。
+- `eef_pose` 与 `tactile_force` 只存在于 processed v15 与 Real 部署能力中；Policy Zarr v8
+  不包含它们，训练 loader 不应在 v8 store 里寻找这两个 key。
 - 训练 Zarr 前应保留其对应 processed HDF5；Zarr 是训练传输格式，不是完整审计归档。
-- Real 训练 loader 必须校验 `schema_version=7`、`episode_start_policy=full_history`、camera-source
+- Real 训练 loader 必须校验 `schema_version=8`、`episode_start_policy=full_history`、camera-source
   state alignment 与 `teleop_published_joint_target` 动作语义，并使用
   `pad_before=n_obs_steps-1`、`pad_after=n_action_steps-1` 和 repeat-edge padding。当前 DP3 的
   `n_obs_steps=2`、`n_action_steps=8`，实例值为 `1/7`；不得把实例值写成通用常数。

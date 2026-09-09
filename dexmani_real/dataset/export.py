@@ -1,9 +1,10 @@
-"""Transactional export of processed HDF5 v14 episodes to Policy Zarr v7.
+"""Transactional export of processed HDF5 v15 episodes to Policy Zarr v8.
 
-The Zarr v7 data-key and root-attr contract is frozen: the exporter fully
-validates the v14 artifact first, then explicitly projects the legacy v7
-keys.  Processed-v14-only fields (``eef_pose``, ``tactile_force``) and their
-semantic attrs never enter the Zarr store.
+The Zarr v8 data-key and root-attr contract keeps the legacy core projection:
+the exporter fully validates the v15 artifact first, then explicitly projects
+the v8 keys.  Processed-v15-only fields (``eef_pose``, ``tactile_force``) and
+their semantic attrs never enter the Zarr store.  ``contact_force`` numeric
+semantics follow processed v15 (SDK-native, bias-corrected units).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from dexmani_real.dataset.contracts import OutputProfile, validate_processed_tas
 from dexmani_real.dataset.processed import (
     _ACTION_EE_FRAME,
     _CONTACT_FORCE_FRAME,
+    _CONTACT_FORCE_REPRESENTATION,
     _CONTACT_FORCE_SI_VERIFIED,
     _CONTACT_FORCE_UNIT,
     _FINGERTIP_POINTS_FRAME,
@@ -49,10 +51,10 @@ from dexmani_real.sensor.pointcloud import (
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 
 POLICY_ZARR_SCHEMA_NAME = "dexmani-real-policy-zarr"
-POLICY_ZARR_SCHEMA_VERSION = 7
-# Frozen legacy projection of the processed core into Zarr v7.  Processed v14
+POLICY_ZARR_SCHEMA_VERSION = 8
+# Legacy core projection of the processed core into Zarr v8.  Processed v14+
 # added eef_pose/tactile_force; they are deliberately absent here.
-_POLICY_ZARR_V7_CORE_KEYS = (
+_POLICY_ZARR_CORE_KEYS = (
     "joint_state",
     "action",
     "action_ee",
@@ -62,9 +64,9 @@ _POLICY_ZARR_V7_CORE_KEYS = (
 ExportProgressCallback = Callable[[str, int, int], None]
 
 
-def _policy_zarr_v7_keys(profile: OutputProfile) -> tuple[str, ...]:
-    """Return the frozen Zarr v7 data-key projection for one v14 profile."""
-    keys = list(_POLICY_ZARR_V7_CORE_KEYS)
+def _policy_zarr_keys(profile: OutputProfile) -> tuple[str, ...]:
+    """Return the Zarr v8 data-key projection for one processed profile."""
+    keys = list(_POLICY_ZARR_CORE_KEYS)
     if profile.needs_rgb:
         keys.extend(("rgb", "depth", "camera_intrinsic", "camera_extrinsic"))
     if profile.needs_pointcloud:
@@ -289,10 +291,17 @@ def _inspect_artifact(
         fingertip_semantics = validate_fingertip_points_semantics(
             source.attrs, label=path.name
         )
-        # Full v14 semantic admission runs before the v7 projection; these
+        # Full v15 semantic admission runs before the v8 projection; these
         # identities are validated but never copied into the Zarr root attrs.
         validate_eef_pose_semantics(source.attrs, label=path.name)
         validate_tactile_force_semantics(source.attrs, label=path.name)
+        # contact_force_representation is validated at admission but is not
+        # carried into the Zarr root (it stays processed-only).
+        if (
+            _text(source.attrs.get("contact_force_representation", ""))
+            != _CONTACT_FORCE_REPRESENTATION
+        ):
+            raise ValueError(f"{path.name}: invalid contact_force_representation")
         semantics: dict[str, Any] = {
             "obs_alignment": _text(source.attrs.get("obs_alignment", "")),
             "observation_reference": _text(
@@ -460,8 +469,8 @@ def _inspect_artifact(
                     for key, value in point_cloud_semantics.items()
                 }
             )
-        # Full processed-v14 admission specs: the complete artifact, including
-        # the processed-only fields, is validated before the v7 projection.
+        # Full processed-v15 admission specs: the complete artifact, including
+        # the processed-only fields, is validated before the v8 projection.
         expected_specs: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
             "joint_state": ((length, 19), np.dtype(np.float32)),
             "eef_pose": ((length, 9), np.dtype(np.float32)),
@@ -516,9 +525,9 @@ def _inspect_artifact(
         )
         if rejection is not None:
             return rejection
-        # Explicit legacy projection: only the frozen Zarr v7 keys are carried
-        # into the artifact metadata that drives the data copy and validation.
-        for key in _policy_zarr_v7_keys(profile):
+        # Explicit legacy projection: only the Zarr v8 keys are carried into
+        # the artifact metadata that drives the data copy and validation.
+        for key in _policy_zarr_keys(profile):
             shapes[key] = tuple(int(value) for value in source[key].shape[1:])
             dtypes[key] = np.dtype(source[key].dtype)
     return _Artifact(

@@ -4,6 +4,15 @@ Audited integrated base `2316bf0c129c145716a954664f9791cbae28a715` on 2026-09-09
 Decision: **KEEP all inspected production validators; production diff is zero**.
 No candidate satisfies every condition for deleting a fixed schema identity check.
 
+> **Historical record.** This audit predates the tactile v14 → v15 / Policy Zarr
+> v7 → v8 rename. Names below — "processed v14", the "frozen v7 projection",
+> `_policy_zarr_v7_keys`, and the test names `test_processed_v14.py` /
+> `test_zarr_v7_projection.py` — refer to the audited base. The current tree
+> renamed them to processed v15 (`PROCESSED_SCHEMA_VERSION = 15`),
+> `_policy_zarr_keys` / `_POLICY_ZARR_CORE_KEYS` (`POLICY_ZARR_SCHEMA_VERSION =
+> 8`), and `tests/test_processed_v15.py` / `tests/test_zarr_v8_projection.py`.
+> The KEEP decision and its reasoning are unchanged.
+
 ## Classification and evidence
 
 The unit of classification is a check, not its containing function. A function

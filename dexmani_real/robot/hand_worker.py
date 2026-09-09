@@ -22,6 +22,7 @@ from dexmani_real.ipc.schema import (
     HAND_TACTILE_DTYPE,
     HAND_TACTILE_FORCE_SHAPE,
     HAND_TACTILE_SUM_SHAPE,
+    TACTILE_UNIT_CODE_XHAND_SDK_NATIVE,
 )
 from dexmani_real.robot.command_validation import check_worker_hand_target
 from dexmani_real.utils.limits import limit_hand_target_delta
@@ -105,8 +106,10 @@ def _build_tactile_frame(
         frame["tactile_force"][0] = force
     frame["source_monotonic_ns"][0] = max(0, int(source_monotonic_ns))
     frame["fresh"][0] = int(valid)
-    frame["calibrated"][0] = int(valid and calibrated)
-    frame["unit_code"][0] = 0
+    # Calibration state is independent of dense-frame validity: a contact-only
+    # policy still needs a calibrated hand even when dense tactile is absent.
+    frame["calibrated"][0] = int(calibrated)
+    frame["unit_code"][0] = TACTILE_UNIT_CODE_XHAND_SDK_NATIVE
     return frame
 
 

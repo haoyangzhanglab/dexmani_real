@@ -17,7 +17,10 @@ import numpy as np
 from dexmani_real.config.defaults import PolicyParams
 from dexmani_real.deployment.config import FingertipAssemblerConfig
 from dexmani_real.ipc.channels import RuntimeChannels
-from dexmani_real.ipc.schema import validate_point_cloud_array
+from dexmani_real.ipc.schema import (
+    TACTILE_UNIT_CODE_XHAND_SDK_NATIVE,
+    validate_point_cloud_array,
+)
 from dexmani_real.planning.kinematics.arm_fk import (
     compute_eef_pose_history_xarm_base,
     make_arm_fk,
@@ -240,11 +243,16 @@ def _read_tactile_provenance_history(
     max_age_ns: int,
     not_before_ns: int,
 ) -> FrameWindow | None:
-    """Read only tactile provenance flags; never copy the full tactile tensor."""
+    """Read only tactile provenance flags; never copy the full tactile tensor.
+
+    Contact-only policies gate on calibration, unit identity, causality, and
+    age — not on dense-frame freshness, which aggregate ``tactile_sum``
+    validity already covers through ``hand_state_ring``.
+    """
     try:
         history = ring.get_last_k_fields(
             min(int(history_len), ring.maxlen),
-            fields=("source_monotonic_ns", "fresh", "calibrated", "unit_code"),
+            fields=("source_monotonic_ns", "calibrated", "unit_code"),
         )
     except Exception:
         logger.warning("inference: tactile provenance read failed", exc_info=True)
@@ -254,9 +262,8 @@ def _read_tactile_provenance_history(
         source_ns = int(record["source_monotonic_ns"])
         publish_ns = int(ring_publish_ns)
         if not (
-            bool(record["fresh"])
-            and bool(record["calibrated"])
-            and int(record["unit_code"]) == 0
+            bool(record["calibrated"])
+            and int(record["unit_code"]) == TACTILE_UNIT_CODE_XHAND_SDK_NATIVE
         ):
             continue
         if not (max(1, not_before_ns) <= source_ns <= publish_ns <= anchor_ns):
@@ -286,12 +293,13 @@ def _read_tactile_force_history(
     max_age_ns: int,
     not_before_ns: int,
 ) -> FrameWindow | None:
-    """Read the full ``[T,5,120,3]`` tactile history behind identical gates.
+    """Read the full ``[T,5,120,3]`` tactile history behind strict dense gates.
 
     Called only when the PolicySpec requests ``tactile_force``; the contact-only
     path keeps using ``_read_tactile_provenance_history`` and never copies the
-    full tensor.  Provenance gates match the provenance reader exactly: fresh,
-    calibrated, unit_code == 0, causal to the anchor, within the age bound.
+    full tensor.  Unlike that provenance reader, this path additionally
+    requires ``fresh`` (dense validity): it gates on fresh, calibrated,
+    unit_code == 0, causal to the anchor, and within the age bound.
     """
     try:
         history = ring.get_last_k(min(int(history_len), ring.maxlen))
@@ -306,7 +314,7 @@ def _read_tactile_force_history(
         if not (
             bool(record["fresh"])
             and bool(record["calibrated"])
-            and int(record["unit_code"]) == 0
+            and int(record["unit_code"]) == TACTILE_UNIT_CODE_XHAND_SDK_NATIVE
         ):
             continue
         if not (max(1, not_before_ns) <= source_ns <= publish_ns <= anchor_ns):

@@ -934,6 +934,12 @@ class PolicyExecutor:
                 and now_ns - int(tactile["source_monotonic_ns"][0])
                 <= _RECORDING_TACTILE_MAX_AGE_NS
             )
+            tactile_sum_fresh = bool(
+                hand["tactile_sum_valid"][0]
+                and 0 < int(hand["source_monotonic_ns"][0]) <= now_ns
+                and now_ns - int(hand["source_monotonic_ns"][0])
+                <= _RECORDING_TACTILE_MAX_AGE_NS
+            )
             state = build_episode_state(
                 arm,
                 hand,
@@ -953,6 +959,7 @@ class PolicyExecutor:
                 "hand_source_monotonic_ns": int(hand["source_monotonic_ns"][0]),
                 "vr_source_monotonic_ns": 0,
                 "camera_source_monotonic_ns": int(camera["source_monotonic_ns"]),
+                "tactile_sum_fresh": tactile_sum_fresh,
                 "tactile_fresh": tactile_fresh,
                 "tactile_source_monotonic_ns": (
                     0 if tactile is None else int(tactile["source_monotonic_ns"][0])

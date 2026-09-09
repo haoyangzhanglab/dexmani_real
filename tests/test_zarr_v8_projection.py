@@ -1,11 +1,11 @@
-"""Offline regressions for the frozen Policy Zarr v7 projection boundary.
+"""Offline regressions for the frozen Policy Zarr v8 projection boundary.
 
-No hardware.  Exports a processed-v14 fixture and pins the Zarr v7 contract:
-schema_version stays 7, the data-key set and root semantic attrs are exactly
-the legacy v7 projection, and the processed-v14-only fields (``eef_pose``,
+No hardware.  Exports a processed-v15 fixture and pins the Zarr v8 contract:
+schema_version stays 8, the data-key set and root semantic attrs are exactly
+the legacy v8 projection, and the processed-v15-only fields (``eef_pose``,
 ``tactile_force``) plus their attrs never leak into the store.  Run with:
 
-    python -m unittest discover -s tests -p 'test_zarr_v7_projection.py'
+    python -m unittest discover -s tests -p 'test_zarr_v8_projection.py'
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from dexmani_real.dataset.contracts import OutputProfile
 from dexmani_real.dataset.export import (
     POLICY_ZARR_SCHEMA_NAME,
     POLICY_ZARR_SCHEMA_VERSION,
-    _policy_zarr_v7_keys,
+    _policy_zarr_keys,
     _whole_episode_rejection,
     export_processed_hdf5_to_zarr,
 )
@@ -32,9 +32,9 @@ from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
 )
-from test_processed_v14 import _process_fixture
+from test_processed_v15 import _process_fixture
 
-_EXPECTED_V7_DATA_KEYS = {
+_EXPECTED_V8_DATA_KEYS = {
     "joint_state",
     "action",
     "action_ee",
@@ -42,7 +42,7 @@ _EXPECTED_V7_DATA_KEYS = {
     "fingertip_points",
 }
 
-_EXPECTED_V7_ATTR_KEYS = {
+_EXPECTED_V8_ATTR_KEYS = {
     "schema_name",
     "schema_version",
     "domain",
@@ -73,7 +73,7 @@ _EXPECTED_V7_ATTR_KEYS = {
 }
 
 
-class TestPolicyZarrV7Projection(unittest.TestCase):
+class TestPolicyZarrV8Projection(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls._tmp = tempfile.TemporaryDirectory()
@@ -97,24 +97,24 @@ class TestPolicyZarrV7Projection(unittest.TestCase):
         self.assertEqual(self.report["episode_count"], 1)
         self.assertEqual(self.report["rejected_episode_count"], 0)
         self.assertEqual(self.report["profile"], "joint")
-        self.assertEqual(sorted(self.report["dataset_keys"]), sorted(_EXPECTED_V7_DATA_KEYS))
+        self.assertEqual(sorted(self.report["dataset_keys"]), sorted(_EXPECTED_V8_DATA_KEYS))
 
-    def test_schema_version_remains_seven(self) -> None:
+    def test_schema_version_remains_eight(self) -> None:
         root = zarr.open_group(str(self.zarr_path), mode="r")
-        self.assertEqual(int(root.attrs["schema_version"]), 7)
-        self.assertEqual(POLICY_ZARR_SCHEMA_VERSION, 7)
+        self.assertEqual(int(root.attrs["schema_version"]), 8)
+        self.assertEqual(POLICY_ZARR_SCHEMA_VERSION, 8)
         self.assertEqual(str(root.attrs["schema_name"]), POLICY_ZARR_SCHEMA_NAME)
 
     def test_data_keys_are_exactly_the_legacy_projection(self) -> None:
         root = zarr.open_group(str(self.zarr_path), mode="r")
-        self.assertEqual(set(root["data"].array_keys()), _EXPECTED_V7_DATA_KEYS)
+        self.assertEqual(set(root["data"].array_keys()), _EXPECTED_V8_DATA_KEYS)
         self.assertNotIn("eef_pose", set(root["data"].array_keys()))
         self.assertNotIn("tactile_force", set(root["data"].array_keys()))
 
     def test_root_attrs_frozen_and_no_new_field_leakage(self) -> None:
         root = zarr.open_group(str(self.zarr_path), mode="r")
         attrs = dict(root.attrs)
-        self.assertEqual(set(attrs), _EXPECTED_V7_ATTR_KEYS)
+        self.assertEqual(set(attrs), _EXPECTED_V8_ATTR_KEYS)
         leaked = [
             key
             for key in attrs
@@ -129,7 +129,7 @@ class TestPolicyZarrV7Projection(unittest.TestCase):
         self.assertEqual(attrs["observation_reference"], "grid_anchor_monotonic_ns")
         self.assertEqual(attrs["state_alignment"], "control_grid_state")
         self.assertEqual(attrs["action_semantics"], "teleop_published_joint_target")
-        self.assertEqual(attrs["contact_force_unit"], "sdk_scaled_unknown_si")
+        self.assertEqual(attrs["contact_force_unit"], "xhand_sdk_native_unknown_si")
         self.assertIs(bool(attrs["contact_force_si_verified"]), False)
         self.assertEqual(
             attrs["contact_force_frame"], "xhand_sensor_native_axes_per_finger"
@@ -160,7 +160,7 @@ class TestPolicyZarrV7Projection(unittest.TestCase):
     def test_projected_payload_matches_processed_source(self) -> None:
         root = zarr.open_group(str(self.zarr_path), mode="r")
         with h5py.File(self.processed_path, "r") as source:
-            for key in sorted(_EXPECTED_V7_DATA_KEYS):
+            for key in sorted(_EXPECTED_V8_DATA_KEYS):
                 stored = np.asarray(root["data"][key][:])
                 original = np.asarray(source[key][:])
                 self.assertEqual(stored.shape, original.shape)
@@ -169,14 +169,14 @@ class TestPolicyZarrV7Projection(unittest.TestCase):
         ends = np.asarray(root["meta"]["episode_ends"][:])
         np.testing.assert_array_equal(ends, np.asarray([24], dtype=np.int64))
 
-    def test_projection_key_helper_excludes_v14_only_fields(self) -> None:
+    def test_projection_key_helper_excludes_v15_only_fields(self) -> None:
         for profile in OutputProfile:
-            keys = _policy_zarr_v7_keys(profile)
+            keys = _policy_zarr_keys(profile)
             self.assertNotIn("eef_pose", keys)
             self.assertNotIn("tactile_force", keys)
             self.assertTrue(set(keys).issubset(set(profile.dataset_keys)))
         self.assertEqual(
-            _policy_zarr_v7_keys(OutputProfile.JOINT),
+            _policy_zarr_keys(OutputProfile.JOINT),
             (
                 "joint_state",
                 "action",
@@ -186,7 +186,7 @@ class TestPolicyZarrV7Projection(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            _policy_zarr_v7_keys(OutputProfile.RGB_PC),
+            _policy_zarr_keys(OutputProfile.RGB_PC),
             (
                 "joint_state",
                 "action",
@@ -202,8 +202,8 @@ class TestPolicyZarrV7Projection(unittest.TestCase):
         )
 
 
-class TestZarrV7AdmissionFailClosed(unittest.TestCase):
-    """Corrupted v14-only semantics must fail export admission before the v7 projection."""
+class TestZarrV8AdmissionFailClosed(unittest.TestCase):
+    """Corrupted v15-only semantics must fail export admission before the v8 projection."""
 
     def _expect_export_rejects(self, attr_name: str, bad_value: str) -> None:
         with tempfile.TemporaryDirectory() as tmp:

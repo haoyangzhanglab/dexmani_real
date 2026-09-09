@@ -1,11 +1,11 @@
-"""The only supported raw episode layout: physical source rows, schema v25."""
+"""The only supported raw episode layout: physical source rows, schema v26."""
 
 from dataclasses import dataclass
 from enum import IntEnum
 
 import numpy as np
 
-EPISODE_SCHEMA_VERSION = 25
+EPISODE_SCHEMA_VERSION = 26
 ARM_SENT_DATASET = "action_arm_joint_sent"
 
 
@@ -54,6 +54,10 @@ DATASET_SPECS = {
     "tactile_source_monotonic_ns": _spec(np.uint64),
     "vr_source_monotonic_ns": _spec(np.uint64),
     "camera_source_monotonic_ns": _spec(np.uint64),
+    # ``tactile_sum_fresh`` marks the aggregate ``hand_contact`` payload valid;
+    # ``tactile_fresh`` marks the dense ``hand_tactile_force`` payload valid.
+    # The two payloads share one calibration state and unit convention below.
+    "tactile_sum_fresh": _spec(np.bool_),
     "tactile_fresh": _spec(np.bool_),
     "tactile_calibrated": _spec(np.bool_),
     "tactile_unit_code": _spec(np.uint8),

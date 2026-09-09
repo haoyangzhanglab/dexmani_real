@@ -1,4 +1,4 @@
-"""Owned raw-v25 source rows assembled at the recording boundary."""
+"""Owned raw-v26 source rows assembled at the recording boundary."""
 
 from __future__ import annotations
 
@@ -83,6 +83,7 @@ def episode_source_values(
         "camera_source_monotonic_ns": signal.get(
             "camera_source_monotonic_ns", camera.get("source_monotonic_ns", 0)
         ),
+        "tactile_sum_fresh": signal.get("tactile_sum_fresh", False),
         "tactile_fresh": signal.get("tactile_fresh", False),
         "tactile_calibrated": signal.get("tactile_calibrated", False),
         "tactile_unit_code": signal.get("tactile_unit_code", 0),

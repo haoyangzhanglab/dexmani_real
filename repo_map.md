@@ -13,6 +13,7 @@
 | `README.md` | 面向使用者的能力、环境、工作流与稳定架构。 |
 | `repo_map.md` | 当前运行拓扑、核心数据流与边界索引。 |
 | `tools/convert_raw_v24_to_v25.py` | 冻结的一次性历史 raw v24 → v25 转换器；不依赖当前 runtime。 |
+| `tools/convert_raw_v25_to_v26_tactile.py` | 冻结的一次性 raw v25 → v26 tactile 表示迁移（`* 10` 还原 SDK 原生刻度、新增 `tactile_sum_fresh`）。 |
 | `docs/raw_v24_migration.md` | 历史数据迁移与 processed/Zarr golden 回归步骤。 |
 | `docs/refactor_contract_audit.md` | 验证器分类、producer/consumer 证据与 KEEP 决策。 |
 | `docs/refactor_execution_plan.md` | 已执行重构的 canonical 方案、protected invariants 与分阶段验收规则；执行结果见 evidence。 |
@@ -142,7 +143,7 @@ B + completed H
   max_frames→INVALID
   与 recording-invalid 不触发全局 FAULT）；不启动任何 worker 或设备。
 - `tests/test_recorder_io_boundary.py` 覆盖 Recorder STOP save/outcome 边界，并用临时目录与合成
-  held sample 实际写入、验证 raw-v25 HDF5/depth/video 和 FAILURE result.json；不连接设备。
+  held sample 实际写入、验证 raw-v26 HDF5/depth/video 和 FAILURE result.json；不连接设备。
 
 ## Teleop flow
 
@@ -194,7 +195,7 @@ VR / keyboard input
 - Camera IPC 只携带 source/receive/publish 时间、generation、帧号和 health；保留 payload
   尺寸字段以支持 name-only ring attach。设备时钟映射留在 driver/worker，不作为录制审计传输。
   static shared metadata 只保留 serial、RGB-D geometry 和 depth scale；校准与研究 provenance
-  继续写入 raw v25。`tests/test_camera_v25_telemetry.py` 覆盖 health、causality 与 seqlock 边界。
+  继续写入 raw v26。`tests/test_camera_v25_telemetry.py` 覆盖 health、causality 与 seqlock 边界。
 - teleop 只把已经选择并校验的 causal fixed-grid sample 交给 RecorderIO；RecorderIO 独占
   episode transaction、sidecar、sequence continuity、validation 和 atomic finalize，不决定
   机器人动作。
@@ -203,21 +204,21 @@ VR / keyboard input
   selector、checkpoint name/SHA-256、eval seed 和 wall-clock budget 通过 recorder-owned
   `provenance_*` metadata attrs 保存，不与 camera metadata 混用。
 - raw episode 的 schema、字段语义和对齐保持单一来源：`recording/storage/schema.py` 与
-  [`docs/data_schema.md`](docs/data_schema.md)。当前链路为 raw v25 → processed HDF5 v14 →
-  Policy Zarr v7；离线 `dataset/` 负责清洗、审计和导出，不改变 raw 字段含义。Policy Zarr v7
-  是 processed v14 的显式 legacy 投影：`eef_pose`/`tactile_force` 只存在于 processed，不进入
+  [`docs/data_schema.md`](docs/data_schema.md)。当前链路为 raw v26 → processed HDF5 v15 →
+  Policy Zarr v8；离线 `dataset/` 负责清洗、审计和导出，不改变 raw 字段含义。Policy Zarr v8
+  是 processed v15 的显式 legacy 投影：`eef_pose`/`tactile_force` 只存在于 processed，不进入
   Zarr keys 或 root attrs。所有 processed profile 的 `eef_pose` 与 fingertip 都由自身
   `joint_state` FK 推导（每 timestep 一次 canonical Arm FK，两者共用），`contact_force` 与
   `tactile_force` 共用同一因果 tactile source row，并在处理时记录 derivation 与 policy identity。
-- `EpisodeReader` 只接受 raw v25 并检查必需文件、layout 和 sidecar 帧数；不重放 runtime proof、不完整解码 RGB。
+- `EpisodeReader` 只接受 raw v26 并检查必需文件、layout 和 sidecar 帧数；不重放 runtime proof、不完整解码 RGB。
 - `dataset/processing.py::process_episode_root` 独占 batch 准入与 publication transaction；
   CLI 只调用一次 batch processing（compare 每 profile 一次 dry-run），task-name override
   与用户 annotation 来源分开，报告在 staging 中完成。temporal detectors 仅审计。
 - processed writer 只在原子发布前重开并确认 HDF5 结构；`--verify-output` 才执行完整写后
   自检。processed consumer/export 边界仍严格验证 payload finite、shape/dtype、alignment 和
   semantic attrs。
-- `tests/test_raw_v25_recording.py` 覆盖 direct-row batch、真实时间缺口、sidecar identity 与失败不发布；`recording/timeline.py` 的第二时间网格已删除。
-- `tests/test_v25_producers.py` 用实际 sample/client 覆盖 sent target、head pose、active/IK hold、retarget-failure queued 语义及视觉状态 freshness。
+- `tests/test_raw_v26_recording.py` 覆盖 direct-row batch、真实时间缺口、sidecar identity 与失败不发布；`recording/timeline.py` 的第二时间网格已删除。
+- `tests/test_v26_producers.py` 用实际 sample/client 覆盖 sent target、head pose、active/IK hold、retarget-failure queued 语义及视觉状态 freshness。
 - `recording/storage/hdf5_writer.py` 独占单个 `data.h5` handle；camera sidecar 和 video writer 不
   反向拥有控制状态。缺口、失败或未完成 finalize 不伪装成完整 episode。
 - 物理回放读取 recorded published arm target 与 recorded logical hand target/provenance，并重新经过

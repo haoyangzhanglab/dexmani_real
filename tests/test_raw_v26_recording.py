@@ -1,4 +1,4 @@
-"""Offline raw-v25 source-row recording and storage regressions."""
+"""Offline raw-v26 source-row recording and storage regressions."""
 
 import json
 from pathlib import Path
@@ -29,9 +29,11 @@ from tools.convert_raw_v24_to_v25 import KEEP_DATASETS
 
 
 def test_schema_matches_frozen_converter_projection():
-    assert len(DATASET_SPECS) == 41
-    assert set(DATASET_SPECS) == set(KEEP_DATASETS)
-    assert len(SOURCE_FRAME_DATASET_NAMES) == 37
+    # v26 adds exactly one aggregate freshness column over the frozen v24->v25
+    # converter projection (which still targets v25).
+    assert len(DATASET_SPECS) == 42
+    assert set(DATASET_SPECS) - set(KEEP_DATASETS) == {"tactile_sum_fresh"}
+    assert len(SOURCE_FRAME_DATASET_NAMES) == 38
 
 
 def test_decoded_frame_owns_sample_ring_arrays():
@@ -260,7 +262,7 @@ def test_direct_rows_cross_batch_and_preserve_gap(tmp_path):
         path = _save(recorder)
         with EpisodeReader(path) as reader:
             f = reader.h5f
-            assert int(f["meta"].attrs["schema_version"]) == 25
+            assert int(f["meta"].attrs["schema_version"]) == 26
             np.testing.assert_array_equal(f["timestamp"][:], timestamps)
             np.testing.assert_array_equal(f["source_sample_index"][:], np.arange(35))
             np.testing.assert_array_equal(f["fill_reason"][:], 0)
@@ -283,7 +285,7 @@ def test_reader_rejects_old_schema_and_inconsistent_rows(tmp_path):
     with pytest.raises(ValueError, match="unsupported"):
         EpisodeReader(path)
     with h5py.File(path / "data.h5", "r+") as f:
-        f["meta"].attrs["schema_version"] = 25
+        f["meta"].attrs["schema_version"] = 26
         f["meta"].attrs["num_frames"] = 2
     with pytest.raises(ValueError, match="validity"):
         EpisodeReader(path)

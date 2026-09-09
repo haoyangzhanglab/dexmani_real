@@ -1,11 +1,11 @@
-"""Offline regressions for the processed HDF5 v14 writer and validators.
+"""Offline regressions for the processed HDF5 v15 writer and validators.
 
 No hardware.  A synthetic JOINT-profile raw fixture drives ``analyze_episode``
-and ``_write_processed_episode`` end to end, then the v14 validators pin keys,
+and ``_write_processed_episode`` end to end, then the v15 validators pin keys,
 shapes, dtypes, semantic attrs, tactile provenance causality, and fail-closed
 behavior, SOURCE-only cleaning and camera/tactile admission. Run with:
 
-    python -m unittest discover -s tests -p 'test_processed_v14.py'
+    python -m unittest discover -s tests -p 'test_processed_v15.py'
 """
 
 from __future__ import annotations
@@ -217,7 +217,7 @@ class TestGatherDatasetRows(unittest.TestCase):
             np.testing.assert_array_equal(gathered, np.repeat(values[2:3], 3, axis=0))
 
 
-class TestProcessedV14Writer(unittest.TestCase):
+class TestProcessedV15Writer(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls._tmp = tempfile.TemporaryDirectory()
@@ -260,9 +260,9 @@ class TestProcessedV14Writer(unittest.TestCase):
                         reader.h5f.close()
 
     def test_schema_version_and_keys(self) -> None:
-        self.assertEqual(PROCESSED_SCHEMA_VERSION, 14)
+        self.assertEqual(PROCESSED_SCHEMA_VERSION, 15)
         with h5py.File(self.out_path, "r") as f:
-            self.assertEqual(int(f.attrs["schema_version"]), 14)
+            self.assertEqual(int(f.attrs["schema_version"]), 15)
             expected = set(OutputProfile.JOINT.dataset_keys) | {"provenance"}
             self.assertTrue(expected.issubset(set(f.keys())))
             self.assertIn("eef_pose", f)
@@ -342,7 +342,8 @@ class TestProcessedV14Writer(unittest.TestCase):
             _text("eef_pose_algorithm_id"), "xarm7_custom_eef_pinocchio_fk_v1"
         )
         self.assertEqual(
-            _text("tactile_force_representation"), "xhand_sdk_raw_force_fx_fy_fz"
+            _text("tactile_force_representation"),
+            "xhand_sdk_raw_force_fx_fy_fz_bias_corrected",
         )
         self.assertEqual(
             _text("tactile_force_sensor_order"), "xhand_sdk_sensor_data_order"
@@ -352,7 +353,12 @@ class TestProcessedV14Writer(unittest.TestCase):
             "xhand_sdk_sensor_data_raw_force_order",
         )
         self.assertEqual(_text("tactile_force_axis_labels"), "fx_fy_fz")
-        self.assertEqual(_text("tactile_force_unit"), "sdk_scaled_unknown_si")
+        self.assertEqual(_text("tactile_force_unit"), "xhand_sdk_native_unknown_si")
+        self.assertEqual(
+            _text("contact_force_representation"),
+            "xhand_sdk_calc_force_fx_fy_fz_bias_corrected",
+        )
+        self.assertEqual(_text("contact_force_unit"), "xhand_sdk_native_unknown_si")
         self.assertIs(bool(attrs["tactile_force_si_verified"]), False)
         self.assertIs(bool(attrs["tactile_force_spatial_geometry_verified"]), False)
         for name in (
@@ -365,7 +371,7 @@ class TestProcessedV14Writer(unittest.TestCase):
         self.assertEqual(int(attrs["tactile_force_unit_code"]), 0)
 
 
-class TestProcessedV14ForwardFill(unittest.TestCase):
+class TestProcessedV15ForwardFill(unittest.TestCase):
     def test_forward_fill_duplicates_one_source_row(self) -> None:
         # Rows 5-6 are not fresh; their references stay within the 100ms skew
         # cap of row 4, so both forward-fill onto the same raw source row.
@@ -401,7 +407,7 @@ class TestProcessedV14ForwardFill(unittest.TestCase):
                 reader.h5f.close()
 
 
-class TestProcessedV14FailClosed(unittest.TestCase):
+class TestProcessedV15FailClosed(unittest.TestCase):
     def _mutate_and_expect_failure(self, mutate) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp) / "fail"
@@ -459,7 +465,7 @@ class TestProcessedV14FailClosed(unittest.TestCase):
         self._mutate_and_expect_failure(mutate)
 
 
-class TestV25Cleaning(unittest.TestCase):
+class TestV26Cleaning(unittest.TestCase):
     def _decision(self, mutate, *, visual=False):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "raw.h5"

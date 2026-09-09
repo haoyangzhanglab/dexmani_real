@@ -158,12 +158,12 @@ def _expected_fingertip_semantics(runtime: Any) -> dict[str, str]:
 
 def _expected_tactile_force_semantics() -> dict[str, object]:
     return {
-        "representation": "xhand_sdk_raw_force_fx_fy_fz",
+        "representation": "xhand_sdk_raw_force_fx_fy_fz_bias_corrected",
         "finger_order": HAND_FINGER_ORDER_ID,
         "sensor_order": "xhand_sdk_sensor_data_order",
         "point_order": "xhand_sdk_sensor_data_raw_force_order",
         "axis_labels": "fx_fy_fz",
-        "unit": "sdk_scaled_unknown_si",
+        "unit": "xhand_sdk_native_unknown_si",
         "si_verified": False,
         "spatial_geometry_verified": False,
     }

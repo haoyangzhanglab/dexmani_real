@@ -258,7 +258,7 @@ class TestBuildObservation(unittest.TestCase):
         full.assert_not_called()
         projected.assert_called_once_with(
             ring.maxlen,
-            fields=("source_monotonic_ns", "fresh", "calibrated", "unit_code"),
+            fields=("source_monotonic_ns", "calibrated", "unit_code"),
         )
         force_reader.assert_not_called()
         self.assertIsNotNone(observation)
@@ -313,6 +313,28 @@ class TestBuildObservation(unittest.TestCase):
             data["source_monotonic_ns"] -= 1
         spec = _fake_policy_spec(_Field("contact_force", (5, 3), "float32"))
         self.assertIsNone(_build(shared, spec))
+
+    def test_contact_only_survives_dense_invalid_but_dense_policy_fails(self) -> None:
+        # Aggregate valid, dense fresh=False, calibrated=True, same source.
+        ticks = range(6)
+        shared = types.SimpleNamespace(
+            arm_state_ring=_FakeRing(
+                [_arm_record(tick, np.zeros(7)) for tick in ticks]
+            ),
+            hand_state_ring=_FakeRing(
+                [_hand_state_record(tick) for tick in ticks]
+            ),
+            hand_tactile_ring=_FakeRing(
+                [
+                    _tactile_record(tick, fresh=False, calibrated=True)
+                    for tick in ticks
+                ]
+            ),
+        )
+        contact_spec = _fake_policy_spec(_Field("contact_force", (5, 3), "float32"))
+        self.assertIsNotNone(_build(shared, contact_spec))
+        dense_spec = _fake_policy_spec(_Field("tactile_force", (5, 120, 3), "float32"))
+        self.assertIsNone(_build(shared, dense_spec))
 
     def test_contact_and_force_source_identity_is_enforced(self) -> None:
         spec = _fake_policy_spec(
@@ -527,12 +549,12 @@ class TestRuntimeCompatibility(unittest.TestCase):
 
     def test_tactile_semantic_contract(self) -> None:
         expected = {
-            "representation": "xhand_sdk_raw_force_fx_fy_fz",
+            "representation": "xhand_sdk_raw_force_fx_fy_fz_bias_corrected",
             "finger_order": "thumb_index_mid_ring_pinky",
             "sensor_order": "xhand_sdk_sensor_data_order",
             "point_order": "xhand_sdk_sensor_data_raw_force_order",
             "axis_labels": "fx_fy_fz",
-            "unit": "sdk_scaled_unknown_si",
+            "unit": "xhand_sdk_native_unknown_si",
             "si_verified": False,
             "spatial_geometry_verified": False,
         }

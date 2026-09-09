@@ -1,4 +1,4 @@
-"""Processed-v14 schema, provenance, specifications, and strict validation."""
+"""Processed-v15 schema, provenance, specifications, and strict validation."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ from dexmani_real.planning.kinematics.fingertip import (
 from dexmani_real.planning.kinematics.pose import validate_canonical_rot6d
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 14
+PROCESSED_SCHEMA_VERSION = 15
 _PROVENANCE_DATASETS = (
     "source_row_index",
     "source_sample_index",
@@ -59,7 +59,10 @@ _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "fingertip_points": ((5, 3), np.dtype(np.float32)),
 }
 _FRAME_CHUNKED_DATASETS = frozenset(("rgb", "depth", "point_cloud"))
-_CONTACT_FORCE_UNIT = "sdk_scaled_unknown_si"
+# contact_force is the aggregate XHand SDK calc_force per finger, software-bias
+# corrected, in the SDK-native numeric scale (SI conversion unverified).
+_CONTACT_FORCE_REPRESENTATION = "xhand_sdk_calc_force_fx_fy_fz_bias_corrected"
+_CONTACT_FORCE_UNIT = "xhand_sdk_native_unknown_si"
 _CONTACT_FORCE_SI_VERIFIED = False
 _CONTACT_FORCE_FRAME = "xhand_sensor_native_axes_per_finger"
 _FINGERTIP_POINTS_FRAME = "xarm_base"
@@ -68,11 +71,11 @@ _ACTION_EE_FRAME = "xarm_base"
 # Only source-provable tactile semantics are persisted: SDK orders and axis
 # labels are facts of the xhand driver; SI units and taxel spatial geometry
 # are explicitly unverified.
-_TACTILE_FORCE_REPRESENTATION = "xhand_sdk_raw_force_fx_fy_fz"
+_TACTILE_FORCE_REPRESENTATION = "xhand_sdk_raw_force_fx_fy_fz_bias_corrected"
 _TACTILE_FORCE_SENSOR_ORDER = "xhand_sdk_sensor_data_order"
 _TACTILE_FORCE_POINT_ORDER = "xhand_sdk_sensor_data_raw_force_order"
 _TACTILE_FORCE_AXIS_LABELS = "fx_fy_fz"
-_TACTILE_FORCE_UNIT = "sdk_scaled_unknown_si"
+_TACTILE_FORCE_UNIT = "xhand_sdk_native_unknown_si"
 _TACTILE_FORCE_SI_VERIFIED = False
 _TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED = False
 
@@ -664,7 +667,7 @@ def _validate_processed_output_structure(
 def validate_processed_hdf5(
     path: str | Path, config: ProcessingConfig
 ) -> dict[str, Any]:
-    """Fail closed on a processed Real HDF5 v14 artifact."""
+    """Fail closed on a processed Real HDF5 v15 artifact."""
 
     artifact = Path(path)
     with h5py.File(artifact, "r") as source:
@@ -796,6 +799,8 @@ def validate_processed_hdf5(
             )
             or str(source.attrs.get("action_semantics", ""))
             != "teleop_published_joint_target"
+            or str(source.attrs.get("contact_force_representation", ""))
+            != _CONTACT_FORCE_REPRESENTATION
             or str(source.attrs.get("contact_force_unit", "")) != _CONTACT_FORCE_UNIT
             or contact_force_si_verified is not _CONTACT_FORCE_SI_VERIFIED
             or str(source.attrs.get("contact_force_frame", "")) != _CONTACT_FORCE_FRAME

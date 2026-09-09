@@ -59,7 +59,7 @@ class TestMaxFramesStopReason(unittest.TestCase):
 
 
 class TestSaveOutcome(unittest.TestCase):
-    def test_failure_commits_real_raw_v25_transaction(self):
+    def test_failure_commits_real_raw_v26_transaction(self):
         """Exercise disk IO and codec validation, with no sensors or SDKs."""
         import json
         import tempfile
@@ -119,7 +119,7 @@ class TestSaveOutcome(unittest.TestCase):
                 self.assertTrue((episode_path / "rgb.mp4").is_file())
                 self.assertTrue((episode_path / "depth.h5").is_file())
                 with h5py.File(episode_path / "data.h5", "r") as raw:
-                    self.assertEqual(raw["meta"].attrs["schema_version"], 25)
+                    self.assertEqual(raw["meta"].attrs["schema_version"], 26)
                     self.assertEqual(raw["meta"].attrs["num_frames"], 1)
                     self.assertTrue(raw["meta"].attrs["success"])
                     self.assertEqual(

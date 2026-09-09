@@ -24,6 +24,28 @@ RECORDING_TACTILE_MAX_AGE_NS = 250_000_000
 _NS_PER_SECOND = 1_000_000_000
 
 
+def _dense_tactile_fresh(hand_tactile: np.ndarray | None, *, anchor_ns: int) -> bool:
+    """Return whether the dense tactile frame is valid and causal to the anchor.
+
+    A non-fresh frame must be persisted as NaN rather than the worker's
+    zero-fill, so an invalid dense payload can never be mistaken for a valid
+    no-contact reading. This mirrors the deployment executor's gate and is the
+    single source for both the recorded ``tactile_fresh`` flag and the payload
+    gating in ``record_frame``/``record_held``.
+    """
+    if hand_tactile is None or hand_tactile.dtype.names is None:
+        return False
+    names = hand_tactile.dtype.names
+    if "fresh" not in names or "source_monotonic_ns" not in names:
+        return False
+    source_ns = int(hand_tactile["source_monotonic_ns"][0])
+    return (
+        int(hand_tactile["fresh"][0]) == 1
+        and 0 < source_ns <= anchor_ns
+        and anchor_ns - source_ns <= RECORDING_TACTILE_MAX_AGE_NS
+    )
+
+
 def stop_recording(
     recorder: RecorderClient | None,
     was_active: bool,
@@ -128,10 +150,13 @@ def _recording_provenance(
     )
 
     tactile_source_ns = _field(hand_tactile, "source_monotonic_ns")
-    tactile_fresh = (
-        _field(hand_tactile, "fresh") == 1
-        and 0 < tactile_source_ns <= anchor_ns
-        and anchor_ns - tactile_source_ns <= RECORDING_TACTILE_MAX_AGE_NS
+    tactile_fresh = _dense_tactile_fresh(hand_tactile, anchor_ns=anchor_ns)
+    # Aggregate ``hand_contact`` validity is independent of dense freshness: it
+    # comes from the hand-state aggregate flag and its own causal source time.
+    tactile_sum_fresh = (
+        _field(hand_state, "tactile_sum_valid") == 1
+        and 0 < hand_source_ns <= anchor_ns
+        and anchor_ns - hand_source_ns <= RECORDING_TACTILE_MAX_AGE_NS
     )
     return {
         "observation_anchor_monotonic_ns": anchor_ns,
@@ -140,6 +165,7 @@ def _recording_provenance(
         "vr_source_monotonic_ns": vr_source_ns,
         "camera_source_monotonic_ns": camera_source_ns,
         "observation_valid": observation_valid,
+        "tactile_sum_fresh": tactile_sum_fresh,
         "tactile_fresh": tactile_fresh,
         "tactile_source_monotonic_ns": tactile_source_ns,
         "tactile_calibrated": _field(hand_tactile, "calibrated") == 1,
@@ -194,10 +220,20 @@ def record_held(
             target_eef_rot6d.copy() if target_eef_rot6d is not None else None
         ),
     )
+    anchor_ns = (
+        time.monotonic_ns()
+        if observation_anchor_monotonic_ns is None
+        else int(observation_anchor_monotonic_ns)
+    )
+    dense_tactile = (
+        hand_tactile
+        if _dense_tactile_fresh(hand_tactile, anchor_ns=anchor_ns)
+        else None
+    )
     state = build_episode_state(
         arm_state,
         hand_state,
-        hand_tactile,
+        dense_tactile,
         timestamp_s=(
             None
             if observation_anchor_monotonic_ns is None
@@ -269,10 +305,20 @@ def record_frame(
         target_eef_pos=target_pos.copy(),
         target_eef_rot6d=quat_wxyz_to_rot6d(normalize_quat_wxyz(target_quat)),
     )
+    anchor_ns = (
+        time.monotonic_ns()
+        if observation_anchor_monotonic_ns is None
+        else int(observation_anchor_monotonic_ns)
+    )
+    dense_tactile = (
+        hand_tactile
+        if _dense_tactile_fresh(hand_tactile, anchor_ns=anchor_ns)
+        else None
+    )
     state = build_episode_state(
         arm_state,
         hand_state,
-        hand_tactile,
+        dense_tactile,
         timestamp_s=(
             None
             if observation_anchor_monotonic_ns is None

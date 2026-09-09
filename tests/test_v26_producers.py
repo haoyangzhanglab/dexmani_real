@@ -1,4 +1,4 @@
-"""Offline checks of real v25 producer inputs, without SDKs or workers."""
+"""Offline checks of real v26 producer inputs, without SDKs or workers."""
 
 from types import SimpleNamespace
 from unittest import mock
@@ -10,6 +10,7 @@ from dexmani_real.deployment.executor import PolicyExecutor
 from dexmani_real.ipc.schema import (
     ARM_STATE_DTYPE,
     HAND_STATE_DTYPE,
+    HAND_TACTILE_DTYPE,
     make_record_sample_dtype,
 )
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
@@ -108,7 +109,64 @@ def test_client_requires_explicit_submitted_arm_target():
         _client().add_frame(*_inputs())
 
 
-def test_teleop_active_and_ik_hold_reach_real_client_with_v25_fields():
+def _dense_tactile_frame(*, fresh: bool, source_ns: int, value: float = 7.0):
+    tactile = np.zeros(1, dtype=HAND_TACTILE_DTYPE)
+    tactile["fresh"][0] = int(fresh)
+    tactile["source_monotonic_ns"][0] = source_ns
+    tactile["tactile_force"][0] = value
+    return tactile
+
+
+def _record_dense_frame(client, hand_tactile, *, anchor_ns):
+    arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
+    hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
+    vr = _inputs()[2]
+    record_frame(
+        client,
+        arm,
+        hand,
+        np.zeros(7),
+        np.zeros(12),
+        np.zeros(3),
+        np.array([1, 0, 0, 0]),
+        vr,
+        None,
+        hand_tactile,
+        observation_anchor_monotonic_ns=anchor_ns,
+        max_observation_skew_s=0.1,
+    )
+    return decode_record_sample(client.shared.record_sample_ring.frame[0])
+
+
+def test_non_fresh_dense_tactile_persists_nan():
+    frame = _record_dense_frame(
+        _client(),
+        _dense_tactile_frame(fresh=False, source_ns=10**9),
+        anchor_ns=2 * 10**9,
+    )
+    assert np.isnan(frame.data["hand_tactile_force"]).all()
+
+
+def test_age_stale_dense_tactile_persists_nan():
+    # fresh=1 but the source is older than the 250ms recording age bound.
+    frame = _record_dense_frame(
+        _client(),
+        _dense_tactile_frame(fresh=True, source_ns=10**9),
+        anchor_ns=2 * 10**9,
+    )
+    assert np.isnan(frame.data["hand_tactile_force"]).all()
+
+
+def test_fresh_dense_tactile_persists_payload():
+    frame = _record_dense_frame(
+        _client(),
+        _dense_tactile_frame(fresh=True, source_ns=10**9, value=7.0),
+        anchor_ns=1_200_000_000,
+    )
+    assert np.all(frame.data["hand_tactile_force"] == 7.0)
+
+
+def test_teleop_active_and_ik_hold_reach_real_client_with_v26_fields():
     client = _client()
     arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
     arm["tracking_err"] = 0.125

@@ -1,4 +1,4 @@
-"""Transactional depth-to-color aligned raw-v25 to processed-v14 processing."""
+"""Transactional depth-to-color aligned raw-v26 to processed-v15 processing."""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ from dexmani_real.dataset.pointcloud import (
 from dexmani_real.dataset.processed import (
     _ACTION_EE_FRAME,
     _CONTACT_FORCE_FRAME,
+    _CONTACT_FORCE_REPRESENTATION,
     _CONTACT_FORCE_SI_VERIFIED,
     _CONTACT_FORCE_UNIT,
     _FINGERTIP_POINTS_FRAME,
@@ -328,6 +329,7 @@ def _write_attrs(
                 if visual_profile
                 else "newest_source_not_after_grid_within_max_observation_skew"
             ),
+            "contact_force_representation": _CONTACT_FORCE_REPRESENTATION,
             "contact_force_unit": _CONTACT_FORCE_UNIT,
             "contact_force_si_verified": _CONTACT_FORCE_SI_VERIFIED,
             "contact_force_frame": _CONTACT_FORCE_FRAME,
