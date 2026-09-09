@@ -45,6 +45,10 @@ class _FixtureReader:
         self.h5f.close()
 
 
+class _AnalysisControlSignal(BaseException):
+    """Verify process-control exceptions do not become episode decisions."""
+
+
 def _config(*, horizon: int = 16, min_full_windows: int = 1) -> ProcessingConfig:
     return ProcessingConfig(
         profile=OutputProfile.JOINT,
@@ -171,6 +175,132 @@ def test_unannotated_rejection_blocks_direct_library_call_by_default(
 
     with pytest.raises(ValueError, match="processing batch rejected"):
         process_episode_root(input_root, tmp_path / "processed", _config())
+
+
+def test_runtime_analysis_failure_skips_only_unannotated_episode_in_cli_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_root = tmp_path / "raw"
+    input_root.mkdir()
+    _write_episode(input_root, "episode_bad")
+    _write_episode(input_root, "episode_good")
+    analysis_calls, _analyzed, written = _install_publication_fakes(monkeypatch)
+    real_analyze = processing.analyze_episode
+    attempted: list[str] = []
+
+    def analyze_with_bad_episode(reader, *args, **kwargs):
+        attempted.append(reader.h5_path.name)
+        if reader.h5_path.name == "episode_bad":
+            raise RuntimeError("decoder failed for fixture")
+        return real_analyze(reader, *args, **kwargs)
+
+    monkeypatch.setattr(processing, "analyze_episode", analyze_with_bad_episode)
+    output_root = tmp_path / "processed"
+    report = process_episode_root(
+        input_root,
+        output_root,
+        _config(),
+        skip_rejected_unannotated=True,
+        task_name="canonical_task",
+    )
+
+    assert attempted == ["episode_bad", "episode_good"]
+    assert analysis_calls == ["episode_good"]
+    assert report["accepted_source_episode_count"] == 1
+    assert report["rejected_source_episode_count"] == 1
+    assert report["episodes"][0]["rejected_reason"] == (
+        "RuntimeError: decoder failed for fixture"
+    )
+    assert [decision.source_path.name for decision in written] == ["episode_good"]
+    assert output_root.joinpath("episode_good.h5").is_file()
+    assert not output_root.joinpath("episode_bad.h5").exists()
+
+
+def test_runtime_analysis_failure_with_explicit_include_blocks_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_root = tmp_path / "raw"
+    input_root.mkdir()
+    _write_episode(input_root, "episode_bad")
+    _write_episode(input_root, "episode_good")
+    annotations_path = tmp_path / "annotations.yml"
+    annotations_path.write_text(
+        "episodes:\n  episode_bad:\n    include: true\n",
+        encoding="utf-8",
+    )
+    _analysis_calls, _analyzed, written = _install_publication_fakes(monkeypatch)
+    real_analyze = processing.analyze_episode
+    attempted: list[str] = []
+
+    def analyze_with_bad_episode(reader, *args, **kwargs):
+        attempted.append(reader.h5_path.name)
+        if reader.h5_path.name == "episode_bad":
+            raise RuntimeError("decoder failed for fixture")
+        return real_analyze(reader, *args, **kwargs)
+
+    monkeypatch.setattr(processing, "analyze_episode", analyze_with_bad_episode)
+    output_root = tmp_path / "processed"
+
+    with pytest.raises(ValueError, match="processing batch rejected"):
+        process_episode_root(
+            input_root,
+            output_root,
+            _config(),
+            annotations_path=annotations_path,
+            skip_rejected_unannotated=True,
+        )
+
+    assert attempted == ["episode_bad", "episode_good"]
+    assert written == []
+    assert not output_root.exists()
+
+
+def test_runtime_analysis_failure_blocks_direct_library_call_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_root = tmp_path / "raw"
+    input_root.mkdir()
+    _write_episode(input_root, "episode_bad")
+    monkeypatch.setattr(processing, "EpisodeReader", _FixtureReader)
+
+    def analyze_with_failure(*_args, **_kwargs):
+        raise RuntimeError("decoder failed for fixture")
+
+    monkeypatch.setattr(processing, "analyze_episode", analyze_with_failure)
+    output_root = tmp_path / "processed"
+
+    with pytest.raises(ValueError, match="processing batch rejected"):
+        process_episode_root(input_root, output_root, _config())
+
+    assert not output_root.exists()
+
+
+@pytest.mark.parametrize("exception_type", (KeyboardInterrupt, _AnalysisControlSignal))
+def test_analysis_control_exceptions_are_not_converted_to_rejections(
+    exception_type: type[BaseException],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "raw"
+    input_root.mkdir()
+    _write_episode(input_root, "episode_bad")
+    monkeypatch.setattr(processing, "EpisodeReader", _FixtureReader)
+
+    def stop_analysis(*_args, **_kwargs):
+        raise exception_type("stop analysis")
+
+    monkeypatch.setattr(processing, "analyze_episode", stop_analysis)
+    output_root = tmp_path / "processed"
+
+    with pytest.raises(exception_type, match="stop analysis"):
+        process_episode_root(
+            input_root,
+            output_root,
+            _config(),
+            skip_rejected_unannotated=True,
+        )
+
+    assert not output_root.exists()
 
 
 def test_yaml_entry_without_include_remains_explicit_and_blocks(

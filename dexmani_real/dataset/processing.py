@@ -81,6 +81,18 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
+# Source-facing failures from HDF5/MP4 reading and deterministic cleaning reject
+# only the affected episode. Programming errors and process-control exceptions
+# remain fatal to the batch.
+_ANALYSIS_REJECTION_EXCEPTIONS = (
+    FileNotFoundError,
+    OSError,
+    ValueError,
+    KeyError,
+    RuntimeError,
+    IndexError,
+)
+
 
 def _derive_depth_valid_mask(reader: EpisodeReader) -> np.ndarray:
     depth = reader.h5f["depth"]
@@ -735,7 +747,7 @@ def process_episode_root(
                         source_already_validated=True,
                     )
                 )
-        except (FileNotFoundError, OSError, ValueError) as exc:
+        except _ANALYSIS_REJECTION_EXCEPTIONS as exc:
             logger.warning("episode analysis rejected %s", episode, exc_info=True)
             decisions.append(
                 _rejected_decision(episode, config, f"{type(exc).__name__}: {exc}")
