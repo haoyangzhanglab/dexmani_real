@@ -4,6 +4,26 @@
 （`episodes_processed/pick_place_toy/`）、`process_log/invalid_frames_report.json`、
 Policy Zarr 导出准入（`dexmani_real/dataset/export.py`）。全程离线分析，未连接硬件。
 
+> **后置修正（2026-09-09，随 camera/tactile integrity 修复）**：本文当时的三条结论已按
+> 修正后的根因改写，见下方「修正后的根因」与
+> [`camera_tactile_episode_integrity_fix_plan.md`](camera_tactile_episode_integrity_fix_plan.md)。
+> 当时采纳的「≤2 行内部缺口容忍」已被**回退**，导出端恢复为严格 whole-episode 准入
+> （raw v27 / processed v16 / Policy Zarr v9）：任何 source 行删除、内部缺口或时间/样本
+> 跳变整条拒绝，不再容忍内部瞬态缺口。
+
+## 修正后的根因
+
+1. **frame0 触觉缺口**不是 XHand 启动伪影：BEGIN 前代码已要求 tactile `fresh + calibrated +
+   recent`。真正根因是 recording 用 control-grid anchor `T` 取 tactile，而 visual processing
+   后来改用 camera source `C` 作 reference，通常 `C < H < T`；episode 开始前高频 tactile ring
+   history 未持久化进 raw，offline 无 row -1 可恢复。修复是在 recording 时直接按 camera
+   source 从高频 ring 选择并持久化 camera-aligned tactile。
+2. **中段相机标记**是 timing/reuse 事件，不是「真实坏帧」：`flag_camera_fresh=False` 可能只是
+   该 16 Hz grid tick 复用了仍然 recent 的上一 camera frame。payload 合法、source 因果、age 在
+   预算内、无 clock reset 时保留为 audit，只有 clock reset / delivery delay / 真正 stale /
+   payload 损坏才是 hard-invalid。
+3. **导出**不再做 `<=2` 内部缺口容忍：true hard-invalid 内部行 => 整份 processed HDF5 拒绝。
+
 ## 1. 范围与结论
 
 调试数据集导出时观察到以下现象：
@@ -20,14 +40,17 @@ Policy Zarr 导出准入（`dexmani_real/dataset/export.py`）。全程离线分
 
 1. `invalid_frames_report.json` 是**审计日志，不是淘汰名单**。清洗器接受了全部 61 条
    episode（0 条拒绝），整个数据集只删除了 70/14309 个 source 行（0.49%）。
-2. 帧 0 标记是**结构性启动时序伪影，数据本身健康**：相机曝光时间戳系统性早于触觉
-   采样时间戳，帧 0 没有更早的触觉行可供因果选择。不是传感器故障，不是录制 bug。
-3. 中段相机标记是**真实的 RealSense 单帧瞬态**（重复帧/时钟回跳/投递延迟），检测正确。
+2. 帧 0 标记是**结构性 grid-reference / camera-reference 对齐缺口，数据本身健康**：相机
+   曝光时间戳系统性早于触觉采样时间戳，帧 0 没有更早的触觉行可供因果选择。不是传感器
+   故障、不是 XHand 启动伪影（BEGIN 前 tactile 已 fresh+calibrated）。
+3. 中段相机标记是**观测到的 timing/reuse 事件**：`flag_camera_fresh=False` 可能只是复用了
+   仍然 recent 的 camera frame；payload causal/recent/healthy 时不应自动当作训练损坏。
 4. `long_ik_failure_hold` 是**唯一真正的数据质量事件**（机械臂逼近 workspace 边缘导致
    IK 持续失败），检测正确，该 episode 应当整条拒绝。
 5. 真正需要修复的缺陷在**导出端**：旧 `_whole_episode_rejection` 把"存在任何被删除的
-   source 行"一律整条拒绝，使 35 条仅丢失良性帧 0 的 episode 陪葬（57% 数据损失）。
-   已改为缺口容忍规则（§4），dry-run 实测 `Exported 60/61`，仅拒 `224527`。
+   source 行"一律整条拒绝，使 35 条仅丢失帧 0 的 episode 陪葬（57% 数据损失）。当时
+   改为缺口容忍规则（§4），dry-run 实测 `Exported 60/61`；该容忍规则现已**回退**为严格
+   whole-episode 准入（见顶部修正），帧 0 缺口改为在录制端根治。
 
 ## 2. 现场证据
 
@@ -85,13 +108,18 @@ tactile_source_rows[0] = -1
 `docs/raw_v24_migration.md` 早在 v24→v25 重构前就把"source row [0,1) 有
 tactile_invalid 和 nonfinite_real_modality"记录为已知预期行为。
 
-### 3.2 中段 `camera_invalid` + `observation_invalid`（真实相机瞬态）
+### 3.2 中段 `camera_invalid` + `observation_invalid`（timing/reuse 事件）
 
 RealSense 偶发重复帧/时钟回跳/投递延迟，`sensor/camera/worker.py` 的
 `_camera_health()` 将其分类为非 OK，`teleop/control_loop/camera_freshness.py` 的
 `CameraFreshnessTracker` 据此置 `flag_camera_fresh=False`；录制端 `observation_valid` 把相机新鲜度列为必需源
-（`episode_samples.py`），因此两个原因成对出现。这是采集链路如实上报的单帧丢失，
-8 条 episode 各损失 1–2 帧，处理端按合同将其从压紧数组中删除并形成段边界。
+（`episode_samples.py`），因此两个原因成对出现。
+
+**修正**：这些是 timing/reuse 事件，不是自动的训练损坏。`flag_camera_fresh=False` 可能只是
+该 16 Hz grid tick 复用了仍然 recent 的上一 camera frame（9 个受影响帧相对前一有效 camera
+source 的间隔仅 33.8–67.7 ms，远小于 250 ms 陈旧上限）。修复后 offline camera hard-invalid
+只看 source>0、source<=anchor、age<=budget、health 合法且非 CLOCK_RESET/DELIVERY_DELAY；
+`flag_camera_fresh` 与 `observation_valid` 降为 audit。
 
 ### 3.3 `long_ik_failure_hold`（真实异常，检测正确）
 
@@ -122,9 +150,14 @@ commit `fd7d275`（"0828 0 fix dataset export"）引入，用整条拒绝替代�
 
 ## 4. 修复措施
 
-### 4.1 新导出准入规则（缺口容忍，≤2 行）
+### 4.1 导出准入规则（已回退为严格 whole-episode）
 
-`_whole_episode_rejection` 改为纯结构化判定（`export.py`，常量
+> 本节描述的 `<=2` 内部缺口容忍规则已**回退**。当前 `_whole_episode_rejection`
+> （`export.py`，`POLICY_ZARR_SCHEMA_VERSION = 9`）只接受保留全部 source 行且 source 序列
+> 连续的 processed HDF5；`_MAX_TOLERATED_INTERIOR_GAP_ROWS` 已删除。任何 source 行删除、
+> 内部缺口或时间/样本跳变整条拒绝，不拆分、不压紧、不桥接。下面是当时的容忍规则，仅作历史记录。
+
+`_whole_episode_rejection` 当时改为纯结构化判定（`export.py`，常量
 `_MAX_TOLERATED_INTERIOR_GAP_ROWS = 2`）：
 
 - **首部裁剪恒容忍**：第一个保留行之前的任何丢弃（含帧 0 伪影）不破坏保留行连续性；

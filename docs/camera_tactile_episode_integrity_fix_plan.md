@@ -1347,11 +1347,25 @@ real success rate
 > 由 Claude Code 在实际实现完成后填写。保持简短。
 
 ```text
-Baseline commit:
-Implementation commits:
-Schema versions:
-Focused tests:
+Baseline commit:        b5128927d920cca09dde40d910bcde037ad70ba7 (main @ 2026-09-09)
+Implementation commits: 见 git log（本任务 5 个 phase commit）
+Schema versions:        raw v26 -> v27；processed v15 -> v16；Policy Zarr v8 -> v9
+Focused tests:          tests/test_recording_tactile_alignment.py (T1-T5)
+                        tests/test_processed_v15.py (C1-C5, P1-P3 camera/tactile)
+                        tests/test_zarr_v8_projection.py::TestWholeEpisodeStrictAdmission (E1-E6)
+                        tests/test_strict_export_end_to_end.py (raw->processed->Zarr)
+                        全量 pytest 417 passed
 Historical diagnostic result:
-Hardware validation performed: yes/no
+                        61 episodes；frame0 causal deficit = 41 episodes
+                        same-row/prev-row/older = 6078/8226/5
+                        camera-tactile lag p50/p95/p99/max = 38.3/64.3/66.4/98.8 ms
+                        flag_camera_fresh=false = 10 rows；camera hard old/proposed = 10/0
+                        episodes with hard-invalid = 43；exportable current/strict = 60/18
+                        episodes losing camera-only internal gap = 7
+Hardware validation performed: no（未连接 xArm7/XHand/RealSense/Quest）
 Unperformed checks / remaining hypotheses:
+                        H1 offline tactile extra lag 已由基线量化（~57.5% 行 previous-row）；
+                        H2 camera transient 放大 tactile lag 未获强支持（lag fresh ≈ not-new）；
+                        新 schema frame0 valid rate 需真机 10 条短 episode 验证；
+                        暗场 exposure 归因仍无法由历史 raw 证明。
 ```
