@@ -1,0 +1,2149 @@
+{
+  "schema_name": "dexmani-real-camera-tactile-alignment-baseline",
+  "schema_version": 1,
+  "input_root": "/home/zhanghaoyang/Desktop/dexmani_real/episodes/pick_place_toy",
+  "profile": "pointcloud",
+  "episode_count": 61,
+  "tactile": {
+    "frame0_causal_deficit_count": 41,
+    "same_row_selected_count": 6078,
+    "previous_row_selected_count": 8226,
+    "older_than_previous_row_count": 5,
+    "camera_minus_tactile_ms": {
+      "count": 14268,
+      "p50": 38.2799635,
+      "p90": 62.0296372,
+      "p95": 64.25902655,
+      "p99": 66.41135582,
+      "max": 98.793855
+    }
+  },
+  "camera": {
+    "flag_camera_fresh_false_count": 10,
+    "same_depth_frame_number_as_previous_count": 0,
+    "same_color_frame_number_as_previous_count": 0,
+    "camera_source_delta_ms": {
+      "count": 14248,
+      "p50": 66.612992,
+      "p90": 66.65321060000001,
+      "p95": 66.6796408,
+      "p99": 66.76128714000001,
+      "max": 88.235688
+    },
+    "camera_age_ms": {
+      "count": 14309,
+      "p50": 20.7844,
+      "p90": 34.2067796,
+      "p95": 35.96080839999999,
+      "p99": 48.86692248,
+      "max": 58.951321
+    }
+  },
+  "coupling": {
+    "tactile_lag_ms_when_camera_fresh": {
+      "count": 14258,
+      "p50": 38.2799635,
+      "p90": 62.03505450000001,
+      "p95": 64.26087580000001,
+      "p99": 66.41146122,
+      "max": 98.793855
+    },
+    "tactile_lag_ms_when_camera_not_new": {
+      "count": 10,
+      "p50": 38.645827,
+      "p90": 54.5454381,
+      "p95": 58.09897154999999,
+      "p99": 60.941798309999996,
+      "max": 61.652505
+    }
+  },
+  "episode_integrity": {
+    "episodes_with_hard_invalid": 43,
+    "exportable_current_rule": 60,
+    "exportable_strict_rule": 18
+  },
+  "proposed_camera_rule": {
+    "camera_hard_rows_old_rule": 10,
+    "camera_hard_rows_proposed_rule": 0,
+    "camera_rows_reclassified_to_audit": 10,
+    "episodes_losing_internal_gap": 7
+  },
+  "episodes": [
+    {
+      "episode": "episode_20260827_165510",
+      "source_frames": 272,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 156,
+        "previous_row_selected": 116,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 116,
+          "0": 156
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_165923",
+      "source_frames": 213,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 38,
+        "previous_row_selected": 175,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 175,
+          "0": 38
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_170035",
+      "source_frames": 245,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 82,
+        "previous_row_selected": 163,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 163,
+          "0": 82
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_170151",
+      "source_frames": 189,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 137,
+        "previous_row_selected": 52,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 52,
+          "0": 137
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_172155",
+      "source_frames": 189,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 42,
+        "previous_row_selected": 147,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 147,
+          "0": 42
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_172305",
+      "source_frames": 304,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 69,
+        "previous_row_selected": 235,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 235,
+          "0": 69
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 2,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 3,
+        "leading_invalid": 1,
+        "internal_invalid": 2,
+        "suffix_invalid": 0,
+        "segment_count": 2,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 2,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 2,
+        "internal_gap_disappears": true
+      }
+    },
+    {
+      "episode": "episode_20260827_172943",
+      "source_frames": 245,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 46,
+        "previous_row_selected": 199,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 199,
+          "0": 46
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_173314",
+      "source_frames": 222,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 151,
+        "previous_row_selected": 71,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 71,
+          "0": 151
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_173433",
+      "source_frames": 308,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 21,
+        "previous_row_selected": 287,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 287,
+          "0": 21
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_173921",
+      "source_frames": 224,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 104,
+        "previous_row_selected": 120,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 120,
+          "0": 104
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_174333",
+      "source_frames": 268,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 147,
+        "previous_row_selected": 121,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 121,
+          "0": 147
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_174534",
+      "source_frames": 247,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 181,
+        "previous_row_selected": 66,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 66,
+          "0": 181
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_174820",
+      "source_frames": 261,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 190,
+        "previous_row_selected": 71,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 71,
+          "0": 190
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_175240",
+      "source_frames": 301,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 144,
+        "previous_row_selected": 157,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 157,
+          "0": 144
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 2,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 3,
+        "leading_invalid": 1,
+        "internal_invalid": 2,
+        "suffix_invalid": 0,
+        "segment_count": 2,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 2,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 2,
+        "internal_gap_disappears": true
+      }
+    },
+    {
+      "episode": "episode_20260827_192032",
+      "source_frames": 221,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 77,
+        "previous_row_selected": 144,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 144,
+          "0": 77
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_192229",
+      "source_frames": 175,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 98,
+        "previous_row_selected": 77,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 77,
+          "0": 98
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_192410",
+      "source_frames": 193,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 110,
+        "previous_row_selected": 83,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 83,
+          "0": 110
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_192845",
+      "source_frames": 293,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 197,
+        "previous_row_selected": 96,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 96,
+          "0": 197
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_193023",
+      "source_frames": 238,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 132,
+        "previous_row_selected": 106,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 106,
+          "0": 132
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_193433",
+      "source_frames": 281,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 93,
+        "previous_row_selected": 188,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 188,
+          "0": 93
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_194029",
+      "source_frames": 237,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 92,
+        "previous_row_selected": 145,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 145,
+          "0": 92
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_194221",
+      "source_frames": 209,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 59,
+        "previous_row_selected": 150,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 150,
+          "0": 59
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_194525",
+      "source_frames": 286,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 35,
+        "previous_row_selected": 250,
+        "older_than_previous_row": 1,
+        "offset_histogram": {
+          "-2": 1,
+          "-1": 250,
+          "0": 35
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_194700",
+      "source_frames": 177,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 30,
+        "previous_row_selected": 147,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 147,
+          "0": 30
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_194849",
+      "source_frames": 230,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 81,
+        "previous_row_selected": 149,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 149,
+          "0": 81
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_195038",
+      "source_frames": 286,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 138,
+        "previous_row_selected": 148,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 148,
+          "0": 138
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_195250",
+      "source_frames": 185,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 62,
+        "previous_row_selected": 123,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 123,
+          "0": 62
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_195806",
+      "source_frames": 217,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 75,
+        "previous_row_selected": 142,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 142,
+          "0": 75
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_195951",
+      "source_frames": 318,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 156,
+        "previous_row_selected": 162,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 162,
+          "0": 156
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_202433",
+      "source_frames": 249,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 137,
+        "previous_row_selected": 112,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 112,
+          "0": 137
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_202621",
+      "source_frames": 331,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 178,
+        "previous_row_selected": 153,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 153,
+          "0": 178
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_202812",
+      "source_frames": 226,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 107,
+        "previous_row_selected": 119,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 119,
+          "0": 107
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_202939",
+      "source_frames": 193,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 56,
+        "previous_row_selected": 137,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 137,
+          "0": 56
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_203113",
+      "source_frames": 165,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 39,
+        "previous_row_selected": 122,
+        "older_than_previous_row": 4,
+        "offset_histogram": {
+          "-2": 4,
+          "-1": 122,
+          "0": 39
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_203242",
+      "source_frames": 235,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 115,
+        "previous_row_selected": 120,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 120,
+          "0": 115
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_215020",
+      "source_frames": 206,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 135,
+        "previous_row_selected": 71,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 71,
+          "0": 135
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_215545",
+      "source_frames": 216,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 155,
+        "previous_row_selected": 61,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 61,
+          "0": 155
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_215724",
+      "source_frames": 218,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 98,
+        "previous_row_selected": 120,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 120,
+          "0": 98
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_215901",
+      "source_frames": 244,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 115,
+        "previous_row_selected": 129,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 129,
+          "0": 115
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_220112",
+      "source_frames": 223,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 133,
+        "previous_row_selected": 90,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 90,
+          "0": 133
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 1,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 0,
+        "internal_invalid": 1,
+        "suffix_invalid": 0,
+        "segment_count": 2,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 1,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 1,
+        "internal_gap_disappears": true
+      }
+    },
+    {
+      "episode": "episode_20260827_220438",
+      "source_frames": 215,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 33,
+        "previous_row_selected": 182,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 182,
+          "0": 33
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_220636",
+      "source_frames": 205,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 41,
+        "previous_row_selected": 164,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 164,
+          "0": 41
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_220747",
+      "source_frames": 313,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 120,
+        "previous_row_selected": 193,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 193,
+          "0": 120
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 1,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 2,
+        "leading_invalid": 1,
+        "internal_invalid": 1,
+        "suffix_invalid": 0,
+        "segment_count": 2,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 1,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 1,
+        "internal_gap_disappears": true
+      }
+    },
+    {
+      "episode": "episode_20260827_220919",
+      "source_frames": 225,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 109,
+        "previous_row_selected": 116,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 116,
+          "0": 109
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 1,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 2,
+        "leading_invalid": 1,
+        "internal_invalid": 1,
+        "suffix_invalid": 0,
+        "segment_count": 2,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 1,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 1,
+        "internal_gap_disappears": true
+      }
+    },
+    {
+      "episode": "episode_20260827_221054",
+      "source_frames": 314,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 141,
+        "previous_row_selected": 173,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 173,
+          "0": 141
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_221217",
+      "source_frames": 261,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 76,
+        "previous_row_selected": 185,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 185,
+          "0": 76
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_221434",
+      "source_frames": 248,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 79,
+        "previous_row_selected": 169,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 169,
+          "0": 79
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_221554",
+      "source_frames": 188,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 127,
+        "previous_row_selected": 61,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 61,
+          "0": 127
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_221712",
+      "source_frames": 183,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 61,
+        "previous_row_selected": 122,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 122,
+          "0": 61
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_222159",
+      "source_frames": 259,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 38,
+        "previous_row_selected": 221,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 221,
+          "0": 38
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_222609",
+      "source_frames": 254,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 90,
+        "previous_row_selected": 164,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 164,
+          "0": 90
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_222727",
+      "source_frames": 236,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 129,
+        "previous_row_selected": 107,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 107,
+          "0": 129
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_222906",
+      "source_frames": 210,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 38,
+        "previous_row_selected": 172,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 172,
+          "0": 38
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_223431",
+      "source_frames": 199,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 123,
+        "previous_row_selected": 76,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 76,
+          "0": 123
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_223607",
+      "source_frames": 240,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 85,
+        "previous_row_selected": 155,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 155,
+          "0": 85
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 1,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 0,
+        "internal_invalid": 1,
+        "suffix_invalid": 0,
+        "segment_count": 2,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 1,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 1,
+        "internal_gap_disappears": true
+      }
+    },
+    {
+      "episode": "episode_20260827_223729",
+      "source_frames": 192,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 112,
+        "previous_row_selected": 80,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 80,
+          "0": 112
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 1,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 2,
+        "leading_invalid": 1,
+        "internal_invalid": 1,
+        "suffix_invalid": 0,
+        "segment_count": 2,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 1,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 1,
+        "internal_gap_disappears": true
+      }
+    },
+    {
+      "episode": "episode_20260827_224138",
+      "source_frames": 205,
+      "tactile": {
+        "frame0_causal_deficit": false,
+        "same_row_selected": 148,
+        "previous_row_selected": 57,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 57,
+          "0": 148
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 0,
+        "leading_invalid": 0,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": true
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_224317",
+      "source_frames": 190,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 80,
+        "previous_row_selected": 110,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 110,
+          "0": 80
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_224423",
+      "source_frames": 167,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 88,
+        "previous_row_selected": 79,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 79,
+          "0": 88
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260827_224527",
+      "source_frames": 197,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 65,
+        "previous_row_selected": 132,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 132,
+          "0": 65
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 1,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 21,
+        "leading_invalid": 1,
+        "internal_invalid": 20,
+        "suffix_invalid": 0,
+        "segment_count": 3,
+        "exportable_current_rule": false,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 1,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 1,
+        "internal_gap_disappears": false
+      }
+    },
+    {
+      "episode": "episode_20260908_212811",
+      "source_frames": 268,
+      "tactile": {
+        "frame0_causal_deficit": true,
+        "same_row_selected": 84,
+        "previous_row_selected": 184,
+        "older_than_previous_row": 0,
+        "offset_histogram": {
+          "-1": 184,
+          "0": 84
+        }
+      },
+      "camera": {
+        "flag_camera_fresh_false": 0,
+        "same_depth_frame_number_as_previous": 0,
+        "same_color_frame_number_as_previous": 0
+      },
+      "integrity": {
+        "hard_invalid_frames": 1,
+        "leading_invalid": 1,
+        "internal_invalid": 0,
+        "suffix_invalid": 0,
+        "segment_count": 1,
+        "exportable_current_rule": true,
+        "exportable_strict_rule": false
+      },
+      "camera_rule": {
+        "hard_rows_old_rule": 0,
+        "hard_rows_proposed_rule": 0,
+        "reclassified_rows": 0,
+        "internal_gap_disappears": false
+      }
+    }
+  ]
+}
