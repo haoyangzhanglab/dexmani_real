@@ -243,10 +243,14 @@ def test_visual_record_builder_owns_causal_feedback_freshness(source_ns, valid):
     for frame in (arm, hand):
         frame["source_monotonic_ns"] = source_ns
         frame["state_valid"] = True
-    shared = SimpleNamespace(arm_state_ring=object(), hand_state_ring=object())
+    shared = SimpleNamespace(
+        arm_state_ring=object(),
+        hand_state_ring=object(),
+        hand_tactile_ring=object(),
+    )
     with mock.patch(
         "dexmani_real.teleop.control_loop.grid.read_structured_frame_aligned_to_source",
-        side_effect=[(arm, source_ns, 1), (hand, source_ns, 1)],
+        side_effect=[(arm, source_ns, 1), (hand, source_ns, 1), None],
     ):
         signals = _recording_policy_observation_signals(
             shared,

@@ -119,7 +119,7 @@ class TestSaveOutcome(unittest.TestCase):
                 self.assertTrue((episode_path / "rgb.mp4").is_file())
                 self.assertTrue((episode_path / "depth.h5").is_file())
                 with h5py.File(episode_path / "data.h5", "r") as raw:
-                    self.assertEqual(raw["meta"].attrs["schema_version"], 26)
+                    self.assertEqual(raw["meta"].attrs["schema_version"], 27)
                     self.assertEqual(raw["meta"].attrs["num_frames"], 1)
                     self.assertTrue(raw["meta"].attrs["success"])
                     self.assertEqual(

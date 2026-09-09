@@ -20,8 +20,6 @@ from unittest import mock
 import h5py
 import numpy as np
 
-from dexmani_real.recording.storage.schema import validate_data_layout
-
 _CONVERTER_PATH = (
     Path(__file__).resolve().parents[1]
     / "tools"
@@ -231,21 +229,14 @@ class TestRawV25ToV26Conversion(unittest.TestCase):
                 if name in ("hand_contact", "hand_tactile_force"):
                     continue
                 np.testing.assert_array_equal(after[name][:], before[name][:])
-        # The migrated destination must satisfy the current v26 layout exactly.
+        # The migrated destination is the frozen v26 projection, not the current
+        # canonical schema: the converter stays pinned at v26 and never writes
+        # the v27 camera-health / camera-aligned-tactile fields.
         with h5py.File(destination / "data.h5", "r") as migrated:
-            shapes = {
-                name: migrated[name].shape
-                for name in migrated
-                if isinstance(migrated[name], h5py.Dataset)
+            names = {
+                name for name in migrated if isinstance(migrated[name], h5py.Dataset)
             }
-            dtypes = {
-                name: migrated[name].dtype
-                for name in migrated
-                if isinstance(migrated[name], h5py.Dataset)
-            }
-        self.assertEqual(
-            validate_data_layout(shapes, dtypes, frame_count=_FRAME_COUNT), ()
-        )
+        self.assertEqual(names, set(_CONVERTER.V26_DATASETS))
         # Source unchanged and media hard-linked.
         self.assertEqual(
             (source / "rgb.mp4").read_bytes(), (destination / "rgb.mp4").read_bytes()

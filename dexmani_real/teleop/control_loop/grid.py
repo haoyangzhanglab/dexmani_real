@@ -26,7 +26,11 @@ from dexmani_real.ipc.causal import (
     vr_frame_is_fresh,
 )
 from dexmani_real.ipc.channels import RuntimeChannels
-from dexmani_real.ipc.schema import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.ipc.schema import (
+    ARM_JOINT_SHAPE,
+    HAND_JOINT_SHAPE,
+    TACTILE_UNIT_CODE_XHAND_SDK_NATIVE,
+)
 from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.pose import (
@@ -379,11 +383,23 @@ def feedback_is_newer_than_pause(
 
 
 def _empty_policy_observation_signals() -> dict[str, object]:
-    """Return an explicit invalid policy-observation record."""
+    """Return an explicit invalid policy-observation record.
+
+    Invalid tactile payloads are persisted as NaN with a false valid flag and a
+    zero source timestamp, so an invalid reading can never be mistaken for a
+    valid no-contact reading downstream.
+    """
     return {
         "policy_observation_arm_qpos": np.full(ARM_JOINT_SHAPE, np.nan),
         "policy_observation_hand_qpos": np.full(HAND_JOINT_SHAPE, np.nan),
         "policy_observation_valid": False,
+        "policy_observation_contact_force": np.full((5, 3), np.nan),
+        "policy_observation_contact_force_valid": False,
+        "policy_observation_tactile_force": np.full((5, 120, 3), np.nan),
+        "policy_observation_tactile_force_valid": False,
+        "policy_observation_tactile_source_monotonic_ns": 0,
+        "policy_observation_tactile_calibrated": False,
+        "policy_observation_tactile_unit_code": 0,
     }
 
 
@@ -394,17 +410,23 @@ def _recording_policy_observation_signals(
     anchor_monotonic_ns: int,
     max_observation_skew_s: float,
 ) -> dict[str, object]:
-    """Pair causal arm/hand feedback with the recorded camera source time.
+    """Pair causal arm/hand/tactile feedback with the recorded camera source time.
 
     Teleoperation itself continues to use the latest feedback at the grid cut.
     This separate record is the observation a point-cloud policy will receive
     at deployment, so recording it prevents an offline train/deploy time shift.
+    The tactile pair (aggregate ``contact_force`` and dense ``tactile_force``)
+    is selected from the high-rate hand rings at the camera source time — the
+    same causal semantics the deployment observation builder uses — and stored
+    with its source/calibration/unit provenance so offline processing never has
+    to re-select across persisted rows.
     """
     signals = _empty_policy_observation_signals()
     if camera_frame is None:
         return signals
     reference_ns = int(camera_frame.get("source_monotonic_ns", 0))
     anchor_ns = int(anchor_monotonic_ns)
+    max_skew_ns = int(round(float(max_observation_skew_s) * 1e9))
     arm_result = read_structured_frame_aligned_to_source(
         shared.arm_state_ring,
         source_field="source_monotonic_ns",
@@ -413,6 +435,12 @@ def _recording_policy_observation_signals(
     )
     hand_result = read_structured_frame_aligned_to_source(
         shared.hand_state_ring,
+        source_field="source_monotonic_ns",
+        reference_source_monotonic_ns=reference_ns,
+        anchor_monotonic_ns=anchor_ns,
+    )
+    tactile_result = read_structured_frame_aligned_to_source(
+        shared.hand_tactile_ring,
         source_field="source_monotonic_ns",
         reference_source_monotonic_ns=reference_ns,
         anchor_monotonic_ns=anchor_ns,
@@ -447,13 +475,87 @@ def _recording_policy_observation_signals(
         return signals
     if (
         reference_ns - min(arm_source_ns, hand_source_ns)
-    ) > int(round(float(max_observation_skew_s) * 1e9)):
+    ) > max_skew_ns:
         return signals
+
+    # Aggregate ``contact_force`` comes from the hand-state aggregate flag; the
+    # dense ``tactile_force`` and calibration/unit provenance come from the
+    # tactile ring.  Both rings are published together with one source time, so
+    # the deployment source-match contract reduces to an equality check.
+    tactile_state = tactile_result[0] if tactile_result is not None else None
+    tactile_names = (
+        tactile_state.dtype.names or () if tactile_state is not None else ()
+    )
+    tactile_source_ns = (
+        int(tactile_state["source_monotonic_ns"][0])
+        if tactile_state is not None
+        else 0
+    )
+    tactile_calibrated = (
+        bool(tactile_state["calibrated"][0])
+        if tactile_state is not None and "calibrated" in tactile_names
+        else False
+    )
+    tactile_unit_code = (
+        int(tactile_state["unit_code"][0])
+        if tactile_state is not None and "unit_code" in tactile_names
+        else 0
+    )
+    tactile_fresh = (
+        bool(tactile_state["fresh"][0])
+        if tactile_state is not None and "fresh" in tactile_names
+        else False
+    )
+    tactile_force = (
+        np.asarray(tactile_state["tactile_force"][0], dtype=np.float64)
+        if tactile_state is not None and "tactile_force" in tactile_names
+        else np.full((5, 120, 3), np.nan)
+    )
+    tactile_sum = (
+        np.asarray(hand_state["tactile_sum"][0], dtype=np.float64)
+        if "tactile_sum" in hand_names
+        else np.full((5, 3), np.nan)
+    )
+    aggregate_valid = (
+        "tactile_sum" in hand_names
+        and "tactile_sum_valid" in hand_names
+        and bool(hand_state["tactile_sum_valid"][0])
+        and tactile_sum.shape == (5, 3)
+        and np.all(np.isfinite(tactile_sum))
+    )
+    provenance_valid = (
+        tactile_calibrated and tactile_unit_code == TACTILE_UNIT_CODE_XHAND_SDK_NATIVE
+    )
+    source_match = tactile_source_ns > 0 and tactile_source_ns == hand_source_ns
+    skew_ok = (
+        tactile_source_ns > 0 and reference_ns - tactile_source_ns <= max_skew_ns
+    )
+    contact_valid = aggregate_valid and provenance_valid and source_match and skew_ok
+    dense_valid = (
+        tactile_fresh
+        and provenance_valid
+        and source_match
+        and skew_ok
+        and tactile_force.shape == (5, 120, 3)
+        and np.all(np.isfinite(tactile_force))
+    )
+
     signals.update(
         {
             "policy_observation_arm_qpos": arm_qpos.copy(),
             "policy_observation_hand_qpos": hand_qpos.copy(),
             "policy_observation_valid": True,
+            "policy_observation_contact_force": (
+                tactile_sum.copy() if contact_valid else np.full((5, 3), np.nan)
+            ),
+            "policy_observation_contact_force_valid": bool(contact_valid),
+            "policy_observation_tactile_force": (
+                tactile_force.copy() if dense_valid else np.full((5, 120, 3), np.nan)
+            ),
+            "policy_observation_tactile_force_valid": bool(dense_valid),
+            "policy_observation_tactile_source_monotonic_ns": tactile_source_ns,
+            "policy_observation_tactile_calibrated": tactile_calibrated,
+            "policy_observation_tactile_unit_code": tactile_unit_code,
         }
     )
     return signals

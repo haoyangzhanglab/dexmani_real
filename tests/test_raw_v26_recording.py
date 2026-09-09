@@ -29,11 +29,23 @@ from tools.convert_raw_v24_to_v25 import KEEP_DATASETS
 
 
 def test_schema_matches_frozen_converter_projection():
-    # v26 adds exactly one aggregate freshness column over the frozen v24->v25
-    # converter projection (which still targets v25).
-    assert len(DATASET_SPECS) == 42
-    assert set(DATASET_SPECS) - set(KEEP_DATASETS) == {"tactile_sum_fresh"}
-    assert len(SOURCE_FRAME_DATASET_NAMES) == 38
+    # v26 added exactly one aggregate freshness column over the frozen v24->v25
+    # converter projection (which still targets v25).  v27 then added the
+    # persisted camera-health enum and the recording-time camera-aligned tactile
+    # policy-observation fields.
+    v27_added = {
+        "camera_health",
+        "policy_observation_contact_force",
+        "policy_observation_contact_force_valid",
+        "policy_observation_tactile_force",
+        "policy_observation_tactile_force_valid",
+        "policy_observation_tactile_source_monotonic_ns",
+        "policy_observation_tactile_calibrated",
+        "policy_observation_tactile_unit_code",
+    }
+    assert len(DATASET_SPECS) == 50
+    assert set(DATASET_SPECS) - set(KEEP_DATASETS) == {"tactile_sum_fresh"} | v27_added
+    assert len(SOURCE_FRAME_DATASET_NAMES) == 46
 
 
 def test_decoded_frame_owns_sample_ring_arrays():
@@ -262,7 +274,7 @@ def test_direct_rows_cross_batch_and_preserve_gap(tmp_path):
         path = _save(recorder)
         with EpisodeReader(path) as reader:
             f = reader.h5f
-            assert int(f["meta"].attrs["schema_version"]) == 26
+            assert int(f["meta"].attrs["schema_version"]) == 27
             np.testing.assert_array_equal(f["timestamp"][:], timestamps)
             np.testing.assert_array_equal(f["source_sample_index"][:], np.arange(35))
             np.testing.assert_array_equal(f["fill_reason"][:], 0)
@@ -285,7 +297,7 @@ def test_reader_rejects_old_schema_and_inconsistent_rows(tmp_path):
     with pytest.raises(ValueError, match="unsupported"):
         EpisodeReader(path)
     with h5py.File(path / "data.h5", "r+") as f:
-        f["meta"].attrs["schema_version"] = 26
+        f["meta"].attrs["schema_version"] = 27
         f["meta"].attrs["num_frames"] = 2
     with pytest.raises(ValueError, match="validity"):
         EpisodeReader(path)

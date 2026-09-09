@@ -1,11 +1,11 @@
-"""The only supported raw episode layout: physical source rows, schema v26."""
+"""The only supported raw episode layout: physical source rows, schema v27."""
 
 from dataclasses import dataclass
 from enum import IntEnum
 
 import numpy as np
 
-EPISODE_SCHEMA_VERSION = 26
+EPISODE_SCHEMA_VERSION = 27
 ARM_SENT_DATASET = "action_arm_joint_sent"
 
 
@@ -62,11 +62,24 @@ DATASET_SPECS = {
     "tactile_calibrated": _spec(np.bool_),
     "tactile_unit_code": _spec(np.uint8),
     "flag_camera_fresh": _spec(np.bool_),
+    # Persisted camera header health enum; ``flag_camera_fresh`` keeps its
+    # runtime "new + healthy + recent" semantics and is retained for audit.
+    "camera_health": _spec(np.uint8),
     "camera_depth_frame_number": _spec(np.uint64),
     "camera_color_frame_number": _spec(np.uint64),
     "policy_observation_arm_qpos": _spec(np.float64, (7,)),
     "policy_observation_hand_qpos": _spec(np.float64, (12,)),
     "policy_observation_valid": _spec(np.bool_),
+    # Recording-time camera-aligned tactile, selected from the high-rate hand
+    # rings at camera source time (mirrors deployment observation semantics).
+    # Invalid float payloads are persisted as NaN with the valid flag false.
+    "policy_observation_contact_force": _spec(np.float64, (5, 3)),
+    "policy_observation_contact_force_valid": _spec(np.bool_),
+    "policy_observation_tactile_force": _spec(np.float64, (5, 120, 3)),
+    "policy_observation_tactile_force_valid": _spec(np.bool_),
+    "policy_observation_tactile_source_monotonic_ns": _spec(np.uint64),
+    "policy_observation_tactile_calibrated": _spec(np.bool_),
+    "policy_observation_tactile_unit_code": _spec(np.uint8),
     "vr_wrist_pos": _spec(np.float64, (3,)),
     "vr_wrist_rot6d": _spec(np.float64, (6,)),
     "vr_landmarks": _spec(np.float64, (21, 3)),
