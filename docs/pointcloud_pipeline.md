@@ -48,7 +48,7 @@ Intel RealSense
                  ├─ pointcloud_ring → deployment / policy observation
                  └─ raw v25
                       ├─ raw visualizer → Rerun canonical preview
-                      └─ offline process → processed HDF5 v13 → Policy Zarr v7
+                      └─ offline process → processed HDF5 v14 → Policy Zarr v7
 ```
 
 实时 worker 不排队旧帧：它只读取 `camera_ring` 的最新 sequence。构建前检查候选帧的相机健康、
