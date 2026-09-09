@@ -135,6 +135,14 @@ tactile/reference provenance；v13 文件不做伪迁移，必须由已迁移的
 processed artifact 将它持久化在 `source_decision_json.source_path`。processed replay 只消费该路径，
 要求其下的 raw `data.h5` 存在；不推断或 fallback 到其他 source path。
 
+Dataset 拥有 processed task identity 合同：`task_name` 必须是非空、已去除首尾空白、无 ASCII 控制字符（C0/DEL）且
+不为 `unknown` 的字符串。处理入口按全局 override → annotation → raw `task_label` 解析一次；
+全局 override 与 annotation 的显式冲突仍拒绝。所有 accepted episodes 的 identity 必须一致，
+无效 task identity 或 mixed task batch 在创建发布 staging 前失败。普通 structural publication
+gate、完整 processed validator 和 Zarr artifact inspection 均验证该合同。Canonical processing
+CLI 还要求 output root basename 与 task identity 相同，以满足 Zarr CLI 的 expected task；
+direct library 仍可使用任意临时输出目录。
+
 删除无效 raw 行可能使压紧数组包含多个 source 连续段。v14 不把缺口两侧伪装成相邻时间步：
 `source_segment_ends` 明确记录每段边界，质量窗口只在段内计数。Policy Zarr 不再把这些段
 展开为多个训练 episode；一份 processed 文件只允许对应一个完整训练 episode。首部删除不

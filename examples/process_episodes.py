@@ -54,6 +54,7 @@ from dexmani_real.dataset.contracts import (
     ProcessingConfig,
     QualityPolicy,
     TemporalQualityConfig,
+    validate_processed_task_name,
 )
 from dexmani_real.dataset.processing import (
     discover_episode_dirs,
@@ -239,18 +240,20 @@ def _resolve_default_output_root(input_root: Path) -> Path:
     return Path("episodes_processed") / input_root.name
 
 
-def _validate_task_name(parser: argparse.ArgumentParser, task_name: str | None) -> None:
+def _validate_task_name(
+    parser: argparse.ArgumentParser,
+    task_name: str | None,
+    *,
+    label: str = "--task-name",
+) -> str | None:
     """Reject task labels that cannot identify one processed dataset."""
 
-    if task_name is not None and (
-        not task_name
-        or task_name != task_name.strip()
-        or task_name == "unknown"
-        or any(ord(char) < 32 for char in task_name)
-    ):
-        parser.error(
-            "--task-name must be non-empty, trimmed, printable, and not 'unknown'"
-        )
+    if task_name is None:
+        return None
+    try:
+        return validate_processed_task_name(task_name)
+    except (TypeError, ValueError) as exc:
+        parser.error(f"{label}: {exc}")
 
 
 def _write_annotations_yaml(
@@ -320,7 +323,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _route_library_logging_to_stderr()
     parser = _parser()
     args = parser.parse_args(argv)
-    _validate_task_name(parser, args.task_name)
+    task_name = _validate_task_name(parser, args.task_name)
     selected_profile = OutputProfile(args.profile)
     policy = QualityPolicy(args.quality_policy or QualityPolicy.AUDIT.value)
 
@@ -329,6 +332,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: input root is not a directory: {input_root}", file=sys.stderr)
         return 2
     output_root = args.output_root or _resolve_default_output_root(input_root)
+    expected_task_name = _validate_task_name(
+        parser,
+        output_root.name,
+        label="--output-root basename",
+    )
+    assert expected_task_name is not None
+    if task_name is not None and task_name != expected_task_name:
+        parser.error("--task-name must match the --output-root basename")
     try:
         episodes = discover_episode_dirs(input_root)
         annotations = load_annotations(args.annotations)
@@ -347,7 +358,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         name: annotation for name, annotation in annotations.items() if name in known
     }
     try:
-        validate_annotation_task_name_override(user_annotations, args.task_name)
+        validate_annotation_task_name_override(user_annotations, task_name)
     except (TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -395,7 +406,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         annotations_path=annotations_path,
                         dry_run=True,
                         skip_rejected_unannotated=True,
-                        task_name=args.task_name,
+                        task_name=task_name,
+                        expected_task_name=expected_task_name,
                     )
                 except (OSError, RuntimeError, TypeError, ValueError) as exc:
                     print(f"error: profile audit failed: {exc}", file=sys.stderr)
@@ -423,7 +435,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dry_run=args.dry_run,
                 verify_output=args.verify_output,
                 skip_rejected_unannotated=True,
-                task_name=args.task_name,
+                task_name=task_name,
+                expected_task_name=expected_task_name,
             )
         except Exception as exc:
             print(f"error: batch processing failed: {exc}", file=sys.stderr)

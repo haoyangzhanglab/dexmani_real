@@ -412,8 +412,13 @@ python examples/process_episodes.py \
   --dry-run
 ```
 
-确认后去掉 `--dry-run`。默认写入后只重新打开每个 processed HDF5，确认 schema、key、shape
-和 dtype 的结构完整性，再原子发布；如需在发布前完整扫描有限值、alignment 和 semantic
+确认后去掉 `--dry-run`。每个 accepted episode 的 task identity 按全局 `--task-name`、
+annotation `task_name`、raw `task_label` 的顺序解析；必须是非空、无首尾空白、无 ASCII 控制字符（C0/DEL）且
+不为 `unknown` 的字符串。整批 accepted episodes 必须只有一个 task identity；canonical CLI
+还要求 output root 的目录名与该 identity 相同（含显式 `--output-root`），不匹配时在发布前失败。
+使用 `--task-name` 改名时，需同时指定匹配的新 output root；direct library 不限制输出目录名。
+默认写入后只重新打开每个 processed HDF5，确认 schema、key、shape、dtype 和 task identity
+的结构完整性，再原子发布；如需在发布前完整扫描有限值、alignment 和 semantic
 attributes，显式加 `--verify-output`。所有 consumer/export 边界始终保持完整 validation。
 所有处理 profile 都校验自身的 raw 时序与质量；视觉 profile 还校验
 camera-source 对齐的 arm/hand policy observation 与同 source 已校准 tactile sum。所有 profile 的

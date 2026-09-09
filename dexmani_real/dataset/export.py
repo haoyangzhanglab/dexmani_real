@@ -21,7 +21,7 @@ import numpy as np
 import zarr
 
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.dataset.contracts import OutputProfile
+from dexmani_real.dataset.contracts import OutputProfile, validate_processed_task_name
 from dexmani_real.dataset.processed import (
     _ACTION_EE_FRAME,
     _CONTACT_FORCE_FRAME,
@@ -88,8 +88,8 @@ class PolicyZarrExportConfig:
             or not 0 <= self.compression_level <= 9
         ):
             raise ValueError("compression_level must be an integer in [0, 9]")
-        if self.expected_task_name is not None and not self.expected_task_name.strip():
-            raise ValueError("expected_task_name must be non-empty when provided")
+        if self.expected_task_name is not None:
+            validate_processed_task_name(self.expected_task_name)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -272,9 +272,10 @@ def _inspect_artifact(
         dt = float(source.attrs.get("dt", np.nan))
         if not np.isfinite(dt) or dt <= 0.0:
             raise ValueError(f"{path.name}: dt must be finite and positive")
-        task_name = _text(source.attrs.get("task_name", ""))
-        if not task_name or task_name == "unknown":
-            raise ValueError(f"{path.name}: explicit task_name is required")
+        try:
+            task_name = validate_processed_task_name(source.attrs.get("task_name", ""))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{path.name}: invalid task_name: {exc}") from exc
         if (
             config.expected_task_name is not None
             and task_name != config.expected_task_name

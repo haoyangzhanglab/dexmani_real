@@ -21,7 +21,7 @@ from dexmani_real.dataset.contracts import (
     TemporalQualityConfig,
 )
 from dexmani_real.dataset.processing import load_annotations, process_episode_root
-from examples import process_episodes
+from examples import export_policy_zarr, process_episodes
 
 
 class _FixtureReader:
@@ -85,16 +85,13 @@ def _install_publication_fakes(monkeypatch: pytest.MonkeyPatch):
         decision,
         output_root,
         _processing_config,
-        annotation,
         *,
-        task_name=None,
+        task_name,
     ):
         written.append(decision)
         path = output_root / f"{reader.h5_path.name}.h5"
         with h5py.File(path, "w") as output:
-            output.attrs["task_name"] = (
-                task_name or annotation.task_name or "fixture_task"
-            )
+            output.attrs["task_name"] = task_name
         return {
             "path": path.name,
             "source_episode": reader.h5_path.name,
@@ -384,6 +381,119 @@ def test_task_name_conflict_fails_before_source_analysis(
         )
 
 
+@pytest.mark.parametrize("task_name", ("", "unknown", " task ", "task\x7f"))
+def test_invalid_global_task_name_fails_before_source_analysis(
+    task_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "raw"
+    input_root.mkdir()
+    (input_root / "episode_unread").mkdir()
+
+    def reader_must_not_open(_: Path) -> None:
+        raise AssertionError("invalid global task_name reached source analysis")
+
+    monkeypatch.setattr(processing, "EpisodeReader", reader_must_not_open)
+    output_root = tmp_path / "processed"
+    with pytest.raises((TypeError, ValueError), match="processed task_name"):
+        process_episode_root(
+            input_root,
+            output_root,
+            _config(),
+            dry_run=True,
+            task_name=task_name,
+        )
+
+    assert not output_root.exists()
+
+
+@pytest.mark.parametrize("task_name", ("", "unknown", " task ", "task\x7f"))
+def test_episode_annotation_rejects_invalid_task_name(task_name: str) -> None:
+    with pytest.raises((TypeError, ValueError), match="processed task_name"):
+        EpisodeAnnotation(task_name=task_name)
+
+
+def test_episode_annotation_rejects_non_string_task_name() -> None:
+    with pytest.raises(TypeError, match="processed task_name"):
+        EpisodeAnnotation(task_name=object())
+
+
+@pytest.mark.parametrize("task_name", ("", "unknown", " task ", "task\x7f"))
+def test_invalid_raw_task_name_blocks_before_publication(
+    task_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "raw"
+    input_root.mkdir()
+    episode = _write_episode(input_root, "episode_bad_task")
+    with h5py.File(episode / "data.h5", "r+") as source:
+        source["meta"].attrs["task_label"] = task_name
+    monkeypatch.setattr(processing, "EpisodeReader", _FixtureReader)
+    output_root = tmp_path / "processed"
+
+    with pytest.raises(ValueError, match="processed task identity invalid"):
+        process_episode_root(
+            input_root,
+            output_root,
+            _config(),
+            skip_rejected_unannotated=True,
+        )
+
+    assert not output_root.exists()
+
+
+def test_mixed_annotation_task_names_block_batch_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_root = tmp_path / "raw"
+    input_root.mkdir()
+    _write_episode(input_root, "episode_foo")
+    _write_episode(input_root, "episode_bar")
+    annotations_path = tmp_path / "annotations.yml"
+    annotations_path.write_text(
+        "episodes:\n"
+        "  episode_foo:\n"
+        "    task_name: foo\n"
+        "  episode_bar:\n"
+        "    task_name: bar\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(processing, "EpisodeReader", _FixtureReader)
+    output_root = tmp_path / "processed"
+
+    with pytest.raises(ValueError, match="multiple task_name values"):
+        process_episode_root(
+            input_root,
+            output_root,
+            _config(),
+            annotations_path=annotations_path,
+        )
+
+    assert not output_root.exists()
+
+
+def test_expected_task_name_mismatch_blocks_before_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_root = tmp_path / "raw"
+    input_root.mkdir()
+    _write_episode(input_root, "episode_fixture")
+    monkeypatch.setattr(processing, "EpisodeReader", _FixtureReader)
+    output_root = tmp_path / "processed"
+
+    with pytest.raises(ValueError, match="does not match the expected output"):
+        process_episode_root(
+            input_root,
+            output_root,
+            _config(),
+            expected_task_name="other_task",
+        )
+
+    assert not output_root.exists()
+
+
 def test_audit_findings_do_not_remove_high_confidence_rows(tmp_path: Path) -> None:
     raw_path = tmp_path / "raw.h5"
     _write_raw_fixture(raw_path)
@@ -472,7 +582,7 @@ def test_cli_uses_one_batch_call_and_filters_unknown_annotations(
         return _cli_report(dry_run=kwargs["dry_run"])
 
     monkeypatch.setattr(process_episodes, "process_episode_root", process_once)
-    output_root = tmp_path / "processed"
+    output_root = tmp_path / "canonical_task"
     common_args = [
         str(input_root),
         "--output-root",
@@ -489,6 +599,7 @@ def test_cli_uses_one_batch_call_and_filters_unknown_annotations(
     assert normal_kwargs["dry_run"] is False
     assert normal_kwargs["skip_rejected_unannotated"] is True
     assert normal_kwargs["task_name"] == "canonical_task"
+    assert normal_kwargs["expected_task_name"] == "canonical_task"
 
     calls.clear()
     assert process_episodes.main([*common_args, "--compare-profiles"]) == 0
@@ -496,6 +607,30 @@ def test_cli_uses_one_batch_call_and_filters_unknown_annotations(
     assert {args[2] for args, _ in calls} == set(OutputProfile)
     assert all(kwargs["dry_run"] is True for _, kwargs in calls)
     assert all(kwargs["skip_rejected_unannotated"] is True for _, kwargs in calls)
+    assert all(kwargs["expected_task_name"] == "canonical_task" for _, kwargs in calls)
+
+
+def test_cli_rejects_task_name_output_root_mismatch(tmp_path: Path) -> None:
+    input_root = tmp_path / "raw"
+    input_root.mkdir()
+
+    with pytest.raises(SystemExit) as exc_info:
+        process_episodes.main(
+            [
+                str(input_root),
+                "--output-root",
+                str(tmp_path / "other_task"),
+                "--task-name",
+                "canonical_task",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+
+
+def test_export_cli_rejects_relative_task_directory() -> None:
+    with pytest.raises(ValueError, match="must name one task directory"):
+        export_policy_zarr._resolve_task_paths(Path(".."))
 
 
 def test_removed_write_report_option_is_rejected(tmp_path: Path) -> None:

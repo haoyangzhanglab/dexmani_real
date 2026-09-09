@@ -50,6 +50,26 @@ class OutputProfile(str, Enum):
         return tuple(keys)
 
 
+def validate_processed_task_name(value: str) -> str:
+    """Return one valid processed-artifact task identity.
+
+    Processed HDF5 and its Policy Zarr projection use this value as a shared
+    task identity. It is text metadata rather than a filesystem path component.
+    """
+
+    if not isinstance(value, str):
+        raise TypeError("processed task_name must be a string")
+    if not value:
+        raise ValueError("processed task_name must be non-empty")
+    if value != value.strip():
+        raise ValueError("processed task_name must not have surrounding whitespace")
+    if value == "unknown":
+        raise ValueError("processed task_name must not be 'unknown'")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("processed task_name must not contain control characters")
+    return value
+
+
 class QualityPolicy(str, Enum):
     """How temporal quality findings affect otherwise valid source rows."""
 
@@ -377,8 +397,8 @@ class EpisodeAnnotation:
     exclude_ranges: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
-        if self.task_name is not None and not self.task_name.strip():
-            raise ValueError("task_name must be non-empty when provided")
+        if self.task_name is not None:
+            validate_processed_task_name(self.task_name)
         for label, ranges in (
             ("include_ranges", self.include_ranges),
             ("exclude_ranges", self.exclude_ranges),

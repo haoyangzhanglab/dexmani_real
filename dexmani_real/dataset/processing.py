@@ -22,6 +22,7 @@ from dexmani_real.dataset.contracts import (
     EpisodeDecision,
     OutputProfile,
     ProcessingConfig,
+    validate_processed_task_name,
 )
 from dexmani_real.dataset.pointcloud import (
     RawEpisodePointCloudDeriver,
@@ -92,6 +93,7 @@ _ANALYSIS_REJECTION_EXCEPTIONS = (
     RuntimeError,
     IndexError,
 )
+_TASK_NAME_CANDIDATE_UNSET = object()
 
 
 def _derive_depth_valid_mask(reader: EpisodeReader) -> np.ndarray:
@@ -169,21 +171,36 @@ def load_annotations(path: str | Path | None) -> dict[str, EpisodeAnnotation]:
 
 def validate_annotation_task_name_override(
     annotations: Mapping[str, EpisodeAnnotation], task_name: str | None
-) -> None:
+) -> str | None:
     """Reject a batch task override that conflicts with an audited annotation."""
 
     if task_name is None:
-        return
-    if not isinstance(task_name, str):
-        raise TypeError("task_name must be a string or None")
-    if not task_name.strip():
-        raise ValueError("task_name must be non-empty when provided")
+        return None
+    resolved_task_name = validate_processed_task_name(task_name)
     for episode_name, annotation in sorted(annotations.items()):
-        if annotation.task_name is not None and annotation.task_name != task_name:
+        if (
+            annotation.task_name is not None
+            and annotation.task_name != resolved_task_name
+        ):
             raise ValueError(
-                f"--task-name={task_name!r} conflicts with annotation task_name="
+                f"--task-name={resolved_task_name!r} conflicts with annotation task_name="
                 f"{annotation.task_name!r} for {episode_name}"
             )
+    return resolved_task_name
+
+
+def _task_name_candidate(
+    reader: EpisodeReader,
+    annotation: EpisodeAnnotation,
+    task_name: str | None,
+) -> tuple[Any, bool]:
+    """Choose one task source and flag an unvalidated raw fallback."""
+
+    if task_name is not None:
+        return task_name, False
+    if annotation.task_name is not None:
+        return annotation.task_name, False
+    return reader.h5f["meta"].attrs.get("task_label", ""), True
 
 
 # Reserved subdirectory names under a task root that are never raw episode
@@ -250,17 +267,10 @@ def _write_attrs(
     reader: EpisodeReader,
     decision: EpisodeDecision,
     config: ProcessingConfig,
-    annotation: EpisodeAnnotation,
     *,
-    task_name: str | None = None,
+    task_name: str,
 ) -> None:
     meta = reader.h5f["meta"].attrs
-    resolved_task_name = (
-        task_name
-        or annotation.task_name
-        or str(meta.get("task_label", "")).strip()
-        or "unknown"
-    )
     visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
     output.attrs.update(
         {
@@ -294,7 +304,7 @@ def _write_attrs(
             ),
             "max_observation_skew_s": config.max_observation_skew_s,
             "action_semantics": "teleop_published_joint_target",
-            "task_name": resolved_task_name,
+            "task_name": task_name,
             "point_cloud_frame": (
                 "xarm_base" if config.profile.needs_pointcloud else "omitted"
             ),
@@ -435,9 +445,8 @@ def _write_processed_episode(
     decision: EpisodeDecision,
     output_root: Path,
     config: ProcessingConfig,
-    annotation: EpisodeAnnotation,
     *,
-    task_name: str | None = None,
+    task_name: str,
 ) -> dict[str, Any]:
     path = output_root / f"{reader.h5_path.name}.h5"
     selected = decision.selected_indices
@@ -453,7 +462,6 @@ def _write_processed_episode(
             reader,
             decision,
             config,
-            annotation,
             task_name=task_name,
         )
         _create_data_datasets(output, decision.selected_frames, config)
@@ -701,11 +709,14 @@ def process_episode_root(
     verify_output: bool = False,
     skip_rejected_unannotated: bool = False,
     task_name: str | None = None,
+    expected_task_name: str | None = None,
 ) -> dict[str, Any]:
     """Publish accepted episodes, preserving explicit annotation intent.
 
     Rejected unannotated episodes block direct library callers by default. The
     canonical CLI opts into skipping them with ``skip_rejected_unannotated``.
+    ``expected_task_name`` is an optional caller-owned output-root invariant;
+    direct library callers may leave it unset for arbitrary temporary paths.
     """
 
     if not isinstance(skip_rejected_unannotated, bool):
@@ -717,8 +728,17 @@ def process_episode_root(
         raise ValueError(
             f"annotations reference unknown episodes: {sorted(unknown_annotations)}"
         )
-    validate_annotation_task_name_override(annotations, task_name)
+    resolved_task_override = validate_annotation_task_name_override(
+        annotations, task_name
+    )
+    resolved_expected_task_name = (
+        None
+        if expected_task_name is None
+        else validate_processed_task_name(expected_task_name)
+    )
     decisions: list[EpisodeDecision] = []
+    resolved_episode_task_names: dict[Path, str] = {}
+    task_identity_errors: list[str] = []
     for episode in episodes:
         annotation = annotations.get(episode.name)
         if annotation is not None and not annotation.include:
@@ -729,29 +749,78 @@ def process_episode_root(
             )
             continue
         analysis_annotation = annotation or EpisodeAnnotation()
+        task_name_candidate: Any = _TASK_NAME_CANDIDATE_UNSET
+        raw_task_name_requires_validation = False
         try:
             with EpisodeReader(episode) as reader:
-                decisions.append(
-                    analyze_episode(
-                        reader,
-                        config,
-                        analysis_annotation,
-                        depth_valid_mask=(
-                            _derive_depth_valid_mask(reader)
-                            if (
-                                config.profile.needs_rgb
-                                or config.profile.needs_pointcloud
-                            )
-                            else None
-                        ),
-                        source_already_validated=True,
-                    )
+                decision = analyze_episode(
+                    reader,
+                    config,
+                    analysis_annotation,
+                    depth_valid_mask=(
+                        _derive_depth_valid_mask(reader)
+                        if (
+                            config.profile.needs_rgb
+                            or config.profile.needs_pointcloud
+                        )
+                        else None
+                    ),
+                    source_already_validated=True,
                 )
+                if decision.accepted:
+                    task_name_candidate, raw_task_name_requires_validation = (
+                        _task_name_candidate(
+                            reader,
+                            analysis_annotation,
+                            resolved_task_override,
+                        )
+                    )
         except _ANALYSIS_REJECTION_EXCEPTIONS as exc:
             logger.warning("episode analysis rejected %s", episode, exc_info=True)
             decisions.append(
                 _rejected_decision(episode, config, f"{type(exc).__name__}: {exc}")
             )
+            continue
+        decisions.append(decision)
+        if task_name_candidate is _TASK_NAME_CANDIDATE_UNSET:
+            continue
+        if not raw_task_name_requires_validation:
+            resolved_episode_task_names[decision.source_path] = task_name_candidate
+            continue
+        try:
+            resolved_episode_task_names[decision.source_path] = (
+                validate_processed_task_name(task_name_candidate)
+            )
+        except (TypeError, ValueError) as exc:
+            task_identity_errors.append(
+                f"{episode.name}: {type(exc).__name__}: {exc}"
+            )
+    if task_identity_errors:
+        raise ValueError(
+            "processed task identity invalid; no output published: "
+            + "; ".join(task_identity_errors)
+        )
+    accepted_task_names = {
+        resolved_episode_task_names[decision.source_path]
+        for decision in decisions
+        if decision.accepted
+    }
+    if len(accepted_task_names) > 1:
+        raise ValueError(
+            "processed batch has multiple task_name values; no output published: "
+            + ", ".join(sorted(accepted_task_names))
+        )
+    resolved_batch_task_name = next(iter(accepted_task_names), None)
+    if (
+        resolved_batch_task_name is not None
+        and resolved_expected_task_name is not None
+        and resolved_batch_task_name != resolved_expected_task_name
+    ):
+        raise ValueError(
+            "processed task_name does not match the expected output task identity; "
+            f"no output published: {resolved_batch_task_name!r} != "
+            f"{resolved_expected_task_name!r}"
+        )
     planned_names = [
         f"{decision.source_path.name}.h5" for decision in decisions if decision.accepted
     ]
@@ -810,7 +879,6 @@ def process_episode_root(
         for decision in decisions:
             if not decision.accepted:
                 continue
-            annotation = annotations.get(decision.source_path.name, EpisodeAnnotation())
             with EpisodeReader(decision.source_path) as reader:
                 outputs.append(
                     _write_processed_episode(
@@ -818,8 +886,7 @@ def process_episode_root(
                         decision,
                         staging,
                         config,
-                        annotation,
-                        task_name=task_name,
+                        task_name=resolved_episode_task_names[decision.source_path],
                     )
                 )
         validation = [
@@ -834,9 +901,11 @@ def process_episode_root(
             if verify_output
             else None
         )
-        with h5py.File(staging / outputs[0]["path"], "r") as first_output:
-            report_task_name = str(first_output.attrs["task_name"])
-        invalid_report = _invalid_frames_report(decisions, task_name=report_task_name)
+        assert resolved_batch_task_name is not None
+        invalid_report = _invalid_frames_report(
+            decisions,
+            task_name=resolved_batch_task_name,
+        )
         process_log = staging / "process_log"
         process_log.mkdir()
         with (process_log / "invalid_frames_report.json").open(

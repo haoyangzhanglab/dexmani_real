@@ -231,6 +231,9 @@ class TestZarrV7AdmissionFailClosed(unittest.TestCase):
             "tactile_force_representation", "wrong_representation"
         )
 
+    def test_invalid_task_name_rejected(self) -> None:
+        self._expect_export_rejects("task_name", "unknown")
+
 
 class TestWholeEpisodeGapTolerance(unittest.TestCase):
     """Pin _whole_episode_rejection gap tolerance on synthetic provenance.

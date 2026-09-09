@@ -24,6 +24,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tqdm import tqdm
 
+from dexmani_real.dataset.contracts import validate_processed_task_name
 from dexmani_real.dataset.export import (
     PolicyZarrExportConfig,
     export_processed_hdf5_to_zarr,
@@ -66,6 +67,13 @@ def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:
             "input_root must name one task directory, e.g. "
             "episodes_processed/pick_place_toy"
         )
+    try:
+        task_name = validate_processed_task_name(task_name)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "input_root must name one valid task directory, e.g. "
+            "episodes_processed/pick_place_toy"
+        ) from exc
     return Path("datasets") / f"{task_name}.zarr", task_name
 
 

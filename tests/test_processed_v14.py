@@ -147,7 +147,13 @@ def _process_fixture(
     )
     out_root = workdir / "processed"
     out_root.mkdir(parents=True, exist_ok=True)
-    _write_processed_episode(reader, decision, out_root, config, annotation)
+    _write_processed_episode(
+        reader,
+        decision,
+        out_root,
+        config,
+        task_name="fixture_task",
+    )
     out_path = out_root / f"{raw_path.name}.h5"
     return out_path, reader, decision, config
 
@@ -235,6 +241,23 @@ class TestProcessedV14Writer(unittest.TestCase):
         summary = _validate_processed_output_structure(self.out_path, self.config)
         self.assertEqual(summary["frames"], _FRAME_COUNT)
         validate_processed_hdf5(self.out_path, self.config)
+
+    def test_invalid_task_name_rejected_by_both_validators(self) -> None:
+        for invalid_task_name in ("", "unknown", " task ", "task\x7f"):
+            with self.subTest(task_name=repr(invalid_task_name)):
+                with tempfile.TemporaryDirectory() as tmp:
+                    workdir = Path(tmp) / "invalid-task"
+                    workdir.mkdir(parents=True)
+                    out_path, reader, _decision, config = _process_fixture(workdir)
+                    try:
+                        with h5py.File(out_path, "r+") as output:
+                            output.attrs["task_name"] = invalid_task_name
+                        with self.assertRaisesRegex(ValueError, "invalid task_name"):
+                            _validate_processed_output_structure(out_path, config)
+                        with self.assertRaisesRegex(ValueError, "invalid task_name"):
+                            validate_processed_hdf5(out_path, config)
+                    finally:
+                        reader.h5f.close()
 
     def test_schema_version_and_keys(self) -> None:
         self.assertEqual(PROCESSED_SCHEMA_VERSION, 14)

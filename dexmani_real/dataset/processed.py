@@ -17,7 +17,10 @@ from dexmani_real.config.pointcloud import (
     POINT_CLOUD_SAMPLING,
     POINT_CLOUD_TRANSFORM,
 )
-from dexmani_real.dataset.contracts import ProcessingConfig
+from dexmani_real.dataset.contracts import (
+    ProcessingConfig,
+    validate_processed_task_name,
+)
 from dexmani_real.dataset.pointcloud import validate_rigid_transform
 from dexmani_real.planning.kinematics.arm_fk import (
     EEF_POSE_ALGORITHM_ID,
@@ -72,6 +75,15 @@ _TACTILE_FORCE_AXIS_LABELS = "fx_fy_fz"
 _TACTILE_FORCE_UNIT = "sdk_scaled_unknown_si"
 _TACTILE_FORCE_SI_VERIFIED = False
 _TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED = False
+
+
+def _validate_processed_task_name_attr(attrs: Any, *, label: str) -> str:
+    """Read and validate the task identity at a persisted-artifact boundary."""
+
+    try:
+        return validate_processed_task_name(attrs.get("task_name", ""))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label}: invalid task_name: {exc}") from exc
 
 
 def validate_fingertip_points_semantics(
@@ -629,6 +641,7 @@ def _validate_processed_output_structure(
             raise ValueError(f"{artifact.name}: domain must be real")
         if str(source.attrs.get("profile", "")) != config.profile.value:
             raise ValueError(f"{artifact.name}: profile mismatch")
+        _validate_processed_task_name_attr(source.attrs, label=artifact.name)
         validate_fingertip_points_semantics(source.attrs, label=artifact.name)
         validate_eef_pose_semantics(source.attrs, label=artifact.name)
         validate_tactile_force_semantics(source.attrs, label=artifact.name)
@@ -729,8 +742,7 @@ def validate_processed_hdf5(
             raise ValueError(f"{artifact.name}: domain must be real")
         if str(source.attrs.get("profile", "")) != config.profile.value:
             raise ValueError(f"{artifact.name}: profile mismatch")
-        if str(source.attrs.get("task_name", "")).strip() in {"", "unknown"}:
-            raise ValueError(f"{artifact.name}: explicit task_name required")
+        _validate_processed_task_name_attr(source.attrs, label=artifact.name)
         if str(source.attrs.get("obs_alignment", "")) != "obs[t]_before_action[t]":
             raise ValueError(f"{artifact.name}: invalid observation/action alignment")
         visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
