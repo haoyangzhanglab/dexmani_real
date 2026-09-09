@@ -7,9 +7,9 @@
 
 ## 1. Goal and scope
 
-This task fixes the XHand tactile correctness path while keeping the system small and research-oriented.
+This task fixes the XHand tactile correctness path while keeping the mechanism small, explicit, and suitable for a personal research codebase.
 
-The target architecture is:
+Target architecture:
 
 ```text
 XHand SDK read_state
@@ -31,42 +31,44 @@ XHand SDK read_state
               Policy decides what to consume later
 ```
 
-This guide focuses only on the five confirmed/high-priority problems:
+The Real layer preserves sensor information. It must not prematurely choose whether a future policy consumes aggregate XYZ, magnitude, binary contact, dense tactile, or a learned tactile embedding.
+
+This guide focuses on five issues:
 
 1. `calc_force` and dense `raw_force` validity are incorrectly collapsed into one boolean.
 2. A contact-only policy is unnecessarily coupled to dense-tactile freshness.
-3. `calibrated=True` currently means only “bias arrays exist”; there is no post-bias verification.
-4. The pre-calibration load check uses dense raw taxels instead of checking both aggregate and dense signals.
+3. `calibrated=True` currently means only “bias arrays exist”; there is no independent post-bias verification.
+4. The current pre-calibration load heuristic uses uncalibrated force magnitude as if it were a reliable contact detector.
 5. The driver incorrectly multiplies both tactile representations by `0.1`; canonical Real data should use the XHand SDK-native numeric scale.
 
-The following are deliberately **out of scope** for this task:
+Out of scope:
 
-- choosing whether `dexmani_policy` should consume contact bits, magnitude, 15-D XYZ, or dense tactile;
-- tactile CNN / Transformer / taxel-token architecture;
+- choosing the final tactile representation in `dexmani_policy`;
+- tactile CNN / Transformer / taxel tokenization;
 - proving the 120-taxel spatial geometry (`10x12`, flips, rotations, etc.);
-- a high-rate tactile sidecar stream;
+- high-rate tactile sidecar recording;
 - changing causal alignment to interpolation;
-- enabling vendor `reset_sensor()` by default;
 - claiming Newton/SI units before physical calibration;
-- fixing host read-completion timestamp vs true sensor-acquisition timestamp.
-
-The Real repository must preserve both `calc_force [5,3]` and `raw_force [5,120,3]` so later policy ablations do not require recollecting data.
+- fixing host read-completion timestamp vs true sensor-acquisition timestamp;
+- adding a general sensor abstraction/framework.
 
 ---
 
-## 2. Fact-check: current repository behavior
+## 2. Fact-check and reference-project conclusions
 
-### 2.1 Current scale is wrong for the intended canonical representation
+### 2.1 Current DexMani Real scale
 
 Current `dexmani_real/robot/drivers/xhand.py` defines:
 
 ```python
 _TACTILE_SCALE = 0.1
+_TACTILE_BIAS_SAMPLE_COUNT = 5
+_TACTILE_BIAS_SAMPLE_INTERVAL_S = 0.02
 _TACTILE_CONTACT_THRESHOLD = 1.0
 _RAW_FORCE_CONTACT_THRESHOLD = 1.0
 ```
 
-and `_parse_tactile()` applies:
+and `_parse_tactile()` does:
 
 ```python
 tactile_force *= _TACTILE_SCALE
@@ -75,18 +77,20 @@ force_sum *= _TACTILE_SCALE
 
 before subtracting software biases.
 
-This means current canonical values are:
+Therefore current recorded values are mathematically:
 
 ```text
-stored = 0.1 * SDK_value - bias_in_scaled_space
+old_value = 0.1 * SDK_value - old_bias
+          = 0.1 * (SDK_value - mean(SDK_zero_samples))
 ```
 
-The repository previously removed the same `0.1` scale at commit
-`aa084a9b3a64fe38970154ea4595a6c3c56cbb67`, explicitly because it had no reference-project justification; the following tactile implementation at commit
-`16d3121dc5fd0d9d7ebe233ee03f75b5e6084fcc` returned SDK values without scaling.
-The `0.1` convention was later reintroduced into the current driver lineage.
+The `0.1` scale is not supported by the current repository's verified hardware semantics.
 
-### 2.2 PI-R2 reference behavior
+The repository previously removed the same scale at commit
+`aa084a9b3a64fe38970154ea4595a6c3c56cbb67` because it lacked reference-project justification. The following tactile implementation at commit
+`16d3121dc5fd0d9d7ebe233ee03f75b5e6084fcc` returned SDK tactile values without scaling.
+
+### 2.2 PI-R2: primary reference for this change
 
 Reference:
 
@@ -95,58 +99,72 @@ pi-r2-flow/pi-r2-flow
   deployment/mindex/robots/xhand_robot.py
 ```
 
-PI-R2 parses:
+PI-R2 parses directly:
 
 ```text
-sensor_data[k].calc_force   -> [5,3]
-sensor_data[k].raw_force    -> [5,120,3]
+sensor_data[k].calc_force -> [5,3]
+sensor_data[k].raw_force  -> [5,120,3]
 ```
 
-and does **not** multiply either representation by `0.1` (or any other sensor scale).
-Its canonical form is effectively:
+and does not multiply either representation by `0.1` or another numeric scale.
+Its effective canonical form is:
 
 ```text
 SDK numeric value - software bias
 ```
 
-PI-R2 also performs a post-bias residual check after its reset/bias sequence.
-Its code labels aggregate force as Newtons, but this repository must **not** copy that SI claim because we do not have independent calibration evidence for this installation.
-
-### 2.3 DexUMI reference behavior
-
-References:
+Its tactile zeroing path uses:
 
 ```text
-real-stanford/DexUMI
-  dexumi/hand_sdk/xhand/hand_api_cls.py
-  real_script/eval_policy/eval_xhand.py
+vendor reset_sensor()
+-> 5 fresh reads
+-> software mean bias for calc_force and raw_force
+-> fresh post-bias read
+-> verify per-finger ||calc_force|| <= 2.0
 ```
 
-DexUMI's native XHand deployment path also forwards SDK `calc_force` / `raw_force` values without `0.1` scaling.
-For policy input it computes aggregate magnitude and uses an empirical threshold of `10`:
+PI-R2 names the verification argument `verify_thresh_n=2.0` and comments it as Newtons. DexMani Real must **not** copy the SI/Newton claim because we do not have independent known-load calibration for this installation.
+
+What we do copy from PI-R2 is the engineering pattern:
 
 ```text
-contact = ||calc_force_xyz|| >= 10
+native SDK scale
++ software bias
++ small post-bias aggregate residual threshold
 ```
 
-Therefore the current DexMani Real pair:
+### 2.3 DexUMI: secondary reference only
+
+DexUMI's native XHand deployment path also forwards SDK `calc_force` / `raw_force` without `0.1` scaling.
+
+Its policy code computes:
 
 ```text
-scale = 0.1
-threshold = 1
+magnitude = ||calc_force_xyz||
+contact = magnitude >= 10
 ```
 
-is numerically equivalent **only for binary thresholding**:
+and its configuration documents `fsr_binary_cutoff=[10,10,10]` for XHand.
+
+This is only an empirical policy cutoff. DexUMI provides no evidence that:
 
 ```text
-0.1 * F > 1  <=>  F > 10
+10 SDK units == 10 N
 ```
 
-It does **not** justify rescaling the continuous sensor representation.
+and no evidence that `10` is a good threshold for DexMani Real's light-contact manipulation.
 
-### 2.4 Current partial-status handling is inconsistent with the repository's own hardware diagnostic
+Therefore:
 
-Current runtime `get_state()` does:
+- use DexUMI as evidence that native SDK scale is viable;
+- do **not** copy its contact cutoff as a hardware constant;
+- do **not** preserve the old `0.1*F > 1 <=> F > 10` boundary just for compatibility.
+
+Correctness and sensitivity to light contact are more important than preserving an arbitrary historical binary flag.
+
+### 2.4 Partial RS485 tactile status semantics
+
+Current production `get_state()` does:
 
 ```python
 tactile_valid = code == 0
@@ -155,9 +173,9 @@ tactile_sum_valid = tactile_valid
 tactile_valid = tactile_valid
 ```
 
-so error codes `1501018`, `1501019`, and `1501020` invalidate both aggregate and dense force.
+so `1501018`, `1501019`, and `1501020` currently invalidate both aggregate and dense force.
 
-But `examples/xhand_control_example.py` already encodes the more precise, RS485-verified semantics:
+But `examples/xhand_control_example.py` already implements the more precise RS485 semantics:
 
 | SDK code | Meaning | `calc_force` | `raw_force` |
 |---|---|---:|---:|
@@ -167,11 +185,13 @@ But `examples/xhand_control_example.py` already encodes the more precise, RS485-
 | `1501020` | temperature unavailable | valid | valid |
 | `1501070` | CRC uncertainty | invalid | invalid |
 
-The production driver should match this table for **serial / RS485**. Do not assume the same partial-status semantics for EtherCAT unless independently verified; for EtherCAT, keep tactile fail-closed on nonzero read status while still preserving usable joint feedback where the existing runtime allows it.
+The production driver should match this table for serial / RS485.
 
-### 2.5 Current contact-only deployment still depends on dense tactile
+Do not assume identical partial-status semantics for EtherCAT unless independently verified. For EtherCAT, keep tactile fail-closed on a nonzero read status while preserving usable joint feedback according to the existing runtime policy.
 
-The design already has separate streams:
+### 2.5 Contact-only deployment is still coupled to dense tactile
+
+Current rings already separate values:
 
 ```text
 hand_state_ring:
@@ -185,41 +205,59 @@ hand_tactile_ring:
     unit_code
 ```
 
-However `_build_tactile_frame()` currently writes:
+But `_build_tactile_frame()` currently writes:
 
-```python
-fresh = dense_valid
-calibrated = dense_valid and calibration_state
+```text
+fresh      = dense_valid
+calibrated = dense_valid AND calibration_state
 ```
 
-and contact-only deployment reads `fresh/calibrated/unit_code` from `hand_tactile_ring` as provenance.
-As a result, a `1501019` distributed-force failure prevents a contact-only policy from using otherwise-valid `calc_force`.
+and contact-only deployment reads these metadata from `hand_tactile_ring`.
 
-### 2.6 Current calibration is not verified
+So RS485 `1501019` still prevents an aggregate-only policy from consuming otherwise-valid `calc_force`.
 
-Current calibration:
+### 2.6 Current calibration state is weak
+
+Current calibration is:
 
 ```text
 clear biases
--> require full tactile at startup
--> capture 5 no-contact samples
+-> check startup force using an uncalibrated magnitude threshold
+-> capture 5 samples
 -> mean into aggregate/raw bias
 -> bias arrays exist == calibrated
 ```
 
-There is no independent fresh read after the bias is applied.
+There is no independent fresh read after applying the candidate bias.
 
-### 2.7 Current raw recording has only dense tactile freshness
+The pre-bias magnitude check is also conceptually weak:
+
+```text
+uncalibrated reading = unknown static sensor offset + external load
+```
+
+From a single absolute magnitude, software cannot reliably distinguish these two terms. Lowering that pre-bias threshold simply makes false rejection more likely.
+
+The better simple rule is procedural:
+
+```text
+operator ensures the hand is free / unloaded at startup
+-> capture bias
+-> verify post-bias residual with a small threshold
+```
+
+### 2.7 Current raw recording cannot represent aggregate-valid / dense-invalid
 
 Raw v25 stores both:
 
 ```text
-hand_contact        [N,5,3]       # actually SDK calc_force
-hand_tactile_force  [N,5,120,3]   # SDK raw_force
+hand_contact        [N,5,3]       # SDK calc_force representation
+hand_tactile_force  [N,5,120,3]   # SDK raw_force representation
 ```
 
-but has only one `tactile_fresh` field, sourced from `hand_tactile_ring.fresh`, i.e. dense validity.
-Therefore it cannot represent:
+but only one `tactile_fresh`, sourced from dense tactile validity.
+
+It cannot represent:
 
 ```text
 calc_force valid + raw_force invalid
@@ -231,34 +269,32 @@ without losing provenance.
 
 ## 3. Target invariants
 
-Implementations must preserve all of these invariants.
+### I1. Canonical tactile values use SDK-native numeric scale
 
-### I1. Canonical Real tactile values use SDK-native numeric scale
-
-After this change:
+After the fix:
 
 ```text
 aggregate = SDK calc_force - software aggregate bias
 dense     = SDK raw_force  - software dense bias
 ```
 
-There is no arbitrary `0.1` sensor scaling in the driver.
+No arbitrary sensor scaling is applied in the driver.
 
-Use the unit identity:
+Persist unit identity as:
 
 ```text
 xhand_sdk_native_unknown_si
 ```
 
-until physical calibration proves an SI conversion.
+until a known-load experiment proves an SI conversion.
 
-### I2. Aggregate and dense tactile remain separate canonical observations
+### I2. Store both representations
 
 Keep both:
 
 ```text
-calc_force  [5,3]
-raw_force   [5,120,3]
+calc_force [5,3]
+raw_force  [5,120,3]
 ```
 
 Do not derive one from the other and do not assume:
@@ -269,7 +305,7 @@ calc_force == raw_force.sum(axis=taxel)
 
 ### I3. Aggregate and dense validity are independent
 
-The runtime must be able to represent:
+The runtime must represent:
 
 ```text
 tactile_sum_valid=True
@@ -278,43 +314,56 @@ tactile_valid=False
 
 for RS485 `1501019`.
 
-### I4. Calibration is one shared state, but sample validity remains modality-specific
-
-The software calibration estimates both biases together. `calibrated=True` means the calibration procedure completed and passed verification.
-
-It does **not** mean a particular dense frame is valid.
-
-Therefore:
+### I4. Calibration state and frame validity are different concepts
 
 ```text
-calibrated   = calibration state
-fresh        = this dense sample is valid
-sum_fresh    = this aggregate sample is valid
+calibrated = startup calibration completed and passed post-bias verification
+sum_fresh  = aggregate payload from this source read is valid
+fresh      = dense payload from this source read is valid
 ```
 
-### I5. Contact-only deployment must not require dense tactile freshness
+### I5. Contact-only deployment must not require dense freshness
 
-If aggregate force is valid, calibrated, causal, and within skew/age constraints, a policy that requests only `contact_force` may run even when dense tactile is unavailable.
+A policy requesting only `contact_force` may run when aggregate force is valid, calibrated, causal, and recent even if dense tactile is unavailable.
 
-A policy requesting `tactile_force` must still fail closed when dense force is unavailable.
+A policy requesting `tactile_force` still rejects an invalid dense frame.
 
-### I6. Raw recording preserves enough information for either future policy choice
+### I6. Thresholds are derived heuristics, not physical units
 
-Raw data must persist both payloads and their modality-specific validity.
+Use two separate constants even if both initially equal `2.0`:
 
-### I7. Existing causal alignment stays unchanged
+```python
+_TACTILE_CONTACT_THRESHOLD = 2.0
+_TACTILE_CALIBRATION_RESIDUAL_THRESHOLD = 2.0
+```
 
-Do not replace the current newest-source-before-reference selection with linear interpolation.
+Both are in **XHand SDK-native unknown units**.
+
+They answer different questions:
+
+```text
+contact threshold:
+    is aggregate force large enough to expose a convenience contact bit?
+
+calibration residual threshold:
+    after bias subtraction, is aggregate no-contact residual still too large?
+```
+
+Do not create a dense-taxel contact threshold in this task.
+
+### I7. Existing causal alignment remains unchanged
+
+Do not replace newest-source-before-reference selection with interpolation.
 
 ### I8. Persisted semantic changes require version changes
 
-Do not silently reinterpret existing raw v25, processed v14, or Policy Zarr v7 numeric values.
+Do not silently reinterpret raw v25, processed v14, or Policy Zarr v7 numeric values.
 
 ---
 
 ## 4. Implementation design
 
-## 4.1 Phase A — fix the XHand driver first
+## 4.1 Phase A — driver scale, validity, and contact signal
 
 Primary file:
 
@@ -330,33 +379,39 @@ Delete:
 _TACTILE_SCALE = 0.1
 ```
 
-and delete both multiplications in tactile parsing.
+and remove both multiplications in tactile parsing.
 
-Do **not** replace it with `_TACTILE_SCALE = 1.0`; an identity scale is unnecessary state and invites future confusion.
+Do not replace it with `_TACTILE_SCALE = 1.0`.
 
-### A2. Restore thresholds to the native SDK numeric scale
+### A2. Use a smaller PI-R2-inspired aggregate contact threshold
 
 Use:
 
 ```python
-_TACTILE_CONTACT_THRESHOLD = 10.0
-_RAW_FORCE_CONTACT_THRESHOLD = 10.0
+_TACTILE_CONTACT_THRESHOLD = 2.0
 ```
 
-These are explicitly **SDK numeric units**, not Newtons.
-
-This preserves the previous effective binary boundary:
+Interpretation:
 
 ```text
-old: 0.1 * F > 1
-new:       F > 10
+2.0 XHand SDK-native units
 ```
 
-Do not introduce a new physical threshold in this task.
+not `2 N`.
+
+Rationale:
+
+- PI-R2 uses a small aggregate post-bias boundary of `2.0` on `||calc_force||`;
+- DexUMI's `10` is only an empirical binary policy cutoff and is too coarse as the default reference for light dexterous contact;
+- the runtime `tactile_contact` flag is derived convenience information, not canonical force data;
+- downstream policy experiments remain free to choose a different threshold or ignore the bit entirely.
+
+Do **not** add `_RAW_FORCE_CONTACT_THRESHOLD`.
+Dense raw taxels remain continuous sensor data, not a binary contact oracle.
 
 ### A3. Add one small modality-validity helper
 
-Use one pure helper owned by the driver, conceptually:
+Use one pure helper, conceptually:
 
 ```python
 def _tactile_validity(code: int | None, *, comm_type: str) -> tuple[bool, bool]:
@@ -378,13 +433,11 @@ EtherCAT:
   nonzero -> (False, False) for tactile
 ```
 
-Do not build a generic status-policy class or registry.
+Do not introduce a status registry/class hierarchy.
 
 ### A4. Split aggregate and dense parsing
 
-Current `_parse_tactile()` parses both together, so it cannot retain aggregate force when dense force is unavailable.
-
-Replace it with two narrow helpers:
+Replace the current combined parser with two narrow helpers:
 
 ```text
 _parse_tactile_sum(state)   -> [5,3]
@@ -393,69 +446,85 @@ _parse_tactile_force(state) -> [5,120,3]
 
 Both should reuse `_sensor_data(state)` and `_force_xyz(...)`.
 
-Do not duplicate sensor-list validation.
-
-### A5. Parse each modality independently in `get_state()`
+### A5. Parse both modalities independently
 
 Pseudo-flow:
 
 ```text
 read_state
   |
-  +-> parse joints (existing behavior)
+  +-> parse joints
   |
   +-> (sum_allowed, dense_allowed) = _tactile_validity(...)
           |
-          +-> parse sum independently; parser failure => sum_valid=False
+          +-> parse aggregate independently
           |
-          +-> parse dense independently; parser failure => dense_valid=False
+          +-> parse dense independently
 ```
 
-The resulting state must be able to contain:
+A malformed dense payload must not erase a valid aggregate payload.
 
-```text
-sum payload valid + dense payload zero-filled invalid
+Compute `tactile_contact` whenever `tactile_sum_valid=True`:
+
+```python
+np.linalg.norm(tactile_sum, axis=1) > _TACTILE_CONTACT_THRESHOLD
 ```
-
-Compute `tactile_contact` from aggregate force whenever `tactile_sum_valid` is true, not when dense force is valid.
-
-Do not weaken joint-state handling for partial tactile errors.
 
 ---
 
-## 4.2 Phase B — make calibration mean “verified calibration”
+## 4.2 Phase B — simplify and strengthen calibration
 
-Keep the mechanism software-only for this task. PI-R2's vendor `reset_sensor()` path is useful reference evidence but should remain a later A/B experiment rather than being introduced automatically now.
-
-### B1. Keep one calibration for both representations
-
-Calibration should still estimate:
+Primary file:
 
 ```text
-aggregate bias [5,3]
-dense bias     [5,120,3]
+dexmani_real/robot/drivers/xhand.py
 ```
 
-from the same five fresh no-contact reads.
+The calibration mechanism should mirror the useful PI-R2 structure without importing unnecessary complexity.
 
-### B2. Load detection checks aggregate OR dense
+### B1. Explicit no-contact startup precondition
 
-Current code checks dense taxels whenever dense is available and ignores aggregate force.
+Calibration is only valid when the operator starts the system with the fingertips unloaded.
 
-Replace with:
+Document/log this requirement clearly.
+
+Do **not** attempt to prove no-contact using a small threshold on **uncalibrated** absolute force. Before bias estimation:
 
 ```text
-aggregate_load = any(||calc_force[finger]|| > 10)  if sum valid
-dense_load     = any(||raw_force[taxel]|| > 10)    if dense valid
-load_present   = aggregate_load OR dense_load
+measured = unknown offset + external force
 ```
 
-The value `10` preserves the previous effective numerical boundary after removing `0.1`.
-It is a conservative startup heuristic in unknown SDK units, not a physical contact calibration.
+so a low numeric cutoff cannot reliably distinguish sensor offset from real contact.
 
-The calibration entry point should require both aggregate and dense payloads to be valid because this repository intentionally calibrates and records both canonical representations.
+Therefore remove `_tactile_load_present()` as a hard pre-bias admission gate rather than replacing `10` with another arbitrary small value.
 
-### B3. `_capture_tactile_bias()` should return candidate biases
+The startup calibration still requires:
+
+```text
+aggregate payload valid
+dense payload valid
+all values finite
+```
+
+because this repository deliberately calibrates and records both representations.
+
+### B2. Capture one shared five-read bias window
+
+Keep the existing compact sampling pattern:
+
+```text
+5 fresh reads
+~20 ms spacing
+```
+
+Estimate:
+
+```text
+bias_sum [5,3]
+bias_raw [5,120,3]
+```
+
+from the same reads.
 
 Prefer:
 
@@ -463,62 +532,99 @@ Prefer:
 bias_sum, bias_raw = _capture_tactile_bias()
 ```
 
-instead of publishing member state inside the helper.
-This makes the lifecycle explicit:
+so candidate biases are not published as successful calibration inside the capture helper.
+
+### B3. Publish candidate biases, then verify independently
+
+After candidate biases are assigned, collect:
 
 ```text
-capture candidate -> publish candidate -> verify -> keep or clear
+3 fresh verification reads
+~20 ms spacing
 ```
 
-No new class is needed.
-
-### B4. Add post-bias verification
-
-After publishing the candidate biases, perform a small independent verification window:
-
-```text
-3 fresh reads, ~20 ms apart
-```
-
-Require on every verification read:
+Every verification read must have:
 
 ```text
 tactile_sum_valid == True
 tactile_valid == True
+finite aggregate payload
+finite dense payload
 ```
 
-Compute:
+### B4. Verify aggregate residual with a small independent threshold
+
+Define:
+
+```python
+_TACTILE_CALIBRATION_RESIDUAL_THRESHOLD = 2.0
+```
+
+For the verification window compute:
 
 ```text
-aggregate_peak = max over reads/fingers ||calc_force||
-dense_peak     = max over reads/fingers/taxels ||raw_force||
+aggregate_peak = max over reads/fingers ||calc_force_bias_corrected||
 ```
 
-Initial acceptance boundary:
+Require:
 
 ```text
-aggregate_peak <= 10 SDK-native units
-dense_peak     <= 10 SDK-native units
+aggregate_peak <= 2.0 SDK-native units
 ```
 
-This intentionally reuses the already-established effective threshold rather than inventing a new unverified number.
-Later hardware characterization may tighten these limits.
+This follows PI-R2's use of a `2.0` aggregate post-bias residual boundary, but DexMani Real must keep the unit labeled unknown.
 
-If verification fails or raises:
+Do not reuse `_TACTILE_CONTACT_THRESHOLD` by name even though both initial values are `2.0`; they are separate semantics and should be independently tunable later.
+
+### B5. Dense tactile is verified structurally, not by an invented per-taxel threshold
+
+For dense `raw_force` during verification require:
 
 ```text
-clear both biases
-return False / raise the existing XHand calibration error as appropriate
+valid
+finite
+correct shape
 ```
 
-Only after verification succeeds may `tactile_calibrated` become externally observable as true.
+Optionally log diagnostic statistics such as:
 
-Do not add retry state machines. One calibration attempt plus a clear failure is sufficient; the operator can correct contact/load and restart.
+```text
+abs max
+p99 of per-taxel ||xyz||
+```
 
-### B5. Calibration logging
+but do **not** reject calibration based on a hard dense-taxel magnitude cutoff in this task.
 
-One concise success line is enough. Include aggregate/dense residual peaks if available.
-Do not add a health manager or long-running calibration telemetry.
+Reason:
+
+- PI-R2's hard verification is aggregate `calc_force`, not per-taxel raw force;
+- aggregate and dense representations may have different internal scaling/aggregation behavior;
+- a per-taxel threshold would be another unverified hardware assumption.
+
+### B6. Failure semantics
+
+If any verification read is invalid/non-finite or aggregate residual exceeds `2.0`:
+
+```text
+clear both candidate biases
+calibrated=False
+return False / raise existing calibration error as appropriate
+```
+
+Do not add retry state machines.
+One startup attempt with a clear failure is enough for this personal research system.
+
+### B7. `reset_sensor()` remains optional, not default
+
+PI-R2 calls vendor `reset_sensor()` before software biasing.
+DexUMI exposes the method but does not demonstrate it as a mandatory deployment path.
+
+For this task:
+
+- do not add a public runtime reset API;
+- do not require vendor reset for correctness;
+- keep software bias + post-bias verification as the default minimal path;
+- if later hardware tests show materially better repeatability with `reset_sensor()`, add it as a private startup calibration step in a separate change.
 
 ---
 
@@ -531,29 +637,28 @@ dexmani_real/robot/hand_worker.py
 dexmani_real/deployment/inference/observation.py
 ```
 
-### C1. Fix `HAND_TACTILE_DTYPE.calibrated` semantics at the producer
+### C1. Fix tactile-ring `calibrated` semantics
 
-Current `_build_tactile_frame()` writes:
+Current publication:
 
 ```text
 fresh      = dense_valid
 calibrated = dense_valid AND calibration_state
 ```
 
-Change it to:
+Change to:
 
 ```text
 fresh      = dense_valid
 calibrated = calibration_state
 ```
 
-`calibrated` is a property of the calibration state; `fresh` is a property of this dense payload.
+Calibration state and sample validity are independent concepts.
 
-This is the smallest change that preserves the existing separate ring while allowing its tiny metadata to prove calibration even on a frame where dense data is unavailable.
+### C2. Contact-only provenance reader ignores dense `fresh`
 
-### C2. Contact-only provenance reader must not gate on dense `fresh`
+`_read_tactile_provenance_history()` exists to avoid copying `[5,120,3]` for contact-only policies.
 
-`_read_tactile_provenance_history()` is used only to avoid copying `[5,120,3]` for contact-only policies.
 For this path require:
 
 ```text
@@ -563,9 +668,9 @@ causal source/publish timestamps
 age bound
 ```
 
-Do **not** require dense `fresh` there.
+Do not require dense `fresh`.
 
-Aggregate freshness is already independently enforced by the `hand_state_ring` reader through:
+Aggregate sample validity is already enforced from `hand_state_ring` by:
 
 ```text
 state_valid
@@ -573,21 +678,21 @@ tactile_sum_valid
 qpos_stale == False
 ```
 
-Keep the final source-timestamp identity check between aggregate history and tactile calibration/unit provenance.
+Keep exact aggregate/provenance source-timestamp identity.
 
-### C3. Dense-policy path remains strict
+### C3. Dense path stays strict
 
-`_read_tactile_force_history()` must continue to require:
+`_read_tactile_force_history()` continues to require:
 
 ```text
 fresh == True
 calibrated == True
-unit code matches
+unit matches
 causal and recent
 finite dense payload
 ```
 
-### C4. Required deployment behavior
+### C4. Required runtime behavior
 
 | Runtime situation | contact-only policy | dense-tactile policy |
 |---|---:|---:|
@@ -601,11 +706,11 @@ No padding or zero substitution is allowed for a requested invalid tactile modal
 
 ---
 
-## 4.4 Phase D — make raw storage represent both modalities correctly
+## 4.4 Phase D — raw v26 stores both payloads and both validity states
 
-Because numeric semantics change and aggregate/dense validity must be distinct, raw v25 must not be silently reused.
+Changing the numeric representation and validity contract must not silently reuse raw v25.
 
-### D1. Bump raw schema v25 -> v26
+### D1. Bump raw v25 -> v26
 
 File:
 
@@ -619,42 +724,42 @@ Set:
 EPISODE_SCHEMA_VERSION = 26
 ```
 
-Keep both existing payload datasets unchanged in shape and name:
+Keep payload names/shapes:
 
 ```text
-hand_contact        [N,5,3]       float64  # calc_force, historical name retained
+hand_contact        [N,5,3]       float64  # historical name; payload is calc_force
 hand_tactile_force  [N,5,120,3]   float64  # raw_force
 ```
 
-Do **not** rename `hand_contact` in this task; a field rename adds no correctness value and would expand the migration surface.
+Do not rename `hand_contact` in this task.
 
-### D2. Add exactly one new row-level validity field
+### D2. Add one aggregate freshness field
 
 Add:
 
 ```text
-tactile_sum_fresh  [N] bool
+tactile_sum_fresh [N] bool
 ```
 
 Meaning:
 
 ```text
-hand_contact on this row is a valid aggregate tactile sample from its source read
+hand_contact on this row is a valid aggregate tactile sample
 ```
 
-Keep existing:
+Clarify existing:
 
 ```text
 tactile_fresh [N] bool
 ```
 
-with the clarified meaning:
+as:
 
 ```text
 hand_tactile_force on this row is a valid dense tactile sample
 ```
 
-Keep the common fields:
+Keep common:
 
 ```text
 tactile_source_monotonic_ns
@@ -662,7 +767,7 @@ tactile_calibrated
 tactile_unit_code
 ```
 
-because aggregate and dense are sampled from the same XHand `read_state` call and share the same calibration state and numeric unit convention.
+because both payloads come from the same XHand `read_state` source and share one calibration state/unit convention.
 
 ### D3. Recording provenance
 
@@ -672,7 +777,7 @@ Update `_recording_provenance()` in:
 dexmani_real/teleop/episode_samples.py
 ```
 
-Compute aggregate freshness from `hand_state`:
+Aggregate freshness comes from:
 
 ```text
 hand_state.tactile_sum_valid
@@ -680,52 +785,43 @@ hand_state.tactile_sum_valid
 + recording tactile age bound
 ```
 
-Compute dense freshness from `hand_tactile.fresh` as today.
+Dense freshness continues to come from `hand_tactile.fresh`.
 
-Record both flags independently.
+### D4. Recording-start policy stays strict on both modalities
 
-### D4. Recording-start policy
+The collection intent is to preserve both aggregate and dense tactile.
 
-Keep the current recording-start gate strict on **dense** tactile freshness and successful calibration.
-The explicit collection intent is to preserve both representations, so starting a new official episode while dense tactile is unavailable should still be rejected.
+Therefore a new official recording session should still require:
 
-This is different from learned-policy deployment: a contact-only policy may continue under `1501019`, but a new data-collection episode intended to preserve both modalities should start only when both are healthy.
+```text
+calibrated
+aggregate healthy
+dense healthy
+```
 
-### D5. Unit semantics
+This is intentionally stricter than contact-only policy deployment.
 
-For raw v26 define code `0` as the single current canonical identity:
+### D5. Unit code
+
+Define code `0` as:
 
 ```text
 xhand_sdk_native_unknown_si
 ```
 
-Do not call it Newtons.
-
-Prefer one named constant at the IPC/storage contract boundary rather than scattering magic `0` checks, for example:
+Prefer one named constant, e.g.:
 
 ```python
 TACTILE_UNIT_CODE_XHAND_SDK_NATIVE = 0
 ```
 
-Do not introduce an enum hierarchy unless the codebase actually needs multiple units.
+Do not add an enum hierarchy for one value.
 
 ---
 
-## 4.5 Phase E — processed and Policy Zarr semantic versioning
-
-Changing the numeric scale propagates to persisted downstream artifacts.
-Following `AGENTS.md`, do not silently change their meaning.
+## 4.5 Phase E — processed v15 and Policy Zarr v8
 
 ### E1. Bump processed v14 -> v15
-
-Files include:
-
-```text
-dexmani_real/dataset/processed.py
-dexmani_real/dataset/processing.py
-docs/data_schema.md
-relevant processed tests
-```
 
 Keep both:
 
@@ -734,9 +830,7 @@ contact_force [T,5,3]
 tactile_force [T,5,120,3]
 ```
 
-in processed data.
-
-Update semantic identities to make the stored transform explicit:
+Update semantics:
 
 ```text
 contact_force representation:
@@ -755,27 +849,27 @@ spatial_geometry_verified for dense tactile:
   False
 ```
 
-Do not add magnitude/contact-bit datasets; those remain downstream derived features.
+Do not add magnitude or binary-contact datasets.
 
-For now processed v15 may continue to require both tactile payloads for each retained row, preserving the existing same-source paired research artifact. Raw v26 retains independent validity, so a future contact-only processing profile can be added without recollecting data if experiments justify it.
+For now processed v15 may continue to require both tactile payloads for retained rows, preserving the current paired research artifact. Raw v26 retains independent validity so a future contact-only processed profile can be added without recollection if needed.
 
-### E2. Keep same-source invariant
+### E2. Preserve same-source pairing
 
-Do not change the existing selector invariant:
+Keep:
 
 ```text
 contact_force[t] and tactile_force[t]
 come from the identical selected raw tactile source row
 ```
 
-Do not introduce separate nearest-neighbor matching for the two payloads.
+Do not independently nearest-match the two signals.
 
-### E3. Policy Zarr must also get a semantic version bump
+### E3. Bump Policy Zarr v7 -> v8
 
-Current Zarr v7 contains `contact_force`, so its numeric meaning also changes.
-Do not emit native-scale values while still labeling the artifact v7.
+Zarr v7 contains `contact_force`, whose numeric semantics change after removing `0.1`.
+Do not silently keep schema version 7.
 
-Create Policy Zarr v8 with the same current legacy key projection unless another task explicitly changes policy modalities:
+Zarr v8 keeps the current key projection unless another task explicitly changes policy modalities:
 
 ```text
 joint_state
@@ -786,98 +880,91 @@ fingertip_points
 + profile-dependent visual fields
 ```
 
-Do **not** add dense `tactile_force` to Zarr v8 in this task; the user has intentionally not selected the policy representation yet.
-
-The only reason for the v8 bump is the corrected `contact_force` numeric semantics.
-
-Any `dexmani_policy` loader/checkpoint contract update is a separate cross-repository task. Do not move Real acquisition or processing behavior into `dexmani_policy`.
+Do not add dense `tactile_force` to Zarr v8 yet.
+The user has intentionally not selected the policy tactile representation.
 
 ---
 
 ## 5. Historical raw episode repair
 
-Add a dedicated offline conversion tool:
+Add:
 
 ```text
 tools/convert_raw_v25_to_v26_tactile.py
 ```
 
-Model its transactional structure after the existing:
+Model its transaction structure after:
 
 ```text
 tools/convert_raw_v24_to_v25.py
 ```
 
-### 5.1 Never mutate the source by default
+### 5.1 Source is immutable by default
 
-Use the same source/destination workflow:
+CLI:
 
 ```bash
 python tools/convert_raw_v25_to_v26_tactile.py SOURCE DESTINATION
 ```
 
-Support:
+Support one episode or an episode root.
 
-```text
-one episode -> one destination episode
-episode root -> destination root
-```
+Use a process-owned staging directory, verify the result, then publish by rename.
+Preserve/hard-link `depth.h5` and `rgb.mp4` with the existing EXDEV copy fallback.
 
-Create a process-owned staging directory, verify the result, then rename atomically.
-Preserve/hard-link `depth.h5` and `rgb.mp4` using the same EXDEV fallback as the existing converter.
+Do not default to in-place mutation.
 
-Do not make in-place mutation the default; interrupted `*=10` writes can leave an episode partially converted.
+### 5.2 Direct v25 scale correction
 
-### 5.2 Exact scale correction for directly-recorded v25 episodes
-
-Direct raw v25 recording was introduced after the current `0.1`-scaled driver behavior was already present.
-For a direct v25 episode (`converted_from_schema` absent), convert:
+For directly-recorded v25 episodes (`converted_from_schema` absent):
 
 ```python
 hand_contact[...] *= 10.0
 hand_tactile_force[...] *= 10.0
 ```
 
-This is mathematically correct even with software bias:
+This is exact despite software bias:
 
 ```text
-old bias = mean(0.1 * SDK_zero)
-old saved = 0.1 * SDK - old bias
+old_bias  = mean(0.1 * SDK_zero)
+old_value = 0.1 * SDK - old_bias
           = 0.1 * (SDK - mean(SDK_zero))
 
-new target = SDK - mean(SDK_zero)
-           = 10 * old saved
+new_value = SDK - mean(SDK_zero)
+          = 10 * old_value
 ```
 
-For uncalibrated samples the same scale conversion still holds, and invalid zero-filled payloads remain zero.
+This migration factor is a representation correction only. It has nothing to do with the new contact/residual threshold of `2.0`.
 
-### 5.3 Populate the new aggregate-validity field
+### 5.3 Populate aggregate freshness conservatively
 
-The legacy runtime collapsed aggregate/dense validity, so directly-recorded v25 episodes can be migrated conservatively with:
+Legacy v25 collapsed aggregate/dense validity.
+Therefore migrate:
 
 ```text
 tactile_sum_fresh = tactile_fresh
 ```
 
-This does not invent information that v25 did not preserve.
+Do not invent aggregate-valid frames that v25 did not prove.
 
-### 5.4 Converted v24 -> v25 episodes require explicit scale classification
+### 5.4 v24-derived v25 requires explicit source-scale classification
 
-The existing `convert_raw_v24_to_v25.py` copies tactile payloads unchanged and writes:
+The existing v24 -> v25 tool copies tactile payloads unchanged and writes:
 
 ```text
 converted_from_schema = 24
 ```
 
-Historical raw v24 episodes span different code generations, so the v26 converter must **not** blindly multiply every converted v25 episode by 10.
+Historical v24 data spans different code generations. Do not guess scale from payload magnitude.
 
-Default behavior for `converted_from_schema == 24`:
+Default:
 
 ```text
-REFUSE with a clear message requiring explicit source-scale selection
+REFUSE converted_from_schema == 24
+unless source scale is explicitly supplied
 ```
 
-Provide one explicit option, for example:
+Suggested options:
 
 ```text
 --converted-v24-scale legacy-0.1
@@ -887,19 +974,21 @@ Provide one explicit option, for example:
 Behavior:
 
 ```text
-legacy-0.1 -> multiply tactile payloads by 10
-native     -> copy tactile payloads unchanged
+legacy-0.1 -> tactile payloads * 10
+native     -> tactile payloads unchanged
 ```
 
-In both cases populate `tactile_sum_fresh = tactile_fresh` conservatively because old artifacts do not prove independent aggregate freshness.
+In both cases:
 
-Do not guess from payload magnitude.
-Do not infer scale from task type or threshold statistics.
+```text
+tactile_sum_fresh = tactile_fresh
+```
 
-### 5.5 Derived artifacts are regenerated, not patched
+### 5.5 Regenerate derived artifacts
 
-Do not write migration tools for processed v14 or Policy Zarr v7.
-After raw conversion:
+Do not patch processed v14 or Zarr v7 in place.
+
+Use:
 
 ```text
 raw v26
@@ -907,13 +996,9 @@ raw v26
   -> regenerate Policy Zarr v8 if needed
 ```
 
-This keeps one source of truth and avoids repairing duplicated provenance/semantic metadata in multiple artifact layers.
-
 ---
 
 ## 6. Recommended file-level work plan
-
-Implement in this order so each phase has a narrow invariant.
 
 ### Phase 1 — driver correctness
 
@@ -926,16 +1011,17 @@ dexmani_real/robot/drivers/xhand.py
 Tasks:
 
 1. delete `_TACTILE_SCALE` and both multiplications;
-2. move thresholds `1.0 -> 10.0`;
-3. add RS485-aware `(sum_valid, dense_valid)` status helper;
-4. split aggregate and dense parsing;
-5. compute contact from `tactile_sum_valid`;
-6. change load detection to aggregate OR dense;
-7. make bias capture return candidate arrays;
-8. add 3-read post-bias verification;
-9. clear candidate biases on verification failure.
-
-Do not touch IPC/schema in this phase.
+2. set `_TACTILE_CONTACT_THRESHOLD = 2.0` SDK-native units;
+3. remove `_RAW_FORCE_CONTACT_THRESHOLD`;
+4. add RS485-aware `(sum_valid, dense_valid)` helper;
+5. split aggregate and dense parsing;
+6. compute contact from aggregate validity;
+7. remove the hard pre-bias magnitude load gate;
+8. keep explicit no-contact startup requirement;
+9. make bias capture return candidate arrays;
+10. add 3-read post-bias aggregate verification at independent threshold `2.0`;
+11. require dense verification frames to be valid/finite but do not invent a dense hard threshold;
+12. clear both candidate biases on verification failure.
 
 ### Phase 2 — runtime provenance decoupling
 
@@ -948,10 +1034,10 @@ dexmani_real/deployment/inference/observation.py
 
 Tasks:
 
-1. make `calibrated` independent of dense `fresh` in tactile-ring publication;
+1. make `calibrated` independent of dense `fresh`;
 2. contact-only metadata path ignores dense `fresh`;
-3. full-dense path remains unchanged/strict;
-4. preserve exact source-timestamp equality check.
+3. dense path remains strict;
+4. preserve source-timestamp identity checks.
 
 ### Phase 3 — raw v26 and migration
 
@@ -960,21 +1046,21 @@ Edit/add:
 ```text
 dexmani_real/recording/storage/schema.py
 dexmani_real/teleop/episode_samples.py
-dexmani_real/recording/frame.py     # only if needed by the new field
-dexmani_real/recording/storage/*    # only boundary code required by schema v26
+dexmani_real/recording/frame.py             # only if required by field plumbing
+dexmani_real/recording/storage/*            # only owning boundary code
 tools/convert_raw_v25_to_v26_tactile.py
 docs/data_schema.md
 ```
 
 Tasks:
 
-1. bump raw schema to 26;
-2. add `tactile_sum_fresh`;
-3. define native unknown unit semantics;
-4. implement transactional v25 -> v26 converter;
+1. raw schema 26;
+2. `tactile_sum_fresh`;
+3. native unknown unit semantics;
+4. transactional v25 -> v26 converter;
 5. keep both tactile payloads.
 
-### Phase 4 — processed v15 / Zarr v8 semantic propagation
+### Phase 4 — processed v15 / Zarr v8
 
 Edit:
 
@@ -988,27 +1074,19 @@ relevant tests
 
 Tasks:
 
-1. bump processed to v15;
-2. bump Policy Zarr to v8;
-3. update aggregate/dense representation strings and unit attrs;
-4. do not add dense tactile to Zarr yet;
-5. retain same-source tactile pairing.
-
-### Phase 5 — documentation cleanup
-
-After implementation, update stable user-facing references (`README.md`, `repo_map.md`) only where schema versions / supported workflow text actually changed.
-Do not keep this guide's baseline snapshot as a competing source of truth.
+1. processed v15;
+2. Policy Zarr v8;
+3. updated native-scale representation/unit attrs;
+4. no dense tactile in Zarr unless a later policy task requests it;
+5. retain same-source pairing.
 
 ---
 
 ## 7. Required tests
 
-Do not rely on hardware for normal CI/unit validation.
-Use fake SDK state/error objects for the driver paths.
+Use fake SDK state/error objects. Do not require hardware for unit validation.
 
 ### 7.1 Driver validity matrix
-
-Add focused tests that prove:
 
 | Comm | code | joints | sum | dense |
 |---|---:|---:|---:|---:|
@@ -1020,96 +1098,96 @@ Add focused tests that prove:
 | ethercat | `0` | valid | valid | valid |
 | ethercat | nonzero tactile-status code | preserve existing joint policy | invalid | invalid |
 
-Also test parser-level failure independence:
+Also prove:
 
 ```text
-malformed raw_force does not erase a valid calc_force
+malformed raw_force does not erase valid calc_force
 malformed calc_force does not fabricate aggregate validity
 ```
 
-### 7.2 Scale test
+### 7.2 Native-scale test
 
-For a fake SDK payload with known values:
+With zero bias, fake SDK values must emerge unchanged numerically.
+
+Example:
 
 ```text
 calc_force = [10,20,30]
-raw_force taxel = [4,5,6]
+raw taxel  = [4,5,6]
 ```
 
-with zero bias, assert exact native numeric output (no factor `0.1`).
-
-With known candidate bias, assert:
+With known bias:
 
 ```text
 output = SDK - bias
 ```
 
-### 7.3 Threshold-equivalence test
+No `0.1` factor remains.
 
-Prove the behavior that is intentionally preserved:
+### 7.3 Aggregate contact threshold test
+
+Test the new provisional threshold independently:
 
 ```text
-old scaled threshold: 0.1*F > 1
-new native threshold: F > 10
+||calc_force|| < 2.0  -> no contact
+||calc_force|| = 2.0  -> follow the implementation's explicit > / >= convention
+||calc_force|| > 2.0  -> contact
 ```
 
-for representative values below, at, and above the boundary.
+Do not test compatibility with the old effective cutoff `10`; behavior is intentionally allowed to become more sensitive.
 
 ### 7.4 Calibration tests
 
-Using deterministic fake fresh reads, test:
+Using deterministic fake reads, prove:
 
-1. no-load capture + low residual -> calibrated;
-2. aggregate startup load -> refused;
-3. localized dense startup load -> refused;
-4. verification aggregate residual > threshold -> biases cleared;
-5. verification dense residual > threshold -> biases cleared;
-6. incomplete aggregate/dense payload during capture -> failure;
-7. incomplete payload during verification -> failure and biases cleared.
+1. valid five-read bias capture + three low-residual verification reads -> calibrated;
+2. verification aggregate residual > `2.0` -> biases cleared;
+3. invalid aggregate payload during capture -> failure;
+4. invalid dense payload during capture -> failure;
+5. invalid/non-finite aggregate verification payload -> failure and biases cleared;
+6. invalid/non-finite dense verification payload -> failure and biases cleared;
+7. dense verification magnitude alone does not fail calibration when it is valid/finite;
+8. no pre-bias absolute-magnitude contact gate remains.
 
 ### 7.5 Contact-only deployment regression
 
-Extend `tests/test_deployment_eef_tactile.py` with the critical case:
+Critical case:
 
 ```text
-hand_state aggregate:
+hand_state:
     tactile_sum_valid=True
     source=t
 
 hand_tactile metadata:
-    fresh=False           # dense unavailable
+    fresh=False
     calibrated=True
     unit=native
     source=t
 
-Policy requests contact_force only
-=> observation succeeds
+contact_force-only policy
+=> succeeds
+
+tactile_force policy
+=> rejects
 ```
 
-Then prove:
+### 7.6 Raw migration tests
 
-```text
-same inputs + Policy requests tactile_force
-=> observation rejected
-```
+Synthetic direct v25 episode:
 
-### 7.6 Raw v26 migration tests
-
-Add a focused converter test using a synthetic episode:
-
-- direct v25: both tactile payloads become exactly `old * 10`;
-- all non-tactile datasets remain bit-identical;
+- both tactile payloads exactly `old * 10`;
+- all non-tactile datasets bit-identical;
 - `tactile_sum_fresh == old tactile_fresh`;
 - schema becomes 26;
-- source episode remains unchanged;
-- converted-from-v24 input is refused without explicit scale option;
-- `legacy-0.1` option scales by 10;
-- `native` option preserves values;
-- staging cleanup occurs on failure.
+- source remains unchanged;
+- v24-derived input refuses without explicit scale option;
+- `legacy-0.1` scales;
+- `native` preserves values;
+- failed conversion removes staging output.
 
 ### 7.7 Processed / Zarr tests
 
-Update existing processed and Zarr projection tests to prove:
+Prove:
 
 ```text
 processed v15 contact_force == selected raw v26 hand_contact
@@ -1117,14 +1195,18 @@ processed v15 tactile_force == selected raw v26 hand_tactile_force
 Policy Zarr v8 contact_force == processed v15 contact_force
 ```
 
-and unit semantics are exactly:
+and:
 
 ```text
-xhand_sdk_native_unknown_si
-si_verified=False
+unit = xhand_sdk_native_unknown_si
+si_verified = False
 ```
 
-Do not add an assertion that `contact_force == tactile_force.sum(...)`.
+Never assert:
+
+```text
+contact_force == tactile_force.sum(...)
+```
 
 ---
 
@@ -1136,18 +1218,17 @@ Before editing:
 git status --short
 ```
 
-At minimum after the corresponding phases:
+After relevant phases:
 
 ```bash
 python -m compileall -q dexmani_real tools examples
 python -m unittest tests.test_deployment_eef_tactile
 python -m unittest tests.test_tactile_selector
-python -m unittest tests.test_processed_v14   # rename/update as appropriate for v15
-python -m unittest tests.test_zarr_v7_projection  # rename/update as appropriate for v8
 ```
 
 Run the new focused driver/calibration/migration tests explicitly.
-Then run the repository's current offline unit suite if practical:
+Update/rename processed and Zarr tests with their schema versions as appropriate.
+Then, if practical:
 
 ```bash
 python -m unittest discover -s tests
@@ -1161,70 +1242,99 @@ git diff --stat
 git status --short
 ```
 
-Do not run XHand hardware-affecting examples automatically.
+Do not automatically run XHand hardware-affecting examples.
 
 ---
 
 ## 9. Manual hardware verification after code review
 
-This is not part of automated Codex/Claude execution unless the user explicitly asks to run hardware.
+Do this only when explicitly requested.
 
-When performed manually, use a stationary/no-motion tactile read workflow and verify:
+Use a stationary tactile-read workflow; no robot motion is needed.
 
-1. no-contact values are near zero after calibration;
-2. pressing one finger changes the corresponding aggregate force and dense taxels;
-3. `1501019` (if reproducible) leaves aggregate force readable while dense force is marked invalid;
-4. contact threshold `10` behaves approximately like the previous `scale=0.1, threshold=1` configuration;
-5. no code or documentation labels the value as Newtons without calibration evidence.
+### 9.1 Startup calibration
 
-Known-load SI calibration and taxel geometry characterization are separate experiments.
+With fingertips free/unloaded:
+
+1. run multiple startup calibrations;
+2. inspect post-bias per-finger aggregate norms;
+3. verify the `2.0` residual threshold is not producing routine false failures;
+4. record aggregate residual mean/max and dense p99/max for later characterization.
+
+### 9.2 Light-contact sensitivity
+
+After calibration, apply very light fingertip contact and inspect:
+
+```text
+||calc_force||
+tactile_contact at threshold 2.0
+dense taxel activation
+```
+
+The purpose is not to prove Newton units. It is to verify that `2.0` is a useful provisional sensitivity for this hardware rather than the much coarser DexUMI cutoff `10`.
+
+### 9.3 Threshold adjustment rule
+
+If no-contact residuals frequently exceed `2.0`, do not silently increase all thresholds together.
+Measure the distribution first and adjust:
+
+```text
+contact threshold
+calibration residual threshold
+```
+
+independently.
+
+A later characterization task can replace fixed defaults with evidence from repeated no-contact and light-contact trials.
 
 ---
 
 ## 10. Explicit non-goals / reject these implementation directions
 
-Codex / Claude Code should reject the following unless a new task explicitly requests them:
-
-- Do not keep `0.1` in the driver as “normalization”. ML normalization belongs downstream.
+- Do not keep `0.1` in the driver as ML normalization.
+- Do not call SDK numeric values Newtons without physical calibration.
+- Do not copy DexUMI's `10` cutoff as the default contact threshold.
+- Do not introduce a dense raw-force contact threshold merely because the old driver had one.
 - Do not reduce canonical Real data to binary contact.
-- Do not drop dense tactile because the current policy does not yet consume it.
-- Do not make dense tactile mandatory for a contact-only deployment observation.
-- Do not linear-interpolate tactile values across time.
-- Do not add `reset_sensor()` as a new public runtime API in this task.
+- Do not drop dense tactile because the current policy may not consume it yet.
+- Do not make dense tactile mandatory for contact-only deployment.
+- Do not linear-interpolate tactile across time.
+- Do not add `reset_sensor()` as a public runtime API in this task.
 - Do not hardcode `10x12` taxel geometry.
-- Do not call threshold `10` “10 N”.
-- Do not rename `hand_contact` while fixing scale/validity; document its `calc_force [5,3]` semantics instead.
-- Do not patch processed/Zarr artifacts in place; regenerate them from corrected raw v26.
-- Do not introduce managers, registries, plugin layers, or generic sensor abstractions for one XHand device.
+- Do not rename `hand_contact` while fixing scale/validity; document its `calc_force [5,3]` semantics.
+- Do not patch processed/Zarr artifacts in place; regenerate from raw v26.
+- Do not add managers, registries, plugin layers, or generic sensor abstractions.
 
 ---
 
 ## 11. Completion criteria
 
-The task is complete only when all of the following are true:
-
 ```text
 [ ] driver emits SDK-native bias-corrected calc_force and raw_force
-[ ] no _TACTILE_SCALE=0.1 remains in the production tactile path
-[ ] native threshold 10 preserves the previous binary decision boundary
+[ ] no _TACTILE_SCALE=0.1 remains in production tactile code
+[ ] aggregate convenience contact threshold is 2.0 SDK-native units, not labeled N
+[ ] calibration residual threshold is a separate 2.0 SDK-native constant
+[ ] no dense raw-force hard contact/residual threshold is introduced
+[ ] no hard pre-bias magnitude gate is used to pretend uncalibrated load can be identified reliably
 [ ] RS485 1501019 yields sum-valid / dense-invalid
 [ ] contact-only deployment survives dense-invalid / sum-valid frames
-[ ] dense-tactile deployment still rejects dense-invalid frames
+[ ] dense-tactile deployment rejects dense-invalid frames
 [ ] calibration performs independent post-bias verification
 [ ] calibration failure clears both biases
 [ ] raw v26 stores both payloads + separate aggregate/dense freshness
 [ ] direct raw v25 -> v26 conversion scales both payloads by exactly 10
 [ ] converted v24-derived episodes require explicit scale classification
-[ ] processed v15 preserves both tactile representations in native SDK scale
+[ ] processed v15 preserves both tactile representations in SDK-native scale
 [ ] Policy Zarr v8 does not silently reuse v7 tactile numeric semantics
 [ ] no SI/Newton claim is introduced
 [ ] same-source causal pairing remains unchanged
 [ ] focused offline tests pass
 ```
 
-The intended final principle is simple:
+Final principle:
 
 ```text
 Real owns faithful, bias-corrected sensor observations.
+Small thresholds are provisional derived heuristics, not sensor units.
 Policy owns representation choice and ML normalization.
 ```
