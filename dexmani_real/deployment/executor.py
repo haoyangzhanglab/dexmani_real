@@ -48,6 +48,7 @@ from dexmani_real.deployment.timing import (
 from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
     read_causal_structured_frame,
+    read_hand_contact_causal,
 )
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
@@ -934,22 +935,27 @@ class PolicyExecutor:
                 and now_ns - int(tactile["source_monotonic_ns"][0])
                 <= _RECORDING_TACTILE_MAX_AGE_NS
             )
+            contact = read_hand_contact_causal(
+                self.shared.hand_state_ring, anchor_monotonic_ns=now_ns
+            )
+            contact_source_ns = (
+                0 if contact is None else int(contact["source_monotonic_ns"][0])
+            )
             tactile_sum_fresh = bool(
-                hand["tactile_sum_valid"][0]
-                and 0 < int(hand["source_monotonic_ns"][0]) <= now_ns
-                and now_ns - int(hand["source_monotonic_ns"][0])
-                <= _RECORDING_TACTILE_MAX_AGE_NS
+                0 < contact_source_ns <= now_ns
+                and now_ns - contact_source_ns <= _RECORDING_TACTILE_MAX_AGE_NS
             )
             state = build_episode_state(
                 arm,
                 hand,
                 tactile if tactile_fresh else None,
+                hand_contact=None if contact is None else contact["tactile_sum"][0],
+                hand_contact_source_monotonic_ns=contact_source_ns,
                 timestamp_s=now_ns / 1e9,
             )
             signals = {
                 "observation_anchor_monotonic_ns": now_ns,
                 "observation_valid": False,
-                "policy_observation_valid": False,
                 "tracking_error": (
                     float(arm["tracking_err"][0])
                     if "tracking_err" in (arm.dtype.names or ())

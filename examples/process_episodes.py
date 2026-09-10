@@ -1,31 +1,8 @@
 #!/usr/bin/env python3
-"""Usage: ``python examples/process_episodes.py INPUT_ROOT [--profile PROFILE]``.
+"""Offline whole-episode processing on the logical control grid.
 
-Offline CLI that audits and compacts one task's depth-to-color aligned raw-v27
-episodes into processed HDF5 v16 files, one per source episode.
-
-Directory mapping: ``episodes/<task>/episode_*`` (raw) is published to
-``episodes_processed/<task>/episode_*.h5``.  Passing a single episode
-directory resolves the task level from its parent directory, so the same
-mapping holds for one episode.
-
-Each profile is analyzed once per invocation. Unannotated episodes rejected by
-the library are skipped with a warning; an explicit annotation whose ``include``
-value is true remains batch-blocking. Explicit ``include: false`` skips its
-episode before raw files are opened.
-
-Connects to no hardware, opens no GUI, and writes only the resolved
-``episodes_processed/`` output.  No JSON is printed to stdout; progress,
-warnings, and a concise summary go to stderr. A concise
-``process_log/invalid_frames_report.json`` is always published from staging; it
-lists only episodes with genuinely invalid source frames. Exit codes: 0 at least
-one episode was published or an audit completed; 1 nothing was published or the
-publish failed; 2 usage or environment error (bad input root, existing output
-root, unreadable annotations).
-
-Writer publication reopens each output for bounded HDF5 structural sanity.
-Pass ``--verify-output`` to also rescan every written payload and semantic
-contract before the batch is published.
+Publish one fully validated processed file for each accepted raw episode.
+Hardware and original raw files are never modified.
 """
 
 from __future__ import annotations
@@ -52,8 +29,6 @@ from dexmani_real.dataset.contracts import (
     EpisodeAnnotation,
     OutputProfile,
     ProcessingConfig,
-    QualityPolicy,
-    TemporalQualityConfig,
     validate_processed_task_name,
 )
 from dexmani_real.dataset.processing import (
@@ -91,11 +66,7 @@ def _route_library_logging_to_stderr() -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Audit and compact depth-to-color aligned raw-v27 Real episodes into one "
-            "processed-v16 "
-            "HDF5 per source; seriously broken episodes are skipped with a warning."
-        )
+        description="Process complete control-step episodes into processed HDF5 v17."
     )
     parser.add_argument(
         "input_root",
@@ -118,7 +89,7 @@ def _parser() -> argparse.ArgumentParser:
         "--profile",
         choices=[profile.value for profile in OutputProfile],
         default=OutputProfile.RGB_PC.value,
-        help="Select the required modalities and their shared hard-valid mask.",
+        help="Select the output modalities.",
     )
     parser.add_argument(
         "--pointcloud-num-points",
@@ -134,7 +105,7 @@ def _parser() -> argparse.ArgumentParser:
         "--annotations",
         type=Path,
         help=(
-            "Optional audited include/task/range overrides; task outcome labels "
+            "Optional whole-episode include/task overrides; task outcome labels "
             "are rejected. Entries for episodes outside this input are ignored."
         ),
     )
@@ -145,90 +116,23 @@ def _parser() -> argparse.ArgumentParser:
             "task_label. Refuses conflicts with per-episode annotation task_name."
         ),
     )
-    parser.add_argument("--horizon", type=int, default=16)
-    parser.add_argument("--min-full-windows", type=int, default=1)
-    parser.add_argument(
-        "--max-camera-age-s",
-        type=float,
-        default=None,
-        help=(
-            "Override the visual camera-age limit; it may not exceed "
-            "runtime.policy.max_input_age_s."
-        ),
-    )
-    parser.add_argument(
-        "--max-observation-skew-s",
-        type=float,
-        default=None,
-        help=(
-            "Override runtime.policy.max_observation_skew_s for visual observations."
-        ),
-    )
-    parser.add_argument(
-        "--quality-policy",
-        choices=[policy.value for policy in QualityPolicy],
-        default=None,
-        help="hard_only disables temporal detectors; audit reports findings (default audit).",
-    )
-    parser.add_argument(
-        "--abrupt-arm-step-rad",
-        type=float,
-        default=float(TemporalQualityConfig().abrupt_arm_step_rad),
-        help="Bridge/suspect arm action threshold in radians.",
-    )
-    parser.add_argument(
-        "--abrupt-hand-step-rad",
-        type=float,
-        default=float(TemporalQualityConfig().abrupt_hand_step_rad),
-        help="Bridge/suspect hand action threshold in radians.",
-    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Audit only; print decisions without creating episodes_processed output.",
     )
-    parser.add_argument(
-        "--compare-profiles",
-        action="store_true",
-        help="Audit all profiles so modality-dependent retention can be compared.",
-    )
-    parser.add_argument(
-        "--verify-output",
-        action="store_true",
-        help=(
-            "Before publication, fully rescan each written processed HDF5 payload "
-            "and semantic contract (slow; normal consumers/exporters remain strict)."
-        ),
-    )
     return parser
 
 
 def _config(
-    args: argparse.Namespace,
-    profile: OutputProfile,
-    policy: QualityPolicy,
-    runtime: Any,
+    args: argparse.Namespace, profile: OutputProfile, runtime: Any
 ) -> ProcessingConfig:
-    overrides: dict[str, object] = {
-        "horizon": args.horizon,
-        "min_full_windows": args.min_full_windows,
-        "temporal_quality": TemporalQualityConfig(
-            policy=policy,
-            abrupt_arm_step_rad=args.abrupt_arm_step_rad,
-            abrupt_hand_step_rad=args.abrupt_hand_step_rad,
-        ),
-        "pointcloud": dataclasses.replace(
-            runtime.pointcloud, num_points=args.pointcloud_num_points
-        ),
-    }
-    if args.max_camera_age_s is not None:
-        overrides["max_camera_age_s"] = args.max_camera_age_s
-    if args.max_observation_skew_s is not None:
-        overrides["max_observation_skew_s"] = args.max_observation_skew_s
     return ProcessingConfig.from_runtime(
         runtime,
         profile=profile,
-        **overrides,
+        pointcloud=dataclasses.replace(
+            runtime.pointcloud, num_points=args.pointcloud_num_points
+        ),
     )
 
 
@@ -325,7 +229,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     task_name = _validate_task_name(parser, args.task_name)
     selected_profile = OutputProfile(args.profile)
-    policy = QualityPolicy(args.quality_policy or QualityPolicy.AUDIT.value)
 
     input_root = args.input_root
     if not input_root.is_dir():
@@ -362,7 +265,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    if not args.dry_run and not args.compare_profiles and output_root.exists():
+    if not args.dry_run and output_root.exists():
         print(
             f"error: output root already exists: {output_root}; "
             "remove it or pass a different --output-root",
@@ -390,39 +293,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 Path(temporary_name) if temporary_name is not None else None
             ),
         )
-        if args.compare_profiles:
-            print("profile retention (selected/source frames):", file=sys.stderr)
-            for profile in OutputProfile:
-                try:
-                    profile_config = _config(args, profile, policy, runtime)
-                except (TypeError, ValueError) as exc:
-                    print(f"error: invalid processing config: {exc}", file=sys.stderr)
-                    return 2
-                try:
-                    report = process_episode_root(
-                        input_root,
-                        output_root,
-                        profile_config,
-                        annotations_path=annotations_path,
-                        dry_run=True,
-                        skip_rejected_unannotated=True,
-                        task_name=task_name,
-                        expected_task_name=expected_task_name,
-                    )
-                except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                    print(f"error: profile audit failed: {exc}", file=sys.stderr)
-                    return 1
-                source = int(report["source_frame_count"])
-                selected = int(report["selected_frame_count"])
-                retention = 100.0 * selected / source if source else 0.0
-                print(
-                    f"  {profile.value:<11} {selected}/{source} ({retention:.1f}%)",
-                    file=sys.stderr,
-                )
-            return 0
-
         try:
-            config = _config(args, selected_profile, policy, runtime)
+            config = _config(args, selected_profile, runtime)
         except (TypeError, ValueError) as exc:
             print(f"error: invalid processing config: {exc}", file=sys.stderr)
             return 2
@@ -433,7 +305,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config,
                 annotations_path=annotations_path,
                 dry_run=args.dry_run,
-                verify_output=args.verify_output,
                 skip_rejected_unannotated=True,
                 task_name=task_name,
                 expected_task_name=expected_task_name,
@@ -449,13 +320,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"published {report['output_episode_count']} episode(s) -> {output_root}",
         file=sys.stderr,
     )
-    invalid_episodes = report["invalid_frames_report"]["episodes"]
-    if invalid_episodes:
-        print(
-            f"invalid-frame report: {len(invalid_episodes)} episode(s) -> "
-            f"{output_root / 'process_log' / 'invalid_frames_report.json'}",
-            file=sys.stderr,
-        )
     return 0
 
 

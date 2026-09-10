@@ -1,4 +1,4 @@
-"""Owned raw-v27 source rows assembled at the recording boundary."""
+"""Owned control-step source rows assembled at the recording boundary."""
 
 from __future__ import annotations
 
@@ -48,6 +48,7 @@ def episode_source_values(
         "hand_qpos": state.hand_qpos,
         "hand_current": state.hand_current,
         "hand_contact": state.hand_tactile_sum,
+        "hand_contact_source_monotonic_ns": state.hand_contact_source_monotonic_ns,
         "hand_tactile_force": state.hand_tactile_force,
         "arm_connected": state.arm_connected,
         "hand_connected": state.hand_connected,
@@ -91,34 +92,6 @@ def episode_source_values(
         "camera_health": camera.get("camera_health", 0),
         "camera_depth_frame_number": camera.get("depth_frame_number", 0),
         "camera_color_frame_number": camera.get("color_frame_number", 0),
-        "policy_observation_arm_qpos": signal.get(
-            "policy_observation_arm_qpos", np.full(7, np.nan)
-        ),
-        "policy_observation_hand_qpos": signal.get(
-            "policy_observation_hand_qpos", np.full(12, np.nan)
-        ),
-        "policy_observation_valid": signal.get("policy_observation_valid", False),
-        "policy_observation_contact_force": signal.get(
-            "policy_observation_contact_force", np.full((5, 3), np.nan)
-        ),
-        "policy_observation_contact_force_valid": signal.get(
-            "policy_observation_contact_force_valid", False
-        ),
-        "policy_observation_tactile_force": signal.get(
-            "policy_observation_tactile_force", np.full((5, 120, 3), np.nan)
-        ),
-        "policy_observation_tactile_force_valid": signal.get(
-            "policy_observation_tactile_force_valid", False
-        ),
-        "policy_observation_tactile_source_monotonic_ns": signal.get(
-            "policy_observation_tactile_source_monotonic_ns", 0
-        ),
-        "policy_observation_tactile_calibrated": signal.get(
-            "policy_observation_tactile_calibrated", False
-        ),
-        "policy_observation_tactile_unit_code": signal.get(
-            "policy_observation_tactile_unit_code", 0
-        ),
         "vr_wrist_pos": vr_frame["wrist_pos"],
         "vr_wrist_rot6d": quat_wxyz_to_rot6d(
             np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64)

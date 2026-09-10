@@ -78,101 +78,37 @@ def read_causal_structured_frame(
     return None
 
 
-def read_structured_frame_aligned_to_source(
-    ring: Any,
-    *,
-    source_field: str,
-    reference_source_monotonic_ns: int,
-    anchor_monotonic_ns: int,
-) -> tuple[np.ndarray, int, int] | None:
-    """Return the newest state at or before a causal reference source time.
+def read_hand_contact_causal(
+    ring: Any, *, anchor_monotonic_ns: int
+) -> np.ndarray | None:
+    """Select usable aggregate contact independently of the newest hand qpos.
 
-    The selected state may have been published after the reference sensor
-    sample, but never after ``anchor_monotonic_ns``.  This is the causal
-    pairing used by point-cloud policy deployment: a camera sample is paired
-    with the newest robot feedback that physically existed when the camera
-    sampled, while permitting normal host delivery latency.
+    Recording retains old but valid contact; age is telemetry, not admission.
+    Invalid worker placeholders must never become a valid no-contact reading.
     """
-    reference_ns = int(reference_source_monotonic_ns)
-    anchor_ns = int(anchor_monotonic_ns)
-    if reference_ns <= 0 or anchor_ns <= 0 or reference_ns > anchor_ns:
-        return None
     latest_sequence = int(ring.latest_sequence)
     oldest_sequence = max(1, latest_sequence - int(ring.maxlen) + 1)
-    selected: tuple[np.ndarray, int, int] | None = None
-    selected_source_ns = -1
-    for target_sequence in range(latest_sequence, oldest_sequence - 1, -1):
-        result = ring.read_sequence(target_sequence)
+    for sequence in range(latest_sequence, oldest_sequence - 1, -1):
+        result = ring.read_sequence(sequence)
         if result is None:
             continue
-        data, ring_publish_ns, sequence = result
-        source_ns = int(data[source_field][0])
-        names = data.dtype.names or ()
-        publish_ns = (
-            int(data["publish_monotonic_ns"][0])
-            if "publish_monotonic_ns" in names
-            and int(data["publish_monotonic_ns"][0]) > 0
-            else int(ring_publish_ns)
-        )
-        if not (0 < source_ns <= reference_ns and source_ns <= publish_ns <= anchor_ns):
-            continue
-        if source_ns > selected_source_ns:
-            selected = (data, publish_ns, int(sequence))
-            selected_source_ns = source_ns
-    return selected
-
-
-def read_valid_structured_frame_aligned_to_source(
-    ring: Any,
-    *,
-    source_field: str,
-    reference_source_monotonic_ns: int,
-    anchor_monotonic_ns: int,
-    required_true_fields: tuple[str, ...] = (),
-    required_false_fields: tuple[str, ...] = (),
-) -> tuple[np.ndarray, int, int] | None:
-    """Return the newest *valid* frame at or before a causal reference source time.
-
-    Same causality contract as ``read_structured_frame_aligned_to_source``, but
-    a frame missing (or failing) any ``required_true_fields`` /
-    ``required_false_fields`` gate is skipped, so an older valid frame can still
-    be selected.  This mirrors the deployment observation history reader, which
-    drops gate-failing frames before the causal alignment: e.g. a tactile read
-    whose aggregate sum or dense force is invalid on the newest sample falls
-    back to the previous valid sample instead of failing the whole observation.
-    """
-    reference_ns = int(reference_source_monotonic_ns)
-    anchor_ns = int(anchor_monotonic_ns)
-    if reference_ns <= 0 or anchor_ns <= 0 or reference_ns > anchor_ns:
-        return None
-    latest_sequence = int(ring.latest_sequence)
-    oldest_sequence = max(1, latest_sequence - int(ring.maxlen) + 1)
-    for target_sequence in range(latest_sequence, oldest_sequence - 1, -1):
-        result = ring.read_sequence(target_sequence)
-        if result is None:
-            continue
-        data, ring_publish_ns, sequence = result
-        names = data.dtype.names or ()
-        if any(
-            field not in names or not bool(data[field][0])
-            for field in required_true_fields
+        frame, ring_publish_ns, _sequence = result
+        row = frame[0]
+        contact = row["tactile_sum"]
+        if (
+            row["state_valid"] == 1
+            and row["tactile_sum_valid"] == 1
+            and row["qpos_stale"] == 0
+            and contact.shape == (5, 3)
+            and contact.dtype == np.dtype(np.float64)
+            and np.all(np.isfinite(contact))
+            and 0
+            < int(row["source_monotonic_ns"])
+            <= int(row["publish_monotonic_ns"])
+            <= int(ring_publish_ns)
+            <= int(anchor_monotonic_ns)
         ):
-            continue
-        if any(
-            field not in names or bool(data[field][0])
-            for field in required_false_fields
-        ):
-            continue
-        source_ns = int(data[source_field][0])
-        publish_ns = (
-            int(data["publish_monotonic_ns"][0])
-            if "publish_monotonic_ns" in names
-            and int(data["publish_monotonic_ns"][0]) > 0
-            else int(ring_publish_ns)
-        )
-        if not (0 < source_ns <= reference_ns and source_ns <= publish_ns <= anchor_ns):
-            continue
-        return data, publish_ns, int(sequence)
+            return frame
     return None
 
 

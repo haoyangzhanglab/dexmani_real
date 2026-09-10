@@ -28,7 +28,6 @@ from dexmani_real.deployment.config import (
 from dexmani_real.deployment.inference.observation import (
     FrameWindow,
     ObservationBatch,
-    _align_state_history_to_camera_frames,
     _build_observation,
     _to_policy_observation,
     build_fingertip_runtime,
@@ -374,21 +373,6 @@ class TestBuildObservation(unittest.TestCase):
         spec = _fake_policy_spec(_Field("tactile_force", (5, 120, 3), "float32"))
         self.assertIsNone(_build(shared, spec))
 
-    def test_camera_alignment_parity_for_force_history(self) -> None:
-        spec = _fake_policy_spec(_Field("tactile_force", (5, 120, 3), "float32"))
-        observation = _build(_fake_shared(), spec)
-        force_history = observation.hand_tactile_force_history
-        camera_frames = tuple(
-            types.SimpleNamespace(source_monotonic_ns=_ref_ns(tick))
-            for tick in _REF_TICKS
-        )
-        aligned = _align_state_history_to_camera_frames(
-            force_history, camera_frames, max_skew_ns=int(0.1 * 1e9)
-        )
-        self.assertIsNotNone(aligned)
-        np.testing.assert_array_equal(
-            aligned.source_monotonic_ns, force_history.source_monotonic_ns
-        )
 
 
 class TestToPolicyObservation(unittest.TestCase):

@@ -1,21 +1,7 @@
-"""Transactional export of processed HDF5 v16 episodes to Policy Zarr v9.
-
-The Zarr v9 data-key and root-attr contract keeps the legacy core projection:
-the exporter fully validates the v16 artifact first, then explicitly projects
-the v9 keys.  Processed-v16-only fields (``eef_pose``, ``tactile_force``) and
-their semantic attrs never enter the Zarr store.  ``contact_force`` numeric
-semantics follow processed v16 (SDK-native, bias-corrected units).
-
-A Policy Zarr episode is exactly one source-complete physical demonstration:
-one processed HDF5 that retains every source row as a single contiguous
-sequence.  Any dropped source row, interior gap, or timestamp/sample
-discontinuity rejects the whole HDF5 — no splitting, no compaction, no
-interior-gap tolerance.
-"""
+"""Transactional one-processed-file to one-Policy-Zarr-episode export."""
 
 from __future__ import annotations
 
-import json
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -27,61 +13,13 @@ import h5py
 import numpy as np
 import zarr
 
-from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.dataset.contracts import OutputProfile, validate_processed_task_name
-from dexmani_real.dataset.processed import (
-    _ACTION_EE_FRAME,
-    _CONTACT_FORCE_ALIGNMENT_JOINT,
-    _CONTACT_FORCE_ALIGNMENT_VISUAL,
-    _CONTACT_FORCE_FRAME,
-    _CONTACT_FORCE_REPRESENTATION,
-    _CONTACT_FORCE_SI_VERIFIED,
-    _CONTACT_FORCE_SOURCE_JOINT,
-    _CONTACT_FORCE_SOURCE_VISUAL,
-    _CONTACT_FORCE_UNIT,
-    _FINGERTIP_POINTS_FRAME,
-    _FINGERTIP_POINTS_UNIT,
-    PROCESSED_SCHEMA_NAME,
-    PROCESSED_SCHEMA_VERSION,
-    ProcessedProvenance,
-    _strict_bool_attr,
-    _strict_integer_attr,
-    validate_eef_pose_semantics,
-    validate_fingertip_points_semantics,
-    validate_processed_payload,
-    validate_processed_provenance,
-    validate_tactile_force_semantics,
-)
-from dexmani_real.sensor.pointcloud import (
-    POINT_CLOUD_COLOR_SOURCE,
-    POINT_CLOUD_POLICY_ID,
-    POINT_CLOUD_SAMPLING,
-    POINT_CLOUD_TRANSFORM,
-)
+from dexmani_real.dataset.processed import validate_processed_hdf5
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 
 POLICY_ZARR_SCHEMA_NAME = "dexmani-real-policy-zarr"
-POLICY_ZARR_SCHEMA_VERSION = 9
-# Legacy core projection of the processed core into Zarr v9.  Processed v14+
-# added eef_pose/tactile_force; they are deliberately absent here.
-_POLICY_ZARR_CORE_KEYS = (
-    "joint_state",
-    "action",
-    "action_ee",
-    "contact_force",
-    "fingertip_points",
-)
+POLICY_ZARR_SCHEMA_VERSION = 10
 ExportProgressCallback = Callable[[str, int, int], None]
-
-
-def _policy_zarr_keys(profile: OutputProfile) -> tuple[str, ...]:
-    """Return the Zarr v9 data-key projection for one processed profile."""
-    keys = list(_POLICY_ZARR_CORE_KEYS)
-    if profile.needs_rgb:
-        keys.extend(("rgb", "depth", "camera_intrinsic", "camera_extrinsic"))
-    if profile.needs_pointcloud:
-        keys.append("point_cloud")
-    return tuple(keys)
 
 
 @dataclass(frozen=True)
@@ -93,22 +31,20 @@ class PolicyZarrExportConfig:
     expected_task_name: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.chunk_frames, int) or self.chunk_frames <= 0:
+        if (
+            isinstance(self.chunk_frames, bool)
+            or not isinstance(self.chunk_frames, int)
+            or self.chunk_frames <= 0
+        ):
             raise ValueError("chunk_frames must be a positive integer")
         if (
-            not isinstance(self.compression_level, int)
+            isinstance(self.compression_level, bool)
+            or not isinstance(self.compression_level, int)
             or not 0 <= self.compression_level <= 9
         ):
             raise ValueError("compression_level must be an integer in [0, 9]")
         if self.expected_task_name is not None:
             validate_processed_task_name(self.expected_task_name)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "chunk_frames": self.chunk_frames,
-            "compression": {"id": "zstd", "level": self.compression_level},
-            "expected_task_name": self.expected_task_name,
-        }
 
 
 @dataclass(frozen=True)
@@ -123,101 +59,6 @@ class _Artifact:
     dataset_shapes: dict[str, tuple[int, ...]]
     dataset_dtypes: dict[str, np.dtype[Any]]
     semantic_attrs: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class _ArtifactRejection:
-    """One valid processed artifact excluded from whole-episode export."""
-
-    episode: str
-    source_file: str
-    invalid_frame_count: int
-    invalid_ranges: list[list[int]]
-    reasons: list[dict[str, Any]]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "episode": self.episode,
-            "source_file": self.source_file,
-            "invalid_frame_count": self.invalid_frame_count,
-            "invalid_ranges": self.invalid_ranges,
-            "reasons": self.reasons,
-        }
-
-
-def _text(value: Any) -> str:
-    if isinstance(value, bytes):
-        value = value.decode("utf-8")
-    return str(value).strip()
-
-
-def _indices_to_ranges(indices: np.ndarray) -> list[list[int]]:
-    values = np.asarray(indices, dtype=np.int64)
-    if values.size == 0:
-        return []
-    starts = np.r_[0, np.flatnonzero(np.diff(values) != 1) + 1]
-    ends = np.r_[starts[1:], len(values)]
-    return [
-        [int(values[start]), int(values[end - 1] + 1)]
-        for start, end in zip(starts, ends, strict=True)
-    ]
-
-
-def _whole_episode_rejection(
-    path: Path,
-    provenance: ProcessedProvenance,
-) -> _ArtifactRejection | None:
-    """Reject any processed HDF5 that is not one source-complete episode.
-
-    The canonical exporter admits exactly one Zarr episode per processed HDF5,
-    and only when the HDF5 retains every source row as one contiguous sequence.
-    A leading trim, an interior gap, a suffix truncation, or a timestamp/sample
-    discontinuity each reject the whole HDF5 — never split, never compacted,
-    never bridged.  ``validate_processed_provenance`` already guarantees
-    ``source_rows == flatnonzero(keep_mask)`` and that ``segment_ends`` matches
-    the row/sample/timestamp discontinuities, so the complete proof is
-    ``keep_mask`` all true plus a single contiguous segment.
-    """
-
-    source_frames = int(provenance.keep_mask.shape[0])
-    complete = (
-        bool(np.all(provenance.keep_mask))
-        and np.array_equal(
-            provenance.source_rows, np.arange(source_frames, dtype=np.int64)
-        )
-        and provenance.segment_ends.size == 1
-    )
-    if complete:
-        return None
-    hard_reason_names = provenance.hard_invalid_reason_names
-    reason_rows: dict[str, np.ndarray] = {}
-    hard_invalid = np.zeros(provenance.keep_mask.shape, dtype=bool)
-    for bit, name in enumerate(provenance.drop_reason_names):
-        mask = (provenance.drop_reason_bits & (np.uint64(1) << np.uint64(bit))) != 0
-        if name in hard_reason_names:
-            hard_invalid |= mask
-        reason_rows[name] = np.flatnonzero(mask).astype(np.int64)
-    hard_invalid_rows = np.flatnonzero(hard_invalid).astype(np.int64)
-    reasons: list[dict[str, Any]] = []
-    for name, reason_indices in reason_rows.items():
-        if reason_indices.size:
-            reasons.append(
-                {
-                    "reason": name,
-                    "frame_count": int(reason_indices.size),
-                    "ranges": _indices_to_ranges(reason_indices),
-                }
-            )
-    reasons.append(
-        {"reason": "source_discontinuity", "frame_count": 0, "ranges": []}
-    )
-    return _ArtifactRejection(
-        episode=path.stem,
-        source_file=path.name,
-        invalid_frame_count=int(hard_invalid_rows.size),
-        invalid_ranges=_indices_to_ranges(hard_invalid_rows),
-        reasons=reasons,
-    )
 
 
 def _discover_processed_hdf5_paths(source_root: Path) -> tuple[Path, ...]:
@@ -237,37 +78,12 @@ def _discover_processed_hdf5_paths(source_root: Path) -> tuple[Path, ...]:
     return paths
 
 
-def _inspect_artifact(
-    path: Path, config: PolicyZarrExportConfig
-) -> _Artifact | _ArtifactRejection:
+def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
+    # The processed boundary proves payload integrity and row preservation once.
+    validation = validate_processed_hdf5(path)
     with h5py.File(path, "r") as source:
-        if _text(source.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
-            raise ValueError(f"{path.name}: unsupported processed schema")
-        if int(source.attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
-            raise ValueError(f"{path.name}: unsupported processed schema version")
-        if _text(source.attrs.get("domain", "")) != "real":
-            raise ValueError(f"{path.name}: domain must be real")
-        try:
-            profile = OutputProfile(_text(source.attrs.get("profile", "")))
-        except ValueError as exc:
-            raise ValueError(f"{path.name}: invalid profile") from exc
-        data_keys = {
-            key for key, value in source.items() if isinstance(value, h5py.Dataset)
-        }
-        if not set(profile.dataset_keys).issubset(data_keys) or not isinstance(
-            source.get("provenance"), h5py.Group
-        ):
-            raise ValueError(f"{path.name}: required processed data is incomplete")
-        length = int(source.attrs.get("episode_steps", -1))
-        if length <= 0:
-            raise ValueError(f"{path.name}: episode_steps must be positive")
-        dt = float(source.attrs.get("dt", np.nan))
-        if not np.isfinite(dt) or dt <= 0.0:
-            raise ValueError(f"{path.name}: dt must be finite and positive")
-        try:
-            task_name = validate_processed_task_name(source.attrs.get("task_name", ""))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{path.name}: invalid task_name: {exc}") from exc
+        profile = OutputProfile(source.attrs["profile"])
+        task_name = str(source.attrs["task_name"])
         if (
             config.expected_task_name is not None
             and task_name != config.expected_task_name
@@ -275,254 +91,57 @@ def _inspect_artifact(
             raise ValueError(
                 f"{path.name}: task_name={task_name!r}, expected {config.expected_task_name!r}"
             )
-        resolved_pointcloud: PointCloudConfig | None = None
-        shapes: dict[str, tuple[int, ...]] = {}
-        dtypes: dict[str, np.dtype[Any]] = {}
-        fingertip_semantics = validate_fingertip_points_semantics(
-            source.attrs, label=path.name
-        )
-        # Full v16 semantic admission runs before the v9 projection; these
-        # identities are validated but never copied into the Zarr root attrs.
-        validate_eef_pose_semantics(source.attrs, label=path.name)
-        validate_tactile_force_semantics(source.attrs, label=path.name)
-        # contact_force_representation is validated at admission but is not
-        # carried into the Zarr root (it stays processed-only).
-        if (
-            _text(source.attrs.get("contact_force_representation", ""))
-            != _CONTACT_FORCE_REPRESENTATION
-        ):
-            raise ValueError(f"{path.name}: invalid contact_force_representation")
-        semantics: dict[str, Any] = {
-            "obs_alignment": _text(source.attrs.get("obs_alignment", "")),
-            "observation_reference": _text(
-                source.attrs.get("observation_reference", "")
-            ),
-            "state_alignment": _text(source.attrs.get("state_alignment", "")),
-            "max_observation_skew_s": float(
-                source.attrs.get("max_observation_skew_s", np.nan)
-            ),
-            "action_semantics": _text(source.attrs.get("action_semantics", "")),
-            "contact_force_unit": _text(source.attrs.get("contact_force_unit", "")),
-            "contact_force_si_verified": _strict_bool_attr(
-                source.attrs, "contact_force_si_verified"
-            ),
-            "contact_force_frame": _text(source.attrs.get("contact_force_frame", "")),
-            "contact_force_source": _text(source.attrs.get("contact_force_source", "")),
-            "contact_force_alignment": _text(
-                source.attrs.get("contact_force_alignment", "")
-            ),
-            "contact_force_fresh_required": _strict_bool_attr(
-                source.attrs, "contact_force_fresh_required"
-            ),
-            "contact_force_calibrated_required": _strict_bool_attr(
-                source.attrs, "contact_force_calibrated_required"
-            ),
-            "contact_force_unit_code": _strict_integer_attr(
-                source.attrs, "contact_force_unit_code"
-            ),
-            "contact_force_causal_to_reference": _strict_bool_attr(
-                source.attrs, "contact_force_causal_to_reference"
-            ),
-            "contact_force_hand_source_match_required": _strict_bool_attr(
-                source.attrs, "contact_force_hand_source_match_required"
-            ),
-            "fingertip_points_frame": _text(
-                source.attrs.get("fingertip_points_frame", "")
-            ),
-            "fingertip_points_unit": _text(
-                source.attrs.get("fingertip_points_unit", "")
-            ),
-            "fingertip_points_derivation": fingertip_semantics["derivation"],
-            "fingertip_points_policy_id": fingertip_semantics["policy_id"],
-            "action_ee_frame": _text(source.attrs.get("action_ee_frame", "")),
-        }
-        visual_profile = profile.needs_rgb or profile.needs_pointcloud
-        expected_reference = (
-            "camera_source_monotonic_ns"
-            if visual_profile
-            else "grid_anchor_monotonic_ns"
-        )
-        expected_state_alignment = (
-            "camera_source_aligned_state" if visual_profile else "control_grid_state"
-        )
-        expected_contact_source = (
-            _CONTACT_FORCE_SOURCE_VISUAL
-            if visual_profile
-            else _CONTACT_FORCE_SOURCE_JOINT
-        )
-        expected_contact_alignment = (
-            _CONTACT_FORCE_ALIGNMENT_VISUAL
-            if visual_profile
-            else _CONTACT_FORCE_ALIGNMENT_JOINT
-        )
-        if (
-            semantics["obs_alignment"] != "obs[t]_before_action[t]"
-            or semantics["observation_reference"] != expected_reference
-            or semantics["state_alignment"] != expected_state_alignment
-            or not np.isfinite(semantics["max_observation_skew_s"])
-            or semantics["max_observation_skew_s"] <= 0.0
-            or semantics["action_semantics"] != "teleop_published_joint_target"
-            or semantics["contact_force_unit"] != _CONTACT_FORCE_UNIT
-            or semantics["contact_force_si_verified"] is not _CONTACT_FORCE_SI_VERIFIED
-            or semantics["contact_force_frame"] != _CONTACT_FORCE_FRAME
-            or semantics["contact_force_source"] != expected_contact_source
-            or semantics["contact_force_alignment"] != expected_contact_alignment
-            or not semantics["contact_force_fresh_required"]
-            or not semantics["contact_force_calibrated_required"]
-            or semantics["contact_force_unit_code"] != 0
-            or not semantics["contact_force_causal_to_reference"]
-            or not semantics["contact_force_hand_source_match_required"]
-            or semantics["fingertip_points_frame"] != _FINGERTIP_POINTS_FRAME
-            or semantics["fingertip_points_unit"] != _FINGERTIP_POINTS_UNIT
-            or semantics["action_ee_frame"] != _ACTION_EE_FRAME
-        ):
-            raise ValueError(f"{path.name}: invalid Real core modality semantics")
+        semantic_keys = [
+            "obs_alignment",
+            "observation_alignment",
+            "state_alignment",
+            "action_semantics",
+            "action_ee_frame",
+            "contact_force_source",
+            "contact_force_representation",
+            "contact_force_unit",
+            "contact_force_si_verified",
+            "contact_force_frame",
+            "fingertip_points_frame",
+            "fingertip_points_unit",
+            "fingertip_points_derivation",
+            "fingertip_points_policy_id",
+        ]
         if profile.needs_rgb:
-            semantics.update(
-                {
-                    "depth_scale_m_per_unit": float(
-                        source.attrs.get("depth_scale_m_per_unit", np.nan)
-                    ),
-                    "depth_invalid_value": int(
-                        source.attrs.get("depth_invalid_value", -1)
-                    ),
-                    "camera_extrinsic_semantics": _text(
-                        source.attrs.get("camera_extrinsic_semantics", "")
-                    ),
-                }
-            )
-            if (
-                not np.isfinite(semantics["depth_scale_m_per_unit"])
-                or semantics["depth_scale_m_per_unit"] <= 0.0
-                or semantics["depth_invalid_value"] != 0
-                or semantics["camera_extrinsic_semantics"]
-                != "T_xarm_base_from_color;native_color_optical_to_xarm_base"
-            ):
-                raise ValueError(f"{path.name}: invalid Real RGB-D semantics")
-        if profile.needs_pointcloud:
-            try:
-                processing_config = json.loads(
-                    _text(source.attrs.get("processing_config_json", ""))
+            semantic_keys.extend(
+                (
+                    "depth_scale_m_per_unit",
+                    "depth_invalid_value",
+                    "camera_intrinsic_semantics",
+                    "camera_extrinsic_semantics",
                 )
-                pointcloud_config = processing_config["pointcloud"]
-                table_plane_abcd = processing_config["table_plane_abcd"]
-                if not isinstance(pointcloud_config, dict):
-                    raise TypeError("pointcloud config must be an object")
-                resolved_pointcloud = PointCloudConfig(**pointcloud_config)
-                if resolved_pointcloud.to_dict() != pointcloud_config:
-                    raise ValueError("pointcloud config is not canonical")
-                if resolved_pointcloud.num_points != source["point_cloud"].shape[1]:
-                    raise ValueError("pointcloud config count does not match dataset")
-                if table_plane_abcd is not None:
-                    plane = np.asarray(table_plane_abcd, dtype=np.float64)
-                    norm = (
-                        float(np.linalg.norm(plane[:3])) if plane.shape == (4,) else 0.0
-                    )
-                    if (
-                        plane.shape != (4,)
-                        or not np.all(np.isfinite(plane))
-                        or norm <= 0.0
-                        or plane[2] / norm <= 0.0
-                    ):
-                        raise ValueError("table plane must be finite and upward")
-                canonical_table_plane = json.dumps(
-                    table_plane_abcd,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                )
-            except (KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
-                raise ValueError(
-                    f"{path.name}: invalid persisted point-cloud config"
-                ) from exc
-            point_cloud_semantics = {
-                "frame": _text(source.attrs.get("point_cloud_frame", "")),
-                "color_source": _text(source.attrs.get("point_cloud_color_source", "")),
-                "policy_id": _text(source.attrs.get("point_cloud_policy_id", "")),
-                "table_plane_abcd_json": _text(
-                    source.attrs.get("point_cloud_table_plane_abcd_json", "")
-                ),
-                "sampling": _text(source.attrs.get("point_cloud_sampling", "")),
-                "transform": _text(source.attrs.get("point_cloud_transform", "")),
-            }
-            if point_cloud_semantics != {
-                "frame": "xarm_base",
-                "color_source": POINT_CLOUD_COLOR_SOURCE,
-                "policy_id": POINT_CLOUD_POLICY_ID,
-                "table_plane_abcd_json": canonical_table_plane,
-                "sampling": POINT_CLOUD_SAMPLING,
-                "transform": POINT_CLOUD_TRANSFORM,
-            }:
-                raise ValueError(f"{path.name}: invalid Real point-cloud semantics")
-            semantics.update(
-                {
-                    f"point_cloud_{key}": value
-                    for key, value in point_cloud_semantics.items()
-                }
-            )
-        # Full processed-v16 admission specs: the complete artifact, including
-        # the processed-only fields, is validated before the v9 projection.
-        expected_specs: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
-            "joint_state": ((length, 19), np.dtype(np.float32)),
-            "eef_pose": ((length, 9), np.dtype(np.float32)),
-            "action": ((length, 19), np.dtype(np.float32)),
-            "action_ee": ((length, 21), np.dtype(np.float32)),
-            "contact_force": ((length, 5, 3), np.dtype(np.float32)),
-            "tactile_force": ((length, 5, 120, 3), np.dtype(np.float32)),
-            "fingertip_points": ((length, 5, 3), np.dtype(np.float32)),
-        }
-        if profile.needs_rgb:
-            expected_specs.update(
-                {
-                    key: (tuple(int(value) for value in source[key].shape), dtype)
-                    for key, dtype in (
-                        ("rgb", np.dtype(np.uint8)),
-                        ("depth", np.dtype(np.uint16)),
-                        ("camera_intrinsic", np.dtype(np.float32)),
-                        ("camera_extrinsic", np.dtype(np.float32)),
-                    )
-                }
             )
         if profile.needs_pointcloud:
-            if resolved_pointcloud is None:
-                raise ValueError(f"{path.name}: point-cloud config is missing")
-            expected_specs["point_cloud"] = (
-                (length, resolved_pointcloud.num_points, 6),
-                np.dtype(np.float32),
+            semantic_keys.extend(
+                (
+                    "point_cloud_frame",
+                    "point_cloud_color_source",
+                    "point_cloud_policy_id",
+                    "point_cloud_table_plane_abcd_json",
+                    "point_cloud_sampling",
+                    "point_cloud_transform",
+                    "processing_config_json",
+                )
             )
-        validate_processed_payload(
-            source,
-            expected_specs=expected_specs,
-            length=length,
-            label=path.name,
-            validate_rgbd=profile.needs_rgb,
-            pointcloud_workspace=(
-                None if resolved_pointcloud is None else resolved_pointcloud.workspace
-            ),
+        semantics = {}
+        for key in semantic_keys:
+            value = source.attrs[key]
+            semantics[key] = value.item() if isinstance(value, np.generic) else value
+        return _Artifact(
+            path=path,
+            length=validation["frames"],
+            profile=profile,
+            task_name=task_name,
+            dt=float(source.attrs["dt"]),
+            dataset_shapes={key: source[key].shape[1:] for key in profile.dataset_keys},
+            dataset_dtypes={key: source[key].dtype for key in profile.dataset_keys},
+            semantic_attrs=semantics,
         )
-        provenance = validate_processed_provenance(
-            source,
-            label=path.name,
-        )
-        # validate_processed_provenance has already established the row mapping
-        # and segment boundaries that the whole-episode admission proof uses.
-        rejection = _whole_episode_rejection(path, provenance)
-        if rejection is not None:
-            return rejection
-        # Explicit legacy projection: only the Zarr v9 keys are carried into
-        # the artifact metadata that drives the data copy and validation.
-        for key in _policy_zarr_keys(profile):
-            shapes[key] = tuple(int(value) for value in source[key].shape[1:])
-            dtypes[key] = np.dtype(source[key].dtype)
-    return _Artifact(
-        path=path,
-        length=length,
-        profile=profile,
-        task_name=task_name,
-        dt=dt,
-        dataset_shapes=shapes,
-        dataset_dtypes=dtypes,
-        semantic_attrs=semantics,
-    )
 
 
 def _validate_uniform(artifacts: tuple[_Artifact, ...]) -> None:
@@ -538,12 +157,6 @@ def _validate_uniform(artifacts: tuple[_Artifact, ...]) -> None:
             raise ValueError(f"{artifact.path.name}: non-uniform dataset shapes")
         if artifact.dataset_dtypes != first.dataset_dtypes:
             raise ValueError(f"{artifact.path.name}: non-uniform dataset dtypes")
-        for key in (
-            "fingertip_points_derivation",
-            "fingertip_points_policy_id",
-        ):
-            if artifact.semantic_attrs[key] != first.semantic_attrs[key]:
-                raise ValueError(f"{artifact.path.name}: {key} mismatch")
         if artifact.semantic_attrs != first.semantic_attrs:
             raise ValueError(
                 f"{artifact.path.name}: non-uniform Real modality semantics"
@@ -567,50 +180,40 @@ def _load_artifacts(
     config: PolicyZarrExportConfig,
     *,
     progress_callback: ExportProgressCallback | None = None,
-) -> tuple[tuple[_Artifact, ...], tuple[_ArtifactRejection, ...]]:
+) -> tuple[_Artifact, ...]:
     """Inspect one complete task input before any Zarr output is created."""
 
     paths = _discover_processed_hdf5_paths(Path(input_root))
     _report_progress(progress_callback, "validate", 0, len(paths))
     artifacts: list[_Artifact] = []
-    rejections: list[_ArtifactRejection] = []
     for index, path in enumerate(paths, start=1):
-        inspected = _inspect_artifact(path, config)
-        if isinstance(inspected, _ArtifactRejection):
-            rejections.append(inspected)
-        else:
-            artifacts.append(inspected)
+        artifacts.append(_inspect_artifact(path, config))
         _report_progress(progress_callback, "validate", index, len(paths))
-    if artifacts:
-        _validate_uniform(tuple(artifacts))
-    return tuple(artifacts), tuple(rejections)
+    _validate_uniform(tuple(artifacts))
+    return tuple(artifacts)
 
 
 def _export_plan_report(
     artifacts: tuple[_Artifact, ...],
-    rejections: tuple[_ArtifactRejection, ...],
     *,
     input_root: str | Path,
-    expected_task_name: str | None,
 ) -> dict[str, Any]:
     """Summarize the validated source layout used by preflight and publishing."""
 
-    first = artifacts[0] if artifacts else None
+    first = artifacts[0]
     episode_ends = np.cumsum(
         [artifact.length for artifact in artifacts], dtype=np.int64
     )
     return {
         "input_root": str(Path(input_root).resolve()),
-        "task_name": first.task_name if first is not None else expected_task_name,
-        "profile": first.profile.value if first is not None else None,
-        "dt": first.dt if first is not None else None,
-        "source_file_count": len(artifacts) + len(rejections),
+        "task_name": first.task_name,
+        "profile": first.profile.value,
+        "dt": first.dt,
+        "source_file_count": len(artifacts),
         "episode_count": len(artifacts),
-        "rejected_episode_count": len(rejections),
-        "rejected_episodes": [item.to_dict() for item in rejections],
-        "total_frames": int(episode_ends[-1]) if len(episode_ends) else 0,
+        "total_frames": int(episode_ends[-1]),
         "episode_ends": episode_ends.tolist(),
-        "dataset_keys": sorted(first.dataset_shapes) if first is not None else [],
+        "dataset_keys": sorted(first.dataset_shapes),
     }
 
 
@@ -629,16 +232,14 @@ def preflight_processed_hdf5_to_zarr(
     """
 
     resolved = config or PolicyZarrExportConfig()
-    artifacts, rejections = _load_artifacts(
+    artifacts = _load_artifacts(
         input_root,
         resolved,
         progress_callback=progress_callback,
     )
     return _export_plan_report(
         artifacts,
-        rejections,
         input_root=input_root,
-        expected_task_name=resolved.expected_task_name,
     )
 
 
@@ -659,12 +260,6 @@ def _copy_data(
                 target_slice = slice(offset + row_start, offset + row_end)
                 for key in artifacts[0].dataset_shapes:
                     block = np.asarray(source[key][row_start:row_end])
-                    if np.issubdtype(block.dtype, np.floating) and not np.all(
-                        np.isfinite(block)
-                    ):
-                        raise ValueError(
-                            f"{artifact.path.name}: {key} contains NaN/Inf"
-                        )
                     data_group[key][target_slice] = block
                 _report_progress(
                     progress_callback,
@@ -709,7 +304,9 @@ def _validate_zarr(
     expected_ends = np.cumsum(
         [artifact.length for artifact in artifacts], dtype=np.int64
     )
-    if not np.array_equal(root["meta"]["episode_ends"][:], expected_ends):
+    if root["meta"]["episode_ends"].dtype != np.dtype(np.int64) or not np.array_equal(
+        root["meta"]["episode_ends"][:], expected_ends
+    ):
         raise ValueError("Zarr episode_ends mismatch")
     total = int(expected_ends[-1])
     _report_progress(progress_callback, "verify", 0, len(expected_keys))
@@ -735,7 +332,7 @@ def export_processed_hdf5_to_zarr(
     *,
     progress_callback: ExportProgressCallback | None = None,
 ) -> dict[str, Any]:
-    """Atomically publish data/* + meta/episode_ends, without HDF provenance.
+    """Atomically publish one complete Zarr episode for each processed file.
 
     ``progress_callback`` receives ``(phase, completed, total)`` for validation,
     Zarr writing, and structural verification. It does not affect export
@@ -749,21 +346,11 @@ def export_processed_hdf5_to_zarr(
         raise NotADirectoryError(source_root)
     if target_is_occupied(target):
         raise FileExistsError(f"refusing to overwrite existing policy Zarr: {target}")
-    artifacts, rejections = _load_artifacts(
+    artifacts = _load_artifacts(
         source_root,
         resolved,
         progress_callback=progress_callback,
     )
-    if not artifacts:
-        return {
-            "output_path": None,
-            **_export_plan_report(
-                artifacts,
-                rejections,
-                input_root=source_root,
-                expected_task_name=resolved.expected_task_name,
-            ),
-        }
     # All payload admission (including finite checks) completes before a
     # staging directory is created, so a rejected source leaves no partial
     # export artifact behind.
@@ -829,8 +416,6 @@ def export_processed_hdf5_to_zarr(
         "output_path": str(target.resolve()),
         **_export_plan_report(
             artifacts,
-            rejections,
             input_root=source_root,
-            expected_task_name=resolved.expected_task_name,
         ),
     }

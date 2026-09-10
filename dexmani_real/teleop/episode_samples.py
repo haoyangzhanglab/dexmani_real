@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import time
-from typing import Mapping
 
 import numpy as np
 
+from dexmani_real.ipc.causal import read_hand_contact_causal
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning.kinematics.pose import (
     normalize_quat_wxyz,
@@ -68,6 +68,7 @@ def _recording_provenance(
     vr_frame: dict | None,
     cam: dict | None,
     *,
+    hand_contact_source_monotonic_ns: int,
     anchor_monotonic_ns: int | None = None,
     max_observation_skew_s: float,
 ) -> dict[str, object]:
@@ -114,10 +115,8 @@ def _recording_provenance(
 
     source_valid = np.array(
         [
-            arm_source_ns > 0
-            and _field(arm_state, "state_valid") == 1,
-            hand_source_ns > 0
-            and _field(hand_state, "state_valid") == 1,
+            arm_source_ns > 0 and _field(arm_state, "state_valid") == 1,
+            hand_source_ns > 0 and _field(hand_state, "state_valid") == 1,
             vr_source_ns > 0,
             (
                 camera_source_ns > 0 and bool(cam.get("camera_fresh", False))
@@ -151,12 +150,10 @@ def _recording_provenance(
 
     tactile_source_ns = _field(hand_tactile, "source_monotonic_ns")
     tactile_fresh = _dense_tactile_fresh(hand_tactile, anchor_ns=anchor_ns)
-    # Aggregate ``hand_contact`` validity is independent of dense freshness: it
-    # comes from the hand-state aggregate flag and its own causal source time.
+    # Contact selection has already proved validity; age remains telemetry only.
     tactile_sum_fresh = (
-        _field(hand_state, "tactile_sum_valid") == 1
-        and 0 < hand_source_ns <= anchor_ns
-        and anchor_ns - hand_source_ns <= RECORDING_TACTILE_MAX_AGE_NS
+        0 < hand_contact_source_monotonic_ns <= anchor_ns
+        and anchor_ns - hand_contact_source_monotonic_ns <= RECORDING_TACTILE_MAX_AGE_NS
     )
     return {
         "observation_anchor_monotonic_ns": anchor_ns,
@@ -191,7 +188,6 @@ def record_held(
     observation_anchor_monotonic_ns: int | None = None,
     shared: RuntimeChannels | None = None,
     max_observation_skew_s: float,
-    policy_observation: Mapping[str, object] | None = None,
 ) -> None:
     """Record an active safety-fallback frame and its optional hold command.
 
@@ -230,10 +226,19 @@ def record_held(
         if _dense_tactile_fresh(hand_tactile, anchor_ns=anchor_ns)
         else None
     )
+    contact = (
+        read_hand_contact_causal(shared.hand_state_ring, anchor_monotonic_ns=anchor_ns)
+        if shared is not None
+        else None
+    )
     state = build_episode_state(
         arm_state,
         hand_state,
         dense_tactile,
+        hand_contact=None if contact is None else contact["tactile_sum"][0],
+        hand_contact_source_monotonic_ns=(
+            0 if contact is None else int(contact["source_monotonic_ns"][0])
+        ),
         timestamp_s=(
             None
             if observation_anchor_monotonic_ns is None
@@ -257,12 +262,11 @@ def record_held(
                 hand_tactile,
                 vr_frame,
                 cam,
+                hand_contact_source_monotonic_ns=state.hand_contact_source_monotonic_ns,
                 anchor_monotonic_ns=observation_anchor_monotonic_ns,
                 max_observation_skew_s=max_observation_skew_s,
             )
         )
-    if policy_observation is not None:
-        signals.update(policy_observation)
     recorder.add_frame(
         state,
         action,
@@ -289,7 +293,6 @@ def record_frame(
     observation_anchor_monotonic_ns: int | None = None,
     shared: RuntimeChannels | None = None,
     max_observation_skew_s: float,
-    policy_observation: Mapping[str, object] | None = None,
 ) -> None:
     """Record a normal (active teleop) frame.
 
@@ -315,10 +318,19 @@ def record_frame(
         if _dense_tactile_fresh(hand_tactile, anchor_ns=anchor_ns)
         else None
     )
+    contact = (
+        read_hand_contact_causal(shared.hand_state_ring, anchor_monotonic_ns=anchor_ns)
+        if shared is not None
+        else None
+    )
     state = build_episode_state(
         arm_state,
         hand_state,
         dense_tactile,
+        hand_contact=None if contact is None else contact["tactile_sum"][0],
+        hand_contact_source_monotonic_ns=(
+            0 if contact is None else int(contact["source_monotonic_ns"][0])
+        ),
         timestamp_s=(
             None
             if observation_anchor_monotonic_ns is None
@@ -351,12 +363,11 @@ def record_frame(
                 hand_tactile,
                 vr_frame,
                 cam,
+                hand_contact_source_monotonic_ns=state.hand_contact_source_monotonic_ns,
                 anchor_monotonic_ns=observation_anchor_monotonic_ns,
                 max_observation_skew_s=max_observation_skew_s,
             )
         )
-    if policy_observation is not None:
-        signals.update(policy_observation)
     recorder.add_frame(
         state,
         action,

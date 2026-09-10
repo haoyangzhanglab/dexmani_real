@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +9,7 @@ import h5py
 import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
+from dexmani_real.dataset.processed import validate_processed_hdf5
 from dexmani_real.planning import Pose, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 from dexmani_real.planning.paths import wrap_nearest_equivalent
@@ -169,132 +169,23 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
     return trajectory
 
 
-def _processed_replay_source(
-    artifact_path: Path,
-) -> tuple[Path, np.ndarray, int]:
-    """Read the raw-source identity and retained rows from one processed artifact."""
-    from dexmani_real.dataset.processed import (
-        PROCESSED_SCHEMA_NAME,
-        PROCESSED_SCHEMA_VERSION,
-        validate_processed_provenance,
-    )
-
-    if not artifact_path.is_file():
-        raise ValueError(f"processed episode must be an HDF5 file: {artifact_path}")
-    with h5py.File(artifact_path, "r") as artifact:
-        if str(artifact.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
-            raise ValueError(f"not a processed HDF5 artifact: {artifact_path.name}")
-        if int(artifact.attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
-            raise ValueError(
-                f"unsupported processed schema version in {artifact_path.name}"
-            )
-        if str(artifact.attrs.get("domain", "")) != "real":
-            raise ValueError(
-                f"processed episode {artifact_path.name} must have domain='real'"
-            )
-        provenance = validate_processed_provenance(
-            artifact,
-            label=f"processed episode {artifact_path.name}",
-        )
-
-        try:
-            decision = json.loads(str(artifact.attrs["source_decision_json"]))
-        except (KeyError, TypeError, json.JSONDecodeError) as exc:
-            raise ValueError(
-                f"processed episode {artifact_path.name} has invalid source provenance"
-            ) from exc
-        if not isinstance(decision, dict):
-            raise ValueError(
-                f"processed episode {artifact_path.name} has invalid source provenance"
-            )
-        source_path_text = decision.get("source_path")
-        if not isinstance(source_path_text, str) or not source_path_text:
-            raise ValueError(
-                f"processed episode {artifact_path.name} lacks its raw source path"
-            )
-        retained_rows = provenance.source_rows
-        source_frames = int(provenance.keep_mask.shape[0])
-        if not np.array_equal(
-            provenance.segment_ends,
-            np.asarray([retained_rows.size], dtype=np.int64),
-        ) or np.any(np.diff(retained_rows) != 1):
-            raise ValueError(
-                f"processed episode {artifact_path.name} has inconsistent row provenance"
-            )
-
-    return (
-        Path(source_path_text),
-        retained_rows,
-        source_frames,
-    )
-
-
-def _select_raw_trajectory_rows(
-    raw_trajectory: TrajectoryData,
-    retained_rows: np.ndarray,
-) -> TrajectoryData:
-    """Build a replay trajectory from retained raw arm and logical hand targets."""
-    rows = np.asarray(retained_rows, dtype=np.int64)
-    if (
-        rows.ndim != 1
-        or rows.size == 0
-        or rows[0] < 0
-        or rows[-1] >= raw_trajectory.num_frames
-        or np.any(np.diff(rows) <= 0)
-    ):
-        raise ValueError("processed replay rows are invalid for the raw source episode")
-    return TrajectoryData(
-        episode_path=raw_trajectory.episode_path,
-        num_frames=int(rows.size),
-        fps=raw_trajectory.fps,
-        task_label=raw_trajectory.task_label,
-        action_arm_joint=raw_trajectory.action_arm_joint[rows].copy(),
-        action_hand_joint=(
-            None
-            if raw_trajectory.action_hand_joint is None
-            else raw_trajectory.action_hand_joint[rows].copy()
-        ),
-        arm_qpos=raw_trajectory.arm_qpos[rows].copy(),
-        hand_qpos=(
-            None
-            if raw_trajectory.hand_qpos is None
-            else raw_trajectory.hand_qpos[rows].copy()
-        ),
-        arm_ee=(
-            None
-            if raw_trajectory.arm_ee is None
-            else raw_trajectory.arm_ee[rows].copy()
-        ),
-        action_source=raw_trajectory.action_source,
-        send_mask=(
-            None
-            if raw_trajectory.send_mask is None
-            else raw_trajectory.send_mask[rows].copy()
-        ),
-    )
-
-
 def load_processed_trajectory(episode_path: str) -> TrajectoryData:
-    """Load raw arm and logical hand targets selected by one processed artifact.
+    """Load the complete raw command trajectory identified by a processed episode.
 
-    Processed ``float32`` action arrays are training data, not physical commands.
-    This loader uses their row provenance to select retained rows from raw
-    ``float64`` arm and logical hand targets.
+    Processed float32 actions are training values. Physical replay always uses
+    the original raw float64 sent targets and its existing safety preflight.
     """
     artifact_path = Path(episode_path)
-    (
-        source_path,
-        retained_rows,
-        source_frames,
-    ) = _processed_replay_source(artifact_path)
-    raw_trajectory = load_trajectory(str(source_path))
-    if raw_trajectory.num_frames != source_frames:
+    validated = validate_processed_hdf5(artifact_path)
+    with h5py.File(artifact_path, "r") as artifact:
+        source_path = Path(artifact.attrs["source_path"])
+    trajectory = load_trajectory(str(source_path))
+    if trajectory.num_frames != validated["frames"]:
         raise ValueError(
             f"processed episode {artifact_path.name} source frame count does not match raw source"
         )
-    trajectory = _select_raw_trajectory_rows(raw_trajectory, retained_rows)
     logger.info(
-        "Loaded processed replay selection: %d raw frames from %s (artifact=%s)",
+        "Loaded complete raw replay: %d frames from %s (artifact=%s)",
         trajectory.num_frames,
         source_path,
         artifact_path,

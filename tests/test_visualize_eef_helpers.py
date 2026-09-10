@@ -1,11 +1,11 @@
-"""Offline regressions for the visualizer EEF and fingertip helpers.
+"""Offline regressions for the raw and processed visualizer helpers.
 
 No Rerun GUI is started and no hardware is touched: these tests import the two
 example visualizer modules by path and pin their pure render-admission helpers
-— finite derived raw EEF / processed ``eef_pose`` rows yield the position and
-finite ``fingertip`` rows yield the (5,3) positions, while invalid rows yield
-None (the clear-entity path that prevents stale spheres), and the processed
-time-series labels are the frozen ``ee_x..ee_r5`` set.  Run with:
+— finite derived raw EEF rows yield the position, and finite fingertip rows in
+both viewers yield the (5,3) positions. Invalid rows yield None (the
+clear-entity path that prevents stale spheres). Processed EEF is intentionally
+not part of the v17 artifact. Run with:
 
     python -m unittest discover -s tests -p 'test_visualize_eef_helpers.py'
 """
@@ -101,28 +101,11 @@ class TestFingertipHelpers(unittest.TestCase):
         )
         self.assertIsNone(_processed_viz._fingertip_positions_or_none(np.zeros((5, 2))))
 
-
-class TestProcessedEefHelper(unittest.TestCase):
-    def test_finite_row_returns_position(self) -> None:
-        position = _processed_viz._eef_position_or_none(_valid_eef_row())
-        self.assertIsNotNone(position)
-        np.testing.assert_allclose(position, (0.3, -0.1, 0.25))
-
-    def test_invalid_rows_return_none(self) -> None:
-        self.assertIsNone(_processed_viz._eef_position_or_none(np.full(9, np.nan)))
-        self.assertIsNone(_processed_viz._eef_position_or_none(np.zeros(8)))
-
-    def test_series_labels_for_eef_pose(self) -> None:
-        labels = _processed_viz._series_labels("eef_pose", 9)
-        self.assertEqual(
-            labels,
-            ["ee_x", "ee_y", "ee_z", "ee_r0", "ee_r1", "ee_r2", "ee_r3", "ee_r4", "ee_r5"],
-        )
-
-    def test_visual_constants(self) -> None:
-        # EEF sphere is larger than fingertip spheres and distinctly colored.
-        self.assertNotIn(_processed_viz._EEF_COLOR, _processed_viz._FINGERTIP_COLORS)
-        self.assertNotIn(_raw_viz._EEF_COLOR, _raw_viz._FINGERTIP_COLORS)
+    def test_processed_action_ee_labels_remain_available(self) -> None:
+        labels = _processed_viz._series_labels("action_ee", 21)
+        self.assertEqual(labels[:3], ["ee_x", "ee_y", "ee_z"])
+        self.assertEqual(labels[3:9], [f"ee_r{i}" for i in range(6)])
+        self.assertEqual(len(labels), 21)
 
 
 if __name__ == "__main__":

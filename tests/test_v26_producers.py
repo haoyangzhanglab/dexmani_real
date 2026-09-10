@@ -1,7 +1,6 @@
-"""Offline checks of real v26 producer inputs, without SDKs or workers."""
+"""Offline checks of current raw producer inputs, without SDKs or workers."""
 
 from types import SimpleNamespace
-from unittest import mock
 
 import numpy as np
 import pytest
@@ -18,7 +17,6 @@ from dexmani_real.recording.client import RecorderClient
 from dexmani_real.recording.frame import build_episode_frame, decode_record_sample
 from dexmani_real.recording.sample import EpisodeAction, build_episode_state
 from dexmani_real.teleop.episode_samples import record_frame, record_held
-from dexmani_real.teleop.control_loop.grid import _recording_policy_observation_signals
 
 
 def _state():
@@ -166,7 +164,7 @@ def test_fresh_dense_tactile_persists_payload():
     assert np.all(frame.data["hand_tactile_force"] == 7.0)
 
 
-def test_teleop_active_and_ik_hold_reach_real_client_with_v26_fields():
+def test_teleop_active_and_ik_hold_reach_real_client_with_control_step_fields():
     client = _client()
     arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
     arm["tracking_err"] = 0.125
@@ -232,30 +230,3 @@ def test_published_retarget_failure_remains_queued():
     frame = decode_record_sample(client.shared.record_sample_ring.frame[0])
     assert frame.data["flag_frame_status"] == 4
     assert frame.data["flag_action_queued"]
-
-
-@pytest.mark.parametrize(
-    "source_ns, valid", [(950_000_000, True), (800_000_000, False)]
-)
-def test_visual_record_builder_owns_causal_feedback_freshness(source_ns, valid):
-    arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
-    hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
-    for frame in (arm, hand):
-        frame["source_monotonic_ns"] = source_ns
-        frame["state_valid"] = True
-    shared = SimpleNamespace(
-        arm_state_ring=object(),
-        hand_state_ring=object(),
-        hand_tactile_ring=object(),
-    )
-    with mock.patch(
-        "dexmani_real.teleop.control_loop.grid.read_valid_structured_frame_aligned_to_source",
-        side_effect=[(arm, source_ns, 1), (hand, source_ns, 1), None, None],
-    ):
-        signals = _recording_policy_observation_signals(
-            shared,
-            {"source_monotonic_ns": 10**9},
-            anchor_monotonic_ns=1_010_000_000,
-            max_observation_skew_s=0.1,
-        )
-    assert signals["policy_observation_valid"] == valid

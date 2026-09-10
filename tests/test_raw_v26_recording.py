@@ -1,4 +1,4 @@
-"""Offline raw-v26 source-row recording and storage regressions."""
+"""Offline current raw source-row recording and storage regressions."""
 
 import json
 from pathlib import Path
@@ -22,30 +22,36 @@ from dexmani_real.recording.storage.camera_writer import CameraStreamWriter
 from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.recording.storage.schema import (
     DATASET_SPECS,
+    EPISODE_SCHEMA_VERSION,
     SOURCE_FRAME_DATASET_NAMES,
 )
 from dexmani_real.recording.storage.video import VideoDecoder
-from tools.convert_raw_v24_to_v25 import KEEP_DATASETS
 
 
-def test_schema_matches_frozen_converter_projection():
-    # v26 added exactly one aggregate freshness column over the frozen v24->v25
-    # converter projection (which still targets v25).  v27 then added the
-    # persisted camera-health enum and the recording-time camera-aligned tactile
-    # policy-observation fields.
-    v27_added = {
+def test_schema_keeps_control_step_sensor_facts():
+    assert EPISODE_SCHEMA_VERSION == 28
+    assert len(DATASET_SPECS) == 41
+    assert len(SOURCE_FRAME_DATASET_NAMES) == 37
+    assert {
+        "arm_qpos",
+        "hand_qpos",
+        "hand_contact",
+        "hand_tactile_force",
+        "hand_contact_source_monotonic_ns",
+        "action_arm_joint_sent",
+        "action_hand_joint",
+        "action_arm_ee",
+        "observation_anchor_monotonic_ns",
+        "arm_source_monotonic_ns",
+        "hand_source_monotonic_ns",
+        "tactile_source_monotonic_ns",
+        "camera_source_monotonic_ns",
         "camera_health",
-        "policy_observation_contact_force",
-        "policy_observation_contact_force_valid",
-        "policy_observation_tactile_force",
-        "policy_observation_tactile_force_valid",
-        "policy_observation_tactile_source_monotonic_ns",
-        "policy_observation_tactile_calibrated",
-        "policy_observation_tactile_unit_code",
-    }
-    assert len(DATASET_SPECS) == 50
-    assert set(DATASET_SPECS) - set(KEEP_DATASETS) == {"tactile_sum_fresh"} | v27_added
-    assert len(SOURCE_FRAME_DATASET_NAMES) == 46
+        "tactile_sum_fresh",
+        "tactile_fresh",
+        "tactile_calibrated",
+        "tactile_unit_code",
+    }.issubset(SOURCE_FRAME_DATASET_NAMES)
 
 
 def test_decoded_frame_owns_sample_ring_arrays():
@@ -153,7 +159,9 @@ def test_synchronous_finish_raises_after_failed_validation_cleanup(tmp_path):
 
 
 @pytest.mark.parametrize("failed_resource", ["encoder", "depth"])
-def test_camera_close_failure_retains_resource_after_thread_exit(tmp_path, failed_resource):
+def test_camera_close_failure_retains_resource_after_thread_exit(
+    tmp_path, failed_resource
+):
     encoder = mock.Mock()
     depth_file = mock.Mock()
     resource = encoder if failed_resource == "encoder" else depth_file
@@ -198,11 +206,16 @@ def test_finish_retains_unsafe_resource_and_refuses_restart(tmp_path, failed_res
         data_writer.close.side_effect = OSError("HDF5 remains open")
     with (
         mock.patch.object(
-            recorder, "_finalize_episode_files", side_effect=OSError("transaction failed")
+            recorder,
+            "_finalize_episode_files",
+            side_effect=OSError("transaction failed"),
         ),
         mock.patch.object(
-            recorder, "_discard_temp_files",
-            side_effect=OSError("staging remains") if failed_resource == "staging" else None,
+            recorder,
+            "_discard_temp_files",
+            side_effect=(
+                OSError("staging remains") if failed_resource == "staging" else None
+            ),
         ),
     ):
         with pytest.raises(RuntimeError):
@@ -274,7 +287,7 @@ def test_direct_rows_cross_batch_and_preserve_gap(tmp_path):
         path = _save(recorder)
         with EpisodeReader(path) as reader:
             f = reader.h5f
-            assert int(f["meta"].attrs["schema_version"]) == 27
+            assert int(f["meta"].attrs["schema_version"]) == EPISODE_SCHEMA_VERSION
             np.testing.assert_array_equal(f["timestamp"][:], timestamps)
             np.testing.assert_array_equal(f["source_sample_index"][:], np.arange(35))
             np.testing.assert_array_equal(f["fill_reason"][:], 0)
@@ -297,7 +310,7 @@ def test_reader_rejects_old_schema_and_inconsistent_rows(tmp_path):
     with pytest.raises(ValueError, match="unsupported"):
         EpisodeReader(path)
     with h5py.File(path / "data.h5", "r+") as f:
-        f["meta"].attrs["schema_version"] = 27
+        f["meta"].attrs["schema_version"] = EPISODE_SCHEMA_VERSION
         f["meta"].attrs["num_frames"] = 2
     with pytest.raises(ValueError, match="validity"):
         EpisodeReader(path)

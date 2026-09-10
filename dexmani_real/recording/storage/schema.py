@@ -1,11 +1,11 @@
-"""The only supported raw episode layout: physical source rows, schema v27."""
+"""The only supported raw episode layout: physical source rows, schema v28."""
 
 from dataclasses import dataclass
 from enum import IntEnum
 
 import numpy as np
 
-EPISODE_SCHEMA_VERSION = 27
+EPISODE_SCHEMA_VERSION = 28
 ARM_SENT_DATASET = "action_arm_joint_sent"
 
 
@@ -36,6 +36,7 @@ DATASET_SPECS = {
     "hand_qpos": _spec(np.float64, (12,)),
     "hand_current": _spec(np.float64, (12,)),
     "hand_contact": _spec(np.float64, (5, 3)),
+    "hand_contact_source_monotonic_ns": _spec(np.uint64),
     "hand_tactile_force": _spec(np.float64, (5, 120, 3)),
     "arm_connected": _spec(np.bool_),
     "hand_connected": _spec(np.bool_),
@@ -54,9 +55,8 @@ DATASET_SPECS = {
     "tactile_source_monotonic_ns": _spec(np.uint64),
     "vr_source_monotonic_ns": _spec(np.uint64),
     "camera_source_monotonic_ns": _spec(np.uint64),
-    # ``tactile_sum_fresh`` marks the aggregate ``hand_contact`` payload valid;
-    # ``tactile_fresh`` marks the dense ``hand_tactile_force`` payload valid.
-    # The two payloads share one calibration state and unit convention below.
+    # Aggregate contact can be valid but old; freshness is telemetry only.
+    # Dense calibration/unit telemetry below describes its separate ring frame.
     "tactile_sum_fresh": _spec(np.bool_),
     "tactile_fresh": _spec(np.bool_),
     "tactile_calibrated": _spec(np.bool_),
@@ -67,19 +67,6 @@ DATASET_SPECS = {
     "camera_health": _spec(np.uint8),
     "camera_depth_frame_number": _spec(np.uint64),
     "camera_color_frame_number": _spec(np.uint64),
-    "policy_observation_arm_qpos": _spec(np.float64, (7,)),
-    "policy_observation_hand_qpos": _spec(np.float64, (12,)),
-    "policy_observation_valid": _spec(np.bool_),
-    # Recording-time camera-aligned tactile, selected from the high-rate hand
-    # rings at camera source time (mirrors deployment observation semantics).
-    # Invalid float payloads are persisted as NaN with the valid flag false.
-    "policy_observation_contact_force": _spec(np.float64, (5, 3)),
-    "policy_observation_contact_force_valid": _spec(np.bool_),
-    "policy_observation_tactile_force": _spec(np.float64, (5, 120, 3)),
-    "policy_observation_tactile_force_valid": _spec(np.bool_),
-    "policy_observation_tactile_source_monotonic_ns": _spec(np.uint64),
-    "policy_observation_tactile_calibrated": _spec(np.bool_),
-    "policy_observation_tactile_unit_code": _spec(np.uint8),
     "vr_wrist_pos": _spec(np.float64, (3,)),
     "vr_wrist_rot6d": _spec(np.float64, (6,)),
     "vr_landmarks": _spec(np.float64, (21, 3)),

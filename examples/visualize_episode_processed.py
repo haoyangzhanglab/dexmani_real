@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Usage: ``python examples/visualize_episode_processed.py PROCESSED.h5 [--info] [--max-frames N]``.
 
-Self-contained Rerun-based visualizer for processed HDF5 v16
+Self-contained Rerun-based visualizer for processed HDF5 v17
 (``dexmani-real-processed-hdf5``) artifacts written by
 ``examples/process_episodes.py``.  Offline only: connects to no hardware, writes
 no files; opens a Rerun viewer window (or prints a structure summary with
@@ -9,8 +9,8 @@ no files; opens a Rerun viewer window (or prints a structure summary with
 
 Unlike ``examples/visualize_episode.py``, which derives a current-config point
 cloud preview from raw v27 RGB-D, this reads a single ``.h5`` file whose RGB,
-depth, and point cloud are already stored grid-aligned at ``(T, ...)`` with
-processing provenance. The point cloud is precomputed in the xArm base frame,
+depth, and point cloud are already stored grid-aligned at ``(T, ...)``. The
+point cloud is precomputed in the xArm base frame,
 so nothing is back-projected here.
 
 Examples::
@@ -66,27 +66,10 @@ _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
 )
 
 
-# Fixed, easily distinguishable from the five finger colors.
-_EEF_COLOR = (255, 255, 255)
-
-
-def _eef_position_or_none(eef_pose_row: np.ndarray) -> np.ndarray | None:
-    """Return the processed ``eef_pose`` position when finite, else None.
-
-    ``None`` marks a row that must not be rendered; the caller clears the EEF
-    entity instead of leaving a stale sphere.  Processed v16 rows are validated
-    finite, so this is a fail-safe guard, not an admission path.
-    """
-    row = np.asarray(eef_pose_row, dtype=np.float64)
-    if row.shape != (9,) or not np.all(np.isfinite(row)):
-        return None
-    return row[:3]
-
-
 def _fingertip_positions_or_none(fingertip_row: np.ndarray) -> np.ndarray | None:
     """Return the processed fingertip positions when renderable, else None.
 
-    Processed v16 validates finiteness at admission, so ``None`` is a
+    Processed v17 validates finiteness at admission, so ``None`` is a
     fail-safe guard; the caller clears the fingertips entity rather than
     leaving the previous frame's spheres visible at the new timestep.
     """
@@ -112,15 +95,13 @@ def _series_labels(key: str, dim: int) -> list[str]:
             + [f"ee_r{i}" for i in range(6)]
             + list(_HAND_JOINT_LABELS)
         )
-    if key == "eef_pose" and dim == 9:
-        return ["ee_x", "ee_y", "ee_z"] + [f"ee_r{i}" for i in range(6)]
     if key == "contact_force_mag" and dim == 5:
         return list(HAND_FINGER_NAMES)
     return [str(i) for i in range(dim)]
 
 
 def _present_keys(h5f: h5py.File) -> set[str]:
-    """Top-level HDF5 datasets (excludes the provenance group)."""
+    """Top-level HDF5 datasets in the processed artifact."""
     return {k for k in h5f.keys() if isinstance(h5f[k], h5py.Dataset)}
 
 
@@ -221,18 +202,6 @@ def print_episode_info(h5_path: str) -> None:
             print(f"sampling: {attrs['point_cloud_sampling']}")
             print()
 
-        if "provenance" in f:
-            prov = f["provenance"]
-            kept = prov.get("source_row_index")
-            total = prov.get("source_keep_mask")
-            names = prov.attrs.get("drop_reason_bit_names_json", "")
-            if isinstance(kept, h5py.Dataset) and isinstance(total, h5py.Dataset):
-                print(
-                    f"provenance: retained {kept.shape[0]}/{total.shape[0]} source rows "
-                    f"(drop reasons: {names})"
-                )
-            print()
-
         if "joint_state" in f:
             q = f["joint_state"][:]
             print(
@@ -265,7 +234,7 @@ def print_episode_info(h5_path: str) -> None:
 
 
 class ProcessedEpisodeVisualizer:
-    """Load a processed HDF5 v16 file and stream it into Rerun for interactive viewing."""
+    """Load a processed HDF5 v17 file and stream it into Rerun."""
 
     def __init__(
         self,
@@ -282,7 +251,7 @@ class ProcessedEpisodeVisualizer:
                 != PROCESSED_SCHEMA_VERSION
             ):
                 raise ValueError(
-                    f"{self._h5_path.name} is not a processed HDF5 v16 artifact"
+                    f"{self._h5_path.name} is not a processed HDF5 v17 artifact"
                 )
             self._keys = _present_keys(self._h5f)
             if "joint_state" not in self._keys and "action" not in self._keys:
@@ -316,10 +285,15 @@ class ProcessedEpisodeVisualizer:
             self._pointcloud_num_points = _validate_pointcloud_dataset(self._h5f)
             self._has_pointcloud = self._pointcloud_num_points is not None
 
-            # Preload the small scalar/tactile/fingertip modalities; the larger
+            # Preload the small scalar/fingertip modalities; the larger
             # rgb/depth/point_cloud arrays are sliced per frame in log_step.
             self._state = self._preload_state()
-            self._timestamps = self._preload_timestamps()
+            self._dt = float(self._h5f.attrs.get("dt", np.nan))
+            if not np.isfinite(self._dt) or self._dt <= 0:
+                raise ValueError("processed dt must be finite and positive")
+            # Processed rows are the logical control timeline. They do not
+            # need raw source timestamps or a provenance group for rendering.
+            self._timestamps = np.arange(self._T, dtype=np.float64) * self._dt
 
             self._depth_meter = self._resolve_depth_meter()
             self._K, self._h, self._w = self._resolve_intrinsics()
@@ -359,11 +333,8 @@ class ProcessedEpisodeVisualizer:
     def _preload_state(self) -> dict[str, np.ndarray]:
         """Read small non-camera, non-pointcloud datasets into memory, truncated to T."""
         state: dict[str, np.ndarray] = {}
-        # eef_pose is small and preloaded; tactile_force (T,5,120,3) is never
-        # preloaded into RAM by this viewer.
         expected_tails = {
             "joint_state": (19,),
-            "eef_pose": (9,),
             "action": (19,),
             "action_ee": (21,),
             "fingertip_points": (5, 3),
@@ -398,12 +369,6 @@ class ProcessedEpisodeVisualizer:
             state["contact_force_mag"] = np.linalg.norm(contact, axis=2)  # (T, 5)
         return state
 
-    def _preload_timestamps(self) -> np.ndarray | None:
-        prov = self._h5f.get("provenance")
-        if prov is None or "source_timestamp_s" not in prov:
-            return None
-        return np.asarray(prov["source_timestamp_s"][: self._T], dtype=np.float64)
-
     def _resolve_depth_meter(self) -> float | None:
         """Rerun ``DepthImage`` meter = raw units per meter = 1 / meters-per-unit."""
         if "depth" not in self._keys:
@@ -427,8 +392,6 @@ class ProcessedEpisodeVisualizer:
         groups: list[tuple[str, str]] = []
         if "joint_state" in self._state:
             groups.append(("state", "joint_state"))
-        if "eef_pose" in self._state:
-            groups.append(("state", "eef_pose"))
         for key in ("action", "action_ee"):
             if key in self._state:
                 groups.append(("action", key))
@@ -451,7 +414,6 @@ class ProcessedEpisodeVisualizer:
         has_3d = (
             self._pc_enabled
             or "fingertip_points" in self._state
-            or "eef_pose" in self._state
         )
         if has_3d:
             columns.append(
@@ -508,12 +470,10 @@ class ProcessedEpisodeVisualizer:
     def log_step(self, step_idx: int) -> None:
         """Log camera, point cloud, fingertips, and time series for one timestep."""
         rr.set_time_sequence("step", step_idx)
-        if self._timestamps is not None:
-            rr.set_time_seconds("time", float(self._timestamps[step_idx]))
+        rr.set_time_seconds("time", float(self._timestamps[step_idx]))
         self._log_camera(step_idx)
         self._log_pointcloud(step_idx)
         self._log_fingertips(step_idx)
-        self._log_eef(step_idx)
         self._log_time_series(step_idx)
 
     def _log_camera(self, step_idx: int) -> None:
@@ -569,24 +529,6 @@ class ProcessedEpisodeVisualizer:
                 positions=fp,
                 colors=np.array(_FINGERTIP_COLORS, dtype=np.uint8),
                 radii=0.012,
-            ),
-        )
-
-    def _log_eef(self, step_idx: int) -> None:
-        """Render the processed eef_pose position as one larger sphere."""
-        ee_data = self._state.get("eef_pose")
-        if ee_data is None:
-            return
-        position = _eef_position_or_none(ee_data[step_idx])
-        if position is None:
-            rr.log("eef", rr.Clear(recursive=False))
-            return
-        rr.log(
-            "eef",
-            rr.Points3D(
-                positions=position[None, :],
-                colors=np.array([_EEF_COLOR], dtype=np.uint8),
-                radii=0.020,  # EEF sphere is intentionally larger than fingertips
             ),
         )
 

@@ -21,16 +21,10 @@ from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
     read_causal_structured_frame,
     read_hand_tactile_causal,
-    read_valid_structured_frame_aligned_to_source,
     read_vr_frame_causal,
     vr_frame_is_fresh,
 )
 from dexmani_real.ipc.channels import RuntimeChannels
-from dexmani_real.ipc.schema import (
-    ARM_JOINT_SHAPE,
-    HAND_JOINT_SHAPE,
-    TACTILE_UNIT_CODE_XHAND_SDK_NATIVE,
-)
 from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.pose import (
@@ -196,7 +190,6 @@ class TeleopGridObservation:
     hand_tactile: np.ndarray | None
     anchor_monotonic_ns: int
     control_run_generation: int
-    policy_observation_signals: dict[str, object] | None
 
 
 @dataclass(frozen=True)
@@ -382,208 +375,6 @@ def feedback_is_newer_than_pause(
     )
 
 
-def _empty_policy_observation_signals() -> dict[str, object]:
-    """Return an explicit invalid policy-observation record.
-
-    Invalid tactile payloads are persisted as NaN with a false valid flag and a
-    zero source timestamp, so an invalid reading can never be mistaken for a
-    valid no-contact reading downstream.
-    """
-    return {
-        "policy_observation_arm_qpos": np.full(ARM_JOINT_SHAPE, np.nan),
-        "policy_observation_hand_qpos": np.full(HAND_JOINT_SHAPE, np.nan),
-        "policy_observation_valid": False,
-        "policy_observation_contact_force": np.full((5, 3), np.nan),
-        "policy_observation_contact_force_valid": False,
-        "policy_observation_tactile_force": np.full((5, 120, 3), np.nan),
-        "policy_observation_tactile_force_valid": False,
-        "policy_observation_tactile_source_monotonic_ns": 0,
-        "policy_observation_tactile_calibrated": False,
-        "policy_observation_tactile_unit_code": 0,
-    }
-
-
-def _recording_policy_observation_signals(
-    shared: RuntimeChannels,
-    camera_frame: dict[str, Any] | None,
-    *,
-    anchor_monotonic_ns: int,
-    max_observation_skew_s: float,
-) -> dict[str, object]:
-    """Pair causal arm/hand/tactile feedback with the recorded camera source time.
-
-    Teleoperation itself continues to use the latest feedback at the grid cut.
-    This separate record is the observation a point-cloud policy will receive
-    at deployment, so recording it prevents an offline train/deploy time shift.
-    The tactile pair (aggregate ``contact_force`` and dense ``tactile_force``)
-    is selected from the high-rate hand rings at the camera source time — the
-    same causal semantics the deployment observation builder uses — and stored
-    with its source/calibration/unit provenance so offline processing never has
-    to re-select across persisted rows.
-    """
-    signals = _empty_policy_observation_signals()
-    if camera_frame is None:
-        return signals
-    reference_ns = int(camera_frame.get("source_monotonic_ns", 0))
-    anchor_ns = int(anchor_monotonic_ns)
-    max_skew_ns = int(round(float(max_observation_skew_s) * 1e9))
-    # arm/hand qpos use the validity-gated read so a transient read-failure
-    # frame (state_valid=False / qpos_stale=True re-published with the previous
-    # source) falls back to the previous valid sample instead of failing the
-    # observation — matching deployment's skip-invalid-then-align.
-    arm_result = read_valid_structured_frame_aligned_to_source(
-        shared.arm_state_ring,
-        source_field="source_monotonic_ns",
-        reference_source_monotonic_ns=reference_ns,
-        anchor_monotonic_ns=anchor_ns,
-        required_true_fields=("state_valid",),
-    )
-    hand_result = read_valid_structured_frame_aligned_to_source(
-        shared.hand_state_ring,
-        source_field="source_monotonic_ns",
-        reference_source_monotonic_ns=reference_ns,
-        anchor_monotonic_ns=anchor_ns,
-        required_true_fields=("state_valid",),
-        required_false_fields=("qpos_stale",),
-    )
-    if arm_result is None or hand_result is None:
-        return signals
-    arm_state, _arm_publish_ns, _arm_sequence = arm_result
-    hand_state, _hand_publish_ns, _hand_sequence = hand_result
-    arm_names = arm_state.dtype.names or ()
-    hand_names = hand_state.dtype.names or ()
-    if (
-        "state_valid" not in arm_names
-        or "state_valid" not in hand_names
-        or "qpos" not in arm_names
-        or "qpos" not in hand_names
-        or not bool(arm_state["state_valid"][0])
-        or not bool(hand_state["state_valid"][0])
-        or ("qpos_stale" in hand_names and bool(hand_state["qpos_stale"][0]))
-    ):
-        return signals
-    arm_qpos = np.asarray(arm_state["qpos"][0], dtype=np.float64)
-    hand_qpos = np.asarray(hand_state["qpos"][0], dtype=np.float64)
-    arm_source_ns = int(arm_state["source_monotonic_ns"][0])
-    hand_source_ns = int(hand_state["source_monotonic_ns"][0])
-    if (
-        arm_qpos.shape != ARM_JOINT_SHAPE
-        or hand_qpos.shape != HAND_JOINT_SHAPE
-        or not np.all(np.isfinite(arm_qpos))
-        or not np.all(np.isfinite(hand_qpos))
-        or min(reference_ns, arm_source_ns, hand_source_ns) <= 0
-    ):
-        return signals
-    if (
-        reference_ns - min(arm_source_ns, hand_source_ns)
-    ) > max_skew_ns:
-        return signals
-
-    # Tactile pair: aggregate ``contact_force`` comes from the hand-state
-    # aggregate flag, the dense ``tactile_force`` and calibration/unit
-    # provenance from the tactile ring.  Each side is read with the same
-    # validity-gated fallback the deployment observer uses (the newest *valid*
-    # frame at or before the camera source), so a transient invalid tactile
-    # sample falls back to the previous valid sample instead of failing the
-    # observation.  Both rings are published together with one source time, so
-    # the deployment source-match contract reduces to an equality check.
-    aggregate_result = read_valid_structured_frame_aligned_to_source(
-        shared.hand_state_ring,
-        source_field="source_monotonic_ns",
-        reference_source_monotonic_ns=reference_ns,
-        anchor_monotonic_ns=anchor_ns,
-        required_true_fields=("state_valid", "tactile_sum_valid"),
-        required_false_fields=("qpos_stale",),
-    )
-    dense_result = read_valid_structured_frame_aligned_to_source(
-        shared.hand_tactile_ring,
-        source_field="source_monotonic_ns",
-        reference_source_monotonic_ns=reference_ns,
-        anchor_monotonic_ns=anchor_ns,
-        required_true_fields=("fresh", "calibrated"),
-    )
-    aggregate_state = aggregate_result[0] if aggregate_result is not None else None
-    dense_state = dense_result[0] if dense_result is not None else None
-    aggregate_names = (
-        aggregate_state.dtype.names or () if aggregate_state is not None else ()
-    )
-    dense_names = dense_state.dtype.names or () if dense_state is not None else ()
-    aggregate_source_ns = (
-        int(aggregate_state["source_monotonic_ns"][0])
-        if aggregate_state is not None
-        else 0
-    )
-    dense_source_ns = (
-        int(dense_state["source_monotonic_ns"][0]) if dense_state is not None else 0
-    )
-    tactile_calibrated = (
-        bool(dense_state["calibrated"][0])
-        if dense_state is not None and "calibrated" in dense_names
-        else False
-    )
-    tactile_unit_code = (
-        int(dense_state["unit_code"][0])
-        if dense_state is not None and "unit_code" in dense_names
-        else 0
-    )
-    tactile_force = (
-        np.asarray(dense_state["tactile_force"][0], dtype=np.float64)
-        if dense_state is not None and "tactile_force" in dense_names
-        else np.full((5, 120, 3), np.nan)
-    )
-    tactile_sum = (
-        np.asarray(aggregate_state["tactile_sum"][0], dtype=np.float64)
-        if aggregate_state is not None and "tactile_sum" in aggregate_names
-        else np.full((5, 3), np.nan)
-    )
-    aggregate_valid = (
-        aggregate_state is not None
-        and tactile_sum.shape == (5, 3)
-        and np.all(np.isfinite(tactile_sum))
-    )
-    provenance_valid = (
-        tactile_calibrated and tactile_unit_code == TACTILE_UNIT_CODE_XHAND_SDK_NATIVE
-    )
-    source_match = (
-        aggregate_source_ns > 0 and aggregate_source_ns == dense_source_ns
-    )
-    skew_ok = (
-        aggregate_source_ns > 0
-        and reference_ns - aggregate_source_ns <= max_skew_ns
-    )
-    contact_valid = aggregate_valid and provenance_valid and source_match and skew_ok
-    dense_valid = (
-        dense_state is not None
-        and provenance_valid
-        and source_match
-        and skew_ok
-        and tactile_force.shape == (5, 120, 3)
-        and np.all(np.isfinite(tactile_force))
-    )
-
-    signals.update(
-        {
-            "policy_observation_arm_qpos": arm_qpos.copy(),
-            "policy_observation_hand_qpos": hand_qpos.copy(),
-            "policy_observation_valid": True,
-            "policy_observation_contact_force": (
-                tactile_sum.copy() if contact_valid else np.full((5, 3), np.nan)
-            ),
-            "policy_observation_contact_force_valid": bool(contact_valid),
-            "policy_observation_tactile_force": (
-                tactile_force.copy() if dense_valid else np.full((5, 120, 3), np.nan)
-            ),
-            "policy_observation_tactile_force_valid": bool(dense_valid),
-            "policy_observation_tactile_source_monotonic_ns": (
-                aggregate_source_ns if source_match else 0
-            ),
-            "policy_observation_tactile_calibrated": tactile_calibrated,
-            "policy_observation_tactile_unit_code": tactile_unit_code,
-        }
-    )
-    return signals
-
-
 def _record_grid_hold(
     controller: TeleopController,
     shared: RuntimeChannels,
@@ -616,7 +407,6 @@ def _record_grid_hold(
         observation_anchor_monotonic_ns=observation.anchor_monotonic_ns,
         shared=shared,
         max_observation_skew_s=resources.max_observation_skew_s,
-        policy_observation=observation.policy_observation_signals,
         **kwargs,
     )
 
@@ -863,16 +653,6 @@ def _read_control_grid_observation(
         )
 
     assert vr_frame is not None
-    policy_observation_signals = (
-        _recording_policy_observation_signals(
-            shared,
-            cam,
-            anchor_monotonic_ns=observation_anchor_monotonic_ns,
-            max_observation_skew_s=resources.max_observation_skew_s,
-        )
-        if recording_active
-        else None
-    )
     return (
         TeleopGridTickResult(
             recording_active=recording_active,
@@ -890,7 +670,6 @@ def _read_control_grid_observation(
             hand_tactile=hand_tactile,
             anchor_monotonic_ns=observation_anchor_monotonic_ns,
             control_run_generation=control_run_generation,
-            policy_observation_signals=policy_observation_signals,
         ),
     )
 
@@ -1165,7 +944,6 @@ def _publish_solved_action(
             observation_anchor_monotonic_ns=_current_grid_anchor_ns,
             shared=shared,
             max_observation_skew_s=resources.max_observation_skew_s,
-            policy_observation=observation.policy_observation_signals,
         )
     return True
 

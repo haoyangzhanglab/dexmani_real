@@ -668,27 +668,6 @@ def _select_camera_control_grid(
     return tuple(selected), logical_step_ns
 
 
-def _align_state_history_to_camera_frames(
-    state_history: FrameWindow | None,
-    camera_history: tuple[PointCloudFrame | RgbFrame, ...],
-    *,
-    max_skew_ns: int,
-) -> FrameWindow | None:
-    """Causally align state to a selected point-cloud or RGB reference timeline.
-
-    For every camera source time, choose the newest valid state at or
-    before that time. Future state samples and pairs outside the explicit skew
-    budget are rejected rather than interpolated or padded.
-    """
-    return _align_state_history_to_reference_ns(
-        state_history,
-        np.asarray(
-            [frame.source_monotonic_ns for frame in camera_history], dtype=np.uint64
-        ),
-        max_skew_ns=max_skew_ns,
-    )
-
-
 def _build_observation(
     shared: RuntimeChannels,
     policy: PolicyParams,
@@ -707,6 +686,14 @@ def _build_observation(
     gated by its source/publish timestamps and modality-specific health flags.
     """
     horizon = int(getattr(policy_spec, "n_obs_steps"))
+    reference_ns, logical_step_ns = _select_control_grid_reference_ns(
+        run_started_ns=run_started_ns,
+        anchor_ns=anchor_ns,
+        history_len=horizon,
+        step_dt_ns=step_dt_ns,
+    )
+    if logical_step_ns <= 0:
+        return None
     max_age_ns = int(policy.max_input_age_s * 1e9)
     max_skew_ns = int(policy.max_observation_skew_s * 1e9)
     max_grid_lag_ns = int(policy.max_grid_lag_s * 1e9)
@@ -722,7 +709,6 @@ def _build_observation(
     requested = _requested_observation_fields(policy_spec)
     pointcloud_requested = "point_cloud" in requested
     rgb_requested = "rgb" in requested
-    camera_requested = pointcloud_requested or rgb_requested
     rgb_history: tuple[RgbFrame, ...] = ()
     fields = {field.name: field for field in policy_spec.observation_fields}
     rgb_shape = tuple(fields["rgb"].shape) if rgb_requested else None
@@ -750,7 +736,7 @@ def _build_observation(
             history_len=shared.pointcloud_ring.maxlen,
             not_before_ns=run_started_ns,
         )
-        pointcloud_history, logical_step_ns = _select_camera_control_grid(
+        pointcloud_history, _ = _select_camera_control_grid(
             all_pointclouds,
             run_started_ns=run_started_ns,
             anchor_ns=anchor_ns,
@@ -778,7 +764,7 @@ def _build_observation(
             history_len=shared.camera_ring.maxlen,
             not_before_ns=run_started_ns,
         )
-        selected_rgb, logical_step_ns = _select_camera_control_grid(
+        selected_rgb, _ = _select_camera_control_grid(
             all_rgb,
             run_started_ns=run_started_ns,
             anchor_ns=anchor_ns,
@@ -787,13 +773,6 @@ def _build_observation(
             max_grid_lag_ns=max_grid_lag_ns,
         )
         rgb_history = selected_rgb
-    else:
-        reference_ns, logical_step_ns = _select_control_grid_reference_ns(
-            run_started_ns=run_started_ns,
-            anchor_ns=anchor_ns,
-            history_len=horizon,
-            step_dt_ns=step_dt_ns,
-        )
     if rgb_requested and len(rgb_history) == horizon:
         assert rgb_shape is not None
         rgb_history = _resize_rgb_history(
@@ -843,65 +822,31 @@ def _build_observation(
                 max_age_ns=state_history_max_age_ns,
                 not_before_ns=run_started_ns,
             )
-    reference_history: tuple[PointCloudFrame | RgbFrame, ...]
-    if pointcloud_requested:
-        reference_history = pointcloud_history
-    else:
-        reference_history = rgb_history
-    if camera_requested and len(reference_history) == horizon:
-        arm_history = _align_state_history_to_camera_frames(
-            arm_history,
-            reference_history,
+    # Every modality uses the policy control grid; camera exposure times do
+    # not move the robot/contact observation back to an earlier raw instant.
+    arm_history = _align_state_history_to_reference_ns(
+        arm_history, reference_ns, max_skew_ns=max_skew_ns
+    )
+    if hand_history is not None:
+        hand_history = _align_state_history_to_reference_ns(
+            hand_history, reference_ns, max_skew_ns=max_skew_ns
+        )
+    if hand_tactile_sum_history is not None:
+        hand_tactile_sum_history = _align_state_history_to_reference_ns(
+            hand_tactile_sum_history, reference_ns, max_skew_ns=max_skew_ns
+        )
+    if hand_tactile_provenance_history is not None:
+        hand_tactile_provenance_history = _align_state_history_to_reference_ns(
+            hand_tactile_provenance_history,
+            reference_ns,
             max_skew_ns=max_skew_ns,
         )
-        if hand_state_requested:
-            hand_history = _align_state_history_to_camera_frames(
-                hand_history,
-                reference_history,
-                max_skew_ns=max_skew_ns,
-            )
-        if hand_tactile_sum_history is not None:
-            hand_tactile_sum_history = _align_state_history_to_camera_frames(
-                hand_tactile_sum_history,
-                reference_history,
-                max_skew_ns=max_skew_ns,
-            )
-        if hand_tactile_provenance_history is not None:
-            hand_tactile_provenance_history = _align_state_history_to_camera_frames(
-                hand_tactile_provenance_history,
-                reference_history,
-                max_skew_ns=max_skew_ns,
-            )
-        if hand_tactile_force_history is not None:
-            hand_tactile_force_history = _align_state_history_to_camera_frames(
-                hand_tactile_force_history,
-                reference_history,
-                max_skew_ns=max_skew_ns,
-            )
-    elif not camera_requested and logical_step_ns > 0:
-        arm_history = _align_state_history_to_reference_ns(
-            arm_history, reference_ns, max_skew_ns=max_skew_ns
+    if hand_tactile_force_history is not None:
+        hand_tactile_force_history = _align_state_history_to_reference_ns(
+            hand_tactile_force_history,
+            reference_ns,
+            max_skew_ns=max_skew_ns,
         )
-        if hand_history is not None:
-            hand_history = _align_state_history_to_reference_ns(
-                hand_history, reference_ns, max_skew_ns=max_skew_ns
-            )
-        if hand_tactile_sum_history is not None:
-            hand_tactile_sum_history = _align_state_history_to_reference_ns(
-                hand_tactile_sum_history, reference_ns, max_skew_ns=max_skew_ns
-            )
-        if hand_tactile_provenance_history is not None:
-            hand_tactile_provenance_history = _align_state_history_to_reference_ns(
-                hand_tactile_provenance_history,
-                reference_ns,
-                max_skew_ns=max_skew_ns,
-            )
-        if hand_tactile_force_history is not None:
-            hand_tactile_force_history = _align_state_history_to_reference_ns(
-                hand_tactile_force_history,
-                reference_ns,
-                max_skew_ns=max_skew_ns,
-            )
     if pointcloud_requested:
         if pointcloud is None or logical_step_ns <= 0:
             return None

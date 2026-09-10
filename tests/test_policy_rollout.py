@@ -1258,6 +1258,9 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
                 executor_mod, "read_camera_frame_causal", return_value=camera
             ),
             mock.patch.object(executor_mod, "build_episode_state", return_value=state),
+            mock.patch.object(
+                executor_mod, "read_hand_contact_causal", return_value=None
+            ),
             mock.patch.object(executor, "_record_frame", return_value=True) as record,
         ):
             executor._record_rollout_tick(now)

@@ -1,10 +1,9 @@
-"""Processed-v16 schema, provenance, specifications, and strict validation."""
+"""Processed control-step schema and payload validation."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -12,22 +11,18 @@ import h5py
 import numpy as np
 
 from dexmani_real.config.pointcloud import (
+    PointCloudConfig,
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
     POINT_CLOUD_SAMPLING,
     POINT_CLOUD_TRANSFORM,
 )
 from dexmani_real.dataset.contracts import (
+    OutputProfile,
     ProcessingConfig,
     validate_processed_task_name,
 )
 from dexmani_real.dataset.pointcloud import validate_rigid_transform
-from dexmani_real.planning.kinematics.arm_fk import (
-    EEF_POSE_ALGORITHM_ID,
-    EEF_POSE_COMPONENTS,
-    EEF_POSE_DERIVATION,
-    EEF_POSE_FRAME,
-)
 from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
@@ -35,38 +30,14 @@ from dexmani_real.planning.kinematics.fingertip import (
 from dexmani_real.planning.kinematics.pose import validate_canonical_rot6d
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 16
-# Visual profile contact_force/tactile_force are now selected at recording time
-# from the high-rate hand rings at camera source time (matching deployment),
-# instead of being re-selected offline from the persisted 16 Hz rows.
-_CONTACT_FORCE_SOURCE_VISUAL = "recording_time_camera_aligned_tactile_sum"
-_CONTACT_FORCE_SOURCE_JOINT = "control_grid_tactile_sum"
-_CONTACT_FORCE_ALIGNMENT_VISUAL = (
-    "recording_time_newest_source_not_after_camera_within_max_observation_skew"
-)
-_CONTACT_FORCE_ALIGNMENT_JOINT = (
-    "newest_source_not_after_grid_within_max_observation_skew"
-)
-_PROVENANCE_DATASETS = (
-    "source_row_index",
-    "source_sample_index",
-    "source_timestamp_s",
-    "source_segment_ends",
-    "source_keep_mask",
-    "source_drop_reason_bits",
-    "tactile_source_row_index",
-    "observation_reference_monotonic_ns",
-    "tactile_source_monotonic_ns",
-)
-_PROVENANCE_ATTRS = ("drop_reason_bit_names_json",)
+PROCESSED_SCHEMA_VERSION = 17
+_CONTACT_FORCE_SOURCE = "raw_hand_contact_control_step"
 _VALIDATION_CHUNK_BYTES = 64 * 1024 * 1024
 _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "joint_state": ((19,), np.dtype(np.float32)),
-    "eef_pose": ((9,), np.dtype(np.float32)),
     "action": ((19,), np.dtype(np.float32)),
     "action_ee": ((21,), np.dtype(np.float32)),
     "contact_force": ((5, 3), np.dtype(np.float32)),
-    "tactile_force": ((5, 120, 3), np.dtype(np.float32)),
     "fingertip_points": ((5, 3), np.dtype(np.float32)),
 }
 _FRAME_CHUNKED_DATASETS = frozenset(("rgb", "depth", "point_cloud"))
@@ -79,16 +50,6 @@ _CONTACT_FORCE_FRAME = "xhand_sensor_native_axes_per_finger"
 _FINGERTIP_POINTS_FRAME = "xarm_base"
 _FINGERTIP_POINTS_UNIT = "m"
 _ACTION_EE_FRAME = "xarm_base"
-# Only source-provable tactile semantics are persisted: SDK orders and axis
-# labels are facts of the xhand driver; SI units and taxel spatial geometry
-# are explicitly unverified.
-_TACTILE_FORCE_REPRESENTATION = "xhand_sdk_raw_force_fx_fy_fz_bias_corrected"
-_TACTILE_FORCE_SENSOR_ORDER = "xhand_sdk_sensor_data_order"
-_TACTILE_FORCE_POINT_ORDER = "xhand_sdk_sensor_data_raw_force_order"
-_TACTILE_FORCE_AXIS_LABELS = "fx_fy_fz"
-_TACTILE_FORCE_UNIT = "xhand_sdk_native_unknown_si"
-_TACTILE_FORCE_SI_VERIFIED = False
-_TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED = False
 
 
 def _validate_processed_task_name_attr(attrs: Any, *, label: str) -> str:
@@ -119,80 +80,6 @@ def validate_fingertip_points_semantics(
     return values
 
 
-def validate_eef_pose_semantics(
-    attrs: Any,
-    *,
-    label: str,
-) -> dict[str, str]:
-    """Return the required persisted EEF frame and derivation identity."""
-    values: dict[str, str] = {}
-    for key in ("frame", "components", "derivation", "algorithm_id"):
-        value = attrs.get(f"eef_pose_{key}", "")
-        if isinstance(value, bytes):
-            value = value.decode("utf-8")
-        values[key] = str(value).strip()
-    expected = {
-        "frame": EEF_POSE_FRAME,
-        "components": EEF_POSE_COMPONENTS,
-        "derivation": EEF_POSE_DERIVATION,
-        "algorithm_id": EEF_POSE_ALGORITHM_ID,
-    }
-    for key, expected_value in expected.items():
-        if values[key] != expected_value:
-            raise ValueError(f"{label}: invalid eef_pose_{key}")
-    return values
-
-
-def validate_tactile_force_semantics(
-    attrs: Any,
-    *,
-    label: str,
-) -> None:
-    """Check the persisted full-tactile contract; only provable facts exist.
-
-    The validator pins the XHand SDK representation/order/axis identity and
-    the conservative ``si_verified``/``spatial_geometry_verified`` negatives,
-    plus the same provenance gates the causal selector enforces.  It never
-    re-derives payload values and never assumes a contact-sum equivalence.
-    """
-    def _text(name: str) -> str:
-        value = attrs.get(name, "")
-        if isinstance(value, bytes):
-            value = value.decode("utf-8")
-        return str(value).strip()
-
-    expected_text = {
-        "tactile_force_representation": _TACTILE_FORCE_REPRESENTATION,
-        "tactile_force_sensor_order": _TACTILE_FORCE_SENSOR_ORDER,
-        "tactile_force_point_order": _TACTILE_FORCE_POINT_ORDER,
-        "tactile_force_axis_labels": _TACTILE_FORCE_AXIS_LABELS,
-        "tactile_force_unit": _TACTILE_FORCE_UNIT,
-    }
-    for name, expected in expected_text.items():
-        if _text(name) != expected:
-            raise ValueError(f"{label}: invalid {name}")
-    if _strict_bool_attr(attrs, "tactile_force_si_verified") is not (
-        _TACTILE_FORCE_SI_VERIFIED
-    ):
-        raise ValueError(f"{label}: invalid tactile_force_si_verified")
-    if _strict_bool_attr(attrs, "tactile_force_spatial_geometry_verified") is not (
-        _TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED
-    ):
-        raise ValueError(
-            f"{label}: invalid tactile_force_spatial_geometry_verified"
-        )
-    for name in (
-        "tactile_force_fresh_required",
-        "tactile_force_calibrated_required",
-        "tactile_force_causal_to_reference",
-        "tactile_force_hand_source_match_required",
-    ):
-        if not _strict_bool_attr(attrs, name):
-            raise ValueError(f"{label}: {name} must be true")
-    if _strict_integer_attr(attrs, "tactile_force_unit_code") != 0:
-        raise ValueError(f"{label}: tactile_force_unit_code must be 0")
-
-
 def _strict_bool_attr(attrs: Any, name: str) -> bool:
     """Read one schema boolean without accepting truthy strings or integers."""
     try:
@@ -213,23 +100,6 @@ def _strict_integer_attr(attrs: Any, name: str) -> int:
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
         raise ValueError(f"{name} must be an integer HDF5 attribute")
     return int(value)
-
-
-@dataclass(frozen=True)
-class ProcessedProvenance:
-    """Validated compact-row provenance shared by processing and export."""
-
-    source_rows: np.ndarray
-    source_samples: np.ndarray
-    source_timestamps: np.ndarray
-    segment_ends: np.ndarray
-    keep_mask: np.ndarray
-    drop_reason_bits: np.ndarray
-    drop_reason_names: tuple[str, ...]
-    hard_invalid_reason_names: tuple[str, ...]
-    tactile_source_rows: np.ndarray
-    observation_reference_ns: np.ndarray
-    tactile_source_ns: np.ndarray
 
 
 def _json(value: Any) -> str:
@@ -294,19 +164,15 @@ def validate_processed_payload(
     for key, (_expected_shape, expected_dtype) in expected_specs.items():
         dataset = source[key]
         dtype = np.dtype(expected_dtype)
-        if not np.issubdtype(dtype, np.floating) and key != "point_cloud":
-            continue
         for row_slice in _dataset_row_slices(dataset):
+            # Integer image payloads must also be readable. This checks storage
+            # integrity without treating sensor pixel values as quality gates.
             block = np.asarray(dataset[row_slice])
             if np.issubdtype(dtype, np.floating) and not np.all(np.isfinite(block)):
                 raise ValueError(f"{label}: {key} contains NaN/Inf")
             if key == "action_ee":
                 validate_canonical_rot6d(
                     block[:, 3:9], label=f"{label}: action_ee rot6d"
-                )
-            if key == "eef_pose":
-                validate_canonical_rot6d(
-                    block[:, 3:9], label=f"{label}: eef_pose rot6d"
                 )
             if key == "point_cloud":
                 if np.any(block[..., 3:] < 0.0) or np.any(block[..., 3:] > 1.0):
@@ -335,10 +201,6 @@ def validate_processed_payload(
                 f"{label}: rgb/depth spatial shape mismatch: "
                 f"rgb={rgb.shape}, depth={depth.shape}"
             )
-        for row_slice in _dataset_row_slices(depth):
-            depth_block = np.asarray(depth[row_slice], dtype=np.uint16)
-            if np.any(~np.any(depth_block > 0, axis=(1, 2))):
-                raise ValueError(f"{label}: depth contains an all-invalid frame")
         k = np.asarray(intrinsic[:], dtype=np.float64).reshape(length, 3, 3)
         canonical_last_row = np.broadcast_to(
             np.asarray((0.0, 0.0, 1.0), dtype=np.float64), (length, 3)
@@ -368,7 +230,7 @@ def _validate_processed_structure(
         raise ValueError(f"{label}: processed length must be positive")
     expected_keys = set(expected_specs)
     present_keys = set(source.keys())
-    if not expected_keys.issubset(present_keys) or "provenance" not in present_keys:
+    if expected_keys != present_keys:
         raise ValueError(f"{label}: processed data keys are incomplete")
     for key, (expected_shape, expected_dtype) in expected_specs.items():
         dataset = source.get(key)
@@ -398,201 +260,6 @@ def _validate_processed_structure(
             raise ValueError(f"{label}: camera_extrinsic must be (N,4,4)")
         if key == "point_cloud" and (dataset.ndim != 3 or dataset.shape[-1] != 6):
             raise ValueError(f"{label}: point_cloud must be (N,P,6)")
-
-
-def validate_processed_provenance(
-    source: h5py.File | h5py.Group,
-    *,
-    length: int | None = None,
-    source_frames: int | None = None,
-    dt: float | None = None,
-    contiguity_tolerance_s: float | None = None,
-    label: str = "processed",
-) -> ProcessedProvenance:
-    """Validate processed provenance and return its compact mapping.
-
-    This is an internal row-selection provenance contract. It records how
-    processed rows map back to the source episode; it is not an authenticity
-    mechanism.
-    """
-    attrs = source.attrs
-    if length is None:
-        length = int(attrs.get("episode_steps", -1))
-    if source_frames is None:
-        source_frames = int(attrs.get("source_frames", -1))
-    if dt is None:
-        dt = float(attrs.get("dt", np.nan))
-    if contiguity_tolerance_s is None:
-        contiguity_tolerance_s = float(
-            attrs.get("source_contiguity_tolerance_s", np.nan)
-        )
-    if length <= 0 or source_frames < length:
-        raise ValueError(f"{label}: invalid processed/source frame counts")
-    if not np.isfinite(dt) or dt <= 0.0:
-        raise ValueError(f"{label}: dt must be finite and positive")
-    if not np.isfinite(contiguity_tolerance_s) or contiguity_tolerance_s <= 0.0:
-        raise ValueError(f"{label}: invalid source contiguity tolerance")
-
-    provenance = source.get("provenance")
-    if not isinstance(provenance, h5py.Group):
-        raise ValueError(f"{label}: provenance group is missing")
-    if not set(_PROVENANCE_DATASETS).issubset(provenance.keys()):
-        raise ValueError(f"{label}: required provenance datasets are missing")
-    if not set(_PROVENANCE_ATTRS).issubset(provenance.attrs.keys()):
-        raise ValueError(f"{label}: required provenance attributes are missing")
-
-    expected_dtypes: dict[str, np.dtype[Any]] = {
-        "source_row_index": np.dtype(np.int64),
-        "source_sample_index": np.dtype(np.int64),
-        "source_timestamp_s": np.dtype(np.float64),
-        "source_segment_ends": np.dtype(np.int64),
-        "source_keep_mask": np.dtype(np.bool_),
-        "source_drop_reason_bits": np.dtype(np.uint64),
-        "tactile_source_row_index": np.dtype(np.int64),
-        "observation_reference_monotonic_ns": np.dtype(np.int64),
-        "tactile_source_monotonic_ns": np.dtype(np.int64),
-    }
-    expected_shapes = {
-        "source_row_index": (length,),
-        "source_sample_index": (length,),
-        "source_timestamp_s": (length,),
-        "source_segment_ends": None,
-        "source_keep_mask": (source_frames,),
-        "source_drop_reason_bits": (source_frames,),
-        "tactile_source_row_index": (length,),
-        "observation_reference_monotonic_ns": (length,),
-        "tactile_source_monotonic_ns": (length,),
-    }
-    values: dict[str, np.ndarray] = {}
-    for key in _PROVENANCE_DATASETS:
-        dataset = provenance[key]
-        if not isinstance(dataset, h5py.Dataset):
-            raise ValueError(f"{label}: provenance/{key} is not a dataset")
-        if dataset.dtype != expected_dtypes[key]:
-            raise ValueError(
-                f"{label}: provenance/{key} dtype must be "
-                f"{expected_dtypes[key]}, got {dataset.dtype}"
-            )
-        expected_shape = expected_shapes[key]
-        if expected_shape is not None and dataset.shape != expected_shape:
-            raise ValueError(
-                f"{label}: provenance/{key} shape must be {expected_shape}, "
-                f"got {dataset.shape}"
-            )
-        if key == "source_segment_ends" and (
-            dataset.ndim != 1 or dataset.shape[0] == 0
-        ):
-            raise ValueError(f"{label}: provenance/{key} shape is invalid")
-        values[key] = np.asarray(dataset[:])
-
-    rows = values["source_row_index"]
-    samples = values["source_sample_index"]
-    timestamps = values["source_timestamp_s"]
-    segment_ends = values["source_segment_ends"]
-    keep_mask = values["source_keep_mask"]
-    reasons = values["source_drop_reason_bits"]
-    if (
-        np.any(rows < 0)
-        or np.any(samples < 0)
-        or np.any(np.diff(rows) <= 0)
-        or np.any(np.diff(samples) <= 0)
-        or not np.all(np.isfinite(timestamps))
-        or np.any(np.diff(timestamps) <= 0.0)
-        or np.any(segment_ends <= 0)
-        or np.any(np.diff(segment_ends) <= 0)
-        or segment_ends[-1] != length
-        or not np.array_equal(rows, np.flatnonzero(keep_mask))
-        or np.any(reasons[keep_mask] != 0)
-        or np.any(reasons[~keep_mask] == 0)
-    ):
-        raise ValueError(f"{label}: provenance row mapping mismatch")
-
-    # Tactile proof: contact_force[t] and tactile_force[t] must come from one
-    # raw row that was already persisted at the processed source row and whose
-    # sample time is causal to the observation reference within the skew cap.
-    tactile_rows = values["tactile_source_row_index"]
-    reference_ns = values["observation_reference_monotonic_ns"]
-    tactile_ns = values["tactile_source_monotonic_ns"]
-    max_observation_skew_s = float(attrs.get("max_observation_skew_s", np.nan))
-    if not np.isfinite(max_observation_skew_s) or max_observation_skew_s <= 0.0:
-        raise ValueError(f"{label}: invalid max_observation_skew_s")
-    max_skew_ns = int(round(max_observation_skew_s * 1e9))
-    if (
-        np.any(tactile_rows < 0)
-        or np.any(tactile_rows >= source_frames)
-        or np.any(tactile_rows > rows)
-        or np.any(reference_ns <= 0)
-        or np.any(tactile_ns <= 0)
-        or np.any(tactile_ns > reference_ns)
-        or np.any(reference_ns - tactile_ns > max_skew_ns)
-    ):
-        raise ValueError(f"{label}: tactile provenance causality mismatch")
-
-    reason_names_value = _json_object_attr(
-        provenance, "drop_reason_bit_names_json", label=label
-    )
-    if (
-        set(reason_names_value) != {str(bit) for bit in range(len(reason_names_value))}
-        or len(reason_names_value) > 64
-        or any(
-            not isinstance(name, str) or not name
-            for name in reason_names_value.values()
-        )
-        or len(set(reason_names_value.values())) != len(reason_names_value)
-    ):
-        raise ValueError(f"{label}: invalid drop-reason name mapping")
-    reason_names = tuple(
-        reason_names_value[str(bit)] for bit in range(len(reason_names_value))
-    )
-    valid_reason_bits = (
-        np.uint64((1 << len(reason_names)) - 1)
-        if len(reason_names) < 64
-        else np.iinfo(np.uint64).max
-    )
-    if np.any(reasons & ~valid_reason_bits):
-        raise ValueError(f"{label}: unknown provenance reason bit")
-
-    discontinuity = (
-        (np.diff(rows) != 1)
-        | (np.diff(samples) != 1)
-        | (np.abs(np.diff(timestamps) - dt) > contiguity_tolerance_s)
-    )
-    expected_segment_ends = np.concatenate(
-        (np.flatnonzero(discontinuity).astype(np.int64) + 1, [length])
-    )
-    if not np.array_equal(segment_ends, expected_segment_ends):
-        raise ValueError(f"{label}: source segment boundaries mismatch")
-
-    # The compact arrays above are the authoritative row-selection record.
-    # Keep the JSON decision for source identity and hard-invalid reasons, but
-    # do not rescan its derived counts/ranges against the same arrays.
-    source_decision = _json_object_attr(source, "source_decision_json", label=label)
-    source_path = source_decision.get("source_path")
-    if not isinstance(source_path, str) or not source_path:
-        raise ValueError(f"{label}: source_decision_json source_path is required")
-    hard_invalid_value = source_decision.get("hard_invalid_reason_names")
-    if (
-        not isinstance(hard_invalid_value, list)
-        or any(not isinstance(name, str) for name in hard_invalid_value)
-        or len(set(hard_invalid_value)) != len(hard_invalid_value)
-        or not set(hard_invalid_value).issubset(reason_names)
-    ):
-        raise ValueError(f"{label}: invalid hard-invalid reason names")
-    hard_invalid_reason_names = tuple(hard_invalid_value)
-
-    return ProcessedProvenance(
-        source_rows=rows,
-        source_samples=samples,
-        source_timestamps=timestamps,
-        segment_ends=segment_ends,
-        keep_mask=keep_mask,
-        drop_reason_bits=reasons,
-        drop_reason_names=reason_names,
-        hard_invalid_reason_names=hard_invalid_reason_names,
-        tactile_source_rows=tactile_rows,
-        observation_reference_ns=reference_ns,
-        tactile_source_ns=tactile_ns,
-    )
 
 
 def _dataset_row_slices(dataset: h5py.Dataset) -> Iterator[slice]:
@@ -632,246 +299,162 @@ def _expected_specs(
     return specs
 
 
-def _validate_processed_output_structure(
-    path: str | Path, config: ProcessingConfig
+def validate_processed_hdf5(
+    path: str | Path, config: ProcessingConfig | None = None
 ) -> dict[str, Any]:
-    """Reopen one just-written output and verify its publishable HDF5 layout.
+    """Validate a complete v17 episode before publishing or consuming it.
 
-    Writer-side sanity is intentionally bounded to metadata, keys, dtype, and
-    shape.  Payload values and semantic attributes are fully checked only at
-    the explicit ``verify_output`` step or by a consumer/export boundary.
+    Image dimensions and point-cloud configuration are self-describing. A caller
+    may additionally supply its expected preprocessing configuration.
     """
     artifact = Path(path)
     with h5py.File(artifact, "r") as source:
-        length = int(source.attrs.get("episode_steps", -1))
-        specs = _expected_specs(length, config)
-        if length < config.min_episode_frames:
-            raise ValueError(f"{artifact.name}: episode_steps={length} is too short")
-        if str(source.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
-            raise ValueError(f"{artifact.name}: invalid schema_name")
-        if int(source.attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
+        attrs = source.attrs
+        length = _strict_integer_attr(attrs, "episode_steps")
+        source_frames = _strict_integer_attr(attrs, "source_frames")
+        if length <= 0 or source_frames != length:
+            raise ValueError(f"{artifact.name}: source_frames must equal episode_steps")
+        if _strict_integer_attr(attrs, "schema_version") != PROCESSED_SCHEMA_VERSION:
             raise ValueError(f"{artifact.name}: invalid schema_version")
-        if str(source.attrs.get("domain", "")) != "real":
-            raise ValueError(f"{artifact.name}: domain must be real")
-        if str(source.attrs.get("profile", "")) != config.profile.value:
-            raise ValueError(f"{artifact.name}: profile mismatch")
-        _validate_processed_task_name_attr(source.attrs, label=artifact.name)
-        validate_fingertip_points_semantics(source.attrs, label=artifact.name)
-        validate_eef_pose_semantics(source.attrs, label=artifact.name)
-        validate_tactile_force_semantics(source.attrs, label=artifact.name)
-        if not isinstance(source.get("provenance"), h5py.Group):
-            raise ValueError(f"{artifact.name}: provenance is not an HDF5 group")
-        _validate_processed_structure(
-            source,
-            expected_specs=specs,
-            length=length,
-            label=artifact.name,
-        )
-    return {
-        "path": artifact.name,
-        "frames": length,
-        "keys": sorted(specs),
-        "level": "structural",
-    }
-
-
-def validate_processed_hdf5(
-    path: str | Path, config: ProcessingConfig
-) -> dict[str, Any]:
-    """Fail closed on a processed Real HDF5 v16 artifact."""
-
-    artifact = Path(path)
-    with h5py.File(artifact, "r") as source:
-        length = int(source.attrs.get("episode_steps", -1))
-        if length < config.min_episode_frames:
-            raise ValueError(f"{artifact.name}: episode_steps={length} is too short")
-        specs = _expected_specs(length, config)
+        if _strict_integer_attr(attrs, "source_schema_version") <= 0:
+            raise ValueError(f"{artifact.name}: invalid source_schema_version")
+        for name in ("source_path", "source_episode"):
+            if not isinstance(attrs.get(name), str) or not attrs[name]:
+                raise ValueError(f"{artifact.name}: missing {name}")
+        profile = OutputProfile(str(attrs.get("profile", "")))
+        dt = float(attrs.get("dt", np.nan))
+        if not np.isfinite(dt) or dt <= 0:
+            raise ValueError(f"{artifact.name}: invalid dt")
+        _validate_processed_task_name_attr(attrs, label=artifact.name)
+        expected_attrs = {
+            "schema_name": PROCESSED_SCHEMA_NAME,
+            "domain": "real",
+            "obs_alignment": "obs[t]_before_action[t]",
+            "observation_alignment": "control_step_latest_causal",
+            "state_alignment": "control_step",
+            "action_semantics": "teleop_published_joint_target",
+            "contact_force_source": _CONTACT_FORCE_SOURCE,
+            "contact_force_representation": _CONTACT_FORCE_REPRESENTATION,
+            "contact_force_unit": _CONTACT_FORCE_UNIT,
+            "contact_force_frame": _CONTACT_FORCE_FRAME,
+            "fingertip_points_frame": _FINGERTIP_POINTS_FRAME,
+            "fingertip_points_unit": _FINGERTIP_POINTS_UNIT,
+            "action_ee_frame": _ACTION_EE_FRAME,
+            "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
+        }
+        validate_fingertip_points_semantics(attrs, label=artifact.name)
+        if (
+            _strict_bool_attr(attrs, "contact_force_si_verified")
+            is not _CONTACT_FORCE_SI_VERIFIED
+        ):
+            raise ValueError(f"{artifact.name}: invalid contact_force_si_verified")
+        specs = {
+            name: ((length, *tail), dtype)
+            for name, (tail, dtype) in _CORE_DATASET_SPECS.items()
+        }
+        if profile.needs_rgb:
+            rgb, depth = source.get("rgb"), source.get("depth")
+            if (
+                not isinstance(rgb, h5py.Dataset)
+                or rgb.ndim != 4
+                or not isinstance(depth, h5py.Dataset)
+            ):
+                raise ValueError(f"{artifact.name}: RGB-D datasets are incomplete")
+            height, width = rgb.shape[1:3]
+            if height <= 0 or width <= 0:
+                raise ValueError(f"{artifact.name}: invalid image dimensions")
+            specs.update(
+                {
+                    "rgb": ((length, height, width, 3), np.dtype(np.uint8)),
+                    "depth": ((length, height, width), np.dtype(np.uint16)),
+                    "camera_intrinsic": ((length, 9), np.dtype(np.float32)),
+                    "camera_extrinsic": ((length, 4, 4), np.dtype(np.float32)),
+                }
+            )
+            scale = float(attrs.get("depth_scale_m_per_unit", np.nan))
+            if not np.isfinite(scale) or scale <= 0:
+                raise ValueError(f"{artifact.name}: invalid depth scale")
+            if _strict_integer_attr(attrs, "depth_invalid_value") != 0:
+                raise ValueError(f"{artifact.name}: invalid depth_invalid_value")
+            expected_attrs.update(
+                {
+                    "rgb_transform": "resize_no_crop",
+                    "depth_transform": "depth_to_color_aligned_resize_no_crop_nearest",
+                    "camera_intrinsic_semantics": "resized_color_intrinsics_for_depth_to_color_aligned_depth",
+                    "camera_extrinsic_semantics": "T_xarm_base_from_color;native_color_optical_to_xarm_base",
+                }
+            )
+            depth_k = np.asarray(
+                attrs.get("source_camera_depth_intrinsics_native", ()), dtype=np.float64
+            )
+            if depth_k.shape != (9,) or not np.all(np.isfinite(depth_k)):
+                raise ValueError(f"{artifact.name}: invalid native depth intrinsics")
+            validate_rigid_transform(
+                np.asarray(attrs.get("camera_T_color_from_depth", ())),
+                label="camera_T_color_from_depth",
+            )
+        workspace = None
+        if profile.needs_pointcloud:
+            persisted = _json_object_attr(
+                source, "processing_config_json", label=artifact.name
+            )
+            if set(persisted) != {"pointcloud", "table_plane_abcd"}:
+                raise ValueError(
+                    f"{artifact.name}: invalid point-cloud processing config"
+                )
+            pointcloud = PointCloudConfig(**persisted["pointcloud"])
+            table_plane = persisted["table_plane_abcd"]
+            if table_plane is not None:
+                plane = np.asarray(table_plane, dtype=np.float64)
+                if (
+                    plane.shape != (4,)
+                    or not np.all(np.isfinite(plane))
+                    or plane[2] <= 0
+                ):
+                    raise ValueError(f"{artifact.name}: invalid table plane")
+            workspace = pointcloud.workspace
+            specs["point_cloud"] = (
+                (length, pointcloud.num_points, 6),
+                np.dtype(np.float32),
+            )
+            expected_attrs.update(
+                {
+                    "point_cloud_frame": "xarm_base",
+                    "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
+                    "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
+                    "point_cloud_sampling": POINT_CLOUD_SAMPLING,
+                    "point_cloud_transform": POINT_CLOUD_TRANSFORM,
+                    "point_cloud_table_plane_abcd_json": _json(table_plane),
+                }
+            )
+            if not np.array_equal(
+                attrs.get("point_cloud_shape", ()), (pointcloud.num_points, 6)
+            ):
+                raise ValueError(f"{artifact.name}: invalid point_cloud_shape")
+            if config is not None and persisted != {
+                "pointcloud": config.pointcloud.to_dict(),
+                "table_plane_abcd": (
+                    None
+                    if config.table_plane_abcd is None
+                    else list(config.table_plane_abcd)
+                ),
+            }:
+                raise ValueError(
+                    f"{artifact.name}: point-cloud processing config mismatch"
+                )
+        for name, expected in expected_attrs.items():
+            if attrs.get(name) != expected:
+                raise ValueError(f"{artifact.name}: invalid {name}")
+        if config is not None and (
+            profile != config.profile or specs != _expected_specs(length, config)
+        ):
+            raise ValueError(f"{artifact.name}: processing profile/shape mismatch")
         validate_processed_payload(
             source,
             expected_specs=specs,
             length=length,
             label=artifact.name,
-            validate_rgbd=config.profile.needs_rgb,
-            pointcloud_workspace=(
-                config.pointcloud.workspace if config.profile.needs_pointcloud else None
-            ),
+            validate_rgbd=profile.needs_rgb,
+            pointcloud_workspace=workspace,
         )
-        if config.profile.needs_rgb:
-            scale = float(source.attrs.get("depth_scale_m_per_unit", np.nan))
-            if not np.isfinite(scale) or scale <= 0.0:
-                raise ValueError(f"{artifact.name}: invalid depth scale")
-            if (
-                str(source.attrs.get("camera_intrinsic_semantics", ""))
-                != "resized_color_intrinsics_for_depth_to_color_aligned_depth"
-                or str(source.attrs.get("camera_extrinsic_semantics", ""))
-                != "T_xarm_base_from_color;native_color_optical_to_xarm_base"
-                or str(source.attrs.get("depth_transform", ""))
-                != "depth_to_color_aligned_resize_no_crop_nearest"
-            ):
-                raise ValueError(f"{artifact.name}: invalid aligned RGB-D semantics")
-            depth_k = np.asarray(
-                source.attrs.get("source_camera_depth_intrinsics_native", ()),
-                dtype=np.float64,
-            )
-            color_from_depth = np.asarray(
-                source.attrs.get("camera_T_color_from_depth", ()),
-                dtype=np.float64,
-            )
-            if depth_k.shape != (9,) or not np.all(np.isfinite(depth_k)):
-                raise ValueError(f"{artifact.name}: invalid native depth intrinsics")
-            validate_rigid_transform(
-                color_from_depth,
-                label="camera_T_color_from_depth",
-            )
-        if config.profile.needs_pointcloud:
-            if (
-                not np.array_equal(
-                    np.asarray(source.attrs.get("point_cloud_shape", ())),
-                    np.asarray((config.pointcloud.num_points, 6)),
-                )
-                or str(source.attrs.get("point_cloud_frame", "")) != "xarm_base"
-                or str(source.attrs.get("point_cloud_color_source", ""))
-                != POINT_CLOUD_COLOR_SOURCE
-                or str(source.attrs.get("point_cloud_policy_id", ""))
-                != POINT_CLOUD_POLICY_ID
-                or str(source.attrs.get("point_cloud_table_plane_abcd_json", ""))
-                != _json(
-                    None
-                    if config.table_plane_abcd is None
-                    else list(config.table_plane_abcd)
-                )
-                or str(source.attrs.get("point_cloud_sampling", ""))
-                != POINT_CLOUD_SAMPLING
-                or str(source.attrs.get("point_cloud_transform", ""))
-                != POINT_CLOUD_TRANSFORM
-            ):
-                raise ValueError(
-                    f"{artifact.name}: invalid v{PROCESSED_SCHEMA_VERSION} point-cloud semantics"
-                )
-        if str(source.attrs.get("schema_name", "")) != PROCESSED_SCHEMA_NAME:
-            raise ValueError(f"{artifact.name}: invalid schema_name")
-        if int(source.attrs.get("schema_version", -1)) != PROCESSED_SCHEMA_VERSION:
-            raise ValueError(f"{artifact.name}: invalid schema_version")
-        if str(source.attrs.get("domain", "")) != "real":
-            raise ValueError(f"{artifact.name}: domain must be real")
-        if str(source.attrs.get("profile", "")) != config.profile.value:
-            raise ValueError(f"{artifact.name}: profile mismatch")
-        _validate_processed_task_name_attr(source.attrs, label=artifact.name)
-        if str(source.attrs.get("obs_alignment", "")) != "obs[t]_before_action[t]":
-            raise ValueError(f"{artifact.name}: invalid observation/action alignment")
-        visual_profile = config.profile.needs_rgb or config.profile.needs_pointcloud
-        expected_state_alignment = (
-            "camera_source_aligned_state" if visual_profile else "control_grid_state"
-        )
-        expected_reference = (
-            "camera_source_monotonic_ns"
-            if visual_profile
-            else "grid_anchor_monotonic_ns"
-        )
-        expected_contact_source = (
-            _CONTACT_FORCE_SOURCE_VISUAL
-            if visual_profile
-            else _CONTACT_FORCE_SOURCE_JOINT
-        )
-        expected_contact_alignment = (
-            _CONTACT_FORCE_ALIGNMENT_VISUAL
-            if visual_profile
-            else _CONTACT_FORCE_ALIGNMENT_JOINT
-        )
-        contact_force_si_verified = _strict_bool_attr(
-            source.attrs, "contact_force_si_verified"
-        )
-        contact_force_fresh_required = _strict_bool_attr(
-            source.attrs, "contact_force_fresh_required"
-        )
-        contact_force_calibrated_required = _strict_bool_attr(
-            source.attrs, "contact_force_calibrated_required"
-        )
-        contact_force_unit_code = _strict_integer_attr(
-            source.attrs, "contact_force_unit_code"
-        )
-        contact_force_causal_to_reference = _strict_bool_attr(
-            source.attrs, "contact_force_causal_to_reference"
-        )
-        contact_force_hand_source_match_required = _strict_bool_attr(
-            source.attrs, "contact_force_hand_source_match_required"
-        )
-        validate_fingertip_points_semantics(source.attrs, label=artifact.name)
-        validate_eef_pose_semantics(source.attrs, label=artifact.name)
-        validate_tactile_force_semantics(source.attrs, label=artifact.name)
-        if (
-            str(source.attrs.get("state_alignment", "")) != expected_state_alignment
-            or str(source.attrs.get("observation_reference", "")) != expected_reference
-            or not np.isclose(
-                float(source.attrs.get("max_observation_skew_s", np.nan)),
-                config.max_observation_skew_s,
-                rtol=0.0,
-                atol=1e-15,
-            )
-            or str(source.attrs.get("action_semantics", ""))
-            != "teleop_published_joint_target"
-            or str(source.attrs.get("contact_force_representation", ""))
-            != _CONTACT_FORCE_REPRESENTATION
-            or str(source.attrs.get("contact_force_unit", "")) != _CONTACT_FORCE_UNIT
-            or contact_force_si_verified is not _CONTACT_FORCE_SI_VERIFIED
-            or str(source.attrs.get("contact_force_frame", "")) != _CONTACT_FORCE_FRAME
-            or str(source.attrs.get("contact_force_source", ""))
-            != expected_contact_source
-            or str(source.attrs.get("contact_force_alignment", ""))
-            != expected_contact_alignment
-            or not contact_force_fresh_required
-            or not contact_force_calibrated_required
-            or contact_force_unit_code != 0
-            or not contact_force_causal_to_reference
-            or not contact_force_hand_source_match_required
-            or str(source.attrs.get("fingertip_points_frame", ""))
-            != _FINGERTIP_POINTS_FRAME
-            or str(source.attrs.get("fingertip_points_unit", ""))
-            != _FINGERTIP_POINTS_UNIT
-            or str(source.attrs.get("action_ee_frame", "")) != _ACTION_EE_FRAME
-        ):
-            raise ValueError(f"{artifact.name}: invalid processed data contract")
-        if str(source.attrs.get("source_contiguity", "")) != (
-            "segment_ends_in_provenance"
-        ):
-            raise ValueError(f"{artifact.name}: invalid source-contiguity contract")
-        for key in (
-            "processing_config_json",
-            "quality_summary_json",
-        ):
-            try:
-                value = json.loads(str(source.attrs[key]))
-            except (KeyError, TypeError, json.JSONDecodeError) as exc:
-                raise ValueError(f"{artifact.name}: invalid {key}") from exc
-            if not isinstance(value, dict):
-                raise ValueError(f"{artifact.name}: {key} must encode an object")
-        if json.loads(str(source.attrs["processing_config_json"])) != config.to_dict():
-            raise ValueError(f"{artifact.name}: processing config mismatch")
-        provenance = validate_processed_provenance(
-            source,
-            label=artifact.name,
-        )
-        segment_ends = provenance.segment_ends
-        dt = float(source.attrs.get("dt", np.nan))
-        tolerance_s = float(source.attrs.get("source_contiguity_tolerance_s", np.nan))
-        if (
-            not np.isfinite(tolerance_s)
-            or tolerance_s <= 0.0
-            or not np.isclose(
-                tolerance_s,
-                max(1e-7, dt * config.grid_dt_relative_tolerance),
-                rtol=0.0,
-                atol=1e-15,
-            )
-        ):
-            raise ValueError(f"{artifact.name}: invalid contiguity tolerance")
-        segment_starts = np.concatenate(
-            (np.asarray([0], dtype=np.int64), segment_ends[:-1])
-        )
-        full_window_count = sum(
-            max(0, int(end - start) - config.horizon + 1)
-            for start, end in zip(segment_starts, segment_ends, strict=True)
-        )
-        if full_window_count < config.min_full_windows:
-            raise ValueError(f"{artifact.name}: insufficient source-contiguous windows")
-        return {"path": artifact.name, "frames": length, "keys": sorted(specs)}
+    return {"path": artifact.name, "frames": length, "keys": sorted(specs)}

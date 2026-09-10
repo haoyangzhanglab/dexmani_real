@@ -30,7 +30,6 @@ from dexmani_real.dataset.export import (
     export_processed_hdf5_to_zarr,
     preflight_processed_hdf5_to_zarr,
 )
-from dexmani_real.dataset.processed import PROCESSED_SCHEMA_VERSION
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -78,49 +77,13 @@ def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:
     return Path("datasets") / f"{task_name}.zarr", task_name
 
 
-def _format_export_failure(exc: Exception) -> str:
-    """Add the recovery hint for a processed artifact rejected by policy export."""
-
-    message = str(exc)
-    if "invalid Real core modality semantics" in message:
-        return (
-            f"{message}\n"
-            "hint: Policy Zarr v9 requires teleop-published-target processed "
-            f"v{PROCESSED_SCHEMA_VERSION} data; reprocess raw v27 with --task-name <task>"
-        )
-    return message
-
-
-def _print_export_admission(report: dict) -> None:
-    """Print whole-episode rejections and one concise batch summary."""
-
-    for rejection in report["rejected_episodes"]:
-        print(f"REJECT {rejection['episode']}:", file=sys.stderr)
-        print(
-            f"  {rejection['invalid_frame_count']} invalid frame(s); "
-            f"rows: {rejection['invalid_ranges']}",
-            file=sys.stderr,
-        )
-        for reason in rejection["reasons"]:
-            print(
-                f"  reason: {reason['reason']} "
-                f"({reason['frame_count']} frame(s), rows {reason['ranges']})",
-                file=sys.stderr,
-            )
-    print(
-        f"Exported {report['episode_count']}/{report['source_file_count']} episode(s); "
-        f"rejected {report['rejected_episode_count']} episode(s).",
-        file=sys.stderr,
-    )
-
-
 class _ExportProgress:
     """Render the data-layer's cumulative progress events as one bar per phase."""
 
     _PHASE_LABELS = {
         "validate": ("validate processed episodes", "file"),
         "write": ("write policy Zarr", "frame"),
-        "verify": ("verify policy Zarr", "chunk"),
+        "verify": ("verify policy Zarr", "array"),
     }
 
     def __init__(self) -> None:
@@ -181,12 +144,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         UnicodeError,
         ValueError,
     ) as exc:
-        print(f"Export failed: {_format_export_failure(exc)}", file=sys.stderr)
+        print(f"Export failed: {exc}", file=sys.stderr)
         return 1
     finally:
         progress.close()
-    _print_export_admission(report)
-    return 0 if report["episode_count"] > 0 else 1
+    verb = "Validated" if args.dry_run else "Exported"
+    print(
+        f"{verb} {report['episode_count']} episode(s), {report['total_frames']} frames.",
+        file=sys.stderr,
+    )
+    return 0
 
 
 if __name__ == "__main__":

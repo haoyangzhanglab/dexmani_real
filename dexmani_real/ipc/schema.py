@@ -232,11 +232,12 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
     align=True,
 )
 
+
 def make_record_sample_dtype(
     rgb_shape: tuple[int, int, int],
     depth_shape: tuple[int, int],
 ) -> np.dtype:
-    """Return the v27 source row and fixed camera payload for the sample ring."""
+    """Return the control-step source row and fixed camera payload for the sample ring."""
     return np.dtype(
         [
             ("timestamp", "<f8"),
@@ -246,6 +247,7 @@ def make_record_sample_dtype(
             ("hand_qpos", "<f8", HAND_JOINT_SHAPE),
             ("hand_current", "<f8", HAND_JOINT_SHAPE),
             ("hand_contact", "<f8", HAND_TACTILE_SUM_SHAPE),
+            ("hand_contact_source_monotonic_ns", "<u8"),
             ("hand_tactile_force", "<f8", HAND_TACTILE_FORCE_SHAPE),
             ("hand_qpos_stale", "<u1"),
             ("arm_connected", "<u1"),
@@ -272,16 +274,6 @@ def make_record_sample_dtype(
             ("camera_health", "<u1"),
             ("camera_depth_frame_number", "<u8"),
             ("camera_color_frame_number", "<u8"),
-            ("policy_observation_arm_qpos", "<f8", ARM_JOINT_SHAPE),
-            ("policy_observation_hand_qpos", "<f8", HAND_JOINT_SHAPE),
-            ("policy_observation_valid", "<u1"),
-            ("policy_observation_contact_force", "<f8", HAND_TACTILE_SUM_SHAPE),
-            ("policy_observation_contact_force_valid", "<u1"),
-            ("policy_observation_tactile_force", "<f8", HAND_TACTILE_FORCE_SHAPE),
-            ("policy_observation_tactile_force_valid", "<u1"),
-            ("policy_observation_tactile_source_monotonic_ns", "<u8"),
-            ("policy_observation_tactile_calibrated", "<u1"),
-            ("policy_observation_tactile_unit_code", "<u1"),
             ("vr_wrist_pos", "<f8", (3,)),
             ("vr_wrist_rot6d", "<f8", (6,)),
             ("vr_landmarks", "<f8", (21, 3)),

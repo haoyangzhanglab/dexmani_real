@@ -1,4 +1,4 @@
-"""Physical feedback and useful action values for raw-v27 recording."""
+"""Physical feedback and useful action values for control-step recording."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ class EpisodeState:
     hand_connected: bool
     timestamp: float
     hand_current: np.ndarray
+    hand_contact_source_monotonic_ns: int = 0
     arm_last_cmd_seq: int = 0
 
 
@@ -39,6 +40,9 @@ def build_episode_state(
     hand_state: np.ndarray | None,
     hand_tactile: np.ndarray | None = None,
     timestamp_s: float | None = None,
+    *,
+    hand_contact: np.ndarray | None = None,
+    hand_contact_source_monotonic_ns: int = 0,
 ) -> EpisodeState:
     """Copy physical feedback, without computing derived robot geometry."""
     arm = arm_state[0] if arm_state is not None else None
@@ -64,10 +68,11 @@ def build_episode_state(
             else np.full(12, np.nan)
         ),
         hand_tactile_sum=(
-            np.array(hand["tactile_sum"], copy=True)
-            if hand is not None
+            np.array(hand_contact, copy=True)
+            if hand_contact is not None
             else np.full((5, 3), np.nan)
         ),
+        hand_contact_source_monotonic_ns=int(hand_contact_source_monotonic_ns),
         hand_tactile_force=(
             np.array(hand_tactile[0]["tactile_force"], copy=True)
             if hand_tactile is not None
