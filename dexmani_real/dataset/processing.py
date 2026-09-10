@@ -70,21 +70,7 @@ from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_TRANSFORM,
 )
 from dexmani_real.utils.atomic_io import atomic_publish
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
-
-# Source-facing failures from HDF5/MP4 reading and required payload validation reject
-# only the affected episode. Programming errors and process-control exceptions
-# remain fatal to the batch.
-_ANALYSIS_REJECTION_EXCEPTIONS = (
-    FileNotFoundError,
-    OSError,
-    ValueError,
-    KeyError,
-    RuntimeError,
-    IndexError,
-)
 _TASK_NAME_CANDIDATE_UNSET = object()
 
 
@@ -723,27 +709,25 @@ def process_episode_root(
         analysis_annotation = annotation or EpisodeAnnotation()
         task_name_candidate: Any = _TASK_NAME_CANDIDATE_UNSET
         raw_task_name_requires_validation = False
-        try:
-            with _open_processing_episode(episode) as reader:
-                decision = analyze_episode(
-                    reader,
-                    config,
-                    analysis_annotation,
-                )
-                if decision.accepted:
-                    task_name_candidate, raw_task_name_requires_validation = (
-                        _task_name_candidate(
-                            reader,
-                            analysis_annotation,
-                            resolved_task_override,
-                        )
-                    )
-        except _ANALYSIS_REJECTION_EXCEPTIONS as exc:
-            logger.warning("episode analysis rejected %s", episode, exc_info=True)
-            decisions.append(
-                _rejected_decision(episode, config, f"{type(exc).__name__}: {exc}")
+        # Only explicit behavior/admission decisions become EpisodeDecision
+        # results. Technical, source-corruption, and programming failures raise
+        # and fail the whole batch: silently training on fewer demonstrations
+        # is more dangerous than a loud stop. Known-bad episodes are excluded
+        # by the operator through annotation include:false.
+        with _open_processing_episode(episode) as reader:
+            decision = analyze_episode(
+                reader,
+                config,
+                analysis_annotation,
             )
-            continue
+            if decision.accepted:
+                task_name_candidate, raw_task_name_requires_validation = (
+                    _task_name_candidate(
+                        reader,
+                        analysis_annotation,
+                        resolved_task_override,
+                    )
+                )
         decisions.append(decision)
         if task_name_candidate is _TASK_NAME_CANDIDATE_UNSET:
             continue

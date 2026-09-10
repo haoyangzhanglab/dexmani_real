@@ -199,6 +199,9 @@ processing 独占 whole-episode admission。必需 payload（joint/action/action
 contact/dense 用 validity mask 表达，单个 invalid row 不整条拒绝。视觉数据要求 source
 正值且不晚于 control anchor，但不比较 tactile 与 camera 时间。
 persistent IK 是唯一自动行为质量拒绝；不会用 timing、tracking 或 dense flags 删行。
+技术与程序错误（missing field、损坏 payload、注入的 RuntimeError/IndexError 等）直接
+raise 并 fail 整批，不再转成单 episode rejection；已知坏 episode 用 annotation
+`include: false` 显式排除，宁可 loud failure 也不静默地用更少 demonstration 训练。
 
 每份输出在原子发布前经过完整 owning validator。它验证 `source_frames==episode_steps`、
 schema/shape/dtype/finite payload（validity-masked contact/dense 除外，valid=True 仍须 finite）、

@@ -96,34 +96,39 @@ def test_explicit_include_rejection_blocks_publication(tmp_path: Path) -> None:
         )
 
 
-def test_runtime_analysis_failure_is_skipped_only_without_explicit_include(
+@pytest.mark.parametrize("exception_cls", [RuntimeError, IndexError, KeyError])
+def test_technical_analysis_failure_fails_the_whole_batch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    exception_cls: type[Exception],
 ) -> None:
+    """Technical/programming failures are never per-episode rejections.
+
+    Silently training on fewer demonstrations is more dangerous than a loud
+    batch failure; a known-bad episode is excluded by annotation include:false.
+    """
     input_root = tmp_path / "raw"
     _write_episode(input_root, "episode_bad")
-    good = _write_episode(input_root, "episode_good")
+    _write_episode(input_root, "episode_good")
     real_analyze = processing.analyze_episode
 
     def fail_one(reader, *args, **kwargs):
         if reader.h5_path.name == "episode_bad":
-            raise RuntimeError("decoder failed for fixture")
+            raise exception_cls("decoder failed for fixture")
         return real_analyze(reader, *args, **kwargs)
 
     monkeypatch.setattr(processing, "analyze_episode", fail_one)
-    report = process_episode_root(
-        input_root,
-        tmp_path / "processed",
-        _config(),
-        skip_rejected_unannotated=True,
-        task_name="fixture_task",
-        expected_task_name="fixture_task",
-    )
-    assert report["accepted_source_episode_count"] == 1
-    assert report["episodes"][0]["rejected_reason"] == (
-        "RuntimeError: decoder failed for fixture"
-    )
-    assert (tmp_path / "processed" / f"{good.name}.h5").is_file()
+    output_root = tmp_path / "processed"
+    with pytest.raises(exception_cls, match="decoder failed for fixture"):
+        process_episode_root(
+            input_root,
+            output_root,
+            _config(),
+            skip_rejected_unannotated=True,
+            task_name="fixture_task",
+            expected_task_name="fixture_task",
+        )
+    assert not output_root.exists()
 
 
 def test_analysis_control_exception_is_not_converted_to_rejection(

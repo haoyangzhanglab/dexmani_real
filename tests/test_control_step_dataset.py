@@ -187,9 +187,14 @@ def test_d7_exact_sent_action(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "corruption", ["future_source", "sample_identity", "nan_action"]
+    ("corruption", "match"),
+    [
+        ("future_source", "source must be positive and causal"),
+        ("sample_identity", "raw sample identity"),
+        ("nan_action", "NaN/Inf"),
+    ],
 )
-def test_technical_corruption_has_no_published_artifact(tmp_path, corruption):
+def test_technical_corruption_fails_the_batch(tmp_path, corruption, match):
     episode = write_control_episode(tmp_path / "raw")
     with h5py.File(episode / "data.h5", "r+") as raw:
         if corruption == "future_source":
@@ -201,10 +206,22 @@ def test_technical_corruption_has_no_published_artifact(tmp_path, corruption):
         else:
             raw["action_arm_joint_sent"][5, 0] = np.nan
     output = tmp_path / "processed"
-    with pytest.raises(ValueError, match="no output published"):
+    with pytest.raises(ValueError, match=match):
         process_episode_root(
             episode, output, permissive_test_config()
         )
+    assert not output.exists()
+
+
+def test_missing_required_field_fails_the_batch(tmp_path):
+    episode = write_control_episode(tmp_path / "raw")
+    with h5py.File(episode / "data.h5", "r+") as raw:
+        del raw["hand_tactile_force"]
+    output = tmp_path / "processed"
+    # The v28 reader proves dataset layout completeness before analysis; the
+    # missing field must fail the whole batch, never become a silent rejection.
+    with pytest.raises(ValueError, match="episode validity"):
+        process_episode_root(episode, output, permissive_test_config())
     assert not output.exists()
 
 
