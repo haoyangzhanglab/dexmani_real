@@ -4,12 +4,12 @@
 （`episodes_processed/pick_place_toy/`）、`process_log/invalid_frames_report.json`、
 Policy Zarr 导出准入（`dexmani_real/dataset/export.py`）。全程离线分析，未连接硬件。
 
-> **后置修正（2026-09-09，随 camera/tactile integrity 修复）**：本文当时的三条结论已按
-> 修正后的根因改写，见下方「修正后的根因」与
-> [`camera_tactile_episode_integrity_fix_plan.md`](camera_tactile_episode_integrity_fix_plan.md)。
-> 当时采纳的「≤2 行内部缺口容忍」已被**回退**，导出端恢复为严格 whole-episode 准入
-> （raw v27 / processed v16 / Policy Zarr v9）：任何 source 行删除、内部缺口或时间/样本
-> 跳变整条拒绝，不再容忍内部瞬态缺口。
+> **历史说明（2026-09-09）**：下文保留当时的 camera-master / row-cleaning
+> 调查，作为 incident forensic record；它不是当前架构规范。当前规范是
+> [`control_step_dataset_simplification_plan.md`](control_step_dataset_simplification_plan.md)：
+> control step 是唯一 timeline，accepted episode 保留全部 source rows，camera/tactile
+> 不再通过 processed provenance 做跨行修复。下文提到的旧 schema、selector 和 gap
+> machinery 均为历史行为。
 
 ## 修正后的根因
 
@@ -204,7 +204,7 @@ commit `fd7d275`（"0828 0 fix dataset export"）引入，用整条拒绝替代�
 未验证项：Zarr 实际写入未执行（仅 dry-run）；新规则对其他任务/其他日期数据的
 准入分布未测量。
 
-## 6. 已知权衡与回退路径
+## 6. 当时的权衡与回退路径（已被当前合同取代）
 
 - 7 条相机缺口 episode 共 7 个中段缺口（合计 9 个被删帧）进入训练数据：每个缺口使
   跨缺口窗口含一个 2–3 dt 的伪动作转移，全数据集帧污染率约 0.75%。这是知情接受的权衡；若训练指标
@@ -215,15 +215,131 @@ commit `fd7d275`（"0828 0 fix dataset export"）引入，用整条拒绝替代�
 - 帧 0 丢弃本身未改动（清洗端因果合同保持原样）：导出侧豁免比放松清洗合同更小、
   且不触碰 raw→processed 语义。
 
-## 7. 相关文件
+## 7. 当时相关文件（历史职责，非当前 API）
 
 | 文件 | 角色 |
 | --- | --- |
 | [dataset/export.py](../dexmani_real/dataset/export.py) | `_whole_episode_rejection` 新准入规则与常量 |
-| [dataset/clean.py](../dexmani_real/dataset/clean.py) | 帧无效原因位、段边界审计、处理期警告 |
+| `dataset/clean.py`（已删除） | 当时的帧无效原因位、段边界审计、处理期警告 |
 | [dataset/processed.py](../dexmani_real/dataset/processed.py) | `ProcessedProvenance` 不变量与连续性校验 |
 | [examples/export_policy_zarr.py](../examples/export_policy_zarr.py) | 导出 CLI（`--dry-run` 只读预检） |
-| [tests/test_zarr_v7_projection.py](../tests/test_zarr_v7_projection.py) | v7 投影回归 + 缺口容忍单测 |
-| [docs/data_schema.md](data_schema.md) | processed v14 / Policy Zarr v7 合同（已同步） |
+| `tests/test_zarr_v7_projection.py`（历史文件） | v7 投影回归 + 缺口容忍单测 |
+| [docs/data_schema.md](data_schema.md) | 当时为 v14/v7；现已更新为当前合同 |
 | [README.md](../README.md) | 导出工作流描述（已同步） |
 | `episodes_processed/pick_place_toy/process_log/invalid_frames_report.json` | 本次现象来源（审计日志，数据文件） |
+
+## 8. 保留的历史 forensic evidence（旧分析工具已移除）
+
+旧基线 artifact 的完整统计已在删除前核对并压缩记录如下（原 artifact 含机器路径，
+不再作为 tracked evidence 保留）：
+
+- 61 条 episode；frame-0 causal tactile deficit 41 条；same-row / previous-row /
+  older-than-previous 选择数为 `6078 / 8226 / 5`。
+- camera-minus-tactile lag（14268 个有效样本）的 p50/p95/p99/max 为
+  `38.2799635 / 64.25902655 / 66.41135582 / 98.793855 ms`。
+- `flag_camera_fresh=False` 共 10 行；camera source delta p50/p95/max 为
+  `66.612992 / 66.6796408 / 88.235688 ms`；camera age p50/p95/max 为
+  `20.7844 / 35.9608084 / 58.951321 ms`。
+- camera fresh 与 not-new 两类的 tactile lag p50 分别为 `38.2799635` 与
+  `38.645827 ms`，不能据此把 not-new 事件当作系统性 tactile failure；旧规则的
+  camera hard rows 为 10，按 causal/age/health 规则重分类后为 0。
+- 旧导出模拟为 current/strict `60 / 18` 条可导出 episode，内部相机缺口 episode
+  共 7 条。这些数字解释 incident，但不构成当前 admission logic。
+
+补充可定位的旧统计：previous-row 占比约 57.5%；旧 hard-invalid 共 43 行。
+depth/color consecutive frame-number reuse 均为 0；fresh/not-new lag 样本数分别为
+14258/10。五个 older-than-previous 选择分别出现在 `episode_20260827_194525`（1 行）
+与 `episode_20260827_203113`（4 行）。七条 gap episode 为同日的
+`172305, 175240, 220112, 220747, 220919, 223607, 223729`。
+这些 camera/tactile 差异不能证明旧数据暗场曝光是根因；该归因没有本次硬件证据。
+
+旧计划的实现记录也已转移到本 incident：baseline commit 为
+`b5128927d920cca09dde40d910bcde037ad70ba7`；当时 focused tests 覆盖
+`tests/test_recording_tactile_alignment.py`、`tests/test_processed_v15.py`、
+`tests/test_zarr_v8_projection.py::TestWholeEpisodeStrictAdmission` 与
+`tests/test_strict_export_end_to_end.py`，记录为 full pytest `417 passed`，硬件未连接。
+历史实现涉及 raw `v26→v27`、processed `v15→v16`、Policy Zarr `v8→v9`；这些版本号
+只用于解释旧 artifact，不能伪装成当前 schema。
+相关历史实现 commits：`b52b9de`、`e8dd0e7`、`18690af`、`a8b2e32`、`e76b8a3`、
+`59e880a`。冻结 migration scripts 仍保留；旧分析工具、基线 JSON 与 camera-master
+计划已删除，其独有证据记录在本节而不是保留第二套公开分析 API。
+
+## 9. 当前 control-step salvage evidence（2026-09-10）
+
+当前离线 salvage 保持 `episodes/pick_place_toy/` 原始文件 bitwise 不变：源数据是
+60 条 converted-v24 与 1 条 direct-v25，明确 lineage 的 frozen out-of-place
+`v25→v26` 转换结果位于 `episodes/salvage_v26/pick_place_toy`；未依据 payload magnitude
+猜 tactile scale，也未对原始文件做 in-place migration。当前 schema28 reader 不声明
+对 original v25 的 physical replay 支持。
+
+实际结果为：61 source episodes，60 accepted，1 rejected；唯一拒绝
+`episode_20260827_224527`，原因为 persistent IK failure；source frames `14309`，
+accepted retained frames `14112`，Policy Zarr episodes `60`。每个 accepted processed
+episode 均满足 `processed_steps == source_frames`，每个 Zarr episode 对应一个 processed
+file，且 retained row 未做 compact/repair。
+[manifest](../artifacts/pick_place_toy_salvage_manifest.json) 记录 episode identity、schema、
+counts、lineage、admission 与验证摘要，不含机器绝对路径。
+
+执行 baseline 为 `6d9655fdc2f774f0f5eb0613cea0cbcca8816eb6`。原始 183 个文件的 size/SHA-256
+清单在转换前、salvage 后与最终检查时一致；清单 fingerprint 为
+`a0a4679248a8c345b37d648f3348ded1526f9e8afebede645b7811f3112a1c22`。
+实际源数据全部为 v25；60 条显式 converted_from_schema=24，1 条 direct-v25。
+v24 引入 commit `c195991d88b6b63db85b6fc2b611515ecfce5d83` 的 driver 已使用 0.1 scale，
+至 `c7dced05d55d9ae148a19f94c2aa81ee719aa903` 替换 v24 期间没有 scale 变化；冻结
+v24→v25 按原值复制 tactile。SDK-native scale 恢复于之后的
+`aac23d27e1fafcd264a24c122f9acf4d37962040`。因此本次只在新的 v26 working copies
+执行一次 *10，其他数组保持一致，绝未对已恢复的 v26 再次缩放。
+
+新 processed v17 位于 `episodes_processed/salvage_v17/pick_place_toy`，Zarr v10 位于
+`datasets/salvage_v10/pick_place_toy.zarr`；均未覆盖旧产物。所有 accepted core arrays 与
+normalized raw 同行比较，600 个 Zarr episode-array 与 processed 精确比较通过。
+大型生成数据不进入 git。
+
+可复现 processing/export 命令（normalized v26 必须先完成上述 lineage 审计）：
+
+```bash
+python examples/process_episodes.py episodes/salvage_v26/pick_place_toy \
+  --output-root episodes_processed/salvage_v17/pick_place_toy \
+  --profile rgb_pc --pointcloud-num-points 1024 --task-name pick_place_toy
+python - <<'PY'
+from dexmani_real.dataset.export import PolicyZarrExportConfig, export_processed_hdf5_to_zarr
+export_processed_hdf5_to_zarr(
+    "episodes_processed/salvage_v17/pick_place_toy",
+    "datasets/salvage_v10/pick_place_toy.zarr",
+    PolicyZarrExportConfig(expected_task_name="pick_place_toy"),
+)
+PY
+```
+
+上述库调用用于显式选择新的 salvage 输出目录；CLI 仍固定输出 `datasets/<task>.zarr`。
+已存在的输出会拒绝覆盖，不要删除原始数据或旧产物来重复执行。
+
+### 历史信息限制与新的录制修正
+
+`episode_20260827_195951` 的 zero-based row 157：旧 collapsed tactile flag 为 false、
+calibrated=false、hand_contact 是有限全零值；hand_qpos_stale=false、hand_connected=true、
+frame_status=0，hand/tactile source 相等且在 anchor 前 18.70 ms。
+v25 没有独立 aggregate validity，无法从现有数据区分合法无接触与旧驱动的无效零占位。
+本次保留原行，不推断、不补值、不据此追加 rejection；该信息无法恢复。
+
+最终源码审查发现，原录制代码在 aggregate-invalid 时也可能复制零占位，而 deployment
+会保持 validity/provenance source-match 的 fail-closed 行为。raw v28 因此增加一个必要的
+`hand_contact_source_monotonic_ns`：录制按当前 control anchor 从 live hand ring 独立选择
+最新有效 aggregate，保持最新 hand qpos/current 与 dense 原义不变；没有有效读数则保存
+NaN/source0。旧但有效 aggregate 只将 freshness telemetry 置 false，不触发离线删行。
+这不是跨 raw row 修复；当前 processing 仍严格 `contact_force[t] = raw hand_contact[t]`。
+deployment 的 calibration/unit/source-match、freshness 与 command safety 没有放宽。
+
+审查修正后全量离线测试：`python -m pytest -q`，399 passed、99 subtests passed；
+`python -m compileall -q dexmani_real examples tools` 与 `git diff --check` 通过。
+最终 normalized-v26 RGB-PC dry-run 仍为 60 accepted / 1 persistent-IK rejection；
+独立 adversarial source review 已通过，没有未解决的 material Real-code finding。
+`astra-high` 用受支持的 `gpt-6-astra/high`；中等实现阶段复用该高档 agent
+（线程限制，未声称使用不存在的 astra-medium alias）；机械工作使用 `luna-max`。
+
+Hardware validation: NOT RUN
+
+当前已安装的相邻 `../dexmani_policy` exporter/consumer 仍是 Policy Zarr v9、
+camera-master `observation_reference` 语义；它会拒绝 current v10 artifacts 缺少的
+旧 attr。该 integration limitation 已知且未通过修改 external repository 或削弱 current
+contract 解决；可用的 v10 control-step consumer 只在内存验证过，未写回 external tree。

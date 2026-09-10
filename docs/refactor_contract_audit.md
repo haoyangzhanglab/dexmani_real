@@ -4,14 +4,12 @@ Audited integrated base `2316bf0c129c145716a954664f9791cbae28a715` on 2026-09-09
 Decision: **KEEP all inspected production validators; production diff is zero**.
 No candidate satisfies every condition for deleting a fixed schema identity check.
 
-> **Historical record.** This audit predates the tactile v14 → v15 / Policy Zarr
-> v7 → v8 rename. Names below — "processed v14", the "frozen v7 projection",
-> `_policy_zarr_v7_keys`, and the test names `test_processed_v14.py` /
-> `test_zarr_v7_projection.py` — refer to the audited base. The current tree
-> renamed them to processed v15 (`PROCESSED_SCHEMA_VERSION = 15`),
-> `_policy_zarr_keys` / `_POLICY_ZARR_CORE_KEYS` (`POLICY_ZARR_SCHEMA_VERSION =
-> 8`), and `tests/test_processed_v15.py` / `tests/test_zarr_v8_projection.py`.
-> The KEEP decision and its reasoning are unchanged.
+> **Historical record, not current deletion authority.** Names and KEEP decisions
+> below refer only to the audited base. The subsequent
+> [control-step simplification](control_step_dataset_simplification_plan.md)
+> removed camera-master alignment, row provenance/selection, and processed EEF/dense
+> fields with their obsolete validators/tests. Current contracts are documented in
+> [data_schema.md](data_schema.md); runtime safety and live modality semantics remain.
 
 ## Classification and evidence
 
@@ -51,7 +49,7 @@ consumer. A literal comparison alone does not establish this category.
   values. Processing and deployment reuse these mathematical owners. The
   [processed visualizer](../examples/visualize_episode_processed.py) also consumes
   EEF/fingertip values. Identical array dimensions cannot certify their meaning.
-- **Tactile:** [clean.py](../dexmani_real/dataset/clean.py)
+- **Tactile (historical):** `clean.py` (now deleted)
   `select_tactile_rows_to_references` selects causal raw rows; processing writes
   both contact and full tactile payloads with matching provenance. Deployment's
   [observation.py](../dexmani_real/deployment/inference/observation.py) tactile

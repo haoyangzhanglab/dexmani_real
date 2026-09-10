@@ -7,9 +7,9 @@
 >
 > **Historical note (2026-09-10):** this guide documents the frozen raw **v25 → v26** tactile
 > migration. Its references to raw v26 / processed v15 / Policy Zarr v8 describe that legacy
-> contract; the current schemas are raw **v27** / processed **v16** / Policy Zarr **v9** (see
+> contract; the current schemas are raw **v28** / processed **v17** / Policy Zarr **v10** (see
 > [`data_schema.md`](data_schema.md) and
-> [`camera_tactile_episode_integrity_fix_plan.md`](camera_tactile_episode_integrity_fix_plan.md)).
+> [`control_step_dataset_simplification_plan.md`](control_step_dataset_simplification_plan.md)).
 > Do not read this guide as the current schema.
 
 ## 1. Goal and scope

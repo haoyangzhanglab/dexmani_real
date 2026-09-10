@@ -14,7 +14,9 @@
 | `repo_map.md` | 当前运行拓扑、核心数据流与边界索引。 |
 | `tools/convert_raw_v24_to_v25.py` | 冻结的一次性历史 raw v24 → v25 转换器；不依赖当前 runtime。 |
 | `tools/convert_raw_v25_to_v26_tactile.py` | 冻结的一次性 raw v25 → v26 tactile 表示迁移（`* 10` 还原 SDK 原生刻度、新增 `tactile_sum_fresh`）。 |
-| `tools/analyze_camera_tactile_alignment.py` | 纯离线只读诊断：量化 camera/tactile 对齐、camera 复用与 episode 完整性 baseline。 |
+| `docs/control_step_dataset_simplification_plan.md` | 当前 control-step dataset 简化规范；旧 camera-master 计划已删除。 |
+| `docs/invalid_frames_export_incident.md` | 历史 forensic evidence 与实际 salvage 验证记录。 |
+| `artifacts/pick_place_toy_salvage_manifest.json` | 小型 source identity/lineage/whole-episode salvage manifest；无生成数据或机器绝对路径。 |
 | `docs/raw_v24_migration.md` | 历史数据迁移与 processed/Zarr golden 回归步骤。 |
 | `docs/refactor_contract_audit.md` | 验证器分类、producer/consumer 证据与 KEEP 决策。 |
 | `docs/refactor_execution_plan.md` | 已执行重构的 canonical 方案、protected invariants 与分阶段验收规则；执行结果见 evidence。 |
@@ -72,7 +74,10 @@ causal observation history
     → arm / hand worker final checks
 ```
 
-- `deployment/inference/observation.py` 的 builder 拥有 causal/freshness/history/skew/generation 准入；内部 window/batch 只承载结果。SHM reader 保留复制与 seqlock 检查，模型输入转换后检查有限值。
+- `deployment/inference/observation.py` 的 builder 拥有 causal/freshness/history/skew/generation
+  准入。camera、arm、hand、contact 均按 logical policy control-grid references 对齐，
+  不以 camera exposure time 对齐机器人状态。SHM copy/seqlock、run-start、age/grid-lag、
+  health/state/calibration/unit 与必要的 contact provenance source-match gates 保留。
 - `Prediction` 是简单的内部策略输出容器；动作在 inference 输出边界校验为 finite
   `float64[chunk_size, D]`，序列化和 SHM 读取建立传输副本，
   `run_generation`、source timestamp 和 logical-step timestamp 随对象传播。
@@ -196,7 +201,7 @@ VR / keyboard input
 - Camera IPC 只携带 source/receive/publish 时间、generation、帧号和 health；保留 payload
   尺寸字段以支持 name-only ring attach。设备时钟映射留在 driver/worker，不作为录制审计传输。
   static shared metadata 只保留 serial、RGB-D geometry 和 depth scale；校准与研究 provenance
-  继续写入 raw v27。`tests/test_camera_v25_telemetry.py` 覆盖 health、causality 与 seqlock 边界。
+  继续写入 raw v28。`tests/test_camera_v25_telemetry.py` 覆盖 health、causality 与 seqlock 边界。
 - teleop 只把已经选择并校验的 causal fixed-grid sample 交给 RecorderIO；RecorderIO 独占
   episode transaction、sidecar、sequence continuity、validation 和 atomic finalize，不决定
   机器人动作。
@@ -204,29 +209,38 @@ VR / keyboard input
   source/publish provenance，不新增 episode sidecar 或进入 realtime loop。run/eval 的 policy
   selector、checkpoint name/SHA-256、eval seed 和 wall-clock budget 通过 recorder-owned
   `provenance_*` metadata attrs 保存，不与 camera metadata 混用。
-- raw episode 的 schema、字段语义和对齐保持单一来源：`recording/storage/schema.py` 与
-  [`docs/data_schema.md`](docs/data_schema.md)。当前链路为 raw v27 → processed HDF5 v16 →
-  Policy Zarr v9；离线 `dataset/` 负责清洗、审计和导出，不改变 raw 字段含义。Policy Zarr v9
-  是 processed v16 的显式 legacy 投影：`eef_pose`/`tactile_force` 只存在于 processed，不进入
-  Zarr keys 或 root attrs。所有 processed profile 的 `eef_pose` 与 fingertip 都由自身
-  `joint_state` FK 推导（每 timestep 一次 canonical Arm FK，两者共用）。视觉 profile 的
-  `contact_force`/`tactile_force` 直接消费录制时 camera-aligned tactile（不再跨 raw rows
-  重选），JOINT profile 仍用 grid-anchor selector；两者都在处理时记录 derivation 与 policy identity。
-- `EpisodeReader` 只接受 raw v27 并检查必需文件、layout 和 sidecar 帧数；不重放 runtime proof、不完整解码 RGB。
-- `dataset/processing.py::process_episode_root` 独占 batch 准入与 publication transaction；
-  CLI 只调用一次 batch processing（compare 每 profile 一次 dry-run），task-name override
-  与用户 annotation 来源分开，报告在 staging 中完成。temporal detectors 仅审计。
-- processed writer 只在原子发布前重开并确认 HDF5 结构；`--verify-output` 才执行完整写后
-  自检。processed consumer/export 边界仍严格验证 payload finite、shape/dtype、alignment 和
-  semantic attrs。
+- raw episode 的 schema 与语义由 `recording/storage/schema.py` 与
+  [data schema](docs/data_schema.md) 定义：raw v28 → processed v17 → Policy Zarr v10。
+  每个 accepted episode 完整保留 raw 行，一个 processed 文件对应一个 Zarr episode。
+- `ipc/causal.py::read_hand_contact_causal` 只为 recording 选择最新有效 causal aggregate；
+  `recording/sample.py` / `recording/frame.py` 显式携带独立
+  `hand_contact_source_monotonic_ns`，不修改 command hand feedback，也不借用 dense source。
+  无有效 aggregate 保存 NaN/source0；age 仅是 recording telemetry。dense raw 数据保留。
+- `EpisodeReader` 只接受 raw v28 并检查文件/layout/sidecar 帧数，不完整解码 RGB。
+  `dataset/processing.py` 有一个窄的只读 normalized-v26 历史入口；冻结迁移独立存在，
+  没有 v26/v27→v28 伪迁移或 runtime compatibility reader。
+- `dataset/processing.py::process_episode_root` 独占 whole-episode admission 与 batch
+  publication。persistent IK（连续 >4 行）是唯一自动行为拒绝；技术损坏失败，
+  不做 timing-quality filtering、跨 raw row tactile repair 或 row compaction。
+- `dataset/processed.py` 独占完整 schema/payload validation，证明
+  `source_frames == episode_steps`。core 只有 joint_state/action/action_ee/contact_force/
+  fingertip_points；图像/点云取同一 raw row。EEF 只在 FK 计算中复用，不存 processed EEF/dense。
+- `dataset/export.py` 验证 processed 和跨文件一致性，完整追加并写 episode_ends 后
+  transactional publish；无 gap、keep-mask、row-provenance 或 quality framework。
+  `clean.py` 与 `quality.py` 已删除。CLI 只调用一次 batch，annotation 仅 include/task_name，
+  无 compare/verify-output 开关或 invalid-frame JSON。
+- `tests/test_control_step_dataset.py`、`test_control_step_export.py`、
+  `test_control_step_observation.py`、`test_control_step_replay.py` 与
+  `test_recording_control_contact.py` 覆盖当前数据/部署/录制边界；
+  旧 selector、camera-aligned recording、processed-v15、gap projection 测试已移除。
 - `tests/test_raw_v26_recording.py` 覆盖 direct-row batch、真实时间缺口、sidecar identity 与失败不发布；`recording/timeline.py` 的第二时间网格已删除。
-- `tests/test_v26_producers.py` 用实际 sample/client 覆盖 sent target、head pose、active/IK hold、retarget-failure queued 语义及视觉状态 freshness。
+- `tests/test_v26_producers.py` 用实际 sample/client 覆盖 sent target、head pose、active/IK hold 与 retarget-failure queued 语义。
 - `recording/storage/hdf5_writer.py` 独占单个 `data.h5` handle；camera sidecar 和 video writer 不
   反向拥有控制状态。缺口、失败或未完成 finalize 不伪装成完整 episode。
 - 物理回放读取 recorded published arm target 与 recorded logical hand target/provenance，并重新经过
   当前 runtime 的 preflight、safety、generation 与 worker 边界；当前 hand worker 由 logical
   hand target 生成受限 SDK intermediate setpoint，而不是回放 exact actuator setpoint。processed
-  产物不能重新解释或替代 raw 命令事实；processed replay 只按 `source_path` 读取 raw 命令数据。已有非空 replay
+  产物不能重新解释或替代 raw 命令事实；processed replay 只按 `source_path` 读取完整 raw float64 命令数据；当前 reader 不支持历史 v25/v26 physical replay。已有非空 replay
   output 在创建 channel 或 worker 前拒绝，避免覆盖实验结果。
 
 源代码、schema 和 canonical config 是实现真相；本文件只帮助定位上述稳定边界。

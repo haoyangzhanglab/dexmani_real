@@ -29,20 +29,15 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
   自碰撞/静态障碍检查和新鲜反馈确认后才从 frame 0 开始重放。手部反馈不要求复现录制值。
 - RealSense 相机按设备原生频率连续采集；16 Hz 控制网格只选择最新严格因果帧，
   不再将相机发布节拍绑定到控制频率。
-- 事务式写入 depth-to-color aligned RGB-D raw episode v27；除 native depth/color 几何与
-  calibration 外，保留与 camera source 对齐的 arm/hand policy observation、录制时按 camera
-  source 从高频 hand/tactile ring 选出的 camera-aligned tactile（aggregate contact + dense
-  force + provenance）、必要 source timestamp、camera health enum 和实际发送的 arm target /
-  logical hand target；不持久化 runtime proof 或 SDK ACK。
-- 将 aligned raw v27 episode 清洗为 processed HDF5 v16；四种 profile 的
-  teleop 已发布 target 数据均可导出 Policy Zarr v9（v9 是 v16 的显式 legacy 投影，
-  `eef_pose`/`tactile_force` 不进入 Zarr）。所有 profile 的 `eef_pose` 与 `fingertip_points`
-  都由自身 `joint_state` 推导，每 timestep 只执行一次 canonical Arm FK，并在处理时记录
-  derivation 与 algorithm identity。视觉 profile 的 `contact_force`/`tactile_force` 直接消费
-  录制时的 camera-aligned tactile（不再跨 16 Hz raw rows 重选），JOINT profile 仍用
-  grid-anchor selector。导出坚持一份 processed HDF5 对应一个训练 episode；
-  仅保留全部 source 行且 source 序列连续的 processed HDF5 才整份准入，
-  任何 source 行删除、内部缺口或时间/样本跳变都整条拒绝，不在缺口处拆分、压紧或桥接。
+- 事务式写入 raw v28：16 Hz control step 是 observation/action timeline，camera、arm、
+  hand、aggregate contact 独立按 control anchor 取最新有效观测；保留 raw dense tactile、
+  calibration、camera health 与真实 source timestamps。aggregate 有独立
+  `hand_contact_source_monotonic_ns`，不伪装成更新的 hand qpos/dense 来源。
+- raw → processed v17 → Policy Zarr v10 全程逐行对应：accepted N 行保持 N 行，一个
+  processed 文件对应一个 Zarr episode。唯一自动行为质量拒绝是 persistent IK；
+  技术损坏可使整条失败，camera/tactile timing jitter 不删行，也不跨行修复。
+- processed core 为 joint_state、exact sent action、action_ee、contact_force、fingertip_points；
+  RGB-D/pointcloud 从同一 raw row 派生。FK 保留，但不持久化可重算的 eef_pose 或 dense tactile。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
 - 通过 Policy-owned public runtime 与 Real-owned NumPy adapter 运行 joint/EE-action learned
   policy；Policy strict restore 模型，Real fail-closed 校验固定硬件、观测、IPC 与时序兼容。
@@ -56,8 +51,8 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | 键盘遥操作 | [`examples/keyboard_teleop.py`](examples/keyboard_teleop.py) | [`teleop/keyboard_session.py`](dexmani_real/teleop/keyboard_session.py)、[`docs/teleop_jitter_incident.md`](docs/teleop_jitter_incident.md) |
 | 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`replay/`](dexmani_real/replay) |
 | raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/storage/hdf5_writer.py`](dexmani_real/recording/storage/hdf5_writer.py)、[`recording/storage/reader.py`](dexmani_real/recording/storage/reader.py) |
-| 离线清洗与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`dataset/`](dexmani_real/dataset) |
-| 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v27、processed v16 与 Policy Zarr v9 的字段、dtype、shape 与语义 |
+| 离线处理与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`dataset/`](dexmani_real/dataset) |
+| 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v28、processed v17 与 Policy Zarr v10 的字段、dtype、shape 与语义 |
 | learned-policy 部署与正式评估 | [`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`deployment/inference/dexmani_policy.py`](dexmani_real/deployment/inference/dexmani_policy.py) |
 | 相机、桌面与 VR 标定 | [`examples/`](examples) | [`calibration/`](dexmani_real/calibration)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
 | 点云完整链路 | [`docs/pointcloud_pipeline.md`](docs/pointcloud_pipeline.md) | [`sensor/pointcloud.py`](dexmani_real/sensor/pointcloud.py)、[`sensor/pointcloud_worker.py`](dexmani_real/sensor/pointcloud_worker.py) |
@@ -184,7 +179,7 @@ python examples/collect_teleop.py --print-config
 | VR 遥操作但不录制 | `python examples/collect_teleop.py --task-name <task> --no-record` | 连接 arm/hand/VR；不启动 camera/recorder |
 | 键盘遥操作 | `python examples/keyboard_teleop.py` | 连接并控制 xArm7，可选 XHand |
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 回放 recorded published arm target 与 recorded logical hand target；当前 runtime/geometry 完整预检后控制 xArm7/XHand，hand worker 生成受限 SDK 中间 setpoint；output target 必须缺失或为空目录，默认写入 `replay_results/` |
-| 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 仅提供保留 raw 行的 provenance；回放从其 `source_path` 读取原始 `float64` arm target 与 logical hand target，再执行完整的 live-start、limits、workspace 与 collision 预检；包含多个 source 连续段的产物拒绝物理回放 |
+| 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 验证后按 `source_path` 读取完整 raw `float64` arm target 与 logical hand target；执行完整 live-start、limits、workspace 与 collision 预检，不发送 processed float32 action；当前 reader 不支持历史 v25/v26 physical replay |
 
 | learned policy 检查 | `python examples/run_policy.py list`；`python examples/run_policy.py check <experiment> --device <device>` | 仅列出实验，或经 Policy public API strict restore + warmup + full action-chunk smoke test；不连接硬件 |
 | learned policy shadow | `python examples/run_policy.py shadow <experiment> [--eval-seed N]` | 连接真实 sensor 与 arm/XHand feedback，执行 inference、IK 和 SafetyGate；禁止 actuator publication 与 home |
@@ -373,7 +368,7 @@ RGB-D、完整 raw 点云、canonical processed 点云、相机几何、外参�
 根因已确认并修复：`RealSenseCameraConfig.auto_exposure_priority` 默认 `0.0`（OFF，Auto
 Exposure 仍 ON），RGB 恢复 30 Hz，亮度由增益补偿、几乎不变（暗场噪声上升）。
 
-深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew）。processed v16 的点云将
+深度与颜色流仍然不是同时曝光（两路曝光/时间戳存在 skew）。processed v17 的点云将
 depth-to-color aligned 像素 RGB 聚合为体素颜色，但这不表示同步曝光；运动物体仍可能出现
 颜色时间错位。
 
@@ -401,9 +396,12 @@ python examples/process_episodes.py \
 `--profile` 选择 `joint`、`rgb`、`pointcloud` 或 `rgb_pc`。后两种 profile 可用
 `--pointcloud-num-points` 选择 `1024`、`2048`、`4096` 或 `8192`，默认 `1024`。
 
-普通读取、处理、回放和可视化只接受 raw v27：必需文件、schema、dataset shape/dtype
-和 sidecar 帧数必须有效。Reader 和 finalize 不重放 runtime proof，也不完整解码 RGB。
-历史 v24 仅通过[一次性 frozen converter](docs/raw_v24_migration.md)迁移；没有 compatibility Reader。
+当前 runtime reader、raw viewer 和 physical replay 只接受 raw v28，检查必需文件、
+shape/dtype 与 sidecar 帧数，不在 reader/finalize 完整解码 RGB。
+离线 processing 另有一个窄的 normalized-v26 salvage 路径；历史 v24/v25 必须先依据明确
+lineage 使用冻结转换器生成 out-of-place v26，不能伪装成 v28 或改写原始数据。
+见 [历史迁移](docs/raw_v24_migration.md) 与
+[实际 salvage 证据](docs/invalid_frames_export_incident.md)。
 
 要生成 learned-policy 训练数据，在发布
 前先使用明确的 task identity 做 dry-run：
@@ -420,45 +418,38 @@ annotation `task_name`、raw `task_label` 的顺序解析；必须是非空、�
 不为 `unknown` 的字符串。整批 accepted episodes 必须只有一个 task identity；canonical CLI
 还要求 output root 的目录名与该 identity 相同（含显式 `--output-root`），不匹配时在发布前失败。
 使用 `--task-name` 改名时，需同时指定匹配的新 output root；direct library 不限制输出目录名。
-默认写入后只重新打开每个 processed HDF5，确认 schema、key、shape、dtype 和 task identity
-的结构完整性，再原子发布；如需在发布前完整扫描有限值、alignment 和 semantic
-attributes，显式加 `--verify-output`。所有 consumer/export 边界始终保持完整 validation。
-所有处理 profile 都校验自身的 raw 时序与质量；视觉 profile 还校验
-camera-source 对齐的 arm/hand policy observation 与同 source 已校准 tactile sum。所有 profile 的
-`fingertip_points` 都由其持久化的 `joint_state` 重算为 xArm-base FK 结果，并记录对应 derivation
-与 policy identity。`--task-name` 会统一写入每个 processed episode，并拒绝与逐 episode
-annotation 中 task_name 冲突。四种 profile 在通过各自边界后使用
-`teleop_published_joint_target` 语义，并可进入 Policy Zarr v9。
+每个 accepted episode 保留全部 source rows，输出始终满足 `source_frames == episode_steps`；
+原子发布前执行完整 schema/payload/semantics validation，不再提供 `--verify-output` 开关。
+四种 profile 的 joint_state/contact_force 都直接来自同一 raw row；fingertip 由本行 joint_state
+经共享 FK 计算。action 使用 `action_arm_joint_sent`，不能替换成未发布 candidate。
+视觉时间与 tactile 时间均只需不晚于 control anchor，不要求彼此同步或 tactile 早于 camera。
 
-raw v27 episode 可视化默认使用当前 resolved runtime 中的点云策略和桌面标定即时生成 canonical
+raw v28 episode 可视化默认使用当前 resolved runtime 中的点云策略和桌面标定即时生成 canonical
 `(N,6)` 点云；该路径与 offline processing、实时 deployment 共用同一个 `build_point_cloud()`
 实现。使用 `--no-point-cloud` 可关闭即时点云，
 `--pointcloud-num-points` 可选择 `1024`、`2048`、`4096` 或 `8192`。
 
-需要检查已清洗、持久化及 provenance 完整的点云时，仍应先用 `process_episodes.py` 生成
-processed HDF5 v16，再运行 `python examples/visualize_episode_processed.py <processed.h5>`；该入口
-按实际使用的模态读取并校验必要的 shape、dtype 与点云坐标/采样语义，点云帧在渲染时再检查
-有限值与 RGB 范围；`rgb`/`rgb_pc` 还要求 RGB 与 depth 的 `N/H/W` 完全一致。可视化不会执行
-完整 payload/provenance 扫描，完整检查仍由 `--verify-output` 或 export 边界负责。
+查看持久化点云可运行 `python examples/visualize_episode_processed.py <processed.h5>`。
+该离线 viewer 读取 processed v17 的 RGB-D/点云和 fingertip，使用逻辑 `arange(T)*dt`
+显示时间；不加载 row provenance 或存储的 EEF pose。它按所用模态检查结构和渲染 payload；
+完整 artifact 验证由 processing/export 边界承担。
 
 物理回放始终以当前 geometry 和 runtime 完整验证 live start、joint limits、recorded
 start→first target、workspace、collision 及全部相邻 transition。
 
-处理入口对整个 batch 分析一次，终端打印精简汇总。
-发布前在 staging 中生成 `episodes_processed/<task>/process_log/invalid_frames_report.json`；
-它只列存在真正无效帧的 episode、半开行范围和原因，没有无效帧时 `episodes` 为空。
-未标注的损坏或不满足准入条件的 episode（硬无效帧过多、各 source 连续段均不足以
-形成完整训练窗口等）会自动跳过；`--annotations` 中 `include: false` 的 episode 显式跳过。
-用户 YAML 中存在 episode 条目时，省略 `include` 仍默认 `include: true`，其失败会阻断整批。
-`--task-name` 只覆盖 task 名称，并保留原有名称冲突校验，不会将未标注 episode 变为显式 include。
-直接调用 library 默认仍阻断未标注 rejected episode；需显式传入
-`skip_rejected_unannotated=True` 才采用 CLI 的跳过策略。temporal quality 只提供
-`audit` 与 `hard_only`，不再依据 temporal heuristic 删除 otherwise-valid rows。
-保留 `--dry-run`、`--compare-profiles` 和 `--verify-output`；不再支持 `--write-report`。
-先对待导出的 processed HDF5 执行只读预检；它会检查
-deployment data contract、跨文件一致性、完整 provenance、canonical action_ee/相机几何、
-点云 RGB/XYZ 与持久化 workspace 边界及浮点 payload 是否有限，但不会创建 Zarr。processed
-输入的来源与信任由调用方或可信处理流程负责；export preflight 只检查内部 provenance 与 payload：
+处理入口对整个 batch 分析一次，只打印 whole-episode 汇总，不写 invalid-frame range JSON。
+连续 1–4 个 IK_FAIL 保留；连续超过 4 个拒绝整条 episode。camera fresh=False、
+observation_valid=False 单独出现、短 IK/tracking transient、dense 不可用但 aggregate 可用
+均不删行；无法读取必需 payload、非有限必需值或严重 identity 损坏可使整条失败。
+
+`--annotations` 仅支持 episode 的 `include` 与可选 `task_name`。include 默认为 true；
+显式 include 的失败阻断整批，include:false 跳过。不支持 include_ranges/exclude_ranges。
+CLI 跳过未标注 rejected episode；direct library 默认阻断，调用方可显式设置
+`skip_rejected_unannotated=True`。CLI 只保留 input_root、output-root、profile、
+pointcloud-num-points、task-name、annotations、dry-run。
+
+导出前可只读预检 processed schema/payload、task/profile/dt/shape/dtype 和 modality
+semantics 一致性；preflight 不创建 Zarr，也不扫描 raw 来重建 row-selection proof：
 
 ```bash
 python examples/export_policy_zarr.py \
@@ -476,10 +467,14 @@ python examples/export_policy_zarr.py \
 输入目录名决定导出任务名，且会与每个 processed HDF5 中的 `task_name` 校验；已有
 `datasets/<task>.zarr` 文件、目录或符号链接（包括悬空链接）都会拒绝覆盖。
 导出时在 stderr 显示输入校验、Zarr 写入的 tqdm 进度条；不会向 stdout
-打印 JSON 报告。每个 processed HDF5 只能贡献一个完整训练 episode；只有保留全部 source 行
-且 source 序列连续的 processed HDF5 才整份准入。任何 source 行删除（含首部/尾部裁剪）、
-内部缺口或无法解释的时间/样本跳变都会让导出器在 stderr 打印 episode、范围和原因并整条
-拒绝，同时继续导出其他合格 episode；导出器绝不在缺口处拆分或压紧。全部 episode 被拒绝时不创建 Zarr，并返回失败。
+打印 JSON 报告。每个经过 processed validator 的文件完整追加为一个 Zarr episode，
+`episode_ends` 是各文件行数的累积和。无效 processed input 使本次 export 整体失败；
+没有 gap heuristic、按行 rejection report 或 partial export。
+
+当前相邻 `dexmani_policy` 的旧 v9 export gate 仍会拒绝 v10/control-step metadata。
+本轮只修改 Real；消费端需独立更新后才能使用新 Zarr 构建部署 artifact，不能通过旧 attrs
+或 compatibility aliases 冒充 camera-master 数据。
+
 可视化 raw episode：
 
 ```bash
@@ -497,40 +492,38 @@ python examples/visualize_episode_processed.py episodes_processed/<task>/episode
 
 ```text
 episodes/<task>/episode_<timestamp>/
-├── data.h5       # fixed-grid robot/action/VR/quality data and metadata
-├── depth.h5      # grid-aligned uint16 depth stream
-└── rgb.mp4       # grid-aligned RGB stream
+├── data.h5       # control-step robot/action/VR/contact and factual telemetry
+├── depth.h5      # same-row aligned uint16 depth
+└── rgb.mp4       # same-row RGB
 
 episodes_processed/<task>/
-├── episode_<timestamp>.h5
-└── process_log/
-    └── invalid_frames_report.json  # staged before publication
+└── episode_<timestamp>.h5
 
 datasets/<task>.zarr/
 ├── data/*
 └── meta/episode_ends
 ```
 
-正式 raw writer 写 schema v27：保留 physical/human source、useful command、必要 timestamp、
-最小 validity、calibration 与 camera health；不保存 runtime proof/ACK/device-clock/profiling。
-新采集每个 controller sample 写一行，timestamp gaps 保持缺口；迁移行保留 row/media identity，
-cleaner 排除非 SOURCE 行。1–4 行 IK_FAIL 暂停可保留，连续 5 行起删除。
-视觉 profile 的 tactile 在录制时按 camera source 从高频 hand/tactile ring 因果选择并持久化
-payload + source/calibration/unit provenance，cleaner 直接消费、不再跨 raw rows 重选；
-JOINT profile 仍从已持久化前缀选择 source 不晚于 grid reference、skew 有界、fresh/calibrated
-的同-source 样本。camera fresh 与 observation valid 只作 audit，clock reset / delivery delay /
-真正 stale / 未来 source 才是 camera hard-invalid；视觉 policy state valid 仍必须成立。
-状态机械越界保留审计，动作机械越界硬拒绝。
-temporal quality 行为和 processed v16 / Policy Zarr v9 contract 一致；Zarr 只接受 source 完整
-且连续的 episode，任何 source 行删除、内部缺口或时间/样本跳变整条拒绝，不再容忍内部瞬态缺口。
+当前合同是 raw v28 → processed v17 → Policy Zarr v10。原始 dense tactile 保留，
+processed 不保存 dense tactile、eef_pose、row provenance、quality JSON 或 segments。
+录制时从 live ring 选择有效 aggregate，并保存其独立 source；这不是从其他 raw row
+修补 dataset。历史 raw 不改写；详细字段和边界见 [data schema](docs/data_schema.md)。
+
+实际 `pick_place_toy` salvage：61 条 / 14,309 行源数据；60 条 / 14,112 行保留；
+只拒绝 `episode_20260827_224527` 的 persistent IK（197 行）。60 个 Zarr episodes 与
+accepted processed 文件逐行一致，原始 183 个文件 SHA-256 未变。新产物分别位于
+`episodes_processed/salvage_v17/pick_place_toy` 与
+`datasets/salvage_v10/pick_place_toy.zarr`，不覆盖旧产物。
+[小型 manifest](artifacts/pick_place_toy_salvage_manifest.json) 保留计数、lineage 和验证记录；
+大型 HDF5/Zarr 不进入 git。
 
 ## 开发与验证
 
 安全的最低成本检查：
 
 ```bash
-python -m compileall -q dexmani_real examples tests
-python -m unittest discover -s tests
+python -m compileall -q dexmani_real examples tools
+python -m pytest -q
 git diff --check
 git diff --stat
 git status --short
