@@ -14,6 +14,7 @@
 | `repo_map.md` | 当前运行拓扑、核心数据流与边界索引。 |
 | `tools/convert_raw_v24_to_v25.py` | 冻结的一次性历史 raw v24 → v25 转换器；不依赖当前 runtime。 |
 | `tools/convert_raw_v25_to_v26_tactile.py` | 冻结的一次性 raw v25 → v26 tactile 表示迁移（`* 10` 还原 SDK 原生刻度、新增 `tactile_sum_fresh`）。 |
+| `tools/analyze_camera_tactile_alignment.py` | 纯离线只读诊断：量化 camera/tactile 对齐、camera 复用与 episode 完整性 baseline。 |
 | `docs/raw_v24_migration.md` | 历史数据迁移与 processed/Zarr golden 回归步骤。 |
 | `docs/refactor_contract_audit.md` | 验证器分类、producer/consumer 证据与 KEEP 决策。 |
 | `docs/refactor_execution_plan.md` | 已执行重构的 canonical 方案、protected invariants 与分阶段验收规则；执行结果见 evidence。 |

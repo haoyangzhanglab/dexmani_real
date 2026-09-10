@@ -4,6 +4,13 @@
 >
 > Baseline verified against `main` at commit `bc14cb00bd67c7d9e7c4bcef373e3c5ed5fa7a16` (2026-09-09).
 > Source code is authoritative if this document becomes stale.
+>
+> **Historical note (2026-09-10):** this guide documents the frozen raw **v25 → v26** tactile
+> migration. Its references to raw v26 / processed v15 / Policy Zarr v8 describe that legacy
+> contract; the current schemas are raw **v27** / processed **v16** / Policy Zarr **v9** (see
+> [`data_schema.md`](data_schema.md) and
+> [`camera_tactile_episode_integrity_fix_plan.md`](camera_tactile_episode_integrity_fix_plan.md)).
+> Do not read this guide as the current schema.
 
 ## 1. Goal and scope
 

@@ -194,7 +194,7 @@ detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal
 
 所有 profile 都包含 core 七项；RGB 与点云字段由 profile 决定。校验器只要求 profile 声明的
 字段与 `/provenance` 必须存在，文件可以保留额外的研究字段、group 或 attrs；Policy Zarr
-导出只复制显式 v8 legacy 投影字段（见第 3 节），processed-only 的 `eef_pose` 与
+导出只复制显式 v9 legacy 投影字段（见第 3 节），processed-only 的 `eef_pose` 与
 `tactile_force` 不进入 Zarr。
 
 | profile | 固定数据集 | 附加数据集 |
@@ -207,7 +207,7 @@ detector 标记受影响的 `start+1` 到 `end` 行。`audit` 只记录 temporal
 | 路径 | shape | dtype | 语义 |
 |---|---:|---|---|
 | `/joint_state` | `(N,19)` | float32 | 视觉 profile 为 `policy_observation_arm_qpos(7)+policy_observation_hand_qpos(12)`；`joint` profile 为 control-grid state，单位 rad。 |
-| `/eef_pose` | `(N,9)` | float32 | `position_m(3)+rot6d(6)`，`xarm_base`；由本 artifact 的 `/joint_state[:,:7]`（已因果对齐的 measured arm qpos）经 canonical Arm FK 推导，rot6d 必须 canonical；不使用 xArm firmware Cartesian pose。每 timestep 只执行一次 Arm FK，`/fingertip_points` 复用同一 EEF 结果。processed-only，不进入 Zarr v8。 |
+| `/eef_pose` | `(N,9)` | float32 | `position_m(3)+rot6d(6)`，`xarm_base`；由本 artifact 的 `/joint_state[:,:7]`（已因果对齐的 measured arm qpos）经 canonical Arm FK 推导，rot6d 必须 canonical；不使用 xArm firmware Cartesian pose。每 timestep 只执行一次 Arm FK，`/fingertip_points` 复用同一 EEF 结果。processed-only，不进入 Zarr v9。 |
 | `/action` | `(N,19)` | float32 | `action_arm_joint_sent(7)+action_hand_joint(12)`；是 teleop 已发布 target，单位 rad；arm 部分不表示 SDK accepted state 或物理到位。 |
 | `/action_ee` | `(N,21)` | float32 | `eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)`，EEF 在 `xarm_base`；rot6d 两列必须是 canonical 单位正交列。 |
 | `/contact_force` | `(N,5,3)` | float32 | 视觉 profile 直接等于 raw `policy_observation_contact_force`（录制时按 camera source 对齐的 aggregate `calc_force`）；JOINT profile 为 `hand_contact` 选择不晚于 observation reference、skew 有界且 hand/tactile source 相等的最新 fresh+calibrated+unit-proven 行。单位/轴由 root attrs 指定。 |
