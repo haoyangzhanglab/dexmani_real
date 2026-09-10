@@ -266,6 +266,8 @@ depth/color consecutive frame-number reuse 均为 0；fresh/not-new lag 样本�
 
 ## 9. 当前 control-step salvage evidence（2026-09-10）
 
+> 注：本节命令与版本号（v17/v10、`--profile rgb_pc`）是当时的历史执行记录；profile 词汇已从 CLI 移除，最终 v18/v11 重建证据见 [salvage manifest](../artifacts/pick_place_toy_salvage_manifest.json)。
+
 当前离线 salvage 保持 `episodes/pick_place_toy/` 原始文件 bitwise 不变：源数据是
 60 条 converted-v24 与 1 条 direct-v25，明确 lineage 的 frozen out-of-place
 `v25→v26` 转换结果位于 `episodes/salvage_v26/pick_place_toy`；未依据 payload magnitude

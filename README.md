@@ -390,7 +390,7 @@ python examples/process_episodes.py \
   --dry-run
 ```
 
-传入 `episodes/<task>/episode_*` 时只处理该 episode；传入 `episodes/<task>` 时处理其直接子目录中的全部 episode。
+传入 `episodes/<task>/episode_*` 时只处理该 episode；传入 `episodes/<task>` 时处理其下全部 `episode_*` 子目录。
 
 确认审计结果后去掉 `--dry-run`，默认发布到
 `episodes_processed/<task>/`。canonical 输出始终是完整 multimodal superset（不再有

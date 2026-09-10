@@ -286,19 +286,16 @@ def _task_name_candidate(
     return reader.h5f["meta"].attrs.get("task_label", ""), True
 
 
-# Reserved subdirectory names under a task root that are never raw episode
-# directories.  ``process_log`` holds per-episode process reports written into
-# the processed output root, so it must not be rediscovered as an episode.
-_NON_EPISODE_DIR_NAMES = frozenset({"process_log"})
-
-
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
     """Accept either one episode directory or a task directory of episodes.
 
-    Non-hidden subdirectories of a task root are treated as episodes, except
-    reserved names (``process_log``) that hold processed-output sidecars rather
-    than raw ``data.h5`` sources. Returned paths are absolute so persisted source
-    provenance remains independent of the caller's working directory.
+    Task roots discover only explicit ``episode_*`` subdirectories
+    (ManiUniCon-style convention). A corrupt ``episode_*`` directory is still
+    discovered and must fail loudly downstream; it is never silently filtered
+    by a ``data.h5`` existence check. The direct single-episode root
+    (``root/data.h5``) path is unchanged. Returned paths are absolute so
+    persisted source provenance remains independent of the caller's working
+    directory.
     """
     root = Path(input_root).resolve()
     if not root.is_dir():
@@ -309,9 +306,7 @@ def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
         sorted(
             child
             for child in root.iterdir()
-            if child.is_dir()
-            and not child.name.startswith(".")
-            and child.name not in _NON_EPISODE_DIR_NAMES
+            if child.is_dir() and child.name.startswith("episode_")
         )
     )
     if not episodes:

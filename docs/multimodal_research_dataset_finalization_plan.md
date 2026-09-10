@@ -1,5 +1,11 @@
 # DexMani Real 多模态研究数据集最终化方案
 
+> **Implementation status: SUPERSEDED.**
+>
+> Current implementation is the v18/v11 multimodal dataset. Remaining
+> last-mile work is tracked in:
+> [`multimodal_dataset_last_mile_repair_plan.md`](multimodal_dataset_last_mile_repair_plan.md)
+
 > 面向 Claude Code 的 canonical implementation plan。
 >
 > 目标：在当前 control-step 数据架构基础上，完成最后一轮**语义修正、模态补全和冗余清理**，形成适合个人 PhD 研究长期复用的数据管线。本文不把数据集裁成当前 `dexmani_policy` 某个策略的最小输入，而是构建一次采集、一次处理、后续不同策略可按需选择模态的 multimodal research dataset。

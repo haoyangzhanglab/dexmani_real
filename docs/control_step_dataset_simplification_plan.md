@@ -1,5 +1,11 @@
 # Control-Step Dataset 简化、旧数据抢救与 Codex 自动执行计划
 
+> **Implementation status: SUPERSEDED.**
+>
+> Current implementation is the v18/v11 multimodal dataset. Remaining
+> last-mile work is tracked in:
+> [`multimodal_dataset_last_mile_repair_plan.md`](multimodal_dataset_last_mile_repair_plan.md)
+
 > 面向 Codex 的 canonical 执行文档。目标是把 DexMani Real 的数据链路从过度严格的
 > camera-master / row-level cleaning 方案收敛为适合个人 PhD 研究项目的简单实现，同时
 > 最大化保留昂贵真实机器人 demonstration。

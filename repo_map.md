@@ -14,7 +14,7 @@
 | `repo_map.md` | 当前运行拓扑、核心数据流与边界索引。 |
 | `tools/convert_raw_v24_to_v25.py` | 冻结的一次性历史 raw v24 → v25 转换器；不依赖当前 runtime。 |
 | `tools/convert_raw_v25_to_v26_tactile.py` | 冻结的一次性 raw v25 → v26 tactile 表示迁移（`* 10` 还原 SDK 原生刻度、新增 `tactile_sum_fresh`）。 |
-| `docs/control_step_dataset_simplification_plan.md` | 当前 control-step dataset 简化规范；旧 camera-master 计划已删除。 |
+| `docs/control_step_dataset_simplification_plan.md` | 历史 control-step dataset 简化执行计划（SUPERSEDED）；当前实现为 v18/v11 multimodal dataset。 |
 | `docs/invalid_frames_export_incident.md` | 历史 forensic evidence 与实际 salvage 验证记录。 |
 | `docs/control_step_dataset_human_review_record.md` | Real/Policy control-step 修复交接：固定提交范围、证据边界、剩余限制与待人工签署的 review checklist。 |
 | `artifacts/pick_place_toy_salvage_manifest.json` | 小型 source identity/lineage/whole-episode salvage manifest；无生成数据或机器绝对路径。 |

@@ -5,7 +5,7 @@ example visualizer modules by path and pin their pure render-admission helpers
 — finite derived raw EEF rows yield the position, and finite fingertip rows in
 both viewers yield the (5,3) positions. Invalid rows yield None (the
 clear-entity path that prevents stale spheres). Processed EEF is intentionally
-not part of the v17 artifact. Run with:
+not part of the v18 artifact. Run with:
 
     python -m unittest discover -s tests -p 'test_visualize_eef_helpers.py'
 """
