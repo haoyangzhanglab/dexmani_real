@@ -211,7 +211,7 @@ VR / keyboard input
   selector、checkpoint name/SHA-256、eval seed 和 wall-clock budget 通过 recorder-owned
   `provenance_*` metadata attrs 保存，不与 camera metadata 混用。
 - raw episode 的 schema 与语义由 `recording/storage/schema.py` 与
-  [data schema](docs/data_schema.md) 定义：raw v28 → processed v17 → Policy Zarr v10。
+  [data schema](docs/data_schema.md) 定义：raw v28 → processed v18 → Policy Zarr v11。
   每个 accepted episode 完整保留 raw 行，一个 processed 文件对应一个 Zarr episode。
 - `ipc/causal.py::read_hand_contact_causal` 只为 recording 选择最新有效 causal aggregate；
   `recording/sample.py` / `recording/frame.py` 显式携带独立
@@ -224,8 +224,10 @@ VR / keyboard input
   publication。persistent IK（连续 >4 行）是唯一自动行为拒绝；技术损坏失败，
   不做 timing-quality filtering、跨 raw row tactile repair 或 row compaction。
 - `dataset/processed.py` 独占完整 schema/payload validation，证明
-  `source_frames == episode_steps`。core 只有 joint_state/action/action_ee/contact_force/
-  fingertip_points；图像/点云取同一 raw row。EEF 只在 FK 计算中复用，不存 processed EEF/dense。
+  `source_frames == episode_steps`。processed 是完整 multimodal superset：joint/action/action_ee、
+  aggregate contact（含 `contact_force_valid`）、dense tactile（含 `tactile_force_valid`）、
+  fingertip、native-resolution RGB-D、camera geometry、point cloud 与 flat timing arrays；
+  无效 contact/dense 用 validity mask 表达，不整条拒绝。不再有 modality-specific profile。
 - `dataset/export.py` 验证 processed 和跨文件一致性，完整追加并写 episode_ends 后
   transactional publish；无 gap、keep-mask、row-provenance 或 quality framework。
   `clean.py` 与 `quality.py` 已删除。CLI 只调用一次 batch，annotation 仅 include/task_name，

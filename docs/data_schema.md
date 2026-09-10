@@ -1,6 +1,6 @@
 # Real 数据集 schema 参考
 
-本文覆盖 raw HDF5 v28、processed HDF5 v17 与 Policy Zarr v10。精确合同由
+本文覆盖 raw HDF5 v28、processed HDF5 v18 与 Policy Zarr v11。精确合同由
 [raw schema](../dexmani_real/recording/storage/schema.py)、
 [processing](../dexmani_real/dataset/processing.py)、
 [processed validator](../dexmani_real/dataset/processed.py) 和
@@ -30,8 +30,8 @@ observation_valid=False 单独出现或 dense tactile 不可用，不参与 epis
 - `N`：单个 raw/processed episode 行数；`T`：Zarr 总行数；`P`：点云点数。
 - `xarm_base`：Real 世界坐标系。位置/XYZ/fingertip 用 m；关节/手目标用 rad。
 - rot6d 无单位；点云 RGB 为 float32 `[0,1]`。Real 与 Sim 不可混用坐标系/标签。
-- processed RGB 默认 `H=240,W=320`；CLI 点数支持 1024/2048/4096/8192。
-  离线库允许其他正整数点数，实时 IPC/Policy shape 必须另行匹配。
+- processed RGB/depth 保存 native aligned color resolution（不再固定 240×320）；CLI 点数
+  支持 1024/2048/4096/8192。离线库允许其他正整数点数，实时 IPC/Policy shape 必须另行匹配。
 
 ## 1. Raw episode HDF5 v28
 
@@ -121,10 +121,10 @@ hand_source，同一 raw row 原样映射。当前 runtime reader、raw viewer �
 [incident evidence](invalid_frames_export_incident.md) 和
 [salvage manifest](../artifacts/pick_place_toy_salvage_manifest.json)。
 
-## 2. Processed HDF5 v17
+## 2. Processed HDF5 v18
 
-`episodes_processed/<task>/*.h5`，每个 accepted raw episode 一个文件。
-Required core 与全部 profile 都使用同一 control-step 映射：
+`episodes_processed/<task>/*.h5`，每个 accepted raw episode 一个文件。processed 是
+完整 multimodal superset（不再有 modality-specific profile），全部使用同一 control-step 映射：
 
 | Dataset | shape | dtype | 同行 raw 来源 |
 |---|---|---|---|
@@ -132,24 +132,32 @@ Required core 与全部 profile 都使用同一 control-step 映射：
 | action | (N,19) | float32 | action_arm_joint_sent + action_hand_joint |
 | action_ee | (N,21) | float32 | action_arm_ee + action_hand_joint |
 | contact_force | (N,5,3) | float32 | hand_contact |
+| contact_force_valid | (N,) | bool | 同行 aggregate 可用（finite ∧ source>0） |
+| tactile_force | (N,5,120,3) | float32 | hand_tactile_force |
+| tactile_force_valid | (N,) | bool | finite ∧ calibrated ∧ unit native ∧ source>0 |
 | fingertip_points | (N,5,3) | float32 | 本行 joint_state 经共享 arm+hand FK |
-| rgb | (N,H,W,3) | uint8 | 本行 RGB，resize/no crop |
-| depth | (N,H,W) | uint16 | 本行 aligned depth，nearest resize |
-| camera_intrinsic | (N,9) | float32 | resized color K，展平 |
+| rgb | (N,H,W,3) | uint8 | 本行 native aligned color RGB，不 resize |
+| depth | (N,H,W) | uint16 | 本行 aligned depth，不 resize |
+| camera_intrinsic | (N,9) | float32 | native color K，展平 |
 | camera_extrinsic | (N,4,4) | float32 | T_xarm_base_from_color |
 | point_cloud | (N,P,6) | float32 | 本行 RGB-D 经 canonical preprocessing |
+| observation_anchor_monotonic_ns | (N,) | uint64 | 本行 control anchor |
+| arm_source_monotonic_ns | (N,) | uint64 | arm 反馈来源 |
+| hand_source_monotonic_ns | (N,) | uint64 | hand 反馈来源 |
+| contact_source_monotonic_ns | (N,) | uint64 | 选中 aggregate contact 来源（v26 为 hand_source） |
+| tactile_source_monotonic_ns | (N,) | uint64 | dense 来源 |
+| camera_source_monotonic_ns | (N,) | uint64 | 相机帧来源 |
 
-`joint` 只含 core；`rgb` 加四项 RGB-D；`pointcloud` 加点云；
-`rgb_pc` 两者都有。processed 不保存 `eef_pose`、dense `tactile_force` 或
-`/provenance`。FK implementation 保留，fingertip 复用每步 Arm FK；
-`action_ee` 是无法从 IK 后 joint target 无损恢复的控制意图，必须保留。
+无效 contact/dense 用 validity mask 表达（`*_valid=False` 时 payload 可为 NaN），不整条拒绝。
+processed 不保存 `eef_pose` 或 `/provenance`。FK implementation 保留，fingertip 复用每步
+Arm FK；`action_ee` 是无法从 IK 后 joint target 无损恢复的控制意图，必须保留。
 
 ### 必需身份与语义 attrs
 
 | 属性 | 值/含义 |
 |---|---|
-| schema_name / schema_version | dexmani-real-processed-hdf5 / 17 |
-| domain / profile / task_name | real / profile / 单一有效任务名 |
+| schema_name / schema_version | dexmani-real-processed-hdf5 / 18 |
+| domain / task_name | real / 单一有效任务名 |
 | source_path / source_episode / source_schema_version | 实际输入 raw 身份；source_path 为绝对路径 |
 | source_frames / episode_steps | 正整数且二者相等 |
 | dt | control period，默认 1/16 s |
@@ -160,18 +168,20 @@ Required core 与全部 profile 都使用同一 control-step 映射：
 | action_semantics | teleop_published_joint_target |
 
 另外保留 contact representation/unit/frame/SI-unverified、fingertip frame/unit/derivation/
-policy identity 与 action_ee frame/components。RGB profile 保留 resize、depth scale/invalid value、
-intrinsic/extrinsic semantics 和必要相机几何；点云 profile 保留 frame/color/sampling/transform/
+policy identity 与 action_ee frame/components。native RGB-D 保留 depth scale/invalid value、
+intrinsic/extrinsic semantics 和必要相机几何；点云保留 frame/color/sampling/transform/
 policy identity、shape、桌面平面，以及仅用于重现点云的 `processing_config_json`。
 没有 row-decision JSON、quality summary、repair mask 或 source-segment attrs。
 
-processing 独占 whole-episode admission。必需 payload 非有限、shape/dtype/帧数损坏、
-必需媒体不可读取、严重 sample/timestamp identity 错误会失败；视觉数据要求 source
+processing 独占 whole-episode admission。必需 payload（joint/action/action_ee/fingertip/RGB-D）
+非有限、shape/dtype/帧数损坏、必需媒体不可读取、严重 sample/timestamp identity 错误会失败；
+contact/dense 用 validity mask 表达，单个 invalid row 不整条拒绝。视觉数据要求 source
 正值且不晚于 control anchor，但不比较 tactile 与 camera 时间。
 persistent IK 是唯一自动行为质量拒绝；不会用 timing、tracking 或 dense flags 删行。
 
 每份输出在原子发布前经过完整 owning validator。它验证 `source_frames==episode_steps`、
-schema/shape/dtype/finite payload、action_ee canonical rot6d、RGB-D 几何与点云语义。
+schema/shape/dtype/finite payload（validity-masked contact/dense 除外，valid=True 仍须 finite）、
+action_ee canonical rot6d、RGB-D 几何与点云语义。
 export 不再另造 source-row 检查。外部篡改的 source 身份不是密码学证明；
 保留原始 raw 才能重建实验。
 
@@ -188,27 +198,27 @@ task 名必须非空、无首尾空白/ASCII 控制字符，且不能是 unknown
 冲突 annotation；整批 accepted episodes 必须只有一个任务。CLI 跳过未标注 rejected
 episode；显式 include 的失败阻断整批。直接 library 默认不跳过未标注 rejection。
 
-## 3. Policy Zarr v10
+## 3. Policy Zarr v11
 
 ```text
 datasets/<task>.zarr/
-    data/<profile keys>
+    data/<multimodal keys>
     meta/episode_ends
 ```
 
 每个 processed file 按文件名字典序追加成一个完整 episode。
-`data/<key>` 为 `(T,*tail_shape)`，key/shape/dtype 与 processed profile 相同；
+`data/<key>` 为 `(T,*tail_shape)`，key/shape/dtype 与 processed 相同（完整 multimodal superset）；
 `episode_ends` 是 int64、严格递增、exclusive 累积行数，末值等于 T。
 
-Exporter：发现 HDF5 → owning processed validation → task/profile/dt/shape/dtype/语义一致性 →
+Exporter：发现 HDF5 → owning processed validation → task/dt/shape/dtype/语义一致性 →
 逐文件完整追加 → 写 episode_ends → 校验输出结构 → transactional publish。
 任何无效 processed input 使本次导出失败，不创建局部 episode，不跳过部分 source 行。
 已有输出（含符号链接）拒绝覆盖。
 
-root attrs 为 `schema_name=dexmani-real-policy-zarr`、`schema_version=10`、`domain=real`、
-profile/task_name/dt、`episode_start_policy=full_history`、同一 control-step alignment/action
-语义及各 profile 必需 modality semantics；不复制 raw source paths、row provenance、
-完整 camera calibration 或 audit JSON。
+root attrs 为 `schema_name=dexmani-real-policy-zarr`、`schema_version=11`、`domain=real`、
+task_name/dt、同一 control-step alignment/action 语义及各 modality semantics；不再有 `profile`
+或 `episode_start_policy`（edge padding 是 sampling/runtime 语义，不是 storage 合同）；不复制
+raw source paths、row provenance、完整 camera calibration 或 audit JSON。
 
 ## Deployment、replay 与训练边界
 
@@ -226,12 +236,14 @@ normalized-v26 salvage 不由当前 raw reader 进行 physical replay。
 contact/fingertip 的 finger 顺序为 thumb,index,middle,ring,pinky；
 SDK sensor indices 0..4 对应 finger IDs (2,5,7,9,11)，定义在 robot/model.py。
 不要把 raw dense SDK point order 当作已知 taxel XYZ/邻接关系。
-部署仍可支持显式请求的 EEF/dense modality，但当前 processed/Zarr 不生产这些 key。
+部署仍可支持显式请求的 EEF/dense modality；processed/Zarr 现在生产 dense tactile
+（tactile_force + tactile_force_valid），但不生产 EEF key（EEF 由 joint_state FK 派生）。
 
-训练 consumer 应接受 v10 control-step semantics，并保存 dataset contract 到 checkpoint；
-full_history 禁止用 episode 左侧 padding 冒充已观测历史。不要把某个模型的 horizon/padding
-实例值写成通用合同。相邻 dexmani_policy 自 commit `2bc5b85` 严格接受 v10/control-step
-合同并持久化 observation_alignment/state_alignment/contact_force_source；旧 v8/v9 不兼容。
+训练 consumer 应接受 control-step semantics 并保存 dataset contract 到 checkpoint；`schema_version`
+是 metadata 而非 exact-version gate。edge padding 属于 sampling/runtime 语义（training 用
+pad_before=n_obs_steps-1，deployment run-start 用 edge-repeat），dataset 不存储合成 padding 行。
+不要把某个模型的 horizon/padding 实例值写成通用合同。相邻 dexmani_policy 消费 control-step 合同并
+持久化 observation_alignment/state_alignment/contact_force_source。
 实际 salvage Zarr 的读取和采样已验证，未执行真实 checkpoint export 或硬件 rollout。
 
 Hardware validation: NOT RUN
