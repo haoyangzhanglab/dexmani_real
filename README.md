@@ -471,9 +471,9 @@ python examples/export_policy_zarr.py \
 `episode_ends` 是各文件行数的累积和。无效 processed input 使本次 export 整体失败；
 没有 gap heuristic、按行 rejection report 或 partial export。
 
-当前相邻 `dexmani_policy` 的旧 v9 export gate 仍会拒绝 v10/control-step metadata。
-本轮只修改 Real；消费端需独立更新后才能使用新 Zarr 构建部署 artifact，不能通过旧 attrs
-或 compatibility aliases 冒充 camera-master 数据。
+相邻 `dexmani_policy` 自 commit `2bc5b85` 接受 v10/control-step metadata，并严格拒绝
+旧 v8/v9 与 camera-master 合同；不提供 compatibility aliases。实际 salvage Zarr 已通过
+消费端合同、ReplayBuffer 和离线采样验证；未执行真实 checkpoint export 或硬件 rollout。
 
 可视化 raw episode：
 

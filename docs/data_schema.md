@@ -230,7 +230,8 @@ SDK sensor indices 0..4 对应 finger IDs (2,5,7,9,11)，定义在 robot/model.p
 
 训练 consumer 应接受 v10 control-step semantics，并保存 dataset contract 到 checkpoint；
 full_history 禁止用 episode 左侧 padding 冒充已观测历史。不要把某个模型的 horizon/padding
-实例值写成通用合同。当前相邻 dexmani_policy 的旧 v9 export gate 尚未更新，会拒绝 v10；
-本仓库未用 compatibility alias 隐藏该跨仓库限制。
+实例值写成通用合同。相邻 dexmani_policy 自 commit `2bc5b85` 严格接受 v10/control-step
+合同并持久化 observation_alignment/state_alignment/contact_force_source；旧 v8/v9 不兼容。
+实际 salvage Zarr 的读取和采样已验证，未执行真实 checkpoint export 或硬件 rollout。
 
 Hardware validation: NOT RUN

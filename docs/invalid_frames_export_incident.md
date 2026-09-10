@@ -339,7 +339,12 @@ deployment 的 calibration/unit/source-match、freshness 与 command safety 没�
 
 Hardware validation: NOT RUN
 
-当前已安装的相邻 `../dexmani_policy` exporter/consumer 仍是 Policy Zarr v9、
-camera-master `observation_reference` 语义；它会拒绝 current v10 artifacts 缺少的
-旧 attr。该 integration limitation 已知且未通过修改 external repository 或削弱 current
-contract 解决；可用的 v10 control-step consumer 只在内存验证过，未写回 external tree。
+首次 Real 交付时，相邻 `../dexmani_policy` 仍是 v9/camera-master export gate，因缺少旧
+`observation_reference` 而拒绝 v10。用户随后授权针对性修改，Policy commit `2bc5b85`
+已严格切换到 v10/control-step，保留任务、dt、action、单位与 modality 校验，无旧版 alias。
+消费端全量离线测试为 26 passed、36 subtests passed；实际 salvage Zarr 的 joint/contact、
+pointcloud/contact/fingertip、RGB+pointcloud 组合均通过合同入口，公共 runtime parser
+保持原动作维度/周期。ReplayBuffer 保留 60 episodes、14112 行；既有 16/1/7 窗口配置
+生成 13692 个窗口，无跨 episode 窗口。模型、训练配置、原始及生成数据均未修改。
+该补充未运行训练、真实 checkpoint export 或 hardware；独立 reviewer 因额度限制未能
+运行，补充审查由主 agent 完成，不声称独立审查通过。
