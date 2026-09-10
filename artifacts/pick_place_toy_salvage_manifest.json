@@ -1,11 +1,10 @@
 {
-  "baseline_head": "6d9655fdc2f774f0f5eb0613cea0cbcca8816eb6",
-  "profile": "rgb_pc",
+  "baseline_head": "72d861e1c050767aa15888341b3a1183c5e79206",
   "pointcloud_num_points": 1024,
   "source_root": "episodes/pick_place_toy",
   "normalized_raw_root": "episodes/salvage_v26/pick_place_toy",
-  "processed_root": "episodes_processed/salvage_v17/pick_place_toy",
-  "zarr_path": "datasets/salvage_v10/pick_place_toy.zarr",
+  "processed_root": "episodes_processed/salvage_v18/pick_place_toy",
+  "zarr_path": "datasets/salvage_v11/pick_place_toy.zarr",
   "source_episodes": 61,
   "accepted": 60,
   "rejected": 1,
@@ -14,6 +13,8 @@
   "zarr_episode_count": 60,
   "original_raw_files_sha256_verified": 183,
   "original_raw_inventory_sha256": "a0a4679248a8c345b37d648f3348ded1526f9e8afebede645b7811f3112a1c22",
+  "normalized_raw_files_sha256_verified": 183,
+  "normalized_raw_inventory_sha256": "fd5e71f3f312f06bb6e82b3619c79f890e2a8746a5fcbd6864b72eab3f99c2ee",
   "inventory_hash_encoding": "SHA256 of sorted compact JSON mapping relative file path to [byte_size, SHA256]",
   "normalization": {
     "converter": "tools/convert_raw_v25_to_v26_tactile.py",
@@ -29,12 +30,22 @@
     ],
     "original_raw_modified": false
   },
+  "validity": {
+    "contact_force_invalid_rows": 1,
+    "tactile_force_invalid_rows": 1,
+    "semantics": "legacy v26 conservative proxy: contact_force_valid requires tactile_sum_fresh and tactile_force_valid additionally requires tactile_fresh; aggregate counts are evidence only and never affect episode admission"
+  },
   "verification": {
     "processed_core_arrays_equal_normalized_raw": true,
-    "zarr_episode_arrays_exactly_compared": 600,
+    "zarr_episode_arrays_exactly_compared": 1380,
     "accepted_episode_lost_rows": false,
-    "timing_only_rejection": false
+    "timing_only_rejection": false,
+    "original_raw_inventory_reverified_after_rebuild": true
   },
+  "notes": [
+    "Supersedes the v17/v10 manifest recorded at baseline 6d9655fdc2f774f0f5eb0613cea0cbcca8816eb6; the pre-repair v18/v11 builds were kept aside as salvage_v18_pre_repair / salvage_v11_pre_repair.",
+    "Invalid-row counts are higher than the v17 generation by design: the conservative legacy-v26 validity rules demote finite placeholders whose provenance flags are false; admission is unchanged."
+  ],
   "episodes": [
     {
       "episode": "episode_20260827_165510",
@@ -45,8 +56,8 @@
       "rejection_reason": null,
       "processed_frames": 272,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_165923",
@@ -57,8 +68,8 @@
       "rejection_reason": null,
       "processed_frames": 213,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_170035",
@@ -69,8 +80,8 @@
       "rejection_reason": null,
       "processed_frames": 245,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_170151",
@@ -81,8 +92,8 @@
       "rejection_reason": null,
       "processed_frames": 189,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_172155",
@@ -93,8 +104,8 @@
       "rejection_reason": null,
       "processed_frames": 189,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_172305",
@@ -105,8 +116,8 @@
       "rejection_reason": null,
       "processed_frames": 304,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_172943",
@@ -117,8 +128,8 @@
       "rejection_reason": null,
       "processed_frames": 245,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_173314",
@@ -129,8 +140,8 @@
       "rejection_reason": null,
       "processed_frames": 222,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_173433",
@@ -141,8 +152,8 @@
       "rejection_reason": null,
       "processed_frames": 308,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_173921",
@@ -153,8 +164,8 @@
       "rejection_reason": null,
       "processed_frames": 224,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_174333",
@@ -165,8 +176,8 @@
       "rejection_reason": null,
       "processed_frames": 268,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_174534",
@@ -177,8 +188,8 @@
       "rejection_reason": null,
       "processed_frames": 247,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_174820",
@@ -189,8 +200,8 @@
       "rejection_reason": null,
       "processed_frames": 261,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_175240",
@@ -201,8 +212,8 @@
       "rejection_reason": null,
       "processed_frames": 301,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_192032",
@@ -213,8 +224,8 @@
       "rejection_reason": null,
       "processed_frames": 221,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_192229",
@@ -225,8 +236,8 @@
       "rejection_reason": null,
       "processed_frames": 175,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_192410",
@@ -237,8 +248,8 @@
       "rejection_reason": null,
       "processed_frames": 193,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_192845",
@@ -249,8 +260,8 @@
       "rejection_reason": null,
       "processed_frames": 293,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_193023",
@@ -261,8 +272,8 @@
       "rejection_reason": null,
       "processed_frames": 238,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_193433",
@@ -273,8 +284,8 @@
       "rejection_reason": null,
       "processed_frames": 281,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_194029",
@@ -285,8 +296,8 @@
       "rejection_reason": null,
       "processed_frames": 237,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_194221",
@@ -297,8 +308,8 @@
       "rejection_reason": null,
       "processed_frames": 209,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_194525",
@@ -309,8 +320,8 @@
       "rejection_reason": null,
       "processed_frames": 286,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_194700",
@@ -321,8 +332,8 @@
       "rejection_reason": null,
       "processed_frames": 177,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_194849",
@@ -333,8 +344,8 @@
       "rejection_reason": null,
       "processed_frames": 230,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_195038",
@@ -345,8 +356,8 @@
       "rejection_reason": null,
       "processed_frames": 286,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_195250",
@@ -357,8 +368,8 @@
       "rejection_reason": null,
       "processed_frames": 185,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_195806",
@@ -369,8 +380,8 @@
       "rejection_reason": null,
       "processed_frames": 217,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_195951",
@@ -381,8 +392,8 @@
       "rejection_reason": null,
       "processed_frames": 318,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_202433",
@@ -393,8 +404,8 @@
       "rejection_reason": null,
       "processed_frames": 249,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_202621",
@@ -405,8 +416,8 @@
       "rejection_reason": null,
       "processed_frames": 331,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_202812",
@@ -417,8 +428,8 @@
       "rejection_reason": null,
       "processed_frames": 226,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_202939",
@@ -429,8 +440,8 @@
       "rejection_reason": null,
       "processed_frames": 193,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_203113",
@@ -441,8 +452,8 @@
       "rejection_reason": null,
       "processed_frames": 165,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_203242",
@@ -453,8 +464,8 @@
       "rejection_reason": null,
       "processed_frames": 235,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_215020",
@@ -465,8 +476,8 @@
       "rejection_reason": null,
       "processed_frames": 206,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_215545",
@@ -477,8 +488,8 @@
       "rejection_reason": null,
       "processed_frames": 216,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_215724",
@@ -489,8 +500,8 @@
       "rejection_reason": null,
       "processed_frames": 218,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_215901",
@@ -501,8 +512,8 @@
       "rejection_reason": null,
       "processed_frames": 244,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_220112",
@@ -513,8 +524,8 @@
       "rejection_reason": null,
       "processed_frames": 223,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_220438",
@@ -525,8 +536,8 @@
       "rejection_reason": null,
       "processed_frames": 215,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_220636",
@@ -537,8 +548,8 @@
       "rejection_reason": null,
       "processed_frames": 205,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_220747",
@@ -549,8 +560,8 @@
       "rejection_reason": null,
       "processed_frames": 313,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_220919",
@@ -561,8 +572,8 @@
       "rejection_reason": null,
       "processed_frames": 225,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_221054",
@@ -573,8 +584,8 @@
       "rejection_reason": null,
       "processed_frames": 314,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_221217",
@@ -585,8 +596,8 @@
       "rejection_reason": null,
       "processed_frames": 261,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_221434",
@@ -597,8 +608,8 @@
       "rejection_reason": null,
       "processed_frames": 248,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_221554",
@@ -609,8 +620,8 @@
       "rejection_reason": null,
       "processed_frames": 188,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_221712",
@@ -621,8 +632,8 @@
       "rejection_reason": null,
       "processed_frames": 183,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_222159",
@@ -633,8 +644,8 @@
       "rejection_reason": null,
       "processed_frames": 259,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_222609",
@@ -645,8 +656,8 @@
       "rejection_reason": null,
       "processed_frames": 254,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_222727",
@@ -657,8 +668,8 @@
       "rejection_reason": null,
       "processed_frames": 236,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_222906",
@@ -669,8 +680,8 @@
       "rejection_reason": null,
       "processed_frames": 210,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_223431",
@@ -681,8 +692,8 @@
       "rejection_reason": null,
       "processed_frames": 199,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_223607",
@@ -693,8 +704,8 @@
       "rejection_reason": null,
       "processed_frames": 240,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_223729",
@@ -705,8 +716,8 @@
       "rejection_reason": null,
       "processed_frames": 192,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_224138",
@@ -717,8 +728,8 @@
       "rejection_reason": null,
       "processed_frames": 205,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_224317",
@@ -729,8 +740,8 @@
       "rejection_reason": null,
       "processed_frames": 190,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_224423",
@@ -741,8 +752,8 @@
       "rejection_reason": null,
       "processed_frames": 167,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260827_224527",
@@ -753,8 +764,8 @@
       "rejection_reason": "persistent IK failure",
       "processed_frames": 0,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     },
     {
       "episode": "episode_20260908_212811",
@@ -765,8 +776,8 @@
       "rejection_reason": null,
       "processed_frames": 268,
       "processing_source_schema_version": 26,
-      "processed_schema_version": 17,
-      "zarr_schema_version": 10
+      "processed_schema_version": 18,
+      "zarr_schema_version": 11
     }
   ]
 }
