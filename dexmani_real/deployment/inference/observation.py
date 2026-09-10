@@ -342,16 +342,27 @@ def _read_tactile_force_history(
 def _select_control_grid_reference_ns(
     *, run_started_ns: int, anchor_ns: int, history_len: int, step_dt_ns: int
 ) -> tuple[np.ndarray, int]:
-    """Return the last T completed episode-grid times, oldest first."""
+    """Return the last T episode-grid times, oldest first.
+
+    During run warm-up fewer than ``history_len`` grid ticks have elapsed, so
+    the earliest tick is repeated to fill the window (edge-repeat).  The
+    repeated leading slots keep the real earliest-tick time; the aligner then
+    maps each leading reference to the oldest complete post-run observation.
+    """
     if history_len <= 0 or step_dt_ns <= 0 or anchor_ns < run_started_ns:
         return np.empty(0, dtype=np.uint64), 0
     latest_tick = (anchor_ns - run_started_ns) // step_dt_ns
-    if latest_tick < history_len - 1:
-        return np.empty(0, dtype=np.uint64), 0
     logical_step_ns = run_started_ns + latest_tick * step_dt_ns
-    first_ns = logical_step_ns - (history_len - 1) * step_dt_ns
+    tick_indices = np.arange(
+        max(0, latest_tick - history_len + 1), latest_tick + 1, dtype=np.int64
+    )
+    if tick_indices.size < history_len:
+        pad = history_len - tick_indices.size
+        tick_indices = np.concatenate(
+            (np.zeros(pad, dtype=np.int64), tick_indices)
+        )
     return (
-        np.arange(first_ns, logical_step_ns + 1, step_dt_ns, dtype=np.uint64),
+        (run_started_ns + tick_indices * step_dt_ns).astype(np.uint64),
         logical_step_ns,
     )
 
@@ -361,20 +372,33 @@ def _align_state_history_to_reference_ns(
     reference_ns: np.ndarray,
     *,
     max_skew_ns: int,
+    run_started_ns: int,
 ) -> FrameWindow | None:
-    """Choose newest source <= each reference, within the explicit skew bound."""
+    """Choose newest source <= each reference, within the explicit skew bound.
+
+    A leading reference at or before run start maps to the oldest post-run
+    source (edge-repeat), filling the history window during warm-up.  Any
+    non-leading reference with no skew-valid candidate still fails the window.
+    """
     if state_history is None or np.asarray(reference_ns).size == 0:
         return None
     sources = np.asarray(state_history.source_monotonic_ns, dtype=np.int64)
     valid = np.asarray(state_history.valid_mask, dtype=np.uint8) == 1
+    valid_idx = np.flatnonzero(valid)
+    if valid_idx.size == 0:
+        return None
     selected: list[int] = []
     for value in np.asarray(reference_ns, dtype=np.int64):
         candidates = np.flatnonzero(
             valid & (sources <= value) & (value - sources <= max_skew_ns)
         )
         if candidates.size == 0:
-            return None
-        selected.append(int(candidates[-1]))
+            if value <= run_started_ns:
+                selected.append(int(valid_idx[0]))
+            else:
+                return None
+        else:
+            selected.append(int(candidates[-1]))
     indices = np.asarray(selected, dtype=np.intp)
     return FrameWindow(
         values=state_history.values[indices],
@@ -634,18 +658,20 @@ def _select_camera_control_grid(
     step_dt_ns: int,
     max_grid_lag_ns: int,
 ) -> tuple[tuple[PointCloudFrame | RgbFrame, ...], int]:
-    """Select a strictly advancing causal visual window on the policy grid."""
+    """Select a causal visual window on the policy grid.
+
+    A healthy, recent, same-generation frame may be reused across adjacent grid
+    slots when no newer frame has arrived, and the oldest available frame fills
+    the leading warm-up slots (edge-repeat).  Future, stale, unhealthy, and
+    wrong-generation frames are rejected before they reach ``frames``.
+    """
     if not frames or history_len <= 0 or step_dt_ns <= 0:
         return (), 0
     if anchor_ns < run_started_ns:
         return (), 0
     latest_tick = (anchor_ns - run_started_ns) // step_dt_ns
-    if latest_tick < history_len - 1:
-        return (), 0
     logical_step_ns = run_started_ns + latest_tick * step_dt_ns
     selected: list[PointCloudFrame | RgbFrame] = []
-    previous_sequence = 0
-    previous_source_ns = 0
     for offset in range(history_len - 1, -1, -1):
         desired_ns = logical_step_ns - offset * step_dt_ns
         candidates = [
@@ -654,17 +680,14 @@ def _select_camera_control_grid(
             if frame.source_monotonic_ns <= desired_ns
             and desired_ns - frame.source_monotonic_ns <= max_grid_lag_ns
         ]
-        if not candidates:
-            return (), 0
-        frame = candidates[-1]
-        if (
-            frame.source_camera_sequence <= previous_sequence
-            or frame.source_monotonic_ns <= previous_source_ns
-        ):
+        if candidates:
+            frame = candidates[-1]
+        elif desired_ns <= run_started_ns:
+            # Leading warm-up slot: reuse the oldest available frame.
+            frame = frames[0]
+        else:
             return (), 0
         selected.append(frame)
-        previous_sequence = frame.source_camera_sequence
-        previous_source_ns = frame.source_monotonic_ns
     return tuple(selected), logical_step_ns
 
 
@@ -825,27 +848,32 @@ def _build_observation(
     # Every modality uses the policy control grid; camera exposure times do
     # not move the robot/contact observation back to an earlier raw instant.
     arm_history = _align_state_history_to_reference_ns(
-        arm_history, reference_ns, max_skew_ns=max_skew_ns
+        arm_history, reference_ns, max_skew_ns=max_skew_ns,
+        run_started_ns=run_started_ns,
     )
     if hand_history is not None:
         hand_history = _align_state_history_to_reference_ns(
-            hand_history, reference_ns, max_skew_ns=max_skew_ns
+            hand_history, reference_ns, max_skew_ns=max_skew_ns,
+            run_started_ns=run_started_ns,
         )
     if hand_tactile_sum_history is not None:
         hand_tactile_sum_history = _align_state_history_to_reference_ns(
-            hand_tactile_sum_history, reference_ns, max_skew_ns=max_skew_ns
+            hand_tactile_sum_history, reference_ns, max_skew_ns=max_skew_ns,
+            run_started_ns=run_started_ns,
         )
     if hand_tactile_provenance_history is not None:
         hand_tactile_provenance_history = _align_state_history_to_reference_ns(
             hand_tactile_provenance_history,
             reference_ns,
             max_skew_ns=max_skew_ns,
+            run_started_ns=run_started_ns,
         )
     if hand_tactile_force_history is not None:
         hand_tactile_force_history = _align_state_history_to_reference_ns(
             hand_tactile_force_history,
             reference_ns,
             max_skew_ns=max_skew_ns,
+            run_started_ns=run_started_ns,
         )
     if pointcloud_requested:
         if pointcloud is None or logical_step_ns <= 0:

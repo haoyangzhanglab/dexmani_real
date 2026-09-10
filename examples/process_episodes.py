@@ -27,7 +27,6 @@ import yaml
 from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.dataset.contracts import (
     EpisodeAnnotation,
-    OutputProfile,
     ProcessingConfig,
     validate_processed_task_name,
 )
@@ -86,20 +85,11 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--profile",
-        choices=[profile.value for profile in OutputProfile],
-        default=OutputProfile.RGB_PC.value,
-        help="Select the output modalities.",
-    )
-    parser.add_argument(
         "--pointcloud-num-points",
         type=int,
         choices=sorted(SUPPORTED_POINT_CLOUD_COUNTS),
         default=1024,
-        help=(
-            "Fixed (N,6) point-cloud size for pointcloud/rgb_pc profiles "
-            "(default: 1024)."
-        ),
+        help="Fixed (N,6) point-cloud size (default: 1024).",
     )
     parser.add_argument(
         "--annotations",
@@ -124,12 +114,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _config(
-    args: argparse.Namespace, profile: OutputProfile, runtime: Any
-) -> ProcessingConfig:
+def _config(args: argparse.Namespace, runtime: Any) -> ProcessingConfig:
     return ProcessingConfig.from_runtime(
         runtime,
-        profile=profile,
         pointcloud=dataclasses.replace(
             runtime.pointcloud, num_points=args.pointcloud_num_points
         ),
@@ -228,7 +215,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     task_name = _validate_task_name(parser, args.task_name)
-    selected_profile = OutputProfile(args.profile)
 
     input_root = args.input_root
     if not input_root.is_dir():
@@ -294,7 +280,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
         )
         try:
-            config = _config(args, selected_profile, runtime)
+            config = _config(args, runtime)
         except (TypeError, ValueError) as exc:
             print(f"error: invalid processing config: {exc}", file=sys.stderr)
             return 2

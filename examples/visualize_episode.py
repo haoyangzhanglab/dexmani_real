@@ -37,7 +37,7 @@ import rerun.blueprint as rrb
 
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.config.experiment import resolve_experiment_config
-from dexmani_real.dataset.contracts import OutputProfile, ProcessingConfig
+from dexmani_real.dataset.contracts import ProcessingConfig
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 from dexmani_real.planning.kinematics.fingertip import (
     compute_fingertip_history_xarm_base,
@@ -302,7 +302,7 @@ class EpisodeVisualizer:
                 state[key] = np.asarray(data)
 
         # Raw stores physical joints; geometry is derived only for this viewer.
-        geometry = ProcessingConfig(profile=OutputProfile.JOINT)
+        geometry = ProcessingConfig()
         arm = state["arm_qpos"]
         hand = state["hand_qpos"]
         arm_valid = np.all(np.isfinite(arm), axis=1)

@@ -391,6 +391,17 @@ def _record_grid_hold(
     kwargs: dict[str, Any] = {}
     if frame_status is not None:
         kwargs["frame_status"] = frame_status
+    target_eef_pos = controller.last_target_eef_pos
+    target_eef_rot6d = controller.last_target_eef_rot6d
+    if not (
+        np.all(np.isfinite(target_eef_pos)) and np.all(np.isfinite(target_eef_rot6d))
+    ):
+        # A held frame before any successful IK solve still records a finite,
+        # consistent EE representation: FK(actual published hold joint target),
+        # matching the joint hold, so short-IK episodes never carry NaN action_ee.
+        target_eef_pos, target_eef_rot6d = make_arm_fk().compute(
+            np.asarray(controller.prev_qpos_cmd, dtype=np.float64)
+        )
     record_held(
         resources.recorder,
         observation.arm_state,
@@ -402,8 +413,8 @@ def _record_grid_hold(
         hand_tactile=observation.hand_tactile,
         arm_qpos_sent=controller.prev_qpos_cmd.copy(),
         action_queued=action_queued,
-        target_eef_pos=controller.last_target_eef_pos,
-        target_eef_rot6d=controller.last_target_eef_rot6d,
+        target_eef_pos=target_eef_pos,
+        target_eef_rot6d=target_eef_rot6d,
         observation_anchor_monotonic_ns=observation.anchor_monotonic_ns,
         shared=shared,
         max_observation_skew_s=resources.max_observation_skew_s,

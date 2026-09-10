@@ -16,16 +16,15 @@ import pytest
 import dexmani_real.dataset.processing as processing
 from dexmani_real.dataset.contracts import (
     EpisodeAnnotation,
-    OutputProfile,
     ProcessingConfig,
 )
 from dexmani_real.dataset.processing import load_annotations, process_episode_root
 from examples import export_policy_zarr, process_episodes
-from test_control_step_dataset import write_control_episode
+from test_control_step_dataset import permissive_test_config, write_control_episode
 
 
 def _config() -> ProcessingConfig:
-    return ProcessingConfig(profile=OutputProfile.JOINT)
+    return permissive_test_config()
 
 
 def _write_episode(root: Path, name: str, *, frames: int = 24) -> Path:
@@ -328,7 +327,7 @@ def test_cli_uses_one_batch_call_and_filters_unknown_annotations(
     monkeypatch.setattr(
         process_episodes,
         "_config",
-        lambda _args, profile, _runtime: profile,
+        lambda _args, _runtime: object(),
     )
 
     def process_once(*_args, **kwargs):

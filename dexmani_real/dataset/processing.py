@@ -17,7 +17,6 @@ import yaml
 from dexmani_real.dataset.contracts import (
     EpisodeAnnotation,
     EpisodeDecision,
-    OutputProfile,
     ProcessingConfig,
     validate_processed_task_name,
 )
@@ -26,6 +25,7 @@ from dexmani_real.dataset.pointcloud import (
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
 )
+from dexmani_real.ipc.schema import TACTILE_UNIT_CODE_XHAND_SDK_NATIVE
 from dexmani_real.dataset.processed import (
     _ACTION_EE_FRAME,
     _CONTACT_FORCE_SOURCE,
@@ -54,11 +54,6 @@ from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.storage.reader import EpisodeReader, MergedH5File
 from dexmani_real.recording.storage.schema import EPISODE_SCHEMA_VERSION
 from dexmani_real.recording.storage.video import VideoDecoder
-from dexmani_real.sensor.camera.transforms import (
-    resize_camera_intrinsic,
-    resize_depth,
-    resize_rgb,
-)
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
@@ -129,9 +124,7 @@ def analyze_episode(
     if frames <= 0:
         raise ValueError("raw episode must contain at least one row")
     if annotation is not None and not annotation.include:
-        return EpisodeDecision(
-            reader.h5_path, frames, config.profile, "excluded by annotation"
-        )
+        return EpisodeDecision(reader.h5_path, frames, "excluded by annotation")
     dt = float(reader.timing.grid_dt_s)
     if not np.isfinite(dt) or dt <= 0:
         raise ValueError("control period must be finite and positive")
@@ -142,26 +135,36 @@ def analyze_episode(
         "action_hand_joint": ((12,), np.float64),
         "action_arm_ee": ((9,), np.float64),
         "hand_contact": ((5, 3), np.float64),
+        "hand_tactile_force": ((5, 120, 3), np.float64),
+        "tactile_calibrated": ((), np.bool_),
+        "tactile_unit_code": ((), np.uint8),
         "timestamp": ((), np.float64),
         "source_sample_index": ((), np.int64),
         "flag_frame_status": ((), np.uint8),
         "observation_anchor_monotonic_ns": ((), np.uint64),
         "arm_source_monotonic_ns": ((), np.uint64),
         "hand_source_monotonic_ns": ((), np.uint64),
+        "tactile_source_monotonic_ns": ((), np.uint64),
+        "camera_source_monotonic_ns": ((), np.uint64),
     }
-    # Legacy v26 stored contact with its hand row. Current recording independently
-    # selects valid aggregate contact; dense tactile never gates this dataset.
+    # Legacy v26 stored aggregate contact with its hand row (no independent
+    # contact source); current recording selects valid aggregate contact.
     if reader.schema_version != 26:
         specs["hand_contact_source_monotonic_ns"] = ((), np.uint64)
-    if config.profile.needs_rgb or config.profile.needs_pointcloud:
-        specs["camera_source_monotonic_ns"] = ((), np.uint64)
+    # Dense/aggregate payloads carry an explicit per-row validity mask, so NaN
+    # (or the legacy finite-zero placeholder) is admissible and never rejects.
+    validity_masked = {"hand_contact", "hand_tactile_force"}
     arrays = {}
     for name, (tail, dtype) in specs.items():
         dataset = source[name]
         if dataset.shape != (frames, *tail) or dataset.dtype != np.dtype(dtype):
             raise ValueError(f"{name}: corrupt shape/dtype")
         values = np.asarray(dataset[:])
-        if np.issubdtype(dtype, np.floating) and not np.all(np.isfinite(values)):
+        if (
+            np.issubdtype(dtype, np.floating)
+            and name not in validity_masked
+            and not np.all(np.isfinite(values))
+        ):
             raise ValueError(f"{name}: NaN/Inf")
         arrays[name] = values
     if np.any(np.diff(arrays["timestamp"]) <= 0):
@@ -171,48 +174,47 @@ def analyze_episode(
     anchor = arrays["observation_anchor_monotonic_ns"]
     if np.any(anchor == 0) or np.any(anchor[1:] <= anchor[:-1]):
         raise ValueError("control anchors must be positive and strictly increasing")
-    for name in specs:
-        if name.endswith("_source_monotonic_ns"):
-            if np.any(arrays[name] == 0) or np.any(arrays[name] > anchor):
-                raise ValueError(
-                    f"{name}: source must be positive and causal to control anchor"
-                )
+    for name in ("arm_source_monotonic_ns", "hand_source_monotonic_ns", "camera_source_monotonic_ns"):
+        if np.any(arrays[name] == 0) or np.any(arrays[name] > anchor):
+            raise ValueError(
+                f"{name}: source must be positive and causal to control anchor"
+            )
+    for name in ("hand_contact_source_monotonic_ns", "tactile_source_monotonic_ns"):
+        if name in arrays and np.any(arrays[name] > anchor):
+            raise ValueError(f"{name}: source must be causal to control anchor")
     validate_canonical_rot6d(arrays["action_arm_ee"][:, 3:9], label="raw action_arm_ee")
-    if config.profile.needs_rgb or config.profile.needs_pointcloud:
-        camera = load_raw_episode_camera_model(reader)
-        load_raw_episode_base_from_color(reader)
-        depth = source["depth"]
-        geometry = camera.geometry.color
-        if depth.shape != (
-            frames,
-            geometry.height,
-            geometry.width,
-        ) or depth.dtype != np.dtype(np.uint16):
-            raise ValueError("depth: corrupt shape/dtype/frame count")
-        # Decode all required images during admission, so dry-run can detect
-        # technical corruption before any batch is built.
-        decoded = 0
-        for image in reader.iter_camera_frames("rgb"):
-            if (
-                image.shape != (geometry.height, geometry.width, 3)
-                or image.dtype != np.uint8
-            ):
-                raise ValueError("RGB: corrupt shape/dtype")
-            decoded += 1
-        if decoded != frames:
-            raise ValueError(f"RGB frame count {decoded} != source frames {frames}")
-        for rows in _dataset_row_slices(depth):
-            depth[rows]  # Force HDF5 decompression/read errors at admission.
+    camera = load_raw_episode_camera_model(reader)
+    load_raw_episode_base_from_color(reader)
+    depth = source["depth"]
+    geometry = camera.geometry.color
+    if depth.shape != (
+        frames,
+        geometry.height,
+        geometry.width,
+    ) or depth.dtype != np.dtype(np.uint16):
+        raise ValueError("depth: corrupt shape/dtype/frame count")
+    # Decode all required images during admission, so dry-run can detect
+    # technical corruption before any batch is built.
+    decoded = 0
+    for image in reader.iter_camera_frames("rgb"):
+        if (
+            image.shape != (geometry.height, geometry.width, 3)
+            or image.dtype != np.uint8
+        ):
+            raise ValueError("RGB: corrupt shape/dtype")
+        decoded += 1
+    if decoded != frames:
+        raise ValueError(f"RGB frame count {decoded} != source frames {frames}")
+    for rows in _dataset_row_slices(depth):
+        depth[rows]  # Force HDF5 decompression/read errors at admission.
     # Preserve the established transient/persistent boundary: up to four
     # consecutive FRAME_IK_FAIL samples are a short hold, five are persistent.
     consecutive_ik_fail = 0
     for status in arrays["flag_frame_status"]:
         consecutive_ik_fail = consecutive_ik_fail + 1 if status == 2 else 0
         if consecutive_ik_fail > 4:
-            return EpisodeDecision(
-                reader.h5_path, frames, config.profile, "persistent IK failure"
-            )
-    return EpisodeDecision(reader.h5_path, frames, config.profile)
+            return EpisodeDecision(reader.h5_path, frames, "persistent IK failure")
+    return EpisodeDecision(reader.h5_path, frames)
 
 
 def load_annotations(path: str | Path | None) -> dict[str, EpisodeAnnotation]:
@@ -331,12 +333,15 @@ def _dataset_kwargs(
 
 
 def _create_data_datasets(
-    output: h5py.File, length: int, config: ProcessingConfig
+    output: h5py.File,
+    length: int,
+    config: ProcessingConfig,
+    rgb_height: int,
+    rgb_width: int,
 ) -> None:
     numeric_chunk = min(length, 256)
-    specs = _expected_specs(length, config)
-    for name in config.profile.dataset_keys:
-        shape, dtype = specs[name]
+    specs = _expected_specs(length, config.pointcloud.num_points, rgb_height, rgb_width)
+    for name, (shape, dtype) in specs.items():
         row_chunk = 1 if name in _FRAME_CHUNKED_DATASETS else numeric_chunk
         output.create_dataset(
             name,
@@ -364,7 +369,6 @@ def _write_attrs(
             "source_episode": reader.h5_path.name,
             "source_schema_version": int(meta["schema_version"]),
             "source_frames": decision.source_frames,
-            "profile": config.profile.value,
             "episode_steps": decision.processed_frames,
             "dt": float(reader.timing.grid_dt_s),
             "obs_alignment": "obs[t]_before_action[t]",
@@ -383,70 +387,60 @@ def _write_attrs(
             "contact_force_unit": _CONTACT_FORCE_UNIT,
             "contact_force_si_verified": _CONTACT_FORCE_SI_VERIFIED,
             "contact_force_frame": _CONTACT_FORCE_FRAME,
+            "rgb_transform": "native_color_resolution_no_resize",
+            "depth_transform": "depth_to_color_aligned_native_resolution",
+            "depth_unit": "sensor_unit",
+            "depth_scale_m_per_unit": float(meta["depth_scale"]),
+            "depth_invalid_value": 0,
+            "camera_intrinsic_semantics": (
+                "native_color_intrinsics_for_depth_to_color_aligned_depth"
+            ),
+            "camera_extrinsic_semantics": (
+                "T_xarm_base_from_color;native_color_optical_to_xarm_base"
+            ),
+            "source_camera_depth_intrinsics_native": np.asarray(
+                meta["camera_depth_intrinsics"], dtype=np.float64
+            ),
+            "source_camera_depth_distortion_model": str(
+                meta["camera_depth_distortion_model"]
+            ),
+            "source_camera_depth_distortion_coeffs": np.asarray(
+                meta["camera_depth_distortion_coeffs"], dtype=np.float64
+            ),
+            "camera_color_distortion_model": str(
+                meta["camera_color_distortion_model"]
+            ),
+            "camera_color_distortion_coeffs": np.asarray(
+                meta["camera_color_distortion_coeffs"], dtype=np.float64
+            ),
+            "camera_T_color_from_depth": np.asarray(
+                meta["camera_T_color_from_depth"], dtype=np.float64
+            ),
+            "point_cloud_frame": "xarm_base",
+            "processing_config_json": _json(
+                {
+                    "pointcloud": config.pointcloud.to_dict(),
+                    "table_plane_abcd": (
+                        None
+                        if config.table_plane_abcd is None
+                        else list(config.table_plane_abcd)
+                    ),
+                }
+            ),
+            "point_cloud_shape": np.asarray(
+                (config.pointcloud.num_points, 6), dtype=np.int64
+            ),
+            "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
+            "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
+            "point_cloud_table_plane_abcd_json": _json(
+                None
+                if config.table_plane_abcd is None
+                else list(config.table_plane_abcd)
+            ),
+            "point_cloud_sampling": POINT_CLOUD_SAMPLING,
+            "point_cloud_transform": POINT_CLOUD_TRANSFORM,
         }
     )
-    if config.profile.needs_rgb:
-        output.attrs.update(
-            {
-                "rgb_transform": "resize_no_crop",
-                "depth_transform": "depth_to_color_aligned_resize_no_crop_nearest",
-                "depth_unit": "sensor_unit",
-                "depth_scale_m_per_unit": float(meta["depth_scale"]),
-                "depth_invalid_value": 0,
-                "camera_intrinsic_semantics": (
-                    "resized_color_intrinsics_for_depth_to_color_aligned_depth"
-                ),
-                "camera_extrinsic_semantics": (
-                    "T_xarm_base_from_color;native_color_optical_to_xarm_base"
-                ),
-                "source_camera_depth_intrinsics_native": np.asarray(
-                    meta["camera_depth_intrinsics"], dtype=np.float64
-                ),
-                "source_camera_depth_distortion_model": str(
-                    meta["camera_depth_distortion_model"]
-                ),
-                "source_camera_depth_distortion_coeffs": np.asarray(
-                    meta["camera_depth_distortion_coeffs"], dtype=np.float64
-                ),
-                "camera_color_distortion_model": str(
-                    meta["camera_color_distortion_model"]
-                ),
-                "camera_color_distortion_coeffs": np.asarray(
-                    meta["camera_color_distortion_coeffs"], dtype=np.float64
-                ),
-                "camera_T_color_from_depth": np.asarray(
-                    meta["camera_T_color_from_depth"], dtype=np.float64
-                ),
-            }
-        )
-    if config.profile.needs_pointcloud:
-        output.attrs.update(
-            {
-                "point_cloud_frame": "xarm_base",
-                "processing_config_json": _json(
-                    {
-                        "pointcloud": config.pointcloud.to_dict(),
-                        "table_plane_abcd": (
-                            None
-                            if config.table_plane_abcd is None
-                            else list(config.table_plane_abcd)
-                        ),
-                    }
-                ),
-                "point_cloud_shape": np.asarray(
-                    (config.pointcloud.num_points, 6), dtype=np.int64
-                ),
-                "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
-                "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
-                "point_cloud_table_plane_abcd_json": _json(
-                    None
-                    if config.table_plane_abcd is None
-                    else list(config.table_plane_abcd)
-                ),
-                "point_cloud_sampling": POINT_CLOUD_SAMPLING,
-                "point_cloud_transform": POINT_CLOUD_TRANSFORM,
-            }
-        )
 
 
 def _write_processed_episode(
@@ -461,12 +455,11 @@ def _write_processed_episode(
     if not decision.accepted:
         raise ValueError("cannot write a rejected episode")
     frames = decision.source_frames
-    camera_model = None
-    T_xarm_base_from_color = None
-    if config.profile.needs_rgb or config.profile.needs_pointcloud:
-        # Resolve the raw RGB-D geometry boundary before creating output.
-        camera_model = load_raw_episode_camera_model(reader)
-        T_xarm_base_from_color = load_raw_episode_base_from_color(reader)
+    camera_model = load_raw_episode_camera_model(reader)
+    T_xarm_base_from_color = load_raw_episode_base_from_color(reader)
+    geometry = camera_model.geometry
+    rgb_height = geometry.color.height
+    rgb_width = geometry.color.width
     with h5py.File(path, "w") as output:
         _write_attrs(
             output,
@@ -475,7 +468,9 @@ def _write_processed_episode(
             config,
             task_name=task_name,
         )
-        _create_data_datasets(output, decision.processed_frames, config)
+        _create_data_datasets(
+            output, decision.processed_frames, config, rgb_height, rgb_width
+        )
         arm_action = np.asarray(
             reader.h5f["action_arm_joint_sent"][:], dtype=np.float32
         )
@@ -491,9 +486,41 @@ def _write_processed_episode(
         output["joint_state"][:] = joint_state
         output["action"][:] = np.concatenate((arm_action, hand_action), axis=1)
         output["action_ee"][:] = np.concatenate((arm_action_ee, hand_action), axis=1)
-        output["contact_force"][:] = np.asarray(
-            reader.h5f["hand_contact"][:], dtype=np.float32
+        # Aggregate contact with an explicit per-row validity mask.
+        hand_contact = np.asarray(reader.h5f["hand_contact"][:], dtype=np.float32)
+        contact_finite = np.all(np.isfinite(hand_contact), axis=(1, 2))
+        if reader.schema_version != 26:
+            contact_valid = contact_finite & (
+                np.asarray(
+                    reader.h5f["hand_contact_source_monotonic_ns"][:], dtype=np.uint64
+                )
+                > 0
+            )
+        else:
+            # Legacy v26 kept aggregate contact with its hand row.
+            contact_valid = contact_finite
+        output["contact_force"][:] = hand_contact
+        output["contact_force_valid"][:] = contact_valid
+        # Dense tactile with an explicit per-row validity mask.
+        hand_tactile = np.asarray(
+            reader.h5f["hand_tactile_force"][:], dtype=np.float32
         )
+        tactile_valid = (
+            np.all(np.isfinite(hand_tactile), axis=(1, 2, 3))
+            & np.asarray(reader.h5f["tactile_calibrated"][:], dtype=bool)
+            & (
+                np.asarray(reader.h5f["tactile_unit_code"][:], dtype=np.uint8)
+                == TACTILE_UNIT_CODE_XHAND_SDK_NATIVE
+            )
+            & (
+                np.asarray(
+                    reader.h5f["tactile_source_monotonic_ns"][:], dtype=np.uint64
+                )
+                > 0
+            )
+        )
+        output["tactile_force"][:] = hand_tactile
+        output["tactile_force_valid"][:] = tactile_valid
         hand_fk = HandKinematics(
             config.hand_urdf_path, list(config.fingertip_link_names)
         )
@@ -511,66 +538,57 @@ def _write_processed_episode(
             ),
             eef_pose_history=compute_eef_pose_history_xarm_base(joint_state[:, :7]),
         )
+        # Flat timing arrays: one scalar per control row.
+        output["observation_anchor_monotonic_ns"][:] = reader.h5f[
+            "observation_anchor_monotonic_ns"
+        ][:]
+        output["arm_source_monotonic_ns"][:] = reader.h5f[
+            "arm_source_monotonic_ns"
+        ][:]
+        output["hand_source_monotonic_ns"][:] = reader.h5f[
+            "hand_source_monotonic_ns"
+        ][:]
+        contact_source_name = (
+            "hand_contact_source_monotonic_ns"
+            if reader.schema_version != 26
+            else "hand_source_monotonic_ns"
+        )
+        output["contact_source_monotonic_ns"][:] = reader.h5f[contact_source_name][:]
+        output["tactile_source_monotonic_ns"][:] = reader.h5f[
+            "tactile_source_monotonic_ns"
+        ][:]
+        output["camera_source_monotonic_ns"][:] = reader.h5f[
+            "camera_source_monotonic_ns"
+        ][:]
 
-        if config.profile.needs_rgb:
-            assert camera_model is not None
-            assert T_xarm_base_from_color is not None
-            geometry = camera_model.geometry
-            camera_k = resize_camera_intrinsic(
-                geometry.color.matrix(),
-                source_height=geometry.color.height,
-                source_width=geometry.color.width,
-                target_height=config.target_rgb_height,
-                target_width=config.target_rgb_width,
+        # Native aligned RGB-D: store the source color resolution without resize.
+        output["camera_intrinsic"][:] = (
+            geometry.color.matrix().astype(np.float32).reshape(9)[None, :]
+        )
+        output["camera_extrinsic"][:] = np.broadcast_to(
+            T_xarm_base_from_color,
+            output["camera_extrinsic"].shape,
+        ).astype(np.float32)
+        pointcloud_deriver = RawEpisodePointCloudDeriver(
+            reader=reader,
+            camera=camera_model,
+            T_xarm_base_from_color=T_xarm_base_from_color,
+            pointcloud=config.pointcloud,
+            table_plane_abcd=config.table_plane_abcd,
+        )
+        for source_index, frame in enumerate(reader.iter_camera_frames("rgb")):
+            if source_index >= frames:
+                raise ValueError("RGB contains extra frames")
+            output["rgb"][source_index] = frame
+            output["depth"][source_index] = np.asarray(
+                reader.h5f["depth"][source_index], dtype=np.uint16
             )
-            output["camera_intrinsic"][:] = camera_k[None, :]
-            output["camera_extrinsic"][:] = np.broadcast_to(
-                T_xarm_base_from_color,
-                output["camera_extrinsic"].shape,
-            ).astype(np.float32)
-            for source_index in range(frames):
-                depth = np.asarray(reader.h5f["depth"][source_index], dtype=np.uint16)
-                output["depth"][source_index] = resize_depth(
-                    depth,
-                    height=config.target_rgb_height,
-                    width=config.target_rgb_width,
-                )
-
-        if config.profile.needs_pointcloud:
-            assert camera_model is not None
-            assert T_xarm_base_from_color is not None
-            pointcloud_deriver = RawEpisodePointCloudDeriver(
-                reader=reader,
-                camera=camera_model,
-                T_xarm_base_from_color=T_xarm_base_from_color,
-                pointcloud=config.pointcloud,
-                table_plane_abcd=config.table_plane_abcd,
-            )
-        else:
-            pointcloud_deriver = None
-        if config.profile.needs_rgb or config.profile.needs_pointcloud:
-            decoded_count = 0
-            for source_index, frame in enumerate(reader.iter_camera_frames("rgb")):
-                decoded_count += 1
-                if source_index >= frames:
-                    raise ValueError("RGB contains extra frames")
-                if config.profile.needs_rgb:
-                    output["rgb"][source_index] = resize_rgb(
-                        frame,
-                        height=config.target_rgb_height,
-                        width=config.target_rgb_width,
-                    )
-                if pointcloud_deriver is not None:
-                    cloud = pointcloud_deriver.derive(source_index, frame)
-                    if cloud is None:
-                        raise ValueError(
-                            f"derived point cloud empty at source row {source_index}"
-                        )
-                    output["point_cloud"][source_index] = cloud
-            if decoded_count != frames:
+            cloud = pointcloud_deriver.derive(source_index, frame)
+            if cloud is None:
                 raise ValueError(
-                    f"RGB frame count mismatch: {decoded_count} != {frames}"
+                    f"derived point cloud empty at source row {source_index}"
                 )
+            output["point_cloud"][source_index] = cloud
         output.flush()
     return {
         "path": path.name,
@@ -583,7 +601,7 @@ def _write_processed_episode(
 def _rejected_decision(
     episode: Path, config: ProcessingConfig, reason: str
 ) -> EpisodeDecision:
-    return EpisodeDecision(episode, 0, config.profile, reason)
+    return EpisodeDecision(episode, 0, reason)
 
 
 def _rejection_is_blocking(

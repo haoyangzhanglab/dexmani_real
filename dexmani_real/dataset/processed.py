@@ -18,7 +18,6 @@ from dexmani_real.config.pointcloud import (
     POINT_CLOUD_TRANSFORM,
 )
 from dexmani_real.dataset.contracts import (
-    OutputProfile,
     ProcessingConfig,
     validate_processed_task_name,
 )
@@ -30,17 +29,54 @@ from dexmani_real.planning.kinematics.fingertip import (
 from dexmani_real.planning.kinematics.pose import validate_canonical_rot6d
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 17
+PROCESSED_SCHEMA_VERSION = 18
 _CONTACT_FORCE_SOURCE = "raw_hand_contact_control_step"
 _VALIDATION_CHUNK_BYTES = 64 * 1024 * 1024
+# Fixed-tail multimodal datasets; rgb/depth/point_cloud have variable tails and
+# are appended by _expected_specs.  Dense/aggregate validity masks are bool rows.
 _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "joint_state": ((19,), np.dtype(np.float32)),
     "action": ((19,), np.dtype(np.float32)),
     "action_ee": ((21,), np.dtype(np.float32)),
     "contact_force": ((5, 3), np.dtype(np.float32)),
+    "contact_force_valid": ((), np.dtype(np.bool_)),
+    "tactile_force": ((5, 120, 3), np.dtype(np.float32)),
+    "tactile_force_valid": ((), np.dtype(np.bool_)),
     "fingertip_points": ((5, 3), np.dtype(np.float32)),
+    "camera_intrinsic": ((9,), np.dtype(np.float32)),
+    "camera_extrinsic": ((4, 4), np.dtype(np.float32)),
+    "observation_anchor_monotonic_ns": ((), np.dtype(np.uint64)),
+    "arm_source_monotonic_ns": ((), np.dtype(np.uint64)),
+    "hand_source_monotonic_ns": ((), np.dtype(np.uint64)),
+    "contact_source_monotonic_ns": ((), np.dtype(np.uint64)),
+    "tactile_source_monotonic_ns": ((), np.dtype(np.uint64)),
+    "camera_source_monotonic_ns": ((), np.dtype(np.uint64)),
 }
+# Payloads whose per-row validity mask governs whether NaN is admissible.
+_VALIDITY_MASKED_KEYS = frozenset({"contact_force", "tactile_force"})
 _FRAME_CHUNKED_DATASETS = frozenset(("rgb", "depth", "point_cloud"))
+# Canonical full multimodal dataset keys (one reusable research episode).
+MULTIMODAL_DATASET_KEYS = (
+    "joint_state",
+    "action",
+    "action_ee",
+    "contact_force",
+    "contact_force_valid",
+    "tactile_force",
+    "tactile_force_valid",
+    "fingertip_points",
+    "rgb",
+    "depth",
+    "camera_intrinsic",
+    "camera_extrinsic",
+    "point_cloud",
+    "observation_anchor_monotonic_ns",
+    "arm_source_monotonic_ns",
+    "hand_source_monotonic_ns",
+    "contact_source_monotonic_ns",
+    "tactile_source_monotonic_ns",
+    "camera_source_monotonic_ns",
+)
 # contact_force is the aggregate XHand SDK calc_force per finger, software-bias
 # corrected, in the SDK-native numeric scale (SI conversion unverified).
 _CONTACT_FORCE_REPRESENTATION = "xhand_sdk_calc_force_fx_fy_fz_bias_corrected"
@@ -168,7 +204,11 @@ def validate_processed_payload(
             # Integer image payloads must also be readable. This checks storage
             # integrity without treating sensor pixel values as quality gates.
             block = np.asarray(dataset[row_slice])
-            if np.issubdtype(dtype, np.floating) and not np.all(np.isfinite(block)):
+            if (
+                np.issubdtype(dtype, np.floating)
+                and key not in _VALIDITY_MASKED_KEYS
+                and not np.all(np.isfinite(block))
+            ):
                 raise ValueError(f"{label}: {key} contains NaN/Inf")
             if key == "action_ee":
                 validate_canonical_rot6d(
@@ -185,6 +225,21 @@ def validate_processed_payload(
                     _validate_pointcloud_workspace(
                         block, pointcloud_workspace, label=label
                     )
+
+    for key in _VALIDITY_MASKED_KEYS:
+        if key not in expected_specs:
+            continue
+        payload = source[key]
+        mask = np.asarray(source[f"{key}_valid"][:], dtype=bool)
+        for row_slice in _dataset_row_slices(payload):
+            block = np.asarray(payload[row_slice])
+            rows_finite = np.all(
+                np.isfinite(block), axis=tuple(range(1, block.ndim))
+            )
+            if np.any(mask[row_slice] & ~rows_finite):
+                raise ValueError(
+                    f"{label}: {key} has non-finite payload on a valid row"
+                )
 
     if validate_rgbd:
         rgb = source.get("rgb")
@@ -270,42 +325,33 @@ def _dataset_row_slices(dataset: h5py.Dataset) -> Iterator[slice]:
 
 
 def _expected_specs(
-    length: int, config: ProcessingConfig
+    length: int,
+    num_points: int,
+    rgb_height: int,
+    rgb_width: int,
 ) -> dict[str, tuple[tuple[int, ...], np.dtype[Any]]]:
+    """Full multimodal processed specs for one native-RGB-D episode."""
     specs = {
         name: ((length, *tail_shape), dtype)
         for name, (tail_shape, dtype) in _CORE_DATASET_SPECS.items()
     }
-    if config.profile.needs_rgb:
-        specs.update(
-            {
-                "rgb": (
-                    (length, config.target_rgb_height, config.target_rgb_width, 3),
-                    np.dtype(np.uint8),
-                ),
-                "depth": (
-                    (length, config.target_rgb_height, config.target_rgb_width),
-                    np.dtype(np.uint16),
-                ),
-                "camera_intrinsic": ((length, 9), np.dtype(np.float32)),
-                "camera_extrinsic": ((length, 4, 4), np.dtype(np.float32)),
-            }
-        )
-    if config.profile.needs_pointcloud:
-        specs["point_cloud"] = (
-            (length, config.pointcloud.num_points, 6),
-            np.dtype(np.float32),
-        )
+    specs.update(
+        {
+            "rgb": ((length, rgb_height, rgb_width, 3), np.dtype(np.uint8)),
+            "depth": ((length, rgb_height, rgb_width), np.dtype(np.uint16)),
+            "point_cloud": ((length, num_points, 6), np.dtype(np.float32)),
+        }
+    )
     return specs
 
 
 def validate_processed_hdf5(
     path: str | Path, config: ProcessingConfig | None = None
 ) -> dict[str, Any]:
-    """Validate a complete v17 episode before publishing or consuming it.
+    """Validate a complete multimodal episode before publishing or consuming it.
 
-    Image dimensions and point-cloud configuration are self-describing. A caller
-    may additionally supply its expected preprocessing configuration.
+    Native RGB-D resolution and point-cloud configuration are self-describing. A
+    caller may additionally supply its expected point-cloud/table configuration.
     """
     artifact = Path(path)
     with h5py.File(artifact, "r") as source:
@@ -321,7 +367,6 @@ def validate_processed_hdf5(
         for name in ("source_path", "source_episode"):
             if not isinstance(attrs.get(name), str) or not attrs[name]:
                 raise ValueError(f"{artifact.name}: missing {name}")
-        profile = OutputProfile(str(attrs.get("profile", "")))
         dt = float(attrs.get("dt", np.nan))
         if not np.isfinite(dt) or dt <= 0:
             raise ValueError(f"{artifact.name}: invalid dt")
@@ -348,113 +393,92 @@ def validate_processed_hdf5(
             is not _CONTACT_FORCE_SI_VERIFIED
         ):
             raise ValueError(f"{artifact.name}: invalid contact_force_si_verified")
-        specs = {
-            name: ((length, *tail), dtype)
-            for name, (tail, dtype) in _CORE_DATASET_SPECS.items()
-        }
-        if profile.needs_rgb:
-            rgb, depth = source.get("rgb"), source.get("depth")
+        # RGB-D and point cloud are always present in the multimodal superset.
+        rgb, depth = source.get("rgb"), source.get("depth")
+        if (
+            not isinstance(rgb, h5py.Dataset)
+            or rgb.ndim != 4
+            or not isinstance(depth, h5py.Dataset)
+        ):
+            raise ValueError(f"{artifact.name}: RGB-D datasets are incomplete")
+        rgb_height, rgb_width = rgb.shape[1:3]
+        if rgb_height <= 0 or rgb_width <= 0:
+            raise ValueError(f"{artifact.name}: invalid image dimensions")
+        scale = float(attrs.get("depth_scale_m_per_unit", np.nan))
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError(f"{artifact.name}: invalid depth scale")
+        if _strict_integer_attr(attrs, "depth_invalid_value") != 0:
+            raise ValueError(f"{artifact.name}: invalid depth_invalid_value")
+        expected_attrs.update(
+            {
+                "rgb_transform": "native_color_resolution_no_resize",
+                "depth_transform": "depth_to_color_aligned_native_resolution",
+                "camera_intrinsic_semantics": "native_color_intrinsics_for_depth_to_color_aligned_depth",
+                "camera_extrinsic_semantics": "T_xarm_base_from_color;native_color_optical_to_xarm_base",
+            }
+        )
+        depth_k = np.asarray(
+            attrs.get("source_camera_depth_intrinsics_native", ()), dtype=np.float64
+        )
+        if depth_k.shape != (9,) or not np.all(np.isfinite(depth_k)):
+            raise ValueError(f"{artifact.name}: invalid native depth intrinsics")
+        validate_rigid_transform(
+            np.asarray(attrs.get("camera_T_color_from_depth", ())),
+            label="camera_T_color_from_depth",
+        )
+        persisted = _json_object_attr(
+            source, "processing_config_json", label=artifact.name
+        )
+        if set(persisted) != {"pointcloud", "table_plane_abcd"}:
+            raise ValueError(
+                f"{artifact.name}: invalid point-cloud processing config"
+            )
+        pointcloud = PointCloudConfig(**persisted["pointcloud"])
+        table_plane = persisted["table_plane_abcd"]
+        if table_plane is not None:
+            plane = np.asarray(table_plane, dtype=np.float64)
             if (
-                not isinstance(rgb, h5py.Dataset)
-                or rgb.ndim != 4
-                or not isinstance(depth, h5py.Dataset)
+                plane.shape != (4,)
+                or not np.all(np.isfinite(plane))
+                or plane[2] <= 0
             ):
-                raise ValueError(f"{artifact.name}: RGB-D datasets are incomplete")
-            height, width = rgb.shape[1:3]
-            if height <= 0 or width <= 0:
-                raise ValueError(f"{artifact.name}: invalid image dimensions")
-            specs.update(
-                {
-                    "rgb": ((length, height, width, 3), np.dtype(np.uint8)),
-                    "depth": ((length, height, width), np.dtype(np.uint16)),
-                    "camera_intrinsic": ((length, 9), np.dtype(np.float32)),
-                    "camera_extrinsic": ((length, 4, 4), np.dtype(np.float32)),
-                }
+                raise ValueError(f"{artifact.name}: invalid table plane")
+        workspace = pointcloud.workspace
+        expected_attrs.update(
+            {
+                "point_cloud_frame": "xarm_base",
+                "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
+                "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
+                "point_cloud_sampling": POINT_CLOUD_SAMPLING,
+                "point_cloud_transform": POINT_CLOUD_TRANSFORM,
+                "point_cloud_table_plane_abcd_json": _json(table_plane),
+            }
+        )
+        if not np.array_equal(
+            attrs.get("point_cloud_shape", ()), (pointcloud.num_points, 6)
+        ):
+            raise ValueError(f"{artifact.name}: invalid point_cloud_shape")
+        if config is not None and persisted != {
+            "pointcloud": config.pointcloud.to_dict(),
+            "table_plane_abcd": (
+                None
+                if config.table_plane_abcd is None
+                else list(config.table_plane_abcd)
+            ),
+        }:
+            raise ValueError(
+                f"{artifact.name}: point-cloud processing config mismatch"
             )
-            scale = float(attrs.get("depth_scale_m_per_unit", np.nan))
-            if not np.isfinite(scale) or scale <= 0:
-                raise ValueError(f"{artifact.name}: invalid depth scale")
-            if _strict_integer_attr(attrs, "depth_invalid_value") != 0:
-                raise ValueError(f"{artifact.name}: invalid depth_invalid_value")
-            expected_attrs.update(
-                {
-                    "rgb_transform": "resize_no_crop",
-                    "depth_transform": "depth_to_color_aligned_resize_no_crop_nearest",
-                    "camera_intrinsic_semantics": "resized_color_intrinsics_for_depth_to_color_aligned_depth",
-                    "camera_extrinsic_semantics": "T_xarm_base_from_color;native_color_optical_to_xarm_base",
-                }
-            )
-            depth_k = np.asarray(
-                attrs.get("source_camera_depth_intrinsics_native", ()), dtype=np.float64
-            )
-            if depth_k.shape != (9,) or not np.all(np.isfinite(depth_k)):
-                raise ValueError(f"{artifact.name}: invalid native depth intrinsics")
-            validate_rigid_transform(
-                np.asarray(attrs.get("camera_T_color_from_depth", ())),
-                label="camera_T_color_from_depth",
-            )
-        workspace = None
-        if profile.needs_pointcloud:
-            persisted = _json_object_attr(
-                source, "processing_config_json", label=artifact.name
-            )
-            if set(persisted) != {"pointcloud", "table_plane_abcd"}:
-                raise ValueError(
-                    f"{artifact.name}: invalid point-cloud processing config"
-                )
-            pointcloud = PointCloudConfig(**persisted["pointcloud"])
-            table_plane = persisted["table_plane_abcd"]
-            if table_plane is not None:
-                plane = np.asarray(table_plane, dtype=np.float64)
-                if (
-                    plane.shape != (4,)
-                    or not np.all(np.isfinite(plane))
-                    or plane[2] <= 0
-                ):
-                    raise ValueError(f"{artifact.name}: invalid table plane")
-            workspace = pointcloud.workspace
-            specs["point_cloud"] = (
-                (length, pointcloud.num_points, 6),
-                np.dtype(np.float32),
-            )
-            expected_attrs.update(
-                {
-                    "point_cloud_frame": "xarm_base",
-                    "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
-                    "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
-                    "point_cloud_sampling": POINT_CLOUD_SAMPLING,
-                    "point_cloud_transform": POINT_CLOUD_TRANSFORM,
-                    "point_cloud_table_plane_abcd_json": _json(table_plane),
-                }
-            )
-            if not np.array_equal(
-                attrs.get("point_cloud_shape", ()), (pointcloud.num_points, 6)
-            ):
-                raise ValueError(f"{artifact.name}: invalid point_cloud_shape")
-            if config is not None and persisted != {
-                "pointcloud": config.pointcloud.to_dict(),
-                "table_plane_abcd": (
-                    None
-                    if config.table_plane_abcd is None
-                    else list(config.table_plane_abcd)
-                ),
-            }:
-                raise ValueError(
-                    f"{artifact.name}: point-cloud processing config mismatch"
-                )
+        specs = _expected_specs(length, pointcloud.num_points, rgb_height, rgb_width)
         for name, expected in expected_attrs.items():
             if attrs.get(name) != expected:
                 raise ValueError(f"{artifact.name}: invalid {name}")
-        if config is not None and (
-            profile != config.profile or specs != _expected_specs(length, config)
-        ):
-            raise ValueError(f"{artifact.name}: processing profile/shape mismatch")
         validate_processed_payload(
             source,
             expected_specs=specs,
             length=length,
             label=artifact.name,
-            validate_rgbd=profile.needs_rgb,
+            validate_rgbd=True,
             pointcloud_workspace=workspace,
         )
     return {"path": artifact.name, "frames": length, "keys": sorted(specs)}

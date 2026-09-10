@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -13,38 +12,6 @@ import numpy as np
 from dexmani_real.config.defaults import environment, hand
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
-
-
-class OutputProfile(str, Enum):
-    """Uniform dataset profiles accepted by downstream consumers."""
-
-    JOINT = "joint"
-    RGB = "rgb"
-    POINTCLOUD = "pointcloud"
-    RGB_PC = "rgb_pc"
-
-    @property
-    def needs_rgb(self) -> bool:
-        return self in (OutputProfile.RGB, OutputProfile.RGB_PC)
-
-    @property
-    def needs_pointcloud(self) -> bool:
-        return self in (OutputProfile.POINTCLOUD, OutputProfile.RGB_PC)
-
-    @property
-    def dataset_keys(self) -> tuple[str, ...]:
-        keys = [
-            "joint_state",
-            "action",
-            "action_ee",
-            "contact_force",
-            "fingertip_points",
-        ]
-        if self.needs_rgb:
-            keys.extend(("rgb", "depth", "camera_intrinsic", "camera_extrinsic"))
-        if self.needs_pointcloud:
-            keys.append("point_cloud")
-        return tuple(keys)
 
 
 def validate_processed_task_name(value: str) -> str:
@@ -62,11 +29,13 @@ def validate_processed_task_name(value: str) -> str:
 
 @dataclass(frozen=True)
 class ProcessingConfig:
-    """Image, point-cloud and fingertip transforms; no sensor-quality policy."""
+    """Point-cloud, fingertip and table transforms; output is always multimodal.
 
-    profile: OutputProfile
-    target_rgb_height: int = 240
-    target_rgb_width: int = 320
+    The canonical processed artifact is one full multimodal episode (joint,
+    action, RGB-D, camera geometry, point cloud, aggregate contact, dense
+    tactile, fingertip, and timing/validity), never a modality-specific profile.
+    """
+
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = (
         environment.table.plane_abcd
@@ -80,13 +49,10 @@ class ProcessingConfig:
     )
 
     @classmethod
-    def from_runtime(
-        cls, runtime: object, *, profile: OutputProfile, **overrides: Any
-    ) -> "ProcessingConfig":
+    def from_runtime(cls, runtime: object, **overrides: Any) -> "ProcessingConfig":
         hand_config = getattr(runtime, "hand")
         table = getattr(runtime, "environment").table
         values = {
-            "profile": profile,
             "pointcloud": getattr(runtime, "pointcloud"),
             "table_plane_abcd": table.plane_abcd if table.enabled else None,
             "fingertip_link_names": tuple(hand_config.fingertip_link_names),
@@ -100,15 +66,8 @@ class ProcessingConfig:
         return cls(**values)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.profile, OutputProfile):
-            raise TypeError("profile must be an OutputProfile")
         if not isinstance(self.pointcloud, PointCloudConfig):
             raise TypeError("pointcloud must be a PointCloudConfig")
-        if any(
-            isinstance(v, bool) or not isinstance(v, int) or v <= 0
-            for v in (self.target_rgb_height, self.target_rgb_width)
-        ):
-            raise ValueError("target image sizes must be positive integers")
         if not 0 <= self.gzip_level <= 9:
             raise ValueError("gzip_level must be in [0, 9]")
         if not self.hand_urdf_path or len(self.fingertip_link_names) != 5:
@@ -132,7 +91,6 @@ class ProcessingConfig:
 
     def to_dict(self) -> dict[str, Any]:
         values = dataclasses.asdict(self)
-        values["profile"] = self.profile.value
         values["pointcloud"] = self.pointcloud.to_dict()
         return values
 
@@ -157,7 +115,6 @@ class EpisodeDecision:
 
     source_path: Path
     source_frames: int
-    profile: OutputProfile
     rejected_reason: str | None = None
 
     @property
@@ -171,7 +128,6 @@ class EpisodeDecision:
     def to_dict(self) -> dict[str, Any]:
         return {
             "source_episode": self.source_path.name,
-            "profile": self.profile.value,
             "accepted": self.accepted,
             "rejected_reason": self.rejected_reason,
             "source_frames": self.source_frames,

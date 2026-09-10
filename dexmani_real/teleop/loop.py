@@ -21,7 +21,6 @@ from dexmani_real.control.safety_gate import SafetyGate, planner_action_safety_g
 from dexmani_real.ipc.causal import (
     read_arm_state_causal,
     read_hand_state_causal,
-    read_hand_tactile_causal,
     read_vr_frame_causal,
     vr_frame_is_fresh,
 )
@@ -58,10 +57,7 @@ from dexmani_real.teleop.control_loop.hand_control import (
     seed_hand_retargeter,
 )
 from dexmani_real.teleop.control_loop.vr_mapping import VRWristMapper
-from dexmani_real.teleop.episode_samples import (
-    RECORDING_TACTILE_MAX_AGE_NS,
-    stop_recording,
-)
+from dexmani_real.teleop.episode_samples import stop_recording
 from dexmani_real.teleop.homing import do_configured_teleop_home
 from dexmani_real.teleop.retargeting.retargeter import (
     DexPilotHandRetargeter,
@@ -254,12 +250,14 @@ def _begin_feedback_issue(
     cfg: TeleopConfig,
     vr_frame: dict | None,
     hand_state: np.ndarray | None,
-    hand_tactile: np.ndarray | None,
     *,
-    recording_enabled: bool,
     now_monotonic_ns: int,
 ) -> str | None:
-    """Return the first data-admission issue before beginning a session."""
+    """Return the first data-admission issue before beginning a session.
+
+    Dense tactile is not a recording-admission gate: an invalid or missing dense
+    payload is recorded as an invalid mask and never blocks the demo.
+    """
     if not vr_frame_is_fresh(
         vr_frame,
         now_monotonic_ns=now_monotonic_ns,
@@ -267,35 +265,17 @@ def _begin_feedback_issue(
     ):
         return "VR hand feedback is unavailable or stale"
     if not cfg.runtime.policy.hand_enabled:
-        hand_issue = None
-    elif hand_state is None:
-        hand_issue = "hand feedback unavailable"
-    else:
-        hand_issue = validate_hand_feedback(
-            connected=bool(hand_state["connected"][0]),
-            state_valid=bool(hand_state["state_valid"][0]),
-            source_monotonic_ns=int(hand_state["source_monotonic_ns"][0]),
-            now_monotonic_ns=time.monotonic_ns(),
-            max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
-            qpos=np.asarray(hand_state["qpos"][0]),
-        )
-    if hand_issue is not None:
-        return hand_issue
-    if not recording_enabled or not cfg.runtime.policy.hand_enabled:
         return None
-    if hand_tactile is None:
-        return "tactile feedback is unavailable"
-    tactile = hand_tactile[0]
-    tactile_source_ns = int(tactile["source_monotonic_ns"])
-    if not (
-        bool(tactile["fresh"])
-        and 0 < tactile_source_ns <= now_monotonic_ns
-        and now_monotonic_ns - tactile_source_ns <= RECORDING_TACTILE_MAX_AGE_NS
-    ):
-        return "tactile feedback is stale"
-    if not bool(tactile["calibrated"]):
-        return "tactile feedback is not calibrated"
-    return None
+    if hand_state is None:
+        return "hand feedback unavailable"
+    return validate_hand_feedback(
+        connected=bool(hand_state["connected"][0]),
+        state_valid=bool(hand_state["state_valid"][0]),
+        source_monotonic_ns=int(hand_state["source_monotonic_ns"][0]),
+        now_monotonic_ns=time.monotonic_ns(),
+        max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
+        qpos=np.asarray(hand_state["qpos"][0]),
+    )
 
 
 def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
@@ -791,17 +771,10 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         if cfg.runtime.policy.hand_enabled
                         else None
                     )
-                    begin_hand_tactile = (
-                        read_hand_tactile_causal(shared)
-                        if recorder is not None and cfg.runtime.policy.hand_enabled
-                        else None
-                    )
                     begin_issue = _begin_feedback_issue(
                         cfg,
                         vr_frame,
                         begin_hand_state,
-                        begin_hand_tactile,
-                        recording_enabled=recorder is not None,
                         now_monotonic_ns=begin_now_ns,
                     )
                     if begin_issue is not None:

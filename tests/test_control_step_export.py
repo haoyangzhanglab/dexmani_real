@@ -8,29 +8,25 @@ import pytest
 import zarr
 
 import dexmani_real.dataset.export as exporter
-from dexmani_real.dataset.contracts import OutputProfile, ProcessingConfig
+from dexmani_real.dataset.contracts import ProcessingConfig
+from dexmani_real.dataset.processed import MULTIMODAL_DATASET_KEYS
 from dexmani_real.dataset.processing import process_episode_root
-from test_control_step_dataset import write_control_episode
+from test_control_step_dataset import permissive_test_config, write_control_episode
 
 
-def processed_pair(tmp_path: Path, profile=OutputProfile.JOINT) -> Path:
+def processed_pair(tmp_path: Path) -> Path:
     raw = tmp_path / "raw"
     write_control_episode(raw, "episode_a")
     write_control_episode(raw, "episode_b")
     with h5py.File(raw / "episode_b" / "data.h5", "r+") as second:
         second["hand_contact"][:] += 100.0
     processed = tmp_path / "processed"
-    process_episode_root(
-        raw,
-        processed,
-        ProcessingConfig(profile=profile, target_rgb_height=16, target_rgb_width=16),
-    )
+    process_episode_root(raw, processed, permissive_test_config())
     return processed
 
 
-@pytest.mark.parametrize("profile", [OutputProfile.JOINT, OutputProfile.RGB])
-def test_d8_two_files_are_two_complete_zarr_episodes(tmp_path, monkeypatch, profile):
-    processed = processed_pair(tmp_path, profile)
+def test_d8_two_files_are_two_complete_zarr_episodes(tmp_path, monkeypatch):
+    processed = processed_pair(tmp_path)
     target = tmp_path / "fixture.zarr"
     validate_calls = []
     real_validate = exporter.validate_processed_hdf5
@@ -47,13 +43,13 @@ def test_d8_two_files_are_two_complete_zarr_episodes(tmp_path, monkeypatch, prof
     assert report["episode_count"] == 2
     assert report["episode_ends"] == [40, 80]
     store = zarr.open_group(str(target), mode="r")
-    assert store.attrs["schema_version"] == 10
+    assert store.attrs["schema_version"] == 11
     assert store.attrs["observation_alignment"] == "control_step_latest_causal"
     assert store.attrs["state_alignment"] == "control_step"
-    assert store.attrs["episode_start_policy"] == "full_history"
-    assert set(store["data"].array_keys()) == set(profile.dataset_keys)
+    assert "episode_start_policy" not in store.attrs
+    assert set(store["data"].array_keys()) == set(MULTIMODAL_DATASET_KEYS)
     np.testing.assert_array_equal(store["meta"]["episode_ends"][:], [40, 80])
-    for key in profile.dataset_keys:
+    for key in MULTIMODAL_DATASET_KEYS:
         expected = []
         for path in sorted(processed.glob("*.h5")):
             with h5py.File(path, "r") as source:

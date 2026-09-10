@@ -1,16 +1,35 @@
 """Offline end-to-end tests of complete control-step episode processing."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import h5py
 import numpy as np
 import pytest
 
-from dexmani_real.dataset.contracts import OutputProfile, ProcessingConfig
-from dexmani_real.dataset.processed import validate_processed_hdf5
+from dexmani_real.config.pointcloud import PointCloudConfig
+from dexmani_real.dataset.contracts import ProcessingConfig
+from dexmani_real.dataset.processed import (
+    MULTIMODAL_DATASET_KEYS,
+    validate_processed_hdf5,
+)
 from dexmani_real.dataset.processing import load_annotations, process_episode_root
 from dexmani_real.recording.storage.schema import DATASET_SPECS, EPISODE_SCHEMA_VERSION
 from dexmani_real.recording.storage.video import VideoEncoder
+
+
+def permissive_test_config() -> ProcessingConfig:
+    """A processing config whose point-cloud policy tolerates the flat synthetic
+    plane (16x16, ~25 mm spacing), which the canonical outlier radius would
+    reject entirely."""
+    return ProcessingConfig(
+        pointcloud=replace(
+            PointCloudConfig(),
+            outlier_min_neighbors=0,
+            outlier_min_component_points=1,
+        ),
+        table_plane_abcd=None,
+    )
 
 
 def write_control_episode(
@@ -86,12 +105,11 @@ def write_control_episode(
     return episode
 
 
-@pytest.mark.parametrize("profile", [OutputProfile.JOINT, OutputProfile.RGB])
 @pytest.mark.parametrize(
     "event",
     ["ordinary", "camera_stale", "newer_tactile", "dense_unavailable", "short_ik"],
 )
-def test_d1_to_d5_all_rows_and_same_row_contact(tmp_path, profile, event):
+def test_d1_to_d5_all_rows_and_same_row_contact(tmp_path, event):
     episode = write_control_episode(tmp_path / "raw")
     with h5py.File(episode / "data.h5", "r+") as raw:
         if event == "camera_stale":
@@ -107,9 +125,7 @@ def test_d1_to_d5_all_rows_and_same_row_contact(tmp_path, profile, event):
         expected_state = np.concatenate(
             (raw["arm_qpos"][:], raw["hand_qpos"][:]), axis=1
         ).astype(np.float32)
-    config = ProcessingConfig(
-        profile=profile, target_rgb_height=16, target_rgb_width=16
-    )
+    config = permissive_test_config()
     output = tmp_path / "processed"
     report = process_episode_root(episode, output, config)
     assert report["processed_frame_count"] == 40
@@ -117,9 +133,25 @@ def test_d1_to_d5_all_rows_and_same_row_contact(tmp_path, profile, event):
     validate_processed_hdf5(artifact)
     with h5py.File(artifact, "r") as data:
         assert data.attrs["source_frames"] == data.attrs["episode_steps"] == 40
-        assert set(data) == set(profile.dataset_keys)
+        assert set(data) == set(MULTIMODAL_DATASET_KEYS)
         np.testing.assert_array_equal(data["contact_force"][:], expected_contact)
         np.testing.assert_array_equal(data["joint_state"][:], expected_state)
+        if event == "dense_unavailable":
+            assert bool(data["tactile_force_valid"][12]) is False
+            assert np.all(np.isnan(data["tactile_force"][12]))
+
+
+def test_contact_and_dense_validity_are_independent(tmp_path):
+    episode = write_control_episode(tmp_path / "raw")
+    with h5py.File(episode / "data.h5", "r+") as raw:
+        # Dense tactile invalid at row 5; the aggregate contact stays valid.
+        raw["hand_tactile_force"][5] = np.nan
+        raw["tactile_source_monotonic_ns"][5] = 0
+    output = tmp_path / "processed"
+    process_episode_root(episode, output, permissive_test_config())
+    with h5py.File(output / f"{episode.name}.h5", "r") as data:
+        assert bool(data["contact_force_valid"][5]) is True
+        assert bool(data["tactile_force_valid"][5]) is False
 
 
 def test_d6_persistent_ik_rejects_whole_episode(tmp_path):
@@ -127,7 +159,7 @@ def test_d6_persistent_ik_rejects_whole_episode(tmp_path):
     with h5py.File(episode / "data.h5", "r+") as raw:
         raw["flag_frame_status"][10:15] = 2
     output = tmp_path / "processed"
-    config = ProcessingConfig(profile=OutputProfile.JOINT)
+    config = permissive_test_config()
     report = process_episode_root(episode, output, config, dry_run=True)
     assert report["processed_frame_count"] == 0
     assert report["episodes"][0]["rejected_reason"] == "persistent IK failure"
@@ -139,7 +171,7 @@ def test_d6_persistent_ik_rejects_whole_episode(tmp_path):
 def test_d7_exact_sent_action(tmp_path):
     episode = write_control_episode(tmp_path / "raw")
     output = tmp_path / "processed"
-    process_episode_root(episode, output, ProcessingConfig(profile=OutputProfile.JOINT))
+    process_episode_root(episode, output, permissive_test_config())
     with (
         h5py.File(episode / "data.h5", "r") as raw,
         h5py.File(output / f"{episode.name}.h5", "r") as processed,
@@ -171,7 +203,7 @@ def test_technical_corruption_has_no_published_artifact(tmp_path, corruption):
     output = tmp_path / "processed"
     with pytest.raises(ValueError, match="no output published"):
         process_episode_root(
-            episode, output, ProcessingConfig(profile=OutputProfile.JOINT)
+            episode, output, permissive_test_config()
         )
     assert not output.exists()
 
@@ -190,9 +222,7 @@ def test_processed_validator_reads_compressed_image_payload(tmp_path, key):
     process_episode_root(
         episode,
         output,
-        ProcessingConfig(
-            profile=OutputProfile.RGB, target_rgb_height=16, target_rgb_width=16
-        ),
+        permissive_test_config(),
     )
     artifact = output / f"{episode.name}.h5"
     with h5py.File(artifact, "r+") as processed:

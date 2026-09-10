@@ -114,7 +114,10 @@ def test_camera_restart_does_not_supply_old_history():
         step_dt_ns=10,
         max_grid_lag_ns=20,
     )
-    assert selected == ()
+    # Camera reuse fills both slots from the single post-restart frame; no
+    # old-generation frame is present to leak through.
+    assert len(selected) == 2
+    assert all(frame.camera_generation == 2 for frame in selected)
 
 
 def test_alignment_rejects_future_and_excessive_skew():
@@ -128,7 +131,10 @@ def test_alignment_rejects_future_and_excessive_skew():
         )
         assert (
             obs._align_state_history_to_reference_ns(
-                window, np.array([100]), max_skew_ns=20
+                window,
+                np.array([100]),
+                max_skew_ns=20,
+                run_started_ns=1,
             )
             is None
         )

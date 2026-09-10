@@ -7,14 +7,13 @@ import h5py
 import numpy as np
 import pytest
 
-from dexmani_real.dataset.contracts import OutputProfile, ProcessingConfig
 from dexmani_real.dataset.processing import _open_processing_episode, analyze_episode
 from dexmani_real.deployment import executor as executor_module
 from dexmani_real.ipc.causal import read_hand_contact_causal
 from dexmani_real.ipc.schema import ARM_STATE_DTYPE, HAND_STATE_DTYPE
 from dexmani_real.recording.frame import decode_record_sample
 from dexmani_real.teleop.episode_samples import record_frame, record_held
-from test_control_step_dataset import write_control_episode
+from test_control_step_dataset import permissive_test_config, write_control_episode
 from test_raw_v26_recording import _frame, _recorder
 from test_v26_producers import _client
 
@@ -141,14 +140,20 @@ def test_teleop_records_selected_contact_and_keeps_latest_hand(held, case):
     assert np.isnan(row["hand_tactile_force"]).all()
 
 
-@pytest.mark.parametrize("source_ns", [0, 10_000_000_000])
-def test_current_raw_contact_source_is_required_and_legacy26_uses_hand_source(
-    tmp_path, source_ns
-):
+def test_contact_source_zero_is_validity_masked_not_rejected(tmp_path):
     episode = write_control_episode(tmp_path)
-    config = ProcessingConfig(profile=OutputProfile.JOINT)
+    config = permissive_test_config()
     with h5py.File(episode / "data.h5", "r+") as raw:
-        raw["hand_contact_source_monotonic_ns"][5] = source_ns
+        raw["hand_contact_source_monotonic_ns"][5] = 0
+    with _open_processing_episode(episode) as reader:
+        assert analyze_episode(reader, config).accepted
+
+
+def test_future_contact_source_rejected_and_legacy26_uses_hand_source(tmp_path):
+    episode = write_control_episode(tmp_path)
+    config = permissive_test_config()
+    with h5py.File(episode / "data.h5", "r+") as raw:
+        raw["hand_contact_source_monotonic_ns"][5] = 10_000_000_000
     with _open_processing_episode(episode) as reader:
         with pytest.raises(ValueError, match="hand_contact_source"):
             analyze_episode(reader, config)

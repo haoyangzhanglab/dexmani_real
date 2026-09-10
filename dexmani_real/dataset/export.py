@@ -13,12 +13,12 @@ import h5py
 import numpy as np
 import zarr
 
-from dexmani_real.dataset.contracts import OutputProfile, validate_processed_task_name
+from dexmani_real.dataset.contracts import validate_processed_task_name
 from dexmani_real.dataset.processed import validate_processed_hdf5
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 
 POLICY_ZARR_SCHEMA_NAME = "dexmani-real-policy-zarr"
-POLICY_ZARR_SCHEMA_VERSION = 10
+POLICY_ZARR_SCHEMA_VERSION = 11
 ExportProgressCallback = Callable[[str, int, int], None]
 
 
@@ -53,7 +53,6 @@ class _Artifact:
 
     path: Path
     length: int
-    profile: OutputProfile
     task_name: str
     dt: float
     dataset_shapes: dict[str, tuple[int, ...]]
@@ -82,7 +81,6 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
     # The processed boundary proves payload integrity and row preservation once.
     validation = validate_processed_hdf5(path)
     with h5py.File(path, "r") as source:
-        profile = OutputProfile(source.attrs["profile"])
         task_name = str(source.attrs["task_name"])
         if (
             config.expected_task_name is not None
@@ -106,40 +104,30 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
             "fingertip_points_unit",
             "fingertip_points_derivation",
             "fingertip_points_policy_id",
+            "depth_scale_m_per_unit",
+            "depth_invalid_value",
+            "camera_intrinsic_semantics",
+            "camera_extrinsic_semantics",
+            "point_cloud_frame",
+            "point_cloud_color_source",
+            "point_cloud_policy_id",
+            "point_cloud_table_plane_abcd_json",
+            "point_cloud_sampling",
+            "point_cloud_transform",
+            "processing_config_json",
         ]
-        if profile.needs_rgb:
-            semantic_keys.extend(
-                (
-                    "depth_scale_m_per_unit",
-                    "depth_invalid_value",
-                    "camera_intrinsic_semantics",
-                    "camera_extrinsic_semantics",
-                )
-            )
-        if profile.needs_pointcloud:
-            semantic_keys.extend(
-                (
-                    "point_cloud_frame",
-                    "point_cloud_color_source",
-                    "point_cloud_policy_id",
-                    "point_cloud_table_plane_abcd_json",
-                    "point_cloud_sampling",
-                    "point_cloud_transform",
-                    "processing_config_json",
-                )
-            )
         semantics = {}
         for key in semantic_keys:
             value = source.attrs[key]
             semantics[key] = value.item() if isinstance(value, np.generic) else value
+        dataset_keys = tuple(validation["keys"])
         return _Artifact(
             path=path,
             length=validation["frames"],
-            profile=profile,
             task_name=task_name,
             dt=float(source.attrs["dt"]),
-            dataset_shapes={key: source[key].shape[1:] for key in profile.dataset_keys},
-            dataset_dtypes={key: source[key].dtype for key in profile.dataset_keys},
+            dataset_shapes={key: source[key].shape[1:] for key in dataset_keys},
+            dataset_dtypes={key: source[key].dtype for key in dataset_keys},
             semantic_attrs=semantics,
         )
 
@@ -147,8 +135,6 @@ def _inspect_artifact(path: Path, config: PolicyZarrExportConfig) -> _Artifact:
 def _validate_uniform(artifacts: tuple[_Artifact, ...]) -> None:
     first = artifacts[0]
     for artifact in artifacts[1:]:
-        if artifact.profile != first.profile:
-            raise ValueError("processed HDF5 profiles are not uniform")
         if artifact.task_name != first.task_name:
             raise ValueError("one policy Zarr must contain one task_name")
         if not np.isclose(artifact.dt, first.dt, rtol=0.0, atol=1e-12):
@@ -207,7 +193,6 @@ def _export_plan_report(
     return {
         "input_root": str(Path(input_root).resolve()),
         "task_name": first.task_name,
-        "profile": first.profile.value,
         "dt": first.dt,
         "source_file_count": len(artifacts),
         "episode_count": len(artifacts),
@@ -290,10 +275,8 @@ def _validate_zarr(
         "schema_name": POLICY_ZARR_SCHEMA_NAME,
         "schema_version": POLICY_ZARR_SCHEMA_VERSION,
         "domain": "real",
-        "profile": first.profile.value,
         "task_name": first.task_name,
         "dt": first.dt,
-        "episode_start_policy": "full_history",
         **first.semantic_attrs,
     }
     if dict(root.attrs) != expected_attrs:
@@ -370,10 +353,8 @@ def export_processed_hdf5_to_zarr(
                 "schema_name": POLICY_ZARR_SCHEMA_NAME,
                 "schema_version": POLICY_ZARR_SCHEMA_VERSION,
                 "domain": "real",
-                "profile": first.profile.value,
                 "task_name": first.task_name,
                 "dt": first.dt,
-                "episode_start_policy": "full_history",
                 **first.semantic_attrs,
             }
         )
