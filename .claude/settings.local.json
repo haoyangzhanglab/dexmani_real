@@ -45,7 +45,6 @@
       "Bash(~/miniconda3/envs/real/bin/python *)",
       "Bash(pyflakes dexmani_real/teleop/core/pipeline.py dexmani_real/teleop/core/controller.py dexmani_real/robot/validate.py dexmani_real/robot/inner_loop.py)",
       "Bash(ruff check *)",
-      "Bash(grep -rn \"^\\\\s*pass\\\\s*$\" --include=\"*.py\" dexmani_real/)",
       "Bash(~/.pyenv/shims/python -c \"import py_compile; py_compile.compile\\('examples/keyboard_teleop_real.py', doraise=True\\); py_compile.compile\\('dexmani_real/robot/interface.py', doraise=True\\); print\\('OK'\\)\")",
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:docs.supportarticle.ufactory.cc)",
