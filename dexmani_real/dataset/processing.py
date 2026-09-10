@@ -18,6 +18,7 @@ from dexmani_real.dataset.contracts import (
     EpisodeAnnotation,
     EpisodeDecision,
     ProcessingConfig,
+    canonical_json,
     validate_processed_task_name,
 )
 from dexmani_real.dataset.pointcloud import (
@@ -29,18 +30,16 @@ from dexmani_real.ipc.schema import TACTILE_UNIT_CODE_XHAND_SDK_NATIVE
 from dexmani_real.dataset.processed import (
     _ACTION_EE_FRAME,
     _CONTACT_FORCE_SOURCE,
-    _CONTACT_FORCE_FRAME,
-    _CONTACT_FORCE_REPRESENTATION,
     _CONTACT_FORCE_SI_VERIFIED,
-    _CONTACT_FORCE_UNIT,
     _FINGERTIP_POINTS_FRAME,
     _FINGERTIP_POINTS_UNIT,
     _FRAME_CHUNKED_DATASETS,
+    _TACTILE_FORCE_SI_VERIFIED,
+    _TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED,
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
     _dataset_row_slices,
     _expected_specs,
-    _json,
     validate_processed_hdf5,
 )
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
@@ -54,6 +53,16 @@ from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.storage.reader import EpisodeReader, MergedH5File
 from dexmani_real.recording.storage.schema import EPISODE_SCHEMA_VERSION
 from dexmani_real.recording.storage.video import VideoDecoder
+from dexmani_real.robot.model import (
+    CONTACT_FORCE_REPRESENTATION,
+    HAND_FINGER_ORDER_ID,
+    TACTILE_FORCE_AXIS_LABELS,
+    TACTILE_FORCE_POINT_ORDER,
+    TACTILE_FORCE_REPRESENTATION,
+    TACTILE_FORCE_SENSOR_ORDER,
+    XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
+    XHAND_SENSOR_NATIVE_AXES_FRAME,
+)
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
@@ -138,6 +147,8 @@ def analyze_episode(
         "hand_tactile_force": ((5, 120, 3), np.float64),
         "tactile_calibrated": ((), np.bool_),
         "tactile_unit_code": ((), np.uint8),
+        "tactile_sum_fresh": ((), np.bool_),
+        "tactile_fresh": ((), np.bool_),
         "timestamp": ((), np.float64),
         "source_sample_index": ((), np.int64),
         "flag_frame_status": ((), np.uint8),
@@ -380,13 +391,32 @@ def _write_attrs(
             "fingertip_points_unit": _FINGERTIP_POINTS_UNIT,
             "fingertip_points_derivation": FINGERTIP_POINTS_DERIVATION,
             "fingertip_points_policy_id": FINGERTIP_POLICY_ID,
+            # Portable numeric FK inputs for the deployment geometry contract;
+            # the URDF path stays local and the policy id owns model identity.
+            "fingertip_config_json": canonical_json(
+                {
+                    "fingertip_link_names": list(config.fingertip_link_names),
+                    "handbase_position_eef_m": list(config.handbase_position_eef_m),
+                    "handbase_quat_eef_wxyz": list(config.handbase_quat_eef_wxyz),
+                }
+            ),
             "action_ee_frame": _ACTION_EE_FRAME,
             "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
             "contact_force_source": _CONTACT_FORCE_SOURCE,
-            "contact_force_representation": _CONTACT_FORCE_REPRESENTATION,
-            "contact_force_unit": _CONTACT_FORCE_UNIT,
+            "contact_force_representation": CONTACT_FORCE_REPRESENTATION,
+            "contact_force_unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
             "contact_force_si_verified": _CONTACT_FORCE_SI_VERIFIED,
-            "contact_force_frame": _CONTACT_FORCE_FRAME,
+            "contact_force_frame": XHAND_SENSOR_NATIVE_AXES_FRAME,
+            "tactile_force_representation": TACTILE_FORCE_REPRESENTATION,
+            "tactile_force_finger_order": HAND_FINGER_ORDER_ID,
+            "tactile_force_sensor_order": TACTILE_FORCE_SENSOR_ORDER,
+            "tactile_force_point_order": TACTILE_FORCE_POINT_ORDER,
+            "tactile_force_axis_labels": TACTILE_FORCE_AXIS_LABELS,
+            "tactile_force_unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
+            "tactile_force_si_verified": _TACTILE_FORCE_SI_VERIFIED,
+            "tactile_force_spatial_geometry_verified": (
+                _TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED
+            ),
             "rgb_transform": "native_color_resolution_no_resize",
             "depth_transform": "depth_to_color_aligned_native_resolution",
             "depth_unit": "sensor_unit",
@@ -417,7 +447,7 @@ def _write_attrs(
                 meta["camera_T_color_from_depth"], dtype=np.float64
             ),
             "point_cloud_frame": "xarm_base",
-            "processing_config_json": _json(
+            "processing_config_json": canonical_json(
                 {
                     "pointcloud": config.pointcloud.to_dict(),
                     "table_plane_abcd": (
@@ -432,7 +462,7 @@ def _write_attrs(
             ),
             "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
             "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
-            "point_cloud_table_plane_abcd_json": _json(
+            "point_cloud_table_plane_abcd_json": canonical_json(
                 None
                 if config.table_plane_abcd is None
                 else list(config.table_plane_abcd)
@@ -486,6 +516,23 @@ def _write_processed_episode(
         output["joint_state"][:] = joint_state
         output["action"][:] = np.concatenate((arm_action, hand_action), axis=1)
         output["action_ee"][:] = np.concatenate((arm_action_ee, hand_action), axis=1)
+        # Copied raw provenance telemetry: lets consumers distinguish stale,
+        # uncalibrated, and wrong/unknown-unit rows behind a validity mask
+        # without a reason framework.  Facts only; never an admission gate.
+        tactile_sum_fresh = np.asarray(
+            reader.h5f["tactile_sum_fresh"][:], dtype=bool
+        )
+        tactile_fresh = np.asarray(reader.h5f["tactile_fresh"][:], dtype=bool)
+        tactile_calibrated = np.asarray(
+            reader.h5f["tactile_calibrated"][:], dtype=bool
+        )
+        tactile_unit_code = np.asarray(
+            reader.h5f["tactile_unit_code"][:], dtype=np.uint8
+        )
+        output["contact_force_fresh"][:] = tactile_sum_fresh
+        output["tactile_force_fresh"][:] = tactile_fresh
+        output["tactile_calibrated"][:] = tactile_calibrated
+        output["tactile_unit_code"][:] = tactile_unit_code
         # Aggregate contact with an explicit per-row validity mask.
         hand_contact = np.asarray(reader.h5f["hand_contact"][:], dtype=np.float32)
         contact_finite = np.all(np.isfinite(hand_contact), axis=(1, 2))
@@ -497,8 +544,13 @@ def _write_processed_episode(
                 > 0
             )
         else:
-            # Legacy v26 kept aggregate contact with its hand row.
-            contact_valid = contact_finite
+            # Legacy v26 kept aggregate contact with its hand row and has no
+            # independent contact source; its tactile_sum_fresh is the frozen
+            # converter's conservative copy of the old collapsed freshness
+            # flag.  A finite payload alone never proves a valid measurement
+            # (v25 drivers could copy zero placeholders), so require the best
+            # available provenance; false negatives are acceptable here.
+            contact_valid = contact_finite & tactile_sum_fresh
         output["contact_force"][:] = hand_contact
         output["contact_force_valid"][:] = contact_valid
         # Dense tactile with an explicit per-row validity mask.
@@ -507,11 +559,8 @@ def _write_processed_episode(
         )
         tactile_valid = (
             np.all(np.isfinite(hand_tactile), axis=(1, 2, 3))
-            & np.asarray(reader.h5f["tactile_calibrated"][:], dtype=bool)
-            & (
-                np.asarray(reader.h5f["tactile_unit_code"][:], dtype=np.uint8)
-                == TACTILE_UNIT_CODE_XHAND_SDK_NATIVE
-            )
+            & tactile_calibrated
+            & (tactile_unit_code == TACTILE_UNIT_CODE_XHAND_SDK_NATIVE)
             & (
                 np.asarray(
                     reader.h5f["tactile_source_monotonic_ns"][:], dtype=np.uint64
@@ -519,6 +568,11 @@ def _write_processed_episode(
                 > 0
             )
         )
+        if reader.schema_version == 26:
+            # Legacy dense freshness is the only dense timing evidence the
+            # historical schema preserved; current raw keeps *_fresh as
+            # independent telemetry instead of a validity input.
+            tactile_valid = tactile_valid & tactile_fresh
         output["tactile_force"][:] = hand_tactile
         output["tactile_force_valid"][:] = tactile_valid
         hand_fk = HandKinematics(

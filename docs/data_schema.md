@@ -116,9 +116,11 @@ camera health/fresh/frame numbers 是事实 telemetry，不是 offline timing-qu
 v24-derived 数据必须先证明 lineage，再显式选择 scale，不能靠数值大小猜测。
 
 仅离线 processing 有一个窄的 normalized-v26 读取路径；其 aggregate 来源仍是原来的
-hand_source，同一 raw row 原样映射。当前 runtime reader、raw viewer 与 physical replay
-没有历史版本兼容路径。实际 pick_place_toy lineage、不可恢复的信息限制及验证结果见
-[incident evidence](invalid_frames_export_incident.md) 和
+hand_source，同一 raw row 原样映射。v26 的 validity 使用保守规则：contact 需要
+`tactile_sum_fresh`（转换器复制的旧 collapsed flag proxy），dense 额外需要
+`tactile_fresh`；见 §2 的 validity 语义分级。当前 runtime reader、raw viewer 与
+physical replay 没有历史版本兼容路径。实际 pick_place_toy lineage、不可恢复的信息
+限制及验证结果见 [incident evidence](invalid_frames_export_incident.md) 和
 [salvage manifest](../artifacts/pick_place_toy_salvage_manifest.json)。
 
 ## 2. Processed HDF5 v18
@@ -132,9 +134,13 @@ hand_source，同一 raw row 原样映射。当前 runtime reader、raw viewer �
 | action | (N,19) | float32 | action_arm_joint_sent + action_hand_joint |
 | action_ee | (N,21) | float32 | action_arm_ee + action_hand_joint |
 | contact_force | (N,5,3) | float32 | hand_contact |
-| contact_force_valid | (N,) | bool | 同行 aggregate 可用（finite ∧ source>0） |
+| contact_force_valid | (N,) | bool | 同行 aggregate 可用（finite ∧ source>0；v26 为 finite ∧ tactile_sum_fresh） |
+| contact_force_fresh | (N,) | bool | 同行 tactile_sum_fresh（aggregate 年龄 telemetry，v28 不参与 validity） |
 | tactile_force | (N,5,120,3) | float32 | hand_tactile_force |
-| tactile_force_valid | (N,) | bool | finite ∧ calibrated ∧ unit native ∧ source>0 |
+| tactile_force_valid | (N,) | bool | finite ∧ calibrated ∧ unit native ∧ source>0（v26 额外 ∧ tactile_fresh） |
+| tactile_force_fresh | (N,) | bool | 同行 tactile_fresh（dense 年龄 telemetry，v28 不参与 validity） |
+| tactile_calibrated | (N,) | bool | 同行 tactile_calibrated |
+| tactile_unit_code | (N,) | uint8 | 同行 tactile_unit_code |
 | fingertip_points | (N,5,3) | float32 | 本行 joint_state 经共享 arm+hand FK |
 | rgb | (N,H,W,3) | uint8 | 本行 native aligned color RGB，不 resize |
 | depth | (N,H,W) | uint16 | 本行 aligned depth，不 resize |
@@ -149,6 +155,15 @@ hand_source，同一 raw row 原样映射。当前 runtime reader、raw viewer �
 | camera_source_monotonic_ns | (N,) | uint64 | 相机帧来源 |
 
 无效 contact/dense 用 validity mask 表达（`*_valid=False` 时 payload 可为 NaN），不整条拒绝。
+`contact_force_fresh` / `tactile_force_fresh` / `tactile_calibrated` / `tactile_unit_code`
+是原样复制的 raw provenance telemetry：mask 为 False 后仍能区分 stale、uncalibrated、
+wrong/unknown unit 与 payload 缺失，不构成 quality framework，也不参与 episode 准入。
+Validity 语义分级：current v28 = 直接 producer evidence（独立 contact source、
+calibrated/native-unit dense）；legacy v26 = 保守 best-available proxy
+（`tactile_sum_fresh` 是冻结转换器从旧 collapsed flag 复制的代理，finite payload
+本身不证明有效测量——旧驱动可能复制零占位；允许 false negative，不允许把
+unknown/placeholder 宣称为 valid）。zero payload 不天然 invalid，mask 只来自
+provenance flags，不来自数值大小。
 processed 不保存 `eef_pose` 或 `/provenance`。FK implementation 保留，fingertip 复用每步
 Arm FK；`action_ee` 是无法从 IK 后 joint target 无损恢复的控制意图，必须保留。
 
@@ -167,10 +182,16 @@ Arm FK；`action_ee` 是无法从 IK 后 joint target 无损恢复的控制意�
 | contact_force_source | raw_hand_contact_control_step |
 | action_semantics | teleop_published_joint_target |
 
-另外保留 contact representation/unit/frame/SI-unverified、fingertip frame/unit/derivation/
-policy identity 与 action_ee frame/components。native RGB-D 保留 depth scale/invalid value、
-intrinsic/extrinsic semantics 和必要相机几何；点云保留 frame/color/sampling/transform/
-policy identity、shape、桌面平面，以及仅用于重现点云的 `processing_config_json`。
+另外保留 contact representation/unit/frame/SI-unverified、dense tactile
+representation/finger/sensor/point order/axis labels/unit/SI-unverified/spatial-geometry-
+unverified（词汇单一 owner 在 `robot/model.py`）、fingertip frame/unit/derivation/
+policy identity 与仅承载部署几何合同的 `fingertip_config_json`（fingertip_link_names +
+handbase position/quaternion 数值，不存 URDF 路径或文件 hash；FK implementation/model
+identity 由 `fingertip_points_policy_id` 承担），以及 action_ee frame/components。
+native RGB-D 保留 depth scale/invalid value、intrinsic/extrinsic semantics 和必要相机几何；
+点云保留 frame/color/sampling/transform/policy identity、shape、桌面平面，以及仅用于重现
+点云与部署 exact-compare 的 `processing_config_json`。这两个 canonical JSON attr 与
+deployment 期望值由同一 `dataset/contracts.py::canonical_json` 序列化，字节一致即合同成立。
 没有 row-decision JSON、quality summary、repair mask 或 source-segment attrs。
 
 processing 独占 whole-episode admission。必需 payload（joint/action/action_ee/fingertip/RGB-D）

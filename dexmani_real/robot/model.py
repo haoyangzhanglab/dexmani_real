@@ -38,6 +38,20 @@ if (
 TACTILE_POINTS_PER_FINGER = 120
 TACTILE_AXIS_COUNT = 3
 
+# XHand SDK force-representation vocabulary shared by recording, dataset
+# artifacts, and deployment semantics: contact_force is the aggregate calc_force
+# per finger; tactile_force is the dense raw_force payload.  Both stay in the
+# SDK-native numeric scale (SI Newton unverified) and per-finger sensor axes
+# (taxel spatial geometry unverified); validity comes from provenance flags,
+# never from payload magnitude.
+CONTACT_FORCE_REPRESENTATION = "xhand_sdk_calc_force_fx_fy_fz_bias_corrected"
+TACTILE_FORCE_REPRESENTATION = "xhand_sdk_raw_force_fx_fy_fz_bias_corrected"
+TACTILE_FORCE_SENSOR_ORDER = "xhand_sdk_sensor_data_order"
+TACTILE_FORCE_POINT_ORDER = "xhand_sdk_sensor_data_raw_force_order"
+TACTILE_FORCE_AXIS_LABELS = "fx_fy_fz"
+XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT = "xhand_sdk_native_unknown_si"
+XHAND_SENSOR_NATIVE_AXES_FRAME = "xhand_sensor_native_axes_per_finger"
+
 ARM_JOINT_SHAPE = (ARM_DOF,)
 HAND_JOINT_SHAPE = (HAND_DOF,)
 ARM_EE_SHAPE = (9,)

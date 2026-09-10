@@ -19,6 +19,7 @@ from dexmani_real.config.pointcloud import (
 )
 from dexmani_real.dataset.contracts import (
     ProcessingConfig,
+    canonical_json,
     validate_processed_task_name,
 )
 from dexmani_real.dataset.pointcloud import validate_rigid_transform
@@ -27,21 +28,36 @@ from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POLICY_ID,
 )
 from dexmani_real.planning.kinematics.pose import validate_canonical_rot6d
+from dexmani_real.robot.model import (
+    CONTACT_FORCE_REPRESENTATION,
+    HAND_FINGER_ORDER_ID,
+    TACTILE_FORCE_AXIS_LABELS,
+    TACTILE_FORCE_POINT_ORDER,
+    TACTILE_FORCE_REPRESENTATION,
+    TACTILE_FORCE_SENSOR_ORDER,
+    XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
+    XHAND_SENSOR_NATIVE_AXES_FRAME,
+)
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
 PROCESSED_SCHEMA_VERSION = 18
 _CONTACT_FORCE_SOURCE = "raw_hand_contact_control_step"
 _VALIDATION_CHUNK_BYTES = 64 * 1024 * 1024
 # Fixed-tail multimodal datasets; rgb/depth/point_cloud have variable tails and
-# are appended by _expected_specs.  Dense/aggregate validity masks are bool rows.
+# are appended by _expected_specs.  Dense/aggregate validity masks and copied
+# raw provenance telemetry are bool/uint8 rows.
 _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "joint_state": ((19,), np.dtype(np.float32)),
     "action": ((19,), np.dtype(np.float32)),
     "action_ee": ((21,), np.dtype(np.float32)),
     "contact_force": ((5, 3), np.dtype(np.float32)),
     "contact_force_valid": ((), np.dtype(np.bool_)),
+    "contact_force_fresh": ((), np.dtype(np.bool_)),
     "tactile_force": ((5, 120, 3), np.dtype(np.float32)),
     "tactile_force_valid": ((), np.dtype(np.bool_)),
+    "tactile_force_fresh": ((), np.dtype(np.bool_)),
+    "tactile_calibrated": ((), np.dtype(np.bool_)),
+    "tactile_unit_code": ((), np.dtype(np.uint8)),
     "fingertip_points": ((5, 3), np.dtype(np.float32)),
     "camera_intrinsic": ((9,), np.dtype(np.float32)),
     "camera_extrinsic": ((4, 4), np.dtype(np.float32)),
@@ -62,8 +78,12 @@ MULTIMODAL_DATASET_KEYS = (
     "action_ee",
     "contact_force",
     "contact_force_valid",
+    "contact_force_fresh",
     "tactile_force",
     "tactile_force_valid",
+    "tactile_force_fresh",
+    "tactile_calibrated",
+    "tactile_unit_code",
     "fingertip_points",
     "rgb",
     "depth",
@@ -78,11 +98,11 @@ MULTIMODAL_DATASET_KEYS = (
     "camera_source_monotonic_ns",
 )
 # contact_force is the aggregate XHand SDK calc_force per finger, software-bias
-# corrected, in the SDK-native numeric scale (SI conversion unverified).
-_CONTACT_FORCE_REPRESENTATION = "xhand_sdk_calc_force_fx_fy_fz_bias_corrected"
-_CONTACT_FORCE_UNIT = "xhand_sdk_native_unknown_si"
+# corrected; its representation/unit/frame vocabulary is owned by robot.model.
 _CONTACT_FORCE_SI_VERIFIED = False
-_CONTACT_FORCE_FRAME = "xhand_sensor_native_axes_per_finger"
+# Dense tactile SI Newton conversion and taxel spatial geometry are unverified.
+_TACTILE_FORCE_SI_VERIFIED = False
+_TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED = False
 _FINGERTIP_POINTS_FRAME = "xarm_base"
 _FINGERTIP_POINTS_UNIT = "m"
 _ACTION_EE_FRAME = "xarm_base"
@@ -136,10 +156,6 @@ def _strict_integer_attr(attrs: Any, name: str) -> int:
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
         raise ValueError(f"{name} must be an integer HDF5 attribute")
     return int(value)
-
-
-def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _json_object_attr(
@@ -379,9 +395,15 @@ def validate_processed_hdf5(
             "state_alignment": "control_step",
             "action_semantics": "teleop_published_joint_target",
             "contact_force_source": _CONTACT_FORCE_SOURCE,
-            "contact_force_representation": _CONTACT_FORCE_REPRESENTATION,
-            "contact_force_unit": _CONTACT_FORCE_UNIT,
-            "contact_force_frame": _CONTACT_FORCE_FRAME,
+            "contact_force_representation": CONTACT_FORCE_REPRESENTATION,
+            "contact_force_unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
+            "contact_force_frame": XHAND_SENSOR_NATIVE_AXES_FRAME,
+            "tactile_force_representation": TACTILE_FORCE_REPRESENTATION,
+            "tactile_force_finger_order": HAND_FINGER_ORDER_ID,
+            "tactile_force_sensor_order": TACTILE_FORCE_SENSOR_ORDER,
+            "tactile_force_point_order": TACTILE_FORCE_POINT_ORDER,
+            "tactile_force_axis_labels": TACTILE_FORCE_AXIS_LABELS,
+            "tactile_force_unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
             "fingertip_points_frame": _FINGERTIP_POINTS_FRAME,
             "fingertip_points_unit": _FINGERTIP_POINTS_UNIT,
             "action_ee_frame": _ACTION_EE_FRAME,
@@ -393,6 +415,18 @@ def validate_processed_hdf5(
             is not _CONTACT_FORCE_SI_VERIFIED
         ):
             raise ValueError(f"{artifact.name}: invalid contact_force_si_verified")
+        if (
+            _strict_bool_attr(attrs, "tactile_force_si_verified")
+            is not _TACTILE_FORCE_SI_VERIFIED
+        ):
+            raise ValueError(f"{artifact.name}: invalid tactile_force_si_verified")
+        if (
+            _strict_bool_attr(attrs, "tactile_force_spatial_geometry_verified")
+            is not _TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED
+        ):
+            raise ValueError(
+                f"{artifact.name}: invalid tactile_force_spatial_geometry_verified"
+            )
         # RGB-D and point cloud are always present in the multimodal superset.
         rgb, depth = source.get("rgb"), source.get("depth")
         if (
@@ -443,6 +477,40 @@ def validate_processed_hdf5(
                 or plane[2] <= 0
             ):
                 raise ValueError(f"{artifact.name}: invalid table plane")
+        # Fingertip FK inputs are portable numeric/semantic values only; the
+        # policy id keeps FK implementation and canonical hand-model identity.
+        fingertip = _json_object_attr(
+            source, "fingertip_config_json", label=artifact.name
+        )
+        if set(fingertip) != {
+            "fingertip_link_names",
+            "handbase_position_eef_m",
+            "handbase_quat_eef_wxyz",
+        }:
+            raise ValueError(f"{artifact.name}: invalid fingertip geometry config")
+        link_names = fingertip["fingertip_link_names"]
+        if (
+            not isinstance(link_names, list)
+            or len(link_names) != 5
+            or not all(isinstance(name, str) and name for name in link_names)
+        ):
+            raise ValueError(f"{artifact.name}: invalid fingertip_link_names")
+        handbase_position = np.asarray(
+            fingertip["handbase_position_eef_m"], dtype=np.float64
+        )
+        handbase_quaternion = np.asarray(
+            fingertip["handbase_quat_eef_wxyz"], dtype=np.float64
+        )
+        if (
+            handbase_position.shape != (3,)
+            or not np.all(np.isfinite(handbase_position))
+            or handbase_quaternion.shape != (4,)
+            or not np.all(np.isfinite(handbase_quaternion))
+            or np.linalg.norm(handbase_quaternion) <= 0
+        ):
+            raise ValueError(
+                f"{artifact.name}: invalid fingertip hand-mount transform"
+            )
         workspace = pointcloud.workspace
         expected_attrs.update(
             {
@@ -451,7 +519,7 @@ def validate_processed_hdf5(
                 "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
                 "point_cloud_sampling": POINT_CLOUD_SAMPLING,
                 "point_cloud_transform": POINT_CLOUD_TRANSFORM,
-                "point_cloud_table_plane_abcd_json": _json(table_plane),
+                "point_cloud_table_plane_abcd_json": canonical_json(table_plane),
             }
         )
         if not np.array_equal(
@@ -468,6 +536,14 @@ def validate_processed_hdf5(
         }:
             raise ValueError(
                 f"{artifact.name}: point-cloud processing config mismatch"
+            )
+        if config is not None and fingertip != {
+            "fingertip_link_names": list(config.fingertip_link_names),
+            "handbase_position_eef_m": list(config.handbase_position_eef_m),
+            "handbase_quat_eef_wxyz": list(config.handbase_quat_eef_wxyz),
+        }:
+            raise ValueError(
+                f"{artifact.name}: fingertip geometry config mismatch"
             )
         specs = _expected_specs(length, pointcloud.num_points, rgb_height, rgb_width)
         for name, expected in expected_attrs.items():

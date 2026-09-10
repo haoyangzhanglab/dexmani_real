@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,22 @@ import numpy as np
 from dexmani_real.config.defaults import environment, hand
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
+
+
+def canonical_json(value: Any) -> str:
+    """Serialize one persisted-contract value for byte-exact comparisons.
+
+    Producers (processing attrs) and consumers (deployment expected semantics)
+    must use this one serializer so an exact string compare proves numeric
+    config identity; NaN/Infinity are contract violations, never serialized.
+    """
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def validate_processed_task_name(value: str) -> str:

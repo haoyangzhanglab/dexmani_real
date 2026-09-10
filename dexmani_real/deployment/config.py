@@ -8,7 +8,6 @@ identity into the spawned worker; it never imports Policy or Torch.
 
 from __future__ import annotations
 
-import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -20,6 +19,7 @@ from dexmani_real.config.pointcloud import (
     POINT_CLOUD_SAMPLING,
     POINT_CLOUD_TRANSFORM,
 )
+from dexmani_real.dataset.contracts import canonical_json
 from dexmani_real.ipc.schema import (
     MAX_PREDICTION_STEPS,
     POINT_CLOUD_FEATURE_DIM,
@@ -33,7 +33,16 @@ from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
 )
-from dexmani_real.robot.model import HAND_FINGER_ORDER_ID, XHAND_RIGHT_URDF_PATH
+from dexmani_real.robot.model import (
+    HAND_FINGER_ORDER_ID,
+    TACTILE_FORCE_AXIS_LABELS,
+    TACTILE_FORCE_POINT_ORDER,
+    TACTILE_FORCE_REPRESENTATION,
+    TACTILE_FORCE_SENSOR_ORDER,
+    XHAND_RIGHT_URDF_PATH,
+    XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
+    XHAND_SENSOR_NATIVE_AXES_FRAME,
+)
 
 FIXED_POLICY_RUNTIME_TARGET = (
     "dexmani_real.deployment.inference.dexmani_policy:DexManiPolicyAdapter"
@@ -135,10 +144,17 @@ def _expected_pointcloud_semantics(runtime: Any) -> dict[str, str]:
         "color_order": "rgb",
         "color_source": POINT_CLOUD_COLOR_SOURCE,
         "policy_id": POINT_CLOUD_POLICY_ID,
-        "table_plane_abcd_json": json.dumps(
-            table_plane,
-            separators=(",", ":"),
-            allow_nan=False,
+        "table_plane_abcd_json": canonical_json(table_plane),
+        # Full numeric derivation config, byte-identical to the persisted
+        # processing_config_json attr (same structure, same canonical_json), so
+        # any physics-changing point-cloud drift fails the exact compare.
+        "processing_config_json": canonical_json(
+            {
+                "pointcloud": runtime.pointcloud.to_dict(),
+                "table_plane_abcd": (
+                    None if table_plane is None else list(table_plane)
+                ),
+            }
         ),
         "sampling": POINT_CLOUD_SAMPLING,
         "transform": POINT_CLOUD_TRANSFORM,
@@ -146,6 +162,7 @@ def _expected_pointcloud_semantics(runtime: Any) -> dict[str, str]:
 
 
 def _expected_fingertip_semantics(runtime: Any) -> dict[str, str]:
+    hand = runtime.hand
     return {
         "representation": "point_xyz",
         "frame": "xarm_base",
@@ -153,17 +170,26 @@ def _expected_fingertip_semantics(runtime: Any) -> dict[str, str]:
         "finger_order": HAND_FINGER_ORDER_ID,
         "derivation": FINGERTIP_POINTS_DERIVATION,
         "policy_id": FINGERTIP_POLICY_ID,
+        # Numeric FK inputs behind the deployed fingertip observation; same
+        # HandParams source and canonical_json as the persisted attr.
+        "fingertip_config_json": canonical_json(
+            {
+                "fingertip_link_names": list(hand.fingertip_link_names),
+                "handbase_position_eef_m": list(hand.T_eef_handbase_pos_xyz),
+                "handbase_quat_eef_wxyz": list(hand.T_eef_handbase_quat_wxyz),
+            }
+        ),
     }
 
 
 def _expected_tactile_force_semantics() -> dict[str, object]:
     return {
-        "representation": "xhand_sdk_raw_force_fx_fy_fz_bias_corrected",
+        "representation": TACTILE_FORCE_REPRESENTATION,
         "finger_order": HAND_FINGER_ORDER_ID,
-        "sensor_order": "xhand_sdk_sensor_data_order",
-        "point_order": "xhand_sdk_sensor_data_raw_force_order",
-        "axis_labels": "fx_fy_fz",
-        "unit": "xhand_sdk_native_unknown_si",
+        "sensor_order": TACTILE_FORCE_SENSOR_ORDER,
+        "point_order": TACTILE_FORCE_POINT_ORDER,
+        "axis_labels": TACTILE_FORCE_AXIS_LABELS,
+        "unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
         "si_verified": False,
         "spatial_geometry_verified": False,
     }
@@ -171,9 +197,11 @@ def _expected_tactile_force_semantics() -> dict[str, object]:
 
 def _expected_contact_force_semantics() -> dict[str, object]:
     return {
+        # Policy-contract vocabulary for the requested contact field; the
+        # dataset attr keeps the SDK calc_force representation string.
         "representation": "per_finger_sensor_axes",
-        "frame": "xhand_sensor_native_axes_per_finger",
-        "units": "xhand_sdk_native_unknown_si",
+        "frame": XHAND_SENSOR_NATIVE_AXES_FRAME,
+        "units": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
         "si_verified": False,
         "finger_order": HAND_FINGER_ORDER_ID,
     }
