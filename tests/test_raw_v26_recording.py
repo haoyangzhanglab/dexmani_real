@@ -253,7 +253,7 @@ def test_camera_calibration_survives_minimal_shared_metadata(tmp_path):
         operator="offline",
         episode_name=None,
         calibration=calibration,
-        provenance={"eval_seed": "1"},
+        provenance={"seed": "1"},
     )
     assert metadata["episode_name"] is None
     recorder = _recorder(tmp_path)
@@ -263,7 +263,7 @@ def test_camera_calibration_survives_minimal_shared_metadata(tmp_path):
         attrs = raw["meta"].attrs
         assert attrs["camera_serial"] == "offline-serial"
         assert attrs["depth_scale"] == 0.001
-        assert attrs["provenance_eval_seed"] == "1"
+        assert attrs["provenance_seed"] == "1"
         np.testing.assert_array_equal(
             attrs["camera_depth_intrinsics"], intrinsics.matrix().ravel()
         )

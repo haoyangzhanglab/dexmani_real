@@ -397,41 +397,63 @@ class TestEvalSeed(unittest.TestCase):
             with self.assertRaises(ValueError):
                 InferenceWorkerConfig(*base, "ckpt.pt", steps)
 
-    def test_cli_seed(self):
+    def test_cli_defaults(self):
+        from examples.run_policy import _parser
+
+        args = _parser().parse_args(["dp/task/exp"])
+        self.assertEqual(args.seed, 0)
+        self.assertEqual(args.num_episodes, 1)
+        self.assertEqual(args.max_running_s, 60.0)
+        self.assertEqual(args.device, "cuda:0")
+        self.assertIsNone(args.artifact)
+        self.assertIsNone(args.inference_steps)
+
+    def test_cli_overrides(self):
+        from examples.run_policy import _parser
+
+        args = _parser().parse_args(
+            [
+                "dp/task/exp",
+                "--artifact",
+                "epoch_500-deployment.pt",
+                "--inference-steps",
+                "2",
+                "--seed",
+                "1",
+                "--num-episodes",
+                "10",
+                "--max-duration",
+                "30",
+                "--device",
+                "cpu",
+            ]
+        )
+        self.assertEqual(args.artifact, "epoch_500-deployment.pt")
+        self.assertEqual(args.inference_steps, 2)
+        self.assertEqual(args.seed, 1)
+        self.assertEqual(args.num_episodes, 10)
+        self.assertEqual(args.max_running_s, 30.0)
+        self.assertEqual(args.device, "cpu")
+
+    def test_cli_rejects_subcommands_removed_options_and_bad_values(self):
         from examples.run_policy import _parser
 
         parser = _parser()
-        for command in ("run", "shadow"):
-            self.assertEqual(parser.parse_args([command, "dp/task/exp"]).eval_seed, 0)
-        required = [
-            "eval",
-            "dp/task/exp",
-            "--max-duration",
-            "60",
-            "--task-label",
-            "task",
-            "--operator",
-            "me",
-        ]
-        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
-            parser.parse_args(required)
-        self.assertEqual(
-            parser.parse_args(required + ["--eval-seed", "1"]).eval_seed, 1
-        )
-
-    def test_removed_cli_options_are_rejected(self):
-        from examples.run_policy import _parser
-
-        for option in (
-            "--inference-mode",
-            "--runtime-config",
-            "--max-action-steps",
-            "--output-dir",
+        for argv in (
+            ["dp/task/exp", "--seed", "-1"],
+            ["dp/task/exp", "--inference-steps", "0"],
+            ["dp/task/exp", "--num-episodes", "0"],
+            ["dp/task/exp", "--max-duration", "0"],
+            ["run", "dp/task/exp"],
+            ["eval", "dp/task/exp"],
+            ["dp/task/exp", "--eval-seed", "0"],
+            ["dp/task/exp", "--task-label", "x"],
+            ["dp/task/exp", "--output-dir", "x"],
+            ["dp/task/exp", "--inference-mode", "1"],
         ):
-            with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
-                _parser().parse_args(["run", "dp/task/exp", option, "1"])
-        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
-            _parser().parse_args(["shadow", "dp/task/exp", "--max-duration", "60"])
+            with self.subTest(argv=argv):
+                with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                    parser.parse_args(argv)
 
     def test_loader_passes_seed_and_reset(self):
         from dexmani_real.deployment.config import InferenceWorkerConfig
@@ -458,27 +480,58 @@ class TestEvalSeed(unittest.TestCase):
         loaded.reset_episode.assert_called_once_with()
 
 
+class TestSessionDirectory(unittest.TestCase):
+    def test_run_config_records_resolved_conditions(self):
+        import tempfile
+        from pathlib import Path
+
+        import yaml
+
+        from examples.run_policy import _write_run_config
+
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory)
+            _write_run_config(
+                session,
+                experiment="p/t/e",
+                artifact="epoch_500-deployment.pt",
+                inference_steps=2,
+                seed=0,
+                num_episodes=10,
+                max_duration_s=60.0,
+            )
+            payload = yaml.safe_load((session / "run_config.yaml").read_text())
+            self.assertEqual(
+                payload,
+                {
+                    "experiment": "p/t/e",
+                    "artifact": "epoch_500-deployment.pt",
+                    "inference_steps": 2,
+                    "seed": 0,
+                    "num_episodes": 10,
+                    "max_duration_s": 60.0,
+                },
+            )
+
+    def test_session_directory_collision_gets_suffix(self):
+        import tempfile
+        from pathlib import Path
+
+        import examples.run_policy as run_policy
+        from examples.run_policy import _session_directory
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(
+                run_policy.time, "strftime", return_value="20260101_000000"
+            ):
+                first = _session_directory(root, "p/t/e")
+                second = _session_directory(root, "p/t/e")
+            self.assertEqual(first.name, "session_20260101_000000")
+            self.assertEqual(second.name, "session_20260101_000000_01")
+
+
 class TestFutureChunkBoundary(unittest.TestCase):
-    def test_check_smokes_production_api_and_rejects_bad_chunks(self):
-        from examples.run_policy import _check_action_chunk
-
-        spec = _fake_policy_spec()
-        policy = mock.Mock()
-        policy.predict_action_chunk.return_value = np.zeros((15, 19), np.float64)
-        _check_action_chunk(policy, spec)
-        policy.predict.assert_not_called()
-        policy.reset_episode.assert_called_once_with()
-        observation = policy.predict_action_chunk.call_args.args[0]
-        self.assertEqual(observation["joint_state"].shape, (2, 19))
-        for actions in (
-            np.zeros((8, 19)),
-            np.zeros((15, 19), np.float32),
-            np.full((15, 19), np.nan),
-        ):
-            policy.predict_action_chunk.return_value = actions
-            with self.assertRaises(RuntimeError):
-                _check_action_chunk(policy, spec)
-
     def test_adapter_and_prediction_transport_keep_full_chunk(self):
         from dexmani_real.deployment.inference.dexmani_policy import (
             DexManiPolicyAdapter,
