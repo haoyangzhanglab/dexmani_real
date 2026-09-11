@@ -272,10 +272,10 @@ class TestBuildObservation(unittest.TestCase):
 
     def test_force_window_respects_causal_cut(self) -> None:
         shared = _fake_shared()
-        shared.hand_state_ring._records = [
-            (data, _ANCHOR_NS + 1, sequence)
-            for data, _ring_publish_ns, sequence in shared.hand_state_ring._records
-        ]
+        # The hand record carries an in-array publish timestamp; a publish after
+        # the anchor must fail the causal cut regardless of the ring slot time.
+        for data, _ring_publish_ns, _sequence in shared.hand_state_ring._records:
+            data["publish_monotonic_ns"][0] = _ANCHOR_NS + 1
         spec = _fake_policy_spec(_Field("tactile_force", (5, 120, 3), "float32"))
         self.assertIsNone(_build(shared, spec))
 

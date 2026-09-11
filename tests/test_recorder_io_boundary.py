@@ -3,7 +3,7 @@
 No hardware, no trained checkpoint.  These tests pin the owner-boundary contract:
 RecorderIO announces capacity and its configured max_frames stop reason, the
 rollout recording config threads capacity through it, and a real
-EpisodeRecorder transaction publishes a structurally valid raw-v28 episode.
+EpisodeRecorder transaction publishes a structurally valid raw-v29 episode.
 """
 
 from __future__ import annotations
@@ -118,7 +118,7 @@ class TestSaveOutcome(unittest.TestCase):
                 self.assertTrue((episode_path / "rgb.mp4").is_file())
                 self.assertTrue((episode_path / "depth.h5").is_file())
                 with h5py.File(episode_path / "data.h5", "r") as raw:
-                    self.assertEqual(raw["meta"].attrs["schema_version"], 28)
+                    self.assertEqual(raw["meta"].attrs["schema_version"], 29)
                     self.assertEqual(raw["meta"].attrs["num_frames"], 1)
                     self.assertTrue(raw["meta"].attrs["success"])
                     self.assertEqual(raw["meta"].attrs["stop_reason"], "operator")
@@ -251,7 +251,7 @@ class TestExplicitEpisodeName(unittest.TestCase):
                 published = Path(recorder.finish_episode(save=True, reason="operator"))
                 self.assertEqual(published.name, name)
                 with EpisodeReader(published) as reader:
-                    self.assertEqual(reader.schema_version, 28)
+                    self.assertEqual(reader.schema_version, 29)
                     self.assertEqual(reader.h5f["meta"].attrs["stop_reason"], "operator")
 
 
