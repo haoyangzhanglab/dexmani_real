@@ -356,7 +356,7 @@ def run_policy_deployment(
     max_running_s: float | None = None,
     recording_config: RolloutRecordingConfig | None = None,
 ) -> int:
-    """Run a single-rollout policy deployment lifecycle and return its exit code.
+    """Run a persistent multi-episode policy deployment lifecycle and return its exit code.
 
     ``execute=False`` validates candidates without publication;
     ``execute=True`` enables coupled arm/hand publication. The inference worker

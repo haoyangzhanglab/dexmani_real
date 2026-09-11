@@ -1,5 +1,8 @@
 # DexMani 多模态数据集最后收尾修复方案（Fact-Checked）
 
+> STATUS: SUPERSEDED
+> Current implementation: raw v28 → processed v19 → Policy Zarr v12
+
 > 状态：**implementation plan / last-mile only**  
 > 主工作仓库：`dexmani_real`  
 > 邻接 consumer：`../dexmani_policy`  

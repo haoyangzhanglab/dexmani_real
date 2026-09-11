@@ -124,8 +124,8 @@ unit native）是 **unit-agnostic** 的——它 gate 的是"单位身份与声�
 4. **证据**：实验记录写入 artifacts/ 并被本文与指南引用
 
 实验通过后才具备执行迁移的资格（每一步都有证据背书）：flip processed.py 的
-`*_SI_VERIFIED` 常量 → 更新单位字符串（robot/model.py 词汇表）→ processed v19 +
-Zarr v12 bump → 60 episode 离线重建 + 重导出 → policy 门禁与测试协同更新 →
+`*_SI_VERIFIED` 常量 → 更新单位字符串（robot/model.py 词汇表）→ next processed /
+Policy-Zarr schema version bump → 60 episode 离线重建 + 重导出 → policy 门禁与测试协同更新 →
 deployment/config.py semantics → data_schema.md / 指南 / manifest 同步。
 
 若提案人持有**厂商文档**（写明 `calc_force` 单位为 N）：指南要求的是"对这套安装"的
