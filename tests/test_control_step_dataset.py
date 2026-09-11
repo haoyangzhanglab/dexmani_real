@@ -211,19 +211,53 @@ def test_zero_contact_is_not_intrinsically_invalid(tmp_path):
         assert np.all(data["contact_force"][:] == 0.0)
 
 
-def test_invalid_contact_is_copied_false_and_payload_preserved(tmp_path):
-    """An invalid aggregate row copies its validity bit verbatim; the archived
-    payload is preserved unchanged (processing does not rewrite it)."""
+@pytest.mark.parametrize("kind", ["contact", "dense"])
+@pytest.mark.parametrize(
+    "valid, payload_nan, should_pass",
+    [
+        (True, False, True),  # valid + finite
+        (True, True, False),  # valid + NaN
+        (False, True, True),  # invalid + all-NaN
+        (False, False, False),  # invalid + finite
+    ],
+)
+def test_raw_tactile_mask_payload_invariant(
+    tmp_path, kind, valid, payload_nan, should_pass
+):
     episode = write_control_episode(tmp_path / "raw")
+    valid_field = (
+        "hand_contact_valid" if kind == "contact" else "hand_tactile_force_valid"
+    )
+    payload_field = "hand_contact" if kind == "contact" else "hand_tactile_force"
     with h5py.File(episode / "data.h5", "r+") as raw:
-        raw["hand_contact_valid"][11] = False
-        expected_contact = raw["hand_contact"][11].astype(np.float32)
+        raw[valid_field][11] = valid
+        if payload_nan:
+            raw[payload_field][11] = np.nan
+    output = tmp_path / "processed"
+    if should_pass:
+        process_episode_root(episode, output, permissive_test_config())
+    else:
+        with pytest.raises(
+            ValueError, match="raw hand_contact|raw hand_tactile_force"
+        ):
+            process_episode_root(episode, output, permissive_test_config())
+        assert not output.exists()
+
+
+@pytest.mark.parametrize("kind", ["contact", "dense"])
+def test_processed_validator_rejects_mask_payload_contradiction(tmp_path, kind):
+    episode = write_control_episode(tmp_path / "raw")
     output = tmp_path / "processed"
     process_episode_root(episode, output, permissive_test_config())
-    with h5py.File(output / f"{episode.name}.h5", "r") as data:
-        assert bool(data["contact_force_valid"][11]) is False
-        assert bool(data["contact_force_valid"][10]) is True
-        np.testing.assert_array_equal(data["contact_force"][11], expected_contact)
+    artifact = output / f"{episode.name}.h5"
+    valid_field = (
+        "contact_force_valid" if kind == "contact" else "tactile_force_valid"
+    )
+    with h5py.File(artifact, "r+") as processed:
+        # Tamper one row to valid=False while leaving the payload finite.
+        processed[valid_field][11] = False
+    with pytest.raises(ValueError, match="finite payload on an invalid row"):
+        validate_processed_hdf5(artifact)
 
 
 def test_d6_persistent_ik_rejects_whole_episode(tmp_path):

@@ -5,7 +5,12 @@
 > Reviewed GitHub baseline: `main` at `832c2ffff5b4774177ea45cbaa257c947c75bc86` on 2026-09-11.
 > Source code is authoritative if `main` advances before implementation.
 >
-> **Status: PROPOSED — NOT IMPLEMENTED.**
+> **Status: IMPLEMENTED.**
+>
+> Implementation matches this plan's semantic targets: deployment reads one
+> `HandFrameWindow` and aligns it once (`observation.py`), and raw/processed
+> validation enforces the bidirectional mask/payload invariant
+> (`dataset/processing.py`, `dataset/processed.py`). No schema version bump.
 >
 > This is a narrow follow-up to the completed raw-v29 / processed-v20 / Zarr-v13 tactile simplification. It does **not** reopen the acquisition architecture. The current driver, one-hand-ring IPC, recording schema, direct raw validity masks, and software-bias ownership are retained.
 

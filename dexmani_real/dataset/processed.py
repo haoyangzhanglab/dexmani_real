@@ -186,6 +186,27 @@ def _validate_pointcloud_workspace(
         raise ValueError(f"{label}: point-cloud XYZ leaves persisted workspace")
 
 
+def _validate_masked_tactile_rows(
+    payload: np.ndarray,
+    valid: np.ndarray,
+    *,
+    label: str,
+) -> None:
+    """Enforce the mask/payload invariant for tactile rows; never repair it.
+
+    ``valid`` rows must be fully finite (a real zero/no-contact reading is finite
+    zero + valid); ``invalid`` rows must be all-NaN. Any contradiction is a
+    technical contract error and raises.
+    """
+    axes = tuple(range(1, payload.ndim))
+    rows_finite = np.all(np.isfinite(payload), axis=axes)
+    rows_all_nan = np.all(np.isnan(payload), axis=axes)
+    if np.any(valid & ~rows_finite):
+        raise ValueError(f"{label}: non-finite payload on a valid row")
+    if np.any(~valid & ~rows_all_nan):
+        raise ValueError(f"{label}: finite payload on an invalid row")
+
+
 def validate_processed_payload(
     source: h5py.File | h5py.Group,
     *,
@@ -248,14 +269,11 @@ def validate_processed_payload(
         payload = source[key]
         mask = np.asarray(source[f"{key}_valid"][:], dtype=bool)
         for row_slice in _dataset_row_slices(payload):
-            block = np.asarray(payload[row_slice])
-            rows_finite = np.all(
-                np.isfinite(block), axis=tuple(range(1, block.ndim))
+            _validate_masked_tactile_rows(
+                np.asarray(payload[row_slice]),
+                mask[row_slice],
+                label=f"{label}: {key}",
             )
-            if np.any(mask[row_slice] & ~rows_finite):
-                raise ValueError(
-                    f"{label}: {key} has non-finite payload on a valid row"
-                )
 
     if validate_rgbd:
         rgb = source.get("rgb")

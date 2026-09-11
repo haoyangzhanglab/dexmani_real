@@ -47,12 +47,10 @@ def test_nonfinite_tactile_payload_is_rejected_at_read():
     record["tactile_dense"][0, 0, 0] = np.inf
     ring = SimpleNamespace(maxlen=4, get_last_k=lambda k: [(record, 95, 1)])
     assert (
-        obs._read_state_history(
+        obs._read_hand_history(
             ring,
             history_len=4,
             anchor_ns=100,
-            values_field="tactile_dense",
-            required_true_fields=("state_valid", "tactile_dense_valid"),
             max_age_ns=20,
             not_before_ns=1,
         )
@@ -149,7 +147,7 @@ def test_alignment_rejects_future_and_excessive_skew():
 
 
 def test_float32_overflow_cannot_reach_model():
-    def window(width, value):
+    def arm_window(width, value):
         return obs.FrameWindow(
             np.full((1, width), value),
             np.array([1]),
@@ -158,8 +156,28 @@ def test_float32_overflow_cannot_reach_model():
             np.ones(1),
         )
 
+    def hand_window():
+        return obs.HandFrameWindow(
+            qpos=np.zeros((1, 12)),
+            tactile_aggregate=np.zeros((1, 5, 3), dtype=np.float32),
+            tactile_dense=np.zeros((1, 5, 120, 3), dtype=np.float32),
+            tactile_aggregate_valid=np.ones(1, dtype=np.uint8),
+            tactile_dense_valid=np.ones(1, dtype=np.uint8),
+            source_sequence=np.array([1], dtype=np.uint64),
+            source_monotonic_ns=np.array([90], dtype=np.uint64),
+            publish_monotonic_ns=np.array([95], dtype=np.uint64),
+            valid_mask=np.ones(1, dtype=np.uint8),
+        )
+
     batch = obs.ObservationBatch(
-        1, 1, 1, 100, 90, 100, arm_history=window(7, 1e100), hand_history=window(12, 0)
+        1,
+        1,
+        1,
+        100,
+        90,
+        100,
+        arm_history=arm_window(7, 1e100),
+        hand_history=hand_window(),
     )
     spec = SimpleNamespace(observation_fields=(SimpleNamespace(name="joint_state"),))
     with np.errstate(over="ignore"), pytest.raises(ValueError, match="NaN/Inf"):

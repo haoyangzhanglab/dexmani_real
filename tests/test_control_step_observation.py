@@ -78,16 +78,14 @@ def test_d9_visual_state_contact_and_dense_use_logical_grid(visual, dense):
     assert batch is not None
     refs = np.asarray([_ref_ns(tick) for tick in _REF_TICKS])
     expected_source = refs - 9_000_000
-    windows = [batch.arm_history, batch.hand_history, batch.hand_contact_history]
-    if dense:
-        windows.append(batch.hand_tactile_force_history)
+    windows = [batch.arm_history, batch.hand_history]
     for window in windows:
         np.testing.assert_array_equal(window.source_monotonic_ns, expected_source)
         assert np.all(window.source_monotonic_ns > refs - 25_000_000)
         assert np.all(window.source_monotonic_ns <= refs)
     assert batch.logical_step_monotonic_ns == refs[-1]
     np.testing.assert_array_equal(
-        batch.hand_contact_history.values[:, 0, 0], _REF_TICKS
+        batch.hand_history.tactile_aggregate[:, 0, 0], _REF_TICKS
     )
 
 

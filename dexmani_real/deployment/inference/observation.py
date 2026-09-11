@@ -71,6 +71,29 @@ class FrameWindow:
 
 
 @dataclass(frozen=True)
+class HandFrameWindow:
+    """Oldest-first window of one XHand sample per slot, with per-modality validity.
+
+    ``qpos``, ``tactile_aggregate``, and ``tactile_dense`` all come from the
+    same selected hand record, so one policy slot is one XHand sample: the three
+    payloads share ``source_sequence``/``source_monotonic_ns`` by construction.
+    The two validity bits are copied from that same record and are only consulted
+    after alignment; they never drop a record before sample selection.
+    """
+
+    qpos: np.ndarray  # [T,12] float64
+    tactile_aggregate: np.ndarray  # [T,5,3] float32
+    tactile_dense: np.ndarray  # [T,5,120,3] float32
+    tactile_aggregate_valid: np.ndarray  # [T] uint8
+    tactile_dense_valid: np.ndarray  # [T] uint8
+
+    source_sequence: np.ndarray  # [T] uint64
+    source_monotonic_ns: np.ndarray  # [T] uint64
+    publish_monotonic_ns: np.ndarray  # [T] uint64
+    valid_mask: np.ndarray  # [T] uint8
+
+
+@dataclass(frozen=True)
 class PointCloudFrame:
     """One fixed-size xArm-base point cloud and its causal provenance."""
 
@@ -96,14 +119,13 @@ class RgbFrame:
 class ObservationBatch:
     """One causal observation assembled from state and point-cloud rings.
 
-    Process-local. ``arm_history``/``hand_history``/``hand_contact_history``/
-    ``hand_tactile_force_history`` are sensor-value ``FrameWindow`` values, all
-    read from the same ``hand_state_ring`` so aggregate and dense tactile share
-    one source identity with hand qpos.
-    ``pointcloud`` is the latest causally valid ``PointCloudFrame``. Optional
-    modalities are None when not requested.
-    ``anchor_monotonic_ns`` is the causal cut: no frame published after the
-    anchor may be included.
+    Process-local. ``arm_history`` is an arm-qpos ``FrameWindow`` and
+    ``hand_history`` is a ``HandFrameWindow`` carrying qpos, aggregate tactile,
+    and dense tactile read from the same ``hand_state_ring`` record, so the three
+    hand representations share one source identity per slot. ``pointcloud`` is
+    the latest causally valid ``PointCloudFrame``. Optional modalities are None
+    when not requested. ``anchor_monotonic_ns`` is the causal cut: no frame
+    published after the anchor may be included.
     """
 
     observation_id: int
@@ -114,9 +136,7 @@ class ObservationBatch:
     logical_step_monotonic_ns: int
 
     arm_history: FrameWindow | None = None
-    hand_history: FrameWindow | None = None
-    hand_contact_history: FrameWindow | None = None
-    hand_tactile_force_history: FrameWindow | None = None
+    hand_history: HandFrameWindow | None = None
     pointcloud: PointCloudFrame | None = None
     # Oldest-first causal window of recent point-cloud frames; ``pointcloud`` is
     # the latest (and last element) when non-empty.  ``point_cloud`` models use
@@ -228,6 +248,88 @@ def _read_state_history(
     )
 
 
+def _read_hand_history(
+    ring,
+    *,
+    history_len: int,
+    anchor_ns: int,
+    max_age_ns: int | None,
+    not_before_ns: int = 0,
+) -> HandFrameWindow | None:
+    """Read one causal XHand window, copying qpos and both tactile payloads together.
+
+    Admission is decided by the hand sample alone (state_valid, qpos_stale,
+    source/publish causality, freshness, finite qpos); tactile validity bits are
+    copied verbatim and never drop a record. A record whose *valid* tactile
+    payload is non-finite is rejected as producer corruption, not as invalidity.
+    """
+    try:
+        history = ring.get_last_k(min(int(history_len), ring.maxlen))
+    except Exception:
+        logger.warning("inference: hand history read failed", exc_info=True)
+        return None
+
+    qpos_list: list[np.ndarray] = []
+    aggregate_list: list[np.ndarray] = []
+    dense_list: list[np.ndarray] = []
+    aggregate_valid_list: list[int] = []
+    dense_valid_list: list[int] = []
+    sequences: list[int] = []
+    sources: list[int] = []
+    publishes: list[int] = []
+    for data, ring_publish_ns, sequence in history:
+        names = data.dtype.names or ()
+        if "state_valid" not in names or not bool(data["state_valid"][0]):
+            continue
+        if "qpos_stale" not in names or bool(data["qpos_stale"][0]):
+            continue
+        source_ns = int(data["source_monotonic_ns"][0])
+        publish_ns = (
+            int(data["publish_monotonic_ns"][0])
+            if "publish_monotonic_ns" in names
+            and int(data["publish_monotonic_ns"][0]) > 0
+            else int(ring_publish_ns)
+        )
+        if not (max(1, int(not_before_ns)) <= source_ns <= publish_ns <= anchor_ns):
+            continue
+        if max_age_ns is not None and anchor_ns - source_ns > max_age_ns:
+            continue
+        qpos = np.asarray(data["qpos"][0], dtype=np.float64)
+        if not np.all(np.isfinite(qpos)):
+            continue
+        aggregate = np.asarray(data["tactile_aggregate"][0], dtype=np.float32)
+        dense = np.asarray(data["tactile_dense"][0], dtype=np.float32)
+        aggregate_valid = bool(data["tactile_aggregate_valid"][0])
+        dense_valid = bool(data["tactile_dense_valid"][0])
+        if aggregate_valid and not np.all(np.isfinite(aggregate)):
+            continue
+        if dense_valid and not np.all(np.isfinite(dense)):
+            continue
+        qpos_list.append(qpos)
+        aggregate_list.append(aggregate)
+        dense_list.append(dense)
+        aggregate_valid_list.append(int(aggregate_valid))
+        dense_valid_list.append(int(dense_valid))
+        sequences.append(int(sequence))
+        sources.append(source_ns)
+        publishes.append(publish_ns)
+
+    if not qpos_list:
+        return None
+    t = len(qpos_list)
+    return HandFrameWindow(
+        qpos=np.stack(qpos_list),
+        tactile_aggregate=np.stack(aggregate_list),
+        tactile_dense=np.stack(dense_list),
+        tactile_aggregate_valid=np.asarray(aggregate_valid_list, dtype=np.uint8),
+        tactile_dense_valid=np.asarray(dense_valid_list, dtype=np.uint8),
+        source_sequence=np.asarray(sequences, dtype=np.uint64),
+        source_monotonic_ns=np.asarray(sources, dtype=np.uint64),
+        publish_monotonic_ns=np.asarray(publishes, dtype=np.uint64),
+        valid_mask=np.ones(t, dtype=np.uint8),
+    )
+
+
 def _select_control_grid_reference_ns(
     *, run_started_ns: int, anchor_ns: int, history_len: int, step_dt_ns: int
 ) -> tuple[np.ndarray, int]:
@@ -256,23 +358,22 @@ def _select_control_grid_reference_ns(
     )
 
 
-def _align_state_history_to_reference_ns(
-    state_history: FrameWindow | None,
+def _select_history_indices(
+    source_monotonic_ns: np.ndarray,
+    valid_mask: np.ndarray,
     reference_ns: np.ndarray,
     *,
     max_skew_ns: int,
     run_started_ns: int,
-) -> FrameWindow | None:
-    """Choose newest source <= each reference, within the explicit skew bound.
+) -> np.ndarray | None:
+    """Return the newest source <= each reference within skew, oldest-first.
 
     A leading reference at or before run start maps to the oldest post-run
     source (edge-repeat), filling the history window during warm-up.  Any
-    non-leading reference with no skew-valid candidate still fails the window.
+    non-leading reference with no skew-valid candidate fails (returns None).
     """
-    if state_history is None or np.asarray(reference_ns).size == 0:
-        return None
-    sources = np.asarray(state_history.source_monotonic_ns, dtype=np.int64)
-    valid = np.asarray(state_history.valid_mask, dtype=np.uint8) == 1
+    sources = np.asarray(source_monotonic_ns, dtype=np.int64)
+    valid = np.asarray(valid_mask, dtype=np.uint8) == 1
     valid_idx = np.flatnonzero(valid)
     if valid_idx.size == 0:
         return None
@@ -288,12 +389,69 @@ def _align_state_history_to_reference_ns(
                 return None
         else:
             selected.append(int(candidates[-1]))
-    indices = np.asarray(selected, dtype=np.intp)
+    return np.asarray(selected, dtype=np.intp)
+
+
+def _align_state_history_to_reference_ns(
+    state_history: FrameWindow | None,
+    reference_ns: np.ndarray,
+    *,
+    max_skew_ns: int,
+    run_started_ns: int,
+) -> FrameWindow | None:
+    """Choose newest source <= each reference, within the explicit skew bound."""
+    if state_history is None or np.asarray(reference_ns).size == 0:
+        return None
+    indices = _select_history_indices(
+        state_history.source_monotonic_ns,
+        state_history.valid_mask,
+        reference_ns,
+        max_skew_ns=max_skew_ns,
+        run_started_ns=run_started_ns,
+    )
+    if indices is None:
+        return None
     return FrameWindow(
         values=state_history.values[indices],
         source_sequence=state_history.source_sequence[indices],
         source_monotonic_ns=state_history.source_monotonic_ns[indices],
         publish_monotonic_ns=state_history.publish_monotonic_ns[indices],
+        valid_mask=np.ones(len(indices), dtype=np.uint8),
+    )
+
+
+def _align_hand_history_to_reference_ns(
+    hand_history: HandFrameWindow | None,
+    reference_ns: np.ndarray,
+    *,
+    max_skew_ns: int,
+    run_started_ns: int,
+) -> HandFrameWindow | None:
+    """Select one hand sample per reference slot, then project every field from it.
+
+    The same selected indices are applied to qpos, both tactile payloads, both
+    validity bits, and provenance, so one policy slot stays one XHand sample.
+    """
+    if hand_history is None or np.asarray(reference_ns).size == 0:
+        return None
+    indices = _select_history_indices(
+        hand_history.source_monotonic_ns,
+        hand_history.valid_mask,
+        reference_ns,
+        max_skew_ns=max_skew_ns,
+        run_started_ns=run_started_ns,
+    )
+    if indices is None:
+        return None
+    return HandFrameWindow(
+        qpos=hand_history.qpos[indices],
+        tactile_aggregate=hand_history.tactile_aggregate[indices],
+        tactile_dense=hand_history.tactile_dense[indices],
+        tactile_aggregate_valid=hand_history.tactile_aggregate_valid[indices],
+        tactile_dense_valid=hand_history.tactile_dense_valid[indices],
+        source_sequence=hand_history.source_sequence[indices],
+        source_monotonic_ns=hand_history.source_monotonic_ns[indices],
+        publish_monotonic_ns=hand_history.publish_monotonic_ns[indices],
         valid_mask=np.ones(len(indices), dtype=np.uint8),
     )
 
@@ -612,9 +770,7 @@ def _build_observation(
     history_span_ns = max(0, horizon - 1) * int(step_dt_ns)
     visual_history_max_age_ns = max_age_ns + history_span_ns + max_grid_lag_ns
     state_history_max_age_ns = visual_history_max_age_ns + max_skew_ns
-    hand_history: FrameWindow | None = None
-    hand_contact_history: FrameWindow | None = None
-    hand_tactile_force_history: FrameWindow | None = None
+    hand_history: HandFrameWindow | None = None
     pointcloud: PointCloudFrame | None = None
     pointcloud_history: tuple[PointCloudFrame, ...] = ()
     requested = _requested_observation_fields(policy_spec)
@@ -633,10 +789,10 @@ def _build_observation(
         max_age_ns=state_history_max_age_ns,
         not_before_ns=run_started_ns,
     )
-    hand_state_requested = bool(
-        requested & {"joint_state", "contact_force", "fingertip_points"}
+    hand_requested = bool(
+        requested & {"joint_state", "contact_force", "tactile_force", "fingertip_points"}
     )
-    tactile_requested = "contact_force" in requested
+    contact_force_requested = "contact_force" in requested
     tactile_force_requested = "tactile_force" in requested
     if pointcloud_requested:
         all_pointclouds = _read_pointcloud_history(
@@ -691,40 +847,14 @@ def _build_observation(
             height=int(rgb_shape[0]),
             width=int(rgb_shape[1]),
         )
-    if getattr(policy_spec, "requires_hand") is True:
-        if hand_state_requested:
-            hand_history = _read_state_history(
-                shared.hand_state_ring,
-                history_len=(shared.hand_state_ring.maxlen),
-                anchor_ns=anchor_ns,
-                values_field="qpos",
-                required_true_fields=("state_valid",),
-                required_false_fields=("qpos_stale",),
-                max_age_ns=state_history_max_age_ns,
-                not_before_ns=run_started_ns,
-            )
-        if tactile_requested:
-            hand_contact_history = _read_state_history(
-                shared.hand_state_ring,
-                history_len=shared.hand_state_ring.maxlen,
-                anchor_ns=anchor_ns,
-                values_field="tactile_aggregate",
-                required_true_fields=("state_valid", "tactile_aggregate_valid"),
-                required_false_fields=("qpos_stale",),
-                max_age_ns=state_history_max_age_ns,
-                not_before_ns=run_started_ns,
-            )
-        if tactile_force_requested:
-            hand_tactile_force_history = _read_state_history(
-                shared.hand_state_ring,
-                history_len=shared.hand_state_ring.maxlen,
-                anchor_ns=anchor_ns,
-                values_field="tactile_dense",
-                required_true_fields=("state_valid", "tactile_dense_valid"),
-                required_false_fields=("qpos_stale",),
-                max_age_ns=state_history_max_age_ns,
-                not_before_ns=run_started_ns,
-            )
+    if getattr(policy_spec, "requires_hand") is True and hand_requested:
+        hand_history = _read_hand_history(
+            shared.hand_state_ring,
+            history_len=shared.hand_state_ring.maxlen,
+            anchor_ns=anchor_ns,
+            max_age_ns=state_history_max_age_ns,
+            not_before_ns=run_started_ns,
+        )
     # Every modality uses the policy control grid; camera exposure times do
     # not move the robot/contact observation back to an earlier raw instant.
     arm_history = _align_state_history_to_reference_ns(
@@ -732,20 +862,8 @@ def _build_observation(
         run_started_ns=run_started_ns,
     )
     if hand_history is not None:
-        hand_history = _align_state_history_to_reference_ns(
+        hand_history = _align_hand_history_to_reference_ns(
             hand_history, reference_ns, max_skew_ns=max_skew_ns,
-            run_started_ns=run_started_ns,
-        )
-    if hand_contact_history is not None:
-        hand_contact_history = _align_state_history_to_reference_ns(
-            hand_contact_history, reference_ns, max_skew_ns=max_skew_ns,
-            run_started_ns=run_started_ns,
-        )
-    if hand_tactile_force_history is not None:
-        hand_tactile_force_history = _align_state_history_to_reference_ns(
-            hand_tactile_force_history,
-            reference_ns,
-            max_skew_ns=max_skew_ns,
             run_started_ns=run_started_ns,
         )
     if pointcloud_requested:
@@ -772,8 +890,6 @@ def _build_observation(
             for window in (
                 arm_history,
                 hand_history,
-                hand_contact_history,
-                hand_tactile_force_history,
             )
             if window is not None
         )
@@ -783,18 +899,18 @@ def _build_observation(
         return None
     if arm_history is None or arm_history.values.shape[0] != horizon:
         return None
-    if hand_state_requested and (
-        hand_history is None or hand_history.values.shape[0] != horizon
+    if hand_requested and (
+        hand_history is None or hand_history.qpos.shape[0] != horizon
     ):
         return None
-    if tactile_requested and (
-        hand_contact_history is None
-        or hand_contact_history.values.shape[0] != horizon
+    if contact_force_requested and (
+        hand_history is None
+        or not np.all(hand_history.tactile_aggregate_valid)
     ):
         return None
     if tactile_force_requested and (
-        hand_tactile_force_history is None
-        or hand_tactile_force_history.values.shape[0] != horizon
+        hand_history is None
+        or not np.all(hand_history.tactile_dense_valid)
     ):
         return None
     return ObservationBatch(
@@ -806,8 +922,6 @@ def _build_observation(
         logical_step_monotonic_ns=logical_step_ns,
         arm_history=arm_history,
         hand_history=hand_history,
-        hand_contact_history=hand_contact_history,
-        hand_tactile_force_history=hand_tactile_force_history,
         pointcloud=pointcloud,
         pointcloud_history=pointcloud_history,
         rgb_history=rgb_history,
@@ -826,8 +940,6 @@ def observation_timing_ms(observation: ObservationBatch) -> tuple[float, float]:
     for window in (
         getattr(observation, "arm_history", None),
         getattr(observation, "hand_history", None),
-        getattr(observation, "hand_contact_history", None),
-        getattr(observation, "hand_tactile_force_history", None),
     ):
         if window is None:
             continue
@@ -874,7 +986,7 @@ def _to_policy_observation(
         raise ValueError("joint_state requires aligned arm and hand histories")
     arrays: dict[str, np.ndarray] = {}
     joint = np.concatenate(
-        (observation.arm_history.values, observation.hand_history.values), axis=1
+        (observation.arm_history.values, observation.hand_history.qpos), axis=1
     )
     arrays["joint_state"] = np.ascontiguousarray(joint, dtype=np.float32)
     policy_joint_state = arrays["joint_state"]
@@ -891,16 +1003,12 @@ def _to_policy_observation(
             dtype=np.uint8,
         )
     if "contact_force" in field_names:
-        if observation.hand_contact_history is None:
-            raise ValueError("contact_force lacks valid aggregate tactile history")
         arrays["contact_force"] = np.ascontiguousarray(
-            observation.hand_contact_history.values, dtype=np.float32
+            observation.hand_history.tactile_aggregate, dtype=np.float32
         )
     if "tactile_force" in field_names:
-        if observation.hand_tactile_force_history is None:
-            raise ValueError("tactile_force lacks valid dense tactile history")
         arrays["tactile_force"] = np.ascontiguousarray(
-            observation.hand_tactile_force_history.values, dtype=np.float32
+            observation.hand_history.tactile_dense, dtype=np.float32
         )
     if "eef_pose" in field_names or "fingertip_points" in field_names:
         if fingertip_runtime is None:

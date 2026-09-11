@@ -217,41 +217,42 @@ class TestFieldGates(unittest.TestCase):
 
 
 class TestBuildObservation(unittest.TestCase):
-    def test_joint_state_only_skips_tactile_read(self) -> None:
+    def test_joint_state_only_does_not_require_tactile_validity(self) -> None:
         spec = _fake_policy_spec(_Field("eef_pose", (9,), "float32"))
-        observation = _build(_fake_shared(), spec)
+        observation = _build(_fake_shared(dense_invalid_ticks=(5,)), spec)
         self.assertIsNotNone(observation)
-        self.assertIsNone(observation.hand_contact_history)
-        self.assertIsNone(observation.hand_tactile_force_history)
+        self.assertIsNotNone(observation.hand_history)
         np.testing.assert_array_equal(
             observation.arm_history.source_monotonic_ns,
             np.asarray([_ref_ns(tick) for tick in _REF_TICKS], dtype=np.uint64),
         )
 
-    def test_contact_only_reads_aggregate_not_dense(self) -> None:
+    def test_contact_only_does_not_require_dense_valid(self) -> None:
         spec = _fake_policy_spec(_Field("contact_force", (5, 3), "float32"))
-        observation = _build(_fake_shared(), spec)
+        observation = _build(_fake_shared(dense_invalid_ticks=(5,)), spec)
         self.assertIsNotNone(observation)
-        self.assertIsNotNone(observation.hand_contact_history)
-        self.assertIsNone(observation.hand_tactile_force_history)
+        self.assertIsNotNone(observation.hand_history)
 
-    def test_contact_and_dense_share_one_hand_source(self) -> None:
+    def test_single_source_identity(self) -> None:
         spec = _fake_policy_spec(
             _Field("contact_force", (5, 3), "float32"),
             _Field("tactile_force", (5, 120, 3), "float32"),
         )
         observation = _build(_fake_shared(), spec)
         self.assertIsNotNone(observation)
-        self.assertIsNotNone(observation.hand_contact_history)
-        force_history = observation.hand_tactile_force_history
-        self.assertIsNotNone(force_history)
-        self.assertEqual(force_history.values.shape, (_HORIZON, 5, 120, 3))
+        hand = observation.hand_history
+        self.assertIsNotNone(hand)
+        self.assertEqual(hand.tactile_dense.shape, (_HORIZON, 5, 120, 3))
+        # One hand window carries qpos, aggregate, and dense under a single
+        # source axis; the aligned source matches the policy grid, and the
+        # aggregate/dense values encode the very tick their source points at.
         np.testing.assert_array_equal(
-            force_history.source_monotonic_ns,
-            observation.hand_contact_history.source_monotonic_ns,
+            hand.source_monotonic_ns,
+            np.asarray([_ref_ns(tick) for tick in _REF_TICKS], dtype=np.uint64),
         )
         for index, tick in enumerate(_REF_TICKS):
-            self.assertTrue(np.all(force_history.values[index] == float(tick)))
+            self.assertTrue(np.all(hand.tactile_aggregate[index] == float(tick)))
+            self.assertTrue(np.all(hand.tactile_dense[index] == float(tick)))
 
     def test_contact_only_survives_dense_invalid_but_dense_policy_fails(self) -> None:
         shared = _fake_shared(dense_invalid_ticks=(0, 1, 2, 3, 4, 5))
@@ -278,6 +279,35 @@ class TestBuildObservation(unittest.TestCase):
             data["publish_monotonic_ns"][0] = _ANCHOR_NS + 1
         spec = _fake_policy_spec(_Field("tactile_force", (5, 120, 3), "float32"))
         self.assertIsNone(_build(shared, spec))
+
+    def test_dense_no_fallback_newest_invalid(self) -> None:
+        # Newest sample (tick 5) has invalid dense; the older valid sample
+        # (tick 4) is only 62.5 ms back, still inside the 0.10 s skew bound.
+        # Validity is checked after selection, so the observation must fail
+        # rather than fall back to tick 4's dense payload.
+        shared = _fake_shared(dense_invalid_ticks=(5,))
+        spec = _fake_policy_spec(_Field("tactile_force", (5, 120, 3), "float32"))
+        self.assertIsNone(_build(shared, spec))
+
+    def test_aggregate_no_fallback_newest_invalid(self) -> None:
+        shared = _fake_shared(aggregate_invalid_ticks=(5,))
+        spec = _fake_policy_spec(_Field("contact_force", (5, 3), "float32"))
+        self.assertIsNone(_build(shared, spec))
+
+    def test_partial_validity(self) -> None:
+        # Selected newest sample: aggregate valid, dense invalid.
+        shared = _fake_shared(dense_invalid_ticks=(5,))
+        joint_spec = _fake_policy_spec(_Field("eef_pose", (9,), "float32"))
+        contact_spec = _fake_policy_spec(_Field("contact_force", (5, 3), "float32"))
+        dense_spec = _fake_policy_spec(_Field("tactile_force", (5, 120, 3), "float32"))
+        both_spec = _fake_policy_spec(
+            _Field("contact_force", (5, 3), "float32"),
+            _Field("tactile_force", (5, 120, 3), "float32"),
+        )
+        self.assertIsNotNone(_build(shared, joint_spec))
+        self.assertIsNotNone(_build(shared, contact_spec))
+        self.assertIsNone(_build(shared, dense_spec))
+        self.assertIsNone(_build(shared, both_spec))
 
 
 class TestToPolicyObservation(unittest.TestCase):
@@ -371,14 +401,18 @@ class TestToPolicyObservation(unittest.TestCase):
         for index, tick in enumerate(_REF_TICKS):
             self.assertTrue(np.all(tactile[index] == np.float32(float(tick))))
 
-    def test_tactile_force_without_history_raises(self) -> None:
+    def test_to_policy_observation_requires_hand_history(self) -> None:
         spec = _fake_policy_spec(_Field("tactile_force", (5, 120, 3), "float32"))
-        observation = _build(
-            _fake_shared(arm_qpos=_distinct_arm_qpos()),
-            _fake_policy_spec(),
+        batch = ObservationBatch(
+            observation_id=1,
+            run_generation=0,
+            run_started_monotonic_ns=_T0_NS,
+            anchor_monotonic_ns=_ANCHOR_NS,
+            latest_source_monotonic_ns=_ANCHOR_NS,
+            logical_step_monotonic_ns=_ANCHOR_NS,
         )
         with self.assertRaises(ValueError):
-            _to_policy_observation(observation, spec)
+            _to_policy_observation(batch, spec)
 
     def test_eef_pose_without_runtime_raises(self) -> None:
         spec = _fake_policy_spec(_Field("eef_pose", (9,), "float32"))

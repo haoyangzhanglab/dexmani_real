@@ -38,6 +38,7 @@ from dexmani_real.dataset.processed import (
     PROCESSED_SCHEMA_VERSION,
     _dataset_row_slices,
     _expected_specs,
+    _validate_masked_tactile_rows,
     validate_processed_hdf5,
 )
 from dexmani_real.planning.kinematics.arm_fk import (
@@ -140,6 +141,16 @@ def analyze_episode(
         ):
             raise ValueError(f"{name}: NaN/Inf")
         arrays[name] = values
+    _validate_masked_tactile_rows(
+        arrays["hand_contact"],
+        arrays["hand_contact_valid"],
+        label="raw hand_contact",
+    )
+    _validate_masked_tactile_rows(
+        arrays["hand_tactile_force"],
+        arrays["hand_tactile_force_valid"],
+        label="raw hand_tactile_force",
+    )
     if np.any(np.diff(arrays["timestamp"]) <= 0):
         raise ValueError("raw timestamps must strictly increase")
     if not np.array_equal(arrays["source_sample_index"], np.arange(frames)):
