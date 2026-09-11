@@ -14,7 +14,6 @@ handlers so ``list`` stays a filesystem-only Policy operation.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import math
 import statistics
 import sys
@@ -208,14 +207,10 @@ def _print_evaluation_summary(info: Any, inputs: _LifecycleInputs) -> None:
     evaluation = inputs.evaluation_config
     if evaluation is None:
         raise ValueError("recorded rollout summary requires a recording contract")
-    checkpoint_sha256 = evaluation.provenance.get("checkpoint_sha256")
-    if checkpoint_sha256 is None:
-        raise ValueError("recorded rollout provenance lacks checkpoint_sha256")
     print("── Recorded Rollout ──")
     print(f"Eval seed             : {inputs.worker_config.seed}")
     print(f"Policy selector       : {info.selector}")
     print(f"Checkpoint            : {info.checkpoint_name}")
-    print(f"Checkpoint SHA-256    : {checkpoint_sha256}")
     print(f"Device                : {inputs.worker_config.device}")
     print(
         "Observation modalities : "
@@ -242,18 +237,6 @@ def _validated_warmup_durations(raw: Any) -> tuple[float, ...]:
     if any(not math.isfinite(value) or value < 0.0 for value in durations):
         raise RuntimeError("Policy warmup returned invalid timing samples")
     return durations
-
-
-def _checkpoint_sha256(checkpoint_path: Any) -> str:
-    """Hash the exact checkpoint artifact before any worker can start."""
-    path = Path(checkpoint_path)
-    if not path.is_file():
-        raise ValueError(f"checkpoint artifact is not a regular file: {path}")
-    digest = hashlib.sha256()
-    with path.open("rb") as checkpoint_file:
-        while chunk := checkpoint_file.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _safe_selector_parts(selector: Any) -> tuple[str, str, str]:
@@ -348,8 +331,8 @@ def _prepare_lifecycle_inputs(
     from dexmani_real.config.experiment import resolve_experiment_config
     from dexmani_real.deployment.config import (
         InferenceWorkerConfig,
+        RolloutRecordingConfig,
     )
-    from dexmani_real.deployment.evaluation import RolloutRecordingConfig
 
     if not isinstance(execute, bool):
         raise TypeError("execute must be a boolean")
@@ -372,22 +355,11 @@ def _prepare_lifecycle_inputs(
             / mode
             / f"seed_{args.eval_seed:03d}"
         )
-        checkpoint_sha256 = _checkpoint_sha256(info.checkpoint_path)
         evaluation_config = RolloutRecordingConfig(
-            mode=mode,
             data_dir=str(output_dir),
             task_label=args.task_label or info.task_name,
             operator=args.operator or getpass.getuser(),
             max_running_s=args.max_running_s,
-            provenance={
-                "workflow": f"policy_{mode}",
-                "eval_seed": str(args.eval_seed),
-                "device": args.device,
-                "policy_selector": info.selector,
-                "checkpoint_name": str(info.checkpoint_name),
-                "checkpoint_sha256": checkpoint_sha256,
-                "max_running_s": f"{float(args.max_running_s):.17g}",
-            },
         )
     return _LifecycleInputs(
         execute=execute,
@@ -412,7 +384,7 @@ def _start_lifecycle(inputs: _LifecycleInputs) -> int:
             if inputs.evaluation_config is None
             else inputs.evaluation_config.max_running_s
         ),
-        evaluation_config=inputs.evaluation_config,
+        recording_config=inputs.evaluation_config,
     )
 
 

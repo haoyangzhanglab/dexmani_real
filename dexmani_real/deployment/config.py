@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from dexmani_real.config.pointcloud import (
@@ -311,6 +312,48 @@ class InferenceWorkerConfig:
 
 
 @dataclass(frozen=True)
+class RolloutRecordingConfig:
+    """Resolved recording inputs for one physical policy rollout session.
+
+    ``data_dir`` is an isolated absolute output directory (the session
+    directory); the CLI owns selector/path validation before workers start.
+    This pickle-safe object carries only recording inputs — task success is
+    judged offline from the published raw episodes, and the runtime records
+    only technical stop reasons.
+    """
+
+    data_dir: str
+    task_label: str
+    operator: str
+    max_running_s: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data_dir, str) or not self.data_dir.strip():
+            raise ValueError("rollout data_dir must be a non-empty path")
+        raw_data_dir = Path(self.data_dir)
+        if not raw_data_dir.is_absolute():
+            raise ValueError("rollout data_dir must be absolute")
+        resolved_data_dir = raw_data_dir.resolve(strict=False)
+        if resolved_data_dir == resolved_data_dir.parent:
+            raise ValueError("rollout data_dir must not be a filesystem root")
+        for field_name in ("task_label", "operator"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"rollout {field_name} must be non-empty")
+            if value != value.strip():
+                raise ValueError(
+                    f"rollout {field_name} must not have surrounding whitespace"
+                )
+        if isinstance(self.max_running_s, bool):
+            raise TypeError("rollout max_running_s must be a finite positive number")
+        timeout_s = float(self.max_running_s)
+        if not math.isfinite(timeout_s) or timeout_s <= 0.0:
+            raise ValueError("rollout max_running_s must be finite and positive")
+        object.__setattr__(self, "data_dir", str(resolved_data_dir))
+        object.__setattr__(self, "max_running_s", timeout_s)
+
+
+@dataclass(frozen=True)
 class FingertipAssemblerConfig:
     """Explicit pickle-safe geometry inputs for deployment-local FK."""
 
@@ -345,6 +388,7 @@ __all__ = [
     "FIXED_POLICY_RUNTIME_TARGET",
     "FingertipAssemblerConfig",
     "InferenceWorkerConfig",
+    "RolloutRecordingConfig",
     "validate_policy_runtime_compatibility",
     "validate_max_running_s",
 ]

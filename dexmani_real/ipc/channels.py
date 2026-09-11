@@ -213,10 +213,6 @@ class RuntimeChannels:
     physical_home_completed: Any
     # Main/operator -> policy executor: explicit S request.
     stop_request: Any
-    # Main/operator -> policy executor: recorded-rollout outcome wire value
-    # (0 NONE, 1 SUCCESS, 2 FAILURE, 3 INVALID, 4 STOPPED). Shadow deployment
-    # leaves 0 because it does not create a recorded rollout.
-    evaluation_outcome: Any
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write
     # Serializes the motion permit and coupled-command ring writer. It is never
@@ -358,7 +354,6 @@ class RuntimeChannels:
         storage.start_request = ctx.Value("b", False)
         storage.physical_home_completed = ctx.Value("b", False)
         storage.stop_request = ctx.Value("b", False)
-        storage.evaluation_outcome = ctx.Value("i", 0)
 
         storage.safety_state = ctx.Value("i", DISARMED_SAFETY_STATE_WIRE_VALUE)
         storage.motion_lock = ctx.RLock()

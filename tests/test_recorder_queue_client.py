@@ -57,7 +57,7 @@ def test_start_ack_precedes_production_and_stop_captures_last_commit():
     recorder = client()
     assert not add(recorder)
     recorder.shared.record_result_q.put(
-        RecordingStarted("episode", 2, "eval:invalid:max_frames")
+        RecordingStarted("episode", 2, "max_frames")
     )
     assert recorder.start_episode(task_label="task", operator="operator")
     assert recorder.shared.record_control_q.get_nowait() == StartRecording(
@@ -68,13 +68,13 @@ def test_start_ack_precedes_production_and_stop_captures_last_commit():
     assert not recorder.is_recording
     assert not add(recorder)
     assert recorder.shared.record_control_q.get_nowait() == StopRecording(
-        True, "eval:invalid:max_frames", 2
+        True, "max_frames", 2
     )
     assert recorder.stop_pending
-    assert recorder.poll_stop().reason == "eval:invalid:max_frames"
+    assert recorder.poll_stop().reason == "max_frames"
     assert not recorder.start_episode()
     recorder.shared.record_result_q.put(
-        RecordingFinished(True, "episode", 2, "eval:invalid:max_frames")
+        RecordingFinished(True, "episode", 2, "max_frames")
     )
     assert recorder.poll_stop().done
     assert not recorder.poll_stop().done

@@ -21,7 +21,6 @@ import numpy as np
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.control.arm_homing import ArmHomeConfig, execute_arm_home
 from dexmani_real.control.hand_homing import publish_hand_home_and_wait_accepted
-from dexmani_real.deployment.evaluation import EvaluationOutcome
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import (
     OnlineIKConfig,
@@ -57,32 +56,6 @@ def _request_immediate_quit(shared: RuntimeChannels) -> None:
     """Apply Q's motion fence before asking the supervisor to shut down."""
     _request_immediate_stop(shared)
     shared.quit_requested.value = True
-
-
-def _request_evaluation_outcome_and_stop(
-    shared: RuntimeChannels,
-    outcome: EvaluationOutcome,
-) -> bool:
-    """Publish a formal outcome before its ordered motion fence.
-
-    ``motion_lock`` is an RLock, so ``request_policy_stop`` preserves this
-    write-before-stop ordering while it revokes RUNNING.  The executor can
-    therefore consume a stable outcome rather than observing an ordinary S
-    first and guessing how the trial ended.
-    """
-    with shared.motion_lock:
-        was_running = int(shared.safety_state.value) == int(SafetyState.RUNNING)
-        if was_running:
-            try:
-                current = EvaluationOutcome(int(shared.evaluation_outcome.value))
-            except ValueError:
-                shared.error_state.value = True
-                return False
-            if current is EvaluationOutcome.NONE:
-                shared.evaluation_outcome.value = int(outcome)
-        if not request_policy_stop(shared):
-            shared.error_state.value = True
-    return was_running
 
 
 def build_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
@@ -177,33 +150,27 @@ def run_operator_control(
     *,
     stop_event: threading.Event,
     execute: bool,
-    evaluation: bool = False,
 ) -> None:
     """Keyboard thread target: map operator keys to shared flags / home.
 
-    B -> ``start_request``, S -> ``stop_request``, Q -> ``quit_requested``,
-    ESC -> ``estop_request``. H is enabled only when a caller supplies a home
-    planner. The thread exits when *stop_event*
-    is set, when the runtime stops, or after a terminal Q/ESC.
+    B -> ``start_request``, S -> ``stop_request`` + motion fence,
+    Q -> ``quit_requested``, ESC -> ``estop_request``. S/Q/ESC fire as
+    immediate callbacks so they stay responsive while this thread blocks in
+    H. H is enabled only when a caller supplies a home planner. The thread
+    exits when *stop_event* is set, when the runtime stops, or after a
+    terminal Q/ESC. C/D belong to teleop (PAUSE/DISCARD); policy deployment
+    ignores them with a warning and assigns no task meaning to any key —
+    task success is judged offline from the saved raw episode.
     """
     if not isinstance(execute, bool):
         raise TypeError("execute must be a boolean")
-    if not isinstance(evaluation, bool):
-        raise TypeError("evaluation must be a boolean")
     if execute != (planner is not None):
         raise ValueError("execute must match physical home availability")
-    if evaluation:
-        # S/C/D/Q must be consumed by this loop so outcome writes happen
-        # before their stop fence. ESC stays an immediate callback.
-        keyboard = KeyboardInput(
-            estop_callback=lambda: setattr(shared.estop_request, "value", True),
-        )
-    else:
-        keyboard = KeyboardInput(
-            estop_callback=lambda: setattr(shared.estop_request, "value", True),
-            stop_callback=lambda: _request_immediate_stop(shared),
-            quit_callback=lambda: _request_immediate_quit(shared),
-        )
+    keyboard = KeyboardInput(
+        estop_callback=lambda: setattr(shared.estop_request, "value", True),
+        stop_callback=lambda: _request_immediate_stop(shared),
+        quit_callback=lambda: _request_immediate_quit(shared),
+    )
     try:
         keyboard.start()
     except Exception:
@@ -246,33 +213,15 @@ def run_operator_control(
                         )
                         continue
                 elif signal is OperatorCommand.STOP:
-                    if evaluation:
-                        _request_evaluation_outcome_and_stop(
-                            shared,
-                            EvaluationOutcome.SUCCESS,
-                        )
-                    else:
-                        _request_immediate_stop(shared)
+                    _request_immediate_stop(shared)
                 elif signal is OperatorCommand.PAUSE:
-                    if evaluation:
-                        _request_evaluation_outcome_and_stop(
-                            shared,
-                            EvaluationOutcome.FAILURE,
-                        )
-                    else:
-                        logger.warning(
-                            "operator: C is available only in eval mode"
-                        )
+                    logger.warning(
+                        "operator: C is not used in policy deployment; ignored"
+                    )
                 elif signal is OperatorCommand.DISCARD:
-                    if evaluation:
-                        _request_evaluation_outcome_and_stop(
-                            shared,
-                            EvaluationOutcome.INVALID,
-                        )
-                    else:
-                        logger.warning(
-                            "operator: D is available only in eval mode"
-                        )
+                    logger.warning(
+                        "operator: D is not used in policy deployment; ignored"
+                    )
                 elif signal is OperatorCommand.HOME:
                     if planner is None:
                         logger.warning("operator: H is disabled in policy deployment")
@@ -339,14 +288,7 @@ def run_operator_control(
                     discard_begin_in_batch = True
                 elif signal is OperatorCommand.QUIT:
                     if not shared.quit_requested.value:
-                        if evaluation:
-                            _request_evaluation_outcome_and_stop(
-                                shared,
-                                EvaluationOutcome.INVALID,
-                            )
-                            shared.quit_requested.value = True
-                        else:
-                            _request_immediate_quit(shared)
+                        _request_immediate_quit(shared)
                     return
                 elif signal is OperatorCommand.EMERGENCY_STOP:
                     shared.estop_request.value = True

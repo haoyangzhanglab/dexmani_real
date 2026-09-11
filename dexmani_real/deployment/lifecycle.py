@@ -10,9 +10,9 @@ no second health mechanism: supervisor heartbeats cover the policy executor,
 actuator, and inference workers, while readiness covers asynchronous startup
 only.
 
-There is no VR worker. A shadow session starts the camera only when the
-explicit observation contract contains ``point_cloud`` or ``rgb``. Physical
-``run`` and ``eval`` sessions always start camera and RecorderIO so the raw
+There is no VR worker. A validate-only session starts the camera only when
+the explicit observation contract contains ``point_cloud`` or ``rgb``.
+Physical recorded sessions always start camera and RecorderIO so the raw
 rollout is retained, while camera payload stays out of a state-only policy
 observation.
 
@@ -33,12 +33,9 @@ from dexmani_real.deployment.config import (
     FIXED_POLICY_RUNTIME_TARGET,
     FingertipAssemblerConfig,
     InferenceWorkerConfig,
+    RolloutRecordingConfig,
     validate_max_running_s,
     validate_policy_runtime_compatibility,
-)
-from dexmani_real.deployment.evaluation import (
-    EVALUATION_MAX_FRAMES_STOP_REASON,
-    RolloutRecordingConfig,
 )
 from dexmani_real.deployment.executor import policy_executor_loop
 from dexmani_real.deployment.inference.worker import inference_loop
@@ -69,7 +66,7 @@ logger = get_logger(__name__)
 
 
 _OBSERVATION_READ_MARGIN = 2
-_EVALUATION_RECORDER_FRAME_MARGIN = 4
+_ROLLOUT_RECORDER_FRAME_MARGIN = 4
 
 
 def _observation_field_names(policy_spec: Any) -> tuple[str, ...]:
@@ -99,33 +96,27 @@ def _requires_hand_sensor(policy_spec: Any) -> bool:
     )
 
 
-def _evaluation_recorder_config(
+def _rollout_recorder_config(
     runtime: ExperimentConfig,
-    evaluation: RolloutRecordingConfig,
+    rollout: RolloutRecordingConfig,
 ) -> RecorderIOConfig:
-    """Build the mode-specific recorder capacity contract for one rollout."""
+    """Build the recorder capacity contract for one recorded rollout session."""
     control_hz = float(runtime.policy.control_hz)
     max_frames = (
-        math.ceil(float(evaluation.max_running_s) * control_hz)
-        + _EVALUATION_RECORDER_FRAME_MARGIN
+        math.ceil(float(rollout.max_running_s) * control_hz)
+        + _ROLLOUT_RECORDER_FRAME_MARGIN
     )
     return RecorderIOConfig(
-        data_dir=evaluation.data_dir,
+        data_dir=rollout.data_dir,
         max_frames=max_frames,
         control_hz=control_hz,
         min_frames=1,
         writer_queue_size=int(runtime.camera.writer_queue_size),
-        provenance=evaluation.provenance,
-        max_frames_stop_reason=(
-            EVALUATION_MAX_FRAMES_STOP_REASON
-            if evaluation.mode == "eval"
-            else "run:invalid:max_frames"
-        ),
     )
 
 
 def _wait_for_rollout_recording(shared: RuntimeChannels, processes: list[Any]) -> bool:
-    """Allow the ordinary recorder transaction and result write to finish.
+    """Allow the ordinary recorder transaction to finish before shutdown.
 
     Motion must already be fenced. Only the recorder and its executor owner
     need to remain alive; no arm/hand acceptance is involved in finalization.
@@ -225,7 +216,7 @@ def build_policy_worker_specs(
     *,
     execute: bool,
     max_running_s: float | None = None,
-    evaluation_config: RolloutRecordingConfig | None = None,
+    recording_config: RolloutRecordingConfig | None = None,
 ) -> list[ProcessSpec]:
     """Build the workers required by the explicit deployment contract.
 
@@ -236,17 +227,17 @@ def build_policy_worker_specs(
     if not isinstance(worker_config, InferenceWorkerConfig):
         raise TypeError("worker_config must be an InferenceWorkerConfig")
     max_running_s = validate_max_running_s(max_running_s)
-    if evaluation_config is not None:
-        if not isinstance(evaluation_config, RolloutRecordingConfig):
-            raise TypeError("evaluation_config must be a RolloutRecordingConfig")
+    if recording_config is not None:
+        if not isinstance(recording_config, RolloutRecordingConfig):
+            raise TypeError("recording_config must be a RolloutRecordingConfig")
         if not execute:
             raise ValueError("recorded rollout requires execute=True")
-        if max_running_s != evaluation_config.max_running_s:
+        if max_running_s != recording_config.max_running_s:
             raise ValueError(
                 "rollout max_running_s must match its recording contract"
             )
     pointcloud_requested = _requires_pointcloud(policy_spec)
-    camera_requested = _requires_camera(policy_spec) or evaluation_config is not None
+    camera_requested = _requires_camera(policy_spec) or recording_config is not None
     fingertip_config = (
         FingertipAssemblerConfig.from_runtime(runtime)
         if "fingertip_points" in _observation_field_names(policy_spec)
@@ -293,12 +284,12 @@ def build_policy_worker_specs(
                 ready_name="pointcloud",
             )
         )
-    if evaluation_config is not None:
+    if recording_config is not None:
         specs.append(
             ProcessSpec(
                 "recorder",
                 recorder_io_loop,
-                (shared, _evaluation_recorder_config(runtime, evaluation_config)),
+                (shared, _rollout_recorder_config(runtime, recording_config)),
                 ready_name="recorder",
             )
         )
@@ -319,7 +310,7 @@ def build_policy_worker_specs(
                     policy_spec,
                     execute,
                     max_running_s,
-                    evaluation_config,
+                    recording_config,
                 ),
             ),
         ]
@@ -348,7 +339,7 @@ def run_policy_deployment(
     *,
     prefix: str | None = None,
     max_running_s: float | None = None,
-    evaluation_config: RolloutRecordingConfig | None = None,
+    recording_config: RolloutRecordingConfig | None = None,
 ) -> int:
     """Run a single-rollout policy deployment lifecycle and return its exit code.
 
@@ -362,9 +353,9 @@ def run_policy_deployment(
         raise TypeError("runtime must be an ExperimentConfig")
     if not isinstance(execute, bool):
         raise TypeError("execute must be a boolean")
-    if evaluation_config is not None:
-        if not isinstance(evaluation_config, RolloutRecordingConfig):
-            raise TypeError("evaluation_config must be a RolloutRecordingConfig")
+    if recording_config is not None:
+        if not isinstance(recording_config, RolloutRecordingConfig):
+            raise TypeError("recording_config must be a RolloutRecordingConfig")
         if not execute:
             raise ValueError("recorded rollout requires execute=True")
     validate_policy_runtime_compatibility(policy_spec, runtime)
@@ -373,15 +364,15 @@ def run_policy_deployment(
     if worker_config.spec is not policy_spec:
         raise ValueError("worker PolicySpec must be the validated lifecycle PolicySpec")
     max_running_s = validate_max_running_s(max_running_s)
-    if evaluation_config is not None:
+    if recording_config is not None:
         if (
             max_running_s is not None
-            and max_running_s != evaluation_config.max_running_s
+            and max_running_s != recording_config.max_running_s
         ):
             raise ValueError(
                 "rollout max_running_s must match its recording contract"
             )
-        max_running_s = evaluation_config.max_running_s
+        max_running_s = recording_config.max_running_s
     logger.info(
         "policy deployment: experiment=%s runtime=%s device=%s seed=%s execute=%s",
         worker_config.experiment,
@@ -393,7 +384,7 @@ def run_policy_deployment(
 
     ctx = mp.get_context("spawn")
     pointcloud_requested = _requires_pointcloud(policy_spec)
-    camera_requested = _requires_camera(policy_spec) or evaluation_config is not None
+    camera_requested = _requires_camera(policy_spec) or recording_config is not None
     channel_config = RuntimeChannelsConfig.from_runtime(
         runtime,
         pointcloud_num_points=(
@@ -432,7 +423,7 @@ def run_policy_deployment(
             worker_config,
             execute=execute,
             max_running_s=max_running_s,
-            evaluation_config=evaluation_config,
+            recording_config=recording_config,
         )
         procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)
@@ -503,18 +494,11 @@ def run_policy_deployment(
         )
         home_planner = build_home_planner(runtime) if execute else None
         home_status = "return hand + arm home before B" if home_planner else "disabled"
-        if evaluation_config is not None and evaluation_config.mode == "eval":
-            print(
-                "  [B] begin eval   [S] success   [C] failure   [D] invalid   "
-                f"[Q] quit   [ESC] e-stop   [H] {home_status}",
-                flush=True,
-            )
-        else:
-            print(
-                "  [B] start run   [S] stop run   [Q] quit   [ESC] e-stop   "
-                f"[H] {home_status}",
-                flush=True,
-            )
+        print(
+            "  [B] begin   [S] stop/save   [Q] quit   [ESC] e-stop   "
+            f"[H] {home_status}",
+            flush=True,
+        )
 
         operator_stop = threading.Event()
         operator_thread = threading.Thread(
@@ -523,8 +507,6 @@ def run_policy_deployment(
             kwargs={
                 "stop_event": operator_stop,
                 "execute": execute,
-                "evaluation": evaluation_config is not None
-                and evaluation_config.mode == "eval",
             },
             name="policy-operator",
             daemon=True,
@@ -532,7 +514,7 @@ def run_policy_deployment(
         operator_thread.start()
 
         heartbeat_names = {"arm", "hand", "inference", "policy"}
-        if evaluation_config is not None:
+        if recording_config is not None:
             heartbeat_names.update({"camera", "pointcloud", "recorder"})
         heartbeat_timeouts = {
             process.name: float(runtime.safety.heartbeat_timeouts[process.name])
@@ -555,7 +537,7 @@ def run_policy_deployment(
         )
         if normal_exit:
             shared.quit_requested.value = True
-        if evaluation_config is not None and not _wait_for_rollout_recording(
+        if recording_config is not None and not _wait_for_rollout_recording(
             shared, started_procs
         ):
             logger.error("rollout recording did not finalize before shutdown")

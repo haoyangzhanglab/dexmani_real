@@ -10,20 +10,19 @@ semantics.  Run with:
 
 from __future__ import annotations
 
-import json
-import tempfile
 import threading
 import types
 import unittest
 from dataclasses import replace
-from pathlib import Path
 from unittest import mock
 
 import numpy as np
 
 import dexmani_real.deployment.executor as executor_mod
-from dexmani_real.deployment.config import validate_policy_runtime_compatibility
-from dexmani_real.deployment.evaluation import EVALUATION_MAX_FRAMES_STOP_REASON
+from dexmani_real.deployment.config import (
+    RolloutRecordingConfig,
+    validate_policy_runtime_compatibility,
+)
 from dexmani_real.deployment.executor import (
     PolicyExecutor,
     _CommandProgress,
@@ -35,7 +34,6 @@ from dexmani_real.deployment.inference.worker import serialize_prediction
 from dexmani_real.deployment.metrics import PolicyStats
 from dexmani_real.deployment.prediction import Prediction
 from dexmani_real.deployment.timing import first_future_step_index
-from dexmani_real.deployment.evaluation import EvaluationOutcome, RolloutRecordingConfig
 from dexmani_real.recording.client import RecorderStopResult
 from dexmani_real.runtime.safety import SafetyState, StopRequest, request_policy_stop
 
@@ -750,7 +748,7 @@ class TestSingleRollout(unittest.TestCase):
 
 
 class TestRecordedRolloutLifecycle(unittest.TestCase):
-    def executor(self, mode="eval"):
+    def executor(self):
         shared = types.SimpleNamespace(motion_lock=threading.RLock())
         for name, value in dict(
             is_running=True,
@@ -764,7 +762,6 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
             run_started_monotonic_ns=0,
             physical_home_completed=True,
             is_recording=False,
-            evaluation_outcome=int(EvaluationOutcome.NONE),
         ).items():
             setattr(shared, name, types.SimpleNamespace(value=value))
         runtime = _fake_runtime()
@@ -784,8 +781,6 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
             "task",
             "me",
             60.0,
-            mode=mode,
-            provenance={"eval_seed": "1"},
         )
         with mock.patch.object(executor_mod, "_build_policy_safety_gate"):
             executor = PolicyExecutor(
@@ -794,7 +789,7 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
                 _fake_policy_spec(),
                 execute=True,
                 max_running_s=60.0,
-                evaluation_config=config,
+                recording_config=config,
             )
         recorder = mock.Mock()
         recorder.stop_pending = False
@@ -849,96 +844,15 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         self.assertFalse(executor.rollout_started)
         self.assertTrue(executor.shared.is_recording.value)
         executor.recorder.stop_episode.assert_called_once_with(
-            save=False, reason="eval:invalid:start_recheck_failed"
+            save=False, reason="start_recheck_failed"
         )
-        with mock.patch.object(executor_mod, "write_rollout_result") as write:
-            executor._complete_recording(executor_mod.RecorderStopResult(done=True))
+        executor._complete_recording(executor_mod.RecorderStopResult(done=True))
         self.assertFalse(executor.shared.is_recording.value)
-        write.assert_not_called()
 
-    def test_rollout_result_keeps_counts_across_live_log_flushes(self):
-        executor = self.executor()
-        self.begin(executor)
-        executor.stats.safety_rejection_count = 3
-        executor.stats.ik_rejection_count = 2
-        executor.stats.flush(prefix="test")
-        executor.stats.safety_rejection_count += 1
-        executor._finish_episode("stop", outcome=EvaluationOutcome.STOPPED)
-        self.assertEqual(
-            executor.rollout_result["metrics"]["safety_rejection_count"], 4
-        )
-        self.assertEqual(executor.rollout_result["metrics"]["ik_rejection_count"], 2)
-
-    def test_prediction_timing_reaches_result_json(self):
-        executor = self.executor("eval")
-        self.begin(executor)
-        now = executor.run_started_ns
-        prediction = Prediction(
-            executor.run_generation, now, now, np.zeros((15, 19)), 12.5, 3.25, 0.125
-        )
-        ring = mock.Mock()
-        executor.shared.prediction_ring = ring
-        for sequence, current in enumerate(
-            (
-                prediction,
-                replace(
-                    prediction,
-                    inference_latency_ms=18.123456789012345,
-                    observation_age_ms=4.125,
-                    observation_skew_ms=0.25,
-                ),
-            ),
-            1,
-        ):
-            ring.read_latest.return_value = (
-                serialize_prediction(current),
-                now,
-                sequence,
-            )
-            self.assertTrue(executor._ingest_latest_prediction(now))
-            for name in (
-                "inference_latency_ms",
-                "observation_age_ms",
-                "observation_skew_ms",
-            ):
-                self.assertEqual(
-                    executor.stats.snapshot()[name], getattr(current, name)
-                )
-        executor.stats.flush(prefix="test")
-        executor._finish_episode(
-            "stop",
-            outcome=EvaluationOutcome.SUCCESS,
-            stop_reason="eval:success:operator",
-        )
-        metrics = dict(executor.rollout_result["metrics"])
-        for name in (
-            "inference_latency_ms",
-            "observation_age_ms",
-            "observation_skew_ms",
-        ):
-            self.assertEqual(metrics[name], getattr(current, name))
-        with tempfile.TemporaryDirectory() as directory:
-            executor._complete_recording(
-                RecorderStopResult(
-                    done=True,
-                    saved=True,
-                    path=directory,
-                )
-            )
-            payload = json.loads((Path(directory) / "result.json").read_text())
-            self.assertEqual(payload["metrics"], metrics)
-
-    def test_timeout_termination_matrix(self):
-        for mode, event, expected in (
-            ("run", "timeout", EvaluationOutcome.STOPPED),
-            ("run", "first_command_timeout", EvaluationOutcome.INVALID),
-            ("run", "command_silence_timeout", EvaluationOutcome.INVALID),
-            ("eval", "timeout", EvaluationOutcome.FAILURE),
-            ("eval", "first_command_timeout", EvaluationOutcome.FAILURE),
-            ("eval", "command_silence_timeout", EvaluationOutcome.FAILURE),
-        ):
-            with self.subTest(mode=mode, event=event):
-                executor = self.executor(mode)
+    def test_timeout_termination_reasons(self):
+        for event in ("timeout", "first_command_timeout", "command_silence_timeout"):
+            with self.subTest(event=event):
+                executor = self.executor()
                 self.begin(executor)
                 start = executor.run_started_ns
                 if event == "timeout":
@@ -952,52 +866,43 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
                     executor, "_observe_worker_progress", return_value=True
                 ):
                     executor._run_active_tick(now)
-                reason = f"{mode}:{expected.name.lower()}:{event}"
-                self.assertEqual(executor.rollout_result["outcome"], expected)
-                self.assertEqual(executor.rollout_result["stop_reason"], reason)
                 executor.recorder.stop_episode.assert_called_once_with(
-                    save=True, reason=reason
+                    save=True, reason=event
                 )
+                self.assertEqual(executor._pending_stop_reason, event)
                 self.assertEqual(executor.shared.safety_state.value, SafetyState.ARMED)
 
-    def test_shared_invalid_paths_follow_mode(self):
-        for mode in ("run", "eval"):
-            for event in ("hardware_fault", "estop", "recorder_fault", "max_frames"):
-                with self.subTest(mode=mode, event=event):
-                    executor = self.executor(mode)
-                    self.begin(executor)
-                    if event == "hardware_fault":
-                        executor._fault("offline fault")
-                    elif event == "estop":
-                        executor.shared.estop_request.value = True
-                        executor._handle_run_boundary()
-                    else:
-                        executor.recorder.stop_pending = True
-                        executor.recorder.poll_stop.return_value = RecorderStopResult(
-                            done=False,
-                            reason=(
-                                f"{mode}:invalid:max_frames"
-                                if event == "max_frames"
-                                else "unexpected"
-                            ),
-                        )
-                        executor._poll_recorder()
-                    self.assertEqual(
-                        executor.rollout_result["outcome"], EvaluationOutcome.INVALID
+    def test_shared_fault_paths_use_technical_reasons(self):
+        for event in ("hardware_fault", "estop", "recorder_fault", "max_frames"):
+            with self.subTest(event=event):
+                executor = self.executor()
+                self.begin(executor)
+                if event == "hardware_fault":
+                    executor._fault("offline fault")
+                elif event == "estop":
+                    executor.shared.estop_request.value = True
+                    executor._handle_run_boundary()
+                else:
+                    executor.recorder.stop_pending = True
+                    executor.recorder.poll_stop.return_value = RecorderStopResult(
+                        done=False,
+                        reason="max_frames" if event == "max_frames" else "unexpected",
                     )
-                    self.assertEqual(
-                        executor.rollout_result["stop_reason"],
-                        f"{mode}:invalid:{event}",
-                    )
-                    expected_state = (
-                        SafetyState.FAULT
-                        if event in {"hardware_fault", "estop"}
-                        else SafetyState.ARMED
-                    )
-                    self.assertEqual(executor.shared.safety_state.value, expected_state)
+                    executor._poll_recorder()
+                self.assertEqual(executor._pending_stop_reason, event)
+                if event in {"hardware_fault", "recorder_fault"}:
+                    self.assertTrue(executor.shared.error_state.value)
+                else:
+                    self.assertFalse(executor.shared.error_state.value)
+                expected_state = (
+                    SafetyState.FAULT
+                    if event in {"hardware_fault", "estop"}
+                    else SafetyState.ARMED
+                )
+                self.assertEqual(executor.shared.safety_state.value, expected_state)
 
     def test_malformed_ipc_timing_is_passive_diagnostic(self):
-        executor = self.executor("run")
+        executor = self.executor()
         self.begin(executor)
         now = executor.run_started_ns
         frame = serialize_prediction(
@@ -1044,9 +949,9 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
             )
         self.assertFalse(executor.shared.error_state.value)
         self.assertIsNone(executor.active_prediction)
-        self.assertEqual(executor.rollout_result["outcome"], EvaluationOutcome.INVALID)
+        self.assertEqual(executor._pending_stop_reason, "recording_failure")
 
-    def test_terminal_error_is_consumed_after_invalid_result_created(self):
+    def test_terminal_storage_error_fails_closed(self):
         executor = self.executor()
         self.begin(executor)
         executor.recorder.poll_stop.return_value = RecorderStopResult(
@@ -1055,43 +960,30 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
             path="/tmp/rollout-test/episode",
             saved=False,
         )
-        with mock.patch.object(executor_mod, "write_rollout_result") as write:
-            executor._poll_recorder()
-        self.assertEqual(write.call_args.kwargs["outcome"], EvaluationOutcome.INVALID)
-        self.assertFalse(write.call_args.kwargs["saved"])
+        executor._poll_recorder()
         self.assertFalse(executor.shared.is_recording.value)
-        self.assertIsNone(executor.rollout_result)
+        self.assertTrue(executor.shared.error_state.value)
+        self.assertIsNone(executor._pending_stop_reason)
 
-    def test_operator_outcomes_save_and_return_armed(self):
-        for mode, outcome in (
-            ("eval", EvaluationOutcome.SUCCESS),
-            ("eval", EvaluationOutcome.FAILURE),
-            ("eval", EvaluationOutcome.INVALID),
-            ("run", EvaluationOutcome.NONE),
-            ("run", EvaluationOutcome.FAILURE),
-        ):
-            with self.subTest(mode=mode, outcome=outcome):
-                executor = self.executor(mode)
-                self.begin(executor)
-                executor.shared.evaluation_outcome.value = int(outcome)
-                request_policy_stop(executor.shared)
-                executor._handle_run_boundary()
-                self.assertEqual(executor.shared.safety_state.value, SafetyState.ARMED)
-                self.assertTrue(executor.shared.is_running.value)
-                self.assertTrue(executor.recorder.stop_episode.call_args.kwargs["save"])
-                expected = EvaluationOutcome.STOPPED if mode == "run" else outcome
-                self.assertEqual(executor.rollout_result["outcome"], expected)
-                self.assertEqual(
-                    executor.rollout_result["stop_reason"],
-                    f"{mode}:{expected.name.lower()}:operator",
-                )
-                self.assertEqual(executor.shared.stop_request.value, StopRequest.NONE)
+    def test_operator_stop_saves_and_returns_armed(self):
+        executor = self.executor()
+        self.begin(executor)
+        request_policy_stop(executor.shared)
+        executor._handle_run_boundary()
+        self.assertEqual(executor.shared.safety_state.value, SafetyState.ARMED)
+        self.assertTrue(executor.shared.is_running.value)
+        self.assertTrue(executor.recorder.stop_episode.call_args.kwargs["save"])
+        self.assertEqual(
+            executor.recorder.stop_episode.call_args.kwargs["reason"], "operator"
+        )
+        self.assertEqual(executor._pending_stop_reason, "operator")
+        self.assertEqual(executor.shared.stop_request.value, StopRequest.NONE)
 
-    def test_timeout_quit_and_estop_labels(self):
-        for event, expected in (
-            ("timeout", EvaluationOutcome.FAILURE),
-            ("quit", EvaluationOutcome.INVALID),
-            ("estop", EvaluationOutcome.INVALID),
+    def test_timeout_quit_and_estop_stop_reasons(self):
+        for event, expected_reason in (
+            ("timeout", "timeout"),
+            ("quit", "quit"),
+            ("estop", "estop"),
         ):
             with self.subTest(event=event):
                 executor = self.executor()
@@ -1109,31 +1001,29 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
                         "quit_requested" if event == "quit" else "estop_request",
                     ).value = True
                     executor._handle_run_boundary()
-                self.assertEqual(executor.rollout_result["outcome"], expected)
+                self.assertEqual(executor._pending_stop_reason, expected_reason)
                 self.assertIsNone(executor.active_prediction)
                 if event == "estop":
                     self.assertEqual(
                         executor.shared.safety_state.value, SafetyState.FAULT
                     )
 
-    def test_result_waits_for_terminal_storage_status(self):
+    def test_terminal_storage_status_is_consumed_once(self):
         executor = self.executor()
         self.begin(executor)
-        executor._finish_episode("failure", outcome=EvaluationOutcome.FAILURE)
+        executor._finish_episode("failure")
         executor.recorder.poll_stop.return_value = RecorderStopResult(done=False)
-        with mock.patch.object(executor_mod, "write_rollout_result") as write:
-            executor._poll_recorder()
-            write.assert_not_called()
-            self.assertTrue(executor.shared.is_recording.value)
-            executor.recorder.poll_stop.return_value = RecorderStopResult(
-                done=True,
-                saved=True,
-                path="/tmp/rollout-test/episode",
-            )
-            executor._poll_recorder()
-        self.assertEqual(write.call_args.kwargs["outcome"], EvaluationOutcome.FAILURE)
-        self.assertTrue(write.call_args.kwargs["saved"])
+        executor._poll_recorder()
+        self.assertTrue(executor.shared.is_recording.value)
+        executor.recorder.poll_stop.return_value = RecorderStopResult(
+            done=True,
+            saved=True,
+            path="/tmp/rollout-test/episode",
+        )
+        executor._poll_recorder()
         self.assertFalse(executor.shared.is_recording.value)
+        self.assertIsNone(executor._pending_stop_reason)
+        self.assertFalse(executor.shared.error_state.value)
 
     def test_target_expiring_during_ik_is_not_published(self):
         executor = self.executor()
@@ -1221,8 +1111,8 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
             )
         self.assertEqual(order, ["publish", "record"])
         self.assertEqual(executor.episode_steps, 1)
-        self.assertEqual(executor.rollout_result["outcome"], EvaluationOutcome.INVALID)
-        self.assertFalse(executor.shared.error_state.value)
+        self.assertEqual(executor._pending_stop_reason, "recording_failure")
+        self.assertTrue(executor.shared.error_state.value)
         self.assertEqual(executor.shared.safety_state.value, SafetyState.ARMED)
 
     def test_ordinary_held_row_needs_no_initial_evidence_transaction(self):
