@@ -180,5 +180,133 @@ class TestSaveOutcome(unittest.TestCase):
             self.assertEqual(payload["eval_seed"], 1)
 
 
+class TestExplicitEpisodeName(unittest.TestCase):
+    """Episode naming contract: timestamp default, explicit exact names.
+
+    Real ``EpisodeRecorder`` transactions on a temporary directory; no
+    devices, no workers.  Explicit names are the policy multi-episode
+    sequence (``episode_001``...); ``None`` must keep teleop naming intact.
+    """
+
+    @staticmethod
+    def _recorder(directory):
+        from dexmani_real.recording.recorder import EpisodeRecorder
+        from dexmani_real.recording.storage.camera_writer import (
+            CameraStreamWriterConfig,
+        )
+
+        return EpisodeRecorder(
+            directory,
+            max_frames=8,
+            min_frames=1,
+            control_hz=16.0,
+            camera_writer_config=CameraStreamWriterConfig(
+                rgb_shape=(16, 16, 3), depth_shape=(16, 16), fps=16.0, queue_size=8
+            ),
+        )
+
+    @staticmethod
+    def _add_one_frame(recorder):
+        from dexmani_real.recording.sample import EpisodeAction, build_episode_state
+
+        state = build_episode_state(None, None, timestamp_s=1.0)
+        action = EpisodeAction(np.zeros(7), np.zeros(12))
+        return recorder.add_frame(
+            state,
+            action,
+            {
+                "wrist_pos": np.full(3, np.nan),
+                "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
+                "landmarks": np.full((21, 3), np.nan),
+            },
+            signals={
+                "frame_status": 1,
+                "action_queued": False,
+                "observation_anchor_monotonic_ns": 1_000_000_000,
+            },
+            arm_qpos_sent=np.zeros(7),
+        )
+
+    def test_none_keeps_timestamp_naming(self):
+        import re
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self._recorder(directory)
+            try:
+                self.assertTrue(recorder.start_episode())
+                name = Path(recorder.episode_path).name
+                self.assertRegex(name, re.compile(r"^episode_\d{8}_\d{6}$"))
+            finally:
+                if recorder.is_recording:
+                    recorder.finish_episode(save=False, reason="test_cleanup")
+
+    def test_explicit_name_publishes_exact_directory(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self._recorder(directory)
+            self.assertTrue(recorder.start_episode(episode_name="episode_001"))
+            self.assertTrue(self._add_one_frame(recorder))
+            published = Path(
+                recorder.finish_episode(save=True, reason="operator")
+            )
+            self.assertEqual(published.name, "episode_001")
+            self.assertEqual(published.parent, Path(directory))
+            for filename in ("data.h5", "depth.h5", "rgb.mp4"):
+                self.assertTrue((published / filename).is_file())
+
+    def test_duplicate_explicit_name_fails_loudly_without_clobber(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self._recorder(directory)
+            self.assertTrue(recorder.start_episode(episode_name="episode_001"))
+            self.assertTrue(self._add_one_frame(recorder))
+            recorder.finish_episode(save=True, reason="operator")
+            before = sorted(p.name for p in Path(directory).iterdir())
+            with self.assertRaises(FileExistsError):
+                recorder.start_episode(episode_name="episode_001")
+            # A stale temporary directory blocks the name as well.
+            (Path(directory) / ".tmp_episode_002").mkdir()
+            with self.assertRaises(FileExistsError):
+                recorder.start_episode(episode_name="episode_002")
+            self.assertEqual(
+                sorted(p.name for p in Path(directory).iterdir()),
+                sorted(before + [".tmp_episode_002"]),
+            )
+
+    def test_invalid_explicit_names_rejected(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self._recorder(directory)
+            for name in ("../evil", "", "a/b", "a\\b", ".hidden", ".", ".."):
+                with self.subTest(name=name):
+                    with self.assertRaises(ValueError):
+                        recorder.start_episode(episode_name=name)
+
+    def test_second_episode_after_finalize_uses_next_name(self):
+        import tempfile
+        from pathlib import Path
+
+        from dexmani_real.recording.storage.reader import EpisodeReader
+
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = self._recorder(directory)
+            for index in (1, 2):
+                name = f"episode_{index:03d}"
+                self.assertTrue(recorder.start_episode(episode_name=name))
+                self.assertTrue(self._add_one_frame(recorder))
+                published = Path(recorder.finish_episode(save=True, reason="operator"))
+                self.assertEqual(published.name, name)
+                with EpisodeReader(published) as reader:
+                    self.assertEqual(reader.schema_version, 28)
+                    self.assertEqual(reader.h5f["meta"].attrs["stop_reason"], "operator")
+
+
 if __name__ == "__main__":
     unittest.main()

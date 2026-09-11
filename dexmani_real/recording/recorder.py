@@ -89,6 +89,22 @@ class EpisodeFinalizationError(RuntimeError):
     """An episode transaction failed; callers must also check resource release."""
 
 
+def _validate_explicit_episode_name(episode_name: str) -> None:
+    """Require a plain directory name that stays inside the recorder data dir."""
+    if (
+        type(episode_name) is not str
+        or not episode_name
+        or episode_name in {".", ".."}
+        or "/" in episode_name
+        or "\\" in episode_name
+        or episode_name.startswith(".")
+    ):
+        raise ValueError(
+            "episode_name must be a plain non-empty directory name without "
+            f"path separators: {episode_name!r}"
+        )
+
+
 class EpisodeRecorder:
     """Coordinate one transactional episode around a dedicated data writer.
 
@@ -175,22 +191,41 @@ class EpisodeRecorder:
         camera_serial: str | None = None,
         depth_scale: float | None = None,
         provenance: Mapping[str, object] | None = None,
+        episode_name: str | None = None,
     ) -> bool:
+        """Open one episode transaction.
+
+        ``episode_name=None`` keeps the historical timestamp naming with a
+        same-second dedup suffix.  An explicit name selects the exact published
+        directory; an existing final or temporary directory with that name is
+        refused loudly (raised) instead of overwritten or silently renamed, so
+        a caller-supplied sequence like ``episode_001`` stays trustworthy.
+        """
         normalized_provenance = normalize_provenance_metadata(provenance)
+        if episode_name is not None:
+            _validate_explicit_episode_name(episode_name)
         if self._finishing or not self.resources_released:
             return False
         if self._recording:
             return False
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        ep_dir = self.data_dir / f"episode_{stamp}"
-        tmp_dir = self.data_dir / f".tmp_episode_{stamp}"
-        dedup = 1
-        while ep_dir.exists() or tmp_dir.exists():  # same-second collision → suffix
-            ep_dir = self.data_dir / f"episode_{stamp}_{dedup}"
-            tmp_dir = self.data_dir / f".tmp_episode_{stamp}_{dedup}"
-            dedup += 1
+        if episode_name is None:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            ep_dir = self.data_dir / f"episode_{stamp}"
+            tmp_dir = self.data_dir / f".tmp_episode_{stamp}"
+            dedup = 1
+            while ep_dir.exists() or tmp_dir.exists():  # same-second collision → suffix
+                ep_dir = self.data_dir / f"episode_{stamp}_{dedup}"
+                tmp_dir = self.data_dir / f".tmp_episode_{stamp}_{dedup}"
+                dedup += 1
+        else:
+            ep_dir = self.data_dir / episode_name
+            tmp_dir = self.data_dir / f".tmp_{episode_name}"
+            if ep_dir.exists() or tmp_dir.exists():
+                raise FileExistsError(
+                    f"explicit episode name already exists: {ep_dir}"
+                )
 
         self._episode_dir = str(ep_dir)
         self._temp_dir = str(tmp_dir)

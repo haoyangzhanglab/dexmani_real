@@ -152,3 +152,35 @@ def test_control_queue_full_aborts_without_blocking_or_restarting():
     assert not recorder.start_episode()
     assert recorder.shared.error_state.value
     assert not recorder.start_episode()
+
+
+def test_start_episode_wires_explicit_episode_name():
+    recorder = client()
+    recorder.shared.record_result_q.put(
+        RecordingStarted("episode_001", 2, "max_frames")
+    )
+    assert recorder.start_episode(
+        task_label="task", operator="op", episode_name="episode_001"
+    )
+    assert recorder.shared.record_control_q.get_nowait() == StartRecording(
+        "task", "op", 1, "episode_001"
+    )
+
+
+def test_default_start_recording_keeps_three_positional_equality():
+    assert StartRecording("task", "op", 1) == StartRecording("task", "op", 1, None)
+
+
+def test_start_refusal_exposes_last_error():
+    recorder = client()
+    recorder.shared.record_result_q.put(
+        RecordingFinished(
+            False,
+            None,
+            0,
+            "start_error",
+            error="explicit episode name already exists: /x/episode_001",
+        )
+    )
+    assert not recorder.start_episode(episode_name="episode_001")
+    assert "already exists" in recorder.last_error

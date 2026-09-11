@@ -24,6 +24,7 @@ class StartRecording:
     task: str
     operator: str
     start_sequence: int
+    episode_name: str | None = None
 
 
 @dataclass
@@ -94,6 +95,11 @@ class RecorderClient:
     def camera_writer_error(self) -> str | None:
         return self._last_stop_result.error if self._last_stop_result else None
 
+    @property
+    def last_error(self) -> str | None:
+        """Terminal error text of the most recent recording result, if any."""
+        return self._last_stop_result.error if self._last_stop_result else None
+
     def _fail_transport(self, error: str) -> None:
         logger.error("RecorderIO unavailable: %s", error)
         self._unavailable = True
@@ -115,7 +121,18 @@ class RecorderClient:
             self._fail_transport(f"control queue failed: {exc}")
             return False
 
-    def start_episode(self, *, task_label: str = "", operator: str = "") -> bool:
+    def start_episode(
+        self,
+        *,
+        task_label: str = "",
+        operator: str = "",
+        episode_name: str | None = None,
+    ) -> bool:
+        """Request one recording; ``episode_name=None`` keeps timestamp naming.
+
+        An explicit ``episode_name`` selects the exact published directory and
+        is refused loudly by the recorder when it already exists.
+        """
         if (
             self._recording
             or self._stop_requested
@@ -130,6 +147,7 @@ class RecorderClient:
             task_label,
             operator,
             int(self.shared.record_sample_ring.latest_sequence) + 1,
+            episode_name,
         )
         if not self._send_control(start):
             return False

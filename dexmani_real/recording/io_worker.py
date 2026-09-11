@@ -115,6 +115,7 @@ def _build_start_metadata(
     *,
     task_label: str,
     operator: str,
+    episode_name: str | None,
     calibration: CameraExtrinsics,
     provenance: Mapping[str, str],
 ) -> dict[str, Any]:
@@ -143,6 +144,7 @@ def _build_start_metadata(
     return {
         "task_label": task_label,
         "operator": operator,
+        "episode_name": episode_name,
         "calib": calibration,
         "camera_geometry": camera_geometry,
         "camera_name": camera_name,
@@ -217,6 +219,7 @@ class _RecorderIOSession:
                 self.shared,
                 task_label=control.task,
                 operator=control.operator,
+                episode_name=control.episode_name,
                 calibration=self.config.camera_calibration,
                 provenance=self.config.provenance,
             )

@@ -251,9 +251,11 @@ def test_camera_calibration_survives_minimal_shared_metadata(tmp_path):
         shared,
         task_label="fixture",
         operator="offline",
+        episode_name=None,
         calibration=calibration,
         provenance={"eval_seed": "1"},
     )
+    assert metadata["episode_name"] is None
     recorder = _recorder(tmp_path)
     assert recorder.start_episode(**metadata)
     assert recorder.add_episode_frame(_frame(1))

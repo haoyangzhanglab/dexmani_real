@@ -21,6 +21,7 @@ from dexmani_real.recording.client import (
 from dexmani_real.recording.io_worker import (
     RecorderIOConfig,
     _RecorderIOSession,
+    _build_start_metadata,
     _create_episode_recorder,
     recorder_io_loop,
 )
@@ -732,3 +733,52 @@ def test_client_shm_recorder_disk_roundtrip_at_capacity(tmp_path):
         assert session.shutdown()
         ring.close()
         ring.unlink()
+
+def test_build_start_metadata_forwards_episode_name():
+    shared = SimpleNamespace(
+        camera_depth_scale=SimpleNamespace(value=0.0),
+        camera_serial=SimpleNamespace(value=b""),
+        camera_geometry=SimpleNamespace(value=b""),
+    )
+    with mock.patch(
+        "dexmani_real.recording.io_worker._camera_geometry_from_shared",
+        return_value=None,
+    ):
+        explicit = _build_start_metadata(
+            shared,
+            task_label="task",
+            operator="op",
+            episode_name="episode_003",
+            calibration=None,
+            provenance={},
+        )
+        default = _build_start_metadata(
+            shared,
+            task_label="task",
+            operator="op",
+            episode_name=None,
+            calibration=None,
+            provenance={},
+        )
+    assert explicit["episode_name"] == "episode_003"
+    assert default["episode_name"] is None
+
+
+def test_handle_start_forwards_episode_name(session):
+    captured = {}
+
+    def fake_metadata(shared, **kwargs):
+        captured.update(kwargs)
+        return {}
+
+    with mock.patch(
+        "dexmani_real.recording.io_worker._build_start_metadata",
+        side_effect=fake_metadata,
+    ):
+        session.shared.record_control_q.put(
+            StartRecording("task", "operator", 1, "episode_007")
+        )
+        _step(session)
+    result = session.shared.record_result_q.get_nowait()
+    assert isinstance(result, RecordingStarted)
+    assert captured["episode_name"] == "episode_007"

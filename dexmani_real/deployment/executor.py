@@ -1048,7 +1048,10 @@ class PolicyExecutor:
                     self.shared.evaluation_outcome.value = int(
                         EvaluationOutcome.INVALID
                     )
-                logger.warning("executor: RecorderIO did not acknowledge eval START")
+                logger.warning(
+                    "executor: RecorderIO did not acknowledge eval START: %s",
+                    self.recorder.last_error or "unknown error",
+                )
                 return
             self.shared.is_recording.value = True
             rejection = _physical_start_pose_rejection(
