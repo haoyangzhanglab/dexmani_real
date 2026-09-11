@@ -167,6 +167,20 @@ def test_eef_pose_persisted_from_canonical_fk(tmp_path):
         assert rot6d.shape == (6,)
 
 
+def test_eef_pose_invalid_rot6d_fails_validation(tmp_path):
+    episode = write_control_episode(tmp_path / "raw")
+    output = tmp_path / "processed"
+    process_episode_root(episode, output, permissive_test_config())
+    artifact = output / f"{episode.name}.h5"
+    with h5py.File(artifact, "r+") as processed:
+        # Finite and non-degenerate, but not canonical: scaled orthogonal basis
+        # columns must be rejected by the rot6d validator, not the finiteness
+        # gate.
+        processed["eef_pose"][:, 3:9] = [2.0, 0.0, 0.0, 0.0, 2.0, 0.0]
+    with pytest.raises(ValueError, match="eef_pose rot6d"):
+        validate_processed_hdf5(artifact)
+
+
 def test_contact_and_dense_validity_are_independent(tmp_path):
     episode = write_control_episode(tmp_path / "raw")
     with h5py.File(episode / "data.h5", "r+") as raw:

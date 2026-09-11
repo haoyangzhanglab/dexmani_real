@@ -238,6 +238,10 @@ def validate_processed_payload(
                 validate_canonical_rot6d(
                     block[:, 3:9], label=f"{label}: action_ee rot6d"
                 )
+            if key == "eef_pose":
+                validate_canonical_rot6d(
+                    block[:, 3:9], label=f"{label}: eef_pose rot6d"
+                )
             if key == "point_cloud":
                 if np.any(block[..., 3:] < 0.0) or np.any(block[..., 3:] > 1.0):
                     raise ValueError(f"{label}: point-cloud RGB outside [0,1]")

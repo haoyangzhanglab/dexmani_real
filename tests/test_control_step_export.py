@@ -57,6 +57,39 @@ def test_d8_two_files_are_two_complete_zarr_episodes(tmp_path, monkeypatch):
         np.testing.assert_array_equal(store["data"][key][:], np.concatenate(expected))
 
 
+def test_eef_pose_attrs_propagate_verbatim_to_zarr(tmp_path):
+    from dexmani_real.planning.kinematics.arm_fk import (
+        EEF_POSE_ALGORITHM_ID,
+        EEF_POSE_COMPONENTS,
+        EEF_POSE_DERIVATION,
+        EEF_POSE_FRAME,
+    )
+
+    processed = processed_pair(tmp_path)
+    target = tmp_path / "fixture.zarr"
+    exporter.export_processed_hdf5_to_zarr(processed, target)
+    store = zarr.open_group(str(target), mode="r")
+    assert store.attrs["eef_pose_frame"] == EEF_POSE_FRAME
+    assert store.attrs["eef_pose_components"] == EEF_POSE_COMPONENTS
+    assert store.attrs["eef_pose_derivation"] == EEF_POSE_DERIVATION
+    assert store.attrs["eef_pose_algorithm_id"] == EEF_POSE_ALGORITHM_ID
+
+
+def test_real_zarr_eef_contract_accepted_by_policy(tmp_path):
+    from dexmani_policy.deployment.export import _validate_eef_pose
+
+    processed = processed_pair(tmp_path)
+    target = tmp_path / "fixture.zarr"
+    exporter.export_processed_hdf5_to_zarr(processed, target)
+    store = zarr.open_group(str(target), mode="r")
+    contract = _validate_eef_pose(dict(store.attrs))
+    assert contract["frame"] == "xarm_base"
+    assert contract["derivation"] == "canonical_arm_fk_from_aligned_qpos"
+    assert contract["algorithm_id"] == "xarm7_custom_eef_pinocchio_fk_v1"
+    assert contract["position_units"] == "m"
+    assert contract["rotation_representation"] == "rot6d"
+
+
 @pytest.mark.parametrize(
     "mismatch", ["task_name", "dt", "source_frames", "dtype", "action_nan"]
 )
