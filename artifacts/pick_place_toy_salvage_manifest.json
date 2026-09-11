@@ -33,7 +33,7 @@
   "validity": {
     "contact_force_invalid_rows": 1,
     "tactile_force_invalid_rows": 1,
-    "semantics": "legacy v26 conservative proxy: contact_force_valid requires tactile_sum_fresh and tactile_force_valid additionally requires tactile_fresh; aggregate counts are evidence only and never affect episode admission"
+    "semantics": "legacy v26 conservative proxy: contact_force_valid requires tactile_sum_fresh, tactile_calibrated and native tactile_unit_code, and tactile_force_valid additionally requires tactile_fresh; aggregate counts are evidence only and never affect episode admission"
   },
   "verification": {
     "processed_core_arrays_equal_normalized_raw": true,
@@ -41,6 +41,13 @@
     "accepted_episode_lost_rows": false,
     "timing_only_rejection": false,
     "original_raw_inventory_reverified_after_rebuild": true
+  },
+  "contact_validity_calibration_unit_audit": {
+    "rows_checked": 14112,
+    "existing_valid_contact_rows_invalid_under_new_rule": 0,
+    "rebuild_required": false,
+    "original_raw_inventory_reverified_after_audit": true,
+    "normalized_raw_inventory_reverified_after_audit": true
   },
   "notes": [
     "Supersedes the v17/v10 manifest recorded at baseline 6d9655fdc2f774f0f5eb0613cea0cbcca8816eb6; the pre-repair v18/v11 builds were kept aside as salvage_v18_pre_repair / salvage_v11_pre_repair.",

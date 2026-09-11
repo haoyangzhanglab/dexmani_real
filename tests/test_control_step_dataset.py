@@ -144,7 +144,9 @@ def test_d1_to_d5_all_rows_and_same_row_contact(tmp_path, event):
 def test_contact_and_dense_validity_are_independent(tmp_path):
     episode = write_control_episode(tmp_path / "raw")
     with h5py.File(episode / "data.h5", "r+") as raw:
-        # Dense tactile invalid at row 5; the aggregate contact stays valid.
+        # Dense tactile fully failed at row 5 (stale flag, NaN payload, zero
+        # source); the usable aggregate contact must stay valid anyway.
+        raw["tactile_fresh"][5] = False
         raw["hand_tactile_force"][5] = np.nan
         raw["tactile_source_monotonic_ns"][5] = 0
     output = tmp_path / "processed"
@@ -152,6 +154,59 @@ def test_contact_and_dense_validity_are_independent(tmp_path):
     with h5py.File(output / f"{episode.name}.h5", "r") as data:
         assert bool(data["contact_force_valid"][5]) is True
         assert bool(data["tactile_force_valid"][5]) is False
+
+
+def test_calibrated_native_unit_contact_is_valid(tmp_path):
+    """Canonical row: finite payload, positive contact source, successful
+    software calibration, and native unit identity is valid."""
+    episode = write_control_episode(tmp_path / "raw")
+    output = tmp_path / "processed"
+    process_episode_root(episode, output, permissive_test_config())
+    with h5py.File(output / f"{episode.name}.h5", "r") as data:
+        assert bool(np.all(data["tactile_calibrated"][:]))
+        assert np.all(data["tactile_unit_code"][:] == 0)
+        assert bool(np.all(data["contact_force_valid"][:]))
+
+
+def test_zero_contact_is_not_intrinsically_invalid(tmp_path):
+    """Zero can be a real no-contact reading; only provenance and
+    representation flags decide, never payload magnitude."""
+    episode = write_control_episode(tmp_path / "raw")
+    with h5py.File(episode / "data.h5", "r+") as raw:
+        raw["hand_contact"][:] = 0.0
+    output = tmp_path / "processed"
+    process_episode_root(episode, output, permissive_test_config())
+    with h5py.File(output / f"{episode.name}.h5", "r") as data:
+        assert bool(np.all(data["contact_force_valid"][:]))
+        assert np.all(data["contact_force"][:] == 0.0)
+
+
+def test_uncalibrated_contact_is_invalid_but_payload_preserved(tmp_path):
+    """SDK payload validity is not software calibration state: a finite,
+    well-sourced row recorded while calibration had failed cannot satisfy the
+    declared bias-corrected representation, but its payload stays archived
+    unchanged."""
+    episode = write_control_episode(tmp_path / "raw")
+    with h5py.File(episode / "data.h5", "r+") as raw:
+        raw["tactile_calibrated"][11] = False
+        expected_contact = raw["hand_contact"][11].astype(np.float32)
+    output = tmp_path / "processed"
+    process_episode_root(episode, output, permissive_test_config())
+    with h5py.File(output / f"{episode.name}.h5", "r") as data:
+        assert bool(data["contact_force_valid"][11]) is False
+        assert bool(data["contact_force_valid"][10]) is True
+        np.testing.assert_array_equal(data["contact_force"][11], expected_contact)
+
+
+def test_wrong_unit_contact_is_invalid(tmp_path):
+    episode = write_control_episode(tmp_path / "raw")
+    with h5py.File(episode / "data.h5", "r+") as raw:
+        raw["tactile_unit_code"][13] = 1
+    output = tmp_path / "processed"
+    process_episode_root(episode, output, permissive_test_config())
+    with h5py.File(output / f"{episode.name}.h5", "r") as data:
+        assert bool(data["contact_force_valid"][13]) is False
+        assert bool(data["contact_force_valid"][12]) is True
 
 
 def test_d6_persistent_ik_rejects_whole_episode(tmp_path):

@@ -117,7 +117,8 @@ v24-derived 数据必须先证明 lineage，再显式选择 scale，不能靠数
 
 仅离线 processing 有一个窄的 normalized-v26 读取路径；其 aggregate 来源仍是原来的
 hand_source，同一 raw row 原样映射。v26 的 validity 使用保守规则：contact 需要
-`tactile_sum_fresh`（转换器复制的旧 collapsed flag proxy），dense 额外需要
+`tactile_sum_fresh`（转换器复制的旧 collapsed flag proxy）∧ `tactile_calibrated` ∧
+unit native，dense 额外需要
 `tactile_fresh`；见 §2 的 validity 语义分级。当前 runtime reader、raw viewer 与
 physical replay 没有历史版本兼容路径。实际 pick_place_toy lineage、不可恢复的信息
 限制及验证结果见 [incident evidence](invalid_frames_export_incident.md) 和
@@ -134,7 +135,7 @@ physical replay 没有历史版本兼容路径。实际 pick_place_toy lineage�
 | action | (N,19) | float32 | action_arm_joint_sent + action_hand_joint |
 | action_ee | (N,21) | float32 | action_arm_ee + action_hand_joint |
 | contact_force | (N,5,3) | float32 | hand_contact |
-| contact_force_valid | (N,) | bool | 同行 aggregate 可用（finite ∧ source>0；v26 为 finite ∧ tactile_sum_fresh） |
+| contact_force_valid | (N,) | bool | 同行 aggregate 可用（finite ∧ source>0 ∧ tactile_calibrated ∧ unit native；v26 为 finite ∧ tactile_sum_fresh ∧ tactile_calibrated ∧ unit native） |
 | contact_force_fresh | (N,) | bool | 同行 tactile_sum_fresh（aggregate 年龄 telemetry，v28 不参与 validity） |
 | tactile_force | (N,5,120,3) | float32 | hand_tactile_force |
 | tactile_force_valid | (N,) | bool | finite ∧ calibrated ∧ unit native ∧ source>0（v26 额外 ∧ tactile_fresh） |
@@ -158,12 +159,15 @@ physical replay 没有历史版本兼容路径。实际 pick_place_toy lineage�
 `contact_force_fresh` / `tactile_force_fresh` / `tactile_calibrated` / `tactile_unit_code`
 是原样复制的 raw provenance telemetry：mask 为 False 后仍能区分 stale、uncalibrated、
 wrong/unknown unit 与 payload 缺失，不构成 quality framework，也不参与 episode 准入。
+`tactile_calibrated` 描述共享的 XHand software bias calibration 状态，同时作用于
+aggregate calc_force 与 dense raw_force；它不蕴含 dense raw_force 的 freshness，
+aggregate 与 dense 的可用性保持相互独立。
 Validity 语义分级：current v28 = 直接 producer evidence（独立 contact source、
-calibrated/native-unit dense）；legacy v26 = 保守 best-available proxy
+calibrated/native-unit aggregate 与 dense）；legacy v26 = 保守 best-available proxy
 （`tactile_sum_fresh` 是冻结转换器从旧 collapsed flag 复制的代理，finite payload
 本身不证明有效测量——旧驱动可能复制零占位；允许 false negative，不允许把
 unknown/placeholder 宣称为 valid）。zero payload 不天然 invalid，mask 只来自
-provenance flags，不来自数值大小。
+provenance/representation flags，不来自数值大小。
 processed 不保存 `eef_pose` 或 `/provenance`。FK implementation 保留，fingertip 复用每步
 Arm FK；`action_ee` 是无法从 IK 后 joint target 无损恢复的控制意图，必须保留。
 
@@ -188,6 +192,8 @@ unverified（词汇单一 owner 在 `robot/model.py`）、fingertip frame/unit/d
 policy identity 与仅承载部署几何合同的 `fingertip_config_json`（fingertip_link_names +
 handbase position/quaternion 数值，不存 URDF 路径或文件 hash；FK implementation/model
 identity 由 `fingertip_points_policy_id` 承担），以及 action_ee frame/components。
+`*_representation` metadata 描述对应 `*_valid=True` 的行；invalid 行仍是 archival
+payload，不得按 calibrated physical observation 解释。
 native RGB-D 保留 depth scale/invalid value、intrinsic/extrinsic semantics 和必要相机几何；
 点云保留 frame/color/sampling/transform/policy identity、shape、桌面平面，以及仅用于重现
 点云与部署 exact-compare 的 `processing_config_json`。这两个 canonical JSON attr 与

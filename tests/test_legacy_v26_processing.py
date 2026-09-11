@@ -5,8 +5,9 @@ The frozen v25->v26 converter copied the collapsed legacy freshness flag into
 aggregate contact source.  A finite legacy payload alone therefore never proves
 a valid measurement (old drivers could copy zero placeholders), while a zero
 payload is not intrinsically invalid either: the mask comes from provenance
-flags only.  These tests pin the v26 write-path rules, the exact-copied
-telemetry arrays, and that current v28 freshness flags stay pure telemetry.
+and representation flags only, never from payload values.  These tests pin
+the v26 write-path rules, the exact-copied telemetry arrays, and that
+current v28 freshness flags stay pure telemetry.
 
 Run with:
 
@@ -89,6 +90,30 @@ def test_v26_dense_stale_fresh_is_invalid_while_contact_stays_valid(tmp_path):
         assert bool(processed["tactile_force_valid"][8]) is True
         # Aggregate validity is independent of dense freshness.
         assert bool(processed["contact_force_valid"][9]) is True
+
+
+def test_v26_uncalibrated_contact_is_invalid(tmp_path):
+    """Freshness alone never proves the bias-corrected representation: a
+    legacy row recorded while software calibration had failed is invalid even
+    with its conservative freshness proxy set."""
+    episode = _write_legacy_v26_episode(tmp_path / "raw")
+    with h5py.File(episode / "data.h5", "r+") as raw:
+        raw["tactile_calibrated"][6] = False
+    artifact = _process(tmp_path, episode)
+    with h5py.File(artifact, "r") as processed:
+        assert bool(processed["contact_force_valid"][6]) is False
+        assert bool(processed["contact_force_valid"][5]) is True
+        assert np.all(np.isfinite(processed["contact_force"][6]))
+
+
+def test_v26_wrong_unit_contact_is_invalid(tmp_path):
+    episode = _write_legacy_v26_episode(tmp_path / "raw")
+    with h5py.File(episode / "data.h5", "r+") as raw:
+        raw["tactile_unit_code"][8] = 1
+    artifact = _process(tmp_path, episode)
+    with h5py.File(artifact, "r") as processed:
+        assert bool(processed["contact_force_valid"][8]) is False
+        assert bool(processed["contact_force_valid"][7]) is True
 
 
 def test_v26_telemetry_arrays_are_exact_copies(tmp_path):

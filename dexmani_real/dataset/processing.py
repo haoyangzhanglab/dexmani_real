@@ -514,15 +514,28 @@ def _write_processed_episode(
         output["tactile_force_fresh"][:] = tactile_fresh
         output["tactile_calibrated"][:] = tactile_calibrated
         output["tactile_unit_code"][:] = tactile_unit_code
-        # Aggregate contact with an explicit per-row validity mask.
+        # Aggregate contact with an explicit per-row validity mask.  Valid
+        # means usable under the declared bias-corrected SDK-native calc_force
+        # representation: finite payload, valid source/provenance, successful
+        # software calibration, and native unit identity.  The calibration is
+        # shared with dense raw_force, but dense availability (tactile_fresh)
+        # is independent and must never gate aggregate validity.
         hand_contact = np.asarray(reader.h5f["hand_contact"][:], dtype=np.float32)
         contact_finite = np.all(np.isfinite(hand_contact), axis=(1, 2))
+        contact_representation_valid = tactile_calibrated & (
+            tactile_unit_code == TACTILE_UNIT_CODE_XHAND_SDK_NATIVE
+        )
         if reader.schema_version != 26:
-            contact_valid = contact_finite & (
-                np.asarray(
-                    reader.h5f["hand_contact_source_monotonic_ns"][:], dtype=np.uint64
+            contact_valid = (
+                contact_finite
+                & (
+                    np.asarray(
+                        reader.h5f["hand_contact_source_monotonic_ns"][:],
+                        dtype=np.uint64,
+                    )
+                    > 0
                 )
-                > 0
+                & contact_representation_valid
             )
         else:
             # Legacy v26 kept aggregate contact with its hand row and has no
@@ -531,7 +544,9 @@ def _write_processed_episode(
             # flag.  A finite payload alone never proves a valid measurement
             # (v25 drivers could copy zero placeholders), so require the best
             # available provenance; false negatives are acceptable here.
-            contact_valid = contact_finite & tactile_sum_fresh
+            contact_valid = (
+                contact_finite & tactile_sum_fresh & contact_representation_valid
+            )
         output["contact_force"][:] = hand_contact
         output["contact_force_valid"][:] = contact_valid
         # Dense tactile with an explicit per-row validity mask.
