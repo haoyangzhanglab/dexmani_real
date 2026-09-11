@@ -84,7 +84,7 @@ causal observation history
   `float64[chunk_size, D]`，序列化和 SHM 读取建立传输副本，
   `run_generation`、source timestamp 和 logical-step timestamp 随对象传播。
   三个 timing（inference latency、observation age/skew，单位 ms；无效诊断值忽略）
-  随 exact chunk 经 IPC 进入 executor-owned `PolicyStats` 和 `result.json.metrics`，
+  随 exact chunk 经 IPC 进入 executor-owned `PolicyStats`（live 日志），
   表示当前 generation 最新收到的样本（含全过期 chunk），不是 full-episode percentile。
 - Real 只校验 Policy 公开契约字段（observation fields/shape/dtype/相应 semantics、`requires_hand`、
   `chunk_size`、`n_action_steps`、`action_key`、`control_action_dim`、`control_dt_s`），不解析
@@ -108,8 +108,8 @@ causal observation history
   超 joint limit 或 per-joint jump 阈值直接拒绝，绝不 clip。observation freshness 在 inference
   边界检查，action 有效性由 logical target timestamp 的 stale 过滤决定，command 有效性由
   `action_validity_s` + worker guards 决定。
-- B 只在 ARMED、尚未开始过 rollout、physical home（物理运行）完成后进入 RUNNING；唯一周期执行路径
-  不追赶过期 deadline，也不制造超过 `control_hz` 的 command burst。
+- B 只在 ARMED、physical home（物理运行）完成后进入 RUNNING；每个 episode 都必须重新 H 才能 B。
+  唯一周期执行路径不追赶过期 deadline，也不制造超过 `control_hz` 的 command burst。
 - `tests/test_policy_rollout.py` 用离线 fake 覆盖 Policy 公开契约兼容、timestamp 调度
   （stale-prefix/whole-stale/no-catch-up）、IK/SAFETY 归属、reject-only arm 与
   publish-then-record rollout 合同，不启动 worker 或硬件。
@@ -125,33 +125,32 @@ B + completed H
     → RUNNING generation
     → existing PolicyExecutor schedule / coupled publication
     → ordinary raw sample after publish/reject, or held control tick
-    → SUCCESS | FAILURE | INVALID | STOPPED
+    → operator S / timeout / watchdog / quit / estop / fault
     → motion fence
-    → RecorderIO STOP(save=outcome-dependent) → asynchronous finalize
-    → rollouts/<policy>/<task>/<experiment>/<run|eval>/seed_NNN/episode_...
-    → result.json
+    → RecorderIO STOP → asynchronous finalize → saved=True → completed_episodes++
+    → rollouts/<policy>/<task>/<experiment>/session_<ts>/episode_NNN/
+    → (N/N) quit_requested → clean shutdown
 ```
 
-- `deployment/evaluation.py` 携带 run/eval 的输出路径、task/operator、wall-clock timeout、provenance
-  和独立 task outcome，并写入 result.json；它不是第二个 lifecycle 或 recorder。
-- executor 的时限映射区分 run STOPPED（时长上限）/INVALID（命令 watchdog）与 eval FAILURE；
-  stop_reason 使用当前 mode 前缀，共用 INVALID 故障路径保持原有 motion fence 和录制语义。
-- run/eval 强制启动 camera 与 RecorderIO，即使 policy 是 state-only；camera 仍只在 `PolicySpec`
-  请求 RGB/pointcloud 时进入 inference observation。`RuntimeChannels.evaluation_outcome` 仅传递
-  `NONE/SUCCESS/FAILURE/INVALID/STOPPED`，operator 在同一 `motion_lock` 内先写 outcome 再请求 stop。
+- `deployment/config.py` 携带会话输出目录、task/operator、wall-clock timeout 与 episode 数的 narrow
+  `RolloutRecordingConfig`（`deployment/evaluation.py` 已删除）；不写 result.json，也不判断 task success。
+- executor 的时限与 watchdog 映射为 technical stop reason（`timeout` / `first_command_timeout` /
+  `command_silence_timeout`）；`S`→`operator`、`Q`→`quit`、estop/hardware 故障为对应硬件原因，
+  recorder/storage 失败为 `recording_failure` / `recorder_fault`，均 fail closed。
+- 强制启动 camera 与 RecorderIO，即使 policy 是 state-only；camera 仍只在 `PolicySpec`
+  请求 RGB/pointcloud 时进入 inference observation。`RuntimeChannels.evaluation_outcome` 已删除。
 - START/RECORDING ACK 是唯一启动录制屏障。首条普通控制网格 sample 开始 raw evidence；没有 initial
-  sample gate、evaluation observation builder 或 pending termination。recording failure 立即 INVALID
-  并撤销 generation，不等待 command acceptance，也不单独触发全局 FAULT。
-- 正常 outcome 调用 `stop_episode(save=True)`，storage commit 与 task success 分离。
-  motion 已撤销后，普通 Recorder STOP/finalization 和 result.json 写入有界完成。
-  `_CommandProgress` 继续承担 worker/SDK progress watchdog；SDK final fence 和 supervisor 保留。
-  每次 invocation 最多一个 rollout，结束后 H/Q 可用，第二次 B 拒绝。
-- `tests/test_policy_rollout.py` 用 fake/shared-memory boundary 覆盖 Policy 公开契约、timestamp 调度、
-  IK/SAFETY 归属、reject-only arm 与 publish-then-record run/eval 语义（含 mode-specific
-  max_frames→INVALID
-  与 recording-invalid 不触发全局 FAULT）；不启动任何 worker 或设备。
-- `tests/test_recorder_io_boundary.py` 覆盖 Recorder STOP save/outcome 边界，并用临时目录与合成
-  held sample 实际写入、验证 raw-v26 HDF5/depth/video 和 FAILURE result.json；不连接设备。
+  sample gate 或第二套 evidence 事务。recording failure 立即 fail closed 并撤销 generation，
+  不等待 command acceptance。
+- 停止调用 `stop_episode(save=...)`；`saved=True` 且无 error 是唯一计数证据（recorder client 的
+  capacity 自停同样被计入，因为 RecorderIO 不会把 discard 升级为 save）。一个 session 跑 N 个
+  episode，每个 episode 都需要 fresh H；第 N 个 publish 后自动 quit_requested，supervisor 走
+  clean shutdown。`_CommandProgress` 继续承担 worker/SDK progress watchdog。
+- `tests/test_policy_rollout.py` 用 fake/shared-memory boundary 覆盖 Policy 公开契约、timestamp
+  调度、IK/SAFETY 归属、reject-only arm、多 episode 计数/超时/quit/estop 的 technical reason 与
+  recording fail-closed；不启动任何 worker 或设备。
+- `tests/test_recorder_io_boundary.py` 覆盖 RecorderIO capacity/stop reason 边界、显式 episode
+  命名与真实 raw-v28 事务（临时目录写入 data.h5/depth.h5/rgb.mp4）；不连接设备。
 
 ## Teleop flow
 
@@ -208,9 +207,10 @@ VR / keyboard input
   episode transaction、sidecar、sequence continuity、validation 和 atomic finalize，不决定
   机器人动作。
 - recording startup 在创建 channel/worker 前使用已解析的运行时配置；录制数据只保留运行所需的
-  source/publish provenance，不新增 episode sidecar 或进入 realtime loop。run/eval 的 policy
-  selector、checkpoint name/SHA-256、eval seed 和 wall-clock budget 通过 recorder-owned
-  `provenance_*` metadata attrs 保存，不与 camera metadata 混用。
+  source/publish provenance，不新增 episode sidecar 或进入 realtime loop。policy 会话的
+  selector、pinned checkpoint name、inference steps、seed 和 wall-clock budget 通过
+  recorder-owned `provenance_*` metadata attrs 保存（不含 git commit / SHA-256），不与 camera
+  metadata 混用。
 - raw episode 的 schema 与语义由 `recording/storage/schema.py` 与
   [data schema](docs/data_schema.md) 定义：raw v28 → processed v18 → Policy Zarr v11。
   每个 accepted episode 完整保留 raw 行，一个 processed 文件对应一个 Zarr episode。
