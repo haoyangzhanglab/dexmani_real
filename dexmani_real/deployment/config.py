@@ -291,12 +291,19 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
 
 @dataclass(frozen=True)
 class InferenceWorkerConfig:
-    """Narrow Policy-owned inputs required by the inference child."""
+    """Narrow Policy-owned inputs required by the inference child.
+
+    ``artifact`` pins the resolved deployment filename so the child cannot
+    silently switch checkpoints after the parent inspected them; Policy owns
+    the filesystem layout and only the basename crosses this boundary.
+    """
 
     experiment: str
     device: str
     spec: Any
-    seed: int = 0
+    seed: int
+    artifact: str
+    inference_steps: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.experiment, str) or not self.experiment.strip():
@@ -309,6 +316,16 @@ class InferenceWorkerConfig:
             raise ValueError("device must not have leading or trailing whitespace")
         if type(self.seed) is not int or self.seed < 0:
             raise ValueError("policy inference seed must be a non-negative integer")
+        if (
+            not isinstance(self.artifact, str)
+            or not self.artifact
+            or self.artifact != Path(self.artifact).name
+        ):
+            raise ValueError(
+                "artifact must be a plain checkpoint filename (no path separators)"
+            )
+        if type(self.inference_steps) is not int or self.inference_steps < 1:
+            raise ValueError("inference_steps must be a positive integer")
 
 
 @dataclass(frozen=True)

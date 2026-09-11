@@ -47,9 +47,19 @@ class TestMaxFramesStopReason(unittest.TestCase):
             operator="op",
             max_running_s=30.0,
         )
-        config = _rollout_recorder_config(runtime, rollout)
+        worker_config = types.SimpleNamespace(
+            experiment="policy/task/exp",
+            artifact="epoch_500-deployment.pt",
+            inference_steps=2,
+            seed=0,
+        )
+        config = _rollout_recorder_config(runtime, rollout, worker_config)
         self.assertEqual(config.max_frames_stop_reason, "max_frames")
         self.assertEqual(config.data_dir, "/tmp/rollout_data")
+        self.assertEqual(
+            config.provenance["checkpoint_name"], "epoch_500-deployment.pt"
+        )
+        self.assertEqual(config.provenance["inference_steps"], "2")
 
 
 class TestSaveOutcome(unittest.TestCase):

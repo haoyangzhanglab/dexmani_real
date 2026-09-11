@@ -373,11 +373,29 @@ class TestEvalSeed(unittest.TestCase):
 
         for seed in (0, 1):
             self.assertEqual(
-                InferenceWorkerConfig("dp/task/exp", "cpu", None, seed).seed, seed
+                InferenceWorkerConfig(
+                    "dp/task/exp", "cpu", None, seed, "ckpt.pt", 10
+                ).seed,
+                seed,
             )
         for seed in (-1, True, 1.0):
             with self.assertRaises(ValueError):
-                InferenceWorkerConfig("dp/task/exp", "cpu", None, seed)
+                InferenceWorkerConfig(
+                    "dp/task/exp", "cpu", None, seed, "ckpt.pt", 10
+                )
+
+    def test_artifact_and_inference_steps_validation(self):
+        from dexmani_real.deployment.config import InferenceWorkerConfig
+
+        base = ("dp/task/exp", "cpu", None, 0)
+        for artifact in ("ckpt.pt", "epoch_500-deployment.pt"):
+            InferenceWorkerConfig(*base, artifact, 10)
+        for artifact in ("", "../evil.pt", "/abs/x.pt", "sub/x.pt"):
+            with self.assertRaises(ValueError):
+                InferenceWorkerConfig(*base, artifact, 10)
+        for steps in (0, -1, True, 1.0):
+            with self.assertRaises(ValueError):
+                InferenceWorkerConfig(*base, "ckpt.pt", steps)
 
     def test_cli_seed(self):
         from examples.run_policy import _parser
@@ -427,10 +445,16 @@ class TestEvalSeed(unittest.TestCase):
             policy_api, "load_experiment", return_value=loaded
         ) as load:
             runtime = _load_inference_runtime(
-                InferenceWorkerConfig("dp/task/exp", "cpu", spec, 1)
+                InferenceWorkerConfig("dp/task/exp", "cpu", spec, 1, "ckpt.pt", 7)
             )
             runtime.reset_episode()
-        load.assert_called_once_with("dp/task/exp", device="cpu", seed=1)
+        load.assert_called_once_with(
+            "dp/task/exp",
+            device="cpu",
+            seed=1,
+            artifact="ckpt.pt",
+            inference_steps=7,
+        )
         loaded.reset_episode.assert_called_once_with()
 
 
@@ -571,7 +595,7 @@ class TestPredictionTiming(unittest.TestCase):
             worker.inference_loop(
                 shared,
                 PolicyParams(),
-                InferenceWorkerConfig("fake", "cpu", _fake_policy_spec()),
+                InferenceWorkerConfig("fake", "cpu", _fake_policy_spec(), 0, "ckpt.pt", 10),
             )
         shared.prediction_ring.write.assert_called_once()
         prediction = executor_mod.prediction_from_record(

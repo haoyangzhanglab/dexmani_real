@@ -65,6 +65,8 @@ def _load_inference_runtime(config: InferenceWorkerConfig) -> PolicyRuntime:
         config.experiment,
         device=config.device,
         seed=config.seed,
+        artifact=config.artifact,
+        inference_steps=config.inference_steps,
     )
     try:
         return DexManiPolicyAdapter(loaded_policy, config.spec)

@@ -99,8 +99,15 @@ def _requires_hand_sensor(policy_spec: Any) -> bool:
 def _rollout_recorder_config(
     runtime: ExperimentConfig,
     rollout: RolloutRecordingConfig,
+    worker_config: InferenceWorkerConfig,
 ) -> RecorderIOConfig:
-    """Build the recorder capacity contract for one recorded rollout session."""
+    """Build the recorder capacity contract for one recorded rollout session.
+
+    The recorder-owned ``provenance_*`` attributes carry the resolved
+    experimental conditions (pinned artifact, effective inference steps, seed,
+    budget) so each published raw episode is self-describing without any git or
+    checksum provenance.
+    """
     control_hz = float(runtime.policy.control_hz)
     max_frames = (
         math.ceil(float(rollout.max_running_s) * control_hz)
@@ -112,6 +119,14 @@ def _rollout_recorder_config(
         control_hz=control_hz,
         min_frames=1,
         writer_queue_size=int(runtime.camera.writer_queue_size),
+        provenance={
+            "workflow": "policy_eval",
+            "policy_selector": worker_config.experiment,
+            "checkpoint_name": worker_config.artifact,
+            "inference_steps": str(worker_config.inference_steps),
+            "seed": str(worker_config.seed),
+            "max_running_s": f"{float(rollout.max_running_s):.17g}",
+        },
     )
 
 
@@ -289,7 +304,7 @@ def build_policy_worker_specs(
             ProcessSpec(
                 "recorder",
                 recorder_io_loop,
-                (shared, _rollout_recorder_config(runtime, recording_config)),
+                (shared, _rollout_recorder_config(runtime, recording_config, worker_config)),
                 ready_name="recorder",
             )
         )

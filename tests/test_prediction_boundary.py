@@ -57,7 +57,12 @@ def test_warmup_failure_is_distinct_from_invalid_diagnostics(warmup_fails):
     if warmup_fails:
         runtime.warmup.side_effect = RuntimeError("model warmup failed")
     cfg = InferenceWorkerConfig(
-        "fixture", "cpu", SimpleNamespace(control_dt_s=0.05, n_action_steps=8)
+        "fixture",
+        "cpu",
+        SimpleNamespace(control_dt_s=0.05, n_action_steps=8),
+        0,
+        "ckpt.pt",
+        10,
     )
     with (
         mock.patch.object(worker, "_load_inference_runtime", return_value=runtime),

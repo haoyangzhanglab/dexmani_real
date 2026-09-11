@@ -342,6 +342,8 @@ def _prepare_lifecycle_inputs(
         device=args.device,
         spec=info.spec,
         seed=args.eval_seed,
+        artifact=info.checkpoint_name,
+        inference_steps=info.spec.default_inference_steps,
     )
     evaluation_config = None
     if execute:
