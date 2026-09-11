@@ -22,6 +22,7 @@
 | `docs/refactor_contract_audit.md` | 验证器分类、producer/consumer 证据与 KEEP 决策。 |
 | `docs/refactor_execution_plan.md` | 已执行重构的 canonical 方案、protected invariants 与分阶段验收规则；执行结果见 evidence。 |
 | `docs/refactor_execution_evidence.md` | 本轮分阶段重构的 baseline、审查、离线验证和交付记录。 |
+| `docs/tactile_unit_si_verification_pending.md` | 触觉力单位语义 fact-check 与决策记录：0.1 scale 考古、"单位=N"证据盘点、删除代价矩阵与 known-load 解锁协议；规则 owner 仍是 xhand 指南。 |
 | `.codex/config.toml` | 项目级 Codex 权限、联网与子智能体并发配置。 |
 | `.codex/agents/*.toml` | 项目级难度分档子智能体：`sol-high`、`terra-max`、`luna-max`。 |
 
