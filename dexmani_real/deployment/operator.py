@@ -191,14 +191,11 @@ def run_operator_control(
             # drained batch must not survive a successful home sequence.
             discard_begin_in_batch = False
             signals = keyboard.poll(timeout=_POLL_S)
+            # Only lifecycle-changing signals suppress a Home in the same batch.
+            # C/D (PAUSE/DISCARD) belong to teleop and are true no-ops here, so
+            # they must not fence H; ESC is fenced by the estop latch/callback.
             stop_in_batch = any(
-                signal
-                in {
-                    OperatorCommand.STOP,
-                    OperatorCommand.PAUSE,
-                    OperatorCommand.DISCARD,
-                    OperatorCommand.QUIT,
-                }
+                signal in {OperatorCommand.STOP, OperatorCommand.QUIT}
                 for signal in signals
             )
             for signal in signals:
@@ -228,7 +225,7 @@ def run_operator_control(
                         continue
                     if stop_in_batch:
                         logger.warning(
-                            "operator: ignored H received in the same batch as S"
+                            "operator: ignored H received in the same batch as S/Q"
                         )
                         continue
                     with shared.motion_lock:

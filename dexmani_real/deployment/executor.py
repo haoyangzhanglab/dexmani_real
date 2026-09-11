@@ -1040,6 +1040,16 @@ class PolicyExecutor:
                 self.shared.is_recording.value = self.recorder.stop_pending
                 with self.shared.motion_lock:
                     self.shared.start_request.value = False
+                if self.recorder.last_error is not None:
+                    # A terminal START failure never began motion; latch the
+                    # recording fault so the supervisor ends the session instead
+                    # of letting the operator retry B indefinitely.
+                    logger.error(
+                        "executor: RecorderIO START failed terminally: %s",
+                        self.recorder.last_error,
+                    )
+                    self._latch_recording_fault()
+                    return
                 logger.warning(
                     "executor: RecorderIO did not acknowledge the recording START: %s",
                     self.recorder.last_error or "unknown error",

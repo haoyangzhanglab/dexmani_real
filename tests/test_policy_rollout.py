@@ -887,11 +887,26 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         ingest.assert_called_once()
 
     def test_start_failure_never_begins_motion(self):
+        # A retryable start refusal (no terminal RecorderIO error) keeps the
+        # session ARMED so the operator may retry B.
         executor = self.executor()
         executor.recorder.start_episode.return_value = False
+        executor.recorder.last_error = None
         self.begin(executor)
         self.assertEqual(executor.shared.safety_state.value, SafetyState.ARMED)
         self.assertIsNone(executor.run_started_ns)
+        self.assertFalse(executor.shared.error_state.value)
+
+    def test_start_terminal_error_fails_closed(self):
+        # A terminal START error (e.g. episode-name collision) latches the
+        # recording fault: no motion begins and the supervisor shuts down.
+        executor = self.executor()
+        executor.recorder.start_episode.return_value = False
+        executor.recorder.last_error = "episode name collision"
+        self.begin(executor)
+        self.assertEqual(executor.shared.safety_state.value, SafetyState.ARMED)
+        self.assertIsNone(executor.run_started_ns)
+        self.assertTrue(executor.shared.error_state.value)
 
     def test_cancel_after_start_ack_waits_for_recorder_terminal_status(self):
         executor = self.executor()
