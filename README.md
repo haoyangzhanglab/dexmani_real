@@ -33,12 +33,12 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
   hand、aggregate contact 独立按 control anchor 取最新有效观测；保留 raw dense tactile、
   calibration、camera health 与真实 source timestamps。aggregate 有独立
   `hand_contact_source_monotonic_ns`，不伪装成更新的 hand qpos/dense 来源。
-- raw → processed v18 → Policy Zarr v11 全程逐行对应：accepted N 行保持 N 行，一个
+- raw → processed v19 → Policy Zarr v12 全程逐行对应：accepted N 行保持 N 行，一个
   processed 文件对应一个 Zarr episode。唯一自动行为质量拒绝是 persistent IK；
   技术损坏可使整条失败，camera/tactile timing jitter 不删行，也不跨行修复。
 - processed 是完整 multimodal superset：joint/action/action_ee、aggregate contact（含 validity）、
-  dense tactile（含 validity）、fingertip、native RGB-D、camera geometry、point cloud 与 timing。
-  FK 保留，但不持久化可重算的 eef_pose。
+  dense tactile（含 validity）、fingertip、eef_pose（与 fingertip 复用同一次 canonical arm FK）、
+  native RGB-D、camera geometry、point cloud 与 timing。
 - 物理回放已记录 episode，并保存回放轨迹与一致性指标。
 - 通过 Policy-owned public runtime 与 Real-owned NumPy adapter 运行 joint/EE-action learned
   policy；Policy strict restore 模型，Real fail-closed 校验固定硬件、观测、IPC 与时序兼容。
@@ -410,8 +410,8 @@ raw v28 episode 可视化默认使用当前 resolved runtime 中的点云策略�
 `--pointcloud-num-points` 可选择 `1024`、`2048`、`4096` 或 `8192`。
 
 查看持久化点云可运行 `python examples/visualize_episode_processed.py <processed.h5>`。
-该离线 viewer 读取 processed v18 的 RGB-D/点云和 fingertip，使用逻辑 `arange(T)*dt`
-显示时间；不加载 row provenance 或存储的 EEF pose。它按所用模态检查结构和渲染 payload；
+该离线 viewer 读取 processed v19 的 RGB-D/点云、fingertip 与 eef_pose，使用逻辑 `arange(T)*dt`
+显示时间；不加载 row provenance。它按所用模态检查结构和渲染 payload；
 完整 artifact 验证由 processing/export 边界承担。
 
 物理回放始终以当前 geometry 和 runtime 完整验证 live start、joint limits、recorded
@@ -484,9 +484,9 @@ datasets/<task>.zarr/
 └── meta/episode_ends
 ```
 
-当前合同是 raw v28 → processed v18 → Policy Zarr v11。processed 保存 dense tactile（含
-validity）、aggregate contact（含 validity）与 flat timing；不保存 eef_pose、row provenance、
-quality JSON 或 segments。
+当前合同是 raw v28 → processed v19 → Policy Zarr v12。processed 保存 dense tactile（含
+validity）、aggregate contact（含 validity）、fingertip、eef_pose 与 flat timing；不保存
+row provenance、quality JSON 或 segments。
 录制时从 live ring 选择有效 aggregate，并保存其独立 source；这不是从其他 raw row
 修补 dataset。历史 raw 不改写；详细字段和边界见 [data schema](docs/data_schema.md)。
 

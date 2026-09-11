@@ -141,6 +141,32 @@ def test_d1_to_d5_all_rows_and_same_row_contact(tmp_path, event):
             assert np.all(np.isnan(data["tactile_force"][12]))
 
 
+def test_eef_pose_persisted_from_canonical_fk(tmp_path):
+    from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
+
+    episode = write_control_episode(tmp_path / "raw")
+    with h5py.File(episode / "data.h5", "r") as raw:
+        expected = compute_eef_pose_history_xarm_base(raw["arm_qpos"][:]).astype(
+            np.float32
+        )
+    config = permissive_test_config()
+    output = tmp_path / "processed"
+    process_episode_root(episode, output, config)
+    artifact = output / f"{episode.name}.h5"
+    validate_processed_hdf5(artifact)
+    with h5py.File(artifact, "r") as data:
+        eef = data["eef_pose"]
+        assert eef.shape == (40, 9)
+        assert eef.dtype == np.float32
+        assert np.isfinite(eef[:]).all()
+        np.testing.assert_allclose(eef[:], expected, rtol=1e-6, atol=1e-6)
+        assert data.attrs["eef_pose_frame"] == "xarm_base"
+        assert data.attrs["eef_pose_components"] == "position_m(3)+rot6d(6)"
+        # The rot6d tail is two orthonormal columns of a rotation matrix.
+        rot6d = eef[0, 3:]
+        assert rot6d.shape == (6,)
+
+
 def test_contact_and_dense_validity_are_independent(tmp_path):
     episode = write_control_episode(tmp_path / "raw")
     with h5py.File(episode / "data.h5", "r+") as raw:

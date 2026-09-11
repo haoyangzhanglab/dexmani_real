@@ -23,6 +23,12 @@ from dexmani_real.dataset.contracts import (
     validate_processed_task_name,
 )
 from dexmani_real.dataset.pointcloud import validate_rigid_transform
+from dexmani_real.planning.kinematics.arm_fk import (
+    EEF_POSE_ALGORITHM_ID,
+    EEF_POSE_COMPONENTS,
+    EEF_POSE_DERIVATION,
+    EEF_POSE_FRAME,
+)
 from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
@@ -40,7 +46,7 @@ from dexmani_real.robot.model import (
 )
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 18
+PROCESSED_SCHEMA_VERSION = 19
 _CONTACT_FORCE_SOURCE = "raw_hand_contact_control_step"
 _VALIDATION_CHUNK_BYTES = 64 * 1024 * 1024
 # Fixed-tail multimodal datasets; rgb/depth/point_cloud have variable tails and
@@ -59,6 +65,7 @@ _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "tactile_calibrated": ((), np.dtype(np.bool_)),
     "tactile_unit_code": ((), np.dtype(np.uint8)),
     "fingertip_points": ((5, 3), np.dtype(np.float32)),
+    "eef_pose": ((9,), np.dtype(np.float32)),
     "camera_intrinsic": ((9,), np.dtype(np.float32)),
     "camera_extrinsic": ((4, 4), np.dtype(np.float32)),
     "observation_anchor_monotonic_ns": ((), np.dtype(np.uint64)),
@@ -85,6 +92,7 @@ MULTIMODAL_DATASET_KEYS = (
     "tactile_calibrated",
     "tactile_unit_code",
     "fingertip_points",
+    "eef_pose",
     "rgb",
     "depth",
     "camera_intrinsic",
@@ -406,6 +414,10 @@ def validate_processed_hdf5(
             "tactile_force_unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
             "fingertip_points_frame": _FINGERTIP_POINTS_FRAME,
             "fingertip_points_unit": _FINGERTIP_POINTS_UNIT,
+            "eef_pose_frame": EEF_POSE_FRAME,
+            "eef_pose_components": EEF_POSE_COMPONENTS,
+            "eef_pose_derivation": EEF_POSE_DERIVATION,
+            "eef_pose_algorithm_id": EEF_POSE_ALGORITHM_ID,
             "action_ee_frame": _ACTION_EE_FRAME,
             "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
         }

@@ -1,6 +1,6 @@
 # Real 数据集 schema 参考
 
-本文覆盖 raw HDF5 v28、processed HDF5 v18 与 Policy Zarr v11。精确合同由
+本文覆盖 raw HDF5 v28、processed HDF5 v19 与 Policy Zarr v12。精确合同由
 [raw schema](../dexmani_real/recording/storage/schema.py)、
 [processing](../dexmani_real/dataset/processing.py)、
 [processed validator](../dexmani_real/dataset/processed.py) 和
@@ -124,7 +124,7 @@ physical replay 没有历史版本兼容路径。实际 pick_place_toy lineage�
 限制及验证结果见 [incident evidence](invalid_frames_export_incident.md) 和
 [salvage manifest](../artifacts/pick_place_toy_salvage_manifest.json)。
 
-## 2. Processed HDF5 v18
+## 2. Processed HDF5 v19
 
 `episodes_processed/<task>/*.h5`，每个 accepted raw episode 一个文件。processed 是
 完整 multimodal superset（不再有 modality-specific profile），全部使用同一 control-step 映射：
@@ -143,6 +143,7 @@ physical replay 没有历史版本兼容路径。实际 pick_place_toy lineage�
 | tactile_calibrated | (N,) | bool | 同行 tactile_calibrated |
 | tactile_unit_code | (N,) | uint8 | 同行 tactile_unit_code |
 | fingertip_points | (N,5,3) | float32 | 本行 joint_state 经共享 arm+hand FK |
+| eef_pose | (N,9) | float32 | 本行 joint_state 经 canonical arm FK（position_m(3)+rot6d(6)） |
 | rgb | (N,H,W,3) | uint8 | 本行 native aligned color RGB，不 resize |
 | depth | (N,H,W) | uint16 | 本行 aligned depth，不 resize |
 | camera_intrinsic | (N,9) | float32 | native color K，展平 |
@@ -168,8 +169,9 @@ calibrated/native-unit aggregate 与 dense）；legacy v26 = 保守 best-availab
 本身不证明有效测量——旧驱动可能复制零占位；允许 false negative，不允许把
 unknown/placeholder 宣称为 valid）。zero payload 不天然 invalid，mask 只来自
 provenance/representation flags，不来自数值大小。
-processed 不保存 `eef_pose` 或 `/provenance`。FK implementation 保留，fingertip 复用每步
-Arm FK；`action_ee` 是无法从 IK 后 joint target 无损恢复的控制意图，必须保留。
+processed 保存 `eef_pose`（v19 起）：`eef_pose` 与本行 `fingertip_points` 复用同一次
+canonical arm FK 结果，不重复 FK。`action_ee` 是无法从 IK 后 joint target 无损恢复的
+控制意图，必须保留。
 
 ### 必需身份与语义 attrs
 
@@ -228,7 +230,7 @@ task 名必须非空、无首尾空白/ASCII 控制字符，且不能是 unknown
 冲突 annotation；整批 accepted episodes 必须只有一个任务。CLI 跳过未标注 rejected
 episode；显式 include 的失败阻断整批。直接 library 默认不跳过未标注 rejection。
 
-## 3. Policy Zarr v11
+## 3. Policy Zarr v12
 
 ```text
 datasets/<task>.zarr/

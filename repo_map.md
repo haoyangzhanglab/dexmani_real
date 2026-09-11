@@ -14,7 +14,7 @@
 | `repo_map.md` | 当前运行拓扑、核心数据流与边界索引。 |
 | `tools/convert_raw_v24_to_v25.py` | 冻结的一次性历史 raw v24 → v25 转换器；不依赖当前 runtime。 |
 | `tools/convert_raw_v25_to_v26_tactile.py` | 冻结的一次性 raw v25 → v26 tactile 表示迁移（`* 10` 还原 SDK 原生刻度、新增 `tactile_sum_fresh`）。 |
-| `docs/control_step_dataset_simplification_plan.md` | 历史 control-step dataset 简化执行计划（SUPERSEDED）；当前实现为 v18/v11 multimodal dataset。 |
+| `docs/control_step_dataset_simplification_plan.md` | 历史 control-step dataset 简化执行计划（SUPERSEDED）；当前实现为 v19/v12 multimodal dataset。 |
 | `docs/invalid_frames_export_incident.md` | 历史 forensic evidence 与实际 salvage 验证记录。 |
 | `docs/control_step_dataset_human_review_record.md` | Real/Policy control-step 修复交接：固定提交范围、证据边界、剩余限制与待人工签署的 review checklist。 |
 | `artifacts/pick_place_toy_salvage_manifest.json` | 小型 source identity/lineage/whole-episode salvage manifest；无生成数据或机器绝对路径。 |
@@ -212,7 +212,7 @@ VR / keyboard input
   recorder-owned `provenance_*` metadata attrs 保存（不含 git commit / SHA-256），不与 camera
   metadata 混用。
 - raw episode 的 schema 与语义由 `recording/storage/schema.py` 与
-  [data schema](docs/data_schema.md) 定义：raw v28 → processed v18 → Policy Zarr v11。
+  [data schema](docs/data_schema.md) 定义：raw v28 → processed v19 → Policy Zarr v12。
   每个 accepted episode 完整保留 raw 行，一个 processed 文件对应一个 Zarr episode。
 - `ipc/causal.py::read_hand_contact_causal` 只为 recording 选择最新有效 causal aggregate；
   `recording/sample.py` / `recording/frame.py` 显式携带独立
@@ -227,7 +227,8 @@ VR / keyboard input
 - `dataset/processed.py` 独占完整 schema/payload validation，证明
   `source_frames == episode_steps`。processed 是完整 multimodal superset：joint/action/action_ee、
   aggregate contact（含 `contact_force_valid`）、dense tactile（含 `tactile_force_valid`）、
-  fingertip、native-resolution RGB-D、camera geometry、point cloud 与 flat timing arrays；
+  fingertip、eef_pose（与 fingertip 复用同一次 canonical arm FK）、native-resolution RGB-D、
+  camera geometry、point cloud 与 flat timing arrays；
   无效 contact/dense 用 validity mask 表达，不整条拒绝。不再有 modality-specific profile。
 - `dataset/export.py` 验证 processed 和跨文件一致性，完整追加并写 episode_ends 后
   transactional publish；无 gap、keep-mask、row-provenance 或 quality framework。

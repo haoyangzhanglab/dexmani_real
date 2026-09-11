@@ -42,7 +42,13 @@ from dexmani_real.dataset.processed import (
     _expected_specs,
     validate_processed_hdf5,
 )
-from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
+from dexmani_real.planning.kinematics.arm_fk import (
+    EEF_POSE_ALGORITHM_ID,
+    EEF_POSE_COMPONENTS,
+    EEF_POSE_DERIVATION,
+    EEF_POSE_FRAME,
+    compute_eef_pose_history_xarm_base,
+)
 from dexmani_real.planning.kinematics.pose import validate_canonical_rot6d
 from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
@@ -381,6 +387,10 @@ def _write_attrs(
                     "handbase_quat_eef_wxyz": list(config.handbase_quat_eef_wxyz),
                 }
             ),
+            "eef_pose_frame": EEF_POSE_FRAME,
+            "eef_pose_components": EEF_POSE_COMPONENTS,
+            "eef_pose_derivation": EEF_POSE_DERIVATION,
+            "eef_pose_algorithm_id": EEF_POSE_ALGORITHM_ID,
             "action_ee_frame": _ACTION_EE_FRAME,
             "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
             "contact_force_source": _CONTACT_FORCE_SOURCE,
@@ -576,6 +586,8 @@ def _write_processed_episode(
         )
         if not hand_fk.is_ready():
             raise RuntimeError("processed fingertip FK startup failed")
+        eef_pose = compute_eef_pose_history_xarm_base(joint_state[:, :7])
+        output["eef_pose"][:] = eef_pose.astype(np.float32)
         output["fingertip_points"][:] = compute_fingertip_history_xarm_base(
             joint_state[:, :7],
             joint_state[:, 7:19],
@@ -586,7 +598,7 @@ def _write_processed_episode(
             handbase_quat_eef_wxyz=np.asarray(
                 config.handbase_quat_eef_wxyz, dtype=np.float64
             ),
-            eef_pose_history=compute_eef_pose_history_xarm_base(joint_state[:, :7]),
+            eef_pose_history=eef_pose,
         )
         # Flat timing arrays: one scalar per control row.
         output["observation_anchor_monotonic_ns"][:] = reader.h5f[
