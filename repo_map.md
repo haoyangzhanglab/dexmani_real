@@ -14,7 +14,7 @@
 | `repo_map.md` | 当前运行拓扑、核心数据流与边界索引。 |
 | `tools/convert_raw_v24_to_v25.py` | 冻结的一次性历史 raw v24 → v25 转换器；不依赖当前 runtime。 |
 | `tools/convert_raw_v25_to_v26_tactile.py` | 冻结的一次性 raw v25 → v26 tactile 表示迁移（`* 10` 还原 SDK 原生刻度、新增 `tactile_sum_fresh`）。 |
-| `docs/control_step_dataset_simplification_plan.md` | 历史 control-step dataset 简化执行计划（SUPERSEDED）；当前实现为 v19/v12 multimodal dataset。 |
+| `docs/control_step_dataset_simplification_plan.md` | 历史 control-step dataset 简化执行计划（SUPERSEDED）；当前实现为 v20/v13 multimodal dataset。 |
 | `docs/invalid_frames_export_incident.md` | 历史 forensic evidence 与实际 salvage 验证记录。 |
 | `docs/control_step_dataset_human_review_record.md` | Real/Policy control-step 修复交接：固定提交范围、证据边界、剩余限制与待人工签署的 review checklist。 |
 | `artifacts/pick_place_toy_salvage_manifest.json` | 小型 source identity/lineage/whole-episode salvage manifest；无生成数据或机器绝对路径。 |
@@ -79,7 +79,9 @@ causal observation history
 - `deployment/inference/observation.py` 的 builder 拥有 causal/freshness/history/skew/generation
   准入。camera、arm、hand、contact 均按 logical policy control-grid references 对齐，
   不以 camera exposure time 对齐机器人状态。SHM copy/seqlock、run-start、age/grid-lag、
-  health/state/calibration/unit 与必要的 contact provenance source-match gates 保留。
+  health/state gates 保留；contact/dense 直接读取同一 hand_state history 并分别要求
+  `tactile_aggregate_valid`/`tactile_dense_valid`，不再有独立 provenance ring 或
+  calibration/unit/source-match gate。
 - `Prediction` 是简单的内部策略输出容器；动作在 inference 输出边界校验为 finite
   `float64[chunk_size, D]`，序列化和 SHM 读取建立传输副本，
   `run_generation`、source timestamp 和 logical-step timestamp 随对象传播。
@@ -98,9 +100,8 @@ causal observation history
   horizon 解码、control-grid 调度、EE→IK、候选校验和 command-progress watchdog。
 - `robot/model.py` 统一 anatomical finger、SDK tactile sensor ID 和 fingertip link 顺序；
   `tests/test_hand_finger_order.py` 固定其映射。部署 EEF/fingertips 从 policy-visible float32
-  joint_state 派生；tactile full snapshot 同时提供 provenance，contact-only 使用
-  `ipc/ring.py::get_last_k_fields()` 投影 metadata。`tests/test_ring_projection.py` 使用真实
-  SHM 验证投影、副本所有权与 seqlock rejection，不启动硬件。
+  joint_state 派生；contact_force/tactile_force 从同一 hand_state ring 读取，不需要独立
+  provenance 投影。
 - 正常策略 tick 的路径是 `validate → publish → continue`；`execute=False` 完成同样的候选
   校验但不产生 actuator side effect。需要确认 SDK 接受的 home、calibration 和 replay 操作，
   才显式调用 blocking acceptance。
@@ -150,7 +151,7 @@ B + completed H
   调度、IK/SAFETY 归属、reject-only arm、多 episode 计数/超时/quit/estop 的 technical reason 与
   recording fail-closed；不启动任何 worker 或设备。
 - `tests/test_recorder_io_boundary.py` 覆盖 RecorderIO capacity/stop reason 边界、显式 episode
-  命名与真实 raw-v28 事务（临时目录写入 data.h5/depth.h5/rgb.mp4）；不连接设备。
+  命名与真实 raw-v29 事务（临时目录写入 data.h5/depth.h5/rgb.mp4）；不连接设备。
 
 ## Teleop flow
 
@@ -202,7 +203,7 @@ VR / keyboard input
 - Camera IPC 只携带 source/receive/publish 时间、generation、帧号和 health；保留 payload
   尺寸字段以支持 name-only ring attach。设备时钟映射留在 driver/worker，不作为录制审计传输。
   static shared metadata 只保留 serial、RGB-D geometry 和 depth scale；校准与研究 provenance
-  继续写入 raw v28。`tests/test_camera_v25_telemetry.py` 覆盖 health、causality 与 seqlock 边界。
+  继续写入 raw v29。`tests/test_camera_v25_telemetry.py` 覆盖 health、causality 与 seqlock 边界。
 - teleop 只把已经选择并校验的 causal fixed-grid sample 交给 RecorderIO；RecorderIO 独占
   episode transaction、sidecar、sequence continuity、validation 和 atomic finalize，不决定
   机器人动作。
@@ -212,15 +213,14 @@ VR / keyboard input
   recorder-owned `provenance_*` metadata attrs 保存（不含 git commit / SHA-256），不与 camera
   metadata 混用。
 - raw episode 的 schema 与语义由 `recording/storage/schema.py` 与
-  [data schema](docs/data_schema.md) 定义：raw v28 → processed v19 → Policy Zarr v12。
+  [data schema](docs/data_schema.md) 定义：raw v29 → processed v20 → Policy Zarr v13。
   每个 accepted episode 完整保留 raw 行，一个 processed 文件对应一个 Zarr episode。
-- `ipc/causal.py::read_hand_contact_causal` 只为 recording 选择最新有效 causal aggregate；
-  `recording/sample.py` / `recording/frame.py` 显式携带独立
-  `hand_contact_source_monotonic_ns`，不修改 command hand feedback，也不借用 dense source。
-  无有效 aggregate 保存 NaN/source0；age 仅是 recording telemetry。dense raw 数据保留。
-- `EpisodeReader` 只接受 raw v28 并检查文件/layout/sidecar 帧数，不完整解码 RGB。
-  `dataset/processing.py` 有一个窄的只读 normalized-v26 历史入口；冻结迁移独立存在，
-  没有 v26/v27→v28 伪迁移或 runtime compatibility reader。
+- recording 在每个 control anchor 选择最新 causal 的 XHand hand sample；qpos/current 与
+  aggregate/dense 来自同一次 SDK read，共享唯一 `hand_source_monotonic_ns`。无有效 payload
+  保存 NaN + valid=False，不做 backward search 或跨 row tactile repair。
+- `EpisodeReader` 只接受 raw v29 并检查文件/layout/sidecar 帧数，不完整解码 RGB。
+  `dataset/processing.py` 只接受 current raw；冻结迁移工具独立存在，没有 v26/v27→v29
+  伪迁移或 runtime compatibility reader。
 - `dataset/processing.py::process_episode_root` 独占 whole-episode admission 与 batch
   publication。persistent IK（连续 >4 行）是唯一自动行为拒绝；技术损坏失败，
   不做 timing-quality filtering、跨 raw row tactile repair 或 row compaction。
@@ -229,7 +229,8 @@ VR / keyboard input
   aggregate contact（含 `contact_force_valid`）、dense tactile（含 `tactile_force_valid`）、
   fingertip、eef_pose（与 fingertip 复用同一次 canonical arm FK）、native-resolution RGB-D、
   camera geometry、point cloud 与 flat timing arrays；
-  无效 contact/dense 用 validity mask 表达，不整条拒绝。不再有 modality-specific profile。
+  无效 contact/dense 用 validity mask 表达（直接拷贝 raw `hand_contact_valid`/
+  `hand_tactile_force_valid`），不整条拒绝。不再有 modality-specific profile。
 - `dataset/export.py` 验证 processed 和跨文件一致性，完整追加并写 episode_ends 后
   transactional publish；无 gap、keep-mask、row-provenance 或 quality framework。
   `clean.py` 与 `quality.py` 已删除。CLI 只调用一次 batch，annotation 仅 include/task_name，

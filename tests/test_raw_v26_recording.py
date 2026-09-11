@@ -29,28 +29,24 @@ from dexmani_real.recording.storage.video import VideoDecoder
 
 
 def test_schema_keeps_control_step_sensor_facts():
-    assert EPISODE_SCHEMA_VERSION == 28
-    assert len(DATASET_SPECS) == 41
-    assert len(SOURCE_FRAME_DATASET_NAMES) == 37
+    assert EPISODE_SCHEMA_VERSION == 29
+    assert len(DATASET_SPECS) == 37
+    assert len(SOURCE_FRAME_DATASET_NAMES) == 33
     assert {
         "arm_qpos",
         "hand_qpos",
         "hand_contact",
+        "hand_contact_valid",
         "hand_tactile_force",
-        "hand_contact_source_monotonic_ns",
+        "hand_tactile_force_valid",
         "action_arm_joint_sent",
         "action_hand_joint",
         "action_arm_ee",
         "observation_anchor_monotonic_ns",
         "arm_source_monotonic_ns",
         "hand_source_monotonic_ns",
-        "tactile_source_monotonic_ns",
         "camera_source_monotonic_ns",
         "camera_health",
-        "tactile_sum_fresh",
-        "tactile_fresh",
-        "tactile_calibrated",
-        "tactile_unit_code",
     }.issubset(SOURCE_FRAME_DATASET_NAMES)
 
 

@@ -13,7 +13,6 @@ import numpy as np
 
 from dexmani_real.robot.model import (
     ARM_JOINT_SHAPE,
-    HAND_CONTACT_SHAPE,
     HAND_JOINT_SHAPE,
     HAND_TACTILE_FORCE_SHAPE,
     HAND_TACTILE_SUM_SHAPE,
@@ -30,9 +29,6 @@ MAX_POLICY_ACTION_DIM = 21
 # reaching the inference boundary.
 POINT_CLOUD_FEATURE_DIM = 6
 SUPPORTED_POINT_CLOUD_COUNTS = frozenset({1024, 2048, 4096, 8192})
-# Canonical tactile unit identity persisted in ``tactile_unit_code``:
-# XHand SDK-native numeric scale whose SI conversion is not yet verified.
-TACTILE_UNIT_CODE_XHAND_SDK_NATIVE = 0
 
 
 def make_pointcloud_frame_dtype(num_points: int) -> np.dtype:
@@ -156,11 +152,14 @@ HAND_STATE_DTYPE = np.dtype(
     [
         ("qpos", "<f8", HAND_JOINT_SHAPE),
         ("current", "<f8", HAND_JOINT_SHAPE),
-        ("tactile_sum", "<f8", HAND_TACTILE_SUM_SHAPE),
-        # Combined tactile values are zero-filled on read failure; this bit
-        # distinguishes an invalid sample from a valid zero-contact sample.
-        ("tactile_sum_valid", "<u1"),
-        ("tactile_contact", "<u1", HAND_CONTACT_SHAPE),
+        ("tactile_aggregate", "<f4", HAND_TACTILE_SUM_SHAPE),
+        # Aggregate and dense tactile payloads are zero-filled on read failure;
+        # these bits distinguish an invalid sample from a valid zero-contact
+        # sample. Both are gated on session software-bias readiness by the
+        # worker before publication.
+        ("tactile_aggregate_valid", "<u1"),
+        ("tactile_dense", "<f4", HAND_TACTILE_FORCE_SHAPE),
+        ("tactile_dense_valid", "<u1"),
         ("connected", "<u1"),
         # Set when qpos is held from the last read after a single-frame failure.
         ("qpos_stale", "<u1"),
@@ -180,16 +179,6 @@ HAND_STATE_DTYPE = np.dtype(
         ("publish_monotonic_ns", "<u8"),
         ("state_valid", "<u1"),
         ("timestamp", "<f8"),
-    ]
-)
-
-HAND_TACTILE_DTYPE = np.dtype(
-    [
-        ("tactile_force", "<f8", HAND_TACTILE_FORCE_SHAPE),
-        ("source_monotonic_ns", "<u8"),
-        ("fresh", "<u1"),
-        ("calibrated", "<u1"),
-        ("unit_code", "<u1"),
     ]
 )
 
@@ -246,9 +235,10 @@ def make_record_sample_dtype(
             ("arm_tau", "<f8", ARM_JOINT_SHAPE),
             ("hand_qpos", "<f8", HAND_JOINT_SHAPE),
             ("hand_current", "<f8", HAND_JOINT_SHAPE),
-            ("hand_contact", "<f8", HAND_TACTILE_SUM_SHAPE),
-            ("hand_contact_source_monotonic_ns", "<u8"),
-            ("hand_tactile_force", "<f8", HAND_TACTILE_FORCE_SHAPE),
+            ("hand_contact", "<f4", HAND_TACTILE_SUM_SHAPE),
+            ("hand_contact_valid", "<u1"),
+            ("hand_tactile_force", "<f4", HAND_TACTILE_FORCE_SHAPE),
+            ("hand_tactile_force_valid", "<u1"),
             ("hand_qpos_stale", "<u1"),
             ("arm_connected", "<u1"),
             ("hand_connected", "<u1"),
@@ -263,13 +253,8 @@ def make_record_sample_dtype(
             ("observation_valid", "<u1"),
             ("arm_source_monotonic_ns", "<u8"),
             ("hand_source_monotonic_ns", "<u8"),
-            ("tactile_source_monotonic_ns", "<u8"),
             ("vr_source_monotonic_ns", "<u8"),
             ("camera_source_monotonic_ns", "<u8"),
-            ("tactile_sum_fresh", "<u1"),
-            ("tactile_fresh", "<u1"),
-            ("tactile_calibrated", "<u1"),
-            ("tactile_unit_code", "<u1"),
             ("flag_camera_fresh", "<u1"),
             ("camera_health", "<u1"),
             ("camera_depth_frame_number", "<u8"),
@@ -300,7 +285,6 @@ __all__ = [
     "CAMERA_FRAME_HEADER_DTYPE",
     "COUPLED_COMMAND_DTYPE",
     "HAND_STATE_DTYPE",
-    "HAND_TACTILE_DTYPE",
     "MAX_POLICY_ACTION_DIM",
     "MAX_PREDICTION_STEPS",
     "POINT_CLOUD_FEATURE_DIM",

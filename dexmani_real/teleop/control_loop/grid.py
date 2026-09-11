@@ -20,7 +20,6 @@ from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
 from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
     read_causal_structured_frame,
-    read_hand_tactile_causal,
     read_vr_frame_causal,
     vr_frame_is_fresh,
 )
@@ -187,7 +186,6 @@ class TeleopGridObservation:
     camera_frame: dict[str, Any] | None
     hand_state: np.ndarray | None
     hand_ring_sequence: int
-    hand_tactile: np.ndarray | None
     anchor_monotonic_ns: int
     control_run_generation: int
 
@@ -410,7 +408,6 @@ def _record_grid_hold(
         observation.vr_frame,
         observation.camera_frame,
         hand_state=observation.hand_state,
-        hand_tactile=observation.hand_tactile,
         arm_qpos_sent=controller.prev_qpos_cmd.copy(),
         action_queued=action_queued,
         target_eef_pos=target_eef_pos,
@@ -538,9 +535,6 @@ def _read_control_grid_observation(
     )
     hand_state = None if hand_result is None else hand_result[0]
     hand_ring_sequence = 0 if hand_result is None else int(hand_result[2])
-    hand_tactile = read_hand_tactile_causal(
-        shared, anchor_monotonic_ns=_current_grid_anchor_ns
-    )
 
     if not cfg.runtime.policy.hand_enabled:
         hand_issue = None
@@ -678,7 +672,6 @@ def _read_control_grid_observation(
             camera_frame=cam,
             hand_state=hand_state,
             hand_ring_sequence=hand_ring_sequence,
-            hand_tactile=hand_tactile,
             anchor_monotonic_ns=observation_anchor_monotonic_ns,
             control_run_generation=control_run_generation,
         ),
@@ -820,7 +813,6 @@ def _publish_solved_action(
     vr_frame = observation.vr_frame
     cam = observation.camera_frame
     hand_state = observation.hand_state
-    hand_tactile = observation.hand_tactile
     target_pos = computation.target_position_world_m
     target_quat = computation.target_quat_world_wxyz
     hand_cmd = computation.hand_qpos_rad
@@ -950,7 +942,6 @@ def _publish_solved_action(
             target_quat,
             vr_frame,
             cam,
-            hand_tactile,
             frame_status=_f_status,
             observation_anchor_monotonic_ns=_current_grid_anchor_ns,
             shared=shared,

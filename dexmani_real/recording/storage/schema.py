@@ -1,11 +1,11 @@
-"""The only supported raw episode layout: physical source rows, schema v28."""
+"""The only supported raw episode layout: physical source rows, schema v29."""
 
 from dataclasses import dataclass
 from enum import IntEnum
 
 import numpy as np
 
-EPISODE_SCHEMA_VERSION = 28
+EPISODE_SCHEMA_VERSION = 29
 ARM_SENT_DATASET = "action_arm_joint_sent"
 
 
@@ -35,9 +35,13 @@ DATASET_SPECS = {
     "arm_tau": _spec(np.float64, (7,)),
     "hand_qpos": _spec(np.float64, (12,)),
     "hand_current": _spec(np.float64, (12,)),
-    "hand_contact": _spec(np.float64, (5, 3)),
-    "hand_contact_source_monotonic_ns": _spec(np.uint64),
-    "hand_tactile_force": _spec(np.float64, (5, 120, 3)),
+    "hand_contact": _spec(np.float32, (5, 3)),
+    # Tactile validity states only whether the bias-corrected payload of the
+    # selected causal hand sample is usable; it never encodes freshness, units,
+    # or contact state. Invalid payloads are persisted as NaN.
+    "hand_contact_valid": _spec(np.bool_),
+    "hand_tactile_force": _spec(np.float32, (5, 120, 3)),
+    "hand_tactile_force_valid": _spec(np.bool_),
     "arm_connected": _spec(np.bool_),
     "hand_connected": _spec(np.bool_),
     "hand_qpos_stale": _spec(np.bool_),
@@ -52,15 +56,8 @@ DATASET_SPECS = {
     "observation_valid": _spec(np.bool_),
     "arm_source_monotonic_ns": _spec(np.uint64),
     "hand_source_monotonic_ns": _spec(np.uint64),
-    "tactile_source_monotonic_ns": _spec(np.uint64),
     "vr_source_monotonic_ns": _spec(np.uint64),
     "camera_source_monotonic_ns": _spec(np.uint64),
-    # Aggregate contact can be valid but old; freshness is telemetry only.
-    # Dense calibration/unit telemetry below describes its separate ring frame.
-    "tactile_sum_fresh": _spec(np.bool_),
-    "tactile_fresh": _spec(np.bool_),
-    "tactile_calibrated": _spec(np.bool_),
-    "tactile_unit_code": _spec(np.uint8),
     "flag_camera_fresh": _spec(np.bool_),
     # Persisted camera header health enum; ``flag_camera_fresh`` keeps its
     # runtime "new + healthy + recent" semantics and is retained for audit.

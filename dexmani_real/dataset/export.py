@@ -18,7 +18,7 @@ from dexmani_real.dataset.processed import validate_processed_hdf5
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 
 POLICY_ZARR_SCHEMA_NAME = "dexmani-real-policy-zarr"
-POLICY_ZARR_SCHEMA_VERSION = 12
+POLICY_ZARR_SCHEMA_VERSION = 13
 ExportProgressCallback = Callable[[str, int, int], None]
 
 

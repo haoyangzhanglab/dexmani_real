@@ -25,11 +25,7 @@ from test_deployment_eef_tactile import (
 
 def visual_fixture(visual: str, *, dense: bool):
     shared = _fake_shared()
-    for ring in (
-        shared.arm_state_ring,
-        shared.hand_state_ring,
-        shared.hand_tactile_ring,
-    ):
+    for ring in (shared.arm_state_ring, shared.hand_state_ring):
         ring._records = ring._records[3:]
         for data, _, _ in ring._records:
             data["source_monotonic_ns"] -= np.uint64(9_000_000)
@@ -82,19 +78,16 @@ def test_d9_visual_state_contact_and_dense_use_logical_grid(visual, dense):
     assert batch is not None
     refs = np.asarray([_ref_ns(tick) for tick in _REF_TICKS])
     expected_source = refs - 9_000_000
-    windows = [batch.arm_history, batch.hand_history, batch.hand_tactile_sum_history]
-    windows.append(
-        batch.hand_tactile_force_history
-        if dense
-        else batch.hand_tactile_provenance_history
-    )
+    windows = [batch.arm_history, batch.hand_history, batch.hand_contact_history]
+    if dense:
+        windows.append(batch.hand_tactile_force_history)
     for window in windows:
         np.testing.assert_array_equal(window.source_monotonic_ns, expected_source)
         assert np.all(window.source_monotonic_ns > refs - 25_000_000)
         assert np.all(window.source_monotonic_ns <= refs)
     assert batch.logical_step_monotonic_ns == refs[-1]
     np.testing.assert_array_equal(
-        batch.hand_tactile_sum_history.values[:, 0, 0], _REF_TICKS
+        batch.hand_contact_history.values[:, 0, 0], _REF_TICKS
     )
 
 
@@ -109,10 +102,8 @@ def test_d9_visual_state_contact_and_dense_use_logical_grid(visual, dense):
         "qpos_stale",
         "future_source",
         "future_publish",
-        "uncalibrated",
-        "unit",
-        "source_mismatch",
-        "dense_unfresh",
+        "aggregate_invalid",
+        "dense_invalid",
     ],
 )
 def test_d9_visual_runtime_failures_remain_closed(defect):
@@ -146,21 +137,18 @@ def test_d9_visual_runtime_failures_remain_closed(defect):
                 defect == "qpos_stale"
             )
     else:
-        for data, _, _ in shared.hand_tactile_ring._records:
-            if defect == "uncalibrated":
-                data["calibrated"] = False
-            elif defect == "unit":
-                data["unit_code"] = 255
-            elif defect == "source_mismatch":
-                data["source_monotonic_ns"] -= np.uint64(1)
+        # aggregate_invalid / dense_invalid: the corresponding tactile validity
+        # bit is cleared on every hand sample.
+        for data, _, _ in shared.hand_state_ring._records:
+            if defect == "aggregate_invalid":
+                data["tactile_aggregate_valid"] = 0
             else:
-                data["fresh"] = False
+                data["tactile_dense_valid"] = 0
     assert _build(shared, spec) is None
 
 
-def test_visual_contact_only_keeps_dense_freshness_optional():
+def test_visual_contact_only_does_not_require_dense():
     shared, spec, _ = visual_fixture("rgb_pc", dense=False)
-    for data, _, _ in shared.hand_tactile_ring._records:
-        data["fresh"] = False
-        data["tactile_force"] = np.nan
+    for data, _, _ in shared.hand_state_ring._records:
+        data["tactile_dense_valid"] = 0
     assert _build(shared, spec) is not None

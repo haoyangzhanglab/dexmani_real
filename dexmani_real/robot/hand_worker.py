@@ -17,12 +17,9 @@ import numpy as np
 
 from dexmani_real.config.defaults import HandParams
 from dexmani_real.ipc.schema import (
-    HAND_CONTACT_SHAPE,
     HAND_STATE_DTYPE,
-    HAND_TACTILE_DTYPE,
     HAND_TACTILE_FORCE_SHAPE,
     HAND_TACTILE_SUM_SHAPE,
-    TACTILE_UNIT_CODE_XHAND_SDK_NATIVE,
 )
 from dexmani_real.robot.command_validation import check_worker_hand_target
 from dexmani_real.utils.limits import limit_hand_target_delta
@@ -87,42 +84,15 @@ def _log_board_error_transitions(
     return {name: current[name].copy() for name in previous}
 
 
-def _build_tactile_frame(
-    tactile_force: np.ndarray,
-    *,
-    source_monotonic_ns: int,
-    valid: bool,
-    calibrated: bool,
-) -> np.ndarray:
-    """Build one tactile publication, explicitly invalidating bad payloads."""
-    frame = np.zeros(1, dtype=HAND_TACTILE_DTYPE)
-    if valid:
-        force = np.asarray(tactile_force, dtype=np.float64)
-        if force.shape != HAND_TACTILE_FORCE_SHAPE or not np.all(np.isfinite(force)):
-            raise ValueError(
-                "valid tactile_force must be finite with shape "
-                f"{HAND_TACTILE_FORCE_SHAPE}"
-            )
-        frame["tactile_force"][0] = force
-    frame["source_monotonic_ns"][0] = max(0, int(source_monotonic_ns))
-    frame["fresh"][0] = int(valid)
-    # Calibration state is independent of dense-frame validity: a contact-only
-    # policy still needs a calibrated hand even when dense tactile is absent.
-    frame["calibrated"][0] = int(calibrated)
-    frame["unit_code"][0] = TACTILE_UNIT_CODE_XHAND_SDK_NATIVE
-    return frame
-
-
 def _publish_feedback(
     shared: Any,
     *,
     qpos: np.ndarray,
     current_ma: np.ndarray,
-    tactile_sum: np.ndarray,
-    tactile_sum_valid: bool,
-    tactile_contact: np.ndarray,
-    tactile_force: np.ndarray,
-    tactile_valid: bool,
+    tactile_aggregate: np.ndarray,
+    tactile_aggregate_valid: bool,
+    tactile_dense: np.ndarray,
+    tactile_dense_valid: bool,
     tactile_calibrated: bool,
     connected: bool,
     read_failed: bool,
@@ -134,16 +104,23 @@ def _publish_feedback(
     tipboard_err: np.ndarray,
     source_monotonic_ns: int,
 ) -> None:
-    """Serialize one hand-state and tactile feedback pair."""
+    """Serialize one hand-state record carrying qpos/current and both tactile payloads."""
     from dexmani_real.ipc.channels import new_frame
 
     source_ns = max(0, int(source_monotonic_ns))
     frame = new_frame(HAND_STATE_DTYPE)
     frame["qpos"][0] = qpos
     frame["current"][0] = current_ma
-    frame["tactile_sum"][0] = tactile_sum
-    frame["tactile_sum_valid"][0] = int(tactile_sum_valid)
-    frame["tactile_contact"][0] = tactile_contact
+    frame["tactile_aggregate"][0] = np.asarray(tactile_aggregate, dtype=np.float32)
+    frame["tactile_dense"][0] = np.asarray(tactile_dense, dtype=np.float32)
+    # Session software-bias readiness gates both tactile representations at the
+    # worker boundary: a failed zeroing leaves them invalid while joint control
+    # continues. This is the one-place combination of per-read validity with
+    # startup readiness (see xhand_tactile_research_simplification_plan §5.4).
+    frame["tactile_aggregate_valid"][0] = int(
+        tactile_calibrated and tactile_aggregate_valid
+    )
+    frame["tactile_dense_valid"][0] = int(tactile_calibrated and tactile_dense_valid)
     frame["connected"][0] = int(connected)
     frame["qpos_stale"][0] = int(read_failed)
     frame["accepted_target_action_id"][0] = int(accepted_target_action_id)
@@ -161,14 +138,6 @@ def _publish_feedback(
     frame["state_valid"][0] = int(connected and not read_failed)
     frame["timestamp"][0] = source_ns / 1e9
     shared.hand_state_ring.write(frame)
-    shared.hand_tactile_ring.write(
-        _build_tactile_frame(
-            tactile_force,
-            source_monotonic_ns=source_ns,
-            valid=bool(connected and tactile_valid),
-            calibrated=tactile_calibrated,
-        )
-    )
 
 
 def hand_loop(
@@ -225,11 +194,10 @@ def hand_loop(
             shared,
             qpos=initial_state.qpos,
             current_ma=initial_state.current_ma,
-            tactile_sum=initial_state.tactile_sum,
-            tactile_sum_valid=initial_state.tactile_sum_valid,
-            tactile_contact=initial_state.tactile_contact,
-            tactile_force=initial_state.tactile_force,
-            tactile_valid=initial_state.tactile_valid,
+            tactile_aggregate=initial_state.tactile_aggregate,
+            tactile_aggregate_valid=initial_state.tactile_aggregate_valid,
+            tactile_dense=initial_state.tactile_dense,
+            tactile_dense_valid=initial_state.tactile_dense_valid,
             tactile_calibrated=hand.tactile_calibrated,
             connected=True,
             read_failed=False,
@@ -271,11 +239,10 @@ def hand_loop(
                     shared,
                     qpos=last_state.qpos,
                     current_ma=last_state.current_ma,
-                    tactile_sum=np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64),
-                    tactile_sum_valid=False,
-                    tactile_contact=np.zeros(HAND_CONTACT_SHAPE, dtype=bool),
-                    tactile_force=np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64),
-                    tactile_valid=False,
+                    tactile_aggregate=np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64),
+                    tactile_aggregate_valid=False,
+                    tactile_dense=np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64),
+                    tactile_dense_valid=False,
                     tactile_calibrated=hand.tactile_calibrated,
                     connected=hand.is_connected,
                     read_failed=True,
@@ -313,11 +280,10 @@ def hand_loop(
                 shared,
                 qpos=state.qpos,
                 current_ma=state.current_ma,
-                tactile_sum=state.tactile_sum,
-                tactile_sum_valid=state.tactile_sum_valid,
-                tactile_contact=state.tactile_contact,
-                tactile_force=state.tactile_force,
-                tactile_valid=state.tactile_valid,
+                tactile_aggregate=state.tactile_aggregate,
+                tactile_aggregate_valid=state.tactile_aggregate_valid,
+                tactile_dense=state.tactile_dense,
+                tactile_dense_valid=state.tactile_dense_valid,
                 tactile_calibrated=hand.tactile_calibrated,
                 connected=hand.is_connected,
                 read_failed=False,

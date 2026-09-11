@@ -43,7 +43,6 @@ from dexmani_real.deployment.timing import (
 from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
     read_causal_structured_frame,
-    read_hand_contact_causal,
 )
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
@@ -102,7 +101,6 @@ logger = get_logger(__name__)
 _POLICY_WORKSPACE_INTERPOLATION_MAX_STEP_RAD = 0.02
 _JOINT_ACTION_DIM = 19
 _EE_ACTION_DIM = 21
-_RECORDING_TACTILE_MAX_AGE_NS = 250_000_000
 _RECORD_FRAME_OK = 0
 _RECORD_FRAME_HELD = 1
 _RECORD_FRAME_IK_FAIL = 2
@@ -910,7 +908,6 @@ class PolicyExecutor:
             for name, ring in (
                 ("arm", self.shared.arm_state_ring),
                 ("hand", self.shared.hand_state_ring),
-                ("tactile", self.shared.hand_tactile_ring),
             ):
                 sources[name] = read_causal_structured_frame(
                     ring, source_field="source_monotonic_ns", anchor_monotonic_ns=now_ns
@@ -930,29 +927,11 @@ class PolicyExecutor:
             )
             if not camera["camera_fresh"]:
                 raise RuntimeError("recording camera unhealthy or stale")
-            tactile = None if sources["tactile"] is None else sources["tactile"][0]
-            tactile_fresh = bool(
-                tactile is not None
-                and tactile["fresh"][0]
-                and now_ns - int(tactile["source_monotonic_ns"][0])
-                <= _RECORDING_TACTILE_MAX_AGE_NS
-            )
-            contact = read_hand_contact_causal(
-                self.shared.hand_state_ring, anchor_monotonic_ns=now_ns
-            )
-            contact_source_ns = (
-                0 if contact is None else int(contact["source_monotonic_ns"][0])
-            )
-            tactile_sum_fresh = bool(
-                0 < contact_source_ns <= now_ns
-                and now_ns - contact_source_ns <= _RECORDING_TACTILE_MAX_AGE_NS
-            )
+            # One causal hand sample carries qpos/current and both tactile
+            # payloads with a single source identity; no backward tactile search.
             state = build_episode_state(
                 arm,
                 hand,
-                tactile if tactile_fresh else None,
-                hand_contact=None if contact is None else contact["tactile_sum"][0],
-                hand_contact_source_monotonic_ns=contact_source_ns,
                 timestamp_s=now_ns / 1e9,
             )
             signals = {
@@ -967,17 +946,6 @@ class PolicyExecutor:
                 "hand_source_monotonic_ns": int(hand["source_monotonic_ns"][0]),
                 "vr_source_monotonic_ns": 0,
                 "camera_source_monotonic_ns": int(camera["source_monotonic_ns"]),
-                "tactile_sum_fresh": tactile_sum_fresh,
-                "tactile_fresh": tactile_fresh,
-                "tactile_source_monotonic_ns": (
-                    0 if tactile is None else int(tactile["source_monotonic_ns"][0])
-                ),
-                "tactile_calibrated": (
-                    False if tactile is None else bool(tactile["calibrated"][0])
-                ),
-                "tactile_unit_code": (
-                    0 if tactile is None else int(tactile["unit_code"][0])
-                ),
             }
             inputs = (state, camera, signals)
             if raw_action is None:

@@ -61,7 +61,6 @@ HAND_TACTILE_FORCE_SHAPE = (
     TACTILE_POINTS_PER_FINGER,
     TACTILE_AXIS_COUNT,
 )
-HAND_CONTACT_SHAPE = (HAND_FINGER_COUNT,)
 HAND_FINGERTIP_SHAPE = (HAND_FINGER_COUNT, 3)
 
 # Canonical order for every cross-process XHand joint vector. Retargeting,

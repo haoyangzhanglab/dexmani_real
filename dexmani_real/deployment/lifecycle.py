@@ -206,7 +206,6 @@ def _compute_policy_observation_ring_capacities(
     capacities = {
         "arm_state_ring_maxlen": arm_state_ring_maxlen,
         "hand_state_ring_maxlen": hand_state_ring_maxlen,
-        "hand_tactile_ring_maxlen": hand_state_ring_maxlen,
     }
     if channels_config.camera_requested:
         capacities["camera_ring_maxlen"] = max(

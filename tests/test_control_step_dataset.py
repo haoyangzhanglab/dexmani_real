@@ -73,17 +73,12 @@ def write_control_episode(
         source["timestamp"][:] = anchor / 1e9
         source["source_sample_index"][:] = np.arange(frames)
         source["observation_anchor_monotonic_ns"][:] = anchor
-        for sensor in ("arm", "hand", "tactile"):
+        for sensor in ("arm", "hand"):
             source[f"{sensor}_source_monotonic_ns"][:] = anchor - 9_000_000
         source["camera_source_monotonic_ns"][:] = anchor - 25_000_000
-        source["hand_contact_source_monotonic_ns"][:] = anchor - 12_000_000
-        for field in (
-            "tactile_calibrated",
-            "tactile_sum_fresh",
-            "tactile_fresh",
-            "flag_camera_fresh",
-        ):
-            source[field][:] = True
+        source["flag_camera_fresh"][:] = True
+        source["hand_contact_valid"][:] = True
+        source["hand_tactile_force_valid"][:] = True
         source["arm_qpos"][:] = np.arange(frames)[:, None] * 0.001
         source["hand_qpos"][:] = np.arange(12)[None, :] * 0.01
         source["hand_contact"][:] = (
@@ -107,7 +102,7 @@ def write_control_episode(
 
 @pytest.mark.parametrize(
     "event",
-    ["ordinary", "camera_stale", "newer_tactile", "dense_unavailable", "short_ik"],
+    ["ordinary", "camera_stale", "dense_unavailable", "short_ik"],
 )
 def test_d1_to_d5_all_rows_and_same_row_contact(tmp_path, event):
     episode = write_control_episode(tmp_path / "raw")
@@ -115,12 +110,10 @@ def test_d1_to_d5_all_rows_and_same_row_contact(tmp_path, event):
         if event == "camera_stale":
             raw["flag_camera_fresh"][12] = False
         if event == "dense_unavailable":
-            raw["tactile_fresh"][12] = False
+            raw["hand_tactile_force_valid"][12] = False
             raw["hand_tactile_force"][12] = np.nan
-            raw["tactile_source_monotonic_ns"][12] = 0
         if event == "short_ik":
             raw["flag_frame_status"][10:14] = 2
-        # The fixture already has camera=1000, tactile=1016, anchor=1025 ms.
         expected_contact = raw["hand_contact"][:].astype(np.float32)
         expected_state = np.concatenate(
             (raw["arm_qpos"][:], raw["hand_qpos"][:]), axis=1
@@ -184,11 +177,9 @@ def test_eef_pose_invalid_rot6d_fails_validation(tmp_path):
 def test_contact_and_dense_validity_are_independent(tmp_path):
     episode = write_control_episode(tmp_path / "raw")
     with h5py.File(episode / "data.h5", "r+") as raw:
-        # Dense tactile fully failed at row 5 (stale flag, NaN payload, zero
-        # source); the usable aggregate contact must stay valid anyway.
-        raw["tactile_fresh"][5] = False
+        # Dense tactile invalid at row 5; the aggregate contact stays valid.
+        raw["hand_tactile_force_valid"][5] = False
         raw["hand_tactile_force"][5] = np.nan
-        raw["tactile_source_monotonic_ns"][5] = 0
     output = tmp_path / "processed"
     process_episode_root(episode, output, permissive_test_config())
     with h5py.File(output / f"{episode.name}.h5", "r") as data:
@@ -196,21 +187,20 @@ def test_contact_and_dense_validity_are_independent(tmp_path):
         assert bool(data["tactile_force_valid"][5]) is False
 
 
-def test_calibrated_native_unit_contact_is_valid(tmp_path):
-    """Canonical row: finite payload, positive contact source, successful
-    software calibration, and native unit identity is valid."""
+def test_validity_is_copied_directly_not_reconstructed(tmp_path):
+    """Processing copies raw hand_contact_valid verbatim; it never re-derives
+    validity from calibration/unit/freshness fields."""
     episode = write_control_episode(tmp_path / "raw")
     output = tmp_path / "processed"
     process_episode_root(episode, output, permissive_test_config())
     with h5py.File(output / f"{episode.name}.h5", "r") as data:
-        assert bool(np.all(data["tactile_calibrated"][:]))
-        assert np.all(data["tactile_unit_code"][:] == 0)
         assert bool(np.all(data["contact_force_valid"][:]))
+        assert bool(np.all(data["tactile_force_valid"][:]))
 
 
 def test_zero_contact_is_not_intrinsically_invalid(tmp_path):
-    """Zero can be a real no-contact reading; only provenance and
-    representation flags decide, never payload magnitude."""
+    """Zero can be a real no-contact reading; validity is a direct copy of the
+    raw validity bit, never a function of payload magnitude."""
     episode = write_control_episode(tmp_path / "raw")
     with h5py.File(episode / "data.h5", "r+") as raw:
         raw["hand_contact"][:] = 0.0
@@ -221,14 +211,12 @@ def test_zero_contact_is_not_intrinsically_invalid(tmp_path):
         assert np.all(data["contact_force"][:] == 0.0)
 
 
-def test_uncalibrated_contact_is_invalid_but_payload_preserved(tmp_path):
-    """SDK payload validity is not software calibration state: a finite,
-    well-sourced row recorded while calibration had failed cannot satisfy the
-    declared bias-corrected representation, but its payload stays archived
-    unchanged."""
+def test_invalid_contact_is_copied_false_and_payload_preserved(tmp_path):
+    """An invalid aggregate row copies its validity bit verbatim; the archived
+    payload is preserved unchanged (processing does not rewrite it)."""
     episode = write_control_episode(tmp_path / "raw")
     with h5py.File(episode / "data.h5", "r+") as raw:
-        raw["tactile_calibrated"][11] = False
+        raw["hand_contact_valid"][11] = False
         expected_contact = raw["hand_contact"][11].astype(np.float32)
     output = tmp_path / "processed"
     process_episode_root(episode, output, permissive_test_config())
@@ -236,17 +224,6 @@ def test_uncalibrated_contact_is_invalid_but_payload_preserved(tmp_path):
         assert bool(data["contact_force_valid"][11]) is False
         assert bool(data["contact_force_valid"][10]) is True
         np.testing.assert_array_equal(data["contact_force"][11], expected_contact)
-
-
-def test_wrong_unit_contact_is_invalid(tmp_path):
-    episode = write_control_episode(tmp_path / "raw")
-    with h5py.File(episode / "data.h5", "r+") as raw:
-        raw["tactile_unit_code"][13] = 1
-    output = tmp_path / "processed"
-    process_episode_root(episode, output, permissive_test_config())
-    with h5py.File(output / f"{episode.name}.h5", "r") as data:
-        assert bool(data["contact_force_valid"][13]) is False
-        assert bool(data["contact_force_valid"][12]) is True
 
 
 def test_d6_persistent_ik_rejects_whole_episode(tmp_path):

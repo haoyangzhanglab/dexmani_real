@@ -26,18 +26,13 @@ from dexmani_real.deployment.config import (
     validate_policy_runtime_compatibility,
 )
 from dexmani_real.deployment.inference.observation import (
-    FrameWindow,
     ObservationBatch,
     _build_observation,
     _to_policy_observation,
     build_fingertip_runtime,
 )
 from dexmani_real.deployment.lifecycle import _requires_hand_sensor
-from dexmani_real.ipc.schema import (
-    ARM_STATE_DTYPE,
-    HAND_STATE_DTYPE,
-    HAND_TACTILE_DTYPE,
-)
+from dexmani_real.ipc.schema import ARM_STATE_DTYPE, HAND_STATE_DTYPE
 from dexmani_real.planning.kinematics.arm_fk import (
     EEF_POSE_ALGORITHM_ID,
     EEF_POSE_DERIVATION,
@@ -111,38 +106,30 @@ def _arm_record(tick: int, qpos: np.ndarray) -> tuple[np.ndarray, int, int]:
     return data, data["publish_monotonic_ns"][0], tick + 1
 
 
-def _hand_state_record(tick: int) -> tuple[np.ndarray, int, int]:
+def _hand_state_record(
+    tick: int,
+    *,
+    aggregate_valid: bool = True,
+    dense_valid: bool = True,
+) -> tuple[np.ndarray, int, int]:
     data = np.zeros(1, dtype=HAND_STATE_DTYPE)
     data["qpos"][0] = 0.1
-    data["tactile_sum"][0] = float(tick)
+    data["tactile_aggregate"][0] = float(tick)
+    data["tactile_aggregate_valid"][0] = int(aggregate_valid)
+    data["tactile_dense"][0] = float(tick)
+    data["tactile_dense_valid"][0] = int(dense_valid)
     data["state_valid"][0] = 1
-    data["tactile_sum_valid"][0] = 1
     data["qpos_stale"][0] = 0
     data["source_monotonic_ns"][0] = _ref_ns(tick)
     data["publish_monotonic_ns"][0] = _ref_ns(tick) + 10**6
     return data, data["publish_monotonic_ns"][0], tick + 1
 
 
-def _tactile_record(
-    tick: int,
-    *,
-    fresh: bool = True,
-    calibrated: bool = True,
-    unit_code: int = 0,
-) -> tuple[np.ndarray, int, int]:
-    data = np.zeros(1, dtype=HAND_TACTILE_DTYPE)
-    data["tactile_force"][0] = float(tick)
-    data["source_monotonic_ns"][0] = _ref_ns(tick)
-    data["fresh"][0] = int(fresh)
-    data["calibrated"][0] = int(calibrated)
-    data["unit_code"][0] = unit_code
-    return data, _ref_ns(tick) + 10**6, tick + 1
-
-
 def _fake_shared(
     *,
     arm_qpos: np.ndarray | None = None,
-    tactile_uncalibrated_ticks: tuple[int, ...] = (),
+    aggregate_invalid_ticks: tuple[int, ...] = (),
+    dense_invalid_ticks: tuple[int, ...] = (),
 ) -> types.SimpleNamespace:
     ticks = range(6)
     qpos_history = (
@@ -152,11 +139,12 @@ def _fake_shared(
         arm_state_ring=_FakeRing(
             [_arm_record(tick, qpos_history[tick]) for tick in ticks]
         ),
-        hand_state_ring=_FakeRing([_hand_state_record(tick) for tick in ticks]),
-        hand_tactile_ring=_FakeRing(
+        hand_state_ring=_FakeRing(
             [
-                _tactile_record(
-                    tick, calibrated=tick not in tactile_uncalibrated_ticks
+                _hand_state_record(
+                    tick,
+                    aggregate_valid=tick not in aggregate_invalid_ticks,
+                    dense_valid=tick not in dense_invalid_ticks,
                 )
                 for tick in ticks
             ]
@@ -229,150 +217,67 @@ class TestFieldGates(unittest.TestCase):
 
 
 class TestBuildObservation(unittest.TestCase):
-    def test_joint_state_only_skips_full_tactile_read(self) -> None:
+    def test_joint_state_only_skips_tactile_read(self) -> None:
         spec = _fake_policy_spec(_Field("eef_pose", (9,), "float32"))
-        with mock.patch.object(
-            observation_mod, "_read_tactile_force_history"
-        ) as force_reader:
-            observation = _build(_fake_shared(), spec)
-        force_reader.assert_not_called()
+        observation = _build(_fake_shared(), spec)
         self.assertIsNotNone(observation)
+        self.assertIsNone(observation.hand_contact_history)
         self.assertIsNone(observation.hand_tactile_force_history)
         np.testing.assert_array_equal(
             observation.arm_history.source_monotonic_ns,
             np.asarray([_ref_ns(tick) for tick in _REF_TICKS], dtype=np.uint64),
         )
 
-    def test_contact_only_does_not_copy_full_tactile(self) -> None:
+    def test_contact_only_reads_aggregate_not_dense(self) -> None:
         spec = _fake_policy_spec(_Field("contact_force", (5, 3), "float32"))
-        shared = _fake_shared()
-        ring = shared.hand_tactile_ring
-        with mock.patch.object(
-            observation_mod, "_read_tactile_force_history"
-        ) as force_reader, mock.patch.object(
-            ring, "get_last_k", wraps=ring.get_last_k
-        ) as full, mock.patch.object(
-            ring, "get_last_k_fields", wraps=ring.get_last_k_fields
-        ) as projected:
-            observation = _build(shared, spec)
-        full.assert_not_called()
-        projected.assert_called_once_with(
-            ring.maxlen,
-            fields=("source_monotonic_ns", "calibrated", "unit_code"),
-        )
-        force_reader.assert_not_called()
+        observation = _build(_fake_shared(), spec)
         self.assertIsNotNone(observation)
-        self.assertIsNotNone(observation.hand_tactile_sum_history)
-        self.assertIsNotNone(observation.hand_tactile_provenance_history)
+        self.assertIsNotNone(observation.hand_contact_history)
         self.assertIsNone(observation.hand_tactile_force_history)
 
-    def test_tactile_force_requested_reads_aligned_full_tensor(self) -> None:
+    def test_contact_and_dense_share_one_hand_source(self) -> None:
         spec = _fake_policy_spec(
             _Field("contact_force", (5, 3), "float32"),
             _Field("tactile_force", (5, 120, 3), "float32"),
         )
         observation = _build(_fake_shared(), spec)
         self.assertIsNotNone(observation)
+        self.assertIsNotNone(observation.hand_contact_history)
         force_history = observation.hand_tactile_force_history
+        self.assertIsNotNone(force_history)
         self.assertEqual(force_history.values.shape, (_HORIZON, 5, 120, 3))
         np.testing.assert_array_equal(
             force_history.source_monotonic_ns,
-            observation.hand_tactile_sum_history.source_monotonic_ns,
+            observation.hand_contact_history.source_monotonic_ns,
         )
-        self.assertIsNone(observation.hand_tactile_provenance_history)
         for index, tick in enumerate(_REF_TICKS):
             self.assertTrue(np.all(force_history.values[index] == float(tick)))
 
-    def test_full_tactile_snapshot_once_with_or_without_contact(self):
-        for contact_requested in (False, True):
-            with self.subTest(contact=contact_requested):
-                fields = [_Field("tactile_force", (5, 120, 3), "float32")]
-                if contact_requested:
-                    fields.append(_Field("contact_force", (5, 3), "float32"))
-                spec = _fake_policy_spec(*fields)
-                shared = _fake_shared()
-                ring = shared.hand_tactile_ring
-                with mock.patch.object(
-                    ring, "get_last_k", wraps=ring.get_last_k
-                ) as full, mock.patch.object(
-                    ring, "get_last_k_fields", wraps=ring.get_last_k_fields
-                ) as projected, mock.patch.object(
-                    observation_mod, "_read_tactile_provenance_history"
-                ) as provenance:
-                    observation = _build(shared, spec)
-                self.assertIsNotNone(observation)
-                full.assert_called_once_with(ring.maxlen)
-                projected.assert_not_called()
-                provenance.assert_not_called()
-                self.assertIsNone(observation.hand_tactile_provenance_history)
-                self.assertIn("tactile_force", _to_policy_observation(observation, spec).arrays)
-
-    def test_contact_only_source_mismatch_fails_closed(self):
-        shared = _fake_shared()
-        for data, _, _ in shared.hand_tactile_ring._records:
-            data["source_monotonic_ns"] -= 1
-        spec = _fake_policy_spec(_Field("contact_force", (5, 3), "float32"))
-        self.assertIsNone(_build(shared, spec))
-
     def test_contact_only_survives_dense_invalid_but_dense_policy_fails(self) -> None:
-        # Aggregate valid, dense fresh=False, calibrated=True, same source.
-        ticks = range(6)
-        shared = types.SimpleNamespace(
-            arm_state_ring=_FakeRing(
-                [_arm_record(tick, np.zeros(7)) for tick in ticks]
-            ),
-            hand_state_ring=_FakeRing(
-                [_hand_state_record(tick) for tick in ticks]
-            ),
-            hand_tactile_ring=_FakeRing(
-                [
-                    _tactile_record(tick, fresh=False, calibrated=True)
-                    for tick in ticks
-                ]
-            ),
-        )
+        shared = _fake_shared(dense_invalid_ticks=(0, 1, 2, 3, 4, 5))
         contact_spec = _fake_policy_spec(_Field("contact_force", (5, 3), "float32"))
         self.assertIsNotNone(_build(shared, contact_spec))
         dense_spec = _fake_policy_spec(_Field("tactile_force", (5, 120, 3), "float32"))
         self.assertIsNone(_build(shared, dense_spec))
 
-    def test_contact_and_force_source_identity_is_enforced(self) -> None:
-        spec = _fake_policy_spec(
-            _Field("contact_force", (5, 3), "float32"),
-            _Field("tactile_force", (5, 120, 3), "float32"),
-        )
-        shifted_sources = np.asarray(
-            [_ref_ns(tick) - _DT_NS for tick in _REF_TICKS], dtype=np.uint64
-        )
-        shifted = FrameWindow(
-            values=np.zeros((_HORIZON, 5, 120, 3)),
-            source_sequence=np.ones(_HORIZON, dtype=np.uint64),
-            source_monotonic_ns=shifted_sources,
-            publish_monotonic_ns=shifted_sources + 10**6,
-            valid_mask=np.ones(_HORIZON, dtype=np.uint8),
-        )
-        with mock.patch.object(
-            observation_mod, "_read_tactile_force_history", return_value=shifted
-        ):
-            self.assertIsNone(_build(_fake_shared(), spec))
-
-    def test_uncalibrated_tactile_fails_closed(self) -> None:
-        # Ticks 4-5 uncalibrated: the newest calibrated source for ref5 is
-        # ref3, which exceeds the 100ms skew budget, so no observation is
-        # assembled (a single stale sample would legally forward-align).
+    def test_dense_requires_dense_valid(self) -> None:
         spec = _fake_policy_spec(_Field("tactile_force", (5, 120, 3), "float32"))
-        shared = _fake_shared(tactile_uncalibrated_ticks=(4, 5))
+        shared = _fake_shared(dense_invalid_ticks=(4, 5))
+        self.assertIsNone(_build(shared, spec))
+
+    def test_aggregate_requires_aggregate_valid(self) -> None:
+        spec = _fake_policy_spec(_Field("contact_force", (5, 3), "float32"))
+        shared = _fake_shared(aggregate_invalid_ticks=(4, 5))
         self.assertIsNone(_build(shared, spec))
 
     def test_force_window_respects_causal_cut(self) -> None:
         shared = _fake_shared()
-        shared.hand_tactile_ring._records = [
+        shared.hand_state_ring._records = [
             (data, _ANCHOR_NS + 1, sequence)
-            for data, _ring_publish_ns, sequence in shared.hand_tactile_ring._records
+            for data, _ring_publish_ns, sequence in shared.hand_state_ring._records
         ]
         spec = _fake_policy_spec(_Field("tactile_force", (5, 120, 3), "float32"))
         self.assertIsNone(_build(shared, spec))
-
 
 
 class TestToPolicyObservation(unittest.TestCase):

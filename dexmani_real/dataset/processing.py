@@ -5,9 +5,8 @@ from __future__ import annotations
 import shutil
 import tempfile
 from collections import Counter
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Mapping
 
 import h5py
@@ -26,7 +25,6 @@ from dexmani_real.dataset.pointcloud import (
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
 )
-from dexmani_real.ipc.schema import TACTILE_UNIT_CODE_XHAND_SDK_NATIVE
 from dexmani_real.dataset.processed import (
     _ACTION_EE_FRAME,
     _CONTACT_FORCE_SOURCE,
@@ -56,9 +54,8 @@ from dexmani_real.planning.kinematics.fingertip import (
     compute_fingertip_history_xarm_base,
 )
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
-from dexmani_real.recording.storage.reader import EpisodeReader, MergedH5File
+from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.recording.storage.schema import EPISODE_SCHEMA_VERSION
-from dexmani_real.recording.storage.video import VideoDecoder
 from dexmani_real.robot.model import (
     CONTACT_FORCE_REPRESENTATION,
     HAND_FINGER_ORDER_ID,
@@ -82,36 +79,16 @@ _TASK_NAME_CANDIDATE_UNSET = object()
 
 @contextmanager
 def _open_processing_episode(episode: Path):
-    """Read current raw or normalized historical v26, without changing either.
-
-    v25 tactile scale must first be restored out of place by the frozen migration
-    tool with explicit lineage. Historical fields never enter the runtime reader.
-    """
+    """Read current raw only; historical v26 stays frozen (reprocess via old revision)."""
     with h5py.File(episode / "data.h5", "r") as source:
         version = int(source["meta"].attrs["schema_version"])
-    if version == EPISODE_SCHEMA_VERSION:
-        with EpisodeReader(episode) as reader:
-            yield reader
-        return
-    if version != 26:
+    if version != EPISODE_SCHEMA_VERSION:
         raise ValueError(
-            f"offline processing requires current raw or normalized v26; got v{version}"
+            f"offline processing requires current raw v{EPISODE_SCHEMA_VERSION}; "
+            f"got v{version}"
         )
-    with ExitStack() as files:
-        data = files.enter_context(h5py.File(episode / "data.h5", "r"))
-        depth = files.enter_context(h5py.File(episode / "depth.h5", "r"))
-        video = files.enter_context(VideoDecoder(episode / "rgb.mp4"))
-        hz = float(data["meta"].attrs["control_hz"])
-        if not np.isfinite(hz) or hz <= 0:
-            raise ValueError("legacy control_hz must be finite and positive")
-        # A local borrowed-file view is sufficient for this one historical schema.
-        yield SimpleNamespace(
-            h5_path=episode,
-            schema_version=26,
-            h5f=MergedH5File(data, {"depth": depth}),
-            timing=SimpleNamespace(grid_dt_s=1.0 / hz),
-            iter_camera_frames=lambda key: video.iter_frames(),
-        )
+    with EpisodeReader(episode) as reader:
+        yield reader
 
 
 def analyze_episode(
@@ -135,27 +112,20 @@ def analyze_episode(
         "action_arm_joint_sent": ((7,), np.float64),
         "action_hand_joint": ((12,), np.float64),
         "action_arm_ee": ((9,), np.float64),
-        "hand_contact": ((5, 3), np.float64),
-        "hand_tactile_force": ((5, 120, 3), np.float64),
-        "tactile_calibrated": ((), np.bool_),
-        "tactile_unit_code": ((), np.uint8),
-        "tactile_sum_fresh": ((), np.bool_),
-        "tactile_fresh": ((), np.bool_),
+        "hand_contact": ((5, 3), np.float32),
+        "hand_contact_valid": ((), np.bool_),
+        "hand_tactile_force": ((5, 120, 3), np.float32),
+        "hand_tactile_force_valid": ((), np.bool_),
         "timestamp": ((), np.float64),
         "source_sample_index": ((), np.int64),
         "flag_frame_status": ((), np.uint8),
         "observation_anchor_monotonic_ns": ((), np.uint64),
         "arm_source_monotonic_ns": ((), np.uint64),
         "hand_source_monotonic_ns": ((), np.uint64),
-        "tactile_source_monotonic_ns": ((), np.uint64),
         "camera_source_monotonic_ns": ((), np.uint64),
     }
-    # Legacy v26 stored aggregate contact with its hand row (no independent
-    # contact source); current recording selects valid aggregate contact.
-    if reader.schema_version != 26:
-        specs["hand_contact_source_monotonic_ns"] = ((), np.uint64)
-    # Dense/aggregate payloads carry an explicit per-row validity mask, so NaN
-    # (or the legacy finite-zero placeholder) is admissible and never rejects.
+    # Tactile payloads carry an explicit per-row validity mask, so NaN is
+    # admissible for invalid rows and never rejects the episode.
     validity_masked = {"hand_contact", "hand_tactile_force"}
     arrays = {}
     for name, (tail, dtype) in specs.items():
@@ -182,9 +152,6 @@ def analyze_episode(
             raise ValueError(
                 f"{name}: source must be positive and causal to control anchor"
             )
-    for name in ("hand_contact_source_monotonic_ns", "tactile_source_monotonic_ns"):
-        if name in arrays and np.any(arrays[name] > anchor):
-            raise ValueError(f"{name}: source must be causal to control anchor")
     validate_canonical_rot6d(arrays["action_arm_ee"][:, 3:9], label="raw action_arm_ee")
     camera = load_raw_episode_camera_model(reader)
     load_raw_episode_base_from_color(reader)
@@ -507,80 +474,20 @@ def _write_processed_episode(
         output["joint_state"][:] = joint_state
         output["action"][:] = np.concatenate((arm_action, hand_action), axis=1)
         output["action_ee"][:] = np.concatenate((arm_action_ee, hand_action), axis=1)
-        # Copied raw provenance telemetry: lets consumers distinguish stale,
-        # uncalibrated, and wrong/unknown-unit rows behind a validity mask
-        # without a reason framework.  Facts only; never an admission gate.
-        tactile_sum_fresh = np.asarray(
-            reader.h5f["tactile_sum_fresh"][:], dtype=bool
+        # Tactile validity is copied directly from raw; processing never
+        # reconstructs measurement truth from calibration/unit/freshness fields.
+        output["contact_force"][:] = np.asarray(
+            reader.h5f["hand_contact"][:], dtype=np.float32
         )
-        tactile_fresh = np.asarray(reader.h5f["tactile_fresh"][:], dtype=bool)
-        tactile_calibrated = np.asarray(
-            reader.h5f["tactile_calibrated"][:], dtype=bool
+        output["contact_force_valid"][:] = np.asarray(
+            reader.h5f["hand_contact_valid"][:], dtype=bool
         )
-        tactile_unit_code = np.asarray(
-            reader.h5f["tactile_unit_code"][:], dtype=np.uint8
-        )
-        output["contact_force_fresh"][:] = tactile_sum_fresh
-        output["tactile_force_fresh"][:] = tactile_fresh
-        output["tactile_calibrated"][:] = tactile_calibrated
-        output["tactile_unit_code"][:] = tactile_unit_code
-        # Aggregate contact with an explicit per-row validity mask.  Valid
-        # means usable under the declared bias-corrected SDK-native calc_force
-        # representation: finite payload, valid source/provenance, successful
-        # software calibration, and native unit identity.  The calibration is
-        # shared with dense raw_force, but dense availability (tactile_fresh)
-        # is independent and must never gate aggregate validity.
-        hand_contact = np.asarray(reader.h5f["hand_contact"][:], dtype=np.float32)
-        contact_finite = np.all(np.isfinite(hand_contact), axis=(1, 2))
-        contact_representation_valid = tactile_calibrated & (
-            tactile_unit_code == TACTILE_UNIT_CODE_XHAND_SDK_NATIVE
-        )
-        if reader.schema_version != 26:
-            contact_valid = (
-                contact_finite
-                & (
-                    np.asarray(
-                        reader.h5f["hand_contact_source_monotonic_ns"][:],
-                        dtype=np.uint64,
-                    )
-                    > 0
-                )
-                & contact_representation_valid
-            )
-        else:
-            # Legacy v26 kept aggregate contact with its hand row and has no
-            # independent contact source; its tactile_sum_fresh is the frozen
-            # converter's conservative copy of the old collapsed freshness
-            # flag.  A finite payload alone never proves a valid measurement
-            # (v25 drivers could copy zero placeholders), so require the best
-            # available provenance; false negatives are acceptable here.
-            contact_valid = (
-                contact_finite & tactile_sum_fresh & contact_representation_valid
-            )
-        output["contact_force"][:] = hand_contact
-        output["contact_force_valid"][:] = contact_valid
-        # Dense tactile with an explicit per-row validity mask.
-        hand_tactile = np.asarray(
+        output["tactile_force"][:] = np.asarray(
             reader.h5f["hand_tactile_force"][:], dtype=np.float32
         )
-        tactile_valid = (
-            np.all(np.isfinite(hand_tactile), axis=(1, 2, 3))
-            & tactile_calibrated
-            & (tactile_unit_code == TACTILE_UNIT_CODE_XHAND_SDK_NATIVE)
-            & (
-                np.asarray(
-                    reader.h5f["tactile_source_monotonic_ns"][:], dtype=np.uint64
-                )
-                > 0
-            )
+        output["tactile_force_valid"][:] = np.asarray(
+            reader.h5f["hand_tactile_force_valid"][:], dtype=bool
         )
-        if reader.schema_version == 26:
-            # Legacy dense freshness is the only dense timing evidence the
-            # historical schema preserved; current raw keeps *_fresh as
-            # independent telemetry instead of a validity input.
-            tactile_valid = tactile_valid & tactile_fresh
-        output["tactile_force"][:] = hand_tactile
-        output["tactile_force_valid"][:] = tactile_valid
         hand_fk = HandKinematics(
             config.hand_urdf_path, list(config.fingertip_link_names)
         )
@@ -609,15 +516,6 @@ def _write_processed_episode(
         ][:]
         output["hand_source_monotonic_ns"][:] = reader.h5f[
             "hand_source_monotonic_ns"
-        ][:]
-        contact_source_name = (
-            "hand_contact_source_monotonic_ns"
-            if reader.schema_version != 26
-            else "hand_source_monotonic_ns"
-        )
-        output["contact_source_monotonic_ns"][:] = reader.h5f[contact_source_name][:]
-        output["tactile_source_monotonic_ns"][:] = reader.h5f[
-            "tactile_source_monotonic_ns"
         ][:]
         output["camera_source_monotonic_ns"][:] = reader.h5f[
             "camera_source_monotonic_ns"

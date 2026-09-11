@@ -46,24 +46,20 @@ from dexmani_real.robot.model import (
 )
 
 PROCESSED_SCHEMA_NAME = "dexmani-real-processed-hdf5"
-PROCESSED_SCHEMA_VERSION = 19
+PROCESSED_SCHEMA_VERSION = 20
 _CONTACT_FORCE_SOURCE = "raw_hand_contact_control_step"
 _VALIDATION_CHUNK_BYTES = 64 * 1024 * 1024
 # Fixed-tail multimodal datasets; rgb/depth/point_cloud have variable tails and
-# are appended by _expected_specs.  Dense/aggregate validity masks and copied
-# raw provenance telemetry are bool/uint8 rows.
+# are appended by _expected_specs.  Tactile validity is a direct copy of the raw
+# hand_contact_valid / hand_tactile_force_valid rows.
 _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "joint_state": ((19,), np.dtype(np.float32)),
     "action": ((19,), np.dtype(np.float32)),
     "action_ee": ((21,), np.dtype(np.float32)),
     "contact_force": ((5, 3), np.dtype(np.float32)),
     "contact_force_valid": ((), np.dtype(np.bool_)),
-    "contact_force_fresh": ((), np.dtype(np.bool_)),
     "tactile_force": ((5, 120, 3), np.dtype(np.float32)),
     "tactile_force_valid": ((), np.dtype(np.bool_)),
-    "tactile_force_fresh": ((), np.dtype(np.bool_)),
-    "tactile_calibrated": ((), np.dtype(np.bool_)),
-    "tactile_unit_code": ((), np.dtype(np.uint8)),
     "fingertip_points": ((5, 3), np.dtype(np.float32)),
     "eef_pose": ((9,), np.dtype(np.float32)),
     "camera_intrinsic": ((9,), np.dtype(np.float32)),
@@ -71,8 +67,6 @@ _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "observation_anchor_monotonic_ns": ((), np.dtype(np.uint64)),
     "arm_source_monotonic_ns": ((), np.dtype(np.uint64)),
     "hand_source_monotonic_ns": ((), np.dtype(np.uint64)),
-    "contact_source_monotonic_ns": ((), np.dtype(np.uint64)),
-    "tactile_source_monotonic_ns": ((), np.dtype(np.uint64)),
     "camera_source_monotonic_ns": ((), np.dtype(np.uint64)),
 }
 # Payloads whose per-row validity mask governs whether NaN is admissible.
@@ -85,12 +79,8 @@ MULTIMODAL_DATASET_KEYS = (
     "action_ee",
     "contact_force",
     "contact_force_valid",
-    "contact_force_fresh",
     "tactile_force",
     "tactile_force_valid",
-    "tactile_force_fresh",
-    "tactile_calibrated",
-    "tactile_unit_code",
     "fingertip_points",
     "eef_pose",
     "rgb",
@@ -101,8 +91,6 @@ MULTIMODAL_DATASET_KEYS = (
     "observation_anchor_monotonic_ns",
     "arm_source_monotonic_ns",
     "hand_source_monotonic_ns",
-    "contact_source_monotonic_ns",
-    "tactile_source_monotonic_ns",
     "camera_source_monotonic_ns",
 )
 # contact_force is the aggregate XHand SDK calc_force per finger, software-bias

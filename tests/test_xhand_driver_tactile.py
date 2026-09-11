@@ -2,8 +2,8 @@
 
 No hardware and no SDK: a fake ``read_state`` feeds ``XHand.get_state`` and
 ``XHand.calibrate_tactile``.  Pins the RS485 partial-validity matrix, SDK-native
-scale (no ``0.1``), the aggregate contact threshold, and the candidate-bias +
-post-bias-verification calibration contract.  Run with:
+scale (no ``0.1``), independent aggregate/dense parse failure, and the
+candidate-bias + post-bias-verification calibration contract.  Run with:
 
     python -m unittest discover -s tests -p 'test_xhand_driver_tactile.py'
 """
@@ -114,31 +114,31 @@ class TestValidityMatrix(unittest.TestCase):
             _TEMPERATURE: (True, True),
             _CRC_CODE: (False, False),
         }
-        for code, (sum_valid, dense_valid) in cases.items():
+        for code, (aggregate_valid, dense_valid) in cases.items():
             with self.subTest(code=code):
                 hand = _make_hand("serial", code, _state())
                 out = hand.get_state()
                 self.assertIsNotNone(out)
-                self.assertEqual(out.tactile_sum_valid, sum_valid)
-                self.assertEqual(out.tactile_valid, dense_valid)
-                if sum_valid:
-                    np.testing.assert_array_equal(out.tactile_sum[0], [1.0, 2.0, 3.0])
+                self.assertEqual(out.tactile_aggregate_valid, aggregate_valid)
+                self.assertEqual(out.tactile_dense_valid, dense_valid)
+                if aggregate_valid:
+                    np.testing.assert_array_equal(out.tactile_aggregate[0], [1.0, 2.0, 3.0])
                 else:
-                    np.testing.assert_array_equal(out.tactile_sum[0], [0.0, 0.0, 0.0])
+                    np.testing.assert_array_equal(out.tactile_aggregate[0], [0.0, 0.0, 0.0])
                 if dense_valid:
-                    np.testing.assert_array_equal(out.tactile_force[0, 0], [4.0, 5.0, 6.0])
+                    np.testing.assert_array_equal(out.tactile_dense[0, 0], [4.0, 5.0, 6.0])
                 else:
-                    np.testing.assert_array_equal(out.tactile_force[0, 0], [0.0, 0.0, 0.0])
+                    np.testing.assert_array_equal(out.tactile_dense[0, 0], [0.0, 0.0, 0.0])
 
     def test_ethercat_nonzero_fails_tactile_closed_joints_usable(self) -> None:
         hand = _make_hand("ethercat", _DISTRIBUTED, _state())
         out = hand.get_state()
         self.assertIsNotNone(out)
         self.assertEqual(out.qpos.shape, (12,))
-        self.assertFalse(out.tactile_sum_valid)
-        self.assertFalse(out.tactile_valid)
+        self.assertFalse(out.tactile_aggregate_valid)
+        self.assertFalse(out.tactile_dense_valid)
 
-    def test_malformed_dense_does_not_erase_valid_sum(self) -> None:
+    def test_malformed_dense_does_not_erase_valid_aggregate(self) -> None:
         sensors = [
             _RawSensor((1.0, 2.0, 3.0), [_Force(4.0, 5.0, 6.0)] * 119)  # short raw
             for _ in range(HAND_FINGER_COUNT)
@@ -146,11 +146,11 @@ class TestValidityMatrix(unittest.TestCase):
         hand = _make_hand("serial", 0, _MalformedState(sensors))
         out = hand.get_state()
         self.assertIsNotNone(out)
-        self.assertTrue(out.tactile_sum_valid)
-        self.assertFalse(out.tactile_valid)
-        np.testing.assert_array_equal(out.tactile_sum[0], [1.0, 2.0, 3.0])
+        self.assertTrue(out.tactile_aggregate_valid)
+        self.assertFalse(out.tactile_dense_valid)
+        np.testing.assert_array_equal(out.tactile_aggregate[0], [1.0, 2.0, 3.0])
 
-    def test_malformed_calc_invalidates_sum(self) -> None:
+    def test_malformed_calc_invalidates_aggregate(self) -> None:
         class _BadCalcSensor:
             calc_force = None  # triggers _force_xyz -> ValueError
             raw_force = [_Force(4.0, 5.0, 6.0) for _ in range(TACTILE_POINTS_PER_FINGER)]
@@ -160,52 +160,46 @@ class TestValidityMatrix(unittest.TestCase):
         )
         out = hand.get_state()
         self.assertIsNotNone(out)
-        self.assertFalse(out.tactile_sum_valid)
+        self.assertFalse(out.tactile_aggregate_valid)
         # Dense parsed independently and stays valid.
-        self.assertTrue(out.tactile_valid)
+        self.assertTrue(out.tactile_dense_valid)
+
+    def test_nonfinite_calc_invalidates_aggregate_only(self) -> None:
+        sensors = [
+            _RawSensor((np.nan, 2.0, 3.0), [_Force(4.0, 5.0, 6.0)] * TACTILE_POINTS_PER_FINGER)
+            for _ in range(HAND_FINGER_COUNT)
+        ]
+        hand = _make_hand("serial", 0, _MalformedState(sensors))
+        out = hand.get_state()
+        self.assertIsNotNone(out)
+        self.assertFalse(out.tactile_aggregate_valid)
+        self.assertTrue(out.tactile_dense_valid)
 
 
 class TestNativeScale(unittest.TestCase):
     def test_zero_bias_returns_sdk_values_unchanged(self) -> None:
         hand = _make_hand("serial", 0, _state(calc=(10.0, 20.0, 30.0), raw=(4.0, 5.0, 6.0)))
         out = hand.get_state()
-        np.testing.assert_array_equal(out.tactile_sum[0], [10.0, 20.0, 30.0])
-        np.testing.assert_array_equal(out.tactile_force[0, 0], [4.0, 5.0, 6.0])
+        np.testing.assert_array_equal(out.tactile_aggregate[0], [10.0, 20.0, 30.0])
+        np.testing.assert_array_equal(out.tactile_dense[0, 0], [4.0, 5.0, 6.0])
 
     def test_bias_subtracts(self) -> None:
         hand = _make_hand("serial", 0, _state(calc=(10.0, 20.0, 30.0), raw=(4.0, 5.0, 6.0)))
-        hand._tactile_bias_sum = np.full((5, 3), 1.0)
-        hand._tactile_bias_raw = np.full((5, 120, 3), 2.0)
+        hand._tactile_bias_aggregate = np.full((5, 3), 1.0)
+        hand._tactile_bias_dense = np.full((5, 120, 3), 2.0)
         out = hand.get_state()
-        np.testing.assert_array_equal(out.tactile_sum[0], [9.0, 19.0, 29.0])
-        np.testing.assert_array_equal(out.tactile_force[0, 0], [2.0, 3.0, 4.0])
+        np.testing.assert_array_equal(out.tactile_aggregate[0], [9.0, 19.0, 29.0])
+        np.testing.assert_array_equal(out.tactile_dense[0, 0], [2.0, 3.0, 4.0])
 
 
-class TestContactThreshold(unittest.TestCase):
-    def _contact(self, calc: tuple[float, float, float]) -> np.ndarray:
-        hand = _make_hand("serial", 0, _state(calc=calc))
-        return hand.get_state().tactile_contact
-
-    def test_below_threshold_no_contact(self) -> None:
-        self.assertFalse(bool(self._contact((1.0, 0.0, 0.0))[0]))
-
-    def test_equal_threshold_no_contact(self) -> None:
-        # The driver uses a strict ``>`` comparison: exactly 2.0 is not contact.
-        self.assertFalse(bool(self._contact((2.0, 0.0, 0.0))[0]))
-
-    def test_above_threshold_contact(self) -> None:
-        self.assertTrue(bool(self._contact((2.5, 0.0, 0.0))[0]))
-
-
-def _xstate(tactile_sum, *, sum_valid=True, dense_valid=True) -> XHandState:
+def _xstate(tactile_aggregate, *, aggregate_valid=True, dense_valid=True) -> XHandState:
     return XHandState(
         qpos=np.zeros(12),
         current_ma=np.zeros(12),
-        tactile_force=np.zeros((5, 120, 3)),
-        tactile_sum=np.asarray(tactile_sum, dtype=np.float64),
-        tactile_contact=np.zeros(5, dtype=bool),
-        tactile_sum_valid=sum_valid,
-        tactile_valid=dense_valid,
+        tactile_aggregate=np.asarray(tactile_aggregate, dtype=np.float64),
+        tactile_dense=np.zeros((5, 120, 3)),
+        tactile_aggregate_valid=aggregate_valid,
+        tactile_dense_valid=dense_valid,
         commboard_err=np.zeros(12, dtype=np.int32),
         jointboard_err=np.zeros(12, dtype=np.int32),
         tipboard_err=np.zeros(12, dtype=np.int32),
@@ -226,7 +220,7 @@ class TestCalibration(unittest.TestCase):
         ok, hand = self._calibrate(capture, verify)
         self.assertTrue(ok)
         self.assertTrue(hand.tactile_calibrated)
-        np.testing.assert_allclose(hand._tactile_bias_sum, np.full((5, 3), 1.0))
+        np.testing.assert_allclose(hand._tactile_bias_aggregate, np.full((5, 3), 1.0))
 
     def test_residual_above_threshold_fails_and_clears(self) -> None:
         capture = [_xstate(np.full((5, 3), 1.0)) for _ in range(5)]
@@ -235,12 +229,12 @@ class TestCalibration(unittest.TestCase):
         ok, hand = self._calibrate(capture, verify)
         self.assertFalse(ok)
         self.assertFalse(hand.tactile_calibrated)
-        self.assertIsNone(hand._tactile_bias_sum)
-        self.assertIsNone(hand._tactile_bias_raw)
+        self.assertIsNone(hand._tactile_bias_aggregate)
+        self.assertIsNone(hand._tactile_bias_dense)
 
-    def test_invalid_sum_during_capture_fails(self) -> None:
+    def test_invalid_aggregate_during_capture_fails(self) -> None:
         capture = [_xstate(np.full((5, 3), 1.0)) for _ in range(4)]
-        capture.append(_xstate(np.full((5, 3), 1.0), sum_valid=False))
+        capture.append(_xstate(np.full((5, 3), 1.0), aggregate_valid=False))
         with self.assertRaises(XHandError):
             self._calibrate(capture, [])
 
@@ -250,19 +244,19 @@ class TestCalibration(unittest.TestCase):
         with self.assertRaises(XHandError):
             self._calibrate(capture, [])
 
-    def test_invalid_sum_during_verify_fails_and_clears(self) -> None:
+    def test_invalid_aggregate_during_verify_fails_and_clears(self) -> None:
         capture = [_xstate(np.full((5, 3), 1.0)) for _ in range(5)]
-        verify = [_xstate(np.full((5, 3), 0.1), sum_valid=False)]
+        verify = [_xstate(np.full((5, 3), 0.1), aggregate_valid=False)]
         ok, hand = self._calibrate(capture, verify)
         self.assertFalse(ok)
-        self.assertIsNone(hand._tactile_bias_sum)
+        self.assertIsNone(hand._tactile_bias_aggregate)
 
     def test_invalid_dense_during_verify_fails_and_clears(self) -> None:
         capture = [_xstate(np.full((5, 3), 1.0)) for _ in range(5)]
         verify = [_xstate(np.full((5, 3), 0.1), dense_valid=False)]
         ok, hand = self._calibrate(capture, verify)
         self.assertFalse(ok)
-        self.assertIsNone(hand._tactile_bias_sum)
+        self.assertIsNone(hand._tactile_bias_aggregate)
 
     def test_large_finite_dense_does_not_fail_verification(self) -> None:
         # Dense payload magnitude alone is structural-only: a large but finite
@@ -270,7 +264,7 @@ class TestCalibration(unittest.TestCase):
         capture = [_xstate(np.full((5, 3), 1.0)) for _ in range(5)]
         verify = [_xstate(np.full((5, 3), 0.1)) for _ in range(3)]
         for state in verify:
-            state.tactile_force = np.full((5, 120, 3), 1000.0)
+            state.tactile_dense = np.full((5, 120, 3), 1000.0)
         ok, hand = self._calibrate(capture, verify)
         self.assertTrue(ok)
         self.assertTrue(hand.tactile_calibrated)

@@ -10,7 +10,7 @@ from dexmani_real.deployment.inference import observation as obs
 from dexmani_real.ipc.schema import (
     ARM_STATE_DTYPE,
     CAMERA_FRAME_HEADER_DTYPE,
-    HAND_TACTILE_DTYPE,
+    HAND_STATE_DTYPE,
 )
 
 
@@ -39,14 +39,22 @@ def test_invalid_state_never_enters_history(source, publish, value):
 
 
 def test_nonfinite_tactile_payload_is_rejected_at_read():
-    record = np.zeros(1, dtype=HAND_TACTILE_DTYPE)
+    record = np.zeros(1, dtype=HAND_STATE_DTYPE)
     record["source_monotonic_ns"] = 90
-    record["fresh"] = record["calibrated"] = 1
-    record["tactile_force"][0, 0, 0, 0] = np.inf
+    record["publish_monotonic_ns"] = 95
+    record["state_valid"] = 1
+    record["tactile_dense_valid"] = 1
+    record["tactile_dense"][0, 0, 0] = np.inf
     ring = SimpleNamespace(maxlen=4, get_last_k=lambda k: [(record, 95, 1)])
     assert (
-        obs._read_tactile_force_history(
-            ring, history_len=4, anchor_ns=100, max_age_ns=20, not_before_ns=1
+        obs._read_state_history(
+            ring,
+            history_len=4,
+            anchor_ns=100,
+            values_field="tactile_dense",
+            required_true_fields=("state_valid", "tactile_dense_valid"),
+            max_age_ns=20,
+            not_before_ns=1,
         )
         is None
     )

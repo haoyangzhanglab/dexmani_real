@@ -19,7 +19,6 @@ from dexmani_real.ipc.schema import (
     ARM_STATE_DTYPE,
     COUPLED_COMMAND_DTYPE,
     HAND_STATE_DTYPE,
-    HAND_TACTILE_DTYPE,
     PREDICTION_DTYPE,
     SUPPORTED_POINT_CLOUD_COUNTS,
     VR_FRAME_DTYPE,
@@ -54,7 +53,6 @@ class RuntimeChannelsConfig:
     vr_ring_maxlen: int = 8
     arm_state_ring_maxlen: int = 8
     hand_state_ring_maxlen: int = 8
-    hand_tactile_ring_maxlen: int = 8
     coupled_cmd_ring_maxlen: int = 8
     record_sample_ring_maxlen: int = 4
     pointcloud_num_points: int = 1024
@@ -79,7 +77,6 @@ class RuntimeChannelsConfig:
             self.vr_ring_maxlen,
             self.arm_state_ring_maxlen,
             self.hand_state_ring_maxlen,
-            self.hand_tactile_ring_maxlen,
             self.coupled_cmd_ring_maxlen,
             self.record_sample_ring_maxlen,
             self.pointcloud_ring_maxlen,
@@ -127,7 +124,6 @@ _RING_RESOURCE_NAMES = (
     "vr_ring",
     "arm_state_ring",
     "hand_state_ring",
-    "hand_tactile_ring",
     "coupled_cmd_ring",
     "record_sample_ring",
     "prediction_ring",
@@ -182,7 +178,6 @@ class RuntimeChannels:
     vr_ring: SharedMemoryRingBuffer  # vr -> policy
     arm_state_ring: SharedMemoryRingBuffer  # arm -> policy
     hand_state_ring: SharedMemoryRingBuffer  # hand -> policy
-    hand_tactile_ring: SharedMemoryRingBuffer  # hand -> policy (sparse)
     coupled_cmd_ring: SharedMemoryRingBuffer  # serialized control -> arm/hand endpoint
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     prediction_ring: SharedMemoryRingBuffer  # inference -> policy executor, single latest
@@ -303,12 +298,6 @@ class RuntimeChannels:
             f"{prefix}_hand_state",
             dtype=HAND_STATE_DTYPE,
             maxlen=cfg.hand_state_ring_maxlen,
-            create=True,
-        )
-        storage.hand_tactile_ring = SharedMemoryRingBuffer(
-            f"{prefix}_hand_tactile",
-            dtype=HAND_TACTILE_DTYPE,
-            maxlen=cfg.hand_tactile_ring_maxlen,
             create=True,
         )
         storage.coupled_cmd_ring = SharedMemoryRingBuffer(
@@ -511,9 +500,10 @@ def read_hand_state_dict(shared: "RuntimeChannels") -> "dict | None":
     return {
         "qpos": np.asarray(data["qpos"][0], dtype=np.float64),
         "current": np.asarray(data["current"][0], dtype=np.float64),
-        "tactile_sum": np.asarray(data["tactile_sum"][0], dtype=np.float64),
-        "tactile_sum_valid": bool(data["tactile_sum_valid"][0]),
-        "tactile_contact": np.asarray(data["tactile_contact"][0], dtype=bool),
+        "tactile_aggregate": np.asarray(data["tactile_aggregate"][0], dtype=np.float32),
+        "tactile_aggregate_valid": bool(data["tactile_aggregate_valid"][0]),
+        "tactile_dense": np.asarray(data["tactile_dense"][0], dtype=np.float32),
+        "tactile_dense_valid": bool(data["tactile_dense_valid"][0]),
         "connected": bool(data["connected"][0]),
         "qpos_stale": bool(data["qpos_stale"][0]),
         "accepted_target_action_id": int(data["accepted_target_action_id"][0]),

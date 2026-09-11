@@ -21,7 +21,6 @@ from xhand_controller import xhand_control as xhc  # type: ignore[import-untyped
 
 from dexmani_real.config.defaults import HandParams
 from dexmani_real.robot.model import (
-    HAND_CONTACT_SHAPE,
     HAND_DOF,
     HAND_FINGER_COUNT,
     HAND_JOINT_SHAPE,
@@ -73,12 +72,8 @@ _TACTILE_BIAS_SAMPLE_COUNT = 5
 _TACTILE_VERIFY_SAMPLE_COUNT = 3
 _TACTILE_BIAS_SAMPLE_INTERVAL_S = 0.02
 _POSITION_MODE = 3
-# Derived convenience contact bit: aggregate ||calc_force|| above this in
-# XHand SDK-native unknown units (not Newtons). Dense taxels stay continuous.
-_TACTILE_CONTACT_THRESHOLD = 2.0
-# Post-bias no-contact residual bound for calibration verification, also in
-# XHand SDK-native unknown units. Semantically distinct from the contact
-# threshold even though both currently equal 2.0, so they stay tunable apart.
+# Post-bias no-contact residual bound for calibration verification, in XHand
+# SDK-native unknown units.
 _TACTILE_CALIBRATION_RESIDUAL_THRESHOLD = 2.0
 _CONNECTION_HINT = {
     "ethercat": "Check XHand power, EtherCAT cable/link, SDK permissions, and stale slave state",
@@ -107,13 +102,14 @@ def _force_xyz(force: Any, label: str) -> np.ndarray:
 
 
 def _tactile_validity(code: int | None, *, comm_type: str) -> tuple[bool, bool]:
-    """Return ``(calc_force_valid, raw_force_valid)`` for one read status.
+    """Return ``(aggregate_allowed, dense_allowed)`` for one read status.
 
     Serial/RS485 exposes partial tactile statuses: a distributed-force drop
-    (``1501019``) leaves combined ``calc_force`` valid while ``raw_force`` is
-    unavailable, and a temperature drop (``1501020``) keeps both force fields.
-    EtherCAT is not known to share those partial semantics, so any nonzero
-    status fails tactile closed there while joints stay usable per the caller.
+    (``1501019``) leaves aggregate ``calc_force`` valid while dense
+    ``raw_force`` is unavailable, and a temperature drop (``1501020``) keeps
+    both force fields.  EtherCAT is not known to share those partial
+    semantics, so any nonzero status fails tactile closed there while joints
+    stay usable per the caller.
     """
     if comm_type == "ethercat":
         return (code == 0, code == 0)
@@ -154,11 +150,10 @@ class XHandState:
 
     qpos: np.ndarray
     current_ma: np.ndarray
-    tactile_force: np.ndarray
-    tactile_sum: np.ndarray
-    tactile_contact: np.ndarray
-    tactile_sum_valid: bool
-    tactile_valid: bool
+    tactile_aggregate: np.ndarray
+    tactile_dense: np.ndarray
+    tactile_aggregate_valid: bool
+    tactile_dense_valid: bool
     commboard_err: np.ndarray
     jointboard_err: np.ndarray
     tipboard_err: np.ndarray
@@ -179,8 +174,8 @@ class XHand:
 
         self._control: Any = None
         self._command: Any = None
-        self._tactile_bias_sum: np.ndarray | None = None
-        self._tactile_bias_raw: np.ndarray | None = None
+        self._tactile_bias_aggregate: np.ndarray | None = None
+        self._tactile_bias_dense: np.ndarray | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -188,7 +183,10 @@ class XHand:
 
     @property
     def tactile_calibrated(self) -> bool:
-        return self._tactile_bias_sum is not None and self._tactile_bias_raw is not None
+        return (
+            self._tactile_bias_aggregate is not None
+            and self._tactile_bias_dense is not None
+        )
 
     def connect(self) -> None:
         """Open the configured device and seed its command buffer from live feedback."""
@@ -395,18 +393,18 @@ class XHand:
         A failed verification clears both biases so a half-calibrated state is
         never left behind.
         """
-        self._tactile_bias_sum = None
-        self._tactile_bias_raw = None
-        bias_sum, bias_raw = self._capture_tactile_bias()
+        self._tactile_bias_aggregate = None
+        self._tactile_bias_dense = None
+        bias_aggregate, bias_dense = self._capture_tactile_bias()
         # Publish both candidate biases together, then verify from fresh reads.
-        self._tactile_bias_sum = bias_sum
-        self._tactile_bias_raw = bias_raw
+        self._tactile_bias_aggregate = bias_aggregate
+        self._tactile_bias_dense = bias_dense
         if not self._verify_tactile_bias():
             logger.error(
                 "Tactile calibration failed post-bias verification; biases cleared"
             )
-            self._tactile_bias_sum = None
-            self._tactile_bias_raw = None
+            self._tactile_bias_aggregate = None
+            self._tactile_bias_dense = None
             return False
         logger.info(
             "XHand tactile software bias calibrated from %d no-contact samples",
@@ -415,7 +413,7 @@ class XHand:
         return self.tactile_calibrated
 
     def _capture_tactile_bias(self) -> tuple[np.ndarray, np.ndarray]:
-        """Collect candidate ``(bias_sum, bias_raw)`` without declaring success.
+        """Collect candidate ``(bias_aggregate, bias_dense)`` without declaring success.
 
         Every capture read must report both aggregate and dense payloads as
         valid and finite; a failure raises rather than returning a partial
@@ -432,18 +430,20 @@ class XHand:
                     -1,
                     "joint state unavailable during bias capture",
                 )
-            if not state.tactile_sum_valid or not state.tactile_valid:
+            if not state.tactile_aggregate_valid or not state.tactile_dense_valid:
                 raise XHandError(
                     "calibrate_tactile",
                     -1,
                     "incomplete tactile data during bias capture",
                 )
             samples.append(state)
-        bias_sum = np.mean(np.stack([sample.tactile_sum for sample in samples]), axis=0)
-        bias_raw = np.mean(
-            np.stack([sample.tactile_force for sample in samples]), axis=0
+        bias_aggregate = np.mean(
+            np.stack([sample.tactile_aggregate for sample in samples]), axis=0
         )
-        return bias_sum, bias_raw
+        bias_dense = np.mean(
+            np.stack([sample.tactile_dense for sample in samples]), axis=0
+        )
+        return bias_aggregate, bias_dense
 
     def _verify_tactile_bias(self) -> bool:
         """Independently verify the published bias from three fresh reads.
@@ -456,14 +456,18 @@ class XHand:
         for _ in range(_TACTILE_VERIFY_SAMPLE_COUNT):
             time.sleep(_TACTILE_BIAS_SAMPLE_INTERVAL_S)
             state = self.get_state()
-            if state is None or not state.tactile_sum_valid or not state.tactile_valid:
+            if (
+                state is None
+                or not state.tactile_aggregate_valid
+                or not state.tactile_dense_valid
+            ):
                 logger.warning("tactile post-bias verification frame invalid")
                 return False
             aggregate_peak = max(
                 aggregate_peak,
-                float(np.max(np.linalg.norm(state.tactile_sum, axis=1))),
+                float(np.max(np.linalg.norm(state.tactile_aggregate, axis=1))),
             )
-            dense_magnitudes = np.abs(state.tactile_force)
+            dense_magnitudes = np.abs(state.tactile_dense)
             logger.info(
                 "tactile verify: dense abs_max=%.3g p99=%.3g",
                 float(np.max(dense_magnitudes)),
@@ -503,44 +507,40 @@ class XHand:
             logger.warning("XHand joint payload invalid", exc_info=True)
             return None
 
-        tactile_force = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
-        tactile_sum = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
-        sum_valid, dense_valid = _tactile_validity(code, comm_type=self.cfg.comm_type)
-        if sum_valid:
+        tactile_dense = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
+        tactile_aggregate = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
+        aggregate_valid, dense_valid = _tactile_validity(
+            code, comm_type=self.cfg.comm_type
+        )
+        if aggregate_valid:
             try:
-                tactile_sum = self._parse_tactile_sum(raw_state)
+                tactile_aggregate = self._parse_tactile_aggregate(raw_state)
             except (AttributeError, TypeError, ValueError, OverflowError):
-                logger.warning("XHand tactile sum payload invalid", exc_info=True)
-                sum_valid = False
-                tactile_sum.fill(0.0)
+                logger.warning("XHand tactile aggregate payload invalid", exc_info=True)
+                aggregate_valid = False
+                tactile_aggregate.fill(0.0)
             else:
                 # Bias subtraction runs only after a successful parse so an
                 # internal bias fault is not mislabeled as a malformed read.
-                if self._tactile_bias_sum is not None:
-                    tactile_sum = tactile_sum - self._tactile_bias_sum
+                if self._tactile_bias_aggregate is not None:
+                    tactile_aggregate = tactile_aggregate - self._tactile_bias_aggregate
         if dense_valid:
             try:
-                tactile_force = self._parse_tactile_force(raw_state)
+                tactile_dense = self._parse_tactile_dense(raw_state)
             except (AttributeError, TypeError, ValueError, OverflowError):
-                logger.warning("XHand tactile force payload invalid", exc_info=True)
+                logger.warning("XHand tactile dense payload invalid", exc_info=True)
                 dense_valid = False
-                tactile_force.fill(0.0)
+                tactile_dense.fill(0.0)
             else:
-                if self._tactile_bias_raw is not None:
-                    tactile_force = tactile_force - self._tactile_bias_raw
-        tactile_contact = (
-            np.linalg.norm(tactile_sum, axis=1) > _TACTILE_CONTACT_THRESHOLD
-            if sum_valid
-            else np.zeros(HAND_CONTACT_SHAPE, dtype=bool)
-        )
+                if self._tactile_bias_dense is not None:
+                    tactile_dense = tactile_dense - self._tactile_bias_dense
         return XHandState(
             qpos=qpos,
             current_ma=current,
-            tactile_force=tactile_force,
-            tactile_sum=tactile_sum,
-            tactile_contact=tactile_contact,
-            tactile_sum_valid=sum_valid,
-            tactile_valid=dense_valid,
+            tactile_aggregate=tactile_aggregate,
+            tactile_dense=tactile_dense,
+            tactile_aggregate_valid=aggregate_valid,
+            tactile_dense_valid=dense_valid,
             **board_errors,
         )
 
@@ -647,21 +647,21 @@ class XHand:
             )
         return sensors
 
-    def _parse_tactile_sum(self, state: Any) -> np.ndarray:
+    def _parse_tactile_aggregate(self, state: Any) -> np.ndarray:
         """Return the SDK-native ``[5,3]`` aggregate ``calc_force`` payload."""
         sensors = self._sensor_data(state)
-        force_sum = np.empty(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
+        force_aggregate = np.empty(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
         for sensor_index, sensor in enumerate(sensors):
-            force_sum[sensor_index] = _force_xyz(
+            force_aggregate[sensor_index] = _force_xyz(
                 getattr(sensor, "calc_force", None),
                 f"sensor_data[{sensor_index}].calc_force",
             )
-        return force_sum
+        return force_aggregate
 
-    def _parse_tactile_force(self, state: Any) -> np.ndarray:
+    def _parse_tactile_dense(self, state: Any) -> np.ndarray:
         """Return the SDK-native ``[5,120,3]`` dense ``raw_force`` payload."""
         sensors = self._sensor_data(state)
-        tactile_force = np.empty(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
+        tactile_dense = np.empty(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
         for sensor_index, sensor in enumerate(sensors):
             points = list(sensor.raw_force)
             if len(points) != TACTILE_POINTS_PER_FINGER:
@@ -670,7 +670,7 @@ class XHand:
                     f"{TACTILE_POINTS_PER_FINGER} points, got {len(points)}"
                 )
             for point_index, force in enumerate(points):
-                tactile_force[sensor_index, point_index] = _force_xyz(
+                tactile_dense[sensor_index, point_index] = _force_xyz(
                     force, f"sensor_data[{sensor_index}].raw_force[{point_index}]"
                 )
-        return tactile_force
+        return tactile_dense

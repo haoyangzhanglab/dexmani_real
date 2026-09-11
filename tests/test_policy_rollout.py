@@ -861,7 +861,6 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         executor.recorder = recorder
         shared.arm_state_ring = mock.Mock()
         shared.hand_state_ring = mock.Mock()
-        shared.hand_tactile_ring = mock.Mock()
         return executor
 
     def begin(self, executor):
@@ -1217,15 +1216,12 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
             mock.patch.object(
                 executor_mod,
                 "read_causal_structured_frame",
-                side_effect=[(arm, source_ns, 1), (hand, source_ns, 1), None],
+                side_effect=[(arm, source_ns, 1), (hand, source_ns, 1)],
             ),
             mock.patch.object(
                 executor_mod, "read_camera_frame_causal", return_value=camera
             ),
             mock.patch.object(executor_mod, "build_episode_state", return_value=state),
-            mock.patch.object(
-                executor_mod, "read_hand_contact_causal", return_value=None
-            ),
             mock.patch.object(executor, "_record_frame", return_value=True) as record,
         ):
             executor._record_rollout_tick(now)

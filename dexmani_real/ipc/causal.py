@@ -78,40 +78,6 @@ def read_causal_structured_frame(
     return None
 
 
-def read_hand_contact_causal(
-    ring: Any, *, anchor_monotonic_ns: int
-) -> np.ndarray | None:
-    """Select usable aggregate contact independently of the newest hand qpos.
-
-    Recording retains old but valid contact; age is telemetry, not admission.
-    Invalid worker placeholders must never become a valid no-contact reading.
-    """
-    latest_sequence = int(ring.latest_sequence)
-    oldest_sequence = max(1, latest_sequence - int(ring.maxlen) + 1)
-    for sequence in range(latest_sequence, oldest_sequence - 1, -1):
-        result = ring.read_sequence(sequence)
-        if result is None:
-            continue
-        frame, ring_publish_ns, _sequence = result
-        row = frame[0]
-        contact = row["tactile_sum"]
-        if (
-            row["state_valid"] == 1
-            and row["tactile_sum_valid"] == 1
-            and row["qpos_stale"] == 0
-            and contact.shape == (5, 3)
-            and contact.dtype == np.dtype(np.float64)
-            and np.all(np.isfinite(contact))
-            and 0
-            < int(row["source_monotonic_ns"])
-            <= int(row["publish_monotonic_ns"])
-            <= int(ring_publish_ns)
-            <= int(anchor_monotonic_ns)
-        ):
-            return frame
-    return None
-
-
 def read_arm_state_causal(
     shared: RuntimeChannels, *, anchor_monotonic_ns: int | None = None
 ) -> np.ndarray | None:
@@ -171,25 +137,6 @@ def read_vr_frame_causal(
         "ring_sequence": int(sequence),
         "side": int(rec["side"]),
     }
-
-
-def read_hand_tactile_causal(
-    shared: RuntimeChannels, *, anchor_monotonic_ns: int | None = None
-) -> np.ndarray | None:
-    """Read the latest or newest causal hand tactile frame."""
-    result = (
-        shared.hand_tactile_ring.read_latest()
-        if anchor_monotonic_ns is None
-        else read_causal_structured_frame(
-            shared.hand_tactile_ring,
-            source_field="source_monotonic_ns",
-            anchor_monotonic_ns=int(anchor_monotonic_ns),
-        )
-    )
-    if result is None:
-        return None
-    data, _ts_ns, _seq = result
-    return data
 
 
 def read_camera_frame_causal(

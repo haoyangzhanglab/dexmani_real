@@ -6,7 +6,6 @@ import time
 
 import numpy as np
 
-from dexmani_real.ipc.causal import read_hand_contact_causal
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning.kinematics.pose import (
     normalize_quat_wxyz,
@@ -20,30 +19,7 @@ _FRAME_HELD = 1
 FRAME_IK_FAIL = 2
 FRAME_SAFETY_REJECT = 3
 FRAME_RETARGET_FAIL = 4
-RECORDING_TACTILE_MAX_AGE_NS = 250_000_000
 _NS_PER_SECOND = 1_000_000_000
-
-
-def _dense_tactile_fresh(hand_tactile: np.ndarray | None, *, anchor_ns: int) -> bool:
-    """Return whether the dense tactile frame is valid and causal to the anchor.
-
-    A non-fresh frame must be persisted as NaN rather than the worker's
-    zero-fill, so an invalid dense payload can never be mistaken for a valid
-    no-contact reading. This mirrors the deployment executor's gate and is the
-    single source for both the recorded ``tactile_fresh`` flag and the payload
-    gating in ``record_frame``/``record_held``.
-    """
-    if hand_tactile is None or hand_tactile.dtype.names is None:
-        return False
-    names = hand_tactile.dtype.names
-    if "fresh" not in names or "source_monotonic_ns" not in names:
-        return False
-    source_ns = int(hand_tactile["source_monotonic_ns"][0])
-    return (
-        int(hand_tactile["fresh"][0]) == 1
-        and 0 < source_ns <= anchor_ns
-        and anchor_ns - source_ns <= RECORDING_TACTILE_MAX_AGE_NS
-    )
 
 
 def stop_recording(
@@ -64,11 +40,9 @@ def stop_recording(
 def _recording_provenance(
     arm_state: np.ndarray | None,
     hand_state: np.ndarray | None,
-    hand_tactile: np.ndarray | None,
     vr_frame: dict | None,
     cam: dict | None,
     *,
-    hand_contact_source_monotonic_ns: int,
     anchor_monotonic_ns: int | None = None,
     max_observation_skew_s: float,
 ) -> dict[str, object]:
@@ -148,13 +122,6 @@ def _recording_provenance(
         max_observation_skew_s
     )
 
-    tactile_source_ns = _field(hand_tactile, "source_monotonic_ns")
-    tactile_fresh = _dense_tactile_fresh(hand_tactile, anchor_ns=anchor_ns)
-    # Contact selection has already proved validity; age remains telemetry only.
-    tactile_sum_fresh = (
-        0 < hand_contact_source_monotonic_ns <= anchor_ns
-        and anchor_ns - hand_contact_source_monotonic_ns <= RECORDING_TACTILE_MAX_AGE_NS
-    )
     return {
         "observation_anchor_monotonic_ns": anchor_ns,
         "arm_source_monotonic_ns": arm_source_ns,
@@ -162,11 +129,6 @@ def _recording_provenance(
         "vr_source_monotonic_ns": vr_source_ns,
         "camera_source_monotonic_ns": camera_source_ns,
         "observation_valid": observation_valid,
-        "tactile_sum_fresh": tactile_sum_fresh,
-        "tactile_fresh": tactile_fresh,
-        "tactile_source_monotonic_ns": tactile_source_ns,
-        "tactile_calibrated": _field(hand_tactile, "calibrated") == 1,
-        "tactile_unit_code": _field(hand_tactile, "unit_code"),
     }
 
 
@@ -179,7 +141,6 @@ def record_held(
     cam: dict | None,
     *,
     hand_state: np.ndarray | None = None,
-    hand_tactile: np.ndarray | None = None,
     frame_status: int = _FRAME_HELD,
     arm_qpos_sent: np.ndarray,
     action_queued: bool = False,
@@ -216,29 +177,9 @@ def record_held(
             target_eef_rot6d.copy() if target_eef_rot6d is not None else None
         ),
     )
-    anchor_ns = (
-        time.monotonic_ns()
-        if observation_anchor_monotonic_ns is None
-        else int(observation_anchor_monotonic_ns)
-    )
-    dense_tactile = (
-        hand_tactile
-        if _dense_tactile_fresh(hand_tactile, anchor_ns=anchor_ns)
-        else None
-    )
-    contact = (
-        read_hand_contact_causal(shared.hand_state_ring, anchor_monotonic_ns=anchor_ns)
-        if shared is not None
-        else None
-    )
     state = build_episode_state(
         arm_state,
         hand_state,
-        dense_tactile,
-        hand_contact=None if contact is None else contact["tactile_sum"][0],
-        hand_contact_source_monotonic_ns=(
-            0 if contact is None else int(contact["source_monotonic_ns"][0])
-        ),
         timestamp_s=(
             None
             if observation_anchor_monotonic_ns is None
@@ -259,10 +200,8 @@ def record_held(
             _recording_provenance(
                 arm_state,
                 hand_state,
-                hand_tactile,
                 vr_frame,
                 cam,
-                hand_contact_source_monotonic_ns=state.hand_contact_source_monotonic_ns,
                 anchor_monotonic_ns=observation_anchor_monotonic_ns,
                 max_observation_skew_s=max_observation_skew_s,
             )
@@ -287,7 +226,6 @@ def record_frame(
     target_quat: np.ndarray,
     vr_frame: dict | None,
     cam: dict | None,
-    hand_tactile: np.ndarray | None = None,
     *,
     frame_status: int = FRAME_OK,
     observation_anchor_monotonic_ns: int | None = None,
@@ -308,29 +246,9 @@ def record_frame(
         target_eef_pos=target_pos.copy(),
         target_eef_rot6d=quat_wxyz_to_rot6d(normalize_quat_wxyz(target_quat)),
     )
-    anchor_ns = (
-        time.monotonic_ns()
-        if observation_anchor_monotonic_ns is None
-        else int(observation_anchor_monotonic_ns)
-    )
-    dense_tactile = (
-        hand_tactile
-        if _dense_tactile_fresh(hand_tactile, anchor_ns=anchor_ns)
-        else None
-    )
-    contact = (
-        read_hand_contact_causal(shared.hand_state_ring, anchor_monotonic_ns=anchor_ns)
-        if shared is not None
-        else None
-    )
     state = build_episode_state(
         arm_state,
         hand_state,
-        dense_tactile,
-        hand_contact=None if contact is None else contact["tactile_sum"][0],
-        hand_contact_source_monotonic_ns=(
-            0 if contact is None else int(contact["source_monotonic_ns"][0])
-        ),
         timestamp_s=(
             None
             if observation_anchor_monotonic_ns is None
@@ -360,10 +278,8 @@ def record_frame(
             _recording_provenance(
                 arm_state,
                 hand_state,
-                hand_tactile,
                 vr_frame,
                 cam,
-                hand_contact_source_monotonic_ns=state.hand_contact_source_monotonic_ns,
                 anchor_monotonic_ns=observation_anchor_monotonic_ns,
                 max_observation_skew_s=max_observation_skew_s,
             )

@@ -24,7 +24,6 @@ def _tiny_channels_config() -> RuntimeChannelsConfig:
         vr_ring_maxlen=1,
         arm_state_ring_maxlen=1,
         hand_state_ring_maxlen=1,
-        hand_tactile_ring_maxlen=1,
         coupled_cmd_ring_maxlen=1,
         record_sample_ring_maxlen=1,
         pointcloud_ring_maxlen=1,

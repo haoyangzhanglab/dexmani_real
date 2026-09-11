@@ -43,7 +43,7 @@ def test_d8_two_files_are_two_complete_zarr_episodes(tmp_path, monkeypatch):
     assert report["episode_count"] == 2
     assert report["episode_ends"] == [40, 80]
     store = zarr.open_group(str(target), mode="r")
-    assert store.attrs["schema_version"] == 12
+    assert store.attrs["schema_version"] == 13
     assert store.attrs["observation_alignment"] == "control_step_latest_causal"
     assert store.attrs["state_alignment"] == "control_step"
     assert "episode_start_policy" not in store.attrs
