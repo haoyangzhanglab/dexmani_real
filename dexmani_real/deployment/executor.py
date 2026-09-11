@@ -584,7 +584,10 @@ class PolicyExecutor:
         self.previous_arm_command_qpos: np.ndarray | None = None
         self.previous_hand_command_qpos: np.ndarray | None = None
         self.episode_steps = 0
-        self.rollout_started = False
+        self.num_episodes = (
+            recording_config.num_episodes if recording_config is not None else 1
+        )
+        self.completed_episodes = 0
         self._pending_stop_reason: str | None = None
         self.last_metrics_flush_ns = time.monotonic_ns()
 
@@ -812,9 +815,16 @@ class PolicyExecutor:
                 result.error,
             )
         elif result.saved:
+            self.completed_episodes += 1
+            print(
+                f"Episode {self.completed_episodes}/{self.num_episodes} saved",
+                flush=True,
+            )
             logger.info(
                 "executor: rollout episode saved: %s", result.path or "<unknown>"
             )
+            if self.completed_episodes >= self.num_episodes:
+                self.shared.quit_requested.value = True
         else:
             logger.info(
                 "executor: rollout recording discarded (%s)",
@@ -1004,11 +1014,6 @@ class PolicyExecutor:
     def _start_requested_episode(self) -> None:
         if not bool(self.shared.start_request.value):
             return
-        if self.rollout_started:
-            with self.shared.motion_lock:
-                self.shared.start_request.value = False
-            logger.warning("rollout already completed; restart run_policy.py")
-            return
         if self.recorder is not None and self.recorder.stop_pending:
             with self.shared.motion_lock:
                 self.shared.start_request.value = False
@@ -1030,6 +1035,7 @@ class PolicyExecutor:
             if not self.recorder.start_episode(
                 task_label=self.recording_config.task_label,
                 operator=self.recording_config.operator,
+                episode_name=f"episode_{self.completed_episodes + 1:03d}",
             ):
                 self.shared.is_recording.value = self.recorder.stop_pending
                 with self.shared.motion_lock:
@@ -1081,11 +1087,14 @@ class PolicyExecutor:
         if self.execute:
             self.shared.physical_home_completed.value = False
         self.run_started_ns = epoch.started_monotonic_ns
-        self.rollout_started = True
         self.stats = PolicyStats()
         self.next_record_ns = epoch.started_monotonic_ns + self.step_dt_ns
         self.episode_steps = 0
         self._clear_execution(epoch.generation)
+        print(
+            f"Episode {self.completed_episodes + 1}/{self.num_episodes} RUNNING",
+            flush=True,
+        )
         logger.info("policy_executor_loop: RUNNING generation=%d", epoch.generation)
 
     def _handle_run_boundary(self) -> None:

@@ -326,6 +326,7 @@ class RolloutRecordingConfig:
     task_label: str
     operator: str
     max_running_s: float
+    num_episodes: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.data_dir, str) or not self.data_dir.strip():
@@ -349,6 +350,8 @@ class RolloutRecordingConfig:
         timeout_s = float(self.max_running_s)
         if not math.isfinite(timeout_s) or timeout_s <= 0.0:
             raise ValueError("rollout max_running_s must be finite and positive")
+        if type(self.num_episodes) is not int or self.num_episodes < 1:
+            raise ValueError("rollout num_episodes must be a positive int")
         object.__setattr__(self, "data_dir", str(resolved_data_dir))
         object.__setattr__(self, "max_running_s", timeout_s)
 

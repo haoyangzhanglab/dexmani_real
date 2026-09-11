@@ -731,24 +731,8 @@ class TestFutureTail(unittest.TestCase):
         self.assertIsNone(executor.active_prediction)
 
 
-class TestSingleRollout(unittest.TestCase):
-    def test_second_begin_rejected_without_recorder_or_motion(self):
-        import threading
-
-        executor = PolicyExecutor.__new__(PolicyExecutor)
-        executor.shared = types.SimpleNamespace(
-            start_request=types.SimpleNamespace(value=True),
-            motion_lock=threading.RLock(),
-        )
-        executor.rollout_started = True
-        with mock.patch.object(executor_mod, "begin_requested_motion") as begin:
-            executor._start_requested_episode()
-        begin.assert_not_called()
-        self.assertFalse(executor.shared.start_request.value)
-
-
 class TestRecordedRolloutLifecycle(unittest.TestCase):
-    def executor(self):
+    def executor(self, *, num_episodes=1):
         shared = types.SimpleNamespace(motion_lock=threading.RLock())
         for name, value in dict(
             is_running=True,
@@ -781,6 +765,7 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
             "task",
             "me",
             60.0,
+            num_episodes,
         )
         with mock.patch.object(executor_mod, "_build_policy_safety_gate"):
             executor = PolicyExecutor(
@@ -830,7 +815,6 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         self.begin(executor)
         self.assertEqual(executor.shared.safety_state.value, SafetyState.ARMED)
         self.assertIsNone(executor.run_started_ns)
-        self.assertFalse(executor.rollout_started)
 
     def test_cancel_after_start_ack_waits_for_recorder_terminal_status(self):
         executor = self.executor()
@@ -841,7 +825,6 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         ):
             executor._start_requested_episode()
         self.assertIsNone(executor.run_started_ns)
-        self.assertFalse(executor.rollout_started)
         self.assertTrue(executor.shared.is_recording.value)
         executor.recorder.stop_episode.assert_called_once_with(
             save=False, reason="start_recheck_failed"
@@ -1188,6 +1171,111 @@ class TestRecordedRolloutLifecycle(unittest.TestCase):
         with mock.patch.object(executor_mod, "begin_requested_motion") as begin:
             executor._start_requested_episode()
         begin.assert_not_called()
+
+    def test_second_episode_uses_next_name_after_finalization(self):
+        executor = self.executor(num_episodes=2)
+        self.begin(executor)
+        executor._finish_episode("stop", stop_reason="operator")
+        executor.recorder.poll_stop.return_value = RecorderStopResult(
+            done=True, saved=True, path="/tmp/rollout-test/episode_001"
+        )
+        executor._poll_recorder()
+        self.assertEqual(executor.completed_episodes, 1)
+        # A second episode needs a fresh physical home, then a fresh B.
+        executor.shared.physical_home_completed.value = True
+        executor.shared.start_request.value = True
+        self.begin(executor)
+        self.assertEqual(
+            executor.recorder.start_episode.call_args.kwargs["episode_name"],
+            "episode_002",
+        )
+
+    def test_auto_quit_only_after_nth_finalization(self):
+        executor = self.executor(num_episodes=2)
+        for index in range(2):
+            self.begin(executor)
+            executor._finish_episode("stop", stop_reason="operator")
+            executor.recorder.poll_stop.return_value = RecorderStopResult(
+                done=True,
+                saved=True,
+                path=f"/tmp/rollout-test/episode_{index + 1:03d}",
+            )
+            executor._poll_recorder()
+            self.assertEqual(executor.completed_episodes, index + 1)
+            if index == 0:
+                self.assertFalse(executor.shared.quit_requested.value)
+            else:
+                self.assertTrue(executor.shared.quit_requested.value)
+
+    def test_unsaved_episode_does_not_increment(self):
+        executor = self.executor(num_episodes=2)
+        self.begin(executor)
+        executor._finish_episode("stop", stop_reason="operator")
+        executor.recorder.poll_stop.return_value = RecorderStopResult(
+            done=True, saved=False, error=None, path=None
+        )
+        executor._poll_recorder()
+        self.assertEqual(executor.completed_episodes, 0)
+        self.assertFalse(executor.shared.quit_requested.value)
+        self.assertFalse(executor.shared.error_state.value)
+
+    def test_storage_error_fails_closed_without_increment(self):
+        executor = self.executor()
+        self.begin(executor)
+        executor._finish_episode("stop", stop_reason="operator")
+        executor.recorder.poll_stop.return_value = RecorderStopResult(
+            done=True, saved=False, error="disk full", path=None
+        )
+        executor._poll_recorder()
+        self.assertEqual(executor.completed_episodes, 0)
+        self.assertTrue(executor.shared.error_state.value)
+        self.assertFalse(executor.shared.quit_requested.value)
+
+    def test_episode_end_clears_physical_home(self):
+        executor = self.executor()
+        self.begin(executor)
+        executor.shared.physical_home_completed.value = True
+        executor._finish_episode("stop", stop_reason="operator")
+        self.assertFalse(executor.shared.physical_home_completed.value)
+
+    def test_execute_false_dry_run_begin_and_stop(self):
+        shared = types.SimpleNamespace(motion_lock=threading.RLock())
+        for name, value in dict(
+            is_running=True,
+            error_state=False,
+            estop_request=False,
+            quit_requested=False,
+            start_request=True,
+            stop_request=int(StopRequest.NONE),
+            safety_state=int(SafetyState.ARMED),
+            run_generation=1,
+            run_started_monotonic_ns=0,
+            physical_home_completed=True,
+            is_recording=False,
+        ).items():
+            setattr(shared, name, types.SimpleNamespace(value=value))
+        runtime = _fake_runtime()
+        runtime.policy.first_command_timeout_s = 10.0
+        runtime.policy.max_command_silence_s = 10.0
+        runtime.policy.command_progress_timeout_s = 1.0
+        runtime.policy.executor_poll_hz = 128.0
+        with mock.patch.object(executor_mod, "_build_policy_safety_gate"):
+            executor = PolicyExecutor(
+                shared,
+                runtime,
+                _fake_policy_spec(),
+                execute=False,
+                max_running_s=None,
+            )
+        with mock.patch.object(
+            executor_mod, "_physical_start_pose_rejection", return_value=None
+        ):
+            executor._start_requested_episode()
+        self.assertEqual(executor.shared.safety_state.value, SafetyState.RUNNING)
+        request_policy_stop(executor.shared)
+        executor._handle_run_boundary()
+        self.assertEqual(executor.shared.stop_request.value, StopRequest.NONE)
+        self.assertFalse(executor.shared.error_state.value)
 
 
 if __name__ == "__main__":
