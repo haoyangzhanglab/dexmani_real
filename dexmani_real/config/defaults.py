@@ -292,7 +292,6 @@ class ArmParams:
     table_z_surface_m: float = 0.022
     hand_safety_margin_m: float = 0.05
 
-    tracking_error_warn_rad: float = 0.35  # diagnostic warning threshold
     # Final worker guard against discontinuous producer/IK branch jumps.
     # Normal command-rate shaping remains owned by each producer.
     max_servo_command_jump_rad: float = np.deg2rad(20.0)
@@ -335,11 +334,6 @@ class ArmParams:
             raise ValueError("table_z_surface_m must be finite")
         if not np.isfinite(self.hand_safety_margin_m) or self.hand_safety_margin_m < 0:
             raise ValueError("hand_safety_margin_m must be finite and non-negative")
-        if (
-            not np.isfinite(self.tracking_error_warn_rad)
-            or self.tracking_error_warn_rad <= 0
-        ):
-            raise ValueError("tracking_error_warn_rad must be finite and positive")
         if (
             not np.isfinite(self.max_servo_command_jump_rad)
             or self.max_servo_command_jump_rad <= 0
