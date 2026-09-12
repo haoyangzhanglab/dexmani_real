@@ -73,7 +73,7 @@ Controls:
         "episode",
         type=str,
         help=(
-            "Published raw schema-v28 episode directory (episodes/<task_name>/episode_*) "
+            "Published current raw-schema episode directory (episodes/<task_name>/episode_*) "
             "or, with --processed, a processed HDF5 selection artifact."
         ),
     )

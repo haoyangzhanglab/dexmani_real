@@ -5,8 +5,8 @@
 > Baseline reviewed: `haoyangzhanglab/dexmani_real` `main` on 2026-09-11, with raw v28 / processed v19 / Policy Zarr v12.
 > Source code and current schemas remain authoritative if this document becomes stale.
 >
-> **Status: PROPOSED — NOT IMPLEMENTED.**
-> This document defines the next tactile acquisition/data-path simplification. It does not claim hardware validation and does not change current behavior by itself.
+> **Status: IMPLEMENTED.**
+> This document defines the tactile acquisition/data-path simplification, which has since been implemented. Source and current schemas (raw v29 / processed v20 / Policy Zarr v13) are authoritative; this document does not claim hardware validation.
 
 ---
 

@@ -23,7 +23,7 @@ Policy artifact
 → inference-first startup
 → one persistent real-robot session
 → H → scene → B → S/timeout
-→ canonical raw v28 episode
+→ canonical raw v29 episode
 → recorder finalize
 → completed_episodes++
 → next episode
@@ -456,7 +456,7 @@ canonical control slice check
 
 ```text
 STATUS: SUPERSEDED
-Current implementation: raw v28 → processed v19 → Policy Zarr v12
+Current implementation: raw v29 → processed v20 → Policy Zarr v13
 ```
 
 历史正文可以保留。
@@ -513,12 +513,12 @@ existing model encoders do not automatically consume them.
 执行：
 
 ```text
-synthetic current raw v28
+synthetic current raw v29
 → process_episode_root()
-→ processed v19
+→ processed v20
 → validate_processed_hdf5()
 → export_processed_hdf5_to_zarr()
-→ Policy Zarr v12
+→ Policy Zarr v13
 → inspect data/eef_pose
 → inspect eef_pose_* attrs
 → dexmani_policy _build_observation_contract(... eef_pose ...)
@@ -648,7 +648,7 @@ online SUCCESS/FAILURE classifier
 同时保持不动：
 
 ```text
-raw v28
+raw v29
 PointCloud scientific contract
 Fingertip geometry contract
 Tactile calibration/unit contract
@@ -755,7 +755,7 @@ runtime inference_steps 保持
 persistent multi-episode 保持
 fresh H per episode 保持
 finalization 后计数保持
-raw v28 保持
+raw v29 保持
 offline task outcome 保持
 
 [Efficiency]

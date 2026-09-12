@@ -65,7 +65,7 @@ def _route_library_logging_to_stderr() -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Process complete control-step episodes into processed HDF5 v18."
+        description="Process complete control-step episodes into the current processed HDF5 schema."
     )
     parser.add_argument(
         "input_root",

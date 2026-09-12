@@ -4,7 +4,7 @@ model = "gpt-5.6-luna"
 model_reasoning_effort = "max"
 developer_instructions = """
 Follow the target repository's AGENTS.md. For the Policy Deployment / Real-World
-Eval task, read docs/policy_eval_workflow.md in the Real repository and the
+Eval task, read docs/policy_eval_finalization_plan.md in the Real repository and the
 assigned guide sections. Use rg and narrow reads to answer the parent's question
 with file/symbol evidence. Do not infer behavior from comments or filenames.
 

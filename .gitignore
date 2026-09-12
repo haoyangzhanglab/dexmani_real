@@ -141,7 +141,7 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-.vscode/
+.claude/settings.local.json
 # .claude/
 # .codex/
 # .agents/
@@ -149,7 +149,6 @@ dmypy.json
 trajectories/
 episodes_arm/
 episodes_hand/
-episodes/
 replay_results/
 
 tmp_docs/
