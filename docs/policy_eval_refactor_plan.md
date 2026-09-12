@@ -1,11 +1,11 @@
 # DexMani Policy Deployment / Evaluation 重构执行方案
 
-> 状态：**实施计划 / Claude Code 执行依据**  
+> 状态：**架构 / rationale（历史设计记录）**
 > 事实核查基线：`dexmani_real/main` @ `3ad3019383cc7cad79af95b2d984af67b8d01408`（2026-09-11）  
 > 关联仓库：`haoyangzhanglab/dexmani_policy`  
 > Hardware validation：**NOT RUN**
 
-本文定义 DexMani 真实机器人 Policy deployment / evaluation 的目标形态、职责边界、跨仓库依赖、修改顺序、测试要求与禁止事项。实施时以本文为主，不要从历史 refactor plan、旧 README 示例或已 superseded 文档反推目标行为。
+本文定义 DexMani 真实机器人 Policy deployment / evaluation 的目标形态、职责边界、跨仓库依赖、修改顺序、测试要求与禁止事项，作为架构 / rationale 保留。当前执行依据为 `docs/policy_eval_finalization_plan.md` 与 source（当前 raw v29 / processed v20 / Policy Zarr v13）；不要从旧 README 示例或已 superseded 文档反推目标行为。
 
 目标不是建设 production deployment platform，而是为博士研究中的真实机器人论文实验提供一个：
 

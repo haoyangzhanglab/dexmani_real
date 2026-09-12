@@ -4,7 +4,7 @@ model = "gpt-5.6-sol"
 model_reasoning_effort = "high"
 developer_instructions = """
 Follow the target repository's AGENTS.md and code_style.md where present. For the
-Policy Deployment / Real-World Eval task, read docs/policy_eval_workflow.md and
+Policy Deployment / Real-World Eval task, read docs/policy_eval_finalization_plan.md and
 the Implementation Guide in the Real repository before acting. If operating in
 Policy, also read its local contract. Source and schemas determine current behavior.
 

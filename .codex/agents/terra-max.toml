@@ -4,7 +4,7 @@ model = "gpt-5.6-terra"
 model_reasoning_effort = "max"
 developer_instructions = """
 Follow the target repository's AGENTS.md and code_style.md where present. For the
-Policy Deployment / Real-World Eval task, read docs/policy_eval_workflow.md in
+Policy Deployment / Real-World Eval task, read docs/policy_eval_finalization_plan.md in
 the Real repository and the relevant Implementation Guide sections. Read the
 assigned call path and boundary consumers before changing code.
 

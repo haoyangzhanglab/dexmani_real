@@ -15,8 +15,8 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
   校验；homing 使用独立的碰撞检查路径和专用 queue。
 - VR/键盘遥操作与物理回放的轨迹回放环节保留机器人自碰撞和静态障碍检查，但桌面不作为
   动作拒绝条件，以允许近桌面的精细抓取；homing（含回放 return_home）保留桌面安全验证。
-- XHand 已知的抓取接触过流码 `1501035` 在发送位置命令时会被接受，不中止抓取，并记入
-  episode 质量指标；同一码在状态读取失败时不生成伪造的新鲜反馈。持续数据不可用仍由
+- XHand 已知的抓取接触过流码 `1501035` 在发送位置命令时会被接受，不中止抓取；同一码
+  在状态读取失败时不生成伪造的新鲜反馈。持续数据不可用仍由
   新鲜度和 watchdog 边界处理。
 - XHand 通信 CRC 码 `1501070` 在发送路径表示交付状态不明：worker 记录告警但不置位全局
   fault、不退出，也不更新该 action 的 SDK-acceptance ACK；下一周期从新鲜实测状态和仍有效的
@@ -29,11 +29,11 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
   自碰撞/静态障碍检查和新鲜反馈确认后才从 frame 0 开始重放。手部反馈不要求复现录制值。
 - RealSense 相机按设备原生频率连续采集；16 Hz 控制网格只选择最新严格因果帧，
   不再将相机发布节拍绑定到控制频率。
-- 事务式写入 raw v28：16 Hz control step 是 observation/action timeline，camera、arm、
-  hand、aggregate contact 独立按 control anchor 取最新有效观测；保留 raw dense tactile、
-  calibration、camera health 与真实 source timestamps。aggregate 有独立
-  `hand_contact_source_monotonic_ns`，不伪装成更新的 hand qpos/dense 来源。
-- raw → processed v19 → Policy Zarr v12 全程逐行对应：accepted N 行保持 N 行，一个
+- 事务式写入 raw v29：16 Hz control step 是 observation/action timeline，camera、arm、
+  hand 按 control anchor 取最新有效观测；保留 raw aggregate/dense tactile（含 validity）、
+  calibration、camera health 与真实 source timestamps。aggregate 与 dense tactile 来自
+  同一次 SDK 读取、同一个 hand sample，不伪装成更新的 hand qpos 来源。
+- raw v29 → processed v20 → Policy Zarr v13 全程逐行对应：accepted N 行保持 N 行，一个
   processed 文件对应一个 Zarr episode。唯一自动行为质量拒绝是 persistent IK；
   技术损坏可使整条失败，camera/tactile timing jitter 不删行，也不跨行修复。
 - processed 是完整 multimodal superset：joint/action/action_ee、aggregate contact（含 validity）、
@@ -53,7 +53,7 @@ XHand（12 DoF）、Quest/HTS 手部跟踪与 RealSense RGB-D 的遥操作、数
 | 物理回放 | [`examples/replay_episode.py`](examples/replay_episode.py) | [`replay/`](dexmani_real/replay) |
 | raw episode 读取/录制 | — | [`recording/frame.py`](dexmani_real/recording/frame.py)、[`recording/recorder.py`](dexmani_real/recording/recorder.py)、[`recording/storage/hdf5_writer.py`](dexmani_real/recording/storage/hdf5_writer.py)、[`recording/storage/reader.py`](dexmani_real/recording/storage/reader.py) |
 | 离线处理与 Zarr 导出 | [`examples/process_episodes.py`](examples/process_episodes.py)、[`examples/export_policy_zarr.py`](examples/export_policy_zarr.py) | [`dataset/`](dexmani_real/dataset) |
-| 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v28、processed v18 与 Policy Zarr v11 的字段、dtype、shape 与语义 |
+| 数据 schema 参考 | [`docs/data_schema.md`](docs/data_schema.md) | raw v29、processed v20 与 Policy Zarr v13 的字段、dtype、shape 与语义 |
 | learned-policy 部署与评估会话 | [`examples/run_policy.py`](examples/run_policy.py) | [`deployment/`](dexmani_real/deployment)、[`deployment/inference/dexmani_policy.py`](dexmani_real/deployment/inference/dexmani_policy.py) |
 | 相机、桌面与 VR 标定 | [`examples/`](examples) | [`calibration/`](dexmani_real/calibration)、[`sensor/`](dexmani_real/sensor)、[`config/`](dexmani_real/config) |
 | 点云完整链路 | [`docs/pointcloud_pipeline.md`](docs/pointcloud_pipeline.md) | [`sensor/pointcloud.py`](dexmani_real/sensor/pointcloud.py)、[`sensor/pointcloud_worker.py`](dexmani_real/sensor/pointcloud_worker.py) |
@@ -182,7 +182,7 @@ python examples/collect_teleop.py --print-config
 | 物理回放 | `python examples/replay_episode.py episodes/<task>/episode_*` | 回放 recorded published arm target 与 recorded logical hand target；当前 runtime/geometry 完整预检后控制 xArm7/XHand，hand worker 生成受限 SDK 中间 setpoint；output target 必须缺失或为空目录，默认写入 `replay_results/` |
 | 回放 processed HDF5 | `python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed` | processed 验证后按 `source_path` 读取完整 raw `float64` arm target 与 logical hand target；执行完整 live-start、limits、workspace 与 collision 预检，不发送 processed float32 action；当前 reader 不支持历史 v25/v26 physical replay |
 
-| learned policy 评估会话 | `python examples/run_policy.py <policy/task/experiment> [--artifact A] [--inference-steps N] [--seed S] [--num-episodes N] [--max-duration SEC] [--device D]` | 先 inference restore+warmup 就绪，再启动 arm/hand/camera/recorder；H→B→S 循环录制 raw-v28 episode 到 `rollouts/.../session_*/episode_NNN/`；N/N 后自动 clean shutdown |
+| learned policy 评估会话 | `python examples/run_policy.py <policy/task/experiment> [--artifact A] [--inference-steps N] [--seed S] [--num-episodes N] [--max-duration SEC] [--device D]` | 先 inference restore+warmup 就绪，再启动 arm/hand/camera/recorder；H→B→S 循环录制 raw-v29 episode 到 `rollouts/.../session_*/episode_NNN/`；N/N 后自动 clean shutdown |
 | 相机标定 | `python examples/calibrate_camera.py --hand-geometry <absent or secured-home>` | 连接 xArm/RealSense；更新相机标定；参数必须反映真实 XHand 安装状态 |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 连接 HTS；更新 VR transform |
 | RealSense 点云交互诊断 | `python examples/realsense_record_example.py` | 只连接相机；GUI 切换完整 RAW/处理后点云，不写标定 |
@@ -376,10 +376,10 @@ python examples/process_episodes.py \
 modality-specific profile）；`--pointcloud-num-points` 可选 `1024`、`2048`、`4096` 或
 `8192`，默认 `1024`。
 
-当前 runtime reader、raw viewer 和 physical replay 只接受 raw v28，检查必需文件、
+当前 runtime reader、raw viewer 和 physical replay 只接受 raw v29，检查必需文件、
 shape/dtype 与 sidecar 帧数，不在 reader/finalize 完整解码 RGB。
 离线 processing 另有一个窄的 normalized-v26 salvage 路径；历史 v24/v25 必须先依据明确
-lineage 使用冻结转换器生成 out-of-place v26，不能伪装成 v28 或改写原始数据。
+lineage 使用冻结转换器生成 out-of-place v26，不能伪装成 v29 或改写原始数据。
 见 [历史迁移](docs/raw_v24_migration.md) 与
 [实际 salvage 证据](docs/invalid_frames_export_incident.md)。
 
@@ -404,13 +404,13 @@ joint_state/contact_force/tactile 都直接来自同一 raw row；fingertip 由�
 经共享 FK 计算。action 使用 `action_arm_joint_sent`，不能替换成未发布 candidate。
 视觉时间与 tactile 时间均只需不晚于 control anchor，不要求彼此同步或 tactile 早于 camera。
 
-raw v28 episode 可视化默认使用当前 resolved runtime 中的点云策略和桌面标定即时生成 canonical
+raw v29 episode 可视化默认使用当前 resolved runtime 中的点云策略和桌面标定即时生成 canonical
 `(N,6)` 点云；该路径与 offline processing、实时 deployment 共用同一个 `build_point_cloud()`
 实现。使用 `--no-point-cloud` 可关闭即时点云，
 `--pointcloud-num-points` 可选择 `1024`、`2048`、`4096` 或 `8192`。
 
 查看持久化点云可运行 `python examples/visualize_episode_processed.py <processed.h5>`。
-该离线 viewer 读取 processed v19 的 RGB-D/点云、fingertip 与 eef_pose，使用逻辑 `arange(T)*dt`
+该离线 viewer 读取 processed v20 的 RGB-D/点云、fingertip 与 eef_pose，使用逻辑 `arange(T)*dt`
 显示时间；不加载 row provenance。它按所用模态检查结构和渲染 payload；
 完整 artifact 验证由 processing/export 边界承担。
 
@@ -484,10 +484,10 @@ datasets/<task>.zarr/
 └── meta/episode_ends
 ```
 
-当前合同是 raw v28 → processed v19 → Policy Zarr v12。processed 保存 dense tactile（含
+当前合同是 raw v29 → processed v20 → Policy Zarr v13。processed 保存 dense tactile（含
 validity）、aggregate contact（含 validity）、fingertip、eef_pose 与 flat timing；不保存
 row provenance、quality JSON 或 segments。
-录制时从 live ring 选择有效 aggregate，并保存其独立 source；这不是从其他 raw row
+录制时按 control anchor 选择最新有效 hand sample，aggregate 与 dense tactile 来自同一次读取；这不是从其他 raw row
 修补 dataset。历史 raw 不改写；详细字段和边界见 [data schema](docs/data_schema.md)。
 
 实际 `pick_place_toy` salvage：61 条 / 14,309 行源数据；60 条 / 14,112 行保留；

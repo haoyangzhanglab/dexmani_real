@@ -40,8 +40,8 @@
 
 当前状态（HEAD）：
 
-- driver 零缩放直通：`_parse_tactile_sum`（robot/drivers/xhand.py:650-659）与
-  `_parse_tactile_force`（:661-676）直接读取 SDK `calc_force`/`raw_force`；
+- driver 零缩放直通：`_parse_tactile_aggregate`（robot/drivers/xhand.py:650-659）与
+  `_parse_tactile_dense`（:661-676）直接读取 SDK `calc_force`/`raw_force`；
   唯一运算是软件 bias 减法（:519-520、:529-530）
 - 冻结转换器方向与次数：tools/convert_raw_v25_to_v26_tactile.py:113（直接 v25 →
   scale=10.0）、:145（应用于 `hand_contact` 与 `hand_tactile_force`，:67）；
@@ -49,7 +49,7 @@
 - forensic 确认无二次缩放：invalid_frames_export_incident.md:293
   "绝未对已恢复的 v26 再次缩放"
 
-结论：**当前 v28 录制与 salvage v26 数据集的数值均为 SDK 原生值**；"0.1 已修正"对
+结论：**当前 v29 录制与 salvage v26 数据集的数值均为 SDK 原生值**；"0.1 已修正"对
 两者都成立。但原生值以什么物理单位计量，厂商没有说，也从未被测过。
 
 ## 4. "单位 = N" 证据盘点
@@ -77,7 +77,7 @@
 
 ```text
 driver/hand_worker（每帧发 unit_code=0，hand_worker.py:112）
-  → IPC dtype（ipc/schema.py:272）→ raw v28 字段（recording/storage/schema.py:63）
+  → IPC dtype（ipc/schema.py:272）→ raw v29 字段（recording/storage/schema.py:63）
   → processing validity 合取项（dataset/processing.py:526、:559）
     + processed telemetry 数组复制（:516）+ unit attrs（:388-397）
   → processed validator 精确比对（dataset/processed.py:399、:406、:414-429）

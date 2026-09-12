@@ -10,5 +10,4 @@ max_concurrent_threads_per_session = 3
 interrupt_message = true
 
 [sandbox_workspace_write]
-writable_roots = ["/home/zhanghaoyang/Desktop/dexmani_real"]
 network_access = true

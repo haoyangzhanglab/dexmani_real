@@ -1,4 +1,4 @@
-"""Raw-v28 camera metadata to canonical xArm-base point-cloud inputs.
+"""Current raw-episode camera metadata to canonical xArm-base point-cloud inputs.
 
 This module owns the persisted-data boundary shared by offline processing and
 raw episode visualization. It performs no hardware IO and does not own or
@@ -59,7 +59,7 @@ def _intrinsics_from_meta(meta: Any, *, stream: str) -> CameraIntrinsics:
 
 
 def load_raw_episode_camera_model(reader: EpisodeReader) -> RawEpisodeCameraModel:
-    """Load the depth-to-color aligned camera model persisted by raw v28."""
+    """Load the depth-to-color aligned camera model persisted by the current raw schema."""
     meta = reader.h5f["meta"].attrs
     if str(meta.get("camera_payload_mode", "")) != "depth_to_color_aligned_rgbd":
         raise ValueError("raw camera payload is not depth-to-color aligned RGB-D")

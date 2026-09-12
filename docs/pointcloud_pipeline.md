@@ -46,9 +46,9 @@ Intel RealSense
         fixed float32[N, 6], frame=xarm_base
                  │
                  ├─ pointcloud_ring → deployment / policy observation
-                 └─ raw v28
+                 └─ raw v29
                       ├─ raw visualizer → Rerun canonical preview
-                      └─ offline process → processed HDF5 v18 → Policy Zarr v11
+                      └─ offline process → processed HDF5 v20 → Policy Zarr v13
 ```
 
 实时 worker 不排队旧帧：它只读取 `camera_ring` 的最新 sequence。构建前检查候选帧的相机健康、
@@ -58,7 +58,7 @@ generation、时钟重置、source/publish/now 因果关系和最大帧龄；构
 
 ## Raw episode 即时可视化
 
-`examples/visualize_episode.py` 对 raw v28 默认启用点云。持久化边界由
+`examples/visualize_episode.py` 对 raw v29 默认启用点云。持久化边界由
 `dataset/pointcloud.py` 统一解析：它从 episode 读取 aligned RGB-D 几何、`depth_scale` 与
 `T_xarm_base_from_color`，再调用和 offline processing、实时 worker 相同的
 `sensor.pointcloud.build_point_cloud()`。可视化入口不维护第二套反投影、裁减或采样实现。
@@ -67,7 +67,7 @@ raw episode 不保存可反序列化的完整点云策略与桌面平面。因�
 的 `PointCloudConfig` 和桌面标定，结果应视为 current-config preview。需要可持久复现和完整
 provenance 时，应生成 processed HDF5；其文件内保存 processing config、点云策略与桌面平面身份。
 
-运行时只读取 raw v28。`--no-point-cloud` 可关闭即时推导。
+运行时只读取 raw v29。`--no-point-cloud` 可关闭即时推导。
 单帧构建结果为空时 Rerun 会显式清除该时间点的点云，避免沿用上一帧。eye-in-hand 仍会 fail closed，因为 raw schema 没有保存相机曝光
 时刻对应的机械臂位姿。
 
@@ -276,12 +276,12 @@ OpenCV 3×3 depth fast path 与逐步 SciPy 参考实现的 240 帧最终点云�
 
 ## 录制、离线处理与语义校验
 
-录制 schema v28 保存 aligned raw depth、RGB、native depth/color 几何 provenance、帧号和时间
+录制 schema v29 保存 aligned raw depth、RGB、native depth/color 几何 provenance、帧号和时间
 信息，并持久化 control-step 采样的 arm/hand policy observation 与各模态独立 source
-timestamp。离线处理接受 raw v28 与
+timestamp。离线处理接受 raw v29 与
 狭窄的 normalized-v26 salvage 路径；processed 始终是完整 multimodal superset，视觉数据要求
 source 正值且不晚于 control anchor。只有具备完整观测、对齐与 teleop 已发布动作语义的产物
-可进入 Policy Zarr v11，其中点云仍须满足本页的点云语义。
+可进入 Policy Zarr v13，其中点云仍须满足本页的点云语义。
 
 每个 processed 点云产物记录并在导出/可视化时校验：
 
@@ -293,7 +293,7 @@ source 正值且不晚于 control anchor。只有具备完整观测、对齐与 
 
 完整点云数值 config 持久化在 `processing_config_json`，部署时逐项精确比对。
 导出、可视化和部署只接受与当前 policy ID、点云策略及桌面标定身份一致的产物；其他产物
-必须从受支持的 raw v28 episode 重新处理。
+必须从受支持的 raw v29 episode 重新处理。
 
 ## 代码所有权
 
@@ -305,8 +305,8 @@ source 正值且不晚于 control anchor。只有具备完整观测、对齐与 
 | 最新帧消费、freshness 与 point-cloud IPC 发布 | `sensor/pointcloud_worker.py` |
 | 点云参数与稳定 identity | `config/pointcloud.py` |
 | 桌面 RANSAC 与 plane 文件 | `calibration/table.py`、`config/desk_plane.json` |
-| raw v28 相机 metadata 与点云输入适配 | `dataset/pointcloud.py` |
-| raw v28/v26 → processed v18 | `dataset/processing.py` |
+| raw v29 相机 metadata 与点云输入适配 | `dataset/pointcloud.py` |
+| raw v29/v26 → processed v20 | `dataset/processing.py` |
 | raw current-config preview | `examples/visualize_episode.py` |
 
 核心数学不访问 SDK、共享内存、文件或可视化；硬件采集、IPC、标定写入和 GUI 均在外围 owner 中。
