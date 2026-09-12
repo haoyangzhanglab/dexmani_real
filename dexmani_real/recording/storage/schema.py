@@ -11,8 +11,6 @@ ARM_SENT_DATASET = "action_arm_joint_sent"
 
 class FillReason(IntEnum):
     SOURCE = 0
-    CAUSAL_HOLD_LAST = 1
-    LEADING_PLACEHOLDER = 2
 
 
 @dataclass(frozen=True)
