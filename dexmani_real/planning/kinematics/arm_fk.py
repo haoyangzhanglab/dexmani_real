@@ -37,7 +37,7 @@ def make_arm_fk() -> "ArmFK":
 
 
 class ArmFK:
-    """Standalone Pinocchio FK for arm_loop — URDF-consistent, no MPlib dependency.
+    """Standalone Pinocchio FK — URDF-consistent, no MPlib dependency.
 
     Used instead of xArm SDK get_position_aa() because the firmware EEF frame
     differs from the URDF definition.
