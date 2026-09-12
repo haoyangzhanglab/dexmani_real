@@ -115,8 +115,8 @@ def _publish_feedback(
     frame["tactile_dense"][0] = np.asarray(tactile_dense, dtype=np.float32)
     # Session software-bias readiness gates both tactile representations at the
     # worker boundary: a failed zeroing leaves them invalid while joint control
-    # continues. This is the one-place combination of per-read validity with
-    # startup readiness (see xhand_tactile_research_simplification_plan §5.4).
+    # continues. This is the one-place combination of per-read aggregate/dense
+    # validity with startup readiness.
     frame["tactile_aggregate_valid"][0] = int(
         tactile_calibrated and tactile_aggregate_valid
     )
