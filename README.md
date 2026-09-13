@@ -10,10 +10,9 @@ Quest/HTS 手部跟踪与 RealSense RGB-D，主要用于遥操作与数据采集
 
 ## 环境与安装
 
-项目要求 Python `>=3.10`。常用开发环境为 `real_robot`：
+项目要求 Python `>=3.10`。在已创建的 Python 环境中，从仓库根目录安装：
 
 ```bash
-conda activate real_robot
 python -m pip install -e .
 ```
 
@@ -45,7 +44,7 @@ python examples/collect_teleop.py --print-config
 | 离线 episode 处理 | `python examples/process_episodes.py episodes/<task> --dry-run` | 否 | 审计；去掉 `--dry-run` 后发布 processed HDF5 |
 | Policy Zarr 导出 | `python examples/export_policy_zarr.py episodes_processed/<task> --dry-run` | 否 | 预检；去掉 `--dry-run` 后发布 `datasets/<task>.zarr` |
 | Learned-policy rollout | `python examples/run_policy.py <policy/task/experiment>` | 是 | `rollouts/.../session_*` 下的记录与 resolved run config |
-| Camera 标定 | `python examples/calibrate_camera.py` | 是 | xArm/RealSense eye-to-hand 标定并更新 camera calibration |
+| Camera 标定 | `python examples/calibrate_camera.py --hand-geometry {absent,secured-home}` | 是 | xArm/RealSense eye-to-hand 标定并更新 camera calibration |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 仅 HTS/VR | 更新 `dexmani_real/config/vr_transform.json`；不控制机器人 |
 
 ### VR 遥操作与采集
@@ -57,7 +56,12 @@ recording 时使用 `--no-record`。两者的准确语义和其余参数以脚�
 ### 物理回放
 
 `replay_episode.py` 会把已记录轨迹真正发送到机器人，属于 hardware-affecting workflow。
-它可以读取当前 raw episode，也可以通过脚本公开的 processed 模式回放 processed selection。
+它可以读取当前 raw episode，也可以通过脚本公开的 processed 模式回放 processed selection：
+
+```bash
+python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed
+```
+
 运行前必须按真实机器人流程确认起始状态、碰撞环境和急停条件。
 
 ### 离线数据处理与导出
@@ -80,6 +84,17 @@ processing 不修改原始 raw episode；export 从已验证的 processed HDF5 �
 当前 schema version、字段、dtype、shape 与 validation contract 由代码中的 schema/validator
 定义，不在 README 复制一份易漂移的快照。
 
+### 离线检查
+
+raw 与 processed episode 都提供不连接硬件、不写文件的结构检查入口：
+
+```bash
+python examples/visualize_episode.py <raw-episode> --info
+python examples/visualize_episode_processed.py <processed.h5> --info
+```
+
+去掉 `--info` 会打开对应的 Rerun viewer；完整参数以脚本 `--help` 为准。
+
 ### Learned-policy rollout
 
 `run_policy.py` 运行一个 persistent recorded policy session。当前 CLI 直接以
@@ -89,6 +104,14 @@ processing 不修改原始 raw episode；export 从已验证的 processed HDF5 �
 该入口 **始终连接真实硬件**。它会在启动 actuator/camera worker 之前先准备 inference child，
 并为 session 写入 resolved `run_config.yaml`。任务成功与否在离线数据审核中判断；runtime 记录
 技术停止原因和 episode 数据。
+
+### Camera 标定
+
+`--hand-geometry` 是必须由操作者显式给出的物理状态声明，而不是 geometry selector：
+`absent` 仅用于没有安装 XHand；`secured-home` 仅用于已安装且物理固定在 configured home 的
+XHand。当前 calibration collision checks 在两种声明下都使用 canonical fixed-home XHand
+envelope，因此 `absent` 是保守建模。未来若引入经过验证的 arm-only collision model，这一用户
+接口语义也必须同步更新。
 
 ## 核心架构
 

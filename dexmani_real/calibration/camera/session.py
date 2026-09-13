@@ -20,8 +20,8 @@ Hardware preparation:
 
 Usage::
 
-    conda activate real_robot
-    python examples/calibrate_camera.py [--serial SERIAL] [--config YAML]
+    python examples/calibrate_camera.py --hand-geometry <absent|secured-home> \
+        [--serial SERIAL] [--config YAML]
 
 Controls:
 
@@ -37,10 +37,11 @@ Controls:
   Q                 quit (discard data)
   ESC               emergency stop (FAULT)
 
-XHand is optional, but ``--hand-geometry`` is a physical assertion used for
-collision checks: pass ``absent`` only when it is not mounted, or
-``secured-home`` only when an installed hand is physically fixed at its
-configured home pose.  The assertion never disables collision checking.
+XHand is optional, but ``--hand-geometry`` is a required physical-state assertion,
+not a geometry selector: pass ``absent`` only when no XHand is mounted, or
+``secured-home`` only when an installed hand is physically fixed at its configured
+home pose. Current calibration collision checks use the canonical fixed-home XHand
+envelope for both assertions, so the ``absent`` case is conservative.
 """
 
 from __future__ import annotations
@@ -799,13 +800,27 @@ def run_camera_calibration(
     calibration_config: CalibrationConfig | None = None,
     aruco_config: ArucoConfig | None = None,
 ) -> int:
-    """Own the arm worker, shared state, camera session, and bounded cleanup."""
+    """Own the arm worker, shared state, camera session, and bounded cleanup.
+
+    ``hand_geometry`` is an operator physical-state assertion. Collision planning
+    intentionally uses the canonical fixed-home XHand envelope for both accepted
+    values; ``absent`` therefore retains conservative hand geometry.
+    """
     if hand_geometry not in {"absent", "secured-home"}:
         raise ValueError("hand_geometry must be 'absent' or 'secured-home'")
     calib_cfg = calibration_config or CalibrationConfig()
     aruco_cfg = aruco_config or ArucoConfig()
     planner, safety_gate, workspace = _build_planner_and_gate(runtime)
-    print(f"  XHand: not required ({hand_geometry} geometry used for collision checks)")
+    if hand_geometry == "absent":
+        print(
+            "  XHand: absent (operator assertion); collision checks conservatively "
+            "retain the fixed-home XHand envelope"
+        )
+    else:
+        print(
+            "  XHand: mounted and secured at configured home (operator assertion); "
+            "collision checks use the fixed-home XHand envelope"
+        )
 
     ctx = mp.get_context("spawn")
     shared = RuntimeChannels.create(

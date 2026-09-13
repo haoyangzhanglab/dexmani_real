@@ -190,8 +190,8 @@ class RealSenseCamera:
     def connect(self) -> bool:
         """Open RealSense pipeline. Returns True on success.
 
-        Canonical lifecycle method per CLAUDE.md Section 2.3.
-        Idempotent: calling on an already-connected camera returns True.
+        Explicit lifecycle method. Idempotent: calling on an already-connected
+        camera returns True.
         """
         if self.pipeline is not None:
             return True
@@ -489,8 +489,8 @@ class RealSenseCamera:
     def disconnect(self) -> None:
         """Close RealSense pipeline.
 
-        Canonical lifecycle method per CLAUDE.md Section 2.3.
-        Idempotent: calling on an already-disconnected camera is a no-op.
+        Explicit lifecycle method. Idempotent: calling on an already-disconnected
+        camera is a no-op.
         """
         if self.pipeline is None:
             return

@@ -323,10 +323,10 @@ def verify_replay_preflight(
     command hard limits, the recorded-state-to-first-command transition, and
     every adjacent command pair for workspace bounds and collision
     (self-collision plus static obstacle boxes). Robot-table contact is
-    deliberately not a replay rejection condition (user_design.md §3): replayed
-    episodes were recorded by teleop without table gating, and table clearance
-    remains enforced on the return-home path. Called once before worker startup;
-    any rejection prevents hardware access entirely.
+    deliberately not a replay rejection condition because replayed episodes were
+    recorded under the same teleop table-contact semantics; table clearance remains
+    enforced on the return-home path. Called once before worker startup; any
+    rejection prevents hardware access entirely.
     """
     require_hand_actions(trajectory)
     if not bool(runtime.policy.hand_enabled):
@@ -357,7 +357,7 @@ def verify_replay_preflight(
         ),
         hand_dof=True,
         static_boxes=tuple(runtime.environment.static_boxes),
-        # user_design.md §3: replay does not reject on robot-table contact.
+        # Replay intentionally mirrors teleop's table-contact semantics here.
         # Table clearance stays enforced on the return-home path, which uses the
         # replayer's own planner (see EpisodeReplayer.setup()).
         table=None,
