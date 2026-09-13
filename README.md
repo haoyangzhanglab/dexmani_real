@@ -44,7 +44,7 @@ python examples/collect_teleop.py --print-config
 | 离线 episode 处理 | `python examples/process_episodes.py episodes/<task> --dry-run` | 否 | 审计；去掉 `--dry-run` 后发布 processed HDF5 |
 | Policy Zarr 导出 | `python examples/export_policy_zarr.py episodes_processed/<task> --dry-run` | 否 | 预检；去掉 `--dry-run` 后发布 `datasets/<task>.zarr` |
 | Learned-policy rollout | `python examples/run_policy.py <policy/task/experiment>` | 是 | `rollouts/.../session_*` 下的记录与 resolved run config |
-| Camera 标定 | `python examples/calibrate_camera.py --hand-geometry <absent\|secured-home>` | 是 | xArm/RealSense eye-to-hand 标定并更新 camera calibration |
+| Camera 标定 | `python examples/calibrate_camera.py --hand-geometry {absent,secured-home}` | 是 | xArm/RealSense eye-to-hand 标定并更新 camera calibration |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 仅 HTS/VR | 更新 `dexmani_real/config/vr_transform.json`；不控制机器人 |
 
 ### VR 遥操作与采集
