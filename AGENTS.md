@@ -39,12 +39,15 @@ inspected.
   generation, command-validation, or fail-closed boundaries to make a change pass.
 - Keep live SDK objects inside their owning driver/worker boundary; do not move them
   across process boundaries.
+- Keep live device acquisition and robot commands behind explicit lifecycle methods;
+  ordinary imports and constructors should not open devices or command hardware.
 - Never claim hardware validation unless real hardware was actually exercised.
 - Report hardware/CUDA/device validation separately from offline validation.
 
 ## 3. Working method
 
-Before editing, inspect the smallest relevant entry point and trace important values
+Before editing a worktree, inspect `git status --short` and preserve unrelated user
+changes. Then inspect the smallest relevant entry point and trace important values
 through the real call/data path:
 
 ```text
@@ -61,8 +64,8 @@ than filenames, comments, historical plans, or stale documentation.
 While editing:
 
 - make the smallest coherent change that solves the assigned problem;
-- preserve unrelated user changes and externally visible behavior unless the task
-  explicitly changes that behavior;
+- preserve externally visible behavior unless the task explicitly changes that
+  behavior;
 - avoid speculative features, abstractions, configurability, and nearby cleanup;
 - follow the existing ownership and dependency direction;
 - remove only artifacts made obsolete by the current change;

@@ -2,9 +2,11 @@
 """Run the hardware-affecting xArm7/RealSense eye-to-hand calibration workflow.
 
 The interactive session can command the arm and writes ``cameras.json`` after
-ENTER.  ``--hand-geometry`` is a physical collision-model assertion: use
-``absent`` only without a mounted XHand, or ``secured-home`` only when the
-mounted hand is physically fixed at its configured home pose.
+ENTER. ``--hand-geometry`` is a required physical-state assertion, not a geometry
+selector: use ``absent`` only without a mounted XHand, or ``secured-home`` only
+when the mounted hand is physically fixed at its configured home pose. Current
+calibration collision checks conservatively use the fixed-home XHand envelope for
+both assertions.
 """
 
 from __future__ import annotations
@@ -34,8 +36,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--hand-geometry",
         choices=("absent", "secured-home"),
-        default="secured-home",
-        help="physical assertion for arm-only procedure (default: secured-home)",
+        required=True,
+        help=(
+            "required physical-state assertion: absent means no XHand is mounted; "
+            "secured-home means a mounted XHand is physically fixed at configured "
+            "home. Collision checks use the fixed-home XHand envelope in both cases."
+        ),
     )
     parser.add_argument(
         "--config",
@@ -52,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
         f"  ArUco: {ARUCO_DICT_NAME} ID={aruco.target_id} "
         f"size={aruco.marker_size_m * 1000:.1f}mm"
     )
-    print(f"  hand geometry assertion: {args.hand_geometry}")
+    print(f"  hand physical-state assertion: {args.hand_geometry}")
     print("=" * 60)
 
     try:
