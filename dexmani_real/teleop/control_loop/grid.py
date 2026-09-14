@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -15,6 +15,7 @@ from dexmani_real.control.publication import (
     PublishResult,
     prepare_joint_command,
     publish_command,
+    wait_command_accepted,
 )
 from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
 from dexmani_real.ipc.causal import (
@@ -32,7 +33,7 @@ from dexmani_real.planning.kinematics.pose import (
     rot6d_to_quat_wxyz,
 )
 from dexmani_real.recording.client import RecorderClient
-from dexmani_real.runtime.safety import SafetyState
+from dexmani_real.runtime.safety import SafetyState, revoke_motion
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.control_loop.action_proposal import (
     compute_arm_joint_proposal,
@@ -400,28 +401,25 @@ def _record_grid_hold(
         target_eef_pos, target_eef_rot6d = make_arm_fk().compute(
             np.asarray(controller.prev_qpos_cmd, dtype=np.float64)
         )
-    # Serialize the recording decision with worker rejection. RecorderClient
-    # may automatically request a save when this sample reaches max_frames.
-    with shared.motion_lock:
-        if int(shared.safety_state.value) != int(SafetyState.RUNNING):
-            return
-        record_held(
-            resources.recorder,
-            observation.arm_state,
-            controller.prev_qpos_cmd,
-            controller.prev_hand_qpos,
-            observation.vr_frame,
-            observation.camera_frame,
-            hand_state=observation.hand_state,
-            arm_qpos_sent=controller.prev_qpos_cmd.copy(),
-            action_queued=action_queued,
-            target_eef_pos=target_eef_pos,
-            target_eef_rot6d=target_eef_rot6d,
-            observation_anchor_monotonic_ns=observation.anchor_monotonic_ns,
-            shared=shared,
-            max_observation_skew_s=resources.max_observation_skew_s,
-            **kwargs,
-        )
+    if int(shared.safety_state.value) != int(SafetyState.RUNNING):
+        return
+    record_held(
+        resources.recorder,
+        observation.arm_state,
+        controller.prev_qpos_cmd,
+        controller.prev_hand_qpos,
+        observation.vr_frame,
+        observation.camera_frame,
+        hand_state=observation.hand_state,
+        arm_qpos_sent=controller.prev_qpos_cmd.copy(),
+        action_queued=action_queued,
+        target_eef_pos=target_eef_pos,
+        target_eef_rot6d=target_eef_rot6d,
+        observation_anchor_monotonic_ns=observation.anchor_monotonic_ns,
+        shared=shared,
+        max_observation_skew_s=resources.max_observation_skew_s,
+        **kwargs,
+    )
 
 
 def _read_control_grid_observation(
@@ -696,6 +694,53 @@ def _publication_motion_revoked(
     )
 
 
+def _confirm_terminal_arm_acceptance_if_needed(
+    shared: RuntimeChannels,
+    cfg: TeleopConfig,
+    recorder: RecorderClient | None,
+    candidate: ActionCandidate,
+    publication: PublishResult,
+    *,
+    recording_active: bool,
+) -> bool:
+    """Admit only SDK-accepted arm commands to the auto-saving terminal frame."""
+    if (
+        not recording_active
+        or recorder is None
+        or not recorder.next_frame_reaches_limit
+    ):
+        return True
+    assert publication.published and publication.ticket is not None
+    assert candidate.arm_qpos is not None and candidate.action_id > 0
+    acceptance = wait_command_accepted(
+        shared,
+        ticket=publication.ticket,
+        action_id=candidate.action_id,
+        wait_for_arm=True,
+        wait_for_hand=False,
+        timeout_s=float(cfg.runtime.policy.action_apply_timeout_s),
+        arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
+        hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
+        heartbeat=lambda: shared.set_heartbeat("policy", time.monotonic()),
+    )
+    if acceptance.accepted:
+        return True
+    logger.warning("teleop_loop: terminal arm command not accepted: %s", acceptance.reason)
+    # The wait can cancel ownership without leaving RUNNING. Establish the
+    # silent boundary here; the outer loop owns discard and fresh-B recovery.
+    # Keep the health check and transition atomic without downgrading faults.
+    with shared.motion_lock:
+        if (
+            shared.is_running.value
+            and not shared.error_state.value
+            and not shared.estop_request.value
+            and int(shared.safety_state.value) == int(SafetyState.RUNNING)
+        ):
+            if not revoke_motion(shared, SafetyState.ARMED):
+                shared.error_state.value = True
+    return False
+
+
 def _publish_arm_safety_hold(
     controller: TeleopController,
     shared: RuntimeChannels,
@@ -731,6 +776,11 @@ def _publish_arm_safety_hold(
         )
         shared.error_state.value = True
         return False
+    if not _confirm_terminal_arm_acceptance_if_needed(
+        shared, cfg, resources.recorder, published_hold, hold_result,
+        recording_active=recording_active,
+    ):
+        return _publication_motion_revoked(shared, prepared_hold)
     _record_grid_hold(
         controller,
         shared,
@@ -792,6 +842,11 @@ def _publish_ik_failure_hold(
         )
         shared.error_state.value = True
         return False
+    if not _confirm_terminal_arm_acceptance_if_needed(
+        shared, cfg, resources.recorder, published_candidate, publish_result,
+        recording_active=recording_active,
+    ):
+        return _publication_motion_revoked(shared, prepared_command)
     if controller.hand_enabled:
         if published_candidate.arm_qpos is not None:
             controller.prev_qpos_cmd = np.asarray(
@@ -938,6 +993,11 @@ def _publish_solved_action(
             recording_active=recording_active,
         )
         return True
+    if not _confirm_terminal_arm_acceptance_if_needed(
+        shared, cfg, resources.recorder, published_candidate, publish_result,
+        recording_active=recording_active,
+    ):
+        return _publication_motion_revoked(shared, prepared_command)
     if published_candidate.arm_qpos is not None:
         arm_cmd = np.asarray(published_candidate.arm_qpos, dtype=np.float64)
     if published_candidate.hand_qpos is not None:
@@ -956,25 +1016,23 @@ def _publish_solved_action(
             _f_status = FRAME_RETARGET_FAIL
         else:
             _f_status = FRAME_OK
-        # An already-rejected run must not reach RecorderClient's auto-save.
-        with shared.motion_lock:
-            if int(shared.safety_state.value) != int(SafetyState.RUNNING):
-                return True
-            record_frame(
-                recorder,
-                arm_state,
-                hand_state,
-                arm_cmd,
-                hand_cmd,
-                target_pos,
-                target_quat,
-                vr_frame,
-                cam,
-                frame_status=_f_status,
-                observation_anchor_monotonic_ns=_current_grid_anchor_ns,
-                shared=shared,
-                max_observation_skew_s=resources.max_observation_skew_s,
-            )
+        if int(shared.safety_state.value) != int(SafetyState.RUNNING):
+            return True
+        record_frame(
+            recorder,
+            arm_state,
+            hand_state,
+            arm_cmd,
+            hand_cmd,
+            target_pos,
+            target_quat,
+            vr_frame,
+            cam,
+            frame_status=_f_status,
+            observation_anchor_monotonic_ns=_current_grid_anchor_ns,
+            shared=shared,
+            max_observation_skew_s=resources.max_observation_skew_s,
+        )
     return True
 
 
@@ -1044,6 +1102,14 @@ def run_control_grid_tick(
                 recording_active=tick_result.recording_active,
                 arm_feedback_error_count=tick_result.arm_feedback_error_count,
                 hand_disconnected_at_s=tick_result.hand_disconnected_at_s,
+            )
+        if not _confirm_terminal_arm_acceptance_if_needed(
+            shared, cfg, resources.recorder, published_hold, hold_result,
+            recording_active=tick_result.recording_active,
+        ):
+            return replace(
+                tick_result,
+                keep_running=_publication_motion_revoked(shared, prepared_hold),
             )
         _record_grid_hold(
             controller,

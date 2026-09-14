@@ -505,7 +505,7 @@ def _run_keyboard_home(
         )
     else:
         logger.warning("Return-home cancelled: hand-home command was not accepted")
-        home_result = None
+        return None
 
     if shared.estop_request.value:
         set_keyboard_fault(shared, "operator e-stop during homing")

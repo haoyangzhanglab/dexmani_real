@@ -88,6 +88,15 @@ class RecorderClient:
         return self._recording
 
     @property
+    def next_frame_reaches_limit(self) -> bool:
+        """Whether a successful append now would trigger max-frames auto-save."""
+        return bool(
+            self._recording
+            and self._max_frames > 0
+            and self._frame_count + 1 >= self._max_frames
+        )
+
+    @property
     def stop_pending(self) -> bool:
         return self._stop_requested
 
