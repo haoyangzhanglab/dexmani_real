@@ -41,6 +41,11 @@ from dexmani_real.dataset.processed import (
     _validate_masked_tactile_rows,
     validate_processed_hdf5,
 )
+from dexmani_real.dataset.processing_report import (
+    PROCESSING_REPORT_FILENAME,
+    build_processing_report,
+    write_processing_report,
+)
 from dexmani_real.planning.kinematics.arm_fk import (
     EEF_POSE_ALGORITHM_ID,
     EEF_POSE_COMPONENTS,
@@ -770,6 +775,11 @@ def process_episode_root(
         ]
         report["outputs"] = outputs
         report["validation"] = validation
+        assert resolved_batch_task_name is not None
+        persisted_report = build_processing_report(
+            decisions, task_name=resolved_batch_task_name
+        )
+        write_processing_report(staging / PROCESSING_REPORT_FILENAME, persisted_report)
         atomic_publish(staging, target)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
