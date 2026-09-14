@@ -572,7 +572,7 @@ class EpisodeRecorder:
             meta.attrs["duration"] = duration
             meta.attrs["wall_duration_s"] = duration
             meta.attrs["num_frames"] = self._frame_count
-            meta.attrs["success"] = save
+            # Task success is intentionally judged offline from the published episode.
             meta.attrs["fps"] = self.control_hz
             meta.attrs["wall_fps"] = (
                 self._frame_count / duration if duration > 0 else self.control_hz

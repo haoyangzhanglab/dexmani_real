@@ -142,6 +142,7 @@ def _write_run_config(
     artifact: str,
     inference_steps: int,
     seed: int,
+    device: str,
     num_episodes: int,
     max_duration_s: float,
 ) -> None:
@@ -153,6 +154,7 @@ def _write_run_config(
         "artifact": artifact,
         "inference_steps": inference_steps,
         "seed": seed,
+        "device": device,
         "num_episodes": num_episodes,
         "max_duration_s": float(max_duration_s),
     }
@@ -235,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
             artifact=info.checkpoint_name,
             inference_steps=inference_steps,
             seed=args.seed,
+            device=args.device,
             num_episodes=args.num_episodes,
             max_duration_s=args.max_running_s,
         )

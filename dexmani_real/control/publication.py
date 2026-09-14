@@ -218,7 +218,8 @@ def build_action_candidate(
         if scheduled_target_monotonic_ns is None
         else scheduled_target_monotonic_ns
     )
-    if not 0 < scheduled_ns <= now_ns:
+    # Logical/provenance time may be before or after candidate creation time.
+    if scheduled_ns <= 0:
         return None
     delivery_deadline_ns = now_ns + int(float(action_validity_s) * 1e9)
     if valid_until_monotonic_ns is not None:
