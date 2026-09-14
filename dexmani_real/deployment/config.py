@@ -231,6 +231,10 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
         raise ValueError(
             f"Policy chunk_size exceeds Real IPC capacity {MAX_PREDICTION_STEPS}"
         )
+    if runtime.policy.replan_steps > policy_spec.chunk_size:
+        raise ValueError(
+            "policy.replan_steps exceeds the available Policy future chunk"
+        )
     if policy_spec.action_key not in {"action", "action_ee"}:
         raise ValueError("Policy action_key is unsupported by Real")
     expected_control_dim = 21 if policy_spec.action_key == "action_ee" else 19

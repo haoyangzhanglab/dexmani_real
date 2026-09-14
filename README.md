@@ -98,7 +98,7 @@ python examples/visualize_episode_processed.py <processed.h5> --info
 ### Learned-policy rollout
 
 `run_policy.py` 运行一个 persistent recorded policy session。当前 CLI 直接以
-`<policy/task/experiment>` 选择实验，并支持 artifact、inference steps、seed、episode 数量、
+`<policy/task/experiment>` 选择实验，并支持 artifact、inference steps、`--replan-steps`、seed、episode 数量、
 每个 episode 的运行时长预算和 device 等参数；完整接口以 `--help` 为准。
 
 该入口 **始终连接真实硬件**。它会在启动 actuator/camera worker 之前先准备 inference child，

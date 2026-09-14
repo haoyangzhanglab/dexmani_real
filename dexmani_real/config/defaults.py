@@ -600,6 +600,9 @@ class PolicyParams:
     """Policy / teleop parameters — single source of truth."""
 
     control_hz: float = 16.0
+    # PolicySpec owns prediction shape/history and action-grid spacing.
+    # Real owns how often it re-observes and replans on that grid.
+    replan_steps: int = 8
     # Executor polling is deliberately faster than the 16 Hz action grid: it
     # shortens arm/hand progress and publication-result phase delay without raising
     # command rate.
@@ -658,6 +661,10 @@ class PolicyParams:
     def validate(self) -> None:
         if not np.isfinite(self.control_hz) or self.control_hz <= 0:
             raise ValueError(f"control_hz={self.control_hz} must be > 0")
+        if isinstance(self.replan_steps, bool) or not isinstance(self.replan_steps, int):
+            raise TypeError("replan_steps must be an int")
+        if self.replan_steps < 1:
+            raise ValueError("replan_steps must be >= 1")
         if (
             not np.isfinite(self.executor_poll_hz)
             or self.executor_poll_hz < self.control_hz

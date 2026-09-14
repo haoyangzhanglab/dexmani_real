@@ -163,7 +163,7 @@ def inference_loop(
     logger.info("inference_loop: ready (runtime=%s)", FIXED_POLICY_RUNTIME_TARGET)
 
     step_dt_ns = int(round(float(config.spec.control_dt_s) * 1e9))
-    inference_period_ns = int(config.spec.n_action_steps) * step_dt_ns
+    inference_period_ns = int(policy.replan_steps) * step_dt_ns
 
     observation_id = 0
     last_generation = -1

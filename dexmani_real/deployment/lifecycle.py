@@ -124,6 +124,7 @@ def _rollout_recorder_config(
             "policy_selector": worker_config.experiment,
             "checkpoint_name": worker_config.artifact,
             "inference_steps": str(worker_config.inference_steps),
+            "replan_steps": str(runtime.policy.replan_steps),
             "seed": str(worker_config.seed),
             "max_running_s": f"{float(rollout.max_running_s):.17g}",
         },
