@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -35,6 +36,7 @@ from dexmani_real.control.publication import (
 from dexmani_real.control.safety_gate import SafetyGate
 from dexmani_real.deployment.config import RolloutRecordingConfig
 from dexmani_real.deployment.metrics import PolicyStats, flush_every
+from dexmani_real.deployment.policy_trace import PolicyTrace, trace_path_for_episode
 from dexmani_real.deployment.prediction import Prediction
 from dexmani_real.deployment.timing import (
     first_future_step_index,
@@ -234,12 +236,12 @@ def prediction_from_record(record: np.void) -> Prediction:
     )
 
 
-def read_latest_prediction(shared: RuntimeChannels) -> tuple[Prediction, int] | None:
-    """Read the newest prediction plus its latest-wins ring sequence."""
+def read_latest_prediction(shared: RuntimeChannels) -> tuple[Prediction, int, int] | None:
+    """Read the newest prediction, ring commit timestamp, and logical sequence."""
     result = shared.prediction_ring.read_latest()
     if result is None:
         return None
-    return prediction_from_record(result[0][0]), int(result[2])
+    return prediction_from_record(result[0][0]), int(result[1]), int(result[2])
 
 
 def _command_watchdog_reason(
@@ -574,6 +576,8 @@ class PolicyExecutor:
         self.run_started_ns: int | None = None
         self.last_seen_prediction_sequence: int | None = None
         self.active_prediction: Prediction | None = None
+        self.active_prediction_sequence: int | None = None
+        self._policy_trace: PolicyTrace | None = None
         self.step_index = 0
         self.schedule_base_ns: int | None = None
         self.next_command_due_ns: int | None = None
@@ -593,6 +597,7 @@ class PolicyExecutor:
         self.run_generation = generation
         self.last_seen_prediction_sequence = None
         self.active_prediction = None
+        self.active_prediction_sequence = None
         self.step_index = 0
         self.schedule_base_ns = None
         self.next_command_due_ns = None
@@ -602,6 +607,41 @@ class PolicyExecutor:
         self.previous_hand_command_qpos = None
         self.last_recorded_action = None
         self.progress.reset(generation)
+
+    def _start_policy_trace(self) -> None:
+        self._policy_trace = None
+        if self.recorder is None:
+            return
+        try:
+            self._policy_trace = PolicyTrace(
+                self.run_started_ns,
+                self.policy_spec.chunk_size,
+                self.policy_spec.control_action_dim,
+            )
+        except Exception:
+            logger.warning("executor: could not start policy trace", exc_info=True)
+
+    def _append_policy_trace(self, method: str, **values: Any) -> None:
+        trace = self._policy_trace
+        if trace is None:
+            return
+        try:
+            getattr(trace, method)(**values)
+        except Exception:
+            self._policy_trace = None
+            logger.warning("executor: disabling this episode's policy trace", exc_info=True)
+
+    def _finish_policy_trace(self, result: RecorderStopResult) -> None:
+        # Execution state may already be cleared while RecorderIO finishes.
+        trace, self._policy_trace = self._policy_trace, None
+        if trace is None or not result.saved or result.error is not None:
+            return
+        try:
+            if not result.path or not Path(result.path).is_dir():
+                raise ValueError("saved recording has no valid episode directory")
+            trace.save(trace_path_for_episode(result.path))
+        except Exception:
+            logger.warning("executor: could not save policy trace", exc_info=True)
 
     def _finish_episode(
         self,
@@ -828,6 +868,7 @@ class PolicyExecutor:
                 "executor: rollout recording discarded (%s)",
                 result.reason or pending_reason or "unknown",
             )
+        self._finish_policy_trace(result)
 
     def _record_rejection(
         self,
@@ -1069,6 +1110,7 @@ class PolicyExecutor:
         self.next_record_ns = epoch.started_monotonic_ns + self.step_dt_ns
         self.episode_steps = 0
         self._clear_execution(epoch.generation)
+        self._start_policy_trace()
         print(
             f"Episode {self.completed_episodes + 1}/{self.num_episodes} RUNNING",
             flush=True,
@@ -1211,7 +1253,7 @@ class PolicyExecutor:
             return False
         if latest is None:
             return True
-        prediction, sequence = latest
+        prediction, publish_ns, sequence = latest
         if sequence == self.last_seen_prediction_sequence:
             return True
         self.last_seen_prediction_sequence = sequence
@@ -1229,10 +1271,21 @@ class PolicyExecutor:
             now_ns,
             prediction.num_steps,
         )
+        self._append_policy_trace(
+            "add_prediction", sequence=sequence, publish_ns=publish_ns,
+            ingest_ns=now_ns, source_ns=prediction.source_monotonic_ns,
+            logical_step_ns=prediction.logical_step_monotonic_ns,
+            first_index=-1 if first_index is None else first_index,
+            inference_latency_ms=prediction.inference_latency_ms,
+            observation_age_ms=prediction.observation_age_ms,
+            observation_skew_ms=prediction.observation_skew_ms,
+            actions=prediction.actions,
+        )
         if first_index is None:
             self.stats.stale_prediction_count += 1
             return True
         self.active_prediction = prediction
+        self.active_prediction_sequence = sequence
         self.step_index = first_index
         self.schedule_base_ns = prediction.logical_step_monotonic_ns
         self.stats.skipped_prefix_steps = first_index
@@ -1253,6 +1306,7 @@ class PolicyExecutor:
             )
             if first_index is None:
                 self.active_prediction = None
+                self.active_prediction_sequence = None
                 self.stats.stale_prediction_count += 1
                 return None
             self.step_index = max(self.step_index, first_index)
@@ -1286,6 +1340,7 @@ class PolicyExecutor:
         self.step_index += 1
         if self.step_index >= prediction.num_steps:
             self.active_prediction = None
+            self.active_prediction_sequence = None
             self.schedule_base_ns = None
             return
         first_index = first_future_step_index(
@@ -1296,6 +1351,7 @@ class PolicyExecutor:
         )
         if first_index is None:
             self.active_prediction = None
+            self.active_prediction_sequence = None
         else:
             self.step_index = max(self.step_index, first_index)
 
@@ -1375,6 +1431,9 @@ class PolicyExecutor:
         scheduled_target_ns: int,
         due_ns: int,
     ) -> None:
+        # Capture before decode/rejection/commit can advance or clear the chunk.
+        prediction_sequence = self.active_prediction_sequence
+        chunk_index = self.step_index
         decoded, reject_kind, decode_rejection = self._decode_due_action(action)
         if decoded is None:
             if bool(self.shared.error_state.value):
@@ -1385,6 +1444,14 @@ class PolicyExecutor:
                     terminal_ns,
                     raw_action=action,
                     reject_kind=reject_kind,
+                )
+                self._append_policy_trace(
+                    "add_decision", sequence=prediction_sequence,
+                    chunk_index=chunk_index, due_ns=due_ns, event_ns=terminal_ns,
+                    frame_status=(
+                        _RECORD_FRAME_SAFETY_REJECT if reject_kind is _RejectKind.SAFETY
+                        else _RECORD_FRAME_IK_FAIL
+                    ),
                 )
             return
         arm_qpos, hand_qpos = decoded
@@ -1425,6 +1492,8 @@ class PolicyExecutor:
                 candidate,
                 due_ns,
                 raw_action=action,
+                prediction_sequence=prediction_sequence,
+                chunk_index=chunk_index,
             )
             return
         published_candidate = prepared.candidate
@@ -1484,6 +1553,10 @@ class PolicyExecutor:
             candidate=published_candidate,
             raw_action=action,
         )
+        self._append_policy_trace(
+            "add_decision", sequence=prediction_sequence, chunk_index=chunk_index,
+            due_ns=due_ns, event_ns=publication_ns, frame_status=_RECORD_FRAME_OK,
+        )
 
     def _handle_preparation_rejection(
         self,
@@ -1492,6 +1565,8 @@ class PolicyExecutor:
         due_ns: int,
         *,
         raw_action: np.ndarray,
+        prediction_sequence: int | None,
+        chunk_index: int,
     ) -> None:
         if prepared.unavailable:
             return
@@ -1507,6 +1582,11 @@ class PolicyExecutor:
             terminal_ns,
             raw_action=raw_action,
             reject_kind=_RejectKind.SAFETY,
+        )
+        self._append_policy_trace(
+            "add_decision", sequence=prediction_sequence, chunk_index=chunk_index,
+            due_ns=due_ns, event_ns=terminal_ns,
+            frame_status=_RECORD_FRAME_SAFETY_REJECT,
         )
 
     def _handle_publication_rejection(self, result: PublishResult) -> None:

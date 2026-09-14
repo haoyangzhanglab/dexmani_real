@@ -105,6 +105,13 @@ python examples/visualize_episode_processed.py <processed.h5> --info
 并为 session 写入 resolved `run_config.yaml`。任务成功与否在离线数据审核中判断；runtime 记录
 技术停止原因和 episode 数据。
 
+Recorded rollout session 额外生成与 `episode_XXX/` 同级的
+`episode_XXX.policy_trace.npz`，用于 offline prediction-to-execution debugging：
+
+```bash
+python examples/visualize_policy_rollout.py <rollout-episode> --info
+```
+
 ### Camera 标定
 
 `--hand-geometry` 是必须由操作者显式给出的物理状态声明，而不是 geometry selector：
