@@ -20,7 +20,7 @@ from scipy.spatial.transform import Rotation
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.control.arm_homing import ArmHomeConfig, execute_arm_home
 from dexmani_real.control.hand_homing import publish_hand_home_and_wait_accepted
-from dexmani_real.control.jog import compute_cartesian_jog_delta
+from dexmani_real.control.jog import any_jog_key_held, compute_cartesian_jog_delta
 from dexmani_real.control.publication import prepare_joint_command, publish_command
 from dexmani_real.control.safety_gate import planner_action_safety_gate
 from dexmani_real.ipc.channels import (
@@ -32,6 +32,10 @@ from dexmani_real.ipc.channels import (
 from dexmani_real.planning import OnlineIKConfig, Pose, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.pose import quat_multiply
 from dexmani_real.robot.arm_worker import arm_loop
+from dexmani_real.robot.command_validation import (
+    ARM_COMMAND_JUMP_REJECTION,
+    check_worker_arm_target,
+)
 from dexmani_real.robot.hand_worker import hand_loop
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import ProcessSpec, build_processes, start_processes
@@ -79,6 +83,9 @@ def _build_planner_and_gate(
 ) -> tuple[XArm7MotionPlanner, Any]:
     planner = XArm7MotionPlanner.create_default(
         teleop_profile=OnlineIKConfig(
+            max_ik_jump_deg=(
+                float(np.rad2deg(runtime.arm.max_servo_command_jump_rad)),
+            ) * 7,
             max_pose_error_pos_m=float(runtime.keyboard_teleop.ik_max_pose_error_pos_m),
             max_pose_error_rot_rad=float(
                 runtime.keyboard_teleop.ik_max_pose_error_rot_rad
@@ -286,6 +293,7 @@ class _KeyboardPublishResult:
     arm_qpos_rad: np.ndarray | None = None
     detail: str = ""
     action_id: int = 0
+    fatal: bool = False
 
 
 def _keyboard_action_was_accepted(
@@ -536,9 +544,25 @@ def _publish_keyboard_target(
             detail=ik_result.reason or "unknown",
         )
 
+    q_cmd = planner.ik_mgr.nearest_equivalent_qpos(
+        np.asarray(ik_result.qpos, dtype=np.float64), previous_command_qpos_rad
+    )
+    issue = check_worker_arm_target(
+        q_cmd,
+        previous_target_qpos_rad=previous_command_qpos_rad,
+        joint_limit_lower_rad=np.asarray(runtime.arm.joint_limit_lower),
+        joint_limit_upper_rad=np.asarray(runtime.arm.joint_limit_upper),
+        max_command_jump_rad=runtime.arm.max_servo_command_jump_rad,
+    )
+    if issue is not None:
+        return _KeyboardPublishResult(
+            _KeyboardPublishStatus.SAFETY_REJECTED,
+            detail=issue,
+            fatal=issue != ARM_COMMAND_JUMP_REJECTION,
+        )
     prepared = prepare_joint_command(
         shared,
-        np.asarray(ik_result.qpos, dtype=np.float64).copy(),
+        q_cmd,
         gate=safety_gate,
         arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
@@ -563,6 +587,7 @@ def _publish_keyboard_target(
             _KeyboardPublishStatus.SAFETY_REJECTED,
             detail=prepared.reason
             or (publish_result.reason if publish_result is not None else ""),
+            fatal=prepared.fatal,
         )
     return _KeyboardPublishResult(
         _KeyboardPublishStatus.PUBLISHED,
@@ -607,11 +632,39 @@ def _run_control_loop(
     release_ack_started_s = 0.0
     quit_quiesced = False
     previous_active_keys: tuple[str, ...] | None = None
-    blocked_keys: tuple[str, ...] | None = None
+    blocked_until_release = False
     frame = 0
     last_ik_warning_s = 0.0
     last_boundary_warn_s = 0.0
     started_s = time.monotonic()
+
+    def reject_motion(reason: str, *, fatal: bool = False) -> bool:
+        nonlocal motion_active, release_idle_frames, last_motion_action_id
+        nonlocal release_ack_started_s, previous_command, target_pos, target_quat
+        nonlocal blocked_until_release
+        if (
+            fatal
+            or shared.error_state.value
+            or shared.estop_request.value
+            or not shared.is_running.value
+            or int(shared.safety_state.value)
+            not in (int(SafetyState.ARMED), int(SafetyState.RUNNING))
+        ):
+            set_keyboard_fault(shared, reason)
+            return False
+        if int(shared.safety_state.value) == int(SafetyState.RUNNING):
+            if not revoke_motion(shared, SafetyState.ARMED):
+                set_keyboard_fault(shared, "failed to stop rejected keyboard motion")
+                return False
+        motion_active = False
+        release_idle_frames = 0
+        last_motion_action_id = 0
+        release_ack_started_s = 0.0
+        previous_command, target_pos, target_quat = _keyboard_command_anchor(
+            planner, current_qpos
+        )
+        blocked_until_release = True
+        return True
 
     print(
         "Keyboard active (terminal input captured through shutdown): "
@@ -670,6 +723,10 @@ def _run_control_loop(
         if quit_requested:
             return True
 
+        if motion_active and int(shared.safety_state.value) == int(SafetyState.ARMED):
+            if not reject_motion("arm command rejected"):
+                return False
+
         home_pressed = keys.is_pressed("r")
         if home_pressed and not home_key_down:
             home_anchor = _run_keyboard_home(
@@ -708,8 +765,8 @@ def _run_control_loop(
                 print("  [--------] released", flush=True)
             previous_active_keys = active_keys
         moving = bool(np.any(dx != 0.0) or np.any(drpy != 0.0))
-        if blocked_keys is not None:
-            if active_keys == blocked_keys:
+        if blocked_until_release:
+            if any_jog_key_held(active_keys):
                 if frame % int(cfg.idle_interval_frames) == 0:
                     elapsed = time.monotonic() - started_s
                     pose = planner.kin.compute_eef_pose_world(current_qpos)
@@ -719,7 +776,11 @@ def _run_control_loop(
                         flush=True,
                     )
                 continue
-            blocked_keys = None
+            blocked_until_release = False
+            previous_command, target_pos, target_quat = _keyboard_command_anchor(
+                planner, current_qpos
+            )
+            continue
         # A short release debounce bridges transient key gaps. Once confirmed,
         # wait only for the final normal endpoint to cross the SDK boundary;
         # revocation then leaves Mode 6 to finish that endpoint unchanged.
@@ -825,14 +886,16 @@ def _run_control_loop(
             if now_s - last_ik_warning_s >= _IK_WARNING_INTERVAL_S:
                 logger.warning("IK rejected target: %s", publish_result.detail)
                 last_ik_warning_s = now_s
-            blocked_keys = active_keys
+            if not reject_motion(publish_result.detail):
+                return False
             continue
         if publish_result.status is _KeyboardPublishStatus.SAFETY_REJECTED:
             logger.warning(
-                "Keyboard motion command rejected (%s) — blocked until keys change",
+                "Keyboard motion command rejected (%s) — release all jog keys to restart",
                 publish_result.detail,
             )
-            blocked_keys = active_keys
+            if not reject_motion(publish_result.detail, fatal=publish_result.fatal):
+                return False
             continue
         assert publish_result.arm_qpos_rad is not None
         last_motion_action_id = publish_result.action_id

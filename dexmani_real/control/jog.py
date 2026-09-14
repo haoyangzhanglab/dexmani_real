@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 if TYPE_CHECKING:
     from dexmani_real.runtime.operator_input import KeyboardInput
+
+CARTESIAN_JOG_KEYS = frozenset(
+    {"w", "s", "a", "d", "up", "down", "left", "right", "i", "k", "j", "l"}
+)
+
+
+def any_jog_key_held(active_keys: Iterable[str]) -> bool:
+    """Check physical jog keys even when opposite increments cancel out."""
+    return not CARTESIAN_JOG_KEYS.isdisjoint(active_keys)
 
 
 def compute_cartesian_jog_delta(

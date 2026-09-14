@@ -174,6 +174,7 @@ class EpisodeReplayer:
         self._running = False
         self._estopped = False
         self._motion_started = False
+        self._replay_started = False
         self._status = ReplayStatus.COMPLETED
         self._reason = ""
         self._hand_available = trajectory.has_hand
@@ -293,7 +294,7 @@ class EpisodeReplayer:
         return True
 
     def _reject(self, reason: str) -> None:
-        """Stop before replay commands without converting a valid runtime into a fault."""
+        """End command publication without converting a valid runtime into a fault."""
         self._running = False
         self._status = ReplayStatus.REJECTED
         self._reason = reason
@@ -422,7 +423,7 @@ class EpisodeReplayer:
         require_transition(self.shared, SafetyState.FAULT)
 
     def _runtime_issue(self) -> tuple[ReplayStatus, str] | None:
-        """Return (status, reason) if shared state signals a fault, estop, or health issue; None otherwise."""
+        """Classify runtime faults and a healthy revoked replay motion epoch."""
         assert self.shared is not None
         if self.shared.estop_request.value:
             return ReplayStatus.ESTOP, "e-stop requested"
@@ -436,6 +437,21 @@ class EpisodeReplayer:
             issue = self._health_check()
             if issue:
                 return ReplayStatus.FAULT, issue
+        if self._replay_started and int(self.shared.safety_state.value) == int(
+            SafetyState.ARMED
+        ):
+            arm_state = read_arm_state_dict(self.shared)
+            issue = arm_feedback_issue(
+                arm_state, float(self.runtime.policy.arm_state_stale_threshold_s)
+            )
+            if issue is not None:
+                return ReplayStatus.FAULT, issue
+            if self._hand_available and not hand_feedback_is_healthy(
+                read_hand_state_dict(self.shared),
+                float(self.runtime.safety.heartbeat_timeouts["hand"]),
+            ):
+                return ReplayStatus.FAULT, "hand feedback unhealthy after motion revocation"
+            return ReplayStatus.REJECTED, "arm command rejected; replay motion revoked"
         return None
 
     def _enter_terminal_quiescence(self) -> None:
@@ -470,7 +486,10 @@ class EpisodeReplayer:
         issue = self._runtime_issue()
         if issue is not None:
             status, reason = issue
-            self._fault(reason, estop=status is ReplayStatus.ESTOP)
+            if status is ReplayStatus.REJECTED:
+                self._reject(reason)
+            else:
+                self._fault(reason, estop=status is ReplayStatus.ESTOP)
             return False
         if OperatorCommand.QUIT in signals:
             print("\nQ: stopping command publication")
@@ -554,6 +573,7 @@ class EpisodeReplayer:
             if not begin_motion(self.shared):
                 self._fault("failed to enter replay motion")
                 return self._outcome()
+            self._replay_started = True
             self._motion_started = True
             if not self._wait_arm_streaming(keyboard):
                 return self._outcome()
@@ -703,9 +723,21 @@ class EpisodeReplayer:
                         reason = published.reason
                     if not reason and accepted is not None:
                         reason = accepted.reason
-                    self._fault(
-                        f"frame {frame_idx}: joint {boundary} boundary rejected: {reason}"
-                    )
+                    runtime_issue = self._runtime_issue()
+                    if (
+                        not prepared.fatal
+                        and runtime_issue is not None
+                        and runtime_issue[0] is ReplayStatus.REJECTED
+                    ):
+                        self._reject(runtime_issue[1])
+                    else:
+                        self._fault(
+                            f"frame {frame_idx}: joint {boundary} boundary rejected: {reason}",
+                            estop=(
+                                runtime_issue is not None
+                                and runtime_issue[0] is ReplayStatus.ESTOP
+                            ),
+                        )
                     break
                 assert candidate.arm_qpos is not None
                 sent_arm_cmd = np.asarray(candidate.arm_qpos, dtype=np.float64)

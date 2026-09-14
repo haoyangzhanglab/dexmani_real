@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
+ARM_COMMAND_JUMP_REJECTION = "command jump limit violation"
+
 
 def check_worker_arm_target(
     target_qpos_rad: np.ndarray,
@@ -22,7 +24,7 @@ def check_worker_arm_target(
     if np.any(
         np.abs(target - previous_target_qpos_rad) > float(max_command_jump_rad)
     ):
-        return "command jump limit violation"
+        return ARM_COMMAND_JUMP_REJECTION
     return None
 
 

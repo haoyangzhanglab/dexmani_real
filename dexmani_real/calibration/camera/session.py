@@ -195,6 +195,9 @@ def _build_planner_and_gate(
     workspace = _workspace_bounds(runtime)
     planner = XArm7MotionPlanner.create_default(
         teleop_profile=OnlineIKConfig(
+            max_ik_jump_deg=(
+                float(np.rad2deg(runtime.arm.max_servo_command_jump_rad)),
+            ) * 7,
             max_pose_error_pos_m=float(runtime.keyboard_teleop.ik_max_pose_error_pos_m),
             max_pose_error_rot_rad=float(
                 runtime.keyboard_teleop.ik_max_pose_error_rot_rad
@@ -683,7 +686,7 @@ def _run_calibration_control_loop(
 ) -> int:
     """Run control logic while borrowing already-started session resources."""
     heartbeat_timeout = float(runtime.safety.heartbeat_timeouts["arm"])
-    state = CalibrationLoopState.from_arm_state(planner, initial_state)
+    state = CalibrationLoopState.from_arm_state(initial_state)
     marker_corners = marker_corners_3d(aruco_cfg.marker_size_m)
     preview_detector = cv2.aruco.ArucoDetector(
         cv2.aruco.getPredefinedDictionary(ARUCO_DICT),

@@ -1199,14 +1199,12 @@ class PolicyExecutor:
 
         if run_snapshot.state is not SafetyState.RUNNING:
             if self.run_started_ns is not None:
-                # Operator S revokes motion before this process observes its flag.
-                if self.recorder is not None:
-                    self._finish_episode(
-                        "motion revoked outside formal stop request",
-                        stop_reason="hardware_fault",
-                        recorder_save=True,
-                        aborted=True,
-                    )
+                self._finish_episode(
+                    "motion revoked outside formal stop request",
+                    stop_reason="executor_boundary",
+                    recorder_save=True,
+                    aborted=True,
+                )
                 return
             self._clear_execution(None)
             if not self.execute:
@@ -1611,12 +1609,9 @@ class PolicyExecutor:
         assert self.run_started_ns is not None
         run_snapshot = read_run_state_snapshot(self.shared)
         if self.run_generation != run_snapshot.generation:
-            if (
-                run_snapshot.state is SafetyState.ARMED
-                and run_snapshot.stop_request == int(StopRequest.OPERATOR)
-            ):
-                # S revoked this run after the loop boundary check. The next
-                # iteration consumes its request and ends the episode normally.
+            if run_snapshot.state is SafetyState.ARMED:
+                # S or the arm worker revoked motion after the boundary check.
+                # The next iteration ends the episode through its existing owner.
                 return
             self._fault("RUNNING generation changed outside an episode boundary")
             return

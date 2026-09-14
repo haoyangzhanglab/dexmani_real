@@ -413,36 +413,79 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
         relabel: bool = False,
     ) -> None:
         nonlocal pause_since_ns, pause_reason
-        now_ns = time.monotonic_ns()
-        if start_new_run:
-            if pause_reason is not None:
-                logger.info(
-                    "teleop_loop: new run supersedes %s pause boundary",
-                    pause_reason,
-                )
-            pause_since_ns = now_ns
-            pause_reason = reason
-            run_generation = int(shared.run_generation.value)
-        elif pause_reason is None:
-            pause_since_ns = now_ns
-            pause_reason = reason
-            run_generation = invalidate_coupled_commands(shared)
-        else:
-            if relabel:
-                pause_reason = reason
-            controller.clear_reference()
-            logger.debug(
-                "teleop_loop: remaining in %s pause boundary (observed %s)",
-                pause_reason,
-                reason,
+        nonlocal teleop_active, recording_active
+        # Classify a worker rejection before an operator pause can relabel it
+        # or request a normal save. RuntimeChannels owns a reentrant motion lock.
+        with shared.motion_lock:
+            arm_rejected = bool(
+                teleop_active
+                and int(shared.safety_state.value) == int(SafetyState.ARMED)
+                and shared.is_running.value
+                and not shared.error_state.value
+                and not shared.estop_request.value
             )
-            return
-        controller.clear_reference()
-        logger.info(
-            "teleop_loop: entered %s pause boundary (run=%d)",
-            reason,
-            run_generation,
-        )
+            if arm_rejected:
+                reason = "arm_command_rejected"
+                relabel = True
+                teleop_active = False
+                stop_recording(
+                    recorder,
+                    recording_active,
+                    save=False,
+                    shared=shared,
+                    reason=reason,
+                )
+                recording_active = False
+                shared.is_recording.value = False
+                pending_controls[:] = [
+                    control
+                    for control in pending_controls
+                    if control is not OperatorCommand.BEGIN
+                ]
+                kb.drain_signal(OperatorCommand.BEGIN)
+                logger.warning("teleop_loop: arm command rejected; begin a new run with B")
+            now_ns = time.monotonic_ns()
+            if start_new_run:
+                if pause_reason is not None:
+                    logger.info(
+                        "teleop_loop: new run supersedes %s pause boundary",
+                        pause_reason,
+                    )
+                pause_since_ns = now_ns
+                pause_reason = reason
+                run_generation = int(shared.run_generation.value)
+            elif pause_reason is None:
+                pause_since_ns = now_ns
+                pause_reason = reason
+                run_generation = invalidate_coupled_commands(shared)
+            else:
+                if relabel:
+                    pause_reason = reason
+                controller.clear_reference()
+                logger.debug(
+                    "teleop_loop: remaining in %s pause boundary (observed %s)",
+                    pause_reason,
+                    reason,
+                )
+                return
+            controller.clear_reference()
+            logger.info(
+                "teleop_loop: entered %s pause boundary (run=%d)",
+                reason,
+                run_generation,
+            )
+
+    def reject_revoked_run() -> bool:
+        if not (
+            teleop_active
+            and int(shared.safety_state.value) == int(SafetyState.ARMED)
+            and shared.is_running.value
+            and not shared.error_state.value
+            and not shared.estop_request.value
+        ):
+            return False
+        enter_pause("arm_command_rejected", relabel=True)
+        return True
 
     def clear_pause_for_home() -> None:
         nonlocal pause_since_ns, pause_reason
@@ -484,6 +527,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             shared.set_heartbeat("policy", time.monotonic())
             limiter.wait()
 
+            reject_revoked_run()
             if recorder is not None:
                 stop_result = recorder.poll_stop()
                 reached_limit = (
@@ -632,6 +676,8 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             reanchor_grid = False
             break_loop = False
             for control in controls:
+                if reject_revoked_run() and control is OperatorCommand.BEGIN:
+                    continue
                 if control is OperatorCommand.EMERGENCY_STOP:
                     print("\nESC: emergency_stop")
                     audio.play("emergency")
@@ -695,6 +741,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 if control is OperatorCommand.HOME:
                     print("\nH: return_home")
                     audio.play("home")
+                    enter_pause("home", relabel=True)
                     stop_recording(recorder, recording_active, save=True, shared=shared)
                     recording_active = False
                     teleop_active = False
@@ -842,6 +889,8 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 continue
             if skip_control_tick or not grid_due:
                 continue
+            if reject_revoked_run():
+                continue
 
             tick_result = run_control_grid_tick(
                 controller,
@@ -860,6 +909,8 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             recording_active = tick_result.recording_active
             arm_feedback_error_count = tick_result.arm_feedback_error_count
             hand_disconnected_at_s = tick_result.hand_disconnected_at_s
+            if reject_revoked_run():
+                continue
             if tick_result.pause_reason is not None:
                 enter_pause(tick_result.pause_reason)
             if tick_result.pause_released:

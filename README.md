@@ -53,6 +53,19 @@ python examples/collect_teleop.py --print-config
 `episodes/<task>/episode_*`。需要只调试 arm 时使用该入口提供的显式 `--no-hand`；需要关闭
 recording 时使用 `--no-record`。两者的准确语义和其余参数以脚本 `--help` 为准。
 
+如果 arm worker 拒绝了不连续的关节目标，当前 run 会进入静默暂停，受影响的当前录制会被
+丢弃。此时 `C` 不能恢复该 run；需要重新按 `B` 开始新的 run，并从新反馈建立控制参考。
+
+### 键盘遥操作
+
+`keyboard_teleop.py` 使用 WASD/方向键/IJKL 进行 Cartesian jog。持续按键时，目标的前瞻距离
+相对实测位姿受限；正常释放按键后，控制端会去抖并有界等待最后一个目标被 arm SDK 接受，
+再结束当前 motion epoch。
+
+IK 或普通安全拒绝会结束当前 epoch，并从实测反馈重新建立参考。必须先释放所有 jog keys，
+再重新按键才能继续；`W+S` 等相反方向按键即使净位移为零，也不算释放，增加 `SPACE` 等
+其它按键同样不能解除阻塞。
+
 ### 物理回放
 
 `replay_episode.py` 会把已记录轨迹真正发送到机器人，属于 hardware-affecting workflow。
@@ -63,6 +76,9 @@ python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.
 ```
 
 运行前必须按真实机器人流程确认起始状态、碰撞环境和急停条件。
+
+回放期间若 arm command-jump 拒绝撤销了 motion，而 runtime 与反馈仍健康，回放以
+`REJECTED` 结束，不自动重试，也不因此升级为硬件 `FAULT`。回放仍按录制帧率和发送计划执行。
 
 ### 离线数据处理与导出
 
@@ -105,6 +121,9 @@ python examples/visualize_episode_processed.py <processed.h5> --info
 并为 session 写入 resolved `run_config.yaml`。任务成功与否在离线数据审核中判断；runtime 记录
 技术停止原因和 episode 数据。
 
+如果 arm worker 因 command-jump 拒绝撤销当前 motion，executor 会结束当前 episode；
+这种健康运行时中的拒绝本身不会设置全局硬件故障。
+
 Recorded rollout session 额外生成与 `episode_XXX/` 同级的
 `episode_XXX.policy_trace.npz`，用于 offline prediction-to-execution debugging：
 
@@ -119,6 +138,10 @@ python examples/visualize_policy_rollout.py <rollout-episode> --info
 XHand。当前 calibration collision checks 在两种声明下都使用 canonical fixed-home XHand
 envelope，因此 `absent` 是保守建模。未来若引入经过验证的 arm-only collision model，这一用户
 接口语义也必须同步更新。
+
+标定 jog 每次从最新实测末端位姿提出一个平移/旋转增量，不跨 tick 累积 Cartesian 目标。
+每条命令都等待 arm SDK acceptance，成功后才更新命令参考。IK、安全检查、发布或 acceptance
+拒绝后，当前 motion epoch 结束；与键盘遥操作一样，必须释放所有 jog keys 后重新按键。
 
 ## 核心架构
 
@@ -156,12 +179,19 @@ raw episode → offline processing → processed HDF5 → Policy Zarr
 - live device/SDK state 留在对应 robot/sensor owner 中；
 - teleop、replay 和 deployment 产生动作意图，安全与 command publication 由
   [`dexmani_real/control/`](dexmani_real/control) 的边界负责；
+- arm worker 拥有 SDK 边界处的最终命令连续性判断：同一 motion generation 参考上次 SDK
+  接受的目标，新 generation 参考实测关节位置。超限目标不会进入 SDK；拒绝只原子撤销仍然
+  当前有效的命令，不影响已取代它的新命令；
 - recording 负责持久化数据，不拥有机器人动作决策；
 - learned-policy 集成通过相邻 `dexmani_policy` 的 public deployment contract 完成，而不是依赖
   其私有 artifact 实现。
 
 更细的 concurrency、freshness、schema、error-code 和 scheduling 语义属于当前 source，修改代码时
 应直接追踪实际 producer/consumer，而不是依赖 README 中的历史描述。
+
+Command-jump 拒绝建立软件 ARMED 边界，允许操作者开始新 run；非有限目标、到达 worker 的
+关节限位违规、SDK/controller 错误和无效硬件反馈仍按故障处理。软件撤销不会回滚已经被 SDK
+接受的运动，SDK acceptance 也不表示机械臂已经到达目标。
 
 ## 数据与输出
 
@@ -185,6 +215,9 @@ learned-policy rollout 使用独立的：
 ```text
 rollouts/<policy>/<task>/<experiment>/session_*/
 ```
+
+raw episode 的 `action_arm_joint_sent` 保存控制端提交的 arm target，不保证每条目标都已被
+SDK 接受。命令拒绝恢复机制不改变这个字段的含义。
 
 当前数据合同的 source of truth：
 

@@ -178,6 +178,28 @@ def cancel_coupled_command_if_current(
         return True
 
 
+def reject_coupled_command_if_current(
+    shared: Any,
+    *,
+    ticket: CoupledCommandTicket,
+) -> bool:
+    """Pause only the still-executable rejected ticket, never a newer command.
+
+    Ownership verification and revocation share one critical section. Unlike
+    ACK cancellation, rejection establishes an ARMED lifecycle boundary too.
+    """
+    with shared.motion_lock:
+        if not (
+            _ticket_is_current_locked(shared, ticket)
+            and shared.is_running.value
+            and not shared.error_state.value
+            and not shared.estop_request.value
+            and time.monotonic_ns() < int(ticket.valid_until_monotonic_ns)
+        ):
+            return False
+        return _revoke_motion_locked(shared, SafetyState.ARMED) is not None
+
+
 def read_motion_permit(shared: Any) -> MotionPermit:
     """Read state and generation as one indivisible worker/send permit."""
     with shared.motion_lock:

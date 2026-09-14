@@ -13,6 +13,9 @@ Error handling is fail-fast: any hardware/SDK failure raises to the single
 top-level handler, which latches ``error_state``; cleanup always does a
 best-effort stop + disconnect.  No retry counters, no last-known fallbacks,
 no error-classification framework.
+
+Command-jump rejection pauses the current motion epoch without faulting the
+worker. Other invalid targets and hardware failures retain the fail-fast path.
 """
 
 from __future__ import annotations
@@ -28,13 +31,17 @@ import numpy as np
 from dexmani_real.config.defaults import ArmParams
 from dexmani_real.ipc.channels import new_frame
 from dexmani_real.ipc.schema import ARM_STATE_DTYPE
-from dexmani_real.robot.command_validation import check_worker_arm_target
+from dexmani_real.robot.command_validation import (
+    ARM_COMMAND_JUMP_REJECTION,
+    check_worker_arm_target,
+)
 from dexmani_real.robot.drivers.xarm7 import HomeAborted, XArm7, describe_controller_error
 from dexmani_real.runtime.safety import (
     CoupledCommandTicket,
     SafetyState,
     coupled_command_ticket_allows_execution,
     read_motion_permit,
+    reject_coupled_command_if_current,
 )
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
@@ -294,6 +301,20 @@ def _handle_servo_command(
         joint_limit_upper_rad=np.asarray(st.cfg.joint_limit_upper, dtype=np.float64),
         max_command_jump_rad=st.cfg.max_servo_command_jump_rad,
     )
+    if issue == ARM_COMMAND_JUMP_REJECTION:
+        if reject_coupled_command_if_current(shared, ticket=ticket):
+            delta = np.abs(target - jump_reference)
+            joint = int(np.argmax(delta))
+            logger.warning(
+                "arm_loop: rejected action_id=%d generation=%d joint=%d "
+                "raw jump=%.3fdeg limit=%.3fdeg; motion paused",
+                int(action["action_id"][0]),
+                command_generation,
+                joint + 1,
+                float(np.rad2deg(delta[joint])),
+                float(np.rad2deg(st.cfg.max_servo_command_jump_rad)),
+            )
+        return
     # This is the sole command-authority fence and the final operation before
     # an otherwise valid target crosses the xArm SDK boundary.
     if not coupled_command_ticket_allows_execution(shared, ticket=ticket):

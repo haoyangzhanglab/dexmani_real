@@ -400,23 +400,28 @@ def _record_grid_hold(
         target_eef_pos, target_eef_rot6d = make_arm_fk().compute(
             np.asarray(controller.prev_qpos_cmd, dtype=np.float64)
         )
-    record_held(
-        resources.recorder,
-        observation.arm_state,
-        controller.prev_qpos_cmd,
-        controller.prev_hand_qpos,
-        observation.vr_frame,
-        observation.camera_frame,
-        hand_state=observation.hand_state,
-        arm_qpos_sent=controller.prev_qpos_cmd.copy(),
-        action_queued=action_queued,
-        target_eef_pos=target_eef_pos,
-        target_eef_rot6d=target_eef_rot6d,
-        observation_anchor_monotonic_ns=observation.anchor_monotonic_ns,
-        shared=shared,
-        max_observation_skew_s=resources.max_observation_skew_s,
-        **kwargs,
-    )
+    # Serialize the recording decision with worker rejection. RecorderClient
+    # may automatically request a save when this sample reaches max_frames.
+    with shared.motion_lock:
+        if int(shared.safety_state.value) != int(SafetyState.RUNNING):
+            return
+        record_held(
+            resources.recorder,
+            observation.arm_state,
+            controller.prev_qpos_cmd,
+            controller.prev_hand_qpos,
+            observation.vr_frame,
+            observation.camera_frame,
+            hand_state=observation.hand_state,
+            arm_qpos_sent=controller.prev_qpos_cmd.copy(),
+            action_queued=action_queued,
+            target_eef_pos=target_eef_pos,
+            target_eef_rot6d=target_eef_rot6d,
+            observation_anchor_monotonic_ns=observation.anchor_monotonic_ns,
+            shared=shared,
+            max_observation_skew_s=resources.max_observation_skew_s,
+            **kwargs,
+        )
 
 
 def _read_control_grid_observation(
@@ -678,6 +683,19 @@ def _read_control_grid_observation(
     )
 
 
+def _publication_motion_revoked(
+    shared: RuntimeChannels, prepared: PreparedCommand
+) -> bool:
+    """Let the loop own a healthy worker-created pause, including hold races."""
+    return bool(
+        not prepared.fatal
+        and shared.is_running.value
+        and not shared.error_state.value
+        and not shared.estop_request.value
+        and int(shared.safety_state.value) == int(SafetyState.ARMED)
+    )
+
+
 def _publish_arm_safety_hold(
     controller: TeleopController,
     shared: RuntimeChannels,
@@ -703,6 +721,8 @@ def _publish_arm_safety_hold(
     )
     published_hold = prepared_hold.candidate
     if hold_result is None or not hold_result.published or published_hold is None:
+        if _publication_motion_revoked(shared, prepared_hold):
+            return True
         reason = prepared_hold.reason or (hold_result.reason if hold_result else "")
         logger.error(
             "teleop_loop: %s hold publish failed: %s",
@@ -761,6 +781,8 @@ def _publish_ik_failure_hold(
         or not publish_result.published
         or published_candidate is None
     ):
+        if _publication_motion_revoked(shared, prepared_command):
+            return True
         reason = prepared_command.reason or (
             publish_result.reason if publish_result else ""
         )
@@ -889,6 +911,8 @@ def _publish_solved_action(
         or not publish_result.published
         or published_candidate is None
     ):
+        if _publication_motion_revoked(shared, prepared_command):
+            return True
         # Recoverable holds keep arm and hand in place without latching a fault.
         reason = prepared_command.reason or (
             publish_result.reason if publish_result else ""
@@ -932,21 +956,25 @@ def _publish_solved_action(
             _f_status = FRAME_RETARGET_FAIL
         else:
             _f_status = FRAME_OK
-        record_frame(
-            recorder,
-            arm_state,
-            hand_state,
-            arm_cmd,
-            hand_cmd,
-            target_pos,
-            target_quat,
-            vr_frame,
-            cam,
-            frame_status=_f_status,
-            observation_anchor_monotonic_ns=_current_grid_anchor_ns,
-            shared=shared,
-            max_observation_skew_s=resources.max_observation_skew_s,
-        )
+        # An already-rejected run must not reach RecorderClient's auto-save.
+        with shared.motion_lock:
+            if int(shared.safety_state.value) != int(SafetyState.RUNNING):
+                return True
+            record_frame(
+                recorder,
+                arm_state,
+                hand_state,
+                arm_cmd,
+                hand_cmd,
+                target_pos,
+                target_quat,
+                vr_frame,
+                cam,
+                frame_status=_f_status,
+                observation_anchor_monotonic_ns=_current_grid_anchor_ns,
+                shared=shared,
+                max_observation_skew_s=resources.max_observation_skew_s,
+            )
     return True
 
 
@@ -1003,6 +1031,8 @@ def run_control_grid_tick(
         )
         published_hold = prepared_hold.candidate
         if hold_result is None or not hold_result.published or published_hold is None:
+            if _publication_motion_revoked(shared, prepared_hold):
+                return tick_result
             reason = prepared_hold.reason or (hold_result.reason if hold_result else "")
             logger.error(
                 "teleop_loop: mapper hold publish failed: %s",
