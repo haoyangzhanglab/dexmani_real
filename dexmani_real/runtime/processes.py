@@ -155,7 +155,12 @@ def stop_processes_verified(
         exits.append(ProcessExit(process.name, process.exitcode, escalation))
 
     frozen_exits = tuple(exits)
-    logger.info("verified process stop: %s", frozen_exits)
+    log_stop = (
+        logger.warning
+        if any(item.exitcode != 0 or item.escalation != "graceful" for item in frozen_exits)
+        else logger.debug
+    )
+    log_stop("verified process stop: %s", frozen_exits)
     return frozen_exits
 
 
@@ -184,5 +189,5 @@ def shutdown_processes_verified(
     )
     shared_closed = _close_runtime_channels(shared)
     report = ShutdownReport(frozen_exits, shared_closed=shared_closed)
-    logger.info("verified process shutdown: %s", report.exits)
+    logger.debug("verified process shutdown: %s", report.exits)
     return report

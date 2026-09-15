@@ -263,7 +263,7 @@ class RuntimeChannels:
                 ) from allocation_error
             raise
 
-        logger.info("RuntimeChannels created (prefix=%s)", prefix)
+        logger.debug("RuntimeChannels created (prefix=%s)", prefix)
         return storage
 
     @staticmethod
@@ -415,7 +415,7 @@ class RuntimeChannels:
 
         self._closed = not errors
         if self._closed:
-            logger.info("RuntimeChannels closed cleanly")
+            logger.debug("RuntimeChannels closed cleanly")
         else:
             logger.error("RuntimeChannels close incomplete: %s", ", ".join(errors))
         return self._closed

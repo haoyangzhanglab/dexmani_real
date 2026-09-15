@@ -118,7 +118,6 @@ def do_configured_teleop_home(
         # Keep the departure cue intact; AudioFeedback.queue() serializes this
         # completion cue after it instead of cancelling it mid-sentence.
         audio.queue("home_done")
-        print("  arm: home reached", flush=True)
     else:
         logger.warning("arm home failed or was cancelled")
 

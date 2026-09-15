@@ -445,7 +445,7 @@ def run_teleop_experiment(
             return 1
 
         for spec, _process in dependency_pairs:
-            print(f"  {spec.ready_name}: ready", flush=True)
+            logger.debug("%s: ready", spec.ready_name)
 
         policy_procs = [process for _spec, process in policy_pairs]
         start_processes(policy_procs)
@@ -465,7 +465,7 @@ def run_teleop_experiment(
             )
             shared_closed = shutdown_report.shared_closed
             return 1
-        print("  policy: ready", flush=True)
+        logger.debug("policy: ready")
 
         if vr_pairs:
             vr_procs = [process for _spec, process in vr_pairs]

@@ -305,7 +305,7 @@ class RealSenseCamera:
             "confidence_override": cfg.confidence_threshold,
             "final_readbacks": final_readbacks,
         }
-        logger.info("L515 depth option snapshot: %s", self.l515_depth_option_snapshot)
+        logger.debug("L515 depth option snapshot: %s", self.l515_depth_option_snapshot)
 
     @staticmethod
     def _read_l515_option_snapshot(sensor: Any) -> dict[str, float | None]:
@@ -381,7 +381,7 @@ class RealSenseCamera:
                 readback,
             )
         else:
-            logger.info("color auto_exposure_priority set to %s (0=OFF)", readback)
+            logger.debug("color auto_exposure_priority set to %s (0=OFF)", readback)
 
     def _setup_pipeline_post_start(self) -> None:
         """Configure active-device options and immutable native geometry."""
@@ -448,7 +448,7 @@ class RealSenseCamera:
         self.profile = self.pipeline.start(rs_config, self.frame_queue)
 
     def _warmup_pipeline(self) -> None:
-        """Consume exactly ``warmup_frames`` frames, restarting if necessary."""
+        """Warm up frame processing for ``warmup_frames``, restarting if necessary."""
         if self.pipeline is None or self.frame_queue is None:
             raise RuntimeError("Pipeline is unavailable during warmup.")
 
@@ -460,7 +460,8 @@ class RealSenseCamera:
         for attempt in range(max_restarts + 1):
             try:
                 for _ in range(warmup_frames):
-                    self.frame_queue.wait_for_frame(5000)
+                    # Initialize alignment and image copies before live publication.
+                    self.read(timeout_ms=5000, compute_depth=False)
                 return
             except RuntimeError:
                 if attempt >= max_restarts:
@@ -468,7 +469,7 @@ class RealSenseCamera:
 
                 delay = 3.0 * (attempt + 1)
                 logger.warning(
-                    "L515 warmup timed out; restarting pipeline after %.0f s "
+                    "L515 warmup failed; restarting pipeline after %.0f s "
                     "(attempt %d/%d).",
                     delay,
                     attempt + 1,

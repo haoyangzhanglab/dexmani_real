@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 from collections import Counter
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping
@@ -81,6 +82,17 @@ from dexmani_real.sensor.pointcloud import (
 from dexmani_real.utils.atomic_io import atomic_publish
 
 _TASK_NAME_CANDIDATE_UNSET = object()
+ProcessingProgressCallback = Callable[[str, int, int], None]
+
+
+def _report_progress(
+    callback: ProcessingProgressCallback | None,
+    phase: str,
+    completed: int,
+    total: int,
+) -> None:
+    if callback is not None:
+        callback(phase, completed, total)
 
 
 @contextmanager
@@ -454,6 +466,7 @@ def _write_processed_episode(
     config: ProcessingConfig,
     *,
     task_name: str,
+    frame_completed_callback: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     path = output_root / f"{reader.h5_path.name}.h5"
     if not decision.accepted:
@@ -565,6 +578,8 @@ def _write_processed_episode(
                     f"derived point cloud empty at source row {source_index}"
                 )
             output["point_cloud"][source_index] = cloud
+            if frame_completed_callback is not None:
+                frame_completed_callback()
         output.flush()
     return {
         "path": path.name,
@@ -604,6 +619,7 @@ def process_episode_root(
     skip_rejected_unannotated: bool = False,
     task_name: str | None = None,
     expected_task_name: str | None = None,
+    progress_callback: ProcessingProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Publish accepted episodes, preserving explicit annotation intent.
 
@@ -611,6 +627,9 @@ def process_episode_root(
     canonical CLI opts into skipping them with ``skip_rejected_unannotated``.
     ``expected_task_name`` is an optional caller-owned output-root invariant;
     direct library callers may leave it unset for arbitrary temporary paths.
+    ``progress_callback`` receives cumulative ``(phase, completed, total)``:
+    analyze counts input episodes, write counts accepted source frames, and
+    verify counts output files. Dry runs report only analyze progress.
     """
 
     if not isinstance(skip_rejected_unannotated, bool):
@@ -633,6 +652,7 @@ def process_episode_root(
     decisions: list[EpisodeDecision] = []
     resolved_episode_task_names: dict[Path, str] = {}
     task_identity_errors: list[str] = []
+    _report_progress(progress_callback, "analyze", 0, len(episodes))
     for episode in episodes:
         annotation = annotations.get(episode.name)
         if annotation is not None and not annotation.include:
@@ -641,6 +661,7 @@ def process_episode_root(
             decisions.append(
                 _rejected_decision(episode, config, "excluded by annotation")
             )
+            _report_progress(progress_callback, "analyze", len(decisions), len(episodes))
             continue
         analysis_annotation = annotation or EpisodeAnnotation()
         task_name_candidate: Any = _TASK_NAME_CANDIDATE_UNSET
@@ -665,6 +686,7 @@ def process_episode_root(
                     )
                 )
         decisions.append(decision)
+        _report_progress(progress_callback, "analyze", len(decisions), len(episodes))
         if task_name_candidate is _TASK_NAME_CANDIDATE_UNSET:
             continue
         if not raw_task_name_requires_validation:
@@ -757,6 +779,15 @@ def process_episode_root(
     )
     try:
         outputs: list[dict[str, Any]] = []
+        total_frames = sum(d.source_frames for d in decisions if d.accepted)
+        completed_frames = 0
+
+        def frame_completed() -> None:
+            nonlocal completed_frames
+            completed_frames += 1
+            _report_progress(progress_callback, "write", completed_frames, total_frames)
+
+        _report_progress(progress_callback, "write", 0, total_frames)
         for decision in decisions:
             if not decision.accepted:
                 continue
@@ -768,11 +799,16 @@ def process_episode_root(
                         staging,
                         config,
                         task_name=resolved_episode_task_names[decision.source_path],
+                        frame_completed_callback=(
+                            frame_completed if progress_callback is not None else None
+                        ),
                     )
                 )
-        validation = [
-            validate_processed_hdf5(staging / item["path"], config) for item in outputs
-        ]
+        validation = []
+        _report_progress(progress_callback, "verify", 0, len(outputs))
+        for index, item in enumerate(outputs, start=1):
+            validation.append(validate_processed_hdf5(staging / item["path"], config))
+            _report_progress(progress_callback, "verify", index, len(outputs))
         report["outputs"] = outputs
         report["validation"] = validation
         assert resolved_batch_task_name is not None

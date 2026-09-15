@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
+from dexmani_real.control.hand_homing import initialize_hand_home
 from dexmani_real.control.publication import (
     prepare_joint_command,
     publish_command,
@@ -325,7 +326,7 @@ class EpisodeReplayer:
         return arm_state, hand_state
 
     def _warm_up_hand_at_start(self, keyboard: KeyboardInput) -> bool:
-        """Warm up XHand's first target after reset while holding xArm still."""
+        """Restore hand home, then warm up frame 0 while holding xArm still."""
         feedback = self._read_start_feedback()
         if feedback is None:
             return False
@@ -341,10 +342,26 @@ class EpisodeReplayer:
             self._reject("xArm is not at the recorded trajectory start")
             return False
 
+        if not self._poll_control(keyboard, 0.0):
+            return False
+        if not initialize_hand_home(
+            self.shared,
+            self.runtime,
+            abort_requested=lambda: not self._poll_control(keyboard, 0.0),
+        ):
+            if self._running:
+                self._fault("startup hand-home command was not accepted")
+            return False
+        self._motion_started = True
+        feedback = self._read_start_feedback()
+        if feedback is None:
+            return False
+        arm_state, hand_state = feedback
+
         assert self._start_warmup_gate is not None
         assert self.traj.action_hand_joint is not None
         print(
-            "Warming up XHand from connection reset toward the frame 0 hand target "
+            "Warming up XHand from home toward the frame 0 hand target "
             f"({self._format_arm_start_deviation(arm_max_deg, arm_joint_index)}; "
             "Q=quit  ESC=emergency_stop)"
         )

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from dexmani_real.config.experiment import ExperimentConfig
 
 import numpy as np
 
@@ -20,7 +23,34 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-__all__ = ["publish_hand_home_and_wait_accepted"]
+__all__ = ["publish_hand_home_and_wait_accepted", "initialize_hand_home"]
+
+
+def initialize_hand_home(
+    shared: Any,
+    runtime: ExperimentConfig,
+    *,
+    heartbeat: bool = False,
+    abort_requested: Any = None,
+) -> bool:
+    """Restore the configured hand pose before task commands or recording begin."""
+    if not runtime.policy.hand_enabled:
+        return True
+    if abort_requested is not None and abort_requested():
+        return False
+    hand = runtime.hand
+    return publish_hand_home_and_wait_accepted(
+        shared,
+        np.deg2rad(np.asarray(hand.home_qpos_deg, dtype=np.float64)),
+        command_lower_rad=np.asarray(hand.qpos_min_rad, dtype=np.float64),
+        command_upper_rad=np.asarray(hand.qpos_max_rad, dtype=np.float64),
+        mechanical_lower_rad=np.asarray(hand.mechanical_qpos_min_rad, dtype=np.float64),
+        mechanical_upper_rad=np.asarray(hand.mechanical_qpos_max_rad, dtype=np.float64),
+        hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
+        timeout_s=hand.home_command_ack_timeout_s,
+        heartbeat=heartbeat,
+        abort_requested=abort_requested,
+    )
 
 
 def publish_hand_home_and_wait_accepted(

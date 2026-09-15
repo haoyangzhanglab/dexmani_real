@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
+from dexmani_real.control.hand_homing import initialize_hand_home
 from dexmani_real.control.safety_gate import SafetyGate, planner_action_safety_gate
 from dexmani_real.ipc.causal import (
     read_arm_state_causal,
@@ -383,6 +384,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
     next_grid_ns = time.monotonic_ns() + grid_period_ns
     current_grid_anchor_ns = next_grid_ns
     pending_controls: list[OperatorCommand] = []
+    startup_hand_home_pending = bool(cfg.runtime.policy.hand_enabled)
     validate_warn = ThrottledWarner(interval_s=_VALIDATION_WARN_INTERVAL_S)
     arm_feedback_warn = ThrottledWarner(interval_s=_ARM_FEEDBACK_WARN_INTERVAL_S)
     grid_overrun_warn = ThrottledWarner(interval_s=_VALIDATION_WARN_INTERVAL_S)
@@ -447,7 +449,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             now_ns = time.monotonic_ns()
             if start_new_run:
                 if pause_reason is not None:
-                    logger.info(
+                    logger.debug(
                         "teleop_loop: new run supersedes %s pause boundary",
                         pause_reason,
                     )
@@ -469,7 +471,12 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 )
                 return
             controller.clear_reference()
-            logger.info(
+            log_pause = (
+                logger.debug
+                if reason in {"begin", "pause", "home", "stop", "discard", "quit"}
+                else logger.info
+            )
+            log_pause(
                 "teleop_loop: entered %s pause boundary (run=%d)",
                 reason,
                 run_generation,
@@ -490,7 +497,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
     def clear_pause_for_home() -> None:
         nonlocal pause_since_ns, pause_reason
         if pause_reason is not None:
-            logger.info(
+            logger.debug(
                 "teleop_loop: homing supersedes %s pause boundary", pause_reason
             )
         pause_since_ns = 0
@@ -553,8 +560,10 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         path_label = f": {stop_result.path}" if stop_result.path else ""
                         print(f"  ⚠ 录制终结失败 ({stop_result.error}){path_label}")
                     elif stop_result.saved:
-                        print(
-                            f"  录制已保存: {stop_result.path}  ({stop_result.frame_count} 帧)"
+                        logger.debug(
+                            "Recording save acknowledged: %s frames=%d",
+                            stop_result.path,
+                            stop_result.frame_count,
                         )
                         if not stop_result.min_frames_met:
                             print("  ⚠ 已保存，但未达到配置的最短质量时长")
@@ -591,6 +600,31 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 # This branch is command/recording-start silent; the loop only
                 # continues its heartbeat until parent shutdown clears is_running.
                 continue
+
+            if startup_hand_home_pending and int(shared.safety_state.value) == int(
+                SafetyState.ARMED
+            ):
+                if not initialize_hand_home(
+                    shared,
+                    cfg.runtime,
+                    heartbeat=True,
+                    abort_requested=lambda: (
+                        sigterm_requested or kb.estop_latched or not kb.healthy
+                    ),
+                ):
+                    shared.error_state.value = True
+                    _transition_or_fault(shared, SafetyState.FAULT, "startup hand home")
+                    break
+                controller.prev_hand_qpos = command_limits.hand_home_qpos_rad.copy()
+                hand_state = read_hand_state_causal(shared)
+                if hand_state is None:
+                    shared.error_state.value = True
+                    _transition_or_fault(shared, SafetyState.FAULT, "startup hand feedback")
+                    break
+                planner.set_hand_qpos(np.asarray(hand_state["qpos"][0], dtype=np.float64))
+                startup_hand_home_pending = False
+                next_grid_ns = time.monotonic_ns() + grid_period_ns
+                limiter.reset()
 
             if quit_pending:
                 home_handled = False
@@ -676,6 +710,8 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             reanchor_grid = False
             break_loop = False
             for control in controls:
+                if startup_hand_home_pending and control is OperatorCommand.BEGIN:
+                    continue
                 if reject_revoked_run() and control is OperatorCommand.BEGIN:
                     continue
                 if control is OperatorCommand.EMERGENCY_STOP:
@@ -830,11 +866,8 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         continue
                     wrist_pos = vr_frame["wrist_pos"]
                     wrist_quat_wxyz = vr_frame["wrist_quat_wxyz"]
-                    print(
-                        "\nB: wrist_pose "
-                        f"pos=[{' '.join(f'{value:.6f}' for value in wrist_pos)}] + "
-                        f"wxyz=[{' '.join(f'{value:.6f}' for value in wrist_quat_wxyz)}]",
-                        flush=True,
+                    logger.debug(
+                        "B: wrist_pose pos=%s wxyz=%s", wrist_pos, wrist_quat_wxyz
                     )
                     gc.collect()
                     if recorder is not None:
@@ -937,4 +970,4 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             logger.error("teleop_loop: %s", exit_fault)
         else:
             logger.debug("teleop_loop: STOPPED")
-        logger.info("Teleop: loop exited")
+        logger.debug("Teleop: loop exited")

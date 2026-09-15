@@ -254,7 +254,7 @@ class AudioFeedback:
                         )
                         return
                     self._current_proc = proc
-                logger.info(
+                logger.debug(
                     "Audio started: event=%s player=%s pid=%s",
                     request.event,
                     player,
@@ -282,10 +282,10 @@ class AudioFeedback:
             with self._condition:
                 cancelled = request.generation != self._generation or self._closed
             if cancelled:
-                logger.info("Audio cancelled: event=%s", request.event)
+                logger.debug("Audio cancelled: event=%s", request.event)
                 return
             if returncode == 0:
-                logger.info("Audio completed: event=%s", request.event)
+                logger.debug("Audio completed: event=%s", request.event)
                 return
 
             stderr_text = _stderr_text(stderr)

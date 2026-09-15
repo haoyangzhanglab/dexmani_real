@@ -633,7 +633,7 @@ class PolicyParams:
     min_record_duration_s: float = 1.0
     episodes_dir: str = "episodes"
 
-    status_print_interval: int = 16  # status print interval (ticks)
+    status_print_interval: int = 80  # observation/action grid ticks (5 s at 16 Hz)
     max_consecutive_errors: int = 10
 
     ik_max_pose_error_pos_m: float = 0.02

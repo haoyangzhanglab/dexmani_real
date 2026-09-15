@@ -39,15 +39,10 @@ import h5py
 import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
-from tqdm import tqdm
 
 from dexmani_real.dataset.processed import (
     PROCESSED_SCHEMA_NAME,
     PROCESSED_SCHEMA_VERSION,
-)
-from dexmani_real.dataset.processing_report import (
-    PROCESSING_REPORT_FILENAME,
-    load_processing_report,
 )
 from dexmani_real.ipc.schema import POINT_CLOUD_FEATURE_DIM, validate_point_cloud_array
 from dexmani_real.robot.model import HAND_FINGER_NAMES
@@ -559,50 +554,6 @@ class ProcessedEpisodeVisualizer:
             pass
 
 
-def _batch_summary(h5_path: Path) -> str:
-    """Read optional batch provenance without suppressing HDF5 read failures."""
-    with h5py.File(h5_path, "r") as source:
-        identity = {
-            key: source.attrs.get(key)
-            for key in ("task_name", "schema_name", "schema_version", "source_episode")
-        }
-    report_path = h5_path.parent / PROCESSING_REPORT_FILENAME
-    try:
-        report = load_processing_report(report_path)
-        for report_key, h5_key in (
-            ("task_name", "task_name"),
-            ("processed_schema_name", "schema_name"),
-            ("processed_schema_version", "schema_version"),
-        ):
-            if report[report_key] != identity[h5_key]:
-                raise ValueError(f"report {report_key} does not match current HDF5")
-        if not any(
-            entry["source_episode"] == identity["source_episode"]
-            and entry["status"] == "accepted"
-            for entry in report["episodes"]
-        ):
-            raise ValueError("current HDF5 source_episode is not accepted in report")
-    except FileNotFoundError:
-        return f"Batch summary unavailable: {PROCESSING_REPORT_FILENAME} not found (legacy batch)."
-    except (OSError, UnicodeError, TypeError, ValueError) as exc:
-        return f"Batch summary unavailable: {' '.join(str(exc).splitlines())}"
-
-    accepted = report["accepted_episode_count"]
-    skipped = report["skipped_episode_count"]
-    excluded = report["excluded_episode_count"]
-    if not skipped and not excluded:
-        return f"Batch: {accepted} accepted, no skipped episodes."
-    lines = [f"Batch: {accepted} accepted, {skipped} skipped, {excluded} user-excluded"]
-    for status, label in (("skipped", "Skipped"), ("excluded", "Excluded")):
-        if report[f"{status}_episode_count"]:
-            lines.append(f"{label}:")
-            lines.extend(
-                f"  {entry['source_episode']} — {entry['reason']}"
-                for entry in report["episodes"] if entry["status"] == status
-            )
-    return "\n".join(lines)
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -643,7 +594,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.info:
         print_episode_info(str(h5_path))
-        print(_batch_summary(h5_path))
         return 0
 
     viz = ProcessedEpisodeVisualizer(
@@ -653,19 +603,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.num_steps)
-        with tqdm(
-            range(viz.num_steps),
-            total=viz.num_steps,
-            desc=f"log {h5_path.stem}",
-            unit="frame",
-            file=sys.stderr,
-        ) as progress:
-            for step in progress:
-                viz.log_step(step)
+        for step in range(viz.num_steps):
+            viz.log_step(step)
     finally:
         viz.close()
     print(f"Rerun logging complete: {viz.num_steps} frames.")
-    print(_batch_summary(h5_path))
     return 0
 
 

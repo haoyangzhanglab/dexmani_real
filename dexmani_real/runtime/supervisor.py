@@ -173,9 +173,11 @@ def run_supervisor(
                 heartbeat_text = ", ".join(
                     f"{name}={heartbeat_ages[name]:.1f}s" for name in timeouts
                 )
-                print(
-                    f"  [supervisor]  runtime={runtime_m:.1f}min  safety={safety_state}  hb_age=({heartbeat_text})",
-                    flush=True,
+                logger.debug(
+                    "runtime=%.1fmin safety=%s hb_age=(%s)",
+                    runtime_m,
+                    safety_state,
+                    heartbeat_text,
                 )
                 last_status_s = now
 

@@ -468,7 +468,7 @@ class XHand:
                 float(np.max(np.linalg.norm(state.tactile_aggregate, axis=1))),
             )
             dense_magnitudes = np.abs(state.tactile_dense)
-            logger.info(
+            logger.debug(
                 "tactile verify: dense abs_max=%.3g p99=%.3g",
                 float(np.max(dense_magnitudes)),
                 float(np.percentile(dense_magnitudes, 99)),

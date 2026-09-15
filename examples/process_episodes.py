@@ -23,6 +23,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import yaml
+from tqdm import tqdm
 
 from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.dataset.contracts import (
@@ -195,6 +196,43 @@ def _print_report_summary(report: dict) -> None:
             )
 
 
+class _ProcessingProgress:
+    """Render cumulative data-layer events as one active bar per phase."""
+
+    _PHASE_LABELS = {
+        "analyze": ("Analyze episodes", "episode"),
+        "write": ("Process RGB-D", "frame"),
+        "verify": ("Verify outputs", "episode"),
+    }
+
+    def __init__(self) -> None:
+        self._phase: str | None = None
+        self._bar: tqdm | None = None
+
+    def update(self, phase: str, completed: int, total: int) -> None:
+        if phase != self._phase:
+            self.close()
+            label, unit = self._PHASE_LABELS[phase]
+            self._bar = tqdm(
+                total=total,
+                desc=label,
+                unit=unit,
+                file=sys.stderr,
+                disable=None,
+                dynamic_ncols=True,
+                mininterval=0.2,
+            )
+            self._phase = phase
+        assert self._bar is not None
+        self._bar.update(completed - self._bar.n)
+
+    def close(self) -> None:
+        if self._bar is not None:
+            self._bar.close()
+            self._bar = None
+        self._phase = None
+
+
 def _filtered_annotations_path(
     annotations: dict[str, EpisodeAnnotation],
     *,
@@ -284,17 +322,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (TypeError, ValueError) as exc:
             print(f"error: invalid processing config: {exc}", file=sys.stderr)
             return 2
+        progress = _ProcessingProgress()
         try:
-            report = process_episode_root(
-                input_root,
-                output_root,
-                config,
-                annotations_path=annotations_path,
-                dry_run=args.dry_run,
-                skip_rejected_unannotated=True,
-                task_name=task_name,
-                expected_task_name=expected_task_name,
-            )
+            with contextlib.closing(progress):
+                report = process_episode_root(
+                    input_root,
+                    output_root,
+                    config,
+                    annotations_path=annotations_path,
+                    dry_run=args.dry_run,
+                    skip_rejected_unannotated=True,
+                    task_name=task_name,
+                    expected_task_name=expected_task_name,
+                    progress_callback=progress.update,
+                )
         except Exception as exc:
             print(f"error: batch processing failed: {exc}", file=sys.stderr)
             return 1
