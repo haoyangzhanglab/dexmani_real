@@ -425,15 +425,18 @@ def _project_policy_targets(
     return arm, hand
 
 
-def _read_command_progress(
-    shared: RuntimeChannels,
+def _command_progress_from_feedback(
     runtime: ExperimentConfig,
     *,
+    arm_state: dict[str, Any] | None,
+    hand_state: dict[str, Any] | None,
     now_ns: int,
 ) -> tuple[int | None, int | None, int | None, str | None]:
-    """Read healthy worker watermarks; stale feedback means no new progress."""
-    arm_state = read_arm_state_dict(shared)
-    hand_state = read_hand_state_dict(shared)
+    """Validate copied feedback against a clock sampled after both reads.
+
+    Healthy snapshots supply worker watermarks; stale feedback means no new
+    progress. This function does not read live worker state.
+    """
     arm_action_id: int | None = None
     hand_action_id: int | None = None
     hand_setpoint_accepted_ns: int | None = None
@@ -611,6 +614,7 @@ class PolicyExecutor:
             recording_config.num_episodes if recording_config is not None else 1
         )
         self.completed_episodes = 0
+        self._recorder_start_wait_ms = 0.0
         self._pending_stop_reason: str | None = None
         self.last_metrics_flush_ns = time.monotonic_ns()
 
@@ -882,6 +886,10 @@ class PolicyExecutor:
                 "executor: rollout episode saved: %s", result.path or "<unknown>"
             )
             if self.completed_episodes >= self.num_episodes:
+                logger.info(
+                    "executor: all %d requested episodes saved; requesting shutdown",
+                    self.num_episodes,
+                )
                 self.shared.quit_requested.value = True
         else:
             logger.info(
@@ -987,7 +995,32 @@ class PolicyExecutor:
                 and camera["camera_age_s"] <= self.runtime.camera.max_frame_age_s
             )
             if not camera["camera_fresh"]:
-                raise RuntimeError("recording camera unhealthy or stale")
+                # Keep the causal recording anchor: a later clock would change
+                # the age of this historical sample. Report admission health
+                # separately from age and expose each stage of its latency.
+                health_code = int(camera["camera_health"])
+                try:
+                    health_name = CameraHealth(health_code).name
+                except ValueError:
+                    health_name = "UNKNOWN"
+                source_ns = int(camera["source_monotonic_ns"])
+                receive_ns = int(camera["receive_monotonic_ns"])
+                publish_ns = int(camera["publish_monotonic_ns"])
+                raise RuntimeError(
+                    "recording camera unhealthy or stale: "
+                    f"health={health_name}({health_code}) "
+                    f"age_ms={camera['camera_age_s'] * 1e3:.3f} "
+                    f"max_age_ms={self.runtime.camera.max_frame_age_s * 1e3:.3f} "
+                    f"source_to_receive_ms={(receive_ns - source_ns) / 1e6:.3f} "
+                    f"receive_to_publish_ms={(publish_ns - receive_ns) / 1e6:.3f} "
+                    f"publish_to_anchor_ms={(now_ns - publish_ns) / 1e6:.3f} "
+                    f"ring_sequence={camera['ring_sequence']} "
+                    f"depth_frame={camera['depth_frame_number']} "
+                    f"color_frame={camera['color_frame_number']} "
+                    f"generation={camera['camera_generation']} "
+                    f"source_ns={source_ns} receive_ns={receive_ns} "
+                    f"publish_ns={publish_ns} anchor_ns={now_ns}"
+                )
             # One causal hand sample carries qpos/current and both tactile
             # payloads with a single source identity; no backward tactile search.
             state = build_episode_state(
@@ -1061,11 +1094,16 @@ class PolicyExecutor:
             # Reserve the transaction before the bounded START wait so Q cannot
             # let lifecycle shutdown race an in-flight recorder acknowledgement.
             self.shared.is_recording.value = True
-            if not self.recorder.start_episode(
+            recorder_start_ns = time.monotonic_ns()
+            started = self.recorder.start_episode(
                 task_label=self.recording_config.task_label,
                 operator=self.recording_config.operator,
                 episode_name=f"episode_{self.completed_episodes + 1:03d}",
-            ):
+            )
+            self._recorder_start_wait_ms = (
+                time.monotonic_ns() - recorder_start_ns
+            ) / 1e6
+            if not started:
                 self.shared.is_recording.value = self.recorder.stop_pending
                 with self.shared.motion_lock:
                     self.shared.start_request.value = False
@@ -1236,12 +1274,23 @@ class PolicyExecutor:
                         self.shared.stop_request.value = int(StopRequest.NONE)
             self._start_requested_episode()
 
-    def _observe_worker_progress(self, now_ns: int) -> bool:
+    def _observe_worker_progress(self) -> bool:
         if not self.execute:
             return True
         try:
+            arm_state = read_arm_state_dict(self.shared)
+            hand_state = read_hand_state_dict(self.shared)
+            # Latest feedback may be published after the scheduler's tick clock.
+            # Sample after both copies and share this clock with SDK progress
+            # validation so normal concurrent publication cannot look future-dated.
+            observed_ns = time.monotonic_ns()
             arm_id, hand_id, hand_setpoint_accepted_ns, feedback_fault = (
-                _read_command_progress(self.shared, self.runtime, now_ns=now_ns)
+                _command_progress_from_feedback(
+                    self.runtime,
+                    arm_state=arm_state,
+                    hand_state=hand_state,
+                    now_ns=observed_ns,
+                )
             )
         except Exception as exc:
             self._fault(f"command progress feedback failed: {type(exc).__name__}")
@@ -1255,7 +1304,7 @@ class PolicyExecutor:
             arm_action_id=arm_id,
             hand_action_id=hand_id,
             hand_setpoint_accepted_ns=hand_setpoint_accepted_ns,
-            now_ns=now_ns,
+            now_ns=observed_ns,
             timeout_ns=self.command_progress_timeout_ns,
         )
         if reason is not None:
@@ -1648,7 +1697,7 @@ class PolicyExecutor:
                 return
             self._fault("RUNNING generation changed outside an episode boundary")
             return
-        if not self._observe_worker_progress(now_ns):
+        if not self._observe_worker_progress():
             return
         if (
             self.max_running_ns is not None
@@ -1709,28 +1758,50 @@ class PolicyExecutor:
         executor_poll_hz = float(self.runtime.policy.executor_poll_hz)
         rate = LoopRate(
             executor_poll_hz,
-            label="policy executor",
+            label="policy executor poll",
             busy_wait=False,
         )
         try:
             while self.shared.is_running.value:
+                tick_started_ns = time.monotonic_ns()
+                self._recorder_start_wait_ms = 0.0
+                phase_ms = {"active_control": 0.0, "recording": 0.0, "metrics": 0.0}
                 self.shared.set_heartbeat("policy", time.monotonic())
+                boundary_started_ns = time.monotonic_ns()
                 self._handle_run_boundary()
+                phase_ms["boundary"] = (
+                    time.monotonic_ns() - boundary_started_ns
+                ) / 1e6
+                # Nested in boundary time, not an additional phase to sum.
+                phase_ms["boundary_recorder_start_wait"] = self._recorder_start_wait_ms
                 run_snapshot = read_run_state_snapshot(self.shared)
                 if (
                     self.run_started_ns is not None
                     and run_snapshot.state is SafetyState.RUNNING
                 ):
-                    self._run_active_tick(time.monotonic_ns())
+                    active_started_ns = time.monotonic_ns()
+                    self._run_active_tick(active_started_ns)
+                    phase_ms["active_control"] = (
+                        time.monotonic_ns() - active_started_ns
+                    ) / 1e6
                     if self.run_started_ns is not None:
-                        self._record_rollout_tick(time.monotonic_ns())
+                        record_started_ns = time.monotonic_ns()
+                        self._record_rollout_tick(record_started_ns)
+                        phase_ms["recording"] = (
+                            time.monotonic_ns() - record_started_ns
+                        ) / 1e6
+                        metrics_started_ns = time.monotonic_ns()
                         self.last_metrics_flush_ns = flush_every(
                             self.stats,
                             last_ns=self.last_metrics_flush_ns,
                             prefix="executor metrics",
                             debug=True,
                         )
-                rate.wait()
+                        phase_ms["metrics"] = (
+                            time.monotonic_ns() - metrics_started_ns
+                        ) / 1e6
+                phase_ms["work"] = (time.monotonic_ns() - tick_started_ns) / 1e6
+                rate.wait(phase_ms=phase_ms)
         finally:
             # A runtime stop can end the loop before its next boundary poll.
             # Storage finalization remains owned by RecorderIO.

@@ -29,7 +29,8 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-PREDICTION_RING_MAXLEN = 1
+# Keep the last committed prediction readable while the next slot is written.
+PREDICTION_RING_MAXLEN = 2
 # ``runtime.safety.SafetyState`` owns the enum; IPC carries this stable wire value
 # without importing the runtime state machine back into the data plane.
 DISARMED_SAFETY_STATE_WIRE_VALUE = 0
@@ -184,6 +185,8 @@ class RuntimeChannels:
     pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> inference
 
     arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, generation)
+    # Arm worker -> HOME waiter; zero until success, stale after generation changes.
+    arm_home_completed_generation: Any
     record_control_q: mp.Queue  # policy -> RecorderIO episode boundaries
     record_result_q: mp.Queue  # RecorderIO -> RecorderClient (sole consumer)
     arm_command_seq: (
@@ -326,6 +329,7 @@ class RuntimeChannels:
         )
 
         storage.arm_home_q = ctx.Queue(maxsize=cfg.arm_home_q_maxsize)
+        storage.arm_home_completed_generation = ctx.Value("Q", 0)
         storage.record_control_q = ctx.Queue(maxsize=8)
         storage.record_result_q = ctx.Queue(maxsize=8)
         storage.arm_command_seq = ctx.Value("Q", 0)

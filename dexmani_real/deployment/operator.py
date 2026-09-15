@@ -98,7 +98,11 @@ def _home(
     *,
     abort_requested,
 ) -> bool:
-    """Home hand + arm from ARMED and report full-sequence completion."""
+    """Accept the hand home target, then wait for the arm home lifecycle.
+
+    Hand acceptance acknowledges the target, not measured arrival. Arm success
+    includes the worker's completion confirmation and stationary home feedback.
+    """
     if int(shared.safety_state.value) != int(SafetyState.ARMED):
         logger.warning("operator: home requires ARMED; press S before H")
         return False
@@ -191,7 +195,7 @@ def run_operator_control(
             # drained batch must not survive a successful home sequence.
             discard_begin_in_batch = False
             signals = keyboard.poll(timeout=_POLL_S)
-            # Only lifecycle-changing signals suppress a Home in the same batch.
+            # Lifecycle-changing signals suppress Home and Begin in the same batch.
             # C/D (PAUSE/DISCARD) belong to teleop and are true no-ops here, so
             # they must not fence H; ESC is fenced by the estop latch/callback.
             stop_in_batch = any(
@@ -200,9 +204,17 @@ def run_operator_control(
             )
             for signal in signals:
                 if signal is OperatorCommand.BEGIN:
-                    if discard_begin_in_batch or not request_policy_start(
-                        shared,
-                        require_physical_home=planner is not None,
+                    if stop_in_batch:
+                        logger.warning(
+                            "operator: ignored B received in the same batch as S/Q"
+                        )
+                        continue
+                    if (
+                        discard_begin_in_batch
+                        or not request_policy_start(
+                            shared,
+                            require_physical_home=planner is not None,
+                        )
                     ):
                         logger.warning(
                             "operator: ignored B until a completed physical home "
@@ -210,7 +222,10 @@ def run_operator_control(
                         )
                         continue
                 elif signal is OperatorCommand.STOP:
-                    _request_immediate_stop(shared)
+                    # The keyboard completed the motion fence before enqueueing.
+                    # STOP still suppresses HOME/BEGIN in this batch, but must
+                    # not revoke again after the executor acknowledges it.
+                    continue
                 elif signal is OperatorCommand.PAUSE:
                     logger.warning(
                         "operator: C is not used in policy deployment; ignored"
@@ -257,6 +272,8 @@ def run_operator_control(
                     with shared.motion_lock:
                         authorized = bool(
                             completed
+                            and int(shared.arm_home_completed_generation.value)
+                            == int(shared.run_generation.value)
                             and shared.is_running.value
                             and not shared.quit_requested.value
                             and not shared.error_state.value
@@ -284,8 +301,7 @@ def run_operator_control(
                     keyboard.drain_signal(OperatorCommand.BEGIN)
                     discard_begin_in_batch = True
                 elif signal is OperatorCommand.QUIT:
-                    if not shared.quit_requested.value:
-                        _request_immediate_quit(shared)
+                    # The immediate callback already fenced motion and set Q.
                     return
                 elif signal is OperatorCommand.EMERGENCY_STOP:
                     shared.estop_request.value = True

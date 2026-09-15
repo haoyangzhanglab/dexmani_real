@@ -3,10 +3,9 @@
 The planner densely validates a joint-space path (self/table/environment
 collision, joint limits) and returns a typed already-home/safe/unsafe result.
 Only a safe result supplies sparse milestones.  The requester queues
-``(waypoints, final_qpos)`` to the arm worker, which drives them as a
-blocking ``XArm7.home()`` in Mode 0; completion is observed from the arm
-state ring (a fresh Mode-6 frame at the canonical home), not from an RPC
-acknowledgement.
+``(waypoints, final_qpos, generation)`` to the arm worker, which drives them as a
+blocking ``XArm7.home()``. Completion requires the worker's generation-matched
+acknowledgement after settling and mode restoration, plus stationary home feedback.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ from dexmani_real.planning.paths import (
     compute_joint_home_path,
 )
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
-from dexmani_real.runtime.safety import SafetyState, revoke_motion
+from dexmani_real.runtime.safety import SafetyState, StopRequest, revoke_motion
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -352,13 +351,11 @@ def _wait_for_home_completion(
     arm_heartbeat_max_age_s: float,
     progress: Callable[[str], None] | None,
 ) -> ArmHomeResult:
-    """Block until the arm worker publishes a fresh stationary frame at ``home_qpos``.
+    """Wait for worker completion and stationary feedback at ``home_qpos``.
 
-    HOME is a blocking worker operation.  Completion is observed from the arm
-    state ring: a frame published after the request whose ``qpos`` converged to
-    ``home_qpos`` and whose ``qvel`` has settled.  Milestone frames published
-    while the arm is still moving fail the velocity check, so only the settled
-    end state (or an already-at-home arm) satisfies it.
+    Stationary milestone feedback can precede dwell completion and Mode 6
+    restoration. Require the worker's completion generation as well as a valid
+    feedback frame sourced after the request; neither witness alone suffices.
     """
     if not np.isfinite(tol_rad) or tol_rad <= 0.0:
         raise ValueError("arm home result tolerance must be finite and positive")
@@ -410,8 +407,22 @@ def _wait_for_home_completion(
                     and float(np.max(np.abs(qpos - home_qpos))) < tol_rad
                     and float(np.max(np.abs(qvel))) <= settled_velocity_rad_s
                 ):
-                    _emit_progress(progress, "arm: home reached")
-                    return ArmHomeResult(ArmHomeStatus.REACHED)
+                    with shared.motion_lock:
+                        completed = (
+                            int(shared.arm_home_completed_generation.value)
+                            == expected_run_generation
+                            and int(shared.run_generation.value)
+                            == expected_run_generation
+                            and int(shared.safety_state.value) == int(SafetyState.ARMED)
+                            and shared.is_running.value
+                            and not shared.quit_requested.value
+                            and not shared.estop_request.value
+                            and not shared.error_state.value
+                            and int(shared.stop_request.value) == int(StopRequest.NONE)
+                        )
+                    if completed:
+                        _emit_progress(progress, "arm: home reached (worker complete)")
+                        return ArmHomeResult(ArmHomeStatus.REACHED)
         time.sleep(_HOME_RESULT_POLL_S)
     if abort_reason is not None:
         _emit_progress(progress, f"arm: home wait aborted — {abort_reason}")

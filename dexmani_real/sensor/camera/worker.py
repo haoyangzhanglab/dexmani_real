@@ -286,11 +286,27 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
                     backlog_s=frame.backlog_s,
                     max_age_s=cfg.max_frame_age_s,
                 )
+                if camera_health is CameraHealth.DUPLICATE:
+                    # A frameset can reuse the previous depth sample. It adds no
+                    # new depth observation: keep the resident RGB-D sample and
+                    # its original timestamps instead of publishing a duplicate.
+                    # Persistent repeats still age out at the consumers. Clock
+                    # resets take precedence above and must remain visible.
+                    continue
                 if frame.frame_gap > cfg.resolved_frame_gap_stall_threshold:
                     frame_gap_warn(
-                        "camera_loop: device frame gap=%d (current frame retained; threshold=%d)",
+                        "camera_loop: skipped_frames=%d threshold=%d "
+                        "depth_frame=%d color_frame=%s generation=%d "
+                        "health=%s(%d) backlog_ms=%.3f "
+                        "(publishing current frame with reported health)",
                         frame.frame_gap,
                         cfg.resolved_frame_gap_stall_threshold,
+                        frame.depth_frame_number,
+                        frame.color_frame_number,
+                        frame.camera_generation,
+                        camera_health.name,
+                        int(camera_health),
+                        frame.backlog_s * 1e3,
                     )
                 try:
                     header, rgb, depth = pack_camera_frame(

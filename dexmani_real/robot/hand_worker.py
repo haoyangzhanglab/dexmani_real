@@ -67,19 +67,24 @@ def _safe_disconnect(hand: Any) -> bool:
 def _log_board_error_transitions(
     previous: dict[str, np.ndarray], current: dict[str, np.ndarray]
 ) -> dict[str, np.ndarray]:
-    """Log board-register transitions without assigning them safety meaning."""
+    """Warn on nonzero registers and log clearing without decoding vendor bits.
+
+    These diagnostics do not grant motion authority or replace feedback checks.
+    """
     for name in ("commboard_err", "jointboard_err", "tipboard_err"):
         prev = previous[name]
         cur = current[name]
         if prev.shape == cur.shape:
             for joint in range(int(cur.shape[0])):
                 if prev[joint] != cur[joint]:
-                    logger.info(
-                        "%s[%d] 0x%08x -> 0x%08x",
+                    log = logger.warning if int(cur[joint]) != 0 else logger.info
+                    log(
+                        "hand board register %s[%d] 0x%08x -> 0x%08x (%s)",
                         name,
                         joint,
                         int(prev[joint]),
                         int(cur[joint]),
+                        "nonzero" if int(cur[joint]) != 0 else "cleared",
                     )
     return {name: current[name].copy() for name in previous}
 
@@ -225,16 +230,27 @@ def hand_loop(
         mechanical_lower = np.asarray(config.mechanical_qpos_min_rad, dtype=np.float64)
         mechanical_upper = np.asarray(config.mechanical_qpos_max_rad, dtype=np.float64)
 
+        def wait_for_tick() -> None:
+            # Measure host elapsed work, including any descheduling within a
+            # phase. LoopRate adds these values only when its overrun is logged.
+            phase_ms["work"] = (time.monotonic_ns() - tick_started_ns) / 1e6
+            rate_mgr.wait(phase_ms=phase_ms)
+
         while shared.is_running.value:
+            tick_started_ns = time.monotonic_ns()
+            phase_ms = {"read_state": 0.0, "feedback_publish": 0.0, "send_command": 0.0}
             shared.set_heartbeat("hand", time.monotonic())
             if shared.estop_request.value:
                 break
 
+            read_started_ns = time.monotonic_ns()
             state = hand.get_state()
+            phase_ms["read_state"] = (time.monotonic_ns() - read_started_ns) / 1e6
             if state is None:
                 now_s = time.monotonic()
                 if read_failure_started_s is None:
                     read_failure_started_s = now_s
+                feedback_started_ns = time.monotonic_ns()
                 _publish_feedback(
                     shared,
                     qpos=last_state.qpos,
@@ -256,13 +272,16 @@ def hand_loop(
                     tipboard_err=last_state.tipboard_err,
                     source_monotonic_ns=last_source_ns,
                 )
+                phase_ms["feedback_publish"] = (
+                    time.monotonic_ns() - feedback_started_ns
+                ) / 1e6
                 if now_s - read_failure_started_s >= state_read_failure_timeout_s:
                     shared.error_state.value = True
                     raise RuntimeError(
                         "hand state reads failed for "
                         f"{now_s - read_failure_started_s:.3f}s"
                     )
-                rate_mgr.wait()
+                wait_for_tick()
                 continue
 
             read_failure_started_s = None
@@ -276,6 +295,7 @@ def hand_loop(
                     "tipboard_err": state.tipboard_err,
                 },
             )
+            feedback_started_ns = time.monotonic_ns()
             _publish_feedback(
                 shared,
                 qpos=state.qpos,
@@ -297,15 +317,18 @@ def hand_loop(
                 tipboard_err=state.tipboard_err,
                 source_monotonic_ns=last_source_ns,
             )
+            phase_ms["feedback_publish"] = (
+                time.monotonic_ns() - feedback_started_ns
+            ) / 1e6
 
             result = shared.coupled_cmd_ring.read_latest()
             if result is None:
-                rate_mgr.wait()
+                wait_for_tick()
                 continue
             command, _published_ns, sequence = result
             sequence_int = int(sequence)
             if not bool(command["hand_present"][0]):
-                rate_mgr.wait()
+                wait_for_tick()
                 continue
             ticket = CoupledCommandTicket(
                 run_generation=int(command["run_generation"][0]),
@@ -314,7 +337,7 @@ def hand_loop(
             )
             permit = read_motion_permit(shared)
             if permit.run_generation != ticket.run_generation:
-                rate_mgr.wait()
+                wait_for_tick()
                 continue
             if permit.run_generation != command_generation:
                 last_exact_target_sequence = 0
@@ -324,7 +347,7 @@ def hand_loop(
                 # An accepted exact target is an endpoint event, not a
                 # level-triggered command.  Retries remain allowed only until
                 # the SDK has accepted the exact endpoint.
-                rate_mgr.wait()
+                wait_for_tick()
                 continue
             action_id = int(command["action_id"][0])
             target = np.asarray(command["hand_qpos"][0], dtype=np.float64)
@@ -350,7 +373,7 @@ def hand_loop(
             # This is the sole command-authority fence and the final operation
             # before an otherwise valid setpoint crosses the XHand SDK boundary.
             if not coupled_command_ticket_allows_execution(shared, ticket=ticket):
-                rate_mgr.wait()
+                wait_for_tick()
                 continue
             if issue is not None:
                 logger.error(
@@ -361,7 +384,9 @@ def hand_loop(
                 shared.error_state.value = True
                 return
             assert bounded is not None
+            send_started_ns = time.monotonic_ns()
             send_status = hand.send_action(bounded)
+            phase_ms["send_command"] = (time.monotonic_ns() - send_started_ns) / 1e6
             if send_status is XHandSendStatus.ACCEPTED:
                 accepted_now_ns = time.monotonic_ns()
                 last_sdk_accepted_qpos = bounded.copy()
@@ -382,7 +407,7 @@ def hand_loop(
             # CRC_UNCONFIRMED deliberately leaves both the action and its
             # command-space reference unacknowledged.
 
-            rate_mgr.wait()
+            wait_for_tick()
     finally:
         if not _safe_disconnect(hand):
             logger.error("hand_loop: XHand disconnect failed")

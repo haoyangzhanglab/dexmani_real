@@ -214,6 +214,33 @@ python examples/run_policy.py <policy/task/experiment> \
 
 该入口 **始终连接真实硬件**。
 
+### 导出并使用指定检查点
+
+训练检查点需先在 `dexmani_policy` 中导出为部署文件。以下以 60% 进度的检查点为例，从本仓库根目录执行：
+
+```bash
+cd ../dexmani_policy
+python -m dexmani_policy.deployment.export \
+  experiments/maniflow/pick_place_toy/2026-09-15_01-28_0 \
+  --checkpoint epoch=0539-step=00048000-milestone=60pct.pt
+```
+
+导出默认执行模型恢复和合成输入预测验证，在实验的 `checkpoints/` 下生成同名 `-deployment.pt` 文件，并将 `deployment_latest.pt` 更新为指向该文件。
+
+导出成功后，回到本仓库运行真机评估：
+
+```bash
+cd ../dexmani_real
+python examples/run_policy.py \
+  experiments/maniflow/pick_place_toy/2026-09-15_01-28_0 \
+  --num-episodes 10 \
+  --artifact epoch=0539-step=00048000-milestone=60pct-deployment.pt
+```
+
+`--artifact` 只填写 `checkpoints/` 内的部署文件名，不带目录路径；省略时使用 `deployment_latest.pt`。普通训练检查点不能直接作为部署文件使用。
+
+### 评估输出
+
 每个 policy evaluation session 使用独立输出目录：
 
 ```text

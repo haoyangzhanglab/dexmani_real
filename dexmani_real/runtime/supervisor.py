@@ -95,8 +95,8 @@ def run_supervisor(
     """Run the standard supervisor loop with resolved heartbeat settings.
 
     Returns ``(exit_reason, normal_exit)``.  *exit_reason* describes why the
-    supervisor stopped; *normal_exit* is True for user-requested clean exits
-    (Q key or KeyboardInterrupt), False for faults.
+    supervisor stopped; *normal_exit* is True for requested clean exits
+    (Q key, episode target reached, or KeyboardInterrupt), False for faults.
 
     The caller should have already transitioned to ARMED before calling this
     and must handle shutdown + DISARMED transition after it returns.
@@ -164,7 +164,7 @@ def run_supervisor(
                 break
             if reason is ExitReason.EXPLICIT_QUIT:
                 normal_exit = True
-                exit_reason = "explicit quit"
+                exit_reason = "shutdown requested"
                 break
 
             if now - last_status_s >= status_interval_s:

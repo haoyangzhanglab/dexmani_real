@@ -131,6 +131,7 @@ class KeyboardInput:
         # A daemon listener can outlive bounded shutdown.  Its callbacks must
         # not reach a session after this owner has stopped it.
         self._callbacks_active: bool = False
+        self._commands_quiesced: bool = False
         self._debounce_s = float(debounce_s)
         self._startup_timeout_s = float(startup_timeout_s)
         self._estop_callback = estop_callback
@@ -156,7 +157,7 @@ class KeyboardInput:
         operator latency.
         """
         with self._lock:
-            if not self._callbacks_active:
+            if not self._callbacks_active or self._commands_quiesced:
                 return False
             if signal in self._pressed_signals:
                 return False
@@ -165,7 +166,6 @@ class KeyboardInput:
             if now_s - last < self._debounce_s:
                 return False
             self._last_signal_time[signal] = now_s
-            self._buffer.append(signal)
             return True
 
     def _release_control(self, signal: OperatorCommand) -> None:
@@ -192,22 +192,26 @@ class KeyboardInput:
             except Exception:
                 logger.error("keyboard emergency-stop callback failed", exc_info=True)
 
-    def _dispatch_immediate_callback(self, signal: OperatorCommand) -> None:
-        """Run the optional non-e-stop callback for a newly pressed key."""
+    def _dispatch_immediate_callback(self, signal: OperatorCommand) -> bool:
+        """Complete the immediate effect before the command becomes pollable."""
         with self._lock:
-            if not self._callbacks_active:
-                return
+            if not self._callbacks_active or self._commands_quiesced:
+                return False
             callback = (
                 self._stop_callback
                 if signal is OperatorCommand.STOP
                 else self._quit_callback if signal is OperatorCommand.QUIT else None
             )
         if callback is None:
-            return
+            return True
         try:
             callback()
         except Exception:
             logger.error("keyboard %s callback failed", signal.value, exc_info=True)
+            # Consumers must not proceed as if a failed stop/quit was applied.
+            self._latch_emergency_stop()
+            return False
+        return True
 
     def _callbacks(
         self, keyboard: Any
@@ -246,7 +250,7 @@ class KeyboardInput:
                 if name in _EVENT_ONLY_KEYS:
                     if self._capture_raw_events:
                         with self._lock:
-                            if self._callbacks_active:
+                            if self._callbacks_active and not self._commands_quiesced:
                                 self._events.append(name)
                     return
                 with self._lock:
@@ -262,7 +266,10 @@ class KeyboardInput:
                     and signal is not None
                     and self._accept_control_press(signal, time.perf_counter())
                 ):
-                    self._dispatch_immediate_callback(signal)
+                    if self._dispatch_immediate_callback(signal):
+                        with self._lock:
+                            if self._callbacks_active and not self._commands_quiesced:
+                                self._buffer.append(signal)
             except Exception:
                 logger.warning("keyboard press callback failed", exc_info=True)
 
@@ -318,6 +325,7 @@ class KeyboardInput:
         self._estop_latched.clear()
         self._listener_failure_reported = False
         with self._lock:
+            self._commands_quiesced = False
             self._buffer.clear()
             self._events.clear()
             self._keys.clear()
@@ -500,8 +508,13 @@ class KeyboardInput:
             return self._events.popleft() if self._events else None
 
     def quiesce(self) -> None:
-        """Disable callbacks and discard pending events during owned shutdown."""
+        """Detach session callbacks and stop command/raw-event admission.
+
+        A callback already in flight may finish, but cannot requeue its command.
+        Held-key tracking and the local ESC latch remain active until stop().
+        """
         with self._lock:
+            self._commands_quiesced = True
             self._estop_callback = None
             self._stop_callback = None
             self._quit_callback = None

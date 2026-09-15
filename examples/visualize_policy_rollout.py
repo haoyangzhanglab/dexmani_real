@@ -22,6 +22,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from dexmani_real.deployment.policy_trace import load_trace, trace_path_for_episode
 from dexmani_real.recording.storage.reader import EpisodeReader
+from dexmani_real.robot.model import HAND_FINGER_NAMES
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 
 
@@ -121,76 +122,176 @@ def visualize(episode: Path, trace: dict[str, np.ndarray], hz: float, args) -> N
     from dexmani_real.config.experiment import resolve_experiment_config
 
     class RolloutVisualizer(EpisodeVisualizer):
+        def _preload_state(self):
+            # Keep the rollout focused on execution evidence, not a raw-field browser.
+            self._available = {
+                "arm": ["arm_qpos"],
+                "hand": ["hand_qpos", "hand_contact"],
+                "action": ["action_arm_joint_sent", "action_hand_joint"],
+                "flags": [
+                    "flag_frame_status",
+                    "flag_action_queued",
+                    "flag_sample_valid",
+                    "observation_valid",
+                    "flag_camera_fresh",
+                    "arm_connected",
+                    "hand_connected",
+                    "hand_qpos_stale",
+                    "hand_contact_valid",
+                ],
+                "camera": self._available.get("camera", []),
+                "meta": ["timestamp"],
+            }
+            return super()._preload_state()
+
         def _build_blueprint(self):
-            joint_views = []
-            for group, count in (("arm", 7), ("hand", 12)):
-                joint_views.append(
+            def series(origin, name, **kwargs):
+                return rrb.TimeSeriesView(origin=origin, name=name, **kwargs)
+
+            def flags(keys, name):
+                return series("flags", name, contents=[f"flags/{key}" for key in keys])
+
+            arm_views = [
+                series(
+                    f"comparison/arm/{i}", f"Arm joint {i}: actual / submitted (rad)"
+                )
+                for i in range(7)
+            ]
+            hand_views = []
+            for finger, indices in (
+                ("Thumb", range(0, 3)),
+                ("Index", range(3, 6)),
+                ("Middle", range(6, 8)),
+                ("Ring", range(8, 10)),
+                ("Pinky", range(10, 12)),
+            ):
+                hand_views.append(
                     rrb.Vertical(
-                        name=group.title(),
+                        name=finger,
                         contents=[
-                            rrb.TimeSeriesView(
-                                origin=f"comparison/{group}/{i}",
-                                name=f"{group} joint {i} (rad)",
-                            )
-                            for i in range(count)
+                            series(f"comparison/hand/{i}", f"{finger} joint {i} (rad)")
+                            for i in indices
                         ],
                     )
                 )
             return rrb.Blueprint(
-                rrb.Horizontal(
+                rrb.Vertical(
+                    row_shares=[3, 2],
                     contents=[
-                        rrb.Vertical(
-                            name="Camera",
+                        rrb.Horizontal(
+                            column_shares=[2, 3, 2],
                             contents=[
-                                rrb.Spatial2DView(
-                                    origin="camera/color/rgb", name="Raw RGB"
+                                rrb.Tabs(
+                                    name="Camera",
+                                    active_tab=0,
+                                    contents=[
+                                        rrb.Spatial2DView(
+                                            origin="camera/color/rgb", name="RGB"
+                                        ),
+                                        rrb.Spatial2DView(
+                                            origin="depth/image", name="Depth"
+                                        ),
+                                    ],
                                 ),
-                                rrb.Spatial2DView(
-                                    origin="depth/image", name="Raw Depth"
+                                rrb.Spatial3DView(
+                                    origin="/",
+                                    name="Proposals / terminal target / FK / cloud",
+                                    background=[0.12, 0.12, 0.14],
+                                ),
+                                rrb.Vertical(
+                                    name="Execution overview",
+                                    contents=[
+                                        series(
+                                            "comparison/error_norm",
+                                            "Joint tracking error norms (rad)",
+                                        ),
+                                        series(
+                                            "state/hand_contact_mag",
+                                            "Five-finger contact magnitude (SDK-scaled)",
+                                        ),
+                                        series(
+                                            "flags/flag_frame_status",
+                                            "Frame: 0 OK / 1 held / 2 IK / 3 safety",
+                                        ),
+                                    ],
                                 ),
                             ],
-                        ),
-                        rrb.Spatial3DView(
-                            origin="/",
-                            name="3D Scene — reconstructed cloud / FK",
-                            background=[0.12, 0.12, 0.14],
                         ),
                         rrb.Tabs(
-                            name="Action/State",
+                            name="Diagnostics",
                             active_tab=0,
                             contents=[
-                                rrb.TimeSeriesView(
-                                    origin="comparison/error_norm",
-                                    name="Tracking error norms (rad)",
+                                rrb.Grid(
+                                    name="Arm joints",
+                                    grid_columns=4,
+                                    contents=arm_views,
                                 ),
-                                *joint_views,
-                                rrb.TimeSeriesView(
-                                    origin="state/hand_contact_mag", name="Raw contact"
+                                rrb.Horizontal(name="Hand joints", contents=hand_views),
+                                rrb.Grid(
+                                    name="Contact",
+                                    grid_columns=3,
+                                    contents=[
+                                        *[
+                                            series(
+                                                f"contact/{finger}",
+                                                f"{finger.title()} Fx / Fy / Fz (SDK-scaled)",
+                                            )
+                                            for finger in HAND_FINGER_NAMES
+                                        ],
+                                        flags(
+                                            ["hand_contact_valid"],
+                                            "Contact valid (not contact detected)",
+                                        ),
+                                    ],
+                                ),
+                                rrb.Grid(
+                                    name="Status",
+                                    grid_columns=2,
+                                    contents=[
+                                        flags(["flag_action_queued"], "Action queued"),
+                                        flags(
+                                            [
+                                                "flag_sample_valid",
+                                                "observation_valid",
+                                                "flag_camera_fresh",
+                                            ],
+                                            "Sample / observation validity and camera freshness",
+                                        ),
+                                        flags(
+                                            ["arm_connected", "hand_connected"],
+                                            "Device connected",
+                                        ),
+                                        flags(
+                                            ["hand_qpos_stale"], "Hand feedback stale"
+                                        ),
+                                    ],
+                                ),
+                                rrb.Grid(
+                                    name="Policy timing",
+                                    grid_columns=2,
+                                    contents=[
+                                        series(
+                                            "policy/timing",
+                                            "Prediction latency / age / skew (ms)",
+                                        ),
+                                        series(
+                                            "policy/arrivals",
+                                            "Prediction sequence / first usable index (-1: stale)",
+                                        ),
+                                        series(
+                                            "policy/decisions",
+                                            "Terminal chunk index / status (0 OK / 2 IK / 3 safety)",
+                                        ),
+                                        series(
+                                            "policy/lateness", "Terminal timing (ms)"
+                                        ),
+                                    ],
                                 ),
                             ],
                         ),
-                        rrb.Vertical(
-                            name="Policy Timing",
-                            contents=[
-                                rrb.TimeSeriesView(
-                                    origin="policy/timing",
-                                    name="Prediction latency / age / skew (ms)",
-                                ),
-                                rrb.TimeSeriesView(
-                                    origin="policy/arrivals",
-                                    name="Prediction arrivals / first index",
-                                ),
-                                rrb.TimeSeriesView(
-                                    origin="policy/decisions", name="Terminal decisions"
-                                ),
-                                rrb.TimeSeriesView(
-                                    origin="policy/lateness",
-                                    name="Terminal timing (ms)",
-                                ),
-                            ],
-                        ),
-                    ]
-                )
+                    ],
+                ),
+                auto_views=False,
             )
 
         def _log_static(self):
@@ -200,6 +301,17 @@ def visualize(episode: Path, trace: dict[str, np.ndarray], hz: float, args) -> N
                 rr.SeriesLine(name="Scheduler tick − ring commit (signed ms)"),
                 static=True,
             )
+            for finger in HAND_FINGER_NAMES:
+                for axis, color in zip(
+                    ("Fx", "Fy", "Fz"),
+                    ([255, 90, 90], [90, 210, 90], [90, 150, 255]),
+                    strict=True,
+                ):
+                    rr.log(
+                        f"contact/{finger}/{axis}",
+                        rr.SeriesLine(name=axis, color=color),
+                        static=True,
+                    )
             for group, count in (("arm", 7), ("hand", 12)):
                 rr.log(
                     f"comparison/error_norm/{group}",
@@ -219,6 +331,13 @@ def visualize(episode: Path, trace: dict[str, np.ndarray], hz: float, args) -> N
 
         def _log_time_series(self, step_idx):
             super()._log_time_series(step_idx)
+            for finger, force in zip(
+                HAND_FINGER_NAMES,
+                self._state["hand_contact"][step_idx],
+                strict=True,
+            ):
+                for axis, value in zip(("Fx", "Fy", "Fz"), force, strict=True):
+                    rr.log(f"contact/{finger}/{axis}", rr.Scalar(float(value)))
             for group, command in (
                 ("arm", "action_arm_joint_sent"),
                 ("hand", "action_hand_joint"),

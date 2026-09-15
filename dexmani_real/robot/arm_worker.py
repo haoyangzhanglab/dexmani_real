@@ -39,6 +39,7 @@ from dexmani_real.robot.drivers.xarm7 import HomeAborted, XArm7, describe_contro
 from dexmani_real.runtime.safety import (
     CoupledCommandTicket,
     SafetyState,
+    StopRequest,
     coupled_command_ticket_allows_execution,
     read_motion_permit,
     reject_coupled_command_if_current,
@@ -266,6 +267,15 @@ def _handle_home(st: _LoopState, shared: Any, request: tuple) -> None:
     st.last_target = np.asarray(final_qpos, dtype=np.float64).copy()
     st.last_command_generation = int(generation)
     logger.info("arm_loop: HOME complete")
+    # Publish only after the driver's settle and mode-restoration lifecycle.
+    # S/Q and generation changes must win over a late HOME completion.
+    with shared.motion_lock:
+        if (
+            _home_abort_reason(shared, generation) is None
+            and not shared.quit_requested.value
+            and int(shared.stop_request.value) == int(StopRequest.NONE)
+        ):
+            shared.arm_home_completed_generation.value = int(generation)
 
 
 def _handle_servo_command(

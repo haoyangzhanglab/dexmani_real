@@ -95,7 +95,7 @@ def serialize_prediction(prediction: Prediction) -> np.ndarray:
 
 
 def publish_prediction(shared: RuntimeChannels, prediction: Prediction) -> bool:
-    """Generation-fence and publish one flat prediction to the single-slot ring."""
+    """Generation-fence and publish one flat prediction to the latest-wins ring."""
     if int(shared.run_generation.value) != prediction.run_generation:
         return False
     shared.prediction_ring.write(serialize_prediction(prediction))
@@ -168,6 +168,7 @@ def inference_loop(
     observation_id = 0
     last_generation = -1
     last_logical_step_ns = 0
+    run_detected_ns: int | None = None
     deadline_ns: int | None = None
     last_metrics_flush_ns = time.monotonic_ns()
 
@@ -194,6 +195,7 @@ def inference_loop(
                 last_generation = run_generation
                 observation_id = 0  # new observation epoch for the new run
                 last_logical_step_ns = 0
+                run_detected_ns = None
                 deadline_ns = None
 
             # ARMED = no inference; the policy executor gates RUNNING via B.
@@ -208,6 +210,8 @@ def inference_loop(
             if run_snapshot.started_monotonic_ns <= 0:
                 raise RuntimeError("RUNNING state has no observation epoch")
             now_ns = time.monotonic_ns()
+            if run_detected_ns is None:
+                run_detected_ns = now_ns
             if deadline_ns is None:
                 deadline_ns = run_snapshot.started_monotonic_ns
             if now_ns < deadline_ns:
@@ -239,6 +243,7 @@ def inference_loop(
             observation_age_ms, observation_skew_ms = observation_timing_ms(observation)
             stats.observation_age_ms = observation_age_ms
             stats.observation_skew_ms = observation_skew_ms
+            first_prediction = last_logical_step_ns == 0
             last_logical_step_ns = observation.logical_step_monotonic_ns
 
             started_ns = time.monotonic_ns()
@@ -247,6 +252,7 @@ def inference_loop(
                 config.spec,
                 fingertip_runtime=fingertip_runtime,
             )
+            converted_ns = time.monotonic_ns()
             actions = _predict_action_chunk(runtime, policy_observation, config.spec)
             finished_ns = time.monotonic_ns()
             inference_ms = (finished_ns - started_ns) / 1e6
@@ -263,6 +269,22 @@ def inference_loop(
             )
             if not publish_prediction(shared, prediction):
                 logger.debug("inference: prediction dropped (generation advanced)")
+            elif first_prediction:
+                published_ns = time.monotonic_ns()
+                # Host elapsed times include scheduling waits. The model-call
+                # interval is not a CUDA-kernel timing; no extra device sync.
+                logger.info(
+                    "inference startup: generation=%d epoch_to_detection_ms=%.3f "
+                    "observation_wait_build_ms=%.3f input_conversion_ms=%.3f "
+                    "model_call_ms=%.3f prediction_publication_ms=%.3f total_ms=%.3f",
+                    run_generation,
+                    (run_detected_ns - run_snapshot.started_monotonic_ns) / 1e6,
+                    (started_ns - run_detected_ns) / 1e6,
+                    (converted_ns - started_ns) / 1e6,
+                    (finished_ns - converted_ns) / 1e6,
+                    (published_ns - finished_ns) / 1e6,
+                    (published_ns - run_snapshot.started_monotonic_ns) / 1e6,
+                )
             assert deadline_ns is not None
             deadline_ns = next_periodic_deadline_ns(
                 deadline_ns,
