@@ -232,18 +232,29 @@ def hand_loop(
 
         def wait_for_tick() -> None:
             # Measure host elapsed work, including any descheduling within a
-            # phase. LoopRate adds these values only when its overrun is logged.
-            phase_ms["work"] = (time.monotonic_ns() - tick_started_ns) / 1e6
+            # phase. Residual time is uninstrumented work/measurement overhead,
+            # not a separate estimate of OS scheduling delay.
+            work_ms = (time.monotonic_ns() - tick_started_ns) / 1e6
+            phase_ms["unattributed"] = work_ms - sum(phase_ms.values())
+            phase_ms["work"] = work_ms
             rate_mgr.wait(phase_ms=phase_ms)
 
         while shared.is_running.value:
             tick_started_ns = time.monotonic_ns()
-            phase_ms = {"read_state": 0.0, "feedback_publish": 0.0, "send_command": 0.0}
+            phase_ms = dict.fromkeys(
+                (
+                    "tick_setup", "read_state", "board_error_log", "feedback_publish",
+                    "command_read", "permit_read", "target_prepare", "command_fence",
+                    "send_command", "command_ack",
+                ),
+                0.0,
+            )
             shared.set_heartbeat("hand", time.monotonic())
             if shared.estop_request.value:
                 break
 
             read_started_ns = time.monotonic_ns()
+            phase_ms["tick_setup"] = (read_started_ns - tick_started_ns) / 1e6
             state = hand.get_state()
             phase_ms["read_state"] = (time.monotonic_ns() - read_started_ns) / 1e6
             if state is None:
@@ -287,6 +298,7 @@ def hand_loop(
             read_failure_started_s = None
             last_state = state
             last_source_ns = time.monotonic_ns()
+            board_log_started_ns = time.monotonic_ns()
             previous_board_errors = _log_board_error_transitions(
                 previous_board_errors,
                 {
@@ -296,6 +308,9 @@ def hand_loop(
                 },
             )
             feedback_started_ns = time.monotonic_ns()
+            phase_ms["board_error_log"] = (
+                feedback_started_ns - board_log_started_ns
+            ) / 1e6
             _publish_feedback(
                 shared,
                 qpos=state.qpos,
@@ -321,7 +336,11 @@ def hand_loop(
                 time.monotonic_ns() - feedback_started_ns
             ) / 1e6
 
+            command_read_started_ns = time.monotonic_ns()
             result = shared.coupled_cmd_ring.read_latest()
+            phase_ms["command_read"] = (
+                time.monotonic_ns() - command_read_started_ns
+            ) / 1e6
             if result is None:
                 wait_for_tick()
                 continue
@@ -335,7 +354,9 @@ def hand_loop(
                 ring_sequence=sequence_int,
                 valid_until_monotonic_ns=int(command["valid_until_monotonic_ns"][0]),
             )
+            permit_started_ns = time.monotonic_ns()
             permit = read_motion_permit(shared)
+            phase_ms["permit_read"] = (time.monotonic_ns() - permit_started_ns) / 1e6
             if permit.run_generation != ticket.run_generation:
                 wait_for_tick()
                 continue
@@ -349,6 +370,7 @@ def hand_loop(
                 # the SDK has accepted the exact endpoint.
                 wait_for_tick()
                 continue
+            target_started_ns = time.monotonic_ns()
             action_id = int(command["action_id"][0])
             target = np.asarray(command["hand_qpos"][0], dtype=np.float64)
             issue = check_worker_hand_target(
@@ -370,9 +392,15 @@ def hand_loop(
                     mechanical_lower_rad=mechanical_lower,
                     mechanical_upper_rad=mechanical_upper,
                 )
-            # This is the sole command-authority fence and the final operation
-            # before an otherwise valid setpoint crosses the XHand SDK boundary.
-            if not coupled_command_ticket_allows_execution(shared, ticket=ticket):
+            fence_started_ns = time.monotonic_ns()
+            phase_ms["target_prepare"] = (fence_started_ns - target_started_ns) / 1e6
+            # This remains the final authority check before the SDK call.
+            # Timing the check includes any motion-lock wait, not just lock hold.
+            allowed = coupled_command_ticket_allows_execution(shared, ticket=ticket)
+            phase_ms["command_fence"] = (
+                time.monotonic_ns() - fence_started_ns
+            ) / 1e6
+            if not allowed:
                 wait_for_tick()
                 continue
             if issue is not None:
@@ -386,7 +414,8 @@ def hand_loop(
             assert bounded is not None
             send_started_ns = time.monotonic_ns()
             send_status = hand.send_action(bounded)
-            phase_ms["send_command"] = (time.monotonic_ns() - send_started_ns) / 1e6
+            ack_started_ns = time.monotonic_ns()
+            phase_ms["send_command"] = (ack_started_ns - send_started_ns) / 1e6
             if send_status is XHandSendStatus.ACCEPTED:
                 accepted_now_ns = time.monotonic_ns()
                 last_sdk_accepted_qpos = bounded.copy()
@@ -406,6 +435,7 @@ def hand_loop(
                 return
             # CRC_UNCONFIRMED deliberately leaves both the action and its
             # command-space reference unacknowledged.
+            phase_ms["command_ack"] = (time.monotonic_ns() - ack_started_ns) / 1e6
 
             wait_for_tick()
     finally:

@@ -123,7 +123,8 @@ def visualize(episode: Path, trace: dict[str, np.ndarray], hz: float, args) -> N
 
     class RolloutVisualizer(EpisodeVisualizer):
         def _preload_state(self):
-            # Keep the rollout focused on execution evidence, not a raw-field browser.
+            # Policy raw rows do not carry the inference worker's observation
+            # verdict. Show sample validity and camera freshness instead.
             self._available = {
                 "arm": ["arm_qpos"],
                 "hand": ["hand_qpos", "hand_contact"],
@@ -132,7 +133,6 @@ def visualize(episode: Path, trace: dict[str, np.ndarray], hz: float, args) -> N
                     "flag_frame_status",
                     "flag_action_queued",
                     "flag_sample_valid",
-                    "observation_valid",
                     "flag_camera_fresh",
                     "arm_connected",
                     "hand_connected",
@@ -252,10 +252,9 @@ def visualize(episode: Path, trace: dict[str, np.ndarray], hz: float, args) -> N
                                         flags(
                                             [
                                                 "flag_sample_valid",
-                                                "observation_valid",
                                                 "flag_camera_fresh",
                                             ],
-                                            "Sample / observation validity and camera freshness",
+                                            "Sample validity and camera freshness",
                                         ),
                                         flags(
                                             ["arm_connected", "hand_connected"],

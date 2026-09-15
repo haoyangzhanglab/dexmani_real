@@ -1030,6 +1030,8 @@ class PolicyExecutor:
             )
             signals = {
                 "observation_anchor_monotonic_ns": now_ns,
+                # This raw row is not the inference worker's assembled model
+                # observation; preserve the stored field without claiming that verdict.
                 "observation_valid": False,
                 "tracking_error": (
                     float(arm["tracking_err"][0])

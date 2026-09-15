@@ -304,7 +304,7 @@ class SharedMemoryRingBuffer:
         if latest_seq == 0:
             return []
         frames: list[tuple[np.ndarray, int, int]] = []
-        dropped = False
+        missing: list[tuple[int, str]] = []
         count = min(k, latest_seq)
         first_seq = latest_seq - count + 1
         for target_seq in range(first_seq, latest_seq + 1):
@@ -317,10 +317,11 @@ class SharedMemoryRingBuffer:
             for _attempt in range(2):
                 marker1 = seqlock.marker
                 if not seqlock_is_complete(marker1):
+                    reason = "writer_active" if marker1 else "uninitialized"
                     continue
                 if seqlock_to_logical(marker1) != target_seq:
                     # Skip slots overwritten during the read.
-                    dropped = True
+                    reason = "sequence_mismatch"
                     break
                 timestamp_ns = seqlock.timestamp_ns
                 data = slot["data"].copy().reshape(1)
@@ -331,10 +332,11 @@ class SharedMemoryRingBuffer:
                     frames.append((data, timestamp_ns, target_seq))
                     accepted = True
                     break
+                reason = "changed_during_copy"
             if not accepted:
-                dropped = True
-        if dropped:
-            self._warn_torn_read_k(k, len(frames))
+                missing.append((target_seq, reason))
+        if missing:
+            self._warn_torn_read_k(k, len(frames), latest_seq, missing)
         return frames
 
     def get_last_k_fields(
@@ -351,7 +353,7 @@ class SharedMemoryRingBuffer:
             raise ValueError(f"k ({k}) exceeds ring capacity maxlen ({self.maxlen})")
         latest_seq = int(self._write_seq[0])
         frames: list[tuple[dict[str, np.ndarray | np.generic], int, int]] = []
-        dropped = False
+        missing: list[tuple[int, str]] = []
         for target_seq in range(latest_seq - min(k, latest_seq) + 1, latest_seq + 1):
             slot = self._data_buf[target_seq % self.maxlen]
             seqlock = SeqlockSlot(
@@ -362,8 +364,10 @@ class SharedMemoryRingBuffer:
             for _attempt in range(2):
                 marker_before = seqlock.marker
                 if not seqlock_is_complete(marker_before):
+                    reason = "writer_active" if marker_before else "uninitialized"
                     continue
                 if seqlock_to_logical(marker_before) != target_seq:
+                    reason = "sequence_mismatch"
                     break
                 timestamp_ns = seqlock.timestamp_ns
                 record = slot["data"]
@@ -372,10 +376,11 @@ class SharedMemoryRingBuffer:
                     frames.append((projected, timestamp_ns, target_seq))
                     accepted = True
                     break
+                reason = "changed_during_copy"
             if not accepted:
-                dropped = True
-        if dropped:
-            self._warn_torn_read_k(k, len(frames))
+                missing.append((target_seq, reason))
+        if missing:
+            self._warn_torn_read_k(k, len(frames), latest_seq, missing)
         return frames
 
     @property
@@ -436,14 +441,34 @@ class SharedMemoryRingBuffer:
             "last-good frame" if self._last_good is not None else "None",
         )
 
-    def _warn_torn_read_k(self, k: int, recovered: int) -> None:
+    def _warn_torn_read_k(
+        self,
+        requested: int,
+        recovered: int,
+        snapshot_sequence: int,
+        missing: list[tuple[int, str]],
+    ) -> None:
+        """Report the final failed check per skipped slot, not persisted frame loss.
+
+        The snapshot sequence fixes the attempted range even if the writer has
+        advanced by log time. A partial ring at startup has fewer candidates
+        than requested, so the denominator counts only those attempted.
+        """
         now_ns = time.monotonic_ns()
         if now_ns - self._last_torn_warn_k_ns < TORN_WARN_INTERVAL_NS:
             return
         self._last_torn_warn_k_ns = now_ns
+        attempted = min(requested, snapshot_sequence)
         logger.warning(
-            "Shared-memory ring %s recovered %d/%d history frames",
+            "Shared-memory ring %s recovered %d/%d history frames "
+            "requested=%d sequence_range=%d..%d latest_sequence=%d "
+            "missing=[%s] (unverified slots skipped)",
             self.name,
             recovered,
-            k,
+            attempted,
+            requested,
+            snapshot_sequence - attempted + 1,
+            snapshot_sequence,
+            self.latest_sequence,
+            ", ".join(f"{sequence}:{reason}" for sequence, reason in missing),
         )
