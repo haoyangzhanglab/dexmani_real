@@ -121,11 +121,24 @@ python examples/visualize_episode_processed.py <processed.h5> --info
 并为 session 写入 resolved `run_config.yaml`。任务成功与否在离线数据审核中判断；runtime 记录
 技术停止原因和 episode 数据。
 
+Policy executor 在发布前将解码后的关节目标投影到允许范围：arm 先选择最近的周期等价角，
+再限制绝对关节位置与相邻命令的跳变；hand 限制到 operational joint bounds。
+Arm 命令连续性使用与 worker 相同的运行配置阈值；hand 的逐 tick 速率整形由 hand worker
+负责。投影后的目标仍需通过安全验证，worker 保留 SDK 边界处的最终检查。
+
+临时缺失或过期的反馈，以及上一条 arm command 尚未获 SDK acceptance，都会使当前
+executor poll 返回等待，不发布新命令、不因等待推进轨迹。等待 arm acceptance 时仍可接收
+新预测；executor 不等待 hand 精确端点的 ACK。成功发布后才正常推进，明确因时间过期的
+目标仍可跳过。IK 无可用解或实际 workspace violation 会结束当前 episode 并回到 ARMED，
+不会跳过不安全 waypoint 后继续执行后续轨迹；投影后的限位违规、非法目标或检查器异常
+仍按 FAULT 处理。既有超时与生命周期停止机制继续生效。
+
 如果 arm worker 因 command-jump 拒绝撤销当前 motion，executor 会结束当前 episode；
 这种健康运行时中的拒绝本身不会设置全局硬件故障。
 
 Recorded rollout session 额外生成与 `episode_XXX/` 同级的
-`episode_XXX.policy_trace.npz`，用于 offline prediction-to-execution debugging：
+`episode_XXX.policy_trace.npz`，其中保留 raw policy prediction；episode 的命令字段记录
+投影后实际提交的目标，可对照分析 prediction 与 execution：
 
 ```bash
 python examples/visualize_policy_rollout.py <rollout-episode> --info
@@ -217,7 +230,7 @@ rollouts/<policy>/<task>/<experiment>/session_*/
 ```
 
 raw episode 的 `action_arm_joint_sent` 保存控制端提交的 arm target，不保证每条目标都已被
-SDK 接受。命令拒绝恢复机制不改变这个字段的含义。
+SDK 接受。Policy 投影与 arm acceptance 背压不改变这个字段的含义。
 
 当前数据合同的 source of truth：
 

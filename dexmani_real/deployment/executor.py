@@ -33,7 +33,7 @@ from dexmani_real.control.publication import (
     prepare_command,
     publish_command,
 )
-from dexmani_real.control.safety_gate import SafetyGate
+from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
 from dexmani_real.deployment.config import RolloutRecordingConfig
 from dexmani_real.deployment.metrics import PolicyStats, flush_every
 from dexmani_real.deployment.policy_trace import PolicyTrace, trace_path_for_episode
@@ -223,6 +223,11 @@ def prediction_from_record(record: np.void) -> Prediction:
             "prediction action_dim must be a supported policy representation "
             f"(<= {MAX_POLICY_ACTION_DIM})"
         )
+    actions = np.array(
+        record["actions"][:num_steps, :action_dim], dtype=np.float64, copy=True
+    )
+    if not np.all(np.isfinite(actions)):
+        raise ValueError("prediction actions contain NaN/Inf")
     return Prediction(
         run_generation=int(record["run_generation"]),
         source_monotonic_ns=int(record["source_monotonic_ns"]),
@@ -230,9 +235,7 @@ def prediction_from_record(record: np.void) -> Prediction:
         inference_latency_ms=record["inference_latency_ms"],
         observation_age_ms=record["observation_age_ms"],
         observation_skew_ms=record["observation_skew_ms"],
-        actions=np.array(
-            record["actions"][:num_steps, :action_dim], dtype=np.float64, copy=True
-        ),
+        actions=actions,
     )
 
 
@@ -337,7 +340,7 @@ def _build_policy_safety_gate(runtime: ExperimentConfig) -> SafetyGate:
         hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
         hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
         workspace_check=_build_policy_workspace_check(runtime),
-        max_hand_delta_rad=float(runtime.policy.hand_max_action_jump_rad),
+        max_hand_delta_rad=None,
         endpoint_delta_tolerance_rad=float(runtime.policy.endpoint_delta_tolerance_rad),
     )
 
@@ -353,7 +356,7 @@ def decode_policy_action(
     """Interpret one already-validated flat action and perform EE IK when needed.
 
     The inference boundary owns flat shape and finite-value validation.  A
-    representational or IK failure rejects this policy step; it does not imply a
+    representational or IK failure aborts this rollout; it does not imply a
     hardware fault.
     """
     reference = (
@@ -380,28 +383,46 @@ def decode_policy_action(
     return np.asarray(result.qpos, dtype=np.float64), hand_qpos, ""
 
 
-def _validate_policy_arm_action(
+def _project_policy_targets(
     target_arm_qpos: np.ndarray,
+    target_hand_qpos: np.ndarray,
     reference_arm_qpos: np.ndarray,
     runtime: ExperimentConfig,
-) -> tuple[np.ndarray | None, str | None]:
-    """Canonicalize then reject, never clip, one learned-policy arm endpoint."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project finite physical endpoints; workers retain final SDK authority."""
+    arm = np.asarray(target_arm_qpos, dtype=np.float64)
+    hand = np.asarray(target_hand_qpos, dtype=np.float64)
+    reference = np.asarray(reference_arm_qpos, dtype=np.float64)
+    for values, shape in ((arm, (7,)), (hand, (12,)), (reference, (7,))):
+        if values.shape != shape or not np.all(np.isfinite(values)):
+            raise ValueError("policy projection requires finite joint targets/reference")
     lower = np.asarray(runtime.arm.joint_limit_lower, dtype=np.float64)
     upper = np.asarray(runtime.arm.joint_limit_upper, dtype=np.float64)
+    if np.any(reference < lower) or np.any(reference > upper):
+        raise ValueError("policy arm continuity reference is outside joint limits")
     canonical = wrap_nearest_equivalent(
-        target_arm_qpos,
-        reference_arm_qpos,
+        arm,
+        reference,
         runtime.arm.joint_limit_lower,
         runtime.arm.joint_limit_upper,
     )
-    if np.any(canonical < lower) or np.any(canonical > upper):
-        return None, "arm joint limit violation"
-
-    delta = canonical - reference_arm_qpos
-    limit = float(runtime.policy.arm_max_action_jump_rad)
-    if np.any(np.abs(delta) > limit):
-        return None, "arm action jump exceeds limit"
-    return canonical, None
+    arm = np.clip(canonical, lower, upper)
+    delta = arm - reference
+    limit = float(runtime.arm.max_servo_command_jump_rad)
+    clipped = np.abs(delta) > limit
+    arm[clipped] = reference[clipped] + np.clip(delta[clipped], -limit, limit)
+    # Addition/subtraction can round beyond the worker's strict float64 bound.
+    outside = np.abs(arm - reference) > limit
+    arm[outside] = np.nextafter(arm[outside], reference[outside])
+    if (
+        not np.all(np.isfinite(arm))
+        or np.any(arm < lower)
+        or np.any(arm > upper)
+        or np.any(np.abs(arm - reference) > limit)
+    ):
+        raise ValueError("policy arm projection violated command invariants")
+    hand = np.clip(hand, runtime.hand.qpos_min_rad, runtime.hand.qpos_max_rad)
+    return arm, hand
 
 
 def _read_command_progress(
@@ -585,7 +606,6 @@ class PolicyExecutor:
         self.last_publication_ns: int | None = None
         self.last_valid_command_ns: int | None = None
         self.previous_arm_command_qpos: np.ndarray | None = None
-        self.previous_hand_command_qpos: np.ndarray | None = None
         self.episode_steps = 0
         self.num_episodes = (
             recording_config.num_episodes if recording_config is not None else 1
@@ -605,7 +625,6 @@ class PolicyExecutor:
         self.last_publication_ns = None
         self.last_valid_command_ns = None
         self.previous_arm_command_qpos = None
-        self.previous_hand_command_qpos = None
         self.last_recorded_action = None
         self.progress.reset(generation)
 
@@ -1259,6 +1278,9 @@ class PolicyExecutor:
         self.last_seen_prediction_sequence = sequence
         if prediction.run_generation != self.run_generation:
             return True
+        if prediction.actions.shape[1] != self.policy_spec.control_action_dim:
+            self._fault("prediction action dimension conflicts with PolicySpec")
+            return False
         # Include even wholly stale chunks: their timing explains the discard.
         # Old generations and repeated ring reads never add samples.
         self.stats.inference_latency_ms = float(prediction.inference_latency_ms)
@@ -1356,16 +1378,35 @@ class PolicyExecutor:
             self.step_index = max(self.step_index, first_index)
 
     def _commit_terminal_step(self) -> None:
-        """Advance after a published or rejected control step."""
+        """Advance after successful publication (or its dry-run admission)."""
         self.episode_steps += 1
         self._advance_prediction()
 
-    def _reject_due_step(self, due_ns: int, reason: str) -> int:
+    def _abort_due_action(
+        self,
+        reason: str,
+        *,
+        reject_kind: _RejectKind,
+        raw_action: np.ndarray,
+        prediction_sequence: int | None,
+        chunk_index: int,
+        due_ns: int,
+    ) -> None:
+        """Record a terminal policy failure without committing trajectory progress."""
         terminal_ns = time.monotonic_ns()
-        self._consume_control_slot(due_ns, terminal_ns)
         self.stats.log_rejection(reason)
-        self._commit_terminal_step()
-        return terminal_ns
+        self._record_rollout_tick(
+            terminal_ns, raw_action=raw_action, reject_kind=reject_kind,
+        )
+        self._append_policy_trace(
+            "add_decision", sequence=prediction_sequence, chunk_index=chunk_index,
+            due_ns=due_ns, event_ns=terminal_ns,
+            frame_status=(
+                _RECORD_FRAME_SAFETY_REJECT if reject_kind is _RejectKind.SAFETY
+                else _RECORD_FRAME_IK_FAIL
+            ),
+        )
+        self._finish_episode(reason, aborted=True)
 
     def _decode_due_action(
         self, action: np.ndarray
@@ -1396,13 +1437,17 @@ class PolicyExecutor:
         if self.policy_spec.action_key == "action_ee" and self.ee_planner is None:
             self._fault("EE policy executor has no IK planner")
             return None, None, None
-        arm_qpos, hand_qpos, rejection = decode_policy_action(
-            action,
-            self.policy_spec,
-            np.asarray(arm_state["qpos"], dtype=np.float64),
-            previous_arm_command_qpos=self.previous_arm_command_qpos,
-            planner=self.ee_planner,
-        )
+        try:
+            arm_qpos, hand_qpos, rejection = decode_policy_action(
+                action,
+                self.policy_spec,
+                np.asarray(arm_state["qpos"], dtype=np.float64),
+                previous_arm_command_qpos=self.previous_arm_command_qpos,
+                planner=self.ee_planner,
+            )
+        except Exception as exc:
+            self._fault(f"policy action decode failed: {exc}")
+            return None, None, None
         if arm_qpos is None:
             if self.policy_spec.action_key == "action_ee":
                 self.stats.ik_rejection_count += 1
@@ -1416,12 +1461,13 @@ class PolicyExecutor:
             if self.previous_arm_command_qpos is None
             else self.previous_arm_command_qpos
         )
-        arm_qpos, rejection = _validate_policy_arm_action(
-            arm_qpos, reference_arm_qpos, self.runtime
-        )
-        if arm_qpos is None:
-            self.stats.safety_rejection_count += 1
-            return None, _RejectKind.SAFETY, rejection
+        try:
+            arm_qpos, hand_qpos = _project_policy_targets(
+                arm_qpos, hand_qpos, reference_arm_qpos, self.runtime
+            )
+        except Exception as exc:
+            self._fault(f"policy target projection failed: {exc}")
+            return None, None, None
         return (arm_qpos, hand_qpos), None, None
 
     def _publish_due_action(
@@ -1439,19 +1485,13 @@ class PolicyExecutor:
             if bool(self.shared.error_state.value):
                 return
             if decode_rejection is not None:
-                terminal_ns = self._reject_due_step(due_ns, decode_rejection)
-                self._record_rollout_tick(
-                    terminal_ns,
+                assert reject_kind is not None
+                self._abort_due_action(
+                    decode_rejection,
                     raw_action=action,
                     reject_kind=reject_kind,
-                )
-                self._append_policy_trace(
-                    "add_decision", sequence=prediction_sequence,
-                    chunk_index=chunk_index, due_ns=due_ns, event_ns=terminal_ns,
-                    frame_status=(
-                        _RECORD_FRAME_SAFETY_REJECT if reject_kind is _RejectKind.SAFETY
-                        else _RECORD_FRAME_IK_FAIL
-                    ),
+                    prediction_sequence=prediction_sequence,
+                    chunk_index=chunk_index, due_ns=due_ns,
                 )
             return
         arm_qpos, hand_qpos = decoded
@@ -1469,27 +1509,24 @@ class PolicyExecutor:
             self._advance_prediction()
             self.stats.stale_prediction_count += 1
             return
-        prepared = prepare_command(
-            self.shared,
-            candidate,
-            gate=self.gate,
-            arm_feedback_max_age_s=float(self.runtime.safety.heartbeat_timeouts["arm"]),
-            hand_feedback_max_age_s=float(
-                self.runtime.safety.heartbeat_timeouts["hand"]
-            ),
-            hand_delta_reference_qpos=self.previous_hand_command_qpos,
-            hand_mechanical_lower_rad=np.asarray(
-                self.runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
-            ),
-            hand_mechanical_upper_rad=np.asarray(
-                self.runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
-            ),
-            canonicalize_policy_hand_roundoff=True,
-        )
+        try:
+            prepared = prepare_command(
+                self.shared,
+                candidate,
+                gate=self.gate,
+                arm_feedback_max_age_s=float(
+                    self.runtime.safety.heartbeat_timeouts["arm"]
+                ),
+                hand_feedback_max_age_s=float(
+                    self.runtime.safety.heartbeat_timeouts["hand"]
+                ),
+            )
+        except Exception as exc:
+            self._fault(f"policy command preparation failed: {exc}")
+            return
         if not prepared.accepted:
             self._handle_preparation_rejection(
                 prepared,
-                candidate,
                 due_ns,
                 raw_action=action,
                 prediction_sequence=prediction_sequence,
@@ -1540,7 +1577,6 @@ class PolicyExecutor:
         assert published_candidate.arm_qpos is not None
         assert published_candidate.hand_qpos is not None
         self.previous_arm_command_qpos = published_candidate.arm_qpos.copy()
-        self.previous_hand_command_qpos = published_candidate.hand_qpos.copy()
         self._consume_control_slot(due_ns, publication_ns)
         if self.last_publication_ns is not None:
             interval_ms = (publication_ns - self.last_publication_ns) / 1e6
@@ -1561,7 +1597,6 @@ class PolicyExecutor:
     def _handle_preparation_rejection(
         self,
         prepared: PreparedCommand,
-        candidate: ActionCandidate,
         due_ns: int,
         *,
         raw_action: np.ndarray,
@@ -1573,20 +1608,16 @@ class PolicyExecutor:
         if prepared.fatal:
             self._fault(prepared.reason or "physical safety check failed")
             return
-        if prepared.gate_code is not None or candidate.hand_qpos is not None:
-            self.stats.safety_rejection_count += 1
-        terminal_ns = self._reject_due_step(
-            due_ns, prepared.reason or "physical safety rejection"
-        )
-        self._record_rollout_tick(
-            terminal_ns,
+        if prepared.gate_code is not GateRejectCode.WORKSPACE:
+            self._fault(prepared.reason or "post-projection safety invariant failed")
+            return
+        self.stats.safety_rejection_count += 1
+        self._abort_due_action(
+            prepared.reason or "policy workspace violation",
             raw_action=raw_action,
             reject_kind=_RejectKind.SAFETY,
-        )
-        self._append_policy_trace(
-            "add_decision", sequence=prediction_sequence, chunk_index=chunk_index,
-            due_ns=due_ns, event_ns=terminal_ns,
-            frame_status=_RECORD_FRAME_SAFETY_REJECT,
+            prediction_sequence=prediction_sequence,
+            chunk_index=chunk_index, due_ns=due_ns,
         )
 
     def _handle_publication_rejection(self, result: PublishResult) -> None:
@@ -1659,6 +1690,14 @@ class PolicyExecutor:
         if due is None:
             return
         action, scheduled_target_ns, due_ns = due
+        # Align the previous published reference with the worker's SDK-accepted
+        # target before another latest-wins publication can supersede it.
+        latest = self.progress.latest_published_action_id
+        arm_accepted = self.progress.arm_accepted_action_id
+        if self.execute and latest is not None and (
+            arm_accepted is None or arm_accepted < latest
+        ):
+            return
         self._publish_due_action(
             action,
             scheduled_target_ns=scheduled_target_ns,

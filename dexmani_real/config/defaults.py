@@ -642,12 +642,6 @@ class PolicyParams:
 
     # Teleop endpoint shaping bound per control tick; this is not arm interpolation.
     teleop_arm_max_delta_rad_per_tick: float | None = np.deg2rad(8.0)
-    # Learned-policy-only arm endpoint jump reject threshold. The arm worker owns
-    # its separate final command-jump guard at the SDK boundary.
-    arm_max_action_jump_rad: float = np.deg2rad(20.0)
-    # Learned-policy hand actions are rejected, never shaped, when any joint
-    # jumps farther than this experimentally selected threshold.
-    hand_max_action_jump_rad: float = 1.0
     # Shared numerical slack for the reject-only endpoint-delta predicate.
     # Keep this tiny: it admits producer round-off at the limit without
     # weakening a materially oversized command.
@@ -741,16 +735,6 @@ class PolicyParams:
             raise ValueError(
                 "teleop_arm_max_delta_rad_per_tick must be finite and > 0 or None"
             )
-        if (
-            not np.isfinite(self.arm_max_action_jump_rad)
-            or self.arm_max_action_jump_rad <= 0
-        ):
-            raise ValueError("arm_max_action_jump_rad must be finite and positive")
-        if (
-            not np.isfinite(self.hand_max_action_jump_rad)
-            or self.hand_max_action_jump_rad <= 0
-        ):
-            raise ValueError("hand_max_action_jump_rad must be finite and positive")
         if (
             isinstance(self.endpoint_delta_tolerance_rad, bool)
             or not np.isfinite(self.endpoint_delta_tolerance_rad)
