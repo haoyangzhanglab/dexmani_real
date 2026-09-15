@@ -1,12 +1,14 @@
 # DexMani Real
 
-DexMani Real 是面向灵巧操作研究的真实机器人运行时，覆盖 xArm7、XHand、
-Quest/HTS 手部跟踪与 RealSense RGB-D，主要用于遥操作与数据采集、物理回放、
-离线数据处理、learned-policy rollout 和标定。
+DexMani Real 是面向灵巧操作研究的真实机器人运行时，覆盖 xArm7、XHand、Quest/HTS 手部跟踪与 RealSense RGB-D，主要用于：
 
-> **安全提示**：这是会连接并控制真实硬件的软件。运行任何可能连接设备、驱动机器人、
-> home、replay、policy rollout 或写入标定的命令前，应先确认工作空间、标定、急停状态和
-> 操作者授权。不要把 `examples/` 下的脚本默认当成离线工具；先看该入口的 docstring/`--help`。
+- VR / keyboard teleoperation 与数据采集；
+- raw episode 的物理回放、离线处理与 Policy Zarr 导出；
+- learned-policy 在真实机器人上的 rollout；
+- camera / VR 标定；
+- 机器人 runtime、IPC、recording 与 safety boundary 的统一管理。
+
+> **安全提示**：这是会连接并控制真实硬件的软件。运行任何可能连接设备、驱动机器人、home、replay、policy rollout 或写入标定的命令前，应先确认工作空间、标定、急停状态和操作者授权。不要把 `examples/` 下的脚本默认当成离线工具；先阅读对应入口的 docstring 或 `--help`。
 
 ## 环境与安装
 
@@ -16,11 +18,9 @@ Quest/HTS 手部跟踪与 RealSense RGB-D，主要用于遥操作与数据采集
 python -m pip install -e .
 ```
 
-`pyproject.toml` 提供通用 Python 依赖。xArm、XHand、RealSense、HTS、运动学/规划以及
-learned-policy 相关工作流还需要各自的外部 SDK 或研究依赖，请按实际任务安装。
+`pyproject.toml` 提供通用 Python 依赖。xArm、XHand、RealSense、HTS、运动学/规划以及 learned-policy 工作流还需要各自的外部 SDK 或研究依赖，请按实际任务安装。
 
-运行时配置由 [`dexmani_real/config/experiment.py`](dexmani_real/config/experiment.py) 统一解析，
-覆盖优先级为：
+运行时配置由 [`dexmani_real/config/experiment.py`](dexmani_real/config/experiment.py) 统一解析，覆盖优先级为：
 
 ```text
 CLI override > YAML file > dexmani_real/config/defaults.py
@@ -43,44 +43,45 @@ python examples/collect_teleop.py --print-config
 | 物理回放 | `python examples/replay_episode.py <episode>` | 是 | 物理 replay 与 replay evaluation 结果 |
 | 离线 episode 处理 | `python examples/process_episodes.py episodes/<task> --dry-run` | 否 | 审计；去掉 `--dry-run` 后发布 processed HDF5 |
 | Policy Zarr 导出 | `python examples/export_policy_zarr.py episodes_processed/<task> --dry-run` | 否 | 预检；去掉 `--dry-run` 后发布 `datasets/<task>.zarr` |
-| Learned-policy rollout | `python examples/run_policy.py <policy/task/experiment>` | 是 | `rollouts/.../session_*` 下的记录与 resolved run config |
+| Learned-policy rollout | `python examples/run_policy.py <policy/task/experiment>` | 是 | `rollouts/.../session_*` 下的 rollout、trace 与 resolved run config |
 | Camera 标定 | `python examples/calibrate_camera.py --hand-geometry {absent,secured-home}` | 是 | xArm/RealSense eye-to-hand 标定并更新 camera calibration |
 | VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 仅 HTS/VR | 更新 `dexmani_real/config/vr_transform.json`；不控制机器人 |
 
-### VR 遥操作与采集
+## 遥操作与采集
 
-`collect_teleop.py` 可以控制 xArm7/XHand，并在 recording 启用时将 raw episode 写入
-`episodes/<task>/episode_*`。需要只调试 arm 时使用该入口提供的显式 `--no-hand`；需要关闭
-recording 时使用 `--no-record`。两者的准确语义和其余参数以脚本 `--help` 为准。
+### VR 遥操作
 
-如果 arm worker 拒绝了不连续的关节目标，当前 run 会进入静默暂停，受影响的当前录制会被
-丢弃。此时 `C` 不能恢复该 run；需要重新按 `B` 开始新的 run，并从新反馈建立控制参考。
+`collect_teleop.py` 可以控制 xArm7/XHand，并在 recording 启用时将 raw episode 写入：
+
+```text
+episodes/<task>/episode_*
+```
+
+只调试 arm 时使用该入口提供的显式 `--no-hand`；关闭 recording 时使用 `--no-record`。准确语义和其余参数以脚本 `--help` 为准。
+
+若 arm worker 在 SDK boundary 拒绝不连续目标，当前 motion 会被撤销，控制参考必须从新的有效 feedback 重新建立；不要把未被 robot 接受的 target 当作已经执行。
 
 ### 键盘遥操作
 
-`keyboard_teleop.py` 使用 WASD/方向键/IJKL 进行 Cartesian jog。持续按键时，目标的前瞻距离
-相对实测位姿受限；正常释放按键后，控制端会去抖并有界等待最后一个目标被 arm SDK 接受，
-再结束当前 motion epoch。
+`keyboard_teleop.py` 使用 WASD / 方向键 / IJKL 进行 Cartesian jog。连续按键时，target 基于最新实测状态生成；正常释放按键后，控制端有界等待最后一个 arm target 的 acceptance，再结束当前 motion epoch。
 
-IK 或普通安全拒绝会结束当前 epoch，并从实测反馈重新建立参考。必须先释放所有 jog keys，
-再重新按键才能继续；`W+S` 等相反方向按键即使净位移为零，也不算释放，增加 `SPACE` 等
-其它按键同样不能解除阻塞。
+IK、安全检查或 command acceptance 失败会结束当前 epoch。继续 jog 前应先释放当前按键组合，再重新输入命令。
 
-### 物理回放
+## 物理回放
 
 `replay_episode.py` 会把已记录轨迹真正发送到机器人，属于 hardware-affecting workflow。
-它可以读取当前 raw episode，也可以通过脚本公开的 processed 模式回放 processed selection：
+
+它可以读取 raw episode，也可以通过 processed 模式回放 processed selection：
 
 ```bash
 python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed
 ```
 
-运行前必须按真实机器人流程确认起始状态、碰撞环境和急停条件。
+运行前必须确认真实机器人起始状态、碰撞环境和急停条件。
 
-回放期间若 arm command-jump 拒绝撤销了 motion，而 runtime 与反馈仍健康，回放以
-`REJECTED` 结束，不自动重试，也不因此升级为硬件 `FAULT`。回放仍按录制帧率和发送计划执行。
+如果 command 被 runtime/worker 拒绝，replay 不会把该失败伪装成成功执行，也不会自动跳过后继续补执行未来轨迹。硬件/controller fault 仍使用现有 fail-closed 路径。
 
-### 离线数据处理与导出
+## 离线数据处理与导出
 
 推荐先做只读 preflight：
 
@@ -97,8 +98,8 @@ python examples/export_policy_zarr.py episodes_processed/<task>
 ```
 
 processing 不修改原始 raw episode；export 从已验证的 processed HDF5 生成 policy Zarr。
-当前 schema version、字段、dtype、shape 与 validation contract 由代码中的 schema/validator
-定义，不在 README 复制一份易漂移的快照。
+
+当前 schema version、字段、dtype、shape 与 validation contract 由代码中的 schema / validator 定义，README 不复制易漂移的结构快照。
 
 ### 离线检查
 
@@ -109,52 +110,70 @@ python examples/visualize_episode.py <raw-episode> --info
 python examples/visualize_episode_processed.py <processed.h5> --info
 ```
 
-去掉 `--info` 会打开对应的 Rerun viewer；完整参数以脚本 `--help` 为准。
+去掉 `--info` 会打开对应 viewer；完整参数以脚本 `--help` 为准。
 
-### Learned-policy rollout
+## Learned-policy rollout
 
-`run_policy.py` 运行一个 persistent recorded policy session。当前 CLI 直接以
-`<policy/task/experiment>` 选择实验，并支持 artifact、inference steps、`--replan-steps`、seed、episode 数量、
-每个 episode 的运行时长预算和 device 等参数；完整接口以 `--help` 为准。
+`run_policy.py` 运行 persistent recorded policy session，通过：
 
-该入口 **始终连接真实硬件**。它会在启动 actuator/camera worker 之前先准备 inference child，
-并为 session 写入 resolved `run_config.yaml`。任务成功与否在离线数据审核中判断；runtime 记录
-技术停止原因和 episode 数据。
+```text
+<policy/task/experiment>
+```
 
-Policy executor 在发布前将解码后的关节目标投影到允许范围：arm 先选择最近的周期等价角，
-再限制绝对关节位置与相邻命令的跳变；hand 限制到 operational joint bounds。
-Arm 命令连续性使用与 worker 相同的运行配置阈值；hand 的逐 tick 速率整形由 hand worker
-负责。投影后的目标仍需通过安全验证，worker 保留 SDK 边界处的最终检查。
+选择相邻 `dexmani_policy` 中的 deployment experiment，并支持 artifact、inference steps、`--replan-steps`、seed、episode 数量、单 episode 运行时长和 device 等参数。
 
-临时缺失或过期的反馈，以及上一条 arm command 尚未获 SDK acceptance，都会使当前
-executor poll 返回等待，不发布新命令、不因等待推进轨迹。等待 arm acceptance 时仍可接收
-新预测；executor 不等待 hand 精确端点的 ACK。成功发布后才正常推进，明确因时间过期的
-目标仍可跳过。IK 无可用解或实际 workspace violation 会结束当前 episode 并回到 ARMED，
-不会跳过不安全 waypoint 后继续执行后续轨迹；投影后的限位违规、非法目标或检查器异常
-仍按 FAULT 处理。既有超时与生命周期停止机制继续生效。
+例如：
 
-如果 arm worker 因 command-jump 拒绝撤销当前 motion，executor 会结束当前 episode；
-这种健康运行时中的拒绝本身不会设置全局硬件故障。
+```bash
+python examples/run_policy.py <policy/task/experiment> \
+  --num-episodes 2 \
+  --inference-steps 4 \
+  --seed 0
+```
 
-Recorded rollout session 额外生成与 `episode_XXX/` 同级的
-`episode_XXX.policy_trace.npz`，其中保留 raw policy prediction；episode 的命令字段记录
-投影后实际提交的目标，可对照分析 prediction 与 execution：
+该入口 **始终连接真实硬件**。session 会写入 resolved `run_config.yaml`；任务成功与否应在离线数据审核中判断，runtime 只记录技术停止原因与 rollout 数据。
+
+### Policy action safety semantics
+
+Learned-policy action 在真正进入 command publication 前先经过 physical-space shaping 和现有 safety validation。当前稳定语义是：
+
+| 情况 | Runtime 行为 |
+|---|---|
+| 可安全修正的 joint / continuity 超界 | 在 physical action space 中 project/clip，再验证并发布 |
+| 上一条 arm command 尚未被 worker 接受 | 等待；不发布下一条 arm command，不伪造执行进度 |
+| feedback 暂时不可用或 stale | 等待；保持当前 trajectory state |
+| action 因 wall-clock timing 已过期 | 按 timing stale 语义跳过 |
+| EE IK 无可用解或实际 workspace violation | 结束当前 rollout，撤销到 `ARMED` |
+| malformed target、post-projection invariant failure、SDK/controller/hardware fault | fail closed，进入现有 fault path |
+
+Normal policy trajectory 只有在 command 成功进入 publication boundary 后才正常推进；**physical safety failure 不再等价于“跳过这个 waypoint，然后执行更未来的 waypoint”**。
+
+Arm 的最终 command-continuity guard 仍由 arm worker 在 SDK boundary 持有；XHand 的逐 tick rate limiting 仍由 hand worker 持有。Policy executor 不复制底层 dynamics controller。
+
+### Rollout diagnostics
+
+Recorded policy session 使用独立目录：
+
+```text
+rollouts/<policy>/<task>/<experiment>/session_*/
+```
+
+每个 saved rollout 还会生成对应的 policy trace，保留 raw policy prediction；episode action 字段记录实际提交给 runtime 的 action target，因此可以对照 prediction 与 execution：
 
 ```bash
 python examples/visualize_policy_rollout.py <rollout-episode> --info
 ```
 
-### Camera 标定
+这一区分很重要：生成模型输出可以超出 command envelope，而 runtime projection/validation 不应掩盖模型本身的分布质量问题。
 
-`--hand-geometry` 是必须由操作者显式给出的物理状态声明，而不是 geometry selector：
-`absent` 仅用于没有安装 XHand；`secured-home` 仅用于已安装且物理固定在 configured home 的
-XHand。当前 calibration collision checks 在两种声明下都使用 canonical fixed-home XHand
-envelope，因此 `absent` 是保守建模。未来若引入经过验证的 arm-only collision model，这一用户
-接口语义也必须同步更新。
+## Camera 标定
 
-标定 jog 每次从最新实测末端位姿提出一个平移/旋转增量，不跨 tick 累积 Cartesian 目标。
-每条命令都等待 arm SDK acceptance，成功后才更新命令参考。IK、安全检查、发布或 acceptance
-拒绝后，当前 motion epoch 结束；与键盘遥操作一样，必须释放所有 jog keys 后重新按键。
+`calibrate_camera.py` 的 `--hand-geometry` 是操作者对真实物理状态的显式声明：
+
+- `absent`：未安装 XHand；
+- `secured-home`：已安装且物理固定在 configured home。
+
+标定 jog 从最新实测末端状态生成下一条增量 command；IK、安全检查、publication 或 acceptance 失败时结束当前 motion epoch，而不是继续累计未执行目标。
 
 ## 核心架构
 
@@ -185,30 +204,22 @@ control-step recording → raw episode
 raw episode → offline processing → processed HDF5 → Policy Zarr
 ```
 
-长期应保持的边界只有少数几条：
+长期边界：
 
-- runtime 配置从 [`dexmani_real/config/`](dexmani_real/config) 的 canonical 定义解析；
-- 跨进程通信与 shared-memory contract 由 [`dexmani_real/ipc/`](dexmani_real/ipc) 持有；
-- live device/SDK state 留在对应 robot/sensor owner 中；
-- teleop、replay 和 deployment 产生动作意图，安全与 command publication 由
-  [`dexmani_real/control/`](dexmani_real/control) 的边界负责；
-- arm worker 拥有 SDK 边界处的最终命令连续性判断：同一 motion generation 参考上次 SDK
-  接受的目标，新 generation 参考实测关节位置。超限目标不会进入 SDK；拒绝只原子撤销仍然
-  当前有效的命令，不影响已取代它的新命令；
-- recording 负责持久化数据，不拥有机器人动作决策；
-- learned-policy 集成通过相邻 `dexmani_policy` 的 public deployment contract 完成，而不是依赖
-  其私有 artifact 实现。
+- runtime 配置由 [`dexmani_real/config/`](dexmani_real/config) 持有并统一解析；
+- IPC / shared-memory contract 由 [`dexmani_real/ipc/`](dexmani_real/ipc) 持有；
+- live SDK/device state 留在对应 robot/sensor owner 中；
+- teleop、replay、deployment 产生动作意图，`control/` 与 worker boundary 负责 admission、publication 和最终硬件检查；
+- arm worker 使用最后 SDK-accepted target 保持 command continuity；新 motion generation 从最新 measured state 重建参考；
+- hand worker 负责 XHand 的 hardware-bound validation 与逐 tick command shaping；
+- recording 只负责持久化，不拥有机器人动作决策；
+- learned-policy 集成只依赖相邻 `dexmani_policy` 的 public deployment contract。
 
-更细的 concurrency、freshness、schema、error-code 和 scheduling 语义属于当前 source，修改代码时
-应直接追踪实际 producer/consumer，而不是依赖 README 中的历史描述。
-
-Command-jump 拒绝建立软件 ARMED 边界，允许操作者开始新 run；非有限目标、到达 worker 的
-关节限位违规、SDK/controller 错误和无效硬件反馈仍按故障处理。软件撤销不会回滚已经被 SDK
-接受的运动，SDK acceptance 也不表示机械臂已经到达目标。
+更细的 concurrency、timeout、schema、error-code 和 scheduling 实现属于当前 source；修改这些路径时应直接追踪 producer → representation → consumer → side effect，而不是依赖 README 中的历史描述。
 
 ## 数据与输出
 
-主要数据流为：
+主要数据流：
 
 ```text
 episodes/<task>/episode_*/
@@ -223,24 +234,20 @@ episodes_processed/<task>/episode_*.h5
 datasets/<task>.zarr
 ```
 
-learned-policy rollout 使用独立的：
+Learned-policy rollout 使用独立的：
 
 ```text
 rollouts/<policy>/<task>/<experiment>/session_*/
 ```
 
-raw episode 的 `action_arm_joint_sent` 保存控制端提交的 arm target，不保证每条目标都已被
-SDK 接受。Policy 投影与 arm acceptance 背压不改变这个字段的含义。
-
 当前数据合同的 source of truth：
 
 - raw episode schema：[`dexmani_real/recording/storage/schema.py`](dexmani_real/recording/storage/schema.py)
-- processed contract/validation：[`dexmani_real/dataset/`](dexmani_real/dataset)
+- processed contract / validation：[`dexmani_real/dataset/`](dexmani_real/dataset)
 - Policy Zarr export：[`dexmani_real/dataset/export.py`](dexmani_real/dataset/export.py)
-- runtime/IPC wire contract：[`dexmani_real/ipc/`](dexmani_real/ipc)
+- runtime / IPC wire contract：[`dexmani_real/ipc/`](dexmani_real/ipc)
 
-历史数据迁移、一次性 salvage、实验统计和 incident 记录不属于 README 的长期接口；需要追溯时使用
-Git history、issue/PR 或实验产物。
+历史 migration、一次性 salvage、实验统计和 incident 记录不属于 README 的长期接口；需要追溯时使用 Git history、issue/PR 或实验产物。
 
 ## Repository Layout
 
@@ -265,8 +272,7 @@ examples/           # user-facing entry points and diagnostics
 assets/             # robot/resources used by the runtime
 ```
 
-针对 coding agent 的仓库级工程与安全契约见 [`AGENTS.md`](AGENTS.md)。实现事实以当前 source、
-schemas 和 resolved configuration 为准。
+针对 coding agent 的仓库级工程与安全契约见 [`AGENTS.md`](AGENTS.md)。实现事实以当前 source、schemas 和 resolved configuration 为准。
 
 ## 开发与验证
 
@@ -278,5 +284,4 @@ git diff --check
 git status --short
 ```
 
-如果修改的子系统有现成的 focused offline validation，应按实际风险运行。不要把 example 程序当作
-测试，也不要因为离线检查通过就声称完成了真实硬件验证。
+如果修改的子系统有现成的 focused offline validation，应按实际风险运行。不要把 example 程序当作测试，也不要因为离线检查通过就声称完成了真实硬件验证。
