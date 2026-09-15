@@ -70,8 +70,15 @@ class CalibrationConfig:
     delta_pos_m: float = 0.008
     delta_rpy_rad: float = 0.03
     status_interval_frames: int = 50
+    command_lookahead_frames: int = 3
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.command_lookahead_frames, int)
+            or isinstance(self.command_lookahead_frames, bool)
+            or self.command_lookahead_frames < 1
+        ):
+            raise ValueError("command_lookahead_frames must be an integer >= 1")
         if not isinstance(self.min_samples, int) or self.min_samples < 3:
             raise ValueError("min_samples must be at least 3")
         positive_fields = (

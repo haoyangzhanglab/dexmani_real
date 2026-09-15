@@ -510,8 +510,9 @@ def _end_policy_run(
             revoke_motion(shared, SafetyState.FAULT)
             aborted = True
             logger.critical("executor: failed to fence episode into ARMED (%s)", reason)
+    stats.flush(prefix="executor final metrics", debug=True)
+    stats.log_summary()
     if aborted:
-        stats.flush(prefix="executor metrics")
         logger.warning("executor: policy episode ended: %s", reason)
     else:
         logger.info("executor: policy episode ended: %s", reason)
@@ -700,7 +701,7 @@ class PolicyExecutor:
             )
         elif self.recorder is not None and self.recorder.is_recording:
             self.recorder.stop_episode(save=False, reason=stop_reason)
-        self.stats.flush(prefix="executor metrics")
+        self.stats.flush(prefix="executor metrics", debug=True)
         logger.critical("executor: runtime fault: %s", reason)
         self.run_started_ns = None
         self._clear_execution(None)
@@ -858,7 +859,7 @@ class PolicyExecutor:
                 f"Episode {self.completed_episodes}/{self.num_episodes} saved",
                 flush=True,
             )
-            logger.info(
+            logger.debug(
                 "executor: rollout episode saved: %s", result.path or "<unknown>"
             )
             if self.completed_episodes >= self.num_episodes:
@@ -1107,6 +1108,7 @@ class PolicyExecutor:
             self.shared.physical_home_completed.value = False
         self.run_started_ns = epoch.started_monotonic_ns
         self.stats = PolicyStats()
+        self.last_metrics_flush_ns = epoch.started_monotonic_ns
         self.next_record_ns = epoch.started_monotonic_ns + self.step_dt_ns
         self.episode_steps = 0
         self._clear_execution(epoch.generation)
@@ -1115,7 +1117,7 @@ class PolicyExecutor:
             f"Episode {self.completed_episodes + 1}/{self.num_episodes} RUNNING",
             flush=True,
         )
-        logger.info("policy_executor_loop: RUNNING generation=%d", epoch.generation)
+        logger.debug("policy_executor_loop: RUNNING generation=%d", epoch.generation)
 
     def _handle_run_boundary(self) -> None:
         if not self._poll_recorder():
@@ -1361,7 +1363,7 @@ class PolicyExecutor:
     def _reject_due_step(self, due_ns: int, reason: str) -> int:
         terminal_ns = time.monotonic_ns()
         self._consume_control_slot(due_ns, terminal_ns)
-        logger.warning("executor: rejected policy step: %s", reason)
+        self.stats.log_rejection(reason)
         self._commit_terminal_step()
         return terminal_ns
 
@@ -1683,11 +1685,12 @@ class PolicyExecutor:
                     self._run_active_tick(time.monotonic_ns())
                     if self.run_started_ns is not None:
                         self._record_rollout_tick(time.monotonic_ns())
-                self.last_metrics_flush_ns = flush_every(
-                    self.stats,
-                    last_ns=self.last_metrics_flush_ns,
-                    prefix="executor metrics",
-                )
+                        self.last_metrics_flush_ns = flush_every(
+                            self.stats,
+                            last_ns=self.last_metrics_flush_ns,
+                            prefix="executor metrics",
+                            debug=True,
+                        )
                 rate.wait()
         finally:
             # A runtime stop can end the loop before its next boundary poll.
@@ -1702,7 +1705,6 @@ class PolicyExecutor:
                     self._complete_recording(result)
                 else:
                     logger.error("rollout recording finalization timed out")
-            self.stats.flush(prefix="executor metrics")
 
 
 def policy_executor_loop(

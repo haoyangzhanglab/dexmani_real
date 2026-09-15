@@ -388,7 +388,7 @@ def run_policy_deployment(
                 "rollout max_running_s must match its recording contract"
             )
         max_running_s = recording_config.max_running_s
-    logger.info(
+    logger.debug(
         "policy deployment: experiment=%s runtime=%s device=%s seed=%s execute=%s",
         worker_config.experiment,
         FIXED_POLICY_RUNTIME_TARGET,

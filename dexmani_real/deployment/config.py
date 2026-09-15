@@ -8,6 +8,7 @@ identity into the spawned worker; it never imports Policy or Torch.
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -135,9 +136,7 @@ def _validate_field_semantics(
             raise ValueError(f"{field_name} {key} mismatch")
 
 
-def _expected_pointcloud_semantics(runtime: Any) -> dict[str, str]:
-    table = runtime.environment.table
-    table_plane = table.plane_abcd if table.enabled else None
+def _expected_pointcloud_semantics() -> dict[str, str]:
     return {
         "representation": "xyzrgb",
         "frame": "xarm_base",
@@ -145,18 +144,6 @@ def _expected_pointcloud_semantics(runtime: Any) -> dict[str, str]:
         "color_order": "rgb",
         "color_source": POINT_CLOUD_COLOR_SOURCE,
         "policy_id": POINT_CLOUD_POLICY_ID,
-        "table_plane_abcd_json": canonical_json(table_plane),
-        # Full numeric derivation config, byte-identical to the persisted
-        # processing_config_json attr (same structure, same canonical_json), so
-        # any physics-changing point-cloud drift fails the exact compare.
-        "processing_config_json": canonical_json(
-            {
-                "pointcloud": runtime.pointcloud.to_dict(),
-                "table_plane_abcd": (
-                    None if table_plane is None else list(table_plane)
-                ),
-            }
-        ),
         "sampling": POINT_CLOUD_SAMPLING,
         "transform": POINT_CLOUD_TRANSFORM,
     }
@@ -275,8 +262,21 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
         _validate_field_semantics(
             point_cloud,
             field_name="point_cloud",
-            expected=_expected_pointcloud_semantics(runtime),
+            expected=_expected_pointcloud_semantics(),
         )
+        # The persisted plane records dataset calibration. Live perception uses
+        # the current calibrated plane; only processing settings must match.
+        try:
+            processing = json.loads(point_cloud.semantics.get("processing_config_json"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("point_cloud processing_config_json mismatch") from exc
+        if (
+            not isinstance(processing, dict)
+            or set(processing) != {"pointcloud", "table_plane_abcd"}
+            or canonical_json(processing["pointcloud"])
+            != canonical_json(runtime.pointcloud.to_dict())
+        ):
+            raise ValueError("point_cloud processing_config_json mismatch")
     fingertip_points = fields_by_name.get("fingertip_points")
     if fingertip_points is not None:
         _validate_field_semantics(

@@ -13,7 +13,11 @@ from scipy.spatial.transform import Rotation
 from dexmani_real.calibration.camera.solver import CalibrationConfig, CalibrationSamples
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.control.arm_homing import ArmHomeConfig, execute_arm_home
-from dexmani_real.control.jog import any_jog_key_held, compute_cartesian_jog_delta
+from dexmani_real.control.jog import (
+    any_jog_key_held,
+    compute_cartesian_jog_delta,
+    limit_cartesian_pose_lead,
+)
 from dexmani_real.control.publication import (
     prepare_joint_command,
     publish_command,
@@ -301,7 +305,7 @@ def run_calibration_motion_tick(
     state: CalibrationLoopState,
     calib_cfg: CalibrationConfig,
 ) -> None:
-    """Propose one measured-relative jog step, committing only after arm ACK."""
+    """Advance from the arm-ACK anchor with measured-pose bounded lookahead."""
     active_keys = keys.pressed_keys()
     if state.blocked_until_release:
         if not any_jog_key_held(active_keys):
@@ -339,20 +343,30 @@ def run_calibration_motion_tick(
             return
 
     measured_pose = planner.kin.compute_eef_pose_world(state.current_qpos)
+    anchor_pose = planner.kin.compute_eef_pose_world(state.previous_command)
     workspace_margin_m = float(runtime.keyboard_teleop.workspace_command_margin_m)
     command_low = workspace[:, 0] + workspace_margin_m
     command_high = workspace[:, 1] - workspace_margin_m
-    desired_pos = measured_pose.p + dx
+    desired_pos = anchor_pose.p + dx
     proposed_pos = np.clip(desired_pos, command_low, command_high)
     state.last_boundary_warning_s = _log_workspace_clipping(
         desired_pos,
         proposed_pos,
         state.last_boundary_warning_s,
     )
-    proposed_quat = measured_pose.q.copy()
+    proposed_quat = anchor_pose.q.copy()
     if np.any(drpy != 0.0):
         delta_quat = Rotation.from_euler("xyz", drpy).as_quat(scalar_first=True)
         proposed_quat = quat_multiply(delta_quat, proposed_quat)
+
+    proposed_pos, proposed_quat = limit_cartesian_pose_lead(
+        measured_pose.p,
+        measured_pose.q,
+        proposed_pos,
+        proposed_quat,
+        max_position_lead_m=calib_cfg.command_lookahead_frames * calib_cfg.delta_pos_m,
+        max_rotation_lead_rad=calib_cfg.command_lookahead_frames * calib_cfg.delta_rpy_rad,
+    )
 
     ik_result = planner.solve_teleop_ik(
         Pose(p=proposed_pos, q=proposed_quat),

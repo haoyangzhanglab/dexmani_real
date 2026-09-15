@@ -142,7 +142,7 @@ def inference_loop(
         fingertip_runtime = build_fingertip_runtime(config.spec, fingertip_config)
         warmup_samples = 5
         timings_s = runtime.warmup(samples=warmup_samples)
-        logger.info(
+        logger.debug(
             "inference warmup: samples_ms=%s",
             ",".join(
                 f"{value * 1e3:.3f}"
@@ -160,7 +160,7 @@ def inference_loop(
     shared.set_ready("inference")
     # Refresh the heartbeat after model loading, which may exceed the timeout.
     shared.set_heartbeat("inference", time.monotonic())
-    logger.info("inference_loop: ready (runtime=%s)", FIXED_POLICY_RUNTIME_TARGET)
+    logger.debug("inference_loop: ready (runtime=%s)", FIXED_POLICY_RUNTIME_TARGET)
 
     step_dt_ns = int(round(float(config.spec.control_dt_s) * 1e9))
     inference_period_ns = int(policy.replan_steps) * step_dt_ns
@@ -281,4 +281,4 @@ def inference_loop(
             runtime.close()
         except Exception:
             logger.warning("inference: runtime.close raised", exc_info=True)
-        logger.info("inference_loop: exited")
+        logger.debug("inference_loop: exited")

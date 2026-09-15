@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dexmani_real.utils.log import get_logger
 
@@ -25,6 +25,33 @@ class PolicyStats:
     command_progress_timeout_count: int = 0
     ik_rejection_count: int = 0
     stale_prediction_count: int = 0
+    rejection_reasons: dict[str, int] = field(default_factory=dict)
+
+    def log_rejection(self, reason: str) -> None:
+        """Show each cause once per episode; keep every rejection in the file log."""
+        count = self.rejection_reasons.get(reason, 0) + 1
+        self.rejection_reasons[reason] = count
+        if count == 1:
+            logger.warning(
+                "executor: rejected policy step: %s (repeats summarized at episode end)",
+                reason,
+            )
+        else:
+            logger.debug("executor: rejected policy step: %s (count=%d)", reason, count)
+
+    def log_summary(self) -> None:
+        """Report episode counts without presenting old timings as live metrics."""
+        logger.info(
+            "executor summary: safety_rejections=%d ik_rejections=%d "
+            "stale_predictions=%d command_progress_timeouts=%d%s",
+            self.safety_rejection_count,
+            self.ik_rejection_count,
+            self.stale_prediction_count,
+            self.command_progress_timeout_count,
+            " | " + "; ".join(
+                f"{reason}: {count}" for reason, count in self.rejection_reasons.items()
+            ) if self.rejection_reasons else "",
+        )
 
     def snapshot(self) -> dict[str, int | float]:
         """Return latest timings and cumulative counts for this rollout."""
