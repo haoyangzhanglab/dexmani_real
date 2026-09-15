@@ -1,128 +1,209 @@
 # DexMani Real
 
-DexMani Real 是面向灵巧操作研究的真实机器人运行时，覆盖 xArm7、XHand、Quest/HTS 手部跟踪与 RealSense RGB-D，主要用于：
+DexMani Real 是面向灵巧操作研究的真实机器人运行时，围绕 **xArm7 + XHand + RGB-D + VR/HTS** 构建，覆盖从真实机器人交互、数据采集到 learned-policy 部署与实验评估的完整研究流程。
 
-- VR / keyboard teleoperation 与数据采集；
-- raw episode 的物理回放、离线处理与 Policy Zarr 导出；
+项目主要面向以下场景：
+
+- VR / keyboard teleoperation 与 demonstration collection；
+- raw episode 记录、物理 replay 与离线数据处理；
+- Policy Zarr 数据集导出；
 - learned-policy 在真实机器人上的 rollout；
 - camera / VR 标定；
 - 机器人 runtime、IPC、recording 与 safety boundary 的统一管理。
 
-> **安全提示**：这是会连接并控制真实硬件的软件。运行任何可能连接设备、驱动机器人、home、replay、policy rollout 或写入标定的命令前，应先确认工作空间、标定、急停状态和操作者授权。不要把 `examples/` 下的脚本默认当成离线工具；先阅读对应入口的 docstring 或 `--help`。
+> **安全提示**：本仓库包含会连接和控制真实硬件的程序。运行 home、teleoperation、replay、policy rollout 或 calibration 前，应确认机器人工作空间、标定状态、急停状态与操作者授权。`examples/` 下的脚本不应默认视为离线工具，请先查看对应入口的 docstring 或 `--help`。
 
-## 环境与安装
+## Hardware / Software Stack
 
-项目要求 Python `>=3.10`。在已创建的 Python 环境中，从仓库根目录安装：
+典型实验系统包括：
+
+- **Robot Arm**: xArm7
+- **Dexterous Hand**: XHand
+- **Vision**: RealSense RGB-D
+- **Human Input**: Quest / HTS hand tracking
+- **Policy**: 通过相邻 `dexmani_policy` 仓库的 public deployment interface 接入
+
+DexMani Real 负责真实机器人侧的数据、控制与实验运行；policy model、training 和 deployment artifact 由 `dexmani_policy` 侧维护。
+
+## Installation
+
+项目要求 Python `>=3.10`。
+
+在仓库根目录安装：
 
 ```bash
 python -m pip install -e .
 ```
 
-`pyproject.toml` 提供通用 Python 依赖。xArm、XHand、RealSense、HTS、运动学/规划以及 learned-policy 工作流还需要各自的外部 SDK 或研究依赖，请按实际任务安装。
+`pyproject.toml` 提供通用 Python 依赖。xArm、XHand、RealSense、HTS、运动学/规划以及 learned-policy 工作流还需要各自的外部 SDK 或研究依赖，请根据实验环境安装。
 
-运行时配置由 [`dexmani_real/config/experiment.py`](dexmani_real/config/experiment.py) 统一解析，覆盖优先级为：
+运行时配置由 [`dexmani_real/config/experiment.py`](dexmani_real/config/experiment.py) 统一解析：
 
 ```text
 CLI override > YAML file > dexmani_real/config/defaults.py
 ```
 
-可以在不进入遥操作会话的情况下查看当前解析结果：
+查看当前解析配置：
 
 ```bash
 python examples/collect_teleop.py --print-config
 ```
 
-## 主要工作流
+## Main Workflows
 
-下面只列 canonical entry point。完整参数以各脚本当前的 `--help` 为准。
+下面列出主要研究入口。完整参数以各脚本当前的 `--help` 为准。
 
-| 工作流 | 入口 | 是否连接真实设备 | 主要结果 |
+| Workflow | Entry Point | Hardware | Main Output |
 |---|---|---|---|
-| VR 遥操作与采集 | `python examples/collect_teleop.py --task-name <task> --operator <name>` | 是 | raw episode（启用 recording 时） |
-| 键盘遥操作 | `python examples/keyboard_teleop.py` | 是 | 交互式机器人控制 |
-| 物理回放 | `python examples/replay_episode.py <episode>` | 是 | 物理 replay 与 replay evaluation 结果 |
-| 离线 episode 处理 | `python examples/process_episodes.py episodes/<task> --dry-run` | 否 | 审计；去掉 `--dry-run` 后发布 processed HDF5 |
-| Policy Zarr 导出 | `python examples/export_policy_zarr.py episodes_processed/<task> --dry-run` | 否 | 预检；去掉 `--dry-run` 后发布 `datasets/<task>.zarr` |
-| Learned-policy rollout | `python examples/run_policy.py <policy/task/experiment>` | 是 | `rollouts/.../session_*` 下的 rollout、trace 与 resolved run config |
-| Camera 标定 | `python examples/calibrate_camera.py --hand-geometry {absent,secured-home}` | 是 | xArm/RealSense eye-to-hand 标定并更新 camera calibration |
-| VR 朝向标定 | `python examples/calibrate_vr_heading.py` | 仅 HTS/VR | 更新 `dexmani_real/config/vr_transform.json`；不控制机器人 |
+| VR teleoperation / collection | `python examples/collect_teleop.py --task-name <task> --operator <name>` | Yes | raw episode |
+| Keyboard teleoperation | `python examples/keyboard_teleop.py` | Yes | interactive robot control |
+| Physical replay | `python examples/replay_episode.py <episode>` | Yes | physical replay / evaluation |
+| Offline episode processing | `python examples/process_episodes.py episodes/<task> --dry-run` | No | processed HDF5 |
+| Policy Zarr export | `python examples/export_policy_zarr.py episodes_processed/<task> --dry-run` | No | `datasets/<task>.zarr` |
+| Learned-policy rollout | `python examples/run_policy.py <policy/task/experiment>` | Yes | recorded rollout session |
+| Camera calibration | `python examples/calibrate_camera.py --hand-geometry {absent,secured-home}` | Yes | camera calibration |
+| VR heading calibration | `python examples/calibrate_vr_heading.py` | HTS/VR only | VR transform calibration |
 
-## 遥操作与采集
+## Teleoperation and Data Collection
 
-### VR 遥操作
+### VR Teleoperation
 
-`collect_teleop.py` 可以控制 xArm7/XHand，并在 recording 启用时将 raw episode 写入：
+`collect_teleop.py` 是主要 demonstration collection 入口，可以控制 xArm7 / XHand，并在 recording 启用时将 raw episode 写入：
 
 ```text
 episodes/<task>/episode_*
 ```
 
-只调试 arm 时使用该入口提供的显式 `--no-hand`；关闭 recording 时使用 `--no-record`。准确语义和其余参数以脚本 `--help` 为准。
+常用模式：
 
-若 arm worker 在 SDK boundary 拒绝不连续目标，当前 motion 会被撤销，控制参考必须从新的有效 feedback 重新建立；不要把未被 robot 接受的 target 当作已经执行。
+```bash
+# 标准 VR teleoperation + recording
+python examples/collect_teleop.py --task-name <task> --operator <name>
 
-### 键盘遥操作
+# Arm-only debugging
+python examples/collect_teleop.py --task-name <task> --operator <name> --no-hand
 
-`keyboard_teleop.py` 使用 WASD / 方向键 / IJKL 进行 Cartesian jog。连续按键时，target 基于最新实测状态生成；正常释放按键后，控制端有界等待最后一个 arm target 的 acceptance，再结束当前 motion epoch。
+# Teleoperation without recording
+python examples/collect_teleop.py --task-name <task> --operator <name> --no-record
+```
 
-IK、安全检查或 command acceptance 失败会结束当前 epoch。继续 jog 前应先释放当前按键组合，再重新输入命令。
+### Keyboard Teleoperation
 
-## 物理回放
+`keyboard_teleop.py` 提供 Cartesian jog，用于机器人调试、实验准备和低频人工控制。
 
-`replay_episode.py` 会把已记录轨迹真正发送到机器人，属于 hardware-affecting workflow。
+```bash
+python examples/keyboard_teleop.py
+```
 
-它可以读取 raw episode，也可以通过 processed 模式回放 processed selection：
+具体按键、运行条件和限制以脚本当前帮助信息为准。
+
+## Physical Replay
+
+`replay_episode.py` 用于将已记录动作重新发送到真实机器人，是 hardware-affecting workflow。
+
+Raw replay：
+
+```bash
+python examples/replay_episode.py <episode>
+```
+
+Processed replay：
 
 ```bash
 python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed
 ```
 
-运行前必须确认真实机器人起始状态、碰撞环境和急停条件。
+运行 replay 前应确认机器人初始状态、场景布局、工作空间与急停条件。
 
-如果 command 被 runtime/worker 拒绝，replay 不会把该失败伪装成成功执行，也不会自动跳过后继续补执行未来轨迹。硬件/controller fault 仍使用现有 fail-closed 路径。
+## Offline Data Pipeline
 
-## 离线数据处理与导出
+DexMani Real 的数据流保持为：
 
-推荐先做只读 preflight：
+```text
+raw episode
+    ↓
+offline processing
+    ↓
+processed HDF5
+    ↓
+Policy Zarr
+```
+
+### 1. Process Raw Episodes
+
+推荐先执行只读 preflight：
 
 ```bash
 python examples/process_episodes.py episodes/<task> --dry-run
-python examples/export_policy_zarr.py episodes_processed/<task> --dry-run
 ```
 
-确认后再执行实际发布：
+确认后执行：
 
 ```bash
 python examples/process_episodes.py episodes/<task>
+```
+
+输出：
+
+```text
+episodes_processed/<task>/episode_*.h5
+```
+
+### 2. Export Policy Dataset
+
+同样建议先进行 preflight：
+
+```bash
+python examples/export_policy_zarr.py episodes_processed/<task> --dry-run
+```
+
+实际导出：
+
+```bash
 python examples/export_policy_zarr.py episodes_processed/<task>
 ```
 
-processing 不修改原始 raw episode；export 从已验证的 processed HDF5 生成 policy Zarr。
+输出：
 
-当前 schema version、字段、dtype、shape 与 validation contract 由代码中的 schema / validator 定义，README 不复制易漂移的结构快照。
+```text
+datasets/<task>.zarr
+```
 
-### 离线检查
+Raw / processed schema、dtype、shape 和 validation contract 由代码中的 schema 与 validator 定义，不在 README 中重复维护易漂移的结构快照。
 
-raw 与 processed episode 都提供不连接硬件、不写文件的结构检查入口：
+### Offline Inspection
+
+Raw episode：
 
 ```bash
 python examples/visualize_episode.py <raw-episode> --info
+```
+
+Processed episode：
+
+```bash
 python examples/visualize_episode_processed.py <processed.h5> --info
 ```
 
-去掉 `--info` 会打开对应 viewer；完整参数以脚本 `--help` 为准。
+去掉 `--info` 可进入对应可视化流程。
 
-## Learned-policy rollout
+## Learned-Policy Rollout
 
-`run_policy.py` 运行 persistent recorded policy session，通过：
+`run_policy.py` 是 learned-policy 真机评估入口，通过：
 
 ```text
 <policy/task/experiment>
 ```
 
-选择相邻 `dexmani_policy` 中的 deployment experiment，并支持 artifact、inference steps、`--replan-steps`、seed、episode 数量、单 episode 运行时长和 device 等参数。
+选择 `dexmani_policy` 中的 deployment experiment。
 
-例如：
+基本用法：
+
+```bash
+python examples/run_policy.py <policy/task/experiment>
+```
+
+常用实验参数包括 artifact、inference steps、replan interval、seed、episode 数量、单 episode 时长和 device，例如：
 
 ```bash
 python examples/run_policy.py <policy/task/experiment> \
@@ -131,95 +212,101 @@ python examples/run_policy.py <policy/task/experiment> \
   --seed 0
 ```
 
-该入口 **始终连接真实硬件**。session 会写入 resolved `run_config.yaml`；任务成功与否应在离线数据审核中判断，runtime 只记录技术停止原因与 rollout 数据。
+该入口 **始终连接真实硬件**。
 
-### Policy action safety semantics
-
-Learned-policy action 在真正进入 command publication 前先经过 physical-space shaping 和现有 safety validation。当前稳定语义是：
-
-| 情况 | Runtime 行为 |
-|---|---|
-| 可安全修正的 joint / continuity 超界 | 在 physical action space 中 project/clip，再验证并发布 |
-| 上一条 arm command 尚未被 worker 接受 | 等待；不发布下一条 arm command，不伪造执行进度 |
-| feedback 暂时不可用或 stale | 等待；保持当前 trajectory state |
-| action 因 wall-clock timing 已过期 | 按 timing stale 语义跳过 |
-| EE IK 无可用解或实际 workspace violation | 结束当前 rollout，撤销到 `ARMED` |
-| malformed target、post-projection invariant failure、SDK/controller/hardware fault | fail closed，进入现有 fault path |
-
-Normal policy trajectory 只有在 command 成功进入 publication boundary 后才正常推进；**physical safety failure 不再等价于“跳过这个 waypoint，然后执行更未来的 waypoint”**。
-
-Arm 的最终 command-continuity guard 仍由 arm worker 在 SDK boundary 持有；XHand 的逐 tick rate limiting 仍由 hand worker 持有。Policy executor 不复制底层 dynamics controller。
-
-### Rollout diagnostics
-
-Recorded policy session 使用独立目录：
+每个 policy evaluation session 使用独立输出目录：
 
 ```text
 rollouts/<policy>/<task>/<experiment>/session_*/
 ```
 
-每个 saved rollout 还会生成对应的 policy trace，保留 raw policy prediction；episode action 字段记录实际提交给 runtime 的 action target，因此可以对照 prediction 与 execution：
+其中保存 rollout 数据、resolved run configuration 和用于分析 raw policy prediction 的 policy trace。
+
+Policy deployment 使用与 teleoperation / replay 相同的 runtime safety 与 command publication infrastructure。Policy output 会在进入硬件执行路径前经过必要的表示转换、约束处理与安全验证；robot worker 保留硬件边界处的最终检查。无法安全继续的 rollout 会结束，而不会把未执行动作视作已完成的物理进度。
+
+Rollout 结果可使用：
 
 ```bash
 python examples/visualize_policy_rollout.py <rollout-episode> --info
 ```
 
-这一区分很重要：生成模型输出可以超出 command envelope，而 runtime projection/validation 不应掩盖模型本身的分布质量问题。
+进行离线检查。
 
-## Camera 标定
+## Calibration
 
-`calibrate_camera.py` 的 `--hand-geometry` 是操作者对真实物理状态的显式声明：
+### Camera Calibration
 
-- `absent`：未安装 XHand；
-- `secured-home`：已安装且物理固定在 configured home。
-
-标定 jog 从最新实测末端状态生成下一条增量 command；IK、安全检查、publication 或 acceptance 失败时结束当前 motion epoch，而不是继续累计未执行目标。
-
-## 核心架构
-
-```text
-xArm7 / XHand / RealSense / Quest-HTS
-                │
-                ▼
-        device-specific owners
-                │
-                ▼
-       RuntimeChannels / IPC
-          │             │
-          │             └─ policy inference
-          │
-          ├─ teleop
-          └─ replay / deployment
-                │
-                ▼
-       control safety boundary
-                │
-                ▼
-       command publication
-                │
-                ▼
-        robot worker / SDK
-
-control-step recording → raw episode
-raw episode → offline processing → processed HDF5 → Policy Zarr
+```bash
+python examples/calibrate_camera.py --hand-geometry {absent,secured-home}
 ```
 
-长期边界：
+用于 xArm / RealSense eye-to-hand calibration。
 
-- runtime 配置由 [`dexmani_real/config/`](dexmani_real/config) 持有并统一解析；
-- IPC / shared-memory contract 由 [`dexmani_real/ipc/`](dexmani_real/ipc) 持有；
-- live SDK/device state 留在对应 robot/sensor owner 中；
-- teleop、replay、deployment 产生动作意图，`control/` 与 worker boundary 负责 admission、publication 和最终硬件检查；
-- arm worker 使用最后 SDK-accepted target 保持 command continuity；新 motion generation 从最新 measured state 重建参考；
-- hand worker 负责 XHand 的 hardware-bound validation 与逐 tick command shaping；
-- recording 只负责持久化，不拥有机器人动作决策；
-- learned-policy 集成只依赖相邻 `dexmani_policy` 的 public deployment contract。
+`--hand-geometry` 描述实验时真实的 hand 安装状态：
 
-更细的 concurrency、timeout、schema、error-code 和 scheduling 实现属于当前 source；修改这些路径时应直接追踪 producer → representation → consumer → side effect，而不是依赖 README 中的历史描述。
+- `absent`: 未安装 XHand；
+- `secured-home`: XHand 已安装并固定在 configured home。
 
-## 数据与输出
+### VR Heading Calibration
 
-主要数据流：
+```bash
+python examples/calibrate_vr_heading.py
+```
+
+用于更新 VR heading transform，不控制机器人本体。
+
+## System Architecture
+
+DexMani Real 将真实机器人运行时划分为少数明确边界：
+
+```text
+Sensors / Human Input              Learned Policy
+        │                               │
+        └──────── Observation ──────────┘
+                        │
+                        ▼
+                Teleop / Deployment
+                        │
+                        ▼
+                Control / Safety
+                        │
+                        ▼
+              Command Publication
+                        │
+                        ▼
+                Robot Workers
+                        │
+                        ▼
+                    Hardware
+
+        Recording ──→ Raw Episode
+                         │
+                         ▼
+                Offline Processing
+                         │
+                         ▼
+                    Policy Zarr
+```
+
+总体职责：
+
+- `config/`：runtime configuration；
+- `ipc/`：跨进程通信与 shared-memory contract；
+- `sensor/`：camera / VR / point-cloud runtime；
+- `teleop/`：人类输入到机器人动作意图；
+- `deployment/`：learned-policy runtime integration；
+- `control/`：command admission、safety 与 publication；
+- `robot/`：robot workers、drivers 与 hardware boundary；
+- `recording/`：raw episode persistence；
+- `dataset/`：offline processing、validation 与 policy export；
+- `planning/`：kinematics / geometry / planning utilities；
+- `replay/`：physical trajectory replay。
+
+更细的 concurrency、timeout、schema、error-code 与 scheduling 语义属于当前 source，应以实现为准。
+
+## Data and Outputs
+
+主要 demonstration 数据：
 
 ```text
 episodes/<task>/episode_*/
@@ -234,49 +321,47 @@ episodes_processed/<task>/episode_*.h5
 datasets/<task>.zarr
 ```
 
-Learned-policy rollout 使用独立的：
+Learned-policy rollout：
 
 ```text
 rollouts/<policy>/<task>/<experiment>/session_*/
 ```
 
-当前数据合同的 source of truth：
+Canonical data contracts：
 
 - raw episode schema：[`dexmani_real/recording/storage/schema.py`](dexmani_real/recording/storage/schema.py)
-- processed contract / validation：[`dexmani_real/dataset/`](dexmani_real/dataset)
+- processed validation：[`dexmani_real/dataset/`](dexmani_real/dataset)
 - Policy Zarr export：[`dexmani_real/dataset/export.py`](dexmani_real/dataset/export.py)
-- runtime / IPC wire contract：[`dexmani_real/ipc/`](dexmani_real/ipc)
-
-历史 migration、一次性 salvage、实验统计和 incident 记录不属于 README 的长期接口；需要追溯时使用 Git history、issue/PR 或实验产物。
+- runtime / IPC contract：[`dexmani_real/ipc/`](dexmani_real/ipc)
 
 ## Repository Layout
 
 ```text
 dexmani_real/
-├── calibration/   # camera / VR calibration workflows
-├── config/        # canonical runtime defaults and resolved configuration
-├── control/       # safety, homing, command publication
-├── dataset/       # offline processing, validation, policy export
-├── deployment/    # learned-policy runtime integration
-├── ipc/           # shared-memory and process communication contracts
-├── planning/      # kinematics, geometry, collision/path utilities
-├── recording/     # raw recording and persistence
+├── calibration/   # camera / VR calibration
+├── config/        # runtime configuration
+├── control/       # safety and command publication
+├── dataset/       # offline processing and export
+├── deployment/    # learned-policy deployment
+├── ipc/           # inter-process communication
+├── planning/      # kinematics / geometry / planning
+├── recording/     # raw episode recording
 ├── replay/        # physical replay
-├── robot/         # robot workers, drivers, command validation
-├── runtime/       # process/lifecycle supervision
-├── sensor/        # camera, VR and point-cloud runtime code
-├── teleop/        # VR/keyboard teleoperation
-└── utils/         # small shared utilities
+├── robot/         # robot workers and drivers
+├── runtime/       # process / lifecycle management
+├── sensor/        # camera / VR / point cloud
+├── teleop/        # teleoperation
+└── utils/         # shared utilities
 
-examples/           # user-facing entry points and diagnostics
-assets/             # robot/resources used by the runtime
+examples/           # research-facing entry points
+assets/             # robot models and runtime resources
 ```
 
-针对 coding agent 的仓库级工程与安全契约见 [`AGENTS.md`](AGENTS.md)。实现事实以当前 source、schemas 和 resolved configuration 为准。
+## Development
 
-## 开发与验证
+仓库级 coding-agent 约束见 [`AGENTS.md`](AGENTS.md)。
 
-普通开发优先使用不触碰硬件的最低成本检查：
+普通开发优先执行不触碰真实硬件的最低成本检查：
 
 ```bash
 python -m compileall -q dexmani_real examples
@@ -284,4 +369,4 @@ git diff --check
 git status --short
 ```
 
-如果修改的子系统有现成的 focused offline validation，应按实际风险运行。不要把 example 程序当作测试，也不要因为离线检查通过就声称完成了真实硬件验证。
+不要因为离线检查通过就声称完成真实硬件验证。
