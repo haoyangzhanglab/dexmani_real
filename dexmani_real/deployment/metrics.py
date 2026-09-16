@@ -19,6 +19,8 @@ class PolicyStats:
     observation_age_ms: float | None = None
     observation_skew_ms: float | None = None
     publication_interval_ms: float | None = None
+    publication_input_age_ms: float | None = None
+    stale_prediction_count: int = 0
     safety_rejection_count: int = 0
     ik_rejection_count: int = 0
     rejection_reasons: dict[str, int] = field(default_factory=dict)
@@ -50,6 +52,7 @@ class PolicyStats:
         """Return latest timings and cumulative counts for this rollout."""
         result: dict[str, int | float] = {
             "safety_rejection_count": self.safety_rejection_count,
+            "stale_prediction_count": self.stale_prediction_count,
         }
         if self.ik_rejection_count:
             result["ik_rejection_count"] = self.ik_rejection_count
@@ -58,6 +61,7 @@ class PolicyStats:
             "observation_age_ms",
             "observation_skew_ms",
             "publication_interval_ms",
+            "publication_input_age_ms",
         ):
             value = getattr(self, name)
             if value is not None and math.isfinite(value) and value >= 0:

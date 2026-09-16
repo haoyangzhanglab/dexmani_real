@@ -41,13 +41,14 @@ from dexmani_real.deployment.config import (
 )
 from dexmani_real.deployment.inference.observation import (
     _build_observation,
+    _select_control_grid_reference_ns,
     _to_policy_observation,
     build_fingertip_runtime,
+    observation_sources,
     observation_timing_ms,
 )
 from dexmani_real.deployment.inference.runtime import PolicyRuntime
 from dexmani_real.deployment.metrics import PolicyStats, flush_every
-from dexmani_real.deployment.timing import next_periodic_deadline_ns
 from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
     read_causal_structured_frame,
@@ -95,7 +96,6 @@ from dexmani_real.utils.feedback import (
     diagnose_arm_feedback,
 )
 from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.rate import LoopRate
 
 logger = get_logger(__name__)
 
@@ -353,13 +353,14 @@ class PolicyRunner:
             if self.max_running_s != recording_config.max_running_s:
                 raise ValueError("rollout timeout must match max_running_s")
         self.recording_config = recording_config
-        self.recorder = (
-            RecorderClient(shared) if recording_config is not None else None
-        )
+        self.recorder = RecorderClient(shared) if recording_config is not None else None
         self.last_recorded_action: EpisodeAction | None = None
         self.next_record_ns = 0
         self.control_period_s = float(policy_spec.control_dt_s)
-        self.rate = LoopRate(1.0 / self.control_period_s, label="policy", busy_wait=False)
+        self.poll_period_s = 1.0 / float(runtime.policy.executor_poll_hz)
+        self.chunk_sources: dict[str, tuple[int, ...]] = {}
+        self.chunk_action_index = 0
+        self._decision_recorded = False
         self.step_dt_ns = int(round(self.control_period_s * 1e9))
         self.max_running_ns = (
             None if self.max_running_s is None else int(self.max_running_s * 1e9)
@@ -391,6 +392,8 @@ class PolicyRunner:
         self.previous_arm_command_qpos = None
         self.last_recorded_action = None
         self.actions.clear()
+        self.chunk_sources.clear()
+        self.chunk_action_index = 0
         self.observation_id = 0
 
     def _invalidate_chunk(self) -> None:
@@ -403,6 +406,10 @@ class PolicyRunner:
         ensures the next chunk's first action anchors to the newly measured arm
         state rather than a pre-gap command target.
         """
+        logger.debug(
+            "policy discard generation=%s query=%s index=%s reason=feedback_continuity",
+            self.run_generation, self.observation_id, self.chunk_action_index,
+        )
         self.actions.clear()
         self.previous_arm_command_qpos = None
 
@@ -698,7 +705,7 @@ class PolicyRunner:
         raw_action: np.ndarray | None = None,
         reject_kind: _RejectKind | None = None,
     ) -> None:
-        """Record a completed control decision, or an ordinary idle grid sample.
+        """Record a completed control decision, or an ordinary idle sample.
 
         Command rows are observed immediately so S/Q cannot lose an already
         published command in a second event buffer. The controller emits the
@@ -707,11 +714,10 @@ class PolicyRunner:
         """
         if self.recorder is None or self.run_started_ns is None:
             return
-        if raw_action is None and now_ns < self.next_record_ns:
+        if raw_action is None and (
+            self._decision_recorded or now_ns < self.next_record_ns
+        ):
             return
-        self.next_record_ns = next_periodic_deadline_ns(
-            self.next_record_ns, self.step_dt_ns, now_ns
-        )
         try:
             sources = {}
             for name, ring in (
@@ -806,6 +812,8 @@ class PolicyRunner:
                     )
             if not recorded:
                 raise RuntimeError("rollout sample rejected by RecorderIO")
+            self.next_record_ns = now_ns + self.step_dt_ns
+            self._decision_recorded = raw_action is not None
         except Exception as exc:
             logger.error("rollout recording failed", exc_info=True)
             self._invalidate_rollout(
@@ -911,7 +919,6 @@ class PolicyRunner:
         self.next_record_ns = epoch.started_monotonic_ns + self.step_dt_ns
         self._clear_execution(epoch.generation)
         self.model_runtime.reset_episode()
-        self.rate.reset()
         print(
             f"Episode {self.completed_episodes + 1}/{self.num_episodes} RUNNING",
             flush=True,
@@ -1075,6 +1082,26 @@ class PolicyRunner:
             return None, None, None
         return (arm_qpos, hand_qpos), None, None
 
+    def _input_is_fresh(self, now_ns: int) -> bool:
+        ages = {
+            name: (now_ns - times[-1]) / 1e9
+            for name, times in self.chunk_sources.items()
+        }
+        self.stats.publication_input_age_ms = max(ages.values(), default=0.0) * 1e3
+        if self.chunk_action_index == 0 and any(
+            age > self.runtime.policy.max_input_age_s for age in ages.values()
+        ):
+            logger.debug(
+                "policy discard generation=%s query=%s reason=stale_model_input ages_s=%s",
+                self.run_generation,
+                self.observation_id,
+                ages,
+            )
+            self.stats.stale_prediction_count += 1
+            self.actions.clear()
+            return False
+        return True
+
     def _dispatch_action(self, action: np.ndarray) -> None:
         """Admit the queue head from one immutable feedback snapshot.
 
@@ -1084,6 +1111,8 @@ class PolicyRunner:
         inference follow on the next queue-empty iteration); it is not itself
         a hardware fault.
         """
+        if not self._input_is_fresh(time.monotonic_ns()):
+            return
         max_age_s = float(self.runtime.policy.max_input_age_s)
         feedback, reason, issue = read_command_feedback(
             self.shared,
@@ -1145,6 +1174,13 @@ class PolicyRunner:
             self._invalidate_chunk()
             return
 
+        publication_check_ns = time.monotonic_ns()
+        if not self._running_generation_is_live() or self._running_time_expired(
+            publication_check_ns
+        ):
+            return
+        if not self._input_is_fresh(publication_check_ns):
+            return
         if self.execute:
             result = publish_command(
                 self.shared,
@@ -1172,6 +1208,32 @@ class PolicyRunner:
             publication_ns = time.monotonic_ns()
 
         assert candidate.arm_qpos is not None
+        self.stats.publication_input_age_ms = max(
+            ((publication_ns - times[-1]) / 1e6 for times in self.chunk_sources.values()),
+            default=0.0,
+        )
+        logger.debug(
+            "policy publish generation=%s query=%s index=%s planned_ns=%s actual_ns=%s input_age_ms=%s raw=%s arm=%s hand=%s chunk_arm_delta=%s",
+            self.run_generation,
+            self.observation_id,
+            self.chunk_action_index,
+            (
+                None
+                if self.last_publication_ns is None
+                else self.last_publication_ns + self.step_dt_ns
+            ),
+            publication_ns,
+            self.stats.publication_input_age_ms,
+            action.tolist(),
+            candidate.arm_qpos.tolist(),
+            candidate.hand_qpos.tolist(),
+            (
+                (candidate.arm_qpos - self.previous_arm_command_qpos).tolist()
+                if self.chunk_action_index == 0
+                and self.previous_arm_command_qpos is not None
+                else None
+            ),
+        )
         self.previous_arm_command_qpos = candidate.arm_qpos.copy()
         if self.last_publication_ns is not None:
             self.stats.publication_interval_ms = (
@@ -1179,7 +1241,10 @@ class PolicyRunner:
             ) / 1e6
         self.last_publication_ns = publication_ns
         self.actions.popleft()
-        self._record_rollout_tick(publication_ns, candidate=candidate, raw_action=action)
+        self.chunk_action_index += 1
+        self._record_rollout_tick(
+            publication_ns, candidate=candidate, raw_action=action
+        )
 
     def _handle_preparation_rejection(
         self,
@@ -1280,26 +1345,61 @@ class PolicyRunner:
             if not self._running_generation_is_live():
                 return
             started_ns = time.monotonic_ns()
+            if self._running_time_expired(started_ns):
+                return
             predicted = self.model_runtime.predict(policy_observation)
             finished_ns = time.monotonic_ns()
             self.stats.inference_latency_ms = (finished_ns - started_ns) / 1e6
             # Main can revoke motion during blocking inference. Never accept its
             # result before rechecking the episode's original generation/state.
             if not self._running_generation_is_live():
+                logger.debug(
+                    "policy discard generation=%s query=%s reason=inference_run_boundary",
+                    self.run_generation, self.observation_id,
+                )
                 self.actions.clear()
                 return
             if self._running_time_expired(finished_ns) or not self._poll_recorder():
                 return
+            self.chunk_sources = observation_sources(observation)
+            self.chunk_action_index = 0
+            logger.debug(
+                "policy query generation=%s query=%s anchor_ns=%s references_ns=%s sources_ns=%s inference_start_ns=%s inference_end_ns=%s predicted=%s",
+                self.run_generation,
+                self.observation_id,
+                observation.anchor_monotonic_ns,
+                _select_control_grid_reference_ns(
+                    run_started_ns=self.run_started_ns,
+                    anchor_ns=observation.anchor_monotonic_ns,
+                    history_len=int(self.policy_spec.n_obs_steps),
+                    step_dt_ns=self.step_dt_ns,
+                )[0].tolist(),
+                self.chunk_sources,
+                started_ns,
+                finished_ns,
+                predicted.tolist(),
+            )
             self.actions.extend(predicted)
-            self.rate.reset()
 
+        if not self.actions:
+            return
+        now_ns = time.monotonic_ns()
+        if (
+            self.last_publication_ns is not None
+            and now_ns < self.last_publication_ns + self.step_dt_ns
+        ):
+            return
+        if not self._running_generation_is_live() or self._running_time_expired(now_ns):
+            return
         self._dispatch_action(self.actions[0])
 
     def run(self) -> None:
-        """One policy control tick per iteration, including chunk boundaries."""
+        """Poll lifecycle while preparing chunks and waiting for publication deadlines."""
         try:
             while self.shared.is_running.value:
                 tick_started_ns = time.monotonic_ns()
+                previous_publication_ns = self.last_publication_ns
+                self._decision_recorded = False
                 self._recorder_start_wait_ms = 0.0
                 phase_ms = {"active_control": 0.0, "recording": 0.0, "metrics": 0.0}
                 self.shared.set_heartbeat("policy", time.monotonic())
@@ -1340,7 +1440,22 @@ class PolicyRunner:
                             time.monotonic_ns() - metrics_started_ns
                         ) / 1e6
                 phase_ms["work"] = (time.monotonic_ns() - tick_started_ns) / 1e6
-                self.rate.wait(phase_ms=phase_ms)
+                logger.debug("policy loop phases_ms=%s", phase_ms)
+                # Prepare the next chunk immediately after its predecessor ends.
+                if (
+                    self.run_started_ns is not None
+                    and not self.actions
+                    and self.last_publication_ns != previous_publication_ns
+                ):
+                    continue
+                wait_s = self.poll_period_s
+                if self.actions and self.last_publication_ns is not None:
+                    remaining_s = (
+                        self.last_publication_ns + self.step_dt_ns - time.monotonic_ns()
+                    ) / 1e9
+                    if remaining_s > 0:
+                        wait_s = min(wait_s, remaining_s)
+                time.sleep(wait_s)
         finally:
             # A runtime stop can end the loop before its next boundary poll.
             # Storage finalization remains owned by RecorderIO.

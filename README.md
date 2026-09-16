@@ -217,8 +217,10 @@ python examples/run_policy.py <policy/task/experiment> \
 Policy deployment 使用同步推理：单个 policy 子进程拥有 model/CUDA 和动作调度，
 先完成加载与 warmup，再启动硬件 workers。每次 `policy.predict()` 返回
 `PolicySpec.n_action_steps` 个动作，放入进程内队列，按 `PolicySpec.control_dt_s`
-逐个下发；队列耗尽后才重新观测和推理。推理耗时体现为 chunk 边界的停顿，
-新 chunk 从推理完成后的当前时间开始，不跳动作、不补发追赶。
+逐个下发；每块最后一个动作发布后立即重新观测和同步推理。下一个动作最早在
+上次实际发布加一个控制周期后下发；推理提前完成则等待剩余时间，超时则从新的
+实际发布时间重新计时，不跳动作、不补发追赶。各模态历史共用查询时刻锚点，
+首动作发布前若模型输入已过期，则丢弃未执行的整块并重新查询。
 Arm/Hand workers 继续各自拥有 SDK，下发动作不等待物理收敛。
 
 ### 导出并使用指定检查点
@@ -255,7 +257,9 @@ rollouts/<policy>/<task>/<experiment>/session_*/
 ```
 
 其中保存 raw rollout 数据和 resolved run configuration。同步推理期间采样 hook 暂停，
-记录保留实际时间戳，不补造样本；不生成异步 prediction trace sidecar。
+记录保留实际时间戳，不补造样本；动作记录后一个控制周期内不追加普通 held 行。
+固定 FPS 的 `rgb.mp4` 不代表真实控制时间，时序分析以 HDF5 `timestamp` 为准。
+不生成异步 prediction trace sidecar。
 
 Policy deployment 使用与 teleoperation / replay 相同的 runtime safety 与 command publication infrastructure。Policy output 会在进入硬件执行路径前经过必要的表示转换、约束处理与安全验证；robot worker 保留硬件边界处的最终检查。无法安全继续的 rollout 会结束，而不会把未执行动作视作已完成的物理进度。
 

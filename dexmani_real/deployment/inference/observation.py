@@ -333,29 +333,14 @@ def _read_hand_history(
 def _select_control_grid_reference_ns(
     *, run_started_ns: int, anchor_ns: int, history_len: int, step_dt_ns: int
 ) -> tuple[np.ndarray, int]:
-    """Return the last T episode-grid times, oldest first.
-
-    During run warm-up fewer than ``history_len`` grid ticks have elapsed, so
-    the earliest tick is repeated to fill the window (edge-repeat).  The
-    repeated leading slots keep the real earliest-tick time; the aligner then
-    maps each leading reference to the oldest complete post-run observation.
-    """
+    """Return query-anchored history times, clipped to run start during warm-up."""
     if history_len <= 0 or step_dt_ns <= 0 or anchor_ns < run_started_ns:
         return np.empty(0, dtype=np.uint64), 0
-    latest_tick = (anchor_ns - run_started_ns) // step_dt_ns
-    logical_step_ns = run_started_ns + latest_tick * step_dt_ns
-    tick_indices = np.arange(
-        max(0, latest_tick - history_len + 1), latest_tick + 1, dtype=np.int64
+    references = np.maximum(
+        run_started_ns,
+        anchor_ns - np.arange(history_len - 1, -1, -1, dtype=np.int64) * step_dt_ns,
     )
-    if tick_indices.size < history_len:
-        pad = history_len - tick_indices.size
-        tick_indices = np.concatenate(
-            (np.zeros(pad, dtype=np.int64), tick_indices)
-        )
-    return (
-        (run_started_ns + tick_indices * step_dt_ns).astype(np.uint64),
-        logical_step_ns,
-    )
+    return references.astype(np.uint64), anchor_ns
 
 
 def _select_history_indices(
@@ -700,27 +685,22 @@ def _select_camera_control_grid(
     frames: tuple[PointCloudFrame | RgbFrame, ...],
     *,
     run_started_ns: int,
-    anchor_ns: int,
-    history_len: int,
-    step_dt_ns: int,
+    reference_ns: np.ndarray,
     max_grid_lag_ns: int,
 ) -> tuple[tuple[PointCloudFrame | RgbFrame, ...], int]:
-    """Select a causal visual window on the policy grid.
+    """Select a causal visual window at the shared query references.
 
     A healthy, recent, same-generation frame may be reused across adjacent grid
     slots when no newer frame has arrived, and the oldest available frame fills
     the leading warm-up slots (edge-repeat).  Future, stale, unhealthy, and
     wrong-generation frames are rejected before they reach ``frames``.
     """
-    if not frames or history_len <= 0 or step_dt_ns <= 0:
+    if not frames or reference_ns.size == 0:
         return (), 0
-    if anchor_ns < run_started_ns:
-        return (), 0
-    latest_tick = (anchor_ns - run_started_ns) // step_dt_ns
-    logical_step_ns = run_started_ns + latest_tick * step_dt_ns
+    logical_step_ns = int(reference_ns[-1])
     selected: list[PointCloudFrame | RgbFrame] = []
-    for offset in range(history_len - 1, -1, -1):
-        desired_ns = logical_step_ns - offset * step_dt_ns
+    for reference in reference_ns:
+        desired_ns = int(reference)
         candidates = [
             frame
             for frame in frames
@@ -806,9 +786,7 @@ def _build_observation(
         pointcloud_history, _ = _select_camera_control_grid(
             all_pointclouds,
             run_started_ns=run_started_ns,
-            anchor_ns=anchor_ns,
-            history_len=horizon,
-            step_dt_ns=step_dt_ns,
+            reference_ns=reference_ns,
             max_grid_lag_ns=max_grid_lag_ns,
         )
         if len(pointcloud_history) == horizon:
@@ -834,9 +812,7 @@ def _build_observation(
         selected_rgb, _ = _select_camera_control_grid(
             all_rgb,
             run_started_ns=run_started_ns,
-            anchor_ns=anchor_ns,
-            history_len=horizon,
-            step_dt_ns=step_dt_ns,
+            reference_ns=reference_ns,
             max_grid_lag_ns=max_grid_lag_ns,
         )
         rgb_history = selected_rgb
@@ -855,7 +831,7 @@ def _build_observation(
             max_age_ns=state_history_max_age_ns,
             not_before_ns=run_started_ns,
         )
-    # Every modality uses the policy control grid; camera exposure times do
+    # Every modality uses the same query-anchored references; camera exposure times do
     # not move the robot/contact observation back to an earlier raw instant.
     arm_history = _align_state_history_to_reference_ns(
         arm_history, reference_ns, max_skew_ns=max_skew_ns,
@@ -926,6 +902,25 @@ def _build_observation(
         pointcloud_history=pointcloud_history,
         rgb_history=rgb_history,
     )
+
+
+def observation_sources(observation: ObservationBatch) -> dict[str, tuple[int, ...]]:
+    """Selected source times per modality, oldest first; no persisted semantics."""
+    assert observation.arm_history is not None
+    sources = {
+        "arm": tuple(int(v) for v in observation.arm_history.source_monotonic_ns)
+    }
+    if observation.hand_history is not None:
+        sources["hand"] = tuple(
+            int(v) for v in observation.hand_history.source_monotonic_ns
+        )
+    for name, frames in (
+        ("point_cloud", observation.pointcloud_history),
+        ("rgb", observation.rgb_history),
+    ):
+        if frames:
+            sources[name] = tuple(int(frame.source_monotonic_ns) for frame in frames)
+    return sources
 
 
 def observation_timing_ms(observation: ObservationBatch) -> tuple[float, float]:
