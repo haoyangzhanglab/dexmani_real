@@ -88,6 +88,11 @@ class RecorderClient:
         return self._recording
 
     @property
+    def transport_unavailable(self) -> bool:
+        """Whether transport integrity was lost; the workflow owns disposition."""
+        return self._unavailable
+
+    @property
     def next_frame_reaches_limit(self) -> bool:
         """Whether a successful append now would trigger max-frames auto-save."""
         return bool(
@@ -110,9 +115,7 @@ class RecorderClient:
         return self._last_stop_result.error if self._last_stop_result else None
 
     def _fail_transport(self, error: str) -> None:
-        # A transport failure is this client's own unavailability, not a
-        # physical fault. The caller (PolicyRunner) decides what it means for
-        # the policy workflow.
+        # Report local unavailability; the workflow decides its disposition.
         logger.error("RecorderIO unavailable: %s", error)
         self._unavailable = True
         self._recording = False

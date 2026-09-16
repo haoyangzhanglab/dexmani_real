@@ -140,6 +140,24 @@ def _policy_exit_fault(
     return None
 
 
+def _latch_recorder_transport_fault(
+    shared: RuntimeChannels,
+    recorder: RecorderClient | None,
+    *,
+    context: str,
+) -> bool:
+    """Teleop fails closed on transport loss, not ordinary episode errors."""
+    if recorder is None or not recorder.transport_unavailable:
+        return False
+    logger.error(
+        "teleop recorder transport unavailable during %s: %s",
+        context,
+        recorder.last_error or "unknown error",
+    )
+    shared.error_state.value = True
+    return True
+
+
 def _start_keyboard(shared: RuntimeChannels) -> KeyboardInput | None:
     """Start the required operator input boundary, failing closed on startup errors."""
     keyboard = KeyboardInput(
@@ -505,6 +523,8 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
         controller.clear_reference()
 
     def run_home() -> None:
+        if _latch_recorder_transport_fault(shared, recorder, context="home"):
+            return
         clear_pause_for_home()
         controller.prev_hand_qpos = do_configured_teleop_home(
             shared,
@@ -537,6 +557,8 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             reject_revoked_run()
             if recorder is not None:
                 stop_result = recorder.poll_stop()
+                if _latch_recorder_transport_fault(shared, recorder, context="poll"):
+                    break
                 reached_limit = (
                     (recorder.stop_pending or stop_result.done)
                     and stop_result.reason == "max_frames"
@@ -710,6 +732,10 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             reanchor_grid = False
             break_loop = False
             for control in controls:
+                if _latch_recorder_transport_fault(
+                    shared, recorder, context="operator control"
+                ):
+                    break
                 if startup_hand_home_pending and control is OperatorCommand.BEGIN:
                     continue
                 if reject_revoked_run() and control is OperatorCommand.BEGIN:
@@ -874,6 +900,11 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         if not recorder.start_episode(
                             task_label=cfg.task_label, operator=cfg.operator
                         ):
+                            if _latch_recorder_transport_fault(
+                                shared, recorder, context="start"
+                            ):
+                                break_loop = True
+                                break
                             print("  ⚠ 无法开始录制")
                             skip_control_tick = True
                             continue
@@ -913,6 +944,10 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     limiter.reset()
                     skip_control_tick = True
 
+            if _latch_recorder_transport_fault(
+                shared, recorder, context="operator control completion"
+            ):
+                break
             if break_loop or shared.error_state.value or shared.estop_request.value:
                 break
             if reanchor_grid:
@@ -940,6 +975,8 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 observation_anchor_monotonic_ns=current_grid_anchor_ns,
             )
             recording_active = tick_result.recording_active
+            if _latch_recorder_transport_fault(shared, recorder, context="control grid"):
+                break
             arm_feedback_error_count = tick_result.arm_feedback_error_count
             hand_disconnected_at_s = tick_result.hand_disconnected_at_s
             if reject_revoked_run():
@@ -956,6 +993,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             stop_recording(
                 recorder, True, save=False, shared=shared, reason="policy_shutdown"
             )
+        _latch_recorder_transport_fault(shared, recorder, context="shutdown")
         kb.stop()
         audio.play("end")
         if not audio.wait_until_idle(timeout_s=_END_AUDIO_GRACE_S):
