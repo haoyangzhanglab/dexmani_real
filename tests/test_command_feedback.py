@@ -52,6 +52,27 @@ class _Ring:
         return self._frame
 
 
+class _AdvancingRing:
+    """Ring whose read advances the shared clock before returning its frame.
+
+    Models a producer committing a frame *during* the read itself: the clock
+    jumps forward past the frame's source timestamp. This is exactly the
+    pre-read-``now`` race the old implementation misclassified as
+    ``FUTURE_TIMESTAMP``.
+    """
+
+    def __init__(
+        self, clock: "_FakeClock", record: np.ndarray, commit_ns: int, advance_to_ns: int
+    ) -> None:
+        self._clock = clock
+        self._frame = (record, commit_ns, 1)
+        self._advance_to_ns = advance_to_ns
+
+    def read_latest(self):
+        self._clock.ns = self._advance_to_ns
+        return self._frame
+
+
 def _arm_record(source_ns: int) -> np.ndarray:
     record = np.zeros(1, dtype=ARM_STATE_DTYPE)
     record["connected"] = 1
@@ -129,18 +150,41 @@ class ReadCommandFeedbackTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_legal_concurrent_frame_is_not_future(self):
-        # source/commit are later than a hypothetical old pre-read now, but not
-        # later than the post-read clock: a legal concurrent frame.
-        shared = _shared(arm_source_ns=995 * _MS, arm_commit_ns=998 * _MS,
-                         hand_source_ns=996 * _MS, hand_commit_ns=998 * _MS)
+        # The frame commits during the read itself: the clock starts at
+        # T0=990ms, ``read_latest()`` advances it to 1000ms, and the returned
+        # frame's source (995ms) is AFTER the hypothetical pre-read now (990ms)
+        # but BEFORE the post-read now (1000ms). The old implementation
+        # captured ``now`` before reading the ring and would misclassify this
+        # legal concurrent frame as FUTURE_TIMESTAMP; the post-read ordering
+        # accepts it and satisfies ``0 < source <= ring_commit <= validation_now``.
+        self.clock.ns = 990 * _MS
+        shared = SimpleNamespace(
+            arm_state_ring=_AdvancingRing(
+                self.clock, _arm_record(995 * _MS), 998 * _MS, advance_to_ns=1_000 * _MS
+            ),
+            hand_state_ring=_AdvancingRing(
+                self.clock, _hand_record(996 * _MS), 998 * _MS, advance_to_ns=1_000 * _MS
+            ),
+        )
         snapshot, reason, issue = pub.read_command_feedback(
-            shared, require_hand=False, arm_max_age_s=0.15, hand_max_age_s=0.15
+            shared, require_hand=True, arm_max_age_s=0.15, hand_max_age_s=0.15
         )
         self.assertIsNotNone(snapshot)
         self.assertIsNone(issue)
         self.assertEqual(snapshot.arm_source_monotonic_ns, 995 * _MS)
         self.assertEqual(snapshot.arm_ring_commit_monotonic_ns, 998 * _MS)
+        self.assertEqual(snapshot.hand_source_monotonic_ns, 996 * _MS)
+        self.assertEqual(snapshot.hand_ring_commit_monotonic_ns, 998 * _MS)
         self.assertEqual(snapshot.validation_now_ns, 1_000 * _MS)
+        # Explicit ordering invariant per modality: no future source, no
+        # out-of-order commit.
+        for source, commit in (
+            (snapshot.arm_source_monotonic_ns, snapshot.arm_ring_commit_monotonic_ns),
+            (snapshot.hand_source_monotonic_ns, snapshot.hand_ring_commit_monotonic_ns),
+        ):
+            self.assertGreater(source, 0)
+            self.assertLessEqual(source, commit)
+            self.assertLessEqual(commit, snapshot.validation_now_ns)
 
     def test_source_after_ring_commit_is_fatal(self):
         shared = _shared(arm_source_ns=1_000 * _MS, arm_commit_ns=999 * _MS,
