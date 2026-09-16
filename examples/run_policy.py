@@ -2,7 +2,7 @@
 """Research-facing entry point for one recorded DexMani Policy evaluation session.
 
 ``python examples/run_policy.py EXPERIMENT [--artifact A] [--inference-steps N]
-[--replan-steps N] [--seed S] [--num-episodes N] [--max-duration SEC] [--device D]`` runs one
+[--seed S] [--num-episodes N] [--max-duration SEC] [--device D]`` runs one
 persistent multi-episode physical session (H -> scene setup -> B -> S per
 episode). The parent inspects and pins the deployment artifact, resolves the
 effective inference steps, creates a session directory and writes
@@ -10,7 +10,10 @@ effective inference steps, creates a session directory and writes
 lifecycle. Task success is judged offline from the published raw episodes; this
 command records only technical stop reasons.
 
-The command always connects to hardware (the lifecycle starts the inference
+Inference is synchronous: each query supplies PolicySpec.n_action_steps actions,
+dispatched in order at the policy rate before the next observation and query.
+
+The command always connects to hardware (the lifecycle starts the policy
 child first and waits for its READY before any actuator or camera worker), so
 do not run it outside a supervised robot session.
 """
@@ -81,13 +84,6 @@ def _parser() -> argparse.ArgumentParser:
         help="override the artifact's default inference steps (default: artifact default)",
     )
     parser.add_argument(
-        "--replan-steps",
-        type=_positive_int,
-        default=None,
-        help="target replanning period in Policy control-grid steps "
-        "(default: resolved Real config)",
-    )
-    parser.add_argument(
         "--seed", type=_nonnegative_int, default=0, help="per-episode inference seed"
     )
     parser.add_argument(
@@ -148,7 +144,7 @@ def _write_run_config(
     experiment: str,
     artifact: str,
     inference_steps: int,
-    replan_steps: int,
+    n_action_steps: int,
     seed: int,
     device: str,
     num_episodes: int,
@@ -161,7 +157,7 @@ def _write_run_config(
         "experiment": experiment,
         "artifact": artifact,
         "inference_steps": inference_steps,
-        "replan_steps": replan_steps,
+        "n_action_steps": n_action_steps,
         "seed": seed,
         "device": device,
         "num_episodes": num_episodes,
@@ -178,7 +174,6 @@ def _print_summary(
     device: str,
     artifact: str,
     inference_steps: int,
-    replan_steps: int,
     seed: int,
     num_episodes: int,
     max_running_s: float,
@@ -199,10 +194,7 @@ def _print_summary(
     print(f"Observation    : {' + '.join(fields)}")
     print(f"Action         : {spec.action_key} ({spec.control_action_dim}D)")
     print(f"Control        : {1.0 / spec.control_dt_s:g} Hz")
-    print(
-        f"Replan         : {replan_steps} steps "
-        f"({replan_steps * spec.control_dt_s * 1e3:g} ms nominal)"
-    )
+    print(f"Action chunk   : {spec.n_action_steps} steps; infer when queue is empty")
     print(f"Session dir    : {session_dir}")
     print("──────────────────────────────")
     sys.stdout.flush()
@@ -237,9 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from dexmani_real.config.experiment import resolve_experiment_config
 
-        runtime = resolve_experiment_config(
-            cli_overrides={"policy.replan_steps": args.replan_steps}
-        )
+        runtime = resolve_experiment_config()
     except Exception as exc:
         _print_compatibility_error(f"runtime resolution failed: {exc}")
         return 1
@@ -252,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
             experiment=info.selector,
             artifact=info.checkpoint_name,
             inference_steps=inference_steps,
-            replan_steps=runtime.policy.replan_steps,
+            n_action_steps=info.spec.n_action_steps,
             seed=args.seed,
             device=args.device,
             num_episodes=args.num_episodes,
@@ -264,11 +254,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     from dexmani_real.deployment.config import (
-        InferenceWorkerConfig,
+        PolicyRuntimeConfig,
         RolloutRecordingConfig,
     )
 
-    worker_config = InferenceWorkerConfig(
+    worker_config = PolicyRuntimeConfig(
         experiment=info.selector,
         device=args.device,
         spec=info.spec,
@@ -288,7 +278,6 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         artifact=info.checkpoint_name,
         inference_steps=inference_steps,
-        replan_steps=runtime.policy.replan_steps,
         seed=args.seed,
         num_episodes=args.num_episodes,
         max_running_s=args.max_running_s,

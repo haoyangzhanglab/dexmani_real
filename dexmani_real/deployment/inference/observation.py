@@ -37,7 +37,7 @@ class PolicyObservation:
     """Narrow NumPy boundary passed to a Policy runtime.
 
     Mapping insertion order is the validated Policy modality order. Arrays are
-    C-contiguous, writeable, inference-process-owned model inputs.
+    C-contiguous, writeable, policy-process-owned model inputs.
     """
 
     observation_id: int

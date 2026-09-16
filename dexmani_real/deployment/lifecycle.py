@@ -3,12 +3,10 @@
 Composes the runtime primitives (``ProcessSpec`` +
 ``build_processes``/``start_processes``/``wait_subsystem_ready``/
 ``run_supervisor``/``shutdown_processes``) into the policy workflow — resolve
-config -> create ``RuntimeChannels`` -> start the Policy-owned inference
-process -> spawn arm (+ optional hand and RGB-D / point-cloud workers) ->
-executor -> readiness -> ARMED -> supervise -> verified shutdown. There is
-no second health mechanism: supervisor heartbeats cover the policy executor,
-actuator, and inference workers, while readiness covers asynchronous startup
-only.
+config -> create ``RuntimeChannels`` -> load/warm up the policy child ->
+policy READY -> spawn hardware/recording workers -> readiness -> ARMED ->
+supervise -> verified shutdown. The policy child owns model/CUDA and synchronous
+action dispatch; supervisor heartbeats and readiness cover the existing lifecycle.
 
 There is no VR worker. A validate-only session starts the camera only when
 the explicit observation contract contains ``point_cloud`` or ``rgb``.
@@ -32,13 +30,12 @@ from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.deployment.config import (
     FIXED_POLICY_RUNTIME_TARGET,
     FingertipAssemblerConfig,
-    InferenceWorkerConfig,
+    PolicyRuntimeConfig,
     RolloutRecordingConfig,
     validate_max_running_s,
     validate_policy_runtime_compatibility,
 )
-from dexmani_real.deployment.executor import policy_executor_loop
-from dexmani_real.deployment.inference.worker import inference_loop
+from dexmani_real.deployment.executor import policy_runner_loop
 from dexmani_real.deployment.operator import build_home_planner, run_operator_control
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.recording.io_worker import RecorderIOConfig, recorder_io_loop
@@ -99,7 +96,7 @@ def _requires_hand_sensor(policy_spec: Any) -> bool:
 def _rollout_recorder_config(
     runtime: ExperimentConfig,
     rollout: RolloutRecordingConfig,
-    worker_config: InferenceWorkerConfig,
+    worker_config: PolicyRuntimeConfig,
 ) -> RecorderIOConfig:
     """Build the recorder capacity contract for one recorded rollout session.
 
@@ -124,7 +121,7 @@ def _rollout_recorder_config(
             "policy_selector": worker_config.experiment,
             "checkpoint_name": worker_config.artifact,
             "inference_steps": str(worker_config.inference_steps),
-            "replan_steps": str(runtime.policy.replan_steps),
+            "n_action_steps": str(worker_config.spec.n_action_steps),
             "seed": str(worker_config.seed),
             "max_running_s": f"{float(rollout.max_running_s):.17g}",
         },
@@ -134,7 +131,7 @@ def _rollout_recorder_config(
 def _wait_for_rollout_recording(shared: RuntimeChannels, processes: list[Any]) -> bool:
     """Allow the ordinary recorder transaction to finish before shutdown.
 
-    Motion must already be fenced. Only the recorder and its executor owner
+    Motion must already be fenced. Only the recorder and its policy owner
     need to remain alive; no arm/hand acceptance is involved in finalization.
     """
     owners = [
@@ -227,7 +224,7 @@ def build_policy_worker_specs(
     shared: RuntimeChannels,
     runtime: ExperimentConfig,
     policy_spec: Any,
-    worker_config: InferenceWorkerConfig,
+    worker_config: PolicyRuntimeConfig,
     *,
     execute: bool,
     max_running_s: float | None = None,
@@ -236,11 +233,10 @@ def build_policy_worker_specs(
     """Build the workers required by the explicit deployment contract.
 
     Each spec owns its process and readiness names. ``ready_name`` exists only
-    for workers whose asynchronous initialization can fail; executor liveness
-    is enough.
+    for workers with initialization that must complete before use.
     """
-    if not isinstance(worker_config, InferenceWorkerConfig):
-        raise TypeError("worker_config must be an InferenceWorkerConfig")
+    if not isinstance(worker_config, PolicyRuntimeConfig):
+        raise TypeError("worker_config must be a PolicyRuntimeConfig")
     max_running_s = validate_max_running_s(max_running_s)
     if recording_config is not None:
         if not isinstance(recording_config, RolloutRecordingConfig):
@@ -308,27 +304,21 @@ def build_policy_worker_specs(
                 ready_name="recorder",
             )
         )
-    specs.extend(
-        [
-            ProcessSpec(
-                "inference",
-                inference_loop,
-                (shared, runtime.policy, worker_config, fingertip_config),
-                ready_name="inference",
+    specs.append(
+        ProcessSpec(
+            "policy",
+            policy_runner_loop,
+            (
+                shared,
+                runtime,
+                worker_config,
+                execute,
+                max_running_s,
+                recording_config,
+                fingertip_config,
             ),
-            ProcessSpec(
-                "policy",
-                policy_executor_loop,
-                (
-                    shared,
-                    runtime,
-                    policy_spec,
-                    execute,
-                    max_running_s,
-                    recording_config,
-                ),
-            ),
-        ]
+            ready_name="policy",
+        )
     )
     if policy_spec.requires_hand or _requires_hand_sensor(policy_spec):
         specs.append(
@@ -349,7 +339,7 @@ def build_policy_worker_specs(
 def run_policy_deployment(
     runtime: ExperimentConfig,
     policy_spec: Any,
-    worker_config: InferenceWorkerConfig,
+    worker_config: PolicyRuntimeConfig,
     execute: bool,
     *,
     prefix: str | None = None,
@@ -359,8 +349,8 @@ def run_policy_deployment(
     """Run a persistent multi-episode policy deployment lifecycle and return its exit code.
 
     ``execute=False`` validates candidates without publication;
-    ``execute=True`` enables coupled arm/hand publication. The inference worker
-    must load successfully before any hardware process is started. The runtime then
+    ``execute=True`` enables coupled arm/hand publication. The policy runner
+    must load and warm up before any hardware process is started. The runtime
     follows ``DISARMED -> hardware readiness -> ARMED -> supervision ->
     verified shutdown``.
     """
@@ -374,8 +364,8 @@ def run_policy_deployment(
         if not execute:
             raise ValueError("recorded rollout requires execute=True")
     validate_policy_runtime_compatibility(policy_spec, runtime)
-    if not isinstance(worker_config, InferenceWorkerConfig):
-        raise TypeError("worker_config must be an InferenceWorkerConfig")
+    if not isinstance(worker_config, PolicyRuntimeConfig):
+        raise TypeError("worker_config must be a PolicyRuntimeConfig")
     if worker_config.spec is not policy_spec:
         raise ValueError("worker PolicySpec must be the validated lifecycle PolicySpec")
     max_running_s = validate_max_running_s(max_running_s)
@@ -445,19 +435,19 @@ def run_policy_deployment(
 
         timeouts = runtime.safety.readiness_timeouts_s
         spec_processes = list(zip(specs, procs))
-        inference_pairs = [
+        policy_pairs = [
             (spec, process)
             for spec, process in spec_processes
-            if spec.ready_name == "inference"
+            if spec.ready_name == "policy"
         ]
-        if len(inference_pairs) != 1:
-            raise RuntimeError("deployment requires exactly one inference worker")
-        _inference_spec, inference_process = inference_pairs[0]
-        start_processes([inference_process])
-        started_procs.append(inference_process)
+        if len(policy_pairs) != 1:
+            raise RuntimeError("deployment requires exactly one policy runner")
+        _policy_spec, policy_process = policy_pairs[0]
+        start_processes([policy_process])
+        started_procs.append(policy_process)
         if not wait_subsystem_ready(
             shared,
-            inference_pairs,
+            policy_pairs,
             timeouts,
             monitored_processes=started_procs,
         ):
@@ -469,12 +459,12 @@ def run_policy_deployment(
                 graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
             )
             return 1
-        print("  inference: ready", flush=True)
+        print("  policy: ready", flush=True)
 
         remaining_pairs = [
             (spec, process)
             for spec, process in spec_processes
-            if process is not inference_process
+            if process is not policy_process
         ]
         remaining_procs = [process for _spec, process in remaining_pairs]
         # Register each successful start immediately.  If a later Process.start()
@@ -528,7 +518,7 @@ def run_policy_deployment(
         )
         operator_thread.start()
 
-        heartbeat_names = {"arm", "hand", "inference", "policy"}
+        heartbeat_names = {"arm", "hand", "policy"}
         if recording_config is not None:
             heartbeat_names.update({"camera", "pointcloud", "recorder"})
         heartbeat_timeouts = {

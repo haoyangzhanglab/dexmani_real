@@ -1,15 +1,13 @@
-"""Process-local policy evidence and strict, atomic offline NPZ persistence.
+"""Legacy async trace reader for previously recorded rollout sidecars.
 
-The executor supplies scheduling facts; this module never selects actions or
-reads runtime state. Physical commands and observations remain in the raw episode.
+Synchronous rollout does not produce this format. Validation retains the v1
+field semantics for the offline visualization tool.
 """
 
 from __future__ import annotations
 
-import os
-import tempfile
-from pathlib import Path
 from collections.abc import Mapping
+from pathlib import Path
 
 import numpy as np
 
@@ -57,18 +55,14 @@ def trace_path_for_episode(episode: str | Path) -> Path:
     return path.parent / f"{path.name}.policy_trace.npz"
 
 
-class PolicyTrace:
-    """Append-only evidence for one successfully begun recorded motion epoch."""
+class _TraceValidator:
+    """Check legacy row ordering, values, and cross references."""
 
     def __init__(self, run_started_monotonic_ns: int, chunk_size: int, action_dim: int):
-        self.run_started_monotonic_ns = _integer(
-            run_started_monotonic_ns, "uint64", minimum=1
-        )
+        _integer(run_started_monotonic_ns, "uint64", minimum=1)
         self.chunk_size = _integer(chunk_size, "int32", minimum=1)
         self.action_dim = _integer(action_dim, "int32", minimum=1)
-        self._predictions: list[tuple] = []
-        self._actions: list[np.ndarray] = []
-        self._decisions: list[tuple] = []
+        self._last_sequence: int | None = None
         self._sequences: set[int] = set()
         self._terminal_ids: set[tuple[int, int]] = set()
 
@@ -87,13 +81,11 @@ class PolicyTrace:
         actions: np.ndarray,
     ) -> None:
         sequence = _integer(sequence, "uint64")
-        timestamps = tuple(
+        # Legacy ingest time was sampled before reading the prediction ring,
+        # so it may precede the ring commit; validate values, not their ordering.
+        for value in (publish_ns, ingest_ns, source_ns, logical_step_ns):
             _integer(value, "uint64", minimum=1)
-            for value in (publish_ns, ingest_ns, source_ns, logical_step_ns)
-        )
-        # Ingest is the scheduler's tick timestamp used for first_index. A ring
-        # commit between that clock sample and the read can legitimately be later.
-        if self._predictions and sequence <= self._predictions[-1][0]:
+        if self._last_sequence is not None and sequence <= self._last_sequence:
             raise ValueError("prediction sequences must strictly increase")
         first_index = _integer(first_index, "int32", minimum=-1)
         if first_index >= self.chunk_size:
@@ -106,13 +98,12 @@ class PolicyTrace:
             raise ValueError(
                 "prediction timing metrics must be finite and non-negative"
             )
-        action_copy = np.array(actions, dtype=np.float64, copy=True)
-        if action_copy.shape != (self.chunk_size, self.action_dim):
+        action_values = np.asarray(actions, dtype=np.float64)
+        if action_values.shape != (self.chunk_size, self.action_dim):
             raise ValueError("prediction actions shape does not match trace dimensions")
-        if not np.all(np.isfinite(action_copy)):
+        if not np.all(np.isfinite(action_values)):
             raise ValueError("prediction actions must be finite")
-        self._predictions.append((sequence, *timestamps, first_index, *metrics))
-        self._actions.append(action_copy)
+        self._last_sequence = sequence
         self._sequences.add(sequence)
 
     def add_decision(
@@ -140,52 +131,7 @@ class PolicyTrace:
         identity = (sequence, chunk_index)
         if identity in self._terminal_ids:
             raise ValueError("duplicate terminal decision")
-        self._decisions.append((sequence, chunk_index, due_ns, event_ns, frame_status))
         self._terminal_ids.add(identity)
-
-    def to_payload(self) -> dict[str, np.ndarray]:
-        payload = {
-            "trace_version": np.asarray(TRACE_VERSION, dtype=np.int32),
-            "run_started_monotonic_ns": np.asarray(
-                self.run_started_monotonic_ns, dtype=np.uint64
-            ),
-            "chunk_size": np.asarray(self.chunk_size, dtype=np.int32),
-            "action_dim": np.asarray(self.action_dim, dtype=np.int32),
-        }
-        for fields, rows in (
-            (_PREDICTIONS, self._predictions),
-            (_DECISIONS, self._decisions),
-        ):
-            for index, (key, dtype) in enumerate(fields.items()):
-                payload[key] = np.asarray([row[index] for row in rows], dtype=dtype)
-        payload["actions"] = (
-            np.stack(self._actions)
-            if self._actions
-            else np.empty((0, self.chunk_size, self.action_dim), dtype=np.float64)
-        )
-        return payload
-
-    def save(self, path: str | Path) -> None:
-        """Publish only a closed compressed file; the caller owns episode lifecycle."""
-        path = Path(path)
-        temporary: str | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=path.parent,
-                prefix=f".{path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as stream:
-                temporary = stream.name
-                np.savez_compressed(stream, **self.to_payload())
-            # Same-directory hard-link publication is atomic and refuses every
-            # occupied destination, including a symlink or a concurrent writer.
-            # An exists() check followed by replace() cannot provide that contract.
-            os.link(temporary, path)
-        finally:
-            if temporary is not None and os.path.exists(temporary):
-                os.unlink(temporary)
 
 
 def validate_trace(payload: Mapping[str, np.ndarray]) -> None:
@@ -203,7 +149,7 @@ def validate_trace(payload: Mapping[str, np.ndarray]) -> None:
             raise ValueError(f"policy trace {key} must be scalar")
     if int(payload["trace_version"]) != TRACE_VERSION:
         raise ValueError("unsupported policy trace version")
-    trace = PolicyTrace(
+    trace = _TraceValidator(
         int(payload["run_started_monotonic_ns"]),
         int(payload["chunk_size"]),
         int(payload["action_dim"]),
@@ -215,7 +161,7 @@ def validate_trace(payload: Mapping[str, np.ndarray]) -> None:
             raise ValueError("policy trace row arrays have inconsistent shapes")
     if payload["actions"].shape != (p, trace.chunk_size, trace.action_dim):
         raise ValueError("policy trace actions have inconsistent shape")
-    # Reuse the append boundary so runtime and loader cannot disagree on semantics.
+    # Preserve the original v1 row and reference admission rules.
     for i in range(p):
         trace.add_prediction(
             sequence=payload["prediction_sequence"][i],

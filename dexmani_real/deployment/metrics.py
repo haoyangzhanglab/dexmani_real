@@ -18,13 +18,9 @@ class PolicyStats:
     inference_latency_ms: float | None = None
     observation_age_ms: float | None = None
     observation_skew_ms: float | None = None
-    schedule_lateness_ms: float | None = None
     publication_interval_ms: float | None = None
-    skipped_prefix_steps: int | None = None
     safety_rejection_count: int = 0
-    command_progress_timeout_count: int = 0
     ik_rejection_count: int = 0
-    stale_prediction_count: int = 0
     rejection_reasons: dict[str, int] = field(default_factory=dict)
 
     def log_rejection(self, reason: str) -> None:
@@ -33,21 +29,18 @@ class PolicyStats:
         self.rejection_reasons[reason] = count
         if count == 1:
             logger.warning(
-                "executor: rejected policy step: %s (repeats summarized at episode end)",
+                "policy: rejected policy step: %s (repeats summarized at episode end)",
                 reason,
             )
         else:
-            logger.debug("executor: rejected policy step: %s (count=%d)", reason, count)
+            logger.debug("policy: rejected policy step: %s (count=%d)", reason, count)
 
     def log_summary(self) -> None:
         """Report episode counts without presenting old timings as live metrics."""
         logger.info(
-            "executor summary: safety_rejections=%d ik_rejections=%d "
-            "stale_predictions=%d command_progress_timeouts=%d%s",
+            "policy summary: safety_rejections=%d ik_rejections=%d%s",
             self.safety_rejection_count,
             self.ik_rejection_count,
-            self.stale_prediction_count,
-            self.command_progress_timeout_count,
             " | " + "; ".join(
                 f"{reason}: {count}" for reason, count in self.rejection_reasons.items()
             ) if self.rejection_reasons else "",
@@ -57,20 +50,14 @@ class PolicyStats:
         """Return latest timings and cumulative counts for this rollout."""
         result: dict[str, int | float] = {
             "safety_rejection_count": self.safety_rejection_count,
-            "command_progress_timeout_count": self.command_progress_timeout_count,
         }
-        optional_counts = {
-            "ik_rejection_count": self.ik_rejection_count,
-            "stale_prediction_count": self.stale_prediction_count,
-        }
-        result.update({name: count for name, count in optional_counts.items() if count})
+        if self.ik_rejection_count:
+            result["ik_rejection_count"] = self.ik_rejection_count
         for name in (
             "inference_latency_ms",
             "observation_age_ms",
             "observation_skew_ms",
-            "schedule_lateness_ms",
             "publication_interval_ms",
-            "skipped_prefix_steps",
         ):
             value = getattr(self, name)
             if value is not None and math.isfinite(value) and value >= 0:

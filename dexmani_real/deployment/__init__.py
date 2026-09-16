@@ -1,6 +1,6 @@
 """Learned-policy deployment runtime.
 
-Model contracts, the inference worker, and the policy executor reuse the robot
-runtime, safety, IPC, and lifecycle machinery. The model output is a proposal
-only; the policy executor is the sole learned-policy action producer.
+The synchronous policy runner owns the model and action queue, reusing the
+robot runtime, safety, IPC, and lifecycle machinery. Model output is a proposal
+until it passes the existing command preparation and publication boundaries.
 """

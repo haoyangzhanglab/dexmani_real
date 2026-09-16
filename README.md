@@ -203,7 +203,7 @@ python examples/visualize_episode_processed.py <processed.h5> --info
 python examples/run_policy.py <policy/task/experiment>
 ```
 
-常用实验参数包括 artifact、inference steps、replan interval、seed、episode 数量、单 episode 时长和 device，例如：
+常用实验参数包括 artifact、inference steps、seed、episode 数量、单 episode 时长和 device，例如：
 
 ```bash
 python examples/run_policy.py <policy/task/experiment> \
@@ -213,6 +213,13 @@ python examples/run_policy.py <policy/task/experiment> \
 ```
 
 该入口 **始终连接真实硬件**。
+
+Policy deployment 使用同步推理：单个 policy 子进程拥有 model/CUDA 和动作调度，
+先完成加载与 warmup，再启动硬件 workers。每次 `policy.predict()` 返回
+`PolicySpec.n_action_steps` 个动作，放入进程内队列，按 `PolicySpec.control_dt_s`
+逐个下发；队列耗尽后才重新观测和推理。推理耗时体现为 chunk 边界的停顿，
+新 chunk 从推理完成后的当前时间开始，不跳动作、不补发追赶。
+Arm/Hand workers 继续各自拥有 SDK，下发动作不等待物理收敛。
 
 ### 导出并使用指定检查点
 
@@ -247,17 +254,18 @@ python examples/run_policy.py \
 rollouts/<policy>/<task>/<experiment>/session_*/
 ```
 
-其中保存 rollout 数据、resolved run configuration 和用于分析 raw policy prediction 的 policy trace。
+其中保存 raw rollout 数据和 resolved run configuration。同步推理期间采样 hook 暂停，
+记录保留实际时间戳，不补造样本；不生成异步 prediction trace sidecar。
 
 Policy deployment 使用与 teleoperation / replay 相同的 runtime safety 与 command publication infrastructure。Policy output 会在进入硬件执行路径前经过必要的表示转换、约束处理与安全验证；robot worker 保留硬件边界处的最终检查。无法安全继续的 rollout 会结束，而不会把未执行动作视作已完成的物理进度。
 
-Rollout 结果可使用：
+已有 legacy policy trace sidecar 的旧 rollout 可使用：
 
 ```bash
 python examples/visualize_policy_rollout.py <rollout-episode> --info
 ```
 
-进行离线检查。
+进行离线检查；该工具不适用于没有该 sidecar 的同步 rollout。
 
 ## Calibration
 

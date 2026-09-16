@@ -16,10 +16,10 @@ from dexmani_real.robot.model import ARM_JOINT_SHAPE, XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.utils.limits import validate_hand_limit_nesting
 
 _HEARTBEAT_SUBSYSTEMS = frozenset(
-    {"arm", "hand", "policy", "recorder", "vr", "camera", "pointcloud", "inference"}
+    {"arm", "hand", "policy", "recorder", "vr", "camera", "pointcloud"}
 )
 _READINESS_SUBSYSTEMS = frozenset(
-    {"arm", "hand", "camera", "pointcloud", "recorder", "policy", "vr", "inference"}
+    {"arm", "hand", "camera", "pointcloud", "recorder", "policy", "vr"}
 )
 
 
@@ -600,23 +600,14 @@ class PolicyParams:
     """Policy / teleop parameters — single source of truth."""
 
     control_hz: float = 16.0
-    # PolicySpec owns prediction shape/history and action-grid spacing.
-    # Real owns how often it re-observes and replans on that grid.
-    replan_steps: int = 8
-    # Executor polling is deliberately faster than the 16 Hz action grid: it
-    # shortens arm/hand progress and publication-result phase delay without raising
-    # command rate.
+    # Teleoperation polls faster than its command rate. Policy uses PolicySpec dt.
     executor_poll_hz: float = 128.0
     # Learned-policy inference and causal observation timing. Model shape,
     # history, and action horizon remain PolicySpec-owned.
     max_input_age_s: float = 0.15
     max_observation_skew_s: float = 0.10
     max_grid_lag_s: float = 0.08
-    max_command_silence_s: float = 2.0
     action_validity_s: float = 0.5
-    # Maximum interval with published work but no arm/hand acceptance progress.
-    command_progress_timeout_s: float = 0.5
-    first_command_timeout_s: float = 5.0
     action_apply_timeout_s: float = 0.75
     arm_state_stale_threshold_s: float = 0.5
     quit_save_timeout_s: float = 30.0
@@ -655,10 +646,6 @@ class PolicyParams:
     def validate(self) -> None:
         if not np.isfinite(self.control_hz) or self.control_hz <= 0:
             raise ValueError(f"control_hz={self.control_hz} must be > 0")
-        if isinstance(self.replan_steps, bool) or not isinstance(self.replan_steps, int):
-            raise TypeError("replan_steps must be an int")
-        if self.replan_steps < 1:
-            raise ValueError("replan_steps must be >= 1")
         if (
             not np.isfinite(self.executor_poll_hz)
             or self.executor_poll_hz < self.control_hz
@@ -668,19 +655,11 @@ class PolicyParams:
             self.max_input_age_s,
             self.max_observation_skew_s,
             self.max_grid_lag_s,
-            self.max_command_silence_s,
             self.action_validity_s,
-            self.command_progress_timeout_s,
-            self.first_command_timeout_s,
         )
         if not all(np.isfinite(value) and value > 0 for value in deployment_timing):
             raise ValueError(
                 "policy deployment timing values must be finite and positive"
-            )
-        if self.command_progress_timeout_s > self.action_validity_s:
-            raise ValueError(
-                "policy.command_progress_timeout_s must not exceed "
-                "policy.action_validity_s"
             )
         timing = (
             self.action_apply_timeout_s,
@@ -948,12 +927,11 @@ class SafetyParams:
         default_factory=lambda: {
             "arm": 1.0,
             "hand": 1.0,
-            "policy": 1.0,
+            "policy": 5.0,  # Includes blocking model inference.
             "recorder": 2.0,
             "vr": 5.0,
             "camera": 2.0,
             "pointcloud": 2.0,
-            "inference": 5.0,
         }
     )
     readiness_timeouts_s: Mapping[str, float] = field(
@@ -965,7 +943,6 @@ class SafetyParams:
             "recorder": 15.0,
             "policy": 120.0,
             "vr": 120.0,
-            "inference": 120.0,
         }
     )
     shutdown_timeout_s: float = 65.0

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline prediction-to-execution debugging of a published rollout episode.
+"""Offline debugging of legacy async rollouts with an existing policy trace.
 
 Saved predictions, terminal decisions, and raw state/commands/RGB-D/contact are
 exact recorded evidence. Point clouds use current production reconstruction;
@@ -49,7 +49,7 @@ def prediction_xyz(actions: np.ndarray) -> np.ndarray:
 
 
 def scheduled_targets(trace: dict[str, np.ndarray], control_hz: float) -> np.ndarray:
-    """Reconstruct logical targets, distinct from Executor control-slot due times."""
+    """Reconstruct legacy logical targets separately from control-slot due times."""
     if not np.isfinite(control_hz) or control_hz <= 0:
         raise ValueError("control_hz must be finite and positive")
     step_dt_ns = int(round((1.0 / control_hz) * 1e9))
@@ -123,7 +123,7 @@ def visualize(episode: Path, trace: dict[str, np.ndarray], hz: float, args) -> N
 
     class RolloutVisualizer(EpisodeVisualizer):
         def _preload_state(self):
-            # Policy raw rows do not carry the inference worker's observation
+            # Legacy raw rows do not carry the old inference worker's observation
             # verdict. Show sample validity and camera freshness instead.
             self._available = {
                 "arm": ["arm_qpos"],

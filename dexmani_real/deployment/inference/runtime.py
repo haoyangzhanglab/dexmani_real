@@ -1,4 +1,4 @@
-"""Typed model runtime contract owned by the inference child."""
+"""Typed model runtime contract owned by the policy child."""
 
 from __future__ import annotations
 
@@ -10,12 +10,12 @@ from dexmani_real.deployment.inference.observation import PolicyObservation
 
 
 class PolicyRuntime(Protocol):
-    """Model boundary owned by the inference process."""
+    """Model boundary owned by the policy process."""
 
     def warmup(self, *, samples: int) -> tuple[float, ...]: ...
 
     def reset_episode(self) -> None: ...
 
-    def predict_action_chunk(self, observation: PolicyObservation) -> np.ndarray: ...
+    def predict(self, observation: PolicyObservation) -> np.ndarray: ...
 
     def close(self) -> None: ...

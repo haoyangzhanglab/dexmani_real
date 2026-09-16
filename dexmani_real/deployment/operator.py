@@ -1,7 +1,7 @@
 """Operator keyboard control for learned-policy deployment (B/S/H/Q/ESC).
 
 Runs as a daemon thread in the Main process.  B/S/Q/ESC translate to the shared
-request flags the executor and supervisor already consume (``start_request``,
+request flags the policy runner and supervisor already consume (``start_request``,
 ``stop_request``, ``quit_requested``, ``estop_request``). When a caller owns a
 home lifecycle, H orchestrates a collision-checked hand + arm return-home from
 ARMED using a Main-process planner that mirrors the replay collision setup
@@ -61,7 +61,7 @@ def _request_immediate_quit(shared: RuntimeChannels) -> None:
 def build_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
     """Construct the collision-checked home planner (mirrors replay setup).
 
-    The executor's own planner only carries workspace bounds; a safe
+    The policy runner's planner only carries workspace bounds; a safe
     return-home needs the full collision model (hand-dof + table + static
     boxes), so the Main process builds its own.
     """
@@ -224,7 +224,7 @@ def run_operator_control(
                 elif signal is OperatorCommand.STOP:
                     # The keyboard completed the motion fence before enqueueing.
                     # STOP still suppresses HOME/BEGIN in this batch, but must
-                    # not revoke again after the executor acknowledges it.
+                    # not revoke again after the policy runner acknowledges it.
                     continue
                 elif signal is OperatorCommand.PAUSE:
                     logger.warning(

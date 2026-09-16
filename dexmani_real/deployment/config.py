@@ -1,4 +1,4 @@
-"""PolicySpec compatibility and narrow inference-worker configuration.
+"""PolicySpec compatibility and narrow policy-runtime configuration.
 
 Policy owns model shape, modality, horizon, and action-grid spacing. Real
 validates that spacing against its control frequency and owns safety timing.
@@ -23,7 +23,6 @@ from dexmani_real.config.pointcloud import (
 )
 from dexmani_real.dataset.contracts import canonical_json
 from dexmani_real.ipc.schema import (
-    MAX_PREDICTION_STEPS,
     POINT_CLOUD_FEATURE_DIM,
     SUPPORTED_POINT_CLOUD_COUNTS,
 )
@@ -65,7 +64,7 @@ _SUPPORTED_OBSERVATION_FIELDS = frozenset(
 
 
 def validate_max_running_s(max_running_s: float | None) -> float | None:
-    """Validate the executor-owned B-relative episode duration limit."""
+    """Validate the runner-owned B-relative episode duration limit."""
     if max_running_s is None:
         return None
     if isinstance(max_running_s, bool):
@@ -214,14 +213,6 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
             "Real deployment requires hand actions because its control schema is "
             "arm7 + hand12"
         )
-    if policy_spec.chunk_size > MAX_PREDICTION_STEPS:
-        raise ValueError(
-            f"Policy chunk_size exceeds Real IPC capacity {MAX_PREDICTION_STEPS}"
-        )
-    if runtime.policy.replan_steps > policy_spec.chunk_size:
-        raise ValueError(
-            "policy.replan_steps exceeds the available Policy future chunk"
-        )
     if policy_spec.action_key not in {"action", "action_ee"}:
         raise ValueError("Policy action_key is unsupported by Real")
     expected_control_dim = 21 if policy_spec.action_key == "action_ee" else 19
@@ -294,8 +285,8 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
 
 
 @dataclass(frozen=True)
-class InferenceWorkerConfig:
-    """Narrow Policy-owned inputs required by the inference child.
+class PolicyRuntimeConfig:
+    """Narrow Policy-owned inputs required by the policy child.
 
     ``artifact`` pins the resolved deployment filename so the child cannot
     silently switch checkpoints after the parent inspected them; Policy owns
@@ -411,7 +402,7 @@ class FingertipAssemblerConfig:
 __all__ = [
     "FIXED_POLICY_RUNTIME_TARGET",
     "FingertipAssemblerConfig",
-    "InferenceWorkerConfig",
+    "PolicyRuntimeConfig",
     "RolloutRecordingConfig",
     "validate_policy_runtime_compatibility",
     "validate_max_running_s",

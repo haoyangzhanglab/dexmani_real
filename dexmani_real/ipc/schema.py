@@ -18,12 +18,6 @@ from dexmani_real.robot.model import (
     HAND_TACTILE_SUM_SHAPE,
 )
 
-# Runtime IPC capacity for flat learned-policy predictions. Adapters must not
-# truncate larger requests, and the executor decodes only the validated 19-D
-# joint or 21-D EE representations.
-MAX_PREDICTION_STEPS = 32
-MAX_POLICY_ACTION_DIM = 21
-
 # Realtime point-cloud transport is fixed-size per deployment. Keeping the
 # supported sizes explicit prevents a model/RuntimeChannels shape mismatch from
 # reaching the inference boundary.
@@ -102,26 +96,6 @@ COUPLED_COMMAND_DTYPE = np.dtype(
         ("hand_present", "<u1"),
         ("arm_qpos", "<f8", ARM_JOINT_SHAPE),
         ("hand_qpos", "<f8", HAND_JOINT_SHAPE),
-    ],
-    align=True,
-)
-
-# One flat policy prediction is written per inference; the executor consumes
-# only the latest. The three timing fields are required float64 milliseconds
-# for the exact observation/inference pair and must be finite and non-negative.
-# ``num_steps`` and ``action_dim`` describe the populated prefix of the
-# fixed-capacity payload for an independent IPC decoder.
-PREDICTION_DTYPE = np.dtype(
-    [
-        ("run_generation", "<u8"),
-        ("source_monotonic_ns", "<u8"),
-        ("logical_step_monotonic_ns", "<u8"),
-        ("inference_latency_ms", "<f8"),
-        ("observation_age_ms", "<f8"),
-        ("observation_skew_ms", "<f8"),
-        ("num_steps", "<u4"),
-        ("action_dim", "<u4"),
-        ("actions", "<f8", (MAX_PREDICTION_STEPS, MAX_POLICY_ACTION_DIM)),
     ],
     align=True,
 )
@@ -285,10 +259,7 @@ __all__ = [
     "CAMERA_FRAME_HEADER_DTYPE",
     "COUPLED_COMMAND_DTYPE",
     "HAND_STATE_DTYPE",
-    "MAX_POLICY_ACTION_DIM",
-    "MAX_PREDICTION_STEPS",
     "POINT_CLOUD_FEATURE_DIM",
-    "PREDICTION_DTYPE",
     "SUPPORTED_POINT_CLOUD_COUNTS",
     "VR_FRAME_DTYPE",
     "make_pointcloud_frame_dtype",

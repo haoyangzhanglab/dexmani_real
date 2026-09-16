@@ -1,4 +1,4 @@
-"""Pure timing calculations for immutable learned-policy action grids."""
+"""Periodic recording deadline calculation."""
 
 from __future__ import annotations
 
@@ -22,34 +22,6 @@ def _require_uint64_integer(
     if result > _UINT64_MAX:
         raise ValueError(f"{name} exceeds uint64")
     return result
-
-
-def first_future_step_index(
-    logical_start_ns: int,
-    step_dt_ns: int,
-    now_ns: int,
-    num_steps: int,
-) -> int | None:
-    """Return the first action index whose logical target is strictly future."""
-    logical_start = _require_uint64_integer(
-        logical_start_ns,
-        name="logical_start_ns",
-        positive=True,
-    )
-    step_dt = _require_uint64_integer(
-        step_dt_ns,
-        name="step_dt_ns",
-        positive=True,
-    )
-    now = _require_uint64_integer(now_ns, name="now_ns", positive=True)
-    count = _require_uint64_integer(num_steps, name="num_steps", positive=True)
-    final_offset = (count - 1) * step_dt
-    if final_offset > _UINT64_MAX or logical_start > _UINT64_MAX - final_offset:
-        raise ValueError("action timeline exceeds uint64")
-    if now < logical_start:
-        return 0
-    index = (now - logical_start) // step_dt + 1
-    return int(index) if index < count else None
 
 
 def next_periodic_deadline_ns(

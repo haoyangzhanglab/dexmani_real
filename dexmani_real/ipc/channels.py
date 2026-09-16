@@ -19,7 +19,6 @@ from dexmani_real.ipc.schema import (
     ARM_STATE_DTYPE,
     COUPLED_COMMAND_DTYPE,
     HAND_STATE_DTYPE,
-    PREDICTION_DTYPE,
     SUPPORTED_POINT_CLOUD_COUNTS,
     VR_FRAME_DTYPE,
     make_pointcloud_frame_dtype,
@@ -29,8 +28,6 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-# Keep the last committed prediction readable while the next slot is written.
-PREDICTION_RING_MAXLEN = 2
 # ``runtime.safety.SafetyState`` owns the enum; IPC carries this stable wire value
 # without importing the runtime state machine back into the data plane.
 DISARMED_SAFETY_STATE_WIRE_VALUE = 0
@@ -127,7 +124,6 @@ _RING_RESOURCE_NAMES = (
     "hand_state_ring",
     "coupled_cmd_ring",
     "record_sample_ring",
-    "prediction_ring",
     "pointcloud_ring",
 )
 _QUEUE_RESOURCE_NAMES = ("arm_home_q",)
@@ -142,7 +138,6 @@ HEARTBEAT_FIELDS: tuple[str, ...] = (
     "vr",
     "camera",
     "pointcloud",
-    "inference",
 )
 HEARTBEAT_INDEX: dict[str, int] = {
     name: index for index, name in enumerate(HEARTBEAT_FIELDS)
@@ -157,7 +152,6 @@ READY_FIELDS: tuple[str, ...] = (
     "vr",
     "policy",
     "recorder",
-    "inference",
 )
 READY_INDEX: dict[str, int] = {name: index for index, name in enumerate(READY_FIELDS)}
 
@@ -181,8 +175,7 @@ class RuntimeChannels:
     hand_state_ring: SharedMemoryRingBuffer  # hand -> policy
     coupled_cmd_ring: SharedMemoryRingBuffer  # serialized control -> arm/hand endpoint
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
-    prediction_ring: SharedMemoryRingBuffer  # inference -> policy executor, single latest
-    pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> inference
+    pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> policy
 
     arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, generation)
     # Arm worker -> HOME waiter; zero until success, stale after generation changes.
@@ -205,11 +198,11 @@ class RuntimeChannels:
         Any  # Main -> camera; keep native RGB-D payload publication active
     )
     pointcloud_requested: Any  # Main -> pointcloud worker
-    start_request: Any  # Main -> policy executor: B (start a new policy run)
-    # Main/operator -> policy executor: true only after this process completed the
+    start_request: Any  # Main -> policy runner: B (start a new policy run)
+    # Main/operator -> policy runner: true only after Main completed the
     # authorized hand-home + collision-checked arm-home sequence.
     physical_home_completed: Any
-    # Main/operator -> policy executor: explicit S request.
+    # Main/operator -> policy runner: explicit S request.
     stop_request: Any
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write
@@ -313,12 +306,6 @@ class RuntimeChannels:
             f"{prefix}_record_sample",
             dtype=make_record_sample_dtype(rgb_shape, depth_shape),
             maxlen=cfg.record_sample_ring_maxlen,
-            create=True,
-        )
-        storage.prediction_ring = SharedMemoryRingBuffer(
-            f"{prefix}_prediction",
-            dtype=PREDICTION_DTYPE,
-            maxlen=PREDICTION_RING_MAXLEN,
             create=True,
         )
         storage.pointcloud_ring = SharedMemoryRingBuffer(
