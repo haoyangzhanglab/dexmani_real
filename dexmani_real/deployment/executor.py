@@ -1306,6 +1306,17 @@ class PolicyRunner:
             return True
         return False
 
+    def _next_control_boundary_ns(self) -> int | None:
+        """Return the next action-cadence boundary, anchored to actual publication.
+
+        ``None`` means no command has been published yet (episode first chunk):
+        the queue may be filled immediately.  Otherwise a command must occupy one
+        full ``step_dt_ns`` before the next dispatch or fresh observation query.
+        """
+        if self.last_publication_ns is None:
+            return None
+        return self.last_publication_ns + self.step_dt_ns
+
     def _run_active_tick(self, now_ns: int) -> None:
         assert self.run_started_ns is not None
         if not self._running_generation_is_live():
@@ -1320,77 +1331,80 @@ class PolicyRunner:
             return
         if self._running_time_expired(now_ns):
             return
-        if not self.actions:
-            self.observation_id += 1
-            observation = _build_observation(
-                self.shared,
-                self.runtime.policy,
-                self.policy_spec,
-                observation_id=self.observation_id,
-                run_generation=self.run_generation,
-                run_started_ns=self.run_started_ns,
-                anchor_ns=time.monotonic_ns(),
-                step_dt_ns=self.step_dt_ns,
-            )
-            if observation is None:
-                return
-            self.stats.observation_age_ms, self.stats.observation_skew_ms = (
-                observation_timing_ms(observation)
-            )
-            policy_observation = _to_policy_observation(
-                observation,
-                self.policy_spec,
-                fingertip_runtime=self.fingertip_runtime,
-            )
-            if not self._running_generation_is_live():
-                return
-            started_ns = time.monotonic_ns()
-            if self._running_time_expired(started_ns):
-                return
-            predicted = self.model_runtime.predict(policy_observation)
-            finished_ns = time.monotonic_ns()
-            self.stats.inference_latency_ms = (finished_ns - started_ns) / 1e6
-            # Main can revoke motion during blocking inference. Never accept its
-            # result before rechecking the episode's original generation/state.
-            if not self._running_generation_is_live():
-                logger.debug(
-                    "policy discard generation=%s query=%s reason=inference_run_boundary",
-                    self.run_generation, self.observation_id,
-                )
-                self.actions.clear()
-                return
-            if self._running_time_expired(finished_ns) or not self._poll_recorder():
-                return
-            self.chunk_sources = observation_sources(observation)
-            self.chunk_action_index = 0
-            logger.debug(
-                "policy query generation=%s query=%s anchor_ns=%s references_ns=%s sources_ns=%s inference_start_ns=%s inference_end_ns=%s predicted=%s",
-                self.run_generation,
-                self.observation_id,
-                observation.anchor_monotonic_ns,
-                _select_control_grid_reference_ns(
-                    run_started_ns=self.run_started_ns,
-                    anchor_ns=observation.anchor_monotonic_ns,
-                    history_len=int(self.policy_spec.n_obs_steps),
-                    step_dt_ns=self.step_dt_ns,
-                )[0].tolist(),
-                self.chunk_sources,
-                started_ns,
-                finished_ns,
-                predicted.tolist(),
-            )
-            self.actions.extend(predicted)
 
-        if not self.actions:
+        # Action cadence is anchored solely to the previous physical publication.
+        # Neither a chunk[1:] dispatch nor a queue-empty replan may start before
+        # that publication has occupied one full control period.
+        boundary_ns = self._next_control_boundary_ns()
+        if boundary_ns is not None and now_ns < boundary_ns:
             return
-        now_ns = time.monotonic_ns()
-        if (
-            self.last_publication_ns is not None
-            and now_ns < self.last_publication_ns + self.step_dt_ns
-        ):
+
+        if self.actions:
+            self._dispatch_action(self.actions[0])
             return
-        if not self._running_generation_is_live() or self._running_time_expired(now_ns):
+
+        # Queue empty and boundary reached: fresh synchronous replan.
+        self.observation_id += 1
+        observation = _build_observation(
+            self.shared,
+            self.runtime.policy,
+            self.policy_spec,
+            observation_id=self.observation_id,
+            run_generation=self.run_generation,
+            run_started_ns=self.run_started_ns,
+            anchor_ns=time.monotonic_ns(),
+            step_dt_ns=self.step_dt_ns,
+        )
+        if observation is None:
             return
+        self.stats.observation_age_ms, self.stats.observation_skew_ms = (
+            observation_timing_ms(observation)
+        )
+        policy_observation = _to_policy_observation(
+            observation,
+            self.policy_spec,
+            fingertip_runtime=self.fingertip_runtime,
+        )
+        if not self._running_generation_is_live():
+            return
+        started_ns = time.monotonic_ns()
+        if self._running_time_expired(started_ns):
+            return
+        predicted = self.model_runtime.predict(policy_observation)
+        finished_ns = time.monotonic_ns()
+        self.stats.inference_latency_ms = (finished_ns - started_ns) / 1e6
+        # Main can revoke motion during blocking inference. Never accept its
+        # result before rechecking the episode's original generation/state.
+        if not self._running_generation_is_live():
+            logger.debug(
+                "policy discard generation=%s query=%s reason=inference_run_boundary",
+                self.run_generation, self.observation_id,
+            )
+            self.actions.clear()
+            return
+        if self._running_time_expired(finished_ns) or not self._poll_recorder():
+            return
+        self.chunk_sources = observation_sources(observation)
+        self.chunk_action_index = 0
+        logger.debug(
+            "policy query generation=%s query=%s anchor_ns=%s references_ns=%s sources_ns=%s inference_start_ns=%s inference_end_ns=%s predicted=%s",
+            self.run_generation,
+            self.observation_id,
+            observation.anchor_monotonic_ns,
+            _select_control_grid_reference_ns(
+                run_started_ns=self.run_started_ns,
+                anchor_ns=observation.anchor_monotonic_ns,
+                history_len=int(self.policy_spec.n_obs_steps),
+                step_dt_ns=self.step_dt_ns,
+            )[0].tolist(),
+            self.chunk_sources,
+            started_ns,
+            finished_ns,
+            predicted.tolist(),
+        )
+        self.actions.extend(predicted)
+        # The boundary elapsed before observation/inference began; dispatch the
+        # first action immediately without waiting another control period.
         self._dispatch_action(self.actions[0])
 
     def run(self) -> None:
@@ -1398,7 +1412,6 @@ class PolicyRunner:
         try:
             while self.shared.is_running.value:
                 tick_started_ns = time.monotonic_ns()
-                previous_publication_ns = self.last_publication_ns
                 self._decision_recorded = False
                 self._recorder_start_wait_ms = 0.0
                 phase_ms = {"active_control": 0.0, "recording": 0.0, "metrics": 0.0}
@@ -1441,21 +1454,13 @@ class PolicyRunner:
                         ) / 1e6
                 phase_ms["work"] = (time.monotonic_ns() - tick_started_ns) / 1e6
                 logger.debug("policy loop phases_ms=%s", phase_ms)
-                # Prepare the next chunk immediately after its predecessor ends.
-                if (
-                    self.run_started_ns is not None
-                    and not self.actions
-                    and self.last_publication_ns != previous_publication_ns
-                ):
-                    continue
                 wait_s = self.poll_period_s
-                if self.actions and self.last_publication_ns is not None:
-                    remaining_s = (
-                        self.last_publication_ns + self.step_dt_ns - time.monotonic_ns()
-                    ) / 1e9
+                boundary_ns = self._next_control_boundary_ns()
+                if boundary_ns is not None:
+                    remaining_s = (boundary_ns - time.monotonic_ns()) / 1e9
                     if remaining_s > 0:
                         wait_s = min(wait_s, remaining_s)
-                time.sleep(wait_s)
+                time.sleep(max(0.0, wait_s))
         finally:
             # A runtime stop can end the loop before its next boundary poll.
             # Storage finalization remains owned by RecorderIO.
