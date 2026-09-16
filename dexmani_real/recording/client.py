@@ -110,10 +110,12 @@ class RecorderClient:
         return self._last_stop_result.error if self._last_stop_result else None
 
     def _fail_transport(self, error: str) -> None:
+        # A transport failure is this client's own unavailability, not a
+        # physical fault. The caller (PolicyRunner) decides what it means for
+        # the policy workflow.
         logger.error("RecorderIO unavailable: %s", error)
         self._unavailable = True
         self._recording = False
-        self.shared.error_state.value = True
         self._last_stop_result = RecorderStopResult(
             done=False,
             error=error,

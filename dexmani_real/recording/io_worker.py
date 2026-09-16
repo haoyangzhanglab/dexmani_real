@@ -373,8 +373,10 @@ class _RecorderIOSession:
         if thread is None:
             raise RuntimeError("episode finalizer did not start")
         if time.monotonic() - pending.started_monotonic_s >= RECORDER_STOP_TIMEOUT_S:
+            # An episode-finalization timeout is this recorder's own evidence
+            # failure, not a physical/control fault.
             self.fatal = True
-            self.shared.error_state.value = True
+            self.shared.session_failed.value = True
             raise RuntimeError("episode finalization timed out")
         if thread.is_alive():
             return
@@ -384,8 +386,10 @@ class _RecorderIOSession:
         except Empty as exc:
             raise RuntimeError("episode finalizer returned no result") from exc
         if not released:
+            # Still inside the ordinary step loop (not a process shutdown
+            # confirmation), so this is an evidence failure, not a fault.
             self.fatal = True
-            self.shared.error_state.value = True
+            self.shared.session_failed.value = True
             raise RuntimeError("episode finalizer retained unreleased resources")
         if error is not None and not isinstance(error, EpisodeFinalizationError):
             raise RuntimeError("unexpected episode finalizer failure") from error
@@ -418,6 +422,10 @@ class _RecorderIOSession:
             )
             thread.join(timeout=remaining_s)
             if thread.is_alive():
+                # The finalizer thread cannot be confirmed stopped during
+                # process shutdown; the caller cannot safely reclaim shared
+                # IPC. Fail closed with the physical fault latch, not
+                # session_failed.
                 self.fatal = True
                 self.shared.error_state.value = True
                 return False
@@ -471,15 +479,19 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
             session.step()
             limiter.wait()
     except Exception:
+        # A RecorderIO crash is an evidence failure, not a physical/control
+        # fault: the arm/hand workers and their safety fencing are unaffected.
         crashed = True
         if session is not None:
             session.fatal = True
-        shared.error_state.value = True
+        shared.session_failed.value = True
         logger.error("RecorderIO process crashed", exc_info=True)
     finally:
         if session is not None:
             try:
                 if not session.shutdown():
+                    # Shutdown could not confirm the finalizer thread stopped;
+                    # shared IPC cannot safely be reclaimed. Fail closed.
                     crashed = True
                     shared.error_state.value = True
             except Exception:

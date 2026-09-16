@@ -546,7 +546,7 @@ class PolicyRunner:
                 stop_reason="recorder_fault",
                 recorder_save=False,
             )
-            self._latch_recording_fault()
+            self._request_failed_session_shutdown()
             return not finished
         ended = False
         if result.error:
@@ -567,7 +567,7 @@ class PolicyRunner:
                 stop_reason="recorder_fault",
                 recorder_save=False,
             )
-            self._latch_recording_fault()
+            self._request_failed_session_shutdown()
         elif (
             self.recorder.stop_pending or result.done
         ) and self.run_started_ns is not None:
@@ -584,18 +584,20 @@ class PolicyRunner:
                     stop_reason="recorder_fault",
                     recorder_save=False,
                 )
-                self._latch_recording_fault()
+                self._request_failed_session_shutdown()
         if result.done:
             self._complete_recording(result)
         return not ended
 
-    def _latch_recording_fault(self) -> None:
-        """Fail closed: a session without trustworthy raw evidence must end.
+    def _request_failed_session_shutdown(self) -> None:
+        """Request a failed-session shutdown; this is not a hardware fault.
 
         Motion is already fenced by the invalidation that precedes this call;
-        the supervisor observes the sticky error and runs verified shutdown.
+        the supervisor observes session_failed and runs verified shutdown to
+        DISARMED rather than SafetyState.FAULT.
         """
-        self.shared.error_state.value = True
+        self.shared.session_failed.value = True
+        self.shared.quit_requested.value = True
 
     def _complete_recording(self, result: RecorderStopResult) -> None:
         """Consume terminal storage status once, after the motion fence.
@@ -609,7 +611,7 @@ class PolicyRunner:
         self._pending_stop_reason = None
         self.shared.is_recording.value = False
         if result.error is not None:
-            self._latch_recording_fault()
+            self._request_failed_session_shutdown()
             logger.critical(
                 "policy: rollout recording failed (%s): %s",
                 result.reason or pending_reason or "unknown",
@@ -811,7 +813,7 @@ class PolicyRunner:
                 stop_reason="recording_failure",
                 recorder_save=False,
             )
-            self._latch_recording_fault()
+            self._request_failed_session_shutdown()
 
     def _start_requested_episode(self) -> None:
         if not bool(self.shared.start_request.value):
@@ -848,14 +850,14 @@ class PolicyRunner:
                 with self.shared.motion_lock:
                     self.shared.start_request.value = False
                 if self.recorder.last_error is not None:
-                    # A terminal START failure never began motion; latch the
-                    # recording fault so the supervisor ends the session instead
-                    # of letting the operator retry B indefinitely.
+                    # A terminal START failure never began motion; request a
+                    # failed-session shutdown instead of letting the operator
+                    # retry B indefinitely.
                     logger.error(
                         "policy: RecorderIO START failed terminally: %s",
                         self.recorder.last_error,
                     )
-                    self._latch_recording_fault()
+                    self._request_failed_session_shutdown()
                     return
                 logger.warning(
                     "policy: RecorderIO did not acknowledge the recording START: %s",

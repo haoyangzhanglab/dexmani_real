@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import sys
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -30,6 +30,7 @@ def shutdown_processes(
     *,
     graceful_timeout_s: float = 5.0,
     disarm_if_clean: bool = False,
+    service_process_names: Collection[str] = (),
 ) -> ShutdownReport:
     """Stop workers and return their verified post-join safety state."""
     from dexmani_real.runtime.processes import shutdown_processes_verified
@@ -39,6 +40,7 @@ def shutdown_processes(
         procs,
         graceful_timeout_s=graceful_timeout_s,
         disarm_if_clean=disarm_if_clean,
+        service_process_names=service_process_names,
     )
     if report.exits:
         print(
@@ -56,18 +58,35 @@ def supervisor_exit_reason(
     processes: Iterable[Any],
     heartbeat_ages_s: Mapping[str, float],
     heartbeat_timeouts_s: Mapping[str, float],
+    *,
+    service_process_names: Collection[str] = (),
 ) -> ExitReason:
-    """Apply the fixed safety-first supervisor priority."""
+    """Apply the fixed safety-first supervisor priority.
+
+    ``service_process_names`` (e.g. recorder, recording-only camera) death or
+    heartbeat timeout is a ``SERVICE_FAILURE`` — verified normal shutdown with
+    the session marked failed, never ``SafetyState.FAULT``. Everything else is
+    a critical subsystem and keeps the existing fault-first behavior. A
+    critical failure always takes priority over a concurrent service failure.
+    """
     if bool(shared.estop_request.value):
         return ExitReason.ESTOP
     if bool(shared.error_state.value):
         return ExitReason.STICKY_FAULT
     stopped = [process for process in processes if process.exitcode is not None]
+    critical_stopped = [
+        process for process in stopped if process.name not in service_process_names
+    ]
+    service_stopped = [
+        process for process in stopped if process.name in service_process_names
+    ]
     explicit_quit = bool(shared.quit_requested.value) or not bool(
         shared.is_running.value
     )
-    if stopped:
+    if critical_stopped:
         return ExitReason.WORKER_DEATH
+    critical_heartbeat_timeout = False
+    service_heartbeat_timeout = False
     for name, timeout in heartbeat_timeouts_s.items():
         age_s = float(heartbeat_ages_s.get(name, float("inf")))
         timeout_s = float(timeout)
@@ -78,7 +97,18 @@ def supervisor_exit_reason(
             or timeout_s <= 0.0
             or age_s > timeout_s
         ):
-            return ExitReason.HEARTBEAT_TIMEOUT
+            if name in service_process_names:
+                service_heartbeat_timeout = True
+            else:
+                critical_heartbeat_timeout = True
+    if critical_heartbeat_timeout:
+        return ExitReason.HEARTBEAT_TIMEOUT
+    if (
+        bool(shared.session_failed.value)
+        or service_stopped
+        or service_heartbeat_timeout
+    ):
+        return ExitReason.SERVICE_FAILURE
     if explicit_quit:
         return ExitReason.EXPLICIT_QUIT
     return ExitReason.NONE
@@ -91,12 +121,18 @@ def run_supervisor(
     status_interval_s: float = 30.0,
     heartbeat_timeouts_s: Mapping[str, float],
     supervisor_hz: float | None = None,
+    service_process_names: Collection[str] = (),
 ) -> tuple[str, bool]:
     """Run the standard supervisor loop with resolved heartbeat settings.
 
     Returns ``(exit_reason, normal_exit)``.  *exit_reason* describes why the
     supervisor stopped; *normal_exit* is True for requested clean exits
-    (Q key, episode target reached, or KeyboardInterrupt), False for faults.
+    (Q key, episode target reached, KeyboardInterrupt, or a service failure),
+    False for a critical fault.
+
+    ``service_process_names`` names non-critical processes (e.g. recorder,
+    recording-only camera): their death/heartbeat timeout ends the session via
+    ``SERVICE_FAILURE`` on the normal verified-shutdown path, not FAULT.
 
     The caller should have already transitioned to ARMED before calling this
     and must handle shutdown + DISARMED transition after it returns.
@@ -139,7 +175,13 @@ def run_supervisor(
                 )
                 for name, timestamp_s in heartbeat_timestamps.items()
             }
-            reason = supervisor_exit_reason(shared, procs, heartbeat_ages, timeouts)
+            reason = supervisor_exit_reason(
+                shared,
+                procs,
+                heartbeat_ages,
+                timeouts,
+                service_process_names=service_process_names,
+            )
             if reason is ExitReason.ESTOP:
                 exit_reason = "e-stop requested"
                 transition(shared, SafetyState.FAULT)
@@ -161,6 +203,11 @@ def run_supervisor(
                 ]
                 exit_reason = f"heartbeat timeout: {stale}"
                 transition(shared, SafetyState.FAULT)
+                break
+            if reason is ExitReason.SERVICE_FAILURE:
+                shared.session_failed.value = True
+                normal_exit = True
+                exit_reason = "service process failed"
                 break
             if reason is ExitReason.EXPLICIT_QUIT:
                 normal_exit = True

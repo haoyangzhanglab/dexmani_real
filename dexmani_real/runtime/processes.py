@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Collection, Iterable
 
 from dexmani_real.runtime.safety import SafetyState, transition
 from dexmani_real.utils.log import get_logger
@@ -67,20 +67,35 @@ def _finalize_shutdown_state(
     exits: tuple[ProcessExit, ...],
     *,
     disarm_if_clean: bool,
+    service_process_names: Collection[str] = (),
 ) -> None:
-    """Latch post-join failures, or disarm only after a verified clean stop."""
+    """Latch post-join failures, or disarm only after a verified clean stop.
+
+    A confirmed-stopped ``service_process_names`` member's nonzero/escalated
+    exit fails the session (``session_failed``) without claiming a physical
+    fault. Any other (critical) process failing the same way remains FAULT.
+    This classification only applies after process termination is verified —
+    it never weakens the unverified-shutdown fail-closed path above.
+    """
     error_latched = bool(_shared_value(shared, "error_state"))
     estop_requested = bool(_shared_value(shared, "estop_request"))
     safety_value = _shared_value(shared, "safety_state")
     safety_state = None if safety_value is None else int(safety_value)
-    worker_failed = any(
-        item.exitcode != 0 or item.escalation != "graceful" for item in exits
+    critical_worker_failed = any(
+        (item.exitcode != 0 or item.escalation != "graceful")
+        and item.name not in service_process_names
+        for item in exits
+    )
+    service_worker_failed = any(
+        (item.exitcode != 0 or item.escalation != "graceful")
+        and item.name in service_process_names
+        for item in exits
     )
     faulted = (
         error_latched
         or estop_requested
         or safety_state == int(SafetyState.FAULT)
-        or worker_failed
+        or critical_worker_failed
     )
 
     if faulted:
@@ -89,7 +104,14 @@ def _finalize_shutdown_state(
             error_field.value = True
         if safety_state is not None:
             transition(shared, SafetyState.FAULT)
-    elif disarm_if_clean and safety_state is not None:
+        return
+
+    if service_worker_failed:
+        session_failed_field = getattr(shared, "session_failed", None)
+        if session_failed_field is not None:
+            session_failed_field.value = True
+
+    if disarm_if_clean and safety_state is not None:
         if not transition(shared, SafetyState.DISARMED):
             error_field = getattr(shared, "error_state", None)
             if error_field is not None:
@@ -172,6 +194,7 @@ def shutdown_processes_verified(
     terminate_timeout_s: float = 1.0,
     kill_timeout_s: float = 1.0,
     disarm_if_clean: bool = False,
+    service_process_names: Collection[str] = (),
 ) -> ShutdownReport:
     """Stop workers, finalize physical safety, then close IPC after verification."""
     frozen_exits = stop_processes_verified(
@@ -186,6 +209,7 @@ def shutdown_processes_verified(
         shared,
         frozen_exits,
         disarm_if_clean=disarm_if_clean,
+        service_process_names=service_process_names,
     )
     shared_closed = _close_runtime_channels(shared)
     report = ShutdownReport(frozen_exits, shared_closed=shared_closed)

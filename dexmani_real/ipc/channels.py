@@ -191,7 +191,15 @@ class RuntimeChannels:
 
     is_running: Any  # Main -> all
     is_recording: Any  # policy -> arm/hand/camera
-    error_state: Any  # arm/hand -> all (sticky latch)
+    # arm/hand/policy/control-critical camera -> all: physical/control safety
+    # integrity is lost (sticky latch). Never set for experiment-evidence-only
+    # failures — those belong to session_failed.
+    error_state: Any
+    # recorder/recording-only camera/policy -> all: the requested experiment
+    # cannot produce a valid result, but verified safe shutdown remains
+    # possible (sticky latch). Distinct from error_state: this never implies a
+    # physical/control fault.
+    session_failed: Any
     estop_request: Any  # policy -> arm/hand
     quit_requested: Any  # policy -> Main
     camera_requested: (
@@ -327,6 +335,7 @@ class RuntimeChannels:
         storage.is_running = ctx.Value("b", True)
         storage.is_recording = ctx.Value("b", False)
         storage.error_state = ctx.Value("b", False)
+        storage.session_failed = ctx.Value("b", False)
         storage.estop_request = ctx.Value("b", False)
         storage.quit_requested = ctx.Value("b", False)
         storage.camera_requested = ctx.Value("b", cfg.camera_requested)

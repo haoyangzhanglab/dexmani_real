@@ -79,6 +79,24 @@ def _requires_camera(policy_spec: Any) -> bool:
     return "point_cloud" in requested or "rgb" in requested
 
 
+def _service_process_names(
+    policy_spec: Any, recording_config: RolloutRecordingConfig | None
+) -> set[str]:
+    """Experiment-service processes: their failure fails the session, not the robot.
+
+    Recorder is a service whenever recording is requested; camera is a service
+    only when it was started solely for recording evidence (i.e. the policy
+    observation contract itself does not require it). Pointcloud is never a
+    service: it is always part of the policy observation contract.
+    """
+    names: set[str] = set()
+    if recording_config is not None:
+        names.add("recorder")
+        if not _requires_camera(policy_spec):
+            names.add("camera")
+    return names
+
+
 def _requires_hand_sensor(policy_spec: Any) -> bool:
     # eef_pose derives from arm qpos only and never triggers the hand sensor.
     requested = set(_observation_field_names(policy_spec))
@@ -279,7 +297,11 @@ def build_policy_worker_specs(
             ProcessSpec(
                 "camera",
                 camera_loop,
-                (shared, CameraLoopConfig.from_runtime(runtime)),
+                (
+                    shared,
+                    CameraLoopConfig.from_runtime(runtime),
+                    _requires_camera(policy_spec),
+                ),
                 ready_name="camera",
             )
         )
@@ -390,6 +412,7 @@ def run_policy_deployment(
     ctx = mp.get_context("spawn")
     pointcloud_requested = _requires_pointcloud(policy_spec)
     camera_requested = _requires_camera(policy_spec) or recording_config is not None
+    service_process_names = _service_process_names(policy_spec, recording_config)
     channel_config = RuntimeChannelsConfig.from_runtime(
         runtime,
         pointcloud_num_points=(
@@ -466,16 +489,31 @@ def run_policy_deployment(
             for spec, process in spec_processes
             if process is not policy_process
         ]
-        remaining_procs = [process for _spec, process in remaining_pairs]
+        critical_pairs = [
+            (spec, process)
+            for spec, process in remaining_pairs
+            if spec.name not in service_process_names
+        ]
+        service_pairs = [
+            (spec, process)
+            for spec, process in remaining_pairs
+            if spec.name in service_process_names
+        ]
+        # policy is already started/ready; it is critical like every other
+        # non-service process for the purposes of the service readiness wait.
+        critical_procs = [policy_process] + [
+            process for _spec, process in critical_pairs
+        ]
         # Register each successful start immediately.  If a later Process.start()
         # raises, verified shutdown must still stop every earlier child before IPC
-        # is closed or unlinked.
-        for process in remaining_procs:
+        # is closed or unlinked. Critical workers start (and become ready)
+        # before any experiment service is started.
+        for _spec, process in critical_pairs:
             start_processes([process])
             started_procs.append(process)
         if not wait_subsystem_ready(
             shared,
-            remaining_pairs,
+            critical_pairs,
             timeouts,
             monitored_processes=started_procs,
         ):
@@ -485,10 +523,44 @@ def run_policy_deployment(
                 shared,
                 started_procs,
                 graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+                service_process_names=service_process_names,
             )
             return 1
 
-        for spec, _process in remaining_pairs:
+        for spec, _process in critical_pairs:
+            if spec.ready_name is not None:
+                print(f"  {spec.ready_name}: ready", flush=True)
+
+        for _spec, process in service_pairs:
+            start_processes([process])
+            started_procs.append(process)
+        if service_pairs and not wait_subsystem_ready(
+            shared,
+            service_pairs,
+            timeouts,
+            monitored_processes=started_procs,
+        ):
+            # An already-ready critical worker dying (or error_state becoming
+            # true) during the service readiness wait is still a critical
+            # failure, never a service failure. Motion never started (still
+            # DISARMED), so a pure service failure needs no FAULT transition.
+            if bool(shared.error_state.value) or any(
+                not process.is_alive() for process in critical_procs
+            ):
+                shared.error_state.value = True
+                require_transition(shared, SafetyState.FAULT)
+            else:
+                shared.session_failed.value = True
+            shutdown_report = shutdown_processes(
+                shared,
+                started_procs,
+                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+                disarm_if_clean=not bool(shared.error_state.value),
+                service_process_names=service_process_names,
+            )
+            return 1
+
+        for spec, _process in service_pairs:
             if spec.ready_name is not None:
                 print(f"  {spec.ready_name}: ready", flush=True)
 
@@ -531,6 +603,7 @@ def run_policy_deployment(
             started_procs,
             heartbeat_timeouts_s=heartbeat_timeouts,
             supervisor_hz=float(runtime.safety.supervisor_hz),
+            service_process_names=service_process_names,
         )
 
         # Stop user input before finalization. E-stop remains latched and the
@@ -546,7 +619,7 @@ def run_policy_deployment(
             shared, started_procs
         ):
             logger.error("rollout recording did not finalize before shutdown")
-            shared.error_state.value = True
+            shared.session_failed.value = True
 
         if operator_stop is not None:
             operator_stop.set()
@@ -564,6 +637,7 @@ def run_policy_deployment(
             started_procs,
             graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
             disarm_if_clean=normal_exit,
+            service_process_names=service_process_names,
         )
         worker_exit_clean = all(
             item.exitcode == 0 and item.escalation == "graceful"
@@ -575,6 +649,7 @@ def run_policy_deployment(
             and shutdown_report.shared_closed
             and not bool(shared.error_state.value)
             and not bool(shared.estop_request.value)
+            and not bool(shared.session_failed.value)
             and int(shared.safety_state.value) == int(SafetyState.DISARMED)
         )
         safety_name = SafetyState(int(shared.safety_state.value)).name
@@ -616,6 +691,7 @@ def run_policy_deployment(
                             shared,
                             started_procs,
                             graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+                            service_process_names=service_process_names,
                         )
                 except RuntimeError:
                     logger.critical(

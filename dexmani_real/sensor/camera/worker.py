@@ -183,7 +183,11 @@ def pack_camera_frame(
     return header, rgb_arr, depth_arr
 
 
-def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
+def camera_loop(
+    shared: "RuntimeChannels",
+    config: CameraLoopConfig,
+    latch_runtime_fault: bool = True,
+) -> None:
     """Run RealSense camera → write frames directly to ``shared.camera_ring``.
 
     Designed as an ``mp.Process`` target. Runs the camera capture loop directly
@@ -191,6 +195,11 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
 
     On init failure, logs the error and returns without setting the camera
     ready flag — Main detects this via ready timeout.
+
+    ``latch_runtime_fault`` distinguishes policy-input camera (default, a
+    control-critical failure) from a camera started only for recording
+    evidence: when ``False``, persistent read/publication failures mark
+    ``session_failed`` instead of the physical ``error_state`` fault latch.
     """
     _logger = get_logger("camera_loop")
     if not isinstance(config, CameraLoopConfig):
@@ -265,7 +274,10 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
                 # Back off only after a failure so repeated errors cannot spin.
                 shared.set_heartbeat("camera", now_s)
                 if now_s - read_failure_started_s >= cfg.read_failure_timeout_s:
-                    shared.error_state.value = True
+                    if latch_runtime_fault:
+                        shared.error_state.value = True
+                    else:
+                        shared.session_failed.value = True
                     raise RuntimeError(
                         "camera frame reads failed for "
                         f"{now_s - read_failure_started_s:.3f}s"
@@ -330,10 +342,16 @@ def camera_loop(shared: "RuntimeChannels", config: CameraLoopConfig) -> None:
                         )
                 except Exception:
                     failed = True
-                    shared.error_state.value = True
-                    _logger.exception(
-                        "camera_loop: frame publication failed; latching runtime fault"
-                    )
+                    if latch_runtime_fault:
+                        shared.error_state.value = True
+                        _logger.exception(
+                            "camera_loop: frame publication failed; latching runtime fault"
+                        )
+                    else:
+                        shared.session_failed.value = True
+                        _logger.exception(
+                            "camera_loop: frame publication failed; failing session"
+                        )
                     return
     except Exception:
         failed = True
