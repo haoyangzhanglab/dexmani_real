@@ -80,6 +80,7 @@ class _ArmFeedbackSnapshot:
     qpos: np.ndarray
     accepted_action_id: int
     accepted_monotonic_ns: int = 0
+    source_monotonic_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,24 @@ class _HandFeedbackSnapshot:
     qpos: np.ndarray
     accepted_action_id: int
     accepted_monotonic_ns: int = 0
+    source_monotonic_ns: int = 0
+
+
+@dataclass(frozen=True)
+class CommandFeedbackSnapshot:
+    """One immutable feedback selection reused across a single command dispatch.
+
+    Not a claim that arm and hand were sampled atomically: each modality is its
+    own ring read evaluated against one common ``captured_monotonic_ns``. This
+    is the only feedback a policy dispatch may use for decode/IK, SafetyGate,
+    and the pre-publication freshness recheck — never re-read the rings mid-dispatch.
+    """
+
+    captured_monotonic_ns: int
+    arm_qpos: np.ndarray
+    arm_source_monotonic_ns: int
+    hand_qpos: np.ndarray | None = None
+    hand_source_monotonic_ns: int | None = None
 
 
 def motion_rejection_reason(
@@ -121,18 +140,21 @@ def _read_arm_feedback(
     shared: Any,
     *,
     max_age_s: float,
+    now_monotonic_ns: int | None = None,
 ) -> tuple[_ArmFeedbackSnapshot | None, str, FeedbackIssue | None]:
     result = shared.arm_state_ring.read_latest()
     if result is None:
         return None, "arm feedback unavailable", None
     record = result[0][0]
     qpos = np.asarray(record["qpos"], dtype=np.float64)
+    now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
+    source_ns = int(record["source_monotonic_ns"])
     issue = diagnose_arm_feedback(
         connected=bool(record["connected"]),
         error_code=int(record["error_code"]),
         state_valid=bool(record["state_valid"]),
-        source_monotonic_ns=int(record["source_monotonic_ns"]),
-        now_monotonic_ns=time.monotonic_ns(),
+        source_monotonic_ns=source_ns,
+        now_monotonic_ns=now_ns,
         max_age_s=max_age_s,
         qpos=qpos,
         qvel=np.asarray(record["qvel"], dtype=np.float64),
@@ -144,6 +166,7 @@ def _read_arm_feedback(
             qpos=qpos.copy(),
             accepted_action_id=int(record["last_cmd_seq"]),
             accepted_monotonic_ns=int(record["last_cmd_accepted_monotonic_ns"]),
+            source_monotonic_ns=source_ns,
         ),
         "",
         None,
@@ -154,17 +177,20 @@ def read_hand_feedback(
     shared: Any,
     *,
     max_age_s: float,
+    now_monotonic_ns: int | None = None,
 ) -> tuple[_HandFeedbackSnapshot | None, str, FeedbackIssue | None]:
     result = shared.hand_state_ring.read_latest()
     if result is None:
         return None, "hand feedback unavailable", None
     record = result[0][0]
     qpos = np.asarray(record["qpos"], dtype=np.float64)
+    now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
+    source_ns = int(record["source_monotonic_ns"])
     issue = diagnose_hand_feedback(
         connected=bool(record["connected"]),
         state_valid=bool(record["state_valid"]),
-        source_monotonic_ns=int(record["source_monotonic_ns"]),
-        now_monotonic_ns=time.monotonic_ns(),
+        source_monotonic_ns=source_ns,
+        now_monotonic_ns=now_ns,
         max_age_s=max_age_s,
         qpos=qpos,
     )
@@ -175,10 +201,86 @@ def read_hand_feedback(
             qpos=qpos.copy(),
             accepted_action_id=int(record["accepted_target_action_id"]),
             accepted_monotonic_ns=int(record["accepted_target_monotonic_ns"]),
+            source_monotonic_ns=source_ns,
         ),
         "",
         None,
     )
+
+
+def read_command_feedback(
+    shared: Any,
+    *,
+    require_hand: bool,
+    arm_max_age_s: float,
+    hand_max_age_s: float,
+) -> tuple[CommandFeedbackSnapshot | None, str, FeedbackIssue | None]:
+    """Select one immutable feedback snapshot for a single command dispatch.
+
+    Captures ``now_ns`` once and evaluates both modalities against it. Arm
+    feedback is always required; hand feedback is read and validated only when
+    ``require_hand`` is set. Returned arrays are ownership copies, so later
+    ring writes cannot mutate the selected state.
+    """
+    now_ns = time.monotonic_ns()
+    arm_feedback, reason, issue = _read_arm_feedback(
+        shared, max_age_s=arm_max_age_s, now_monotonic_ns=now_ns
+    )
+    if arm_feedback is None:
+        return None, reason, issue
+
+    hand_qpos: np.ndarray | None = None
+    hand_source_ns: int | None = None
+    if require_hand:
+        hand_feedback, reason, issue = read_hand_feedback(
+            shared, max_age_s=hand_max_age_s, now_monotonic_ns=now_ns
+        )
+        if hand_feedback is None:
+            return None, reason, issue
+        hand_qpos = hand_feedback.qpos
+        hand_source_ns = hand_feedback.source_monotonic_ns
+
+    return (
+        CommandFeedbackSnapshot(
+            captured_monotonic_ns=now_ns,
+            arm_qpos=arm_feedback.qpos,
+            arm_source_monotonic_ns=arm_feedback.source_monotonic_ns,
+            hand_qpos=hand_qpos,
+            hand_source_monotonic_ns=hand_source_ns,
+        ),
+        "",
+        None,
+    )
+
+
+def command_feedback_is_fresh(
+    snapshot: CommandFeedbackSnapshot,
+    *,
+    now_monotonic_ns: int,
+    arm_max_age_s: float,
+    hand_max_age_s: float,
+) -> bool:
+    """Re-check the SAME snapshot's age without reading either ring again.
+
+    A snapshot fresh at selection can age out while decode/IK/projection run.
+    Malformed or future source timestamps are treated as not fresh.
+    """
+    if not np.isfinite(arm_max_age_s) or arm_max_age_s <= 0.0:
+        raise ValueError("arm_max_age_s must be finite and positive")
+    if not np.isfinite(hand_max_age_s) or hand_max_age_s <= 0.0:
+        raise ValueError("hand_max_age_s must be finite and positive")
+    arm_source_ns = int(snapshot.arm_source_monotonic_ns)
+    if arm_source_ns <= 0 or arm_source_ns > now_monotonic_ns:
+        return False
+    if (now_monotonic_ns - arm_source_ns) * 1e-9 > arm_max_age_s:
+        return False
+    if snapshot.hand_source_monotonic_ns is not None:
+        hand_source_ns = int(snapshot.hand_source_monotonic_ns)
+        if hand_source_ns <= 0 or hand_source_ns > now_monotonic_ns:
+            return False
+        if (now_monotonic_ns - hand_source_ns) * 1e-9 > hand_max_age_s:
+            return False
+    return True
 
 
 def build_action_candidate(
@@ -260,26 +362,22 @@ def prepare_command(
     hand_mechanical_lower_rad: np.ndarray | None = None,
     hand_mechanical_upper_rad: np.ndarray | None = None,
     canonicalize_policy_hand_roundoff: bool = False,
+    feedback_snapshot: CommandFeedbackSnapshot | None = None,
 ) -> PreparedCommand:
-    """Read valid feedback and check one candidate without shaping it."""
-    arm_feedback, reason, issue = _read_arm_feedback(
-        shared, max_age_s=arm_feedback_max_age_s
-    )
-    if arm_feedback is None:
-        unavailable = issue is None or issue.code is FeedbackIssueCode.STALE
-        return PreparedCommand(
-            reason=reason,
-            feedback_issue=issue,
-            unavailable=unavailable,
-            fatal=not unavailable,
-        )
+    """Check one candidate without shaping it, against valid current feedback.
 
-    hand_feedback: _HandFeedbackSnapshot | None = None
-    if candidate.hand_qpos is not None:
-        hand_feedback, reason, issue = read_hand_feedback(
-            shared, max_age_s=hand_feedback_max_age_s
+    ``feedback_snapshot is None`` reads/validates arm and (when required) hand
+    feedback internally, as before. When a snapshot is supplied, it is used
+    as-is for SafetyGate's current state without any additional ring read —
+    the caller already selected and validated it for this dispatch.
+    """
+    current_arm_qpos: np.ndarray
+    current_hand_qpos: np.ndarray | None
+    if feedback_snapshot is None:
+        arm_feedback, reason, issue = _read_arm_feedback(
+            shared, max_age_s=arm_feedback_max_age_s
         )
-        if hand_feedback is None:
+        if arm_feedback is None:
             unavailable = issue is None or issue.code is FeedbackIssueCode.STALE
             return PreparedCommand(
                 reason=reason,
@@ -287,6 +385,25 @@ def prepare_command(
                 unavailable=unavailable,
                 fatal=not unavailable,
             )
+
+        hand_feedback: _HandFeedbackSnapshot | None = None
+        if candidate.hand_qpos is not None:
+            hand_feedback, reason, issue = read_hand_feedback(
+                shared, max_age_s=hand_feedback_max_age_s
+            )
+            if hand_feedback is None:
+                unavailable = issue is None or issue.code is FeedbackIssueCode.STALE
+                return PreparedCommand(
+                    reason=reason,
+                    feedback_issue=issue,
+                    unavailable=unavailable,
+                    fatal=not unavailable,
+                )
+        current_arm_qpos = arm_feedback.qpos
+        current_hand_qpos = hand_feedback.qpos if hand_feedback is not None else None
+    else:
+        current_arm_qpos = feedback_snapshot.arm_qpos
+        current_hand_qpos = feedback_snapshot.hand_qpos
 
     hand_roundoff_canonicalized = False
     if candidate.hand_qpos is not None and canonicalize_policy_hand_roundoff:
@@ -323,8 +440,8 @@ def prepare_command(
 
     gate_result = gate.validate(
         candidate,
-        current_arm_qpos=arm_feedback.qpos,
-        current_hand_qpos=(hand_feedback.qpos if hand_feedback is not None else None),
+        current_arm_qpos=current_arm_qpos,
+        current_hand_qpos=current_hand_qpos,
         hand_delta_reference_qpos=hand_delta_reference_qpos,
     )
     if not gate_result.accepted:

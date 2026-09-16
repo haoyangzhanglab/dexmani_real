@@ -23,12 +23,15 @@ from dexmani_real.control.publication import (
     PUBLISH_REASON_GENERATION,
     PUBLISH_REASON_RUNTIME_STOPPED,
     PUBLISH_REASON_SAFETY_STATE,
+    CommandFeedbackSnapshot,
     PreparedCommand,
     PublishResult,
     build_action_candidate,
+    command_feedback_is_fresh,
     command_publishability_reason,
     prepare_command,
     publish_command,
+    read_command_feedback,
 )
 from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
 from dexmani_real.deployment.config import (
@@ -389,6 +392,19 @@ class PolicyRunner:
         self.last_recorded_action = None
         self.actions.clear()
         self.observation_id = 0
+
+    def _invalidate_chunk(self) -> None:
+        """Discard the unexecuted chunk after a feedback continuity break.
+
+        A replanning boundary, not an episode boundary: run_generation,
+        observation_id, model episode state, and recording state are untouched.
+        The next queue-empty iteration builds a fresh causal observation and
+        performs a fresh blocking inference. Clearing the continuity reference
+        ensures the next chunk's first action anchors to the newly measured arm
+        state rather than a pre-gap command target.
+        """
+        self.actions.clear()
+        self.previous_arm_command_qpos = None
 
     def _finish_episode(
         self,
@@ -1014,31 +1030,13 @@ class PolicyRunner:
         self._finish_episode(reason, aborted=True)
 
     def _decode_action(
-        self, action: np.ndarray
+        self, action: np.ndarray, feedback: CommandFeedbackSnapshot
     ) -> tuple[tuple[np.ndarray, np.ndarray] | None, _RejectKind | None, str | None]:
-        arm_state = read_arm_state_dict(self.shared)
-        if arm_state is None:
-            return None, None, None
-        try:
-            issue = diagnose_arm_feedback(
-                connected=bool(arm_state["connected"]),
-                error_code=int(arm_state["error_code"]),
-                state_valid=bool(arm_state["state_valid"]),
-                source_monotonic_ns=int(arm_state["source_monotonic_ns"]),
-                now_monotonic_ns=time.monotonic_ns(),
-                max_age_s=float(self.runtime.safety.heartbeat_timeouts["arm"]),
-                qpos=np.asarray(arm_state["qpos"], dtype=np.float64),
-                qvel=np.asarray(arm_state["qvel"], dtype=np.float64),
-            )
-        except Exception as exc:
-            self._fault(f"malformed arm feedback: {type(exc).__name__}")
-            return None, None, None
-        if issue is not None:
-            if issue.code is FeedbackIssueCode.STALE:
-                pass
-            else:
-                self._fault(f"fatal arm feedback: {issue.code.value}")
-            return None, None, None
+        """Decode/IK one action against the caller-selected feedback snapshot.
+
+        Side-effect free with respect to feedback I/O: the caller has already
+        read and validated ``feedback`` once for this dispatch.
+        """
         if self.policy_spec.action_key == "action_ee" and self.ee_planner is None:
             self._fault("EE policy runner has no IK planner")
             return None, None, None
@@ -1046,7 +1044,7 @@ class PolicyRunner:
             arm_qpos, hand_qpos, rejection = decode_policy_action(
                 action,
                 self.policy_spec,
-                np.asarray(arm_state["qpos"], dtype=np.float64),
+                feedback.arm_qpos,
                 previous_arm_command_qpos=self.previous_arm_command_qpos,
                 planner=self.ee_planner,
             )
@@ -1062,7 +1060,7 @@ class PolicyRunner:
                 rejection or "EE action has no usable IK solution",
             )
         reference_arm_qpos = (
-            np.asarray(arm_state["qpos"], dtype=np.float64)
+            feedback.arm_qpos
             if self.previous_arm_command_qpos is None
             else self.previous_arm_command_qpos
         )
@@ -1076,8 +1074,29 @@ class PolicyRunner:
         return (arm_qpos, hand_qpos), None, None
 
     def _dispatch_action(self, action: np.ndarray) -> None:
-        """Admit the queue head; temporary feedback gaps leave it queued."""
-        decoded, reject_kind, decode_rejection = self._decode_action(action)
+        """Admit the queue head from one immutable feedback snapshot.
+
+        decode/IK, SafetyGate, and the pre-publication freshness recheck all
+        consume the SAME snapshot selected here. A stale/unavailable control
+        state invalidates the whole pending chunk (fresh observation and
+        inference follow on the next queue-empty iteration); it is not itself
+        a hardware fault.
+        """
+        max_age_s = float(self.runtime.policy.max_input_age_s)
+        feedback, reason, issue = read_command_feedback(
+            self.shared,
+            require_hand=True,
+            arm_max_age_s=max_age_s,
+            hand_max_age_s=max_age_s,
+        )
+        if feedback is None:
+            if issue is None or issue.code is FeedbackIssueCode.STALE:
+                self._invalidate_chunk()
+                return
+            self._fault(f"fatal command feedback: {issue.code.value}")
+            return
+
+        decoded, reject_kind, decode_rejection = self._decode_action(action, feedback)
         if decoded is None:
             if decode_rejection is not None:
                 assert reject_kind is not None
@@ -1102,12 +1121,9 @@ class PolicyRunner:
                 self.shared,
                 candidate,
                 gate=self.gate,
-                arm_feedback_max_age_s=float(
-                    self.runtime.safety.heartbeat_timeouts["arm"]
-                ),
-                hand_feedback_max_age_s=float(
-                    self.runtime.safety.heartbeat_timeouts["hand"]
-                ),
+                arm_feedback_max_age_s=max_age_s,
+                hand_feedback_max_age_s=max_age_s,
+                feedback_snapshot=feedback,
             )
         except Exception as exc:
             self._fault(f"policy command preparation failed: {exc}")
@@ -1117,6 +1133,16 @@ class PolicyRunner:
             return
         candidate = prepared.candidate
         assert candidate is not None
+
+        if not command_feedback_is_fresh(
+            feedback,
+            now_monotonic_ns=time.monotonic_ns(),
+            arm_max_age_s=max_age_s,
+            hand_max_age_s=max_age_s,
+        ):
+            self._invalidate_chunk()
+            return
+
         if self.execute:
             result = publish_command(
                 self.shared,
