@@ -95,13 +95,13 @@ class _HandFeedbackSnapshot:
 class CommandFeedbackSnapshot:
     """One immutable feedback selection reused across a single command dispatch.
 
-    Not a claim that arm and hand were sampled atomically: each modality is its
-    own ring read evaluated against one common ``captured_monotonic_ns``. This
-    is the only feedback a policy dispatch may use for decode/IK, SafetyGate,
-    and the pre-publication freshness recheck — never re-read the rings mid-dispatch.
+    Arm and hand are independent ring reads, but ``read_command_feedback``
+    evaluates both against the same local ``now_ns`` before constructing this
+    immutable snapshot. This is the only feedback a policy dispatch may use for
+    decode/IK, SafetyGate, and the pre-publication freshness recheck — never
+    re-read the rings mid-dispatch.
     """
 
-    captured_monotonic_ns: int
     arm_qpos: np.ndarray
     arm_source_monotonic_ns: int
     hand_qpos: np.ndarray | None = None
@@ -242,7 +242,6 @@ def read_command_feedback(
 
     return (
         CommandFeedbackSnapshot(
-            captured_monotonic_ns=now_ns,
             arm_qpos=arm_feedback.qpos,
             arm_source_monotonic_ns=arm_feedback.source_monotonic_ns,
             hand_qpos=hand_qpos,

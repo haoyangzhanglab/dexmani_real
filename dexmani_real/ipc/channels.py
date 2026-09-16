@@ -191,14 +191,13 @@ class RuntimeChannels:
 
     is_running: Any  # Main -> all
     is_recording: Any  # policy -> arm/hand/camera
-    # arm/hand/policy/control-critical camera -> all: physical/control safety
-    # integrity is lost (sticky latch). Never set for experiment-evidence-only
-    # failures — those belong to session_failed.
+    # Sticky fail-closed runtime/safety fault latch. When set, supervision
+    # takes the FAULT path. The owning workflow decides which failures require
+    # this disposition.
     error_state: Any
-    # recorder/recording-only camera/policy -> all: the requested experiment
-    # cannot produce a valid result, but verified safe shutdown remains
-    # possible (sticky latch). Distinct from error_state: this never implies a
-    # physical/control fault.
+    # Sticky experiment/session failure latch. When set without a physical/runtime
+    # fault, the owning workflow may use verified non-FAULT shutdown while still
+    # reporting the session as failed.
     session_failed: Any
     estop_request: Any  # policy -> arm/hand
     quit_requested: Any  # policy -> Main

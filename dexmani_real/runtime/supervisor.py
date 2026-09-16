@@ -63,11 +63,10 @@ def supervisor_exit_reason(
 ) -> ExitReason:
     """Apply the fixed safety-first supervisor priority.
 
-    ``service_process_names`` (e.g. recorder, recording-only camera) death or
-    heartbeat timeout is a ``SERVICE_FAILURE`` — verified normal shutdown with
-    the session marked failed, never ``SafetyState.FAULT``. Everything else is
-    a critical subsystem and keeps the existing fault-first behavior. A
-    critical failure always takes priority over a concurrent service failure.
+    ``SERVICE_FAILURE`` comes from ``session_failed``, or process death or
+    heartbeat timeout for a name in ``service_process_names``. It uses verified
+    non-FAULT shutdown with the session marked failed. Other processes are
+    critical; critical failures take priority over session/service failures.
     """
     if bool(shared.estop_request.value):
         return ExitReason.ESTOP
@@ -127,12 +126,12 @@ def run_supervisor(
 
     Returns ``(exit_reason, normal_exit)``.  *exit_reason* describes why the
     supervisor stopped; *normal_exit* is True for requested clean exits
-    (Q key, episode target reached, KeyboardInterrupt, or a service failure),
-    False for a critical fault.
+    (Q key, episode target reached, KeyboardInterrupt) or a session/service
+    failure, False for a critical fault.
 
-    ``service_process_names`` names non-critical processes (e.g. recorder,
-    recording-only camera): their death/heartbeat timeout ends the session via
-    ``SERVICE_FAILURE`` on the normal verified-shutdown path, not FAULT.
+    ``SERVICE_FAILURE`` comes from ``session_failed``, or process death or
+    heartbeat timeout for a name in ``service_process_names``. These use the
+    verified non-FAULT shutdown path.
 
     The caller should have already transitioned to ARMED before calling this
     and must handle shutdown + DISARMED transition after it returns.
@@ -207,7 +206,7 @@ def run_supervisor(
             if reason is ExitReason.SERVICE_FAILURE:
                 shared.session_failed.value = True
                 normal_exit = True
-                exit_reason = "service process failed"
+                exit_reason = "session/service failure"
                 break
             if reason is ExitReason.EXPLICIT_QUIT:
                 normal_exit = True
