@@ -21,6 +21,7 @@ __all__ = [
     "FeedbackIssueCode",
     "diagnose_arm_feedback",
     "diagnose_hand_feedback",
+    "diagnose_feedback_timestamp_order",
     "validate_arm_feedback",
     "validate_hand_feedback",
 ]
@@ -34,6 +35,7 @@ class FeedbackIssueCode(str, Enum):
     STATE_INVALID = "state_invalid"
     MISSING_TIMESTAMP = "missing_timestamp"
     FUTURE_TIMESTAMP = "future_timestamp"
+    TIMESTAMP_ORDER = "timestamp_order"
     STALE = "stale"
     MALFORMED_SHAPE = "malformed_shape"
     NONFINITE = "nonfinite"
@@ -146,6 +148,56 @@ def diagnose_hand_feedback(
     if age_s > max_age_s:
         return FeedbackIssue(
             FeedbackIssueCode.STALE, f"hand state stale ({age_s:.2f}s)"
+        )
+    return None
+
+
+def diagnose_feedback_timestamp_order(
+    *,
+    source_monotonic_ns: int,
+    ring_commit_monotonic_ns: int,
+    validation_now_ns: int,
+    max_age_s: float,
+    modality: str,
+) -> FeedbackIssue | None:
+    """Validate ring-commit provenance and freshness against a post-selection now.
+
+    This is the post-selection recheck, layered on the per-modality
+    ``diagnose_arm_feedback``/``diagnose_hand_feedback`` pass that owns the
+    ``FUTURE_TIMESTAMP`` (source vs. its own post-read now) check. One
+    already-selected frame must satisfy ``0 < source <= ring_commit <=
+    validation_now`` and ``validation_now - source <= max_age``. A producer or
+    clock-invariant violation (``source > ring_commit`` or ``ring_commit >
+    validation_now``) is a fatal timestamp-order issue, distinct from a plain
+    ``STALE`` frame. No future/ordering tolerance is applied.
+    """
+    if not np.isfinite(max_age_s) or max_age_s <= 0.0:
+        raise ValueError("max_age_s must be finite and positive")
+    if source_monotonic_ns <= 0:
+        return FeedbackIssue(
+            FeedbackIssueCode.MISSING_TIMESTAMP,
+            f"{modality} state has no source timestamp",
+        )
+    if source_monotonic_ns > ring_commit_monotonic_ns:
+        return FeedbackIssue(
+            FeedbackIssueCode.TIMESTAMP_ORDER,
+            f"{modality} source_ns={source_monotonic_ns} exceeds "
+            f"ring_commit_ns={ring_commit_monotonic_ns} "
+            f"(source_to_commit_ms="
+            f"{(ring_commit_monotonic_ns - source_monotonic_ns) / 1e6:.3f})",
+        )
+    if ring_commit_monotonic_ns > validation_now_ns:
+        return FeedbackIssue(
+            FeedbackIssueCode.TIMESTAMP_ORDER,
+            f"{modality} ring_commit_ns={ring_commit_monotonic_ns} exceeds "
+            f"validation_now_ns={validation_now_ns} "
+            f"(commit_to_now_ms="
+            f"{(validation_now_ns - ring_commit_monotonic_ns) / 1e6:.3f})",
+        )
+    age_s = (validation_now_ns - source_monotonic_ns) * 1e-9
+    if age_s > max_age_s:
+        return FeedbackIssue(
+            FeedbackIssueCode.STALE, f"{modality} state stale ({age_s:.2f}s)"
         )
     return None
 

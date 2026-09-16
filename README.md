@@ -129,6 +129,11 @@ processed HDF5
 Policy Zarr
 ```
 
+`/meta` 标记 `provenance_workflow="policy_eval"` 的 raw rollout 记录的是同步推理的实际
+发布时间，在出现明确的 resampling / time-aware 契约之前仅用于评估：offline
+processing 与 fixed-rate physical replay 都会 fail-closed 拒绝它，而不是静默按
+fixed-dt teleop 解释或按名义控制周期压缩时间。
+
 ### 1. Process Raw Episodes
 
 推荐先执行只读 preflight：

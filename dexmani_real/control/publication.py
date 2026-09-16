@@ -31,6 +31,7 @@ from dexmani_real.utils.feedback import (
     FeedbackIssue,
     FeedbackIssueCode,
     diagnose_arm_feedback,
+    diagnose_feedback_timestamp_order,
     diagnose_hand_feedback,
 )
 from dexmani_real.utils.limits import (
@@ -81,6 +82,7 @@ class _ArmFeedbackSnapshot:
     accepted_action_id: int
     accepted_monotonic_ns: int = 0
     source_monotonic_ns: int = 0
+    ring_commit_monotonic_ns: int = 0
 
 
 @dataclass(frozen=True)
@@ -89,23 +91,28 @@ class _HandFeedbackSnapshot:
     accepted_action_id: int
     accepted_monotonic_ns: int = 0
     source_monotonic_ns: int = 0
+    ring_commit_monotonic_ns: int = 0
 
 
 @dataclass(frozen=True)
 class CommandFeedbackSnapshot:
     """One immutable feedback selection reused across a single command dispatch.
 
-    Arm and hand are independent ring reads, but ``read_command_feedback``
-    evaluates both against the same local ``now_ns`` before constructing this
-    immutable snapshot. This is the only feedback a policy dispatch may use for
-    decode/IK, SafetyGate, and the pre-publication freshness recheck — never
-    re-read the rings mid-dispatch.
+    Arm and hand are independent ring reads; ``read_command_feedback`` then
+    captures one post-selection ``validation_now_ns`` and revalidates both
+    modalities' provenance (``source <= ring_commit <= validation_now``) and
+    freshness against it before constructing this immutable snapshot. This is
+    the only feedback a policy dispatch may use for decode/IK, SafetyGate, and
+    the pre-publication freshness recheck — never re-read the rings mid-dispatch.
     """
 
     arm_qpos: np.ndarray
     arm_source_monotonic_ns: int
     hand_qpos: np.ndarray | None = None
     hand_source_monotonic_ns: int | None = None
+    arm_ring_commit_monotonic_ns: int = 0
+    hand_ring_commit_monotonic_ns: int | None = None
+    validation_now_ns: int = 0
 
 
 def motion_rejection_reason(
@@ -146,6 +153,7 @@ def _read_arm_feedback(
     if result is None:
         return None, "arm feedback unavailable", None
     record = result[0][0]
+    ring_commit_ns = int(result[1])
     qpos = np.asarray(record["qpos"], dtype=np.float64)
     now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
     source_ns = int(record["source_monotonic_ns"])
@@ -167,6 +175,7 @@ def _read_arm_feedback(
             accepted_action_id=int(record["last_cmd_seq"]),
             accepted_monotonic_ns=int(record["last_cmd_accepted_monotonic_ns"]),
             source_monotonic_ns=source_ns,
+            ring_commit_monotonic_ns=ring_commit_ns,
         ),
         "",
         None,
@@ -183,6 +192,7 @@ def read_hand_feedback(
     if result is None:
         return None, "hand feedback unavailable", None
     record = result[0][0]
+    ring_commit_ns = int(result[1])
     qpos = np.asarray(record["qpos"], dtype=np.float64)
     now_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
     source_ns = int(record["source_monotonic_ns"])
@@ -202,6 +212,7 @@ def read_hand_feedback(
             accepted_action_id=int(record["accepted_target_action_id"]),
             accepted_monotonic_ns=int(record["accepted_target_monotonic_ns"]),
             source_monotonic_ns=source_ns,
+            ring_commit_monotonic_ns=ring_commit_ns,
         ),
         "",
         None,
@@ -217,28 +228,57 @@ def read_command_feedback(
 ) -> tuple[CommandFeedbackSnapshot | None, str, FeedbackIssue | None]:
     """Select one immutable feedback snapshot for a single command dispatch.
 
-    Captures ``now_ns`` once and evaluates both modalities against it. Arm
-    feedback is always required; hand feedback is read and validated only when
-    ``require_hand`` is set. Returned arrays are ownership copies, so later
-    ring writes cannot mutate the selected state.
+    Each modality is read and validated against its own post-read local now
+    (never a pre-captured common ``now``, which can race a concurrent producer
+    into a false ``FUTURE_TIMESTAMP``). After both modalities are selected, one
+    post-selection ``validation_now_ns`` is captured and both are revalidated
+    against it for provenance (``source <= ring_commit <= validation_now``) and
+    freshness, so arm cannot silently age out during a slow hand read. Returned
+    arrays are ownership copies, so later ring writes cannot mutate the selected
+    state.
     """
-    now_ns = time.monotonic_ns()
     arm_feedback, reason, issue = _read_arm_feedback(
-        shared, max_age_s=arm_max_age_s, now_monotonic_ns=now_ns
+        shared, max_age_s=arm_max_age_s
     )
     if arm_feedback is None:
         return None, reason, issue
 
-    hand_qpos: np.ndarray | None = None
-    hand_source_ns: int | None = None
+    hand_feedback: _HandFeedbackSnapshot | None = None
     if require_hand:
         hand_feedback, reason, issue = read_hand_feedback(
-            shared, max_age_s=hand_max_age_s, now_monotonic_ns=now_ns
+            shared, max_age_s=hand_max_age_s
         )
         if hand_feedback is None:
             return None, reason, issue
+
+    validation_now_ns = time.monotonic_ns()
+
+    issue = diagnose_feedback_timestamp_order(
+        source_monotonic_ns=arm_feedback.source_monotonic_ns,
+        ring_commit_monotonic_ns=arm_feedback.ring_commit_monotonic_ns,
+        validation_now_ns=validation_now_ns,
+        max_age_s=arm_max_age_s,
+        modality="arm",
+    )
+    if issue is not None:
+        return None, f"arm feedback is unhealthy: {issue.detail}", issue
+
+    hand_qpos: np.ndarray | None = None
+    hand_source_ns: int | None = None
+    hand_commit_ns: int | None = None
+    if hand_feedback is not None:
+        issue = diagnose_feedback_timestamp_order(
+            source_monotonic_ns=hand_feedback.source_monotonic_ns,
+            ring_commit_monotonic_ns=hand_feedback.ring_commit_monotonic_ns,
+            validation_now_ns=validation_now_ns,
+            max_age_s=hand_max_age_s,
+            modality="hand",
+        )
+        if issue is not None:
+            return None, f"hand feedback is unhealthy: {issue.detail}", issue
         hand_qpos = hand_feedback.qpos
         hand_source_ns = hand_feedback.source_monotonic_ns
+        hand_commit_ns = hand_feedback.ring_commit_monotonic_ns
 
     return (
         CommandFeedbackSnapshot(
@@ -246,6 +286,9 @@ def read_command_feedback(
             arm_source_monotonic_ns=arm_feedback.source_monotonic_ns,
             hand_qpos=hand_qpos,
             hand_source_monotonic_ns=hand_source_ns,
+            arm_ring_commit_monotonic_ns=arm_feedback.ring_commit_monotonic_ns,
+            hand_ring_commit_monotonic_ns=hand_commit_ns,
+            validation_now_ns=validation_now_ns,
         ),
         "",
         None,

@@ -63,6 +63,11 @@ from dexmani_real.planning.kinematics.fingertip import (
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.recording.storage.schema import EPISODE_SCHEMA_VERSION
+from dexmani_real.dataset.provenance import (
+    POLICY_EVAL_WORKFLOW,
+    read_provenance_workflow,
+    supports_fixed_dt_teleop,
+)
 from dexmani_real.robot.model import (
     CONTACT_FORCE_REPRESENTATION,
     HAND_FINGER_ORDER_ID,
@@ -116,6 +121,16 @@ def analyze_episode(
 ) -> EpisodeDecision:
     """Admit all source rows or reject the entire episode; never repair rows."""
     source = reader.h5f
+    workflow = read_provenance_workflow(source["meta"].attrs)
+    if not supports_fixed_dt_teleop(workflow):
+        if workflow == POLICY_EVAL_WORKFLOW:
+            raise ValueError(
+                "policy_eval rollout has synchronous/irregular execution timing and "
+                "cannot enter the current fixed-dt teleop processing pipeline"
+            )
+        raise ValueError(
+            f"unsupported provenance_workflow {workflow!r} for fixed-dt teleop processing"
+        )
     frames = int(source["meta"].attrs["num_frames"])
     if frames <= 0:
         raise ValueError("raw episode must contain at least one row")

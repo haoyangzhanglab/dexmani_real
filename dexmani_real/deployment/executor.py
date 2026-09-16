@@ -396,6 +396,7 @@ class PolicyRunner:
         self.chunk_sources.clear()
         self.chunk_action_index = 0
         self.observation_id = 0
+        self.consecutive_stale_predictions = 0
 
     def _invalidate_chunk(self, reason: str) -> None:
         """Discard the unexecuted chunk after a recoverable continuity break.
@@ -1139,7 +1140,7 @@ class PolicyRunner:
             if issue is None or issue.code is FeedbackIssueCode.STALE:
                 self._invalidate_chunk("command_feedback_unavailable")
                 return
-            self._fault(f"fatal command feedback: {issue.code.value}")
+            self._fault(f"fatal command feedback: {issue.code.value}: {issue.detail}")
             return
 
         decoded, reject_kind, decode_rejection = self._decode_action(action, feedback)

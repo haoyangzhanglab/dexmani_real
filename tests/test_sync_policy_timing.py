@@ -54,8 +54,10 @@ class _Clock:
 
 
 class _Model:
-    """Fake model whose chunk[k] encodes (logical_step + k), so a phase shift in
-    the scheduler surfaces as an off-by-one in the first published action."""
+    """Fake model whose chunk[k] encodes (logical_t + k), where logical_t is
+    derived from the observation anchor time. A phase shift in the scheduler
+    then surfaces as an off-by-one in the first published action value, not just
+    in the recorded query anchor."""
 
     def __init__(self, clock: _Clock, n_action_steps: int, inference_ns: int) -> None:
         self.clock = clock
@@ -65,7 +67,7 @@ class _Model:
     def predict(self, observation) -> np.ndarray:
         # Blocking inference: advance the clock, then return an open-loop chunk.
         self.clock.advance(self.inference_ns)
-        t = observation.observation_id
+        t = observation.anchor_monotonic_ns // _STEP_DT_NS
         return np.arange(t, t + self.n_action_steps, dtype=float).reshape(-1, 1)
 
 
@@ -97,7 +99,10 @@ class SyncPolicyTimingTest(unittest.TestCase):
             )
 
         def to_policy(observation, policy_spec, fingertip_runtime=None):
-            return SimpleNamespace(observation_id=observation.observation_id)
+            return SimpleNamespace(
+                anchor_monotonic_ns=observation.anchor_monotonic_ns,
+                observation_id=observation.observation_id,
+            )
 
         def sources(observation):
             return {}
@@ -119,6 +124,9 @@ class SyncPolicyTimingTest(unittest.TestCase):
             mock.patch.object(
                 executor_module, "_select_control_grid_reference_ns", side_effect=grid
             ),
+            # Replace executor.time so _run_active_tick's own monotonic_ns()
+            # reads (and sleeps) use the deterministic _Clock.
+            mock.patch.object(executor_module, "time", self.clock),
         ]
         for patcher in patchers:
             patcher.start()
@@ -214,10 +222,11 @@ class SyncPolicyTimingTest(unittest.TestCase):
         self.clock.ns = 1_062_500_000
         runner._run_active_tick(self.clock.ns)
 
-        t = runner.observation_id  # logical step of the queried observation
+        logical_t = 1_062_500_000 // _STEP_DT_NS  # anchor-derived logical step
         self.assertEqual(self.queries, [1_062_500_000])
-        # First action encodes t and lands at query+inference, not query+dt.
-        self.assertEqual(self.published, [(1_082_500_000, (float(t),))])
+        # First action encodes the anchor-derived logical step and lands at
+        # query+inference, not query+dt.
+        self.assertEqual(self.published, [(1_082_500_000, (float(logical_t),))])
 
     def test_slow_inference_no_catchup(self):
         # dt=62.5 ms, inference=100 ms: new[0] lands at 1162.5 ms and new[1]
@@ -230,7 +239,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
 
         self.clock.ns = 1_062_500_000
         runner._run_active_tick(self.clock.ns)
-        self.assertEqual(self.published, [(1_162_500_000, (1.0,))])
+        self.assertEqual(self.published, [(1_162_500_000, (17.0,))])
 
         # Still before new[0]+dt: no second dispatch.
         self.clock.ns = 1_162_500_000
@@ -239,7 +248,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
 
         self.clock.ns = 1_225_000_000
         runner._run_active_tick(self.clock.ns)
-        self.assertEqual(self.published[1], (1_225_000_000, (2.0,)))
+        self.assertEqual(self.published[1], (1_225_000_000, (18.0,)))
 
     # --- unified whole-chunk invalidation ----------------------------------
 
@@ -313,6 +322,24 @@ class SyncPolicyTimingTest(unittest.TestCase):
         self.assertEqual(runner.consecutive_stale_predictions, 1)
         runner._invalidate_rollout.assert_not_called()
         runner._request_failed_session_shutdown.assert_not_called()
+
+    def test_clear_execution_resets_consecutive_stale_predictions(self):
+        runner = PolicyRunner.__new__(PolicyRunner)
+        runner.run_generation = 1
+        runner.last_publication_ns = 1_000_000_000
+        runner.previous_arm_command_qpos = np.array([1.0])
+        runner.last_recorded_action = None
+        runner.actions = deque([np.array([1.0])])
+        runner.chunk_sources = {"arm": (0,)}
+        runner.chunk_action_index = 2
+        runner.observation_id = 5
+        runner.consecutive_stale_predictions = 7
+
+        runner._clear_execution(None)
+
+        self.assertEqual(runner.consecutive_stale_predictions, 0)
+        self.assertEqual(runner.observation_id, 0)
+        self.assertEqual(list(runner.actions), [])
 
     # --- lifecycle invariant -----------------------------------------------
 

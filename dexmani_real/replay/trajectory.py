@@ -14,6 +14,11 @@ from dexmani_real.planning import Pose, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.recording.storage.reader import EpisodeReader
+from dexmani_real.dataset.provenance import (
+    POLICY_EVAL_WORKFLOW,
+    read_provenance_workflow,
+    supports_fixed_dt_teleop,
+)
 from dexmani_real.robot.model import (
     ARM_EE_SHAPE,
     ARM_JOINT_SHAPE,
@@ -81,6 +86,18 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
             )
         h5 = reader.h5f
         meta = h5.get("meta")
+        if meta is not None:
+            workflow = read_provenance_workflow(meta.attrs)
+            if not supports_fixed_dt_teleop(workflow):
+                if workflow == POLICY_EVAL_WORKFLOW:
+                    raise ValueError(
+                        "policy_eval rollout contains synchronous irregular timing; "
+                        "current physical replay is fixed-rate and must not silently "
+                        "time-compress it"
+                    )
+                raise ValueError(
+                    f"unsupported provenance_workflow {workflow!r} for fixed-rate physical replay"
+                )
         num_frames_attr = (
             int(meta.attrs.get("num_frames", 0)) if meta is not None else 0
         )
