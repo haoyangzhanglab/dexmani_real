@@ -378,6 +378,7 @@ class PolicyRunner:
         self.run_started_ns: int | None = None
         self.last_publication_ns: int | None = None
         self.previous_arm_command_qpos: np.ndarray | None = None
+        self.consecutive_stale_predictions = 0
         self.num_episodes = (
             recording_config.num_episodes if recording_config is not None else 1
         )
@@ -396,21 +397,24 @@ class PolicyRunner:
         self.chunk_action_index = 0
         self.observation_id = 0
 
-    def _invalidate_chunk(self) -> None:
-        """Discard the unexecuted chunk after a feedback continuity break.
+    def _invalidate_chunk(self, reason: str) -> None:
+        """Discard the unexecuted chunk after a recoverable continuity break.
 
         A replanning boundary, not an episode boundary: run_generation,
-        observation_id, model episode state, and recording state are untouched.
-        The next queue-empty iteration builds a fresh causal observation and
-        performs a fresh blocking inference. Clearing the continuity reference
-        ensures the next chunk's first action anchors to the newly measured arm
-        state rather than a pre-gap command target.
+        observation_id, model episode state, and recording state are untouched,
+        as is last_publication_ns (already-occurred physical history stays the
+        cadence anchor).  The next queue-empty iteration builds a fresh causal
+        observation and performs a fresh blocking inference.  Clearing the
+        continuity reference ensures the next chunk's first action anchors to the
+        newly measured arm state rather than a pre-gap command target.
         """
         logger.debug(
-            "policy discard generation=%s query=%s index=%s reason=feedback_continuity",
-            self.run_generation, self.observation_id, self.chunk_action_index,
+            "policy discard generation=%s query=%s index=%s reason=%s",
+            self.run_generation, self.observation_id, self.chunk_action_index, reason,
         )
         self.actions.clear()
+        self.chunk_sources.clear()
+        self.chunk_action_index = 0
         self.previous_arm_command_qpos = None
 
     def _finish_episode(
@@ -1098,7 +1102,18 @@ class PolicyRunner:
                 ages,
             )
             self.stats.stale_prediction_count += 1
-            self.actions.clear()
+            self.consecutive_stale_predictions += 1
+            self._invalidate_chunk("stale_model_input")
+            if (
+                self.consecutive_stale_predictions
+                >= int(self.runtime.policy.max_consecutive_errors)
+            ):
+                self._invalidate_rollout(
+                    "repeated stale policy predictions",
+                    stop_reason="policy_failure",
+                    recorder_save=False,
+                )
+                self._request_failed_session_shutdown()
             return False
         return True
 
@@ -1122,7 +1137,7 @@ class PolicyRunner:
         )
         if feedback is None:
             if issue is None or issue.code is FeedbackIssueCode.STALE:
-                self._invalidate_chunk()
+                self._invalidate_chunk("command_feedback_unavailable")
                 return
             self._fault(f"fatal command feedback: {issue.code.value}")
             return
@@ -1171,7 +1186,7 @@ class PolicyRunner:
             arm_max_age_s=max_age_s,
             hand_max_age_s=max_age_s,
         ):
-            self._invalidate_chunk()
+            self._invalidate_chunk("command_feedback_aged_out")
             return
 
         publication_check_ns = time.monotonic_ns()
@@ -1241,6 +1256,8 @@ class PolicyRunner:
             ) / 1e6
         self.last_publication_ns = publication_ns
         self.actions.popleft()
+        if self.chunk_action_index == 0:
+            self.consecutive_stale_predictions = 0
         self.chunk_action_index += 1
         self._record_rollout_tick(
             publication_ns, candidate=candidate, raw_action=action
@@ -1370,17 +1387,26 @@ class PolicyRunner:
         started_ns = time.monotonic_ns()
         if self._running_time_expired(started_ns):
             return
-        predicted = self.model_runtime.predict(policy_observation)
+        try:
+            predicted = self.model_runtime.predict(policy_observation)
+        except Exception as exc:
+            # Model/contract failure (CUDA OOM, forward error, shape/NaN/Inf) is a
+            # session failure, not a physical fault: fence, mark failed, and let
+            # verified shutdown complete.
+            self._invalidate_rollout(
+                f"policy inference failed: {exc}",
+                stop_reason="policy_failure",
+                recorder_save=False,
+            )
+            self._request_failed_session_shutdown()
+            logger.critical("policy: inference exception", exc_info=True)
+            return
         finished_ns = time.monotonic_ns()
         self.stats.inference_latency_ms = (finished_ns - started_ns) / 1e6
         # Main can revoke motion during blocking inference. Never accept its
         # result before rechecking the episode's original generation/state.
         if not self._running_generation_is_live():
-            logger.debug(
-                "policy discard generation=%s query=%s reason=inference_run_boundary",
-                self.run_generation, self.observation_id,
-            )
-            self.actions.clear()
+            self._invalidate_chunk("inference_run_boundary")
             return
         if self._running_time_expired(finished_ns) or not self._poll_recorder():
             return
@@ -1518,6 +1544,17 @@ def policy_runner_loop(
                 if np.isfinite(value) and value >= 0
             ),
         )
+        max_input_age_s = float(runtime.policy.max_input_age_s)
+        warm_durations = [
+            value for value in timings_s if np.isfinite(value) and value >= 0
+        ]
+        if warm_durations and all(value >= max_input_age_s for value in warm_durations):
+            logger.warning(
+                "policy warmup: all %d samples are at or above max_input_age_s "
+                "(%.3fs); publication freshness may be violated at runtime",
+                len(warm_durations),
+                max_input_age_s,
+            )
         runner = PolicyRunner(
             shared,
             runtime,

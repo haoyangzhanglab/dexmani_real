@@ -889,7 +889,7 @@ def _build_observation(
         or not np.all(hand_history.tactile_dense_valid)
     ):
         return None
-    return ObservationBatch(
+    observation = ObservationBatch(
         observation_id=observation_id,
         run_generation=run_generation,
         run_started_monotonic_ns=run_started_ns,
@@ -902,6 +902,16 @@ def _build_observation(
         pointcloud_history=pointcloud_history,
         rgb_history=rgb_history,
     )
+    # Final temporal admission at the owner boundary: the newest required source
+    # must be fresh and the cross-modal newest-source skew must be bounded.  A
+    # failed admission is a transient wait for the next poll, not an error.
+    try:
+        age_ms, skew_ms = observation_timing_ms(observation)
+    except ValueError:
+        return None
+    if age_ms > max_age_ns / 1e6 or skew_ms > max_skew_ns / 1e6:
+        return None
+    return observation
 
 
 def observation_sources(observation: ObservationBatch) -> dict[str, tuple[int, ...]]:
