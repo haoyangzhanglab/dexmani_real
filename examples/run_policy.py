@@ -11,8 +11,9 @@ lifecycle. Task success is judged offline from the published raw episodes; this
 command records only technical stop reasons.
 
 Inference is synchronous: each query supplies PolicySpec.n_action_steps actions,
-dispatched in order. The next query starts immediately after the last action;
-publication waits until at least one control period after the previous publish.
+dispatched in order at a cadence anchored to actual publication. The next query
+starts one control period after the previous publish; the new chunk's first
+action publishes immediately after inference, without an extra control period.
 Late inference never triggers catch-up dispatch. Fixed-FPS video is for viewing;
 use HDF5 timestamps for actual control timing.
 
