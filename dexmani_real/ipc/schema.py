@@ -82,8 +82,8 @@ _COMMON_COMMAND_FIELDS = [
     ("observation_id", "<u8"),
     ("action_id", "<u8"),
     ("created_monotonic_ns", "<u8"),
-    # Policy-grid target retained for provenance even when publication occurs
-    # after that instant and the worker delivery target is immediate.
+    # Producer-provided nominal/reference timestamp, retained for provenance.
+    # Defaults to target_monotonic_ns, the actual worker delivery target.
     ("scheduled_target_monotonic_ns", "<u8"),
     ("target_monotonic_ns", "<u8"),
     ("valid_until_monotonic_ns", "<u8"),

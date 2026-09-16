@@ -9,14 +9,19 @@ import numpy as np
 
 @dataclass(frozen=True)
 class ActionCandidate:
-    """One current-tick joint target proposed by a control source.
+    """One current command candidate proposed by a control producer.
 
     The controller assigns a globally monotonic action ID while building the
     candidate; publication confirms it still belongs to the active
-    ``run_generation``. ``scheduled_target_monotonic_ns`` preserves the policy
-    grid endpoint for provenance. ``target_monotonic_ns`` is the worker delivery
-    target chosen at publication, and ``valid_until_monotonic_ns`` is its hard
-    expiry. An overdue policy endpoint is never relabeled as a fresh endpoint.
+    ``run_generation``.
+
+    ``created_monotonic_ns`` is the candidate creation time.
+    ``scheduled_target_monotonic_ns`` retains an optional producer-provided
+    nominal/reference timestamp for provenance only; when omitted by the
+    producer, the builder defaults it to ``target_monotonic_ns``.
+    ``target_monotonic_ns`` is the actual worker delivery target assigned when
+    building the candidate. ``valid_until_monotonic_ns`` is the hard expiry
+    at and after which the command may no longer cross an actuator SDK boundary.
     """
 
     observation_id: int

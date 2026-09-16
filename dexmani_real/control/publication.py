@@ -195,7 +195,12 @@ def build_action_candidate(
     action_validity_s: float = 0.5,
     valid_until_monotonic_ns: int | None = None,
 ) -> ActionCandidate | None:
-    """Assign command identity and delivery timing before semantic admission."""
+    """Assign command identity and delivery timing before semantic admission.
+
+    The optional producer-provided ``scheduled_target_monotonic_ns`` is
+    provenance only and defaults to the current delivery target. It does not
+    determine delivery timing or expiry.
+    """
     if run_generation is not None and (
         isinstance(run_generation, (bool, np.bool_))
         or not isinstance(run_generation, (int, np.integer))
@@ -218,7 +223,7 @@ def build_action_candidate(
         if scheduled_target_monotonic_ns is None
         else scheduled_target_monotonic_ns
     )
-    # Logical/provenance time may be before or after candidate creation time.
+    # The producer's reference time may precede or follow candidate creation.
     if scheduled_ns <= 0:
         return None
     delivery_deadline_ns = now_ns + int(float(action_validity_s) * 1e9)
