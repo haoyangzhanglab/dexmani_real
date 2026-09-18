@@ -241,7 +241,13 @@ python -m dexmani_policy.deployment.export \
   --checkpoint epoch=0539-step=00048000-milestone=60pct.pt
 ```
 
-导出默认执行模型恢复和合成输入预测验证，在实验的 `checkpoints/` 下生成同名 `-deployment.pt` 文件，并将 `deployment_latest.pt` 更新为指向该文件。
+导出**始终**执行模型恢复和合成输入预测验证（没有跳过验证的开关），成功后在实验的 `checkpoints/` 下生成同名 `-deployment.pt` 文件，并将 `deployment_latest.pt` 更新为指向该文件。因此导出成功即代表该文件已完成 safe reload、严格恢复和一次确定性合成预测。
+
+导出的模型与数据语义（architecture / constructor、action/window、normalization、dataset/preprocessing）取自 **selected checkpoint 自己保存的** contract，而不是 `dexmani_policy` 当前的 experiment `config.yaml`；训练后修改 config 中这些部分不会改变旧检查点的部署行为。
+
+当前 config 仍提供 experiment identity 与 inference recipe：非 `best` 选择器读取 `eval.use_ema` 与 `eval.denoise_steps`，`best` 选择器读取 `best_ckpt.json` 中记录的同一组设置。因此只有这两项会随当前 config 变化，决定导出使用 raw 还是 EMA 权重以及 artifact 的默认 NFE；artifact 内只保存被选中的那一套权重。
+
+导出在 publish 之前失败时，本次生成的 candidate 会被删除且 `deployment_latest.pt` 保持原值，同一条命令可直接重试。
 
 导出成功后，回到本仓库运行真机评估：
 
