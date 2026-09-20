@@ -570,7 +570,10 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 reached_limit = (
                     (recorder.stop_pending or stop_result.done)
                     and stop_result.reason == "max_frames"
-                    and (teleop_active or recording_active)
+                    # Client production has already stopped at capacity, but
+                    # this controller flag still owns the current capture's
+                    # first capacity event. A new unrecorded B cannot own it.
+                    and recording_active
                 )
                 if reached_limit:
                     enter_pause("max_frames", relabel=True)

@@ -178,10 +178,14 @@ class _TeleopRecordingHarness:
             self.case.assertTrue(self.client.add_frame(
                 _state(float(index + 1)), _action(), dict(_VR_FRAME), arm_qpos_sent=np.zeros(7)))
 
-    def finalize(self):
+    def begin_finalization(self):
         stop = self.shared.record_control_q.get_nowait()
         self.session._handle_stop(stop)
         self.session._drain_samples()
+
+    def finalize(self):
+        if self.session.pending_finalization is None:
+            self.begin_finalization()
         pending = self.session.pending_finalization
         self.case.assertIsNotNone(pending)
         pending.thread.join(5)
@@ -459,6 +463,86 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
                 self.assertEqual(r.logs.count("[DROP]"), 1)
                 if boundary in ("r", "epoch"):
                     self.assertEqual([c.action_id for _, c in r.published], [2])
+
+
+class TeleopCapacityOwnershipTest(unittest.TestCase):
+    def test_old_terminal_arriving_on_first_poll_after_b_cannot_pause_it(self):
+        from dexmani_real.runtime.operator_input import OperatorCommand as Command
+        from dexmani_real.runtime.safety import SafetyState
+        h = _TeleopRecordingHarness(self, max_frames=2)
+        begin = lambda h: setattr(h, "controls", [Command.BEGIN])
+        h.run([begin, lambda h: h.add_rows(), begin, lambda h: h.finalize(), lambda h: None])
+        snapshots = {s[0]: s[1:] for s in h.snapshots}
+        self.assertEqual(snapshots[4][:3], (True, False, SafetyState.RUNNING))
+        self.assertEqual(snapshots[4], snapshots[5])
+        self.assertEqual(h.output.getvalue().count("已达到最大录制时长"), 1)
+
+    def test_old_pending_and_done_cannot_pause_new_unrecorded_run(self):
+        import threading
+        from unittest import mock
+        from dexmani_real.recording.client import StopRecording
+        from dexmani_real.runtime.operator_input import OperatorCommand as Command
+        from dexmani_real.runtime.safety import SafetyState
+        h = _TeleopRecordingHarness(self, max_frames=2)
+        begin = lambda h: setattr(h, "controls", [Command.BEGIN])
+        stop = lambda h: setattr(h, "controls", [Command.STOP])
+        entered, release = threading.Event(), threading.Event()
+        def capacity_with_active_finalizer(h):
+            h.add_rows()
+            close = h.recorder._camera_writer.close
+            def blocked_close(*args, **kwargs):
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test did not release finalizer")
+                return close(*args, **kwargs)
+            patch = mock.patch.object(h.recorder._camera_writer, "close", side_effect=blocked_close)
+            patch.start()
+            self.addCleanup(patch.stop)
+            h.begin_finalization()
+            self.assertTrue(entered.wait(2))
+        def finish(h):
+            self.assertTrue(h.session.pending_finalization.thread.is_alive())
+            release.set()
+            h.finalize()
+        try:
+            with self.assertLogs("dexmani_real", level="INFO") as logs:
+                h.run([begin, capacity_with_active_finalizer, begin, lambda h: None,
+                       finish, lambda h: None, stop,
+                       begin, lambda h: h.add_rows(1), stop, lambda h: h.finalize(), lambda h: None])
+        finally:
+            release.set()
+        snapshots = {s[0]: s[1:] for s in h.snapshots}
+        # poll A/max_frames -> B -> repeated pending -> delayed terminal -> poll again.
+        for frame in (4, 5, 6):
+            self.assertEqual(snapshots[frame][:3], (True, False, SafetyState.RUNNING))
+        self.assertEqual(snapshots[4][3], snapshots[5][3])
+        self.assertEqual(snapshots[4][3], snapshots[6][3])
+        self.assertEqual(snapshots[9][:3], (True, True, SafetyState.RUNNING))
+        self.assertEqual(h.starts, 2)
+        stops = [m for m in h.messages if isinstance(m, StopRecording)]
+        self.assertEqual([(m.save, m.reason) for m in stops], [(True, "max_frames"), (True, "manual")])
+        self.assertEqual(h.output.getvalue().count("已达到最大录制时长"), 1)
+        records = [line for line in logs.output if "[RECORD] reason=" in line]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(sum("reason=max_frames" in line for line in records), 1)
+        self.assertTrue((h.root / "episode_1" / "data.h5").is_file())
+        self.assertTrue((h.root / "episode_2" / "data.h5").is_file())
+        self.assertFalse(h.client.poll_stop().done)
+
+    def test_first_capacity_terminal_without_pending_observation_still_pauses(self):
+        from dexmani_real.runtime.operator_input import OperatorCommand as Command
+        from dexmani_real.runtime.safety import SafetyState
+        h = _TeleopRecordingHarness(self, max_frames=2)
+        def finish_capacity(h):
+            h.add_rows()
+            h.finalize()
+            self.assertTrue(h.client.stop_pending)  # terminal is still queued
+        with self.assertLogs("dexmani_real", level="INFO") as logs:
+            h.run([lambda h: setattr(h, "controls", [Command.BEGIN]), finish_capacity, lambda h: None])
+        self.assertEqual(h.snapshots[0][1:4], (False, False, SafetyState.ARMED))
+        self.assertEqual(h.output.getvalue().count("已达到最大录制时长"), 1)
+        self.assertEqual(sum("[RECORD] reason=max_frames" in line for line in logs.output), 1)
+        self.assertFalse(h.client.poll_stop().done)
 
 
 if __name__ == "__main__":
