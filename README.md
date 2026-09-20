@@ -104,6 +104,8 @@ python examples/keyboard_teleop.py
 
 具体按键、运行条件和限制以脚本当前帮助信息为准。
 
+FIFO 满时仍处理按键释放：短暂释放期间暂停提交，重新按住可重试同一候选；释放确认后取消未提交候选，只等待最后成功发布动作的既有 ACK 或 timeout，再撤销 motion 并从 measured feedback 重建参考。ACK 表示命令接受，不代表物理收敛。
+
 ## Physical Replay
 
 `replay_episode.py` 用于将已记录动作重新发送到真实机器人，是 hardware-affecting workflow。

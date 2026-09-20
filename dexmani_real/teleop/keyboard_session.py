@@ -670,10 +670,22 @@ def _run_control_loop(
     pending_arm_qpos: np.ndarray | None = None
     fifo_wait = PublishWaitTracker("keyboard")
 
+    def drop_pending(reason: str) -> None:
+        """Cancel only the uncommitted jog and close its visible wait once."""
+        nonlocal pending_candidate, pending_arm_qpos
+        if pending_candidate is not None:
+            logger.warning(
+                "[DROP] keyboard action=%d reason=%s", pending_candidate.action_id, reason
+            )
+        fifo_wait.note_dropped(reason, report=False)
+        pending_candidate = None
+        pending_arm_qpos = None
+
     def reject_motion(reason: str, *, fatal: bool = False) -> bool:
         nonlocal motion_active, release_idle_frames, last_motion_action_id
         nonlocal release_ack_started_s, previous_command, target_pos, target_quat
         nonlocal blocked_until_release
+        drop_pending(reason)
         if (
             fatal
             or shared.error_state.value
@@ -707,9 +719,11 @@ def _run_control_loop(
         frame += 1
 
         if keys.is_pressed("esc"):
+            drop_pending("estop")
             set_keyboard_fault(shared, "operator e-stop", estop=True)
             return False
         if not keys.healthy:
+            drop_pending("keyboard_listener_exited")
             set_keyboard_fault(shared, "keyboard listener exited", estop=True)
             return False
 
@@ -721,10 +735,12 @@ def _run_control_loop(
             heartbeat_timeouts_s=heartbeat_timeouts,
         )
         if issue is not None:
+            drop_pending(issue)
             set_keyboard_fault(shared, issue)
             return False
         quit_requested = keys.is_pressed("q")
         if quit_requested and not quit_quiesced:
+            drop_pending("quit")
             # Establish the terminal command-silence boundary before any
             # remaining feedback/fault classification work in this iteration.
             if not revoke_motion(shared, SafetyState.ARMED):
@@ -738,10 +754,12 @@ def _run_control_loop(
         )
         if feedback.issue is not None:
             if not feedback.retryable:
+                drop_pending(feedback.issue)
                 set_keyboard_fault(shared, feedback.issue)
                 return False
             state_failures += 1
             if state_failures >= int(policy.max_consecutive_errors):
+                drop_pending(feedback.issue)
                 set_keyboard_fault(shared, feedback.issue)
                 return False
             continue
@@ -761,6 +779,7 @@ def _run_control_loop(
 
         home_pressed = keys.is_pressed("r")
         if home_pressed and not home_key_down:
+            drop_pending("home")
             home_anchor = _run_keyboard_home(
                 shared,
                 runtime,
@@ -782,52 +801,11 @@ def _run_control_loop(
             continue
         home_key_down = home_pressed
 
-        # Recoverable FIFO backpressure: retry the identical kept candidate
-        # before any new proposal or release handling; a revoked epoch drops
-        # it visibly instead of sending stale key intent.
-        if pending_candidate is not None:
-            if int(pending_candidate.run_generation) != int(
-                shared.run_generation.value
-            ):
-                logger.warning(
-                    "[DROP] keyboard action=%d reason=generation_revoked",
-                    pending_candidate.action_id,
-                )
-                fifo_wait.note_dropped("generation_revoked", report=False)
-                pending_candidate = None
-                pending_arm_qpos = None
-                continue
-            else:
-                retry = publish_command(
-                    shared,
-                    pending_candidate,
-                    required_safety_state=SafetyState.RUNNING,
-                )
-                if retry.published:
-                    fifo_wait.note_committed()
-                    last_motion_action_id = int(pending_candidate.action_id)
-                    assert pending_arm_qpos is not None
-                    previous_command = pending_arm_qpos
-                    pending_candidate = None
-                    pending_arm_qpos = None
-                    # One committed command per frame: do not also propose a
-                    # fresh target in the same iteration.
-                    continue
-                elif retry.reason == PUBLISH_REASON_FIFO_FULL:
-                    fifo_wait.note_full(retry.fifo_depth, pending_candidate.action_id)
-                    continue
-                else:
-                    logger.warning(
-                        "[DROP] keyboard action=%d reason=%s",
-                        pending_candidate.action_id,
-                        retry.reason,
-                    )
-                    fifo_wait.note_dropped(retry.reason, report=False)
-                    kept_reason = retry.reason
-                    pending_candidate = None
-                    pending_arm_qpos = None
-                    if not reject_motion(kept_reason):
-                        return False
+        if pending_candidate is not None and int(pending_candidate.run_generation) != int(
+            shared.run_generation.value
+        ):
+            drop_pending("generation_revoked")
+            continue
 
         active_keys = keys.pressed_keys()
         dx, drpy = compute_cartesian_jog_delta(
@@ -868,6 +846,9 @@ def _run_control_loop(
                 release_idle_frames += 1
                 if release_idle_frames < int(cfg.release_debounce_frames):
                     continue
+                # The unsubmitted endpoint has no ACK to wait for. Only the
+                # last successful publication participates in the original wait.
+                drop_pending("release")
                 if release_ack_started_s <= 0.0:
                     release_ack_started_s = time.monotonic()
                 last_action_accepted = _keyboard_action_was_accepted(
@@ -919,6 +900,27 @@ def _run_control_loop(
         # Moving: keys are held.
         release_idle_frames = 0
         release_ack_started_s = 0.0
+        # Only held motion intent may retry. Debounce/confirmed release above
+        # must run even while FULL; retry never replaces or re-projects a target.
+        if pending_candidate is not None:
+            retry = publish_command(
+                shared, pending_candidate, required_safety_state=SafetyState.RUNNING
+            )
+            if retry.published:
+                fifo_wait.note_committed()
+                last_motion_action_id = int(pending_candidate.action_id)
+                assert pending_arm_qpos is not None
+                previous_command = pending_arm_qpos
+                pending_candidate = None
+                pending_arm_qpos = None
+            elif retry.reason == PUBLISH_REASON_FIFO_FULL:
+                fifo_wait.note_full(retry.fifo_depth, pending_candidate.action_id)
+            else:
+                drop_pending(retry.reason)
+                if not reject_motion(retry.reason):
+                    return False
+            # At most one publication per tick, including a successful retry.
+            continue
         if not motion_active:
             if not begin_motion(shared):
                 set_keyboard_fault(shared, "failed to enter keyboard motion")
@@ -997,6 +999,7 @@ def _run_control_loop(
                 f"Δ={_err_m:.3f}m{boundary_indicator}",
                 flush=True,
             )
+    drop_pending("shutdown")
     return False
 
 

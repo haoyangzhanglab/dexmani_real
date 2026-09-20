@@ -316,5 +316,150 @@ class TeleopInterruptedRecordingTest(unittest.TestCase):
                 self.assertEqual((h.root / "episode_1").exists(), save)
 
 
+class KeyboardReleaseLoopTest(unittest.TestCase):
+    def _run(self, script):
+        """Drive actual jog/retry/release code, replacing device reads and FIFO capacity."""
+        import contextlib
+        import io
+        import numpy as np
+        from unittest import mock
+        import dexmani_real.teleop.keyboard_session as keyboard
+        from dexmani_real.config.experiment import resolve_experiment_config
+        from dexmani_real.control.action import ActionCandidate
+        from dexmani_real.control.publication import PreparedCommand, PublishResult
+        from dexmani_real.runtime.safety import SafetyState
+        from test_deployment_evidence import _fake_shared
+
+        runtime = resolve_experiment_config()
+        shared = _fake_shared()
+        state = SimpleNamespace(frame=0, now=10., step={})
+        shared.get_heartbeat = lambda *a: state.now
+        qpos = np.asarray(runtime.arm.home_qpos, dtype=np.float64)
+        workspace = keyboard._workspace(runtime)
+        pose = SimpleNamespace(p=workspace.mean(axis=1), q=np.array([1., 0., 0., 0.]))
+        planner = mock.Mock()
+        planner.kin.compute_eef_pose_world.return_value = pose
+        planner.solve_teleop_ik.return_value = SimpleNamespace(success=True, qpos=qpos + .01)
+        planner.ik_mgr.nearest_equivalent_qpos.side_effect = lambda q, ref: q.copy()
+        prepared, attempts, published, snapshots = [], [], [], {}
+        case = self
+
+        class Rate:
+            def wait(self):
+                snapshots[state.frame] = (int(shared.safety_state.value), int(shared.run_generation.value))
+                state.frame += 1
+                case.assertLessEqual(state.frame, len(script) + 1)
+                state.now += 1. / runtime.keyboard_teleop.control_hz
+                state.step = script[state.frame - 1] if state.frame <= len(script) else {"keys": ("q",)}
+                if state.step.get("revoke"):
+                    keyboard.revoke_motion(shared, SafetyState.ARMED)
+
+            def reset(self):
+                pass
+
+        keys = SimpleNamespace(healthy=True,
+            is_pressed=lambda k: k in state.step.get("keys", ()),
+            pressed_keys=lambda: tuple(state.step.get("keys", ())))
+
+        def feedback(*args, **kwargs):
+            return keyboard._KeyboardFeedback(
+                arm_state={"last_cmd_generation": shared.run_generation.value,
+                           "last_cmd_seq": state.step.get("ack", 0)},
+                arm_qpos_rad=qpos.copy(), hand_qpos_rad=None, issue=None)
+
+        def prepare(shared, q, **kwargs):
+            candidate = ActionCandidate(run_generation=int(shared.run_generation.value),
+                                        action_id=len(prepared) + 1, arm_qpos=q.copy())
+            prepared.append(candidate)
+            return PreparedCommand(candidate=candidate)
+
+        def publish(shared, candidate, **kwargs):
+            attempts.append((state.frame, candidate))
+            self.assertEqual(candidate.run_generation, shared.run_generation.value)
+            self.assertEqual(shared.safety_state.value, SafetyState.RUNNING)
+            if state.step.get("full", False):
+                return PublishResult(False, reason=keyboard.PUBLISH_REASON_FIFO_FULL, fifo_depth=4)
+            published.append((state.frame, candidate))
+            return PublishResult(True)
+
+        def home(shared, runtime, planner, keys, current, **kwargs):
+            keyboard.revoke_motion(shared, SafetyState.ARMED)
+            return keyboard._keyboard_command_anchor(planner, current)
+
+        with contextlib.ExitStack() as stack:
+            patches = dict(read_initial_arm=mock.Mock(return_value={"qpos": qpos}),
+                _read_keyboard_feedback=feedback, LoopRate=mock.Mock(return_value=Rate()),
+                time=SimpleNamespace(monotonic=lambda: state.now),
+                prepare_joint_command=prepare, publish_command=publish,
+                _run_keyboard_home=home)
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(keyboard, name, value))
+            anchor = stack.enter_context(mock.patch.object(keyboard, "_keyboard_command_anchor",
+                                                          wraps=keyboard._keyboard_command_anchor))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            logs = stack.enter_context(self.assertLogs("dexmani_real", level="INFO"))
+            result = keyboard._run_control_loop(shared, runtime, planner, mock.Mock(), keys,
+                                                mock.Mock(is_alive=lambda: True), None, hand_enabled=False)
+        return SimpleNamespace(prepared=prepared, attempts=attempts, published=published,
+                               snapshots=snapshots, logs="\n".join(logs.output), result=result,
+                               anchors=anchor.call_count, ik_calls=planner.solve_teleop_ik.call_count)
+
+    def test_full_release_drops_before_capacity_returns(self):
+        r = self._run([{"keys": ("w",), "full": True}, {"full": True}, {}, {},
+                       {"keys": ("w",)}, {}])
+        self.assertEqual([f for f, c in r.attempts if c.action_id == 1], [1])
+        self.assertEqual([c.action_id for _, c in r.published], [2])
+        self.assertEqual(r.logs.count("[DROP]"), 1)
+        self.assertIn("reason=release", r.logs)
+        self.assertGreaterEqual(r.anchors, 2)
+
+    def test_unacked_predecessor_uses_original_release_timeout(self):
+        from dexmani_real.runtime.safety import SafetyState
+        r = self._run([{"keys": ("w",)}, {"keys": ("w",), "full": True}]
+                      + [{"full": True}] * 8 + [{}])
+        self.assertEqual([c.action_id for _, c in r.published], [1])
+        self.assertEqual(r.snapshots[4][0], SafetyState.RUNNING)
+        self.assertEqual(r.snapshots[8][0], SafetyState.RUNNING)
+        self.assertEqual(r.snapshots[9][0], SafetyState.ARMED)
+        self.assertIn("final action_id=1 was not accepted", r.logs)
+        self.assertEqual(r.logs.count("[DROP]"), 1)
+
+    def test_accepted_or_absent_predecessor_releases_without_wait(self):
+        from dexmani_real.runtime.safety import SafetyState
+        for predecessor in (False, True):
+            with self.subTest(predecessor=predecessor):
+                prefix = [{"keys": ("w",)}] if predecessor else []
+                r = self._run(prefix + [{"keys": ("w",), "full": True},
+                                        {"ack": 1, "full": True}, {"ack": 1, "full": True}, {}])
+                self.assertEqual(r.snapshots[len(prefix) + 3][0], SafetyState.ARMED)
+                self.assertNotIn("was not accepted", r.logs)
+                self.assertEqual(r.logs.count("[DROP]"), 1)
+
+    def test_held_key_retries_same_candidate_once_without_new_ik(self):
+        r = self._run([{"keys": ("w",), "full": True}] * 3 + [{"keys": ("w",)}])
+        self.assertEqual(len(r.prepared), 1)
+        self.assertEqual(r.ik_calls, 1)
+        self.assertEqual(len(r.published), 1)
+        self.assertTrue(all(c is r.prepared[0] for _, c in r.attempts))
+        self.assertNotIn("[DROP]", r.logs)
+
+    def test_short_release_retains_without_submitting_until_repress(self):
+        r = self._run([{"keys": ("w",), "full": True}, {}, {"keys": ("w",)}])
+        self.assertEqual([f for f, _ in r.attempts], [1, 3])
+        self.assertEqual(len(r.prepared), 1)
+        self.assertEqual(len(r.published), 1)
+        self.assertIs(r.published[0][1], r.prepared[0])
+
+    def test_terminal_home_and_epoch_boundaries_drop_once(self):
+        for boundary in ("q", "esc", "r", "epoch"):
+            with self.subTest(boundary=boundary):
+                event = {"revoke": True, "keys": ("w",)} if boundary == "epoch" else {"keys": (boundary,)}
+                r = self._run([{"keys": ("w",), "full": True}, event, {}, {"keys": ("w",)}])
+                self.assertFalse(any(c.action_id == 1 for _, c in r.published))
+                self.assertEqual(r.logs.count("[DROP]"), 1)
+                if boundary in ("r", "epoch"):
+                    self.assertEqual([c.action_id for _, c in r.published], [2])
+
+
 if __name__ == "__main__":
     unittest.main()
