@@ -409,9 +409,15 @@ class PolicyRunner:
         continuity reference ensures the next chunk's first action anchors to the
         newly measured arm state rather than a pre-gap command target.
         """
-        logger.debug(
-            "policy discard generation=%s query=%s index=%s reason=%s",
-            self.run_generation, self.observation_id, self.chunk_action_index, reason,
+        # One visible line per real chunk discard; the dropped actions never
+        # reach the SDK and the next query replaces them.
+        logger.warning(
+            "[DROP] policy q=%s idx=%s remaining=%d reason=%s",
+            self.run_generation,
+            self.observation_id,
+            self.chunk_action_index,
+            len(self.actions),
+            reason,
         )
         self.actions.clear()
         self.chunk_sources.clear()

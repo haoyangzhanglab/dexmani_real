@@ -26,16 +26,12 @@ class PolicyStats:
     rejection_reasons: dict[str, int] = field(default_factory=dict)
 
     def log_rejection(self, reason: str) -> None:
-        """Show each cause once per episode; keep every rejection in the file log."""
+        """One visible line per rejected policy step; repeats carry their count."""
         count = self.rejection_reasons.get(reason, 0) + 1
         self.rejection_reasons[reason] = count
-        if count == 1:
-            logger.warning(
-                "policy: rejected policy step: %s (repeats summarized at episode end)",
-                reason,
-            )
-        else:
-            logger.debug("policy: rejected policy step: %s (count=%d)", reason, count)
+        logger.warning(
+            "[REJECT] policy step reason=%s count=%d", reason, count
+        )
 
     def log_summary(self) -> None:
         """Report episode counts without presenting old timings as live metrics."""
