@@ -88,6 +88,33 @@ def load_rollout(episode: Path) -> tuple[dict[str, np.ndarray], float, np.ndarra
     return trace, hz, timestamps
 
 
+def print_raw_only_notice(episode: Path) -> int:
+    """Explain one trace-less synchronous raw rollout without calling it corrupt.
+
+    The refactored synchronous pipeline publishes raw rollouts and no
+    prediction-trace sidecar, so a missing sidecar is a normal rollout shape,
+    not damaged data: report the raw basics and point to the raw viewer.
+    """
+    with EpisodeReader(episode) as reader:
+        meta = reader.h5f["meta"].attrs
+        print(f"Episode: {episode}")
+        print(
+            "Trace:   none — this is a synchronous-raw rollout (no legacy "
+            "policy-trace sidecar); the raw data is intact, not corrupt"
+        )
+        print(
+            f"Raw frames: {int(meta.get('num_frames', 0))}; "
+            f"control_hz: {reader.timing.rate_hz:g}; "
+            f"task: {str(meta.get('task_label', ''))}"
+        )
+        print(
+            "This viewer requires a legacy trace sidecar. Inspect the raw "
+            "episode with:\n"
+            f"  python examples/visualize_episode.py {episode}"
+        )
+    return 0
+
+
 def print_info(
     episode: Path, trace: dict[str, np.ndarray], hz: float, frames: int
 ) -> None:
@@ -488,6 +515,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--pointcloud-num-points requires --point-cloud")
     episode = Path(args.episode).expanduser().resolve()
     try:
+        if not trace_path_for_episode(episode).is_file():
+            # No sidecar is a distinct, non-corrupt outcome; a sidecar that
+            # exists but cannot be read still fails loudly below.
+            return print_raw_only_notice(episode)
         trace, hz, timestamps = load_rollout(episode)
         if args.info:
             print_info(episode, trace, hz, len(timestamps))

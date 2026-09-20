@@ -30,6 +30,7 @@ from dexmani_real.dataset.export import (
     export_processed_hdf5_to_zarr,
     preflight_processed_hdf5_to_zarr,
 )
+from dexmani_real.utils.atomic_io import target_is_occupied
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -71,7 +72,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-# Source roots whose contents must never receive derived export output.
+# Source roots whose contents must never receive derived export output. They
+# are anchored to the REPOSITORY root, not the caller's working directory, so
+# the guard holds no matter where the tool is invoked from.
 _PROTECTED_SOURCE_ROOTS = ("episodes", "episodes_processed", "rollouts")
 
 
@@ -84,12 +87,13 @@ def _resolve_output_path(
 
     Symlinks are followed, so a link that escapes into raw/processed/rollout
     data is refused by its resolved location. Overwriting any existing output
-    is refused later by the export transaction itself.
+    is refused by the occupied-target check before either mode runs.
     """
     candidate = default_path if output is None else output
     resolved = candidate.expanduser().resolve(strict=False)
     protected = [
-        Path(name).resolve(strict=False) for name in _PROTECTED_SOURCE_ROOTS
+        (_REPO_ROOT / name).resolve(strict=False)
+        for name in _PROTECTED_SOURCE_ROOTS
     ]
     protected.append(input_root.expanduser().resolve(strict=False))
     for root in protected:
@@ -172,6 +176,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
     progress = _ExportProgress()
     report: dict
+    # Preflight and real export share the identical output contract: an
+    # occupied target is refused up front in BOTH modes, exactly as the
+    # export transaction would refuse it.
+    if target_is_occupied(output_path):
+        print(
+            f"error: refusing to overwrite existing output: {output_path}",
+            file=sys.stderr,
+        )
+        return 2
     try:
         if args.dry_run:
             report = preflight_processed_hdf5_to_zarr(

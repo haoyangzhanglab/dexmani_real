@@ -104,6 +104,36 @@ class ExportOutputGuardTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._guard(store / "data" / "new.zarr", self.root / "in")
 
+    def test_guard_holds_from_a_foreign_working_directory(self):
+        """Protected roots are repository-anchored, not CWD-anchored."""
+        import os
+
+        original = Path.cwd()
+        try:
+            os.chdir(self.root)
+            with self.assertRaises(ValueError):
+                self._guard(
+                    _REPO_ROOT / "episodes" / "pick_place_toy" / "evil.zarr",
+                    self.root / "in",
+                )
+        finally:
+            os.chdir(original)
+
+    def test_occupied_target_refused_in_both_modes(self):
+        """Preflight and real export share the same refusal for a target."""
+        import contextlib
+        import io
+
+        occupied = self.root / "occupied.zarr"
+        occupied.mkdir()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = _export_cli.main(
+                ["some_task", "--output", str(occupied), "--dry-run"]
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("refusing to overwrite existing output", stderr.getvalue())
+
     def test_parser_exposes_narrow_output(self):
         parser = _export_cli._parser()
         args = parser.parse_args(
@@ -174,6 +204,54 @@ class AffectedParserSmokeTest(unittest.TestCase):
                     source = (_EXAMPLES / f"{name}.py").read_text(encoding="utf-8")
                     for flag in flags:
                         self.assertIn(f'"{flag}"', source)
+
+
+class PolicyRolloutViewerTest(unittest.TestCase):
+    """EX11: a sync-raw rollout without a trace sidecar is not corruption."""
+
+    def test_missing_trace_reports_raw_basics_and_redirects(self):
+        import contextlib
+        import io
+        import tempfile
+
+        try:
+            from tests.raw_episode_fixture import build_raw_episode
+        except Exception as exc:  # pragma: no cover - environment guard
+            self.skipTest(f"raw fixture unavailable: {exc}")
+        module = _load_example_or_skip(self, "visualize_policy_rollout")
+        with tempfile.TemporaryDirectory() as tmp:
+            episode = build_raw_episode(Path(tmp) / "episode_trace_less")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = module.main([str(episode), "--info"])
+            text = stdout.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("synchronous-raw rollout", text)
+        self.assertIn("not corrupt", text)
+        self.assertIn("visualize_episode.py", text)
+
+    def test_present_but_unreadable_trace_still_fails_loudly(self):
+        """A sidecar that exists but cannot be read is never excused as raw-only."""
+        import contextlib
+        import io
+        import tempfile
+
+        try:
+            from tests.raw_episode_fixture import build_raw_episode
+        except Exception as exc:  # pragma: no cover - environment guard
+            self.skipTest(f"raw fixture unavailable: {exc}")
+        module = _load_example_or_skip(self, "visualize_policy_rollout")
+        with tempfile.TemporaryDirectory() as tmp:
+            episode = build_raw_episode(Path(tmp) / "episode_bad_trace")
+            (Path(tmp) / "episode_bad_trace.policy_trace.npz").write_bytes(
+                b"not a trace archive"
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as ctx:
+                    module.main([str(episode), "--info"])
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("rollout visualization", stderr.getvalue())
 
 
 class StaticEntryCheckTest(unittest.TestCase):

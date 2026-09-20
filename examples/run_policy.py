@@ -92,7 +92,7 @@ def _parser() -> argparse.ArgumentParser:
         help="override the artifact's default inference steps (default: artifact default)",
     )
     parser.add_argument(
-        "--seed", type=_nonnegative_int, default=0, help="per-episode inference seed"
+        "--seed", type=_nonnegative_int, default=0, help="per-session inference seed"
     )
     parser.add_argument(
         "--num-episodes",
