@@ -14,7 +14,6 @@ from dexmani_real.control.publication import (
     PUBLISH_REASON_SAFETY_STATE,
     PreparedCommand,
     PublishResult,
-    PublishWaitTracker,
     prepare_joint_command,
     publish_command,
     wait_command_accepted,
@@ -181,9 +180,8 @@ class _PendingTeleopPublish:
     retarget_succeeded: bool = True
 
 
-def _drop_pending_publish(
+def drop_pending_command(
     controller: "TeleopController",
-    resources: "TeleopGridResources",
     reason: str,
 ) -> None:
     """Visibly drop a local pending candidate revoked by lifecycle."""
@@ -194,25 +192,6 @@ def _drop_pending_publish(
     logger.warning(
         "[DROP] teleop action=%d reason=%s", pending.candidate.action_id, reason
     )
-    # The action owner already reported this cancellation; close the span once.
-    resources.fifo_wait.note_dropped(reason, report=False)
-
-
-def close_publish_span(
-    controller: "TeleopController",
-    resources: "TeleopGridResources",
-    reason: str,
-) -> None:
-    """End any retained backpressure span at a pause/re-anchor boundary.
-
-    Every pause path discards ``controller.pending_publish``; without closing
-    the tracker here a span would outlive its candidate, suppressing the next
-    ``[WAIT]`` and turning the following ``[RESUME]`` into a wait that never
-    resumed. ``note_dropped`` is a no-op when no span is open, so this is safe
-    on every boundary.
-    """
-    _drop_pending_publish(controller, resources, reason)
-    resources.fifo_wait.note_dropped(reason)
 
 
 @dataclass(frozen=True)
@@ -228,7 +207,6 @@ class TeleopGridResources:
     arm_feedback_warn: ThrottledWarner
     hand_ramp_total_frames: int
     max_observation_skew_s: float
-    fifo_wait: PublishWaitTracker
 
 
 @dataclass(frozen=True)
@@ -696,7 +674,7 @@ def _read_control_grid_observation(
                 hand_source_monotonic_ns=hand_source_ns,
             )
         ):
-            close_publish_span(controller, resources, "pause_release")
+            drop_pending_command(controller, "pause_release")
             if controller.reset_reference(arm_state, vr_frame, hand_state):
                 logger.info(
                     "teleop_loop: released %s pause boundary after fresh re-anchor",
@@ -834,7 +812,6 @@ def _commit_pending_command(
     )
     if not result.published:
         if result.reason == PUBLISH_REASON_FIFO_FULL:
-            resources.fifo_wait.note_full(result.fifo_depth, candidate.action_id)
             _record_grid_hold(
                 controller,
                 shared,
@@ -845,12 +822,12 @@ def _commit_pending_command(
             )
             return True
         if _publication_motion_revoked(shared, PreparedCommand(candidate=candidate)):
-            _drop_pending_publish(controller, resources, "motion_revoked")
+            drop_pending_command(controller, "motion_revoked")
             return True
         if result.reason.startswith(PUBLISH_REASON_SAFETY_STATE):
             # A lifecycle pause is revoking this epoch; the held row stays
             # honest and the outer loop owns the pause boundary.
-            _drop_pending_publish(controller, resources, result.reason)
+            drop_pending_command(controller, result.reason)
             _record_grid_hold(
                 controller,
                 shared,
@@ -864,10 +841,9 @@ def _commit_pending_command(
             "teleop_loop: joint publication stopped by runtime gate: %s",
             result.reason,
         )
-        _drop_pending_publish(controller, resources, result.reason)
+        drop_pending_command(controller, result.reason)
         return False
 
-    resources.fifo_wait.note_committed()
     controller.pending_publish = None
     if not _confirm_terminal_arm_acceptance_if_needed(
         shared, cfg, resources.recorder, candidate, result,
@@ -1214,7 +1190,7 @@ def run_control_grid_tick(
         pending is not None
         and int(pending.candidate.run_generation) != control_run_generation
     ):
-        _drop_pending_publish(controller, resources, "generation_revoked")
+        drop_pending_command(controller, "generation_revoked")
     tick_result, observation = _read_control_grid_observation(
         controller,
         shared,

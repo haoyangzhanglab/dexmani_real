@@ -5,7 +5,7 @@ Two levels of verification, both without hardware, GUI, or batch --help runs:
 * affected entries whose module imports are offline-safe are imported and
   their real argument parsers are exercised (EX01 run_policy, EX07
   process_episodes, EX08 export_policy_zarr including the new narrow
-  ``--output`` guard, EX11 visualize_policy_rollout on a trace-less raw
+  ``--output`` guard,
   episode, plus parser smoke checks for EX02/EX03/EX04/EX05);
 * the export guard's protected-source rules are unit-tested directly
   (defaults unchanged, symlink escape refused, existing .zarr store refused).
@@ -256,61 +256,10 @@ class AffectedParserSmokeTest(unittest.TestCase):
             self.assertEqual(hashes(), before)
 
 
-
-class PolicyRolloutViewerTest(unittest.TestCase):
-    """EX11: a sync-raw rollout without a trace sidecar is not corruption."""
-
-    def test_missing_trace_reports_raw_basics_and_redirects(self):
-        import contextlib
-        import io
-        import tempfile
-
-        try:
-            from tests.raw_episode_fixture import build_raw_episode
-        except ImportError as exc:  # pragma: no cover - environment guard
-            self.skipTest(f"raw fixture unavailable: {exc}")
-        module = _load_example_or_skip(self, "visualize_policy_rollout")
-        with tempfile.TemporaryDirectory() as tmp:
-            episode = build_raw_episode(Path(tmp) / "episode_trace_less")
-            stdout = io.StringIO()
-            with contextlib.redirect_stdout(stdout):
-                code = module.main([str(episode), "--info"])
-            text = stdout.getvalue()
-        self.assertEqual(code, 0)
-        self.assertIn("synchronous-raw rollout", text)
-        self.assertIn("not corrupt", text)
-        self.assertIn("visualize_episode.py", text)
-
-    def test_present_but_unreadable_trace_still_fails_loudly(self):
-        """A sidecar that exists but cannot be read is never excused as raw-only."""
-        import contextlib
-        import io
-        import tempfile
-
-        try:
-            from tests.raw_episode_fixture import build_raw_episode
-        except ImportError as exc:  # pragma: no cover - environment guard
-            self.skipTest(f"raw fixture unavailable: {exc}")
-        module = _load_example_or_skip(self, "visualize_policy_rollout")
-        with tempfile.TemporaryDirectory() as tmp:
-            episode = build_raw_episode(Path(tmp) / "episode_bad_trace")
-            (Path(tmp) / "episode_bad_trace.policy_trace.npz").write_bytes(
-                b"not a trace archive"
-            )
-            stderr = io.StringIO()
-            with contextlib.redirect_stderr(stderr):
-                with self.assertRaises(SystemExit) as ctx:
-                    module.main([str(episode), "--info"])
-        self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("rollout visualization", stderr.getvalue())
-
-
 class StaticEntryCheckTest(unittest.TestCase):
     """AST-parse the device/GUI entries and scan them for removed APIs.
 
-    Nothing in this class executes an example. ``visualize_policy_rollout``
-    (EX11) is included so the removed-API scan covers it; its real parser is
-    exercised separately by ``PolicyRolloutViewerTest``.
+    Nothing in this class executes an example.
     """
 
     def test_device_and_gui_entries_parse(self):
@@ -318,7 +267,6 @@ class StaticEntryCheckTest(unittest.TestCase):
             "calibrate_vr_heading",
             "visualize_episode",
             "visualize_episode_processed",
-            "visualize_policy_rollout",
             "pointcloud_process_example",
             "realsense_record_example",
             "xhand_control_example",

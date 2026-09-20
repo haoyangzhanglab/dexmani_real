@@ -11,7 +11,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import numpy as np
 
@@ -27,7 +27,6 @@ from dexmani_real.control.publication import (
     CommandFeedbackSnapshot,
     PreparedCommand,
     PublishResult,
-    PublishWaitTracker,
     build_action_candidate,
     command_publishability_reason,
     prepare_command,
@@ -53,7 +52,6 @@ from dexmani_real.deployment.inference.observation import (
     observation_sources,
     observation_timing_ms,
 )
-from dexmani_real.deployment.inference.runtime import PolicyRuntime
 from dexmani_real.deployment.metrics import PolicyStats, flush_every
 from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
@@ -99,6 +97,9 @@ from dexmani_real.utils.feedback import (
     diagnose_arm_feedback,
 )
 from dexmani_real.utils.log import ThrottledWarner, get_logger
+
+if TYPE_CHECKING:
+    from dexmani_policy.deployment import LoadedPolicy
 
 logger = get_logger(__name__)
 
@@ -350,7 +351,7 @@ class PolicyRunner:
         runtime: ExperimentConfig,
         policy_spec: Any,
         *,
-        model_runtime: PolicyRuntime,
+        model_runtime: LoadedPolicy,
         fingertip_runtime: Any,
         execute: bool,
         max_running_s: float | None,
@@ -406,7 +407,6 @@ class PolicyRunner:
         # candidate; only a successful commit advances the action index, the
         # continuity reference, and the publication cadence.
         self._pending_dispatch: ActionCandidate | None = None
-        self._fifo_wait = PublishWaitTracker("policy")
 
         self.run_generation: int | None = None
         self._trial_generation: int | None = None
@@ -445,14 +445,13 @@ class PolicyRunner:
         self.session_inference_ms: list[float] = []
 
     def _drop_unpublished(self, reason: str, *, prediction_count: int | None = None) -> None:
-        """One owner counts/logs a real suffix and closes its wait span."""
+        """Discard uncommitted intent without modifying the accepted prefix."""
         count = len(self.actions) if prediction_count is None else prediction_count
         if count:
             logger.warning(
                 "[DROP] policy gen=%s q=%s idx=%s remaining=%d reason=%s",
                 self.run_generation, self.observation_id, self.chunk_action_index, count, reason,
             )
-        self._fifo_wait.note_dropped(reason, report=not bool(count))
         self.actions.clear()
         self._pending_dispatch = None
         self.chunk_sources.clear()
@@ -1401,7 +1400,6 @@ class PolicyRunner:
                 return
             publication_ns = time.monotonic_ns()
 
-        self._fifo_wait.note_committed()
         self._pending_dispatch = None
         assert candidate.arm_qpos is not None
         self.stats.publication_input_age_ms = max(
@@ -1471,16 +1469,8 @@ class PolicyRunner:
 
     def _handle_publication_rejection(self, result: PublishResult) -> None:
         if result.reason == PUBLISH_REASON_FIFO_FULL:
-            # Recoverable backpressure: keep the identical prepared candidate
-            # and retry from the poll cadence. One visible [WAIT] line per
-            # continuous full span; STOP/fault/timeout keep priority because
-            # the main loop polls them between retries.
-            keep_action = (
-                self._pending_dispatch.action_id
-                if self._pending_dispatch is not None
-                else 0
-            )
-            self._fifo_wait.note_full(result.fifo_depth, keep_action)
+            # Retry the same candidate; STOP/fault/timeout retain priority
+            # because the main loop polls them between attempts.
             return
         if result.reason in {PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT}:
             return
@@ -1773,11 +1763,9 @@ class PolicyRunner:
         )
 
 
-def _load_policy_runtime(config: PolicyRuntimeConfig) -> PolicyRuntime:
+def _load_policy_runtime(config: PolicyRuntimeConfig) -> LoadedPolicy:
     """Load model/CUDA only inside the policy child, through the public API."""
     from dexmani_policy.deployment import load_experiment
-
-    from dexmani_real.deployment.inference.dexmani_policy import DexManiPolicyAdapter
 
     loaded = load_experiment(
         config.experiment,
@@ -1787,7 +1775,9 @@ def _load_policy_runtime(config: PolicyRuntimeConfig) -> PolicyRuntime:
         inference_steps=config.inference_steps,
     )
     try:
-        return DexManiPolicyAdapter(loaded, config.spec)
+        if loaded.spec != config.spec:
+            raise RuntimeError("PolicySpec changed between inspect and load")
+        return loaded
     except BaseException:
         loaded.close()
         raise

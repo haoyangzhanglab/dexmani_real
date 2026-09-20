@@ -28,7 +28,6 @@ from typing import Any
 
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.deployment.config import (
-    FIXED_POLICY_RUNTIME_TARGET,
     FingertipAssemblerConfig,
     PolicyRuntimeConfig,
     RolloutRecordingConfig,
@@ -444,10 +443,9 @@ def run_policy_deployment(
             "recorded rollout requires an explicit max_running_s run budget"
         )
     logger.debug(
-        "policy deployment: experiment=%s runtime=%s device=%s seed=%s execute=%s",
+        "policy deployment: experiment=%s device=%s seed=%s execute=%s",
         worker_config.experiment,
-        FIXED_POLICY_RUNTIME_TARGET,
-        worker_config.device,
+            worker_config.device,
         worker_config.seed,
         execute,
     )

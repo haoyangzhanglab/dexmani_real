@@ -12,7 +12,6 @@ import numpy as np
 
 from dexmani_real.control.publication import (
     PUBLISH_REASON_FIFO_FULL,
-    PublishWaitTracker,
     build_action_candidate,
     motion_rejection_reason,
     publish_command,
@@ -119,7 +118,6 @@ def publish_hand_home_and_wait_accepted(
     # FULL is recoverable backpressure: retry the identical home candidate
     # inside the original operation deadline; abort and the runtime gates
     # keep priority over the retry.
-    fifo_wait = PublishWaitTracker("hand_home")
     publish_result = publish_command(
         shared,
         candidate,
@@ -130,7 +128,6 @@ def publish_hand_home_and_wait_accepted(
         and publish_result.reason == PUBLISH_REASON_FIFO_FULL
         and time.monotonic() < deadline_s
     ):
-        fifo_wait.note_full(publish_result.fifo_depth, candidate.action_id)
         if abort_requested is not None and abort_requested():
             break
         time.sleep(_FULL_RETRY_POLL_S)
@@ -140,10 +137,8 @@ def publish_hand_home_and_wait_accepted(
             required_safety_state=SafetyState.ARMED,
         )
     if not publish_result.published:
-        fifo_wait.note_dropped("hand home publish stopped")
         logger.warning("hand home publish failed: %s", publish_result.reason)
         return False
-    fifo_wait.note_committed()
     if publish_result.command is None:
         logger.error("hand home published without a committed-command receipt")
         return False

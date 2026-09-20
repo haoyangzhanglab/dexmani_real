@@ -160,12 +160,6 @@ class _RunnerTest(unittest.TestCase):
         runner.next_record_ns = 0
         runner.runtime = SimpleNamespace(policy=SimpleNamespace())
         runner.model_runtime = SimpleNamespace(reset_episode=lambda: None)
-        runner._fifo_wait = SimpleNamespace(
-            waiting=False,
-            note_full=lambda *a: None,
-            note_committed=lambda: None,
-            note_dropped=lambda reason, **kw: None,
-        )
         return runner
 
 
@@ -637,22 +631,18 @@ class RunTerminationFactsTest(_RunnerTest):
         self.assertEqual(runner.completed_trials, 1)
 
     def test_epoch_clear_reports_the_entire_unpublished_suffix_once(self):
-        from dexmani_real.control.publication import PublishWaitTracker
         runner = self._runner(run_started_ns=1)
         runner.run_generation = 5
         runner.observation_id = 21
         runner.actions = deque(range(7))  # first of eight already committed
         runner.chunk_action_index = 1
         runner._pending_dispatch = object()
-        runner._fifo_wait = PublishWaitTracker("policy")
-        runner._fifo_wait.note_full(4, 200)
         with self.assertLogs(level="INFO") as logs:
             runner._clear_execution(None)
         drops = [line for line in logs.output if "[DROP]" in line]
         self.assertEqual(len(drops), 1)
         self.assertIn("remaining=7", drops[0])
         self.assertIn("q=21", drops[0])
-        self.assertFalse(runner._fifo_wait.waiting)
 
 class FirstTerminalFactTest(_RunnerTest):
     def test_first_fact_survives_repeated_stop_home_cleanup_and_next_trial(self):

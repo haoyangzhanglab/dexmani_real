@@ -1,7 +1,7 @@
 """Process-local observation windows for the deployment runtime.
 
-These types never enter RuntimeChannels and therefore carry no
-IPC dtype. They are the ``PolicyRuntime`` input contract.
+These types never enter RuntimeChannels. The final model input is a plain
+NumPy array mapping consumed by the public dexmani_policy runtime.
 
 Shared-memory readers take ownership copies. The builder owns temporal and
 payload admission; these process-local containers only carry assembled values.
@@ -10,7 +10,7 @@ payload admission; these process-local containers only carry assembled values.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 
@@ -30,27 +30,6 @@ from dexmani_real.sensor.camera.transforms import resize_rgb
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-
-@dataclass(frozen=True)
-class PolicyObservation:
-    """Narrow NumPy boundary passed to a Policy runtime.
-
-    Mapping insertion order is the validated Policy modality order. Arrays are
-    C-contiguous, writeable, policy-process-owned model inputs.
-    """
-
-    observation_id: int
-    run_generation: int
-    anchor_monotonic_ns: int
-    latest_source_monotonic_ns: int
-    logical_step_monotonic_ns: int
-    arrays: Mapping[str, np.ndarray]
-
-
-def _validate_finite(array: np.ndarray, *, name: str) -> None:
-    if array.dtype.kind in "fc" and not np.all(np.isfinite(array)):
-        raise ValueError(f"{name} contains NaN/Inf")
 
 
 @dataclass(frozen=True)
@@ -1016,7 +995,7 @@ def _to_policy_observation(
     fingertip_runtime: (
         tuple[object, HandKinematics | None, FingertipAssemblerConfig | None] | None
     ) = None,
-) -> PolicyObservation:
+) -> dict[str, np.ndarray]:
     """Project typed ring readers into the exact public Policy array mapping."""
     field_names = tuple(field.name for field in policy_spec.observation_fields)
     if observation.arm_history is None or observation.hand_history is None:
@@ -1076,14 +1055,5 @@ def _to_policy_observation(
                 ),
                 dtype=np.float32,
             )
-    ordered = {name: arrays[name] for name in field_names}
-    for name, values in ordered.items():
-        _validate_finite(values, name=f"PolicyObservation.{name}")
-    return PolicyObservation(
-        observation_id=observation.observation_id,
-        run_generation=observation.run_generation,
-        anchor_monotonic_ns=observation.anchor_monotonic_ns,
-        latest_source_monotonic_ns=observation.latest_source_monotonic_ns,
-        logical_step_monotonic_ns=observation.logical_step_monotonic_ns,
-        arrays=ordered,
-    )
+    # LoadedPolicy owns model-input shape, dtype and finite-value validation.
+    return {name: arrays[name] for name in field_names}

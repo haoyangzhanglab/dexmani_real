@@ -287,8 +287,6 @@ class ArmParams:
 
     ip: str = "192.168.1.111"
 
-    expected_axis: int = 7
-
     table_z_surface_m: float = 0.022
     hand_safety_margin_m: float = 0.05
 
@@ -357,8 +355,6 @@ class ArmParams:
                 f"max_joint_acceleration_deg_per_s2={self.max_joint_acceleration_deg_per_s2} "
                 f"resolves to {_max_acc_rad} rad/s², outside the SDK command range [0.01, 20]"
             )
-        if not isinstance(self.expected_axis, int) or self.expected_axis <= 0:
-            raise ValueError("expected_axis must be a positive integer")
         if not np.isfinite(self.tcp_load_mass_kg) or self.tcp_load_mass_kg <= 0:
             raise ValueError("tcp_load_mass_kg must be finite and positive")
         cog = np.asarray(self.tcp_load_cog_mm, dtype=np.float64)

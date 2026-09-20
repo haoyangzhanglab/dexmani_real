@@ -34,14 +34,7 @@ import math
 import sys
 import time
 from pathlib import Path
-from typing import Any, NoReturn
-
-
-class _ArgumentParser(argparse.ArgumentParser):
-    """Render command-line contract failures with their owner marker."""
-
-    def error(self, message: str) -> NoReturn:
-        self.exit(2, f"{self.prog}: error: [CLI] {message}\n")
+from typing import Any
 
 
 def _positive_int(raw: str) -> int:
@@ -75,7 +68,7 @@ def _positive_running_seconds(raw: str) -> float:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = _ArgumentParser(
+    parser = argparse.ArgumentParser(
         description="Run one persistent recorded policy-evaluation session"
     )
     parser.add_argument("experiment", metavar="EXPERIMENT")

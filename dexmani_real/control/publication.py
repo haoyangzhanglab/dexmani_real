@@ -64,68 +64,6 @@ class AcceptanceResult:
     reason: str = ""
 
 
-class PublishWaitTracker:
-    """One visible ``[WAIT]``/``[RESUME]`` pair per continuous FIFO-full span.
-
-    Each command producer owns one tracker. Entering backpressure prints once;
-    repeated FULL retries of the same kept candidate stay silent. A span ends
-    exactly one way: either the kept candidate commits (``[RESUME]`` with the
-    elapsed wait) or lifecycle revokes it (``[DROP]`` naming the kept action
-    and the reason). Every terminal path must call one of the two, so the next
-    span starts from a clean state and each decision keeps exactly one line.
-    """
-
-    def __init__(self, label: str) -> None:
-        self._label = label
-        self._waiting_since_ns: int | None = None
-        self._keep_action_id = 0
-
-    @property
-    def waiting(self) -> bool:
-        return self._waiting_since_ns is not None
-
-    def note_full(self, depth: int, keep_action: int) -> None:
-        if self._waiting_since_ns is None:
-            logger.warning(
-                "[WAIT] %s command_fifo full depth=%d keep_action=%d",
-                self._label,
-                int(depth),
-                int(keep_action),
-            )
-            self._waiting_since_ns = time.monotonic_ns()
-            self._keep_action_id = int(keep_action)
-
-    def note_committed(self) -> None:
-        if self._waiting_since_ns is None:
-            return
-        wait_ms = (time.monotonic_ns() - self._waiting_since_ns) / 1e6
-        logger.info(
-            "[RESUME] %s command_fifo wait_ms=%.0f dropped=0",
-            self._label,
-            wait_ms,
-        )
-        self._reset()
-
-    def note_dropped(self, reason: str, *, report: bool = True) -> None:
-        """Report the kept candidate revoked by lifecycle while waiting."""
-        if self._waiting_since_ns is None:
-            return
-        wait_ms = (time.monotonic_ns() - self._waiting_since_ns) / 1e6
-        if report:
-            logger.warning(
-                "[DROP] %s command_fifo keep_action=%d wait_ms=%.0f dropped=1 reason=%s",
-                self._label,
-                self._keep_action_id,
-                wait_ms,
-                reason,
-            )
-        self._reset()
-
-    def _reset(self) -> None:
-        self._waiting_since_ns = None
-        self._keep_action_id = 0
-
-
 @dataclass(frozen=True)
 class PreparedCommand:
     """A physically checked command, or its preparation rejection."""

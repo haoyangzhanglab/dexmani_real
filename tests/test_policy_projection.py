@@ -218,7 +218,6 @@ class RecoverableMissTest(unittest.TestCase):
         runner.chunk_sources = {}
         runner.actions = deque([np.array([1.0]), np.array([2.0])])
         runner._pending_dispatch = None
-        runner._fifo_wait = SimpleNamespace(waiting=False, note_dropped=lambda reason, **kw: None)
         runner.stats = PolicyStats()
         runner.run_started_ns = 12345
         runner.recorder = None
@@ -306,13 +305,6 @@ class FullRetryKeepsCandidateTest(unittest.TestCase):
         runner.last_publication_ns = 1_000_000
         runner.actions = deque([np.array([1.0])])
         runner.chunk_action_index = 0
-        observed: dict = {}
-        runner._fifo_wait = SimpleNamespace(
-            waiting=False,
-            note_full=lambda depth, keep: observed.update(depth=depth, keep=keep),
-            note_committed=lambda: observed.update(committed=True),
-            note_dropped=lambda reason, **kw: observed.update(dropped=reason),
-        )
         runner._prepare_dispatch_candidate = mock.Mock(
             side_effect=AssertionError("FULL retry must not re-prepare")
         )
@@ -327,8 +319,6 @@ class FullRetryKeepsCandidateTest(unittest.TestCase):
         self.assertEqual(len(runner.actions), 1)  # head not popped
         self.assertEqual(runner.last_publication_ns, 1_000_000)  # cadence kept
         self.assertEqual(runner.chunk_action_index, 0)
-        self.assertEqual(observed.get("keep"), 41)
-        self.assertNotIn("committed", observed)
 
 
 @unittest.skipIf(
@@ -373,7 +363,7 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
         import threading
         from unittest import mock
         from dexmani_real.config.experiment import resolve_experiment_config
-        from dexmani_real.control.publication import CommandFeedbackSnapshot, PublishWaitTracker
+        from dexmani_real.control.publication import CommandFeedbackSnapshot
         from dexmani_real.control.safety_gate import SafetyGate
         from dexmani_real.runtime.safety import SafetyState
         from test_deployment_evidence import _fake_shared
@@ -406,7 +396,6 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
         runner._session_failure = mock.Mock()
         runner._record_rollout_tick = mock.Mock()
         runner._pending_dispatch = None
-        runner._fifo_wait = PublishWaitTracker("policy")
         runner._running_generation_is_live = lambda: True
         runner._running_time_expired = lambda now: False
         runner.execute = True
@@ -507,6 +496,65 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
                             self.assertIsNone(runner._prepare_dispatch_candidate(action))
                     runner._session_failure.assert_called_once()
                     self.assertIn("projection invariant violation", runner._session_failure.call_args.args[0])
+
+
+class PublicPolicyBoundaryTest(unittest.TestCase):
+    """The runner consumes the real public mapping API, without another adapter."""
+
+    def test_joint_history_becomes_owned_float32_array_mapping(self):
+        from dexmani_real.deployment.inference.observation import _to_policy_observation
+
+        arm = np.arange(14, dtype=np.float64).reshape(2, 7)
+        hand = np.arange(24, dtype=np.float64).reshape(2, 12)
+        observation = SimpleNamespace(
+            arm_history=SimpleNamespace(values=arm),
+            hand_history=SimpleNamespace(qpos=hand),
+        )
+        spec = SimpleNamespace(observation_fields=[SimpleNamespace(name="joint_state")])
+        arrays = _to_policy_observation(observation, spec)
+        self.assertIs(type(arrays), dict)
+        self.assertEqual(set(arrays), {"joint_state"})
+        joint = arrays["joint_state"]
+        self.assertEqual(joint.shape, (2, 19))
+        self.assertEqual(joint.dtype, np.float32)
+        self.assertTrue(joint.flags.c_contiguous and joint.flags.writeable)
+        np.testing.assert_array_equal(joint[:, :7], arm)
+        np.testing.assert_array_equal(joint[:, 7:], hand)
+        self.assertFalse(np.shares_memory(joint, arm))
+        self.assertFalse(np.shares_memory(joint, hand))
+
+    def test_load_returns_public_runtime_and_pins_exact_artifact(self):
+        from unittest import mock
+        import sys
+        from types import ModuleType
+        from dexmani_real.deployment.executor import _load_policy_runtime
+
+        config = SimpleNamespace(experiment="p/t/e", device="cpu", seed=0,
+                                 artifact="pinned.pt", inference_steps=8, spec=object())
+        loaded = SimpleNamespace(spec=config.spec, close=mock.Mock())
+        public = ModuleType("dexmani_policy.deployment")
+        public.load_experiment = mock.Mock(return_value=loaded)
+        with mock.patch.dict(sys.modules, {"dexmani_policy.deployment": public}):
+            self.assertIs(_load_policy_runtime(config), loaded)
+        public.load_experiment.assert_called_once_with(
+            "p/t/e", device="cpu", seed=0, artifact="pinned.pt", inference_steps=8)
+        loaded.close.assert_not_called()
+
+    def test_changed_spec_closes_loaded_runtime_before_rejecting(self):
+        from unittest import mock
+        import sys
+        from types import ModuleType
+        from dexmani_real.deployment.executor import _load_policy_runtime
+
+        config = SimpleNamespace(experiment="p/t/e", device="cpu", seed=0,
+                                 artifact="pinned.pt", inference_steps=8, spec=object())
+        loaded = SimpleNamespace(spec=object(), close=mock.Mock())
+        public = ModuleType("dexmani_policy.deployment")
+        public.load_experiment = mock.Mock(return_value=loaded)
+        with mock.patch.dict(sys.modules, {"dexmani_policy.deployment": public}):
+            with self.assertRaises(RuntimeError):
+                _load_policy_runtime(config)
+        loaded.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

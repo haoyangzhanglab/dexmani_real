@@ -42,11 +42,6 @@ from dexmani_real.dataset.processed import (
     _validate_masked_tactile_rows,
     validate_processed_hdf5,
 )
-from dexmani_real.dataset.processing_report import (
-    PROCESSING_REPORT_FILENAME,
-    build_processing_report,
-    write_processing_report,
-)
 from dexmani_real.planning.kinematics.arm_fk import (
     EEF_POSE_ALGORITHM_ID,
     EEF_POSE_COMPONENTS,
@@ -829,10 +824,27 @@ def process_episode_root(
         report["outputs"] = outputs
         report["validation"] = validation
         assert resolved_batch_task_name is not None
-        persisted_report = build_processing_report(
-            decisions, task_name=resolved_batch_task_name
-        )
-        write_processing_report(staging / PROCESSING_REPORT_FILENAME, persisted_report)
+        # This is an inspection summary, not a dataset admission schema.
+        # Payload integrity is checked above at the processed-HDF5 boundary.
+        with (staging / "processing_report.yaml").open("w", encoding="utf-8") as stream:
+            yaml.safe_dump(
+                {
+                    "task_name": resolved_batch_task_name,
+                    "episodes": [
+                        {
+                            "source_episode": decision.source_path.name,
+                            "accepted": decision.accepted,
+                            "reason": decision.rejected_reason,
+                            "source_frames": decision.source_frames,
+                            "processed_frames": decision.processed_frames,
+                        }
+                        for decision in decisions
+                    ],
+                },
+                stream,
+                sort_keys=False,
+                allow_unicode=True,
+            )
         atomic_publish(staging, target)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)

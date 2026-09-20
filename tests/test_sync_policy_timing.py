@@ -67,7 +67,7 @@ class _Model:
     def predict(self, observation) -> np.ndarray:
         # Blocking inference: advance the clock, then return an open-loop chunk.
         self.clock.advance(self.inference_ns)
-        t = observation.anchor_monotonic_ns // _STEP_DT_NS
+        t = int(observation["joint_state"][0, 0]) // _STEP_DT_NS
         return np.arange(t, t + self.n_action_steps, dtype=float).reshape(-1, 1)
 
 
@@ -98,10 +98,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
             )
 
         def to_policy(observation, policy_spec, fingertip_runtime=None):
-            return SimpleNamespace(
-                anchor_monotonic_ns=observation.anchor_monotonic_ns,
-                observation_id=observation.observation_id,
-            )
+            return {"joint_state": np.array([[observation.anchor_monotonic_ns]])}
 
         def sources(observation):
             return {}
@@ -154,7 +151,6 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.previous_arm_command_qpos = None
         runner._pending_dispatch = None
         runner._observation_waiting_since_ns = None
-        runner._fifo_wait = executor_module.PublishWaitTracker("test")
         runner.stats = SimpleNamespace()
         runner.shared = None
         runner.policy_spec = SimpleNamespace(
@@ -259,7 +255,6 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.chunk_sources = {"arm": (100, 200)}
         runner.actions = deque([np.array([1.0]), np.array([2.0])])
         runner._pending_dispatch = object()
-        runner._fifo_wait = SimpleNamespace(waiting=False, note_dropped=lambda reason, **kw: None)
 
         runner._invalidate_chunk("test_reason")
 
@@ -290,10 +285,6 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.observation_id = 5
         runner._pending_dispatch = object()
         runner._observation_waiting_since_ns = 7
-        # An open backpressure span must end visibly at the epoch boundary and
-        # leave the tracker clean for the next trial's [WAIT].
-        runner._fifo_wait = executor_module.PublishWaitTracker("test")
-        runner._fifo_wait.note_full(8, 813)
 
         with self.assertLogs("dexmani_real.deployment.executor", level="WARNING") as logs:
             runner._clear_execution(None)
@@ -303,7 +294,6 @@ class SyncPolicyTimingTest(unittest.TestCase):
         self.assertIsNone(runner._pending_dispatch)
         self.assertIsNone(runner._observation_waiting_since_ns)
         self.assertIsNone(runner.previous_arm_command_qpos)
-        self.assertFalse(runner._fifo_wait.waiting)
         self.assertIn("remaining=1", "\n".join(logs.output))
         self.assertIn("reason=epoch_boundary", "\n".join(logs.output))
 
@@ -320,8 +310,8 @@ class SyncPolicyTimingTest(unittest.TestCase):
         def revoke(observation):
             state["live"] = False
             return np.arange(
-                observation.observation_id,
-                observation.observation_id + 8,
+                0,
+                8,
                 dtype=float,
             ).reshape(-1, 1)
 

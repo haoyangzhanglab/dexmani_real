@@ -24,7 +24,6 @@ from dexmani_real.control.hand_homing import publish_hand_home_and_wait_accepted
 from dexmani_real.control.jog import any_jog_key_held, compute_cartesian_jog_delta
 from dexmani_real.control.publication import (
     PUBLISH_REASON_FIFO_FULL,
-    PublishWaitTracker,
     prepare_joint_command,
     publish_command,
 )
@@ -668,16 +667,14 @@ def _run_control_loop(
     # backpressure; retried unchanged and dropped visibly on epoch revoke.
     pending_candidate: ActionCandidate | None = None
     pending_arm_qpos: np.ndarray | None = None
-    fifo_wait = PublishWaitTracker("keyboard")
 
     def drop_pending(reason: str) -> None:
-        """Cancel only the uncommitted jog and close its visible wait once."""
+        """Cancel only the uncommitted jog; accepted commands stay untouched."""
         nonlocal pending_candidate, pending_arm_qpos
         if pending_candidate is not None:
             logger.warning(
                 "[DROP] keyboard action=%d reason=%s", pending_candidate.action_id, reason
             )
-        fifo_wait.note_dropped(reason, report=False)
         pending_candidate = None
         pending_arm_qpos = None
 
@@ -907,15 +904,12 @@ def _run_control_loop(
                 shared, pending_candidate, required_safety_state=SafetyState.RUNNING
             )
             if retry.published:
-                fifo_wait.note_committed()
                 last_motion_action_id = int(pending_candidate.action_id)
                 assert pending_arm_qpos is not None
                 previous_command = pending_arm_qpos
                 pending_candidate = None
                 pending_arm_qpos = None
-            elif retry.reason == PUBLISH_REASON_FIFO_FULL:
-                fifo_wait.note_full(retry.fifo_depth, pending_candidate.action_id)
-            else:
+            elif retry.reason != PUBLISH_REASON_FIFO_FULL:
                 drop_pending(retry.reason)
                 if not reject_motion(retry.reason):
                     return False
@@ -967,7 +961,6 @@ def _run_control_loop(
             assert publish_result.candidate is not None
             pending_candidate = publish_result.candidate
             pending_arm_qpos = publish_result.arm_qpos_rad
-            fifo_wait.note_full(publish_result.fifo_depth, publish_result.action_id)
             continue
         if publish_result.status is _KeyboardPublishStatus.IK_REJECTED:
             now_s = time.monotonic()
