@@ -518,15 +518,18 @@ def _read_control_grid_observation(
     if recording_active:
         cam, _camera_stalled = _camera_freshness.observe(cam)
         if _camera_stalled:
+            # Evidence degradation, not a control fault: stop source-row
+            # production, let RecorderIO drain the committed prefix, verify it,
+            # and publish it with the terminal reason. Teleop keeps running.
             logger.error(
-                "Camera source stale for %.1fs — discarding episode; teleoperation remains RUNNING",
+                "[RECORD] reason=camera_stall stale_for_s=%.1f action=save_prefix control=continue",
                 cfg.runtime.camera.recording_stall_abort_s,
             )
-            print("  ⚠ 相机连续失帧超过阈值，当前 episode 已废弃；遥操作继续")
+            print("  ⚠ 相机连续失帧超过阈值：保存已采集前缀并停止录制；遥操作继续")
             stop_recording(
                 recorder,
                 True,
-                save=False,
+                save=True,
                 shared=shared,
                 reason="camera_stall",
             )

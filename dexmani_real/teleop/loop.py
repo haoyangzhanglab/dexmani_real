@@ -582,15 +582,21 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         path_label = f": {stop_result.path}" if stop_result.path else ""
                         print(f"  ⚠ 录制终结失败 ({stop_result.error}){path_label}")
                     elif stop_result.saved:
-                        logger.debug(
-                            "Recording save acknowledged: %s frames=%d",
-                            stop_result.path,
+                        # One visible terminal line per finished recording:
+                        # reason, saved source rows, and published location.
+                        logger.info(
+                            "[RECORD] reason=%s saved_rows=%d path=%s control=continue",
+                            stop_result.reason or "manual",
                             stop_result.frame_count,
+                            stop_result.path,
                         )
                         if not stop_result.min_frames_met:
                             print("  ⚠ 已保存，但未达到配置的最短质量时长")
                     else:
-                        print(f"  录制已丢弃 ({stop_result.frame_count} 帧)")
+                        print(
+                            f"  录制已丢弃 ({stop_result.reason or 'manual'}: "
+                            f"{stop_result.frame_count} 帧)"
+                        )
                     gc.collect()
                     if quit_after_recording:
                         shared.quit_requested.value = True

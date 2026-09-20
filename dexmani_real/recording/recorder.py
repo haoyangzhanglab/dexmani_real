@@ -149,6 +149,18 @@ class EpisodeRecorder:
         self._flush_interval = 32
 
         self._finishing = False
+        self._last_finish_saved = False
+
+    @property
+    def last_finish_saved(self) -> bool:
+        """Whether the most recent finish_episode actually published raw data.
+
+        The recorder is the sole owner of the transaction outcome: a discarded,
+        downgraded (zero-row), or failed finish reports ``False`` even when the
+        caller requested ``save=True``. Survives episode-state reset so the
+        finalizing worker can read it after the transaction completes.
+        """
+        return self._last_finish_saved
 
     @property
     def resources_released(self) -> bool:
@@ -464,14 +476,29 @@ class EpisodeRecorder:
     def finish_episode(self, save: bool = True, reason: str = "") -> str | None:
         """Synchronously finish one episode and return its reserved final path.
 
-        Discard also returns the reserved path, although no raw episode is
-        published there. Failure raises after transaction cleanup. The caller
-        must serialize this operation with all other recorder access.
+        ``save=True`` validates the collected rows and publishes atomically; a
+        technically complete short prefix is a valid episode (``min_frames_met``
+        is a quality label, not an admission gate). Zero source rows are never
+        published as success: a save request downgrades to a clean discard of
+        the empty staging. Discard also returns the reserved path, although no
+        raw episode is published there. Failure raises after cleanup; once
+        every writer confirmed release, the failed transaction's staging is
+        retained under an ``incomplete_*`` name with a failure note instead of
+        being destroyed. The caller must serialize this operation with all
+        other recorder access.
         """
         if self._finishing:
             raise RuntimeError("episode finalization is still active")
         if not self._recording:
             return None
+        self._last_finish_saved = False
+        if save and self._frame_count == 0:
+            logger.warning(
+                "[RECORD] reason=%s saved_rows=0 — no source rows to publish; "
+                "discarding the empty staging",
+                reason or "manual",
+            )
+            save = False
         path = self._episode_dir
         truncated = self._max_frames_reached
         self._recording = False
@@ -525,7 +552,18 @@ class EpisodeRecorder:
             if self._camera_writer is None and self._data_writer is None:
                 try:
                     if self._temp_dir is not None:
-                        self._discard_temp_files(self._temp_dir)
+                        if failure is not None:
+                            # Automatic-failure retention: the transaction never
+                            # published, so keep the closed partial staging under
+                            # an explicit incomplete name for offline inspection.
+                            self._preserve_incomplete_staging(
+                                self._temp_dir,
+                                reason=reason,
+                                error=f"{type(failure).__name__}: {failure}",
+                            )
+                        else:
+                            # Clean explicit discard (save=False) stays destructive.
+                            self._discard_temp_files(self._temp_dir)
                 except Exception as exc:
                     failure = exc
                     logger.error("temporary episode cleanup failed", exc_info=True)
@@ -599,6 +637,7 @@ class EpisodeRecorder:
             if save:
                 self._validate_temp_episode(Path(_tmp), self._frame_count)
                 atomic_publish(_tmp, _final)
+                self._last_finish_saved = True
                 logger.info("Episode saved: %s frames=%d", _final, self._frame_count)
             else:
                 self._write_aborted_manifest(reason=reason or "discarded", error="")
@@ -685,3 +724,46 @@ class EpisodeRecorder:
         """Remove staging after resource release; expose incomplete cleanup."""
         if Path(tmp).exists():
             shutil.rmtree(tmp)
+
+    def _preserve_incomplete_staging(self, tmp: str, *, reason: str, error: str) -> None:
+        """Rename failed owned staging to an explicit incomplete location.
+
+        Runs only after every writer confirmed resource release, so no active
+        owner can access the moved files. Only this transaction's staging is
+        touched; published user episodes are never inspected or relocated. The
+        retained directory is not a valid raw episode and is never published as
+        one — ``incomplete_*`` names stay outside ``episode_*`` discovery.
+        """
+        staging = Path(tmp)
+        if not staging.exists():
+            return
+        episode_name = Path(
+            self._episode_dir or staging.name.removeprefix(".tmp_")
+        ).name
+        target = self.data_dir / f"incomplete_{episode_name}"
+        suffix = 1
+        while target.exists():
+            target = self.data_dir / f"incomplete_{episode_name}_{suffix}"
+            suffix += 1
+        staging.rename(target)
+        atomic_json_dump(
+            {
+                "episode": episode_name,
+                "status": "incomplete",
+                "reason": reason,
+                "error": error,
+                "frame_count_before_failure": int(self._frame_count),
+                "original_staging": staging.name,
+                "created_wall_time_ns": time.time_ns(),
+            },
+            target / "failure_note.json",
+            indent=2,
+            ensure_ascii=False,
+        )
+        logger.error(
+            "[RECORD] episode=%s reason=%s finalization failed — partial staging "
+            "retained at %s (not a valid raw episode)",
+            episode_name,
+            reason,
+            target,
+        )

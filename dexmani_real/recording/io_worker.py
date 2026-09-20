@@ -278,14 +278,20 @@ class _RecorderIOSession:
         # Only this thread accesses the recorder until the main thread reaps it.
         path = pending.path
         error = None
+        published = False
         try:
             path = self.recorder.finish_episode(pending.save, pending.reason)
             if path is None:
                 raise RuntimeError("active episode missing during finalization")
+            # The recorder owns the transaction outcome: a zero-row downgrade
+            # or clean discard reports False even when this STOP asked to save.
+            published = bool(self.recorder.last_finish_saved)
         except Exception as exc:
             error = exc
             logger.error("RecorderIO finalization failed", exc_info=True)
-        pending.results.put((path, error, self.recorder.resources_released))
+        pending.results.put(
+            (path, error, self.recorder.resources_released, published)
+        )
 
     def _fail_samples(self, reason: str, error: str) -> None:
         """Doom the episode before releasing any unconsumed sample capacity."""
@@ -355,10 +361,13 @@ class _RecorderIOSession:
                 return
         stop = self.pending_stop
         if stop is not None and self.last_sample_sequence == stop.through_sequence:
+            # Genuine transport/writer corruption is never published as valid
+            # raw. A camera_stall STOP keeps the caller's save decision: the
+            # committed prefix is technically complete and finalizes normally
+            # with its terminal reason recorded in episode metadata.
             error = (
                 f"recording aborted: {stop.reason}"
-                if stop.reason
-                in {"sample_ring_overflow", "camera_writer_error", "camera_stall"}
+                if stop.reason in {"sample_ring_overflow", "camera_writer_error"}
                 else ""
             )
             self._begin_finalization(
@@ -379,7 +388,7 @@ class _RecorderIOSession:
             return
         thread.join(timeout=0)
         try:
-            path, error, released = pending.results.get_nowait()
+            path, error, released, published = pending.results.get_nowait()
         except Empty as exc:
             raise RuntimeError("episode finalizer returned no result") from exc
         if not released:
@@ -390,7 +399,7 @@ class _RecorderIOSession:
         error = str(error) if error is not None else pending.forced_error
         self._send_result(
             RecordingFinished(
-                saved=pending.save and not error,
+                saved=published and not error,
                 path=path or pending.path,
                 frame_count=pending.frame_count,
                 reason=pending.reason,
