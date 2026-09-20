@@ -395,6 +395,9 @@ class PolicyRunner:
         self._evidence_warn = ThrottledWarner(interval_s=2.0)
         self._recorder_start_wait_ms = 0.0
         self._pending_stop_reason: str | None = None
+        # A queued recording STOP owns exactly one terminal outcome; the
+        # shutdown path never consumes a verdict that was already handled.
+        self._recording_outcome_consumed = True
         self.last_metrics_flush_ns = time.monotonic_ns()
         # Session research statistics (small in-memory accumulators, reported
         # once in the session summary — no monitoring platform):
@@ -475,12 +478,21 @@ class PolicyRunner:
         self.session_running_ns += max(
             0, time.monotonic_ns() - int(self.run_started_ns)
         )
-        if self.recorder is not None:
+        if self.recorder is not None and (
+            self.recorder.is_recording or self.recorder.stop_pending
+        ):
+            # Only a trial that actually produced evidence leaves a recording
+            # outcome to consume; a trial that ran without recording must not
+            # hook the shutdown path onto an older verdict.
             self._pending_stop_reason = stop_reason
+            self._recording_outcome_consumed = False
             self.recorder.stop_episode(
                 save=recorder_save,
                 reason=stop_reason,
             )
+        else:
+            self._pending_stop_reason = None
+            self._recording_outcome_consumed = True
         logger.info(
             "policy: trial %d/%d ended (%s); saved_episodes=%d",
             self.completed_trials,
@@ -686,6 +698,7 @@ class PolicyRunner:
         """
         pending_reason = self._pending_stop_reason
         self._pending_stop_reason = None
+        self._recording_outcome_consumed = True
         self.shared.is_recording.value = False
         if result.error is not None:
             self._mark_evidence_failed(
@@ -1651,8 +1664,13 @@ class PolicyRunner:
             # Storage finalization remains owned by RecorderIO.
             if self.run_started_ns is not None:
                 self._finish_episode("runtime shutdown", stop_reason="runtime_shutdown")
-            if self.recorder is not None and (
-                self.recorder.stop_pending or self._pending_stop_reason is not None
+            if (
+                self.recorder is not None
+                and not self._recording_outcome_consumed
+                and (
+                    self.recorder.stop_pending
+                    or self._pending_stop_reason is not None
+                )
             ):
                 result = self.recorder.join_stop()
                 if result.done:

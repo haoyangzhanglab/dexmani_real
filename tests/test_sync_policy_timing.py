@@ -257,7 +257,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.chunk_sources = {"arm": (100, 200)}
         runner.actions = deque([np.array([1.0]), np.array([2.0])])
         runner._pending_dispatch = object()
-        runner._fifo_wait = SimpleNamespace(note_dropped=lambda reason: None)
+        runner._fifo_wait = SimpleNamespace(waiting=False, note_dropped=lambda reason: None)
 
         runner._invalidate_chunk("test_reason")
 

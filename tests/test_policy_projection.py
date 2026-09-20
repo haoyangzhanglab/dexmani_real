@@ -188,7 +188,7 @@ class RecoverableMissTest(unittest.TestCase):
         runner.chunk_sources = {}
         runner.actions = deque([np.array([1.0]), np.array([2.0])])
         runner._pending_dispatch = None
-        runner._fifo_wait = SimpleNamespace(note_dropped=lambda reason: None)
+        runner._fifo_wait = SimpleNamespace(waiting=False, note_dropped=lambda reason: None)
         runner.stats = PolicyStats()
         runner.run_started_ns = 12345
         runner.recorder = None
@@ -278,6 +278,7 @@ class FullRetryKeepsCandidateTest(unittest.TestCase):
         runner.chunk_action_index = 0
         observed: dict = {}
         runner._fifo_wait = SimpleNamespace(
+            waiting=False,
             note_full=lambda depth, keep: observed.update(depth=depth, keep=keep),
             note_committed=lambda: observed.update(committed=True),
             note_dropped=lambda reason: observed.update(dropped=reason),

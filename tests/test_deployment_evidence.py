@@ -123,6 +123,7 @@ class _RunnerTest(unittest.TestCase):
         runner._evidence_logged_this_trial = False
         runner._evidence_warn = ThrottledWarner(interval_s=2.0)
         runner._pending_stop_reason = None
+        runner._recording_outcome_consumed = True
         runner._recorder_start_wait_ms = 0.0
         runner.run_started_ns = run_started_ns
         runner.run_generation = None
@@ -188,6 +189,39 @@ class TrialCountingTest(_RunnerTest):
         runner._complete_recording(recorder.poll_stop())
         self.assertEqual(runner.saved_episodes, 1)
         self.assertEqual(runner.completed_trials, 1)
+
+
+class RecordingOutcomeOwnershipTest(_RunnerTest):
+    """A trial owns at most one terminal recording outcome."""
+
+    def test_trial_without_recording_leaves_no_pending_outcome(self):
+        recorder = _FakeRecorderClient(start_ok=False, last_error="refused")
+        runner = self._runner(recorder=recorder, run_started_ns=1)
+        recorder.is_recording = False
+        recorder.stop_pending = False
+        runner._finish_episode("stop", stop_reason="operator", aborted=False)
+        # Nothing was recorded, so the shutdown path must not later consume an
+        # older verdict for this trial (double-counted saves / wrong trial id).
+        self.assertIsNone(runner._pending_stop_reason)
+        self.assertTrue(runner._recording_outcome_consumed)
+        self.assertEqual(recorder.stop_calls, [])
+
+    def test_recording_trial_marks_then_consumes_its_outcome(self):
+        recorder = _FakeRecorderClient()
+        recorder.is_recording = True
+        runner = self._runner(recorder=recorder, run_started_ns=1)
+        runner._finish_episode("stop", stop_reason="operator", aborted=False)
+        self.assertEqual(runner._pending_stop_reason, "operator")
+        self.assertFalse(runner._recording_outcome_consumed)
+        self.assertEqual(recorder.stop_calls, [(True, "operator")])
+
+        recorder._result = RecorderStopResult(
+            done=True, saved=True, path="p", frame_count=9, reason="operator"
+        )
+        runner._poll_recorder()  # poll path consumes the terminal verdict
+        self.assertEqual(runner.saved_episodes, 1)
+        self.assertTrue(runner._recording_outcome_consumed)
+        self.assertIsNone(runner._pending_stop_reason)
 
 
 class EvidenceIsolationTest(_RunnerTest):
@@ -335,6 +369,11 @@ class TerminalResultConsumptionTest(unittest.TestCase):
         self.assertTrue(first.done)
         self.assertTrue(first.saved)
         self.assertFalse(second.done)
+        # join_stop (the shutdown path) must not re-deliver the consumed verdict
+        # either: that would let the owner re-run its completion bookkeeping.
+        joined = client.join_stop()
+        self.assertTrue(joined.done)
+        self.assertFalse(joined.saved)
         # The consumer's evidence counter therefore increments exactly once.
         from dexmani_real.recording.client import RecordingFinished
 

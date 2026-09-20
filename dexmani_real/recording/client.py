@@ -291,7 +291,15 @@ class RecorderClient:
 
     def join_stop(self, timeout: float | None = None) -> RecorderStopResult:
         if not self._stop_requested:
-            return self._last_stop_result or RecorderStopResult(done=True)
+            if self._last_stop_result is None:
+                return RecorderStopResult(done=True)
+            if self._last_stop_result.done and self._terminal_result_delivered:
+                # The polling path already consumed this terminal verdict;
+                # handing it out again would let the owner re-run its
+                # completion bookkeeping for a different trial.
+                return RecorderStopResult(done=True)
+            self._terminal_result_delivered = self._last_stop_result.done
+            return self._last_stop_result
         timeout_s = RECORDER_STOP_TIMEOUT_S if timeout is None else float(timeout)
         if not np.isfinite(timeout_s) or timeout_s < 0:
             raise ValueError("recorder stop timeout must be finite and non-negative")
