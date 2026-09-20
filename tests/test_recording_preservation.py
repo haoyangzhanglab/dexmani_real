@@ -534,6 +534,23 @@ class RecorderShutdownExceptionTest(unittest.TestCase):
 
 
 class InterruptedRetentionBoundaryTest(unittest.TestCase):
+    def test_policy_automatic_stop_sends_retention_through_real_client(self):
+        from queue import Queue
+        from types import SimpleNamespace
+        from dexmani_real.deployment.executor import PolicyRunner
+        from dexmani_real.recording.client import RecorderClient
+        shared = SimpleNamespace(record_control_q=Queue(),
+                                 record_sample_ring=SimpleNamespace(latest_sequence=2))
+        runner = PolicyRunner.__new__(PolicyRunner)
+        runner._pending_stop_reason = None
+        runner.recorder = RecorderClient(shared)
+        runner.recorder._recording = True
+        runner._stop_recording_capture(save=False, reason="hardware_fault")
+        self.assertEqual(shared.record_control_q.get_nowait(),
+                         StopRecording(False, "hardware_fault", 2, retain_partial=True))
+        runner._stop_recording_capture(save=False, reason="policy_shutdown")
+        self.assertTrue(shared.record_control_q.empty())
+
     def test_active_writer_stays_in_staging_until_confirmed_closed(self):
         import threading
         entered, release = threading.Event(), threading.Event()

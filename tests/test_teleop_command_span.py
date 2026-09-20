@@ -251,6 +251,27 @@ class _TeleopRecordingHarness:
 
 
 class TeleopInterruptedRecordingTest(unittest.TestCase):
+    def test_retained_terminal_is_unpublished_and_logs_confirmed_path(self):
+        from dexmani_real.runtime.operator_input import OperatorCommand as Command
+        from dexmani_real.runtime.safety import SafetyState
+        h = _TeleopRecordingHarness(self)
+        def reject(h):
+            h.add_rows()
+            h.shared.safety_state.value = SafetyState.ARMED
+        with self.assertLogs("dexmani_real", level="INFO") as logs:
+            h.run([lambda h: setattr(h, "controls", [Command.BEGIN]), reject,
+                   lambda h: h.finalize(), lambda h: None])
+        output = h.output.getvalue()
+        self.assertEqual(output.count("录制未发布"), 1)
+        self.assertNotIn("录制已丢弃", output)
+        self.assertNotIn("已保存", output)
+        retained = h.root / "incomplete_episode_1"
+        self.assertTrue((retained / "data.h5").is_file())
+        retention_lines = [line for line in logs.output if "partial staging retained at" in line]
+        self.assertEqual(len(retention_lines), 1)
+        self.assertIn(str(retained), retention_lines[0])
+        self.assertFalse(h.client.poll_stop().done)
+
     def test_controller_interruptions_retain_buffered_source_rows(self):
         import json
         import h5py
