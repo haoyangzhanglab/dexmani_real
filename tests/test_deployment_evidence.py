@@ -737,3 +737,55 @@ class BlockingPredictionStopTest(_RunnerTest):
         self.assertEqual(runner.session_running_ns, 2_000_000_000)
         self.assertEqual(runner.session_inference_ms, [10000.])
         self.assertEqual(runner.session_publication_count, 0)
+
+class RecorderExceptionBoundaryTest(_RunnerTest):
+    def test_stop_exception_cannot_interrupt_trial_bookkeeping(self):
+        recorder = _FakeRecorderClient()
+        recorder.is_recording = True
+        runner = self._runner(recorder=recorder, run_started_ns=1)
+        def stop(**kwargs):
+            raise OSError("broken STOP channel")
+        recorder.stop_episode = stop
+        runner._finish_episode("operator", stop_reason="operator")
+        self.assertEqual(runner.completed_trials, 1)
+        self.assertIsNone(runner.run_started_ns)
+        self.assertTrue(runner.shared.evidence_failed.value)
+        self.assertFalse(runner.shared.error_state.value)
+
+class CleanupSummaryOutputTest(unittest.TestCase):
+    def test_unverified_cleanup_is_visible_without_relabeling_policy_as_recording_failure(self):
+        from unittest.mock import patch
+        from dexmani_real.deployment.lifecycle import _report_session_end
+        shared = _fake_shared()
+        shared.session_failed.value = True
+        with patch("builtins.print") as output:
+            self.assertFalse(_report_session_end(shared, None, recording_enabled=True,
+                normal_exit=False, exit_reason="policy failure"))
+        text = str(output.call_args_list)
+        self.assertIn("cleanup_status  = incomplete-or-failed", text)
+        self.assertIn("recording_status= no evidence failure observed", text)
+
+class LateRecordingDuringTrialTest(_RunnerTest):
+    def test_old_result_during_new_trial_does_not_stop_or_record_new_trial(self):
+        from unittest.mock import patch
+        recorder = _FakeRecorderClient()
+        recorder.stop_pending = True
+        runner = self._runner(recorder=recorder, num_trials=3)
+        runner.completed_trials = 1
+        runner._recording_trial_id = 1
+        runner._recording_outcome_consumed = False
+        runner._pending_stop_reason = "operator"
+        runner.shared.start_request.value = True
+        runner.shared.is_recording.value = True
+        runner._start_requested_episode()
+        start = runner.run_started_ns
+        recorder._result = RecorderStopResult(done=True, saved=True, frame_count=2, reason="operator")
+        with patch("builtins.print") as output:
+            runner._poll_recorder()
+        self.assertIn("Trial 1/3", str(output.call_args_list))
+        self.assertEqual(runner.completed_trials, 1)
+        self.assertEqual(runner.run_started_ns, start)
+        self.assertEqual(runner.saved_episodes, 1)
+        runner._finish_episode("timeout", stop_reason="timeout")
+        self.assertEqual(runner.saved_episodes, 1)
+        self.assertEqual(recorder.stop_calls, [])

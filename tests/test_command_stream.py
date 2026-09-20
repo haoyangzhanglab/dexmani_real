@@ -411,6 +411,20 @@ class WaitCommandAcceptedTest(_TransportTest):
             hand_feedback_max_age_s=1.0,
         )
 
+    def test_late_old_sdk_ack_cannot_satisfy_revoked_wait(self):
+        from dexmani_real.runtime.safety import CommittedCommand
+        for name in ("arm", "hand"):
+            with self.subTest(worker=name):
+                generation = int(self.shared.run_generation.value)
+                command = CommittedCommand(run_generation=generation, sequence=3)
+                invalidate_coupled_commands(self.shared)
+                frame = (_arm_feedback_record if name == "arm" else _hand_feedback_record)(
+                    action_id=42, generation=generation, sequence=3)
+                getattr(self.shared, name + "_state_ring").set(frame)
+                result = self._wait(command=command, action_id=42,
+                    wait_for_arm=name == "arm", wait_for_hand=name == "hand")
+                self.assertFalse(result.accepted)
+
     def test_exact_acceptance_same_generation(self):
         from dexmani_real.runtime.safety import CommittedCommand
 

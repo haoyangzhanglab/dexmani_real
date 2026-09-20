@@ -10,9 +10,9 @@ action dispatch; supervisor heartbeats and readiness cover the existing lifecycl
 
 There is no VR worker. A validate-only session starts the camera only when
 the explicit observation contract contains ``point_cloud`` or ``rgb``.
-Physical recorded sessions always start camera and RecorderIO so the raw
-rollout is retained, while camera payload stays out of a state-only policy
-observation.
+Physical recorded sessions attempt to start camera and RecorderIO for raw
+evidence. Optional evidence startup failure permits unrecorded control;
+camera payload stays out of a state-only policy observation.
 
 """
 
@@ -100,10 +100,27 @@ def _session_result_facts(shared, report, *, recording_enabled: bool, normal_exi
     return recording_status, "clean" if cleanup_ok else "incomplete-or-failed", clean_exit
 
 
+def _report_session_end(shared, report, *, recording_enabled: bool, normal_exit: bool, exit_reason: str) -> bool:
+    """Report evidence and verified cleanup even on exceptional teardown."""
+    recording_status, cleanup_status, clean_exit = _session_result_facts(
+        shared, report, recording_enabled=recording_enabled, normal_exit=normal_exit,
+    )
+    print("\n── Session End ──")
+    print(f"  control_reason  = {exit_reason}")
+    print(f"  recording_status= {recording_status}")
+    print(f"  cleanup_status  = {cleanup_status}")
+    print(f"  safety={SafetyState(int(shared.safety_state.value)).name}  "
+          f"supervisor_normal={normal_exit}  clean_exit={clean_exit}")
+    if report is not None:
+        print(f"  process_exits   = {report.exits}")
+    print("──")
+    return clean_exit
+
+
 def _service_process_names(
     policy_spec: Any, recording_config: RolloutRecordingConfig | None
 ) -> set[str]:
-    """Experiment-service processes: their failure fails the session, not the robot.
+    """Optional evidence processes: failure affects the result, not the run plan.
 
     Recorder is a service whenever recording is requested; camera is a service
     only when it was started solely for recording evidence (i.e. the policy
@@ -469,6 +486,9 @@ def run_policy_deployment(
     shutdown_report: ShutdownReport | None = None
     operator_thread: threading.Thread | None = None
     operator_stop: threading.Event | None = None
+    summary_emitted = False
+    normal_exit = False
+    exit_reason = "startup failed"
     try:
         specs = build_policy_worker_specs(
             shared,
@@ -644,23 +664,11 @@ def run_policy_deployment(
             disarm_if_clean=normal_exit,
             service_process_names=service_process_names,
         )
-        recording_status, cleanup_status, clean_exit = _session_result_facts(
+        clean_exit = _report_session_end(
             shared, shutdown_report, recording_enabled=recording_config is not None,
-            normal_exit=normal_exit,
+            normal_exit=normal_exit, exit_reason=exit_reason,
         )
-        safety_name = SafetyState(int(shared.safety_state.value)).name
-        print(f"\n── Session End ──")
-        print(f"  control_reason  = {exit_reason}")
-        print(f"  recording_status= {recording_status}")
-        print(
-            "  cleanup_status  = "
-            + cleanup_status
-        )
-        print(
-            f"  safety={safety_name}  supervisor_normal={normal_exit}  "
-            f"clean_exit={clean_exit}"
-        )
-        print("──")
+        summary_emitted = True
         return 0 if clean_exit else 1
 
     except Exception:
@@ -669,41 +677,50 @@ def run_policy_deployment(
         require_transition(shared, SafetyState.FAULT)
         return 1
     finally:
-        if operator_stop is not None:
-            operator_stop.set()
-        operator_alive = False
-        if operator_thread is not None:
-            operator_thread.join(timeout=float(runtime.safety.shutdown_timeout_s))
-            operator_alive = operator_thread.is_alive()
-            if operator_alive:
-                logger.critical(
-                    "operator thread remains alive; leaving RuntimeChannels linked"
-                )
-        if shutdown_report is None:
-            if started_procs:
-                try:
-                    if operator_alive:
-                        stop_processes_verified(
-                            shared,
-                            started_procs,
-                            graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-                        )
-                    else:
-                        shutdown_processes(
-                            shared,
-                            started_procs,
-                            graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-                            service_process_names=service_process_names,
-                        )
-                except RuntimeError:
+        try:
+            if operator_stop is not None:
+                operator_stop.set()
+            operator_alive = False
+            if operator_thread is not None:
+                operator_thread.join(timeout=float(runtime.safety.shutdown_timeout_s))
+                operator_alive = operator_thread.is_alive()
+                if operator_alive:
                     logger.critical(
-                        "child process remains alive; leaving RuntimeChannels linked",
-                        exc_info=True,
+                        "operator thread remains alive; leaving RuntimeChannels linked"
                     )
-                    raise
-            elif not operator_alive:
-                try:
-                    if not shared.close():
-                        logger.error("RuntimeChannels cleanup was incomplete")
-                except Exception:
-                    logger.warning("RuntimeChannels cleanup failed", exc_info=True)
+            if shutdown_report is None:
+                if started_procs:
+                    try:
+                        if operator_alive:
+                            stop_processes_verified(
+                                shared,
+                                started_procs,
+                                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+                            )
+                        else:
+                            shutdown_report = shutdown_processes(
+                                shared,
+                                started_procs,
+                                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+                                service_process_names=service_process_names,
+                            )
+                    except RuntimeError:
+                        logger.critical(
+                            "child process remains alive; leaving RuntimeChannels linked",
+                            exc_info=True,
+                        )
+                        raise
+                elif not operator_alive:
+                    try:
+                        closed = bool(shared.close())
+                        shutdown_report = ShutdownReport((), shared_closed=closed)
+                        if not closed:
+                            logger.error("RuntimeChannels cleanup was incomplete")
+                    except Exception:
+                        logger.warning("RuntimeChannels cleanup failed", exc_info=True)
+        finally:
+            if not summary_emitted:
+                _report_session_end(
+                    shared, shutdown_report, recording_enabled=recording_config is not None,
+                    normal_exit=False, exit_reason=exit_reason,
+                )

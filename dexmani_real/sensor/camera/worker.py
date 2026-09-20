@@ -426,6 +426,11 @@ def camera_loop(
             except Exception:
                 failed = True
                 _logger.warning("camera_loop: disconnect failed", exc_info=True)
-        if not failed:
+        if failed:
+            if latch_runtime_fault:
+                shared.error_state.value = True
+            else:
+                shared.evidence_failed.value = True
+        else:
             _logger.debug("camera_loop: STOPPED")
         _logger.info("camera_loop: exited")

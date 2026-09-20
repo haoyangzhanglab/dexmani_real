@@ -501,7 +501,7 @@ class PolicyRunner:
             and self.recorder.is_recording
         ):
             self._pending_stop_reason = stop_reason
-            self.recorder.stop_episode(save=recorder_save, reason=stop_reason)
+            self._stop_recording_capture(save=recorder_save, reason=stop_reason)
         # A different trial's pending capture retains its identity and reason.
         logger.info(
             "policy: trial %d/%d ended (%s); saved_episodes=%d",
@@ -550,7 +550,7 @@ class PolicyRunner:
                 recorder_save=True if recorder_save is None else recorder_save,
             )
         elif self.recorder is not None and self.recorder.is_recording:
-            self.recorder.stop_episode(save=False, reason=stop_reason)
+            self._stop_recording_capture(save=False, reason=stop_reason)
         self.stats.flush(prefix="policy metrics", debug=True)
         logger.critical("policy: runtime fault: %s", reason)
         self.run_started_ns = None
@@ -632,14 +632,24 @@ class PolicyRunner:
             )
             return False
 
+    def _stop_recording_capture(self, *, save: bool, reason: str) -> None:
+        """Stop the one owned capture without granting storage control authority."""
+        self._pending_stop_reason = self._pending_stop_reason or reason
+        try:
+            self.recorder.stop_episode(save=save, reason=reason)
+        except Exception as exc:
+            # Preserve context/occupancy: a raised send cannot prove closure.
+            self.recording_unavailable = True
+            self._mark_evidence_failed(f"RecorderIO STOP raised: {exc}")
+
     def _poll_recorder(self) -> bool:
         """Evidence results never own trial termination, including capacity."""
         if self.recorder is None:
             return True
         if self.shared.evidence_failed.value:
             self.recording_unavailable = True
-            if self.recorder.is_recording:
-                self.recorder.stop_episode(save=True, reason="evidence_failure")
+            if self.recorder.is_recording and self._pending_stop_reason is None:
+                self._stop_recording_capture(save=True, reason="evidence_failure")
         try:
             result = self.recorder.poll_stop()
         except Exception as exc:
@@ -780,6 +790,7 @@ class PolicyRunner:
             self.recorder is None
             or self.run_started_ns is None
             or not self.recorder.is_recording
+            or self.shared.evidence_failed.value
             or self._recording_trial_id != self.completed_trials + 1
         ):
             # No recorder, no active trial, or this trial's evidence already
@@ -978,7 +989,7 @@ class PolicyRunner:
         if epoch is None:
             if attempted_recording and self.recorder.is_recording:
                 self._pending_stop_reason = "start_cancelled"
-                self.recorder.stop_episode(
+                self._stop_recording_capture(
                     save=False,
                     reason="start_cancelled",
                 )
@@ -1672,7 +1683,11 @@ class PolicyRunner:
                     or self._pending_stop_reason is not None
                 )
             ):
-                result = self.recorder.join_stop()
+                try:
+                    result = self.recorder.join_stop()
+                except Exception as exc:
+                    self._mark_evidence_failed(f"RecorderIO finalization wait raised: {exc}")
+                    result = RecorderStopResult(done=False)
                 if result.done:
                     self._complete_recording(result)
                 else:

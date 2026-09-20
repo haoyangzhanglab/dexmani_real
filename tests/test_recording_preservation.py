@@ -485,9 +485,49 @@ class RecorderCapacityPathTest(unittest.TestCase):
             self.assertTrue(runner._poll_recorder())
             self.assertEqual(runner.completed_trials, 0)
             self.assertEqual(runner.saved_episodes, 1)
+            # Rapid replans after capacity exhaustion must not become a hidden
+            # miss threshold or reopen the finished writer.
+            from dexmani_real.deployment.executor import _RejectKind
+            from collections import deque
+            runner.run_generation = int(shared.run_generation.value)
+            reference = np.ones(7)
+            runner.previous_arm_command_qpos = reference
+            for index in range(12):
+                runner.observation_id = index + 1
+                runner.actions = deque([np.zeros(19), np.zeros(19)])
+                runner._handle_recoverable_miss("workspace" if index % 2 else "ik",
+                    raw_action=np.zeros(19), reject_kind=_RejectKind.SAFETY if index % 2 else _RejectKind.IK)
+                self.assertEqual(runner.completed_trials, 0)
+                self.assertEqual(runner.run_started_ns, 1)
+                self.assertIs(runner.previous_arm_command_qpos, reference)
+            self.assertEqual(shared.record_sample_ring.latest_sequence, 2)
             runner._poll_recorder()
             self.assertFalse(client.join_stop().saved)
             self.assertEqual(runner.saved_episodes, 1)
             with EpisodeReader(str(Path(directory) / "capacity")) as reader:
                 self.assertEqual(int(reader.h5f["meta"].attrs["num_frames"]), 2)
                 reader.require_valid(purpose="test")
+
+class RecorderShutdownExceptionTest(unittest.TestCase):
+    def test_actual_shutdown_exception_does_not_set_motion_fault(self):
+        from queue import Queue
+        from types import SimpleNamespace
+        import dexmani_real.recording.io_worker as io
+        class Recorder(_FakeRecorder):
+            is_recording = False
+            @property
+            def resources_released(self):
+                raise OSError("writer close verification failed")
+        recorder = Recorder()
+        recorder.is_recording = False
+        shared = SimpleNamespace(is_running=_FakeValue(True), error_state=_FakeValue(False),
+            evidence_failed=_FakeValue(False), recorder_consumed_sequence=_FakeValue(0),
+            record_control_q=Queue(), record_result_q=Queue(),
+            set_ready=lambda *a: None, set_heartbeat=lambda *a: None)
+        shared.record_control_q.put(object())  # actual step rejects unknown control
+        with mock.patch.object(io, "_create_episode_recorder", return_value=recorder):
+            with self.assertRaisesRegex(RuntimeError, "recording failure"):
+                io.recorder_io_loop(shared, RecorderIOConfig(data_dir="unused",
+                    max_frames=2, control_hz=10, min_frames=1))
+        self.assertTrue(shared.evidence_failed.value)
+        self.assertFalse(shared.error_state.value)

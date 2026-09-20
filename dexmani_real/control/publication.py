@@ -703,12 +703,14 @@ def wait_command_accepted(
                 cancel_coupled_command_if_current(shared, command=command)
                 return AcceptanceResult(False, "hand acceptance timestamp is missing")
 
-        if arm_accepted and hand_accepted:
-            return AcceptanceResult(True)
+        # A matching old SDK return remains historical acceptance, never a
+        # successful wait after that operation lost its motion generation.
         if not coupled_command_is_current(shared, command=command):
             return AcceptanceResult(
                 False, "command generation was revoked before acceptance"
             )
+        if arm_accepted and hand_accepted:
+            return AcceptanceResult(True)
         time.sleep(0.005)
 
     cancel_coupled_command_if_current(shared, command=command)
