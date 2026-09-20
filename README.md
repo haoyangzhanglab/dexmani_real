@@ -74,6 +74,11 @@ python examples/collect_teleop.py --print-config
 episodes/<task>/episode_*
 ```
 
+相机与 recorder 在遥操作里只是录制证据角色：读失败、源停滞或 recorder 异常只把会话结果
+标记为失败（会话自然结束时非零），不会中断遥操作——相机停帧时 recording 层按
+`camera_stall` 保存已采集前缀，遥操作继续。只有 arm/hand/VR 等控制角色失效才走物理故障
+路径。
+
 常用模式：
 
 ```bash

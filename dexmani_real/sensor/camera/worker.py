@@ -316,11 +316,19 @@ def camera_loop(
             now_s = time.monotonic()
             shared.set_heartbeat("camera", now_s)
 
-            # Producer-owned source truth: only a genuinely new frame with
-            # valid device timing advances the stream. Duplicates and invalid
+            # Producer-owned source truth: only a genuinely new frame with a
+            # usable device stamp advances the stream. Duplicates and invalid
             # clocks never refresh it, so a required sensor that stopped
             # producing cannot be masked forever by an old resident frame.
-            timing_valid = math.isfinite(frame.backlog_s) and frame.backlog_s >= 0.0
+            # ``backlog_s`` is finite and non-negative by construction (a
+            # clamped host/device difference), so the remaining device-stamp
+            # class this rejects is an unusable source timestamp — exactly the
+            # rule the consumers apply before they will read a frame.
+            timing_valid = (
+                math.isfinite(frame.backlog_s)
+                and frame.backlog_s >= 0.0
+                and frame.source_monotonic_ns > 0
+            )
             if not frame.duplicate and not frame.clock_reset and timing_valid:
                 last_new_source_s = now_s
             elif now_s - last_new_source_s >= cfg.source_stall_timeout_s:

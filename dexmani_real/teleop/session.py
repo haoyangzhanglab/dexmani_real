@@ -291,7 +291,14 @@ def _build_processes(
         camera_config = CameraLoopConfig.from_runtime(runtime)
         specs.append(
             ProcessSpec(
-                "camera", _camera_loop, (shared, camera_config), ready_name="camera"
+                "camera",
+                _camera_loop,
+                # Teleop's camera exists only to produce recording evidence
+                # (it starts only with recording), so its failures — including
+                # the producer source-stall latch — degrade evidence instead
+                # of latching the physical fault that would end teleoperation.
+                (shared, camera_config, False),
+                ready_name="camera",
             )
         )
         # Recorder still owns only episode serialization; the entry point
@@ -531,12 +538,20 @@ def run_teleop_experiment(
             if process.name != "vr"
         }
 
+        # Evidence roles: their death or stalled heartbeat fails the session
+        # result without claiming a physical fault or terminating teleop
+        # control (TASKBOOK T4/T5). They are supervised whatever else happens.
+        service_process_names = (
+            frozenset({"camera", "recorder"}) if recording_enabled else frozenset()
+        )
+
         start_time = time.monotonic()
         exit_reason, normal_exit = run_supervisor(
             shared,
             started_procs,
             heartbeat_timeouts_s=heartbeat_timeouts,
             supervisor_hz=float(runtime.safety.supervisor_hz),
+            service_process_names=service_process_names,
         )
 
         shutdown_report = shutdown_processes(
@@ -544,6 +559,7 @@ def run_teleop_experiment(
             started_procs,
             graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
             disarm_if_clean=normal_exit,
+            service_process_names=service_process_names,
         )
         shared_closed = shutdown_report.shared_closed
         worker_exit_clean = all(
@@ -556,6 +572,9 @@ def run_teleop_experiment(
             and shutdown_report.shared_closed
             and not bool(shared.error_state.value)
             and not bool(shared.estop_request.value)
+            # An evidence failure never ends control, but it does make the
+            # session result non-zero at the natural end (TASKBOOK T5).
+            and not bool(shared.session_failed.value)
             and int(shared.safety_state.value) == int(SafetyState.DISARMED)
         )
         if normal_exit and not clean_exit:

@@ -988,7 +988,11 @@ class CameraParams:
     # reads or no new valid source frame before it latches. This is a device
     # truthfulness threshold — it is never derived from model latency or
     # recording-quality parameters, and the value matches the long-standing
-    # effective device stall timeout.
+    # effective device stall timeout. The disposition belongs to the caller:
+    # a required policy-input camera latches the physical fault, while an
+    # evidence-only camera marks a session failure that never ends control,
+    # so the recording layer's own recording_stall_abort_s path saves the
+    # collected prefix.
     source_stall_timeout_s: float = 2.0
     # Recording-evidence stall budget owned by the teleop recording grid
     # (CameraFreshnessTracker): how long a recording tolerates no fresh camera
