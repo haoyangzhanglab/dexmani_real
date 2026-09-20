@@ -32,6 +32,7 @@ class StopRecording:
     save: bool
     reason: str
     through_sequence: int
+    retain_partial: bool = False
 
 
 @dataclass
@@ -242,7 +243,14 @@ class RecorderClient:
             self.stop_episode(save=True, reason=self._max_frames_stop_reason)
         return True
 
-    def stop_episode(self, save: bool = True, reason: str = "") -> str | None:
+    def stop_episode(
+        self, save: bool = True, reason: str = "", *, retain_partial: bool = False
+    ) -> str | None:
+        """Stop once; interrupted unpublished captures may retain closed staging.
+
+        ``retain_partial`` is control intent, never a raw sample field. An
+        already issued STOP keeps its original save/retention decision.
+        """
         if not self._recording or self._stop_requested:
             return None
         # Revoke production before capturing the final committed sequence.
@@ -250,7 +258,7 @@ class RecorderClient:
         self._stop_requested = True
         self._stop_reason = reason or "manual"
         through = int(self.shared.record_sample_ring.latest_sequence)
-        self._send_control(StopRecording(save, self._stop_reason, through))
+        self._send_control(StopRecording(save, self._stop_reason, through, retain_partial))
         return None
 
     def _finish(self, event: RecordingFinished) -> RecorderStopResult:

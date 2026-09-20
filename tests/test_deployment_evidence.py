@@ -61,7 +61,7 @@ class _FakeRecorderClient:
             self.is_recording = True
         return self._start_ok
 
-    def stop_episode(self, save=True, reason=""):
+    def stop_episode(self, save=True, reason="", *, retain_partial=False):
         self.stop_calls.append((bool(save), reason))
         self.is_recording = False
         self.stop_pending = False

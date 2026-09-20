@@ -390,6 +390,8 @@ class _RecorderIOSession:
             # raw. A camera_stall STOP keeps the caller's save decision: the
             # committed prefix is technically complete and finalizes normally
             # with its terminal reason recorded in episode metadata.
+            # Automatic controller interruption separately requests retention;
+            # its clean close must not be interpreted as operator DISCARD.
             error = (
                 f"recording aborted: {stop.reason}"
                 if stop.reason in {"sample_ring_overflow", "camera_writer_error"}
@@ -399,7 +401,7 @@ class _RecorderIOSession:
                 save=stop.save and not error,
                 reason=stop.reason,
                 error=error,
-                retain_partial=bool(error),
+                retain_partial=stop.retain_partial or bool(error),
             )
 
     def _poll_finalization(self) -> None:

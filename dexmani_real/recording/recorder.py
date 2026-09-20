@@ -783,7 +783,7 @@ class EpisodeRecorder:
             ensure_ascii=False,
         )
         logger.error(
-            "[RECORD] episode=%s reason=%s finalization failed — partial staging "
+            "[RECORD] episode=%s reason=%s incomplete — partial staging "
             "retained at %s (not a valid raw episode)",
             episode_name,
             reason,

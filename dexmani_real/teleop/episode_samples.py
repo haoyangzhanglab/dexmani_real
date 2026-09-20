@@ -29,10 +29,11 @@ def stop_recording(
     save: bool,
     shared: RuntimeChannels | None = None,
     reason: str = "",
+    retain_partial: bool = False,
 ) -> None:
-    """Stop recording if active. Non-blocking — poll completion in main loop."""
+    """Stop once without blocking; retain interrupted staging only when requested."""
     if was_active and recorder is not None:
-        recorder.stop_episode(save=save, reason=reason)
+        recorder.stop_episode(save=save, reason=reason, retain_partial=retain_partial)
         if shared is not None:
             shared.is_recording.value = False
 

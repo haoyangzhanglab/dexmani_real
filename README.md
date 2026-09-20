@@ -92,6 +92,8 @@ python examples/collect_teleop.py --task-name <task> --operator <name> --no-hand
 python examples/collect_teleop.py --task-name <task> --operator <name> --no-record
 ```
 
+自动中断（包括 ESC、故障和录制中的进程退出）会在 writer 安全关闭后将非空前缀保留到 `incomplete_*`，实际位置由 recorder 日志给出。这些文件未发布，不是训练可用的完整 raw。显式 D 仍丢弃；Q 确认等待超时仍按提示默认丢弃，区别于等待期间的 ESTOP/SHUTDOWN。S/H/明确 SAVE 及 camera_stall 继续按原规则保存有效前缀；零行不算保存成功。
+
 ### Keyboard Teleoperation
 
 `keyboard_teleop.py` 提供 Cartesian jog，用于机器人调试、实验准备和低频人工控制。

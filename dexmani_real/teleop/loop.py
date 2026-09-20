@@ -457,6 +457,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     save=False,
                     shared=shared,
                     reason=reason,
+                    retain_partial=True,
                 )
                 recording_active = False
                 shared.is_recording.value = False
@@ -602,7 +603,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                             print("  ⚠ 已保存，但未达到配置的最短质量时长")
                     else:
                         print(
-                            f"  录制已丢弃 ({stop_result.reason or 'manual'}: "
+                            f"  录制未发布 ({stop_result.reason or 'manual'}: "
                             f"{stop_result.frame_count} 帧)"
                         )
                     gc.collect()
@@ -612,7 +613,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     print("  ⚠ 录制终结超过时限；仍在安全回收，本会话将标记为失败")
                 if recording_active and recorder.camera_writer_error is not None:
                     logger.error(
-                        "Camera writer failed — discarding current episode: %s",
+                        "Camera writer failed — retaining closed partial episode: %s",
                         recorder.camera_writer_error,
                     )
                     stop_recording(
@@ -621,6 +622,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         save=False,
                         shared=shared,
                         reason="camera_writer_error",
+                        retain_partial=True,
                     )
                     recording_active = False
 
@@ -756,7 +758,8 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     audio.play("emergency")
                     shared.estop_request.value = True
                     stop_recording(
-                        recorder, recording_active, save=False, shared=shared
+                        recorder, recording_active, save=False, shared=shared,
+                        reason="estop", retain_partial=True,
                     )
                     recording_active = False
                     break_loop = True
@@ -782,12 +785,26 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                             QuitRecordingDecision.SAVE,
                             QuitRecordingDecision.SAVE_AND_HOME,
                         )
-                        audio.play(
-                            "emergency"
-                            if decision is QuitRecordingDecision.ESTOP
-                            else ("save" if save else "discard")
+                        interrupted = decision in (
+                            QuitRecordingDecision.ESTOP, QuitRecordingDecision.SHUTDOWN
                         )
-                        stop_recording(recorder, True, save=save, shared=shared)
+                        reason = "manual"
+                        if decision is QuitRecordingDecision.ESTOP:
+                            reason = "estop"
+                        elif decision is QuitRecordingDecision.SHUTDOWN:
+                            reason = "policy_shutdown"
+                        elif decision is QuitRecordingDecision.TIMEOUT:
+                            reason = "quit_timeout"
+                        elif decision is QuitRecordingDecision.DISCARD:
+                            reason = "discard"
+                        if decision is QuitRecordingDecision.ESTOP:
+                            audio.play("emergency")
+                        elif not interrupted:
+                            audio.play("save" if save else "discard")
+                        stop_recording(
+                            recorder, True, save=save, shared=shared,
+                            reason=reason, retain_partial=interrupted,
+                        )
                         recording_active = False
                         if decision is QuitRecordingDecision.TIMEOUT:
                             print("  超时，默认丢弃请求已提交")
@@ -833,7 +850,8 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     audio.play("save" if save_episode else "discard")
                     enter_pause(reason, relabel=True)
                     stop_recording(
-                        recorder, recording_active, save=save_episode, shared=shared
+                        recorder, recording_active, save=save_episode, shared=shared,
+                        reason="manual" if save_episode else "discard",
                     )
                     recording_active = False
                     teleop_active = False
@@ -930,6 +948,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                             save=False,
                             shared=shared,
                             reason="safety_transition_failed",
+                            retain_partial=True,
                         )
                         recording_active = False
                         break_loop = True
@@ -991,8 +1010,16 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 break
     finally:
         if recording_active:
+            # An automatic exit is not the operator's DISCARD. Preserve the
+            # committed prefix after the existing finalizer releases writers.
+            reason = "policy_shutdown"
+            if shared.estop_request.value:
+                reason = "estop"
+            elif shared.error_state.value or shared.safety_state.value == SafetyState.FAULT:
+                reason = "hardware_fault"
             stop_recording(
-                recorder, True, save=False, shared=shared, reason="policy_shutdown"
+                recorder, True, save=False, shared=shared, reason=reason,
+                retain_partial=True,
             )
         _note_recorder_transport_failure(shared, recorder, context="shutdown")
         kb.stop()

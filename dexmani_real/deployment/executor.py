@@ -636,7 +636,9 @@ class PolicyRunner:
         """Stop the one owned capture without granting storage control authority."""
         self._pending_stop_reason = self._pending_stop_reason or reason
         try:
-            self.recorder.stop_episode(save=save, reason=reason)
+            # Policy's non-saving stops are automatic interruptions; it has
+            # no explicit operator DISCARD path. Keep closed partial evidence.
+            self.recorder.stop_episode(save=save, reason=reason, retain_partial=not save)
         except Exception as exc:
             # Preserve context/occupancy: a raised send cannot prove closure.
             self.recording_unavailable = True
@@ -715,7 +717,7 @@ class PolicyRunner:
             )
         else:
             logger.info(
-                "policy: rollout recording discarded (%s)",
+                "policy: rollout recording unpublished (%s)",
                 result.reason or pending_reason or "unknown",
             )
 

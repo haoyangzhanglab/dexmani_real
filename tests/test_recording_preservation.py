@@ -531,3 +531,66 @@ class RecorderShutdownExceptionTest(unittest.TestCase):
                     max_frames=2, control_hz=10, min_frames=1))
         self.assertTrue(shared.evidence_failed.value)
         self.assertFalse(shared.error_state.value)
+
+
+class InterruptedRetentionBoundaryTest(unittest.TestCase):
+    def test_active_writer_stays_in_staging_until_confirmed_closed(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recorder = _make_recorder(root, min_frames=1)
+            self.assertTrue(recorder.start_episode(task_label="test", episode_name="episode_active"))
+            _add_frames(recorder, 2)
+            self.assertEqual(len(recorder._pending_rows), 2)
+            self.assertLess(2, recorder._flush_interval)
+            staging = Path(recorder._temp_dir)
+            close = recorder._camera_writer.close
+            errors = []
+
+            def blocked_close(*args, **kwargs):
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test did not release writer")
+                return close(*args, **kwargs)
+
+            def finish():
+                try:
+                    recorder.finish_episode(False, "policy_shutdown", failure_note="controller interrupted")
+                except Exception as exc:
+                    errors.append(exc)
+
+            with mock.patch.object(recorder._camera_writer, "close", side_effect=blocked_close):
+                thread = threading.Thread(target=finish)
+                thread.start()
+                try:
+                    self.assertTrue(entered.wait(2))
+                    self.assertFalse(recorder.resources_released)
+                    self.assertTrue(staging.is_dir())
+                    self.assertEqual(list(root.glob("incomplete_*")), [])
+                    self.assertFalse((root / "episode_active").exists())
+                finally:
+                    release.set()
+                    thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertTrue(recorder.resources_released)
+            self.assertFalse(staging.exists())
+            with EpisodeReader(root / "incomplete_episode_active") as reader:
+                self.assertEqual(reader.h5f["meta"].attrs["num_frames"], 2)
+                np.testing.assert_array_equal(reader.h5f["timestamp"][:], [1., 2.])
+
+    def test_old_stop_signature_and_single_stop_intent_are_preserved(self):
+        from queue import Queue
+        from types import SimpleNamespace
+        from dexmani_real.recording.client import RecorderClient
+        old_message = StopRecording(False, "discard", 2)
+        self.assertFalse(old_message.retain_partial)
+        shared = SimpleNamespace(record_control_q=Queue(),
+                                 record_sample_ring=SimpleNamespace(latest_sequence=2))
+        client = RecorderClient(shared)
+        client._recording = True
+        client.stop_episode(False, "discard")
+        client.stop_episode(False, "policy_shutdown", retain_partial=True)
+        self.assertEqual(shared.record_control_q.get_nowait(), old_message)
+        self.assertTrue(shared.record_control_q.empty())
