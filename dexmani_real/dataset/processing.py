@@ -119,7 +119,12 @@ def analyze_episode(
     config: ProcessingConfig,
     annotation: EpisodeAnnotation | None = None,
 ) -> EpisodeDecision:
-    """Admit all source rows or reject the entire episode; never repair rows."""
+    """Technically admit all source rows or fail loudly; never repair rows.
+
+    Shape/dtype, timing, media, masked-tactile, and provenance checks raise on
+    corruption. There is no automatic quality rejection: an episode is excluded
+    only by explicit operator annotation.
+    """
     source = reader.h5f
     workflow = read_provenance_workflow(source["meta"].attrs)
     if not supports_fixed_dt_teleop(workflow):
@@ -220,13 +225,10 @@ def analyze_episode(
         raise ValueError(f"RGB frame count {decoded} != source frames {frames}")
     for rows in _dataset_row_slices(depth):
         depth[rows]  # Force HDF5 decompression/read errors at admission.
-    # Preserve the established transient/persistent boundary: up to four
-    # consecutive FRAME_IK_FAIL samples are a short hold, five are persistent.
-    consecutive_ik_fail = 0
-    for status in arrays["flag_frame_status"]:
-        consecutive_ik_fail = consecutive_ik_fail + 1 if status == 2 else 0
-        if consecutive_ik_fail > 4:
-            return EpisodeDecision(reader.h5_path, frames, "persistent IK failure")
+    # IK-hold rows (flag_frame_status=FRAME_IK_FAIL) are technically valid
+    # source rows and stay admitted regardless of run length; quality selection
+    # is explicit operator curation (annotation include:false), never an
+    # automatic per-episode rejection here.
     return EpisodeDecision(reader.h5_path, frames)
 
 
