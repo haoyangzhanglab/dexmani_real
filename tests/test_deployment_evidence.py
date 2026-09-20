@@ -266,6 +266,41 @@ class EvidenceIsolationTest(_RunnerTest):
 
 
 @unittest.skipIf(_IMPORT_ERROR is not None, f"dependencies unavailable: {_IMPORT_ERROR}")
+class SessionStatisticsTest(_RunnerTest):
+    """V20: the four session statistics use real sources and denominators."""
+
+    def _stats_runner(self):
+        runner = self._runner(num_trials=2)
+        runner.control_period_s = 0.0625
+        return runner
+
+    def test_effective_hz_and_percentiles_from_real_accumulators(self):
+        runner = self._stats_runner()
+        runner.session_publication_count = 100
+        runner.session_running_ns = 5_000_000_000  # 5 s of RUNNING wall time
+        runner.session_inference_ms = [10.0, 20.0, 30.0, 40.0]
+        with self.assertLogs("dexmani_real.deployment.executor", level="INFO") as logs:
+            runner._log_session_statistics()
+        line = "\n".join(logs.output)
+        self.assertIn("nominal_hz=16.000", line)  # 1/0.0625
+        self.assertIn("effective_publication_hz=20.000", line)  # 100 commits / 5 s
+        self.assertIn("publications=100", line)
+        self.assertIn("predict_samples=4", line)
+        self.assertIn("inference_ms_mean=25.000", line)
+        self.assertIn("inference_ms_p95=38.500", line)
+
+    def test_unavailable_markers_without_running_time_or_samples(self):
+        runner = self._stats_runner()
+        with self.assertLogs("dexmani_real.deployment.executor", level="INFO") as logs:
+            runner._log_session_statistics()
+        line = "\n".join(logs.output)
+        self.assertIn("effective_publication_hz=unavailable", line)
+        self.assertIn("inference_ms_mean=unavailable", line)
+        self.assertIn("inference_ms_p95=unavailable", line)
+        self.assertIn("predict_samples=0", line)
+
+
+@unittest.skipIf(_IMPORT_ERROR is not None, f"dependencies unavailable: {_IMPORT_ERROR}")
 class SupervisorEvidenceDeferralTest(unittest.TestCase):
     """An evidence-role service failure never terminates a RUNNING trial."""
 

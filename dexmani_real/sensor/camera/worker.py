@@ -1,4 +1,12 @@
-"""RealSense worker that publishes frames to ``RuntimeChannels.camera_ring``."""
+"""RealSense worker that publishes frames to ``RuntimeChannels.camera_ring``.
+
+The worker owns device truth: it publishes each frame with its health class
+(clock reset, duplicate, skipped-frame telemetry, finite-but-slow delivery)
+and it owns the source-stall latch — failed reads OR the absence of any new
+valid source frame for the device-owned stall budget fail closed, so a stale
+resident frame downstream can never mask a dead required sensor. Duplicates
+and clock resets never refresh that progress counter.
+"""
 
 from __future__ import annotations
 

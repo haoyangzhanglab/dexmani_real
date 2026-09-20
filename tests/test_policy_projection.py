@@ -254,6 +254,56 @@ class RecoverableMissTest(unittest.TestCase):
     _IMPORT_ERROR is not None,
     f"deployment runtime dependencies unavailable: {_IMPORT_ERROR}",
 )
+class FullRetryKeepsCandidateTest(unittest.TestCase):
+    """V05: a FULL commit keeps the identical prepared candidate."""
+
+    def test_full_never_reprepares_or_advances_state(self):
+        from unittest import mock
+
+        import dexmani_real.deployment.executor as executor_module
+        from dexmani_real.control.action import ActionCandidate
+        from dexmani_real.control.publication import PublishResult
+
+        runner = PolicyRunner.__new__(PolicyRunner)
+        candidate = ActionCandidate(
+            run_generation=7, action_id=41, arm_qpos=np.full(7, 0.1)
+        )
+        runner._pending_dispatch = candidate
+        runner.shared = SimpleNamespace()
+        runner._running_generation_is_live = lambda: True
+        runner._running_time_expired = lambda now_ns: False
+        runner.execute = True
+        runner.last_publication_ns = 1_000_000
+        runner.actions = deque([np.array([1.0])])
+        runner.chunk_action_index = 0
+        observed: dict = {}
+        runner._fifo_wait = SimpleNamespace(
+            note_full=lambda depth, keep: observed.update(depth=depth, keep=keep),
+            note_committed=lambda: observed.update(committed=True),
+            note_dropped=lambda reason: observed.update(dropped=reason),
+        )
+        runner._prepare_dispatch_candidate = mock.Mock(
+            side_effect=AssertionError("FULL retry must not re-prepare")
+        )
+        full = PublishResult(
+            False, reason="command fifo full", fifo_depth=8
+        )
+        with mock.patch.object(executor_module, "publish_command", return_value=full):
+            runner._dispatch_action(np.array([0.5]))
+
+        runner._prepare_dispatch_candidate.assert_not_called()
+        self.assertIs(runner._pending_dispatch, candidate)
+        self.assertEqual(len(runner.actions), 1)  # head not popped
+        self.assertEqual(runner.last_publication_ns, 1_000_000)  # cadence kept
+        self.assertEqual(runner.chunk_action_index, 0)
+        self.assertEqual(observed.get("keep"), 41)
+        self.assertNotIn("committed", observed)
+
+
+@unittest.skipIf(
+    _IMPORT_ERROR is not None,
+    f"deployment runtime dependencies unavailable: {_IMPORT_ERROR}",
+)
 class EndpointWorkspaceCheckTest(unittest.TestCase):
     """The joint-policy workspace critic is an endpoint check."""
 
