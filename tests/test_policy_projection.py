@@ -366,5 +366,148 @@ class EndpointWorkspaceCheckTest(unittest.TestCase):
             self.skipTest("chosen endpoint is not outside the tiny workspace")
 
 
+class PolicyEndpointClipReportingTest(unittest.TestCase):
+    """Real decode/projection/prepare/dispatch; only devices and FIFO capacity are fake."""
+
+    def _runner_and_action(self, key="action", *, arm_clip=False, hand_clip=False, tiny=False):
+        import threading
+        from unittest import mock
+        from dexmani_real.config.experiment import resolve_experiment_config
+        from dexmani_real.control.publication import CommandFeedbackSnapshot, PublishWaitTracker
+        from dexmani_real.control.safety_gate import SafetyGate
+        from dexmani_real.runtime.safety import SafetyState
+        from test_deployment_evidence import _fake_shared
+        runtime = resolve_experiment_config()
+        runner = PolicyRunner.__new__(PolicyRunner)
+        runner.runtime = runtime
+        runner.shared = _fake_shared(safety_state=SafetyState.RUNNING)
+        lock = threading.RLock()
+        runner.shared.arm_command_seq = SimpleNamespace(value=40, get_lock=lambda: lock)
+        runner.run_generation = runner.shared.run_generation.value
+        runner.previous_arm_command_qpos = np.asarray(runtime.arm.home_qpos).copy()
+        arm = runner.previous_arm_command_qpos.copy()
+        if arm_clip:
+            arm[0] += 1.
+        low, high = np.asarray(runtime.hand.qpos_min_rad), np.asarray(runtime.hand.qpos_max_rad)
+        hand = (low + high) / 2
+        if hand_clip:
+            hand[3] = np.nextafter(high[3], np.inf) if tiny else high[3] + .25
+        runner.policy_spec = SimpleNamespace(action_key=key)
+        runner.ee_planner = mock.Mock()
+        runner.ee_planner.solve_teleop_ik.return_value = SimpleNamespace(success=True, qpos=arm.copy())
+        action = np.concatenate((arm, hand)) if key == "action" else np.concatenate(
+            (np.zeros(3), [1., 0., 0., 0., 1., 0.], hand))
+        runner.gate = SafetyGate(arm_joint_lower_rad=runtime.arm.joint_limit_lower,
+            arm_joint_upper_rad=runtime.arm.joint_limit_upper,
+            hand_joint_lower_rad=runtime.hand.qpos_min_rad, hand_joint_upper_rad=runtime.hand.qpos_max_rad)
+        # Deliberately unrelated measured hand: correction must use decoded target.
+        feedback = CommandFeedbackSnapshot(arm_qpos=runner.previous_arm_command_qpos.copy(),
+            arm_source_monotonic_ns=1, hand_qpos=low.copy(), hand_source_monotonic_ns=1)
+        runner._session_failure = mock.Mock()
+        runner._record_rollout_tick = mock.Mock()
+        runner._pending_dispatch = None
+        runner._fifo_wait = PublishWaitTracker("policy")
+        runner._running_generation_is_live = lambda: True
+        runner._running_time_expired = lambda now: False
+        runner.execute = True
+        runner.last_publication_ns = None
+        runner.session_publication_count = 0
+        runner.actions = deque([action])
+        runner.chunk_action_index = 0
+        runner.chunk_sources = {}
+        runner.observation_id = 1
+        runner.stats = PolicyStats()
+        return runner, action, feedback, arm, hand
+
+    def test_real_candidate_logs_one_combined_line_and_preserves_values(self):
+        from unittest import mock
+        import dexmani_real.deployment.executor as executor
+        for key in ("action", "action_ee"):
+            for arm_clip, hand_clip in ((False, True), (True, False), (True, True), (False, False)):
+                with self.subTest(key=key, arm=arm_clip, hand=hand_clip):
+                    runner, action, feedback, arm, hand = self._runner_and_action(
+                        key, arm_clip=arm_clip, hand_clip=hand_clip)
+                    original = action.copy()
+                    with mock.patch.object(executor, "read_command_feedback", return_value=(feedback, "", None)):
+                        context = self.assertLogs(executor.logger.name, level="INFO") if arm_clip or hand_clip else self.assertNoLogs(executor.logger.name, level="INFO")
+                        with context as logs:
+                            candidate = runner._prepare_dispatch_candidate(action)
+                    self.assertIsNotNone(candidate)
+                    runner._session_failure.assert_not_called()
+                    np.testing.assert_array_equal(action, original)
+                    np.testing.assert_array_equal(candidate.arm_qpos, project_arm_command(
+                        arm, runner.previous_arm_command_qpos,
+                        joint_lower_rad=runner.runtime.arm.joint_limit_lower,
+                        joint_upper_rad=runner.runtime.arm.joint_limit_upper,
+                        max_command_jump_rad=runner.runtime.arm.max_servo_command_jump_rad))
+                    np.testing.assert_array_equal(candidate.hand_qpos, np.clip(
+                        hand, runner.runtime.hand.qpos_min_rad, runner.runtime.hand.qpos_max_rad))
+                    if arm_clip or hand_clip:
+                        lines = [line for line in logs.output if "[CLIP]" in line]
+                        self.assertEqual(len(lines), 1)
+                        self.assertIn(f"action={candidate.action_id}", lines[0])
+                        self.assertEqual("arm_max_delta_rad=" in lines[0], arm_clip)
+                        self.assertEqual("hand_max_correction_rad=" in lines[0], hand_clip)
+                        if hand_clip:
+                            self.assertIn("hand_joint=3", lines[0])
+                            self.assertIn("hand_max_correction_rad=0.25", lines[0])
+
+    def test_tiny_nonzero_hand_correction_is_visible(self):
+        from unittest import mock
+        import dexmani_real.deployment.executor as executor
+        runner, action, feedback, _, hand = self._runner_and_action(hand_clip=True, tiny=True)
+        with mock.patch.object(executor, "read_command_feedback", return_value=(feedback, "", None)):
+            with self.assertLogs(executor.logger.name, level="INFO") as logs:
+                candidate = runner._prepare_dispatch_candidate(action)
+        line, = [line for line in logs.output if "[CLIP]" in line]
+        magnitude = float(line.split("hand_max_correction_rad=")[1].split()[0])
+        self.assertGreater(magnitude, 0.)
+        self.assertEqual(magnitude, hand[3] - candidate.hand_qpos[3])
+
+    def test_full_retries_project_and_report_only_once(self):
+        from unittest import mock
+        import dexmani_real.deployment.executor as executor
+        from dexmani_real.control.publication import PublishResult, PUBLISH_REASON_FIFO_FULL
+        runner, action, feedback, _, _ = self._runner_and_action(hand_clip=True)
+        original = action.copy()
+        results = [PublishResult(False, reason=PUBLISH_REASON_FIFO_FULL, fifo_depth=4)] * 3
+        results.append(PublishResult(True, command=SimpleNamespace(published_monotonic_ns=100)))
+        with mock.patch.object(executor, "read_command_feedback", return_value=(feedback, "", None)), \
+             mock.patch.object(executor, "_project_policy_targets", wraps=executor._project_policy_targets) as project, \
+             mock.patch.object(executor, "publish_command", side_effect=results) as publish:
+            with self.assertLogs(executor.logger.name, level="INFO") as logs:
+                for index in range(4):
+                    runner._dispatch_action(action)
+                    if index < 3:
+                        self.assertEqual(runner.chunk_action_index, 0)
+                        self.assertIsNone(runner.last_publication_ns)
+        self.assertEqual(project.call_count, 1)
+        candidates = [call.args[1] for call in publish.call_args_list]
+        self.assertTrue(all(c is candidates[0] for c in candidates))
+        self.assertEqual(sum("[CLIP]" in line for line in logs.output), 1)
+        self.assertEqual(runner.session_publication_count, 1)
+        self.assertEqual(runner.chunk_action_index, 1)
+        self.assertEqual(len(runner.actions), 0)
+        self.assertIsNone(runner._pending_dispatch)
+        np.testing.assert_array_equal(action, original)
+
+    def test_invalid_hand_shape_and_nan_still_fail_contract(self):
+        from unittest import mock
+        import dexmani_real.deployment.executor as executor
+        for key in ("action", "action_ee"):
+            for invalid in ("shape", "nan"):
+                with self.subTest(key=key, invalid=invalid):
+                    runner, action, feedback, _, _ = self._runner_and_action(key)
+                    if invalid == "shape":
+                        action = action[:-1]
+                    else:
+                        action[-1] = np.nan
+                    with mock.patch.object(executor, "read_command_feedback", return_value=(feedback, "", None)):
+                        with self.assertNoLogs(executor.logger.name, level="INFO"):
+                            self.assertIsNone(runner._prepare_dispatch_candidate(action))
+                    runner._session_failure.assert_called_once()
+                    self.assertIn("projection invariant violation", runner._session_failure.call_args.args[0])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
 
@@ -214,12 +215,21 @@ def decode_policy_action(
     return np.asarray(result.qpos, dtype=np.float64), hand_qpos, ""
 
 
+@dataclass(frozen=True)
+class _PolicyClipReport:
+    """One projection's arm step and decoded-hand endpoint correction (radians)."""
+
+    arm: ArmClipReport = ArmClipReport()
+    hand_joint: int = -1
+    hand_max_correction_rad: float = 0.0
+
+
 def _project_policy_targets(
     target_arm_qpos: np.ndarray,
     target_hand_qpos: np.ndarray,
     reference_arm_qpos: np.ndarray,
     runtime: ExperimentConfig,
-) -> tuple[np.ndarray, np.ndarray, ArmClipReport]:
+) -> tuple[np.ndarray, np.ndarray, _PolicyClipReport]:
     """Project finite physical endpoints through the single-owner projection.
 
     Canonicalization, operational bounds, the soft delta clip, and the
@@ -245,7 +255,16 @@ def _project_policy_targets(
         qpos_min_rad=runtime.hand.qpos_min_rad,
         qpos_max_rad=runtime.hand.qpos_max_rad,
     )
-    return arm, hand, arm_clip
+    # Compare the decoded endpoint with its one projection, never measured
+    # feedback or a second clip. Exact nonzero corrections remain visible.
+    correction = np.abs(np.asarray(target_hand_qpos, dtype=np.float64) - hand)
+    hand_joint = int(np.argmax(correction)) if np.any(correction != 0.0) else -1
+    report = _PolicyClipReport(
+        arm=arm_clip,
+        hand_joint=hand_joint,
+        hand_max_correction_rad=(float(correction[hand_joint]) if hand_joint >= 0 else 0.0),
+    )
+    return arm, hand, report
 
 
 def _physical_start_pose_rejection(
@@ -1200,18 +1219,18 @@ class PolicyRunner:
         tuple[np.ndarray, np.ndarray] | None,
         _RejectKind | None,
         str | None,
-        ArmClipReport,
+        _PolicyClipReport,
     ]:
         """Decode/IK one action against the caller-selected feedback snapshot.
 
         Side-effect free with respect to feedback I/O: the caller has already
         read and validated ``feedback`` once for this dispatch. The last
-        element reports whether the projection really truncated the step, so
-        the caller can print one visible line against the action identity.
+        element reports arm step clipping and decoded-hand endpoint correction,
+        so the caller can print one visible line against the action identity.
         """
         if self.policy_spec.action_key == "action_ee" and self.ee_planner is None:
             self._session_failure("EE policy runner has no IK planner")
-            return None, None, None, ArmClipReport()
+            return None, None, None, _PolicyClipReport()
         try:
             arm_qpos, hand_qpos, rejection = decode_policy_action(
                 action,
@@ -1228,7 +1247,7 @@ class PolicyRunner:
                 f"{type(exc).__name__}: {exc}",
                 log_exc=True,
             )
-            return None, None, None, ArmClipReport()
+            return None, None, None, _PolicyClipReport()
         if arm_qpos is None:
             # Ordinary IK no-solution: recoverable miss in the same trial.
             if self.policy_spec.action_key == "action_ee":
@@ -1237,7 +1256,7 @@ class PolicyRunner:
                 None,
                 _RejectKind.IK,
                 rejection or "EE action has no usable IK solution",
-                ArmClipReport(),
+                _PolicyClipReport(),
             )
         reference_arm_qpos = (
             feedback.arm_qpos
@@ -1245,7 +1264,7 @@ class PolicyRunner:
             else self.previous_arm_command_qpos
         )
         try:
-            arm_qpos, hand_qpos, arm_clip = _project_policy_targets(
+            arm_qpos, hand_qpos, clip = _project_policy_targets(
                 arm_qpos, hand_qpos, reference_arm_qpos, self.runtime
             )
         except Exception as exc:
@@ -1254,8 +1273,8 @@ class PolicyRunner:
                 f"{type(exc).__name__}: {exc}",
                 log_exc=True,
             )
-            return None, None, None, ArmClipReport()
-        return (arm_qpos, hand_qpos), None, None, arm_clip
+            return None, None, None, _PolicyClipReport()
+        return (arm_qpos, hand_qpos), None, None, clip
 
     def _prepare_dispatch_candidate(self, action: np.ndarray) -> ActionCandidate | None:
         """Decode, project, and gate the queue head exactly once.
@@ -1280,7 +1299,7 @@ class PolicyRunner:
             self._fault(f"fatal command feedback: {issue.code.value}: {issue.detail}")
             return None
 
-        decoded, reject_kind, decode_rejection, arm_clip = self._decode_action(
+        decoded, reject_kind, decode_rejection, clip = self._decode_action(
             action, feedback
         )
         if decoded is None:
@@ -1298,16 +1317,22 @@ class PolicyRunner:
             run_generation=self.run_generation,
             is_hold=False,
         )
-        if arm_clip.clipped:
+        if clip.arm.clipped or clip.hand_joint >= 0:
             # One visible line per really truncated action (taskbook §4/V19).
             # Preparing happens once per candidate, so a FULL retry cannot
             # repeat it.
-            logger.info(
-                "[CLIP] action=%d arm_max_delta_rad=%.3f joint=%d",
-                int(candidate.action_id),
-                arm_clip.max_abs_delta_rad,
-                arm_clip.joint,
-            )
+            fields = []
+            if clip.arm.clipped:
+                # Existing arm magnitude is the pre-clip command step.
+                fields.append(
+                    f"arm_max_delta_rad={clip.arm.max_abs_delta_rad:.3f} joint={clip.arm.joint}"
+                )
+            if clip.hand_joint >= 0:
+                fields.append(
+                    f"hand_max_correction_rad={clip.hand_max_correction_rad:.17g} "
+                    f"hand_joint={clip.hand_joint}"
+                )
+            logger.info("[CLIP] action=%d %s", int(candidate.action_id), " ".join(fields))
         try:
             prepared = prepare_command(
                 self.shared,

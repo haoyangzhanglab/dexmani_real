@@ -381,6 +381,8 @@ Sensors / Human Input              Learned Policy
 - `planning/`：kinematics / geometry / planning utilities；
 - `replay/`：physical trajectory replay。
 
+Policy 的 `[CLIP]` 每个 action 至多一行：`arm_max_delta_rad` 是原有的裁剪前 arm command step，`hand_max_correction_rad` 是 decoded hand endpoint 到 projected endpoint 的最大绝对修正量（rad），`hand_joint` 为对应的零起始关节索引。仅 hand 裁剪也会打印；FULL 重试不会重复投影或打印。
+
 更细的 concurrency、timeout、schema、error-code 与 scheduling 语义属于当前 source，应以实现为准。
 
 ## Data and Outputs
