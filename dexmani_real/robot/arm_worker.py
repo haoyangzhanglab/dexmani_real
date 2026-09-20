@@ -325,14 +325,12 @@ def _consume_one_arm_command(st: _LoopState, shared: Any, permit_generation: int
     """Consume at most one ordered FIFO record for the arm this tick."""
     consumer = st.consumer
     consumer.resync_if_stale_generation(permit_generation)
+    if consumer.generation != permit_generation:
+        return  # The locked resync observed a newer epoch; reread next tick.
     record = consumer.next_record()
     if record is None:
         return  # EMPTY is a wait, never a fault
     command, sequence = record
-    if int(command["run_generation"][0]) != permit_generation:
-        # A record whose epoch was revoked after the tick's permit read.
-        consumer.advance()
-        return
     if not bool(command["arm_present"][0]):
         # An absent actuator advances only its consumer; no SDK involvement
         # and no acceptance is implied.

@@ -113,6 +113,8 @@ def _consume_one_hand_command(
         # A new epoch invalidates the queued backlog; re-anchor the
         # command-space slew reference to fresh measured state.
         ack.last_sdk_accepted_qpos = measured_qpos.copy()
+    if consumer.generation != permit.run_generation:
+        return  # Resync overtook this tick's permit; do not consume a new epoch.
     record = consumer.next_record()
     _phase("command_read", read_started_ns)
     if record is None:
@@ -121,10 +123,6 @@ def _consume_one_hand_command(
     command, sequence = record
     sequence_int = int(sequence)
     command_generation = int(command["run_generation"][0])
-    if command_generation != permit.run_generation:
-        # A revoked-epoch record: consumed without SDK involvement.
-        consumer.advance()
-        return
     if not bool(command["hand_present"][0]):
         # An absent actuator advances only its consumer; no SDK send and no
         # acceptance is implied.

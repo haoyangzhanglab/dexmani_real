@@ -707,6 +707,99 @@ class HandWorkerConsumptionTest(_TransportTest):
         self.assertEqual(int(self.shared.hand_cmd_consumed_sequence.value), 1)
 
 
+class WorkerEpochInterleavingTest(_TransportTest):
+    """Deterministic epoch changes through real worker consumption owners."""
+
+    _make_state = ArmWorkerConsumptionTest._make_state
+
+    def _worker(self, name):
+        from dexmani_real.robot.arm_worker import _consume_one_arm_command
+        from dexmani_real.robot.hand_worker import _consume_one_hand_command, _HandCommandAck
+        watermark = getattr(self.shared, name + "_cmd_consumed_sequence")
+        consumer = CommandStreamConsumer(self.shared, watermark)
+        if name == "arm":
+            state, sdk = self._make_state(consumer)
+            return consumer, sdk, lambda gen: _consume_one_arm_command(state, self.shared, gen)
+        sdk = _FakeHandSdk([_FakeSendStatus.ACCEPTED] * 10)
+        ack = _HandCommandAck(last_sdk_accepted_qpos=np.zeros(12))
+        def tick(gen):
+            _consume_one_hand_command(
+                self.shared, sdk, _FakeSendStatus, consumer,
+                SimpleNamespace(run_generation=gen, state=SafetyState.RUNNING),
+                np.zeros(12), ack, mechanical_lower=np.full(12, -1.),
+                mechanical_upper=np.full(12, 2.), max_delta_rad_per_tick=1.,
+            )
+        return consumer, sdk, tick
+
+    def test_three_generations_do_not_skip_first_new_command(self):
+        for name in ("arm", "hand"):
+            with self.subTest(worker=name):
+                consumer, sdk, tick = self._worker(name)
+                invalidate_coupled_commands(self.shared)
+                old_permit = int(self.shared.run_generation.value)
+                invalidate_coupled_commands(self.shared)
+                generation = int(self.shared.run_generation.value)
+                _, receipt = _publish(self.shared, 901, generation=generation, **{name: .05})
+                sequence = receipt.command.sequence
+                tick(old_permit)
+                self.assertEqual(consumer.next_sequence, sequence)
+                tick(generation)
+                self.assertEqual(consumer.next_sequence, sequence + 1)
+                tick(generation)
+                calls = sdk.servo_calls if name == "arm" else sdk.sent
+                self.assertEqual(len(calls), 1)
+
+    def test_sdk_late_return_cannot_consume_new_epoch(self):
+        for name in ("arm", "hand"):
+            with self.subTest(worker=name):
+                consumer, sdk, tick = self._worker(name)
+                generation = int(self.shared.run_generation.value)
+                _, receipt = _publish(self.shared, 902, generation=generation, **{name: .05})
+                original = sdk.servo if name == "arm" else sdk.send_action
+                def late(target):
+                    result = original(target)
+                    invalidate_coupled_commands(self.shared)
+                    _, new = _publish(self.shared, 903,
+                        generation=int(self.shared.run_generation.value), **{name: .06})
+                    # No other thread owns this consumer; emulate its next rebase
+                    # only after the old invocation returns, as the worker does.
+                    self.assertEqual(new.command.sequence, receipt.command.sequence + 1)
+                    return result
+                setattr(sdk, "servo" if name == "arm" else "send_action", late)
+                tick(generation)
+                self.assertEqual(consumer.next_sequence, receipt.command.sequence)
+                setattr(sdk, "servo" if name == "arm" else "send_action", original)
+                tick(int(self.shared.run_generation.value))
+                self.assertEqual(consumer.next_sequence, receipt.command.sequence + 2)
+
+    def test_revocation_at_final_sdk_fence_prevents_send(self):
+        from unittest.mock import patch
+        from dexmani_real.runtime.safety import coupled_command_may_cross_sdk
+        for name in ("arm", "hand"):
+            with self.subTest(worker=name):
+                consumer, sdk, tick = self._worker(name)
+                generation = int(self.shared.run_generation.value)
+                _, receipt = _publish(self.shared, 905, generation=generation, **{name: .05})
+                def fence(shared, **kwargs):
+                    invalidate_coupled_commands(shared)
+                    return coupled_command_may_cross_sdk(shared, **kwargs)
+                with patch(f"dexmani_real.robot.{name}_worker.coupled_command_may_cross_sdk", side_effect=fence):
+                    tick(generation)
+                self.assertEqual(sdk.servo_calls if name == "arm" else sdk.sent, [])
+                self.assertEqual(consumer.next_sequence, receipt.command.sequence)
+
+    def test_stable_wrong_record_generation_is_corruption(self):
+        for name in ("arm", "hand"):
+            with self.subTest(worker=name):
+                consumer, sdk, tick = self._worker(name)
+                frame = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
+                frame["run_generation"] = int(self.shared.run_generation.value) + 1
+                frame["action_id"] = 904
+                self.shared.coupled_cmd_ring.write(frame)
+                with self.assertRaises(CommandStreamCorruption):
+                    tick(int(self.shared.run_generation.value))
+
+
 def _spawn_consume_one(shared) -> None:
     """Child entry: attach as the arm consumer and commit-consume one record.
 

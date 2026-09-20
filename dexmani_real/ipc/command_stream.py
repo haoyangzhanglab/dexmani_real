@@ -150,17 +150,29 @@ class CommandStreamConsumer:
                 )
             else:
                 return None
+        with shared.motion_lock:
+            if int(shared.run_generation.value) != self._generation:
+                return None
+            if int(result[0]["run_generation"][0]) != self._generation:
+                raise CommandStreamCorruption(
+                    f"command sequence {sequence} has an impossible generation "
+                    f"in stable epoch {self._generation}"
+                )
         return result[0], sequence
 
-    def advance(self) -> None:
-        """Mark the current record fully processed and release its slot.
+    def advance(self) -> bool:
+        """Release this worker's record only while its epoch is still current.
 
-        Called after the worker's terminal disposition of the record: SDK
-        acceptance of an arm endpoint, exact-endpoint acceptance of a hand
-        target, or a skip (absent actuator, stale generation). Intermediate
-        hand slew setpoints and CRC-unconfirmed sends do NOT advance.
+        SDK acceptance or an absent actuator may advance; intermediate hand
+        setpoints and CRC-unconfirmed sends may not. A late old SDK return
+        leaves both the cursor and shared watermark unchanged until resync.
+        The worker is the sole owner of this cursor, including across SDK IO.
         """
-        sequence = self._next_sequence
-        self._next_sequence = sequence + 1
-        if int(self._watermark.value) < sequence:
-            self._watermark.value = sequence
+        with self._shared.motion_lock:
+            if int(self._shared.run_generation.value) != self._generation:
+                return False
+            sequence = self._next_sequence
+            self._next_sequence = sequence + 1
+            if int(self._watermark.value) < sequence:
+                self._watermark.value = sequence
+            return True
