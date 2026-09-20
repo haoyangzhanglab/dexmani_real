@@ -144,6 +144,9 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.run_generation = 1
         runner.run_started_ns = 0
         runner.last_publication_ns = last_publication_ns
+        runner.session_publication_count = 0
+        runner.session_running_ns = 0
+        runner.session_inference_ms = []
         runner.step_dt_ns = _STEP_DT_NS
         runner.chunk_sources = {}
         runner.chunk_action_index = 0

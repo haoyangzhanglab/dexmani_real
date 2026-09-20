@@ -396,6 +396,14 @@ class PolicyRunner:
         self._recorder_start_wait_ms = 0.0
         self._pending_stop_reason: str | None = None
         self.last_metrics_flush_ns = time.monotonic_ns()
+        # Session research statistics (small in-memory accumulators, reported
+        # once in the session summary — no monitoring platform):
+        # effective publication Hz uses successful commits over total RUNNING
+        # wall duration, and latency mean/p95 use real completed predict
+        # samples only.
+        self.session_publication_count = 0
+        self.session_running_ns = 0
+        self.session_inference_ms: list[float] = []
 
     def _clear_execution(self, generation: int | None) -> None:
         self.run_generation = generation
@@ -459,6 +467,9 @@ class PolicyRunner:
         # exactly once here, independent of whether its evidence saved.
         self.completed_trials += 1
         self._evidence_logged_this_trial = False
+        self.session_running_ns += max(
+            0, time.monotonic_ns() - int(self.run_started_ns)
+        )
         if self.recorder is not None:
             self._pending_stop_reason = stop_reason
             self.recorder.stop_episode(
@@ -1361,6 +1372,7 @@ class PolicyRunner:
                 publication_ns - self.last_publication_ns
             ) / 1e6
         self.last_publication_ns = publication_ns
+        self.session_publication_count += 1
         self.actions.popleft()
         self.chunk_action_index += 1
         self._record_rollout_tick(
@@ -1543,6 +1555,8 @@ class PolicyRunner:
             return
         finished_ns = time.monotonic_ns()
         self.stats.inference_latency_ms = (finished_ns - started_ns) / 1e6
+        # Real completed predict sample for the session mean/p95 statistics.
+        self.session_inference_ms.append(self.stats.inference_latency_ms)
         # Main can revoke motion during blocking inference. Never accept its
         # result before rechecking the episode's original generation/state.
         if not self._running_generation_is_live():
@@ -1664,6 +1678,43 @@ class PolicyRunner:
                     else ""
                 ),
             )
+            self._log_session_statistics()
+
+    def _log_session_statistics(self) -> None:
+        """Report the four session research statistics from real accumulators.
+
+        nominal_hz = 1/control_dt; effective publication Hz = successful
+        commits over total RUNNING wall duration (not a physical arrival
+        rate); inference mean/p95 use the completed predict samples and are
+        reported as ``unavailable`` when there are none.
+        """
+        nominal_hz = (
+            1.0 / self.control_period_s if self.control_period_s > 0 else float("nan")
+        )
+        running_s = self.session_running_ns / 1e9
+        if running_s > 0.0:
+            effective_hz: str = f"{self.session_publication_count / running_s:.3f}"
+        else:
+            effective_hz = "unavailable"
+        if self.session_inference_ms:
+            samples = np.asarray(self.session_inference_ms, dtype=np.float64)
+            mean_ms = f"{float(np.mean(samples)):.3f}"
+            p95_ms = f"{float(np.percentile(samples, 95.0)):.3f}"
+        else:
+            mean_ms = "unavailable"
+            p95_ms = "unavailable"
+        logger.info(
+            "policy session stats: nominal_hz=%.3f effective_publication_hz=%s "
+            "publications=%d running_wall_s=%.2f inference_ms_mean=%s "
+            "inference_ms_p95=%s predict_samples=%d",
+            nominal_hz,
+            effective_hz,
+            self.session_publication_count,
+            running_s,
+            mean_ms,
+            p95_ms,
+            len(self.session_inference_ms),
+        )
 
 
 def _load_policy_runtime(config: PolicyRuntimeConfig) -> PolicyRuntime:

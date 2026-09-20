@@ -45,6 +45,19 @@ def _parser() -> argparse.ArgumentParser:
             "datasets/<task_name>.zarr; existing output paths are refused."
         ),
     )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help=(
+            "Alternative Zarr output path for a NEW generation of this task "
+            "(default: datasets/<task_name>.zarr). The task identity always "
+            "comes from the input directory. Existing outputs are refused, "
+            "and the resolved target (symlinks followed) must not fall "
+            "inside the protected sources: episodes/, episodes_processed/, "
+            "rollouts/, the input root, or an existing .zarr store."
+        ),
+    )
     parser.add_argument("--chunk-frames", type=int, default=100)
     parser.add_argument("--compression-level", type=int, default=3)
     parser.add_argument(
@@ -56,6 +69,42 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+# Source roots whose contents must never receive derived export output.
+_PROTECTED_SOURCE_ROOTS = ("episodes", "episodes_processed", "rollouts")
+
+
+def _resolve_output_path(
+    output: Path | None,
+    default_path: Path,
+    input_root: Path,
+) -> Path:
+    """Resolve the export target and keep it outside every protected source.
+
+    Symlinks are followed, so a link that escapes into raw/processed/rollout
+    data is refused by its resolved location. Overwriting any existing output
+    is refused later by the export transaction itself.
+    """
+    candidate = default_path if output is None else output
+    resolved = candidate.expanduser().resolve(strict=False)
+    protected = [
+        Path(name).resolve(strict=False) for name in _PROTECTED_SOURCE_ROOTS
+    ]
+    protected.append(input_root.expanduser().resolve(strict=False))
+    for root in protected:
+        if resolved == root or root in resolved.parents:
+            raise ValueError(
+                f"output target {resolved} must not resolve inside the "
+                f"protected source {root}"
+            )
+    for parent in resolved.parents:
+        if parent.suffix == ".zarr" and parent.exists():
+            raise ValueError(
+                f"output target {resolved} must not resolve inside the "
+                f"existing Zarr store {parent}"
+            )
+    return candidate
 
 
 def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:
@@ -109,7 +158,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
-        output_path, task_name = _resolve_task_paths(args.input_root)
+        default_output_path, task_name = _resolve_task_paths(args.input_root)
+        # Preflight and real export share the identical output contract.
+        output_path = _resolve_output_path(
+            args.output, default_output_path, args.input_root
+        )
         config = PolicyZarrExportConfig(
             chunk_frames=args.chunk_frames,
             compression_level=args.compression_level,

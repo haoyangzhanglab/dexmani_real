@@ -138,6 +138,9 @@ class _RunnerTest(unittest.TestCase):
         runner.last_metrics_flush_ns = 0
         runner.execute = False
         runner.max_running_s = 60.0
+        runner.session_publication_count = 0
+        runner.session_running_ns = 0
+        runner.session_inference_ms = []
         runner.step_dt_ns = 62_500_000
         runner.next_record_ns = 0
         runner.runtime = SimpleNamespace(policy=SimpleNamespace())
