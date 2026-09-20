@@ -51,6 +51,10 @@ class _PendingFinalization:
     started_monotonic_s: float
     forced_error: str = ""
     truncated: bool = False
+    # True when the episode ended by itself (writer/sampling failure, transport
+    # corruption, shutdown while recording) rather than by an explicit operator
+    # discard: the closed partial staging is retained, not destroyed.
+    retain_partial: bool = False
     thread: threading.Thread | None = None
     results: Queue = field(default_factory=Queue)
 
@@ -252,7 +256,14 @@ class _RecorderIOSession:
             )
         )
 
-    def _begin_finalization(self, *, save: bool, reason: str, error: str = "") -> None:
+    def _begin_finalization(
+        self,
+        *,
+        save: bool,
+        reason: str,
+        error: str = "",
+        retain_partial: bool = False,
+    ) -> None:
         if self.pending_finalization is not None or not self.recorder.is_recording:
             return
         pending = _PendingFinalization(
@@ -263,6 +274,7 @@ class _RecorderIOSession:
             truncated=self.recorder.max_frames_reached,
             started_monotonic_s=time.monotonic(),
             forced_error=error,
+            retain_partial=retain_partial,
         )
         self.pending_stop = None
         self.pending_finalization = pending
@@ -280,7 +292,18 @@ class _RecorderIOSession:
         error = None
         published = False
         try:
-            path = self.recorder.finish_episode(pending.save, pending.reason)
+            path = self.recorder.finish_episode(
+                pending.save,
+                pending.reason,
+                failure_note=(
+                    pending.forced_error
+                    or (
+                        f"episode interrupted: {pending.reason}"
+                        if pending.retain_partial
+                        else ""
+                    )
+                ),
+            )
             if path is None:
                 raise RuntimeError("active episode missing during finalization")
             # The recorder owns the transaction outcome: a zero-row downgrade
@@ -296,7 +319,9 @@ class _RecorderIOSession:
     def _fail_samples(self, reason: str, error: str) -> None:
         """Doom the episode before releasing any unconsumed sample capacity."""
         logger.error("RecorderIO %s: %s", reason, error)
-        self._begin_finalization(save=False, reason=reason, error=error)
+        self._begin_finalization(
+            save=False, reason=reason, error=error, retain_partial=True
+        )
         self.last_sample_sequence = int(self.shared.record_sample_ring.latest_sequence)
         self.shared.recorder_consumed_sequence.value = self.last_sample_sequence
 
@@ -371,7 +396,10 @@ class _RecorderIOSession:
                 else ""
             )
             self._begin_finalization(
-                save=stop.save and not error, reason=stop.reason, error=error
+                save=stop.save and not error,
+                reason=stop.reason,
+                error=error,
+                retain_partial=bool(error),
             )
 
     def _poll_finalization(self) -> None:
@@ -412,7 +440,13 @@ class _RecorderIOSession:
     def shutdown(self) -> bool:
         """Use the same finalizer and its original deadline during worker exit."""
         if self.pending_finalization is None and self.recorder.is_recording:
-            self._begin_finalization(save=False, reason="recorder_process_shutdown")
+            # Shutdown mid-episode is an interruption, never an operator
+            # discard: the closed partial staging is retained for inspection.
+            self._begin_finalization(
+                save=False,
+                reason="recorder_process_shutdown",
+                retain_partial=True,
+            )
         pending = self.pending_finalization
         if pending is not None:
             thread = pending.thread
@@ -454,7 +488,11 @@ class _RecorderIOSession:
             and self.recorder.is_recording
             and self.pending_stop is None
         ):
-            self._begin_finalization(save=False, reason="runtime_shutdown")
+            # The runtime ended while an episode was still open: an
+            # interruption, not an operator discard.
+            self._begin_finalization(
+                save=False, reason="runtime_shutdown", retain_partial=True
+            )
         self._drain_samples()
         if (
             self.pending_finalization is None

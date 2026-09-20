@@ -473,7 +473,9 @@ class EpisodeRecorder:
         self._data_writer.append(batch)
         self._pending_rows.clear()
 
-    def finish_episode(self, save: bool = True, reason: str = "") -> str | None:
+    def finish_episode(
+        self, save: bool = True, reason: str = "", *, failure_note: str = ""
+    ) -> str | None:
         """Synchronously finish one episode and return its reserved final path.
 
         ``save=True`` validates the collected rows and publishes atomically; a
@@ -484,8 +486,16 @@ class EpisodeRecorder:
         raw episode is published there. Failure raises after cleanup; once
         every writer confirmed release, the failed transaction's staging is
         retained under an ``incomplete_*`` name with a failure note instead of
-        being destroyed. The caller must serialize this operation with all
-        other recorder access.
+        being destroyed.
+
+        A non-empty ``failure_note`` marks an episode that ended by itself
+        (writer/sampling failure, transport corruption, shutdown while
+        recording) rather than by an explicit operator discard. Those close
+        their partial staging under the same ``incomplete_*`` name even when
+        the finalization itself completes cleanly — only a discard with no
+        failure identity is destructive, and an empty staging is never kept.
+        The caller must serialize this operation with all other recorder
+        access.
         """
         if self._finishing:
             raise RuntimeError("episode finalization is still active")
@@ -505,7 +515,9 @@ class EpisodeRecorder:
         self._max_frames_reached = False
         self._finishing = True
         try:
-            self._finish_episode_transaction(save, reason, truncated)
+            self._finish_episode_transaction(
+                save, reason, truncated, failure_note=failure_note
+            )
         finally:
             self._finishing = False
         return path
@@ -515,6 +527,8 @@ class EpisodeRecorder:
         save: bool,
         reason: str,
         truncated: bool,
+        *,
+        failure_note: str = "",
     ) -> None:
         """Finalize one transaction; retain any resource that failed cleanup."""
         failure = None
@@ -552,14 +566,22 @@ class EpisodeRecorder:
             if self._camera_writer is None and self._data_writer is None:
                 try:
                     if self._temp_dir is not None:
-                        if failure is not None:
-                            # Automatic-failure retention: the transaction never
-                            # published, so keep the closed partial staging under
-                            # an explicit incomplete name for offline inspection.
+                        note = (
+                            f"{type(failure).__name__}: {failure}"
+                            if failure is not None
+                            else failure_note
+                        )
+                        if failure is not None or (note and self._frame_count > 0):
+                            # Automatic-failure / interrupted retention: the
+                            # transaction never published, so keep the closed
+                            # partial staging under an explicit incomplete name
+                            # for offline inspection. Only an explicit operator
+                            # discard (no failure identity) is destructive, and
+                            # an empty staging is never worth keeping.
                             self._preserve_incomplete_staging(
                                 self._temp_dir,
                                 reason=reason,
-                                error=f"{type(failure).__name__}: {failure}",
+                                error=note,
                             )
                         else:
                             # Clean explicit discard (save=False) stays destructive.

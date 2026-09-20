@@ -165,6 +165,52 @@ class RecorderPrefixPreservationTest(unittest.TestCase):
         self.assertEqual(len(manifests), 1)
         self.assertTrue(recorder.resources_released)
 
+    def test_automatic_failure_retains_prefix_when_finalization_succeeds(self):
+        """An automatic failure keeps the collected prefix.
+
+        The finalization itself completes cleanly here, so no exception marks
+        the transaction: the failure identity carried by the caller is what
+        separates an automatic failure (retain the closed staging) from an
+        explicit operator discard (destructive).
+        """
+        recorder = _make_recorder(self.root, min_frames=1)
+        self.assertTrue(
+            recorder.start_episode(task_label="t1", episode_name="episode_t1_auto")
+        )
+        _add_frames(recorder, 3)
+        path = recorder.finish_episode(
+            save=False,
+            reason="sample_ring_overflow",
+            failure_note="RecorderIO sample_ring_overflow: sample ring full",
+        )
+        self.assertEqual(path, str(self.root / "episode_t1_auto"))
+        self.assertFalse(recorder.last_finish_saved)
+        self.assertFalse((self.root / "episode_t1_auto").exists())
+        retained = self.root / "incomplete_episode_t1_auto"
+        self.assertTrue(
+            retained.is_dir(), "automatic-failure staging must be retained"
+        )
+        note = json.loads((retained / "failure_note.json").read_text(encoding="utf-8"))
+        self.assertEqual(note["status"], "incomplete")
+        self.assertEqual(note["frame_count_before_failure"], 3)
+        self.assertIn("sample_ring_overflow", note["error"])
+        self.assertTrue(recorder.resources_released)
+
+    def test_zero_row_automatic_failure_keeps_no_empty_staging(self):
+        """An empty staging is junk, not a partial prefix worth retaining."""
+        recorder = _make_recorder(self.root, min_frames=1)
+        self.assertTrue(
+            recorder.start_episode(
+                task_label="t1", episode_name="episode_t1_zero_fail"
+            )
+        )
+        recorder.finish_episode(
+            save=False, reason="sample_write_error", failure_note="write failed"
+        )
+        self.assertEqual(list(self.root.glob("incomplete_*")), [])
+        self.assertEqual(list(self.root.glob(".tmp_*")), [])
+        self.assertTrue(recorder.resources_released)
+
     def test_explicit_user_discard_stays_destructive(self):
         """A clean save=False discard removes staging and publishes nothing."""
         recorder = _make_recorder(self.root, min_frames=1)
@@ -247,6 +293,7 @@ class _FakeRecorder:
         self.camera_writer_error = None
         self.last_finish_saved = False
         self.finished: list[tuple[bool, str]] = []
+        self.failure_notes: list[str] = []
 
     @property
     def resources_released(self) -> bool:
@@ -255,8 +302,9 @@ class _FakeRecorder:
     def add_episode_frame(self, frame: EpisodeFrame) -> bool:
         return True
 
-    def finish_episode(self, save: bool, reason: str):
+    def finish_episode(self, save: bool, reason: str, *, failure_note: str = ""):
         self.finished.append((bool(save), reason))
+        self.failure_notes.append(failure_note)
         self.is_recording = False
         self.last_finish_saved = bool(save)
         return self.episode_path
@@ -292,6 +340,9 @@ class RecorderIOStopClassificationTest(unittest.TestCase):
             shared, StopRecording(save=True, reason="camera_stall", through_sequence=3)
         )
         self.assertEqual(recorder.finished, [(True, "camera_stall")])
+        # An evidence-preserving stop carries no failure identity, so the
+        # recorder would treat a non-publishing outcome as an explicit discard.
+        self.assertEqual(recorder.failure_notes, [""])
 
     def test_corruption_reasons_still_override_save(self):
         """Genuine transport/writer corruption is never published as valid raw."""
@@ -302,6 +353,12 @@ class RecorderIOStopClassificationTest(unittest.TestCase):
                     shared, StopRecording(save=True, reason=reason, through_sequence=3)
                 )
                 self.assertEqual(recorder.finished, [(False, reason)])
+                # The automatic-failure identity reaches the transaction, which
+                # is what makes the closed prefix staging retained rather than
+                # destroyed (TASKBOOK T1: an automatic failure is never
+                # conflated with an explicit operator discard).
+                self.assertEqual(len(recorder.failure_notes), 1)
+                self.assertIn(reason, recorder.failure_notes[0])
 
 
 if __name__ == "__main__":
