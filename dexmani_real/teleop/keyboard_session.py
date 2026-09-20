@@ -793,7 +793,7 @@ def _run_control_loop(
                     "[DROP] keyboard action=%d reason=generation_revoked",
                     pending_candidate.action_id,
                 )
-                fifo_wait.note_dropped("generation_revoked")
+                fifo_wait.note_dropped("generation_revoked", report=False)
                 pending_candidate = None
                 pending_arm_qpos = None
                 continue
@@ -822,7 +822,7 @@ def _run_control_loop(
                         pending_candidate.action_id,
                         retry.reason,
                     )
-                    fifo_wait.note_dropped(retry.reason)
+                    fifo_wait.note_dropped(retry.reason, report=False)
                     kept_reason = retry.reason
                     pending_candidate = None
                     pending_arm_qpos = None

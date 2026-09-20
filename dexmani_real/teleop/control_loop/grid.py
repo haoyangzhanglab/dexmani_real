@@ -194,7 +194,8 @@ def _drop_pending_publish(
     logger.warning(
         "[DROP] teleop action=%d reason=%s", pending.candidate.action_id, reason
     )
-    resources.fifo_wait.note_dropped(reason)
+    # The action owner already reported this cancellation; close the span once.
+    resources.fifo_wait.note_dropped(reason, report=False)
 
 
 def close_publish_span(

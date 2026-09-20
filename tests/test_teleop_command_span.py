@@ -47,7 +47,7 @@ class PauseBoundarySpanTest(unittest.TestCase):
         controller = self._controller(813)
 
         with self.assertLogs(
-            "dexmani_real.teleop.control_loop.grid", level="WARNING"
+            "dexmani_real", level="WARNING"
         ) as logs:
             close_publish_span(
                 controller, SimpleNamespace(fifo_wait=tracker), "pause_boundary"
@@ -56,6 +56,7 @@ class PauseBoundarySpanTest(unittest.TestCase):
         text = "\n".join(logs.output)
         self.assertIn("[DROP] teleop action=813", text)
         self.assertIn("pause_boundary", text)
+        self.assertEqual(text.count("[DROP]"), 1)
         self.assertIsNone(controller.pending_publish)
         self.assertFalse(tracker.waiting)
         # The span is closed, so the next successful commit reports no wait
