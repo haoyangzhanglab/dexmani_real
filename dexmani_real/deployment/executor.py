@@ -411,6 +411,11 @@ class PolicyRunner:
         self.previous_arm_command_qpos = None
         self.last_recorded_action = None
         self.actions.clear()
+        if self._pending_dispatch is not None or self._fifo_wait.waiting:
+            # Epoch/trial boundary: an uncommitted kept candidate is discarded
+            # here, so the backpressure span ends with its own visible line and
+            # the next trial's [WAIT] starts from a clean state.
+            self._fifo_wait.note_dropped("epoch_boundary")
         self._pending_dispatch = None
         self._observation_waiting_since_ns = None
         self.chunk_sources.clear()

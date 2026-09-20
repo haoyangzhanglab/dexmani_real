@@ -68,16 +68,17 @@ class PublishWaitTracker:
     """One visible ``[WAIT]``/``[RESUME]`` pair per continuous FIFO-full span.
 
     Each command producer owns one tracker. Entering backpressure prints once;
-    repeated FULL retries of the same kept candidate stay silent; the first
-    successful commit after the span prints the elapsed wait and how many
-    waiting candidates were dropped by lifecycle revocation.
+    repeated FULL retries of the same kept candidate stay silent. A span ends
+    exactly one way: either the kept candidate commits (``[RESUME]`` with the
+    elapsed wait) or lifecycle revokes it (``[DROP]`` naming the kept action
+    and the reason). Every terminal path must call one of the two, so the next
+    span starts from a clean state and each decision keeps exactly one line.
     """
 
     def __init__(self, label: str) -> None:
         self._label = label
         self._waiting_since_ns: int | None = None
         self._keep_action_id = 0
-        self._dropped = 0
 
     @property
     def waiting(self) -> bool:
@@ -99,20 +100,19 @@ class PublishWaitTracker:
             return
         wait_ms = (time.monotonic_ns() - self._waiting_since_ns) / 1e6
         logger.info(
-            "[RESUME] %s command_fifo wait_ms=%.0f dropped=%d",
+            "[RESUME] %s command_fifo wait_ms=%.0f dropped=0",
             self._label,
             wait_ms,
-            self._dropped,
         )
         self._reset()
 
     def note_dropped(self, reason: str) -> None:
-        """Report a kept candidate revoked by lifecycle while waiting."""
+        """Report the kept candidate revoked by lifecycle while waiting."""
         if self._waiting_since_ns is None:
             return
         wait_ms = (time.monotonic_ns() - self._waiting_since_ns) / 1e6
         logger.warning(
-            "[DROP] %s command_fifo keep_action=%d wait_ms=%.0f reason=%s",
+            "[DROP] %s command_fifo keep_action=%d wait_ms=%.0f dropped=1 reason=%s",
             self._label,
             self._keep_action_id,
             wait_ms,
@@ -123,7 +123,6 @@ class PublishWaitTracker:
     def _reset(self) -> None:
         self._waiting_since_ns = None
         self._keep_action_id = 0
-        self._dropped = 0
 
 
 @dataclass(frozen=True)

@@ -77,6 +77,8 @@ class RecorderClient:
         self._max_frames_stop_reason = "max_frames"
         self._stop_reason = ""
         self._last_stop_result: RecorderStopResult | None = None
+        # A terminal verdict is delivered to its sole consumer exactly once.
+        self._terminal_result_delivered = False
         self.episode_path: str | None = None
 
     @property
@@ -126,6 +128,7 @@ class RecorderClient:
             path=self.episode_path,
             frame_count=self._frame_count,
         )
+        self._terminal_result_delivered = False
 
     def _send_control(self, message: StartRecording | StopRecording) -> bool:
         try:
@@ -261,6 +264,7 @@ class RecorderClient:
             min_frames_met=event.min_frames_met,
         )
         self._last_stop_result = result
+        self._terminal_result_delivered = True
         return result
 
     def poll_stop(self) -> RecorderStopResult:
@@ -268,6 +272,13 @@ class RecorderClient:
             event = self.shared.record_result_q.get_nowait()
         except Empty:
             if self._unavailable and self._last_stop_result:
+                # A transport-lost client still reports its last known state,
+                # but a terminal (done) verdict is delivered exactly once:
+                # repeating it would make the sole consumer re-consume the same
+                # outcome (double-counted saves, repeated result lines).
+                if self._last_stop_result.done and self._terminal_result_delivered:
+                    return RecorderStopResult(done=False, reason=self._stop_reason)
+                self._terminal_result_delivered = self._last_stop_result.done
                 return self._last_stop_result
             return RecorderStopResult(done=False, reason=self._stop_reason)
         except (EOFError, OSError, ValueError) as exc:

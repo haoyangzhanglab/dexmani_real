@@ -146,6 +146,7 @@ class _RunnerTest(unittest.TestCase):
         runner.runtime = SimpleNamespace(policy=SimpleNamespace())
         runner.model_runtime = SimpleNamespace(reset_episode=lambda: None)
         runner._fifo_wait = SimpleNamespace(
+            waiting=False,
             note_full=lambda *a: None,
             note_committed=lambda: None,
             note_dropped=lambda reason: None,
@@ -298,6 +299,53 @@ class SessionStatisticsTest(_RunnerTest):
         self.assertIn("inference_ms_mean=unavailable", line)
         self.assertIn("inference_ms_p95=unavailable", line)
         self.assertIn("predict_samples=0", line)
+
+
+@unittest.skipIf(_IMPORT_ERROR is not None, f"dependencies unavailable: {_IMPORT_ERROR}")
+class TerminalResultConsumptionTest(unittest.TestCase):
+    """V16: a terminal recorder verdict is consumed exactly once."""
+
+    def test_done_result_is_delivered_once_after_transport_loss(self):
+        from queue import Empty
+
+        from dexmani_real.recording.client import (
+            RecorderClient,
+            RecorderStopResult,
+        )
+
+        class _EmptyQueue:
+            def get_nowait(self):
+                raise Empty
+
+        class _Shared:
+            record_result_q = _EmptyQueue()
+            is_ready = staticmethod(lambda name: True)
+            is_running = SimpleNamespace(value=True)
+            record_sample_ring = SimpleNamespace(latest_sequence=0, maxlen=4)
+            recorder_consumed_sequence = SimpleNamespace(value=0)
+            set_heartbeat = staticmethod(lambda *a: None)
+
+        client = RecorderClient(_Shared())
+        client._unavailable = True
+        client._last_stop_result = RecorderStopResult(
+            done=True, saved=True, path="p", frame_count=7, reason="manual"
+        )
+        first = client.poll_stop()
+        second = client.poll_stop()
+        self.assertTrue(first.done)
+        self.assertTrue(first.saved)
+        self.assertFalse(second.done)
+        # The consumer's evidence counter therefore increments exactly once.
+        from dexmani_real.recording.client import RecordingFinished
+
+        client._last_stop_result = None
+        client._terminal_result_delivered = False
+        client._unavailable = False
+        result = client._finish(
+            RecordingFinished(saved=True, path="p", frame_count=7, reason="manual")
+        )
+        self.assertTrue(result.done)
+        self.assertTrue(client._terminal_result_delivered)
 
 
 @unittest.skipIf(_IMPORT_ERROR is not None, f"dependencies unavailable: {_IMPORT_ERROR}")

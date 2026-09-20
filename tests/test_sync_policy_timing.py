@@ -288,14 +288,22 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.observation_id = 5
         runner._pending_dispatch = object()
         runner._observation_waiting_since_ns = 7
+        # An open backpressure span must end visibly at the epoch boundary and
+        # leave the tracker clean for the next trial's [WAIT].
+        runner._fifo_wait = executor_module.PublishWaitTracker("test")
+        runner._fifo_wait.note_full(8, 813)
 
-        runner._clear_execution(None)
+        with self.assertLogs("dexmani_real.control.publication", level="WARNING") as logs:
+            runner._clear_execution(None)
 
         self.assertEqual(runner.observation_id, 0)
         self.assertEqual(list(runner.actions), [])
         self.assertIsNone(runner._pending_dispatch)
         self.assertIsNone(runner._observation_waiting_since_ns)
         self.assertIsNone(runner.previous_arm_command_qpos)
+        self.assertFalse(runner._fifo_wait.waiting)
+        self.assertIn("keep_action=813", "\n".join(logs.output))
+        self.assertIn("reason=epoch_boundary", "\n".join(logs.output))
 
     # --- lifecycle invariant -----------------------------------------------
 
