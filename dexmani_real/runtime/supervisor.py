@@ -68,10 +68,9 @@ def supervisor_exit_reason(
 ) -> ExitReason:
     """Apply the fixed safety-first supervisor priority.
 
-    ``SERVICE_FAILURE`` comes from ``session_failed``, or process death or
-    heartbeat timeout for a name in ``service_process_names``. It uses verified
-    non-FAULT shutdown with the session marked failed. Other processes are
-    critical; critical failures take priority over session/service failures.
+    Critical faults take precedence over terminal session failure and Q.
+    Optional service death/heartbeat loss is evidence-only and cannot mask Q;
+    the caller records it while continuing the entire control run plan.
     """
     if bool(shared.estop_request.value):
         return ExitReason.ESTOP
@@ -107,14 +106,12 @@ def supervisor_exit_reason(
                 critical_heartbeat_timeout = True
     if critical_heartbeat_timeout:
         return ExitReason.HEARTBEAT_TIMEOUT
-    if (
-        bool(shared.session_failed.value)
-        or service_stopped
-        or service_heartbeat_timeout
-    ):
+    if bool(shared.session_failed.value):
         return ExitReason.SERVICE_FAILURE
     if explicit_quit:
         return ExitReason.EXPLICIT_QUIT
+    if service_stopped or service_heartbeat_timeout:
+        return ExitReason.EVIDENCE_FAILURE
     return ExitReason.NONE
 
 
@@ -135,9 +132,9 @@ def run_supervisor(
     (Q key, episode target reached, KeyboardInterrupt) or a session/service
     failure, False for a critical fault.
 
-    ``SERVICE_FAILURE`` comes from ``session_failed``, or process death or
-    heartbeat timeout for a name in ``service_process_names``. These use the
-    verified non-FAULT shutdown path.
+    Terminal ``session_failed`` ends the session. Optional evidence service
+    failure only latches ``evidence_failed`` through ARMED and RUNNING; all
+    started process handles remain owned by the final verified shutdown.
 
     ``max_running_s`` is the parent-side run budget for one RUNNING epoch —
     the same budget the policy child applies between its own polls. The
@@ -240,28 +237,15 @@ def run_supervisor(
                 exit_reason = f"heartbeat timeout: {stale}"
                 transition(shared, SafetyState.FAULT)
                 break
+            if reason is ExitReason.EVIDENCE_FAILURE:
+                shared.evidence_failed.value = True
+                if not service_failure_deferred:
+                    service_failure_deferred = True
+                    logger.error("[EVIDENCE] optional service unavailable; control run plan continues")
             if reason is ExitReason.SERVICE_FAILURE:
-                shared.session_failed.value = True
-                if (
-                    int(shared.safety_state.value) == int(SafetyState.RUNNING)
-                ):
-                    # Evidence-role service failure (recorder/evidence-only
-                    # camera death, heartbeat loss, or a deferred evidence
-                    # latch) must never terminate a RUNNING trial early: the
-                    # session result is marked failed and supervision waits
-                    # for the natural end of control. The stopped service's
-                    # process handle stays registered for the final join.
-                    if not service_failure_deferred:
-                        service_failure_deferred = True
-                        logger.error(
-                            "[EVIDENCE] service failure during RUNNING — evidence "
-                            "unavailable for the rest of the session; control "
-                            "continues to its natural end"
-                        )
-                else:
-                    normal_exit = True
-                    exit_reason = "session/service failure"
-                    break
+                normal_exit = True
+                exit_reason = "terminal session failure"
+                break
             if reason is ExitReason.EXPLICIT_QUIT:
                 normal_exit = True
                 exit_reason = "shutdown requested"
@@ -457,3 +441,37 @@ def print_health_summary(
 
     print("──")
     sys.stdout.flush()
+
+
+def start_evidence_services(shared, worker_pairs, readiness_timeouts_s, *, critical_processes, started_processes) -> bool:
+    """Prepare optional evidence once, retaining every started cleanup handle.
+
+    A failed optional service disables capture, not control readiness. Earlier
+    critical workers are still monitored during each bounded preparation.
+    """
+    available = True
+    for spec, process in worker_pairs:
+        try:
+            process.start()
+        except Exception:
+            # Some start implementations can raise after acquiring a PID.
+            if process.pid is not None and process not in started_processes:
+                started_processes.append(process)
+            available = False
+            shared.evidence_failed.value = True
+            logger.error("[EVIDENCE] %s failed to start", spec.name, exc_info=True)
+        else:
+            started_processes.append(process)
+            ready = wait_subsystem_ready(
+                shared, [(spec, process)], readiness_timeouts_s,
+                monitored_processes=[*critical_processes, process],
+            )
+            if not ready:
+                available = False
+                shared.evidence_failed.value = True
+            logger.info("evidence %s: %s", spec.name, "ready" if ready else "unavailable")
+        if shared.error_state.value or shared.estop_request.value or any(
+            not process.is_alive() for process in critical_processes
+        ):
+            raise RuntimeError("critical startup failure during evidence preparation")
+    return available

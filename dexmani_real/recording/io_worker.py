@@ -461,10 +461,10 @@ class _RecorderIOSession:
             if thread.is_alive():
                 # The finalizer thread cannot be confirmed stopped during
                 # process shutdown; the caller cannot safely reclaim shared
-                # IPC. Fail closed with the physical fault latch, not
-                # session_failed.
+                # IPC. Report evidence failure; the parent verifies process
+                # exit before reclaiming resources after control ends.
                 self.fatal = True
-                self.shared.error_state.value = True
+                self.shared.evidence_failed.value = True
                 return False
         return self.recorder.resources_released
 
@@ -522,6 +522,7 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
     except Exception:
         # Exit nonzero so the workflow supervisor classifies this worker failure.
         crashed = True
+        shared.evidence_failed.value = True
         if session is not None:
             session.fatal = True
         logger.error("RecorderIO process crashed", exc_info=True)
@@ -532,10 +533,10 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
                     # Shutdown could not confirm the finalizer thread stopped;
                     # shared IPC cannot safely be reclaimed. Fail closed.
                     crashed = True
-                    shared.error_state.value = True
+                    shared.evidence_failed.value = True
             except Exception:
                 crashed = True
-                shared.error_state.value = True
+                shared.evidence_failed.value = True
                 logger.error("RecorderIO shutdown failed", exc_info=True)
         logger.info("RecorderIO exited")
     if crashed or (session is not None and session.fatal):

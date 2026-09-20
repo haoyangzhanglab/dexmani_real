@@ -154,12 +154,14 @@ class RecorderClient:
             self._recording
             or self._stop_requested
             or self._unavailable
+            or self.shared.evidence_failed.value
             or not self.shared.is_ready("recorder")
         ):
             return False
         self.episode_path = None
         self._last_stop_result = None
         self._stop_reason = ""
+        self._terminal_result_delivered = False
         start = StartRecording(
             task_label,
             operator,

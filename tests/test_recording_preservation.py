@@ -363,3 +363,131 @@ class RecorderIOStopClassificationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RecorderFinalizerIsolationTest(unittest.TestCase):
+    def test_real_loop_timeout_and_shutdown_preserve_active_writer(self):
+        import threading
+        from queue import Queue
+        from types import SimpleNamespace
+        import dexmani_real.recording.io_worker as io
+        entered, release = threading.Event(), threading.Event()
+        shared = SimpleNamespace(
+            is_running=_FakeValue(True), error_state=_FakeValue(False),
+            evidence_failed=_FakeValue(False), quit_requested=_FakeValue(False),
+            run_generation=_FakeValue(7), recorder_consumed_sequence=_FakeValue(0),
+            record_control_q=Queue(), record_result_q=Queue(),
+            set_ready=lambda *a: None, set_heartbeat=lambda *a: None,
+        )
+        class Writer(_FakeRecorder):
+            @property
+            def resources_released(self):
+                return release.is_set()
+            def finish_episode(self, *args, **kwargs):
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test writer was not released")
+                return super().finish_episode(*args, **kwargs)
+        recorder = Writer()
+        create = io._RecorderIOSession.create
+        sessions = []
+        def prepare(*args):
+            session = create(*args)
+            sessions.append(session)
+            session._begin_finalization(save=True, reason="operator")
+            self.assertTrue(entered.wait(2))
+            session.pending_finalization.started_monotonic_s = -1000
+            return session
+        try:
+            with mock.patch.object(io, "_create_episode_recorder", return_value=recorder), mock.patch.object(io._RecorderIOSession, "create", side_effect=prepare):
+                with self.assertRaisesRegex(RuntimeError, "recording failure"):
+                    io.recorder_io_loop(shared, RecorderIOConfig(data_dir="unused", max_frames=2, control_hz=10, min_frames=1))
+            self.assertTrue(shared.evidence_failed.value)
+            self.assertFalse(shared.error_state.value)
+            self.assertFalse(shared.quit_requested.value)
+            self.assertEqual(shared.run_generation.value, 7)
+            self.assertTrue(sessions[0].pending_finalization.thread.is_alive())
+            self.assertFalse(sessions[0].pending_finalization.thread.daemon)
+            self.assertFalse(recorder.resources_released)
+        finally:
+            release.set()
+            for session in sessions:
+                session.pending_finalization.thread.join(2)
+
+    def test_unreleased_finished_writer_is_evidence_failure(self):
+        from queue import Queue
+        from types import SimpleNamespace
+        import dexmani_real.recording.io_worker as io
+        shared = SimpleNamespace(is_running=_FakeValue(True), error_state=_FakeValue(False),
+            evidence_failed=_FakeValue(False), recorder_consumed_sequence=_FakeValue(0),
+            record_control_q=Queue(), record_result_q=Queue(),
+            set_ready=lambda *a: None, set_heartbeat=lambda *a: None)
+        class Writer(_FakeRecorder):
+            @property
+            def resources_released(self):
+                return False
+        create = io._RecorderIOSession.create
+        def prepare(*args):
+            session = create(*args)
+            session._begin_finalization(save=True, reason="operator")
+            session.pending_finalization.thread.join(2)
+            return session
+        with mock.patch.object(io, "_create_episode_recorder", return_value=Writer()), mock.patch.object(io._RecorderIOSession, "create", side_effect=prepare):
+            with self.assertRaisesRegex(RuntimeError, "recording failure"):
+                io.recorder_io_loop(shared, RecorderIOConfig(data_dir="unused", max_frames=2, control_hz=10, min_frames=1))
+        self.assertTrue(shared.evidence_failed.value)
+        self.assertFalse(shared.error_state.value)
+
+class RecorderCapacityPathTest(unittest.TestCase):
+    def test_real_client_sample_stop_and_writer_prefix(self):
+        from queue import Queue
+        from types import SimpleNamespace
+        from dexmani_real.ipc.schema import make_record_sample_dtype
+        from dexmani_real.recording.client import RecorderClient
+        from test_deployment_evidence import _RunnerTest, _fake_shared
+        class Ring:
+            dtype = make_record_sample_dtype(_RGB_SHAPE, _DEPTH_SHAPE)
+            maxlen = 4
+            latest_sequence = 0
+            def __init__(self):
+                self.frames = []
+            def write(self, frame):
+                self.frames.append(frame.copy())
+                self.latest_sequence += 1
+                return self.latest_sequence
+            def read_sequence(self, sequence):
+                return self.frames[sequence - 1], 0, sequence
+        shared = _fake_shared()
+        shared.record_sample_ring = Ring()
+        shared.record_control_q, shared.record_result_q = Queue(), Queue()
+        shared.recorder_consumed_sequence = _FakeValue(0)
+        shared.set_heartbeat = lambda *a: None
+        shared.is_recording.value = True
+        client = RecorderClient(shared)
+        client._recording, client._max_frames = True, 2
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = _make_recorder(Path(directory), min_frames=1)
+            self.assertTrue(recorder.start_episode(task_label="t1", episode_name="capacity"))
+            session = _RecorderIOSession(shared, RecorderIOConfig(data_dir=directory,
+                max_frames=2, control_hz=_CONTROL_HZ, min_frames=1), recorder)
+            for index in range(2):
+                self.assertTrue(client.add_frame(_state(index + 1.), _action(), dict(_VR_FRAME),
+                    arm_qpos_sent=np.zeros(7)))
+            self.assertFalse(client.is_recording)
+            self.assertTrue(client.stop_pending)
+            self.assertFalse(client.add_frame(_state(3.), _action(), dict(_VR_FRAME)))
+            stop = shared.record_control_q.get_nowait()
+            self.assertEqual(stop.reason, "max_frames")
+            session._handle_stop(stop)
+            session._drain_samples()
+            session.pending_finalization.thread.join(5)
+            session._poll_finalization()
+            runner = _RunnerTest()._runner(shared=shared, recorder=client, run_started_ns=1)
+            self.assertTrue(runner._poll_recorder())
+            self.assertEqual(runner.completed_trials, 0)
+            self.assertEqual(runner.saved_episodes, 1)
+            runner._poll_recorder()
+            self.assertFalse(client.join_stop().saved)
+            self.assertEqual(runner.saved_episodes, 1)
+            with EpisodeReader(str(Path(directory) / "capacity")) as reader:
+                self.assertEqual(int(reader.h5f["meta"].attrs["num_frames"]), 2)
+                reader.require_valid(purpose="test")

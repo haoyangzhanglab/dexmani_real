@@ -212,6 +212,7 @@ class RuntimeChannels:
     # fault, the owning workflow may use verified non-FAULT shutdown while still
     # reporting the session as failed.
     session_failed: Any
+    evidence_failed: Any  # sticky evidence-only result; never terminates control
     estop_request: Any  # policy -> arm/hand
     quit_requested: Any  # policy -> Main
     camera_requested: (
@@ -351,6 +352,7 @@ class RuntimeChannels:
         storage.is_recording = ctx.Value("b", False)
         storage.error_state = ctx.Value("b", False)
         storage.session_failed = ctx.Value("b", False)
+        storage.evidence_failed = ctx.Value("b", False)
         storage.estop_request = ctx.Value("b", False)
         storage.quit_requested = ctx.Value("b", False)
         storage.camera_requested = ctx.Value("b", cfg.camera_requested)

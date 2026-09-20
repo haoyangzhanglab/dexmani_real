@@ -142,22 +142,22 @@ def _policy_exit_fault(
     return None
 
 
-def _latch_recorder_transport_fault(
+def _note_recorder_transport_failure(
     shared: RuntimeChannels,
     recorder: RecorderClient | None,
     *,
     context: str,
-) -> bool:
-    """Teleop fails closed on transport loss, not ordinary episode errors."""
-    if recorder is None or not recorder.transport_unavailable:
-        return False
+) -> None:
+    """Report optional evidence loss without terminating teleop control."""
+    if recorder is None or not recorder.transport_unavailable or shared.evidence_failed.value:
+        return
     logger.error(
         "teleop recorder transport unavailable during %s: %s",
         context,
         recorder.last_error or "unknown error",
     )
-    shared.error_state.value = True
-    return True
+    shared.evidence_failed.value = True
+    return
 
 
 def _start_keyboard(shared: RuntimeChannels) -> KeyboardInput | None:
@@ -529,8 +529,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
         controller.clear_reference()
 
     def run_home() -> None:
-        if _latch_recorder_transport_fault(shared, recorder, context="home"):
-            return
+        _note_recorder_transport_failure(shared, recorder, context="home")
         clear_pause_for_home()
         controller.prev_hand_qpos = do_configured_teleop_home(
             shared,
@@ -563,8 +562,10 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             reject_revoked_run()
             if recorder is not None:
                 stop_result = recorder.poll_stop()
-                if _latch_recorder_transport_fault(shared, recorder, context="poll"):
-                    break
+                _note_recorder_transport_failure(shared, recorder, context="poll")
+                if shared.evidence_failed.value:
+                    stop_recording(recorder, recording_active, save=True, shared=shared, reason="evidence_failure")
+                    recording_active = False
                 reached_limit = (
                     (recorder.stop_pending or stop_result.done)
                     and stop_result.reason == "max_frames"
@@ -585,6 +586,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     recording_active = False
                     shared.is_recording.value = False
                     if stop_result.error:
+                        shared.evidence_failed.value = True
                         path_label = f": {stop_result.path}" if stop_result.path else ""
                         print(f"  ⚠ 录制终结失败 ({stop_result.error}){path_label}")
                     elif stop_result.saved:
@@ -744,10 +746,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             reanchor_grid = False
             break_loop = False
             for control in controls:
-                if _latch_recorder_transport_fault(
-                    shared, recorder, context="operator control"
-                ):
-                    break
+                _note_recorder_transport_failure(shared, recorder, context="operator control")
                 if startup_hand_home_pending and control is OperatorCommand.BEGIN:
                     continue
                 if reject_revoked_run() and control is OperatorCommand.BEGIN:
@@ -908,27 +907,21 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         "B: wrist_pose pos=%s wxyz=%s", wrist_pos, wrist_quat_wxyz
                     )
                     gc.collect()
-                    if recorder is not None:
-                        if not recorder.start_episode(
+                    recording_active = False
+                    if (recorder is not None and not shared.evidence_failed.value
+                            and not recorder.stop_pending):
+                        recording_active = recorder.start_episode(
                             task_label=cfg.task_label, operator=cfg.operator
-                        ):
-                            if _latch_recorder_transport_fault(
-                                shared, recorder, context="start"
-                            ):
-                                break_loop = True
-                                break
-                            print("  ⚠ 无法开始录制")
-                            skip_control_tick = True
-                            continue
-                        recording_active = True
+                        )
+                        if not recording_active:
+                            shared.evidence_failed.value = True
+                            _note_recorder_transport_failure(shared, recorder, context="start")
+                    if recording_active:
                         camera_freshness.reset(time.monotonic())
                         shared.is_recording.value = True
-                        begin_message = (
-                            f"\nB: 遥操作+录制开始  episode={recorder.frame_count}"
-                        )
+                        begin_message = f"\nB: 遥操作+录制开始  episode={recorder.frame_count}"
                     else:
-                        shared.is_recording.value = False
-                        begin_message = "\nB: 遥操作开始（未启用录制 capability）"
+                        begin_message = "\nB: 遥操作开始（本次无录制）"
                     kb.drain_signal(OperatorCommand.BEGIN)
                     if not _transition_or_fault(shared, SafetyState.RUNNING, "begin"):
                         stop_recording(
@@ -956,10 +949,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     limiter.reset()
                     skip_control_tick = True
 
-            if _latch_recorder_transport_fault(
-                shared, recorder, context="operator control completion"
-            ):
-                break
+            _note_recorder_transport_failure(shared, recorder, context="operator control completion")
             if break_loop or shared.error_state.value or shared.estop_request.value:
                 break
             if reanchor_grid:
@@ -987,8 +977,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 observation_anchor_monotonic_ns=current_grid_anchor_ns,
             )
             recording_active = tick_result.recording_active
-            if _latch_recorder_transport_fault(shared, recorder, context="control grid"):
-                break
+            _note_recorder_transport_failure(shared, recorder, context="control grid")
             arm_feedback_error_count = tick_result.arm_feedback_error_count
             hand_disconnected_at_s = tick_result.hand_disconnected_at_s
             if reject_revoked_run():
@@ -1005,7 +994,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             stop_recording(
                 recorder, True, save=False, shared=shared, reason="policy_shutdown"
             )
-        _latch_recorder_transport_fault(shared, recorder, context="shutdown")
+        _note_recorder_transport_failure(shared, recorder, context="shutdown")
         kb.stop()
         audio.play("end")
         if not audio.wait_until_idle(timeout_s=_END_AUDIO_GRACE_S):

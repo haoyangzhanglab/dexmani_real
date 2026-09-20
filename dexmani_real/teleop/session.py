@@ -33,6 +33,7 @@ from dexmani_real.runtime.supervisor import (
     run_supervisor,
     shutdown_processes,
     wait_subsystem_ready,
+    start_evidence_services,
 )
 from dexmani_real.runtime.processes import (
     ShutdownReport,
@@ -406,6 +407,7 @@ def run_teleop_experiment(
     specs: list[ProcessSpec] = []
     procs: list[Any] = []
     started_procs: list[Any] = []
+    service_process_names = frozenset({"camera", "recorder"}) if recording_enabled else frozenset()
     shutdown_report: ShutdownReport | None = None
     shared_closed = False
     try:
@@ -432,9 +434,12 @@ def run_teleop_experiment(
         ]
         vr_pairs = [pair for pair in spec_processes if pair[0].ready_name == "vr"]
 
+        evidence_pairs = [pair for pair in dependency_pairs if pair[0].name in service_process_names]
+        dependency_pairs = [pair for pair in dependency_pairs if pair[0].name not in service_process_names]
         dependency_procs = [process for _spec, process in dependency_pairs]
-        start_processes(dependency_procs)
-        started_procs.extend(dependency_procs)
+        for process in dependency_procs:
+            start_processes([process])
+            started_procs.append(process)
         if not wait_subsystem_ready(
             shared,
             dependency_pairs,
@@ -502,12 +507,16 @@ def run_teleop_experiment(
                 return 1
             print(f"  VR connected", flush=True)
 
+        evidence_ready = start_evidence_services(
+            shared, evidence_pairs, timeouts, critical_processes=list(started_procs),
+            started_processes=started_procs,
+        )
         print_health_summary(shared)
         health_issues = _preflight_health_issues(
             shared,
             runtime,
             hand_enabled=hand_enabled,
-            recording_enabled=recording_enabled,
+            recording_enabled=False,  # evidence health is supervised separately
         )
         if health_issues:
             for issue in health_issues:
@@ -524,9 +533,11 @@ def run_teleop_experiment(
 
         require_transition(shared, SafetyState.ARMED)
 
-        begin_label = "teleop+record" if recording_enabled else "teleop"
+        if not evidence_ready:
+            print("  Evidence unavailable; teleop control remains available", flush=True)
+        begin_label = "teleop+record" if recording_enabled and evidence_ready else "teleop"
         print(
-            f"\nAll subsystems ready — safety=ARMED({int(SafetyState.ARMED)})\n"
+            f"\nControl subsystems ready — safety=ARMED({int(SafetyState.ARMED)})\n"
             f"Controls: B={begin_label}  C=pause  S=stop  D=discard  H=home  Q=quit  ESC=estop\n"
         )
 
@@ -541,9 +552,7 @@ def run_teleop_experiment(
         # Evidence roles: their death or stalled heartbeat fails the session
         # result without claiming a physical fault or terminating teleop
         # control (TASKBOOK T4/T5). They are supervised whatever else happens.
-        service_process_names = (
-            frozenset({"camera", "recorder"}) if recording_enabled else frozenset()
-        )
+
 
         start_time = time.monotonic()
         exit_reason, normal_exit = run_supervisor(
@@ -575,6 +584,7 @@ def run_teleop_experiment(
             # An evidence failure never ends control, but it does make the
             # session result non-zero at the natural end (TASKBOOK T5).
             and not bool(shared.session_failed.value)
+            and not bool(shared.evidence_failed.value)
             and int(shared.safety_state.value) == int(SafetyState.DISARMED)
         )
         if normal_exit and not clean_exit:

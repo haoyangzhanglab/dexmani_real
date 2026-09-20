@@ -287,9 +287,11 @@ rollouts/<policy>/<task>/<experiment>/session_*/
 不生成异步 prediction trace sidecar。
 
 每个真正 begin 的 trial 结束时恰好计一次（与保存 episode 数独立）；录制（evidence）失败
-只在会话自然结束时使结果非零，不会提前终止 RUNNING；START 被拒时该 trial 无录制继续运行，
-目录名始终按 trial 序号命名。Session End 同时输出 control reason、recording status 与
-cleanup status 三项事实。
+会使会话最终结果非零，但不会结束当前 trial 或取消剩余 trials。证据服务不可用、START
+失败或旧录制仍在收尾时，有效 B 可以启动不录制 trial；同一 recorder 始终只有一个事务。
+录制容量耗尽只保存已采前缀，控制继续；有效 raw 前缀不代表覆盖完整 trial。迟到保存结果
+按原录制 trial 归属计数，目录名按 trial 序号命名。Session End 分别输出 control reason、
+recording status 和 cleanup status；资源已确认释放与会话总体成功是独立事实。
 
 Policy deployment 使用与 teleoperation / replay 相同的 runtime safety 与 command publication infrastructure。命令经单一 owner 的软投影（2π canonicalization、操作关节界限、软命令步长一次裁剪）后进入有界有序命令 FIFO；FIFO 满时是 non-blocking 可恢复背压，producer 保留同一 candidate 按主循环节奏重试。robot worker 在硬件边界只保留硬限位等最终检查，不重复拒绝同一软阈值。普通 IK 无解或 workspace miss 只丢弃未发布的 chunk 后缀，并在同一 trial 内重新观测（已提交前缀与命令连续性参考保留）；模型/合同违规与硬件故障才会结束 rollout。未执行动作不会被视作已完成的物理进度。
 

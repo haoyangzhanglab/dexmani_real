@@ -12,7 +12,6 @@ class ExitReason(IntEnum):
     STICKY_FAULT = 3
     WORKER_DEATH = 4
     HEARTBEAT_TIMEOUT = 5
-    # A non-FAULT session/service failure: an owning workflow has latched
-    # session_failed, or a configured service process died/timed out.
-    # Supervision uses the verified non-FAULT shutdown path.
+    # Terminal policy/session failure, distinct from optional evidence failure.
     SERVICE_FAILURE = 6
+    EVIDENCE_FAILURE = 7

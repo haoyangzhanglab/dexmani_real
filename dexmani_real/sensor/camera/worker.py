@@ -225,7 +225,7 @@ def camera_loop(
     ``latch_runtime_fault`` distinguishes policy-input camera (default, a
     control-critical failure) from a camera started only for recording
     evidence: when ``False``, persistent read/publication failures mark
-    ``session_failed`` instead of the physical ``error_state`` fault latch.
+    ``evidence_failed`` instead of the physical ``error_state`` fault latch.
     """
     _logger = get_logger("camera_loop")
     if not isinstance(config, CameraLoopConfig):
@@ -305,7 +305,7 @@ def camera_loop(
                     if latch_runtime_fault:
                         shared.error_state.value = True
                     else:
-                        shared.session_failed.value = True
+                        shared.evidence_failed.value = True
                     raise RuntimeError(
                         "camera frame reads failed for "
                         f"{now_s - read_failure_started_s:.3f}s"
@@ -335,7 +335,7 @@ def camera_loop(
                 if latch_runtime_fault:
                     shared.error_state.value = True
                 else:
-                    shared.session_failed.value = True
+                    shared.evidence_failed.value = True
                 raise RuntimeError(
                     "camera source stalled (no new valid frame) for "
                     f"{now_s - last_new_source_s:.3f}s"
@@ -411,7 +411,7 @@ def camera_loop(
                             "camera_loop: frame publication failed; latching runtime fault"
                         )
                     else:
-                        shared.session_failed.value = True
+                        shared.evidence_failed.value = True
                         _logger.exception(
                             "camera_loop: frame publication failed; failing session"
                         )

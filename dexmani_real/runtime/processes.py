@@ -72,7 +72,7 @@ def _finalize_shutdown_state(
     """Latch post-join failures, or disarm only after a verified clean stop.
 
     A confirmed-stopped ``service_process_names`` member's nonzero/escalated
-    exit fails the session (``session_failed``) without claiming a physical
+    exit fails the session (``evidence_failed``) without claiming a physical
     fault. Any other (critical) process failing the same way remains FAULT.
     This classification only applies after process termination is verified —
     it never weakens the unverified-shutdown fail-closed path above.
@@ -107,9 +107,9 @@ def _finalize_shutdown_state(
         return
 
     if service_worker_failed:
-        session_failed_field = getattr(shared, "session_failed", None)
-        if session_failed_field is not None:
-            session_failed_field.value = True
+        evidence_failed_field = getattr(shared, "evidence_failed", None)
+        if evidence_failed_field is not None:
+            evidence_failed_field.value = True
 
     if disarm_if_clean and safety_state is not None:
         if not transition(shared, SafetyState.DISARMED):

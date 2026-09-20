@@ -7,7 +7,7 @@ Covers the acceptance matrix:
 * V16 trials and saved episodes are independent counts, a trial counts
   exactly once, directory names follow the trial sequence (a failed save
   never reuses a name), and an evidence-role service failure during RUNNING
-  defers to the natural end of control instead of terminating it.
+  remains evidence-only across subsequent ARMED and RUNNING trials.
 
 The runner is exercised through its real methods against a fake recorder and
 a fake shared-state object wired to the real safety primitives; no hardware,
@@ -85,6 +85,7 @@ def _fake_shared(*, safety_state: int = int(SafetyState.ARMED)):
         is_recording=SimpleNamespace(value=False),
         quit_requested=SimpleNamespace(value=False),
         session_failed=SimpleNamespace(value=False),
+        evidence_failed=SimpleNamespace(value=False),
         error_state=SimpleNamespace(value=False),
         estop_request=SimpleNamespace(value=False),
         is_running=SimpleNamespace(value=True),
@@ -125,7 +126,8 @@ class _RunnerTest(unittest.TestCase):
         runner._evidence_logged_this_trial = False
         runner._evidence_warn = ThrottledWarner(interval_s=2.0)
         runner._pending_stop_reason = None
-        runner._recording_outcome_consumed = True
+        runner._recording_trial_id = 1 if recorder is not None and run_started_ns is not None else None
+        runner._recording_outcome_consumed = runner._recording_trial_id is None
         runner._recorder_start_wait_ms = 0.0
         runner.run_started_ns = run_started_ns
         runner.run_generation = None
@@ -195,9 +197,6 @@ class TrialCountingTest(_RunnerTest):
     def test_saved_count_is_independent_of_trial_count(self):
         recorder = _FakeRecorderClient()
         runner = self._runner(recorder=recorder, run_started_ns=1)
-        recorder._result = RecorderStopResult(
-            done=True, saved=False, error=None, path=None, frame_count=0, reason="d"
-        )
         runner._finish_episode("stop", stop_reason="operator", aborted=False)
         runner._poll_recorder()
         self.assertEqual(runner.completed_trials, 1)
@@ -218,6 +217,8 @@ class RecordingOutcomeOwnershipTest(_RunnerTest):
         runner = self._runner(recorder=recorder, run_started_ns=1)
         recorder.is_recording = False
         recorder.stop_pending = False
+        runner._recording_trial_id = None
+        runner._recording_outcome_consumed = True
         runner._finish_episode("stop", stop_reason="operator", aborted=False)
         # Nothing was recorded, so the shutdown path must not later consume an
         # older verdict for this trial (double-counted saves / wrong trial id).
@@ -304,7 +305,7 @@ class EvidenceIsolationTest(_RunnerTest):
         self.assertEqual(recorder.start_calls, ["episode_001"])
         self.assertIsNotNone(runner.run_started_ns)
 
-    def test_directory_names_follow_trial_sequence_not_saves(self):
+    def test_evidence_failure_keeps_next_trial_unrecorded(self):
         shared = _fake_shared(safety_state=int(SafetyState.ARMED))
         recorder = _FakeRecorderClient(start_ok=False, last_error="nope")
         runner = self._runner(shared=shared, recorder=recorder)
@@ -316,7 +317,8 @@ class EvidenceIsolationTest(_RunnerTest):
         shared.safety_state.value = int(SafetyState.ARMED)
         runner.run_started_ns = None
         runner._start_requested_episode()
-        self.assertEqual(recorder.start_calls, ["episode_001", "episode_002"])
+        self.assertEqual(recorder.start_calls, ["episode_001"])
+        self.assertIsNotNone(runner.run_started_ns)  # failed evidence never gates trial 2
 
 
 @unittest.skipIf(_IMPORT_ERROR is not None, f"dependencies unavailable: {_IMPORT_ERROR}")
@@ -374,6 +376,7 @@ class TerminalResultConsumptionTest(unittest.TestCase):
             record_result_q = _EmptyQueue()
             is_ready = staticmethod(lambda name: True)
             is_running = SimpleNamespace(value=True)
+            evidence_failed = SimpleNamespace(value=False)
             record_sample_ring = SimpleNamespace(latest_sequence=0, maxlen=4)
             recorder_consumed_sequence = SimpleNamespace(value=0)
             set_heartbeat = staticmethod(lambda *a: None)
@@ -428,26 +431,26 @@ class SupervisorEvidenceDeferralTest(unittest.TestCase):
         thread.start()
         return thread, result
 
-    def test_service_failure_defers_until_control_ends_naturally(self):
+    def test_service_failure_survives_armed_and_next_trial_until_q(self):
+        from unittest.mock import patch
         shared = _fake_shared(safety_state=int(SafetyState.RUNNING))
-        shared.run_started_monotonic_ns.value = time.monotonic_ns()
-        shared.session_failed.value = True  # evidence latch during RUNNING
-        thread, result = self._run_supervisor_thread(shared)
-        try:
-            time.sleep(0.2)
-            self.assertTrue(thread.is_alive(), "supervisor must not exit during RUNNING")
-            # Control ends naturally: motion fenced, operator quit observed.
-            shared.safety_state.value = int(SafetyState.ARMED)
-            shared.quit_requested.value = True
-            thread.join(timeout=5.0)
-            self.assertFalse(thread.is_alive())
-            exit_reason, normal_exit = result["outcome"]
-            self.assertEqual(exit_reason, "session/service failure")
-            self.assertTrue(normal_exit)
-            self.assertTrue(bool(shared.session_failed.value))
-        finally:
-            shared.is_running.value = False
-            thread.join(timeout=5.0)
+        shared.evidence_failed.value = True
+        states = iter((SafetyState.ARMED, SafetyState.RUNNING, SafetyState.ARMED))
+        visited = []
+        def advance(_delay):
+            state = next(states)
+            visited.append(state)
+            shared.safety_state.value = int(state)
+            if len(visited) == 3:
+                shared.quit_requested.value = True
+        dead = SimpleNamespace(name="recorder", exitcode=1)
+        with patch("dexmani_real.runtime.supervisor.time.sleep", side_effect=advance):
+            reason, normal = run_supervisor(shared, [dead], heartbeat_timeouts_s={},
+                service_process_names={"recorder"})
+        self.assertEqual(len(visited), 3)
+        self.assertEqual(reason, "shutdown requested")
+        self.assertTrue(normal)
+        self.assertFalse(shared.session_failed.value)
 
     def test_estop_still_wins_immediately(self):
         shared = _fake_shared(safety_state=int(SafetyState.RUNNING))
@@ -464,3 +467,143 @@ class SupervisorEvidenceDeferralTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RecordingAcrossTrialsTest(_RunnerTest):
+    def test_capacity_saves_once_without_ending_trial(self):
+        recorder = _FakeRecorderClient()
+        runner = self._runner(recorder=recorder, run_started_ns=1)
+        runner._recording_trial_id = 1
+        runner._recording_outcome_consumed = False
+        recorder._result = RecorderStopResult(done=True, saved=True, reason="max_frames", frame_count=2)
+        self.assertTrue(runner._poll_recorder())
+        self.assertEqual(runner.run_started_ns, 1)
+        self.assertEqual(runner.completed_trials, 0)
+        self.assertEqual(runner.saved_episodes, 1)
+        runner._poll_recorder()
+        self.assertEqual(runner.saved_episodes, 1)
+
+    def test_pending_old_result_keeps_identity_through_unrecorded_trial(self):
+        from unittest.mock import patch
+        recorder = _FakeRecorderClient()
+        recorder.stop_pending = True
+        runner = self._runner(recorder=recorder, num_trials=3)
+        runner.completed_trials = 1
+        runner._recording_trial_id = 1
+        runner._recording_outcome_consumed = False
+        runner._pending_stop_reason = "operator"
+        runner.shared.is_recording.value = True
+        runner.shared.start_request.value = True
+        runner._start_requested_episode()
+        self.assertIsNotNone(runner.run_started_ns)
+        self.assertEqual(recorder.start_calls, [])
+        self.assertTrue(runner.shared.is_recording.value)
+        runner._finish_episode("timeout", stop_reason="timeout")
+        self.assertEqual(runner._pending_stop_reason, "operator")
+        self.assertFalse(runner._recording_outcome_consumed)
+        recorder._result = RecorderStopResult(done=True, saved=True, reason="operator", frame_count=3)
+        with patch("builtins.print") as output:
+            runner._poll_recorder()
+        self.assertIn("Trial 1/3", str(output.call_args_list))
+        self.assertEqual(runner.saved_episodes, 1)
+        self.assertEqual(runner.completed_trials, 2)
+
+    def test_all_start_outcomes_recheck_stop_epoch_and_physical_state(self):
+        from unittest.mock import patch
+        from dexmani_real.runtime.safety import request_policy_stop
+        for started in (False, True):
+            for change in ("generation", "S", "Q", "physical"):
+                with self.subTest(started=started, change=change):
+                    recorder = _FakeRecorderClient(start_ok=started)
+                    runner = self._runner(recorder=recorder)
+                    runner.shared.start_request.value = True
+                    original = recorder.start_episode
+                    def prepare(**kwargs):
+                        if change == "generation":
+                            runner.shared.run_generation.value += 1
+                        elif change == "S":
+                            request_policy_stop(runner.shared)
+                        elif change == "Q":
+                            runner.shared.quit_requested.value = True
+                        return original(**kwargs)
+                    recorder.start_episode = prepare
+                    with patch("dexmani_real.deployment.executor._physical_start_pose_rejection",
+                               side_effect=[None, "moved" if change == "physical" else None]):
+                        runner._start_requested_episode()
+                    self.assertIsNone(runner.run_started_ns)
+                    self.assertEqual(runner.completed_trials, 0)
+
+    def test_evidence_and_quit_priority(self):
+        from dexmani_real.runtime.supervisor import supervisor_exit_reason
+        from dexmani_real.runtime.status import ExitReason
+        shared = _fake_shared()
+        shared.quit_requested.value = True
+        dead = SimpleNamespace(name="recorder", exitcode=1)
+        self.assertEqual(supervisor_exit_reason(shared, [dead], {}, {},
+            service_process_names={"recorder"}), ExitReason.EXPLICIT_QUIT)
+
+class EvidenceStartupTest(unittest.TestCase):
+    def test_optional_failure_keeps_handles_and_required_failure_is_terminal(self):
+        from unittest.mock import patch
+        from dexmani_real.runtime.processes import ProcessSpec
+        from dexmani_real.runtime.supervisor import start_evidence_services
+        for critical_alive in (True, False):
+            shared = _fake_shared()
+            shared.is_ready = lambda name: False
+            critical = SimpleNamespace(name="arm", is_alive=lambda: critical_alive)
+            optional = SimpleNamespace(name="recorder", pid=None, is_alive=lambda: False)
+            def start():
+                optional.pid = 123
+            optional.start = start
+            started = [critical]
+            spec = ProcessSpec("recorder", lambda: None, (), ready_name="recorder")
+            if critical_alive:
+                self.assertFalse(start_evidence_services(shared, [(spec, optional)], {"recorder": 1.},
+                    critical_processes=[critical], started_processes=started))
+            else:
+                with self.assertRaisesRegex(RuntimeError, "critical startup"):
+                    start_evidence_services(shared, [(spec, optional)], {"recorder": 1.},
+                        critical_processes=[critical], started_processes=started)
+            self.assertIn(optional, started)
+            self.assertTrue(shared.evidence_failed.value)
+            self.assertFalse(shared.quit_requested.value)
+
+class SessionResultFactsTest(unittest.TestCase):
+    def test_evidence_policy_and_cleanup_are_independent(self):
+        from dexmani_real.deployment.lifecycle import _session_result_facts
+        from dexmani_real.runtime.processes import ShutdownReport, ProcessExit
+        for evidence, policy, closed, expected_record, expected_cleanup in (
+            (True, False, True, "failed", "clean"),
+            (False, True, True, "no evidence failure observed", "clean"),
+            (False, False, False, "no evidence failure observed", "incomplete-or-failed"),
+        ):
+            shared = _fake_shared(safety_state=int(SafetyState.DISARMED))
+            shared.evidence_failed.value, shared.session_failed.value = evidence, policy
+            report = ShutdownReport((ProcessExit("recorder", 0, "graceful"),), closed)
+            self.assertEqual(_session_result_facts(shared, report, recording_enabled=True,
+                normal_exit=True), (expected_record, expected_cleanup, False))
+
+class VerifiedEvidenceCleanupTest(unittest.TestCase):
+    def test_unconfirmed_process_never_releases_ipc(self):
+        from dexmani_real.runtime.processes import shutdown_processes_verified
+        from unittest.mock import Mock
+        shared = _fake_shared()
+        shared.close = Mock(return_value=True)
+        process = SimpleNamespace(name="recorder", exitcode=None, is_alive=lambda: True,
+            join=lambda **kw: None, terminate=lambda: None, kill=lambda: None)
+        with self.assertRaisesRegex(RuntimeError, "confirmed stopped"):
+            shutdown_processes_verified(shared, [process], graceful_timeout_s=0,
+                terminate_timeout_s=0, kill_timeout_s=0, service_process_names={"recorder"})
+        shared.close.assert_not_called()
+
+    def test_confirmed_abnormal_evidence_exit_can_release_resources(self):
+        from dexmani_real.runtime.processes import shutdown_processes_verified
+        shared = _fake_shared()
+        shared.close = lambda: True
+        process = SimpleNamespace(name="recorder", exitcode=1, is_alive=lambda: False,
+            join=lambda **kw: None)
+        report = shutdown_processes_verified(shared, [process], graceful_timeout_s=0,
+            service_process_names={"recorder"}, disarm_if_clean=True)
+        self.assertTrue(report.shared_closed)
+        self.assertTrue(shared.evidence_failed.value)
+        self.assertFalse(shared.error_state.value)
+        self.assertFalse(shared.session_failed.value)

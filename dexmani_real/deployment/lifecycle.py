@@ -55,6 +55,7 @@ from dexmani_real.runtime.supervisor import (
     run_supervisor,
     shutdown_processes,
     wait_subsystem_ready,
+    start_evidence_services,
 )
 from dexmani_real.sensor.camera.worker import CameraLoopConfig, camera_loop
 from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig, pointcloud_loop
@@ -78,6 +79,25 @@ def _requires_pointcloud(policy_spec: Any) -> bool:
 def _requires_camera(policy_spec: Any) -> bool:
     requested = _observation_field_names(policy_spec)
     return "point_cloud" in requested or "rgb" in requested
+
+
+def _session_result_facts(shared, report, *, recording_enabled: bool, normal_exit: bool):
+    """Compute independent evidence, cleanup and overall 0/1 outcome facts."""
+    cleanup_ok = report is not None and report.shared_closed and all(
+        item.exitcode is not None for item in report.exits
+    )
+    recording_status = (
+        "failed" if shared.evidence_failed.value else
+        "no evidence failure observed" if recording_enabled else "not recording"
+    )
+    clean_exit = bool(
+        cleanup_ok and normal_exit
+        and all(item.exitcode == 0 and item.escalation == "graceful" for item in report.exits)
+        and not shared.error_state.value and not shared.estop_request.value
+        and not shared.session_failed.value and not shared.evidence_failed.value
+        and int(shared.safety_state.value) == int(SafetyState.DISARMED)
+    )
+    return recording_status, "clean" if cleanup_ok else "incomplete-or-failed", clean_exit
 
 
 def _service_process_names(
@@ -538,44 +558,18 @@ def run_policy_deployment(
             if spec.ready_name is not None:
                 print(f"  {spec.ready_name}: ready", flush=True)
 
-        for _spec, process in service_pairs:
-            start_processes([process])
-            started_procs.append(process)
-        if service_pairs and not wait_subsystem_ready(
-            shared,
-            service_pairs,
-            timeouts,
-            monitored_processes=started_procs,
-        ):
-            # An already-ready critical worker dying (or error_state becoming
-            # true) during the service readiness wait is still a critical
-            # failure, never a service failure. Motion never started (still
-            # DISARMED), so a pure service failure needs no FAULT transition.
-            if bool(shared.error_state.value) or any(
-                not process.is_alive() for process in critical_procs
-            ):
-                shared.error_state.value = True
-                require_transition(shared, SafetyState.FAULT)
-            else:
-                shared.session_failed.value = True
-            shutdown_report = shutdown_processes(
-                shared,
-                started_procs,
-                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-                disarm_if_clean=not bool(shared.error_state.value),
-                service_process_names=service_process_names,
-            )
-            return 1
-
-        for spec, _process in service_pairs:
-            if spec.ready_name is not None:
-                print(f"  {spec.ready_name}: ready", flush=True)
+        evidence_ready = start_evidence_services(
+            shared, service_pairs, timeouts, critical_processes=critical_procs,
+            started_processes=started_procs,
+        )
 
         require_transition(shared, SafetyState.ARMED)
         print(
-            f"\nAll subsystems ready — safety=ARMED({int(SafetyState.ARMED)})",
+            f"\nControl subsystems ready — safety=ARMED({int(SafetyState.ARMED)})",
             flush=True,
         )
+        if not evidence_ready:
+            print("  Evidence unavailable; trials can run without recording", flush=True)
         home_planner = build_home_planner(runtime) if execute else None
         home_status = "return hand + arm home before B" if home_planner else "disabled"
         print(
@@ -630,7 +624,7 @@ def run_policy_deployment(
             shared, started_procs
         ):
             logger.error("rollout recording did not finalize before shutdown")
-            shared.session_failed.value = True
+            shared.evidence_failed.value = True
 
         if operator_stop is not None:
             operator_stop.set()
@@ -650,37 +644,17 @@ def run_policy_deployment(
             disarm_if_clean=normal_exit,
             service_process_names=service_process_names,
         )
-        worker_exit_clean = all(
-            item.exitcode == 0 and item.escalation == "graceful"
-            for item in shutdown_report.exits
-        )
-        clean_exit = (
-            normal_exit
-            and worker_exit_clean
-            and shutdown_report.shared_closed
-            and not bool(shared.error_state.value)
-            and not bool(shared.estop_request.value)
-            and not bool(shared.session_failed.value)
-            and int(shared.safety_state.value) == int(SafetyState.DISARMED)
+        recording_status, cleanup_status, clean_exit = _session_result_facts(
+            shared, shutdown_report, recording_enabled=recording_config is not None,
+            normal_exit=normal_exit,
         )
         safety_name = SafetyState(int(shared.safety_state.value)).name
-        # Three simple outcome facts, never conflated: why control ended,
-        # whether the evidence result failed the session, and whether cleanup
-        # was verified. A system timeout/stop is never reported as success.
-        if bool(shared.error_state.value) or bool(shared.estop_request.value):
-            recording_status = "unknown (physical fault path)"
-        elif bool(shared.session_failed.value):
-            recording_status = "failed"
-        elif recording_config is None:
-            recording_status = "not recording"
-        else:
-            recording_status = "no evidence failure observed"
         print(f"\n── Session End ──")
         print(f"  control_reason  = {exit_reason}")
         print(f"  recording_status= {recording_status}")
         print(
             "  cleanup_status  = "
-            + ("clean" if clean_exit else "incomplete-or-failed")
+            + cleanup_status
         )
         print(
             f"  safety={safety_name}  supervisor_normal={normal_exit}  "
