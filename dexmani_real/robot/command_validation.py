@@ -1,30 +1,28 @@
-"""Final physical target guards for arm and hand hardware workers."""
+"""Final physical target guards for arm and hand hardware workers.
+
+Workers own only the HARD boundary at the SDK fence: finiteness and the
+physical joint limits. The soft command-jump bound is owned once by
+``control/projection.py`` at production time; a worker never re-rejects the
+same soft threshold (no duplicate validation of one constraint).
+"""
 
 from __future__ import annotations
 
 import numpy as np
 
-ARM_COMMAND_JUMP_REJECTION = "command jump limit violation"
-
 
 def check_worker_arm_target(
     target_qpos_rad: np.ndarray,
     *,
-    previous_target_qpos_rad: np.ndarray,
     joint_limit_lower_rad: np.ndarray,
     joint_limit_upper_rad: np.ndarray,
-    max_command_jump_rad: float,
 ) -> str | None:
-    """Return why an arm target cannot cross the SDK boundary."""
+    """Return why an arm target cannot cross the SDK boundary (hard limits)."""
     target = np.asarray(target_qpos_rad, dtype=np.float64)
     if not np.all(np.isfinite(target)):
         return "non-finite target"
     if np.any(target < joint_limit_lower_rad) or np.any(target > joint_limit_upper_rad):
         return "joint limit violation"
-    if np.any(
-        np.abs(target - previous_target_qpos_rad) > float(max_command_jump_rad)
-    ):
-        return ARM_COMMAND_JUMP_REJECTION
     return None
 
 

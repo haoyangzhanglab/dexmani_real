@@ -505,7 +505,7 @@ class ArmWorkerConsumptionTest(_TransportTest):
     def _make_state(self, consumer):
         from dexmani_real.config.defaults import ArmParams
         from dexmani_real.ipc.channels import new_frame
-        from dexmani_real.robot.arm_worker import _CmdState, _LoopState
+        from dexmani_real.robot.arm_worker import _LoopState
 
         arm = _FakeArmSdk()
         st = _LoopState(
@@ -513,8 +513,6 @@ class ArmWorkerConsumptionTest(_TransportTest):
             arm=arm,
             frame=new_frame(ARM_STATE_DTYPE),
             last_target=np.zeros(7, dtype=np.float64),
-            last_measured_qpos=np.zeros(7, dtype=np.float64),
-            last_command_generation=_GEN,
             consumer=consumer,
         )
         return st, arm
@@ -554,27 +552,44 @@ class ArmWorkerConsumptionTest(_TransportTest):
         self.assertEqual(arm.servo_calls, [])
         self.assertEqual(int(self.shared.arm_cmd_consumed_sequence.value), 1)
 
-    def test_jump_rejection_pauses_epoch_without_sdk_send(self):
+    def test_worker_does_not_recheck_the_soft_jump_bound(self):
+        """V09: the producer-owned soft jump bound is never re-rejected here."""
         from dexmani_real.robot.arm_worker import _consume_one_arm_command
 
         consumer = CommandStreamConsumer(
             self.shared, self.shared.arm_cmd_consumed_sequence
         )
         st, arm = self._make_state(consumer)
-        # Inside joint limits but beyond max_servo_command_jump_rad (0.349)
-        # from the zero reference.
+        # Inside hard joint limits but beyond max_servo_command_jump_rad
+        # (0.349) from the worker's reference: the soft bound belongs to the
+        # producer projection, so the worker still delivers it.
         _candidate, result = _publish(self.shared, 104, arm=0.5)
         self.assertTrue(result.published, result.reason)
         generation_before = int(self.shared.run_generation.value)
         _consume_one_arm_command(st, self.shared, _GEN)
+        self.assertEqual(len(arm.servo_calls), 1)
+        self.assertAlmostEqual(float(arm.servo_calls[0][0]), 0.5)
+        self.assertEqual(
+            int(self.shared.run_generation.value), generation_before
+        )
+        self.assertEqual(int(self.shared.arm_cmd_consumed_sequence.value), 1)
+
+    def test_hard_joint_limit_violation_fails_fast(self):
+        """The hard physical boundary at the SDK fence is never weakened."""
+        from dexmani_real.robot.arm_worker import _consume_one_arm_command
+
+        consumer = CommandStreamConsumer(
+            self.shared, self.shared.arm_cmd_consumed_sequence
+        )
+        st, arm = self._make_state(consumer)
+        # Joint 2 upper limit is ~2.094 rad: 2.5 violates the hard box.
+        _candidate, result = _publish(self.shared, 105, arm=2.5)
+        self.assertTrue(result.published, result.reason)
+        with self.assertRaises(RuntimeError):
+            _consume_one_arm_command(st, self.shared, _GEN)
         self.assertEqual(arm.servo_calls, [])
-        # The rejection revoked motion and batch-invalidated the epoch.
-        self.assertEqual(
-            int(self.shared.run_generation.value), generation_before + 1
-        )
-        self.assertEqual(
-            int(self.shared.safety_state.value), int(SafetyState.ARMED)
-        )
+        # The record was not accepted: the cursor holds before the bad record.
+        self.assertEqual(int(self.shared.arm_cmd_consumed_sequence.value), 0)
 
 
 class _FakeSendStatus:

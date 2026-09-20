@@ -220,27 +220,6 @@ def cancel_coupled_command_if_current(
         return True
 
 
-def reject_coupled_command_if_current(
-    shared: Any,
-    *,
-    command: CommittedCommand,
-) -> bool:
-    """Pause only the still-executable rejected command's epoch.
-
-    Ownership verification and revocation share one critical section. Unlike
-    ACK cancellation, rejection establishes an ARMED lifecycle boundary too.
-    """
-    with shared.motion_lock:
-        if not (
-            _committed_command_is_current_locked(shared, command)
-            and shared.is_running.value
-            and not shared.error_state.value
-            and not shared.estop_request.value
-        ):
-            return False
-        return _revoke_motion_locked(shared, SafetyState.ARMED) is not None
-
-
 def read_motion_permit(shared: Any) -> MotionPermit:
     """Read state and generation as one indivisible worker/send permit."""
     with shared.motion_lock:

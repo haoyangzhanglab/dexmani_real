@@ -25,13 +25,14 @@ class PolicyStats:
     ik_rejection_count: int = 0
     rejection_reasons: dict[str, int] = field(default_factory=dict)
 
-    def log_rejection(self, reason: str) -> None:
-        """One visible line per rejected policy step; repeats carry their count."""
-        count = self.rejection_reasons.get(reason, 0) + 1
-        self.rejection_reasons[reason] = count
-        logger.warning(
-            "[REJECT] policy step reason=%s count=%d", reason, count
-        )
+    def count_rejection(self, reason: str) -> None:
+        """Count one rejected policy step without a second visible line.
+
+        The rejection itself is already visible exactly once: a recoverable
+        miss prints the chunk-boundary ``[DROP]`` line, and a contract
+        violation logs critically. Reasons are summarized at episode end.
+        """
+        self.rejection_reasons[reason] = self.rejection_reasons.get(reason, 0) + 1
 
     def log_summary(self) -> None:
         """Report episode counts without presenting old timings as live metrics."""

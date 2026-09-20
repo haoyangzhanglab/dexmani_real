@@ -19,6 +19,7 @@ from dexmani_real.control.publication import (
     publish_command,
     wait_command_accepted,
 )
+from dexmani_real.control.projection import project_arm_command
 from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
 from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
@@ -70,6 +71,9 @@ class _TeleopCommandLimits:
     arm_joint_lower_rad: np.ndarray
     arm_joint_upper_rad: np.ndarray
     teleop_arm_max_delta_rad_per_tick: np.ndarray | None
+    # Physical command-continuity bound owned by control/projection.py; the
+    # teleop delta above is human-smoothing config, not this bound.
+    arm_max_servo_command_jump_rad: float
     hand_home_qpos_rad: np.ndarray
     hand_command_lower_rad: np.ndarray
     hand_command_upper_rad: np.ndarray
@@ -102,6 +106,9 @@ class _TeleopCommandLimits:
             arm_joint_lower_rad=arm_lower.copy(),
             arm_joint_upper_rad=arm_upper.copy(),
             teleop_arm_max_delta_rad_per_tick=max_delta,
+            arm_max_servo_command_jump_rad=float(
+                config.runtime.arm.max_servo_command_jump_rad
+            ),
             hand_home_qpos_rad=np.deg2rad(
                 np.asarray(config.runtime.hand.home_qpos_deg, dtype=np.float64)
             ),
@@ -1073,6 +1080,21 @@ def _publish_solved_action(
             failure_context="rejected-action",
             frame_status=FRAME_SAFETY_REJECT,
         )
+    # Single-owner soft projection: canonicalize and bound the command jump
+    # exactly once against the committed continuity reference. The worker at
+    # the SDK boundary keeps only the hard joint-limit validation.
+    try:
+        arm_cmd = project_arm_command(
+            arm_cmd,
+            controller.prev_qpos_cmd,
+            joint_lower_rad=command_limits.arm_joint_lower_rad,
+            joint_upper_rad=command_limits.arm_joint_upper_rad,
+            max_command_jump_rad=command_limits.arm_max_servo_command_jump_rad,
+        )
+    except ValueError as exc:
+        logger.error("teleop_loop: arm projection invariant failed: %s", exc)
+        shared.error_state.value = True
+        return False
 
     prepared = _prepare_joint_candidate(
         shared,

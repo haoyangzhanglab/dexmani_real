@@ -18,6 +18,10 @@ from dexmani_real.control.jog import (
     compute_cartesian_jog_delta,
     limit_cartesian_pose_lead,
 )
+from dexmani_real.control.projection import (
+    ARM_COMMAND_JUMP_REJECTION,
+    validate_arm_command,
+)
 from dexmani_real.control.publication import (
     PUBLISH_REASON_FIFO_FULL,
     PublishResult,
@@ -30,10 +34,6 @@ from dexmani_real.control.safety_gate import SafetyGate
 from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
 from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.pose import quat_multiply
-from dexmani_real.robot.command_validation import (
-    ARM_COMMAND_JUMP_REJECTION,
-    check_worker_arm_target,
-)
 from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.utils.feedback import validate_arm_feedback
@@ -429,11 +429,13 @@ def run_calibration_motion_tick(
     q_cmd = planner.ik_mgr.nearest_equivalent_qpos(
         np.asarray(ik_result.qpos, dtype=np.float64), state.previous_command
     )
-    issue = check_worker_arm_target(
+    # Producer-owned reject-style validation: an oversized jog step is
+    # rejected here once; the worker keeps only the hard SDK-boundary checks.
+    issue = validate_arm_command(
         q_cmd,
-        previous_target_qpos_rad=state.previous_command,
-        joint_limit_lower_rad=np.asarray(runtime.arm.joint_limit_lower),
-        joint_limit_upper_rad=np.asarray(runtime.arm.joint_limit_upper),
+        state.previous_command,
+        joint_lower_rad=np.asarray(runtime.arm.joint_limit_lower),
+        joint_upper_rad=np.asarray(runtime.arm.joint_limit_upper),
         max_command_jump_rad=runtime.arm.max_servo_command_jump_rad,
     )
     if issue is not None:

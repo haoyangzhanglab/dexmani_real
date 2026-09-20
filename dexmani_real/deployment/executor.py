@@ -34,6 +34,7 @@ from dexmani_real.control.publication import (
     publish_command,
     read_command_feedback,
 )
+from dexmani_real.control.projection import project_arm_command, project_hand_command
 from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
 from dexmani_real.deployment.config import (
     FingertipAssemblerConfig,
@@ -66,11 +67,7 @@ from dexmani_real.planning import (
 )
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
-from dexmani_real.planning.paths import (
-    WORKSPACE_BOUNDS_TOLERANCE_M,
-    interpolate_waypoints,
-    wrap_nearest_equivalent,
-)
+from dexmani_real.planning.paths import WORKSPACE_BOUNDS_TOLERANCE_M
 from dexmani_real.recording.client import (
     RecorderClient,
     RecorderStopResult,
@@ -100,7 +97,6 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-_POLICY_WORKSPACE_INTERPOLATION_MAX_STEP_RAD = 0.02
 _RECORD_FRAME_OK = 0
 _RECORD_FRAME_HELD = 1
 _RECORD_FRAME_IK_FAIL = 2
@@ -137,29 +133,31 @@ def _build_policy_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
 def _build_policy_workspace_check(
     runtime: ExperimentConfig,
 ) -> Callable[[np.ndarray, np.ndarray], bool]:
-    """Return the reject-only interpolated joint-policy workspace predicate."""
+    """Return the reject-only endpoint workspace predicate for the joint policy.
+
+    The per-control-step command delta is already bounded once by the
+    projection (soft jump clip) on top of the operational joint limits, so
+    the workspace contract for an ordinary joint policy is the necessary
+    endpoint check — not a dense interpolated critic. The bounds and their
+    edge tolerance are unchanged; EE policies keep the existing IK profile's
+    reference/selection rules (no IK algorithm change).
+    """
     bounds = np.asarray(runtime.policy.workspace.as_tuple(), dtype=np.float64)
     arm_fk = make_arm_fk()
 
-    def is_workspace_segment_safe(
+    def is_workspace_endpoint_safe(
         start_arm_qpos: np.ndarray, end_arm_qpos: np.ndarray
     ) -> bool:
-        path = interpolate_waypoints(
-            np.stack([start_arm_qpos, end_arm_qpos]),
-            max_step=_POLICY_WORKSPACE_INTERPOLATION_MAX_STEP_RAD,
+        eef_position_base, _ = arm_fk.compute(end_arm_qpos)
+        position = np.asarray(eef_position_base, dtype=np.float64)
+        if position.shape != (3,) or not np.all(np.isfinite(position)):
+            raise ValueError("arm FK returned an invalid workspace position")
+        return not (
+            np.any(position < bounds[:, 0] - WORKSPACE_BOUNDS_TOLERANCE_M)
+            or np.any(position > bounds[:, 1] + WORKSPACE_BOUNDS_TOLERANCE_M)
         )
-        for arm_qpos in path:
-            eef_position_base, _ = arm_fk.compute(arm_qpos)
-            position = np.asarray(eef_position_base, dtype=np.float64)
-            if position.shape != (3,) or not np.all(np.isfinite(position)):
-                raise ValueError("arm FK returned an invalid workspace position")
-            if np.any(position < bounds[:, 0] - WORKSPACE_BOUNDS_TOLERANCE_M) or np.any(
-                position > bounds[:, 1] + WORKSPACE_BOUNDS_TOLERANCE_M
-            ):
-                return False
-        return True
 
-    return is_workspace_segment_safe
+    return is_workspace_endpoint_safe
 
 
 def _build_policy_safety_gate(runtime: ExperimentConfig) -> SafetyGate:
@@ -184,9 +182,12 @@ def decode_policy_action(
 ) -> tuple[np.ndarray | None, np.ndarray, str]:
     """Interpret one already-validated flat action and perform EE IK when needed.
 
-    The inference boundary owns flat shape and finite-value validation.  A
-    representational or IK failure aborts this rollout; it does not imply a
-    hardware fault.
+    The inference boundary owns flat shape and finite-value validation. An
+    ordinary IK no-solution is a RECOVERABLE miss: ``(None, hand, reason)``
+    lets the caller drop the unpublished chunk suffix and re-observe in the
+    same trial. Contract violations (a missing planner, an illegal rotation
+    representation, or an internal solver exception) raise instead — they are
+    never swallowed into the recoverable-miss path.
     """
     reference = (
         current_arm_qpos
@@ -198,15 +199,12 @@ def decode_policy_action(
 
     hand_qpos = action[9:21]
     if planner is None:
-        return None, hand_qpos, "EE planner is unavailable"
-    try:
-        target = Pose(
-            p=action[:3],
-            q=rot6d_to_quat_wxyz(action[3:9]),
-        )
-        result = planner.solve_teleop_ik(target, current_arm_qpos, reference)
-    except Exception as exc:
-        return None, hand_qpos, f"EE IK failed: {type(exc).__name__}"
+        raise RuntimeError("EE policy action reached decode without an IK planner")
+    target = Pose(
+        p=action[:3],
+        q=rot6d_to_quat_wxyz(action[3:9]),
+    )
+    result = planner.solve_teleop_ik(target, current_arm_qpos, reference)
     if not result.success or result.qpos is None:
         return None, hand_qpos, result.reason or "EE IK found no usable solution"
     return np.asarray(result.qpos, dtype=np.float64), hand_qpos, ""
@@ -218,39 +216,27 @@ def _project_policy_targets(
     reference_arm_qpos: np.ndarray,
     runtime: ExperimentConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Project finite physical endpoints; workers retain final SDK authority."""
-    arm = np.asarray(target_arm_qpos, dtype=np.float64)
-    hand = np.asarray(target_hand_qpos, dtype=np.float64)
-    reference = np.asarray(reference_arm_qpos, dtype=np.float64)
-    for values, shape in ((arm, (7,)), (hand, (12,)), (reference, (7,))):
-        if values.shape != shape or not np.all(np.isfinite(values)):
-            raise ValueError("policy projection requires finite joint targets/reference")
-    lower = np.asarray(runtime.arm.joint_limit_lower, dtype=np.float64)
-    upper = np.asarray(runtime.arm.joint_limit_upper, dtype=np.float64)
-    if np.any(reference < lower) or np.any(reference > upper):
-        raise ValueError("policy arm continuity reference is outside joint limits")
-    canonical = wrap_nearest_equivalent(
-        arm,
-        reference,
-        runtime.arm.joint_limit_lower,
-        runtime.arm.joint_limit_upper,
+    """Project finite physical endpoints through the single-owner projection.
+
+    Canonicalization, operational bounds, the soft delta clip, and the
+    float64 round-off guard all live in ``control/projection.py`` — the one
+    owner shared with the teleop producer. Workers retain final hard-limit
+    SDK authority but never re-reject the same soft threshold. A raised
+    ``ValueError`` is a projector-invariant/contract violation, not an
+    ordinary recoverable IK miss.
+    """
+    arm = project_arm_command(
+        target_arm_qpos,
+        reference_arm_qpos,
+        joint_lower_rad=runtime.arm.joint_limit_lower,
+        joint_upper_rad=runtime.arm.joint_limit_upper,
+        max_command_jump_rad=float(runtime.arm.max_servo_command_jump_rad),
     )
-    arm = np.clip(canonical, lower, upper)
-    delta = arm - reference
-    limit = float(runtime.arm.max_servo_command_jump_rad)
-    clipped = np.abs(delta) > limit
-    arm[clipped] = reference[clipped] + np.clip(delta[clipped], -limit, limit)
-    # Addition/subtraction can round beyond the worker's strict float64 bound.
-    outside = np.abs(arm - reference) > limit
-    arm[outside] = np.nextafter(arm[outside], reference[outside])
-    if (
-        not np.all(np.isfinite(arm))
-        or np.any(arm < lower)
-        or np.any(arm > upper)
-        or np.any(np.abs(arm - reference) > limit)
-    ):
-        raise ValueError("policy arm projection violated command invariants")
-    hand = np.clip(hand, runtime.hand.qpos_min_rad, runtime.hand.qpos_max_rad)
+    hand = project_hand_command(
+        target_hand_qpos,
+        qpos_min_rad=runtime.hand.qpos_min_rad,
+        qpos_max_rad=runtime.hand.qpos_max_rad,
+    )
     return arm, hand
 
 
@@ -407,15 +393,17 @@ class PolicyRunner:
         self.consecutive_stale_predictions = 0
 
     def _invalidate_chunk(self, reason: str) -> None:
-        """Discard the unexecuted chunk after a recoverable continuity break.
+        """Discard the unexecuted chunk suffix after a recoverable break.
 
         A replanning boundary, not an episode boundary: run_generation,
-        observation_id, model episode state, and recording state are untouched,
-        as is last_publication_ns (already-occurred physical history stays the
-        cadence anchor).  The next queue-empty iteration builds a fresh causal
-        observation and performs a fresh blocking inference.  Clearing the
-        continuity reference ensures the next chunk's first action anchors to the
-        newly measured arm state rather than a pre-gap command target.
+        observation_id, model episode state, and recording state are
+        untouched, as is last_publication_ns (already-occurred physical
+        history stays the cadence anchor). The continuity reference is KEPT:
+        the next chunk's first action still anchors behind the last committed
+        command instead of snapping to measured qpos. Only a new epoch
+        (``_clear_execution``) rebuilds the initial reference. The next
+        queue-empty iteration builds a fresh causal observation and performs
+        a fresh blocking inference.
         """
         # One visible line per real chunk discard; the dropped actions never
         # reach the SDK and the next query replaces them.
@@ -433,7 +421,6 @@ class PolicyRunner:
             self._fifo_wait.note_dropped(reason)
         self.chunk_sources.clear()
         self.chunk_action_index = 0
-        self.previous_arm_command_qpos = None
 
     def _finish_episode(
         self,
@@ -524,6 +511,16 @@ class PolicyRunner:
         hand_qpos: np.ndarray,
         raw_action: np.ndarray,
     ) -> EpisodeAction:
+        """Build the recorded action row, keeping EE intent distinct from execution.
+
+        For an EE policy, ``target_eef_pos/rot6d`` record the model's raw EE
+        INTENT (the pre-IK command); the executed joints live in
+        ``arm_qpos_cmd`` / ``action_arm_joint_sent`` (the projected IK result
+        actually committed to the FIFO). The intent is never relabeled as the
+        executed EEF pose — the executed Cartesian pose is derivable offline
+        by FK over the recorded joints. For a joint policy the recorded EE
+        columns are exactly FK(projected joints).
+        """
         if self.policy_spec.action_key == "action_ee":
             target_eef_pos = np.asarray(raw_action[:3], dtype=np.float64)
             target_eef_rot6d = quat_wxyz_to_rot6d(
@@ -1045,20 +1042,46 @@ class PolicyRunner:
                         self.shared.stop_request.value = int(StopRequest.NONE)
             self._start_requested_episode()
 
-    def _abort_action(
+    def _handle_recoverable_miss(
         self,
         reason: str,
         *,
         reject_kind: _RejectKind,
         raw_action: np.ndarray,
     ) -> None:
-        """Record a rejected queue head and end the episode."""
-        terminal_ns = time.monotonic_ns()
-        self.stats.log_rejection(reason)
+        """Drop the unpublished chunk suffix and re-observe in the SAME trial.
+
+        An ordinary IK no-solution or workspace miss is a replanning boundary,
+        never a trial boundary: nothing is published for this action, while
+        the committed FIFO prefix, the continuity reference, the run
+        generation, and the model episode state stay untouched. The rejection
+        row is recorded and the chunk drop prints one visible line. There is
+        no first-miss terminalization and no consecutive-miss cap — the run
+        budget or the operator ends the trial.
+        """
+        self.stats.count_rejection(reason)
         self._record_rollout_tick(
-            terminal_ns, raw_action=raw_action, reject_kind=reject_kind
+            time.monotonic_ns(), raw_action=raw_action, reject_kind=reject_kind
         )
-        self._finish_episode(reason, aborted=True)
+        self._invalidate_chunk(reason)
+
+    def _session_failure(self, reason: str, *, log_exc: bool = False) -> None:
+        """End the trial on a model/contract failure — not a hardware fault.
+
+        Motion is fenced into ARMED and the session is marked failed so the
+        supervisor runs verified non-FAULT shutdown. Internal contract
+        violations (decode, rotation representation, projector invariants,
+        preparation) are never swallowed as recoverable IK misses and never
+        presented as physical faults.
+        """
+        self._invalidate_rollout(
+            reason, stop_reason="policy_failure", recorder_save=False
+        )
+        self._request_failed_session_shutdown()
+        if log_exc:
+            logger.critical("policy: %s", reason, exc_info=True)
+        else:
+            logger.critical("policy: %s", reason)
 
     def _decode_action(
         self, action: np.ndarray, feedback: CommandFeedbackSnapshot
@@ -1069,7 +1092,7 @@ class PolicyRunner:
         read and validated ``feedback`` once for this dispatch.
         """
         if self.policy_spec.action_key == "action_ee" and self.ee_planner is None:
-            self._fault("EE policy runner has no IK planner")
+            self._session_failure("EE policy runner has no IK planner")
             return None, None, None
         try:
             arm_qpos, hand_qpos, rejection = decode_policy_action(
@@ -1080,9 +1103,16 @@ class PolicyRunner:
                 planner=self.ee_planner,
             )
         except Exception as exc:
-            self._fault(f"policy action decode failed: {exc}")
+            # Contract violation (illegal rotation representation, internal
+            # solver exception): a session failure, never a recoverable miss.
+            self._session_failure(
+                f"policy action decode contract violation: "
+                f"{type(exc).__name__}: {exc}",
+                log_exc=True,
+            )
             return None, None, None
         if arm_qpos is None:
+            # Ordinary IK no-solution: recoverable miss in the same trial.
             if self.policy_spec.action_key == "action_ee":
                 self.stats.ik_rejection_count += 1
             return (
@@ -1100,7 +1130,11 @@ class PolicyRunner:
                 arm_qpos, hand_qpos, reference_arm_qpos, self.runtime
             )
         except Exception as exc:
-            self._fault(f"policy target projection failed: {exc}")
+            self._session_failure(
+                f"policy target projection invariant violation: "
+                f"{type(exc).__name__}: {exc}",
+                log_exc=True,
+            )
             return None, None, None
         return (arm_qpos, hand_qpos), None, None
 
@@ -1164,7 +1198,7 @@ class PolicyRunner:
         if decoded is None:
             if decode_rejection is not None:
                 assert reject_kind is not None
-                self._abort_action(
+                self._handle_recoverable_miss(
                     decode_rejection, raw_action=action, reject_kind=reject_kind
                 )
             return None
@@ -1186,7 +1220,11 @@ class PolicyRunner:
                 feedback_snapshot=feedback,
             )
         except Exception as exc:
-            self._fault(f"policy command preparation failed: {exc}")
+            self._session_failure(
+                f"policy command preparation contract violation: "
+                f"{type(exc).__name__}: {exc}",
+                log_exc=True,
+            )
             return None
         if not prepared.accepted:
             self._handle_preparation_rejection(prepared, raw_action=action)
@@ -1300,17 +1338,22 @@ class PolicyRunner:
     ) -> None:
         if prepared.unavailable:
             return
-        if prepared.fatal:
-            self._fault(prepared.reason or "physical safety check failed")
+        if prepared.gate_code is GateRejectCode.WORKSPACE:
+            # Ordinary workspace miss: a recoverable replanning boundary in
+            # the same trial, with the committed prefix and reference kept.
+            self.stats.safety_rejection_count += 1
+            self._handle_recoverable_miss(
+                prepared.reason or "policy workspace violation",
+                raw_action=raw_action,
+                reject_kind=_RejectKind.SAFETY,
+            )
             return
-        if prepared.gate_code is not GateRejectCode.WORKSPACE:
-            self._fault(prepared.reason or "post-projection safety invariant failed")
-            return
-        self.stats.safety_rejection_count += 1
-        self._abort_action(
-            prepared.reason or "policy workspace violation",
-            raw_action=raw_action,
-            reject_kind=_RejectKind.SAFETY,
+        # Anything else after the single-owner projection (a joint-limit
+        # rejection, a failed collision/workspace check, a fatal contract
+        # break) is an internal invariant violation: session failure — never
+        # a recoverable miss and never presented as a hardware fault.
+        self._session_failure(
+            prepared.reason or "post-projection safety invariant failed"
         )
 
     def _handle_publication_rejection(self, result: PublishResult) -> None:
@@ -1444,13 +1487,7 @@ class PolicyRunner:
             # Model/contract failure (CUDA OOM, forward error, shape/NaN/Inf) is a
             # session failure, not a physical fault: fence, mark failed, and let
             # verified shutdown complete.
-            self._invalidate_rollout(
-                f"policy inference failed: {exc}",
-                stop_reason="policy_failure",
-                recorder_save=False,
-            )
-            self._request_failed_session_shutdown()
-            logger.critical("policy: inference exception", exc_info=True)
+            self._session_failure(f"policy inference failed: {exc}", log_exc=True)
             return
         finished_ns = time.monotonic_ns()
         self.stats.inference_latency_ms = (finished_ns - started_ns) / 1e6

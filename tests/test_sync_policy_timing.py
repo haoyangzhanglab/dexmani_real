@@ -254,7 +254,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
 
     # --- unified whole-chunk invalidation ----------------------------------
 
-    def test_invalidate_chunk_resets_continuity_but_keeps_anchor(self):
+    def test_invalidate_chunk_keeps_committed_reference_and_anchor(self):
         runner = PolicyRunner.__new__(PolicyRunner)
         runner.run_generation = 7
         runner.observation_id = 3
@@ -272,7 +272,12 @@ class SyncPolicyTimingTest(unittest.TestCase):
         self.assertIsNone(runner._pending_dispatch)
         self.assertEqual(runner.chunk_sources, {})
         self.assertEqual(runner.chunk_action_index, 0)
-        self.assertIsNone(runner.previous_arm_command_qpos)
+        # A recoverable chunk drop keeps the committed continuity reference:
+        # the next prediction anchors behind the last committed command, not
+        # at measured qpos. Only a new epoch rebuilds the initial reference.
+        self.assertTrue(
+            np.array_equal(runner.previous_arm_command_qpos, np.array([1.0, 2.0, 3.0]))
+        )
         # Already-occurred physical history and episode identity are preserved.
         self.assertEqual(runner.last_publication_ns, 1_000_000_000)
         self.assertEqual(runner.run_generation, 7)

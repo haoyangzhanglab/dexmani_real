@@ -14,8 +14,9 @@ top-level handler, which latches ``error_state``; cleanup always does a
 best-effort stop + disconnect.  No retry counters, no last-known fallbacks,
 no error-classification framework.
 
-Command-jump rejection pauses the current motion epoch without faulting the
-worker. Other invalid targets and hardware failures retain the fail-fast path.
+The worker validates only the HARD boundary (finite targets inside physical
+joint limits) at the SDK fence; the soft command-jump bound is owned once by
+the producers through ``control/projection.py`` and is never re-rejected here.
 """
 
 from __future__ import annotations
@@ -32,18 +33,13 @@ from dexmani_real.config.defaults import ArmParams
 from dexmani_real.ipc.channels import new_frame
 from dexmani_real.ipc.command_stream import CommandStreamConsumer
 from dexmani_real.ipc.schema import ARM_STATE_DTYPE
-from dexmani_real.robot.command_validation import (
-    ARM_COMMAND_JUMP_REJECTION,
-    check_worker_arm_target,
-)
+from dexmani_real.robot.command_validation import check_worker_arm_target
 from dexmani_real.robot.drivers.xarm7 import HomeAborted, XArm7, describe_controller_error
 from dexmani_real.runtime.safety import (
-    CommittedCommand,
     SafetyState,
     StopRequest,
     coupled_command_may_cross_sdk,
     read_motion_permit,
-    reject_coupled_command_if_current,
 )
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
@@ -78,8 +74,6 @@ class _LoopState:
     arm: XArm7
     frame: Any
     last_target: np.ndarray
-    last_measured_qpos: np.ndarray
-    last_command_generation: int
     consumer: CommandStreamConsumer
     last_cmd: _CmdState = field(default_factory=_CmdState.idle)
     last_state_source_ns: int = field(default_factory=time.monotonic_ns)
@@ -170,8 +164,6 @@ def _startup(shared: Any, arm: XArm7, cfg: ArmParams) -> _LoopState:
         arm=arm,
         frame=new_frame(ARM_STATE_DTYPE),
         last_target=qpos.copy(),
-        last_measured_qpos=qpos.copy(),
-        last_command_generation=int(shared.run_generation.value),
         consumer=consumer,
     )
     # Publish the initial frame before signaling ready.
@@ -257,7 +249,6 @@ def _handle_home(st: _LoopState, shared: Any, request: tuple) -> None:
             st.arm.enter_mode6(on_poll=heartbeat)
         return
     st.last_target = np.asarray(final_qpos, dtype=np.float64).copy()
-    st.last_command_generation = int(generation)
     logger.info("arm_loop: HOME complete")
     # Publish only after the driver's settle and mode-restoration lifecycle.
     # S/Q and generation changes must win over a late HOME completion.
@@ -276,48 +267,24 @@ def _handle_servo_command(
     action: Any,
     sequence: int,
 ) -> None:
-    """Validate and servo one ordered endpoint command.
+    """Validate the hard boundary and servo one ordered endpoint command.
 
-    Fail-fast: a raised SDK exception or a non-zero return propagates to the
-    worker's top-level handler, which latches ``error_state`` and stops the
-    controller in cleanup. The FIFO cursor advances only after explicit SDK
-    acceptance; a rejected jump revokes the epoch instead (the resync then
-    batch-skips the invalidated backlog). At most one send happens per tick —
-    the worker never drains the queue to catch up.
+    The soft command-jump bound was already applied once by the producer's
+    projection; the worker keeps only the hard SDK-boundary validation and
+    never re-rejects the same soft threshold. Fail-fast: a raised SDK
+    exception or a non-zero return propagates to the worker's top-level
+    handler, which latches ``error_state`` and stops the controller in
+    cleanup. The FIFO cursor advances only after explicit SDK acceptance. At
+    most one send happens per tick — the worker never drains the queue to
+    catch up.
     """
     command_generation = int(action["run_generation"][0])
-    jump_reference = (
-        st.last_target
-        if command_generation == st.last_command_generation
-        else st.last_measured_qpos
-    )
     target = np.asarray(action["arm_qpos"][0], dtype=np.float64)
     issue = check_worker_arm_target(
         target,
-        previous_target_qpos_rad=jump_reference,
         joint_limit_lower_rad=np.asarray(st.cfg.joint_limit_lower, dtype=np.float64),
         joint_limit_upper_rad=np.asarray(st.cfg.joint_limit_upper, dtype=np.float64),
-        max_command_jump_rad=st.cfg.max_servo_command_jump_rad,
     )
-    if issue == ARM_COMMAND_JUMP_REJECTION:
-        if reject_coupled_command_if_current(
-            shared,
-            command=CommittedCommand(
-                run_generation=command_generation, sequence=sequence
-            ),
-        ):
-            delta = np.abs(target - jump_reference)
-            joint = int(np.argmax(delta))
-            logger.warning(
-                "arm_loop: rejected action_id=%d generation=%d joint=%d "
-                "raw jump=%.3fdeg limit=%.3fdeg; motion paused",
-                int(action["action_id"][0]),
-                command_generation,
-                joint + 1,
-                float(np.rad2deg(delta[joint])),
-                float(np.rad2deg(st.cfg.max_servo_command_jump_rad)),
-            )
-        return
     # This is the sole command-authority fence and the final operation before
     # an otherwise valid target crosses the xArm SDK boundary. A transient
     # same-generation fence miss retries this record on the next tick; any
@@ -342,7 +309,6 @@ def _handle_servo_command(
         raise RuntimeError(f"set_servo_angle failed (SDK code={code})")
     accepted_monotonic_ns = time.monotonic_ns()
     st.last_target = target.copy()  # producer owns 2π canonicalization
-    st.last_command_generation = command_generation
     st.last_cmd = _CmdState(
         int(action["action_id"][0]),
         bool(action["is_hold"][0]),
@@ -407,7 +373,6 @@ def _observe_and_publish(st: _LoopState, shared: Any) -> bool:
     top-level handler.
     """
     qpos, qvel, tau = st.arm.read()
-    st.last_measured_qpos = qpos.copy()
     st.last_state_source_ns = time.monotonic_ns()
 
     tracking_err = float(np.max(np.abs(qpos - st.last_target)))
