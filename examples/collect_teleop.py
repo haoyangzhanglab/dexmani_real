@@ -75,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-hand",
         action="store_true",
-        help="Do not start XHand; arm bring-up/debug only, with recording disabled.",
+        help="Do not start XHand; arm bring-up/debug only. Also pass --no-record (or disable recording in config).",
     )
     parser.add_argument(
         "--no-record",

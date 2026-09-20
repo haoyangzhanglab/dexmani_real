@@ -168,11 +168,11 @@ def _load_example_or_skip(testcase: unittest.TestCase, name: str):
 
 
 class AffectedParserSmokeTest(unittest.TestCase):
-    """Parser-only checks for affected entries (never runs their bodies).
+    """Offline argument/configuration checks with hardware lifecycle mocked.
 
-    ``main(["--help"])`` exits inside ``parse_args`` before any config,
-    device, or session code runs, so it is a parser-safety check, not an
-    execution of the entry.
+    Hardware session calls are replaced at the lifecycle boundary. Real CLI
+    parsing and resolved configuration are checked without batch --help runs.
+    run_policy is parsed only; its hardware main is never invoked.
     """
 
     def test_run_policy_num_episodes_selects_trials(self):
@@ -204,22 +204,57 @@ class AffectedParserSmokeTest(unittest.TestCase):
         args = module._parse_args(["episodes/task/episode_x", "--processed"])
         self.assertTrue(args.processed)
 
-    def test_help_exits_in_parser_for_session_entries(self):
-        for name, flags in (
-            ("collect_teleop", ["--no-hand", "--no-record"]),
-            ("keyboard_teleop", []),
-            ("calibrate_camera", []),
-        ):
-            with self.subTest(example=name):
-                module = _load_example_or_skip(self, name)
-                with self.assertRaises(SystemExit) as ctx:
-                    module.main(["--help"])
-                self.assertEqual(ctx.exception.code, 0)
-                # The documented flags still exist in the real parser.
-                if flags:
-                    source = (_EXAMPLES / f"{name}.py").read_text(encoding="utf-8")
-                    for flag in flags:
-                        self.assertIn(f'"{flag}"', source)
+    def test_collect_teleop_no_record_configuration_reaches_session(self):
+        from unittest.mock import patch
+        module = _load_example_or_skip(self, "collect_teleop")
+        with patch.object(module, "run_teleop_experiment", return_value=0) as session:
+            self.assertEqual(module.main(["--no-record"]), 0)
+        self.assertFalse(session.call_args.args[0].policy.recording_enabled)
+
+    def test_collect_teleop_no_hand_with_no_record_reaches_session(self):
+        from unittest.mock import patch
+        module = _load_example_or_skip(self, "collect_teleop")
+        with patch.object(module, "run_teleop_experiment", return_value=0) as session:
+            self.assertEqual(module.main(["--no-hand", "--no-record"]), 0)
+        self.assertFalse(session.call_args.args[0].policy.hand_enabled)
+        self.assertFalse(session.call_args.args[0].policy.recording_enabled)
+
+    def test_keyboard_configuration_and_result_reach_session(self):
+        from unittest.mock import patch
+        module = _load_example_or_skip(self, "keyboard_teleop")
+        with patch.object(module, "run_keyboard_experiment", return_value=1) as session:
+            self.assertEqual(module.main(["--no-hand"]), 1)
+        self.assertTrue(session.call_args.kwargs["no_hand"])
+        self.assertFalse(session.call_args.args[0].policy.hand_enabled)
+
+    def test_calibration_physical_assertion_reaches_session(self):
+        from unittest.mock import patch
+        module = _load_example_or_skip(self, "calibrate_camera")
+        with patch.object(module, "run_camera_calibration", return_value=0) as session:
+            self.assertEqual(module.main(["--hand-geometry", "absent"]), 0)
+        self.assertEqual(session.call_args.kwargs["hand_geometry"], "absent")
+
+    def test_single_episode_processing_dry_run_is_read_only(self):
+        import hashlib
+        import subprocess
+        from tests.raw_episode_fixture import build_raw_episode
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            episode = build_raw_episode(root / "task" / "episode_fixture")
+            source = episode.parent if episode.is_file() else episode
+            def hashes():
+                return {str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
+                        for p in source.rglob("*") if p.is_file()}
+            before = hashes()
+            output = root / "processed" / "provenance_fixture"
+            result = subprocess.run([sys.executable, str(_EXAMPLES / "process_episodes.py"),
+                str(source), "--dry-run", "--output-root", str(output)],
+                capture_output=True, text=True, cwd=_REPO_ROOT, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("1 accepted", result.stderr)
+            self.assertFalse(output.exists())
+            self.assertEqual(hashes(), before)
+
 
 
 class PolicyRolloutViewerTest(unittest.TestCase):

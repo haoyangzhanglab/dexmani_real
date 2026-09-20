@@ -339,7 +339,8 @@
   </section>
 
   <section>
-    <h2>验证命令与结果</h2>
+    <h2>历史验证声明（代码 9913e25）</h2>
+    <p>以下旧测试、性能和数据数字不代表 PR #17 修复后版本的结果。本次修复的被测 SHA、命令、范围及缺口另见 <a href="PATCH_EVIDENCE.md">PATCH_EVIDENCE.md</a>。</p>
     <div class="scroll">
       <table>
         <thead>
@@ -373,12 +374,12 @@
           </tr>
           <tr>
             <td class="mono">单 episode <span class="mono">--dry-run</span> 预检（重构后的 admission 路径）</td>
-            <td class="num">接受</td>
-            <td><span class="chip done">pass</span></td>
+            <td class="num">历史声明；原始单 episode 命令未能核实</td>
+            <td><span class="chip deferred">unverified</span></td>
           </tr>
           <tr>
             <td class="mono">数据树写入检查（mtime + git status）</td>
-            <td class="num">episodes / episodes_processed / datasets / rollouts 零变更</td>
+            <td class="num">历史 mtime/status 观察：零变更；不构成完整内容 hash 证明</td>
             <td><span class="chip done">pass</span></td>
           </tr>
           <tr>
@@ -552,28 +553,21 @@
   </section>
 
   <section>
-    <h2>复现步骤</h2>
-    <pre><span class="c"># 环境</span>
-conda activate real_robot        <span class="c"># Python 3.10.20</span>
-git fetch origin
-git checkout refactor/research-runtime-v2   <span class="c"># 9913e25</span>
-
-<span class="c"># 离线验证（不连接任何设备）</span>
-python -m unittest discover -s tests -p 'test_*.py'
+    <h2>本次离线复验入口</h2>
+    <p>原列出的 run_policy dry-run 不受其 parser 支持，已删除；不能通过运行其硬件主体替代预检。未找到历史“单 episode 预检”的原始记录，不能倒填新命令为历史证据。</p>
+    <pre><span class="c"># 已有 real_robot 环境；实际执行范围与结果见 PATCH_EVIDENCE.md</span>
+python -m unittest discover -s tests -p 'test_examples_interfaces.py' -q
+<span class="c"># 其中单 episode 用例构造临时 raw fixture，实际调用 process_episodes.py
+# --dry-run --output-root，校验源文件 hashes 不变且没有创建输出。
+# 不调用 run_policy.main，不批量运行 examples 或 --help。</span>
+python -m unittest discover -s tests -p 'test_*.py' -v
 python -m compileall -q dexmani_real examples tests
-git diff --check origin/main...HEAD
-
-<span class="c"># 只读数据兼容</span>
-python examples/process_episodes.py episodes/pick_place_toy --dry-run
-python examples/run_policy.py &lt;policy/task/exp&gt; --dry-run   <span class="c"># 单 episode 预检</span>
-
-<span class="c"># 完整 diff</span>
-git diff origin/main...HEAD</pre>
+git diff --check</pre>
   </section>
 
   <footer>
     <div>证据快照 · 2026-09-20 · 被验证代码 HEAD <span class="mono">9913e25</span></div>
-    <div>本页只读，内容来自本地 STATUS 账本与实际运行输出；真机 / CUDA 范围保持未验证。本页随分支提交，但其提交本身不改变被验证的代码版本。</div>
+    <div>原历史声明保留；PR #17 修复校正了无法核实的复现步骤。新结果独立记录，真机 / CUDA 范围保持未验证。</div>
   </footer>
 
 </div>

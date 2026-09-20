@@ -86,7 +86,7 @@ episodes/<task>/episode_*
 python examples/collect_teleop.py --task-name <task> --operator <name>
 
 # Arm-only debugging
-python examples/collect_teleop.py --task-name <task> --operator <name> --no-hand
+python examples/collect_teleop.py --task-name <task> --operator <name> --no-hand --no-record
 
 # Teleoperation without recording
 python examples/collect_teleop.py --task-name <task> --operator <name> --no-record
@@ -293,6 +293,8 @@ rollouts/<policy>/<task>/<experiment>/session_*/
 按原录制 trial 归属计数，目录名按 trial 序号命名。Session End 分别输出 control reason、
 recording status 和 cleanup status；资源已确认释放与会话总体成功是独立事实。
 
+有效 publication rate 的分母为各 trial 的软件 RUNNING epoch 时长：由 motion 撤销边界记录首次结束时间，阻塞推理迟返不延长它。这不代表机械臂或手已物理停止或收敛。
+
 Policy deployment 使用与 teleoperation / replay 相同的 runtime safety 与 command publication infrastructure。命令经单一 owner 的软投影（2π canonicalization、操作关节界限、软命令步长一次裁剪）后进入有界有序命令 FIFO；FIFO 满时是 non-blocking 可恢复背压，producer 保留同一 candidate 按主循环节奏重试。robot worker 在硬件边界只保留硬限位等最终检查，不重复拒绝同一软阈值。普通 IK 无解或 workspace miss 只丢弃未发布的 chunk 后缀，并在同一 trial 内重新观测（已提交前缀与命令连续性参考保留）；模型/合同违规与硬件故障才会结束 rollout。未执行动作不会被视作已完成的物理进度。
 
 已有 legacy policy trace sidecar 的旧 rollout 可使用：
@@ -301,7 +303,7 @@ Policy deployment 使用与 teleoperation / replay 相同的 runtime safety 与 
 python examples/visualize_policy_rollout.py <rollout-episode> --info
 ```
 
-进行离线检查；该工具不适用于没有该 sidecar 的同步 rollout。
+进行离线检查；没有 trace sidecar 的同步 rollout 会显示 raw 基本信息并指向 raw viewer，不会仅因缺少 trace 判定数据损坏。
 
 ## Calibration
 
@@ -441,5 +443,3 @@ git status --short
 ```
 
 不要因为离线检查通过就声称完成真实硬件验证。
-
-有效 publication rate 的分母为各 trial 的软件 RUNNING epoch 时长：由 motion 撤销边界记录首次结束时间，阻塞推理迟返不延长它。这不代表机械臂或手已物理停止或收敛。
