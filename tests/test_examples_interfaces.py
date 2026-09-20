@@ -5,12 +5,15 @@ Two levels of verification, both without hardware, GUI, or batch --help runs:
 * affected entries whose module imports are offline-safe are imported and
   their real argument parsers are exercised (EX01 run_policy, EX07
   process_episodes, EX08 export_policy_zarr including the new narrow
-  ``--output`` guard, plus parser smoke checks for EX02/EX03/EX04/EX05);
+  ``--output`` guard, EX11 visualize_policy_rollout on a trace-less raw
+  episode, plus parser smoke checks for EX02/EX03/EX04/EX05);
 * the export guard's protected-source rules are unit-tested directly
   (defaults unchanged, symlink escape refused, existing .zarr store refused).
 
-Entries whose top-level imports require device/GUI stacks (EX06, EX09-EX14)
-are validated by AST parse only, per the task's safe-verification rules.
+Entries whose top-level imports require device/GUI stacks (EX06, EX09, EX10,
+EX12-EX14) are validated by AST parse only, per the task's safe-verification
+rules. EX11 is listed there too so the removed-API scan covers it, but it is
+additionally imported and run through its real parser below.
 """
 
 from __future__ import annotations
@@ -39,10 +42,12 @@ def _load_example(name: str):
     return module
 
 
+# Only a genuinely missing dependency may skip this module: a renamed or
+# broken symbol must fail the suite rather than hide behind a skip.
 try:
     _export_cli = _load_example("export_policy_zarr")
     _EXPORT_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - environment guard
+except ImportError as exc:  # pragma: no cover - environment guard
     _export_cli = None
     _EXPORT_IMPORT_ERROR = exc
 
@@ -71,6 +76,17 @@ class ExportOutputGuardTest(unittest.TestCase):
     def test_plain_new_output_allowed(self):
         target = self.root / "next_generation.zarr"
         self.assertEqual(self._guard(target, self.root / "in"), target)
+
+    def test_tilde_output_is_returned_expanded(self):
+        """The path that is validated is the path that gets written.
+
+        Without the expansion a ``~``-prefixed --output would be checked
+        against the home directory and then written to a literal ``~/`` tree
+        under the working directory.
+        """
+        resolved = self._guard(Path("~/gen2.zarr"), self.root / "in")
+        self.assertEqual(resolved, Path("~/gen2.zarr").expanduser())
+        self.assertNotIn("~", str(resolved))
 
     def test_protected_source_roots_refused(self):
         for relative in (
@@ -147,7 +163,7 @@ class ExportOutputGuardTest(unittest.TestCase):
 def _load_example_or_skip(testcase: unittest.TestCase, name: str):
     try:
         return _load_example(name)
-    except Exception as exc:  # pragma: no cover - environment guard
+    except ImportError as exc:  # pragma: no cover - environment guard
         testcase.skipTest(f"{name} dependencies unavailable: {exc}")
 
 
@@ -216,7 +232,7 @@ class PolicyRolloutViewerTest(unittest.TestCase):
 
         try:
             from tests.raw_episode_fixture import build_raw_episode
-        except Exception as exc:  # pragma: no cover - environment guard
+        except ImportError as exc:  # pragma: no cover - environment guard
             self.skipTest(f"raw fixture unavailable: {exc}")
         module = _load_example_or_skip(self, "visualize_policy_rollout")
         with tempfile.TemporaryDirectory() as tmp:
@@ -238,7 +254,7 @@ class PolicyRolloutViewerTest(unittest.TestCase):
 
         try:
             from tests.raw_episode_fixture import build_raw_episode
-        except Exception as exc:  # pragma: no cover - environment guard
+        except ImportError as exc:  # pragma: no cover - environment guard
             self.skipTest(f"raw fixture unavailable: {exc}")
         module = _load_example_or_skip(self, "visualize_policy_rollout")
         with tempfile.TemporaryDirectory() as tmp:
@@ -255,7 +271,12 @@ class PolicyRolloutViewerTest(unittest.TestCase):
 
 
 class StaticEntryCheckTest(unittest.TestCase):
-    """AST-parse entries whose imports need device/GUI stacks (no execution)."""
+    """AST-parse the device/GUI entries and scan them for removed APIs.
+
+    Nothing in this class executes an example. ``visualize_policy_rollout``
+    (EX11) is included so the removed-API scan covers it; its real parser is
+    exercised separately by ``PolicyRolloutViewerTest``.
+    """
 
     def test_device_and_gui_entries_parse(self):
         for name in (

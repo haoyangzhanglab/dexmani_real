@@ -19,7 +19,7 @@ from dexmani_real.control.publication import (
     publish_command,
     wait_command_accepted,
 )
-from dexmani_real.control.projection import project_arm_command
+from dexmani_real.control.projection import project_arm_command_reported
 from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
 from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
@@ -194,6 +194,23 @@ def _drop_pending_publish(
     logger.warning(
         "[DROP] teleop action=%d reason=%s", pending.candidate.action_id, reason
     )
+    resources.fifo_wait.note_dropped(reason)
+
+
+def close_publish_span(
+    controller: "TeleopController",
+    resources: "TeleopGridResources",
+    reason: str,
+) -> None:
+    """End any retained backpressure span at a pause/re-anchor boundary.
+
+    Every pause path discards ``controller.pending_publish``; without closing
+    the tracker here a span would outlive its candidate, suppressing the next
+    ``[WAIT]`` and turning the following ``[RESUME]`` into a wait that never
+    resumed. ``note_dropped`` is a no-op when no span is open, so this is safe
+    on every boundary.
+    """
+    _drop_pending_publish(controller, resources, reason)
     resources.fifo_wait.note_dropped(reason)
 
 
@@ -678,6 +695,7 @@ def _read_control_grid_observation(
                 hand_source_monotonic_ns=hand_source_ns,
             )
         ):
+            close_publish_span(controller, resources, "pause_release")
             if controller.reset_reference(arm_state, vr_frame, hand_state):
                 logger.info(
                     "teleop_loop: released %s pause boundary after fresh re-anchor",
@@ -1084,7 +1102,7 @@ def _publish_solved_action(
     # exactly once against the committed continuity reference. The worker at
     # the SDK boundary keeps only the hard joint-limit validation.
     try:
-        arm_cmd = project_arm_command(
+        arm_cmd, arm_clip = project_arm_command_reported(
             arm_cmd,
             controller.prev_qpos_cmd,
             joint_lower_rad=command_limits.arm_joint_lower_rad,
@@ -1104,6 +1122,16 @@ def _publish_solved_action(
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
     )
+    if arm_clip.clipped and prepared.candidate is not None:
+        # One visible line per really truncated teleop command (taskbook
+        # §4/V19). A retained FULL candidate is never re-projected, so this
+        # cannot repeat within one span.
+        logger.info(
+            "[CLIP] action=%d arm_max_delta_rad=%.3f joint=%d",
+            int(prepared.candidate.action_id),
+            arm_clip.max_abs_delta_rad,
+            arm_clip.joint,
+        )
     workspace_rejected = prepared.gate_code in (
         GateRejectCode.WORKSPACE,
         GateRejectCode.WORKSPACE_CHECK_FAILED,
@@ -1223,7 +1251,6 @@ def run_control_grid_tick(
             arm_feedback_error_count=tick_result.arm_feedback_error_count,
             hand_disconnected_at_s=tick_result.hand_disconnected_at_s,
         )
-    vr_frame = observation.vr_frame
     computation = controller.compute(observation, resources)
     if computation is None:
         prepared = _prepare_joint_candidate(

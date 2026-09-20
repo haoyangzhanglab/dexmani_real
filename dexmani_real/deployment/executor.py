@@ -33,7 +33,11 @@ from dexmani_real.control.publication import (
     publish_command,
     read_command_feedback,
 )
-from dexmani_real.control.projection import project_arm_command, project_hand_command
+from dexmani_real.control.projection import (
+    ArmClipReport,
+    project_arm_command_reported,
+    project_hand_command,
+)
 from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
 from dexmani_real.deployment.config import (
     FingertipAssemblerConfig,
@@ -214,7 +218,7 @@ def _project_policy_targets(
     target_hand_qpos: np.ndarray,
     reference_arm_qpos: np.ndarray,
     runtime: ExperimentConfig,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, ArmClipReport]:
     """Project finite physical endpoints through the single-owner projection.
 
     Canonicalization, operational bounds, the soft delta clip, and the
@@ -223,8 +227,12 @@ def _project_policy_targets(
     SDK authority but never re-reject the same soft threshold. A raised
     ``ValueError`` is a projector-invariant/contract violation, not an
     ordinary recoverable IK miss.
+
+    The returned clip report lets the caller print one visible ``[CLIP]``
+    line per really truncated action; projecting happens exactly once per
+    prepared candidate, so a FULL retry never repeats it.
     """
-    arm = project_arm_command(
+    arm, arm_clip = project_arm_command_reported(
         target_arm_qpos,
         reference_arm_qpos,
         joint_lower_rad=runtime.arm.joint_limit_lower,
@@ -236,7 +244,7 @@ def _project_policy_targets(
         qpos_min_rad=runtime.hand.qpos_min_rad,
         qpos_max_rad=runtime.hand.qpos_max_rad,
     )
-    return arm, hand
+    return arm, hand, arm_clip
 
 
 def _physical_start_pose_rejection(
@@ -1079,8 +1087,19 @@ class PolicyRunner:
                     recorder_save=False,
                 )
             else:
+                # No recording outcome is pending (run configured without
+                # recording, or the trial ran unrecorded). A trial that truly
+                # began must still count once and keep its RUNNING wall time
+                # in the statistics denominator; ``_finish_episode`` is a
+                # no-op when no epoch started.
+                self._finish_episode(
+                    "emergency stop"
+                    if bool(self.shared.estop_request.value)
+                    else "hardware fault",
+                    recorder_save=False,
+                    aborted=False,
+                )
                 self.shared.physical_home_completed.value = False
-                self.run_started_ns = None
                 self._clear_execution(None)
             return
 
@@ -1195,15 +1214,22 @@ class PolicyRunner:
 
     def _decode_action(
         self, action: np.ndarray, feedback: CommandFeedbackSnapshot
-    ) -> tuple[tuple[np.ndarray, np.ndarray] | None, _RejectKind | None, str | None]:
+    ) -> tuple[
+        tuple[np.ndarray, np.ndarray] | None,
+        _RejectKind | None,
+        str | None,
+        ArmClipReport,
+    ]:
         """Decode/IK one action against the caller-selected feedback snapshot.
 
         Side-effect free with respect to feedback I/O: the caller has already
-        read and validated ``feedback`` once for this dispatch.
+        read and validated ``feedback`` once for this dispatch. The last
+        element reports whether the projection really truncated the step, so
+        the caller can print one visible line against the action identity.
         """
         if self.policy_spec.action_key == "action_ee" and self.ee_planner is None:
             self._session_failure("EE policy runner has no IK planner")
-            return None, None, None
+            return None, None, None, ArmClipReport()
         try:
             arm_qpos, hand_qpos, rejection = decode_policy_action(
                 action,
@@ -1220,7 +1246,7 @@ class PolicyRunner:
                 f"{type(exc).__name__}: {exc}",
                 log_exc=True,
             )
-            return None, None, None
+            return None, None, None, ArmClipReport()
         if arm_qpos is None:
             # Ordinary IK no-solution: recoverable miss in the same trial.
             if self.policy_spec.action_key == "action_ee":
@@ -1229,6 +1255,7 @@ class PolicyRunner:
                 None,
                 _RejectKind.IK,
                 rejection or "EE action has no usable IK solution",
+                ArmClipReport(),
             )
         reference_arm_qpos = (
             feedback.arm_qpos
@@ -1236,7 +1263,7 @@ class PolicyRunner:
             else self.previous_arm_command_qpos
         )
         try:
-            arm_qpos, hand_qpos = _project_policy_targets(
+            arm_qpos, hand_qpos, arm_clip = _project_policy_targets(
                 arm_qpos, hand_qpos, reference_arm_qpos, self.runtime
             )
         except Exception as exc:
@@ -1245,8 +1272,8 @@ class PolicyRunner:
                 f"{type(exc).__name__}: {exc}",
                 log_exc=True,
             )
-            return None, None, None
-        return (arm_qpos, hand_qpos), None, None
+            return None, None, None, ArmClipReport()
+        return (arm_qpos, hand_qpos), None, None, arm_clip
 
     def _prepare_dispatch_candidate(self, action: np.ndarray) -> ActionCandidate | None:
         """Decode, project, and gate the queue head exactly once.
@@ -1271,7 +1298,9 @@ class PolicyRunner:
             self._fault(f"fatal command feedback: {issue.code.value}: {issue.detail}")
             return None
 
-        decoded, reject_kind, decode_rejection = self._decode_action(action, feedback)
+        decoded, reject_kind, decode_rejection, arm_clip = self._decode_action(
+            action, feedback
+        )
         if decoded is None:
             if decode_rejection is not None:
                 assert reject_kind is not None
@@ -1287,6 +1316,16 @@ class PolicyRunner:
             run_generation=self.run_generation,
             is_hold=False,
         )
+        if arm_clip.clipped:
+            # One visible line per really truncated action (taskbook §4/V19).
+            # Preparing happens once per candidate, so a FULL retry cannot
+            # repeat it.
+            logger.info(
+                "[CLIP] action=%d arm_max_delta_rad=%.3f joint=%d",
+                int(candidate.action_id),
+                arm_clip.max_abs_delta_rad,
+                arm_clip.joint,
+            )
         try:
             prepared = prepare_command(
                 self.shared,

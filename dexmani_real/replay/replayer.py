@@ -538,6 +538,7 @@ class EpisodeReplayer:
         result = publish_command(
             self.shared, candidate, required_safety_state=required_state
         )
+        stopped = False
         while (
             not result.published
             and result.reason == PUBLISH_REASON_FIFO_FULL
@@ -546,13 +547,21 @@ class EpisodeReplayer:
         ):
             self._fifo_wait.note_full(result.fifo_depth, int(candidate.action_id))
             if not self._poll_control(keyboard, _WAIT_POLL_INTERVAL_S):
+                stopped = True
                 break
             result = publish_command(
                 self.shared, candidate, required_safety_state=required_state
             )
         if result.published:
             self._fifo_wait.note_committed()
-        elif result.reason == PUBLISH_REASON_FIFO_FULL:
+        elif result.reason != PUBLISH_REASON_FIFO_FULL:
+            # A non-FULL rejection names its own cause (for example no attached
+            # consumer); never report a deadline that cannot expire.
+            self._fifo_wait.note_dropped(result.reason or "replay publish rejected")
+        elif stopped:
+            # Q/ESC/fault ended the retry, not the deadline.
+            self._fifo_wait.note_dropped("replay stopped")
+        else:
             self._fifo_wait.note_dropped("replay publish deadline")
         return result
 

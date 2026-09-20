@@ -52,6 +52,7 @@ from dexmani_real.teleop.control_loop.grid import (
     TeleopController,
     TeleopGridResources,
     _TeleopCommandLimits,
+    close_publish_span,
     run_control_grid_tick,
 )
 from dexmani_real.teleop.control_loop.hand_control import (
@@ -483,6 +484,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             else:
                 if relabel:
                     pause_reason = reason
+                close_publish_span(controller, grid_resources, "pause_boundary")
                 controller.clear_reference()
                 logger.debug(
                     "teleop_loop: remaining in %s pause boundary (observed %s)",
@@ -490,6 +492,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     reason,
                 )
                 return
+            close_publish_span(controller, grid_resources, "pause_boundary")
             controller.clear_reference()
             log_pause = (
                 logger.debug
@@ -522,6 +525,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             )
         pause_since_ns = 0
         pause_reason = None
+        close_publish_span(controller, grid_resources, "home_boundary")
         controller.clear_reference()
 
     def run_home() -> None:

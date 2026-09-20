@@ -3,10 +3,12 @@
 
 Offline CLI that exports validated processed task episodes to a minimal
 dexmani_policy Zarr. Connects to no hardware, opens no GUI, and writes only
-the derived ``datasets/<task>.zarr`` output. The positional input
-``episodes_processed/<task>`` determines both paths and the required dataset
-task name. ``--dry-run`` performs the same input-contract and finite-payload
-checks without creating an output store. Progress bars and errors go to stderr;
+the resolved output store. The output defaults to the derived
+``datasets/<task>.zarr`` and ``--output`` may redirect it to a new generation
+of the same task, while the task identity always comes from the positional
+input ``episodes_processed/<task>``. ``--dry-run`` performs the same
+input-contract and finite-payload checks without creating an output store.
+Progress bars and errors go to stderr;
 stdout stays empty. Argument parsing and terminal presentation live here; the
 export transaction itself stays in ``dexmani_real.dataset.export``.
 """
@@ -43,7 +45,8 @@ def _parser() -> argparse.ArgumentParser:
         metavar="episodes_processed/<task_name>",
         help=(
             "One processed task directory. Exports to "
-            "datasets/<task_name>.zarr; existing output paths are refused."
+            "datasets/<task_name>.zarr by default (see --output); existing "
+            "output paths are refused."
         ),
     )
     parser.add_argument(
@@ -87,7 +90,9 @@ def _resolve_output_path(
 
     Symlinks are followed, so a link that escapes into raw/processed/rollout
     data is refused by its resolved location. Overwriting any existing output
-    is refused by the occupied-target check before either mode runs.
+    is refused by the occupied-target check before either mode runs. The
+    returned path is the same one the checks resolved (``~`` expanded), so
+    safety, the occupied-target refusal, and the real export all agree.
     """
     candidate = default_path if output is None else output
     resolved = candidate.expanduser().resolve(strict=False)
@@ -108,7 +113,10 @@ def _resolve_output_path(
                 f"output target {resolved} must not resolve inside the "
                 f"existing Zarr store {parent}"
             )
-    return candidate
+    # Return the path the checks actually resolved. Without the expansion a
+    # ``~``-prefixed --output would be validated at the home directory and
+    # then written to a literal ``~/`` tree under the working directory.
+    return candidate.expanduser()
 
 
 def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:

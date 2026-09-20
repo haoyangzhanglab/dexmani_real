@@ -23,6 +23,8 @@ import unittest
 from collections import deque
 from types import SimpleNamespace
 
+# Only a genuinely missing dependency may skip this module: a renamed or
+# broken symbol must fail the suite rather than hide behind a skip.
 try:
     from dexmani_real.deployment.executor import PolicyRunner
     from dexmani_real.deployment.metrics import PolicyStats
@@ -32,7 +34,7 @@ try:
     from dexmani_real.utils.log import ThrottledWarner
 
     _IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - environment guard
+except ImportError as exc:  # pragma: no cover - environment guard
     _IMPORT_ERROR = exc
 
 
@@ -172,6 +174,23 @@ class TrialCountingTest(_RunnerTest):
         runner._finish_episode("operator stop", stop_reason="operator", aborted=False)
         self.assertEqual(runner.completed_trials, 2)
         self.assertTrue(bool(shared.quit_requested.value))
+
+    def test_estop_ended_trial_counts_and_keeps_its_running_time(self):
+        """V20: an epoch that truly began counts even without a recorder.
+
+        Without this the statistics denominator would lose that trial's
+        RUNNING wall time while its publications stayed in the numerator.
+        """
+        shared = _fake_shared(safety_state=int(SafetyState.RUNNING))
+        shared.estop_request.value = True
+        runner = self._runner(
+            shared=shared, recorder=None, run_started_ns=time.monotonic_ns()
+        )
+        runner._handle_run_boundary()
+        self.assertEqual(runner.completed_trials, 1)
+        self.assertGreater(runner.session_running_ns, 0)
+        self.assertIsNone(runner.run_started_ns)
+        self.assertEqual(int(shared.safety_state.value), int(SafetyState.FAULT))
 
     def test_saved_count_is_independent_of_trial_count(self):
         recorder = _FakeRecorderClient()

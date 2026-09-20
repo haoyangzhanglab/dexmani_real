@@ -19,6 +19,8 @@ from pathlib import Path
 
 import h5py
 
+# Only a genuinely missing dependency may skip this module: a renamed or
+# broken symbol must fail the suite rather than hide behind a skip.
 try:
     from dexmani_real.dataset.contracts import EpisodeAnnotation
     from dexmani_real.dataset.processing import analyze_episode
@@ -26,7 +28,7 @@ try:
     from tests.raw_episode_fixture import build_raw_episode
 
     _IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - environment guard
+except ImportError as exc:  # pragma: no cover - environment guard
     EpisodeAnnotation = None
     analyze_episode = None
     EpisodeReader = None

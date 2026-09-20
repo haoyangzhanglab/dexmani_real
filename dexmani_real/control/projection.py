@@ -17,16 +17,34 @@ from __future__ import annotations
 
 __all__ = [
     "ARM_COMMAND_JUMP_REJECTION",
+    "ArmClipReport",
     "project_arm_command",
+    "project_arm_command_reported",
     "project_hand_command",
     "validate_arm_command",
 ]
+
+from dataclasses import dataclass
 
 import numpy as np
 
 from dexmani_real.planning.paths import wrap_nearest_equivalent
 
 ARM_COMMAND_JUMP_REJECTION = "command jump limit violation"
+
+
+@dataclass(frozen=True)
+class ArmClipReport:
+    """Whether one arm projection actually truncated a command step.
+
+    The joint index and the pre-clip magnitude are reported so the producer
+    that owns the action identity can print one visible ``[CLIP]`` line per
+    really truncated action without re-deriving the clip condition.
+    """
+
+    clipped: bool = False
+    joint: int = -1
+    max_abs_delta_rad: float = 0.0
 
 
 def project_arm_command(
@@ -45,7 +63,29 @@ def project_arm_command(
     ``reference_arm_qpos`` must itself be limit-valid; anything else is a
     producer contract violation, not a recoverable miss. Raises
     ``ValueError`` on non-finite inputs or a broken projection invariant.
+
+    Producers that must report a real truncation visibly use
+    :func:`project_arm_command_reported` instead; the projection itself is
+    identical.
     """
+    return project_arm_command_reported(
+        target_arm_qpos,
+        reference_arm_qpos,
+        joint_lower_rad=joint_lower_rad,
+        joint_upper_rad=joint_upper_rad,
+        max_command_jump_rad=max_command_jump_rad,
+    )[0]
+
+
+def project_arm_command_reported(
+    target_arm_qpos: np.ndarray,
+    reference_arm_qpos: np.ndarray,
+    *,
+    joint_lower_rad: np.ndarray | tuple[float, ...],
+    joint_upper_rad: np.ndarray | tuple[float, ...],
+    max_command_jump_rad: float,
+) -> tuple[np.ndarray, ArmClipReport]:
+    """Project one arm endpoint and report whether the soft clip bit."""
     arm = np.asarray(target_arm_qpos, dtype=np.float64)
     reference = np.asarray(reference_arm_qpos, dtype=np.float64)
     for values, shape in ((arm, (7,)), (reference, (7,))):
@@ -60,6 +100,15 @@ def project_arm_command(
     delta = arm - reference
     limit = float(max_command_jump_rad)
     clipped = np.abs(delta) > limit
+    report = ArmClipReport()
+    if bool(clipped.any()):
+        # The pre-clip delta is the truncation the producer must report.
+        joint = int(np.argmax(np.abs(delta)))
+        report = ArmClipReport(
+            clipped=True,
+            joint=joint,
+            max_abs_delta_rad=float(np.abs(delta[joint])),
+        )
     arm[clipped] = reference[clipped] + np.clip(delta[clipped], -limit, limit)
     # Addition/subtraction can round beyond the strict float64 bound.
     outside = np.abs(arm - reference) > limit
@@ -71,7 +120,7 @@ def project_arm_command(
         or np.any(np.abs(arm - reference) > limit)
     ):
         raise ValueError("arm projection violated command invariants")
-    return arm
+    return arm, report
 
 
 def project_hand_command(

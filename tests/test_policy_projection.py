@@ -29,6 +29,8 @@ from dexmani_real.control.projection import (
     validate_arm_command,
 )
 
+# Only a genuinely missing dependency may skip this module: a renamed or
+# broken symbol must fail the suite rather than hide behind a skip.
 try:
     from dexmani_real.control.publication import PreparedCommand
     from dexmani_real.control.safety_gate import GateRejectCode
@@ -40,7 +42,7 @@ try:
     from dexmani_real.deployment.metrics import PolicyStats
 
     _IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - environment guard
+except ImportError as exc:  # pragma: no cover - environment guard
     PreparedCommand = None
     GateRejectCode = None
     _RejectKind = None
@@ -79,6 +81,34 @@ class ProjectionOwnerTest(unittest.TestCase):
             max_command_jump_rad=_JUMP,
         )
         self.assertTrue(np.array_equal(again, projected))
+
+    def test_reported_projection_names_the_truncation(self):
+        """A real truncation is reported for the producer's visible [CLIP] line."""
+        from dexmani_real.control.projection import project_arm_command_reported
+
+        reference = np.zeros(7)
+        target = np.full(7, 3.0)
+        projected, report = project_arm_command_reported(
+            target,
+            reference,
+            joint_lower_rad=_LOWER,
+            joint_upper_rad=_UPPER,
+            max_command_jump_rad=_JUMP,
+        )
+        self.assertTrue(report.clipped)
+        self.assertEqual(report.joint, 0)
+        self.assertAlmostEqual(report.max_abs_delta_rad, 3.0)
+        self.assertTrue(np.array_equal(projected, np.full(7, _JUMP)))
+        # A step inside the bound is not a truncation and stays silent.
+        _, quiet = project_arm_command_reported(
+            reference + 0.01,
+            reference,
+            joint_lower_rad=_LOWER,
+            joint_upper_rad=_UPPER,
+            max_command_jump_rad=_JUMP,
+        )
+        self.assertFalse(quiet.clipped)
+        self.assertEqual(quiet.joint, -1)
 
     def test_roundoff_guard_keeps_strict_bound(self):
         # reference + clip can round beyond the strict float64 bound; the

@@ -23,6 +23,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+# Only a genuinely missing dependency may skip this module: a renamed or
+# broken symbol must fail the suite rather than hide behind a skip.
 try:
     from dexmani_real.deployment.inference.observation import (
         _pointcloud_frame_from_record,
@@ -39,7 +41,7 @@ try:
     from dexmani_real.sensor.camera.worker import CameraHealth
 
     _IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - environment guard
+except ImportError as exc:  # pragma: no cover - environment guard
     _IMPORT_ERROR = exc
 
 _MS = 1_000_000
@@ -335,19 +337,57 @@ class RunBudgetRevocationTest(unittest.TestCase):
         self.assertEqual(int(shared.safety_state.value), int(SafetyState.RUNNING))
         self.assertEqual(int(shared.run_generation.value), 7)
 
-    def test_supervisor_budget_revoke_requires_running_epoch(self):
-        from dexmani_real.runtime.safety import read_run_state_snapshot
+    def test_supervisor_loop_enforces_the_run_budget(self):
+        """The real supervisor loop revokes an expired RUNNING epoch.
+
+        Driven through ``run_supervisor`` itself, not by re-implementing its
+        branch: the budget must fire while the control owner is blocked, and
+        the epoch must be fenced exactly once without a physical fault.
+        """
+        import threading
+
+        from dexmani_real.runtime.supervisor import run_supervisor
 
         shared = _BudgetShared(generation=5, state=SafetyState.RUNNING)
-        shared.run_started_monotonic_ns.value = time.monotonic_ns() - 10 * _S
-        snapshot = read_run_state_snapshot(shared)
-        self.assertIs(snapshot.state, SafetyState.RUNNING)
-        # The supervisor's budget branch: elapsed >= budget and generation
-        # re-verified under the lock.
-        elapsed_ns = time.monotonic_ns() - snapshot.started_monotonic_ns
-        self.assertGreaterEqual(elapsed_ns, 1 * _S)
-        self.assertTrue(revoke_motion_if_generation(shared, snapshot.generation))
-        self.assertEqual(int(shared.safety_state.value), int(SafetyState.ARMED))
+        shared.physical_home_completed = SimpleNamespace(value=True)
+        shared.start_request = SimpleNamespace(value=False)
+        shared.quit_requested = SimpleNamespace(value=False)
+        shared.session_failed = SimpleNamespace(value=False)
+        shared.run_started_monotonic_ns.value = time.monotonic_ns()
+        result: dict = {}
+
+        def target():
+            result["outcome"] = run_supervisor(
+                shared,
+                [],
+                status_interval_s=3600.0,
+                heartbeat_timeouts_s={},
+                supervisor_hz=200.0,
+                max_running_s=0.05,
+            )
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 5.0
+            while (
+                time.monotonic() < deadline
+                and int(shared.safety_state.value) != int(SafetyState.ARMED)
+            ):
+                time.sleep(0.01)
+            self.assertEqual(int(shared.safety_state.value), int(SafetyState.ARMED))
+            self.assertEqual(int(shared.run_generation.value), 6)
+            self.assertFalse(bool(shared.error_state.value))
+            # Only then does the control owner end the trial.
+            shared.quit_requested.value = True
+            thread.join(timeout=5.0)
+            self.assertFalse(thread.is_alive())
+            exit_reason, normal_exit = result["outcome"]
+            self.assertEqual(exit_reason, "shutdown requested")
+            self.assertTrue(normal_exit)
+        finally:
+            shared.is_running.value = False
+            thread.join(timeout=5.0)
 
 
 if __name__ == "__main__":
