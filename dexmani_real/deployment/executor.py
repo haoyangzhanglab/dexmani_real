@@ -92,7 +92,7 @@ from dexmani_real.utils.feedback import (
     FeedbackIssueCode,
     diagnose_arm_feedback,
 )
-from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.log import ThrottledWarner, get_logger
 
 logger = get_logger(__name__)
 
@@ -320,6 +320,7 @@ class PolicyRunner:
         fingertip_runtime: Any,
         execute: bool,
         max_running_s: float | None,
+        num_trials: int = 1,
         recording_config: RolloutRecordingConfig | None = None,
     ) -> None:
         self.shared = shared
@@ -331,13 +332,20 @@ class PolicyRunner:
         self.observation_id = 0
         self.execute = execute
         self.max_running_s = max_running_s
+        if type(num_trials) is not int or isinstance(num_trials, bool) or num_trials < 1:
+            raise ValueError("num_trials must be a positive integer")
         if recording_config is not None:
             if not isinstance(recording_config, RolloutRecordingConfig):
                 raise TypeError("recording_config must be a RolloutRecordingConfig")
             if not execute:
                 raise ValueError("recorded rollout requires execute=True")
-            if self.max_running_s != recording_config.max_running_s:
-                raise ValueError("rollout timeout must match max_running_s")
+            # The recorder capacity contract is derived from the RUN budget by
+            # the lifecycle; recording never owns or re-validates the plan.
+            if self.max_running_s is None:
+                raise ValueError(
+                    "recorded rollout requires an explicit max_running_s run budget"
+                )
+        self.num_trials = int(num_trials)
         self.recording_config = recording_config
         self.recorder = RecorderClient(shared) if recording_config is not None else None
         self.last_recorded_action: EpisodeAction | None = None
@@ -372,10 +380,19 @@ class PolicyRunner:
         self.previous_arm_command_qpos: np.ndarray | None = None
         # Transition marker for the visible observation WAIT/RESUME pair.
         self._observation_waiting_since_ns: int | None = None
-        self.num_episodes = (
-            recording_config.num_episodes if recording_config is not None else 1
-        )
-        self.completed_episodes = 0
+        # Run-owner trial budget: a trial counts exactly once when a truly
+        # begun trial ends; the saved-episode count is independent evidence
+        # status, never the termination condition.
+        self.completed_trials = 0
+        self.saved_episodes = 0
+        # Simple evidence-status fields (no state machine): the START channel
+        # became unusable, or at least one evidence error was marked. Neither
+        # ever terminates RUNNING control early.
+        self.recording_unavailable = False
+        self.evidence_failed = False
+        self.evidence_failure_reason: str | None = None
+        self._evidence_logged_this_trial = False
+        self._evidence_warn = ThrottledWarner(interval_s=2.0)
         self._recorder_start_wait_ms = 0.0
         self._pending_stop_reason: str | None = None
         self.last_metrics_flush_ns = time.monotonic_ns()
@@ -438,12 +455,29 @@ class PolicyRunner:
             stats=self.stats,
             aborted=aborted,
         )
+        # Trial counting belongs to the run owner: a truly begun trial counts
+        # exactly once here, independent of whether its evidence saved.
+        self.completed_trials += 1
+        self._evidence_logged_this_trial = False
         if self.recorder is not None:
             self._pending_stop_reason = stop_reason
             self.recorder.stop_episode(
                 save=recorder_save,
                 reason=stop_reason,
             )
+        logger.info(
+            "policy: trial %d/%d ended (%s); saved_episodes=%d",
+            self.completed_trials,
+            self.num_trials,
+            reason,
+            self.saved_episodes,
+        )
+        if self.completed_trials >= self.num_trials:
+            logger.info(
+                "policy: all %d requested trials complete; requesting shutdown",
+                self.num_trials,
+            )
+            self.shared.quit_requested.value = True
         self.run_started_ns = None
         self._clear_execution(None)
 
@@ -561,19 +595,25 @@ class PolicyRunner:
             return False
 
     def _poll_recorder(self) -> bool:
+        """Poll recorder results; in-band evidence errors never end control.
+
+        Only the run-budget-derived recording capacity (``max_frames``) still
+        ends the trial, through the ordinary fenced episode boundary. Writer,
+        polling, unexpected-finalization, and sampling failures change only
+        the evidence state; a required model-input sensor failure is handled
+        by its own producer worker (stall latch / heartbeat / error_state),
+        never through this evidence path.
+        """
         if self.recorder is None:
             return True
         was_stop_pending = self.recorder.stop_pending
         try:
             result = self.recorder.poll_stop()
-        except Exception:
-            finished = self._invalidate_rollout(
-                "RecorderIO status polling failed",
-                stop_reason="recorder_fault",
-                recorder_save=False,
+        except Exception as exc:
+            self._mark_evidence_failed(
+                f"RecorderIO status polling failed: {type(exc).__name__}: {exc}"
             )
-            self._request_failed_session_shutdown()
-            return not finished
+            return True
         ended = False
         if result.error:
             if (
@@ -588,12 +628,10 @@ class PolicyRunner:
                     result.error or "unknown error",
                 )
                 return True
-            ended = self._invalidate_rollout(
-                f"RecorderIO failed: {result.error or 'unknown error'}",
-                stop_reason="recorder_fault",
-                recorder_save=False,
+            self._mark_evidence_failed(
+                f"RecorderIO failed ({result.reason or 'unknown'}): "
+                f"{result.error or 'unknown error'}"
             )
-            self._request_failed_session_shutdown()
         elif (
             self.recorder.stop_pending or result.done
         ) and self.run_started_ns is not None:
@@ -604,13 +642,10 @@ class PolicyRunner:
                     recorder_save=True,
                 )
             else:
-                ended = self._invalidate_rollout(
+                self._mark_evidence_failed(
                     "RecorderIO finalized unexpectedly: "
-                    f"{result.reason or 'unknown reason'}",
-                    stop_reason="recorder_fault",
-                    recorder_save=False,
+                    f"{result.reason or 'unknown reason'}"
                 )
-                self._request_failed_session_shutdown()
         if result.done:
             self._complete_recording(result)
         return not ended
@@ -629,35 +664,32 @@ class PolicyRunner:
         """Consume terminal storage status once, after the motion fence.
 
         ``saved=True`` with no error is itself the save witness: RecorderIO
-        never upgrades a discard to a save, so this classifies every terminal
-        result without runner-side intent bookkeeping (the sample-ring
-        capacity stop is issued by the recorder client directly).
+        never upgrades a discard to a save. The saved count is independent
+        evidence status — it never gates control, and a failed finalization
+        marks evidence state without requesting quit or a motion fault.
         """
         pending_reason = self._pending_stop_reason
         self._pending_stop_reason = None
         self.shared.is_recording.value = False
         if result.error is not None:
-            self._request_failed_session_shutdown()
-            logger.critical(
-                "policy: rollout recording failed (%s): %s",
-                result.reason or pending_reason or "unknown",
-                result.error,
+            self._mark_evidence_failed(
+                f"rollout recording failed ({result.reason or pending_reason or 'unknown'}): "
+                f"{result.error}"
             )
         elif result.saved:
-            self.completed_episodes += 1
+            self.saved_episodes += 1
             print(
-                f"Episode {self.completed_episodes}/{self.num_episodes} saved",
+                f"Trial {self.completed_trials}/{self.num_trials}: episode saved "
+                f"({self.saved_episodes} saved)",
                 flush=True,
             )
-            logger.debug(
-                "policy: rollout episode saved: %s", result.path or "<unknown>"
+            logger.info(
+                "[RECORD] trial=%d reason=%s saved_rows=%d path=%s",
+                self.completed_trials,
+                result.reason or pending_reason or "stop",
+                result.frame_count,
+                result.path or "<unknown>",
             )
-            if self.completed_episodes >= self.num_episodes:
-                logger.info(
-                    "policy: all %d requested episodes saved; requesting shutdown",
-                    self.num_episodes,
-                )
-                self.shared.quit_requested.value = True
         else:
             logger.info(
                 "policy: rollout recording discarded (%s)",
@@ -731,7 +763,14 @@ class PolicyRunner:
         recording sample; RecorderIO preserves that source row without creating
         a second time grid. No source read here admits or rejects a robot command.
         """
-        if self.recorder is None or self.run_started_ns is None:
+        if (
+            self.recorder is None
+            or self.run_started_ns is None
+            or not self.recorder.is_recording
+        ):
+            # No recorder, no active trial, or this trial's evidence already
+            # ended (refused START / recorder-side failure): skipping rows is
+            # not a new failure and never re-reads sources for nothing.
             return
         if raw_action is None and (
             self._decision_recorded or now_ns < self.next_record_ns
@@ -830,17 +869,19 @@ class PolicyRunner:
                         kind=reject_kind,
                     )
             if not recorded:
+                if not (self.recorder.is_recording or self.recorder.stop_pending):
+                    # Evidence for this trial already ended on the recorder
+                    # side; skipping rows now is not a new failure.
+                    return
                 raise RuntimeError("rollout sample rejected by RecorderIO")
             self.next_record_ns = now_ns + self.step_dt_ns
             self._decision_recorded = raw_action is not None
         except Exception as exc:
-            logger.error("rollout recording failed", exc_info=True)
-            self._invalidate_rollout(
-                str(exc),
-                stop_reason="recording_failure",
-                recorder_save=False,
+            # A RUNNING-phase sampling/writer evidence error changes only the
+            # evidence state; it never ends control or latches a motion fault.
+            self._mark_evidence_failed(
+                f"rollout recording sample failed: {exc}", exc_info=True
             )
-            self._request_failed_session_shutdown()
 
     def _start_requested_episode(self) -> None:
         if not bool(self.shared.start_request.value):
@@ -858,52 +899,60 @@ class PolicyRunner:
                 self.shared.start_request.value = False
             logger.warning("policy: ignored B: %s", rejection)
             return
-        if self.recorder is not None:
+        if self.recorder is not None and not self.recording_unavailable:
             assert self.recording_config is not None
-            # Reserve the transaction before the bounded START wait so Q cannot
-            # let lifecycle shutdown race an in-flight recorder acknowledgement.
+            # One bounded START preparation while non-RUNNING; no async
+            # START and no pre-ACK sample buffer. Reserve the transaction
+            # before the bounded wait so Q cannot let lifecycle shutdown race
+            # an in-flight recorder acknowledgement.
             self.shared.is_recording.value = True
             recorder_start_ns = time.monotonic_ns()
             started = self.recorder.start_episode(
                 task_label=self.recording_config.task_label,
                 operator=self.recording_config.operator,
-                episode_name=f"episode_{self.completed_episodes + 1:03d}",
+                episode_name=f"episode_{self.completed_trials + 1:03d}",
             )
             self._recorder_start_wait_ms = (
                 time.monotonic_ns() - recorder_start_ns
             ) / 1e6
             if not started:
                 self.shared.is_recording.value = self.recorder.stop_pending
-                with self.shared.motion_lock:
-                    self.shared.start_request.value = False
-                if self.recorder.last_error is not None:
-                    # A terminal START failure never began motion; request a
-                    # failed-session shutdown instead of letting the operator
-                    # retry B indefinitely.
-                    logger.error(
-                        "policy: RecorderIO START failed terminally: %s",
-                        self.recorder.last_error,
+                if self.recorder.transport_unavailable:
+                    # A timed-out/corrupted START channel is never reused
+                    # while its finalizer may still be unfinished, never
+                    # auto-restarted, and no second same-owner writer is
+                    # opened: later trials simply run without recording.
+                    self.recording_unavailable = True
+                    self._mark_evidence_failed(
+                        "RecorderIO START channel unusable; this session records "
+                        f"no further trials: {self.recorder.last_error or 'unknown error'}"
                     )
-                    self._request_failed_session_shutdown()
+                else:
+                    # A refused START makes THIS trial's evidence unavailable;
+                    # it never rejects a valid B.
+                    self._mark_evidence_failed(
+                        "RecorderIO refused the recording START; the trial runs "
+                        f"without recording: {self.recorder.last_error or 'unknown error'}"
+                    )
+                # Fall through: after the preparation the lifecycle rechecks
+                # B/S/Q, generation, and start state below before RUNNING.
+            else:
+                self.shared.is_recording.value = True
+                rejection = _physical_start_pose_rejection(
+                    self.shared, self.runtime, execute=self.execute
+                )
+                if rejection is not None:
+                    with self.shared.motion_lock:
+                        self.shared.start_request.value = False
+                    self.recorder.stop_episode(
+                        save=False,
+                        reason="start_recheck_failed",
+                    )
+                    logger.warning("policy: cancelled rollout START: %s", rejection)
                     return
-                logger.warning(
-                    "policy: RecorderIO did not acknowledge the recording START: %s",
-                    self.recorder.last_error or "unknown error",
-                )
-                return
-            self.shared.is_recording.value = True
-            rejection = _physical_start_pose_rejection(
-                self.shared, self.runtime, execute=self.execute
-            )
-            if rejection is not None:
-                with self.shared.motion_lock:
-                    self.shared.start_request.value = False
-                self.recorder.stop_episode(
-                    save=False,
-                    reason="start_recheck_failed",
-                )
-                logger.warning("policy: cancelled rollout START: %s", rejection)
-                return
+        elif self.recorder is not None:
+            # Recording is unavailable for this session: the trial still runs.
+            self.shared.is_recording.value = False
 
         if self.recorder is None:
             epoch = begin_requested_motion(self.shared)
@@ -936,10 +985,17 @@ class PolicyRunner:
         self.stats = PolicyStats()
         self.last_metrics_flush_ns = epoch.started_monotonic_ns
         self.next_record_ns = epoch.started_monotonic_ns + self.step_dt_ns
+        self._evidence_logged_this_trial = False
         self._clear_execution(epoch.generation)
         self.model_runtime.reset_episode()
+        recording_note = (
+            "  [evidence unavailable — running without recording]"
+            if self.recorder is not None and not self.recorder.is_recording
+            else ""
+        )
         print(
-            f"Episode {self.completed_episodes + 1}/{self.num_episodes} RUNNING",
+            f"Trial {self.completed_trials + 1}/{self.num_trials} RUNNING"
+            f"{recording_note}",
             flush=True,
         )
         logger.debug("policy_runner_loop: RUNNING generation=%d", epoch.generation)
@@ -1072,16 +1128,41 @@ class PolicyRunner:
         supervisor runs verified non-FAULT shutdown. Internal contract
         violations (decode, rotation representation, projector invariants,
         preparation) are never swallowed as recoverable IK misses and never
-        presented as physical faults.
+        presented as physical faults. The recording prefix up to the failure
+        is technically valid evidence and stays saved with its technical stop
+        reason; quality selection happens offline.
         """
         self._invalidate_rollout(
-            reason, stop_reason="policy_failure", recorder_save=False
+            reason, stop_reason="policy_failure", recorder_save=True
         )
         self._request_failed_session_shutdown()
         if log_exc:
             logger.critical("policy: %s", reason, exc_info=True)
         else:
             logger.critical("policy: %s", reason)
+
+    def _mark_evidence_failed(self, reason: str, *, exc_info: bool = False) -> None:
+        """Move recording/evidence state to failed without touching control.
+
+        Sampling, writer, result-polling, and finalization errors during
+        RUNNING change only this evidence state: they never call the control
+        termination path, never request quit, and never latch a motion fault.
+        The session RESULT becomes non-zero at the natural end of control.
+        The first failure of each trial logs one full visible line; repeats
+        are throttled to avoid flooding at control rate.
+        """
+        self.evidence_failed = True
+        if self.evidence_failure_reason is None:
+            self.evidence_failure_reason = reason
+        if not self._evidence_logged_this_trial:
+            self._evidence_logged_this_trial = True
+            logger.error(
+                "[EVIDENCE] recording failed; control continues: %s",
+                reason,
+                exc_info=exc_info,
+            )
+        else:
+            self._evidence_warn("[EVIDENCE] recording still failing: %s", reason)
 
     def _decode_action(
         self, action: np.ndarray, feedback: CommandFeedbackSnapshot
@@ -1558,7 +1639,31 @@ class PolicyRunner:
                 if result.done:
                     self._complete_recording(result)
                 else:
-                    logger.error("rollout recording finalization timed out")
+                    self._mark_evidence_failed(
+                        "rollout recording finalization timed out"
+                    )
+            if (
+                self.evidence_failed
+                and not bool(self.shared.error_state.value)
+                and not bool(self.shared.estop_request.value)
+            ):
+                # Evidence failure makes the session RESULT non-zero only after
+                # control has ended naturally; it never requested an early end
+                # of RUNNING and never overrides a physical fault classification.
+                self.shared.session_failed.value = True
+            logger.info(
+                "policy session summary: trials=%d/%d saved_episodes=%d "
+                "evidence_failed=%s%s",
+                self.completed_trials,
+                self.num_trials,
+                self.saved_episodes,
+                self.evidence_failed,
+                (
+                    f" first_reason={self.evidence_failure_reason}"
+                    if self.evidence_failure_reason
+                    else ""
+                ),
+            )
 
 
 def _load_policy_runtime(config: PolicyRuntimeConfig) -> PolicyRuntime:
@@ -1587,6 +1692,7 @@ def policy_runner_loop(
     config: PolicyRuntimeConfig,
     execute: bool,
     max_running_s: float | None = None,
+    num_trials: int = 1,
     recording_config: RolloutRecordingConfig | None = None,
     fingertip_config: FingertipAssemblerConfig | None = None,
 ) -> None:
@@ -1611,6 +1717,7 @@ def policy_runner_loop(
             fingertip_runtime=fingertip_runtime,
             execute=execute,
             max_running_s=max_running_s,
+            num_trials=num_trials,
             recording_config=recording_config,
         )
         shared.set_heartbeat("policy", time.monotonic())

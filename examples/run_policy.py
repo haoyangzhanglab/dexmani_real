@@ -3,12 +3,16 @@
 
 ``python examples/run_policy.py EXPERIMENT [--artifact A] [--inference-steps N]
 [--seed S] [--num-episodes N] [--max-duration SEC] [--device D]`` runs one
-persistent multi-episode physical session (H -> scene setup -> B -> S per
-episode). The parent inspects and pins the deployment artifact, resolves the
-effective inference steps, creates a session directory and writes
-``run_config.yaml``, then hands a thin set of inputs to the deployment
-lifecycle. Task success is judged offline from the published raw episodes; this
-command records only technical stop reasons.
+persistent multi-trial physical session (H -> scene setup -> B -> S per
+trial). ``--num-episodes`` selects the number of TRIALS to run: a trial
+counts once when it truly begins and ends, while saved raw episodes are
+counted separately as evidence status (a trial whose recording failed still
+counts, and recording failure never ends control early — it makes the
+session result non-zero at its natural end). The parent inspects and pins the
+deployment artifact, resolves the effective inference steps, creates a
+session directory and writes ``run_config.yaml``, then hands a thin set of
+inputs to the deployment lifecycle. Task success is judged offline from the
+published raw episodes; this command records only technical stop reasons.
 
 Inference is synchronous: each query supplies PolicySpec.n_action_steps actions,
 dispatched in order at a cadence anchored to actual publication. The next query
@@ -91,14 +95,21 @@ def _parser() -> argparse.ArgumentParser:
         "--seed", type=_nonnegative_int, default=0, help="per-episode inference seed"
     )
     parser.add_argument(
-        "--num-episodes", type=_positive_int, default=1, help="episodes to save"
+        "--num-episodes",
+        dest="num_trials",
+        type=_positive_int,
+        default=1,
+        help=(
+            "trials to run; each truly begun trial counts once at its end, "
+            "independently of whether its recording saved"
+        ),
     )
     parser.add_argument(
         "--max-duration",
         dest="max_running_s",
         type=_positive_running_seconds,
         default=60.0,
-        help="per-episode running-seconds budget after B (default: 60)",
+        help="per-trial running-seconds budget after B (default: 60)",
     )
     parser.add_argument("--device", default="cuda:0")
     return parser
@@ -151,7 +162,7 @@ def _write_run_config(
     n_action_steps: int,
     seed: int,
     device: str,
-    num_episodes: int,
+    num_trials: int,
     max_duration_s: float,
 ) -> None:
     """Write the resolved experimental conditions before any worker starts."""
@@ -164,7 +175,7 @@ def _write_run_config(
         "n_action_steps": n_action_steps,
         "seed": seed,
         "device": device,
-        "num_episodes": num_episodes,
+        "num_trials": num_trials,
         "max_duration_s": float(max_duration_s),
     }
     (session_dir / "run_config.yaml").write_text(
@@ -179,7 +190,7 @@ def _print_summary(
     artifact: str,
     inference_steps: int,
     seed: int,
-    num_episodes: int,
+    num_trials: int,
     max_running_s: float,
     session_dir: Path,
 ) -> None:
@@ -192,8 +203,8 @@ def _print_summary(
     print(f"Artifact       : {artifact}")
     print(f"Inference steps: {inference_steps}")
     print(f"Seed           : {seed}")
-    print(f"Episodes       : {num_episodes}")
-    print(f"Max duration   : {max_running_s:g} s per episode")
+    print(f"Trials to run  : {num_trials} (saved episodes counted separately)")
+    print(f"Max duration   : {max_running_s:g} s per trial")
     print(f"Device         : {device}")
     print(f"Observation    : {' + '.join(fields)}")
     print(f"Action         : {spec.action_key} ({spec.control_action_dim}D)")
@@ -249,7 +260,7 @@ def main(argv: list[str] | None = None) -> int:
             n_action_steps=info.spec.n_action_steps,
             seed=args.seed,
             device=args.device,
-            num_episodes=args.num_episodes,
+            num_trials=args.num_trials,
             max_duration_s=args.max_running_s,
         )
     except Exception as exc:
@@ -274,8 +285,6 @@ def main(argv: list[str] | None = None) -> int:
         data_dir=str(session_dir),
         task_label=info.task_name,
         operator=getpass.getuser(),
-        max_running_s=args.max_running_s,
-        num_episodes=args.num_episodes,
     )
     _print_summary(
         info,
@@ -283,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
         artifact=info.checkpoint_name,
         inference_steps=inference_steps,
         seed=args.seed,
-        num_episodes=args.num_episodes,
+        num_trials=args.num_trials,
         max_running_s=args.max_running_s,
         session_dir=session_dir,
     )
@@ -297,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
             worker_config,
             True,
             max_running_s=args.max_running_s,
+            num_trials=args.num_trials,
             recording_config=recording_config,
         )
     except Exception as exc:

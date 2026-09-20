@@ -33,6 +33,7 @@ from dexmani_real.deployment.config import (
     PolicyRuntimeConfig,
     RolloutRecordingConfig,
     validate_max_running_s,
+    validate_num_trials,
     validate_policy_runtime_compatibility,
 )
 from dexmani_real.deployment.executor import policy_runner_loop
@@ -115,17 +116,21 @@ def _rollout_recorder_config(
     runtime: ExperimentConfig,
     rollout: RolloutRecordingConfig,
     worker_config: PolicyRuntimeConfig,
+    max_running_s: float,
+    num_trials: int,
 ) -> RecorderIOConfig:
     """Build the recorder capacity contract for one recorded rollout session.
 
-    The recorder-owned ``provenance_*`` attributes carry the resolved
-    experimental conditions (pinned artifact, effective inference steps, seed,
-    budget) so each published raw episode is self-describing without any git or
-    checksum provenance.
+    The frame capacity is DERIVED from the run-owner trial budget; recording
+    does not own or re-validate the run plan. The recorder-owned
+    ``provenance_*`` attributes carry the resolved experimental conditions
+    (pinned artifact, effective inference steps, seed, budget) so each
+    published raw episode is self-describing without any git or checksum
+    provenance.
     """
     control_hz = float(runtime.policy.control_hz)
     max_frames = (
-        math.ceil(float(rollout.max_running_s) * control_hz)
+        math.ceil(float(max_running_s) * control_hz)
         + _ROLLOUT_RECORDER_FRAME_MARGIN
     )
     return RecorderIOConfig(
@@ -141,7 +146,8 @@ def _rollout_recorder_config(
             "inference_steps": str(worker_config.inference_steps),
             "n_action_steps": str(worker_config.spec.n_action_steps),
             "seed": str(worker_config.seed),
-            "max_running_s": f"{float(rollout.max_running_s):.17g}",
+            "max_running_s": f"{float(max_running_s):.17g}",
+            "num_trials": str(int(num_trials)),
         },
     )
 
@@ -235,6 +241,7 @@ def build_policy_worker_specs(
     *,
     execute: bool,
     max_running_s: float | None = None,
+    num_trials: int = 1,
     recording_config: RolloutRecordingConfig | None = None,
 ) -> list[ProcessSpec]:
     """Build the workers required by the explicit deployment contract.
@@ -245,14 +252,15 @@ def build_policy_worker_specs(
     if not isinstance(worker_config, PolicyRuntimeConfig):
         raise TypeError("worker_config must be a PolicyRuntimeConfig")
     max_running_s = validate_max_running_s(max_running_s)
+    num_trials = validate_num_trials(num_trials)
     if recording_config is not None:
         if not isinstance(recording_config, RolloutRecordingConfig):
             raise TypeError("recording_config must be a RolloutRecordingConfig")
         if not execute:
             raise ValueError("recorded rollout requires execute=True")
-        if max_running_s != recording_config.max_running_s:
+        if max_running_s is None:
             raise ValueError(
-                "rollout max_running_s must match its recording contract"
+                "recorded rollout requires an explicit max_running_s run budget"
             )
     pointcloud_requested = _requires_pointcloud(policy_spec)
     camera_requested = _requires_camera(policy_spec) or recording_config is not None
@@ -307,11 +315,21 @@ def build_policy_worker_specs(
             )
         )
     if recording_config is not None:
+        assert max_running_s is not None
         specs.append(
             ProcessSpec(
                 "recorder",
                 recorder_io_loop,
-                (shared, _rollout_recorder_config(runtime, recording_config, worker_config)),
+                (
+                    shared,
+                    _rollout_recorder_config(
+                        runtime,
+                        recording_config,
+                        worker_config,
+                        max_running_s,
+                        num_trials,
+                    ),
+                ),
                 ready_name="recorder",
             )
         )
@@ -325,6 +343,7 @@ def build_policy_worker_specs(
                 worker_config,
                 execute,
                 max_running_s,
+                num_trials,
                 recording_config,
                 fingertip_config,
             ),
@@ -355,15 +374,17 @@ def run_policy_deployment(
     *,
     prefix: str | None = None,
     max_running_s: float | None = None,
+    num_trials: int = 1,
     recording_config: RolloutRecordingConfig | None = None,
 ) -> int:
-    """Run a persistent multi-episode policy deployment lifecycle and return its exit code.
+    """Run a persistent multi-trial policy deployment lifecycle and return its exit code.
 
     ``execute=False`` validates candidates without publication;
     ``execute=True`` enables coupled arm/hand publication. The policy runner
     must load and warm up before any hardware process is started. The runtime
     follows ``DISARMED -> hardware readiness -> ARMED -> supervision ->
-    verified shutdown``.
+    verified shutdown``. Trials and the per-trial budget are run-owner
+    configuration; recording is evidence and never gates the run plan.
     """
     if not isinstance(runtime, ExperimentConfig):
         raise TypeError("runtime must be an ExperimentConfig")
@@ -380,15 +401,11 @@ def run_policy_deployment(
     if worker_config.spec is not policy_spec:
         raise ValueError("worker PolicySpec must be the validated lifecycle PolicySpec")
     max_running_s = validate_max_running_s(max_running_s)
-    if recording_config is not None:
-        if (
-            max_running_s is not None
-            and max_running_s != recording_config.max_running_s
-        ):
-            raise ValueError(
-                "rollout max_running_s must match its recording contract"
-            )
-        max_running_s = recording_config.max_running_s
+    num_trials = validate_num_trials(num_trials)
+    if recording_config is not None and max_running_s is None:
+        raise ValueError(
+            "recorded rollout requires an explicit max_running_s run budget"
+        )
     logger.debug(
         "policy deployment: experiment=%s runtime=%s device=%s seed=%s execute=%s",
         worker_config.experiment,
@@ -440,6 +457,7 @@ def run_policy_deployment(
             worker_config,
             execute=execute,
             max_running_s=max_running_s,
+            num_trials=num_trials,
             recording_config=recording_config,
         )
         procs = build_processes(ctx, specs)
@@ -646,10 +664,27 @@ def run_policy_deployment(
             and int(shared.safety_state.value) == int(SafetyState.DISARMED)
         )
         safety_name = SafetyState(int(shared.safety_state.value)).name
+        # Three simple outcome facts, never conflated: why control ended,
+        # whether the evidence result failed the session, and whether cleanup
+        # was verified. A system timeout/stop is never reported as success.
+        if bool(shared.error_state.value) or bool(shared.estop_request.value):
+            recording_status = "unknown (physical fault path)"
+        elif bool(shared.session_failed.value):
+            recording_status = "failed"
+        elif recording_config is None:
+            recording_status = "not recording"
+        else:
+            recording_status = "no evidence failure observed"
         print(f"\n── Session End ──")
+        print(f"  control_reason  = {exit_reason}")
+        print(f"  recording_status= {recording_status}")
         print(
-            f"  exit_reason={exit_reason}  safety={safety_name}  "
-            f"supervisor_normal={normal_exit}  clean={clean_exit}"
+            "  cleanup_status  = "
+            + ("clean" if clean_exit else "incomplete-or-failed")
+        )
+        print(
+            f"  safety={safety_name}  supervisor_normal={normal_exit}  "
+            f"clean_exit={clean_exit}"
         )
         print("──")
         return 0 if clean_exit else 1

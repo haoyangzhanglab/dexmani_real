@@ -323,22 +323,31 @@ class PolicyRuntimeConfig:
             raise ValueError("inference_steps must be a positive integer")
 
 
+def validate_num_trials(num_trials: Any) -> int:
+    """Validate the run-owner trial budget (trials to run, not saves)."""
+    if isinstance(num_trials, bool) or type(num_trials) is not int:
+        raise TypeError("num_trials must be a positive integer")
+    if num_trials < 1:
+        raise ValueError("num_trials must be a positive integer")
+    return int(num_trials)
+
+
 @dataclass(frozen=True)
 class RolloutRecordingConfig:
     """Resolved recording inputs for one physical policy rollout session.
 
     ``data_dir`` is an isolated absolute output directory (the session
     directory); the CLI owns selector/path validation before workers start.
-    This pickle-safe object carries only recording inputs — task success is
-    judged offline from the published raw episodes, and the runtime records
+    This pickle-safe object carries only evidence-recording inputs — the run
+    plan (trials, per-trial budget) is run configuration owned by the
+    lifecycle, never part of the recording correctness contract. Task success
+    is judged offline from the published raw episodes, and the runtime records
     only technical stop reasons.
     """
 
     data_dir: str
     task_label: str
     operator: str
-    max_running_s: float
-    num_episodes: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.data_dir, str) or not self.data_dir.strip():
@@ -357,15 +366,7 @@ class RolloutRecordingConfig:
                 raise ValueError(
                     f"rollout {field_name} must not have surrounding whitespace"
                 )
-        if isinstance(self.max_running_s, bool):
-            raise TypeError("rollout max_running_s must be a finite positive number")
-        timeout_s = float(self.max_running_s)
-        if not math.isfinite(timeout_s) or timeout_s <= 0.0:
-            raise ValueError("rollout max_running_s must be finite and positive")
-        if type(self.num_episodes) is not int or self.num_episodes < 1:
-            raise ValueError("rollout num_episodes must be a positive int")
         object.__setattr__(self, "data_dir", str(resolved_data_dir))
-        object.__setattr__(self, "max_running_s", timeout_s)
 
 
 @dataclass(frozen=True)
@@ -406,4 +407,5 @@ __all__ = [
     "RolloutRecordingConfig",
     "validate_policy_runtime_compatibility",
     "validate_max_running_s",
+    "validate_num_trials",
 ]

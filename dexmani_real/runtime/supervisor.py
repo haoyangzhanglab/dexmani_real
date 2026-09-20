@@ -181,6 +181,7 @@ def run_supervisor(
     max_running_ns = (
         None if max_running_s is None else int(float(max_running_s) * 1e9)
     )
+    service_failure_deferred = False
     try:
         while True:
             if max_running_ns is not None:
@@ -241,9 +242,26 @@ def run_supervisor(
                 break
             if reason is ExitReason.SERVICE_FAILURE:
                 shared.session_failed.value = True
-                normal_exit = True
-                exit_reason = "session/service failure"
-                break
+                if (
+                    int(shared.safety_state.value) == int(SafetyState.RUNNING)
+                ):
+                    # Evidence-role service failure (recorder/evidence-only
+                    # camera death, heartbeat loss, or a deferred evidence
+                    # latch) must never terminate a RUNNING trial early: the
+                    # session result is marked failed and supervision waits
+                    # for the natural end of control. The stopped service's
+                    # process handle stays registered for the final join.
+                    if not service_failure_deferred:
+                        service_failure_deferred = True
+                        logger.error(
+                            "[EVIDENCE] service failure during RUNNING — evidence "
+                            "unavailable for the rest of the session; control "
+                            "continues to its natural end"
+                        )
+                else:
+                    normal_exit = True
+                    exit_reason = "session/service failure"
+                    break
             if reason is ExitReason.EXPLICIT_QUIT:
                 normal_exit = True
                 exit_reason = "shutdown requested"

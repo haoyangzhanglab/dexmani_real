@@ -208,7 +208,9 @@ python examples/visualize_episode_processed.py <processed.h5> --info
 python examples/run_policy.py <policy/task/experiment>
 ```
 
-常用实验参数包括 artifact、inference steps、seed、episode 数量、单 episode 时长和 device，例如：
+常用实验参数包括 artifact、inference steps、seed、trial 数量（`--num-episodes` 选择要运行的
+trial 数：真正 begin 的 trial 结束时恰好计一次，与保存的 episode 数独立；录制失败不会提前
+终止控制，只会在会话自然结束时使结果非零）、单 trial 时长和 device，例如：
 
 ```bash
 python examples/run_policy.py <policy/task/experiment> \
