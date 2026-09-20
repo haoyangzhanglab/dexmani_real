@@ -90,6 +90,7 @@ from dexmani_real.runtime.safety import (
     begin_requested_motion,
     read_run_state_snapshot,
     revoke_motion,
+    RunEndReason,
 )
 from dexmani_real.sensor.camera.worker import CameraHealth
 from dexmani_real.utils.feedback import (
@@ -291,22 +292,28 @@ def _end_policy_run(
     *,
     stats: PolicyStats,
     aborted: bool,
+    stop_reason: str,
+    trial_generation: int,
 ) -> None:
     """Fence one episode into ARMED without converting policy failure to FAULT."""
-    shared.physical_home_completed.value = False
-    lifecycle_faulted = bool(
-        shared.error_state.value
-        or shared.estop_request.value
-        or int(shared.safety_state.value) == int(SafetyState.FAULT)
-    )
-    if not lifecycle_faulted and int(shared.safety_state.value) == int(
-        SafetyState.RUNNING
-    ):
-        if not revoke_motion(shared, SafetyState.ARMED):
-            shared.error_state.value = True
-            revoke_motion(shared, SafetyState.FAULT)
-            aborted = True
-            logger.critical("policy: failed to fence episode into ARMED (%s)", reason)
+    with shared.motion_lock:
+        if int(shared.run_started_generation.value) != trial_generation:
+            return  # An old owner/callback cannot revoke a newer trial.
+        shared.physical_home_completed.value = False
+        lifecycle_faulted = bool(
+            shared.error_state.value
+            or shared.estop_request.value
+            or int(shared.safety_state.value) == int(SafetyState.FAULT)
+        )
+        if int(shared.safety_state.value) == int(SafetyState.RUNNING):
+            if not revoke_motion(
+                shared, SafetyState.FAULT if lifecycle_faulted else SafetyState.ARMED,
+                reason=RunEndReason.__members__.get(stop_reason.upper(), RunEndReason.EXECUTOR_BOUNDARY),
+            ):
+                shared.error_state.value = True
+                revoke_motion(shared, SafetyState.FAULT)
+                aborted = True
+                logger.critical("policy: failed to fence episode into ARMED (%s)", reason)
     stats.flush(prefix="policy final metrics", debug=True)
     stats.log_summary()
     if aborted:
@@ -383,6 +390,7 @@ class PolicyRunner:
         self._fifo_wait = PublishWaitTracker("policy")
 
         self.run_generation: int | None = None
+        self._trial_generation: int | None = None
         self.run_started_ns: int | None = None
         self.last_publication_ns: int | None = None
         self.previous_arm_command_qpos: np.ndarray | None = None
@@ -417,21 +425,27 @@ class PolicyRunner:
         self.session_running_ns = 0
         self.session_inference_ms: list[float] = []
 
-    def _clear_execution(self, generation: int | None) -> None:
+    def _drop_unpublished(self, reason: str, *, prediction_count: int | None = None) -> None:
+        """One owner counts/logs a real suffix and closes its wait span."""
+        count = len(self.actions) if prediction_count is None else prediction_count
+        if count:
+            logger.warning(
+                "[DROP] policy gen=%s q=%s idx=%s remaining=%d reason=%s",
+                self.run_generation, self.observation_id, self.chunk_action_index, count, reason,
+            )
+        self._fifo_wait.note_dropped(reason, report=not bool(count))
+        self.actions.clear()
+        self._pending_dispatch = None
+        self.chunk_sources.clear()
+        self.chunk_action_index = 0
+
+    def _clear_execution(self, generation: int | None, *, reason: str = "epoch_boundary") -> None:
+        self._drop_unpublished(reason)
         self.run_generation = generation
         self.last_publication_ns = None
         self.previous_arm_command_qpos = None
         self.last_recorded_action = None
-        self.actions.clear()
-        if self._pending_dispatch is not None or self._fifo_wait.waiting:
-            # Epoch/trial boundary: an uncommitted kept candidate is discarded
-            # here, so the backpressure span ends with its own visible line and
-            # the next trial's [WAIT] starts from a clean state.
-            self._fifo_wait.note_dropped("epoch_boundary")
-        self._pending_dispatch = None
         self._observation_waiting_since_ns = None
-        self.chunk_sources.clear()
-        self.chunk_action_index = 0
         self.observation_id = 0
 
     def _invalidate_chunk(self, reason: str) -> None:
@@ -447,22 +461,7 @@ class PolicyRunner:
         queue-empty iteration builds a fresh causal observation and performs
         a fresh blocking inference.
         """
-        # One visible line per real chunk discard; the dropped actions never
-        # reach the SDK and the next query replaces them.
-        logger.warning(
-            "[DROP] policy gen=%s q=%s idx=%s remaining=%d reason=%s",
-            self.run_generation,
-            self.observation_id,
-            self.chunk_action_index,
-            len(self.actions),
-            reason,
-        )
-        self.actions.clear()
-        if self._pending_dispatch is not None:
-            self._pending_dispatch = None
-            self._fifo_wait.note_dropped(reason)
-        self.chunk_sources.clear()
-        self.chunk_action_index = 0
+        self._drop_unpublished(reason)
 
     def _finish_episode(
         self,
@@ -479,13 +478,22 @@ class PolicyRunner:
             reason,
             stats=self.stats,
             aborted=aborted,
+            stop_reason=stop_reason,
+            trial_generation=self._trial_generation,
         )
+        terminal = read_run_state_snapshot(self.shared)
+        if (terminal.ended_started_monotonic_ns != self.run_started_ns
+                or terminal.ended_generation != self._trial_generation
+                or terminal.ended_reason is RunEndReason.NONE):
+            raise RuntimeError("RUNNING ended without its matching software terminal fact")
+        stop_reason = terminal.ended_reason.name.lower()
+        reason = stop_reason
         # Trial counting belongs to the run owner: a truly begun trial counts
         # exactly once here, independent of whether its evidence saved.
         self.completed_trials += 1
         self._evidence_logged_this_trial = False
         self.session_running_ns += max(
-            0, time.monotonic_ns() - int(self.run_started_ns)
+            0, terminal.ended_monotonic_ns - int(self.run_started_ns)
         )
         if (
             self.recorder is not None
@@ -509,7 +517,7 @@ class PolicyRunner:
             )
             self.shared.quit_requested.value = True
         self.run_started_ns = None
-        self._clear_execution(None)
+        self._clear_execution(None, reason=stop_reason)
 
     def _invalidate_rollout(
         self, reason: str, *, stop_reason: str, recorder_save: bool
@@ -978,6 +986,7 @@ class PolicyRunner:
         if self.execute:
             self.shared.physical_home_completed.value = False
         self.run_started_ns = epoch.started_monotonic_ns
+        self._trial_generation = epoch.generation
         self.stats = PolicyStats()
         self.last_metrics_flush_ns = epoch.started_monotonic_ns
         self.next_record_ns = epoch.started_monotonic_ns + self.step_dt_ns
@@ -1486,25 +1495,15 @@ class PolicyRunner:
     def _run_active_tick(self, now_ns: int) -> None:
         assert self.run_started_ns is not None
         if not self._running_generation_is_live():
-            # Batch-invalidate this epoch's uncommitted predictions with one
-            # visible line; the queued FIFO records are invalidated under the
-            # motion lock by the revocation itself.
-            if self.actions or self._pending_dispatch is not None:
-                logger.warning(
-                    "[DROP] policy q=%s uncommitted_actions=%d reason=generation_revoked",
-                    self.run_generation,
-                    len(self.actions),
-                )
-                self._fifo_wait.note_dropped("generation_revoked")
-            self.actions.clear()
-            self._pending_dispatch = None
             self._handle_run_boundary()
-            # Also end a RUNNING epoch whose generation changed externally.
-            if (
-                self.run_started_ns is not None
-                and not self._running_generation_is_live()
-            ):
-                self._finish_episode("motion generation changed")
+            if self.run_started_ns is not None and not self._running_generation_is_live():
+                snapshot = read_run_state_snapshot(self.shared)
+                if snapshot.state is SafetyState.RUNNING and snapshot.started_monotonic_ns == self.run_started_ns:
+                    # A command-only pause/rebase is not a trial end. Discard
+                    # old intent and re-anchor on the next normal control tick.
+                    self._clear_execution(snapshot.generation, reason="command_epoch_changed")
+                else:
+                    self._finish_episode("motion generation changed")
             return
         if self._running_time_expired(now_ns):
             return
@@ -1577,8 +1576,10 @@ class PolicyRunner:
         # Main can revoke motion during blocking inference. Never accept its
         # result before rechecking the episode's original generation/state.
         if not self._running_generation_is_live():
-            self._invalidate_chunk("inference_run_boundary")
+            self._drop_unpublished("inference_run_boundary", prediction_count=len(predicted))
             return
+        if self.max_running_ns is not None and finished_ns - self.run_started_ns >= self.max_running_ns:
+            self._drop_unpublished("timeout", prediction_count=len(predicted))
         if self._running_time_expired(finished_ns) or not self._poll_recorder():
             return
         self.chunk_sources = observation_sources(observation)

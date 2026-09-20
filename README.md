@@ -441,3 +441,5 @@ git status --short
 ```
 
 不要因为离线检查通过就声称完成真实硬件验证。
+
+有效 publication rate 的分母为各 trial 的软件 RUNNING epoch 时长：由 motion 撤销边界记录首次结束时间，阻塞推理迟返不延长它。这不代表机械臂或手已物理停止或收敛。

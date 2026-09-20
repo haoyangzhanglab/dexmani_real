@@ -147,6 +147,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.session_publication_count = 0
         runner.session_running_ns = 0
         runner.session_inference_ms = []
+        runner.max_running_ns = None
         runner.step_dt_ns = _STEP_DT_NS
         runner.chunk_sources = {}
         runner.chunk_action_index = 0
@@ -188,6 +189,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
     def test_next_control_boundary_ns(self):
         runner = PolicyRunner.__new__(PolicyRunner)
         runner.last_publication_ns = None
+        runner.max_running_ns = None
         runner.step_dt_ns = _STEP_DT_NS
         self.assertIsNone(runner._next_control_boundary_ns())
         runner.last_publication_ns = 1_000_000_000
@@ -257,7 +259,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.chunk_sources = {"arm": (100, 200)}
         runner.actions = deque([np.array([1.0]), np.array([2.0])])
         runner._pending_dispatch = object()
-        runner._fifo_wait = SimpleNamespace(waiting=False, note_dropped=lambda reason: None)
+        runner._fifo_wait = SimpleNamespace(waiting=False, note_dropped=lambda reason, **kw: None)
 
         runner._invalidate_chunk("test_reason")
 
@@ -293,7 +295,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner._fifo_wait = executor_module.PublishWaitTracker("test")
         runner._fifo_wait.note_full(8, 813)
 
-        with self.assertLogs("dexmani_real.control.publication", level="WARNING") as logs:
+        with self.assertLogs("dexmani_real.deployment.executor", level="WARNING") as logs:
             runner._clear_execution(None)
 
         self.assertEqual(runner.observation_id, 0)
@@ -302,7 +304,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
         self.assertIsNone(runner._observation_waiting_since_ns)
         self.assertIsNone(runner.previous_arm_command_qpos)
         self.assertFalse(runner._fifo_wait.waiting)
-        self.assertIn("keep_action=813", "\n".join(logs.output))
+        self.assertIn("remaining=1", "\n".join(logs.output))
         self.assertIn("reason=epoch_boundary", "\n".join(logs.output))
 
     # --- lifecycle invariant -----------------------------------------------
@@ -325,7 +327,11 @@ class SyncPolicyTimingTest(unittest.TestCase):
 
         runner.model_runtime.predict = revoke
 
-        runner._run_active_tick(0)
+        with self.assertLogs("dexmani_real.deployment.executor", level="WARNING") as logs:
+            runner._run_active_tick(0)
+        drops = [line for line in logs.output if "[DROP]" in line]
+        self.assertEqual(len(drops), 1)
+        self.assertIn("remaining=8", drops[0])
 
         self.assertEqual(self.published, [])
         self.assertEqual(list(runner.actions), [])

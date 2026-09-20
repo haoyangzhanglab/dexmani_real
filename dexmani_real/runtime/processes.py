@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Collection, Iterable
 
-from dexmani_real.runtime.safety import SafetyState, transition
+from dexmani_real.runtime.safety import SafetyState, RunEndReason, revoke_motion, transition
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -147,6 +147,9 @@ def stop_processes_verified(
 ) -> tuple[ProcessExit, ...]:
     """Stop every worker without closing IPC that another local thread may use."""
     procs = list(processes)
+    # Fence before any blocking join; record the software end if still RUNNING.
+    if _shared_value(shared, "safety_state") == int(SafetyState.RUNNING):
+        revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
     shared.is_running.value = False
     exits: list[ProcessExit] = []
     deadline = time.monotonic() + graceful_timeout_s

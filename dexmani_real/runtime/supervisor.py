@@ -13,6 +13,8 @@ import numpy as np
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.runtime.safety import (
     SafetyState,
+    RunEndReason,
+    revoke_motion,
     read_run_state_snapshot,
     revoke_motion_if_generation,
     transition,
@@ -188,7 +190,7 @@ def run_supervisor(
                     and snapshot.started_monotonic_ns > 0
                     and time.monotonic_ns() - int(snapshot.started_monotonic_ns)
                     >= max_running_ns
-                    and revoke_motion_if_generation(shared, snapshot.generation)
+                    and revoke_motion_if_generation(shared, snapshot.generation, reason=RunEndReason.TIMEOUT)
                 ):
                     logger.warning(
                         "[SUPERVISOR] run budget %.1fs exceeded — motion revoked "
@@ -245,10 +247,12 @@ def run_supervisor(
             if reason is ExitReason.SERVICE_FAILURE:
                 normal_exit = True
                 exit_reason = "terminal session failure"
+                revoke_motion(shared, reason=RunEndReason.POLICY_FAILURE)
                 break
             if reason is ExitReason.EXPLICIT_QUIT:
                 normal_exit = True
                 exit_reason = "shutdown requested"
+                revoke_motion(shared, reason=RunEndReason.QUIT)
                 break
 
             if now - last_status_s >= status_interval_s:

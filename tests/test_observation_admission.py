@@ -342,6 +342,12 @@ class _BudgetShared:
         self.estop_request = SimpleNamespace(value=False)
         self.safety_state = SimpleNamespace(value=int(state))
         self.run_started_monotonic_ns = SimpleNamespace(value=0)
+        self.run_started_generation = SimpleNamespace(value=0)
+        self.run_ended_generation = SimpleNamespace(value=0)
+        self.run_ended_started_monotonic_ns = SimpleNamespace(value=0)
+        self.run_ended_monotonic_ns = SimpleNamespace(value=0)
+        self.run_ended_reason = SimpleNamespace(value=0)
+
         self.stop_request = SimpleNamespace(value=0)
         self.coupled_cmd_ring = SimpleNamespace(latest_sequence=0)
 

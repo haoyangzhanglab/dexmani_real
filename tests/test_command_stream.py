@@ -99,6 +99,12 @@ class _FakeShared:
         self.estop_request = ctx.Value("b", False)
         self.safety_state = ctx.Value("i", int(SafetyState.RUNNING))
         self.run_started_monotonic_ns = ctx.Value("Q", 0)
+        self.run_started_generation = ctx.Value("Q", 0)
+        self.run_ended_generation = ctx.Value("Q", 0)
+        self.run_ended_started_monotonic_ns = ctx.Value("Q", 0)
+        self.run_ended_monotonic_ns = ctx.Value("Q", 0)
+        self.run_ended_reason = ctx.Value("Q", 0)
+
         self.stop_request = ctx.Value("b", 0)
         self.arm_state_ring = _StateRing()
         self.hand_state_ring = _StateRing()
@@ -771,6 +777,15 @@ class WorkerEpochInterleavingTest(_TransportTest):
                 setattr(sdk, "servo" if name == "arm" else "send_action", original)
                 tick(int(self.shared.run_generation.value))
                 self.assertEqual(consumer.next_sequence, receipt.command.sequence + 2)
+
+    def test_consumed_fifo_epoch_does_not_report_pending_drop(self):
+        from unittest.mock import patch
+        consumer, sdk, tick = self._worker("arm")
+        _publish(self.shared, 906, arm=.05)
+        tick(_GEN)
+        with patch("dexmani_real.runtime.safety.logger.info") as log:
+            invalidate_coupled_commands(self.shared)
+        self.assertFalse(any("[DROP]" in str(call) for call in log.call_args_list))
 
     def test_revocation_at_final_sdk_fence_prevents_send(self):
         from unittest.mock import patch

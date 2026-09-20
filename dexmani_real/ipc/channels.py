@@ -189,6 +189,12 @@ class RuntimeChannels:
     )
     run_generation: Any  # controller advances it to invalidate old policy proposals
     run_started_monotonic_ns: Any  # start of the current RUNNING observation epoch
+    # Latest software RUNNING terminal snapshot; safety owns writes under motion_lock.
+    run_started_generation: Any  # run identity survives command-only rebases
+    run_ended_generation: Any
+    run_ended_started_monotonic_ns: Any
+    run_ended_monotonic_ns: Any
+    run_ended_reason: Any
     recorder_consumed_sequence: Any
     # Ordered command-FIFO consumption watermarks (one per attached worker
     # consumer; -1 means the consumer never attached and it is excluded from
@@ -343,6 +349,11 @@ class RuntimeChannels:
         storage.arm_command_seq = ctx.Value("Q", 0)
         storage.run_generation = ctx.Value("Q", 1)
         storage.run_started_monotonic_ns = ctx.Value("Q", 0)
+        storage.run_started_generation = ctx.Value("Q", 0)
+        storage.run_ended_generation = ctx.Value("Q", 0)
+        storage.run_ended_started_monotonic_ns = ctx.Value("Q", 0)
+        storage.run_ended_monotonic_ns = ctx.Value("Q", 0)
+        storage.run_ended_reason = ctx.Value("i", 0)
         storage.recorder_consumed_sequence = ctx.Value("Q", 0)
         storage.arm_cmd_consumed_sequence = ctx.Value("q", -1)
         storage.hand_cmd_consumed_sequence = ctx.Value("q", -1)

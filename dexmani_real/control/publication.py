@@ -106,18 +106,19 @@ class PublishWaitTracker:
         )
         self._reset()
 
-    def note_dropped(self, reason: str) -> None:
+    def note_dropped(self, reason: str, *, report: bool = True) -> None:
         """Report the kept candidate revoked by lifecycle while waiting."""
         if self._waiting_since_ns is None:
             return
         wait_ms = (time.monotonic_ns() - self._waiting_since_ns) / 1e6
-        logger.warning(
-            "[DROP] %s command_fifo keep_action=%d wait_ms=%.0f dropped=1 reason=%s",
-            self._label,
-            self._keep_action_id,
-            wait_ms,
-            reason,
-        )
+        if report:
+            logger.warning(
+                "[DROP] %s command_fifo keep_action=%d wait_ms=%.0f dropped=1 reason=%s",
+                self._label,
+                self._keep_action_id,
+                wait_ms,
+                reason,
+            )
         self._reset()
 
     def _reset(self) -> None:

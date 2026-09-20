@@ -93,6 +93,12 @@ def _fake_shared(*, safety_state: int = int(SafetyState.ARMED)):
         run_generation=SimpleNamespace(value=5),
         run_generation_base_sequence=SimpleNamespace(value=0),
         run_started_monotonic_ns=SimpleNamespace(value=0),
+        run_started_generation=SimpleNamespace(value=0),
+        run_ended_generation=SimpleNamespace(value=0),
+        run_ended_started_monotonic_ns=SimpleNamespace(value=0),
+        run_ended_monotonic_ns=SimpleNamespace(value=0),
+        run_ended_reason=SimpleNamespace(value=0),
+
         arm_cmd_consumed_sequence=SimpleNamespace(value=-1),
         hand_cmd_consumed_sequence=SimpleNamespace(value=-1),
         coupled_cmd_ring=SimpleNamespace(latest_sequence=0, maxlen=4),
@@ -130,7 +136,11 @@ class _RunnerTest(unittest.TestCase):
         runner._recording_outcome_consumed = runner._recording_trial_id is None
         runner._recorder_start_wait_ms = 0.0
         runner.run_started_ns = run_started_ns
+        if run_started_ns is not None:
+            runner.shared.run_started_monotonic_ns.value = run_started_ns
+            runner.shared.safety_state.value = int(SafetyState.RUNNING)
         runner.run_generation = None
+        runner._trial_generation = runner.shared.run_started_generation.value
         runner.last_publication_ns = None
         runner.previous_arm_command_qpos = None
         runner._observation_waiting_since_ns = None
@@ -154,7 +164,7 @@ class _RunnerTest(unittest.TestCase):
             waiting=False,
             note_full=lambda *a: None,
             note_committed=lambda: None,
-            note_dropped=lambda reason: None,
+            note_dropped=lambda reason, **kw: None,
         )
         return runner
 
@@ -172,6 +182,7 @@ class TrialCountingTest(_RunnerTest):
         self.assertEqual(runner.completed_trials, 1)
         # The second begun trial ends the run at the trial budget.
         runner.run_started_ns = 2
+        shared.run_started_monotonic_ns.value = 2
         shared.safety_state.value = int(SafetyState.RUNNING)
         runner._finish_episode("operator stop", stop_reason="operator", aborted=False)
         self.assertEqual(runner.completed_trials, 2)
@@ -607,3 +618,122 @@ class VerifiedEvidenceCleanupTest(unittest.TestCase):
         self.assertTrue(shared.evidence_failed.value)
         self.assertFalse(shared.error_state.value)
         self.assertFalse(shared.session_failed.value)
+
+class RunTerminationFactsTest(_RunnerTest):
+    def test_external_stop_before_late_predict_return_uses_actual_end(self):
+        from unittest.mock import patch
+        from test_sync_policy_timing import _Clock
+        from dexmani_real.runtime.safety import request_policy_stop
+        clock = _Clock(1_000_000_000)
+        runner = self._runner()
+        with patch("dexmani_real.runtime.safety.time", clock), patch("dexmani_real.deployment.executor.time", clock):
+            runner.shared.start_request.value = True
+            runner._start_requested_episode()
+            clock.ns = 3_000_000_000  # relative t=2: external S during predict
+            request_policy_stop(runner.shared)
+            clock.ns = 11_000_000_000  # relative t=10: predict finally returns
+            runner._handle_run_boundary()
+        self.assertEqual(runner.session_running_ns, 2_000_000_000)
+        self.assertEqual(runner.completed_trials, 1)
+
+    def test_epoch_clear_reports_the_entire_unpublished_suffix_once(self):
+        from dexmani_real.control.publication import PublishWaitTracker
+        runner = self._runner(run_started_ns=1)
+        runner.run_generation = 5
+        runner.observation_id = 21
+        runner.actions = deque(range(7))  # first of eight already committed
+        runner.chunk_action_index = 1
+        runner._pending_dispatch = object()
+        runner._fifo_wait = PublishWaitTracker("policy")
+        runner._fifo_wait.note_full(4, 200)
+        with self.assertLogs(level="INFO") as logs:
+            runner._clear_execution(None)
+        drops = [line for line in logs.output if "[DROP]" in line]
+        self.assertEqual(len(drops), 1)
+        self.assertIn("remaining=7", drops[0])
+        self.assertIn("q=21", drops[0])
+        self.assertFalse(runner._fifo_wait.waiting)
+
+class FirstTerminalFactTest(_RunnerTest):
+    def test_first_fact_survives_repeated_stop_home_cleanup_and_next_trial(self):
+        from unittest.mock import patch
+        from test_sync_policy_timing import _Clock
+        from dexmani_real.runtime.safety import (RunEndReason, request_policy_stop,
+            read_run_state_snapshot, revoke_motion, invalidate_coupled_commands)
+        clock = _Clock(0)
+        runner = self._runner(num_trials=3)
+        with patch("dexmani_real.runtime.safety.time", clock), patch("dexmani_real.deployment.executor.time", clock):
+            runner.shared.start_request.value = True
+            runner._start_requested_episode()
+            generation = runner.run_generation
+            clock.ns = 2_000_000_000
+            request_policy_stop(runner.shared)
+            first = read_run_state_snapshot(runner.shared)
+            self.assertEqual(first.ended_generation, generation)
+            self.assertEqual(first.ended_reason, RunEndReason.OPERATOR)
+            clock.ns = 10_000_000_000
+            request_policy_stop(runner.shared)
+            revoke_motion(runner.shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
+            invalidate_coupled_commands(runner.shared)  # ARMED/home rebase
+            self.assertEqual(read_run_state_snapshot(runner.shared).ended_monotonic_ns, first.ended_monotonic_ns)
+            runner._handle_run_boundary()
+            self.assertEqual(runner.session_running_ns, 2_000_000_000)
+            runner.shared.start_request.value = True
+            runner._start_requested_episode()
+            invalidate_coupled_commands(runner.shared)  # RUNNING teleop-style pause
+            self.assertEqual(read_run_state_snapshot(runner.shared).ended_generation, generation)
+            clock.ns = 13_000_000_000
+            request_policy_stop(runner.shared)
+            runner._handle_run_boundary()
+            self.assertEqual(runner.session_running_ns, 5_000_000_000)
+            self.assertEqual(runner.completed_trials, 2)
+
+    def test_parent_budget_uses_actual_revoke_time_and_timeout_reason(self):
+        from unittest.mock import patch
+        from test_sync_policy_timing import _Clock
+        from dexmani_real.runtime.safety import RunEndReason, read_run_state_snapshot
+        clock = _Clock(1_000_000_000)
+        runner = self._runner()
+        with patch("dexmani_real.runtime.safety.time", clock), patch("dexmani_real.deployment.executor.time", clock):
+            runner.shared.start_request.value = True
+            runner._start_requested_episode()
+            clock.ns = 3_100_000_000  # parent's poll actually revokes 0.1s after budget
+            def next_poll(_seconds):
+                runner.shared.quit_requested.value = True
+            with patch("dexmani_real.runtime.supervisor.time.monotonic_ns", clock.monotonic_ns), patch("dexmani_real.runtime.supervisor.time.sleep", side_effect=next_poll):
+                run_supervisor(runner.shared, [], heartbeat_timeouts_s={}, max_running_s=2.)
+            self.assertEqual(read_run_state_snapshot(runner.shared).ended_reason, RunEndReason.TIMEOUT)
+            clock.ns = 11_000_000_000
+            runner._handle_run_boundary()
+            self.assertEqual(runner.session_running_ns, 2_100_000_000)
+
+class BlockingPredictionStopTest(_RunnerTest):
+    def test_real_active_tick_prediction_late_return_has_two_second_denominator(self):
+        import numpy as np
+        from unittest.mock import patch
+        from test_sync_policy_timing import SyncPolicyTimingTest
+        from dexmani_real.runtime.safety import request_policy_stop
+        helper = SyncPolicyTimingTest()
+        helper.setUp()
+        helper._install_observation_fakes()
+        self.addCleanup(helper.doCleanups)
+        runner = self._runner()
+        runner.max_running_ns = None
+        runner.policy_spec = SimpleNamespace(n_obs_steps=2)
+        runner.fingertip_runtime = None
+        def predict(observation):
+            helper.clock.ns = 2_000_000_000
+            request_policy_stop(runner.shared)
+            helper.clock.ns = 10_000_000_000
+            return np.zeros((8, 19))
+        runner.model_runtime.predict = predict
+        with patch("dexmani_real.runtime.safety.time", helper.clock):
+            runner.shared.start_request.value = True
+            runner._start_requested_episode()
+            with self.assertLogs("dexmani_real.deployment.executor", level="WARNING") as logs:
+                runner._run_active_tick(0)
+            self.assertIn("remaining=8", "\n".join(logs.output))
+            runner._handle_run_boundary()
+        self.assertEqual(runner.session_running_ns, 2_000_000_000)
+        self.assertEqual(runner.session_inference_ms, [10000.])
+        self.assertEqual(runner.session_publication_count, 0)

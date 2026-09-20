@@ -41,6 +41,20 @@ class StopRequest(IntEnum):
     OPERATOR = 1
 
 
+class RunEndReason(IntEnum):
+    """First software RUNNING termination cause; never physical convergence."""
+
+    NONE = 0
+    EXECUTOR_BOUNDARY = 1
+    OPERATOR = 2
+    QUIT = 3
+    TIMEOUT = 4
+    POLICY_FAILURE = 5
+    ESTOP = 6
+    HARDWARE_FAULT = 7
+    RUNTIME_SHUTDOWN = 8
+
+
 _ALLOWED_TRANSITIONS = frozenset(
     {
         (SafetyState.DISARMED, SafetyState.ARMED),
@@ -99,6 +113,10 @@ class RunStateSnapshot:
     generation: int
     started_monotonic_ns: int
     stop_request: int
+    ended_generation: int
+    ended_started_monotonic_ns: int
+    ended_monotonic_ns: int
+    ended_reason: RunEndReason
 
 
 def _advance_run_generation_locked(shared: Any) -> int:
@@ -123,15 +141,12 @@ def _advance_run_generation_locked(shared: Any) -> int:
     shared.run_generation_base_sequence.value = latest
     shared.run_generation.value = int(shared.run_generation.value) + 1
     generation = int(shared.run_generation.value)
-    queued = max(0, latest - previous_base)
-    if queued > 0 or any(pending.values()):
+    if any(pending.values()):
         logger.info(
-            "[DROP] generation=%d invalidated %d queued command record(s) "
-            "(arm_pending=%d hand_pending=%d)",
-            generation,
-            queued,
-            pending.get("arm", 0),
-            pending.get("hand", 0),
+            "[DROP] generation=%d command admission cancelled; "
+            "unconfirmed consumer records through_sequence=%d arm_pending=%d hand_pending=%d "
+            "(overlapping ranges; SDK entry is not undone)",
+            generation - 1, latest, pending.get("arm", 0), pending.get("hand", 0),
         )
     return generation
 
@@ -157,12 +172,13 @@ def _begin_motion_locked(shared: Any) -> RunEpoch | None:
     generation = _invalidate_coupled_commands_locked(shared)
     started_ns = time.monotonic_ns()
     shared.run_started_monotonic_ns.value = started_ns
+    shared.run_started_generation.value = generation
     shared.safety_state.value = int(SafetyState.RUNNING)
     return RunEpoch(generation=generation, started_monotonic_ns=started_ns)
 
 
 def _revoke_motion_locked(
-    shared: Any, new_state: SafetyState
+    shared: Any, new_state: SafetyState, reason: RunEndReason = RunEndReason.EXECUTOR_BOUNDARY
 ) -> tuple[SafetyState, int] | None:
     """Revoke motion while the caller owns ``motion_lock``."""
     current_value = int(shared.safety_state.value)
@@ -180,6 +196,18 @@ def _revoke_motion_locked(
             int(new_state),
         )
         return None
+    if current is SafetyState.RUNNING and new_state is not SafetyState.RUNNING:
+        # Only this actual state transition writes the terminal fact. Later
+        # ARMED/home/cleanup revocations cannot replace it; command-only pause
+        # invalidation never passes through this boundary.
+        if shared.estop_request.value:
+            reason = RunEndReason.ESTOP
+        elif shared.error_state.value or new_state is SafetyState.FAULT:
+            reason = RunEndReason.HARDWARE_FAULT
+        shared.run_ended_generation.value = int(shared.run_started_generation.value)
+        shared.run_ended_started_monotonic_ns.value = int(shared.run_started_monotonic_ns.value)
+        shared.run_ended_monotonic_ns.value = time.monotonic_ns()
+        shared.run_ended_reason.value = int(reason)
     generation = _invalidate_coupled_commands_locked(shared)
     shared.run_started_monotonic_ns.value = 0
     shared.safety_state.value = int(new_state)
@@ -235,6 +263,10 @@ def read_run_state_snapshot(shared: Any) -> RunStateSnapshot:
             generation=permit.run_generation,
             started_monotonic_ns=int(shared.run_started_monotonic_ns.value),
             stop_request=int(shared.stop_request.value),
+            ended_generation=int(shared.run_ended_generation.value),
+            ended_started_monotonic_ns=int(shared.run_ended_started_monotonic_ns.value),
+            ended_monotonic_ns=int(shared.run_ended_monotonic_ns.value),
+            ended_reason=RunEndReason(int(shared.run_ended_reason.value)),
         )
 
 
@@ -425,7 +457,7 @@ def request_policy_start(shared: Any, *, require_physical_home: bool) -> bool:
         return True
 
 
-def request_policy_stop(shared: Any) -> bool:
+def request_policy_stop(shared: Any, *, reason: RunEndReason = RunEndReason.OPERATOR) -> bool:
     """Publish S and revoke ARMED/RUNNING motion as one ordered operation."""
     with shared.motion_lock:
         already_requested = int(shared.stop_request.value) == int(
@@ -443,7 +475,7 @@ def request_policy_stop(shared: Any) -> bool:
             return True
         if current is SafetyState.ARMED and already_requested:
             return True
-        revoked = _revoke_motion_locked(shared, SafetyState.ARMED)
+        revoked = _revoke_motion_locked(shared, SafetyState.ARMED, reason)
     if revoked is None:
         return False
     previous, generation = revoked
@@ -461,6 +493,7 @@ def revoke_motion_if_generation(
     shared: Any,
     expected_generation: int,
     new_state: SafetyState = SafetyState.ARMED,
+    *, reason: RunEndReason = RunEndReason.EXECUTOR_BOUNDARY,
 ) -> bool:
     """Revoke motion only while *expected_generation* still owns it.
 
@@ -472,7 +505,7 @@ def revoke_motion_if_generation(
     with shared.motion_lock:
         if int(shared.run_generation.value) != int(expected_generation):
             return False
-        revoked = _revoke_motion_locked(shared, new_state)
+        revoked = _revoke_motion_locked(shared, new_state, reason)
     if revoked is None:
         return False
     current, generation = revoked
@@ -487,7 +520,8 @@ def revoke_motion_if_generation(
     return True
 
 
-def revoke_motion(shared: Any, new_state: SafetyState = SafetyState.ARMED) -> bool:
+def revoke_motion(shared: Any, new_state: SafetyState = SafetyState.ARMED, *,
+                  reason: RunEndReason = RunEndReason.EXECUTOR_BOUNDARY) -> bool:
     """Atomically invalidate commands and leave the current motion state.
 
     This is the required path for a normal command pause boundary and fault
@@ -496,7 +530,7 @@ def revoke_motion(shared: Any, new_state: SafetyState = SafetyState.ARMED) -> bo
     if new_state not in (SafetyState.ARMED, SafetyState.DISARMED, SafetyState.FAULT):
         raise ValueError("motion revocation must target ARMED, DISARMED, or FAULT")
     with shared.motion_lock:
-        revoked = _revoke_motion_locked(shared, new_state)
+        revoked = _revoke_motion_locked(shared, new_state, reason)
     if revoked is None:
         return False
     current, generation = revoked

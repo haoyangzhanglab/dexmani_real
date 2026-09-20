@@ -38,6 +38,7 @@ from dexmani_real.runtime.safety import (
     StopRequest,
     request_policy_start,
     request_policy_stop,
+    RunEndReason,
 )
 from dexmani_real.utils.log import get_logger
 
@@ -54,7 +55,8 @@ def _request_immediate_stop(shared: RuntimeChannels) -> None:
 
 def _request_immediate_quit(shared: RuntimeChannels) -> None:
     """Apply Q's motion fence before asking the supervisor to shut down."""
-    _request_immediate_stop(shared)
+    if not request_policy_stop(shared, reason=RunEndReason.QUIT):
+        shared.error_state.value = True
     shared.quit_requested.value = True
 
 
