@@ -457,6 +457,36 @@ def request_policy_stop(shared: Any) -> bool:
     return True
 
 
+def revoke_motion_if_generation(
+    shared: Any,
+    expected_generation: int,
+    new_state: SafetyState = SafetyState.ARMED,
+) -> bool:
+    """Revoke motion only while *expected_generation* still owns it.
+
+    Lets a bounded parent-side timeout (the run budget) fence a blocking
+    policy predict without ever revoking a newer trial whose epoch already
+    advanced: the generation is re-verified inside the same critical section
+    as the revocation, so an expired timeout is a no-op.
+    """
+    with shared.motion_lock:
+        if int(shared.run_generation.value) != int(expected_generation):
+            return False
+        revoked = _revoke_motion_locked(shared, new_state)
+    if revoked is None:
+        return False
+    current, generation = revoked
+    logger.info(
+        "safety: generation-checked revocation %s(%d) → %s(%d), generation=%d",
+        current.name,
+        int(current),
+        new_state.name,
+        int(new_state),
+        generation,
+    )
+    return True
+
+
 def revoke_motion(shared: Any, new_state: SafetyState = SafetyState.ARMED) -> bool:
     """Atomically invalidate commands and leave the current motion state.
 

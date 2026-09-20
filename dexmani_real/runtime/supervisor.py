@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from dexmani_real.ipc.channels import RuntimeChannels
-from dexmani_real.runtime.safety import SafetyState, transition
+from dexmani_real.runtime.safety import (
+    SafetyState,
+    read_run_state_snapshot,
+    revoke_motion_if_generation,
+    transition,
+)
 from dexmani_real.runtime.status import ExitReason
 from dexmani_real.utils.feedback import validate_hand_feedback
 from dexmani_real.utils.log import get_logger
@@ -121,6 +126,7 @@ def run_supervisor(
     heartbeat_timeouts_s: Mapping[str, float],
     supervisor_hz: float | None = None,
     service_process_names: Collection[str] = (),
+    max_running_s: float | None = None,
 ) -> tuple[str, bool]:
     """Run the standard supervisor loop with resolved heartbeat settings.
 
@@ -132,6 +138,14 @@ def run_supervisor(
     ``SERVICE_FAILURE`` comes from ``session_failed``, or process death or
     heartbeat timeout for a name in ``service_process_names``. These use the
     verified non-FAULT shutdown path.
+
+    ``max_running_s`` is the parent-side run budget for one RUNNING epoch —
+    the same budget the policy child applies between its own polls. The
+    supervisor enforces it even while a blocking predict prevents the child
+    from checking: it revokes motion only after re-verifying the snapshot's
+    generation under the lock, so an expired timeout can never revoke a
+    newer trial. The policy process itself is supervised through
+    is_alive/exitcode, not through a loop-heartbeat deadline.
 
     The caller should have already transitioned to ARMED before calling this
     and must handle shutdown + DISARMED transition after it returns.
@@ -160,8 +174,30 @@ def run_supervisor(
     timeouts = {name: float(timeout) for name, timeout in heartbeat_timeouts_s.items()}
     if any(not np.isfinite(timeout) or timeout <= 0 for timeout in timeouts.values()):
         raise ValueError("heartbeat timeouts must be finite and positive")
+    if max_running_s is not None and (
+        not np.isfinite(float(max_running_s)) or float(max_running_s) <= 0.0
+    ):
+        raise ValueError("max_running_s must be finite and positive, or None")
+    max_running_ns = (
+        None if max_running_s is None else int(float(max_running_s) * 1e9)
+    )
     try:
         while True:
+            if max_running_ns is not None:
+                snapshot = read_run_state_snapshot(shared)
+                if (
+                    snapshot.state is SafetyState.RUNNING
+                    and snapshot.started_monotonic_ns > 0
+                    and time.monotonic_ns() - int(snapshot.started_monotonic_ns)
+                    >= max_running_ns
+                    and revoke_motion_if_generation(shared, snapshot.generation)
+                ):
+                    logger.warning(
+                        "[SUPERVISOR] run budget %.1fs exceeded — motion revoked "
+                        "(generation=%d); the control owner ends the trial",
+                        float(max_running_s),
+                        snapshot.generation,
+                    )
             heartbeat_timestamps = {
                 name: shared.get_heartbeat(name) for name in timeouts
             }

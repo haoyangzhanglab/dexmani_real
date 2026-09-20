@@ -29,8 +29,23 @@ class CameraHealth(IntEnum):
     # numbers skipped earlier frames.
     FRAME_GAP = 3
     # Current device-to-host delay above the clock mapper's lower envelope
-    # exceeded the freshness budget; this is not an SDK queue depth.
+    # exceeded the freshness budget; this is not an SDK queue depth. The
+    # payload is still valid and causally ordered — finite-but-slow delivery,
+    # distinct from an invalid clock or payload.
     DELIVERY_DELAY = 4
+
+
+# Payload-valid health classes for downstream admission: OK, skipped-frame
+# telemetry, and finite-but-slow delivery all carry a valid, causally ordered
+# payload; CLOCK_RESET (invalid clock) and DUPLICATE (no new source) do not.
+# Raw enum meanings are unchanged — this only classifies admission.
+PAYLOAD_VALID_CAMERA_HEALTH = frozenset(
+    {
+        int(CameraHealth.OK),
+        int(CameraHealth.FRAME_GAP),
+        int(CameraHealth.DELIVERY_DELAY),
+    }
+)
 
 
 _READ_FAILURE_BACKOFF_S = 0.05
@@ -44,8 +59,11 @@ class CameraLoopConfig:
     fps: int = field(default_factory=lambda: camera.fps)
     warmup_frames: int = field(default_factory=lambda: camera.warmup_frames)
     max_frame_age_s: float = field(default_factory=lambda: camera.max_frame_age_s)
-    read_failure_timeout_s: float = field(
-        default_factory=lambda: camera.recording_stall_abort_s
+    # Device-owned stall budget covering both failed reads and the absence of
+    # any new valid source frame. It is never derived from model latency or
+    # recording-quality parameters.
+    source_stall_timeout_s: float = field(
+        default_factory=lambda: camera.source_stall_timeout_s
     )
     frame_gap_stall_threshold: int = field(
         default_factory=lambda: camera.frame_gap_stall_threshold
@@ -64,12 +82,12 @@ class CameraLoopConfig:
         if (
             not math.isfinite(self.max_frame_age_s)
             or self.max_frame_age_s <= 0
-            or not math.isfinite(self.read_failure_timeout_s)
-            or self.read_failure_timeout_s <= self.max_frame_age_s
+            or not math.isfinite(self.source_stall_timeout_s)
+            or self.source_stall_timeout_s <= self.max_frame_age_s
         ):
             raise ValueError(
-                "camera frame age and read-failure thresholds must be finite and "
-                "positive, with read-failure timeout greater than max frame age"
+                "camera frame age and source-stall thresholds must be finite and "
+                "positive, with the stall timeout greater than max frame age"
             )
         if self.warmup_frames < 0:
             raise ValueError("warmup_frames must be non-negative")
@@ -112,7 +130,7 @@ class CameraLoopConfig:
             fps=int(cam.fps),
             warmup_frames=int(cam.warmup_frames),
             max_frame_age_s=float(cam.max_frame_age_s),
-            read_failure_timeout_s=float(cam.recording_stall_abort_s),
+            source_stall_timeout_s=float(cam.source_stall_timeout_s),
             frame_gap_stall_threshold=int(cam.frame_gap_stall_threshold),
             l515_visual_preset=int(cam.l515_visual_preset),
             l515_confidence_threshold=(
@@ -254,7 +272,9 @@ def camera_loop(
         shared.camera_geometry.value = _geometry_payload.ljust(2048, b"\x00")
         ready_published = False
         read_failure_started_s: float | None = None
+        last_new_source_s = time.monotonic()
         frame_gap_warn = ThrottledWarner(interval_s=5.0, logger=_logger)
+        invalid_timing_warn = ThrottledWarner(interval_s=5.0, logger=_logger)
 
         while shared.is_running.value:
             _publish_payload = (
@@ -273,7 +293,7 @@ def camera_loop(
                 # ``wait_for_frames`` normally provides the device-rate pacing.
                 # Back off only after a failure so repeated errors cannot spin.
                 shared.set_heartbeat("camera", now_s)
-                if now_s - read_failure_started_s >= cfg.read_failure_timeout_s:
+                if now_s - read_failure_started_s >= cfg.source_stall_timeout_s:
                     if latch_runtime_fault:
                         shared.error_state.value = True
                     else:
@@ -285,13 +305,40 @@ def camera_loop(
                 time.sleep(_READ_FAILURE_BACKOFF_S)
                 continue
             read_failure_started_s = None
-            shared.set_heartbeat("camera", time.monotonic())
+            now_s = time.monotonic()
+            shared.set_heartbeat("camera", now_s)
+
+            # Producer-owned source truth: only a genuinely new frame with
+            # valid device timing advances the stream. Duplicates and invalid
+            # clocks never refresh it, so a required sensor that stopped
+            # producing cannot be masked forever by an old resident frame.
+            timing_valid = math.isfinite(frame.backlog_s) and frame.backlog_s >= 0.0
+            if not frame.duplicate and not frame.clock_reset and timing_valid:
+                last_new_source_s = now_s
+            elif now_s - last_new_source_s >= cfg.source_stall_timeout_s:
+                if latch_runtime_fault:
+                    shared.error_state.value = True
+                else:
+                    shared.session_failed.value = True
+                raise RuntimeError(
+                    "camera source stalled (no new valid frame) for "
+                    f"{now_s - last_new_source_s:.3f}s"
+                )
 
             if _publish_payload:
                 if frame.rgb is None or frame.depth_aligned_to_color_raw is None:
                     raise RuntimeError(
                         "camera configured with color must publish aligned RGB-D"
                     )
+                if not timing_valid:
+                    # Invalid device timing is never published as a valid
+                    # frame, and never conflated with finite-but-slow delivery.
+                    invalid_timing_warn(
+                        "camera_loop: dropped frame with invalid device timing "
+                        "(backlog_s=%r)",
+                        frame.backlog_s,
+                    )
+                    continue
                 camera_health = _camera_health(
                     clock_reset=frame.clock_reset,
                     duplicate=frame.duplicate,

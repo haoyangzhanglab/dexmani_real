@@ -219,7 +219,7 @@ def motion_rejection_reason(
 def _read_arm_feedback(
     shared: Any,
     *,
-    max_age_s: float,
+    max_age_s: float | None,
     now_monotonic_ns: int | None = None,
 ) -> tuple[_ArmFeedbackSnapshot | None, str, FeedbackIssue | None]:
     result = shared.arm_state_ring.read_latest()
@@ -260,7 +260,7 @@ def _read_arm_feedback(
 def read_hand_feedback(
     shared: Any,
     *,
-    max_age_s: float,
+    max_age_s: float | None,
     now_monotonic_ns: int | None = None,
 ) -> tuple[_HandFeedbackSnapshot | None, str, FeedbackIssue | None]:
     result = shared.hand_state_ring.read_latest()
@@ -300,8 +300,8 @@ def read_command_feedback(
     shared: Any,
     *,
     require_hand: bool,
-    arm_max_age_s: float,
-    hand_max_age_s: float,
+    arm_max_age_s: float | None,
+    hand_max_age_s: float | None,
 ) -> tuple[CommandFeedbackSnapshot | None, str, FeedbackIssue | None]:
     """Select one immutable feedback snapshot for a single command dispatch.
 
@@ -309,10 +309,13 @@ def read_command_feedback(
     (never a pre-captured common ``now``, which can race a concurrent producer
     into a false ``FUTURE_TIMESTAMP``). After both modalities are selected, one
     post-selection ``validation_now_ns`` is captured and both are revalidated
-    against it for provenance (``source <= ring_commit <= validation_now``) and
-    freshness, so arm cannot silently age out during a slow hand read. Returned
-    arrays are ownership copies, so later ring writes cannot mutate the selected
-    state.
+    against it for provenance (``source <= ring_commit <= validation_now``), so
+    an out-of-order commit is never admitted. Returned arrays are ownership
+    copies, so later ring writes cannot mutate the selected state.
+
+    ``*_max_age_s=None`` removes the age-only veto (truthfulness and causality
+    still apply): policy dispatch relies on worker supervision for liveness,
+    while teleop/replay callers keep explicit live-feedback thresholds.
     """
     arm_feedback, reason, issue = _read_arm_feedback(
         shared, max_age_s=arm_max_age_s
@@ -370,36 +373,6 @@ def read_command_feedback(
         "",
         None,
     )
-
-
-def command_feedback_is_fresh(
-    snapshot: CommandFeedbackSnapshot,
-    *,
-    now_monotonic_ns: int,
-    arm_max_age_s: float,
-    hand_max_age_s: float,
-) -> bool:
-    """Re-check the SAME snapshot's age without reading either ring again.
-
-    A snapshot fresh at selection can age out while decode/IK/projection run.
-    Malformed or future source timestamps are treated as not fresh.
-    """
-    if not np.isfinite(arm_max_age_s) or arm_max_age_s <= 0.0:
-        raise ValueError("arm_max_age_s must be finite and positive")
-    if not np.isfinite(hand_max_age_s) or hand_max_age_s <= 0.0:
-        raise ValueError("hand_max_age_s must be finite and positive")
-    arm_source_ns = int(snapshot.arm_source_monotonic_ns)
-    if arm_source_ns <= 0 or arm_source_ns > now_monotonic_ns:
-        return False
-    if (now_monotonic_ns - arm_source_ns) * 1e-9 > arm_max_age_s:
-        return False
-    if snapshot.hand_source_monotonic_ns is not None:
-        hand_source_ns = int(snapshot.hand_source_monotonic_ns)
-        if hand_source_ns <= 0 or hand_source_ns > now_monotonic_ns:
-            return False
-        if (now_monotonic_ns - hand_source_ns) * 1e-9 > hand_max_age_s:
-            return False
-    return True
 
 
 def build_action_candidate(

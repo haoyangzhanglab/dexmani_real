@@ -14,10 +14,10 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from dexmani_real.config.defaults import PolicyParams
 from dexmani_real.deployment.config import FingertipAssemblerConfig
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.ipc.schema import validate_point_cloud_array
+from dexmani_real.sensor.camera.worker import PAYLOAD_VALID_CAMERA_HEALTH
 from dexmani_real.planning.kinematics.arm_fk import (
     compute_eef_pose_history_xarm_base,
     make_arm_fk,
@@ -187,13 +187,14 @@ def _read_state_history(
     values_field: str,
     required_true_fields: tuple[str, ...] = (),
     required_false_fields: tuple[str, ...] = (),
-    max_age_ns: int | None = None,
     not_before_ns: int = 0,
 ) -> FrameWindow | None:
-    """Read the causal (source <= publish <= anchor) state frames, oldest-first.
+    """Read the causal (source <= publish <= query anchor) frames, oldest-first.
 
-    When ``max_age_ns`` is given, frames older than the bound are dropped so a
-    stalled feedback stream cannot feed a stale window to the model.
+    Admission is truthfulness plus causality against the ONE query anchor —
+    there is no generic age gate: an old-but-causal frame is a valid history
+    slot, and a stalled source is the producer's failure to expose (device
+    stall latches, ring residency), never a silent per-frame age drop here.
     """
     try:
         history = ring.get_last_k(min(int(history_len), ring.maxlen))
@@ -226,8 +227,6 @@ def _read_state_history(
         )
         if not (max(1, int(not_before_ns)) <= source_ns <= publish_ns <= anchor_ns):
             continue
-        if max_age_ns is not None and anchor_ns - source_ns > max_age_ns:
-            continue
         value = np.asarray(data[values_field][0], dtype=np.float64)
         if not np.all(np.isfinite(value)):
             continue
@@ -253,15 +252,16 @@ def _read_hand_history(
     *,
     history_len: int,
     anchor_ns: int,
-    max_age_ns: int | None,
     not_before_ns: int = 0,
 ) -> HandFrameWindow | None:
     """Read one causal XHand window, copying qpos and both tactile payloads together.
 
     Admission is decided by the hand sample alone (state_valid, qpos_stale,
-    source/publish causality, freshness, finite qpos); tactile validity bits are
-    copied verbatim and never drop a record. A record whose *valid* tactile
-    payload is non-finite is rejected as producer corruption, not as invalidity.
+    source/publish causality against the query anchor, finite qpos); tactile
+    validity bits are copied verbatim and never drop a record. A record whose
+    *valid* tactile payload is non-finite is rejected as producer corruption,
+    not as invalidity. The all-valid tactile contract for contact/tactile
+    policy fields is enforced by the caller, unchanged.
     """
     try:
         history = ring.get_last_k(min(int(history_len), ring.maxlen))
@@ -291,8 +291,6 @@ def _read_hand_history(
             else int(ring_publish_ns)
         )
         if not (max(1, int(not_before_ns)) <= source_ns <= publish_ns <= anchor_ns):
-            continue
-        if max_age_ns is not None and anchor_ns - source_ns > max_age_ns:
             continue
         qpos = np.asarray(data["qpos"][0], dtype=np.float64)
         if not np.all(np.isfinite(qpos)):
@@ -348,14 +346,18 @@ def _select_history_indices(
     valid_mask: np.ndarray,
     reference_ns: np.ndarray,
     *,
-    max_skew_ns: int,
     run_started_ns: int,
 ) -> np.ndarray | None:
-    """Return the newest source <= each reference within skew, oldest-first.
+    """Return the newest source <= each reference, oldest-first.
 
-    A leading reference at or before run start maps to the oldest post-run
-    source (edge-repeat), filling the history window during warm-up.  Any
-    non-leading reference with no skew-valid candidate fails (returns None).
+    There is no skew/age bound: a normal low-rate source legitimately reuses
+    one frame across adjacent grid slots. A leading reference at or before run
+    start maps to the oldest post-run source (warm-up edge repeat, treated as
+    padding by the model contract and keeping its ORIGINAL source time — no
+    fabricated run-start frame). Any non-leading reference with no causal
+    candidate means the required history is unavailable: the whole selection
+    fails (returns None) and the query waits; future frames or a different
+    source identity are never substituted.
     """
     sources = np.asarray(source_monotonic_ns, dtype=np.int64)
     valid = np.asarray(valid_mask, dtype=np.uint8) == 1
@@ -364,9 +366,7 @@ def _select_history_indices(
         return None
     selected: list[int] = []
     for value in np.asarray(reference_ns, dtype=np.int64):
-        candidates = np.flatnonzero(
-            valid & (sources <= value) & (value - sources <= max_skew_ns)
-        )
+        candidates = np.flatnonzero(valid & (sources <= value))
         if candidates.size == 0:
             if value <= run_started_ns:
                 selected.append(int(valid_idx[0]))
@@ -381,17 +381,15 @@ def _align_state_history_to_reference_ns(
     state_history: FrameWindow | None,
     reference_ns: np.ndarray,
     *,
-    max_skew_ns: int,
     run_started_ns: int,
 ) -> FrameWindow | None:
-    """Choose newest source <= each reference, within the explicit skew bound."""
+    """Choose the newest source <= each reference on the shared grid."""
     if state_history is None or np.asarray(reference_ns).size == 0:
         return None
     indices = _select_history_indices(
         state_history.source_monotonic_ns,
         state_history.valid_mask,
         reference_ns,
-        max_skew_ns=max_skew_ns,
         run_started_ns=run_started_ns,
     )
     if indices is None:
@@ -409,7 +407,6 @@ def _align_hand_history_to_reference_ns(
     hand_history: HandFrameWindow | None,
     reference_ns: np.ndarray,
     *,
-    max_skew_ns: int,
     run_started_ns: int,
 ) -> HandFrameWindow | None:
     """Select one hand sample per reference slot, then project every field from it.
@@ -423,7 +420,6 @@ def _align_hand_history_to_reference_ns(
         hand_history.source_monotonic_ns,
         hand_history.valid_mask,
         reference_ns,
-        max_skew_ns=max_skew_ns,
         run_started_ns=run_started_ns,
     )
     if indices is None:
@@ -446,11 +442,17 @@ def _pointcloud_frame_from_record(
     ring_publish_ns: int,
     *,
     anchor_ns: int,
-    max_age_ns: int,
     num_points: int,
     not_before_ns: int,
 ) -> PointCloudFrame | None:
-    """Extract one causal, fresh ``PointCloudFrame`` from a ring record (or None)."""
+    """Extract one causal ``PointCloudFrame`` from a ring record (or None).
+
+    Admission is the full provenance chain (source <= camera publish <=
+    payload publish <= ring commit <= query anchor) plus identity and payload
+    validity. There is no age drop before or after the cloud build: a
+    finite-but-slow delivery stays usable, while an invalid clock, ordering,
+    or payload never passes.
+    """
     source_ns = int(record["source_monotonic_ns"])
     camera_publish_ns = int(record["camera_publish_monotonic_ns"])
     payload_publish_ns = int(record["publish_monotonic_ns"])
@@ -465,7 +467,6 @@ def _pointcloud_frame_from_record(
         <= payload_publish_ns
         <= int(ring_publish_ns)
         <= anchor_ns
-        and anchor_ns - source_ns <= max_age_ns
         and source_ns >= int(not_before_ns)
     ):
         return None
@@ -490,12 +491,11 @@ def _read_pointcloud_history(
     shared: RuntimeChannels,
     *,
     anchor_ns: int,
-    max_age_ns: int,
     num_points: int,
     history_len: int,
     not_before_ns: int,
 ) -> tuple[PointCloudFrame, ...]:
-    """Read the last ``history_len`` causal, fresh clouds, oldest-first."""
+    """Read the last ``history_len`` causal clouds, oldest-first."""
     if history_len <= 0:
         return ()
     try:
@@ -511,7 +511,6 @@ def _read_pointcloud_history(
             data[0],
             int(ring_publish_ns),
             anchor_ns=anchor_ns,
-            max_age_ns=max_age_ns,
             num_points=num_points,
             not_before_ns=not_before_ns,
         )
@@ -526,17 +525,31 @@ def _read_pointcloud_history(
     return tuple(frame for frame in frames if frame.camera_generation == newest_gen)
 
 
-def _rgb_frame_from_camera_record(
-    camera_ring,
+@dataclass(frozen=True)
+class _RgbIdentity:
+    """Admitted camera-frame identity, selected before any payload copy."""
+
+    source_camera_sequence: int
+    source_monotonic_ns: int
+    publish_monotonic_ns: int
+    camera_generation: int
+
+
+def _rgb_identity_from_header(
     header: np.ndarray,
     ring_publish_ns: int,
     sequence: int,
     *,
     anchor_ns: int,
-    max_age_ns: int,
     not_before_ns: int,
-) -> RgbFrame | None:
-    """Copy one verified, causal raw RGB frame from the camera ring."""
+) -> _RgbIdentity | None:
+    """Admit one camera header by causality and payload-valid health.
+
+    Finite-but-slow delivery (``DELIVERY_DELAY``) and skipped-frame telemetry
+    (``FRAME_GAP``) carry a valid, causally ordered payload and stay usable;
+    an invalid clock (``CLOCK_RESET``) never passes, and the full provenance
+    chain must order into the query anchor. No age gate applies.
+    """
     record = header[0]
     source_ns = int(record["source_monotonic_ns"])
     receive_ns = int(record["receive_monotonic_ns"])
@@ -545,25 +558,36 @@ def _rgb_frame_from_camera_record(
     if not (
         sequence > 0
         and camera_generation > 0
-        and int(record["camera_health"]) == 0
+        and int(record["camera_health"]) in PAYLOAD_VALID_CAMERA_HEALTH
         and 0
         < source_ns
         <= receive_ns
         <= camera_publish_ns
         <= ring_publish_ns
         <= anchor_ns
-        and anchor_ns - source_ns <= max_age_ns
         and source_ns >= not_before_ns
     ):
         return None
-    payload = camera_ring.read_sequence(sequence, modalities=("rgb",))
+    return _RgbIdentity(
+        source_camera_sequence=sequence,
+        source_monotonic_ns=source_ns,
+        publish_monotonic_ns=camera_publish_ns,
+        camera_generation=camera_generation,
+    )
+
+
+def _copy_rgb_payload(camera_ring, identity: _RgbIdentity) -> RgbFrame | None:
+    """Copy the payload of one already-admitted identity, re-checking it."""
+    payload = camera_ring.read_sequence(
+        identity.source_camera_sequence, modalities=("rgb",)
+    )
     if payload is None:
         return None
     payload_header = payload["header"][0]
     if (
-        int(payload_header["source_monotonic_ns"]) != source_ns
-        or int(payload_header["publish_monotonic_ns"]) != camera_publish_ns
-        or int(payload_header["camera_generation"]) != camera_generation
+        int(payload_header["source_monotonic_ns"]) != identity.source_monotonic_ns
+        or int(payload_header["publish_monotonic_ns"]) != identity.publish_monotonic_ns
+        or int(payload_header["camera_generation"]) != identity.camera_generation
     ):
         return None
     rgb = payload["rgb"]
@@ -576,10 +600,10 @@ def _rgb_frame_from_camera_record(
         return None
     return RgbFrame(
         values=rgb,
-        source_camera_sequence=sequence,
-        source_monotonic_ns=source_ns,
-        publish_monotonic_ns=camera_publish_ns,
-        camera_generation=camera_generation,
+        source_camera_sequence=identity.source_camera_sequence,
+        source_monotonic_ns=identity.source_monotonic_ns,
+        publish_monotonic_ns=identity.publish_monotonic_ns,
+        camera_generation=identity.camera_generation,
     )
 
 
@@ -587,12 +611,18 @@ def _read_rgb_history(
     shared: RuntimeChannels,
     *,
     anchor_ns: int,
-    max_age_ns: int,
     history_len: int,
     not_before_ns: int,
+    reference_ns: np.ndarray,
+    run_started_ns: int,
 ) -> tuple[RgbFrame, ...]:
-    """Read the verified causal RGB frames still resident in camera shared memory."""
-    if history_len <= 0:
+    """Select the causal RGB window by identity first, then copy payloads.
+
+    Selection sees only header identities; the large payload is copied once
+    per selected unique frame, and a frame reused across adjacent grid slots
+    or warm-up edge-repeat slots shares that single copy.
+    """
+    if history_len <= 0 or np.asarray(reference_ns).size == 0:
         return ()
     try:
         records = shared.camera_ring.get_last_metadata(
@@ -601,25 +631,43 @@ def _read_rgb_history(
     except Exception:
         logger.warning("inference: RGB history metadata read failed", exc_info=True)
         return ()
-    frames: list[RgbFrame] = []
+    identities: list[_RgbIdentity] = []
     for header, ring_publish_ns, sequence in records:
-        frame = _rgb_frame_from_camera_record(
-            shared.camera_ring,
+        identity = _rgb_identity_from_header(
             header,
             int(ring_publish_ns),
             int(sequence),
             anchor_ns=anchor_ns,
-            max_age_ns=max_age_ns,
             not_before_ns=not_before_ns,
         )
-        if frame is not None:
-            frames.append(frame)
-    if not frames:
+        if identity is not None:
+            identities.append(identity)
+    if not identities:
         return ()
-    newest_generation = frames[-1].camera_generation
-    return tuple(
-        frame for frame in frames if frame.camera_generation == newest_generation
+    newest_generation = identities[-1].camera_generation
+    admitted = tuple(
+        identity
+        for identity in identities
+        if identity.camera_generation == newest_generation
     )
+    selected, _logical = _select_camera_control_grid(
+        admitted,
+        run_started_ns=run_started_ns,
+        reference_ns=reference_ns,
+    )
+    if not selected:
+        return ()
+    copied: dict[int, RgbFrame | None] = {}
+    frames: list[RgbFrame] = []
+    for identity in selected:
+        key = identity.source_camera_sequence
+        if key not in copied:
+            copied[key] = _copy_rgb_payload(shared.camera_ring, identity)
+        frame = copied[key]
+        if frame is None:
+            return ()
+        frames.append(frame)
+    return tuple(frames)
 
 
 def _read_rgb_for_pointcloud_history(
@@ -627,7 +675,6 @@ def _read_rgb_for_pointcloud_history(
     pointcloud_history: tuple[PointCloudFrame, ...],
     *,
     anchor_ns: int,
-    max_age_ns: int,
     not_before_ns: int,
 ) -> tuple[RgbFrame, ...]:
     """Read RGB frames with exactly the camera provenance selected for clouds."""
@@ -647,19 +694,20 @@ def _read_rgb_for_pointcloud_history(
         if metadata is None:
             return ()
         header, ring_publish_ns = metadata
-        frame = _rgb_frame_from_camera_record(
-            camera_ring,
+        identity = _rgb_identity_from_header(
             header,
             ring_publish_ns,
             pointcloud.source_camera_sequence,
             anchor_ns=anchor_ns,
-            max_age_ns=max_age_ns,
             not_before_ns=not_before_ns,
         )
-        if frame is None or (
-            frame.source_monotonic_ns != pointcloud.source_monotonic_ns
-            or frame.camera_generation != pointcloud.camera_generation
+        if identity is None or (
+            identity.source_monotonic_ns != pointcloud.source_monotonic_ns
+            or identity.camera_generation != pointcloud.camera_generation
         ):
+            return ()
+        frame = _copy_rgb_payload(camera_ring, identity)
+        if frame is None:
             return ()
         frames.append(frame)
     return tuple(frames)
@@ -668,44 +716,50 @@ def _read_rgb_for_pointcloud_history(
 def _resize_rgb_history(
     frames: tuple[RgbFrame, ...], *, height: int, width: int
 ) -> tuple[RgbFrame, ...]:
-    """Resize selected causal RGB frames into the Policy input shape."""
-    return tuple(
-        RgbFrame(
-            values=resize_rgb(frame.values, height=height, width=width),
-            source_camera_sequence=frame.source_camera_sequence,
-            source_monotonic_ns=frame.source_monotonic_ns,
-            publish_monotonic_ns=frame.publish_monotonic_ns,
-            camera_generation=frame.camera_generation,
-        )
-        for frame in frames
-    )
+    """Resize selected causal RGB frames, reusing one resize per identity."""
+    resized: dict[int, RgbFrame] = {}
+    result: list[RgbFrame] = []
+    for frame in frames:
+        key = frame.source_camera_sequence
+        cached = resized.get(key)
+        if cached is None:
+            cached = RgbFrame(
+                values=resize_rgb(frame.values, height=height, width=width),
+                source_camera_sequence=frame.source_camera_sequence,
+                source_monotonic_ns=frame.source_monotonic_ns,
+                publish_monotonic_ns=frame.publish_monotonic_ns,
+                camera_generation=frame.camera_generation,
+            )
+            resized[key] = cached
+        result.append(cached)
+    return tuple(result)
 
 
 def _select_camera_control_grid(
-    frames: tuple[PointCloudFrame | RgbFrame, ...],
+    frames: tuple[Any, ...],
     *,
     run_started_ns: int,
     reference_ns: np.ndarray,
-    max_grid_lag_ns: int,
-) -> tuple[tuple[PointCloudFrame | RgbFrame, ...], int]:
+) -> tuple[tuple[Any, ...], int]:
     """Select a causal visual window at the shared query references.
 
-    A healthy, recent, same-generation frame may be reused across adjacent grid
-    slots when no newer frame has arrived, and the oldest available frame fills
-    the leading warm-up slots (edge-repeat).  Future, stale, unhealthy, and
-    wrong-generation frames are rejected before they reach ``frames``.
+    A same-generation frame may be reused across adjacent grid slots when no
+    newer frame has arrived (normal low-rate reuse, never warned), and the
+    oldest available frame fills the leading warm-up slots (edge-repeat with
+    its ORIGINAL source time). Future and wrong-generation frames are rejected
+    before they reach ``frames``; there is no grid-lag bound. A non-leading
+    slot without a causal candidate fails the whole selection.
     """
     if not frames or reference_ns.size == 0:
         return (), 0
     logical_step_ns = int(reference_ns[-1])
-    selected: list[PointCloudFrame | RgbFrame] = []
+    selected: list[Any] = []
     for reference in reference_ns:
         desired_ns = int(reference)
         candidates = [
             frame
             for frame in frames
             if frame.source_monotonic_ns <= desired_ns
-            and desired_ns - frame.source_monotonic_ns <= max_grid_lag_ns
         ]
         if candidates:
             frame = candidates[-1]
@@ -720,7 +774,6 @@ def _select_camera_control_grid(
 
 def _build_observation(
     shared: RuntimeChannels,
-    policy: PolicyParams,
     policy_spec: Any,
     *,
     observation_id: int,
@@ -729,11 +782,17 @@ def _build_observation(
     anchor_ns: int,
     step_dt_ns: int,
 ) -> ObservationBatch | None:
-    """Assemble requested causal modalities from the arm/hand rings.
+    """Assemble requested causal modalities at one query anchor.
 
-    Policy modalities are projected to their concrete Real sensor fields.
-    Every selected frame is additionally
-    gated by its source/publish timestamps and modality-specific health flags.
+    All modalities share the same query-anchored reference grid. A normal
+    slot takes the newest source <= its reference with the full provenance
+    chain ordered into the query ANCHOR (source <= commit <= anchor); history
+    slots are not required to satisfy commit <= their own historical
+    reference, and no generic age/skew/grid-lag gate applies. Required
+    history that is unavailable returns ``None`` — an explicit wait for the
+    next poll, never a substitution of future frames or another source
+    identity. Truthfulness (validity flags, finite payloads, tactile
+    all-valid contract) and causality are enforced throughout.
     """
     horizon = int(getattr(policy_spec, "n_obs_steps"))
     reference_ns, logical_step_ns = _select_control_grid_reference_ns(
@@ -744,12 +803,6 @@ def _build_observation(
     )
     if logical_step_ns <= 0:
         return None
-    max_age_ns = int(policy.max_input_age_s * 1e9)
-    max_skew_ns = int(policy.max_observation_skew_s * 1e9)
-    max_grid_lag_ns = int(policy.max_grid_lag_s * 1e9)
-    history_span_ns = max(0, horizon - 1) * int(step_dt_ns)
-    visual_history_max_age_ns = max_age_ns + history_span_ns + max_grid_lag_ns
-    state_history_max_age_ns = visual_history_max_age_ns + max_skew_ns
     hand_history: HandFrameWindow | None = None
     pointcloud: PointCloudFrame | None = None
     pointcloud_history: tuple[PointCloudFrame, ...] = ()
@@ -766,7 +819,6 @@ def _build_observation(
         anchor_ns=anchor_ns,
         values_field="qpos",
         required_true_fields=("state_valid",),
-        max_age_ns=state_history_max_age_ns,
         not_before_ns=run_started_ns,
     )
     hand_requested = bool(
@@ -778,7 +830,6 @@ def _build_observation(
         all_pointclouds = _read_pointcloud_history(
             shared,
             anchor_ns=anchor_ns,
-            max_age_ns=visual_history_max_age_ns,
             num_points=int(fields["point_cloud"].shape[0]),
             history_len=shared.pointcloud_ring.maxlen,
             not_before_ns=run_started_ns,
@@ -787,7 +838,6 @@ def _build_observation(
             all_pointclouds,
             run_started_ns=run_started_ns,
             reference_ns=reference_ns,
-            max_grid_lag_ns=max_grid_lag_ns,
         )
         if len(pointcloud_history) == horizon:
             pointcloud = pointcloud_history[-1]
@@ -797,25 +847,18 @@ def _build_observation(
                     shared.camera_ring,
                     pointcloud_history,
                     anchor_ns=anchor_ns,
-                    max_age_ns=visual_history_max_age_ns,
                     not_before_ns=run_started_ns,
                 )
     elif rgb_requested:
         assert rgb_shape is not None
-        all_rgb = _read_rgb_history(
+        rgb_history = _read_rgb_history(
             shared,
             anchor_ns=anchor_ns,
-            max_age_ns=visual_history_max_age_ns,
             history_len=shared.camera_ring.maxlen,
             not_before_ns=run_started_ns,
-        )
-        selected_rgb, _ = _select_camera_control_grid(
-            all_rgb,
-            run_started_ns=run_started_ns,
             reference_ns=reference_ns,
-            max_grid_lag_ns=max_grid_lag_ns,
+            run_started_ns=run_started_ns,
         )
-        rgb_history = selected_rgb
     if rgb_requested and len(rgb_history) == horizon:
         assert rgb_shape is not None
         rgb_history = _resize_rgb_history(
@@ -828,34 +871,29 @@ def _build_observation(
             shared.hand_state_ring,
             history_len=shared.hand_state_ring.maxlen,
             anchor_ns=anchor_ns,
-            max_age_ns=state_history_max_age_ns,
             not_before_ns=run_started_ns,
         )
     # Every modality uses the same query-anchored references; camera exposure times do
     # not move the robot/contact observation back to an earlier raw instant.
     arm_history = _align_state_history_to_reference_ns(
-        arm_history, reference_ns, max_skew_ns=max_skew_ns,
+        arm_history, reference_ns,
         run_started_ns=run_started_ns,
     )
     if hand_history is not None:
         hand_history = _align_hand_history_to_reference_ns(
-            hand_history, reference_ns, max_skew_ns=max_skew_ns,
+            hand_history, reference_ns,
             run_started_ns=run_started_ns,
         )
     if pointcloud_requested:
         if pointcloud is None or logical_step_ns <= 0:
             return None
         latest_source_ns = int(pointcloud.source_monotonic_ns)
-        if anchor_ns - latest_source_ns > max_age_ns:
-            return None
         if rgb_requested and len(rgb_history) != horizon:
             return None
     elif rgb_requested:
         if len(rgb_history) != horizon or logical_step_ns <= 0:
             return None
         latest_source_ns = int(rgb_history[-1].source_monotonic_ns)
-        if anchor_ns - latest_source_ns > max_age_ns:
-            return None
     elif (
         arm_history is not None
         and arm_history.values.shape[0] == horizon
@@ -869,8 +907,6 @@ def _build_observation(
             )
             if window is not None
         )
-        if anchor_ns - latest_source_ns > max_age_ns:
-            return None
     else:
         return None
     if arm_history is None or arm_history.values.shape[0] != horizon:
@@ -889,7 +925,7 @@ def _build_observation(
         or not np.all(hand_history.tactile_dense_valid)
     ):
         return None
-    observation = ObservationBatch(
+    return ObservationBatch(
         observation_id=observation_id,
         run_generation=run_generation,
         run_started_monotonic_ns=run_started_ns,
@@ -902,16 +938,6 @@ def _build_observation(
         pointcloud_history=pointcloud_history,
         rgb_history=rgb_history,
     )
-    # Final temporal admission at the owner boundary: the newest required source
-    # must be fresh and the cross-modal newest-source skew must be bounded.  A
-    # failed admission is a transient wait for the next poll, not an error.
-    try:
-        age_ms, skew_ms = observation_timing_ms(observation)
-    except ValueError:
-        return None
-    if age_ms > max_age_ns / 1e6 or skew_ms > max_skew_ns / 1e6:
-        return None
-    return observation
 
 
 def observation_sources(observation: ObservationBatch) -> dict[str, tuple[int, ...]]:

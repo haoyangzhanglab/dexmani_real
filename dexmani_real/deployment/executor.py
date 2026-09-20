@@ -28,7 +28,6 @@ from dexmani_real.control.publication import (
     PublishResult,
     PublishWaitTracker,
     build_action_candidate,
-    command_feedback_is_fresh,
     command_publishability_reason,
     prepare_command,
     publish_command,
@@ -371,7 +370,8 @@ class PolicyRunner:
         self.run_started_ns: int | None = None
         self.last_publication_ns: int | None = None
         self.previous_arm_command_qpos: np.ndarray | None = None
-        self.consecutive_stale_predictions = 0
+        # Transition marker for the visible observation WAIT/RESUME pair.
+        self._observation_waiting_since_ns: int | None = None
         self.num_episodes = (
             recording_config.num_episodes if recording_config is not None else 1
         )
@@ -387,10 +387,10 @@ class PolicyRunner:
         self.last_recorded_action = None
         self.actions.clear()
         self._pending_dispatch = None
+        self._observation_waiting_since_ns = None
         self.chunk_sources.clear()
         self.chunk_action_index = 0
         self.observation_id = 0
-        self.consecutive_stale_predictions = 0
 
     def _invalidate_chunk(self, reason: str) -> None:
         """Discard the unexecuted chunk suffix after a recoverable break.
@@ -1138,54 +1138,21 @@ class PolicyRunner:
             return None, None, None
         return (arm_qpos, hand_qpos), None, None
 
-    def _input_is_fresh(self, now_ns: int) -> bool:
-        ages = {
-            name: (now_ns - times[-1]) / 1e9
-            for name, times in self.chunk_sources.items()
-        }
-        self.stats.publication_input_age_ms = max(ages.values(), default=0.0) * 1e3
-        if self.chunk_action_index == 0 and any(
-            age > self.runtime.policy.max_input_age_s for age in ages.values()
-        ):
-            logger.debug(
-                "policy discard generation=%s query=%s reason=stale_model_input ages_s=%s",
-                self.run_generation,
-                self.observation_id,
-                ages,
-            )
-            self.stats.stale_prediction_count += 1
-            self.consecutive_stale_predictions += 1
-            self._invalidate_chunk("stale_model_input")
-            if (
-                self.consecutive_stale_predictions
-                >= int(self.runtime.policy.max_consecutive_errors)
-            ):
-                self._invalidate_rollout(
-                    "repeated stale policy predictions",
-                    stop_reason="policy_failure",
-                    recorder_save=False,
-                )
-                self._request_failed_session_shutdown()
-            return False
-        return True
-
     def _prepare_dispatch_candidate(self, action: np.ndarray) -> ActionCandidate | None:
         """Decode, project, and gate the queue head exactly once.
 
-        decode/IK, SafetyGate, and the pre-commit freshness recheck all
-        consume the SAME immutable feedback snapshot selected here. A
-        stale/unavailable control state invalidates the whole pending chunk
-        (fresh observation and inference follow on the next queue-empty
-        iteration); it is not itself a hardware fault.
+        decode/IK and SafetyGate consume the SAME immutable feedback snapshot
+        selected here. Feedback truthfulness and causality are enforced; the
+        age-only veto is not — an old-but-real control state stays usable and
+        worker liveness is owned by supervision, so a slow predict with
+        advancing producers is never a device failure. An unavailable ring
+        (no committed sample yet) invalidates the pending chunk and waits.
         """
-        if not self._input_is_fresh(time.monotonic_ns()):
-            return None
-        max_age_s = float(self.runtime.policy.max_input_age_s)
         feedback, reason, issue = read_command_feedback(
             self.shared,
             require_hand=True,
-            arm_max_age_s=max_age_s,
-            hand_max_age_s=max_age_s,
+            arm_max_age_s=None,
+            hand_max_age_s=None,
         )
         if feedback is None:
             if issue is None or issue.code is FeedbackIssueCode.STALE:
@@ -1215,8 +1182,8 @@ class PolicyRunner:
                 self.shared,
                 candidate,
                 gate=self.gate,
-                arm_feedback_max_age_s=max_age_s,
-                hand_feedback_max_age_s=max_age_s,
+                arm_feedback_max_age_s=None,
+                hand_feedback_max_age_s=None,
                 feedback_snapshot=feedback,
             )
         except Exception as exc:
@@ -1231,15 +1198,6 @@ class PolicyRunner:
             return None
         candidate = prepared.candidate
         assert candidate is not None
-
-        if not command_feedback_is_fresh(
-            feedback,
-            now_monotonic_ns=time.monotonic_ns(),
-            arm_max_age_s=max_age_s,
-            hand_max_age_s=max_age_s,
-        ):
-            self._invalidate_chunk("command_feedback_aged_out")
-            return None
         return candidate
 
     def _dispatch_action(self, action: np.ndarray) -> None:
@@ -1323,8 +1281,6 @@ class PolicyRunner:
             ) / 1e6
         self.last_publication_ns = publication_ns
         self.actions.popleft()
-        if self.chunk_action_index == 0:
-            self.consecutive_stale_predictions = 0
         self.chunk_action_index += 1
         self._record_rollout_tick(
             publication_ns, candidate=candidate, raw_action=action
@@ -1458,7 +1414,6 @@ class PolicyRunner:
         self.observation_id += 1
         observation = _build_observation(
             self.shared,
-            self.runtime.policy,
             self.policy_spec,
             observation_id=self.observation_id,
             run_generation=self.run_generation,
@@ -1467,7 +1422,23 @@ class PolicyRunner:
             step_dt_ns=self.step_dt_ns,
         )
         if observation is None:
+            # Required-history-unavailable is an explicit WAIT for the next
+            # poll: one visible transition line (never per-poll spam), and
+            # never a DROP — no prepared action was discarded here.
+            if self._observation_waiting_since_ns is None:
+                self._observation_waiting_since_ns = time.monotonic_ns()
+                logger.warning(
+                    "[WAIT] policy observation q=%d reason=required_history_unavailable",
+                    self.observation_id,
+                )
             return
+        if self._observation_waiting_since_ns is not None:
+            logger.info(
+                "[RESUME] policy observation q=%d wait_ms=%.0f",
+                self.observation_id,
+                (time.monotonic_ns() - self._observation_waiting_since_ns) / 1e6,
+            )
+            self._observation_waiting_since_ns = None
         self.stats.observation_age_ms, self.stats.observation_skew_ms = (
             observation_timing_ms(observation)
         )
@@ -1632,17 +1603,6 @@ def policy_runner_loop(
                 if np.isfinite(value) and value >= 0
             ),
         )
-        max_input_age_s = float(runtime.policy.max_input_age_s)
-        warm_durations = [
-            value for value in timings_s if np.isfinite(value) and value >= 0
-        ]
-        if warm_durations and all(value >= max_input_age_s for value in warm_durations):
-            logger.warning(
-                "policy warmup: all %d samples are at or above max_input_age_s "
-                "(%.3fs); publication freshness may be violated at runtime",
-                len(warm_durations),
-                max_input_age_s,
-            )
         runner = PolicyRunner(
             shared,
             runtime,

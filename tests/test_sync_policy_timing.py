@@ -84,7 +84,6 @@ class SyncPolicyTimingTest(unittest.TestCase):
     def _install_observation_fakes(self) -> None:
         def build(
             shared,
-            policy,
             policy_spec,
             *,
             observation_id,
@@ -138,8 +137,6 @@ class SyncPolicyTimingTest(unittest.TestCase):
         last_publication_ns=None,
         inference_ns=0,
         n_action_steps=8,
-        max_input_age_s=0.15,
-        max_consecutive_errors=10,
     ) -> "PolicyRunner":
         runner = PolicyRunner.__new__(PolicyRunner)
         runner.actions = deque()
@@ -151,8 +148,8 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.chunk_sources = {}
         runner.chunk_action_index = 0
         runner.previous_arm_command_qpos = None
-        runner.consecutive_stale_predictions = 0
         runner._pending_dispatch = None
+        runner._observation_waiting_since_ns = None
         runner._fifo_wait = executor_module.PublishWaitTracker("test")
         runner.stats = SimpleNamespace()
         runner.shared = None
@@ -161,12 +158,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
             n_action_steps=n_action_steps,
             control_dt_s=_STEP_DT_NS / 1e9,
         )
-        runner.runtime = SimpleNamespace(
-            policy=SimpleNamespace(
-                max_input_age_s=max_input_age_s,
-                max_consecutive_errors=max_consecutive_errors,
-            )
-        )
+        runner.runtime = SimpleNamespace(policy=SimpleNamespace())
         runner.model_runtime = _Model(self.clock, n_action_steps, inference_ns)
         runner.fingertip_runtime = None
 
@@ -183,8 +175,6 @@ class SyncPolicyTimingTest(unittest.TestCase):
             published.append((clock.ns, tuple(np.asarray(action).tolist())))
             runner.last_publication_ns = clock.ns
             runner.actions.popleft()
-            if runner.chunk_action_index == 0:
-                runner.consecutive_stale_predictions = 0
             runner.chunk_action_index += 1
 
         runner._dispatch_action = dispatch
@@ -283,61 +273,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
         self.assertEqual(runner.run_generation, 7)
         self.assertEqual(runner.observation_id, 3)
 
-    # --- stale-prediction guard --------------------------------------------
-
-    def test_repeated_stale_prediction_escalates_to_session_failure(self):
-        runner = PolicyRunner.__new__(PolicyRunner)
-        runner.chunk_sources = {"arm": (0,)}
-        runner.chunk_action_index = 0
-        runner.run_generation = 1
-        runner.observation_id = 1
-        runner.actions = deque([np.array([1.0])])
-        runner.previous_arm_command_qpos = np.array([2.0])
-        runner.runtime = SimpleNamespace(
-            policy=SimpleNamespace(max_input_age_s=0.15, max_consecutive_errors=3)
-        )
-        runner.stats = SimpleNamespace(stale_prediction_count=0)
-        runner.consecutive_stale_predictions = 0
-        runner._pending_dispatch = None
-        runner._fifo_wait = SimpleNamespace(note_dropped=lambda reason: None)
-        runner._invalidate_rollout = mock.Mock(return_value=True)
-        runner._request_failed_session_shutdown = mock.Mock()
-
-        now_ns = 10_000_000_000  # age >> max_input_age_s
-
-        for _ in range(3):
-            runner.chunk_sources = {"arm": (0,)}
-            self.assertFalse(runner._input_is_fresh(now_ns))
-
-        self.assertEqual(runner.consecutive_stale_predictions, 3)
-        self.assertEqual(runner.stats.stale_prediction_count, 3)
-        runner._invalidate_rollout.assert_called_once()
-        runner._request_failed_session_shutdown.assert_called_once()
-
-    def test_single_stale_prediction_does_not_escalate(self):
-        runner = PolicyRunner.__new__(PolicyRunner)
-        runner.chunk_sources = {"arm": (0,)}
-        runner.chunk_action_index = 0
-        runner.run_generation = 1
-        runner.observation_id = 1
-        runner.actions = deque([np.array([1.0])])
-        runner.previous_arm_command_qpos = np.array([2.0])
-        runner.runtime = SimpleNamespace(
-            policy=SimpleNamespace(max_input_age_s=0.15, max_consecutive_errors=10)
-        )
-        runner.stats = SimpleNamespace(stale_prediction_count=0)
-        runner.consecutive_stale_predictions = 0
-        runner._pending_dispatch = None
-        runner._fifo_wait = SimpleNamespace(note_dropped=lambda reason: None)
-        runner._invalidate_rollout = mock.Mock(return_value=True)
-        runner._request_failed_session_shutdown = mock.Mock()
-
-        self.assertFalse(runner._input_is_fresh(10_000_000_000))
-        self.assertEqual(runner.consecutive_stale_predictions, 1)
-        runner._invalidate_rollout.assert_not_called()
-        runner._request_failed_session_shutdown.assert_not_called()
-
-    def test_clear_execution_resets_consecutive_stale_predictions(self):
+    def test_clear_execution_resets_epoch_local_state(self):
         runner = PolicyRunner.__new__(PolicyRunner)
         runner.run_generation = 1
         runner.last_publication_ns = 1_000_000_000
@@ -347,13 +283,16 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.chunk_sources = {"arm": (0,)}
         runner.chunk_action_index = 2
         runner.observation_id = 5
-        runner.consecutive_stale_predictions = 7
+        runner._pending_dispatch = object()
+        runner._observation_waiting_since_ns = 7
 
         runner._clear_execution(None)
 
-        self.assertEqual(runner.consecutive_stale_predictions, 0)
         self.assertEqual(runner.observation_id, 0)
         self.assertEqual(list(runner.actions), [])
+        self.assertIsNone(runner._pending_dispatch)
+        self.assertIsNone(runner._observation_waiting_since_ns)
+        self.assertIsNone(runner.previous_arm_command_qpos)
 
     # --- lifecycle invariant -----------------------------------------------
 

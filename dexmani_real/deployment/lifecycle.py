@@ -172,12 +172,16 @@ def _compute_policy_observation_ring_capacities(
     policy_spec: Any,
     channels_config: RuntimeChannelsConfig,
 ) -> dict[str, int]:
-    """Return deployment-owned history capacities for a policy observation grid."""
+    """Return deployment-owned history capacities for a policy observation grid.
+
+    Capacity = source rate x history span, plus one predecessor control period
+    and a small read margin. This is a STORAGE COVERAGE assumption so one
+    causal window stays resident for sequence-addressed reads — it is NOT an
+    admission deadline: temporal admission is decided per query from source
+    causality against the query anchor alone.
+    """
     observation_horizon = policy_spec.n_obs_steps
     observation_dt_s = policy_spec.control_dt_s
-    max_input_age_s = runtime.policy.max_input_age_s
-    max_observation_skew_s = runtime.policy.max_observation_skew_s
-    max_grid_lag_s = runtime.policy.max_grid_lag_s
     if (
         observation_horizon is None
         or isinstance(observation_horizon, bool)
@@ -190,33 +194,18 @@ def _compute_policy_observation_ring_capacities(
         or float(observation_dt_s) <= 0.0
     ):
         raise ValueError("deployment observation_dt_s must be finite and positive")
-    if not math.isfinite(float(max_input_age_s)) or float(max_input_age_s) <= 0.0:
-        raise ValueError("max_input_age_s must be finite and positive")
-    if (
-        not math.isfinite(float(max_observation_skew_s))
-        or float(max_observation_skew_s) < 0.0
-    ):
-        raise ValueError("max_observation_skew_s must be finite and non-negative")
-    if not math.isfinite(float(max_grid_lag_s)) or float(max_grid_lag_s) < 0.0:
-        raise ValueError("max_grid_lag_s must be finite and non-negative")
 
     horizon = int(observation_horizon)
     # Observation history lives on the policy control grid. Camera FPS only
     # determines source frames inside that span, not model temporal spacing.
-    history_span_s = (horizon - 1) * float(observation_dt_s)
-    visual_span_s = history_span_s + float(max_grid_lag_s) + float(max_input_age_s)
-    state_span_s = (
-        visual_span_s + float(max_observation_skew_s)
-        if channels_config.camera_requested
-        else history_span_s + float(max_input_age_s) + float(max_observation_skew_s)
-    )
+    coverage_s = horizon * float(observation_dt_s)
     arm_state_ring_maxlen = max(
         channels_config.arm_state_ring_maxlen,
-        math.ceil(float(runtime.arm.loop_hz) * state_span_s) + _OBSERVATION_READ_MARGIN,
+        math.ceil(float(runtime.arm.loop_hz) * coverage_s) + _OBSERVATION_READ_MARGIN,
     )
     hand_state_ring_maxlen = max(
         channels_config.hand_state_ring_maxlen,
-        math.ceil(float(runtime.hand.loop_hz) * state_span_s)
+        math.ceil(float(runtime.hand.loop_hz) * coverage_s)
         + _OBSERVATION_READ_MARGIN,
     )
     capacities = {
@@ -226,13 +215,13 @@ def _compute_policy_observation_ring_capacities(
     if channels_config.camera_requested:
         capacities["camera_ring_maxlen"] = max(
             channels_config.camera_ring_maxlen,
-            math.ceil(float(runtime.camera.fps) * visual_span_s)
+            math.ceil(float(runtime.camera.fps) * coverage_s)
             + _OBSERVATION_READ_MARGIN,
         )
     if channels_config.pointcloud_requested:
         capacities["pointcloud_ring_maxlen"] = max(
             channels_config.pointcloud_ring_maxlen,
-            math.ceil(float(runtime.camera.fps) * visual_span_s)
+            math.ceil(float(runtime.camera.fps) * coverage_s)
             + _OBSERVATION_READ_MARGIN,
         )
     return capacities
@@ -590,9 +579,12 @@ def run_policy_deployment(
         )
         operator_thread.start()
 
-        heartbeat_names = {"arm", "hand", "policy"}
-        if recording_config is not None:
-            heartbeat_names.update({"camera", "pointcloud", "recorder"})
+        # The policy child is supervised through is_alive/exitcode plus the
+        # parent-side run budget below — a normal blocking inference must
+        # never trip a loop-heartbeat deadline. Every started I/O worker keeps
+        # its existing heartbeat supervision (the timeout lookup below only
+        # covers processes that actually run).
+        heartbeat_names = {"arm", "hand", "camera", "pointcloud", "recorder"}
         heartbeat_timeouts = {
             process.name: float(runtime.safety.heartbeat_timeouts[process.name])
             for process in started_procs
@@ -604,6 +596,7 @@ def run_policy_deployment(
             heartbeat_timeouts_s=heartbeat_timeouts,
             supervisor_hz=float(runtime.safety.supervisor_hz),
             service_process_names=service_process_names,
+            max_running_s=max_running_s,
         )
 
         # Stop user input before finalization. E-stop remains latched and the

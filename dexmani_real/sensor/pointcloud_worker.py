@@ -22,7 +22,7 @@ from dexmani_real.ipc.schema import (
     validate_point_cloud_array,
 )
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
-from dexmani_real.sensor.camera.worker import CameraHealth
+from dexmani_real.sensor.camera.worker import PAYLOAD_VALID_CAMERA_HEALTH
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
@@ -59,12 +59,17 @@ def _validate_transform(value: np.ndarray, *, label: str) -> np.ndarray:
 
 @dataclass(frozen=True)
 class PointCloudLoopConfig:
-    """Resolved processing and freshness policy for the realtime worker."""
+    """Resolved processing policy for the realtime worker.
+
+    The worker owns no freshness/age gate: it derives a cloud from every new
+    valid camera sequence and publishes it with its full provenance chain.
+    Temporal admission is decided by consumers against their query anchors,
+    and true source stalls are exposed by the camera producer itself.
+    """
 
     pointcloud: PointCloudConfig
     camera_calibration: CameraExtrinsics
     table_plane_abcd: tuple[float, float, float, float] | None = None
-    max_input_age_s: float = 0.25
 
     def __post_init__(self) -> None:
         if not isinstance(self.pointcloud, PointCloudConfig):
@@ -86,8 +91,6 @@ class PointCloudLoopConfig:
             if norm <= 0.0 or plane[2] / norm <= 0.0:
                 raise ValueError("table_plane_abcd normal must point upward")
             object.__setattr__(self, "table_plane_abcd", plane)
-        if not np.isfinite(self.max_input_age_s) or self.max_input_age_s <= 0.0:
-            raise ValueError("max_input_age_s must be finite and positive")
 
     @classmethod
     def from_runtime(
@@ -101,10 +104,6 @@ class PointCloudLoopConfig:
             pointcloud=replace(runtime.pointcloud, num_points=num_points),
             camera_calibration=CameraExtrinsics(),
             table_plane_abcd=table.plane_abcd if table.enabled else None,
-            max_input_age_s=min(
-                float(runtime.camera.max_frame_age_s),
-                float(runtime.policy.max_input_age_s),
-            ),
         )
 
 
@@ -166,16 +165,20 @@ def _camera_frame_is_usable(
     header: np.ndarray,
     *,
     now_ns: int,
-    max_input_age_ns: int,
 ) -> bool:
+    """Truthfulness and causality only — no age drop before the cloud build.
+
+    A finite-but-slow delivery (DELIVERY_DELAY) and skipped-frame telemetry
+    (FRAME_GAP) carry valid payloads and stay usable; an invalid clock
+    (CLOCK_RESET) or an ordering violation never passes.
+    """
     record = header[0]
     source_ns = int(record["source_monotonic_ns"])
     camera_publish_ns = int(record["publish_monotonic_ns"])
     return bool(
         int(record["camera_generation"]) > 0
-        and int(record["camera_health"]) == int(CameraHealth.OK)
+        and int(record["camera_health"]) in PAYLOAD_VALID_CAMERA_HEALTH
         and 0 < source_ns <= camera_publish_ns <= now_ns
-        and now_ns - source_ns <= max_input_age_ns
     )
 
 
@@ -210,7 +213,6 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
 
     last_camera_sequence = 0
     ready = False
-    max_input_age_ns = int(cfg.max_input_age_s * 1e9)
 
     try:
         while shared.is_running.value:
@@ -228,11 +230,7 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
                 continue
             last_camera_sequence = camera_sequence
             now_ns = time.monotonic_ns()
-            if not _camera_frame_is_usable(
-                header,
-                now_ns=now_ns,
-                max_input_age_ns=max_input_age_ns,
-            ):
+            if not _camera_frame_is_usable(header, now_ns=now_ns):
                 continue
 
             cloud = build_point_cloud(
@@ -253,8 +251,6 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
             )
 
             publish_ns = time.monotonic_ns()
-            if publish_ns - int(header[0]["source_monotonic_ns"]) > max_input_age_ns:
-                continue
             record = np.zeros(1, dtype=expected_dtype)
             camera_header = header[0]
             record["source_camera_sequence"][0] = np.uint64(camera_sequence)

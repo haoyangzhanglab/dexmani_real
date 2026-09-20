@@ -602,11 +602,11 @@ class PolicyParams:
     control_hz: float = 16.0
     # Teleoperation polls faster than its command rate. Policy uses PolicySpec dt.
     executor_poll_hz: float = 128.0
-    # Learned-policy inference and causal observation timing. Model shape,
-    # history, and action horizon remain PolicySpec-owned.
-    max_input_age_s: float = 0.15
+    # Cross-modal source-span bound for the teleop RECORDING provenance flag
+    # (raw ``observation_valid``); it is not a policy admission gate. Model
+    # shape, history, and action horizon remain PolicySpec-owned; policy
+    # observation admission is source causality against the query anchor.
     max_observation_skew_s: float = 0.10
-    max_grid_lag_s: float = 0.08
     action_apply_timeout_s: float = 0.75
     arm_state_stale_threshold_s: float = 0.5
     quit_save_timeout_s: float = 30.0
@@ -650,14 +650,12 @@ class PolicyParams:
             or self.executor_poll_hz < self.control_hz
         ):
             raise ValueError("executor_poll_hz must be finite and >= control_hz")
-        deployment_timing = (
-            self.max_input_age_s,
-            self.max_observation_skew_s,
-            self.max_grid_lag_s,
-        )
-        if not all(np.isfinite(value) and value > 0 for value in deployment_timing):
+        if (
+            not np.isfinite(self.max_observation_skew_s)
+            or self.max_observation_skew_s <= 0
+        ):
             raise ValueError(
-                "policy deployment timing values must be finite and positive"
+                "recording observation skew bound must be finite and positive"
             )
         timing = (
             self.action_apply_timeout_s,
@@ -925,7 +923,11 @@ class SafetyParams:
         default_factory=lambda: {
             "arm": 1.0,
             "hand": 1.0,
-            "policy": 5.0,  # Includes blocking model inference.
+            # The "policy" heartbeat slot is owned by the teleop loop. Policy
+            # deployments supervise the policy child through is_alive/exitcode
+            # and the parent-side run budget instead, so a normal blocking
+            # model inference can never trip a loop-heartbeat deadline.
+            "policy": 5.0,
             "recorder": 2.0,
             "vr": 5.0,
             "camera": 2.0,
@@ -982,6 +984,15 @@ class CameraParams:
     fps: int = 30
     warmup_frames: int = 10
     max_frame_age_s: float = 0.25
+    # Device-owned stall budget: how long the camera worker tolerates failed
+    # reads or no new valid source frame before it latches. This is a device
+    # truthfulness threshold — it is never derived from model latency or
+    # recording-quality parameters, and the value matches the long-standing
+    # effective device stall timeout.
+    source_stall_timeout_s: float = 2.0
+    # Recording-evidence stall budget owned by the teleop recording grid
+    # (CameraFreshnessTracker): how long a recording tolerates no fresh camera
+    # sample before it stops and saves the collected prefix.
     recording_stall_abort_s: float = 2.0
     # Zero selects the default recovered-frame-gap logging threshold. Gaps are
     # retained as telemetry; current-frame freshness is timestamp-based.
@@ -1012,10 +1023,12 @@ class CameraParams:
             or self.max_frame_age_s <= 0
             or not np.isfinite(self.recording_stall_abort_s)
             or self.recording_stall_abort_s <= self.max_frame_age_s
+            or not np.isfinite(self.source_stall_timeout_s)
+            or self.source_stall_timeout_s <= self.max_frame_age_s
         ):
             raise ValueError(
                 "camera frame age and stall thresholds must be finite and positive, "
-                "with stall abort greater than max frame age"
+                "with both stall timeouts greater than max frame age"
             )
         if self.frame_gap_stall_threshold < 0:
             raise ValueError("camera frame_gap_stall_threshold must be >= 0")

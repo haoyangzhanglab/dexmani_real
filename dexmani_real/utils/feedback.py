@@ -59,13 +59,23 @@ def diagnose_arm_feedback(
     state_valid: bool,
     source_monotonic_ns: int,
     now_monotonic_ns: int,
-    max_age_s: float,
+    max_age_s: float | None,
     qpos: np.ndarray,
     qvel: np.ndarray,
 ) -> FeedbackIssue | None:
-    """Return the typed arm feedback failure, or ``None`` when healthy."""
-    if not np.isfinite(max_age_s) or max_age_s <= 0.0:
-        raise ValueError("max_age_s must be finite and positive")
+    """Return the typed arm feedback failure, or ``None`` when healthy.
+
+    Truthfulness (connection, controller error, validity, shape, finiteness)
+    and causality (no missing/future timestamps) are always checked.
+    ``max_age_s=None`` removes only the age veto: callers whose liveness is
+    owned by worker supervision (policy dispatch) must not treat an
+    old-but-real frame as a device failure, while teleop/replay live-feedback
+    callers keep their explicit thresholds.
+    """
+    if max_age_s is not None and (
+        not np.isfinite(max_age_s) or max_age_s <= 0.0
+    ):
+        raise ValueError("max_age_s must be finite and positive, or None")
     fields = {
         "qpos": (np.asarray(qpos), ARM_JOINT_SHAPE),
         "qvel": (np.asarray(qvel), ARM_JOINT_SHAPE),
@@ -103,7 +113,7 @@ def diagnose_arm_feedback(
             FeedbackIssueCode.FUTURE_TIMESTAMP,
             f"arm state timestamp is {abs(age_s):.3f}s in the future",
         )
-    if age_s > max_age_s:
+    if max_age_s is not None and age_s > max_age_s:
         return FeedbackIssue(FeedbackIssueCode.STALE, f"arm state stale ({age_s:.2f}s)")
     return None
 
@@ -114,12 +124,18 @@ def diagnose_hand_feedback(
     state_valid: bool,
     source_monotonic_ns: int,
     now_monotonic_ns: int,
-    max_age_s: float,
+    max_age_s: float | None,
     qpos: np.ndarray,
 ) -> FeedbackIssue | None:
-    """Return the typed hand feedback failure, or ``None`` when healthy."""
-    if not np.isfinite(max_age_s) or max_age_s <= 0.0:
-        raise ValueError("max_age_s must be finite and positive")
+    """Return the typed hand feedback failure, or ``None`` when healthy.
+
+    ``max_age_s=None`` removes only the age veto, exactly as in
+    :func:`diagnose_arm_feedback`; truthfulness and causality always apply.
+    """
+    if max_age_s is not None and (
+        not np.isfinite(max_age_s) or max_age_s <= 0.0
+    ):
+        raise ValueError("max_age_s must be finite and positive, or None")
     value = np.asarray(qpos)
     if value.shape != HAND_JOINT_SHAPE:
         return FeedbackIssue(
@@ -145,7 +161,7 @@ def diagnose_hand_feedback(
             FeedbackIssueCode.FUTURE_TIMESTAMP,
             f"hand state timestamp is {abs(age_s):.3f}s in the future",
         )
-    if age_s > max_age_s:
+    if max_age_s is not None and age_s > max_age_s:
         return FeedbackIssue(
             FeedbackIssueCode.STALE, f"hand state stale ({age_s:.2f}s)"
         )
@@ -157,22 +173,25 @@ def diagnose_feedback_timestamp_order(
     source_monotonic_ns: int,
     ring_commit_monotonic_ns: int,
     validation_now_ns: int,
-    max_age_s: float,
+    max_age_s: float | None,
     modality: str,
 ) -> FeedbackIssue | None:
-    """Validate ring-commit provenance and freshness against a post-selection now.
+    """Validate ring-commit provenance against a post-selection now.
 
     This is the post-selection recheck, layered on the per-modality
     ``diagnose_arm_feedback``/``diagnose_hand_feedback`` pass that owns the
     ``FUTURE_TIMESTAMP`` (source vs. its own post-read now) check. One
     already-selected frame must satisfy ``0 < source <= ring_commit <=
-    validation_now`` and ``validation_now - source <= max_age``. A producer or
-    clock-invariant violation (``source > ring_commit`` or ``ring_commit >
-    validation_now``) is a fatal timestamp-order issue, distinct from a plain
-    ``STALE`` frame. No future/ordering tolerance is applied.
+    validation_now``; a producer or clock-invariant violation
+    (``source > ring_commit`` or ``ring_commit > validation_now``) is a fatal
+    timestamp-order issue with no future/ordering tolerance. ``max_age_s=None``
+    removes only the additional age veto for callers whose liveness is owned
+    by worker supervision.
     """
-    if not np.isfinite(max_age_s) or max_age_s <= 0.0:
-        raise ValueError("max_age_s must be finite and positive")
+    if max_age_s is not None and (
+        not np.isfinite(max_age_s) or max_age_s <= 0.0
+    ):
+        raise ValueError("max_age_s must be finite and positive, or None")
     if source_monotonic_ns <= 0:
         return FeedbackIssue(
             FeedbackIssueCode.MISSING_TIMESTAMP,
@@ -195,7 +214,7 @@ def diagnose_feedback_timestamp_order(
             f"{(validation_now_ns - ring_commit_monotonic_ns) / 1e6:.3f})",
         )
     age_s = (validation_now_ns - source_monotonic_ns) * 1e-9
-    if age_s > max_age_s:
+    if max_age_s is not None and age_s > max_age_s:
         return FeedbackIssue(
             FeedbackIssueCode.STALE, f"{modality} state stale ({age_s:.2f}s)"
         )
@@ -209,7 +228,7 @@ def validate_arm_feedback(
     state_valid: bool,
     source_monotonic_ns: int,
     now_monotonic_ns: int,
-    max_age_s: float,
+    max_age_s: float | None,
     qpos: np.ndarray,
     qvel: np.ndarray,
 ) -> str | None:
@@ -233,7 +252,7 @@ def validate_hand_feedback(
     state_valid: bool,
     source_monotonic_ns: int,
     now_monotonic_ns: int,
-    max_age_s: float,
+    max_age_s: float | None,
     qpos: np.ndarray,
 ) -> str | None:
     """Return why measured XHand feedback is unusable, or ``None``."""
