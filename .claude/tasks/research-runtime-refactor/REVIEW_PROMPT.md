@@ -1,4 +1,4 @@
-对当前工作树按 `.claude/tasks/research-runtime-refactor/TASKBOOK.md` 做独立、只读的交付审查。这是已实施代码的审查，不是重新设计更复杂的系统。先读 AGENTS.md、CLAUDE.md、TASKBOOK 和本地 `$(git rev-parse --absolute-git-dir)/research-runtime-refactor/STATUS.md`，再核对 Git log、IMPLEMENTATION_BASE→HEAD diff、staged/unstaged diff、测试证据和实际源码。STATUS 只是索引，不是通过证明。
+对当前工作树按 `.claude/tasks/research-runtime-refactor/TASKBOOK.md` 做独立、只读的交付审查。这是已实施代码的审查，不是重新设计更复杂的系统。先读 AGENTS.md、CLAUDE.md、TASKBOOK 和本地 `$(git rev-parse --absolute-git-dir)/research-runtime-refactor/STATUS.md`，再核对 Git log、IMPLEMENTATION_BASE→HEAD diff、staged/unstaged diff、测试证据和实际源码。本地 STATUS 账本不随仓库提交；其结论已整理为同目录的 `ACCEPTANCE_EVIDENCE.html`（验收证据页：阶段矩阵、验证命令与结果、删除/保留机制、EX01–EX14 逐项结论、提交清单、审查轮次、未验证范围），可直接阅读。STATUS 与证据页都只是索引，不是通过证明；证据页声明的被验证代码版本以其中标注的 HEAD 为准，页面自身的文档提交不改变它。
 
 不修改文件、不提交、不 push、不安装依赖、不连接硬件、不执行 examples 或未检查的测试。测试结果只引用实际日志和明确运行范围；缺少证据记验证缺口，不把它自动当作代码 bug，也不把 skip 当通过。
 
