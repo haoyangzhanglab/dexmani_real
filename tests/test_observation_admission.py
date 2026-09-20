@@ -143,6 +143,32 @@ class StateHistoryAdmissionTest(unittest.TestCase):
 
 
 @unittest.skipIf(_IMPORT_ERROR is not None, f"dependencies unavailable: {_IMPORT_ERROR}")
+class RingCommitAdmissionTest(unittest.TestCase):
+    def test_real_commit_and_payload_order_for_arm_and_hand(self):
+        from dexmani_real.deployment.inference.observation import _read_hand_history
+        from dexmani_real.ipc.schema import HAND_STATE_DTYPE
+        for name, dtype in (("arm", ARM_STATE_DTYPE), ("hand", HAND_STATE_DTYPE)):
+            for publish, commit, anchor, admitted in (
+                (95, 105, 100, False), (95, 99, 100, True),
+                (98, 96, 100, False), (89, 99, 100, False),
+                (95, 99, 10000, True), (0, 99, 100, True),
+            ):
+                with self.subTest(name=name, publish=publish, commit=commit, anchor=anchor):
+                    record = np.zeros(1, dtype=dtype)
+                    record["state_valid"] = 1
+                    record["source_monotonic_ns"] = 90
+                    record["publish_monotonic_ns"] = publish
+                    ring = _FakeRing([(record, commit, 1)])
+                    kwargs = dict(history_len=1, anchor_ns=anchor)
+                    if name == "arm":
+                        window = _read_state_history(ring, values_field="qpos", **kwargs)
+                    else:
+                        window = _read_hand_history(ring, **kwargs)
+                    self.assertEqual(window is not None, admitted)
+                    if admitted:
+                        self.assertEqual(int(window.publish_monotonic_ns[0]), publish or commit)
+
+
 class GridSelectionTest(unittest.TestCase):
     def test_low_rate_reuse_and_newest_before_reference(self):
         run_started = 10 * _S

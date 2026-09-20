@@ -189,7 +189,7 @@ def _read_state_history(
     required_false_fields: tuple[str, ...] = (),
     not_before_ns: int = 0,
 ) -> FrameWindow | None:
-    """Read the causal (source <= publish <= query anchor) frames, oldest-first.
+    """Read causal source <= payload publish <= ring commit <= anchor frames.
 
     Admission is truthfulness plus causality against the ONE query anchor —
     there is no generic age gate: an old-but-causal frame is a valid history
@@ -225,7 +225,10 @@ def _read_state_history(
             and int(data["publish_monotonic_ns"][0]) > 0
             else int(ring_publish_ns)
         )
-        if not (max(1, int(not_before_ns)) <= source_ns <= publish_ns <= anchor_ns):
+        if not (
+            max(1, int(not_before_ns)) <= source_ns <= publish_ns
+            <= int(ring_publish_ns) <= anchor_ns
+        ):
             continue
         value = np.asarray(data[values_field][0], dtype=np.float64)
         if not np.all(np.isfinite(value)):
@@ -257,7 +260,7 @@ def _read_hand_history(
     """Read one causal XHand window, copying qpos and both tactile payloads together.
 
     Admission is decided by the hand sample alone (state_valid, qpos_stale,
-    source/publish causality against the query anchor, finite qpos); tactile
+    source/payload/ring-commit causality against the query anchor, finite qpos); tactile
     validity bits are copied verbatim and never drop a record. A record whose
     *valid* tactile payload is non-finite is rejected as producer corruption,
     not as invalidity. The all-valid tactile contract for contact/tactile
@@ -290,7 +293,10 @@ def _read_hand_history(
             and int(data["publish_monotonic_ns"][0]) > 0
             else int(ring_publish_ns)
         )
-        if not (max(1, int(not_before_ns)) <= source_ns <= publish_ns <= anchor_ns):
+        if not (
+            max(1, int(not_before_ns)) <= source_ns <= publish_ns
+            <= int(ring_publish_ns) <= anchor_ns
+        ):
             continue
         qpos = np.asarray(data["qpos"][0], dtype=np.float64)
         if not np.all(np.isfinite(qpos)):
