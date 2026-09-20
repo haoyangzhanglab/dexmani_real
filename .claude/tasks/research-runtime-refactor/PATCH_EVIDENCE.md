@@ -170,3 +170,126 @@ print('processed_replay_loader', {'files': len(files),
 反向复核重点：较大 ACK 只在同代无跳序的消费前提下证明前驱；旧 SDK ACK 不穿过 generation wait 检查。Evidence latch 没有退出 run plan 的权限，Q/critical failure 不被持续 evidence 事件吞掉。旧 recording 的身份、reason、terminal consumed 不被无录制 trial 重置。软件首次终止只在离开 RUNNING 时写入；pending 日志不把累计历史或双 consumer 数相加冒充 distinct actions。
 
 未验证/条件暂缓：真实机器人与相机运行、CUDA 推理、真实 policy artifact、实手 exact endpoint 容差、真实设备断流/SDK 延时分布、性能基准、未知 raw/legacy 根。离线通过不等于真机安全或物理动作完成已验证；timeout / 系统停止不推断 task success。
+
+---
+
+## R1–R4 后续有边界修复（2026-09-20）
+
+本节是新的修复批次；上文 F1–F9、旧 PATCH_BASE、160-test 和真实数据读数保留为历史记录，不能用来代替本节的验证。
+
+### 本批基线与结果
+
+- PATCH_BASE：`11911a1cba4812175e6bf19eb0695932f6f33bd2`，实际开始 HEAD，与指定 review tip 一致。
+- 分支：`refactor/research-runtime-v2`；未在 main 修改。开始时 index/worktree/untracked 全空。
+- 原 IMPLEMENTATION_BASE 仍为 `5b9f8968a10c845d695de418b632e6ce64de3be6`；旧批次 PATCH_BASE 未覆盖。
+- Python：现有 `real_robot` 环境 3.10.20；没有安装升级依赖或改 Git 身份。
+- 最终被测源码/测试 SHA：`671a67cac2440bb94ff0821152e2652d54cfd874`。
+- 本 SHA 完整离线回归：**179 tests，OK，0 fail，0 skip，Python exit 0**。后续仅提交本交付证据。
+- TASKBOOK、AGENTS、CLAUDE、agent 配置未改；无 push/merge/amend/no-verify。
+
+### Fact-check、修复与具体证据
+
+| 项 | 实际开始结论 | 最终修改位置与行为 | 本批回归 |
+|---|---|---|---|
+| R1 | CONFIRMED；两行真实 STOP/drain/writer 探针只剩 aborted JSON，assertion exit 1 | `recording/client.py:31,246` 增加默认 False 的 retain_partial；`teleop/episode_samples.py:25` 传递；`teleop/loop.py:454,622,763,807,948,1014` 标记自动中断；`recording/io_worker.py:404` 合并既有 corruption 保留条件；`recording/recorder.py:785` 明确 incomplete 提示；`deployment/executor.py:660,739` 自动非保存 STOP 保留、结果提示未发布 | `TeleopInterruptedRecordingTest` 实际 controller→client→STOP→RecorderIO→临时 EpisodeRecorder；shutdown/fault/ESC/arm reject、Q/ESTOP、Q/SHUTDOWN、明确 SAVE/D、Q/TIMEOUT；两行 HDF5 时间戳逐值核对。`InterruptedRetentionBoundaryTest` 证明 2 行低于 flush interval=32，writer 未释放时 staging 不动，释放后才保存数据；旧三参数消息、位置参数 stop_episode 及 STOP 幂等；Policy helper→真实 client 消息；实际 terminal 只打印一次未发布并由 recorder 报告真实保留路径。 |
+| R2 | CONFIRMED；FULL 的 continue 先于 release | `teleop/keyboard_session.py:673,844,903` 小局部 drop_pending helper；先处理当前 moving/release，再重试原 candidate；确认释放后取消未提交目标，原 ACK/timeout 仅针对已 publication action | `KeyboardReleaseLoopTest` 真实 `_run_control_loop` 和 `_publish_keyboard_target`；受控 LoopRate/fake clock，无随机 sleep。持续 FULL 后释放、容量恢复、已 ACK/无 predecessor、未 ACK 原 0.15s timeout、持续按住同 candidate 单次成功、短暂释放后重按、Q/ESC/home/epoch、重新 anchor 和新按键均覆盖。 |
+| R3 | CONFIRMED；teleop_active 令旧 max_frames 获得新 B 的暂停权限 | `teleop/loop.py:570` 仅用现有 recording_active 门控；当前顺序仍在 terminal 清除前判断首次容量，不需要额外快照或 persistent ID | `TeleopCapacityOwnershipTest` 真实 poll→B→poll；Event 控制的真实 finalizer 在 B 期间保持活跃，旧 pending/done 均不改新 RUNNING/generation；新正常 capture 可开始并保存；首次 terminal 直接到达仍暂停一次；STOP/保存结果各消费一次。 |
+| R4 | CONFIRMED；hand 已 clip，返回链和日志仅包含 arm | `deployment/executor.py:219,260,1216,1320` 内部 `_PolicyClipReport` 从第一次投影携带 hand correction；每 action 合成一行 CLIP | `PolicyEndpointClipReportingTest` 真实 decode/projection/prepare/dispatch，实际 SafetyGate；仅 hand、仅 arm、两者、无 clip；nextafter 级微小 correction；3 次 FULL 后成功，projection/log 各一次；action/action_ee 数值与原投影函数及既有 clip 结果精确一致，input 不变；NaN/shape 仍走合同失败。 |
+
+没有 ALREADY_FIXED 或为清单制造的修改。R2/R3/R4 的反例也实际在各自修复前执行失败；不是仅静态推测后标通过。
+
+新增生产接口只有 `StopRecording.retain_partial=False`、两个 STOP helper 的同名 keyword-only 参数，以及 executor 内部的 `_PolicyClipReport`。Keyboard 的 `drop_pending` 只取消一个未提交候选并关闭原 wait span。没有 ACK/STOP/trial/report registry、失败策略框架、heartbeat 线程、source archive、每动作 barrier 或新的终止阈值。
+
+`hand_max_correction_rad` 是 decoded hand 与 projected hand 的最大绝对差，单位 rad；`hand_joint` 零起始。没有重新 clip，不使用 measured hand 计算，不用 allclose/deadband，使用 17 位有效数字。原 `arm_max_delta_rad` 仍表示裁剪前 command step。投影函数、bounds/roundoff、SafetyGate、worker hard limit、SDK slew/CRC/exact endpoint 没有改动。
+
+### 实际验证命令、退出码与失败记录
+
+命令均使用本环境 Python；重定向后立即保存 `$?` 再显示日志并以该值退出，没有以 tail/tee 状态代替 Python 退出码。
+
+| 命令/执行阶段 | 实际结果 |
+|---|---|
+| 初始只读 inline R1 probe（真实 stop_recording/client/RecorderIO/EpisodeRecorder） | 2 行被删除、仅 aborted JSON；期望保留的断言失败，exit 1；未驱动完整 Teleop loop，不冒充 R1 最终集成测试。 |
+| `python -m unittest discover -s tests -p 'test_teleop_command_span.py' -v`，R1 修复前 | 5 methods，9 个失败子例，exit 1；`/tmp/pr17-r1-before.log`。 |
+| `PYTHONPATH=tests python -m unittest test_teleop_command_span.KeyboardReleaseLoopTest -v`，R2 修复前 | 初次夹具错误传递 PreparedCommand 构造参数，10 errors，exit 1；修正夹具后旧生产代码实际 7 failures，exit 1，`/tmp/pr17-r2-before.log`。前者不作为缺陷复现。 |
+| `PYTHONPATH=tests python -m unittest test_teleop_command_span.TeleopCapacityOwnershipTest -q`，R3 修复前 | 3 methods，旧 pending 与迟到 terminal 两项失败，exit 1；`/tmp/pr17-r3-before.log`。后续增加 Event 控制真实 finalizer 的验证。 |
+| `PYTHONPATH=tests python -m unittest test_policy_projection.PolicyEndpointClipReportingTest -v`，R4 修复前 | 4 methods，6 failures/subcases，exit 1；`/tmp/pr17-r4-before.log`。 |
+| `python -m unittest discover -s tests -p 'test_recording_preservation.py' -q` | R1 时 14、最终补证后 15 tests，OK，exit 0。 |
+| `python -m unittest discover -s tests -p 'test_teleop_command_span.py' -q` | R1/R2/R3 分别 5/11/14；最终补证后 15 tests，OK，exit 0。 |
+| `python -m unittest discover -s tests -p 'test_deployment_evidence.py' -q` | 31 tests，OK，exit 0。 |
+| `python -m unittest discover -s tests -p 'test_policy_projection.py' -q` | 17 tests，OK，exit 0。 |
+| `python -m unittest discover -s tests -p 'test_sync_policy_timing.py' -q` | 7 tests，OK，exit 0；CUDA OOM 是既有 mock 异常用例，不运行 CUDA。 |
+| `python -m unittest discover -s tests -p 'test_examples_interfaces.py' -q` | 21 tests，OK，exit 0；parser/mock/AST/临时 fixture 路径。 |
+| `python -m unittest discover -s tests -p 'test_*.py' -v`，`8d439db` | 177 tests，OK，exit 0；`/tmp/pr17-r1-r4-full-final.log`。自审后增加两条测试，以下最终版本重新全量验证。 |
+| `python -m unittest discover -s tests -p 'test_*.py' -v`，`671a67c` | **179 tests，OK，0 fail，0 skip，exit 0**；`/tmp/pr17-r1-r4-full-tested.log`。 |
+| `python -m compileall -q dexmani_real examples tests` | 最终被测版本 exit 0。 |
+| `git diff --check` | exit 0。 |
+| `git diff 11911a1cba4812175e6bf19eb0695932f6f33bd2 HEAD --check` | exit 0；另在证据提交后复核。 |
+| `git status --short --untracked-files=all`、staged/unstaged name-status | 最终被测代码提交时均空；证据提交后再复核，不用单个干净 diff 冒充全部状态。 |
+
+所有 focused 和完整 suite 均没有新增 skip、删除失败断言或放宽生产阈值。旧 160-test 只属于旧 `4ee497d`，不属于本次被测版本。
+
+### V01–V22 本批矩阵
+
+“回归执行”表示本批最终 full suite 的实际离线覆盖，不是重新完成真机/真实数据验收。
+
+| 项 | 本批状态 / 实际证据 |
+|---|---|
+| V01 | 本批 raw/schema/reader 未改；provenance、masked NaN、source hash 的临时 fixture 回归执行；未重查真实 raw 全库。 |
+| V02 | R1 新增完整 controller→真实文件证据；2 行低于 flush interval、writer release Event、零行/显式 discard/camera_stall 原用例全部执行。 |
+| V03 | 本批 processing 未改；processing admission/provenance 回归执行；无批量转换。 |
+| V04 | 本批 FIFO/worker 未改；command_stream 的单/双/absent、真实 spawn IPC、fake SDK 有序消费回归执行。 |
+| V05 | R2 真实 keyboard loop 的释放优先、原 candidate/ID/FULL 恢复与单 tick 提交；R4 实际 dispatch 的重复 FULL 一次投影/CLIP；既有 transport/timing 回归执行。 |
+| V06 | 本批 corruption/EMPTY 合同未改；command_stream 稳定身份/sequence 损坏回归执行。 |
+| V07 | 本批手部物理合同未改；中间 setpoint、CRC_UNCONFIRMED、exact endpoint、旧 ACK 回归执行；真实手部 measured tolerance 仍条件暂缓。 |
+| V08 | 本批 generation/SDK fence 未改；SDK 前撤销、调用内晚返与三代交错回归执行；R2 增加控制器 epoch/home 取消验证。 |
+| V09 | R4 数值精确保持；projection/roundoff、SafetyGate 与 hard limit 回归执行；没有扩大界限。 |
+| V10 | 本批 recoverable miss 策略未改；projection/deployment evidence 回归执行，包括保留原 trial/reference。 |
+| V11 | 本批 causal ring/tactile/RGB 合同未改；observation admission/provenance 回归执行。 |
+| V12 | 本批 source stall/quality gate 未改；已有离线 admission 与 evidence-role 回归执行；未重新验证真实设备断流。 |
+| V13 | 本批 cadence 未改；7 timing tests 与新增 FULL dispatch 回归执行，无 catch-up。 |
+| V14 | 本批父预算/心跳合同未改；真实 supervisor 配 fake clock、blocking predict 迟返回归执行；无真实 CUDA。 |
+| V15 | 31 deployment evidence tests 与全量回归覆盖 START、optional service、S/Q 优先；R1 的 STOP retention 不授予 evidence 运动权限；R3 旧容量事件不干扰新 B。 |
+| V16 | R1 writer 释放前 staging 不动、实际 terminal 未发布与真实路径；R3 旧 pending/done 单次消费；原 verified cleanup/Policy trial 计数回归执行。 |
+| V17 | 本批 raw/replay/derived 合同未改；fixture/provenance loader 回归执行；真实 legacy/真实全库未重新验证。 |
+| V18 | 下表 EX01–EX14 全部有本批结论；21 interface tests 与相关真实 owner 离线回归执行；硬件/GUI 主体未运行。 |
+| V19 | R2 每次 pending 取消一条 DROP；R4 hand-only/combined/tiny 一条 CLIP，FULL 不重打；原 F7 suffix/WAIT span 回归执行。 |
+| V20 | 本批统计定义未改；真实 RUNNING 终止分母及迟返预测回归执行；未重新做性能测量。 |
+| V21 | README 同步自动保留、Q TIMEOUT、旧容量事件、keyboard release 与 CLIP 字段；相关源码 docstrings/comments 更新；任务书和稳定 agent 文档未改。 |
+| V22 | 原目标分支，显式路径 stage、后续本地 commits；无用户修改混入；检查完整 PATCH_BASE diff 和 staged/unstaged/untracked。提交清单见下。 |
+
+### EX01–EX14 本批矩阵
+
+| 项 | 本批变更/验证结论 |
+|---|---|
+| EX01 run_policy | 受影响的是 executor 报告与自动非保存 STOP；README/docstrings 已说明 arm pre-clip step、hand endpoint correction/rad/joint 和 FULL 一次报告。真实 decode/projection/prepare/dispatch 用例及 parser/trial/evidence 回归执行；未运行 run_policy 主体、真实模型或新增 dry-run。 |
+| EX02 collect_teleop | 自动中断与明确 discard 分开；TIMEOUT 原默认丢弃，ESTOP/SHUTDOWN 保留；终结显示未发布，recorder 日志才是 incomplete 实际位置，RecordingFinished.path 仍可能是 reserved final path。实际 Teleop 消息/结果/文件与旧容量事件测试执行；CLI→配置→mock session 回归执行；原 no-hand 禁录制约束不变。 |
+| EX03 keyboard_teleop | release debounce 先于 pending retry；释放确认取消候选，等待已提交 predecessor 原 ACK/timeout 并 measured anchor；短 gap 保留候选，持续按住同 ID/targets。真实 loop 回归与 CLI→mock session 返回码测试执行；未连键盘/机器人。 |
+| EX04 replay_episode | 本批未改，未直接调用 StopRecording；共用命令传输 API/原 deadline/abort/保存语义不变。processed parser、replay provenance/loader fixture 回归执行；未物理 replay，未重新读真实 processed 全库。 |
+| EX05 calibrate_camera | 本批未改，未直接调用 StopRecording；共用 motion API/原 deadline/abort/save guard 不变。参数到 mock calibration session 回归执行；无标定写入。 |
+| EX06 calibrate_vr_heading | NOT_AFFECTED：独立 heading 定位/保存接口，本批未改；AST 与受影响符号扫描执行；硬件/保存路径未重新验证。 |
+| EX07 process_episodes | 本批未改；现有 parser、annotations、provenance、单临时 episode dry-run/source hash 回归执行；没有批量处理真实数据。 |
+| EX08 export_policy_zarr | 本批未改；output/preflight/no-overwrite/protected-path 回归执行；没有写现有 Zarr。 |
+| EX09 visualize_episode | NOT_AFFECTED：raw reader/schema 未改；AST/符号检查执行；GUI/真实全库未重新验证。 |
+| EX10 visualize_episode_processed | NOT_AFFECTED：processed schema/loader 未改；AST 和相关 provenance 回归执行；GUI 未重新验证。 |
+| EX11 visualize_policy_rollout | 本批未改；trace-less raw fixture 信息及坏 trace 拒绝回归执行；未加载模型/GUI。 |
+| EX12 pointcloud_process_example | NOT_AFFECTED：camera/pointcloud/交互 table calibration 本批未改；AST 执行；主体未运行。 |
+| EX13 realsense_record_example | NOT_AFFECTED：独立 camera driver 诊断，本批未改；AST 执行；主体未运行。 |
+| EX14 xhand_control_example | NOT_AFFECTED：native SDK/CRC 诊断合同未改；仅 AST；没有运行主体或 --help。 |
+
+### 本批提交、反向自审与未验证边界
+
+| SHA | 标题 |
+|---|---|
+| `4720bea272c5b36a6ce472a2fe2bd991f44365a5` | fix(recording): preserve controller-interrupted captures |
+| `ce4e3128e76fa64809c33e4be1cc6f65edb17554` | fix(keyboard): process release before FIFO retry |
+| `77819377dc0e41d5c869eefa59c71029ae3c5aa2` | fix(teleop): scope capacity handling to the active capture |
+| `8d439db14463e7c5ceb5affa88c219bb4dc77d48` | fix(deployment): report hand endpoint clipping |
+| `671a67cac2440bb94ff0821152e2652d54cfd874` | test(recording): verify terminal reporting and policy retention |
+
+本节证据另作后续 documentation commit，SHA 由最终 Git log/交付回复给出，避免自引用。恢复记录追加到既有 `.git/research-runtime-refactor/STATUS.md`；未覆盖历史基线。
+
+反向自审逐项结论：自动 retain 已经到实际 HDF5 源行，不是只到 mock；明确 D 只有一次 STOP，finally 不能改写；确认释放后取消 pending，home/reject/epoch 也取消，不会 re-anchor 后复活；旧 max_frames 的 pending 和 terminal 分别有失败前/通过后证据；hand-only 一行可见、FULL 不重复投影和报告。完整套件执行已有 F1–F9 回归，未发现本批破坏其离线合同。
+
+本任务未写入现有 raw/derived/processed/Zarr/checkpoint；实际数据输出仅测试临时目录，compileall 仅生成编译缓存。没有对真实数据做前后全量 hash，因此不把 Git status、mtime 或历史盘点当作全库内容不变证明。本批未重跑真实 raw/processed 全库 reader，也未借用旧数据读数声称本批通过。
+
+条件暂缓/未执行：真实机器人/相机/手和 SDK 运行、运动/home/replay/rollout、实手 measured tolerance、真实 CUDA/model artifact、真实设备断流/延时与性能基准、未知 legacy。没有修改相邻 dexmani_policy。离线通过不等于硬件验证。
