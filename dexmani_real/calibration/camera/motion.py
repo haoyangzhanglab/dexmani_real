@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -19,6 +19,9 @@ from dexmani_real.control.jog import (
     limit_cartesian_pose_lead,
 )
 from dexmani_real.control.publication import (
+    PUBLISH_REASON_FIFO_FULL,
+    PublishResult,
+    PublishWaitTracker,
     prepare_joint_command,
     publish_command,
     wait_command_accepted,
@@ -42,6 +45,43 @@ logger = get_logger(__name__)
 _INITIAL_STATE_POLL_S = 0.05
 _IK_WARNING_INTERVAL_S = 1.0
 _BOUNDARY_WARN_INTERVAL_S = 2.0
+_FULL_RETRY_POLL_S = 0.01
+
+
+def _publish_with_backpressure(
+    shared: RuntimeChannels,
+    candidate: Any,
+    *,
+    required_state: SafetyState,
+    deadline_s: float,
+    fifo_wait: PublishWaitTracker,
+    abort_requested: Any = None,
+) -> PublishResult:
+    """Commit the identical candidate, retrying while the command FIFO is FULL.
+
+    Bounded by the enclosing calibration operation's deadline; the candidate
+    is never rebuilt or replaced here.
+    """
+    result = publish_command(
+        shared, candidate, required_safety_state=required_state
+    )
+    while (
+        not result.published
+        and result.reason == PUBLISH_REASON_FIFO_FULL
+        and time.monotonic() < deadline_s
+    ):
+        fifo_wait.note_full(result.fifo_depth, int(candidate.action_id))
+        if abort_requested is not None and abort_requested():
+            break
+        time.sleep(_FULL_RETRY_POLL_S)
+        result = publish_command(
+            shared, candidate, required_safety_state=required_state
+        )
+    if result.published:
+        fifo_wait.note_committed()
+    elif result.reason == PUBLISH_REASON_FIFO_FULL:
+        fifo_wait.note_dropped("calibration publish deadline")
+    return result
 
 
 def read_initial_arm(
@@ -90,6 +130,9 @@ class CalibrationLoopState:
     last_ik_warning_s: float = 0.0
     blocked_until_release: bool = False
     last_boundary_warning_s: float = 0.0
+    fifo_wait: PublishWaitTracker = field(
+        default_factory=lambda: PublishWaitTracker("calibration")
+    )
 
     @classmethod
     def from_arm_state(
@@ -162,10 +205,12 @@ def publish_calibration_quit_hold(
     )
     candidate = prepared.candidate
     published = (
-        publish_command(
+        _publish_with_backpressure(
             shared,
             candidate,
-            required_safety_state=SafetyState.ARMED,
+            required_state=SafetyState.ARMED,
+            deadline_s=time.monotonic() + float(runtime.policy.action_apply_timeout_s),
+            fifo_wait=PublishWaitTracker("calibration_quit_hold"),
         )
         if candidate is not None
         else None
@@ -175,11 +220,11 @@ def publish_calibration_quit_hold(
         candidate is not None
         and published is not None
         and published.published
-        and published.ticket is not None
+        and published.command is not None
     ):
         accepted = wait_command_accepted(
             shared,
-            ticket=published.ticket,
+            command=published.command,
             action_id=candidate.action_id,
             wait_for_arm=True,
             wait_for_hand=False,
@@ -410,10 +455,13 @@ def run_calibration_motion_tick(
         return
     candidate = prepared.candidate
     published = (
-        publish_command(
+        _publish_with_backpressure(
             shared,
             candidate,
-            required_safety_state=SafetyState.RUNNING,
+            required_state=SafetyState.RUNNING,
+            deadline_s=time.monotonic() + float(runtime.policy.action_apply_timeout_s),
+            fifo_wait=state.fifo_wait,
+            abort_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
         )
         if candidate is not None
         else None
@@ -423,11 +471,11 @@ def run_calibration_motion_tick(
         candidate is not None
         and published is not None
         and published.published
-        and published.ticket is not None
+        and published.command is not None
     ):
         accepted = wait_command_accepted(
             shared,
-            ticket=published.ticket,
+            command=published.command,
             action_id=candidate.action_id,
             wait_for_arm=True,
             wait_for_hand=False,

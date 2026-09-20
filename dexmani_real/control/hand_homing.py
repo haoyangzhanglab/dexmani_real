@@ -11,6 +11,8 @@ if TYPE_CHECKING:
 import numpy as np
 
 from dexmani_real.control.publication import (
+    PUBLISH_REASON_FIFO_FULL,
+    PublishWaitTracker,
     build_action_candidate,
     motion_rejection_reason,
     publish_command,
@@ -24,6 +26,8 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 __all__ = ["publish_hand_home_and_wait_accepted", "initialize_hand_home"]
+
+_FULL_RETRY_POLL_S = 0.01
 
 
 def initialize_hand_home(
@@ -111,31 +115,42 @@ def publish_hand_home_and_wait_accepted(
     if runtime_rejection:
         logger.warning("hand home stopped by runtime gate: %s", runtime_rejection)
         return False
-    candidate = build_action_candidate(
-        shared,
-        None,
-        target,
-        observation_id=None,
-        action_validity_s=max(0.3, deadline_s - time.monotonic() + 0.1),
-    )
-    if candidate is None:
-        logger.warning("hand home rejected: command delivery window is closed")
-        return False
+    candidate = build_action_candidate(shared, None, target)
+    # FULL is recoverable backpressure: retry the identical home candidate
+    # inside the original operation deadline; abort and the runtime gates
+    # keep priority over the retry.
+    fifo_wait = PublishWaitTracker("hand_home")
     publish_result = publish_command(
         shared,
         candidate,
         required_safety_state=SafetyState.ARMED,
     )
+    while (
+        not publish_result.published
+        and publish_result.reason == PUBLISH_REASON_FIFO_FULL
+        and time.monotonic() < deadline_s
+    ):
+        fifo_wait.note_full(publish_result.fifo_depth, candidate.action_id)
+        if abort_requested is not None and abort_requested():
+            break
+        time.sleep(_FULL_RETRY_POLL_S)
+        publish_result = publish_command(
+            shared,
+            candidate,
+            required_safety_state=SafetyState.ARMED,
+        )
     if not publish_result.published:
+        fifo_wait.note_dropped("hand home publish stopped")
         logger.warning("hand home publish failed: %s", publish_result.reason)
         return False
-    if publish_result.ticket is None:
-        logger.error("hand home published without a coupled-command ticket")
+    fifo_wait.note_committed()
+    if publish_result.command is None:
+        logger.error("hand home published without a committed-command receipt")
         return False
 
     acceptance = wait_command_accepted(
         shared,
-        ticket=publish_result.ticket,
+        command=publish_result.command,
         action_id=int(candidate.action_id),
         wait_for_arm=False,
         wait_for_hand=True,

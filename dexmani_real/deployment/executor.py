@@ -18,14 +18,15 @@ from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.control.action import ActionCandidate
 from dexmani_real.control.publication import (
     PUBLISH_REASON_ESTOP,
-    PUBLISH_REASON_EXPIRED,
     PUBLISH_REASON_FAULT,
+    PUBLISH_REASON_FIFO_FULL,
     PUBLISH_REASON_GENERATION,
     PUBLISH_REASON_RUNTIME_STOPPED,
     PUBLISH_REASON_SAFETY_STATE,
     CommandFeedbackSnapshot,
     PreparedCommand,
     PublishResult,
+    PublishWaitTracker,
     build_action_candidate,
     command_feedback_is_fresh,
     command_publishability_reason,
@@ -373,6 +374,12 @@ class PolicyRunner:
             else None
         )
         self.stats = PolicyStats()
+        # Prepared-but-uncommitted queue head during recoverable FIFO
+        # backpressure. FULL never rebuilds, re-solves IK, or re-clips this
+        # candidate; only a successful commit advances the action index, the
+        # continuity reference, and the publication cadence.
+        self._pending_dispatch: ActionCandidate | None = None
+        self._fifo_wait = PublishWaitTracker("policy")
 
         self.run_generation: int | None = None
         self.run_started_ns: int | None = None
@@ -393,6 +400,7 @@ class PolicyRunner:
         self.previous_arm_command_qpos = None
         self.last_recorded_action = None
         self.actions.clear()
+        self._pending_dispatch = None
         self.chunk_sources.clear()
         self.chunk_action_index = 0
         self.observation_id = 0
@@ -412,7 +420,7 @@ class PolicyRunner:
         # One visible line per real chunk discard; the dropped actions never
         # reach the SDK and the next query replaces them.
         logger.warning(
-            "[DROP] policy q=%s idx=%s remaining=%d reason=%s",
+            "[DROP] policy gen=%s q=%s idx=%s remaining=%d reason=%s",
             self.run_generation,
             self.observation_id,
             self.chunk_action_index,
@@ -420,6 +428,9 @@ class PolicyRunner:
             reason,
         )
         self.actions.clear()
+        if self._pending_dispatch is not None:
+            self._pending_dispatch = None
+            self._fifo_wait.note_dropped(reason)
         self.chunk_sources.clear()
         self.chunk_action_index = 0
         self.previous_arm_command_qpos = None
@@ -1124,17 +1135,17 @@ class PolicyRunner:
             return False
         return True
 
-    def _dispatch_action(self, action: np.ndarray) -> None:
-        """Admit the queue head from one immutable feedback snapshot.
+    def _prepare_dispatch_candidate(self, action: np.ndarray) -> ActionCandidate | None:
+        """Decode, project, and gate the queue head exactly once.
 
-        decode/IK, SafetyGate, and the pre-publication freshness recheck all
-        consume the SAME snapshot selected here. A stale/unavailable control
-        state invalidates the whole pending chunk (fresh observation and
-        inference follow on the next queue-empty iteration); it is not itself
-        a hardware fault.
+        decode/IK, SafetyGate, and the pre-commit freshness recheck all
+        consume the SAME immutable feedback snapshot selected here. A
+        stale/unavailable control state invalidates the whole pending chunk
+        (fresh observation and inference follow on the next queue-empty
+        iteration); it is not itself a hardware fault.
         """
         if not self._input_is_fresh(time.monotonic_ns()):
-            return
+            return None
         max_age_s = float(self.runtime.policy.max_input_age_s)
         feedback, reason, issue = read_command_feedback(
             self.shared,
@@ -1145,9 +1156,9 @@ class PolicyRunner:
         if feedback is None:
             if issue is None or issue.code is FeedbackIssueCode.STALE:
                 self._invalidate_chunk("command_feedback_unavailable")
-                return
+                return None
             self._fault(f"fatal command feedback: {issue.code.value}: {issue.detail}")
-            return
+            return None
 
         decoded, reject_kind, decode_rejection = self._decode_action(action, feedback)
         if decoded is None:
@@ -1156,7 +1167,7 @@ class PolicyRunner:
                 self._abort_action(
                     decode_rejection, raw_action=action, reject_kind=reject_kind
                 )
-            return
+            return None
         arm_qpos, hand_qpos = decoded
         candidate = build_action_candidate(
             self.shared,
@@ -1164,11 +1175,7 @@ class PolicyRunner:
             hand_qpos,
             run_generation=self.run_generation,
             is_hold=False,
-            action_validity_s=float(self.runtime.policy.action_validity_s),
         )
-        if candidate is None:
-            self._finish_episode("policy command could not be constructed")
-            return
         try:
             prepared = prepare_command(
                 self.shared,
@@ -1180,10 +1187,10 @@ class PolicyRunner:
             )
         except Exception as exc:
             self._fault(f"policy command preparation failed: {exc}")
-            return
+            return None
         if not prepared.accepted:
             self._handle_preparation_rejection(prepared, raw_action=action)
-            return
+            return None
         candidate = prepared.candidate
         assert candidate is not None
 
@@ -1194,41 +1201,56 @@ class PolicyRunner:
             hand_max_age_s=max_age_s,
         ):
             self._invalidate_chunk("command_feedback_aged_out")
-            return
+            return None
+        return candidate
+
+    def _dispatch_action(self, action: np.ndarray) -> None:
+        """Commit the queue head; a FULL FIFO keeps the identical candidate.
+
+        Preparation happens exactly once per action. A FULL commit result is
+        recoverable backpressure: the same immutable prepared candidate is
+        retried from the main poll cadence without rebuilding, re-solving IK,
+        or re-clipping, and only a successful commit advances the action
+        index, the continuity reference, and the actual-publication cadence.
+        """
+        if self._pending_dispatch is None:
+            candidate = self._prepare_dispatch_candidate(action)
+            if candidate is None:
+                return
+            self._pending_dispatch = candidate
+        candidate = self._pending_dispatch
 
         publication_check_ns = time.monotonic_ns()
         if not self._running_generation_is_live() or self._running_time_expired(
             publication_check_ns
         ):
             return
-        if not self._input_is_fresh(publication_check_ns):
-            return
         if self.execute:
             result = publish_command(
                 self.shared,
                 candidate,
                 required_safety_state=SafetyState.RUNNING,
-                minimum_delivery_window_s=self.control_period_s,
             )
             if not result.published:
                 self._handle_publication_rejection(result)
                 return
-            if result.ticket is None or result.ticket.published_monotonic_ns <= 0:
-                self._fault("physical publication omitted its command ticket/timestamp")
+            if result.command is None or result.command.published_monotonic_ns <= 0:
+                self._fault("physical publication omitted its command receipt/timestamp")
                 return
-            publication_ns = int(result.ticket.published_monotonic_ns)
+            publication_ns = int(result.command.published_monotonic_ns)
         else:
             reason = command_publishability_reason(
                 self.shared,
                 candidate,
                 required_safety_state=SafetyState.RUNNING,
-                minimum_delivery_window_s=self.control_period_s,
             )
             if reason:
                 self._handle_publication_rejection(PublishResult(False, reason=reason))
                 return
             publication_ns = time.monotonic_ns()
 
+        self._fifo_wait.note_committed()
+        self._pending_dispatch = None
         assert candidate.arm_qpos is not None
         self.stats.publication_input_age_ms = max(
             ((publication_ns - times[-1]) / 1e6 for times in self.chunk_sources.values()),
@@ -1292,13 +1314,24 @@ class PolicyRunner:
         )
 
     def _handle_publication_rejection(self, result: PublishResult) -> None:
-        if result.reason == PUBLISH_REASON_EXPIRED:
-            self._finish_episode("policy command expired before publication")
+        if result.reason == PUBLISH_REASON_FIFO_FULL:
+            # Recoverable backpressure: keep the identical prepared candidate
+            # and retry from the poll cadence. One visible [WAIT] line per
+            # continuous full span; STOP/fault/timeout keep priority because
+            # the main loop polls them between retries.
+            keep_action = (
+                self._pending_dispatch.action_id
+                if self._pending_dispatch is not None
+                else 0
+            )
+            self._fifo_wait.note_full(result.fifo_depth, keep_action)
             return
         if result.reason in {PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT}:
             return
         # A concurrent S/generation fence is an ordinary episode boundary.  The
-        # next loop observes the operator request before any further command.
+        # next loop observes the operator request before any further command;
+        # the pending candidate belongs to the revoked epoch and is dropped by
+        # the boundary handling, never committed.
         if result.reason in {
             PUBLISH_REASON_GENERATION,
             PUBLISH_REASON_RUNTIME_STOPPED,
@@ -1344,7 +1377,18 @@ class PolicyRunner:
     def _run_active_tick(self, now_ns: int) -> None:
         assert self.run_started_ns is not None
         if not self._running_generation_is_live():
+            # Batch-invalidate this epoch's uncommitted predictions with one
+            # visible line; the queued FIFO records are invalidated under the
+            # motion lock by the revocation itself.
+            if self.actions or self._pending_dispatch is not None:
+                logger.warning(
+                    "[DROP] policy q=%s uncommitted_actions=%d reason=generation_revoked",
+                    self.run_generation,
+                    len(self.actions),
+                )
+                self._fifo_wait.note_dropped("generation_revoked")
             self.actions.clear()
+            self._pending_dispatch = None
             self._handle_run_boundary()
             # Also end a RUNNING epoch whose generation changed externally.
             if (

@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
 from dexmani_real.control.action import ActionCandidate
 from dexmani_real.control.publication import (
+    PUBLISH_REASON_FIFO_FULL,
     PUBLISH_REASON_SAFETY_STATE,
     PreparedCommand,
     PublishResult,
+    PublishWaitTracker,
     prepare_joint_command,
     publish_command,
     wait_command_accepted,
@@ -127,7 +129,7 @@ def _advance_arm_feedback_error_count(
     return next_count, next_count >= max_consecutive_errors
 
 
-def _prepare_and_publish_joint_command(
+def _prepare_joint_candidate(
     shared: RuntimeChannels,
     arm_qpos: np.ndarray,
     hand_qpos: np.ndarray | None,
@@ -136,29 +138,56 @@ def _prepare_and_publish_joint_command(
     arm_feedback_max_age_s: float,
     hand_feedback_max_age_s: float,
     is_hold: bool = False,
-    observation_id: int | None = None,
-    observation_anchor_monotonic_ns: int | None = None,
-) -> tuple[PreparedCommand, PublishResult | None]:
-    """Run the explicit non-blocking teleop safety/publication path."""
-    prepared = prepare_joint_command(
+) -> PreparedCommand:
+    """Run the explicit non-blocking teleop safety path without committing.
+
+    Commitment is owned by :func:`_commit_pending_command` so a FULL FIFO
+    result can keep the identical prepared candidate across grid ticks.
+    """
+    return prepare_joint_command(
         shared,
         arm_qpos,
         hand_qpos,
         gate=gate,
         is_hold=is_hold,
-        observation_id=observation_id,
-        observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
         arm_feedback_max_age_s=arm_feedback_max_age_s,
         hand_feedback_max_age_s=hand_feedback_max_age_s,
     )
-    if not prepared.accepted:
-        return prepared, None
-    assert prepared.candidate is not None
-    return prepared, publish_command(
-        shared,
-        prepared.candidate,
-        required_safety_state=SafetyState.RUNNING,
+
+
+@dataclass(frozen=True)
+class _PendingTeleopPublish:
+    """One prepared-but-uncommitted teleop command and its recording context.
+
+    FULL backpressure keeps this exact candidate (same action ID and targets)
+    across grid ticks without rebuilding or re-solving IK; a lifecycle
+    revocation drops it visibly instead of sending stale human intent after a
+    fresh re-anchor.
+    """
+
+    candidate: ActionCandidate
+    solved: bool
+    frame_status: int | None = None
+    target_position_world_m: np.ndarray | None = None
+    target_quat_world_wxyz: np.ndarray | None = None
+    record_hand_qpos: np.ndarray | None = None
+    retarget_succeeded: bool = True
+
+
+def _drop_pending_publish(
+    controller: "TeleopController",
+    resources: "TeleopGridResources",
+    reason: str,
+) -> None:
+    """Visibly drop a local pending candidate revoked by lifecycle."""
+    pending = controller.pending_publish
+    if pending is None:
+        return
+    controller.pending_publish = None
+    logger.warning(
+        "[DROP] teleop action=%d reason=%s", pending.candidate.action_id, reason
     )
+    resources.fifo_wait.note_dropped(reason)
 
 
 @dataclass(frozen=True)
@@ -174,6 +203,7 @@ class TeleopGridResources:
     arm_feedback_warn: ThrottledWarner
     hand_ramp_total_frames: int
     max_observation_skew_s: float
+    fifo_wait: PublishWaitTracker
 
 
 @dataclass(frozen=True)
@@ -247,6 +277,9 @@ class TeleopController:
         self.ik_hold_started_s = 0.0
         self.last_target_eef_pos = np.full(3, np.nan)
         self.last_target_eef_rot6d = np.full(6, np.nan)
+        # Prepared-but-uncommitted command during recoverable FIFO
+        # backpressure; revoked (never committed) at any pause boundary.
+        self.pending_publish: _PendingTeleopPublish | None = None
         self.planner.set_hand_qpos(self.prev_hand_qpos)
 
     def clear_reference(self) -> None:
@@ -257,6 +290,7 @@ class TeleopController:
         self.hand_ramp_start = None
         self.hand_ramp_step = 0
         self.hand_retarget_cache.reset()
+        self.pending_publish = None
 
     def reset_reference(
         self,
@@ -265,6 +299,8 @@ class TeleopController:
         hand_state: np.ndarray | None,
     ) -> bool:
         """Re-anchor mapping from fresh measured feedback after a pause."""
+        # A fresh re-anchor never carries a pre-pause unpublished candidate.
+        self.pending_publish = None
         try:
             eef_pos, eef_rot6d = make_arm_fk().compute(
                 np.asarray(arm_state["qpos"][0], dtype=np.float64)
@@ -713,11 +749,11 @@ def _confirm_terminal_arm_acceptance_if_needed(
         or not recorder.next_frame_reaches_limit
     ):
         return True
-    assert publication.published and publication.ticket is not None
+    assert publication.published and publication.command is not None
     assert candidate.arm_qpos is not None and candidate.action_id > 0
     acceptance = wait_command_accepted(
         shared,
-        ticket=publication.ticket,
+        command=publication.command,
         action_id=candidate.action_id,
         wait_for_arm=True,
         wait_for_hand=False,
@@ -744,6 +780,143 @@ def _confirm_terminal_arm_acceptance_if_needed(
     return False
 
 
+def _commit_pending_command(
+    controller: TeleopController,
+    shared: RuntimeChannels,
+    cfg: TeleopConfig,
+    resources: TeleopGridResources,
+    observation: TeleopGridObservation,
+    *,
+    recording_active: bool,
+) -> bool:
+    """Try one non-blocking FIFO commit of the pending candidate.
+
+    Returns whether the teleop loop keeps running. Success advances the
+    proposal references and records this tick's command row; FULL keeps the
+    identical candidate (same action ID/targets) for the next grid tick and
+    records an honest held row (``action_queued=False``) instead of claiming a
+    send; lifecycle revocation drops the candidate and the pause machinery
+    owns the silent boundary.
+    """
+    pending = controller.pending_publish
+    assert pending is not None
+    candidate = pending.candidate
+    result = publish_command(
+        shared,
+        candidate,
+        required_safety_state=SafetyState.RUNNING,
+    )
+    if not result.published:
+        if result.reason == PUBLISH_REASON_FIFO_FULL:
+            resources.fifo_wait.note_full(result.fifo_depth, candidate.action_id)
+            _record_grid_hold(
+                controller,
+                shared,
+                resources,
+                observation,
+                recording_active=recording_active,
+                action_queued=False,
+            )
+            return True
+        if _publication_motion_revoked(shared, PreparedCommand(candidate=candidate)):
+            _drop_pending_publish(controller, resources, "motion_revoked")
+            return True
+        if result.reason.startswith(PUBLISH_REASON_SAFETY_STATE):
+            # A lifecycle pause is revoking this epoch; the held row stays
+            # honest and the outer loop owns the pause boundary.
+            _drop_pending_publish(controller, resources, result.reason)
+            _record_grid_hold(
+                controller,
+                shared,
+                resources,
+                observation,
+                recording_active=recording_active,
+                action_queued=False,
+            )
+            return True
+        logger.info(
+            "teleop_loop: joint publication stopped by runtime gate: %s",
+            result.reason,
+        )
+        _drop_pending_publish(controller, resources, result.reason)
+        return False
+
+    resources.fifo_wait.note_committed()
+    controller.pending_publish = None
+    if not _confirm_terminal_arm_acceptance_if_needed(
+        shared, cfg, resources.recorder, candidate, result,
+        recording_active=recording_active,
+    ):
+        return _publication_motion_revoked(shared, PreparedCommand(candidate=candidate))
+
+    # Only a successful commit advances the proposal references; FULL or a
+    # dropped candidate never touches them.
+    if candidate.arm_qpos is not None:
+        controller.prev_qpos_cmd = np.asarray(
+            candidate.arm_qpos, dtype=np.float64
+        ).copy()
+    if candidate.hand_qpos is not None:
+        controller.prev_hand_qpos = np.asarray(
+            candidate.hand_qpos, dtype=np.float64
+        ).copy()
+
+    if pending.solved:
+        assert (
+            pending.target_position_world_m is not None
+            and pending.target_quat_world_wxyz is not None
+        )
+        controller.ema_prev_pos = pending.target_position_world_m.copy()
+        controller.ema_prev_quat = pending.target_quat_world_wxyz.copy()
+        if recording_active:
+            controller.last_target_eef_pos = pending.target_position_world_m.copy()
+            controller.last_target_eef_rot6d = quat_wxyz_to_rot6d(
+                normalize_quat_wxyz(pending.target_quat_world_wxyz)
+            )
+            if int(shared.safety_state.value) != int(SafetyState.RUNNING):
+                return True
+            arm_cmd = np.asarray(candidate.arm_qpos, dtype=np.float64)
+            hand_cmd = (
+                np.asarray(candidate.hand_qpos, dtype=np.float64)
+                if candidate.hand_qpos is not None
+                else (
+                    pending.record_hand_qpos
+                    if pending.record_hand_qpos is not None
+                    else controller.prev_hand_qpos
+                )
+            )
+            frame_status = (
+                FRAME_RETARGET_FAIL
+                if not pending.retarget_succeeded and controller.hand_enabled
+                else FRAME_OK
+            )
+            record_frame(
+                resources.recorder,
+                observation.arm_state,
+                observation.hand_state,
+                arm_cmd,
+                hand_cmd,
+                pending.target_position_world_m,
+                pending.target_quat_world_wxyz,
+                observation.vr_frame,
+                observation.camera_frame,
+                frame_status=frame_status,
+                observation_anchor_monotonic_ns=observation.anchor_monotonic_ns,
+                shared=shared,
+                max_observation_skew_s=resources.max_observation_skew_s,
+            )
+    else:
+        _record_grid_hold(
+            controller,
+            shared,
+            resources,
+            observation,
+            recording_active=recording_active,
+            action_queued=True,
+            frame_status=pending.frame_status,
+        )
+    return True
+
+
 def _publish_arm_safety_hold(
     controller: TeleopController,
     shared: RuntimeChannels,
@@ -755,45 +928,40 @@ def _publish_arm_safety_hold(
     failure_context: str,
     frame_status: int,
 ) -> bool:
-    """Publish and record an arm-only hold after a rejected proposal."""
-    prepared_hold, hold_result = _prepare_and_publish_joint_command(
+    """Prepare and commit an arm-only hold after a rejected proposal."""
+    prepared = _prepare_joint_candidate(
         shared,
         controller.prev_qpos_cmd.copy(),
         None,
         gate=resources.safety_gate,
         is_hold=True,
-        observation_id=int(observation.vr_frame["ring_sequence"]),
-        observation_anchor_monotonic_ns=int(observation.vr_frame["recv_ts_ns"]),
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
     )
-    published_hold = prepared_hold.candidate
-    if hold_result is None or not hold_result.published or published_hold is None:
-        if _publication_motion_revoked(shared, prepared_hold):
+    if not prepared.accepted:
+        if _publication_motion_revoked(shared, prepared):
             return True
-        reason = prepared_hold.reason or (hold_result.reason if hold_result else "")
         logger.error(
             "teleop_loop: %s hold publish failed: %s",
             failure_context,
-            reason,
+            prepared.reason,
         )
         shared.error_state.value = True
         return False
-    if not _confirm_terminal_arm_acceptance_if_needed(
-        shared, cfg, resources.recorder, published_hold, hold_result,
-        recording_active=recording_active,
-    ):
-        return _publication_motion_revoked(shared, prepared_hold)
-    _record_grid_hold(
+    assert prepared.candidate is not None
+    controller.pending_publish = _PendingTeleopPublish(
+        candidate=prepared.candidate,
+        solved=False,
+        frame_status=frame_status,
+    )
+    return _commit_pending_command(
         controller,
         shared,
+        cfg,
         resources,
         observation,
         recording_active=recording_active,
-        action_queued=True,
-        frame_status=frame_status,
     )
-    return True
 
 
 def _publish_ik_failure_hold(
@@ -806,7 +974,7 @@ def _publish_ik_failure_hold(
     *,
     recording_active: bool,
 ) -> bool:
-    """Publish a bounded hold while preserving independent safe hand motion."""
+    """Prepare and commit a bounded hold preserving independent safe hand motion."""
     if controller.consecutive_ik_hold_frames == 0:
         controller.ik_hold_started_s = time.monotonic()
         logger.warning(
@@ -816,60 +984,38 @@ def _publish_ik_failure_hold(
     controller.consecutive_ik_hold_frames += 1
 
     safe_hand_qpos = computation.hand_qpos_rad if controller.hand_enabled else None
-    prepared_command, publish_result = _prepare_and_publish_joint_command(
+    prepared = _prepare_joint_candidate(
         shared,
         controller.prev_qpos_cmd.copy(),
         safe_hand_qpos,
         gate=resources.safety_gate,
         is_hold=True,
-        observation_id=int(observation.vr_frame["ring_sequence"]),
-        observation_anchor_monotonic_ns=int(observation.vr_frame["recv_ts_ns"]),
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
     )
-
-    published_candidate = prepared_command.candidate
-    if (
-        publish_result is None
-        or not publish_result.published
-        or published_candidate is None
-    ):
-        if _publication_motion_revoked(shared, prepared_command):
+    if not prepared.accepted:
+        if _publication_motion_revoked(shared, prepared):
             return True
-        reason = prepared_command.reason or (
-            publish_result.reason if publish_result else ""
-        )
         logger.error(
             "teleop_loop: IK-failure hold publish failed: %s",
-            reason,
+            prepared.reason,
         )
         shared.error_state.value = True
         return False
-    if not _confirm_terminal_arm_acceptance_if_needed(
-        shared, cfg, resources.recorder, published_candidate, publish_result,
-        recording_active=recording_active,
-    ):
-        return _publication_motion_revoked(shared, prepared_command)
-    if controller.hand_enabled:
-        if published_candidate.arm_qpos is not None:
-            controller.prev_qpos_cmd = np.asarray(
-                published_candidate.arm_qpos, dtype=np.float64
-            )
-        if published_candidate.hand_qpos is not None:
-            controller.prev_hand_qpos = np.asarray(
-                published_candidate.hand_qpos, dtype=np.float64
-            ).copy()
-
-    _record_grid_hold(
+    assert prepared.candidate is not None
+    controller.pending_publish = _PendingTeleopPublish(
+        candidate=prepared.candidate,
+        solved=False,
+        frame_status=FRAME_IK_FAIL,
+    )
+    return _commit_pending_command(
         controller,
         shared,
+        cfg,
         resources,
         observation,
         recording_active=recording_active,
-        action_queued=True,
-        frame_status=FRAME_IK_FAIL,
     )
-    return True
 
 
 def _publish_solved_action(
@@ -886,13 +1032,7 @@ def _publish_solved_action(
     assert computation.ik_qpos_rad is not None
     planner = resources.planner
     gate = resources.safety_gate
-    recorder = resources.recorder
     command_limits = resources.command_limits
-    _current_grid_anchor_ns = observation.anchor_monotonic_ns
-    arm_state = observation.arm_state
-    vr_frame = observation.vr_frame
-    cam = observation.camera_frame
-    hand_state = observation.hand_state
     target_pos = computation.target_position_world_m
     target_quat = computation.target_quat_world_wxyz
     hand_cmd = computation.hand_qpos_rad
@@ -934,25 +1074,22 @@ def _publish_solved_action(
             frame_status=FRAME_SAFETY_REJECT,
         )
 
-    prepared_command, publish_result = _prepare_and_publish_joint_command(
+    prepared = _prepare_joint_candidate(
         shared,
         arm_cmd.copy(),
         hand_cmd.copy() if controller.hand_enabled else None,
         gate=gate,
-        observation_id=int(vr_frame["ring_sequence"]),
-        observation_anchor_monotonic_ns=int(vr_frame["recv_ts_ns"]),
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
     )
-    published_candidate = prepared_command.candidate
-    workspace_rejected = prepared_command.gate_code in (
+    workspace_rejected = prepared.gate_code in (
         GateRejectCode.WORKSPACE,
         GateRejectCode.WORKSPACE_CHECK_FAILED,
     )
     if workspace_rejected:
         resources.validation_warn(
             "teleop_loop: action rejected — %s; publishing hold",
-            prepared_command.reason,
+            prepared.reason,
         )
         return _publish_arm_safety_hold(
             controller,
@@ -964,79 +1101,40 @@ def _publish_solved_action(
             failure_context="workspace-rejection",
             frame_status=FRAME_SAFETY_REJECT,
         )
-    if (
-        publish_result is None
-        or not publish_result.published
-        or published_candidate is None
-    ):
-        if _publication_motion_revoked(shared, prepared_command):
+    if not prepared.accepted:
+        if _publication_motion_revoked(shared, prepared):
             return True
-        # Recoverable holds keep arm and hand in place without latching a fault.
-        reason = prepared_command.reason or (
-            publish_result.reason if publish_result else ""
-        )
-        hold_status = prepared_command.unavailable
-        if publish_result is not None and publish_result.reason:
-            logger.info(
-                "teleop_loop: joint publication stopped by runtime gate: %s",
-                publish_result.reason,
+        if prepared.unavailable:
+            # Recoverable holds keep arm and hand in place without latching a
+            # fault; no candidate was prepared, so nothing is pending.
+            _record_grid_hold(
+                controller,
+                shared,
+                resources,
+                observation,
+                recording_active=recording_active,
             )
-            if not publish_result.reason.startswith(PUBLISH_REASON_SAFETY_STATE):
-                return False
-            hold_status = True
-        if not hold_status:
-            logger.error("teleop_loop: joint publish failed: %s", reason)
-            shared.error_state.value = True
-            return False
-        _record_grid_hold(
-            controller,
-            shared,
-            resources,
-            observation,
-            recording_active=recording_active,
-        )
-        return True
-    if not _confirm_terminal_arm_acceptance_if_needed(
-        shared, cfg, resources.recorder, published_candidate, publish_result,
-        recording_active=recording_active,
-    ):
-        return _publication_motion_revoked(shared, prepared_command)
-    if published_candidate.arm_qpos is not None:
-        arm_cmd = np.asarray(published_candidate.arm_qpos, dtype=np.float64)
-    if published_candidate.hand_qpos is not None:
-        hand_cmd = np.asarray(published_candidate.hand_qpos, dtype=np.float64)
-    controller.prev_qpos_cmd = arm_cmd.copy()
-    controller.prev_hand_qpos = hand_cmd.copy()
-    controller.ema_prev_pos = target_pos.copy()
-    controller.ema_prev_quat = target_quat.copy()
-
-    if recording_active:
-        controller.last_target_eef_pos = target_pos.copy()
-        controller.last_target_eef_rot6d = quat_wxyz_to_rot6d(
-            normalize_quat_wxyz(target_quat)
-        )
-        if not retarget_ok and controller.hand_enabled:
-            _f_status = FRAME_RETARGET_FAIL
-        else:
-            _f_status = FRAME_OK
-        if int(shared.safety_state.value) != int(SafetyState.RUNNING):
             return True
-        record_frame(
-            recorder,
-            arm_state,
-            hand_state,
-            arm_cmd,
-            hand_cmd,
-            target_pos,
-            target_quat,
-            vr_frame,
-            cam,
-            frame_status=_f_status,
-            observation_anchor_monotonic_ns=_current_grid_anchor_ns,
-            shared=shared,
-            max_observation_skew_s=resources.max_observation_skew_s,
-        )
-    return True
+        logger.error("teleop_loop: joint publish failed: %s", prepared.reason)
+        shared.error_state.value = True
+        return False
+    assert prepared.candidate is not None
+    controller.pending_publish = _PendingTeleopPublish(
+        candidate=prepared.candidate,
+        solved=True,
+        target_position_world_m=target_pos,
+        target_quat_world_wxyz=target_quat,
+        record_hand_qpos=hand_cmd,
+        retarget_succeeded=retarget_ok,
+    )
+    return _commit_pending_command(
+        controller,
+        shared,
+        cfg,
+        resources,
+        observation,
+        recording_active=recording_active,
+    )
 
 
 def run_control_grid_tick(
@@ -1057,6 +1155,15 @@ def run_control_grid_tick(
     """Consume one causal observation and publish at most one action."""
     gate = resources.safety_gate
     control_run_generation = int(shared.run_generation.value)
+    # A pending candidate whose epoch was revoked (pause/STOP/new B) is
+    # dropped, never committed: after a fresh re-anchor the loop must not
+    # send stale human intent.
+    pending = controller.pending_publish
+    if (
+        pending is not None
+        and int(pending.candidate.run_generation) != control_run_generation
+    ):
+        _drop_pending_publish(controller, resources, "generation_revoked")
     tick_result, observation = _read_control_grid_observation(
         controller,
         shared,
@@ -1074,30 +1181,46 @@ def run_control_grid_tick(
     )
     if observation is None:
         return tick_result
+    if controller.pending_publish is not None:
+        # Recoverable FULL backpressure: retry the identical candidate at the
+        # grid cadence before proposing anything new; VR/live-state pause
+        # processing above keeps running while the candidate is held.
+        keep_running = _commit_pending_command(
+            controller,
+            shared,
+            cfg,
+            resources,
+            observation,
+            recording_active=tick_result.recording_active,
+        )
+        if keep_running:
+            return tick_result
+        return TeleopGridTickResult(
+            keep_running=False,
+            recording_active=tick_result.recording_active,
+            arm_feedback_error_count=tick_result.arm_feedback_error_count,
+            hand_disconnected_at_s=tick_result.hand_disconnected_at_s,
+        )
     vr_frame = observation.vr_frame
     computation = controller.compute(observation, resources)
     if computation is None:
-        prepared_hold, hold_result = _prepare_and_publish_joint_command(
+        prepared = _prepare_joint_candidate(
             shared,
             controller.prev_qpos_cmd.copy(),
             None,
             gate=gate,
             is_hold=True,
-            observation_id=int(vr_frame["ring_sequence"]),
-            observation_anchor_monotonic_ns=int(vr_frame["recv_ts_ns"]),
             arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
             hand_feedback_max_age_s=float(
                 cfg.runtime.safety.heartbeat_timeouts["hand"]
             ),
         )
-        published_hold = prepared_hold.candidate
-        if hold_result is None or not hold_result.published or published_hold is None:
-            if _publication_motion_revoked(shared, prepared_hold):
+        if not prepared.accepted:
+            if _publication_motion_revoked(shared, prepared):
                 return tick_result
-            reason = prepared_hold.reason or (hold_result.reason if hold_result else "")
             logger.error(
                 "teleop_loop: mapper hold publish failed: %s",
-                reason,
+                prepared.reason,
             )
             shared.error_state.value = True
             return TeleopGridTickResult(
@@ -1106,23 +1229,27 @@ def run_control_grid_tick(
                 arm_feedback_error_count=tick_result.arm_feedback_error_count,
                 hand_disconnected_at_s=tick_result.hand_disconnected_at_s,
             )
-        if not _confirm_terminal_arm_acceptance_if_needed(
-            shared, cfg, resources.recorder, published_hold, hold_result,
-            recording_active=tick_result.recording_active,
-        ):
-            return replace(
-                tick_result,
-                keep_running=_publication_motion_revoked(shared, prepared_hold),
-            )
-        _record_grid_hold(
+        assert prepared.candidate is not None
+        controller.pending_publish = _PendingTeleopPublish(
+            candidate=prepared.candidate,
+            solved=False,
+        )
+        keep_running = _commit_pending_command(
             controller,
             shared,
+            cfg,
             resources,
             observation,
             recording_active=tick_result.recording_active,
-            action_queued=True,
         )
-        return tick_result
+        if keep_running:
+            return tick_result
+        return TeleopGridTickResult(
+            keep_running=False,
+            recording_active=tick_result.recording_active,
+            arm_feedback_error_count=tick_result.arm_feedback_error_count,
+            hand_disconnected_at_s=tick_result.hand_disconnected_at_s,
+        )
 
     if computation.ik_qpos_rad is None:
         keep_running = _publish_ik_failure_hold(

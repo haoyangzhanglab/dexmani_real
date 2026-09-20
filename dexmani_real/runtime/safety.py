@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
+from dexmani_real.ipc.command_stream import command_stream_capacity_locked
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -16,7 +17,12 @@ PUBLISH_REASON_ESTOP = "e-stop requested"
 PUBLISH_REASON_FAULT = "sticky fault"
 PUBLISH_REASON_SAFETY_STATE = "safety state does not permit motion"
 PUBLISH_REASON_GENERATION = "command generation no longer owns motion"
-PUBLISH_REASON_EXPIRED = "command validity window closed"
+# Recoverable backpressure: the ordered command FIFO is at capacity. The
+# producer keeps its identical prepared candidate and retries from its main
+# loop; nothing queued is dropped and no fault is implied.
+PUBLISH_REASON_FIFO_FULL = "command fifo full"
+# Fail-closed: no worker consumer ever attached to the command stream.
+PUBLISH_REASON_NO_CONSUMER = "no attached command consumer"
 
 
 class SafetyState(IntEnum):
@@ -63,12 +69,17 @@ class MotionPermit:
 
 
 @dataclass(frozen=True)
-class CoupledCommandTicket:
-    """Ownership identity of one coherent record in the coupled ring."""
+class CommittedCommand:
+    """Commit receipt of one coherent record in the ordered command FIFO.
+
+    The receipt identifies the record for explicit acceptance waits and
+    lifecycle cancellation. It carries no delivery lease: the record stays
+    valid until its run generation is revoked, and workers consume it in
+    commit order.
+    """
 
     run_generation: int
-    ring_sequence: int
-    valid_until_monotonic_ns: int
+    sequence: int
     published_monotonic_ns: int = 0
 
 
@@ -91,8 +102,38 @@ class RunStateSnapshot:
 
 
 def _advance_run_generation_locked(shared: Any) -> int:
+    """Invalidate the whole command epoch and re-base the FIFO watermark floor.
+
+    Queued records of the old generation are batch-invalidated: the new epoch
+    starts at the current last committed sequence + 1, and consumer watermarks
+    are clamped to the new base so a late old-generation consumer update
+    cannot hold back the new epoch. One summary line reports the per-actuator
+    pending ranges (never their sum — both views overlap the same records).
+    """
+    latest = int(shared.coupled_cmd_ring.latest_sequence)
+    previous_base = int(shared.run_generation_base_sequence.value)
+    pending = {}
+    for name, watermark in (
+        ("arm", shared.arm_cmd_consumed_sequence),
+        ("hand", shared.hand_cmd_consumed_sequence),
+    ):
+        value = int(watermark.value)
+        if value >= 0:
+            pending[name] = max(0, latest - max(value, previous_base))
+    shared.run_generation_base_sequence.value = latest
     shared.run_generation.value = int(shared.run_generation.value) + 1
-    return int(shared.run_generation.value)
+    generation = int(shared.run_generation.value)
+    queued = max(0, latest - previous_base)
+    if queued > 0 or any(pending.values()):
+        logger.info(
+            "[DROP] generation=%d invalidated %d queued command record(s) "
+            "(arm_pending=%d hand_pending=%d)",
+            generation,
+            queued,
+            pending.get("arm", 0),
+            pending.get("hand", 0),
+        )
+    return generation
 
 
 def _read_motion_permit_locked(shared: Any) -> MotionPermit:
@@ -164,15 +205,16 @@ def invalidate_coupled_commands(shared: Any) -> int:
 def cancel_coupled_command_if_current(
     shared: Any,
     *,
-    ticket: CoupledCommandTicket,
+    command: CommittedCommand,
 ) -> bool:
-    """Invalidate *ticket* only while it still owns the command slot.
+    """Invalidate *command*'s whole epoch only while that generation is current.
 
-    A timed-out caller must not revoke a newer publisher's command merely
-    because the newer record has not reached actuator acknowledgement yet.
+    Cancellation is generation-scoped, never record-scoped: an aborted wait
+    revokes every still-pending record of its own operation epoch (and only
+    those), so a timed-out caller cannot revoke a newer run's commands.
     """
     with shared.motion_lock:
-        if not _ticket_is_current_locked(shared, ticket):
+        if not _committed_command_is_current_locked(shared, command):
             return False
         _invalidate_coupled_commands_locked(shared)
         return True
@@ -181,20 +223,19 @@ def cancel_coupled_command_if_current(
 def reject_coupled_command_if_current(
     shared: Any,
     *,
-    ticket: CoupledCommandTicket,
+    command: CommittedCommand,
 ) -> bool:
-    """Pause only the still-executable rejected ticket, never a newer command.
+    """Pause only the still-executable rejected command's epoch.
 
     Ownership verification and revocation share one critical section. Unlike
     ACK cancellation, rejection establishes an ARMED lifecycle boundary too.
     """
     with shared.motion_lock:
         if not (
-            _ticket_is_current_locked(shared, ticket)
+            _committed_command_is_current_locked(shared, command)
             and shared.is_running.value
             and not shared.error_state.value
             and not shared.estop_request.value
-            and time.monotonic_ns() < int(ticket.valid_until_monotonic_ns)
         ):
             return False
         return _revoke_motion_locked(shared, SafetyState.ARMED) is not None
@@ -224,33 +265,27 @@ def publish_coupled_command_if_motion_permitted(
     expected_run_generation: int,
     frame: Any,
     required_state: SafetyState | None = None,
-    minimum_delivery_window_ns: int = 0,
-) -> tuple[CoupledCommandTicket | None, str]:
-    """Publish one frame or return its exact locked rejection reason.
+) -> tuple[CommittedCommand | None, str, int]:
+    """Commit one frame to the ordered command FIFO, or return the exact
+    locked rejection reason and the current backlog depth.
 
-    The ring sequence is recorded under the same lock as the motion permit.
-    A newer publication atomically supersedes the prior ticket, so delayed
-    workers cannot execute an overwritten frame.
+    Permission, generation, capacity, and the ring commit share one short
+    motion-lock section; the payload is a small fixed-size record. The commit
+    produces the queue sequence. A FULL result is recoverable backpressure:
+    the producer keeps the identical prepared candidate and retries from its
+    main loop — queued records are never dropped or superseded here.
     """
-    if (
-        isinstance(minimum_delivery_window_ns, bool)
-        or not isinstance(minimum_delivery_window_ns, int)
-        or minimum_delivery_window_ns < 0
-    ):
-        raise ValueError("minimum_delivery_window_ns must be a non-negative integer")
     names = getattr(getattr(frame, "dtype", None), "names", None) or ()
     required_fields = {
         "run_generation",
         "action_id",
         "arm_present",
         "hand_present",
-        "valid_until_monotonic_ns",
     }
     if getattr(frame, "shape", None) != (1,) or not required_fields.issubset(names):
         raise ValueError("coupled command frame is malformed")
     frame_generation = int(frame["run_generation"][0])
     action_id = int(frame["action_id"][0])
-    valid_until_monotonic_ns = int(frame["valid_until_monotonic_ns"][0])
     controls_actuator = bool(frame["arm_present"][0]) or bool(frame["hand_present"][0])
     if frame_generation != int(expected_run_generation) or action_id <= 0:
         raise ValueError(
@@ -260,81 +295,96 @@ def publish_coupled_command_if_motion_permitted(
         raise ValueError("coupled command must target at least one actuator")
     with shared.motion_lock:
         if bool(shared.estop_request.value):
-            return None, PUBLISH_REASON_ESTOP
+            return None, PUBLISH_REASON_ESTOP, 0
         if bool(shared.error_state.value):
-            return None, PUBLISH_REASON_FAULT
+            return None, PUBLISH_REASON_FAULT, 0
         if not bool(shared.is_running.value):
-            return None, PUBLISH_REASON_RUNTIME_STOPPED
+            return None, PUBLISH_REASON_RUNTIME_STOPPED, 0
         permit = _read_motion_permit_locked(shared)
         if not permit.allows_motion:
-            return None, f"{PUBLISH_REASON_SAFETY_STATE}: {permit.state.name}"
+            return (
+                None,
+                f"{PUBLISH_REASON_SAFETY_STATE}: {permit.state.name}",
+                0,
+            )
         if required_state is not None and permit.state is not required_state:
             return (
                 None,
                 f"{PUBLISH_REASON_SAFETY_STATE}: expected {required_state.name}, "
                 f"got {permit.state.name}",
+                0,
             )
         if permit.run_generation != int(expected_run_generation):
-            return None, PUBLISH_REASON_GENERATION
-        if valid_until_monotonic_ns - time.monotonic_ns() <= minimum_delivery_window_ns:
-            return None, PUBLISH_REASON_EXPIRED
+            return None, PUBLISH_REASON_GENERATION, 0
+        has_capacity, backlog, any_attached = command_stream_capacity_locked(shared)
+        if not has_capacity:
+            return (
+                None,
+                PUBLISH_REASON_FIFO_FULL if any_attached else PUBLISH_REASON_NO_CONSUMER,
+                backlog,
+            )
         sequence = int(shared.coupled_cmd_ring.write(frame))
         if sequence <= 0:
             raise RuntimeError("coupled command ring returned an invalid sequence")
         published_monotonic_ns = time.monotonic_ns()
         return (
-            CoupledCommandTicket(
+            CommittedCommand(
                 run_generation=permit.run_generation,
-                ring_sequence=sequence,
-                valid_until_monotonic_ns=valid_until_monotonic_ns,
+                sequence=sequence,
                 published_monotonic_ns=published_monotonic_ns,
             ),
             "",
+            0,
         )
 
 
-def _ticket_is_current_locked(
+def _committed_command_is_current_locked(
     shared: Any,
-    ticket: CoupledCommandTicket,
+    command: CommittedCommand,
 ) -> bool:
-    """Return whether *ticket* still owns the active command slot."""
+    """Return whether *command*'s generation still owns motion.
+
+    The ordered FIFO has no latest-wins slot: a committed record stays valid
+    for its whole epoch, so currency is exactly generation currency.
+    """
     permit = _read_motion_permit_locked(shared)
     return bool(
         permit.allows_motion
-        and permit.run_generation == int(ticket.run_generation)
-        and int(shared.coupled_cmd_ring.latest_sequence) == int(ticket.ring_sequence)
+        and permit.run_generation == int(command.run_generation)
     )
 
 
-def coupled_command_ticket_is_current(
+def coupled_command_is_current(
     shared: Any,
     *,
-    ticket: CoupledCommandTicket,
+    command: CommittedCommand,
 ) -> bool:
-    """Return whether a published ticket remains latest and unrevoked."""
+    """Return whether a committed command's epoch remains unrevoked."""
     with shared.motion_lock:
-        return _ticket_is_current_locked(shared, ticket)
+        return _committed_command_is_current_locked(shared, command)
 
 
-def coupled_command_ticket_allows_execution(
+def coupled_command_may_cross_sdk(
     shared: Any,
     *,
-    ticket: CoupledCommandTicket,
+    run_generation: int,
 ) -> bool:
-    """Return whether *ticket* may still cross an actuator SDK boundary.
+    """Return whether a record of *run_generation* may cross an actuator SDK
+    boundary right now.
 
-    This is the common final worker check: the record must still own the
-    latest-wins slot, remain inside its delivery window, and the runtime must
-    not be stopping or faulted. The lock is deliberately released before
-    hardware IO, so workers call this immediately before their SDK method.
+    This is the common final worker check: the record's generation must still
+    own motion and the runtime must not be stopping or faulted. The lock is
+    deliberately released before hardware IO, so workers call this immediately
+    before their SDK method.
     """
     with shared.motion_lock:
+        permit = _read_motion_permit_locked(shared)
         return bool(
-            _ticket_is_current_locked(shared, ticket)
+            permit.allows_motion
+            and permit.run_generation == int(run_generation)
             and shared.is_running.value
             and not shared.error_state.value
             and not shared.estop_request.value
-            and time.monotonic_ns() < int(ticket.valid_until_monotonic_ns)
         )
 
 

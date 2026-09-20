@@ -33,6 +33,7 @@ from dexmani_real.planning import (
     XArm7MotionPlanner,
     XArm7PlannerConfig,
 )
+from dexmani_real.control.publication import PublishWaitTracker
 from dexmani_real.recording.client import RecorderClient
 from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
@@ -424,6 +425,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             cfg.runtime.policy.hand_ramp_duration_s, cfg.runtime.policy.control_hz
         ),
         max_observation_skew_s=cfg.runtime.policy.max_observation_skew_s,
+        fifo_wait=PublishWaitTracker("teleop"),
     )
 
     def enter_pause(

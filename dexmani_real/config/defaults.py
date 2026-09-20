@@ -607,7 +607,6 @@ class PolicyParams:
     max_input_age_s: float = 0.15
     max_observation_skew_s: float = 0.10
     max_grid_lag_s: float = 0.08
-    action_validity_s: float = 0.5
     action_apply_timeout_s: float = 0.75
     arm_state_stale_threshold_s: float = 0.5
     quit_save_timeout_s: float = 30.0
@@ -655,7 +654,6 @@ class PolicyParams:
             self.max_input_age_s,
             self.max_observation_skew_s,
             self.max_grid_lag_s,
-            self.action_validity_s,
         )
         if not all(np.isfinite(value) and value > 0 for value in deployment_timing):
             raise ValueError(

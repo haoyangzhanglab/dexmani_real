@@ -74,19 +74,15 @@ def validate_point_cloud_array(
     return array
 
 
-# Every servo publication is one coherent arm/hand record. The publisher marks
-# its ring sequence active atomically; workers execute only while that exact
-# latest-wins ticket is still active. Physical execution remains asynchronous.
+# Every servo publication is one coherent arm/hand record committed once to the
+# bounded ordered command FIFO. Consumers read records by sequence in commit
+# order and workers execute only while the record's run_generation still owns
+# motion; there is no per-command lease and no latest-wins supersession. The
+# queue sequence is produced by the commit; action IDs are producer-assigned,
+# globally monotonic, and may have gaps — the two identities are never mixed.
 _COMMON_COMMAND_FIELDS = [
     ("run_generation", "<u8"),
-    ("observation_id", "<u8"),
     ("action_id", "<u8"),
-    ("created_monotonic_ns", "<u8"),
-    # Producer-provided nominal/reference timestamp, retained for provenance.
-    # Defaults to target_monotonic_ns, the actual worker delivery target.
-    ("scheduled_target_monotonic_ns", "<u8"),
-    ("target_monotonic_ns", "<u8"),
-    ("valid_until_monotonic_ns", "<u8"),
     ("is_hold", "<u1"),
 ]
 COUPLED_COMMAND_DTYPE = np.dtype(
@@ -113,6 +109,11 @@ ARM_STATE_DTYPE = np.dtype(
         ("last_cmd_seq", "<u8"),
         # Monotonic time immediately after the arm SDK accepted last_cmd_seq.
         ("last_cmd_accepted_monotonic_ns", "<u8"),
+        # Generation and FIFO sequence of the SDK-accepted command, so waiters
+        # distinguish a stale-generation ACK from ordered acceptance in the
+        # current epoch. Pure IPC identity; never persisted to raw.
+        ("last_cmd_generation", "<u8"),
+        ("last_cmd_accepted_sequence", "<u8"),
         ("last_cmd_is_hold", "<u1"),
         ("source_monotonic_ns", "<u8"),
         # Load-bearing for causal consumer selection (ipc/causal.py,
@@ -143,6 +144,11 @@ HAND_STATE_DTYPE = np.dtype(
         ("accepted_target_action_id", "<u8"),
         # Monotonic time immediately after the XHand SDK accepted that target.
         ("accepted_target_monotonic_ns", "<u8"),
+        # Generation and FIFO sequence of the exact-endpoint acceptance, so
+        # waiters reject stale-generation ACKs and use ordered acceptance in
+        # the current epoch. Pure IPC identity; never persisted to raw.
+        ("accepted_target_generation", "<u8"),
+        ("accepted_target_sequence", "<u8"),
         # Monotonic time after the most recent accepted SDK setpoint, including
         # intermediate slew setpoints that have not reached the exact target.
         ("last_sdk_setpoint_accepted_monotonic_ns", "<u8"),

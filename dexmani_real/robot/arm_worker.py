@@ -30,6 +30,7 @@ import numpy as np
 
 from dexmani_real.config.defaults import ArmParams
 from dexmani_real.ipc.channels import new_frame
+from dexmani_real.ipc.command_stream import CommandStreamConsumer
 from dexmani_real.ipc.schema import ARM_STATE_DTYPE
 from dexmani_real.robot.command_validation import (
     ARM_COMMAND_JUMP_REJECTION,
@@ -37,10 +38,10 @@ from dexmani_real.robot.command_validation import (
 )
 from dexmani_real.robot.drivers.xarm7 import HomeAborted, XArm7, describe_controller_error
 from dexmani_real.runtime.safety import (
-    CoupledCommandTicket,
+    CommittedCommand,
     SafetyState,
     StopRequest,
-    coupled_command_ticket_allows_execution,
+    coupled_command_may_cross_sdk,
     read_motion_permit,
     reject_coupled_command_if_current,
 )
@@ -57,10 +58,12 @@ class _CmdState:
     seq: int
     is_hold: bool
     accepted_monotonic_ns: int
+    generation: int = 0
+    accepted_sequence: int = 0
 
     @classmethod
     def idle(cls) -> "_CmdState":
-        return cls(0, False, 0)
+        return cls(0, False, 0, 0, 0)
 
 
 @dataclass
@@ -77,27 +80,9 @@ class _LoopState:
     last_target: np.ndarray
     last_measured_qpos: np.ndarray
     last_command_generation: int
+    consumer: CommandStreamConsumer
     last_cmd: _CmdState = field(default_factory=_CmdState.idle)
-    last_processed_ring_sequence: int = 0
     last_state_source_ns: int = field(default_factory=time.monotonic_ns)
-
-
-def _read_latest_arm_command(
-    shared: Any,
-) -> tuple[Any, CoupledCommandTicket] | None:
-    """Read the newest arm-present record; the handler owns safety checks."""
-    result = shared.coupled_cmd_ring.read_latest()
-    if result is None:
-        return None
-    command, _published_ns, ring_sequence = result
-    if not bool(command["arm_present"][0]):
-        return None
-    ticket = CoupledCommandTicket(
-        run_generation=int(command["run_generation"][0]),
-        ring_sequence=int(ring_sequence),
-        valid_until_monotonic_ns=int(command["valid_until_monotonic_ns"][0]),
-    )
-    return command, ticket
 
 
 def _home_abort_reason(shared: Any, generation: int) -> str | None:
@@ -156,6 +141,8 @@ def _write_arm_frame(
     frame["tracking_err"][0] = tracking_err
     frame["last_cmd_seq"][0] = cmd.seq
     frame["last_cmd_accepted_monotonic_ns"][0] = cmd.accepted_monotonic_ns
+    frame["last_cmd_generation"][0] = cmd.generation
+    frame["last_cmd_accepted_sequence"][0] = cmd.accepted_sequence
     frame["last_cmd_is_hold"][0] = int(cmd.is_hold)
     frame["source_monotonic_ns"][0] = source_ns
     frame["publish_monotonic_ns"][0] = time.monotonic_ns()
@@ -174,6 +161,10 @@ def _startup(shared: Any, arm: XArm7, cfg: ArmParams) -> _LoopState:
     logger.debug("arm_loop: LOADING")
     arm.connect(on_poll=heartbeat)
     qpos, qvel, tau = arm.read()
+    # Attach this worker as the arm consumer of the ordered command FIFO
+    # before signalling ready, so the publisher's capacity watermark sees an
+    # attached consumer from the first committable command on.
+    consumer = CommandStreamConsumer(shared, shared.arm_cmd_consumed_sequence)
     st = _LoopState(
         cfg=cfg,
         arm=arm,
@@ -181,6 +172,7 @@ def _startup(shared: Any, arm: XArm7, cfg: ArmParams) -> _LoopState:
         last_target=qpos.copy(),
         last_measured_qpos=qpos.copy(),
         last_command_generation=int(shared.run_generation.value),
+        consumer=consumer,
     )
     # Publish the initial frame before signaling ready.
     _write_arm_frame(
@@ -282,21 +274,17 @@ def _handle_servo_command(
     st: _LoopState,
     shared: Any,
     action: Any,
-    ticket: CoupledCommandTicket,
+    sequence: int,
 ) -> None:
-    """Validate and servo one endpoint command.
+    """Validate and servo one ordered endpoint command.
 
     Fail-fast: a raised SDK exception or a non-zero return propagates to the
     worker's top-level handler, which latches ``error_state`` and stops the
-    controller in cleanup.
+    controller in cleanup. The FIFO cursor advances only after explicit SDK
+    acceptance; a rejected jump revokes the epoch instead (the resync then
+    batch-skips the invalidated backlog). At most one send happens per tick —
+    the worker never drains the queue to catch up.
     """
-    if ticket.ring_sequence <= st.last_processed_ring_sequence:
-        return
-
-    # A coupled-ring endpoint is an event, not a level-triggered setpoint. Mark
-    # it consumed before validation so a superseded or rejected snapshot cannot
-    # be retried on every worker tick. A newer ring sequence remains eligible.
-    st.last_processed_ring_sequence = ticket.ring_sequence
     command_generation = int(action["run_generation"][0])
     jump_reference = (
         st.last_target
@@ -312,7 +300,12 @@ def _handle_servo_command(
         max_command_jump_rad=st.cfg.max_servo_command_jump_rad,
     )
     if issue == ARM_COMMAND_JUMP_REJECTION:
-        if reject_coupled_command_if_current(shared, ticket=ticket):
+        if reject_coupled_command_if_current(
+            shared,
+            command=CommittedCommand(
+                run_generation=command_generation, sequence=sequence
+            ),
+        ):
             delta = np.abs(target - jump_reference)
             joint = int(np.argmax(delta))
             logger.warning(
@@ -326,8 +319,10 @@ def _handle_servo_command(
             )
         return
     # This is the sole command-authority fence and the final operation before
-    # an otherwise valid target crosses the xArm SDK boundary.
-    if not coupled_command_ticket_allows_execution(shared, ticket=ticket):
+    # an otherwise valid target crosses the xArm SDK boundary. A transient
+    # same-generation fence miss retries this record on the next tick; any
+    # real revocation advanced the generation and resyncs the cursor.
+    if not coupled_command_may_cross_sdk(shared, run_generation=command_generation):
         return
     if issue is not None:
         raise RuntimeError(
@@ -352,14 +347,39 @@ def _handle_servo_command(
         int(action["action_id"][0]),
         bool(action["is_hold"][0]),
         accepted_monotonic_ns,
+        generation=command_generation,
+        accepted_sequence=sequence,
     )
+    # The SDK accepted this endpoint: the record is fully processed and its
+    # FIFO slot is released to the publisher's capacity watermark.
+    st.consumer.advance()
+
+
+def _consume_one_arm_command(st: _LoopState, shared: Any, permit_generation: int) -> None:
+    """Consume at most one ordered FIFO record for the arm this tick."""
+    consumer = st.consumer
+    consumer.resync_if_stale_generation(permit_generation)
+    record = consumer.next_record()
+    if record is None:
+        return  # EMPTY is a wait, never a fault
+    command, sequence = record
+    if int(command["run_generation"][0]) != permit_generation:
+        # A record whose epoch was revoked after the tick's permit read.
+        consumer.advance()
+        return
+    if not bool(command["arm_present"][0]):
+        # An absent actuator advances only its consumer; no SDK involvement
+        # and no acceptance is implied.
+        consumer.advance()
+        return
+    _handle_servo_command(st, shared, command, sequence)
 
 
 def _step(st: _LoopState, shared: Any, limiter: LoopRate) -> bool:
     """Run one iteration; return True when the worker must exit.
 
     Apply at most one command per tick — a queued HOME request takes priority
-    over the newest servo endpoint — then observe + publish.  Motion is software-disarmed:
+    over the next ordered servo endpoint — then observe + publish.  Motion is software-disarmed:
     outside ARMED/RUNNING (or on ``error_state``) nothing is consumed, while
     observation keeps publishing every tick.
     """
@@ -375,10 +395,7 @@ def _step(st: _LoopState, shared: Any, limiter: LoopRate) -> bool:
             # instead of reporting its Mode 0/6 transition as loop overrun.
             limiter.reset()
         else:
-            latest = _read_latest_arm_command(shared)
-            if latest is not None:
-                command, ticket = latest
-                _handle_servo_command(st, shared, command, ticket)
+            _consume_one_arm_command(st, shared, permit.run_generation)
     return _observe_and_publish(st, shared)
 
 

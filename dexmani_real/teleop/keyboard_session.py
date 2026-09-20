@@ -18,10 +18,16 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real.config.experiment import ExperimentConfig
+from dexmani_real.control.action import ActionCandidate
 from dexmani_real.control.arm_homing import ArmHomeConfig, execute_arm_home
 from dexmani_real.control.hand_homing import publish_hand_home_and_wait_accepted
 from dexmani_real.control.jog import any_jog_key_held, compute_cartesian_jog_delta
-from dexmani_real.control.publication import prepare_joint_command, publish_command
+from dexmani_real.control.publication import (
+    PUBLISH_REASON_FIFO_FULL,
+    PublishWaitTracker,
+    prepare_joint_command,
+    publish_command,
+)
 from dexmani_real.control.safety_gate import planner_action_safety_gate
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
@@ -285,6 +291,9 @@ class _KeyboardPublishStatus(str, Enum):
     PUBLISHED = "published"
     IK_REJECTED = "ik_rejected"
     SAFETY_REJECTED = "safety_rejected"
+    # Recoverable command-FIFO backpressure: the prepared candidate is kept
+    # and retried unchanged on the next frame.
+    FIFO_FULL = "fifo_full"
 
 
 @dataclass(frozen=True)
@@ -294,14 +303,24 @@ class _KeyboardPublishResult:
     detail: str = ""
     action_id: int = 0
     fatal: bool = False
+    candidate: ActionCandidate | None = None
+    fifo_depth: int = 0
 
 
 def _keyboard_action_was_accepted(
     action_id: int,
     arm_state: dict[str, Any],
+    run_generation: int,
 ) -> bool:
-    """Return whether the final normal keyboard action crossed the SDK boundary."""
-    return int(action_id) <= 0 or int(arm_state["last_cmd_seq"]) >= int(action_id)
+    """Return whether the final normal keyboard action crossed the SDK boundary.
+
+    Ordered acceptance inside the current run generation only: a larger
+    watermark from a stale generation never satisfies the check.
+    """
+    return int(action_id) <= 0 or (
+        int(arm_state["last_cmd_generation"]) == int(run_generation)
+        and int(arm_state["last_cmd_seq"]) >= int(action_id)
+    )
 
 
 def _read_keyboard_feedback(
@@ -568,31 +587,37 @@ def _publish_keyboard_target(
         hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
     )
     candidate = prepared.candidate
-    publish_result = (
-        publish_command(
-            shared,
-            candidate,
-            required_safety_state=SafetyState.RUNNING,
-        )
-        if candidate is not None
-        else None
-    )
-    if (
-        publish_result is None
-        or not publish_result.published
-        or candidate is None
-        or candidate.arm_qpos is None
-    ):
+    if candidate is None or candidate.arm_qpos is None:
         return _KeyboardPublishResult(
             _KeyboardPublishStatus.SAFETY_REJECTED,
-            detail=prepared.reason
-            or (publish_result.reason if publish_result is not None else ""),
+            detail=prepared.reason,
+            fatal=prepared.fatal,
+        )
+    publish_result = publish_command(
+        shared,
+        candidate,
+        required_safety_state=SafetyState.RUNNING,
+    )
+    if not publish_result.published:
+        if publish_result.reason == PUBLISH_REASON_FIFO_FULL:
+            # Keep the identical prepared candidate for the retry loop.
+            return _KeyboardPublishResult(
+                _KeyboardPublishStatus.FIFO_FULL,
+                arm_qpos_rad=np.asarray(candidate.arm_qpos, dtype=np.float64).copy(),
+                detail=publish_result.reason,
+                action_id=int(candidate.action_id),
+                candidate=candidate,
+                fifo_depth=publish_result.fifo_depth,
+            )
+        return _KeyboardPublishResult(
+            _KeyboardPublishStatus.SAFETY_REJECTED,
+            detail=publish_result.reason,
             fatal=prepared.fatal,
         )
     return _KeyboardPublishResult(
         _KeyboardPublishStatus.PUBLISHED,
         arm_qpos_rad=np.asarray(candidate.arm_qpos, dtype=np.float64).copy(),
-        action_id=int(getattr(candidate, "action_id", 0)),
+        action_id=int(candidate.action_id),
     )
 
 
@@ -637,6 +662,11 @@ def _run_control_loop(
     last_ik_warning_s = 0.0
     last_boundary_warn_s = 0.0
     started_s = time.monotonic()
+    # Prepared-but-uncommitted jog command during recoverable FIFO
+    # backpressure; retried unchanged and dropped visibly on epoch revoke.
+    pending_candidate: ActionCandidate | None = None
+    pending_arm_qpos: np.ndarray | None = None
+    fifo_wait = PublishWaitTracker("keyboard")
 
     def reject_motion(reason: str, *, fatal: bool = False) -> bool:
         nonlocal motion_active, release_idle_frames, last_motion_action_id
@@ -750,6 +780,53 @@ def _run_control_loop(
             continue
         home_key_down = home_pressed
 
+        # Recoverable FIFO backpressure: retry the identical kept candidate
+        # before any new proposal or release handling; a revoked epoch drops
+        # it visibly instead of sending stale key intent.
+        if pending_candidate is not None:
+            if int(pending_candidate.run_generation) != int(
+                shared.run_generation.value
+            ):
+                logger.warning(
+                    "[DROP] keyboard action=%d reason=generation_revoked",
+                    pending_candidate.action_id,
+                )
+                fifo_wait.note_dropped("generation_revoked")
+                pending_candidate = None
+                pending_arm_qpos = None
+                continue
+            else:
+                retry = publish_command(
+                    shared,
+                    pending_candidate,
+                    required_safety_state=SafetyState.RUNNING,
+                )
+                if retry.published:
+                    fifo_wait.note_committed()
+                    last_motion_action_id = int(pending_candidate.action_id)
+                    assert pending_arm_qpos is not None
+                    previous_command = pending_arm_qpos
+                    pending_candidate = None
+                    pending_arm_qpos = None
+                    # One committed command per frame: do not also propose a
+                    # fresh target in the same iteration.
+                    continue
+                elif retry.reason == PUBLISH_REASON_FIFO_FULL:
+                    fifo_wait.note_full(retry.fifo_depth, pending_candidate.action_id)
+                    continue
+                else:
+                    logger.warning(
+                        "[DROP] keyboard action=%d reason=%s",
+                        pending_candidate.action_id,
+                        retry.reason,
+                    )
+                    fifo_wait.note_dropped(retry.reason)
+                    kept_reason = retry.reason
+                    pending_candidate = None
+                    pending_arm_qpos = None
+                    if not reject_motion(kept_reason):
+                        return False
+
         active_keys = keys.pressed_keys()
         dx, drpy = compute_cartesian_jog_delta(
             keys, float(cfg.delta_pos_m), float(cfg.delta_rpy_rad)
@@ -794,6 +871,7 @@ def _run_control_loop(
                 last_action_accepted = _keyboard_action_was_accepted(
                     last_motion_action_id,
                     feedback.arm_state,
+                    int(shared.run_generation.value),
                 )
                 ack_timed_out = time.monotonic() - release_ack_started_s >= float(
                     cfg.release_last_action_ack_timeout_s
@@ -881,6 +959,12 @@ def _run_control_loop(
             current_qpos,
             previous_command,
         )
+        if publish_result.status is _KeyboardPublishStatus.FIFO_FULL:
+            assert publish_result.candidate is not None
+            pending_candidate = publish_result.candidate
+            pending_arm_qpos = publish_result.arm_qpos_rad
+            fifo_wait.note_full(publish_result.fifo_depth, publish_result.action_id)
+            continue
         if publish_result.status is _KeyboardPublishStatus.IK_REJECTED:
             now_s = time.monotonic()
             if now_s - last_ik_warning_s >= _IK_WARNING_INTERVAL_S:

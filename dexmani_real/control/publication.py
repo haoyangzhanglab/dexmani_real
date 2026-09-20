@@ -15,15 +15,15 @@ from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
 from dexmani_real.ipc.schema import COUPLED_COMMAND_DTYPE
 from dexmani_real.runtime.safety import (
     PUBLISH_REASON_ESTOP,
-    PUBLISH_REASON_EXPIRED,
     PUBLISH_REASON_FAULT,
+    PUBLISH_REASON_FIFO_FULL,
     PUBLISH_REASON_GENERATION,
     PUBLISH_REASON_RUNTIME_STOPPED,
     PUBLISH_REASON_SAFETY_STATE,
-    CoupledCommandTicket,
+    CommittedCommand,
     SafetyState,
     cancel_coupled_command_if_current,
-    coupled_command_ticket_is_current,
+    coupled_command_is_current,
     publish_coupled_command_if_motion_permitted,
     read_motion_permit,
 )
@@ -44,11 +44,16 @@ logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class PublishResult:
-    """Compact result of the realtime IPC publication boundary."""
+    """Compact result of the realtime IPC publication boundary.
+
+    ``fifo_depth`` is the committed backlog observed by a rejected FULL
+    commit, for the producer's visible ``[WAIT]`` report.
+    """
 
     published: bool
-    ticket: CoupledCommandTicket | None = None
+    command: CommittedCommand | None = None
     reason: str = ""
+    fifo_depth: int = 0
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,68 @@ class AcceptanceResult:
 
     accepted: bool
     reason: str = ""
+
+
+class PublishWaitTracker:
+    """One visible ``[WAIT]``/``[RESUME]`` pair per continuous FIFO-full span.
+
+    Each command producer owns one tracker. Entering backpressure prints once;
+    repeated FULL retries of the same kept candidate stay silent; the first
+    successful commit after the span prints the elapsed wait and how many
+    waiting candidates were dropped by lifecycle revocation.
+    """
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+        self._waiting_since_ns: int | None = None
+        self._keep_action_id = 0
+        self._dropped = 0
+
+    @property
+    def waiting(self) -> bool:
+        return self._waiting_since_ns is not None
+
+    def note_full(self, depth: int, keep_action: int) -> None:
+        if self._waiting_since_ns is None:
+            logger.warning(
+                "[WAIT] %s command_fifo full depth=%d keep_action=%d",
+                self._label,
+                int(depth),
+                int(keep_action),
+            )
+            self._waiting_since_ns = time.monotonic_ns()
+            self._keep_action_id = int(keep_action)
+
+    def note_committed(self) -> None:
+        if self._waiting_since_ns is None:
+            return
+        wait_ms = (time.monotonic_ns() - self._waiting_since_ns) / 1e6
+        logger.info(
+            "[RESUME] %s command_fifo wait_ms=%.0f dropped=%d",
+            self._label,
+            wait_ms,
+            self._dropped,
+        )
+        self._reset()
+
+    def note_dropped(self, reason: str) -> None:
+        """Report a kept candidate revoked by lifecycle while waiting."""
+        if self._waiting_since_ns is None:
+            return
+        wait_ms = (time.monotonic_ns() - self._waiting_since_ns) / 1e6
+        logger.warning(
+            "[DROP] %s command_fifo keep_action=%d wait_ms=%.0f reason=%s",
+            self._label,
+            self._keep_action_id,
+            wait_ms,
+            reason,
+        )
+        self._reset()
+
+    def _reset(self) -> None:
+        self._waiting_since_ns = None
+        self._keep_action_id = 0
+        self._dropped = 0
 
 
 @dataclass(frozen=True)
@@ -83,6 +150,10 @@ class _ArmFeedbackSnapshot:
     accepted_monotonic_ns: int = 0
     source_monotonic_ns: int = 0
     ring_commit_monotonic_ns: int = 0
+    # Generation/sequence identity of the acceptance watermark: a stale
+    # generation's ACK can never satisfy a current-epoch acceptance wait.
+    accepted_generation: int = 0
+    accepted_sequence: int = 0
 
 
 @dataclass(frozen=True)
@@ -92,6 +163,8 @@ class _HandFeedbackSnapshot:
     accepted_monotonic_ns: int = 0
     source_monotonic_ns: int = 0
     ring_commit_monotonic_ns: int = 0
+    accepted_generation: int = 0
+    accepted_sequence: int = 0
 
 
 @dataclass(frozen=True)
@@ -176,6 +249,8 @@ def _read_arm_feedback(
             accepted_monotonic_ns=int(record["last_cmd_accepted_monotonic_ns"]),
             source_monotonic_ns=source_ns,
             ring_commit_monotonic_ns=ring_commit_ns,
+            accepted_generation=int(record["last_cmd_generation"]),
+            accepted_sequence=int(record["last_cmd_accepted_sequence"]),
         ),
         "",
         None,
@@ -213,6 +288,8 @@ def read_hand_feedback(
             accepted_monotonic_ns=int(record["accepted_target_monotonic_ns"]),
             source_monotonic_ns=source_ns,
             ring_commit_monotonic_ns=ring_commit_ns,
+            accepted_generation=int(record["accepted_target_generation"]),
+            accepted_sequence=int(record["accepted_target_sequence"]),
         ),
         "",
         None,
@@ -332,18 +409,14 @@ def build_action_candidate(
     *,
     run_generation: int | None = None,
     is_hold: bool = False,
-    observation_id: int | None = None,
-    observation_anchor_monotonic_ns: int | None = None,
-    scheduled_target_monotonic_ns: int | None = None,
-    now_ns: int | None = None,
-    action_validity_s: float = 0.5,
-    valid_until_monotonic_ns: int | None = None,
-) -> ActionCandidate | None:
-    """Assign command identity and delivery timing before semantic admission.
+) -> ActionCandidate:
+    """Assign command identity and copy targets into an immutable candidate.
 
-    The optional producer-provided ``scheduled_target_monotonic_ns`` is
-    provenance only and defaults to the current delivery target. It does not
-    determine delivery timing or expiry.
+    The candidate carries no delivery lease or timing authority: it stays
+    committable until its run generation is revoked, and a FULL commit result
+    retries this exact numeric snapshot unchanged. Action IDs come from the
+    shared monotonic counter and may have gaps; the FIFO queue sequence is
+    produced later by the commit and is never mixed with them.
     """
     if run_generation is not None and (
         isinstance(run_generation, (bool, np.bool_))
@@ -351,44 +424,26 @@ def build_action_candidate(
         or int(run_generation) < 0
     ):
         raise ValueError("run_generation must be a non-negative integer or None")
-    if not np.isfinite(action_validity_s) or action_validity_s <= 0.0:
-        raise ValueError("action_validity_s must be finite and positive")
     with shared.arm_command_seq.get_lock():
         action_id = int(shared.arm_command_seq.value) + 1
         shared.arm_command_seq.value = action_id
-    now_ns = int(time.monotonic_ns() if now_ns is None else now_ns)
-    if observation_anchor_monotonic_ns is not None:
-        anchor_ns = int(observation_anchor_monotonic_ns)
-        if anchor_ns <= 0 or anchor_ns > now_ns:
-            return None
-    target_ns = now_ns
-    scheduled_ns = int(
-        target_ns
-        if scheduled_target_monotonic_ns is None
-        else scheduled_target_monotonic_ns
-    )
-    # The producer's reference time may precede or follow candidate creation.
-    if scheduled_ns <= 0:
-        return None
-    delivery_deadline_ns = now_ns + int(float(action_validity_s) * 1e9)
-    if valid_until_monotonic_ns is not None:
-        delivery_deadline_ns = min(delivery_deadline_ns, int(valid_until_monotonic_ns))
-    if delivery_deadline_ns < target_ns:
-        return None
     return ActionCandidate(
-        observation_id=action_id if observation_id is None else int(observation_id),
         run_generation=(
             int(shared.run_generation.value)
             if run_generation is None
             else int(run_generation)
         ),
         action_id=action_id,
-        created_monotonic_ns=now_ns,
-        scheduled_target_monotonic_ns=scheduled_ns,
-        target_monotonic_ns=target_ns,
-        valid_until_monotonic_ns=delivery_deadline_ns,
-        arm_qpos=None if arm_qpos is None else np.asarray(arm_qpos, dtype=np.float64),
-        hand_qpos=None if hand_qpos is None else np.asarray(hand_qpos, dtype=np.float64),
+        arm_qpos=(
+            None
+            if arm_qpos is None
+            else np.array(arm_qpos, dtype=np.float64, copy=True)
+        ),
+        hand_qpos=(
+            None
+            if hand_qpos is None
+            else np.array(hand_qpos, dtype=np.float64, copy=True)
+        ),
         is_hold=is_hold,
     )
 
@@ -511,9 +566,6 @@ def prepare_joint_command(
     *,
     gate: SafetyGate,
     is_hold: bool = False,
-    observation_id: int | None = None,
-    observation_anchor_monotonic_ns: int | None = None,
-    action_validity_s: float = 0.5,
     hand_delta_reference_qpos: np.ndarray | None = None,
     arm_feedback_max_age_s: float,
     hand_feedback_max_age_s: float,
@@ -525,16 +577,9 @@ def prepare_joint_command(
             arm_qpos,
             hand_qpos,
             is_hold=is_hold,
-            observation_id=observation_id,
-            observation_anchor_monotonic_ns=observation_anchor_monotonic_ns,
-            action_validity_s=action_validity_s,
         )
     except (TypeError, ValueError) as exc:
         return PreparedCommand(reason=str(exc), fatal=True)
-    if candidate is None:
-        return PreparedCommand(
-            reason="invalid observation anchor or closed window", fatal=True
-        )
     return prepare_command(
         shared,
         candidate,
@@ -548,12 +593,7 @@ def prepare_joint_command(
 def _make_coupled_command(candidate: ActionCandidate) -> np.ndarray:
     frame = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
     frame["run_generation"][0] = candidate.run_generation
-    frame["observation_id"][0] = candidate.observation_id
     frame["action_id"][0] = candidate.action_id
-    frame["created_monotonic_ns"][0] = candidate.created_monotonic_ns
-    frame["scheduled_target_monotonic_ns"][0] = candidate.scheduled_target_monotonic_ns
-    frame["target_monotonic_ns"][0] = candidate.target_monotonic_ns
-    frame["valid_until_monotonic_ns"][0] = candidate.valid_until_monotonic_ns
     frame["is_hold"][0] = int(candidate.is_hold)
     if candidate.arm_qpos is not None:
         frame["arm_present"][0] = 1
@@ -570,35 +610,13 @@ def command_publishability_reason(
     *,
     check_is_running: bool = True,
     required_safety_state: SafetyState | None = None,
-    minimum_delivery_window_s: float = 0.0,
 ) -> str:
-    """Check runtime, generation, and validity-window publication invariants."""
-    minimum_delivery_window_ns = _minimum_delivery_window_ns(minimum_delivery_window_s)
-    return _command_publishability_reason(
-        shared,
-        candidate,
-        check_is_running=check_is_running,
-        required_safety_state=required_safety_state,
-        minimum_delivery_window_ns=minimum_delivery_window_ns,
-    )
+    """Check the runtime and generation publication invariants without committing.
 
-
-def _minimum_delivery_window_ns(minimum_delivery_window_s: float) -> int:
-    """Convert the public delivery-window requirement to monotonic nanoseconds."""
-    if not np.isfinite(minimum_delivery_window_s) or minimum_delivery_window_s < 0.0:
-        raise ValueError("minimum_delivery_window_s must be finite and non-negative")
-    return int(minimum_delivery_window_s * 1e9)
-
-
-def _command_publishability_reason(
-    shared: Any,
-    candidate: ActionCandidate,
-    *,
-    check_is_running: bool,
-    required_safety_state: SafetyState | None,
-    minimum_delivery_window_ns: int,
-) -> str:
-    """Check the pre-publication state using a resolved delivery window."""
+    This is the ``execute=False`` rehearsal of :func:`publish_command`; it
+    deliberately does not evaluate FIFO capacity, which is only meaningful at
+    the atomic commit point.
+    """
     reason = motion_rejection_reason(
         shared,
         check_is_running=check_is_running,
@@ -609,11 +627,6 @@ def _command_publishability_reason(
     permit = read_motion_permit(shared)
     if int(candidate.run_generation) != permit.run_generation:
         return PUBLISH_REASON_GENERATION
-    if (
-        candidate.valid_until_monotonic_ns - time.monotonic_ns()
-        <= minimum_delivery_window_ns
-    ):
-        return PUBLISH_REASON_EXPIRED
     return ""
 
 
@@ -622,26 +635,28 @@ def publish_command(
     candidate: ActionCandidate,
     *,
     required_safety_state: SafetyState,
-    minimum_delivery_window_s: float = 0.0,
 ) -> PublishResult:
-    """Publish one checked command without waiting for worker acknowledgement."""
-    minimum_delivery_window_ns = _minimum_delivery_window_ns(minimum_delivery_window_s)
-    ticket, rejection_reason = publish_coupled_command_if_motion_permitted(
+    """Commit one checked command to the ordered FIFO without waiting for
+    worker acknowledgement.
+
+    A FULL result is recoverable backpressure: the caller keeps this exact
+    candidate and retries from its main loop cadence.
+    """
+    command, rejection_reason, fifo_depth = publish_coupled_command_if_motion_permitted(
         shared,
         expected_run_generation=int(candidate.run_generation),
         frame=_make_coupled_command(candidate),
         required_state=required_safety_state,
-        minimum_delivery_window_ns=minimum_delivery_window_ns,
     )
-    if ticket is None:
-        return PublishResult(False, reason=rejection_reason)
-    return PublishResult(True, ticket=ticket)
+    if command is None:
+        return PublishResult(False, reason=rejection_reason, fifo_depth=fifo_depth)
+    return PublishResult(True, command=command)
 
 
 def wait_command_accepted(
     shared: Any,
     *,
-    ticket: CoupledCommandTicket,
+    command: CommittedCommand,
     action_id: int,
     wait_for_arm: bool,
     wait_for_hand: bool,
@@ -652,21 +667,33 @@ def wait_command_accepted(
     abort_requested: Callable[[], bool] | None = None,
     heartbeat: Callable[[], None] | None = None,
 ) -> AcceptanceResult:
-    """Block until the requested workers report SDK acceptance of one command."""
+    """Block until the requested workers report SDK acceptance of one command.
+
+    Acceptance is judged by ordered consumption inside the command's own run
+    generation, never by action-ID supersession: a worker only advances its
+    acceptance watermark after SDK-accepting every targeted record in commit
+    order, so a same-generation watermark at or beyond this command's FIFO
+    sequence proves ordered acceptance of this command. A larger action ID
+    alone proves nothing, and a stale-generation ACK can never satisfy the
+    wait. Explicit waits are for home/replay/calibration boundaries only;
+    ordinary streaming never blocks here.
+    """
     if not wait_for_arm and not wait_for_hand:
         raise ValueError("acceptance wait requires at least one worker")
     if not np.isfinite(timeout_s) or timeout_s <= 0.0:
         raise ValueError("acceptance timeout must be finite and positive")
-    if action_id < 0 or ticket.ring_sequence <= 0:
+    if action_id < 0 or command.sequence <= 0:
         raise ValueError("acceptance identity must be non-negative and published")
+    generation = int(command.run_generation)
+    sequence = int(command.sequence)
     deadline_s = time.monotonic() + timeout_s
     while time.monotonic() < deadline_s:
         if abort_requested is not None and abort_requested():
-            cancel_coupled_command_if_current(shared, ticket=ticket)
+            cancel_coupled_command_if_current(shared, command=command)
             return AcceptanceResult(False, "acceptance aborted")
         reason = motion_rejection_reason(shared, check_is_running=check_is_running)
         if reason:
-            cancel_coupled_command_if_current(shared, ticket=ticket)
+            cancel_coupled_command_if_current(shared, command=command)
             return AcceptanceResult(False, reason)
         if heartbeat is not None:
             heartbeat()
@@ -677,13 +704,14 @@ def wait_command_accepted(
                 shared, max_age_s=arm_feedback_max_age_s
             )
             if arm_feedback is None:
-                cancel_coupled_command_if_current(shared, ticket=ticket)
+                cancel_coupled_command_if_current(shared, command=command)
                 return AcceptanceResult(False, reason)
-            if arm_feedback.accepted_action_id > action_id:
-                return AcceptanceResult(False, "arm acceptance was superseded")
-            arm_accepted = arm_feedback.accepted_action_id == action_id
+            arm_accepted = arm_feedback.accepted_generation == generation and (
+                arm_feedback.accepted_action_id == action_id
+                or arm_feedback.accepted_sequence >= sequence
+            )
             if arm_accepted and arm_feedback.accepted_monotonic_ns <= 0:
-                cancel_coupled_command_if_current(shared, ticket=ticket)
+                cancel_coupled_command_if_current(shared, command=command)
                 return AcceptanceResult(False, "arm acceptance timestamp is missing")
 
         hand_accepted = not wait_for_hand
@@ -692,22 +720,23 @@ def wait_command_accepted(
                 shared, max_age_s=hand_feedback_max_age_s
             )
             if hand_feedback is None:
-                cancel_coupled_command_if_current(shared, ticket=ticket)
+                cancel_coupled_command_if_current(shared, command=command)
                 return AcceptanceResult(False, reason)
-            if hand_feedback.accepted_action_id > action_id:
-                return AcceptanceResult(False, "hand acceptance was superseded")
-            hand_accepted = hand_feedback.accepted_action_id == action_id
+            hand_accepted = hand_feedback.accepted_generation == generation and (
+                hand_feedback.accepted_action_id == action_id
+                or hand_feedback.accepted_sequence >= sequence
+            )
             if hand_accepted and hand_feedback.accepted_monotonic_ns <= 0:
-                cancel_coupled_command_if_current(shared, ticket=ticket)
+                cancel_coupled_command_if_current(shared, command=command)
                 return AcceptanceResult(False, "hand acceptance timestamp is missing")
 
         if arm_accepted and hand_accepted:
             return AcceptanceResult(True)
-        if not coupled_command_ticket_is_current(shared, ticket=ticket):
+        if not coupled_command_is_current(shared, command=command):
             return AcceptanceResult(
-                False, "command ownership was revoked or superseded"
+                False, "command generation was revoked before acceptance"
             )
         time.sleep(0.005)
 
-    cancel_coupled_command_if_current(shared, ticket=ticket)
+    cancel_coupled_command_if_current(shared, command=command)
     return AcceptanceResult(False, f"command was not accepted within {timeout_s:.3f}s")

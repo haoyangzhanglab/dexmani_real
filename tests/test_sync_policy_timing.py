@@ -152,6 +152,8 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.chunk_action_index = 0
         runner.previous_arm_command_qpos = None
         runner.consecutive_stale_predictions = 0
+        runner._pending_dispatch = None
+        runner._fifo_wait = executor_module.PublishWaitTracker("test")
         runner.stats = SimpleNamespace()
         runner.shared = None
         runner.policy_spec = SimpleNamespace(
@@ -261,10 +263,13 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.previous_arm_command_qpos = np.array([1.0, 2.0, 3.0])
         runner.chunk_sources = {"arm": (100, 200)}
         runner.actions = deque([np.array([1.0]), np.array([2.0])])
+        runner._pending_dispatch = object()
+        runner._fifo_wait = SimpleNamespace(note_dropped=lambda reason: None)
 
         runner._invalidate_chunk("test_reason")
 
         self.assertEqual(list(runner.actions), [])
+        self.assertIsNone(runner._pending_dispatch)
         self.assertEqual(runner.chunk_sources, {})
         self.assertEqual(runner.chunk_action_index, 0)
         self.assertIsNone(runner.previous_arm_command_qpos)
@@ -288,6 +293,8 @@ class SyncPolicyTimingTest(unittest.TestCase):
         )
         runner.stats = SimpleNamespace(stale_prediction_count=0)
         runner.consecutive_stale_predictions = 0
+        runner._pending_dispatch = None
+        runner._fifo_wait = SimpleNamespace(note_dropped=lambda reason: None)
         runner._invalidate_rollout = mock.Mock(return_value=True)
         runner._request_failed_session_shutdown = mock.Mock()
 
@@ -315,6 +322,8 @@ class SyncPolicyTimingTest(unittest.TestCase):
         )
         runner.stats = SimpleNamespace(stale_prediction_count=0)
         runner.consecutive_stale_predictions = 0
+        runner._pending_dispatch = None
+        runner._fifo_wait = SimpleNamespace(note_dropped=lambda reason: None)
         runner._invalidate_rollout = mock.Mock(return_value=True)
         runner._request_failed_session_shutdown = mock.Mock()
 

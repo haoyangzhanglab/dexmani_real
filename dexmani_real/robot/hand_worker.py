@@ -1,9 +1,13 @@
-"""Single-owner XHand servo worker with latest-target, fixed-grid feedback.
+"""Single-owner XHand servo worker with ordered FIFO consumption.
 
 Each tick reads one state, publishes it (or a clearly stale previous state),
-then sends at most one rate-bounded target. RUNNING motion advances from the
-last SDK-accepted setpoint; ARMED homing remains bounded from measurement. A
-CRC response keeps the target unacknowledged and the worker running; other
+then consumes at most one ordered command-FIFO record and sends at most one
+rate-bounded setpoint. The endpoint cursor advances only on exact-endpoint
+SDK acceptance: an intermediate slew setpoint or a CRC-unconfirmed send
+leaves the record pending for the next tick without updating the acceptance
+identity or the command-space reference. RUNNING motion advances from the
+last SDK-accepted setpoint; ARMED homing remains bounded from measurement.
+A CRC response keeps the target unacknowledged and the worker running; other
 rejected SDK commands latch the shared fault so publishers cannot mistake
 silence for successful application.
 """
@@ -11,22 +15,45 @@ silence for successful application.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
 from dexmani_real.config.defaults import HandParams
+from dexmani_real.ipc.command_stream import CommandStreamConsumer
 from dexmani_real.ipc.schema import (
     HAND_STATE_DTYPE,
     HAND_TACTILE_FORCE_SHAPE,
     HAND_TACTILE_SUM_SHAPE,
 )
 from dexmani_real.robot.command_validation import check_worker_hand_target
+from dexmani_real.runtime.safety import (
+    SafetyState,
+    coupled_command_may_cross_sdk,
+    read_motion_permit,
+)
 from dexmani_real.utils.limits import limit_hand_target_delta
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
 logger = get_logger(__name__)
+
+
+class _HandWorkerFault(RuntimeError):
+    """Unsafe hand target or SDK rejection; the loop latches the shared fault."""
+
+
+@dataclass
+class _HandCommandAck:
+    """Exact-endpoint acceptance identity and command-space slew reference."""
+
+    last_sdk_accepted_qpos: np.ndarray
+    accepted_target_action_id: int = 0
+    accepted_target_monotonic_ns: int = 0
+    accepted_target_generation: int = 0
+    accepted_target_sequence: int = 0
+    last_sdk_setpoint_accepted_monotonic_ns: int = 0
 
 
 def _limited_hand_setpoint(
@@ -50,6 +77,120 @@ def _limited_hand_setpoint(
         reference_qpos,
         max_delta_rad_per_tick,
     )
+
+
+def _consume_one_hand_command(
+    shared: Any,
+    hand: Any,
+    send_status_enum: Any,
+    consumer: CommandStreamConsumer,
+    permit: Any,
+    measured_qpos: np.ndarray,
+    ack: _HandCommandAck,
+    *,
+    mechanical_lower: np.ndarray,
+    mechanical_upper: np.ndarray,
+    max_delta_rad_per_tick: float | np.ndarray,
+    phase_ms: dict[str, float] | None = None,
+) -> None:
+    """Consume at most one ordered FIFO record for the hand this tick.
+
+    At most one SDK send happens per tick — the worker never drains the queue
+    to catch up. The FIFO cursor advances only after the exact endpoint was
+    ACCEPTED; an intermediate slew setpoint or a CRC-unconfirmed send retries
+    the same record on the next tick. A blocked final fence also keeps the
+    record pending (any real revocation advanced the generation and resyncs
+    the cursor). Raises :class:`_HandWorkerFault` for an unsafe target or an
+    SDK rejection; the caller latches the shared fault and exits fail-fast.
+    """
+
+    def _phase(name: str, started_ns: int) -> None:
+        if phase_ms is not None:
+            phase_ms[name] = (time.monotonic_ns() - started_ns) / 1e6
+
+    read_started_ns = time.monotonic_ns()
+    if consumer.resync_if_stale_generation(permit.run_generation):
+        # A new epoch invalidates the queued backlog; re-anchor the
+        # command-space slew reference to fresh measured state.
+        ack.last_sdk_accepted_qpos = measured_qpos.copy()
+    record = consumer.next_record()
+    _phase("command_read", read_started_ns)
+    if record is None:
+        # EMPTY is a wait, never a fault.
+        return
+    command, sequence = record
+    sequence_int = int(sequence)
+    command_generation = int(command["run_generation"][0])
+    if command_generation != permit.run_generation:
+        # A revoked-epoch record: consumed without SDK involvement.
+        consumer.advance()
+        return
+    if not bool(command["hand_present"][0]):
+        # An absent actuator advances only its consumer; no SDK send and no
+        # acceptance is implied.
+        consumer.advance()
+        return
+    prepare_started_ns = time.monotonic_ns()
+    action_id = int(command["action_id"][0])
+    target = np.asarray(command["hand_qpos"][0], dtype=np.float64)
+    issue = check_worker_hand_target(
+        target,
+        mechanical_lower_rad=mechanical_lower,
+        mechanical_upper_rad=mechanical_upper,
+    )
+    bounded: np.ndarray | None = None
+    if issue is None:
+        bounded = _limited_hand_setpoint(
+            target,
+            measured_qpos=measured_qpos,
+            last_sdk_accepted_qpos=ack.last_sdk_accepted_qpos,
+            is_running=permit.state is SafetyState.RUNNING,
+            max_delta_rad_per_tick=max_delta_rad_per_tick,
+        )
+        issue = check_worker_hand_target(
+            bounded,
+            mechanical_lower_rad=mechanical_lower,
+            mechanical_upper_rad=mechanical_upper,
+        )
+    _phase("target_prepare", prepare_started_ns)
+    # This remains the final authority check before the SDK call.
+    fence_started_ns = time.monotonic_ns()
+    allowed = coupled_command_may_cross_sdk(
+        shared, run_generation=command_generation
+    )
+    _phase("command_fence", fence_started_ns)
+    if not allowed:
+        return
+    if issue is not None:
+        raise _HandWorkerFault(f"unsafe action_id={action_id}: {issue}")
+    assert bounded is not None
+    send_started_ns = time.monotonic_ns()
+    send_status = hand.send_action(bounded)
+    _phase("send_command", send_started_ns)
+    ack_started_ns = time.monotonic_ns()
+    if send_status is send_status_enum.ACCEPTED:
+        accepted_now_ns = time.monotonic_ns()
+        ack.last_sdk_accepted_qpos = bounded.copy()
+        ack.last_sdk_setpoint_accepted_monotonic_ns = accepted_now_ns
+        # ACK denotes SDK acceptance of the exact IPC endpoint, not
+        # physical convergence or acceptance of an intermediate step.
+        if np.array_equal(bounded, target):
+            ack.accepted_target_action_id = action_id
+            ack.accepted_target_monotonic_ns = accepted_now_ns
+            ack.accepted_target_generation = command_generation
+            ack.accepted_target_sequence = sequence_int
+            # The exact endpoint was accepted: the record is fully processed
+            # and its FIFO slot is released to the publisher's watermark.
+            consumer.advance()
+        # An intermediate slew setpoint does NOT advance the endpoint cursor;
+        # the same record is retried next tick from the updated command-space
+        # reference.
+    elif send_status is send_status_enum.REJECTED:
+        raise _HandWorkerFault(f"SDK rejected action_id={action_id}")
+    # CRC_UNCONFIRMED deliberately leaves the exact target, the endpoint
+    # cursor, and the command-space reference unacknowledged; the same
+    # record is retried next tick.
+    _phase("command_ack", ack_started_ns)
 
 
 def _safe_disconnect(hand: Any) -> bool:
@@ -101,9 +242,7 @@ def _publish_feedback(
     tactile_calibrated: bool,
     connected: bool,
     read_failed: bool,
-    accepted_target_action_id: int,
-    accepted_target_monotonic_ns: int,
-    last_sdk_setpoint_accepted_monotonic_ns: int,
+    ack: _HandCommandAck,
     commboard_err: np.ndarray,
     jointboard_err: np.ndarray,
     tipboard_err: np.ndarray,
@@ -128,12 +267,12 @@ def _publish_feedback(
     frame["tactile_dense_valid"][0] = int(tactile_calibrated and tactile_dense_valid)
     frame["connected"][0] = int(connected)
     frame["qpos_stale"][0] = int(read_failed)
-    frame["accepted_target_action_id"][0] = int(accepted_target_action_id)
-    frame["accepted_target_monotonic_ns"][0] = int(
-        accepted_target_monotonic_ns
-    )
+    frame["accepted_target_action_id"][0] = int(ack.accepted_target_action_id)
+    frame["accepted_target_monotonic_ns"][0] = int(ack.accepted_target_monotonic_ns)
+    frame["accepted_target_generation"][0] = int(ack.accepted_target_generation)
+    frame["accepted_target_sequence"][0] = int(ack.accepted_target_sequence)
     frame["last_sdk_setpoint_accepted_monotonic_ns"][0] = int(
-        last_sdk_setpoint_accepted_monotonic_ns
+        ack.last_sdk_setpoint_accepted_monotonic_ns
     )
     frame["commboard_err"][0] = commboard_err
     frame["jointboard_err"][0] = jointboard_err
@@ -152,12 +291,6 @@ def hand_loop(
 ) -> None:
     """Run one XHand worker; all SDK objects remain in this process."""
     from dexmani_real.robot.drivers.xhand import XHand, XHandSendStatus
-    from dexmani_real.runtime.safety import (
-        CoupledCommandTicket,
-        SafetyState,
-        coupled_command_ticket_allows_execution,
-        read_motion_permit,
-    )
 
     logger.debug("hand_loop: LOADING")
     hand: XHand | None = None
@@ -189,12 +322,11 @@ def hand_loop(
         last_state = initial_state
         last_source_ns = time.monotonic_ns()
         read_failure_started_s: float | None = None
-        last_sdk_accepted_qpos = initial_state.qpos.copy()
-        accepted_target_action_id = 0
-        accepted_target_monotonic_ns = 0
-        last_sdk_setpoint_accepted_monotonic_ns = 0
-        last_exact_target_sequence = 0
-        command_generation: int | None = None
+        ack = _HandCommandAck(last_sdk_accepted_qpos=initial_state.qpos.copy())
+        # Attach as the hand consumer of the ordered command FIFO before READY
+        # so the publisher's capacity watermark sees this consumer from the
+        # first committable command on.
+        consumer = CommandStreamConsumer(shared, shared.hand_cmd_consumed_sequence)
         _publish_feedback(
             shared,
             qpos=initial_state.qpos,
@@ -206,11 +338,7 @@ def hand_loop(
             tactile_calibrated=hand.tactile_calibrated,
             connected=True,
             read_failed=False,
-            accepted_target_action_id=accepted_target_action_id,
-            accepted_target_monotonic_ns=accepted_target_monotonic_ns,
-            last_sdk_setpoint_accepted_monotonic_ns=(
-                last_sdk_setpoint_accepted_monotonic_ns
-            ),
+            ack=ack,
             commboard_err=initial_state.commboard_err,
             jointboard_err=initial_state.jointboard_err,
             tipboard_err=initial_state.tipboard_err,
@@ -273,11 +401,7 @@ def hand_loop(
                     tactile_calibrated=hand.tactile_calibrated,
                     connected=hand.is_connected,
                     read_failed=True,
-                    accepted_target_action_id=accepted_target_action_id,
-                    accepted_target_monotonic_ns=accepted_target_monotonic_ns,
-                    last_sdk_setpoint_accepted_monotonic_ns=(
-                        last_sdk_setpoint_accepted_monotonic_ns
-                    ),
+                    ack=ack,
                     commboard_err=last_state.commboard_err,
                     jointboard_err=last_state.jointboard_err,
                     tipboard_err=last_state.tipboard_err,
@@ -322,11 +446,7 @@ def hand_loop(
                 tactile_calibrated=hand.tactile_calibrated,
                 connected=hand.is_connected,
                 read_failed=False,
-                accepted_target_action_id=accepted_target_action_id,
-                accepted_target_monotonic_ns=accepted_target_monotonic_ns,
-                last_sdk_setpoint_accepted_monotonic_ns=(
-                    last_sdk_setpoint_accepted_monotonic_ns
-                ),
+                ack=ack,
                 commboard_err=state.commboard_err,
                 jointboard_err=state.jointboard_err,
                 tipboard_err=state.tipboard_err,
@@ -336,106 +456,30 @@ def hand_loop(
                 time.monotonic_ns() - feedback_started_ns
             ) / 1e6
 
-            command_read_started_ns = time.monotonic_ns()
-            result = shared.coupled_cmd_ring.read_latest()
-            phase_ms["command_read"] = (
-                time.monotonic_ns() - command_read_started_ns
-            ) / 1e6
-            if result is None:
-                wait_for_tick()
-                continue
-            command, _published_ns, sequence = result
-            sequence_int = int(sequence)
-            if not bool(command["hand_present"][0]):
-                wait_for_tick()
-                continue
-            ticket = CoupledCommandTicket(
-                run_generation=int(command["run_generation"][0]),
-                ring_sequence=sequence_int,
-                valid_until_monotonic_ns=int(command["valid_until_monotonic_ns"][0]),
-            )
             permit_started_ns = time.monotonic_ns()
             permit = read_motion_permit(shared)
             phase_ms["permit_read"] = (time.monotonic_ns() - permit_started_ns) / 1e6
-            if permit.run_generation != ticket.run_generation:
+            if not permit.allows_motion or shared.error_state.value:
                 wait_for_tick()
                 continue
-            if permit.run_generation != command_generation:
-                last_exact_target_sequence = 0
-                last_sdk_accepted_qpos = state.qpos.copy()
-                command_generation = permit.run_generation
-            if sequence_int == last_exact_target_sequence:
-                # An accepted exact target is an endpoint event, not a
-                # level-triggered command.  Retries remain allowed only until
-                # the SDK has accepted the exact endpoint.
-                wait_for_tick()
-                continue
-            target_started_ns = time.monotonic_ns()
-            action_id = int(command["action_id"][0])
-            target = np.asarray(command["hand_qpos"][0], dtype=np.float64)
-            issue = check_worker_hand_target(
-                target,
-                mechanical_lower_rad=mechanical_lower,
-                mechanical_upper_rad=mechanical_upper,
-            )
-            bounded: np.ndarray | None = None
-            if issue is None:
-                bounded = _limited_hand_setpoint(
-                    target,
-                    measured_qpos=state.qpos,
-                    last_sdk_accepted_qpos=last_sdk_accepted_qpos,
-                    is_running=permit.state is SafetyState.RUNNING,
+            try:
+                _consume_one_hand_command(
+                    shared,
+                    hand,
+                    XHandSendStatus,
+                    consumer,
+                    permit,
+                    state.qpos,
+                    ack,
+                    mechanical_lower=mechanical_lower,
+                    mechanical_upper=mechanical_upper,
                     max_delta_rad_per_tick=config.hand_max_delta_rad_per_tick,
+                    phase_ms=phase_ms,
                 )
-                issue = check_worker_hand_target(
-                    bounded,
-                    mechanical_lower_rad=mechanical_lower,
-                    mechanical_upper_rad=mechanical_upper,
-                )
-            fence_started_ns = time.monotonic_ns()
-            phase_ms["target_prepare"] = (fence_started_ns - target_started_ns) / 1e6
-            # This remains the final authority check before the SDK call.
-            # Timing the check includes any motion-lock wait, not just lock hold.
-            allowed = coupled_command_ticket_allows_execution(shared, ticket=ticket)
-            phase_ms["command_fence"] = (
-                time.monotonic_ns() - fence_started_ns
-            ) / 1e6
-            if not allowed:
-                wait_for_tick()
-                continue
-            if issue is not None:
-                logger.error(
-                    "hand_loop: unsafe action_id=%d: %s; latching runtime fault",
-                    action_id,
-                    issue,
-                )
+            except _HandWorkerFault as exc:
+                logger.error("hand_loop: %s; latching runtime fault", exc)
                 shared.error_state.value = True
                 return
-            assert bounded is not None
-            send_started_ns = time.monotonic_ns()
-            send_status = hand.send_action(bounded)
-            ack_started_ns = time.monotonic_ns()
-            phase_ms["send_command"] = (ack_started_ns - send_started_ns) / 1e6
-            if send_status is XHandSendStatus.ACCEPTED:
-                accepted_now_ns = time.monotonic_ns()
-                last_sdk_accepted_qpos = bounded.copy()
-                last_sdk_setpoint_accepted_monotonic_ns = accepted_now_ns
-                # ACK denotes SDK acceptance of the exact IPC endpoint, not
-                # physical convergence or acceptance of an intermediate step.
-                if np.array_equal(bounded, target):
-                    accepted_target_action_id = action_id
-                    accepted_target_monotonic_ns = accepted_now_ns
-                    last_exact_target_sequence = sequence_int
-            elif send_status is XHandSendStatus.REJECTED:
-                logger.error(
-                    "hand_loop: SDK rejected action_id=%d; latching runtime fault",
-                    action_id,
-                )
-                shared.error_state.value = True
-                return
-            # CRC_UNCONFIRMED deliberately leaves both the action and its
-            # command-space reference unacknowledged.
-            phase_ms["command_ack"] = (time.monotonic_ns() - ack_started_ns) / 1e6
 
             wait_for_tick()
     finally:

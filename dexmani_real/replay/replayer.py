@@ -13,6 +13,9 @@ import numpy as np
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.control.hand_homing import initialize_hand_home
 from dexmani_real.control.publication import (
+    PUBLISH_REASON_FIFO_FULL,
+    PublishResult,
+    PublishWaitTracker,
     prepare_joint_command,
     publish_command,
     wait_command_accepted,
@@ -180,6 +183,7 @@ class EpisodeReplayer:
         self._reason = ""
         self._hand_available = trajectory.has_hand
         self._frame_count = trajectory.num_frames
+        self._fifo_wait = PublishWaitTracker("replay")
 
     def _make_planner(
         self, workspace: np.ndarray, *, table: Any | None
@@ -371,7 +375,6 @@ class EpisodeReplayer:
             self.traj.action_hand_joint[0],
             gate=self._start_warmup_gate,
             is_hold=True,
-            action_validity_s=_START_HAND_WARMUP_S,
             arm_feedback_max_age_s=float(self.runtime.safety.heartbeat_timeouts["arm"]),
             hand_feedback_max_age_s=float(
                 self.runtime.safety.heartbeat_timeouts["hand"]
@@ -379,10 +382,11 @@ class EpisodeReplayer:
         )
         candidate = prepared.candidate
         published = (
-            publish_command(
-                self.shared,
+            self._publish_command_with_backpressure(
                 candidate,
-                required_safety_state=SafetyState.ARMED,
+                required_state=SafetyState.ARMED,
+                deadline_s=time.monotonic() + _START_HAND_WARMUP_S,
+                keyboard=keyboard,
             )
             if candidate is not None
             else None
@@ -516,6 +520,41 @@ class EpisodeReplayer:
             self._reason = "operator quit after entering command quiescence"
             return False
         return True
+
+    def _publish_command_with_backpressure(
+        self,
+        candidate: Any,
+        *,
+        required_state: SafetyState,
+        deadline_s: float,
+        keyboard: KeyboardInput,
+    ) -> PublishResult:
+        """Commit the identical candidate, retrying while the FIFO is FULL.
+
+        Bounded by the enclosing operation's deadline; Q/ESC and runtime
+        health keep priority through ``_poll_control`` between retries. The
+        candidate is never rebuilt, re-gated, or replaced here.
+        """
+        result = publish_command(
+            self.shared, candidate, required_safety_state=required_state
+        )
+        while (
+            not result.published
+            and result.reason == PUBLISH_REASON_FIFO_FULL
+            and time.monotonic() < deadline_s
+            and self._running
+        ):
+            self._fifo_wait.note_full(result.fifo_depth, int(candidate.action_id))
+            if not self._poll_control(keyboard, _WAIT_POLL_INTERVAL_S):
+                break
+            result = publish_command(
+                self.shared, candidate, required_safety_state=required_state
+            )
+        if result.published:
+            self._fifo_wait.note_committed()
+        elif result.reason == PUBLISH_REASON_FIFO_FULL:
+            self._fifo_wait.note_dropped("replay publish deadline")
+        return result
 
     def _wait_until_deadline(
         self, keyboard: KeyboardInput, deadline_s: float
@@ -698,10 +737,14 @@ class EpisodeReplayer:
                 )
                 candidate = prepared.candidate
                 published = (
-                    publish_command(
-                        self.shared,
+                    self._publish_command_with_backpressure(
                         candidate,
-                        required_safety_state=SafetyState.RUNNING,
+                        required_state=SafetyState.RUNNING,
+                        # The operation boundary is Q/ESC/runtime health, not a
+                        # per-frame deadline: honest backpressure may slow the
+                        # replay, never silently drop or replace a frame.
+                        deadline_s=float("inf"),
+                        keyboard=keyboard,
                     )
                     if candidate is not None
                     else None
@@ -712,11 +755,11 @@ class EpisodeReplayer:
                     and candidate is not None
                     and published is not None
                     and published.published
-                    and published.ticket is not None
+                    and published.command is not None
                 ):
                     accepted = wait_command_accepted(
                         self.shared,
-                        ticket=published.ticket,
+                        command=published.command,
                         action_id=candidate.action_id,
                         wait_for_arm=True,
                         wait_for_hand=candidate.hand_qpos is not None,

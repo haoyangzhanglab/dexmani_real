@@ -173,7 +173,9 @@ class RuntimeChannels:
     vr_ring: SharedMemoryRingBuffer  # vr -> policy
     arm_state_ring: SharedMemoryRingBuffer  # arm -> policy
     hand_state_ring: SharedMemoryRingBuffer  # hand -> policy
-    coupled_cmd_ring: SharedMemoryRingBuffer  # serialized control -> arm/hand endpoint
+    coupled_cmd_ring: (
+        SharedMemoryRingBuffer  # bounded ordered control -> arm/hand command FIFO
+    )
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> policy
 
@@ -188,6 +190,17 @@ class RuntimeChannels:
     run_generation: Any  # controller advances it to invalidate old policy proposals
     run_started_monotonic_ns: Any  # start of the current RUNNING observation epoch
     recorder_consumed_sequence: Any
+    # Ordered command-FIFO consumption watermarks (one per attached worker
+    # consumer; -1 means the consumer never attached and it is excluded from
+    # the capacity watermark). The owning worker is the sole writer; the
+    # publisher reads them under motion_lock to decide FULL backpressure.
+    arm_cmd_consumed_sequence: Any
+    hand_cmd_consumed_sequence: Any
+    # Last committed FIFO sequence when the current run_generation began
+    # (b-1 for the epoch's first sequence b). Updated under motion_lock with
+    # every generation advance; clamps stale consumer watermarks so a late
+    # old-generation update cannot hold back a new epoch.
+    run_generation_base_sequence: Any
 
     is_running: Any  # Main -> all
     is_recording: Any  # policy -> arm/hand/camera
@@ -330,6 +343,9 @@ class RuntimeChannels:
         storage.run_generation = ctx.Value("Q", 1)
         storage.run_started_monotonic_ns = ctx.Value("Q", 0)
         storage.recorder_consumed_sequence = ctx.Value("Q", 0)
+        storage.arm_cmd_consumed_sequence = ctx.Value("q", -1)
+        storage.hand_cmd_consumed_sequence = ctx.Value("q", -1)
+        storage.run_generation_base_sequence = ctx.Value("Q", 0)
 
         storage.is_running = ctx.Value("b", True)
         storage.is_recording = ctx.Value("b", False)
@@ -463,8 +479,8 @@ def read_arm_state_dict(shared: "RuntimeChannels") -> "dict | None":
     """Read latest arm state from ring. Return dict of numpy arrays or None.
 
     Fields: qpos(7), qvel(7), tau(7), error_code, connected, tracking_err,
-            last_cmd_seq, last_cmd_is_hold, source/publish timestamps,
-            state_valid.
+            last_cmd_seq, last_cmd_generation, last_cmd_accepted_sequence,
+            last_cmd_is_hold, source/publish timestamps, state_valid.
     Callers must validate fields they depend on (e.g. ``np.all(np.isfinite(d["qpos"]))``).
     The EEF pose is not published; derive it from ``qpos`` via
     ``planning.kinematics.arm_fk.make_arm_fk()`` when needed.
@@ -480,6 +496,8 @@ def read_arm_state_dict(shared: "RuntimeChannels") -> "dict | None":
         "connected": bool(data["connected"][0]),
         "tracking_err": float(data["tracking_err"][0]),
         "last_cmd_seq": int(data["last_cmd_seq"][0]),
+        "last_cmd_generation": int(data["last_cmd_generation"][0]),
+        "last_cmd_accepted_sequence": int(data["last_cmd_accepted_sequence"][0]),
         "last_cmd_is_hold": bool(data["last_cmd_is_hold"][0]),
         "source_monotonic_ns": int(data["source_monotonic_ns"][0]),
         "publish_monotonic_ns": int(data["publish_monotonic_ns"][0]),
