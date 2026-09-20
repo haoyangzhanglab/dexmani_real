@@ -290,7 +290,6 @@ rollouts/<policy>/<task>/<experiment>/session_*/
 其中保存 raw rollout 数据和 resolved run configuration。同步推理期间采样 hook 暂停，
 记录保留实际时间戳，不补造样本；动作记录后一个控制周期内不追加普通 held 行。
 固定 FPS 的 `rgb.mp4` 不代表真实控制时间，时序分析以 HDF5 `timestamp` 为准。
-不生成异步 prediction trace sidecar。
 
 每个真正 begin 的 trial 结束时恰好计一次（与保存 episode 数独立）；录制（evidence）失败
 会使会话最终结果非零，但不会结束当前 trial 或取消剩余 trials。证据服务不可用、START
@@ -303,13 +302,11 @@ recording status 和 cleanup status；资源已确认释放与会话总体成功
 
 Policy deployment 使用与 teleoperation / replay 相同的 runtime safety 与 command publication infrastructure。命令经单一 owner 的软投影（2π canonicalization、操作关节界限、软命令步长一次裁剪）后进入有界有序命令 FIFO；FIFO 满时是 non-blocking 可恢复背压，producer 保留同一 candidate 按主循环节奏重试。robot worker 在硬件边界只保留硬限位等最终检查，不重复拒绝同一软阈值。普通 IK 无解或 workspace miss 只丢弃未发布的 chunk 后缀，并在同一 trial 内重新观测（已提交前缀与命令连续性参考保留）；模型/合同违规与硬件故障才会结束 rollout。未执行动作不会被视作已完成的物理进度。
 
-已有 legacy policy trace sidecar 的旧 rollout 可使用：
+Rollout 与 demonstration 共用 raw episode viewer：
 
 ```bash
-python examples/visualize_policy_rollout.py <rollout-episode> --info
+python examples/visualize_episode.py <rollout-episode> --info
 ```
-
-进行离线检查；没有 trace sidecar 的同步 rollout 会显示 raw 基本信息并指向 raw viewer，不会仅因缺少 trace 判定数据损坏。
 
 ## Calibration
 

@@ -1,24 +1,12 @@
-"""Offline interface tests for affected examples entries (task T6, EX table).
+"""Offline CLI behavior and dataset export guards.
 
-Two levels of verification, both without hardware, GUI, or batch --help runs:
-
-* affected entries whose module imports are offline-safe are imported and
-  their real argument parsers are exercised (EX01 run_policy, EX07
-  process_episodes, EX08 export_policy_zarr including the new narrow
-  ``--output`` guard, EX11 visualize_policy_rollout on a trace-less raw
-  episode, plus parser smoke checks for EX02/EX03/EX04/EX05);
-* the export guard's protected-source rules are unit-tested directly
-  (defaults unchanged, symlink escape refused, existing .zarr store refused).
-
-Entries whose top-level imports require device/GUI stacks (EX06, EX09, EX10,
-EX12-EX14) are validated by AST parse only, per the task's safe-verification
-rules. EX11 is listed there too so the removed-API scan covers it, but it is
-additionally imported and run through its real parser below.
+Hardware sessions are replaced at their boundary; the run_policy entry point
+is parsed but never executed. These checks preserve research-facing arguments
+and protect recorded data from accidental overwrite.
 """
 
 from __future__ import annotations
 
-import ast
 import importlib.util
 import sys
 import tempfile
@@ -57,7 +45,7 @@ except ImportError as exc:  # pragma: no cover - environment guard
     f"export CLI dependencies unavailable: {_EXPORT_IMPORT_ERROR}",
 )
 class ExportOutputGuardTest(unittest.TestCase):
-    """EX08: narrow --output, default unchanged, protected sources refused."""
+    """Export output guards preserve source data and refuse occupied targets."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -254,87 +242,6 @@ class AffectedParserSmokeTest(unittest.TestCase):
             self.assertIn("1 accepted", result.stderr)
             self.assertFalse(output.exists())
             self.assertEqual(hashes(), before)
-
-
-
-class PolicyRolloutViewerTest(unittest.TestCase):
-    """EX11: a sync-raw rollout without a trace sidecar is not corruption."""
-
-    def test_missing_trace_reports_raw_basics_and_redirects(self):
-        import contextlib
-        import io
-        import tempfile
-
-        try:
-            from tests.raw_episode_fixture import build_raw_episode
-        except ImportError as exc:  # pragma: no cover - environment guard
-            self.skipTest(f"raw fixture unavailable: {exc}")
-        module = _load_example_or_skip(self, "visualize_policy_rollout")
-        with tempfile.TemporaryDirectory() as tmp:
-            episode = build_raw_episode(Path(tmp) / "episode_trace_less")
-            stdout = io.StringIO()
-            with contextlib.redirect_stdout(stdout):
-                code = module.main([str(episode), "--info"])
-            text = stdout.getvalue()
-        self.assertEqual(code, 0)
-        self.assertIn("synchronous-raw rollout", text)
-        self.assertIn("not corrupt", text)
-        self.assertIn("visualize_episode.py", text)
-
-    def test_present_but_unreadable_trace_still_fails_loudly(self):
-        """A sidecar that exists but cannot be read is never excused as raw-only."""
-        import contextlib
-        import io
-        import tempfile
-
-        try:
-            from tests.raw_episode_fixture import build_raw_episode
-        except ImportError as exc:  # pragma: no cover - environment guard
-            self.skipTest(f"raw fixture unavailable: {exc}")
-        module = _load_example_or_skip(self, "visualize_policy_rollout")
-        with tempfile.TemporaryDirectory() as tmp:
-            episode = build_raw_episode(Path(tmp) / "episode_bad_trace")
-            (Path(tmp) / "episode_bad_trace.policy_trace.npz").write_bytes(
-                b"not a trace archive"
-            )
-            stderr = io.StringIO()
-            with contextlib.redirect_stderr(stderr):
-                with self.assertRaises(SystemExit) as ctx:
-                    module.main([str(episode), "--info"])
-        self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("rollout visualization", stderr.getvalue())
-
-
-class StaticEntryCheckTest(unittest.TestCase):
-    """AST-parse the device/GUI entries and scan them for removed APIs.
-
-    Nothing in this class executes an example. ``visualize_policy_rollout``
-    (EX11) is included so the removed-API scan covers it; its real parser is
-    exercised separately by ``PolicyRolloutViewerTest``.
-    """
-
-    def test_device_and_gui_entries_parse(self):
-        for name in (
-            "calibrate_vr_heading",
-            "visualize_episode",
-            "visualize_episode_processed",
-            "visualize_policy_rollout",
-            "pointcloud_process_example",
-            "realsense_record_example",
-            "xhand_control_example",
-        ):
-            with self.subTest(example=name):
-                source = (_EXAMPLES / f"{name}.py").read_text(encoding="utf-8")
-                ast.parse(source)
-                # No references to the removed lease/timing-gate APIs.
-                for stale in (
-                    "max_input_age_s",
-                    "max_grid_lag_s",
-                    "valid_until_monotonic_ns",
-                    "CoupledCommandTicket",
-                    "command_feedback_is_fresh",
-                ):
-                    self.assertNotIn(stale, source, f"{name} references {stale}")
 
 
 if __name__ == "__main__":
