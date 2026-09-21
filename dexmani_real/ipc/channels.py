@@ -184,9 +184,6 @@ class RuntimeChannels:
     arm_home_completed_generation: Any
     record_control_q: mp.Queue  # policy -> RecorderIO episode boundaries
     record_result_q: mp.Queue  # RecorderIO -> RecorderClient (sole consumer)
-    arm_command_seq: (
-        Any  # all actuator-action producers -> globally unique monotonic IDs
-    )
     run_generation: Any  # controller advances it to invalidate old policy proposals
     run_started_monotonic_ns: Any  # start of the current RUNNING observation epoch
     # Latest software RUNNING terminal snapshot; safety owns writes under motion_lock.
@@ -346,7 +343,6 @@ class RuntimeChannels:
         storage.arm_home_completed_generation = ctx.Value("Q", 0)
         storage.record_control_q = ctx.Queue(maxsize=8)
         storage.record_result_q = ctx.Queue(maxsize=8)
-        storage.arm_command_seq = ctx.Value("Q", 0)
         storage.run_generation = ctx.Value("Q", 1)
         storage.run_started_monotonic_ns = ctx.Value("Q", 0)
         storage.run_started_generation = ctx.Value("Q", 0)
@@ -492,7 +488,7 @@ def read_arm_state_dict(shared: "RuntimeChannels") -> "dict | None":
     """Read latest arm state from ring. Return dict of numpy arrays or None.
 
     Fields: qpos(7), qvel(7), tau(7), error_code, connected, tracking_err,
-            last_cmd_seq, last_cmd_generation, last_cmd_accepted_sequence,
+            last_cmd_generation, last_cmd_accepted_sequence,
             last_cmd_is_hold, source/publish timestamps, state_valid.
     Callers must validate fields they depend on (e.g. ``np.all(np.isfinite(d["qpos"]))``).
     The EEF pose is not published; derive it from ``qpos`` via
@@ -508,7 +504,6 @@ def read_arm_state_dict(shared: "RuntimeChannels") -> "dict | None":
         "error_code": int(data["error_code"][0]),
         "connected": bool(data["connected"][0]),
         "tracking_err": float(data["tracking_err"][0]),
-        "last_cmd_seq": int(data["last_cmd_seq"][0]),
         "last_cmd_generation": int(data["last_cmd_generation"][0]),
         "last_cmd_accepted_sequence": int(data["last_cmd_accepted_sequence"][0]),
         "last_cmd_is_hold": bool(data["last_cmd_is_hold"][0]),
@@ -536,7 +531,6 @@ def read_hand_state_dict(shared: "RuntimeChannels") -> "dict | None":
         "tactile_dense_valid": bool(data["tactile_dense_valid"][0]),
         "connected": bool(data["connected"][0]),
         "qpos_stale": bool(data["qpos_stale"][0]),
-        "accepted_target_action_id": int(data["accepted_target_action_id"][0]),
         "last_sdk_setpoint_accepted_monotonic_ns": int(
             data["last_sdk_setpoint_accepted_monotonic_ns"][0]
         ),

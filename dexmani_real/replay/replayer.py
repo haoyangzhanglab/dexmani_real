@@ -545,7 +545,7 @@ class EpisodeReplayer:
             and time.monotonic() < deadline_s
             and self._running
         ):
-            self._fifo_wait.note_full(result.fifo_depth, int(candidate.action_id))
+            self._fifo_wait.note_full(result.fifo_depth)
             if not self._poll_control(keyboard, _WAIT_POLL_INTERVAL_S):
                 stopped = True
                 break
@@ -769,7 +769,6 @@ class EpisodeReplayer:
                     accepted = wait_command_accepted(
                         self.shared,
                         command=published.command,
-                        action_id=candidate.action_id,
                         wait_for_arm=True,
                         wait_for_hand=candidate.hand_qpos is not None,
                         timeout_s=float(self.runtime.policy.action_apply_timeout_s),

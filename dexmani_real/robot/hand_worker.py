@@ -49,7 +49,6 @@ class _HandCommandAck:
     """Exact-endpoint acceptance identity and command-space slew reference."""
 
     last_sdk_accepted_qpos: np.ndarray
-    accepted_target_action_id: int = 0
     accepted_target_monotonic_ns: int = 0
     accepted_target_generation: int = 0
     accepted_target_sequence: int = 0
@@ -129,7 +128,6 @@ def _consume_one_hand_command(
         consumer.advance()
         return
     prepare_started_ns = time.monotonic_ns()
-    action_id = int(command["action_id"][0])
     target = np.asarray(command["hand_qpos"][0], dtype=np.float64)
     issue = check_worker_hand_target(
         target,
@@ -160,7 +158,7 @@ def _consume_one_hand_command(
     if not allowed:
         return
     if issue is not None:
-        raise _HandWorkerFault(f"unsafe action_id={action_id}: {issue}")
+        raise _HandWorkerFault(f"unsafe sequence={sequence}: {issue}")
     assert bounded is not None
     send_started_ns = time.monotonic_ns()
     send_status = hand.send_action(bounded)
@@ -173,7 +171,6 @@ def _consume_one_hand_command(
         # ACK denotes SDK acceptance of the exact IPC endpoint, not
         # physical convergence or acceptance of an intermediate step.
         if np.array_equal(bounded, target):
-            ack.accepted_target_action_id = action_id
             ack.accepted_target_monotonic_ns = accepted_now_ns
             ack.accepted_target_generation = command_generation
             ack.accepted_target_sequence = sequence_int
@@ -184,7 +181,7 @@ def _consume_one_hand_command(
         # the same record is retried next tick from the updated command-space
         # reference.
     elif send_status is send_status_enum.REJECTED:
-        raise _HandWorkerFault(f"SDK rejected action_id={action_id}")
+        raise _HandWorkerFault(f"SDK rejected sequence={sequence}")
     # CRC_UNCONFIRMED deliberately leaves the exact target, the endpoint
     # cursor, and the command-space reference unacknowledged; the same
     # record is retried next tick.
@@ -265,7 +262,6 @@ def _publish_feedback(
     frame["tactile_dense_valid"][0] = int(tactile_calibrated and tactile_dense_valid)
     frame["connected"][0] = int(connected)
     frame["qpos_stale"][0] = int(read_failed)
-    frame["accepted_target_action_id"][0] = int(ack.accepted_target_action_id)
     frame["accepted_target_monotonic_ns"][0] = int(ack.accepted_target_monotonic_ns)
     frame["accepted_target_generation"][0] = int(ack.accepted_target_generation)
     frame["accepted_target_sequence"][0] = int(ack.accepted_target_sequence)

@@ -1,7 +1,7 @@
 """Process-local observation windows for the deployment runtime.
 
 These types never enter RuntimeChannels and therefore carry no
-IPC dtype. They are the ``PolicyRuntime`` input contract.
+IPC dtype. The model receives only an ordered mapping of NumPy arrays.
 
 Shared-memory readers take ownership copies. The builder owns temporal and
 payload admission; these process-local containers only carry assembled values.
@@ -32,20 +32,6 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 
-@dataclass(frozen=True)
-class PolicyObservation:
-    """Narrow NumPy boundary passed to a Policy runtime.
-
-    Mapping insertion order is the validated Policy modality order. Arrays are
-    C-contiguous, writeable, policy-process-owned model inputs.
-    """
-
-    observation_id: int
-    run_generation: int
-    anchor_monotonic_ns: int
-    latest_source_monotonic_ns: int
-    logical_step_monotonic_ns: int
-    arrays: Mapping[str, np.ndarray]
 
 
 def _validate_finite(array: np.ndarray, *, name: str) -> None:
@@ -1016,7 +1002,7 @@ def _to_policy_observation(
     fingertip_runtime: (
         tuple[object, HandKinematics | None, FingertipAssemblerConfig | None] | None
     ) = None,
-) -> PolicyObservation:
+) -> dict[str, np.ndarray]:
     """Project typed ring readers into the exact public Policy array mapping."""
     field_names = tuple(field.name for field in policy_spec.observation_fields)
     if observation.arm_history is None or observation.hand_history is None:
@@ -1078,12 +1064,5 @@ def _to_policy_observation(
             )
     ordered = {name: arrays[name] for name in field_names}
     for name, values in ordered.items():
-        _validate_finite(values, name=f"PolicyObservation.{name}")
-    return PolicyObservation(
-        observation_id=observation.observation_id,
-        run_generation=observation.run_generation,
-        anchor_monotonic_ns=observation.anchor_monotonic_ns,
-        latest_source_monotonic_ns=observation.latest_source_monotonic_ns,
-        logical_step_monotonic_ns=observation.logical_step_monotonic_ns,
-        arrays=ordered,
-    )
+        _validate_finite(values, name=f"policy observation {name}")
+    return ordered

@@ -65,7 +65,6 @@ def _state(timestamp_s: float) -> EpisodeState:
         hand_connected=True,
         timestamp=timestamp_s,
         hand_current=np.zeros(12, dtype=np.float64),
-        arm_last_cmd_seq=0,
     )
 
 

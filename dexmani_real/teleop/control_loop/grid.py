@@ -192,7 +192,7 @@ def _drop_pending_publish(
         return
     controller.pending_publish = None
     logger.warning(
-        "[DROP] teleop action=%d reason=%s", pending.candidate.action_id, reason
+        "[DROP] teleop pending command reason=%s", reason
     )
     # The action owner already reported this cancellation; close the span once.
     resources.fifo_wait.note_dropped(reason, report=False)
@@ -776,11 +776,10 @@ def _confirm_terminal_arm_acceptance_if_needed(
     ):
         return True
     assert publication.published and publication.command is not None
-    assert candidate.arm_qpos is not None and candidate.action_id > 0
+    assert candidate.arm_qpos is not None
     acceptance = wait_command_accepted(
         shared,
         command=publication.command,
-        action_id=candidate.action_id,
         wait_for_arm=True,
         wait_for_hand=False,
         timeout_s=float(cfg.runtime.policy.action_apply_timeout_s),
@@ -834,7 +833,7 @@ def _commit_pending_command(
     )
     if not result.published:
         if result.reason == PUBLISH_REASON_FIFO_FULL:
-            resources.fifo_wait.note_full(result.fifo_depth, candidate.action_id)
+            resources.fifo_wait.note_full(result.fifo_depth)
             _record_grid_hold(
                 controller,
                 shared,
@@ -1128,8 +1127,7 @@ def _publish_solved_action(
         # §4/V19). A retained FULL candidate is never re-projected, so this
         # cannot repeat within one span.
         logger.info(
-            "[CLIP] action=%d arm_max_delta_rad=%.3f joint=%d",
-            int(prepared.candidate.action_id),
+            "[CLIP] arm_max_delta_rad=%.3f joint=%d",
             arm_clip.max_abs_delta_rad,
             arm_clip.joint,
         )

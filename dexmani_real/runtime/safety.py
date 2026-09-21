@@ -286,19 +286,9 @@ def publish_coupled_command_if_motion_permitted(
     the producer keeps the identical prepared candidate and retries from its
     main loop — queued records are never dropped or superseded here.
     """
-    names = getattr(getattr(frame, "dtype", None), "names", None) or ()
-    required_fields = {
-        "run_generation",
-        "action_id",
-        "arm_present",
-        "hand_present",
-    }
-    if getattr(frame, "shape", None) != (1,) or not required_fields.issubset(names):
-        raise ValueError("coupled command frame is malformed")
     frame_generation = int(frame["run_generation"][0])
-    action_id = int(frame["action_id"][0])
     controls_actuator = bool(frame["arm_present"][0]) or bool(frame["hand_present"][0])
-    if frame_generation != int(expected_run_generation) or action_id <= 0:
+    if frame_generation != int(expected_run_generation):
         raise ValueError(
             "coupled command identity does not match its publication permit"
         )

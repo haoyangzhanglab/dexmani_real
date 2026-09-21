@@ -93,7 +93,6 @@ from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.runtime.safety import SafetyState, require_transition
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
 from dexmani_real.runtime.operator_input import KeyboardInput
-from dexmani_real.runtime.processes import ProcessSpec, build_processes, start_processes
 from dexmani_real.utils.feedback import validate_arm_feedback
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
@@ -834,20 +833,15 @@ def run_camera_calibration(
     processes: list[Any] = []
     exit_code = 1
     try:
-        specs = [
-            ProcessSpec(
-                "arm-calib",
-                arm_loop,
-                (shared, runtime.arm),
-                ready_name="arm",
-            )
+        processes = [
+            ctx.Process(name="arm", target=arm_loop, args=(shared, runtime.arm))
         ]
-        processes = build_processes(ctx, specs)
-        start_processes(processes)
+        for process in processes:
+            process.start()
         arm_process = processes[0]
         if not wait_subsystem_ready(
             shared,
-            list(zip(specs, processes)),
+            processes,
             runtime.safety.readiness_timeouts_s,
         ):
             set_calibration_fault(shared, "arm worker did not become ready")

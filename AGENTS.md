@@ -1,143 +1,66 @@
-# AGENTS.md — DexMani Real Engineering Contract
+# Working on DexMani Real
 
-This file is the repository-wide contract for coding agents. It applies throughout
-the repository unless a deeper `AGENTS.md` explicitly overrides it.
+This is a personal PhD research repository for real-robot dexterous data collection
+and learned-policy evaluation, using xArm7, XHand, RealSense and VR/HTS.
+It is not a generic robotics platform or production policy-serving service.
 
-Keep this file stable. It defines how to investigate, modify, and validate the
-repository; it is not an inventory of current modules or runtime parameters.
+## Priorities
 
-## 1. Sources of truth
+Physical safety > experiment correctness > iteration speed > readability >
+generic extensibility > enterprise robustness.
 
-Separate current system behavior from agent policy:
+Prefer delete, then inline, then merge, then rewrite. Add an abstraction only for
+an actual hardware/resource boundary or demonstrated duplication. A single
+implementation does not need an interface for hypothetical future backends.
+Do not preserve internal wrappers, states, validators or tests merely because
+they already exist. Git history preserves old implementations.
 
-```text
-Current behavior: source code + schemas + resolved configuration → README
-Agent behavior:   AGENTS.md → tool-specific adapters
-```
+## Hardware
 
-Source defines what the system currently does. This file defines how an agent may
-investigate, modify, or execute it. When documentation and implementation disagree,
-verify the current behavior from source/configuration and fix stale documentation
-only when it is in scope.
+Do not execute hardware-affecting code without explicit authorization. This
+includes connection/discovery through a live SDK, robot motion, homing, physical
+replay, teleoperation, policy rollout and calibration writes. Inspect imports,
+constructors and examples before executing them.
 
-Use `README.md` for supported user-facing workflows and repository orientation, not
-as an implementation specification.
+Preserve the actual physical guarantees: mechanical limits, finite SDK inputs,
+actuator speed/step limits, emergency stop, robot error handling, safe disconnect,
+rejection of revoked commands and experiment-required collision/workspace checks.
+Each guarantee needs a clear owner, not repeated checks in every layer.
+Generation/freshness mechanisms may be simplified only after tracing the race or
+physical hazard they currently prevent, not merely because their names look complex.
+Keep live SDK objects in their owning process. Imports and ordinary constructors
+must not connect devices. Never report offline checks as hardware validation.
 
-## 2. Hardware safety
+## Changes
 
-DexMani Real controls physical robotics hardware. Do not execute hardware-affecting
-code unless the user explicitly authorizes that operation.
+Before editing, inspect `git status --short` and preserve unrelated changes.
+Trace definition → producer → transformation → consumer → side effect from actual
+entry points. Read both sides of changed process, policy, robot and storage boundaries.
+Source and resolved configuration define current behavior; update stale docs.
 
-Hardware-affecting behavior includes device connection or discovery that opens a
-live SDK/device, robot motion, homing, teleoperation, physical replay, policy
-rollout, and calibration writes. Treat `examples/`, imports, constructors, and
-helper scripts as potentially hardware-affecting until their execution path is
-inspected.
+Validate external inputs at their owning boundaries. Do not revalidate structures
+just constructed internally or wrap exceptions without a real recovery decision.
+Preserve units, coordinate frames, action timing, sensor validity and actual
+scientific data. Do not silently reinterpret an existing persisted field.
+When old data needs conversion, prefer an explicit offline conversion over runtime
+compatibility branches. Use `dexmani_policy` public interfaces.
 
-- Prefer source inspection and offline checks during normal development.
-- Do not bypass or weaken existing safety, collision, freshness, lifecycle,
-  generation, command-validation, or fail-closed boundaries to make a change pass.
-- Keep live SDK objects inside their owning driver/worker boundary; do not move them
-  across process boundaries.
-- Keep live device acquisition and robot commands behind explicit lifecycle methods;
-  ordinary imports and constructors should not open devices or command hardware.
-- Never claim hardware validation unless real hardware was actually exercised.
-- Report hardware/CUDA/device validation separately from offline validation.
+## Checks and handoff
 
-## 3. Working method
-
-Before editing a worktree, inspect `git status --short` and preserve unrelated user
-changes. Then inspect the smallest relevant entry point and trace important values
-through the real call/data path:
-
-```text
-definition → producer → transformation → consumer → side effect
-```
-
-For a changed boundary, inspect both sides. Relevant boundaries include process/IPC,
-runtime/storage, policy/control, control/robot, configuration/runtime, and
-user-input/physical side effects.
-
-Confirm behavior from current source, schemas, and resolved configuration rather
-than filenames, comments, historical plans, or stale documentation.
-
-While editing:
-
-- make the smallest coherent change that solves the assigned problem;
-- preserve externally visible behavior unless the task explicitly changes that
-  behavior;
-- avoid speculative features, abstractions, configurability, and nearby cleanup;
-- follow the existing ownership and dependency direction;
-- remove only artifacts made obsolete by the current change;
-- prefer the simplest design that makes ownership, data flow, and failure behavior
-  explicit.
-
-Scope is defined by the requested behavior, not by an arbitrary file count. A small
-vertical change may touch the producer and consumer required to keep one contract
-coherent, but every changed file must be necessary for that same goal.
-
-## 4. Boundaries and ownership
-
-Important mutable resources need one clear owner, especially hardware SDK state,
-process lifecycle, shared state, robot command publication, recording output, and
-model runtime resources.
-
-Validate contracts at their owning boundaries. For robotics/data interfaces, check
-relevant shape, dtype, units, coordinate frame, freshness/lifecycle state, and
-persisted semantics.
-
-Maintain one source of truth for each contract. Do not add fallback defaults or
-parallel interpretations when a canonical configuration/schema already exists.
-
-Treat IPC and persisted-data changes as cross-boundary changes: inspect writers,
-representations, readers, persistence, and downstream consumers. Never silently
-change the meaning of an existing persisted field.
-
-Keep pure computation separate from device/IPC/file side effects when that improves
-ownership and testability, but do not introduce abstraction layers without a real
-boundary or demonstrated duplication.
-
-For adjacent repositories such as `dexmani_policy`, consume public interfaces and
-contracts rather than reaching into private implementation details.
-
-## 5. Verification and handoff
-
-Start with the smallest safe checks relevant to the change. Repository-wide low-cost
-checks are:
+Start with relevant offline tests. Useful low-cost checks are:
 
 ```bash
 python -m compileall -q dexmani_real examples
 git diff --check
-git status --short
 ```
 
-Run focused offline validation that actually exists for the changed subsystem when
-useful. Do not run example programs as tests, and do not invent or restore test
-infrastructure merely to satisfy a generic checklist.
+Protect transforms, FK/IK, retargeting math, dataset conversion, clipping and real
+regressions. Delete tests that only preserve removed bookkeeping or internal APIs;
+do not delete tests to hide failures. Do not build a new test framework as part of
+simplification. Do not run hardware examples as tests.
 
-Before handoff:
-
-1. inspect the focused diff and final worktree status;
-2. check for accidental scope expansion, duplicated logic, hidden ownership, and
-   stale comments/docs introduced by the change;
-3. report what changed, what was validated, and what remains unverified.
-
-A skipped or failed check is not a passing check.
-
-## 6. Documentation discipline
-
-Permanent documentation should contain information with the same lifetime as the
-file that owns it.
-
-- `README.md`: project orientation, setup, canonical user workflows, stable
-  architecture, and user-visible side effects/outputs.
-- `AGENTS.md`: repository-wide agent safety and engineering contract.
-- `CLAUDE.md`: Claude-specific adapter only.
-- `.codex/agents/`: Codex role behavior only.
-- source/config/schema: current implementation details and volatile contracts.
-
-Do not use permanent repository docs or agent prompts as storage for one-off
-implementation plans, incident narratives, generated evidence, migration history,
-experiment statistics, cleanup checklists, or snapshots of schema versions, error
-codes, queue sizes, CLI internals, and other fast-changing implementation facts.
-Use source, Git history, issues/PRs, or experiment artifacts for those records.
+Inspect the final diff for dead imports, configuration, docs and terminology.
+Report measured changes, passing/failed/skipped checks and remaining limitations.
+Keep one-off audits and plans in review artifacts or PRs, not permanent runtime docs.
+README contains setup, workflows and stable ownership; implementation details belong
+in source. Avoid new compatibility adapters and half-migrated internal interfaces.

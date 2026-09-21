@@ -1,12 +1,10 @@
-"""IK candidate generation, filtering, scoring, and canonicalization."""
+"""Joint canonicalization, IK geometry and collision queries used by online IK/home."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-
-from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
     from .arm_fk import XArm7Kinematics
@@ -16,30 +14,6 @@ if TYPE_CHECKING:
 from ..collision import CollisionInfo
 from ..paths import wrap_nearest_equivalent
 from .pose import Pose, ensure_qpos
-
-logger = get_logger(__name__)
-
-# Map freeform reject reason strings → structured diagnostic categories.
-# Used in collect_ik_candidates() to produce reject_by_category summary.
-_REJECT_CATEGORY_MAP: dict[str, str] = {
-    "mplib_ik_failed": "unreachable",
-    "IK candidate outside planning limits.": "limits",
-    "IK candidate exceeds max_ik_delta_deg.": "delta",
-    "IK candidate pose error exceeds threshold.": "pose_error",
-    "IK candidate in self-collision.": "collision",
-    "IK candidate collides with environment.": "collision",
-    "IK candidate collision check failed.": "collision",
-}
-
-
-def _categorize_rejects(reject_counts: dict[str, int]) -> dict[str, int]:
-    """Aggregate freeform reject reason counts into diagnostic categories."""
-    categorized: dict[str, int] = {}
-    for reason, count in reject_counts.items():
-        category = _REJECT_CATEGORY_MAP.get(reason, "other")
-        categorized[category] = categorized.get(category, 0) + count
-    return categorized
-
 
 def is_mplib_success(status: str) -> bool:
     """Canonical MPlib IK status check — True when MPlib reports success.
@@ -51,8 +25,8 @@ def is_mplib_success(status: str) -> bool:
     return status.lower().startswith("success")
 
 
-class IKCandidateSearch:
-    """IK candidate generation, filtering, scoring, and joint canonicalization.
+class IKGeometry:
+    """Joint canonicalization and collision queries shared by online IK and home.
 
     References:
       - LeFranX weighted_ik.cpp
@@ -82,176 +56,6 @@ class IKCandidateSearch:
             return_closest=return_closest,
         )
 
-    def generate_ik_seeds(self, current_qpos: np.ndarray, profile: MotionPlanningConfig) -> list[np.ndarray]:
-        limits = self.resolve_planning_limits(profile, current_qpos)
-        current = self.canonicalize_qpos(current_qpos, current_qpos, limits)
-        seeds: list[np.ndarray] = [current.copy()]
-
-        rng = np.random.default_rng(profile.random_seed)
-        offsets_rad = np.deg2rad(self.profile_array(profile.ik_seed_offsets_deg, "ik_seed_offsets_deg"))
-        for _ in range(profile.num_random_ik_seeds):
-            seed = current + rng.uniform(-offsets_rad, offsets_rad)
-            seed = self.canonicalize_qpos(seed, current, limits)
-            seeds.append(seed)
-        return self.unique_qpos_list(seeds)
-
-    def collect_ik_candidates(
-        self,
-        target_eef_pose_world: Pose,
-        current_qpos: np.ndarray,
-        profile: MotionPlanningConfig,
-    ) -> tuple[list[tuple[np.ndarray, dict[str, Any]]], dict[str, Any]]:
-        target_pose_base = self.kin.world_to_base_pose(target_eef_pose_world)
-        seeds = self.generate_ik_seeds(current_qpos, profile)
-        planning_limits = self.resolve_planning_limits(profile, current_qpos)
-        candidates: list[tuple[np.ndarray, dict[str, Any]]] = []
-        reject_counts: dict[str, int] = {}
-        reject_examples: list[dict[str, Any]] = []
-        raw_success_count = 0
-
-        for seed_index, seed in enumerate(seeds):
-            status, raw_qpos = self.call_mplib_ik(
-                target_pose_base, seed, n_init_qpos=profile.n_init_qpos, return_closest=True
-            )
-            if not is_mplib_success(status) or raw_qpos is None:
-                reason = "mplib_ik_failed"
-                reject_counts[reason] = reject_counts.get(reason, 0) + 1
-                continue
-
-            raw_success_count += 1
-            raw_qpos = np.asarray(raw_qpos, dtype=np.float64)
-            # Reject NaN/Inf even when MPlib reports success.
-            if not np.all(np.isfinite(raw_qpos)):
-                reason = "mplib_ik_failed"
-                reject_counts[reason] = reject_counts.get(reason, 0) + 1
-                continue
-            qpos = self.canonicalize_qpos(raw_qpos, current_qpos, planning_limits)
-            if any(
-                np.max(np.abs(self.compute_qpos_delta(qpos, existing_qpos))) < 1e-4 for existing_qpos, _ in candidates
-            ):
-                reject_counts["duplicate_candidate"] = reject_counts.get("duplicate_candidate", 0) + 1
-                continue
-            valid, report = self.filter_ik_candidate(
-                qpos, raw_qpos, target_eef_pose_world, current_qpos, profile, planning_limits
-            )
-            if valid:
-                report["ik_score"] = self.score_ik_candidate(qpos, current_qpos, report, profile)
-                report["seed_index"] = seed_index
-                candidates.append((qpos.copy(), report))
-                continue
-
-            reason = str(report.get("reason", "rejected"))
-            reject_counts[reason] = reject_counts.get(reason, 0) + 1
-            if len(reject_examples) < 5:
-                reject_examples.append(self.compact_reject_report(seed_index, report))
-
-        candidates.sort(key=lambda item: item[1]["ik_score"])
-        reject_by_category = _categorize_rejects(reject_counts)
-        summary: dict[str, Any] = {
-            "num_seeds": len(seeds),
-            "raw_ik_success_count": raw_success_count,
-            "valid_candidate_count": len(candidates),
-            "returned_candidate_count": min(len(candidates), profile.num_ik_candidates),
-            "reject_counts": reject_counts,
-            "reject_by_category": reject_by_category,
-            "random_seed": profile.random_seed,
-        }
-        if reject_examples:
-            summary["reject_examples"] = reject_examples
-        return candidates[: profile.num_ik_candidates], summary
-
-    def filter_ik_candidate(
-        self,
-        qpos: np.ndarray,
-        raw_qpos: np.ndarray,
-        target_eef_pose_world: Pose,
-        current_qpos: np.ndarray,
-        profile: MotionPlanningConfig,
-        limits: np.ndarray,
-    ) -> tuple[bool, dict[str, Any]]:
-        low, high = limits[:, 0], limits[:, 1]
-        report: dict[str, Any] = {"raw_qpos": raw_qpos.copy()}
-
-        outside, violation = self.limit_violation(qpos, limits)
-        if np.any(outside):
-            indices = np.where(outside)[0]
-            report.update(
-                reason="IK candidate outside planning limits.",
-                outside_joint_indices_1based=(indices + 1).tolist(),
-                max_limit_violation_deg=float(np.rad2deg(np.max(violation[indices]))),
-                qpos_deg=np.rad2deg(qpos.copy()),
-                low_deg=np.rad2deg(low.copy()),
-                high_deg=np.rad2deg(high.copy()),
-            )
-            return False, report
-
-        delta = self.compute_qpos_delta(qpos, current_qpos)
-        max_delta = np.deg2rad(self.profile_array(profile.max_ik_delta_deg, "max_ik_delta_deg"))
-        over_delta = np.abs(delta) > max_delta
-        if np.any(over_delta):
-            indices = np.where(over_delta)[0]
-            violation_delta = np.maximum(np.abs(delta) - max_delta, 0.0)
-            report.update(
-                reason="IK candidate exceeds max_ik_delta_deg.",
-                max_delta_joint_indices_1based=(indices + 1).tolist(),
-                max_delta_violation_deg=float(np.rad2deg(np.max(violation_delta[indices]))),
-            )
-            return False, report
-
-        pose_error_pos, pose_error_rot = self.kin.compute_world_pose_error(target_eef_pose_world, qpos)
-        report.update(
-            pose_error_pos_m=pose_error_pos,
-            pose_error_rot_rad=pose_error_rot,
-            qpos_distance=float(np.linalg.norm(delta)),
-            max_qpos_delta=float(np.max(np.abs(delta))),
-            max_qpos_delta_deg=float(np.rad2deg(np.max(np.abs(delta)))),
-            joint_limit_penalty=self.joint_limit_penalty(qpos, limits),
-        )
-
-        if pose_error_pos > profile.max_pose_error_pos_m or pose_error_rot > profile.max_pose_error_rot_rad:
-            report["reason"] = "IK candidate pose error exceeds threshold."
-            return False, report
-
-        if profile.check_self_collision:
-            try:
-                collision_info = self.check_collision(qpos)
-            except Exception as exc:
-                logger.warning("IK candidate collision check failed closed", exc_info=True)
-                report.update(reason="IK candidate collision check failed.", collision_check_error=str(exc))
-                return False, report
-            if collision_info:
-                pairs = collision_info.collision_pairs
-                is_environment = bool(pairs) and pairs[0].collision_type == "environment"
-                report["reason"] = (
-                    "IK candidate collides with environment." if is_environment else "IK candidate in self-collision."
-                )
-                report["collision"] = collision_info.to_dict()
-                return False, report
-
-        return True, report
-
-    def score_ik_candidate(
-        self, qpos: np.ndarray, current_qpos: np.ndarray, report: dict[str, Any], profile: MotionPlanningConfig
-    ) -> float:
-        delta = self.compute_qpos_delta(qpos, current_qpos)
-        joint_cost = float(np.linalg.norm(delta) + 0.5 * np.max(np.abs(delta)))
-        pose_cost = float(report.get("pose_error_pos_m", 0.0) + report.get("pose_error_rot_rad", 0.0))
-        limit_cost = float(report.get("joint_limit_penalty", 0.0))
-
-        score = profile.ik_score_joint_delta_weight * joint_cost
-        score += profile.ik_score_pose_error_weight * pose_cost
-        score += profile.ik_score_joint_limit_weight * limit_cost
-
-        manipulability = self.kin.compute_manipulability(qpos)
-        score -= profile.ik_score_manipulability_weight * manipulability
-        report["manipulability"] = float(manipulability)
-
-        if profile.neutral_qpos is not None:
-            neutral_dist = self.normalized_joint_distance(qpos, profile.neutral_qpos)
-            score += profile.ik_score_neutral_weight * neutral_dist
-            report["neutral_distance"] = float(neutral_dist)
-
-        return float(score)
 
     def resolve_planning_limits(self, profile: MotionPlanningConfig, reference_qpos: np.ndarray | None = None) -> np.ndarray:
         if profile.planning_limits_deg is not None:
@@ -355,7 +159,7 @@ class IKCandidateSearch:
         if self._cm is None:
             raise RuntimeError(
                 "CollisionModel not configured — cannot check collisions. "
-                "Pass collision_model=... to IKCandidateSearch constructor."
+                "Pass collision_model=... to IKGeometry constructor."
             )
 
     def has_self_collision(self, qpos: np.ndarray) -> bool:
@@ -501,14 +305,6 @@ class IKCandidateSearch:
                 return info
         return None
 
-    def normalized_joint_distance(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> float:
-        """Per-joint-range normalized Euclidean distance (ref: LeFranX weighted_ik.cpp)."""
-        qpos = ensure_qpos(qpos, self.dof, "qpos")
-        reference_qpos = ensure_qpos(reference_qpos, self.dof, "reference_qpos")
-        joint_ranges = self.joint_limits[:, 1] - self.joint_limits[:, 0]
-        joint_ranges = np.maximum(joint_ranges, 1e-6)
-        normalized_diff = (qpos - reference_qpos) / joint_ranges
-        return float(np.sqrt(np.sum(normalized_diff**2)))
 
     def weighted_joint_distance(
         self,
@@ -558,26 +354,3 @@ class IKCandidateSearch:
         if array.shape != (self.dof,):
             raise ValueError(f"{name} must have length 1 or {self.dof}, got {array.shape[0]}.")
         return array
-
-    def unique_qpos_list(self, qpos_list: list[np.ndarray], atol: float = 1e-8) -> list[np.ndarray]:
-        unique: list[np.ndarray] = []
-        for qpos in qpos_list:
-            if not any(np.allclose(qpos, item, atol=atol, rtol=0.0) for item in unique):
-                unique.append(qpos)
-        return unique
-
-    def compact_reject_report(self, seed_index: int, report: dict[str, Any]) -> dict[str, Any]:
-        compact: dict[str, Any] = {"seed_index": seed_index, "reason": report.get("reason")}
-        keys = (
-            "outside_joint_indices_1based",
-            "max_limit_violation_deg",
-            "max_delta_joint_indices_1based",
-            "max_delta_violation_deg",
-            "pose_error_pos_m",
-            "pose_error_rot_rad",
-            "max_qpos_delta_deg",
-        )
-        for key in keys:
-            if key in report:
-                compact[key] = report[key]
-        return compact

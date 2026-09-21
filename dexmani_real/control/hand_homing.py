@@ -130,7 +130,7 @@ def publish_hand_home_and_wait_accepted(
         and publish_result.reason == PUBLISH_REASON_FIFO_FULL
         and time.monotonic() < deadline_s
     ):
-        fifo_wait.note_full(publish_result.fifo_depth, candidate.action_id)
+        fifo_wait.note_full(publish_result.fifo_depth)
         if abort_requested is not None and abort_requested():
             break
         time.sleep(_FULL_RETRY_POLL_S)
@@ -151,7 +151,6 @@ def publish_hand_home_and_wait_accepted(
     acceptance = wait_command_accepted(
         shared,
         command=publish_result.command,
-        action_id=int(candidate.action_id),
         wait_for_arm=False,
         wait_for_hand=True,
         timeout_s=max(1e-6, deadline_s - time.monotonic()),
@@ -170,7 +169,7 @@ def publish_hand_home_and_wait_accepted(
         return False
     if verbose:
         print(
-            f"  hand: home command accepted (action_id={candidate.action_id})",
+            f"  hand: home command accepted (sequence={publish_result.command.sequence})",
             flush=True,
         )
     return True

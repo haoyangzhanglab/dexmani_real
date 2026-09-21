@@ -23,7 +23,6 @@ class EpisodeState:
     hand_connected: bool
     timestamp: float
     hand_current: np.ndarray
-    arm_last_cmd_seq: int = 0
 
 
 @dataclass
@@ -99,6 +98,5 @@ def build_episode_state(
         arm_connected=bool(arm["connected"]) if arm is not None else False,
         hand_connected=bool(hand["connected"]) if hand is not None else False,
         hand_qpos_stale=bool(hand["qpos_stale"]) if hand is not None else False,
-        arm_last_cmd_seq=int(arm["last_cmd_seq"]) if arm is not None else 0,
         timestamp=time.perf_counter() if timestamp_s is None else float(timestamp_s),
     )

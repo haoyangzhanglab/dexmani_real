@@ -42,10 +42,7 @@ from dexmani_real.robot.arm_worker import arm_loop as _arm_loop
 from dexmani_real.robot.hand_worker import hand_loop as _hand_loop
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.processes import (
-    ProcessSpec,
     ShutdownReport,
-    build_processes,
-    start_processes,
 )
 from dexmani_real.runtime.safety import SafetyState, require_transition
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
@@ -330,28 +327,23 @@ def replay_episode(
     outcome = ReplayOutcome(ReplayStatus.REJECTED, reason="replay did not start")
     try:
         hand_available = trajectory.has_hand
-        specs = [ProcessSpec("arm", _arm_loop, (shared, runtime.arm), ready_name="arm")]
+        processes = [context.Process(name="arm", target=_arm_loop, args=(shared, runtime.arm))]
         if hand_available:
-            specs.append(
-                ProcessSpec(
-                    "hand",
-                    _hand_loop,
-                    (
+            processes.append(
+                context.Process(name="hand", target=_hand_loop, args=(
                         shared,
                         runtime.hand,
                         float(runtime.policy.hand_disconnect_timeout_s),
-                    ),
-                    ready_name="hand",
-                )
+                    ))
             )
 
         require_transition(shared, SafetyState.DISARMED)
-        processes = build_processes(context, specs)
-        start_processes(processes)
+        for process in processes:
+            process.start()
 
         workers_ready = wait_subsystem_ready(
             shared,
-            list(zip(specs, processes)),
+            processes,
             runtime.safety.readiness_timeouts_s,
         )
         if not workers_ready:

@@ -44,7 +44,6 @@ from dexmani_real.planning.kinematics.pose import quat_multiply
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.robot.hand_worker import hand_loop
 from dexmani_real.runtime.operator_input import KeyboardInput
-from dexmani_real.runtime.processes import ProcessSpec, build_processes, start_processes
 from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
 from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
 from dexmani_real.utils.feedback import validate_arm_feedback, validate_hand_feedback
@@ -200,15 +199,12 @@ def _start_workers(
     *,
     hand_requested: bool,
 ) -> tuple[Any, Any | None, bool]:
-    arm_spec = ProcessSpec(
-        "arm", arm_loop, (shared, runtime.arm), ready_name="arm"
-    )
-    arm_process = build_processes(context, [arm_spec])[0]
+    arm_process = context.Process(name="arm", target=arm_loop, args=(shared, runtime.arm))
     processes.append(arm_process)
-    start_processes([arm_process])
+    arm_process.start()
     if not wait_subsystem_ready(
         shared,
-        [(arm_spec, arm_process)],
+        [arm_process],
         runtime.safety.readiness_timeouts_s,
         monitored_processes=processes,
     ):
@@ -217,22 +213,16 @@ def _start_workers(
     if not hand_requested:
         return arm_process, None, False
 
-    hand_spec = ProcessSpec(
-        "hand",
-        hand_loop,
-        (
+    hand_process = context.Process(name="hand", target=hand_loop, args=(
             shared,
             runtime.hand,
             float(runtime.policy.hand_disconnect_timeout_s),
-        ),
-        ready_name="hand",
-    )
-    hand_process = build_processes(context, [hand_spec])[0]
+        ))
     processes.append(hand_process)
-    start_processes([hand_process])
+    hand_process.start()
     if not wait_subsystem_ready(
         shared,
-        [(hand_spec, hand_process)],
+        [hand_process],
         runtime.safety.readiness_timeouts_s,
         monitored_processes=processes,
     ):
@@ -301,14 +291,14 @@ class _KeyboardPublishResult:
     status: _KeyboardPublishStatus
     arm_qpos_rad: np.ndarray | None = None
     detail: str = ""
-    action_id: int = 0
+    sequence: int = 0
     fatal: bool = False
     candidate: ActionCandidate | None = None
     fifo_depth: int = 0
 
 
 def _keyboard_action_was_accepted(
-    action_id: int,
+    sequence: int,
     arm_state: dict[str, Any],
     run_generation: int,
 ) -> bool:
@@ -317,9 +307,9 @@ def _keyboard_action_was_accepted(
     Ordered acceptance inside the current run generation only: a larger
     watermark from a stale generation never satisfies the check.
     """
-    return int(action_id) <= 0 or (
+    return int(sequence) <= 0 or (
         int(arm_state["last_cmd_generation"]) == int(run_generation)
-        and int(arm_state["last_cmd_seq"]) >= int(action_id)
+        and int(arm_state["last_cmd_accepted_sequence"]) >= int(sequence)
     )
 
 
@@ -607,7 +597,6 @@ def _publish_keyboard_target(
                 _KeyboardPublishStatus.FIFO_FULL,
                 arm_qpos_rad=np.asarray(candidate.arm_qpos, dtype=np.float64).copy(),
                 detail=publish_result.reason,
-                action_id=int(candidate.action_id),
                 candidate=candidate,
                 fifo_depth=publish_result.fifo_depth,
             )
@@ -619,7 +608,7 @@ def _publish_keyboard_target(
     return _KeyboardPublishResult(
         _KeyboardPublishStatus.PUBLISHED,
         arm_qpos_rad=np.asarray(candidate.arm_qpos, dtype=np.float64).copy(),
-        action_id=int(candidate.action_id),
+        sequence=publish_result.command.sequence,
     )
 
 
@@ -655,7 +644,7 @@ def _run_control_loop(
     home_key_down = False
     motion_active = False
     release_idle_frames = 0
-    last_motion_action_id = 0
+    last_motion_sequence = 0
     release_ack_started_s = 0.0
     quit_quiesced = False
     previous_active_keys: tuple[str, ...] | None = None
@@ -675,14 +664,14 @@ def _run_control_loop(
         nonlocal pending_candidate, pending_arm_qpos
         if pending_candidate is not None:
             logger.warning(
-                "[DROP] keyboard action=%d reason=%s", pending_candidate.action_id, reason
+                "[DROP] keyboard pending command reason=%s", reason
             )
         fifo_wait.note_dropped(reason, report=False)
         pending_candidate = None
         pending_arm_qpos = None
 
     def reject_motion(reason: str, *, fatal: bool = False) -> bool:
-        nonlocal motion_active, release_idle_frames, last_motion_action_id
+        nonlocal motion_active, release_idle_frames, last_motion_sequence
         nonlocal release_ack_started_s, previous_command, target_pos, target_quat
         nonlocal blocked_until_release
         drop_pending(reason)
@@ -702,7 +691,7 @@ def _run_control_loop(
                 return False
         motion_active = False
         release_idle_frames = 0
-        last_motion_action_id = 0
+        last_motion_sequence = 0
         release_ack_started_s = 0.0
         previous_command, target_pos, target_quat = _keyboard_command_anchor(
             planner, current_qpos
@@ -794,7 +783,7 @@ def _run_control_loop(
             previous_command = current_qpos.copy()
             motion_active = False
             release_idle_frames = 0
-            last_motion_action_id = 0
+            last_motion_sequence = 0
             release_ack_started_s = 0.0
             rate.reset()
             home_key_down = home_pressed
@@ -852,7 +841,7 @@ def _run_control_loop(
                 if release_ack_started_s <= 0.0:
                     release_ack_started_s = time.monotonic()
                 last_action_accepted = _keyboard_action_was_accepted(
-                    last_motion_action_id,
+                    last_motion_sequence,
                     feedback.arm_state,
                     int(shared.run_generation.value),
                 )
@@ -863,15 +852,15 @@ def _run_control_loop(
                     continue
                 if last_action_accepted:
                     logger.info(
-                        "Keyboard release: final action_id=%d accepted; "
+                        "Keyboard release: final sequence=%d accepted; "
                         "leaving its Mode 6 endpoint unchanged",
-                        last_motion_action_id,
+                        last_motion_sequence,
                     )
                 else:
                     logger.warning(
-                        "Keyboard release: final action_id=%d was not accepted "
+                        "Keyboard release: final sequence=%d was not accepted "
                         "within %.3fs; revoking motion",
-                        last_motion_action_id,
+                        last_motion_sequence,
                         float(cfg.release_last_action_ack_timeout_s),
                     )
 
@@ -880,7 +869,7 @@ def _run_control_loop(
                     return False
                 motion_active = False
                 release_idle_frames = 0
-                last_motion_action_id = 0
+                last_motion_sequence = 0
                 release_ack_started_s = 0.0
                 rate.reset()
             # Rebuild baselines so new key presses start from current feedback.
@@ -908,13 +897,13 @@ def _run_control_loop(
             )
             if retry.published:
                 fifo_wait.note_committed()
-                last_motion_action_id = int(pending_candidate.action_id)
+                last_motion_sequence = retry.command.sequence
                 assert pending_arm_qpos is not None
                 previous_command = pending_arm_qpos
                 pending_candidate = None
                 pending_arm_qpos = None
             elif retry.reason == PUBLISH_REASON_FIFO_FULL:
-                fifo_wait.note_full(retry.fifo_depth, pending_candidate.action_id)
+                fifo_wait.note_full(retry.fifo_depth)
             else:
                 drop_pending(retry.reason)
                 if not reject_motion(retry.reason):
@@ -926,7 +915,7 @@ def _run_control_loop(
                 set_keyboard_fault(shared, "failed to enter keyboard motion")
                 return False
             motion_active = True
-            last_motion_action_id = 0
+            last_motion_sequence = 0
             rate.reset()
 
         measured_pose = planner.kin.compute_eef_pose_world(current_qpos)
@@ -967,7 +956,7 @@ def _run_control_loop(
             assert publish_result.candidate is not None
             pending_candidate = publish_result.candidate
             pending_arm_qpos = publish_result.arm_qpos_rad
-            fifo_wait.note_full(publish_result.fifo_depth, publish_result.action_id)
+            fifo_wait.note_full(publish_result.fifo_depth)
             continue
         if publish_result.status is _KeyboardPublishStatus.IK_REJECTED:
             now_s = time.monotonic()
@@ -986,7 +975,7 @@ def _run_control_loop(
                 return False
             continue
         assert publish_result.arm_qpos_rad is not None
-        last_motion_action_id = publish_result.action_id
+        last_motion_sequence = publish_result.sequence
         previous_command = publish_result.arm_qpos_rad
 
         if frame % int(cfg.status_interval_frames) == 0:

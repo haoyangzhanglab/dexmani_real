@@ -1,1 +1,1 @@
-"""Process-local policy model adapters and causal observations."""
+"""Build policy input arrays from timestamped sensor histories."""

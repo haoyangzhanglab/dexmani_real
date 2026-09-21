@@ -78,22 +78,19 @@ class PublishWaitTracker:
     def __init__(self, label: str) -> None:
         self._label = label
         self._waiting_since_ns: int | None = None
-        self._keep_action_id = 0
 
     @property
     def waiting(self) -> bool:
         return self._waiting_since_ns is not None
 
-    def note_full(self, depth: int, keep_action: int) -> None:
+    def note_full(self, depth: int) -> None:
         if self._waiting_since_ns is None:
             logger.warning(
-                "[WAIT] %s command_fifo full depth=%d keep_action=%d",
+                "[WAIT] %s command_fifo full depth=%d",
                 self._label,
                 int(depth),
-                int(keep_action),
             )
             self._waiting_since_ns = time.monotonic_ns()
-            self._keep_action_id = int(keep_action)
 
     def note_committed(self) -> None:
         if self._waiting_since_ns is None:
@@ -113,9 +110,8 @@ class PublishWaitTracker:
         wait_ms = (time.monotonic_ns() - self._waiting_since_ns) / 1e6
         if report:
             logger.warning(
-                "[DROP] %s command_fifo keep_action=%d wait_ms=%.0f dropped=1 reason=%s",
+                "[DROP] %s command_fifo wait_ms=%.0f dropped=1 reason=%s",
                 self._label,
-                self._keep_action_id,
                 wait_ms,
                 reason,
             )
@@ -123,7 +119,6 @@ class PublishWaitTracker:
 
     def _reset(self) -> None:
         self._waiting_since_ns = None
-        self._keep_action_id = 0
 
 
 @dataclass(frozen=True)
@@ -146,7 +141,6 @@ class PreparedCommand:
 @dataclass(frozen=True)
 class _ArmFeedbackSnapshot:
     qpos: np.ndarray
-    accepted_action_id: int
     accepted_monotonic_ns: int = 0
     source_monotonic_ns: int = 0
     ring_commit_monotonic_ns: int = 0
@@ -159,7 +153,6 @@ class _ArmFeedbackSnapshot:
 @dataclass(frozen=True)
 class _HandFeedbackSnapshot:
     qpos: np.ndarray
-    accepted_action_id: int
     accepted_monotonic_ns: int = 0
     source_monotonic_ns: int = 0
     ring_commit_monotonic_ns: int = 0
@@ -245,7 +238,6 @@ def _read_arm_feedback(
     return (
         _ArmFeedbackSnapshot(
             qpos=qpos.copy(),
-            accepted_action_id=int(record["last_cmd_seq"]),
             accepted_monotonic_ns=int(record["last_cmd_accepted_monotonic_ns"]),
             source_monotonic_ns=source_ns,
             ring_commit_monotonic_ns=ring_commit_ns,
@@ -284,7 +276,6 @@ def read_hand_feedback(
     return (
         _HandFeedbackSnapshot(
             qpos=qpos.copy(),
-            accepted_action_id=int(record["accepted_target_action_id"]),
             accepted_monotonic_ns=int(record["accepted_target_monotonic_ns"]),
             source_monotonic_ns=source_ns,
             ring_commit_monotonic_ns=ring_commit_ns,
@@ -383,13 +374,12 @@ def build_action_candidate(
     run_generation: int | None = None,
     is_hold: bool = False,
 ) -> ActionCandidate:
-    """Assign command identity and copy targets into an immutable candidate.
+    """Copy targets into a candidate belonging to the current motion generation.
 
     The candidate carries no delivery lease or timing authority: it stays
     committable until its run generation is revoked, and a FULL commit result
-    retries this exact numeric snapshot unchanged. Action IDs come from the
-    shared monotonic counter and may have gaps; the FIFO queue sequence is
-    produced later by the commit and is never mixed with them.
+    retries this exact numeric snapshot unchanged. Only a successful FIFO
+    commit assigns a sequence; an unpublished candidate needs no identity.
     """
     if run_generation is not None and (
         isinstance(run_generation, (bool, np.bool_))
@@ -397,16 +387,12 @@ def build_action_candidate(
         or int(run_generation) < 0
     ):
         raise ValueError("run_generation must be a non-negative integer or None")
-    with shared.arm_command_seq.get_lock():
-        action_id = int(shared.arm_command_seq.value) + 1
-        shared.arm_command_seq.value = action_id
     return ActionCandidate(
         run_generation=(
             int(shared.run_generation.value)
             if run_generation is None
             else int(run_generation)
         ),
-        action_id=action_id,
         arm_qpos=(
             None
             if arm_qpos is None
@@ -566,7 +552,6 @@ def prepare_joint_command(
 def _make_coupled_command(candidate: ActionCandidate) -> np.ndarray:
     frame = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
     frame["run_generation"][0] = candidate.run_generation
-    frame["action_id"][0] = candidate.action_id
     frame["is_hold"][0] = int(candidate.is_hold)
     if candidate.arm_qpos is not None:
         frame["arm_present"][0] = 1
@@ -630,7 +615,6 @@ def wait_command_accepted(
     shared: Any,
     *,
     command: CommittedCommand,
-    action_id: int,
     wait_for_arm: bool,
     wait_for_hand: bool,
     timeout_s: float,
@@ -643,11 +627,11 @@ def wait_command_accepted(
     """Block until the requested workers report SDK acceptance of one command.
 
     Acceptance is judged by ordered consumption inside the command's own run
-    generation, never by action-ID supersession: a worker only advances its
+    generation: a worker only advances its
     acceptance watermark after SDK-accepting every targeted record in commit
     order, so a same-generation watermark at or beyond this command's FIFO
-    sequence proves ordered acceptance of this command. A larger action ID
-    alone proves nothing, and a stale-generation ACK can never satisfy the
+    sequence proves ordered acceptance of this command. A stale-generation
+    ACK can never satisfy the
     wait. Explicit waits are for home/replay/calibration boundaries only;
     ordinary streaming never blocks here.
     """
@@ -655,8 +639,8 @@ def wait_command_accepted(
         raise ValueError("acceptance wait requires at least one worker")
     if not np.isfinite(timeout_s) or timeout_s <= 0.0:
         raise ValueError("acceptance timeout must be finite and positive")
-    if action_id < 0 or command.sequence <= 0:
-        raise ValueError("acceptance identity must be non-negative and published")
+    if command.sequence <= 0:
+        raise ValueError("acceptance requires a published command sequence")
     generation = int(command.run_generation)
     sequence = int(command.sequence)
     deadline_s = time.monotonic() + timeout_s
@@ -680,8 +664,7 @@ def wait_command_accepted(
                 cancel_coupled_command_if_current(shared, command=command)
                 return AcceptanceResult(False, reason)
             arm_accepted = arm_feedback.accepted_generation == generation and (
-                arm_feedback.accepted_action_id == action_id
-                or arm_feedback.accepted_sequence >= sequence
+                arm_feedback.accepted_sequence >= sequence
             )
             if arm_accepted and arm_feedback.accepted_monotonic_ns <= 0:
                 cancel_coupled_command_if_current(shared, command=command)
@@ -696,8 +679,7 @@ def wait_command_accepted(
                 cancel_coupled_command_if_current(shared, command=command)
                 return AcceptanceResult(False, reason)
             hand_accepted = hand_feedback.accepted_generation == generation and (
-                hand_feedback.accepted_action_id == action_id
-                or hand_feedback.accepted_sequence >= sequence
+                hand_feedback.accepted_sequence >= sequence
             )
             if hand_accepted and hand_feedback.accepted_monotonic_ns <= 0:
                 cancel_coupled_command_if_current(shared, command=command)

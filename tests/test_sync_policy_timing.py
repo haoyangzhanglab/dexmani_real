@@ -160,6 +160,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.policy_spec = SimpleNamespace(
             n_obs_steps=2,
             n_action_steps=n_action_steps,
+            control_action_dim=1,
             control_dt_s=_STEP_DT_NS / 1e9,
         )
         runner.runtime = SimpleNamespace(policy=SimpleNamespace())
@@ -293,7 +294,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
         # An open backpressure span must end visibly at the epoch boundary and
         # leave the tracker clean for the next trial's [WAIT].
         runner._fifo_wait = executor_module.PublishWaitTracker("test")
-        runner._fifo_wait.note_full(8, 813)
+        runner._fifo_wait.note_full(8)
 
         with self.assertLogs("dexmani_real.deployment.executor", level="WARNING") as logs:
             runner._clear_execution(None)
@@ -337,6 +338,18 @@ class SyncPolicyTimingTest(unittest.TestCase):
         self.assertEqual(list(runner.actions), [])
 
     # --- failure taxonomy ---------------------------------------------------
+
+    def test_invalid_policy_chunks_are_rejected_before_dispatch(self):
+        self._install_observation_fakes()
+        for output in (np.zeros((7, 1)), np.full((8, 1), np.nan), np.full((8, 1), np.inf)):
+            with self.subTest(shape=output.shape, finite=np.all(np.isfinite(output))):
+                runner = self._make_runner()
+                runner.model_runtime.predict = lambda observation: output
+                runner._session_failure = mock.Mock()
+                runner._run_active_tick(self.clock.ns)
+                runner._session_failure.assert_called_once()
+                self.assertEqual(self.published, [])
+                self.assertEqual(list(runner.actions), [])
 
     def test_model_exception_is_session_failure_not_fault(self):
         self.clock.ns = 0

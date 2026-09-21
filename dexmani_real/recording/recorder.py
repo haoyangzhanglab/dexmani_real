@@ -32,7 +32,6 @@ from dexmani_real.recording.storage.schema import (
     EPISODE_SCHEMA_VERSION,
     DATASET_SPECS,
     SOURCE_FRAME_DATASET_NAMES,
-    FillReason,
     validate_data_layout,
 )
 from dexmani_real.recording.sample import EpisodeAction, EpisodeState
@@ -418,11 +417,7 @@ class EpisodeRecorder:
             raise ValueError("recording timestamps must be finite and increasing")
         if set(frame.data) != SOURCE_FRAME_DATASET_NAMES:
             raise ValueError("episode source frame fields do not match the raw schema")
-        row = dict(frame.data)
-        row.update(
-            timestamp=ts, source_sample_index=self._frame_count,
-            fill_reason=FillReason.SOURCE, flag_sample_valid=True,
-        )
+        row = dict(frame.data, timestamp=ts)
         self._pending_rows.append(row)
         self._frame_count += 1
         self._last_timestamp_s = ts

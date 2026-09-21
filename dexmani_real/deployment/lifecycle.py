@@ -1,20 +1,4 @@
-"""Learned-policy deployment lifecycle.
-
-Composes the runtime primitives (``ProcessSpec`` +
-``build_processes``/``start_processes``/``wait_subsystem_ready``/
-``run_supervisor``/``shutdown_processes``) into the policy workflow — resolve
-config -> create ``RuntimeChannels`` -> load/warm up the policy child ->
-policy READY -> spawn hardware/recording workers -> readiness -> ARMED ->
-supervise -> verified shutdown. The policy child owns model/CUDA and synchronous
-action dispatch; supervisor heartbeats and readiness cover the existing lifecycle.
-
-There is no VR worker. A validate-only session starts the camera only when
-the explicit observation contract contains ``point_cloud`` or ``rgb``.
-Physical recorded sessions attempt to start camera and RecorderIO for raw
-evidence. Optional evidence startup failure permits unrecorded control;
-camera payload stays out of a state-only policy observation.
-
-"""
+"""Start the policy and hardware processes, handle operator input, and stop them."""
 
 from __future__ import annotations
 
@@ -28,7 +12,6 @@ from typing import Any
 
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.deployment.config import (
-    FIXED_POLICY_RUNTIME_TARGET,
     FingertipAssemblerConfig,
     PolicyRuntimeConfig,
     RolloutRecordingConfig,
@@ -44,10 +27,7 @@ from dexmani_real.recording.client import RECORDER_STOP_TIMEOUT_S
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.robot.hand_worker import hand_loop
 from dexmani_real.runtime.processes import (
-    ProcessSpec,
     ShutdownReport,
-    build_processes,
-    start_processes,
     stop_processes_verified,
 )
 from dexmani_real.runtime.safety import SafetyState, require_transition
@@ -270,7 +250,8 @@ def _compute_policy_observation_ring_capacities(
     return capacities
 
 
-def build_policy_worker_specs(
+def _build_policy_processes(
+    context: Any,
     shared: RuntimeChannels,
     runtime: ExperimentConfig,
     policy_spec: Any,
@@ -280,25 +261,8 @@ def build_policy_worker_specs(
     max_running_s: float | None = None,
     num_trials: int = 1,
     recording_config: RolloutRecordingConfig | None = None,
-) -> list[ProcessSpec]:
-    """Build the workers required by the explicit deployment contract.
-
-    Each spec owns its process and readiness names. ``ready_name`` exists only
-    for workers with initialization that must complete before use.
-    """
-    if not isinstance(worker_config, PolicyRuntimeConfig):
-        raise TypeError("worker_config must be a PolicyRuntimeConfig")
-    max_running_s = validate_max_running_s(max_running_s)
-    num_trials = validate_num_trials(num_trials)
-    if recording_config is not None:
-        if not isinstance(recording_config, RolloutRecordingConfig):
-            raise TypeError("recording_config must be a RolloutRecordingConfig")
-        if not execute:
-            raise ValueError("recorded rollout requires execute=True")
-        if max_running_s is None:
-            raise ValueError(
-                "recorded rollout requires an explicit max_running_s run budget"
-            )
+) -> list[Any]:
+    """Construct the concrete processes; the caller starts and joins them."""
     pointcloud_requested = _requires_pointcloud(policy_spec)
     camera_requested = _requires_camera(policy_spec) or recording_config is not None
     fingertip_config = (
@@ -318,46 +282,28 @@ def build_policy_worker_specs(
         if pointcloud_requested
         else None
     )
-    specs: list[ProcessSpec] = [
-        ProcessSpec(
-            "arm",
-            arm_loop,
-            (shared, runtime.arm),
-            ready_name="arm",
-        ),
+    processes: list[Any] = [
+        context.Process(name="arm", target=arm_loop, args=(shared, runtime.arm)),
     ]
     if camera_requested:
-        specs.append(
-            ProcessSpec(
-                "camera",
-                camera_loop,
-                (
+        processes.append(
+            context.Process(name="camera", target=camera_loop, args=(
                     shared,
                     CameraLoopConfig.from_runtime(runtime),
                     _requires_camera(policy_spec),
-                ),
-                ready_name="camera",
-            )
+                ))
         )
     if pointcloud_requested:
-        specs.append(
-            ProcessSpec(
-                "pointcloud",
-                pointcloud_loop,
-                (
+        processes.append(
+            context.Process(name="pointcloud", target=pointcloud_loop, args=(
                     shared,
                     pointcloud_config,
-                ),
-                ready_name="pointcloud",
-            )
+                ))
         )
     if recording_config is not None:
         assert max_running_s is not None
-        specs.append(
-            ProcessSpec(
-                "recorder",
-                recorder_io_loop,
-                (
+        processes.append(
+            context.Process(name="recorder", target=recorder_io_loop, args=(
                     shared,
                     _rollout_recorder_config(
                         runtime,
@@ -366,15 +312,10 @@ def build_policy_worker_specs(
                         max_running_s,
                         num_trials,
                     ),
-                ),
-                ready_name="recorder",
-            )
+                ))
         )
-    specs.append(
-        ProcessSpec(
-            "policy",
-            policy_runner_loop,
-            (
+    processes.append(
+        context.Process(name="policy", target=policy_runner_loop, args=(
                 shared,
                 runtime,
                 worker_config,
@@ -383,24 +324,17 @@ def build_policy_worker_specs(
                 num_trials,
                 recording_config,
                 fingertip_config,
-            ),
-            ready_name="policy",
-        )
+            ))
     )
     if policy_spec.requires_hand or _requires_hand_sensor(policy_spec):
-        specs.append(
-            ProcessSpec(
-                "hand",
-                hand_loop,
-                (
+        processes.append(
+            context.Process(name="hand", target=hand_loop, args=(
                     shared,
                     runtime.hand,
                     float(runtime.policy.hand_disconnect_timeout_s),
-                ),
-                ready_name="hand",
-            )
+                ))
         )
-    return specs
+    return processes
 
 
 def run_policy_deployment(
@@ -444,9 +378,8 @@ def run_policy_deployment(
             "recorded rollout requires an explicit max_running_s run budget"
         )
     logger.debug(
-        "policy deployment: experiment=%s runtime=%s device=%s seed=%s execute=%s",
+        "policy deployment: experiment=%s device=%s seed=%s execute=%s",
         worker_config.experiment,
-        FIXED_POLICY_RUNTIME_TARGET,
         worker_config.device,
         worker_config.seed,
         execute,
@@ -480,7 +413,6 @@ def run_policy_deployment(
         ),
         mp_context=ctx,
     )
-    specs: list[ProcessSpec] = []
     procs: list[Any] = []
     started_procs: list[Any] = []
     shutdown_report: ShutdownReport | None = None
@@ -490,7 +422,8 @@ def run_policy_deployment(
     normal_exit = False
     exit_reason = "startup failed"
     try:
-        specs = build_policy_worker_specs(
+        procs = _build_policy_processes(
+            ctx,
             shared,
             runtime,
             policy_spec,
@@ -500,24 +433,22 @@ def run_policy_deployment(
             num_trials=num_trials,
             recording_config=recording_config,
         )
-        procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)
 
         timeouts = runtime.safety.readiness_timeouts_s
-        spec_processes = list(zip(specs, procs))
-        policy_pairs = [
-            (spec, process)
-            for spec, process in spec_processes
-            if spec.ready_name == "policy"
+        policy_procs = [
+            process
+            for process in procs
+            if process.name == "policy"
         ]
-        if len(policy_pairs) != 1:
+        if len(policy_procs) != 1:
             raise RuntimeError("deployment requires exactly one policy runner")
-        _policy_spec, policy_process = policy_pairs[0]
-        start_processes([policy_process])
+        policy_process = policy_procs[0]
+        policy_process.start()
         started_procs.append(policy_process)
         if not wait_subsystem_ready(
             shared,
-            policy_pairs,
+            policy_procs,
             timeouts,
             monitored_processes=started_procs,
         ):
@@ -531,36 +462,36 @@ def run_policy_deployment(
             return 1
         print("  policy: ready", flush=True)
 
-        remaining_pairs = [
-            (spec, process)
-            for spec, process in spec_processes
+        remaining_procs = [
+            process
+            for process in procs
             if process is not policy_process
         ]
-        critical_pairs = [
-            (spec, process)
-            for spec, process in remaining_pairs
-            if spec.name not in service_process_names
+        critical_workers = [
+            process
+            for process in remaining_procs
+            if process.name not in service_process_names
         ]
-        service_pairs = [
-            (spec, process)
-            for spec, process in remaining_pairs
-            if spec.name in service_process_names
+        service_procs = [
+            process
+            for process in remaining_procs
+            if process.name in service_process_names
         ]
         # policy is already started/ready; it is critical like every other
         # non-service process for the purposes of the service readiness wait.
         critical_procs = [policy_process] + [
-            process for _spec, process in critical_pairs
+            process for process in critical_workers
         ]
         # Register each successful start immediately.  If a later Process.start()
         # raises, verified shutdown must still stop every earlier child before IPC
         # is closed or unlinked. Critical workers start (and become ready)
         # before any experiment service is started.
-        for _spec, process in critical_pairs:
-            start_processes([process])
+        for process in critical_workers:
+            process.start()
             started_procs.append(process)
         if not wait_subsystem_ready(
             shared,
-            critical_pairs,
+            critical_workers,
             timeouts,
             monitored_processes=started_procs,
         ):
@@ -574,12 +505,11 @@ def run_policy_deployment(
             )
             return 1
 
-        for spec, _process in critical_pairs:
-            if spec.ready_name is not None:
-                print(f"  {spec.ready_name}: ready", flush=True)
+        for process in critical_workers:
+            print(f"  {process.name}: ready", flush=True)
 
         evidence_ready = start_evidence_services(
-            shared, service_pairs, timeouts, critical_processes=critical_procs,
+            shared, service_procs, timeouts, critical_processes=critical_procs,
             started_processes=started_procs,
         )
 

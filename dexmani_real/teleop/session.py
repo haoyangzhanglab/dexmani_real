@@ -37,9 +37,6 @@ from dexmani_real.runtime.supervisor import (
 )
 from dexmani_real.runtime.processes import (
     ShutdownReport,
-    ProcessSpec,
-    build_processes,
-    start_processes,
 )
 from dexmani_real.sensor.camera.worker import CameraHealth, CameraLoopConfig
 from dexmani_real.sensor.camera.worker import camera_loop as _camera_loop
@@ -257,6 +254,7 @@ def _print_session_header(
 
 
 def _build_processes(
+    context: Any,
     shared: RuntimeChannels,
     runtime: ExperimentConfig,
     *,
@@ -265,42 +263,22 @@ def _build_processes(
     operator: str,
     hand_enabled: bool,
     recording_enabled: bool,
-) -> list[ProcessSpec]:
+) -> list[Any]:
     policy_config = TeleopConfig.from_runtime(
         runtime,
         task_label=task_name,
         operator=operator,
         hand_urdf_path=str(XHAND_RIGHT_URDF_PATH),
     )
-    # Worker specs are the single source of process and readiness names.
-    specs = [
-        ProcessSpec(
-            "arm",
-            _arm_loop,
-            (shared, runtime.arm),
-            ready_name="arm",
-        ),
-        ProcessSpec(
-            "vr",
-            _vr_loop,
-            (shared, VRReceiverConfig.from_runtime(runtime)),
-            ready_name="vr",
-        ),
-        ProcessSpec("policy", teleop_loop, (shared, policy_config), ready_name="policy"),
+    processes = [
+        context.Process(name="arm", target=_arm_loop, args=(shared, runtime.arm)),
+        context.Process(name="vr", target=_vr_loop, args=(shared, VRReceiverConfig.from_runtime(runtime))),
+        context.Process(name="policy", target=teleop_loop, args=(shared, policy_config)),
     ]
     if recording_enabled:
         camera_config = CameraLoopConfig.from_runtime(runtime)
-        specs.append(
-            ProcessSpec(
-                "camera",
-                _camera_loop,
-                # Teleop's camera exists only to produce recording evidence
-                # (it starts only with recording), so its failures — including
-                # the producer source-stall latch — degrade evidence instead
-                # of latching the physical fault that would end teleoperation.
-                (shared, camera_config, False),
-                ready_name="camera",
-            )
+        processes.append(
+            context.Process(name="camera", target=_camera_loop, args=(shared, camera_config, False))
         )
         # Recorder still owns only episode serialization; the entry point
         # selects the already-validated task parent directory.
@@ -323,28 +301,18 @@ def _build_processes(
             ),
             writer_queue_size=int(runtime.camera.writer_queue_size),
         )
-        specs.append(
-            ProcessSpec(
-                "recorder",
-                recorder_io_loop,
-                (shared, recorder_config),
-                ready_name="recorder",
-            )
+        processes.append(
+            context.Process(name="recorder", target=recorder_io_loop, args=(shared, recorder_config))
         )
     if hand_enabled:
-        specs.append(
-            ProcessSpec(
-                "hand",
-                _hand_loop,
-                (
+        processes.append(
+            context.Process(name="hand", target=_hand_loop, args=(
                     shared,
                     runtime.hand,
                     float(runtime.policy.hand_disconnect_timeout_s),
-                ),
-                ready_name="hand",
-            )
+                ))
         )
-    return specs
+    return processes
 
 
 def run_teleop_experiment(
@@ -404,14 +372,14 @@ def run_teleop_experiment(
         config=RuntimeChannelsConfig.from_runtime(runtime),
         mp_context=ctx,
     )
-    specs: list[ProcessSpec] = []
     procs: list[Any] = []
     started_procs: list[Any] = []
     service_process_names = frozenset({"camera", "recorder"}) if recording_enabled else frozenset()
     shutdown_report: ShutdownReport | None = None
     shared_closed = False
     try:
-        specs = _build_processes(
+        procs = _build_processes(
+            ctx,
             shared,
             runtime,
             repo_root=repo_root,
@@ -420,29 +388,27 @@ def run_teleop_experiment(
             hand_enabled=hand_enabled,
             recording_enabled=recording_enabled,
         )
-        procs = build_processes(ctx, specs)
         require_transition(shared, SafetyState.DISARMED)
         timeouts = runtime.safety.readiness_timeouts_s
-        spec_processes = list(zip(specs, procs))
-        dependency_pairs = [
-            pair
-            for pair in spec_processes
-            if pair[0].ready_name not in {"policy", "vr"}
+        dependency_procs = [
+            process
+            for process in procs
+            if process.name not in {"policy", "vr"}
         ]
-        policy_pairs = [
-            pair for pair in spec_processes if pair[0].ready_name == "policy"
+        policy_procs = [
+            process for process in procs if process.name == "policy"
         ]
-        vr_pairs = [pair for pair in spec_processes if pair[0].ready_name == "vr"]
+        vr_procs = [process for process in procs if process.name == "vr"]
 
-        evidence_pairs = [pair for pair in dependency_pairs if pair[0].name in service_process_names]
-        dependency_pairs = [pair for pair in dependency_pairs if pair[0].name not in service_process_names]
-        dependency_procs = [process for _spec, process in dependency_pairs]
+        evidence_procs = [process for process in dependency_procs if process.name in service_process_names]
+        dependency_procs = [process for process in dependency_procs if process.name not in service_process_names]
+
         for process in dependency_procs:
-            start_processes([process])
+            process.start()
             started_procs.append(process)
         if not wait_subsystem_ready(
             shared,
-            dependency_pairs,
+            dependency_procs,
             timeouts,
             monitored_processes=started_procs,
         ):
@@ -456,15 +422,15 @@ def run_teleop_experiment(
             shared_closed = shutdown_report.shared_closed
             return 1
 
-        for spec, _process in dependency_pairs:
-            logger.debug("%s: ready", spec.ready_name)
+        for process in dependency_procs:
+            logger.debug("%s: ready", process.name)
 
-        policy_procs = [process for _spec, process in policy_pairs]
-        start_processes(policy_procs)
+        for process in policy_procs:
+            process.start()
         started_procs.extend(policy_procs)
         if not wait_subsystem_ready(
             shared,
-            policy_pairs,
+            policy_procs,
             timeouts,
             monitored_processes=started_procs,
         ):
@@ -479,9 +445,10 @@ def run_teleop_experiment(
             return 1
         logger.debug("policy: ready")
 
-        if vr_pairs:
-            vr_procs = [process for _spec, process in vr_pairs]
-            start_processes(vr_procs)
+        if vr_procs:
+
+            for process in vr_procs:
+                process.start()
             started_procs.extend(vr_procs)
             vr_timeout = float(timeouts["vr"])
             print(
@@ -492,7 +459,7 @@ def run_teleop_experiment(
             )
             if not wait_subsystem_ready(
                 shared,
-                vr_pairs,
+                vr_procs,
                 timeouts,
                 monitored_processes=started_procs,
             ):
@@ -508,7 +475,7 @@ def run_teleop_experiment(
             print(f"  VR connected", flush=True)
 
         evidence_ready = start_evidence_services(
-            shared, evidence_pairs, timeouts, critical_processes=list(started_procs),
+            shared, evidence_procs, timeouts, critical_processes=list(started_procs),
             started_processes=started_procs,
         )
         print_health_summary(shared)

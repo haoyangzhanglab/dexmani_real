@@ -24,7 +24,7 @@ from dexmani_real.utils.feedback import validate_hand_feedback
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
-    from dexmani_real.runtime.processes import ProcessSpec, ShutdownReport
+    from dexmani_real.runtime.processes import ShutdownReport
 
 logger = get_logger(__name__)
 
@@ -282,33 +282,22 @@ def run_supervisor(
 
 def wait_subsystem_ready(
     shared: RuntimeChannels,
-    workers: Iterable[tuple["ProcessSpec", Any]],
+    workers: Iterable[Any],
     readiness_timeouts_s: Mapping[str, float],
     *,
     monitored_processes: Iterable[Any] | None = None,
 ) -> bool:
     """Wait boundedly for worker readiness while supervising startup health.
 
-    Worker specs own readiness names, while the runtime configuration owns their
-    timeouts. ``monitored_processes`` lets staged startup keep earlier workers in
-    the same fault/liveness barrier.
+    Process names select readiness flags and startup timeouts.
+    ``monitored_processes`` keeps earlier workers in the same startup check.
 
     The caller is responsible for printing pre-wait user messages
     (e.g. "put on Quest headset") before calling this function.
     """
-    worker_pairs = list(workers)
-    monitored = (
-        [process for _spec, process in worker_pairs]
-        if monitored_processes is None
-        else list(monitored_processes)
-    )
-    ready_names = [
-        spec.ready_name
-        for spec, _process in worker_pairs
-        if spec.ready_name is not None
-    ]
-    if len(set(ready_names)) != len(ready_names):
-        raise ValueError("worker readiness names must be unique")
+    workers = list(workers)
+    monitored = workers if monitored_processes is None else list(monitored_processes)
+    ready_names = [process.name for process in workers]
 
     for name in ready_names:
         if name not in readiness_timeouts_s:
@@ -447,14 +436,14 @@ def print_health_summary(
     sys.stdout.flush()
 
 
-def start_evidence_services(shared, worker_pairs, readiness_timeouts_s, *, critical_processes, started_processes) -> bool:
+def start_evidence_services(shared, processes, readiness_timeouts_s, *, critical_processes, started_processes) -> bool:
     """Prepare optional evidence once, retaining every started cleanup handle.
 
     A failed optional service disables capture, not control readiness. Earlier
     critical workers are still monitored during each bounded preparation.
     """
     available = True
-    for spec, process in worker_pairs:
+    for process in processes:
         try:
             process.start()
         except Exception:
@@ -463,17 +452,17 @@ def start_evidence_services(shared, worker_pairs, readiness_timeouts_s, *, criti
                 started_processes.append(process)
             available = False
             shared.evidence_failed.value = True
-            logger.error("[EVIDENCE] %s failed to start", spec.name, exc_info=True)
+            logger.error("[EVIDENCE] %s failed to start", process.name, exc_info=True)
         else:
             started_processes.append(process)
             ready = wait_subsystem_ready(
-                shared, [(spec, process)], readiness_timeouts_s,
+                shared, [process], readiness_timeouts_s,
                 monitored_processes=[*critical_processes, process],
             )
             if not ready:
                 available = False
                 shared.evidence_failed.value = True
-            logger.info("evidence %s: %s", spec.name, "ready" if ready else "unavailable")
+            logger.info("evidence %s: %s", process.name, "ready" if ready else "unavailable")
         if shared.error_state.value or shared.estop_request.value or any(
             not process.is_alive() for process in critical_processes
         ):

@@ -1,4 +1,4 @@
-"""Minimal schema-v29 raw-episode fixture for provenance integration tests.
+"""Minimal current-schema raw-episode fixture for provenance integration tests.
 
 Builds a real, self-consistent raw episode (``data.h5`` + ``depth.h5`` +
 ``rgb.mp4``) that :class:`EpisodeReader` accepts as VALID and that both the
@@ -50,14 +50,12 @@ def _anchors(n: int) -> np.ndarray:
 
 
 def _dataset_values(name: str, n: int) -> np.ndarray:
-    """Return semantically valid values for one schema-v29 dataset row block."""
+    """Return semantically valid values for one current-schema dataset row block."""
     anchors = _anchors(n)
     causal_source = anchors - 1  # positive and strictly behind the anchor
 
     if name == "timestamp":
         return _timestamps(n)
-    if name == "source_sample_index":
-        return np.arange(n, dtype=np.int64)
     if name == "observation_anchor_monotonic_ns":
         return anchors
     if name in (
@@ -78,8 +76,6 @@ def _dataset_values(name: str, n: int) -> np.ndarray:
         rows = np.zeros((n, 4), dtype=np.float64)
         rows[:, 0] = 1.0
         return rows
-    if name == "arm_last_cmd_seq":
-        return np.arange(n, dtype=np.int64)
     if name in ("camera_depth_frame_number", "camera_color_frame_number"):
         return np.arange(n, dtype=np.uint64)
 
@@ -102,7 +98,7 @@ def build_raw_episode(
     provenance_workflow: str | None = None,
     num_frames: int = _DEFAULT_NUM_FRAMES,
 ) -> Path:
-    """Write a valid schema-v29 raw episode directory and return its path."""
+    """Write a valid current-schema raw episode directory and return its path."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     n = int(num_frames)

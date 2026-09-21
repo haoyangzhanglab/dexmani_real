@@ -555,7 +555,6 @@ class RecordingAcrossTrialsTest(_RunnerTest):
 class EvidenceStartupTest(unittest.TestCase):
     def test_optional_failure_keeps_handles_and_required_failure_is_terminal(self):
         from unittest.mock import patch
-        from dexmani_real.runtime.processes import ProcessSpec
         from dexmani_real.runtime.supervisor import start_evidence_services
         for critical_alive in (True, False):
             shared = _fake_shared()
@@ -566,13 +565,12 @@ class EvidenceStartupTest(unittest.TestCase):
                 optional.pid = 123
             optional.start = start
             started = [critical]
-            spec = ProcessSpec("recorder", lambda: None, (), ready_name="recorder")
             if critical_alive:
-                self.assertFalse(start_evidence_services(shared, [(spec, optional)], {"recorder": 1.},
+                self.assertFalse(start_evidence_services(shared, [optional], {"recorder": 1.},
                     critical_processes=[critical], started_processes=started))
             else:
                 with self.assertRaisesRegex(RuntimeError, "critical startup"):
-                    start_evidence_services(shared, [(spec, optional)], {"recorder": 1.},
+                    start_evidence_services(shared, [optional], {"recorder": 1.},
                         critical_processes=[critical], started_processes=started)
             self.assertIn(optional, started)
             self.assertTrue(shared.evidence_failed.value)
@@ -645,7 +643,7 @@ class RunTerminationFactsTest(_RunnerTest):
         runner.chunk_action_index = 1
         runner._pending_dispatch = object()
         runner._fifo_wait = PublishWaitTracker("policy")
-        runner._fifo_wait.note_full(4, 200)
+        runner._fifo_wait.note_full(4)
         with self.assertLogs(level="INFO") as logs:
             runner._clear_execution(None)
         drops = [line for line in logs.output if "[DROP]" in line]
@@ -719,7 +717,7 @@ class BlockingPredictionStopTest(_RunnerTest):
         self.addCleanup(helper.doCleanups)
         runner = self._runner()
         runner.max_running_ns = None
-        runner.policy_spec = SimpleNamespace(n_obs_steps=2)
+        runner.policy_spec = SimpleNamespace(n_obs_steps=2, n_action_steps=8, control_action_dim=19)
         runner.fingertip_runtime = None
         def predict(observation):
             helper.clock.ns = 2_000_000_000

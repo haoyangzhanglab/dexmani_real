@@ -12,10 +12,10 @@ import numpy as np
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
-    from .ik_candidates import IKCandidateSearch
+    from .ik_geometry import IKGeometry
     from .arm_fk import XArm7Kinematics
 
-from .ik_candidates import is_mplib_success
+from .ik_geometry import is_mplib_success
 from .pose import Pose, compute_pose_error, ensure_qpos
 
 logger = get_logger(__name__)
@@ -91,7 +91,7 @@ class OnlineIKSolver:
     def __init__(
         self,
         kin: XArm7Kinematics,
-        ik_mgr: IKCandidateSearch,
+        ik_mgr: IKGeometry,
         teleop_profile: OnlineIKConfig,
         elbow_joint_index: int = 3,
     ) -> None:

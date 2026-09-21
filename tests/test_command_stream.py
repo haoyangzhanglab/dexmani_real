@@ -93,7 +93,6 @@ class _FakeShared:
         self.run_generation_base_sequence = ctx.Value("Q", 0)
         self.arm_cmd_consumed_sequence = ctx.Value("q", -1)
         self.hand_cmd_consumed_sequence = ctx.Value("q", -1)
-        self.arm_command_seq = ctx.Value("Q", 0)
         self.is_running = ctx.Value("b", True)
         self.error_state = ctx.Value("b", False)
         self.estop_request = ctx.Value("b", False)
@@ -127,7 +126,6 @@ def _hand_qpos(value: float) -> np.ndarray:
 
 def _publish(
     shared: _FakeShared,
-    action_id: int,
     *,
     arm: float | None = None,
     hand: float | None = None,
@@ -136,7 +134,6 @@ def _publish(
 ):
     candidate = ActionCandidate(
         run_generation=generation,
-        action_id=action_id,
         arm_qpos=None if arm is None else _arm_qpos(arm),
         hand_qpos=None if hand is None else _hand_qpos(hand),
         is_hold=is_hold,
@@ -158,22 +155,21 @@ class OrderedDeliveryTest(_TransportTest):
             self.shared, self.shared.arm_cmd_consumed_sequence
         )
         sent = []
-        for action_id in (11, 12, 13):
-            _candidate, result = _publish(self.shared, action_id, arm=0.1 * action_id)
+        for target_number in (11, 12, 13):
+            _candidate, result = _publish(self.shared, arm=0.1 * target_number)
             self.assertTrue(result.published, result.reason)
-            sent.append((action_id, result.command.sequence))
+            sent.append((target_number, result.command.sequence))
         # Sequences are commit-produced and strictly ordered.
-        self.assertEqual([seq for _aid, seq in sent], [1, 2, 3])
+        self.assertEqual([seq for _target, seq in sent], [1, 2, 3])
 
         received = []
-        for expected_action_id, expected_seq in sent:
+        for expected_target, expected_seq in sent:
             record = consumer.next_record()
             self.assertIsNotNone(record)
             command, sequence = record
             self.assertEqual(sequence, expected_seq)
-            self.assertEqual(int(command["action_id"][0]), expected_action_id)
             self.assertEqual(
-                float(command["arm_qpos"][0][0]), 0.1 * expected_action_id
+                float(command["arm_qpos"][0][0]), 0.1 * expected_target
             )
             self.assertEqual(int(command["run_generation"][0]), _GEN)
             consumer.advance()
@@ -190,7 +186,7 @@ class OrderedDeliveryTest(_TransportTest):
         hand = CommandStreamConsumer(
             self.shared, self.shared.hand_cmd_consumed_sequence
         )
-        _candidate, result = _publish(self.shared, 21, arm=0.5)  # hand absent
+        _candidate, result = _publish(self.shared, arm=0.5)  # hand absent
         self.assertTrue(result.published, result.reason)
 
         arm_record = arm.next_record()
@@ -213,11 +209,11 @@ class FullBackpressureTest(_TransportTest):
         consumer = CommandStreamConsumer(
             self.shared, self.shared.arm_cmd_consumed_sequence
         )
-        for action_id in (31, 32, 33, 34):
-            _candidate, result = _publish(self.shared, action_id, arm=0.01 * action_id)
+        for target_number in (31, 32, 33, 34):
+            _candidate, result = _publish(self.shared, arm=0.01 * target_number)
             self.assertTrue(result.published, result.reason)
 
-        blocked_candidate, blocked = _publish(self.shared, 35, arm=0.35)
+        blocked_candidate, blocked = _publish(self.shared, arm=0.35)
         self.assertFalse(blocked.published)
         self.assertEqual(blocked.reason, "command fifo full")
         self.assertEqual(blocked.fifo_depth, 4)
@@ -225,7 +221,7 @@ class FullBackpressureTest(_TransportTest):
         # Free exactly one slot: the SAME candidate object commits unchanged.
         record = consumer.next_record()
         self.assertIsNotNone(record)
-        self.assertEqual(int(record[0]["action_id"][0]), 31)
+        self.assertAlmostEqual(float(record[0]["arm_qpos"][0][0]), 0.31)
         consumer.advance()
         retry = publish_command(
             self.shared, blocked_candidate, required_safety_state=SafetyState.RUNNING
@@ -234,15 +230,15 @@ class FullBackpressureTest(_TransportTest):
         self.assertEqual(retry.command.sequence, 5)
 
         # Drain everything: exactly 31..35 in order, no loss, no duplication.
-        seen = [31]
+        seen = [0.31]
         while True:
             record = consumer.next_record()
             if record is None:
                 break
             command, _sequence = record
-            seen.append(int(command["action_id"][0]))
+            seen.append(float(command["arm_qpos"][0][0]))
             consumer.advance()
-        self.assertEqual(seen, [31, 32, 33, 34, 35])
+        np.testing.assert_allclose(seen, [0.31, 0.32, 0.33, 0.34, 0.35])
 
     def test_slow_hand_governs_dual_consumer_capacity(self):
         arm = CommandStreamConsumer(
@@ -251,16 +247,16 @@ class FullBackpressureTest(_TransportTest):
         _hand = CommandStreamConsumer(
             self.shared, self.shared.hand_cmd_consumed_sequence
         )  # attached but never advances: the slow consumer
-        for action_id in (41, 42, 43, 44):
+        for target_number in (41, 42, 43, 44):
             _candidate, result = _publish(
-                self.shared, action_id, arm=0.1, hand=0.2
+                self.shared, arm=0.1, hand=0.2
             )
             self.assertTrue(result.published, result.reason)
             record = arm.next_record()
             self.assertIsNotNone(record)
             arm.advance()  # arm keeps up fully
         # Arm consumed everything, yet the lagging hand watermark blocks.
-        _candidate, blocked = _publish(self.shared, 45, arm=0.1, hand=0.2)
+        _candidate, blocked = _publish(self.shared, arm=0.1, hand=0.2)
         self.assertFalse(blocked.published)
         self.assertEqual(blocked.reason, "command fifo full")
 
@@ -270,8 +266,8 @@ class FullBackpressureTest(_TransportTest):
         )
         # hand watermark stays -1 (never attached): excluded from capacity.
         for round_index in range(3):
-            for action_id in range(51 + 10 * round_index, 55 + 10 * round_index):
-                _candidate, result = _publish(self.shared, action_id, arm=0.1)
+            for target_number in range(51 + 10 * round_index, 55 + 10 * round_index):
+                _candidate, result = _publish(self.shared, arm=0.1)
                 self.assertTrue(result.published, result.reason)
                 record = arm.next_record()
                 self.assertIsNotNone(record)
@@ -279,7 +275,7 @@ class FullBackpressureTest(_TransportTest):
         self.assertEqual(int(self.shared.hand_cmd_consumed_sequence.value), -1)
 
     def test_no_attached_consumer_fails_closed(self):
-        _candidate, result = _publish(self.shared, 61, arm=0.1)
+        _candidate, result = _publish(self.shared, arm=0.1)
         self.assertFalse(result.published)
         self.assertEqual(result.reason, "no attached command consumer")
 
@@ -289,8 +285,8 @@ class GenerationEpochTest(_TransportTest):
         consumer = CommandStreamConsumer(
             self.shared, self.shared.arm_cmd_consumed_sequence
         )
-        for action_id in (71, 72):
-            _candidate, result = _publish(self.shared, action_id, arm=0.1)
+        for target_number in (71, 72):
+            _candidate, result = _publish(self.shared, arm=0.1)
             self.assertTrue(result.published, result.reason)
 
         new_generation = invalidate_coupled_commands(self.shared)
@@ -304,7 +300,7 @@ class GenerationEpochTest(_TransportTest):
         self.assertIsNone(consumer.next_record())
 
         _candidate, result = _publish(
-            self.shared, 73, arm=0.3, generation=new_generation
+            self.shared, arm=0.3, generation=new_generation
         )
         self.assertTrue(result.published, result.reason)
         self.assertEqual(result.command.sequence, 3)
@@ -312,26 +308,25 @@ class GenerationEpochTest(_TransportTest):
         self.assertIsNotNone(record)
         command, sequence = record
         self.assertEqual(sequence, 3)
-        self.assertEqual(int(command["action_id"][0]), 73)
         self.assertEqual(int(command["run_generation"][0]), new_generation)
 
     def test_stale_watermark_cannot_hold_back_new_epoch(self):
         _consumer = CommandStreamConsumer(
             self.shared, self.shared.arm_cmd_consumed_sequence
         )
-        for action_id in (81, 82, 83, 84):
-            _candidate, result = _publish(self.shared, action_id, arm=0.1)
+        for target_number in (81, 82, 83, 84):
+            _candidate, result = _publish(self.shared, arm=0.1)
             self.assertTrue(result.published, result.reason)
         # Watermark stuck at 0 with a full backlog of the old epoch.
         new_generation = invalidate_coupled_commands(self.shared)
         # The clamp max(c, b-1) frees the whole capacity for the new epoch.
-        for action_id in (85, 86, 87, 88):
+        for target_number in (85, 86, 87, 88):
             _candidate, result = _publish(
-                self.shared, action_id, arm=0.1, generation=new_generation
+                self.shared, arm=0.1, generation=new_generation
             )
             self.assertTrue(result.published, result.reason)
         _candidate, blocked = _publish(
-            self.shared, 89, arm=0.1, generation=new_generation
+            self.shared, arm=0.1, generation=new_generation
         )
         self.assertFalse(blocked.published)
         self.assertEqual(blocked.reason, "command fifo full")
@@ -349,7 +344,7 @@ class CorruptionTest(_TransportTest):
         consumer = CommandStreamConsumer(
             self.shared, self.shared.arm_cmd_consumed_sequence
         )
-        _candidate, result = _publish(self.shared, 91, arm=0.1)
+        _candidate, result = _publish(self.shared, arm=0.1)
         self.assertTrue(result.published, result.reason)
         # Destroy the resident slot's seqlock marker behind the consumer's
         # back: a committed current-epoch sequence becomes unreadable.
@@ -364,7 +359,7 @@ class CorruptionTest(_TransportTest):
 
 
 def _arm_feedback_record(
-    *, action_id: int, generation: int, sequence: int
+    *, generation: int, sequence: int
 ) -> np.ndarray:
     record = np.zeros(1, dtype=ARM_STATE_DTYPE)
     record["connected"] = 1
@@ -373,15 +368,14 @@ def _arm_feedback_record(
     now_ns = time.monotonic_ns()
     record["source_monotonic_ns"] = now_ns
     record["qpos"] = 0.1
-    record["last_cmd_seq"] = action_id
     record["last_cmd_generation"] = generation
     record["last_cmd_accepted_sequence"] = sequence
-    record["last_cmd_accepted_monotonic_ns"] = now_ns if action_id else 0
+    record["last_cmd_accepted_monotonic_ns"] = now_ns if sequence else 0
     return record
 
 
 def _hand_feedback_record(
-    *, action_id: int, generation: int, sequence: int
+    *, generation: int, sequence: int
 ) -> np.ndarray:
     record = np.zeros(1, dtype=HAND_STATE_DTYPE)
     record["connected"] = 1
@@ -389,21 +383,19 @@ def _hand_feedback_record(
     now_ns = time.monotonic_ns()
     record["source_monotonic_ns"] = now_ns
     record["qpos"] = 0.1
-    record["accepted_target_action_id"] = action_id
     record["accepted_target_generation"] = generation
     record["accepted_target_sequence"] = sequence
-    record["accepted_target_monotonic_ns"] = now_ns if action_id else 0
+    record["accepted_target_monotonic_ns"] = now_ns if sequence else 0
     return record
 
 
 class WaitCommandAcceptedTest(_TransportTest):
-    """Ordered same-generation acceptance; no action-ID supersession."""
+    """Ordered SDK acceptance in the current motion generation."""
 
-    def _wait(self, *, command, action_id, wait_for_arm=True, wait_for_hand=False):
+    def _wait(self, *, command, wait_for_arm=True, wait_for_hand=False):
         return wait_command_accepted(
             self.shared,
             command=command,
-            action_id=action_id,
             wait_for_arm=wait_for_arm,
             wait_for_hand=wait_for_hand,
             timeout_s=0.2,
@@ -419,33 +411,32 @@ class WaitCommandAcceptedTest(_TransportTest):
                 command = CommittedCommand(run_generation=generation, sequence=3)
                 invalidate_coupled_commands(self.shared)
                 frame = (_arm_feedback_record if name == "arm" else _hand_feedback_record)(
-                    action_id=42, generation=generation, sequence=3)
+                    generation=generation, sequence=3)
                 getattr(self.shared, name + "_state_ring").set(frame)
-                result = self._wait(command=command, action_id=42,
-                    wait_for_arm=name == "arm", wait_for_hand=name == "hand")
+                result = self._wait(command=command, wait_for_arm=name == "arm", wait_for_hand=name == "hand")
                 self.assertFalse(result.accepted)
 
     def test_exact_acceptance_same_generation(self):
         from dexmani_real.runtime.safety import CommittedCommand
 
         self.shared.arm_state_ring.set(
-            _arm_feedback_record(action_id=42, generation=_GEN, sequence=3)
+            _arm_feedback_record(generation=_GEN, sequence=3)
         )
         result = self._wait(
-            command=CommittedCommand(run_generation=_GEN, sequence=3), action_id=42
+            command=CommittedCommand(run_generation=_GEN, sequence=3)
         )
         self.assertTrue(result.accepted, result.reason)
 
     def test_larger_same_generation_watermark_proves_predecessor(self):
         from dexmani_real.runtime.safety import CommittedCommand
 
-        # A later arm-targeted record was accepted (id 50 > 42, sequence 5 >= 3):
+        # A later arm-targeted record was accepted (sequence 5 >= 3):
         # ordered consumption proves our command was SDK-accepted first.
         self.shared.arm_state_ring.set(
-            _arm_feedback_record(action_id=50, generation=_GEN, sequence=5)
+            _arm_feedback_record(generation=_GEN, sequence=5)
         )
         result = self._wait(
-            command=CommittedCommand(run_generation=_GEN, sequence=3), action_id=42
+            command=CommittedCommand(run_generation=_GEN, sequence=3)
         )
         self.assertTrue(result.accepted, result.reason)
 
@@ -454,11 +445,11 @@ class WaitCommandAcceptedTest(_TransportTest):
 
         # A large watermark from the PREVIOUS generation is not evidence.
         self.shared.arm_state_ring.set(
-            _arm_feedback_record(action_id=99, generation=_GEN - 1, sequence=99)
+            _arm_feedback_record(generation=_GEN - 1, sequence=99)
         )
         generation_before = int(self.shared.run_generation.value)
         result = self._wait(
-            command=CommittedCommand(run_generation=_GEN, sequence=3), action_id=42
+            command=CommittedCommand(run_generation=_GEN, sequence=3)
         )
         self.assertFalse(result.accepted)
         self.assertIn("not accepted", result.reason)
@@ -471,10 +462,10 @@ class WaitCommandAcceptedTest(_TransportTest):
         from dexmani_real.runtime.safety import CommittedCommand
 
         self.shared.arm_state_ring.set(
-            _arm_feedback_record(action_id=40, generation=_GEN, sequence=2)
+            _arm_feedback_record(generation=_GEN, sequence=2)
         )
         result = self._wait(
-            command=CommittedCommand(run_generation=_GEN, sequence=3), action_id=42
+            command=CommittedCommand(run_generation=_GEN, sequence=3)
         )
         self.assertFalse(result.accepted)
 
@@ -482,11 +473,10 @@ class WaitCommandAcceptedTest(_TransportTest):
         from dexmani_real.runtime.safety import CommittedCommand
 
         self.shared.hand_state_ring.set(
-            _hand_feedback_record(action_id=42, generation=_GEN, sequence=3)
+            _hand_feedback_record(generation=_GEN, sequence=3)
         )
         result = self._wait(
             command=CommittedCommand(run_generation=_GEN, sequence=3),
-            action_id=42,
             wait_for_arm=False,
             wait_for_hand=True,
         )
@@ -496,11 +486,11 @@ class WaitCommandAcceptedTest(_TransportTest):
         from dexmani_real.runtime.safety import CommittedCommand
 
         self.shared.arm_state_ring.set(
-            _arm_feedback_record(action_id=40, generation=_GEN, sequence=2)
+            _arm_feedback_record(generation=_GEN, sequence=2)
         )
         self.shared.safety_state.value = int(SafetyState.DISARMED)
         result = self._wait(
-            command=CommittedCommand(run_generation=_GEN, sequence=3), action_id=42
+            command=CommittedCommand(run_generation=_GEN, sequence=3)
         )
         self.assertFalse(result.accepted)
         self.assertIn("safety state", result.reason)
@@ -545,8 +535,8 @@ class ArmWorkerConsumptionTest(_TransportTest):
         )
         st, arm = self._make_state(consumer)
         targets = []
-        for action_id, value in ((101, 0.05), (102, 0.09)):
-            _candidate, result = _publish(self.shared, action_id, arm=value)
+        for target_number, value in ((101, 0.05), (102, 0.09)):
+            _candidate, result = _publish(self.shared, arm=value)
             self.assertTrue(result.published, result.reason)
             targets.append(value)
             _consume_one_arm_command(st, self.shared, _GEN)
@@ -555,7 +545,6 @@ class ArmWorkerConsumptionTest(_TransportTest):
         self.assertAlmostEqual(float(arm.servo_calls[1][0]), targets[1])
         # The acceptance watermark advanced only after SDK acceptance.
         self.assertEqual(int(self.shared.arm_cmd_consumed_sequence.value), 2)
-        self.assertEqual(st.last_cmd.seq, 102)
         self.assertEqual(st.last_cmd.generation, _GEN)
         self.assertEqual(st.last_cmd.accepted_sequence, 2)
 
@@ -566,7 +555,7 @@ class ArmWorkerConsumptionTest(_TransportTest):
             self.shared, self.shared.arm_cmd_consumed_sequence
         )
         st, arm = self._make_state(consumer)
-        _candidate, result = _publish(self.shared, 103, hand=0.2)
+        _candidate, result = _publish(self.shared, hand=0.2)
         self.assertTrue(result.published, result.reason)
         _consume_one_arm_command(st, self.shared, _GEN)
         self.assertEqual(arm.servo_calls, [])
@@ -583,7 +572,7 @@ class ArmWorkerConsumptionTest(_TransportTest):
         # Inside hard joint limits but beyond max_servo_command_jump_rad
         # (0.349) from the worker's reference: the soft bound belongs to the
         # producer projection, so the worker still delivers it.
-        _candidate, result = _publish(self.shared, 104, arm=0.5)
+        _candidate, result = _publish(self.shared, arm=0.5)
         self.assertTrue(result.published, result.reason)
         generation_before = int(self.shared.run_generation.value)
         _consume_one_arm_command(st, self.shared, _GEN)
@@ -603,7 +592,7 @@ class ArmWorkerConsumptionTest(_TransportTest):
         )
         st, arm = self._make_state(consumer)
         # Joint 2 upper limit is ~2.094 rad: 2.5 violates the hard box.
-        _candidate, result = _publish(self.shared, 105, arm=2.5)
+        _candidate, result = _publish(self.shared, arm=2.5)
         self.assertTrue(result.published, result.reason)
         with self.assertRaises(RuntimeError):
             _consume_one_arm_command(st, self.shared, _GEN)
@@ -666,24 +655,24 @@ class HandWorkerConsumptionTest(_TransportTest):
         statuses = [_FakeSendStatus.ACCEPTED] * 10
         _consumer, ack, hand, consume = self._setup(statuses)
         target_value = 0.25  # 2.5 slew steps of 0.1 from zero
-        _candidate, result = _publish(self.shared, 111, hand=target_value)
+        _candidate, result = _publish(self.shared, hand=target_value)
         self.assertTrue(result.published, result.reason)
 
         consume()  # bounded = 0.1: intermediate
         self.assertEqual(len(hand.sent), 1)
         self.assertAlmostEqual(float(hand.sent[0][0]), 0.1)
-        self.assertEqual(ack.accepted_target_action_id, 0)
+        self.assertEqual(ack.accepted_target_sequence, 0)
         self.assertEqual(
             int(self.shared.hand_cmd_consumed_sequence.value), 0
         )  # cursor holds
 
         consume()  # bounded = 0.2: intermediate
         self.assertAlmostEqual(float(hand.sent[1][0]), 0.2)
-        self.assertEqual(ack.accepted_target_action_id, 0)
+        self.assertEqual(ack.accepted_target_sequence, 0)
 
         consume()  # bounded == target: exact endpoint ACCEPTED
         self.assertAlmostEqual(float(hand.sent[2][0]), target_value)
-        self.assertEqual(ack.accepted_target_action_id, 111)
+        self.assertEqual(ack.accepted_target_sequence, result.command.sequence)
         self.assertEqual(ack.accepted_target_generation, _GEN)
         self.assertEqual(ack.accepted_target_sequence, 1)
         self.assertEqual(
@@ -694,33 +683,33 @@ class HandWorkerConsumptionTest(_TransportTest):
         _consumer, ack, hand, consume = self._setup(
             [_FakeSendStatus.CRC_UNCONFIRMED, _FakeSendStatus.ACCEPTED]
         )
-        _candidate, result = _publish(self.shared, 112, hand=0.05)
+        _candidate, result = _publish(self.shared, hand=0.05)
         self.assertTrue(result.published, result.reason)
 
         consume()  # CRC: no reference update, no ACK, no cursor move
         self.assertEqual(len(hand.sent), 1)
-        self.assertEqual(ack.accepted_target_action_id, 0)
+        self.assertEqual(ack.accepted_target_sequence, 0)
         self.assertEqual(ack.last_sdk_setpoint_accepted_monotonic_ns, 0)
         self.assertTrue(np.all(ack.last_sdk_accepted_qpos == 0.0))
         self.assertEqual(int(self.shared.hand_cmd_consumed_sequence.value), 0)
 
         consume()  # retry of the SAME record is accepted exactly
         self.assertEqual(len(hand.sent), 2)
-        self.assertEqual(ack.accepted_target_action_id, 112)
+        self.assertEqual(ack.accepted_target_sequence, result.command.sequence)
         self.assertEqual(int(self.shared.hand_cmd_consumed_sequence.value), 1)
 
     def test_sdk_rejection_raises_worker_fault(self):
         from dexmani_real.robot.hand_worker import _HandWorkerFault
 
         _consumer, _ack, _hand, consume = self._setup([_FakeSendStatus.REJECTED])
-        _candidate, result = _publish(self.shared, 113, hand=0.05)
+        _candidate, result = _publish(self.shared, hand=0.05)
         self.assertTrue(result.published, result.reason)
         with self.assertRaises(_HandWorkerFault):
             consume()
 
     def test_absent_hand_record_advances_without_send(self):
         _consumer, _ack, hand, consume = self._setup([])
-        _candidate, result = _publish(self.shared, 114, arm=0.1)
+        _candidate, result = _publish(self.shared, arm=0.1)
         self.assertTrue(result.published, result.reason)
         consume()
         self.assertEqual(hand.sent, [])
@@ -759,7 +748,7 @@ class WorkerEpochInterleavingTest(_TransportTest):
                 old_permit = int(self.shared.run_generation.value)
                 invalidate_coupled_commands(self.shared)
                 generation = int(self.shared.run_generation.value)
-                _, receipt = _publish(self.shared, 901, generation=generation, **{name: .05})
+                _, receipt = _publish(self.shared, generation=generation, **{name: .05})
                 sequence = receipt.command.sequence
                 tick(old_permit)
                 self.assertEqual(consumer.next_sequence, sequence)
@@ -774,12 +763,12 @@ class WorkerEpochInterleavingTest(_TransportTest):
             with self.subTest(worker=name):
                 consumer, sdk, tick = self._worker(name)
                 generation = int(self.shared.run_generation.value)
-                _, receipt = _publish(self.shared, 902, generation=generation, **{name: .05})
+                _, receipt = _publish(self.shared, generation=generation, **{name: .05})
                 original = sdk.servo if name == "arm" else sdk.send_action
                 def late(target):
                     result = original(target)
                     invalidate_coupled_commands(self.shared)
-                    _, new = _publish(self.shared, 903,
+                    _, new = _publish(self.shared,
                         generation=int(self.shared.run_generation.value), **{name: .06})
                     # No other thread owns this consumer; emulate its next rebase
                     # only after the old invocation returns, as the worker does.
@@ -795,7 +784,7 @@ class WorkerEpochInterleavingTest(_TransportTest):
     def test_consumed_fifo_epoch_does_not_report_pending_drop(self):
         from unittest.mock import patch
         consumer, sdk, tick = self._worker("arm")
-        _publish(self.shared, 906, arm=.05)
+        _publish(self.shared, arm=.05)
         tick(_GEN)
         with patch("dexmani_real.runtime.safety.logger.info") as log:
             invalidate_coupled_commands(self.shared)
@@ -808,7 +797,7 @@ class WorkerEpochInterleavingTest(_TransportTest):
             with self.subTest(worker=name):
                 consumer, sdk, tick = self._worker(name)
                 generation = int(self.shared.run_generation.value)
-                _, receipt = _publish(self.shared, 905, generation=generation, **{name: .05})
+                _, receipt = _publish(self.shared, generation=generation, **{name: .05})
                 def fence(shared, **kwargs):
                     invalidate_coupled_commands(shared)
                     return coupled_command_may_cross_sdk(shared, **kwargs)
@@ -823,7 +812,6 @@ class WorkerEpochInterleavingTest(_TransportTest):
                 consumer, sdk, tick = self._worker(name)
                 frame = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
                 frame["run_generation"] = int(self.shared.run_generation.value) + 1
-                frame["action_id"] = 904
                 self.shared.coupled_cmd_ring.write(frame)
                 with self.assertRaises(CommandStreamCorruption):
                     tick(int(self.shared.run_generation.value))
@@ -842,7 +830,6 @@ def _spawn_consume_one(shared) -> None:
         record = consumer.next_record()
         if record is not None:
             command, _sequence = record
-            assert int(command["action_id"][0]) == 12345
             assert float(command["arm_qpos"][0][0]) == 0.25
             consumer.advance()
             return
@@ -870,7 +857,7 @@ class SpawnTransportTest(unittest.TestCase):
                 self.assertEqual(process.exitcode, None, "consumer child died")
                 time.sleep(0.01)
             self.assertGreaterEqual(int(shared.arm_cmd_consumed_sequence.value), 0)
-            _candidate, result = _publish(shared, 12345, arm=0.25)
+            _candidate, result = _publish(shared, arm=0.25)
             self.assertTrue(result.published, result.reason)
             process.join(timeout=30.0)
             self.assertEqual(process.exitcode, 0)

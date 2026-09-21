@@ -78,11 +78,9 @@ def validate_point_cloud_array(
 # bounded ordered command FIFO. Consumers read records by sequence in commit
 # order and workers execute only while the record's run_generation still owns
 # motion; there is no per-command lease and no latest-wins supersession. The
-# queue sequence is produced by the commit; action IDs are producer-assigned,
-# globally monotonic, and may have gaps — the two identities are never mixed.
+# queue sequence is assigned only by a successful commit.
 _COMMON_COMMAND_FIELDS = [
     ("run_generation", "<u8"),
-    ("action_id", "<u8"),
     ("is_hold", "<u1"),
 ]
 COUPLED_COMMAND_DTYPE = np.dtype(
@@ -106,8 +104,7 @@ ARM_STATE_DTYPE = np.dtype(
         # a disconnect now fails the worker, so this is truthful while alive.
         ("connected", "<u1"),
         ("tracking_err", "<f8"),
-        ("last_cmd_seq", "<u8"),
-        # Monotonic time immediately after the arm SDK accepted last_cmd_seq.
+        # Monotonic time immediately after the arm SDK accepted the command.
         ("last_cmd_accepted_monotonic_ns", "<u8"),
         # Generation and FIFO sequence of the SDK-accepted command, so waiters
         # distinguish a stale-generation ACK from ordered acceptance in the
@@ -138,11 +135,9 @@ HAND_STATE_DTYPE = np.dtype(
         ("connected", "<u1"),
         # Set when qpos is held from the last read after a single-frame failure.
         ("qpos_stale", "<u1"),
-        # action_id whose exact requested target was accepted by
-        # XHand.send_action(), including a configured-current overrun accepted
-        # as grasp contact. This is not physical convergence.
-        ("accepted_target_action_id", "<u8"),
-        # Monotonic time immediately after the XHand SDK accepted that target.
+        # Monotonic time after XHand accepted the exact requested target,
+        # including a configured-current overrun accepted as grasp contact.
+        # This is SDK acceptance, not physical convergence.
         ("accepted_target_monotonic_ns", "<u8"),
         # Generation and FIFO sequence of the exact-endpoint acceptance, so
         # waiters reject stale-generation ACKs and use ordered acceptance in
@@ -223,7 +218,6 @@ def make_record_sample_dtype(
             ("arm_connected", "<u1"),
             ("hand_connected", "<u1"),
             ("tracking_error", "<f8"),
-            ("arm_last_cmd_seq", "<i8"),
             ("action_arm_joint_sent", "<f8", ARM_JOINT_SHAPE),
             ("action_hand_joint", "<f8", HAND_JOINT_SHAPE),
             ("action_arm_ee", "<f8", (9,)),

@@ -45,11 +45,6 @@ from dexmani_real.robot.model import (
     XHAND_SENSOR_NATIVE_AXES_FRAME,
 )
 
-FIXED_POLICY_RUNTIME_TARGET = (
-    "dexmani_real.deployment.inference.dexmani_policy:DexManiPolicyAdapter"
-)
-
-
 _SUPPORTED_OBSERVATION_FIELDS = frozenset(
     {
         "joint_state",
@@ -401,7 +396,6 @@ class FingertipAssemblerConfig:
 
 
 __all__ = [
-    "FIXED_POLICY_RUNTIME_TARGET",
     "FingertipAssemblerConfig",
     "PolicyRuntimeConfig",
     "RolloutRecordingConfig",

@@ -54,7 +54,6 @@ def episode_source_values(
         "arm_connected": state.arm_connected,
         "hand_connected": state.hand_connected,
         "hand_qpos_stale": state.hand_qpos_stale,
-        "arm_last_cmd_seq": state.arm_last_cmd_seq,
         "action_arm_joint_sent": arm_qpos_sent,
         "action_hand_joint": action.hand_qpos_cmd,
         "action_arm_ee": np.concatenate(

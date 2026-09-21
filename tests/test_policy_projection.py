@@ -296,7 +296,7 @@ class FullRetryKeepsCandidateTest(unittest.TestCase):
 
         runner = PolicyRunner.__new__(PolicyRunner)
         candidate = ActionCandidate(
-            run_generation=7, action_id=41, arm_qpos=np.full(7, 0.1)
+            run_generation=7, arm_qpos=np.full(7, 0.1)
         )
         runner._pending_dispatch = candidate
         runner.shared = SimpleNamespace()
@@ -309,7 +309,7 @@ class FullRetryKeepsCandidateTest(unittest.TestCase):
         observed: dict = {}
         runner._fifo_wait = SimpleNamespace(
             waiting=False,
-            note_full=lambda depth, keep: observed.update(depth=depth, keep=keep),
+            note_full=lambda depth: observed.update(depth=depth),
             note_committed=lambda: observed.update(committed=True),
             note_dropped=lambda reason, **kw: observed.update(dropped=reason),
         )
@@ -327,7 +327,7 @@ class FullRetryKeepsCandidateTest(unittest.TestCase):
         self.assertEqual(len(runner.actions), 1)  # head not popped
         self.assertEqual(runner.last_publication_ns, 1_000_000)  # cadence kept
         self.assertEqual(runner.chunk_action_index, 0)
-        self.assertEqual(observed.get("keep"), 41)
+        self.assertEqual(observed.get("depth"), 8)
         self.assertNotIn("committed", observed)
 
 
@@ -382,7 +382,6 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
         runner.runtime = runtime
         runner.shared = _fake_shared(safety_state=SafetyState.RUNNING)
         lock = threading.RLock()
-        runner.shared.arm_command_seq = SimpleNamespace(value=40, get_lock=lambda: lock)
         runner.run_generation = runner.shared.run_generation.value
         runner.previous_arm_command_qpos = np.asarray(runtime.arm.home_qpos).copy()
         arm = runner.previous_arm_command_qpos.copy()
@@ -445,7 +444,6 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
                     if arm_clip or hand_clip:
                         lines = [line for line in logs.output if "[CLIP]" in line]
                         self.assertEqual(len(lines), 1)
-                        self.assertIn(f"action={candidate.action_id}", lines[0])
                         self.assertEqual("arm_max_delta_rad=" in lines[0], arm_clip)
                         self.assertEqual("hand_max_correction_rad=" in lines[0], hand_clip)
                         if hand_clip:

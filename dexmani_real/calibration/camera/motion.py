@@ -70,7 +70,7 @@ def _publish_with_backpressure(
         and result.reason == PUBLISH_REASON_FIFO_FULL
         and time.monotonic() < deadline_s
     ):
-        fifo_wait.note_full(result.fifo_depth, int(candidate.action_id))
+        fifo_wait.note_full(result.fifo_depth)
         if abort_requested is not None and abort_requested():
             break
         time.sleep(_FULL_RETRY_POLL_S)
@@ -225,7 +225,6 @@ def publish_calibration_quit_hold(
         accepted = wait_command_accepted(
             shared,
             command=published.command,
-            action_id=candidate.action_id,
             wait_for_arm=True,
             wait_for_hand=False,
             timeout_s=float(runtime.policy.action_apply_timeout_s),
@@ -478,7 +477,6 @@ def run_calibration_motion_tick(
         accepted = wait_command_accepted(
             shared,
             command=published.command,
-            action_id=candidate.action_id,
             wait_for_arm=True,
             wait_for_hand=False,
             timeout_s=float(runtime.policy.action_apply_timeout_s),

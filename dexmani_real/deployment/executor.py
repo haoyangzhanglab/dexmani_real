@@ -53,7 +53,6 @@ from dexmani_real.deployment.inference.observation import (
     observation_sources,
     observation_timing_ms,
 )
-from dexmani_real.deployment.inference.runtime import PolicyRuntime
 from dexmani_real.deployment.metrics import PolicyStats, flush_every
 from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
@@ -350,7 +349,7 @@ class PolicyRunner:
         runtime: ExperimentConfig,
         policy_spec: Any,
         *,
-        model_runtime: PolicyRuntime,
+        model_runtime: Any,
         fingertip_runtime: Any,
         execute: bool,
         max_running_s: float | None,
@@ -1332,7 +1331,7 @@ class PolicyRunner:
                     f"hand_max_correction_rad={clip.hand_max_correction_rad:.17g} "
                     f"hand_joint={clip.hand_joint}"
                 )
-            logger.info("[CLIP] action=%d %s", int(candidate.action_id), " ".join(fields))
+            logger.info("[CLIP] %s", " ".join(fields))
         try:
             prepared = prepare_command(
                 self.shared,
@@ -1475,12 +1474,7 @@ class PolicyRunner:
             # and retry from the poll cadence. One visible [WAIT] line per
             # continuous full span; STOP/fault/timeout keep priority because
             # the main loop polls them between retries.
-            keep_action = (
-                self._pending_dispatch.action_id
-                if self._pending_dispatch is not None
-                else 0
-            )
-            self._fifo_wait.note_full(result.fifo_depth, keep_action)
+            self._fifo_wait.note_full(result.fifo_depth)
             return
         if result.reason in {PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT}:
             return
@@ -1600,7 +1594,14 @@ class PolicyRunner:
         if self._running_time_expired(started_ns):
             return
         try:
-            predicted = self.model_runtime.predict(policy_observation)
+            predicted = np.asarray(
+                self.model_runtime.predict(policy_observation), dtype=np.float64
+            )
+            expected = (self.policy_spec.n_action_steps, self.policy_spec.control_action_dim)
+            if predicted.shape != expected:
+                raise ValueError(f"Policy action shape {predicted.shape} conflicts with {expected}")
+            if not np.all(np.isfinite(predicted)):
+                raise ValueError("Policy actions contain NaN/Inf")
         except Exception as exc:
             # Model/contract failure (CUDA OOM, forward error, shape/NaN/Inf) is a
             # session failure, not a physical fault: fence, mark failed, and let
@@ -1773,11 +1774,10 @@ class PolicyRunner:
         )
 
 
-def _load_policy_runtime(config: PolicyRuntimeConfig) -> PolicyRuntime:
+def _load_policy_runtime(config: PolicyRuntimeConfig) -> Any:
     """Load model/CUDA only inside the policy child, through the public API."""
     from dexmani_policy.deployment import load_experiment
 
-    from dexmani_real.deployment.inference.dexmani_policy import DexManiPolicyAdapter
 
     loaded = load_experiment(
         config.experiment,
@@ -1787,7 +1787,9 @@ def _load_policy_runtime(config: PolicyRuntimeConfig) -> PolicyRuntime:
         inference_steps=config.inference_steps,
     )
     try:
-        return DexManiPolicyAdapter(loaded, config.spec)
+        if loaded.spec != config.spec:
+            raise RuntimeError("PolicySpec changed between inspect and load")
+        return loaded
     except BaseException:
         loaded.close()
         raise
