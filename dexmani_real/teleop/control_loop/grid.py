@@ -8,19 +8,10 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.control.action import ActionCandidate
-from dexmani_real.control.publication import (
-    PUBLISH_REASON_FIFO_FULL,
-    PUBLISH_REASON_SAFETY_STATE,
-    PreparedCommand,
-    PublishResult,
-    PublishWaitTracker,
-    prepare_joint_command,
-    publish_command,
-    wait_command_accepted,
-)
-from dexmani_real.control.projection import project_arm_command_reported
-from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
+from dexmani_real.robot.commands import ActionCandidate
+from dexmani_real.robot.commands import (PUBLISH_REASON_FIFO_FULL, PUBLISH_REASON_SAFETY_STATE, PreparedCommand, PublishResult, prepare_joint_command, publish_command, wait_command_accepted)
+from dexmani_real.robot.projection import project_arm_command_reported
+from dexmani_real.robot.commands import GateRejectCode, SafetyGate
 from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
     read_causal_structured_frame,
@@ -71,7 +62,7 @@ class _TeleopCommandLimits:
     arm_joint_lower_rad: np.ndarray
     arm_joint_upper_rad: np.ndarray
     teleop_arm_max_delta_rad_per_tick: np.ndarray | None
-    # Physical command-continuity bound owned by control/projection.py; the
+    # Physical command-continuity bound owned by robot/projection.py; the
     # teleop delta above is human-smoothing config, not this bound.
     arm_max_servo_command_jump_rad: float
     hand_home_qpos_rad: np.ndarray
@@ -181,9 +172,8 @@ class _PendingTeleopPublish:
     retarget_succeeded: bool = True
 
 
-def _drop_pending_publish(
+def drop_pending_command(
     controller: "TeleopController",
-    resources: "TeleopGridResources",
     reason: str,
 ) -> None:
     """Visibly drop a local pending candidate revoked by lifecycle."""
@@ -192,27 +182,8 @@ def _drop_pending_publish(
         return
     controller.pending_publish = None
     logger.warning(
-        "[DROP] teleop action=%d reason=%s", pending.candidate.action_id, reason
+        "[DROP] teleop pending command reason=%s", reason
     )
-    # The action owner already reported this cancellation; close the span once.
-    resources.fifo_wait.note_dropped(reason, report=False)
-
-
-def close_publish_span(
-    controller: "TeleopController",
-    resources: "TeleopGridResources",
-    reason: str,
-) -> None:
-    """End any retained backpressure span at a pause/re-anchor boundary.
-
-    Every pause path discards ``controller.pending_publish``; without closing
-    the tracker here a span would outlive its candidate, suppressing the next
-    ``[WAIT]`` and turning the following ``[RESUME]`` into a wait that never
-    resumed. ``note_dropped`` is a no-op when no span is open, so this is safe
-    on every boundary.
-    """
-    _drop_pending_publish(controller, resources, reason)
-    resources.fifo_wait.note_dropped(reason)
 
 
 @dataclass(frozen=True)
@@ -228,7 +199,6 @@ class TeleopGridResources:
     arm_feedback_warn: ThrottledWarner
     hand_ramp_total_frames: int
     max_observation_skew_s: float
-    fifo_wait: PublishWaitTracker
 
 
 @dataclass(frozen=True)
@@ -467,7 +437,6 @@ def _record_grid_hold(
     record_held(
         resources.recorder,
         observation.arm_state,
-        controller.prev_qpos_cmd,
         controller.prev_hand_qpos,
         observation.vr_frame,
         observation.camera_frame,
@@ -696,7 +665,7 @@ def _read_control_grid_observation(
                 hand_source_monotonic_ns=hand_source_ns,
             )
         ):
-            close_publish_span(controller, resources, "pause_release")
+            drop_pending_command(controller, "pause_release")
             if controller.reset_reference(arm_state, vr_frame, hand_state):
                 logger.info(
                     "teleop_loop: released %s pause boundary after fresh re-anchor",
@@ -776,11 +745,10 @@ def _confirm_terminal_arm_acceptance_if_needed(
     ):
         return True
     assert publication.published and publication.command is not None
-    assert candidate.arm_qpos is not None and candidate.action_id > 0
+    assert candidate.arm_qpos is not None
     acceptance = wait_command_accepted(
         shared,
         command=publication.command,
-        action_id=candidate.action_id,
         wait_for_arm=True,
         wait_for_hand=False,
         timeout_s=float(cfg.runtime.policy.action_apply_timeout_s),
@@ -834,7 +802,6 @@ def _commit_pending_command(
     )
     if not result.published:
         if result.reason == PUBLISH_REASON_FIFO_FULL:
-            resources.fifo_wait.note_full(result.fifo_depth, candidate.action_id)
             _record_grid_hold(
                 controller,
                 shared,
@@ -845,12 +812,12 @@ def _commit_pending_command(
             )
             return True
         if _publication_motion_revoked(shared, PreparedCommand(candidate=candidate)):
-            _drop_pending_publish(controller, resources, "motion_revoked")
+            drop_pending_command(controller, "motion_revoked")
             return True
         if result.reason.startswith(PUBLISH_REASON_SAFETY_STATE):
             # A lifecycle pause is revoking this epoch; the held row stays
             # honest and the outer loop owns the pause boundary.
-            _drop_pending_publish(controller, resources, result.reason)
+            drop_pending_command(controller, result.reason)
             _record_grid_hold(
                 controller,
                 shared,
@@ -864,10 +831,9 @@ def _commit_pending_command(
             "teleop_loop: joint publication stopped by runtime gate: %s",
             result.reason,
         )
-        _drop_pending_publish(controller, resources, result.reason)
+        drop_pending_command(controller, result.reason)
         return False
 
-    resources.fifo_wait.note_committed()
     controller.pending_publish = None
     if not _confirm_terminal_arm_acceptance_if_needed(
         shared, cfg, resources.recorder, candidate, result,
@@ -1128,8 +1094,7 @@ def _publish_solved_action(
         # §4/V19). A retained FULL candidate is never re-projected, so this
         # cannot repeat within one span.
         logger.info(
-            "[CLIP] action=%d arm_max_delta_rad=%.3f joint=%d",
-            int(prepared.candidate.action_id),
+            "[CLIP] arm_max_delta_rad=%.3f joint=%d",
             arm_clip.max_abs_delta_rad,
             arm_clip.joint,
         )
@@ -1214,7 +1179,7 @@ def run_control_grid_tick(
         pending is not None
         and int(pending.candidate.run_generation) != control_run_generation
     ):
-        _drop_pending_publish(controller, resources, "generation_revoked")
+        drop_pending_command(controller, "generation_revoked")
     tick_result, observation = _read_control_grid_observation(
         controller,
         shared,

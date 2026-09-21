@@ -26,7 +26,7 @@ import numpy as np
 # Only a genuinely missing dependency may skip this module: a renamed or
 # broken symbol must fail the suite rather than hide behind a skip.
 try:
-    from dexmani_real.deployment.inference.observation import (
+    from dexmani_real.deployment.observation import (
         _pointcloud_frame_from_record,
         _read_state_history,
         _rgb_identity_from_header,
@@ -88,6 +88,37 @@ def _camera_header(
 
 @unittest.skipIf(_IMPORT_ERROR is not None, f"dependencies unavailable: {_IMPORT_ERROR}")
 class StateHistoryAdmissionTest(unittest.TestCase):
+    def test_public_joint_mapping_owns_float32_aligned_arrays(self):
+        from dexmani_real.deployment.observation import build_policy_observation
+        from dexmani_real.ipc.schema import HAND_STATE_DTYPE
+
+        arm = [_arm_frame(t, t, i, qpos=i) for i, t in enumerate((100, 200), 1)]
+        hand = []
+        for i, t in enumerate((100, 200), 1):
+            record = np.zeros(1, dtype=HAND_STATE_DTYPE)
+            record["state_valid"] = 1
+            record["source_monotonic_ns"] = t
+            record["publish_monotonic_ns"] = t
+            record["qpos"] = i + 10
+            hand.append((record, t, i))
+        shared = SimpleNamespace(arm_state_ring=_FakeRing(arm), hand_state_ring=_FakeRing(hand))
+        spec = SimpleNamespace(n_obs_steps=2, control_dt_s=100e-9, requires_hand=True,
+                               observation_fields=[SimpleNamespace(name="joint_state")])
+        arrays = build_policy_observation(shared, spec, anchor_ns=200,
+                                          run_started_ns=100, step_dt_ns=100)
+        self.assertIs(type(arrays), dict)
+        self.assertEqual(set(arrays), {"joint_state"})
+        joint = arrays["joint_state"]
+        self.assertEqual(joint.shape, (2, 19))
+        self.assertEqual(joint.dtype, np.float32)
+        self.assertTrue(joint.flags.c_contiguous and joint.flags.writeable)
+        np.testing.assert_array_equal(joint[:, 0], [1, 2])
+        np.testing.assert_array_equal(joint[:, 7], [11, 12])
+        arm[0][0]["qpos"] = 99
+        hand[0][0]["qpos"] = 99
+        self.assertEqual(joint[0, 0], 1)
+        self.assertEqual(joint[0, 7], 11)
+
     def test_old_but_causal_frames_are_admitted(self):
         """A frame far older than any removed age gate stays a valid slot."""
         anchor = 100 * _S
@@ -145,7 +176,7 @@ class StateHistoryAdmissionTest(unittest.TestCase):
 @unittest.skipIf(_IMPORT_ERROR is not None, f"dependencies unavailable: {_IMPORT_ERROR}")
 class RingCommitAdmissionTest(unittest.TestCase):
     def test_real_commit_and_payload_order_for_arm_and_hand(self):
-        from dexmani_real.deployment.inference.observation import _read_hand_history
+        from dexmani_real.deployment.observation import _read_hand_history
         from dexmani_real.ipc.schema import HAND_STATE_DTYPE
         for name, dtype in (("arm", ARM_STATE_DTYPE), ("hand", HAND_STATE_DTYPE)):
             for publish, commit, anchor, admitted in (

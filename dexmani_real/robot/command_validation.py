@@ -2,7 +2,7 @@
 
 Workers own only the HARD boundary at the SDK fence: finiteness and the
 physical joint limits. The soft command-jump bound is owned once by
-``control/projection.py`` at production time; a worker never re-rejects the
+``robot/projection.py`` at production time; a worker never re-rejects the
 same soft threshold (no duplicate validation of one constraint).
 """
 

@@ -1,16 +1,13 @@
-"""The only supported raw episode layout: physical source rows, schema v29."""
+"""The only supported raw episode layout: physical source rows, schema v30."""
 
 from dataclasses import dataclass
-from enum import IntEnum
 
 import numpy as np
 
-EPISODE_SCHEMA_VERSION = 29
+EPISODE_SCHEMA_VERSION = 30
 ARM_SENT_DATASET = "action_arm_joint_sent"
 
 
-class FillReason(IntEnum):
-    SOURCE = 0
 
 
 @dataclass(frozen=True)
@@ -25,9 +22,6 @@ def _spec(dtype, tail_shape=()):
 
 DATASET_SPECS = {
     "timestamp": _spec(np.float64),
-    "source_sample_index": _spec(np.int64),
-    "fill_reason": _spec(np.uint8),
-    "flag_sample_valid": _spec(np.bool_),
     "arm_qpos": _spec(np.float64, (7,)),
     "arm_qvel": _spec(np.float64, (7,)),
     "arm_tau": _spec(np.float64, (7,)),
@@ -44,7 +38,6 @@ DATASET_SPECS = {
     "hand_connected": _spec(np.bool_),
     "hand_qpos_stale": _spec(np.bool_),
     "tracking_error": _spec(np.float64),
-    "arm_last_cmd_seq": _spec(np.int64),
     "action_arm_joint_sent": _spec(np.float64, (7,)),
     "action_hand_joint": _spec(np.float64, (12,)),
     "action_arm_ee": _spec(np.float64, (9,)),
@@ -69,9 +62,6 @@ DATASET_SPECS = {
 }
 SOURCE_FRAME_DATASET_NAMES = frozenset(DATASET_SPECS) - {
     "timestamp",
-    "source_sample_index",
-    "fill_reason",
-    "flag_sample_valid",
 }
 
 

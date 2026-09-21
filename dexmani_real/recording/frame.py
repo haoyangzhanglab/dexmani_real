@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import time
 
 import numpy as np
 
 from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d
-from dexmani_real.recording.sample import EpisodeAction, EpisodeState
 from dexmani_real.recording.storage.schema import (
     DATASET_SPECS,
     SOURCE_FRAME_DATASET_NAMES,
@@ -27,50 +27,45 @@ class EpisodeFrame:
     camera_depth: np.ndarray | None = None
 
 
-def episode_source_values(
-    state: EpisodeState,
-    action: EpisodeAction,
+def build_episode_frame(
+    arm_state: np.ndarray | None,
+    hand_state: np.ndarray | None,
+    action: Mapping[str, np.ndarray],
     vr_frame: Mapping[str, object],
     *,
+    timestamp_s: float | None = None,
     camera_frame: Mapping[str, object] | None = None,
     signals: Mapping[str, object] | None = None,
-    arm_qpos_sent: np.ndarray | None = None,
-) -> dict[str, EpisodeValue]:
-    """Map source values; the destination owns copying them before retention."""
+) -> EpisodeFrame:
+    """Copy a control sample directly into the raw episode's field names.
+
+    Action keys are action_arm_joint_sent, action_hand_joint, action_arm_ee.
+    Joint targets are those actually submitted, while action_arm_ee retains
+    Cartesian intent. Invalid tactile is NaN, never a false zero-contact sample.
+    Arm/hand payloads and timestamps refer to the caller's one selected sample.
+    """
+    arm = arm_state[0] if arm_state is not None else None
+    hand = hand_state[0] if hand_state is not None else None
+    contact_valid = hand is not None and bool(hand["tactile_aggregate_valid"])
+    dense_valid = hand is not None and bool(hand["tactile_dense_valid"])
     signal = signals or {}
     camera = camera_frame or {}
-    if arm_qpos_sent is None:
-        raise ValueError("recording requires the explicit submitted arm target")
-    return {
-        "arm_qpos": state.arm_qpos,
-        "arm_qvel": state.arm_qvel,
-        "arm_tau": state.arm_tau,
-        "hand_qpos": state.hand_qpos,
-        "hand_current": state.hand_current,
-        "hand_contact": state.hand_contact,
-        "hand_contact_valid": state.hand_contact_valid,
-        "hand_tactile_force": state.hand_tactile_force,
-        "hand_tactile_force_valid": state.hand_tactile_force_valid,
-        "arm_connected": state.arm_connected,
-        "hand_connected": state.hand_connected,
-        "hand_qpos_stale": state.hand_qpos_stale,
-        "arm_last_cmd_seq": state.arm_last_cmd_seq,
-        "action_arm_joint_sent": arm_qpos_sent,
-        "action_hand_joint": action.hand_qpos_cmd,
-        "action_arm_ee": np.concatenate(
-            (
-                (
-                    action.target_eef_pos
-                    if action.target_eef_pos is not None
-                    else np.full(3, np.nan)
-                ),
-                (
-                    action.target_eef_rot6d
-                    if action.target_eef_rot6d is not None
-                    else np.full(6, np.nan)
-                ),
-            )
-        ),
+    values = {
+        "arm_qpos": arm["qpos"] if arm is not None else np.full(7, np.nan),
+        "arm_qvel": arm["qvel"] if arm is not None else np.full(7, np.nan),
+        "arm_tau": arm["tau"] if arm is not None else np.full(7, np.nan),
+        "hand_qpos": hand["qpos"] if hand is not None else np.full(12, np.nan),
+        "hand_current": hand["current"] if hand is not None else np.full(12, np.nan),
+        "hand_contact": hand["tactile_aggregate"] if contact_valid else np.full((5, 3), np.nan),
+        "hand_contact_valid": contact_valid,
+        "hand_tactile_force": hand["tactile_dense"] if dense_valid else np.full((5, 120, 3), np.nan),
+        "hand_tactile_force_valid": dense_valid,
+        "arm_connected": bool(arm["connected"]) if arm is not None else False,
+        "hand_connected": bool(hand["connected"]) if hand is not None else False,
+        "hand_qpos_stale": bool(hand["qpos_stale"]) if hand is not None else False,
+        "action_arm_joint_sent": action["action_arm_joint_sent"],
+        "action_hand_joint": action["action_hand_joint"],
+        "action_arm_ee": action["action_arm_ee"],
         "flag_action_queued": signal.get("action_queued", False),
         "flag_frame_status": signal.get("frame_status", 0),
         "tracking_error": signal.get("tracking_error", np.nan),
@@ -97,33 +92,12 @@ def episode_source_values(
             "head_quat_wxyz", signal.get("head_quat_wxyz", np.full(4, np.nan))
         ),
     }
-
-
-def build_episode_frame(
-    state: EpisodeState,
-    action: EpisodeAction,
-    vr_frame: Mapping[str, object],
-    *,
-    camera_frame: Mapping[str, object] | None = None,
-    signals: Mapping[str, object] | None = None,
-    arm_qpos_sent: np.ndarray | None = None,
-) -> EpisodeFrame:
-    """Copy a source sample for direct recorder retention."""
-    values = episode_source_values(
-        state,
-        action,
-        vr_frame,
-        camera_frame=camera_frame,
-        signals=signals,
-        arm_qpos_sent=arm_qpos_sent,
-    )
-    camera = camera_frame or {}
     data = {
         name: np.array(value, dtype=DATASET_SPECS[name].dtype, copy=True)
         for name, value in values.items()
     }
     return EpisodeFrame(
-        timestamp_s=float(state.timestamp),
+        timestamp_s=time.perf_counter() if timestamp_s is None else float(timestamp_s),
         data=data,
         camera_rgb=(
             np.array(camera["rgb"], copy=True)

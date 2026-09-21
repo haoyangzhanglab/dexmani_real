@@ -1,6 +1,6 @@
 """Offline tests for the command-feedback temporal transaction.
 
-These exercise ``control.publication`` against a fake clock and synthetic ring
+These exercise ``robot.commands`` against a fake clock and synthetic ring
 frames built on the real ``ARM_STATE_DTYPE``/``HAND_STATE_DTYPE``. They never
 open hardware or an SDK, and they do not import the deployment runtime (so they
 run without scipy/pinocchio/dexmani_policy).
@@ -26,7 +26,7 @@ from dexmani_real.utils.feedback import (
     diagnose_feedback_timestamp_order,
 )
 
-import dexmani_real.control.publication as pub
+import dexmani_real.robot.commands as pub
 
 _MS = 1_000_000
 
@@ -235,6 +235,23 @@ class ReadCommandFeedbackTest(unittest.TestCase):
         self.assertIsNone(issue)
         self.assertEqual(hand_feedback.source_monotonic_ns, 996 * _MS)
         self.assertEqual(hand_feedback.ring_commit_monotonic_ns, 998 * _MS)
+
+
+class FixedArmIdentityTest(unittest.TestCase):
+    def test_axis_identity_is_the_hardware_model_not_an_experiment_setting(self):
+        from types import SimpleNamespace
+        from dexmani_real.robot.drivers.xarm7 import XArm7
+
+        # No constructor, connection, discovery or vendor SDK is used.
+        arm = XArm7.__new__(XArm7)
+        for axes in (6, 7, 8):
+            with self.subTest(axes=axes):
+                arm._api = SimpleNamespace(axis=axes)
+                if axes == 7:
+                    arm._wait_for_axis_report(on_poll=None)
+                else:
+                    with self.assertRaises(RuntimeError):
+                        arm._wait_for_axis_report(on_poll=None)
 
 
 if __name__ == "__main__":

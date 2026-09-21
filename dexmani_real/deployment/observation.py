@@ -1,16 +1,13 @@
-"""Process-local observation windows for the deployment runtime.
+"""Read and align real sensor history, then return the policy NumPy mapping.
 
-These types never enter RuntimeChannels and therefore carry no
-IPC dtype. They are the ``PolicyRuntime`` input contract.
-
-Shared-memory readers take ownership copies. The builder owns temporal and
-payload admission; these process-local containers only carry assembled values.
+The one query anchor, actual source timestamps and tactile validity protect
+experiment semantics. No query IDs or process-local observation protocol.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 
@@ -30,22 +27,6 @@ from dexmani_real.sensor.camera.transforms import resize_rgb
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-
-@dataclass(frozen=True)
-class PolicyObservation:
-    """Narrow NumPy boundary passed to a Policy runtime.
-
-    Mapping insertion order is the validated Policy modality order. Arrays are
-    C-contiguous, writeable, policy-process-owned model inputs.
-    """
-
-    observation_id: int
-    run_generation: int
-    anchor_monotonic_ns: int
-    latest_source_monotonic_ns: int
-    logical_step_monotonic_ns: int
-    arrays: Mapping[str, np.ndarray]
 
 
 def _validate_finite(array: np.ndarray, *, name: str) -> None:
@@ -113,38 +94,6 @@ class RgbFrame:
     source_monotonic_ns: int
     publish_monotonic_ns: int
     camera_generation: int
-
-
-@dataclass(frozen=True)
-class ObservationBatch:
-    """One causal observation assembled from state and point-cloud rings.
-
-    Process-local. ``arm_history`` is an arm-qpos ``FrameWindow`` and
-    ``hand_history`` is a ``HandFrameWindow`` carrying qpos, aggregate tactile,
-    and dense tactile read from the same ``hand_state_ring`` record, so the three
-    hand representations share one source identity per slot. ``pointcloud`` is
-    the latest causally valid ``PointCloudFrame``. Optional modalities are None
-    when not requested. ``anchor_monotonic_ns`` is the causal cut: no frame
-    published after the anchor may be included.
-    """
-
-    observation_id: int
-    run_generation: int
-    run_started_monotonic_ns: int
-    anchor_monotonic_ns: int
-    latest_source_monotonic_ns: int
-    logical_step_monotonic_ns: int
-
-    arm_history: FrameWindow | None = None
-    hand_history: HandFrameWindow | None = None
-    pointcloud: PointCloudFrame | None = None
-    # Oldest-first causal window of recent point-cloud frames; ``pointcloud`` is
-    # the latest (and last element) when non-empty.  ``point_cloud`` models use
-    # this window for their per-step point-cloud history.
-    pointcloud_history: tuple[PointCloudFrame, ...] = ()
-    # Raw camera RGB frames on the same causal control grid as state and, when
-    # requested jointly, the point-cloud history.
-    rgb_history: tuple[RgbFrame, ...] = ()
 
 
 def _requested_observation_fields(policy_spec: Any) -> set[str]:
@@ -778,16 +727,17 @@ def _select_camera_control_grid(
     return tuple(selected), logical_step_ns
 
 
-def _build_observation(
+def build_policy_observation(
     shared: RuntimeChannels,
     policy_spec: Any,
     *,
-    observation_id: int,
-    run_generation: int,
     run_started_ns: int,
     anchor_ns: int,
     step_dt_ns: int,
-) -> ObservationBatch | None:
+    fingertip_runtime: (
+        tuple[object, HandKinematics | None, FingertipAssemblerConfig | None] | None
+    ) = None,
+) -> dict[str, np.ndarray] | None:
     """Assemble requested causal modalities at one query anchor.
 
     All modalities share the same query-anchored reference grid. A normal
@@ -890,30 +840,9 @@ def _build_observation(
             hand_history, reference_ns,
             run_started_ns=run_started_ns,
         )
-    if pointcloud_requested:
-        if pointcloud is None or logical_step_ns <= 0:
-            return None
-        latest_source_ns = int(pointcloud.source_monotonic_ns)
-        if rgb_requested and len(rgb_history) != horizon:
-            return None
-    elif rgb_requested:
-        if len(rgb_history) != horizon or logical_step_ns <= 0:
-            return None
-        latest_source_ns = int(rgb_history[-1].source_monotonic_ns)
-    elif (
-        arm_history is not None
-        and arm_history.values.shape[0] == horizon
-        and logical_step_ns > 0
-    ):
-        latest_source_ns = max(
-            int(window.source_monotonic_ns[-1])
-            for window in (
-                arm_history,
-                hand_history,
-            )
-            if window is not None
-        )
-    else:
+    if pointcloud_requested and pointcloud is None:
+        return None
+    if rgb_requested and len(rgb_history) != horizon:
         return None
     if arm_history is None or arm_history.values.shape[0] != horizon:
         return None
@@ -931,99 +860,12 @@ def _build_observation(
         or not np.all(hand_history.tactile_dense_valid)
     ):
         return None
-    return ObservationBatch(
-        observation_id=observation_id,
-        run_generation=run_generation,
-        run_started_monotonic_ns=run_started_ns,
-        anchor_monotonic_ns=anchor_ns,
-        latest_source_monotonic_ns=latest_source_ns,
-        logical_step_monotonic_ns=logical_step_ns,
-        arm_history=arm_history,
-        hand_history=hand_history,
-        pointcloud=pointcloud,
-        pointcloud_history=pointcloud_history,
-        rgb_history=rgb_history,
-    )
-
-
-def observation_sources(observation: ObservationBatch) -> dict[str, tuple[int, ...]]:
-    """Selected source times per modality, oldest first; no persisted semantics."""
-    assert observation.arm_history is not None
-    sources = {
-        "arm": tuple(int(v) for v in observation.arm_history.source_monotonic_ns)
-    }
-    if observation.hand_history is not None:
-        sources["hand"] = tuple(
-            int(v) for v in observation.hand_history.source_monotonic_ns
-        )
-    for name, frames in (
-        ("point_cloud", observation.pointcloud_history),
-        ("rgb", observation.rgb_history),
-    ):
-        if frames:
-            sources[name] = tuple(int(frame.source_monotonic_ns) for frame in frames)
-    return sources
-
-
-def observation_timing_ms(observation: ObservationBatch) -> tuple[float, float]:
-    """Return causal latest-frame age and cross-modality skew in milliseconds.
-
-    Age is measured from the causal cut to the newest source frame.  Skew uses
-    the newest valid frame of each modality, rather than the history span of a
-    single modality, so a normal ``n_obs_steps`` window is not misreported as
-    sensor skew.
-    """
-    latest_sources: list[int] = []
-    for window in (
-        getattr(observation, "arm_history", None),
-        getattr(observation, "hand_history", None),
-    ):
-        if window is None:
-            continue
-        valid_mask = getattr(window, "valid_mask", None)
-        source_ns = getattr(window, "source_monotonic_ns", None)
-        if valid_mask is None or source_ns is None:
-            continue
-        valid = np.asarray(valid_mask, dtype=np.uint8) == 1
-        if np.any(valid):
-            latest_sources.append(int(np.max(np.asarray(source_ns)[valid])))
-    pointcloud = getattr(observation, "pointcloud", None)
-    if pointcloud is not None:
-        latest_sources.append(int(pointcloud.source_monotonic_ns))
-    rgb_history = getattr(observation, "rgb_history", ())
-    if rgb_history:
-        latest_sources.append(int(rgb_history[-1].source_monotonic_ns))
-    if not latest_sources:
-        latest_sources.append(int(observation.latest_source_monotonic_ns))
-    latest_ns = max(latest_sources)
-    anchor_ns = int(
-        getattr(
-            observation, "anchor_monotonic_ns", observation.logical_step_monotonic_ns
-        )
-    )
-    if latest_ns > anchor_ns:
-        raise ValueError("observation source timestamp exceeds causal cut")
-    return (
-        (anchor_ns - latest_ns) / 1e6,
-        (latest_ns - min(latest_sources)) / 1e6,
-    )
-
-
-def _to_policy_observation(
-    observation: ObservationBatch,
-    policy_spec: Any,
-    *,
-    fingertip_runtime: (
-        tuple[object, HandKinematics | None, FingertipAssemblerConfig | None] | None
-    ) = None,
-) -> PolicyObservation:
-    """Project typed ring readers into the exact public Policy array mapping."""
     field_names = tuple(field.name for field in policy_spec.observation_fields)
-    if observation.arm_history is None or observation.hand_history is None:
+    if arm_history is None or hand_history is None:
         raise ValueError("joint_state requires aligned arm and hand histories")
     arrays: dict[str, np.ndarray] = {}
     joint = np.concatenate(
-        (observation.arm_history.values, observation.hand_history.qpos), axis=1
+        (arm_history.values, hand_history.qpos), axis=1
     )
     arrays["joint_state"] = np.ascontiguousarray(joint, dtype=np.float32)
     policy_joint_state = arrays["joint_state"]
@@ -1031,21 +873,21 @@ def _to_policy_observation(
     hand_qpos_policy = policy_joint_state[:, 7:19]
     if "point_cloud" in field_names:
         arrays["point_cloud"] = np.ascontiguousarray(
-            np.stack([frame.values for frame in observation.pointcloud_history]),
+            np.stack([frame.values for frame in pointcloud_history]),
             dtype=np.float32,
         )
     if "rgb" in field_names:
         arrays["rgb"] = np.ascontiguousarray(
-            np.stack([frame.values for frame in observation.rgb_history]),
+            np.stack([frame.values for frame in rgb_history]),
             dtype=np.uint8,
         )
     if "contact_force" in field_names:
         arrays["contact_force"] = np.ascontiguousarray(
-            observation.hand_history.tactile_aggregate, dtype=np.float32
+            hand_history.tactile_aggregate, dtype=np.float32
         )
     if "tactile_force" in field_names:
         arrays["tactile_force"] = np.ascontiguousarray(
-            observation.hand_history.tactile_dense, dtype=np.float32
+            hand_history.tactile_dense, dtype=np.float32
         )
     if "eef_pose" in field_names or "fingertip_points" in field_names:
         if fingertip_runtime is None:
@@ -1078,12 +920,5 @@ def _to_policy_observation(
             )
     ordered = {name: arrays[name] for name in field_names}
     for name, values in ordered.items():
-        _validate_finite(values, name=f"PolicyObservation.{name}")
-    return PolicyObservation(
-        observation_id=observation.observation_id,
-        run_generation=observation.run_generation,
-        anchor_monotonic_ns=observation.anchor_monotonic_ns,
-        latest_source_monotonic_ns=observation.latest_source_monotonic_ns,
-        logical_step_monotonic_ns=observation.logical_step_monotonic_ns,
-        arrays=ordered,
-    )
+        _validate_finite(values, name=f"policy observation {name}")
+    return ordered

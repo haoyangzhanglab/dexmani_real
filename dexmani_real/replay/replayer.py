@@ -11,16 +11,9 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.control.hand_homing import initialize_hand_home
-from dexmani_real.control.publication import (
-    PUBLISH_REASON_FIFO_FULL,
-    PublishResult,
-    PublishWaitTracker,
-    prepare_joint_command,
-    publish_command,
-    wait_command_accepted,
-)
-from dexmani_real.control.safety_gate import SafetyGate, planner_action_safety_gate
+from dexmani_real.robot.hand_homing import initialize_hand_home
+from dexmani_real.robot.commands import (PUBLISH_REASON_FIFO_FULL, PublishResult, prepare_joint_command, publish_command, wait_command_accepted)
+from dexmani_real.robot.commands import SafetyGate, planner_action_safety_gate
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
     read_arm_state_dict,
@@ -183,7 +176,6 @@ class EpisodeReplayer:
         self._reason = ""
         self._hand_available = trajectory.has_hand
         self._frame_count = trajectory.num_frames
-        self._fifo_wait = PublishWaitTracker("replay")
 
     def _make_planner(
         self, workspace: np.ndarray, *, table: Any | None
@@ -538,31 +530,17 @@ class EpisodeReplayer:
         result = publish_command(
             self.shared, candidate, required_safety_state=required_state
         )
-        stopped = False
         while (
             not result.published
             and result.reason == PUBLISH_REASON_FIFO_FULL
             and time.monotonic() < deadline_s
             and self._running
         ):
-            self._fifo_wait.note_full(result.fifo_depth, int(candidate.action_id))
             if not self._poll_control(keyboard, _WAIT_POLL_INTERVAL_S):
-                stopped = True
                 break
             result = publish_command(
                 self.shared, candidate, required_safety_state=required_state
             )
-        if result.published:
-            self._fifo_wait.note_committed()
-        elif result.reason != PUBLISH_REASON_FIFO_FULL:
-            # A non-FULL rejection names its own cause (for example no attached
-            # consumer); never report a deadline that cannot expire.
-            self._fifo_wait.note_dropped(result.reason or "replay publish rejected")
-        elif stopped:
-            # Q/ESC/fault ended the retry, not the deadline.
-            self._fifo_wait.note_dropped("replay stopped")
-        else:
-            self._fifo_wait.note_dropped("replay publish deadline")
         return result
 
     def _wait_until_deadline(
@@ -769,7 +747,6 @@ class EpisodeReplayer:
                     accepted = wait_command_accepted(
                         self.shared,
                         command=published.command,
-                        action_id=candidate.action_id,
                         wait_for_arm=True,
                         wait_for_hand=candidate.hand_qpos is not None,
                         timeout_s=float(self.runtime.policy.action_apply_timeout_s),

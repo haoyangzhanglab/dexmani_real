@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -12,25 +12,18 @@ from scipy.spatial.transform import Rotation
 
 from dexmani_real.calibration.camera.solver import CalibrationConfig, CalibrationSamples
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.control.arm_homing import ArmHomeConfig, execute_arm_home
-from dexmani_real.control.jog import (
+from dexmani_real.robot.arm_homing import ArmHomeConfig, execute_arm_home
+from dexmani_real.teleop.jog import (
     any_jog_key_held,
     compute_cartesian_jog_delta,
     limit_cartesian_pose_lead,
 )
-from dexmani_real.control.projection import (
+from dexmani_real.robot.projection import (
     ARM_COMMAND_JUMP_REJECTION,
     validate_arm_command,
 )
-from dexmani_real.control.publication import (
-    PUBLISH_REASON_FIFO_FULL,
-    PublishResult,
-    PublishWaitTracker,
-    prepare_joint_command,
-    publish_command,
-    wait_command_accepted,
-)
-from dexmani_real.control.safety_gate import SafetyGate
+from dexmani_real.robot.commands import (PUBLISH_REASON_FIFO_FULL, PublishResult, prepare_joint_command, publish_command, wait_command_accepted)
+from dexmani_real.robot.commands import SafetyGate
 from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
 from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.pose import quat_multiply
@@ -54,7 +47,6 @@ def _publish_with_backpressure(
     *,
     required_state: SafetyState,
     deadline_s: float,
-    fifo_wait: PublishWaitTracker,
     abort_requested: Any = None,
 ) -> PublishResult:
     """Commit the identical candidate, retrying while the command FIFO is FULL.
@@ -70,17 +62,12 @@ def _publish_with_backpressure(
         and result.reason == PUBLISH_REASON_FIFO_FULL
         and time.monotonic() < deadline_s
     ):
-        fifo_wait.note_full(result.fifo_depth, int(candidate.action_id))
         if abort_requested is not None and abort_requested():
             break
         time.sleep(_FULL_RETRY_POLL_S)
         result = publish_command(
             shared, candidate, required_safety_state=required_state
         )
-    if result.published:
-        fifo_wait.note_committed()
-    elif result.reason == PUBLISH_REASON_FIFO_FULL:
-        fifo_wait.note_dropped("calibration publish deadline")
     return result
 
 
@@ -130,9 +117,6 @@ class CalibrationLoopState:
     last_ik_warning_s: float = 0.0
     blocked_until_release: bool = False
     last_boundary_warning_s: float = 0.0
-    fifo_wait: PublishWaitTracker = field(
-        default_factory=lambda: PublishWaitTracker("calibration")
-    )
 
     @classmethod
     def from_arm_state(
@@ -210,7 +194,6 @@ def publish_calibration_quit_hold(
             candidate,
             required_state=SafetyState.ARMED,
             deadline_s=time.monotonic() + float(runtime.policy.action_apply_timeout_s),
-            fifo_wait=PublishWaitTracker("calibration_quit_hold"),
         )
         if candidate is not None
         else None
@@ -225,7 +208,6 @@ def publish_calibration_quit_hold(
         accepted = wait_command_accepted(
             shared,
             command=published.command,
-            action_id=candidate.action_id,
             wait_for_arm=True,
             wait_for_hand=False,
             timeout_s=float(runtime.policy.action_apply_timeout_s),
@@ -462,7 +444,6 @@ def run_calibration_motion_tick(
             candidate,
             required_state=SafetyState.RUNNING,
             deadline_s=time.monotonic() + float(runtime.policy.action_apply_timeout_s),
-            fifo_wait=state.fifo_wait,
             abort_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
         )
         if candidate is not None
@@ -478,7 +459,6 @@ def run_calibration_motion_tick(
         accepted = wait_command_accepted(
             shared,
             command=published.command,
-            action_id=candidate.action_id,
             wait_for_arm=True,
             wait_for_hand=False,
             timeout_s=float(runtime.policy.action_apply_timeout_s),

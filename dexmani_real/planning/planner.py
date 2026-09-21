@@ -1,4 +1,4 @@
-"""xArm7 motion planner with MPlib backend — IK, path planning, collision checks."""
+"""xArm7 online IK, collision checks and bounded joint-space home planning."""
 
 from __future__ import annotations
 
@@ -24,8 +24,8 @@ from dexmani_real.robot.model import (
 from .collision import CollisionModel
 from .kinematics.arm_fk import XArm7Kinematics
 from .kinematics.ik import IKResult, OnlineIKConfig, OnlineIKSolver
-from .kinematics.ik_candidates import IKCandidateSearch, is_mplib_success
-from .kinematics.pose import Pose, compute_pose_error, ensure_qpos
+from .kinematics.ik_geometry import IKGeometry, is_mplib_success
+from .kinematics.pose import Pose, ensure_qpos
 from .paths import PathResult, WORKSPACE_BOUNDS_TOLERANCE_M, interpolate_waypoints
 
 __all__ = [
@@ -51,48 +51,24 @@ class XArm7PlannerConfig:
 
 @dataclass(kw_only=True)
 class MotionPlanningConfig:
-    """Offline path planning configuration."""
+    """Joint-space home fallback and dense-path validation settings."""
 
     path_dt: float = 1 / 15
     planning_limits_deg: tuple[tuple[float, float], ...] | None = None
-    max_ik_delta_deg: tuple[float, ...] = (120, 135, 120, 120, 180, 150, 180)
     max_waypoint_delta_deg: float = 15.0
     max_pose_error_pos_m: float = 0.005
     max_pose_error_rot_rad: float = 0.05
-    rrt_time_limit: float = 2.0
     rrt_range_options: tuple[float, ...] = (0.05, 0.12)
-    num_rrt_attempts: int = 2
     simplify_path: bool = True
-    screw_qpos_step: float = 0.02
-    ik_seed_offsets_deg: tuple[float, ...] = (15.0, 8.0, 15.0, 3.0, 15.0, 8.0, 15.0)
-    num_random_ik_seeds: int = 15
-    num_ik_candidates: int = 6
-    n_init_qpos: int = 3
-    random_seed: int | None = None
     check_self_collision: bool = True
-    neutral_qpos: np.ndarray | None = None
-    ik_score_manipulability_weight: float = 1.0
-    ik_score_neutral_weight: float = 0.5
-    ik_score_joint_delta_weight: float = 1.0
-    ik_score_pose_error_weight: float = 0.2
-    ik_score_joint_limit_weight: float = 0.2
 
 
 class XArm7MotionPlanner:
-    """Arm-only xArm7 motion planner with MPlib backend.
+    """Online IK and the current collision-checked home fallback.
 
-    Three internal subsystems:
-      - ``kin`` (:class:`XArm7Kinematics`): FK / Jacobian / pose transforms.
-      - ``ik_mgr`` (:class:`IKCandidateSearch`): IK candidate generation,
-        filtering, scoring, canonicalization.
-      - ``mp_planner`` (:class:`mplib.Planner`): raw MPlib plan_screw /
-        plan_qpos calls.
-
-    Public API (prefer these over direct subsystem access):
-      - ``solve_teleop_ik`` — single-shot IK for teleop.
-      - ``plan_path`` — multi-strategy path planning (screw → RRT).
-      - ``compute_eef_pose_world`` / ``compute_eef_jacobian`` — FK queries.
-      - ``has_self_collision`` — collision queries.
+    ``kin`` owns FK/Jacobians, ``ik_mgr`` owns joint/IK geometry, and
+    ``collision_model`` owns the current 19-DOF collision model. There is no
+    general Cartesian goal planner or multi-strategy candidate search.
     """
 
     def __init__(
@@ -185,7 +161,7 @@ class XArm7MotionPlanner:
             static_boxes=static_boxes,
             table=table,
         )
-        self.ik_mgr = IKCandidateSearch(self.kin, collision_model=self.collision_model)
+        self.ik_mgr = IKGeometry(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
         self.teleop_solver = OnlineIKSolver(
@@ -265,70 +241,6 @@ class XArm7MotionPlanner:
     ) -> IKResult:
         return self.teleop_solver.solve(target_eef_pose_world, current_qpos, previous_qpos_cmd)
 
-    def plan_path(self, target_eef_pose_world: Pose, current_qpos: np.ndarray) -> PathResult:
-        profile = self.planning_profile
-        current_qpos = ensure_qpos(current_qpos, self.dof, "current_qpos")
-        current_qpos = self.canonicalize_qpos(
-            current_qpos, current_qpos, self.resolve_planning_limits(profile, current_qpos)
-        )
-
-        current_pose = self.compute_eef_pose_world(current_qpos)
-        pos_error, rot_error = compute_pose_error(target_eef_pose_world, current_pose)
-        if pos_error <= profile.max_pose_error_pos_m and rot_error <= profile.max_pose_error_rot_rad:
-            return PathResult(
-                success=True, qpos_path=current_qpos.reshape(1, -1), source="hold", report={"num_waypoints": 1}
-            )
-
-        screw_result = self.try_screw_plan(target_eef_pose_world, current_qpos, profile)
-        if screw_result.success:
-            screw_result.report["num_planning_attempts"] = 1
-            screw_result.report["num_valid_plans"] = 1
-            return screw_result
-
-        candidates, ik_report = self.collect_ik_candidates(target_eef_pose_world, current_qpos, profile)
-        results: list[PathResult] = [screw_result]
-        if candidates:
-            results.extend(self.try_multi_rrt_plan(target_eef_pose_world, current_qpos, candidates, profile))
-        else:
-            results.append(
-                PathResult(
-                    success=False,
-                    qpos_path=None,
-                    source="",
-                    reason=f"IK failed: 0/{ik_report.get('num_seeds', '?')} seeds produced valid candidates. "
-                    f"Reject counts: {ik_report.get('reject_counts', {})}",
-                    report={"ik": ik_report},
-                )
-            )
-
-        valid_results = [result for result in results if result.success and result.qpos_path is not None]
-        if not valid_results:
-            reason_counts: dict[str, int] = {}
-            for result in results:
-                reason = result.reason or "unknown"
-                reason_counts[reason] = reason_counts.get(reason, 0) + 1
-            reason = (
-                "; ".join(f"{text} x{count}" for text, count in reason_counts.items())
-                or "All planning strategies failed."
-            )
-            return PathResult(
-                success=False,
-                qpos_path=None,
-                source="",
-                reason=reason,
-                report={
-                    "ik": ik_report,
-                    "num_planning_attempts": len(results),
-                    "planning_reject_counts": reason_counts,
-                },
-            )
-
-        valid_results.sort(key=lambda result: result.report.get("path_score", float("inf")))
-        best = valid_results[0]
-        best.report.setdefault("ik", ik_report)
-        best.report["num_planning_attempts"] = len(results)
-        best.report["num_valid_plans"] = len(valid_results)
-        return best
 
     def plan_joint_qpos_path(
         self,
@@ -378,45 +290,6 @@ class XArm7MotionPlanner:
 
     # __getattr__ to self.kin / self.ik_mgr / self.mplib_planner.
 
-    def try_screw_plan(
-        self, target_eef_pose_world: Pose, current_qpos: np.ndarray, profile: MotionPlanningConfig
-    ) -> PathResult:
-        result = self.mplib_planner.plan_screw(
-            goal_pose=self.to_mplib_pose(target_eef_pose_world),
-            current_qpos=current_qpos,
-            time_step=profile.path_dt,
-            qpos_step=profile.screw_qpos_step,
-            wrt_world=True,
-        )
-        return self.result_from_mplib(result, target_eef_pose_world, current_qpos, source="screw", profile=profile)
-
-    def try_multi_rrt_plan(
-        self,
-        target_eef_pose_world: Pose,
-        current_qpos: np.ndarray,
-        candidates: list[tuple[np.ndarray, dict[str, Any]]],
-        profile: MotionPlanningConfig,
-    ) -> list[PathResult]:
-        goal_qposes = [qpos for qpos, report in candidates]
-        results: list[PathResult] = []
-        for rrt_range in profile.rrt_range_options:
-            for attempt_index in range(profile.num_rrt_attempts):
-                result = self.mplib_planner.plan_qpos(
-                    goal_qposes=goal_qposes,
-                    current_qpos=current_qpos,
-                    time_step=profile.path_dt,
-                    rrt_range=rrt_range,
-                    planning_time=profile.rrt_time_limit,
-                    simplify=profile.simplify_path,
-                    verbose=False,
-                )
-                path_result = self.result_from_mplib(
-                    result, target_eef_pose_world, current_qpos, source="rrt", profile=profile
-                )
-                path_result.report["rrt_range"] = rrt_range
-                path_result.report["rrt_attempt_index"] = attempt_index
-                results.append(path_result)
-        return results
 
     def result_from_mplib(
         self,

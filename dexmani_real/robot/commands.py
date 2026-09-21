@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import hand as hand_defaults
-from dexmani_real.control.action import ActionCandidate
-from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
+from dexmani_real.config.defaults import policy as policy_defaults
+from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.ipc.command_stream import command_stream_capacity_locked
 from dexmani_real.ipc.schema import COUPLED_COMMAND_DTYPE
 from dexmani_real.runtime.safety import (
     PUBLISH_REASON_ESTOP,
@@ -24,7 +25,7 @@ from dexmani_real.runtime.safety import (
     SafetyState,
     cancel_coupled_command_if_current,
     coupled_command_is_current,
-    publish_coupled_command_if_motion_permitted,
+    PUBLISH_REASON_NO_CONSUMER,
     read_motion_permit,
 )
 from dexmani_real.utils.feedback import (
@@ -34,12 +35,280 @@ from dexmani_real.utils.feedback import (
     diagnose_feedback_timestamp_order,
     diagnose_hand_feedback,
 )
-from dexmani_real.utils.limits import (
-    canonicalize_policy_hand_endpoint_roundoff,
-)
-from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.log import get_logger, ThrottledWarner
 
 logger = get_logger(__name__)
+_warn_full = ThrottledWarner(interval_s=2.0, logger=logger)
+
+
+@dataclass(frozen=True)
+class ActionCandidate:
+    """One current command candidate proposed by a control producer.
+
+    Publication confirms the candidate still belongs to the active
+    ``run_generation`` and commits it once to the ordered command FIFO. The
+    candidate is an owner-owned immutable numeric snapshot: a FULL commit
+    result retries this exact object without rebuilding it, re-solving IK, or
+    re-clipping its targets, and it carries no delivery lease — it stays
+    committable until its generation is revoked.
+    """
+
+    run_generation: int
+    arm_qpos: np.ndarray | None = None
+    hand_qpos: np.ndarray | None = None
+    is_hold: bool = False
+
+
+_JOINT_LIMIT_TOLERANCE_RAD = 1e-12
+
+
+def _hand_joint_limit_detail(
+    hand_qpos_rad: np.ndarray, lower_rad: np.ndarray, upper_rad: np.ndarray
+) -> str:
+    outside = (hand_qpos_rad < lower_rad - _JOINT_LIMIT_TOLERANCE_RAD) | (
+        hand_qpos_rad > upper_rad + _JOINT_LIMIT_TOLERANCE_RAD
+    )
+    return f"hand_joint_limit:j{np.flatnonzero(outside)[0]}"
+
+
+def _joint_delta_limit_detail(
+    *,
+    target_rad: np.ndarray,
+    reference_rad: np.ndarray,
+    limit_rad: np.ndarray,
+    tolerance_rad: float,
+) -> str:
+    delta = np.abs(target_rad - reference_rad)
+    index = int(np.flatnonzero(delta > limit_rad + tolerance_rad)[0])
+    return f"hand_delta_limit:j{index}:{delta[index]:.3f}>{limit_rad[index]:.3f}"
+
+
+class GateRejectCode(str, Enum):
+    """Stable machine-readable rejection reasons from :class:`SafetyGate`."""
+
+    INVALID_TARGET = "invalid joint target"
+    ARM_JOINT_LIMIT = "arm joint limit violation"
+    HAND_JOINT_LIMIT = "hand joint limit violation"
+    HAND_DELTA_LIMIT = "hand per-tick delta limit violation"
+    COLLISION_TRANSITION = "collision on arm/hand transition"
+    COLLISION_CHECK_FAILED = "collision transition check failed"
+    WORKSPACE = "workspace"
+    WORKSPACE_CHECK_FAILED = "workspace check failed"
+
+
+@dataclass(frozen=True)
+class GateResult:
+    """Typed outcome of one safety-gate validation."""
+
+    accepted: bool
+    code: GateRejectCode | None = None
+    detail: str = ""
+
+    @property
+    def reason(self) -> str:
+        return self.detail or ("" if self.code is None else self.code.value)
+
+
+class SafetyGate:
+    """Fail-closed validation of physical limits, workspace, and collision.
+
+    The optional hand delta check rejects the whole coupled endpoint; learned
+    arm spike shaping belongs to its producer. ``endpoint_delta_tolerance_rad``
+    is numerical slack for the hand endpoint-delta predicate.
+    """
+
+    def __init__(
+        self,
+        *,
+        arm_joint_lower_rad: tuple[float, ...],
+        arm_joint_upper_rad: tuple[float, ...],
+        hand_joint_lower_rad: tuple[float, ...],
+        hand_joint_upper_rad: tuple[float, ...],
+        workspace_check: Callable[[np.ndarray, np.ndarray], bool] | None = None,
+        max_hand_delta_rad: Any = None,
+        endpoint_delta_tolerance_rad: float = (
+            policy_defaults.endpoint_delta_tolerance_rad
+        ),
+        collision_check: (
+            Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], bool] | None
+        ) = None,
+    ) -> None:
+        arm_low = np.asarray(arm_joint_lower_rad, dtype=np.float64)
+        arm_high = np.asarray(arm_joint_upper_rad, dtype=np.float64)
+        hand_low = np.asarray(hand_joint_lower_rad, dtype=np.float64)
+        hand_high = np.asarray(hand_joint_upper_rad, dtype=np.float64)
+        if arm_low.shape != ARM_JOINT_SHAPE or arm_high.shape != ARM_JOINT_SHAPE:
+            raise ValueError("arm joint limits must have seven entries")
+        if hand_low.shape != HAND_JOINT_SHAPE or hand_high.shape != HAND_JOINT_SHAPE:
+            raise ValueError("hand joint limits must have twelve entries")
+        bounds = np.concatenate((arm_low, arm_high, hand_low, hand_high))
+        if (
+            not np.all(np.isfinite(bounds))
+            or np.any(arm_low > arm_high)
+            or np.any(hand_low > hand_high)
+        ):
+            raise ValueError("joint limits must be finite and ordered")
+        self.arm_low = arm_low
+        self.arm_high = arm_high
+        self.hand_low = hand_low
+        self.hand_high = hand_high
+        self.workspace_check = workspace_check
+        self.max_hand_delta_rad = self._coerce_delta(
+            max_hand_delta_rad, HAND_JOINT_SHAPE, "max_hand_delta_rad"
+        )
+        if (
+            isinstance(endpoint_delta_tolerance_rad, bool)
+            or not np.isfinite(endpoint_delta_tolerance_rad)
+            or endpoint_delta_tolerance_rad < 0.0
+        ):
+            raise ValueError(
+                "endpoint_delta_tolerance_rad must be finite and non-negative"
+            )
+        self.endpoint_delta_tolerance_rad = float(endpoint_delta_tolerance_rad)
+        self.collision_check = collision_check
+
+    @staticmethod
+    def _coerce_delta(
+        value: Any, shape: tuple[int, ...], name: str
+    ) -> np.ndarray | None:
+        if value is None:
+            return None
+        arr = np.broadcast_to(np.asarray(value, dtype=np.float64), shape).copy()
+        if not np.all(np.isfinite(arr)) or np.any(arr <= 0.0):
+            raise ValueError(f"{name} must be finite and positive")
+        return arr
+
+    def validate(
+        self,
+        candidate: ActionCandidate,
+        *,
+        current_arm_qpos: np.ndarray,
+        current_hand_qpos: np.ndarray | None = None,
+        hand_delta_reference_qpos: np.ndarray | None = None,
+    ) -> GateResult:
+        """Validate one candidate without modifying it or external state.
+
+        Workspace and collision transitions start at measured feedback. The
+        optional hand delta reference is the previous published target, so
+        actuator lag cannot become an unintended tracking-error gate.
+        """
+        # Sensor readers own measured feedback; this gate admits outgoing targets.
+        if candidate.arm_qpos is None and candidate.hand_qpos is None:
+            return GateResult(
+                False, GateRejectCode.INVALID_TARGET, "no actuator target"
+            )
+        for name, target, shape in (
+            ("arm", candidate.arm_qpos, ARM_JOINT_SHAPE),
+            ("hand", candidate.hand_qpos, HAND_JOINT_SHAPE),
+        ):
+            if target is not None and (
+                target.shape != shape or not np.all(np.isfinite(target))
+            ):
+                return GateResult(
+                    False, GateRejectCode.INVALID_TARGET, f"{name} target shape/finite"
+                )
+        arm_start = current_arm_qpos
+        arm_end = arm_start.copy() if candidate.arm_qpos is None else candidate.arm_qpos
+        hand_end = candidate.hand_qpos
+        hand_start: np.ndarray | None = None
+        hand_delta_start: np.ndarray | None = None
+        if hand_end is not None:
+            assert current_hand_qpos is not None
+            hand_start = current_hand_qpos
+            hand_delta_start = hand_start
+            if hand_delta_reference_qpos is not None:
+                hand_delta_start = hand_delta_reference_qpos
+        if candidate.arm_qpos is not None and (
+            np.any(arm_end < self.arm_low) or np.any(arm_end > self.arm_high)
+        ):
+            return GateResult(False, GateRejectCode.ARM_JOINT_LIMIT)
+        if hand_end is not None and (
+            np.any(hand_end < self.hand_low - _JOINT_LIMIT_TOLERANCE_RAD)
+            or np.any(hand_end > self.hand_high + _JOINT_LIMIT_TOLERANCE_RAD)
+        ):
+            return GateResult(
+                False,
+                GateRejectCode.HAND_JOINT_LIMIT,
+                _hand_joint_limit_detail(hand_end, self.hand_low, self.hand_high),
+            )
+        if (
+            self.max_hand_delta_rad is not None
+            and hand_end is not None
+            and hand_delta_start is not None
+        ):
+            if np.any(
+                np.abs(hand_end - hand_delta_start)
+                > self.max_hand_delta_rad + self.endpoint_delta_tolerance_rad
+            ):
+                return GateResult(
+                    False,
+                    GateRejectCode.HAND_DELTA_LIMIT,
+                    _joint_delta_limit_detail(
+                        target_rad=hand_end,
+                        reference_rad=hand_delta_start,
+                        limit_rad=self.max_hand_delta_rad,
+                        tolerance_rad=self.endpoint_delta_tolerance_rad,
+                    ),
+                )
+        if self.workspace_check is not None and candidate.arm_qpos is not None:
+            try:
+                if not self.workspace_check(arm_start, arm_end):
+                    return GateResult(False, GateRejectCode.WORKSPACE)
+            except Exception:
+                logger.warning(
+                    "SafetyGate: workspace check failed closed", exc_info=True
+                )
+                return GateResult(False, GateRejectCode.WORKSPACE_CHECK_FAILED)
+        # Arm/hand transition collision (requires both current + target hand).
+        if (
+            self.collision_check is not None
+            and candidate.arm_qpos is not None
+            and hand_end is not None
+            and hand_start is not None
+        ):
+            try:
+                if not self.collision_check(arm_start, arm_end, hand_start, hand_end):
+                    return GateResult(False, GateRejectCode.COLLISION_TRANSITION)
+            except Exception:
+                logger.warning(
+                    "SafetyGate: collision transition check failed closed",
+                    exc_info=True,
+                )
+                return GateResult(False, GateRejectCode.COLLISION_CHECK_FAILED)
+        return GateResult(True)
+
+
+def planner_action_safety_gate(
+    *,
+    planner: Any,
+    arm_joint_lower_rad: tuple[float, ...],
+    arm_joint_upper_rad: tuple[float, ...],
+    hand_joint_lower_rad: tuple[float, ...],
+    hand_joint_upper_rad: tuple[float, ...],
+    max_hand_delta_rad: Any = None,
+    endpoint_delta_tolerance_rad: float = (
+        policy_defaults.endpoint_delta_tolerance_rad
+    ),
+    collision_check: (
+        Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], bool] | None
+    ) = None,
+) -> SafetyGate:
+    """Build a safety gate using the planner's segment workspace check.
+
+    ``max_hand_delta_rad`` / ``collision_check`` are opt-in; each caller enables
+    only the checks owned by its command path.
+    The endpoint tolerance defaults to the canonical policy runtime default.
+    """
+    return SafetyGate(
+        arm_joint_lower_rad=arm_joint_lower_rad,
+        arm_joint_upper_rad=arm_joint_upper_rad,
+        hand_joint_lower_rad=hand_joint_lower_rad,
+        hand_joint_upper_rad=hand_joint_upper_rad,
+        workspace_check=planner.is_workspace_segment_safe,
+        max_hand_delta_rad=max_hand_delta_rad,
+        endpoint_delta_tolerance_rad=endpoint_delta_tolerance_rad,
+        collision_check=collision_check,
+    )
 
 
 @dataclass(frozen=True)
@@ -64,68 +333,6 @@ class AcceptanceResult:
     reason: str = ""
 
 
-class PublishWaitTracker:
-    """One visible ``[WAIT]``/``[RESUME]`` pair per continuous FIFO-full span.
-
-    Each command producer owns one tracker. Entering backpressure prints once;
-    repeated FULL retries of the same kept candidate stay silent. A span ends
-    exactly one way: either the kept candidate commits (``[RESUME]`` with the
-    elapsed wait) or lifecycle revokes it (``[DROP]`` naming the kept action
-    and the reason). Every terminal path must call one of the two, so the next
-    span starts from a clean state and each decision keeps exactly one line.
-    """
-
-    def __init__(self, label: str) -> None:
-        self._label = label
-        self._waiting_since_ns: int | None = None
-        self._keep_action_id = 0
-
-    @property
-    def waiting(self) -> bool:
-        return self._waiting_since_ns is not None
-
-    def note_full(self, depth: int, keep_action: int) -> None:
-        if self._waiting_since_ns is None:
-            logger.warning(
-                "[WAIT] %s command_fifo full depth=%d keep_action=%d",
-                self._label,
-                int(depth),
-                int(keep_action),
-            )
-            self._waiting_since_ns = time.monotonic_ns()
-            self._keep_action_id = int(keep_action)
-
-    def note_committed(self) -> None:
-        if self._waiting_since_ns is None:
-            return
-        wait_ms = (time.monotonic_ns() - self._waiting_since_ns) / 1e6
-        logger.info(
-            "[RESUME] %s command_fifo wait_ms=%.0f dropped=0",
-            self._label,
-            wait_ms,
-        )
-        self._reset()
-
-    def note_dropped(self, reason: str, *, report: bool = True) -> None:
-        """Report the kept candidate revoked by lifecycle while waiting."""
-        if self._waiting_since_ns is None:
-            return
-        wait_ms = (time.monotonic_ns() - self._waiting_since_ns) / 1e6
-        if report:
-            logger.warning(
-                "[DROP] %s command_fifo keep_action=%d wait_ms=%.0f dropped=1 reason=%s",
-                self._label,
-                self._keep_action_id,
-                wait_ms,
-                reason,
-            )
-        self._reset()
-
-    def _reset(self) -> None:
-        self._waiting_since_ns = None
-        self._keep_action_id = 0
-
-
 @dataclass(frozen=True)
 class PreparedCommand:
     """A physically checked command, or its preparation rejection."""
@@ -136,7 +343,6 @@ class PreparedCommand:
     feedback_issue: FeedbackIssue | None = None
     unavailable: bool = False
     fatal: bool = False
-    hand_roundoff_canonicalized: bool = False
 
     @property
     def accepted(self) -> bool:
@@ -144,25 +350,13 @@ class PreparedCommand:
 
 
 @dataclass(frozen=True)
-class _ArmFeedbackSnapshot:
+class _ActuatorFeedback:
     qpos: np.ndarray
-    accepted_action_id: int
     accepted_monotonic_ns: int = 0
     source_monotonic_ns: int = 0
     ring_commit_monotonic_ns: int = 0
     # Generation/sequence identity of the acceptance watermark: a stale
     # generation's ACK can never satisfy a current-epoch acceptance wait.
-    accepted_generation: int = 0
-    accepted_sequence: int = 0
-
-
-@dataclass(frozen=True)
-class _HandFeedbackSnapshot:
-    qpos: np.ndarray
-    accepted_action_id: int
-    accepted_monotonic_ns: int = 0
-    source_monotonic_ns: int = 0
-    ring_commit_monotonic_ns: int = 0
     accepted_generation: int = 0
     accepted_sequence: int = 0
 
@@ -176,7 +370,7 @@ class CommandFeedbackSnapshot:
     modalities' provenance (``source <= ring_commit <= validation_now``) and
     freshness against it before constructing this immutable snapshot. This is
     the only feedback a policy dispatch may use for decode/IK, SafetyGate, and
-    the pre-publication freshness recheck — never re-read the rings mid-dispatch.
+    publication preparation — never re-read the rings mid-dispatch.
     """
 
     arm_qpos: np.ndarray
@@ -221,7 +415,7 @@ def _read_arm_feedback(
     *,
     max_age_s: float | None,
     now_monotonic_ns: int | None = None,
-) -> tuple[_ArmFeedbackSnapshot | None, str, FeedbackIssue | None]:
+) -> tuple[_ActuatorFeedback | None, str, FeedbackIssue | None]:
     result = shared.arm_state_ring.read_latest()
     if result is None:
         return None, "arm feedback unavailable", None
@@ -243,9 +437,8 @@ def _read_arm_feedback(
     if issue is not None:
         return None, f"arm feedback is unhealthy: {issue.detail}", issue
     return (
-        _ArmFeedbackSnapshot(
+        _ActuatorFeedback(
             qpos=qpos.copy(),
-            accepted_action_id=int(record["last_cmd_seq"]),
             accepted_monotonic_ns=int(record["last_cmd_accepted_monotonic_ns"]),
             source_monotonic_ns=source_ns,
             ring_commit_monotonic_ns=ring_commit_ns,
@@ -262,7 +455,7 @@ def read_hand_feedback(
     *,
     max_age_s: float | None,
     now_monotonic_ns: int | None = None,
-) -> tuple[_HandFeedbackSnapshot | None, str, FeedbackIssue | None]:
+) -> tuple[_ActuatorFeedback | None, str, FeedbackIssue | None]:
     result = shared.hand_state_ring.read_latest()
     if result is None:
         return None, "hand feedback unavailable", None
@@ -282,9 +475,8 @@ def read_hand_feedback(
     if issue is not None:
         return None, f"hand feedback is unhealthy: {issue.detail}", issue
     return (
-        _HandFeedbackSnapshot(
+        _ActuatorFeedback(
             qpos=qpos.copy(),
-            accepted_action_id=int(record["accepted_target_action_id"]),
             accepted_monotonic_ns=int(record["accepted_target_monotonic_ns"]),
             source_monotonic_ns=source_ns,
             ring_commit_monotonic_ns=ring_commit_ns,
@@ -323,7 +515,7 @@ def read_command_feedback(
     if arm_feedback is None:
         return None, reason, issue
 
-    hand_feedback: _HandFeedbackSnapshot | None = None
+    hand_feedback: _ActuatorFeedback | None = None
     if require_hand:
         hand_feedback, reason, issue = read_hand_feedback(
             shared, max_age_s=hand_max_age_s
@@ -375,72 +567,35 @@ def read_command_feedback(
     )
 
 
-def build_action_candidate(
+def prepare_joint_command(
     shared: Any,
-    arm_qpos: np.ndarray | None,
-    hand_qpos: np.ndarray | None,
-    *,
-    run_generation: int | None = None,
-    is_hold: bool = False,
-) -> ActionCandidate:
-    """Assign command identity and copy targets into an immutable candidate.
-
-    The candidate carries no delivery lease or timing authority: it stays
-    committable until its run generation is revoked, and a FULL commit result
-    retries this exact numeric snapshot unchanged. Action IDs come from the
-    shared monotonic counter and may have gaps; the FIFO queue sequence is
-    produced later by the commit and is never mixed with them.
-    """
-    if run_generation is not None and (
-        isinstance(run_generation, (bool, np.bool_))
-        or not isinstance(run_generation, (int, np.integer))
-        or int(run_generation) < 0
-    ):
-        raise ValueError("run_generation must be a non-negative integer or None")
-    with shared.arm_command_seq.get_lock():
-        action_id = int(shared.arm_command_seq.value) + 1
-        shared.arm_command_seq.value = action_id
-    return ActionCandidate(
-        run_generation=(
-            int(shared.run_generation.value)
-            if run_generation is None
-            else int(run_generation)
-        ),
-        action_id=action_id,
-        arm_qpos=(
-            None
-            if arm_qpos is None
-            else np.array(arm_qpos, dtype=np.float64, copy=True)
-        ),
-        hand_qpos=(
-            None
-            if hand_qpos is None
-            else np.array(hand_qpos, dtype=np.float64, copy=True)
-        ),
-        is_hold=is_hold,
-    )
-
-
-def prepare_command(
-    shared: Any,
-    candidate: ActionCandidate,
+    arm_qpos: np.ndarray,
+    hand_qpos: np.ndarray | None = None,
     *,
     gate: SafetyGate,
+    run_generation: int | None = None,
+    is_hold: bool = False,
     arm_feedback_max_age_s: float,
     hand_feedback_max_age_s: float,
     hand_delta_reference_qpos: np.ndarray | None = None,
-    hand_mechanical_lower_rad: np.ndarray | None = None,
-    hand_mechanical_upper_rad: np.ndarray | None = None,
-    canonicalize_policy_hand_roundoff: bool = False,
     feedback_snapshot: CommandFeedbackSnapshot | None = None,
 ) -> PreparedCommand:
-    """Check one candidate without shaping it, against valid current feedback.
+    """Copy and check a target once; retry this snapshot unchanged after FIFO FULL.
 
-    ``feedback_snapshot is None`` reads/validates arm and (when required) hand
-    feedback internally, as before. When a snapshot is supplied, it is used
-    as-is for SafetyGate's current state without any additional ring read —
-    the caller already selected and validated it for this dispatch.
+    A supplied feedback snapshot is reused by decode, IK and these checks.
+    Mechanical/SDK validity remains checked by the actuator-owning worker.
     """
+    try:
+        candidate = ActionCandidate(
+            run_generation=(int(shared.run_generation.value)
+                            if run_generation is None else run_generation),
+            arm_qpos=np.array(arm_qpos, dtype=np.float64, copy=True),
+            hand_qpos=(None if hand_qpos is None else
+                       np.array(hand_qpos, dtype=np.float64, copy=True)),
+            is_hold=is_hold,
+        )
+    except (TypeError, ValueError) as exc:
+        return PreparedCommand(reason=str(exc), fatal=True)
     current_arm_qpos: np.ndarray
     current_hand_qpos: np.ndarray | None
     if feedback_snapshot is None:
@@ -456,7 +611,7 @@ def prepare_command(
                 fatal=not unavailable,
             )
 
-        hand_feedback: _HandFeedbackSnapshot | None = None
+        hand_feedback: _ActuatorFeedback | None = None
         if candidate.hand_qpos is not None:
             hand_feedback, reason, issue = read_hand_feedback(
                 shared, max_age_s=hand_feedback_max_age_s
@@ -475,39 +630,6 @@ def prepare_command(
         current_arm_qpos = feedback_snapshot.arm_qpos
         current_hand_qpos = feedback_snapshot.hand_qpos
 
-    hand_roundoff_canonicalized = False
-    if candidate.hand_qpos is not None and canonicalize_policy_hand_roundoff:
-        mechanical_lower = np.asarray(
-            (
-                hand_defaults.mechanical_qpos_min_rad
-                if hand_mechanical_lower_rad is None
-                else hand_mechanical_lower_rad
-            ),
-            dtype=np.float64,
-        )
-        mechanical_upper = np.asarray(
-            (
-                hand_defaults.mechanical_qpos_max_rad
-                if hand_mechanical_upper_rad is None
-                else hand_mechanical_upper_rad
-            ),
-            dtype=np.float64,
-        )
-        try:
-            hand_qpos, hand_roundoff_canonicalized = (
-                canonicalize_policy_hand_endpoint_roundoff(
-                    candidate.hand_qpos,
-                    gate.hand_low,
-                    gate.hand_high,
-                    mechanical_lower,
-                    mechanical_upper,
-                )
-            )
-        except ValueError as exc:
-            return PreparedCommand(reason=str(exc))
-        if hand_roundoff_canonicalized:
-            candidate = replace(candidate, hand_qpos=hand_qpos)
-
     gate_result = gate.validate(
         candidate,
         current_arm_qpos=current_arm_qpos,
@@ -523,58 +645,11 @@ def prepare_command(
                 GateRejectCode.COLLISION_CHECK_FAILED,
                 GateRejectCode.WORKSPACE_CHECK_FAILED,
             },
-            hand_roundoff_canonicalized=hand_roundoff_canonicalized,
         )
 
     return PreparedCommand(
         candidate=candidate,
-        hand_roundoff_canonicalized=hand_roundoff_canonicalized,
     )
-
-
-def prepare_joint_command(
-    shared: Any,
-    arm_qpos: np.ndarray,
-    hand_qpos: np.ndarray | None = None,
-    *,
-    gate: SafetyGate,
-    is_hold: bool = False,
-    hand_delta_reference_qpos: np.ndarray | None = None,
-    arm_feedback_max_age_s: float,
-    hand_feedback_max_age_s: float,
-) -> PreparedCommand:
-    """Build and physically validate raw joint targets without publishing."""
-    try:
-        candidate = build_action_candidate(
-            shared,
-            arm_qpos,
-            hand_qpos,
-            is_hold=is_hold,
-        )
-    except (TypeError, ValueError) as exc:
-        return PreparedCommand(reason=str(exc), fatal=True)
-    return prepare_command(
-        shared,
-        candidate,
-        gate=gate,
-        arm_feedback_max_age_s=arm_feedback_max_age_s,
-        hand_feedback_max_age_s=hand_feedback_max_age_s,
-        hand_delta_reference_qpos=hand_delta_reference_qpos,
-    )
-
-
-def _make_coupled_command(candidate: ActionCandidate) -> np.ndarray:
-    frame = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
-    frame["run_generation"][0] = candidate.run_generation
-    frame["action_id"][0] = candidate.action_id
-    frame["is_hold"][0] = int(candidate.is_hold)
-    if candidate.arm_qpos is not None:
-        frame["arm_present"][0] = 1
-        frame["arm_qpos"][0] = candidate.arm_qpos
-    if candidate.hand_qpos is not None:
-        frame["hand_present"][0] = 1
-        frame["hand_qpos"][0] = candidate.hand_qpos
-    return frame
 
 
 def command_publishability_reason(
@@ -615,22 +690,53 @@ def publish_command(
     A FULL result is recoverable backpressure: the caller keeps this exact
     candidate and retries from its main loop cadence.
     """
-    command, rejection_reason, fifo_depth = publish_coupled_command_if_motion_permitted(
-        shared,
-        expected_run_generation=int(candidate.run_generation),
-        frame=_make_coupled_command(candidate),
-        required_state=required_safety_state,
-    )
-    if command is None:
-        return PublishResult(False, reason=rejection_reason, fifo_depth=fifo_depth)
-    return PublishResult(True, command=command)
+    frame = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
+    frame["run_generation"][0] = candidate.run_generation
+    frame["is_hold"][0] = int(candidate.is_hold)
+    if candidate.arm_qpos is not None:
+        frame["arm_present"][0] = 1
+        frame["arm_qpos"][0] = candidate.arm_qpos
+    if candidate.hand_qpos is not None:
+        frame["hand_present"][0] = 1
+        frame["hand_qpos"][0] = candidate.hand_qpos
+    with shared.motion_lock:
+        if bool(shared.estop_request.value):
+            return PublishResult(False, reason=PUBLISH_REASON_ESTOP)
+        if bool(shared.error_state.value):
+            return PublishResult(False, reason=PUBLISH_REASON_FAULT)
+        if not bool(shared.is_running.value):
+            return PublishResult(False, reason=PUBLISH_REASON_RUNTIME_STOPPED)
+        state = SafetyState(int(shared.safety_state.value))
+        if state not in (SafetyState.ARMED, SafetyState.RUNNING):
+            return PublishResult(False, reason=f"{PUBLISH_REASON_SAFETY_STATE}: {state.name}")
+        if state is not required_safety_state:
+            return PublishResult(False, reason=(
+                f"{PUBLISH_REASON_SAFETY_STATE}: expected {required_safety_state.name}, "
+                f"got {state.name}"))
+        if int(shared.run_generation.value) != candidate.run_generation:
+            return PublishResult(False, reason=PUBLISH_REASON_GENERATION)
+        has_capacity, backlog, any_attached = command_stream_capacity_locked(shared)
+        if not has_capacity:
+            result = PublishResult(False, reason=(
+                PUBLISH_REASON_FIFO_FULL if any_attached else PUBLISH_REASON_NO_CONSUMER
+            ), fifo_depth=backlog)
+        else:
+            sequence = int(shared.coupled_cmd_ring.write(frame))
+            result = PublishResult(True, command=CommittedCommand(
+                run_generation=candidate.run_generation,
+                sequence=sequence,
+                published_monotonic_ns=time.monotonic_ns(),
+            ))
+    # Logging must not hold the motion lock and delay an operator's stop fence.
+    if result.reason == PUBLISH_REASON_FIFO_FULL:
+        _warn_full("command FIFO full depth=%d; retaining target", result.fifo_depth)
+    return result
 
 
 def wait_command_accepted(
     shared: Any,
     *,
     command: CommittedCommand,
-    action_id: int,
     wait_for_arm: bool,
     wait_for_hand: bool,
     timeout_s: float,
@@ -643,11 +749,11 @@ def wait_command_accepted(
     """Block until the requested workers report SDK acceptance of one command.
 
     Acceptance is judged by ordered consumption inside the command's own run
-    generation, never by action-ID supersession: a worker only advances its
+    generation: a worker only advances its
     acceptance watermark after SDK-accepting every targeted record in commit
     order, so a same-generation watermark at or beyond this command's FIFO
-    sequence proves ordered acceptance of this command. A larger action ID
-    alone proves nothing, and a stale-generation ACK can never satisfy the
+    sequence proves ordered acceptance of this command. A stale-generation
+    ACK can never satisfy the
     wait. Explicit waits are for home/replay/calibration boundaries only;
     ordinary streaming never blocks here.
     """
@@ -655,8 +761,8 @@ def wait_command_accepted(
         raise ValueError("acceptance wait requires at least one worker")
     if not np.isfinite(timeout_s) or timeout_s <= 0.0:
         raise ValueError("acceptance timeout must be finite and positive")
-    if action_id < 0 or command.sequence <= 0:
-        raise ValueError("acceptance identity must be non-negative and published")
+    if command.sequence <= 0:
+        raise ValueError("acceptance requires a published command sequence")
     generation = int(command.run_generation)
     sequence = int(command.sequence)
     deadline_s = time.monotonic() + timeout_s
@@ -680,8 +786,7 @@ def wait_command_accepted(
                 cancel_coupled_command_if_current(shared, command=command)
                 return AcceptanceResult(False, reason)
             arm_accepted = arm_feedback.accepted_generation == generation and (
-                arm_feedback.accepted_action_id == action_id
-                or arm_feedback.accepted_sequence >= sequence
+                arm_feedback.accepted_sequence >= sequence
             )
             if arm_accepted and arm_feedback.accepted_monotonic_ns <= 0:
                 cancel_coupled_command_if_current(shared, command=command)
@@ -696,8 +801,7 @@ def wait_command_accepted(
                 cancel_coupled_command_if_current(shared, command=command)
                 return AcceptanceResult(False, reason)
             hand_accepted = hand_feedback.accepted_generation == generation and (
-                hand_feedback.accepted_action_id == action_id
-                or hand_feedback.accepted_sequence >= sequence
+                hand_feedback.accepted_sequence >= sequence
             )
             if hand_accepted and hand_feedback.accepted_monotonic_ns <= 0:
                 cancel_coupled_command_if_current(shared, command=command)

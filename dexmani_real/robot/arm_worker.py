@@ -16,7 +16,7 @@ no error-classification framework.
 
 The worker validates only the HARD boundary (finite targets inside physical
 joint limits) at the SDK fence; the soft command-jump bound is owned once by
-the producers through ``control/projection.py`` and is never re-rejected here.
+the producers through ``robot/projection.py`` and is never re-rejected here.
 """
 
 from __future__ import annotations
@@ -51,7 +51,6 @@ logger = get_logger(__name__)
 class _CmdState:
     """Metadata of the last command accepted by the SDK."""
 
-    seq: int
     is_hold: bool
     accepted_monotonic_ns: int
     generation: int = 0
@@ -59,7 +58,7 @@ class _CmdState:
 
     @classmethod
     def idle(cls) -> "_CmdState":
-        return cls(0, False, 0, 0, 0)
+        return cls(False, 0, 0, 0)
 
 
 @dataclass
@@ -133,7 +132,6 @@ def _write_arm_frame(
     frame["error_code"][0] = int(error_code)
     frame["connected"][0] = 1 if connected else 0
     frame["tracking_err"][0] = tracking_err
-    frame["last_cmd_seq"][0] = cmd.seq
     frame["last_cmd_accepted_monotonic_ns"][0] = cmd.accepted_monotonic_ns
     frame["last_cmd_generation"][0] = cmd.generation
     frame["last_cmd_accepted_sequence"][0] = cmd.accepted_sequence
@@ -292,10 +290,7 @@ def _handle_servo_command(
     if not coupled_command_may_cross_sdk(shared, run_generation=command_generation):
         return
     if issue is not None:
-        raise RuntimeError(
-            "unsafe servo action_id="
-            f"{int(action['action_id'][0])}: {issue}"
-        )
+        raise RuntimeError(f"unsafe servo sequence={sequence}: {issue}")
     code = st.arm.servo(target)
     if code != 0:
         # Setter code 1 only means that the controller has an error. Read the
@@ -310,7 +305,6 @@ def _handle_servo_command(
     accepted_monotonic_ns = time.monotonic_ns()
     st.last_target = target.copy()  # producer owns 2π canonicalization
     st.last_cmd = _CmdState(
-        int(action["action_id"][0]),
         bool(action["is_hold"][0]),
         accepted_monotonic_ns,
         generation=command_generation,

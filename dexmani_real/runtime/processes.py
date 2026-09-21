@@ -1,10 +1,10 @@
-"""Spawn-only process construction and verified shutdown."""
+"""Bounded process shutdown; never unlink shared memory while a worker is alive."""
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Collection, Iterable
+from typing import Any, Collection, Iterable
 
 from dexmani_real.runtime.safety import SafetyState, RunEndReason, revoke_motion, transition
 from dexmani_real.utils.log import get_logger
@@ -19,36 +19,6 @@ class ProcessExit:
     escalation: str
 
 
-@dataclass(frozen=True)
-class ProcessSpec:
-    """One process to construct: name, target, args, readiness key.
-
-    ``ready_name`` is optional because only asynchronous initialization belongs
-    in readiness checks. Heartbeats are selected independently by the lifecycle.
-    """
-
-    name: str
-    target: Callable[..., None]
-    args: tuple[Any, ...]
-    ready_name: str | None = None
-    daemon: bool = False
-
-
-def build_processes(context: Any, specs: Iterable[ProcessSpec]) -> list[Any]:
-    """Construct (but do not start) one process per spec."""
-    return [
-        context.Process(
-            target=spec.target, args=spec.args, name=spec.name, daemon=spec.daemon
-        )
-        for spec in specs
-    ]
-
-
-def start_processes(processes: Iterable[Any]) -> None:
-    """Start each process. Callers keep require_transition(DISARMED) between
-    build and start so worker processes never race the safety transition."""
-    for process in processes:
-        process.start()
 
 
 @dataclass(frozen=True)

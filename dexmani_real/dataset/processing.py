@@ -42,11 +42,6 @@ from dexmani_real.dataset.processed import (
     _validate_masked_tactile_rows,
     validate_processed_hdf5,
 )
-from dexmani_real.dataset.processing_report import (
-    PROCESSING_REPORT_FILENAME,
-    build_processing_report,
-    write_processing_report,
-)
 from dexmani_real.planning.kinematics.arm_fk import (
     EEF_POSE_ALGORITHM_ID,
     EEF_POSE_COMPONENTS,
@@ -155,7 +150,6 @@ def analyze_episode(
         "hand_tactile_force": ((5, 120, 3), np.float32),
         "hand_tactile_force_valid": ((), np.bool_),
         "timestamp": ((), np.float64),
-        "source_sample_index": ((), np.int64),
         "flag_frame_status": ((), np.uint8),
         "observation_anchor_monotonic_ns": ((), np.uint64),
         "arm_source_monotonic_ns": ((), np.uint64),
@@ -190,8 +184,6 @@ def analyze_episode(
     )
     if np.any(np.diff(arrays["timestamp"]) <= 0):
         raise ValueError("raw timestamps must strictly increase")
-    if not np.array_equal(arrays["source_sample_index"], np.arange(frames)):
-        raise ValueError("raw sample identity must match every control row")
     anchor = arrays["observation_anchor_monotonic_ns"]
     if np.any(anchor == 0) or np.any(anchor[1:] <= anchor[:-1]):
         raise ValueError("control anchors must be positive and strictly increasing")
@@ -829,10 +821,21 @@ def process_episode_root(
         report["outputs"] = outputs
         report["validation"] = validation
         assert resolved_batch_task_name is not None
-        persisted_report = build_processing_report(
-            decisions, task_name=resolved_batch_task_name
-        )
-        write_processing_report(staging / PROCESSING_REPORT_FILENAME, persisted_report)
+        summary = {
+            "task_name": resolved_batch_task_name,
+            "episodes": [
+                {
+                    "source_episode": decision.source_path.name,
+                    "accepted": decision.accepted,
+                    "reason": decision.rejected_reason,
+                    "source_frames": decision.source_frames,
+                    "processed_frames": decision.processed_frames,
+                }
+                for decision in decisions
+            ],
+        }
+        with (staging / "processing_report.yaml").open("w", encoding="utf-8") as stream:
+            yaml.safe_dump(summary, stream, sort_keys=False, allow_unicode=True)
         atomic_publish(staging, target)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)

@@ -28,10 +28,7 @@ from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.planning.kinematics.pose import forward_from_quat_wxyz, normalize_quat_wxyz
 from dexmani_real.runtime.supervisor import wait_subsystem_ready
 from dexmani_real.runtime.processes import (
-    ProcessSpec,
-    build_processes,
     shutdown_processes_verified,
-    start_processes,
 )
 from dexmani_real.sensor.vr_worker import VRReceiverConfig, vr_loop
 from dexmani_real.teleop.audio_feedback import AudioFeedback
@@ -263,28 +260,22 @@ def main(argv: list[str] | None = None) -> int:
     shared = RuntimeChannels.create(
         prefix="dexmani_vr_calib", config=RuntimeChannelsConfig(), mp_context=ctx
     )
-    specs = [
-        ProcessSpec(
-            "vr-calib",
-            vr_loop,
-            (shared, VRReceiverConfig(port=args.port)),
-            ready_name="vr",
-            daemon=True,
-        )
+    processes = [
+        ctx.Process(name="vr", target=vr_loop, args=(shared, VRReceiverConfig(port=args.port)), daemon=True)
     ]
-    vr_proc = build_processes(ctx, specs)[0]
+    vr_proc = processes[0]
     forwards: list[np.ndarray] = []
     stale_count = 0
     shutdown_clean = False
     try:
-        start_processes([vr_proc])
+        vr_proc.start()
         print(
             "\n  Waiting for VR connection (up to 120 s) — put on Quest headset...",
             flush=True,
         )
         if not wait_subsystem_ready(
             shared,
-            [(specs[0], vr_proc)],
+            [vr_proc],
             {"vr": cfg.vr_ready_timeout_s},
         ):
             print("  ERROR: VR receiver startup timeout", flush=True)

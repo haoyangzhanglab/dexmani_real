@@ -16,78 +16,6 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-# Only a genuinely missing dependency may skip this module: a renamed or
-# broken symbol must fail the suite rather than hide behind a skip.
-try:
-    from dexmani_real.control.publication import PublishWaitTracker
-    from dexmani_real.teleop.control_loop.grid import close_publish_span
-
-    _IMPORT_ERROR = None
-except ImportError as exc:  # pragma: no cover - environment guard
-    PublishWaitTracker = None
-    close_publish_span = None
-    _IMPORT_ERROR = exc
-
-
-@unittest.skipIf(
-    _IMPORT_ERROR is not None, f"dependencies unavailable: {_IMPORT_ERROR}"
-)
-class PauseBoundarySpanTest(unittest.TestCase):
-    def _controller(self, action_id: int):
-        return SimpleNamespace(
-            pending_publish=SimpleNamespace(
-                candidate=SimpleNamespace(action_id=action_id)
-            )
-        )
-
-    def test_pause_boundary_drops_the_retained_candidate_visibly(self):
-        tracker = PublishWaitTracker("teleop")
-        tracker.note_full(8, 813)
-        self.assertTrue(tracker.waiting)
-        controller = self._controller(813)
-
-        with self.assertLogs(
-            "dexmani_real", level="WARNING"
-        ) as logs:
-            close_publish_span(
-                controller, SimpleNamespace(fifo_wait=tracker), "pause_boundary"
-            )
-
-        text = "\n".join(logs.output)
-        self.assertIn("[DROP] teleop action=813", text)
-        self.assertIn("pause_boundary", text)
-        self.assertEqual(text.count("[DROP]"), 1)
-        self.assertIsNone(controller.pending_publish)
-        self.assertFalse(tracker.waiting)
-        # The span is closed, so the next successful commit reports no wait
-        # that never resumed.
-        with self.assertNoLogs("dexmani_real.control.publication", level="INFO"):
-            tracker.note_committed()
-
-    def test_boundary_without_a_candidate_still_closes_a_stale_span(self):
-        tracker = PublishWaitTracker("teleop")
-        tracker.note_full(8, 901)
-        controller = SimpleNamespace(pending_publish=None)
-
-        close_publish_span(
-            controller, SimpleNamespace(fifo_wait=tracker), "pause_boundary"
-        )
-        self.assertFalse(tracker.waiting)
-        # A later FULL span is announced again instead of being swallowed.
-        with self.assertLogs("dexmani_real.control.publication", level="WARNING") as logs:
-            tracker.note_full(8, 902)
-        self.assertIn("keep_action=902", "\n".join(logs.output))
-
-    def test_boundary_with_no_span_is_a_no_op(self):
-        tracker = PublishWaitTracker("teleop")
-        controller = SimpleNamespace(pending_publish=None)
-        with self.assertNoLogs("dexmani_real.control.publication", level="WARNING"):
-            close_publish_span(
-                controller, SimpleNamespace(fifo_wait=tracker), "pause_release"
-            )
-        self.assertFalse(tracker.waiting)
-
-
 class _TeleopRecordingHarness:
     """Real controller, client and finalizer; synthetic inputs and temporary media."""
 
@@ -172,11 +100,10 @@ class _TeleopRecordingHarness:
         case.addCleanup(cleanup_writer)
 
     def add_rows(self, count=2):
-        import numpy as np
-        from test_recording_preservation import _state, _action, _VR_FRAME
+        from test_recording_preservation import _frame
         for index in range(count):
             self.case.assertTrue(self.client.add_frame(
-                _state(float(index + 1)), _action(), dict(_VR_FRAME), arm_qpos_sent=np.zeros(7)))
+                _frame(float(index + 1))))
 
     def begin_finalization(self):
         stop = self.shared.record_control_q.get_nowait()
@@ -350,9 +277,9 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
         from unittest import mock
         import dexmani_real.teleop.keyboard_session as keyboard
         from dexmani_real.config.experiment import resolve_experiment_config
-        from dexmani_real.control.action import ActionCandidate
-        from dexmani_real.control.publication import PreparedCommand, PublishResult
-        from dexmani_real.runtime.safety import SafetyState
+        from dexmani_real.robot.commands import ActionCandidate
+        from dexmani_real.robot.commands import PreparedCommand, PublishResult
+        from dexmani_real.runtime.safety import SafetyState, CommittedCommand
         from test_deployment_evidence import _fake_shared
 
         runtime = resolve_experiment_config()
@@ -389,12 +316,12 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
         def feedback(*args, **kwargs):
             return keyboard._KeyboardFeedback(
                 arm_state={"last_cmd_generation": shared.run_generation.value,
-                           "last_cmd_seq": state.step.get("ack", 0)},
+                           "last_cmd_accepted_sequence": state.step.get("ack", 0)},
                 arm_qpos_rad=qpos.copy(), hand_qpos_rad=None, issue=None)
 
         def prepare(shared, q, **kwargs):
             candidate = ActionCandidate(run_generation=int(shared.run_generation.value),
-                                        action_id=len(prepared) + 1, arm_qpos=q.copy())
+                                        arm_qpos=q.copy())
             prepared.append(candidate)
             return PreparedCommand(candidate=candidate)
 
@@ -405,7 +332,8 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
             if state.step.get("full", False):
                 return PublishResult(False, reason=keyboard.PUBLISH_REASON_FIFO_FULL, fifo_depth=4)
             published.append((state.frame, candidate))
-            return PublishResult(True)
+            return PublishResult(True, command=CommittedCommand(
+                run_generation=candidate.run_generation, sequence=len(published)))
 
         def home(shared, runtime, planner, keys, current, **kwargs):
             keyboard.revoke_motion(shared, SafetyState.ARMED)
@@ -432,8 +360,9 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
     def test_full_release_drops_before_capacity_returns(self):
         r = self._run([{"keys": ("w",), "full": True}, {"full": True}, {}, {},
                        {"keys": ("w",)}, {}])
-        self.assertEqual([f for f, c in r.attempts if c.action_id == 1], [1])
-        self.assertEqual([c.action_id for _, c in r.published], [2])
+        self.assertEqual([f for f, c in r.attempts if c is r.prepared[0]], [1])
+        self.assertEqual(len(r.published), 1)
+        self.assertIs(r.published[0][1], r.prepared[1])
         self.assertEqual(r.logs.count("[DROP]"), 1)
         self.assertIn("reason=release", r.logs)
         self.assertGreaterEqual(r.anchors, 2)
@@ -442,11 +371,12 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
         from dexmani_real.runtime.safety import SafetyState
         r = self._run([{"keys": ("w",)}, {"keys": ("w",), "full": True}]
                       + [{"full": True}] * 8 + [{}])
-        self.assertEqual([c.action_id for _, c in r.published], [1])
+        self.assertEqual(len(r.published), 1)
+        self.assertIs(r.published[0][1], r.prepared[0])
         self.assertEqual(r.snapshots[4][0], SafetyState.RUNNING)
         self.assertEqual(r.snapshots[8][0], SafetyState.RUNNING)
         self.assertEqual(r.snapshots[9][0], SafetyState.ARMED)
-        self.assertIn("final action_id=1 was not accepted", r.logs)
+        self.assertIn("final sequence=1 was not accepted", r.logs)
         self.assertEqual(r.logs.count("[DROP]"), 1)
 
     def test_accepted_or_absent_predecessor_releases_without_wait(self):
@@ -480,10 +410,11 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
             with self.subTest(boundary=boundary):
                 event = {"revoke": True, "keys": ("w",)} if boundary == "epoch" else {"keys": (boundary,)}
                 r = self._run([{"keys": ("w",), "full": True}, event, {}, {"keys": ("w",)}])
-                self.assertFalse(any(c.action_id == 1 for _, c in r.published))
+                self.assertFalse(any(c is r.prepared[0] for _, c in r.published))
                 self.assertEqual(r.logs.count("[DROP]"), 1)
                 if boundary in ("r", "epoch"):
-                    self.assertEqual([c.action_id for _, c in r.published], [2])
+                    self.assertEqual(len(r.published), 1)
+                    self.assertIs(r.published[0][1], r.prepared[1])
 
 
 class TeleopCapacityOwnershipTest(unittest.TestCase):
