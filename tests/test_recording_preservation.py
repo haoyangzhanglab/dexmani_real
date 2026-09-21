@@ -421,7 +421,6 @@ class RecorderFinalizerIsolationTest(unittest.TestCase):
 class RecorderCapacityPathTest(unittest.TestCase):
     def test_real_client_sample_stop_and_writer_prefix(self):
         from queue import Queue
-        from types import SimpleNamespace
         from dexmani_real.ipc.schema import make_record_sample_dtype
         from dexmani_real.recording.client import RecorderClient
         from test_deployment_evidence import _RunnerTest, _fake_shared

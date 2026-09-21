@@ -541,7 +541,6 @@ class RecordingAcrossTrialsTest(_RunnerTest):
 
 class EvidenceStartupTest(unittest.TestCase):
     def test_optional_failure_keeps_handles_and_required_failure_is_terminal(self):
-        from unittest.mock import patch
         from dexmani_real.runtime.supervisor import start_evidence_services
         for critical_alive in (True, False):
             shared = _fake_shared()

@@ -92,7 +92,6 @@ def build_episode_frame(
             "head_quat_wxyz", signal.get("head_quat_wxyz", np.full(4, np.nan))
         ),
     }
-    camera = camera_frame or {}
     data = {
         name: np.array(value, dtype=DATASET_SPECS[name].dtype, copy=True)
         for name, value in values.items()
