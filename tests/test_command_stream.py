@@ -11,7 +11,7 @@ transport's own sequence identities. Coverage maps to the acceptance matrix:
 * V07 hand intermediate slew / CRC / exact-endpoint cursor distinction;
 * V08 generation cancel batch-invalidates the backlog, stale-generation ACKs
   never satisfy an acceptance wait, and ordered same-generation watermarks
-  prove predecessor acceptance without action-ID supersession.
+  prove predecessor acceptance.
 
 Never opens hardware or an SDK: the arm/hand workers are exercised through
 their consumption functions with fake SDK objects.

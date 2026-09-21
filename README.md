@@ -19,15 +19,18 @@ python -m pip install -e .
 xArm、XHand、RealSense、HTS SDK，以及运动学/碰撞规划和 `dexmani_policy` 依赖，
 按实验机环境安装。普通 import 不应连接设备；SDK 连接与控制由 owning worker 显式执行。
 
-配置解析顺序是 **CLI > YAML > `config/defaults.py`**：
+支持 `--config` 的入口按 **CLI > 显式指定的 YAML > `config/defaults.py`** 解析，
+不会自动查找实验 YAML。可在连接设备前查看采集入口的解析结果：
 
 ```bash
 python examples/collect_teleop.py --print-config
+python examples/collect_teleop.py --config experiment.yaml --print-config
 ```
 
 经常调整的 IP、serial、频率、相机尺寸、数据路径、task、控制参数留在实验配置。
 
-运动入口要求在实验 YAML 显式提供 `safety.max_dispatch_delay_s`（有限正秒数）。
+运动入口要求显式配置 `safety.max_dispatch_delay_s`（有限正秒数）；
+支持 `--config` 的入口应在实验 YAML 中提供该值。policy CLI 的配置限制见下文。
 当前没有经过真机 timing validation 的默认值；缺失配置会在设备启动前拒绝运行。
 该预算从每个 endpoint 的执行时机开始，覆盖准备、FIFO 等待和 XHand 最终目标 slew；
 FULL/CRC 重试不刷新 deadline。过期撤销该 generation，必须由操作者重新开始；
@@ -38,26 +41,29 @@ keyboard/calibration jog 必须先释放按键。HOME 排队使用现有 request
 
 | 工作流 | 命令 | 硬件 / 输出 |
 |---|---|---|
-| VR collection | `python examples/collect_teleop.py --task-name <task> --operator <name>` | 真机；raw episode |
-| Keyboard jog / home | `python examples/keyboard_teleop.py` | 真机 |
-| Physical replay | `python examples/replay_episode.py <episode>` | 真机；raw float64 sent targets |
+| VR collection | `python examples/collect_teleop.py --config experiment.yaml --task-name <task> --operator <name>` | 真机；raw episode |
+| Keyboard jog / home | `python examples/keyboard_teleop.py --config experiment.yaml` | 真机 |
+| Physical replay | `python examples/replay_episode.py <episode> --config experiment.yaml` | 真机；raw float64 sent targets |
 | Policy rollout | `python examples/run_policy.py <policy/task/experiment>` | 真机；rollout session |
-| Camera calibration | `python examples/calibrate_camera.py --hand-geometry {absent,secured-home}` | 真机；标定 |
+| Camera calibration | `python examples/calibrate_camera.py --config experiment.yaml --hand-geometry absent` | 真机；标定；仅适用于未安装 XHand |
 | VR heading calibration | `python examples/calibrate_vr_heading.py` | VR / HTS；标定 |
 | Policy export | `python examples/export_policy_zarr.py episodes/<task> --dry-run` | 只读预检；移除 `--dry-run` 后导出 |
 | XHand diagnostics | `python examples/xhand_diagnostics.py` | 连接真机；读取 joints/tactile/identity，无运动 |
 | Inspect raw | `python examples/visualize_episode.py <episode> --info` | 离线；去掉 `--info` 可视化 |
 
-完整参数与按键以各入口的 `--help` 为准。
+除 XHand diagnostics 外，参数以各入口的 `--help` 为准，交互按键见会话提示。
+`xhand_diagnostics.py` 没有离线 `--help`，执行该脚本会启动 SDK 诊断并连接/发现设备。
+相机标定的 `--hand-geometry` 是物理状态声明：未安装 XHand 才可用 `absent`；
+安装的手已物理固定在配置的 home 姿态时用 `secured-home`。两者均使用固定 home 手模型做碰撞检查。
 
 ### Teleoperation / recording
 
 ```bash
 # 标准采集
-python examples/collect_teleop.py --task-name <task> --operator <name>
+python examples/collect_teleop.py --config experiment.yaml --task-name <task> --operator <name>
 
 # 无手、无录制的 arm 调试
-python examples/collect_teleop.py --task-name <task> --operator <name> --no-hand --no-record
+python examples/collect_teleop.py --config experiment.yaml --task-name <task> --operator <name> --no-hand --no-record
 ```
 
 `B` 开始、`C` 暂停、`S` 停止并保存、`D` 丢弃、`H` 归位、`Q` 退出、`ESC` 急停。
@@ -71,6 +77,11 @@ recorder 进程自己 drain 最后一帧、关闭视频/HDF5 并发布结果；�
 上一 episode 的结果未确认前不开始下一次录制。键盘监听持续到录制收尾完成。
 
 ### Policy rollout
+
+当前 `run_policy.py` 没有 `--config`，直接读取 `config/defaults.py`。
+启动前必须完成 commissioning，并在该配置源中显式设置实测的
+`safety.max_dispatch_delay_s`；仓库保留未标定的 `None`，会在启动硬件前拒绝运行。
+其他入口的 `--config experiment.yaml` 不会影响 policy CLI。
 
 ```bash
 python examples/run_policy.py <policy/task/experiment> \
@@ -165,12 +176,14 @@ arm 与 hand 也不是物理事务。SDK acceptance 不等于物理收敛，尤�
 ## 离线检查
 
 ```bash
-python -m compileall -q dexmani_real examples
-python -m pytest -q
+python -m compileall -q dexmani_real examples tests
+python -m pytest -q -ra
+ruff check --select F401,F821,F822,F823 dexmani_real examples tests
 git diff --check
 ```
 
-pytest 需要相应的离线媒体、运动学依赖，但不应连接硬件。保留的重点是数值几何、转换、
+在已有离线环境中提供 pytest、Ruff、媒体和运动学依赖，以及可导入的 `dexmani_policy`
+公共数据接口；不要为验证升级实验机全局环境。pytest 不应连接硬件。保留的重点是数值几何、转换、
 动作限制、deadline/revocation、录制边界和 public policy 数据接口。
 离线检查不启动真机、CUDA 或真实 checkpoint。
 
