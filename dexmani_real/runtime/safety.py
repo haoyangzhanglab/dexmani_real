@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
-from dexmani_real.ipc.command_stream import command_stream_capacity_locked
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -270,73 +269,6 @@ def read_run_state_snapshot(shared: Any) -> RunStateSnapshot:
         )
 
 
-def publish_coupled_command_if_motion_permitted(
-    shared: Any,
-    *,
-    expected_run_generation: int,
-    frame: Any,
-    required_state: SafetyState | None = None,
-) -> tuple[CommittedCommand | None, str, int]:
-    """Commit one frame to the ordered command FIFO, or return the exact
-    locked rejection reason and the current backlog depth.
-
-    Permission, generation, capacity, and the ring commit share one short
-    motion-lock section; the payload is a small fixed-size record. The commit
-    produces the queue sequence. A FULL result is recoverable backpressure:
-    the producer keeps the identical prepared candidate and retries from its
-    main loop — queued records are never dropped or superseded here.
-    """
-    frame_generation = int(frame["run_generation"][0])
-    controls_actuator = bool(frame["arm_present"][0]) or bool(frame["hand_present"][0])
-    if frame_generation != int(expected_run_generation):
-        raise ValueError(
-            "coupled command identity does not match its publication permit"
-        )
-    if not controls_actuator:
-        raise ValueError("coupled command must target at least one actuator")
-    with shared.motion_lock:
-        if bool(shared.estop_request.value):
-            return None, PUBLISH_REASON_ESTOP, 0
-        if bool(shared.error_state.value):
-            return None, PUBLISH_REASON_FAULT, 0
-        if not bool(shared.is_running.value):
-            return None, PUBLISH_REASON_RUNTIME_STOPPED, 0
-        permit = _read_motion_permit_locked(shared)
-        if not permit.allows_motion:
-            return (
-                None,
-                f"{PUBLISH_REASON_SAFETY_STATE}: {permit.state.name}",
-                0,
-            )
-        if required_state is not None and permit.state is not required_state:
-            return (
-                None,
-                f"{PUBLISH_REASON_SAFETY_STATE}: expected {required_state.name}, "
-                f"got {permit.state.name}",
-                0,
-            )
-        if permit.run_generation != int(expected_run_generation):
-            return None, PUBLISH_REASON_GENERATION, 0
-        has_capacity, backlog, any_attached = command_stream_capacity_locked(shared)
-        if not has_capacity:
-            return (
-                None,
-                PUBLISH_REASON_FIFO_FULL if any_attached else PUBLISH_REASON_NO_CONSUMER,
-                backlog,
-            )
-        sequence = int(shared.coupled_cmd_ring.write(frame))
-        if sequence <= 0:
-            raise RuntimeError("coupled command ring returned an invalid sequence")
-        published_monotonic_ns = time.monotonic_ns()
-        return (
-            CommittedCommand(
-                run_generation=permit.run_generation,
-                sequence=sequence,
-                published_monotonic_ns=published_monotonic_ns,
-            ),
-            "",
-            0,
-        )
 
 
 def _committed_command_is_current_locked(

@@ -447,9 +447,9 @@ class XArm7:
             if on_poll is not None:
                 on_poll()
             time.sleep(0.05)
-        if self.axis != self.cfg.expected_axis:
+        if self.axis != ARM_JOINT_SHAPE[0]:
             raise RuntimeError(
-                f"device reports {self.axis} axes, expected {self.cfg.expected_axis}"
+                f"device reports {self.axis} axes, expected {ARM_JOINT_SHAPE[0]}"
             )
 
     def _check_controller_error(self) -> None:

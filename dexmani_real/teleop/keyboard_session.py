@@ -18,21 +18,16 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.control.action import ActionCandidate
-from dexmani_real.control.arm_homing import ArmHomeConfig, execute_arm_home
-from dexmani_real.control.hand_homing import publish_hand_home_and_wait_accepted
-from dexmani_real.control.jog import any_jog_key_held, compute_cartesian_jog_delta
-from dexmani_real.control.publication import (
-    PUBLISH_REASON_FIFO_FULL,
-    PublishWaitTracker,
-    prepare_joint_command,
-    publish_command,
-)
-from dexmani_real.control.projection import (
+from dexmani_real.robot.commands import ActionCandidate
+from dexmani_real.robot.arm_homing import ArmHomeConfig, execute_arm_home
+from dexmani_real.robot.hand_homing import publish_hand_home_and_wait_accepted
+from dexmani_real.teleop.jog import any_jog_key_held, compute_cartesian_jog_delta
+from dexmani_real.robot.commands import (PUBLISH_REASON_FIFO_FULL, prepare_joint_command, publish_command)
+from dexmani_real.robot.projection import (
     ARM_COMMAND_JUMP_REJECTION,
     validate_arm_command,
 )
-from dexmani_real.control.safety_gate import planner_action_safety_gate
+from dexmani_real.robot.commands import planner_action_safety_gate
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
     RuntimeChannelsConfig,
@@ -657,7 +652,6 @@ def _run_control_loop(
     # backpressure; retried unchanged and dropped visibly on epoch revoke.
     pending_candidate: ActionCandidate | None = None
     pending_arm_qpos: np.ndarray | None = None
-    fifo_wait = PublishWaitTracker("keyboard")
 
     def drop_pending(reason: str) -> None:
         """Cancel only the uncommitted jog and close its visible wait once."""
@@ -666,7 +660,6 @@ def _run_control_loop(
             logger.warning(
                 "[DROP] keyboard pending command reason=%s", reason
             )
-        fifo_wait.note_dropped(reason, report=False)
         pending_candidate = None
         pending_arm_qpos = None
 
@@ -896,15 +889,12 @@ def _run_control_loop(
                 shared, pending_candidate, required_safety_state=SafetyState.RUNNING
             )
             if retry.published:
-                fifo_wait.note_committed()
                 last_motion_sequence = retry.command.sequence
                 assert pending_arm_qpos is not None
                 previous_command = pending_arm_qpos
                 pending_candidate = None
                 pending_arm_qpos = None
-            elif retry.reason == PUBLISH_REASON_FIFO_FULL:
-                fifo_wait.note_full(retry.fifo_depth)
-            else:
+            elif retry.reason != PUBLISH_REASON_FIFO_FULL:
                 drop_pending(retry.reason)
                 if not reject_motion(retry.reason):
                     return False
@@ -956,7 +946,6 @@ def _run_control_loop(
             assert publish_result.candidate is not None
             pending_candidate = publish_result.candidate
             pending_arm_qpos = publish_result.arm_qpos_rad
-            fifo_wait.note_full(publish_result.fifo_depth)
             continue
         if publish_result.status is _KeyboardPublishStatus.IK_REJECTED:
             now_s = time.monotonic()

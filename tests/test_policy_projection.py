@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from dexmani_real.control.projection import (
+from dexmani_real.robot.projection import (
     ARM_COMMAND_JUMP_REJECTION,
     project_arm_command,
     project_hand_command,
@@ -32,14 +32,13 @@ from dexmani_real.control.projection import (
 # Only a genuinely missing dependency may skip this module: a renamed or
 # broken symbol must fail the suite rather than hide behind a skip.
 try:
-    from dexmani_real.control.publication import PreparedCommand
-    from dexmani_real.control.safety_gate import GateRejectCode
-    from dexmani_real.deployment.executor import (
+    from dexmani_real.robot.commands import PreparedCommand
+    from dexmani_real.robot.commands import GateRejectCode
+    from dexmani_real.deployment.runner import (
         _RejectKind,
         _build_policy_workspace_check,
     )
-    from dexmani_real.deployment.executor import PolicyRunner
-    from dexmani_real.deployment.metrics import PolicyStats
+    from dexmani_real.deployment.runner import PolicyRunner
 
     _IMPORT_ERROR = None
 except ImportError as exc:  # pragma: no cover - environment guard
@@ -48,7 +47,6 @@ except ImportError as exc:  # pragma: no cover - environment guard
     _RejectKind = None
     _build_policy_workspace_check = None
     PolicyRunner = None
-    PolicyStats = None
     _IMPORT_ERROR = exc
 
 _LOWER = np.array([-6.283, -2.059, -6.283, -0.192, -6.283, -1.693, -6.283])
@@ -84,7 +82,7 @@ class ProjectionOwnerTest(unittest.TestCase):
 
     def test_reported_projection_names_the_truncation(self):
         """A real truncation is reported for the producer's visible [CLIP] line."""
-        from dexmani_real.control.projection import project_arm_command_reported
+        from dexmani_real.robot.projection import project_arm_command_reported
 
         reference = np.zeros(7)
         target = np.full(7, 3.0)
@@ -211,15 +209,10 @@ class RecoverableMissTest(unittest.TestCase):
     def _runner(self):
         runner = PolicyRunner.__new__(PolicyRunner)
         runner.run_generation = 7
-        runner.observation_id = 3
-        runner.chunk_action_index = 1
         runner.last_publication_ns = None
         runner.previous_arm_command_qpos = np.full(7, 0.25)
-        runner.chunk_sources = {}
         runner.actions = deque([np.array([1.0]), np.array([2.0])])
         runner._pending_dispatch = None
-        runner._fifo_wait = SimpleNamespace(waiting=False, note_dropped=lambda reason, **kw: None)
-        runner.stats = PolicyStats()
         runner.run_started_ns = 12345
         runner.recorder = None
         runner.shared = None
@@ -239,12 +232,10 @@ class RecoverableMissTest(unittest.TestCase):
         # The trial continues; only the unpublished suffix was dropped.
         self.assertEqual(runner.run_started_ns, 12345)
         self.assertEqual(list(runner.actions), [])
-        self.assertEqual(runner.chunk_action_index, 0)
         # New predictions still anchor behind the last committed command.
         self.assertTrue(
             np.array_equal(runner.previous_arm_command_qpos, np.full(7, 0.25))
         )
-        self.assertEqual(runner.stats.rejection_reasons.get("ik_no_solution"), 1)
         runner._invalidate_rollout.assert_not_called()
         runner._request_failed_session_shutdown.assert_not_called()
 
@@ -255,7 +246,6 @@ class RecoverableMissTest(unittest.TestCase):
         )
         runner._handle_preparation_rejection(prepared, raw_action=np.array([0.0]))
         self.assertEqual(runner.run_started_ns, 12345)
-        self.assertEqual(runner.stats.safety_rejection_count, 1)
         runner._invalidate_rollout.assert_not_called()
 
     def test_post_projection_invariant_break_is_session_failure(self):
@@ -290,9 +280,9 @@ class FullRetryKeepsCandidateTest(unittest.TestCase):
     def test_full_never_reprepares_or_advances_state(self):
         from unittest import mock
 
-        import dexmani_real.deployment.executor as executor_module
-        from dexmani_real.control.action import ActionCandidate
-        from dexmani_real.control.publication import PublishResult
+        import dexmani_real.deployment.runner as executor_module
+        from dexmani_real.robot.commands import ActionCandidate
+        from dexmani_real.robot.commands import PublishResult
 
         runner = PolicyRunner.__new__(PolicyRunner)
         candidate = ActionCandidate(
@@ -305,14 +295,6 @@ class FullRetryKeepsCandidateTest(unittest.TestCase):
         runner.execute = True
         runner.last_publication_ns = 1_000_000
         runner.actions = deque([np.array([1.0])])
-        runner.chunk_action_index = 0
-        observed: dict = {}
-        runner._fifo_wait = SimpleNamespace(
-            waiting=False,
-            note_full=lambda depth: observed.update(depth=depth),
-            note_committed=lambda: observed.update(committed=True),
-            note_dropped=lambda reason, **kw: observed.update(dropped=reason),
-        )
         runner._prepare_dispatch_candidate = mock.Mock(
             side_effect=AssertionError("FULL retry must not re-prepare")
         )
@@ -326,9 +308,6 @@ class FullRetryKeepsCandidateTest(unittest.TestCase):
         self.assertIs(runner._pending_dispatch, candidate)
         self.assertEqual(len(runner.actions), 1)  # head not popped
         self.assertEqual(runner.last_publication_ns, 1_000_000)  # cadence kept
-        self.assertEqual(runner.chunk_action_index, 0)
-        self.assertEqual(observed.get("depth"), 8)
-        self.assertNotIn("committed", observed)
 
 
 @unittest.skipIf(
@@ -373,8 +352,8 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
         import threading
         from unittest import mock
         from dexmani_real.config.experiment import resolve_experiment_config
-        from dexmani_real.control.publication import CommandFeedbackSnapshot, PublishWaitTracker
-        from dexmani_real.control.safety_gate import SafetyGate
+        from dexmani_real.robot.commands import (CommandFeedbackSnapshot)
+        from dexmani_real.robot.commands import SafetyGate
         from dexmani_real.runtime.safety import SafetyState
         from test_deployment_evidence import _fake_shared
         runtime = resolve_experiment_config()
@@ -405,22 +384,17 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
         runner._session_failure = mock.Mock()
         runner._record_rollout_tick = mock.Mock()
         runner._pending_dispatch = None
-        runner._fifo_wait = PublishWaitTracker("policy")
         runner._running_generation_is_live = lambda: True
         runner._running_time_expired = lambda now: False
         runner.execute = True
         runner.last_publication_ns = None
         runner.session_publication_count = 0
         runner.actions = deque([action])
-        runner.chunk_action_index = 0
-        runner.chunk_sources = {}
-        runner.observation_id = 1
-        runner.stats = PolicyStats()
         return runner, action, feedback, arm, hand
 
     def test_real_candidate_logs_one_combined_line_and_preserves_values(self):
         from unittest import mock
-        import dexmani_real.deployment.executor as executor
+        import dexmani_real.deployment.runner as executor
         for key in ("action", "action_ee"):
             for arm_clip, hand_clip in ((False, True), (True, False), (True, True), (False, False)):
                 with self.subTest(key=key, arm=arm_clip, hand=hand_clip):
@@ -452,7 +426,7 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
 
     def test_tiny_nonzero_hand_correction_is_visible(self):
         from unittest import mock
-        import dexmani_real.deployment.executor as executor
+        import dexmani_real.deployment.runner as executor
         runner, action, feedback, _, hand = self._runner_and_action(hand_clip=True, tiny=True)
         with mock.patch.object(executor, "read_command_feedback", return_value=(feedback, "", None)):
             with self.assertLogs(executor.logger.name, level="INFO") as logs:
@@ -464,8 +438,8 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
 
     def test_full_retries_project_and_report_only_once(self):
         from unittest import mock
-        import dexmani_real.deployment.executor as executor
-        from dexmani_real.control.publication import PublishResult, PUBLISH_REASON_FIFO_FULL
+        import dexmani_real.deployment.runner as executor
+        from dexmani_real.robot.commands import PublishResult, PUBLISH_REASON_FIFO_FULL
         runner, action, feedback, _, _ = self._runner_and_action(hand_clip=True)
         original = action.copy()
         results = [PublishResult(False, reason=PUBLISH_REASON_FIFO_FULL, fifo_depth=4)] * 3
@@ -477,21 +451,19 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
                 for index in range(4):
                     runner._dispatch_action(action)
                     if index < 3:
-                        self.assertEqual(runner.chunk_action_index, 0)
                         self.assertIsNone(runner.last_publication_ns)
         self.assertEqual(project.call_count, 1)
         candidates = [call.args[1] for call in publish.call_args_list]
         self.assertTrue(all(c is candidates[0] for c in candidates))
         self.assertEqual(sum("[CLIP]" in line for line in logs.output), 1)
         self.assertEqual(runner.session_publication_count, 1)
-        self.assertEqual(runner.chunk_action_index, 1)
         self.assertEqual(len(runner.actions), 0)
         self.assertIsNone(runner._pending_dispatch)
         np.testing.assert_array_equal(action, original)
 
     def test_invalid_hand_shape_and_nan_still_fail_contract(self):
         from unittest import mock
-        import dexmani_real.deployment.executor as executor
+        import dexmani_real.deployment.runner as executor
         for key in ("action", "action_ee"):
             for invalid in ("shape", "nan"):
                 with self.subTest(key=key, invalid=invalid):

@@ -16,7 +16,7 @@ no error-classification framework.
 
 The worker validates only the HARD boundary (finite targets inside physical
 joint limits) at the SDK fence; the soft command-jump bound is owned once by
-the producers through ``control/projection.py`` and is never re-rejected here.
+the producers through ``robot/projection.py`` and is never re-rejected here.
 """
 
 from __future__ import annotations

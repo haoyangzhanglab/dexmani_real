@@ -17,8 +17,8 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.control.hand_homing import initialize_hand_home
-from dexmani_real.control.safety_gate import SafetyGate, planner_action_safety_gate
+from dexmani_real.robot.hand_homing import initialize_hand_home
+from dexmani_real.robot.commands import SafetyGate, planner_action_safety_gate
 from dexmani_real.ipc.causal import (
     read_arm_state_causal,
     read_hand_state_causal,
@@ -33,7 +33,6 @@ from dexmani_real.planning import (
     XArm7MotionPlanner,
     XArm7PlannerConfig,
 )
-from dexmani_real.control.publication import PublishWaitTracker
 from dexmani_real.recording.client import RecorderClient
 from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
@@ -52,7 +51,7 @@ from dexmani_real.teleop.control_loop.grid import (
     TeleopController,
     TeleopGridResources,
     _TeleopCommandLimits,
-    close_publish_span,
+    drop_pending_command,
     run_control_grid_tick,
 )
 from dexmani_real.teleop.control_loop.hand_control import (
@@ -426,7 +425,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             cfg.runtime.policy.hand_ramp_duration_s, cfg.runtime.policy.control_hz
         ),
         max_observation_skew_s=cfg.runtime.policy.max_observation_skew_s,
-        fifo_wait=PublishWaitTracker("teleop"),
     )
 
     def enter_pause(
@@ -485,7 +483,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             else:
                 if relabel:
                     pause_reason = reason
-                close_publish_span(controller, grid_resources, "pause_boundary")
+                drop_pending_command(controller, "pause_boundary")
                 controller.clear_reference()
                 logger.debug(
                     "teleop_loop: remaining in %s pause boundary (observed %s)",
@@ -493,7 +491,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     reason,
                 )
                 return
-            close_publish_span(controller, grid_resources, "pause_boundary")
+            drop_pending_command(controller, "pause_boundary")
             controller.clear_reference()
             log_pause = (
                 logger.debug
@@ -526,7 +524,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             )
         pause_since_ns = 0
         pause_reason = None
-        close_publish_span(controller, grid_resources, "home_boundary")
+        drop_pending_command(controller, "home_boundary")
         controller.clear_reference()
 
     def run_home() -> None:

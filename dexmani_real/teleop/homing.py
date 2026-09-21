@@ -8,8 +8,8 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.control.arm_homing import ArmHomeConfig, execute_arm_home
-from dexmani_real.control.hand_homing import publish_hand_home_and_wait_accepted
+from dexmani_real.robot.arm_homing import ArmHomeConfig, execute_arm_home
+from dexmani_real.robot.hand_homing import publish_hand_home_and_wait_accepted
 from dexmani_real.ipc.causal import read_arm_state_causal
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import XArm7MotionPlanner

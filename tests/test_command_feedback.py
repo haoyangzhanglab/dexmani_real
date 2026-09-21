@@ -1,6 +1,6 @@
 """Offline tests for the command-feedback temporal transaction.
 
-These exercise ``control.publication`` against a fake clock and synthetic ring
+These exercise ``robot.commands`` against a fake clock and synthetic ring
 frames built on the real ``ARM_STATE_DTYPE``/``HAND_STATE_DTYPE``. They never
 open hardware or an SDK, and they do not import the deployment runtime (so they
 run without scipy/pinocchio/dexmani_policy).
@@ -26,7 +26,7 @@ from dexmani_real.utils.feedback import (
     diagnose_feedback_timestamp_order,
 )
 
-import dexmani_real.control.publication as pub
+import dexmani_real.robot.commands as pub
 
 _MS = 1_000_000
 

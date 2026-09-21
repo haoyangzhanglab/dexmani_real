@@ -35,7 +35,8 @@ from dexmani_real.recording.recorder import (
     EpisodeFinalizationError,
     EpisodeRecorder,
 )
-from dexmani_real.recording.sample import EpisodeAction, EpisodeState
+from dexmani_real.recording.frame import build_episode_frame
+from dexmani_real.ipc.schema import ARM_STATE_DTYPE, HAND_STATE_DTYPE
 from dexmani_real.recording.storage.camera_writer import CameraStreamWriterConfig
 from dexmani_real.recording.storage.reader import EpisodeReader
 
@@ -50,31 +51,17 @@ _VR_FRAME = {
 }
 
 
-def _state(timestamp_s: float) -> EpisodeState:
-    return EpisodeState(
-        arm_qpos=np.zeros(7, dtype=np.float64),
-        arm_qvel=np.zeros(7, dtype=np.float64),
-        arm_tau=np.zeros(7, dtype=np.float64),
-        hand_qpos=np.zeros(12, dtype=np.float64),
-        hand_contact=np.zeros((5, 3), dtype=np.float32),
-        hand_contact_valid=True,
-        hand_tactile_force=np.zeros((5, 120, 3), dtype=np.float32),
-        hand_tactile_force_valid=True,
-        hand_qpos_stale=False,
-        arm_connected=True,
-        hand_connected=True,
-        timestamp=timestamp_s,
-        hand_current=np.zeros(12, dtype=np.float64),
-    )
-
-
-def _action() -> EpisodeAction:
-    return EpisodeAction(
-        arm_qpos_cmd=np.zeros(7, dtype=np.float64),
-        hand_qpos_cmd=np.zeros(12, dtype=np.float64),
-        target_eef_pos=np.zeros(3, dtype=np.float64),
-        target_eef_rot6d=_ROT6D_IDENTITY.copy(),
-    )
+def _frame(timestamp_s: float) -> EpisodeFrame:
+    arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
+    hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
+    arm["connected"] = hand["connected"] = 1
+    hand["tactile_aggregate_valid"] = hand["tactile_dense_valid"] = 1
+    action = {
+        "action_arm_joint_sent": np.zeros(7),
+        "action_hand_joint": np.zeros(12),
+        "action_arm_ee": np.concatenate((np.zeros(3), _ROT6D_IDENTITY)),
+    }
+    return build_episode_frame(arm, hand, action, _VR_FRAME, timestamp_s=timestamp_s)
 
 
 def _make_recorder(data_dir: Path, *, min_frames: int = 50) -> EpisodeRecorder:
@@ -93,12 +80,7 @@ def _make_recorder(data_dir: Path, *, min_frames: int = 50) -> EpisodeRecorder:
 
 def _add_frames(recorder: EpisodeRecorder, count: int) -> None:
     for index in range(count):
-        added = recorder.add_frame(
-            _state(float(index + 1)),
-            _action(),
-            dict(_VR_FRAME),
-            arm_qpos_sent=np.zeros(7, dtype=np.float64),
-        )
+        added = recorder.add_frame(_frame(float(index + 1)))
         assert added, f"frame {index} was not accepted"
 
 
@@ -298,7 +280,7 @@ class _FakeRecorder:
     def resources_released(self) -> bool:
         return True
 
-    def add_episode_frame(self, frame: EpisodeFrame) -> bool:
+    def add_frame(self, frame: EpisodeFrame) -> bool:
         return True
 
     def finish_episode(self, save: bool, reason: str, *, failure_note: str = ""):
@@ -469,11 +451,10 @@ class RecorderCapacityPathTest(unittest.TestCase):
             session = _RecorderIOSession(shared, RecorderIOConfig(data_dir=directory,
                 max_frames=2, control_hz=_CONTROL_HZ, min_frames=1), recorder)
             for index in range(2):
-                self.assertTrue(client.add_frame(_state(index + 1.), _action(), dict(_VR_FRAME),
-                    arm_qpos_sent=np.zeros(7)))
+                self.assertTrue(client.add_frame(_frame(index + 1.)))
             self.assertFalse(client.is_recording)
             self.assertTrue(client.stop_pending)
-            self.assertFalse(client.add_frame(_state(3.), _action(), dict(_VR_FRAME)))
+            self.assertFalse(client.add_frame(_frame(3.)))
             stop = shared.record_control_q.get_nowait()
             self.assertEqual(stop.reason, "max_frames")
             session._handle_stop(stop)
@@ -486,13 +467,12 @@ class RecorderCapacityPathTest(unittest.TestCase):
             self.assertEqual(runner.saved_episodes, 1)
             # Rapid replans after capacity exhaustion must not become a hidden
             # miss threshold or reopen the finished writer.
-            from dexmani_real.deployment.executor import _RejectKind
+            from dexmani_real.deployment.runner import _RejectKind
             from collections import deque
             runner.run_generation = int(shared.run_generation.value)
             reference = np.ones(7)
             runner.previous_arm_command_qpos = reference
             for index in range(12):
-                runner.observation_id = index + 1
                 runner.actions = deque([np.zeros(19), np.zeros(19)])
                 runner._handle_recoverable_miss("workspace" if index % 2 else "ik",
                     raw_action=np.zeros(19), reject_kind=_RejectKind.SAFETY if index % 2 else _RejectKind.IK)
@@ -536,7 +516,7 @@ class InterruptedRetentionBoundaryTest(unittest.TestCase):
     def test_policy_automatic_stop_sends_retention_through_real_client(self):
         from queue import Queue
         from types import SimpleNamespace
-        from dexmani_real.deployment.executor import PolicyRunner
+        from dexmani_real.deployment.runner import PolicyRunner
         from dexmani_real.recording.client import RecorderClient
         shared = SimpleNamespace(record_control_q=Queue(),
                                  record_sample_ring=SimpleNamespace(latest_sequence=2))
@@ -610,3 +590,39 @@ class InterruptedRetentionBoundaryTest(unittest.TestCase):
         client.stop_episode(False, "policy_shutdown", retain_partial=True)
         self.assertEqual(shared.record_control_q.get_nowait(), old_message)
         self.assertTrue(shared.record_control_q.empty())
+
+
+class FrameSemanticsTest(unittest.TestCase):
+    def test_owned_frame_preserves_submitted_joints_and_cartesian_intent(self):
+        arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
+        hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
+        submitted = np.arange(7, dtype=float)
+        intent = np.arange(9, dtype=float) + 100
+        action = {"action_arm_joint_sent": submitted,
+                  "action_hand_joint": np.zeros(12), "action_arm_ee": intent}
+        rgb = np.ones((2, 3, 3), np.uint8)
+        frame = build_episode_frame(arm, hand, action, _VR_FRAME,
+                                    timestamp_s=1.5, camera_frame={"rgb": rgb})
+        submitted[:] = -1
+        intent[:] = -1
+        arm["qpos"] = 9
+        rgb[:] = 0
+        np.testing.assert_array_equal(frame.data["action_arm_joint_sent"], np.arange(7))
+        np.testing.assert_array_equal(frame.data["action_arm_ee"], np.arange(9) + 100)
+        np.testing.assert_array_equal(frame.data["arm_qpos"], np.zeros(7))
+        np.testing.assert_array_equal(frame.camera_rgb, np.ones((2, 3, 3), np.uint8))
+        self.assertEqual(frame.timestamp_s, 1.5)
+
+    def test_invalid_tactile_is_nan_not_zero_contact(self):
+        arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
+        hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
+        hand["tactile_aggregate_valid"] = 1
+        hand["tactile_aggregate"] = 3
+        hand["tactile_dense_valid"] = 0
+        action = {"action_arm_joint_sent": np.zeros(7),
+                  "action_hand_joint": np.zeros(12), "action_arm_ee": np.zeros(9)}
+        frame = build_episode_frame(arm, hand, action, _VR_FRAME, timestamp_s=1.)
+        self.assertTrue(frame.data["hand_contact_valid"])
+        np.testing.assert_array_equal(frame.data["hand_contact"], np.full((5, 3), 3))
+        self.assertFalse(frame.data["hand_tactile_force_valid"])
+        self.assertTrue(np.isnan(frame.data["hand_tactile_force"]).all())

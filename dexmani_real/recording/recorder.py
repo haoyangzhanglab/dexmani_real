@@ -26,7 +26,7 @@ from dexmani_real.recording.storage.camera_writer import (
     CameraStreamWriter,
     CameraStreamWriterConfig,
 )
-from dexmani_real.recording.frame import EpisodeFrame, build_episode_frame
+from dexmani_real.recording.frame import EpisodeFrame
 from dexmani_real.recording.storage.hdf5_writer import EpisodeDataWriter
 from dexmani_real.recording.storage.schema import (
     EPISODE_SCHEMA_VERSION,
@@ -34,7 +34,6 @@ from dexmani_real.recording.storage.schema import (
     SOURCE_FRAME_DATASET_NAMES,
     validate_data_layout,
 )
-from dexmani_real.recording.sample import EpisodeAction, EpisodeState
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
 from dexmani_real.utils.log import get_logger
@@ -366,36 +365,8 @@ class EpisodeRecorder:
         if depth_scale is not None:
             meta.attrs["depth_scale"] = float(depth_scale)
 
-    def add_frame(
-        self,
-        state: EpisodeState,
-        action: EpisodeAction,
-        vr_frame: Mapping[str, object],
-        camera_frame: Mapping[str, object] | None = None,
-        signals: Mapping[str, object] | None = None,
-        arm_qpos_sent: np.ndarray | None = None,
-    ) -> bool:
-        """Build and add one :class:`EpisodeFrame` from component inputs."""
-        if not self._accept_source_frame():
-            return False
-        frame = build_episode_frame(
-            state,
-            action,
-            vr_frame,
-            camera_frame=camera_frame,
-            signals=signals,
-            arm_qpos_sent=arm_qpos_sent,
-        )
-        return self._add_episode_frame(frame)
-
-    def add_episode_frame(self, frame: EpisodeFrame) -> bool:
-        """Append one owned controller source frame."""
-        if not self._accept_source_frame():
-            return False
-        return self._add_episode_frame(frame)
-
-    def _accept_source_frame(self) -> bool:
-        """Admit source frames only during the active episode and below capacity."""
+    def add_frame(self, frame: EpisodeFrame) -> bool:
+        """Append an owned control sample; no secondary resampling or state model."""
         if not self._recording:
             return False
 
@@ -406,10 +377,6 @@ class EpisodeRecorder:
             self._max_frames_reached = True
             return False
 
-        return True
-
-    def _add_episode_frame(self, frame: EpisodeFrame) -> bool:
-        """Store one emitted source row without aligning or filling timestamps."""
         ts = float(frame.timestamp_s)
         if not np.isfinite(ts) or (
             self._last_timestamp_s is not None and ts <= self._last_timestamp_s

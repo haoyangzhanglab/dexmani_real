@@ -9,8 +9,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.recording.frame import episode_source_values
-from dexmani_real.recording.sample import EpisodeAction, EpisodeState
+from dexmani_real.recording.frame import EpisodeFrame
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -199,15 +198,7 @@ class RecorderClient:
         )
         return False
 
-    def add_frame(
-        self,
-        state: EpisodeState,
-        action: EpisodeAction,
-        vr_frame: dict[str, Any],
-        camera_frame: dict[str, Any] | None = None,
-        signals: dict[str, Any] | None = None,
-        arm_qpos_sent: np.ndarray | None = None,
-    ) -> bool:
+    def add_frame(self, sample: EpisodeFrame) -> bool:
         if not self._recording:
             return False
         latest = int(self.shared.record_sample_ring.latest_sequence)
@@ -219,24 +210,15 @@ class RecorderClient:
 
         dtype = self.shared.record_sample_ring.dtype
         frame = np.zeros(1, dtype=dtype)
-        frame["timestamp"][0] = state.timestamp
-        for name, value in episode_source_values(
-            state,
-            action,
-            vr_frame,
-            camera_frame=camera_frame,
-            signals=signals,
-            arm_qpos_sent=arm_qpos_sent,
-        ).items():
+        frame["timestamp"][0] = sample.timestamp_s
+        for name, value in sample.data.items():
             frame[name][0] = value
-        if camera_frame is not None:
+        if sample.camera_rgb is not None or sample.camera_depth is not None:
             frame["camera_present"][0] = 1
-            frame["camera_rgb"][0] = camera_frame.get(
-                "rgb", np.zeros(frame["camera_rgb"][0].shape, np.uint8)
-            )
-            frame["camera_depth"][0] = camera_frame.get(
-                "depth", np.zeros(frame["camera_depth"][0].shape, np.uint16)
-            )
+            if sample.camera_rgb is not None:
+                frame["camera_rgb"][0] = sample.camera_rgb
+            if sample.camera_depth is not None:
+                frame["camera_depth"][0] = sample.camera_depth
         self.shared.record_sample_ring.write(frame)
         self._frame_count += 1
         if self._max_frames and self._frame_count >= self._max_frames:

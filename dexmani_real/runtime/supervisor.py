@@ -351,7 +351,7 @@ def _hand_feedback_issue(hand_data: Any, *, max_age_s: float) -> str | None:
     """Delegated fail-closed health check over one hand state record.
 
     Single source of truth for "is this hand feedback usable" in the supervisor,
-    matching ``control.publication.read_hand_feedback`` and the teleop predicates.
+    matching ``robot.commands.read_hand_feedback`` and the teleop predicates.
     Returns the rejection reason, or ``None`` when healthy.
     """
     return validate_hand_feedback(

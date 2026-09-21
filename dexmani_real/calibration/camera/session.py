@@ -81,7 +81,7 @@ from dexmani_real.calibration.camera.solver import (
     save_camera_calibration,
 )
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.control.safety_gate import SafetyGate, planner_action_safety_gate
+from dexmani_real.robot.commands import SafetyGate, planner_action_safety_gate
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
     RuntimeChannelsConfig,

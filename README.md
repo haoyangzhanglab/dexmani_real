@@ -111,19 +111,24 @@ python examples/convert_raw_v29.py episodes_old/<task>/episode_x episodes/<task>
 ```text
 teleop/session.py → teleop/loop.py → control_loop/grid.py
                                        ↓
-                         control/projection.py + safety_gate.py
+                        robot/projection.py（一次软投影）
                                        ↓
-                         control/publication.py → command FIFO
+                 robot/commands.py（检查目标、提交有序 FIFO）
                                        ↓
-                          robot/{arm,hand}_worker.py → SDK
+                     robot/{arm,hand}_worker.py → SDK
 
-policy: deployment/lifecycle.py → executor.py
-        → inference/observation.py → dexmani_policy.predict(array_dict)
-        → 同一 command path
+policy: deployment/session.py 启动进程、operator.py 处理键盘
+        deployment/runner.py → observation.py → dexmani_policy.predict(array_dict)
+        → 同一 robot command path
 
-recording: control loop → recording/sample.py + client.py
-          → IO worker → recorder.py → HDF5 / video
+recording: control loop → build_episode_frame → RecorderClient.add_frame(frame)
+          → sample ring → IO worker → EpisodeRecorder.add_frame(frame) → HDF5/video
 ```
+
+`control/`、观测 batch wrap/unwrap、`EpisodeState/EpisodeAction` 和逐步骤 metrics
+协议已删除；不保留旧 import alias。主进程与模型子进程仍是实际资源边界，不为减少文件数
+把键盘急停、CUDA 推理和设备 SDK 放在同一阻塞循环。FIFO FULL 只有节流日志，重试的仍是
+原 target；日志不再拥有必须配对收尾的 WAIT/RESUME 状态。
 
 启动器直接创建 `context.Process`；process name 就是 readiness key，没有第二套 process spec。
 命令只在 FIFO 成功提交时分配 sequence。generation 只用于暂停、停止或阻塞推理结束后拒绝旧动作，

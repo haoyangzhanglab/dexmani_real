@@ -369,7 +369,7 @@ class _RecorderIOSession:
             self.shared.recorder_consumed_sequence.value = expected
             try:
                 before = self.recorder.frame_count
-                added = self.recorder.add_episode_frame(frame)
+                added = self.recorder.add_frame(frame)
                 if self.recorder.camera_writer_error:
                     raise RuntimeError(self.recorder.camera_writer_error)
                 # The last allowed row is accepted but returns False to signal capacity.

@@ -26,8 +26,7 @@ from types import SimpleNamespace
 # Only a genuinely missing dependency may skip this module: a renamed or
 # broken symbol must fail the suite rather than hide behind a skip.
 try:
-    from dexmani_real.deployment.executor import PolicyRunner
-    from dexmani_real.deployment.metrics import PolicyStats
+    from dexmani_real.deployment.runner import PolicyRunner
     from dexmani_real.recording.client import RecorderStopResult
     from dexmani_real.runtime.safety import SafetyState
     from dexmani_real.runtime.supervisor import run_supervisor
@@ -143,14 +142,8 @@ class _RunnerTest(unittest.TestCase):
         runner._trial_generation = runner.shared.run_started_generation.value
         runner.last_publication_ns = None
         runner.previous_arm_command_qpos = None
-        runner._observation_waiting_since_ns = None
         runner._pending_dispatch = None
         runner.actions = deque()
-        runner.chunk_sources = {}
-        runner.chunk_action_index = 0
-        runner.observation_id = 0
-        runner.stats = PolicyStats()
-        runner.last_metrics_flush_ns = 0
         runner.execute = False
         runner.max_running_s = 60.0
         runner.session_publication_count = 0
@@ -160,12 +153,6 @@ class _RunnerTest(unittest.TestCase):
         runner.next_record_ns = 0
         runner.runtime = SimpleNamespace(policy=SimpleNamespace())
         runner.model_runtime = SimpleNamespace(reset_episode=lambda: None)
-        runner._fifo_wait = SimpleNamespace(
-            waiting=False,
-            note_full=lambda *a: None,
-            note_committed=lambda: None,
-            note_dropped=lambda reason, **kw: None,
-        )
         return runner
 
 
@@ -346,7 +333,7 @@ class SessionStatisticsTest(_RunnerTest):
         runner.session_publication_count = 100
         runner.session_running_ns = 5_000_000_000  # 5 s of RUNNING wall time
         runner.session_inference_ms = [10.0, 20.0, 30.0, 40.0]
-        with self.assertLogs("dexmani_real.deployment.executor", level="INFO") as logs:
+        with self.assertLogs("dexmani_real.deployment.runner", level="INFO") as logs:
             runner._log_session_statistics()
         line = "\n".join(logs.output)
         self.assertIn("nominal_hz=16.000", line)  # 1/0.0625
@@ -358,7 +345,7 @@ class SessionStatisticsTest(_RunnerTest):
 
     def test_unavailable_markers_without_running_time_or_samples(self):
         runner = self._stats_runner()
-        with self.assertLogs("dexmani_real.deployment.executor", level="INFO") as logs:
+        with self.assertLogs("dexmani_real.deployment.runner", level="INFO") as logs:
             runner._log_session_statistics()
         line = "\n".join(logs.output)
         self.assertIn("effective_publication_hz=unavailable", line)
@@ -537,7 +524,7 @@ class RecordingAcrossTrialsTest(_RunnerTest):
                             runner.shared.quit_requested.value = True
                         return original(**kwargs)
                     recorder.start_episode = prepare
-                    with patch("dexmani_real.deployment.executor._physical_start_pose_rejection",
+                    with patch("dexmani_real.deployment.runner._physical_start_pose_rejection",
                                side_effect=[None, "moved" if change == "physical" else None]):
                         runner._start_requested_episode()
                     self.assertIsNone(runner.run_started_ns)
@@ -578,7 +565,7 @@ class EvidenceStartupTest(unittest.TestCase):
 
 class SessionResultFactsTest(unittest.TestCase):
     def test_evidence_policy_and_cleanup_are_independent(self):
-        from dexmani_real.deployment.lifecycle import _session_result_facts
+        from dexmani_real.deployment.session import _session_result_facts
         from dexmani_real.runtime.processes import ShutdownReport, ProcessExit
         for evidence, policy, closed, expected_record, expected_cleanup in (
             (True, False, True, "failed", "clean"),
@@ -624,7 +611,7 @@ class RunTerminationFactsTest(_RunnerTest):
         from dexmani_real.runtime.safety import request_policy_stop
         clock = _Clock(1_000_000_000)
         runner = self._runner()
-        with patch("dexmani_real.runtime.safety.time", clock), patch("dexmani_real.deployment.executor.time", clock):
+        with patch("dexmani_real.runtime.safety.time", clock), patch("dexmani_real.deployment.runner.time", clock):
             runner.shared.start_request.value = True
             runner._start_requested_episode()
             clock.ns = 3_000_000_000  # relative t=2: external S during predict
@@ -635,22 +622,15 @@ class RunTerminationFactsTest(_RunnerTest):
         self.assertEqual(runner.completed_trials, 1)
 
     def test_epoch_clear_reports_the_entire_unpublished_suffix_once(self):
-        from dexmani_real.control.publication import PublishWaitTracker
         runner = self._runner(run_started_ns=1)
         runner.run_generation = 5
-        runner.observation_id = 21
         runner.actions = deque(range(7))  # first of eight already committed
-        runner.chunk_action_index = 1
         runner._pending_dispatch = object()
-        runner._fifo_wait = PublishWaitTracker("policy")
-        runner._fifo_wait.note_full(4)
         with self.assertLogs(level="INFO") as logs:
             runner._clear_execution(None)
         drops = [line for line in logs.output if "[DROP]" in line]
         self.assertEqual(len(drops), 1)
         self.assertIn("remaining=7", drops[0])
-        self.assertIn("q=21", drops[0])
-        self.assertFalse(runner._fifo_wait.waiting)
 
 class FirstTerminalFactTest(_RunnerTest):
     def test_first_fact_survives_repeated_stop_home_cleanup_and_next_trial(self):
@@ -660,7 +640,7 @@ class FirstTerminalFactTest(_RunnerTest):
             read_run_state_snapshot, revoke_motion, invalidate_coupled_commands)
         clock = _Clock(0)
         runner = self._runner(num_trials=3)
-        with patch("dexmani_real.runtime.safety.time", clock), patch("dexmani_real.deployment.executor.time", clock):
+        with patch("dexmani_real.runtime.safety.time", clock), patch("dexmani_real.deployment.runner.time", clock):
             runner.shared.start_request.value = True
             runner._start_requested_episode()
             generation = runner.run_generation
@@ -692,7 +672,7 @@ class FirstTerminalFactTest(_RunnerTest):
         from dexmani_real.runtime.safety import RunEndReason, read_run_state_snapshot
         clock = _Clock(1_000_000_000)
         runner = self._runner()
-        with patch("dexmani_real.runtime.safety.time", clock), patch("dexmani_real.deployment.executor.time", clock):
+        with patch("dexmani_real.runtime.safety.time", clock), patch("dexmani_real.deployment.runner.time", clock):
             runner.shared.start_request.value = True
             runner._start_requested_episode()
             clock.ns = 3_100_000_000  # parent's poll actually revokes 0.1s after budget
@@ -728,7 +708,7 @@ class BlockingPredictionStopTest(_RunnerTest):
         with patch("dexmani_real.runtime.safety.time", helper.clock):
             runner.shared.start_request.value = True
             runner._start_requested_episode()
-            with self.assertLogs("dexmani_real.deployment.executor", level="WARNING") as logs:
+            with self.assertLogs("dexmani_real.deployment.runner", level="WARNING") as logs:
                 runner._run_active_tick(0)
             self.assertIn("remaining=8", "\n".join(logs.output))
             runner._handle_run_boundary()
@@ -753,7 +733,7 @@ class RecorderExceptionBoundaryTest(_RunnerTest):
 class CleanupSummaryOutputTest(unittest.TestCase):
     def test_unverified_cleanup_is_visible_without_relabeling_policy_as_recording_failure(self):
         from unittest.mock import patch
-        from dexmani_real.deployment.lifecycle import _report_session_end
+        from dexmani_real.deployment.session import _report_session_end
         shared = _fake_shared()
         shared.session_failed.value = True
         with patch("builtins.print") as output:

@@ -22,8 +22,8 @@ from unittest import mock
 import numpy as np
 
 try:
-    import dexmani_real.deployment.executor as executor_module
-    from dexmani_real.deployment.executor import PolicyRunner
+    import dexmani_real.deployment.runner as executor_module
+    from dexmani_real.deployment.runner import PolicyRunner
 
     _IMPORT_ERROR = None
 except Exception as exc:  # pragma: no cover - environment guard
@@ -67,7 +67,7 @@ class _Model:
     def predict(self, observation) -> np.ndarray:
         # Blocking inference: advance the clock, then return an open-loop chunk.
         self.clock.advance(self.inference_ns)
-        t = observation.anchor_monotonic_ns // _STEP_DT_NS
+        t = observation["test_anchor_ns"] // _STEP_DT_NS
         return np.arange(t, t + self.n_action_steps, dtype=float).reshape(-1, 1)
 
 
@@ -78,53 +78,17 @@ class _Model:
 class SyncPolicyTimingTest(unittest.TestCase):
     def setUp(self) -> None:
         self.clock = _Clock(0)
-        self.queries: list[int] = []  # anchor_ns of each _build_observation call
+        self.queries: list[int] = []  # anchor_ns of each policy observation query
         self.published: list[tuple[int, tuple[float, ...]]] = []
 
     def _install_observation_fakes(self) -> None:
-        def build(
-            shared,
-            policy_spec,
-            *,
-            observation_id,
-            run_generation,
-            run_started_ns,
-            anchor_ns,
-            step_dt_ns,
-        ):
+        def build(shared, policy_spec, *, run_started_ns, anchor_ns,
+                  step_dt_ns, fingertip_runtime=None):
             self.queries.append(anchor_ns)
-            return SimpleNamespace(
-                anchor_monotonic_ns=anchor_ns, observation_id=observation_id
-            )
-
-        def to_policy(observation, policy_spec, fingertip_runtime=None):
-            return SimpleNamespace(
-                anchor_monotonic_ns=observation.anchor_monotonic_ns,
-                observation_id=observation.observation_id,
-            )
-
-        def sources(observation):
-            return {}
-
-        def timing(observation):
-            return (0.0, 0.0)
-
-        def grid(*, run_started_ns, anchor_ns, history_len, step_dt_ns):
-            return (
-                np.array([anchor_ns] * history_len, dtype=np.uint64),
-                anchor_ns,
-            )
+            return {"test_anchor_ns": anchor_ns}
 
         patchers = [
-            mock.patch.object(executor_module, "_build_observation", side_effect=build),
-            mock.patch.object(executor_module, "_to_policy_observation", side_effect=to_policy),
-            mock.patch.object(executor_module, "observation_sources", side_effect=sources),
-            mock.patch.object(executor_module, "observation_timing_ms", side_effect=timing),
-            mock.patch.object(
-                executor_module, "_select_control_grid_reference_ns", side_effect=grid
-            ),
-            # Replace executor.time so _run_active_tick's own monotonic_ns()
-            # reads (and sleeps) use the deterministic _Clock.
+            mock.patch.object(executor_module, "build_policy_observation", side_effect=build),
             mock.patch.object(executor_module, "time", self.clock),
         ]
         for patcher in patchers:
@@ -140,7 +104,6 @@ class SyncPolicyTimingTest(unittest.TestCase):
     ) -> "PolicyRunner":
         runner = PolicyRunner.__new__(PolicyRunner)
         runner.actions = deque()
-        runner.observation_id = 0
         runner.run_generation = 1
         runner.run_started_ns = 0
         runner.last_publication_ns = last_publication_ns
@@ -149,13 +112,8 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.session_inference_ms = []
         runner.max_running_ns = None
         runner.step_dt_ns = _STEP_DT_NS
-        runner.chunk_sources = {}
-        runner.chunk_action_index = 0
         runner.previous_arm_command_qpos = None
         runner._pending_dispatch = None
-        runner._observation_waiting_since_ns = None
-        runner._fifo_wait = executor_module.PublishWaitTracker("test")
-        runner.stats = SimpleNamespace()
         runner.shared = None
         runner.policy_spec = SimpleNamespace(
             n_obs_steps=2,
@@ -180,7 +138,6 @@ class SyncPolicyTimingTest(unittest.TestCase):
             published.append((clock.ns, tuple(np.asarray(action).tolist())))
             runner.last_publication_ns = clock.ns
             runner.actions.popleft()
-            runner.chunk_action_index += 1
 
         runner._dispatch_action = dispatch
         return runner
@@ -253,21 +210,15 @@ class SyncPolicyTimingTest(unittest.TestCase):
     def test_invalidate_chunk_keeps_committed_reference_and_anchor(self):
         runner = PolicyRunner.__new__(PolicyRunner)
         runner.run_generation = 7
-        runner.observation_id = 3
-        runner.chunk_action_index = 2
         runner.last_publication_ns = 1_000_000_000
         runner.previous_arm_command_qpos = np.array([1.0, 2.0, 3.0])
-        runner.chunk_sources = {"arm": (100, 200)}
         runner.actions = deque([np.array([1.0]), np.array([2.0])])
         runner._pending_dispatch = object()
-        runner._fifo_wait = SimpleNamespace(waiting=False, note_dropped=lambda reason, **kw: None)
 
         runner._invalidate_chunk("test_reason")
 
         self.assertEqual(list(runner.actions), [])
         self.assertIsNone(runner._pending_dispatch)
-        self.assertEqual(runner.chunk_sources, {})
-        self.assertEqual(runner.chunk_action_index, 0)
         # A recoverable chunk drop keeps the committed continuity reference:
         # the next prediction anchors behind the last committed command, not
         # at measured qpos. Only a new epoch rebuilds the initial reference.
@@ -277,7 +228,6 @@ class SyncPolicyTimingTest(unittest.TestCase):
         # Already-occurred physical history and episode identity are preserved.
         self.assertEqual(runner.last_publication_ns, 1_000_000_000)
         self.assertEqual(runner.run_generation, 7)
-        self.assertEqual(runner.observation_id, 3)
 
     def test_clear_execution_resets_epoch_local_state(self):
         runner = PolicyRunner.__new__(PolicyRunner)
@@ -286,25 +236,14 @@ class SyncPolicyTimingTest(unittest.TestCase):
         runner.previous_arm_command_qpos = np.array([1.0])
         runner.last_recorded_action = None
         runner.actions = deque([np.array([1.0])])
-        runner.chunk_sources = {"arm": (0,)}
-        runner.chunk_action_index = 2
-        runner.observation_id = 5
         runner._pending_dispatch = object()
-        runner._observation_waiting_since_ns = 7
-        # An open backpressure span must end visibly at the epoch boundary and
-        # leave the tracker clean for the next trial's [WAIT].
-        runner._fifo_wait = executor_module.PublishWaitTracker("test")
-        runner._fifo_wait.note_full(8)
 
-        with self.assertLogs("dexmani_real.deployment.executor", level="WARNING") as logs:
+        with self.assertLogs("dexmani_real.deployment.runner", level="WARNING") as logs:
             runner._clear_execution(None)
 
-        self.assertEqual(runner.observation_id, 0)
         self.assertEqual(list(runner.actions), [])
         self.assertIsNone(runner._pending_dispatch)
-        self.assertIsNone(runner._observation_waiting_since_ns)
         self.assertIsNone(runner.previous_arm_command_qpos)
-        self.assertFalse(runner._fifo_wait.waiting)
         self.assertIn("remaining=1", "\n".join(logs.output))
         self.assertIn("reason=epoch_boundary", "\n".join(logs.output))
 
@@ -321,14 +260,14 @@ class SyncPolicyTimingTest(unittest.TestCase):
         def revoke(observation):
             state["live"] = False
             return np.arange(
-                observation.observation_id,
-                observation.observation_id + 8,
+                0,
+                8,
                 dtype=float,
             ).reshape(-1, 1)
 
         runner.model_runtime.predict = revoke
 
-        with self.assertLogs("dexmani_real.deployment.executor", level="WARNING") as logs:
+        with self.assertLogs("dexmani_real.deployment.runner", level="WARNING") as logs:
             runner._run_active_tick(0)
         drops = [line for line in logs.output if "[DROP]" in line]
         self.assertEqual(len(drops), 1)

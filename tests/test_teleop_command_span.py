@@ -16,21 +16,6 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-# Only a genuinely missing dependency may skip this module: a renamed or
-# broken symbol must fail the suite rather than hide behind a skip.
-try:
-    from dexmani_real.control.publication import PublishWaitTracker
-    from dexmani_real.teleop.control_loop.grid import close_publish_span
-
-    _IMPORT_ERROR = None
-except ImportError as exc:  # pragma: no cover - environment guard
-    PublishWaitTracker = None
-    close_publish_span = None
-    _IMPORT_ERROR = exc
-
-
-
-
 class _TeleopRecordingHarness:
     """Real controller, client and finalizer; synthetic inputs and temporary media."""
 
@@ -115,11 +100,10 @@ class _TeleopRecordingHarness:
         case.addCleanup(cleanup_writer)
 
     def add_rows(self, count=2):
-        import numpy as np
-        from test_recording_preservation import _state, _action, _VR_FRAME
+        from test_recording_preservation import _frame
         for index in range(count):
             self.case.assertTrue(self.client.add_frame(
-                _state(float(index + 1)), _action(), dict(_VR_FRAME), arm_qpos_sent=np.zeros(7)))
+                _frame(float(index + 1))))
 
     def begin_finalization(self):
         stop = self.shared.record_control_q.get_nowait()
@@ -293,8 +277,8 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
         from unittest import mock
         import dexmani_real.teleop.keyboard_session as keyboard
         from dexmani_real.config.experiment import resolve_experiment_config
-        from dexmani_real.control.action import ActionCandidate
-        from dexmani_real.control.publication import PreparedCommand, PublishResult
+        from dexmani_real.robot.commands import ActionCandidate
+        from dexmani_real.robot.commands import PreparedCommand, PublishResult
         from dexmani_real.runtime.safety import SafetyState, CommittedCommand
         from test_deployment_evidence import _fake_shared
 

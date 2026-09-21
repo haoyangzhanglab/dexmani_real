@@ -16,44 +16,23 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.control.action import ActionCandidate
-from dexmani_real.control.publication import (
-    PUBLISH_REASON_ESTOP,
-    PUBLISH_REASON_FAULT,
-    PUBLISH_REASON_FIFO_FULL,
-    PUBLISH_REASON_GENERATION,
-    PUBLISH_REASON_RUNTIME_STOPPED,
-    PUBLISH_REASON_SAFETY_STATE,
-    CommandFeedbackSnapshot,
-    PreparedCommand,
-    PublishResult,
-    PublishWaitTracker,
-    build_action_candidate,
-    command_publishability_reason,
-    prepare_command,
-    publish_command,
-    read_command_feedback,
-)
-from dexmani_real.control.projection import (
+from dexmani_real.robot.commands import ActionCandidate
+from dexmani_real.robot.commands import (PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT, PUBLISH_REASON_FIFO_FULL, PUBLISH_REASON_GENERATION, PUBLISH_REASON_RUNTIME_STOPPED, PUBLISH_REASON_SAFETY_STATE, CommandFeedbackSnapshot, PreparedCommand, PublishResult, command_publishability_reason, prepare_joint_command, publish_command, read_command_feedback)
+from dexmani_real.robot.projection import (
     ArmClipReport,
     project_arm_command_reported,
     project_hand_command,
 )
-from dexmani_real.control.safety_gate import GateRejectCode, SafetyGate
+from dexmani_real.robot.commands import GateRejectCode, SafetyGate
 from dexmani_real.deployment.config import (
     FingertipAssemblerConfig,
     PolicyRuntimeConfig,
     RolloutRecordingConfig,
 )
-from dexmani_real.deployment.inference.observation import (
-    _build_observation,
-    _select_control_grid_reference_ns,
-    _to_policy_observation,
+from dexmani_real.deployment.observation import (
+    build_policy_observation,
     build_fingertip_runtime,
-    observation_sources,
-    observation_timing_ms,
 )
-from dexmani_real.deployment.metrics import PolicyStats, flush_every
 from dexmani_real.ipc.causal import (
     read_camera_frame_causal,
     read_causal_structured_frame,
@@ -75,11 +54,7 @@ from dexmani_real.recording.client import (
     RecorderClient,
     RecorderStopResult,
 )
-from dexmani_real.recording.sample import (
-    EpisodeAction,
-    EpisodeState,
-    build_episode_state,
-)
+from dexmani_real.recording.frame import build_episode_frame
 from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
@@ -100,6 +75,7 @@ from dexmani_real.utils.feedback import (
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 
 logger = get_logger(__name__)
+_warn_observation = ThrottledWarner(interval_s=2.0, logger=logger)
 
 _RECORD_FRAME_OK = 0
 _RECORD_FRAME_HELD = 1
@@ -232,7 +208,7 @@ def _project_policy_targets(
     """Project finite physical endpoints through the single-owner projection.
 
     Canonicalization, operational bounds, the soft delta clip, and the
-    float64 round-off guard all live in ``control/projection.py`` — the one
+    float64 round-off guard all live in ``robot/projection.py`` — the one
     owner shared with the teleop producer. Workers retain final hard-limit
     SDK authority but never re-reject the same soft threshold. A raised
     ``ValueError`` is a projector-invariant/contract violation, not an
@@ -308,7 +284,6 @@ def _end_policy_run(
     shared: RuntimeChannels,
     reason: str,
     *,
-    stats: PolicyStats,
     aborted: bool,
     stop_reason: str,
     trial_generation: int,
@@ -332,8 +307,6 @@ def _end_policy_run(
                 revoke_motion(shared, SafetyState.FAULT)
                 aborted = True
                 logger.critical("policy: failed to fence episode into ARMED (%s)", reason)
-    stats.flush(prefix="policy final metrics", debug=True)
-    stats.log_summary()
     if aborted:
         logger.warning("policy: episode ended: %s", reason)
     else:
@@ -362,7 +335,6 @@ class PolicyRunner:
         self.model_runtime = model_runtime
         self.fingertip_runtime = fingertip_runtime
         self.actions: deque[np.ndarray] = deque()
-        self.observation_id = 0
         self.execute = execute
         self.max_running_s = max_running_s
         if type(num_trials) is not int or isinstance(num_trials, bool) or num_trials < 1:
@@ -381,12 +353,10 @@ class PolicyRunner:
         self.num_trials = int(num_trials)
         self.recording_config = recording_config
         self.recorder = RecorderClient(shared) if recording_config is not None else None
-        self.last_recorded_action: EpisodeAction | None = None
+        self.last_recorded_action: dict[str, np.ndarray] | None = None
         self.next_record_ns = 0
         self.control_period_s = float(policy_spec.control_dt_s)
         self.poll_period_s = 1.0 / float(runtime.policy.executor_poll_hz)
-        self.chunk_sources: dict[str, tuple[int, ...]] = {}
-        self.chunk_action_index = 0
         self._decision_recorded = False
         self.step_dt_ns = int(round(self.control_period_s * 1e9))
         self.max_running_ns = (
@@ -399,21 +369,17 @@ class PolicyRunner:
             if policy_spec.action_key == "action_ee"
             else None
         )
-        self.stats = PolicyStats()
         # Prepared-but-uncommitted queue head during recoverable FIFO
         # backpressure. FULL never rebuilds, re-solves IK, or re-clips this
         # candidate; only a successful commit advances the action index, the
         # continuity reference, and the publication cadence.
         self._pending_dispatch: ActionCandidate | None = None
-        self._fifo_wait = PublishWaitTracker("policy")
 
         self.run_generation: int | None = None
         self._trial_generation: int | None = None
         self.run_started_ns: int | None = None
         self.last_publication_ns: int | None = None
         self.previous_arm_command_qpos: np.ndarray | None = None
-        # Transition marker for the visible observation WAIT/RESUME pair.
-        self._observation_waiting_since_ns: int | None = None
         # Run-owner trial budget: a trial counts exactly once when a truly
         # begun trial ends; the saved-episode count is independent evidence
         # status, never the termination condition.
@@ -433,7 +399,6 @@ class PolicyRunner:
         # A queued recording STOP owns exactly one terminal outcome; the
         # shutdown path never consumes a verdict that was already handled.
         self._recording_outcome_consumed = True
-        self.last_metrics_flush_ns = time.monotonic_ns()
         # Session research statistics (small in-memory accumulators, reported
         # once in the session summary — no monitoring platform):
         # effective publication Hz uses successful commits over total RUNNING
@@ -444,18 +409,15 @@ class PolicyRunner:
         self.session_inference_ms: list[float] = []
 
     def _drop_unpublished(self, reason: str, *, prediction_count: int | None = None) -> None:
-        """One owner counts/logs a real suffix and closes its wait span."""
+        """Discard an unpublished suffix and report the actual loss."""
         count = len(self.actions) if prediction_count is None else prediction_count
         if count:
             logger.warning(
-                "[DROP] policy gen=%s q=%s idx=%s remaining=%d reason=%s",
-                self.run_generation, self.observation_id, self.chunk_action_index, count, reason,
+                "[DROP] policy remaining=%d reason=%s",
+                count, reason,
             )
-        self._fifo_wait.note_dropped(reason, report=not bool(count))
         self.actions.clear()
         self._pending_dispatch = None
-        self.chunk_sources.clear()
-        self.chunk_action_index = 0
 
     def _clear_execution(self, generation: int | None, *, reason: str = "epoch_boundary") -> None:
         self._drop_unpublished(reason)
@@ -463,14 +425,12 @@ class PolicyRunner:
         self.last_publication_ns = None
         self.previous_arm_command_qpos = None
         self.last_recorded_action = None
-        self._observation_waiting_since_ns = None
-        self.observation_id = 0
 
     def _invalidate_chunk(self, reason: str) -> None:
         """Discard the unexecuted chunk suffix after a recoverable break.
 
         A replanning boundary, not an episode boundary: run_generation,
-        observation_id, model episode state, and recording state are
+        model episode state and recording state are
         untouched, as is last_publication_ns (already-occurred physical
         history stays the cadence anchor). The continuity reference is KEPT:
         the next chunk's first action still anchors behind the last committed
@@ -494,7 +454,6 @@ class PolicyRunner:
         _end_policy_run(
             self.shared,
             reason,
-            stats=self.stats,
             aborted=aborted,
             stop_reason=stop_reason,
             trial_generation=self._trial_generation,
@@ -569,7 +528,6 @@ class PolicyRunner:
             )
         elif self.recorder is not None and self.recorder.is_recording:
             self._stop_recording_capture(save=False, reason=stop_reason)
-        self.stats.flush(prefix="policy metrics", debug=True)
         logger.critical("policy: runtime fault: %s", reason)
         self.run_started_ns = None
         self._clear_execution(None)
@@ -583,16 +541,15 @@ class PolicyRunner:
             "landmarks": np.full((21, 3), np.nan),
         }
 
-    def _recorded_hold_action(self, state: EpisodeState) -> EpisodeAction:
+    def _recorded_hold_action(self, arm_qpos: np.ndarray, hand_qpos: np.ndarray) -> dict[str, np.ndarray]:
         if self.last_recorded_action is not None:
             return self.last_recorded_action
-        target_eef_pos, target_eef_rot6d = make_arm_fk().compute(state.arm_qpos)
-        return EpisodeAction(
-            arm_qpos_cmd=np.asarray(state.arm_qpos, dtype=np.float64),
-            hand_qpos_cmd=np.asarray(state.hand_qpos, dtype=np.float64),
-            target_eef_pos=np.asarray(target_eef_pos, dtype=np.float64),
-            target_eef_rot6d=np.asarray(target_eef_rot6d, dtype=np.float64),
-        )
+        position, rotation = make_arm_fk().compute(arm_qpos)
+        return {
+            "action_arm_joint_sent": np.asarray(arm_qpos, dtype=np.float64),
+            "action_hand_joint": np.asarray(hand_qpos, dtype=np.float64),
+            "action_arm_ee": np.concatenate((position, rotation)),
+        }
 
     def _recorded_action_from_command(
         self,
@@ -600,12 +557,12 @@ class PolicyRunner:
         arm_qpos: np.ndarray,
         hand_qpos: np.ndarray,
         raw_action: np.ndarray,
-    ) -> EpisodeAction:
+    ) -> dict[str, np.ndarray]:
         """Build the recorded action row, keeping EE intent distinct from execution.
 
-        For an EE policy, ``target_eef_pos/rot6d`` record the model's raw EE
+        For an EE policy, ``action_arm_ee`` record the model's raw EE
         INTENT (the pre-IK command); the executed joints live in
-        ``arm_qpos_cmd`` / ``action_arm_joint_sent`` (the projected IK result
+        ``action_arm_joint_sent`` (the projected IK result
         actually committed to the FIFO). The intent is never relabeled as the
         executed EEF pose — the executed Cartesian pose is derivable offline
         by FK over the recorded joints. For a joint policy the recorded EE
@@ -618,37 +575,12 @@ class PolicyRunner:
             )
         else:
             target_eef_pos, target_eef_rot6d = make_arm_fk().compute(arm_qpos)
-        return EpisodeAction(
-            arm_qpos_cmd=np.asarray(arm_qpos, dtype=np.float64),
-            hand_qpos_cmd=np.asarray(hand_qpos, dtype=np.float64),
-            target_eef_pos=np.asarray(target_eef_pos, dtype=np.float64),
-            target_eef_rot6d=np.asarray(target_eef_rot6d, dtype=np.float64),
-        )
+        return {
+            "action_arm_joint_sent": np.asarray(arm_qpos, dtype=np.float64),
+            "action_hand_joint": np.asarray(hand_qpos, dtype=np.float64),
+            "action_arm_ee": np.concatenate((target_eef_pos, target_eef_rot6d)),
+        }
 
-    def _record_frame(
-        self,
-        inputs: tuple[EpisodeState, dict, dict],
-        action: EpisodeAction,
-        *,
-        signals: dict[str, Any],
-        arm_qpos_sent: np.ndarray | None = None,
-    ) -> bool:
-        if self.recorder is None or self.run_generation is None:
-            return False
-        try:
-            return self.recorder.add_frame(
-                inputs[0],
-                action,
-                self._recording_vr_sentinel(),
-                camera_frame=inputs[1],
-                signals={**inputs[2], **signals},
-                arm_qpos_sent=arm_qpos_sent,
-            )
-        except Exception:
-            logger.error(
-                "policy: rollout sample construction failed", exc_info=True
-            )
-            return False
 
     def _stop_recording_capture(self, *, save: bool, reason: str) -> None:
         """Stop the one owned capture without granting storage control authority."""
@@ -739,57 +671,6 @@ class PolicyRunner:
                 result.reason or pending_reason or "unknown",
             )
 
-    def _record_rejection(
-        self,
-        inputs: tuple[EpisodeState, dict, dict],
-        *,
-        kind: _RejectKind,
-    ) -> bool:
-        action = self._recorded_hold_action(inputs[0])
-        safety_reject = kind is _RejectKind.SAFETY
-        return self._record_frame(
-            inputs,
-            action,
-            signals={
-                "action_queued": False,
-                "frame_status": (
-                    _RECORD_FRAME_SAFETY_REJECT
-                    if safety_reject
-                    else _RECORD_FRAME_IK_FAIL
-                ),
-            },
-            arm_qpos_sent=action.arm_qpos_cmd,
-        )
-
-    def _record_command(
-        self,
-        inputs: tuple[EpisodeState, dict, dict],
-        candidate: ActionCandidate,
-        raw_action: np.ndarray,
-    ) -> bool:
-        assert candidate.arm_qpos is not None
-        assert candidate.hand_qpos is not None
-        try:
-            action = self._recorded_action_from_command(
-                arm_qpos=candidate.arm_qpos,
-                hand_qpos=candidate.hand_qpos,
-                raw_action=raw_action,
-            )
-        except Exception:
-            logger.error(
-                "policy: failed to build rollout action record", exc_info=True
-            )
-            return False
-        self.last_recorded_action = action
-        return self._record_frame(
-            inputs,
-            action,
-            signals={
-                "action_queued": True,
-                "frame_status": _RECORD_FRAME_OK,
-            },
-            arm_qpos_sent=candidate.arm_qpos,
-        )
 
     def _record_rollout_tick(
         self,
@@ -872,11 +753,6 @@ class PolicyRunner:
                 )
             # One causal hand sample carries qpos/current and both tactile
             # payloads with a single source identity; no backward tactile search.
-            state = build_episode_state(
-                arm,
-                hand,
-                timestamp_s=now_ns / 1e9,
-            )
             signals = {
                 "observation_anchor_monotonic_ns": now_ns,
                 # This raw row is not the policy runner's assembled model
@@ -892,27 +768,25 @@ class PolicyRunner:
                 "vr_source_monotonic_ns": 0,
                 "camera_source_monotonic_ns": int(camera["source_monotonic_ns"]),
             }
-            inputs = (state, camera, signals)
-            if raw_action is None:
-                action = self._recorded_hold_action(state)
-                recorded = self._record_frame(
-                    inputs,
-                    action,
-                    signals={
-                        "action_queued": False,
-                        "frame_status": _RECORD_FRAME_HELD,
-                    },
-                    arm_qpos_sent=action.arm_qpos_cmd,
+            if candidate is not None:
+                assert candidate.arm_qpos is not None and candidate.hand_qpos is not None
+                assert raw_action is not None
+                action = self._recorded_action_from_command(
+                    arm_qpos=candidate.arm_qpos, hand_qpos=candidate.hand_qpos,
+                    raw_action=raw_action,
                 )
+                self.last_recorded_action = action
+                status = _RECORD_FRAME_OK
             else:
-                if candidate is not None:
-                    recorded = self._record_command(inputs, candidate, raw_action)
-                else:
-                    assert reject_kind is not None
-                    recorded = self._record_rejection(
-                        inputs,
-                        kind=reject_kind,
-                    )
+                action = self._recorded_hold_action(arm["qpos"][0], hand["qpos"][0])
+                status = (_RECORD_FRAME_HELD if raw_action is None else
+                          _RECORD_FRAME_SAFETY_REJECT if reject_kind is _RejectKind.SAFETY
+                          else _RECORD_FRAME_IK_FAIL)
+            signals.update(action_queued=candidate is not None, frame_status=status)
+            recorded = self.recorder.add_frame(build_episode_frame(
+                arm, hand, action, self._recording_vr_sentinel(),
+                timestamp_s=now_ns / 1e9, camera_frame=camera, signals=signals,
+            ))
             if not recorded:
                 if not (self.recorder.is_recording or self.recorder.stop_pending):
                     # Evidence for this trial already ended on the recorder
@@ -1018,8 +892,6 @@ class PolicyRunner:
             self.shared.physical_home_completed.value = False
         self.run_started_ns = epoch.started_monotonic_ns
         self._trial_generation = epoch.generation
-        self.stats = PolicyStats()
-        self.last_metrics_flush_ns = epoch.started_monotonic_ns
         self.next_record_ns = epoch.started_monotonic_ns + self.step_dt_ns
         self._evidence_logged_this_trial = False
         self._clear_execution(epoch.generation)
@@ -1162,7 +1034,6 @@ class PolicyRunner:
         no first-miss terminalization and no consecutive-miss cap — the run
         budget or the operator ends the trial.
         """
-        self.stats.count_rejection(reason)
         self._record_rollout_tick(
             time.monotonic_ns(), raw_action=raw_action, reject_kind=reject_kind
         )
@@ -1249,8 +1120,6 @@ class PolicyRunner:
             return None, None, None, _PolicyClipReport()
         if arm_qpos is None:
             # Ordinary IK no-solution: recoverable miss in the same trial.
-            if self.policy_spec.action_key == "action_ee":
-                self.stats.ik_rejection_count += 1
             return (
                 None,
                 _RejectKind.IK,
@@ -1309,13 +1178,6 @@ class PolicyRunner:
                 )
             return None
         arm_qpos, hand_qpos = decoded
-        candidate = build_action_candidate(
-            self.shared,
-            arm_qpos,
-            hand_qpos,
-            run_generation=self.run_generation,
-            is_hold=False,
-        )
         if clip.arm.clipped or clip.hand_joint >= 0:
             # One visible line per really truncated action (taskbook §4/V19).
             # Preparing happens once per candidate, so a FULL retry cannot
@@ -1333,9 +1195,10 @@ class PolicyRunner:
                 )
             logger.info("[CLIP] %s", " ".join(fields))
         try:
-            prepared = prepare_command(
+            prepared = prepare_joint_command(
                 self.shared,
-                candidate,
+                arm_qpos, hand_qpos,
+                run_generation=self.run_generation,
                 gate=self.gate,
                 arm_feedback_max_age_s=None,
                 hand_feedback_max_age_s=None,
@@ -1400,44 +1263,12 @@ class PolicyRunner:
                 return
             publication_ns = time.monotonic_ns()
 
-        self._fifo_wait.note_committed()
         self._pending_dispatch = None
         assert candidate.arm_qpos is not None
-        self.stats.publication_input_age_ms = max(
-            ((publication_ns - times[-1]) / 1e6 for times in self.chunk_sources.values()),
-            default=0.0,
-        )
-        logger.debug(
-            "policy publish generation=%s query=%s index=%s planned_ns=%s actual_ns=%s input_age_ms=%s raw=%s arm=%s hand=%s chunk_arm_delta=%s",
-            self.run_generation,
-            self.observation_id,
-            self.chunk_action_index,
-            (
-                None
-                if self.last_publication_ns is None
-                else self.last_publication_ns + self.step_dt_ns
-            ),
-            publication_ns,
-            self.stats.publication_input_age_ms,
-            action.tolist(),
-            candidate.arm_qpos.tolist(),
-            candidate.hand_qpos.tolist(),
-            (
-                (candidate.arm_qpos - self.previous_arm_command_qpos).tolist()
-                if self.chunk_action_index == 0
-                and self.previous_arm_command_qpos is not None
-                else None
-            ),
-        )
         self.previous_arm_command_qpos = candidate.arm_qpos.copy()
-        if self.last_publication_ns is not None:
-            self.stats.publication_interval_ms = (
-                publication_ns - self.last_publication_ns
-            ) / 1e6
         self.last_publication_ns = publication_ns
         self.session_publication_count += 1
         self.actions.popleft()
-        self.chunk_action_index += 1
         self._record_rollout_tick(
             publication_ns, candidate=candidate, raw_action=action
         )
@@ -1453,7 +1284,6 @@ class PolicyRunner:
         if prepared.gate_code is GateRejectCode.WORKSPACE:
             # Ordinary workspace miss: a recoverable replanning boundary in
             # the same trial, with the committed prefix and reference kept.
-            self.stats.safety_rejection_count += 1
             self._handle_recoverable_miss(
                 prepared.reason or "policy workspace violation",
                 raw_action=raw_action,
@@ -1471,10 +1301,8 @@ class PolicyRunner:
     def _handle_publication_rejection(self, result: PublishResult) -> None:
         if result.reason == PUBLISH_REASON_FIFO_FULL:
             # Recoverable backpressure: keep the identical prepared candidate
-            # and retry from the poll cadence. One visible [WAIT] line per
-            # continuous full span; STOP/fault/timeout keep priority because
+            # and retry from the poll cadence. STOP/fault/timeout keep priority because
             # the main loop polls them between retries.
-            self._fifo_wait.note_full(result.fifo_depth)
             return
         if result.reason in {PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT}:
             return
@@ -1552,42 +1380,17 @@ class PolicyRunner:
             return
 
         # Queue empty and boundary reached: fresh synchronous replan.
-        self.observation_id += 1
-        observation = _build_observation(
+        policy_observation = build_policy_observation(
             self.shared,
             self.policy_spec,
-            observation_id=self.observation_id,
-            run_generation=self.run_generation,
             run_started_ns=self.run_started_ns,
             anchor_ns=time.monotonic_ns(),
             step_dt_ns=self.step_dt_ns,
-        )
-        if observation is None:
-            # Required-history-unavailable is an explicit WAIT for the next
-            # poll: one visible transition line (never per-poll spam), and
-            # never a DROP — no prepared action was discarded here.
-            if self._observation_waiting_since_ns is None:
-                self._observation_waiting_since_ns = time.monotonic_ns()
-                logger.warning(
-                    "[WAIT] policy observation q=%d reason=required_history_unavailable",
-                    self.observation_id,
-                )
-            return
-        if self._observation_waiting_since_ns is not None:
-            logger.info(
-                "[RESUME] policy observation q=%d wait_ms=%.0f",
-                self.observation_id,
-                (time.monotonic_ns() - self._observation_waiting_since_ns) / 1e6,
-            )
-            self._observation_waiting_since_ns = None
-        self.stats.observation_age_ms, self.stats.observation_skew_ms = (
-            observation_timing_ms(observation)
-        )
-        policy_observation = _to_policy_observation(
-            observation,
-            self.policy_spec,
             fingertip_runtime=self.fingertip_runtime,
         )
+        if policy_observation is None:
+            _warn_observation("policy waiting for required sensor history")
+            return
         if not self._running_generation_is_live():
             return
         started_ns = time.monotonic_ns()
@@ -1609,9 +1412,8 @@ class PolicyRunner:
             self._session_failure(f"policy inference failed: {exc}", log_exc=True)
             return
         finished_ns = time.monotonic_ns()
-        self.stats.inference_latency_ms = (finished_ns - started_ns) / 1e6
         # Real completed predict sample for the session mean/p95 statistics.
-        self.session_inference_ms.append(self.stats.inference_latency_ms)
+        self.session_inference_ms.append((finished_ns - started_ns) / 1e6)
         # Main can revoke motion during blocking inference. Never accept its
         # result before rechecking the episode's original generation/state.
         if not self._running_generation_is_live():
@@ -1621,24 +1423,6 @@ class PolicyRunner:
             self._drop_unpublished("timeout", prediction_count=len(predicted))
         if self._running_time_expired(finished_ns) or not self._poll_recorder():
             return
-        self.chunk_sources = observation_sources(observation)
-        self.chunk_action_index = 0
-        logger.debug(
-            "policy query generation=%s query=%s anchor_ns=%s references_ns=%s sources_ns=%s inference_start_ns=%s inference_end_ns=%s predicted=%s",
-            self.run_generation,
-            self.observation_id,
-            observation.anchor_monotonic_ns,
-            _select_control_grid_reference_ns(
-                run_started_ns=self.run_started_ns,
-                anchor_ns=observation.anchor_monotonic_ns,
-                history_len=int(self.policy_spec.n_obs_steps),
-                step_dt_ns=self.step_dt_ns,
-            )[0].tolist(),
-            self.chunk_sources,
-            started_ns,
-            finished_ns,
-            predicted.tolist(),
-        )
         self.actions.extend(predicted)
         # The boundary elapsed before observation/inference began; dispatch the
         # first action immediately without waiting another control period.
@@ -1648,49 +1432,21 @@ class PolicyRunner:
         """Poll lifecycle while preparing chunks and waiting for publication deadlines."""
         try:
             while self.shared.is_running.value:
-                tick_started_ns = time.monotonic_ns()
                 self._decision_recorded = False
                 self._recorder_start_wait_ms = 0.0
-                phase_ms = {"active_control": 0.0, "recording": 0.0, "metrics": 0.0}
                 self.shared.set_heartbeat("policy", time.monotonic())
-                boundary_started_ns = time.monotonic_ns()
                 self._handle_run_boundary()
-                phase_ms["boundary"] = (
-                    time.monotonic_ns() - boundary_started_ns
-                ) / 1e6
-                # Nested in boundary time, not an additional phase to sum.
-                phase_ms["boundary_recorder_start_wait"] = self._recorder_start_wait_ms
                 run_snapshot = read_run_state_snapshot(self.shared)
                 if (
                     self.run_started_ns is not None
                     and run_snapshot.state is SafetyState.RUNNING
                 ):
-                    active_started_ns = time.monotonic_ns()
-                    self._run_active_tick(active_started_ns)
-                    phase_ms["active_control"] = (
-                        time.monotonic_ns() - active_started_ns
-                    ) / 1e6
+                    self._run_active_tick(time.monotonic_ns())
                     if (
                         self.run_started_ns is not None
                         and self._running_generation_is_live()
                     ):
-                        record_started_ns = time.monotonic_ns()
-                        self._record_rollout_tick(record_started_ns)
-                        phase_ms["recording"] = (
-                            time.monotonic_ns() - record_started_ns
-                        ) / 1e6
-                        metrics_started_ns = time.monotonic_ns()
-                        self.last_metrics_flush_ns = flush_every(
-                            self.stats,
-                            last_ns=self.last_metrics_flush_ns,
-                            prefix="policy metrics",
-                            debug=True,
-                        )
-                        phase_ms["metrics"] = (
-                            time.monotonic_ns() - metrics_started_ns
-                        ) / 1e6
-                phase_ms["work"] = (time.monotonic_ns() - tick_started_ns) / 1e6
-                logger.debug("policy loop phases_ms=%s", phase_ms)
+                        self._record_rollout_tick(time.monotonic_ns())
                 wait_s = self.poll_period_s
                 boundary_ns = self._next_control_boundary_ns()
                 if boundary_ns is not None:

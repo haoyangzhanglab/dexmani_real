@@ -12,7 +12,7 @@ from dexmani_real.planning.kinematics.pose import (
     quat_wxyz_to_rot6d,
 )
 from dexmani_real.recording.client import RecorderClient
-from dexmani_real.recording.sample import EpisodeAction, build_episode_state
+from dexmani_real.recording.frame import build_episode_frame
 
 FRAME_OK = 0
 _FRAME_HELD = 1
@@ -136,7 +136,6 @@ def _recording_provenance(
 def record_held(
     recorder: RecorderClient | None,
     arm_state: np.ndarray | None,
-    hold_arm: np.ndarray,
     hold_hand: np.ndarray,
     vr_frame: dict | None,
     cam: dict | None,
@@ -170,23 +169,14 @@ def record_held(
             "wrist_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
             "landmarks": np.full((21, 3), np.nan),
         }
-    action = EpisodeAction(
-        arm_qpos_cmd=hold_arm,
-        hand_qpos_cmd=hold_hand,
-        target_eef_pos=target_eef_pos.copy() if target_eef_pos is not None else None,
-        target_eef_rot6d=(
-            target_eef_rot6d.copy() if target_eef_rot6d is not None else None
-        ),
-    )
-    state = build_episode_state(
-        arm_state,
-        hand_state,
-        timestamp_s=(
-            None
-            if observation_anchor_monotonic_ns is None
-            else int(observation_anchor_monotonic_ns) / 1e9
-        ),
-    )
+    action = {
+        "action_arm_joint_sent": arm_qpos_sent,
+        "action_hand_joint": hold_hand,
+        "action_arm_ee": np.concatenate((
+            target_eef_pos if target_eef_pos is not None else np.full(3, np.nan),
+            target_eef_rot6d if target_eef_rot6d is not None else np.full(6, np.nan),
+        )),
+    }
     signals: dict[str, object] = {
         "action_queued": action_queued,
         "frame_status": frame_status,
@@ -207,14 +197,12 @@ def record_held(
                 max_observation_skew_s=max_observation_skew_s,
             )
         )
-    recorder.add_frame(
-        state,
-        action,
-        vr_frame,
-        camera_frame=cam,
-        signals=signals,
-        arm_qpos_sent=arm_qpos_sent,
-    )
+    recorder.add_frame(build_episode_frame(
+        arm_state, hand_state, action, vr_frame,
+        camera_frame=cam, signals=signals,
+        timestamp_s=(None if observation_anchor_monotonic_ns is None
+                     else observation_anchor_monotonic_ns / 1e9),
+    ))
 
 
 def record_frame(
@@ -241,21 +229,12 @@ def record_frame(
     """
     if recorder is None:
         return
-    action = EpisodeAction(
-        arm_qpos_cmd=arm_cmd,
-        hand_qpos_cmd=hand_cmd,
-        target_eef_pos=target_pos.copy(),
-        target_eef_rot6d=quat_wxyz_to_rot6d(normalize_quat_wxyz(target_quat)),
-    )
-    state = build_episode_state(
-        arm_state,
-        hand_state,
-        timestamp_s=(
-            None
-            if observation_anchor_monotonic_ns is None
-            else int(observation_anchor_monotonic_ns) / 1e9
-        ),
-    )
+    action = {
+        "action_arm_joint_sent": arm_cmd,
+        "action_hand_joint": hand_cmd,
+        "action_arm_ee": np.concatenate((target_pos,
+            quat_wxyz_to_rot6d(normalize_quat_wxyz(target_quat)))),
+    }
     _vr = (
         vr_frame
         if vr_frame is not None
@@ -285,11 +264,9 @@ def record_frame(
                 max_observation_skew_s=max_observation_skew_s,
             )
         )
-    recorder.add_frame(
-        state,
-        action,
-        _vr,
-        camera_frame=cam,
-        signals=signals,
-        arm_qpos_sent=arm_cmd.copy(),
-    )
+    recorder.add_frame(build_episode_frame(
+        arm_state, hand_state, action, _vr,
+        camera_frame=cam, signals=signals,
+        timestamp_s=(None if observation_anchor_monotonic_ns is None
+                     else observation_anchor_monotonic_ns / 1e9),
+    ))

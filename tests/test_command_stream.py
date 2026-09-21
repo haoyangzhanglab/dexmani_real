@@ -27,8 +27,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from dexmani_real.control.action import ActionCandidate
-from dexmani_real.control.publication import (
+from dexmani_real.robot.commands import ActionCandidate
+from dexmani_real.robot.commands import (
     publish_command,
     wait_command_accepted,
 )

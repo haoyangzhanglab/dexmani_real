@@ -26,7 +26,7 @@ import numpy as np
 # Only a genuinely missing dependency may skip this module: a renamed or
 # broken symbol must fail the suite rather than hide behind a skip.
 try:
-    from dexmani_real.deployment.inference.observation import (
+    from dexmani_real.deployment.observation import (
         _pointcloud_frame_from_record,
         _read_state_history,
         _rgb_identity_from_header,
@@ -145,7 +145,7 @@ class StateHistoryAdmissionTest(unittest.TestCase):
 @unittest.skipIf(_IMPORT_ERROR is not None, f"dependencies unavailable: {_IMPORT_ERROR}")
 class RingCommitAdmissionTest(unittest.TestCase):
     def test_real_commit_and_payload_order_for_arm_and_hand(self):
-        from dexmani_real.deployment.inference.observation import _read_hand_history
+        from dexmani_real.deployment.observation import _read_hand_history
         from dexmani_real.ipc.schema import HAND_STATE_DTYPE
         for name, dtype in (("arm", ARM_STATE_DTYPE), ("hand", HAND_STATE_DTYPE)):
             for publish, commit, anchor, admitted in (

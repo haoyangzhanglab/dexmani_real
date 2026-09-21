@@ -19,7 +19,7 @@ from dexmani_real.deployment.config import (
     validate_num_trials,
     validate_policy_runtime_compatibility,
 )
-from dexmani_real.deployment.executor import policy_runner_loop
+from dexmani_real.deployment.runner import policy_runner_loop
 from dexmani_real.deployment.operator import build_home_planner, run_operator_control
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.recording.io_worker import RecorderIOConfig, recorder_io_loop
