@@ -18,6 +18,7 @@ from dexmani_real.dataset.contracts import (
 )
 from dexmani_real.dataset.processing import (
     _open_processing_episode,
+    _validate_masked_tactile_rows,
     analyze_episode,
     discover_episode_dirs,
     iter_policy_blocks,
@@ -53,6 +54,65 @@ class PolicyZarrExportConfig:
             raise ValueError("compression_level must be an integer in [0, 9]")
         if self.expected_task_name is not None:
             validate_task_name(self.expected_task_name)
+
+
+def _validate_staged_policy_zarr(
+    staging: Path, *, attrs: dict, specs: dict, episode_ends: list[int],
+    chunk_frames: int, processing: ProcessingConfig,
+) -> None:
+    """Reopen persisted staging and read bounded payloads before publication."""
+    root = zarr.open_group(str(staging), mode="r")
+    if set(root.group_keys()) != {"data", "meta"} or set(root.array_keys()):
+        raise ValueError("staged policy root groups/keys mismatch")
+    if dict(root.attrs) != attrs:
+        raise ValueError("staged policy required attributes mismatch")
+    data, meta = root["data"], root["meta"]
+    if (set(data.array_keys()) != set(specs) or set(data.group_keys())
+            or set(meta.array_keys()) != {"episode_ends"} or set(meta.group_keys())):
+        raise ValueError("staged policy array keys mismatch")
+    ends = meta["episode_ends"]
+    if ends.shape != (len(episode_ends),) or ends.dtype != np.dtype("int64"):
+        raise ValueError("staged episode_ends shape/dtype mismatch")
+    for start in range(0, len(episode_ends), chunk_frames):
+        if not np.array_equal(ends[start:start + chunk_frames],
+                              episode_ends[start:start + chunk_frames]):
+            raise ValueError("staged episode_ends mismatch")
+    total = episode_ends[-1]
+    for key, (tail, dtype) in specs.items():
+        if data[key].shape != (total, *tail) or data[key].dtype != dtype:
+            raise ValueError(f"{key}: staged shape/dtype/row count mismatch")
+    row_bytes = sum(int(np.prod(tail)) * dtype.itemsize for tail, dtype in specs.values())
+    rows_per_read = min(chunk_frames, max(1, (64 * 1024 * 1024) // row_bytes))
+    lower, upper = np.asarray(processing.pointcloud.workspace).reshape(2, 3)
+    begin = 0
+    for end in episode_ends:
+        previous_anchor = 0
+        for start in range(begin, end, rows_per_read):
+            stop = min(end, start + rows_per_read)
+            block = {key: data[key][start:stop] for key in specs}
+            for key, values in block.items():
+                if (np.issubdtype(values.dtype, np.floating)
+                        and key not in {"contact_force", "tactile_force"}
+                        and not np.isfinite(values).all()):
+                    raise ValueError(f"{key}: non-finite persisted payload")
+            for key in ("contact_force", "tactile_force"):
+                _validate_masked_tactile_rows(
+                    block[key], block[f"{key}_valid"], label=f"staged {key}"
+                )
+            anchor = block["observation_anchor_monotonic_ns"]
+            if anchor[0] <= previous_anchor or np.any(anchor[1:] <= anchor[:-1]):
+                raise ValueError("staged anchors must be positive and strictly increasing")
+            previous_anchor = int(anchor[-1])
+            for key in ("arm_source_monotonic_ns", "hand_source_monotonic_ns",
+                        "camera_source_monotonic_ns"):
+                if np.any(block[key] == 0) or np.any(block[key] > anchor):
+                    raise ValueError(f"{key}: persisted source must be positive and causal")
+            cloud = block["point_cloud"]
+            if (np.any(cloud[..., :3] < lower) or np.any(cloud[..., :3] > upper)
+                    or np.any(cloud[..., 3:] < 0) or np.any(cloud[..., 3:] > 1)
+                    or np.any(~np.any(np.linalg.norm(cloud[..., :3], axis=2) > 0, axis=1))):
+                raise ValueError("persisted point cloud violates workspace/color contract")
+        begin = end
 
 
 def export_raw_to_zarr(
@@ -198,11 +258,10 @@ def export_raw_to_zarr(
             root.create_group("meta").create_dataset(
                 "episode_ends", data=np.asarray(ends, dtype=np.int64)
             )
-            if any(
-                data[key].shape != (offset, *tail) or data[key].dtype != dtype
-                for key, (tail, dtype) in first_specs.items()
-            ):
-                raise ValueError("written policy array shape/dtype mismatch")
+            _validate_staged_policy_zarr(
+                staging, attrs=first_attrs, specs=first_specs, episode_ends=ends,
+                chunk_frames=config.chunk_frames, processing=processing,
+            )
             atomic_publish(staging, target)
             staging = None
         if progress_callback:

@@ -239,3 +239,59 @@ def test_actual_cli_dry_run_and_export(tmp_path):
         assert result.returncode == 0, result.stdout + result.stderr
         assert target.exists() is not dry
     assert hashes(root) == before
+
+
+@pytest.mark.parametrize("corruption", [
+    "payload", "valid_tactile", "invalid_contact", "cloud_color", "anchor",
+    "future_source", "attrs", "ends", "keys", "shape", "dtype", "groups",
+])
+def test_persisted_corruption_blocks_real_export_transaction(tmp_path, monkeypatch, corruption):
+    import dexmani_real.dataset.export as export
+    from unittest.mock import Mock
+    root = fixture(tmp_path)
+    before = hashes(root)
+    target = tmp_path / "policy.zarr"
+    validate = export._validate_staged_policy_zarr
+    published = Mock(side_effect=AssertionError("corrupt staging was published"))
+    monkeypatch.setattr(export, "atomic_publish", published)
+
+    def corrupt_then_validate(staging, **kwargs):
+        stored = zarr.open_group(str(staging), mode="r+")
+        data = stored["data"]
+        if corruption == "payload":
+            data["joint_state"][2, 0] = np.nan
+        elif corruption == "valid_tactile":
+            data["tactile_force"][2, 0, 0, 0] = np.nan
+        elif corruption == "invalid_contact":
+            data["contact_force_valid"][2] = False
+        elif corruption == "cloud_color":
+            data["point_cloud"][2, 0, 3] = 2.
+        elif corruption == "anchor":
+            # At a chunk boundary, still inside the first episode.
+            data["observation_anchor_monotonic_ns"][2] = data["observation_anchor_monotonic_ns"][1]
+        elif corruption == "future_source":
+            data["camera_source_monotonic_ns"][2] = data["observation_anchor_monotonic_ns"][2] + 1
+        elif corruption == "attrs":
+            del stored.attrs["action_ee_components"]
+        elif corruption == "ends":
+            stored["meta/episode_ends"][0] = 2
+        elif corruption == "keys":
+            del data["rgb"]
+        elif corruption == "shape":
+            data["action"].resize((6, 19))
+        elif corruption == "dtype":
+            values = data["action"][:].astype(np.float64)
+            del data["action"]
+            data.create_dataset("action", data=values)
+        elif corruption == "groups":
+            stored.create_group("unexpected")
+        validate(staging, **kwargs)
+
+    monkeypatch.setattr(export, "_validate_staged_policy_zarr", corrupt_then_validate)
+    with pytest.raises(ValueError):
+        export_raw_to_zarr(root, target, PolicyZarrExportConfig(chunk_frames=2),
+                           processing=policy_processing_config())
+    published.assert_not_called()
+    assert not target.exists()
+    assert not list(tmp_path.glob(".*.tmp-*"))
+    assert hashes(root) == before
