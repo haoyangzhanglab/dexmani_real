@@ -526,9 +526,13 @@ class StartupHandHomeClassificationTest(unittest.TestCase):
 
         def expire(shared, candidate, **kwargs):
             attempts.append(candidate)
+            before = shared.run_generation.value
+            self.assertEqual(candidate.run_generation, before)
             with patch("dexmani_real.runtime.safety.time.monotonic_ns",
                        return_value=candidate.expires_monotonic_ns):
-                return publish_command(shared, candidate, **kwargs)
+                result = publish_command(shared, candidate, **kwargs)
+            self.assertEqual(shared.run_generation.value, before + 1)
+            return result
 
         def assert_waiting(h):
             self.assertEqual(len(attempts), 1)
@@ -538,16 +542,25 @@ class StartupHandHomeClassificationTest(unittest.TestCase):
             self.assertTrue(h.shared.stop_request.value)
             self.assertEqual(h.starts, 0)
 
+        stopped_generation = []
+
+        def assert_stopped(h):
+            self.assertEqual(len(attempts), 1)
+            stopped_generation.append(h.shared.run_generation.value)
+
         with patch("dexmani_real.robot.hand_homing.read_hand_feedback",
                    return_value=(object(), "", None)), \
              patch("dexmani_real.robot.hand_homing.publish_command", side_effect=expire):
             h.run([lambda h: None, assert_waiting, assert_waiting,
                    lambda h: setattr(h, "controls", [Command.STOP, Command.BEGIN]),
-                   lambda h: self.assertEqual(len(attempts), 1),
+                   assert_stopped,
                    lambda h: setattr(h, "controls", [Command.BEGIN]),
                    lambda h: None, lambda h: None])
         self.assertEqual(len(attempts), 2)
-        self.assertEqual(h.shared.run_generation.value, generation + 3)
+        # Measure the retry expiry from the explicit STOP boundary; STOP also
+        # revokes motion independently of command expiry.
+        self.assertEqual(attempts[1].run_generation, stopped_generation[0])
+        self.assertEqual(h.shared.run_generation.value, stopped_generation[0] + 1)
         self.assertFalse(h.shared.error_state.value)
         self.assertNotEqual(h.shared.safety_state.value, SafetyState.FAULT)
         self.assertEqual(h.starts, 0)
