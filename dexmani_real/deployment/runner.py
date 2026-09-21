@@ -98,9 +98,7 @@ def _build_policy_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
             urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
             srdf_path=str(XARM7_XHAND_SRDF_PATH),
             base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
-            workspace_bounds=np.asarray(
-                runtime.policy.workspace.as_tuple(), dtype=np.float64
-            ),
+            workspace_bounds=runtime.policy.workspace.as_array(),
         ),
         teleop_profile=OnlineIKConfig(
             max_pose_error_pos_m=float(runtime.policy.ik_max_pose_error_pos_m),
@@ -123,7 +121,7 @@ def _build_policy_workspace_check(
     edge tolerance are unchanged; EE policies keep the existing IK profile's
     reference/selection rules (no IK algorithm change).
     """
-    bounds = np.asarray(runtime.policy.workspace.as_tuple(), dtype=np.float64)
+    bounds = runtime.policy.workspace.as_array()
     arm_fk = make_arm_fk()
 
     def is_workspace_endpoint_safe(
@@ -148,8 +146,6 @@ def _build_policy_safety_gate(runtime: ExperimentConfig) -> SafetyGate:
         hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
         hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
         workspace_check=_build_policy_workspace_check(runtime),
-        max_hand_delta_rad=None,
-        endpoint_delta_tolerance_rad=float(runtime.policy.endpoint_delta_tolerance_rad),
     )
 
 

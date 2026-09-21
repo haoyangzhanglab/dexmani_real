@@ -119,8 +119,8 @@ class XArm7MotionPlanner:
         self._elbow_joint_index = list(self.pinocchio_model.get_joint_names()).index("joint4")
         joint_limits = np.asarray(self.mplib_planner.joint_limits, dtype=np.float64)
 
-        # Cross-check URDF (mplib) limits against defaults.arm (Python config).
-        # They should be identical; divergence indicates a stale hardcoded copy.
+        # Diagnose drift between canonical Python hardware limits and the URDF.
+        # Kinematic authority remains the URDF/MPlib model.
         from dexmani_real.config.defaults import arm as _arm_cfg
 
         _cfg_lower = np.asarray(_arm_cfg.joint_limit_lower, dtype=np.float64)

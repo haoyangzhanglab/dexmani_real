@@ -260,7 +260,6 @@ def handle_calibration_home_key(
             runtime,
             publish_policy_heartbeat=False,
         ),
-        table_z_surface_m=float(runtime.arm.table_z_surface_m),
         current_qpos=state.current_qpos,
         estop_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
         progress=lambda message: print(f"  {message}", flush=True),

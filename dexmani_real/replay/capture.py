@@ -14,9 +14,8 @@ _SAFETY_REASON_BYTES = 256
 class ReplayRecorder:
     """Pre-allocated, single-threaded capture buffer for replay evaluation."""
 
-    def __init__(self, capacity: int, has_hand: bool = False) -> None:
+    def __init__(self, capacity: int) -> None:
         self.capacity = capacity
-        self.has_hand = has_hand
         self._count = 0
         self.arm_qpos = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
         self.eef_pos = np.full((capacity, 3), np.nan, dtype=np.float64)
@@ -30,15 +29,8 @@ class ReplayRecorder:
         self.timestamps = np.full(capacity, np.nan, dtype=np.float64)
         self.flag_safety_reject = np.zeros(capacity, dtype=bool)
         self.safety_reject_reason: list[str | None] = [None] * capacity
-        self.hand_qpos: np.ndarray | None = None
-        self.hand_cmd: np.ndarray | None = None
-        if has_hand:
-            self.hand_qpos = np.full(
-                (capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64
-            )
-            self.hand_cmd = np.full(
-                (capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64
-            )
+        self.hand_qpos = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
+        self.hand_cmd = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
 
     def record(
         self,
@@ -47,12 +39,13 @@ class ReplayRecorder:
         eef_pos: np.ndarray,
         eef_rot6d: np.ndarray,
         arm_cmd: np.ndarray,
-        hand_cmd: np.ndarray | None,
+        hand_cmd: np.ndarray,
         ts: float,
+        *,
+        hand_qpos: np.ndarray,
         arm_sent_cmd: np.ndarray | None = None,
         arm_tracking_error: float | None = None,
         safety_reject_reason: str | None = None,
-        hand_qpos: np.ndarray | None = None,
     ) -> None:
         """Capture one replay row, preserving rejected candidates for diagnosis."""
         if idx < 0:
@@ -75,10 +68,8 @@ class ReplayRecorder:
             self.arm_sent_cmd[idx] = arm_sent_cmd
         if arm_tracking_error is not None:
             self.arm_tracking_error[idx] = arm_tracking_error
-        if self.hand_qpos is not None and hand_qpos is not None:
-            self.hand_qpos[idx] = hand_qpos
-        if self.hand_cmd is not None and hand_cmd is not None:
-            self.hand_cmd[idx] = hand_cmd
+        self.hand_qpos[idx] = hand_qpos
+        self.hand_cmd[idx] = hand_cmd
         if safety_reject_reason is not None:
             self.flag_safety_reject[idx] = True
             self.safety_reject_reason[idx] = safety_reject_reason
@@ -100,6 +91,8 @@ class ReplayRecorder:
         )
         result = {
             "arm_qpos": self.arm_qpos[:count].copy(),
+            "hand_qpos": self.hand_qpos[:count].copy(),
+            "hand_cmd": self.hand_cmd[:count].copy(),
             "eef_pos": self.eef_pos[:count].copy(),
             "eef_quat_wxyz": self.eef_quat_wxyz[:count].copy(),
             "eef_rot6d": self.eef_rot6d[:count].copy(),
@@ -110,8 +103,4 @@ class ReplayRecorder:
             "flag_safety_reject": self.flag_safety_reject[:count].copy(),
             "safety_reject_reason": reasons,
         }
-        if self.hand_qpos is not None:
-            result["hand_qpos"] = self.hand_qpos[:count].copy()
-        if self.hand_cmd is not None:
-            result["hand_cmd"] = self.hand_cmd[:count].copy()
         return result

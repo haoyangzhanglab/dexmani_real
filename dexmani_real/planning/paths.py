@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import arm as _arm_cfg
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
 
 if TYPE_CHECKING:
@@ -100,7 +99,7 @@ def _table_clearance_m(
     planner: "XArm7MotionPlanner",
     arm_qpos: np.ndarray,
     *,
-    table_z_surface_m: float | None,
+    table_z_surface_m: float,
     hand_safety_margin_m: float,
 ) -> tuple[float, float, str]:
     """Return ``(clearance, raw_measurement, source)`` for one arm pose."""
@@ -109,8 +108,6 @@ def _table_clearance_m(
         distance_m = float(collision_model.minimum_table_distance(arm_qpos))
         clearance_m = distance_m - float(collision_model.table_soft_clearance_m)
         return clearance_m, distance_m, "calibrated_mesh_distance"
-    if table_z_surface_m is None:
-        return float("inf"), float("inf"), "disabled"
     hand_min_z_m = float(collision_model.minimum_hand_frame_z(arm_qpos))
     clearance_m = hand_min_z_m - hand_safety_margin_m - table_z_surface_m
     return clearance_m, hand_min_z_m, "hand_frame_proxy"
@@ -227,19 +224,15 @@ def _collision_pairs(collision: object) -> tuple[HomeCollisionPair, ...]:
 def _check_home_path_candidate(
     path: np.ndarray,
     candidate_name: str,
-    planner: "XArm7MotionPlanner | None",
+    planner: "XArm7MotionPlanner",
     *,
-    table_z_surface_m: float | None,
+    table_z_surface_m: float,
     hand_safety_margin_m: float,
     allow_table_soft_escape: bool,
 ) -> HomePathCandidate:
     """Validate one dense path and return its first safety rejection."""
     sample_count = len(path)
-    have_collision = (
-        planner is not None and planner.planning_profile.check_self_collision
-    )
-    if have_collision:
-        assert planner is not None
+    if planner.planning_profile.check_self_collision:
         path_check = getattr(
             planner.ik_mgr,
             "check_path_combined_collisions",
@@ -275,34 +268,25 @@ def _check_home_path_candidate(
                 collision_pairs=pairs,
             )
 
-    if planner is not None:
-        try:
-            for segment_index, (start, end) in enumerate(zip(path[:-1], path[1:])):
-                if not planner.is_workspace_segment_safe(start, end):
-                    return HomePathCandidate(
-                        candidate_name,
-                        False,
-                        reason="workspace",
-                        sample_count=sample_count,
-                        workspace_segment_index=segment_index,
-                    )
-        except (ValueError, RuntimeError) as exc:
-            return HomePathCandidate(
-                candidate_name,
-                False,
-                reason="workspace_check_error",
-                sample_count=sample_count,
-                detail=str(exc),
-            )
+    try:
+        for segment_index, (start, end) in enumerate(zip(path[:-1], path[1:])):
+            if not planner.is_workspace_segment_safe(start, end):
+                return HomePathCandidate(
+                    candidate_name,
+                    False,
+                    reason="workspace",
+                    sample_count=sample_count,
+                    workspace_segment_index=segment_index,
+                )
+    except (ValueError, RuntimeError) as exc:
+        return HomePathCandidate(
+            candidate_name,
+            False,
+            reason="workspace_check_error",
+            sample_count=sample_count,
+            detail=str(exc),
+        )
 
-    check_table = planner is not None and (
-        bool(getattr(planner.collision_model, "has_table", False))
-        or table_z_surface_m is not None
-    )
-    if not check_table:
-        return HomePathCandidate(candidate_name, True, sample_count=sample_count)
-
-    assert planner is not None
     table_samples: list[tuple[int, float, float, str]] = []
     for waypoint_index, waypoint in enumerate(path):
         try:
@@ -393,35 +377,21 @@ def _unique_milestones(*points: np.ndarray) -> np.ndarray:
 def compute_joint_home_path(
     qpos: np.ndarray,
     home_qpos: np.ndarray,
-    planner: "XArm7MotionPlanner | None" = None,
+    planner: "XArm7MotionPlanner",
     *,
-    table_z_surface_m: float | None = None,
-    hand_safety_margin_m: float | None = None,
+    table_z_surface_m: float,
+    hand_safety_margin_m: float,
     use_canonical_target: bool = False,
 ) -> HomePathResult:
     """Return a typed, collision-checked path from current to home joints."""
-    if hand_safety_margin_m is None:
-        hand_safety_margin_m = _arm_cfg.hand_safety_margin_m
-
     if use_canonical_target:
         # Canonical home uses raw absolute deltas; equivalent joints may rotate a full band.
         target = np.asarray(home_qpos, dtype=np.float64)
         # Use raw delta for the already-home check; wrapped deltas hide band mismatches.
         delta = float(np.max(np.abs(target - qpos)))
     else:
-        if planner is not None:
-            target = planner.ik_mgr.nearest_equivalent_qpos(home_qpos, qpos)
-            delta = float(
-                np.max(np.abs(planner.ik_mgr.compute_qpos_delta(target, qpos)))
-            )
-        else:
-            target = wrap_nearest_equivalent(
-                home_qpos,
-                qpos,
-                _arm_cfg.joint_limit_lower,
-                _arm_cfg.joint_limit_upper,
-            )
-            delta = float(np.max(np.abs(qpos - target)))
+        target = planner.ik_mgr.nearest_equivalent_qpos(home_qpos, qpos)
+        delta = float(np.max(np.abs(planner.ik_mgr.compute_qpos_delta(target, qpos))))
     if delta < np.deg2rad(0.15):
         return HomePathResult(HomePathStatus.ALREADY_HOME, _empty_home_path())
 
@@ -466,41 +436,40 @@ def compute_joint_home_path(
     if result is not None:
         return result
 
-    if planner is not None and hasattr(planner, "plan_joint_qpos_path"):
-        try:
-            planned = planner.plan_joint_qpos_path(target, qpos, planning_time_s=0.5)
-        except (ValueError, RuntimeError) as exc:
+    try:
+        planned = planner.plan_joint_qpos_path(target, qpos, planning_time_s=0.5)
+    except (ValueError, RuntimeError) as exc:
+        candidates.append(
+            HomePathCandidate(
+                "joint_qpos_rrt",
+                False,
+                reason="planner_error",
+                detail=str(exc),
+            )
+        )
+    else:
+        if (
+            planned.success
+            and planned.qpos_path is not None
+            and len(planned.qpos_path) >= 2
+        ):
+            rrt_milestones = np.asarray(planned.qpos_path, dtype=np.float64)
+            if float(np.max(np.abs(rrt_milestones[-1] - target))) > 1e-6:
+                rrt_milestones = np.concatenate(
+                    [rrt_milestones, target.reshape((1, *ARM_JOINT_SHAPE))], axis=0
+                )
+            result = try_candidate(rrt_milestones, "joint_qpos_rrt")
+            if result is not None:
+                return result
+        else:
             candidates.append(
                 HomePathCandidate(
                     "joint_qpos_rrt",
                     False,
-                    reason="planner_error",
-                    detail=str(exc),
+                    reason="planner_failed",
+                    detail=planned.reason,
                 )
             )
-        else:
-            if (
-                planned.success
-                and planned.qpos_path is not None
-                and len(planned.qpos_path) >= 2
-            ):
-                rrt_milestones = np.asarray(planned.qpos_path, dtype=np.float64)
-                if float(np.max(np.abs(rrt_milestones[-1] - target))) > 1e-6:
-                    rrt_milestones = np.concatenate(
-                        [rrt_milestones, target.reshape((1, *ARM_JOINT_SHAPE))], axis=0
-                    )
-                result = try_candidate(rrt_milestones, "joint_qpos_rrt")
-                if result is not None:
-                    return result
-            else:
-                candidates.append(
-                    HomePathCandidate(
-                        "joint_qpos_rrt",
-                        False,
-                        reason="planner_failed",
-                        detail=planned.reason,
-                    )
-                )
 
     return HomePathResult(
         HomePathStatus.UNSAFE,
@@ -512,18 +481,13 @@ def compute_joint_home_path(
 def compute_band_alignment_path(
     wrapped_home: np.ndarray,
     canonical_home: np.ndarray,
-    planner: "XArm7MotionPlanner | None" = None,
+    planner: "XArm7MotionPlanner",
     *,
-    table_z_surface_m: float | None = None,
-    hand_safety_margin_m: float | None = None,
+    table_z_surface_m: float,
+    hand_safety_margin_m: float,
 ) -> HomePathResult:
     """Return a typed safety result for equivalent-joint band alignment."""
-    if hand_safety_margin_m is None:
-        hand_safety_margin_m = _arm_cfg.hand_safety_margin_m
-
-    equivalent_mask = (
-        np.array(_arm_cfg.joint_limit_upper) - np.array(_arm_cfg.joint_limit_lower)
-    ) > 2.0 * np.pi
+    equivalent_mask = planner.equivalent_joint_mask
     raw_delta_deg = np.rad2deg(np.abs(wrapped_home - canonical_home))
     if not np.any(raw_delta_deg[equivalent_mask] > 1.0):
         return HomePathResult(HomePathStatus.ALREADY_HOME, _empty_home_path())

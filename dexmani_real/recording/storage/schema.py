@@ -65,10 +65,6 @@ SOURCE_FRAME_DATASET_NAMES = frozenset(DATASET_SPECS) - {
 }
 
 
-def required_dataset_names() -> frozenset[str]:
-    return frozenset(DATASET_SPECS)
-
-
 def validate_data_layout(shapes, dtypes, *, frame_count: int) -> tuple[str, ...]:
     """Check the storage boundary without replaying runtime admission proofs."""
     errors = []

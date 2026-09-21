@@ -108,9 +108,7 @@ class _TeleopCommandLimits:
                 config.runtime.hand.qpos_max_rad, dtype=np.float64
             ).copy(),
             hand_max_delta_rad_per_tick=hand_max_delta,
-            workspace_bounds_world_m=np.asarray(
-                config.runtime.policy.workspace.as_tuple(), dtype=np.float64
-            ).copy(),
+            workspace_bounds_world_m=config.runtime.policy.workspace.as_array(),
         )
 
 

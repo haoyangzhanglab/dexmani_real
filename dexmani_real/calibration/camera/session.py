@@ -181,17 +181,10 @@ def _start_camera(serial: str | None = None) -> tuple[Any, str, np.ndarray, np.n
     return pipeline, serial, intrinsics, distortion
 
 
-def _workspace_bounds(runtime: ExperimentConfig) -> np.ndarray:
-    w = runtime.policy.workspace
-    return np.array(
-        [[w.x_min, w.x_max], [w.y_min, w.y_max], [w.z_min, w.z_max]], dtype=np.float64
-    )
-
-
 def _build_planner_and_gate(
     runtime: ExperimentConfig,
 ) -> tuple[XArm7MotionPlanner, SafetyGate, np.ndarray]:
-    workspace = _workspace_bounds(runtime)
+    workspace = runtime.policy.workspace.as_array()
     planner = XArm7MotionPlanner.create_default(
         teleop_profile=OnlineIKConfig(
             max_ik_jump_deg=(
@@ -593,7 +586,6 @@ def _run_calibration(
     safety_gate: SafetyGate,
     workspace: np.ndarray,
     arm_process: Any,
-    camera_serial: str | None,
     calib_cfg: CalibrationConfig,
     aruco_cfg: ArucoConfig,
 ) -> int:
@@ -616,7 +608,7 @@ def _run_calibration(
     keys_started = False
     window_created = False
     try:
-        pipeline, serial, intrinsics, distortion = _start_camera(camera_serial)
+        pipeline, serial, intrinsics, distortion = _start_camera(runtime.camera.serial)
         print(f"  Camera serial: {serial}")
         print(
             f"  Intrinsics: fx={intrinsics[0, 0]:.1f} "
@@ -797,7 +789,6 @@ def _run_calibration_control_loop(
 def run_camera_calibration(
     runtime: ExperimentConfig,
     *,
-    camera_serial: str | None,
     hand_geometry: str,
     calibration_config: CalibrationConfig | None = None,
     aruco_config: ArucoConfig | None = None,
@@ -865,7 +856,6 @@ def run_camera_calibration(
             safety_gate,
             workspace,
             arm_process,
-            camera_serial,
             calib_cfg,
             aruco_cfg,
         )

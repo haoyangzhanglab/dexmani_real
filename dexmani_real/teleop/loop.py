@@ -194,9 +194,7 @@ def _load_control_resources(
                 p=np.array([0.0, 0.0, 0.0]),
                 q=np.array([1.0, 0.0, 0.0, 0.0]),
             ),
-            workspace_bounds=np.asarray(
-                config.runtime.policy.workspace.as_tuple(), dtype=np.float64
-            ),
+            workspace_bounds=config.runtime.policy.workspace.as_array(),
         ),
         planning_profile=MotionPlanningConfig(),
         teleop_profile=OnlineIKConfig(

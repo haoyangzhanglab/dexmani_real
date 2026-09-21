@@ -18,7 +18,6 @@ from dexmani_real.dataset.provenance import (
     supports_fixed_dt_teleop,
 )
 from dexmani_real.robot.model import (
-    ARM_EE_SHAPE,
     ARM_JOINT_SHAPE,
     HAND_JOINT_SHAPE,
     XARM7_XHAND_COLLISION_URDF_PATH,
@@ -35,29 +34,18 @@ _JOINT_LIMIT_TOLERANCE_RAD = 1e-12
 
 @dataclass
 class TrajectoryData:
-    """Preloaded state and command streams used by replay and evaluation."""
+    """Required raw-v30 xArm7/XHand streams and derived EEF history for replay."""
 
     episode_path: str
     num_frames: int
     fps: float
     task_label: str
     action_arm_joint: np.ndarray
-    action_hand_joint: np.ndarray | None
+    action_hand_joint: np.ndarray
     arm_qpos: np.ndarray
-    hand_qpos: np.ndarray | None
-    arm_ee: np.ndarray | None
-    action_source: str | None = None
-    send_mask: np.ndarray | None = None
-
-    @property
-    def has_hand(self) -> bool:
-        """Whether a fixed-shape hand action stream is present."""
-        return self.has_hand_actions
-
-    @property
-    def has_hand_actions(self) -> bool:
-        """Whether a fixed-shape hand action dataset is present."""
-        return self.action_hand_joint is not None
+    hand_qpos: np.ndarray
+    arm_ee: np.ndarray
+    send_mask: np.ndarray
 
 
 def resolve_episode_path(raw_path: str) -> tuple[str, str]:
@@ -73,8 +61,6 @@ def resolve_episode_path(raw_path: str) -> tuple[str, str]:
 def load_trajectory(episode_path: str) -> TrajectoryData:
     """Load recorded published arm targets and logical hand targets for replay."""
     resolved_path, _episode_name = resolve_episode_path(episode_path)
-    if not Path(resolved_path).exists():
-        raise FileNotFoundError(f"Episode not found: {episode_path}")
 
     with EpisodeReader(resolved_path) as reader:
         if not reader.min_frames_met:
@@ -83,82 +69,33 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
                 resolved_path,
             )
         h5 = reader.h5f
-        meta = h5.get("meta")
-        if meta is not None:
-            workflow = read_provenance_workflow(meta.attrs)
-            if not supports_fixed_dt_teleop(workflow):
-                if workflow == POLICY_EVAL_WORKFLOW:
-                    raise ValueError(
-                        "policy_eval rollout contains synchronous irregular timing; "
-                        "current physical replay is fixed-rate and must not silently "
-                        "time-compress it"
-                    )
+        meta = h5["meta"]
+        workflow = read_provenance_workflow(meta.attrs)
+        if not supports_fixed_dt_teleop(workflow):
+            if workflow == POLICY_EVAL_WORKFLOW:
                 raise ValueError(
-                    f"unsupported provenance_workflow {workflow!r} for fixed-rate physical replay"
+                    "policy_eval rollout contains synchronous irregular timing; "
+                    "current physical replay is fixed-rate and must not silently "
+                    "time-compress it"
                 )
-        num_frames_attr = (
-            int(meta.attrs.get("num_frames", 0)) if meta is not None else 0
-        )
+            raise ValueError(
+                f"unsupported provenance_workflow {workflow!r} for fixed-rate physical replay"
+            )
+        total_frames = int(meta.attrs["num_frames"])
         fps = float(reader.timing.rate_hz)
         if not _MIN_EPISODE_RATE_HZ <= fps <= _MAX_EPISODE_RATE_HZ:
             raise ValueError(
                 f"physical replay requires a valid episode rate, got {fps!r} Hz"
             )
-        task_label = str(meta.attrs.get("task_label", "")) if meta is not None else ""
+        task_label = str(meta.attrs.get("task_label", ""))
 
-        arm_action_key = "action_arm_joint_sent"
-        action_source = "sent"
-        if arm_action_key not in h5:
-            raise ValueError("physical replay requires /action_arm_joint_sent")
-        for key in (arm_action_key, "arm_qpos"):
-            if key not in h5:
-                raise ValueError(f"episode missing required dataset: /{key}")
-
-        source_frames = int(h5[arm_action_key].shape[0])
-        total_frames = (
-            source_frames
-            if num_frames_attr == 0
-            else min(source_frames, num_frames_attr)
-        )
-
-        action_arm_joint = np.asarray(
-            h5[arm_action_key][:total_frames], dtype=np.float64
-        )
-        arm_qpos = np.asarray(h5["arm_qpos"][:total_frames], dtype=np.float64)
-        action_hand_joint = (
-            np.asarray(h5["action_hand_joint"][:total_frames], dtype=np.float64)
-            if "action_hand_joint" in h5
-            else None
-        )
-        hand_qpos = (
-            np.asarray(h5["hand_qpos"][:total_frames], dtype=np.float64)
-            if "hand_qpos" in h5
-            else None
-        )
+        # EpisodeReader validates every v30 dataset's shape, dtype and frame count.
+        action_arm_joint = np.asarray(h5["action_arm_joint_sent"][:], dtype=np.float64)
+        arm_qpos = np.asarray(h5["arm_qpos"][:], dtype=np.float64)
+        action_hand_joint = np.asarray(h5["action_hand_joint"][:], dtype=np.float64)
+        hand_qpos = np.asarray(h5["hand_qpos"][:], dtype=np.float64)
         arm_ee = compute_eef_pose_history_xarm_base(arm_qpos)
-        send_mask = (
-            np.asarray(h5["flag_action_queued"][:total_frames], dtype=bool)
-            if "flag_action_queued" in h5
-            else None
-        )
-
-    arrays: dict[str, tuple[np.ndarray, tuple[int, ...]]] = {
-        "arm action": (action_arm_joint, (total_frames, *ARM_JOINT_SHAPE)),
-        "arm state": (arm_qpos, (total_frames, *ARM_JOINT_SHAPE)),
-    }
-    if action_hand_joint is not None:
-        arrays["hand action"] = (action_hand_joint, (total_frames, *HAND_JOINT_SHAPE))
-    if hand_qpos is not None:
-        arrays["hand state"] = (hand_qpos, (total_frames, *HAND_JOINT_SHAPE))
-    if arm_ee is not None:
-        arrays["arm EEF"] = (arm_ee, (total_frames, *ARM_EE_SHAPE))
-    if send_mask is not None:
-        arrays["send mask"] = (send_mask, (total_frames,))
-    for name, (array, expected_shape) in arrays.items():
-        if array.shape != expected_shape:
-            raise ValueError(
-                f"episode {name} has shape {array.shape}, expected {expected_shape}"
-            )
+        send_mask = np.asarray(h5["flag_action_queued"][:], dtype=bool)
 
     trajectory = TrajectoryData(
         episode_path=resolved_path,
@@ -170,26 +107,19 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
         arm_qpos=arm_qpos,
         hand_qpos=hand_qpos,
         arm_ee=arm_ee,
-        action_source=action_source,
         send_mask=send_mask,
     )
     logger.info(
-        "Loaded trajectory: %d frames, fps=%.1f, task=%s, hand=%s, ee=%s",
+        "Loaded xArm7/XHand trajectory: %d frames, fps=%.1f, task=%s",
         trajectory.num_frames,
         trajectory.fps,
         trajectory.task_label or "(none)",
-        ("yes" if trajectory.has_hand_actions else "no"),
-        "yes" if trajectory.arm_ee is not None else "no",
     )
     return trajectory
 
 
 def modeled_hand_actions(trajectory: TrajectoryData) -> np.ndarray:
     """Return recorded logical hand targets used for geometry preflight."""
-    if trajectory.action_hand_joint is None:
-        raise ValueError(
-            "episode has no hand action stream; physical replay requires recorded hand data"
-        )
     actions = np.asarray(trajectory.action_hand_joint, dtype=np.float64)
     expected_shape = (trajectory.num_frames, *HAND_JOINT_SHAPE)
     if actions.shape != expected_shape or not np.all(np.isfinite(actions)):
@@ -199,14 +129,6 @@ def modeled_hand_actions(trajectory: TrajectoryData) -> np.ndarray:
     return actions
 
 
-def require_hand_actions(trajectory: TrajectoryData) -> None:
-    """Fail closed when an episode has no recorded hand action stream."""
-    if not trajectory.has_hand_actions:
-        raise ValueError(
-            "episode has no hand action stream; physical replay requires recorded hand data"
-        )
-
-
 def replay_start_state(trajectory: TrajectoryData) -> tuple[np.ndarray, np.ndarray]:
     """Return the finite measured arm/hand state at the first replay frame."""
     if trajectory.num_frames <= 0:
@@ -214,8 +136,6 @@ def replay_start_state(trajectory: TrajectoryData) -> tuple[np.ndarray, np.ndarr
     arm_qpos = np.asarray(trajectory.arm_qpos[0], dtype=np.float64)
     if arm_qpos.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(arm_qpos)):
         raise ValueError("physical replay requires a finite first arm_qpos state")
-    if trajectory.hand_qpos is None:
-        raise ValueError("physical replay requires a recorded first hand_qpos state")
     hand_qpos = np.asarray(trajectory.hand_qpos[0], dtype=np.float64)
     if hand_qpos.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(hand_qpos)):
         raise ValueError("physical replay requires a finite first hand_qpos state")
@@ -224,10 +144,6 @@ def replay_start_state(trajectory: TrajectoryData) -> tuple[np.ndarray, np.ndarr
 
 def _verify_trajectory_input(trajectory: TrajectoryData) -> None:
     """Fail closed on the exact source stream needed for physical preflight."""
-    if trajectory.action_source != "sent":
-        raise ValueError(
-            "physical replay requires recorded published arm targets ('sent')"
-        )
     if trajectory.num_frames <= 0:
         raise ValueError("physical replay trajectory is empty")
     arm_actions = np.asarray(trajectory.action_arm_joint)
@@ -310,7 +226,7 @@ def verify_replay_preflight(
 ) -> None:
     """Fail-closed validation immediately before spawning hardware workers.
 
-    Checks: recorded first measured state, hand-data availability, full arm/hand
+    Checks: recorded first measured state, full arm/hand
     command hard limits, the recorded-state-to-first-command transition, and
     every adjacent command pair for workspace bounds and collision
     (self-collision plus static obstacle boxes). Robot-table contact is
@@ -319,7 +235,6 @@ def verify_replay_preflight(
     enforced on the return-home path. Called once before worker startup; any
     rejection prevents hardware access entirely.
     """
-    require_hand_actions(trajectory)
     if not bool(runtime.policy.hand_enabled):
         raise ValueError("physical replay requires policy.hand_enabled=true")
     _verify_trajectory_input(trajectory)
@@ -331,14 +246,7 @@ def verify_replay_preflight(
         raise ValueError("physical replay first arm_qpos violates joint limits")
     arm_actions = _canonicalize_replay_arm_actions(trajectory, runtime)
     _validate_replay_hand_limits(modeled_hand, recorded_hand_start, runtime)
-    workspace = np.array(
-        [
-            [runtime.policy.workspace.x_min, runtime.policy.workspace.x_max],
-            [runtime.policy.workspace.y_min, runtime.policy.workspace.y_max],
-            [runtime.policy.workspace.z_min, runtime.policy.workspace.z_max],
-        ],
-        dtype=np.float64,
-    )
+    workspace = runtime.policy.workspace.as_array()
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(
             urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),

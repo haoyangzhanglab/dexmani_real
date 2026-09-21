@@ -15,12 +15,6 @@ import numpy as np
 
 from dexmani_real.robot.model import HAND_JOINT_SHAPE
 
-# Learned policy checkpoints run their forward/normalizer arithmetic in
-# float32, while the command path intentionally stores float64.  This narrow
-# allowance is only for canonicalizing that representation roundoff to the
-# operational endpoint; it is never applied to the mechanical/rated envelope.
-POLICY_HAND_ENDPOINT_ROUNDOFF_TOLERANCE_RAD = 1e-6
-
 
 def validate_hand_limit_nesting(
     command_lower: object,
@@ -113,44 +107,3 @@ def limit_hand_target_delta(
     if np.all(np.abs(target - measured) <= max_delta):
         return target.copy()
     return measured + np.clip(target - measured, -max_delta, max_delta)
-
-
-def canonicalize_policy_hand_endpoint_roundoff(
-    hand_cmd: object,
-    operational_lower: object,
-    operational_upper: object,
-    mechanical_lower: object,
-    mechanical_upper: object,
-) -> tuple[np.ndarray, bool]:
-    """Canonicalize only a learned policy's tiny operational-bound roundoff.
-
-    The learned-policy runtime converts float32 network outputs to float64
-    before its safety checks.  A value one or a few float32 ULPs beyond a
-    *narrower operational* limit is not a meaningful physical command.  This
-    helper maps it to the exact operational boundary, but first keeps the
-    mechanical envelope strict. Manual, teleoperation, and replay paths remain
-    reject-only through :func:`validate_hand_command_bounds`.
-    """
-    command = np.asarray(hand_cmd, dtype=np.float64)
-    op_lower = np.asarray(operational_lower, dtype=np.float64)
-    op_upper = np.asarray(operational_upper, dtype=np.float64)
-    mech_lower = np.asarray(mechanical_lower, dtype=np.float64)
-    mech_upper = np.asarray(mechanical_upper, dtype=np.float64)
-    if command.shape != HAND_JOINT_SHAPE:
-        raise ValueError(
-            f"hand policy endpoint must have shape {HAND_JOINT_SHAPE}, got {command.shape}"
-        )
-    if not np.all(np.isfinite(command)):
-        raise ValueError("hand policy endpoint must be finite")
-    if np.any(command < mech_lower) or np.any(command > mech_upper):
-        raise ValueError("hand policy endpoint violates rated mechanical joint limits")
-    canonical = command.copy()
-    lower_roundoff = (command < op_lower) & (
-        command >= op_lower - POLICY_HAND_ENDPOINT_ROUNDOFF_TOLERANCE_RAD
-    )
-    upper_roundoff = (command > op_upper) & (
-        command <= op_upper + POLICY_HAND_ENDPOINT_ROUNDOFF_TOLERANCE_RAD
-    )
-    canonical[lower_roundoff] = op_lower[lower_roundoff]
-    canonical[upper_roundoff] = op_upper[upper_roundoff]
-    return canonical, not np.array_equal(canonical, command)

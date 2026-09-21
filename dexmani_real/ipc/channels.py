@@ -525,8 +525,10 @@ def read_arm_state_dict(shared: "RuntimeChannels") -> "dict | None":
 def read_hand_state_dict(shared: "RuntimeChannels") -> "dict | None":
     """Read latest hand state from ring. Return dict of numpy arrays or None.
 
-    Fields include qpos/current/tactile data, freshness validity, board
-    telemetry, and the last hand command sequence accepted by the worker/SDK.
+    Fields: qpos, current, tactile_aggregate, tactile_aggregate_valid,
+    tactile_dense, tactile_dense_valid, connected, qpos_stale,
+    last_sdk_setpoint_accepted_monotonic_ns, source_monotonic_ns,
+    publish_monotonic_ns, state_valid.
     """
     data = read_hand_state(shared)
     if data is None:

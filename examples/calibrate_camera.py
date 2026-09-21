@@ -79,7 +79,6 @@ def main(argv: list[str] | None = None) -> int:
 
     return run_camera_calibration(
         runtime,
-        camera_serial=args.serial,
         hand_geometry=args.hand_geometry,
         aruco_config=aruco,
     )

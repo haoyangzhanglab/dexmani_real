@@ -66,18 +66,6 @@ def _fmt_keys(keys: tuple[str, ...]) -> str:
     return "".join(short.get(k, k.upper()) for k in keys)
 
 
-def _workspace(runtime: ExperimentConfig) -> np.ndarray:
-    bounds = runtime.policy.workspace
-    return np.array(
-        [
-            [bounds.x_min, bounds.x_max],
-            [bounds.y_min, bounds.y_max],
-            [bounds.z_min, bounds.z_max],
-        ],
-        dtype=np.float64,
-    )
-
-
 def _build_planner_and_gate(
     runtime: ExperimentConfig,
 ) -> tuple[XArm7MotionPlanner, Any]:
@@ -96,7 +84,7 @@ def _build_planner_and_gate(
         # reject intentional tabletop contact.
         table=None,
     )
-    planner.workspace_bounds = _workspace(runtime)
+    planner.workspace_bounds = runtime.policy.workspace.as_array()
     planner.set_hand_qpos(
         np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
     )
@@ -502,7 +490,6 @@ def _run_keyboard_home(
                 runtime,
                 publish_policy_heartbeat=False,
             ),
-            table_z_surface_m=float(runtime.arm.table_z_surface_m),
             current_qpos=current_qpos_rad,
             estop_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
             progress=lambda message: print(f"  {message}", flush=True),
@@ -628,7 +615,7 @@ def _run_control_loop(
 
     cfg = runtime.keyboard_teleop
     policy = runtime.policy
-    workspace = _workspace(runtime)
+    workspace = runtime.policy.workspace.as_array()
     current_qpos = np.asarray(state["qpos"], dtype=np.float64)
     previous_command, target_pos, target_quat = _keyboard_command_anchor(
         planner,

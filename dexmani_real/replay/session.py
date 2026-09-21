@@ -169,7 +169,6 @@ def _offer_return_home(
     replayer: EpisodeReplayer,
     runtime: ExperimentConfig,
     *,
-    hand_available: bool,
     health_check: Callable[[], str | None],
 ) -> tuple[ReplayStatus, str] | None:
     """Post-replay prompt: press H to return arm/hand to home, Q to exit."""
@@ -205,42 +204,41 @@ def _offer_return_home(
             if OperatorCommand.HOME not in signals:
                 continue
 
-            if hand_available:
-                hand_home = np.deg2rad(
-                    np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)
+            hand_home = np.deg2rad(
+                np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)
+            )
+            hand_accepted = publish_hand_home_and_wait_accepted(
+                shared,
+                hand_home,
+                command_lower_rad=np.asarray(
+                    runtime.hand.qpos_min_rad, dtype=np.float64
+                ),
+                command_upper_rad=np.asarray(
+                    runtime.hand.qpos_max_rad, dtype=np.float64
+                ),
+                mechanical_lower_rad=np.asarray(
+                    runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
+                ),
+                mechanical_upper_rad=np.asarray(
+                    runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
+                ),
+                hand_feedback_max_age_s=float(
+                    runtime.safety.heartbeat_timeouts["hand"]
+                ),
+                timeout_s=float(runtime.hand.home_command_ack_timeout_s),
+                heartbeat=False,
+                check_is_running=False,
+                verbose=True,
+                abort_requested=lambda: keyboard.estop_latched
+                or not keyboard.healthy,
+            )
+            if not hand_accepted:
+                logger.warning(
+                    "arm home cancelled because hand-home command was not accepted"
                 )
-                hand_accepted = publish_hand_home_and_wait_accepted(
-                    shared,
-                    hand_home,
-                    command_lower_rad=np.asarray(
-                        runtime.hand.qpos_min_rad, dtype=np.float64
-                    ),
-                    command_upper_rad=np.asarray(
-                        runtime.hand.qpos_max_rad, dtype=np.float64
-                    ),
-                    mechanical_lower_rad=np.asarray(
-                        runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
-                    ),
-                    mechanical_upper_rad=np.asarray(
-                        runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
-                    ),
-                    hand_feedback_max_age_s=float(
-                        runtime.safety.heartbeat_timeouts["hand"]
-                    ),
-                    timeout_s=float(runtime.hand.home_command_ack_timeout_s),
-                    heartbeat=False,
-                    check_is_running=False,
-                    verbose=True,
-                    abort_requested=lambda: keyboard.estop_latched
-                    or not keyboard.healthy,
-                )
-                if not hand_accepted:
-                    logger.warning(
-                        "arm home cancelled because hand-home command was not accepted"
-                    )
-                    continue
-                assert replayer.planner is not None
-                replayer.planner.set_hand_qpos(hand_home)
+                continue
+            assert replayer.planner is not None
+            replayer.planner.set_hand_qpos(hand_home)
 
             home_result = execute_arm_home(
                 shared,
@@ -250,7 +248,6 @@ def _offer_return_home(
                     runtime,
                     publish_policy_heartbeat=False,
                 ),
-                table_z_surface_m=float(runtime.arm.table_z_surface_m),
                 estop_requested=lambda: keyboard.estop_latched or not keyboard.healthy,
                 progress=lambda message: print(f"  {message}", flush=True),
             )
@@ -327,16 +324,14 @@ def replay_episode(
     replayer: EpisodeReplayer | None = None
     outcome = ReplayOutcome(ReplayStatus.REJECTED, reason="replay did not start")
     try:
-        hand_available = trajectory.has_hand
-        processes = [context.Process(name="arm", target=_arm_loop, args=(shared, runtime.arm))]
-        if hand_available:
-            processes.append(
-                context.Process(name="hand", target=_hand_loop, args=(
-                        shared,
-                        runtime.hand,
-                        float(runtime.policy.hand_disconnect_timeout_s),
-                    ))
-            )
+        processes = [
+            context.Process(name="arm", target=_arm_loop, args=(shared, runtime.arm)),
+            context.Process(
+                name="hand",
+                target=_hand_loop,
+                args=(shared, runtime.hand, float(runtime.policy.hand_disconnect_timeout_s)),
+            ),
+        ]
 
         require_transition(shared, SafetyState.DISARMED)
         for process in processes:
@@ -408,7 +403,6 @@ def replay_episode(
                         shared,
                         replayer,
                         runtime,
-                        hand_available=hand_available,
                         health_check=health_check,
                     )
                     if home_outcome is not None:

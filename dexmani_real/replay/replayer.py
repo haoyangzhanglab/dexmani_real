@@ -174,7 +174,6 @@ class EpisodeReplayer:
         self._replay_started = False
         self._status = ReplayStatus.COMPLETED
         self._reason = ""
-        self._hand_available = trajectory.has_hand
         self._frame_count = trajectory.num_frames
 
     def _make_planner(
@@ -203,14 +202,7 @@ class EpisodeReplayer:
         runtime_arm = self.runtime.arm
         runtime_hand = self.runtime.hand
         runtime_policy = self.runtime.policy
-        workspace = np.array(
-            [
-                [runtime_policy.workspace.x_min, runtime_policy.workspace.x_max],
-                [runtime_policy.workspace.y_min, runtime_policy.workspace.y_max],
-                [runtime_policy.workspace.z_min, runtime_policy.workspace.z_max],
-            ],
-            dtype=np.float64,
-        )
+        workspace = runtime_policy.workspace.as_array()
         replay_planner = self._make_planner(workspace, table=None)
         home_planner = self._make_planner(
             workspace,
@@ -255,7 +247,6 @@ class EpisodeReplayer:
     ) -> str | None:
         """Validate the live start state against the first replay command."""
         assert self._replay_planner is not None
-        assert self.traj.action_hand_joint is not None
         first_arm_cmd = wrap_nearest_equivalent(
             self.traj.action_arm_joint[0],
             np.asarray(arm_qpos, dtype=np.float64),
@@ -358,7 +349,6 @@ class EpisodeReplayer:
         arm_state, hand_state = feedback
 
         assert self._start_warmup_gate is not None
-        assert self.traj.action_hand_joint is not None
         print(
             "Warming up XHand from home toward the frame 0 hand target "
             f"({self._format_arm_start_deviation(arm_max_deg, arm_joint_index)}; "
@@ -463,7 +453,7 @@ class EpisodeReplayer:
             )
             if issue is not None:
                 return ReplayStatus.FAULT, issue
-            if self._hand_available and not hand_feedback_is_healthy(
+            if not hand_feedback_is_healthy(
                 read_hand_state_dict(self.shared),
                 float(self.runtime.safety.heartbeat_timeouts["hand"]),
             ):
@@ -597,11 +587,9 @@ class EpisodeReplayer:
         print(f"  Source: {self.traj.episode_path}")
         if self.traj.task_label:
             print(f"  Task:   {self.traj.task_label}")
-        print(f"  Hand:   {'ON' if self._hand_available else 'OFF'}")
         print("\nControl: Q=quit  ESC=emergency_stop\n")
 
-        has_hand = self._hand_available
-        self._recorder = ReplayRecorder(frame_count, has_hand=has_hand)
+        self._recorder = ReplayRecorder(frame_count)
         keyboard = KeyboardInput(
             estop_callback=lambda: setattr(self.shared.estop_request, "value", True)
         )
@@ -629,16 +617,12 @@ class EpisodeReplayer:
             ):
                 expires_ns = int(next_deadline_s * 1e9) + self.runtime.safety.dispatch_delay_ns
                 arm_cmd = self.traj.action_arm_joint[frame_idx].copy()
-                hand_cmd = None
-                if has_hand and self.traj.action_hand_joint is not None:
-                    hand_cmd = self.traj.action_hand_joint[frame_idx].copy()
+                hand_cmd = self.traj.action_hand_joint[frame_idx].copy()
                 # Replay only slots whose recording flag indicates a queued command.
-                send_this = self.traj.send_mask is None or bool(
-                    self.traj.send_mask[frame_idx]
-                )
+                send_this = bool(self.traj.send_mask[frame_idx])
                 if send_this and (
                     not np.all(np.isfinite(arm_cmd))
-                    or (hand_cmd is not None and not np.all(np.isfinite(hand_cmd)))
+                    or not np.all(np.isfinite(hand_cmd))
                 ):
                     self._fault(
                         f"frame {frame_idx} contains a non-finite replay action"
@@ -671,19 +655,17 @@ class EpisodeReplayer:
                     break
 
                 error_count = 0
-                hand_qpos: np.ndarray | None = None
-                if has_hand:
-                    hand_state = read_hand_state_dict(self.shared)
-                    if not hand_feedback_is_healthy(
-                        hand_state,
-                        float(self.runtime.safety.heartbeat_timeouts["hand"]),
-                    ):
-                        self._fault(
-                            f"frame {frame_idx}: hand feedback is unavailable or unhealthy"
-                        )
-                        break
-                    assert hand_state is not None
-                    hand_qpos = hand_state["qpos"]
+                hand_state = read_hand_state_dict(self.shared)
+                if not hand_feedback_is_healthy(
+                    hand_state,
+                    float(self.runtime.safety.heartbeat_timeouts["hand"]),
+                ):
+                    self._fault(
+                        f"frame {frame_idx}: hand feedback is unavailable or unhealthy"
+                    )
+                    break
+                assert hand_state is not None
+                hand_qpos = hand_state["qpos"]
 
                 if not send_this:
                     # During recorded quiescence, observe but send nothing.
@@ -752,7 +734,7 @@ class EpisodeReplayer:
                         self.shared,
                         command=published.command,
                         wait_for_arm=True,
-                        wait_for_hand=candidate.hand_qpos is not None,
+                        wait_for_hand=True,
                         timeout_s=float(self.runtime.policy.action_apply_timeout_s),
                         arm_feedback_max_age_s=float(
                             self.runtime.safety.heartbeat_timeouts["arm"]
@@ -790,9 +772,9 @@ class EpisodeReplayer:
                         )
                     break
                 assert candidate.arm_qpos is not None
+                assert candidate.hand_qpos is not None
                 sent_arm_cmd = np.asarray(candidate.arm_qpos, dtype=np.float64)
-                if candidate.hand_qpos is not None:
-                    hand_cmd = np.asarray(candidate.hand_qpos, dtype=np.float64)
+                hand_cmd = np.asarray(candidate.hand_qpos, dtype=np.float64)
 
                 self._recorder.record(
                     frame_idx,

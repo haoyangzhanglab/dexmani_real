@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from dexmani_real.planning.kinematics.pose import quat_multiply
 from dexmani_real.teleop.control_loop.hand_control import (
     HandRetargetObservationCache,
     compute_hand_command,
@@ -55,20 +56,6 @@ def _normalize_quat(q: np.ndarray, *, name: str) -> np.ndarray:
     if norm < 1e-12:
         raise ValueError(f"{name} quaternion norm is too small")
     return value / norm
-
-
-def _quat_multiply(left: np.ndarray, right: np.ndarray) -> np.ndarray:
-    lw, lx, ly, lz = left
-    rw, rx, ry, rz = right
-    return np.array(
-        [
-            lw * rw - lx * rx - ly * ry - lz * rz,
-            lw * rx + lx * rw + ly * rz - lz * ry,
-            lw * ry - lx * rz + ly * rw + lz * rx,
-            lw * rz + lx * ry - ly * rx + lz * rw,
-        ],
-        dtype=np.float64,
-    )
 
 
 def _quat_to_rotvec(q: np.ndarray) -> np.ndarray:
@@ -130,7 +117,7 @@ def ema_smooth_pose(
     if float(np.dot(prev_quat, target_quat)) < 0.0:
         target_quat = -target_quat
     prev_conjugate = prev_quat * np.array([1.0, -1.0, -1.0, -1.0])
-    relative_quat = _normalize_quat(_quat_multiply(prev_conjugate, target_quat), name="relative")
+    relative_quat = _normalize_quat(quat_multiply(prev_conjugate, target_quat), name="relative")
     rv = alpha_rot * _quat_to_rotvec(relative_quat)
 
     angle = float(np.linalg.norm(rv))
@@ -142,7 +129,7 @@ def ema_smooth_pose(
         delta_quat = np.array(
             [np.cos(half), axis[0] * np.sin(half), axis[1] * np.sin(half), axis[2] * np.sin(half)], dtype=np.float64
         )
-        quat = _normalize_quat(_quat_multiply(prev_quat, delta_quat), name="smoothed")
+        quat = _normalize_quat(quat_multiply(prev_quat, delta_quat), name="smoothed")
 
     return pos, quat
 

@@ -29,10 +29,9 @@ python examples/collect_teleop.py --config experiment.yaml --print-config
 
 经常调整的 IP、serial、频率、相机尺寸、数据路径、task、控制参数留在实验配置。
 
-`safety.max_dispatch_delay_s` 默认 **0.1 秒（100 ms）**，是基于当前机器固定姿态
-派发测试选定的初始预算；运动 IK、大幅手部 slew 和高负载工况仍需验证。
+`safety.max_dispatch_delay_s` 默认 **0.1 秒（100 ms）**，限制命令到达执行时机后的最大延迟。
 支持 `--config` 的入口可在实验 YAML 中覆盖该值；必须为有限正秒数，
-显式设为 `null` 会在设备启动前拒绝运行。policy CLI 的配置限制见下文。
+显式设为 `null` 会在配置解析时拒绝。policy CLI 的配置限制见下文。
 该预算从每个 endpoint 的执行时机开始，覆盖准备、FIFO 等待和 XHand 最终目标 slew；
 FULL/CRC 重试不刷新 deadline。过期撤销该 generation，必须由操作者重新开始；
 keyboard/calibration jog 必须先释放按键。手部归位统一使用
@@ -46,10 +45,9 @@ keyboard/calibration jog 必须先释放按键。手部归位统一使用
 |---|---|---|
 | VR collection | `python examples/collect_teleop.py --config experiment.yaml --task-name <task> --operator <name>` | 真机；raw episode |
 | Keyboard jog / home | `python examples/keyboard_teleop.py --config experiment.yaml` | 真机 |
-| Fixed-pose dispatch timing | `python examples/measure_dispatch_timing.py --execute-hold --budget-s <seconds> --output /tmp/dispatch_timing.json` | 真机；保持初始姿态，JSON 耗时报告 |
 | Physical replay | `python examples/replay_episode.py <episode> --config experiment.yaml` | 真机；raw float64 sent targets |
 | Policy rollout | `python examples/run_policy.py <policy/task/experiment>` | 真机；rollout session |
-| Camera calibration | `python examples/calibrate_camera.py --config experiment.yaml --hand-geometry absent` | 真机；标定；仅适用于未安装 XHand |
+| Camera calibration | `python examples/calibrate_camera.py --config experiment.yaml --hand-geometry absent` | 真机；标定；需声明 XHand 物理状态 |
 | VR heading calibration | `python examples/calibrate_vr_heading.py` | VR / HTS；标定 |
 | Policy export | `python examples/export_policy_zarr.py episodes/<task> --dry-run` | 只读预检；移除 `--dry-run` 后导出 |
 | XHand diagnostics | `python examples/xhand_diagnostics.py` | 连接真机；读取 joints/tactile/identity，无运动 |
@@ -59,16 +57,6 @@ keyboard/calibration jog 必须先释放按键。手部归位统一使用
 `xhand_diagnostics.py` 没有离线 `--help`，执行该脚本会启动 SDK 诊断并连接/发现设备。
 相机标定的 `--hand-geometry` 是物理状态声明：未安装 XHand 才可用 `absent`；
 安装的手已物理固定在配置的 home 姿态时用 `secured-home`。两者均使用固定 home 手模型做碰撞检查。
-
-`measure_dispatch_timing.py` 默认测量 15 秒，只向 arm 下发初始实测关节角，
-XHand 提供真实姿态用于碰撞检查；`--hold-hand` 才同时下发手部保持指令。
-初始手部角度超出命令范围时，可加 `--clip-hand`，显式允许先裁剪再保持；
-这会产生手部运动，报告保留原始姿态、裁剪目标与裁剪量，发送前检查 arm/hand 过渡碰撞。
-重试时用 `--hand-target-report <previous.json>` 复用上次目标，避免反复从反馈重设目标。
-`--hand-tolerance-deg` 控制实测姿态相对初始到目标区间的观测余量，不修改命令或机械限位。
-`--budget-s` 是本次测试的有限截止预算，不会自动放宽或写回配置。
-`Q`/`S` 结束，`ESC` 急停；报告保留全部样本及缺失接受记录数。
-该测量使用当前姿态的 IK 和 SDK 返回时间，不代表运动目标 IK、手部大动作 slew 或物理停机延迟。
 
 ### Teleoperation / recording
 
@@ -93,8 +81,7 @@ recorder 进程自己 drain 最后一帧、关闭视频/HDF5 并发布结果；�
 ### Policy rollout
 
 当前 `run_policy.py` 没有 `--config`，直接读取 `config/defaults.py`。
-`safety.max_dispatch_delay_s` 当前默认 0.1 秒；policy 工作负载须单独完成
-commissioning，必要时在该配置源中调整预算。
+`safety.max_dispatch_delay_s` 默认 0.1 秒，可在该配置源中调整命令延迟预算。
 其他入口的 `--config experiment.yaml` 不会影响 policy CLI。
 
 ```bash
@@ -142,14 +129,9 @@ policy_eval 的同步、非均匀时序不能被静默解释成 fixed-dt teleop 
 转换和 fixed-rate replay 仍拒绝这种输入；需要 time-aware conversion 才能改变此限制。
 触觉 validity 必须保存，不能把传感器无效数据解释成零接触力。
 
-raw 当前只支持 v30。旧 v29 episode 可独立复制转换，不修改原始数据：
-
-```bash
-python examples/convert_raw_v29.py episodes_old/<task>/episode_x episodes/<task>/episode_x
-```
-
-转换只去掉旧命令 ID、重复行号、恒定 SOURCE 标记和恒定 sample-valid 标记，保留科学数据；
-输出路径必须不存在。运行时不维护旧 schema 分支。更早的格式使用相应历史版本代码离线处理。
+raw 当前只支持 v30；旧格式需使用相应历史版本代码离线处理。
+物理 replay 要求 xArm7 + XHand、`policy.hand_enabled=true` 和有效的 v30 数据；
+使用记录的 float64 arm sent targets、hand targets 与 queued 标记，不支持缺失 hand 数据的回放。
 
 ## 代码追踪与安全 owner
 
@@ -190,16 +172,14 @@ arm 与 hand 也不是物理事务。SDK acceptance 不等于物理收敛，尤�
 ## 离线检查
 
 ```bash
-python -m compileall -q dexmani_real examples tests
-python -m pytest -q -ra
-ruff check --select F401,F821,F822,F823 dexmani_real examples tests
+python -m compileall -q dexmani_real examples
+ruff check --select F401,F821,F822,F823 dexmani_real examples
 git diff --check
 ```
 
-在已有离线环境中提供 pytest、Ruff、媒体和运动学依赖，以及可导入的 `dexmani_policy`
-公共数据接口；不要为验证升级实验机全局环境。pytest 不应连接硬件。保留的重点是数值几何、转换、
-动作限制、deadline/revocation、录制边界和 public policy 数据接口。
-离线检查不启动真机、CUDA 或真实 checkpoint。
+仓库没有提交的测试目录。对改动的纯逻辑可运行一次性离线 smoke checks，重点包括数值几何、
+转换、动作限制和数据接口；不新增测试框架。Ruff 或依赖缺失时报告跳过，不为检查升级实验环境。
+离线检查不运行硬件入口，不启动真机、CUDA 或真实 checkpoint。
 
 ## 真机 commissioning（需单独授权，离线测试不代替）
 

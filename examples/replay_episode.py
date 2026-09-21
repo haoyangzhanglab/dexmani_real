@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Physically replay one recorded episode on xArm7 and optional XHand.
+"""Physically replay one raw-v30 episode on xArm7 and XHand.
 
 This is a hardware-affecting entry point and writes replay evaluation results.
 """
@@ -136,8 +136,6 @@ def main(argv: list[str] | None = None) -> int:
         f"Duration: {trajectory.num_frames / trajectory.fps:.1f}s"
     )
     print(f"  Task: {trajectory.task_label or '(none)'}")
-    print(f"  Hand action stream: {'yes' if trajectory.has_hand_actions else 'no'}")
-    print(f"  EE data: {'yes' if trajectory.arm_ee is not None else 'no'}")
     print(f"  Acc: {selection.acceleration_deg_s2:.0f}°/s²")
     print(f"  Joint speed: {selection.joint_speed_deg_s:.0f}°/s")
 

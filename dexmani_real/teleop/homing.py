@@ -109,7 +109,6 @@ def do_configured_teleop_home(
         _home_qpos,
         planner=planner,
         config=ArmHomeConfig.from_runtime(runtime, publish_policy_heartbeat=True),
-        table_z_surface_m=runtime.arm.table_z_surface_m,
         current_qpos=arm_qpos,
         estop_requested=estop_requested,
         progress=lambda message: print(f"  {message}", flush=True),

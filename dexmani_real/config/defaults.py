@@ -630,10 +630,6 @@ class PolicyParams:
 
     # Teleop endpoint shaping bound per control tick; this is not arm interpolation.
     teleop_arm_max_delta_rad_per_tick: float | None = np.deg2rad(8.0)
-    # Shared numerical slack for the reject-only endpoint-delta predicate.
-    # Keep this tiny: it admits producer round-off at the limit without
-    # weakening a materially oversized command.
-    endpoint_delta_tolerance_rad: float = 1e-12
 
     hand_enabled: bool = True
     hand_retargeting_type: str = "tag"
@@ -707,14 +703,6 @@ class PolicyParams:
         ):
             raise ValueError(
                 "teleop_arm_max_delta_rad_per_tick must be finite and > 0 or None"
-            )
-        if (
-            isinstance(self.endpoint_delta_tolerance_rad, bool)
-            or not np.isfinite(self.endpoint_delta_tolerance_rad)
-            or self.endpoint_delta_tolerance_rad < 0.0
-        ):
-            raise ValueError(
-                "endpoint_delta_tolerance_rad must be finite and non-negative"
             )
 
 
@@ -917,9 +905,8 @@ class VRParams:
 class SafetyParams:
     """Safety / heartbeat parameters — single source of truth."""
 
-    # 100 ms baseline: fixed-pose xArm/XHand tests observed <36 ms to SDK acceptance.
-    # Moving IK, larger hand slew and loaded runs still require timing validation.
-    max_dispatch_delay_s: float | None = 0.1
+    # Maximum lateness allowed after a command becomes eligible.
+    max_dispatch_delay_s: float = 0.1
 
     @property
     def dispatch_delay_ns(self) -> int:
@@ -960,8 +947,7 @@ class SafetyParams:
     supervisor_hz: float = 10.0
 
     def validate(self) -> None:
-        if self.max_dispatch_delay_s is not None:
-            _ = self.dispatch_delay_ns
+        _ = self.dispatch_delay_ns
         if not self.heartbeat_timeouts or any(
             not name or not np.isfinite(value) or value <= 0
             for name, value in self.heartbeat_timeouts.items()

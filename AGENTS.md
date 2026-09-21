@@ -47,17 +47,20 @@ compatibility branches. Use `dexmani_policy` public interfaces.
 
 ## Checks and handoff
 
-Start with relevant offline tests. Useful low-cost checks are:
+The repository intentionally has no committed `tests/` directory; do not restore it.
+Start with focused one-off offline smoke checks for changed pure logic. Do not add
+a committed test framework unless explicitly requested. Useful low-cost checks are:
 
 ```bash
 python -m compileall -q dexmani_real examples
+ruff check --select F401,F821,F822,F823 dexmani_real examples
 git diff --check
 ```
 
 Protect transforms, FK/IK, retargeting math, dataset conversion, clipping and real
-regressions. Delete tests that only preserve removed bookkeeping or internal APIs;
-do not delete tests to hide failures. Do not build a new test framework as part of
-simplification. Do not run hardware examples as tests.
+regressions with focused offline checks. If Ruff or another optional dependency is
+unavailable, report it rather than installing or upgrading the experiment
+environment. Never run hardware examples as tests.
 
 Inspect the final diff for dead imports, configuration, docs and terminology.
 Report measured changes, passing/failed/skipped checks and remaining limitations.

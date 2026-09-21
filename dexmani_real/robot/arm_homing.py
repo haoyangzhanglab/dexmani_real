@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.config.defaults import arm
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning.paths import (
     HomePathCandidate,
@@ -41,7 +40,6 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 _HOME_RESULT_POLL_S = 0.1
-_ARM_HEARTBEAT_MAX_AGE_S = 1.0
 _MIN_HOME_TIMEOUT_S = 10.0
 _HOME_TIMEOUT_PADDING_S = 5.0
 _RESULT_TIMEOUT_PADDING_S = 2.0
@@ -58,7 +56,6 @@ class ArmHomeStatus(str, Enum):
     INVALID_TARGET = "invalid_target"
     INVALID_CURRENT_STATE = "invalid_current_state"
     PREHOME_STATE_UNAVAILABLE = "prehome_state_unavailable"
-    PLANNER_UNAVAILABLE = "planner_unavailable"
     PLANNING_FAILED = "planning_failed"
     NO_SAFE_PATH = "no_safe_path"
     GENERATION_CHANGED = "generation_changed"
@@ -82,16 +79,18 @@ class ArmHomeResult:
 
 @dataclass(frozen=True)
 class ArmHomeConfig:
-    """Timing and convergence policy for one arm-home workflow."""
+    """Runtime-owned planning, timing, and convergence values for arm homing."""
 
-    request_queue_timeout_s: float = arm.homing.request_queue_timeout_s
-    prehome_timeout_s: float = arm.homing.convergence_timeout_s
-    state_max_age_s: float = arm.homing.state_max_age_s
-    max_speed_rad_s: float = np.deg2rad(arm.homing.max_speed_deg_s)
-    target_timeout_s: float = arm.homing.target_timeout_s
-    arm_heartbeat_max_age_s: float = _ARM_HEARTBEAT_MAX_AGE_S
-    stationary_velocity_rad_s: float = arm.homing.velocity_convergence_rad_s
-    result_tolerance_rad: float = arm.homing.convergence_rad
+    request_queue_timeout_s: float
+    prehome_timeout_s: float
+    state_max_age_s: float
+    max_speed_rad_s: float
+    target_timeout_s: float
+    arm_heartbeat_max_age_s: float
+    stationary_velocity_rad_s: float
+    result_tolerance_rad: float
+    table_z_surface_m: float
+    hand_safety_margin_m: float
     publish_policy_heartbeat: bool = True
 
     def __post_init__(self) -> None:
@@ -109,6 +108,10 @@ class ArmHomeConfig:
             value = float(getattr(self, field_name))
             if not np.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{field_name} must be finite and positive")
+        if not np.isfinite(self.table_z_surface_m):
+            raise ValueError("table_z_surface_m must be finite")
+        if not np.isfinite(self.hand_safety_margin_m) or self.hand_safety_margin_m < 0:
+            raise ValueError("hand_safety_margin_m must be finite and non-negative")
 
     @classmethod
     def from_runtime(
@@ -129,6 +132,8 @@ class ArmHomeConfig:
                 runtime.arm.homing.velocity_convergence_rad_s
             ),
             result_tolerance_rad=float(runtime.arm.homing.convergence_rad),
+            table_z_surface_m=float(runtime.arm.table_z_surface_m),
+            hand_safety_margin_m=float(runtime.arm.hand_safety_margin_m),
             publish_policy_heartbeat=publish_policy_heartbeat,
         )
 
@@ -186,8 +191,8 @@ def _arm_heartbeat_issue(
 def _estimate_home_timeout_s(
     waypoints: np.ndarray,
     *,
-    max_speed_rad_s: float = np.deg2rad(arm.homing.max_speed_deg_s),
-    target_timeout_s: float = arm.homing.target_timeout_s,
+    max_speed_rad_s: float,
+    target_timeout_s: float,
 ) -> float:
     """Deadline derived from milestone path length and feedback settle overhead."""
     if not np.isfinite(max_speed_rad_s) or max_speed_rad_s <= 0.0:
@@ -449,7 +454,7 @@ def _resolve_home_waypoints(
     home_qpos: np.ndarray,
     planner: XArm7MotionPlanner,
     *,
-    table_z_surface_m: float,
+    config: ArmHomeConfig,
     estop_requested: Callable[[], bool] | None,
     progress: Callable[[str], None] | None,
 ) -> tuple[np.ndarray | None, ArmHomeResult | None]:
@@ -459,7 +464,8 @@ def _resolve_home_waypoints(
             current_qpos,
             home_qpos,
             planner,
-            table_z_surface_m=table_z_surface_m,
+            table_z_surface_m=config.table_z_surface_m,
+            hand_safety_margin_m=config.hand_safety_margin_m,
             use_canonical_target=True,
         )
     except Exception as exc:
@@ -496,7 +502,8 @@ def _resolve_home_waypoints(
                 current_qpos,
                 home_qpos,
                 planner,
-                table_z_surface_m=table_z_surface_m,
+                table_z_surface_m=config.table_z_surface_m,
+                hand_safety_margin_m=config.hand_safety_margin_m,
                 use_canonical_target=False,
             )
         except Exception as exc:
@@ -549,7 +556,8 @@ def _resolve_home_waypoints(
                 wrapped_home,
                 home_qpos,
                 planner,
-                table_z_surface_m=table_z_surface_m,
+                table_z_surface_m=config.table_z_surface_m,
+                hand_safety_margin_m=config.hand_safety_margin_m,
             )
         except Exception as exc:
             logger.warning(
@@ -608,9 +616,8 @@ def execute_arm_home(
     shared: RuntimeChannels,
     home_qpos: np.ndarray,
     *,
-    planner: XArm7MotionPlanner | None,
+    planner: XArm7MotionPlanner,
     config: ArmHomeConfig,
-    table_z_surface_m: float = 0.0,
     current_qpos: np.ndarray | None = None,
     estop_requested: Callable[[], bool] | None = None,
     cancel_requested: Callable[[], bool] | None = None,
@@ -675,13 +682,6 @@ def execute_arm_home(
                 progress=progress,
                 operator_message="arm: invalid current qpos hint — homing cancelled",
             )
-    if planner is None:
-        return _home_failure(
-            ArmHomeStatus.PLANNER_UNAVAILABLE,
-            "collision planner is unavailable",
-            progress=progress,
-            operator_message="arm: no collision planner — homing cancelled",
-        )
 
     if not revoke_motion(shared, SafetyState.ARMED):
         return _home_failure(
@@ -733,7 +733,7 @@ def execute_arm_home(
         fresh_qpos,
         home_qpos,
         planner,
-        table_z_surface_m=table_z_surface_m,
+        config=config,
         estop_requested=estop_requested,
         progress=progress,
     )
@@ -819,14 +819,7 @@ def build_policy_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
     boxes), so the Main process builds its own.
     """
     policy = runtime.policy
-    workspace = np.array(
-        [
-            [policy.workspace.x_min, policy.workspace.x_max],
-            [policy.workspace.y_min, policy.workspace.y_max],
-            [policy.workspace.z_min, policy.workspace.z_max],
-        ],
-        dtype=np.float64,
-    )
+    workspace = policy.workspace.as_array()
     return XArm7MotionPlanner(
         XArm7PlannerConfig(
             urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
@@ -890,7 +883,6 @@ def home_policy_robot(
         np.asarray(runtime.arm.home_qpos, dtype=np.float64),
         planner=planner,
         config=ArmHomeConfig.from_runtime(runtime, publish_policy_heartbeat=False),
-        table_z_surface_m=float(runtime.arm.table_z_surface_m),
         # Only the physical e-stop path may latch ESTOP. Ordinary shutdown,
         # faults, and quit requests are already observed by execute_arm_home.
         estop_requested=lambda: bool(shared.estop_request.value),

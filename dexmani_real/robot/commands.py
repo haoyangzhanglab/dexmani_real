@@ -10,7 +10,6 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import policy as policy_defaults
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.ipc.command_stream import command_stream_capacity_locked
 from dexmani_real.ipc.schema import COUPLED_COMMAND_DTYPE
@@ -73,25 +72,12 @@ def _hand_joint_limit_detail(
     return f"hand_joint_limit:j{np.flatnonzero(outside)[0]}"
 
 
-def _joint_delta_limit_detail(
-    *,
-    target_rad: np.ndarray,
-    reference_rad: np.ndarray,
-    limit_rad: np.ndarray,
-    tolerance_rad: float,
-) -> str:
-    delta = np.abs(target_rad - reference_rad)
-    index = int(np.flatnonzero(delta > limit_rad + tolerance_rad)[0])
-    return f"hand_delta_limit:j{index}:{delta[index]:.3f}>{limit_rad[index]:.3f}"
-
-
 class GateRejectCode(str, Enum):
     """Stable machine-readable rejection reasons from :class:`SafetyGate`."""
 
     INVALID_TARGET = "invalid joint target"
     ARM_JOINT_LIMIT = "arm joint limit violation"
     HAND_JOINT_LIMIT = "hand joint limit violation"
-    HAND_DELTA_LIMIT = "hand per-tick delta limit violation"
     COLLISION_TRANSITION = "collision on arm/hand transition"
     COLLISION_CHECK_FAILED = "collision transition check failed"
     WORKSPACE = "workspace"
@@ -112,12 +98,7 @@ class GateResult:
 
 
 class SafetyGate:
-    """Fail-closed validation of physical limits, workspace, and collision.
-
-    The optional hand delta check rejects the whole coupled endpoint; learned
-    arm spike shaping belongs to its producer. ``endpoint_delta_tolerance_rad``
-    is numerical slack for the hand endpoint-delta predicate.
-    """
+    """Fail-closed validation of physical limits, workspace, and collision."""
 
     def __init__(
         self,
@@ -127,10 +108,6 @@ class SafetyGate:
         hand_joint_lower_rad: tuple[float, ...],
         hand_joint_upper_rad: tuple[float, ...],
         workspace_check: Callable[[np.ndarray, np.ndarray], bool] | None = None,
-        max_hand_delta_rad: Any = None,
-        endpoint_delta_tolerance_rad: float = (
-            policy_defaults.endpoint_delta_tolerance_rad
-        ),
         collision_check: (
             Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], bool] | None
         ) = None,
@@ -155,30 +132,7 @@ class SafetyGate:
         self.hand_low = hand_low
         self.hand_high = hand_high
         self.workspace_check = workspace_check
-        self.max_hand_delta_rad = self._coerce_delta(
-            max_hand_delta_rad, HAND_JOINT_SHAPE, "max_hand_delta_rad"
-        )
-        if (
-            isinstance(endpoint_delta_tolerance_rad, bool)
-            or not np.isfinite(endpoint_delta_tolerance_rad)
-            or endpoint_delta_tolerance_rad < 0.0
-        ):
-            raise ValueError(
-                "endpoint_delta_tolerance_rad must be finite and non-negative"
-            )
-        self.endpoint_delta_tolerance_rad = float(endpoint_delta_tolerance_rad)
         self.collision_check = collision_check
-
-    @staticmethod
-    def _coerce_delta(
-        value: Any, shape: tuple[int, ...], name: str
-    ) -> np.ndarray | None:
-        if value is None:
-            return None
-        arr = np.broadcast_to(np.asarray(value, dtype=np.float64), shape).copy()
-        if not np.all(np.isfinite(arr)) or np.any(arr <= 0.0):
-            raise ValueError(f"{name} must be finite and positive")
-        return arr
 
     def validate(
         self,
@@ -186,13 +140,10 @@ class SafetyGate:
         *,
         current_arm_qpos: np.ndarray,
         current_hand_qpos: np.ndarray | None = None,
-        hand_delta_reference_qpos: np.ndarray | None = None,
     ) -> GateResult:
         """Validate one candidate without modifying it or external state.
 
-        Workspace and collision transitions start at measured feedback. The
-        optional hand delta reference is the previous published target, so
-        actuator lag cannot become an unintended tracking-error gate.
+        Workspace and collision transitions start at measured feedback.
         """
         # Sensor readers own measured feedback; this gate admits outgoing targets.
         if candidate.arm_qpos is None and candidate.hand_qpos is None:
@@ -213,13 +164,9 @@ class SafetyGate:
         arm_end = arm_start.copy() if candidate.arm_qpos is None else candidate.arm_qpos
         hand_end = candidate.hand_qpos
         hand_start: np.ndarray | None = None
-        hand_delta_start: np.ndarray | None = None
         if hand_end is not None:
             assert current_hand_qpos is not None
             hand_start = current_hand_qpos
-            hand_delta_start = hand_start
-            if hand_delta_reference_qpos is not None:
-                hand_delta_start = hand_delta_reference_qpos
         if candidate.arm_qpos is not None and (
             np.any(arm_end < self.arm_low) or np.any(arm_end > self.arm_high)
         ):
@@ -233,25 +180,6 @@ class SafetyGate:
                 GateRejectCode.HAND_JOINT_LIMIT,
                 _hand_joint_limit_detail(hand_end, self.hand_low, self.hand_high),
             )
-        if (
-            self.max_hand_delta_rad is not None
-            and hand_end is not None
-            and hand_delta_start is not None
-        ):
-            if np.any(
-                np.abs(hand_end - hand_delta_start)
-                > self.max_hand_delta_rad + self.endpoint_delta_tolerance_rad
-            ):
-                return GateResult(
-                    False,
-                    GateRejectCode.HAND_DELTA_LIMIT,
-                    _joint_delta_limit_detail(
-                        target_rad=hand_end,
-                        reference_rad=hand_delta_start,
-                        limit_rad=self.max_hand_delta_rad,
-                        tolerance_rad=self.endpoint_delta_tolerance_rad,
-                    ),
-                )
         if self.workspace_check is not None and candidate.arm_qpos is not None:
             try:
                 if not self.workspace_check(arm_start, arm_end):
@@ -287,19 +215,13 @@ def planner_action_safety_gate(
     arm_joint_upper_rad: tuple[float, ...],
     hand_joint_lower_rad: tuple[float, ...],
     hand_joint_upper_rad: tuple[float, ...],
-    max_hand_delta_rad: Any = None,
-    endpoint_delta_tolerance_rad: float = (
-        policy_defaults.endpoint_delta_tolerance_rad
-    ),
     collision_check: (
         Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], bool] | None
     ) = None,
 ) -> SafetyGate:
     """Build a safety gate using the planner's segment workspace check.
 
-    ``max_hand_delta_rad`` / ``collision_check`` are opt-in; each caller enables
-    only the checks owned by its command path.
-    The endpoint tolerance defaults to the canonical policy runtime default.
+    Collision checking is enabled by the caller that owns the command path.
     """
     return SafetyGate(
         arm_joint_lower_rad=arm_joint_lower_rad,
@@ -307,8 +229,6 @@ def planner_action_safety_gate(
         hand_joint_lower_rad=hand_joint_lower_rad,
         hand_joint_upper_rad=hand_joint_upper_rad,
         workspace_check=planner.is_workspace_segment_safe,
-        max_hand_delta_rad=max_hand_delta_rad,
-        endpoint_delta_tolerance_rad=endpoint_delta_tolerance_rad,
         collision_check=collision_check,
     )
 
@@ -580,7 +500,6 @@ def prepare_joint_command(
     is_hold: bool = False,
     arm_feedback_max_age_s: float,
     hand_feedback_max_age_s: float,
-    hand_delta_reference_qpos: np.ndarray | None = None,
     feedback_snapshot: CommandFeedbackSnapshot | None = None,
 ) -> PreparedCommand:
     """Copy and check a target once; retry this snapshot unchanged after FIFO FULL.
@@ -638,7 +557,6 @@ def prepare_joint_command(
         candidate,
         current_arm_qpos=current_arm_qpos,
         current_hand_qpos=current_hand_qpos,
-        hand_delta_reference_qpos=hand_delta_reference_qpos,
     )
     if not gate_result.accepted:
         return PreparedCommand(
