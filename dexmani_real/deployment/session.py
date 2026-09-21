@@ -199,11 +199,14 @@ def _wait_for_rollout_recording(
             require_transition(shared, SafetyState.FAULT)
             return False
         finishing = int(shared.recorder_finish_deadline_ns.value)
-        if finishing > 0:
-            deadline = min(deadline, finishing)
+        finish_expired = (
+            finishing > 0 and time.monotonic_ns() >= finishing
+            and not shared.recorder_completed_ns.value
+        )
         if (
             len(owners) != 2
             or time.monotonic_ns() >= deadline
+            or finish_expired
             or shared.recorder_transport_failed.value
             or not all(p.is_alive() for p in owners)
         ):

@@ -264,6 +264,7 @@ class _FakeShared:
         self.record_sample_ring = _FakeRing(latest_sequence)
         self.recorder_consumed_sequence = _FakeValue(0)
         self.recorder_finish_deadline_ns = _FakeValue(0)
+        self.recorder_completed_ns = _FakeValue(0)
         self.recorder_transport_failed = _FakeValue(False)
         from queue import Queue
         self.record_result_q = Queue()

@@ -272,7 +272,8 @@ class RecorderClient:
     def poll_stop(self) -> RecorderStopResult:
         deadline = self._finish_deadline_ns or int(self.shared.recorder_finish_deadline_ns.value)
         if (self.shared.recorder_transport_failed.value
-                or (deadline > 0 and time.monotonic_ns() >= deadline)):
+                or (deadline > 0 and time.monotonic_ns() >= deadline
+                    and not 0 < self.shared.recorder_completed_ns.value < deadline)):
             if not self._unavailable:
                 self._fail_transport("recorder transport unavailable or finalization deadline expired")
             # A dead/terminated process may have corrupted a Queue lock. Never read it again.
@@ -299,7 +300,10 @@ class RecorderClient:
         return self._finish(event)
 
     def join_stop(self, timeout: float | None = None) -> RecorderStopResult:
-        if not self._stop_requested:
+        if not self._stop_requested and not (
+            self._recording and (self.shared.recorder_finish_deadline_ns.value
+                                 or self.shared.recorder_completed_ns.value)
+        ):
             if self._last_stop_result is None:
                 return RecorderStopResult(done=True)
             if self._last_stop_result.done and self._terminal_result_delivered:
@@ -315,10 +319,17 @@ class RecorderClient:
         deadline_ns = min(time.monotonic_ns() + int(timeout_s * 1e9),
                           self._finish_deadline_ns or int(self.shared.recorder_finish_deadline_ns.value)
                           or time.monotonic_ns() + int(RECORDER_STOP_TIMEOUT_S * 1e9))
-        while time.monotonic_ns() < deadline_ns:
+        # Poll once even when the caller arrives after the finish deadline.
+        # Completion permits bounded delivery time, never extra finalization time.
+        delivery_deadline_ns = time.monotonic_ns() + int(timeout_s * 1e9)
+        while True:
             result = self.poll_stop()
             if result.done or result.error:
                 return result
+            wait_deadline = (delivery_deadline_ns if self.shared.recorder_completed_ns.value
+                             else deadline_ns)
+            if time.monotonic_ns() >= wait_deadline:
+                break
             self.shared.set_heartbeat("policy", time.monotonic())
             time.sleep(_STOP_POLL_INTERVAL_S)
         self._fail_transport("recorder finalization timed out")

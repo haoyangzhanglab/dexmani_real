@@ -192,6 +192,7 @@ class RuntimeChannels:
     run_ended_monotonic_ns: Any
     run_ended_reason: Any
     recorder_finish_deadline_ns: Any  # recorder-owned; zero while idle
+    recorder_completed_ns: Any  # close completed before finish deadline; reset on START
     recorder_transport_failed: Any  # sticky; never reuse IPC after failure/death
     recorder_consumed_sequence: Any
     # Ordered command-FIFO consumption watermarks (one per attached worker
@@ -350,18 +351,24 @@ class RuntimeChannels:
         storage.run_ended_generation = ctx.Value("Q", 0)
         storage.run_ended_monotonic_ns = ctx.Value("Q", 0)
         storage.run_ended_reason = ctx.Value("i", 0)
+        # Recorder may be killed at any instruction. Its shared status accesses
+        # must not acquire mutexes also needed by surviving workers/monitor.
+        # Heartbeat/ready slots and consumed sequence have one writer; camera
+        # metadata is immutable after camera readiness. These status scalars
+        # need no compound transaction. Motion state keeps its existing locks.
         storage.recorder_finish_deadline_ns = ctx.Value("q", 0, lock=False)
         storage.recorder_transport_failed = ctx.Value("b", False, lock=False)
-        storage.recorder_consumed_sequence = ctx.Value("Q", 0)
+        storage.recorder_completed_ns = ctx.Value("q", 0, lock=False)
+        storage.recorder_consumed_sequence = ctx.Value("Q", 0, lock=False)
         storage.arm_cmd_consumed_sequence = ctx.Value("q", -1)
         storage.hand_cmd_consumed_sequence = ctx.Value("q", -1)
         storage.run_generation_base_sequence = ctx.Value("Q", 0)
 
-        storage.is_running = ctx.Value("b", True)
+        storage.is_running = ctx.Value("b", True, lock=False)
         storage.is_recording = ctx.Value("b", False)
         storage.error_state = ctx.Value("b", False)
         storage.session_failed = ctx.Value("b", False)
-        storage.evidence_failed = ctx.Value("b", False)
+        storage.evidence_failed = ctx.Value("b", False, lock=False)
         storage.estop_request = ctx.Value("b", False)
         storage.quit_requested = ctx.Value("b", False)
         storage.camera_requested = ctx.Value("b", cfg.camera_requested)
@@ -373,13 +380,13 @@ class RuntimeChannels:
         storage.safety_state = ctx.Value("i", DISARMED_SAFETY_STATE_WIRE_VALUE)
         storage.motion_lock = ctx.RLock()
 
-        storage.heartbeats = ctx.Array("d", [0.0] * len(HEARTBEAT_FIELDS))
+        storage.heartbeats = ctx.Array("d", [0.0] * len(HEARTBEAT_FIELDS), lock=False)
 
-        storage.ready_flags = ctx.Array("b", len(READY_FIELDS))
+        storage.ready_flags = ctx.Array("b", len(READY_FIELDS), lock=False)
 
-        storage.camera_depth_scale = ctx.Value("d", 0.0)
-        storage.camera_serial = ctx.Array("c", b"\x00" * 32)
-        storage.camera_geometry = ctx.Array("c", b"\x00" * 2048)
+        storage.camera_depth_scale = ctx.Value("d", 0.0, lock=False)
+        storage.camera_serial = ctx.Array("c", b"\x00" * 32, lock=False)
+        storage.camera_geometry = ctx.Array("c", b"\x00" * 2048, lock=False)
 
     def close(self) -> bool:
         """Release all shared memory primitives.
@@ -519,7 +526,7 @@ def read_hand_state_dict(shared: "RuntimeChannels") -> "dict | None":
     """Read latest hand state from ring. Return dict of numpy arrays or None.
 
     Fields include qpos/current/tactile data, freshness validity, board
-    telemetry, and the last hand action ID accepted by the worker/SDK.
+    telemetry, and the last hand command sequence accepted by the worker/SDK.
     """
     data = read_hand_state(shared)
     if data is None:

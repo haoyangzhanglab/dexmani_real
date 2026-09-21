@@ -96,7 +96,8 @@ def supervisor_exit_reason(
     service_heartbeat_timeout = bool(shared.recorder_transport_failed.value)
     for name, timeout in heartbeat_timeouts_s.items():
         if name == "recorder" and shared.recorder_finish_deadline_ns.value:
-            if time.monotonic_ns() >= int(shared.recorder_finish_deadline_ns.value):
+            if (time.monotonic_ns() >= int(shared.recorder_finish_deadline_ns.value)
+                    and not shared.recorder_completed_ns.value):
                 shared.recorder_transport_failed.value = True
                 service_heartbeat_timeout = True
             continue

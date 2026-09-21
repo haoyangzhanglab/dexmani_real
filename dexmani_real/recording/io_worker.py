@@ -192,6 +192,7 @@ class _RecorderIOSession:
         if self.fatal or self.recorder.is_recording:
             raise RuntimeError("START while previous recording is active")
         self.shared.recorder_finish_deadline_ns.value = 0
+        self.shared.recorder_completed_ns.value = 0
         try:
             if (
                 control.start_sequence
@@ -263,12 +264,16 @@ class _RecorderIOSession:
         if not self.recorder.resources_released:
             self.fatal = True
             raise RuntimeError("episode retained unreleased resources")
-        if time.monotonic_ns() >= deadline or self.shared.recorder_transport_failed.value:
+        completed_ns = time.monotonic_ns()
+        if completed_ns >= deadline or self.shared.recorder_transport_failed.value:
             self.fatal = True
             raise RuntimeError("episode finalization deadline/transport failed")
         # Refresh before returning to normal heartbeat supervision, even if the
         # sole result consumer receives this message before our next loop tick.
         self.shared.set_heartbeat("recorder", time.monotonic())
+        # This fact precedes Queue delivery: a late consumer must not expire an
+        # already completed close while the feeder is delivering its sole result.
+        self.shared.recorder_completed_ns.value = completed_ns
         self._send_result(RecordingFinished(
             saved=published and not error, path=path, frame_count=frame_count,
             reason=reason, error=error or None, min_frames_met=frame_count >= self.config.min_frames,
