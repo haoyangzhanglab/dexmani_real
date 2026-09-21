@@ -159,7 +159,7 @@ def _prepare_joint_candidate(
 class _PendingTeleopPublish:
     """One prepared-but-uncommitted teleop command and its recording context.
 
-    FULL backpressure keeps this exact candidate (same action ID and targets)
+    FULL backpressure keeps this exact candidate (same targets, generation and deadline)
     across grid ticks without rebuilding or re-solving IK; a lifecycle
     revocation drops it visibly instead of sending stale human intent after a
     fresh re-anchor.
@@ -789,7 +789,7 @@ def _commit_pending_command(
 
     Returns whether the teleop loop keeps running. Success advances the
     proposal references and records this tick's command row; FULL keeps the
-    identical candidate (same action ID/targets) for the next grid tick and
+    identical candidate (same targets/generation/deadline) for the next grid tick and
     records an honest held row (``action_queued=False``) instead of claiming a
     send; lifecycle revocation drops the candidate and the pause machinery
     owns the silent boundary.

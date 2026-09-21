@@ -9,7 +9,7 @@ from types import SimpleNamespace
 class _TeleopRecordingHarness:
     """Real controller, client and recorder; synthetic inputs and temporary media."""
 
-    def __init__(self, case, *, max_frames=100):
+    def __init__(self, case, *, max_frames=100, hand_enabled=False):
         import tempfile
         from pathlib import Path
         from queue import Queue
@@ -78,7 +78,8 @@ class _TeleopRecordingHarness:
 
         self.shared.record_control_q = ControlQueue()
         self.client = RecorderClient(self.shared)
-        runtime = resolve_experiment_config(cli_overrides={"policy.hand_enabled": False})
+        runtime = resolve_experiment_config(cli_overrides={
+            "policy.hand_enabled": hand_enabled, "safety.max_dispatch_delay_s": 0.1})
         self.config = TeleopConfig(runtime=runtime)
 
         def cleanup_writer():
@@ -152,10 +153,15 @@ class _TeleopRecordingHarness:
                                    arm_feedback_error_count=0, hand_disconnected_at_s=None,
                                    pause_reason=None, pause_released=True, keep_running=True)
 
+        from dexmani_real.ipc.schema import HAND_STATE_DTYPE
+        hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
+        hand["connected"] = hand["state_valid"] = True
+        hand["source_monotonic_ns"] = int(self.now * 1e9)
         patches = dict(
+            _build_hand_retargeter=mock.Mock(),
             _load_control_resources=mock.Mock(return_value=(mock.Mock(), mock.Mock(), mock.Mock(), self.client)),
             _start_keyboard=mock.Mock(return_value=keyboard), AudioFeedback=mock.Mock(),
-            read_arm_state_causal=mock.Mock(return_value=arm), read_hand_state_causal=mock.Mock(return_value=None),
+            read_arm_state_causal=mock.Mock(return_value=arm), read_hand_state_causal=mock.Mock(return_value=hand if self.config.runtime.policy.hand_enabled else None),
             read_vr_frame_causal=lambda *a: {"recv_ts_ns": int(self.now * 1e9),
                                            "wrist_pos": np.zeros(3), "wrist_quat_wxyz": np.array([1., 0., 0., 0.])},
             LoopRate=mock.Mock(return_value=Rate()), time=clock,
@@ -506,3 +512,93 @@ class TeleopFinalizationFailureTest(unittest.TestCase):
         self.assertFalse(h.shared.error_state.value)
         self.assertEqual(h.client._finish_deadline_ns, deadline[0])
         self.assertEqual(len([m for m in h.messages if m.__class__.__name__ == 'StopRecording']), 1)
+
+
+class StartupHandHomeClassificationTest(unittest.TestCase):
+    def test_expiry_revokes_once_and_requires_new_begin_to_retry(self):
+        from unittest.mock import patch
+        from dexmani_real.robot.commands import publish_command
+        from dexmani_real.runtime.operator_input import OperatorCommand as Command
+        from dexmani_real.runtime.safety import SafetyState
+        h = _TeleopRecordingHarness(self, hand_enabled=True)
+        generation = h.shared.run_generation.value
+        attempts = []
+
+        def expire(shared, candidate, **kwargs):
+            attempts.append(candidate)
+            with patch("dexmani_real.runtime.safety.time.monotonic_ns",
+                       return_value=candidate.expires_monotonic_ns):
+                return publish_command(shared, candidate, **kwargs)
+
+        def assert_waiting(h):
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(h.shared.run_generation.value, generation + 1)
+            self.assertEqual(h.shared.safety_state.value, SafetyState.ARMED)
+            self.assertFalse(h.shared.error_state.value)
+            self.assertTrue(h.shared.stop_request.value)
+            self.assertEqual(h.starts, 0)
+
+        with patch("dexmani_real.robot.hand_homing.read_hand_feedback",
+                   return_value=(object(), "", None)), \
+             patch("dexmani_real.robot.hand_homing.publish_command", side_effect=expire):
+            h.run([lambda h: None, assert_waiting, assert_waiting,
+                   lambda h: setattr(h, "controls", [Command.STOP, Command.BEGIN]),
+                   lambda h: self.assertEqual(len(attempts), 1),
+                   lambda h: setattr(h, "controls", [Command.BEGIN]),
+                   lambda h: None, lambda h: None])
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(h.shared.run_generation.value, generation + 3)
+        self.assertFalse(h.shared.error_state.value)
+        self.assertNotEqual(h.shared.safety_state.value, SafetyState.FAULT)
+        self.assertEqual(h.starts, 0)
+
+    def test_invalid_feedback_keeps_startup_fault_path(self):
+        from unittest.mock import patch
+        from dexmani_real.runtime.safety import SafetyState
+        h = _TeleopRecordingHarness(self, hand_enabled=True)
+        with patch("dexmani_real.robot.hand_homing.read_hand_feedback",
+                   return_value=(None, "hand disconnected", None)):
+            h.run([lambda h: None])
+        self.assertTrue(h.shared.error_state.value)
+        self.assertEqual(h.shared.safety_state.value, SafetyState.FAULT)
+        self.assertEqual(h.starts, 0)
+
+
+    def test_operator_stop_during_startup_is_cancelled_without_publish(self):
+        from unittest.mock import patch
+        from dexmani_real.runtime.operator_input import OperatorCommand as Command
+        from dexmani_real.runtime.safety import SafetyState
+        h = _TeleopRecordingHarness(self, hand_enabled=True)
+        generation = h.shared.run_generation.value
+        with patch("dexmani_real.robot.hand_homing.publish_command") as publish:
+            h.run([lambda h: setattr(h, "controls", [Command.STOP]),
+                   lambda h: None, lambda h: None])
+        publish.assert_not_called()
+        self.assertGreater(h.shared.run_generation.value, generation)
+        self.assertFalse(h.shared.error_state.value)
+        self.assertEqual(h.shared.safety_state.value, SafetyState.ARMED)
+
+    def test_previous_expiry_stop_flag_cannot_hide_real_feedback_failure(self):
+        from unittest.mock import patch
+        from dexmani_real.runtime.safety import SafetyState
+        h = _TeleopRecordingHarness(self, hand_enabled=True)
+        h.shared.stop_request.value = 1
+        with patch("dexmani_real.robot.hand_homing.read_hand_feedback",
+                   return_value=(None, "invalid feedback", None)):
+            h.run([lambda h: None])
+        self.assertTrue(h.shared.error_state.value)
+        self.assertEqual(h.shared.safety_state.value, SafetyState.FAULT)
+
+
+    def test_sdk_error_takes_priority_over_concurrent_revocation(self):
+        from unittest.mock import patch
+        from dexmani_real.runtime.safety import SafetyState, revoke_motion
+        h = _TeleopRecordingHarness(self, hand_enabled=True)
+        def sdk_failure(shared, *args, **kwargs):
+            revoke_motion(shared)
+            shared.error_state.value = True
+            return False
+        with patch("dexmani_real.teleop.loop.initialize_hand_home", side_effect=sdk_failure):
+            h.run([lambda h: None])
+        self.assertTrue(h.shared.error_state.value)
+        self.assertEqual(h.shared.safety_state.value, SafetyState.FAULT)

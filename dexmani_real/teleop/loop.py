@@ -42,6 +42,7 @@ from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.safety import (
     SafetyState,
     invalidate_coupled_commands,
+    revoke_motion_if_generation,
     transition,
 )
 from dexmani_real.teleop.audio_feedback import AudioFeedback
@@ -403,6 +404,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
     current_grid_anchor_ns = next_grid_ns
     pending_controls: list[OperatorCommand] = []
     startup_hand_home_pending = bool(cfg.runtime.policy.hand_enabled)
+    startup_hand_home_retry_required = False
     validate_warn = ThrottledWarner(interval_s=_VALIDATION_WARN_INTERVAL_S)
     arm_feedback_warn = ThrottledWarner(interval_s=_ARM_FEEDBACK_WARN_INTERVAL_S)
     grid_overrun_warn = ThrottledWarner(interval_s=_VALIDATION_WARN_INTERVAL_S)
@@ -640,17 +642,43 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 # continues its heartbeat until parent shutdown clears is_running.
                 continue
 
-            if startup_hand_home_pending and int(shared.safety_state.value) == int(
-                SafetyState.ARMED
-            ):
+            if (startup_hand_home_pending and not startup_hand_home_retry_required
+                    and int(shared.safety_state.value) == int(SafetyState.ARMED)):
+                home_generation = int(shared.run_generation.value)
+
+                def startup_home_abort_requested() -> bool:
+                    # Home waits for acceptance; keep S/Q observable in that wait.
+                    controls = kb.poll(timeout=0.0)
+                    pending_controls.extend(controls)
+                    if any(control in (OperatorCommand.STOP, OperatorCommand.DISCARD,
+                                       OperatorCommand.QUIT) for control in controls):
+                        revoke_motion_if_generation(shared, home_generation)
+                        return True
+                    return sigterm_requested or kb.estop_latched or not kb.healthy
+
                 if not initialize_hand_home(
                     shared,
                     cfg.runtime,
                     heartbeat=True,
-                    abort_requested=lambda: (
-                        sigterm_requested or kb.estop_latched or not kb.healthy
-                    ),
+                    abort_requested=startup_home_abort_requested,
                 ):
+                    cancelled = (
+                        int(shared.run_generation.value) != home_generation
+                        or not shared.is_running.value
+                        or shared.quit_requested.value
+                        or sigterm_requested
+                    )
+                    if (cancelled and not shared.error_state.value
+                            and not shared.estop_request.value
+                            and int(shared.safety_state.value) != int(SafetyState.FAULT)):
+                        # Keep the revoked generation. Only a fresh B can ask
+                        # for another startup home; an old queued B is discarded.
+                        startup_hand_home_retry_required = True
+                        pending_controls[:] = [control for control in pending_controls
+                                               if control is not OperatorCommand.BEGIN]
+                        kb.drain_signal(OperatorCommand.BEGIN)
+                        logger.info("startup hand home cancelled; press B to retry")
+                        continue
                     shared.error_state.value = True
                     _transition_or_fault(shared, SafetyState.FAULT, "startup hand home")
                     break
@@ -735,6 +763,10 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             for control in controls:
                 _note_recorder_transport_failure(shared, recorder, context="operator control")
                 if startup_hand_home_pending and control is OperatorCommand.BEGIN:
+                    if not any(item in (OperatorCommand.STOP, OperatorCommand.DISCARD,
+                                        OperatorCommand.QUIT, OperatorCommand.EMERGENCY_STOP)
+                               for item in controls):
+                        startup_hand_home_retry_required = False
                     continue
                 if reject_revoked_run() and control is OperatorCommand.BEGIN:
                     continue
