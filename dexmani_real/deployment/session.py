@@ -706,8 +706,8 @@ def run_operator_control(
     Q -> ``quit_requested``, ESC -> ``estop_request``. S/Q/ESC fire as
     immediate callbacks so they stay responsive while this thread blocks in
     H. H is enabled only when a caller supplies a home planner. The thread
-    exits when *stop_event* is set, when the runtime stops, or after a
-    terminal Q/ESC. C/D belong to teleop (PAUSE/DISCARD); policy deployment
+    exits when *stop_event* is set, when the runtime stops, or on ESC.
+    Q keeps the listener alive through file finalization. C/D belong to teleop (PAUSE/DISCARD); policy deployment
     ignores them with a warning and assigns no task meaning to any key —
     task success is judged offline from the saved raw episode.
     """

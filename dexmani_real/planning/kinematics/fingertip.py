@@ -19,6 +19,7 @@ from dexmani_real.planning.kinematics.pose import (
     rot6d_to_quat_wxyz,
 )
 
+# Public dexmani_policy metadata vocabulary; this does not name a storage format.
 FINGERTIP_POINTS_DERIVATION = "fk_from_processed_joint_state"
 FINGERTIP_POLICY_ID = "arm_hand_fk_from_joint_state_v1"
 

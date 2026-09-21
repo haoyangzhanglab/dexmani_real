@@ -18,8 +18,7 @@ from .pose import Pose, compose_pose, compute_pose_error, invert_pose, quat_wxyz
 
 _ARM_FK_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)
 
-# Persisted identity of the canonical EEF observation.  Train-time (processed
-# HDF5) and deploy-time derivation must both resolve to these constants.
+# Persisted EEF identity shared by raw-to-policy conversion and deployment.
 EEF_POSE_FRAME = "xarm_base"
 EEF_POSE_COMPONENTS = "position_m(3)+rot6d(6)"
 EEF_POSE_DERIVATION = "canonical_arm_fk_from_aligned_qpos"
@@ -90,7 +89,7 @@ def compute_eef_pose_history_xarm_base(
 ) -> np.ndarray:
     """Return finite ``[T,9]`` position+rot6d poses from aligned arm qpos.
 
-    Shared canonical EEF history helper for the processed dataset writer and
+    Shared canonical EEF history helper for policy dataset conversion and
     deployment observation assembly: exactly one ``ArmFK.compute()`` per
     timestep, reusing its rot6d without a second rotation conversion.  The
     result is float64; callers cast to float32 at their storage/model

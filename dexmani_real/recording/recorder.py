@@ -205,7 +205,7 @@ class EpisodeRecorder:
     ) -> bool:
         """Open one episode transaction.
 
-        ``episode_name=None`` keeps the historical timestamp naming with a
+        ``episode_name=None`` uses timestamp naming with a
         same-second dedup suffix.  An explicit name selects the exact published
         directory; an existing final or temporary directory with that name is
         refused loudly (raised) instead of overwritten or silently renamed, so

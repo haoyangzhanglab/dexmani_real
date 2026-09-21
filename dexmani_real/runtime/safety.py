@@ -253,8 +253,8 @@ def _committed_command_is_current_locked(
 ) -> bool:
     """Return whether *command*'s generation still owns motion.
 
-    The ordered FIFO has no latest-wins slot: a committed record stays valid
-    for its whole epoch, so currency is exactly generation currency.
+    This checks cancellation identity only. Publication and the worker SDK
+    fence separately enforce the transported command deadline.
     """
     permit = _read_motion_permit_locked(shared)
     return bool(

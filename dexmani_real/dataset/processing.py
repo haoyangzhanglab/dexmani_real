@@ -62,7 +62,7 @@ from dexmani_real.sensor.pointcloud import (
 
 @contextmanager
 def _open_processing_episode(episode: Path):
-    """Read current raw only; historical v26 stays frozen (reprocess via old revision)."""
+    """Read the current raw schema without modifying the source."""
     with h5py.File(episode / "data.h5", "r") as source:
         version = int(source["meta"].attrs["schema_version"])
     if version != EPISODE_SCHEMA_VERSION:

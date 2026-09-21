@@ -7,7 +7,7 @@ import time
 from types import SimpleNamespace
 
 class _TeleopRecordingHarness:
-    """Real controller, client and finalizer; synthetic inputs and temporary media."""
+    """Real controller, client and recorder; synthetic inputs and temporary media."""
 
     def __init__(self, case, *, max_frames=100):
         import tempfile
@@ -424,13 +424,13 @@ class TeleopCapacityOwnershipTest(unittest.TestCase):
         begin = lambda h: setattr(h, "controls", [Command.BEGIN])
         stop = lambda h: setattr(h, "controls", [Command.STOP])
         entered, release = threading.Event(), threading.Event()
-        def capacity_with_active_finalizer(h):
+        def capacity_while_recorder_closes(h):
             h.add_rows()
             close = h.recorder._camera_writer.close
             def blocked_close(*args, **kwargs):
                 entered.set()
                 if not release.wait(5):
-                    raise RuntimeError("test did not release finalizer")
+                    raise RuntimeError("test did not release recorder close")
                 return close(*args, **kwargs)
             patch = mock.patch.object(h.recorder._camera_writer, "close", side_effect=blocked_close)
             patch.start()
@@ -443,7 +443,7 @@ class TeleopCapacityOwnershipTest(unittest.TestCase):
             h.finalize()
         try:
             with self.assertLogs("dexmani_real", level="INFO") as logs:
-                h.run([begin, capacity_with_active_finalizer, begin, lambda h: None,
+                h.run([begin, capacity_while_recorder_closes, begin, lambda h: None,
                        finish, lambda h: None, stop,
                        begin, lambda h: h.add_rows(1), stop, lambda h: h.finalize(), lambda h: None])
         finally:

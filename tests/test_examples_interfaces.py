@@ -225,7 +225,7 @@ class StaticEntryCheckTest(unittest.TestCase):
             "visualize_episode",
             "pointcloud_process_example",
             "realsense_record_example",
-            "xhand_control_example",
+            "xhand_diagnostics",
         ):
             with self.subTest(example=name):
                 source = (_EXAMPLES / f"{name}.py").read_text(encoding="utf-8")
