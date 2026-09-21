@@ -17,6 +17,7 @@ reporting false passes.
 from __future__ import annotations
 
 import unittest
+import time
 from collections import deque
 from types import SimpleNamespace
 
@@ -285,7 +286,7 @@ class FullRetryKeepsCandidateTest(unittest.TestCase):
         from dexmani_real.robot.commands import PublishResult
 
         runner = PolicyRunner.__new__(PolicyRunner)
-        candidate = ActionCandidate(
+        candidate = ActionCandidate(expires_monotonic_ns=time.monotonic_ns() + 10_000_000_000,
             run_generation=7, arm_qpos=np.full(7, 0.1)
         )
         runner._pending_dispatch = candidate
@@ -302,7 +303,7 @@ class FullRetryKeepsCandidateTest(unittest.TestCase):
             False, reason="command fifo full", fifo_depth=8
         )
         with mock.patch.object(executor_module, "publish_command", return_value=full):
-            runner._dispatch_action(np.array([0.5]))
+            runner._dispatch_action(np.array([0.5]), eligible_ns=time.monotonic_ns())
 
         runner._prepare_dispatch_candidate.assert_not_called()
         self.assertIs(runner._pending_dispatch, candidate)
@@ -356,7 +357,7 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
         from dexmani_real.robot.commands import SafetyGate
         from dexmani_real.runtime.safety import SafetyState
         from test_deployment_evidence import _fake_shared
-        runtime = resolve_experiment_config()
+        runtime = resolve_experiment_config(cli_overrides={"safety.max_dispatch_delay_s": 1.0})
         runner = PolicyRunner.__new__(PolicyRunner)
         runner.runtime = runtime
         runner.shared = _fake_shared(safety_state=SafetyState.RUNNING)
@@ -392,6 +393,17 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
         runner.actions = deque([action])
         return runner, action, feedback, arm, hand
 
+    def test_preparation_cannot_refresh_a_delayed_scheduled_intent(self):
+        from unittest import mock
+        import dexmani_real.deployment.runner as executor
+        runner, action, feedback, _, _ = self._runner_and_action()
+        eligible = time.monotonic_ns() - 2_000_000_000
+        with mock.patch.object(executor, "read_command_feedback", return_value=(feedback, "", None)):
+            candidate = runner._prepare_dispatch_candidate(action, eligible_ns=eligible)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.expires_monotonic_ns, eligible + runner.runtime.safety.dispatch_delay_ns)
+        self.assertLess(candidate.expires_monotonic_ns, time.monotonic_ns())
+
     def test_real_candidate_logs_one_combined_line_and_preserves_values(self):
         from unittest import mock
         import dexmani_real.deployment.runner as executor
@@ -404,7 +416,7 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
                     with mock.patch.object(executor, "read_command_feedback", return_value=(feedback, "", None)):
                         context = self.assertLogs(executor.logger.name, level="INFO") if arm_clip or hand_clip else self.assertNoLogs(executor.logger.name, level="INFO")
                         with context as logs:
-                            candidate = runner._prepare_dispatch_candidate(action)
+                            candidate = runner._prepare_dispatch_candidate(action, eligible_ns=time.monotonic_ns())
                     self.assertIsNotNone(candidate)
                     runner._session_failure.assert_not_called()
                     np.testing.assert_array_equal(action, original)
@@ -430,7 +442,7 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
         runner, action, feedback, _, hand = self._runner_and_action(hand_clip=True, tiny=True)
         with mock.patch.object(executor, "read_command_feedback", return_value=(feedback, "", None)):
             with self.assertLogs(executor.logger.name, level="INFO") as logs:
-                candidate = runner._prepare_dispatch_candidate(action)
+                candidate = runner._prepare_dispatch_candidate(action, eligible_ns=time.monotonic_ns())
         line, = [line for line in logs.output if "[CLIP]" in line]
         magnitude = float(line.split("hand_max_correction_rad=")[1].split()[0])
         self.assertGreater(magnitude, 0.)
@@ -449,7 +461,7 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
              mock.patch.object(executor, "publish_command", side_effect=results) as publish:
             with self.assertLogs(executor.logger.name, level="INFO") as logs:
                 for index in range(4):
-                    runner._dispatch_action(action)
+                    runner._dispatch_action(action, eligible_ns=time.monotonic_ns())
                     if index < 3:
                         self.assertIsNone(runner.last_publication_ns)
         self.assertEqual(project.call_count, 1)
@@ -474,7 +486,7 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
                         action[-1] = np.nan
                     with mock.patch.object(executor, "read_command_feedback", return_value=(feedback, "", None)):
                         with self.assertNoLogs(executor.logger.name, level="INFO"):
-                            self.assertIsNone(runner._prepare_dispatch_candidate(action))
+                            self.assertIsNone(runner._prepare_dispatch_candidate(action, eligible_ns=time.monotonic_ns()))
                     runner._session_failure.assert_called_once()
                     self.assertIn("projection invariant violation", runner._session_failure.call_args.args[0])
 

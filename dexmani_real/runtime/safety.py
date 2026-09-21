@@ -11,6 +11,7 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
+PUBLISH_REASON_EXPIRED = "command dispatch deadline expired"
 PUBLISH_REASON_RUNTIME_STOPPED = "runtime stopped"
 PUBLISH_REASON_ESTOP = "e-stop requested"
 PUBLISH_REASON_FAULT = "sticky fault"
@@ -52,6 +53,7 @@ class RunEndReason(IntEnum):
     ESTOP = 6
     HARDWARE_FAULT = 7
     RUNTIME_SHUTDOWN = 8
+    COMMAND_EXPIRED = 9
 
 
 _ALLOWED_TRANSITIONS = frozenset(
@@ -86,9 +88,8 @@ class CommittedCommand:
     """Commit receipt of one coherent record in the ordered command FIFO.
 
     The receipt identifies the record for explicit acceptance waits and
-    lifecycle cancellation. It carries no delivery lease: the record stays
-    valid until its run generation is revoked, and workers consume it in
-    commit order.
+    lifecycle cancellation. Workers consume it in commit order while its generation and
+    transported deadline still permit admission.
     """
 
     run_generation: int
@@ -272,28 +273,34 @@ def coupled_command_is_current(
         return _committed_command_is_current_locked(shared, command)
 
 
-def coupled_command_may_cross_sdk(
-    shared: Any,
-    *,
-    run_generation: int,
-) -> bool:
-    """Return whether a record of *run_generation* may cross an actuator SDK
-    boundary right now.
+def _expire_command_locked(shared: Any, generation: int, expires_ns: int) -> bool:
+    """Revoke only this generation; the caller holds the short motion lock."""
+    if int(shared.run_generation.value) != generation:
+        return False
+    if time.monotonic_ns() < expires_ns:
+        return False
+    _revoke_motion_locked(shared, SafetyState.ARMED, RunEndReason.COMMAND_EXPIRED)
+    shared.start_request.value = False
+    shared.stop_request.value = int(StopRequest.OPERATOR)
+    shared.physical_home_completed.value = False
+    return True
 
-    This is the common final worker check: the record's generation must still
-    own motion and the runtime must not be stopping or faulted. The lock is
-    deliberately released before hardware IO, so workers call this immediately
-    before their SDK method.
+
+def coupled_command_may_cross_sdk(
+    shared: Any, *, run_generation: int, expires_monotonic_ns: int,
+) -> bool:
+    """Order admission against revocation, then release the lock BEFORE SDK IO.
+
+    An already-admitted vendor call may still run/return after revocation.
+    Its old-generation reply cannot authorize a new step or satisfy a new run.
     """
     with shared.motion_lock:
         permit = _read_motion_permit_locked(shared)
-        return bool(
-            permit.allows_motion
-            and permit.run_generation == int(run_generation)
-            and shared.is_running.value
-            and not shared.error_state.value
-            and not shared.estop_request.value
-        )
+        if not (permit.allows_motion and permit.run_generation == int(run_generation)
+                and shared.is_running.value and not shared.error_state.value
+                and not shared.estop_request.value):
+            return False
+        return not _expire_command_locked(shared, run_generation, expires_monotonic_ns)
 
 
 def begin_motion(shared: Any) -> bool:

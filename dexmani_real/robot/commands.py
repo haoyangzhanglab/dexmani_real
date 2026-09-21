@@ -16,6 +16,8 @@ from dexmani_real.ipc.command_stream import command_stream_capacity_locked
 from dexmani_real.ipc.schema import COUPLED_COMMAND_DTYPE
 from dexmani_real.runtime.safety import (
     PUBLISH_REASON_ESTOP,
+    PUBLISH_REASON_EXPIRED,
+    _expire_command_locked,
     PUBLISH_REASON_FAULT,
     PUBLISH_REASON_FIFO_FULL,
     PUBLISH_REASON_GENERATION,
@@ -49,11 +51,11 @@ class ActionCandidate:
     ``run_generation`` and commits it once to the ordered command FIFO. The
     candidate is an owner-owned immutable numeric snapshot: a FULL commit
     result retries this exact object without rebuilding it, re-solving IK, or
-    re-clipping its targets, and it carries no delivery lease — it stays
-    committable until its generation is revoked.
+    re-clipping its targets, and retains its original execution deadline through every retry.
     """
 
     run_generation: int
+    expires_monotonic_ns: int
     arm_qpos: np.ndarray | None = None
     hand_qpos: np.ndarray | None = None
     is_hold: bool = False
@@ -573,6 +575,7 @@ def prepare_joint_command(
     hand_qpos: np.ndarray | None = None,
     *,
     gate: SafetyGate,
+    expires_monotonic_ns: int,
     run_generation: int | None = None,
     is_hold: bool = False,
     arm_feedback_max_age_s: float,
@@ -587,6 +590,7 @@ def prepare_joint_command(
     """
     try:
         candidate = ActionCandidate(
+            expires_monotonic_ns=expires_monotonic_ns,
             run_generation=(int(shared.run_generation.value)
                             if run_generation is None else run_generation),
             arm_qpos=np.array(arm_qpos, dtype=np.float64, copy=True),
@@ -691,6 +695,9 @@ def publish_command(
     candidate and retries from its main loop cadence.
     """
     frame = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
+    if not 0 < candidate.expires_monotonic_ns < 2**64:
+        raise ValueError("command deadline must be positive uint64 monotonic nanoseconds")
+    frame["expires_monotonic_ns"][0] = candidate.expires_monotonic_ns
     frame["run_generation"][0] = candidate.run_generation
     frame["is_hold"][0] = int(candidate.is_hold)
     if candidate.arm_qpos is not None:
@@ -715,6 +722,8 @@ def publish_command(
                 f"got {state.name}"))
         if int(shared.run_generation.value) != candidate.run_generation:
             return PublishResult(False, reason=PUBLISH_REASON_GENERATION)
+        if _expire_command_locked(shared, candidate.run_generation, candidate.expires_monotonic_ns):
+            return PublishResult(False, reason=PUBLISH_REASON_EXPIRED)
         has_capacity, backlog, any_attached = command_stream_capacity_locked(shared)
         if not has_capacity:
             result = PublishResult(False, reason=(

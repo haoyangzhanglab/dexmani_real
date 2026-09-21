@@ -360,6 +360,7 @@ def run_policy_deployment(
     verified shutdown``. Trials and the per-trial budget are run-owner
     configuration; recording is evidence and never gates the run plan.
     """
+    _ = runtime.safety.dispatch_delay_ns  # This entry starts hardware even without publication.
     if not isinstance(runtime, ExperimentConfig):
         raise TypeError("runtime must be an ExperimentConfig")
     if not isinstance(execute, bool):

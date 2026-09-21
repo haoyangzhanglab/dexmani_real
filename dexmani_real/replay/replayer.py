@@ -346,7 +346,10 @@ class EpisodeReplayer:
             abort_requested=lambda: not self._poll_control(keyboard, 0.0),
         ):
             if self._running:
-                self._fault("startup hand-home command was not accepted")
+                if self.shared.stop_request.value:
+                    self._reject("startup hand-home command admission revoked")
+                else:
+                    self._fault("startup hand-home command was not accepted")
             return False
         self._motion_started = True
         feedback = self._read_start_feedback()
@@ -366,6 +369,7 @@ class EpisodeReplayer:
             np.asarray(arm_state["qpos"], dtype=np.float64),
             self.traj.action_hand_joint[0],
             gate=self._start_warmup_gate,
+            expires_monotonic_ns=time.monotonic_ns() + self.runtime.safety.dispatch_delay_ns,
             is_hold=True,
             arm_feedback_max_age_s=float(self.runtime.safety.heartbeat_timeouts["arm"]),
             hand_feedback_max_age_s=float(
@@ -548,7 +552,7 @@ class EpisodeReplayer:
     ) -> bool:
         """Wait in short slices so controls and worker health remain responsive."""
         while self._running:
-            remaining_s = deadline_s - time.perf_counter()
+            remaining_s = deadline_s - time.monotonic()
             if remaining_s <= 0:
                 return self._poll_control(keyboard, 0.0)
             if not self._poll_control(
@@ -606,8 +610,6 @@ class EpisodeReplayer:
         error_count = 0
         max_consecutive_errors = int(self.runtime.policy.max_consecutive_errors)
         period_s = 1.0 / self.replay_hz
-        next_deadline_s = time.perf_counter()
-        start_time = next_deadline_s
         frame_idx = 0
 
         try:
@@ -620,9 +622,12 @@ class EpisodeReplayer:
             self._motion_started = True
             if not self._wait_arm_streaming(keyboard):
                 return self._outcome()
+            next_deadline_s = time.monotonic()
+            start_time = time.perf_counter()
             while frame_idx < frame_count and self._wait_until_deadline(
                 keyboard, next_deadline_s
             ):
+                expires_ns = int(next_deadline_s * 1e9) + self.runtime.safety.dispatch_delay_ns
                 arm_cmd = self.traj.action_arm_joint[frame_idx].copy()
                 hand_cmd = None
                 if has_hand and self.traj.action_hand_joint is not None:
@@ -652,7 +657,7 @@ class EpisodeReplayer:
                     if error_count >= max_consecutive_errors:
                         self._fault("too many consecutive arm state read failures")
                         break
-                    next_deadline_s = time.perf_counter() + min(
+                    next_deadline_s = time.monotonic() + min(
                         period_s, _WAIT_POLL_INTERVAL_S
                     )
                     continue
@@ -695,7 +700,7 @@ class EpisodeReplayer:
                     )
                     frame_idx += 1
                     next_deadline_s += period_s
-                    now_s = time.perf_counter()
+                    now_s = time.monotonic()
                     if next_deadline_s < now_s:
                         next_deadline_s = now_s + period_s
                     continue
@@ -715,6 +720,7 @@ class EpisodeReplayer:
                     arm_cmd,
                     hand_cmd,
                     gate=self._action_safety_gate,
+                    expires_monotonic_ns=expires_ns,
                     arm_feedback_max_age_s=float(
                         self.runtime.safety.heartbeat_timeouts["arm"]
                     ),
@@ -727,9 +733,7 @@ class EpisodeReplayer:
                     self._publish_command_with_backpressure(
                         candidate,
                         required_state=SafetyState.RUNNING,
-                        # The operation boundary is Q/ESC/runtime health, not a
-                        # per-frame deadline: honest backpressure may slow the
-                        # replay, never silently drop or replace a frame.
+                        # Retries retain the endpoint deadline; no skipped frames.
                         deadline_s=float("inf"),
                         keyboard=keyboard,
                     )
@@ -811,7 +815,7 @@ class EpisodeReplayer:
                         flush=True,
                     )
                 next_deadline_s += period_s
-                now_s = time.perf_counter()
+                now_s = time.monotonic()
                 if next_deadline_s < now_s:
                     next_deadline_s = now_s + period_s
         except KeyboardInterrupt:

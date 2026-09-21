@@ -38,6 +38,7 @@ def initialize_hand_home(
     return publish_hand_home_and_wait_accepted(
         shared,
         np.deg2rad(np.asarray(hand.home_qpos_deg, dtype=np.float64)),
+        expires_monotonic_ns=time.monotonic_ns() + runtime.safety.dispatch_delay_ns,
         command_lower_rad=np.asarray(hand.qpos_min_rad, dtype=np.float64),
         command_upper_rad=np.asarray(hand.qpos_max_rad, dtype=np.float64),
         mechanical_lower_rad=np.asarray(hand.mechanical_qpos_min_rad, dtype=np.float64),
@@ -53,6 +54,7 @@ def publish_hand_home_and_wait_accepted(
     shared: Any,
     home_qpos: np.ndarray,
     *,
+    expires_monotonic_ns: int,
     command_lower_rad: np.ndarray,
     command_upper_rad: np.ndarray,
     mechanical_lower_rad: np.ndarray,
@@ -108,6 +110,7 @@ def publish_hand_home_and_wait_accepted(
         logger.warning("hand home stopped by runtime gate: %s", runtime_rejection)
         return False
     candidate = ActionCandidate(
+        expires_monotonic_ns=expires_monotonic_ns,
         run_generation=int(shared.run_generation.value),
         hand_qpos=np.array(target, dtype=np.float64, copy=True),
     )

@@ -28,6 +28,13 @@ python examples/collect_teleop.py --print-config
 经常调整的 IP、serial、频率、相机尺寸、数据路径、task、控制参数留在实验配置。
 不要为了假想硬件组合、存储后端或未来 serving 需求继续增加配置层。
 
+运动入口要求在实验 YAML 显式提供 `safety.max_dispatch_delay_s`（有限正秒数）。
+当前没有经过真机 timing validation 的默认值；缺失配置会在设备启动前拒绝运行。
+该预算从每个 endpoint 的执行时机开始，覆盖准备、FIFO 等待和 XHand 最终目标 slew；
+FULL/CRC 重试不刷新 deadline。过期撤销该 generation，必须由操作者重新开始；
+keyboard/calibration jog 必须先释放按键。HOME 排队使用现有 request queue budget，
+已开始的长轨迹仍使用自身的执行/abort timeout。
+
 ## 研究入口
 
 | 工作流 | 命令 | 硬件 / 输出 |
@@ -132,7 +139,8 @@ recording: control loop → build_episode_frame → RecorderClient.add_frame(fra
 
 启动器直接创建 `context.Process`；process name 就是 readiness key，没有第二套 process spec。
 命令只在 FIFO 成功提交时分配 sequence。generation 只用于暂停、停止或阻塞推理结束后拒绝旧动作，
-不是科研 episode 身份。SDK acceptance 不等于物理收敛，尤其不能让 XHand 中间限速点提前确认最终目标。
+不是科研 episode 身份。撤销阻止新的 software admission；已经 admission 的 SDK 调用仍可能晚返回，
+arm 与 hand 也不是物理事务。SDK acceptance 不等于物理收敛，尤其不能让 XHand 中间限速点提前确认最终目标。
 
 必须保留的硬边界：机械限位、非有限数阻断、实际速度 / 步长限制、急停、SDK 错误、旧命令撤销、
 实验依赖的工作空间 / 碰撞约束，以及 worker 停止后才释放共享内存。

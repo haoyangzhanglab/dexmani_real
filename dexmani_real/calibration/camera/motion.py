@@ -183,6 +183,7 @@ def publish_calibration_quit_hold(
         shared,
         current_qpos,
         gate=safety_gate,
+        expires_monotonic_ns=time.monotonic_ns() + runtime.safety.dispatch_delay_ns,
         is_hold=True,
         arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
@@ -333,6 +334,10 @@ def run_calibration_motion_tick(
     calib_cfg: CalibrationConfig,
 ) -> None:
     """Advance from the arm-ACK anchor with measured-pose bounded lookahead."""
+    if shared.stop_request.value:
+        _reject_calibration_motion(shared, state, "command admission revoked")
+        with shared.motion_lock:
+            shared.stop_request.value = 0
     active_keys = keys.pressed_keys()
     if state.blocked_until_release:
         if not any_jog_key_held(active_keys):
@@ -369,6 +374,7 @@ def run_calibration_motion_tick(
             set_calibration_fault(shared, "failed to enter calibration motion")
             return
 
+    expires_ns = time.monotonic_ns() + runtime.safety.dispatch_delay_ns
     measured_pose = planner.kin.compute_eef_pose_world(state.current_qpos)
     anchor_pose = planner.kin.compute_eef_pose_world(state.previous_command)
     workspace_margin_m = float(runtime.keyboard_teleop.workspace_command_margin_m)
@@ -431,6 +437,7 @@ def run_calibration_motion_tick(
         shared,
         q_cmd,
         gate=safety_gate,
+        expires_monotonic_ns=expires_ns,
         arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
     )

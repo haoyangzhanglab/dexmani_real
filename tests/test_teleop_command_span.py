@@ -14,6 +14,7 @@ inputs and temporary media; planner/input initialization is isolated from hardwa
 from __future__ import annotations
 
 import unittest
+import time
 from types import SimpleNamespace
 
 class _TeleopRecordingHarness:
@@ -282,7 +283,7 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
         from dexmani_real.runtime.safety import SafetyState, CommittedCommand
         from test_deployment_evidence import _fake_shared
 
-        runtime = resolve_experiment_config()
+        runtime = resolve_experiment_config(cli_overrides={"safety.max_dispatch_delay_s": 1.0})
         shared = _fake_shared()
         state = SimpleNamespace(frame=0, now=10., step={})
         shared.get_heartbeat = lambda *a: state.now
@@ -320,7 +321,7 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
                 arm_qpos_rad=qpos.copy(), hand_qpos_rad=None, issue=None)
 
         def prepare(shared, q, **kwargs):
-            candidate = ActionCandidate(run_generation=int(shared.run_generation.value),
+            candidate = ActionCandidate(expires_monotonic_ns=time.monotonic_ns() + 10_000_000_000, run_generation=int(shared.run_generation.value),
                                         arm_qpos=q.copy())
             prepared.append(candidate)
             return PreparedCommand(candidate=candidate)

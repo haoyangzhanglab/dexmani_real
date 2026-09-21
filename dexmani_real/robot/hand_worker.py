@@ -123,6 +123,11 @@ def _consume_one_hand_command(
     sequence_int = int(sequence)
     command_generation = int(command["run_generation"][0])
     if not bool(command["hand_present"][0]):
+        if not coupled_command_may_cross_sdk(
+            shared, run_generation=command_generation,
+            expires_monotonic_ns=int(command["expires_monotonic_ns"][0]),
+        ):
+            return
         # An absent actuator advances only its consumer; no SDK send and no
         # acceptance is implied.
         consumer.advance()
@@ -152,7 +157,8 @@ def _consume_one_hand_command(
     # This remains the final authority check before the SDK call.
     fence_started_ns = time.monotonic_ns()
     allowed = coupled_command_may_cross_sdk(
-        shared, run_generation=command_generation
+        shared, run_generation=command_generation,
+        expires_monotonic_ns=int(command["expires_monotonic_ns"][0]),
     )
     _phase("command_fence", fence_started_ns)
     if not allowed:

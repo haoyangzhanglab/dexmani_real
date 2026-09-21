@@ -469,6 +469,7 @@ def _run_keyboard_home(
         hand_home_accepted = publish_hand_home_and_wait_accepted(
             shared,
             hand_home_qpos_rad,
+            expires_monotonic_ns=time.monotonic_ns() + runtime.safety.dispatch_delay_ns,
             command_lower_rad=np.asarray(
                 runtime.hand.qpos_min_rad,
                 dtype=np.float64,
@@ -537,6 +538,7 @@ def _publish_keyboard_target(
     previous_command_qpos_rad: np.ndarray,
 ) -> _KeyboardPublishResult:
     """Solve and publish one keyboard target through the shared safety boundary."""
+    expires_ns = int(time.monotonic() * 1e9) + runtime.safety.dispatch_delay_ns
     ik_result = planner.solve_teleop_ik(
         Pose(p=target_pos_world_m, q=target_quat_wxyz),
         current_qpos_rad,
@@ -570,6 +572,7 @@ def _publish_keyboard_target(
         shared,
         q_cmd,
         gate=safety_gate,
+        expires_monotonic_ns=expires_ns,
         arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
     )
@@ -698,6 +701,11 @@ def _run_control_loop(
     )
     while shared.is_running.value:
         rate.wait()
+        if shared.stop_request.value:
+            if not reject_motion("command admission revoked"):
+                return False
+            with shared.motion_lock:
+                shared.stop_request.value = 0
         frame += 1
 
         if keys.is_pressed("esc"):
@@ -1044,6 +1052,7 @@ def run_keyboard_experiment(
     *,
     no_hand: bool,
 ) -> int:
+    _ = runtime.safety.dispatch_delay_ns  # Validate before device startup.
     if not bool(runtime.policy.hand_enabled) and not no_hand:
         logger.error("Hand-disabled operation must be acknowledged with --no-hand")
         return 2

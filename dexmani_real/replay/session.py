@@ -212,6 +212,7 @@ def _offer_return_home(
                 hand_accepted = publish_hand_home_and_wait_accepted(
                     shared,
                     hand_home,
+                    expires_monotonic_ns=time.monotonic_ns() + runtime.safety.dispatch_delay_ns,
                     command_lower_rad=np.asarray(
                         runtime.hand.qpos_min_rad, dtype=np.float64
                     ),
@@ -296,6 +297,7 @@ def replay_episode(
     config: EpisodeReplayConfig,
 ) -> ReplayOutcome:
     """Start arm/hand workers, run one replay, then shut the session down."""
+    _ = runtime.safety.dispatch_delay_ns  # Validate before device startup.
     try:
         _validate_replay_output_dir(config.output_dir)
     except (OSError, ValueError) as exc:

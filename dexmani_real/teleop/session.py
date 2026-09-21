@@ -323,6 +323,7 @@ def run_teleop_experiment(
     allow_no_hand: bool = False,
 ) -> int:
     """Run one resolved teleoperation experiment lifecycle."""
+    _ = runtime.safety.dispatch_delay_ns  # Validate before device startup.
     hand_enabled = bool(runtime.policy.hand_enabled)
     recording_enabled = bool(runtime.policy.recording_enabled)
     if recording_enabled and not hand_enabled:

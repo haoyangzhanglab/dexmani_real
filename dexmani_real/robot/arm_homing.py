@@ -3,7 +3,7 @@
 The planner densely validates a joint-space path (self/table/environment
 collision, joint limits) and returns a typed already-home/safe/unsafe result.
 Only a safe result supplies sparse milestones.  The requester queues
-``(waypoints, final_qpos, generation)`` to the arm worker, which drives them as a
+``(waypoints, final_qpos, generation, expires_ns)`` to the arm worker, which drives them as a
 blocking ``XArm7.home()``. Completion requires the worker's generation-matched
 acknowledgement after settling and mode restoration, plus stationary home feedback.
 """
@@ -770,7 +770,8 @@ def execute_arm_home(
     queued_monotonic_ns = time.monotonic_ns()
     try:
         shared.arm_home_q.put(
-            (waypoints, home_qpos.copy(), home_generation),
+            (waypoints, home_qpos.copy(), home_generation,
+             queued_monotonic_ns + int(config.request_queue_timeout_s * 1e9)),
             timeout=config.request_queue_timeout_s,
         )
     except Full:
@@ -864,6 +865,7 @@ def home_policy_robot(
     accepted = publish_hand_home_and_wait_accepted(
         shared,
         hand_home,
+        expires_monotonic_ns=time.monotonic_ns() + runtime.safety.dispatch_delay_ns,
         command_lower_rad=np.asarray(runtime.hand.qpos_min_rad, dtype=np.float64),
         command_upper_rad=np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64),
         mechanical_lower_rad=np.asarray(

@@ -179,7 +179,7 @@ class RuntimeChannels:
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> policy
 
-    arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, generation)
+    arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, generation, expires_ns)
     # Arm worker -> HOME waiter; zero until success, stale after generation changes.
     arm_home_completed_generation: Any
     record_control_q: mp.Queue  # policy -> RecorderIO episode boundaries
