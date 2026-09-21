@@ -237,5 +237,22 @@ class ReadCommandFeedbackTest(unittest.TestCase):
         self.assertEqual(hand_feedback.ring_commit_monotonic_ns, 998 * _MS)
 
 
+class FixedArmIdentityTest(unittest.TestCase):
+    def test_axis_identity_is_the_hardware_model_not_an_experiment_setting(self):
+        from types import SimpleNamespace
+        from dexmani_real.robot.drivers.xarm7 import XArm7
+
+        # No constructor, connection, discovery or vendor SDK is used.
+        arm = XArm7.__new__(XArm7)
+        for axes in (6, 7, 8):
+            with self.subTest(axes=axes):
+                arm._api = SimpleNamespace(axis=axes)
+                if axes == 7:
+                    arm._wait_for_axis_report(on_poll=None)
+                else:
+                    with self.assertRaises(RuntimeError):
+                        arm._wait_for_axis_report(on_poll=None)
+
+
 if __name__ == "__main__":
     unittest.main()

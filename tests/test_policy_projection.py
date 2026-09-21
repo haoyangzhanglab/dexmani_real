@@ -479,5 +479,40 @@ class PolicyEndpointClipReportingTest(unittest.TestCase):
                     self.assertIn("projection invariant violation", runner._session_failure.call_args.args[0])
 
 
+class PublicPolicyArtifactBoundaryTest(unittest.TestCase):
+    def test_load_returns_public_runtime_and_pins_exact_artifact(self):
+        from unittest import mock
+        import sys
+        from types import ModuleType
+        from dexmani_real.deployment.runner import _load_policy_runtime
+
+        config = SimpleNamespace(experiment="p/t/e", device="cpu", seed=0,
+                                 artifact="pinned.pt", inference_steps=8, spec=object())
+        loaded = SimpleNamespace(spec=config.spec, close=mock.Mock())
+        public = ModuleType("dexmani_policy.deployment")
+        public.load_experiment = mock.Mock(return_value=loaded)
+        with mock.patch.dict(sys.modules, {"dexmani_policy.deployment": public}):
+            self.assertIs(_load_policy_runtime(config), loaded)
+        public.load_experiment.assert_called_once_with(
+            "p/t/e", device="cpu", seed=0, artifact="pinned.pt", inference_steps=8)
+        loaded.close.assert_not_called()
+
+    def test_changed_spec_closes_loaded_runtime_before_rejecting(self):
+        from unittest import mock
+        import sys
+        from types import ModuleType
+        from dexmani_real.deployment.runner import _load_policy_runtime
+
+        config = SimpleNamespace(experiment="p/t/e", device="cpu", seed=0,
+                                 artifact="pinned.pt", inference_steps=8, spec=object())
+        loaded = SimpleNamespace(spec=object(), close=mock.Mock())
+        public = ModuleType("dexmani_policy.deployment")
+        public.load_experiment = mock.Mock(return_value=loaded)
+        with mock.patch.dict(sys.modules, {"dexmani_policy.deployment": public}):
+            with self.assertRaises(RuntimeError):
+                _load_policy_runtime(config)
+        loaded.close.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()
