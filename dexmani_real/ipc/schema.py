@@ -77,7 +77,7 @@ def validate_point_cloud_array(
 # Every servo publication is one coherent arm/hand record committed once to the
 # bounded ordered command FIFO. Consumers read records by sequence in commit
 # order and workers execute only while the record's run_generation still owns
-# motion; there is no per-command lease and no latest-wins supersession. The
+# motion and its immutable deadline has not expired. There is no latest-wins supersession. The
 # queue sequence is assigned only by a successful commit.
 _COMMON_COMMAND_FIELDS = [
     ("run_generation", "<u8"),
@@ -86,6 +86,7 @@ _COMMON_COMMAND_FIELDS = [
 COUPLED_COMMAND_DTYPE = np.dtype(
     _COMMON_COMMAND_FIELDS
     + [
+        ("expires_monotonic_ns", "<u8"),
         ("arm_present", "<u1"),
         ("hand_present", "<u1"),
         ("arm_qpos", "<f8", ARM_JOINT_SHAPE),

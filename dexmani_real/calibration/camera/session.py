@@ -808,6 +808,7 @@ def run_camera_calibration(
     intentionally uses the canonical fixed-home XHand envelope for both accepted
     values; ``absent`` therefore retains conservative hand geometry.
     """
+    _ = runtime.safety.dispatch_delay_ns  # Validate before device startup.
     if hand_geometry not in {"absent", "secured-home"}:
         raise ValueError("hand_geometry must be 'absent' or 'secured-home'")
     calib_cfg = calibration_config or CalibrationConfig()

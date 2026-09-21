@@ -1,11 +1,7 @@
-"""Transactional, row-preserving control-step dataset processing."""
+"""Raw admission and numerical transforms for direct policy export."""
 
 from __future__ import annotations
 
-import shutil
-import tempfile
-from collections import Counter
-from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping
@@ -19,28 +15,12 @@ from dexmani_real.dataset.contracts import (
     EpisodeDecision,
     ProcessingConfig,
     canonical_json,
-    validate_processed_task_name,
+    validate_task_name,
 )
 from dexmani_real.dataset.pointcloud import (
     RawEpisodePointCloudDeriver,
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
-)
-from dexmani_real.dataset.processed import (
-    _ACTION_EE_FRAME,
-    _CONTACT_FORCE_SOURCE,
-    _CONTACT_FORCE_SI_VERIFIED,
-    _FINGERTIP_POINTS_FRAME,
-    _FINGERTIP_POINTS_UNIT,
-    _FRAME_CHUNKED_DATASETS,
-    _TACTILE_FORCE_SI_VERIFIED,
-    _TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED,
-    PROCESSED_SCHEMA_NAME,
-    PROCESSED_SCHEMA_VERSION,
-    _dataset_row_slices,
-    _expected_specs,
-    _validate_masked_tactile_rows,
-    validate_processed_hdf5,
 )
 from dexmani_real.planning.kinematics.arm_fk import (
     EEF_POSE_ALGORITHM_ID,
@@ -79,25 +59,10 @@ from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_SAMPLING,
     POINT_CLOUD_TRANSFORM,
 )
-from dexmani_real.utils.atomic_io import atomic_publish
-
-_TASK_NAME_CANDIDATE_UNSET = object()
-ProcessingProgressCallback = Callable[[str, int, int], None]
-
-
-def _report_progress(
-    callback: ProcessingProgressCallback | None,
-    phase: str,
-    completed: int,
-    total: int,
-) -> None:
-    if callback is not None:
-        callback(phase, completed, total)
-
 
 @contextmanager
 def _open_processing_episode(episode: Path):
-    """Read current raw only; historical v26 stays frozen (reprocess via old revision)."""
+    """Read the current raw schema without modifying the source."""
     with h5py.File(episode / "data.h5", "r") as source:
         version = int(source["meta"].attrs["schema_version"])
     if version != EPISODE_SCHEMA_VERSION:
@@ -187,7 +152,11 @@ def analyze_episode(
     anchor = arrays["observation_anchor_monotonic_ns"]
     if np.any(anchor == 0) or np.any(anchor[1:] <= anchor[:-1]):
         raise ValueError("control anchors must be positive and strictly increasing")
-    for name in ("arm_source_monotonic_ns", "hand_source_monotonic_ns", "camera_source_monotonic_ns"):
+    for name in (
+        "arm_source_monotonic_ns",
+        "hand_source_monotonic_ns",
+        "camera_source_monotonic_ns",
+    ):
         if np.any(arrays[name] == 0) or np.any(arrays[name] > anchor):
             raise ValueError(
                 f"{name}: source must be positive and causal to control anchor"
@@ -203,20 +172,7 @@ def analyze_episode(
         geometry.width,
     ) or depth.dtype != np.dtype(np.uint16):
         raise ValueError("depth: corrupt shape/dtype/frame count")
-    # Decode all required images during admission, so dry-run can detect
-    # technical corruption before any batch is built.
-    decoded = 0
-    for image in reader.iter_camera_frames("rgb"):
-        if (
-            image.shape != (geometry.height, geometry.width, 3)
-            or image.dtype != np.uint8
-        ):
-            raise ValueError("RGB: corrupt shape/dtype")
-        decoded += 1
-    if decoded != frames:
-        raise ValueError(f"RGB frame count {decoded} != source frames {frames}")
-    for rows in _dataset_row_slices(depth):
-        depth[rows]  # Force HDF5 decompression/read errors at admission.
+    # Images are decoded and checked once by iter_policy_blocks in both modes.
     # IK-hold rows (flag_frame_status=FRAME_IK_FAIL) are technically valid
     # source rows and stay admitted regardless of run length; quality selection
     # is explicit operator curation (annotation include:false), never an
@@ -269,7 +225,7 @@ def validate_annotation_task_name_override(
 
     if task_name is None:
         return None
-    resolved_task_name = validate_processed_task_name(task_name)
+    resolved_task_name = validate_task_name(task_name)
     for episode_name, annotation in sorted(annotations.items()):
         if (
             annotation.task_name is not None
@@ -280,20 +236,6 @@ def validate_annotation_task_name_override(
                 f"{annotation.task_name!r} for {episode_name}"
             )
     return resolved_task_name
-
-
-def _task_name_candidate(
-    reader: EpisodeReader,
-    annotation: EpisodeAnnotation,
-    task_name: str | None,
-) -> tuple[Any, bool]:
-    """Choose one task source and flag an unvalidated raw fallback."""
-
-    if task_name is not None:
-        return task_name, False
-    if annotation.task_name is not None:
-        return annotation.task_name, False
-    return reader.h5f["meta"].attrs.get("task_label", ""), True
 
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
@@ -324,520 +266,203 @@ def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
     return episodes
 
 
-def _dataset_kwargs(
-    config: ProcessingConfig, *, chunks: tuple[int, ...]
-) -> dict[str, Any]:
-    return {
-        "compression": "gzip",
-        "compression_opts": config.gzip_level,
-        "chunks": chunks,
-    }
-
-
-def _create_data_datasets(
-    output: h5py.File,
-    length: int,
-    config: ProcessingConfig,
-    rgb_height: int,
-    rgb_width: int,
+def _validate_masked_tactile_rows(
+    payload: np.ndarray,
+    valid: np.ndarray,
+    *,
+    label: str,
 ) -> None:
-    numeric_chunk = min(length, 256)
-    specs = _expected_specs(length, config.pointcloud.num_points, rgb_height, rgb_width)
-    for name, (shape, dtype) in specs.items():
-        row_chunk = 1 if name in _FRAME_CHUNKED_DATASETS else numeric_chunk
-        output.create_dataset(
-            name,
-            shape=shape,
-            dtype=dtype,
-            **_dataset_kwargs(config, chunks=(row_chunk, *shape[1:])),
-        )
+    """Enforce the mask/payload invariant for tactile rows; never repair it.
 
-
-def _write_attrs(
-    output: h5py.File,
-    reader: EpisodeReader,
-    decision: EpisodeDecision,
-    config: ProcessingConfig,
-    *,
-    task_name: str,
-) -> None:
-    meta = reader.h5f["meta"].attrs
-    output.attrs.update(
-        {
-            "schema_name": PROCESSED_SCHEMA_NAME,
-            "schema_version": PROCESSED_SCHEMA_VERSION,
-            "domain": "real",
-            "source_path": str(reader.h5_path.resolve()),
-            "source_episode": reader.h5_path.name,
-            "source_schema_version": int(meta["schema_version"]),
-            "source_frames": decision.source_frames,
-            "episode_steps": decision.processed_frames,
-            "dt": float(reader.timing.grid_dt_s),
-            "obs_alignment": "obs[t]_before_action[t]",
-            "observation_alignment": "control_step_latest_causal",
-            "state_alignment": "control_step",
-            "action_semantics": "teleop_published_joint_target",
-            "task_name": task_name,
-            "fingertip_points_frame": _FINGERTIP_POINTS_FRAME,
-            "fingertip_points_unit": _FINGERTIP_POINTS_UNIT,
-            "fingertip_points_derivation": FINGERTIP_POINTS_DERIVATION,
-            "fingertip_points_policy_id": FINGERTIP_POLICY_ID,
-            # Portable numeric FK inputs for the deployment geometry contract;
-            # the URDF path stays local and the policy id owns model identity.
-            "fingertip_config_json": canonical_json(
-                {
-                    "fingertip_link_names": list(config.fingertip_link_names),
-                    "handbase_position_eef_m": list(config.handbase_position_eef_m),
-                    "handbase_quat_eef_wxyz": list(config.handbase_quat_eef_wxyz),
-                }
-            ),
-            "eef_pose_frame": EEF_POSE_FRAME,
-            "eef_pose_components": EEF_POSE_COMPONENTS,
-            "eef_pose_derivation": EEF_POSE_DERIVATION,
-            "eef_pose_algorithm_id": EEF_POSE_ALGORITHM_ID,
-            "action_ee_frame": _ACTION_EE_FRAME,
-            "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
-            "contact_force_source": _CONTACT_FORCE_SOURCE,
-            "contact_force_representation": CONTACT_FORCE_REPRESENTATION,
-            "contact_force_unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
-            "contact_force_si_verified": _CONTACT_FORCE_SI_VERIFIED,
-            "contact_force_frame": XHAND_SENSOR_NATIVE_AXES_FRAME,
-            "tactile_force_representation": TACTILE_FORCE_REPRESENTATION,
-            "tactile_force_finger_order": HAND_FINGER_ORDER_ID,
-            "tactile_force_sensor_order": TACTILE_FORCE_SENSOR_ORDER,
-            "tactile_force_point_order": TACTILE_FORCE_POINT_ORDER,
-            "tactile_force_axis_labels": TACTILE_FORCE_AXIS_LABELS,
-            "tactile_force_unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
-            "tactile_force_si_verified": _TACTILE_FORCE_SI_VERIFIED,
-            "tactile_force_spatial_geometry_verified": (
-                _TACTILE_FORCE_SPATIAL_GEOMETRY_VERIFIED
-            ),
-            "rgb_transform": "native_color_resolution_no_resize",
-            "depth_transform": "depth_to_color_aligned_native_resolution",
-            "depth_unit": "sensor_unit",
-            "depth_scale_m_per_unit": float(meta["depth_scale"]),
-            "depth_invalid_value": 0,
-            "camera_intrinsic_semantics": (
-                "native_color_intrinsics_for_depth_to_color_aligned_depth"
-            ),
-            "camera_extrinsic_semantics": (
-                "T_xarm_base_from_color;native_color_optical_to_xarm_base"
-            ),
-            "source_camera_depth_intrinsics_native": np.asarray(
-                meta["camera_depth_intrinsics"], dtype=np.float64
-            ),
-            "source_camera_depth_distortion_model": str(
-                meta["camera_depth_distortion_model"]
-            ),
-            "source_camera_depth_distortion_coeffs": np.asarray(
-                meta["camera_depth_distortion_coeffs"], dtype=np.float64
-            ),
-            "camera_color_distortion_model": str(
-                meta["camera_color_distortion_model"]
-            ),
-            "camera_color_distortion_coeffs": np.asarray(
-                meta["camera_color_distortion_coeffs"], dtype=np.float64
-            ),
-            "camera_T_color_from_depth": np.asarray(
-                meta["camera_T_color_from_depth"], dtype=np.float64
-            ),
-            "point_cloud_frame": "xarm_base",
-            "processing_config_json": canonical_json(
-                {
-                    "pointcloud": config.pointcloud.to_dict(),
-                    "table_plane_abcd": (
-                        None
-                        if config.table_plane_abcd is None
-                        else list(config.table_plane_abcd)
-                    ),
-                }
-            ),
-            "point_cloud_shape": np.asarray(
-                (config.pointcloud.num_points, 6), dtype=np.int64
-            ),
-            "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
-            "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
-            "point_cloud_table_plane_abcd_json": canonical_json(
-                None
-                if config.table_plane_abcd is None
-                else list(config.table_plane_abcd)
-            ),
-            "point_cloud_sampling": POINT_CLOUD_SAMPLING,
-            "point_cloud_transform": POINT_CLOUD_TRANSFORM,
-        }
-    )
-
-
-def _write_processed_episode(
-    reader: EpisodeReader,
-    decision: EpisodeDecision,
-    output_root: Path,
-    config: ProcessingConfig,
-    *,
-    task_name: str,
-    frame_completed_callback: Callable[[], None] | None = None,
-) -> dict[str, Any]:
-    path = output_root / f"{reader.h5_path.name}.h5"
-    if not decision.accepted:
-        raise ValueError("cannot write a rejected episode")
-    frames = decision.source_frames
-    camera_model = load_raw_episode_camera_model(reader)
-    T_xarm_base_from_color = load_raw_episode_base_from_color(reader)
-    geometry = camera_model.geometry
-    rgb_height = geometry.color.height
-    rgb_width = geometry.color.width
-    with h5py.File(path, "w") as output:
-        _write_attrs(
-            output,
-            reader,
-            decision,
-            config,
-            task_name=task_name,
-        )
-        _create_data_datasets(
-            output, decision.processed_frames, config, rgb_height, rgb_width
-        )
-        arm_action = np.asarray(
-            reader.h5f["action_arm_joint_sent"][:], dtype=np.float32
-        )
-        hand_action = np.asarray(reader.h5f["action_hand_joint"][:], dtype=np.float32)
-        arm_action_ee = np.asarray(reader.h5f["action_arm_ee"][:], dtype=np.float32)
-        joint_state = np.concatenate(
-            (
-                np.asarray(reader.h5f["arm_qpos"][:], dtype=np.float32),
-                np.asarray(reader.h5f["hand_qpos"][:], dtype=np.float32),
-            ),
-            axis=1,
-        )
-        output["joint_state"][:] = joint_state
-        output["action"][:] = np.concatenate((arm_action, hand_action), axis=1)
-        output["action_ee"][:] = np.concatenate((arm_action_ee, hand_action), axis=1)
-        # Tactile validity is copied directly from raw; processing never
-        # reconstructs measurement truth from calibration/unit/freshness fields.
-        output["contact_force"][:] = np.asarray(
-            reader.h5f["hand_contact"][:], dtype=np.float32
-        )
-        output["contact_force_valid"][:] = np.asarray(
-            reader.h5f["hand_contact_valid"][:], dtype=bool
-        )
-        output["tactile_force"][:] = np.asarray(
-            reader.h5f["hand_tactile_force"][:], dtype=np.float32
-        )
-        output["tactile_force_valid"][:] = np.asarray(
-            reader.h5f["hand_tactile_force_valid"][:], dtype=bool
-        )
-        hand_fk = HandKinematics(
-            config.hand_urdf_path, list(config.fingertip_link_names)
-        )
-        if not hand_fk.is_ready():
-            raise RuntimeError("processed fingertip FK startup failed")
-        eef_pose = compute_eef_pose_history_xarm_base(joint_state[:, :7])
-        output["eef_pose"][:] = eef_pose.astype(np.float32)
-        output["fingertip_points"][:] = compute_fingertip_history_xarm_base(
-            joint_state[:, :7],
-            joint_state[:, 7:19],
-            hand_fk=hand_fk,
-            handbase_position_eef_m=np.asarray(
-                config.handbase_position_eef_m, dtype=np.float64
-            ),
-            handbase_quat_eef_wxyz=np.asarray(
-                config.handbase_quat_eef_wxyz, dtype=np.float64
-            ),
-            eef_pose_history=eef_pose,
-        )
-        # Flat timing arrays: one scalar per control row.
-        output["observation_anchor_monotonic_ns"][:] = reader.h5f[
-            "observation_anchor_monotonic_ns"
-        ][:]
-        output["arm_source_monotonic_ns"][:] = reader.h5f[
-            "arm_source_monotonic_ns"
-        ][:]
-        output["hand_source_monotonic_ns"][:] = reader.h5f[
-            "hand_source_monotonic_ns"
-        ][:]
-        output["camera_source_monotonic_ns"][:] = reader.h5f[
-            "camera_source_monotonic_ns"
-        ][:]
-
-        # Native aligned RGB-D: store the source color resolution without resize.
-        output["camera_intrinsic"][:] = (
-            geometry.color.matrix().astype(np.float32).reshape(9)[None, :]
-        )
-        output["camera_extrinsic"][:] = np.broadcast_to(
-            T_xarm_base_from_color,
-            output["camera_extrinsic"].shape,
-        ).astype(np.float32)
-        pointcloud_deriver = RawEpisodePointCloudDeriver(
-            reader=reader,
-            camera=camera_model,
-            T_xarm_base_from_color=T_xarm_base_from_color,
-            pointcloud=config.pointcloud,
-            table_plane_abcd=config.table_plane_abcd,
-        )
-        for source_index, frame in enumerate(reader.iter_camera_frames("rgb")):
-            if source_index >= frames:
-                raise ValueError("RGB contains extra frames")
-            output["rgb"][source_index] = frame
-            output["depth"][source_index] = np.asarray(
-                reader.h5f["depth"][source_index], dtype=np.uint16
-            )
-            cloud = pointcloud_deriver.derive(source_index, frame)
-            if cloud is None:
-                raise ValueError(
-                    f"derived point cloud empty at source row {source_index}"
-                )
-            output["point_cloud"][source_index] = cloud
-            if frame_completed_callback is not None:
-                frame_completed_callback()
-        output.flush()
-    return {
-        "path": path.name,
-        "source_episode": reader.h5_path.name,
-        "source_frames": decision.source_frames,
-        "frames": decision.processed_frames,
-    }
-
-
-def _rejected_decision(
-    episode: Path, config: ProcessingConfig, reason: str
-) -> EpisodeDecision:
-    return EpisodeDecision(episode, 0, reason)
-
-
-def _rejection_is_blocking(
-    decision: EpisodeDecision,
-    annotations: Mapping[str, EpisodeAnnotation],
-    *,
-    skip_rejected_unannotated: bool,
-) -> bool:
-    """Keep explicit annotation intent separate from absent annotation metadata."""
-
-    annotation = annotations.get(decision.source_path.name)
-    if annotation is None:
-        return not skip_rejected_unannotated
-    return annotation.include
-
-
-def process_episode_root(
-    input_root: str | Path,
-    output_root: str | Path,
-    config: ProcessingConfig,
-    *,
-    annotations_path: str | Path | None = None,
-    dry_run: bool = False,
-    skip_rejected_unannotated: bool = False,
-    task_name: str | None = None,
-    expected_task_name: str | None = None,
-    progress_callback: ProcessingProgressCallback | None = None,
-) -> dict[str, Any]:
-    """Publish accepted episodes, preserving explicit annotation intent.
-
-    Rejected unannotated episodes block direct library callers by default. The
-    canonical CLI opts into skipping them with ``skip_rejected_unannotated``.
-    ``expected_task_name`` is an optional caller-owned output-root invariant;
-    direct library callers may leave it unset for arbitrary temporary paths.
-    ``progress_callback`` receives cumulative ``(phase, completed, total)``:
-    analyze counts input episodes, write counts accepted source frames, and
-    verify counts output files. Dry runs report only analyze progress.
+    ``valid`` rows must be fully finite (a real zero/no-contact reading is finite
+    zero + valid); ``invalid`` rows must be all-NaN. Any contradiction is a
+    technical contract error and raises.
     """
+    axes = tuple(range(1, payload.ndim))
+    rows_finite = np.all(np.isfinite(payload), axis=axes)
+    rows_all_nan = np.all(np.isnan(payload), axis=axes)
+    if np.any(valid & ~rows_finite):
+        raise ValueError(f"{label}: non-finite payload on a valid row")
+    if np.any(~valid & ~rows_all_nan):
+        raise ValueError(f"{label}: finite payload on an invalid row")
 
-    if not isinstance(skip_rejected_unannotated, bool):
-        raise TypeError("skip_rejected_unannotated must be boolean")
-    episodes = discover_episode_dirs(input_root)
-    annotations = load_annotations(annotations_path)
-    unknown_annotations = set(annotations) - {episode.name for episode in episodes}
-    if unknown_annotations:
-        raise ValueError(
-            f"annotations reference unknown episodes: {sorted(unknown_annotations)}"
-        )
-    resolved_task_override = validate_annotation_task_name_override(
-        annotations, task_name
-    )
-    resolved_expected_task_name = (
-        None
-        if expected_task_name is None
-        else validate_processed_task_name(expected_task_name)
-    )
-    decisions: list[EpisodeDecision] = []
-    resolved_episode_task_names: dict[Path, str] = {}
-    task_identity_errors: list[str] = []
-    _report_progress(progress_callback, "analyze", 0, len(episodes))
-    for episode in episodes:
-        annotation = annotations.get(episode.name)
-        if annotation is not None and not annotation.include:
-            # Do not require an excluded episode to remain readable. Its
-            # exclusion is operator-owned and needs no source inspection.
-            decisions.append(
-                _rejected_decision(episode, config, "excluded by annotation")
-            )
-            _report_progress(progress_callback, "analyze", len(decisions), len(episodes))
-            continue
-        analysis_annotation = annotation or EpisodeAnnotation()
-        task_name_candidate: Any = _TASK_NAME_CANDIDATE_UNSET
-        raw_task_name_requires_validation = False
-        # Only explicit behavior/admission decisions become EpisodeDecision
-        # results. Technical, source-corruption, and programming failures raise
-        # and fail the whole batch: silently training on fewer demonstrations
-        # is more dangerous than a loud stop. Known-bad episodes are excluded
-        # by the operator through annotation include:false.
-        with _open_processing_episode(episode) as reader:
-            decision = analyze_episode(
-                reader,
-                config,
-                analysis_annotation,
-            )
-            if decision.accepted:
-                task_name_candidate, raw_task_name_requires_validation = (
-                    _task_name_candidate(
-                        reader,
-                        analysis_annotation,
-                        resolved_task_override,
-                    )
-                )
-        decisions.append(decision)
-        _report_progress(progress_callback, "analyze", len(decisions), len(episodes))
-        if task_name_candidate is _TASK_NAME_CANDIDATE_UNSET:
-            continue
-        if not raw_task_name_requires_validation:
-            resolved_episode_task_names[decision.source_path] = task_name_candidate
-            continue
-        try:
-            resolved_episode_task_names[decision.source_path] = (
-                validate_processed_task_name(task_name_candidate)
-            )
-        except (TypeError, ValueError) as exc:
-            task_identity_errors.append(f"{episode.name}: {type(exc).__name__}: {exc}")
-    if task_identity_errors:
-        raise ValueError(
-            "processed task identity invalid; no output published: "
-            + "; ".join(task_identity_errors)
-        )
-    accepted_task_names = {
-        resolved_episode_task_names[decision.source_path]
-        for decision in decisions
-        if decision.accepted
+
+def policy_semantics(reader: EpisodeReader, config: ProcessingConfig) -> dict[str, Any]:
+    meta = reader.h5f["meta"].attrs
+    return {
+        "obs_alignment": "obs[t]_before_action[t]",
+        "observation_alignment": "control_step_latest_causal",
+        "state_alignment": "control_step",
+        "action_semantics": "teleop_published_joint_target",
+        "fingertip_points_frame": "xarm_base",
+        "fingertip_points_unit": "m",
+        "fingertip_points_derivation": FINGERTIP_POINTS_DERIVATION,
+        "fingertip_points_policy_id": FINGERTIP_POLICY_ID,
+        "fingertip_config_json": canonical_json(
+            {
+                "fingertip_link_names": list(config.fingertip_link_names),
+                "handbase_position_eef_m": list(config.handbase_position_eef_m),
+                "handbase_quat_eef_wxyz": list(config.handbase_quat_eef_wxyz),
+            }
+        ),
+        "eef_pose_frame": EEF_POSE_FRAME,
+        "eef_pose_components": EEF_POSE_COMPONENTS,
+        "eef_pose_derivation": EEF_POSE_DERIVATION,
+        "eef_pose_algorithm_id": EEF_POSE_ALGORITHM_ID,
+        "action_ee_frame": "xarm_base",
+        "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
+        "contact_force_source": "raw_hand_contact_control_step",
+        "contact_force_representation": CONTACT_FORCE_REPRESENTATION,
+        "contact_force_unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
+        "contact_force_si_verified": False,
+        "contact_force_frame": XHAND_SENSOR_NATIVE_AXES_FRAME,
+        "tactile_force_representation": TACTILE_FORCE_REPRESENTATION,
+        "tactile_force_finger_order": HAND_FINGER_ORDER_ID,
+        "tactile_force_sensor_order": TACTILE_FORCE_SENSOR_ORDER,
+        "tactile_force_point_order": TACTILE_FORCE_POINT_ORDER,
+        "tactile_force_axis_labels": TACTILE_FORCE_AXIS_LABELS,
+        "tactile_force_unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
+        "tactile_force_si_verified": False,
+        "tactile_force_spatial_geometry_verified": False,
+        "depth_scale_m_per_unit": float(meta["depth_scale"]),
+        "depth_invalid_value": 0,
+        "camera_intrinsic_semantics": "native_color_intrinsics_for_depth_to_color_aligned_depth",
+        "camera_extrinsic_semantics": "T_xarm_base_from_color;native_color_optical_to_xarm_base",
+        "point_cloud_frame": "xarm_base",
+        "processing_config_json": canonical_json(
+            {
+                "pointcloud": config.pointcloud.to_dict(),
+                "table_plane_abcd": None
+                if config.table_plane_abcd is None
+                else list(config.table_plane_abcd),
+            }
+        ),
+        "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
+        "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
+        "point_cloud_table_plane_abcd_json": canonical_json(
+            None if config.table_plane_abcd is None else list(config.table_plane_abcd)
+        ),
+        "point_cloud_sampling": POINT_CLOUD_SAMPLING,
+        "point_cloud_transform": POINT_CLOUD_TRANSFORM,
     }
-    if len(accepted_task_names) > 1:
-        raise ValueError(
-            "processed batch has multiple task_name values; no output published: "
-            + ", ".join(sorted(accepted_task_names))
-        )
-    resolved_batch_task_name = next(iter(accepted_task_names), None)
-    if (
-        resolved_batch_task_name is not None
-        and resolved_expected_task_name is not None
-        and resolved_batch_task_name != resolved_expected_task_name
-    ):
-        raise ValueError(
-            "processed task_name does not match the expected output task identity; "
-            f"no output published: {resolved_batch_task_name!r} != "
-            f"{resolved_expected_task_name!r}"
-        )
-    planned_names = [
-        f"{decision.source_path.name}.h5" for decision in decisions if decision.accepted
-    ]
-    collisions = sorted(
-        name for name, count in Counter(planned_names).items() if count > 1
-    )
-    if collisions:
-        raise ValueError(f"source names produce colliding outputs: {collisions}")
-    report: dict[str, Any] = {
-        "schema_name": PROCESSED_SCHEMA_NAME,
-        "schema_version": PROCESSED_SCHEMA_VERSION,
-        "input_root": str(Path(input_root).resolve()),
-        "output_root": str(Path(output_root).resolve()),
-        "dry_run": dry_run,
-        "config": config.to_dict(),
-        "source_episode_count": len(decisions),
-        "accepted_source_episode_count": sum(d.accepted for d in decisions),
-        "rejected_source_episode_count": sum(not d.accepted for d in decisions),
-        "output_episode_count": sum(d.accepted for d in decisions),
-        "source_frame_count": sum(d.source_frames for d in decisions),
-        "processed_frame_count": sum(d.processed_frames for d in decisions),
-        "episodes": [d.to_dict() for d in decisions],
-        "outputs": [],
-    }
-    if dry_run:
-        return report
-    blocking_rejections = [
-        decision
-        for decision in decisions
-        if not decision.accepted
-        and _rejection_is_blocking(
-            decision,
-            annotations,
-            skip_rejected_unannotated=skip_rejected_unannotated,
-        )
-    ]
-    if blocking_rejections:
-        details = "; ".join(
-            f"{decision.source_path.name}: {decision.rejected_reason}"
-            for decision in blocking_rejections
-        )
-        raise ValueError(f"processing batch rejected; no output published: {details}")
-    if not any(decision.accepted for decision in decisions):
-        raise ValueError("processing produced no included episodes")
-    target = Path(output_root)
-    if target.exists():
-        raise FileExistsError(
-            f"refusing to overwrite existing processed root: {target}"
-        )
-    target.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(
-        tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=str(target.parent))
-    )
-    try:
-        outputs: list[dict[str, Any]] = []
-        total_frames = sum(d.source_frames for d in decisions if d.accepted)
-        completed_frames = 0
 
-        def frame_completed() -> None:
-            nonlocal completed_frames
-            completed_frames += 1
-            _report_progress(progress_callback, "write", completed_frames, total_frames)
 
-        _report_progress(progress_callback, "write", 0, total_frames)
-        for decision in decisions:
-            if not decision.accepted:
-                continue
-            with _open_processing_episode(decision.source_path) as reader:
-                outputs.append(
-                    _write_processed_episode(
-                        reader,
-                        decision,
-                        staging,
-                        config,
-                        task_name=resolved_episode_task_names[decision.source_path],
-                        frame_completed_callback=(
-                            frame_completed if progress_callback is not None else None
-                        ),
-                    )
-                )
-        validation = []
-        _report_progress(progress_callback, "verify", 0, len(outputs))
-        for index, item in enumerate(outputs, start=1):
-            validation.append(validate_processed_hdf5(staging / item["path"], config))
-            _report_progress(progress_callback, "verify", index, len(outputs))
-        report["outputs"] = outputs
-        report["validation"] = validation
-        assert resolved_batch_task_name is not None
-        summary = {
-            "task_name": resolved_batch_task_name,
-            "episodes": [
-                {
-                    "source_episode": decision.source_path.name,
-                    "accepted": decision.accepted,
-                    "reason": decision.rejected_reason,
-                    "source_frames": decision.source_frames,
-                    "processed_frames": decision.processed_frames,
-                }
-                for decision in decisions
-            ],
-        }
-        with (staging / "processing_report.yaml").open("w", encoding="utf-8") as stream:
-            yaml.safe_dump(summary, stream, sort_keys=False, allow_unicode=True)
-        atomic_publish(staging, target)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
-    return report
+def iter_policy_blocks(
+    reader: EpisodeReader, config: ProcessingConfig, *, chunk_frames: int
+):
+    """One episode of numeric state; bounded RGB-D/cloud chunks, never a task in RAM."""
+    frames = int(reader.h5f["meta"].attrs["num_frames"])
+    camera_model = load_raw_episode_camera_model(reader)
+    geometry = camera_model.geometry
+    transform = load_raw_episode_base_from_color(reader)
+    values = {}
+    arm_action = np.asarray(reader.h5f["action_arm_joint_sent"][:], dtype=np.float32)
+    hand_action = np.asarray(reader.h5f["action_hand_joint"][:], dtype=np.float32)
+    arm_action_ee = np.asarray(reader.h5f["action_arm_ee"][:], dtype=np.float32)
+    joint_state = np.concatenate(
+        (
+            np.asarray(reader.h5f["arm_qpos"][:], dtype=np.float32),
+            np.asarray(reader.h5f["hand_qpos"][:], dtype=np.float32),
+        ),
+        axis=1,
+    )
+    values["joint_state"] = joint_state
+    values["action"] = np.concatenate((arm_action, hand_action), axis=1)
+    values["action_ee"] = np.concatenate((arm_action_ee, hand_action), axis=1)
+    # Tactile validity is copied directly from raw; processing never
+    # reconstructs measurement truth from calibration/unit/freshness fields.
+    values["contact_force"] = np.asarray(
+        reader.h5f["hand_contact"][:], dtype=np.float32
+    )
+    values["contact_force_valid"] = np.asarray(
+        reader.h5f["hand_contact_valid"][:], dtype=bool
+    )
+    values["tactile_force"] = np.asarray(
+        reader.h5f["hand_tactile_force"][:], dtype=np.float32
+    )
+    values["tactile_force_valid"] = np.asarray(
+        reader.h5f["hand_tactile_force_valid"][:], dtype=bool
+    )
+    hand_fk = HandKinematics(config.hand_urdf_path, list(config.fingertip_link_names))
+    if not hand_fk.is_ready():
+        raise RuntimeError("policy fingertip FK startup failed")
+    eef_pose = compute_eef_pose_history_xarm_base(joint_state[:, :7])
+    values["eef_pose"] = eef_pose.astype(np.float32)
+    values["fingertip_points"] = compute_fingertip_history_xarm_base(
+        joint_state[:, :7],
+        joint_state[:, 7:19],
+        hand_fk=hand_fk,
+        handbase_position_eef_m=np.asarray(
+            config.handbase_position_eef_m, dtype=np.float64
+        ),
+        handbase_quat_eef_wxyz=np.asarray(
+            config.handbase_quat_eef_wxyz, dtype=np.float64
+        ),
+        eef_pose_history=eef_pose,
+    )
+    # Flat timing arrays: one scalar per control row.
+    values["observation_anchor_monotonic_ns"] = reader.h5f[
+        "observation_anchor_monotonic_ns"
+    ][:]
+    values["arm_source_monotonic_ns"] = reader.h5f["arm_source_monotonic_ns"][:]
+    values["hand_source_monotonic_ns"] = reader.h5f["hand_source_monotonic_ns"][:]
+    values["camera_source_monotonic_ns"] = reader.h5f["camera_source_monotonic_ns"][:]
+
+    pointcloud_deriver = RawEpisodePointCloudDeriver(
+        reader=reader,
+        camera=camera_model,
+        T_xarm_base_from_color=transform,
+        pointcloud=config.pointcloud,
+        table_plane_abcd=config.table_plane_abcd,
+    )
+    images = iter(reader.iter_camera_frames("rgb"))
+    for start in range(0, frames, chunk_frames):
+        end = min(frames, start + chunk_frames)
+        block = {key: value[start:end] for key, value in values.items()}
+        rgb, depth, clouds = [], [], []
+        for index in range(start, end):
+            image = next(images, None)
+            if (
+                image is None
+                or image.shape != (geometry.color.height, geometry.color.width, 3)
+                or image.dtype != np.uint8
+            ):
+                raise ValueError(f"RGB missing or invalid at row {index}")
+            cloud = pointcloud_deriver.derive(index, image)
+            if cloud is None:
+                raise ValueError(f"derived point cloud empty at source row {index}")
+            rgb.append(image)
+            depth.append(np.asarray(reader.h5f["depth"][index], dtype=np.uint16))
+            clouds.append(cloud)
+        block.update(
+            rgb=np.stack(rgb),
+            depth=np.stack(depth),
+            point_cloud=np.stack(clouds),
+            camera_intrinsic=np.broadcast_to(
+                geometry.color.matrix().astype(np.float32).reshape(9), (end - start, 9)
+            ),
+            camera_extrinsic=np.broadcast_to(
+                transform.astype(np.float32), (end - start, 4, 4)
+            ),
+        )
+        for key, value in block.items():
+            if (
+                np.issubdtype(value.dtype, np.floating)
+                and key not in {"contact_force", "tactile_force"}
+                and not np.isfinite(value).all()
+            ):
+                raise ValueError(f"{key}: non-finite transformed values")
+        validate_canonical_rot6d(block["eef_pose"][:, 3:9], label="eef_pose")
+        cloud = block["point_cloud"]
+        lower, upper = np.asarray(config.pointcloud.workspace).reshape(2, 3)
+        if (
+            np.any(cloud[..., :3] < lower)
+            or np.any(cloud[..., :3] > upper)
+            or np.any(cloud[..., 3:] < 0)
+            or np.any(cloud[..., 3:] > 1)
+            or np.any(~np.any(np.linalg.norm(cloud[..., :3], axis=2) > 0, axis=1))
+        ):
+            raise ValueError("derived point cloud violates workspace/color contract")
+        yield block
+    if next(images, None) is not None:
+        raise ValueError("RGB contains extra frames")

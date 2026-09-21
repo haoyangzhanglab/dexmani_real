@@ -134,7 +134,9 @@ class SyncPolicyTimingTest(unittest.TestCase):
         clock = self.clock
         published = self.published
 
-        def dispatch(action):
+        runner.test_eligibility = []
+        def dispatch(action, *, eligible_ns):
+            runner.test_eligibility.append(eligible_ns)
             published.append((clock.ns, tuple(np.asarray(action).tolist())))
             runner.last_publication_ns = clock.ns
             runner.actions.popleft()
@@ -195,6 +197,7 @@ class SyncPolicyTimingTest(unittest.TestCase):
         self.clock.ns = 1_062_500_000
         runner._run_active_tick(self.clock.ns)
         self.assertEqual(self.published, [(1_162_500_000, (17.0,))])
+        self.assertEqual(runner.test_eligibility, [1_162_500_000])
 
         # Still before new[0]+dt: no second dispatch.
         self.clock.ns = 1_162_500_000
@@ -204,6 +207,15 @@ class SyncPolicyTimingTest(unittest.TestCase):
         self.clock.ns = 1_225_000_000
         runner._run_active_tick(self.clock.ns)
         self.assertEqual(self.published[1], (1_225_000_000, (18.0,)))
+
+    def test_delayed_scheduled_action_keeps_its_original_eligibility(self):
+        self._install_observation_fakes()
+        runner = self._make_runner(last_publication_ns=1_000_000_000)
+        runner.actions.extend([np.array([1.0]), np.array([2.0])])
+        self.clock.ns = 2_000_000_000
+        runner._run_active_tick(self.clock.ns)
+        self.assertEqual(runner.test_eligibility, [1_000_000_000 + _STEP_DT_NS])
+        self.assertEqual(self.queries, [])
 
     # --- unified whole-chunk invalidation ----------------------------------
 

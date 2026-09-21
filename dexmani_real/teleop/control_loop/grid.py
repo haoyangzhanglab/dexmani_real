@@ -133,6 +133,7 @@ def _prepare_joint_candidate(
     hand_qpos: np.ndarray | None,
     *,
     gate: SafetyGate,
+    expires_monotonic_ns: int,
     arm_feedback_max_age_s: float,
     hand_feedback_max_age_s: float,
     is_hold: bool = False,
@@ -147,6 +148,7 @@ def _prepare_joint_candidate(
         arm_qpos,
         hand_qpos,
         gate=gate,
+        expires_monotonic_ns=expires_monotonic_ns,
         is_hold=is_hold,
         arm_feedback_max_age_s=arm_feedback_max_age_s,
         hand_feedback_max_age_s=hand_feedback_max_age_s,
@@ -157,7 +159,7 @@ def _prepare_joint_candidate(
 class _PendingTeleopPublish:
     """One prepared-but-uncommitted teleop command and its recording context.
 
-    FULL backpressure keeps this exact candidate (same action ID and targets)
+    FULL backpressure keeps this exact candidate (same targets, generation and deadline)
     across grid ticks without rebuilding or re-solving IK; a lifecycle
     revocation drops it visibly instead of sending stale human intent after a
     fresh re-anchor.
@@ -787,7 +789,7 @@ def _commit_pending_command(
 
     Returns whether the teleop loop keeps running. Success advances the
     proposal references and records this tick's command row; FULL keeps the
-    identical candidate (same action ID/targets) for the next grid tick and
+    identical candidate (same targets/generation/deadline) for the next grid tick and
     records an honest held row (``action_queued=False``) instead of claiming a
     send; lifecycle revocation drops the candidate and the pause machinery
     owns the silent boundary.
@@ -925,6 +927,7 @@ def _publish_arm_safety_hold(
         shared,
         controller.prev_qpos_cmd.copy(),
         None,
+        expires_monotonic_ns=observation.anchor_monotonic_ns + cfg.runtime.safety.dispatch_delay_ns,
         gate=resources.safety_gate,
         is_hold=True,
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
@@ -980,6 +983,7 @@ def _publish_ik_failure_hold(
         shared,
         controller.prev_qpos_cmd.copy(),
         safe_hand_qpos,
+        expires_monotonic_ns=observation.anchor_monotonic_ns + cfg.runtime.safety.dispatch_delay_ns,
         gate=resources.safety_gate,
         is_hold=True,
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
@@ -1085,6 +1089,7 @@ def _publish_solved_action(
         shared,
         arm_cmd.copy(),
         hand_cmd.copy() if controller.hand_enabled else None,
+        expires_monotonic_ns=observation.anchor_monotonic_ns + cfg.runtime.safety.dispatch_delay_ns,
         gate=gate,
         arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
@@ -1223,6 +1228,7 @@ def run_control_grid_tick(
             shared,
             controller.prev_qpos_cmd.copy(),
             None,
+            expires_monotonic_ns=observation.anchor_monotonic_ns + cfg.runtime.safety.dispatch_delay_ns,
             gate=gate,
             is_hold=True,
             arm_feedback_max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["arm"]),

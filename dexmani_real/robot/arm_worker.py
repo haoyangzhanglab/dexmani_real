@@ -214,7 +214,7 @@ def _publish_homing_feedback(
 
 
 def _handle_home(st: _LoopState, shared: Any, request: tuple) -> None:
-    """Run planned homing for a queued ``(waypoints, final_qpos, generation)``.
+    """Run planned homing for a queued ``(waypoints, final_qpos, generation, expires_ns)``.
 
     Blocks the worker: the arm drives the collision-validated milestones in
     Mode 0, then restores Mode 6.  A stale request (its generation advanced
@@ -223,9 +223,13 @@ def _handle_home(st: _LoopState, shared: Any, request: tuple) -> None:
     Mode 6 without faulting; any other failure raises into the top-level
     handler, which latches ``error_state``.
     """
-    waypoints, final_qpos, generation = request
+    waypoints, final_qpos, generation, expires_ns = request
     if int(shared.run_generation.value) != generation:
         logger.warning("arm_loop: discarding stale-generation HOME request")
+        return
+    if not coupled_command_may_cross_sdk(
+        shared, run_generation=generation, expires_monotonic_ns=expires_ns
+    ):
         return
     logger.info(
         "arm_loop: HOME — planned homing (%d validated milestones)",
@@ -287,7 +291,10 @@ def _handle_servo_command(
     # an otherwise valid target crosses the xArm SDK boundary. A transient
     # same-generation fence miss retries this record on the next tick; any
     # real revocation advanced the generation and resyncs the cursor.
-    if not coupled_command_may_cross_sdk(shared, run_generation=command_generation):
+    if not coupled_command_may_cross_sdk(
+        shared, run_generation=command_generation,
+        expires_monotonic_ns=int(action["expires_monotonic_ns"][0]),
+    ):
         return
     if issue is not None:
         raise RuntimeError(f"unsafe servo sequence={sequence}: {issue}")
@@ -326,6 +333,11 @@ def _consume_one_arm_command(st: _LoopState, shared: Any, permit_generation: int
         return  # EMPTY is a wait, never a fault
     command, sequence = record
     if not bool(command["arm_present"][0]):
+        if not coupled_command_may_cross_sdk(
+            shared, run_generation=int(command["run_generation"][0]),
+            expires_monotonic_ns=int(command["expires_monotonic_ns"][0]),
+        ):
+            return
         # An absent actuator advances only its consumer; no SDK involvement
         # and no acceptance is implied.
         consumer.advance()

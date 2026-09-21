@@ -68,7 +68,7 @@ class IKHoldAdmissionTest(unittest.TestCase):
         self.assertIsNone(decision.rejected_reason)
         self.assertEqual(decision.source_frames, 8)
         # Source-row mapping is preserved: every row stays processable.
-        self.assertEqual(decision.processed_frames, 8)
+        self.assertEqual(decision.exported_frames, 8)
 
     def test_explicit_annotation_still_excludes(self):
         """Quality selection remains an explicit operator decision."""
@@ -81,7 +81,7 @@ class IKHoldAdmissionTest(unittest.TestCase):
             )
         self.assertFalse(decision.accepted)
         self.assertEqual(decision.rejected_reason, "excluded by annotation")
-        self.assertEqual(decision.processed_frames, 0)
+        self.assertEqual(decision.exported_frames, 0)
 
 
 if __name__ == "__main__":

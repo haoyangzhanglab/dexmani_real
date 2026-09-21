@@ -11,6 +11,7 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
+PUBLISH_REASON_EXPIRED = "command dispatch deadline expired"
 PUBLISH_REASON_RUNTIME_STOPPED = "runtime stopped"
 PUBLISH_REASON_ESTOP = "e-stop requested"
 PUBLISH_REASON_FAULT = "sticky fault"
@@ -52,6 +53,7 @@ class RunEndReason(IntEnum):
     ESTOP = 6
     HARDWARE_FAULT = 7
     RUNTIME_SHUTDOWN = 8
+    COMMAND_EXPIRED = 9
 
 
 _ALLOWED_TRANSITIONS = frozenset(
@@ -86,36 +88,13 @@ class CommittedCommand:
     """Commit receipt of one coherent record in the ordered command FIFO.
 
     The receipt identifies the record for explicit acceptance waits and
-    lifecycle cancellation. It carries no delivery lease: the record stays
-    valid until its run generation is revoked, and workers consume it in
-    commit order.
+    lifecycle cancellation. Workers consume it in commit order while its generation and
+    transported deadline still permit admission.
     """
 
     run_generation: int
     sequence: int
     published_monotonic_ns: int = 0
-
-
-@dataclass(frozen=True)
-class RunEpoch:
-    """Atomic identity and start time of the current control run."""
-
-    generation: int
-    started_monotonic_ns: int
-
-
-@dataclass(frozen=True)
-class RunStateSnapshot:
-    """Atomic safety state and observation epoch used by worker loops."""
-
-    state: SafetyState
-    generation: int
-    started_monotonic_ns: int
-    stop_request: int
-    ended_generation: int
-    ended_started_monotonic_ns: int
-    ended_monotonic_ns: int
-    ended_reason: RunEndReason
 
 
 def _advance_run_generation_locked(shared: Any) -> int:
@@ -159,7 +138,7 @@ def _read_motion_permit_locked(shared: Any) -> MotionPermit:
     return MotionPermit(state, int(shared.run_generation.value))
 
 
-def _begin_motion_locked(shared: Any) -> RunEpoch | None:
+def _begin_motion_locked(shared: Any) -> tuple[int, int] | None:
     """Enter RUNNING while the caller owns ``motion_lock``."""
     if (
         int(shared.safety_state.value) != int(SafetyState.ARMED)
@@ -173,7 +152,7 @@ def _begin_motion_locked(shared: Any) -> RunEpoch | None:
     shared.run_started_monotonic_ns.value = started_ns
     shared.run_started_generation.value = generation
     shared.safety_state.value = int(SafetyState.RUNNING)
-    return RunEpoch(generation=generation, started_monotonic_ns=started_ns)
+    return generation, started_ns
 
 
 def _revoke_motion_locked(
@@ -204,7 +183,6 @@ def _revoke_motion_locked(
         elif shared.error_state.value or new_state is SafetyState.FAULT:
             reason = RunEndReason.HARDWARE_FAULT
         shared.run_ended_generation.value = int(shared.run_started_generation.value)
-        shared.run_ended_started_monotonic_ns.value = int(shared.run_started_monotonic_ns.value)
         shared.run_ended_monotonic_ns.value = time.monotonic_ns()
         shared.run_ended_reason.value = int(reason)
     generation = _invalidate_coupled_commands_locked(shared)
@@ -253,22 +231,20 @@ def read_motion_permit(shared: Any) -> MotionPermit:
         return _read_motion_permit_locked(shared)
 
 
-def read_run_state_snapshot(shared: Any) -> RunStateSnapshot:
-    """Read the run boundary state under one motion lock."""
+def read_run_state(shared: Any) -> tuple[SafetyState, int, int, int]:
+    """Read permission, cancellation generation, run start and STOP atomically."""
     with shared.motion_lock:
         permit = _read_motion_permit_locked(shared)
-        return RunStateSnapshot(
-            state=permit.state,
-            generation=permit.run_generation,
-            started_monotonic_ns=int(shared.run_started_monotonic_ns.value),
-            stop_request=int(shared.stop_request.value),
-            ended_generation=int(shared.run_ended_generation.value),
-            ended_started_monotonic_ns=int(shared.run_ended_started_monotonic_ns.value),
-            ended_monotonic_ns=int(shared.run_ended_monotonic_ns.value),
-            ended_reason=RunEndReason(int(shared.run_ended_reason.value)),
-        )
+        return (permit.state, permit.run_generation,
+                int(shared.run_started_monotonic_ns.value), int(shared.stop_request.value))
 
 
+def read_run_end(shared: Any) -> tuple[int, int, RunEndReason]:
+    """First terminal fact survives delayed inference and subsequent cleanup."""
+    with shared.motion_lock:
+        return (int(shared.run_ended_generation.value),
+                int(shared.run_ended_monotonic_ns.value),
+                RunEndReason(int(shared.run_ended_reason.value)))
 
 
 def _committed_command_is_current_locked(
@@ -277,8 +253,8 @@ def _committed_command_is_current_locked(
 ) -> bool:
     """Return whether *command*'s generation still owns motion.
 
-    The ordered FIFO has no latest-wins slot: a committed record stays valid
-    for its whole epoch, so currency is exactly generation currency.
+    This checks cancellation identity only. Publication and the worker SDK
+    fence separately enforce the transported command deadline.
     """
     permit = _read_motion_permit_locked(shared)
     return bool(
@@ -297,28 +273,34 @@ def coupled_command_is_current(
         return _committed_command_is_current_locked(shared, command)
 
 
-def coupled_command_may_cross_sdk(
-    shared: Any,
-    *,
-    run_generation: int,
-) -> bool:
-    """Return whether a record of *run_generation* may cross an actuator SDK
-    boundary right now.
+def _expire_command_locked(shared: Any, generation: int, expires_ns: int) -> bool:
+    """Revoke only this generation; the caller holds the short motion lock."""
+    if int(shared.run_generation.value) != generation:
+        return False
+    if time.monotonic_ns() < expires_ns:
+        return False
+    _revoke_motion_locked(shared, SafetyState.ARMED, RunEndReason.COMMAND_EXPIRED)
+    shared.start_request.value = False
+    shared.stop_request.value = int(StopRequest.OPERATOR)
+    shared.physical_home_completed.value = False
+    return True
 
-    This is the common final worker check: the record's generation must still
-    own motion and the runtime must not be stopping or faulted. The lock is
-    deliberately released before hardware IO, so workers call this immediately
-    before their SDK method.
+
+def coupled_command_may_cross_sdk(
+    shared: Any, *, run_generation: int, expires_monotonic_ns: int,
+) -> bool:
+    """Order admission against revocation, then release the lock BEFORE SDK IO.
+
+    An already-admitted vendor call may still run/return after revocation.
+    Its old-generation reply cannot authorize a new step or satisfy a new run.
     """
     with shared.motion_lock:
         permit = _read_motion_permit_locked(shared)
-        return bool(
-            permit.allows_motion
-            and permit.run_generation == int(run_generation)
-            and shared.is_running.value
-            and not shared.error_state.value
-            and not shared.estop_request.value
-        )
+        if not (permit.allows_motion and permit.run_generation == int(run_generation)
+                and shared.is_running.value and not shared.error_state.value
+                and not shared.estop_request.value):
+            return False
+        return not _expire_command_locked(shared, run_generation, expires_monotonic_ns)
 
 
 def begin_motion(shared: Any) -> bool:
@@ -331,13 +313,13 @@ def begin_motion(shared: Any) -> bool:
         "safety: ARMED(%d) → RUNNING(%d), generation=%d epoch_ns=%d",
         1,
         2,
-        epoch.generation,
-        epoch.started_monotonic_ns,
+        epoch[0],
+        epoch[1],
     )
     return True
 
 
-def begin_requested_motion(shared: Any) -> RunEpoch | None:
+def begin_requested_motion(shared: Any) -> tuple[int, int] | None:
     """Consume one B request and enter RUNNING unless a newer S is pending."""
     with shared.motion_lock:
         if not bool(shared.start_request.value) or int(
@@ -352,8 +334,8 @@ def begin_requested_motion(shared: Any) -> RunEpoch | None:
         "safety: consumed B; ARMED(%d) → RUNNING(%d), generation=%d epoch_ns=%d",
         1,
         2,
-        epoch.generation,
-        epoch.started_monotonic_ns,
+        epoch[0],
+        epoch[1],
     )
     return epoch
 

@@ -149,7 +149,7 @@ def validate_config(cfg: ExperimentConfig) -> None:
     ):
         section.validate()
     # PointCloudConfig owns its external persisted-policy validation in its
-    # constructor, shared with processed/Zarr input admission.
+    # constructor, shared with raw-to-policy conversion.
     widths = np.diff(cfg.policy.workspace.as_array(), axis=1)
     if 2 * cfg.keyboard_teleop.workspace_command_margin_m >= float(widths.min()):
         raise ValueError(

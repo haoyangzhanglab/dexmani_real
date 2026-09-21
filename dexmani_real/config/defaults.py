@@ -916,6 +916,17 @@ class VRParams:
 class SafetyParams:
     """Safety / heartbeat parameters — single source of truth."""
 
+    # Commission from measured producer/SDK/slew delay; never guess a live value.
+    max_dispatch_delay_s: float | None = None
+
+    @property
+    def dispatch_delay_ns(self) -> int:
+        value = self.max_dispatch_delay_s
+        if (value is None or isinstance(value, bool) or not np.isfinite(value)
+                or value <= 0 or value * 1e9 < 1 or value * 1e9 >= 2**63):
+            raise ValueError("safety.max_dispatch_delay_s requires an explicit finite positive motion budget")
+        return int(value * 1e9)
+
     heartbeat_timeouts: Mapping[str, float] = field(
         default_factory=lambda: {
             "arm": 1.0,
@@ -947,6 +958,8 @@ class SafetyParams:
     supervisor_hz: float = 10.0
 
     def validate(self) -> None:
+        if self.max_dispatch_delay_s is not None:
+            _ = self.dispatch_delay_ns
         if not self.heartbeat_timeouts or any(
             not name or not np.isfinite(value) or value <= 0
             for name, value in self.heartbeat_timeouts.items()

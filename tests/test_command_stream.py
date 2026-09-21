@@ -11,7 +11,7 @@ transport's own sequence identities. Coverage maps to the acceptance matrix:
 * V07 hand intermediate slew / CRC / exact-endpoint cursor distinction;
 * V08 generation cancel batch-invalidates the backlog, stale-generation ACKs
   never satisfy an acceptance wait, and ordered same-generation watermarks
-  prove predecessor acceptance without action-ID supersession.
+  prove predecessor acceptance.
 
 Never opens hardware or an SDK: the arm/hand workers are exercised through
 their consumption functions with fake SDK objects.
@@ -100,10 +100,11 @@ class _FakeShared:
         self.run_started_monotonic_ns = ctx.Value("Q", 0)
         self.run_started_generation = ctx.Value("Q", 0)
         self.run_ended_generation = ctx.Value("Q", 0)
-        self.run_ended_started_monotonic_ns = ctx.Value("Q", 0)
         self.run_ended_monotonic_ns = ctx.Value("Q", 0)
         self.run_ended_reason = ctx.Value("Q", 0)
 
+        self.start_request = ctx.Value("b", False)
+        self.physical_home_completed = ctx.Value("b", False)
         self.stop_request = ctx.Value("b", 0)
         self.arm_state_ring = _StateRing()
         self.hand_state_ring = _StateRing()
@@ -131,8 +132,9 @@ def _publish(
     hand: float | None = None,
     is_hold: bool = False,
     generation: int = _GEN,
+    expires_ns: int | None = None,
 ):
-    candidate = ActionCandidate(
+    candidate = ActionCandidate(expires_monotonic_ns=(time.monotonic_ns() + 10_000_000_000 if expires_ns is None else expires_ns),
         run_generation=generation,
         arm_qpos=None if arm is None else _arm_qpos(arm),
         hand_qpos=None if hand is None else _hand_qpos(hand),

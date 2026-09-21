@@ -17,7 +17,7 @@ import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.robot.commands import ActionCandidate
-from dexmani_real.robot.commands import (PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT, PUBLISH_REASON_FIFO_FULL, PUBLISH_REASON_GENERATION, PUBLISH_REASON_RUNTIME_STOPPED, PUBLISH_REASON_SAFETY_STATE, CommandFeedbackSnapshot, PreparedCommand, PublishResult, command_publishability_reason, prepare_joint_command, publish_command, read_command_feedback)
+from dexmani_real.robot.commands import (PUBLISH_REASON_EXPIRED, PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT, PUBLISH_REASON_FIFO_FULL, PUBLISH_REASON_GENERATION, PUBLISH_REASON_RUNTIME_STOPPED, PUBLISH_REASON_SAFETY_STATE, CommandFeedbackSnapshot, PreparedCommand, PublishResult, command_publishability_reason, prepare_joint_command, publish_command, read_command_feedback)
 from dexmani_real.robot.projection import (
     ArmClipReport,
     project_arm_command_reported,
@@ -63,7 +63,8 @@ from dexmani_real.runtime.safety import (
     SafetyState,
     StopRequest,
     begin_requested_motion,
-    read_run_state_snapshot,
+    read_run_state,
+    read_run_end,
     revoke_motion,
     RunEndReason,
 )
@@ -458,19 +459,17 @@ class PolicyRunner:
             stop_reason=stop_reason,
             trial_generation=self._trial_generation,
         )
-        terminal = read_run_state_snapshot(self.shared)
-        if (terminal.ended_started_monotonic_ns != self.run_started_ns
-                or terminal.ended_generation != self._trial_generation
-                or terminal.ended_reason is RunEndReason.NONE):
+        ended_generation, ended_ns, ended_reason = read_run_end(self.shared)
+        if ended_generation != self._trial_generation or ended_reason is RunEndReason.NONE:
             raise RuntimeError("RUNNING ended without its matching software terminal fact")
-        stop_reason = terminal.ended_reason.name.lower()
+        stop_reason = ended_reason.name.lower()
         reason = stop_reason
         # Trial counting belongs to the run owner: a truly begun trial counts
         # exactly once here, independent of whether its evidence saved.
         self.completed_trials += 1
         self._evidence_logged_this_trial = False
         self.session_running_ns += max(
-            0, terminal.ended_monotonic_ns - int(self.run_started_ns)
+            0, ended_ns - int(self.run_started_ns)
         )
         if (
             self.recorder is not None
@@ -851,7 +850,7 @@ class PolicyRunner:
                     self._recording_outcome_consumed = True
                 if self.recorder.transport_unavailable or start_uncertain:
                     # A timed-out/corrupted START channel is never reused
-                    # while its finalizer may still be unfinished, never
+                    # while its recorder may still be closing, never
                     # auto-restarted, and no second same-owner writer is
                     # opened: later trials simply run without recording.
                     self.recording_unavailable = True
@@ -890,11 +889,11 @@ class PolicyRunner:
             return
         if self.execute:
             self.shared.physical_home_completed.value = False
-        self.run_started_ns = epoch.started_monotonic_ns
-        self._trial_generation = epoch.generation
-        self.next_record_ns = epoch.started_monotonic_ns + self.step_dt_ns
+        self.run_started_ns = epoch[1]
+        self._trial_generation = epoch[0]
+        self.next_record_ns = epoch[1] + self.step_dt_ns
         self._evidence_logged_this_trial = False
-        self._clear_execution(epoch.generation)
+        self._clear_execution(epoch[0])
         self.model_runtime.reset_episode()
         recording_note = (
             "  [evidence unavailable — running without recording]"
@@ -906,7 +905,7 @@ class PolicyRunner:
             f"{recording_note}",
             flush=True,
         )
-        logger.debug("policy_runner_loop: RUNNING generation=%d", epoch.generation)
+        logger.debug("policy_runner_loop: RUNNING generation=%d", epoch[0])
 
     def _handle_run_boundary(self) -> None:
         if not self._poll_recorder():
@@ -974,8 +973,7 @@ class PolicyRunner:
                 self._clear_execution(None)
             return
 
-        run_snapshot = read_run_state_snapshot(self.shared)
-        raw_stop = run_snapshot.stop_request
+        state, generation, started_ns, raw_stop = read_run_state(self.shared)
         if raw_stop not in {int(StopRequest.NONE), int(StopRequest.OPERATOR)}:
             self._fault("invalid stop request code")
             return
@@ -999,7 +997,7 @@ class PolicyRunner:
                     self.shared.stop_request.value = int(StopRequest.NONE)
             return
 
-        if run_snapshot.state is not SafetyState.RUNNING:
+        if state is not SafetyState.RUNNING:
             if self.run_started_ns is not None:
                 self._finish_episode(
                     "motion revoked outside formal stop request",
@@ -1144,7 +1142,7 @@ class PolicyRunner:
             return None, None, None, _PolicyClipReport()
         return (arm_qpos, hand_qpos), None, None, clip
 
-    def _prepare_dispatch_candidate(self, action: np.ndarray) -> ActionCandidate | None:
+    def _prepare_dispatch_candidate(self, action: np.ndarray, *, eligible_ns: int) -> ActionCandidate | None:
         """Decode, project, and gate the queue head exactly once.
 
         decode/IK and SafetyGate consume the SAME immutable feedback snapshot
@@ -1154,6 +1152,7 @@ class PolicyRunner:
         advancing producers is never a device failure. An unavailable ring
         (no committed sample yet) invalidates the pending chunk and waits.
         """
+        expires_ns = eligible_ns + self.runtime.safety.dispatch_delay_ns
         feedback, reason, issue = read_command_feedback(
             self.shared,
             require_hand=True,
@@ -1200,6 +1199,7 @@ class PolicyRunner:
                 arm_qpos, hand_qpos,
                 run_generation=self.run_generation,
                 gate=self.gate,
+                expires_monotonic_ns=expires_ns,
                 arm_feedback_max_age_s=None,
                 hand_feedback_max_age_s=None,
                 feedback_snapshot=feedback,
@@ -1218,9 +1218,11 @@ class PolicyRunner:
         assert candidate is not None
         return candidate
 
-    def _dispatch_action(self, action: np.ndarray) -> None:
+    def _dispatch_action(self, action: np.ndarray, *, eligible_ns: int) -> None:
         """Commit the queue head; a FULL FIFO keeps the identical candidate.
 
+        The caller supplies the existing cadence boundary (or prediction return
+        for a new chunk). Scheduling/IK delay consumes this same budget.
         Preparation happens exactly once per action. A FULL commit result is
         recoverable backpressure: the same immutable prepared candidate is
         retried from the main poll cadence without rebuilding, re-solving IK,
@@ -1228,7 +1230,7 @@ class PolicyRunner:
         index, the continuity reference, and the actual-publication cadence.
         """
         if self._pending_dispatch is None:
-            candidate = self._prepare_dispatch_candidate(action)
+            candidate = self._prepare_dispatch_candidate(action, eligible_ns=eligible_ns)
             if candidate is None:
                 return
             self._pending_dispatch = candidate
@@ -1304,7 +1306,7 @@ class PolicyRunner:
             # and retry from the poll cadence. STOP/fault/timeout keep priority because
             # the main loop polls them between retries.
             return
-        if result.reason in {PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT}:
+        if result.reason in {PUBLISH_REASON_EXPIRED, PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT}:
             return
         # A concurrent S/generation fence is an ordinary episode boundary.  The
         # next loop observes the operator request before any further command;
@@ -1320,11 +1322,11 @@ class PolicyRunner:
         )
 
     def _running_generation_is_live(self) -> bool:
-        snapshot = read_run_state_snapshot(self.shared)
+        state, generation, started_ns, raw_stop = read_run_state(self.shared)
         return (
-            snapshot.state is SafetyState.RUNNING
-            and snapshot.generation == self.run_generation
-            and snapshot.stop_request == int(StopRequest.NONE)
+            state is SafetyState.RUNNING
+            and generation == self.run_generation
+            and raw_stop == int(StopRequest.NONE)
             and bool(self.shared.is_running.value)
             and not bool(self.shared.quit_requested.value)
             and not bool(self.shared.error_state.value)
@@ -1357,11 +1359,11 @@ class PolicyRunner:
         if not self._running_generation_is_live():
             self._handle_run_boundary()
             if self.run_started_ns is not None and not self._running_generation_is_live():
-                snapshot = read_run_state_snapshot(self.shared)
-                if snapshot.state is SafetyState.RUNNING and snapshot.started_monotonic_ns == self.run_started_ns:
+                state, generation, started_ns, raw_stop = read_run_state(self.shared)
+                if state is SafetyState.RUNNING and started_ns == self.run_started_ns:
                     # A command-only pause/rebase is not a trial end. Discard
                     # old intent and re-anchor on the next normal control tick.
-                    self._clear_execution(snapshot.generation, reason="command_epoch_changed")
+                    self._clear_execution(generation, reason="command_epoch_changed")
                 else:
                     self._finish_episode("motion generation changed")
             return
@@ -1376,7 +1378,7 @@ class PolicyRunner:
             return
 
         if self.actions:
-            self._dispatch_action(self.actions[0])
+            self._dispatch_action(self.actions[0], eligible_ns=boundary_ns if boundary_ns is not None else now_ns)
             return
 
         # Queue empty and boundary reached: fresh synchronous replan.
@@ -1426,7 +1428,7 @@ class PolicyRunner:
         self.actions.extend(predicted)
         # The boundary elapsed before observation/inference began; dispatch the
         # first action immediately without waiting another control period.
-        self._dispatch_action(self.actions[0])
+        self._dispatch_action(self.actions[0], eligible_ns=finished_ns)
 
     def run(self) -> None:
         """Poll lifecycle while preparing chunks and waiting for publication deadlines."""
@@ -1436,10 +1438,10 @@ class PolicyRunner:
                 self._recorder_start_wait_ms = 0.0
                 self.shared.set_heartbeat("policy", time.monotonic())
                 self._handle_run_boundary()
-                run_snapshot = read_run_state_snapshot(self.shared)
+                state, generation, started_ns, raw_stop = read_run_state(self.shared)
                 if (
                     self.run_started_ns is not None
-                    and run_snapshot.state is SafetyState.RUNNING
+                    and state is SafetyState.RUNNING
                 ):
                     self._run_active_tick(time.monotonic_ns())
                     if (
