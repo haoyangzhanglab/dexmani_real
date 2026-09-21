@@ -1,4 +1,4 @@
-"""Contracts for row-preserving offline episode processing."""
+"""Contracts for raw-to-policy numerical transforms."""
 
 from __future__ import annotations
 
@@ -31,16 +31,14 @@ def canonical_json(value: Any) -> str:
     )
 
 
-def validate_processed_task_name(value: str) -> str:
-    """Validate the shared processed/Policy task identity, not a path component."""
+def validate_task_name(value: str) -> str:
+    """Validate the shared policy task identity, not a path component."""
     if not isinstance(value, str):
-        raise TypeError("processed task_name must be a string")
+        raise TypeError("task_name must be a string")
     if not value or value == "unknown" or value != value.strip():
-        raise ValueError(
-            "processed task_name must be non-empty, trimmed, and not 'unknown'"
-        )
+        raise ValueError("task_name must be non-empty, trimmed, and not 'unknown'")
     if any(ord(char) < 32 or ord(char) == 127 for char in value):
-        raise ValueError("processed task_name must not contain control characters")
+        raise ValueError("task_name must not contain control characters")
     return value
 
 
@@ -48,16 +46,14 @@ def validate_processed_task_name(value: str) -> str:
 class ProcessingConfig:
     """Point-cloud, fingertip and table transforms; output is always multimodal.
 
-    The canonical processed artifact is one full multimodal episode (joint,
-    action, RGB-D, camera geometry, point cloud, aggregate contact, dense
-    tactile, fingertip, and timing/validity), never a modality-specific profile.
+    Every included episode retains joint targets, RGB-D, geometry, contact,
+    tactile validity, FK and source timing.
     """
 
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = (
         environment.table.plane_abcd
     )
-    gzip_level: int = 4
     hand_urdf_path: str = str(XHAND_RIGHT_URDF_PATH)
     fingertip_link_names: tuple[str, ...] = hand.fingertip_link_names
     handbase_position_eef_m: tuple[float, float, float] = hand.T_eef_handbase_pos_xyz
@@ -85,8 +81,6 @@ class ProcessingConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.pointcloud, PointCloudConfig):
             raise TypeError("pointcloud must be a PointCloudConfig")
-        if not 0 <= self.gzip_level <= 9:
-            raise ValueError("gzip_level must be in [0, 9]")
         if not self.hand_urdf_path or len(self.fingertip_link_names) != 5:
             raise ValueError("fingertip geometry requires a URDF and five link names")
         if (
@@ -123,7 +117,7 @@ class EpisodeAnnotation:
         if not isinstance(self.include, bool):
             raise TypeError("episode include must be boolean")
         if self.task_name is not None:
-            validate_processed_task_name(self.task_name)
+            validate_task_name(self.task_name)
 
 
 @dataclass(frozen=True)
@@ -139,7 +133,7 @@ class EpisodeDecision:
         return self.rejected_reason is None and self.source_frames > 0
 
     @property
-    def processed_frames(self) -> int:
+    def exported_frames(self) -> int:
         return self.source_frames if self.accepted else 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -148,5 +142,45 @@ class EpisodeDecision:
             "accepted": self.accepted,
             "rejected_reason": self.rejected_reason,
             "source_frames": self.source_frames,
-            "processed_frames": self.processed_frames,
+            "exported_frames": self.exported_frames,
         }
+
+
+_CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
+    "joint_state": ((19,), np.dtype(np.float32)),
+    "action": ((19,), np.dtype(np.float32)),
+    "action_ee": ((21,), np.dtype(np.float32)),
+    "contact_force": ((5, 3), np.dtype(np.float32)),
+    "contact_force_valid": ((), np.dtype(np.bool_)),
+    "tactile_force": ((5, 120, 3), np.dtype(np.float32)),
+    "tactile_force_valid": ((), np.dtype(np.bool_)),
+    "fingertip_points": ((5, 3), np.dtype(np.float32)),
+    "eef_pose": ((9,), np.dtype(np.float32)),
+    "camera_intrinsic": ((9,), np.dtype(np.float32)),
+    "camera_extrinsic": ((4, 4), np.dtype(np.float32)),
+    "observation_anchor_monotonic_ns": ((), np.dtype(np.uint64)),
+    "arm_source_monotonic_ns": ((), np.dtype(np.uint64)),
+    "hand_source_monotonic_ns": ((), np.dtype(np.uint64)),
+    "camera_source_monotonic_ns": ((), np.dtype(np.uint64)),
+}
+
+
+def policy_array_specs(
+    length: int,
+    num_points: int,
+    rgb_height: int,
+    rgb_width: int,
+) -> dict[str, tuple[tuple[int, ...], np.dtype[Any]]]:
+    """Policy array shapes and dtypes for one native-RGB-D episode."""
+    specs = {
+        name: ((length, *tail_shape), dtype)
+        for name, (tail_shape, dtype) in _CORE_DATASET_SPECS.items()
+    }
+    specs.update(
+        {
+            "rgb": ((length, rgb_height, rgb_width, 3), np.dtype(np.uint8)),
+            "depth": ((length, rgb_height, rgb_width), np.dtype(np.uint16)),
+            "point_cloud": ((length, num_points, 6), np.dtype(np.float32)),
+        }
+    )
+    return specs

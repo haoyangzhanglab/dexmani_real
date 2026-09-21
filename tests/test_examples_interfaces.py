@@ -1,20 +1,4 @@
-"""Offline interface tests for affected examples entries (task T6, EX table).
-
-Two levels of verification, both without hardware, GUI, or batch --help runs:
-
-* affected entries whose module imports are offline-safe are imported and
-  their real argument parsers are exercised (EX01 run_policy, EX07
-  process_episodes, EX08 export_policy_zarr including the new narrow
-  ``--output`` guard, raw
-  episode, plus parser smoke checks for EX02/EX03/EX04/EX05);
-* the export guard's protected-source rules are unit-tested directly
-  (defaults unchanged, symlink escape refused, existing .zarr store refused).
-
-Entries whose top-level imports require device/GUI stacks (EX06, EX09, EX10,
-EX12-EX14) are validated by AST parse only, per the task's safe-verification
-rules. EX11 is listed there too so the removed-API scan covers it, but it is
-additionally imported and run through its real parser below.
-"""
+"""Offline CLI parsing and output protection; device examples are never run."""
 
 from __future__ import annotations
 
@@ -100,7 +84,7 @@ class ExportOutputGuardTest(unittest.TestCase):
                     self._guard(target, self.root / "in")
 
     def test_input_root_refused(self):
-        input_root = self.root / "processed_task"
+        input_root = self.root / "raw_task"
         input_root.mkdir()
         with self.assertRaises(ValueError):
             self._guard(input_root / "sneaky.zarr", input_root)
@@ -153,10 +137,10 @@ class ExportOutputGuardTest(unittest.TestCase):
     def test_parser_exposes_narrow_output(self):
         parser = _export_cli._parser()
         args = parser.parse_args(
-            ["episodes_processed/task", "--output", "/tmp/gen2.zarr"]
+            ["episodes/task", "--output", "/tmp/gen2.zarr"]
         )
         self.assertEqual(args.output, Path("/tmp/gen2.zarr"))
-        args_default = parser.parse_args(["episodes_processed/task"])
+        args_default = parser.parse_args(["episodes/task"])
         self.assertIsNone(args_default.output)
 
 
@@ -183,26 +167,21 @@ class AffectedParserSmokeTest(unittest.TestCase):
         self.assertEqual(args.num_trials, 3)
         self.assertEqual(args.max_running_s, 12.0)
 
-    def test_process_episodes_keeps_output_root_annotations_dry_run(self):
-        module = _load_example_or_skip(self, "process_episodes")
+    def test_export_keeps_annotations_dry_run(self):
+        module = _load_example_or_skip(self, "export_policy_zarr")
         args = module._parser().parse_args(
             [
                 "episodes/task",
-                "--output-root",
+                "--output",
                 "/tmp/out",
                 "--annotations",
                 "ann.yml",
                 "--dry-run",
             ]
         )
-        self.assertEqual(args.output_root, Path("/tmp/out"))
+        self.assertEqual(args.output, Path("/tmp/out"))
         self.assertEqual(args.annotations, Path("ann.yml"))
         self.assertTrue(args.dry_run)
-
-    def test_replay_episode_keeps_processed_flag(self):
-        module = _load_example_or_skip(self, "replay_episode")
-        args = module._parse_args(["episodes/task/episode_x", "--processed"])
-        self.assertTrue(args.processed)
 
     def test_collect_teleop_no_record_configuration_reaches_session(self):
         from unittest.mock import patch
@@ -234,31 +213,6 @@ class AffectedParserSmokeTest(unittest.TestCase):
             self.assertEqual(module.main(["--hand-geometry", "absent"]), 0)
         self.assertEqual(session.call_args.kwargs["hand_geometry"], "absent")
 
-    def test_single_episode_processing_dry_run_is_read_only(self):
-        import hashlib
-        import subprocess
-        from tests.raw_episode_fixture import build_raw_episode
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            episode = build_raw_episode(root / "task" / "episode_fixture")
-            source = episode.parent if episode.is_file() else episode
-            def hashes():
-                return {str(p.relative_to(source)): hashlib.sha256(p.read_bytes()).hexdigest()
-                        for p in source.rglob("*") if p.is_file()}
-            before = hashes()
-            output = root / "processed" / "provenance_fixture"
-            result = subprocess.run([sys.executable, str(_EXAMPLES / "process_episodes.py"),
-                str(source), "--dry-run", "--output-root", str(output)],
-                capture_output=True, text=True, cwd=_REPO_ROOT, timeout=30)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("1 accepted", result.stderr)
-            self.assertFalse(output.exists())
-            self.assertEqual(hashes(), before)
-
-
-
-
-
 class StaticEntryCheckTest(unittest.TestCase):
     """AST-parse the device/GUI entries and scan them for removed APIs.
 
@@ -269,7 +223,6 @@ class StaticEntryCheckTest(unittest.TestCase):
         for name in (
             "calibrate_vr_heading",
             "visualize_episode",
-            "visualize_episode_processed",
             "pointcloud_process_example",
             "realsense_record_example",
             "xhand_control_example",

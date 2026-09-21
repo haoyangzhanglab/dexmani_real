@@ -27,7 +27,6 @@ from dexmani_real.replay.session import (
     replay_episode,
 )
 from dexmani_real.replay.trajectory import (
-    load_processed_trajectory,
     load_trajectory,
     resolve_episode_path,
 )
@@ -61,7 +60,6 @@ Examples:
   python examples/replay_episode.py episodes/<task_name>/<episode_dir>
   python examples/replay_episode.py episodes/<task_name>/<episode_dir> --acc 810 --speed 120
   python examples/replay_episode.py episodes/<task_name>/<episode_dir> --output replay_results/my_replay/
-  python examples/replay_episode.py episodes_processed/<task>/episode_<timestamp>.h5 --processed
 
 Controls:
   Q     clean exit (save partial results)
@@ -74,7 +72,7 @@ Controls:
         type=str,
         help=(
             "Published current raw-schema episode directory (episodes/<task_name>/episode_*) "
-            "or, with --processed, a processed HDF5 selection artifact."
+            "with recorded float64 sent targets."
         ),
     )
     parser.add_argument(
@@ -97,14 +95,6 @@ Controls:
         type=_positive_float,
         default=None,
         help="Joint max speed (°/s); must match the recording's resolved config.",
-    )
-    parser.add_argument(
-        "--processed",
-        action="store_true",
-        help=(
-            "Use a processed HDF5 only as a retained-row manifest. Physical commands "
-            "come from its raw source episode."
-        ),
     )
     return parser.parse_args(argv)
 
@@ -129,22 +119,9 @@ def _resolve_replay_runtime(args: argparse.Namespace) -> ReplayRuntimeSelection:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
-        trajectory = (
-            load_processed_trajectory(args.episode)
-            if args.processed
-            else load_trajectory(args.episode)
-        )
+        trajectory = load_trajectory(args.episode)
     except (FileNotFoundError, OSError, ValueError) as exc:
         print(f"Error loading episode: {exc}")
-        if args.processed:
-            print(
-                "Hint: processed replay requires the recorded raw episode at its "
-                "provenance source_path with matching data.h5."
-            )
-        elif Path(args.episode).is_file():
-            print(
-                "Hint: this path is a file; use --processed only for a processed HDF5."
-            )
         return 1
 
     try:
@@ -163,21 +140,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  EE data: {'yes' if trajectory.arm_ee is not None else 'no'}")
     print(f"  Acc: {selection.acceleration_deg_s2:.0f}°/s²")
     print(f"  Joint speed: {selection.joint_speed_deg_s:.0f}°/s")
-    if args.processed:
-        print(
-            "  Processed selection: using retained rows from raw source commands; "
-            "the processed float32 action array is not sent to hardware."
-        )
 
     evaluate_consistency = bool(np.all(np.isfinite(trajectory.arm_qpos)))
     if not evaluate_consistency:
         print("Warning: arm_qpos is invalid; consistency metrics will be skipped.")
     if args.output is None:
-        episode_name = (
-            Path(args.episode).stem
-            if args.processed
-            else resolve_episode_path(args.episode)[1]
-        )
+        episode_name = resolve_episode_path(args.episode)[1]
         output_dir = str(Path(DEFAULT_OUTPUT_DIR) / f"{episode_name}_replay")
     else:
         output_dir = args.output

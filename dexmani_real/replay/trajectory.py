@@ -5,11 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-import h5py
 import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.dataset.processed import validate_processed_hdf5
 from dexmani_real.planning import Pose, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 from dexmani_real.planning.paths import wrap_nearest_equivalent
@@ -182,30 +180,6 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
         trajectory.task_label or "(none)",
         ("yes" if trajectory.has_hand_actions else "no"),
         "yes" if trajectory.arm_ee is not None else "no",
-    )
-    return trajectory
-
-
-def load_processed_trajectory(episode_path: str) -> TrajectoryData:
-    """Load the complete raw command trajectory identified by a processed episode.
-
-    Processed float32 actions are training values. Physical replay always uses
-    the original raw float64 sent targets and its existing safety preflight.
-    """
-    artifact_path = Path(episode_path)
-    validated = validate_processed_hdf5(artifact_path)
-    with h5py.File(artifact_path, "r") as artifact:
-        source_path = Path(artifact.attrs["source_path"])
-    trajectory = load_trajectory(str(source_path))
-    if trajectory.num_frames != validated["frames"]:
-        raise ValueError(
-            f"processed episode {artifact_path.name} source frame count does not match raw source"
-        )
-    logger.info(
-        "Loaded complete raw replay: %d frames from %s (artifact=%s)",
-        trajectory.num_frames,
-        source_path,
-        artifact_path,
     )
     return trajectory
 

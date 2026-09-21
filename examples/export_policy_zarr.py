@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""Export or preflight processed Real episodes for dexmani_policy.
-
-Offline CLI that exports validated processed task episodes to a minimal
-dexmani_policy Zarr. Connects to no hardware, opens no GUI, and writes only
-the resolved output store. The output defaults to the derived
-``datasets/<task>.zarr`` and ``--output`` may redirect it to a new generation
-of the same task, while the task identity always comes from the positional
-input ``episodes_processed/<task>``. ``--dry-run`` performs the same
-input-contract and finite-payload checks without creating an output store.
-Progress bars and errors go to stderr;
-stdout stays empty. Argument parsing and terminal presentation live here; the
-export transaction itself stays in ``dexmani_real.dataset.export``.
-"""
+"""Export raw episodes directly to policy Zarr; --dry-run executes the same transforms."""
 
 from __future__ import annotations
 
@@ -26,25 +14,27 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tqdm import tqdm
 
-from dexmani_real.dataset.contracts import validate_processed_task_name
+from dexmani_real.dataset.contracts import ProcessingConfig, validate_task_name
+from dexmani_real.config.experiment import resolve_experiment_config
+from dataclasses import replace
+from dexmani_real.ipc.schema import SUPPORTED_POINT_CLOUD_COUNTS
 from dexmani_real.dataset.export import (
     PolicyZarrExportConfig,
-    export_processed_hdf5_to_zarr,
-    preflight_processed_hdf5_to_zarr,
+    export_raw_to_zarr,
 )
 from dexmani_real.utils.atomic_io import target_is_occupied
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Export validated Real processed HDF5 episodes to dexmani_policy Zarr."
+        description="Transform raw Real episodes to dexmani_policy Zarr."
     )
     parser.add_argument(
         "input_root",
         type=Path,
-        metavar="episodes_processed/<task_name>",
+        metavar="episodes/<task_name>",
         help=(
-            "One processed task directory. Exports to "
+            "One raw task directory. Exports to "
             "datasets/<task_name>.zarr by default (see --output); existing "
             "output paths are refused."
         ),
@@ -58,9 +48,29 @@ def _parser() -> argparse.ArgumentParser:
             "(default: datasets/<task_name>.zarr). The task identity always "
             "comes from the input directory. Existing outputs are refused, "
             "and the resolved target (symlinks followed) must not fall "
-            "inside the protected sources: episodes/, episodes_processed/, "
+            "inside the protected sources: episodes/, "
             "rollouts/, the input root, or an existing .zarr store."
         ),
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Experiment YAML; otherwise use the default experiment configuration.",
+    )
+    parser.add_argument(
+        "--annotations",
+        type=Path,
+        help="Whole-episode include/task annotations; unknown episodes are rejected.",
+    )
+    parser.add_argument(
+        "--task-name",
+        help="Explicit task label override; must match the input task directory.",
+    )
+    parser.add_argument(
+        "--pointcloud-num-points",
+        type=int,
+        choices=sorted(SUPPORTED_POINT_CLOUD_COUNTS),
+        default=None,
     )
     parser.add_argument("--chunk-frames", type=int, default=100)
     parser.add_argument("--compression-level", type=int, default=3)
@@ -68,7 +78,7 @@ def _parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help=(
-            "Read and validate the processed inputs without creating a Zarr output. "
+            "Compute and validate raw inputs without creating a Zarr output. "
             "Use this before a large export."
         ),
     )
@@ -78,6 +88,7 @@ def _parser() -> argparse.ArgumentParser:
 # Source roots whose contents must never receive derived export output. They
 # are anchored to the REPOSITORY root, not the caller's working directory, so
 # the guard holds no matter where the tool is invoked from.
+# Historical data directories remain write-protected even though their loader is gone.
 _PROTECTED_SOURCE_ROOTS = ("episodes", "episodes_processed", "rollouts")
 
 
@@ -88,7 +99,7 @@ def _resolve_output_path(
 ) -> Path:
     """Resolve the export target and keep it outside every protected source.
 
-    Symlinks are followed, so a link that escapes into raw/processed/rollout
+    Symlinks are followed, so a link that escapes into raw/rollout
     data is refused by its resolved location. Overwriting any existing output
     is refused by the occupied-target check before either mode runs. The
     returned path is the same one the checks resolved (``~`` expanded), so
@@ -97,8 +108,7 @@ def _resolve_output_path(
     candidate = default_path if output is None else output
     resolved = candidate.expanduser().resolve(strict=False)
     protected = [
-        (_REPO_ROOT / name).resolve(strict=False)
-        for name in _PROTECTED_SOURCE_ROOTS
+        (_REPO_ROOT / name).resolve(strict=False) for name in _PROTECTED_SOURCE_ROOTS
     ]
     protected.append(input_root.expanduser().resolve(strict=False))
     for root in protected:
@@ -125,15 +135,14 @@ def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:
     task_name = input_root.name
     if not task_name or task_name in {".", ".."}:
         raise ValueError(
-            "input_root must name one task directory, e.g. "
-            "episodes_processed/pick_place_toy"
+            "input_root must name one task directory, e.g. episodes/pick_place_toy"
         )
     try:
-        task_name = validate_processed_task_name(task_name)
+        task_name = validate_task_name(task_name)
     except (TypeError, ValueError) as exc:
         raise ValueError(
             "input_root must name one valid task directory, e.g. "
-            "episodes_processed/pick_place_toy"
+            "episodes/pick_place_toy"
         ) from exc
     return Path("datasets") / f"{task_name}.zarr", task_name
 
@@ -141,11 +150,7 @@ def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:
 class _ExportProgress:
     """Render the data-layer's cumulative progress events as one bar per phase."""
 
-    _PHASE_LABELS = {
-        "validate": ("validate processed episodes", "file"),
-        "write": ("write policy Zarr", "frame"),
-        "verify": ("verify policy Zarr", "array"),
-    }
+    _PHASE_LABELS = {"convert": ("raw to policy Zarr", "episode")}
 
     def __init__(self) -> None:
         self._phase: str | None = None
@@ -194,19 +199,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
     try:
-        if args.dry_run:
-            report = preflight_processed_hdf5_to_zarr(
-                args.input_root,
-                config,
-                progress_callback=progress.update,
+        runtime = resolve_experiment_config(yaml_path=args.config)
+        processing = ProcessingConfig.from_runtime(runtime)
+        if args.pointcloud_num_points is not None:
+            processing = replace(
+                processing,
+                pointcloud=replace(
+                    processing.pointcloud, num_points=args.pointcloud_num_points
+                ),
             )
-        else:
-            report = export_processed_hdf5_to_zarr(
-                args.input_root,
-                output_path,
-                config,
-                progress_callback=progress.update,
-            )
+        report = export_raw_to_zarr(
+            args.input_root,
+            output_path,
+            config,
+            processing=processing,
+            annotations_path=args.annotations,
+            task_name=args.task_name,
+            dry_run=args.dry_run,
+            progress_callback=progress.update,
+        )
     except (FileExistsError, FileNotFoundError, NotADirectoryError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

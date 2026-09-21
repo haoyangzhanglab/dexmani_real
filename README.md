@@ -41,14 +41,12 @@ keyboard/calibration jog 必须先释放按键。HOME 排队使用现有 request
 |---|---|---|
 | VR collection | `python examples/collect_teleop.py --task-name <task> --operator <name>` | 真机；raw episode |
 | Keyboard jog / home | `python examples/keyboard_teleop.py` | 真机 |
-| Physical replay | `python examples/replay_episode.py <episode>` | 真机；processed 输入加 `--processed` |
+| Physical replay | `python examples/replay_episode.py <episode>` | 真机；raw float64 sent targets |
 | Policy rollout | `python examples/run_policy.py <policy/task/experiment>` | 真机；rollout session |
 | Camera calibration | `python examples/calibrate_camera.py --hand-geometry {absent,secured-home}` | 真机；标定 |
 | VR heading calibration | `python examples/calibrate_vr_heading.py` | VR / HTS；标定 |
-| Offline processing | `python examples/process_episodes.py episodes/<task> --dry-run` | 只读预检；移除 `--dry-run` 后转换 |
-| Policy export | `python examples/export_policy_zarr.py episodes_processed/<task> --dry-run` | 只读预检；移除 `--dry-run` 后导出 |
+| Policy export | `python examples/export_policy_zarr.py episodes/<task> --dry-run` | 只读预检；移除 `--dry-run` 后导出 |
 | Inspect raw | `python examples/visualize_episode.py <episode> --info` | 离线；去掉 `--info` 可视化 |
-| Inspect processed | `python examples/visualize_episode_processed.py <processed.h5> --info` | 离线 |
 
 完整参数与按键以各入口的 `--help` 为准。
 
@@ -94,15 +92,26 @@ policy 子进程拥有模型 / CUDA，先 load / warmup，再启动硬件 worker
 当前路径：
 
 ```text
-raw episode → offline geometric / sensor processing → processed HDF5 → Policy Zarr
+raw episode → offline geometric / sensor transforms → Policy Zarr
 ```
 
-中间 processing 有真实工作：相机几何、点云、坐标变换、FK / fingertip / 触觉准备。
-processed 文件是可检查的离线结果，而不是另一套运行时协议。batch report 是普通 YAML 摘要，
-不具有独立的 schema / migration / loader 体系。
+```bash
+python examples/export_policy_zarr.py episodes/<task> --dry-run
+python examples/export_policy_zarr.py episodes/<task>
+# 新输出位置（目标必须不存在），使用实验几何配置
+python examples/export_policy_zarr.py episodes/<task> --config experiment.yaml --output datasets/<task>_v2.zarr
+```
+
+默认输出为 `datasets/<task>.zarr`。转换保留每个完整 episode 的行数与边界、实际 source timestamps、
+RGB-D、点云、FK/EE/fingertips、joint/EE actions 和触觉 validity。数值按 episode、图像按有界 chunk
+处理；正式 export 不先完整 dry-run 一遍。`--dry-run` 执行相同转换和 admission，但不写输出。
+技术损坏会阻断整个输出；`--annotations` YAML 可显式排除整个 episode（`include: false`），
+或提供 `task_name`。一个输出只允许一个 task，必须与输入任务目录名一致；`--task-name` 可显式覆盖
+raw task label，但不能与 annotation 冲突。未知 episode annotation 会报错。已有输出、输入内部路径、
+源数据目录和已有 Zarr 内部均拒绝覆盖/写入。
 
 policy_eval 的同步、非均匀时序不能被静默解释成 fixed-dt teleop 数据。
-目前 processing 和 fixed-rate replay 仍拒绝这种输入；需要 time-aware conversion 才能改变此限制。
+转换和 fixed-rate replay 仍拒绝这种输入；需要 time-aware conversion 才能改变此限制。
 触觉 validity 必须保存，不能把传感器无效数据解释成零接触力。
 
 raw 当前只支持 v30。旧 v29 episode 可独立复制转换，不修改原始数据：

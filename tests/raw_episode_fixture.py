@@ -155,3 +155,23 @@ def build_raw_episode(
             )
 
     return root
+
+
+def build_policy_raw_episode(root, *, num_frames=3):
+    """Synthetic depth and moving joints for real FK/cloud conversion tests."""
+    path = build_raw_episode(root, num_frames=num_frames)
+    with h5py.File(path / "depth.h5", "r+") as f:
+        f["depth"][:] = 600
+    with h5py.File(path / "data.h5", "r+") as f:
+        for name, width in (("arm_qpos", 7), ("hand_qpos", 12),
+                            ("action_arm_joint_sent", 7), ("action_hand_joint", 12)):
+            f[name][:] = np.arange(num_frames * width).reshape(num_frames, width) * .001
+    return path
+
+
+def policy_processing_config():
+    from dexmani_real.config.pointcloud import PointCloudConfig
+    from dexmani_real.dataset.contracts import ProcessingConfig
+    return ProcessingConfig(pointcloud=PointCloudConfig(
+        workspace=(-1, -1, 0, 1, 1, 2), outlier_radius_m=.15,
+        outlier_min_neighbors=1, outlier_min_component_points=1), table_plane_abcd=None)
