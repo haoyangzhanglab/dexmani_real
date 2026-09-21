@@ -436,7 +436,8 @@ class EpisodeRecorder:
         self._pending_rows.clear()
 
     def finish_episode(
-        self, save: bool = True, reason: str = "", *, failure_note: str = ""
+        self, save: bool = True, reason: str = "", *, failure_note: str = "",
+        deadline_monotonic_ns: int | None = None
     ) -> str | None:
         """Synchronously finish one episode and return its reserved final path.
 
@@ -478,7 +479,8 @@ class EpisodeRecorder:
         self._finishing = True
         try:
             self._finish_episode_transaction(
-                save, reason, truncated, failure_note=failure_note
+                save, reason, truncated, failure_note=failure_note,
+                deadline_monotonic_ns=deadline_monotonic_ns
             )
         finally:
             self._finishing = False
@@ -491,11 +493,12 @@ class EpisodeRecorder:
         truncated: bool,
         *,
         failure_note: str = "",
+        deadline_monotonic_ns: int | None = None,
     ) -> None:
         """Finalize one transaction; retain any resource that failed cleanup."""
         failure = None
         try:
-            self._finalize_episode_files(save, reason, truncated)
+            self._finalize_episode_files(save, reason, truncated, deadline_monotonic_ns=deadline_monotonic_ns)
         except Exception as exc:
             failure = exc
             logger.error("episode finalization failed", exc_info=True)
@@ -563,6 +566,7 @@ class EpisodeRecorder:
         save: bool,
         reason: str,
         truncated: bool,
+        *, deadline_monotonic_ns: int | None = None,
     ) -> None:
         """Close, validate, and publish files before releasing staging ownership."""
         duration = time.perf_counter() - (self._start_time or 0.0)
@@ -620,6 +624,8 @@ class EpisodeRecorder:
         if _tmp is not None and _final is not None:
             if save:
                 self._validate_temp_episode(Path(_tmp), self._frame_count)
+                if deadline_monotonic_ns is not None and time.monotonic_ns() >= deadline_monotonic_ns:
+                    raise TimeoutError("episode close exceeded its original finalization deadline")
                 atomic_publish(_tmp, _final)
                 self._last_finish_saved = True
                 logger.info("Episode saved: %s frames=%d", _final, self._frame_count)

@@ -78,6 +78,8 @@ class _FakeRecorderClient:
 def _fake_shared(*, safety_state: int = int(SafetyState.ARMED)):
     return SimpleNamespace(
         motion_lock=threading.RLock(),
+        recorder_finish_deadline_ns=SimpleNamespace(value=0),
+        recorder_transport_failed=SimpleNamespace(value=False),
         start_request=SimpleNamespace(value=False),
         stop_request=SimpleNamespace(value=0),
         physical_home_completed=SimpleNamespace(value=True),
@@ -376,6 +378,8 @@ class TerminalResultConsumptionTest(unittest.TestCase):
             evidence_failed = SimpleNamespace(value=False)
             record_sample_ring = SimpleNamespace(latest_sequence=0, maxlen=4)
             recorder_consumed_sequence = SimpleNamespace(value=0)
+            recorder_finish_deadline_ns = SimpleNamespace(value=0)
+            recorder_transport_failed = SimpleNamespace(value=False)
             set_heartbeat = staticmethod(lambda *a: None)
 
         client = RecorderClient(_Shared())

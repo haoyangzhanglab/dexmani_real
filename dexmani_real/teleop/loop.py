@@ -387,7 +387,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
     pause_reason: str | None = None
     quit_pending = False
     quit_after_recording = False
-    quit_recording_deadline_s = 0.0
     post_teleop_deadline_s = 0.0
     arm_feedback_error_count = 0
     hand_disconnected_at_s: float | None = None
@@ -610,8 +609,9 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     gc.collect()
                     if quit_after_recording:
                         shared.quit_requested.value = True
-                elif stop_result.error:
-                    print("  ⚠ 录制终结超过时限；仍在安全回收，本会话将标记为失败")
+                elif stop_result.error and quit_after_recording:
+                    # Client and supervisor enforce the original STOP deadline.
+                    shared.quit_requested.value = True
                 if recording_active and recorder.camera_writer_error is not None:
                     logger.error(
                         "Camera writer failed — retaining closed partial episode: %s",
@@ -682,10 +682,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         elif recorder is not None and recorder.stop_pending:
                             if not quit_after_recording:
                                 quit_after_recording = True
-                                quit_recording_deadline_s = (
-                                    time.monotonic()
-                                    + cfg.runtime.policy.quit_save_timeout_s
-                                )
                             print("  录制仍在终结；完成后自动退出", flush=True)
                         else:
                             shared.quit_requested.value = True
@@ -698,23 +694,11 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 if shared.quit_requested.value:
                     continue
                 recording_stop_pending = recorder is not None and recorder.stop_pending
-                if (
-                    quit_after_recording
-                    and recording_stop_pending
-                    and time.monotonic() >= quit_recording_deadline_s
-                ):
-                    print("  录制终结超时 — 退出并将本会话标记为失败")
-                    shared.quit_requested.value = True
-                    continue
                 if time.perf_counter() <= post_teleop_deadline_s:
                     continue
                 if recording_stop_pending:
                     if not quit_after_recording:
                         quit_after_recording = True
-                        quit_recording_deadline_s = (
-                            time.monotonic() + cfg.runtime.policy.quit_save_timeout_s
-                        )
-                        print("  timeout — 等待录制终结后自动退出", flush=True)
                     continue
                 print("  timeout — auto exit")
                 shared.quit_requested.value = True
@@ -1012,7 +996,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
     finally:
         if recording_active:
             # An automatic exit is not the operator's DISCARD. Preserve the
-            # committed prefix after the existing finalizer releases writers.
+            # committed prefix after the recorder process closes its writers.
             reason = "policy_shutdown"
             if shared.estop_request.value:
                 reason = "estop"

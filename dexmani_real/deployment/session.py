@@ -34,8 +34,10 @@ from dexmani_real.runtime.processes import (
     stop_processes_verified,
 )
 from dexmani_real.runtime.safety import SafetyState, require_transition
+from dexmani_real.runtime.status import ExitReason
 from dexmani_real.runtime.supervisor import (
     run_supervisor,
+    supervisor_exit_reason,
     shutdown_processes,
     wait_subsystem_ready,
     start_evidence_services,
@@ -172,20 +174,37 @@ def _rollout_recorder_config(
     )
 
 
-def _wait_for_rollout_recording(shared: RuntimeChannels, processes: list[Any]) -> bool:
+def _wait_for_rollout_recording(
+    shared: RuntimeChannels, processes: list[Any], *,
+    heartbeat_timeouts_s: dict[str, float], service_process_names: set[str],
+) -> bool:
     """Allow the ordinary recorder transaction to finish before shutdown.
 
-    Motion must already be fenced. Only the recorder and its policy owner
-    need to remain alive; no arm/hand acceptance is involved in finalization.
+    Motion is already revoked; hardware health and the independent operator
+    listener remain active. The policy child is the sole result consumer.
     """
     owners = [
         process for process in processes if process.name in {"policy", "recorder"}
     ]
-    deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
+    deadline = time.monotonic_ns() + int(RECORDER_STOP_TIMEOUT_S * 1e9)
     while bool(shared.is_recording.value):
+        now = time.monotonic()
+        reason = supervisor_exit_reason(
+            shared, processes,
+            {name: now - shared.get_heartbeat(name) for name in heartbeat_timeouts_s},
+            heartbeat_timeouts_s, service_process_names=service_process_names,
+        )
+        if reason in {ExitReason.ESTOP, ExitReason.STICKY_FAULT,
+                      ExitReason.WORKER_DEATH, ExitReason.HEARTBEAT_TIMEOUT}:
+            require_transition(shared, SafetyState.FAULT)
+            return False
+        finishing = int(shared.recorder_finish_deadline_ns.value)
+        if finishing > 0:
+            deadline = min(deadline, finishing)
         if (
             len(owners) != 2
-            or time.monotonic() >= deadline
+            or time.monotonic_ns() >= deadline
+            or shared.recorder_transport_failed.value
             or not all(p.is_alive() for p in owners)
         ):
             return False
@@ -565,17 +584,15 @@ def run_policy_deployment(
             max_running_s=max_running_s,
         )
 
-        # Stop user input before finalization. E-stop remains latched and the
-        # software fence is applied before any disk wait.
-        if operator_stop is not None:
-            operator_stop.set()
+        # Keep the independent listener alive until file cleanup is bounded.
         require_transition(
             shared, SafetyState.ARMED if normal_exit else SafetyState.FAULT
         )
         if normal_exit:
             shared.quit_requested.value = True
         if recording_config is not None and not _wait_for_rollout_recording(
-            shared, started_procs
+            shared, started_procs, heartbeat_timeouts_s=heartbeat_timeouts,
+            service_process_names=service_process_names,
         ):
             logger.error("rollout recording did not finalize before shutdown")
             shared.evidence_failed.value = True
@@ -772,9 +789,8 @@ def run_operator_control(
                         )
                         continue
                     with shared.motion_lock:
-                        home_allowed = int(shared.safety_state.value) == int(
-                            SafetyState.ARMED
-                        )
+                        home_allowed = (not shared.quit_requested.value and
+                            int(shared.safety_state.value) == int(SafetyState.ARMED))
                         shared.physical_home_completed.value = False
                         if home_allowed:
                             # H follows any older inactive S but cannot erase an
@@ -829,8 +845,8 @@ def run_operator_control(
                     keyboard.drain_signal(OperatorCommand.BEGIN)
                     discard_begin_in_batch = True
                 elif signal is OperatorCommand.QUIT:
-                    # The immediate callback already fenced motion and set Q.
-                    return
+                    # Listener stays available through final recording cleanup.
+                    continue
                 elif signal is OperatorCommand.EMERGENCY_STOP:
                     shared.estop_request.value = True
                     return

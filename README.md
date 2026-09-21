@@ -66,6 +66,9 @@ python examples/collect_teleop.py --task-name <task> --operator <name> --no-hand
 录制失败不应突然中断人工控制，但会使会话结果失败。arm / hand / VR 控制故障仍走停机路径。
 自动中断时，非空且已安全关闭的录制前缀保存在 `incomplete_*`，不是可直接训练的完整 episode；
 显式丢弃仍丢弃。最终路径与录制结果查看日志。
+recorder 进程自己 drain 最后一帧、关闭视频/HDF5 并发布结果；关闭期间使用原始固定 deadline，
+不以普通循环 heartbeat 判死。无法确认关闭时保留 staging，停止后不复用其 IPC；
+上一 episode 的结果未确认前不开始下一次录制。键盘监听持续到录制收尾完成。
 
 ### Policy rollout
 

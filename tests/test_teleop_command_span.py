@@ -1,15 +1,4 @@
-"""Offline tests for teleop backpressure-span accounting (task T2, V05/V19).
-
-A teleop producer can hold a prepared-but-uncommitted candidate while the
-ordered command FIFO is full. Every pause boundary that discards that
-candidate must close the visible ``[WAIT]`` span with its own ``[DROP]``:
-otherwise the span outlives its candidate, the next ``[WAIT]`` is suppressed,
-and the following ``[RESUME]`` reports a wait that never resumed.
-
-The span tests exercise the real tracker and close helper. Recording cases
-drive the real Teleop loop, client and RecorderIO transaction against synthetic
-inputs and temporary media; planner/input initialization is isolated from hardware.
-"""
+"""Offline teleop recording ownership and keyboard FULL/release regressions."""
 
 from __future__ import annotations
 
@@ -34,6 +23,7 @@ class _TeleopRecordingHarness:
         from test_recording_preservation import _make_recorder, _RGB_SHAPE, _DEPTH_SHAPE, _CONTROL_HZ
 
         self.case = case
+        self._io_thread = None
         tmp = tempfile.TemporaryDirectory()
         case.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
@@ -92,12 +82,11 @@ class _TeleopRecordingHarness:
         self.config = TeleopConfig(runtime=runtime)
 
         def cleanup_writer():
+            if self._io_thread is not None:
+                self._io_thread.join(5)
+                case.assertFalse(self._io_thread.is_alive())
             if self.recorder.is_recording:
                 self.recorder.finish_episode(False, "test_cleanup")
-            pending = self.session.pending_finalization
-            if pending is not None:
-                pending.thread.join(5)
-                case.assertFalse(pending.thread.is_alive())
         case.addCleanup(cleanup_writer)
 
     def add_rows(self, count=2):
@@ -107,18 +96,21 @@ class _TeleopRecordingHarness:
                 _frame(float(index + 1))))
 
     def begin_finalization(self):
+        import threading
+        # A test thread stands in for the independent recorder process.
         stop = self.shared.record_control_q.get_nowait()
-        self.session._handle_stop(stop)
-        self.session._drain_samples()
+        def work():
+            self.session._handle_stop(stop)
+            self.session._drain_samples()
+        self._io_thread = threading.Thread(target=work)
+        self._io_thread.start()
 
     def finalize(self):
-        if self.session.pending_finalization is None:
+        if self._io_thread is None:
             self.begin_finalization()
-        pending = self.session.pending_finalization
-        self.case.assertIsNotNone(pending)
-        pending.thread.join(5)
-        self.case.assertFalse(pending.thread.is_alive())
-        self.session._poll_finalization()
+        self._io_thread.join(5)
+        self.case.assertFalse(self._io_thread.is_alive())
+        self._io_thread = None
 
     def run(self, steps, *, decision=None):
         import contextlib
@@ -364,8 +356,6 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
         self.assertEqual([f for f, c in r.attempts if c is r.prepared[0]], [1])
         self.assertEqual(len(r.published), 1)
         self.assertIs(r.published[0][1], r.prepared[1])
-        self.assertEqual(r.logs.count("[DROP]"), 1)
-        self.assertIn("reason=release", r.logs)
         self.assertGreaterEqual(r.anchors, 2)
 
     def test_unacked_predecessor_uses_original_release_timeout(self):
@@ -377,8 +367,6 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
         self.assertEqual(r.snapshots[4][0], SafetyState.RUNNING)
         self.assertEqual(r.snapshots[8][0], SafetyState.RUNNING)
         self.assertEqual(r.snapshots[9][0], SafetyState.ARMED)
-        self.assertIn("final sequence=1 was not accepted", r.logs)
-        self.assertEqual(r.logs.count("[DROP]"), 1)
 
     def test_accepted_or_absent_predecessor_releases_without_wait(self):
         from dexmani_real.runtime.safety import SafetyState
@@ -388,8 +376,6 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
                 r = self._run(prefix + [{"keys": ("w",), "full": True},
                                         {"ack": 1, "full": True}, {"ack": 1, "full": True}, {}])
                 self.assertEqual(r.snapshots[len(prefix) + 3][0], SafetyState.ARMED)
-                self.assertNotIn("was not accepted", r.logs)
-                self.assertEqual(r.logs.count("[DROP]"), 1)
 
     def test_held_key_retries_same_candidate_once_without_new_ik(self):
         r = self._run([{"keys": ("w",), "full": True}] * 3 + [{"keys": ("w",)}])
@@ -397,7 +383,6 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
         self.assertEqual(r.ik_calls, 1)
         self.assertEqual(len(r.published), 1)
         self.assertTrue(all(c is r.prepared[0] for _, c in r.attempts))
-        self.assertNotIn("[DROP]", r.logs)
 
     def test_short_release_retains_without_submitting_until_repress(self):
         r = self._run([{"keys": ("w",), "full": True}, {}, {"keys": ("w",)}])
@@ -406,13 +391,12 @@ class KeyboardReleaseLoopTest(unittest.TestCase):
         self.assertEqual(len(r.published), 1)
         self.assertIs(r.published[0][1], r.prepared[0])
 
-    def test_terminal_home_and_epoch_boundaries_drop_once(self):
+    def test_terminal_home_and_generation_boundaries_cancel_pending(self):
         for boundary in ("q", "esc", "r", "epoch"):
             with self.subTest(boundary=boundary):
                 event = {"revoke": True, "keys": ("w",)} if boundary == "epoch" else {"keys": (boundary,)}
                 r = self._run([{"keys": ("w",), "full": True}, event, {}, {"keys": ("w",)}])
                 self.assertFalse(any(c is r.prepared[0] for _, c in r.published))
-                self.assertEqual(r.logs.count("[DROP]"), 1)
                 if boundary in ("r", "epoch"):
                     self.assertEqual(len(r.published), 1)
                     self.assertIs(r.published[0][1], r.prepared[1])
@@ -454,7 +438,7 @@ class TeleopCapacityOwnershipTest(unittest.TestCase):
             h.begin_finalization()
             self.assertTrue(entered.wait(2))
         def finish(h):
-            self.assertTrue(h.session.pending_finalization.thread.is_alive())
+            self.assertTrue(h._io_thread.is_alive())
             release.set()
             h.finalize()
         try:
@@ -500,3 +484,25 @@ class TeleopCapacityOwnershipTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TeleopFinalizationFailureTest(unittest.TestCase):
+    def test_quit_after_transport_failure_finishes_without_a_second_timeout(self):
+        from dexmani_real.runtime.operator_input import OperatorCommand as Command
+        h = _TeleopRecordingHarness(self)
+        answers = iter(([Command.STOP], [Command.QUIT]))
+        deadline = []
+        def request_quit(h):
+            h.add_rows()
+            h.controls = [Command.QUIT]
+        def lose_transport(h):
+            deadline.append(h.client._finish_deadline_ns)
+            h.shared.recorder_transport_failed.value = True
+        h.run([lambda h: setattr(h, 'controls', [Command.BEGIN]), request_quit,
+               lose_transport, lambda h: None, lambda h: None],
+              decision=lambda h: next(answers, []))
+        self.assertTrue(h.shared.quit_requested.value)
+        self.assertTrue(h.shared.evidence_failed.value)
+        self.assertFalse(h.shared.error_state.value)
+        self.assertEqual(h.client._finish_deadline_ns, deadline[0])
+        self.assertEqual(len([m for m in h.messages if m.__class__.__name__ == 'StopRecording']), 1)

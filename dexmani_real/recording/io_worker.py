@@ -2,7 +2,7 @@
 
 Policy owns episode boundaries, the configured control grid, and sample
 contents. This module first ownership-copies each fixed shared-memory record
-into an ``EpisodeFrame``, then owns serialization, non-blocking finalization,
+into an ``EpisodeFrame``, then owns serialization, synchronous episode finalization,
 camera encoding, HDF5 writes, verification and transactional publication.
 Large camera arrays never travel through an ``mp.Queue``; they occupy fixed
 slots in a seqlock ring.
@@ -11,11 +11,10 @@ slots in a seqlock ring.
 from __future__ import annotations
 
 import json
-import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from queue import Empty, Queue
+from queue import Empty
 from typing import Any
 
 import numpy as np
@@ -40,23 +39,6 @@ from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
 logger = get_logger(__name__)
-
-
-@dataclass
-class _PendingFinalization:
-    save: bool
-    reason: str
-    path: str
-    frame_count: int
-    started_monotonic_s: float
-    forced_error: str = ""
-    truncated: bool = False
-    # True when the episode ended by itself (writer/sampling failure, transport
-    # corruption, shutdown while recording) rather than by an explicit operator
-    # discard: the closed partial staging is retained, not destroyed.
-    retain_partial: bool = False
-    thread: threading.Thread | None = None
-    results: Queue = field(default_factory=Queue)
 
 
 @dataclass(frozen=True)
@@ -188,7 +170,6 @@ class _RecorderIOSession:
     recorder: EpisodeRecorder
     last_sample_sequence: int = 0
     pending_stop: StopRecording | None = None
-    pending_finalization: _PendingFinalization | None = None
     fatal: bool = False
 
     @classmethod
@@ -201,7 +182,6 @@ class _RecorderIOSession:
     def should_run(self) -> bool:
         return bool(
             self.shared.is_running.value
-            or self.pending_finalization is not None
             or self.recorder.is_recording
         )
 
@@ -209,8 +189,9 @@ class _RecorderIOSession:
         self.shared.record_result_q.put(result, timeout=0.1)
 
     def _handle_start(self, control: StartRecording) -> None:
-        if self.fatal or self.pending_finalization is not None or self.recorder.is_recording:
+        if self.fatal or self.recorder.is_recording:
             raise RuntimeError("START while previous recording is active")
+        self.shared.recorder_finish_deadline_ns.value = 0
         try:
             if (
                 control.start_sequence
@@ -257,64 +238,42 @@ class _RecorderIOSession:
         )
 
     def _begin_finalization(
-        self,
-        *,
-        save: bool,
-        reason: str,
-        error: str = "",
-        retain_partial: bool = False,
+        self, *, save: bool, reason: str, error: str = "", retain_partial: bool = False,
     ) -> None:
-        if self.pending_finalization is not None or not self.recorder.is_recording:
+        """The process owns close; publish its fixed deadline before blocking."""
+        if not self.recorder.is_recording:
             return
-        pending = _PendingFinalization(
-            save=save,
-            reason=reason,
-            path=self.recorder.episode_path or "",
-            frame_count=self.recorder.frame_count,
-            truncated=self.recorder.max_frames_reached,
-            started_monotonic_s=time.monotonic(),
-            forced_error=error,
-            retain_partial=retain_partial,
-        )
+        if not self.shared.recorder_finish_deadline_ns.value:
+            self.shared.recorder_finish_deadline_ns.value = (
+                time.monotonic_ns() + int(RECORDER_STOP_TIMEOUT_S * 1e9)
+            )
+        deadline = int(self.shared.recorder_finish_deadline_ns.value)
+        path = self.recorder.episode_path or ""
+        frame_count = self.recorder.frame_count
         self.pending_stop = None
-        self.pending_finalization = pending
-        pending.thread = threading.Thread(
-            target=self._finish_episode,
-            args=(pending,),
-            name="recorder-finalizer",
-            daemon=False,
-        )
-        pending.thread.start()
-
-    def _finish_episode(self, pending: _PendingFinalization) -> None:
-        # Only this thread accesses the recorder until the main thread reaps it.
-        path = pending.path
-        error = None
         published = False
         try:
             path = self.recorder.finish_episode(
-                pending.save,
-                pending.reason,
-                failure_note=(
-                    pending.forced_error
-                    or (
-                        f"episode interrupted: {pending.reason}"
-                        if pending.retain_partial
-                        else ""
-                    )
-                ),
+                save, reason, failure_note=error or (f"episode interrupted: {reason}" if retain_partial else ""),
+                deadline_monotonic_ns=deadline,
             )
-            if path is None:
-                raise RuntimeError("active episode missing during finalization")
-            # The recorder owns the transaction outcome: a zero-row downgrade
-            # or clean discard reports False even when this STOP asked to save.
             published = bool(self.recorder.last_finish_saved)
-        except Exception as exc:
-            error = exc
-            logger.error("RecorderIO finalization failed", exc_info=True)
-        pending.results.put(
-            (path, error, self.recorder.resources_released, published)
-        )
+        except EpisodeFinalizationError as exc:
+            error = str(exc)
+        if not self.recorder.resources_released:
+            self.fatal = True
+            raise RuntimeError("episode retained unreleased resources")
+        if time.monotonic_ns() >= deadline or self.shared.recorder_transport_failed.value:
+            self.fatal = True
+            raise RuntimeError("episode finalization deadline/transport failed")
+        # Refresh before returning to normal heartbeat supervision, even if the
+        # sole result consumer receives this message before our next loop tick.
+        self.shared.set_heartbeat("recorder", time.monotonic())
+        self._send_result(RecordingFinished(
+            saved=published and not error, path=path, frame_count=frame_count,
+            reason=reason, error=error or None, min_frames_met=frame_count >= self.config.min_frames,
+        ))
+        self.shared.recorder_finish_deadline_ns.value = 0
 
     def _fail_samples(self, reason: str, error: str) -> None:
         """Doom the episode before releasing any unconsumed sample capacity."""
@@ -327,8 +286,10 @@ class _RecorderIOSession:
 
     def _handle_stop(self, control: StopRecording) -> None:
         # A late STOP after an asynchronous writer failure is not another result.
-        if self.pending_finalization is not None or not self.recorder.is_recording:
+        if not self.recorder.is_recording:
             return
+        if self.pending_stop is not None:
+            return  # Duplicate STOP cannot change intent, cutoff or deadline.
         latest = int(self.shared.record_sample_ring.latest_sequence)
         if not self.last_sample_sequence <= control.through_sequence <= latest:
             self._fail_samples(
@@ -336,10 +297,11 @@ class _RecorderIOSession:
             )
             return
         self.pending_stop = control
+        self.shared.recorder_finish_deadline_ns.value = control.deadline_monotonic_ns
 
     def _drain_samples(self) -> None:
         """Read consecutive owned samples, never beyond a received STOP boundary."""
-        if self.pending_finalization is not None or not self.recorder.is_recording:
+        if not self.recorder.is_recording:
             return
         ring = self.shared.record_sample_ring
         latest = int(ring.latest_sequence)
@@ -404,70 +366,10 @@ class _RecorderIOSession:
                 retain_partial=stop.retain_partial or bool(error),
             )
 
-    def _poll_finalization(self) -> None:
-        pending = self.pending_finalization
-        if pending is None:
-            return
-        thread = pending.thread
-        if thread is None:
-            raise RuntimeError("episode finalizer did not start")
-        if time.monotonic() - pending.started_monotonic_s >= RECORDER_STOP_TIMEOUT_S:
-            self.fatal = True
-            raise RuntimeError("episode finalization timed out")
-        if thread.is_alive():
-            return
-        thread.join(timeout=0)
-        try:
-            path, error, released, published = pending.results.get_nowait()
-        except Empty as exc:
-            raise RuntimeError("episode finalizer returned no result") from exc
-        if not released:
-            self.fatal = True
-            raise RuntimeError("episode finalizer retained unreleased resources")
-        if error is not None and not isinstance(error, EpisodeFinalizationError):
-            raise RuntimeError("unexpected episode finalizer failure") from error
-        error = str(error) if error is not None else pending.forced_error
-        self._send_result(
-            RecordingFinished(
-                saved=published and not error,
-                path=path or pending.path,
-                frame_count=pending.frame_count,
-                reason=pending.reason,
-                error=error or None,
-                min_frames_met=pending.frame_count >= self.config.min_frames,
-            )
-        )
-        self.pending_finalization = None
-
     def shutdown(self) -> bool:
-        """Use the same finalizer and its original deadline during worker exit."""
-        if self.pending_finalization is None and self.recorder.is_recording:
-            # Shutdown mid-episode is an interruption, never an operator
-            # discard: the closed partial staging is retained for inspection.
-            self._begin_finalization(
-                save=False,
-                reason="recorder_process_shutdown",
-                retain_partial=True,
-            )
-        pending = self.pending_finalization
-        if pending is not None:
-            thread = pending.thread
-            if thread is None or thread.ident is None:
-                return False
-            remaining_s = max(
-                0.0,
-                RECORDER_STOP_TIMEOUT_S
-                - (time.monotonic() - pending.started_monotonic_s),
-            )
-            thread.join(timeout=remaining_s)
-            if thread.is_alive():
-                # The finalizer thread cannot be confirmed stopped during
-                # process shutdown; the caller cannot safely reclaim shared
-                # IPC. Report evidence failure; the parent verifies process
-                # exit before reclaiming resources after control ends.
-                self.fatal = True
-                self.shared.evidence_failed.value = True
-                return False
+        """An interrupted episode uses the same process and original deadline."""
+        if self.recorder.is_recording:
+            self._begin_finalization(save=False, reason="recorder_process_shutdown", retain_partial=True)
         return self.recorder.resources_released
 
     def step(self) -> None:
@@ -482,27 +384,22 @@ class _RecorderIOSession:
             self._handle_stop(control)
         elif control is not None:
             raise RuntimeError(f"unknown recorder command: {type(control).__name__}")
-        if self.pending_finalization is not None:
-            self._poll_finalization()
-            return
         if (
-            not self.shared.is_running.value
+            (not self.shared.is_running.value or self.shared.recorder_transport_failed.value)
             and self.recorder.is_recording
             and self.pending_stop is None
         ):
             # The runtime ended while an episode was still open: an
             # interruption, not an operator discard.
-            self._begin_finalization(
-                save=False, reason="runtime_shutdown", retain_partial=True
-            )
+            self._handle_stop(StopRecording(
+                False, "runtime_shutdown", int(self.shared.record_sample_ring.latest_sequence), True
+            ))
         self._drain_samples()
         if (
-            self.pending_finalization is None
-            and self.recorder.is_recording
+            self.recorder.is_recording
             and self.recorder.camera_writer_error
         ):
             self._fail_samples("camera_writer_error", self.recorder.camera_writer_error)
-        self._poll_finalization()
 
 
 def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
@@ -532,8 +429,7 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
         if session is not None:
             try:
                 if not session.shutdown():
-                    # Shutdown could not confirm the finalizer thread stopped;
-                    # shared IPC cannot safely be reclaimed. Fail closed.
+                    # Close did not confirm release; preserve staging.
                     crashed = True
                     shared.evidence_failed.value = True
             except Exception:

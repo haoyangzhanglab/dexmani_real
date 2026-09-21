@@ -91,8 +91,15 @@ def supervisor_exit_reason(
     if critical_stopped:
         return ExitReason.WORKER_DEATH
     critical_heartbeat_timeout = False
-    service_heartbeat_timeout = False
+    if any(p.name == "recorder" for p in stopped):
+        shared.recorder_transport_failed.value = True
+    service_heartbeat_timeout = bool(shared.recorder_transport_failed.value)
     for name, timeout in heartbeat_timeouts_s.items():
+        if name == "recorder" and shared.recorder_finish_deadline_ns.value:
+            if time.monotonic_ns() >= int(shared.recorder_finish_deadline_ns.value):
+                shared.recorder_transport_failed.value = True
+                service_heartbeat_timeout = True
+            continue
         age_s = float(heartbeat_ages_s.get(name, float("inf")))
         timeout_s = float(timeout)
         if (
@@ -104,6 +111,8 @@ def supervisor_exit_reason(
         ):
             if name in service_process_names:
                 service_heartbeat_timeout = True
+                if name == "recorder":
+                    shared.recorder_transport_failed.value = True
             else:
                 critical_heartbeat_timeout = True
     if critical_heartbeat_timeout:
@@ -181,6 +190,7 @@ def run_supervisor(
         None if max_running_s is None else int(float(max_running_s) * 1e9)
     )
     service_failure_deferred = False
+    recorder_kill_at = None
     try:
         while True:
             if max_running_ns is not None:
@@ -217,6 +227,18 @@ def run_supervisor(
                 timeouts,
                 service_process_names=service_process_names,
             )
+            if shared.recorder_transport_failed.value:
+                for process in procs:
+                    if process.name != "recorder":
+                        continue
+                    if process.exitcode is not None:
+                        continue  # The final shutdown still owns join/cleanup.
+                    if recorder_kill_at is None:
+                        process.terminate()
+                        recorder_kill_at = now + 1.0
+                    elif now >= recorder_kill_at:
+                        process.kill()
+                        recorder_kill_at = float("inf")
             if reason is ExitReason.ESTOP:
                 exit_reason = "e-stop requested"
                 transition(shared, SafetyState.FAULT)

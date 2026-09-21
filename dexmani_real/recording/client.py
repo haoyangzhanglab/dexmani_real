@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import Empty, Full
 from typing import Any
 
@@ -26,12 +26,13 @@ class StartRecording:
     episode_name: str | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class StopRecording:
     save: bool
     reason: str
     through_sequence: int
     retain_partial: bool = False
+    deadline_monotonic_ns: int = field(default_factory=lambda: time.monotonic_ns() + int(RECORDER_STOP_TIMEOUT_S * 1e9))
 
 
 @dataclass
@@ -69,6 +70,7 @@ class RecorderClient:
 
     def __init__(self, shared: Any) -> None:
         self.shared = shared
+        self._finish_deadline_ns = 0
         self._frame_count = 0
         self._recording = False
         self._stop_requested = False
@@ -120,6 +122,7 @@ class RecorderClient:
         # Report local unavailability; the workflow decides its disposition.
         logger.error("RecorderIO unavailable: %s", error)
         self._unavailable = True
+        self.shared.recorder_transport_failed.value = True
         self._recording = False
         self._last_stop_result = RecorderStopResult(
             done=False,
@@ -154,6 +157,7 @@ class RecorderClient:
             self._recording
             or self._stop_requested
             or self._unavailable
+            or self.shared.recorder_transport_failed.value
             or self.shared.evidence_failed.value
             or not self.shared.is_ready("recorder")
         ):
@@ -172,6 +176,9 @@ class RecorderClient:
             return False
         deadline = time.monotonic() + RECORDER_START_TIMEOUT_S
         while time.monotonic() < deadline and self.shared.is_running.value:
+            if self.shared.recorder_transport_failed.value:
+                self._fail_transport("recorder died during START")
+                return False
             self.shared.set_heartbeat("policy", time.monotonic())
             try:
                 result = self.shared.record_result_q.get(timeout=_STOP_POLL_INTERVAL_S)
@@ -199,7 +206,7 @@ class RecorderClient:
         return False
 
     def add_frame(self, sample: EpisodeFrame) -> bool:
-        if not self._recording:
+        if not self._recording or self.shared.recorder_transport_failed.value:
             return False
         latest = int(self.shared.record_sample_ring.latest_sequence)
         consumed = int(self.shared.recorder_consumed_sequence.value)
@@ -240,12 +247,15 @@ class RecorderClient:
         self._stop_requested = True
         self._stop_reason = reason or "manual"
         through = int(self.shared.record_sample_ring.latest_sequence)
-        self._send_control(StopRecording(save, self._stop_reason, through, retain_partial))
+        stop = StopRecording(save, self._stop_reason, through, retain_partial)
+        self._finish_deadline_ns = stop.deadline_monotonic_ns
+        self._send_control(stop)
         return None
 
     def _finish(self, event: RecordingFinished) -> RecorderStopResult:
         self._recording = False
         self._stop_requested = False
+        self._finish_deadline_ns = 0
         result = RecorderStopResult(
             done=True,
             saved=event.saved,
@@ -260,6 +270,13 @@ class RecorderClient:
         return result
 
     def poll_stop(self) -> RecorderStopResult:
+        deadline = self._finish_deadline_ns or int(self.shared.recorder_finish_deadline_ns.value)
+        if (self.shared.recorder_transport_failed.value
+                or (deadline > 0 and time.monotonic_ns() >= deadline)):
+            if not self._unavailable:
+                self._fail_transport("recorder transport unavailable or finalization deadline expired")
+            # A dead/terminated process may have corrupted a Queue lock. Never read it again.
+            return self._last_stop_result or RecorderStopResult(done=False, error="recorder unavailable")
         try:
             event = self.shared.record_result_q.get_nowait()
         except Empty:
@@ -295,8 +312,10 @@ class RecorderClient:
         timeout_s = RECORDER_STOP_TIMEOUT_S if timeout is None else float(timeout)
         if not np.isfinite(timeout_s) or timeout_s < 0:
             raise ValueError("recorder stop timeout must be finite and non-negative")
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
+        deadline_ns = min(time.monotonic_ns() + int(timeout_s * 1e9),
+                          self._finish_deadline_ns or int(self.shared.recorder_finish_deadline_ns.value)
+                          or time.monotonic_ns() + int(RECORDER_STOP_TIMEOUT_S * 1e9))
+        while time.monotonic_ns() < deadline_ns:
             result = self.poll_stop()
             if result.done or result.error:
                 return result

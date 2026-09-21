@@ -358,6 +358,8 @@ class CameraIdentityAdmissionTest(unittest.TestCase):
 
 
 class _BudgetShared:
+    recorder_finish_deadline_ns = SimpleNamespace(value=0)
+    recorder_transport_failed = SimpleNamespace(value=False)
     """Minimal motion-lock shared state for generation-checked revocation."""
 
     def __init__(self, generation: int, state: SafetyState) -> None:

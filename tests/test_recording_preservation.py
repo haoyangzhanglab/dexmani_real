@@ -263,6 +263,11 @@ class _FakeShared:
     def __init__(self, latest_sequence: int) -> None:
         self.record_sample_ring = _FakeRing(latest_sequence)
         self.recorder_consumed_sequence = _FakeValue(0)
+        self.recorder_finish_deadline_ns = _FakeValue(0)
+        self.recorder_transport_failed = _FakeValue(False)
+        from queue import Queue
+        self.record_result_q = Queue()
+        self.set_heartbeat = lambda *args: None
 
 
 class _FakeRecorder:
@@ -283,7 +288,7 @@ class _FakeRecorder:
     def add_frame(self, frame: EpisodeFrame) -> bool:
         return True
 
-    def finish_episode(self, save: bool, reason: str, *, failure_note: str = ""):
+    def finish_episode(self, save: bool, reason: str, *, failure_note: str = "", deadline_monotonic_ns=None):
         self.finished.append((bool(save), reason))
         self.failure_notes.append(failure_note)
         self.is_recording = False
@@ -307,9 +312,6 @@ def _drain_stop(shared: _FakeShared, stop: StopRecording) -> _FakeRecorder:
     ):
         session._handle_stop(stop)
         session._drain_samples()
-    pending = session.pending_finalization
-    assert pending is not None and pending.thread is not None
-    pending.thread.join(timeout=10.0)
     return recorder
 
 
@@ -345,78 +347,29 @@ class RecorderIOStopClassificationTest(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
-class RecorderFinalizerIsolationTest(unittest.TestCase):
-    def test_real_loop_timeout_and_shutdown_preserve_active_writer(self):
-        import threading
-        from queue import Queue
-        from types import SimpleNamespace
-        import dexmani_real.recording.io_worker as io
-        entered, release = threading.Event(), threading.Event()
-        shared = SimpleNamespace(
-            is_running=_FakeValue(True), error_state=_FakeValue(False),
-            evidence_failed=_FakeValue(False), quit_requested=_FakeValue(False),
-            run_generation=_FakeValue(7), recorder_consumed_sequence=_FakeValue(0),
-            record_control_q=Queue(), record_result_q=Queue(),
-            set_ready=lambda *a: None, set_heartbeat=lambda *a: None,
-        )
-        class Writer(_FakeRecorder):
-            @property
-            def resources_released(self):
-                return release.is_set()
-            def finish_episode(self, *args, **kwargs):
-                entered.set()
-                if not release.wait(5):
-                    raise RuntimeError("test writer was not released")
-                return super().finish_episode(*args, **kwargs)
-        recorder = Writer()
-        create = io._RecorderIOSession.create
-        sessions = []
-        def prepare(*args):
-            session = create(*args)
-            sessions.append(session)
-            session._begin_finalization(save=True, reason="operator")
-            self.assertTrue(entered.wait(2))
-            session.pending_finalization.started_monotonic_s = -1000
-            return session
-        try:
-            with mock.patch.object(io, "_create_episode_recorder", return_value=recorder), mock.patch.object(io._RecorderIOSession, "create", side_effect=prepare):
-                with self.assertRaisesRegex(RuntimeError, "recording failure"):
-                    io.recorder_io_loop(shared, RecorderIOConfig(data_dir="unused", max_frames=2, control_hz=10, min_frames=1))
-            self.assertTrue(shared.evidence_failed.value)
-            self.assertFalse(shared.error_state.value)
-            self.assertFalse(shared.quit_requested.value)
-            self.assertEqual(shared.run_generation.value, 7)
-            self.assertTrue(sessions[0].pending_finalization.thread.is_alive())
-            self.assertFalse(sessions[0].pending_finalization.thread.daemon)
-            self.assertFalse(recorder.resources_released)
-        finally:
-            release.set()
-            for session in sessions:
-                session.pending_finalization.thread.join(2)
-
-    def test_unreleased_finished_writer_is_evidence_failure(self):
-        from queue import Queue
-        from types import SimpleNamespace
-        import dexmani_real.recording.io_worker as io
-        shared = SimpleNamespace(is_running=_FakeValue(True), error_state=_FakeValue(False),
-            evidence_failed=_FakeValue(False), recorder_consumed_sequence=_FakeValue(0),
-            record_control_q=Queue(), record_result_q=Queue(),
-            set_ready=lambda *a: None, set_heartbeat=lambda *a: None)
+class RecorderFinalizationTest(unittest.TestCase):
+    def test_unreleased_finished_writer_fails_without_result(self):
         class Writer(_FakeRecorder):
             @property
             def resources_released(self):
                 return False
-        create = io._RecorderIOSession.create
-        def prepare(*args):
-            session = create(*args)
+        shared = _FakeShared(0)
+        session = _RecorderIOSession(shared, RecorderIOConfig(
+            data_dir="unused", max_frames=2, control_hz=10, min_frames=1), Writer())
+        with self.assertRaises(RuntimeError):
             session._begin_finalization(save=True, reason="operator")
-            session.pending_finalization.thread.join(2)
-            return session
-        with mock.patch.object(io, "_create_episode_recorder", return_value=Writer()), mock.patch.object(io._RecorderIOSession, "create", side_effect=prepare):
-            with self.assertRaisesRegex(RuntimeError, "recording failure"):
-                io.recorder_io_loop(shared, RecorderIOConfig(data_dir="unused", max_frames=2, control_hz=10, min_frames=1))
-        self.assertTrue(shared.evidence_failed.value)
-        self.assertFalse(shared.error_state.value)
+        self.assertTrue(shared.record_result_q.empty())
+        self.assertGreater(shared.recorder_finish_deadline_ns.value, 0)
+
+    def test_duplicate_stop_keeps_original_cutoff_and_deadline(self):
+        shared = _FakeShared(3)
+        session = _RecorderIOSession(shared, RecorderIOConfig(
+            data_dir="unused", max_frames=5, control_hz=10, min_frames=1), _FakeRecorder())
+        first = StopRecording(True, "original", 3)
+        session._handle_stop(first)
+        session._handle_stop(StopRecording(False, "duplicate", 0))
+        self.assertIs(session.pending_stop, first)
+        self.assertEqual(shared.recorder_finish_deadline_ns.value, first.deadline_monotonic_ns)
 
 class RecorderCapacityPathTest(unittest.TestCase):
     def test_real_client_sample_stop_and_writer_prefix(self):
@@ -458,8 +411,6 @@ class RecorderCapacityPathTest(unittest.TestCase):
             self.assertEqual(stop.reason, "max_frames")
             session._handle_stop(stop)
             session._drain_samples()
-            session.pending_finalization.thread.join(5)
-            session._poll_finalization()
             runner = _RunnerTest()._runner(shared=shared, recorder=client, run_started_ns=1)
             self.assertTrue(runner._poll_recorder())
             self.assertEqual(runner.completed_trials, 0)
@@ -524,8 +475,10 @@ class InterruptedRetentionBoundaryTest(unittest.TestCase):
         runner.recorder = RecorderClient(shared)
         runner.recorder._recording = True
         runner._stop_recording_capture(save=False, reason="hardware_fault")
-        self.assertEqual(shared.record_control_q.get_nowait(),
-                         StopRecording(False, "hardware_fault", 2, retain_partial=True))
+        message = shared.record_control_q.get_nowait()
+        self.assertEqual((message.save, message.reason, message.through_sequence, message.retain_partial),
+                         (False, "hardware_fault", 2, True))
+        self.assertGreater(message.deadline_monotonic_ns, 0)
         runner._stop_recording_capture(save=False, reason="policy_shutdown")
         self.assertTrue(shared.record_control_q.empty())
 
@@ -587,7 +540,10 @@ class InterruptedRetentionBoundaryTest(unittest.TestCase):
         client._recording = True
         client.stop_episode(False, "discard")
         client.stop_episode(False, "policy_shutdown", retain_partial=True)
-        self.assertEqual(shared.record_control_q.get_nowait(), old_message)
+        message = shared.record_control_q.get_nowait()
+        self.assertEqual((message.save, message.reason, message.through_sequence, message.retain_partial),
+                         (False, "discard", 2, False))
+        self.assertEqual(message.deadline_monotonic_ns, client._finish_deadline_ns)
         self.assertTrue(shared.record_control_q.empty())
 
 

@@ -191,6 +191,8 @@ class RuntimeChannels:
     run_ended_generation: Any
     run_ended_monotonic_ns: Any
     run_ended_reason: Any
+    recorder_finish_deadline_ns: Any  # recorder-owned; zero while idle
+    recorder_transport_failed: Any  # sticky; never reuse IPC after failure/death
     recorder_consumed_sequence: Any
     # Ordered command-FIFO consumption watermarks (one per attached worker
     # consumer; -1 means the consumer never attached and it is excluded from
@@ -348,6 +350,8 @@ class RuntimeChannels:
         storage.run_ended_generation = ctx.Value("Q", 0)
         storage.run_ended_monotonic_ns = ctx.Value("Q", 0)
         storage.run_ended_reason = ctx.Value("i", 0)
+        storage.recorder_finish_deadline_ns = ctx.Value("q", 0, lock=False)
+        storage.recorder_transport_failed = ctx.Value("b", False, lock=False)
         storage.recorder_consumed_sequence = ctx.Value("Q", 0)
         storage.arm_cmd_consumed_sequence = ctx.Value("q", -1)
         storage.hand_cmd_consumed_sequence = ctx.Value("q", -1)
