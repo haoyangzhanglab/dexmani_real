@@ -626,7 +626,9 @@ Then:
 
 This logic is especially important around C pause and stop/fault boundaries.
 
-Do not block normal control indefinitely to resolve historical adoption. Use existing bounded lifecycle/shutdown timing and fail the episode integrity when truth cannot be established.
+Before any later operation publishes a new command that could overwrite worker `last_adopted_*` evidence, resolve the old pending command from fresh post-boundary state or explicitly classify it `ADOPTION_UNKNOWN` and invalidate the episode. This is a short **adoption-accounting barrier**, not a motion queue: it exists only to preserve truthful evidence across lifecycle boundaries.
+
+Do not block normal control indefinitely to resolve historical adoption. Use existing bounded lifecycle/shutdown timing; if the bounded accounting barrier cannot resolve the old command, record/mark `ADOPTION_UNKNOWN`, invalidate the episode, and only then allow a later command-producing operation to proceed.
 
 ---
 
@@ -1796,7 +1798,8 @@ Verify:
 
 - no adoption fact is invented;
 - episode becomes invalid;
-- unknown diagnostic state is representable when recorder is available.
+- unknown diagnostic state is representable when recorder is available;
+- the bounded adoption-accounting barrier resolves to UNKNOWN before any later command is allowed to overwrite the worker adoption evidence.
 
 ## S14 — normal recording label truth
 
