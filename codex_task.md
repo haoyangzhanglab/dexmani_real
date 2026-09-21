@@ -1,347 +1,358 @@
-# Codex Task — Simplify DexMani Real into a Reliable PhD Real-Robot Experiment Endpoint
+# Codex Task — Refactor DexMani Real into a Small, Reliable PhD Real-Robot Experiment Endpoint
 
-## 0. Read this first
+## 0. Execution contract
 
-This file is the execution task for the local Codex CLI.
+This file is the implementation task for the local Codex CLI. Treat it as an engineering specification, not as a brainstorming document.
 
-Before editing anything:
+Before editing:
 
-1. Read the repository-root `AGENTS.md` in full and obey it.
+1. Read repository-root `AGENTS.md` in full and obey it.
 2. Run:
    ```bash
    git status --short
    git rev-parse HEAD
    ```
-3. Preserve unrelated local changes. Do not reset, checkout, stash, or overwrite user work.
-4. Inspect the actual current code before applying any instruction below. The design in this task was prepared against:
-   - `dexmani_real`: `4bba54d9094291b7b8030464c7983ac93971ce6b`
-   - LeRobot: `8352ca62d88ab4464001d427267a6a0758e6cb99`
-   - ManiUniCon: `85c6f2e32ecf9f2bed62d202b058c39623444686`
-   - LeFranX: `a39906e6629f39490950fe8bd20f4f992ed74fd7`
-5. If local HEAD differs, re-trace the affected boundaries from actual entry points instead of blindly applying old line-level assumptions.
-6. Do **not** run any hardware-affecting program or SDK path. Do not connect/discover xArm, XHand, RealSense, VR hardware, home, replay, teleoperate, calibrate, or rollout. Offline checks only.
-7. Do **not** create a committed `tests/` directory. Use focused one-off offline smoke checks for pure logic.
-8. Keep this file at the repository root. Do not delete it as part of the refactor.
+3. Preserve unrelated local changes. Never reset, checkout, stash, clean, or overwrite user work.
+4. Trace the actual current code before applying this document. The design was reviewed against:
+   - `dexmani_real` runtime code from `4bba54d9094291b7b8030464c7983ac93971ce6b`
+   - current task-bearing main after `89beeb690f39c8959cf4be25055c13283e58bc87`
+   - LeRobot `8352ca62d88ab4464001d427267a6a0758e6cb99`
+   - ManiUniCon `85c6f2e32ecf9f2bed62d202b058c39623444686`
+   - LeFranX `a39906e6629f39490950fe8bd20f4f992ed74fd7`
+5. If local HEAD differs, source code and resolved configuration are authoritative. Re-trace every affected definition → producer → transformation → consumer → side effect.
+6. Do **not** execute hardware-affecting code. No device discovery, SDK connection, homing, replay, teleoperation, calibration writes, policy rollout, camera capture, or physical motion without explicit user authorization.
+7. Ordinary imports and constructors used by offline checks must not connect hardware.
+8. Do **not** create or restore a committed `tests/` directory. Use temporary/offline smoke checks.
+9. Do not install or upgrade the experiment environment just to run checks. If an optional tool is missing, report it.
+10. Do not create generic framework abstractions to make the refactor look cleaner. The target is a research instrument.
+11. Do not stop after producing a plan. Execute the complete task unless genuinely blocked by unavailable source/dependency information or a required physical validation.
+12. Keep this `codex_task.md` at repository root until the user explicitly asks to remove it.
+13. Do not claim hardware validation. Offline correctness and physical validation are different.
 
-The goal is not a framework rewrite. The goal is to make the current research repository smaller, easier to reason about, and more reliable for real experiments.
+When a phase touches a cross-process protocol, read and modify **both sides** of the boundary before considering the phase complete.
 
 ---
 
-## 1. Repository mission
+# 1. Repository mission
 
-`dexmani_real` is a personal PhD research repository for exactly two primary workflows:
+`dexmani_real` is a personal PhD research repository for two primary workflows.
 
-### A. Real-robot dexterous data collection
+## 1.1 Dexterous real-robot data collection
 
 ```text
-Quest/VR human motion
-        ↓
-teleop mapping + hand retargeting
-        ↓
+Quest / VR
+   ↓
+wrist mapping + hand retargeting
+   ↓
 IK / projection / safety
-        ↓
+   ↓
 xArm7 + XHand
-        ↓
-timestamped robot/sensor data
-        ↓
+   ↓
+timestamped proprioception + tactile + RGB-D + VR
+   ↓
 raw research episode
 ```
 
-### B. Real-robot evaluation of learned policies trained in other repositories
+## 1.2 Real-robot evaluation of models trained in other repositories
 
 ```text
 external trained model
-        ↓
-model-specific loading / PolicySpec
-        ↓
+   ↓
+public model metadata / PolicySpec
+   ↓
 causal multimodal observation
-        ↓
-synchronous inference + action chunk
-        ↓
-IK / projection / safety
-        ↓
+   ↓
+synchronous predict + local action chunk
+   ↓
+decode / IK / projection / safety
+   ↓
 xArm7 + XHand
-        ↓
+   ↓
 raw evaluation episode + technical metrics
 ```
 
-This repository is **not**:
+The repository is **not**:
 
-- a generic robotics framework;
-- a multi-robot plugin platform;
-- production serving infrastructure;
-- an async inference platform;
+- a generic robotics platform;
+- a robot plugin ecosystem;
+- production policy serving;
+- a remote inference service;
+- an async inference framework;
 - an RTC implementation;
+- a generic rollout strategy framework;
 - a policy training framework;
-- a generic dataset framework;
-- a compatibility layer for arbitrary hypothetical models.
+- a universal dataset compatibility layer.
 
-Use this priority order:
+Priority:
 
 > physical safety > experiment correctness > iteration speed > readability > generic extensibility > enterprise robustness
 
-Prefer:
+Preferred change order:
 
 > delete > inline > merge > rewrite > add abstraction
 
-Only preserve complexity that protects a real physical guarantee, a real scientific-data guarantee, or a current experiment requirement.
+A mechanism earns its complexity only if it protects a current physical guarantee, scientific-data guarantee, or current experiment requirement.
 
 ---
 
-## 2. Reference-project lessons: copy the principles, not the infrastructure
+# 2. What to learn from the reference projects
 
-### LeRobot
+## 2.1 LeRobot
 
 Adopt:
 
-- clear separation between recording and policy rollout;
-- simple conceptual robot boundary: observe / send action;
-- explicit action representation at the physical boundary;
-- simple operator-facing workflows.
+- explicit separation between teleop recording and learned-policy rollout;
+- clear observation/action boundaries;
+- simple operator-facing workflows;
+- a physical action boundary where clipping/modification is explicit.
 
 Do not copy:
 
 - generic rollout strategies;
-- async inference abstractions;
-- plugin registries;
-- processor framework complexity;
+- async inference engines;
+- processor/plugin infrastructure;
 - broad robot ecosystem abstractions.
 
-Important: current LeRobot recording saves the processed teleop action rather than necessarily the value returned by `robot.send_action()`. Do **not** copy that semantic for DexMani. DexMani action labels must represent an executable high-level target that the real actuator workers actually adopted.
+Important: DexMani must not persist a normal behavior-cloning label merely because a teleop/model action was computed or published. A normal action row must refer to a high-level executable command that the relevant actuator workers actually adopted.
 
-### ManiUniCon
+## 2.2 ManiUniCon
 
 Adopt:
 
-- sensor / policy / robot process separation where it corresponds to real resource ownership;
-- shared-memory transport for high-rate data;
-- teleop and learned policy as action producers above robot execution.
+- process boundaries that follow actual resource ownership;
+- shared memory for high-rate sensor/state transport;
+- teleop and learned policy as command producers above robot execution.
 
 Do not copy:
 
-- target-timestamp action queues;
-- generic future-action buffering;
-- Hydra plugin architecture;
-- generic control-mode machinery not needed by the current embodiment.
+- future target-timestamp action queues;
+- generic control-mode machinery;
+- Hydra-style extensibility for hypothetical hardware;
+- buffered action backlogs.
 
-### LeFranX
+## 2.3 LeFranX
 
 Adopt:
 
 - simple dexterous collection workflow;
-- combined arm + hand operator experience;
-- human-friendly home / begin / save / discard loop.
+- combined arm/hand operator experience;
+- straightforward home / begin / save / discard interaction.
 
 Do not copy:
 
-- serial arm/hand/camera observation as the scientific observation contract;
-- sequential sends presented as physical synchronization;
-- fixed sleeps as homing verification;
-- zero-valued fallback actions after teleop exceptions.
+- serial observation as the scientific timing contract;
+- sequential arm/hand sends presented as physical synchronization;
+- fixed sleeps as homing proof;
+- zero fallback commands after teleop exceptions.
 
-DexMani should keep stronger temporal and tactile semantics than LeFranX.
+DexMani intentionally keeps stronger timing, tactile, and causal-observation semantics.
 
 ---
 
-## 3. Target architecture
+# 3. Target architecture
 
 Keep two workflow-specific upper layers and one shared physical runtime.
 
 ```text
-                         ┌─────────────────────┐
-                         │   Teleop Collection │
-                         │  TeleopController   │
-                         └──────────┬──────────┘
-                                    │
-                                    │ high-level target
-                                    │
-                         ┌──────────▼──────────┐
-                         │    RobotCommand     │
-                         │ command_id + run_id │
-                         └──────────┬──────────┘
-                                    │
-                    single-inflight coupled command
-                                    │
-                   ┌────────────────┴────────────────┐
-                   ▼                                 ▼
-              Arm Worker                        Hand Worker
-               xArm SDK                         XHand SDK
-                   │                                 │
-             command adopt                    command adopt
-                                                     │
-                                                bounded slew
-                                                     │
-                                                command reach
-                   │                                 │
-                   └──────────────┬──────────────────┘
-                                  ▼
-                       timestamped state rings
+          Teleop Collection                         Policy Eval
+          -----------------                         -----------
+          TeleopController                          Policy runner
+          VR map / retarget                         sync predict
+                   │                                action chunk
+                   └──────────────┬─────────────────────┘
                                   │
-                 ┌────────────────┴────────────────┐
-                 ▼                                 ▼
-          Teleop raw recording              Policy observation
-                                                   ▲
-                                                   │
-                                        ┌──────────┴──────────┐
-                                        │     Policy Eval      │
-                                        │ synchronous predict  │
-                                        │   action chunk       │
-                                        └─────────────────────┘
+                         executable targets
+                                  │
+                                  ▼
+                           RobotCommand
+                    command_id + run_id + targets
+                                  │
+                     single-inflight per run
+                                  │
+                    ┌─────────────┴─────────────┐
+                    ▼                           ▼
+                Arm worker                  Hand worker
+                 xArm SDK                    XHand SDK
+                    │                           │
+                 adopted                    adopted
+                                                │
+                                           bounded slew
+                                                │
+                                             reached
+                    │                           │
+                    └─────────────┬─────────────┘
+                                  ▼
+                        timestamped state rings
+                                  │
+                ┌─────────────────┴─────────────────┐
+                ▼                                   ▼
+          raw recording                       policy observation
 ```
 
-Do **not** introduce a generic `ProducerInterface`, `RolloutStrategy`, `InferenceBackend`, plugin registry, or service framework.
+Important:
 
-Teleop and policy may share low-level helpers, but they remain separate workflows.
+- “coupled command” means one arm/hand high-level command identity.
+- It does **not** mean physically atomic or simultaneous SDK admission.
+- Arm and hand are independent workers; partial adoption is possible at lifecycle boundaries and must be represented truthfully.
+
+Do **not** create:
+
+- `ProducerInterface`;
+- `RolloutStrategy`;
+- `InferenceBackend`;
+- a plugin registry;
+- a generic runtime service manager;
+- a generic failure taxonomy framework.
 
 ---
 
-## 4. Hard constraints and invariants
+# 4. Hard invariants
 
-These are non-negotiable.
+## 4.1 SDK ownership
 
-### 4.1 Keep SDK ownership in workers
+Keep live SDK objects inside their owning processes:
 
-- xArm live SDK object stays inside the arm worker process.
-- XHand live SDK object stays inside the hand worker process.
-- RealSense live object stays in its camera-owning process.
-- Model/CUDA ownership stays in the policy process.
-- Imports and ordinary constructors must not connect hardware.
+- xArm SDK → arm worker;
+- XHand SDK → hand worker;
+- RealSense SDK → camera worker;
+- CUDA/model runtime → policy worker.
 
-### 4.2 Keep separate arm and hand worker processes
+Do not collapse arm and hand into one process. XHand latency must not stall arm execution.
 
-Do not collapse arm and hand into one process. XHand blocking/latency must not stall the arm worker.
+## 4.2 Physical safety ownership
 
-### 4.3 Preserve real physical checks
+Preserve clear ownership for:
 
-The refactor must preserve clear ownership for:
-
-- finite numeric SDK inputs;
-- arm and hand mechanical limits;
-- arm command jump / speed limits;
-- XHand bounded slew;
+- finite target validation;
+- arm/hand hard joint limits;
+- arm command step/jump limits;
+- XHand low-level bounded slew;
 - required workspace checks;
 - required collision checks;
-- robot error handling;
-- emergency stop;
+- xArm/XHand error handling;
+- estop;
 - safe disconnect;
-- stale/revoked command rejection immediately before SDK admission.
+- stale/revoked command rejection at the last software fence before SDK admission.
 
-Do not duplicate every check in every layer. Keep proposal shaping at the producer side and hard boundary validation at the actuator worker side.
+Producer-side projection/soft shaping and worker-side hard boundary validation are different responsibilities. Do not duplicate all checks everywhere.
 
-### 4.4 Preserve causal observation semantics
+If a command that already passed the producer boundary later fails a worker-owned hard finite/shape/mechanical validation, treat that as an invariant/physical-safety failure and fail closed; do not leave the producer waiting forever for an ACK that can never arrive.
 
-Do not regress to a LeRobot-style sequential `get_observation()` implementation.
+Likewise, an unexpected SDK send failure for a current valid command is a worker/runtime failure unless the existing driver explicitly classifies that status as a successful/tolerated physical outcome.
 
-For policy observations and teleop recording where relevant, preserve:
+## 4.3 Causal observation
+
+Do not replace causal multimodal observation with sequential “read everything now”.
+
+Preserve where scientifically relevant:
 
 - explicit observation anchor;
-- latest causal sample with source time `<= anchor`;
+- latest source sample with source timestamp `<= anchor`;
 - actual source timestamps;
 - heterogeneous producer rates;
+- policy history grids;
+- past-only selection;
 - same-sample XHand qpos/current/tactile aggregate/tactile dense/validity;
-- RGB/depth identity from the same camera sample;
-- tactile validity bits;
-- policy history semantics;
-- actual wall/monotonic timing rather than pretending every sample is perfectly periodic.
+- RGB/depth identity from one camera sample;
+- tactile validity;
+- actual timing rather than fictitious fixed wall time;
+- required derived EEF/fingertip quantities.
 
-### 4.5 Keep synchronous policy inference only
+## 4.4 Synchronous policy inference only
 
-Current scope is synchronous inference. Do not add:
+Current scope is synchronous inference.
 
-- async predict;
-- remote inference;
+Do not add:
+
+- async prediction;
 - RTC;
+- remote inference;
+- background queries;
 - action merging;
-- interpolation framework;
-- background model query;
-- target-timestamp future queues.
+- interpolation frameworks;
+- future target timestamp queues.
 
-A blocking `predict()` is acceptable. The runtime must safely fence stale results with a simple run identity.
+A blocking `predict()` is acceptable. Lifecycle fencing must make its returned stale result harmless.
 
-### 4.6 Teleop C key MUST remain
+## 4.5 Teleop C key MUST remain
 
-This task explicitly **must not delete the teleop C key**.
+This refactor must **not delete or reinterpret C**.
 
-Preserve the existing operator-facing C pause/resume capability for this refactor.
+C remains operator-facing pause/resume.
 
-The command transport migration must adapt C safely:
+Requirements:
 
-- pausing must revoke/fence pre-pause commands;
-- a not-yet-jointly-adopted pending command/sample must not leak across pause;
-- resume must continue to require fresh post-pause feedback and a fresh teleop reference/re-anchor;
-- C must remain visible in operator help;
-- do not silently reinterpret C as discard or episode termination;
-- do not remove same-session pause/resume behavior in this task.
+- C remains in help text and keyboard handling;
+- pause fences the active command-admission epoch;
+- stale pre-pause commands cannot cross the SDK fence after revocation;
+- resume requires fresh post-pause arm/hand/VR data and the current re-anchor behavior;
+- unpublished pre-pause intent must not become a post-resume command;
+- C must not become discard, stop/save, or episode termination.
 
-A future research decision may revisit recorded-pause semantics, but that is **out of scope here**.
+Do not redesign the overall “recorded pause” user semantics in this task. Only make it truthful and safe under the new command transport.
 
-### 4.7 No silent recording downgrade
+## 4.6 Recording-enabled teleop must not silently degrade
 
-If teleop collection is configured with recording enabled, camera + recorder availability is a collection requirement.
+When recording is enabled, camera + recorder are collection requirements.
 
-Do not silently change:
+If either is unavailable:
 
-```text
-B = teleop + record
-```
+- B must not start a recorded demonstration;
+- do not silently relabel B as unrecorded teleop;
+- H/Q/safe recovery may remain available if hardware is otherwise healthy.
 
-into:
+Unrecorded teleop is an explicit `--no-record` / disabled-recording mode.
 
-```text
-B = unrecorded teleop
-```
+## 4.7 Raw episode is source of truth
 
-because evidence services failed.
+Do not make LeRobotDataset the raw runtime storage contract.
 
-Unrecorded/debug teleop must be an explicit configuration/CLI mode.
-
-### 4.8 Raw episode data is source of truth
-
-Do not force raw collection to be a LeRobot dataset.
-
-Keep raw:
+Preserve raw information needed for current and future research:
 
 - RGB-D;
 - camera calibration/identity metadata;
-- robot proprioception;
-- XHand current;
+- arm q/qvel/tau as currently recorded;
+- XHand q/current;
 - tactile aggregate + dense + validity;
 - raw VR wrist + landmarks;
 - mapped/retargeted intent where currently available;
-- executable arm/hand high-level target;
+- executable high-level robot target;
 - actual source timestamps;
-- control/observation anchor;
-- frame status;
-- command/adoption facts.
+- observation/control anchor;
+- command identity and adoption facts;
+- frame status.
 
-Point clouds should normally be produced offline for collected demonstrations. Online point-cloud generation remains available only when a deployed policy requires it.
+Collected demonstrations should normally store RGB-D, not an online point cloud. Generate point clouds offline for dataset processing. Keep online point-cloud production only when a deployed policy explicitly requires it.
 
 ---
 
-## 5. Replace the command FIFO with a single-inflight coupled command
+# 5. New command protocol: single-inflight coupled command
 
-This is the core architecture change.
+This is the core runtime change.
 
-### 5.1 Current problem
+## 5.1 Why the FIFO goes away
 
-The current ordered coupled-command FIFO creates infrastructure that is not needed for the present synchronous research workflows:
+The current ordered command FIFO creates unnecessary streaming infrastructure:
 
-- command backlog;
-- FIFO capacity;
+- backlog;
 - FULL retry;
-- arm/hand consumed watermarks;
+- consumed watermarks;
 - generation-base sequence;
-- per-command expiration used to protect backlog;
+- queued-command expiry;
 - pending exact-candidate retries;
-- command-stream corruption/backpressure machinery.
+- queue corruption/backpressure logic.
 
-A stale high-level control backlog is undesirable for both policy rollout and human teleoperation.
+For teleop and synchronous policy deployment, stale high-level commands should not accumulate.
 
-However, unrestricted latest-wins is also wrong for recorded teleoperation: a human action must not be written as a valid demonstration label if it was overwritten before the actuator workers adopted it.
+However, unrestricted latest-wins is also incorrect: it can overwrite a human/model action before one actuator adopts it while the dataset still labels it as executed.
 
-### 5.2 New command contract
+Target:
 
-Introduce one small canonical command object:
+> no backlog, and at most one not-yet-jointly-adopted high-level command in the current run.
+
+## 5.2 Canonical command
+
+Use one small immutable command:
 
 ```python
 @dataclass(frozen=True)
@@ -353,11 +364,11 @@ class RobotCommand:
     hand_qpos: np.ndarray | None
 ```
 
-The IPC wire dtype should carry exactly the required fixed-size fields, conceptually:
+Wire fields are conceptually:
 
 ```text
-run_id
 command_id
+run_id
 issued_monotonic_ns
 arm_present
 hand_present
@@ -365,36 +376,82 @@ arm_qpos[7]
 hand_qpos[12]
 ```
 
-Do not add a generic command variant/tag system.
+No generic action tag or command subclass hierarchy.
 
-Reuse the existing shared-memory ring primitive as a latest command mailbox if practical. The key invariant is semantic, not the container name:
+Reserve `command_id == 0` for “no command / unknown”.
 
-> There may be at most one high-level command that has been published but not yet adopted by every actuator worker present in that command.
+## 5.3 command_id allocation
 
-The producer must not overwrite that command with the next command.
+`command_id` must be monotonic for the whole shared-runtime lifetime, not local to one producer process.
 
-There is one control producer per session. Do not invent multi-producer arbitration.
+Reason: command publication can occur from different owning workflows/operations over one runtime lifetime (for example home/warm-up/replay/policy paths). Process-local counters can reuse IDs and make worker ACK identity ambiguous.
 
-### 5.3 Command identity
+Keep a minimal shared `next_command_id` (or equivalent) allocated under the existing short motion/lifecycle lock.
 
-Use a monotonically increasing `command_id` for a runtime process lifetime.
+Prefer:
 
-Use `run_id` for lifecycle cancellation.
+1. producer computes/project/checks target outside the lock;
+2. publication acquires the short motion lock;
+3. rechecks lifecycle ownership;
+4. allocates the next command ID;
+5. timestamps `issued_monotonic_ns` at publication;
+6. writes one command record;
+7. releases the lock.
 
-Do not use FIFO sequence as command identity.
+Do not hold the motion lock across SDK IO.
 
-The same `RobotCommand` must be visible to both actuator workers.
+Do not use shared-memory ring sequence as the public command identity.
 
-### 5.4 Arm adoption
+## 5.4 Mailbox / ring semantics
+
+A latest-record shared-memory ring may be reused as the physical container. The semantic contract is a mailbox, not a FIFO.
+
+Within one current `run_id`:
+
+- producer may publish command k;
+- producer must not publish k+1 until every actuator **present in k** has adopted k;
+- no queue/backlog exists.
+
+Across lifecycle invalidation:
+
+- an old-run command in the mailbox is cancelled by `run_id`;
+- it must **not** block the new run;
+- a new current-run command may overwrite the stale old-run slot even if the old command was never jointly adopted.
+
+Therefore “single-inflight” is a **per-current-run** invariant, not a permanent lock on the last mailbox record.
+
+The session architecture must still guarantee one active command-producing workflow at a time. Do not add multi-producer arbitration infrastructure.
+
+## 5.5 Publication race ordering
+
+Publication and lifecycle transitions must keep a short common ordering fence.
+
+The important race is:
+
+```text
+publish command
+vs.
+pause / stop / quit / timeout / fault
+```
+
+The implementation must ensure one of two outcomes:
+
+1. publication wins the lifecycle lock, then a later revocation changes `run_id`; workers reject the stale command unless it had already crossed their SDK admission fence;
+2. revocation wins first, then publication sees the changed state/run and fails without writing a current command.
+
+Do not imply that software can retract a vendor SDK call that already crossed its admission fence. It cannot.
+
+## 5.6 Arm adoption
 
 The arm worker marks a command adopted only after:
 
-1. it reads a new command;
-2. command `run_id` still owns motion immediately before the SDK boundary;
-3. worker-owned finite/shape/hard-limit checks pass;
-4. the xArm SDK accepts the servo target.
+1. it observes a new `(run_id, command_id)`;
+2. arm is present in that command;
+3. current command still owns motion at the last software fence immediately before SDK admission;
+4. worker-owned hard finite/shape/joint checks pass;
+5. xArm SDK accepts the target.
 
-Publish in arm state:
+Arm state must expose:
 
 ```text
 last_adopted_run_id
@@ -402,29 +459,35 @@ last_adopted_command_id
 last_adopted_monotonic_ns
 ```
 
-These are executor facts, not producer guesses.
+An old-run SDK result may still be published later as a historical adoption fact if the call had already crossed the fence before revocation. Its old `run_id` must never authorize a new run.
 
-### 5.5 XHand adoption versus reach
+For a current-run hard validation or SDK failure, fail closed rather than silently leaving the command unacknowledged.
 
-This distinction is mandatory.
+## 5.7 XHand adoption versus reach
 
-For streaming:
+Keep two distinct facts.
+
+### Adopted
+
+A new high-level hand target is adopted when:
+
+1. hand worker observes a new current-run command;
+2. hard target checks pass;
+3. worker installs it as the active high-level target;
+4. worker computes the next bounded low-level setpoint;
+5. XHand SDK accepts at least that first bounded setpoint.
+
+Then publish:
 
 ```text
-new high-level hand target q*
-        ↓
-hand worker adopts target
-        ↓
-worker computes first bounded SDK setpoint
-        ↓
-SDK accepts first bounded setpoint
-        ↓
-hand_adopted = command id
-        ↓
-worker continues bounded slew toward latest target
+last_adopted_run_id
+last_adopted_command_id
+last_adopted_monotonic_ns
 ```
 
-Use:
+### Reached
+
+Continue bounded low-level slew:
 
 ```text
 q_sdk_next =
@@ -432,188 +495,248 @@ q_sdk_next =
     + clip(q_target - q_sdk_current, -delta_max, +delta_max)
 ```
 
-The hand worker must expose two different facts:
+Only when the exact high-level target reaches the existing endpoint-acceptance semantics publish:
 
 ```text
-last_adopted_run_id
-last_adopted_command_id
-last_adopted_monotonic_ns
-
 last_reached_run_id
 last_reached_command_id
 last_reached_monotonic_ns
 ```
 
-Definitions:
+A streaming target can be superseded after adoption but before exact reach. In that case its command ID may never become `last_reached_command_id`. Do not fabricate reach.
 
-- **adopted**: worker has accepted the new high-level target and at least the first bounded low-level SDK setpoint for that target was accepted;
-- **reached**: the exact high-level endpoint has been accepted/reached according to the existing XHand endpoint semantics.
+Streaming gates on **adopted**.
 
-Teleop and policy streaming gate the next high-level command on **adopted**, not **reached**.
+Blocking hand home or another operation that truly needs endpoint completion may wait on **reached**.
 
-Home or any operation that truly requires exact endpoint completion may wait for **reached**.
+If the current measured/SDK state already equals the new target and the exact target is accepted, adopted and reached may advance together.
 
-A streaming target may be superseded before it is reached. Do not fabricate a reached ACK for such a target.
+## 5.8 Exact adoption comparison
 
-### 5.6 Producer gating
-
-Before publishing command `k+1`, the producer checks the latest arm/hand state and verifies command `k` is adopted by every actuator present in `k`.
-
-If not:
-
-- do not publish another command;
-- do not build a backlog;
-- do not busy-wait;
-- count/report executor lag;
-- continue the normal control loop timing;
-- do not label a new human/model proposal as successfully executed.
-
-### 5.7 Pending recording row
-
-For a newly published command, keep at most one small producer-local pending recording row.
-
-The row contains:
-
-- observation snapshot/anchor used to generate the command;
-- raw/mapped intent needed by the raw schema;
-- `RobotCommand`;
-- frame status;
-- any action representation required by the raw writer.
-
-Only finalize/append that normal command row after the arm and hand adoption facts show that the coupled command was adopted.
-
-This guarantees that a normal command label in the raw dataset corresponds to a command actually adopted by both actuator workers.
-
-If lifecycle revocation occurs before joint adoption:
-
-- drop the pending normal command row;
-- log the drop;
-- never relabel it as a valid executed action.
-
-Do not block waiting for adoption.
-
-### 5.8 Hold/failure rows
-
-For IK failure, retarget failure, or safety rejection where no new command is published:
-
-- keep the previous executable high-level target in effect;
-- do not publish duplicate hold commands solely for dataset bookkeeping unless actual xArm/XHand hardware semantics prove repeated sends are required;
-- keep an explicit frame status;
-- recording may store the previous valid executable target as the held action.
-
-Do not remove the existing research-useful status distinction.
-
-Recommended stable statuses include at least:
+For command k, adoption is true only when the relevant worker reports the exact pair:
 
 ```text
-OK
-HELD
-IK_FAIL
-SAFETY_REJECT
-RETARGET_FAIL
+worker.last_adopted_run_id == k.run_id
+and
+worker.last_adopted_command_id == k.command_id
 ```
 
-Do not add a large error taxonomy.
+Do not rely on FIFO-style `>= sequence` proof.
+
+For a command with no hand target, hand adoption is not required. Likewise for arm-absent operations.
+
+## 5.9 Worker repeated-read behavior
+
+Workers may observe the mailbox repeatedly.
+
+- Arm must not repeatedly re-send the same high-level `(run_id, command_id)` as a new command.
+- Hand must not re-adopt the same command, but it must continue bounded slew toward its currently active target on later worker ticks.
+- Stale old-run mailbox records are ignored, not faulted.
+- A new run with a new command ID must remain distinguishable from every previous command.
 
 ---
 
-## 6. Simplify lifecycle cancellation to run_id
+# 6. Partial adoption is real and must not be hidden
 
-The current generation/FIFO transaction should become a much smaller lifecycle fence.
+Arm and hand SDK admission is not atomic.
 
-Keep `SafetyState`:
+This race is physically possible:
 
 ```text
-DISARMED
-ARMED
-RUNNING
-FAULT
+publish coupled command k
+
+arm crosses SDK fence and accepts k
+
+C / S / timeout / fault revokes run
+
+hand has not accepted k
 ```
 
-Keep a monotonically increasing `run_id`.
+The old task incorrectly allowed “drop the pending row” for every non-jointly-adopted command. That would erase a real physical arm action.
 
-A new RUNNING epoch gets a new `run_id`.
+The new implementation must distinguish:
 
-Any stop/pause/quit/fault/new epoch invalidates old work by changing/fencing `run_id`.
+```text
+NO_ADOPTION
+JOINT_ADOPTION
+PARTIAL_ADOPTION
+ADOPTION_UNKNOWN
+```
 
-### Required stale-inference race protection
+Do not build a general state-machine framework; this is a narrow recording truth requirement.
 
-This exact race must remain safe:
+## 6.1 Producer-local pending descriptor
+
+After successful publication, keep at most one small pending command/sample descriptor containing:
+
+- selected observation/anchor;
+- raw/mapped intent required by raw recording;
+- returned `RobotCommand`;
+- action target representations;
+- current frame status/context.
+
+Do not append its normal action row immediately.
+
+## 6.2 Normal completion
+
+If every present actuator reports exact adoption for that command:
+
+- finalize one normal command row;
+- store actual arm/hand adoption timestamps;
+- clear the pending descriptor;
+- allow the next current-run command.
+
+## 6.3 Lifecycle boundary before joint adoption
+
+On C/S/Q/timeout/fault/new-run boundary:
+
+- revoke/fence the old run immediately;
+- do **not** immediately relabel the command as executed;
+- do **not** blindly discard the pending descriptor if any physical adoption may have occurred.
+
+Resolve it from post-boundary worker state when possible.
+
+A fresh post-boundary state sample from each still-live relevant worker must be newer than the revocation/pause boundary before using it to classify the old command. This allows an SDK call admitted just before revocation to return and publish its historical old-run adoption fact.
+
+Then:
+
+### Neither relevant worker adopted
+
+- no physical high-level command was observed as adopted;
+- dropping the pending normal row is acceptable.
+
+### Every relevant worker adopted
+
+- finalize the command row with the actual adoption facts;
+- it was a real jointly adopted command even if a lifecycle boundary followed immediately.
+
+### Only a subset adopted
+
+- persist a diagnostic row if recording is still available;
+- store target + per-actuator adoption bits/timestamps;
+- use a dedicated small frame status such as `PARTIAL_ADOPTION`;
+- never treat this row as a normal training label;
+- mark the episode technically/integrity-invalid for default training export because the coupled physical action was split.
+
+### Cannot determine because worker died / state never became fresh / shutdown removed evidence
+
+- persist `ADOPTION_UNKNOWN` if the recorder is still available;
+- mark the episode technically/integrity-invalid;
+- never fabricate adoption timestamps.
+
+This logic is especially important around C pause and stop/fault boundaries.
+
+Do not block normal control indefinitely to resolve historical adoption. Use existing bounded lifecycle/shutdown timing and fail the episode integrity when truth cannot be established.
+
+---
+
+# 7. Lifecycle: simplify generation into run_id
+
+Keep:
+
+```text
+SafetyState:
+    DISARMED
+    ARMED
+    RUNNING
+    FAULT
+```
+
+Use a monotonic `run_id` as the command-admission epoch identity.
+
+Important semantic clarification:
+
+- every RUNNING epoch has a unique current `run_id`;
+- command revocation/invalidation advances/fences the ID;
+- ARMED maintenance operations that use the shared RobotCommand mailbox may use the current run ID with an explicit required safety state;
+- aborting such an operation must invalidate its command epoch before another operation reuses the mailbox.
+
+Do not treat `run_id` as “policy trial ID”; it is a runtime command-admission epoch.
+
+## 7.1 Blocking inference fence
+
+Required race:
 
 ```text
 captured_run_id = current run
 
-model.predict() blocks
+predict() blocks
 
-operator presses S / Q
-or timeout/fault ends the run
-
+S / Q / timeout / fault / C boundary occurs
 run_id changes
 
-predict() returns old action chunk
+predict() returns old chunk
 ```
 
-The old chunk must be discarded before any publication.
+The returned chunk must be discarded before publication.
 
-The actuator worker must also check command `run_id` immediately before SDK admission.
+## 7.2 Worker SDK fence
 
-That is why `run_id` must remain even after deleting the FIFO generation system.
+Immediately before a current command is admitted to an SDK, recheck:
 
-### Remove after migration
+- runtime still running;
+- no estop;
+- no sticky error;
+- safety state permits that operation;
+- command `run_id` equals current `run_id`.
 
-Once no backlog transport remains and all callers are migrated, remove obsolete concepts such as:
+The short lock is released before SDK IO. A vendor call already admitted before revocation may finish afterward; that is a historical old-run physical fact, not permission for more old-run commands.
+
+## 7.3 Remove old lifecycle/FIFO concepts after full cutover
+
+Remove when no caller depends on them:
 
 - `run_generation_base_sequence`;
-- arm/hand FIFO consumed watermarks;
-- FIFO FULL handling;
-- command FIFO capacity;
-- exact pending FIFO retry state;
-- FIFO-generation commit receipts;
-- per-command dispatch expiry whose only purpose was protecting queued backlog;
-- `RunEndReason.COMMAND_EXPIRED` if it has no independent non-backlog use.
+- arm/hand consumed sequence watermarks;
+- FIFO capacity/FULL;
+- FIFO commit receipts;
+- FIFO exact retry state;
+- command queue corruption handling;
+- per-command dispatch expiry whose only hazard was queued backlog;
+- `RunEndReason.COMMAND_EXPIRED` if no independent use remains.
 
-Do not delete an expiry/freshness mechanism before tracing every caller and proving its original hazard is gone.
+Do not delete a freshness/deadline mechanism if it protects a different real hazard. Trace first.
 
 ---
 
-## 7. Target RuntimeChannels shape
+# 8. RuntimeChannels target
 
-Keep the existing shared-memory/process ownership model, but reduce command/lifecycle fields.
-
-The target should be approximately:
+The target is approximately:
 
 ```text
 state/data
----------
+----------
 arm_state_ring
 hand_state_ring
 camera_ring
 vr_ring
-pointcloud_ring          # only used when requested
+pointcloud_ring          # only active when requested
 record_sample_ring
 
 command
 -------
-robot_command_ring       # latest mailbox; semantic single-inflight
+robot_command_ring       # latest mailbox semantics
+next_command_id
 
-recording
----------
-record_control_q
-record_result_q
-recorder status needed for safe shutdown
-
-runtime
--------
+runtime/lifecycle
+-----------------
 run_id
 run_started_monotonic_ns
-run terminal fact(s) only if still useful
+minimal run terminal fact(s) still required
 safety_state
 is_running
 is_recording
 error_state
 estop_request
 quit_requested
-start/stop request fields actually required by policy parent UX
+policy start/stop/home authorization fields still genuinely needed
+motion_lock
+
+recording
+---------
+record_control_q
+record_result_q
+minimal recorder completion/transport state required for safe shutdown
 
 process health
 --------------
@@ -623,171 +746,256 @@ ready_flags
 home
 ----
 arm_home_q
-home completion facts actually required
+minimal verified completion facts
 ```
 
-Prefer command adoption facts in the arm/hand state dtypes rather than duplicate standalone shared scalar ACK channels.
+Prefer executor adoption facts in arm/hand state records, not duplicate shared ACK scalars.
 
-Delete fields only after all producers/consumers are migrated.
+Delete fields only after all call sites are migrated.
 
 ---
 
-## 8. Teleop workflow
+# 9. Teleop workflow
 
-The teleop workflow remains separate from policy evaluation.
+Keep teleop and policy eval as separate workflows.
 
-Operator-facing normal collection controls must remain easy to understand:
+Normal operator controls:
 
 ```text
 H   home
-B   begin/resume active teleop recording workflow as currently defined
-C   pause/resume       # MUST remain in this task
+B   begin
+C   pause/resume
 S   stop/save
 D   stop/discard
 Q   quit
 ESC emergency stop
 ```
 
-Do not remove C.
+B is not “resume”; C owns pause/resume.
 
-### 8.1 Recording-enabled startup
+## 9.1 Recording-enabled startup
 
-When `recording_enabled=True`:
+When recording is enabled:
 
-- camera and recorder must be ready before B may start recorded collection;
-- do not print/use a degraded `B=teleop` mode;
-- if collection resources are unavailable, the user may still be allowed to home/quit safely, but a recorded episode must not start.
+- arm/hand/VR readiness remains required as today;
+- camera and recorder must also be ready before B can start a recorded episode;
+- collection may stay ARMED for safe home/quit if recorder/camera is unavailable;
+- do not allow a degraded unrecorded B.
 
-When `recording_enabled=False`, explicit manual/debug teleop remains valid.
+When recording is explicitly disabled, no-record debug teleop remains valid.
 
-### 8.2 Mid-episode recording failure
+## 9.2 Mid-episode recorder/camera failure
 
-Camera/recorder failure is not automatically a physical hardware FAULT.
+Do not convert a pure evidence failure into hardware FAULT unless there is also a physical runtime fault.
 
-For teleop collection:
+For recorded teleop:
 
-- current demonstration becomes invalid/incomplete;
-- stop/revoke current teleop RUNNING episode to ARMED using the normal lifecycle fence;
-- do not silently continue recording;
-- retain safe operator recovery/home/quit where possible;
-- block a new recorded B unless recording resources are available again;
-- return a non-zero collection/session result when evidence failed.
+- current episode becomes invalid/incomplete;
+- revoke active RUNNING teleop to ARMED;
+- do not continue pretending collection is valid;
+- retain H/Q/safe recovery where possible;
+- block another recorded B unless recording resources are healthy again;
+- final session result is non-zero.
 
-Do not build a generic “evidence service priority matrix”.
+Do not retain a generic “evidence service priority matrix” if simple workflow-specific handling replaces it.
 
-### 8.3 C pause/resume behavior
+## 9.3 C pause/resume under the new command protocol
 
-For this task, preserve C.
+On C pause:
 
-When C pauses:
+1. establish the pause/revocation monotonic boundary;
+2. fence the old `run_id`;
+3. stop publication of new commands;
+4. keep any potentially partially adopted pending descriptor until section 6 classification is possible;
+5. clear teleop proposal/reference state as current behavior requires;
+6. require fresh arm/hand/VR feedback newer than the pause boundary.
 
-- invalidate the current `run_id`/motion epoch;
-- drop any producer-local command that has not been jointly adopted;
-- drop its not-yet-finalized normal recording row;
-- do not allow a stale command to cross the SDK boundary;
-- clear/rebuild teleop temporal references as required by current behavior;
-- continue to require fresh arm/hand/VR feedback newer than the pause boundary before resume/re-anchor.
+On resume:
 
-When C resumes:
+1. resolve any old pending adoption truth sufficiently for safe/raw-data accounting;
+2. establish the fresh current command epoch;
+3. re-anchor from fresh measured robot state and current VR state;
+4. do not reuse an unpublished pre-pause target.
 
-- create/fence a fresh active run identity as required by the simplified lifecycle;
-- re-anchor from fresh measured state and current VR state;
-- do not carry an unpublished pre-pause human target into the resumed period.
+Keep the existing same-session C behavior otherwise. Do not redesign pause UX in this task.
 
-Do not redesign the recording policy for C beyond what is needed to preserve correctness during this transport refactor.
+## 9.4 Teleop timing
 
-### 8.4 Teleop control timing
+Keep a fixed teleop control opportunity grid:
 
-Keep a fixed teleop control/data grid because it is scientifically useful.
-
-Remove a separate high-frequency executor polling loop if it exists only to service keyboard/control bookkeeping.
-
-Prefer event-or-deadline waiting:
-
-```python
-while running:
-    controls = wait_for_operator_input_until(next_grid_deadline)
-    handle_controls(controls)
-
-    if grid_due:
-        run_one_teleop_grid_tick()
+```text
+t_k = t_0 + k * dt_teleop
 ```
 
-Do not perform catch-up bursts after missed grid slots. Skip/count missed slots.
+At each due grid:
 
-Teleop grid frequency belongs to teleop/data-collection config, not policy model config.
+- process operator controls first;
+- if a current-run previous command is still waiting for joint adoption, do not publish a new command;
+- count executor-lag/missed-command opportunity;
+- do not catch up with burst commands;
+- advance to the next grid deadline.
+
+It is acceptable for persisted raw rows to be fewer than nominal grid opportunities during executor lag; preserve actual timestamps rather than inventing rows that would need to be reordered around a pending command.
+
+Do not build a second high-frequency executor scheduler merely for keyboard bookkeeping. Prefer event-or-deadline waiting where practical.
+
+Teleop control rate belongs to teleop/data-collection config, not to a learned model spec.
 
 ---
 
-## 9. Teleop raw-data action semantics
+# 10. Teleop and raw action semantics
 
-The raw training action must be scientifically explicit.
-
-For a normal command row:
+For a normal command row, the canonical executed high-level target is:
 
 ```text
-action =
-    post-IK / post-projection / safety-admitted
-    arm + hand high-level target
-    that the real actuator workers actually adopted
+post-IK / post-projection / producer safety-admitted
+arm + hand RobotCommand target
+with all present actuator adoption facts confirmed
 ```
 
-Do not use as the canonical behavior-cloning action:
+Do not use as the canonical normal BC action:
 
 - raw VR pose;
-- unexecuted pre-IK arm intent;
-- XHand intermediate slew setpoints;
+- pre-IK Cartesian intent;
+- XHand intermediate slew setpoint;
 - measured qpos;
-- a command that was merely published but never adopted.
+- a merely published command;
+- a partially adopted command.
 
-Still keep human/mapped intent separately in raw data where available.
+Keep human/mapped intent separately where the current raw schema supports it.
 
-The raw episode should preserve the chain:
+The raw chain should remain recoverable:
 
 ```text
 human intent
-    ↓
-mapped / retargeted robot intent
-    ↓
-executable high-level RobotCommand
-    ↓
-measured robot + tactile response
+   ↓
+mapped/retargeted robot intent
+   ↓
+high-level executable target
+   ↓
+per-actuator adoption facts
+   ↓
+measured proprioception/tactile/vision response
 ```
 
 ---
 
-## 10. Raw schema migration
+# 11. Raw schema migration: v30 → v31
 
-Current raw schema is v30. Because command/action semantics change, perform an explicit schema bump instead of silently reinterpreting old fields.
-
-Target: bump to v31 (unless local HEAD already bumped for another reason; then use the next unused version).
-
-Update all writer/reader/processing/export code that assumes the current schema.
-
-### New/changed raw facts
-
-A normal or held row should be able to expose the command identity/effect that its stored executable target refers to.
-
-Add or rename fields as needed, with clear semantics, including the equivalent of:
-
-```text
-command_id
-command_run_id
-command_issued_monotonic_ns
-arm_command_adopted_monotonic_ns
-hand_command_adopted_monotonic_ns
-frame_status
-```
-
-For rows with no valid prior command, command identity/timestamps may use the schema’s explicit unknown/sentinel representation.
-
-Replace/remove `action_queued` because “queued” is no longer the transport truth.
-
-Do not invent historical adoption timestamps for v30 data.
+Current raw schema is v30. The command/action truth changes, so bump explicitly to v31 unless local HEAD already consumed v31; then use the next unused version.
 
 Do not silently reinterpret v30.
 
-Do not add runtime compatibility branches just to make old data look like v31. Old data conversion, if ever required, must be an explicit offline operation with honest unknown fields.
+Do not add runtime compatibility branches that pretend v30 has new adoption facts.
+
+## 11.1 Required command fields
+
+The v31 row contract should contain the equivalent of:
+
+```text
+command_id                         uint64
+command_run_id                     uint64
+command_issued_monotonic_ns        uint64
+
+command_arm_present                bool
+command_hand_present               bool
+
+arm_command_adopted                bool
+hand_command_adopted               bool
+
+arm_command_adopted_monotonic_ns   uint64
+hand_command_adopted_monotonic_ns  uint64
+```
+
+Use explicit zero/false sentinel semantics for “not present / not adopted / unknown timestamp” and document the distinction through presence + adoption bits.
+
+Keep the existing action target arrays unless a rename is clearly worth the migration cost. A schema-version bump makes changed semantics explicit; do not perform gratuitous dataset renames.
+
+## 11.2 Frame statuses
+
+Keep the existing small statuses and add only the two needed interruption statuses.
+
+At minimum:
+
+```text
+OK
+HELD
+IK_FAIL
+SAFETY_REJECT
+RETARGET_FAIL
+PARTIAL_ADOPTION
+ADOPTION_UNKNOWN
+```
+
+Do not create a broad error code framework.
+
+## 11.3 Remove queue truth
+
+Remove `flag_action_queued` / `action_queued` as persisted truth. “Queued” is no longer meaningful.
+
+Do not replace it with another redundant transport flag if command identity + presence + adoption already provide the truth.
+
+## 11.4 Replay/export send mask
+
+Current replay/processing may derive a send mask from `flag_action_queued`. Replace that logic deliberately.
+
+For v31, a row is a candidate “new executable command row” only when:
+
+- `command_id > 0`;
+- every actuator present in the command has its adoption bit true;
+- the command ID is different from the previously represented command;
+- frame status is not partial/unknown;
+- any additional current replay validity requirements still pass.
+
+Held/failure rows that reference the previous jointly adopted command must not cause duplicate command publication merely because they contain action target arrays.
+
+Partial/unknown adoption rows are never normal replay/training command rows.
+
+Update raw processing/export/replay readers consistently.
+
+## 11.5 Normal, held, partial rows
+
+Normal command row:
+
+- new command ID;
+- all present adoption bits true;
+- actual adoption timestamps.
+
+Held / IK / safety / retarget row:
+
+- no new command;
+- may reference the last jointly adopted command ID/target where scientifically correct;
+- must not claim a new publication/adoption.
+
+Partial adoption row:
+
+- records the interrupted new command ID and intended high-level targets;
+- per-actuator adoption bits/timestamps show what physically happened;
+- episode marked invalid/non-exportable by default for training.
+
+Unknown adoption row:
+
+- records what is actually known;
+- unknown timestamps stay zero/false;
+- episode invalid/non-exportable by default.
+
+## 11.6 Episode-level integrity
+
+Do not hide command-level corruption by filtering one row from an otherwise sequential demonstration.
+
+If a recorded episode contains `PARTIAL_ADOPTION` or `ADOPTION_UNKNOWN`:
+
+- raw data may still be saved for diagnosis;
+- episode technical/integrity status must be invalid;
+- default training export must reject/skip it unless an explicit future recovery tool is written.
+
+This is especially important because later robot state may depend on the partial physical action.
+
+---
+
+# 12. Observation/provenance simplification
+
+Preserve scientific timing, remove duplicate internal transport proofs.
 
 Keep:
 
@@ -798,182 +1006,156 @@ Keep:
 - camera source timestamp;
 - observation validity;
 - camera/tactile validity;
-- actual physical state and raw sensor data.
+- causal latest-before selection;
+- policy history semantics;
+- inter-modality skew/freshness rules that directly affect scientific validity.
 
-### Recording-row finalization
-
-A normal command row should be appended only once joint adoption is established, and should store the actual adoption timestamps from worker state.
-
-Held/failure rows may reuse the most recent jointly adopted command identity/target when scientifically correct.
-
----
-
-## 11. Observation and provenance simplification
-
-Keep the scientific temporal contract, simplify IPC-internal proof machinery.
-
-### Keep
-
-- observation anchor;
-- latest-before-anchor selection;
-- policy history grid;
-- past-only selection;
-- same-sample XHand state;
-- tactile validity;
-- RGB/depth identity;
-- actual source timestamps;
-- derived EEF/fingertip features required by policy;
-- inter-modality skew/freshness validation that directly affects observation validity.
-
-### Simplify/remove where not scientifically consumed
-
-Avoid repeatedly proving internal transport chains such as:
+Simplify only when no scientific consumer needs it:
 
 ```text
 source <= receive <= publish <= ring_commit <= anchor
 ```
 
-at multiple layers.
+should not be re-proven independently in every layer.
 
-The producer/ring should own its internal integrity.
+Producer/ring owns internal record integrity. Consumer owns source causality/freshness relative to its anchor.
 
-The consumer normally needs:
-
-```text
-source timestamp
-causal relation to anchor
-freshness
-validity
-```
-
-Do not remove a timestamp that a scientific consumer actually uses.
+Do not remove a timestamp because it looks implementation-specific without tracing actual dataset/observation consumers.
 
 ---
 
-## 12. Policy evaluation workflow
+# 13. Policy evaluation workflow
 
-Policy eval must become a small synchronous loop.
-
-Conceptual shape:
+Target runner shape:
 
 ```python
 while session_active:
     handle_parent_requests()
 
-    if not trial_running:
+    if not episode_running:
         continue
 
-    if previous_command_is_not_yet_jointly_adopted():
+    resolve_pending_command_if_needed()
+
+    if current_run_has_pending_unjointly_adopted_command():
         note_executor_lag()
-        wait_for_next_control_deadline()
+        wait_without_catchup()
         continue
-
-    finalize_pending_recording_row_if_adopted()
 
     if action_chunk_empty():
         obs = build_policy_observation()
-
         captured_run_id = current_run_id()
-        chunk = policy.predict(obs)
+
+        chunk = model_runtime.predict(obs)
 
         if current_run_id() != captured_run_id:
             discard(chunk)
             continue
 
-        queue_local_chunk(chunk)
+        validate_chunk(chunk)
+        store_local_unexecuted_chunk(chunk)
 
     raw_action = pop_next_action()
-    command = decode_project_validate(raw_action)
+    decoded = decode_or_ik(raw_action)
 
     if recoverable_ik_or_workspace_miss:
         clear_unexecuted_chunk_suffix()
         continue
 
-    publish(command)
-    keep_one_pending_recording_row(command, obs, raw_action)
+    target = project_and_safety_check(decoded)
+    command = publish_robot_command(target, required_state=RUNNING)
 
-    wait_until_actual_next_control_time()
+    if command_published:
+        create_one_pending_record_descriptor(command, obs, raw_action)
+
+    pace_without_catchup()
 ```
 
-### Timing
+## 13.1 Exact policy timing rule
 
-- inference remains synchronous;
-- first action of a newly returned chunk publishes as soon as inference finishes and the previous command has been adopted;
-- subsequent actions follow the policy control period;
-- do not catch up missed action times by rapid multi-dispatch;
-- anchor cadence to actual physical publication/adoption history as appropriate;
-- preserve actual timing in raw timestamps.
+Do not leave timing ambiguous.
 
-### Action chunk
+For action commands in one continuous RUNNING episode:
 
-Keep:
+```text
+earliest_next_publish =
+    last_successful_publish_monotonic + PolicySpec.control_dt_s
+```
 
-- `PolicySpec.n_action_steps`;
-- local unexecuted action chunk;
-- clear chunk suffix after a recoverable replanning boundary.
+Rules:
 
-Delete:
+1. Never publish before that deadline.
+2. Also never publish while the previous current-run command is not jointly adopted.
+3. If adoption or synchronous inference finishes after the deadline, publish the next eligible command as soon as both conditions are satisfied.
+4. After a late publish, anchor the following deadline to that **actual successful publish time**.
+5. Never emit catch-up bursts for missed periods.
+6. First action of a newly inferred chunk may publish immediately after inference only if the previous command adoption gate is satisfied and the earliest-next-publish rule is satisfied.
+7. When the local chunk becomes empty, the next inference may begin at the existing query boundary semantics, but no returned command bypasses the publication cadence.
+8. Preserve actual timestamps in raw output.
 
-- pending FIFO publication retry;
-- queue-backpressure state;
-- async-style scheduling abstractions.
+This intentionally converts model/control delay into slower real wall-time execution rather than stale-command catch-up.
 
-### Policy integration scope
+## 13.2 Recoverable replanning
 
-Continue using the public `dexmani_policy.deployment` interface for the currently integrated model source.
+Keep current useful behavior:
 
-Do not build a generic adapter/plugin registry in this refactor merely for hypothetical repositories.
+- ordinary EE IK/no-solution or recoverable workspace miss can clear the unexecuted local chunk suffix;
+- re-observe and re-infer in the same episode;
+- do not convert a normal recoverable miss into hardware FAULT.
 
-However, keep `PolicyRunner` organized so training-repository-specific loading/model code stays at the deployment boundary and the runtime loop operates on the existing `PolicySpec` plus canonical observation/action contract.
+Hard contract violations/internal exceptions remain failures.
 
-When a second concrete external model repository is actually integrated, add the smallest concrete adapter needed then.
+## 13.3 External model boundary
+
+The repository goal includes models trained elsewhere, but do **not** build a plugin framework now.
+
+Keep training-repository-specific code confined to the narrow deployment boundary:
+
+- parent metadata inspection;
+- one child-side model loader;
+- public `PolicySpec`;
+- loaded runtime’s minimal current methods such as `predict/reset/close`, according to the actual public API.
+
+The core real-robot runner should operate on the existing validated spec + canonical observation/action arrays, not on model architecture internals.
+
+Continue using the public `dexmani_policy.deployment` API for the currently integrated model.
+
+When a second concrete training repository is actually integrated, add the smallest concrete adapter needed then. Do not pre-build a registry.
 
 ---
 
-## 13. run_policy.py cleanup
+# 14. run_policy.py reproducibility
 
-Make `examples/run_policy.py` a trustworthy reproducible experiment entry point.
+Make `examples/run_policy.py` a trustworthy experiment entry point.
 
 Required:
 
-1. Add `--config` and resolve the selected experiment runtime config through the existing config resolver. Do not create a second config system.
-2. Rename internal `num_trials` terminology to `num_episodes` unless a distinction remains scientifically necessary.
-3. Keep “technical episode” semantics separate from task success.
-4. Write the **full resolved runtime configuration** into the session directory before hardware starts, not only a small hand-written subset.
-5. Also save the model/policy facts needed to reproduce the run:
-   - experiment selector;
-   - checkpoint/artifact;
+1. Add `--config`.
+2. Resolve it with the existing `resolve_experiment_config(yaml_path=...)` path; do not create a second configuration system.
+3. Normalize internal `num_trials` naming to `num_episodes` unless code semantics genuinely require two separately named concepts.
+4. Keep task success separate from technical validity.
+5. Before any hardware worker starts, write one complete resolved session configuration containing:
+   - full resolved `ExperimentConfig`;
+   - policy experiment selector;
+   - resolved checkpoint/artifact;
    - inference steps;
    - seed;
    - device;
-   - PolicySpec-relevant control dt/history/action chunk facts;
-   - requested episode count and duration.
-6. Do not connect hardware during parsing/config/model metadata inspection.
-7. Keep the user-facing summary concise.
+   - relevant `PolicySpec` facts including control dt, observation history/modalities, action representation and action chunk length;
+   - requested episode count;
+   - per-episode duration;
+   - repository HEAD / dirty-state fact when cheaply available without mutating the repo.
+6. Do not connect hardware during parsing, config resolution, metadata inspection, or writing this file.
+7. Prefer one canonical resolved session YAML/JSON over overlapping partial config files.
+8. Keep operator summary concise.
 
-Prefer one resolved session config file rather than multiple overlapping sources of truth.
+Do not require the external policy package to be a Git checkout merely to record a version. Record what can be resolved reliably; do not invent version metadata.
 
 ---
 
-## 14. Technical episode result semantics
+# 15. Episode result semantics
 
-Separate:
-
-```text
-technical validity
-```
-
-from:
-
-```text
-task success
-```
-
-A robot that fails to grasp can still be a technically valid eval episode.
-
-A camera failure, policy crash, hardware fault, or required recorder failure is a technically invalid episode.
-
-Store/report enough metadata to distinguish at least:
+For policy eval, separate:
 
 ```text
 technical_status: valid | invalid
@@ -981,505 +1163,681 @@ termination_reason
 task_success: true | false | unknown
 ```
 
-Task success may remain offline/manual if that is current workflow.
+A failed grasp can be technically valid.
 
-Avoid dual counters that mix “trial happened” and “evidence happened” unless both facts are actually needed. Use clear names if both remain.
+Examples of technical invalidity:
+
+- required camera failure;
+- recorder failure when eval evidence is required;
+- policy crash;
+- hardware fault;
+- partial/unknown command adoption;
+- invalid observation that terminates the episode.
+
+Task success can remain offline/manual.
+
+Store the result in the existing episode/session metadata path or a simple sidecar already consistent with the repository; do not build a results database.
+
+For teleop collection, use the same integrity concept where useful, but do not force task-success labeling.
 
 ---
 
-## 15. Recorder scope
+# 16. Recording process and failure policy
 
-Keep the recorder as a dedicated process with shared-memory sample transport.
+Keep RecorderIO as a separate process with SHM sample transport.
 
-This is justified by real IO/resource boundaries:
+Justification:
 
 - RGB-D payload size;
-- video/image serialization;
+- video/image encoding;
 - disk IO;
-- avoiding large multiprocessing queue copies.
+- avoiding large queue copies.
 
-Do not collapse video/HDF5 writing into the control process.
+Do not move serialization into the control loop.
 
-But simplify the *control protocol* where possible.
-
-The logical client API should move toward:
+Eventually simplify the logical client API toward:
 
 ```text
 start_episode(metadata)
 append(frame)
-finish_episode(save=True/False, reason=...)
+finish_episode(save=..., reason=...)
 ```
 
-Do not redesign recorder internals until command transport, worker ACK semantics, and raw row semantics are stable.
+but do not rewrite recorder transaction internals until command + raw-row semantics are stable.
 
-Policy eval required-recording failure should invalidate/end the current eval workflow cleanly rather than claim a hardware FAULT.
+## 16.1 Policy eval recorder failure
 
-Teleop recording failure handling follows section 8.
+When policy eval recording is required:
+
+- stop/fence the current episode;
+- mark it technically invalid;
+- request clean session shutdown/non-zero result;
+- do not claim hardware FAULT unless hardware also failed;
+- do not continue running additional unrecorded eval episodes.
+
+This is simpler and scientifically safer than “control continues but evidence is missing”.
+
+## 16.2 Teleop recorder failure
+
+Use section 9.2: current demonstration invalid, motion returns to ARMED when safe, manual recovery/home/quit remain possible, no new recorded B until recorder/camera health is restored.
 
 ---
 
-## 16. Process supervision
+# 17. Process supervision
 
-Keep only supervision that corresponds to real experiment hazards:
+Keep supervision that maps to real hazards:
 
 - readiness;
 - unexpected critical worker death;
 - arm heartbeat;
 - hand heartbeat;
-- camera heartbeat when required;
-- recorder health when required;
+- camera heartbeat when camera is required;
+- recorder health when recording is required;
 - estop;
-- episode/session timeout;
-- verified process shutdown before unlinking shared memory.
+- parent-side episode/session timeout;
+- verified shutdown before SHM unlink.
 
-Do not heartbeat-fault the policy child merely because synchronous inference is blocking.
+Do not heartbeat-fault the policy worker merely because synchronous `predict()` blocks.
 
-VR freshness should primarily be based on actual VR source freshness where appropriate rather than a generic heartbeat abstraction.
+VR health should primarily use actual VR source freshness where appropriate.
 
-Preserve the verified stop/join/terminate/kill/confirm-before-unlink behavior in `runtime/processes.py` unless a specific part is proven redundant.
+Preserve `runtime/processes.py` stop → join → terminate → kill → confirm behavior unless a concrete part is proven unnecessary.
 
-Reduce/remove generic “service/evidence” classification once workflow-specific failure handling no longer needs it.
+Remove generic service/evidence matrices when direct workflow-specific handling replaces them.
 
 ---
 
-## 17. Home / replay / blocking operations
+# 18. Home, replay, calibration, keyboard teleop
 
-Do not force safe homing into the streaming command abstraction.
+Do not treat these as “later callers” after workers already switched protocols. They are command publishers/waiters and must be part of the same command-transport cutover.
 
-Arm home may remain a special physical operation because it owns:
+Search all actual callers of:
 
-- planned path;
-- controller mode transitions;
-- workspace/table/collision checks;
+- `publish_command`;
+- `wait_command_accepted`;
+- `ActionCandidate`;
+- `CommandStreamConsumer`;
+- `coupled_cmd_ring`;
+- old acceptance generation/sequence fields.
+
+Known current paths include at least:
+
+- teleop control grid;
+- keyboard teleop/session;
+- policy runner;
+- hand homing;
+- replay;
+- camera calibration motion;
+- arm/hand workers.
+
+Trace repository-wide; do not assume this list is exhaustive.
+
+## 18.1 Arm home
+
+Keep arm home as its special physical operation if that remains the simplest safe design. It owns:
+
+- planned waypoints;
+- control-mode behavior;
+- workspace/table/collision constraints;
+- abort;
 - settled feedback;
-- mode restoration;
-- abort semantics.
+- mode restoration.
 
-Hand home may use exact endpoint semantics.
+Do not force it into RobotCommand merely for API uniformity.
 
-After command transport migration:
+Its old generation cancellation should become the new `run_id`/operation-epoch fence without changing physical semantics.
 
-- convert any command ACK caller to explicit `wait_command_adopted` or `wait_hand_reached` semantics;
-- use **adopted** for streaming/replay only when that is the existing physical intent;
-- use **reached** when exact endpoint completion is truly required;
-- trace each call site rather than globally replacing waits.
+## 18.2 Hand home
 
-Do not use fixed sleeps as proof of physical home completion.
+If hand home continues to use the shared RobotCommand mailbox:
+
+- required safety state is explicitly ARMED;
+- use current operation `run_id`;
+- wait for **hand reached**, not merely hand adopted;
+- abort invalidates the operation epoch;
+- no FIFO retry exists.
+
+A dedicated hand-home request is acceptable only if it is clearly simpler than sharing RobotCommand; do not create a generic “operation command” framework.
+
+## 18.3 Replay
+
+Trace the intended replay semantics per step.
+
+- For streaming steps, gate next command on adoption, not exact XHand reach, unless the existing replay intentionally requires endpoint blocking.
+- For startup hand home, require reach.
+- Replace `flag_action_queued`-derived send logic using the v31 command identity/adoption contract from section 11.
+- No backlog/catch-up.
+
+## 18.4 Calibration motion
+
+Preserve its exact required SafetyState and blocking/adoption semantics.
+
+Do not globally replace every old acceptance wait with the same new wait. Decide per call site whether the physical requirement is:
+
+- arm adopted;
+- hand adopted;
+- hand reached;
+- settled measured state;
+- dedicated home completion.
 
 ---
 
-## 18. Configuration ownership cleanup
+# 19. Configuration ownership
 
-Do this after the runtime command migration is stable.
+Do this only after command/data semantics are stable.
 
-The current config has teleop concepts living under policy-oriented names. Move ownership only when it makes the source of truth clearer.
+Current config mixes teleop concepts into policy-oriented fields.
 
-Target conceptual ownership:
+Desired conceptual ownership:
 
 ```yaml
-hardware:
-  arm: ...
-  hand: ...
-  camera: ...
-
+arm: ...
+hand: ...
+camera: ...
+pointcloud: ...
 safety: ...
 
 teleop:
   control_hz: ...
   vr_mapping: ...
-  hand_retargeting: ...
-  smoothing: ...
-  recording behavior: ...
+  retargeting/smoothing: ...
 
 recording:
-  data paths / duration / writer settings ...
+  episode paths / durations / writer settings: ...
 
 eval:
-  num_episodes / max duration / recording policy ...
+  episode-count / duration / recording behavior: ...
 ```
 
-Policy-model timing and required modalities should come from `PolicySpec`, not be duplicated in runtime YAML.
+Important:
 
-Do not perform a cosmetic config reorganization that creates broad churn without removing real ambiguity.
+- learned-model control dt belongs to `PolicySpec`;
+- teleop grid dt belongs to teleop config;
+- do not maintain two authoritative policy control rates.
 
-Update all call sites atomically for any field moved.
+However, do not perform broad cosmetic YAML/dataclass churn merely to match the conceptual tree. Move a field only when it removes a real source-of-truth ambiguity or substantially simplifies code.
+
+The minimum required result is that teleop timing is not semantically owned by a learned-policy setting, and policy deployment validates/uses `PolicySpec.control_dt_s` without an unnecessary duplicate runtime truth.
+
+Update every call site atomically for a moved field.
 
 ---
 
-## 19. File-level disposition guide
+# 20. File-level target
 
-Use actual dependency tracing; this is a target, not permission to blindly delete.
+Use dependency tracing; this is not permission for blind deletion.
 
-### `examples/run_policy.py`
+## `examples/run_policy.py`
 
-- add `--config`;
-- full resolved config snapshot;
-- normalize episode terminology;
-- keep no-hardware preflight behavior.
+- `--config`;
+- full resolved session config;
+- episode naming cleanup;
+- no hardware during preflight.
 
-### `examples/collect_teleop.py`
+## `examples/collect_teleop.py`
 
-- keep simple research-facing entry point;
-- preserve C in help/behavior through teleop loop;
-- explicit recorded versus unrecorded mode.
+- keep explicit `--no-record`;
+- preserve C through the teleop loop;
+- keep a simple research-facing CLI.
 
-### `dexmani_real/ipc/command_stream.py`
+## `dexmani_real/ipc/schema.py`
 
-- delete **only after** every consumer has migrated to single-inflight latest-command semantics;
-- no compatibility wrapper should remain.
+- replace FIFO command dtype with `ROBOT_COMMAND_DTYPE`;
+- arm adopted identity/timestamp;
+- hand adopted + reached identity/timestamps;
+- record-sample v31 command/adoption fields;
+- remove FIFO sequence identity from worker state when no longer used.
 
-### `dexmani_real/ipc/schema.py`
+## `dexmani_real/ipc/channels.py`
 
-- replace FIFO command dtype with small `ROBOT_COMMAND_DTYPE`;
-- add arm adoption fields;
-- replace XHand exact-only ACK identity with adopted + reached identities;
-- update record sample dtype for command/adoption facts.
+- mailbox-style robot command ring;
+- shared monotonic `next_command_id`;
+- simplified `run_id`;
+- remove FIFO consumed/base fields after full cutover;
+- keep sensor rings, recorder resources, readiness/health.
 
-### `dexmani_real/ipc/channels.py`
+## `dexmani_real/runtime/safety.py`
 
-- replace `coupled_cmd_ring` FIFO semantics with one latest command mailbox/ring;
-- remove consumed watermarks and generation-base state after migration;
-- keep real sensor/state rings and recorder resources;
-- keep process readiness/heartbeat data that is still used.
+- keep SafetyState and short motion lock;
+- simplify generation to command-admission `run_id`;
+- preserve begin/revoke/invalidate race ordering;
+- remove FIFO/backlog/expiry transaction code after all callers migrate.
 
-### `dexmani_real/runtime/safety.py`
+## `dexmani_real/robot/commands.py`
 
-- keep `SafetyState`;
-- simplify generation into `run_id`;
-- preserve atomic begin/revoke lifecycle;
-- preserve stale command/inference fencing;
-- remove FIFO/backlog/expiry-specific logic after no callers depend on it.
-
-### `dexmani_real/robot/commands.py`
-
-Rewrite around:
+Rewrite around the smallest useful concepts:
 
 - `RobotCommand`;
-- command construction/preparation;
-- current-feedback read needed for producer safety;
-- simple safety result;
-- publish to single-inflight mailbox;
-- adoption/reach helpers for blocking callers.
+- current feedback snapshot needed for producer safety;
+- safety gate/result if it still carries a real decision;
+- command publication;
+- exact adoption status helpers;
+- blocking helpers for adopted/reached callers.
 
-Collapse/remove transport-only layers such as:
+Remove transport-only layers when no longer useful:
 
 - `ActionCandidate`;
 - `PublishResult`;
 - `AcceptanceResult`;
-- `PreparedCommand`
+- `PreparedCommand`;
 
-when they no longer add a real decision.
+Do not force removal if one tiny result type still materially clarifies a real recovery decision. Avoid wrappers that only rename booleans.
 
-Keep real joint/workspace/collision validation.
+## `dexmani_real/robot/arm_worker.py`
 
-### `dexmani_real/robot/arm_worker.py`
+- mailbox/latest new command;
+- exact run/id handling;
+- one arm SDK send per new high-level command;
+- hard worker validation;
+- historical old-run adoption may publish but never authorize current motion.
 
-- latest command observation instead of FIFO consumer;
-- ignore already-seen command id;
-- reject wrong run id before SDK;
-- hard boundary validation;
-- mark adopted only after SDK accepts.
+## `dexmani_real/robot/hand_worker.py`
 
-### `dexmani_real/robot/hand_worker.py`
+- preserve same-sample qpos/current/tactile;
+- active high-level target;
+- adopted after first accepted bounded setpoint;
+- continue slew on later ticks;
+- reached only at exact endpoint;
+- no FIFO consumer/watermark.
 
-- keep same-sample qpos/current/tactile;
-- keep XHand bounded slew;
-- latest high-level target;
-- adopted after first accepted bounded SDK step;
-- reached only at exact target;
-- no FIFO sequence advancement.
+## `dexmani_real/teleop/control_loop/grid.py`
 
-### `dexmani_real/teleop/control_loop/grid.py`
+Keep:
 
-Major simplification:
+- causal observation;
+- VR mapping;
+- retargeting;
+- IK;
+- projection;
+- safety.
 
-- keep causal observation;
-- keep VR mapping;
-- keep hand retargeting;
-- keep IK/projection/safety;
-- delete FIFO FULL retry/pending publication transaction;
-- replace with at-most-one pending command recording row;
-- gate next command on joint adoption;
-- preserve C pause integration.
+Delete:
 
-### `dexmani_real/teleop/loop.py`
+- FIFO FULL retry;
+- exact pending FIFO candidate;
+- queue terminal-acceptance hacks.
 
-- simplify state/loop bookkeeping where command FIFO complexity disappears;
-- keep C pause/resume;
-- remove separate executor polling frequency if unnecessary;
-- keep operator controls and safe recovery.
+Add:
 
-### `dexmani_real/teleop/episode_samples.py`
+- one pending command/sample descriptor;
+- adoption gating;
+- partial-adoption accounting;
+- C integration.
 
-- keep frame status;
-- keep source timestamps/observation validity;
-- add command/adoption facts;
-- remove queue-specific `action_queued` semantics;
-- simplify internal provenance validation only after tracing consumers.
+## `dexmani_real/teleop/loop.py`
 
-### `dexmani_real/teleop/session.py`
+- simplify state made obsolete by FIFO;
+- keep C;
+- keep safe re-anchor;
+- simplify polling/scheduling only if behavior remains responsive.
 
-- recording-enabled camera/recorder become collection-critical for B;
-- remove silent evidence downgrade;
-- simplify generic service/evidence classification where possible;
-- do not turn recorder failure into hardware FAULT.
+## `dexmani_real/teleop/episode_samples.py`
 
-### `dexmani_real/deployment/runner.py`
+- v31 command/adoption fields;
+- frame statuses including partial/unknown;
+- actual source timestamps;
+- no `action_queued`;
+- do not over-prove internal publish/ring timestamps.
 
-Major rewrite to small synchronous:
+## `dexmani_real/teleop/session.py`
+
+- recording resources required for recorded B;
+- no silent evidence downgrade;
+- recorder/camera failure is collection failure, not automatically hardware FAULT;
+- simplify generic service/evidence bookkeeping.
+
+## `dexmani_real/deployment/runner.py`
+
+Target:
 
 ```text
-observe → predict chunk → decode/project → publish → adoption gate → pace
+observe → synchronous infer → local chunk → decode/project/safety
+       → publish → adoption gate → pace
 ```
 
 Keep run-id fence around blocking inference.
 
-### `dexmani_real/deployment/observation.py`
+## `dexmani_real/deployment/observation.py`
 
-Keep scientifically meaningful history/causal logic. Simplify only redundant transport provenance.
+Keep causal/history logic. Simplify only duplicate transport provenance.
 
-### `dexmani_real/deployment/session.py`
+## `dexmani_real/deployment/session.py`
 
-Keep process ownership and parent-side timeout/controls. Simplify evidence/service bookkeeping consistent with the new failure model.
+Keep process ownership, parent controls/timeouts, policy worker isolation, required recording supervision. Simplify evidence bookkeeping.
 
-### `dexmani_real/replay/replayer.py`
+## `dexmani_real/teleop/keyboard_session.py`
 
-Migrate from FIFO acceptance to explicit adopted/reached semantics based on actual replay intent.
+Migrate old FIFO publication/ACK semantics in the same atomic command cutover.
 
-### homing modules
+## `dexmani_real/replay/replayer.py`
 
-Keep real safety/planning behavior. Only change command acknowledgement plumbing as needed.
+Migrate publication/waits/send-mask semantics in the same atomic command cutover.
 
-### `dexmani_real/recording/*`
+## `dexmani_real/calibration/camera/motion.py`
 
-- preserve recorder process + SHM;
-- bump raw schema;
-- update writer/reader/frame construction;
-- simplify protocol later, after command/data semantics stabilize.
+Migrate old publication/acceptance in the same atomic command cutover.
 
-### `dexmani_real/runtime/supervisor.py`
+## `dexmani_real/robot/hand_homing.py`
 
-- preserve critical liveness/safety;
-- remove generic evidence service matrix when workflow-specific logic replaces it.
+Migrate old FIFO publication to new adopted/reached semantics in the same atomic cutover.
 
-### `dexmani_real/runtime/processes.py`
+## `dexmani_real/robot/arm_homing.py`
+
+Preserve physical planning/safety; migrate generation naming/fencing only as required.
+
+## `dexmani_real/recording/*`
+
+- v31 schema;
+- writer/reader/frame/sample transport update;
+- preserve RecorderIO process;
+- protocol simplification later.
+
+## `dexmani_real/runtime/supervisor.py`
+
+Keep real liveness/safety supervision; remove generic evidence service matrix if obsolete.
+
+## `dexmani_real/runtime/processes.py`
 
 Mostly preserve.
 
-### `dexmani_real/robot/projection.py`
+## `dexmani_real/robot/projection.py`
 
-Keep. It is current algorithm/physical command shaping, not framework overhead.
+Preserve. It is real command shaping, not infrastructure overhead.
 
 ---
 
-## 20. Mandatory execution phases
+# 21. Mandatory execution phases
 
-Complete phases in order. Do not leave a long-lived half-migration between old and new command semantics.
+Do the phases in order. “Phase complete” means code compiles and no intentionally broken old/new boundary remains.
 
-### Phase 0 — audit and low-risk reproducibility fixes
+## Phase 0 — audit + low-risk reproducibility fixes
 
-1. Trace current entry points:
-   - `examples/collect_teleop.py`;
-   - `examples/run_policy.py`;
-   - replay/home callers.
-2. Run repository-wide searches for:
-   - `coupled_cmd_ring`;
-   - `command_stream`;
-   - `run_generation`;
-   - `run_generation_base_sequence`;
-   - `arm_cmd_consumed_sequence`;
-   - `hand_cmd_consumed_sequence`;
-   - `ActionCandidate`;
-   - `PUBLISH_REASON_FIFO_FULL`;
-   - `expires_monotonic_ns`;
-   - `accepted_target_sequence`;
-   - `action_queued`.
-3. Document in working notes which producer/consumer/side effect each match belongs to. Do not add a permanent audit document.
-4. Implement:
-   - `run_policy --config`;
-   - full resolved config save;
-   - episode naming cleanup;
-   - recording-enabled teleop no silent downgrade.
-5. Verify C still exists before and after Phase 0.
+Before changing transport, repository-wide search at least:
 
-Run focused offline checks.
+```text
+coupled_cmd_ring
+command_stream
+CommandStreamConsumer
+run_generation
+run_generation_base_sequence
+arm_cmd_consumed_sequence
+hand_cmd_consumed_sequence
+ActionCandidate
+publish_command(
+wait_command_accepted(
+PUBLISH_REASON_FIFO_FULL
+expires_monotonic_ns
+accepted_target_sequence
+action_queued
+flag_action_queued
+```
 
-### Phase 1 — define new command and state wire contracts
+Make working notes only; do not add a permanent audit document.
 
-Change `ipc/schema.py`, `ipc/channels.py`, and the smallest pure helpers first.
+Trace every command publisher/waiter and both workers.
 
-Add:
+Implement low-risk independent fixes:
 
-- `ROBOT_COMMAND_DTYPE`;
-- arm adopted fields;
-- hand adopted + reached fields;
-- single command mailbox;
-- simplified run identity fields.
+- `run_policy --config`;
+- full resolved session config;
+- episode naming cleanup where safe;
+- recorded teleop no silent downgrade.
 
-Do not yet delete old command stream if live callers remain.
+Verify C exists before and after.
 
-Write one-off pure/offline checks that validate dtype shapes and command identity semantics.
+Run offline checks.
 
-### Phase 2 — migrate arm + hand workers and both main producers together
+## Phase 1 — design the cutover from actual code
 
-Migrate in one coordinated phase:
+Do not introduce a second live transport yet.
 
+Using the audit, define the exact local implementation plan for:
+
+- RobotCommand wire dtype;
+- arm state adoption fields;
+- hand adopted/reached fields;
+- shared next_command_id;
+- run_id lifecycle;
+- v31 raw row fields;
+- every old command caller’s new adopted/reached requirement.
+
+If a helper/type can be added without creating a parallel runtime path, it may be added. Do not leave unused “future” abstractions.
+
+The output of Phase 1 is a coherent edit plan in Codex working context, not a permanent design file.
+
+## Phase 2 — one atomic command + raw-data cutover
+
+This is intentionally broad. Do **not** migrate workers first and leave old publishers for a later phase.
+
+In one coordinated implementation phase migrate:
+
+- `ipc/schema.py`;
+- `ipc/channels.py`;
+- `runtime/safety.py`;
+- `robot/commands.py`;
 - arm worker;
 - hand worker;
-- teleop grid/loop command path;
-- policy runner command path.
+- teleop grid/loop publisher;
+- keyboard teleop publisher;
+- policy runner publisher;
+- hand homing;
+- replay;
+- camera calibration motion;
+- every other repository-wide old command publisher/waiter found in Phase 0;
+- record sample wire dtype;
+- raw storage schema v31;
+- frame builder;
+- recorder writer/reader validation;
+- raw processing/export;
+- replay/send-mask consumers of old `action_queued`.
 
-Required invariant after this phase:
+The phase is not complete until:
 
-> No teleop/policy streaming path depends on FIFO ordering, FULL retry, or consumed watermarks.
+- every command publisher speaks the new protocol;
+- both workers speak the new protocol;
+- every blocking caller has explicit adopted/reached/settled semantics;
+- normal recording row truth matches executor adoption;
+- partial/unknown adoption is representable;
+- v31 readers/writers/processors agree.
 
-Implement producer-local single pending recording row.
-
-Keep C working through the new run-id fence.
-
-Run offline fake/shared-memory smoke checks for the scenarios in section 21.
-
-Only after all streaming callers are migrated:
+Only then:
 
 - delete `ipc/command_stream.py`;
-- remove FIFO resources and imports;
-- remove dead transport status code.
+- remove old FIFO resources;
+- remove old FIFO imports/status/retry code;
+- remove generation-base/watermark fields.
 
-### Phase 3 — migrate blocking command users
+Do not keep a compatibility shim for the deleted internal FIFO.
 
-Trace replay, home, calibration helpers, or diagnostics that depended on old acceptance receipts.
+Run all smoke scenarios below before proceeding.
 
-Replace with explicit:
+## Phase 3 — simplify teleop and policy state
 
-- adopted wait;
-- hand reached wait;
-- direct home completion mechanism;
+Now remove state that existed only for FIFO/evidence infrastructure:
 
-according to real semantics.
+- pending FIFO publication retries;
+- FIFO depth/backpressure logging;
+- obsolete policy dispatch state;
+- generic evidence-service matrices;
+- unnecessary high-frequency polling if event/deadline waiting is simpler.
 
-Then remove remaining backlog expiry/generation transaction code.
+Keep:
 
-### Phase 4 — raw schema v31 and recorder row semantics
+- C pause/resume;
+- fresh re-anchor;
+- safety state;
+- run-id fence;
+- one pending command recording descriptor;
+- current research-useful frame statuses;
+- useful session metrics.
 
-1. Update record sample wire schema.
-2. Update `recording/frame.py`.
-3. Update storage schema and bump raw version.
-4. Update recorder writer/validation.
-5. Update reader/processing/export code that requires the current raw version.
-6. Ensure normal command rows are finalized only after joint adoption.
-7. Keep held/failure rows scientifically explicit.
-8. Do not reinterpret old v30.
+Policy required-recording failure should end invalid eval rather than continue evidence-less.
 
-### Phase 5 — simplify teleop/policy workflow bookkeeping
+## Phase 4 — observation/provenance + config ownership
 
-Now that transport complexity is gone:
+- remove duplicate transport proof checks only after tracing consumers;
+- preserve causal/source-time semantics;
+- eliminate duplicate control-rate truth;
+- move only clearly mis-owned config fields;
+- update README stable workflow/terminology if it became stale.
 
-- remove obsolete pending-publish/retry state;
-- simplify policy evidence bookkeeping;
-- simplify teleop service/evidence state;
-- remove unnecessary high-frequency polling;
-- keep C;
-- preserve supervisor/hardware safety.
+Do not turn this into a wholesale configuration rewrite.
 
-Do not redesign homing.
+## Phase 5 — recorder protocol simplification
 
-### Phase 6 — observation/provenance and config cleanup
+Only after command/data semantics are stable:
 
-- remove duplicated internal provenance checks that no scientific consumer needs;
-- preserve source timestamps and causal selection;
-- move clearly mis-owned teleop/eval configuration fields;
-- ensure one source of truth for teleop control rate and policy control dt.
-
-### Phase 7 — recorder protocol simplification
-
-Only after the above is stable:
-
-- reduce recorder client state/transactions where possible;
-- retain recorder process + SHM;
-- preserve safe finalization and verified shutdown.
+- reduce recorder client/transaction state where possible;
+- preserve RecorderIO process + SHM;
+- preserve safe finalization and verified shutdown;
+- avoid a new generic recorder framework.
 
 ---
 
-## 21. Required offline smoke scenarios
+# 22. Required offline smoke scenarios
 
-Do not add a committed test framework. Use temporary scripts / inline Python / existing pure constructors.
+Do not commit a test suite. Use temporary scripts, inline Python, fake/shared-memory pure logic, or existing non-hardware constructors.
 
-At minimum verify:
+## S1 — process-lifetime command IDs
 
-### S1. Single-inflight gate
+Simulate publication from two different logical producers/operations sharing one RuntimeChannels.
+
+Verify command IDs are unique/monotonic and never reset per producer.
+
+## S2 — single-inflight within one run
 
 - publish command 1;
-- arm adopted command 1;
-- hand has not adopted command 1;
-- producer refuses to publish command 2;
-- command mailbox is not overwritten.
+- arm adopts 1;
+- hand has not adopted 1;
+- command 2 cannot replace command 1 in the same run.
 
-### S2. Joint adoption unlocks next command
+## S3 — joint adoption unlocks next command
 
-- arm and hand both report adopted command 1 for the active run;
+- exact arm + hand adoption pair matches command 1;
 - command 2 may publish.
 
-### S3. Hand adopted != reached
+## S4 — stale old run does not block new run
 
-- hand accepts first bounded setpoint for command 1;
-- `last_adopted_command_id == 1`;
-- `last_reached_command_id` remains previous;
-- streaming may advance after arm also adopts;
-- no fake reached ACK is produced.
+- command 1 belongs to run N and remains unadopted;
+- lifecycle advances to run N+1;
+- old run-N mailbox record cannot cross SDK;
+- a valid run-N+1 command can publish and replace/advance past the stale slot.
 
-### S4. Exact hand endpoint
+## S5 — hand adopted != reached
 
-- simulated bounded slew eventually reaches exact target;
-- reached identity advances only then.
+- first bounded hand setpoint accepted;
+- adopted ID advances;
+- reached ID stays previous;
+- streaming can advance after required arm adoption;
+- no fake reach.
 
-### S5. Stale run command fence
+## S6 — hand exact reach
 
-- command belongs to run N;
-- run changes to N+1 before SDK admission;
-- old command is rejected.
+Simulated slew reaches exact high-level target; reached identity advances only then.
 
-### S6. Blocking inference fence
+## S7 — stale SDK fence
+
+- worker observes run-N command;
+- run becomes N+1 before SDK admission;
+- worker does not send old command.
+
+Also check the allowed historical case:
+
+- SDK admission already happened in N;
+- run becomes N+1 before SDK return;
+- returned acceptance may be published as old-run historical adoption but cannot authorize N+1.
+
+## S8 — worker hard rejection does not deadlock
+
+A current-run published target that fails worker-owned hard validation must cause a fail-closed runtime/worker outcome, not an endless pending command with no ACK.
+
+## S9 — blocking inference fence
 
 - capture run N;
-- simulate run transition while “predict” is blocked;
-- returned chunk for N is discarded.
+- simulate blocking predict;
+- advance to N+1;
+- returned N chunk is discarded.
 
-### S7. Teleop C pause
+## S10 — policy cadence, no catch-up
 
-- active run has an unjointly-adopted pending command;
-- C pause invalidates run;
-- pending command/sample is dropped;
-- no stale publication after resume;
-- C remains a recognized key;
-- fresh feedback/re-anchor is still required.
+Simulate:
 
-### S8. Recording label truth
+- successful publish at t0;
+- adoption/inference finishes after t0 + dt;
+- next publish occurs late;
+- following deadline is late_publish + dt;
+- no burst sends.
 
-- normal raw command row is not appended before both executor adoptions;
-- after both adoptions, stored command/adoption timestamps correspond to that command id.
+## S11 — C pause with no adoption
 
-### S9. Held/failure row
+- command published;
+- neither worker adopted;
+- C fences run;
+- post-boundary fresh worker states confirm no adoption;
+- pending normal row may be dropped;
+- resume requires fresh re-anchor;
+- C remains recognized.
 
-- IK/safety/retarget failure publishes no new command;
-- frame status records failure;
-- previous valid executable target remains the held action where appropriate.
+## S12 — C/stop partial adoption
 
-### S10. No-record versus recording-required teleop
+- arm adopted command;
+- hand did not;
+- lifecycle fences run;
+- post-boundary state resolves partial adoption;
+- raw diagnostic row stores exact known facts;
+- episode integrity invalid;
+- row is not normal training/replay action.
 
-- explicit no-record mode can start without recorder;
-- recording-enabled mode cannot silently start unrecorded when camera/recorder is unavailable.
+## S13 — adoption unknown
 
-### S11. No hardware side effects on import
+Simulate worker loss before final post-boundary evidence.
 
-Import modified modules in an offline environment where possible and verify ordinary imports/constructors do not connect hardware.
+Verify:
+
+- no adoption fact is invented;
+- episode becomes invalid;
+- unknown diagnostic state is representable when recorder is available.
+
+## S14 — normal recording label truth
+
+Normal row is not finalized before all present actuator adoptions.
+
+After joint adoption, row’s command ID/run ID/issued/adoption timestamps match the command and worker facts.
+
+## S15 — held/failure row
+
+IK/safety/retarget failure:
+
+- publishes no new command;
+- preserves prior physical target;
+- records explicit status;
+- does not create a new command ID;
+- replay send mask will not resend it as a new command.
+
+## S16 — recording-required teleop
+
+- explicit no-record mode works without recorder;
+- recording-enabled mode cannot start B unrecorded when camera/recorder unavailable.
+
+## S17 — v31 replay/export mask
+
+Given rows containing normal command, held row, partial row, and another normal command:
+
+- only jointly adopted new command IDs become replay/send actions;
+- held row causes no duplicate send;
+- partial/unknown episode is rejected/skipped by default training export.
+
+## S18 — imports have no hardware side effects
+
+Import modified pure/runtime modules offline where possible. Ordinary imports/constructors must not connect devices.
 
 ---
 
-## 22. Repository-wide removal checks
+# 23. Required repository-wide cleanup checks
 
-At the end, use `rg` to prove old transport concepts are gone where expected.
+At the end, verify old transport concepts are absent where expected.
 
-Expected absent after full migration, subject to comments/docs being updated:
+Search for:
 
 ```text
 PUBLISH_REASON_FIFO_FULL
@@ -1488,29 +1846,31 @@ arm_cmd_consumed_sequence
 hand_cmd_consumed_sequence
 command fifo full
 coupled command FIFO
+CommandStreamConsumer
+flag_action_queued
 ```
 
-`ipc/command_stream.py` should no longer exist.
+`dexmani_real/ipc/command_stream.py` should be deleted after the atomic cutover.
 
-`ActionCandidate`, `PreparedCommand`, `PublishResult`, `AcceptanceResult` should be removed if no real non-transport decision remains.
+`ActionCandidate`, `PreparedCommand`, `PublishResult`, `AcceptanceResult`, `expires_monotonic_ns`, and `COMMAND_EXPIRED` should be absent if no traced non-FIFO responsibility remains.
 
-`expires_monotonic_ns` and `COMMAND_EXPIRED` should be removed if their only remaining purpose was queued-backlog protection.
+Do not delete by grep alone; trace semantics first.
 
-Do **not** use search-driven deletion without tracing semantics.
+Verify C explicitly remains, using searches appropriate to the actual keyboard implementation.
 
-Also verify C was **not** removed:
+Also inspect for stale README/comments that still describe:
 
-```bash
-rg -n "C=.*pause|pause/resume|KeyCode.*c|['\"]c['\"]" dexmani_real examples
-```
-
-Adapt the exact search to the implementation.
+- command FIFO;
+- FULL retry;
+- generation watermarks;
+- evidence continuing after required recorder loss;
+- v30 as current schema.
 
 ---
 
-## 23. Standard offline checks after each meaningful phase
+# 24. Standard offline checks
 
-Run:
+After each meaningful phase:
 
 ```bash
 python -m compileall -q dexmani_real examples
@@ -1518,165 +1878,182 @@ ruff check --select F401,F821,F822,F823 dexmani_real examples
 git diff --check
 ```
 
-If Ruff is unavailable, report that fact. Do not install/upgrade dependencies just for this task.
+If Ruff is unavailable, report it; do not install it.
 
-Also run focused pure checks for transforms, dtype construction, safety helpers, command state, and recording frame construction touched by the phase.
+Run focused offline checks for changed pure logic, including:
 
-Never run hardware examples as tests.
+- dtype shape/field consistency;
+- command/run identity;
+- adoption classification;
+- policy cadence;
+- frame builder/storage schema agreement;
+- v31 processing/export/replay selection;
+- transforms/FK/IK/projection only when affected.
+
+Never use a hardware example as a “test”.
 
 ---
 
-## 24. Final review checklist
+# 25. Final acceptance checklist
 
-Before declaring completion:
-
-### Architecture
+## Architecture
 
 - [ ] Teleop and policy remain separate workflows.
-- [ ] Arm and hand remain separate SDK-owning processes.
+- [ ] Arm and hand remain separate SDK-owning workers.
 - [ ] Recorder remains a process.
 - [ ] Command FIFO/backlog is gone.
-- [ ] Single-inflight coupled command is enforced.
-- [ ] No unrestricted latest-wins behavior.
+- [ ] Single-inflight is enforced within the current run.
+- [ ] Stale old-run slot does not block a new run.
+- [ ] command_id is unique/monotonic across producer-process changes.
 - [ ] No generic strategy/backend/plugin framework was added.
 
-### Safety
+## Safety
 
-- [ ] SafetyState still fences physical motion.
-- [ ] run_id protects blocked inference and stale commands.
-- [ ] worker checks run_id immediately before SDK admission.
-- [ ] arm hard validation remains.
-- [ ] hand bounded slew remains.
+- [ ] SafetyState remains.
+- [ ] run_id fences stale predict/results/commands.
+- [ ] publication and revocation share a short ordering fence.
+- [ ] worker rechecks run/state immediately before SDK admission.
+- [ ] already-admitted SDK calls are treated honestly as non-retractable.
+- [ ] worker hard validation failure fails closed.
+- [ ] arm hard limits remain.
+- [ ] XHand slew remains.
 - [ ] estop remains.
 - [ ] safe disconnect remains.
-- [ ] homing safety remains.
+- [ ] homing physical guarantees remain.
 
-### XHand
+## XHand
 
-- [ ] qpos/current/tactile are still one same-sample state.
-- [ ] tactile validity bits remain.
-- [ ] adopted and reached are distinct.
-- [ ] streaming waits for adopted, not exact reach.
+- [ ] qpos/current/tactile remain same-sample.
+- [ ] tactile validity remains.
+- [ ] adopted != reached.
+- [ ] streaming waits on adopted.
+- [ ] hand home waits on reached when endpoint completion is required.
 
-### Teleop
+## Teleop
 
-- [ ] B/S/D/H/Q/ESC behavior remains coherent.
-- [ ] **C pause/resume remains present.**
-- [ ] C safely invalidates stale pending commands.
-- [ ] recording-enabled mode never silently downgrades to no-record.
-- [ ] VR stale/hand/camera failures cannot create a fake valid command label.
+- [ ] B/H/S/D/Q/ESC remain coherent.
+- [ ] **C pause/resume remains.**
+- [ ] C cannot leak stale pre-pause intent.
+- [ ] C still requires fresh re-anchor.
+- [ ] partial adoption around C is represented, not hidden.
+- [ ] recording-enabled B never silently becomes unrecorded.
 
-### Policy eval
+## Policy
 
-- [ ] inference is synchronous only.
-- [ ] no catch-up dispatch.
-- [ ] stale prediction chunk after run change is dropped.
+- [ ] inference remains synchronous.
+- [ ] stale inference result after run change is discarded.
+- [ ] publication cadence is explicit and no-catch-up.
 - [ ] action chunk suffix is cleared at recoverable replanning boundaries.
-- [ ] PolicySpec remains the model/runtime contract.
+- [ ] model-specific code remains confined to the deployment boundary.
+- [ ] `PolicySpec` remains the model/runtime contract.
 
-### Data
+## Data
 
-- [ ] raw schema was explicitly version-bumped.
-- [ ] normal action row represents an actually adopted executable target.
-- [ ] raw intent remains distinct from execution.
+- [ ] raw schema explicitly bumped from v30.
+- [ ] v30 is not silently reinterpreted.
+- [ ] normal action row means all present actuators adopted the command.
+- [ ] partial/unknown adoption has explicit diagnostics.
+- [ ] partial/unknown episode is non-exportable by default.
+- [ ] raw intent remains distinct from executable target.
 - [ ] actual source timestamps remain.
 - [ ] observation anchor remains.
 - [ ] tactile validity remains.
-- [ ] old raw schema is not silently reinterpreted.
+- [ ] replay/export no longer depends on queue truth.
 
-### Reproducibility
+## Reproducibility
 
 - [ ] run_policy accepts explicit config.
-- [ ] full resolved config is stored before hardware startup.
-- [ ] policy artifact/spec/session facts are stored.
-- [ ] technical validity is distinct from task success.
+- [ ] full resolved runtime + policy/session facts are saved before hardware startup.
+- [ ] episode technical validity is separate from task success.
+- [ ] no duplicate authoritative policy control rate remains.
 
-### Cleanup
+## Cleanup
 
-- [ ] dead imports removed.
-- [ ] stale docs/README terminology updated.
-- [ ] no duplicate old/new command APIs remain.
-- [ ] no compatibility shim remains solely to preserve deleted internal architecture.
+- [ ] old command stream deleted only after all callers migrated.
+- [ ] no old/new command compatibility shim remains.
+- [ ] dead imports/config/comments removed.
+- [ ] README stable workflow terms are current.
 - [ ] no committed test framework added.
-- [ ] no hardware-affecting checks were run.
+- [ ] no hardware-affecting validation was run.
 
 ---
 
-## 25. Expected final handoff from Codex
+# 26. Final Codex handoff
 
-At completion, report:
+Report:
 
-1. A concise architecture summary of what changed.
-2. The major files modified/deleted.
-3. Measured simplification where useful:
-   - removed files;
-   - removed old command/lifecycle symbols;
-   - approximate line-count reduction in the main runtime path if easy to measure.
-4. Exact offline checks run and their results.
-5. Explicit statement that no hardware validation was performed.
-6. Any behavior that still requires real-robot validation.
-7. Any remaining complexity intentionally kept because it protects:
-   - physical safety;
-   - scientific timing/data correctness;
-   - a current algorithmic requirement.
-8. Confirmation that teleop **C pause/resume was retained**.
+1. concise final architecture;
+2. major files changed/deleted;
+3. exact old command mechanisms removed;
+4. raw schema version and semantic changes;
+5. how partial adoption is handled;
+6. exact teleop C behavior after refactor;
+7. policy cadence semantics after refactor;
+8. offline checks run with pass/fail/skip results;
+9. explicit statement that no hardware validation was performed;
+10. real-robot validation steps still required;
+11. measured simplification when easy to obtain, such as deleted file count / line reduction / removed state fields;
+12. any complexity intentionally retained because it protects physical safety, scientific timing/data correctness, or a current algorithm.
 
-Do not claim the refactor is hardware-validated until it has been tested in a supervised physical session.
+Do not claim success merely because code compiles. Confirm the protocol invariants and smoke scenarios.
 
 ---
 
-## 26. Complexity budget for every design decision
+# 27. Complexity budget
 
 Before adding or preserving a mechanism, ask:
 
 1. Without it, can the robot become less safe?
 2. Without it, can experiment data become scientifically wrong?
 3. Without it, will current experiment iteration materially suffer?
-4. Has this exact hardware/workflow actually encountered the problem?
+4. Has the current hardware/workflow actually created this problem?
 
-If the answer is no to all four, remove or do not add the mechanism.
+If all are no, remove it or do not add it.
 
-Justified complexity categories:
+Justified complexity:
 
-### A. Physical hardware
+### Physical
 
-- SDK ownership;
-- joint/workspace/collision limits;
+- SDK process ownership;
+- hard limits;
 - XHand slew;
 - safe home;
+- workspace/collision checks actually used by experiments;
 - robot errors;
 - estop;
-- safe shutdown.
+- safe shutdown;
+- stale command fence.
 
-### B. Scientific data
+### Scientific
 
 - actual timestamps;
 - coordinate frames;
+- causal sensor selection;
+- same-sample hand modalities;
 - tactile validity;
-- same-sample XHand modalities;
-- causal sensor alignment;
-- human intent versus executable action;
-- executor adoption timing.
+- human intent vs executable target;
+- per-actuator adoption timing;
+- partial-adoption truth.
 
-### C. Current algorithms
+### Current algorithm
 
 - observation history;
-- action chunks;
+- action chunk;
 - EE IK;
 - recoverable replanning;
-- point cloud when the deployed model actually requires it;
+- point cloud when a deployed policy requires it;
 - model inference steps.
 
 Presumptively removable:
 
-### D. Infrastructure transaction complexity
-
 - lossless streaming command FIFO;
-- backlog retry;
-- generation-base/watermark transaction;
-- generic evidence service orchestration;
+- stale backlog;
+- FIFO FULL retries;
+- sequence watermarks/base generations;
+- per-command backlog expiry;
+- generic evidence-service orchestration;
 - async/RTC scaffolding;
-- generic rollout strategy framework;
+- generic rollout strategies;
 - hypothetical backend/plugin abstractions.
 
-The final code should feel like a research instrument, not a platform.
+The final code should feel like a precise real-robot research endpoint, not a platform.
