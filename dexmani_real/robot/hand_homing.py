@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 import numpy as np
 
 from dexmani_real.robot.commands import (PUBLISH_REASON_FIFO_FULL, ActionCandidate, motion_rejection_reason, publish_command, read_hand_feedback, wait_command_accepted)
-from dexmani_real.runtime.safety import SafetyState
+from dexmani_real.runtime.safety import SafetyState, cancel_coupled_command_if_current
 from dexmani_real.utils.limits import validate_hand_command_bounds
 from dexmani_real.utils.log import get_logger
 
@@ -38,7 +38,6 @@ def initialize_hand_home(
     return publish_hand_home_and_wait_accepted(
         shared,
         np.deg2rad(np.asarray(hand.home_qpos_deg, dtype=np.float64)),
-        expires_monotonic_ns=time.monotonic_ns() + runtime.safety.dispatch_delay_ns,
         command_lower_rad=np.asarray(hand.qpos_min_rad, dtype=np.float64),
         command_upper_rad=np.asarray(hand.qpos_max_rad, dtype=np.float64),
         mechanical_lower_rad=np.asarray(hand.mechanical_qpos_min_rad, dtype=np.float64),
@@ -54,7 +53,6 @@ def publish_hand_home_and_wait_accepted(
     shared: Any,
     home_qpos: np.ndarray,
     *,
-    expires_monotonic_ns: int,
     command_lower_rad: np.ndarray,
     command_upper_rad: np.ndarray,
     mechanical_lower_rad: np.ndarray,
@@ -73,11 +71,14 @@ def publish_hand_home_and_wait_accepted(
     home endpoint. Measured qpos must be healthy and fresh, but it is neither
     required to lie inside command bounds nor compared with the target because
     encoder zero offsets, contact, and steady-state position error are valid.
+    One home timeout covers preparation, FIFO retries, measured-state-bounded
+    hand slew and acceptance. It is independent of the streaming dispatch budget.
     """
     if not np.isfinite(timeout_s) or timeout_s <= 0.0:
         raise ValueError(
             "hand home command acknowledgement timeout must be finite and positive"
         )
+    expires_monotonic_ns = time.monotonic_ns() + int(timeout_s * 1e9)
     # Reject bound violations; never clip coupled hand commands here.
     target = validate_hand_command_bounds(
         home_qpos,
@@ -93,7 +94,6 @@ def publish_hand_home_and_wait_accepted(
     if runtime_rejection:
         logger.warning("hand home rejected by runtime gate: %s", runtime_rejection)
         return False
-    deadline_s = time.monotonic() + timeout_s
     hand_feedback, feedback_rejection, _ = read_hand_feedback(
         shared, max_age_s=hand_feedback_max_age_s
     )
@@ -125,7 +125,7 @@ def publish_hand_home_and_wait_accepted(
     while (
         not publish_result.published
         and publish_result.reason == PUBLISH_REASON_FIFO_FULL
-        and time.monotonic() < deadline_s
+        and time.monotonic_ns() < expires_monotonic_ns
     ):
         if abort_requested is not None and abort_requested():
             break
@@ -142,12 +142,17 @@ def publish_hand_home_and_wait_accepted(
         logger.error("hand home published without a committed-command receipt")
         return False
 
+    remaining_s = (expires_monotonic_ns - time.monotonic_ns()) / 1e9
+    if remaining_s <= 0:
+        cancel_coupled_command_if_current(shared, command=publish_result.command)
+        logger.warning("hand home acknowledgement stopped: home deadline expired")
+        return False
     acceptance = wait_command_accepted(
         shared,
         command=publish_result.command,
         wait_for_arm=False,
         wait_for_hand=True,
-        timeout_s=max(1e-6, deadline_s - time.monotonic()),
+        timeout_s=remaining_s,
         arm_feedback_max_age_s=hand_feedback_max_age_s,
         hand_feedback_max_age_s=hand_feedback_max_age_s,
         check_is_running=check_is_running,

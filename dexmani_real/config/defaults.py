@@ -477,7 +477,8 @@ class HandParams:
     # envelope; at the 16 Hz teleop grid it is a 4.8 rad/s envelope.
     hand_max_delta_rad_per_tick: float = 0.3
 
-    # Homing waits for command acceptance, not measured joint convergence.
+    # Whole hand-home budget: preparation, queueing, slew and SDK acceptance.
+    # Independent of streaming dispatch delay; not measured joint convergence.
     home_command_ack_timeout_s: float = 1.0
 
     fingertip_link_names: tuple[str, ...] = XHAND_FINGERTIP_LINK_NAMES
@@ -916,8 +917,9 @@ class VRParams:
 class SafetyParams:
     """Safety / heartbeat parameters — single source of truth."""
 
-    # Commission from measured producer/SDK/slew delay; never guess a live value.
-    max_dispatch_delay_s: float | None = None
+    # 100 ms baseline: fixed-pose xArm/XHand tests observed <36 ms to SDK acceptance.
+    # Moving IK, larger hand slew and loaded runs still require timing validation.
+    max_dispatch_delay_s: float | None = 0.1
 
     @property
     def dispatch_delay_ns(self) -> int:

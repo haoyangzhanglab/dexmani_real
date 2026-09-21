@@ -865,7 +865,6 @@ def home_policy_robot(
     accepted = publish_hand_home_and_wait_accepted(
         shared,
         hand_home,
-        expires_monotonic_ns=time.monotonic_ns() + runtime.safety.dispatch_delay_ns,
         command_lower_rad=np.asarray(runtime.hand.qpos_min_rad, dtype=np.float64),
         command_upper_rad=np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64),
         mechanical_lower_rad=np.asarray(

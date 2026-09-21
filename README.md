@@ -29,13 +29,16 @@ python examples/collect_teleop.py --config experiment.yaml --print-config
 
 经常调整的 IP、serial、频率、相机尺寸、数据路径、task、控制参数留在实验配置。
 
-运动入口要求显式配置 `safety.max_dispatch_delay_s`（有限正秒数）；
-支持 `--config` 的入口应在实验 YAML 中提供该值。policy CLI 的配置限制见下文。
-当前没有经过真机 timing validation 的默认值；缺失配置会在设备启动前拒绝运行。
+`safety.max_dispatch_delay_s` 默认 **0.1 秒（100 ms）**，是基于当前机器固定姿态
+派发测试选定的初始预算；运动 IK、大幅手部 slew 和高负载工况仍需验证。
+支持 `--config` 的入口可在实验 YAML 中覆盖该值；必须为有限正秒数，
+显式设为 `null` 会在设备启动前拒绝运行。policy CLI 的配置限制见下文。
 该预算从每个 endpoint 的执行时机开始，覆盖准备、FIFO 等待和 XHand 最终目标 slew；
 FULL/CRC 重试不刷新 deadline。过期撤销该 generation，必须由操作者重新开始；
-keyboard/calibration jog 必须先释放按键。HOME 排队使用现有 request queue budget，
-已开始的长轨迹仍使用自身的执行/abort timeout。
+keyboard/calibration jog 必须先释放按键。手部归位统一使用
+`hand.home_command_ack_timeout_s`（默认 1 秒），覆盖准备、排队、分步下发和最终目标接受，
+不受实时指令的 100 ms 预算限制；重试不刷新截止时间。
+机械臂 HOME 排队使用现有 request queue budget，已开始的长轨迹使用自身的执行/abort timeout。
 
 ## 研究入口
 
@@ -43,6 +46,7 @@ keyboard/calibration jog 必须先释放按键。HOME 排队使用现有 request
 |---|---|---|
 | VR collection | `python examples/collect_teleop.py --config experiment.yaml --task-name <task> --operator <name>` | 真机；raw episode |
 | Keyboard jog / home | `python examples/keyboard_teleop.py --config experiment.yaml` | 真机 |
+| Fixed-pose dispatch timing | `python examples/measure_dispatch_timing.py --execute-hold --budget-s <seconds> --output /tmp/dispatch_timing.json` | 真机；保持初始姿态，JSON 耗时报告 |
 | Physical replay | `python examples/replay_episode.py <episode> --config experiment.yaml` | 真机；raw float64 sent targets |
 | Policy rollout | `python examples/run_policy.py <policy/task/experiment>` | 真机；rollout session |
 | Camera calibration | `python examples/calibrate_camera.py --config experiment.yaml --hand-geometry absent` | 真机；标定；仅适用于未安装 XHand |
@@ -55,6 +59,16 @@ keyboard/calibration jog 必须先释放按键。HOME 排队使用现有 request
 `xhand_diagnostics.py` 没有离线 `--help`，执行该脚本会启动 SDK 诊断并连接/发现设备。
 相机标定的 `--hand-geometry` 是物理状态声明：未安装 XHand 才可用 `absent`；
 安装的手已物理固定在配置的 home 姿态时用 `secured-home`。两者均使用固定 home 手模型做碰撞检查。
+
+`measure_dispatch_timing.py` 默认测量 15 秒，只向 arm 下发初始实测关节角，
+XHand 提供真实姿态用于碰撞检查；`--hold-hand` 才同时下发手部保持指令。
+初始手部角度超出命令范围时，可加 `--clip-hand`，显式允许先裁剪再保持；
+这会产生手部运动，报告保留原始姿态、裁剪目标与裁剪量，发送前检查 arm/hand 过渡碰撞。
+重试时用 `--hand-target-report <previous.json>` 复用上次目标，避免反复从反馈重设目标。
+`--hand-tolerance-deg` 控制实测姿态相对初始到目标区间的观测余量，不修改命令或机械限位。
+`--budget-s` 是本次测试的有限截止预算，不会自动放宽或写回配置。
+`Q`/`S` 结束，`ESC` 急停；报告保留全部样本及缺失接受记录数。
+该测量使用当前姿态的 IK 和 SDK 返回时间，不代表运动目标 IK、手部大动作 slew 或物理停机延迟。
 
 ### Teleoperation / recording
 
@@ -79,8 +93,8 @@ recorder 进程自己 drain 最后一帧、关闭视频/HDF5 并发布结果；�
 ### Policy rollout
 
 当前 `run_policy.py` 没有 `--config`，直接读取 `config/defaults.py`。
-启动前必须完成 commissioning，并在该配置源中显式设置实测的
-`safety.max_dispatch_delay_s`；仓库保留未标定的 `None`，会在启动硬件前拒绝运行。
+`safety.max_dispatch_delay_s` 当前默认 0.1 秒；policy 工作负载须单独完成
+commissioning，必要时在该配置源中调整预算。
 其他入口的 `--config experiment.yaml` 不会影响 policy CLI。
 
 ```bash
@@ -189,7 +203,8 @@ git diff --check
 
 ## 真机 commissioning（需单独授权，离线测试不代替）
 
-先测量准备、排队、SDK 与 hand slew 延迟，再填写 `safety.max_dispatch_delay_s`。
+测量目标工作负载的准备、排队、SDK 与 hand slew 延迟，验证默认的
+`safety.max_dispatch_delay_s`，必要时调整。
 低速检查启动/停止、慢推理时的 parent timeout、home 与长录制关闭时的 S/Q/ESC、
 人为 backlog 导致的 deadline 撤销、arm/hand 错误和单侧先行、RealSense/触觉失效、
 真实 checkpoint rollout、物理急停和安全断开。deadline 保护 software admission，
