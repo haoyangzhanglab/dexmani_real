@@ -96,28 +96,6 @@ class CommittedCommand:
     published_monotonic_ns: int = 0
 
 
-@dataclass(frozen=True)
-class RunEpoch:
-    """Atomic identity and start time of the current control run."""
-
-    generation: int
-    started_monotonic_ns: int
-
-
-@dataclass(frozen=True)
-class RunStateSnapshot:
-    """Atomic safety state and observation epoch used by worker loops."""
-
-    state: SafetyState
-    generation: int
-    started_monotonic_ns: int
-    stop_request: int
-    ended_generation: int
-    ended_started_monotonic_ns: int
-    ended_monotonic_ns: int
-    ended_reason: RunEndReason
-
-
 def _advance_run_generation_locked(shared: Any) -> int:
     """Invalidate the whole command epoch and re-base the FIFO watermark floor.
 
@@ -159,7 +137,7 @@ def _read_motion_permit_locked(shared: Any) -> MotionPermit:
     return MotionPermit(state, int(shared.run_generation.value))
 
 
-def _begin_motion_locked(shared: Any) -> RunEpoch | None:
+def _begin_motion_locked(shared: Any) -> tuple[int, int] | None:
     """Enter RUNNING while the caller owns ``motion_lock``."""
     if (
         int(shared.safety_state.value) != int(SafetyState.ARMED)
@@ -173,7 +151,7 @@ def _begin_motion_locked(shared: Any) -> RunEpoch | None:
     shared.run_started_monotonic_ns.value = started_ns
     shared.run_started_generation.value = generation
     shared.safety_state.value = int(SafetyState.RUNNING)
-    return RunEpoch(generation=generation, started_monotonic_ns=started_ns)
+    return generation, started_ns
 
 
 def _revoke_motion_locked(
@@ -204,7 +182,6 @@ def _revoke_motion_locked(
         elif shared.error_state.value or new_state is SafetyState.FAULT:
             reason = RunEndReason.HARDWARE_FAULT
         shared.run_ended_generation.value = int(shared.run_started_generation.value)
-        shared.run_ended_started_monotonic_ns.value = int(shared.run_started_monotonic_ns.value)
         shared.run_ended_monotonic_ns.value = time.monotonic_ns()
         shared.run_ended_reason.value = int(reason)
     generation = _invalidate_coupled_commands_locked(shared)
@@ -253,22 +230,20 @@ def read_motion_permit(shared: Any) -> MotionPermit:
         return _read_motion_permit_locked(shared)
 
 
-def read_run_state_snapshot(shared: Any) -> RunStateSnapshot:
-    """Read the run boundary state under one motion lock."""
+def read_run_state(shared: Any) -> tuple[SafetyState, int, int, int]:
+    """Read permission, cancellation generation, run start and STOP atomically."""
     with shared.motion_lock:
         permit = _read_motion_permit_locked(shared)
-        return RunStateSnapshot(
-            state=permit.state,
-            generation=permit.run_generation,
-            started_monotonic_ns=int(shared.run_started_monotonic_ns.value),
-            stop_request=int(shared.stop_request.value),
-            ended_generation=int(shared.run_ended_generation.value),
-            ended_started_monotonic_ns=int(shared.run_ended_started_monotonic_ns.value),
-            ended_monotonic_ns=int(shared.run_ended_monotonic_ns.value),
-            ended_reason=RunEndReason(int(shared.run_ended_reason.value)),
-        )
+        return (permit.state, permit.run_generation,
+                int(shared.run_started_monotonic_ns.value), int(shared.stop_request.value))
 
 
+def read_run_end(shared: Any) -> tuple[int, int, RunEndReason]:
+    """First terminal fact survives delayed inference and subsequent cleanup."""
+    with shared.motion_lock:
+        return (int(shared.run_ended_generation.value),
+                int(shared.run_ended_monotonic_ns.value),
+                RunEndReason(int(shared.run_ended_reason.value)))
 
 
 def _committed_command_is_current_locked(
@@ -331,13 +306,13 @@ def begin_motion(shared: Any) -> bool:
         "safety: ARMED(%d) → RUNNING(%d), generation=%d epoch_ns=%d",
         1,
         2,
-        epoch.generation,
-        epoch.started_monotonic_ns,
+        epoch[0],
+        epoch[1],
     )
     return True
 
 
-def begin_requested_motion(shared: Any) -> RunEpoch | None:
+def begin_requested_motion(shared: Any) -> tuple[int, int] | None:
     """Consume one B request and enter RUNNING unless a newer S is pending."""
     with shared.motion_lock:
         if not bool(shared.start_request.value) or int(
@@ -352,8 +327,8 @@ def begin_requested_motion(shared: Any) -> RunEpoch | None:
         "safety: consumed B; ARMED(%d) → RUNNING(%d), generation=%d epoch_ns=%d",
         1,
         2,
-        epoch.generation,
-        epoch.started_monotonic_ns,
+        epoch[0],
+        epoch[1],
     )
     return epoch
 

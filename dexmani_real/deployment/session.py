@@ -20,7 +20,10 @@ from dexmani_real.deployment.config import (
     validate_policy_runtime_compatibility,
 )
 from dexmani_real.deployment.runner import policy_runner_loop
-from dexmani_real.deployment.operator import build_home_planner, run_operator_control
+from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
+from dexmani_real.planning import XArm7MotionPlanner
+from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
+from dexmani_real.runtime.safety import StopRequest, request_policy_start, request_policy_stop, RunEndReason
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.recording.io_worker import RecorderIOConfig, recorder_io_loop
 from dexmani_real.recording.client import RECORDER_STOP_TIMEOUT_S
@@ -520,7 +523,7 @@ def run_policy_deployment(
         )
         if not evidence_ready:
             print("  Evidence unavailable; trials can run without recording", flush=True)
-        home_planner = build_home_planner(runtime) if execute else None
+        home_planner = build_policy_home_planner(runtime) if execute else None
         home_status = "return hand + arm home before B" if home_planner else "disabled"
         print(
             "  [B] begin   [S] stop/save   [Q] quit   [ESC] e-stop   "
@@ -654,3 +657,181 @@ def run_policy_deployment(
                     shared, shutdown_report, recording_enabled=recording_config is not None,
                     normal_exit=False, exit_reason=exit_reason,
                 )
+
+
+_POLL_S = 0.05
+
+def _request_immediate_stop(shared: RuntimeChannels) -> None:
+    """Fence live motion when S/Q arrives while this thread is blocked by H."""
+    if not request_policy_stop(shared):
+        shared.error_state.value = True
+
+
+def _request_immediate_quit(shared: RuntimeChannels) -> None:
+    """Apply Q's motion fence before asking the supervisor to shut down."""
+    if not request_policy_stop(shared, reason=RunEndReason.QUIT):
+        shared.error_state.value = True
+    shared.quit_requested.value = True
+
+
+def run_operator_control(
+    shared: RuntimeChannels,
+    runtime: ExperimentConfig,
+    planner: XArm7MotionPlanner | None,
+    *,
+    stop_event: threading.Event,
+    execute: bool,
+) -> None:
+    """Keyboard thread target: map operator keys to shared flags / home.
+
+    B -> ``start_request``, S -> ``stop_request`` + motion fence,
+    Q -> ``quit_requested``, ESC -> ``estop_request``. S/Q/ESC fire as
+    immediate callbacks so they stay responsive while this thread blocks in
+    H. H is enabled only when a caller supplies a home planner. The thread
+    exits when *stop_event* is set, when the runtime stops, or after a
+    terminal Q/ESC. C/D belong to teleop (PAUSE/DISCARD); policy deployment
+    ignores them with a warning and assigns no task meaning to any key —
+    task success is judged offline from the saved raw episode.
+    """
+    if not isinstance(execute, bool):
+        raise TypeError("execute must be a boolean")
+    if execute != (planner is not None):
+        raise ValueError("execute must match physical home availability")
+    keyboard = KeyboardInput(
+        estop_callback=lambda: setattr(shared.estop_request, "value", True),
+        stop_callback=lambda: _request_immediate_stop(shared),
+        quit_callback=lambda: _request_immediate_quit(shared),
+    )
+    try:
+        keyboard.start()
+    except Exception:
+        # Without the e-stop keyboard the deployment must not run: fail closed
+        # so the supervisor observes a sticky fault and shuts down.
+        logger.error(
+            "operator: keyboard failed to start; latching error_state", exc_info=True
+        )
+        shared.error_state.value = True
+        return
+    try:
+        while not stop_event.is_set() and shared.is_running.value:
+            if keyboard.estop_latched or not keyboard.healthy:
+                shared.estop_request.value = True
+                return
+            # A physical B must be a fresh, post-home confirmation.  H blocks
+            # this thread while the arm moves, so begin events from the same
+            # drained batch must not survive a successful home sequence.
+            discard_begin_in_batch = False
+            signals = keyboard.poll(timeout=_POLL_S)
+            # Lifecycle-changing signals suppress Home and Begin in the same batch.
+            # C/D (PAUSE/DISCARD) belong to teleop and are true no-ops here, so
+            # they must not fence H; ESC is fenced by the estop latch/callback.
+            stop_in_batch = any(
+                signal in {OperatorCommand.STOP, OperatorCommand.QUIT}
+                for signal in signals
+            )
+            for signal in signals:
+                if signal is OperatorCommand.BEGIN:
+                    if stop_in_batch:
+                        logger.warning(
+                            "operator: ignored B received in the same batch as S/Q"
+                        )
+                        continue
+                    if (
+                        discard_begin_in_batch
+                        or not request_policy_start(
+                            shared,
+                            require_physical_home=planner is not None,
+                        )
+                    ):
+                        logger.warning(
+                            "operator: ignored B until a completed physical home "
+                            "sequence is followed by a fresh B"
+                        )
+                        continue
+                elif signal is OperatorCommand.STOP:
+                    # The keyboard completed the motion fence before enqueueing.
+                    # STOP still suppresses HOME/BEGIN in this batch, but must
+                    # not revoke again after the policy runner acknowledges it.
+                    continue
+                elif signal is OperatorCommand.PAUSE:
+                    logger.warning(
+                        "operator: C is not used in policy deployment; ignored"
+                    )
+                elif signal is OperatorCommand.DISCARD:
+                    logger.warning(
+                        "operator: D is not used in policy deployment; ignored"
+                    )
+                elif signal is OperatorCommand.HOME:
+                    if planner is None:
+                        logger.warning("operator: H is disabled in policy deployment")
+                        continue
+                    if stop_in_batch:
+                        logger.warning(
+                            "operator: ignored H received in the same batch as S/Q"
+                        )
+                        continue
+                    with shared.motion_lock:
+                        home_allowed = int(shared.safety_state.value) == int(
+                            SafetyState.ARMED
+                        )
+                        shared.physical_home_completed.value = False
+                        if home_allowed:
+                            # H follows any older inactive S but cannot erase an
+                            # S arriving after this atomic preparation.
+                            shared.start_request.value = False
+                            shared.stop_request.value = int(StopRequest.NONE)
+                    if not home_allowed:
+                        logger.warning("operator: ignored H unless safety is ARMED")
+                        continue
+                    completed = home_policy_robot(
+                        shared,
+                        runtime,
+                        planner,
+                        abort_requested=lambda: bool(
+                            stop_event.is_set()
+                            or not shared.is_running.value
+                            or shared.quit_requested.value
+                            or shared.error_state.value
+                            or shared.estop_request.value
+                            or int(shared.stop_request.value) != int(StopRequest.NONE)
+                        ),
+                    )
+                    with shared.motion_lock:
+                        authorized = bool(
+                            completed
+                            and int(shared.arm_home_completed_generation.value)
+                            == int(shared.run_generation.value)
+                            and shared.is_running.value
+                            and not shared.quit_requested.value
+                            and not shared.error_state.value
+                            and not shared.estop_request.value
+                            and int(shared.stop_request.value) == int(StopRequest.NONE)
+                            and int(shared.safety_state.value) == int(SafetyState.ARMED)
+                        )
+                        # Stop/start requests share this lock, so a completed H
+                        # cannot resurrect authorization after a newer S.
+                        shared.physical_home_completed.value = authorized
+                    if authorized:
+                        logger.info(
+                            "operator: physical home sequence completed; "
+                            "press B to start"
+                        )
+                    else:
+                        logger.warning(
+                            "operator: physical home sequence did not authorize; "
+                            "B remains disabled for the next episode"
+                        )
+                    # HOME blocks while hand/arm homing completes. Drop stale
+                    # H and B events, but preserve S/Q/ESC so an operator can
+                    # still stop, quit, or e-stop immediately afterwards.
+                    keyboard.drain_signal(OperatorCommand.HOME)
+                    keyboard.drain_signal(OperatorCommand.BEGIN)
+                    discard_begin_in_batch = True
+                elif signal is OperatorCommand.QUIT:
+                    # The immediate callback already fenced motion and set Q.
+                    return
+                elif signal is OperatorCommand.EMERGENCY_STOP:
+                    shared.estop_request.value = True
+                    return
+    finally:
+        keyboard.stop()

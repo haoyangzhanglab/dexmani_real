@@ -100,7 +100,6 @@ class _FakeShared:
         self.run_started_monotonic_ns = ctx.Value("Q", 0)
         self.run_started_generation = ctx.Value("Q", 0)
         self.run_ended_generation = ctx.Value("Q", 0)
-        self.run_ended_started_monotonic_ns = ctx.Value("Q", 0)
         self.run_ended_monotonic_ns = ctx.Value("Q", 0)
         self.run_ended_reason = ctx.Value("Q", 0)
 

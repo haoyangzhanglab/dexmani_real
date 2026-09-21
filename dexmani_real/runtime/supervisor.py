@@ -15,7 +15,7 @@ from dexmani_real.runtime.safety import (
     SafetyState,
     RunEndReason,
     revoke_motion,
-    read_run_state_snapshot,
+    read_run_state,
     revoke_motion_if_generation,
     transition,
 )
@@ -184,19 +184,19 @@ def run_supervisor(
     try:
         while True:
             if max_running_ns is not None:
-                snapshot = read_run_state_snapshot(shared)
+                state, generation, started_ns, _ = read_run_state(shared)
                 if (
-                    snapshot.state is SafetyState.RUNNING
-                    and snapshot.started_monotonic_ns > 0
-                    and time.monotonic_ns() - int(snapshot.started_monotonic_ns)
+                    state is SafetyState.RUNNING
+                    and started_ns > 0
+                    and time.monotonic_ns() - int(started_ns)
                     >= max_running_ns
-                    and revoke_motion_if_generation(shared, snapshot.generation, reason=RunEndReason.TIMEOUT)
+                    and revoke_motion_if_generation(shared, generation, reason=RunEndReason.TIMEOUT)
                 ):
                     logger.warning(
                         "[SUPERVISOR] run budget %.1fs exceeded — motion revoked "
                         "(generation=%d); the control owner ends the trial",
                         float(max_running_s),
-                        snapshot.generation,
+                        generation,
                     )
             heartbeat_timestamps = {
                 name: shared.get_heartbeat(name) for name in timeouts

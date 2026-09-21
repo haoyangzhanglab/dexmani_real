@@ -63,7 +63,8 @@ from dexmani_real.runtime.safety import (
     SafetyState,
     StopRequest,
     begin_requested_motion,
-    read_run_state_snapshot,
+    read_run_state,
+    read_run_end,
     revoke_motion,
     RunEndReason,
 )
@@ -458,19 +459,17 @@ class PolicyRunner:
             stop_reason=stop_reason,
             trial_generation=self._trial_generation,
         )
-        terminal = read_run_state_snapshot(self.shared)
-        if (terminal.ended_started_monotonic_ns != self.run_started_ns
-                or terminal.ended_generation != self._trial_generation
-                or terminal.ended_reason is RunEndReason.NONE):
+        ended_generation, ended_ns, ended_reason = read_run_end(self.shared)
+        if ended_generation != self._trial_generation or ended_reason is RunEndReason.NONE:
             raise RuntimeError("RUNNING ended without its matching software terminal fact")
-        stop_reason = terminal.ended_reason.name.lower()
+        stop_reason = ended_reason.name.lower()
         reason = stop_reason
         # Trial counting belongs to the run owner: a truly begun trial counts
         # exactly once here, independent of whether its evidence saved.
         self.completed_trials += 1
         self._evidence_logged_this_trial = False
         self.session_running_ns += max(
-            0, terminal.ended_monotonic_ns - int(self.run_started_ns)
+            0, ended_ns - int(self.run_started_ns)
         )
         if (
             self.recorder is not None
@@ -890,11 +889,11 @@ class PolicyRunner:
             return
         if self.execute:
             self.shared.physical_home_completed.value = False
-        self.run_started_ns = epoch.started_monotonic_ns
-        self._trial_generation = epoch.generation
-        self.next_record_ns = epoch.started_monotonic_ns + self.step_dt_ns
+        self.run_started_ns = epoch[1]
+        self._trial_generation = epoch[0]
+        self.next_record_ns = epoch[1] + self.step_dt_ns
         self._evidence_logged_this_trial = False
-        self._clear_execution(epoch.generation)
+        self._clear_execution(epoch[0])
         self.model_runtime.reset_episode()
         recording_note = (
             "  [evidence unavailable — running without recording]"
@@ -906,7 +905,7 @@ class PolicyRunner:
             f"{recording_note}",
             flush=True,
         )
-        logger.debug("policy_runner_loop: RUNNING generation=%d", epoch.generation)
+        logger.debug("policy_runner_loop: RUNNING generation=%d", epoch[0])
 
     def _handle_run_boundary(self) -> None:
         if not self._poll_recorder():
@@ -974,8 +973,7 @@ class PolicyRunner:
                 self._clear_execution(None)
             return
 
-        run_snapshot = read_run_state_snapshot(self.shared)
-        raw_stop = run_snapshot.stop_request
+        state, generation, started_ns, raw_stop = read_run_state(self.shared)
         if raw_stop not in {int(StopRequest.NONE), int(StopRequest.OPERATOR)}:
             self._fault("invalid stop request code")
             return
@@ -999,7 +997,7 @@ class PolicyRunner:
                     self.shared.stop_request.value = int(StopRequest.NONE)
             return
 
-        if run_snapshot.state is not SafetyState.RUNNING:
+        if state is not SafetyState.RUNNING:
             if self.run_started_ns is not None:
                 self._finish_episode(
                     "motion revoked outside formal stop request",
@@ -1320,11 +1318,11 @@ class PolicyRunner:
         )
 
     def _running_generation_is_live(self) -> bool:
-        snapshot = read_run_state_snapshot(self.shared)
+        state, generation, started_ns, raw_stop = read_run_state(self.shared)
         return (
-            snapshot.state is SafetyState.RUNNING
-            and snapshot.generation == self.run_generation
-            and snapshot.stop_request == int(StopRequest.NONE)
+            state is SafetyState.RUNNING
+            and generation == self.run_generation
+            and raw_stop == int(StopRequest.NONE)
             and bool(self.shared.is_running.value)
             and not bool(self.shared.quit_requested.value)
             and not bool(self.shared.error_state.value)
@@ -1357,11 +1355,11 @@ class PolicyRunner:
         if not self._running_generation_is_live():
             self._handle_run_boundary()
             if self.run_started_ns is not None and not self._running_generation_is_live():
-                snapshot = read_run_state_snapshot(self.shared)
-                if snapshot.state is SafetyState.RUNNING and snapshot.started_monotonic_ns == self.run_started_ns:
+                state, generation, started_ns, raw_stop = read_run_state(self.shared)
+                if state is SafetyState.RUNNING and started_ns == self.run_started_ns:
                     # A command-only pause/rebase is not a trial end. Discard
                     # old intent and re-anchor on the next normal control tick.
-                    self._clear_execution(snapshot.generation, reason="command_epoch_changed")
+                    self._clear_execution(generation, reason="command_epoch_changed")
                 else:
                     self._finish_episode("motion generation changed")
             return
@@ -1436,10 +1434,10 @@ class PolicyRunner:
                 self._recorder_start_wait_ms = 0.0
                 self.shared.set_heartbeat("policy", time.monotonic())
                 self._handle_run_boundary()
-                run_snapshot = read_run_state_snapshot(self.shared)
+                state, generation, started_ns, raw_stop = read_run_state(self.shared)
                 if (
                     self.run_started_ns is not None
-                    and run_snapshot.state is SafetyState.RUNNING
+                    and state is SafetyState.RUNNING
                 ):
                     self._run_active_tick(time.monotonic_ns())
                     if (

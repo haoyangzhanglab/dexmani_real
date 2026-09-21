@@ -94,7 +94,6 @@ def _fake_shared(*, safety_state: int = int(SafetyState.ARMED)):
         run_started_monotonic_ns=SimpleNamespace(value=0),
         run_started_generation=SimpleNamespace(value=0),
         run_ended_generation=SimpleNamespace(value=0),
-        run_ended_started_monotonic_ns=SimpleNamespace(value=0),
         run_ended_monotonic_ns=SimpleNamespace(value=0),
         run_ended_reason=SimpleNamespace(value=0),
 
@@ -636,7 +635,7 @@ class FirstTerminalFactTest(_RunnerTest):
         from unittest.mock import patch
         from test_sync_policy_timing import _Clock
         from dexmani_real.runtime.safety import (RunEndReason, request_policy_stop,
-            read_run_state_snapshot, revoke_motion, invalidate_coupled_commands)
+            read_run_end, revoke_motion, invalidate_coupled_commands)
         clock = _Clock(0)
         runner = self._runner(num_trials=3)
         with patch("dexmani_real.runtime.safety.time", clock), patch("dexmani_real.deployment.runner.time", clock):
@@ -645,20 +644,20 @@ class FirstTerminalFactTest(_RunnerTest):
             generation = runner.run_generation
             clock.ns = 2_000_000_000
             request_policy_stop(runner.shared)
-            first = read_run_state_snapshot(runner.shared)
-            self.assertEqual(first.ended_generation, generation)
-            self.assertEqual(first.ended_reason, RunEndReason.OPERATOR)
+            first = read_run_end(runner.shared)
+            self.assertEqual(first[0], generation)
+            self.assertEqual(first[2], RunEndReason.OPERATOR)
             clock.ns = 10_000_000_000
             request_policy_stop(runner.shared)
             revoke_motion(runner.shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
             invalidate_coupled_commands(runner.shared)  # ARMED/home rebase
-            self.assertEqual(read_run_state_snapshot(runner.shared).ended_monotonic_ns, first.ended_monotonic_ns)
+            self.assertEqual(read_run_end(runner.shared)[1], first[1])
             runner._handle_run_boundary()
             self.assertEqual(runner.session_running_ns, 2_000_000_000)
             runner.shared.start_request.value = True
             runner._start_requested_episode()
             invalidate_coupled_commands(runner.shared)  # RUNNING teleop-style pause
-            self.assertEqual(read_run_state_snapshot(runner.shared).ended_generation, generation)
+            self.assertEqual(read_run_end(runner.shared)[0], generation)
             clock.ns = 13_000_000_000
             request_policy_stop(runner.shared)
             runner._handle_run_boundary()
@@ -668,7 +667,7 @@ class FirstTerminalFactTest(_RunnerTest):
     def test_parent_budget_uses_actual_revoke_time_and_timeout_reason(self):
         from unittest.mock import patch
         from test_sync_policy_timing import _Clock
-        from dexmani_real.runtime.safety import RunEndReason, read_run_state_snapshot
+        from dexmani_real.runtime.safety import RunEndReason, read_run_end
         clock = _Clock(1_000_000_000)
         runner = self._runner()
         with patch("dexmani_real.runtime.safety.time", clock), patch("dexmani_real.deployment.runner.time", clock):
@@ -679,7 +678,7 @@ class FirstTerminalFactTest(_RunnerTest):
                 runner.shared.quit_requested.value = True
             with patch("dexmani_real.runtime.supervisor.time.monotonic_ns", clock.monotonic_ns), patch("dexmani_real.runtime.supervisor.time.sleep", side_effect=next_poll):
                 run_supervisor(runner.shared, [], heartbeat_timeouts_s={}, max_running_s=2.)
-            self.assertEqual(read_run_state_snapshot(runner.shared).ended_reason, RunEndReason.TIMEOUT)
+            self.assertEqual(read_run_end(runner.shared)[2], RunEndReason.TIMEOUT)
             clock.ns = 11_000_000_000
             runner._handle_run_boundary()
             self.assertEqual(runner.session_running_ns, 2_100_000_000)

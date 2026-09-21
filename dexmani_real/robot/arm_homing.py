@@ -29,6 +29,9 @@ from dexmani_real.planning.paths import (
 )
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
 from dexmani_real.runtime.safety import SafetyState, StopRequest, revoke_motion
+from dexmani_real.robot.hand_homing import publish_hand_home_and_wait_accepted
+from dexmani_real.planning import OnlineIKConfig, Pose, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.robot.model import XARM7_XHAND_COLLISION_URDF_PATH, XARM7_XHAND_SRDF_PATH
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -805,3 +808,92 @@ def execute_arm_home(
         arm_heartbeat_max_age_s=config.arm_heartbeat_max_age_s,
         progress=progress,
     )
+
+
+def build_policy_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
+    """Construct the collision-checked home planner (mirrors replay setup).
+
+    The policy runner's planner only carries workspace bounds; a safe
+    return-home needs the full collision model (hand-dof + table + static
+    boxes), so the Main process builds its own.
+    """
+    policy = runtime.policy
+    workspace = np.array(
+        [
+            [policy.workspace.x_min, policy.workspace.x_max],
+            [policy.workspace.y_min, policy.workspace.y_max],
+            [policy.workspace.z_min, policy.workspace.z_max],
+        ],
+        dtype=np.float64,
+    )
+    return XArm7MotionPlanner(
+        XArm7PlannerConfig(
+            urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
+            srdf_path=str(XARM7_XHAND_SRDF_PATH),
+            base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
+            workspace_bounds=workspace,
+        ),
+        teleop_profile=OnlineIKConfig(
+            max_pose_error_pos_m=float(policy.ik_max_pose_error_pos_m),
+            max_pose_error_rot_rad=float(policy.ik_max_pose_error_rot_rad),
+        ),
+        hand_dof=True,
+        static_boxes=tuple(runtime.environment.static_boxes),
+        table=runtime.environment.table,
+    )
+
+
+def home_policy_robot(
+    shared: RuntimeChannels,
+    runtime: ExperimentConfig,
+    planner: XArm7MotionPlanner,
+    *,
+    abort_requested,
+) -> bool:
+    """Accept the hand home target, then wait for the arm home lifecycle.
+
+    Hand acceptance acknowledges the target, not measured arrival. Arm success
+    includes the worker's completion confirmation and stationary home feedback.
+    """
+    if int(shared.safety_state.value) != int(SafetyState.ARMED):
+        logger.warning("operator: home requires ARMED; press S before H")
+        return False
+    if abort_requested():
+        return False
+    hand_home = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
+    accepted = publish_hand_home_and_wait_accepted(
+        shared,
+        hand_home,
+        command_lower_rad=np.asarray(runtime.hand.qpos_min_rad, dtype=np.float64),
+        command_upper_rad=np.asarray(runtime.hand.qpos_max_rad, dtype=np.float64),
+        mechanical_lower_rad=np.asarray(
+            runtime.hand.mechanical_qpos_min_rad, dtype=np.float64
+        ),
+        mechanical_upper_rad=np.asarray(
+            runtime.hand.mechanical_qpos_max_rad, dtype=np.float64
+        ),
+        hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
+        timeout_s=float(runtime.hand.home_command_ack_timeout_s),
+        heartbeat=False,
+        check_is_running=True,
+        verbose=True,
+        abort_requested=abort_requested,
+    )
+    if not accepted:
+        logger.warning("operator: hand home not accepted; arm home skipped")
+        return False
+    planner.set_hand_qpos(hand_home)
+
+    result = execute_arm_home(
+        shared,
+        np.asarray(runtime.arm.home_qpos, dtype=np.float64),
+        planner=planner,
+        config=ArmHomeConfig.from_runtime(runtime, publish_policy_heartbeat=False),
+        table_z_surface_m=float(runtime.arm.table_z_surface_m),
+        # Only the physical e-stop path may latch ESTOP. Ordinary shutdown,
+        # faults, and quit requests are already observed by execute_arm_home.
+        estop_requested=lambda: bool(shared.estop_request.value),
+        cancel_requested=abort_requested,
+        progress=lambda message: print(f"  {message}", flush=True),
+    )
+    return result.succeeded

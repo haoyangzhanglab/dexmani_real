@@ -189,7 +189,6 @@ class RuntimeChannels:
     # Latest software RUNNING terminal snapshot; safety owns writes under motion_lock.
     run_started_generation: Any  # run identity survives command-only rebases
     run_ended_generation: Any
-    run_ended_started_monotonic_ns: Any
     run_ended_monotonic_ns: Any
     run_ended_reason: Any
     recorder_consumed_sequence: Any
@@ -347,7 +346,6 @@ class RuntimeChannels:
         storage.run_started_monotonic_ns = ctx.Value("Q", 0)
         storage.run_started_generation = ctx.Value("Q", 0)
         storage.run_ended_generation = ctx.Value("Q", 0)
-        storage.run_ended_started_monotonic_ns = ctx.Value("Q", 0)
         storage.run_ended_monotonic_ns = ctx.Value("Q", 0)
         storage.run_ended_reason = ctx.Value("i", 0)
         storage.recorder_consumed_sequence = ctx.Value("Q", 0)

@@ -117,7 +117,7 @@ teleop/session.py → teleop/loop.py → control_loop/grid.py
                                        ↓
                      robot/{arm,hand}_worker.py → SDK
 
-policy: deployment/session.py 启动进程、operator.py 处理键盘
+policy: deployment/session.py 启动进程并独立处理键盘
         deployment/runner.py → observation.py → dexmani_policy.predict(array_dict)
         → 同一 robot command path
 
