@@ -1,1021 +1,315 @@
-# CODEX TASK — Finish `dexmani_real` Research-Simplicity Refactor
+# CODEX TASK — Finish the research-simplicity refactor
 
-> This file is the execution task for Codex.  
-> Repository-wide safety and engineering rules in `AGENTS.md` are authoritative and must be read first.  
-> This task is specific to the remaining architecture cleanup. If this task conflicts with `AGENTS.md`, follow `AGENTS.md`.
+Revision 2 · reviewed 2026-09-21 · repository `haoyangzhanglab/dexmani_real`
 
-## 0. Mission
+Read applicable `AGENTS.md` / `AGENTS.override.md`, this entire file, then README and relevant source. Platform/user and scoped instructions still apply. Read truncated files through EOF; do not assume Codex automatically loads this task.
 
-Finish the current simplification work so that `dexmani_real` is a **personal PhD real-robot research repository**, not a generic robotics framework.
+This revision supersedes the previous task/long chat prompt. The launch prompt references this file, not a second specification. Keep this user-requested task; never weaken its criteria to declare success.
 
-Primary workflows:
+## 0. Mission, scope and deliverable
 
-1. VR / keyboard teleoperation and real-robot data collection.
-2. Learned-policy deployment / rollout / evaluation through `dexmani_policy`.
-3. Calibration, home, replay, conversion, and visualization utilities.
+Personal PhD research: xArm7 + XHand + RealSense + VR/HTS data collection and `dexmani_policy` rollout/evaluation. Preserve teleop, home, calibration, raw replay, conversion and useful visualization, not a general robotics/serving framework.
 
-Optimization order:
-
-```text
-physical safety
-> experiment correctness
-> research iteration speed
-> code readability
-> generic extensibility
-> enterprise robustness
+```
+physical safety > experiment correctness > iteration speed > readability > extensibility
+preferred change: delete > inline > merge > rewrite > introduce abstraction
 ```
 
-Refactoring order:
+Execute three outcomes: consolidate branches; simplify motion/recording/dataset ownership; clean comments/config/tests/docs. Implementation, not another proposal.
 
-```text
-delete
-> inline
-> merge
-> rewrite
-> introduce abstraction
-```
+Target: one motion-authority owner, one episode-file owner, one raw-to-policy path. Delete rather than add managers/protocols/backends/schema families. Internal APIs may break without shims; preserve research data and public `dexmani_policy` semantics.
 
-Do not solve remaining complexity by creating another manager, protocol, service layer, schema family, lifecycle framework, or compatibility adapter.
+### Authority and exclusions
 
----
+- Execution of this task authorizes relevant source/docs/tests edits and task-branch commits. Subject to credentials, user approvals and repository rules, it also covers integrating existing PR #20 and closing/deleting verified superseded PRs/branches listed in Phase 0. Authentication is not permission to bypass approvals.
+- Do not merge the NEW motion/recording/dataset implementation PR automatically. Deliver it for review, with live-hardware checks outstanding where applicable. Software integration and experiment-machine deployment are separate actions.
+- Do not connect/discover devices, send motion, run live home/replay/teleop/rollout, alter calibration, or access laboratory devices as a test. Inspect tests, imports, constructors and fixtures before executing Python where side effects are possible. A `--help` or `--dry-run` name alone proves nothing.
+- Do not modify recorded episodes, existing processed data, checkpoints, calibration files or `assets/**`. Do not change the sibling `dexmani_policy` repository without separate authorization; read its actual public interface as needed. Synthetic fixtures belong in temporary directories.
+- Do not force-push, reset user work, run destructive `git clean`, delete arbitrary branches, change branch protections, auto-stash user changes, or upgrade the laboratory/global Python environment. Do not upload research data or credentials into commits/PRs.
+- Keep separate xArm and XHand SDK processes, the two-consumer ordered broadcast, necessary final ACKs, and the four meaningful SafetyState values in this round. A logical Robot owner does not require one OS process.
 
-## 1. Repository authority and known starting state
+## 1. Reference baseline and selective reading
 
-Read, in this order:
+These are historical anchors, not assumptions about current remote state:
 
-1. `AGENTS.md`
-2. this `CODEX_TASK.md`
-3. `README.md`
-4. the actual source and resolved configuration
+| Item | Anchor |
+|---|---|
+| Existing integration | PR #20, `refactor/research-simplicity-20260921` |
+| Pre-task source | `6298a94ebedb63052f4b6cd5eececa8f7cdbf069` |
+| Original task commit | `d380b53ba62d25dac613cfd6907ce76cd2bb567f` |
+| Historical main | `eaeb7a14e2be400488e62bc7897254270ce313d2` |
+| Superseded candidates | PR #18 and PR #19 |
+| Historical offline result | 176 tests + 78 subtests passed; not verification of any new HEAD |
 
-At the time this task was written:
+Resolve actual refs/commit/tree IDs. GitHub default-branch search is not #20 content: fetch the right ref. If this file is absent, read it from verified #20 before switching; do not overwrite user work.
 
-- repository: `haoyangzhanglab/dexmani_real`
-- integration PR: **#20**
-- integration branch: `refactor/research-simplicity-20260921`
-- #20 was Draft and mergeable
-- #20 HEAD before adding this task file was `6298a94ebedb63052f4b6cd5eececa8f7cdbf069`
-- base `main` was `eaeb7a14e2be400488e62bc7897254270ce313d2`
-- older overlapping PRs #18 and #19 were still open
-- offline verification for the pre-task-file source tree was:
-  - 176 passed
-  - 78 subtests passed
-  - compileall passed
-  - targeted Ruff undefined-name/dead-import checks passed
-  - `git diff --check` passed
+Read relevant implementations, not entire reference repositories:
 
-**Do not trust these SHAs blindly. Re-resolve the repository state before editing.**
+| Reference | Fixed revision | Files to inspect |
+|---|---|---|
+| LeRobot | `d20a4538016d9fe0374a34011aebc1c8cddf3e0d` | `src/lerobot/robots/robot.py`, `scripts/lerobot_record.py`, `datasets/dataset_writer.py`, `rollout/inference/{sync,rtc}.py` (all under `src/lerobot/`) |
+| ManiUniCon | `85c6f2e32ecf9f2bed62d202b058c39623444686` | `main.py`, `maniunicon/core/robot.py`, `maniunicon/utils/shared_memory/shared_storage.py`, `maniunicon/policies/torch_model.py`, `tools/process_demo_data.py` |
 
-Reference implementations to inspect when a design choice is unclear:
+Borrow direct loops, resource ownership, local cancellation and meaningful conversion. Do not copy a generic controller hierarchy or treat queue draining/re-anchoring/min-length trimming as equivalent safety/alignment. Class names do not prove hardware behavior. Reference checkouts stay outside tracked code; unavailable references are reported, not invented.
 
-- LeRobot: `huggingface/lerobot@d20a4538016d9fe0374a34011aebc1c8cddf3e0d`
-- ManiUniCon: `Universal-Control/ManiUniCon@85c6f2e32ecf9f2bed62d202b058c39623444686`
+## 2. Invariants that constrain every phase
 
-Use them for design principles, not for mechanical code copying.
+### Motion and concurrency
 
-Useful principles from them:
+- Mechanical limits, finite SDK inputs, real velocity/step bounds, error detection, emergency stop and safe disconnect remain. Preserve current experiment-dependent workspace/collision checks; do not claim home collision checking covers every policy trajectory.
+- One authoritative motion-cancellation counter is sufficient. Copies of its value on commands/ACKs are not extra counters: retain them while needed to reject late ACKs/results. Camera frame identity is a different requirement and is not removed under the slogan “one generation”.
+- Read/write related permission, generation and deadline/start-time fields atomically. Deleting `RunStateSnapshot` must not replace a coherent read with separately sampled shared values.
+- Preserve an independent parent-side run-duration limit while `predict()` blocks. Retain one shared run start or absolute run deadline, paired with its generation, if that is what the parent needs. Do not make the blocked runner the only timeout owner.
+- Parent-side S/Q/ESC and critical-device health monitoring remain responsive during inference, home and file finalization. Keep the effective callbacks/listener boundary; moving `operator.py` does not mean serializing all operations onto one blocking loop.
+- Keep per-consumer FIFO order, FULL retries of the same numerical candidate, no catch-up burst, and XHand endpoint acceptance distinct from intermediate slew or CRC-unconfirmed sends. SDK acceptance is not physical arrival.
 
-- LeRobot normal paths are direct: observe → infer/teleop → send → record.
-- LeRobot async RTC uses a **local reset epoch** only where an in-flight inference race exists.
-- LeRobot recording has one writer owner for save/discard/finalize.
-- ManiUniCon keeps multiprocessing primitives simple: shared rings/queue, a few events/flags, one main orchestrator.
-- ManiUniCon raw recording → one meaningful offline conversion is acceptable.
-- Do **not** copy LeRobot's generic interactive rollout framework or ManiUniCon's weaker synchronization semantics when they reduce required safety/correctness.
+### Define the software guarantee honestly
 
----
+The current `coupled_command_may_cross_sdk()` releases `motion_lock` BEFORE SDK IO. A last check is not atomic with a later vendor call. Identify this boundary explicitly during implementation and tests:
 
-## 2. Absolute constraints
+1. Under the short motion lock, admission/revocation decisions have an ordering point.
+2. A revoked/expired generation cannot receive a NEW software admission after that point.
+3. A call admitted earlier can be in flight or complete later. A late reply must not authorize another step, satisfy a newer wait, or overwrite a newer terminal cause.
+4. The two SDKs are not a physical transaction. A fast consumer may already be ahead before the other reports expiry. Stop further admissions after revocation; do not promise rollback of earlier sends or add a per-command two-phase barrier.
 
-### 2.1 Never run hardware without explicit user authorization
+Do not hold the global motion lock across potentially blocking SDK calls to manufacture a stronger guarantee at the cost of STOP responsiveness. Preserve immediate driver checks and existing stop mechanisms; document residual check-to-call scheduling/in-flight behavior. Stronger bounded physical stopping requires measured SDK/firmware behavior and authorized hardware testing, not wording in a test. Do not weaken existing safeguards.
 
-Do not execute:
+### Experimental data and resources
 
-- xArm SDK discovery/connect/motion
-- XHand SDK discovery/connect/motion
-- homing
-- physical replay
-- teleoperation
-- policy rollout
-- calibration writes
-- examples that can connect hardware
+Preserve units, frames, common history anchors, run-start history exclusion, RGB/depth/point-cloud pairing, real timestamps, tactile validity, intent vs committed target vs observed state, task/checkpoint/seed metadata, and incomplete-prefix handling. Recording-only camera failure and required-policy-camera failure have different consequences.
 
-Imports/constructors must be inspected before execution when side effects are uncertain.
+Do not unlink SHM with live users. Process termination is neither physical ESTOP nor durable recording. Raw stays untouched; non-uniform `policy_eval` remains rejected for fixed-dt training/replay.
 
-### 2.2 Preserve real safety invariants
+## 3. Execution method and stop conditions
 
-The final design must still enforce, with one clear owner for each invariant:
-
-- mechanical arm/hand limits
-- finite values before SDK calls
-- real velocity / command-step limits
-- emergency stop
-- robot error detection
-- safe stop/disconnect
-- no old/revoked command reaching the SDK after stop/reset
-- workspace/collision constraints where current experiments rely on them
-- worker shutdown before shared-memory release
-- correct distinction between SDK acceptance and physical convergence
-
-Do not remove a check solely because its name sounds defensive. Trace the race/hazard it protects first.
-
-### 2.3 Preserve experimental semantics
-
-Do not silently change:
-
-- coordinate frames
-- units
-- RGB/depth/point-cloud frame pairing
-- tactile validity semantics
-- observation history timing
-- actual action timing
-- committed target vs raw policy/teleop intent
-- incomplete-recording preservation
-- non-uniform `policy_eval` timing semantics
-
-A policy rollout with non-uniform real timing must not become a fixed-dt demonstration by convenience.
-
-### 2.4 No internal backward-compatibility architecture
-
-Allowed:
-
-- break/move internal APIs
-- remove old config keys
-- remove wrappers
-- remove tests for deleted implementation detail
-- remove obsolete CLI
-- remove old processed schema support
-
-Not allowed:
-
-- `LegacyFoo`
-- `DeprecatedFoo`
-- `FooCompat`
-- runtime old/new adapters solely to preserve historical internals
-
-Git history is the compatibility layer for old internal code. Historical research data may use an explicit offline conversion when genuinely needed.
-
----
-
-## 3. Explicit non-goals
-
-Do **not**:
-
-- turn xArm7 + XHand into one OS process merely to reduce process count
-- replace the two-consumer ordered command broadcast with a normal work-sharing `Queue`
-- remove `SafetyState` just to replace it with several booleans
-- create a distributed-system lease protocol
-- create a new recording storage interface
-- create a new policy interface
-- create a new generic dataset schema ecosystem
-- create remote-serving, multi-robot, multi-user, multi-backend abstractions
-- introduce a second configuration framework
-- preserve an abstraction because a test currently imports it
-
-The desired result is a direct research system, not a minimal line count at the expense of physical behavior.
-
----
-
-## 4. Working protocol
-
-Before modifying anything:
+Start with read-only inspection:
 
 ```bash
 git status --short
+git remote -v
 git branch --all --verbose --no-abbrev
+git worktree list
 git log --graph --decorate --oneline --all -n 80
 ```
 
-If `gh` is authenticated, also inspect PR #18, #19, and #20. If it is unavailable, use local refs/remotes and do not claim remote actions were completed.
+Inspect applicable instructions, test collection/import side effects, `pyproject.toml`, existing test commands and Python dependencies. Fetch required refs when allowed. Use a clean worktree for unrelated dirty state. Missing refs/credentials block affected Git operations, not permission to guess.
 
-Rules during implementation:
+Execute Phase 0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 with one coherent, testable commit per logical change. Update callers, tests, imports, comments and README in the SAME change; Phase 6 is a final sweep, not permission for intermediate broken imports. No concurrent writers to shared motion/IPC/schema files. Read-only review may be parallel; integrate and test serially.
 
-1. Preserve unrelated user changes.
-2. Trace actual entry point → producer → transform → consumer → side effect before deleting a mechanism.
-3. Read both sides of every changed process/IPC/file boundary.
-4. Make one coherent architectural change at a time.
-5. Run targeted offline tests after each change.
-6. Never delete a test just to make a failure disappear.
-7. Delete tests that only preserve removed bookkeeping/internal structure.
-8. Keep one-off metrics/review scripts outside the committed source tree.
-9. Do not perform broad keyword replacement in safety/comments/docs.
-10. Prefer ordinary exceptions unless there is a real recovery decision.
+Before deletion trace definition -> producer -> transform -> consumer -> side effect. Note the real capability/race outside tracked code. Prefer direct functions/variables; retained mechanisms need concrete consumers.
 
-Use small, meaningful commits. Suggested boundaries are listed below.
+Use one isolated offline environment for baseline/final comparison. Historical tests used Python 3.11, NumPy 1.26.4, Pinocchio 2.7.0 and NLopt 2.7.1; resolve the complete dependencies from current project/test requirements, not that incomplete list. Do not install unconstrained newest numerical packages and call the results comparable.
 
----
+If interrupted, leave a coherent commit plus an external checkpoint: HEAD, phase, results, next action, blockers. Resume from inspected Git/code, not replayed mutations. Baselines/metrics/comparison fixtures stay untracked.
 
-# PHASE 0 — Integrate the existing simplification work and clean branches
+Make ordinary code choices autonomously. A failed gate stops the affected deletion/merge, not independent safe work. Preserve the known-good path and report the blocker. Mocking an unavailable dependency does not verify integration.
 
-## Goal
+## Phase 0 — Consolidate existing work without losing changes
 
-Make #20 the single integrated baseline, recover any useful behavior that exists only in older overlapping branches, merge the baseline, and remove obsolete duplicate branches/PRs only after verification.
+Inspect current #18/#19/#20 metadata, files, review/check status and exact base/head refs. Already merged/closed/deleted items are handled idempotently; do not reopen or recreate them automatically. Inspect repository rules and required checks; unknown mergeability is not a green light.
 
-## 0.1 Audit #18/#19/#20 by behavior, not PR number
+Compare ancestry AND two-tip content AND behavior. GitHub three-dot compare describes changes from the merge base; it does not by itself prove the newer branch subsumes the older one. Use explicit tip diffs/patch review. Classify unique work as PORT BEHAVIOR / ALREADY EQUIVALENT / OBSOLETE INTERNAL DETAIL / UNRELATED-PRESERVE.
 
-Do not assume #20 contains every useful change from #18/#19.
+Check the #19 no-hardware xArm7 identity test (7 accepted, 6/8 rejected), exact artifact loading, and close-on-spec-mismatch behavior against current `deployment/runner.py`. Port useful coverage without restoring obsolete import paths or enforcing obsolete wrapper details.
 
-At minimum check the older branches for unique:
+Run a pre-change offline baseline, then tests on the integrated #20 candidate. Record the exact tested HEAD. If baseline checks cannot run, report why; do not merge on the strength of historical counts.
 
-- hardware-boundary regression tests
-- policy artifact/spec boundary tests
-- data conversion behavior
-- safety behavior
-- documentation corrections
+With authorization and permissions:
 
-Known example that must be checked:
+1. Refresh main and #20. Include intended ported fixes on #20; do not merge #18, #19 and #20 sequentially.
+2. Pass required checks/review. Mark the Draft ready only after the gate. Prefer a normal merge commit if repository policy permits; never bypass protections/admin review. Match the tested head SHA at merge time, and revalidate if head/base changed.
+3. Fetch the merge result and verify the intended tree/behavior on main. Do not require main to equal an old tree if legitimate base changes exist.
+4. Close superseded #18/#19 with the replacement reference only after independent changes are accounted for.
+5. Delete only verified superseded branch refs at the inspected tips. Recheck for newly pushed commits/other PRs/worktrees. Use exact names, never wildcard cleanup. The docs branch below is a candidate to inspect, not presumed disposable.
 
-- #19 contained a no-hardware fixed xArm7-axis identity test that accepted 7 axes and rejected 6/8. If equivalent coverage is absent on #20, port the behavior to the **current** implementation path. Do not restore removed `control/publication` or deployment wrappers to make the old test run.
-- #19 also contained tests for loading the exact requested deployment artifact and closing a loaded policy when its spec does not match the inspected spec. Preserve those boundary semantics if still relevant, adapted to current `deployment/runner.py` APIs.
+Candidates (not unconditional deletion commands):
 
-For every older difference classify it as:
-
-```text
-PORT BEHAVIOR
-ALREADY EQUIVALENT
-DELETE AS HISTORICAL IMPLEMENTATION DETAIL
-UNRELATED — PRESERVE SEPARATELY
+```
+refactor/research-simplicity-20260920
+refactor/research-simplicity-20260921
+refactor/research-simplicity-final-20260920
+research-simplify/remove-legacy-policy-trace
+work/research-simplicity-resume-20260921
+work/research-simplicity-validated-20260921
+docs/claude-runtime-refactor-v2
 ```
 
-## 0.2 Validate the integrated baseline
+For ported/squashed non-ancestor branches, preserve the tip in a durable PR/tag or external Git bundle before deleting its sole reference. No force-push to fix ancestry; no deletion of checked-out/unexplained unique work.
 
-Required before merge:
+Continue on `refactor/research-simplicity-final` from verified main, or resume existing work. Without remote permission, branch from the locally verified #20 candidate and label it stacked/unmerged; cleanup stays pending. Never restart from old main or claim a local merge is remote integration.
 
-```bash
-python -m compileall -q dexmani_real examples
-python -m pytest -q
-git diff --check
+**Gate:** useful older behavior accounted for; exact integration candidate tested; actual Git actions recorded. Remote-unavailable is a BLOCKED Git gate, not completed cleanup.
+
+## Phase 1 — Fix the comparison baseline and map ownership
+
+Keep the integrated baseline reachable in a detached comparison worktree or recorded retained commit. Pin the environment/config and create synthetic raw fixtures BEFORE removing the old dataset path. Read both sides of the real `dexmani_policy` load/spec/array boundary.
+
+Starting points after #20 (resolve renamed paths from source):
+
+| Work | Definitions AND callers to read |
+|---|---|
+| Motion | `robot/commands.py`, `{arm,hand}_worker.py`, drivers, `{arm,hand}_homing.py`, `runtime/safety.py`, `ipc/{channels,command_stream,schema}.py` |
+| Control | `deployment/{runner,session,operator,observation}.py`, `teleop/{loop,session,keyboard_session}.py`, `teleop/control_loop/grid.py`, replay and calibration motion callers |
+| Recording | `recording/{client,io_worker,recorder,frame}.py`, storage/video writers, `runtime/{supervisor,processes}.py`, every recording caller |
+| Dataset | `dataset/{processing,processed,export,contracts}.py`, conversion CLIs, raw/processed viewers, replay loaders, annotation and export tests |
+
+Record disposable metrics using one script: tracked Python physical LOC (including blank/comments), core/test LOC and file counts, AST classes/dataclasses/enums, configuration declarations, validate/check-named functions. Scope core/examples/tests separately; exclude vendored/assets/reference/generated files and this task. Record exact config-field/name-matching definitions. Also count actual IPC primitive families, runtime states and trace the four critical paths; do not invent universal call-depth numbers.
+
+**Gate:** correct integrated comparison ref/environment, baseline results, source/consumer map and raw fixtures are available. No new permanent audit harness.
+
+## Phase 2 — Localize deployment/runtime ownership
+
+MERGE the one-consumer `deployment/operator.py` orchestration into session or existing home helpers, preserving independent immediate S/Q/ESC callbacks even while home blocks. Preserve fresh post-home BEGIN confirmation and current startup/model-warmup/hardware order. Do not casually combine CUDA, SDK IO and keyboard monitoring.
+
+DELETE redundant trial containers/mirrors (`RunEpoch`, `RunStateSnapshot`, excess `run_ended_*` or result wrappers) AFTER replacing their real behavior. Trial counts/results belong to runner; session cleanup reporting to session; motion permission to robot; file outcomes to recorder. Keep coherent snapshots and the parent-side run-timeout input described in Section 2. Retain a minimal generation-scoped first-terminal fact if another process needs it; do not reconstruct an earlier cause from later global state or add a new event-log protocol.
+
+MERGE actual motion-authority helpers into the robot boundary without recreating `control/` under a new name. A small concrete safety module is acceptable; blindly pasting everything into a giant `commands.py` is not a win. Keep camera frame identity and necessary ACK generation copies. Remove static/shared trial fields with no remaining consumer, not all shared state.
+
+SIMPLIFY supervisor/process utilities to startup readiness, required-device health, optional recording failure, bounded stop/join and final resource release. Required camera/pointcloud/tactile observation loss must still stop policy use; recording-only service loss must not abruptly stop manual teleop. Preserve ownership of every started process handle even after failed startup. Do not replace health checks by process liveness alone for devices that can hang while alive.
+
+**Gate tests:** blocked inference + parent timeout; late timeout/result from old run cannot cancel a new run; stop/quit/estop during home; same-batch STOP beats BEGIN; required-vs-recording-only camera loss; partial startup failure; atomic state/generation reads; no SHM release with an unreaped user.
+
+Commit suggestion: `refactor: localize rollout and motion ownership`.
+
+## Phase 3 — Bound delayed commands with one immutable deadline
+
+### Semantics before code
+
+Use one new absolute monotonic deadline on each endpoint candidate/transport record, e.g. `expires_monotonic_ns`. It is not an ID, lease object or new epoch. Use the same host clock domain and unit through all processes; wall time is only for human metadata. Do not replace scientific timestamps with this field or bump raw-data schema solely for IPC changes.
+
+For each producer identify the time the endpoint becomes eligible under its EXISTING scheduler. Compute its deadline once from that intended execution time and one clearly-owned finite lag budget, e.g. `max_dispatch_delay_s`. Use integer monotonic nanoseconds in transport and define `now >= deadline` as expired.
+
+- Do not start every future chunk endpoint's deadline at inference/chunk creation; preserve policy chunk pacing and the no-catch-up rule.
+- Do not reset an old candidate's origin when FULL clears, it is copied, revalidated or reinserted. FULL retries retain the same target, generation and deadline; do not rerun IK/projection to disguise stale intent.
+- Dispatch freshness is not observation freshness. Keep current observation/source-age and run-budget checks; a recent enqueue cannot make a stale prediction valid.
+- Audit ALL endpoints: policy, VR, keyboard, replay, hand home and calibration. `arm_home_q` is a separate planned-motion path: bound a queued HOME request's admission with its existing timing budget or an explicit start deadline, then retain the plan's own execution/abort timeout. Do not apply one short servo dispatch deadline to the duration of an already-started multi-second home trajectory.
+- A retained XHand endpoint keeps its deadline through intermediate slew and CRC-unconfirmed retries; every attempted SDK setpoint admission checks it. The budget must accommodate intended slew behavior. Never acknowledge an intermediate point as the endpoint.
+
+### No invented live default
+
+First determine whether an existing documented budget has the same semantics and can be reused. Otherwise add ONE explicit finite positive lag setting at startup. If a justified live value is unavailable, leave it unresolved (`None` or an equivalent configuration requirement) and fail closed BEFORE hardware startup/arming on motion-producing entry points. Do not guess a “conservative safe” value, silently disable expiry, or use infinity/zero to bypass it. Offline tests use explicit synthetic budgets; data-only/offline commands do not require a live budget. Report the live configuration requirement as an intentional commissioning change. An explicit number is not proof it is physically safe.
+
+### Admission and cancellation
+
+Publication rejects early under the short motion lock; worker admission immediately before IO owns the final permission/generation/deadline decision. Reuse a small check: different time windows are not repeated array validation.
+
+On expiry, recheck the candidate generation under the same cancellation lock before revoking it. Old expiry cannot revoke a newer run; repeated consumers cannot repeatedly increment the current generation or overwrite a higher-priority terminal cause. Revoke/stop the current operation; do not skip its head and continue, auto-home, auto-rearm, or relabel software expiry as a physical ESTOP/hardware fault.
+
+Section 2 defines admission ordering, not simultaneous SDK acceptance. Late replies retain their original generation; keep consumer ACK semantics without a lockstep barrier. Pre-admitted in-flight actions do not justify NEW admissions after STOP.
+
+**Gate tests:** before/at/after deadline; unchanged FULL target/deadline; delayed hand slew/CRC retries; each worker admission; one consumer ahead then other expires; expiry concurrent with STOP/ESTOP; stale expiry after restart; late ACK cannot satisfy new wait; healthy ordering/pacing; HOME queue wait vs execution timeout; missing/nonfinite live budget rejected before hardware constructors. Use fake clocks and Events/barriers, not lucky sleeps or actual SDKs.
+
+Commit suggestion: `safety: bound delayed command admission`.
+
+## Phase 4 — Make the recorder process the sole file-finalization owner
+
+Target: control tick -> owned `EpisodeFrame` -> sample ring -> recorder process -> HDF5/video -> one result. Keep a thin client, control/result channels and necessary continuous video workers; no storage abstraction.
+
+Remove `_PendingFinalization`, the episode-finalizer thread and its nested result queue/polling. The recorder process is already asynchronous to control and may finalize its episode synchronously. Do NOT delete this thread without changing the outer supervision in the SAME commit.
+
+### Boundary and outcome rules
+
+- `add_frame` and finish-request submission must not wait for file/video close. Ring FULL must end/report recording rather than block manual control indefinitely. A save/discard decision is fixed for that finish operation.
+- Freeze `through_sequence` at the final published sample, stop further publication for that episode, and drain through that cutoff before saving. A control Queue and sample ring have no implicit total order. Copy/own arrays before releasing a ring slot. The cutoff is not increased during retry/shutdown.
+- Exactly one process owns file save/discard/incomplete publication. One client consumes its results. Keep the existing episode identity or strict single-in-flight discipline to match late replies; a timed-out transport cannot start another episode and consume an old result as new.
+- Successful close publishes once; explicit discard really discards. A safely closed nonempty interrupted prefix remains `incomplete`, not “complete” or automatically trainable. If writers cannot be confirmed stopped/closed, retain staging for inspection and report failure. No exactly-once/durability claim across arbitrary process death.
+- Handle producer disappearance and recorder-internal auto-finalization/error, not just an ordinary client STOP. They must enter the same finish supervision before blocking. Preserve recording failure in the final session result without inventing a robot hardware fault.
+
+### Mandatory outer supervision update
+
+Use the existing main/session monitor, not a new service. It must know when draining/finalizing starts and its ONE fixed outer deadline before the recorder blocks (including automatic error/capacity paths). Reuse existing status/control fields where sufficient; one minimal finishing/deadline signal is acceptable if required. This resource signal is not another lifecycle framework.
+
+During that bounded finish, the recorder's tick heartbeat may stop: monitor process exit plus finish deadline rather than treating absent tick heartbeat as immediate failure. Never suspend arm/hand/required-sensor monitoring. The result channel still has one consumer; the supervisor must not race the client for the completion message. Polling, repeated STOP, unrelated heartbeats and shutdown must not renew the finish deadline.
+
+If the recorder is killed or dies, disable its transport for the session; do not reuse potentially damaged queues/locks or auto-restart it. Do not take over its HDF5 writer from the parent. Termination/join can fail; do not unlink SHM or claim completion while a process or child writer is unreaped. Check ownership of video subprocesses as well as Python threads.
+
+Shutdown order: latch/revoke motion promptly -> stop episode sample production at a known cutoff -> retain recorder/result-owner and necessary source buffers long enough to drain/finish under the SAME deadline -> stop/join remaining users -> unlink SHM last. Do not shut the result owner down before its result can be collected. Do not make emergency stopping wait for recording.
+
+**Gate tests:** exact last frame/cutoff, copied arrays, save/discard/incomplete, disk/video errors, blocked finalization with bounded outer timeout, recorder-internal auto-finish, producer death, late result, no next START while pending, repeated finish without renewal, retained critical-device monitoring, process/child cleanup and no false complete publication. Include a small real no-hardware subprocess regression for the process-boundary change; no new test framework.
+
+Commit suggestion: `recording: centralize episode finalization in recorder process`.
+
+## Phase 5 — Convert raw directly to policy Zarr, with bounded memory
+
+Target:
+
 ```
-
-Run existing lint/static checks if configured. Do not add a new lint framework.
-
-## 0.3 Merge and clean safely
-
-After the final baseline HEAD passes:
-
-1. Merge #20 into `main` using the repository's normal merge policy.
-2. Verify the resulting `main` tree contains the intended source.
-3. Only then close #18/#19 as superseded.
-4. Delete duplicate remote/local work branches only after confirming they contain no unrelated unique work.
-5. Do not delete a branch merely because its name starts with `work/`.
-6. If remote permissions are unavailable, prepare the repository locally and report the exact remote actions still required. Never claim they were done.
-
-Known duplicate/review branches to inspect include:
-
-- `refactor/research-simplicity-20260920`
-- `refactor/research-simplicity-20260921`
-- `refactor/research-simplicity-final-20260920`
-- `research-simplify/remove-legacy-policy-trace`
-- `work/research-simplicity-resume-20260921`
-- `work/research-simplicity-validated-20260921`
-- `docs/claude-runtime-refactor-v2`
-
-After baseline integration, create a fresh branch from updated `main` for the remaining work, for example:
-
-```text
-refactor/research-simplicity-final
-```
-
-Do not mix branch-cleanup history with the subsequent architectural changes if avoidable.
-
-### Phase 0 done when
-
-- [ ] useful unique behavior from #18/#19 is accounted for
-- [ ] baseline offline suite passes
-- [ ] #20 is integrated into main, or exact unavailable remote step is documented
-- [ ] older duplicate PRs/branches are cleaned only after verification
-- [ ] remaining work starts from the integrated main baseline
-
----
-
-# PHASE 1 — Record a disposable baseline and retrace the four critical paths
-
-Before the next edits, record **uncommitted/disposable** baseline metrics:
-
-- Python LOC
-- `dexmani_real` LOC
-- test LOC
-- Python file count
-- core module count
-- class count
-- dataclass count
-- enum count
-- config-field count
-- validate/check-named function count
-
-Keep the counting script/result in `/tmp` or another untracked location.
-
-Retrace and write short working notes for:
-
-```text
-teleop / policy → robot
-robot / sensors → policy
-control loop → recorder → files
-raw episode → policy dataset
-```
-
-Do not commit an architecture-audit document just to record these notes.
-
-### Phase 1 done when
-
-- [ ] current flow is understood from actual code, not old docs
-- [ ] baseline metrics are captured outside the permanent source tree
-- [ ] every planned deletion has a known current producer and consumer
-
----
-
-# PHASE 2 — Simplify deployment/runtime ownership
-
-## Goal
-
-Keep the real process/resource boundaries, but remove trial/runtime bookkeeping that does not protect motion or experimental correctness.
-
-Target mental model:
-
-```text
-Main/session
-  ├─ operator input thread
-  ├─ policy process
-  ├─ robot workers
-  ├─ required sensor workers
-  └─ optional recorder/camera service
-
-policy runner
-  observe → predict → prepare command → publish
-
-robot boundary
-  permission/generation/expiry → ordered stream → worker SDK fence
-```
-
-## 2.1 Keep these semantics
-
-Keep:
-
-- `SafetyState` if its four states still have distinct behavior
-- one motion-cancellation generation/epoch
-- ordered arm+hand command sequence
-- actuator-specific final acceptance semantics
-- independent operator stop/estop responsiveness
-- main-process ownership of process start/stop/join
-- model/CUDA ownership inside policy process
-- SDK ownership inside hardware workers
-
-Do not merge xArm and XHand processes in this phase.
-
-## 2.2 Remove duplicated trial identity/result state
-
-Trace every consumer of:
-
-- `RunEpoch`
-- `RunStateSnapshot`
-- `RunEndReason`
-- shared ended-generation fields
-- shared run-start/run-end timestamp mirrors
-- session/trial failure mirrors
-- any shared field used only to print/report a result already known locally
-
-Desired end state:
-
-- shared cross-process state contains only values genuinely required across processes
-- runner owns trial-local counters/result/reason
-- session owns session-local result/cleanup reporting
-- motion subsystem owns motion permission/cancellation
-- recording subsystem owns recording success/failure
-
-Prefer local variables / simple return values over new dataclasses.
-
-If an end timestamp is scientifically persisted in an episode, keep that data. Remove only duplicated runtime bookkeeping.
-
-## 2.3 Merge deployment operator code only if ownership becomes clearer
-
-If `deployment/operator.py` has only one real consumer, merge its orchestration into `deployment/session.py` or move true robot-home helpers to the existing robot/home module.
-
-Important:
-
-- **preserve the independent keyboard/listener thread**
-- S/Q/ESC must remain responsive while policy inference, home, or recording finalization blocks elsewhere
-- do not turn “merge module” into “run everything on one blocking thread”
-
-Delete the old module after all imports/tests/docs are migrated. Do not leave an import compatibility shim.
-
-## 2.4 Simplify supervisor/process utilities
-
-Reduce supervisor/process code to concrete responsibilities:
-
-- wait for required startup readiness
-- monitor required process liveness / sticky hardware errors
-- classify optional recording-service failure separately from motion failure
-- request stop
-- join/terminate if needed
-- release shared memory last
-
-Remove generic reports/specs/wrappers that have one caller and no independent behavior.
-
-Do not weaken shutdown ordering.
-
-### Phase 2 tests
-
-Protect behavior, not implementation names:
-
-- stop while policy inference is blocked
-- stop then later inference return cannot publish old motion
-- quit/estop stays responsive during home
-- worker fault terminates motion path
-- recording-service failure does not become a hardware fault
-- shared memory is released only after workers stop
-
-### Phase 2 done when
-
-- [ ] one motion cancellation identity remains
-- [ ] trial bookkeeping is local instead of protocol-wide
-- [ ] operator stop responsiveness is unchanged
-- [ ] no compatibility wrappers remain
-- [ ] targeted offline tests pass
-
-Suggested commit:
-
-```text
-refactor: localize rollout lifecycle state
-```
-
----
-
-# PHASE 3 — Bound same-generation command staleness without building a lease system
-
-## Problem
-
-A current-generation command can remain queued/pending for too long and still be considered valid. Cross-generation stale work is fenced; same-generation backlog still needs a simple execution-age bound.
-
-## Design
-
-Use **one deadline timestamp**, not a lease framework.
-
-Preferred representation:
-
-```text
-expires_monotonic_ns
-```
-
-The deadline belongs to the command/candidate that may eventually reach an SDK.
-
-Requirements:
-
-1. Deadline is created once for the command intent.
-2. FIFO FULL retry keeps the **same numeric target and same deadline**.
-3. Publication checks expiry while holding the same motion-permission critical section.
-4. Arm and hand workers re-check expiry immediately before the final SDK send/admission.
-5. Do not create:
-   - lease objects
-   - renewals
-   - another generation ID
-   - another command ID
-   - a timeout manager process
-6. Do not skip an expired FIFO head and execute newer commands behind it.
-7. Expiry is a safe cancellation/stop condition, not an estop and not automatically a hardware fault.
-8. A new run requires an explicit new operator/workflow start.
-
-The producer's intended execution time matters. Do not “freshen” an old action merely because it was inserted into the FIFO later.
-
-For periodic policy/teleop commands, derive/resolve the allowed lag from the existing configured cadence plus one clearly-owned bound. Avoid exposing several duplicate timeout knobs.
-
-**Do not invent an aggressive production value without evidence.** Inspect existing control periods, worker timing, acceptance timeout assumptions, and current tests. Implement the mechanism and a single clear configuration/constant owner. If a final live threshold cannot be justified offline, choose a conservative fail-safe default consistent with current timing assumptions and mark the exact value as requiring hardware timing validation in the handoff. Do not disable the protection silently.
-
-Home/calibration/replay commands that already serialize publish→accept may use an appropriate explicit deadline; do not exempt them by accident.
-
-## Required tests
-
-- FIFO FULL retry does not extend deadline
-- expired command is never sent to arm SDK boundary
-- expired command is never sent to hand SDK boundary
-- expiry at one consumer prevents later commands from overtaking the expired head
-- STOP/generation revoke still wins over expiry classification
-- new run does not resurrect expired/old work
-- ordinary in-budget commands preserve current order
-- XHand intermediate slew acceptance still cannot acknowledge the final target early
-
-### Phase 3 done when
-
-- [ ] same-generation backlog has a bounded execution age
-- [ ] only one new temporal concept was added: the deadline
-- [ ] no lease subsystem exists
-- [ ] both worker SDK boundaries enforce it
-- [ ] targeted offline tests pass
-
-Suggested commit:
-
-```text
-safety: expire delayed robot commands at the SDK boundary
-```
-
----
-
-# PHASE 4 — Give recording one episode-finalization owner
-
-## Goal
-
-Keep asynchronous recording so the control loop never blocks on file/video IO, but eliminate the second layer of finalization machinery inside the recorder process.
-
-Target path:
-
-```text
-control/policy loop
-    ↓
-RecorderClient.add_frame(EpisodeFrame)
-    ↓
-sample ring
-    ↓
-recorder process
-    ↓
-EpisodeRecorder.add_frame()
-    ↓
-finish episode synchronously inside recorder process
-    ↓
-one result back to client
-```
-
-## 4.1 Keep the real process boundary
-
-Keep:
-
-- recorder process
-- sample shared-memory ring
-- control queue for episode boundaries
-- one result channel
-- video/image worker threads only if they are necessary for continuous IO
-- `through_sequence` or equivalent boundary required to ensure the last committed sample is drained before finalization
-
-## 4.2 Delete duplicate episode lifecycle ownership
-
-Inspect and remove, if still present:
-
-- `_PendingFinalization`
-- finalizer thread dedicated only to closing one episode
-- nested finalizer result queue
-- polling state whose only purpose is to supervise that internal thread
-- duplicate save/discard ownership split across client, IO session, and serializer
-
-The recorder process itself is already asynchronous relative to robot control. Let it block while closing **its own** episode.
-
-The client should remain a thin cross-process handle, not a second recorder state machine.
-
-Desired public operations can remain conceptually:
-
-```text
-start_episode(...)
-add_frame(frame)
-finish_episode(save: bool, reason: str)
-poll/wait for one finish result
-close()
-```
-
-Do not create a storage backend abstraction.
-
-## 4.3 Preserve failure semantics
-
-Must preserve:
-
-- copy-before-ACK / slot-release safety
-- last-frame drain before save
-- explicit discard really discards
-- unexpected recording failure preserves a non-empty safely-closed prefix as incomplete
-- if safe close cannot be confirmed, keep staging rather than publishing a “complete” episode
-- recording failure must not abruptly stop manual teleoperation
-- rollout/session result must still report recording failure
-- no next episode starts until previous finalization result is known
-- shutdown stops motion first, then allows bounded recording finalization, then releases shared memory
-- finalization timeout is handled by the outer process/session owner, not another finalizer thread
-
-LeRobot's useful principle here is one writer owner with an idempotent finalization path. Copy the ownership principle, not the full dataset framework.
-
-## Required tests
-
-- exact final sample is included
-- finish waits for `through_sequence`
-- save success
-- explicit discard
-- camera/recording degradation preserves allowed incomplete prefix
-- disk/video failure does not publish a false complete episode
-- repeated close/finish is harmless or clearly rejected once
-- no next start while prior finish is unresolved
-- recorder process death is reported without reclassifying it as arm/hand hardware failure
-
-### Phase 4 done when
-
-- [ ] recorder process is sole file-lifecycle owner
-- [ ] no nested episode-finalizer thread/state machine remains
-- [ ] control loop remains non-blocking on file IO
-- [ ] prefix/discard/failure semantics remain correct
-- [ ] targeted recording tests pass
-
-Suggested commit:
-
-```text
-recording: make recorder process own episode finalization
-```
-
----
-
-# PHASE 5 — Remove mandatory processed-HDF5 architecture; export raw directly to policy Zarr
-
-## Goal
-
-End with one canonical research source plus one explicit offline conversion:
-
-```text
-raw episode (source of truth)
-    ↓
-offline geometric / sensor transforms
-    ↓
-policy Zarr consumed by dexmani_policy
-```
-
-The current mathematical processing remains valuable. The **mandatory persisted processed HDF5 contract** does not need to remain.
-
-## 5.1 Preserve real transforms
-
-Keep the numerical behavior currently required for:
-
-- temporal admission/alignment
-- camera geometry
-- RGB-D handling
-- point cloud generation/sampling
-- coordinate transforms
-- arm FK / EE representation
-- fingertip positions
-- contact/tactile validity
-- action representation
-- task identity
-- dtype/shape expected by `dexmani_policy`
-
-Prefer pure functions that operate on raw episode data and feed the Zarr writer.
-
-## 5.2 Collapse the two-step CLI
-
-Target one user-facing offline command, preferably keeping the existing discoverable name:
-
-```bash
+raw episode (source of truth) -> current numerical transforms -> policy Zarr
 python examples/export_policy_zarr.py episodes/<task> --dry-run
 python examples/export_policy_zarr.py episodes/<task>
 ```
 
-The real export and dry-run must share the same validation path.
+KEEP FK/IK-related transforms, fingertip/contact/tactile semantics, RGB-D/point-cloud math, task/annotation decisions, actual time alignment, gap handling and exact policy-consumed keys/dtypes/layout. MERGE orchestration in `dataset/processing.py` and `dataset/export.py`; DELETE mandatory processed-HDF5 persistence/schema, not the mathematics. Stream one episode or bounded frame chunk at a time; do not replace intermediate files with the entire dataset resident in RAM or GPU.
 
-Delete the mandatory sequence:
+### Establish the comparison oracle first
 
-```text
-process_episodes.py
-→ processed HDF5
-→ export_policy_zarr.py
-```
+Run old raw -> processed -> Zarr in the retained BASE worktree/process, and new raw -> Zarr in the new worktree/process. Ensure the imports resolve to the intended tree; do not run “old” code against the new editable install. Use the same raw fixtures, config, calibration and dependencies. Fix sampling randomness or compare using a justified deterministic method; do not widen tolerances until mismatches disappear.
 
-Do not replace it with another intermediate schema.
+Compare every actual policy-consumed field, episode boundaries/order, shapes/dtypes, values, frame conventions, validity, task metadata, and timing/selection decisions. Also compare rejection behavior: explicit include/exclude annotations, task conflicts, missing/invalid modalities, gaps, empty inputs and non-uniform policy_eval. Do not require fabricated fields that the real policy reader does not consume. Exercise its public reader when available; if unavailable, state that external integration remains unverified rather than inventing a substitute.
 
-## 5.3 Remove processed-only architecture
+Use synthetic raw fixtures from current test infrastructure. Real research samples, when available and permitted, are read-only and must not be uploaded. Keep a compact semantic regression without retaining the old implementation as a permanent oracle/compatibility branch. If numerical equivalence is blocked, keep the coherent old path on the working branch and mark this phase BLOCKED; do not delete first and lose the comparison basis.
 
-After the direct exporter is proven equivalent, delete/merge as appropriate:
+### One conversion, not two hidden passes
 
-- processed schema/version constants used only for the intermediate file
-- processed-HDF5 validator ecosystem
-- processed discovery/preflight that duplicates raw admission + final Zarr checks
-- `examples/process_episodes.py`
-- `examples/visualize_episode_processed.py`
-- processed-only replay mode / `--processed`, if it exists only to consume this intermediate format
-- config fields/directories that exist only for `episodes_processed`
-- tests that only freeze the deleted intermediate representation
+Normal export validates raw input at its owner, transforms each payload once, writes staged Zarr, then checks the persisted output in bounded chunks before atomic publication. Dry-run shares the same admission/transformation/finite-value checks but writes no output/staging/report files and cannot claim to verify a persisted store it did not write. Do not call a full dry-run transformation internally and then repeat it for real export. A human explicitly running dry-run followed by export is different.
 
-Do not keep a compatibility loader.
+Retain no-overwrite and resolved-path/symlink protection for raw, rollouts, existing processed data and existing stores; protect existing scientific data even after removing its loader. Do not place output inside inputs. Preserve atomic publication and cleanup of task-created staging; cleanup must never delete user sources.
 
-Historical processed-only data can be handled with Git history or a one-off explicit conversion if there is a concrete dataset that needs it. Do not build runtime compatibility preemptively.
+After the comparison gate passes, remove `dataset/processed.py` and processed-only validators/discovery; remove `examples/process_episodes.py`, `visualize_episode_processed.py`, processed-only replay flag/loader and their dead tests/config/imports/docs in the SAME change. Keep raw replay and useful raw visualization. Retain actually used annotation/export options in the remaining CLI; intentionally removed options get a documentation update, not a compatibility parser.
 
-## 5.4 Keep output safety
+Never delete existing `episodes_processed/` data. Keep raw v29-to-v30 conversion; processed-only history uses pinned historical code or a concrete one-off converter. No default cache/second source of truth. Do not change `dexmani_policy` or its public format to evade comparison failures.
 
-The direct exporter must still:
+**Gate:** differential values AND admission behavior pass; bounded-memory/no-write dry-run/output protection tests pass; policy-reader test passes or is honestly recorded as an external integration blocker; all deleted-format consumers are removed together. Non-uniform policy_eval remains refused for fixed-dt training/replay.
 
-- never overwrite raw episodes
-- refuse occupied output by default
-- write atomically/staged where current code already guarantees this
-- validate final Zarr arrays at the external dataset boundary
-- keep dry-run read-only
-- never write inside protected source roots
-- preserve task identity
-- provide actionable error messages without an error taxonomy framework
+Commit suggestion: `dataset: export raw episodes directly to policy zarr`.
 
-## 5.5 Prove equivalence before deleting the old path
+## Phase 6 — Final cleanup and usable documentation
 
-Before removing the old processed writer, use existing fixtures/sample data to compare:
+Remove dead imports/wrappers/names/CLI/config/tests by consumer tracing. Keep numerical and safety behavior, not exception wording/audit spans/deleted schemas. Never remove meaningful failing regressions to obtain green checks.
 
-```text
-raw → old processed → old Zarr
-vs
-raw → new direct Zarr
-```
+Keep one setting owner (CLI override > experiment YAML > Python default where currently used). Keep researcher-controlled IP/serial/frequency/resolution/path/checkpoint/task/gains and real thresholds. Immutable hardware identity is not an experiment setting; configured soft limits/calibration may still be experiment-specific. No new configuration framework or broad dependency upgrade.
 
-Compare every policy-consumed array:
+README describes the ACTUAL final installation, current workflows/keys, output paths, remaining CLI, raw -> Zarr command, physical safety boundary, live lag-budget requirement, policy timing and incomplete data. Describe software admission vs physical stop honestly. Remove refactor history and old module inventories from everyday guidance. Keep units, coordinate conventions, copy-before-ACK and non-obvious race comments near their implementation; remove obvious code narration and obsolete guarantees.
 
-- keys
-- episode boundaries
-- shapes
-- dtypes
-- timestamps / timing semantics
-- numerical values with justified tolerance
-- point clouds
-- fingertip/contact/tactile validity
-- actions
-- task labels
+Read existing docs before deleting old plans: retain still-current experiment/calibration/safety instructions. Prefer README sections; only extract `docs/hardware.md` or `docs/data.md` if necessary. Keep `CLAUDE.md` referential and `AGENTS.md` concise. Do not edit agent instructions to bypass a constraint. Keep this root task as explicitly requested; do not add another permanent audit/metrics/report framework.
 
-Do not require byte-identical container metadata if it is irrelevant to policy consumption.
+Check stale references in live code/docs while allowing historical names in THIS task, negative tests and intentional historical conversion notes. A blanket zero-occurrence grep would wrongly flag them. Verify help/examples against actual parsers only after import safety review; never run motion examples as smoke tests.
 
-Important:
+**Gate:** callers, docs and configuration describe one implemented path; no dead compatibility shims; the researcher can find and use each retained workflow.
 
-- do not use “truncate all streams to min length” as a replacement for actual time alignment
-- do not silently admit non-uniform `policy_eval` as fixed-dt training data
-- preserve current refusal until a deliberate time-aware training conversion exists
+## Phase 7 — Verification, reviewable delivery and honest status
 
-### Phase 5 done when
-
-- [ ] one raw→policy conversion command remains
-- [ ] mandatory processed HDF5 is gone
-- [ ] policy Zarr semantics match the old valid path
-- [ ] raw remains the source of truth
-- [ ] no runtime compatibility layer remains
-- [ ] dataset tests pass
-
-Suggested commit:
-
-```text
-dataset: export raw episodes directly to policy zarr
-```
-
----
-
-# PHASE 6 — Remove dead config/tests/comments and update stable documentation
-
-Do this only after the architecture above is working.
-
-## 6.1 Configuration
-
-Remove:
-
-- fields used only by deleted processed format
-- fields used only by deleted lifecycle/evidence bookkeeping
-- duplicate derived values
-- hypothetical backend options
-- values that are actually immutable xArm7/XHand hardware constants
-
-Keep configuration for things researchers actually change:
-
-- IP / serial
-- frequencies
-- camera resolution
-- paths
-- checkpoint/artifact
-- task
-- control gains
-- experiment parameters
-- real safety thresholds
-
-One source of truth per setting.
-
-## 6.2 Tests
-
-Keep tests for:
-
-- FK/IK
-- transforms
-- retargeting
-- geometry
-- point clouds
-- dataset conversion
-- action clipping
-- command expiry/revocation
-- concrete past regressions
-- recording boundary correctness
-
-Delete/rewrite tests for:
-
-- exact exception wording
-- deleted internal state enums
-- old evidence/provenance bookkeeping
-- old processed schema identity
-- mocks whose sole purpose is to preserve removed multiprocessing choreography
-- imports of deleted wrappers
-
-Do not reduce test coverage of a real safety invariant.
-
-## 6.3 Comments/docstrings
-
-For every changed area:
-
-Delete comments that:
-
-- narrate removed architecture
-- refer to old module paths/classes
-- restate obvious code
-- describe historical migration stages
-- claim guarantees no longer provided
-
-Keep concise comments that explain:
-
-- non-obvious race conditions
-- units / coordinate frames
-- copy-before-ACK
-- why a worker performs the final SDK fence
-- why XHand intermediate slew points do not acknowledge the final target
-- why policy_eval timing cannot be treated as fixed-dt
-- why a particular shutdown order is safety-critical
-
-Do not perform global terminology replacement. For example, scientific provenance such as task/checkpoint/seed may still be useful even if internal “evidence protocol” terminology is removed.
-
-## 6.4 README and stable docs
-
-Update `README.md` to describe the **final current system**, not the refactor history.
-
-README should contain:
-
-- current installation/config precedence
-- current research entry points
-- teleop/data collection
-- policy rollout
-- raw→policy dataset conversion
-- calibration/home/replay/visualization
-- concise safety ownership
-- offline verification commands
-- explicit note that offline tests are not hardware validation
-
-Update/remove every stale command and path, especially:
-
-- processed-HDF5 workflow
-- `episodes_processed`
-- processed visualizer
-- deleted module names
-- obsolete evidence/lifecycle terminology
-
-Keep `AGENTS.md` as the repository-wide authority. Keep `CLAUDE.md` small and referential.
-
-Do not create a large docs hierarchy unless README genuinely becomes unreadable. If needed, at most extract stable `docs/hardware.md` and/or `docs/data.md`.
-
-Keep `CODEX_TASK.md` during this execution. Do not delete it automatically unless the user explicitly asks.
-
-Suggested commit:
-
-```text
-docs: align repository guidance with simplified architecture
-```
-
----
-
-# PHASE 7 — Final offline verification, metrics, and handoff
-
-## 7.1 Static/offline gates
-
-At minimum:
+Run targeted tests after each logical change. At final handoff run the full audited OFFLINE suite in the same environment as the baseline, plus:
 
 ```bash
-python -m compileall -q dexmani_real examples
+python -m compileall -q dexmani_real examples tests
 python -m pytest -q
 git diff --check
+git diff --cached --check
+git diff --check "$BASE" HEAD
 ```
 
-Run repository-configured Ruff/static checks if available.
+`BASE` must be the recorded integrated comparison commit, not an unset variable. Working-tree diff alone checks nothing after all changes are committed. Run project-configured static checks and relevant existing undefined-name/dead-import checks; do not introduce a lint platform. Capture real exit codes (`pipefail` if piping through tee). Collection failures, timeouts, skips and unavailable dependencies must be reported separately from test passes. Never use `-k`, skip markers, stubs or reduced collection to present targeted success as a full-suite pass.
 
-Also use `git grep` / AST inspection to verify there are no stale references to deleted:
+Review the final action/observation/recording/data paths against Section 2; inspect both sides of every changed boundary. For concurrency tests force the interleaving with controlled clocks/events and bounded joins; do not rely on sleeps or assume ordinary dict mocks test cross-process behavior.
 
-- modules
-- config keys
-- CLI flags
-- schema names
-- comments/docs terminology
+Recompute Phase 1 metrics identically, including IPC/state/config/path changes. Separate runtime, tests/comments and moves; count task/docs separately. Deletion is a result, not a quota.
 
-Do not run hardware to make tests pass.
+Commit/push only task work when permitted. Open/update ONE implementation PR with tested head/base, scope and remaining gates; do not create a new PR on every resumption or silently merge this new implementation. If remote writes are blocked, supply exact local commits/patch and pending actions. Do not leave uncommitted half-migrated APIs; a blocked phase should retain a coherent safe path and be labelled incomplete.
 
-## 7.2 Recompute the same metrics as Phase 1
+### Completion gates (separate outcomes)
 
-Report before/after using the exact same counting method:
+| Gate | PASS means | BLOCKED / NOT RUN means |
+|---|---|---|
+| GIT | #20 integration and verified superseded cleanup actually completed | permissions/refs/review prevent an operation; list it, do not mark cleanup complete |
+| SOFTWARE | intended simplifications implemented; required offline checks and numerical comparisons pass on exact final code | meaningful test/comparison/implementation missing; report partial delivery, not “all complete” |
+| EXTERNAL INTEGRATION | real public policy reader/artifact boundary exercised with available dependencies/fixtures | not tested or dependency/checkpoint unavailable; do not claim it passed |
+| HARDWARE | separately authorized, actually performed device validation | pending is expected here and is NOT supplied by offline tests |
 
-- Python LOC
-- `dexmani_real` LOC
-- test LOC
-- Python file count
-- core modules
-- classes
-- dataclasses
-- enums
-- config fields
-- validate/check-named functions
+Historical counts or reporting failures do not pass gates. Blocked Git/hardware steps do not stop independent safe work, but do stop the affected merge/deletion.
 
-Metrics are evidence, not a quota. Do not delete useful safety code to hit a number.
+Final report must contain actual DELETE/MERGE/SIMPLIFY/KEEP results, remaining load-bearing mechanisms, the four final paths, before/after metrics with method, exact test commands/results, actual Git actions and final SHA/PR, deliberate deviations and all gate statuses. Ordinary documentation edits need not rerun hardware tests, but do not recycle old results as new ones.
 
-## 7.3 Final diff review
+Provide an UNEXECUTED commissioning checklist: explicit finite dispatch budget based on measured producer/SDK/slew delay; low-speed startup/stop; blocked inference with parent timeout; S/Q/ESC during home; backlog expiry and two-consumer partial progress; required camera/tactile loss; recording finalize timeout; real checkpoint/reader/data comparison; safe disconnect and physical emergency-stop response. Do not initiate those experiments. Never describe process kill, software revocation or a passing unit test as physical safety certification.
 
-Manually inspect:
-
-- action path
-- stop/revoke path
-- both worker SDK boundaries
-- recorder finish path
-- raw→Zarr path
-- README commands
-
-Check for:
-
-- dead imports
-- dead config
-- half-migrated terminology
-- compatibility wrappers
-- duplicate owners
-- comments describing old behavior
-
-## 7.4 Hardware validation remains separate
-
-Do not claim hardware validation.
-
-Provide a manual, operator-authorized checklist for later real-hardware testing, including at least:
-
-- low-speed arm+hand connection/start/stop
-- S/Q/ESC response while inference is slow
-- command-expiry behavior under induced backlog
-- xArm/XHand error handling
-- home behavior
-- long recording/finalization
-- RealSense/tactile data validity
-- real checkpoint rollout
-- emergency stop
-- safe disconnect
-
-Do not execute these steps without explicit authorization.
-
----
-
-# 8. Definition of Done
-
-This task is complete only when all of the following are true:
-
-### Git / branches
-
-- [ ] #20 baseline is integrated or the exact unavailable remote operation is explicitly reported
-- [ ] #18/#19 unique useful behavior is accounted for
-- [ ] superseded branches/PRs are cleaned only after verification
-- [ ] subsequent refactor work is isolated from obsolete branch history
-
-### Runtime / motion
-
-- [ ] policy/teleop → robot path has one clear command preparation/publication owner
-- [ ] only one motion cancellation generation/epoch remains
-- [ ] same-generation stale commands have one deadline mechanism
-- [ ] no lease framework or extra command identity was introduced
-- [ ] arm and hand SDK boundaries reject revoked/expired work
-- [ ] operator stop/estop remains responsive during blocking work
-
-### Recording
-
-- [ ] recorder process is the sole episode file-lifecycle owner
-- [ ] nested finalizer thread/state protocol is removed
-- [ ] last-frame/prefix/discard/failure semantics remain correct
-- [ ] recording failure is not mislabeled as robot hardware failure
-
-### Dataset
-
-- [ ] raw episode is the canonical source of truth
-- [ ] one direct raw→policy Zarr conversion exists
-- [ ] mandatory processed HDF5 architecture is removed
-- [ ] old and new policy-consumed values were compared before removing the old path
-- [ ] policy_eval timing semantics remain honest
-
-### Cleanup/docs
-
-- [ ] dead config/imports/tests/comments are removed
-- [ ] README commands match the final implementation
-- [ ] no obsolete compatibility adapters remain
-- [ ] no new generic framework was added
-
-### Verification
-
-- [ ] full offline tests pass, or every failure is explicitly reported with no false success claim
-- [ ] compileall passes
-- [ ] diff check passes
-- [ ] configured static checks pass
-- [ ] before/after complexity metrics use one consistent method
-- [ ] hardware validation is explicitly marked pending unless separately authorized and actually performed
-
----
-
-# 9. Required final Codex report
-
-At completion, report concisely:
-
-1. **What was deleted / merged / simplified / kept**
-2. **Why every remaining non-trivial mechanism is load-bearing**
-3. **Final action path**
-4. **Final observation path**
-5. **Final recording path**
-6. **Final raw→policy dataset path**
-7. **Branch/PR actions actually completed**
-8. **Before/after metrics**
-9. **Exact tests/checks run and results**
-10. **Hardware validation still pending**
-11. **Any deliberate deviations from this task and the concrete reason**
-
-Do not claim success for work that was not executed.
-
-The architectural success criterion is:
-
-> A researcher should be able to trace VR → robot, policy → robot, robot/sensors → policy, control loop → recorder, and raw episode → policy dataset without learning an internal distributed protocol.
+Success: a researcher can trace VR -> robot, policy -> robot, sensors -> policy, control tick -> episode, and raw -> policy dataset without learning a runtime audit protocol.
