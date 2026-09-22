@@ -2,7 +2,7 @@
 
 Policy-eval rollouts carry synchronous/irregular execution timing (real
 inference-boundary gaps) and must not silently enter the fixed-dt teleop
-processing pipeline or the fixed-rate physical replay scheduler. This module is
+processing pipeline or the teleop-only physical replay workflow. This module is
 the single classifier both consumers share, so the two boundaries never drift.
 """
 
@@ -35,7 +35,7 @@ def read_provenance_workflow(meta_attrs: Any) -> str | None:
 
 
 def supports_fixed_dt_teleop(workflow: str | None) -> bool:
-    """Return True when ``workflow`` may enter fixed-dt teleop processing/replay.
+    """Return True when ``workflow`` may enter teleop processing/replay.
 
     ``None`` (absent) and ``""`` (empty) mean the producer declared no workflow
     (the current teleop path); ``teleop`` is accepted for any producer that

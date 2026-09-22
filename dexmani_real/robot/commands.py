@@ -11,22 +11,11 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
-from dexmani_real.ipc.command_stream import command_stream_capacity_locked
-from dexmani_real.ipc.schema import COUPLED_COMMAND_DTYPE
+from dexmani_real.ipc.schema import ROBOT_COMMAND_DTYPE
 from dexmani_real.runtime.safety import (
-    PUBLISH_REASON_ESTOP,
-    PUBLISH_REASON_EXPIRED,
-    _expire_command_locked,
-    PUBLISH_REASON_FAULT,
-    PUBLISH_REASON_FIFO_FULL,
-    PUBLISH_REASON_GENERATION,
-    PUBLISH_REASON_RUNTIME_STOPPED,
-    PUBLISH_REASON_SAFETY_STATE,
-    CommittedCommand,
-    SafetyState,
-    cancel_coupled_command_if_current,
-    coupled_command_is_current,
-    PUBLISH_REASON_NO_CONSUMER,
+    PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT, PUBLISH_REASON_PENDING,
+    PUBLISH_REASON_RUN, PUBLISH_REASON_RUNTIME_STOPPED, PUBLISH_REASON_SAFETY_STATE,
+    SafetyState, cancel_coupled_command_if_current, coupled_command_is_current,
     read_motion_permit,
 )
 from dexmani_real.utils.feedback import (
@@ -36,28 +25,103 @@ from dexmani_real.utils.feedback import (
     diagnose_feedback_timestamp_order,
     diagnose_hand_feedback,
 )
-from dexmani_real.utils.log import get_logger, ThrottledWarner
+from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-_warn_full = ThrottledWarner(interval_s=2.0, logger=logger)
 
 
 @dataclass(frozen=True)
-class ActionCandidate:
-    """One current command candidate proposed by a control producer.
+class RobotCommand:
+    """Owned immutable targets. ID zero denotes an unpublished checked proposal."""
 
-    Publication confirms the candidate still belongs to the active
-    ``run_generation`` and commits it once to the ordered command FIFO. The
-    candidate is an owner-owned immutable numeric snapshot: a FULL commit
-    result retries this exact object without rebuilding it, re-solving IK, or
-    re-clipping its targets, and retains its original execution deadline through every retry.
-    """
-
-    run_generation: int
-    expires_monotonic_ns: int
+    run_id: int
     arm_qpos: np.ndarray | None = None
     hand_qpos: np.ndarray | None = None
-    is_hold: bool = False
+    command_id: int = 0
+    issued_monotonic_ns: int = 0
+
+    def __post_init__(self) -> None:
+        for name in ("arm_qpos", "hand_qpos"):
+            value = getattr(self, name)
+            if value is not None:
+                value = np.array(value, dtype=np.float64, copy=True)
+                value.flags.writeable = False
+                object.__setattr__(self, name, value)
+
+
+@dataclass(frozen=True)
+class CommandAdoption:
+    arm_adopted: bool = False
+    hand_adopted: bool = False
+    arm_monotonic_ns: int = 0
+    hand_monotonic_ns: int = 0
+    arm_known: bool = False
+    hand_known: bool = False
+
+    def complete(self, command: RobotCommand) -> bool:
+        return bool(command.command_id and
+                    (command.arm_qpos is None or self.arm_adopted) and
+                    (command.hand_qpos is None or self.hand_adopted))
+
+    def fields(self, command: RobotCommand) -> dict[str, int | bool]:
+        return dict(
+            command_id=command.command_id, command_run_id=command.run_id,
+            command_issued_monotonic_ns=command.issued_monotonic_ns,
+            command_arm_present=command.arm_qpos is not None,
+            command_hand_present=command.hand_qpos is not None,
+            arm_command_adopted=self.arm_adopted,
+            hand_command_adopted=self.hand_adopted,
+            arm_command_adopted_monotonic_ns=self.arm_monotonic_ns,
+            hand_command_adopted_monotonic_ns=self.hand_monotonic_ns,
+        )
+
+
+def read_command_adoption(shared: Any, command: RobotCommand, *, boundary_ns: int = 0) -> CommandAdoption:
+    """Read exact identities; a fresh source sample proves post-boundary absence.
+
+    Positive historical facts remain useful even if the sensor is now unhealthy.
+    Negative facts require healthy post-boundary feedback, never a republished
+    stale payload. Each SDK owner publishes state serially with its SDK calls.
+    """
+    values = {}
+    for name in ("arm", "hand"):
+        present = getattr(command, f"{name}_qpos") is not None
+        result = getattr(shared, f"{name}_state_ring").read_latest() if present else None
+        adopted, stamp, known = False, 0, not present
+        if result is not None:
+            record = result[0][0]
+            adopted = bool(command.command_id and
+                int(record["last_adopted_run_id"]) == command.run_id and
+                int(record["last_adopted_command_id"]) == command.command_id and
+                int(record["last_adopted_monotonic_ns"]) > 0)
+            stamp = int(record["last_adopted_monotonic_ns"]) if adopted else 0
+            known = bool(record["state_valid"] and
+                         int(record["source_monotonic_ns"]) > boundary_ns)
+        values.update({f"{name}_adopted": adopted, f"{name}_monotonic_ns": stamp,
+                       f"{name}_known": known})
+    return CommandAdoption(**values)
+
+
+def read_robot_command(shared: Any) -> RobotCommand | None:
+    result = shared.robot_command_ring.read_latest()
+    if result is None:
+        return None
+    record = result[0][0]
+    return RobotCommand(
+        command_id=int(record["command_id"]), run_id=int(record["run_id"]),
+        issued_monotonic_ns=int(record["issued_monotonic_ns"]),
+        arm_qpos=record["arm_qpos"] if record["arm_present"] else None,
+        hand_qpos=record["hand_qpos"] if record["hand_present"] else None,
+    )
+
+
+def command_admission_ready(shared: Any) -> bool:
+    with shared.motion_lock:
+        if shared.pending_record_command_id.value:
+            return False
+        previous = read_robot_command(shared)
+        return (previous is None or previous.run_id != int(shared.run_id.value)
+                or read_command_adoption(shared, previous).complete(previous))
 
 
 _JOINT_LIMIT_TOLERANCE_RAD = 1e-12
@@ -136,7 +200,7 @@ class SafetyGate:
 
     def validate(
         self,
-        candidate: ActionCandidate,
+        candidate: RobotCommand,
         *,
         current_arm_qpos: np.ndarray,
         current_hand_qpos: np.ndarray | None = None,
@@ -235,16 +299,10 @@ def planner_action_safety_gate(
 
 @dataclass(frozen=True)
 class PublishResult:
-    """Compact result of the realtime IPC publication boundary.
-
-    ``fifo_depth`` is the committed backlog observed by a rejected FULL
-    commit, for the producer's visible ``[WAIT]`` report.
-    """
-
+    """Publication outcome; the reason distinguishes lifecycle from executor lag."""
     published: bool
-    command: CommittedCommand | None = None
+    command: RobotCommand | None = None
     reason: str = ""
-    fifo_depth: int = 0
 
 
 @dataclass(frozen=True)
@@ -259,7 +317,7 @@ class AcceptanceResult:
 class PreparedCommand:
     """A physically checked command, or its preparation rejection."""
 
-    candidate: ActionCandidate | None = None
+    candidate: RobotCommand | None = None
     reason: str = ""
     gate_code: GateRejectCode | None = None
     feedback_issue: FeedbackIssue | None = None
@@ -274,13 +332,8 @@ class PreparedCommand:
 @dataclass(frozen=True)
 class _ActuatorFeedback:
     qpos: np.ndarray
-    accepted_monotonic_ns: int = 0
     source_monotonic_ns: int = 0
     ring_commit_monotonic_ns: int = 0
-    # Generation/sequence identity of the acceptance watermark: a stale
-    # generation's ACK can never satisfy a current-epoch acceptance wait.
-    accepted_generation: int = 0
-    accepted_sequence: int = 0
 
 
 @dataclass(frozen=True)
@@ -361,11 +414,8 @@ def _read_arm_feedback(
     return (
         _ActuatorFeedback(
             qpos=qpos.copy(),
-            accepted_monotonic_ns=int(record["last_cmd_accepted_monotonic_ns"]),
             source_monotonic_ns=source_ns,
             ring_commit_monotonic_ns=ring_commit_ns,
-            accepted_generation=int(record["last_cmd_generation"]),
-            accepted_sequence=int(record["last_cmd_accepted_sequence"]),
         ),
         "",
         None,
@@ -399,11 +449,8 @@ def read_hand_feedback(
     return (
         _ActuatorFeedback(
             qpos=qpos.copy(),
-            accepted_monotonic_ns=int(record["accepted_target_monotonic_ns"]),
             source_monotonic_ns=source_ns,
             ring_commit_monotonic_ns=ring_commit_ns,
-            accepted_generation=int(record["accepted_target_generation"]),
-            accepted_sequence=int(record["accepted_target_sequence"]),
         ),
         "",
         None,
@@ -495,27 +542,23 @@ def prepare_joint_command(
     hand_qpos: np.ndarray | None = None,
     *,
     gate: SafetyGate,
-    expires_monotonic_ns: int,
-    run_generation: int | None = None,
-    is_hold: bool = False,
+    run_id: int | None = None,
     arm_feedback_max_age_s: float,
     hand_feedback_max_age_s: float,
     feedback_snapshot: CommandFeedbackSnapshot | None = None,
 ) -> PreparedCommand:
-    """Copy and check a target once; retry this snapshot unchanged after FIFO FULL.
+    """Copy targets and apply the producer safety boundary using one feedback snapshot.
 
     A supplied feedback snapshot is reused by decode, IK and these checks.
     Mechanical/SDK validity remains checked by the actuator-owning worker.
     """
     try:
-        candidate = ActionCandidate(
-            expires_monotonic_ns=expires_monotonic_ns,
-            run_generation=(int(shared.run_generation.value)
-                            if run_generation is None else run_generation),
-            arm_qpos=np.array(arm_qpos, dtype=np.float64, copy=True),
+        candidate = RobotCommand(
+            run_id=(int(shared.run_id.value)
+                            if run_id is None else run_id),
+            arm_qpos=None if arm_qpos is None else np.array(arm_qpos, dtype=np.float64, copy=True),
             hand_qpos=(None if hand_qpos is None else
                        np.array(hand_qpos, dtype=np.float64, copy=True)),
-            is_hold=is_hold,
         )
     except (TypeError, ValueError) as exc:
         return PreparedCommand(reason=str(exc), fatal=True)
@@ -575,174 +618,110 @@ def prepare_joint_command(
 
 
 def command_publishability_reason(
-    shared: Any,
-    candidate: ActionCandidate,
-    *,
-    check_is_running: bool = True,
+    shared: Any, candidate: RobotCommand, *, check_is_running: bool = True,
     required_safety_state: SafetyState | None = None,
 ) -> str:
-    """Check the runtime and generation publication invariants without committing.
-
-    This is the ``execute=False`` rehearsal of :func:`publish_command`; it
-    deliberately does not evaluate FIFO capacity, which is only meaningful at
-    the atomic commit point.
-    """
-    reason = motion_rejection_reason(
-        shared,
-        check_is_running=check_is_running,
-        required_safety_state=required_safety_state,
-    )
+    reason = motion_rejection_reason(shared, check_is_running=check_is_running,
+                                     required_safety_state=required_safety_state)
     if reason:
         return reason
-    permit = read_motion_permit(shared)
-    if int(candidate.run_generation) != permit.run_generation:
-        return PUBLISH_REASON_GENERATION
-    return ""
+    return "" if candidate.run_id == int(shared.run_id.value) else PUBLISH_REASON_RUN
 
 
 def publish_command(
-    shared: Any,
-    candidate: ActionCandidate,
-    *,
-    required_safety_state: SafetyState,
+    shared: Any, candidate: RobotCommand, *, required_safety_state: SafetyState,
+    account_recording: bool = False,
 ) -> PublishResult:
-    """Commit one checked command to the ordered FIFO without waiting for
-    worker acknowledgement.
-
-    A FULL result is recoverable backpressure: the caller keeps this exact
-    candidate and retries from its main loop cadence.
-    """
-    frame = np.zeros(1, dtype=COUPLED_COMMAND_DTYPE)
-    if not 0 < candidate.expires_monotonic_ns < 2**64:
-        raise ValueError("command deadline must be positive uint64 monotonic nanoseconds")
-    frame["expires_monotonic_ns"][0] = candidate.expires_monotonic_ns
-    frame["run_generation"][0] = candidate.run_generation
-    frame["is_hold"][0] = int(candidate.is_hold)
-    if candidate.arm_qpos is not None:
-        frame["arm_present"][0] = 1
-        frame["arm_qpos"][0] = candidate.arm_qpos
-    if candidate.hand_qpos is not None:
-        frame["hand_present"][0] = 1
-        frame["hand_qpos"][0] = candidate.hand_qpos
+    """Publish one checked target, never overwriting unaccounted physical evidence."""
     with shared.motion_lock:
-        if bool(shared.estop_request.value):
-            return PublishResult(False, reason=PUBLISH_REASON_ESTOP)
-        if bool(shared.error_state.value):
-            return PublishResult(False, reason=PUBLISH_REASON_FAULT)
-        if not bool(shared.is_running.value):
-            return PublishResult(False, reason=PUBLISH_REASON_RUNTIME_STOPPED)
-        state = SafetyState(int(shared.safety_state.value))
-        if state not in (SafetyState.ARMED, SafetyState.RUNNING):
-            return PublishResult(False, reason=f"{PUBLISH_REASON_SAFETY_STATE}: {state.name}")
-        if state is not required_safety_state:
-            return PublishResult(False, reason=(
-                f"{PUBLISH_REASON_SAFETY_STATE}: expected {required_safety_state.name}, "
-                f"got {state.name}"))
-        if int(shared.run_generation.value) != candidate.run_generation:
-            return PublishResult(False, reason=PUBLISH_REASON_GENERATION)
-        if _expire_command_locked(shared, candidate.run_generation, candidate.expires_monotonic_ns):
-            return PublishResult(False, reason=PUBLISH_REASON_EXPIRED)
-        has_capacity, backlog, any_attached = command_stream_capacity_locked(shared)
-        if not has_capacity:
-            result = PublishResult(False, reason=(
-                PUBLISH_REASON_FIFO_FULL if any_attached else PUBLISH_REASON_NO_CONSUMER
-            ), fifo_depth=backlog)
-        else:
-            sequence = int(shared.coupled_cmd_ring.write(frame))
-            result = PublishResult(True, command=CommittedCommand(
-                run_generation=candidate.run_generation,
-                sequence=sequence,
-                published_monotonic_ns=time.monotonic_ns(),
-            ))
-    # Logging must not hold the motion lock and delay an operator's stop fence.
-    if result.reason == PUBLISH_REASON_FIFO_FULL:
-        _warn_full("command FIFO full depth=%d; retaining target", result.fifo_depth)
-    return result
-
-
-def wait_command_accepted(
-    shared: Any,
-    *,
-    command: CommittedCommand,
-    wait_for_arm: bool,
-    wait_for_hand: bool,
-    timeout_s: float,
-    arm_feedback_max_age_s: float,
-    hand_feedback_max_age_s: float,
-    check_is_running: bool = True,
-    abort_requested: Callable[[], bool] | None = None,
-    heartbeat: Callable[[], None] | None = None,
-) -> AcceptanceResult:
-    """Block until the requested workers report SDK acceptance of one command.
-
-    Acceptance is judged by ordered consumption inside the command's own run
-    generation: a worker only advances its
-    acceptance watermark after SDK-accepting every targeted record in commit
-    order, so a same-generation watermark at or beyond this command's FIFO
-    sequence proves ordered acceptance of this command. A stale-generation
-    ACK can never satisfy the
-    wait. Explicit waits are for home/replay/calibration boundaries only;
-    ordinary streaming never blocks here.
-    """
-    if not wait_for_arm and not wait_for_hand:
-        raise ValueError("acceptance wait requires at least one worker")
-    if not np.isfinite(timeout_s) or timeout_s <= 0.0:
-        raise ValueError("acceptance timeout must be finite and positive")
-    if command.sequence <= 0:
-        raise ValueError("acceptance requires a published command sequence")
-    generation = int(command.run_generation)
-    sequence = int(command.sequence)
-    deadline_s = time.monotonic() + timeout_s
-    while time.monotonic() < deadline_s:
-        if abort_requested is not None and abort_requested():
-            cancel_coupled_command_if_current(shared, command=command)
-            return AcceptanceResult(False, "acceptance aborted")
-        reason = motion_rejection_reason(shared, check_is_running=check_is_running)
+        reason = command_publishability_reason(shared, candidate,
+                                               required_safety_state=required_safety_state)
         if reason:
-            cancel_coupled_command_if_current(shared, command=command)
-            return AcceptanceResult(False, reason)
+            return PublishResult(False, reason=reason)
+        if not command_admission_ready(shared):
+            return PublishResult(False, reason=PUBLISH_REASON_PENDING)
+        if candidate.arm_qpos is None and candidate.hand_qpos is None:
+            raise ValueError("command requires an actuator")
+        for name, shape in (("arm", ARM_JOINT_SHAPE), ("hand", HAND_JOINT_SHAPE)):
+            target = getattr(candidate, f"{name}_qpos")
+            if target is not None and (target.shape != shape or not np.isfinite(target).all()):
+                raise ValueError(f"invalid {name} command target")
+            if target is not None and not shared.is_ready(name):
+                return PublishResult(False, reason=f"{name} worker unavailable")
+        command_id = int(shared.next_command_id.value)
+        if not 0 < command_id < 2**64 - 1:
+            raise OverflowError("command ID lifetime exhausted")
+        shared.next_command_id.value = command_id + 1
+        command = RobotCommand(run_id=candidate.run_id, command_id=command_id,
+            issued_monotonic_ns=time.monotonic_ns(), arm_qpos=candidate.arm_qpos,
+            hand_qpos=candidate.hand_qpos)
+        frame = np.zeros(1, dtype=ROBOT_COMMAND_DTYPE)
+        frame["command_id"] = command.command_id
+        frame["run_id"] = command.run_id
+        frame["issued_monotonic_ns"] = command.issued_monotonic_ns
+        for name in ("arm", "hand"):
+            target = getattr(command, f"{name}_qpos")
+            frame[f"{name}_present"] = target is not None
+            if target is not None:
+                frame[f"{name}_qpos"] = target
+        shared.robot_command_ring.write(frame)
+        if account_recording:
+            shared.pending_record_command_id.value = command.command_id
+            shared.pending_record_revoked_ns.value = 0
+        return PublishResult(True, command)
+
+
+def wait_command_adopted(
+    shared: Any, *, command: RobotCommand, wait_for_arm: bool, wait_for_hand: bool,
+    timeout_s: float, arm_feedback_max_age_s: float, hand_feedback_max_age_s: float,
+    check_is_running: bool = True, abort_requested: Callable[[], bool] | None = None,
+    heartbeat: Callable[[], None] | None = None, hand_reached: bool = False,
+) -> AcceptanceResult:
+    """Wait for exact SDK adoption, or explicitly for the hand's exact endpoint.
+
+    Endpoint acceptance is not measured convergence. Dedicated arm home keeps
+    its separate settled-state and mode-restoration witnesses.
+    """
+    if not (wait_for_arm or wait_for_hand) or command.command_id <= 0:
+        raise ValueError("wait requires a published command and an actuator")
+    if not np.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError("wait timeout must be finite and positive")
+    deadline = time.monotonic() + timeout_s
+    reason = "command adoption timeout"
+    while time.monotonic() < deadline:
+        if abort_requested is not None and abort_requested():
+            reason = "command wait aborted"
+            break
+        reason = motion_rejection_reason(shared, check_is_running=check_is_running)
+        if reason or not coupled_command_is_current(shared, command=command):
+            reason = reason or "command run revoked"
+            break
         if heartbeat is not None:
             heartbeat()
-
-        arm_accepted = not wait_for_arm
-        if wait_for_arm:
-            arm_feedback, reason, _ = _read_arm_feedback(
-                shared, max_age_s=arm_feedback_max_age_s
-            )
-            if arm_feedback is None:
-                cancel_coupled_command_if_current(shared, command=command)
-                return AcceptanceResult(False, reason)
-            arm_accepted = arm_feedback.accepted_generation == generation and (
-                arm_feedback.accepted_sequence >= sequence
-            )
-            if arm_accepted and arm_feedback.accepted_monotonic_ns <= 0:
-                cancel_coupled_command_if_current(shared, command=command)
-                return AcceptanceResult(False, "arm acceptance timestamp is missing")
-
-        hand_accepted = not wait_for_hand
-        if wait_for_hand:
-            hand_feedback, reason, _ = read_hand_feedback(
-                shared, max_age_s=hand_feedback_max_age_s
-            )
-            if hand_feedback is None:
-                cancel_coupled_command_if_current(shared, command=command)
-                return AcceptanceResult(False, reason)
-            hand_accepted = hand_feedback.accepted_generation == generation and (
-                hand_feedback.accepted_sequence >= sequence
-            )
-            if hand_accepted and hand_feedback.accepted_monotonic_ns <= 0:
-                cancel_coupled_command_if_current(shared, command=command)
-                return AcceptanceResult(False, "hand acceptance timestamp is missing")
-
-        # A matching old SDK return remains historical acceptance, never a
-        # successful wait after that operation lost its motion generation.
-        if not coupled_command_is_current(shared, command=command):
-            return AcceptanceResult(
-                False, "command generation was revoked before acceptance"
-            )
-        if arm_accepted and hand_accepted:
-            return AcceptanceResult(True)
+        adopted = read_command_adoption(shared, command)
+        hand_done = adopted.hand_adopted
+        if hand_reached and wait_for_hand:
+            result = shared.hand_state_ring.read_latest()
+            hand_done = bool(result is not None and
+                int(result[0]["last_reached_run_id"][0]) == command.run_id and
+                int(result[0]["last_reached_command_id"][0]) == command.command_id and
+                int(result[0]["last_reached_monotonic_ns"][0]) > 0)
+        healthy = True
+        for name, needed, max_age in (("arm", wait_for_arm, arm_feedback_max_age_s),
+                                      ("hand", wait_for_hand, hand_feedback_max_age_s)):
+            if needed:
+                reader = _read_arm_feedback if name == "arm" else read_hand_feedback
+                feedback, failure, _ = reader(shared, max_age_s=max_age)
+                if feedback is None:
+                    reason, healthy = failure, False
+                    break
+        if not healthy:
+            break
+        if (not wait_for_arm or adopted.arm_adopted) and (not wait_for_hand or hand_done):
+            # A revocation racing the reads wins over a blocking operation's success.
+            if coupled_command_is_current(shared, command=command):
+                return AcceptanceResult(True)
+            break
         time.sleep(0.005)
-
     cancel_coupled_command_if_current(shared, command=command)
-    return AcceptanceResult(False, f"command was not accepted within {timeout_s:.3f}s")
+    return AcceptanceResult(False, reason or "command adoption timeout")

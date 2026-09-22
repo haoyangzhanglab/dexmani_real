@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Physically replay one raw-v30 episode on xArm7 and XHand.
+"""Physically replay one raw-v31 episode on xArm7 and XHand.
 
 This is a hardware-affecting entry point and writes replay evaluation results.
 """

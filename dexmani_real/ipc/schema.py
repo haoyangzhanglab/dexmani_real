@@ -40,8 +40,6 @@ def make_pointcloud_frame_dtype(num_points: int) -> np.dtype:
         [
             ("source_camera_sequence", "<u8"),
             ("source_monotonic_ns", "<u8"),
-            ("camera_publish_monotonic_ns", "<u8"),
-            ("publish_monotonic_ns", "<u8"),
             ("camera_generation", "<u8"),
             ("depth_frame_number", "<u8"),
             ("color_frame_number", "<u8"),
@@ -74,26 +72,24 @@ def validate_point_cloud_array(
     return array
 
 
-# Every servo publication is one coherent arm/hand record committed once to the
-# bounded ordered command FIFO. Consumers read records by sequence in commit
-# order and workers execute only while the record's run_generation still owns
-# motion and its immutable deadline has not expired. There is no latest-wins supersession. The
-# queue sequence is assigned only by a successful commit.
-_COMMON_COMMAND_FIELDS = [
-    ("run_generation", "<u8"),
-    ("is_hold", "<u1"),
+# One current-run single-inflight command; ring sequence is not command identity.
+ROBOT_COMMAND_DTYPE = np.dtype([
+    ("command_id", "<u8"), ("run_id", "<u8"),
+    ("issued_monotonic_ns", "<u8"),
+    ("arm_present", "u1"), ("hand_present", "u1"),
+    ("arm_qpos", "<f8", ARM_JOINT_SHAPE),
+    ("hand_qpos", "<f8", HAND_JOINT_SHAPE),
+], align=True)
+
+# Raw v31 command truth. Zero timestamps never stand in for an inferred adoption.
+RECORD_COMMAND_FIELDS = [
+    ("command_id", "<u8"), ("command_run_id", "<u8"),
+    ("command_issued_monotonic_ns", "<u8"),
+    ("command_arm_present", "?"), ("command_hand_present", "?"),
+    ("arm_command_adopted", "?"), ("hand_command_adopted", "?"),
+    ("arm_command_adopted_monotonic_ns", "<u8"),
+    ("hand_command_adopted_monotonic_ns", "<u8"),
 ]
-COUPLED_COMMAND_DTYPE = np.dtype(
-    _COMMON_COMMAND_FIELDS
-    + [
-        ("expires_monotonic_ns", "<u8"),
-        ("arm_present", "<u1"),
-        ("hand_present", "<u1"),
-        ("arm_qpos", "<f8", ARM_JOINT_SHAPE),
-        ("hand_qpos", "<f8", HAND_JOINT_SHAPE),
-    ],
-    align=True,
-)
 
 ARM_STATE_DTYPE = np.dtype(
     [
@@ -106,13 +102,10 @@ ARM_STATE_DTYPE = np.dtype(
         ("connected", "<u1"),
         ("tracking_err", "<f8"),
         # Monotonic time immediately after the arm SDK accepted the command.
-        ("last_cmd_accepted_monotonic_ns", "<u8"),
-        # Generation and FIFO sequence of the SDK-accepted command, so waiters
-        # distinguish a stale-generation ACK from ordered acceptance in the
-        # current epoch. Pure IPC identity; never persisted to raw.
-        ("last_cmd_generation", "<u8"),
-        ("last_cmd_accepted_sequence", "<u8"),
-        ("last_cmd_is_hold", "<u1"),
+        ("last_adopted_monotonic_ns", "<u8"),
+        # Exact command identity, also used for raw adoption accounting.
+        ("last_adopted_run_id", "<u8"),
+        ("last_adopted_command_id", "<u8"),
         ("source_monotonic_ns", "<u8"),
         # Load-bearing for causal consumer selection (ipc/causal.py,
         # deployment observation history, recording sample alignment).
@@ -136,15 +129,15 @@ HAND_STATE_DTYPE = np.dtype(
         ("connected", "<u1"),
         # Set when qpos is held from the last read after a single-frame failure.
         ("qpos_stale", "<u1"),
-        # Monotonic time after XHand accepted the exact requested target,
-        # including a configured-current overrun accepted as grasp contact.
-        # This is SDK acceptance, not physical convergence.
-        ("accepted_target_monotonic_ns", "<u8"),
-        # Generation and FIFO sequence of the exact-endpoint acceptance, so
-        # waiters reject stale-generation ACKs and use ordered acceptance in
-        # the current epoch. Pure IPC identity; never persisted to raw.
-        ("accepted_target_generation", "<u8"),
-        ("accepted_target_sequence", "<u8"),
+        # Adoption follows the first accepted bounded setpoint; reached follows
+        # acceptance of the exact endpoint. Neither proves physical convergence.
+        ("last_adopted_run_id", "<u8"),
+        ("last_adopted_command_id", "<u8"),
+        ("last_adopted_monotonic_ns", "<u8"),
+        ("last_reached_monotonic_ns", "<u8"),
+        # Exact endpoint identity for operations that require target reach.
+        ("last_reached_run_id", "<u8"),
+        ("last_reached_command_id", "<u8"),
         # Monotonic time after the most recent accepted SDK setpoint, including
         # intermediate slew setpoints that have not reached the exact target.
         ("last_sdk_setpoint_accepted_monotonic_ns", "<u8"),
@@ -222,7 +215,7 @@ def make_record_sample_dtype(
             ("action_arm_joint_sent", "<f8", ARM_JOINT_SHAPE),
             ("action_hand_joint", "<f8", HAND_JOINT_SHAPE),
             ("action_arm_ee", "<f8", (9,)),
-            ("flag_action_queued", "<u1"),
+            *RECORD_COMMAND_FIELDS,
             ("flag_frame_status", "<u1"),
             ("observation_anchor_monotonic_ns", "<u8"),
             ("observation_valid", "<u1"),
@@ -258,7 +251,7 @@ def nan_array(shape: int | tuple[int, ...], dtype: type = np.float64) -> np.ndar
 __all__ = [
     "ARM_STATE_DTYPE",
     "CAMERA_FRAME_HEADER_DTYPE",
-    "COUPLED_COMMAND_DTYPE",
+    "ROBOT_COMMAND_DTYPE",
     "HAND_STATE_DTYPE",
     "POINT_CLOUD_FEATURE_DIM",
     "SUPPORTED_POINT_CLOUD_COUNTS",

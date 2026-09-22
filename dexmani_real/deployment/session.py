@@ -16,7 +16,7 @@ from dexmani_real.deployment.config import (
     PolicyRuntimeConfig,
     RolloutRecordingConfig,
     validate_max_running_s,
-    validate_num_trials,
+    validate_num_episodes,
     validate_policy_runtime_compatibility,
 )
 from dexmani_real.deployment.runner import policy_runner_loop
@@ -102,24 +102,6 @@ def _report_session_end(shared, report, *, recording_enabled: bool, normal_exit:
     return clean_exit
 
 
-def _service_process_names(
-    policy_spec: Any, recording_config: RolloutRecordingConfig | None
-) -> set[str]:
-    """Optional evidence processes: failure affects the result, not the run plan.
-
-    Recorder is a service whenever recording is requested; camera is a service
-    only when it was started solely for recording evidence (i.e. the policy
-    observation contract itself does not require it). Pointcloud is never a
-    service: it is always part of the policy observation contract.
-    """
-    names: set[str] = set()
-    if recording_config is not None:
-        names.add("recorder")
-        if not _requires_camera(policy_spec):
-            names.add("camera")
-    return names
-
-
 def _requires_hand_sensor(policy_spec: Any) -> bool:
     # eef_pose derives from arm qpos only and never triggers the hand sensor.
     requested = set(_observation_field_names(policy_spec))
@@ -139,18 +121,18 @@ def _rollout_recorder_config(
     rollout: RolloutRecordingConfig,
     worker_config: PolicyRuntimeConfig,
     max_running_s: float,
-    num_trials: int,
+    num_episodes: int,
 ) -> RecorderIOConfig:
     """Build the recorder capacity contract for one recorded rollout session.
 
-    The frame capacity is DERIVED from the run-owner trial budget; recording
+    The frame capacity is DERIVED from the run-owner episode budget; recording
     does not own or re-validate the run plan. The recorder-owned
     ``provenance_*`` attributes carry the resolved experimental conditions
     (pinned artifact, effective inference steps, seed, budget) so each
     published raw episode is self-describing without any git or checksum
     provenance.
     """
-    control_hz = float(runtime.policy.control_hz)
+    control_hz = 1.0 / float(worker_config.spec.control_dt_s)
     max_frames = (
         math.ceil(float(max_running_s) * control_hz)
         + _ROLLOUT_RECORDER_FRAME_MARGIN
@@ -169,7 +151,7 @@ def _rollout_recorder_config(
             "n_action_steps": str(worker_config.spec.n_action_steps),
             "seed": str(worker_config.seed),
             "max_running_s": f"{float(max_running_s):.17g}",
-            "num_trials": str(int(num_trials)),
+            "num_episodes": str(int(num_episodes)),
         },
     )
 
@@ -284,7 +266,7 @@ def _build_policy_processes(
     *,
     execute: bool,
     max_running_s: float | None = None,
-    num_trials: int = 1,
+    num_episodes: int = 1,
     recording_config: RolloutRecordingConfig | None = None,
 ) -> list[Any]:
     """Construct the concrete processes; the caller starts and joins them."""
@@ -315,7 +297,7 @@ def _build_policy_processes(
             context.Process(name="camera", target=camera_loop, args=(
                     shared,
                     CameraLoopConfig.from_runtime(runtime),
-                    _requires_camera(policy_spec),
+                    False,
                 ))
         )
     if pointcloud_requested:
@@ -335,7 +317,7 @@ def _build_policy_processes(
                         recording_config,
                         worker_config,
                         max_running_s,
-                        num_trials,
+                        num_episodes,
                     ),
                 ))
         )
@@ -346,7 +328,7 @@ def _build_policy_processes(
                 worker_config,
                 execute,
                 max_running_s,
-                num_trials,
+                num_episodes,
                 recording_config,
                 fingertip_config,
             ))
@@ -370,19 +352,18 @@ def run_policy_deployment(
     *,
     prefix: str | None = None,
     max_running_s: float | None = None,
-    num_trials: int = 1,
+    num_episodes: int = 1,
     recording_config: RolloutRecordingConfig | None = None,
 ) -> int:
-    """Run a persistent multi-trial policy deployment lifecycle and return its exit code.
+    """Run a persistent multi-episode policy deployment lifecycle and return its exit code.
 
     ``execute=False`` validates candidates without publication;
     ``execute=True`` enables coupled arm/hand publication. The policy runner
     must load and warm up before any hardware process is started. The runtime
     follows ``DISARMED -> hardware readiness -> ARMED -> supervision ->
-    verified shutdown``. Trials and the per-trial budget are run-owner
-    configuration; recording is evidence and never gates the run plan.
+    verified shutdown``. Episodes and the per-episode budget are run-owner
+    configuration; required recording must be available before motion.
     """
-    _ = runtime.safety.dispatch_delay_ns  # This entry starts hardware even without publication.
     if not isinstance(runtime, ExperimentConfig):
         raise TypeError("runtime must be an ExperimentConfig")
     if not isinstance(execute, bool):
@@ -398,7 +379,7 @@ def run_policy_deployment(
     if worker_config.spec is not policy_spec:
         raise ValueError("worker PolicySpec must be the validated lifecycle PolicySpec")
     max_running_s = validate_max_running_s(max_running_s)
-    num_trials = validate_num_trials(num_trials)
+    num_episodes = validate_num_episodes(num_episodes)
     if recording_config is not None and max_running_s is None:
         raise ValueError(
             "recorded rollout requires an explicit max_running_s run budget"
@@ -414,7 +395,7 @@ def run_policy_deployment(
     ctx = mp.get_context("spawn")
     pointcloud_requested = _requires_pointcloud(policy_spec)
     camera_requested = _requires_camera(policy_spec) or recording_config is not None
-    service_process_names = _service_process_names(policy_spec, recording_config)
+    service_process_names = {"policy", "camera", "pointcloud", "recorder"}
     channel_config = RuntimeChannelsConfig.from_runtime(
         runtime,
         pointcloud_num_points=(
@@ -456,7 +437,7 @@ def run_policy_deployment(
             worker_config,
             execute=execute,
             max_running_s=max_running_s,
-            num_trials=num_trials,
+            num_episodes=num_episodes,
             recording_config=recording_config,
         )
         require_transition(shared, SafetyState.DISARMED)
@@ -478,12 +459,13 @@ def run_policy_deployment(
             timeouts,
             monitored_processes=started_procs,
         ):
-            shared.error_state.value = True
-            require_transition(shared, SafetyState.FAULT)
+            shared.session_failed.value = True
+            require_transition(shared, SafetyState.DISARMED)
             shutdown_report = shutdown_processes(
                 shared,
                 started_procs,
                 graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
+                service_process_names=service_process_names,
             )
             return 1
         print("  policy: ready", flush=True)
@@ -521,8 +503,15 @@ def run_policy_deployment(
             timeouts,
             monitored_processes=started_procs,
         ):
-            shared.error_state.value = True
-            require_transition(shared, SafetyState.FAULT)
+            physical_failure = bool(
+                shared.error_state.value or shared.estop_request.value
+                or any(not process.is_alive() for process in critical_workers)
+                or policy_process.is_alive()  # otherwise an actuator readiness timeout
+            )
+            shared.session_failed.value = True
+            if physical_failure:
+                shared.error_state.value = True
+            require_transition(shared, SafetyState.FAULT if physical_failure else SafetyState.DISARMED)
             shutdown_report = shutdown_processes(
                 shared,
                 started_procs,
@@ -545,7 +534,10 @@ def run_policy_deployment(
             flush=True,
         )
         if not evidence_ready:
-            print("  Evidence unavailable; trials can run without recording", flush=True)
+            shared.session_failed.value = True
+            shared.quit_requested.value = True
+            logger.error("required evaluation recording/sensors unavailable")
+            return 1
         home_planner = build_policy_home_planner(runtime) if execute else None
         home_status = "return hand + arm home before B" if home_planner else "disabled"
         print(
@@ -585,6 +577,7 @@ def run_policy_deployment(
             supervisor_hz=float(runtime.safety.supervisor_hz),
             service_process_names=service_process_names,
             max_running_s=max_running_s,
+            workflow="policy_eval",
         )
 
         # Keep the independent listener alive until file cleanup is bounded.
@@ -603,7 +596,6 @@ def run_policy_deployment(
         if operator_stop is not None:
             operator_stop.set()
         if operator_thread is not None:
-            shared.is_running.value = False
             operator_thread.join(timeout=float(runtime.safety.shutdown_timeout_s))
             if operator_thread.is_alive():
                 raise RuntimeError(
@@ -627,8 +619,11 @@ def run_policy_deployment(
 
     except Exception:
         logger.error("policy deployment failed", exc_info=True)
-        shared.error_state.value = True
-        require_transition(shared, SafetyState.FAULT)
+        shared.session_failed.value = True
+        if shared.error_state.value or shared.estop_request.value:
+            require_transition(shared, SafetyState.FAULT)
+        else:
+            require_transition(shared, SafetyState.ARMED)
         return 1
     finally:
         try:
@@ -759,6 +754,7 @@ def run_operator_control(
                         continue
                     if (
                         discard_begin_in_batch
+                        or shared.session_failed.value
                         or not request_policy_start(
                             shared,
                             require_physical_home=planner is not None,
@@ -793,6 +789,8 @@ def run_operator_control(
                         continue
                     with shared.motion_lock:
                         home_allowed = (not shared.quit_requested.value and
+                            not shared.session_failed.value and
+                            not shared.pending_record_command_id.value and
                             int(shared.safety_state.value) == int(SafetyState.ARMED))
                         shared.physical_home_completed.value = False
                         if home_allowed:
@@ -811,6 +809,7 @@ def run_operator_control(
                             stop_event.is_set()
                             or not shared.is_running.value
                             or shared.quit_requested.value
+                            or shared.session_failed.value
                             or shared.error_state.value
                             or shared.estop_request.value
                             or int(shared.stop_request.value) != int(StopRequest.NONE)
@@ -819,10 +818,11 @@ def run_operator_control(
                     with shared.motion_lock:
                         authorized = bool(
                             completed
-                            and int(shared.arm_home_completed_generation.value)
-                            == int(shared.run_generation.value)
+                            and int(shared.arm_home_completed_run_id.value)
+                            == int(shared.run_id.value)
                             and shared.is_running.value
                             and not shared.quit_requested.value
+                            and not shared.session_failed.value
                             and not shared.error_state.value
                             and not shared.estop_request.value
                             and int(shared.stop_request.value) == int(StopRequest.NONE)

@@ -67,7 +67,9 @@ _KNOWN_CATEGORIES: dict[str, set[str]] = {
     "camera": {"rgb", "depth"},
     "flags": {
         "flag_frame_status",
-        "flag_action_queued",
+        "command_id",
+        "arm_command_adopted",
+        "hand_command_adopted",
         "flag_camera_fresh",
         "camera_depth_frame_number",
         "camera_color_frame_number",
@@ -175,7 +177,7 @@ def print_episode_info(h5_path: str) -> None:
             )
         status = f["flag_frame_status"][:]
         print(f"frame OK rate: {np.mean(status == 0):.2%}")
-        print(f"action queued rate: {f['flag_action_queued'][:].mean():.2%}")
+        print(f"represented command IDs: {np.unique(f['command_id'][:]).size}")
         if "flag_camera_fresh" in f:
             fresh = f["flag_camera_fresh"][:]
             print(f"flag_camera_fresh rate: {fresh.mean():.2%}")

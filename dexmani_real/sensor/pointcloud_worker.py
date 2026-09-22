@@ -250,15 +250,10 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
                 label="build_point_cloud output",
             )
 
-            publish_ns = time.monotonic_ns()
             record = np.zeros(1, dtype=expected_dtype)
             camera_header = header[0]
             record["source_camera_sequence"][0] = np.uint64(camera_sequence)
             record["source_monotonic_ns"][0] = camera_header["source_monotonic_ns"]
-            record["camera_publish_monotonic_ns"][0] = camera_header[
-                "publish_monotonic_ns"
-            ]
-            record["publish_monotonic_ns"][0] = np.uint64(publish_ns)
             record["camera_generation"][0] = camera_header["camera_generation"]
             record["depth_frame_number"][0] = camera_header["depth_frame_number"]
             record["color_frame_number"][0] = camera_header["color_frame_number"]

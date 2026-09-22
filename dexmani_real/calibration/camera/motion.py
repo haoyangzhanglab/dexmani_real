@@ -22,7 +22,7 @@ from dexmani_real.robot.projection import (
     ARM_COMMAND_JUMP_REJECTION,
     validate_arm_command,
 )
-from dexmani_real.robot.commands import (PUBLISH_REASON_FIFO_FULL, PublishResult, prepare_joint_command, publish_command, wait_command_accepted)
+from dexmani_real.robot.commands import (prepare_joint_command, publish_command, wait_command_adopted)
 from dexmani_real.robot.commands import SafetyGate
 from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
 from dexmani_real.planning import Pose, XArm7MotionPlanner
@@ -38,37 +38,6 @@ logger = get_logger(__name__)
 _INITIAL_STATE_POLL_S = 0.05
 _IK_WARNING_INTERVAL_S = 1.0
 _BOUNDARY_WARN_INTERVAL_S = 2.0
-_FULL_RETRY_POLL_S = 0.01
-
-
-def _publish_with_backpressure(
-    shared: RuntimeChannels,
-    candidate: Any,
-    *,
-    required_state: SafetyState,
-    deadline_s: float,
-    abort_requested: Any = None,
-) -> PublishResult:
-    """Commit the identical candidate, retrying while the command FIFO is FULL.
-
-    Bounded by the enclosing calibration operation's deadline; the candidate
-    is never rebuilt or replaced here.
-    """
-    result = publish_command(
-        shared, candidate, required_safety_state=required_state
-    )
-    while (
-        not result.published
-        and result.reason == PUBLISH_REASON_FIFO_FULL
-        and time.monotonic() < deadline_s
-    ):
-        if abort_requested is not None and abort_requested():
-            break
-        time.sleep(_FULL_RETRY_POLL_S)
-        result = publish_command(
-            shared, candidate, required_safety_state=required_state
-        )
-    return result
 
 
 def read_initial_arm(
@@ -175,7 +144,7 @@ def publish_calibration_quit_hold(
     *,
     calibration_saved: bool,
 ) -> int:
-    """Invalidate queued motion, publish measured hold, and return exit status."""
+    """Revoke the current command, publish measured hold, and return exit status."""
     if not revoke_motion(shared, SafetyState.ARMED):
         set_calibration_fault(shared, "failed to establish calibration quit boundary")
         return 1
@@ -183,18 +152,15 @@ def publish_calibration_quit_hold(
         shared,
         current_qpos,
         gate=safety_gate,
-        expires_monotonic_ns=time.monotonic_ns() + runtime.safety.dispatch_delay_ns,
-        is_hold=True,
         arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
     )
     candidate = prepared.candidate
     published = (
-        _publish_with_backpressure(
+        publish_command(
             shared,
             candidate,
-            required_state=SafetyState.ARMED,
-            deadline_s=time.monotonic() + float(runtime.policy.action_apply_timeout_s),
+            required_safety_state=SafetyState.ARMED,
         )
         if candidate is not None
         else None
@@ -206,7 +172,7 @@ def publish_calibration_quit_hold(
         and published.published
         and published.command is not None
     ):
-        accepted = wait_command_accepted(
+        accepted = wait_command_adopted(
             shared,
             command=published.command,
             wait_for_arm=True,
@@ -373,7 +339,6 @@ def run_calibration_motion_tick(
             set_calibration_fault(shared, "failed to enter calibration motion")
             return
 
-    expires_ns = time.monotonic_ns() + runtime.safety.dispatch_delay_ns
     measured_pose = planner.kin.compute_eef_pose_world(state.current_qpos)
     anchor_pose = planner.kin.compute_eef_pose_world(state.previous_command)
     workspace_margin_m = float(runtime.keyboard_teleop.workspace_command_margin_m)
@@ -436,7 +401,6 @@ def run_calibration_motion_tick(
         shared,
         q_cmd,
         gate=safety_gate,
-        expires_monotonic_ns=expires_ns,
         arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
         hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
     )
@@ -445,12 +409,10 @@ def run_calibration_motion_tick(
         return
     candidate = prepared.candidate
     published = (
-        _publish_with_backpressure(
+        publish_command(
             shared,
             candidate,
-            required_state=SafetyState.RUNNING,
-            deadline_s=time.monotonic() + float(runtime.policy.action_apply_timeout_s),
-            abort_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
+            required_safety_state=SafetyState.RUNNING,
         )
         if candidate is not None
         else None
@@ -462,7 +424,7 @@ def run_calibration_motion_tick(
         and published.published
         and published.command is not None
     ):
-        accepted = wait_command_accepted(
+        accepted = wait_command_adopted(
             shared,
             command=published.command,
             wait_for_arm=True,

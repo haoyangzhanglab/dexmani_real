@@ -10,6 +10,11 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.recording.frame import EpisodeFrame
+from dexmani_real.robot.commands import RobotCommand, read_command_adoption, CommandAdoption
+from dexmani_real.runtime.safety import invalidate_coupled_commands
+from dexmani_real.recording.storage.schema import (
+    FRAME_PARTIAL_ADOPTION, FRAME_ADOPTION_UNKNOWN, validate_command_row,
+)
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -32,6 +37,7 @@ class StopRecording:
     reason: str
     through_sequence: int
     retain_partial: bool = False
+    technical_status: str = "valid"
     deadline_monotonic_ns: int = field(default_factory=lambda: time.monotonic_ns() + int(RECORDER_STOP_TIMEOUT_S * 1e9))
 
 
@@ -43,20 +49,10 @@ class RecordingStarted:
 
 
 @dataclass
-class RecordingFinished:
-    saved: bool
-    path: str | None
-    frame_count: int
-    reason: str
-    error: str | None = None
-    min_frames_met: bool = False
+class RecordingResult:
+    """One recorder outcome shared by the queue and its sole consumer."""
 
-
-@dataclass
-class RecorderStopResult:
-    """Local result, consumed once by the controller."""
-
-    done: bool
+    done: bool = True
     saved: bool = False
     error: str | None = None
     path: str | None = None
@@ -70,6 +66,12 @@ class RecorderClient:
 
     def __init__(self, shared: Any) -> None:
         self.shared = shared
+        self.adoption_timeout_s = float(shared.adoption_accounting_timeout_s)
+        self.pending_command: tuple[RobotCommand, EpisodeFrame] | None = None
+        self._known_adoption = CommandAdoption()
+        self.last_command_fields: dict[str, int | bool] = {}
+        self.last_command_action: dict[str, Any] = {}
+        self.technical_status = "valid"
         self._finish_deadline_ns = 0
         self._frame_count = 0
         self._recording = False
@@ -78,7 +80,7 @@ class RecorderClient:
         self._max_frames = 0
         self._max_frames_stop_reason = "max_frames"
         self._stop_reason = ""
-        self._last_stop_result: RecorderStopResult | None = None
+        self._last_stop_result: RecordingResult | None = None
         # A terminal verdict is delivered to its sole consumer exactly once.
         self._terminal_result_delivered = False
         self.episode_path: str | None = None
@@ -124,7 +126,7 @@ class RecorderClient:
         self._unavailable = True
         self.shared.recorder_transport_failed.value = True
         self._recording = False
-        self._last_stop_result = RecorderStopResult(
+        self._last_stop_result = RecordingResult(
             done=False,
             error=error,
             reason=self._stop_reason,
@@ -162,6 +164,9 @@ class RecorderClient:
             or not self.shared.is_ready("recorder")
         ):
             return False
+        self.technical_status = "valid"
+        self.last_command_fields = {}
+        self.last_command_action = {}
         self.episode_path = None
         self._last_stop_result = None
         self._stop_reason = ""
@@ -194,7 +199,7 @@ class RecorderClient:
                 self._frame_count = 0
                 self._recording = True
                 return True
-            if isinstance(result, RecordingFinished):
+            if isinstance(result, RecordingResult):
                 self._finish(result)
                 return False
             self._fail_transport("unexpected start result")
@@ -205,9 +210,95 @@ class RecorderClient:
         )
         return False
 
+    def stage_command(self, command: RobotCommand, sample: EpisodeFrame) -> None:
+        if self.pending_command is not None:
+            raise RuntimeError("recording already has a pending command")
+        if int(self.shared.pending_record_command_id.value) != command.command_id:
+            raise RuntimeError("recorded publication omitted accounting barrier")
+        self.pending_command = (command, sample)
+        self._known_adoption = CommandAdoption()
+
+    def resolve_command(self, *, finish: bool = False) -> bool:
+        """Resolve one owned sample before new commands or recorder STOP.
+
+        Boundary waits are bounded; current-run polling is nonblocking. Sensor
+        failures do not erase positive adoption evidence already observed.
+        """
+        pending = self.pending_command
+        if pending is None:
+            return True
+        command, sample = pending
+        if finish:
+            with self.shared.motion_lock:
+                if int(self.shared.run_id.value) == command.run_id:
+                    invalidate_coupled_commands(self.shared)
+        while True:
+            # Order the accounting decision against a concurrent lifecycle fence.
+            with self.shared.motion_lock:
+                boundary = int(self.shared.pending_record_revoked_ns.value)
+                facts = read_command_adoption(self.shared, command, boundary_ns=boundary)
+                old = self._known_adoption
+                facts = CommandAdoption(
+                    facts.arm_adopted or old.arm_adopted,
+                    facts.hand_adopted or old.hand_adopted,
+                    facts.arm_monotonic_ns or old.arm_monotonic_ns,
+                    facts.hand_monotonic_ns or old.hand_monotonic_ns,
+                    facts.arm_known, facts.hand_known,
+                )
+                self._known_adoption = facts
+                fresh = facts.arm_known and facts.hand_known
+                expired = boundary and time.monotonic_ns() >= boundary + int(self.adoption_timeout_s * 1e9)
+                if not boundary and facts.complete(command):
+                    outcome = "joint"
+                    break
+                if boundary and fresh:
+                    outcome = ("joint" if facts.complete(command) else
+                               "partial" if facts.arm_adopted or facts.hand_adopted else "none")
+                    break
+                if expired:
+                    outcome = "unknown"
+                    break
+            if not finish:
+                return False
+            self.shared.set_heartbeat("policy", time.monotonic())
+            time.sleep(0.005)
+        if self.shared.error_state.value or self.shared.estop_request.value or self.shared.evidence_failed.value:
+            self.technical_status = "invalid"
+        self.pending_command = None
+        fields = facts.fields(command)
+        sample.data.update(fields)
+        if outcome in {"partial", "unknown"}:
+            sample.data["flag_frame_status"] = (FRAME_PARTIAL_ADOPTION if outcome == "partial"
+                                                 else FRAME_ADOPTION_UNKNOWN)
+            self.technical_status = "invalid"
+            self.shared.session_failed.value = True
+        if outcome == "joint":
+            self.last_command_fields = fields
+            self.last_command_action = {k: sample.data[k].copy() for k in
+                ("action_arm_joint_sent", "action_hand_joint", "action_arm_ee")}
+        try:
+            if outcome != "none" and not self.add_frame(sample):
+                self.technical_status = "invalid"
+                self.shared.evidence_failed.value = True
+                self.shared.session_failed.value = True
+                write_recording_failure(self.shared, "command sample submission failed")
+        except Exception:
+            self.technical_status = "invalid"
+            self.shared.evidence_failed.value = True
+            self.shared.session_failed.value = True
+            # Keep the identity marker for the parent's bounded failure sidecar.
+            raise
+        else:
+            with self.shared.motion_lock:
+                if int(self.shared.pending_record_command_id.value) == command.command_id:
+                    self.shared.pending_record_command_id.value = 0
+                    self.shared.pending_record_revoked_ns.value = 0
+        return True
+
     def add_frame(self, sample: EpisodeFrame) -> bool:
         if not self._recording or self.shared.recorder_transport_failed.value:
             return False
+        validate_command_row(sample.data)
         latest = int(self.shared.record_sample_ring.latest_sequence)
         consumed = int(self.shared.recorder_consumed_sequence.value)
         if latest - consumed >= self.shared.record_sample_ring.maxlen:
@@ -228,7 +319,7 @@ class RecorderClient:
                 frame["camera_depth"][0] = sample.camera_depth
         self.shared.record_sample_ring.write(frame)
         self._frame_count += 1
-        if self._max_frames and self._frame_count >= self._max_frames:
+        if not self._stop_requested and self._max_frames and self._frame_count >= self._max_frames:
             self.stop_episode(save=True, reason=self._max_frames_stop_reason)
         return True
 
@@ -242,34 +333,29 @@ class RecorderClient:
         """
         if not self._recording or self._stop_requested:
             return None
+        # Preserve explicit discard/save intent while appending the final row.
+        self._stop_requested = True
+        self.resolve_command(finish=True)
         # Revoke production before capturing the final committed sequence.
         self._recording = False
         self._stop_requested = True
         self._stop_reason = reason or "manual"
         through = int(self.shared.record_sample_ring.latest_sequence)
-        stop = StopRecording(save, self._stop_reason, through, retain_partial)
+        stop = StopRecording(save, self._stop_reason, through, retain_partial, self.technical_status)
         self._finish_deadline_ns = stop.deadline_monotonic_ns
         self._send_control(stop)
         return None
 
-    def _finish(self, event: RecordingFinished) -> RecorderStopResult:
+    def _finish(self, event: RecordingResult) -> RecordingResult:
         self._recording = False
         self._stop_requested = False
         self._finish_deadline_ns = 0
-        result = RecorderStopResult(
-            done=True,
-            saved=event.saved,
-            error=event.error,
-            path=event.path,
-            frame_count=event.frame_count,
-            reason=event.reason,
-            min_frames_met=event.min_frames_met,
-        )
+        result = event
         self._last_stop_result = result
         self._terminal_result_delivered = True
         return result
 
-    def poll_stop(self) -> RecorderStopResult:
+    def poll_stop(self) -> RecordingResult:
         deadline = self._finish_deadline_ns or int(self.shared.recorder_finish_deadline_ns.value)
         if (self.shared.recorder_transport_failed.value
                 or (deadline > 0 and time.monotonic_ns() >= deadline
@@ -277,7 +363,7 @@ class RecorderClient:
             if not self._unavailable:
                 self._fail_transport("recorder transport unavailable or finalization deadline expired")
             # A dead/terminated process may have corrupted a Queue lock. Never read it again.
-            return self._last_stop_result or RecorderStopResult(done=False, error="recorder unavailable")
+            return self._last_stop_result or RecordingResult(done=False, error="recorder unavailable")
         try:
             event = self.shared.record_result_q.get_nowait()
         except Empty:
@@ -287,30 +373,30 @@ class RecorderClient:
                 # repeating it would make the sole consumer re-consume the same
                 # outcome (double-counted saves, repeated result lines).
                 if self._last_stop_result.done and self._terminal_result_delivered:
-                    return RecorderStopResult(done=False, reason=self._stop_reason)
+                    return RecordingResult(done=False, reason=self._stop_reason)
                 self._terminal_result_delivered = self._last_stop_result.done
                 return self._last_stop_result
-            return RecorderStopResult(done=False, reason=self._stop_reason)
+            return RecordingResult(done=False, reason=self._stop_reason)
         except (EOFError, OSError, ValueError) as exc:
             self._fail_transport(f"result queue failed: {exc}")
             return self._last_stop_result
-        if not isinstance(event, RecordingFinished):
+        if not isinstance(event, RecordingResult) or not event.done:
             self._fail_transport("unexpected recording result")
             return self._last_stop_result
         return self._finish(event)
 
-    def join_stop(self, timeout: float | None = None) -> RecorderStopResult:
+    def join_stop(self, timeout: float | None = None) -> RecordingResult:
         if not self._stop_requested and not (
             self._recording and (self.shared.recorder_finish_deadline_ns.value
                                  or self.shared.recorder_completed_ns.value)
         ):
             if self._last_stop_result is None:
-                return RecorderStopResult(done=True)
+                return RecordingResult(done=True)
             if self._last_stop_result.done and self._terminal_result_delivered:
                 # The polling path already consumed this terminal verdict;
                 # handing it out again would let the owner re-run its
-                # completion bookkeeping for a different trial.
-                return RecorderStopResult(done=True)
+                # completion bookkeeping for a different episode.
+                return RecordingResult(done=True)
             self._terminal_result_delivered = self._last_stop_result.done
             return self._last_stop_result
         timeout_s = RECORDER_STOP_TIMEOUT_S if timeout is None else float(timeout)
@@ -334,3 +420,50 @@ class RecorderClient:
             time.sleep(_STOP_POLL_INTERVAL_S)
         self._fail_transport("recorder finalization timed out")
         return self._last_stop_result
+
+
+def write_recording_failure(shared: Any, reason: str) -> None:
+    """Parent fallback when the sole recording owner cannot finish its account.
+
+    This sidecar does not reconstruct an observation or consume recorder queues.
+    It invalidates the reserved episode even if a late RecorderIO close succeeds.
+    """
+    import json
+    from pathlib import Path
+    from dexmani_real.robot.commands import read_robot_command
+    from dexmani_real.utils.atomic_io import atomic_json_dump
+
+    raw_path = shared.record_episode_path.value
+    if not raw_path:
+        return
+    path = Path(raw_path.decode())
+    result_path = path.with_name(path.name + ".result.json")
+    previous = {}
+    if result_path.is_file():
+        try:
+            previous = json.loads(result_path.read_text())
+        except (OSError, ValueError):
+            logger.warning("could not read previous recording diagnostic", exc_info=True)
+    payload = dict(technical_status="invalid", termination_reason=reason, task_success="unknown")
+    if shared.pending_record_command_id.value:
+        command = read_robot_command(shared)
+        if command is not None and command.command_id == int(shared.pending_record_command_id.value):
+            boundary = int(shared.pending_record_revoked_ns.value)
+            facts = read_command_adoption(shared, command, boundary_ns=boundary)
+            payload.update(facts.fields(command))
+            payload["adoption_accounting"] = ("recording_incomplete" if facts.arm_known and facts.hand_known
+                                               else "ADOPTION_UNKNOWN")
+            payload["revoked_monotonic_ns"] = boundary
+            payload["arm_qpos"] = None if command.arm_qpos is None else command.arm_qpos.tolist()
+            payload["hand_qpos"] = None if command.hand_qpos is None else command.hand_qpos.tolist()
+    # A later shutdown without a pending marker must retain already-known facts.
+    if previous.get("command_id") == payload.get("command_id"):
+        for name in ("arm", "hand"):
+            if previous.get(f"{name}_command_adopted"):
+                payload[f"{name}_command_adopted"] = True
+                payload[f"{name}_command_adopted_monotonic_ns"] = previous[f"{name}_command_adopted_monotonic_ns"]
+    try:
+        atomic_json_dump(previous | payload, result_path)
+    except OSError:
+        shared.session_failed.value = True
+        logger.exception("could not persist recording failure; continuing safe shutdown")

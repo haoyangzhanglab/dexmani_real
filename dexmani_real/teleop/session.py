@@ -289,14 +289,14 @@ def _build_processes(
             max_frames=int(
                 round(
                     policy_config.runtime.policy.max_record_duration_s
-                    * policy_config.runtime.policy.control_hz
+                    * policy_config.runtime.teleop.control_hz
                 )
             ),
-            control_hz=policy_config.runtime.policy.control_hz,
+            control_hz=policy_config.runtime.teleop.control_hz,
             min_frames=int(
                 round(
                     policy_config.runtime.policy.min_record_duration_s
-                    * policy_config.runtime.policy.control_hz
+                    * policy_config.runtime.teleop.control_hz
                 )
             ),
             writer_queue_size=int(runtime.camera.writer_queue_size),
@@ -323,7 +323,6 @@ def run_teleop_experiment(
     allow_no_hand: bool = False,
 ) -> int:
     """Run one resolved teleoperation experiment lifecycle."""
-    _ = runtime.safety.dispatch_delay_ns  # Validate before device startup.
     hand_enabled = bool(runtime.policy.hand_enabled)
     recording_enabled = bool(runtime.policy.recording_enabled)
     if recording_enabled and not hand_enabled:
@@ -502,11 +501,11 @@ def run_teleop_experiment(
         require_transition(shared, SafetyState.ARMED)
 
         if not evidence_ready:
-            print("  Evidence unavailable; teleop control remains available", flush=True)
-        begin_label = "teleop+record" if recording_enabled and evidence_ready else "teleop"
+            print("  Recording unavailable; recorded B is blocked, H/Q remain available", flush=True)
+        begin_label = "teleop+record" if recording_enabled else "teleop (no recording)"
         print(
             f"\nControl subsystems ready — safety=ARMED({int(SafetyState.ARMED)})\n"
-            f"Controls: B={begin_label}  C=pause  S=stop  D=discard  H=home  Q=quit  ESC=estop\n"
+            f"Controls: B={begin_label}  C=pause/resume  S=stop  D=discard  H=home  Q=quit  ESC=estop\n"
         )
 
         # VR heartbeat advances with source events, so its freshness remains a
@@ -549,8 +548,7 @@ def run_teleop_experiment(
             and shutdown_report.shared_closed
             and not bool(shared.error_state.value)
             and not bool(shared.estop_request.value)
-            # An evidence failure never ends control, but it does make the
-            # session result non-zero at the natural end (TASKBOOK T5).
+            # Collection failure invalidates the session even after manual recovery.
             and not bool(shared.session_failed.value)
             and not bool(shared.evidence_failed.value)
             and int(shared.safety_state.value) == int(SafetyState.DISARMED)

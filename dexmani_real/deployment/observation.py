@@ -39,16 +39,12 @@ class FrameWindow:
     """Oldest-first window of frames from one ring + aligned per-frame metadata.
 
     ``values`` is the feature tensor with leading axis = number of frames ``T``
-    (arm ``[T,7]``, hand ``[T,12]``, tactile-sum ``[T,5,3]``). The metadata
-    arrays are all ``[T]`` and aligned to that same axis. ``valid_mask[i] == 0``
-    marks a padding slot whose frame must be ignored by consumers.
+    (arm ``[T,7]``, hand ``[T,12]``, tactile-sum ``[T,5,3]``). Source times
+    are aligned to that same axis; invalid records are excluded.
     """
 
     values: np.ndarray
-    source_sequence: np.ndarray
     source_monotonic_ns: np.ndarray
-    publish_monotonic_ns: np.ndarray
-    valid_mask: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -57,7 +53,7 @@ class HandFrameWindow:
 
     ``qpos``, ``tactile_aggregate``, and ``tactile_dense`` all come from the
     same selected hand record, so one policy slot is one XHand sample: the three
-    payloads share ``source_sequence``/``source_monotonic_ns`` by construction.
+    payloads share ``source_monotonic_ns`` by construction.
     The two validity bits are copied from that same record and are only consulted
     after alignment; they never drop a record before sample selection.
     """
@@ -68,10 +64,7 @@ class HandFrameWindow:
     tactile_aggregate_valid: np.ndarray  # [T] uint8
     tactile_dense_valid: np.ndarray  # [T] uint8
 
-    source_sequence: np.ndarray  # [T] uint64
     source_monotonic_ns: np.ndarray  # [T] uint64
-    publish_monotonic_ns: np.ndarray  # [T] uint64
-    valid_mask: np.ndarray  # [T] uint8
 
 
 @dataclass(frozen=True)
@@ -81,7 +74,6 @@ class PointCloudFrame:
     values: np.ndarray  # [N, 6] float32
     source_camera_sequence: int
     source_monotonic_ns: int
-    publish_monotonic_ns: int
     camera_generation: int
 
 
@@ -92,7 +84,6 @@ class RgbFrame:
     values: np.ndarray  # [H, W, 3] uint8, RGB, [0, 255]
     source_camera_sequence: int
     source_monotonic_ns: int
-    publish_monotonic_ns: int
     camera_generation: int
 
 
@@ -138,7 +129,7 @@ def _read_state_history(
     required_false_fields: tuple[str, ...] = (),
     not_before_ns: int = 0,
 ) -> FrameWindow | None:
-    """Read causal source <= payload publish <= ring commit <= anchor frames.
+    """Read causal source <= ring commit <= anchor frames.
 
     Admission is truthfulness plus causality against the ONE query anchor —
     there is no generic age gate: an old-but-causal frame is a valid history
@@ -152,10 +143,8 @@ def _read_state_history(
         return None
 
     values: list[np.ndarray] = []
-    sequences: list[int] = []
     sources: list[int] = []
-    publishes: list[int] = []
-    for data, ring_publish_ns, sequence in history:
+    for data, ring_publish_ns, _sequence in history:
         names = data.dtype.names or ()
         if any(
             field not in names or not bool(data[field][0])
@@ -168,34 +157,21 @@ def _read_state_history(
         ):
             continue
         source_ns = int(data["source_monotonic_ns"][0])
-        publish_ns = (
-            int(data["publish_monotonic_ns"][0])
-            if "publish_monotonic_ns" in names
-            and int(data["publish_monotonic_ns"][0]) > 0
-            else int(ring_publish_ns)
-        )
         if not (
-            max(1, int(not_before_ns)) <= source_ns <= publish_ns
-            <= int(ring_publish_ns) <= anchor_ns
+            max(1, int(not_before_ns)) <= source_ns <= int(ring_publish_ns) <= anchor_ns
         ):
             continue
         value = np.asarray(data[values_field][0], dtype=np.float64)
         if not np.all(np.isfinite(value)):
             continue
         values.append(value)
-        sequences.append(int(sequence))
         sources.append(source_ns)
-        publishes.append(publish_ns)
 
     if not values:
         return None
-    t = len(values)
     return FrameWindow(
         values=np.stack(values),
-        source_sequence=np.asarray(sequences, dtype=np.uint64),
         source_monotonic_ns=np.asarray(sources, dtype=np.uint64),
-        publish_monotonic_ns=np.asarray(publishes, dtype=np.uint64),
-        valid_mask=np.ones(t, dtype=np.uint8),
     )
 
 
@@ -209,7 +185,7 @@ def _read_hand_history(
     """Read one causal XHand window, copying qpos and both tactile payloads together.
 
     Admission is decided by the hand sample alone (state_valid, qpos_stale,
-    source/payload/ring-commit causality against the query anchor, finite qpos); tactile
+    source/ring-commit causality against the query anchor, finite qpos); tactile
     validity bits are copied verbatim and never drop a record. A record whose
     *valid* tactile payload is non-finite is rejected as producer corruption,
     not as invalidity. The all-valid tactile contract for contact/tactile
@@ -226,25 +202,16 @@ def _read_hand_history(
     dense_list: list[np.ndarray] = []
     aggregate_valid_list: list[int] = []
     dense_valid_list: list[int] = []
-    sequences: list[int] = []
     sources: list[int] = []
-    publishes: list[int] = []
-    for data, ring_publish_ns, sequence in history:
+    for data, ring_publish_ns, _sequence in history:
         names = data.dtype.names or ()
         if "state_valid" not in names or not bool(data["state_valid"][0]):
             continue
         if "qpos_stale" not in names or bool(data["qpos_stale"][0]):
             continue
         source_ns = int(data["source_monotonic_ns"][0])
-        publish_ns = (
-            int(data["publish_monotonic_ns"][0])
-            if "publish_monotonic_ns" in names
-            and int(data["publish_monotonic_ns"][0]) > 0
-            else int(ring_publish_ns)
-        )
         if not (
-            max(1, int(not_before_ns)) <= source_ns <= publish_ns
-            <= int(ring_publish_ns) <= anchor_ns
+            max(1, int(not_before_ns)) <= source_ns <= int(ring_publish_ns) <= anchor_ns
         ):
             continue
         qpos = np.asarray(data["qpos"][0], dtype=np.float64)
@@ -263,23 +230,17 @@ def _read_hand_history(
         dense_list.append(dense)
         aggregate_valid_list.append(int(aggregate_valid))
         dense_valid_list.append(int(dense_valid))
-        sequences.append(int(sequence))
         sources.append(source_ns)
-        publishes.append(publish_ns)
 
     if not qpos_list:
         return None
-    t = len(qpos_list)
     return HandFrameWindow(
         qpos=np.stack(qpos_list),
         tactile_aggregate=np.stack(aggregate_list),
         tactile_dense=np.stack(dense_list),
         tactile_aggregate_valid=np.asarray(aggregate_valid_list, dtype=np.uint8),
         tactile_dense_valid=np.asarray(dense_valid_list, dtype=np.uint8),
-        source_sequence=np.asarray(sequences, dtype=np.uint64),
         source_monotonic_ns=np.asarray(sources, dtype=np.uint64),
-        publish_monotonic_ns=np.asarray(publishes, dtype=np.uint64),
-        valid_mask=np.ones(t, dtype=np.uint8),
     )
 
 
@@ -298,7 +259,6 @@ def _select_control_grid_reference_ns(
 
 def _select_history_indices(
     source_monotonic_ns: np.ndarray,
-    valid_mask: np.ndarray,
     reference_ns: np.ndarray,
     *,
     run_started_ns: int,
@@ -315,16 +275,14 @@ def _select_history_indices(
     source identity are never substituted.
     """
     sources = np.asarray(source_monotonic_ns, dtype=np.int64)
-    valid = np.asarray(valid_mask, dtype=np.uint8) == 1
-    valid_idx = np.flatnonzero(valid)
-    if valid_idx.size == 0:
+    if sources.size == 0:
         return None
     selected: list[int] = []
     for value in np.asarray(reference_ns, dtype=np.int64):
-        candidates = np.flatnonzero(valid & (sources <= value))
+        candidates = np.flatnonzero(sources <= value)
         if candidates.size == 0:
             if value <= run_started_ns:
-                selected.append(int(valid_idx[0]))
+                selected.append(0)
             else:
                 return None
         else:
@@ -343,7 +301,6 @@ def _align_state_history_to_reference_ns(
         return None
     indices = _select_history_indices(
         state_history.source_monotonic_ns,
-        state_history.valid_mask,
         reference_ns,
         run_started_ns=run_started_ns,
     )
@@ -351,10 +308,7 @@ def _align_state_history_to_reference_ns(
         return None
     return FrameWindow(
         values=state_history.values[indices],
-        source_sequence=state_history.source_sequence[indices],
         source_monotonic_ns=state_history.source_monotonic_ns[indices],
-        publish_monotonic_ns=state_history.publish_monotonic_ns[indices],
-        valid_mask=np.ones(len(indices), dtype=np.uint8),
     )
 
 
@@ -373,7 +327,6 @@ def _align_hand_history_to_reference_ns(
         return None
     indices = _select_history_indices(
         hand_history.source_monotonic_ns,
-        hand_history.valid_mask,
         reference_ns,
         run_started_ns=run_started_ns,
     )
@@ -385,10 +338,7 @@ def _align_hand_history_to_reference_ns(
         tactile_dense=hand_history.tactile_dense[indices],
         tactile_aggregate_valid=hand_history.tactile_aggregate_valid[indices],
         tactile_dense_valid=hand_history.tactile_dense_valid[indices],
-        source_sequence=hand_history.source_sequence[indices],
         source_monotonic_ns=hand_history.source_monotonic_ns[indices],
-        publish_monotonic_ns=hand_history.publish_monotonic_ns[indices],
-        valid_mask=np.ones(len(indices), dtype=np.uint8),
     )
 
 
@@ -402,15 +352,12 @@ def _pointcloud_frame_from_record(
 ) -> PointCloudFrame | None:
     """Extract one causal ``PointCloudFrame`` from a ring record (or None).
 
-    Admission is the full provenance chain (source <= camera publish <=
-    payload publish <= ring commit <= query anchor) plus identity and payload
+    Admission is source <= ring commit <= query anchor plus identity and payload
     validity. There is no age drop before or after the cloud build: a
     finite-but-slow delivery stays usable, while an invalid clock, ordering,
     or payload never passes.
     """
     source_ns = int(record["source_monotonic_ns"])
-    camera_publish_ns = int(record["camera_publish_monotonic_ns"])
-    payload_publish_ns = int(record["publish_monotonic_ns"])
     camera_sequence = int(record["source_camera_sequence"])
     camera_generation = int(record["camera_generation"])
     if not (
@@ -418,8 +365,6 @@ def _pointcloud_frame_from_record(
         and camera_generation > 0
         and 0
         < source_ns
-        <= camera_publish_ns
-        <= payload_publish_ns
         <= int(ring_publish_ns)
         <= anchor_ns
         and source_ns >= int(not_before_ns)
@@ -434,7 +379,6 @@ def _pointcloud_frame_from_record(
             values=cloud,
             source_camera_sequence=camera_sequence,
             source_monotonic_ns=source_ns,
-            publish_monotonic_ns=int(ring_publish_ns),
             camera_generation=camera_generation,
         )
     except ValueError:
@@ -486,7 +430,6 @@ class _RgbIdentity:
 
     source_camera_sequence: int
     source_monotonic_ns: int
-    publish_monotonic_ns: int
     camera_generation: int
 
 
@@ -507,8 +450,6 @@ def _rgb_identity_from_header(
     """
     record = header[0]
     source_ns = int(record["source_monotonic_ns"])
-    receive_ns = int(record["receive_monotonic_ns"])
-    camera_publish_ns = int(record["publish_monotonic_ns"])
     camera_generation = int(record["camera_generation"])
     if not (
         sequence > 0
@@ -516,8 +457,6 @@ def _rgb_identity_from_header(
         and int(record["camera_health"]) in PAYLOAD_VALID_CAMERA_HEALTH
         and 0
         < source_ns
-        <= receive_ns
-        <= camera_publish_ns
         <= ring_publish_ns
         <= anchor_ns
         and source_ns >= not_before_ns
@@ -526,7 +465,6 @@ def _rgb_identity_from_header(
     return _RgbIdentity(
         source_camera_sequence=sequence,
         source_monotonic_ns=source_ns,
-        publish_monotonic_ns=camera_publish_ns,
         camera_generation=camera_generation,
     )
 
@@ -541,7 +479,6 @@ def _copy_rgb_payload(camera_ring, identity: _RgbIdentity) -> RgbFrame | None:
     payload_header = payload["header"][0]
     if (
         int(payload_header["source_monotonic_ns"]) != identity.source_monotonic_ns
-        or int(payload_header["publish_monotonic_ns"]) != identity.publish_monotonic_ns
         or int(payload_header["camera_generation"]) != identity.camera_generation
     ):
         return None
@@ -557,7 +494,6 @@ def _copy_rgb_payload(camera_ring, identity: _RgbIdentity) -> RgbFrame | None:
         values=rgb,
         source_camera_sequence=identity.source_camera_sequence,
         source_monotonic_ns=identity.source_monotonic_ns,
-        publish_monotonic_ns=identity.publish_monotonic_ns,
         camera_generation=identity.camera_generation,
     )
 
@@ -682,7 +618,6 @@ def _resize_rgb_history(
                 values=resize_rgb(frame.values, height=height, width=width),
                 source_camera_sequence=frame.source_camera_sequence,
                 source_monotonic_ns=frame.source_monotonic_ns,
-                publish_monotonic_ns=frame.publish_monotonic_ns,
                 camera_generation=frame.camera_generation,
             )
             resized[key] = cached

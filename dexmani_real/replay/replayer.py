@@ -12,7 +12,7 @@ import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.robot.hand_homing import initialize_hand_home
-from dexmani_real.robot.commands import (PUBLISH_REASON_FIFO_FULL, PublishResult, prepare_joint_command, publish_command, wait_command_accepted)
+from dexmani_real.robot.commands import (prepare_joint_command, publish_command, wait_command_adopted)
 from dexmani_real.robot.commands import SafetyGate, planner_action_safety_gate
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
@@ -248,12 +248,13 @@ class EpisodeReplayer:
         """Validate the live start state against the first replay command."""
         assert self._replay_planner is not None
         first_arm_cmd = wrap_nearest_equivalent(
-            self.traj.action_arm_joint[0],
+            self.traj.action_arm_joint[0] if self.traj.send_mask[0] and self.traj.arm_present[0] else arm_qpos,
             np.asarray(arm_qpos, dtype=np.float64),
             tuple(self.runtime.arm.joint_limit_lower),
             tuple(self.runtime.arm.joint_limit_upper),
         )
-        first_hand_cmd = self.traj.action_hand_joint[0]
+        first_hand_cmd = (self.traj.action_hand_joint[0]
+                          if self.traj.send_mask[0] and self.traj.hand_present[0] else hand_qpos)
         if not self._replay_planner.is_workspace_segment_safe(arm_qpos, first_arm_cmd):
             return "live start->frame 0 workspace check failed"
         if not self._replay_planner.collision_model.check_transition_collision_free(
@@ -357,10 +358,9 @@ class EpisodeReplayer:
         prepared = prepare_joint_command(
             self.shared,
             np.asarray(arm_state["qpos"], dtype=np.float64),
-            self.traj.action_hand_joint[0],
+            (self.traj.action_hand_joint[0]
+             if self.traj.send_mask[0] and self.traj.hand_present[0] else hand_state["qpos"]),
             gate=self._start_warmup_gate,
-            expires_monotonic_ns=time.monotonic_ns() + self.runtime.safety.dispatch_delay_ns,
-            is_hold=True,
             arm_feedback_max_age_s=float(self.runtime.safety.heartbeat_timeouts["arm"]),
             hand_feedback_max_age_s=float(
                 self.runtime.safety.heartbeat_timeouts["hand"]
@@ -368,11 +368,10 @@ class EpisodeReplayer:
         )
         candidate = prepared.candidate
         published = (
-            self._publish_command_with_backpressure(
+            publish_command(
+                self.shared,
                 candidate,
-                required_state=SafetyState.ARMED,
-                deadline_s=time.monotonic() + _START_HAND_WARMUP_S,
-                keyboard=keyboard,
+                required_safety_state=SafetyState.ARMED,
             )
             if candidate is not None
             else None
@@ -388,6 +387,18 @@ class EpisodeReplayer:
             return False
         self._motion_started = True
 
+        adopted = wait_command_adopted(
+            self.shared, command=published.command, wait_for_arm=True, wait_for_hand=True,
+            timeout_s=_START_HAND_WARMUP_S,
+            arm_feedback_max_age_s=float(self.runtime.safety.heartbeat_timeouts["arm"]),
+            hand_feedback_max_age_s=float(self.runtime.safety.heartbeat_timeouts["hand"]),
+            abort_requested=lambda: not self._poll_control(keyboard, 0.0),
+        )
+        if not self._running:
+            return False
+        if not adopted.accepted:
+            self._reject(f"warm-up adoption failed: {adopted.reason}")
+            return False
         deadline_s = time.monotonic() + _START_HAND_WARMUP_S
         while time.monotonic() < deadline_s:
             if not self._poll_control(keyboard, 0.0):
@@ -462,7 +473,7 @@ class EpisodeReplayer:
         return None
 
     def _enter_terminal_quiescence(self) -> None:
-        """Invalidate queued replay endpoints and publish nothing further.
+        """Revoke the current replay command and publish nothing further.
 
         An endpoint already accepted by firmware is not retractable; verified
         shutdown later places the controller in State 4.
@@ -471,10 +482,10 @@ class EpisodeReplayer:
         if not revoke_motion(self.shared, SafetyState.ARMED):
             self._fault("failed to establish terminal replay command boundary")
             return
-        run_generation = int(self.shared.run_generation.value)
+        run_id = int(self.shared.run_id.value)
         logger.info(
             "replay entered terminal command quiescence (run=%d)",
-            run_generation,
+            run_id,
         )
 
     def _poll_control(self, keyboard: KeyboardInput, timeout_s: float) -> bool:
@@ -506,36 +517,6 @@ class EpisodeReplayer:
             self._reason = "operator quit after entering command quiescence"
             return False
         return True
-
-    def _publish_command_with_backpressure(
-        self,
-        candidate: Any,
-        *,
-        required_state: SafetyState,
-        deadline_s: float,
-        keyboard: KeyboardInput,
-    ) -> PublishResult:
-        """Commit the identical candidate, retrying while the FIFO is FULL.
-
-        Bounded by the enclosing operation's deadline; Q/ESC and runtime
-        health keep priority through ``_poll_control`` between retries. The
-        candidate is never rebuilt, re-gated, or replaced here.
-        """
-        result = publish_command(
-            self.shared, candidate, required_safety_state=required_state
-        )
-        while (
-            not result.published
-            and result.reason == PUBLISH_REASON_FIFO_FULL
-            and time.monotonic() < deadline_s
-            and self._running
-        ):
-            if not self._poll_control(keyboard, _WAIT_POLL_INTERVAL_S):
-                break
-            result = publish_command(
-                self.shared, candidate, required_safety_state=required_state
-            )
-        return result
 
     def _wait_until_deadline(
         self, keyboard: KeyboardInput, deadline_s: float
@@ -615,14 +596,14 @@ class EpisodeReplayer:
             while frame_idx < frame_count and self._wait_until_deadline(
                 keyboard, next_deadline_s
             ):
-                expires_ns = int(next_deadline_s * 1e9) + self.runtime.safety.dispatch_delay_ns
+                row_started_s = time.monotonic()
                 arm_cmd = self.traj.action_arm_joint[frame_idx].copy()
                 hand_cmd = self.traj.action_hand_joint[frame_idx].copy()
-                # Replay only slots whose recording flag indicates a queued command.
+                # Replay only rows with a new jointly adopted command identity.
                 send_this = bool(self.traj.send_mask[frame_idx])
                 if send_this and (
-                    not np.all(np.isfinite(arm_cmd))
-                    or not np.all(np.isfinite(hand_cmd))
+                    (self.traj.arm_present[frame_idx] and not np.all(np.isfinite(arm_cmd)))
+                    or (self.traj.hand_present[frame_idx] and not np.all(np.isfinite(hand_cmd)))
                 ):
                     self._fault(
                         f"frame {frame_idx} contains a non-finite replay action"
@@ -681,28 +662,29 @@ class EpisodeReplayer:
                         hand_qpos=hand_qpos,
                     )
                     frame_idx += 1
-                    next_deadline_s += period_s
+                    next_deadline_s = row_started_s + (
+                        (self.traj.timestamp_offsets_s[frame_idx] - self.traj.timestamp_offsets_s[frame_idx - 1])
+                        * self.traj.fps / self.replay_hz if frame_idx < frame_count else period_s)
                     now_s = time.monotonic()
                     if next_deadline_s < now_s:
-                        next_deadline_s = now_s + period_s
+                        next_deadline_s = now_s
                     continue
 
                 # 2π-canonicalize the replayed command to the measured arm pose
                 # (defense-in-depth; the worker no longer wraps).
                 arm_cmd = wrap_nearest_equivalent(
-                    arm_cmd,
+                    arm_cmd if self.traj.arm_present[frame_idx] else arm_state["qpos"],
                     arm_state["qpos"],
                     tuple(self.runtime.arm.joint_limit_lower),
                     tuple(self.runtime.arm.joint_limit_upper),
                 )
-                is_final_frame = frame_idx == frame_count - 1
+                is_final_frame = not np.any(self.traj.send_mask[frame_idx + 1:frame_count])
                 assert self._action_safety_gate is not None
                 prepared = prepare_joint_command(
                     self.shared,
-                    arm_cmd,
-                    hand_cmd,
+                    arm_cmd if self.traj.arm_present[frame_idx] else None,
+                    hand_cmd if self.traj.hand_present[frame_idx] else None,
                     gate=self._action_safety_gate,
-                    expires_monotonic_ns=expires_ns,
                     arm_feedback_max_age_s=float(
                         self.runtime.safety.heartbeat_timeouts["arm"]
                     ),
@@ -712,29 +694,29 @@ class EpisodeReplayer:
                 )
                 candidate = prepared.candidate
                 published = (
-                    self._publish_command_with_backpressure(
+                    publish_command(
+                        self.shared,
                         candidate,
-                        required_state=SafetyState.RUNNING,
-                        # Retries retain the endpoint deadline; no skipped frames.
-                        deadline_s=float("inf"),
-                        keyboard=keyboard,
+                        required_safety_state=SafetyState.RUNNING,
                     )
                     if candidate is not None
                     else None
                 )
+                published_time_s = time.monotonic()
                 accepted = None
                 if (
-                    is_final_frame
-                    and candidate is not None
+                    candidate is not None
                     and published is not None
                     and published.published
                     and published.command is not None
                 ):
-                    accepted = wait_command_accepted(
+                    accepted = wait_command_adopted(
                         self.shared,
                         command=published.command,
-                        wait_for_arm=True,
-                        wait_for_hand=True,
+                        wait_for_arm=bool(self.traj.arm_present[frame_idx]),
+                        wait_for_hand=bool(self.traj.hand_present[frame_idx]),
+                        hand_reached=is_final_frame,
+                        abort_requested=lambda: not self._poll_control(keyboard, 0.0),
                         timeout_s=float(self.runtime.policy.action_apply_timeout_s),
                         arm_feedback_max_age_s=float(
                             self.runtime.safety.heartbeat_timeouts["arm"]
@@ -743,11 +725,13 @@ class EpisodeReplayer:
                             self.runtime.safety.heartbeat_timeouts["hand"]
                         ),
                     )
+                if not self._running:
+                    break
                 if (
                     published is None
                     or not published.published
                     or candidate is None
-                    or (is_final_frame and (accepted is None or not accepted.accepted))
+                    or accepted is None or not accepted.accepted
                 ):
                     boundary = "publish/acceptance" if is_final_frame else "publish"
                     reason = prepared.reason
@@ -771,10 +755,9 @@ class EpisodeReplayer:
                             ),
                         )
                     break
-                assert candidate.arm_qpos is not None
-                assert candidate.hand_qpos is not None
-                sent_arm_cmd = np.asarray(candidate.arm_qpos, dtype=np.float64)
-                hand_cmd = np.asarray(candidate.hand_qpos, dtype=np.float64)
+                row_started_s = published_time_s
+                sent_arm_cmd = arm_cmd if candidate.arm_qpos is None else candidate.arm_qpos
+                hand_cmd = hand_cmd if candidate.hand_qpos is None else candidate.hand_qpos
 
                 self._recorder.record(
                     frame_idx,
@@ -796,10 +779,12 @@ class EpisodeReplayer:
                         f"eef={np.round(eef_pos, 3)}m  err={error_count}",
                         flush=True,
                     )
-                next_deadline_s += period_s
+                next_deadline_s = row_started_s + (
+                        (self.traj.timestamp_offsets_s[frame_idx] - self.traj.timestamp_offsets_s[frame_idx - 1])
+                        * self.traj.fps / self.replay_hz if frame_idx < frame_count else period_s)
                 now_s = time.monotonic()
                 if next_deadline_s < now_s:
-                    next_deadline_s = now_s + period_s
+                    next_deadline_s = now_s
         except KeyboardInterrupt:
             print("\nInterrupted by user; stopping command publication")
             self._enter_terminal_quiescence()

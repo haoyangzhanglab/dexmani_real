@@ -85,6 +85,7 @@ def analyze_episode(
     corruption. There is no automatic quality rejection: an episode is excluded
     only by explicit operator annotation.
     """
+    reader.require_valid(purpose="training export")
     source = reader.h5f
     workflow = read_provenance_workflow(source["meta"].attrs)
     if not supports_fixed_dt_teleop(workflow):
@@ -152,6 +153,11 @@ def analyze_episode(
     anchor = arrays["observation_anchor_monotonic_ns"]
     if np.any(anchor == 0) or np.any(anchor[1:] <= anchor[:-1]):
         raise ValueError("control anchors must be positive and strictly increasing")
+    expected_period_ns = int(round(dt * 1e9))
+    if np.any(np.diff(anchor.astype(np.int64)) != expected_period_ns):
+        raise ValueError("fixed-rate training export rejects missing/irregular grid intervals; raw timing is preserved")
+    if np.any(np.asarray(source["command_id"][:]) == 0):
+        raise ValueError("training export requires confirmed action labels for every row")
     for name in (
         "arm_source_monotonic_ns",
         "hand_source_monotonic_ns",
@@ -293,7 +299,7 @@ def policy_semantics(reader: EpisodeReader, config: ProcessingConfig) -> dict[st
         "obs_alignment": "obs[t]_before_action[t]",
         "observation_alignment": "control_step_latest_causal",
         "state_alignment": "control_step",
-        "action_semantics": "teleop_published_joint_target",
+        "action_semantics": "jointly_adopted_robot_target",
         "fingertip_points_frame": "xarm_base",
         "fingertip_points_unit": "m",
         "fingertip_points_derivation": FINGERTIP_POINTS_DERIVATION,

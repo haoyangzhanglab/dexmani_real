@@ -22,7 +22,7 @@ import numpy as np
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.recording.client import (
     RECORDER_STOP_TIMEOUT_S,
-    RecordingFinished,
+    RecordingResult,
     RecordingStarted,
     StartRecording,
     StopRecording,
@@ -185,7 +185,7 @@ class _RecorderIOSession:
             or self.recorder.is_recording
         )
 
-    def _send_result(self, result: RecordingStarted | RecordingFinished) -> None:
+    def _send_result(self, result: RecordingStarted | RecordingResult) -> None:
         self.shared.record_result_q.put(result, timeout=0.1)
 
     def _handle_start(self, control: StartRecording) -> None:
@@ -211,6 +211,7 @@ class _RecorderIOSession:
             )
             if not self.recorder.start_episode(**metadata):
                 raise RuntimeError("EpisodeRecorder refused start")
+            self.shared.record_episode_path.value = str(self.recorder.episode_path).encode()
         except Exception as exc:
             logger.error("RecorderIO start failed", exc_info=True)
             if self.recorder.is_recording:
@@ -221,7 +222,7 @@ class _RecorderIOSession:
             if not self.recorder.resources_released:
                 raise RuntimeError("episode start retained unreleased resources") from exc
             self._send_result(
-                RecordingFinished(
+                RecordingResult(
                     saved=False,
                     path=None,
                     frame_count=0,
@@ -274,7 +275,7 @@ class _RecorderIOSession:
         # This fact precedes Queue delivery: a late consumer must not expire an
         # already completed close while the feeder is delivering its sole result.
         self.shared.recorder_completed_ns.value = completed_ns
-        self._send_result(RecordingFinished(
+        self._send_result(RecordingResult(
             saved=published and not error, path=path, frame_count=frame_count,
             reason=reason, error=error or None, min_frames_met=frame_count >= self.config.min_frames,
         ))
@@ -302,6 +303,8 @@ class _RecorderIOSession:
             )
             return
         self.pending_stop = control
+        if control.technical_status == "invalid":
+            self.recorder.technical_status = "invalid"
         self.shared.recorder_finish_deadline_ns.value = control.deadline_monotonic_ns
 
     def _drain_samples(self) -> None:

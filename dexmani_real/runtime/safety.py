@@ -11,18 +11,12 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-PUBLISH_REASON_EXPIRED = "command dispatch deadline expired"
 PUBLISH_REASON_RUNTIME_STOPPED = "runtime stopped"
 PUBLISH_REASON_ESTOP = "e-stop requested"
 PUBLISH_REASON_FAULT = "sticky fault"
 PUBLISH_REASON_SAFETY_STATE = "safety state does not permit motion"
-PUBLISH_REASON_GENERATION = "command generation no longer owns motion"
-# Recoverable backpressure: the ordered command FIFO is at capacity. The
-# producer keeps its identical prepared candidate and retries from its main
-# loop; nothing queued is dropped and no fault is implied.
-PUBLISH_REASON_FIFO_FULL = "command fifo full"
-# Fail-closed: no worker consumer ever attached to the command stream.
-PUBLISH_REASON_NO_CONSUMER = "no attached command consumer"
+PUBLISH_REASON_RUN = "command run no longer owns motion"
+PUBLISH_REASON_PENDING = "previous command adoption/accounting pending"
 
 
 class SafetyState(IntEnum):
@@ -53,7 +47,7 @@ class RunEndReason(IntEnum):
     ESTOP = 6
     HARDWARE_FAULT = 7
     RUNTIME_SHUTDOWN = 8
-    COMMAND_EXPIRED = 9
+    RECORDING_FAILURE = 9
 
 
 _ALLOWED_TRANSITIONS = frozenset(
@@ -76,57 +70,19 @@ class MotionPermit:
     """One atomic snapshot of the software motion permission."""
 
     state: SafetyState
-    run_generation: int
+    run_id: int
 
     @property
     def allows_motion(self) -> bool:
         return self.state in (SafetyState.ARMED, SafetyState.RUNNING)
 
 
-@dataclass(frozen=True)
-class CommittedCommand:
-    """Commit receipt of one coherent record in the ordered command FIFO.
-
-    The receipt identifies the record for explicit acceptance waits and
-    lifecycle cancellation. Workers consume it in commit order while its generation and
-    transported deadline still permit admission.
-    """
-
-    run_generation: int
-    sequence: int
-    published_monotonic_ns: int = 0
-
-
-def _advance_run_generation_locked(shared: Any) -> int:
-    """Invalidate the whole command epoch and re-base the FIFO watermark floor.
-
-    Queued records of the old generation are batch-invalidated: the new epoch
-    starts at the current last committed sequence + 1, and consumer watermarks
-    are clamped to the new base so a late old-generation consumer update
-    cannot hold back the new epoch. One summary line reports the per-actuator
-    pending ranges (never their sum — both views overlap the same records).
-    """
-    latest = int(shared.coupled_cmd_ring.latest_sequence)
-    previous_base = int(shared.run_generation_base_sequence.value)
-    pending = {}
-    for name, watermark in (
-        ("arm", shared.arm_cmd_consumed_sequence),
-        ("hand", shared.hand_cmd_consumed_sequence),
-    ):
-        value = int(watermark.value)
-        if value >= 0:
-            pending[name] = max(0, latest - max(value, previous_base))
-    shared.run_generation_base_sequence.value = latest
-    shared.run_generation.value = int(shared.run_generation.value) + 1
-    generation = int(shared.run_generation.value)
-    if any(pending.values()):
-        logger.info(
-            "[DROP] generation=%d command admission cancelled; "
-            "unconfirmed consumer records through_sequence=%d arm_pending=%d hand_pending=%d "
-            "(overlapping ranges; SDK entry is not undone)",
-            generation - 1, latest, pending.get("arm", 0), pending.get("hand", 0),
-        )
-    return generation
+def _invalidate_coupled_commands_locked(shared: Any) -> int:
+    """Fence prior commands and preserve the first pending accounting boundary."""
+    if shared.pending_record_command_id.value and not shared.pending_record_revoked_ns.value:
+        shared.pending_record_revoked_ns.value = time.monotonic_ns()
+    shared.run_id.value += 1
+    return int(shared.run_id.value)
 
 
 def _read_motion_permit_locked(shared: Any) -> MotionPermit:
@@ -135,24 +91,25 @@ def _read_motion_permit_locked(shared: Any) -> MotionPermit:
         state = SafetyState(int(shared.safety_state.value))
     except ValueError:
         state = SafetyState.FAULT
-    return MotionPermit(state, int(shared.run_generation.value))
+    return MotionPermit(state, int(shared.run_id.value))
 
 
 def _begin_motion_locked(shared: Any) -> tuple[int, int] | None:
     """Enter RUNNING while the caller owns ``motion_lock``."""
     if (
         int(shared.safety_state.value) != int(SafetyState.ARMED)
+        or bool(shared.pending_record_command_id.value)
         or not shared.is_running.value
         or shared.error_state.value
         or shared.estop_request.value
     ):
         return None
-    generation = _invalidate_coupled_commands_locked(shared)
+    epoch = _invalidate_coupled_commands_locked(shared)
     started_ns = time.monotonic_ns()
     shared.run_started_monotonic_ns.value = started_ns
-    shared.run_started_generation.value = generation
+    shared.run_started_id.value = epoch
     shared.safety_state.value = int(SafetyState.RUNNING)
-    return generation, started_ns
+    return epoch, started_ns
 
 
 def _revoke_motion_locked(
@@ -182,18 +139,13 @@ def _revoke_motion_locked(
             reason = RunEndReason.ESTOP
         elif shared.error_state.value or new_state is SafetyState.FAULT:
             reason = RunEndReason.HARDWARE_FAULT
-        shared.run_ended_generation.value = int(shared.run_started_generation.value)
+        shared.run_ended_id.value = int(shared.run_started_id.value)
         shared.run_ended_monotonic_ns.value = time.monotonic_ns()
         shared.run_ended_reason.value = int(reason)
-    generation = _invalidate_coupled_commands_locked(shared)
+    epoch = _invalidate_coupled_commands_locked(shared)
     shared.run_started_monotonic_ns.value = 0
     shared.safety_state.value = int(new_state)
-    return current, generation
-
-
-def _invalidate_coupled_commands_locked(shared: Any) -> int:
-    """Advance the generation to invalidate every prior coupled command."""
-    return _advance_run_generation_locked(shared)
+    return current, epoch
 
 
 def invalidate_coupled_commands(shared: Any) -> int:
@@ -210,13 +162,12 @@ def invalidate_coupled_commands(shared: Any) -> int:
 def cancel_coupled_command_if_current(
     shared: Any,
     *,
-    command: CommittedCommand,
+    command: Any,
 ) -> bool:
-    """Invalidate *command*'s whole epoch only while that generation is current.
+    """Revoke admission for *command* only while its run is current.
 
-    Cancellation is generation-scoped, never record-scoped: an aborted wait
-    revokes every still-pending record of its own operation epoch (and only
-    those), so a timed-out caller cannot revoke a newer run's commands.
+    An aborted wait fences its run, so a timed-out caller cannot revoke a
+    newer run's command.
     """
     with shared.motion_lock:
         if not _committed_command_is_current_locked(shared, command):
@@ -226,91 +177,74 @@ def cancel_coupled_command_if_current(
 
 
 def read_motion_permit(shared: Any) -> MotionPermit:
-    """Read state and generation as one indivisible worker/send permit."""
+    """Read state and epoch as one indivisible worker/send permit."""
     with shared.motion_lock:
         return _read_motion_permit_locked(shared)
 
 
 def read_run_state(shared: Any) -> tuple[SafetyState, int, int, int]:
-    """Read permission, cancellation generation, run start and STOP atomically."""
+    """Read permission, cancellation epoch, run start and STOP atomically."""
     with shared.motion_lock:
         permit = _read_motion_permit_locked(shared)
-        return (permit.state, permit.run_generation,
+        return (permit.state, permit.run_id,
                 int(shared.run_started_monotonic_ns.value), int(shared.stop_request.value))
 
 
 def read_run_end(shared: Any) -> tuple[int, int, RunEndReason]:
     """First terminal fact survives delayed inference and subsequent cleanup."""
     with shared.motion_lock:
-        return (int(shared.run_ended_generation.value),
+        return (int(shared.run_ended_id.value),
                 int(shared.run_ended_monotonic_ns.value),
                 RunEndReason(int(shared.run_ended_reason.value)))
 
 
 def _committed_command_is_current_locked(
     shared: Any,
-    command: CommittedCommand,
+    command: Any,
 ) -> bool:
-    """Return whether *command*'s generation still owns motion.
+    """Return whether *command*'s epoch still owns motion.
 
-    This checks cancellation identity only. Publication and the worker SDK
-    fence separately enforce the transported command deadline.
+    This checks cancellation identity; the SDK fence separately checks health.
     """
     permit = _read_motion_permit_locked(shared)
     return bool(
         permit.allows_motion
-        and permit.run_generation == int(command.run_generation)
+        and permit.run_id == int(command.run_id)
     )
 
 
 def coupled_command_is_current(
     shared: Any,
     *,
-    command: CommittedCommand,
+    command: Any,
 ) -> bool:
     """Return whether a committed command's epoch remains unrevoked."""
     with shared.motion_lock:
         return _committed_command_is_current_locked(shared, command)
 
 
-def _expire_command_locked(shared: Any, generation: int, expires_ns: int) -> bool:
-    """Revoke only this generation; the caller holds the short motion lock."""
-    if int(shared.run_generation.value) != generation:
-        return False
-    if time.monotonic_ns() < expires_ns:
-        return False
-    _revoke_motion_locked(shared, SafetyState.ARMED, RunEndReason.COMMAND_EXPIRED)
-    shared.start_request.value = False
-    shared.stop_request.value = int(StopRequest.OPERATOR)
-    shared.physical_home_completed.value = False
-    return True
-
-
-def coupled_command_may_cross_sdk(
-    shared: Any, *, run_generation: int, expires_monotonic_ns: int,
+def command_may_cross_sdk(
+    shared: Any, *, run_id: int, required_safety_state: SafetyState | None = None,
 ) -> bool:
-    """Order admission against revocation, then release the lock BEFORE SDK IO.
-
-    An already-admitted vendor call may still run/return after revocation.
-    Its old-generation reply cannot authorize a new step or satisfy a new run.
-    """
+    """Last software admission fence; an admitted SDK call is not retractable."""
     with shared.motion_lock:
         permit = _read_motion_permit_locked(shared)
-        if not (permit.allows_motion and permit.run_generation == int(run_generation)
-                and shared.is_running.value and not shared.error_state.value
-                and not shared.estop_request.value):
-            return False
-        return not _expire_command_locked(shared, run_generation, expires_monotonic_ns)
+        return bool(
+            permit.allows_motion and permit.run_id == int(run_id)
+            and (required_safety_state is None or permit.state is required_safety_state)
+            and shared.is_running.value and not shared.error_state.value
+            and not shared.estop_request.value
+        )
 
 
 def begin_motion(shared: Any) -> bool:
-    """Atomically enter RUNNING and advance the command generation."""
+    """Atomically enter RUNNING and advance the command epoch."""
     with shared.motion_lock:
         epoch = _begin_motion_locked(shared)
     if epoch is None:
         return False
     logger.info(
-        "safety: ARMED(%d) → RUNNING(%d), generation=%d epoch_ns=%d",
+        "safety: ARMED(%d) → RUNNING(%d), epoch=%d epoch_ns=%d",
         1,
         2,
         epoch[0],
@@ -331,7 +265,7 @@ def begin_requested_motion(shared: Any) -> tuple[int, int] | None:
             return None
         shared.start_request.value = False
     logger.info(
-        "safety: consumed B; ARMED(%d) → RUNNING(%d), generation=%d epoch_ns=%d",
+        "safety: consumed B; ARMED(%d) → RUNNING(%d), epoch=%d epoch_ns=%d",
         1,
         2,
         epoch[0],
@@ -348,6 +282,7 @@ def request_policy_start(shared: Any, *, require_physical_home: bool) -> bool:
         raw_stop_request = int(shared.stop_request.value)
         if (
             int(shared.safety_state.value) != int(SafetyState.ARMED)
+            or bool(shared.pending_record_command_id.value)
             or not shared.is_running.value
             or shared.error_state.value
             or shared.estop_request.value
@@ -382,44 +317,44 @@ def request_policy_stop(shared: Any, *, reason: RunEndReason = RunEndReason.OPER
         revoked = _revoke_motion_locked(shared, SafetyState.ARMED, reason)
     if revoked is None:
         return False
-    previous, generation = revoked
+    previous, epoch = revoked
     logger.info(
-        "safety: policy S revoked motion %s(%d) → ARMED(%d), generation=%d",
+        "safety: policy S revoked motion %s(%d) → ARMED(%d), epoch=%d",
         previous.name,
         int(previous),
         int(SafetyState.ARMED),
-        generation,
+        epoch,
     )
     return True
 
 
-def revoke_motion_if_generation(
+def revoke_motion_if_run_id(
     shared: Any,
-    expected_generation: int,
+    expected_run_id: int,
     new_state: SafetyState = SafetyState.ARMED,
     *, reason: RunEndReason = RunEndReason.EXECUTOR_BOUNDARY,
 ) -> bool:
-    """Revoke motion only while *expected_generation* still owns it.
+    """Revoke motion only while *expected_run_id* still owns it.
 
     Lets a bounded parent-side timeout (the run budget) fence a blocking
-    policy predict without ever revoking a newer trial whose epoch already
-    advanced: the generation is re-verified inside the same critical section
+    policy predict without ever revoking a newer episode whose epoch already
+    advanced: the epoch is re-verified inside the same critical section
     as the revocation, so an expired timeout is a no-op.
     """
     with shared.motion_lock:
-        if int(shared.run_generation.value) != int(expected_generation):
+        if int(shared.run_id.value) != int(expected_run_id):
             return False
         revoked = _revoke_motion_locked(shared, new_state, reason)
     if revoked is None:
         return False
-    current, generation = revoked
+    current, epoch = revoked
     logger.info(
-        "safety: generation-checked revocation %s(%d) → %s(%d), generation=%d",
+        "safety: epoch-checked revocation %s(%d) → %s(%d), epoch=%d",
         current.name,
         int(current),
         new_state.name,
         int(new_state),
-        generation,
+        epoch,
     )
     return True
 
@@ -437,14 +372,14 @@ def revoke_motion(shared: Any, new_state: SafetyState = SafetyState.ARMED, *,
         revoked = _revoke_motion_locked(shared, new_state, reason)
     if revoked is None:
         return False
-    current, generation = revoked
+    current, epoch = revoked
     logger.info(
-        "safety: revoked motion %s(%d) → %s(%d), generation=%d",
+        "safety: revoked motion %s(%d) → %s(%d), epoch=%d",
         current.name,
         int(current),
         new_state.name,
         int(new_state),
-        generation,
+        epoch,
     )
     return True
 

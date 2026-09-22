@@ -30,6 +30,7 @@ from dexmani_real.recording.frame import EpisodeFrame
 from dexmani_real.recording.storage.hdf5_writer import EpisodeDataWriter
 from dexmani_real.recording.storage.schema import (
     EPISODE_SCHEMA_VERSION,
+    DIAGNOSTIC_STATUSES, CommandHistory,
     DATASET_SPECS,
     SOURCE_FRAME_DATASET_NAMES,
     validate_data_layout,
@@ -141,8 +142,10 @@ class EpisodeRecorder:
         self._episode_dir: str | None = None  # episode_XXX/ directory
         self._temp_dir: str | None = None  # .tmp_episode_XXX/ directory
         self._pending_meta: dict[str, Any] = {}
+        self.technical_status = "valid"
 
         self._pending_rows: list[dict[str, Any]] = []
+        self._command_history = CommandHistory()
         self._last_timestamp_s: float | None = None
         self._flush_interval = 32
 
@@ -212,6 +215,7 @@ class EpisodeRecorder:
         a caller-supplied sequence like ``episode_001`` stays trustworthy.
         """
         normalized_provenance = normalize_provenance_metadata(provenance)
+        self.technical_status = "valid"
         if episode_name is not None:
             _validate_explicit_episode_name(episode_name)
         if self._finishing or not self.resources_released:
@@ -258,6 +262,7 @@ class EpisodeRecorder:
         }
 
         self._pending_rows.clear()
+        self._command_history = CommandHistory()
         self._last_timestamp_s = None
         self._camera_writer = CameraStreamWriter(tmp_dir, self._camera_writer_config)
         return True
@@ -367,6 +372,9 @@ class EpisodeRecorder:
 
     def add_frame(self, frame: EpisodeFrame) -> bool:
         """Append an owned control sample; no secondary resampling or state model."""
+        self._command_history.observe(frame.data)
+        if int(frame.data["flag_frame_status"]) in DIAGNOSTIC_STATUSES:
+            self.technical_status = "invalid"
         if not self._recording:
             return False
 
@@ -595,6 +603,9 @@ class EpisodeRecorder:
 
         def _write_final_meta(meta: h5py.Group) -> None:
             meta.attrs["schema_version"] = EPISODE_SCHEMA_VERSION
+            meta.attrs["technical_status"] = self.technical_status
+            meta.attrs["termination_reason"] = reason or "manual"
+            meta.attrs["task_success"] = "unknown"
             meta.attrs["duration"] = duration
             meta.attrs["wall_duration_s"] = duration
             meta.attrs["num_frames"] = self._frame_count
@@ -643,6 +654,7 @@ class EpisodeRecorder:
         self._temp_dir = None
         self._pending_rows.clear()
         self._camera_writer = None
+        self._command_history = CommandHistory()
         self._last_timestamp_s = None
 
     # ── Atomic file finalisation ──────────────────────────────────────

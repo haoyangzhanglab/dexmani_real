@@ -3,8 +3,8 @@
 The planner densely validates a joint-space path (self/table/environment
 collision, joint limits) and returns a typed already-home/safe/unsafe result.
 Only a safe result supplies sparse milestones.  The requester queues
-``(waypoints, final_qpos, generation, expires_ns)`` to the arm worker, which drives them as a
-blocking ``XArm7.home()``. Completion requires the worker's generation-matched
+``(waypoints, final_qpos, run_id, expires_ns)`` to the arm worker, which drives them as a
+blocking ``XArm7.home()``. Completion requires the worker's run_id-matched
 acknowledgement after settling and mode restoration, plus stationary home feedback.
 """
 
@@ -58,7 +58,7 @@ class ArmHomeStatus(str, Enum):
     PREHOME_STATE_UNAVAILABLE = "prehome_state_unavailable"
     PLANNING_FAILED = "planning_failed"
     NO_SAFE_PATH = "no_safe_path"
-    GENERATION_CHANGED = "generation_changed"
+    RUN_CHANGED = "run_changed"
     CANCELLED = "cancelled"
     QUEUE_FULL = "queue_full"
     QUEUE_ERROR = "queue_error"
@@ -213,7 +213,7 @@ def _estimate_home_timeout_s(
 def _wait_for_prehome_state(
     shared: RuntimeChannels,
     *,
-    expected_run_generation: int,
+    expected_run_id: int,
     newer_than_ns: int,
     timeout_s: float,
     max_velocity_rad_s: float,
@@ -222,7 +222,7 @@ def _wait_for_prehome_state(
     estop_requested: Callable[[], bool] | None,
     cancel_requested: Callable[[], bool] | None,
 ) -> tuple[np.ndarray | None, str]:
-    """Wait for fresh stationary feedback after invalidating queued actions."""
+    """Wait for fresh stationary feedback after revoking prior commands."""
     if not np.isfinite(timeout_s) or timeout_s <= 0.0:
         raise ValueError("pre-home settle timeout must be finite and positive")
     if not np.isfinite(max_velocity_rad_s) or max_velocity_rad_s <= 0.0:
@@ -236,8 +236,8 @@ def _wait_for_prehome_state(
             shared.set_heartbeat("policy", loop_now_s)
         if cancel_requested is not None and cancel_requested():
             return None, "operator cancelled while waiting for stationary feedback"
-        if int(shared.run_generation.value) != expected_run_generation:
-            return None, "run generation changed while waiting for stationary feedback"
+        if int(shared.run_id.value) != expected_run_id:
+            return None, "run_id changed while waiting for stationary feedback"
         if _latch_operator_estop(shared, estop_requested):
             return None, "e-stop requested while waiting for stationary feedback"
         if not shared.is_running.value:
@@ -348,7 +348,7 @@ def _wait_for_home_completion(
     shared: RuntimeChannels,
     home_qpos: np.ndarray,
     *,
-    expected_run_generation: int,
+    expected_run_id: int,
     newer_than_ns: int,
     timeout_s: float,
     tol_rad: float,
@@ -362,7 +362,7 @@ def _wait_for_home_completion(
     """Wait for worker completion and stationary feedback at ``home_qpos``.
 
     Stationary milestone feedback can precede dwell completion and Mode 6
-    restoration. Require the worker's completion generation as well as a valid
+    restoration. Require the worker's completion run_id as well as a valid
     feedback frame sourced after the request; neither witness alone suffices.
     """
     if not np.isfinite(tol_rad) or tol_rad <= 0.0:
@@ -376,8 +376,8 @@ def _wait_for_home_completion(
         if cancel_requested is not None and cancel_requested():
             abort_reason = "operator cancelled homing"
             break
-        if int(shared.run_generation.value) != expected_run_generation:
-            abort_reason = "run generation changed during homing"
+        if int(shared.run_id.value) != expected_run_id:
+            abort_reason = "run_id changed during homing"
             break
         if _latch_operator_estop(shared, estop_requested):
             abort_reason = "e-stop requested by operator"
@@ -417,10 +417,10 @@ def _wait_for_home_completion(
                 ):
                     with shared.motion_lock:
                         completed = (
-                            int(shared.arm_home_completed_generation.value)
-                            == expected_run_generation
-                            and int(shared.run_generation.value)
-                            == expected_run_generation
+                            int(shared.arm_home_completed_run_id.value)
+                            == expected_run_id
+                            and int(shared.run_id.value)
+                            == expected_run_id
                             and int(shared.safety_state.value) == int(SafetyState.ARMED)
                             and shared.is_running.value
                             and not shared.quit_requested.value
@@ -436,8 +436,8 @@ def _wait_for_home_completion(
         _emit_progress(progress, f"arm: home wait aborted — {abort_reason}")
         if cancel_requested is not None and cancel_requested():
             return ArmHomeResult(ArmHomeStatus.CANCELLED, abort_reason)
-        if int(shared.run_generation.value) != expected_run_generation:
-            return ArmHomeResult(ArmHomeStatus.GENERATION_CHANGED, abort_reason)
+        if int(shared.run_id.value) != expected_run_id:
+            return ArmHomeResult(ArmHomeStatus.RUN_CHANGED, abort_reason)
         if shared.estop_request.value:
             return ArmHomeResult(ArmHomeStatus.ESTOP_REQUESTED, abort_reason)
         if not shared.is_running.value:
@@ -690,12 +690,12 @@ def execute_arm_home(
             progress=progress,
             operator_message="arm: homing cancelled — command boundary unavailable",
         )
-    home_generation = int(shared.run_generation.value)
-    generation_started_ns = time.monotonic_ns()
+    home_run_id = int(shared.run_id.value)
+    boundary_started_ns = time.monotonic_ns()
     fresh_qpos, prehome_issue = _wait_for_prehome_state(
         shared,
-        expected_run_generation=home_generation,
-        newer_than_ns=generation_started_ns,
+        expected_run_id=home_run_id,
+        newer_than_ns=boundary_started_ns,
         timeout_s=max(config.prehome_timeout_s, config.state_max_age_s),
         max_velocity_rad_s=config.stationary_velocity_rad_s,
         heartbeat=config.publish_policy_heartbeat,
@@ -706,8 +706,8 @@ def execute_arm_home(
     if fresh_qpos is None:
         if cancel_requested is not None and cancel_requested():
             status = ArmHomeStatus.CANCELLED
-        elif int(shared.run_generation.value) != home_generation:
-            status = ArmHomeStatus.GENERATION_CHANGED
+        elif int(shared.run_id.value) != home_run_id:
+            status = ArmHomeStatus.RUN_CHANGED
         elif shared.estop_request.value:
             status = ArmHomeStatus.ESTOP_REQUESTED
         elif not shared.is_running.value:
@@ -757,23 +757,27 @@ def execute_arm_home(
                 "arm: homing cancelled before queue publication — e-stop requested"
             ),
         )
-    if int(shared.run_generation.value) != home_generation:
+    if int(shared.run_id.value) != home_run_id:
         return _home_failure(
-            ArmHomeStatus.GENERATION_CHANGED,
-            "run generation changed during planning",
+            ArmHomeStatus.RUN_CHANGED,
+            "run_id changed during planning",
             progress=progress,
             operator_message=(
-                "arm: homing cancelled — run generation changed during planning"
+                "arm: homing cancelled — run_id changed during planning"
             ),
         )
 
     queued_monotonic_ns = time.monotonic_ns()
     try:
-        shared.arm_home_q.put(
-            (waypoints, home_qpos.copy(), home_generation,
-             queued_monotonic_ns + int(config.request_queue_timeout_s * 1e9)),
-            timeout=config.request_queue_timeout_s,
-        )
+        with shared.motion_lock:
+            if (shared.pending_record_command_id.value
+                    or int(shared.run_id.value) != home_run_id
+                    or int(shared.safety_state.value) != int(SafetyState.ARMED)):
+                return _home_failure(ArmHomeStatus.RUN_CHANGED,
+                    "home admission revoked or adoption accounting pending", progress=progress)
+            shared.arm_home_q.put_nowait(
+                (waypoints, home_qpos.copy(), home_run_id,
+                 queued_monotonic_ns + int(config.request_queue_timeout_s * 1e9)))
     except Full:
         return _home_failure(
             ArmHomeStatus.QUEUE_FULL,
@@ -793,7 +797,7 @@ def execute_arm_home(
     return _wait_for_home_completion(
         shared,
         home_qpos,
-        expected_run_generation=home_generation,
+        expected_run_id=home_run_id,
         newer_than_ns=queued_monotonic_ns,
         timeout_s=_estimate_home_timeout_s(
             waypoints,

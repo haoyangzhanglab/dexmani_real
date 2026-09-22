@@ -17,7 +17,7 @@ from dexmani_real.ipc.camera_ring import CameraRingBuffer
 from dexmani_real.ipc.ring import SharedMemoryRingBuffer
 from dexmani_real.ipc.schema import (
     ARM_STATE_DTYPE,
-    COUPLED_COMMAND_DTYPE,
+    ROBOT_COMMAND_DTYPE,
     HAND_STATE_DTYPE,
     SUPPORTED_POINT_CLOUD_COUNTS,
     VR_FRAME_DTYPE,
@@ -51,7 +51,6 @@ class RuntimeChannelsConfig:
     vr_ring_maxlen: int = 8
     arm_state_ring_maxlen: int = 8
     hand_state_ring_maxlen: int = 8
-    coupled_cmd_ring_maxlen: int = 8
     record_sample_ring_maxlen: int = 4
     pointcloud_num_points: int = 1024
     camera_requested: bool = False
@@ -67,15 +66,17 @@ class RuntimeChannelsConfig:
         default_factory=lambda: camera.depth_shape
     )
 
+    adoption_accounting_timeout_s: float = 0.75
     arm_home_q_maxsize: int = 2
 
     def __post_init__(self) -> None:
+        if not np.isfinite(self.adoption_accounting_timeout_s) or self.adoption_accounting_timeout_s <= 0:
+            raise ValueError("adoption accounting timeout must be finite and positive")
         capacities = (
             self.camera_ring_maxlen,
             self.vr_ring_maxlen,
             self.arm_state_ring_maxlen,
             self.hand_state_ring_maxlen,
-            self.coupled_cmd_ring_maxlen,
             self.record_sample_ring_maxlen,
             self.pointcloud_ring_maxlen,
             self.arm_home_q_maxsize,
@@ -109,6 +110,7 @@ class RuntimeChannelsConfig:
         cam = getattr(runtime, "camera")
         return cls(
             camera_ring_maxlen=int(cam.ring_maxlen),
+            adoption_accounting_timeout_s=float(getattr(runtime, "policy").action_apply_timeout_s),
             camera_rgb_shape=(int(cam.height), int(cam.width), 3),
             camera_depth_shape=(int(cam.height), int(cam.width)),
             pointcloud_num_points=int(pointcloud_num_points),
@@ -122,7 +124,7 @@ _RING_RESOURCE_NAMES = (
     "vr_ring",
     "arm_state_ring",
     "hand_state_ring",
-    "coupled_cmd_ring",
+    "robot_command_ring",
     "record_sample_ring",
     "pointcloud_ring",
 )
@@ -173,39 +175,33 @@ class RuntimeChannels:
     vr_ring: SharedMemoryRingBuffer  # vr -> policy
     arm_state_ring: SharedMemoryRingBuffer  # arm -> policy
     hand_state_ring: SharedMemoryRingBuffer  # hand -> policy
-    coupled_cmd_ring: (
-        SharedMemoryRingBuffer  # bounded ordered control -> arm/hand command FIFO
+    robot_command_ring: (
+        SharedMemoryRingBuffer  # current-run single-inflight command mailbox
     )
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> policy
 
-    arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, generation, expires_ns)
-    # Arm worker -> HOME waiter; zero until success, stale after generation changes.
-    arm_home_completed_generation: Any
+    arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, run_id, expires_ns)
+    # Arm worker -> HOME waiter; zero until success, stale after run_id changes.
+    arm_home_completed_run_id: Any
     record_control_q: mp.Queue  # policy -> RecorderIO episode boundaries
     record_result_q: mp.Queue  # RecorderIO -> RecorderClient (sole consumer)
-    run_generation: Any  # controller advances it to invalidate old policy proposals
+    run_id: Any  # controller advances it to invalidate old policy proposals
     run_started_monotonic_ns: Any  # start of the current RUNNING observation epoch
     # Latest software RUNNING terminal snapshot; safety owns writes under motion_lock.
-    run_started_generation: Any  # run identity survives command-only rebases
-    run_ended_generation: Any
+    run_started_id: Any  # run identity survives command-only rebases
+    run_ended_id: Any
     run_ended_monotonic_ns: Any
     run_ended_reason: Any
     recorder_finish_deadline_ns: Any  # recorder-owned; zero while idle
     recorder_completed_ns: Any  # close completed before finish deadline; reset on START
     recorder_transport_failed: Any  # sticky; never reuse IPC after failure/death
     recorder_consumed_sequence: Any
-    # Ordered command-FIFO consumption watermarks (one per attached worker
-    # consumer; -1 means the consumer never attached and it is excluded from
-    # the capacity watermark). The owning worker is the sole writer; the
-    # publisher reads them under motion_lock to decide FULL backpressure.
-    arm_cmd_consumed_sequence: Any
-    hand_cmd_consumed_sequence: Any
-    # Last committed FIFO sequence when the current run_generation began
-    # (b-1 for the epoch's first sequence b). Updated under motion_lock with
-    # every generation advance; clamps stale consumer watermarks so a late
-    # old-generation update cannot hold back a new epoch.
-    run_generation_base_sequence: Any
+    next_command_id: Any  # shared lifetime allocator, under motion_lock
+    adoption_accounting_timeout_s: float
+    record_episode_path: Any  # RecorderIO-owned identity for orphan diagnostics
+    pending_record_command_id: Any  # protects last_adopted evidence until accounting
+    pending_record_revoked_ns: Any  # first revocation boundary, never extended
 
     is_running: Any  # Main -> all
     is_recording: Any  # policy -> arm/hand/camera
@@ -217,7 +213,7 @@ class RuntimeChannels:
     # fault, the owning workflow may use verified non-FAULT shutdown while still
     # reporting the session as failed.
     session_failed: Any
-    evidence_failed: Any  # sticky evidence-only result; never terminates control
+    evidence_failed: Any  # collection failure; workflow owns revocation and recovery
     estop_request: Any  # policy -> arm/hand
     quit_requested: Any  # policy -> Main
     camera_requested: (
@@ -322,10 +318,10 @@ class RuntimeChannels:
             maxlen=cfg.hand_state_ring_maxlen,
             create=True,
         )
-        storage.coupled_cmd_ring = SharedMemoryRingBuffer(
-            f"{prefix}_coupled_cmd",
-            dtype=COUPLED_COMMAND_DTYPE,
-            maxlen=cfg.coupled_cmd_ring_maxlen,
+        storage.robot_command_ring = SharedMemoryRingBuffer(
+            f"{prefix}_robot_command",
+            dtype=ROBOT_COMMAND_DTYPE,
+            maxlen=1,
             create=True,
         )
         storage.record_sample_ring = SharedMemoryRingBuffer(
@@ -342,13 +338,13 @@ class RuntimeChannels:
         )
 
         storage.arm_home_q = ctx.Queue(maxsize=cfg.arm_home_q_maxsize)
-        storage.arm_home_completed_generation = ctx.Value("Q", 0)
+        storage.arm_home_completed_run_id = ctx.Value("Q", 0)
         storage.record_control_q = ctx.Queue(maxsize=8)
         storage.record_result_q = ctx.Queue(maxsize=8)
-        storage.run_generation = ctx.Value("Q", 1)
+        storage.run_id = ctx.Value("Q", 1)
         storage.run_started_monotonic_ns = ctx.Value("Q", 0)
-        storage.run_started_generation = ctx.Value("Q", 0)
-        storage.run_ended_generation = ctx.Value("Q", 0)
+        storage.run_started_id = ctx.Value("Q", 0)
+        storage.run_ended_id = ctx.Value("Q", 0)
         storage.run_ended_monotonic_ns = ctx.Value("Q", 0)
         storage.run_ended_reason = ctx.Value("i", 0)
         # Recorder may be killed at any instruction. Its shared status accesses
@@ -360,9 +356,11 @@ class RuntimeChannels:
         storage.recorder_transport_failed = ctx.Value("b", False, lock=False)
         storage.recorder_completed_ns = ctx.Value("q", 0, lock=False)
         storage.recorder_consumed_sequence = ctx.Value("Q", 0, lock=False)
-        storage.arm_cmd_consumed_sequence = ctx.Value("q", -1)
-        storage.hand_cmd_consumed_sequence = ctx.Value("q", -1)
-        storage.run_generation_base_sequence = ctx.Value("Q", 0)
+        storage.adoption_accounting_timeout_s = cfg.adoption_accounting_timeout_s
+        storage.record_episode_path = ctx.Array("c", b"\x00" * 4096, lock=False)
+        storage.next_command_id = ctx.Value("Q", 1)
+        storage.pending_record_command_id = ctx.Value("Q", 0)
+        storage.pending_record_revoked_ns = ctx.Value("Q", 0)
 
         storage.is_running = ctx.Value("b", True, lock=False)
         storage.is_recording = ctx.Value("b", False)
@@ -497,8 +495,8 @@ def read_arm_state_dict(shared: "RuntimeChannels") -> "dict | None":
     """Read latest arm state from ring. Return dict of numpy arrays or None.
 
     Fields: qpos(7), qvel(7), tau(7), error_code, connected, tracking_err,
-            last_cmd_generation, last_cmd_accepted_sequence,
-            last_cmd_is_hold, source/publish timestamps, state_valid.
+            last_adopted_run_id, last_adopted_command_id,
+            last_adopted_monotonic_ns, source/publish timestamps, state_valid.
     Callers must validate fields they depend on (e.g. ``np.all(np.isfinite(d["qpos"]))``).
     The EEF pose is not published; derive it from ``qpos`` via
     ``planning.kinematics.arm_fk.make_arm_fk()`` when needed.
@@ -513,9 +511,9 @@ def read_arm_state_dict(shared: "RuntimeChannels") -> "dict | None":
         "error_code": int(data["error_code"][0]),
         "connected": bool(data["connected"][0]),
         "tracking_err": float(data["tracking_err"][0]),
-        "last_cmd_generation": int(data["last_cmd_generation"][0]),
-        "last_cmd_accepted_sequence": int(data["last_cmd_accepted_sequence"][0]),
-        "last_cmd_is_hold": bool(data["last_cmd_is_hold"][0]),
+        "last_adopted_run_id": int(data["last_adopted_run_id"][0]),
+        "last_adopted_command_id": int(data["last_adopted_command_id"][0]),
+        "last_adopted_monotonic_ns": int(data["last_adopted_monotonic_ns"][0]),
         "source_monotonic_ns": int(data["source_monotonic_ns"][0]),
         "publish_monotonic_ns": int(data["publish_monotonic_ns"][0]),
         "state_valid": bool(data["state_valid"][0]),

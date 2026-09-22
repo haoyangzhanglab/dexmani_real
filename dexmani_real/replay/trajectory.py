@@ -12,6 +12,7 @@ from dexmani_real.planning import Pose, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.recording.storage.reader import EpisodeReader
+from dexmani_real.recording.storage.schema import command_send_mask
 from dexmani_real.dataset.provenance import (
     POLICY_EVAL_WORKFLOW,
     read_provenance_workflow,
@@ -34,7 +35,7 @@ _JOINT_LIMIT_TOLERANCE_RAD = 1e-12
 
 @dataclass
 class TrajectoryData:
-    """Required raw-v30 xArm7/XHand streams and derived EEF history for replay."""
+    """Required raw-v31 xArm7/XHand streams and derived EEF history for replay."""
 
     episode_path: str
     num_frames: int
@@ -46,6 +47,9 @@ class TrajectoryData:
     hand_qpos: np.ndarray
     arm_ee: np.ndarray
     send_mask: np.ndarray
+    timestamp_offsets_s: np.ndarray
+    arm_present: np.ndarray
+    hand_present: np.ndarray
 
 
 def resolve_episode_path(raw_path: str) -> tuple[str, str]:
@@ -63,6 +67,7 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
     resolved_path, _episode_name = resolve_episode_path(episode_path)
 
     with EpisodeReader(resolved_path) as reader:
+        reader.require_valid(purpose="physical replay")
         if not reader.min_frames_met:
             logger.warning(
                 "Episode %s is internally readable but below the configured minimum recording duration",
@@ -75,11 +80,11 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
             if workflow == POLICY_EVAL_WORKFLOW:
                 raise ValueError(
                     "policy_eval rollout contains synchronous irregular timing; "
-                    "current physical replay is fixed-rate and must not silently "
+                    "current physical replay only admits teleop episodes; it must not silently "
                     "time-compress it"
                 )
             raise ValueError(
-                f"unsupported provenance_workflow {workflow!r} for fixed-rate physical replay"
+                f"unsupported provenance_workflow {workflow!r} for physical replay"
             )
         total_frames = int(meta.attrs["num_frames"])
         fps = float(reader.timing.rate_hz)
@@ -89,13 +94,19 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
             )
         task_label = str(meta.attrs.get("task_label", ""))
 
-        # EpisodeReader validates every v30 dataset's shape, dtype and frame count.
+        # EpisodeReader validates every v31 dataset's shape, dtype and frame count.
         action_arm_joint = np.asarray(h5["action_arm_joint_sent"][:], dtype=np.float64)
         arm_qpos = np.asarray(h5["arm_qpos"][:], dtype=np.float64)
         action_hand_joint = np.asarray(h5["action_hand_joint"][:], dtype=np.float64)
         hand_qpos = np.asarray(h5["hand_qpos"][:], dtype=np.float64)
         arm_ee = compute_eef_pose_history_xarm_base(arm_qpos)
-        send_mask = np.asarray(h5["flag_action_queued"][:], dtype=bool)
+        send_mask = command_send_mask(h5)
+        anchors = np.asarray(h5["observation_anchor_monotonic_ns"][:], dtype=np.uint64)
+        if len(anchors) == 0 or np.any(anchors == 0) or np.any(anchors[1:] <= anchors[:-1]):
+            raise ValueError("replay anchors must be strictly increasing")
+        offsets = (anchors - anchors[0]).astype(np.float64) / 1e9
+        arm_present = np.asarray(h5["command_arm_present"][:], dtype=bool)
+        hand_present = np.asarray(h5["command_hand_present"][:], dtype=bool)
 
     trajectory = TrajectoryData(
         episode_path=resolved_path,
@@ -108,6 +119,8 @@ def load_trajectory(episode_path: str) -> TrajectoryData:
         hand_qpos=hand_qpos,
         arm_ee=arm_ee,
         send_mask=send_mask,
+        timestamp_offsets_s=offsets,
+        arm_present=arm_present, hand_present=hand_present,
     )
     logger.info(
         "Loaded xArm7/XHand trajectory: %d frames, fps=%.1f, task=%s",
@@ -122,11 +135,17 @@ def modeled_hand_actions(trajectory: TrajectoryData) -> np.ndarray:
     """Return recorded logical hand targets used for geometry preflight."""
     actions = np.asarray(trajectory.action_hand_joint, dtype=np.float64)
     expected_shape = (trajectory.num_frames, *HAND_JOINT_SHAPE)
-    if actions.shape != expected_shape or not np.all(np.isfinite(actions)):
-        raise ValueError(
-            f"physical replay hand actions must be finite shape {expected_shape}"
-        )
-    return actions
+    if actions.shape != expected_shape:
+        raise ValueError(f"physical replay hand actions require shape {expected_shape}")
+    modeled = np.empty_like(actions)
+    reference = np.asarray(trajectory.hand_qpos[0], dtype=np.float64)
+    for i, action in enumerate(actions):
+        if trajectory.send_mask[i] and trajectory.hand_present[i]:
+            if not np.all(np.isfinite(action)):
+                raise ValueError(f"non-finite hand target at frame {i}")
+            reference = action
+        modeled[i] = reference
+    return modeled
 
 
 def replay_start_state(trajectory: TrajectoryData) -> tuple[np.ndarray, np.ndarray]:
@@ -148,7 +167,8 @@ def _verify_trajectory_input(trajectory: TrajectoryData) -> None:
         raise ValueError("physical replay trajectory is empty")
     arm_actions = np.asarray(trajectory.action_arm_joint)
     expected_arm_shape = (trajectory.num_frames, *ARM_JOINT_SHAPE)
-    if arm_actions.shape != expected_arm_shape or not np.all(np.isfinite(arm_actions)):
+    if arm_actions.shape != expected_arm_shape or not np.all(np.isfinite(
+            arm_actions[trajectory.send_mask & trajectory.arm_present])):
         raise ValueError(
             f"physical replay arm actions must be finite shape {expected_arm_shape}"
         )
@@ -171,6 +191,9 @@ def _canonicalize_replay_arm_actions(
     upper = np.asarray(runtime.arm.joint_limit_upper, dtype=np.float64)
     reference = np.asarray(trajectory.arm_qpos[0], dtype=np.float64)
     for frame_index, action in enumerate(arm_actions):
+        if not (trajectory.send_mask[frame_index] and trajectory.arm_present[frame_index]):
+            canonical_actions[frame_index] = reference
+            continue
         canonical = wrap_nearest_equivalent(
             action,
             reference,
@@ -245,7 +268,9 @@ def verify_replay_preflight(
     if np.any(recorded_arm_start < arm_lower) or np.any(recorded_arm_start > arm_upper):
         raise ValueError("physical replay first arm_qpos violates joint limits")
     arm_actions = _canonicalize_replay_arm_actions(trajectory, runtime)
-    _validate_replay_hand_limits(modeled_hand, recorded_hand_start, runtime)
+    _validate_replay_hand_limits(
+        modeled_hand[trajectory.send_mask & trajectory.hand_present], recorded_hand_start, runtime
+    )
     workspace = runtime.policy.workspace.as_array()
     planner = XArm7MotionPlanner(
         XArm7PlannerConfig(

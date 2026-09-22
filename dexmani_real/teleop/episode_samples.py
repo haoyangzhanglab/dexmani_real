@@ -14,11 +14,11 @@ from dexmani_real.planning.kinematics.pose import (
 from dexmani_real.recording.client import RecorderClient
 from dexmani_real.recording.frame import build_episode_frame
 
-FRAME_OK = 0
-_FRAME_HELD = 1
-FRAME_IK_FAIL = 2
-FRAME_SAFETY_REJECT = 3
-FRAME_RETARGET_FAIL = 4
+from dexmani_real.recording.storage.schema import (
+    FRAME_OK, FRAME_HELD,
+)
+from dexmani_real.robot.commands import RobotCommand
+
 _NS_PER_SECOND = 1_000_000_000
 
 
@@ -141,9 +141,8 @@ def record_held(
     cam: dict | None,
     *,
     hand_state: np.ndarray | None = None,
-    frame_status: int = _FRAME_HELD,
+    frame_status: int = FRAME_HELD,
     arm_qpos_sent: np.ndarray,
-    action_queued: bool = False,
     target_eef_pos: np.ndarray | None = None,
     target_eef_rot6d: np.ndarray | None = None,
     observation_anchor_monotonic_ns: int | None = None,
@@ -177,8 +176,10 @@ def record_held(
             target_eef_rot6d if target_eef_rot6d is not None else np.full(6, np.nan),
         )),
     }
+    if recorder.last_command_fields:
+        action.update(recorder.last_command_action)
     signals: dict[str, object] = {
-        "action_queued": action_queued,
+        **recorder.last_command_fields,
         "frame_status": frame_status,
         "tracking_error": (
             float(arm_state["tracking_err"][0])
@@ -216,6 +217,7 @@ def record_frame(
     vr_frame: dict | None,
     cam: dict | None,
     *,
+    command: RobotCommand,
     frame_status: int = FRAME_OK,
     observation_anchor_monotonic_ns: int | None = None,
     shared: RuntimeChannels | None = None,
@@ -246,7 +248,6 @@ def record_frame(
     )
     signals: dict[str, object] = {
         "frame_status": frame_status,
-        "action_queued": True,
         "tracking_error": (
             float(arm_state["tracking_err"][0])
             if arm_state is not None and "tracking_err" in arm_state.dtype.names
@@ -264,7 +265,7 @@ def record_frame(
                 max_observation_skew_s=max_observation_skew_s,
             )
         )
-    recorder.add_frame(build_episode_frame(
+    recorder.stage_command(command, build_episode_frame(
         arm_state, hand_state, action, _vr,
         camera_frame=cam, signals=signals,
         timestamp_s=(None if observation_anchor_monotonic_ns is None

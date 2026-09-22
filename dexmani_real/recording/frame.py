@@ -11,6 +11,7 @@ import numpy as np
 from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d
 from dexmani_real.recording.storage.schema import (
     DATASET_SPECS,
+    RECORD_COMMAND_FIELDS,
     SOURCE_FRAME_DATASET_NAMES,
 )
 
@@ -66,7 +67,7 @@ def build_episode_frame(
         "action_arm_joint_sent": action["action_arm_joint_sent"],
         "action_hand_joint": action["action_hand_joint"],
         "action_arm_ee": action["action_arm_ee"],
-        "flag_action_queued": signal.get("action_queued", False),
+        **{name: signal.get(name, 0) for name, _ in RECORD_COMMAND_FIELDS},
         "flag_frame_status": signal.get("frame_status", 0),
         "tracking_error": signal.get("tracking_error", np.nan),
         "observation_anchor_monotonic_ns": signal.get(

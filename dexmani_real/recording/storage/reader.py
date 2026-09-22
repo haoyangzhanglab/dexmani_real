@@ -153,7 +153,7 @@ class EpisodeReader:
                     f"{EPISODE_SCHEMA_VERSION}"
                 )
             self._rgb_decoder = VideoDecoder(paths["rgb"])
-            self.require_valid(purpose="episode read")
+            self.require_valid(purpose="episode read", technical=False)
         except Exception:
             self.close()
             raise
@@ -208,13 +208,27 @@ class EpisodeReader:
             return ValidityState.INVALID
         return ValidityState.VALID
 
-    def require_valid(self, purpose: str = "training") -> None:
+    def require_valid(self, purpose: str = "training", *, technical: bool = True) -> None:
         state = self.validity
         if state is not ValidityState.VALID:
             raise ValueError(
                 f"episode validity is {state.value}; {purpose} requires VALID data "
                 f"from raw schema v{self.schema_version}"
             )
+
+        from dexmani_real.recording.storage.schema import command_send_mask, DIAGNOSTIC_STATUSES
+        command_send_mask(self._h5f)
+        if technical:
+            attrs = self._h5f["meta"].attrs
+            if (attrs.get("technical_status", "invalid") != "valid"
+                    or np.isin(self._h5f["flag_frame_status"][:], DIAGNOSTIC_STATUSES).any()):
+                raise ValueError(f"{purpose} rejects technically invalid episodes")
+            # A parent may have lost the producer before Recorder STOP could carry
+            # invalidity. Session-result diagnostics are authoritative as well.
+            import json
+            result_path = self._path.with_name(self._path.name + ".result.json")
+            if result_path.exists() and json.loads(result_path.read_text()).get("technical_status") != "valid":
+                raise ValueError(f"{purpose} rejects invalid episode result")
 
     @property
     def timing(self) -> EpisodeTiming:

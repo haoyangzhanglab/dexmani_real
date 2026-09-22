@@ -29,15 +29,11 @@ python examples/collect_teleop.py --config experiment.yaml --print-config
 
 经常调整的 IP、serial、频率、相机尺寸、数据路径、task、控制参数留在实验配置。
 
-`safety.max_dispatch_delay_s` 默认 **0.1 秒（100 ms）**，限制命令到达执行时机后的最大延迟。
-支持 `--config` 的入口可在实验 YAML 中覆盖该值；必须为有限正秒数，
-显式设为 `null` 会在配置解析时拒绝。policy CLI 的配置限制见下文。
-该预算从每个 endpoint 的执行时机开始，覆盖准备、FIFO 等待和 XHand 最终目标 slew；
-FULL/CRC 重试不刷新 deadline。过期撤销该 generation，必须由操作者重新开始；
-keyboard/calibration jog 必须先释放按键。手部归位统一使用
-`hand.home_command_ack_timeout_s`（默认 1 秒），覆盖准备、排队、分步下发和最终目标接受，
-不受实时指令的 100 ms 预算限制；重试不刷新截止时间。
-机械臂 HOME 排队使用现有 request queue budget，已开始的长轨迹使用自身的执行/abort timeout。
+VR 遥操作的网格频率和轮询频率由 `teleop.control_hz` / `teleop.executor_poll_hz` 配置。
+learned policy 的动作周期唯一来自 `PolicySpec.control_dt_s`。
+流式命令一次只有一条待采用；下一条必须等本次命令包含的执行器都明确采用。
+XHand 的首次限速点采用与到达最终目标分开记录；手部归位使用
+`hand.home_command_ack_timeout_s` 等待最终目标，机械臂 HOME 保留规划、请求和执行超时。
 
 ## 研究入口
 
@@ -68,10 +64,12 @@ python examples/collect_teleop.py --config experiment.yaml --task-name <task> --
 python examples/collect_teleop.py --config experiment.yaml --task-name <task> --operator <name> --no-hand --no-record
 ```
 
-`B` 开始、`C` 暂停、`S` 停止并保存、`D` 丢弃、`H` 归位、`Q` 退出、`ESC` 急停。
+`B` 开始、`C` 暂停/恢复、`S` 停止并保存、`D` 丢弃、`H` 归位、`Q` 退出、`ESC` 急停。
 退出录制时按提示选择保存/丢弃；不要把 GUI 关闭或进程退出当作物理急停。
-数据写入 `episodes/<task>/episode_*`。相机和 recorder 在 teleop 中不承担控制输入职责：
-录制失败不应突然中断人工控制，但会使会话结果失败。arm / hand / VR 控制故障仍走停机路径。
+数据写入 `episodes/<task>/episode_*`。录制模式下，`B` 必须等相机和 RecorderIO 可用。
+相机或 recorder 失败会使当前 demonstration 无效，并撤销运动回到 ARMED；仍可手动归位或退出。
+只有显式 `--no-record` 才允许不录制的遥操作。`C` 保留同一 episode，撤销旧命令后，
+等待暂停之后的新 robot/VR 反馈再重新锚定；不会把暂停改成停止或丢弃。
 自动中断时，非空且已安全关闭的录制前缀保存在 `incomplete_*`，不是可直接训练的完整 episode；
 显式丢弃仍丢弃。最终路径与录制结果查看日志。
 recorder 进程自己 drain 最后一帧、关闭视频/HDF5 并发布结果；关闭期间使用原始固定 deadline，
@@ -80,27 +78,28 @@ recorder 进程自己 drain 最后一帧、关闭视频/HDF5 并发布结果；�
 
 ### Policy rollout
 
-当前 `run_policy.py` 没有 `--config`，直接读取 `config/defaults.py`。
-`safety.max_dispatch_delay_s` 默认 0.1 秒，可在该配置源中调整命令延迟预算。
-其他入口的 `--config experiment.yaml` 不会影响 policy CLI。
+`run_policy.py --config experiment.yaml` 使用同一配置解析器。
+硬件启动前写入完整 `run_config.yaml`，包括解析后的 runtime、PolicySpec、checkpoint、seed 和 Git 状态。
 
 ```bash
-python examples/run_policy.py <policy/task/experiment> \
+python examples/run_policy.py <policy/task/experiment> --config experiment.yaml \
   --num-episodes 2 --inference-steps 4 --seed 0
 ```
 
-`B` 开始 trial、`S` 停止并保存、`H` 归位、`Q` 退出、`ESC` 急停；`--num-episodes` 指 trial 次数。
+`B` 开始 episode、`S` 停止并保存、`H` 归位、`Q` 退出、`ESC` 急停；`--num-episodes` 指实际开始的 episode 次数。
 该入口连接真实硬件。`--artifact` 是 experiment 的 `checkpoints/` 下的部署文件名；
 不填时使用 `deployment_latest.pt`。训练 checkpoint 先在 `dexmani_policy` 中通过其
 public deployment export 命令导出，不能当作部署文件直接传入。
 
 policy 子进程拥有模型 / CUDA，先 load / warmup，再启动硬件 workers。
 每个 chunk 同步推理，按 policy control period 逐条发送，不跳动作、不补发追赶；
-下一 chunk 等上一条动作完整经过一个周期后再观测和推理。慢推理可能造成实际动作间隔变长。
+下一次发布必须同时满足上一条命令已采用、且距离上次成功发布至少一个周期。
+慢推理或采用延迟后，后续周期从实际成功发布时刻重新计算；不会突发补发。
 
 输出位于 `rollouts/<policy>/<task>/<experiment>/session_*/`，包含 raw episode 和运行配置。
 **时间分析使用 HDF5 的实际 timestamp，不使用 MP4 固定帧率推断控制时间。**
-试验次数与保存成功的 episode 数不同；recording 故障不应被解释成机器人故障。
+运行次数与保存成功的 episode 数不同。必需的 camera/recorder 失败会结束无效 evaluation 并返回非零，
+只有实际硬件故障才声明 FAULT。结果分开保存 technical_status、termination_reason 和 task_success（可离线标注）。
 
 ## 数据
 
@@ -125,13 +124,15 @@ RGB-D、点云、FK/EE/fingertips、joint/EE actions 和触觉 validity。数值
 raw task label，但不能与 annotation 冲突。未知 episode annotation 会报错。已有输出、输入内部路径、
 源数据目录和已有 Zarr 内部均拒绝覆盖/写入。
 
-policy_eval 的同步、非均匀时序不能被静默解释成 fixed-dt teleop 数据。
-转换和 fixed-rate replay 仍拒绝这种输入；需要 time-aware conversion 才能改变此限制。
+固定周期训练导出拒绝非均匀 anchor 间隔（包括暂停缺口），不静默重采样或压缩时间。
+policy_eval 保持其独立的非均匀时序，不直接作为 fixed-dt teleop 数据导出/回放。
 触觉 validity 必须保存，不能把传感器无效数据解释成零接触力。
 
-raw 当前只支持 v30；旧格式需使用相应历史版本代码离线处理。
-物理 replay 要求 xArm7 + XHand、`policy.hand_enabled=true` 和有效的 v30 数据；
-使用记录的 float64 arm sent targets、hand targets 与 queued 标记，不支持缺失 hand 数据的回放。
+raw 当前只支持 v31；v30 缺少采用证据，不能直接视为 v31，也不支持自动补造证据。
+v31 保存 command_id、run_id、issued 时间、每个执行器的 presence、adopted 及真实采用时间。
+正常动作只有在命令包含的全部执行器采用后才写入；held/failure 行不重复发送。
+部分采用或未知采用仅作诊断，并使整个 episode 默认不可训练导出或物理回放。
+物理 replay 使用实际 anchor 间隔与新的共同采用 command ID，保留 float64 目标及执行器 presence。
 
 ## 代码追踪与安全 owner
 
@@ -142,7 +143,7 @@ teleop/session.py → teleop/loop.py → control_loop/grid.py
                                        ↓
                         robot/projection.py（一次软投影）
                                        ↓
-                 robot/commands.py（检查目标、提交有序 FIFO）
+                 robot/commands.py（检查目标、发布单条耦合命令）
                                        ↓
                      robot/{arm,hand}_worker.py → SDK
 
@@ -155,14 +156,16 @@ recording: control loop → build_episode_frame → RecorderClient.add_frame(fra
 ```
 
 主进程拥有进程启动、运行时长上限、critical worker 健康检查与清理；独立键盘 listener
-在模型推理、home 和录制关闭阻塞时响应停止。policy 子进程拥有模型/CUDA 与 trial 计数/结果；
+在模型推理、home 和录制关闭阻塞时响应停止。policy 子进程拥有模型/CUDA 与 episode 计数/结果；
 SDK 由各自 arm/hand worker 持有。`SafetyState` 为 DISARMED / ARMED / RUNNING / FAULT。
-共享 run generation/start 原子读取，让 parent 能在推理阻塞时执行运行时长上限；
+共享 run_id/start 原子读取，让 parent 能在推理阻塞时执行运行时长上限；
 terminal cause 保留第一次实际停止的原因，供晚返回的 runner 收尾。
 
-命令只在 FIFO 成功提交时分配 sequence。generation 只用于暂停、停止或阻塞推理结束后拒绝旧动作，
-不是科研 episode 身份。撤销阻止新的 software admission；已经 admission 的 SDK 调用仍可能晚返回，
-arm 与 hand 也不是物理事务。SDK acceptance 不等于物理收敛，尤其不能让 XHand 中间限速点提前确认最终目标。
+command_id 在同一个 RuntimeChannels 生命周期中单调分配；run_id 是运动授权 epoch，
+用于暂停、停止及阻塞推理返回后拒绝旧动作，不是科研 episode 身份。
+撤销阻止新的 SDK admission；已经 admission 的调用仍可能晚返回，arm/hand 并非物理原子事务。
+录制中的待采用命令在撤销后使用新的 worker 状态完成有界核算，再允许后续命令覆盖证据。
+SDK adoption 不等于物理收敛；XHand 的 adopted 与最终目标 reached 分开。
 
 必须保留的硬边界：机械限位、非有限数阻断、实际速度 / 步长限制、急停、SDK 错误、旧命令撤销、
 实验依赖的工作空间 / 碰撞约束，以及 worker 停止后才释放共享内存。
@@ -183,9 +186,9 @@ git diff --check
 
 ## 真机 commissioning（需单独授权，离线测试不代替）
 
-测量目标工作负载的准备、排队、SDK 与 hand slew 延迟，验证默认的
-`safety.max_dispatch_delay_s`，必要时调整。
-低速检查启动/停止、慢推理时的 parent timeout、home 与长录制关闭时的 S/Q/ESC、
-人为 backlog 导致的 deadline 撤销、arm/hand 错误和单侧先行、RealSense/触觉失效、
-真实 checkpoint rollout、物理急停和安全断开。deadline 保护 software admission，
-已经 admission 的 vendor 调用仍可能执行或晚返回；真机停机距离/延迟必须实测。
+测量真实工作负载的发布、SDK 采用与 hand slew 延迟，验证采用核算和归位超时。
+低速检查 C 暂停/恢复与重新锚定、S/D/Q/H、慢推理时的 parent timeout、
+长录制关闭时的 S/Q/ESC、arm/hand 单侧先行及故障、RealSense/触觉失效、
+真实 checkpoint rollout、物理急停和安全断开。
+软件撤销阻止后续 admission；已经 admission 的 vendor 调用仍可能执行或晚返回，
+真机停机距离/延迟必须实测。

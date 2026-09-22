@@ -213,14 +213,6 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
     expected_control_dim = 21 if policy_spec.action_key == "action_ee" else 19
     if policy_spec.control_action_dim != expected_control_dim:
         raise ValueError("Policy control_action_dim conflicts with its action_key")
-    control_dt_s = 1.0 / float(runtime.policy.control_hz)
-    if not math.isclose(
-        control_dt_s,
-        float(policy_spec.control_dt_s),
-        rel_tol=0.0,
-        abs_tol=1e-12,
-    ):
-        raise ValueError("Policy control_dt_s does not match Real policy.control_hz")
     fields_by_name = {field.name: field for field in fields}
     contact_force = fields_by_name.get("contact_force")
     if contact_force is not None:
@@ -318,13 +310,13 @@ class PolicyRuntimeConfig:
             raise ValueError("inference_steps must be a positive integer")
 
 
-def validate_num_trials(num_trials: Any) -> int:
-    """Validate the run-owner trial budget (trials to run, not saves)."""
-    if isinstance(num_trials, bool) or type(num_trials) is not int:
-        raise TypeError("num_trials must be a positive integer")
-    if num_trials < 1:
-        raise ValueError("num_trials must be a positive integer")
-    return int(num_trials)
+def validate_num_episodes(num_episodes: Any) -> int:
+    """Validate the run-owner episode budget (episodes to run, not saves)."""
+    if isinstance(num_episodes, bool) or type(num_episodes) is not int:
+        raise TypeError("num_episodes must be a positive integer")
+    if num_episodes < 1:
+        raise ValueError("num_episodes must be a positive integer")
+    return int(num_episodes)
 
 
 @dataclass(frozen=True)
@@ -334,7 +326,7 @@ class RolloutRecordingConfig:
     ``data_dir`` is an isolated absolute output directory (the session
     directory); the CLI owns selector/path validation before workers start.
     This pickle-safe object carries only evidence-recording inputs — the run
-    plan (trials, per-trial budget) is run configuration owned by the
+    plan (episodes, per-episode budget) is run configuration owned by the
     lifecycle, never part of the recording correctness contract. Task success
     is judged offline from the published raw episodes, and the runtime records
     only technical stop reasons.
@@ -401,5 +393,5 @@ __all__ = [
     "RolloutRecordingConfig",
     "validate_policy_runtime_compatibility",
     "validate_max_running_s",
-    "validate_num_trials",
+    "validate_num_episodes",
 ]

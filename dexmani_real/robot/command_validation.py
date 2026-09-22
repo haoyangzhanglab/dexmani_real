@@ -19,6 +19,8 @@ def check_worker_arm_target(
 ) -> str | None:
     """Return why an arm target cannot cross the SDK boundary (hard limits)."""
     target = np.asarray(target_qpos_rad, dtype=np.float64)
+    if target.shape != (7,):
+        return "invalid target shape"
     if not np.all(np.isfinite(target)):
         return "non-finite target"
     if np.any(target < joint_limit_lower_rad) or np.any(target > joint_limit_upper_rad):
@@ -34,6 +36,8 @@ def check_worker_hand_target(
 ) -> str | None:
     """Return why a hand target cannot cross the SDK boundary."""
     target = np.asarray(target_qpos_rad, dtype=np.float64)
+    if target.shape != (12,):
+        return "invalid target shape"
     if not np.all(np.isfinite(target)):
         return "non-finite target"
     if np.any(target < mechanical_lower_rad - 1e-12) or np.any(

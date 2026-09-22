@@ -22,6 +22,7 @@ from dexmani_real.config.defaults import (
     HandParams,
     KeyboardTeleopParams,
     PolicyParams,
+    TeleopTimingParams,
     SafetyParams,
     TAGRetargetingParams,
     VRParams,
@@ -36,6 +37,7 @@ class ExperimentConfig:
     arm: ArmParams
     hand: HandParams
     policy: PolicyParams
+    teleop: TeleopTimingParams
     keyboard_teleop: KeyboardTeleopParams
     vr: VRParams
     safety: SafetyParams
@@ -134,6 +136,7 @@ def validate_config(cfg: ExperimentConfig) -> None:
         cfg.arm.homing,
         cfg.hand,
         cfg.policy,
+        cfg.teleop,
         cfg.policy.ema,
         cfg.policy.vr_mapping,
         cfg.policy.workspace,

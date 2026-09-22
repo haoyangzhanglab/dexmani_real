@@ -3,16 +3,11 @@
 
 ``python examples/run_policy.py EXPERIMENT [--artifact A] [--inference-steps N]
 [--seed S] [--num-episodes N] [--max-duration SEC] [--device D]`` runs one
-persistent multi-trial physical session (H -> scene setup -> B -> S per
-trial). ``--num-episodes`` selects the number of TRIALS to run: a trial
-counts once when it truly begins and ends, while saved raw episodes are
-counted separately as evidence status (a trial whose recording failed still
-counts, and recording failure never ends control early — it makes the
-session result non-zero at its natural end). The parent inspects and pins the
-deployment artifact, resolves the effective inference steps, creates a
-session directory and writes ``run_config.yaml``, then hands a thin set of
-inputs to the deployment lifecycle. Task success is judged offline from the
-published raw episodes; this command records only technical stop reasons.
+persistent multi-episode physical session (H -> scene setup -> B -> S).
+Required recording failure ends the invalid evaluation with a nonzero result.
+Before any hardware starts, run_config.yaml records the full resolved runtime,
+public policy specification, artifact and session settings. Task success remains
+an independent offline judgment.
 
 Inference is synchronous: each query supplies PolicySpec.n_action_steps actions,
 dispatched in order at a cadence anchored to actual publication. The next query
@@ -32,6 +27,7 @@ import argparse
 import getpass
 import math
 import sys
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -72,6 +68,7 @@ def _parser() -> argparse.ArgumentParser:
         description="Run one persistent recorded policy-evaluation session"
     )
     parser.add_argument("experiment", metavar="EXPERIMENT")
+    parser.add_argument("--config", help="experiment YAML configuration")
     parser.add_argument(
         "--artifact",
         default=None,
@@ -89,11 +86,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--num-episodes",
-        dest="num_trials",
+        dest="num_episodes",
         type=_positive_int,
         default=1,
         help=(
-            "trials to run; each truly begun trial counts once at its end, "
+            "episodes to run; each truly begun episode counts once at its end, "
             "independently of whether its recording saved"
         ),
     )
@@ -102,7 +99,7 @@ def _parser() -> argparse.ArgumentParser:
         dest="max_running_s",
         type=_positive_running_seconds,
         default=60.0,
-        help="per-trial running-seconds budget after B (default: 60)",
+        help="per-episode running-seconds budget after B (default: 60)",
     )
     parser.add_argument("--device", default="cuda:0")
     return parser
@@ -155,20 +152,38 @@ def _write_run_config(
     n_action_steps: int,
     seed: int,
     device: str,
-    num_trials: int,
+    num_episodes: int,
     max_duration_s: float,
+    runtime: Any,
+    info: Any,
 ) -> None:
     """Write the resolved experimental conditions before any worker starts."""
     import yaml
 
+    from dexmani_real.config.experiment import config_as_dict
+
+    root = Path(__file__).resolve().parents[1]
+    def git_fact(*args: str) -> str | None:
+        try:
+            return subprocess.check_output(
+                ["git", *args], cwd=root, text=True, stderr=subprocess.DEVNULL
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
     payload = {
+        "runtime": config_as_dict(runtime),
+        "policy_spec": config_as_dict(info.spec),
+        "checkpoint_path": str(info.checkpoint_path),
+        "repository_head": git_fact("rev-parse", "HEAD"),
+        "repository_status": git_fact("status", "--short"),
         "experiment": experiment,
         "artifact": artifact,
         "inference_steps": inference_steps,
         "n_action_steps": n_action_steps,
         "seed": seed,
         "device": device,
-        "num_trials": num_trials,
+        "num_episodes": num_episodes,
         "max_duration_s": float(max_duration_s),
     }
     (session_dir / "run_config.yaml").write_text(
@@ -183,7 +198,7 @@ def _print_summary(
     artifact: str,
     inference_steps: int,
     seed: int,
-    num_trials: int,
+    num_episodes: int,
     max_running_s: float,
     session_dir: Path,
 ) -> None:
@@ -196,8 +211,8 @@ def _print_summary(
     print(f"Artifact       : {artifact}")
     print(f"Inference steps: {inference_steps}")
     print(f"Seed           : {seed}")
-    print(f"Trials to run  : {num_trials} (saved episodes counted separately)")
-    print(f"Max duration   : {max_running_s:g} s per trial")
+    print(f"Episodes to run  : {num_episodes} (saved episodes counted separately)")
+    print(f"Max duration   : {max_running_s:g} s per episode")
     print(f"Device         : {device}")
     print(f"Observation    : {' + '.join(fields)}")
     print(f"Action         : {spec.action_key} ({spec.control_action_dim}D)")
@@ -237,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from dexmani_real.config.experiment import resolve_experiment_config
 
-        runtime = resolve_experiment_config()
+        runtime = resolve_experiment_config(yaml_path=args.config)
     except Exception as exc:
         _print_compatibility_error(f"runtime resolution failed: {exc}")
         return 1
@@ -253,8 +268,10 @@ def main(argv: list[str] | None = None) -> int:
             n_action_steps=info.spec.n_action_steps,
             seed=args.seed,
             device=args.device,
-            num_trials=args.num_trials,
+            num_episodes=args.num_episodes,
             max_duration_s=args.max_running_s,
+            runtime=runtime,
+            info=info,
         )
     except Exception as exc:
         # Fail before any hardware or model process can start.
@@ -285,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
         artifact=info.checkpoint_name,
         inference_steps=inference_steps,
         seed=args.seed,
-        num_trials=args.num_trials,
+        num_episodes=args.num_episodes,
         max_running_s=args.max_running_s,
         session_dir=session_dir,
     )
@@ -293,18 +310,31 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from dexmani_real.deployment.session import run_policy_deployment
 
-        return run_policy_deployment(
+        result = run_policy_deployment(
             runtime,
             info.spec,
             worker_config,
             True,
             max_running_s=args.max_running_s,
-            num_trials=args.num_trials,
+            num_episodes=args.num_episodes,
             recording_config=recording_config,
         )
     except Exception as exc:
         _print_lifecycle_error(f"lifecycle failed: {exc}")
+        result = 1
+
+    from dexmani_real.utils.atomic_io import atomic_json_dump
+    try:
+        atomic_json_dump({
+            "technical_status": "valid" if result == 0 else "invalid",
+            "termination_reason": "session_finished" if result == 0 else "session_failed",
+            "task_success": "unknown",
+            "exit_code": result,
+        }, session_dir / "session_result.json")
+    except OSError as exc:
+        _print_lifecycle_error(f"could not persist session result: {exc}")
         return 1
+    return result
 
 
 if __name__ == "__main__":

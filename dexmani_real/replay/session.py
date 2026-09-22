@@ -1,7 +1,7 @@
 """Physically replay one recorded DexMani episode on the real robot.
 
 Spawn-only architecture: arm_loop + hand_loop processes with RuntimeChannels
-and the SafetyState machine. Commands flow through coupled_cmd_ring; state is
+and the SafetyState machine. Commands flow through robot_command_ring; state is
 read from arm_state_ring / hand_state_ring. No direct SDK access from
 the main process.
 
@@ -293,7 +293,6 @@ def replay_episode(
     config: EpisodeReplayConfig,
 ) -> ReplayOutcome:
     """Start arm/hand workers, run one replay, then shut the session down."""
-    _ = runtime.safety.dispatch_delay_ns  # Validate before device startup.
     try:
         _validate_replay_output_dir(config.output_dir)
     except (OSError, ValueError) as exc:

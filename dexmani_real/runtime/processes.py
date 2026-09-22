@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Collection, Iterable
 
-from dexmani_real.runtime.safety import SafetyState, RunEndReason, revoke_motion, transition
+from dexmani_real.runtime.safety import SafetyState, RunEndReason, revoke_motion, transition, invalidate_coupled_commands
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -120,6 +120,24 @@ def stop_processes_verified(
     # Fence before any blocking join; record the software end if still RUNNING.
     if _shared_value(shared, "safety_state") == int(SafetyState.RUNNING):
         revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
+    # Keep SDK owners publishing post-boundary state until recording accounting
+    # completes. This is bounded and grants no new command admission.
+    if shared.pending_record_command_id.value:
+        with shared.motion_lock:
+            if not shared.pending_record_revoked_ns.value:
+                invalidate_coupled_commands(shared)
+        deadline_ns = int(shared.pending_record_revoked_ns.value) + int((shared.adoption_accounting_timeout_s + 1.0) * 1e9)
+        while shared.pending_record_command_id.value and time.monotonic_ns() < deadline_ns:
+            time.sleep(0.005)
+        if shared.pending_record_command_id.value:
+            from dexmani_real.recording.client import write_recording_failure
+            shared.session_failed.value = True
+            write_recording_failure(shared, "recording owner did not complete adoption accounting")
+    if (shared.is_recording.value and
+            (shared.error_state.value or shared.estop_request.value
+             or shared.evidence_failed.value or shared.session_failed.value)):
+        from dexmani_real.recording.client import write_recording_failure
+        write_recording_failure(shared, "invalid session interrupted recording")
     shared.is_running.value = False
     exits: list[ProcessExit] = []
     deadline = time.monotonic() + graceful_timeout_s

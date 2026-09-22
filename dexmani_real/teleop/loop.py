@@ -21,6 +21,7 @@ from dexmani_real.robot.hand_homing import initialize_hand_home
 from dexmani_real.robot.commands import SafetyGate, planner_action_safety_gate
 from dexmani_real.ipc.causal import (
     read_arm_state_causal,
+    read_camera_frame_causal,
     read_hand_state_causal,
     read_vr_frame_causal,
     vr_frame_is_fresh,
@@ -42,7 +43,8 @@ from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.safety import (
     SafetyState,
     invalidate_coupled_commands,
-    revoke_motion_if_generation,
+    revoke_motion_if_run_id,
+    revoke_motion,
     transition,
 )
 from dexmani_real.teleop.audio_feedback import AudioFeedback
@@ -52,7 +54,6 @@ from dexmani_real.teleop.control_loop.grid import (
     TeleopController,
     TeleopGridResources,
     _TeleopCommandLimits,
-    drop_pending_command,
     run_control_grid_tick,
 )
 from dexmani_real.teleop.control_loop.hand_control import (
@@ -202,7 +203,7 @@ def _load_control_resources(
             max_pose_error_rot_rad=config.runtime.policy.ik_max_pose_error_rot_rad,
             nullspace_step_size_deg=(
                 config.runtime.policy.ik_nullspace_step_rate_deg_s
-                / config.runtime.policy.control_hz
+                / config.runtime.teleop.control_hz
             ),
         ),
         hand_dof=True,
@@ -392,12 +393,12 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
     sigterm_requested = False
 
     limiter = LoopRate(
-        cfg.runtime.policy.executor_poll_hz,
+        cfg.runtime.teleop.executor_poll_hz,
         label="teleop",
         busy_wait=False,
         warn_on_overrun=False,
     )
-    grid_period_ns = int(round(_NS_PER_SECOND / cfg.runtime.policy.control_hz))
+    grid_period_ns = int(round(_NS_PER_SECOND / cfg.runtime.teleop.control_hz))
     next_grid_ns = time.monotonic_ns() + grid_period_ns
     current_grid_anchor_ns = next_grid_ns
     pending_controls: list[OperatorCommand] = []
@@ -421,7 +422,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
         validation_warn=validate_warn,
         arm_feedback_warn=arm_feedback_warn,
         hand_ramp_total_frames=hand_ramp_frame_count(
-            cfg.runtime.policy.hand_ramp_duration_s, cfg.runtime.policy.control_hz
+            cfg.runtime.policy.hand_ramp_duration_s, cfg.runtime.teleop.control_hz
         ),
         max_observation_skew_s=cfg.runtime.policy.max_observation_skew_s,
     )
@@ -435,73 +436,74 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
         nonlocal pause_since_ns, pause_reason
         nonlocal teleop_active, recording_active
         # Classify a worker rejection before an operator pause can relabel it
-        # or request a normal save. RuntimeChannels owns a reentrant motion lock.
-        with shared.motion_lock:
-            arm_rejected = bool(
-                teleop_active
-                and int(shared.safety_state.value) == int(SafetyState.ARMED)
-                and shared.is_running.value
-                and not shared.error_state.value
-                and not shared.estop_request.value
+        # or request a normal save. Revocation itself takes the short motion lock.
+        arm_rejected = bool(
+            teleop_active
+            and int(shared.safety_state.value) == int(SafetyState.ARMED)
+            and shared.is_running.value
+            and not shared.error_state.value
+            and not shared.estop_request.value
+        )
+        if arm_rejected:
+            reason = "arm_command_rejected"
+            relabel = True
+            teleop_active = False
+            stop_recording(
+                recorder,
+                recording_active,
+                save=False,
+                shared=shared,
+                reason=reason,
+                retain_partial=True,
             )
-            if arm_rejected:
-                reason = "arm_command_rejected"
-                relabel = True
-                teleop_active = False
-                stop_recording(
-                    recorder,
-                    recording_active,
-                    save=False,
-                    shared=shared,
-                    reason=reason,
-                    retain_partial=True,
-                )
-                recording_active = False
-                shared.is_recording.value = False
-                pending_controls[:] = [
-                    control
-                    for control in pending_controls
-                    if control is not OperatorCommand.BEGIN
-                ]
-                kb.drain_signal(OperatorCommand.BEGIN)
-                logger.warning("teleop_loop: arm command rejected; begin a new run with B")
-            now_ns = time.monotonic_ns()
-            if start_new_run:
-                if pause_reason is not None:
-                    logger.debug(
-                        "teleop_loop: new run supersedes %s pause boundary",
-                        pause_reason,
-                    )
-                pause_since_ns = now_ns
-                pause_reason = reason
-                run_generation = int(shared.run_generation.value)
-            elif pause_reason is None:
-                pause_since_ns = now_ns
-                pause_reason = reason
-                run_generation = invalidate_coupled_commands(shared)
-            else:
-                if relabel:
-                    pause_reason = reason
-                drop_pending_command(controller, "pause_boundary")
-                controller.clear_reference()
+            recording_active = False
+            shared.is_recording.value = False
+            pending_controls[:] = [
+                control
+                for control in pending_controls
+                if control is not OperatorCommand.BEGIN
+            ]
+            kb.drain_signal(OperatorCommand.BEGIN)
+            logger.warning("teleop_loop: arm command rejected; begin a new run with B")
+        now_ns = time.monotonic_ns()
+        if start_new_run:
+            if pause_reason is not None:
                 logger.debug(
-                    "teleop_loop: remaining in %s pause boundary (observed %s)",
+                    "teleop_loop: new run supersedes %s pause boundary",
                     pause_reason,
-                    reason,
                 )
-                return
-            drop_pending_command(controller, "pause_boundary")
+            pause_since_ns = now_ns
+            pause_reason = reason
+            run_id = int(shared.run_id.value)
+        elif pause_reason is None:
+            pause_since_ns = now_ns
+            pause_reason = reason
+            run_id = invalidate_coupled_commands(shared)
+            if recorder is not None:
+                recorder.resolve_command(finish=True)
+        else:
+            if relabel:
+                pause_reason = reason
+
             controller.clear_reference()
-            log_pause = (
-                logger.debug
-                if reason in {"begin", "pause", "home", "stop", "discard", "quit"}
-                else logger.info
-            )
-            log_pause(
-                "teleop_loop: entered %s pause boundary (run=%d)",
+            logger.debug(
+                "teleop_loop: remaining in %s pause boundary (observed %s)",
+                pause_reason,
                 reason,
-                run_generation,
             )
+            return
+
+        controller.clear_reference()
+        log_pause = (
+            logger.debug
+            if reason in {"begin", "pause", "home", "stop", "discard", "quit"}
+            else logger.info
+        )
+        log_pause(
+            "teleop_loop: entered %s pause boundary (run=%d)",
+            reason,
+            run_id,
+        )
 
     def reject_revoked_run() -> bool:
         if not (
@@ -523,7 +525,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             )
         pause_since_ns = 0
         pause_reason = None
-        drop_pending_command(controller, "home_boundary")
+
         controller.clear_reference()
 
     def run_home() -> None:
@@ -548,8 +550,8 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
     signal.signal(signal.SIGTERM, on_sigterm)
     logger.info(
         "Teleop: entering control loop @ %.0f Hz (observation/action grid %.0f Hz)",
-        cfg.runtime.policy.executor_poll_hz,
-        cfg.runtime.policy.control_hz,
+        cfg.runtime.teleop.executor_poll_hz,
+        cfg.runtime.teleop.control_hz,
     )
 
     try:
@@ -557,11 +559,17 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             shared.set_heartbeat("policy", time.monotonic())
             limiter.wait()
 
+            if recorder is not None:
+                recorder.resolve_command()
             reject_revoked_run()
             if recorder is not None:
                 stop_result = recorder.poll_stop()
                 _note_recorder_transport_failure(shared, recorder, context="poll")
-                if shared.evidence_failed.value:
+                if shared.evidence_failed.value and recording_active:
+                    recorder.technical_status = "invalid"
+                    enter_pause("recording_failure", relabel=True)
+                    teleop_active = False
+                    revoke_motion(shared, SafetyState.ARMED)
                     stop_recording(recorder, recording_active, save=True, shared=shared, reason="evidence_failure")
                     recording_active = False
                 reached_limit = (
@@ -613,6 +621,10 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     # Client and supervisor enforce the original STOP deadline.
                     shared.quit_requested.value = True
                 if recording_active and recorder.camera_writer_error is not None:
+                    recorder.technical_status = "invalid"
+                    shared.evidence_failed.value = True
+                    revoke_motion(shared, SafetyState.ARMED)
+                    teleop_active = False
                     logger.error(
                         "Camera writer failed — retaining closed partial episode: %s",
                         recorder.camera_writer_error,
@@ -642,7 +654,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
 
             if (startup_hand_home_pending and not startup_hand_home_retry_required
                     and int(shared.safety_state.value) == int(SafetyState.ARMED)):
-                home_generation = int(shared.run_generation.value)
+                home_run_id = int(shared.run_id.value)
 
                 def startup_home_abort_requested() -> bool:
                     # Home waits for acceptance; keep S/Q observable in that wait.
@@ -650,7 +662,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     pending_controls.extend(controls)
                     if any(control in (OperatorCommand.STOP, OperatorCommand.DISCARD,
                                        OperatorCommand.QUIT) for control in controls):
-                        revoke_motion_if_generation(shared, home_generation)
+                        revoke_motion_if_run_id(shared, home_run_id)
                         return True
                     return sigterm_requested or kb.estop_latched or not kb.healthy
 
@@ -661,7 +673,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     abort_requested=startup_home_abort_requested,
                 ):
                     cancelled = (
-                        int(shared.run_generation.value) != home_generation
+                        int(shared.run_id.value) != home_run_id
                         or not shared.is_running.value
                         or shared.quit_requested.value
                         or sigterm_requested
@@ -669,7 +681,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     if (cancelled and not shared.error_state.value
                             and not shared.estop_request.value
                             and int(shared.safety_state.value) != int(SafetyState.FAULT)):
-                        # Keep the revoked generation. Only a fresh B can ask
+                        # Keep the revoked run_id. Only a fresh B can ask
                         # for another startup home; an old queued B is discarded.
                         startup_hand_home_retry_required = True
                         pending_controls[:] = [control for control in pending_controls
@@ -917,6 +929,18 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         )
                         skip_control_tick = True
                         continue
+                    begin_camera = read_camera_frame_causal(shared) if cfg.runtime.policy.recording_enabled else None
+                    if cfg.runtime.policy.recording_enabled and (
+                        recorder is None or shared.evidence_failed.value
+                        or recorder.stop_pending or recorder.transport_unavailable
+                        or not shared.is_ready("camera") or not shared.is_ready("recorder")
+                        or begin_camera is None
+                        or int(begin_camera["camera_health"]) != 0
+                        or not 0 <= time.monotonic_ns() - int(begin_camera["source_monotonic_ns"]) <= int(cfg.runtime.camera.max_frame_age_s * 1e9)
+                    ):
+                        print("\nB: camera/recorder unavailable — recorded collection cannot begin")
+                        skip_control_tick = True
+                        continue
                     begin_now_ns = time.monotonic_ns()
                     vr_frame = read_vr_frame_causal(shared)
                     begin_hand_state = (
@@ -949,6 +973,10 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         if not recording_active:
                             shared.evidence_failed.value = True
                             _note_recorder_transport_failure(shared, recorder, context="start")
+                    if cfg.runtime.policy.recording_enabled and not recording_active:
+                        print("\nB: recorder START failed — collection remains ARMED")
+                        skip_control_tick = True
+                        continue
                     if recording_active:
                         camera_freshness.reset(time.monotonic())
                         shared.is_recording.value = True

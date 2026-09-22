@@ -16,7 +16,7 @@ from dexmani_real.runtime.safety import (
     RunEndReason,
     revoke_motion,
     read_run_state,
-    revoke_motion_if_generation,
+    revoke_motion_if_run_id,
     transition,
 )
 from dexmani_real.runtime.status import ExitReason
@@ -67,12 +67,13 @@ def supervisor_exit_reason(
     heartbeat_timeouts_s: Mapping[str, float],
     *,
     service_process_names: Collection[str] = (),
+    terminal_session_failure: bool = True,
 ) -> ExitReason:
     """Apply the fixed safety-first supervisor priority.
 
     Critical faults take precedence over terminal session failure and Q.
-    Optional service death/heartbeat loss is evidence-only and cannot mask Q;
-    the caller records it while continuing the entire control run plan.
+    Required sensor/recorder failure revokes collection; the workflow decides
+    whether to remain available for manual recovery or end evaluation.
     """
     if bool(shared.estop_request.value):
         return ExitReason.ESTOP
@@ -118,7 +119,7 @@ def supervisor_exit_reason(
                 critical_heartbeat_timeout = True
     if critical_heartbeat_timeout:
         return ExitReason.HEARTBEAT_TIMEOUT
-    if bool(shared.session_failed.value):
+    if terminal_session_failure and bool(shared.session_failed.value):
         return ExitReason.SERVICE_FAILURE
     if explicit_quit:
         return ExitReason.EXPLICIT_QUIT
@@ -136,6 +137,7 @@ def run_supervisor(
     supervisor_hz: float | None = None,
     service_process_names: Collection[str] = (),
     max_running_s: float | None = None,
+    workflow: str = "teleop",
 ) -> tuple[str, bool]:
     """Run the standard supervisor loop with resolved heartbeat settings.
 
@@ -144,16 +146,15 @@ def run_supervisor(
     (Q key, episode target reached, KeyboardInterrupt) or a session/service
     failure, False for a critical fault.
 
-    Terminal ``session_failed`` ends the session. Optional evidence service
-    failure only latches ``evidence_failed`` through ARMED and RUNNING; all
-    started process handles remain owned by the final verified shutdown.
+    Policy failure ends evaluation. Teleop collection failure returns to ARMED
+    for manual recovery. All started processes remain owned by verified shutdown.
 
     ``max_running_s`` is the parent-side run budget for one RUNNING epoch —
     the same budget the policy child applies between its own polls. The
     supervisor enforces it even while a blocking predict prevents the child
     from checking: it revokes motion only after re-verifying the snapshot's
-    generation under the lock, so an expired timeout can never revoke a
-    newer trial. The policy process itself is supervised through
+    run_id under the lock, so an expired timeout can never revoke a
+    newer episode. The policy process itself is supervised through
     is_alive/exitcode, not through a loop-heartbeat deadline.
 
     The caller should have already transitioned to ARMED before calling this
@@ -195,19 +196,19 @@ def run_supervisor(
     try:
         while True:
             if max_running_ns is not None:
-                state, generation, started_ns, _ = read_run_state(shared)
+                state, run_id, started_ns, _ = read_run_state(shared)
                 if (
                     state is SafetyState.RUNNING
                     and started_ns > 0
                     and time.monotonic_ns() - int(started_ns)
                     >= max_running_ns
-                    and revoke_motion_if_generation(shared, generation, reason=RunEndReason.TIMEOUT)
+                    and revoke_motion_if_run_id(shared, run_id, reason=RunEndReason.TIMEOUT)
                 ):
                     logger.warning(
                         "[SUPERVISOR] run budget %.1fs exceeded — motion revoked "
-                        "(generation=%d); the control owner ends the trial",
+                        "(run_id=%d); the control owner ends the episode",
                         float(max_running_s),
-                        generation,
+                        run_id,
                     )
             heartbeat_timestamps = {
                 name: shared.get_heartbeat(name) for name in timeouts
@@ -227,6 +228,7 @@ def run_supervisor(
                 heartbeat_ages,
                 timeouts,
                 service_process_names=service_process_names,
+                terminal_session_failure=workflow == "policy_eval",
             )
             if shared.recorder_transport_failed.value:
                 for process in procs:
@@ -262,11 +264,27 @@ def run_supervisor(
                 exit_reason = f"heartbeat timeout: {stale}"
                 transition(shared, SafetyState.FAULT)
                 break
-            if reason is ExitReason.EVIDENCE_FAILURE:
+            if reason is ExitReason.EVIDENCE_FAILURE or shared.evidence_failed.value:
                 shared.evidence_failed.value = True
                 if not service_failure_deferred:
                     service_failure_deferred = True
-                    logger.error("[EVIDENCE] optional service unavailable; control run plan continues")
+                    logger.error("required camera/recorder unavailable; collection revoked")
+                    if int(shared.safety_state.value) == int(SafetyState.RUNNING):
+                        revoke_motion(shared, SafetyState.ARMED, reason=RunEndReason.RECORDING_FAILURE)
+                    from dexmani_real.recording.client import write_recording_failure
+                    write_recording_failure(shared, "required camera/recorder failure")
+                if workflow == "policy_eval":
+                    shared.session_failed.value = True
+                    shared.quit_requested.value = True
+                    reason = ExitReason.SERVICE_FAILURE
+            boundary = int(shared.pending_record_revoked_ns.value)
+            if (shared.pending_record_command_id.value and boundary
+                    and time.monotonic_ns() >= boundary + int((shared.adoption_accounting_timeout_s + 1.0) * 1e9)):
+                # A responsive owner resolves UNKNOWN itself. An unresponsive
+                # owner cannot hand control to H/B or another publisher.
+                shared.session_failed.value = True
+                shared.quit_requested.value = True
+                reason = ExitReason.SERVICE_FAILURE
             if reason is ExitReason.SERVICE_FAILURE:
                 normal_exit = True
                 exit_reason = "terminal session failure"
@@ -297,7 +315,8 @@ def run_supervisor(
     except KeyboardInterrupt:
         exit_reason = "KeyboardInterrupt"
         normal_exit = True
-        shared.is_running.value = False
+        revoke_motion(shared, reason=RunEndReason.QUIT)
+        shared.quit_requested.value = True
 
     print(f"  [supervisor exit] reason={exit_reason}", flush=True)
     return exit_reason, normal_exit
@@ -460,10 +479,10 @@ def print_health_summary(
 
 
 def start_evidence_services(shared, processes, readiness_timeouts_s, *, critical_processes, started_processes) -> bool:
-    """Prepare optional evidence once, retaining every started cleanup handle.
+    """Prepare recording/sensor workers, retaining every cleanup handle.
 
-    A failed optional service disables capture, not control readiness. Earlier
-    critical workers are still monitored during each bounded preparation.
+    Failure blocks recorded collection. The workflow chooses manual recovery
+    or evaluation shutdown; physical workers remain supervised during startup.
     """
     available = True
     for process in processes:

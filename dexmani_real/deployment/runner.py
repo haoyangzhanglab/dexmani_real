@@ -16,8 +16,8 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.robot.commands import ActionCandidate
-from dexmani_real.robot.commands import (PUBLISH_REASON_EXPIRED, PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT, PUBLISH_REASON_FIFO_FULL, PUBLISH_REASON_GENERATION, PUBLISH_REASON_RUNTIME_STOPPED, PUBLISH_REASON_SAFETY_STATE, CommandFeedbackSnapshot, PreparedCommand, PublishResult, command_publishability_reason, prepare_joint_command, publish_command, read_command_feedback)
+from dexmani_real.robot.commands import RobotCommand, command_admission_ready
+from dexmani_real.robot.commands import (PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT, PUBLISH_REASON_PENDING, PUBLISH_REASON_RUN, PUBLISH_REASON_RUNTIME_STOPPED, PUBLISH_REASON_SAFETY_STATE, CommandFeedbackSnapshot, PreparedCommand, PublishResult, command_publishability_reason, prepare_joint_command, publish_command, read_command_feedback)
 from dexmani_real.robot.projection import (
     ArmClipReport,
     project_arm_command_reported,
@@ -50,9 +50,15 @@ from dexmani_real.planning import (
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.planning.paths import WORKSPACE_BOUNDS_TOLERANCE_M
+from dexmani_real.recording.storage.schema import (
+    FRAME_OK as _RECORD_FRAME_OK,
+    FRAME_HELD as _RECORD_FRAME_HELD,
+    FRAME_IK_FAIL as _RECORD_FRAME_IK_FAIL,
+    FRAME_SAFETY_REJECT as _RECORD_FRAME_SAFETY_REJECT,
+)
 from dexmani_real.recording.client import (
     RecorderClient,
-    RecorderStopResult,
+    RecordingResult,
 )
 from dexmani_real.recording.frame import build_episode_frame
 from dexmani_real.robot.model import (
@@ -78,10 +84,7 @@ from dexmani_real.utils.log import ThrottledWarner, get_logger
 logger = get_logger(__name__)
 _warn_observation = ThrottledWarner(interval_s=2.0, logger=logger)
 
-_RECORD_FRAME_OK = 0
-_RECORD_FRAME_HELD = 1
-_RECORD_FRAME_IK_FAIL = 2
-_RECORD_FRAME_SAFETY_REJECT = 3
+
 
 
 class _RejectKind(Enum):
@@ -162,7 +165,7 @@ def decode_policy_action(
     The inference boundary owns flat shape and finite-value validation. An
     ordinary IK no-solution is a RECOVERABLE miss: ``(None, hand, reason)``
     lets the caller drop the unpublished chunk suffix and re-observe in the
-    same trial. Contract violations (a missing planner, an illegal rotation
+    same episode. Contract violations (a missing planner, an illegal rotation
     representation, or an internal solver exception) raise instead — they are
     never swallowed into the recoverable-miss path.
     """
@@ -212,8 +215,7 @@ def _project_policy_targets(
     ordinary recoverable IK miss.
 
     The returned clip report lets the caller print one visible ``[CLIP]``
-    line per really truncated action; projecting happens exactly once per
-    prepared candidate, so a FULL retry never repeats it.
+    line per really truncated action.
     """
     arm, arm_clip = project_arm_command_reported(
         target_arm_qpos,
@@ -283,12 +285,12 @@ def _end_policy_run(
     *,
     aborted: bool,
     stop_reason: str,
-    trial_generation: int,
+    episode_run_id: int,
 ) -> None:
     """Fence one episode into ARMED without converting policy failure to FAULT."""
     with shared.motion_lock:
-        if int(shared.run_started_generation.value) != trial_generation:
-            return  # An old owner/callback cannot revoke a newer trial.
+        if int(shared.run_started_id.value) != episode_run_id:
+            return  # An old owner/callback cannot revoke a newer episode.
         shared.physical_home_completed.value = False
         lifecycle_faulted = bool(
             shared.error_state.value
@@ -323,7 +325,7 @@ class PolicyRunner:
         fingertip_runtime: Any,
         execute: bool,
         max_running_s: float | None,
-        num_trials: int = 1,
+        num_episodes: int = 1,
         recording_config: RolloutRecordingConfig | None = None,
     ) -> None:
         self.shared = shared
@@ -334,8 +336,8 @@ class PolicyRunner:
         self.actions: deque[np.ndarray] = deque()
         self.execute = execute
         self.max_running_s = max_running_s
-        if type(num_trials) is not int or isinstance(num_trials, bool) or num_trials < 1:
-            raise ValueError("num_trials must be a positive integer")
+        if type(num_episodes) is not int or isinstance(num_episodes, bool) or num_episodes < 1:
+            raise ValueError("num_episodes must be a positive integer")
         if recording_config is not None:
             if not isinstance(recording_config, RolloutRecordingConfig):
                 raise TypeError("recording_config must be a RolloutRecordingConfig")
@@ -347,15 +349,15 @@ class PolicyRunner:
                 raise ValueError(
                     "recorded rollout requires an explicit max_running_s run budget"
                 )
-        self.num_trials = int(num_trials)
+        self.num_episodes = int(num_episodes)
         self.recording_config = recording_config
         self.recorder = RecorderClient(shared) if recording_config is not None else None
         self.last_recorded_action: dict[str, np.ndarray] | None = None
         self.next_record_ns = 0
         self.control_period_s = float(policy_spec.control_dt_s)
-        self.poll_period_s = 1.0 / float(runtime.policy.executor_poll_hz)
+        self.poll_period_s = min(0.01, self.control_period_s)
         self._decision_recorded = False
-        self.step_dt_ns = int(round(self.control_period_s * 1e9))
+        self.step_dt_ns = int(np.ceil(self.control_period_s * 1e9))
         self.max_running_ns = (
             None if self.max_running_s is None else int(self.max_running_s * 1e9)
         )
@@ -366,21 +368,15 @@ class PolicyRunner:
             if policy_spec.action_key == "action_ee"
             else None
         )
-        # Prepared-but-uncommitted queue head during recoverable FIFO
-        # backpressure. FULL never rebuilds, re-solves IK, or re-clips this
-        # candidate; only a successful commit advances the action index, the
-        # continuity reference, and the publication cadence.
-        self._pending_dispatch: ActionCandidate | None = None
-
-        self.run_generation: int | None = None
-        self._trial_generation: int | None = None
+        self.run_id: int | None = None
+        self._episode_run_id: int | None = None
         self.run_started_ns: int | None = None
         self.last_publication_ns: int | None = None
         self.previous_arm_command_qpos: np.ndarray | None = None
-        # Run-owner trial budget: a trial counts exactly once when a truly
-        # begun trial ends; the saved-episode count is independent evidence
+        # Run-owner episode budget: an episode counts exactly once when a truly
+        # begun episode ends; the saved-episode count is independent evidence
         # status, never the termination condition.
-        self.completed_trials = 0
+        self.completed_episodes = 0
         self.saved_episodes = 0
         # Simple evidence-status fields (no state machine): the START channel
         # became unusable, or at least one evidence error was marked. Neither
@@ -388,10 +384,10 @@ class PolicyRunner:
         self.recording_unavailable = False
         self.evidence_failed = False
         self.evidence_failure_reason: str | None = None
-        self._evidence_logged_this_trial = False
+        self._evidence_logged_this_episode = False
         self._evidence_warn = ThrottledWarner(interval_s=2.0)
         self._recorder_start_wait_ms = 0.0
-        self._recording_trial_id: int | None = None
+        self._recording_episode_id: int | None = None
         self._pending_stop_reason: str | None = None
         # A queued recording STOP owns exactly one terminal outcome; the
         # shutdown path never consumes a verdict that was already handled.
@@ -414,11 +410,10 @@ class PolicyRunner:
                 count, reason,
             )
         self.actions.clear()
-        self._pending_dispatch = None
 
-    def _clear_execution(self, generation: int | None, *, reason: str = "epoch_boundary") -> None:
+    def _clear_execution(self, run_id: int | None, *, reason: str = "epoch_boundary") -> None:
         self._drop_unpublished(reason)
-        self.run_generation = generation
+        self.run_id = run_id
         self.last_publication_ns = None
         self.previous_arm_command_qpos = None
         self.last_recorded_action = None
@@ -426,7 +421,7 @@ class PolicyRunner:
     def _invalidate_chunk(self, reason: str) -> None:
         """Discard the unexecuted chunk suffix after a recoverable break.
 
-        A replanning boundary, not an episode boundary: run_generation,
+        A replanning boundary, not an episode boundary: run_id,
         model episode state and recording state are
         untouched, as is last_publication_ns (already-occurred physical
         history stays the cadence anchor). The continuity reference is KEPT:
@@ -453,39 +448,41 @@ class PolicyRunner:
             reason,
             aborted=aborted,
             stop_reason=stop_reason,
-            trial_generation=self._trial_generation,
+            episode_run_id=self._episode_run_id,
         )
-        ended_generation, ended_ns, ended_reason = read_run_end(self.shared)
-        if ended_generation != self._trial_generation or ended_reason is RunEndReason.NONE:
+        ended_run_id, ended_ns, ended_reason = read_run_end(self.shared)
+        if ended_run_id != self._episode_run_id or ended_reason is RunEndReason.NONE:
             raise RuntimeError("RUNNING ended without its matching software terminal fact")
+        if self.recorder is not None and ended_reason not in {RunEndReason.OPERATOR, RunEndReason.QUIT, RunEndReason.TIMEOUT}:
+            self.recorder.technical_status = "invalid"
         stop_reason = ended_reason.name.lower()
         reason = stop_reason
-        # Trial counting belongs to the run owner: a truly begun trial counts
+        # Episode counting belongs to the run owner: a truly begun episode counts
         # exactly once here, independent of whether its evidence saved.
-        self.completed_trials += 1
-        self._evidence_logged_this_trial = False
+        self.completed_episodes += 1
+        self._evidence_logged_this_episode = False
         self.session_running_ns += max(
             0, ended_ns - int(self.run_started_ns)
         )
         if (
             self.recorder is not None
-            and self._recording_trial_id == self.completed_trials
+            and self._recording_episode_id == self.completed_episodes
             and self.recorder.is_recording
         ):
             self._pending_stop_reason = stop_reason
             self._stop_recording_capture(save=recorder_save, reason=stop_reason)
-        # A different trial's pending capture retains its identity and reason.
+        # A different episode's pending capture retains its identity and reason.
         logger.info(
-            "policy: trial %d/%d ended (%s); saved_episodes=%d",
-            self.completed_trials,
-            self.num_trials,
+            "policy: episode %d/%d ended (%s); saved_episodes=%d",
+            self.completed_episodes,
+            self.num_episodes,
             reason,
             self.saved_episodes,
         )
-        if self.completed_trials >= self.num_trials:
+        if self.completed_episodes >= self.num_episodes:
             logger.info(
-                "policy: all %d requested trials complete; requesting shutdown",
-                self.num_trials,
+                "policy: all %d requested episodes complete; requesting shutdown",
+                self.num_episodes,
             )
             self.shared.quit_requested.value = True
         self.run_started_ns = None
@@ -558,7 +555,7 @@ class PolicyRunner:
         For an EE policy, ``action_arm_ee`` record the model's raw EE
         INTENT (the pre-IK command); the executed joints live in
         ``action_arm_joint_sent`` (the projected IK result
-        actually committed to the FIFO). The intent is never relabeled as the
+        adopted by the arm). The intent is never relabeled as the
         executed EEF pose — the executed Cartesian pose is derivable offline
         by FK over the recorded joints. For a joint policy the recorded EE
         columns are exactly FK(projected joints).
@@ -590,30 +587,22 @@ class PolicyRunner:
             self._mark_evidence_failed(f"RecorderIO STOP raised: {exc}")
 
     def _poll_recorder(self) -> bool:
-        """Evidence results never own trial termination, including capacity."""
         if self.recorder is None:
             return True
         if self.shared.evidence_failed.value:
-            self.recording_unavailable = True
-            if self.recorder.is_recording and self._pending_stop_reason is None:
-                self._stop_recording_capture(save=True, reason="evidence_failure")
+            self._mark_evidence_failed("required camera/recorder unavailable")
         try:
             result = self.recorder.poll_stop()
         except Exception as exc:
-            self.recording_unavailable = True
             self._mark_evidence_failed(f"RecorderIO status polling failed: {exc}")
-            return True
+            return False
         if result.error:
             self._mark_evidence_failed(f"RecorderIO failed ({result.reason}): {result.error}")
-        elif result.done and self.run_started_ns is not None and self._recording_trial_id == self.completed_trials + 1:
-            if result.reason == "max_frames":
-                logger.info("[EVIDENCE] trial=%d capture capacity reached; saved prefix coverage ends here, control continues",
-                            self._recording_trial_id)
-            elif self._pending_stop_reason is None:
-                self._mark_evidence_failed(f"RecorderIO finalized unexpectedly: {result.reason}")
+        elif result.done and self.run_started_ns is not None and self._pending_stop_reason is None:
+            self._mark_evidence_failed(f"recording ended before evaluation: {result.reason}")
         if result.done:
             self._complete_recording(result)
-        return True
+        return not self.shared.evidence_failed.value
 
     def _request_failed_session_shutdown(self) -> None:
         """Request a failed-session shutdown; this is not a hardware fault.
@@ -625,18 +614,18 @@ class PolicyRunner:
         self.shared.session_failed.value = True
         self.shared.quit_requested.value = True
 
-    def _complete_recording(self, result: RecorderStopResult) -> None:
+    def _complete_recording(self, result: RecordingResult) -> None:
         """Consume the unique capture outcome once, independently of motion.
 
         ``saved=True`` with no error is itself the save witness: RecorderIO
         never upgrades a discard to a save. The saved count is independent
-        evidence status — it never gates control, and a failed finalization
-        marks evidence state without requesting quit or a motion fault.
+        evidence status. Required evidence failure ends this evaluation without
+        claiming a physical hardware fault.
         """
-        if self._recording_trial_id is None or self._recording_outcome_consumed:
+        if self._recording_episode_id is None or self._recording_outcome_consumed:
             return
-        trial_id = self._recording_trial_id
-        self._recording_trial_id = None
+        episode_id = self._recording_episode_id
+        self._recording_episode_id = None
         pending_reason = self._pending_stop_reason
         self._pending_stop_reason = None
         self._recording_outcome_consumed = True
@@ -649,13 +638,13 @@ class PolicyRunner:
         elif result.saved:
             self.saved_episodes += 1
             print(
-                f"Trial {trial_id}/{self.num_trials}: episode saved "
+                f"Episode {episode_id}/{self.num_episodes}: episode saved "
                 f"({self.saved_episodes} saved)",
                 flush=True,
             )
             logger.info(
-                "[RECORD] trial=%d reason=%s saved_rows=%d path=%s",
-                trial_id,
+                "[RECORD] episode=%d reason=%s saved_rows=%d path=%s",
+                episode_id,
                 result.reason or pending_reason or "stop",
                 result.frame_count,
                 result.path or "<unknown>",
@@ -671,10 +660,11 @@ class PolicyRunner:
         self,
         now_ns: int,
         *,
-        candidate: ActionCandidate | None = None,
+        candidate: RobotCommand | None = None,
         raw_action: np.ndarray | None = None,
         reject_kind: _RejectKind | None = None,
-    ) -> None:
+        prepare_only: bool = False,
+    ):
         """Record a completed control decision, or an ordinary idle sample.
 
         Command rows are observed immediately so S/Q cannot lose an already
@@ -687,12 +677,14 @@ class PolicyRunner:
             or self.run_started_ns is None
             or not self.recorder.is_recording
             or self.shared.evidence_failed.value
-            or self._recording_trial_id != self.completed_trials + 1
+            or self._recording_episode_id != self.completed_episodes + 1
         ):
-            # No recorder, no active trial, or this trial's evidence already
+            # No recorder, no active episode, or this episode's evidence already
             # ended (refused START / recorder-side failure): skipping rows is
             # not a new failure and never re-reads sources for nothing.
             return
+        if self.recorder.pending_command is not None:
+            return None
         if raw_action is None and (
             self._decision_recorded or now_ns < self.next_record_ns
         ):
@@ -742,7 +734,7 @@ class PolicyRunner:
                     f"ring_sequence={camera['ring_sequence']} "
                     f"depth_frame={camera['depth_frame_number']} "
                     f"color_frame={camera['color_frame_number']} "
-                    f"generation={camera['camera_generation']} "
+                    f"camera_generation={camera['camera_generation']} "
                     f"source_ns={source_ns} receive_ns={receive_ns} "
                     f"publish_ns={publish_ns} anchor_ns={now_ns}"
                 )
@@ -777,22 +769,27 @@ class PolicyRunner:
                 status = (_RECORD_FRAME_HELD if raw_action is None else
                           _RECORD_FRAME_SAFETY_REJECT if reject_kind is _RejectKind.SAFETY
                           else _RECORD_FRAME_IK_FAIL)
-            signals.update(action_queued=candidate is not None, frame_status=status)
-            recorded = self.recorder.add_frame(build_episode_frame(
+            signals.update(self.recorder.last_command_fields if candidate is None else {})
+            signals["frame_status"] = status
+            if candidate is None and self.recorder.last_command_fields:
+                action = self.recorder.last_command_action
+            sample = build_episode_frame(
                 arm, hand, action, self._recording_vr_sentinel(),
                 timestamp_s=now_ns / 1e9, camera_frame=camera, signals=signals,
-            ))
+            )
+            if prepare_only:
+                return sample
+            recorded = self.recorder.add_frame(sample)
             if not recorded:
                 if not (self.recorder.is_recording or self.recorder.stop_pending):
-                    # Evidence for this trial already ended on the recorder
+                    # Evidence for this episode already ended on the recorder
                     # side; skipping rows now is not a new failure.
                     return
                 raise RuntimeError("rollout sample rejected by RecorderIO")
             self.next_record_ns = now_ns + self.step_dt_ns
             self._decision_recorded = raw_action is not None
         except Exception as exc:
-            # A RUNNING-phase sampling/writer evidence error changes only the
-            # evidence state; it never ends control or latches a motion fault.
+            # Required recording failure ends evaluation without a hardware FAULT.
             self._mark_evidence_failed(
                 f"rollout recording sample failed: {exc}", exc_info=True
             )
@@ -800,7 +797,7 @@ class PolicyRunner:
     def _start_requested_episode(self) -> None:
         if not bool(self.shared.start_request.value):
             return
-        preparation_generation = int(self.shared.run_generation.value)
+        preparation_run_id = int(self.shared.run_id.value)
         attempted_recording = False
         rejection = _physical_start_pose_rejection(
             self.shared, self.runtime, execute=self.execute
@@ -812,14 +809,14 @@ class PolicyRunner:
             return
         if (self.recorder is not None and not self.recording_unavailable
                 and not self.shared.evidence_failed.value
-                and self._recording_trial_id is None and not self.recorder.stop_pending):
+                and self._recording_episode_id is None and not self.recorder.stop_pending):
             assert self.recording_config is not None
             # One bounded START preparation while non-RUNNING; no async
             # START and no pre-ACK sample buffer. Reserve the transaction
             # before the bounded wait so Q cannot let lifecycle shutdown race
             # an in-flight recorder acknowledgement.
             attempted_recording = True
-            self._recording_trial_id = self.completed_trials + 1
+            self._recording_episode_id = self.completed_episodes + 1
             self._pending_stop_reason = None
             self._recording_outcome_consumed = False
             self.shared.is_recording.value = True
@@ -829,7 +826,7 @@ class PolicyRunner:
                 started = self.recorder.start_episode(
                     task_label=self.recording_config.task_label,
                     operator=self.recording_config.operator,
-                    episode_name=f"episode_{self.completed_trials + 1:03d}",
+                    episode_name=f"episode_{self.completed_episodes + 1:03d}",
                 )
             except Exception as exc:
                 started = False
@@ -842,34 +839,34 @@ class PolicyRunner:
             if not started:
                 self.shared.is_recording.value = bool(self.recorder.stop_pending or self.recorder.transport_unavailable or start_uncertain)
                 if not self.shared.is_recording.value:
-                    self._recording_trial_id = None
+                    self._recording_episode_id = None
                     self._recording_outcome_consumed = True
                 if self.recorder.transport_unavailable or start_uncertain:
-                    # A timed-out/corrupted START channel is never reused
-                    # while its recorder may still be closing, never
-                    # auto-restarted, and no second same-owner writer is
-                    # opened: later trials simply run without recording.
+                    # A timed-out/corrupted START channel ends the evaluation.
                     self.recording_unavailable = True
                     self._mark_evidence_failed(
                         "RecorderIO START channel unusable; this session records "
-                        f"no further trials: {self.recorder.last_error or 'unknown error'}"
+                        f"no further episodes: {self.recorder.last_error or 'unknown error'}"
                     )
                 else:
-                    # A refused START makes THIS trial's evidence unavailable;
-                    # it never rejects a valid B.
+                    # A refused START cannot admit recorded motion.
                     self._mark_evidence_failed(
-                        "RecorderIO refused the recording START; the trial runs "
-                        f"without recording: {self.recorder.last_error or 'unknown error'}"
+                        "RecorderIO refused the recording START; episode cancelled: "
+                        f" {self.recorder.last_error or 'unknown error'}"
                     )
-                # Fall through: after the preparation the lifecycle rechecks
-                # B/S/Q, generation, and start state below before RUNNING.
+                # The guard below rejects START after evidence failure.
+        if self.recorder is not None and not self.recorder.is_recording:
+            self._mark_evidence_failed("recorded evaluation could not start RecorderIO")
+            with self.shared.motion_lock:
+                self.shared.start_request.value = False
+            return
         # All START outcomes use the same physical and request recheck. A
         # pending older transaction is never stopped by this new B attempt.
         rejection = _physical_start_pose_rejection(self.shared, self.runtime, execute=self.execute)
         with self.shared.motion_lock:
             valid = (
                 rejection is None
-                and int(self.shared.run_generation.value) == preparation_generation
+                and int(self.shared.run_id.value) == preparation_run_id
                 and not bool(self.shared.quit_requested.value)
             )
             epoch = begin_requested_motion(self.shared) if valid else None
@@ -886,26 +883,19 @@ class PolicyRunner:
         if self.execute:
             self.shared.physical_home_completed.value = False
         self.run_started_ns = epoch[1]
-        self._trial_generation = epoch[0]
+        self._episode_run_id = epoch[0]
         self.next_record_ns = epoch[1] + self.step_dt_ns
-        self._evidence_logged_this_trial = False
+        self._evidence_logged_this_episode = False
         self._clear_execution(epoch[0])
         self.model_runtime.reset_episode()
-        recording_note = (
-            "  [evidence unavailable — running without recording]"
-            if self.recorder is not None and not self.recorder.is_recording
-            else ""
-        )
         print(
-            f"Trial {self.completed_trials + 1}/{self.num_trials} RUNNING"
-            f"{recording_note}",
+            f"Episode {self.completed_episodes + 1}/{self.num_episodes} RUNNING",
             flush=True,
         )
-        logger.debug("policy_runner_loop: RUNNING generation=%d", epoch[0])
+        logger.debug("policy_runner_loop: RUNNING run_id=%d", epoch[0])
 
     def _handle_run_boundary(self) -> None:
-        if not self._poll_recorder():
-            return
+        self._poll_recorder()
         if bool(self.shared.quit_requested.value) and not (
             self.shared.error_state.value
             or self.shared.estop_request.value
@@ -954,7 +944,7 @@ class PolicyRunner:
                 )
             else:
                 # No recording outcome is pending (run configured without
-                # recording, or the trial ran unrecorded). A trial that truly
+                # recording, or the episode ran unrecorded). An episode that truly
                 # began must still count once and keep its RUNNING wall time
                 # in the statistics denominator; ``_finish_episode`` is a
                 # no-op when no epoch started.
@@ -969,7 +959,7 @@ class PolicyRunner:
                 self._clear_execution(None)
             return
 
-        state, generation, started_ns, raw_stop = read_run_state(self.shared)
+        state, run_id, started_ns, raw_stop = read_run_state(self.shared)
         if raw_stop not in {int(StopRequest.NONE), int(StopRequest.OPERATOR)}:
             self._fault("invalid stop request code")
             return
@@ -1018,15 +1008,15 @@ class PolicyRunner:
         reject_kind: _RejectKind,
         raw_action: np.ndarray,
     ) -> None:
-        """Drop the unpublished chunk suffix and re-observe in the SAME trial.
+        """Drop the unpublished chunk suffix and re-observe in the SAME episode.
 
         An ordinary IK no-solution or workspace miss is a replanning boundary,
-        never a trial boundary: nothing is published for this action, while
-        the committed FIFO prefix, the continuity reference, the run
-        generation, and the model episode state stay untouched. The rejection
+        never an episode boundary: nothing is published for this action, while
+        the adopted command, the continuity reference, the run
+        run_id, and the model episode state stay untouched. The rejection
         row is recorded and the chunk drop prints one visible line. There is
         no first-miss terminalization and no consecutive-miss cap — the run
-        budget or the operator ends the trial.
+        budget or the operator ends the episode.
         """
         self._record_rollout_tick(
             time.monotonic_ns(), raw_action=raw_action, reject_kind=reject_kind
@@ -1034,15 +1024,14 @@ class PolicyRunner:
         self._invalidate_chunk(reason)
 
     def _session_failure(self, reason: str, *, log_exc: bool = False) -> None:
-        """End the trial on a model/contract failure — not a hardware fault.
+        """End the episode on a model/contract failure — not a hardware fault.
 
         Motion is fenced into ARMED and the session is marked failed so the
         supervisor runs verified non-FAULT shutdown. Internal contract
         violations (decode, rotation representation, projector invariants,
         preparation) are never swallowed as recoverable IK misses and never
-        presented as physical faults. The recording prefix up to the failure
-        is technically valid evidence and stays saved with its technical stop
-        reason; quality selection happens offline.
+        presented as physical faults. Any retained recording is marked invalid
+        with its technical termination reason.
         """
         self._invalidate_rollout(
             reason, stop_reason="policy_failure", recorder_save=True
@@ -1054,28 +1043,18 @@ class PolicyRunner:
             logger.critical("policy: %s", reason)
 
     def _mark_evidence_failed(self, reason: str, *, exc_info: bool = False) -> None:
-        """Move recording/evidence state to failed without touching control.
-
-        Sampling, writer, result-polling, and finalization errors during
-        RUNNING change only this evidence state: they never call the control
-        termination path, never request quit, and never latch a motion fault.
-        The session RESULT becomes non-zero at the natural end of control.
-        The first failure of each trial logs one full visible line; repeats
-        are throttled to avoid flooding at control rate.
-        """
+        """Required evidence loss fences motion and ends the invalid session."""
         self.evidence_failed = True
         self.shared.evidence_failed.value = True
+        self.recording_unavailable = True
+        if self.recorder is not None:
+            self.recorder.technical_status = "invalid"
         if self.evidence_failure_reason is None:
             self.evidence_failure_reason = reason
-        if not self._evidence_logged_this_trial:
-            self._evidence_logged_this_trial = True
-            logger.error(
-                "[EVIDENCE] recording failed; control continues: %s",
-                reason,
-                exc_info=exc_info,
-            )
-        else:
-            self._evidence_warn("[EVIDENCE] recording still failing: %s", reason)
+            logger.error("required recording failed: %s", reason, exc_info=exc_info)
+        if not self.shared.error_state.value and not self.shared.estop_request.value:
+            revoke_motion(self.shared, SafetyState.ARMED, reason=RunEndReason.RECORDING_FAILURE)
+        self._request_failed_session_shutdown()
 
     def _decode_action(
         self, action: np.ndarray, feedback: CommandFeedbackSnapshot
@@ -1113,7 +1092,7 @@ class PolicyRunner:
             )
             return None, None, None, _PolicyClipReport()
         if arm_qpos is None:
-            # Ordinary IK no-solution: recoverable miss in the same trial.
+            # Ordinary IK no-solution: recoverable miss in the same episode.
             return (
                 None,
                 _RejectKind.IK,
@@ -1138,8 +1117,8 @@ class PolicyRunner:
             return None, None, None, _PolicyClipReport()
         return (arm_qpos, hand_qpos), None, None, clip
 
-    def _prepare_dispatch_candidate(self, action: np.ndarray, *, eligible_ns: int) -> ActionCandidate | None:
-        """Decode, project, and gate the queue head exactly once.
+    def _prepare_dispatch_candidate(self, action: np.ndarray) -> RobotCommand | None:
+        """Decode, project, and gate the next local inference action once.
 
         decode/IK and SafetyGate consume the SAME immutable feedback snapshot
         selected here. Feedback truthfulness and causality are enforced; the
@@ -1148,7 +1127,6 @@ class PolicyRunner:
         advancing producers is never a device failure. An unavailable ring
         (no committed sample yet) invalidates the pending chunk and waits.
         """
-        expires_ns = eligible_ns + self.runtime.safety.dispatch_delay_ns
         feedback, reason, issue = read_command_feedback(
             self.shared,
             require_hand=True,
@@ -1175,8 +1153,6 @@ class PolicyRunner:
         arm_qpos, hand_qpos = decoded
         if clip.arm.clipped or clip.hand_joint >= 0:
             # One visible line per really truncated action (taskbook §4/V19).
-            # Preparing happens once per candidate, so a FULL retry cannot
-            # repeat it.
             fields = []
             if clip.arm.clipped:
                 # Existing arm magnitude is the pre-clip command step.
@@ -1193,9 +1169,8 @@ class PolicyRunner:
             prepared = prepare_joint_command(
                 self.shared,
                 arm_qpos, hand_qpos,
-                run_generation=self.run_generation,
+                run_id=self.run_id,
                 gate=self.gate,
-                expires_monotonic_ns=expires_ns,
                 arm_feedback_max_age_s=None,
                 hand_feedback_max_age_s=None,
                 feedback_snapshot=feedback,
@@ -1214,62 +1189,44 @@ class PolicyRunner:
         assert candidate is not None
         return candidate
 
-    def _dispatch_action(self, action: np.ndarray, *, eligible_ns: int) -> None:
-        """Commit the queue head; a FULL FIFO keeps the identical candidate.
-
-        The caller supplies the existing cadence boundary (or prediction return
-        for a new chunk). Scheduling/IK delay consumes this same budget.
-        Preparation happens exactly once per action. A FULL commit result is
-        recoverable backpressure: the same immutable prepared candidate is
-        retried from the main poll cadence without rebuilding, re-solving IK,
-        or re-clipping, and only a successful commit advances the action
-        index, the continuity reference, and the actual-publication cadence.
-        """
-        if self._pending_dispatch is None:
-            candidate = self._prepare_dispatch_candidate(action, eligible_ns=eligible_ns)
-            if candidate is None:
+    def _dispatch_action(self, action: np.ndarray) -> None:
+        """Decode one local action and publish only when cadence and adoption permit."""
+        if not command_admission_ready(self.shared):
+            return
+        candidate = self._prepare_dispatch_candidate(action)
+        if candidate is None:
+            return
+        sample = None
+        if self.recorder is not None:
+            sample = self._record_rollout_tick(time.monotonic_ns(), candidate=candidate,
+                                               raw_action=action, prepare_only=True)
+            if sample is None:
                 return
-            self._pending_dispatch = candidate
-        candidate = self._pending_dispatch
-
-        publication_check_ns = time.monotonic_ns()
-        if not self._running_generation_is_live() or self._running_time_expired(
-            publication_check_ns
-        ):
+        if not self._running_run_is_live() or self._running_time_expired(time.monotonic_ns()):
             return
         if self.execute:
-            result = publish_command(
-                self.shared,
-                candidate,
-                required_safety_state=SafetyState.RUNNING,
-            )
+            result = publish_command(self.shared, candidate,
+                required_safety_state=SafetyState.RUNNING, account_recording=sample is not None)
             if not result.published:
                 self._handle_publication_rejection(result)
                 return
-            if result.command is None or result.command.published_monotonic_ns <= 0:
-                self._fault("physical publication omitted its command receipt/timestamp")
-                return
-            publication_ns = int(result.command.published_monotonic_ns)
+            command = result.command
+            publication_ns = time.monotonic_ns()  # successful mailbox publication has returned
+            if sample is not None:
+                self.recorder.stage_command(command, sample)
         else:
-            reason = command_publishability_reason(
-                self.shared,
-                candidate,
-                required_safety_state=SafetyState.RUNNING,
-            )
+            reason = command_publishability_reason(self.shared, candidate,
+                                                   required_safety_state=SafetyState.RUNNING)
             if reason:
                 self._handle_publication_rejection(PublishResult(False, reason=reason))
                 return
             publication_ns = time.monotonic_ns()
-
-        self._pending_dispatch = None
-        assert candidate.arm_qpos is not None
         self.previous_arm_command_qpos = candidate.arm_qpos.copy()
         self.last_publication_ns = publication_ns
         self.session_publication_count += 1
         self.actions.popleft()
-        self._record_rollout_tick(
-            publication_ns, candidate=candidate, raw_action=action
-        )
+        self.next_record_ns = publication_ns + self.step_dt_ns
+        self._decision_recorded = True
 
     def _handle_preparation_rejection(
         self,
@@ -1281,7 +1238,7 @@ class PolicyRunner:
             return
         if prepared.gate_code is GateRejectCode.WORKSPACE:
             # Ordinary workspace miss: a recoverable replanning boundary in
-            # the same trial, with the committed prefix and reference kept.
+            # the same episode, with the committed prefix and reference kept.
             self._handle_recoverable_miss(
                 prepared.reason or "policy workspace violation",
                 raw_action=raw_action,
@@ -1297,19 +1254,17 @@ class PolicyRunner:
         )
 
     def _handle_publication_rejection(self, result: PublishResult) -> None:
-        if result.reason == PUBLISH_REASON_FIFO_FULL:
-            # Recoverable backpressure: keep the identical prepared candidate
-            # and retry from the poll cadence. STOP/fault/timeout keep priority because
-            # the main loop polls them between retries.
+        if result.reason == PUBLISH_REASON_PENDING:
+            # Another current command or its recording still awaits adoption accounting.
             return
-        if result.reason in {PUBLISH_REASON_EXPIRED, PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT}:
+        if result.reason in {PUBLISH_REASON_ESTOP, PUBLISH_REASON_FAULT}:
             return
-        # A concurrent S/generation fence is an ordinary episode boundary.  The
+        # A concurrent S/run_id fence is an ordinary episode boundary.  The
         # next loop observes the operator request before any further command;
         # the pending candidate belongs to the revoked epoch and is dropped by
         # the boundary handling, never committed.
         if result.reason in {
-            PUBLISH_REASON_GENERATION,
+            PUBLISH_REASON_RUN,
             PUBLISH_REASON_RUNTIME_STOPPED,
         } or (result.reason.startswith(PUBLISH_REASON_SAFETY_STATE)):
             return
@@ -1317,11 +1272,11 @@ class PolicyRunner:
             f"unrecognized publication rejection: {result.reason or 'missing reason'}"
         )
 
-    def _running_generation_is_live(self) -> bool:
-        state, generation, started_ns, raw_stop = read_run_state(self.shared)
+    def _running_run_is_live(self) -> bool:
+        state, run_id, started_ns, raw_stop = read_run_state(self.shared)
         return (
             state is SafetyState.RUNNING
-            and generation == self.run_generation
+            and run_id == self.run_id
             and raw_stop == int(StopRequest.NONE)
             and bool(self.shared.is_running.value)
             and not bool(self.shared.quit_requested.value)
@@ -1352,18 +1307,23 @@ class PolicyRunner:
 
     def _run_active_tick(self, now_ns: int) -> None:
         assert self.run_started_ns is not None
-        if not self._running_generation_is_live():
+        if not self._running_run_is_live():
             self._handle_run_boundary()
-            if self.run_started_ns is not None and not self._running_generation_is_live():
-                state, generation, started_ns, raw_stop = read_run_state(self.shared)
+            if self.run_started_ns is not None and not self._running_run_is_live():
+                state, run_id, started_ns, raw_stop = read_run_state(self.shared)
                 if state is SafetyState.RUNNING and started_ns == self.run_started_ns:
-                    # A command-only pause/rebase is not a trial end. Discard
+                    # A command-only pause/rebase is not an episode end. Discard
                     # old intent and re-anchor on the next normal control tick.
-                    self._clear_execution(generation, reason="command_epoch_changed")
+                    self._clear_execution(run_id, reason="command_epoch_changed")
                 else:
-                    self._finish_episode("motion generation changed")
+                    self._finish_episode("motion run_id changed")
             return
         if self._running_time_expired(now_ns):
+            return
+
+        if self.recorder is not None:
+            self.recorder.resolve_command()
+        if not command_admission_ready(self.shared):
             return
 
         # Action cadence is anchored solely to the previous physical publication.
@@ -1374,7 +1334,7 @@ class PolicyRunner:
             return
 
         if self.actions:
-            self._dispatch_action(self.actions[0], eligible_ns=boundary_ns if boundary_ns is not None else now_ns)
+            self._dispatch_action(self.actions[0])
             return
 
         # Queue empty and boundary reached: fresh synchronous replan.
@@ -1389,15 +1349,17 @@ class PolicyRunner:
         if policy_observation is None:
             _warn_observation("policy waiting for required sensor history")
             return
-        if not self._running_generation_is_live():
+        if not self._running_run_is_live():
             return
         started_ns = time.monotonic_ns()
         if self._running_time_expired(started_ns):
             return
         try:
-            predicted = np.asarray(
-                self.model_runtime.predict(policy_observation), dtype=np.float64
-            )
+            prediction = self.model_runtime.predict(policy_observation)
+            if not self._running_run_is_live():
+                self._drop_unpublished("inference_run_boundary")
+                return
+            predicted = np.asarray(prediction, dtype=np.float64)
             expected = (self.policy_spec.n_action_steps, self.policy_spec.control_action_dim)
             if predicted.shape != expected:
                 raise ValueError(f"Policy action shape {predicted.shape} conflicts with {expected}")
@@ -1413,8 +1375,8 @@ class PolicyRunner:
         # Real completed predict sample for the session mean/p95 statistics.
         self.session_inference_ms.append((finished_ns - started_ns) / 1e6)
         # Main can revoke motion during blocking inference. Never accept its
-        # result before rechecking the episode's original generation/state.
-        if not self._running_generation_is_live():
+        # result before rechecking the episode's original run_id/state.
+        if not self._running_run_is_live():
             self._drop_unpublished("inference_run_boundary", prediction_count=len(predicted))
             return
         if self.max_running_ns is not None and finished_ns - self.run_started_ns >= self.max_running_ns:
@@ -1424,7 +1386,7 @@ class PolicyRunner:
         self.actions.extend(predicted)
         # The boundary elapsed before observation/inference began; dispatch the
         # first action immediately without waiting another control period.
-        self._dispatch_action(self.actions[0], eligible_ns=finished_ns)
+        self._dispatch_action(self.actions[0])
 
     def run(self) -> None:
         """Poll lifecycle while preparing chunks and waiting for publication deadlines."""
@@ -1434,7 +1396,7 @@ class PolicyRunner:
                 self._recorder_start_wait_ms = 0.0
                 self.shared.set_heartbeat("policy", time.monotonic())
                 self._handle_run_boundary()
-                state, generation, started_ns, raw_stop = read_run_state(self.shared)
+                state, run_id, started_ns, raw_stop = read_run_state(self.shared)
                 if (
                     self.run_started_ns is not None
                     and state is SafetyState.RUNNING
@@ -1442,7 +1404,7 @@ class PolicyRunner:
                     self._run_active_tick(time.monotonic_ns())
                     if (
                         self.run_started_ns is not None
-                        and self._running_generation_is_live()
+                        and self._running_run_is_live()
                     ):
                         self._record_rollout_tick(time.monotonic_ns())
                 wait_s = self.poll_period_s
@@ -1469,7 +1431,7 @@ class PolicyRunner:
                     result = self.recorder.join_stop()
                 except Exception as exc:
                     self._mark_evidence_failed(f"RecorderIO finalization wait raised: {exc}")
-                    result = RecorderStopResult(done=False)
+                    result = RecordingResult(done=False)
                 if result.done:
                     self._complete_recording(result)
                 else:
@@ -1477,10 +1439,10 @@ class PolicyRunner:
                         "rollout recording finalization timed out"
                     )
             logger.info(
-                "policy session summary: trials=%d/%d saved_episodes=%d "
+                "policy session summary: episodes=%d/%d saved_episodes=%d "
                 "evidence_failed=%s%s",
-                self.completed_trials,
-                self.num_trials,
+                self.completed_episodes,
+                self.num_episodes,
                 self.saved_episodes,
                 self.evidence_failed,
                 (
@@ -1555,7 +1517,7 @@ def policy_runner_loop(
     config: PolicyRuntimeConfig,
     execute: bool,
     max_running_s: float | None = None,
-    num_trials: int = 1,
+    num_episodes: int = 1,
     recording_config: RolloutRecordingConfig | None = None,
     fingertip_config: FingertipAssemblerConfig | None = None,
 ) -> None:
@@ -1580,7 +1542,7 @@ def policy_runner_loop(
             fingertip_runtime=fingertip_runtime,
             execute=execute,
             max_running_s=max_running_s,
-            num_trials=num_trials,
+            num_episodes=num_episodes,
             recording_config=recording_config,
         )
         shared.set_heartbeat("policy", time.monotonic())

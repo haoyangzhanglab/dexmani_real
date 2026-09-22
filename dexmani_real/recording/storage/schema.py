@@ -1,10 +1,12 @@
-"""The only supported raw episode layout: physical source rows, schema v30."""
+"""The only supported raw episode layout: physical source rows, schema v31."""
 
 from dataclasses import dataclass
 
 import numpy as np
 
-EPISODE_SCHEMA_VERSION = 30
+from dexmani_real.ipc.schema import RECORD_COMMAND_FIELDS
+
+EPISODE_SCHEMA_VERSION = 31
 ARM_SENT_DATASET = "action_arm_joint_sent"
 
 
@@ -41,7 +43,7 @@ DATASET_SPECS = {
     "action_arm_joint_sent": _spec(np.float64, (7,)),
     "action_hand_joint": _spec(np.float64, (12,)),
     "action_arm_ee": _spec(np.float64, (9,)),
-    "flag_action_queued": _spec(np.bool_),
+    **{name: _spec(dtype) for name, dtype in RECORD_COMMAND_FIELDS},
     "flag_frame_status": _spec(np.uint8),
     "observation_anchor_monotonic_ns": _spec(np.uint64),
     "observation_valid": _spec(np.bool_),
@@ -81,3 +83,94 @@ def validate_data_layout(shapes, dtypes, *, frame_count: int) -> tuple[str, ...]
     for name in set(shapes) - DATASET_SPECS.keys():
         errors.append(f"unexpected data.h5 dataset: {name}")
     return tuple(errors)
+
+
+FRAME_OK = 0
+FRAME_HELD = 1
+FRAME_IK_FAIL = 2
+FRAME_SAFETY_REJECT = 3
+FRAME_RETARGET_FAIL = 4
+FRAME_PARTIAL_ADOPTION = 5
+FRAME_ADOPTION_UNKNOWN = 6
+DIAGNOSTIC_STATUSES = (FRAME_PARTIAL_ADOPTION, FRAME_ADOPTION_UNKNOWN)
+
+
+def validate_command_row(row) -> None:
+    """Validate externally persisted command facts without inventing missing ACKs."""
+    status = int(row["flag_frame_status"])
+    if status not in range(7):
+        raise ValueError("unknown frame status")
+    cid = int(row["command_id"])
+    issued = int(row["command_issued_monotonic_ns"])
+    present = False
+    complete = True
+    for actuator in ("arm", "hand"):
+        has_target = bool(row[f"command_{actuator}_present"])
+        adopted = bool(row[f"{actuator}_command_adopted"])
+        stamp = int(row[f"{actuator}_command_adopted_monotonic_ns"])
+        present |= has_target
+        complete &= not has_target or adopted
+        if adopted != (stamp > 0) or (adopted and (not has_target or stamp < issued)):
+            raise ValueError(f"inconsistent {actuator} adoption")
+        if cid == 0 and (has_target or adopted or stamp):
+            raise ValueError("unknown command cannot carry actuator facts")
+    if cid == 0:
+        if issued or int(row["command_run_id"]):
+            raise ValueError("unknown command has identity/timing")
+        if status == FRAME_OK:
+            raise ValueError("normal action requires an adopted command")
+    elif not issued or not int(row["command_run_id"]) or not present:
+        raise ValueError("command identity/presence/timing incomplete")
+    elif status not in DIAGNOSTIC_STATUSES and not complete:
+        raise ValueError("normal/held action is not jointly adopted")
+    if status == FRAME_PARTIAL_ADOPTION:
+        adopted_count = sum(bool(row[f"{name}_command_adopted"]) for name in ("arm", "hand"))
+        present_count = sum(bool(row[f"command_{name}_present"]) for name in ("arm", "hand"))
+        if not 0 < adopted_count < present_count:
+            raise ValueError("partial adoption requires a known adopted subset")
+
+
+COMMAND_IDENTITY_FIELDS = tuple(name for name, _ in RECORD_COMMAND_FIELDS) + (
+    "action_arm_joint_sent", "action_hand_joint", "action_arm_ee",
+)
+
+
+class CommandHistory:
+    """Raw identity validation shared by the streaming writer and offline reader."""
+
+    def __init__(self) -> None:
+        self.highest_id = 0
+        self.last_adopted = None
+
+    def observe(self, row) -> bool:
+        validate_command_row(row)
+        cid = int(row["command_id"])
+        status = int(row["flag_frame_status"])
+        if status not in (FRAME_OK, *DIAGNOSTIC_STATUSES):
+            # After partial adoption a held row still references the last JOINT
+            # command; it does not claim to undo the diagnostic physical action.
+            expected = 0 if self.last_adopted is None else int(self.last_adopted["command_id"])
+            if cid != expected:
+                raise ValueError("held/failure row must reference the last jointly adopted command")
+            if cid:
+                for name in COMMAND_IDENTITY_FIELDS:
+                    if not np.array_equal(row[name], self.last_adopted[name], equal_nan=True):
+                        raise ValueError(f"repeated command changed {name}")
+            return False
+        if cid <= self.highest_id:
+            raise ValueError("new command IDs must increase")
+        self.highest_id = cid
+        if status == FRAME_OK:
+            self.last_adopted = {name: np.copy(row[name]) for name in COMMAND_IDENTITY_FIELDS}
+            return True
+        return False
+
+
+def command_send_mask(rows) -> np.ndarray:
+    """Validate command history and select new jointly adopted commands."""
+    mask = np.zeros(len(rows["command_id"]), dtype=bool)
+    history = CommandHistory()
+    for i in range(len(mask)):
+        row = {name: rows[name][i] for name in (*COMMAND_IDENTITY_FIELDS, "flag_frame_status")}
+        mask[i] = history.observe(row)
+    return mask

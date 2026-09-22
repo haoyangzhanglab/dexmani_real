@@ -594,12 +594,23 @@ class HandParams:
 
 
 @dataclass(frozen=True)
-class PolicyParams:
-    """Policy / teleop parameters — single source of truth."""
+class TeleopTimingParams:
+    """VR command-grid and operator polling cadence."""
 
     control_hz: float = 16.0
-    # Teleoperation polls faster than its command rate. Policy uses PolicySpec dt.
     executor_poll_hz: float = 128.0
+
+    def validate(self) -> None:
+        if not np.isfinite(self.control_hz) or self.control_hz <= 0:
+            raise ValueError("teleop.control_hz must be finite and positive")
+        if not np.isfinite(self.executor_poll_hz) or self.executor_poll_hz < self.control_hz:
+            raise ValueError("teleop.executor_poll_hz must be finite and >= control_hz")
+
+
+@dataclass(frozen=True)
+class PolicyParams:
+    """Shared experiment/control settings; learned policy timing is PolicySpec-owned."""
+
     # Cross-modal source-span bound for the teleop RECORDING provenance flag
     # (raw ``observation_valid``); it is not a policy admission gate. Model
     # shape, history, and action horizon remain PolicySpec-owned; policy
@@ -637,13 +648,6 @@ class PolicyParams:
     hand_disconnect_timeout_s: float = 1.0
 
     def validate(self) -> None:
-        if not np.isfinite(self.control_hz) or self.control_hz <= 0:
-            raise ValueError(f"control_hz={self.control_hz} must be > 0")
-        if (
-            not np.isfinite(self.executor_poll_hz)
-            or self.executor_poll_hz < self.control_hz
-        ):
-            raise ValueError("executor_poll_hz must be finite and >= control_hz")
         if (
             not np.isfinite(self.max_observation_skew_s)
             or self.max_observation_skew_s <= 0
@@ -905,17 +909,6 @@ class VRParams:
 class SafetyParams:
     """Safety / heartbeat parameters — single source of truth."""
 
-    # Maximum lateness allowed after a command becomes eligible.
-    max_dispatch_delay_s: float = 0.1
-
-    @property
-    def dispatch_delay_ns(self) -> int:
-        value = self.max_dispatch_delay_s
-        if (value is None or isinstance(value, bool) or not np.isfinite(value)
-                or value <= 0 or value * 1e9 < 1 or value * 1e9 >= 2**63):
-            raise ValueError("safety.max_dispatch_delay_s requires an explicit finite positive motion budget")
-        return int(value * 1e9)
-
     heartbeat_timeouts: Mapping[str, float] = field(
         default_factory=lambda: {
             "arm": 1.0,
@@ -947,7 +940,6 @@ class SafetyParams:
     supervisor_hz: float = 10.0
 
     def validate(self) -> None:
-        _ = self.dispatch_delay_ns
         if not self.heartbeat_timeouts or any(
             not name or not np.isfinite(value) or value <= 0
             for name, value in self.heartbeat_timeouts.items()
@@ -987,10 +979,8 @@ class CameraParams:
     # truthfulness threshold — it is never derived from model latency or
     # recording-quality parameters, and the value matches the long-standing
     # effective device stall timeout. The disposition belongs to the caller:
-    # a required policy-input camera latches the physical fault, while an
-    # evidence-only camera marks a session failure that never ends control,
-    # so the recording layer's own recording_stall_abort_s path saves the
-    # collected prefix.
+    # required-camera loss ends recorded motion and invalidates the episode.
+    # It is an evidence failure, not by itself a physical hardware fault.
     source_stall_timeout_s: float = 2.0
     # Recording-evidence stall budget owned by the teleop recording grid
     # (CameraFreshnessTracker): how long a recording tolerates no fresh camera
@@ -1061,6 +1051,7 @@ class CameraParams:
 arm = ArmParams()
 hand = HandParams()
 policy = PolicyParams()
+teleop = TeleopTimingParams()
 keyboard_teleop = KeyboardTeleopParams()
 vr = VRParams()
 safety = SafetyParams()
