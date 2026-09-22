@@ -46,9 +46,9 @@ Preserve the actual physical guarantees that matter for this research stack:
 - XHand tactile aggregate/dense partial validity;
 - child-process shutdown before shared-memory release.
 
-Normal teleop, learned-policy evaluation, and ordinary supervised streaming do not require generic software collision checking.
+Online Cartesian IK rejects robot self-colliding target configurations using the final prepared hand target. Arm-only Cartesian control uses fresh measured hand geometry when available; hand-disabled operation assumes the hand is absent or secured at configured home and uses the fixed-home envelope.
 
-Collision/workspace/table path planning is owned by planned return_home.
+Normal teleop/eval/replay do not perform current-to-target transition/path/environment collision checking. Full collision/workspace/table path planning is owned by planned return_home.
 
 Cartesian teleop or EE policies may use a simple EEF workspace clip before IK. Joint policies do not run normal-runtime FK merely to impose a generic workspace gate.
 
@@ -84,6 +84,8 @@ Do not build source -> receive -> publish -> commit causal proof frameworks.
 One control step should assemble one current observation snapshot from latest required fresh samples. Teleop control and raw recording should reuse that same snapshot.
 
 Policy temporal history belongs in a local control-row deque, not in historical sensor-ring reconstruction.
+
+A published point cloud is a self-contained derived observation. source_camera_sequence is provenance and is used for exact matching only when RGB and pointcloud are consumed together. A pointcloud-only policy does not look up its source camera frame; its rollout recorder independently uses latest fresh camera telemetry.
 
 ## Data
 
@@ -147,4 +149,4 @@ Never run hardware examples as tests.
 
 Inspect the final diff/searches for dead imports, deleted config, stale docs, and obsolete terminology.
 
-README contains stable setup/workflow semantics. codex_task.md contains the current implementation migration specification. Implementation details belong in source after the migration is complete.
+README contains stable workflows and operating conventions. Source code and resolved configuration define implementation behavior.

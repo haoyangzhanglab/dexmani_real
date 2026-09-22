@@ -36,6 +36,8 @@ def run_keyboard_experiment(runtime, *, no_hand):
     planner = XArm7MotionPlanner.create_default(teleop_profile=OnlineIKConfig(
         max_pose_error_pos_m=cfg.ik_max_pose_error_pos_m,
         max_pose_error_rot_rad=cfg.ik_max_pose_error_rot_rad))
+    if not runtime.policy.hand_enabled:
+        planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
     workspace = runtime.policy.workspace.as_array()
     home_down = False
     clean = False
@@ -79,6 +81,8 @@ def run_keyboard_experiment(runtime, *, no_hand):
                 pos = np.clip(pose.p+dx, workspace[:,0]+cfg.workspace_command_margin_m,
                               workspace[:,1]-cfg.workspace_command_margin_m)
                 quat = (Rotation.from_euler("xyz", drpy)*Rotation.from_quat(pose.q, scalar_first=True)).as_quat(scalar_first=True)
+                if row.hand is not None:
+                    planner.set_hand_qpos(row.hand["qpos"][0])
                 result = planner.solve_teleop_ik(Pose(p=pos, q=quat), qpos, qpos)
                 if result.success:
                     target = project_arm_command(result.qpos, qpos,

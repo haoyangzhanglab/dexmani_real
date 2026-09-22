@@ -18,6 +18,8 @@ class TeleopController:
         self.arm_fk = make_arm_fk()
         self.cache = HandRetargetObservationCache()
         self.prev_qpos_cmd = None
+        if not runtime.policy.hand_enabled:
+            self.planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
         self.clear_reference()
 
     def clear_reference(self):
@@ -56,6 +58,7 @@ class TeleopController:
                                             qpos_max_rad=cfg.hand.qpos_max_rad)
             except (ValueError, RuntimeError):
                 return None, FRAME_RETARGET_FAIL, intent
+            self.planner.set_hand_qpos(hand)
         solution = self.planner.solve_teleop_ik(Pose(p=target.position_world_m, q=target.quat_world_wxyz),
                                                row.arm["qpos"][0], self.prev_qpos_cmd)
         if not solution.success:

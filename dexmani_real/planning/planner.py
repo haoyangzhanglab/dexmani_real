@@ -23,7 +23,7 @@ from dexmani_real.robot.model import (
 from .collision import CollisionModel
 from .kinematics.arm_fk import XArm7Kinematics
 from .kinematics.ik import IKResult, OnlineIKConfig, OnlineIKSolver
-from .kinematics.ik_geometry import IKGeometry, is_mplib_success
+from .kinematics.ik_geometry import IKGeometry
 from .kinematics.pose import Pose, ensure_qpos
 from .paths import PathResult, WORKSPACE_BOUNDS_TOLERANCE_M, interpolate_waypoints
 
@@ -154,7 +154,7 @@ class XArm7MotionPlanner:
             base_pose_world=base_pose_world,
             mplib=self.mplib,
         )
-        # Pinocchio validates dense paths post-hoc, complementing MPlib's FCL checks.
+        # Pinocchio checks online IK endpoints and planned home paths.
         self.collision_model = CollisionModel(
             hand_dof=hand_dof,
             static_boxes=static_boxes,
@@ -222,7 +222,7 @@ class XArm7MotionPlanner:
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
-        """Set fixed hand geometry for planned return-home."""
+        """Set hand geometry for online IK endpoints or planned return-home."""
         self.collision_model.set_hand_qpos(hand_qpos)
 
     def set_base_pose(self, base_pose_world: Pose) -> None:
@@ -300,7 +300,7 @@ class XArm7MotionPlanner:
                 report={"mplib_status": "Invalid"},
             )
         status = str(result.get("status", ""))
-        if not is_mplib_success(status):
+        if not status.lower().startswith("success"):
             return PathResult(
                 success=False,
                 qpos_path=None,

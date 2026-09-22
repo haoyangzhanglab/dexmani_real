@@ -15,15 +15,6 @@ from ..collision import CollisionInfo
 from ..paths import wrap_nearest_equivalent
 from .pose import ensure_qpos
 
-def is_mplib_success(status: str) -> bool:
-    """Canonical MPlib IK status check — True when MPlib reports success.
-
-    Centralised here because MPlib's status string format (``"Success"``,
-    ``"Success (closest)"``, etc.) is an implementation detail that could
-    change across MPlib versions.
-    """
-    return status.lower().startswith("success")
-
 
 class IKGeometry:
     """Joint canonicalization and collision queries shared by online IK and home.
@@ -150,6 +141,11 @@ class IKGeometry:
     def check_self_collision(self, qpos: np.ndarray) -> CollisionInfo:
         self._require_collision_model()
         return self._cm.check_self_collision_details(qpos)  # type: ignore[union-attr]
+
+    def has_self_collision(self, qpos: np.ndarray) -> bool:
+        """Robot endpoint self-collision only; excludes environment and table."""
+        self._require_collision_model()
+        return self._cm.check_self_collision(qpos)  # type: ignore[union-attr]
 
     def has_collision(self, qpos: np.ndarray) -> bool:
         self._require_collision_model()

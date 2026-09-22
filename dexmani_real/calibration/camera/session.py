@@ -39,8 +39,8 @@ Controls:
 XHand is optional, but ``--hand-geometry`` is a required physical-state assertion,
 not a geometry selector: pass ``absent`` only when no XHand is mounted, or
 ``secured-home`` only when an installed hand is physically fixed at its configured
-home pose. Planned return-home collision checks use the canonical fixed-home XHand
-envelope for both assertions, so the ``absent`` case is conservative.
+home pose. Cartesian IK endpoint checks and planned return-home checks use the
+fixed-home XHand envelope for both assertions, so the ``absent`` case is conservative.
 """
 
 from __future__ import annotations
@@ -709,8 +709,8 @@ def run_camera_calibration(
 ) -> int:
     """Own the arm worker, shared state, camera session, and bounded cleanup.
 
-    ``hand_geometry`` is an operator physical-state assertion. Collision planning
-    intentionally uses the canonical fixed-home XHand envelope for both accepted
+    ``hand_geometry`` is an operator physical-state assertion. IK endpoint and
+    return-home checks use the fixed-home XHand envelope for both accepted
     values; ``absent`` therefore retains conservative hand geometry.
     """
     if hand_geometry not in {"absent", "secured-home"}:
@@ -720,13 +720,13 @@ def run_camera_calibration(
     planner, workspace = _build_planner(runtime)
     if hand_geometry == "absent":
         print(
-            "  XHand: absent (operator assertion); return-home geometry conservatively "
-            "retain the fixed-home XHand envelope"
+            "  XHand: absent (operator assertion); IK/home geometry conservatively "
+            "retains the fixed-home XHand envelope"
         )
     else:
         print(
             "  XHand: mounted and secured at configured home (operator assertion); "
-            "return-home geometry uses the fixed-home XHand envelope"
+            "IK/home geometry uses the fixed-home XHand envelope"
         )
 
     ctx = mp.get_context("spawn")

@@ -61,7 +61,8 @@ class PointCloudLoopConfig:
     """Resolved processing policy for the realtime worker.
 
     Each cloud keeps its camera sequence and acquisition time. Consumers
-    check freshness and retrieve the matching RGB-D sample.
+    check cloud freshness; only joint RGB/cloud consumers retrieve the matching
+    RGB-D sample. Published clouds are otherwise self-contained.
     """
 
     pointcloud: PointCloudConfig

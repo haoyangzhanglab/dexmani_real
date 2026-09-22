@@ -110,9 +110,9 @@ XHand 接收绝对目标，运动响应由设备控制器决定。
 
 ### Collision / workspace
 
-normal teleop、policy eval 和普通 supervised streaming 不运行 generic software collision checker。实验依赖操作者现场监督、硬件急停、机械限位和 xArm firmware motion controls。
+Online Cartesian IK 使用最终准备好的 hand target，拒绝 robot self-colliding target configurations。arm-only Cartesian jogging 使用 fresh measured hand geometry；--no-hand 使用固定 home 几何，要求手已拆除或固定在配置的 home 姿态。
 
-collision planning 只保留在 planned return_home 中。
+normal teleop / policy eval / replay 不做 current-to-target transition/path/environment collision checking。完整 path/environment collision planning 由 planned return_home 负责。实验仍依赖操作者现场监督、硬件急停、机械限位和 xArm firmware motion controls。
 
 Cartesian teleop / EE policy 可以在 IK 前做简单 EEF workspace clip；joint-action policy 不为了 normal runtime safety 额外做 FK workspace gate。
 
@@ -128,6 +128,8 @@ arm、hand、camera、VR、point cloud 都是异步 producer。
 - teleop controller 与 raw recorder 复用同一份 snapshot。
 
 各模态按自身时间戳检查新鲜度。
+
+已发布的 point cloud 是自包含的 derived observation；pointcloud-only policy 不要求源 RGB-D 帧仍保留在 camera ring。source_camera_sequence 保留 provenance，只在模型同时消费 RGB + pointcloud 时用于精确源帧匹配。pointcloud-only rollout 的 recorder 独立使用 latest fresh camera telemetry，不要求与点云同源。
 
 policy temporal history由 control-row deque 维护，不在 inference 时重新从 sensor rings 回溯构造历史。warm-up 使用 edge padding；pause / 大 gap 后清空并重新开始 history。
 
@@ -244,7 +246,7 @@ return_home 是唯一刻意保守的 motion path。
 - measured final convergence；
 - restore Mode 6。
 
-xArm HOME 成功以 measured qpos / qvel convergence 为准。XHand HOME 在 owning worker 的 SDK 发送成功后完成，不等待实测收敛；回家路径使用配置的手部 home 几何，commissioning 必须验证实际手部运动与随后的机械臂路径。
+xArm HOME 成功以 measured qpos / qvel convergence 为准。XHand HOME 在 owning worker 的 SDK 发送成功后完成，不等待实测收敛；随后 arm-home 在现有 feedback 等待期限内取得一份 fresh post-command measured hand qpos 用于路径规划，无需达到 home target。缺少该反馈会阻止 arm-home 规划。无手反馈模式使用固定 home 几何；commissioning 必须验证实际手部运动与随后的机械臂路径。
 
 ## Policy rollout
 
@@ -272,7 +274,9 @@ Policy process拥有 model / CUDA，保持同步 inference 与 local action chun
 - XHand direct absolute target的行为、电流和jerk；
 - C pause/resume stale-action fence 与 re-anchor；
 - arm / hand / camera / VR freshness；
+- Cartesian IK 使用最终 hand target 的端点自碰撞几何与在线求解耗时；
 - return_home安全路径；
+- XHand HOME 接受后的实测手姿态、后续手部运动与机械臂 return_home 路径；
 - slow inference无旧动作复活、无catch-up burst；
 - recorder / camera failure；
 - tactile partial validity；

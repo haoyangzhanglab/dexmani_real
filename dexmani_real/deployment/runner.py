@@ -17,14 +17,18 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 
-def decode_policy_action(action, policy_spec, current_arm_qpos, *, previous_arm_command_qpos, planner, workspace):
+def decode_policy_action(action, policy_spec, current_arm_qpos, *, previous_arm_command_qpos,
+                         planner, workspace, hand_qpos_min_rad, hand_qpos_max_rad):
+    raw_hand = action[7:19] if policy_spec.action_key == "action" else action[9:21]
+    hand = project_hand_command(raw_hand, qpos_min_rad=hand_qpos_min_rad, qpos_max_rad=hand_qpos_max_rad)
     if policy_spec.action_key == "action":
-        return action[:7], action[7:19], None
+        return action[:7], hand, None
+    planner.set_hand_qpos(hand)
     position = np.clip(action[:3], workspace[:,0], workspace[:,1])
     intent = np.concatenate((position, action[3:9]))
     result = planner.solve_teleop_ik(Pose(p=position, q=rot6d_to_quat_wxyz(action[3:9])),
         current_arm_qpos, current_arm_qpos if previous_arm_command_qpos is None else previous_arm_command_qpos)
-    return result.qpos if result.success else None, action[9:21], intent
+    return result.qpos if result.success else None, hand, intent
 
 
 class PolicyRunner:
@@ -50,12 +54,16 @@ class PolicyRunner:
             max_pose_error_pos_m=runtime.policy.ik_max_pose_error_pos_m,
             max_pose_error_rot_rad=runtime.policy.ik_max_pose_error_rot_rad)) if policy_spec.action_key == "action_ee" else None
         fields = {f.name for f in self.spec.observation_fields}
+        self.requires_rgb = "rgb" in fields
         self.requires_cloud = "point_cloud" in fields
-        self.requires_camera = bool(fields & {"point_cloud", "rgb"}) or self.recorder is not None
+        self.requires_recording_camera = self.recorder is not None
+        self.requires_camera_payload = self.requires_rgb or self.requires_recording_camera
+        self.requires_rgb_cloud_identity = self.requires_rgb and self.requires_cloud
 
     def _row(self):
         return read_observation(self.shared, self.runtime, require_hand=True,
-            require_camera=self.requires_camera, require_pointcloud=self.requires_cloud)
+            require_camera=self.requires_camera_payload, require_pointcloud=self.requires_cloud,
+            require_rgb_cloud_identity=self.requires_rgb_cloud_identity)
 
     def _live(self):
         return (self.run_id is not None and self.shared.is_running.value
@@ -167,9 +175,11 @@ class PolicyRunner:
                 self._finish("required_observation_stale", incomplete=True)
                 return
         action = self.actions.popleft()
-        arm, hand, intent = decode_policy_action(action, self.spec, row.arm["qpos"][0],
+        arm, prepared_hand, intent = decode_policy_action(action, self.spec, row.arm["qpos"][0],
             previous_arm_command_qpos=self.previous_arm, planner=self.planner,
-            workspace=self.runtime.policy.workspace.as_array())
+            workspace=self.runtime.policy.workspace.as_array(),
+            hand_qpos_min_rad=self.runtime.hand.qpos_min_rad,
+            hand_qpos_max_rad=self.runtime.hand.qpos_max_rad)
         if arm is None:
             self.actions.clear()
             if self.recorder:
@@ -178,12 +188,11 @@ class PolicyRunner:
             return
         prepared_arm = project_arm_command(arm, row.arm["qpos"][0],
             joint_lower_rad=self.runtime.arm.joint_limit_lower, joint_upper_rad=self.runtime.arm.joint_limit_upper)
-        prepared_hand = project_hand_command(hand, qpos_min_rad=self.runtime.hand.qpos_min_rad,
-                                            qpos_max_rad=self.runtime.hand.qpos_max_rad)
+        raw_hand = action[7:19] if self.spec.action_key == "action" else action[9:21]
         arm_change = prepared_arm - arm
         equivalent = np.asarray(self.runtime.arm.joint_limit_upper) - np.asarray(self.runtime.arm.joint_limit_lower) >= 2*np.pi
         arm_change[equivalent] = (arm_change[equivalent]+np.pi) % (2*np.pi)-np.pi
-        clip = max(float(np.max(np.abs(arm_change))), float(np.max(np.abs(prepared_hand-hand))))
+        clip = max(float(np.max(np.abs(arm_change))), float(np.max(np.abs(prepared_hand-raw_hand))))
         self.clip_count += int(clip > 1e-9)
         self.max_clip_rad = max(self.max_clip_rad, clip)
         command = RobotCommand(self.run_id, prepared_arm, prepared_hand)

@@ -5,8 +5,8 @@ The interactive session can command the arm and writes ``cameras.json`` after
 ENTER. ``--hand-geometry`` is a required physical-state assertion, not a geometry
 selector: use ``absent`` only without a mounted XHand, or ``secured-home`` only
 when the mounted hand is physically fixed at its configured home pose. Current
-calibration collision checks conservatively use the fixed-home XHand envelope for
-both assertions.
+Cartesian IK endpoint self-collision and return-home path checks conservatively
+use the fixed-home XHand envelope for both assertions.
 """
 
 from __future__ import annotations

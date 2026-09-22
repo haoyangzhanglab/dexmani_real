@@ -56,7 +56,7 @@ class ObservationRow:
 
 
 def read_observation(shared, runtime, *, require_hand=True, require_camera=False,
-                     require_vr=False, require_pointcloud=False):
+                     require_vr=False, require_pointcloud=False, require_rgb_cloud_identity=False):
     arm_result = shared.arm_state_ring.read_latest()
     hand_result = shared.hand_state_ring.read_latest() if require_hand else None
     cloud_result = shared.pointcloud_ring.read_latest() if require_pointcloud else None
@@ -65,9 +65,12 @@ def read_observation(shared, runtime, *, require_hand=True, require_camera=False
     arm = arm_result[0]
     hand = hand_result[0] if hand_result else None
     cloud = cloud_result[0][0] if cloud_result else None
-    camera = read_camera_frame(shared, int(cloud["source_camera_sequence"]) if cloud is not None else None) if require_camera else None
+    if require_rgb_cloud_identity:
+        camera = read_camera_frame(shared, int(cloud["source_camera_sequence"])) if cloud is not None else None
+    else:
+        camera = read_camera_frame(shared) if require_camera else None
     vr = read_vr_frame(shared) if require_vr else None
-    if (require_camera and camera is None) or (require_vr and vr is None):
+    if ((require_camera or require_rgb_cloud_identity) and camera is None) or (require_vr and vr is None):
         return None
     now = time.monotonic_ns()
     if not sample_is_fresh(arm["timestamp_ns"][0], runtime.policy.arm_state_stale_threshold_s, now):

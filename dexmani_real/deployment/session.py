@@ -74,6 +74,7 @@ def run_policy_deployment(runtime, policy_spec, worker_config, execute, *, prefi
         raise ValueError("recorded evaluation requires execute and a finite run budget")
     fields = {f.name: f for f in policy_spec.observation_fields}
     cloud = "point_cloud" in fields
+    # Cloud production needs a camera worker; pointcloud-only rows need no source-frame lookup.
     camera = cloud or "rgb" in fields or recording_config is not None
     points = fields["point_cloud"].shape[0] if cloud else runtime.pointcloud.num_points
     ctx = mp.get_context("spawn")

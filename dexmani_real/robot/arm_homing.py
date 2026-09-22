@@ -1,4 +1,4 @@
-"""Planned return-home; collision geometry stays here, outside streaming control."""
+"""Planned return-home with full path/environment collision checks."""
 import time
 from queue import Full, Empty
 from dataclasses import dataclass
@@ -54,7 +54,7 @@ def _home_path(current, target, planner, config):
 
 
 def execute_arm_home(shared, home_qpos, *, planner, config, estop_requested=None,
-                     cancel_requested=None, progress=None):
+                     cancel_requested=None, progress=None, hand_state_max_age_s=None):
     target = np.asarray(home_qpos, dtype=np.float64)
     if target.shape != (7,) or not np.isfinite(target).all():
         return HomeResult(False, "home target must be finite (7,)")
@@ -74,18 +74,31 @@ def execute_arm_home(shared, home_qpos, *, planner, config, estop_requested=None
         return ((cancel_requested is not None and cancel_requested()) or
                 not command_may_cross_sdk(shared, run_id=epoch, required_safety_state=SafetyState.ARMED))
     deadline = time.monotonic() + config.prehome_timeout_s
+    hand_state = None
+    feedback_issue = "fresh stationary arm state unavailable"
     while time.monotonic() < deadline:
         if aborted():
             return HomeResult(False, "home interrupted")
         state = read_arm_state(shared)
+        feedback_issue = "fresh stationary arm state unavailable"
         if (state is not None and int(state["timestamp_ns"][0]) > boundary_ns
                 and sample_is_fresh(state["timestamp_ns"][0], config.state_max_age_s)
                 and np.max(np.abs(state["qvel"][0])) <= config.stationary_velocity_rad_s):
-            break
+            if hand_state_max_age_s is None:
+                break
+            latest_hand = shared.hand_state_ring.read_latest()
+            hand_state = latest_hand[0] if latest_hand is not None else None
+            if (hand_state is not None and int(hand_state["timestamp_ns"][0]) > boundary_ns
+                    and sample_is_fresh(hand_state["timestamp_ns"][0], hand_state_max_age_s)
+                    and np.isfinite(hand_state["qpos"][0]).all()):
+                break
+            feedback_issue = "fresh post-home hand state unavailable"
         time.sleep(0.01)
     else:
-        return HomeResult(False, "fresh stationary arm state unavailable")
+        return HomeResult(False, feedback_issue)
     try:
+        if hand_state is not None:
+            planner.set_hand_qpos(hand_state["qpos"][0])
         waypoints = _home_path(state["qpos"][0], target, planner, config)
     except Exception as exc:
         return HomeResult(False, f"home planning failed: {exc}")
@@ -104,11 +117,11 @@ def execute_arm_home(shared, home_qpos, *, planner, config, estop_requested=None
 
 
 def build_policy_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
-    """Construct the collision-checked home planner (mirrors replay setup).
+    """Construct the shared return-home planner for teleop, policy and replay.
 
-    The policy runner's planner only carries workspace bounds; a safe
-    return-home needs the full collision model (hand-dof + table + static
-    boxes), so the Main process builds its own.
+    Online Cartesian IK checks robot endpoint self-collision. Return-home
+    additionally needs path/workspace/table/static-box checks, so the Main
+    process builds its own planner.
     """
     policy = runtime.policy
     workspace = policy.workspace.as_array()
@@ -136,11 +149,13 @@ def home_policy_robot(shared, runtime, planner, *, abort_requested):
     if not hand_result.ok:
         print(f"Hand home failed: {hand_result.reason}", flush=True)
         return False
-    # Home geometry uses the commanded hand posture; SDK success is not arrival.
-    planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
+    # Hand-disabled mode assumes the hand is absent or secured at home.
+    if not runtime.policy.hand_enabled:
+        planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
     result = execute_arm_home(shared, runtime.arm.home_qpos, planner=planner,
         config=ArmHomeConfig.from_runtime(runtime), cancel_requested=abort_requested,
-        estop_requested=lambda: bool(shared.estop_request.value), progress=print)
+        estop_requested=lambda: bool(shared.estop_request.value), progress=print,
+        hand_state_max_age_s=runtime.policy.hand_state_stale_threshold_s if runtime.policy.hand_enabled else None)
     if not result.ok:
         print(f"Home failed: {result.reason}", flush=True)
     return result.ok

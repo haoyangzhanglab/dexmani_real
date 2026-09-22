@@ -15,7 +15,6 @@ if TYPE_CHECKING:
     from .ik_geometry import IKGeometry
     from .arm_fk import XArm7Kinematics
 
-from .ik_geometry import is_mplib_success
 from .pose import Pose, compute_pose_error, ensure_qpos
 
 logger = get_logger(__name__)
@@ -120,7 +119,6 @@ class OnlineIKSolver:
             result = self._command_from_target_qpos(
                 target_eef_pose_world=target_eef_pose_world,
                 current_qpos=current_qpos,
-                previous_qpos_cmd=previous_qpos_cmd,
                 target_qpos=qpos,
                 profile=profile,
                 report=report,
@@ -201,23 +199,15 @@ class OnlineIKSolver:
         )  # (qpos, seed_name, score, manipulability)
         seen_qpos: list[np.ndarray] = []
 
-        for seed_name, seed, n_init in seeds:
+        for seed_name, seed in seeds:
             _tik0 = time.perf_counter()
             model = self.ik_mgr.mp_planner
             raw_qpos, success, _ = model.pinocchio_model.compute_IK_CLIK(
                 model.link_name_2_idx[model.move_group],
                 self.kin.to_mplib_pose(target_pose_base), seed, [])
-            status = "Success" if success else "IK failed"
             _solve_ms = (time.perf_counter() - _tik0) * 1000.0
-            if not is_mplib_success(status) or raw_qpos is None:
-                # Classify solver failures; none produces a new command.
-                if "Cannot find valid solution" in status:
-                    tag = "mplib_no_solution"
-                elif "Distance" in status:
-                    tag = "mplib_distance_fail"
-                else:
-                    tag = "mplib_failed"
-                attempts.append(f"{seed_name}:{tag}({_solve_ms:.1f}ms)")
+            if not success or raw_qpos is None:
+                attempts.append(f"{seed_name}:mplib_failed({_solve_ms:.1f}ms)")
                 continue
 
             raw_qpos = np.asarray(raw_qpos, dtype=np.float64)
@@ -398,7 +388,7 @@ class OnlineIKSolver:
         jump_limit: np.ndarray,
         profile: OnlineIKConfig,
     ) -> tuple[bool, str]:
-        """Validate IK result: pose error, manipulability, joint jump, elbow flip, branch jump L2.
+        """Validate IK pose, manipulability, branch continuity and endpoint self-collision.
 
         Returns (passed, tag) — tag is the first failing check name or "ok".
         """
@@ -427,6 +417,9 @@ class OnlineIKSolver:
         if float(np.linalg.norm(delta_prev)) > np.deg2rad(120):
             return False, "branch_jump_l2"
 
+        if self.ik_mgr.has_self_collision(qpos):
+            return False, "self_collision"
+
         return True, "ok"
 
     def _make_teleop_seeds(
@@ -434,17 +427,17 @@ class OnlineIKSolver:
         prev_cmd: np.ndarray,
         current_qpos: np.ndarray,
         profile: OnlineIKConfig,
-    ) -> list[tuple[str, np.ndarray, int]]:
-        """Generate teleop IK seeds: prev_cmd (n_init_qpos=1) first, then current_qpos + random perturbations."""
-        seeds: list[tuple[str, np.ndarray, int]] = [
-            ("prev_cmd", prev_cmd.copy(), 1),
-            ("current_qpos", current_qpos.copy(), 1),
+    ) -> list[tuple[str, np.ndarray]]:
+        """Try the previous command, measured pose, then perturbed seeds."""
+        seeds: list[tuple[str, np.ndarray]] = [
+            ("prev_cmd", prev_cmd.copy()),
+            ("current_qpos", current_qpos.copy()),
         ]
         offsets_rad = np.deg2rad(profile.position_ik_seed_offset_deg)
         for i in range(profile.position_ik_num_random_seeds):
             seed = prev_cmd + self._rng.uniform(-offsets_rad, offsets_rad, self.kin.dof)
-            seeds.append((f"random_{i}", seed, 1))
-        unique: list[tuple[str, np.ndarray, int]] = []
+            seeds.append((f"random_{i}", seed))
+        unique: list[tuple[str, np.ndarray]] = []
         for item in seeds:
             if not any(
                 np.allclose(item[1], previous[1], atol=1e-8, rtol=0.0)
@@ -520,7 +513,7 @@ class OnlineIKSolver:
 
     @staticmethod
     def _attempt_tag(attempt: str) -> str:
-        """Extract the gate/failure tag from an attempt string ``seed:tag(...)``."""
+        """Extract the rejection tag from an attempt string ``seed:tag(...)``."""
         if ":" not in attempt:
             return attempt
         return attempt.split(":", 1)[1].split("(", 1)[0]
@@ -530,16 +523,13 @@ class OnlineIKSolver:
         """Classify a failed IK run from its per-attempt tags.
 
         ``unreachable`` is reserved for when *every* seed failed to converge.
-        Otherwise the operative gate tag is reported, so failures separate into
-        coherence (delta), hardware-distance, joint-limit,
-        pose-error, and near-miss buckets instead of collapsing to
-        ``unreachable``.
+        Otherwise report the candidate rejection criterion, including
+        continuity, hardware distance, limits, pose error and self-collision.
         """
         tag_set = {cls._attempt_tag(a) for a in attempts}
         if not tag_set:
             return "unknown"
-        non_convergent = {"mplib_failed", "mplib_no_solution", "nan_qpos"}
-        if tag_set <= non_convergent:
+        if tag_set == {"mplib_failed"}:
             return "unreachable"
         if tag_set & {"jump", "elbow_flip", "branch_jump_l2"}:
             return "delta"
@@ -551,18 +541,18 @@ class OnlineIKSolver:
             return "pose_error"
         if "manipulability" in tag_set:
             return "manipulability"
-        if "mplib_distance_fail" in tag_set:
-            return "near_miss"
+        if "self_collision" in tag_set:
+            return "self_collision"
         return "all_filtered"
 
     @classmethod
     def _build_diagnostic(cls, report: dict[str, Any]) -> dict[str, Any]:
         """Classify failed IK attempts for local diagnostics."""
         attempts = report.get("attempts")
-        if attempts is None or isinstance(attempts, str):
-            # Reports without structured attempts degrade to unknown.
-            attempts = []
-        classification = cls._classify_attempts(list(attempts))
+        classification = (
+            "invalid_output" if report.get("failure_kind") == IKFailureKind.INVALID_OUTPUT
+            else cls._classify_attempts(attempts or [])
+        )
         failure_reason = str(report.get("failure_reason", ""))
         return {
             "classification": classification,
@@ -573,7 +563,6 @@ class OnlineIKSolver:
         self,
         qpos_cmd: np.ndarray,
         current_qpos: np.ndarray,
-        previous_qpos_cmd: np.ndarray,
         reason: str,
         report: dict[str, Any],
         failure_kind: IKFailureKind = IKFailureKind.GEOMETRY_REJECTED,
@@ -605,7 +594,6 @@ class OnlineIKSolver:
         self,
         target_eef_pose_world: Pose,
         current_qpos: np.ndarray,
-        previous_qpos_cmd: np.ndarray,
         target_qpos: np.ndarray,
         profile: OnlineIKConfig,
         report: dict[str, Any],
@@ -616,7 +604,6 @@ class OnlineIKSolver:
             return self._failed_solution(
                 qpos_cmd,
                 current_qpos,
-                previous_qpos_cmd,
                 "Final IK command is non-finite",
                 report,
                 failure_kind=IKFailureKind.INVALID_OUTPUT,
@@ -649,7 +636,6 @@ class OnlineIKSolver:
             return self._failed_solution(
                 qpos_cmd,
                 current_qpos,
-                previous_qpos_cmd,
                 "Final canonical IK command is non-finite",
                 report,
                 failure_kind=IKFailureKind.INVALID_OUTPUT,
@@ -659,7 +645,6 @@ class OnlineIKSolver:
             return self._failed_solution(
                 qpos_cmd,
                 current_qpos,
-                previous_qpos_cmd,
                 "Final IK command violates joint limits",
                 report,
             )
@@ -671,7 +656,6 @@ class OnlineIKSolver:
             return self._failed_solution(
                 qpos_cmd,
                 current_qpos,
-                previous_qpos_cmd,
                 "Final IK pose error is non-finite",
                 report,
                 failure_kind=IKFailureKind.INVALID_OUTPUT,
@@ -683,11 +667,16 @@ class OnlineIKSolver:
             return self._failed_solution(
                 qpos_cmd,
                 current_qpos,
-                previous_qpos_cmd,
                 "Final IK command exceeds pose-error limits",
                 report,
                 cmd_tracking_error_pos_m=cmd_pos_error,
                 cmd_tracking_error_rot_rad=cmd_rot_error,
+            )
+
+        # Refinement can change a previously collision-free candidate.
+        if self.ik_mgr.has_self_collision(qpos_cmd):
+            return self._failed_solution(
+                qpos_cmd, current_qpos, "self_collision", report,
             )
 
         qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
@@ -695,7 +684,6 @@ class OnlineIKSolver:
             return self._failed_solution(
                 qpos_cmd,
                 current_qpos,
-                previous_qpos_cmd,
                 "Final IK command delta is non-finite",
                 report,
                 failure_kind=IKFailureKind.INVALID_OUTPUT,
