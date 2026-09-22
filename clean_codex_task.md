@@ -1,71 +1,115 @@
 # Codex Task — Final Style-Only Cleanup for DexMani Real
 
-## Baseline
+## 0. Baseline and goal
 
-Fact-checked against:
+Production code was fact-checked at:
 
 ~~~text
-main = ea8a4d7f5e1bcd8feba8919eb9ec32b08940c0e4
+ea8a4d7f5e1bcd8feba8919eb9ec32b08940c0e4
 ~~~
 
-If main moved, inspect current source before editing and preserve this task's intent. Do not restore findings that newer code already fixed.
+This task document was added afterward and does not itself change production code.
 
-This is a **style-only final polish** covering only P0, P1, and P2.
+If main moved, inspect the new diff first. Reconcile only real source changes; do not revive stale findings.
 
-Desired result:
+This pass covers **P0 + P1 + P2 only**. The intended result is a boring final-polish diff:
 
-- consistent Python formatting;
-- shorter, factual source prose;
-- fewer redundant comments/docstrings;
-- simpler example imports;
-- no runtime redesign;
-- no behavioral change.
+- mechanical Python formatting;
+- concise, factual source prose;
+- removal of redundant architecture/history narration;
+- removal of the known example path-bootstrap hacks;
+- no robot/runtime redesign.
 
 Target style:
 
 > ManiUniCon-like prose restraint + pi-r2-flow-like implementation directness + DexMani's existing robotics/geometry rigor.
 
-## 1. Hard scope boundary
+## 1. Non-negotiable scope
 
-Allowed:
+### Allowed
 
-1. formatting and import layout;
-2. comment/docstring cleanup;
-3. deletion of comments/docstrings that merely restate code;
-4. concise package/module prose;
-5. minimal Ruff configuration;
-6. removal of repository-root sys.path injection from examples that already rely on editable installation;
-7. trivial type-comment cleanup when behavior is unchanged;
-8. a concise source-style rule in AGENTS.md.
+- Python formatting and import organization;
+- concise comment/docstring edits;
+- deletion of comments that restate code;
+- minimal Ruff configuration;
+- a short source-style guardrail in AGENTS.md;
+- removal of the 9 known repository-root sys.path injections from examples;
+- deletion of imports made unused by that removal.
 
-Forbidden:
+### Forbidden
 
-- algorithm changes;
-- robot-control or safety changes;
-- motion-authority or homing changes;
-- collision, IK/FK, retargeting or observation-semantic changes;
-- worker/process/thread topology changes;
-- IPC, raw episode or policy-Zarr schema changes;
-- config-default or research-hyperparameter changes;
-- hardware SDK call-order changes;
-- recording-transaction changes;
-- public import-path changes;
-- file/directory moves;
-- module split/merge;
-- new wrappers, protocols, base classes, validators or abstractions;
-- Pydantic, mypy, pre-commit, complex CI or a committed tests directory;
-- full-project type annotation or docstring standardization;
-- renaming meaningful robotics variables just to shorten lines;
-- broad print-to-logger conversion;
-- adjacent cleanup unrelated to style.
+Do not change:
 
-The arbitrary point-count whitelist has already been removed. Do not reintroduce or re-clean it.
+- algorithms or numerical formulas;
+- robot-control, safety, motion-authority or homing behavior;
+- collision, FK/IK, retargeting or observation semantics;
+- SDK call order;
+- worker/process/thread topology;
+- IPC/runtime protocols;
+- raw or Zarr schemas and persisted meanings;
+- config defaults or research hyperparameters;
+- recorder transaction behavior;
+- public module/import paths;
+- repository layout.
 
-## 2. P0 — mechanical formatting
+Do not:
 
-### 2.1 Minimal Ruff configuration
+- split, merge, move or rename modules;
+- add wrappers, protocols, base classes, validators or abstraction layers;
+- add Pydantic, mypy, pre-commit, complex CI or a tests directory;
+- standardize all typing or docstring formats;
+- shorten meaningful robotics names to satisfy line length;
+- broadly replace print with logging;
+- perform adjacent cleanup.
 
-Add to pyproject.toml:
+The arbitrary point-count whitelist is already gone. Do not touch that topic.
+
+One intentional P2 behavior change is allowed: the 9 example scripts listed below will rely on the documented editable install instead of mutating sys.path. No robot/runtime behavior may change.
+
+## 2. Editing strategy
+
+Use two distinct kinds of edits.
+
+### Mechanical edits
+
+Ruff formatting/import sorting may touch the full Python tree.
+
+### Manual semantic-prose edits
+
+Manual prose/comment edits are restricted to this allowlist unless a directly adjacent line in the same file must be adjusted for formatting/import cleanup:
+
+~~~text
+AGENTS.md
+pyproject.toml
+
+dexmani_real/__init__.py
+dexmani_real/deployment/__init__.py
+dexmani_real/recording/__init__.py
+
+dexmani_real/calibration/camera/session.py
+dexmani_real/calibration/camera/solver.py
+dexmani_real/recording/io_worker.py
+dexmani_real/recording/recorder.py
+dexmani_real/sensor/camera/geometry.py
+dexmani_real/dataset/pointcloud.py
+dexmani_real/ipc/channels.py
+dexmani_real/ipc/schema.py
+dexmani_real/robot/drivers/xhand.py
+dexmani_real/robot/model.py
+dexmani_real/planning/kinematics/arm_fk.py
+dexmani_real/utils/rate.py
+dexmani_real/teleop/retargeting/dexpilot.py
+~~~
+
+P2 path-bootstrap edits are additionally allowed in the 9 listed example files in section 5.
+
+Do not expand manual prose cleanup repository-wide merely because a grep finds similar words.
+
+## 3. P0 — formatting
+
+### 3.1 Minimal Ruff config
+
+Add:
 
 ~~~toml
 [tool.ruff]
@@ -76,22 +120,38 @@ target-version = "py310"
 select = ["E4", "E7", "E9", "F", "I"]
 ~~~
 
-Keep the configuration intentionally small. Do not enable broad rule families such as ANN, D, SIM, TRY, PLR, C90, ARG or PERF.
+Keep the existing tool.isort configuration unless there is a concrete conflict. Do not add broad lint families such as ANN, D, SIM, TRY, PLR, C90, ARG or PERF.
 
-Do not use linting to redesign research code.
+### 3.2 Ruff execution order
 
-### 2.2 Format source
+If Ruff is available, prefer:
 
-When Ruff is available:
+~~~bash
+ruff check --select I --fix dexmani_real examples
+ruff format dexmani_real examples
+~~~
+
+Run import sorting before the final formatter pass.
+
+After all manual P1/P2 edits, run the formatter once more:
 
 ~~~bash
 ruff format dexmani_real examples
-ruff check --select I --fix dexmani_real examples
 ~~~
 
-If Ruff is unavailable, do not install or upgrade the experiment environment. Manually format only the affected files and report that Ruff was unavailable.
+Do not use unsafe fixes.
 
-Highest-priority formatting targets:
+If the ruff executable is absent, try only an already-installed module form:
+
+~~~bash
+python -m ruff --version
+~~~
+
+Do not install or upgrade anything.
+
+If Ruff is unavailable in both forms, do **not** emulate a whole-repository formatter pass by hand. Manually clean only the known P0 hotspots below plus files changed for P1/P2, and report that full mechanical formatting remains unavailable.
+
+### 3.3 Known P0 hotspots
 
 ~~~text
 dexmani_real/deployment/runner.py
@@ -112,50 +172,49 @@ dexmani_real/teleop/retargeting/tag_optimizer.py
 dexmani_real/teleop/retargeting/pin_grad.py
 ~~~
 
-Do not compress independent operations onto one line merely to reduce LOC.
+Formatting rule:
 
-Preserve descriptive robotics names. Wrap long expressions instead of abbreviating names such as handbase_quat_eef_wxyz, observation_timestamp_ns or source_camera_sequence.
+> readability beats LOC minimization.
 
-## 3. P1 — source prose cleanup
+Split independent assignments/arguments onto readable lines. Preserve descriptive names such as handbase_quat_eef_wxyz, observation_timestamp_ns and source_camera_sequence.
 
-The repository is not globally over-commented. Do not perform blanket comment deletion.
+Do not manually rewrite expressions merely because Ruff leaves a long string/comment unchanged.
 
-### 3.1 Preserve high-value comments
+## 4. P1 — prose and comments
 
-Keep comments/docstrings that explain non-obvious:
+The repository is **not** globally over-commented. Do not do blanket comment deletion.
 
-- mathematics;
+### 4.1 Preserve scientific and physical information
+
+Keep the substance of comments/docstrings that explain:
+
+- math and numerical approximations;
 - FK/IK assumptions;
-- coordinate frames and transforms;
-- quaternion conventions;
-- units;
-- numerical approximations;
-- vendor SDK or firmware behavior;
+- frames, transforms, quaternion conventions and units;
+- vendor SDK/firmware behavior;
 - hardware limitations;
 - sensor semantics;
 - joint/finger ordering;
-- experimental thresholds;
-- real safety-critical reasons;
-- external algorithm/source attribution.
+- experimental thresholds/rationale;
+- actual safety-critical reasons;
+- concise source attribution.
 
-Specifically preserve the substance of:
+In particular, preserve:
 
-- XHand SDK vs Pinocchio joint ordering in planning/kinematics/hand_fk.py;
+- SDK ↔ Pinocchio joint ordering in planning/kinematics/hand_fk.py;
 - FreeFlyer/Jacobian convention in teleop/retargeting/pin_grad.py;
 - SO(3)/quaternion smoothing rationale in teleop/control_loop/action_proposal.py;
-- equivalent-angle and staged-homing rationale in planning/paths.py;
-- depth-edge/same-surface/filtering rationale in sensor/pointcloud.py;
-- RealSense alignment/timestamp/firmware semantics in sensor/camera/realsense.py;
-- manipulability/null-space/branch-continuity reasoning in planning/kinematics/ik.py;
+- equivalent-angle/staged-homing rationale in planning/paths.py;
+- point-cloud filtering rationale in sensor/pointcloud.py;
+- RealSense alignment/timestamp/firmware details in sensor/camera/realsense.py;
+- manipulability/null-space/branch reasoning in planning/kinematics/ik.py;
 - xArm firmware EEF vs URDF EEF distinction in planning/kinematics/arm_fk.py.
 
-Long comments are acceptable when they contain real scientific or hardware information.
+These files may be mechanically formatted, but do not broaden manual prose cleanup into them unless they are on the manual allowlist above.
 
-### 3.2 Reduce architecture-governance prose
+### 4.2 Reduce software-governance narration
 
-Prefer direct descriptions of what code does.
-
-Review prose centered on words such as:
+Within the manual allowlist, simplify prose built around terms such as:
 
 ~~~text
 owns
@@ -171,28 +230,29 @@ explicit
 fail-closed
 ~~~
 
-Do not delete these mechanically. Keep them when they describe a real persisted-data convention, physical-safety/SDK boundary or scientifically meaningful provenance.
+Do not delete these words mechanically. Keep them when they express a real persisted-data convention, scientific provenance, physical-safety rule or actual SDK/process boundary.
 
-Remove or simplify them when they only narrate software governance.
+Delete/rewrite them when they only narrate software governance.
 
-Priority examples:
+Concrete targets:
 
-- deployment/__init__.py: reduce the package manifesto to a one-line package description.
-- ipc/schema.py: remove "single source of truth" prose; describe the schema directly.
-- ipc/channels.py: simplify "centralized data plane", ownership and Usage prose.
-- dataset/pointcloud.py: replace persisted-boundary / does-not-own prose with a direct point-cloud description.
-- recording/io_worker.py: remove repeated "Policy owns / ownership-copies / then owns" narration while keeping operational facts.
+- deployment/__init__.py → one-line package description;
+- ipc/schema.py → remove "single source of truth" narration;
+- ipc/channels.py → shorten "centralized data plane", ownership and Usage prose;
+- dataset/pointcloud.py → describe point-cloud reconstruction directly;
+- recording/io_worker.py → remove repeated "owns/ownership-copies/then owns" narration while retaining the actual shared-memory/serialization facts;
+- recording/recorder.py → compress long transaction/control-flow commentary, but retain real persistence semantics.
 
-### 3.3 Remove development-history prose
+### 4.3 Remove implementation-history prose
 
-Source should describe current behavior, not implementation history.
+Describe the current implementation, not how it evolved.
 
-Clean historical wording such as:
+Within the allowlist, rewrite history-oriented prose such as:
 
 ~~~text
 no longer
+previous implementation
 existing implementation
-previous design
 restores
 dropped
 upstream's
@@ -200,16 +260,16 @@ without touching site-packages
 retained for parity
 ~~~
 
-when it describes development history rather than current semantics.
+when those phrases describe development history.
 
 Examples:
 
-- planning/kinematics/arm_fk.py: replace "the arm worker no longer computes EEF" with a statement of how EEF is computed now.
-- teleop/retargeting/dexpilot.py: keep the current human-flexion prior and its mathematics, but sharply reduce dex-retargeting version history, commented upstream parameters, site-packages discussion, "vanilla optimizer" wording and parity/fallback archaeology.
+- arm_fk.py: state how EEF is derived now; do not say what the arm worker "no longer" does.
+- dexpilot.py: retain the current human-flexion prior, its mathematical purpose, and concise attribution; remove detailed dex-retargeting version archaeology, commented-upstream-parameter discussion, site-packages discussion, "vanilla optimizer" wording and parity/fallback history.
 
-Do not change the DexPilot algorithm while editing prose.
+Do not alter the objective, gradient or solver behavior.
 
-### 3.4 Preserve concise attribution
+### 4.4 Keep attribution
 
 Keep concise attribution such as:
 
@@ -217,40 +277,25 @@ Keep concise attribution such as:
 Adapted from TAG/Retargeting/Hand_Retargeting/utils/pin_grad.py.
 ~~~
 
-Prefer current algorithm + concise attribution over upstream version history + patch history.
+Current algorithm + concise attribution is preferred over upstream patch history.
 
-### 3.5 Shorten README-like internal module docstrings
+### 4.5 Shorten README-like module prose
 
-Highest-priority target:
+Highest priority:
 
 ~~~text
 dexmani_real/calibration/camera/session.py
 ~~~
 
-Its module docstring currently includes ownership, algorithm overview, output path, hardware preparation, environment setup, CLI usage, controls, XHand physical-state explanation and collision semantics.
+Reduce the module docstring to roughly 1–3 sentences describing the current calibration role. Remove embedded hardware-preparation checklist, CLI usage, keyboard-control table and architecture narration from the internal module docstring.
 
-Reduce the internal module docstring to roughly 1–3 concise sentences. Leave user workflow/hardware instructions to README, CLI help or the example entry point.
+Do not delete code or operator safety checks.
 
-Other high-value cleanup targets:
+Also simplify docstrings/comments in the other manual-allowlist files where they merely restate module boundaries.
 
-~~~text
-dexmani_real/recording/io_worker.py
-dexmani_real/calibration/camera/solver.py
-dexmani_real/sensor/camera/geometry.py
-dexmani_real/dataset/pointcloud.py
-dexmani_real/ipc/channels.py
-dexmani_real/ipc/schema.py
-dexmani_real/robot/drivers/xhand.py
-dexmani_real/robot/model.py
-dexmani_real/planning/kinematics/arm_fk.py
-dexmani_real/utils/rate.py
-~~~
+### 4.6 Package docstrings
 
-### 3.6 Simplify package docstrings
-
-Package __init__.py files should normally be export-only, empty, or have a one-line description.
-
-Priority targets:
+Make these minimal without changing exports:
 
 ~~~text
 dexmani_real/__init__.py
@@ -258,58 +303,48 @@ dexmani_real/deployment/__init__.py
 dexmani_real/recording/__init__.py
 ~~~
 
-Remove subsystem inventories and architecture manifestos. Do not change exported names.
+Remove subsystem inventories/manifestos. A one-line description is sufficient.
 
-### 3.7 Remove restatement/decorative comments
+### 4.7 Restatement/decorative comments
 
-Delete comments that only restate the next line or function name.
+Within the manual allowlist, remove comments that simply restate the next line/function name and decorative section separators.
 
-Remove decorative section headings such as long dashed "Atomic file finalisation" comments.
-
-Compress long control-flow explanations when one factual line is sufficient, for example:
+Compress verbose local commentary when one factual line is enough, e.g.:
 
 ~~~text
 Preserve failed partial episodes for offline diagnosis.
 ~~~
 
-Do not delete comments that explain why unusual behavior is necessary.
+Keep "why" comments for unusual behavior.
 
-### 3.8 Private helper docstrings
+### 4.8 Private helper docstrings
 
-Private helpers normally do not need docstrings when the name and implementation are clear.
+Do not run a repository-wide private-docstring purge.
 
-Keep them only when they explain non-obvious math, frames/units, SDK/hardware caveats, safety reasoning or subtle behavior.
+Within the allowlist, delete a private helper docstring only when it is clearly a restatement of the function name/body. Keep any math/frame/hardware/safety caveat.
 
-Do not mechanically delete all private docstrings.
+### 4.9 Dynamic facts
 
-### 3.9 Avoid duplicate dynamic facts
+Avoid repeating mutable constants such as schema version numbers in prose when the code constant already defines them.
 
-Do not duplicate mutable code facts such as schema version numbers in prose when a code constant already defines them.
+## 5. P1 — AGENTS.md guardrail
 
-## 4. P1 — AGENTS.md source-style guardrail
+Add a short "Code style" section to AGENTS.md. Do not rewrite the existing safety/research guidance.
 
-Add a concise Code style section to AGENTS.md without weakening existing hardware/safety/research rules.
-
-It should communicate:
+It should state, concisely:
 
 - Keep research code direct and readable.
-- Do not compress independent operations onto one line merely to reduce line count.
-- Comments explain non-obvious robotics, math, coordinate frames, units, vendor SDK behavior, experimental thresholds, attribution or real safety-critical reasons.
-- Do not narrate architecture, ownership, boundaries, contracts, validation or obvious control flow when code already makes them clear.
+- Do not compress independent operations merely to reduce LOC.
+- Comment non-obvious robotics, math, frames, units, SDK behavior, experimental rationale, attribution and real safety reasons.
+- Do not narrate architecture/ownership/contracts/validation/obvious control flow when code already expresses them.
 - Describe current behavior rather than implementation history.
 - Private helpers normally do not need docstrings.
-- Run Ruff formatting and import sorting on touched Python files when Ruff is available.
-- Do not introduce abstractions solely to satisfy style tooling.
+- Use Ruff formatting/import sorting when available.
+- Do not add abstractions solely for style tooling.
 
-Keep this section short.
+## 6. P2 — example import bootstrap cleanup
 
-## 5. P2 — small packaging and annotation cleanup
-
-P2 is subordinate to P0/P1. Do not let it expand scope.
-
-### 5.1 Remove repository-root sys.path injection
-
-At the fact-checked baseline, repository-root sys.path.insert exists in these 9 examples:
+Remove the repository-root sys.path injection from exactly these currently verified examples:
 
 ~~~text
 examples/keyboard_teleop.py
@@ -323,46 +358,45 @@ examples/visualize_episode.py
 examples/pointcloud_process_example.py
 ~~~
 
-examples/realsense_record_example.py no longer contains this hack; do not add it.
+Do not add it to examples/realsense_record_example.py.
 
-README already documents editable installation:
+README already establishes:
 
 ~~~bash
 python -m pip install -e .
 ~~~
 
-Remove only the path-injection boilerplate and imports that become unused solely because of its removal. Preserve independent uses of sys or pathlib.Path.
+Remove only:
 
-Do not change example CLI behavior otherwise.
+- repository-root calculation used solely for sys.path mutation;
+- sys.path.insert boilerplate;
+- imports made unused solely by that deletion.
 
-### 5.2 Clean awkward double-comment type ignores conservatively
+Preserve independent uses of sys and pathlib.Path.
 
-Where a line contains both a type-ignore and a long prose justification, prefer a local assert, cast or clearer control flow only when the edit is trivial and runtime behavior remains identical.
+Do not otherwise change example CLI behavior.
 
-Do not chase all type ignores.
+## 7. P2 — conservative annotation/docstring cleanup
 
-Keep reasonable external-package ignores such as type: ignore[import-untyped].
+Do **not** replace type-ignore comments with assert statements or new runtime checks. That would exceed style-only scope.
 
-### 5.3 Trim mechanical Args/Returns prose selectively
+Do not proactively chase type ignores.
+
+Only if a touched line contains a redundant prose comment after a necessary type-ignore may that prose be shortened/removed while preserving the ignore.
+
+Keep external-package ignores such as:
+
+~~~python
+# type: ignore[import-untyped]
+~~~
 
 Do not standardize Google vs NumPy docstrings.
 
-Remove parameter prose that merely repeats a parameter name, type annotation or obvious shape. Keep explanations of algorithmic relationships, non-obvious shapes, units, coordinate frames and semantics.
+Do not proactively edit scientific Args/Returns documentation outside the manual allowlist. Within the allowlist, trim only text that plainly repeats the signature; keep units, shapes, frames and algorithmic relationships.
 
-Be conservative in:
+## 8. Files explicitly not to restructure
 
-~~~text
-teleop/retargeting/tag_optimizer.py
-teleop/retargeting/pin_grad.py
-teleop/control_loop/action_proposal.py
-planning/paths.py
-~~~
-
-Scientific explanation has higher priority than brevity.
-
-## 6. Files that must not be structurally refactored
-
-Do not split these merely because they are long:
+Do not split or merge these:
 
 ~~~text
 dexmani_real/config/defaults.py
@@ -372,54 +406,47 @@ dexmani_real/recording/recorder.py
 dexmani_real/sensor/camera/realsense.py
 ~~~
 
-Do not merge small modules merely to reduce file count.
+Do not move examples into tools/.
 
-Do not move examples into tools/ in this task.
+## 9. Execution order
 
-## 7. Execution order
+1. Read AGENTS.md and this task.
+2. Run git status --short; preserve unrelated user changes.
+3. Confirm current HEAD and inspect changes since the baseline if any.
+4. Add the minimal Ruff config.
+5. Run Ruff import sorting + formatting if already available.
+6. Inspect git diff --stat and git diff after the mechanical pass.
+7. Make only the allowlisted P1 manual prose edits.
+8. Add the short AGENTS.md Code style section.
+9. Remove the 9 P2 sys.path bootstraps.
+10. Apply only incidental P2 type/docstring cleanup allowed above.
+11. Run the final Ruff format pass if available.
+12. Run validation.
+13. Inspect the complete diff and revert anything that changes program semantics or expands scope.
 
-1. Read AGENTS.md.
-2. Inspect git status --short and preserve unrelated changes.
-3. Confirm current main and reconcile only if it moved.
-4. Add minimal Ruff config.
-5. Run Ruff formatter/import sorting if available.
-6. Inspect formatter diff before manual edits.
-7. Perform P1 module/package prose cleanup.
-8. Remove P1 restatement/development-history prose.
-9. Add the short AGENTS.md Code style section.
-10. Perform the P2 sys.path cleanup.
-11. Perform only obvious P2 annotation/docstring cleanup.
-12. Run low-cost validation.
-13. Inspect the full final diff for accidental semantic changes.
-
-Do not intermingle architecture redesign with this pass.
-
-## 8. Validation
+## 10. Validation
 
 No hardware execution.
 
-Run:
+Always run:
 
 ~~~bash
 python -m compileall -q dexmani_real examples
-ruff check --select F401,F821,F822,F823 dexmani_real examples
 git diff --check
 ~~~
 
-If Ruff is available, also run:
+If Ruff is available, run:
 
 ~~~bash
 ruff format --check dexmani_real examples
-ruff check --select I dexmani_real examples
+ruff check --select F401,F821,F822,F823,I dexmani_real examples
 ~~~
 
-If Ruff is unavailable:
+If only python -m ruff is available, use the equivalent module commands.
 
-- do not install it;
-- report that limitation;
-- still run compileall and git diff --check.
+Do not install missing tooling.
 
-Useful final searches:
+Final searches:
 
 ~~~bash
 git grep -n "single source of truth" -- dexmani_real
@@ -428,65 +455,45 @@ git grep -n "site-packages" -- dexmani_real
 git grep -n "sys.path.insert" -- examples
 ~~~
 
-Search hits are not an acceptance metric. Review context; some words may legitimately remain.
+Search counts are not goals. Review context. The sys.path search should be empty for the verified repository-root bootstrap pattern.
 
-## 9. Final diff review
-
-Before finishing, confirm:
-
-- no algorithm changed;
-- no config default or schema changed;
-- no hardware/safety behavior changed;
-- no public API/import path changed;
-- no file moved;
-- no process/thread/worker added or removed;
-- no validation/safety mechanism removed merely because it looked verbose;
-- scientific/math/hardware comments remain;
-- source prose is shorter and more timeless;
-- imports and formatting are consistent;
-- the 9 listed path-injection hacks are gone;
-- package docstrings are concise;
-- AGENTS.md contains the source-style guardrail.
-
-Inspect:
+Also inspect:
 
 ~~~bash
 git diff --stat
 git diff
 ~~~
 
-The diff should be dominated by line wrapping, import organization, prose deletion/rewording, small example import cleanup, Ruff config and AGENTS style guidance.
+## 11. Acceptance criteria
 
-If program structure starts changing, revert those changes.
+Finish only when:
 
-## 10. Acceptance criteria
+1. P0 mechanical formatting/import organization is complete when Ruff is available; otherwise the limitation is reported and manual formatting stayed restricted to the known hotspots/touched files.
+2. Long code expressions are wrapped without abbreviating meaningful robotics names.
+3. P1 architecture/history prose is reduced only in the manual allowlist.
+4. Scientific, geometric, hardware, SDK, attribution and experimental-rationale information is preserved.
+5. calibration/camera/session.py no longer embeds README/CLI material in its module docstring.
+6. the three targeted package docstrings are minimal.
+7. AGENTS.md has the concise Code style guardrail.
+8. all 9 verified repository-root sys.path bootstraps are removed.
+9. no assert/control-flow/runtime checks were added for type-cleanup purposes.
+10. no P3 or structural work was performed.
+11. compileall and diff-check pass.
+12. Ruff checks pass when Ruff is available.
+13. no hardware code was executed.
+14. no robot/runtime/algorithm/schema/safety behavior was intentionally changed, except the explicit example import-bootstrap cleanup.
 
-Complete only when:
-
-1. P0 formatting drift is removed without semantic changes.
-2. Long lines are wrapped instead of shortening meaningful robotics names.
-3. Architecture/governance prose is substantially reduced in the identified P1 files.
-4. Development-history prose is replaced by descriptions of current behavior.
-5. Math, geometry, hardware, SDK, attribution and experimental-rationale comments remain.
-6. README-like internal module docstrings are shortened.
-7. Package docstrings are minimal.
-8. AGENTS.md contains concise source-style guidance.
-9. The 9 current repository-root sys.path.insert hacks are removed.
-10. Type-ignore/docstring cleanup stays conservative and behavior-neutral.
-11. No P3 work is performed.
-12. Offline checks pass, or unavailable Ruff tooling is explicitly reported.
-13. No hardware code is executed.
-
-## 11. Handoff
+## 12. Handoff
 
 Report concisely:
 
 1. files changed;
-2. P0 formatting changes;
-3. P1 prose/comment cleanup;
-4. P2 packaging/annotation cleanup;
-5. validation commands and results;
+2. P0 mechanical changes;
+3. P1 prose/comment changes;
+4. P2 example-bootstrap changes;
+5. validation commands/results;
 6. Ruff availability;
-7. confirmation that no runtime/algorithm/schema/safety behavior was intentionally changed.
+7. confirmation that no robot/runtime/algorithm/schema/safety behavior was intentionally changed;
+8. any deviation from this task and the exact reason.
 
-Do not claim hardware validation from this style-only task.
+Do not claim hardware validation.
