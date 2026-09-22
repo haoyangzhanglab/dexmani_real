@@ -1,197 +1,284 @@
 # DexMani Real
 
-面向个人 PhD 灵巧操作实验的真实机器人代码：**采数据、部署 learned policy、做真机 evaluation**。
-当前硬件是 xArm7、XHand、RealSense RGB-D 和 VR / HTS；模型训练与推理由相邻的
-`dexmani_policy` 负责。本仓库负责真机实验与数据采集。
+面向个人 PhD 灵巧操作实验的真实机器人代码：采集真机 demonstration、部署 learned policy、做真机 evaluation。
 
-> 本仓库会控制真实硬件。home、teleoperation、replay、policy rollout 和 camera
-> calibration 都不是离线测试。运行前检查工作空间、标定、机械限位与急停，并保持操作者在场。
-> 软件检查通过不代表真机安全验证通过。
+当前硬件是 xArm7、XHand、RealSense RGB-D 和 VR / HTS。模型训练与 policy implementation 位于相邻的 dexmani_policy；本仓库负责真实硬件、数据采集、部署适配、raw episode 和离线数据转换。
+
+本仓库会控制真实硬件。home、teleoperation、replay、policy rollout 和 camera calibration 都不是离线测试。运行前检查机械限位、实验环境、标定与急停，并保持操作者在场。软件检查通过不代表真机安全验证通过。
 
 ## 安装与配置
 
-要求 Python >=3.10。通用依赖安装：
+要求 Python >= 3.10。
 
-```bash
-python -m pip install -e .
-```
+    python -m pip install -e .
 
-xArm、XHand、RealSense、HTS SDK，以及运动学/碰撞规划和 `dexmani_policy` 依赖，
-按实验机环境安装。普通 import 不应连接设备；SDK 连接与控制由 owning worker 显式执行。
+xArm、XHand、RealSense、HTS SDK，以及运动学/点云和 dexmani_policy 依赖，按实验机环境安装。
 
-支持 `--config` 的入口按 **CLI > 显式指定的 YAML > `config/defaults.py`** 解析，
-不会自动查找实验 YAML。可在连接设备前查看采集入口的解析结果：
+普通 import 和普通配置解析不应连接设备。真实 SDK 连接由对应 owning worker 显式建立：
 
-```bash
-python examples/collect_teleop.py --print-config
-python examples/collect_teleop.py --config experiment.yaml --print-config
-```
+- xArm SDK：arm worker；
+- XHand SDK：hand worker；
+- RealSense SDK：camera worker；
+- model / CUDA：policy worker。
 
-经常调整的 IP、serial、频率、相机尺寸、数据路径、task、控制参数留在实验配置。
+支持 --config 的入口按 CLI > 显式 YAML > config/defaults.py 解析。
 
-VR 遥操作的网格频率和轮询频率由 `teleop.control_hz` / `teleop.executor_poll_hz` 配置。
-learned policy 的动作周期唯一来自 `PolicySpec.control_dt_s`。
-流式命令一次只有一条待采用；下一条必须等本次命令包含的执行器都明确采用。
-XHand 的首次限速点采用与到达最终目标分开记录；手部归位使用
-`hand.home_command_ack_timeout_s` 等待最终目标，机械臂 HOME 保留规划、请求和执行超时。
+可在连接设备前查看采集配置：
+
+    python examples/collect_teleop.py --print-config
+    python examples/collect_teleop.py --config experiment.yaml --print-config
+
+VR teleop 的控制频率由 teleop 配置拥有；learned policy 的动作周期由 PolicySpec.control_dt_s 拥有。
 
 ## 研究入口
 
-| 工作流 | 命令 | 硬件 / 输出 |
+| 工作流 | 命令 | 输出 / 说明 |
 |---|---|---|
-| VR collection | `python examples/collect_teleop.py --config experiment.yaml --task-name <task> --operator <name>` | 真机；raw episode |
-| Keyboard jog / home | `python examples/keyboard_teleop.py --config experiment.yaml` | 真机 |
-| Physical replay | `python examples/replay_episode.py <episode> --config experiment.yaml` | 真机；raw float64 sent targets |
-| Policy rollout | `python examples/run_policy.py <policy/task/experiment>` | 真机；rollout session |
-| Camera calibration | `python examples/calibrate_camera.py --config experiment.yaml --hand-geometry absent` | 真机；标定；需声明 XHand 物理状态 |
-| VR heading calibration | `python examples/calibrate_vr_heading.py` | VR / HTS；标定 |
-| Policy export | `python examples/export_policy_zarr.py episodes/<task> --dry-run` | 只读预检；移除 `--dry-run` 后导出 |
-| XHand diagnostics | `python examples/xhand_diagnostics.py` | 连接真机；读取 joints/tactile/identity，无运动 |
-| Inspect raw | `python examples/visualize_episode.py <episode> --info` | 离线；去掉 `--info` 可视化 |
+| VR collection | python examples/collect_teleop.py --config experiment.yaml --task-name <task> --operator <name> | 真机；raw episode |
+| Keyboard jog / home | python examples/keyboard_teleop.py --config experiment.yaml | 真机 |
+| Physical replay | python examples/replay_episode.py <episode> --config experiment.yaml | 真机 |
+| Policy rollout | python examples/run_policy.py <policy/task/experiment> --config experiment.yaml | 真机；evaluation session |
+| Camera calibration | python examples/calibrate_camera.py --config experiment.yaml ... | 真机；标定 |
+| VR heading calibration | python examples/calibrate_vr_heading.py | VR / HTS |
+| Canonical Zarr export | python examples/export_policy_zarr.py episodes/<task> | 离线 |
+| XHand diagnostics | python examples/xhand_diagnostics.py | 连接真机；诊断，不应运动 |
+| Inspect raw | python examples/visualize_episode.py <episode> --info | 离线 |
 
-除 XHand diagnostics 外，参数以各入口的 `--help` 为准，交互按键见会话提示。
-`xhand_diagnostics.py` 没有离线 `--help`，执行该脚本会启动 SDK 诊断并连接/发现设备。
-相机标定的 `--hand-geometry` 是物理状态声明：未安装 XHand 才可用 `absent`；
-安装的手已物理固定在配置的 home 姿态时用 `secured-home`。两者均使用固定 home 手模型做碰撞检查。
+实际参数以各入口 --help 为准。
 
-### Teleoperation / recording
+## Teleoperation / recording
 
-```bash
-# 标准采集
-python examples/collect_teleop.py --config experiment.yaml --task-name <task> --operator <name>
+标准采集：
 
-# 无手、无录制的 arm 调试
-python examples/collect_teleop.py --config experiment.yaml --task-name <task> --operator <name> --no-hand --no-record
-```
+    python examples/collect_teleop.py --config experiment.yaml --task-name <task> --operator <name>
 
-`B` 开始、`C` 暂停/恢复、`S` 停止并保存、`D` 丢弃、`H` 归位、`Q` 退出、`ESC` 急停。
-退出录制时按提示选择保存/丢弃；不要把 GUI 关闭或进程退出当作物理急停。
-数据写入 `episodes/<task>/episode_*`。录制模式下，`B` 必须等相机和 RecorderIO 可用。
-相机、recorder 或 raw sample 写入失败会使当前 demonstration 无效，并撤销运动回到 ARMED。
-本 session 不再接受录制 B/C 恢复；仍可手动归位或退出，最终返回非零。
-只有显式 `--no-record` 才允许不录制的遥操作。`C` 保留同一 episode，撤销旧命令后，
-等待命令撤销之后的新 robot/VR 反馈再重新锚定；不会把暂停改成停止或丢弃。
-自动中断时，非空且已安全关闭的录制前缀保存在 `incomplete_*`，不是可直接训练的完整 episode；
-显式丢弃仍丢弃。最终路径与录制结果查看日志。
-recorder 进程自己 drain 最后一帧、关闭视频/HDF5 并发布结果；关闭期间使用原始固定 deadline，
-不以普通循环 heartbeat 判死。无法确认关闭时保留 staging，停止后不复用其 IPC；
-上一 episode 的结果未确认前不开始下一次录制。键盘监听持续到录制收尾完成。
+显式无录制调试：
 
-### Policy rollout
+    python examples/collect_teleop.py --config experiment.yaml --task-name <task> --operator <name> --no-record
 
-`run_policy.py --config experiment.yaml` 使用同一配置解析器。
-硬件启动前写入完整 `run_config.yaml`，包括解析后的 runtime、PolicySpec、checkpoint、seed 和 Git 状态。
+交互键保持：
 
-```bash
-python examples/run_policy.py <policy/task/experiment> --config experiment.yaml \
-  --num-episodes 2 --inference-steps 4 --seed 0
-```
+- B：开始；
+- C：暂停 / 恢复；
+- S：停止并保存；
+- D：丢弃；
+- H：return-home；
+- Q：退出；
+- ESC：急停。
 
-`B` 开始 episode、`S` 停止并保存、`H` 归位、`Q` 退出、`ESC` 急停；`--num-episodes` 指实际开始的 episode 次数。
-该入口连接真实硬件。`--artifact` 是 experiment 的 `checkpoints/` 下的部署文件名；
-不填时使用 `deployment_latest.pt`。训练 checkpoint 先在 `dexmani_policy` 中通过其
-public deployment export 命令导出，不能当作部署文件直接传入。
+C 不等于 stop 或 discard。pause 会撤销当前 motion epoch；resume 从 fresh robot / VR feedback 重新锚定。暂停后继续得到的 raw episode 可以保留用于诊断，但由于时间轴存在明显 gap，不属于 clean training episode，canonical Zarr export 应整条拒绝并报告原因。
 
-policy 子进程拥有模型 / CUDA，先 load / warmup，再启动硬件 workers。
-每个 chunk 同步推理，按 policy control period 逐条发送，不跳动作、不补发追赶；
-下一次发布必须同时满足上一条命令已采用、且距离上次成功发布至少一个周期。
-慢推理或采用延迟后，后续周期从实际成功发布时刻重新计算；不会突发补发。
+录制模式下 camera 与 RecorderIO 是 required resources。只有显式 --no-record 才允许不录制的 teleop。camera / recorder 中途失败时，不应静默降级为无录制 teleop，也不应把残缺数据伪装成完整 demonstration。
 
-输出位于 `rollouts/<policy>/<task>/<experiment>/session_*/`，包含 raw episode 和运行配置。
-**时间分析使用 HDF5 的实际 timestamp，不使用 MP4 固定帧率推断控制时间。**
-运行次数与保存成功的 episode 数不同。必需的 camera/recorder 失败会结束无效 evaluation 并返回非零，
-只有实际硬件故障才声明 FAULT。结果分开保存 technical_status、termination_reason 和 task_success（可离线标注）。
+## Control semantics
 
-## 数据
+正常 teleop / policy evaluation 使用简单 streaming target 语义：
 
-当前路径：
+    controller / policy
+        -> target interpretation
+        -> absolute joint target preparation
+        -> latest RobotCommand
+        -> arm worker / hand worker
+        -> vendor SDK
 
-```text
-raw episode → offline geometric / sensor transforms → Policy Zarr
-```
+run_id 是 motion lifecycle epoch，用于阻止 pause、stop、timeout 或慢 inference 返回后的旧动作重新获得执行权限。
 
-```bash
-python examples/export_policy_zarr.py episodes/<task> --dry-run
-python examples/export_policy_zarr.py episodes/<task>
-# 新输出位置（目标必须不存在），使用实验几何配置
-python examples/export_policy_zarr.py episodes/<task> --config experiment.yaml --output datasets/<task>_v2.zarr
-```
+不使用 command_id / actuator-adoption ledger / partial-adoption accounting。
 
-默认输出为 `datasets/<task>.zarr`。转换保留每个完整 episode 的行数与边界、实际 source timestamps、
-RGB-D、点云、FK/EE/fingertips、joint/EE actions 和触觉 validity。数值按 episode、图像按有界 chunk
-处理；正式 export 不先完整 dry-run 一遍。`--dry-run` 执行相同转换和 admission，但不写输出。
-技术损坏会阻断整个输出；`--annotations` YAML 可显式排除整个 episode（`include: false`），
-或提供 `task_name`。一个输出只允许一个 task，必须与输入任务目录名一致；`--task-name` 可显式覆盖
-raw task label，但不能与 annotation 冲突。未知 episode annotation 会报错。已有输出、输入内部路径、
-源数据目录和已有 Zarr 内部均拒绝覆盖/写入。
+记录的 action 是该 control step 发布到 robot execution boundary 的 high-level absolute executable target，不是 SDK adoption 或物理到达证明。
 
-固定周期训练导出拒绝非均匀 anchor 间隔（包括暂停缺口），不静默重采样或压缩时间。
-policy_eval 保持其独立的非均匀时序，不直接作为 fixed-dt teleop 数据导出/回放。
-触觉 validity 必须保存，不能把传感器无效数据解释成零接触力。
+### xArm
 
-raw 当前只支持 v31；v30 缺少采用证据，不能直接视为 v31，也不支持自动补造证据。
-v31 保存 command_id、run_id、issued 时间、每个执行器的 presence、adopted 及真实采用时间。
-正常动作只有在命令包含的全部执行器采用后才写入；held/failure 行不重复发送。
-部分采用或未知采用仅作诊断，并使整个 episode 默认不可训练导出或物理回放。
-物理 replay 使用实际 anchor 间隔与新的共同采用 command ID，保留 float64 目标及执行器 presence。
+normal streaming target：
 
-## 代码追踪与安全 owner
+- finite；
+- nearest 2pi equivalent；
+- absolute operational joint limit；
+- worker physical/rated hard-limit fence；
+- xArm SDK velocity / acceleration control。
 
-当前主要路径：
+normal streaming 不额外做 high-level arm delta clip。
 
-```text
-teleop/session.py → teleop/loop.py → control_loop/grid.py
-                                       ↓
-                        robot/projection.py（一次软投影）
-                                       ↓
-                 robot/commands.py（检查目标、发布单条耦合命令）
-                                       ↓
-                     robot/{arm,hand}_worker.py → SDK
+### XHand
 
-policy: deployment/session.py 启动进程并独立处理键盘
-        deployment/runner.py → observation.py → dexmani_policy.predict(array_dict)
-        → 同一 robot command path
+normal streaming target：
 
-recording: control loop → RecorderClient（命令采纳核算、sample 发布）
-          → sample ring → IO worker → EpisodeRecorder.add_frame(frame) → HDF5/video
-```
+- finite；
+- absolute operational joint limit；
+- worker mechanical hard-limit fence；
+- 直接发送 absolute XHand SDK position target。
 
-主进程拥有进程启动、运行时长上限、critical worker 健康检查与清理；独立键盘 listener
-在模型推理、home 和录制关闭阻塞时响应停止。policy 子进程拥有模型/CUDA 与 episode 计数/结果；
-SDK 由各自 arm/hand worker 持有。`SafetyState` 为 DISARMED / ARMED / RUNNING / FAULT。
-共享 run_id/start 原子读取，让 parent 能在推理阻塞时执行运行时长上限；
-terminal cause 保留第一次实际停止的原因，供晚返回的 runner 收尾。
+不做 producer hand delta clip，不做 worker software slew，也不维护 adopted/reached command identity。
 
-command_id 在同一个 RuntimeChannels 生命周期中单调分配；run_id 是运动授权 epoch，
-用于暂停、停止及阻塞推理返回后拒绝旧动作，不是科研 episode 身份。
-撤销阻止新的 SDK admission；已经 admission 的调用仍可能晚返回，arm/hand 并非物理原子事务。
-录制命令的采纳核算累积历史证据：已确认的采纳保持有效；确认未采纳需要撤销之后的有效 worker 状态。
-每个目标执行器分别解析；超时仍不确定则标记 UNKNOWN。核算终结后释放命令屏障，
-raw 写入失败由录制层标记无效并先撤销运动，不通过控制进程崩溃触发硬件 FAULT。
-SDK adoption 不等于物理收敛；XHand 的 adopted 与最终目标 reached 分开。
+### Collision / workspace
 
-必须保留的硬边界：机械限位、非有限数阻断、实际速度 / 步长限制、急停、SDK 错误、旧命令撤销、
-实验依赖的工作空间 / 碰撞约束，以及 worker 停止后才释放共享内存。
-软 projection 负责生成可执行目标；worker / driver 负责最终 SDK 输入与物理状态。
-不要用多层重复 validation 替代明确的 ownership。
+normal teleop、policy eval 和普通 supervised streaming 不运行 generic software collision checker。实验依赖操作者现场监督、硬件急停、机械限位和 xArm firmware motion controls。
+
+collision planning 只保留在 planned return_home 中。
+
+Cartesian teleop / EE policy 可以在 IK 前做简单 EEF workspace clip；joint-action policy 不为了 normal runtime safety 额外做 FK workspace gate。
+
+## Observation
+
+arm、hand、camera、VR、point cloud 都是异步 producer。
+
+每个 control step 只组装一次 current observation snapshot：
+
+- 读取当前已经 available 的 latest required sample；
+- 每个 modality 单独做 freshness check；
+- snapshot 组装完成后记录 observation timestamp；
+- teleop controller 与 raw recorder 复用同一份 snapshot。
+
+不要求各 modality timestamp 相等，也不使用 generic cross-modal skew gate。
+
+policy temporal history由 control-row deque 维护，不在 inference 时重新从 sensor rings 回溯构造历史。warm-up 使用 edge padding；pause / 大 gap 后清空并重新开始 history。
+
+whole sample acquisition failure时 producer不发布一份带 generic invalid flag 的新 sample；旧 sample自然因 timestamp 变 stale。
+
+唯一显式保留的部分模态 validity 是 XHand tactile aggregate / dense validity，因为 joint state 可以有效而某一种 tactile measurement 无效。
+
+## Raw episode
+
+Raw episode 是实验 source of truth。
+
+新的目标 schema 为 raw v32，保存研究有意义的真实信息：
+
+- arm qpos / qvel / effort；
+- hand qpos / current；
+- aggregate tactile + validity；
+- dense tactile + validity；
+- RGB-D 与 calibration；
+- VR wrist / hand landmarks；
+- observation/action/source timestamps；
+- high-level arm / hand absolute action target；
+- 必要的 controller intent，例如 pre-IK EE intent；
+- 小型 frame-status 诊断。
+
+Raw 不保存 command adoption evidence、command IDs、generic state_valid、observation_valid 或 normal-runtime collision proof。
+
+Point cloud不作为 demonstration raw source重复保存；由 RGB-D + calibration 离线生成。
+
+## Canonical full Zarr
+
+数据路径：
+
+    raw episode
+        -> whole-episode admission
+        -> offline point cloud / FK / fingertips
+        -> one canonical full Zarr
+
+Zarr 是可重建的 training cache，不是第二份 runtime audit database。
+
+Zarr固定全量保存 learning-relevant dynamic modalities，使 dexmani_policy 再通过 sensor_modalities 选择实际模型输入。
+
+目标 dynamic arrays 包括：
+
+- joint_state；
+- arm_qvel；
+- arm_effort；
+- hand_current；
+- contact_force；
+- tactile_force；
+- eef_pose；
+- fingertip_points；
+- rgb；
+- depth；
+- point_cloud；
+- action；
+- action_ee。
+
+静态 camera intrinsic / extrinsic / depth scale 等只保存一次，不逐帧广播。
+
+Zarr 不保存 runtime time arrays，也不保存 validity masks。
+
+action 与 action_ee 必须描述同一个最终 high-level target：
+
+- action = arm joint target + hand joint target；
+- action_ee = FK(arm joint target) + hand joint target。
+
+pre-IK EE intent 是 raw provenance，不是 Zarr action_ee。
+
+## Raw -> Zarr admission
+
+Exporter 不修复 demonstration。
+
+一个 raw episode 要么完整进入 Zarr，要么整条拒绝并说明原因。
+
+禁止：
+
+- 丢单帧后继续；
+- 将一条 raw episode 切成多个训练 episode；
+- 删除 pause 区间后拼接；
+- silent resample；
+- zero-fill invalid tactile；
+- silent camera repair；
+- 将 incomplete recording 当完整 trajectory。
+
+整条拒绝的典型原因包括：
+
+- incomplete recording；
+- 非 teleop training workflow；
+- 任意非 OK frame status；
+- 任意 tactile aggregate / dense invalid；
+- media / row count mismatch；
+- shape / dtype / finite 错误；
+- 明显 pause / missing-control timing gap；
+- 任意 offline pointcloud / FK / fingertip transform failure。
+
+允许正常 OS scheduling jitter；不要求每个 control interval 精确等于 nominal dt。
+
+批量 export 可以接受正常 episodes并整条跳过异常 episodes，但每一条 rejection 必须有明确 reason 和最终 summary，不能静默处理。
+
+## Return-home
+
+return_home 是唯一刻意保守的 motion path。
+
+它可以继续使用：
+
+- equivalent-angle handling；
+- planned waypoints；
+- workspace；
+- self collision；
+- arm-hand collision；
+- table/static obstacle clearance；
+- Mode 0；
+- abort；
+- measured final convergence；
+- restore Mode 6。
+
+HOME 成功以 measured qpos / qvel convergence 为准，不使用 SDK adoption/reached command identity。
+
+## Policy rollout
+
+Policy process拥有 model / CUDA，保持同步 inference 与 local action chunk，不增加 async inference、RTC、remote inference 或 catch-up burst。
+
+如果 predict 阻塞期间 run_id 改变，返回的旧 chunk直接丢弃。
+
+输出属于 evaluation telemetry。默认不能因为格式类似就当作 teleop BC source进入 canonical training Zarr。
 
 ## 离线检查
 
-```bash
-python -m compileall -q dexmani_real examples
-ruff check --select F401,F821,F822,F823 dexmani_real examples
-git diff --check
-```
+    python -m compileall -q dexmani_real examples
+    ruff check --select F401,F821,F822,F823 dexmani_real examples
+    git diff --check
 
-仓库没有提交的测试目录。对改动的纯逻辑可运行一次性离线 smoke checks，重点包括数值几何、
-转换、动作限制和数据接口；不新增测试框架。Ruff 或依赖缺失时报告跳过，不为检查升级实验环境。
-离线检查不运行硬件入口，不启动真机、CUDA 或真实 checkpoint。
+仓库不维护 committed tests 目录。纯逻辑改动使用一次性 offline smoke checks。不要为检查修改实验环境，不运行真实硬件入口。
 
-## 真机 commissioning（需单独授权，离线测试不代替）
+## 真机 commissioning
 
-测量真实工作负载的发布、SDK 采用与 hand slew 延迟，验证采用核算和归位超时。
-低速检查 C 暂停/恢复与重新锚定、S/D/Q/H、慢推理时的 parent timeout、
-长录制关闭时的 S/Q/ESC、arm/hand 单侧先行及故障、RealSense/触觉失效、
-真实 checkpoint rollout、物理急停和安全断开。
-软件撤销阻止后续 admission；已经 admission 的 vendor 调用仍可能执行或晚返回，
-真机停机距离/延迟必须实测。
+离线重构完成后，真机验证需单独授权。
+
+重点实测：
+
+- xArm去除software delta clip后的流式平滑性；
+- XHand direct absolute target的行为、电流和jerk；
+- C pause/resume stale-action fence 与 re-anchor；
+- arm / hand / camera / VR freshness；
+- return_home安全路径；
+- slow inference无旧动作复活、无catch-up burst；
+- recorder / camera failure；
+- tactile partial validity；
+- raw v32；
+- full canonical Zarr export与whole-episode rejection；
+- representative dexmani_policy rollout；
+- emergency stop与shutdown。
