@@ -474,7 +474,7 @@ Return-home may preserve the existing meaningful geometric complexity:
 
 Do not simplify away true return-home geometry merely because normal runtime no longer uses collision checks.
 
-Calibration motion may keep only those geometric protections that are demonstrably required by that calibration procedure. Do not reuse generic SafetyGate.
+Calibration motion must not run collision checking. It may keep only simple procedure-specific non-collision bounds or known-geometry assumptions required by the calibration procedure. Do not reuse generic SafetyGate.
 
 ---
 
@@ -1202,7 +1202,7 @@ Replay should retain only genuinely useful protections:
 - action finiteness/limits;
 - lifecycle/run_id fencing;
 - operator supervision/estop;
-- optional full-trajectory preflight only where it is intentionally part of replay workflow.
+- simple schema/start-state/absolute-limit preflight only. Do not run collision preflight; collision checking belongs to return_home only.
 
 Normal per-step generic collision SafetyGate is not used.
 
