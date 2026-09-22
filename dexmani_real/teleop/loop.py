@@ -42,6 +42,7 @@ from dexmani_real.robot.model import (
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.safety import (
     SafetyState,
+    RunEndReason,
     invalidate_coupled_commands,
     revoke_motion_if_run_id,
     revoke_motion,
@@ -141,24 +142,6 @@ def _policy_exit_fault(
     if error_state or safety_fault:
         return "policy exited with sticky fault"
     return None
-
-
-def _note_recorder_transport_failure(
-    shared: RuntimeChannels,
-    recorder: RecorderClient | None,
-    *,
-    context: str,
-) -> None:
-    """Report optional evidence loss without terminating teleop control."""
-    if recorder is None or not recorder.transport_unavailable or shared.evidence_failed.value:
-        return
-    logger.error(
-        "teleop recorder transport unavailable during %s: %s",
-        context,
-        recorder.last_error or "unknown error",
-    )
-    shared.evidence_failed.value = True
-    return
 
 
 def _start_keyboard(shared: RuntimeChannels) -> KeyboardInput | None:
@@ -443,6 +426,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             and shared.is_running.value
             and not shared.error_state.value
             and not shared.estop_request.value
+            and not shared.evidence_failed.value
         )
         if arm_rejected:
             reason = "arm_command_rejected"
@@ -465,22 +449,23 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             ]
             kb.drain_signal(OperatorCommand.BEGIN)
             logger.warning("teleop_loop: arm command rejected; begin a new run with B")
-        now_ns = time.monotonic_ns()
         if start_new_run:
             if pause_reason is not None:
                 logger.debug(
                     "teleop_loop: new run supersedes %s pause boundary",
                     pause_reason,
                 )
-            pause_since_ns = now_ns
             pause_reason = reason
             run_id = int(shared.run_id.value)
+            pause_since_ns = time.monotonic_ns()
         elif pause_reason is None:
-            pause_since_ns = now_ns
             pause_reason = reason
             run_id = invalidate_coupled_commands(shared)
+            pause_since_ns = time.monotonic_ns()
             if recorder is not None:
                 recorder.resolve_command(finish=True)
+                if shared.evidence_failed.value:
+                    pause_reason = "recording_failure"
         else:
             if relabel:
                 pause_reason = reason
@@ -512,6 +497,7 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             and shared.is_running.value
             and not shared.error_state.value
             and not shared.estop_request.value
+            and not shared.evidence_failed.value
         ):
             return False
         enter_pause("arm_command_rejected", relabel=True)
@@ -529,7 +515,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
         controller.clear_reference()
 
     def run_home() -> None:
-        _note_recorder_transport_failure(shared, recorder, context="home")
         clear_pause_for_home()
         controller.prev_hand_qpos = do_configured_teleop_home(
             shared,
@@ -564,12 +549,13 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             reject_revoked_run()
             if recorder is not None:
                 stop_result = recorder.poll_stop()
-                _note_recorder_transport_failure(shared, recorder, context="poll")
                 if shared.evidence_failed.value and recording_active:
                     recorder.technical_status = "invalid"
                     enter_pause("recording_failure", relabel=True)
                     teleop_active = False
-                    revoke_motion(shared, SafetyState.ARMED)
+                    if (int(shared.safety_state.value) == int(SafetyState.RUNNING)
+                            and not shared.error_state.value and not shared.estop_request.value):
+                        revoke_motion(shared, SafetyState.ARMED, reason=RunEndReason.RECORDING_FAILURE)
                     stop_recording(recorder, recording_active, save=True, shared=shared, reason="evidence_failure")
                     recording_active = False
                 reached_limit = (
@@ -620,25 +606,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 elif stop_result.error and quit_after_recording:
                     # Client and supervisor enforce the original STOP deadline.
                     shared.quit_requested.value = True
-                if recording_active and recorder.camera_writer_error is not None:
-                    recorder.technical_status = "invalid"
-                    shared.evidence_failed.value = True
-                    revoke_motion(shared, SafetyState.ARMED)
-                    teleop_active = False
-                    logger.error(
-                        "Camera writer failed — retaining closed partial episode: %s",
-                        recorder.camera_writer_error,
-                    )
-                    stop_recording(
-                        recorder,
-                        True,
-                        save=False,
-                        shared=shared,
-                        reason="camera_writer_error",
-                        retain_partial=True,
-                    )
-                    recording_active = False
-
             if (
                 shared.estop_request.value
                 or shared.error_state.value
@@ -771,7 +738,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
             reanchor_grid = False
             break_loop = False
             for control in controls:
-                _note_recorder_transport_failure(shared, recorder, context="operator control")
                 if startup_hand_home_pending and control is OperatorCommand.BEGIN:
                     if not any(item in (OperatorCommand.STOP, OperatorCommand.DISCARD,
                                         OperatorCommand.QUIT, OperatorCommand.EMERGENCY_STOP)
@@ -888,6 +854,10 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     skip_control_tick = True
                 elif control is OperatorCommand.PAUSE:
                     pause_signal_applied = False
+                    if cfg.runtime.policy.recording_enabled and shared.evidence_failed.value:
+                        print("\nC: recording failed — use H/Q for safe recovery")
+                        skip_control_tick = True
+                        continue
                     if teleop_active:
                         enter_pause("pause", relabel=True)
                         teleop_active = False
@@ -972,7 +942,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                         )
                         if not recording_active:
                             shared.evidence_failed.value = True
-                            _note_recorder_transport_failure(shared, recorder, context="start")
                     if cfg.runtime.policy.recording_enabled and not recording_active:
                         print("\nB: recorder START failed — collection remains ARMED")
                         skip_control_tick = True
@@ -1011,7 +980,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                     limiter.reset()
                     skip_control_tick = True
 
-            _note_recorder_transport_failure(shared, recorder, context="operator control completion")
             if break_loop or shared.error_state.value or shared.estop_request.value:
                 break
             if reanchor_grid:
@@ -1039,7 +1007,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 observation_anchor_monotonic_ns=current_grid_anchor_ns,
             )
             recording_active = tick_result.recording_active
-            _note_recorder_transport_failure(shared, recorder, context="control grid")
             arm_feedback_error_count = tick_result.arm_feedback_error_count
             hand_disconnected_at_s = tick_result.hand_disconnected_at_s
             if reject_revoked_run():
@@ -1064,7 +1031,6 @@ def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
                 recorder, True, save=False, shared=shared, reason=reason,
                 retain_partial=True,
             )
-        _note_recorder_transport_failure(shared, recorder, context="shutdown")
         kb.stop()
         audio.play("end")
         if not audio.wait_until_idle(timeout_s=_END_AUDIO_GRACE_S):

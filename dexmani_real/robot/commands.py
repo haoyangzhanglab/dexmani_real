@@ -55,6 +55,7 @@ class CommandAdoption:
     hand_adopted: bool = False
     arm_monotonic_ns: int = 0
     hand_monotonic_ns: int = 0
+    # Monotonic negative witnesses, originating only after revocation.
     arm_known: bool = False
     hand_known: bool = False
 
@@ -62,6 +63,22 @@ class CommandAdoption:
         return bool(command.command_id and
                     (command.arm_qpos is None or self.arm_adopted) and
                     (command.hand_qpos is None or self.hand_adopted))
+
+    def resolved(self, command: RobotCommand) -> bool:
+        return bool(command.command_id and
+                    (command.arm_qpos is None or self.arm_adopted or self.arm_known) and
+                    (command.hand_qpos is None or self.hand_adopted or self.hand_known))
+
+    def merge(self, newer: CommandAdoption) -> CommandAdoption:
+        """Accumulate evidence for the same command and revocation boundary."""
+        return CommandAdoption(
+            self.arm_adopted or newer.arm_adopted,
+            self.hand_adopted or newer.hand_adopted,
+            self.arm_monotonic_ns or newer.arm_monotonic_ns,
+            self.hand_monotonic_ns or newer.hand_monotonic_ns,
+            self.arm_known or newer.arm_known,
+            self.hand_known or newer.hand_known,
+        )
 
     def fields(self, command: RobotCommand) -> dict[str, int | bool]:
         return dict(
@@ -87,7 +104,7 @@ def read_command_adoption(shared: Any, command: RobotCommand, *, boundary_ns: in
     for name in ("arm", "hand"):
         present = getattr(command, f"{name}_qpos") is not None
         result = getattr(shared, f"{name}_state_ring").read_latest() if present else None
-        adopted, stamp, known = False, 0, not present
+        adopted, stamp, known = False, 0, False
         if result is not None:
             record = result[0][0]
             adopted = bool(command.command_id and
@@ -95,7 +112,7 @@ def read_command_adoption(shared: Any, command: RobotCommand, *, boundary_ns: in
                 int(record["last_adopted_command_id"]) == command.command_id and
                 int(record["last_adopted_monotonic_ns"]) > 0)
             stamp = int(record["last_adopted_monotonic_ns"]) if adopted else 0
-            known = bool(record["state_valid"] and
+            known = bool(boundary_ns > 0 and not adopted and record["state_valid"] and
                          int(record["source_monotonic_ns"]) > boundary_ns)
         values.update({f"{name}_adopted": adopted, f"{name}_monotonic_ns": stamp,
                        f"{name}_known": known})

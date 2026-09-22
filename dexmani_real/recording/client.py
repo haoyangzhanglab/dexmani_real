@@ -11,7 +11,9 @@ import numpy as np
 
 from dexmani_real.recording.frame import EpisodeFrame
 from dexmani_real.robot.commands import RobotCommand, read_command_adoption, CommandAdoption
-from dexmani_real.runtime.safety import invalidate_coupled_commands
+from dexmani_real.runtime.safety import (
+    RunEndReason, SafetyState, invalidate_coupled_commands, revoke_motion,
+)
 from dexmani_real.recording.storage.schema import (
     FRAME_PARTIAL_ADOPTION, FRAME_ADOPTION_UNKNOWN, validate_command_row,
 )
@@ -95,7 +97,7 @@ class RecorderClient:
 
     @property
     def transport_unavailable(self) -> bool:
-        """Whether transport integrity was lost; the workflow owns disposition."""
+        """Whether transport integrity was lost; the workflow owns finalization."""
         return self._unavailable
 
     @property
@@ -112,17 +114,23 @@ class RecorderClient:
         return self._stop_requested
 
     @property
-    def camera_writer_error(self) -> str | None:
+    def last_error(self) -> str | None:
+        """Most recent recording or transport error, if any."""
         return self._last_stop_result.error if self._last_stop_result else None
 
-    @property
-    def last_error(self) -> str | None:
-        """Terminal error text of the most recent recording result, if any."""
-        return self._last_stop_result.error if self._last_stop_result else None
+    def _fail_recording(self, error: str) -> None:
+        """Fence collection before terminal accounting can release publication."""
+        with self.shared.motion_lock:
+            if (int(self.shared.safety_state.value) == int(SafetyState.RUNNING)
+                    and not self.shared.error_state.value and not self.shared.estop_request.value):
+                revoke_motion(self.shared, SafetyState.ARMED, reason=RunEndReason.RECORDING_FAILURE)
+            self.technical_status = "invalid"
+            self.shared.evidence_failed.value = True
+            self.shared.session_failed.value = True
+        logger.error("Recording failed: %s", error)
 
     def _fail_transport(self, error: str) -> None:
-        # Report local unavailability; the workflow decides its disposition.
-        logger.error("RecorderIO unavailable: %s", error)
+        self._fail_recording(error)
         self._unavailable = True
         self.shared.recorder_transport_failed.value = True
         self._recording = False
@@ -221,8 +229,9 @@ class RecorderClient:
     def resolve_command(self, *, finish: bool = False) -> bool:
         """Resolve one owned sample before new commands or recorder STOP.
 
-        Boundary waits are bounded; current-run polling is nonblocking. Sensor
-        failures do not erase positive adoption evidence already observed.
+        Boundary waits are bounded; current-run polling is nonblocking. Both
+        positive adoption and post-boundary negative witnesses are historical.
+        True means accounting is terminal, independently of persistence success.
         """
         pending = self.pending_command
         if pending is None:
@@ -237,23 +246,14 @@ class RecorderClient:
             with self.shared.motion_lock:
                 boundary = int(self.shared.pending_record_revoked_ns.value)
                 facts = read_command_adoption(self.shared, command, boundary_ns=boundary)
-                old = self._known_adoption
-                facts = CommandAdoption(
-                    facts.arm_adopted or old.arm_adopted,
-                    facts.hand_adopted or old.hand_adopted,
-                    facts.arm_monotonic_ns or old.arm_monotonic_ns,
-                    facts.hand_monotonic_ns or old.hand_monotonic_ns,
-                    facts.arm_known, facts.hand_known,
-                )
+                facts = self._known_adoption.merge(facts)
                 self._known_adoption = facts
-                fresh = facts.arm_known and facts.hand_known
                 expired = boundary and time.monotonic_ns() >= boundary + int(self.adoption_timeout_s * 1e9)
-                if not boundary and facts.complete(command):
+                if facts.complete(command):
                     outcome = "joint"
                     break
-                if boundary and fresh:
-                    outcome = ("joint" if facts.complete(command) else
-                               "partial" if facts.arm_adopted or facts.hand_adopted else "none")
+                if facts.resolved(command):
+                    outcome = "partial" if facts.arm_adopted or facts.hand_adopted else "none"
                     break
                 if expired:
                     outcome = "unknown"
@@ -265,30 +265,24 @@ class RecorderClient:
         if self.shared.error_state.value or self.shared.estop_request.value or self.shared.evidence_failed.value:
             self.technical_status = "invalid"
         self.pending_command = None
-        fields = facts.fields(command)
-        sample.data.update(fields)
-        if outcome in {"partial", "unknown"}:
-            sample.data["flag_frame_status"] = (FRAME_PARTIAL_ADOPTION if outcome == "partial"
-                                                 else FRAME_ADOPTION_UNKNOWN)
-            self.technical_status = "invalid"
-            self.shared.session_failed.value = True
-        if outcome == "joint":
-            self.last_command_fields = fields
-            self.last_command_action = {k: sample.data[k].copy() for k in
-                ("action_arm_joint_sent", "action_hand_joint", "action_arm_ee")}
         try:
-            if outcome != "none" and not self.add_frame(sample):
+            fields = facts.fields(command)
+            sample.data.update(fields)
+            if outcome in {"partial", "unknown"}:
+                sample.data["flag_frame_status"] = (FRAME_PARTIAL_ADOPTION if outcome == "partial"
+                                                     else FRAME_ADOPTION_UNKNOWN)
                 self.technical_status = "invalid"
-                self.shared.evidence_failed.value = True
                 self.shared.session_failed.value = True
-                write_recording_failure(self.shared, "command sample submission failed")
-        except Exception:
-            self.technical_status = "invalid"
-            self.shared.evidence_failed.value = True
-            self.shared.session_failed.value = True
-            # Keep the identity marker for the parent's bounded failure sidecar.
-            raise
-        else:
+            if outcome == "joint":
+                self.last_command_fields = fields
+                self.last_command_action = {k: sample.data[k].copy() for k in
+                    ("action_arm_joint_sent", "action_hand_joint", "action_arm_ee")}
+            if outcome != "none" and not self.add_frame(sample):
+                raise RuntimeError("command sample submission failed")
+        except Exception as exc:
+            self._fail_recording(str(exc))
+            write_recording_failure(self.shared, str(exc), command=command, facts=facts)
+        finally:
             with self.shared.motion_lock:
                 if int(self.shared.pending_record_command_id.value) == command.command_id:
                     self.shared.pending_record_command_id.value = 0
@@ -296,32 +290,42 @@ class RecorderClient:
         return True
 
     def add_frame(self, sample: EpisodeFrame) -> bool:
-        if not self._recording or self.shared.recorder_transport_failed.value:
+        if self.shared.recorder_transport_failed.value:
+            self._fail_recording("recorder transport unavailable during sample submission")
             return False
-        validate_command_row(sample.data)
-        latest = int(self.shared.record_sample_ring.latest_sequence)
-        consumed = int(self.shared.recorder_consumed_sequence.value)
-        if latest - consumed >= self.shared.record_sample_ring.maxlen:
-            logger.error("RecorderIO sample ring overflow — aborting episode")
-            self.stop_episode(save=False, reason="sample_ring_overflow")
+        if not self._recording:
             return False
+        try:
+            validate_command_row(sample.data)
+            latest = int(self.shared.record_sample_ring.latest_sequence)
+            consumed = int(self.shared.recorder_consumed_sequence.value)
+            if latest - consumed >= self.shared.record_sample_ring.maxlen:
+                self._fail_recording("sample ring overflow")
+                self.stop_episode(save=False, reason="sample_ring_overflow")
+                return False
 
-        dtype = self.shared.record_sample_ring.dtype
-        frame = np.zeros(1, dtype=dtype)
-        frame["timestamp"][0] = sample.timestamp_s
-        for name, value in sample.data.items():
-            frame[name][0] = value
-        if sample.camera_rgb is not None or sample.camera_depth is not None:
-            frame["camera_present"][0] = 1
-            if sample.camera_rgb is not None:
-                frame["camera_rgb"][0] = sample.camera_rgb
-            if sample.camera_depth is not None:
-                frame["camera_depth"][0] = sample.camera_depth
-        self.shared.record_sample_ring.write(frame)
-        self._frame_count += 1
-        if not self._stop_requested and self._max_frames and self._frame_count >= self._max_frames:
-            self.stop_episode(save=True, reason=self._max_frames_stop_reason)
-        return True
+            dtype = self.shared.record_sample_ring.dtype
+            frame = np.zeros(1, dtype=dtype)
+            frame["timestamp"][0] = sample.timestamp_s
+            for name, value in sample.data.items():
+                frame[name][0] = value
+            if sample.camera_rgb is not None or sample.camera_depth is not None:
+                frame["camera_present"][0] = 1
+                if sample.camera_rgb is not None:
+                    frame["camera_rgb"][0] = sample.camera_rgb
+                if sample.camera_depth is not None:
+                    frame["camera_depth"][0] = sample.camera_depth
+            self.shared.record_sample_ring.write(frame)
+            self._frame_count += 1
+            if not self._stop_requested and self._max_frames and self._frame_count >= self._max_frames:
+                self.stop_episode(save=True, reason=self._max_frames_stop_reason)
+            if self.shared.recorder_transport_failed.value:
+                self._fail_recording("recorder transport lost during sample submission")
+                return False
+            return True
+        except Exception as exc:
+            self._fail_recording(f"sample submission failed: {exc}")
+            return False
 
     def stop_episode(
         self, save: bool = True, reason: str = "", *, retain_partial: bool = False
@@ -422,8 +426,11 @@ class RecorderClient:
         return self._last_stop_result
 
 
-def write_recording_failure(shared: Any, reason: str) -> None:
-    """Parent fallback when the sole recording owner cannot finish its account.
+def write_recording_failure(
+    shared: Any, reason: str, *, command: RobotCommand | None = None,
+    facts: CommandAdoption | None = None,
+) -> None:
+    """Best-effort failure sidecar using owner evidence or a parent snapshot.
 
     This sidecar does not reconstruct an observation or consume recorder queues.
     It invalidates the reserved episode even if a late RecorderIO close succeeds.
@@ -433,37 +440,47 @@ def write_recording_failure(shared: Any, reason: str) -> None:
     from dexmani_real.robot.commands import read_robot_command
     from dexmani_real.utils.atomic_io import atomic_json_dump
 
-    raw_path = shared.record_episode_path.value
-    if not raw_path:
-        return
-    path = Path(raw_path.decode())
-    result_path = path.with_name(path.name + ".result.json")
-    previous = {}
-    if result_path.is_file():
-        try:
-            previous = json.loads(result_path.read_text())
-        except (OSError, ValueError):
-            logger.warning("could not read previous recording diagnostic", exc_info=True)
-    payload = dict(technical_status="invalid", termination_reason=reason, task_success="unknown")
-    if shared.pending_record_command_id.value:
-        command = read_robot_command(shared)
-        if command is not None and command.command_id == int(shared.pending_record_command_id.value):
+    try:
+        raw_path = shared.record_episode_path.value
+        if not raw_path:
+            return
+        path = Path(raw_path.decode())
+        result_path = path.with_name(path.name + ".result.json")
+        previous = {}
+        if result_path.is_file():
+            try:
+                previous = json.loads(result_path.read_text())
+            except (OSError, ValueError):
+                logger.warning("could not read previous recording diagnostic", exc_info=True)
+        payload = dict(technical_status="invalid", termination_reason=reason, task_success="unknown")
+        with shared.motion_lock:
             boundary = int(shared.pending_record_revoked_ns.value)
-            facts = read_command_adoption(shared, command, boundary_ns=boundary)
+            if command is None and shared.pending_record_command_id.value:
+                command = read_robot_command(shared)
+                if command is not None and command.command_id != int(shared.pending_record_command_id.value):
+                    command = None
+            if command is not None and facts is None:
+                facts = read_command_adoption(shared, command, boundary_ns=boundary)
+        if command is not None and facts is not None:
+            if (previous.get("command_id") == command.command_id
+                    and previous.get("command_run_id") == command.run_id):
+                old = {}
+                same_boundary = boundary > 0 and previous.get("revoked_monotonic_ns") == boundary
+                for name in ("arm", "hand"):
+                    old[f"{name}_adopted"] = bool(previous.get(f"{name}_command_adopted", False))
+                    old[f"{name}_monotonic_ns"] = int(previous.get(f"{name}_command_adopted_monotonic_ns", 0))
+                    old[f"{name}_known"] = bool(same_boundary and previous.get(f"{name}_post_boundary_negative", False))
+                facts = CommandAdoption(**old).merge(facts)
             payload.update(facts.fields(command))
-            payload["adoption_accounting"] = ("recording_incomplete" if facts.arm_known and facts.hand_known
+            payload["adoption_accounting"] = ("recording_incomplete" if facts.resolved(command)
                                                else "ADOPTION_UNKNOWN")
             payload["revoked_monotonic_ns"] = boundary
+            payload["arm_post_boundary_negative"] = facts.arm_known
+            payload["hand_post_boundary_negative"] = facts.hand_known
             payload["arm_qpos"] = None if command.arm_qpos is None else command.arm_qpos.tolist()
             payload["hand_qpos"] = None if command.hand_qpos is None else command.hand_qpos.tolist()
-    # A later shutdown without a pending marker must retain already-known facts.
-    if previous.get("command_id") == payload.get("command_id"):
-        for name in ("arm", "hand"):
-            if previous.get(f"{name}_command_adopted"):
-                payload[f"{name}_command_adopted"] = True
-                payload[f"{name}_command_adopted_monotonic_ns"] = previous[f"{name}_command_adopted_monotonic_ns"]
-    try:
+        # Shutdown after barrier release retains the owner's terminal facts.
         atomic_json_dump(previous | payload, result_path)
-    except OSError:
+    except Exception:
         shared.session_failed.value = True
         logger.exception("could not persist recording failure; continuing safe shutdown")

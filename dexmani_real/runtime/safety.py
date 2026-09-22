@@ -151,9 +151,9 @@ def _revoke_motion_locked(
 def invalidate_coupled_commands(shared: Any) -> int:
     """Invalidate coupled commands while deliberately retaining lifecycle state.
 
-    This narrow primitive is for an already-established pause boundary
-    and for cancellation of a failed home command. Start/stop state changes
-    must use :func:`begin_motion` or :func:`revoke_motion` instead.
+    This establishes the command fence for pause or home cancellation.
+    Capture resume freshness timestamps after it returns. Start/stop state
+    changes use :func:`begin_motion` or :func:`revoke_motion` instead.
     """
     with shared.motion_lock:
         return _invalidate_coupled_commands_locked(shared)
@@ -363,8 +363,8 @@ def revoke_motion(shared: Any, new_state: SafetyState = SafetyState.ARMED, *,
                   reason: RunEndReason = RunEndReason.EXECUTOR_BOUNDARY) -> bool:
     """Atomically invalidate commands and leave the current motion state.
 
-    This is the required path for a normal command pause boundary and fault
-    escalation. The short critical section never includes hardware IO.
+    Use this for lifecycle stops and fault escalation; command-only fences use
+    :func:`invalidate_coupled_commands`. The short lock never includes hardware IO.
     """
     if new_state not in (SafetyState.ARMED, SafetyState.DISARMED, SafetyState.FAULT):
         raise ValueError("motion revocation must target ARMED, DISARMED, or FAULT")

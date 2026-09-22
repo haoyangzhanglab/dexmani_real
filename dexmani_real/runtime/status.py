@@ -12,6 +12,6 @@ class ExitReason(IntEnum):
     STICKY_FAULT = 3
     WORKER_DEATH = 4
     HEARTBEAT_TIMEOUT = 5
-    # Terminal policy/session failure, distinct from optional evidence failure.
+    # Terminal session failure; EVIDENCE_FAILURE allows teleop H/Q recovery.
     SERVICE_FAILURE = 6
     EVIDENCE_FAILURE = 7

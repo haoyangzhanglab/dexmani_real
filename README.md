@@ -67,9 +67,10 @@ python examples/collect_teleop.py --config experiment.yaml --task-name <task> --
 `B` 开始、`C` 暂停/恢复、`S` 停止并保存、`D` 丢弃、`H` 归位、`Q` 退出、`ESC` 急停。
 退出录制时按提示选择保存/丢弃；不要把 GUI 关闭或进程退出当作物理急停。
 数据写入 `episodes/<task>/episode_*`。录制模式下，`B` 必须等相机和 RecorderIO 可用。
-相机或 recorder 失败会使当前 demonstration 无效，并撤销运动回到 ARMED；仍可手动归位或退出。
+相机、recorder 或 raw sample 写入失败会使当前 demonstration 无效，并撤销运动回到 ARMED。
+本 session 不再接受录制 B/C 恢复；仍可手动归位或退出，最终返回非零。
 只有显式 `--no-record` 才允许不录制的遥操作。`C` 保留同一 episode，撤销旧命令后，
-等待暂停之后的新 robot/VR 反馈再重新锚定；不会把暂停改成停止或丢弃。
+等待命令撤销之后的新 robot/VR 反馈再重新锚定；不会把暂停改成停止或丢弃。
 自动中断时，非空且已安全关闭的录制前缀保存在 `incomplete_*`，不是可直接训练的完整 episode；
 显式丢弃仍丢弃。最终路径与录制结果查看日志。
 recorder 进程自己 drain 最后一帧、关闭视频/HDF5 并发布结果；关闭期间使用原始固定 deadline，
@@ -151,7 +152,7 @@ policy: deployment/session.py 启动进程并独立处理键盘
         deployment/runner.py → observation.py → dexmani_policy.predict(array_dict)
         → 同一 robot command path
 
-recording: control loop → build_episode_frame → RecorderClient.add_frame(frame)
+recording: control loop → RecorderClient（命令采纳核算、sample 发布）
           → sample ring → IO worker → EpisodeRecorder.add_frame(frame) → HDF5/video
 ```
 
@@ -164,7 +165,9 @@ terminal cause 保留第一次实际停止的原因，供晚返回的 runner 收
 command_id 在同一个 RuntimeChannels 生命周期中单调分配；run_id 是运动授权 epoch，
 用于暂停、停止及阻塞推理返回后拒绝旧动作，不是科研 episode 身份。
 撤销阻止新的 SDK admission；已经 admission 的调用仍可能晚返回，arm/hand 并非物理原子事务。
-录制中的待采用命令在撤销后使用新的 worker 状态完成有界核算，再允许后续命令覆盖证据。
+录制命令的采纳核算累积历史证据：已确认的采纳保持有效；确认未采纳需要撤销之后的有效 worker 状态。
+每个目标执行器分别解析；超时仍不确定则标记 UNKNOWN。核算终结后释放命令屏障，
+raw 写入失败由录制层标记无效并先撤销运动，不通过控制进程崩溃触发硬件 FAULT。
 SDK adoption 不等于物理收敛；XHand 的 adopted 与最终目标 reached 分开。
 
 必须保留的硬边界：机械限位、非有限数阻断、实际速度 / 步长限制、急停、SDK 错误、旧命令撤销、

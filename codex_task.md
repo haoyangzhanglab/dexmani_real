@@ -594,13 +594,17 @@ On C/S/Q/timeout/fault/new-run boundary:
 - do **not** immediately relabel the command as executed;
 - do **not** blindly discard the pending descriptor if any physical adoption may have occurred.
 
-Resolve it from post-boundary worker state when possible.
-
-A fresh post-boundary state sample from each still-live relevant worker must be newer than the revocation/pause boundary before using it to classify the old command. This allows an SDK call admitted just before revocation to return and publish its historical old-run adoption fact.
+Resolve each present actuator from accumulated physical evidence. Exact adoption
+of the command is permanent historical truth, independent of later feedback
+health or revocation. A negative witness requires valid state sampled strictly
+after a nonzero revocation boundary, without exact adoption of that command.
+Preserve both kinds of evidence across polls; an adopted actuator does not need
+another post-boundary frame. SDK-owner sampling is serial with SDK calls, so a
+post-boundary sample accounts for calls admitted before revocation.
 
 Then:
 
-### Neither relevant worker adopted
+### All present actuators resolved, none adopted
 
 - no physical high-level command was observed as adopted;
 - dropping the pending normal row is acceptable.
@@ -610,7 +614,7 @@ Then:
 - finalize the command row with the actual adoption facts;
 - it was a real jointly adopted command even if a lifecycle boundary followed immediately.
 
-### Only a subset adopted
+### All present actuators resolved, only a subset adopted
 
 - persist a diagnostic row if recording is still available;
 - store target + per-actuator adoption bits/timestamps;
@@ -618,7 +622,7 @@ Then:
 - never treat this row as a normal training label;
 - mark the episode technically/integrity-invalid for default training export because the coupled physical action was split.
 
-### Cannot determine because worker died / state never became fresh / shutdown removed evidence
+### Timeout with at least one present actuator unresolved
 
 - persist `ADOPTION_UNKNOWN` if the recorder is still available;
 - mark the episode technically/integrity-invalid;
@@ -626,9 +630,15 @@ Then:
 
 This logic is especially important around C pause and stop/fault boundaries.
 
-Before any later operation publishes a new command that could overwrite worker `last_adopted_*` evidence, resolve the old pending command from fresh post-boundary state or explicitly classify it `ADOPTION_UNKNOWN` and invalidate the episode. This is a short **adoption-accounting barrier**, not a motion queue: it exists only to preserve truthful evidence across lifecycle boundaries.
+Before any later operation publishes a new command that could overwrite worker `last_adopted_*` evidence, resolve the old pending command from accumulated adoption/negative witnesses or explicitly classify it `ADOPTION_UNKNOWN` at timeout and invalidate the episode. This is a short **adoption-accounting barrier**, not a motion queue: it exists only to preserve truthful evidence across lifecycle boundaries.
 
 Do not block normal control indefinitely to resolve historical adoption. Use existing bounded lifecycle/shutdown timing; if the bounded accounting barrier cannot resolve the old command, record/mark `ADOPTION_UNKNOWN`, invalidate the episode, and only then allow a later command-producing operation to proceed.
+
+Terminal physical accounting does not depend on successful raw persistence.
+On persistence failure, fence RUNNING to ARMED with `RECORDING_FAILURE` unless
+already revoked or owned by a physical fault/ESTOP, mark evidence/session invalid,
+then reliably release the pending accounting barrier. Handle the storage failure
+without crashing the control owner; diagnostic writes are best-effort.
 
 ---
 
@@ -796,7 +806,7 @@ For recorded teleop:
 - revoke active RUNNING teleop to ARMED;
 - do not continue pretending collection is valid;
 - retain H/Q/safe recovery where possible;
-- block another recorded B unless recording resources are healthy again;
+- block recorded B/C for the rest of the failed session;
 - final session result is non-zero.
 
 Do not retain a generic “evidence service priority matrix” if simple workflow-specific handling replaces it.
@@ -805,8 +815,8 @@ Do not retain a generic “evidence service priority matrix” if simple workflo
 
 On C pause:
 
-1. establish the pause/revocation monotonic boundary;
-2. fence the old `run_id`;
+1. fence the old `run_id`;
+2. capture the pause freshness timestamp after the command fence returns;
 3. stop publication of new commands;
 4. keep any potentially partially adopted pending descriptor until section 6 classification is possible;
 5. clear teleop proposal/reference state as current behavior requires;
@@ -884,7 +894,8 @@ measured proprioception/tactile/vision response
 
 # 11. Raw schema migration: v30 → v31
 
-Current raw schema is v30. The command/action truth changes, so bump explicitly to v31 unless local HEAD already consumed v31; then use the next unused version.
+The completed command-protocol migration changed raw v30 to v31. Current raw
+schema is v31; evidence-accounting and persistence-failure fixes do not change it.
 
 Do not silently reinterpret v30.
 
@@ -1221,7 +1232,9 @@ This is simpler and scientifically safer than “control continues but evidence 
 
 ## 16.2 Teleop recorder failure
 
-Use section 9.2: current demonstration invalid, motion returns to ARMED when safe, manual recovery/home/quit remain possible, no new recorded B until recorder/camera health is restored.
+Use section 9.2: current demonstration invalid, motion returns to ARMED when safe,
+manual recovery/home/quit remain possible, and recorded B/C remain blocked for
+the rest of the failed session.
 
 ---
 

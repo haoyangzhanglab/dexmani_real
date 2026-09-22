@@ -213,7 +213,7 @@ class RuntimeChannels:
     # fault, the owning workflow may use verified non-FAULT shutdown while still
     # reporting the session as failed.
     session_failed: Any
-    evidence_failed: Any  # collection failure; workflow owns revocation and recovery
+    evidence_failed: Any  # collection invalidity latch, distinct from hardware fault
     estop_request: Any  # policy -> arm/hand
     quit_requested: Any  # policy -> Main
     camera_requested: (
