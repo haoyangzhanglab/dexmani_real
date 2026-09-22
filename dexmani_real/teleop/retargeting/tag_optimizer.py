@@ -181,7 +181,7 @@ class HandOptimizer:
 
         Returns:
             (dof,) joint angles in Pinocchio model order, or ``None`` when
-            Stage 1 fails. The caller must hold its last valid command.
+            Stage 1 fails. The caller must record failure without a new target.
         """
         fingertip_positions = np.asarray(fingertip_positions, dtype=np.float64)
         if fingertip_positions.shape != (self.finger_num, 3):
@@ -206,7 +206,7 @@ class HandOptimizer:
         except nlopt.RoundoffLimited:
             self._stage1_warn(
                 "HandOptimizer: Stage 1 reached the NLopt roundoff limit — "
-                "caller will hold last command",
+                "no target produced",
                 exc_info=True,
             )
             return None

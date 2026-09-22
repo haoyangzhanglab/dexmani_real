@@ -163,6 +163,7 @@ class XHand:
     """Thin stateful adapter around one worker-local SDK controller."""
 
     def __init__(self, config: HandParams):
+        config.validate()
         self.cfg = config
         self.connected_flag = False
         self.device_identity = {

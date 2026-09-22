@@ -30,10 +30,6 @@ class EpisodeDataWriter:
     def datasets(self) -> Mapping[str, h5py.Dataset]:
         return self._datasets
 
-    @property
-    def flushed_frames(self) -> int:
-        return self._flushed_frames
-
     def _ensure_open(self) -> h5py.File:
         if self._file is None:
             self._file = h5py.File(self.path, "w")

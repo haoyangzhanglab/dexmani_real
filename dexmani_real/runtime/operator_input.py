@@ -521,17 +521,6 @@ class KeyboardInput:
             self._buffer.clear()
             self._events.clear()
 
-    def wait_for_release(self, timeout_s: float = 2.0) -> bool:
-        """Wait boundedly for held keys to be released before listener shutdown."""
-        deadline_s = time.monotonic() + timeout_s
-        while time.monotonic() < deadline_s:
-            with self._lock:
-                if not self._keys:
-                    return True
-            time.sleep(0.01)
-        with self._lock:
-            return not self._keys
-
     def drain_signal(self, target: OperatorCommand | None) -> int:
         """Remove all occurrences of *target* from the buffer, preserving others.
 

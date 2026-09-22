@@ -1,120 +1,30 @@
-"""Start the policy and hardware processes, handle operator input, and stop them."""
-
-from __future__ import annotations
-
-import math
+"""Policy deployment process ownership and operator lifecycle."""
 import multiprocessing as mp
+import math
 import os
 import threading
 import time
-from dataclasses import replace
-from typing import Any
-
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.deployment.config import (
-    FingertipAssemblerConfig,
-    PolicyRuntimeConfig,
-    RolloutRecordingConfig,
-    validate_max_running_s,
-    validate_num_episodes,
-    validate_policy_runtime_compatibility,
-)
+from dexmani_real.deployment.config import (FingertipAssemblerConfig, PolicyRuntimeConfig,
+    RolloutRecordingConfig, validate_policy_runtime_compatibility, validate_max_running_s, validate_num_episodes)
 from dexmani_real.deployment.runner import policy_runner_loop
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
-from dexmani_real.runtime.safety import StopRequest, request_policy_start, request_policy_stop, RunEndReason
+from dexmani_real.runtime.safety import (SafetyState, StopRequest, request_policy_start, request_policy_stop,
+    RunEndReason, require_transition, revoke_motion_if_run_id)
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.recording.io_worker import RecorderIOConfig, recorder_io_loop
-from dexmani_real.recording.client import RECORDER_STOP_TIMEOUT_S
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.robot.hand_worker import hand_loop
-from dexmani_real.runtime.processes import (
-    ShutdownReport,
-    stop_processes_verified,
-)
-from dexmani_real.runtime.safety import SafetyState, require_transition
-from dexmani_real.runtime.status import ExitReason
-from dexmani_real.runtime.supervisor import (
-    run_supervisor,
-    supervisor_exit_reason,
-    shutdown_processes,
-    wait_subsystem_ready,
-    start_evidence_services,
-)
+from dexmani_real.runtime.processes import shutdown_processes_verified, stop_processes_verified
+from dexmani_real.runtime.supervisor import start_processes, check_processes
 from dexmani_real.sensor.camera.worker import CameraLoopConfig, camera_loop
 from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig, pointcloud_loop
 from dexmani_real.utils.log import get_logger
-
 logger = get_logger(__name__)
-
-
-_OBSERVATION_READ_MARGIN = 2
+_POLL_S = 0.05
 _ROLLOUT_RECORDER_FRAME_MARGIN = 4
-
-
-def _observation_field_names(policy_spec: Any) -> tuple[str, ...]:
-    return tuple(field.name for field in policy_spec.observation_fields)
-
-
-def _requires_pointcloud(policy_spec: Any) -> bool:
-    return "point_cloud" in _observation_field_names(policy_spec)
-
-
-def _requires_camera(policy_spec: Any) -> bool:
-    requested = _observation_field_names(policy_spec)
-    return "point_cloud" in requested or "rgb" in requested
-
-
-def _session_result_facts(shared, report, *, recording_enabled: bool, normal_exit: bool):
-    """Compute independent evidence, cleanup and overall 0/1 outcome facts."""
-    cleanup_ok = report is not None and report.shared_closed and all(
-        item.exitcode is not None for item in report.exits
-    )
-    recording_status = (
-        "failed" if shared.evidence_failed.value else
-        "no evidence failure observed" if recording_enabled else "not recording"
-    )
-    clean_exit = bool(
-        cleanup_ok and normal_exit
-        and all(item.exitcode == 0 and item.escalation == "graceful" for item in report.exits)
-        and not shared.error_state.value and not shared.estop_request.value
-        and not shared.session_failed.value and not shared.evidence_failed.value
-        and int(shared.safety_state.value) == int(SafetyState.DISARMED)
-    )
-    return recording_status, "clean" if cleanup_ok else "incomplete-or-failed", clean_exit
-
-
-def _report_session_end(shared, report, *, recording_enabled: bool, normal_exit: bool, exit_reason: str) -> bool:
-    """Report evidence and verified cleanup even on exceptional teardown."""
-    recording_status, cleanup_status, clean_exit = _session_result_facts(
-        shared, report, recording_enabled=recording_enabled, normal_exit=normal_exit,
-    )
-    print("\n── Session End ──")
-    print(f"  control_reason  = {exit_reason}")
-    print(f"  recording_status= {recording_status}")
-    print(f"  cleanup_status  = {cleanup_status}")
-    print(f"  safety={SafetyState(int(shared.safety_state.value)).name}  "
-          f"supervisor_normal={normal_exit}  clean_exit={clean_exit}")
-    if report is not None:
-        print(f"  process_exits   = {report.exits}")
-    print("──")
-    return clean_exit
-
-
-def _requires_hand_sensor(policy_spec: Any) -> bool:
-    # eef_pose derives from arm qpos only and never triggers the hand sensor.
-    requested = set(_observation_field_names(policy_spec))
-    return bool(
-        requested
-        & {
-            "joint_state",
-            "contact_force",
-            "fingertip_points",
-            "tactile_force",
-        }
-    )
-
 
 def _rollout_recorder_config(
     runtime: ExperimentConfig,
@@ -142,7 +52,6 @@ def _rollout_recorder_config(
         max_frames=max_frames,
         control_hz=control_hz,
         min_frames=1,
-        writer_queue_size=int(runtime.camera.writer_queue_size),
         provenance={
             "workflow": "policy_eval",
             "policy_selector": worker_config.experiment,
@@ -156,526 +65,74 @@ def _rollout_recorder_config(
     )
 
 
-def _wait_for_rollout_recording(
-    shared: RuntimeChannels, processes: list[Any], *,
-    heartbeat_timeouts_s: dict[str, float], service_process_names: set[str],
-) -> bool:
-    """Allow the ordinary recorder transaction to finish before shutdown.
-
-    Motion is already revoked; hardware health and the independent operator
-    listener remain active. The policy child is the sole result consumer.
-    """
-    owners = [
-        process for process in processes if process.name in {"policy", "recorder"}
-    ]
-    deadline = time.monotonic_ns() + int(RECORDER_STOP_TIMEOUT_S * 1e9)
-    while bool(shared.is_recording.value):
-        now = time.monotonic()
-        reason = supervisor_exit_reason(
-            shared, processes,
-            {name: now - shared.get_heartbeat(name) for name in heartbeat_timeouts_s},
-            heartbeat_timeouts_s, service_process_names=service_process_names,
-        )
-        if reason in {ExitReason.ESTOP, ExitReason.STICKY_FAULT,
-                      ExitReason.WORKER_DEATH, ExitReason.HEARTBEAT_TIMEOUT}:
-            require_transition(shared, SafetyState.FAULT)
-            return False
-        finishing = int(shared.recorder_finish_deadline_ns.value)
-        finish_expired = (
-            finishing > 0 and time.monotonic_ns() >= finishing
-            and not shared.recorder_completed_ns.value
-        )
-        if (
-            len(owners) != 2
-            or time.monotonic_ns() >= deadline
-            or finish_expired
-            or shared.recorder_transport_failed.value
-            or not all(p.is_alive() for p in owners)
-        ):
-            return False
-        time.sleep(0.01)
-    return True
-
-
-def _compute_policy_observation_ring_capacities(
-    runtime: ExperimentConfig,
-    policy_spec: Any,
-    channels_config: RuntimeChannelsConfig,
-) -> dict[str, int]:
-    """Return deployment-owned history capacities for a policy observation grid.
-
-    Capacity = source rate x history span, plus one predecessor control period
-    and a small read margin. This is a STORAGE COVERAGE assumption so one
-    causal window stays resident for sequence-addressed reads — it is NOT an
-    admission deadline: temporal admission is decided per query from source
-    causality against the query anchor alone.
-    """
-    observation_horizon = policy_spec.n_obs_steps
-    observation_dt_s = policy_spec.control_dt_s
-    if (
-        observation_horizon is None
-        or isinstance(observation_horizon, bool)
-        or int(observation_horizon) <= 0
-    ):
-        raise ValueError("deployment observation_horizon must be positive")
-    if (
-        observation_dt_s is None
-        or not math.isfinite(float(observation_dt_s))
-        or float(observation_dt_s) <= 0.0
-    ):
-        raise ValueError("deployment observation_dt_s must be finite and positive")
-
-    horizon = int(observation_horizon)
-    # Observation history lives on the policy control grid. Camera FPS only
-    # determines source frames inside that span, not model temporal spacing.
-    coverage_s = horizon * float(observation_dt_s)
-    arm_state_ring_maxlen = max(
-        channels_config.arm_state_ring_maxlen,
-        math.ceil(float(runtime.arm.loop_hz) * coverage_s) + _OBSERVATION_READ_MARGIN,
-    )
-    hand_state_ring_maxlen = max(
-        channels_config.hand_state_ring_maxlen,
-        math.ceil(float(runtime.hand.loop_hz) * coverage_s)
-        + _OBSERVATION_READ_MARGIN,
-    )
-    capacities = {
-        "arm_state_ring_maxlen": arm_state_ring_maxlen,
-        "hand_state_ring_maxlen": hand_state_ring_maxlen,
-    }
-    if channels_config.camera_requested:
-        capacities["camera_ring_maxlen"] = max(
-            channels_config.camera_ring_maxlen,
-            math.ceil(float(runtime.camera.fps) * coverage_s)
-            + _OBSERVATION_READ_MARGIN,
-        )
-    if channels_config.pointcloud_requested:
-        capacities["pointcloud_ring_maxlen"] = max(
-            channels_config.pointcloud_ring_maxlen,
-            math.ceil(float(runtime.camera.fps) * coverage_s)
-            + _OBSERVATION_READ_MARGIN,
-        )
-    return capacities
-
-
-def _build_policy_processes(
-    context: Any,
-    shared: RuntimeChannels,
-    runtime: ExperimentConfig,
-    policy_spec: Any,
-    worker_config: PolicyRuntimeConfig,
-    *,
-    execute: bool,
-    max_running_s: float | None = None,
-    num_episodes: int = 1,
-    recording_config: RolloutRecordingConfig | None = None,
-) -> list[Any]:
-    """Construct the concrete processes; the caller starts and joins them."""
-    pointcloud_requested = _requires_pointcloud(policy_spec)
-    camera_requested = _requires_camera(policy_spec) or recording_config is not None
-    fingertip_config = (
-        FingertipAssemblerConfig.from_runtime(runtime)
-        if "fingertip_points" in _observation_field_names(policy_spec)
-        else None
-    )
-    pointcloud_config = (
-        PointCloudLoopConfig.from_runtime(
-            runtime,
-            num_points=next(
-                field.shape[0]
-                for field in policy_spec.observation_fields
-                if field.name == "point_cloud"
-            ),
-        )
-        if pointcloud_requested
-        else None
-    )
-    processes: list[Any] = [
-        context.Process(name="arm", target=arm_loop, args=(shared, runtime.arm)),
-    ]
-    if camera_requested:
-        processes.append(
-            context.Process(name="camera", target=camera_loop, args=(
-                    shared,
-                    CameraLoopConfig.from_runtime(runtime),
-                    False,
-                ))
-        )
-    if pointcloud_requested:
-        processes.append(
-            context.Process(name="pointcloud", target=pointcloud_loop, args=(
-                    shared,
-                    pointcloud_config,
-                ))
-        )
-    if recording_config is not None:
-        assert max_running_s is not None
-        processes.append(
-            context.Process(name="recorder", target=recorder_io_loop, args=(
-                    shared,
-                    _rollout_recorder_config(
-                        runtime,
-                        recording_config,
-                        worker_config,
-                        max_running_s,
-                        num_episodes,
-                    ),
-                ))
-        )
-    processes.append(
-        context.Process(name="policy", target=policy_runner_loop, args=(
-                shared,
-                runtime,
-                worker_config,
-                execute,
-                max_running_s,
-                num_episodes,
-                recording_config,
-                fingertip_config,
-            ))
-    )
-    if policy_spec.requires_hand or _requires_hand_sensor(policy_spec):
-        processes.append(
-            context.Process(name="hand", target=hand_loop, args=(
-                    shared,
-                    runtime.hand,
-                    float(runtime.policy.hand_disconnect_timeout_s),
-                ))
-        )
-    return processes
-
-
-def run_policy_deployment(
-    runtime: ExperimentConfig,
-    policy_spec: Any,
-    worker_config: PolicyRuntimeConfig,
-    execute: bool,
-    *,
-    prefix: str | None = None,
-    max_running_s: float | None = None,
-    num_episodes: int = 1,
-    recording_config: RolloutRecordingConfig | None = None,
-) -> int:
-    """Run a persistent multi-episode policy deployment lifecycle and return its exit code.
-
-    ``execute=False`` validates candidates without publication;
-    ``execute=True`` enables coupled arm/hand publication. The policy runner
-    must load and warm up before any hardware process is started. The runtime
-    follows ``DISARMED -> hardware readiness -> ARMED -> supervision ->
-    verified shutdown``. Episodes and the per-episode budget are run-owner
-    configuration; required recording must be available before motion.
-    """
-    if not isinstance(runtime, ExperimentConfig):
-        raise TypeError("runtime must be an ExperimentConfig")
-    if not isinstance(execute, bool):
-        raise TypeError("execute must be a boolean")
-    if recording_config is not None:
-        if not isinstance(recording_config, RolloutRecordingConfig):
-            raise TypeError("recording_config must be a RolloutRecordingConfig")
-        if not execute:
-            raise ValueError("recorded rollout requires execute=True")
+def run_policy_deployment(runtime, policy_spec, worker_config, execute, *, prefix=None,
+                          max_running_s=None, num_episodes=1, recording_config=None):
     validate_policy_runtime_compatibility(policy_spec, runtime)
-    if not isinstance(worker_config, PolicyRuntimeConfig):
-        raise TypeError("worker_config must be a PolicyRuntimeConfig")
-    if worker_config.spec is not policy_spec:
-        raise ValueError("worker PolicySpec must be the validated lifecycle PolicySpec")
     max_running_s = validate_max_running_s(max_running_s)
     num_episodes = validate_num_episodes(num_episodes)
-    if recording_config is not None and max_running_s is None:
-        raise ValueError(
-            "recorded rollout requires an explicit max_running_s run budget"
-        )
-    logger.debug(
-        "policy deployment: experiment=%s device=%s seed=%s execute=%s",
-        worker_config.experiment,
-        worker_config.device,
-        worker_config.seed,
-        execute,
-    )
-
+    if recording_config is not None and (not execute or max_running_s is None):
+        raise ValueError("recorded evaluation requires execute and a finite run budget")
+    fields = {f.name: f for f in policy_spec.observation_fields}
+    cloud = "point_cloud" in fields
+    camera = cloud or "rgb" in fields or recording_config is not None
+    points = fields["point_cloud"].shape[0] if cloud else runtime.pointcloud.num_points
     ctx = mp.get_context("spawn")
-    pointcloud_requested = _requires_pointcloud(policy_spec)
-    camera_requested = _requires_camera(policy_spec) or recording_config is not None
-    service_process_names = {"policy", "camera", "pointcloud", "recorder"}
-    channel_config = RuntimeChannelsConfig.from_runtime(
-        runtime,
-        pointcloud_num_points=(
-            next(
-                field.shape[0]
-                for field in policy_spec.observation_fields
-                if field.name == "point_cloud"
-            )
-            if pointcloud_requested
-            else runtime.pointcloud.num_points
-        ),
-        camera_requested=camera_requested,
-        pointcloud_requested=pointcloud_requested,
-    )
-    shared = RuntimeChannels.create(
-        prefix=prefix or f"dexmani_policy_{os.getpid()}",
-        config=replace(
-            channel_config,
-            **_compute_policy_observation_ring_capacities(
-                runtime, policy_spec, channel_config
-            ),
-        ),
-        mp_context=ctx,
-    )
-    procs: list[Any] = []
-    started_procs: list[Any] = []
-    shutdown_report: ShutdownReport | None = None
-    operator_thread: threading.Thread | None = None
-    operator_stop: threading.Event | None = None
-    summary_emitted = False
-    normal_exit = False
-    exit_reason = "startup failed"
+    shared = RuntimeChannels.create(prefix=prefix or f"dexmani_policy_{os.getpid()}", mp_context=ctx,
+        config=RuntimeChannelsConfig.from_runtime(runtime, pointcloud_num_points=points,
+                                                 camera_requested=camera, pointcloud_requested=cloud))
+    started = []
+    operator_stop = threading.Event()
+    operator_thread = None
     try:
-        procs = _build_policy_processes(
-            ctx,
-            shared,
-            runtime,
-            policy_spec,
-            worker_config,
-            execute=execute,
-            max_running_s=max_running_s,
-            num_episodes=num_episodes,
-            recording_config=recording_config,
-        )
-        require_transition(shared, SafetyState.DISARMED)
-
-        timeouts = runtime.safety.readiness_timeouts_s
-        policy_procs = [
-            process
-            for process in procs
-            if process.name == "policy"
-        ]
-        if len(policy_procs) != 1:
-            raise RuntimeError("deployment requires exactly one policy runner")
-        policy_process = policy_procs[0]
-        policy_process.start()
-        started_procs.append(policy_process)
-        if not wait_subsystem_ready(
-            shared,
-            policy_procs,
-            timeouts,
-            monitored_processes=started_procs,
-        ):
-            shared.session_failed.value = True
-            require_transition(shared, SafetyState.DISARMED)
-            shutdown_report = shutdown_processes(
-                shared,
-                started_procs,
-                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-                service_process_names=service_process_names,
-            )
-            return 1
-        print("  policy: ready", flush=True)
-
-        remaining_procs = [
-            process
-            for process in procs
-            if process is not policy_process
-        ]
-        critical_workers = [
-            process
-            for process in remaining_procs
-            if process.name not in service_process_names
-        ]
-        service_procs = [
-            process
-            for process in remaining_procs
-            if process.name in service_process_names
-        ]
-        # policy is already started/ready; it is critical like every other
-        # non-service process for the purposes of the service readiness wait.
-        critical_procs = [policy_process] + [
-            process for process in critical_workers
-        ]
-        # Register each successful start immediately.  If a later Process.start()
-        # raises, verified shutdown must still stop every earlier child before IPC
-        # is closed or unlinked. Critical workers start (and become ready)
-        # before any experiment service is started.
-        for process in critical_workers:
-            process.start()
-            started_procs.append(process)
-        if not wait_subsystem_ready(
-            shared,
-            critical_workers,
-            timeouts,
-            monitored_processes=started_procs,
-        ):
-            physical_failure = bool(
-                shared.error_state.value or shared.estop_request.value
-                or any(not process.is_alive() for process in critical_workers)
-                or policy_process.is_alive()  # otherwise an actuator readiness timeout
-            )
-            shared.session_failed.value = True
-            if physical_failure:
-                shared.error_state.value = True
-            require_transition(shared, SafetyState.FAULT if physical_failure else SafetyState.DISARMED)
-            shutdown_report = shutdown_processes(
-                shared,
-                started_procs,
-                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-                service_process_names=service_process_names,
-            )
-            return 1
-
-        for process in critical_workers:
-            print(f"  {process.name}: ready", flush=True)
-
-        evidence_ready = start_evidence_services(
-            shared, service_procs, timeouts, critical_processes=critical_procs,
-            started_processes=started_procs,
-        )
-
+        policy = ctx.Process(name="policy", target=policy_runner_loop, args=(shared, runtime, worker_config,
+            execute, max_running_s, num_episodes, recording_config,
+            FingertipAssemblerConfig.from_runtime(runtime) if "fingertip_points" in fields else None))
+        start_processes(shared, [policy], runtime.safety.readiness_timeouts_s, started)
+        sensors = [ctx.Process(name="arm", target=arm_loop, args=(shared, runtime.arm)),
+                   ctx.Process(name="hand", target=hand_loop, args=(shared, runtime.hand, runtime.policy.hand_disconnect_timeout_s))]
+        if camera:
+            sensors.append(ctx.Process(name="camera", target=camera_loop, args=(shared, CameraLoopConfig.from_runtime(runtime))))
+        if cloud:
+            sensors.append(ctx.Process(name="pointcloud", target=pointcloud_loop,
+                args=(shared, PointCloudLoopConfig.from_runtime(runtime, num_points=points))))
+        if recording_config:
+            sensors.append(ctx.Process(name="recorder", target=recorder_io_loop,
+                args=(shared, _rollout_recorder_config(runtime, recording_config, worker_config, max_running_s, num_episodes))))
+        start_processes(shared, sensors, runtime.safety.readiness_timeouts_s, started)
         require_transition(shared, SafetyState.ARMED)
-        print(
-            f"\nControl subsystems ready — safety=ARMED({int(SafetyState.ARMED)})",
-            flush=True,
-        )
-        if not evidence_ready:
-            shared.session_failed.value = True
-            shared.quit_requested.value = True
-            logger.error("required evaluation recording/sensors unavailable")
-            return 1
-        home_planner = build_policy_home_planner(runtime) if execute else None
-        home_status = "return hand + arm home before B" if home_planner else "disabled"
-        print(
-            "  [B] begin   [S] stop/save   [Q] quit   [ESC] e-stop   "
-            f"[H] {home_status}",
-            flush=True,
-        )
-
-        operator_stop = threading.Event()
-        operator_thread = threading.Thread(
-            target=run_operator_control,
-            args=(shared, runtime, home_planner),
-            kwargs={
-                "stop_event": operator_stop,
-                "execute": execute,
-            },
-            name="policy-operator",
-            daemon=True,
-        )
+        planner = build_policy_home_planner(runtime) if execute else None
+        operator_thread = threading.Thread(target=run_operator_control,
+            args=(shared, runtime, planner), kwargs=dict(stop_event=operator_stop, execute=execute))
         operator_thread.start()
-
-        # The policy child is supervised through is_alive/exitcode plus the
-        # parent-side run budget below — a normal blocking inference must
-        # never trip a loop-heartbeat deadline. Every started I/O worker keeps
-        # its existing heartbeat supervision (the timeout lookup below only
-        # covers processes that actually run).
-        heartbeat_names = {"arm", "hand", "camera", "pointcloud", "recorder"}
-        heartbeat_timeouts = {
-            process.name: float(runtime.safety.heartbeat_timeouts[process.name])
-            for process in started_procs
-            if process.name in heartbeat_names
-        }
-        exit_reason, normal_exit = run_supervisor(
-            shared,
-            started_procs,
-            heartbeat_timeouts_s=heartbeat_timeouts,
-            supervisor_hz=float(runtime.safety.supervisor_hz),
-            service_process_names=service_process_names,
-            max_running_s=max_running_s,
-            workflow="policy_eval",
-        )
-
-        # Keep the independent listener alive until file cleanup is bounded.
-        require_transition(
-            shared, SafetyState.ARMED if normal_exit else SafetyState.FAULT
-        )
-        if normal_exit:
-            shared.quit_requested.value = True
-        if recording_config is not None and not _wait_for_rollout_recording(
-            shared, started_procs, heartbeat_timeouts_s=heartbeat_timeouts,
-            service_process_names=service_process_names,
-        ):
-            logger.error("rollout recording did not finalize before shutdown")
-            shared.evidence_failed.value = True
-
-        if operator_stop is not None:
-            operator_stop.set()
-        if operator_thread is not None:
-            operator_thread.join(timeout=float(runtime.safety.shutdown_timeout_s))
-            if operator_thread.is_alive():
-                raise RuntimeError(
-                    "operator control did not stop; RuntimeChannels cannot be closed"
-                )
-            operator_thread = None
-
-        shutdown_report = shutdown_processes(
-            shared,
-            started_procs,
-            graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-            disarm_if_clean=normal_exit,
-            service_process_names=service_process_names,
-        )
-        clean_exit = _report_session_end(
-            shared, shutdown_report, recording_enabled=recording_config is not None,
-            normal_exit=normal_exit, exit_reason=exit_reason,
-        )
-        summary_emitted = True
-        return 0 if clean_exit else 1
-
+        while shared.is_running.value and not shared.quit_requested.value:
+            if shared.error_state.value or shared.estop_request.value or not check_processes(shared, started):
+                break
+            if not operator_thread.is_alive():
+                shared.workflow_failed.value = True
+                break
+            if max_running_s is not None:
+                with shared.motion_lock:
+                    epoch = int(shared.run_id.value)
+                    start_ns = int(shared.run_started_monotonic_ns.value)
+                if start_ns and time.monotonic_ns()-start_ns >= int(max_running_s*1e9):
+                    revoke_motion_if_run_id(shared, epoch, reason=RunEndReason.TIMEOUT)
+            time.sleep(0.02)
+    except KeyboardInterrupt:
+        shared.estop_request.value = True
     except Exception:
-        logger.error("policy deployment failed", exc_info=True)
-        shared.session_failed.value = True
-        if shared.error_state.value or shared.estop_request.value:
-            require_transition(shared, SafetyState.FAULT)
-        else:
-            require_transition(shared, SafetyState.ARMED)
-        return 1
+        shared.workflow_failed.value = True
+        logger.exception("policy session failed")
     finally:
-        try:
-            if operator_stop is not None:
-                operator_stop.set()
-            operator_alive = False
-            if operator_thread is not None:
-                operator_thread.join(timeout=float(runtime.safety.shutdown_timeout_s))
-                operator_alive = operator_thread.is_alive()
-                if operator_alive:
-                    logger.critical(
-                        "operator thread remains alive; leaving RuntimeChannels linked"
-                    )
-            if shutdown_report is None:
-                if started_procs:
-                    try:
-                        if operator_alive:
-                            stop_processes_verified(
-                                shared,
-                                started_procs,
-                                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-                            )
-                        else:
-                            shutdown_report = shutdown_processes(
-                                shared,
-                                started_procs,
-                                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-                                service_process_names=service_process_names,
-                            )
-                    except RuntimeError:
-                        logger.critical(
-                            "child process remains alive; leaving RuntimeChannels linked",
-                            exc_info=True,
-                        )
-                        raise
-                elif not operator_alive:
-                    try:
-                        closed = bool(shared.close())
-                        shutdown_report = ShutdownReport((), shared_closed=closed)
-                        if not closed:
-                            logger.error("RuntimeChannels cleanup was incomplete")
-                    except Exception:
-                        logger.warning("RuntimeChannels cleanup failed", exc_info=True)
-        finally:
-            if not summary_emitted:
-                _report_session_end(
-                    shared, shutdown_report, recording_enabled=recording_config is not None,
-                    normal_exit=False, exit_reason=exit_reason,
-                )
-
-
-_POLL_S = 0.05
+        operator_stop.set()
+        if operator_thread is not None:
+            operator_thread.join(timeout=5)
+            if operator_thread.is_alive():
+                stop_processes_verified(shared, started, graceful_timeout_s=runtime.safety.shutdown_timeout_s)
+                raise RuntimeError("operator thread still uses channels; refusing SHM release")
+        report = shutdown_processes_verified(shared, started, disarm_if_clean=True,
+            graceful_timeout_s=max(5.0, runtime.safety.shutdown_timeout_s),
+            service_process_names={"policy", "camera", "pointcloud", "recorder"})
+    return 1 if shared.error_state.value or shared.workflow_failed.value or not report.shared_closed else 0
 
 def _request_immediate_stop(shared: RuntimeChannels) -> None:
     """Fence live motion when S/Q arrives while this thread is blocked by H."""
@@ -754,7 +211,7 @@ def run_operator_control(
                         continue
                     if (
                         discard_begin_in_batch
-                        or shared.session_failed.value
+                        or shared.workflow_failed.value
                         or not request_policy_start(
                             shared,
                             require_physical_home=planner is not None,
@@ -789,8 +246,6 @@ def run_operator_control(
                         continue
                     with shared.motion_lock:
                         home_allowed = (not shared.quit_requested.value and
-                            not shared.session_failed.value and
-                            not shared.pending_record_command_id.value and
                             int(shared.safety_state.value) == int(SafetyState.ARMED))
                         shared.physical_home_completed.value = False
                         if home_allowed:
@@ -809,7 +264,6 @@ def run_operator_control(
                             stop_event.is_set()
                             or not shared.is_running.value
                             or shared.quit_requested.value
-                            or shared.session_failed.value
                             or shared.error_state.value
                             or shared.estop_request.value
                             or int(shared.stop_request.value) != int(StopRequest.NONE)
@@ -818,11 +272,9 @@ def run_operator_control(
                     with shared.motion_lock:
                         authorized = bool(
                             completed
-                            and int(shared.arm_home_completed_run_id.value)
-                            == int(shared.run_id.value)
                             and shared.is_running.value
                             and not shared.quit_requested.value
-                            and not shared.session_failed.value
+                            and not shared.workflow_failed.value
                             and not shared.error_state.value
                             and not shared.estop_request.value
                             and int(shared.stop_request.value) == int(StopRequest.NONE)

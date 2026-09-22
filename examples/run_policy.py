@@ -327,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         atomic_json_dump({
             "technical_status": "valid" if result == 0 else "invalid",
-            "termination_reason": "session_finished" if result == 0 else "session_failed",
+            "termination_reason": "session_finished" if result == 0 else "workflow_failed",
             "task_success": "unknown",
             "exit_code": result,
         }, session_dir / "session_result.json")

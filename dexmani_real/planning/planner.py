@@ -10,11 +10,10 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.utils.log import ThrottledWarner, get_logger
+from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-_warn_hand_qpos_unset_teleop = ThrottledWarner(interval_s=30.0)
 
 from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
@@ -223,14 +222,7 @@ class XArm7MotionPlanner:
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
-        """Set current hand joint configuration for 19-DOF collision detection.
-
-        In ``hand_dof`` mode, the CollisionModel auto-expands 7-DOF arm qpos to
-        19-DOF by concatenating with this buffer.  Call each teleop frame before
-        arm IK to keep the hand geometry up-to-date for collision checks.
-
-        No-op in 7-DOF mode.
-        """
+        """Set fixed hand geometry for planned return-home."""
         self.collision_model.set_hand_qpos(hand_qpos)
 
     def set_base_pose(self, base_pose_world: Pose) -> None:

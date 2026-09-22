@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Collection, Iterable
 
-from dexmani_real.runtime.safety import SafetyState, RunEndReason, revoke_motion, transition, invalidate_coupled_commands
+from dexmani_real.runtime.safety import SafetyState, RunEndReason, revoke_motion, transition
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -19,17 +19,10 @@ class ProcessExit:
     escalation: str
 
 
-
-
 @dataclass(frozen=True)
 class ShutdownReport:
     exits: tuple[ProcessExit, ...]
     shared_closed: bool
-
-
-def _shared_value(shared: Any, name: str) -> Any | None:
-    field = getattr(shared, name, None)
-    return None if field is None else getattr(field, "value", None)
 
 
 def _finalize_shutdown_state(
@@ -42,15 +35,14 @@ def _finalize_shutdown_state(
     """Latch post-join failures, or disarm only after a verified clean stop.
 
     A confirmed-stopped ``service_process_names`` member's nonzero/escalated
-    exit fails the session (``evidence_failed``) without claiming a physical
+    exit fails the session (``workflow_failed``) without claiming a physical
     fault. Any other (critical) process failing the same way remains FAULT.
     This classification only applies after process termination is verified —
-    it never weakens the unverified-shutdown fail-closed path above.
+    a child that cannot be confirmed stopped still faults the runtime.
     """
-    error_latched = bool(_shared_value(shared, "error_state"))
-    estop_requested = bool(_shared_value(shared, "estop_request"))
-    safety_value = _shared_value(shared, "safety_state")
-    safety_state = None if safety_value is None else int(safety_value)
+    error_latched = bool(shared.error_state.value)
+    estop_requested = bool(shared.estop_request.value)
+    safety_state = int(shared.safety_state.value)
     critical_worker_failed = any(
         (item.exitcode != 0 or item.escalation != "graceful")
         and item.name not in service_process_names
@@ -69,23 +61,16 @@ def _finalize_shutdown_state(
     )
 
     if faulted:
-        error_field = getattr(shared, "error_state", None)
-        if error_field is not None:
-            error_field.value = True
-        if safety_state is not None:
-            transition(shared, SafetyState.FAULT)
+        shared.error_state.value = True
+        transition(shared, SafetyState.FAULT)
         return
 
     if service_worker_failed:
-        evidence_failed_field = getattr(shared, "evidence_failed", None)
-        if evidence_failed_field is not None:
-            evidence_failed_field.value = True
+        shared.workflow_failed.value = True
 
-    if disarm_if_clean and safety_state is not None:
+    if disarm_if_clean:
         if not transition(shared, SafetyState.DISARMED):
-            error_field = getattr(shared, "error_state", None)
-            if error_field is not None:
-                error_field.value = True
+            shared.error_state.value = True
             transition(shared, SafetyState.FAULT)
 
 
@@ -100,11 +85,8 @@ def _close_runtime_channels(shared: Any) -> bool:
 
 def _latch_unverified_shutdown_fault(shared: Any) -> None:
     """Fail closed when a child might still access live IPC resources."""
-    error_field = getattr(shared, "error_state", None)
-    if error_field is not None:
-        error_field.value = True
-    if _shared_value(shared, "safety_state") is not None:
-        transition(shared, SafetyState.FAULT)
+    shared.error_state.value = True
+    transition(shared, SafetyState.FAULT)
 
 
 def stop_processes_verified(
@@ -118,24 +100,11 @@ def stop_processes_verified(
     """Stop every worker without closing IPC that another local thread may use."""
     procs = list(processes)
     # Fence before any blocking join; record the software end if still RUNNING.
-    if _shared_value(shared, "safety_state") == int(SafetyState.RUNNING):
+    if int(shared.safety_state.value) == int(SafetyState.RUNNING):
         revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
-    # Keep SDK owners publishing post-boundary state until recording accounting
-    # completes. This is bounded and grants no new command admission.
-    if shared.pending_record_command_id.value:
-        with shared.motion_lock:
-            if not shared.pending_record_revoked_ns.value:
-                invalidate_coupled_commands(shared)
-        deadline_ns = int(shared.pending_record_revoked_ns.value) + int((shared.adoption_accounting_timeout_s + 1.0) * 1e9)
-        while shared.pending_record_command_id.value and time.monotonic_ns() < deadline_ns:
-            time.sleep(0.005)
-        if shared.pending_record_command_id.value:
-            from dexmani_real.recording.client import write_recording_failure
-            shared.session_failed.value = True
-            write_recording_failure(shared, "recording owner did not complete adoption accounting")
     if (shared.is_recording.value and
             (shared.error_state.value or shared.estop_request.value
-             or shared.evidence_failed.value or shared.session_failed.value)):
+             or shared.workflow_failed.value)):
         from dexmani_real.recording.client import write_recording_failure
         write_recording_failure(shared, "invalid session interrupted recording")
     shared.is_running.value = False

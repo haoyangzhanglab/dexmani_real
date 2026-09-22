@@ -1,51 +1,23 @@
-"""Compute bounded teleoperation action proposals without side effects.
+"""Compute Cartesian teleoperation intent without side effects.
 
 The control-grid owner supplies observations and temporal state, then remains
-responsible for safety-gated command publication and recording. Keeping this
+responsible for target publication and recording. Keeping this
 module pure makes proposal behavior testable without shared memory or hardware.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
 
 import numpy as np
 
 from dexmani_real.planning.kinematics.pose import quat_multiply
-from dexmani_real.teleop.control_loop.hand_control import (
-    HandRetargetObservationCache,
-    compute_hand_command,
-    smoothstep_hand_ramp,
-)
-from dexmani_real.utils.limits import limit_hand_target_delta
-
-
 @dataclass(frozen=True)
 class EefTargetProposal:
     """One mapped EEF target in the world frame, before and after filtering."""
 
     position_world_m: np.ndarray
     quat_world_wxyz: np.ndarray
-    smoothing_state_incomplete: bool
-
-
-@dataclass(frozen=True)
-class HandJointProposal:
-    """One hand proposal plus the next ramp state; no command is published."""
-
-    qpos_rad: np.ndarray
-    retarget_succeeded: bool
-    next_ramp_start_qpos_rad: np.ndarray | None
-    next_ramp_step: int
-
-
-@dataclass(frozen=True)
-class ArmJointProposal:
-    """One IK result after firmware limits and command-to-command step limits."""
-
-    qpos_rad: np.ndarray
-    validation_issue: str | None
 
 
 def _normalize_quat(q: np.ndarray, *, name: str) -> np.ndarray:
@@ -170,9 +142,6 @@ def compute_target_eef_pose(
 
     position_world_m = raw_position_world_m.copy()
     quat_world_wxyz = raw_quat_world_wxyz.copy()
-    smoothing_state_incomplete = (
-        previous_position_world_m is not None and previous_quat_world_wxyz is None
-    )
     if previous_position_world_m is not None and previous_quat_world_wxyz is not None:
         position_world_m, quat_world_wxyz = ema_smooth_pose(
             position_world_m,
@@ -187,109 +156,4 @@ def compute_target_eef_pose(
     return EefTargetProposal(
         position_world_m=position_world_m,
         quat_world_wxyz=quat_world_wxyz,
-        smoothing_state_incomplete=smoothing_state_incomplete,
-    )
-
-
-def compute_hand_joint_proposal(
-    hand_retargeter: Any,
-    vr_frame: dict[str, Any],
-    previous_hand_qpos_rad: np.ndarray,
-    *,
-    hand_available: bool,
-    retarget_cache: HandRetargetObservationCache,
-    ramp_start_qpos_rad: np.ndarray | None,
-    ramp_step: int,
-    ramp_total_frames: int,
-    command_lower_rad: np.ndarray,
-    command_upper_rad: np.ndarray,
-    max_delta_rad_per_tick: np.ndarray | float,
-) -> HandJointProposal:
-    """Retarget and shape one hand proposal without publishing it.
-
-    The final target is bounded against the previously published hand endpoint,
-    matching the reject-only per-grid contract for the published endpoint.
-    The hand worker separately bounds from measured feedback before its SDK
-    call, so this proposal limit never weakens the actuator safety boundary.
-    """
-    hand_qpos_rad, retarget_succeeded = compute_hand_command(
-        hand_retargeter,
-        vr_frame,
-        previous_hand_qpos_rad,
-        hand_available,
-        retarget_cache,
-    )
-
-    next_ramp_start_qpos_rad = ramp_start_qpos_rad
-    next_ramp_step = ramp_step
-    if ramp_start_qpos_rad is not None and ramp_step < ramp_total_frames:
-        hand_qpos_rad = smoothstep_hand_ramp(
-            ramp_start_qpos_rad,
-            hand_qpos_rad,
-            ramp_step,
-            ramp_total_frames,
-        )
-        next_ramp_step += 1
-        if next_ramp_step >= ramp_total_frames:
-            next_ramp_start_qpos_rad = None
-    elif ramp_start_qpos_rad is not None:
-        next_ramp_start_qpos_rad = None
-        next_ramp_step = 0
-
-    hand_qpos_rad = np.clip(
-        hand_qpos_rad,
-        np.asarray(command_lower_rad, dtype=np.float64),
-        np.asarray(command_upper_rad, dtype=np.float64),
-    )
-    hand_qpos_rad = limit_hand_target_delta(
-        hand_qpos_rad,
-        previous_hand_qpos_rad,
-        max_delta_rad_per_tick,
-    )
-
-    return HandJointProposal(
-        qpos_rad=np.asarray(hand_qpos_rad, dtype=np.float64).copy(),
-        retarget_succeeded=retarget_succeeded,
-        next_ramp_start_qpos_rad=(
-            None
-            if next_ramp_start_qpos_rad is None
-            else np.asarray(next_ramp_start_qpos_rad, dtype=np.float64).copy()
-        ),
-        next_ramp_step=next_ramp_step,
-    )
-
-
-def compute_arm_joint_proposal(
-    ik_qpos_rad: np.ndarray,
-    previous_arm_qpos_rad: np.ndarray | None,
-    *,
-    joint_lower_rad: np.ndarray,
-    joint_upper_rad: np.ndarray,
-    max_delta_rad_per_tick: np.ndarray | float | None,
-    compute_qpos_delta: Callable[[np.ndarray, np.ndarray], np.ndarray],
-) -> ArmJointProposal:
-    """Clamp one IK result to joint and command-to-command delta limits."""
-    arm_qpos_rad = np.asarray(ik_qpos_rad, dtype=np.float64).copy()
-    arm_qpos_rad = np.clip(arm_qpos_rad, joint_lower_rad, joint_upper_rad)
-
-    if (
-        max_delta_rad_per_tick is not None
-        and previous_arm_qpos_rad is not None
-        and np.all(np.isfinite(previous_arm_qpos_rad))
-    ):
-        arm_delta_rad = compute_qpos_delta(arm_qpos_rad, previous_arm_qpos_rad)
-        arm_delta_rad = np.clip(
-            arm_delta_rad,
-            -max_delta_rad_per_tick,
-            max_delta_rad_per_tick,
-        )
-        arm_qpos_rad = (
-            np.asarray(previous_arm_qpos_rad, dtype=np.float64) + arm_delta_rad
-        )
-        arm_qpos_rad = np.clip(arm_qpos_rad, joint_lower_rad, joint_upper_rad)
-
-    validation_issue = None if np.all(np.isfinite(arm_qpos_rad)) else "arm_cmd NaN/Inf"
-    return ArmJointProposal(
-        qpos_rad=np.asarray(arm_qpos_rad, dtype=np.float64).copy(),
-        validation_issue=validation_issue,
     )

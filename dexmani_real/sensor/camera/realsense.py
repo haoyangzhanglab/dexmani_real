@@ -17,7 +17,6 @@ import numpy as np
 import pyrealsense2 as rs
 
 from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry
-from dexmani_real.sensor.camera.clock_sync import DeviceClockMapper
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -154,12 +153,7 @@ class RGBDFrame:
     color_device_timestamp_s: float | None
     depth_timestamp_domain: int
     color_timestamp_domain: int | None
-    source_monotonic_ns: int
-    camera_generation: int
-    clock_reset: bool
-    duplicate: bool
-    frame_gap: int
-    backlog_s: float
+    timestamp_ns: int
     frame_id: int
     depth_scale: float
     camera_name: str
@@ -171,11 +165,9 @@ class RealSenseCamera:
         self.config = config
         # Device discovery, option access, and streaming must share one context.
         # This avoids competing device handles and intermittent power-state errors.
-        self.context = rs.context()
+        self.context = None
         self.active_serial: str | None = config.serial
         self.active_is_l515 = False
-        self._clock_mapper = DeviceClockMapper()
-        self._color_clock_mapper = DeviceClockMapper()
 
         self.pipeline: rs.pipeline | None = None
         self.frame_queue: rs.frame_queue | None = None
@@ -184,7 +176,6 @@ class RealSenseCamera:
         self.depth_scale: float | None = None
         self.geometry: RGBDGeometry | None = None
         self._depth_to_color_aligner: rs.align | None = None
-        self.l515_depth_option_snapshot: dict[str, Any] | None = None
         self.frame_id = 0
 
     def connect(self) -> bool:
@@ -196,8 +187,6 @@ class RealSenseCamera:
         if self.pipeline is not None:
             return True
 
-        self._clock_mapper.reset()
-        self._color_clock_mapper.reset()
         return self._open_pipeline()
 
     def _open_pipeline(self) -> bool:
@@ -207,6 +196,7 @@ class RealSenseCamera:
         disconnect) so a started-but-unusable pipeline is never left holding the
         device — otherwise the next open would hit "Device or resource busy".
         """
+        self.context = rs.context()
         try:
             self.active_serial = (
                 self.config.serial or self._find_default_serial_in_context()
@@ -257,7 +247,6 @@ class RealSenseCamera:
         """Apply one factory preset and an optional confidence override."""
         cfg = self.config.l515_depth_config
         if cfg is None:
-            self.l515_depth_option_snapshot = None
             return
 
         if self.profile is None:
@@ -299,13 +288,13 @@ class RealSenseCamera:
                 "L515 confidence readback mismatch: "
                 f"requested={cfg.confidence_threshold}, actual={final_confidence}"
             )
-        self.l515_depth_option_snapshot = {
+        option_snapshot = {
             "base_visual_preset": int(cfg.visual_preset),
             "base_readbacks": base_readbacks,
             "confidence_override": cfg.confidence_threshold,
             "final_readbacks": final_readbacks,
         }
-        logger.debug("L515 depth option snapshot: %s", self.l515_depth_option_snapshot)
+        logger.debug("L515 depth option snapshot: %s", option_snapshot)
 
     @staticmethod
     def _read_l515_option_snapshot(sensor: Any) -> dict[str, float | None]:
@@ -508,7 +497,6 @@ class RealSenseCamera:
             self.depth_scale = None
             self.geometry = None
             self._depth_to_color_aligner = None
-            self.l515_depth_option_snapshot = None
 
     def create_rs_config(self) -> rs.config:
         depth_width, depth_height = self.config.depth_resolution
@@ -676,28 +664,10 @@ class RealSenseCamera:
         self.frame_id = int(depth_frame.get_frame_number())
         depth_timestamp_s = float(depth_frame.get_timestamp()) * 1e-3
         depth_timestamp_domain = int(depth_frame.get_frame_timestamp_domain())
-        depth_clock_mapping = self._clock_mapper.map(
-            device_time_s=depth_timestamp_s,
-            host_receive_ns=wait_return_monotonic_ns,
-            frame_number=self.frame_id,
-        )
-        color_timestamp_s: float | None = None
-        color_timestamp_domain: int | None = None
-        color_frame_number: int | None = None
-        color_source_monotonic_ns = depth_clock_mapping.source_monotonic_ns
-        if color_frame is not None:
-            color_frame_number = int(color_frame.get_frame_number())
-            color_timestamp_s = float(color_frame.get_timestamp()) * 1e-3
-            color_timestamp_domain = int(color_frame.get_frame_timestamp_domain())
-            color_clock_mapping = self._color_clock_mapper.map(
-                device_time_s=color_timestamp_s,
-                host_receive_ns=wait_return_monotonic_ns,
-                frame_number=color_frame_number,
-            )
-            color_source_monotonic_ns = color_clock_mapping.source_monotonic_ns
-        source_monotonic_ns = min(
-            depth_clock_mapping.source_monotonic_ns, color_source_monotonic_ns
-        )
+        color_timestamp_s = float(color_frame.get_timestamp()) * 1e-3 if color_frame else None
+        color_timestamp_domain = int(color_frame.get_frame_timestamp_domain()) if color_frame else None
+        color_frame_number = int(color_frame.get_frame_number()) if color_frame else None
+        timestamp_ns = time.monotonic_ns()
         frame = RGBDFrame(
             rgb=rgb,
             depth=depth,
@@ -713,12 +683,7 @@ class RealSenseCamera:
             color_device_timestamp_s=color_timestamp_s,
             depth_timestamp_domain=depth_timestamp_domain,
             color_timestamp_domain=color_timestamp_domain,
-            source_monotonic_ns=source_monotonic_ns,
-            camera_generation=depth_clock_mapping.generation,
-            clock_reset=depth_clock_mapping.clock_reset,
-            duplicate=depth_clock_mapping.duplicate,
-            frame_gap=depth_clock_mapping.frame_gap,
-            backlog_s=max(0, wait_return_monotonic_ns - source_monotonic_ns) / 1e9,
+            timestamp_ns=timestamp_ns,
             frame_id=self.frame_id,
             depth_scale=float(self.depth_scale),
             camera_name=self.config.camera_name,
@@ -739,19 +704,6 @@ class RealSenseCamera:
             )
         return float(self.depth_scale)
 
-    def get_l515_depth_option_snapshot(self) -> dict[str, Any] | None:
-        """Return the applied base/final L515 readbacks, if this is an L515."""
-        if self.l515_depth_option_snapshot is None:
-            return None
-        return {
-            "base_visual_preset": self.l515_depth_option_snapshot["base_visual_preset"],
-            "base_readbacks": dict(self.l515_depth_option_snapshot["base_readbacks"]),
-            "confidence_override": self.l515_depth_option_snapshot[
-                "confidence_override"
-            ],
-            "final_readbacks": dict(self.l515_depth_option_snapshot["final_readbacks"]),
-        }
-
     def get_device_info(self) -> dict:
         if self.profile is None:
             raise RuntimeError("RealSense is not connected.")
@@ -768,26 +720,6 @@ class RealSenseCamera:
             except RuntimeError:
                 info[name] = ""
         return info
-
-    def get_active_profiles(self) -> dict[str, dict[str, Any]]:
-        """Return the actual stream profiles selected by librealsense."""
-        if self.profile is None:
-            raise RuntimeError("RealSense is not connected.")
-        profiles: dict[str, dict[str, Any]] = {}
-        for name, stream in (("color", rs.stream.color), ("depth", rs.stream.depth)):
-            if name == "color" and not self.config.enable_color:
-                continue
-            video = self.profile.get_stream(stream).as_video_stream_profile()
-            intrinsics = video.get_intrinsics()
-            profiles[name] = {
-                "width": int(intrinsics.width),
-                "height": int(intrinsics.height),
-                "fps": int(video.fps()),
-                "format": str(video.format()),
-                "distortion_model": str(intrinsics.model),
-                "distortion_coeffs": [float(value) for value in intrinsics.coeffs],
-            }
-        return profiles
 
     @staticmethod
     def get_device_info_value(device: rs.device, key: rs.camera_info) -> str:

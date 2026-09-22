@@ -6,7 +6,6 @@ to RuntimeChannels.vr_ring.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -60,7 +59,7 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
 
     cfg = config or VRReceiverConfig()
 
-    from dexmani_real.ipc.channels import new_frame, vr_frame_dtype
+    from dexmani_real.ipc.schema import VR_FRAME_DTYPE
 
     logger.debug("vr_loop: LOADING")
 
@@ -91,31 +90,26 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
         )
     except ImportError as e:
         logger.error("vr_loop: SDK import failed: %s", e)
-        return
+        raise
     except Exception as e:
         logger.error("vr_loop: connect failed: %s", e)
-        return
+        raise
 
     logger.info("vr_loop: connected to HTS port=%d", cfg.port)
 
-    _latest_head_pos = np.zeros(3, dtype=np.float64)
-    _latest_head_quat_wxyz = np.zeros(4, dtype=np.float64)
-    _latest_head_quat_wxyz[0] = 1.0
+    _latest_head_pos = np.full(3, np.nan)
+    _latest_head_quat_wxyz = np.full(4, np.nan)
     _latest_head_sequence_id = 0
     _latest_head_recv_ts_ns = 0
 
     # vr_ready guarantees that the ring already contains one validated
     # right-hand frame; consumers may read it immediately after readiness.
 
-    dtype = vr_frame_dtype()
 
     for event in client.iter_events():
         if not shared.is_running.value:
             break
 
-        # Heartbeat on every event — proves VR process is alive + receiving data.
-        # Written *before* vr_ready so the supervisor sees a fresh heartbeat
-        shared.set_heartbeat("vr", time.monotonic())
 
         if isinstance(event, HeadFrame):
             try:
@@ -155,7 +149,7 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
                 "landmarks",
             )
 
-            frame = new_frame(dtype)
+            frame = np.zeros(1, dtype=VR_FRAME_DTYPE)
             frame["wrist_pos"][0] = wrist_pos
             frame["wrist_quat_wxyz"][0] = wrist_quat_wxyz
             frame["landmarks"][0] = landmarks
@@ -170,8 +164,8 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
             frame["side"][0] = np.int32(0 if "right" in _side_str else -1)
 
             shared.vr_ring.write(frame)
-            if not shared.is_ready("vr"):
-                shared.set_ready("vr")
+            if not shared.vr_ready.is_set():
+                shared.vr_ready.set()
                 logger.debug("vr_loop: READY")
                 logger.info("vr_loop: ready (first valid right-hand frame received)")
 

@@ -27,17 +27,14 @@ class IKResult:
     qpos: np.ndarray | None
     reason: str = ""
     report: dict[str, Any] = field(default_factory=dict)
-    held: bool = False
     failure_kind: "IKFailureKind | None" = None
 
 
 class IKFailureKind(str, Enum):
-    """Machine-readable reason for a held/failing IK result."""
+    """Machine-readable reason for a failed IK solve."""
 
     NO_SOLUTION = "no_solution"
     GEOMETRY_REJECTED = "geometry_rejected"
-    COLLISION = "collision"
-    CHECKER_FAILURE = "checker_failure"
     INVALID_OUTPUT = "invalid_output"
 
 
@@ -48,7 +45,6 @@ class OnlineIKConfig:
     max_ik_jump_deg: tuple[float, ...] = (30, 30, 30, 35, 40, 40, 40)
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
-    check_self_collision: bool = True
     position_ik_fast_accept_rad: float = np.deg2rad(8.0)
     position_ik_num_random_seeds: int = 3
     position_ik_seed_offset_deg: float = 5.0
@@ -77,13 +73,10 @@ class OnlineIKConfig:
 class OnlineIKSolver:
     """MPlib position IK with prev_cmd seeding and fast-accept.
 
-    Priority: prev_cmd seed (position IK) → multi-seed fallback → hold.
-    Checks self-collision and any static geometry configured by the caller
-    when OnlineIKConfig.check_self_collision=True. Teleoperation callers omit
-    the table deliberately; table-aware callers retain it.
+    Priority: prev_cmd seed (position IK) → multi-seed fallback → failure.
     """
 
-    # Elbow flip detection thresholds (ref: planner.py check_elbow_consistency).
+    # Elbow-branch selection thresholds.
     _ELBOW_FLIP_NEG_THRESH_RAD: float = np.deg2rad(-5.0)
     _ELBOW_FLIP_POS_THRESH_RAD: float = np.deg2rad(15.0)
     _ELBOW_FLIP_MIN_DELTA_RAD: float = np.deg2rad(40.0)
@@ -100,8 +93,8 @@ class OnlineIKSolver:
         self.profile = teleop_profile
         self._elbow_joint_index = elbow_joint_index
         self._nullspace_warn_last_s: float = 0.0
-        self._hold_start: float | None = None
-        self._hold_warned: bool = False
+        self._failure_start: float | None = None
+        self._failure_warned: bool = False
         self._rng = np.random.default_rng(teleop_profile.teleop_ik_seed)
 
     def solve(
@@ -110,7 +103,7 @@ class OnlineIKSolver:
         current_qpos: np.ndarray,
         previous_qpos_cmd: np.ndarray,
     ) -> IKResult:
-        """Run teleop IK — prev_cmd seed, multi-seed fallback, hold on failure."""
+        """Run teleop IK — prev_cmd seed, multi-seed fallback, explicit failure."""
         t_start = time.perf_counter()
 
         profile = self.profile
@@ -140,31 +133,29 @@ class OnlineIKSolver:
             diagnostic = self._build_diagnostic(report)
             result = IKResult(
                 success=False,
-                qpos=previous_qpos_cmd.copy(),
+                qpos=None,
                 reason=diagnostic["summary"],
-                held=True,
                 failure_kind=report.get("failure_kind", IKFailureKind.NO_SOLUTION),
                 report={
                     **report,
-                    "held": True,
                     "diagnostic": diagnostic,
                     "ik_timing_ms": round(dt_total_ms, 1),
                 },
             )
 
-        if not result.success or result.held:
-            if self._hold_start is None:
-                self._hold_start = time.monotonic()
-            elif time.monotonic() - self._hold_start > 2.0 and not self._hold_warned:
+        if not result.success:
+            if self._failure_start is None:
+                self._failure_start = time.monotonic()
+            elif time.monotonic() - self._failure_start > 2.0 and not self._failure_warned:
                 logger.warning(
-                    "IK holding for %.1fs — arm frozen (reason: %s)",
-                    time.monotonic() - self._hold_start,
+                    "IK failed for %.1fs — no new target (reason: %s)",
+                    time.monotonic() - self._failure_start,
                     result.reason,
                 )
-                self._hold_warned = True
+                self._failure_warned = True
         else:
-            self._hold_start = None
-            self._hold_warned = False
+            self._failure_start = None
+            self._failure_warned = False
 
         return result
 
@@ -212,15 +203,14 @@ class OnlineIKSolver:
 
         for seed_name, seed, n_init in seeds:
             _tik0 = time.perf_counter()
-            status, raw_qpos = self.ik_mgr.call_mplib_ik(
-                target_pose_base,
-                seed,
-                n_init_qpos=n_init,
-                return_closest=True,
-            )
+            model = self.ik_mgr.mp_planner
+            raw_qpos, success, _ = model.pinocchio_model.compute_IK_CLIK(
+                model.link_name_2_idx[model.move_group],
+                self.kin.to_mplib_pose(target_pose_base), seed, [])
+            status = "Success" if success else "IK failed"
             _solve_ms = (time.perf_counter() - _tik0) * 1000.0
             if not is_mplib_success(status) or raw_qpos is None:
-                # Classify MPlib failures for telemetry; all failure modes hold.
+                # Classify solver failures; none produces a new command.
                 if "Cannot find valid solution" in status:
                     tag = "mplib_no_solution"
                 elif "Distance" in status:
@@ -345,28 +335,6 @@ class OnlineIKSolver:
                     f"{seed_name}:hw_dist({_solve_ms:.1f}ms, {np.rad2deg(hw_dist):.0f}deg)"
                 )
                 continue
-
-            # Rank collision-free candidates and recheck the winner after refinement.
-            if profile.check_self_collision:
-                try:
-                    candidate_in_collision = self.ik_mgr.has_collision(qpos)
-                except Exception:
-                    logger.warning(
-                        "Teleop IK candidate collision check failed closed",
-                        exc_info=True,
-                    )
-                    attempts.append(
-                        f"{seed_name}:collision_check_failed({_solve_ms:.1f}ms)"
-                    )
-                    return None, {
-                        "method": "position_ik",
-                        "failure_reason": "candidate collision checker failed",
-                        "failure_kind": IKFailureKind.CHECKER_FAILURE,
-                        "attempts": attempts,
-                    }
-                if candidate_in_collision:
-                    attempts.append(f"{seed_name}:collision({_solve_ms:.1f}ms)")
-                    continue
 
             attempts.append(f"{seed_name}:ok({_solve_ms:.1f}ms)")
 
@@ -562,8 +530,8 @@ class OnlineIKSolver:
         """Classify a failed IK run from its per-attempt tags.
 
         ``unreachable`` is reserved for when *every* seed failed to converge.
-        Otherwise the operative gate tag is reported, so holds separate into
-        coherence (delta), collision, hardware-distance, joint-limit,
+        Otherwise the operative gate tag is reported, so failures separate into
+        coherence (delta), hardware-distance, joint-limit,
         pose-error, and near-miss buckets instead of collapsing to
         ``unreachable``.
         """
@@ -575,8 +543,6 @@ class OnlineIKSolver:
             return "unreachable"
         if tag_set & {"jump", "elbow_flip", "branch_jump_l2"}:
             return "delta"
-        if tag_set & {"collision", "collision_check_failed"}:
-            return "collision"
         if tag_set & {"hw_dist", "band_switch"}:
             return "hw_dist"
         if "limits" in tag_set:
@@ -591,15 +557,7 @@ class OnlineIKSolver:
 
     @classmethod
     def _build_diagnostic(cls, report: dict[str, Any]) -> dict[str, Any]:
-        """Build structured IK failure diagnostic.
-
-        Classifies from the per-attempt tags (``report["attempts"]``) rather
-        than scanning the free-form ``failure_reason`` string. The previous
-        string-scan was dead: a ``:ok`` attempt always precedes a successful
-        return, so the None path can only carry gate/failure tags, and every
-        hold collapsed to ``unreachable`` (the ``all_filtered`` branch was
-        unreachable).
-        """
+        """Classify failed IK attempts for local diagnostics."""
         attempts = report.get("attempts")
         if attempts is None or isinstance(attempts, str):
             # Reports without structured attempts degrade to unknown.
@@ -611,31 +569,7 @@ class OnlineIKSolver:
             "summary": f"Position IK [{classification}]: {failure_reason}",
         }
 
-    def _check_teleop_collision_gate(
-        self,
-        qpos_cmd: np.ndarray,
-        profile: OnlineIKConfig,
-    ) -> tuple[str | None, dict[str, Any]]:
-        """Combined collision gate. Returns (reason, extra_report) or (None, {})."""
-        if not profile.check_self_collision:
-            return None, {}
-
-        if self.ik_mgr.has_collision(qpos_cmd):
-            info = self.ik_mgr.check_collision(qpos_cmd)
-            if info:
-                collision_type = (
-                    "environment"
-                    if info.collision_pairs
-                    and info.collision_pairs[0].collision_type == "environment"
-                    else "self"
-                )
-                return (
-                    f"IK result in {collision_type} collision ({info.summary}), holding.",
-                    {"collision_type": collision_type, "collision": info.to_dict()},
-                )
-        return None, {}
-
-    def _make_collision_held(
+    def _failed_solution(
         self,
         qpos_cmd: np.ndarray,
         current_qpos: np.ndarray,
@@ -645,7 +579,7 @@ class OnlineIKSolver:
         failure_kind: IKFailureKind = IKFailureKind.GEOMETRY_REJECTED,
         **extra: Any,
     ) -> IKResult:
-        """Build a held IKResult for collision-gate rejection."""
+        """Build a failed IK result."""
         try:
             qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
         except Exception:
@@ -653,19 +587,17 @@ class OnlineIKSolver:
         max_qpos_cmd_delta_deg: float | None = None
         if qpos_delta is not None and np.all(np.isfinite(qpos_delta)):
             max_qpos_cmd_delta_deg = float(np.rad2deg(np.max(np.abs(qpos_delta))))
-        held_report = {
+        failure_report = {
             **report,
-            "held": True,
             **extra,
         }
         if max_qpos_cmd_delta_deg is not None:
-            held_report["max_qpos_cmd_delta_deg"] = max_qpos_cmd_delta_deg
+            failure_report["max_qpos_cmd_delta_deg"] = max_qpos_cmd_delta_deg
         return IKResult(
             success=False,
-            qpos=previous_qpos_cmd.copy(),
+            qpos=None,
             reason=reason,
-            report=held_report,
-            held=True,
+            report=failure_report,
             failure_kind=failure_kind,
         )
 
@@ -678,10 +610,10 @@ class OnlineIKSolver:
         profile: OnlineIKConfig,
         report: dict[str, Any],
     ) -> IKResult:
-        """Nullspace-optimize, collision-check, and assemble IKResult."""
+        """Refine, verify FK error, and assemble IKResult."""
         qpos_cmd = np.asarray(target_qpos, dtype=np.float64).copy()
         if not np.all(np.isfinite(qpos_cmd)):
-            return self._make_collision_held(
+            return self._failed_solution(
                 qpos_cmd,
                 current_qpos,
                 previous_qpos_cmd,
@@ -714,7 +646,7 @@ class OnlineIKSolver:
             self.ik_mgr.canonicalize_qpos(qpos_cmd, current_qpos), dtype=np.float64
         )
         if not np.all(np.isfinite(qpos_cmd)):
-            return self._make_collision_held(
+            return self._failed_solution(
                 qpos_cmd,
                 current_qpos,
                 previous_qpos_cmd,
@@ -724,7 +656,7 @@ class OnlineIKSolver:
             )
         outside, _ = self.ik_mgr.limit_violation(qpos_cmd, self.ik_mgr.joint_limits)
         if np.any(outside):
-            return self._make_collision_held(
+            return self._failed_solution(
                 qpos_cmd,
                 current_qpos,
                 previous_qpos_cmd,
@@ -736,7 +668,7 @@ class OnlineIKSolver:
             target_eef_pose_world, qpos_cmd
         )
         if not (np.isfinite(cmd_pos_error) and np.isfinite(cmd_rot_error)):
-            return self._make_collision_held(
+            return self._failed_solution(
                 qpos_cmd,
                 current_qpos,
                 previous_qpos_cmd,
@@ -748,7 +680,7 @@ class OnlineIKSolver:
             cmd_pos_error > profile.max_pose_error_pos_m
             or cmd_rot_error > profile.max_pose_error_rot_rad
         ):
-            return self._make_collision_held(
+            return self._failed_solution(
                 qpos_cmd,
                 current_qpos,
                 previous_qpos_cmd,
@@ -758,40 +690,9 @@ class OnlineIKSolver:
                 cmd_tracking_error_rot_rad=cmd_rot_error,
             )
 
-        try:
-            collision_reason, collision_extra = self._check_teleop_collision_gate(
-                qpos_cmd, profile
-            )
-        except Exception:
-            # A checker implementation failure is distinct from an actual
-            # collision. Teleop retains its hold behavior; the learned-policy
-            # executor consumes ``failure_kind`` and aborts fail-closed.
-            logger.warning(
-                "Collision check failed (NaN/Inf qpos likely) — holding position",
-                exc_info=True,
-            )
-            return self._make_collision_held(
-                qpos_cmd,
-                current_qpos,
-                previous_qpos_cmd,
-                "Collision check failed (invalid qpos)",
-                report,
-                failure_kind=IKFailureKind.CHECKER_FAILURE,
-            )
-        if collision_reason is not None:
-            return self._make_collision_held(
-                qpos_cmd,
-                current_qpos,
-                previous_qpos_cmd,
-                collision_reason,
-                report,
-                failure_kind=IKFailureKind.COLLISION,
-                **collision_extra,
-            )
-
         qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
         if not np.all(np.isfinite(qpos_delta)):
-            return self._make_collision_held(
+            return self._failed_solution(
                 qpos_cmd,
                 current_qpos,
                 previous_qpos_cmd,

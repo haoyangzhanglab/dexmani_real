@@ -131,7 +131,7 @@ class VRWristMapper:
             wrist_rot = quat2mat(_unit_quat_wxyz(wrist_quat_wxyz, "wrist_quat_wxyz"))
         except (TypeError, ValueError):
             logger.warning(
-                "VRWristMapper.map: invalid wrist pose — holding", exc_info=True
+                "VRWristMapper.map: invalid wrist pose — no target", exc_info=True
             )
             return None
 
@@ -181,7 +181,7 @@ class VRWristMapper:
         if not np.all(np.isfinite(target_pos)) or not np.all(
             np.isfinite(target_quat_wxyz)
         ):
-            logger.warning("VRWristMapper.map: non-finite mapped pose — holding")
+            logger.warning("VRWristMapper.map: non-finite mapped pose — no target")
             return None
 
         # Commit temporal state only after input and output validation succeeds.

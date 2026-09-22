@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Physically replay one raw-v31 episode on xArm7 and XHand.
+"""Physically replay one raw-v32 episode on xArm7 and XHand.
 
 This is a hardware-affecting entry point and writes replay evaluation results.
 """
@@ -72,7 +72,7 @@ Controls:
         type=str,
         help=(
             "Published current raw-schema episode directory (episodes/<task_name>/episode_*) "
-            "with recorded float64 sent targets."
+            "with recorded float64 high-level targets."
         ),
     )
     parser.add_argument(

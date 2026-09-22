@@ -85,25 +85,3 @@ def validate_hand_command_bounds(
     if np.any(command < mech_lower - 1e-12) or np.any(command > mech_upper + 1e-12):
         raise ValueError("hand command violates mechanical joint limits")
     return command.copy()
-
-
-def limit_hand_target_delta(
-    target_qpos: object,
-    measured_qpos: object,
-    max_delta_rad_per_tick: float | np.ndarray,
-) -> np.ndarray:
-    """Return one finite hand target bounded from fresh measured feedback."""
-    target = np.asarray(target_qpos, dtype=np.float64)
-    measured = np.asarray(measured_qpos, dtype=np.float64)
-    if target.shape != HAND_JOINT_SHAPE or measured.shape != HAND_JOINT_SHAPE:
-        raise ValueError("hand target and measured qpos must both have shape (12,)")
-    if not np.all(np.isfinite(target)) or not np.all(np.isfinite(measured)):
-        raise ValueError("hand target and measured qpos must be finite")
-    max_delta = np.broadcast_to(
-        np.asarray(max_delta_rad_per_tick, dtype=np.float64), HAND_JOINT_SHAPE
-    )
-    if not np.all(np.isfinite(max_delta)) or np.any(max_delta <= 0.0):
-        raise ValueError("hand max_delta_rad_per_tick must be finite and positive")
-    if np.all(np.abs(target - measured) <= max_delta):
-        return target.copy()
-    return measured + np.clip(target - measured, -max_delta, max_delta)

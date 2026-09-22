@@ -102,15 +102,6 @@ class CollisionInfo:
             result["sample_qpos_rad"] = list(self.sample_qpos_rad)
         return result
 
-    @property
-    def summary(self) -> str:
-        if not self.in_collision:
-            return "no collision"
-        pairs = [f"{pair.link_name1}↔{pair.link_name2}" for pair in self.collision_pairs]
-        if not pairs:
-            return f"{self.num_contacts} contact(s), pair details unavailable"
-        return f"{self.num_contacts} contact(s): " + ", ".join(pairs)
-
 
 CollisionInfo._NO_COLLISION = CollisionInfo(in_collision=False)
 
@@ -341,7 +332,6 @@ class CollisionModel:
             dtype=np.float64,
         )
 
-
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
         """Set the current hand joint configuration for auto-expansion.
 
@@ -394,7 +384,6 @@ class CollisionModel:
             )
         return qpos
 
-
     def _pin_update(self, qpos: np.ndarray, stop_at_first: bool = True) -> bool:
         """Compute self-collisions for a validated full configuration."""
         qpos = self._to_full_qpos(qpos)
@@ -403,7 +392,6 @@ class CollisionModel:
                 self._model, self._data, self._collision_model, self._collision_data, qpos, stop_at_first
             )
         )
-
 
     def check_self_collision(self, qpos: np.ndarray) -> bool:
         """Check if qpos is in self-collision (fast bool, single point).
@@ -472,7 +460,6 @@ class CollisionModel:
             # Pair enumeration is diagnostic-only; never turn a real collision into a pass.
             return CollisionInfo(in_collision=True, collision_pairs=(), num_contacts=1)
         return CollisionInfo(in_collision=True, collision_pairs=tuple(pairs), num_contacts=len(pairs))
-
 
     @property
     def has_static_environment(self) -> bool:
@@ -574,7 +561,6 @@ class CollisionModel:
         self_info = self.check_self_collision_details(qpos)
         return self_info if self_info else self.check_environment_collision_details(qpos)
 
-
     @staticmethod
     def _validate_step_size(step_size: float) -> float:
         step_size = float(step_size)
@@ -624,49 +610,6 @@ class CollisionModel:
                 return False
         return True
 
-    def check_transition_collision_free(
-        self,
-        arm_start_qpos: np.ndarray,
-        arm_end_qpos: np.ndarray,
-        hand_start_qpos: np.ndarray,
-        hand_end_qpos: np.ndarray,
-        step_size_rad: float = 0.02,
-    ) -> bool:
-        """Check the conservative envelope of independently executed arm and hand motion."""
-        if not self._hand_dof:
-            raise RuntimeError("arm/hand transition checks require hand_dof=True")
-        step_size = self._validate_step_size(step_size_rad)
-        arm_start = self._validate_vector(arm_start_qpos, 7, "arm_start_qpos")
-        arm_end = self._validate_vector(arm_end_qpos, 7, "arm_end_qpos")
-        hand_start = self._user_hand_to_urdf(hand_start_qpos, "hand_start_qpos")
-        hand_end = self._user_hand_to_urdf(hand_end_qpos, "hand_end_qpos")
-        arm_steps = int(np.ceil(float(np.max(np.abs(arm_end - arm_start))) / step_size))
-        hand_steps = int(np.ceil(float(np.max(np.abs(hand_end - hand_start))) / step_size))
-        arm_diff = arm_end - arm_start
-        hand_diff = hand_end - hand_start
-        arm_alphas = (0.0,) if arm_steps == 0 else np.linspace(0.0, 1.0, arm_steps + 1)
-        hand_alphas = (0.0,) if hand_steps == 0 else np.linspace(0.0, 1.0, hand_steps + 1)
-        for arm_alpha in arm_alphas:
-            arm_qpos = arm_start + arm_alpha * arm_diff
-            for hand_alpha in hand_alphas:
-                hand_qpos = hand_start + hand_alpha * hand_diff
-                if self.check_collision(np.concatenate([arm_qpos, hand_qpos])):
-                    return False
-        return True
-
-    @staticmethod
-    def _validate_vector(values: np.ndarray, size: int, name: str) -> np.ndarray:
-        result = np.asarray(values, dtype=np.float64)
-        if result.shape != (size,):
-            raise ValueError(f"Expected {name} shape ({size},), got {result.shape}")
-        if not np.all(np.isfinite(result)):
-            raise ValueError(f"{name} contains NaN or Inf")
-        return result
-
-    def _user_hand_to_urdf(self, hand_qpos: np.ndarray, name: str) -> np.ndarray:
-        return self._validate_vector(hand_qpos, _HAND_DOF_COUNT, name)[list(_HAND_USER_TO_URDF)]
-
-
     def _get_geom_link_name(self, geom_id: int) -> str:
         """Get the link name for a geometry object index."""
         geom = self._collision_model.geometryObjects[geom_id]
@@ -681,7 +624,6 @@ class CollisionModel:
         if parent_frame < len(self._model.frames):
             return self._model.frames[parent_frame].name
         return geom.name
-
 
     @property
     def hand_dof(self) -> bool:

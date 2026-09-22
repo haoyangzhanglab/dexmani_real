@@ -1,8 +1,6 @@
 """Stable NumPy wire schemas for cross-process channels.
 
-This module deliberately imports only NumPy.  Shared-memory allocation,
-policy logic, device workers, and recording serialization may depend on these
-schemas; the schema layer must never depend on any of those implementations.
+The recording transport reuses the raw row layout as its single source of truth.
 """
 
 from __future__ import annotations
@@ -39,10 +37,7 @@ def make_pointcloud_frame_dtype(num_points: int) -> np.dtype:
     return np.dtype(
         [
             ("source_camera_sequence", "<u8"),
-            ("source_monotonic_ns", "<u8"),
-            ("camera_generation", "<u8"),
-            ("depth_frame_number", "<u8"),
-            ("color_frame_number", "<u8"),
+            ("timestamp_ns", "<u8"),
             ("point_cloud", "<f4", (count, POINT_CLOUD_FEATURE_DIM)),
         ],
         align=True,
@@ -72,84 +67,24 @@ def validate_point_cloud_array(
     return array
 
 
-# One current-run single-inflight command; ring sequence is not command identity.
+# Latest absolute target. Presence bits support arm-only manual workflows.
 ROBOT_COMMAND_DTYPE = np.dtype([
-    ("command_id", "<u8"), ("run_id", "<u8"),
-    ("issued_monotonic_ns", "<u8"),
-    ("arm_present", "u1"), ("hand_present", "u1"),
+    ("run_id", "<u8"), ("arm_present", "u1"), ("hand_present", "u1"),
     ("arm_qpos", "<f8", ARM_JOINT_SHAPE),
     ("hand_qpos", "<f8", HAND_JOINT_SHAPE),
 ], align=True)
 
-# Raw v31 command truth. Zero timestamps never stand in for an inferred adoption.
-RECORD_COMMAND_FIELDS = [
-    ("command_id", "<u8"), ("command_run_id", "<u8"),
-    ("command_issued_monotonic_ns", "<u8"),
-    ("command_arm_present", "?"), ("command_hand_present", "?"),
-    ("arm_command_adopted", "?"), ("hand_command_adopted", "?"),
-    ("arm_command_adopted_monotonic_ns", "<u8"),
-    ("hand_command_adopted_monotonic_ns", "<u8"),
-]
-
-ARM_STATE_DTYPE = np.dtype(
-    [
-        ("qpos", "<f8", ARM_JOINT_SHAPE),
-        ("qvel", "<f8", ARM_JOINT_SHAPE),
-        ("tau", "<f8", ARM_JOINT_SHAPE),
-        ("error_code", "<i4"),
-        # Worker-alive indicator kept for the shared feedback-health predicate;
-        # a disconnect now fails the worker, so this is truthful while alive.
-        ("connected", "<u1"),
-        ("tracking_err", "<f8"),
-        # Monotonic time immediately after the arm SDK accepted the command.
-        ("last_adopted_monotonic_ns", "<u8"),
-        # Exact command identity, also used for raw adoption accounting.
-        ("last_adopted_run_id", "<u8"),
-        ("last_adopted_command_id", "<u8"),
-        ("source_monotonic_ns", "<u8"),
-        # Load-bearing for causal consumer selection (ipc/causal.py,
-        # deployment observation history, recording sample alignment).
-        ("publish_monotonic_ns", "<u8"),
-        ("state_valid", "<u1"),
-    ]
-)
-
-HAND_STATE_DTYPE = np.dtype(
-    [
-        ("qpos", "<f8", HAND_JOINT_SHAPE),
-        ("current", "<f8", HAND_JOINT_SHAPE),
-        ("tactile_aggregate", "<f4", HAND_TACTILE_SUM_SHAPE),
-        # Aggregate and dense tactile payloads are zero-filled on read failure;
-        # these bits distinguish an invalid sample from a valid zero-contact
-        # sample. Both are gated on session software-bias readiness by the
-        # worker before publication.
-        ("tactile_aggregate_valid", "<u1"),
-        ("tactile_dense", "<f4", HAND_TACTILE_FORCE_SHAPE),
-        ("tactile_dense_valid", "<u1"),
-        ("connected", "<u1"),
-        # Set when qpos is held from the last read after a single-frame failure.
-        ("qpos_stale", "<u1"),
-        # Adoption follows the first accepted bounded setpoint; reached follows
-        # acceptance of the exact endpoint. Neither proves physical convergence.
-        ("last_adopted_run_id", "<u8"),
-        ("last_adopted_command_id", "<u8"),
-        ("last_adopted_monotonic_ns", "<u8"),
-        ("last_reached_monotonic_ns", "<u8"),
-        # Exact endpoint identity for operations that require target reach.
-        ("last_reached_run_id", "<u8"),
-        ("last_reached_command_id", "<u8"),
-        # Monotonic time after the most recent accepted SDK setpoint, including
-        # intermediate slew setpoints that have not reached the exact target.
-        ("last_sdk_setpoint_accepted_monotonic_ns", "<u8"),
-        ("commboard_err", "<i4", HAND_JOINT_SHAPE),
-        ("jointboard_err", "<i4", HAND_JOINT_SHAPE),
-        ("tipboard_err", "<i4", HAND_JOINT_SHAPE),
-        ("source_monotonic_ns", "<u8"),
-        ("publish_monotonic_ns", "<u8"),
-        ("state_valid", "<u1"),
-        ("timestamp", "<f8"),
-    ]
-)
+ARM_STATE_DTYPE = np.dtype([
+    ("qpos", "<f8", ARM_JOINT_SHAPE), ("qvel", "<f8", ARM_JOINT_SHAPE),
+    ("effort", "<f8", ARM_JOINT_SHAPE), ("timestamp_ns", "<u8"),
+])
+HAND_STATE_DTYPE = np.dtype([
+    ("qpos", "<f8", HAND_JOINT_SHAPE), ("current", "<f8", HAND_JOINT_SHAPE),
+    ("tactile_aggregate", "<f4", HAND_TACTILE_SUM_SHAPE),
+    ("tactile_aggregate_valid", "u1"),
+    ("tactile_dense", "<f4", HAND_TACTILE_FORCE_SHAPE),
+    ("tactile_dense_valid", "u1"), ("timestamp_ns", "<u8"),
+])
 
 # A ring publication is driven by a right-hand frame; ``head_*`` fields cache the latest HeadFrame.
 VR_FRAME_DTYPE = np.dtype(
@@ -172,10 +107,7 @@ VR_FRAME_DTYPE = np.dtype(
 
 CAMERA_FRAME_HEADER_DTYPE = np.dtype(
     [
-        ("source_monotonic_ns", "<u8"),
-        ("receive_monotonic_ns", "<u8"),
-        ("publish_monotonic_ns", "<u8"),
-        ("camera_generation", "<u8"),
+        ("timestamp_ns", "<u8"),
         ("depth_frame_number", "<u8"),
         ("color_frame_number", "<u8"),
         ("rgb_size", "<u8"),
@@ -185,67 +117,18 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
         ("rgb_shape_c", "<u4"),
         ("depth_shape_h", "<u4"),
         ("depth_shape_w", "<u4"),
-        ("camera_health", "<u1"),
     ],
     align=True,
 )
 
 
-def make_record_sample_dtype(
-    rgb_shape: tuple[int, int, int],
-    depth_shape: tuple[int, int],
-) -> np.dtype:
-    """Return the control-step source row and fixed camera payload for the sample ring."""
-    return np.dtype(
-        [
-            ("timestamp", "<f8"),
-            ("arm_qpos", "<f8", ARM_JOINT_SHAPE),
-            ("arm_qvel", "<f8", ARM_JOINT_SHAPE),
-            ("arm_tau", "<f8", ARM_JOINT_SHAPE),
-            ("hand_qpos", "<f8", HAND_JOINT_SHAPE),
-            ("hand_current", "<f8", HAND_JOINT_SHAPE),
-            ("hand_contact", "<f4", HAND_TACTILE_SUM_SHAPE),
-            ("hand_contact_valid", "<u1"),
-            ("hand_tactile_force", "<f4", HAND_TACTILE_FORCE_SHAPE),
-            ("hand_tactile_force_valid", "<u1"),
-            ("hand_qpos_stale", "<u1"),
-            ("arm_connected", "<u1"),
-            ("hand_connected", "<u1"),
-            ("tracking_error", "<f8"),
-            ("action_arm_joint_sent", "<f8", ARM_JOINT_SHAPE),
-            ("action_hand_joint", "<f8", HAND_JOINT_SHAPE),
-            ("action_arm_ee", "<f8", (9,)),
-            *RECORD_COMMAND_FIELDS,
-            ("flag_frame_status", "<u1"),
-            ("observation_anchor_monotonic_ns", "<u8"),
-            ("observation_valid", "<u1"),
-            ("arm_source_monotonic_ns", "<u8"),
-            ("hand_source_monotonic_ns", "<u8"),
-            ("vr_source_monotonic_ns", "<u8"),
-            ("camera_source_monotonic_ns", "<u8"),
-            ("flag_camera_fresh", "<u1"),
-            ("camera_health", "<u1"),
-            ("camera_depth_frame_number", "<u8"),
-            ("camera_color_frame_number", "<u8"),
-            ("vr_wrist_pos", "<f8", (3,)),
-            ("vr_wrist_rot6d", "<f8", (6,)),
-            ("vr_landmarks", "<f8", (21, 3)),
-            ("head_quat_wxyz", "<f8", (4,)),
-            ("camera_present", "<u1"),
-            ("camera_rgb", "<u1", rgb_shape),
-            ("camera_depth", "<u2", depth_shape),
-        ],
-        align=True,
-    )
-
-
-def nan_array(shape: int | tuple[int, ...], dtype: type = np.float64) -> np.ndarray:
-    """Create an array filled with NaN.
-
-    Centralized factory for the ``np.full(shape, np.nan, dtype=np.float64)``
-    pattern repeated across the codebase.  Ensures consistent dtype and NaN fill.
-    """
-    return np.full(shape, np.nan, dtype=dtype)
+def make_record_sample_dtype(rgb_shape, depth_shape) -> np.dtype:
+    """The raw row plus its owned RGB-D payload, transported to RecorderIO."""
+    from dexmani_real.recording.storage.schema import DATASET_SPECS
+    return np.dtype([
+        (name, spec.dtype, spec.tail_shape) for name, spec in DATASET_SPECS.items()
+    ] + [("camera_present", "u1"), ("camera_rgb", "u1", rgb_shape),
+         ("camera_depth", "<u2", depth_shape)], align=True)
 
 
 __all__ = [
@@ -258,6 +141,5 @@ __all__ = [
     "VR_FRAME_DTYPE",
     "make_pointcloud_frame_dtype",
     "make_record_sample_dtype",
-    "nan_array",
     "validate_point_cloud_array",
 ]

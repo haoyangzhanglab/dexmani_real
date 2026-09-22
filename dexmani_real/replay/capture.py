@@ -8,8 +8,6 @@ from scipy.spatial.transform import Rotation
 from dexmani_real.planning.kinematics.pose import rot6d_to_rotmat
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
-_SAFETY_REASON_BYTES = 256
-
 
 class ReplayRecorder:
     """Pre-allocated, single-threaded capture buffer for replay evaluation."""
@@ -22,13 +20,8 @@ class ReplayRecorder:
         self.eef_quat_wxyz = np.full((capacity, 4), np.nan, dtype=np.float64)
         self.eef_rot6d = np.full((capacity, 6), np.nan, dtype=np.float64)
         self.arm_cmd = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
-        self.arm_sent_cmd = np.full(
-            (capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64
-        )
         self.arm_tracking_error = np.full(capacity, np.nan, dtype=np.float64)
         self.timestamps = np.full(capacity, np.nan, dtype=np.float64)
-        self.flag_safety_reject = np.zeros(capacity, dtype=bool)
-        self.safety_reject_reason: list[str | None] = [None] * capacity
         self.hand_qpos = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
         self.hand_cmd = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
 
@@ -43,9 +36,7 @@ class ReplayRecorder:
         ts: float,
         *,
         hand_qpos: np.ndarray,
-        arm_sent_cmd: np.ndarray | None = None,
         arm_tracking_error: float | None = None,
-        safety_reject_reason: str | None = None,
     ) -> None:
         """Capture one replay row, preserving rejected candidates for diagnosis."""
         if idx < 0:
@@ -64,15 +55,10 @@ class ReplayRecorder:
             self.eef_quat_wxyz[idx] = np.full(4, np.nan)
         self.arm_cmd[idx] = arm_cmd
         self.timestamps[idx] = ts
-        if arm_sent_cmd is not None:
-            self.arm_sent_cmd[idx] = arm_sent_cmd
         if arm_tracking_error is not None:
             self.arm_tracking_error[idx] = arm_tracking_error
         self.hand_qpos[idx] = hand_qpos
         self.hand_cmd[idx] = hand_cmd
-        if safety_reject_reason is not None:
-            self.flag_safety_reject[idx] = True
-            self.safety_reject_reason[idx] = safety_reject_reason
         self._count = idx + 1
 
     @property
@@ -82,13 +68,6 @@ class ReplayRecorder:
     def to_dict(self) -> dict[str, np.ndarray]:
         """Return copies of the populated prefix without pickle-only values."""
         count = self._count
-        reasons = np.array(
-            [
-                reason.encode() if reason else b""
-                for reason in self.safety_reject_reason[:count]
-            ],
-            dtype=f"S{_SAFETY_REASON_BYTES}",
-        )
         result = {
             "arm_qpos": self.arm_qpos[:count].copy(),
             "hand_qpos": self.hand_qpos[:count].copy(),
@@ -97,10 +76,7 @@ class ReplayRecorder:
             "eef_quat_wxyz": self.eef_quat_wxyz[:count].copy(),
             "eef_rot6d": self.eef_rot6d[:count].copy(),
             "arm_cmd": self.arm_cmd[:count].copy(),
-            "arm_sent_cmd": self.arm_sent_cmd[:count].copy(),
             "arm_tracking_error": self.arm_tracking_error[:count].copy(),
             "timestamp": self.timestamps[:count].copy(),
-            "flag_safety_reject": self.flag_safety_reject[:count].copy(),
-            "safety_reject_reason": reasons,
         }
         return result

@@ -359,14 +359,14 @@ class DexPilotHandRetargeter:
             return None
         valid, reason = validate_landmarks(landmarks)
         if not valid:
-            logger.warning("VR landmarks rejected (%s) — holding hand position", reason)
+            logger.warning("VR landmarks rejected (%s) — no target produced", reason)
             return None
 
         try:
             wrist_rot = _estimate_palm_frame(landmarks)
             mano_landmarks = landmarks @ wrist_rot @ _OPERATOR2MANO_RIGHT
         except (ValueError, TypeError, np.linalg.LinAlgError):
-            logger.warning("Coordinate transform failed — holding hand position")
+            logger.warning("Coordinate transform failed — no target produced")
             return None
 
         start_time = time.time()
@@ -383,7 +383,7 @@ class DexPilotHandRetargeter:
                 ref_value, fixed_qpos=self.fixed_joint_values
             )
         except nlopt.RoundoffLimited:
-            logger.warning("Retargeting roundoff limit reached — holding hand position")
+            logger.warning("Retargeting roundoff limit reached — no target produced")
             return None
 
         if qpos is None:

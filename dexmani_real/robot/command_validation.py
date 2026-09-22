@@ -1,10 +1,4 @@
-"""Final physical target guards for arm and hand hardware workers.
-
-Workers own only the HARD boundary at the SDK fence: finiteness and the
-physical joint limits. The soft command-jump bound is owned once by
-``robot/projection.py`` at production time; a worker never re-rejects the
-same soft threshold (no duplicate validation of one constraint).
-"""
+"""Final finite and physical-limit checks at the worker SDK boundary."""
 
 from __future__ import annotations
 

@@ -22,7 +22,6 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.ipc.schema import nan_array
 from dexmani_real.robot.model import (
     HAND_FINGERTIP_SHAPE,
     HAND_JOINT_SHAPE,
@@ -111,12 +110,12 @@ class HandKinematics:
     def compute_tip_positions_in_handbase(self, hand_qpos: np.ndarray) -> np.ndarray:
         """Returns (5, 3) fingertip positions in hand_base frame."""
         if not self._ready:
-            return nan_array(HAND_FINGERTIP_SHAPE)
+            return np.full(HAND_FINGERTIP_SHAPE, np.nan)
 
         try:
             import pinocchio
         except ImportError:
-            return nan_array(HAND_FINGERTIP_SHAPE)
+            return np.full(HAND_FINGERTIP_SHAPE, np.nan)
 
         q = np.asarray(hand_qpos, dtype=np.float64).reshape(HAND_JOINT_SHAPE)
         q_urdf = q[_SDK_TO_URDF_IDX]  # remap SDK order → URDF order

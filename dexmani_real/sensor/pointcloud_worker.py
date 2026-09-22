@@ -22,7 +22,6 @@ from dexmani_real.ipc.schema import (
     validate_point_cloud_array,
 )
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
-from dexmani_real.sensor.camera.worker import PAYLOAD_VALID_CAMERA_HEALTH
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
@@ -61,10 +60,8 @@ def _validate_transform(value: np.ndarray, *, label: str) -> np.ndarray:
 class PointCloudLoopConfig:
     """Resolved processing policy for the realtime worker.
 
-    The worker owns no freshness/age gate: it derives a cloud from every new
-    valid camera sequence and publishes it with its full provenance chain.
-    Temporal admission is decided by consumers against their query anchors,
-    and true source stalls are exposed by the camera producer itself.
+    Each cloud keeps its camera sequence and acquisition time. Consumers
+    check freshness and retrieve the matching RGB-D sample.
     """
 
     pointcloud: PointCloudConfig
@@ -141,8 +138,7 @@ def _load_static_inputs(
 ) -> tuple[RGBDGeometry, float, np.ndarray] | None:
     """Wait for camera-owned geometry and resolve the verified static transform."""
     while shared.is_running.value:
-        shared.set_heartbeat("pointcloud", time.monotonic())
-        if not shared.is_ready("camera"):
+        if not shared.camera_ready.is_set():
             time.sleep(_IDLE_POLL_S)
             continue
         geometry_text = _shared_text(shared.camera_geometry).strip()
@@ -161,27 +157,6 @@ def _load_static_inputs(
     return None
 
 
-def _camera_frame_is_usable(
-    header: np.ndarray,
-    *,
-    now_ns: int,
-) -> bool:
-    """Truthfulness and causality only — no age drop before the cloud build.
-
-    A finite-but-slow delivery (DELIVERY_DELAY) and skipped-frame telemetry
-    (FRAME_GAP) carry valid payloads and stay usable; an invalid clock
-    (CLOCK_RESET) or an ordering violation never passes.
-    """
-    record = header[0]
-    source_ns = int(record["source_monotonic_ns"])
-    camera_publish_ns = int(record["publish_monotonic_ns"])
-    return bool(
-        int(record["camera_generation"]) > 0
-        and int(record["camera_health"]) in PAYLOAD_VALID_CAMERA_HEALTH
-        and 0 < source_ns <= camera_publish_ns <= now_ns
-    )
-
-
 def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> None:
     """Consume only the newest camera sequence and publish fixed ``[N,6]`` clouds."""
     if not isinstance(config, PointCloudLoopConfig):
@@ -195,7 +170,6 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
             "pointcloud ring dtype does not match PointCloudLoopConfig num_points"
         )
 
-    shared.set_heartbeat("pointcloud", time.monotonic())
     static_inputs = _load_static_inputs(shared, cfg.camera_calibration)
     if static_inputs is None:
         return
@@ -216,7 +190,6 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
 
     try:
         while shared.is_running.value:
-            shared.set_heartbeat("pointcloud", time.monotonic())
             latest_sequence = int(shared.camera_ring.latest_sequence)
             if latest_sequence <= last_camera_sequence:
                 time.sleep(_IDLE_POLL_S)
@@ -229,9 +202,6 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
             if camera_sequence <= last_camera_sequence:
                 continue
             last_camera_sequence = camera_sequence
-            now_ns = time.monotonic_ns()
-            if not _camera_frame_is_usable(header, now_ns=now_ns):
-                continue
 
             cloud = build_point_cloud(
                 depth_raw=depth_raw,
@@ -253,19 +223,19 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
             record = np.zeros(1, dtype=expected_dtype)
             camera_header = header[0]
             record["source_camera_sequence"][0] = np.uint64(camera_sequence)
-            record["source_monotonic_ns"][0] = camera_header["source_monotonic_ns"]
-            record["camera_generation"][0] = camera_header["camera_generation"]
-            record["depth_frame_number"][0] = camera_header["depth_frame_number"]
-            record["color_frame_number"][0] = camera_header["color_frame_number"]
+            record["timestamp_ns"][0] = camera_header["timestamp_ns"]
             record["point_cloud"][0] = cloud
             shared.pointcloud_ring.write(record)
             if not ready:
-                shared.set_ready("pointcloud")
+                shared.pointcloud_ready.set()
                 ready = True
                 logger.info(
                     "pointcloud_loop: ready (shape=(%d,6), frame=xarm_base)",
                     cfg.pointcloud.num_points,
                 )
+    except Exception:
+        shared.workflow_failed.value = True
+        raise
     finally:
         logger.info("pointcloud_loop: exited")
 

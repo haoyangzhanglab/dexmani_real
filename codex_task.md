@@ -1,5 +1,7 @@
 # Codex Task — Simplify DexMani Real into a Research-First Real-Robot Experiment Stack
 
+Status (2026-09-22): the architectural migration and offline verification are complete in the local working tree. Physical commissioning remains pending; offline checks do not validate hardware behavior. This file remains the design and acceptance specification. Sections 26–27 retain the original migration map and phase checklist, including names of modules that have since been deleted; they are not a current source inventory or outstanding implementation plan.
+
 ## 0. Purpose and execution contract
 
 This file is the implementation specification for the local Codex CLI.
@@ -1185,7 +1187,7 @@ Delete transaction-style home proof:
 
 A small HomeResult is enough.
 
-XHand home should send the validated absolute home target directly and verify measured convergence/timeout. Do not reintroduce slew or adoption/reach identity.
+XHand home sends the validated absolute home target directly. It succeeds when the owning worker receives SDK send success; queue publication alone is not success. Do not wait for measured convergence or add a position tolerance. SDK errors still fail the operation. Do not reintroduce slew or adoption/reach identity.
 
 ---
 
@@ -1325,9 +1327,9 @@ AGENTS should state the new real physical guarantees clearly:
 
 # 26. File-level migration map
 
-Trace dependencies before deletion; this list is a target, not permission for blind edits.
+Historical migration map, retained to explain the original scope. Check current source and dependencies before further edits; several listed modules no longer exist.
 
-Likely major files:
+Original major files:
 
 ## IPC/runtime
 
@@ -1509,7 +1511,7 @@ examples/export_policy_zarr.py
 
 # 27. Migration phases
 
-Implement in dependency order. Do not leave half-migrated compatibility layers.
+Completed migration checklist, retained in dependency order for acceptance and regression review. Hardware commissioning is tracked separately in section 31.
 
 ## Phase 0 — Freeze the new contracts
 

@@ -82,20 +82,15 @@ def _wait_controller_ready(
     arm_api: Any,
     *,
     expected_mode: int,
-    on_poll: Callable[[], None] | None,
     timeout_s: float,
 ) -> int:
     """Bounded wait for error==0, a movable state, and a settled mode.
 
-    ``mode``/``connected`` are cached report attributes (no synchronous
-    ``get_mode`` read), so a repeated read is one observation; ``on_poll``
-    keeps the caller's heartbeat fresh while this helper sleeps.
+    Mode and connection status come from the SDK report thread.
     """
     deadline = time.monotonic() + timeout_s
     last: LiveStateError | None = None
     while time.monotonic() < deadline:
-        if on_poll is not None:
-            on_poll()
         last = read_live_state_and_error(arm_api)
         if (
             bool(getattr(arm_api, "connected", True))
@@ -112,11 +107,11 @@ def _wait_controller_ready(
     )
 
 
-def _enter_mode(arm_api: Any, mode: int, *, on_poll: Callable[[], None] | None = None) -> None:
+def _enter_mode(arm_api: Any, mode: int) -> None:
     """Enter a controller mode and wait for a movable state; raise on failure."""
     _check_sdk_return_code(arm_api.set_mode(mode), f"set_mode({mode})")
     _check_sdk_return_code(arm_api.set_state(0), f"set_state(0) after Mode {mode}")
-    _wait_controller_ready(arm_api, expected_mode=mode, on_poll=on_poll, timeout_s=1.0)
+    _wait_controller_ready(arm_api, expected_mode=mode, timeout_s=1.0)
 
 
 def _decode_joint_states(
@@ -158,18 +153,18 @@ class HomeAborted(RuntimeError):
 class XArm7:
     """xArm7 driver — the single owner of the controller connection.
 
-    Mode 6 is entered once at the end of :meth:`connect` and held for the
-    whole runtime; the only other mode switches are the HOME-path helpers.
+    Streaming uses Mode 6; home uses Mode 0. The worker restores Mode 6
+    before streaming resumes after a stop.
     Failures raise: the arm worker's top-level handler latches the sticky
     error, and cleanup does a best-effort stop.
     """
 
     def __init__(self, cfg: ArmParams) -> None:
+        cfg.validate()
         self.cfg = cfg
         self._api: Any = None
 
-
-    def connect(self, *, on_poll: Callable[[], None] | None = None) -> None:
+    def connect(self) -> None:
         """One-shot initialization ending in servo Mode 6.
 
         Sequence: XArmAPI → axis-count check → controller error check →
@@ -197,12 +192,12 @@ class XArm7:
                 "xArm SDK initialization diagnostics:\n%s", "\n".join(sdk_diagnostics)
             )
 
-        self._wait_for_axis_report(on_poll=on_poll)
+        self._wait_for_axis_report()
         self._check_controller_error()
         _check_sdk_return_code(self._api.motion_enable(True), "startup motion_enable")
-        self.enter_mode0(on_poll=on_poll)
+        self.enter_mode0()
         self._apply_config()
-        self.enter_mode6(on_poll=on_poll)
+        self.enter_mode6()
 
     def stop(self) -> None:
         """Best-effort State-4 stop; fire-and-forget by design.
@@ -226,9 +221,8 @@ class XArm7:
         except Exception:
             logger.warning("xarm7: disconnect failed during cleanup", exc_info=True)
 
-
     def read(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Read joint positions/velocities/efforts [rad, rad/s, Nm]; raise on any failure."""
+        """Read joint positions/velocities/efforts [rad, rad/s, SDK-native effort]; raise on any failure."""
         code, states = self._api.get_joint_states(is_radian=True, num=3)
         return _decode_joint_states(code, states)
 
@@ -253,7 +247,6 @@ class XArm7:
         waypoints: np.ndarray,
         final_qpos: np.ndarray,
         *,
-        on_poll: Callable[[], None] | None = None,
         feedback_callback: (
             Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], None] | None
         ) = None,
@@ -278,6 +271,8 @@ class XArm7:
             raise ValueError("invalid home final_qpos")
         lower = np.asarray(self.cfg.joint_limit_lower, dtype=np.float64)
         upper = np.asarray(self.cfg.joint_limit_upper, dtype=np.float64)
+        if np.any(final_qpos < lower) or np.any(final_qpos > upper):
+            raise ValueError("home final target violates joint limits")
         if len(waypoints) > 0 and not np.all((waypoints >= lower) & (waypoints <= upper)):
             raise ValueError("home waypoint violates joint limits")
         if len(waypoints) > 0 and float(np.max(np.abs(waypoints[-1] - final_qpos))) > 1e-6:
@@ -304,12 +299,12 @@ class XArm7:
             stable_since = time.monotonic()
             while time.monotonic() - stable_since < self.cfg.homing.dwell_s:
                 _raise_abort()
-                if on_poll is not None:
-                    on_poll()
                 time.sleep(
                     min(self.cfg.homing.step_interval_s, self.cfg.homing.dwell_s)
                 )
                 q, v, t = self.read()
+                if self.read_live_error_code() != 0:
+                    raise RuntimeError("controller error during home dwell")
                 if not _converged(target, q, v, self.cfg.homing.convergence_rad):
                     raise RuntimeError("home dwell interrupted by position/velocity")
                 _publish(target, q, v, t)
@@ -323,6 +318,7 @@ class XArm7:
             ):
                 raise RuntimeError("empty home path while away from canonical home")
             _dwell(final_qpos)
+            self.enter_mode6()
             return
 
         if (
@@ -334,15 +330,14 @@ class XArm7:
         targets = waypoints[1:]
         if len(targets) == 0:
             _dwell(final_qpos)
+            self.enter_mode6()
             return
 
-        self.enter_mode0(on_poll=on_poll)
+        self.enter_mode0()
         milestone_tol = min(self.cfg.homing.convergence_rad, np.deg2rad(0.5))
         current = qpos
         for index, target in enumerate(targets, start=1):
             _raise_abort()
-            if on_poll is not None:
-                on_poll()
             code = int(
                 self._api.set_servo_angle(
                     angle=target,
@@ -361,8 +356,6 @@ class XArm7:
             q = current
             while time.monotonic() < deadline:
                 _raise_abort()
-                if on_poll is not None:
-                    on_poll()
                 q, v, t = self.read()
                 if self.read_live_error_code() != 0:
                     raise RuntimeError(f"controller error at home milestone {index}")
@@ -387,7 +380,7 @@ class XArm7:
         final_error = float(np.max(np.abs(current - final_qpos)))
         if final_error > self.cfg.homing.convergence_rad:
             raise RuntimeError(f"home final error {np.rad2deg(final_error):.2f}deg")
-        self.enter_mode6(on_poll=on_poll)
+        self.enter_mode6()
 
     def emergency_stop(self) -> None:
         """Best-effort emergency stop (requests State 4 without cutting power)."""
@@ -399,14 +392,13 @@ class XArm7:
                 exc_info=True,
             )
 
-
-    def enter_mode0(self, *, on_poll: Callable[[], None] | None = None) -> None:
+    def enter_mode0(self) -> None:
         """Enter Mode 0 (MoveJoint) and wait for a movable state; raise on failure."""
-        _enter_mode(self._api, 0, on_poll=on_poll)
+        _enter_mode(self._api, 0)
 
-    def enter_mode6(self, *, on_poll: Callable[[], None] | None = None) -> None:
+    def enter_mode6(self) -> None:
         """Enter servo Mode 6 and wait for a movable state; raise on failure."""
-        _enter_mode(self._api, 6, on_poll=on_poll)
+        _enter_mode(self._api, 6)
 
     def read_live_error_code(self) -> int:
         """Synchronous live error code; raise on failure (never the cached value)."""
@@ -414,38 +406,20 @@ class XArm7:
         _check_sdk_return_code(code, "get_err_warn_code")
         return int(values[0])
 
-
-    @property
-    def api(self) -> Any:
-        """Raw XArmAPI handle; the homing path drives milestones through it."""
-        return self._api
-
     @property
     def axis(self) -> int:
         return int(getattr(self._api, "axis", 0) or 0)
 
     @property
-    def mode(self) -> int:
-        value = getattr(self._api, "mode", None)
-        return int(value) if value is not None else 0
-
-    @property
-    def state(self) -> Any:
-        return getattr(self._api, "state", None)
-
-    @property
     def error_code(self) -> int:
         return int(getattr(self._api, "error_code", 0) or 0)
 
-
-    def _wait_for_axis_report(self, *, on_poll: Callable[[], None] | None) -> None:
+    def _wait_for_axis_report(self) -> None:
         """Wait for the report thread's axis count and validate it."""
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
             if self.axis > 0:
                 break
-            if on_poll is not None:
-                on_poll()
             time.sleep(0.05)
         if self.axis != ARM_JOINT_SHAPE[0]:
             raise RuntimeError(

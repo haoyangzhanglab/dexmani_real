@@ -12,12 +12,9 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.robot.model import ARM_JOINT_SHAPE, XHAND_FINGERTIP_LINK_NAMES
+from dexmani_real.robot.model import ARM_JOINT_SHAPE, XHAND_FINGERTIP_LINK_NAMES, XARM7_HARD_LOWER, XARM7_HARD_UPPER
 from dexmani_real.utils.limits import validate_hand_limit_nesting
 
-_HEARTBEAT_SUBSYSTEMS = frozenset(
-    {"arm", "hand", "policy", "recorder", "vr", "camera", "pointcloud"}
-)
 _READINESS_SUBSYSTEMS = frozenset(
     {"arm", "hand", "camera", "pointcloud", "recorder", "policy", "vr"}
 )
@@ -258,25 +255,8 @@ class ArmParams:
         0.0,
     )
 
-    # Joint limits mirror assets/robots/xhand/xarm7_xhand_collision.urdf.
-    joint_limit_lower: tuple[float, ...] = (
-        -6.28318530718,
-        -2.059,
-        -6.28318530718,
-        -0.19198,
-        -6.28318530718,
-        -1.69297,
-        -6.28318530718,
-    )
-    joint_limit_upper: tuple[float, ...] = (
-        6.28318530718,
-        2.0944,
-        6.28318530718,
-        3.927,
-        6.28318530718,
-        3.14159265359,
-        6.28318530718,
-    )
+    joint_limit_lower: tuple[float, ...] = XARM7_HARD_LOWER
+    joint_limit_upper: tuple[float, ...] = XARM7_HARD_UPPER
 
     max_joint_velocity_deg_per_s: float = (
         135.0  # 75% of the 180 deg/s SDK command limit
@@ -291,9 +271,6 @@ class ArmParams:
     table_z_surface_m: float = 0.022
     hand_safety_margin_m: float = 0.05
 
-    # Final worker guard against discontinuous producer/IK branch jumps.
-    # Normal command-rate shaping remains owned by each producer.
-    max_servo_command_jump_rad: float = np.deg2rad(20.0)
     collision_sensitivity: int = 1
 
     tcp_load_mass_kg: float = 1.1
@@ -323,6 +300,8 @@ class ArmParams:
             lower >= upper
         ):
             raise ValueError("arm home and joint limits must be finite and ordered")
+        if np.any(lower < XARM7_HARD_LOWER) or np.any(upper > XARM7_HARD_UPPER):
+            raise ValueError("operational arm limits must be inside mechanical limits")
         if np.any(home < lower) or np.any(home > upper):
             raise ValueError("home_qpos must be within joint limits")
         if not self.ip:
@@ -333,11 +312,6 @@ class ArmParams:
             raise ValueError("table_z_surface_m must be finite")
         if not np.isfinite(self.hand_safety_margin_m) or self.hand_safety_margin_m < 0:
             raise ValueError("hand_safety_margin_m must be finite and non-negative")
-        if (
-            not np.isfinite(self.max_servo_command_jump_rad)
-            or self.max_servo_command_jump_rad <= 0
-        ):
-            raise ValueError("max_servo_command_jump_rad must be finite and positive")
         if not (0 <= self.collision_sensitivity <= 5):
             raise ValueError(
                 f"collision_sensitivity={self.collision_sensitivity} out of range [0, 5]"
@@ -473,13 +447,8 @@ class HandParams:
 
     loop_hz: float = 30.0
 
-    # Per-hand-servo-tick bound.  At the 30 Hz hand loop this is a 9 rad/s
-    # envelope; at the 16 Hz teleop grid it is a 4.8 rad/s envelope.
-    hand_max_delta_rad_per_tick: float = 0.3
 
-    # Whole hand-home budget: preparation, queueing, slew and SDK acceptance.
-    # Independent of streaming dispatch delay; not measured joint convergence.
-    home_command_ack_timeout_s: float = 1.0
+    home_timeout_s: float = 1.0
 
     fingertip_link_names: tuple[str, ...] = XHAND_FINGERTIP_LINK_NAMES
     T_eef_handbase_pos_xyz: tuple[float, float, float] = (-0.015, 0.0, 0.0)
@@ -564,18 +533,11 @@ class HandParams:
         if not np.isfinite(self.loop_hz) or self.loop_hz <= 0:
             raise ValueError("hand loop_hz must be finite and positive")
         if (
-            not np.isfinite(self.hand_max_delta_rad_per_tick)
-            or self.hand_max_delta_rad_per_tick <= 0
+            not np.isfinite(self.home_timeout_s)
+            or self.home_timeout_s <= 0
         ):
             raise ValueError(
-                "hand hand_max_delta_rad_per_tick must be finite and positive"
-            )
-        if (
-            not np.isfinite(self.home_command_ack_timeout_s)
-            or self.home_command_ack_timeout_s <= 0
-        ):
-            raise ValueError(
-                "hand home_command_ack_timeout_s must be finite and positive"
+                "hand home_timeout_s must be finite and positive"
             )
         if len(self.fingertip_link_names) != 5 or any(
             not name for name in self.fingertip_link_names
@@ -595,29 +557,21 @@ class HandParams:
 
 @dataclass(frozen=True)
 class TeleopTimingParams:
-    """VR command-grid and operator polling cadence."""
+    """VR control and recording cadence."""
 
     control_hz: float = 16.0
-    executor_poll_hz: float = 128.0
 
     def validate(self) -> None:
         if not np.isfinite(self.control_hz) or self.control_hz <= 0:
             raise ValueError("teleop.control_hz must be finite and positive")
-        if not np.isfinite(self.executor_poll_hz) or self.executor_poll_hz < self.control_hz:
-            raise ValueError("teleop.executor_poll_hz must be finite and >= control_hz")
 
 
 @dataclass(frozen=True)
 class PolicyParams:
     """Shared experiment/control settings; learned policy timing is PolicySpec-owned."""
 
-    # Cross-modal source-span bound for the teleop RECORDING provenance flag
-    # (raw ``observation_valid``); it is not a policy admission gate. Model
-    # shape, history, and action horizon remain PolicySpec-owned; policy
-    # observation admission is source causality against the query anchor.
-    max_observation_skew_s: float = 0.10
-    action_apply_timeout_s: float = 0.75
     arm_state_stale_threshold_s: float = 0.5
+    hand_state_stale_threshold_s: float = 1.0
     quit_save_timeout_s: float = 30.0
     post_teleop_timeout_s: float = 60.0
 
@@ -632,32 +586,21 @@ class PolicyParams:
     min_record_duration_s: float = 1.0
     episodes_dir: str = "episodes"
 
-    status_print_interval: int = 80  # observation/action grid ticks (5 s at 16 Hz)
     max_consecutive_errors: int = 10
 
     ik_max_pose_error_pos_m: float = 0.02
     ik_max_pose_error_rot_rad: float = np.deg2rad(5.0)
     ik_nullspace_step_rate_deg_s: float = 50.0
 
-    # Teleop endpoint shaping bound per control tick; this is not arm interpolation.
-    teleop_arm_max_delta_rad_per_tick: float | None = np.deg2rad(8.0)
 
     hand_enabled: bool = True
     hand_retargeting_type: str = "tag"
-    hand_ramp_duration_s: float = 0.5  # smoothstep startup ramp, rate-independent
     hand_disconnect_timeout_s: float = 1.0
 
     def validate(self) -> None:
-        if (
-            not np.isfinite(self.max_observation_skew_s)
-            or self.max_observation_skew_s <= 0
-        ):
-            raise ValueError(
-                "recording observation skew bound must be finite and positive"
-            )
         timing = (
-            self.action_apply_timeout_s,
             self.arm_state_stale_threshold_s,
+            self.hand_state_stale_threshold_s,
             self.quit_save_timeout_s,
             self.post_teleop_timeout_s,
         )
@@ -665,8 +608,6 @@ class PolicyParams:
             raise ValueError(
                 "policy action, freshness, and operator timeouts must be finite and positive"
             )
-        if not np.isfinite(self.hand_ramp_duration_s) or self.hand_ramp_duration_s < 0:
-            raise ValueError("hand_ramp_duration_s must be finite and >= 0")
         if (
             not np.isfinite(self.max_record_duration_s)
             or not np.isfinite(self.min_record_duration_s)
@@ -679,7 +620,6 @@ class PolicyParams:
             )
         if (
             not self.episodes_dir
-            or self.status_print_interval <= 0
             or self.max_consecutive_errors <= 0
         ):
             raise ValueError(
@@ -701,13 +641,6 @@ class PolicyParams:
             or self.hand_disconnect_timeout_s <= 0
         ):
             raise ValueError("hand_disconnect_timeout_s must be finite and positive")
-        if self.teleop_arm_max_delta_rad_per_tick is not None and (
-            not np.isfinite(self.teleop_arm_max_delta_rad_per_tick)
-            or self.teleop_arm_max_delta_rad_per_tick <= 0
-        ):
-            raise ValueError(
-                "teleop_arm_max_delta_rad_per_tick must be finite and > 0 or None"
-            )
 
 
 @dataclass(frozen=True)
@@ -717,15 +650,9 @@ class KeyboardTeleopParams:
     control_hz: float = 30.0
     delta_pos_m: float = 0.008
     delta_rpy_rad: float = 0.03
-    command_lookahead_frames: int = 5
-    # Confirm release across two input samples, then wait boundedly for the
-    # final normal motion action to cross the arm SDK boundary.
-    release_debounce_frames: int = 2
-    release_last_action_ack_timeout_s: float = 0.15
     workspace_command_margin_m: float = 0.005
     ik_max_pose_error_pos_m: float = 0.002
     ik_max_pose_error_rot_rad: float = np.deg2rad(2.0)
-    status_interval_frames: int = 50
     idle_interval_frames: int = 150
 
     def validate(self) -> None:
@@ -733,7 +660,6 @@ class KeyboardTeleopParams:
             self.control_hz,
             self.delta_pos_m,
             self.delta_rpy_rad,
-            self.release_last_action_ack_timeout_s,
             self.workspace_command_margin_m,
             self.ik_max_pose_error_pos_m,
             self.ik_max_pose_error_rot_rad,
@@ -746,18 +672,12 @@ class KeyboardTeleopParams:
             raise ValueError(f"delta_pos_m={self.delta_pos_m} must be > 0")
         if self.delta_rpy_rad <= 0:
             raise ValueError(f"delta_rpy_rad={self.delta_rpy_rad} must be > 0")
-        if self.command_lookahead_frames <= 0:
-            raise ValueError("command_lookahead_frames must be positive")
-        if self.release_debounce_frames <= 0:
-            raise ValueError("release_debounce_frames must be positive")
-        if self.release_last_action_ack_timeout_s <= 0:
-            raise ValueError("release_last_action_ack_timeout_s must be > 0")
         if self.workspace_command_margin_m < 0:
             raise ValueError("workspace_command_margin_m must be non-negative")
         if self.ik_max_pose_error_pos_m <= 0 or self.ik_max_pose_error_rot_rad <= 0:
             raise ValueError("keyboard IK pose-error limits must be > 0")
-        if self.status_interval_frames <= 0 or self.idle_interval_frames <= 0:
-            raise ValueError("keyboard status/idle intervals must be > 0")
+        if self.idle_interval_frames <= 0:
+            raise ValueError("keyboard idle interval must be > 0")
 
 
 @dataclass(frozen=True)
@@ -907,23 +827,8 @@ class VRParams:
 
 @dataclass(frozen=True)
 class SafetyParams:
-    """Safety / heartbeat parameters — single source of truth."""
+    """Process startup/shutdown parameters — single source of truth."""
 
-    heartbeat_timeouts: Mapping[str, float] = field(
-        default_factory=lambda: {
-            "arm": 1.0,
-            "hand": 1.0,
-            # The "policy" heartbeat slot is owned by the teleop loop. Policy
-            # deployments supervise the policy child through is_alive/exitcode
-            # and the parent-side run budget instead, so a normal blocking
-            # model inference can never trip a loop-heartbeat deadline.
-            "policy": 5.0,
-            "recorder": 2.0,
-            "vr": 5.0,
-            "camera": 2.0,
-            "pointcloud": 2.0,
-        }
-    )
     readiness_timeouts_s: Mapping[str, float] = field(
         default_factory=lambda: {
             "arm": 15.0,
@@ -937,18 +842,7 @@ class SafetyParams:
     )
     shutdown_timeout_s: float = 65.0
 
-    supervisor_hz: float = 10.0
-
     def validate(self) -> None:
-        if not self.heartbeat_timeouts or any(
-            not name or not np.isfinite(value) or value <= 0
-            for name, value in self.heartbeat_timeouts.items()
-        ):
-            raise ValueError(
-                "heartbeat timeout names/values must be non-empty, finite, and > 0"
-            )
-        if _HEARTBEAT_SUBSYSTEMS - self.heartbeat_timeouts.keys():
-            raise ValueError("heartbeat_timeouts is missing a runtime subsystem")
         if not self.readiness_timeouts_s or any(
             not name or not np.isfinite(value) or value <= 0
             for name, value in self.readiness_timeouts_s.items()
@@ -960,8 +854,6 @@ class SafetyParams:
             raise ValueError("readiness_timeouts_s is missing a runtime subsystem")
         if not np.isfinite(self.shutdown_timeout_s) or self.shutdown_timeout_s <= 0:
             raise ValueError("shutdown_timeout_s must be finite and positive")
-        if not np.isfinite(self.supervisor_hz) or self.supervisor_hz <= 0:
-            raise ValueError(f"supervisor_hz={self.supervisor_hz} must be > 0")
 
 
 @dataclass(frozen=True)
@@ -974,28 +866,14 @@ class CameraParams:
     fps: int = 30
     warmup_frames: int = 10
     max_frame_age_s: float = 0.25
-    # Device-owned stall budget: how long the camera worker tolerates failed
-    # reads or no new valid source frame before it latches. This is a device
-    # truthfulness threshold — it is never derived from model latency or
-    # recording-quality parameters, and the value matches the long-standing
-    # effective device stall timeout. The disposition belongs to the caller:
-    # required-camera loss ends recorded motion and invalidates the episode.
-    # It is an evidence failure, not by itself a physical hardware fault.
+    # Missing frames beyond this interval fail the camera workflow.
     source_stall_timeout_s: float = 2.0
-    # Recording-evidence stall budget owned by the teleop recording grid
-    # (CameraFreshnessTracker): how long a recording tolerates no fresh camera
-    # sample before it stops and saves the collected prefix.
-    recording_stall_abort_s: float = 2.0
-    # Zero selects the default recovered-frame-gap logging threshold. Gaps are
-    # retained as telemetry; current-frame freshness is timestamp-based.
-    frame_gap_stall_threshold: int = 0
     l515_visual_preset: int = 5
     l515_confidence_threshold: int | None = None
     # Librealsense-owned frameset queue. Keep only a small scheduling cushion:
     # control freshness is more important than retaining historical frames.
     frame_queue_capacity: int = 2
     ring_maxlen: int = 5
-    writer_queue_size: int = 8
 
     @property
     def rgb_shape(self) -> tuple[int, int, int]:
@@ -1013,8 +891,6 @@ class CameraParams:
         if (
             not np.isfinite(self.max_frame_age_s)
             or self.max_frame_age_s <= 0
-            or not np.isfinite(self.recording_stall_abort_s)
-            or self.recording_stall_abort_s <= self.max_frame_age_s
             or not np.isfinite(self.source_stall_timeout_s)
             or self.source_stall_timeout_s <= self.max_frame_age_s
         ):
@@ -1022,8 +898,6 @@ class CameraParams:
                 "camera frame age and stall thresholds must be finite and positive, "
                 "with both stall timeouts greater than max frame age"
             )
-        if self.frame_gap_stall_threshold < 0:
-            raise ValueError("camera frame_gap_stall_threshold must be >= 0")
         if (
             not isinstance(self.l515_visual_preset, int)
             or isinstance(self.l515_visual_preset, bool)
@@ -1041,7 +915,6 @@ class CameraParams:
         if (
             self.frame_queue_capacity <= 0
             or self.ring_maxlen <= 0
-            or self.writer_queue_size <= 0
         ):
             raise ValueError("camera ring and writer capacities must be > 0")
         if self.serial is not None and not self.serial:

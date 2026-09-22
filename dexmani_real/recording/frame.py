@@ -1,131 +1,57 @@
-"""Owned control-step source rows assembled at the recording boundary."""
-
-from __future__ import annotations
-
-from collections.abc import Mapping
+"""Research rows copied from the same observation used by the controller."""
 from dataclasses import dataclass
-import time
-
 import numpy as np
 
 from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d
-from dexmani_real.recording.storage.schema import (
-    DATASET_SPECS,
-    RECORD_COMMAND_FIELDS,
-    SOURCE_FRAME_DATASET_NAMES,
-)
-
-EpisodeValue = np.ndarray | np.generic | float | int | bool
+from dexmani_real.recording.storage.schema import DATASET_SPECS, SOURCE_FRAME_DATASET_NAMES, FRAME_OK
 
 
 @dataclass
 class EpisodeFrame:
-    """One owned source row; builders copy producer arrays before retaining them."""
-
     timestamp_s: float
-    data: dict[str, EpisodeValue]
+    data: dict
     camera_rgb: np.ndarray | None = None
     camera_depth: np.ndarray | None = None
 
 
-def build_episode_frame(
-    arm_state: np.ndarray | None,
-    hand_state: np.ndarray | None,
-    action: Mapping[str, np.ndarray],
-    vr_frame: Mapping[str, object],
-    *,
-    timestamp_s: float | None = None,
-    camera_frame: Mapping[str, object] | None = None,
-    signals: Mapping[str, object] | None = None,
-) -> EpisodeFrame:
-    """Copy a control sample directly into the raw episode's field names.
-
-    Action keys are action_arm_joint_sent, action_hand_joint, action_arm_ee.
-    Joint targets are those actually submitted, while action_arm_ee retains
-    Cartesian intent. Invalid tactile is NaN, never a false zero-contact sample.
-    Arm/hand payloads and timestamps refer to the caller's one selected sample.
-    """
-    arm = arm_state[0] if arm_state is not None else None
-    hand = hand_state[0] if hand_state is not None else None
+def build_episode_frame(row, command=None, *, action_timestamp_ns=0, frame_status=FRAME_OK, arm_eef_intent=None):
+    arm, hand, vr, camera = row.arm[0], None if row.hand is None else row.hand[0], row.vr, row.camera
     contact_valid = hand is not None and bool(hand["tactile_aggregate_valid"])
     dense_valid = hand is not None and bool(hand["tactile_dense_valid"])
-    signal = signals or {}
-    camera = camera_frame or {}
     values = {
-        "arm_qpos": arm["qpos"] if arm is not None else np.full(7, np.nan),
-        "arm_qvel": arm["qvel"] if arm is not None else np.full(7, np.nan),
-        "arm_tau": arm["tau"] if arm is not None else np.full(7, np.nan),
+        "arm_qpos": arm["qpos"], "arm_qvel": arm["qvel"], "arm_effort": arm["effort"],
         "hand_qpos": hand["qpos"] if hand is not None else np.full(12, np.nan),
         "hand_current": hand["current"] if hand is not None else np.full(12, np.nan),
-        "hand_contact": hand["tactile_aggregate"] if contact_valid else np.full((5, 3), np.nan),
+        "hand_contact": hand["tactile_aggregate"] if contact_valid else np.full((5,3), np.nan),
         "hand_contact_valid": contact_valid,
-        "hand_tactile_force": hand["tactile_dense"] if dense_valid else np.full((5, 120, 3), np.nan),
+        "hand_tactile_force": hand["tactile_dense"] if dense_valid else np.full((5,120,3), np.nan),
         "hand_tactile_force_valid": dense_valid,
-        "arm_connected": bool(arm["connected"]) if arm is not None else False,
-        "hand_connected": bool(hand["connected"]) if hand is not None else False,
-        "hand_qpos_stale": bool(hand["qpos_stale"]) if hand is not None else False,
-        "action_arm_joint_sent": action["action_arm_joint_sent"],
-        "action_hand_joint": action["action_hand_joint"],
-        "action_arm_ee": action["action_arm_ee"],
-        **{name: signal.get(name, 0) for name, _ in RECORD_COMMAND_FIELDS},
-        "flag_frame_status": signal.get("frame_status", 0),
-        "tracking_error": signal.get("tracking_error", np.nan),
-        "observation_anchor_monotonic_ns": signal.get(
-            "observation_anchor_monotonic_ns", 0
-        ),
-        "observation_valid": signal.get("observation_valid", False),
-        "arm_source_monotonic_ns": signal.get("arm_source_monotonic_ns", 0),
-        "hand_source_monotonic_ns": signal.get("hand_source_monotonic_ns", 0),
-        "vr_source_monotonic_ns": signal.get("vr_source_monotonic_ns", 0),
-        "camera_source_monotonic_ns": signal.get(
-            "camera_source_monotonic_ns", camera.get("source_monotonic_ns", 0)
-        ),
-        "flag_camera_fresh": camera.get("camera_fresh", False),
-        "camera_health": camera.get("camera_health", 0),
-        "camera_depth_frame_number": camera.get("depth_frame_number", 0),
-        "camera_color_frame_number": camera.get("color_frame_number", 0),
-        "vr_wrist_pos": vr_frame["wrist_pos"],
-        "vr_wrist_rot6d": quat_wxyz_to_rot6d(
-            np.asarray(vr_frame["wrist_quat_wxyz"], dtype=np.float64)
-        ),
-        "vr_landmarks": vr_frame["landmarks"],
-        "head_quat_wxyz": vr_frame.get(
-            "head_quat_wxyz", signal.get("head_quat_wxyz", np.full(4, np.nan))
-        ),
+        "action_arm_joint_target": command.arm_qpos if command is not None and command.arm_qpos is not None else np.full(7, np.nan),
+        "action_hand_joint_target": command.hand_qpos if command is not None and command.hand_qpos is not None else np.full(12, np.nan),
+        "arm_eef_intent": arm_eef_intent if arm_eef_intent is not None else np.full(9, np.nan),
+        "flag_frame_status": frame_status,
+        "observation_timestamp_ns": row.observation_timestamp_ns,
+        "action_timestamp_ns": action_timestamp_ns,
+        "arm_timestamp_ns": arm["timestamp_ns"],
+        "hand_timestamp_ns": hand["timestamp_ns"] if hand is not None else 0,
+        "vr_timestamp_ns": vr["recv_ts_ns"] if vr is not None else 0,
+        "camera_timestamp_ns": camera["timestamp_ns"] if camera is not None else 0,
+        "camera_depth_frame_number": camera["depth_frame_number"] if camera else 0,
+        "camera_color_frame_number": camera["color_frame_number"] if camera else 0,
+        "vr_wrist_pos": vr["wrist_pos"] if vr else np.full(3, np.nan),
+        "vr_wrist_rot6d": quat_wxyz_to_rot6d(vr["wrist_quat_wxyz"]) if vr else np.full(6, np.nan),
+        "vr_landmarks": vr["landmarks"] if vr else np.full((21,3), np.nan),
+        "head_quat_wxyz": vr["head_quat_wxyz"] if vr else np.full(4, np.nan),
     }
-    data = {
-        name: np.array(value, dtype=DATASET_SPECS[name].dtype, copy=True)
-        for name, value in values.items()
-    }
-    return EpisodeFrame(
-        timestamp_s=time.perf_counter() if timestamp_s is None else float(timestamp_s),
-        data=data,
-        camera_rgb=(
-            np.array(camera["rgb"], copy=True)
-            if camera.get("rgb") is not None
-            else None
-        ),
-        camera_depth=(
-            np.array(camera["depth"], copy=True)
-            if camera.get("depth") is not None
-            else None
-        ),
-    )
+    return EpisodeFrame(row.observation_timestamp_ns / 1e9,
+        {k: np.array(v, dtype=DATASET_SPECS[k].dtype, copy=True) for k,v in values.items()},
+        camera["rgb"] if camera else None, camera["depth"] if camera else None)
 
 
-def decode_record_sample(record: np.void) -> EpisodeFrame:
-    """Copy the sample ring before its producer can overwrite the slot."""
+def decode_record_sample(record):
     present = bool(record["camera_present"])
-    return EpisodeFrame(
-        timestamp_s=float(record["timestamp"]),
-        data={
-            name: np.array(
-                record[name],
-                dtype=DATASET_SPECS[name].dtype,
-                copy=True,
-            )
-            for name in SOURCE_FRAME_DATASET_NAMES
-        },
-        camera_rgb=np.array(record["camera_rgb"], copy=True) if present else None,
-        camera_depth=np.array(record["camera_depth"], copy=True) if present else None,
-    )
+    return EpisodeFrame(float(record["timestamp"]),
+        {name: np.array(record[name], dtype=DATASET_SPECS[name].dtype, copy=True)
+         for name in SOURCE_FRAME_DATASET_NAMES},
+        np.array(record["camera_rgb"], copy=True) if present else None,
+        np.array(record["camera_depth"], copy=True) if present else None)

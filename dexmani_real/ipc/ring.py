@@ -1,11 +1,11 @@
-"""Lock-free shared-memory ring buffer with latest, history, and sequence reads.
+"""Shared-memory ring buffer with latest and exact-sequence reads.
 
-Uses multiprocessing.shared_memory for zero-copy cross-process communication.
+Readers take owned copies from multiprocessing.shared_memory.
 Each ring has one serialized writer at a time and may have multiple readers.
 Odd/even markers prevent readers from accepting a slot while its payload is
 being overwritten.
 
-     DexUMI drop-oldest backpressure via FILO semantics.
+     New writes overwrite the oldest slot; recorder clients prevent unread row loss.
 
 Usage:
     buf = SharedMemoryRingBuffer("vr_frames", VR_FRAME_DTYPE, maxlen=3, create=True)
@@ -132,10 +132,9 @@ class SharedMemoryRingBuffer:
     x86_64 without CAS. Callers with multiple writer processes must hold their
     own cross-process write lock.
 
-    Latest/history readers use FILO semantics: old frames are silently
-    overwritten (drop-oldest backpressure). A sequence-addressed reader can
-    instead ownership-copy one known resident frame. That form is for bounded
-    FIFO consumers that track their own acknowledgement sequence.
+    Latest readers may skip overwritten frames. Exact-sequence readers
+    retrieve a resident frame or None; recorder clients track consumed slots
+    to prevent unread rows from being overwritten.
     """
 
     _OFF_WRITE_IDX = 0
@@ -267,7 +266,7 @@ class SharedMemoryRingBuffer:
     def read_sequence(self, sequence: int) -> tuple[np.ndarray, int, int] | None:
         """Ownership-copy one exact, still-resident logical sequence.
 
-        Unlike :meth:`get_last_k`, this method never scans or copies unrelated
+        This method never scans or copies unrelated
         history slots. It is therefore suitable for a bounded FIFO consumer
         that already knows the next sequence it must acknowledge. ``None``
         means that the requested sequence is not resident or could not be read
@@ -294,94 +293,6 @@ class SharedMemoryRingBuffer:
                 return data, timestamp_ns, sequence
         return None
 
-    def get_last_k(self, k: int) -> list[tuple[np.ndarray, int, int]]:
-        """Return up to ``k`` independently verified frames, oldest first."""
-        if k <= 0:
-            return []
-        if k > self.maxlen:
-            raise ValueError(f"k ({k}) exceeds ring capacity maxlen ({self.maxlen})")
-        latest_seq = int(self._write_seq[0])
-        if latest_seq == 0:
-            return []
-        frames: list[tuple[np.ndarray, int, int]] = []
-        missing: list[tuple[int, str]] = []
-        count = min(k, latest_seq)
-        first_seq = latest_seq - count + 1
-        for target_seq in range(first_seq, latest_seq + 1):
-            slot = self._data_buf[target_seq % self.maxlen]
-            seqlock = SeqlockSlot(
-                self._shm.buf,
-                self._HEADER_SIZE + (target_seq % self.maxlen) * self._slot_size,
-            )
-            accepted = False
-            for _attempt in range(2):
-                marker1 = seqlock.marker
-                if not seqlock_is_complete(marker1):
-                    reason = "writer_active" if marker1 else "uninitialized"
-                    continue
-                if seqlock_to_logical(marker1) != target_seq:
-                    # Skip slots overwritten during the read.
-                    reason = "sequence_mismatch"
-                    break
-                timestamp_ns = seqlock.timestamp_ns
-                data = slot["data"].copy().reshape(1)
-                if (
-                    seqlock.verify(marker1)
-                    and seqlock_to_logical(marker1) == target_seq
-                ):
-                    frames.append((data, timestamp_ns, target_seq))
-                    accepted = True
-                    break
-                reason = "changed_during_copy"
-            if not accepted:
-                missing.append((target_seq, reason))
-        if missing:
-            self._warn_torn_read_k(k, len(frames), latest_seq, missing)
-        return frames
-
-    def get_last_k_fields(
-        self, k: int, fields: tuple[str, ...]
-    ) -> list[tuple[dict[str, np.ndarray | np.generic], int, int]]:
-        """Copy only requested structured fields, with get_last_k history semantics."""
-        if not fields or len(set(fields)) != len(fields):
-            raise ValueError("fields must be non-empty and unique")
-        if any(name not in (self.dtype.names or ()) for name in fields):
-            raise ValueError("requested field is absent from ring dtype")
-        if k <= 0:
-            return []
-        if k > self.maxlen:
-            raise ValueError(f"k ({k}) exceeds ring capacity maxlen ({self.maxlen})")
-        latest_seq = int(self._write_seq[0])
-        frames: list[tuple[dict[str, np.ndarray | np.generic], int, int]] = []
-        missing: list[tuple[int, str]] = []
-        for target_seq in range(latest_seq - min(k, latest_seq) + 1, latest_seq + 1):
-            slot = self._data_buf[target_seq % self.maxlen]
-            seqlock = SeqlockSlot(
-                self._shm.buf,
-                self._HEADER_SIZE + (target_seq % self.maxlen) * self._slot_size,
-            )
-            accepted = False
-            for _attempt in range(2):
-                marker_before = seqlock.marker
-                if not seqlock_is_complete(marker_before):
-                    reason = "writer_active" if marker_before else "uninitialized"
-                    continue
-                if seqlock_to_logical(marker_before) != target_seq:
-                    reason = "sequence_mismatch"
-                    break
-                timestamp_ns = seqlock.timestamp_ns
-                record = slot["data"]
-                projected = {name: record[name].copy() for name in fields}
-                if seqlock.verify(marker_before):
-                    frames.append((projected, timestamp_ns, target_seq))
-                    accepted = True
-                    break
-                reason = "changed_during_copy"
-            if not accepted:
-                missing.append((target_seq, reason))
-        if missing:
-            self._warn_torn_read_k(k, len(frames), latest_seq, missing)
-        return frames
 
     @property
     def latest_sequence(self) -> int:
@@ -439,36 +350,4 @@ class SharedMemoryRingBuffer:
             "Shared-memory ring %s had a persistent torn read; returning %s",
             self.name,
             "last-good frame" if self._last_good is not None else "None",
-        )
-
-    def _warn_torn_read_k(
-        self,
-        requested: int,
-        recovered: int,
-        snapshot_sequence: int,
-        missing: list[tuple[int, str]],
-    ) -> None:
-        """Report the final failed check per skipped slot, not persisted frame loss.
-
-        The snapshot sequence fixes the attempted range even if the writer has
-        advanced by log time. A partial ring at startup has fewer candidates
-        than requested, so the denominator counts only those attempted.
-        """
-        now_ns = time.monotonic_ns()
-        if now_ns - self._last_torn_warn_k_ns < TORN_WARN_INTERVAL_NS:
-            return
-        self._last_torn_warn_k_ns = now_ns
-        attempted = min(requested, snapshot_sequence)
-        logger.warning(
-            "Shared-memory ring %s recovered %d/%d history frames "
-            "requested=%d sequence_range=%d..%d latest_sequence=%d "
-            "missing=[%s] (unverified slots skipped)",
-            self.name,
-            recovered,
-            attempted,
-            requested,
-            snapshot_sequence - attempted + 1,
-            snapshot_sequence,
-            self.latest_sequence,
-            ", ".join(f"{sequence}:{reason}" for sequence, reason in missing),
         )

@@ -1,58 +1,25 @@
-"""VR teleoperation session lifecycle and data-collection process topology.
-
-This module owns the concrete VR teleoperation session: preflight, worker
-construction, readiness, supervision, and cleanup. The CLI remains in
-``examples/collect_teleop.py``.
-"""
-
-from __future__ import annotations
-
+"""VR collection process ownership and startup; all hardware work is explicit."""
 import multiprocessing as mp
 import os
-import time
 from pathlib import Path
 from typing import Any
-
-import numpy as np
-
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.ipc.causal import vr_frame_is_fresh
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.recording.io_worker import RecorderIOConfig, recorder_io_loop
 from dexmani_real.robot.arm_worker import arm_loop as _arm_loop
 from dexmani_real.robot.hand_worker import hand_loop as _hand_loop
-from dexmani_real.robot.model import (
-    XARM7_XHAND_COLLISION_URDF_PATH,
-    XARM7_XHAND_RIGHT_URDF_PATH,
-    XARM7_XHAND_SRDF_PATH,
-    XHAND_RIGHT_URDF_PATH,
-)
+from dexmani_real.robot.model import XARM7_XHAND_COLLISION_URDF_PATH, XARM7_XHAND_RIGHT_URDF_PATH, XARM7_XHAND_SRDF_PATH, XHAND_RIGHT_URDF_PATH
 from dexmani_real.runtime.safety import SafetyState, require_transition
-from dexmani_real.runtime.supervisor import (
-    print_health_summary,
-    run_supervisor,
-    shutdown_processes,
-    wait_subsystem_ready,
-    start_evidence_services,
-)
-from dexmani_real.runtime.processes import (
-    ShutdownReport,
-)
-from dexmani_real.sensor.camera.worker import CameraHealth, CameraLoopConfig
-from dexmani_real.sensor.camera.worker import camera_loop as _camera_loop
-from dexmani_real.sensor.vr_worker import VRReceiverConfig
-from dexmani_real.sensor.vr_worker import vr_loop as _vr_loop
+from dexmani_real.runtime.supervisor import start_processes, run_supervisor
+from dexmani_real.runtime.processes import shutdown_processes_verified
+from dexmani_real.sensor.camera.worker import CameraLoopConfig, camera_loop as _camera_loop
+from dexmani_real.sensor.vr_worker import VRReceiverConfig, vr_loop as _vr_loop
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.loop import teleop_loop
 from dexmani_real.teleop.vr_transform import load_vr_transform
-from dexmani_real.utils.feedback import validate_arm_feedback, validate_hand_feedback
 from dexmani_real.utils.log import get_logger
-
 logger = get_logger(__name__)
-
-# Operator-editable task name; recordings are stored below episodes/<task>/.
 DEFAULT_TASK_NAME = "test"
-
 
 def validate_task_name(value: str) -> str:
     """Validate one task name as a safe directory component."""
@@ -92,167 +59,6 @@ def _validate_recording_resources(repo_root: Path) -> None:
         raise FileNotFoundError(f"required recording resources are missing: {missing}")
 
 
-def _preflight_health_issues(
-    shared: RuntimeChannels,
-    runtime: Any,
-    *,
-    hand_enabled: bool,
-    recording_enabled: bool,
-    now_s: float | None = None,
-    now_ns: int | None = None,
-) -> list[str]:
-    """Validate fresh, finite feedback before Main permits ARMED."""
-    issues: list[str] = []
-    if shared.error_state.value:
-        issues.append("sticky error_state is set")
-    if shared.estop_request.value:
-        issues.append("e-stop is requested")
-
-    # The teleop loop reuses the "policy" heartbeat/ready slots in RuntimeChannels.
-    enabled_heartbeats = ["arm", "vr", "policy"]
-    if hand_enabled:
-        enabled_heartbeats.append("hand")
-    if recording_enabled:
-        enabled_heartbeats += ["camera", "recorder"]
-    heartbeat_timeouts = runtime.safety.heartbeat_timeouts
-    for name in enabled_heartbeats:
-        last_s = shared.get_heartbeat(name)
-        current_s = time.monotonic() if now_s is None else now_s
-        if (
-            not np.isfinite(last_s)
-            or last_s <= 0
-            or last_s > current_s
-            or current_s - last_s > float(heartbeat_timeouts[name])
-        ):
-            issues.append(f"{name} heartbeat is missing or stale")
-
-    arm_result = shared.arm_state_ring.read_latest()
-    if arm_result is None:
-        issues.append("arm feedback is unavailable")
-    else:
-        arm, _timestamp_ns, _sequence = arm_result
-        current_ns = time.monotonic_ns() if now_ns is None else now_ns
-        arm_issue = validate_arm_feedback(
-            connected=bool(arm["connected"][0]),
-            error_code=int(arm["error_code"][0]),
-            state_valid=bool(arm["state_valid"][0]),
-            source_monotonic_ns=int(arm["source_monotonic_ns"][0]),
-            now_monotonic_ns=current_ns,
-            max_age_s=float(runtime.policy.arm_state_stale_threshold_s),
-            qpos=arm["qpos"][0],
-            qvel=arm["qvel"][0],
-        )
-        if arm_issue is not None:
-            issues.append(arm_issue)
-        if int(arm["error_code"][0]) != 0:
-            issues.append(f"arm controller error C{int(arm['error_code'][0])}")
-
-    if hand_enabled:
-        hand_result = shared.hand_state_ring.read_latest()
-        if hand_result is None:
-            issues.append("hand feedback is unavailable")
-        else:
-            hand, _timestamp_ns, _sequence = hand_result
-            current_ns = time.monotonic_ns() if now_ns is None else now_ns
-            hand_issue = validate_hand_feedback(
-                connected=bool(hand["connected"][0]),
-                state_valid=bool(hand["state_valid"][0]),
-                source_monotonic_ns=int(hand["source_monotonic_ns"][0]),
-                now_monotonic_ns=current_ns,
-                max_age_s=float(heartbeat_timeouts["hand"]),
-                qpos=hand["qpos"][0],
-            )
-            if hand_issue is not None:
-                issues.append(hand_issue)
-
-    vr_result = shared.vr_ring.read_latest()
-    if vr_result is None:
-        issues.append("VR hand feedback is unavailable")
-    else:
-        vr, _timestamp_ns, _sequence = vr_result
-        current_ns = time.monotonic_ns() if now_ns is None else now_ns
-        vr_ok = (
-            np.all(np.isfinite(vr["wrist_pos"][0]))
-            and np.all(np.isfinite(vr["wrist_quat_wxyz"][0]))
-            and np.all(np.isfinite(vr["landmarks"][0]))
-            and vr_frame_is_fresh(
-                vr,
-                now_monotonic_ns=current_ns,
-                max_age_s=float(runtime.policy.vr_mapping.stale_threshold_s),
-            )
-        )
-        if not vr_ok:
-            issues.append("VR hand feedback is invalid or stale")
-
-    if recording_enabled:
-        camera_result = shared.camera_ring.read_latest()
-        if camera_result is None:
-            issues.append("camera frame is unavailable")
-        else:
-            header = camera_result[0]
-            camera_health = int(header["camera_health"][0])
-            source_ns = int(header["source_monotonic_ns"][0])
-            current_ns = time.monotonic_ns() if now_ns is None else now_ns
-            max_age_ns = int(float(runtime.camera.max_frame_age_s) * 1e9)
-            age_ns = (current_ns - source_ns) if source_ns > 0 else -1
-            health_ok = camera_health == 0
-            ts_ok = 0 < source_ns <= current_ns
-            age_ok = age_ns <= max_age_ns
-            camera_ok = health_ok and ts_ok and age_ok
-            if not camera_ok:
-                try:
-                    health_name = CameraHealth(camera_health).name
-                except ValueError:
-                    health_name = f"INVALID({camera_health})"
-                logger.warning(
-                    "camera preflight detail: health=%s(%d) source_ns=%d now=%d "
-                    "age_ms=%.2f max_age_ms=%.2f [health_ok=%s ts_ok=%s age_ok=%s]",
-                    health_name,
-                    camera_health,
-                    source_ns,
-                    current_ns,
-                    age_ns / 1e6,
-                    max_age_ns / 1e6,
-                    health_ok,
-                    ts_ok,
-                    age_ok,
-                )
-                issues.append("camera frame is unhealthy or stale")
-    return issues
-
-
-def _print_session_header(
-    runtime: ExperimentConfig,
-    *,
-    task_name: str,
-    operator: str,
-    hand_enabled: bool,
-    recording_enabled: bool,
-) -> None:
-    process_labels = ["arm", "vr", "policy"]
-    if recording_enabled:
-        process_labels.extend(("camera", "recorder"))
-    if hand_enabled:
-        process_labels.append("hand")
-    session_meta = []
-    session_meta.append(f"task={task_name}")
-    if operator:
-        session_meta.append(f"operator={operator}")
-    session_meta.extend(
-        (
-            f"acc={float(runtime.arm.max_joint_acceleration_deg_per_s2)}deg/s2",
-            f"speed={float(runtime.arm.max_joint_velocity_deg_per_s)}deg/s",
-            f"hand={'ON' if hand_enabled else 'OFF'}",
-            f"record={'ON' if recording_enabled else 'OFF'}",
-        )
-    )
-    print("=" * 60)
-    print("  DexMani VR Teleop — xArm7 + XHand")
-    print(f"  procs: {' | '.join(process_labels)}")
-    print(f"  {'  '.join(session_meta)}")
-    print("=" * 60)
-
-
 def _build_processes(
     context: Any,
     shared: RuntimeChannels,
@@ -278,7 +84,7 @@ def _build_processes(
     if recording_enabled:
         camera_config = CameraLoopConfig.from_runtime(runtime)
         processes.append(
-            context.Process(name="camera", target=_camera_loop, args=(shared, camera_config, False))
+            context.Process(name="camera", target=_camera_loop, args=(shared, camera_config))
         )
         # Recorder still owns only episode serialization; the entry point
         # selects the already-validated task parent directory.
@@ -299,7 +105,7 @@ def _build_processes(
                     * policy_config.runtime.teleop.control_hz
                 )
             ),
-            writer_queue_size=int(runtime.camera.writer_queue_size),
+            provenance={"workflow": "teleop"},
         )
         processes.append(
             context.Process(name="recorder", target=recorder_io_loop, args=(shared, recorder_config))
@@ -315,287 +121,34 @@ def _build_processes(
     return processes
 
 
-def run_teleop_experiment(
-    runtime: ExperimentConfig,
-    *,
-    task_name: str = DEFAULT_TASK_NAME,
-    operator: str = "",
-    allow_no_hand: bool = False,
-) -> int:
-    """Run one resolved teleoperation experiment lifecycle."""
-    hand_enabled = bool(runtime.policy.hand_enabled)
-    recording_enabled = bool(runtime.policy.recording_enabled)
-    if recording_enabled and not hand_enabled:
-        logger.error(
-            "recording requires hand_enabled; --no-hand is only for arm bring-up/debug"
-        )
-        return 1
-    try:
-        task_name = validate_task_name(task_name)
-    except ValueError as exc:
-        logger.error("invalid task_name: %s", exc)
-        return 1
-    if recording_enabled:
-        try:
-            operator = validate_operator(operator)
-        except ValueError as exc:
-            logger.error("invalid operator: %s", exc)
-            return 1
-    if not hand_enabled and not allow_no_hand:
-        logger.error("disabled hand requires explicit allow_no_hand acknowledgement")
-        return 1
-
+def run_teleop_experiment(runtime, *, task_name=DEFAULT_TASK_NAME, operator="", allow_no_hand=False):
+    task_name, operator = validate_task_name(task_name), validate_operator(operator)
+    if not runtime.policy.hand_enabled and (runtime.policy.recording_enabled or not allow_no_hand):
+        raise ValueError("hand-disabled operation requires explicit unrecorded debug mode")
     repo_root = Path(__file__).resolve().parents[2]
-    vr_transform_path = repo_root / "dexmani_real" / "config" / "vr_transform.json"
-    if recording_enabled:
-        try:
-            _validate_recording_resources(repo_root)
-        except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
-            print(f"Preflight failed: recording resources: {exc}")
-            return 1
-    try:
-        load_vr_transform(vr_transform_path)
-    except (OSError, TypeError, ValueError) as exc:
-        print(f"Preflight failed: invalid VR transform: {exc}")
-        return 1
-    _print_session_header(
-        runtime,
-        task_name=task_name,
-        operator=operator,
-        hand_enabled=hand_enabled,
-        recording_enabled=recording_enabled,
-    )
-
+    load_vr_transform(repo_root / "dexmani_real/config/vr_transform.json")
+    if runtime.policy.recording_enabled:
+        _validate_recording_resources(repo_root)
     ctx = mp.get_context("spawn")
-    shared = RuntimeChannels.create(
-        prefix=f"dexmani_collect_{os.getpid()}",
-        config=RuntimeChannelsConfig.from_runtime(runtime),
-        mp_context=ctx,
-    )
-    procs: list[Any] = []
-    started_procs: list[Any] = []
-    service_process_names = frozenset({"camera", "recorder"}) if recording_enabled else frozenset()
-    shutdown_report: ShutdownReport | None = None
-    shared_closed = False
+    shared = RuntimeChannels.create(prefix=f"dexmani_collect_{os.getpid()}",
+        config=RuntimeChannelsConfig.from_runtime(runtime, camera_requested=runtime.policy.recording_enabled), mp_context=ctx)
+    started = []
     try:
-        procs = _build_processes(
-            ctx,
-            shared,
-            runtime,
-            repo_root=repo_root,
-            task_name=task_name,
-            operator=operator,
-            hand_enabled=hand_enabled,
-            recording_enabled=recording_enabled,
-        )
-        require_transition(shared, SafetyState.DISARMED)
-        timeouts = runtime.safety.readiness_timeouts_s
-        dependency_procs = [
-            process
-            for process in procs
-            if process.name not in {"policy", "vr"}
-        ]
-        policy_procs = [
-            process for process in procs if process.name == "policy"
-        ]
-        vr_procs = [process for process in procs if process.name == "vr"]
-
-        evidence_procs = [process for process in dependency_procs if process.name in service_process_names]
-        dependency_procs = [process for process in dependency_procs if process.name not in service_process_names]
-
-        for process in dependency_procs:
-            process.start()
-            started_procs.append(process)
-        if not wait_subsystem_ready(
-            shared,
-            dependency_procs,
-            timeouts,
-            monitored_processes=started_procs,
-        ):
-            shared.error_state.value = True
-            require_transition(shared, SafetyState.FAULT)
-            shutdown_report = shutdown_processes(
-                shared,
-                started_procs,
-                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-            )
-            shared_closed = shutdown_report.shared_closed
-            return 1
-
-        for process in dependency_procs:
-            logger.debug("%s: ready", process.name)
-
-        for process in policy_procs:
-            process.start()
-        started_procs.extend(policy_procs)
-        if not wait_subsystem_ready(
-            shared,
-            policy_procs,
-            timeouts,
-            monitored_processes=started_procs,
-        ):
-            shared.error_state.value = True
-            require_transition(shared, SafetyState.FAULT)
-            shutdown_report = shutdown_processes(
-                shared,
-                started_procs,
-                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-            )
-            shared_closed = shutdown_report.shared_closed
-            return 1
-        logger.debug("policy: ready")
-
-        if vr_procs:
-
-            for process in vr_procs:
-                process.start()
-            started_procs.extend(vr_procs)
-            vr_timeout = float(timeouts["vr"])
-            print(
-                f"\n  Non-VR subsystems ready — waiting for VR tracking "
-                f"(up to {vr_timeout}s) — "
-                f"put on Quest headset...",
-                flush=True,
-            )
-            if not wait_subsystem_ready(
-                shared,
-                vr_procs,
-                timeouts,
-                monitored_processes=started_procs,
-            ):
-                shared.error_state.value = True
-                require_transition(shared, SafetyState.FAULT)
-                shutdown_report = shutdown_processes(
-                    shared,
-                    started_procs,
-                    graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-                )
-                shared_closed = shutdown_report.shared_closed
-                return 1
-            print(f"  VR connected", flush=True)
-
-        evidence_ready = start_evidence_services(
-            shared, evidence_procs, timeouts, critical_processes=list(started_procs),
-            started_processes=started_procs,
-        )
-        print_health_summary(shared)
-        health_issues = _preflight_health_issues(
-            shared,
-            runtime,
-            hand_enabled=hand_enabled,
-            recording_enabled=False,  # evidence health is supervised separately
-        )
-        if health_issues:
-            for issue in health_issues:
-                logger.error("preflight health failed: %s", issue)
-            shared.error_state.value = True
-            require_transition(shared, SafetyState.FAULT)
-            shutdown_report = shutdown_processes(
-                shared,
-                procs,
-                graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-            )
-            shared_closed = shutdown_report.shared_closed
-            return 1
-
+        processes = _build_processes(ctx, shared, runtime, repo_root=repo_root, task_name=task_name,
+            operator=operator, hand_enabled=runtime.policy.hand_enabled, recording_enabled=runtime.policy.recording_enabled)
+        by_name = {p.name: p for p in processes}
+        sensors = [by_name[name] for name in ("arm", "hand", "vr", "camera", "recorder") if name in by_name]
+        start_processes(shared, sensors, runtime.safety.readiness_timeouts_s, started)
         require_transition(shared, SafetyState.ARMED)
-
-        if not evidence_ready:
-            print("  Recording unavailable; recorded B is blocked, H/Q remain available", flush=True)
-        begin_label = "teleop+record" if recording_enabled else "teleop (no recording)"
-        print(
-            f"\nControl subsystems ready — safety=ARMED({int(SafetyState.ARMED)})\n"
-            f"Controls: B={begin_label}  C=pause/resume  S=stop  D=discard  H=home  Q=quit  ESC=estop\n"
-        )
-
-        # VR heartbeat advances with source events, so its freshness remains a
-        # teleop-loop concern rather than a supervisor liveness signal.
-        heartbeat_timeouts = {
-            process.name: float(runtime.safety.heartbeat_timeouts[process.name])
-            for process in started_procs
-            if process.name != "vr"
-        }
-
-        # Evidence roles: their death or stalled heartbeat fails the session
-        # result without claiming a physical fault or terminating teleop
-        # control (TASKBOOK T4/T5). They are supervised whatever else happens.
-
-
-        start_time = time.monotonic()
-        exit_reason, normal_exit = run_supervisor(
-            shared,
-            started_procs,
-            heartbeat_timeouts_s=heartbeat_timeouts,
-            supervisor_hz=float(runtime.safety.supervisor_hz),
-            service_process_names=service_process_names,
-        )
-
-        shutdown_report = shutdown_processes(
-            shared,
-            started_procs,
-            graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-            disarm_if_clean=normal_exit,
-            service_process_names=service_process_names,
-        )
-        shared_closed = shutdown_report.shared_closed
-        worker_exit_clean = all(
-            item.exitcode == 0 and item.escalation == "graceful"
-            for item in shutdown_report.exits
-        )
-        clean_exit = (
-            normal_exit
-            and worker_exit_clean
-            and shutdown_report.shared_closed
-            and not bool(shared.error_state.value)
-            and not bool(shared.estop_request.value)
-            # Collection failure invalidates the session even after manual recovery.
-            and not bool(shared.session_failed.value)
-            and not bool(shared.evidence_failed.value)
-            and int(shared.safety_state.value) == int(SafetyState.DISARMED)
-        )
-        if normal_exit and not clean_exit:
-            logger.error(
-                "verified session outcome invalidated the clean supervisor exit: shutdown=%s",
-                shutdown_report,
-            )
-
-        runtime_m = (time.monotonic() - start_time) / 60.0
-        safety_name = SafetyState(int(shared.safety_state.value)).name
-        print(f"\n── Session End ──")
-        print(
-            f"  exit_reason={exit_reason}  runtime={runtime_m:.1f}min  safety={safety_name}  "
-            f"supervisor_normal={normal_exit}  clean={clean_exit}"
-        )
-        print("──")
-        return 0 if clean_exit else 1
-
+        start_processes(shared, [by_name["policy"]], runtime.safety.readiness_timeouts_s, started)
+        run_supervisor(shared, started)
+    except KeyboardInterrupt:
+        shared.estop_request.value = True
     except Exception:
-        logger.error("teleoperation experiment failed", exc_info=True)
-        shared.error_state.value = True
-        require_transition(shared, SafetyState.FAULT)
-        return 1
+        shared.workflow_failed.value = True
+        logger.exception("teleop session failed")
     finally:
-        # RecorderIO may still be validating and publishing an episode transaction.
-        if shutdown_report is None:
-            started = [process for process in procs if process.pid is not None]
-            if started:
-                try:
-                    shutdown_report = shutdown_processes(
-                        shared,
-                        started,
-                        graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-                    )
-                    shared_closed = shutdown_report.shared_closed
-                except RuntimeError:
-                    logger.critical(
-                        "child process remains alive; leaving RuntimeChannels linked",
-                        exc_info=True,
-                    )
-                    raise
-            else:
-                try:
-                    shared_closed = bool(shared.close())
-                    if not shared_closed:
-                        logger.error("RuntimeChannels cleanup was incomplete")
-                except Exception:
-                    logger.warning("RuntimeChannels cleanup failed", exc_info=True)
+        report = shutdown_processes_verified(shared, started, disarm_if_clean=True,
+            graceful_timeout_s=runtime.safety.shutdown_timeout_s,
+            service_process_names={"camera", "recorder", "vr", "policy", "pointcloud"})
+    return 1 if shared.error_state.value or shared.workflow_failed.value or not report.shared_closed else 0

@@ -66,7 +66,7 @@ VR teleop 的控制频率由 teleop 配置拥有；learned policy 的动作周�
 - Q：退出；
 - ESC：急停。
 
-C 不等于 stop 或 discard。pause 会撤销当前 motion epoch；resume 从 fresh robot / VR feedback 重新锚定。暂停后继续得到的 raw episode 可以保留用于诊断，但由于时间轴存在明显 gap，不属于 clean training episode，canonical Zarr export 应整条拒绝并报告原因。
+C 不等于 stop 或 discard。pause 会撤销当前 motion epoch；resume 从 fresh robot / VR feedback 重新锚定。发生过 C 暂停的 raw episode 可以保留用于诊断；无论暂停时长、是否恢复，都不属于 clean training episode，canonical Zarr export 会整条拒绝并报告原因。
 
 录制模式下 camera 与 RecorderIO 是 required resources。只有显式 --no-record 才允许不录制的 teleop。camera / recorder 中途失败时，不应静默降级为无录制 teleop，也不应把残缺数据伪装成完整 demonstration。
 
@@ -83,9 +83,7 @@ C 不等于 stop 或 discard。pause 会撤销当前 motion epoch；resume 从 f
 
 run_id 是 motion lifecycle epoch，用于阻止 pause、stop、timeout 或慢 inference 返回后的旧动作重新获得执行权限。
 
-不使用 command_id / actuator-adoption ledger / partial-adoption accounting。
-
-记录的 action 是该 control step 发布到 robot execution boundary 的 high-level absolute executable target，不是 SDK adoption 或物理到达证明。
+记录的 action 是该 control step 发布到 robot execution boundary 的 high-level absolute executable target，不代表 SDK 消费或物理到达。
 
 ### xArm
 
@@ -108,7 +106,7 @@ normal streaming target：
 - worker mechanical hard-limit fence；
 - 直接发送 absolute XHand SDK position target。
 
-不做 producer hand delta clip，不做 worker software slew，也不维护 adopted/reached command identity。
+XHand 接收绝对目标，运动响应由设备控制器决定。
 
 ### Collision / workspace
 
@@ -129,7 +127,7 @@ arm、hand、camera、VR、point cloud 都是异步 producer。
 - snapshot 组装完成后记录 observation timestamp；
 - teleop controller 与 raw recorder 复用同一份 snapshot。
 
-不要求各 modality timestamp 相等，也不使用 generic cross-modal skew gate。
+各模态按自身时间戳检查新鲜度。
 
 policy temporal history由 control-row deque 维护，不在 inference 时重新从 sensor rings 回溯构造历史。warm-up 使用 edge padding；pause / 大 gap 后清空并重新开始 history。
 
@@ -141,7 +139,7 @@ whole sample acquisition failure时 producer不发布一份带 generic invalid f
 
 Raw episode 是实验 source of truth。
 
-新的目标 schema 为 raw v32，保存研究有意义的真实信息：
+当前 schema 为 raw v32，保存研究有意义的真实信息：
 
 - arm qpos / qvel / effort；
 - hand qpos / current；
@@ -154,7 +152,7 @@ Raw episode 是实验 source of truth。
 - 必要的 controller intent，例如 pre-IK EE intent；
 - 小型 frame-status 诊断。
 
-Raw 不保存 command adoption evidence、command IDs、generic state_valid、observation_valid 或 normal-runtime collision proof。
+Raw 保存实验事实；动作不承诺设备已消费或已到达。
 
 Point cloud不作为 demonstration raw source重复保存；由 RGB-D + calibration 离线生成。
 
@@ -171,7 +169,7 @@ Zarr 是可重建的 training cache，不是第二份 runtime audit database。
 
 Zarr固定全量保存 learning-relevant dynamic modalities，使 dexmani_policy 再通过 sensor_modalities 选择实际模型输入。
 
-目标 dynamic arrays 包括：
+canonical Zarr v14 的 dynamic arrays 包括：
 
 - joint_state；
 - arm_qvel；
@@ -225,7 +223,7 @@ Exporter 不修复 demonstration。
 - 明显 pause / missing-control timing gap；
 - 任意 offline pointcloud / FK / fingertip transform failure。
 
-允许正常 OS scheduling jitter；不要求每个 control interval 精确等于 nominal dt。
+允许正常 OS scheduling jitter；不要求每个 control interval 精确等于 nominal dt。相邻 observation 或 action 的时间间隔超过 2 个标称控制周期时，整条 episode 拒收；发生过 C 暂停则不论间隔长短都拒收。
 
 批量 export 可以接受正常 episodes并整条跳过异常 episodes，但每一条 rejection 必须有明确 reason 和最终 summary，不能静默处理。
 
@@ -246,7 +244,7 @@ return_home 是唯一刻意保守的 motion path。
 - measured final convergence；
 - restore Mode 6。
 
-HOME 成功以 measured qpos / qvel convergence 为准，不使用 SDK adoption/reached command identity。
+xArm HOME 成功以 measured qpos / qvel convergence 为准。XHand HOME 在 owning worker 的 SDK 发送成功后完成，不等待实测收敛；回家路径使用配置的手部 home 几何，commissioning 必须验证实际手部运动与随后的机械臂路径。
 
 ## Policy rollout
 

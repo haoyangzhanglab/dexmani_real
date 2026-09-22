@@ -5,7 +5,6 @@ from __future__ import annotations
 import dataclasses
 import json
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -16,12 +15,7 @@ from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 
 
 def canonical_json(value: Any) -> str:
-    """Serialize one persisted-contract value for byte-exact comparisons.
-
-    Producers (processing attrs) and consumers (deployment expected semantics)
-    must use this one serializer so an exact string compare proves numeric
-    config identity; NaN/Infinity are contract violations, never serialized.
-    """
+    """Serialize static metadata deterministically; reject NaN and infinity."""
     return json.dumps(
         value,
         ensure_ascii=False,
@@ -47,7 +41,7 @@ class ProcessingConfig:
     """Point-cloud, fingertip and table transforms; output is always multimodal.
 
     Every included episode retains joint targets, RGB-D, geometry, contact,
-    tactile validity, FK and source timing.
+    arm velocity/effort, hand current and derived geometry.
     """
 
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
@@ -120,48 +114,17 @@ class EpisodeAnnotation:
             validate_task_name(self.task_name)
 
 
-@dataclass(frozen=True)
-class EpisodeDecision:
-    """One whole-episode admission result; accepted rows are never selected."""
-
-    source_path: Path
-    source_frames: int
-    rejected_reason: str | None = None
-
-    @property
-    def accepted(self) -> bool:
-        return self.rejected_reason is None and self.source_frames > 0
-
-    @property
-    def exported_frames(self) -> int:
-        return self.source_frames if self.accepted else 0
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "source_episode": self.source_path.name,
-            "accepted": self.accepted,
-            "rejected_reason": self.rejected_reason,
-            "source_frames": self.source_frames,
-            "exported_frames": self.exported_frames,
-        }
-
-
 _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "joint_state": ((19,), np.dtype(np.float32)),
+    "arm_qvel": ((7,), np.dtype(np.float32)),
+    "arm_effort": ((7,), np.dtype(np.float32)),
+    "hand_current": ((12,), np.dtype(np.float32)),
     "action": ((19,), np.dtype(np.float32)),
     "action_ee": ((21,), np.dtype(np.float32)),
     "contact_force": ((5, 3), np.dtype(np.float32)),
-    "contact_force_valid": ((), np.dtype(np.bool_)),
     "tactile_force": ((5, 120, 3), np.dtype(np.float32)),
-    "tactile_force_valid": ((), np.dtype(np.bool_)),
     "fingertip_points": ((5, 3), np.dtype(np.float32)),
     "eef_pose": ((9,), np.dtype(np.float32)),
-    "camera_intrinsic": ((9,), np.dtype(np.float32)),
-    "camera_extrinsic": ((4, 4), np.dtype(np.float32)),
-    "observation_anchor_monotonic_ns": ((), np.dtype(np.uint64)),
-    "arm_source_monotonic_ns": ((), np.dtype(np.uint64)),
-    "hand_source_monotonic_ns": ((), np.dtype(np.uint64)),
-    "camera_source_monotonic_ns": ((), np.dtype(np.uint64)),
 }
 
 

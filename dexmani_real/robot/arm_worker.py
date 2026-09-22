@@ -1,378 +1,113 @@
-"""Arm worker — Mode 6 joint online trajectory planning for xArm7.
-
-``arm_loop(shared, config)`` is the mp.Process entry point (RuntimeChannels only). It
-connects and enters servo Mode 6 once at startup, then runs a fixed-rate
-loop: admit at most one command (HOME or servo), observe, publish.
-
-Mode 6 is held for the whole runtime (re-entered only by the HOME path);
-DISARMED/ARMED/RUNNING are software lifecycle states and never switch the
-controller mode.  DISARMED means "publish no servo commands" — the arm holds
-its position (software disarm).
-
-Error handling is fail-fast: any hardware/SDK failure raises to the single
-top-level handler, which latches ``error_state``; cleanup always does a
-best-effort stop + disconnect.  No retry counters, no last-known fallbacks,
-no error-classification framework.
-
-The worker validates only the HARD boundary (finite targets inside physical
-joint limits) at the SDK fence; the soft command-jump bound is owned once by
-the producers through ``robot/projection.py`` and is never re-rejected here.
-"""
-
-from __future__ import annotations
-
-import time
-from dataclasses import dataclass, field
-from functools import partial
+"""xArm SDK owner: Mode 6 absolute streaming and dedicated Mode 0 home."""
 from queue import Empty
-from typing import Any
+import time
 
 import numpy as np
 
-from dexmani_real.config.defaults import ArmParams
-from dexmani_real.ipc.channels import new_frame
-from dexmani_real.robot.commands import read_robot_command, RobotCommand
 from dexmani_real.ipc.schema import ARM_STATE_DTYPE
+from dexmani_real.robot.commands import read_robot_command
 from dexmani_real.robot.command_validation import check_worker_arm_target
 from dexmani_real.robot.drivers.xarm7 import HomeAborted, XArm7, describe_controller_error
-from dexmani_real.runtime.safety import (
-    SafetyState,
-    StopRequest,
-    command_may_cross_sdk,
-    read_motion_permit,
-)
+from dexmani_real.robot.home import HomeResult
+from dexmani_real.robot.model import XARM7_HARD_LOWER, XARM7_HARD_UPPER
+from dexmani_real.runtime.safety import SafetyState, command_may_cross_sdk
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
 logger = get_logger(__name__)
 
 
-@dataclass(frozen=True)
-class _CmdState:
-    """Metadata of the last command accepted by the SDK."""
-
-    accepted_monotonic_ns: int
-    run_id: int = 0
-    command_id: int = 0
-
-    @classmethod
-    def idle(cls) -> "_CmdState":
-        return cls(0, 0, 0)
-
-
-@dataclass
-class _LoopState:
-    """Loop-carried state shared by the per-iteration functions.
-
-    Kept minimal by design: no error counters or health trackers — hardware
-    failures fail fast at the worker top level.
-    """
-
-    cfg: ArmParams
-    arm: XArm7
-    frame: Any
-    last_target: np.ndarray
-    last_cmd: _CmdState = field(default_factory=_CmdState.idle)
-    last_state_source_ns: int = field(default_factory=time.monotonic_ns)
-
-
-def _home_abort_reason(shared: Any, run_id: int) -> str | None:
-    """Return why an in-progress HOME must stop, or ``None`` to continue."""
-    if not shared.is_running.value:
-        return "shutdown requested"
-    if shared.estop_request.value:
-        return "e-stop requested"
-    if shared.error_state.value:
-        return "sticky error_state set during homing"
-    if int(shared.safety_state.value) == int(SafetyState.FAULT):
-        return "FAULT during homing"
-    if int(shared.safety_state.value) != int(SafetyState.ARMED):
-        return "safety state is not ARMED during homing"
-    if int(shared.run_id.value) != run_id:
-        return "run_id changed during homing"
-    return None
-
-
-def _mode6_restore_allowed(shared: Any) -> bool:
-    """Whether a cleanly-aborted HOME may restore servo Mode 6.
-
-    Mode 6 is held for the whole runtime (software disarm), so it is restored
-    after any non-faulted interruption — including DISARMED, where the arm
-    simply holds position.  Skipped on a latched error, an active e-stop,
-    FAULT, or an already-stopped runtime.
-    """
-    return (
-        bool(shared.is_running.value)
-        and int(shared.safety_state.value) != int(SafetyState.FAULT)
-        and not shared.error_state.value
-        and not shared.estop_request.value
-    )
-
-
-def _write_arm_frame(
-    shared: Any,
-    frame: Any,
-    *,
-    qpos: np.ndarray,
-    qvel: np.ndarray,
-    tau: np.ndarray,
-    error_code: int,
-    tracking_err: float,
-    connected: bool = True,
-    cmd: _CmdState,
-    source_ns: int,
-    state_valid: bool,
-) -> None:
-    """Publish one fully-populated ARM_STATE frame to ``arm_state_ring``."""
-    frame["qpos"][0] = qpos
-    frame["qvel"][0] = qvel
-    frame["tau"][0] = tau
-    frame["error_code"][0] = int(error_code)
-    frame["connected"][0] = 1 if connected else 0
-    frame["tracking_err"][0] = tracking_err
-    frame["last_adopted_monotonic_ns"][0] = cmd.accepted_monotonic_ns
-    frame["last_adopted_run_id"][0] = cmd.run_id
-    frame["last_adopted_command_id"][0] = cmd.command_id
-    frame["source_monotonic_ns"][0] = source_ns
-    frame["publish_monotonic_ns"][0] = time.monotonic_ns()
-    frame["state_valid"][0] = int(state_valid)
+def _publish_feedback(shared, qpos, qvel, effort):
+    if any(np.shape(x) != (7,) or not np.isfinite(x).all() for x in (qpos, qvel, effort)):
+        raise RuntimeError("unusable arm feedback")
+    frame = np.zeros(1, dtype=ARM_STATE_DTYPE)
+    frame["qpos"], frame["qvel"], frame["effort"] = qpos, qvel, effort
+    frame["timestamp_ns"] = time.monotonic_ns()
     shared.arm_state_ring.write(frame)
 
 
-def _startup(shared: Any, arm: XArm7, cfg: ArmParams) -> _LoopState:
-    """Connect, enter Mode 6 once, publish the initial frame, signal ready.
-
-    Returns a fully-initialized ``_LoopState``.  Any failure raises to the
-    worker's top-level handler (which latches ``error_state``); cleanup does
-    the best-effort stop + disconnect.
-    """
-    heartbeat = lambda: shared.set_heartbeat("arm", time.monotonic())
-    logger.debug("arm_loop: LOADING")
-    arm.connect(on_poll=heartbeat)
-    qpos, qvel, tau = arm.read()
-    st = _LoopState(
-        cfg=cfg,
-        arm=arm,
-        frame=new_frame(ARM_STATE_DTYPE),
-        last_target=qpos.copy(),
-    )
-    # Publish the initial frame before signaling ready.
-    _write_arm_frame(
-        shared,
-        st.frame,
-        qpos=qpos,
-        qvel=qvel,
-        tau=tau,
-        error_code=0,
-        tracking_err=0.0,
-        cmd=st.last_cmd,
-        source_ns=st.last_state_source_ns,
-        state_valid=True,
-    )
-    shared.set_heartbeat("arm", time.monotonic())  # heartbeat before ready
-    shared.set_ready("arm")
-    logger.debug("arm_loop: READY")
-    logger.info(
-        "arm_loop: ready and DISARMED (Mode 6 held, software disarm; ip=%s, hz=%.0f)",
-        cfg.ip,
-        cfg.loop_hz,
-    )
-    return st
-
-
-def _publish_homing_feedback(
-    st: _LoopState,
-    shared: Any,
-    qpos: np.ndarray,
-    qvel: np.ndarray,
-    tau: np.ndarray,
-    target: np.ndarray,
-) -> None:
-    """Publish a homing-milestone frame."""
-    st.last_state_source_ns = time.monotonic_ns()
-    error_code = st.arm.error_code
-    _write_arm_frame(
-        shared,
-        st.frame,
-        qpos=qpos,
-        qvel=qvel,
-        tau=tau,
-        error_code=error_code,
-        tracking_err=float(np.max(np.abs(qpos - target))),
-        cmd=st.last_cmd,
-        source_ns=st.last_state_source_ns,
-        state_valid=True,
-    )
-
-
-def _handle_home(st: _LoopState, shared: Any, request: tuple) -> None:
-    """Run planned homing for a queued ``(waypoints, final_qpos, run_id, expires_ns)``.
-
-    Blocks the worker: the arm drives the collision-validated milestones in
-    Mode 0, then restores Mode 6.  A stale request (its run_id advanced
-    after planning) is discarded.  A clean runtime interruption (e-stop,
-    shutdown, DISARM, run_id change) stops the controller and restores
-    Mode 6 without faulting; any other failure raises into the top-level
-    handler, which latches ``error_state``.
-    """
+def _home(shared, arm, request):
     waypoints, final_qpos, run_id, expires_ns = request
-    if int(shared.run_id.value) != run_id:
-        logger.warning("arm_loop: discarding stale-run_id HOME request")
-        return
-    if not command_may_cross_sdk(
-        shared, run_id=run_id, required_safety_state=SafetyState.ARMED
-    ):
-        return
-    if time.monotonic_ns() >= expires_ns or shared.pending_record_command_id.value:
-        return
-    logger.info(
-        "arm_loop: HOME — planned homing (%d validated milestones)",
-        len(waypoints),
-    )
-    heartbeat = lambda: shared.set_heartbeat("arm", time.monotonic())
+    def aborted():
+        return None if command_may_cross_sdk(shared, run_id=run_id,
+            required_safety_state=SafetyState.ARMED) else "home authority revoked"
+    if aborted() or time.monotonic_ns() >= expires_ns:
+        shared.arm_home_result_q.put((run_id, HomeResult(False, "stale home request")))
+        return False
+    mode_ready = True
     try:
-        st.arm.home(
-            waypoints,
-            final_qpos,
-            on_poll=heartbeat,
-            feedback_callback=partial(_publish_homing_feedback, st, shared),
-            abort_check=lambda: _home_abort_reason(shared, run_id),
-        )
+        arm.home(waypoints, final_qpos, abort_check=aborted,
+                 feedback_callback=lambda q, v, e, target: _publish_feedback(shared, q, v, e))
     except HomeAborted as exc:
-        logger.warning("arm_loop: HOME aborted — %s", exc)
-        st.arm.stop()
-        if _mode6_restore_allowed(shared):
-            st.arm.enter_mode6(on_poll=heartbeat)
-        return
-    st.last_target = np.asarray(final_qpos, dtype=np.float64).copy()
-    logger.info("arm_loop: HOME complete")
-    # Publish only after the driver's settle and mode-restoration lifecycle.
-    # S/Q and run_id changes must win over a late HOME completion.
-    with shared.motion_lock:
-        if (
-            _home_abort_reason(shared, run_id) is None
-            and not shared.quit_requested.value
-            and int(shared.stop_request.value) == int(StopRequest.NONE)
-        ):
-            shared.arm_home_completed_run_id.value = int(run_id)
+        arm.stop()
+        mode_ready = bool(shared.is_running.value and not shared.estop_request.value and not shared.error_state.value)
+        if mode_ready:
+            arm.enter_mode6()
+        result = HomeResult(False, str(exc))
+    else:
+        result = HomeResult(aborted() is None, aborted() or "")
+    shared.arm_home_result_q.put((run_id, result))
+    return mode_ready
 
 
-def _handle_servo_command(st: _LoopState, shared: Any, command: RobotCommand) -> None:
-    target = command.arm_qpos
-    issue = check_worker_arm_target(
-        target, joint_limit_lower_rad=np.asarray(st.cfg.joint_limit_lower),
-        joint_limit_upper_rad=np.asarray(st.cfg.joint_limit_upper),
-    )
-    if not command_may_cross_sdk(shared, run_id=command.run_id):
-        return
-    if issue is not None:
-        raise RuntimeError(f"unsafe arm command {command.command_id}: {issue}")
-    code = st.arm.servo(target)
-    if code != 0:
-        controller_error = st.arm.read_live_error_code()
-        raise RuntimeError(
-            f"arm SDK rejected command {command.command_id}: code={code}, "
-            f"controller={controller_error} {describe_controller_error(controller_error)}"
-        )
-    # A returned old-run acceptance is a historical physical fact.
-    st.last_cmd = _CmdState(time.monotonic_ns(), command.run_id, command.command_id)
-    st.last_target = target.copy()
-
-
-def _consume_one_arm_command(st: _LoopState, shared: Any, permit_run_id: int) -> None:
-    command = read_robot_command(shared)
-    if (command is None or command.run_id != permit_run_id or command.arm_qpos is None
-            or (st.last_cmd.run_id, st.last_cmd.command_id) == (command.run_id, command.command_id)):
-        return
-    _handle_servo_command(st, shared, command)
-
-
-def _step(st: _LoopState, shared: Any, limiter: LoopRate) -> bool:
-    """Run one iteration; return True when the worker must exit.
-
-    Apply at most one command per tick — a queued HOME request takes priority
-    over the next new servo endpoint — then observe + publish.  Motion is software-disarmed:
-    outside ARMED/RUNNING (or on ``error_state``) nothing is consumed, while
-    observation keeps publishing every tick.
-    """
-    permit = read_motion_permit(shared)
-    if permit.allows_motion and not shared.error_state.value:
-        try:
-            home_request = shared.arm_home_q.get(timeout=0.0)
-        except Empty:
-            home_request = None
-        if home_request is not None:
-            _handle_home(st, shared, home_request)
-            # HOME is intentionally blocking; begin a fresh worker schedule
-            # instead of reporting its Mode 0/6 transition as loop overrun.
-            limiter.reset()
-        else:
-            _consume_one_arm_command(st, shared, permit.run_id)
-    return _observe_and_publish(st, shared)
-
-
-def _observe_and_publish(st: _LoopState, shared: Any) -> bool:
-    """Read state, check the controller error, publish.
-
-    Returns True when the worker must exit; failures raise instead.  A failed
-    state read or a non-zero controller error raises to the worker's single
-    top-level handler.
-    """
-    qpos, qvel, tau = st.arm.read()
-    st.last_state_source_ns = time.monotonic_ns()
-
-    tracking_err = float(np.max(np.abs(qpos - st.last_target)))
-
-    error_code = st.arm.error_code
-    if error_code != 0:
-        raise RuntimeError(f"controller error C{error_code}")
-
-    _write_arm_frame(
-        shared,
-        st.frame,
-        qpos=qpos,
-        qvel=qvel,
-        tau=tau,
-        error_code=error_code,
-        tracking_err=tracking_err,
-        cmd=st.last_cmd,
-        source_ns=st.last_state_source_ns,
-        state_valid=True,
-    )
-    return False
-
-
-def arm_loop(shared: Any, config: ArmParams) -> None:
-    """Arm process entry point — applies coupled servo endpoints via Mode 6.
-
-    mp.Process target communicating exclusively through RuntimeChannels.  The
-    single fail-fast boundary: any SDK/hardware failure raises into the
-    top-level handler below, which latches ``error_state``; cleanup always
-    does a best-effort stop + disconnect.
-    """
-    cfg = config
-    arm = XArm7(cfg)
-    st: _LoopState | None = None
+def arm_loop(shared, config):
+    arm = XArm7(config)
+    last_sequence = 0
+    streaming_epoch = None
+    stopped = False
     try:
-        st = _startup(shared, arm, cfg)
-        limiter = LoopRate(cfg.loop_hz, label="arm")
+        arm.connect()
+        _publish_feedback(shared, *arm.read())
+        shared.arm_ready.set()
+        rate = LoopRate(config.loop_hz, label="arm")
         while shared.is_running.value:
-            shared.set_heartbeat("arm", time.monotonic())
             if shared.estop_request.value:
-                # Best-effort: cleanup enforces the final state-4 stop.
                 arm.emergency_stop()
                 break
-            if _step(st, shared, limiter):
-                break
-            limiter.wait()
+            if streaming_epoch is not None and not command_may_cross_sdk(shared, run_id=streaming_epoch):
+                arm.stop()
+                stopped = True
+                streaming_epoch = None
+            try:
+                home = shared.arm_home_q.get_nowait()
+            except Empty:
+                home = None
+            if home is not None:
+                stopped = not _home(shared, arm, home)
+                rate.reset()
+            else:
+                latest = read_robot_command(shared)
+                if latest is not None:
+                    command, sequence = latest
+                    if sequence != last_sequence:
+                        last_sequence = sequence
+                        if command.arm_qpos is not None:
+                            issue = check_worker_arm_target(command.arm_qpos,
+                                joint_limit_lower_rad=np.asarray(XARM7_HARD_LOWER),
+                                joint_limit_upper_rad=np.asarray(XARM7_HARD_UPPER))
+                            if command_may_cross_sdk(shared, run_id=command.run_id):
+                                if issue:
+                                    raise RuntimeError(f"unsafe arm target: {issue}")
+                                if stopped:
+                                    arm.enter_mode6()
+                                    stopped = False
+                                # Mode changes can block; recheck the lifecycle at actual send.
+                                if not command_may_cross_sdk(shared, run_id=command.run_id):
+                                    continue
+                                code = arm.servo(command.arm_qpos)
+                                streaming_epoch = command.run_id
+                                if code != 0:
+                                    error = arm.read_live_error_code()
+                                    raise RuntimeError(f"arm SDK send failed: {code}; {describe_controller_error(error)}")
+            q, v, effort = arm.read()
+            if arm.error_code:
+                raise RuntimeError(f"arm controller error: {arm.error_code}")
+            _publish_feedback(shared, q, v, effort)
+            rate.wait()
     except Exception:
         shared.error_state.value = True
-        logger.exception("arm_loop: worker failed")
+        logger.exception("arm worker failed")
+        raise
     finally:
-        # Cleanup requests a best-effort state-4 stop and disconnect; firmware is the backstop.
         arm.stop()
         arm.close()
-        if st is None:
-            logger.info("arm_loop: exited before loop startup")
-        else:
-            logger.info("arm_loop: exited")

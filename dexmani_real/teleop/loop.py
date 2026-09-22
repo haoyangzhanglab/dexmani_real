@@ -1,220 +1,25 @@
-"""VR teleoperation control loop over causal shared-memory snapshots.
-
-This module builds policy-process resources, waits for readiness, schedules
-operator control and causal-grid work, and performs bounded cleanup.
-The loop directly owns operator transitions, pause boundaries, recording, and
-grid cadence; ``teleop/control_loop/grid.py`` owns algorithm state and one causal tick. Hardware SDKs stay
-inside the arm, hand, VR, camera, and RecorderIO workers.
-"""
-
-from __future__ import annotations
-
-import gc
+"""Operator-supervised teleop with one current observation per real control step."""
+from pathlib import Path
 import signal
 import time
-from enum import Enum, auto
-from pathlib import Path
-
 import numpy as np
 
-from dexmani_real.robot.hand_homing import initialize_hand_home
-from dexmani_real.robot.commands import SafetyGate, planner_action_safety_gate
-from dexmani_real.ipc.causal import (
-    read_arm_state_causal,
-    read_camera_frame_causal,
-    read_hand_state_causal,
-    read_vr_frame_causal,
-    vr_frame_is_fresh,
-)
-from dexmani_real.ipc.channels import RuntimeChannels
-from dexmani_real.planning import (
-    MotionPlanningConfig,
-    OnlineIKConfig,
-    Pose,
-    XArm7MotionPlanner,
-    XArm7PlannerConfig,
-)
+from dexmani_real.planning import OnlineIKConfig, XArm7MotionPlanner
+from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
+from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.recording.client import RecorderClient
-from dexmani_real.robot.model import (
-    XARM7_XHAND_COLLISION_URDF_PATH,
-    XARM7_XHAND_SRDF_PATH,
-)
+from dexmani_real.runtime.observation import read_observation
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
-from dexmani_real.runtime.safety import (
-    SafetyState,
-    RunEndReason,
-    invalidate_coupled_commands,
-    revoke_motion_if_run_id,
-    revoke_motion,
-    transition,
-)
+from dexmani_real.runtime.safety import begin_motion, revoke_motion
 from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.config import TeleopConfig
-from dexmani_real.teleop.control_loop.camera_freshness import CameraFreshnessTracker
-from dexmani_real.teleop.control_loop.grid import (
-    TeleopController,
-    TeleopGridResources,
-    _TeleopCommandLimits,
-    run_control_grid_tick,
-)
-from dexmani_real.teleop.control_loop.hand_control import (
-    hand_ramp_frame_count,
-    seed_hand_retargeter,
-)
+from dexmani_real.teleop.control_loop.grid import TeleopController, run_control_grid_tick
 from dexmani_real.teleop.control_loop.vr_mapping import VRWristMapper
-from dexmani_real.teleop.episode_samples import stop_recording
-from dexmani_real.teleop.homing import do_configured_teleop_home
-from dexmani_real.teleop.retargeting.retargeter import (
-    DexPilotHandRetargeter,
-    TAGHandRetargeter,
-)
+from dexmani_real.teleop.retargeting.retargeter import TAGHandRetargeter, DexPilotHandRetargeter
 from dexmani_real.teleop.vr_transform import load_vr_transform
-from dexmani_real.utils.feedback import validate_hand_feedback
-from dexmani_real.utils.log import ThrottledWarner, get_logger
-from dexmani_real.utils.rate import LoopRate
+from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-_END_AUDIO_GRACE_S = 2.0
-_NS_PER_SECOND = 1_000_000_000
-_VALIDATION_WARN_INTERVAL_S = 2.0
-_ARM_FEEDBACK_WARN_INTERVAL_S = 3.0
-
-
-class QuitRecordingDecision(Enum):
-    SAVE = auto()
-    DISCARD = auto()
-    SAVE_AND_HOME = auto()
-    ESTOP = auto()
-    SHUTDOWN = auto()
-    TIMEOUT = auto()
-
-
-def await_quit_recording_decision(
-    shared: RuntimeChannels,
-    keyboard: KeyboardInput,
-    *,
-    timeout_s: float,
-) -> QuitRecordingDecision:
-    """Wait for the bounded save/discard decision while keeping policy health live."""
-    deadline_s = time.perf_counter() + timeout_s
-    while time.perf_counter() < deadline_s:
-        if shared.estop_request.value:
-            return QuitRecordingDecision.ESTOP
-        shared.set_heartbeat("policy", time.monotonic())
-        for signal in keyboard.poll(timeout=0.1):
-            if signal is OperatorCommand.STOP:
-                return QuitRecordingDecision.SAVE
-            if signal is OperatorCommand.DISCARD:
-                return QuitRecordingDecision.DISCARD
-            if signal is OperatorCommand.HOME:
-                return QuitRecordingDecision.SAVE_AND_HOME
-            if signal is OperatorCommand.EMERGENCY_STOP:
-                shared.estop_request.value = True
-                return QuitRecordingDecision.ESTOP
-        if shared.estop_request.value:
-            return QuitRecordingDecision.ESTOP
-        if not shared.is_running.value:
-            return QuitRecordingDecision.SHUTDOWN
-    return QuitRecordingDecision.TIMEOUT
-
-
-def _build_safety_gate(config: TeleopConfig, planner: XArm7MotionPlanner) -> SafetyGate:
-    """Build the teleoperation safety gate from control-domain limits."""
-    return planner_action_safety_gate(
-        planner=planner,
-        arm_joint_lower_rad=tuple(config.runtime.arm.joint_limit_lower),
-        arm_joint_upper_rad=tuple(config.runtime.arm.joint_limit_upper),
-        hand_joint_lower_rad=tuple(config.runtime.hand.qpos_min_rad),
-        hand_joint_upper_rad=tuple(config.runtime.hand.qpos_max_rad),
-    )
-
-
-def _policy_exit_fault(
-    *,
-    error_state: bool,
-    estop_request: bool,
-    safety_fault: bool,
-) -> str | None:
-    """Classify terminal policy state without losing an e-stop or sticky fault."""
-    if estop_request:
-        return "policy exited after e-stop request"
-    if error_state or safety_fault:
-        return "policy exited with sticky fault"
-    return None
-
-
-def _start_keyboard(shared: RuntimeChannels) -> KeyboardInput | None:
-    """Start the required operator input boundary, failing closed on startup errors."""
-    keyboard = KeyboardInput(
-        estop_callback=lambda: setattr(shared.estop_request, "value", True)
-    )
-    try:
-        keyboard.start()
-    except Exception:
-        logger.error("teleop_loop: keyboard startup failed", exc_info=True)
-        shared.error_state.value = True
-        return None
-    return keyboard
-
-
-def _load_control_resources(
-    shared: RuntimeChannels,
-    config: TeleopConfig,
-    *,
-    recording_enabled: bool,
-) -> tuple[
-    XArm7MotionPlanner,
-    VRWristMapper,
-    SafetyGate,
-    RecorderClient | None,
-]:
-    """Load the non-hardware resources owned by one teleoperation policy process."""
-    planner = XArm7MotionPlanner(
-        XArm7PlannerConfig(
-            urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
-            srdf_path=str(XARM7_XHAND_SRDF_PATH),
-            base_pose_world=Pose(
-                p=np.array([0.0, 0.0, 0.0]),
-                q=np.array([1.0, 0.0, 0.0, 0.0]),
-            ),
-            workspace_bounds=config.runtime.policy.workspace.as_array(),
-        ),
-        planning_profile=MotionPlanningConfig(),
-        teleop_profile=OnlineIKConfig(
-            max_pose_error_pos_m=config.runtime.policy.ik_max_pose_error_pos_m,
-            max_pose_error_rot_rad=config.runtime.policy.ik_max_pose_error_rot_rad,
-            nullspace_step_size_deg=(
-                config.runtime.policy.ik_nullspace_step_rate_deg_s
-                / config.runtime.teleop.control_hz
-            ),
-        ),
-        hand_dof=True,
-        static_boxes=config.runtime.environment.static_boxes,
-        # Table contact is intentional during fine teleoperation. Homing still
-        # applies its independent table-clearance validation.
-        table=None,
-    )
-
-    vr_config_path = Path(__file__).resolve().parents[2] / config.vr_transform_path
-    vr_calibration = load_vr_transform(vr_config_path)
-    vr_to_robot_rot = vr_calibration.transform
-    logger.info("VR transform loaded: theta=%.6g°", vr_calibration.theta_deg)
-    arm_mapper = VRWristMapper(
-        pos_scale=config.runtime.policy.vr_mapping.pos_scale,
-        rot_scale=config.runtime.policy.vr_mapping.rot_scale,
-        vr_to_robot_rot=vr_to_robot_rot,
-        max_delta_rot_rad=config.runtime.policy.vr_mapping.max_delta_rot_rad,
-        base_to_world_rot=np.eye(3, dtype=np.float64),
-    )
-    return (
-        planner,
-        arm_mapper,
-        _build_safety_gate(config, planner),
-        RecorderClient(shared) if recording_enabled else None,
-    )
-
-
 def _build_hand_retargeter(config: TeleopConfig):
     """Build the configured hand retargeter without owning runtime state."""
     if not config.runtime.policy.hand_enabled:
@@ -232,817 +37,184 @@ def _build_hand_retargeter(config: TeleopConfig):
     )
 
 
-def _transition_or_fault(
-    shared: RuntimeChannels,
-    new_state: SafetyState,
-    reason: str,
-) -> bool:
-    """Apply one safety transition and make any rejection a sticky fault."""
-    if transition(shared, new_state):
-        return True
-    logger.error(
-        "teleop_loop: safety transition to %s failed during %s",
-        new_state.name,
-        reason,
-    )
-    shared.error_state.value = True
-    return False
-
-
-def _begin_feedback_issue(
-    cfg: TeleopConfig,
-    vr_frame: dict | None,
-    hand_state: np.ndarray | None,
-    *,
-    now_monotonic_ns: int,
-) -> str | None:
-    """Return the first data-admission issue before beginning a session.
-
-    Dense tactile is not a recording-admission gate: an invalid or missing dense
-    payload is recorded as an invalid mask and never blocks the demo.
-    """
-    if not vr_frame_is_fresh(
-        vr_frame,
-        now_monotonic_ns=now_monotonic_ns,
-        max_age_s=cfg.runtime.policy.vr_mapping.stale_threshold_s,
-    ):
-        return "VR hand feedback is unavailable or stale"
-    if not cfg.runtime.policy.hand_enabled:
-        return None
-    if hand_state is None:
-        return "hand feedback unavailable"
-    return validate_hand_feedback(
-        connected=bool(hand_state["connected"][0]),
-        state_valid=bool(hand_state["state_valid"][0]),
-        source_monotonic_ns=int(hand_state["source_monotonic_ns"][0]),
-        now_monotonic_ns=time.monotonic_ns(),
-        max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
-        qpos=np.asarray(hand_state["qpos"][0]),
-    )
-
-
-def teleop_loop(shared: RuntimeChannels, config: TeleopConfig) -> None:
-    """Teleoperation process entry point used by ``collect_teleop.py``.
-
-    Reads from rings (vr, arm_state, hand_state, camera), writes actions
-    to the coherent actuator command ring, owns recording.
-    """
-    cfg = config
-    logger.debug("teleop_loop: LOADING")
-    command_limits = _TeleopCommandLimits.from_config(cfg)
-    recording_enabled = bool(cfg.runtime.policy.recording_enabled)
-    try:
-        planner, arm_mapper, safety_gate, recorder = _load_control_resources(
-            shared, cfg, recording_enabled=recording_enabled
-        )
-    except Exception:
-        logger.error("teleop_loop: init failed", exc_info=True)
-        shared.error_state.value = True
-        return
-    kb = _start_keyboard(shared)
-    if kb is None:
-        return
+def teleop_loop(shared, config):
+    runtime = config.runtime
+    recorder = RecorderClient(shared) if runtime.policy.recording_enabled else None
+    keyboard = KeyboardInput(estop_callback=lambda: setattr(shared.estop_request, "value", True))
     audio = AudioFeedback()
-
-    arm_state = read_arm_state_causal(shared)
-    hand_state = read_hand_state_causal(shared)
-    if cfg.runtime.policy.hand_enabled:
-        if hand_state is None:
-            initial_hand_issue = "hand feedback unavailable"
-        else:
-            initial_hand_issue = validate_hand_feedback(
-                connected=bool(hand_state["connected"][0]),
-                state_valid=bool(hand_state["state_valid"][0]),
-                source_monotonic_ns=int(hand_state["source_monotonic_ns"][0]),
-                now_monotonic_ns=time.monotonic_ns(),
-                max_age_s=float(cfg.runtime.safety.heartbeat_timeouts["hand"]),
-                qpos=np.asarray(hand_state["qpos"][0]),
-            )
-        if initial_hand_issue is not None:
-            logger.error(
-                "Teleop: initial hand feedback rejected: %s", initial_hand_issue
-            )
-            shared.error_state.value = True
-            kb.stop()
-            return
-        try:
-            hand_retargeter = _build_hand_retargeter(cfg)
-        except Exception:
-            logger.error("Hand retargeter initialization failed", exc_info=True)
-            shared.error_state.value = True
-            kb.stop()
-            return
-        logger.info(
-            "Hand retargeter ready (type=%s)", cfg.runtime.policy.hand_retargeting_type
-        )
-    else:
-        hand_retargeter = None
-        logger.info(
-            "Hand explicitly disabled — using the configured fixed-home collision assumption"
-        )
-    arm_qpos = (
-        np.asarray(arm_state["qpos"][0], dtype=np.float64).copy()
-        if arm_state is not None
-        else np.asarray(cfg.runtime.arm.home_qpos, dtype=np.float64).copy()
-    )
-    hand_qpos = (
-        np.asarray(hand_state["qpos"][0], dtype=np.float64).copy()
-        if hand_state is not None and np.all(np.isfinite(hand_state["qpos"][0]))
-        else command_limits.hand_home_qpos_rad.copy()
-    )
-    controller = TeleopController(
-        planner=planner,
-        arm_mapper=arm_mapper,
-        config=cfg,
-        command_limits=command_limits,
-        initial_arm_qpos_rad=arm_qpos,
-        initial_hand_qpos_rad=hand_qpos,
-        hand_retargeter=hand_retargeter,
-    )
-
-    shared.set_heartbeat("policy", time.monotonic())
-    shared.set_ready("policy")
-    logger.debug("teleop_loop: READY")
-
-    teleop_active = False
-    recording_active = False
-    pause_since_ns = 0
-    pause_reason: str | None = None
+    controller = None
+    active = False
+    paused = False
+    resume_requested = False
+    pause_ns = 0
     quit_pending = False
-    quit_after_recording = False
-    post_teleop_deadline_s = 0.0
-    arm_feedback_error_count = 0
-    hand_disconnected_at_s: float | None = None
-    sigterm_requested = False
-
-    limiter = LoopRate(
-        cfg.runtime.teleop.executor_poll_hz,
-        label="teleop",
-        busy_wait=False,
-        warn_on_overrun=False,
-    )
-    grid_period_ns = int(round(_NS_PER_SECOND / cfg.runtime.teleop.control_hz))
-    next_grid_ns = time.monotonic_ns() + grid_period_ns
-    current_grid_anchor_ns = next_grid_ns
-    pending_controls: list[OperatorCommand] = []
-    startup_hand_home_pending = bool(cfg.runtime.policy.hand_enabled)
-    startup_hand_home_retry_required = False
-    validate_warn = ThrottledWarner(interval_s=_VALIDATION_WARN_INTERVAL_S)
-    arm_feedback_warn = ThrottledWarner(interval_s=_ARM_FEEDBACK_WARN_INTERVAL_S)
-    grid_overrun_warn = ThrottledWarner(interval_s=_VALIDATION_WARN_INTERVAL_S)
-    missed_control_grid_total = 0
-    loop_count = 0
-    camera_freshness = CameraFreshnessTracker(
-        max_age_s=cfg.runtime.camera.max_frame_age_s,
-        abort_after_s=cfg.runtime.camera.recording_stall_abort_s,
-    )
-    grid_resources = TeleopGridResources(
-        planner=planner,
-        safety_gate=safety_gate,
-        recorder=recorder,
-        command_limits=command_limits,
-        camera_freshness=camera_freshness,
-        validation_warn=validate_warn,
-        arm_feedback_warn=arm_feedback_warn,
-        hand_ramp_total_frames=hand_ramp_frame_count(
-            cfg.runtime.policy.hand_ramp_duration_s, cfg.runtime.teleop.control_hz
-        ),
-        max_observation_skew_s=cfg.runtime.policy.max_observation_skew_s,
-    )
-
-    def enter_pause(
-        reason: str,
-        *,
-        start_new_run: bool = False,
-        relabel: bool = False,
-    ) -> None:
-        nonlocal pause_since_ns, pause_reason
-        nonlocal teleop_active, recording_active
-        # Classify a worker rejection before an operator pause can relabel it
-        # or request a normal save. Revocation itself takes the short motion lock.
-        arm_rejected = bool(
-            teleop_active
-            and int(shared.safety_state.value) == int(SafetyState.ARMED)
-            and shared.is_running.value
-            and not shared.error_state.value
-            and not shared.estop_request.value
-            and not shared.evidence_failed.value
-        )
-        if arm_rejected:
-            reason = "arm_command_rejected"
-            relabel = True
-            teleop_active = False
-            stop_recording(
-                recorder,
-                recording_active,
-                save=False,
-                shared=shared,
-                reason=reason,
-                retain_partial=True,
-            )
-            recording_active = False
-            shared.is_recording.value = False
-            pending_controls[:] = [
-                control
-                for control in pending_controls
-                if control is not OperatorCommand.BEGIN
-            ]
-            kb.drain_signal(OperatorCommand.BEGIN)
-            logger.warning("teleop_loop: arm command rejected; begin a new run with B")
-        if start_new_run:
-            if pause_reason is not None:
-                logger.debug(
-                    "teleop_loop: new run supersedes %s pause boundary",
-                    pause_reason,
-                )
-            pause_reason = reason
-            run_id = int(shared.run_id.value)
-            pause_since_ns = time.monotonic_ns()
-        elif pause_reason is None:
-            pause_reason = reason
-            run_id = invalidate_coupled_commands(shared)
-            pause_since_ns = time.monotonic_ns()
-            if recorder is not None:
-                recorder.resolve_command(finish=True)
-                if shared.evidence_failed.value:
-                    pause_reason = "recording_failure"
-        else:
-            if relabel:
-                pause_reason = reason
-
+    quit_deadline = 0.0
+    next_tick = 0.0
+    failures = 0
+    def stop(save, reason, incomplete=False):
+        nonlocal active, paused, resume_requested
+        revoke_motion(shared)
+        if controller is not None:
             controller.clear_reference()
-            logger.debug(
-                "teleop_loop: remaining in %s pause boundary (observed %s)",
-                pause_reason,
-                reason,
-            )
-            return
-
-        controller.clear_reference()
-        log_pause = (
-            logger.debug
-            if reason in {"begin", "pause", "home", "stop", "discard", "quit"}
-            else logger.info
-        )
-        log_pause(
-            "teleop_loop: entered %s pause boundary (run=%d)",
-            reason,
-            run_id,
-        )
-
-    def reject_revoked_run() -> bool:
-        if not (
-            teleop_active
-            and int(shared.safety_state.value) == int(SafetyState.ARMED)
-            and shared.is_running.value
-            and not shared.error_state.value
-            and not shared.estop_request.value
-            and not shared.evidence_failed.value
-        ):
-            return False
-        enter_pause("arm_command_rejected", relabel=True)
-        return True
-
-    def clear_pause_for_home() -> None:
-        nonlocal pause_since_ns, pause_reason
-        if pause_reason is not None:
-            logger.debug(
-                "teleop_loop: homing supersedes %s pause boundary", pause_reason
-            )
-        pause_since_ns = 0
-        pause_reason = None
-
-        controller.clear_reference()
-
-    def run_home() -> None:
-        clear_pause_for_home()
-        controller.prev_hand_qpos = do_configured_teleop_home(
-            shared,
-            cfg,
-            hand_available=controller.hand_enabled,
-            prev_hand_qpos=controller.prev_hand_qpos,
-            planner=planner,
-            audio=audio,
-            estop_requested=lambda: kb.estop_latched or not kb.healthy,
-            arm_mapper=controller.arm_mapper,
-            hand_retargeter=controller.hand_retargeter,
-        )
-
-    def on_sigterm(signum: int, frame: object) -> None:
-        nonlocal sigterm_requested
-        sigterm_requested = True
-
-    signal.signal(signal.SIGTERM, on_sigterm)
-    logger.info(
-        "Teleop: entering control loop @ %.0f Hz (observation/action grid %.0f Hz)",
-        cfg.runtime.teleop.executor_poll_hz,
-        cfg.runtime.teleop.control_hz,
-    )
-
-    try:
-        while shared.is_running.value and not sigterm_requested:
-            shared.set_heartbeat("policy", time.monotonic())
-            limiter.wait()
-
-            if recorder is not None:
-                recorder.resolve_command()
-            reject_revoked_run()
-            if recorder is not None:
-                stop_result = recorder.poll_stop()
-                if shared.evidence_failed.value and recording_active:
-                    recorder.technical_status = "invalid"
-                    enter_pause("recording_failure", relabel=True)
-                    teleop_active = False
-                    if (int(shared.safety_state.value) == int(SafetyState.RUNNING)
-                            and not shared.error_state.value and not shared.estop_request.value):
-                        revoke_motion(shared, SafetyState.ARMED, reason=RunEndReason.RECORDING_FAILURE)
-                    stop_recording(recorder, recording_active, save=True, shared=shared, reason="evidence_failure")
-                    recording_active = False
-                reached_limit = (
-                    (recorder.stop_pending or stop_result.done)
-                    and stop_result.reason == "max_frames"
-                    # Client production has already stopped at capacity, but
-                    # this controller flag still owns the current capture's
-                    # first capacity event. A new unrecorded B cannot own it.
-                    and recording_active
-                )
-                if reached_limit:
-                    enter_pause("max_frames", relabel=True)
-                    teleop_active = False
-                    recording_active = False
-                    shared.is_recording.value = False
-                    if not _transition_or_fault(
-                        shared, SafetyState.ARMED, "maximum recording duration"
-                    ):
-                        break
-                    print("  已达到最大录制时长：正在自动保存，遥操作进入静默暂停")
-                    audio.play("pause")
-                if stop_result.done:
-                    recording_active = False
-                    shared.is_recording.value = False
-                    if stop_result.error:
-                        shared.evidence_failed.value = True
-                        path_label = f": {stop_result.path}" if stop_result.path else ""
-                        print(f"  ⚠ 录制终结失败 ({stop_result.error}){path_label}")
-                    elif stop_result.saved:
-                        # One visible terminal line per finished recording:
-                        # reason, saved source rows, and published location.
-                        logger.info(
-                            "[RECORD] reason=%s saved_rows=%d path=%s control=continue",
-                            stop_result.reason or "manual",
-                            stop_result.frame_count,
-                            stop_result.path,
-                        )
-                        if not stop_result.min_frames_met:
-                            print("  ⚠ 已保存，但未达到配置的最短质量时长")
-                    else:
-                        print(
-                            f"  录制未发布 ({stop_result.reason or 'manual'}: "
-                            f"{stop_result.frame_count} 帧)"
-                        )
-                    gc.collect()
-                    if quit_after_recording:
-                        shared.quit_requested.value = True
-                elif stop_result.error and quit_after_recording:
-                    # Client and supervisor enforce the original STOP deadline.
-                    shared.quit_requested.value = True
-            if (
-                shared.estop_request.value
-                or shared.error_state.value
-                or not shared.is_running.value
-            ):
-                break
-            if shared.quit_requested.value:
-                # The supervisor owns global shutdown.  Do not let a clean Q
-                # make this child look dead before the parent observes it.
-                # This branch is command/recording-start silent; the loop only
-                # continues its heartbeat until parent shutdown clears is_running.
-                continue
-
-            if (startup_hand_home_pending and not startup_hand_home_retry_required
-                    and int(shared.safety_state.value) == int(SafetyState.ARMED)):
-                home_run_id = int(shared.run_id.value)
-
-                def startup_home_abort_requested() -> bool:
-                    # Home waits for acceptance; keep S/Q observable in that wait.
-                    controls = kb.poll(timeout=0.0)
-                    pending_controls.extend(controls)
-                    if any(control in (OperatorCommand.STOP, OperatorCommand.DISCARD,
-                                       OperatorCommand.QUIT) for control in controls):
-                        revoke_motion_if_run_id(shared, home_run_id)
-                        return True
-                    return sigterm_requested or kb.estop_latched or not kb.healthy
-
-                if not initialize_hand_home(
-                    shared,
-                    cfg.runtime,
-                    heartbeat=True,
-                    abort_requested=startup_home_abort_requested,
-                ):
-                    cancelled = (
-                        int(shared.run_id.value) != home_run_id
-                        or not shared.is_running.value
-                        or shared.quit_requested.value
-                        or sigterm_requested
-                    )
-                    if (cancelled and not shared.error_state.value
-                            and not shared.estop_request.value
-                            and int(shared.safety_state.value) != int(SafetyState.FAULT)):
-                        # Keep the revoked run_id. Only a fresh B can ask
-                        # for another startup home; an old queued B is discarded.
-                        startup_hand_home_retry_required = True
-                        pending_controls[:] = [control for control in pending_controls
-                                               if control is not OperatorCommand.BEGIN]
-                        kb.drain_signal(OperatorCommand.BEGIN)
-                        logger.info("startup hand home cancelled; press B to retry")
-                        continue
-                    shared.error_state.value = True
-                    _transition_or_fault(shared, SafetyState.FAULT, "startup hand home")
-                    break
-                controller.prev_hand_qpos = command_limits.hand_home_qpos_rad.copy()
-                hand_state = read_hand_state_causal(shared)
-                if hand_state is None:
-                    shared.error_state.value = True
-                    _transition_or_fault(shared, SafetyState.FAULT, "startup hand feedback")
-                    break
-                planner.set_hand_qpos(np.asarray(hand_state["qpos"][0], dtype=np.float64))
-                startup_hand_home_pending = False
-                next_grid_ns = time.monotonic_ns() + grid_period_ns
-                limiter.reset()
-
-            if quit_pending:
-                home_handled = False
-                for control in kb.poll(timeout=0.1):
-                    if control is OperatorCommand.HOME and not home_handled:
-                        home_handled = True
-                        print("  H: return_home")
-                        audio.play("home")
-                        run_home()
-                        kb.drain_signal(OperatorCommand.HOME)
-                        limiter.reset()
-                        print("  [Q] quit", flush=True)
-                    elif control in (OperatorCommand.QUIT, OperatorCommand.EMERGENCY_STOP):
-                        if control is OperatorCommand.EMERGENCY_STOP:
-                            shared.estop_request.value = True
-                        elif recorder is not None and recorder.stop_pending:
-                            if not quit_after_recording:
-                                quit_after_recording = True
-                            print("  录制仍在终结；完成后自动退出", flush=True)
-                        else:
-                            shared.quit_requested.value = True
-                            break
-                if (
-                    shared.estop_request.value
-                    or not shared.is_running.value
-                ):
-                    break
-                if shared.quit_requested.value:
-                    continue
-                recording_stop_pending = recorder is not None and recorder.stop_pending
-                if time.perf_counter() <= post_teleop_deadline_s:
-                    continue
-                if recording_stop_pending:
-                    if not quit_after_recording:
-                        quit_after_recording = True
-                    continue
-                print("  timeout — auto exit")
+        active = paused = resume_requested = False
+        if recorder is not None and recorder.is_recording:
+            if incomplete:
+                recorder.technical_status = "invalid"
+            recorder.stop_episode(save=save, reason=reason, retain_partial=incomplete)
+        shared.is_recording.value = False
+    def pause(manual, mark_episode=True):
+        nonlocal paused, resume_requested, pause_ns
+        revoke_motion(shared)
+        pause_ns = time.monotonic_ns()
+        if controller is not None:
+            controller.clear_reference()
+        if mark_episode and recorder is not None and recorder.is_recording:
+            recorder.had_pause = True
+        paused, resume_requested = True, not manual
+        audio.play("pause")
+    def abort_home():
+        for cmd in keyboard.poll(timeout=0):
+            if cmd is OperatorCommand.EMERGENCY_STOP:
+                shared.estop_request.value = True
+            elif cmd is OperatorCommand.QUIT:
                 shared.quit_requested.value = True
-                continue
-
-            pending_controls.extend(kb.poll(timeout=0.0))
-            loop_now_ns = time.monotonic_ns()
-            grid_due = loop_now_ns >= next_grid_ns
-            if grid_due:
-                missed_periods = max(
-                    1, (loop_now_ns - next_grid_ns) // grid_period_ns + 1
-                )
-                if missed_periods > 1:
-                    missed_control_grid_total += int(missed_periods - 1)
-                    grid_overrun_warn(
-                        "teleop_loop: skipped %d control-grid slots (total=%d, lateness=%.1fms)",
-                        missed_periods - 1,
-                        missed_control_grid_total,
-                        (loop_now_ns - next_grid_ns) / 1e6,
-                    )
-                current_grid_anchor_ns = (
-                    next_grid_ns + int(missed_periods - 1) * grid_period_ns
-                )
-                next_grid_ns += int(missed_periods) * grid_period_ns
-                loop_count += 1
-            if not grid_due and not pending_controls:
-                continue
-
-            controls = tuple(pending_controls)
-            pending_controls.clear()
-            skip_control_tick = False
-            reanchor_grid = False
-            break_loop = False
-            for control in controls:
-                if startup_hand_home_pending and control is OperatorCommand.BEGIN:
-                    if not any(item in (OperatorCommand.STOP, OperatorCommand.DISCARD,
-                                        OperatorCommand.QUIT, OperatorCommand.EMERGENCY_STOP)
-                               for item in controls):
-                        startup_hand_home_retry_required = False
-                    continue
-                if reject_revoked_run() and control is OperatorCommand.BEGIN:
-                    continue
-                if control is OperatorCommand.EMERGENCY_STOP:
-                    print("\nESC: emergency_stop")
-                    audio.play("emergency")
+            elif cmd in (OperatorCommand.STOP, OperatorCommand.DISCARD):
+                return True
+        return bool(shared.estop_request.value or shared.quit_requested.value or not shared.is_running.value)
+    try:
+        planner = XArm7MotionPlanner.create_default(teleop_profile=OnlineIKConfig(
+            max_pose_error_pos_m=runtime.policy.ik_max_pose_error_pos_m,
+            max_pose_error_rot_rad=runtime.policy.ik_max_pose_error_rot_rad,
+            nullspace_step_size_deg=runtime.policy.ik_nullspace_step_rate_deg_s/runtime.teleop.control_hz))
+        calibration = load_vr_transform(Path(__file__).resolve().parents[2] / config.vr_transform_path)
+        mapping = runtime.policy.vr_mapping
+        mapper = VRWristMapper(pos_scale=mapping.pos_scale, rot_scale=mapping.rot_scale,
+            vr_to_robot_rot=calibration.transform, max_delta_rot_rad=mapping.max_delta_rot_rad,
+            base_to_world_rot=np.eye(3))
+        controller = TeleopController(planner, mapper, runtime, _build_hand_retargeter(config))
+        keyboard.start()
+        signal.signal(signal.SIGTERM, lambda *_: setattr(shared.is_running, "value", False))
+        home_result = home_hand(shared, runtime, abort_requested=abort_home)
+        if not home_result.ok:
+            raise RuntimeError(f"startup hand home failed: {home_result.reason}")
+        shared.policy_ready.set()
+        print("B begin | C pause/resume | S save | D discard | H home | Q quit | ESC emergency stop", flush=True)
+        home_planner = None
+        while shared.is_running.value and not shared.quit_requested.value:
+            if not keyboard.healthy:
+                shared.estop_request.value = True
+            if shared.estop_request.value or shared.error_state.value:
+                stop(True, "hardware_failure", incomplete=True)
+                break
+            if recorder is not None:
+                result = recorder.poll_stop()
+                if result.error:
+                    shared.workflow_failed.value = True
+                if not recorder.is_recording and active:
+                    stop(True, result.reason or "recording_complete")
+            if shared.workflow_failed.value and active:
+                stop(True, "required_recording_resource_failed", incomplete=True)
+            for cmd in keyboard.poll(timeout=0.005):
+                if cmd is OperatorCommand.EMERGENCY_STOP:
                     shared.estop_request.value = True
-                    stop_recording(
-                        recorder, recording_active, save=False, shared=shared,
-                        reason="estop", retain_partial=True,
-                    )
-                    recording_active = False
-                    break_loop = True
                     break
-                if control is OperatorCommand.QUIT:
-                    print("\nQ: 退出")
-                    audio.play("quit")
-                    enter_pause("quit", relabel=True)
-                    teleop_active = False
-                    if not _transition_or_fault(shared, SafetyState.ARMED, "quit"):
-                        break_loop = True
-                        break
-                    if recording_active:
-                        audio.queue("quit_save_prompt")
-                        print(
-                            "  [S] 保存并退出  [D] 丢弃并退出  [H] 保存并归位 "
-                            f"({cfg.runtime.policy.quit_save_timeout_s:.0f}s 超时默认丢弃)"
-                        )
-                        decision = await_quit_recording_decision(
-                            shared, kb, timeout_s=cfg.runtime.policy.quit_save_timeout_s
-                        )
-                        save = decision in (
-                            QuitRecordingDecision.SAVE,
-                            QuitRecordingDecision.SAVE_AND_HOME,
-                        )
-                        interrupted = decision in (
-                            QuitRecordingDecision.ESTOP, QuitRecordingDecision.SHUTDOWN
-                        )
-                        reason = "manual"
-                        if decision is QuitRecordingDecision.ESTOP:
-                            reason = "estop"
-                        elif decision is QuitRecordingDecision.SHUTDOWN:
-                            reason = "policy_shutdown"
-                        elif decision is QuitRecordingDecision.TIMEOUT:
-                            reason = "quit_timeout"
-                        elif decision is QuitRecordingDecision.DISCARD:
-                            reason = "discard"
-                        if decision is QuitRecordingDecision.ESTOP:
-                            audio.play("emergency")
-                        elif not interrupted:
-                            audio.play("save" if save else "discard")
-                        stop_recording(
-                            recorder, True, save=save, shared=shared,
-                            reason=reason, retain_partial=interrupted,
-                        )
-                        recording_active = False
-                        if decision is QuitRecordingDecision.TIMEOUT:
-                            print("  超时，默认丢弃请求已提交")
-                        elif decision is QuitRecordingDecision.DISCARD:
-                            print("  丢弃请求已提交")
-                        elif save:
-                            print("  保存请求已提交")
-                        if (
-                            decision is QuitRecordingDecision.SAVE_AND_HOME
-                            and shared.is_running.value
-                        ):
-                            audio.play("home")
-                            run_home()
-                    quit_pending = True
-                    post_teleop_deadline_s = (
-                        time.perf_counter() + cfg.runtime.policy.post_teleop_timeout_s
-                    )
-                    print(
-                        f"\n[H] return_home  [Q] quit  ({cfg.runtime.policy.post_teleop_timeout_s:.0f}s timeout)",
-                        flush=True,
-                    )
-                    skip_control_tick = True
-                    break
-                if control is OperatorCommand.HOME:
-                    print("\nH: return_home")
-                    audio.play("home")
-                    enter_pause("home", relabel=True)
-                    stop_recording(recorder, recording_active, save=True, shared=shared)
-                    recording_active = False
-                    teleop_active = False
-                    if not _transition_or_fault(shared, SafetyState.ARMED, "home"):
-                        break_loop = True
-                        break
-                    run_home()
-                    kb.drain_signal(OperatorCommand.HOME)
-                    reanchor_grid = True
-                    skip_control_tick = True
-                    break
-                if control in (OperatorCommand.STOP, OperatorCommand.DISCARD):
-                    save_episode = control is OperatorCommand.STOP
-                    reason = "stop" if save_episode else "discard"
-                    print("\nS: 停止录制" if save_episode else "\nD: 丢弃录制")
-                    audio.play("save" if save_episode else "discard")
-                    enter_pause(reason, relabel=True)
-                    stop_recording(
-                        recorder, recording_active, save=save_episode, shared=shared,
-                        reason="manual" if save_episode else "discard",
-                    )
-                    recording_active = False
-                    teleop_active = False
-                    if not _transition_or_fault(shared, SafetyState.ARMED, reason):
-                        break_loop = True
-                        break
-                    skip_control_tick = True
-                elif control is OperatorCommand.PAUSE:
-                    pause_signal_applied = False
-                    if cfg.runtime.policy.recording_enabled and shared.evidence_failed.value:
-                        print("\nC: recording failed — use H/Q for safe recovery")
-                        skip_control_tick = True
-                        continue
-                    if teleop_active:
-                        enter_pause("pause", relabel=True)
-                        teleop_active = False
-                        if not _transition_or_fault(shared, SafetyState.ARMED, "pause"):
-                            break_loop = True
-                            break
-                        pause_signal_applied = True
-                    elif pause_reason == "pause":
-                        if shared.safety_state.value == SafetyState.ARMED:
-                            if not _transition_or_fault(
-                                shared, SafetyState.RUNNING, "resume"
-                            ):
-                                break_loop = True
-                                break
-                            teleop_active = True
-                            pause_signal_applied = True
-                        else:
-                            print(
-                                f"\nC: safety_state={shared.safety_state.value} — must be ARMED to resume"
-                            )
+                if cmd is OperatorCommand.QUIT:
+                    revoke_motion(shared)
+                    if recorder is not None and recorder.is_recording:
+                        pause(True, mark_episode=False)
+                        quit_pending = True
+                        quit_deadline = time.monotonic() + runtime.policy.quit_save_timeout_s
+                        print("Quit: S save, D discard, H save and home", flush=True)
                     else:
-                        print(
-                            "\nC: 没有可恢复的暂停 session — 请按 B 开始新的遥操作 session"
-                        )
-                    if pause_signal_applied:
-                        print(f"\nC: {'恢复' if teleop_active else '暂停'}遥操作")
-                        audio.play("resume" if teleop_active else "pause")
-                    skip_control_tick = True
-                elif control is OperatorCommand.BEGIN:
-                    if teleop_active or recording_active:
-                        print(
-                            "\nB: session already active — use C to pause/resume, S to save, or D to discard"
-                        )
-                        skip_control_tick = True
-                        continue
-                    if shared.safety_state.value != SafetyState.ARMED:
-                        print(
-                            f"\nB: safety_state={shared.safety_state.value} — must be ARMED"
-                        )
-                        skip_control_tick = True
-                        continue
-                    begin_camera = read_camera_frame_causal(shared) if cfg.runtime.policy.recording_enabled else None
-                    if cfg.runtime.policy.recording_enabled and (
-                        recorder is None or shared.evidence_failed.value
-                        or recorder.stop_pending or recorder.transport_unavailable
-                        or not shared.is_ready("camera") or not shared.is_ready("recorder")
-                        or begin_camera is None
-                        or int(begin_camera["camera_health"]) != 0
-                        or not 0 <= time.monotonic_ns() - int(begin_camera["source_monotonic_ns"]) <= int(cfg.runtime.camera.max_frame_age_s * 1e9)
-                    ):
-                        print("\nB: camera/recorder unavailable — recorded collection cannot begin")
-                        skip_control_tick = True
-                        continue
-                    begin_now_ns = time.monotonic_ns()
-                    vr_frame = read_vr_frame_causal(shared)
-                    begin_hand_state = (
-                        read_hand_state_causal(shared)
-                        if cfg.runtime.policy.hand_enabled
-                        else None
-                    )
-                    begin_issue = _begin_feedback_issue(
-                        cfg,
-                        vr_frame,
-                        begin_hand_state,
-                        now_monotonic_ns=begin_now_ns,
-                    )
-                    if begin_issue is not None:
-                        print(f"\nB: {begin_issue} — cannot begin")
-                        skip_control_tick = True
-                        continue
-                    wrist_pos = vr_frame["wrist_pos"]
-                    wrist_quat_wxyz = vr_frame["wrist_quat_wxyz"]
-                    logger.debug(
-                        "B: wrist_pose pos=%s wxyz=%s", wrist_pos, wrist_quat_wxyz
-                    )
-                    gc.collect()
-                    recording_active = False
-                    if (recorder is not None and not shared.evidence_failed.value
-                            and not recorder.stop_pending):
-                        recording_active = recorder.start_episode(
-                            task_label=cfg.task_label, operator=cfg.operator
-                        )
-                        if not recording_active:
-                            shared.evidence_failed.value = True
-                    if cfg.runtime.policy.recording_enabled and not recording_active:
-                        print("\nB: recorder START failed — collection remains ARMED")
-                        skip_control_tick = True
-                        continue
-                    if recording_active:
-                        camera_freshness.reset(time.monotonic())
-                        shared.is_recording.value = True
-                        begin_message = f"\nB: 遥操作+录制开始  episode={recorder.frame_count}"
+                        shared.quit_requested.value = True
+                elif cmd in (OperatorCommand.STOP, OperatorCommand.DISCARD, OperatorCommand.HOME):
+                    stop(cmd is not OperatorCommand.DISCARD, cmd.value.lower())
+                    audio.play("discard" if cmd is OperatorCommand.DISCARD else "end")
+                    if recorder is not None:
+                        result = recorder.join_stop()
+                        if result.error:
+                            shared.workflow_failed.value = True
+                    if cmd is OperatorCommand.HOME and not shared.error_state.value:
+                        home_planner = home_planner or build_policy_home_planner(runtime)
+                        audio.play("home")
+                        if home_policy_robot(shared, runtime, home_planner, abort_requested=abort_home):
+                            audio.queue("home_done")
+                    if quit_pending:
+                        shared.quit_requested.value = True
+                elif cmd is OperatorCommand.PAUSE and active and not quit_pending:
+                    if paused:
+                        resume_requested = True
                     else:
-                        begin_message = "\nB: 遥操作开始（本次无录制）"
-                    kb.drain_signal(OperatorCommand.BEGIN)
-                    if not _transition_or_fault(shared, SafetyState.RUNNING, "begin"):
-                        stop_recording(
-                            recorder,
-                            recording_active,
-                            save=False,
-                            shared=shared,
-                            reason="safety_transition_failed",
-                            retain_partial=True,
-                        )
-                        recording_active = False
-                        break_loop = True
-                        break
-                    enter_pause("begin", start_new_run=True)
-                    teleop_active = True
-                    if controller.hand_enabled:
-                        assert begin_hand_state is not None
-                        seeded_qpos = seed_hand_retargeter(
-                            controller.hand_retargeter,
-                            np.asarray(begin_hand_state["qpos"][0], dtype=np.float64),
-                        )
-                        if seeded_qpos is not None:
-                            controller.prev_hand_qpos = seeded_qpos
+                        pause(True)
+                elif cmd is OperatorCommand.BEGIN and not active and not quit_pending:
+                    if shared.workflow_failed.value or (recorder is not None and recorder.stop_pending):
+                        continue
+                    row = read_observation(shared, runtime, require_hand=runtime.policy.hand_enabled,
+                                           require_camera=recorder is not None, require_vr=True)
+                    if row is None:
+                        print("Begin requires fresh robot, VR and recording resources", flush=True)
+                        continue
+                    if recorder is not None and not recorder.start_episode(task_label=config.task_label, operator=config.operator):
+                        continue
+                    # START may block on disk; anchor only after it finishes.
+                    row = read_observation(shared, runtime, require_hand=runtime.policy.hand_enabled,
+                                           require_camera=recorder is not None, require_vr=True)
+                    if row is None or not controller.reset_reference(row) or not begin_motion(shared):
+                        stop(False, "begin_unavailable")
+                        continue
+                    active = True
+                    shared.is_recording.value = recorder is not None
+                    next_tick = time.monotonic()
                     audio.play("begin")
-                    print(begin_message)
-                    limiter.reset()
-                    skip_control_tick = True
-
-            if break_loop or shared.error_state.value or shared.estop_request.value:
-                break
-            if reanchor_grid:
-                limiter.reset()
-                next_grid_ns = time.monotonic_ns() + grid_period_ns
-                current_grid_anchor_ns = next_grid_ns
+            if quit_pending and time.monotonic() >= quit_deadline:
+                stop(True, "quit_decision_timeout", incomplete=True)
+                shared.quit_requested.value = True
+            if not active or shared.quit_requested.value:
                 continue
-            if skip_control_tick or not grid_due:
+            if shared.workflow_failed.value:
                 continue
-            if reject_revoked_run():
+            tick_started = time.monotonic()
+            if not paused and tick_started < next_tick:
                 continue
-
-            tick_result = run_control_grid_tick(
-                controller,
-                shared,
-                cfg,
-                grid_resources,
-                teleop_active=teleop_active,
-                recording_active=recording_active,
-                pause_since_ns=pause_since_ns,
-                pause_reason=pause_reason,
-                arm_feedback_error_count=arm_feedback_error_count,
-                hand_disconnected_at_s=hand_disconnected_at_s,
-                loop_count=loop_count,
-                observation_anchor_monotonic_ns=current_grid_anchor_ns,
-            )
-            recording_active = tick_result.recording_active
-            arm_feedback_error_count = tick_result.arm_feedback_error_count
-            hand_disconnected_at_s = tick_result.hand_disconnected_at_s
-            if reject_revoked_run():
+            row = read_observation(shared, runtime, require_hand=runtime.policy.hand_enabled,
+                                   require_camera=recorder is not None, require_vr=True)
+            if row is None:
+                if recorder is not None:
+                    from dexmani_real.runtime.observation import read_camera_frame, sample_is_fresh
+                    camera = read_camera_frame(shared)
+                    if camera is None or not sample_is_fresh(camera["timestamp_ns"], runtime.camera.max_frame_age_s):
+                        shared.workflow_failed.value = True
+                        stop(True, "camera_unavailable", incomplete=True)
+                        continue
+                if not paused:
+                    pause(False)
                 continue
-            if tick_result.pause_reason is not None:
-                enter_pause(tick_result.pause_reason)
-            if tick_result.pause_released:
-                pause_since_ns = 0
-                pause_reason = None
-            if not tick_result.keep_running:
-                break
+            if paused:
+                if resume_requested and all(int(stamp) > pause_ns for stamp in (
+                        row.arm["timestamp_ns"][0], row.vr["recv_ts_ns"],
+                        row.hand["timestamp_ns"][0] if row.hand is not None else row.observation_timestamp_ns)):
+                    if controller.reset_reference(row) and begin_motion(shared):
+                        paused = resume_requested = False
+                        failures = 0
+                        next_tick = time.monotonic()
+                        audio.play("resume")
+                continue
+            status = run_control_grid_tick(controller, shared, row, recorder)
+            next_tick = tick_started + 1/runtime.teleop.control_hz
+            failures = failures + 1 if status else 0
+            if failures >= runtime.policy.max_consecutive_errors:
+                pause(True)
+    except Exception:
+        shared.workflow_failed.value = True
+        revoke_motion(shared)
+        logger.exception("teleop failed")
+        raise
     finally:
-        if recording_active:
-            # An automatic exit is not the operator's DISCARD. Preserve the
-            # committed prefix after the recorder process closes its writers.
-            reason = "policy_shutdown"
-            if shared.estop_request.value:
-                reason = "estop"
-            elif shared.error_state.value or shared.safety_state.value == SafetyState.FAULT:
-                reason = "hardware_fault"
-            stop_recording(
-                recorder, True, save=False, shared=shared, reason=reason,
-                retain_partial=True,
-            )
-        kb.stop()
-        audio.play("end")
-        if not audio.wait_until_idle(timeout_s=_END_AUDIO_GRACE_S):
-            logger.warning("End audio did not finish within %.1fs", _END_AUDIO_GRACE_S)
+        revoke_motion(shared)
+        if recorder is not None:
+            if recorder.is_recording:
+                recorder.technical_status = "invalid"
+                recorder.stop_episode(save=True, reason="interrupted", retain_partial=True)
+            recorder.join_stop()
+        keyboard.stop()
         audio.close()
-        exit_fault = _policy_exit_fault(
-            error_state=bool(shared.error_state.value),
-            estop_request=bool(shared.estop_request.value),
-            safety_fault=shared.safety_state.value == SafetyState.FAULT,
-        )
-        if exit_fault is not None:
-            logger.error("teleop_loop: %s", exit_fault)
-        else:
-            logger.debug("teleop_loop: STOPPED")
-        logger.debug("Teleop: loop exited")

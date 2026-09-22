@@ -20,8 +20,7 @@ def read_provenance_workflow(meta_attrs: Any) -> str | None:
 
     ``meta_attrs`` is the raw ``/meta`` HDF5 attribute mapping. Absent, empty,
     or whitespace-only values normalize to ``None``: the producer declared no
-    workflow. Teleop recordings declare none; only the policy rollout recorder
-    writes ``provenance_workflow="policy_eval"``.
+    workflow. Both collection and rollout recorders declare their workflow.
     """
     if meta_attrs is None:
         return None
@@ -35,10 +34,5 @@ def read_provenance_workflow(meta_attrs: Any) -> str | None:
 
 
 def supports_fixed_dt_teleop(workflow: str | None) -> bool:
-    """Return True when ``workflow`` may enter teleop processing/replay.
-
-    ``None`` (absent) and ``""`` (empty) mean the producer declared no workflow
-    (the current teleop path); ``teleop`` is accepted for any producer that
-    declares it explicitly.
-    """
-    return workflow in (None, "", TELEOP_WORKFLOW)
+    """Only explicitly declared teleop raw is a BC/replay source."""
+    return workflow == TELEOP_WORKFLOW

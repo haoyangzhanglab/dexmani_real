@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping
 
-import h5py
 import numpy as np
 import yaml
 
 from dexmani_real.dataset.contracts import (
     EpisodeAnnotation,
-    EpisodeDecision,
     ProcessingConfig,
     canonical_json,
     validate_task_name,
@@ -37,9 +34,8 @@ from dexmani_real.planning.kinematics.fingertip import (
 )
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.storage.reader import EpisodeReader
-from dexmani_real.recording.storage.schema import EPISODE_SCHEMA_VERSION
+from dexmani_real.recording.storage.schema import DATASET_SPECS, FRAME_OK
 from dexmani_real.dataset.provenance import (
-    POLICY_EVAL_WORKFLOW,
     read_provenance_workflow,
     supports_fixed_dt_teleop,
 )
@@ -60,130 +56,50 @@ from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_TRANSFORM,
 )
 
-@contextmanager
-def _open_processing_episode(episode: Path):
-    """Read the current raw schema without modifying the source."""
-    with h5py.File(episode / "data.h5", "r") as source:
-        version = int(source["meta"].attrs["schema_version"])
-    if version != EPISODE_SCHEMA_VERSION:
-        raise ValueError(
-            f"offline processing requires current raw v{EPISODE_SCHEMA_VERSION}; "
-            f"got v{version}"
-        )
-    with EpisodeReader(episode) as reader:
-        yield reader
-
-
-def analyze_episode(
-    reader: EpisodeReader,
-    config: ProcessingConfig,
-    annotation: EpisodeAnnotation | None = None,
-) -> EpisodeDecision:
-    """Technically admit all source rows or fail loudly; never repair rows.
-
-    Shape/dtype, timing, media, masked-tactile, and provenance checks raise on
-    corruption. There is no automatic quality rejection: an episode is excluded
-    only by explicit operator annotation.
-    """
+def validate_episode(reader) -> int:
+    """Admit every row of a complete teleop episode, or reject the whole episode."""
     reader.require_valid(purpose="training export")
     source = reader.h5f
+    if bool(source["meta"].attrs.get("had_pause", False)):
+        raise ValueError("episode contains an operator or sensor pause")
     workflow = read_provenance_workflow(source["meta"].attrs)
     if not supports_fixed_dt_teleop(workflow):
-        if workflow == POLICY_EVAL_WORKFLOW:
-            raise ValueError(
-                "policy_eval rollout has synchronous/irregular execution timing and "
-                "cannot enter the current fixed-dt teleop processing pipeline"
-            )
-        raise ValueError(
-            f"unsupported provenance_workflow {workflow!r} for fixed-dt teleop processing"
-        )
+        raise ValueError(f"training requires teleop provenance, got {workflow!r}")
     frames = int(source["meta"].attrs["num_frames"])
     if frames <= 0:
-        raise ValueError("raw episode must contain at least one row")
-    if annotation is not None and not annotation.include:
-        return EpisodeDecision(reader.h5_path, frames, "excluded by annotation")
-    dt = float(reader.timing.grid_dt_s)
-    if not np.isfinite(dt) or dt <= 0:
-        raise ValueError("control period must be finite and positive")
-    specs = {
-        "arm_qpos": ((7,), np.float64),
-        "hand_qpos": ((12,), np.float64),
-        "action_arm_joint_sent": ((7,), np.float64),
-        "action_hand_joint": ((12,), np.float64),
-        "action_arm_ee": ((9,), np.float64),
-        "hand_contact": ((5, 3), np.float32),
-        "hand_contact_valid": ((), np.bool_),
-        "hand_tactile_force": ((5, 120, 3), np.float32),
-        "hand_tactile_force_valid": ((), np.bool_),
-        "timestamp": ((), np.float64),
-        "flag_frame_status": ((), np.uint8),
-        "observation_anchor_monotonic_ns": ((), np.uint64),
-        "arm_source_monotonic_ns": ((), np.uint64),
-        "hand_source_monotonic_ns": ((), np.uint64),
-        "camera_source_monotonic_ns": ((), np.uint64),
-    }
-    # Tactile payloads carry an explicit per-row validity mask, so NaN is
-    # admissible for invalid rows and never rejects the episode.
-    validity_masked = {"hand_contact", "hand_tactile_force"}
-    arrays = {}
-    for name, (tail, dtype) in specs.items():
-        dataset = source[name]
-        if dataset.shape != (frames, *tail) or dataset.dtype != np.dtype(dtype):
-            raise ValueError(f"{name}: corrupt shape/dtype")
-        values = np.asarray(dataset[:])
-        if (
-            np.issubdtype(dtype, np.floating)
-            and name not in validity_masked
-            and not np.all(np.isfinite(values))
-        ):
-            raise ValueError(f"{name}: NaN/Inf")
-        arrays[name] = values
-    _validate_masked_tactile_rows(
-        arrays["hand_contact"],
-        arrays["hand_contact_valid"],
-        label="raw hand_contact",
-    )
-    _validate_masked_tactile_rows(
-        arrays["hand_tactile_force"],
-        arrays["hand_tactile_force_valid"],
-        label="raw hand_tactile_force",
-    )
-    if np.any(np.diff(arrays["timestamp"]) <= 0):
-        raise ValueError("raw timestamps must strictly increase")
-    anchor = arrays["observation_anchor_monotonic_ns"]
-    if np.any(anchor == 0) or np.any(anchor[1:] <= anchor[:-1]):
-        raise ValueError("control anchors must be positive and strictly increasing")
-    expected_period_ns = int(round(dt * 1e9))
-    if np.any(np.diff(anchor.astype(np.int64)) != expected_period_ns):
-        raise ValueError("fixed-rate training export rejects missing/irregular grid intervals; raw timing is preserved")
-    if np.any(np.asarray(source["command_id"][:]) == 0):
-        raise ValueError("training export requires confirmed action labels for every row")
-    for name in (
-        "arm_source_monotonic_ns",
-        "hand_source_monotonic_ns",
-        "camera_source_monotonic_ns",
-    ):
-        if np.any(arrays[name] == 0) or np.any(arrays[name] > anchor):
-            raise ValueError(
-                f"{name}: source must be positive and causal to control anchor"
-            )
-    validate_canonical_rot6d(arrays["action_arm_ee"][:, 3:9], label="raw action_arm_ee")
+        raise ValueError("episode contains no rows")
+    status = source["flag_frame_status"][:]
+    bad = np.flatnonzero(status != FRAME_OK)
+    if len(bad):
+        raise ValueError(f"non-OK frame status {status[bad[0]]} at row {bad[0]}")
+    for name in ("hand_contact_valid", "hand_tactile_force_valid"):
+        bad = np.flatnonzero(~source[name][:])
+        if len(bad):
+            raise ValueError(f"{name} false at row {bad[0]}")
+    for name, spec in DATASET_SPECS.items():
+        if spec.dtype.kind == "f" and name not in {"arm_eef_intent", "head_quat_wxyz"}:
+            if not np.isfinite(source[name][:]).all():
+                raise ValueError(f"{name}: non-finite values")
+    dt = reader.timing.grid_dt_s
+    for name in ("observation_timestamp_ns", "action_timestamp_ns"):
+        stamps = source[name][:]
+        if np.any(stamps == 0) or np.any(stamps[1:] <= stamps[:-1]):
+            raise ValueError(f"{name}: must be positive and strictly increasing")
+        gaps = np.diff(stamps.astype(np.int64))
+        if np.any(gaps > round(2 * dt * 1e9)):
+            raise ValueError(f"{name}: pause/missing-control gap exceeds 2 nominal periods")
+    if np.any(source["action_timestamp_ns"][:] < source["observation_timestamp_ns"][:]):
+        raise ValueError("action precedes observation completion")
+    for name in ("arm_timestamp_ns", "hand_timestamp_ns", "camera_timestamp_ns", "vr_timestamp_ns"):
+        if np.any(source[name][:] == 0):
+            raise ValueError(f"{name}: missing source timestamp")
     camera = load_raw_episode_camera_model(reader)
     load_raw_episode_base_from_color(reader)
-    depth = source["depth"]
     geometry = camera.geometry.color
-    if depth.shape != (
-        frames,
-        geometry.height,
-        geometry.width,
-    ) or depth.dtype != np.dtype(np.uint16):
-        raise ValueError("depth: corrupt shape/dtype/frame count")
-    # Images are decoded and checked once by iter_policy_blocks in both modes.
-    # IK-hold rows (flag_frame_status=FRAME_IK_FAIL) are technically valid
-    # source rows and stay admitted regardless of run length; quality selection
-    # is explicit operator curation (annotation include:false), never an
-    # automatic per-episode rejection here.
-    return EpisodeDecision(reader.h5_path, frames)
+    depth = source["depth"]
+    if depth.shape != (frames, geometry.height, geometry.width) or depth.dtype != np.dtype(np.uint16):
+        raise ValueError("depth shape/dtype/frame count mismatch")
+    return frames
 
 
 def load_annotations(path: str | Path | None) -> dict[str, EpisodeAnnotation]:
@@ -272,34 +188,20 @@ def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
     return episodes
 
 
-def _validate_masked_tactile_rows(
-    payload: np.ndarray,
-    valid: np.ndarray,
-    *,
-    label: str,
-) -> None:
-    """Enforce the mask/payload invariant for tactile rows; never repair it.
-
-    ``valid`` rows must be fully finite (a real zero/no-contact reading is finite
-    zero + valid); ``invalid`` rows must be all-NaN. Any contradiction is a
-    technical contract error and raises.
-    """
-    axes = tuple(range(1, payload.ndim))
-    rows_finite = np.all(np.isfinite(payload), axis=axes)
-    rows_all_nan = np.all(np.isnan(payload), axis=axes)
-    if np.any(valid & ~rows_finite):
-        raise ValueError(f"{label}: non-finite payload on a valid row")
-    if np.any(~valid & ~rows_all_nan):
-        raise ValueError(f"{label}: finite payload on an invalid row")
-
-
 def policy_semantics(reader: EpisodeReader, config: ProcessingConfig) -> dict[str, Any]:
     meta = reader.h5f["meta"].attrs
+    camera = load_raw_episode_camera_model(reader)
     return {
+        "camera_intrinsic": camera.geometry.color.matrix().reshape(-1).tolist(),
+        "camera_extrinsic": load_raw_episode_base_from_color(reader).tolist(),
+        "camera_geometry": camera.geometry.to_dict(),
+        "joint_order": "xarm7_joint1_to_7+xhand_sdk_12",
+        "hand_current_unit": "mA",
+        "arm_effort_unit": "sdk_native_unverified",
         "obs_alignment": "obs[t]_before_action[t]",
         "observation_alignment": "control_step_latest_causal",
         "state_alignment": "control_step",
-        "action_semantics": "jointly_adopted_robot_target",
+        "action_semantics": "teleop_published_joint_target",
         "fingertip_points_frame": "xarm_base",
         "fingertip_points_unit": "m",
         "fingertip_points_derivation": FINGERTIP_POINTS_DERIVATION,
@@ -362,9 +264,9 @@ def iter_policy_blocks(
     geometry = camera_model.geometry
     transform = load_raw_episode_base_from_color(reader)
     values = {}
-    arm_action = np.asarray(reader.h5f["action_arm_joint_sent"][:], dtype=np.float32)
-    hand_action = np.asarray(reader.h5f["action_hand_joint"][:], dtype=np.float32)
-    arm_action_ee = np.asarray(reader.h5f["action_arm_ee"][:], dtype=np.float32)
+    arm_action = np.asarray(reader.h5f["action_arm_joint_target"][:], dtype=np.float32)
+    hand_action = np.asarray(reader.h5f["action_hand_joint_target"][:], dtype=np.float32)
+    arm_action_ee = compute_eef_pose_history_xarm_base(arm_action).astype(np.float32)
     joint_state = np.concatenate(
         (
             np.asarray(reader.h5f["arm_qpos"][:], dtype=np.float32),
@@ -375,20 +277,10 @@ def iter_policy_blocks(
     values["joint_state"] = joint_state
     values["action"] = np.concatenate((arm_action, hand_action), axis=1)
     values["action_ee"] = np.concatenate((arm_action_ee, hand_action), axis=1)
-    # Tactile validity is copied directly from raw; processing never
-    # reconstructs measurement truth from calibration/unit/freshness fields.
-    values["contact_force"] = np.asarray(
-        reader.h5f["hand_contact"][:], dtype=np.float32
-    )
-    values["contact_force_valid"] = np.asarray(
-        reader.h5f["hand_contact_valid"][:], dtype=bool
-    )
-    values["tactile_force"] = np.asarray(
-        reader.h5f["hand_tactile_force"][:], dtype=np.float32
-    )
-    values["tactile_force_valid"] = np.asarray(
-        reader.h5f["hand_tactile_force_valid"][:], dtype=bool
-    )
+    for name in ("arm_qvel", "arm_effort", "hand_current"):
+        values[name] = np.asarray(reader.h5f[name][:], dtype=np.float32)
+    values["contact_force"] = np.asarray(reader.h5f["hand_contact"][:], dtype=np.float32)
+    values["tactile_force"] = np.asarray(reader.h5f["hand_tactile_force"][:], dtype=np.float32)
     hand_fk = HandKinematics(config.hand_urdf_path, list(config.fingertip_link_names))
     if not hand_fk.is_ready():
         raise RuntimeError("policy fingertip FK startup failed")
@@ -406,14 +298,6 @@ def iter_policy_blocks(
         ),
         eef_pose_history=eef_pose,
     )
-    # Flat timing arrays: one scalar per control row.
-    values["observation_anchor_monotonic_ns"] = reader.h5f[
-        "observation_anchor_monotonic_ns"
-    ][:]
-    values["arm_source_monotonic_ns"] = reader.h5f["arm_source_monotonic_ns"][:]
-    values["hand_source_monotonic_ns"] = reader.h5f["hand_source_monotonic_ns"][:]
-    values["camera_source_monotonic_ns"] = reader.h5f["camera_source_monotonic_ns"][:]
-
     pointcloud_deriver = RawEpisodePointCloudDeriver(
         reader=reader,
         camera=camera_model,
@@ -444,17 +328,10 @@ def iter_policy_blocks(
             rgb=np.stack(rgb),
             depth=np.stack(depth),
             point_cloud=np.stack(clouds),
-            camera_intrinsic=np.broadcast_to(
-                geometry.color.matrix().astype(np.float32).reshape(9), (end - start, 9)
-            ),
-            camera_extrinsic=np.broadcast_to(
-                transform.astype(np.float32), (end - start, 4, 4)
-            ),
         )
         for key, value in block.items():
             if (
                 np.issubdtype(value.dtype, np.floating)
-                and key not in {"contact_force", "tactile_force"}
                 and not np.isfinite(value).all()
             ):
                 raise ValueError(f"{key}: non-finite transformed values")

@@ -8,7 +8,6 @@ identity into the spawned worker; it never imports Policy or Torch.
 
 from __future__ import annotations
 
-import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -21,7 +20,6 @@ from dexmani_real.config.pointcloud import (
     POINT_CLOUD_SAMPLING,
     POINT_CLOUD_TRANSFORM,
 )
-from dexmani_real.dataset.contracts import canonical_json
 from dexmani_real.ipc.schema import (
     POINT_CLOUD_FEATURE_DIM,
     SUPPORTED_POINT_CLOUD_COUNTS,
@@ -144,7 +142,6 @@ def _expected_pointcloud_semantics() -> dict[str, str]:
 
 
 def _expected_fingertip_semantics(runtime: Any) -> dict[str, str]:
-    hand = runtime.hand
     return {
         "representation": "point_xyz",
         "frame": "xarm_base",
@@ -152,15 +149,7 @@ def _expected_fingertip_semantics(runtime: Any) -> dict[str, str]:
         "finger_order": HAND_FINGER_ORDER_ID,
         "derivation": FINGERTIP_POINTS_DERIVATION,
         "policy_id": FINGERTIP_POLICY_ID,
-        # Numeric FK inputs behind the deployed fingertip observation; same
-        # HandParams source and canonical_json as the persisted attr.
-        "fingertip_config_json": canonical_json(
-            {
-                "fingertip_link_names": list(hand.fingertip_link_names),
-                "handbase_position_eef_m": list(hand.T_eef_handbase_pos_xyz),
-                "handbase_quat_eef_wxyz": list(hand.T_eef_handbase_quat_wxyz),
-            }
-        ),
+
     }
 
 
@@ -242,19 +231,6 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
             field_name="point_cloud",
             expected=_expected_pointcloud_semantics(),
         )
-        # The persisted plane records dataset calibration. Live perception uses
-        # the current calibrated plane; only processing settings must match.
-        try:
-            processing = json.loads(point_cloud.semantics.get("processing_config_json"))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("point_cloud processing_config_json mismatch") from exc
-        if (
-            not isinstance(processing, dict)
-            or set(processing) != {"pointcloud", "table_plane_abcd"}
-            or canonical_json(processing["pointcloud"])
-            != canonical_json(runtime.pointcloud.to_dict())
-        ):
-            raise ValueError("point_cloud processing_config_json mismatch")
     fingertip_points = fields_by_name.get("fingertip_points")
     if fingertip_points is not None:
         _validate_field_semantics(

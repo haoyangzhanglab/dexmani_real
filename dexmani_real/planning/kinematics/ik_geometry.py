@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 from ..collision import CollisionInfo
 from ..paths import wrap_nearest_equivalent
-from .pose import Pose, ensure_qpos
+from .pose import ensure_qpos
 
 def is_mplib_success(status: str) -> bool:
     """Canonical MPlib IK status check — True when MPlib reports success.
@@ -42,20 +42,6 @@ class IKGeometry:
         self._cm = collision_model
         # Equivalent-joint masks already guarantee a range of at least 2π.
         self._periods_arr = np.where(self.equivalent_joint_mask, 2.0 * np.pi, 1.0)
-
-    def call_mplib_ik(
-        self, target_pose_base: Pose, seed_qpos: np.ndarray, n_init_qpos: int, return_closest: bool
-    ) -> tuple[str, Any]:
-        # MPlib's return_closest only re-selects already-converged goals.
-        return self.mp_planner.IK(
-            goal_pose=self.kin.to_mplib_pose(target_pose_base),
-            start_qpos=seed_qpos,
-            mask=None,
-            n_init_qpos=n_init_qpos,
-            threshold=1e-3,
-            return_closest=return_closest,
-        )
-
 
     def resolve_planning_limits(self, profile: MotionPlanningConfig, reference_qpos: np.ndarray | None = None) -> np.ndarray:
         if profile.planning_limits_deg is not None:
@@ -154,17 +140,12 @@ class IKGeometry:
         upper = np.maximum(path - limits[None, :, 1], 0.0)
         return outside, np.maximum(lower, upper)
 
-
     def _require_collision_model(self) -> None:
         if self._cm is None:
             raise RuntimeError(
                 "CollisionModel not configured — cannot check collisions. "
                 "Pass collision_model=... to IKGeometry constructor."
             )
-
-    def has_self_collision(self, qpos: np.ndarray) -> bool:
-        self._require_collision_model()
-        return self._cm.check_self_collision(qpos)  # type: ignore[union-attr]
 
     def check_self_collision(self, qpos: np.ndarray) -> CollisionInfo:
         self._require_collision_model()
@@ -304,7 +285,6 @@ class IKGeometry:
             if info:
                 return info
         return None
-
 
     def weighted_joint_distance(
         self,

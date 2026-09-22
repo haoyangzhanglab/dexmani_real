@@ -62,14 +62,11 @@ logger = get_logger(__name__)
 _KNOWN_CATEGORIES: dict[str, set[str]] = {
     "arm": {"arm_qpos"},
     "hand": {"hand_qpos", "hand_contact"},
-    "action": {"action_arm_joint_sent", "action_arm_ee", "action_hand_joint"},
+    "action": {"action_arm_joint_target", "arm_eef_intent", "action_hand_joint_target"},
     "vr": {"vr_wrist_pos", "vr_wrist_rot6d", "vr_landmarks"},
     "camera": {"rgb", "depth"},
     "flags": {
         "flag_frame_status",
-        "command_id",
-        "arm_command_adopted",
-        "hand_command_adopted",
         "flag_camera_fresh",
         "camera_depth_frame_number",
         "camera_color_frame_number",
@@ -177,7 +174,6 @@ def print_episode_info(h5_path: str) -> None:
             )
         status = f["flag_frame_status"][:]
         print(f"frame OK rate: {np.mean(status == 0):.2%}")
-        print(f"represented command IDs: {np.unique(f['command_id'][:]).size}")
         if "flag_camera_fresh" in f:
             fresh = f["flag_camera_fresh"][:]
             print(f"flag_camera_fresh rate: {fresh.mean():.2%}")

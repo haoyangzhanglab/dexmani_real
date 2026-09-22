@@ -55,8 +55,6 @@ class RuntimeChannelsConfig:
     pointcloud_num_points: int = 1024
     camera_requested: bool = False
     pointcloud_requested: bool = False
-    # Point-cloud ring capacity must cover the observation horizon so the
-    # per-step point-cloud history is a real window, not a broadcast.
     pointcloud_ring_maxlen: int = 8
 
     camera_rgb_shape: tuple[int, int, int] = field(
@@ -66,12 +64,9 @@ class RuntimeChannelsConfig:
         default_factory=lambda: camera.depth_shape
     )
 
-    adoption_accounting_timeout_s: float = 0.75
     arm_home_q_maxsize: int = 2
 
     def __post_init__(self) -> None:
-        if not np.isfinite(self.adoption_accounting_timeout_s) or self.adoption_accounting_timeout_s <= 0:
-            raise ValueError("adoption accounting timeout must be finite and positive")
         capacities = (
             self.camera_ring_maxlen,
             self.vr_ring_maxlen,
@@ -110,7 +105,6 @@ class RuntimeChannelsConfig:
         cam = getattr(runtime, "camera")
         return cls(
             camera_ring_maxlen=int(cam.ring_maxlen),
-            adoption_accounting_timeout_s=float(getattr(runtime, "policy").action_apply_timeout_s),
             camera_rgb_shape=(int(cam.height), int(cam.width), 3),
             camera_depth_shape=(int(cam.height), int(cam.width)),
             pointcloud_num_points=int(pointcloud_num_points),
@@ -128,40 +122,8 @@ _RING_RESOURCE_NAMES = (
     "record_sample_ring",
     "pointcloud_ring",
 )
-_QUEUE_RESOURCE_NAMES = ("arm_home_q",)
+_QUEUE_RESOURCE_NAMES = ("arm_home_q", "arm_home_result_q", "hand_home_q", "hand_home_result_q")
 _RECORDER_QUEUE_RESOURCE_NAMES = ("record_control_q", "record_result_q")
-
-# Heartbeat slots use a fixed process-stable order.
-HEARTBEAT_FIELDS: tuple[str, ...] = (
-    "arm",
-    "hand",
-    "policy",
-    "recorder",
-    "vr",
-    "camera",
-    "pointcloud",
-)
-HEARTBEAT_INDEX: dict[str, int] = {
-    name: index for index, name in enumerate(HEARTBEAT_FIELDS)
-}
-
-# Readiness slots use a fixed, process-stable order and atomic 0/1 flags.
-READY_FIELDS: tuple[str, ...] = (
-    "arm",
-    "hand",
-    "camera",
-    "pointcloud",
-    "vr",
-    "policy",
-    "recorder",
-)
-READY_INDEX: dict[str, int] = {name: index for index, name in enumerate(READY_FIELDS)}
-
-
-def new_frame(dtype: np.dtype) -> np.ndarray:
-    """Allocate a zero-initialized 1-element structured array for ring writes."""
-    return np.zeros(1, dtype=dtype)
-
 
 @dataclass
 class RuntimeChannels:
@@ -176,32 +138,26 @@ class RuntimeChannels:
     arm_state_ring: SharedMemoryRingBuffer  # arm -> policy
     hand_state_ring: SharedMemoryRingBuffer  # hand -> policy
     robot_command_ring: (
-        SharedMemoryRingBuffer  # current-run single-inflight command mailbox
+        SharedMemoryRingBuffer  # latest current-run target mailbox
     )
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> policy
 
     arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, run_id, expires_ns)
-    # Arm worker -> HOME waiter; zero until success, stale after run_id changes.
-    arm_home_completed_run_id: Any
+    arm_home_result_q: Any
+    hand_home_q: Any
+    hand_home_result_q: Any
     record_control_q: mp.Queue  # policy -> RecorderIO episode boundaries
     record_result_q: mp.Queue  # RecorderIO -> RecorderClient (sole consumer)
     run_id: Any  # controller advances it to invalidate old policy proposals
     run_started_monotonic_ns: Any  # start of the current RUNNING observation epoch
     # Latest software RUNNING terminal snapshot; safety owns writes under motion_lock.
-    run_started_id: Any  # run identity survives command-only rebases
-    run_ended_id: Any
-    run_ended_monotonic_ns: Any
     run_ended_reason: Any
     recorder_finish_deadline_ns: Any  # recorder-owned; zero while idle
     recorder_completed_ns: Any  # close completed before finish deadline; reset on START
-    recorder_transport_failed: Any  # sticky; never reuse IPC after failure/death
+    workflow_failed: Any  # sticky; never reuse IPC after failure/death
     recorder_consumed_sequence: Any
-    next_command_id: Any  # shared lifetime allocator, under motion_lock
-    adoption_accounting_timeout_s: float
     record_episode_path: Any  # RecorderIO-owned identity for orphan diagnostics
-    pending_record_command_id: Any  # protects last_adopted evidence until accounting
-    pending_record_revoked_ns: Any  # first revocation boundary, never extended
 
     is_running: Any  # Main -> all
     is_recording: Any  # policy -> arm/hand/camera
@@ -212,8 +168,6 @@ class RuntimeChannels:
     # Sticky experiment/session failure latch. When set without a physical/runtime
     # fault, the owning workflow may use verified non-FAULT shutdown while still
     # reporting the session as failed.
-    session_failed: Any
-    evidence_failed: Any  # collection invalidity latch, distinct from hardware fault
     estop_request: Any  # policy -> arm/hand
     quit_requested: Any  # policy -> Main
     camera_requested: (
@@ -232,9 +186,14 @@ class RuntimeChannels:
     # held across hardware SDK calls.
     motion_lock: Any
 
-    heartbeats: Any  # fixed-order array of per-subsystem heartbeat timestamps (s)
 
-    ready_flags: Any  # fixed-order array of per-subsystem readiness flags (0/1)
+    arm_ready: Any
+    hand_ready: Any
+    policy_ready: Any
+    recorder_ready: Any
+    vr_ready: Any
+    camera_ready: Any
+    pointcloud_ready: Any
 
     camera_depth_scale: Any  # depth scale (mm to meters)
     camera_serial: Any  # serial number string
@@ -251,7 +210,7 @@ class RuntimeChannels:
         camera_depth_shape: tuple[int, int] | None = None,
         mp_context: Any | None = None,
     ) -> "RuntimeChannels":
-        """Create all rings, queues, flags, events, and heartbeats.
+        """Create all rings, queues, flags, and events.
 
         Call once from Main before spawning child processes.
         """
@@ -302,7 +261,7 @@ class RuntimeChannels:
         )
         storage.vr_ring = SharedMemoryRingBuffer(
             f"{prefix}_vr",
-            dtype=vr_frame_dtype(),
+            dtype=VR_FRAME_DTYPE,
             maxlen=cfg.vr_ring_maxlen,
             create=True,
         )
@@ -338,35 +297,28 @@ class RuntimeChannels:
         )
 
         storage.arm_home_q = ctx.Queue(maxsize=cfg.arm_home_q_maxsize)
-        storage.arm_home_completed_run_id = ctx.Value("Q", 0)
+        storage.arm_home_result_q = ctx.Queue(maxsize=2)
+        storage.hand_home_q = ctx.Queue(maxsize=2)
+        storage.hand_home_result_q = ctx.Queue(maxsize=2)
         storage.record_control_q = ctx.Queue(maxsize=8)
         storage.record_result_q = ctx.Queue(maxsize=8)
         storage.run_id = ctx.Value("Q", 1)
         storage.run_started_monotonic_ns = ctx.Value("Q", 0)
-        storage.run_started_id = ctx.Value("Q", 0)
-        storage.run_ended_id = ctx.Value("Q", 0)
-        storage.run_ended_monotonic_ns = ctx.Value("Q", 0)
         storage.run_ended_reason = ctx.Value("i", 0)
         # Recorder may be killed at any instruction. Its shared status accesses
         # must not acquire mutexes also needed by surviving workers/monitor.
-        # Heartbeat/ready slots and consumed sequence have one writer; camera
+        # Ready events and consumed sequence have one writer; camera
         # metadata is immutable after camera readiness. These status scalars
         # need no compound transaction. Motion state keeps its existing locks.
         storage.recorder_finish_deadline_ns = ctx.Value("q", 0, lock=False)
-        storage.recorder_transport_failed = ctx.Value("b", False, lock=False)
+        storage.workflow_failed = ctx.Value("b", False, lock=False)
         storage.recorder_completed_ns = ctx.Value("q", 0, lock=False)
         storage.recorder_consumed_sequence = ctx.Value("Q", 0, lock=False)
-        storage.adoption_accounting_timeout_s = cfg.adoption_accounting_timeout_s
         storage.record_episode_path = ctx.Array("c", b"\x00" * 4096, lock=False)
-        storage.next_command_id = ctx.Value("Q", 1)
-        storage.pending_record_command_id = ctx.Value("Q", 0)
-        storage.pending_record_revoked_ns = ctx.Value("Q", 0)
 
         storage.is_running = ctx.Value("b", True, lock=False)
         storage.is_recording = ctx.Value("b", False)
         storage.error_state = ctx.Value("b", False)
-        storage.session_failed = ctx.Value("b", False)
-        storage.evidence_failed = ctx.Value("b", False, lock=False)
         storage.estop_request = ctx.Value("b", False)
         storage.quit_requested = ctx.Value("b", False)
         storage.camera_requested = ctx.Value("b", cfg.camera_requested)
@@ -378,9 +330,14 @@ class RuntimeChannels:
         storage.safety_state = ctx.Value("i", DISARMED_SAFETY_STATE_WIRE_VALUE)
         storage.motion_lock = ctx.RLock()
 
-        storage.heartbeats = ctx.Array("d", [0.0] * len(HEARTBEAT_FIELDS), lock=False)
 
-        storage.ready_flags = ctx.Array("b", len(READY_FIELDS), lock=False)
+        storage.arm_ready = ctx.Event()
+        storage.hand_ready = ctx.Event()
+        storage.policy_ready = ctx.Event()
+        storage.recorder_ready = ctx.Event()
+        storage.vr_ready = ctx.Event()
+        storage.camera_ready = ctx.Event()
+        storage.pointcloud_ready = ctx.Event()
 
         storage.camera_depth_scale = ctx.Value("d", 0.0, lock=False)
         storage.camera_serial = ctx.Array("c", b"\x00" * 32, lock=False)
@@ -451,29 +408,7 @@ class RuntimeChannels:
             logger.error("RuntimeChannels close incomplete: %s", ", ".join(errors))
         return self._closed
 
-    def set_heartbeat(self, name: str, value_s: float) -> None:
-        """Record a fresh heartbeat timestamp (s) for *name* (a HEARTBEAT_FIELDS key)."""
-        self.heartbeats[HEARTBEAT_INDEX[name]] = float(value_s)
-
-    def get_heartbeat(self, name: str) -> float:
-        """Return the last recorded heartbeat timestamp (s) for *name*, or 0.0."""
-        return float(self.heartbeats[HEARTBEAT_INDEX[name]])
-
-    def set_ready(self, name: str) -> None:
-        """Mark *name* (a READY_FIELDS key) ready."""
-        self.ready_flags[READY_INDEX[name]] = 1
-
-    def is_ready(self, name: str) -> bool:
-        """Return True when *name* is ready."""
-        return bool(self.ready_flags[READY_INDEX[name]])
-
-
-def vr_frame_dtype() -> np.dtype:
-    """Return the wire dtype published by ``sensor.vr_worker``."""
-    return VR_FRAME_DTYPE
-
-
-def read_arm_state(shared: "RuntimeChannels") -> "np.ndarray | None":
+def read_arm_state(shared: RuntimeChannels) -> np.ndarray | None:
     """Read latest arm state from ring. Returns raw structured array or None."""
     result = shared.arm_state_ring.read_latest()
     if result is None:
@@ -482,68 +417,6 @@ def read_arm_state(shared: "RuntimeChannels") -> "np.ndarray | None":
     return data
 
 
-def read_hand_state(shared: "RuntimeChannels") -> "np.ndarray | None":
-    """Read latest hand state from ring. Returns raw structured array or None."""
-    result = shared.hand_state_ring.read_latest()
-    if result is None:
-        return None
-    data, _ts_ns, _seq = result
-    return data
-
-
-def read_arm_state_dict(shared: "RuntimeChannels") -> "dict | None":
-    """Read latest arm state from ring. Return dict of numpy arrays or None.
-
-    Fields: qpos(7), qvel(7), tau(7), error_code, connected, tracking_err,
-            last_adopted_run_id, last_adopted_command_id,
-            last_adopted_monotonic_ns, source/publish timestamps, state_valid.
-    Callers must validate fields they depend on (e.g. ``np.all(np.isfinite(d["qpos"]))``).
-    The EEF pose is not published; derive it from ``qpos`` via
-    ``planning.kinematics.arm_fk.make_arm_fk()`` when needed.
-    """
-    data = read_arm_state(shared)
-    if data is None:
-        return None
-    return {
-        "qpos": np.asarray(data["qpos"][0], dtype=np.float64),
-        "qvel": np.asarray(data["qvel"][0], dtype=np.float64),
-        "tau": np.asarray(data["tau"][0], dtype=np.float64),
-        "error_code": int(data["error_code"][0]),
-        "connected": bool(data["connected"][0]),
-        "tracking_err": float(data["tracking_err"][0]),
-        "last_adopted_run_id": int(data["last_adopted_run_id"][0]),
-        "last_adopted_command_id": int(data["last_adopted_command_id"][0]),
-        "last_adopted_monotonic_ns": int(data["last_adopted_monotonic_ns"][0]),
-        "source_monotonic_ns": int(data["source_monotonic_ns"][0]),
-        "publish_monotonic_ns": int(data["publish_monotonic_ns"][0]),
-        "state_valid": bool(data["state_valid"][0]),
-    }
-
-
-def read_hand_state_dict(shared: "RuntimeChannels") -> "dict | None":
-    """Read latest hand state from ring. Return dict of numpy arrays or None.
-
-    Fields: qpos, current, tactile_aggregate, tactile_aggregate_valid,
-    tactile_dense, tactile_dense_valid, connected, qpos_stale,
-    last_sdk_setpoint_accepted_monotonic_ns, source_monotonic_ns,
-    publish_monotonic_ns, state_valid.
-    """
-    data = read_hand_state(shared)
-    if data is None:
-        return None
-    return {
-        "qpos": np.asarray(data["qpos"][0], dtype=np.float64),
-        "current": np.asarray(data["current"][0], dtype=np.float64),
-        "tactile_aggregate": np.asarray(data["tactile_aggregate"][0], dtype=np.float32),
-        "tactile_aggregate_valid": bool(data["tactile_aggregate_valid"][0]),
-        "tactile_dense": np.asarray(data["tactile_dense"][0], dtype=np.float32),
-        "tactile_dense_valid": bool(data["tactile_dense_valid"][0]),
-        "connected": bool(data["connected"][0]),
-        "qpos_stale": bool(data["qpos_stale"][0]),
-        "last_sdk_setpoint_accepted_monotonic_ns": int(
-            data["last_sdk_setpoint_accepted_monotonic_ns"][0]
-        ),
-        "source_monotonic_ns": int(data["source_monotonic_ns"][0]),
-        "publish_monotonic_ns": int(data["publish_monotonic_ns"][0]),
-        "state_valid": bool(data["state_valid"][0]),
-    }
+def read_arm_state_dict(shared):
+    state = read_arm_state(shared)
+    return None if state is None else {name: state[name][0].copy() for name in state.dtype.names}

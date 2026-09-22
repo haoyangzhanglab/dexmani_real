@@ -42,7 +42,7 @@ TACTILE_AXIS_COUNT = 3
 # artifacts, and deployment semantics: contact_force is the aggregate calc_force
 # per finger; tactile_force is the dense raw_force payload.  Both stay in the
 # SDK-native numeric scale (SI Newton unverified) and per-finger sensor axes
-# (taxel spatial geometry unverified); validity comes from provenance flags,
+# (taxel spatial geometry unverified); validity comes from the explicit tactile flags,
 # never from payload magnitude.
 CONTACT_FORCE_REPRESENTATION = "xhand_sdk_calc_force_fx_fy_fz_bias_corrected"
 TACTILE_FORCE_REPRESENTATION = "xhand_sdk_raw_force_fx_fy_fz_bias_corrected"
@@ -112,3 +112,7 @@ _HAND_URDF_JOINT_NAMES: tuple[str, ...] = (
 HAND_SDK_TO_URDF_IDX: tuple[int, ...] = tuple(
     XHAND_SDK_JOINT_NAMES.index(name) for name in _HAND_URDF_JOINT_NAMES
 )
+
+# Mechanical limits from the xArm7 robot model, radians.
+XARM7_HARD_LOWER = (-6.28318530718, -2.059, -6.28318530718, -0.19198, -6.28318530718, -1.69297, -6.28318530718)
+XARM7_HARD_UPPER = (6.28318530718, 2.0944, 6.28318530718, 3.927, 6.28318530718, 3.14159265359, 6.28318530718)

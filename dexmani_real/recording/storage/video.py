@@ -18,7 +18,6 @@ Typical usage (decode)::
 
 from __future__ import annotations
 
-import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,10 +60,7 @@ class VideoEncoderConfig:
 class VideoEncoder:
     """Streaming H.264 encoder that writes a ``.mp4`` sidecar file.
 
-    Frames are written sequentially via :meth:`write_frame`.  The
-    underlying FFmpeg muxer is :mod:`threading.Lock`-protected so a
-    single encoder can be driven from the recorder's background writer
-    thread and/or the stop-time drain path without races.
+    Frames are written sequentially by the owning recorder process.
 
     The output container is created lazily on the first frame so the
     constructor never blocks on I/O.  Call :meth:`close` (or use the
@@ -89,9 +85,7 @@ class VideoEncoder:
         self._container: av.container.OutputContainer | None = None
         self._stream: Any = None  # av.video.VideoStream — PyAV stubs incomplete
         self._frame_count: int = 0
-        self._lock = threading.Lock()
         self._closed = False
-
 
     @property
     def path(self) -> Path:
@@ -102,46 +96,38 @@ class VideoEncoder:
         """Number of frames written so far."""
         return self._frame_count
 
-    @property
-    def closed(self) -> bool:
-        return self._closed
-
     def write_frame(self, frame: np.ndarray) -> None:
         """Encode and mux one RGB frame.
 
         Frame shape must be ``(height, width, 3)`` with dtype ``uint8``.
         The caller is responsible for feeding frames in display order;
-        duplicate frames (causal hold-last grid slots) are fine — H.264
-        encodes them as near-zero-cost skip blocks.
+        repeated camera samples are encoded efficiently by H.264.
         """
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("VideoEncoder is closed")
-            self._write_frame_impl(frame)
+        if self._closed:
+            raise RuntimeError("VideoEncoder is closed")
+        self._write_frame_impl(frame)
 
     def close(self) -> None:
         """Flush the encoder and finalise the MP4 container.
 
         Idempotent — safe to call multiple times.
         """
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            if self._container is None:
-                return
-            if self._stream is not None:
-                for packet in self._stream.encode(None):  # type: ignore[attr-defined]
-                    self._container.mux(packet)
-            self._container.close()
-            self._container = None
-            self._stream = None
-            logger.debug(
-                "VideoEncoder closed: %s (%d frames)",
-                self._path.name,
-                self._frame_count,
-            )
-
+        if self._closed:
+            return
+        self._closed = True
+        if self._container is None:
+            return
+        if self._stream is not None:
+            for packet in self._stream.encode(None):  # type: ignore[attr-defined]
+                self._container.mux(packet)
+        self._container.close()
+        self._container = None
+        self._stream = None
+        logger.debug(
+            "VideoEncoder closed: %s (%d frames)",
+            self._path.name,
+            self._frame_count,
+        )
 
     def __enter__(self) -> "VideoEncoder":
         return self
@@ -149,9 +135,7 @@ class VideoEncoder:
     def __exit__(self, *args: object) -> None:
         self.close()
 
-
     def _write_frame_impl(self, frame: np.ndarray) -> None:
-        """Lock must be held by caller."""
         # Validate shape so we fail early with a clear message.
         if frame.ndim != 3 or frame.shape[2] != 3:
             raise ValueError(f"Expected (H, W, 3) uint8 RGB frame, got shape {frame.shape}")
@@ -204,7 +188,6 @@ class VideoDecoder:
         self._fps_val: float = 0.0
         self._opened = False
 
-
     @property
     def frame_count(self) -> int:
         """Total frame count in the video (cached on first open)."""
@@ -236,20 +219,6 @@ class VideoDecoder:
                 # Decode only VideoFrame values; PyAV stubs include subtitle types.
                 if isinstance(frame, av.VideoFrame):
                     yield frame.to_ndarray(format="rgb24")
-
-    def count_decoded_frames(self) -> int:
-        """Fully decode the stream and count frames without retaining pixels."""
-        if not self._opened:
-            self._open()
-        if self._container is None:
-            raise RuntimeError("VideoDecoder: container is None after _open()")
-        self._container.seek(0)
-        count = 0
-        for packet in self._container.demux(self._stream):
-            for frame in packet.decode():
-                if isinstance(frame, av.VideoFrame):
-                    count += 1
-        return count
 
     def read_frame(self, index: int) -> np.ndarray:
         """Decode a single frame by index.
@@ -290,13 +259,11 @@ class VideoDecoder:
             self._stream = None
             self._opened = False
 
-
     def __enter__(self) -> "VideoDecoder":
         return self
 
     def __exit__(self, *args: object) -> None:
         self.close()
-
 
     def _open(self) -> None:
         if self._opened:

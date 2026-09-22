@@ -18,18 +18,14 @@ from dexmani_real.teleop.jog import (
     compute_cartesian_jog_delta,
     limit_cartesian_pose_lead,
 )
-from dexmani_real.robot.projection import (
-    ARM_COMMAND_JUMP_REJECTION,
-    validate_arm_command,
-)
-from dexmani_real.robot.commands import (prepare_joint_command, publish_command, wait_command_adopted)
-from dexmani_real.robot.commands import SafetyGate
+from dexmani_real.robot.projection import project_arm_command
+from dexmani_real.robot.commands import RobotCommand, publish_command
+from dexmani_real.runtime.observation import sample_is_fresh
 from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
 from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.pose import quat_multiply
 from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
 from dexmani_real.runtime.operator_input import KeyboardInput
-from dexmani_real.utils.feedback import validate_arm_feedback
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
@@ -46,19 +42,8 @@ def read_initial_arm(
     deadline_s = time.monotonic() + float(runtime.safety.readiness_timeouts_s["arm"])
     while time.monotonic() < deadline_s:
         state = read_arm_state_dict(shared)
-        if state is not None:
-            issue = validate_arm_feedback(
-                connected=state["connected"],
-                error_code=state["error_code"],
-                state_valid=state["state_valid"],
-                source_monotonic_ns=state["source_monotonic_ns"],
-                now_monotonic_ns=time.monotonic_ns(),
-                max_age_s=float(runtime.policy.arm_state_stale_threshold_s),
-                qpos=state["qpos"],
-                qvel=state["qvel"],
-            )
-            if issue is None and state["error_code"] == 0:
-                return state
+        if state is not None and sample_is_fresh(state["timestamp_ns"], runtime.policy.arm_state_stale_threshold_s):
+            return state
         time.sleep(_INITIAL_STATE_POLL_S)
     return None
 
@@ -99,99 +84,14 @@ class CalibrationLoopState:
         )
 
 
-@dataclass(frozen=True)
-class _CalibrationArmFeedback:
-    qpos: np.ndarray | None
-    issue: str = ""
-    error_code: int = 0
-
-
 class HomeKeyOutcome(str, Enum):
     IDLE = "idle"
     COMPLETED = "completed"
     FAULT = "fault"
 
 
-def read_calibration_arm_feedback(
-    shared: RuntimeChannels, runtime: ExperimentConfig
-) -> _CalibrationArmFeedback:
-    arm_state = read_arm_state_dict(shared)
-    if arm_state is None:
-        return _CalibrationArmFeedback(None, "arm state is unavailable")
-    qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
-    issue = validate_arm_feedback(
-        connected=arm_state["connected"],
-        error_code=arm_state["error_code"],
-        state_valid=arm_state["state_valid"],
-        source_monotonic_ns=arm_state["source_monotonic_ns"],
-        now_monotonic_ns=time.monotonic_ns(),
-        max_age_s=float(runtime.policy.arm_state_stale_threshold_s),
-        qpos=qpos,
-        qvel=arm_state["qvel"],
-    )
-    return _CalibrationArmFeedback(
-        None if issue is not None else qpos,
-        issue or "",
-        int(arm_state["error_code"]),
-    )
-
-
-def publish_calibration_quit_hold(
-    shared: RuntimeChannels,
-    runtime: ExperimentConfig,
-    safety_gate: SafetyGate,
-    current_qpos: np.ndarray,
-    *,
-    calibration_saved: bool,
-) -> int:
-    """Revoke the current command, publish measured hold, and return exit status."""
-    if not revoke_motion(shared, SafetyState.ARMED):
-        set_calibration_fault(shared, "failed to establish calibration quit boundary")
-        return 1
-    prepared = prepare_joint_command(
-        shared,
-        current_qpos,
-        gate=safety_gate,
-        arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
-        hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
-    )
-    candidate = prepared.candidate
-    published = (
-        publish_command(
-            shared,
-            candidate,
-            required_safety_state=SafetyState.ARMED,
-        )
-        if candidate is not None
-        else None
-    )
-    accepted = None
-    if (
-        candidate is not None
-        and published is not None
-        and published.published
-        and published.command is not None
-    ):
-        accepted = wait_command_adopted(
-            shared,
-            command=published.command,
-            wait_for_arm=True,
-            wait_for_hand=False,
-            timeout_s=float(runtime.policy.action_apply_timeout_s),
-            arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
-            hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
-        )
-    if accepted is None or not accepted.accepted:
-        reason = prepared.reason
-        if not reason and published is not None:
-            reason = published.reason
-        if not reason and accepted is not None:
-            reason = accepted.reason
-        set_calibration_fault(
-            shared,
-            f"measured quit hold was not accepted: {reason}",
-        )
-        return 1
+def finish_calibration_motion(shared, *, calibration_saved):
+    revoke_motion(shared)
     return 0 if calibration_saved else 2
 
 
@@ -222,11 +122,7 @@ def handle_calibration_home_key(
         shared,
         np.asarray(runtime.arm.home_qpos, dtype=np.float64),
         planner=planner,
-        config=ArmHomeConfig.from_runtime(
-            runtime,
-            publish_policy_heartbeat=False,
-        ),
-        current_qpos=state.current_qpos,
+        config=ArmHomeConfig.from_runtime(runtime),
         estop_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
         progress=lambda message: print(f"  {message}", flush=True),
     )
@@ -240,7 +136,7 @@ def handle_calibration_home_key(
 
     state.current_qpos = np.asarray(refreshed["qpos"], dtype=np.float64)
     state.previous_command = state.current_qpos.copy()
-    if not home_result.succeeded:
+    if not home_result.ok:
         print("  WARNING: return-home request was not executed")
     state.blocked_until_release = False
     rate.reset()
@@ -292,13 +188,12 @@ def run_calibration_motion_tick(
     shared: RuntimeChannels,
     runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
-    safety_gate: SafetyGate,
     workspace: np.ndarray,
     keys: KeyboardInput,
     state: CalibrationLoopState,
     calib_cfg: CalibrationConfig,
 ) -> None:
-    """Advance from the arm-ACK anchor with measured-pose bounded lookahead."""
+    """Advance from the previous high-level target with measured-pose bounded lookahead."""
     if shared.stop_request.value:
         _reject_calibration_motion(shared, state, "command admission revoked")
         with shared.motion_lock:
@@ -339,6 +234,7 @@ def run_calibration_motion_tick(
             set_calibration_fault(shared, "failed to enter calibration motion")
             return
 
+    epoch = int(shared.run_id.value)
     measured_pose = planner.kin.compute_eef_pose_world(state.current_qpos)
     anchor_pose = planner.kin.compute_eef_pose_world(state.previous_command)
     workspace_margin_m = float(runtime.keyboard_teleop.workspace_command_margin_m)
@@ -378,79 +274,10 @@ def run_calibration_motion_tick(
         _reject_calibration_motion(shared, state, ik_result.reason or "IK rejected")
         return
 
-    q_cmd = planner.ik_mgr.nearest_equivalent_qpos(
-        np.asarray(ik_result.qpos, dtype=np.float64), state.previous_command
-    )
-    # Producer-owned reject-style validation: an oversized jog step is
-    # rejected here once; the worker keeps only the hard SDK-boundary checks.
-    issue = validate_arm_command(
-        q_cmd,
-        state.previous_command,
-        joint_lower_rad=np.asarray(runtime.arm.joint_limit_lower),
-        joint_upper_rad=np.asarray(runtime.arm.joint_limit_upper),
-        max_command_jump_rad=runtime.arm.max_servo_command_jump_rad,
-    )
-    if issue is not None:
-        if issue == ARM_COMMAND_JUMP_REJECTION:
-            logger.warning("Calibration command rejected: %s", issue)
-            _reject_calibration_motion(shared, state, issue)
-        else:
-            set_calibration_fault(shared, f"invalid calibration IK output: {issue}")
-        return
-    prepared = prepare_joint_command(
-        shared,
-        q_cmd,
-        gate=safety_gate,
-        arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
-        hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
-    )
-    if prepared.fatal:
-        set_calibration_fault(shared, prepared.reason)
-        return
-    candidate = prepared.candidate
-    published = (
-        publish_command(
-            shared,
-            candidate,
-            required_safety_state=SafetyState.RUNNING,
-        )
-        if candidate is not None
-        else None
-    )
-    accepted = None
-    if (
-        candidate is not None
-        and published is not None
-        and published.published
-        and published.command is not None
-    ):
-        accepted = wait_command_adopted(
-            shared,
-            command=published.command,
-            wait_for_arm=True,
-            wait_for_hand=False,
-            timeout_s=float(runtime.policy.action_apply_timeout_s),
-            arm_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["arm"]),
-            hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
-        )
-    if (
-        accepted is None
-        or not accepted.accepted
-        or candidate is None
-        or candidate.arm_qpos is None
-    ):
-        reason = prepared.reason
-        if not reason and published is not None:
-            reason = published.reason
-        if not reason and accepted is not None:
-            reason = accepted.reason
-        logger.warning(
-            "arm motion command rejected (%s) — release all jog keys to restart",
-            reason,
-        )
-        _reject_calibration_motion(shared, state, reason)
-        return
-    state.previous_command = np.asarray(candidate.arm_qpos, dtype=np.float64).copy()
+    q_cmd = project_arm_command(ik_result.qpos, state.current_qpos,
+        joint_lower_rad=runtime.arm.joint_limit_lower, joint_upper_rad=runtime.arm.joint_limit_upper)
+    if publish_command(shared, RobotCommand(epoch, q_cmd)):
+        state.previous_command = q_cmd
 
     if state.frame % calib_cfg.status_interval_frames == 0:
         measured_pose = planner.kin.compute_eef_pose_world(state.current_qpos)

@@ -1,8 +1,7 @@
 """Interactive xArm7/RealSense lifecycle for ArUco eye-to-hand calibration.
 
-This module owns worker topology, RealSense/GUI interaction, sample capture,
-and cleanup. ``motion.py`` owns the arm-motion state machine,
-gated command publication, quit hold, and homing actions.
+This module owns workers, GUI interaction, sample capture and cleanup.
+``motion.py`` owns Cartesian jogging, motion revocation and planned home.
 
 Computes T_world_camera by detecting ArUco markers on the end-effector from a
 fixed tripod-mounted camera and solving the hand-eye transform across five
@@ -40,7 +39,7 @@ Controls:
 XHand is optional, but ``--hand-geometry`` is a required physical-state assertion,
 not a geometry selector: pass ``absent`` only when no XHand is mounted, or
 ``secured-home`` only when an installed hand is physically fixed at its configured
-home pose. Current calibration collision checks use the canonical fixed-home XHand
+home pose. Planned return-home collision checks use the canonical fixed-home XHand
 envelope for both assertions, so the ``absent`` case is conservative.
 """
 
@@ -60,8 +59,7 @@ from dexmani_real.calibration.camera.motion import (
     CalibrationLoopState,
     HomeKeyOutcome,
     handle_calibration_home_key,
-    publish_calibration_quit_hold,
-    read_calibration_arm_feedback,
+    finish_calibration_motion,
     read_initial_arm,
     run_calibration_motion_tick,
     set_calibration_fault,
@@ -81,7 +79,9 @@ from dexmani_real.calibration.camera.solver import (
     save_camera_calibration,
 )
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.robot.commands import SafetyGate, planner_action_safety_gate
+from dexmani_real.runtime.observation import sample_is_fresh, read_camera_frame
+from dexmani_real.sensor.camera.worker import CameraLoopConfig, camera_loop
+import json
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
     RuntimeChannelsConfig,
@@ -91,9 +91,9 @@ from dexmani_real.planning import OnlineIKConfig, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.runtime.safety import SafetyState, require_transition
-from dexmani_real.runtime.supervisor import shutdown_processes, wait_subsystem_ready
+from dexmani_real.runtime.processes import shutdown_processes_verified
+from dexmani_real.runtime.supervisor import wait_subsystem_ready
 from dexmani_real.runtime.operator_input import KeyboardInput
-from dexmani_real.utils.feedback import validate_arm_feedback
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
@@ -118,12 +118,18 @@ def _detect_aruco_stable(
     """Capture N frames and return median ArUco pose for noise reduction."""
     rvecs_all: list[np.ndarray] = []
     tvecs_all: list[np.ndarray] = []
+    last_stamp = 0
     for _ in range(n_frames):
-        frames = pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        if not color_frame:
-            continue
-        image = np.asanyarray(color_frame.get_data())
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            frame = read_camera_frame(pipeline)
+            if frame and frame["timestamp_ns"] > last_stamp and sample_is_fresh(frame["timestamp_ns"], 0.25):
+                break
+            time.sleep(0.01)
+        else:
+            raise RuntimeError("fresh calibration image unavailable")
+        last_stamp = frame["timestamp_ns"]
+        image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
         result = detect_aruco_pose(
             image,
             intrinsics,
@@ -140,56 +146,12 @@ def _detect_aruco_stable(
     return np.median(rvecs_all, axis=0), np.median(tvecs_all, axis=0)
 
 
-def _start_camera(serial: str | None = None) -> tuple[Any, str, np.ndarray, np.ndarray]:
-    """Start RealSense color stream and return (pipeline, serial, K, dist)."""
-    import pyrealsense2 as rs  # type: ignore[import-not-found]
-
-    pipeline = rs.pipeline()
-    rs_config = rs.config()
-    if serial:
-        rs_config.enable_device(serial)
-    rs_config.enable_stream(
-        rs.stream.color, _CAMERA_WIDTH, _CAMERA_HEIGHT, rs.format.bgr8, _CAMERA_FPS
-    )
-    started = False
-    try:
-        profile = pipeline.start(rs_config)
-        started = True
-        device = profile.get_device()
-        serial = device.get_info(rs.camera_info.serial_number)
-        color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
-        intr = color_profile.get_intrinsics()
-        intrinsics = np.array(
-            [[intr.fx, 0, intr.ppx], [0, intr.fy, intr.ppy], [0, 0, 1]],
-            dtype=np.float64,
-        )
-        distortion = np.array(intr.coeffs, dtype=np.float64)
-
-        # Warm-up: first few frames may have unstable auto-exposure.
-        for _ in range(_CAMERA_WARMUP_FRAMES):
-            pipeline.wait_for_frames()
-    except Exception:
-        if started:
-            try:
-                pipeline.stop()
-            except Exception:
-                logger.error(
-                    "camera cleanup after startup failure failed", exc_info=True
-                )
-        raise
-
-    return pipeline, serial, intrinsics, distortion
-
-
-def _build_planner_and_gate(
+def _build_planner(
     runtime: ExperimentConfig,
-) -> tuple[XArm7MotionPlanner, SafetyGate, np.ndarray]:
+) -> tuple[XArm7MotionPlanner, np.ndarray]:
     workspace = runtime.policy.workspace.as_array()
     planner = XArm7MotionPlanner.create_default(
         teleop_profile=OnlineIKConfig(
-            max_ik_jump_deg=(
-                float(np.rad2deg(runtime.arm.max_servo_command_jump_rad)),
-            ) * 7,
             max_pose_error_pos_m=float(runtime.keyboard_teleop.ik_max_pose_error_pos_m),
             max_pose_error_rot_rad=float(
                 runtime.keyboard_teleop.ik_max_pose_error_rot_rad
@@ -202,18 +164,11 @@ def _build_planner_and_gate(
     planner.set_hand_qpos(
         np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
     )
-    gate = planner_action_safety_gate(
-        planner=planner,
-        arm_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
-        arm_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
-        hand_joint_lower_rad=tuple(runtime.hand.qpos_min_rad),
-        hand_joint_upper_rad=tuple(runtime.hand.qpos_max_rad),
-    )
-    return planner, gate, workspace
+    return planner, workspace
 
 
 def _runtime_issue(
-    shared: RuntimeChannels, arm_process: Any, heartbeat_timeout_s: float
+    shared: RuntimeChannels, arm_process: Any, max_age_s: float
 ) -> str | None:
     if shared.estop_request.value:
         return "e-stop is requested"
@@ -223,16 +178,11 @@ def _runtime_issue(
         return "safety state is FAULT"
     if not arm_process.is_alive():
         return "arm worker exited"
-    heartbeat_s = shared.get_heartbeat("arm")
-    now_s = time.monotonic()
-    age_s = now_s - heartbeat_s
-    if (
-        not np.isfinite(heartbeat_s)
-        or heartbeat_s <= 0.0
-        or heartbeat_s > now_s
-        or age_s > heartbeat_timeout_s
-    ):
-        return f"arm heartbeat stale ({age_s:.2f}s)"
+    arm = read_arm_state_dict(shared)
+    if arm is None or not sample_is_fresh(arm["timestamp_ns"], max_age_s):
+        return "arm feedback stale"
+    if shared.workflow_failed.value:
+        return "camera acquisition failed"
     return None
 
 
@@ -306,18 +256,8 @@ def _read_stationary_calibration_arm_state(
     arm_state = read_arm_state_dict(shared)
     if arm_state is None:
         return None, "arm state unavailable"
-    feedback_issue = validate_arm_feedback(
-        connected=arm_state["connected"],
-        error_code=arm_state["error_code"],
-        state_valid=arm_state["state_valid"],
-        source_monotonic_ns=arm_state["source_monotonic_ns"],
-        now_monotonic_ns=time.monotonic_ns(),
-        max_age_s=float(runtime.policy.arm_state_stale_threshold_s),
-        qpos=np.asarray(arm_state["qpos"], dtype=np.float64),
-        qvel=arm_state["qvel"],
-    )
-    if feedback_issue is not None:
-        return None, feedback_issue
+    if not sample_is_fresh(arm_state["timestamp_ns"], runtime.policy.arm_state_stale_threshold_s):
+        return None, "arm feedback stale"
     max_velocity_rad_s = float(np.max(np.abs(np.asarray(arm_state["qvel"]))))
     velocity_convergence_rad_s = float(runtime.arm.homing.velocity_convergence_rad_s)
     if max_velocity_rad_s > velocity_convergence_rad_s:
@@ -500,11 +440,10 @@ def _show_calibration_preview(
     previous_image: np.ndarray | None,
 ) -> np.ndarray | None:
     """Poll and display the newest camera preview without blocking control."""
-    frames = pipeline.poll_for_frames()
-    color_frame = frames.get_color_frame() if frames else None
+    frame = read_camera_frame(pipeline)
     display_image = previous_image
-    if color_frame:
-        image = np.asanyarray(color_frame.get_data()).copy()
+    if frame and sample_is_fresh(frame["timestamp_ns"], 0.25):
+        image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
         display_image, _ = draw_calibration_overlay(
             image,
             detector,
@@ -583,7 +522,6 @@ def _run_calibration(
     shared: RuntimeChannels,
     runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
-    safety_gate: SafetyGate,
     workspace: np.ndarray,
     arm_process: Any,
     calib_cfg: CalibrationConfig,
@@ -608,7 +546,11 @@ def _run_calibration(
     keys_started = False
     window_created = False
     try:
-        pipeline, serial, intrinsics, distortion = _start_camera(runtime.camera.serial)
+        pipeline = shared
+        serial = shared.camera_serial.value.decode()
+        geometry = json.loads(shared.camera_geometry.value.decode())["color"]
+        intrinsics = np.array([[geometry["fx"], 0, geometry["ppx"]], [0, geometry["fy"], geometry["ppy"]], [0, 0, 1]], dtype=np.float64)
+        distortion = np.asarray(geometry["distortion_coeffs"], dtype=np.float64)
         print(f"  Camera serial: {serial}")
         print(
             f"  Intrinsics: fx={intrinsics[0, 0]:.1f} "
@@ -622,7 +564,6 @@ def _run_calibration(
             shared,
             runtime,
             planner,
-            safety_gate,
             workspace,
             arm_process,
             pipeline,
@@ -652,18 +593,12 @@ def _run_calibration(
                 cv2.destroyWindow(_WINDOW_NAME)
             except Exception:
                 logger.error("calibration window cleanup failed", exc_info=True)
-        if pipeline is not None:
-            try:
-                pipeline.stop()
-            except Exception:
-                logger.error("camera cleanup failed", exc_info=True)
 
 
 def _run_calibration_control_loop(
     shared: RuntimeChannels,
     runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
-    safety_gate: SafetyGate,
     workspace: np.ndarray,
     arm_process: Any,
     pipeline: Any,
@@ -676,7 +611,7 @@ def _run_calibration_control_loop(
     aruco_cfg: ArucoConfig,
 ) -> int:
     """Run control logic while borrowing already-started session resources."""
-    heartbeat_timeout = float(runtime.safety.heartbeat_timeouts["arm"])
+    max_age = runtime.policy.arm_state_stale_threshold_s
     state = CalibrationLoopState.from_arm_state(initial_state)
     marker_corners = marker_corners_3d(aruco_cfg.marker_size_m)
     preview_detector = cv2.aruco.ArucoDetector(
@@ -731,34 +666,14 @@ def _run_calibration_control_loop(
         if not keys.healthy:
             set_calibration_fault(shared, "keyboard listener exited", estop=True)
             return 1
-        issue = _runtime_issue(shared, arm_process, heartbeat_timeout)
+        issue = _runtime_issue(shared, arm_process, max_age)
         if issue is not None:
             set_calibration_fault(shared, issue)
             return 1
 
-        quit_requested = keys.is_pressed("q")
-        feedback = read_calibration_arm_feedback(shared, runtime)
-        if feedback.error_code != 0:
-            set_calibration_fault(shared, f"arm controller error C{feedback.error_code}")
-            return 1
-        if feedback.qpos is None:
-            if quit_requested:
-                set_calibration_fault(
-                    shared,
-                    f"cannot publish measured quit hold: {feedback.issue}",
-                )
-                return 1
-            continue
-        state.current_qpos = feedback.qpos
-
-        if quit_requested:
-            return publish_calibration_quit_hold(
-                shared,
-                runtime,
-                safety_gate,
-                state.current_qpos,
-                calibration_saved=state.calibration_saved,
-            )
+        if keys.is_pressed("q"):
+            return finish_calibration_motion(shared, calibration_saved=state.calibration_saved)
+        state.current_qpos = read_arm_state_dict(shared)["qpos"]
 
         home_outcome = handle_calibration_home_key(
             shared,
@@ -777,7 +692,6 @@ def _run_calibration_control_loop(
             shared,
             runtime,
             planner,
-            safety_gate,
             workspace,
             keys,
             state,
@@ -803,40 +717,37 @@ def run_camera_calibration(
         raise ValueError("hand_geometry must be 'absent' or 'secured-home'")
     calib_cfg = calibration_config or CalibrationConfig()
     aruco_cfg = aruco_config or ArucoConfig()
-    planner, safety_gate, workspace = _build_planner_and_gate(runtime)
+    planner, workspace = _build_planner(runtime)
     if hand_geometry == "absent":
         print(
-            "  XHand: absent (operator assertion); collision checks conservatively "
+            "  XHand: absent (operator assertion); return-home geometry conservatively "
             "retain the fixed-home XHand envelope"
         )
     else:
         print(
             "  XHand: mounted and secured at configured home (operator assertion); "
-            "collision checks use the fixed-home XHand envelope"
+            "return-home geometry uses the fixed-home XHand envelope"
         )
 
     ctx = mp.get_context("spawn")
     shared = RuntimeChannels.create(
         prefix=f"dexmani_calib_{os.getpid()}",
-        config=RuntimeChannelsConfig.from_runtime(runtime),
+        config=RuntimeChannelsConfig.from_runtime(runtime, camera_requested=True),
         mp_context=ctx,
     )
     processes: list[Any] = []
     exit_code = 1
     try:
         processes = [
-            ctx.Process(name="arm", target=arm_loop, args=(shared, runtime.arm))
+            ctx.Process(name="arm", target=arm_loop, args=(shared, runtime.arm)),
+            ctx.Process(name="camera", target=camera_loop, args=(shared, CameraLoopConfig.from_runtime(runtime)))
         ]
         for process in processes:
             process.start()
         arm_process = processes[0]
-        if not wait_subsystem_ready(
-            shared,
-            processes,
-            runtime.safety.readiness_timeouts_s,
-        ):
-            set_calibration_fault(shared, "arm worker did not become ready")
-            return 1
+        for process in processes:
+            if not wait_subsystem_ready(shared, process, runtime.safety.readiness_timeouts_s[process.name]):
+                raise RuntimeError(f"{process.name} startup failed")
 
         initial_state = read_initial_arm(shared, runtime)
         if initial_state is None:
@@ -852,7 +763,6 @@ def run_camera_calibration(
             shared,
             runtime,
             planner,
-            safety_gate,
             workspace,
             arm_process,
             calib_cfg,
@@ -863,7 +773,7 @@ def run_camera_calibration(
         if started:
             try:
                 clean_exit = exit_code == 0
-                shutdown_report = shutdown_processes(
+                shutdown_report = shutdown_processes_verified(
                     shared,
                     started,
                     graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),

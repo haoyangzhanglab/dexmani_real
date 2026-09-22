@@ -1,154 +1,36 @@
-"""Exact fail-closed hand-home publication and acknowledgement sequence."""
-
-from __future__ import annotations
-
+"""Dedicated XHand home: success means SDK send success, not physical arrival."""
+from queue import Full, Empty
 import time
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from dexmani_real.config.experiment import ExperimentConfig
-
 import numpy as np
 
-from dexmani_real.robot.commands import (RobotCommand, motion_rejection_reason, publish_command, read_hand_feedback, wait_command_adopted)
-from dexmani_real.runtime.safety import SafetyState, cancel_coupled_command_if_current
+from dexmani_real.robot.home import HomeResult, wait_home_result
+from dexmani_real.runtime.safety import SafetyState, command_may_cross_sdk, revoke_motion
 from dexmani_real.utils.limits import validate_hand_command_bounds
-from dexmani_real.utils.log import get_logger
-
-logger = get_logger(__name__)
-
-__all__ = ["publish_hand_home_and_wait_accepted", "initialize_hand_home"]
 
 
-
-def initialize_hand_home(
-    shared: Any,
-    runtime: ExperimentConfig,
-    *,
-    heartbeat: bool = False,
-    abort_requested: Any = None,
-) -> bool:
-    """Restore the configured hand pose before task commands or recording begin."""
+def home_hand(shared, runtime, *, abort_requested=None):
     if not runtime.policy.hand_enabled:
-        return True
+        return HomeResult(True)
+    cfg = runtime.hand
+    target = validate_hand_command_bounds(np.deg2rad(cfg.home_qpos_deg),
+        np.asarray(cfg.qpos_min_rad), np.asarray(cfg.qpos_max_rad),
+        np.asarray(cfg.mechanical_qpos_min_rad), np.asarray(cfg.mechanical_qpos_max_rad))
+    if int(shared.safety_state.value) != int(SafetyState.ARMED):
+        return HomeResult(False, "hand home requires ARMED")
+    revoke_motion(shared)
+    epoch = int(shared.run_id.value)
+    while True:
+        try:
+            shared.hand_home_result_q.get_nowait()
+        except Empty:
+            break
+    if not command_may_cross_sdk(shared, run_id=epoch, required_safety_state=SafetyState.ARMED):
+        return HomeResult(False, "hand home requires ARMED authority")
     if abort_requested is not None and abort_requested():
-        return False
-    hand = runtime.hand
-    return publish_hand_home_and_wait_accepted(
-        shared,
-        np.deg2rad(np.asarray(hand.home_qpos_deg, dtype=np.float64)),
-        command_lower_rad=np.asarray(hand.qpos_min_rad, dtype=np.float64),
-        command_upper_rad=np.asarray(hand.qpos_max_rad, dtype=np.float64),
-        mechanical_lower_rad=np.asarray(hand.mechanical_qpos_min_rad, dtype=np.float64),
-        mechanical_upper_rad=np.asarray(hand.mechanical_qpos_max_rad, dtype=np.float64),
-        hand_feedback_max_age_s=float(runtime.safety.heartbeat_timeouts["hand"]),
-        timeout_s=hand.home_command_ack_timeout_s,
-        heartbeat=heartbeat,
-        abort_requested=abort_requested,
-    )
-
-
-def publish_hand_home_and_wait_accepted(
-    shared: Any,
-    home_qpos: np.ndarray,
-    *,
-    command_lower_rad: np.ndarray,
-    command_upper_rad: np.ndarray,
-    mechanical_lower_rad: np.ndarray,
-    mechanical_upper_rad: np.ndarray,
-    hand_feedback_max_age_s: float,
-    timeout_s: float = 1.0,
-    heartbeat: bool = False,
-    check_is_running: bool = True,
-    verbose: bool = True,
-    abort_requested: Any = None,
-) -> bool:
-    """Publish exact hand-home and wait only for worker/SDK acceptance.
-
-    The configured endpoint must lie inside both the operational command box
-    and the rated mechanical box. Success means the worker accepted the exact
-    home endpoint. Measured qpos must be healthy and fresh, but it is neither
-    required to lie inside command bounds nor compared with the target because
-    encoder zero offsets, contact, and steady-state position error are valid.
-    One home timeout covers preparation, measured-state-bounded
-    hand slew and exact-endpoint SDK acceptance (``reached``), rather than just
-    adoption of the first bounded setpoint.
-    """
-    if not np.isfinite(timeout_s) or timeout_s <= 0.0:
-        raise ValueError(
-            "hand home command acknowledgement timeout must be finite and positive"
-        )
-    home_deadline_ns = time.monotonic_ns() + int(timeout_s * 1e9)
-    # Reject bound violations; never clip coupled hand commands here.
-    target = validate_hand_command_bounds(
-        home_qpos,
-        command_lower_rad,
-        command_upper_rad,
-        mechanical_lower_rad,
-        mechanical_upper_rad,
-    )
-    runtime_rejection = motion_rejection_reason(
-        shared,
-        check_is_running=check_is_running,
-    )
-    if runtime_rejection:
-        logger.warning("hand home rejected by runtime gate: %s", runtime_rejection)
-        return False
-    hand_feedback, feedback_rejection, _ = read_hand_feedback(
-        shared, max_age_s=hand_feedback_max_age_s
-    )
-    if hand_feedback is None:
-        logger.warning("hand home rejected: %s", feedback_rejection)
-        return False
-    # Feedback must be healthy, but its measured angle is not an outgoing
-    # command.  Encoder zero offsets must not block a legal home target.
-
-    runtime_rejection = motion_rejection_reason(
-        shared, check_is_running=check_is_running
-    )
-    if runtime_rejection:
-        logger.warning("hand home stopped by runtime gate: %s", runtime_rejection)
-        return False
-    candidate = RobotCommand(
-        run_id=int(shared.run_id.value),
-        hand_qpos=np.array(target, dtype=np.float64, copy=True),
-    )
-    publish_result = publish_command(shared, candidate, required_safety_state=SafetyState.ARMED)
-    if not publish_result.published:
-        logger.warning("hand home publish failed: %s", publish_result.reason)
-        return False
-    if publish_result.command is None:
-        logger.error("hand home published without a committed-command receipt")
-        return False
-
-    remaining_s = (home_deadline_ns - time.monotonic_ns()) / 1e9
-    if remaining_s <= 0:
-        cancel_coupled_command_if_current(shared, command=publish_result.command)
-        logger.warning("hand home acknowledgement stopped: home deadline expired")
-        return False
-    acceptance = wait_command_adopted(
-        shared,
-        command=publish_result.command,
-        wait_for_arm=False,
-        wait_for_hand=True,
-        hand_reached=True,
-        timeout_s=remaining_s,
-        arm_feedback_max_age_s=hand_feedback_max_age_s,
-        hand_feedback_max_age_s=hand_feedback_max_age_s,
-        check_is_running=check_is_running,
-        abort_requested=abort_requested,
-        heartbeat=(
-            (lambda: shared.set_heartbeat("policy", time.monotonic()))
-            if heartbeat
-            else None
-        ),
-    )
-    if not acceptance.accepted:
-        logger.warning("hand home acknowledgement stopped: %s", acceptance.reason)
-        return False
-    if verbose:
-        print(
-            f"  hand: home command accepted (command_id={publish_result.command.command_id})",
-            flush=True,
-        )
-    return True
+        return HomeResult(False, "home aborted")
+    deadline = time.monotonic_ns() + int(cfg.home_timeout_s * 1e9)
+    try:
+        shared.hand_home_q.put_nowait((target, epoch, deadline))
+    except Full:
+        return HomeResult(False, "hand home queue is full")
+    return wait_home_result(shared, shared.hand_home_result_q, epoch, cfg.home_timeout_s, abort_requested)

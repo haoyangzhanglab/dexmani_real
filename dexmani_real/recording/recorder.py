@@ -30,7 +30,6 @@ from dexmani_real.recording.frame import EpisodeFrame
 from dexmani_real.recording.storage.hdf5_writer import EpisodeDataWriter
 from dexmani_real.recording.storage.schema import (
     EPISODE_SCHEMA_VERSION,
-    DIAGNOSTIC_STATUSES, CommandHistory,
     DATASET_SPECS,
     SOURCE_FRAME_DATASET_NAMES,
     validate_data_layout,
@@ -42,7 +41,6 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_MAX_RECORD_FRAMES: int = 10000
-_CAMERA_WRITER_CLOSE_TIMEOUT_S = 60.0
 _MAX_PROVENANCE_VALUE_BYTES = 4096
 
 
@@ -131,7 +129,6 @@ class EpisodeRecorder:
             rgb_shape=camera.rgb_shape,
             depth_shape=camera.depth_shape,
             fps=self.control_hz,
-            queue_size=camera.writer_queue_size,
         )
         if not np.isclose(self._camera_writer_config.fps, self.control_hz):
             raise ValueError("camera writer fps must match recorder control_hz")
@@ -143,9 +140,9 @@ class EpisodeRecorder:
         self._temp_dir: str | None = None  # .tmp_episode_XXX/ directory
         self._pending_meta: dict[str, Any] = {}
         self.technical_status = "valid"
+        self.had_pause = False
 
         self._pending_rows: list[dict[str, Any]] = []
-        self._command_history = CommandHistory()
         self._last_timestamp_s: float | None = None
         self._flush_interval = 32
 
@@ -189,11 +186,6 @@ class EpisodeRecorder:
     def max_frames_reached(self) -> bool:
         return self._max_frames_reached
 
-    @property
-    def camera_writer_error(self) -> str | None:
-        """Latched camera sidecar error requiring episode discard."""
-        return self._camera_writer.error if self._camera_writer is not None else None
-
     def start_episode(
         self,
         task_label: str = "",
@@ -216,6 +208,7 @@ class EpisodeRecorder:
         """
         normalized_provenance = normalize_provenance_metadata(provenance)
         self.technical_status = "valid"
+        self.had_pause = False
         if episode_name is not None:
             _validate_explicit_episode_name(episode_name)
         if self._finishing or not self.resources_released:
@@ -262,7 +255,6 @@ class EpisodeRecorder:
         }
 
         self._pending_rows.clear()
-        self._command_history = CommandHistory()
         self._last_timestamp_s = None
         self._camera_writer = CameraStreamWriter(tmp_dir, self._camera_writer_config)
         return True
@@ -372,9 +364,6 @@ class EpisodeRecorder:
 
     def add_frame(self, frame: EpisodeFrame) -> bool:
         """Append an owned control sample; no secondary resampling or state model."""
-        self._command_history.observe(frame.data)
-        if int(frame.data["flag_frame_status"]) in DIAGNOSTIC_STATUSES:
-            self.technical_status = "invalid"
         if not self._recording:
             return False
 
@@ -397,8 +386,9 @@ class EpisodeRecorder:
         self._frame_count += 1
         self._last_timestamp_s = ts
         writer = self._camera_writer
-        if writer is None or not writer.submit(*self._camera_payload(frame)):
-            raise RuntimeError("camera writer failed to accept the source row")
+        if writer is None:
+            raise RuntimeError("camera writer missing")
+        writer.write(*self._camera_payload(frame))
         if len(self._pending_rows) >= self._flush_interval:
             self._flush_buffered()
         if self._frame_count >= self.max_frames:
@@ -409,14 +399,11 @@ class EpisodeRecorder:
     def _camera_payload(
         self, frame: EpisodeFrame
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Return shape-stable camera arrays, using explicit zero placeholders."""
-        cfg = self._camera_writer_config
+        """Every recorded row carries a complete camera sample."""
         rgb = frame.camera_rgb
         depth = frame.camera_depth
-        if rgb is None:
-            rgb = np.zeros(cfg.rgb_shape, dtype=np.uint8)
-        if depth is None:
-            depth = np.zeros(cfg.depth_shape, dtype=np.uint16)
+        if rgb is None or depth is None:
+            raise ValueError("recorded row is missing RGB-D")
         return rgb, depth
 
     def _ensure_hdf5(self) -> None:
@@ -520,7 +507,7 @@ class EpisodeRecorder:
                 )
             try:
                 if self._camera_writer is not None:
-                    self._camera_writer.close(timeout=5.0)
+                    self._camera_writer.close()
             except Exception:
                 logger.warning("camera writer cleanup failed", exc_info=True)
             if (
@@ -582,7 +569,7 @@ class EpisodeRecorder:
         writer = self._camera_writer
         if writer is None:
             raise RuntimeError("camera writer missing at episode stop")
-        writer.close(timeout=_CAMERA_WRITER_CLOSE_TIMEOUT_S)
+        writer.close()
         if not writer.resources_released:
             raise RuntimeError("camera writer resources were not released")
         camera_frame_count = writer.frame_count
@@ -604,6 +591,7 @@ class EpisodeRecorder:
         def _write_final_meta(meta: h5py.Group) -> None:
             meta.attrs["schema_version"] = EPISODE_SCHEMA_VERSION
             meta.attrs["technical_status"] = self.technical_status
+            meta.attrs["had_pause"] = self.had_pause
             meta.attrs["termination_reason"] = reason or "manual"
             meta.attrs["task_success"] = "unknown"
             meta.attrs["duration"] = duration
@@ -618,7 +606,6 @@ class EpisodeRecorder:
             meta.attrs["has_camera"] = _had_rgb
             meta.attrs["has_timestamps"] = "timestamp" in data_writer.datasets
             meta.attrs["camera_stream_frames"] = camera_frame_count
-            meta.attrs["camera_writer_error"] = ""
             meta.attrs["truncated"] = bool(truncated)
             meta.attrs["stop_reason"] = reason or (
                 "max_frames" if truncated else "manual"
@@ -654,7 +641,6 @@ class EpisodeRecorder:
         self._temp_dir = None
         self._pending_rows.clear()
         self._camera_writer = None
-        self._command_history = CommandHistory()
         self._last_timestamp_s = None
 
     # ── Atomic file finalisation ──────────────────────────────────────

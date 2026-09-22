@@ -255,7 +255,6 @@ class CameraRingBuffer:
         # Stamp and publish only after the payload is fully copied.
         now_ns = time.monotonic_ns()
         seqlock.stamp_timestamp(now_ns)
-        header_dest["publish_monotonic_ns"][0] = np.uint64(now_ns)
 
         seqlock.end_write(seq)
 
@@ -360,42 +359,6 @@ class CameraRingBuffer:
 
         return header, rgb, depth, seqlock_to_logical(slot_seq)
 
-    def get_last_metadata(self, k: int) -> list[tuple[np.ndarray, int, int]]:
-        """Return up to *k* verified camera headers without copying payloads.
-
-        Results are oldest-first ``(header, publish_monotonic_ns, sequence)``.
-        This is the cheap first phase of causal camera selection.
-        """
-        if k <= 0:
-            return []
-        if k > self.maxlen:
-            raise ValueError(f"k ({k}) exceeds ring capacity maxlen ({self.maxlen})")
-        latest_seq = int(self._write_seq[0])
-        if latest_seq == 0:
-            return []
-        result: list[tuple[np.ndarray, int, int]] = []
-        for sequence in range(
-            max(1, latest_seq - min(k, latest_seq) + 1), latest_seq + 1
-        ):
-            idx = sequence % self.maxlen
-            slot_base = self._HEADER_SIZE + idx * self._slot_size
-            seqlock = SeqlockSlot(self._shm.buf, slot_base)
-            marker1 = seqlock.marker
-            if (
-                not seqlock_is_complete(marker1)
-                or seqlock_to_logical(marker1) != sequence
-            ):
-                continue
-            publish_ns = seqlock.timestamp_ns
-            header: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
-                (1,),
-                dtype=CAMERA_FRAME_HEADER_DTYPE,
-                buffer=self._shm.buf,
-                offset=slot_base + 16,
-            ).copy()
-            if seqlock.verify(marker1):
-                result.append((header, publish_ns, sequence))
-        return result
 
     @property
     def latest_sequence(self) -> int:

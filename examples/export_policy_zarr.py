@@ -34,7 +34,7 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         metavar="episodes/<task_name>",
         help=(
-            "One raw task directory. Exports to "
+            "One raw task or episode directory. Exports to "
             "datasets/<task_name>.zarr by default (see --output); existing "
             "output paths are refused."
         ),
@@ -132,7 +132,7 @@ def _resolve_output_path(
 def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:
     """Derive the policy store path and required task name from one input directory."""
 
-    task_name = input_root.name
+    task_name = input_root.parent.name if (input_root / "data.h5").exists() or input_root.name.startswith("episode_") else input_root.name
     if not task_name or task_name in {".", ".."}:
         raise ValueError(
             "input_root must name one task directory, e.g. episodes/pick_place_toy"
@@ -238,6 +238,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{verb} {report['episode_count']} episode(s), {report['total_frames']} frames.",
         file=sys.stderr,
     )
+    print(f"Rejected {len(report['rejected_episodes'])} episode(s); excluded {len(report['excluded_episodes'])} by annotation.", file=sys.stderr)
+    for rejected in report["rejected_episodes"]:
+        print(f"  {rejected['episode']}: {rejected['reason']}", file=sys.stderr)
     return 0
 
 

@@ -20,7 +20,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -35,11 +34,6 @@ from dexmani_real.recording.storage.video import VideoDecoder
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-
-class ValidityState(str, Enum):
-    VALID = "VALID"
-    INVALID = "INVALID"
 
 
 @dataclass(frozen=True)
@@ -114,8 +108,8 @@ class EpisodeReader:
     def __init__(self, h5_path: str | Path) -> None:
         """Open one published episode.
 
-        Check the supported schema and structural layout without decoding RGB
-        or replaying the runtime's admission proofs.
+        Check the supported schema and structural layout. RGB frames are
+        decoded on demand.
         """
         self._path = Path(h5_path)
         self._closed = False
@@ -153,7 +147,7 @@ class EpisodeReader:
                     f"{EPISODE_SCHEMA_VERSION}"
                 )
             self._rgb_decoder = VideoDecoder(paths["rgb"])
-            self.require_valid(purpose="episode read", technical=False)
+            self._validate_layout()
         except Exception:
             self.close()
             raise
@@ -182,53 +176,37 @@ class EpisodeReader:
         meta = self._h5f.get("meta")
         return bool(meta is not None and meta.attrs.get("min_frames_met", False))
 
-    @property
-    def validity(self) -> ValidityState:
-        """Return whether the current supported episode is internally consistent."""
+    def _validate_layout(self) -> None:
+        """Validate the read-only storage layout once, retaining concrete errors."""
         meta = self._h5f.get("meta")
         if meta is None:
-            return ValidityState.INVALID
+            raise ValueError("episode is missing meta")
         frame_count = int(meta.attrs.get("num_frames", -1))
-        datasets = {
-            key: dataset
-            for key, dataset in self._data_h5f.items()
-            if isinstance(dataset, h5py.Dataset)
-        }
-        dataset_shapes = {
-            key: tuple(dataset.shape) for key, dataset in datasets.items()
-        }
-        dataset_dtypes = {key: dataset.dtype for key, dataset in datasets.items()}
-        layout_errors = validate_data_layout(
-            dataset_shapes, dataset_dtypes, frame_count=frame_count
+        datasets = {key: value for key, value in self._data_h5f.items()
+                    if isinstance(value, h5py.Dataset)}
+        errors = validate_data_layout(
+            {key: value.shape for key, value in datasets.items()},
+            {key: value.dtype for key, value in datasets.items()},
+            frame_count=frame_count,
         )
-        if layout_errors or "depth" not in self._h5f:
-            return ValidityState.INVALID
+        if errors:
+            raise ValueError("episode layout invalid: " + "; ".join(errors))
+        if "depth" not in self._h5f:
+            raise ValueError("depth.h5 is missing depth")
         depth = self._h5f["depth"]
         if not isinstance(depth, h5py.Dataset) or depth.shape[:1] != (frame_count,):
-            return ValidityState.INVALID
-        return ValidityState.VALID
+            raise ValueError(f"depth frame count must match num_frames={frame_count}")
 
-    def require_valid(self, purpose: str = "training", *, technical: bool = True) -> None:
-        state = self.validity
-        if state is not ValidityState.VALID:
-            raise ValueError(
-                f"episode validity is {state.value}; {purpose} requires VALID data "
-                f"from raw schema v{self.schema_version}"
-            )
-
-        from dexmani_real.recording.storage.schema import command_send_mask, DIAGNOSTIC_STATUSES
-        command_send_mask(self._h5f)
-        if technical:
-            attrs = self._h5f["meta"].attrs
-            if (attrs.get("technical_status", "invalid") != "valid"
-                    or np.isin(self._h5f["flag_frame_status"][:], DIAGNOSTIC_STATUSES).any()):
-                raise ValueError(f"{purpose} rejects technically invalid episodes")
-            # A parent may have lost the producer before Recorder STOP could carry
-            # invalidity. Session-result diagnostics are authoritative as well.
-            import json
-            result_path = self._path.with_name(self._path.name + ".result.json")
-            if result_path.exists() and json.loads(result_path.read_text()).get("technical_status") != "valid":
-                raise ValueError(f"{purpose} rejects invalid episode result")
+    def require_valid(self, purpose: str = "training") -> None:
+        """Reject technically incomplete recordings; diagnostic reads remain possible."""
+        attrs = self._h5f["meta"].attrs
+        if attrs.get("technical_status", "invalid") != "valid":
+            raise ValueError(f"{purpose} rejects technically invalid episodes")
+        # The parent may have lost the producer before STOP carried the failure.
+        import json
+        result_path = self._path.with_name(self._path.name + ".result.json")
+        if result_path.exists() and json.loads(result_path.read_text()).get("technical_status") != "valid":
+            raise ValueError(f"{purpose} rejects invalid episode result")
 
     @property
     def timing(self) -> EpisodeTiming:
