@@ -11,25 +11,17 @@ import argparse
 import math
 import multiprocessing as mp
 import shutil
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 
 import numpy as np
-
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
 
 from dexmani_real import PACKAGE_DIR
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.planning.kinematics.pose import forward_from_quat_wxyz, normalize_quat_wxyz
+from dexmani_real.runtime.processes import shutdown_processes_verified
 from dexmani_real.runtime.supervisor import wait_subsystem_ready
-from dexmani_real.runtime.processes import (
-    shutdown_processes_verified,
-)
 from dexmani_real.sensor.vr_worker import VRReceiverConfig, vr_loop
 from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.vr_transform import (
@@ -189,8 +181,7 @@ def _shutdown_vr_receiver(shared: RuntimeChannels, vr_proc: mp.Process) -> bool:
         print(f"  ERROR: VR receiver shutdown could not be verified: {exc}")
         return False
     clean = report.shared_closed and all(
-        item.exitcode == 0 and item.escalation == "graceful"
-        for item in report.exits
+        item.exitcode == 0 and item.escalation == "graceful" for item in report.exits
     )
     if not clean:
         print(f"  ERROR: VR receiver shutdown was not clean: {report}")
@@ -244,9 +235,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--duration must be a positive finite number of seconds")
 
     ref_label = (
-        "head (face robot +X)"
-        if args.ref == "head"
-        else "wrist (extend arm, point at robot +X)"
+        "head (face robot +X)" if args.ref == "head" else "wrist (extend arm, point at robot +X)"
     )
 
     print("=" * 55)
@@ -261,7 +250,9 @@ def main(argv: list[str] | None = None) -> int:
         prefix="dexmani_vr_calib", config=RuntimeChannelsConfig(), mp_context=ctx
     )
     processes = [
-        ctx.Process(name="vr", target=vr_loop, args=(shared, VRReceiverConfig(port=args.port)), daemon=True)
+        ctx.Process(
+            name="vr", target=vr_loop, args=(shared, VRReceiverConfig(port=args.port)), daemon=True
+        )
     ]
     vr_proc = processes[0]
     forwards: list[np.ndarray] = []
@@ -293,9 +284,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.ref == "head":
             print("  Face the robot +X direction, hold your head still...")
         else:
-            print(
-                "  Extend your right arm, point fingers toward robot +X, hold steady..."
-            )
+            print("  Extend your right arm, point fingers toward robot +X, hold steady...")
         for i in [3, 2, 1]:
             print(f"  {i}...")
             time.sleep(_COUNTDOWN_DWELL_S)
@@ -347,24 +336,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if len(forwards) < cfg.min_frames:
-        print(
-            f"ERROR: only {len(forwards)} frames collected (< {cfg.min_frames} required)"
-        )
+        print(f"ERROR: only {len(forwards)} frames collected (< {cfg.min_frames} required)")
         return 1
 
     forwards_arr = np.array(forwards, dtype=np.float64)
     try:
-        theta_rad, mean_fwd, inlier = _circular_mean(
-            forwards_arr, outlier_sigma=cfg.outlier_sigma
-        )
+        theta_rad, mean_fwd, inlier = _circular_mean(forwards_arr, outlier_sigma=cfg.outlier_sigma)
     except ValueError as exc:
         print(f"ERROR: invalid heading sample: {exc}")
         return 1
     inlier_frames = int(np.sum(inlier))
     if inlier_frames < cfg.min_frames:
-        print(
-            f"ERROR: only {inlier_frames} inlier frames remain (< {cfg.min_frames} required)"
-        )
+        print(f"ERROR: only {inlier_frames} inlier frames remain (< {cfg.min_frames} required)")
         return 1
     theta_deg = float(np.rad2deg(theta_rad))
     quality = _quality_grade(
@@ -397,9 +380,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{quality['grade']} (σ={float(quality['std_deg']):.1f}°, "
         f"max={float(quality['max_deviation_deg']):.1f}°)"
     )
-    print(
-        f"  verification:  T·forward = [{corrected[0]:.4f}, {corrected[1]:.4f}] (expect [1, 0])"
-    )
+    print(f"  verification:  T·forward = [{corrected[0]:.4f}, {corrected[1]:.4f}] (expect [1, 0])")
     print(f"  T = R_z(-{theta_deg:.1f}°):")
     print(f"    [{T[0, 0]:.4f}, {T[0, 1]:.4f}, {T[0, 2]:.4f}],")
     print(f"    [{T[1, 0]:.4f}, {T[1, 1]:.4f}, {T[1, 2]:.4f}],")
@@ -415,9 +396,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if _OUTPUT_PATH.exists():
-        backup = _OUTPUT_PATH.with_suffix(
-            f".json.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
+        backup = _OUTPUT_PATH.with_suffix(f".json.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         shutil.copy2(_OUTPUT_PATH, backup)
         print(f"  backed up previous transform → {backup.name}")
 

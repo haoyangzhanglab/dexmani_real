@@ -97,9 +97,7 @@ class VRWristMapper:
         # Validate before committing the new anchor; failed resets clear stale state.
         try:
             next_wrist_pos0 = _finite_vector(wrist_pos, (3,), "wrist_pos")
-            next_wrist_rot0 = quat2mat(
-                _unit_quat_wxyz(wrist_quat_wxyz, "wrist_quat_wxyz")
-            )
+            next_wrist_rot0 = quat2mat(_unit_quat_wxyz(wrist_quat_wxyz, "wrist_quat_wxyz"))
             next_eef_pos0 = _finite_vector(eef_pos, (3,), "eef_pos")
             next_eef_rot0 = quat2mat(_unit_quat_wxyz(eef_quat_wxyz, "eef_quat_wxyz"))
         except (TypeError, ValueError):
@@ -130,9 +128,7 @@ class VRWristMapper:
             current_wrist_pos = _finite_vector(wrist_pos, (3,), "wrist_pos")
             wrist_rot = quat2mat(_unit_quat_wxyz(wrist_quat_wxyz, "wrist_quat_wxyz"))
         except (TypeError, ValueError):
-            logger.warning(
-                "VRWristMapper.map: invalid wrist pose — no target", exc_info=True
-            )
+            logger.warning("VRWristMapper.map: invalid wrist pose — no target", exc_info=True)
             return None
 
         # Advance from the previously accepted pose, not from a raw tracking
@@ -162,9 +158,7 @@ class VRWristMapper:
         delta_rot_vr = self._clip_total_delta_rot(delta_rot_vr)
         # Re-express the VR rotation delta in robot-base axes.
         delta_rot_base = self.vr_to_robot_rot @ delta_rot_vr @ self.vr_to_robot_rot.T
-        delta_rot_world = (
-            self.base_to_world_rot @ delta_rot_base @ self.base_to_world_rot.T
-        )
+        delta_rot_world = self.base_to_world_rot @ delta_rot_base @ self.base_to_world_rot.T
 
         # Convert the EEF reference to world coordinates before combining terms.
         eef_pos0_world = self.base_to_world_rot @ self.eef_pos0  # type: ignore[operator]  # is_ready() gate
@@ -173,14 +167,9 @@ class VRWristMapper:
         target_pos = eef_pos0_world + delta_pos_world
         target_rot = delta_rot_world @ eef_rot0_world
         target_quat_wxyz = normalize_quat_wxyz(mat2quat(target_rot))
-        if (
-            self.last_quat_wxyz is not None
-            and np.dot(target_quat_wxyz, self.last_quat_wxyz) < 0
-        ):
+        if self.last_quat_wxyz is not None and np.dot(target_quat_wxyz, self.last_quat_wxyz) < 0:
             target_quat_wxyz = -target_quat_wxyz
-        if not np.all(np.isfinite(target_pos)) or not np.all(
-            np.isfinite(target_quat_wxyz)
-        ):
+        if not np.all(np.isfinite(target_pos)) or not np.all(np.isfinite(target_quat_wxyz)):
             logger.warning("VRWristMapper.map: non-finite mapped pose — no target")
             return None
 
@@ -225,9 +214,7 @@ class VRWristMapper:
         Catches accumulated drift from the reset pose before it reaches IK.
         Note: this is NOT per-frame — it clips the total rotation since reset().
         """
-        clipped, angle, was_clamped = _clip_signed_axis_angle(
-            delta_rot, self.max_delta_rot_rad
-        )
+        clipped, angle, was_clamped = _clip_signed_axis_angle(delta_rot, self.max_delta_rot_rad)
         if was_clamped:
             logger.warning(
                 "Total-from-reset rotation clamped: %.1f° -> %.1f° "

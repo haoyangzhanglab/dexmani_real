@@ -71,7 +71,11 @@ class PointCloudConfig:
     sampling_coarse_voxel_stride: int = 3
 
     def __post_init__(self) -> None:
-        if isinstance(self.num_points, bool) or not isinstance(self.num_points, (int, np.integer)) or self.num_points <= 0:
+        if (
+            isinstance(self.num_points, bool)
+            or not isinstance(self.num_points, (int, np.integer))
+            or self.num_points <= 0
+        ):
             raise ValueError("num_points must be a positive integer")
         object.__setattr__(self, "num_points", int(self.num_points))
         integer_fields = (
@@ -120,17 +124,13 @@ class PointCloudConfig:
         if self.table_core_height_m < 0.0:
             raise ValueError("table_core_height_m must be non-negative")
         if self.table_object_seed_height_m <= self.table_core_height_m:
-            raise ValueError(
-                "table_object_seed_height_m must exceed table_core_height_m"
-            )
+            raise ValueError("table_object_seed_height_m must exceed table_core_height_m")
         if self.voxel_size_m <= 0.0 or self.outlier_radius_m <= 0.0:
             raise ValueError("voxel and outlier radii must be positive")
         lower = self.workspace[:3]
         upper = self.workspace[3:]
         if any(low >= high for low, high in zip(lower, upper, strict=True)):
-            raise ValueError(
-                "workspace lower bounds must be strictly below upper bounds"
-            )
+            raise ValueError("workspace lower bounds must be strictly below upper bounds")
 
     def to_dict(self) -> dict[str, Any]:
         """Return the stable persisted processing-policy representation."""

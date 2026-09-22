@@ -26,28 +26,22 @@ pre-test priority value is restored automatically on exit.
 
 from __future__ import annotations
 
-import sys
 import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
-
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
 
 import cv2
 import numpy as np
 import pyrealsense2 as rs
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
-from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
-from dexmani_real.sensor.pointcloud import build_point_cloud, build_raw_point_cloud
 from dexmani_real.sensor.camera.realsense import RealSenseCamera, RealSenseCameraConfig
+from dexmani_real.sensor.pointcloud import build_point_cloud, build_raw_point_cloud
 
 _WINDOW_NAME = "RealSense Test | RGB(left) Depth(right)"
 
@@ -187,12 +181,7 @@ def _make_jet_depth_vis(depth: np.ndarray, min_d: float, max_d: float) -> np.nda
 def _depth_valid_ratio(depth: np.ndarray, min_d: float, max_d: float) -> float:
     """Return the fraction of depth pixels inside the display band."""
     depth_f32 = depth.astype(np.float32)
-    valid = (
-        np.isfinite(depth_f32)
-        & (depth_f32 > 0.0)
-        & (depth_f32 >= min_d)
-        & (depth_f32 <= max_d)
-    )
+    valid = np.isfinite(depth_f32) & (depth_f32 > 0.0) & (depth_f32 >= min_d) & (depth_f32 <= max_d)
     return float(valid.mean()) if depth_f32.size else 0.0
 
 
@@ -255,10 +244,7 @@ def _test_lifecycle(test_cfg: RealSenseDiagnosticConfig) -> bool:
     ok = False
     for attempt in range(3):
         ok = camera.connect()
-        print(
-            f"  connect() -> {ok}"
-            + (f" (attempt {attempt + 1}/3)" if attempt > 0 else "")
-        )
+        print(f"  connect() -> {ok}" + (f" (attempt {attempt + 1}/3)" if attempt > 0 else ""))
         if ok:
             break
         time.sleep(1.0)
@@ -334,8 +320,7 @@ def _build_hud_lines(
     else:
         lines.append("PCD OFF  [p]toggle [s]raw/processed [f]freeze")
     lines.append(
-        f"cmap={state.colormap}  depth=[{production.depth_min_m:.2f},"
-        f"{production.depth_max_m:.2f}]"
+        f"cmap={state.colormap}  depth=[{production.depth_min_m:.2f},{production.depth_max_m:.2f}]"
     )
     return lines
 
@@ -423,9 +408,7 @@ def _toggle_cmap(state: PointCloudDisplayState) -> None:
     print(f"  Colormap: {state.colormap}")
 
 
-def _compute_base_from_color(
-    serial: str | None, calibration: CameraExtrinsics
-) -> np.ndarray:
+def _compute_base_from_color(serial: str | None, calibration: CameraExtrinsics) -> np.ndarray:
     """Return T_xarm_base_from_color for aligned depth-to-color clouds."""
     if not serial:
         raise RuntimeError("connected camera did not publish a serial")
@@ -609,9 +592,7 @@ def _run_rgbd_test(
         )
 
         stats = _compute_rolling_stats(stats_history)
-        lines = _build_hud_lines(
-            frame_count, stats, state, total_dropped, geometry, production
-        )
+        lines = _build_hud_lines(frame_count, stats, state, total_dropped, geometry, production)
         _overlay_text(panel, lines)
         cv2.imshow(_WINDOW_NAME, panel)
 
@@ -621,9 +602,7 @@ def _run_rgbd_test(
                 viewer.close()
                 print("  Point cloud window closed")
 
-        if not _handle_keyboard(
-            cv2.waitKey(1) & 0xFF, state, viewer, camera, production
-        ):
+        if not _handle_keyboard(cv2.waitKey(1) & 0xFF, state, viewer, camera, production):
             break
 
     viewer.close()
@@ -640,9 +619,7 @@ def _run_rgbd_test(
         print(f"\n  -- Performance ({frame_count} frames) --")
         print(f"  avg fps:          {fps_avg:.1f}")
         print(f"  avg frame total:  {avg_total:.1f} ms  (max {totals.max():.1f} ms)")
-        print(
-            f"  avg read(grab):   {float(reads.mean()):.1f} ms  (max {reads.max():.1f} ms)"
-        )
+        print(f"  avg read(grab):   {float(reads.mean()):.1f} ms  (max {reads.max():.1f} ms)")
         print(f"  avg pcd:          {float(pcds.mean()):.1f} ms")
         print(f"  avg valid depth:  {float(valids.mean()):.3f}")
         if total_dropped:

@@ -45,15 +45,11 @@ class ProcessingConfig:
     """
 
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
-    table_plane_abcd: tuple[float, float, float, float] | None = (
-        environment.table.plane_abcd
-    )
+    table_plane_abcd: tuple[float, float, float, float] | None = environment.table.plane_abcd
     hand_urdf_path: str = str(XHAND_RIGHT_URDF_PATH)
     fingertip_link_names: tuple[str, ...] = hand.fingertip_link_names
     handbase_position_eef_m: tuple[float, float, float] = hand.T_eef_handbase_pos_xyz
-    handbase_quat_eef_wxyz: tuple[float, float, float, float] = (
-        hand.T_eef_handbase_quat_wxyz
-    )
+    handbase_quat_eef_wxyz: tuple[float, float, float, float] = hand.T_eef_handbase_quat_wxyz
 
     @classmethod
     def from_runtime(cls, runtime: object, **overrides: Any) -> "ProcessingConfig":
@@ -81,9 +77,7 @@ class ProcessingConfig:
             len(self.handbase_position_eef_m) != 3
             or len(self.handbase_quat_eef_wxyz) != 4
             or not np.all(
-                np.isfinite(
-                    (*self.handbase_position_eef_m, *self.handbase_quat_eef_wxyz)
-                )
+                np.isfinite((*self.handbase_position_eef_m, *self.handbase_quat_eef_wxyz))
             )
             or np.linalg.norm(self.handbase_quat_eef_wxyz) <= 0
         ):

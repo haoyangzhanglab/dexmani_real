@@ -23,9 +23,9 @@ from dexmani_real.config.defaults import (
     HandParams,
     KeyboardTeleopParams,
     PolicyParams,
-    TeleopTimingParams,
     SafetyParams,
     TAGRetargetingParams,
+    TeleopTimingParams,
     VRParams,
 )
 from dexmani_real.config.pointcloud import PointCloudConfig
@@ -52,10 +52,7 @@ class ExperimentConfig:
 def config_as_dict(value: Any) -> Any:
     """Convert actual configuration values for on-demand YAML printing."""
     if dataclasses.is_dataclass(value):
-        return {
-            f.name: config_as_dict(getattr(value, f.name))
-            for f in dataclasses.fields(value)
-        }
+        return {f.name: config_as_dict(getattr(value, f.name)) for f in dataclasses.fields(value)}
     if isinstance(value, Mapping):
         return {key: config_as_dict(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
@@ -154,18 +151,22 @@ def validate_config(cfg: ExperimentConfig) -> None:
         section.validate()
     # PointCloudConfig owns its external persisted-policy validation in its
     # constructor, shared with raw-to-policy conversion.
-    limiting_hz = min(cfg.arm.loop_hz, cfg.hand.loop_hz) if cfg.policy.hand_enabled else cfg.arm.loop_hz
+    limiting_hz = (
+        min(cfg.arm.loop_hz, cfg.hand.loop_hz) if cfg.policy.hand_enabled else cfg.arm.loop_hz
+    )
     for name, producer_hz, worker_hz in (
         ("teleop.control_hz", cfg.teleop.control_hz, limiting_hz),
         ("keyboard_teleop.control_hz", cfg.keyboard_teleop.control_hz, cfg.arm.loop_hz),
     ):
-        if producer_hz > worker_hz and not math.isclose(producer_hz, worker_hz, rel_tol=1e-9, abs_tol=1e-9):
-            raise ValueError(f"{name}={producer_hz:g} Hz exceeds limiting worker rate {worker_hz:g} Hz")
+        if producer_hz > worker_hz and not math.isclose(
+            producer_hz, worker_hz, rel_tol=1e-9, abs_tol=1e-9
+        ):
+            raise ValueError(
+                f"{name}={producer_hz:g} Hz exceeds limiting worker rate {worker_hz:g} Hz"
+            )
     widths = np.diff(cfg.policy.workspace.as_array(), axis=1)
     if 2 * cfg.keyboard_teleop.workspace_command_margin_m >= float(widths.min()):
-        raise ValueError(
-            "keyboard workspace command margin leaves no interior workspace"
-        )
+        raise ValueError("keyboard workspace command margin leaves no interior workspace")
 
 
 def resolve_experiment_config(

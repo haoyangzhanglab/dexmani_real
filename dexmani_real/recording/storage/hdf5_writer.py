@@ -36,8 +36,10 @@ class EpisodeDataWriter:
             self._write_initial_meta(self._file.create_group("meta"))
             for name, spec in DATASET_SPECS.items():
                 self._datasets[name] = self._file.create_dataset(
-                    name, shape=(0,) + spec.tail_shape,
-                    maxshape=(None,) + spec.tail_shape, dtype=spec.dtype,
+                    name,
+                    shape=(0,) + spec.tail_shape,
+                    maxshape=(None,) + spec.tail_shape,
+                    dtype=spec.dtype,
                     compression="gzip",
                 )
         return self._file
@@ -57,7 +59,7 @@ class EpisodeDataWriter:
         for name, values in data.items():
             dataset = self._datasets[name]
             dataset.resize(end, axis=0)
-            dataset[self._flushed_frames:end] = values
+            dataset[self._flushed_frames : end] = values
         self._flushed_frames = end
 
     def update_meta(self, write_meta: Callable[[h5py.Group], None]) -> None:

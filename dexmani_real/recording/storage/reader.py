@@ -57,9 +57,7 @@ class MergedH5File:
 
     __slots__ = ("_data", "_sidecars")
 
-    def __init__(
-        self, data_h5f: h5py.File, sidecars: dict[str, h5py.File] | None = None
-    ) -> None:
+    def __init__(self, data_h5f: h5py.File, sidecars: dict[str, h5py.File] | None = None) -> None:
         self._data = data_h5f
         self._sidecars = sidecars or {}
 
@@ -124,9 +122,7 @@ class EpisodeReader:
         }
         missing = [name for name, path in paths.items() if not path.is_file()]
         if missing:
-            raise FileNotFoundError(
-                f"episode is missing required files {missing}: {self._path}"
-            )
+            raise FileNotFoundError(f"episode is missing required files {missing}: {self._path}")
 
         self._rgb_decoder: VideoDecoder | None = None
         self._data_h5f = h5py.File(paths["data"], "r")
@@ -182,8 +178,9 @@ class EpisodeReader:
         if meta is None:
             raise ValueError("episode is missing meta")
         frame_count = int(meta.attrs.get("num_frames", -1))
-        datasets = {key: value for key, value in self._data_h5f.items()
-                    if isinstance(value, h5py.Dataset)}
+        datasets = {
+            key: value for key, value in self._data_h5f.items() if isinstance(value, h5py.Dataset)
+        }
         errors = validate_data_layout(
             {key: value.shape for key, value in datasets.items()},
             {key: value.dtype for key, value in datasets.items()},
@@ -204,8 +201,12 @@ class EpisodeReader:
             raise ValueError(f"{purpose} rejects technically invalid episodes")
         # The parent may have lost the producer before STOP carried the failure.
         import json
+
         result_path = self._path.with_name(self._path.name + ".result.json")
-        if result_path.exists() and json.loads(result_path.read_text()).get("technical_status") != "valid":
+        if (
+            result_path.exists()
+            and json.loads(result_path.read_text()).get("technical_status") != "valid"
+        ):
             raise ValueError(f"{purpose} rejects invalid episode result")
 
     @property
@@ -223,9 +224,7 @@ class EpisodeReader:
             grid_dt_s=1.0 / control_hz,
             grid_duration_s=span,
             wall_duration_s=wall_duration,
-            non_sampled_duration_s=max(
-                0.0, span - max(0, len(timestamps) - 1) / control_hz
-            ),
+            non_sampled_duration_s=max(0.0, span - max(0, len(timestamps) - 1) / control_hz),
         )
 
     def read_camera_frame(self, key: str, index: int) -> np.ndarray:
@@ -272,9 +271,7 @@ class EpisodeReader:
         HDF5 camera modalities remain directly sliceable through :attr:`h5f`.
         """
         if key != "rgb":
-            raise ValueError(
-                "iter_camera_frames currently supports only MP4-backed RGB"
-            )
+            raise ValueError("iter_camera_frames currently supports only MP4-backed RGB")
         if self._rgb_decoder is None:
             raise RuntimeError("EpisodeReader has no RGB decoder")
         yield from self._rgb_decoder.iter_frames()

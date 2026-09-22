@@ -1,7 +1,4 @@
-"""Stable NumPy wire schemas for cross-process channels.
-
-The recording transport reuses the raw row layout as its single source of truth.
-"""
+"""NumPy cross-process schemas, with recording rows based on the raw layout."""
 
 from __future__ import annotations
 
@@ -27,9 +24,7 @@ def make_pointcloud_frame_dtype(num_points: int) -> np.dtype:
         or not isinstance(num_points, (int, np.integer))
         or num_points <= 0
     ):
-        raise ValueError(
-            f"point-cloud count must be a positive integer, got {num_points!r}"
-        )
+        raise ValueError(f"point-cloud count must be a positive integer, got {num_points!r}")
     count = int(num_points)
     return np.dtype(
         [
@@ -48,14 +43,17 @@ def validate_point_cloud_array(
     label: str = "point_cloud",
 ) -> np.ndarray:
     """Validate the canonical finite ``float32[N,6]`` xyzrgb payload."""
-    if isinstance(num_points, bool) or not isinstance(num_points, (int, np.integer)) or num_points <= 0:
+    if (
+        isinstance(num_points, bool)
+        or not isinstance(num_points, (int, np.integer))
+        or num_points <= 0
+    ):
         raise ValueError("num_points must be a positive integer")
     array = np.asarray(value)
     expected_shape = (int(num_points), POINT_CLOUD_FEATURE_DIM)
     if array.shape != expected_shape or array.dtype != np.float32:
         raise ValueError(
-            f"{label} must be float32 {expected_shape}, "
-            f"got shape={array.shape} dtype={array.dtype}"
+            f"{label} must be float32 {expected_shape}, got shape={array.shape} dtype={array.dtype}"
         )
     if not np.all(np.isfinite(array)):
         raise ValueError(f"{label} contains NaN/Inf")
@@ -65,23 +63,36 @@ def validate_point_cloud_array(
 
 
 # Latest absolute target. Presence bits support arm-only manual workflows.
-ROBOT_COMMAND_DTYPE = np.dtype([
-    ("run_id", "<u8"), ("arm_present", "u1"), ("hand_present", "u1"),
-    ("arm_qpos", "<f8", ARM_JOINT_SHAPE),
-    ("hand_qpos", "<f8", HAND_JOINT_SHAPE),
-], align=True)
+ROBOT_COMMAND_DTYPE = np.dtype(
+    [
+        ("run_id", "<u8"),
+        ("arm_present", "u1"),
+        ("hand_present", "u1"),
+        ("arm_qpos", "<f8", ARM_JOINT_SHAPE),
+        ("hand_qpos", "<f8", HAND_JOINT_SHAPE),
+    ],
+    align=True,
+)
 
-ARM_STATE_DTYPE = np.dtype([
-    ("qpos", "<f8", ARM_JOINT_SHAPE), ("qvel", "<f8", ARM_JOINT_SHAPE),
-    ("effort", "<f8", ARM_JOINT_SHAPE), ("timestamp_ns", "<u8"),
-])
-HAND_STATE_DTYPE = np.dtype([
-    ("qpos", "<f8", HAND_JOINT_SHAPE), ("current", "<f8", HAND_JOINT_SHAPE),
-    ("tactile_aggregate", "<f4", HAND_TACTILE_SUM_SHAPE),
-    ("tactile_aggregate_valid", "u1"),
-    ("tactile_dense", "<f4", HAND_TACTILE_FORCE_SHAPE),
-    ("tactile_dense_valid", "u1"), ("timestamp_ns", "<u8"),
-])
+ARM_STATE_DTYPE = np.dtype(
+    [
+        ("qpos", "<f8", ARM_JOINT_SHAPE),
+        ("qvel", "<f8", ARM_JOINT_SHAPE),
+        ("effort", "<f8", ARM_JOINT_SHAPE),
+        ("timestamp_ns", "<u8"),
+    ]
+)
+HAND_STATE_DTYPE = np.dtype(
+    [
+        ("qpos", "<f8", HAND_JOINT_SHAPE),
+        ("current", "<f8", HAND_JOINT_SHAPE),
+        ("tactile_aggregate", "<f4", HAND_TACTILE_SUM_SHAPE),
+        ("tactile_aggregate_valid", "u1"),
+        ("tactile_dense", "<f4", HAND_TACTILE_FORCE_SHAPE),
+        ("tactile_dense_valid", "u1"),
+        ("timestamp_ns", "<u8"),
+    ]
+)
 
 # A ring publication is driven by a right-hand frame; ``head_*`` fields cache the latest HeadFrame.
 VR_FRAME_DTYPE = np.dtype(
@@ -120,12 +131,18 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
 
 
 def make_record_sample_dtype(rgb_shape, depth_shape) -> np.dtype:
-    """The raw row plus its owned RGB-D payload, transported to RecorderIO."""
+    """Transport a raw row and its RGB-D payload to RecorderIO."""
     from dexmani_real.recording.storage.schema import DATASET_SPECS
-    return np.dtype([
-        (name, spec.dtype, spec.tail_shape) for name, spec in DATASET_SPECS.items()
-    ] + [("camera_present", "u1"), ("camera_rgb", "u1", rgb_shape),
-         ("camera_depth", "<u2", depth_shape)], align=True)
+
+    return np.dtype(
+        [(name, spec.dtype, spec.tail_shape) for name, spec in DATASET_SPECS.items()]
+        + [
+            ("camera_present", "u1"),
+            ("camera_rgb", "u1", rgb_shape),
+            ("camera_depth", "<u2", depth_shape),
+        ],
+        align=True,
+    )
 
 
 __all__ = [

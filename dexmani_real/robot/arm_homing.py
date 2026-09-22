@@ -1,16 +1,22 @@
 """Planned return-home with full path/environment collision checks."""
+
 import time
-from queue import Full, Empty
 from dataclasses import dataclass
+from queue import Empty, Full
+
 import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.ipc.channels import read_arm_state
 from dexmani_real.planning import OnlineIKConfig, Pose, XArm7MotionPlanner, XArm7PlannerConfig
-from dexmani_real.planning.paths import HomePathStatus, compute_joint_home_path, compute_band_alignment_path
-from dexmani_real.robot.model import XARM7_XHAND_COLLISION_URDF_PATH, XARM7_XHAND_SRDF_PATH
-from dexmani_real.robot.home import HomeResult, wait_home_result
+from dexmani_real.planning.paths import (
+    HomePathStatus,
+    compute_band_alignment_path,
+    compute_joint_home_path,
+)
 from dexmani_real.robot.hand_homing import home_hand
+from dexmani_real.robot.home import HomeResult, wait_home_result
+from dexmani_real.robot.model import XARM7_XHAND_COLLISION_URDF_PATH, XARM7_XHAND_SRDF_PATH
 from dexmani_real.runtime.observation import sample_is_fresh
 from dexmani_real.runtime.safety import SafetyState, command_may_cross_sdk, revoke_motion
 
@@ -29,21 +35,36 @@ class ArmHomeConfig:
     @classmethod
     def from_runtime(cls, runtime):
         h = runtime.arm.homing
-        return cls(h.request_queue_timeout_s, h.convergence_timeout_s, h.state_max_age_s,
-                   h.max_speed_rad_per_s, h.target_timeout_s, h.velocity_convergence_rad_s,
-                   runtime.arm.table_z_surface_m, runtime.arm.hand_safety_margin_m)
+        return cls(
+            h.request_queue_timeout_s,
+            h.convergence_timeout_s,
+            h.state_max_age_s,
+            h.max_speed_rad_per_s,
+            h.target_timeout_s,
+            h.velocity_convergence_rad_s,
+            runtime.arm.table_z_surface_m,
+            runtime.arm.hand_safety_margin_m,
+        )
 
 
 def _home_path(current, target, planner, config):
-    options = dict(table_z_surface_m=config.table_z_surface_m,
-                   hand_safety_margin_m=config.hand_safety_margin_m)
+    options = dict(
+        table_z_surface_m=config.table_z_surface_m,
+        hand_safety_margin_m=config.hand_safety_margin_m,
+    )
     path = compute_joint_home_path(current, target, planner, use_canonical_target=True, **options)
     if path.status is not HomePathStatus.UNSAFE:
         return path.waypoints
-    wrapped = compute_joint_home_path(current, target, planner, use_canonical_target=False, **options)
+    wrapped = compute_joint_home_path(
+        current, target, planner, use_canonical_target=False, **options
+    )
     if wrapped.status is HomePathStatus.UNSAFE:
         raise ValueError(f"no safe home path: {wrapped.candidates}")
-    start = wrapped.waypoints[-1] if len(wrapped.waypoints) else planner.ik_mgr.nearest_equivalent_qpos(target, current)
+    start = (
+        wrapped.waypoints[-1]
+        if len(wrapped.waypoints)
+        else planner.ik_mgr.nearest_equivalent_qpos(target, current)
+    )
     alignment = compute_band_alignment_path(start, target, planner, **options)
     if alignment.status is HomePathStatus.UNSAFE:
         raise ValueError(f"no safe equivalent-angle alignment: {alignment.candidates}")
@@ -53,8 +74,17 @@ def _home_path(current, target, planner, config):
     return wrapped.waypoints
 
 
-def execute_arm_home(shared, home_qpos, *, planner, config, estop_requested=None,
-                     cancel_requested=None, progress=None, hand_state_max_age_s=None):
+def execute_arm_home(
+    shared,
+    home_qpos,
+    *,
+    planner,
+    config,
+    estop_requested=None,
+    cancel_requested=None,
+    progress=None,
+    hand_state_max_age_s=None,
+):
     target = np.asarray(home_qpos, dtype=np.float64)
     if target.shape != (7,) or not np.isfinite(target).all():
         return HomeResult(False, "home target must be finite (7,)")
@@ -68,11 +98,14 @@ def execute_arm_home(shared, home_qpos, *, planner, config, estop_requested=None
         except Empty:
             break
     boundary_ns = time.monotonic_ns()
+
     def aborted():
         if estop_requested is not None and estop_requested():
             shared.estop_request.value = True
-        return ((cancel_requested is not None and cancel_requested()) or
-                not command_may_cross_sdk(shared, run_id=epoch, required_safety_state=SafetyState.ARMED))
+        return (cancel_requested is not None and cancel_requested()) or not command_may_cross_sdk(
+            shared, run_id=epoch, required_safety_state=SafetyState.ARMED
+        )
+
     deadline = time.monotonic() + config.prehome_timeout_s
     hand_state = None
     feedback_issue = "fresh stationary arm state unavailable"
@@ -81,16 +114,22 @@ def execute_arm_home(shared, home_qpos, *, planner, config, estop_requested=None
             return HomeResult(False, "home interrupted")
         state = read_arm_state(shared)
         feedback_issue = "fresh stationary arm state unavailable"
-        if (state is not None and int(state["timestamp_ns"][0]) > boundary_ns
-                and sample_is_fresh(state["timestamp_ns"][0], config.state_max_age_s)
-                and np.max(np.abs(state["qvel"][0])) <= config.stationary_velocity_rad_s):
+        if (
+            state is not None
+            and int(state["timestamp_ns"][0]) > boundary_ns
+            and sample_is_fresh(state["timestamp_ns"][0], config.state_max_age_s)
+            and np.max(np.abs(state["qvel"][0])) <= config.stationary_velocity_rad_s
+        ):
             if hand_state_max_age_s is None:
                 break
             latest_hand = shared.hand_state_ring.read_latest()
             hand_state = latest_hand[0] if latest_hand is not None else None
-            if (hand_state is not None and int(hand_state["timestamp_ns"][0]) > boundary_ns
-                    and sample_is_fresh(hand_state["timestamp_ns"][0], hand_state_max_age_s)
-                    and np.isfinite(hand_state["qpos"][0]).all()):
+            if (
+                hand_state is not None
+                and int(hand_state["timestamp_ns"][0]) > boundary_ns
+                and sample_is_fresh(hand_state["timestamp_ns"][0], hand_state_max_age_s)
+                and np.isfinite(hand_state["qpos"][0]).all()
+            ):
                 break
             feedback_issue = "fresh post-home hand state unavailable"
         time.sleep(0.01)
@@ -107,12 +146,22 @@ def execute_arm_home(shared, home_qpos, *, planner, config, estop_requested=None
     if progress:
         progress(f"arm home: {len(waypoints)} planned milestones")
     try:
-        shared.arm_home_q.put_nowait((waypoints, target, epoch,
-            time.monotonic_ns() + int(config.request_queue_timeout_s * 1e9)))
+        shared.arm_home_q.put_nowait(
+            (
+                waypoints,
+                target,
+                epoch,
+                time.monotonic_ns() + int(config.request_queue_timeout_s * 1e9),
+            )
+        )
     except Full:
         return HomeResult(False, "arm home queue full")
-    travel = float(np.max(np.abs(np.diff(waypoints, axis=0)), axis=1).sum()) if len(waypoints) > 1 else 0
-    timeout = max(10.0, 2 * travel / config.max_speed_rad_s + len(waypoints) * config.target_timeout_s + 7)
+    travel = (
+        float(np.max(np.abs(np.diff(waypoints, axis=0)), axis=1).sum()) if len(waypoints) > 1 else 0
+    )
+    timeout = max(
+        10.0, 2 * travel / config.max_speed_rad_s + len(waypoints) * config.target_timeout_s + 7
+    )
     return wait_home_result(shared, shared.arm_home_result_q, epoch, timeout, aborted)
 
 
@@ -152,10 +201,18 @@ def home_policy_robot(shared, runtime, planner, *, abort_requested):
     # Hand-disabled mode assumes the hand is absent or secured at home.
     if not runtime.policy.hand_enabled:
         planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
-    result = execute_arm_home(shared, runtime.arm.home_qpos, planner=planner,
-        config=ArmHomeConfig.from_runtime(runtime), cancel_requested=abort_requested,
-        estop_requested=lambda: bool(shared.estop_request.value), progress=print,
-        hand_state_max_age_s=runtime.hand.feedback_max_age_s if runtime.policy.hand_enabled else None)
+    result = execute_arm_home(
+        shared,
+        runtime.arm.home_qpos,
+        planner=planner,
+        config=ArmHomeConfig.from_runtime(runtime),
+        cancel_requested=abort_requested,
+        estop_requested=lambda: bool(shared.estop_request.value),
+        progress=print,
+        hand_state_max_age_s=(
+            runtime.hand.feedback_max_age_s if runtime.policy.hand_enabled else None
+        ),
+    )
     if not result.ok:
         print(f"Home failed: {result.reason}", flush=True)
     return result.ok

@@ -39,18 +39,17 @@ def limit_cartesian_pose_lead(
     position_lead = bounded_pos - measured_pos
     position_lead_norm = float(np.linalg.norm(position_lead))
     if position_lead_norm > max_position_lead_m:
-        bounded_pos = measured_pos + position_lead * (
-            max_position_lead_m / position_lead_norm
-        )
+        bounded_pos = measured_pos + position_lead * (max_position_lead_m / position_lead_norm)
 
     measured_rotation = Rotation.from_quat(measured_quat_wxyz, scalar_first=True)
     target_rotation = Rotation.from_quat(target_quat_wxyz, scalar_first=True)
     rotation_lead = (target_rotation * measured_rotation.inv()).as_rotvec()
     rotation_lead_norm = float(np.linalg.norm(rotation_lead))
     if rotation_lead_norm > max_rotation_lead_rad:
-        target_rotation = Rotation.from_rotvec(
-            rotation_lead * (max_rotation_lead_rad / rotation_lead_norm)
-        ) * measured_rotation
+        target_rotation = (
+            Rotation.from_rotvec(rotation_lead * (max_rotation_lead_rad / rotation_lead_norm))
+            * measured_rotation
+        )
     return bounded_pos, target_rotation.as_quat(scalar_first=True)
 
 

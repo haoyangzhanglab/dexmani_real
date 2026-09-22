@@ -5,8 +5,8 @@ from dexmani_real.config.defaults import (
     StaticCollisionBox,
     TableCollisionConfig,
 )
-from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.config.experiment import ExperimentConfig, resolve_experiment_config
+from dexmani_real.config.pointcloud import PointCloudConfig
 
 __all__ = [
     "EnvironmentConfig",

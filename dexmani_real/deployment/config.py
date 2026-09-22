@@ -71,9 +71,7 @@ def _validate_real_observation_capability(policy_spec: Any) -> tuple[Any, ...]:
     fields = policy_spec.observation_fields
     names = tuple(field.name for field in fields)
     if not set(names) <= _SUPPORTED_OBSERVATION_FIELDS or "joint_state" not in names:
-        raise ValueError(
-            "Real supports only configured modalities including joint_state"
-        )
+        raise ValueError("Real supports only configured modalities including joint_state")
 
     fixed_fields = {
         "joint_state": ((19,), "float32"),
@@ -103,11 +101,7 @@ def _validate_real_observation_capability(policy_spec: Any) -> tuple[Any, ...]:
                     "Policy point_cloud must be float32 [N, 6] with positive integer N"
                 )
         elif name == "rgb" and (
-            len(shape) != 3
-            or shape[2] != 3
-            or dtype != "uint8"
-            or shape[0] <= 0
-            or shape[1] <= 0
+            len(shape) != 3 or shape[2] != 3 or dtype != "uint8" or shape[0] <= 0 or shape[1] <= 0
         ):
             raise ValueError("Policy rgb must be uint8 [H, W, 3] with positive H and W")
     return fields
@@ -149,7 +143,6 @@ def _expected_fingertip_semantics(runtime: Any) -> dict[str, str]:
         "finger_order": HAND_FINGER_ORDER_ID,
         "derivation": FINGERTIP_POINTS_DERIVATION,
         "policy_id": FINGERTIP_POLICY_ID,
-
     }
 
 
@@ -193,13 +186,16 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
     """Validate only whether Real can run the Policy-owned public contract."""
     policy_hz = 1.0 / float(policy_spec.control_dt_s)
     limiting_hz = min(runtime.arm.loop_hz, runtime.hand.loop_hz)
-    if policy_hz > limiting_hz and not math.isclose(policy_hz, limiting_hz, rel_tol=1e-9, abs_tol=1e-9):
-        raise ValueError(f"Policy action rate {policy_hz:g} Hz exceeds limiting worker rate {limiting_hz:g} Hz")
+    if policy_hz > limiting_hz and not math.isclose(
+        policy_hz, limiting_hz, rel_tol=1e-9, abs_tol=1e-9
+    ):
+        raise ValueError(
+            f"Policy action rate {policy_hz:g} Hz exceeds limiting worker rate {limiting_hz:g} Hz"
+        )
     fields = _validate_real_observation_capability(policy_spec)
     if policy_spec.requires_hand is not True:
         raise ValueError(
-            "Real deployment requires hand actions because its control schema is "
-            "arm7 + hand12"
+            "Real deployment requires hand actions because its control schema is arm7 + hand12"
         )
     if policy_spec.action_key not in {"action", "action_ee"}:
         raise ValueError("Policy action_key is unsupported by Real")
@@ -222,13 +218,8 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
             expected=_expected_tactile_force_semantics(),
         )
     point_cloud = fields_by_name.get("point_cloud")
-    if (
-        point_cloud is not None
-        and runtime.pointcloud.num_points != point_cloud.shape[0]
-    ):
-        raise ValueError(
-            "Policy point_cloud shape does not match Real pointcloud config"
-        )
+    if point_cloud is not None and runtime.pointcloud.num_points != point_cloud.shape[0]:
+        raise ValueError("Policy point_cloud shape does not match Real pointcloud config")
     if point_cloud is not None:
         _validate_field_semantics(
             point_cloud,
@@ -283,9 +274,7 @@ class PolicyRuntimeConfig:
             or not self.artifact
             or self.artifact != Path(self.artifact).name
         ):
-            raise ValueError(
-                "artifact must be a plain checkpoint filename (no path separators)"
-            )
+            raise ValueError("artifact must be a plain checkpoint filename (no path separators)")
         if type(self.inference_steps) is not int or self.inference_steps < 1:
             raise ValueError("inference_steps must be a positive integer")
 
@@ -330,9 +319,7 @@ class RolloutRecordingConfig:
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"rollout {field_name} must be non-empty")
             if value != value.strip():
-                raise ValueError(
-                    f"rollout {field_name} must not have surrounding whitespace"
-                )
+                raise ValueError(f"rollout {field_name} must not have surrounding whitespace")
         object.__setattr__(self, "data_dir", str(resolved_data_dir))
 
 

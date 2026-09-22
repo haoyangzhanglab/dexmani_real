@@ -72,9 +72,7 @@ class PointCloudLoopConfig:
         if not isinstance(self.pointcloud, PointCloudConfig):
             raise TypeError("pointcloud must be a PointCloudConfig")
         if not isinstance(self.camera_calibration, CameraExtrinsics):
-            raise TypeError(
-                "camera_calibration must be a preloaded CameraExtrinsics snapshot"
-            )
+            raise TypeError("camera_calibration must be a preloaded CameraExtrinsics snapshot")
         if self.table_plane_abcd is not None:
             plane = tuple(float(value) for value in self.table_plane_abcd)
             if len(plane) != 4 or not np.all(np.isfinite(plane)):
@@ -111,9 +109,7 @@ def _resolve_base_from_color(
 ) -> np.ndarray:
     serial = _shared_text(shared.camera_serial).strip()
     if not serial:
-        raise RuntimeError(
-            "camera did not publish a serial for point-cloud calibration"
-        )
+        raise RuntimeError("camera did not publish a serial for point-cloud calibration")
     camera_name = calibration.resolve_name_by_serial(serial)
     metadata = calibration.to_meta_dict(camera_name, expected_serial=serial)
     if metadata.get("camera_type") != "eye_to_hand":
@@ -159,9 +155,7 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
     cfg = config
     expected_dtype = make_pointcloud_frame_dtype(cfg.pointcloud.num_points)
     if shared.pointcloud_ring.dtype != expected_dtype:
-        raise RuntimeError(
-            "pointcloud ring dtype does not match PointCloudLoopConfig num_points"
-        )
+        raise RuntimeError("pointcloud ring dtype does not match PointCloudLoopConfig num_points")
 
     static_inputs = _load_static_inputs(shared, cfg.camera_calibration)
     if static_inputs is None:

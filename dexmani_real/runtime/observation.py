@@ -1,9 +1,11 @@
 """One current copied observation per control step; local rows own temporal history."""
+
+import time
 from collections import deque
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
-import time
+
 import numpy as np
 
 
@@ -17,7 +19,10 @@ def read_vr_frame(shared):
     if result is None:
         return None
     record = result[0][0]
-    return {**{name: record[name].copy() for name in record.dtype.names}, "ring_sequence": result[2]}
+    return {
+        **{name: record[name].copy() for name in record.dtype.names},
+        "ring_sequence": result[2],
+    }
 
 
 def read_camera_frame(shared, sequence=None):
@@ -31,10 +36,14 @@ def read_camera_frame(shared, sequence=None):
         if result is None:
             return None
         header, rgb, depth = result["header"], result["rgb"], result["depth"]
-    return {"rgb": rgb, "depth": depth, "ring_sequence": sequence,
-            "timestamp_ns": int(header["timestamp_ns"][0]),
-            "depth_frame_number": int(header["depth_frame_number"][0]),
-            "color_frame_number": int(header["color_frame_number"][0])}
+    return {
+        "rgb": rgb,
+        "depth": depth,
+        "ring_sequence": sequence,
+        "timestamp_ns": int(header["timestamp_ns"][0]),
+        "depth_frame_number": int(header["depth_frame_number"][0]),
+        "color_frame_number": int(header["color_frame_number"][0]),
+    }
 
 
 def _freeze(value):
@@ -55,36 +64,68 @@ class ObservationRow:
     observation_timestamp_ns: int
 
 
-def read_observation(shared, runtime, *, require_hand=True, require_camera=False,
-                     require_vr=False, require_pointcloud=False, require_rgb_cloud_identity=False):
+def read_observation(
+    shared,
+    runtime,
+    *,
+    require_hand=True,
+    require_camera=False,
+    require_vr=False,
+    require_pointcloud=False,
+    require_rgb_cloud_identity=False,
+):
     arm_result = shared.arm_state_ring.read_latest()
     hand_result = shared.hand_state_ring.read_latest() if require_hand else None
     cloud_result = shared.pointcloud_ring.read_latest() if require_pointcloud else None
-    if arm_result is None or (require_hand and hand_result is None) or (require_pointcloud and cloud_result is None):
+    if (
+        arm_result is None
+        or (require_hand and hand_result is None)
+        or (require_pointcloud and cloud_result is None)
+    ):
         return None
     arm = arm_result[0]
     hand = hand_result[0] if hand_result else None
     cloud = cloud_result[0][0] if cloud_result else None
     if require_rgb_cloud_identity:
-        camera = read_camera_frame(shared, int(cloud["source_camera_sequence"])) if cloud is not None else None
+        camera = (
+            read_camera_frame(shared, int(cloud["source_camera_sequence"]))
+            if cloud is not None
+            else None
+        )
     else:
         camera = read_camera_frame(shared) if require_camera else None
     vr = read_vr_frame(shared) if require_vr else None
-    if ((require_camera or require_rgb_cloud_identity) and camera is None) or (require_vr and vr is None):
+    if ((require_camera or require_rgb_cloud_identity) and camera is None) or (
+        require_vr and vr is None
+    ):
         return None
     now = time.monotonic_ns()
     if not sample_is_fresh(arm["timestamp_ns"][0], runtime.arm.feedback_max_age_s, now):
         return None
-    if hand is not None and not sample_is_fresh(hand["timestamp_ns"][0], runtime.hand.feedback_max_age_s, now):
+    if hand is not None and not sample_is_fresh(
+        hand["timestamp_ns"][0], runtime.hand.feedback_max_age_s, now
+    ):
         return None
-    if camera is not None and not sample_is_fresh(camera["timestamp_ns"], runtime.camera.max_frame_age_s, now):
+    if camera is not None and not sample_is_fresh(
+        camera["timestamp_ns"], runtime.camera.max_frame_age_s, now
+    ):
         return None
-    if cloud is not None and not sample_is_fresh(cloud["timestamp_ns"], runtime.camera.max_frame_age_s, now):
+    if cloud is not None and not sample_is_fresh(
+        cloud["timestamp_ns"], runtime.camera.max_frame_age_s, now
+    ):
         return None
-    if vr is not None and not sample_is_fresh(vr["recv_ts_ns"], runtime.policy.vr_mapping.stale_threshold_s, now):
+    if vr is not None and not sample_is_fresh(
+        vr["recv_ts_ns"], runtime.policy.vr_mapping.stale_threshold_s, now
+    ):
         return None
-    return ObservationRow(_freeze(arm), _freeze(hand), _freeze(camera), _freeze(vr),
-                          _freeze(cloud["point_cloud"]) if cloud is not None else None, now)
+    return ObservationRow(
+        _freeze(arm),
+        _freeze(hand),
+        _freeze(camera),
+        _freeze(vr),
+        _freeze(cloud["point_cloud"]) if cloud is not None else None,
+        now,
+    )
 
 
 class ObservationHistory:
@@ -96,7 +137,11 @@ class ObservationHistory:
         self.rows.clear()
 
     def append(self, row):
-        if self.rows and row.observation_timestamp_ns - self.rows[-1].observation_timestamp_ns > self.max_gap_ns:
+        if (
+            self.rows
+            and row.observation_timestamp_ns - self.rows[-1].observation_timestamp_ns
+            > self.max_gap_ns
+        ):
             self.clear()
         self.rows.append(row)
 

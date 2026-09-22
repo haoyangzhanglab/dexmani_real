@@ -1,6 +1,8 @@
 """Four motion states and a run epoch shared by controllers and SDK workers."""
+
 import time
 from enum import IntEnum
+
 
 class SafetyState(IntEnum):
     """Values stored in ``RuntimeChannels.safety_state``."""
@@ -34,8 +36,12 @@ class RunEndReason(IntEnum):
 
 
 def _begin_motion_locked(shared):
-    if (int(shared.safety_state.value) != int(SafetyState.ARMED)
-            or not shared.is_running.value or shared.error_state.value or shared.estop_request.value):
+    if (
+        int(shared.safety_state.value) != int(SafetyState.ARMED)
+        or not shared.is_running.value
+        or shared.error_state.value
+        or shared.estop_request.value
+    ):
         return None
     shared.run_id.value += 1
     started = time.monotonic_ns()
@@ -53,10 +59,14 @@ def begin_motion(shared):
 def command_may_cross_sdk(shared, *, run_id, required_safety_state=SafetyState.RUNNING):
     """Last software fence; no lock is held during the subsequent SDK call."""
     with shared.motion_lock:
-        return (shared.is_running.value and not shared.error_state.value and not shared.estop_request.value
+        return (
+            shared.is_running.value
+            and not shared.error_state.value
+            and not shared.estop_request.value
             and int(shared.run_id.value) == run_id
             and int(shared.safety_state.value) == int(required_safety_state)
-            and required_safety_state in (SafetyState.ARMED, SafetyState.RUNNING))
+            and required_safety_state in (SafetyState.ARMED, SafetyState.RUNNING)
+        )
 
 
 def revoke_motion(shared, new_state=SafetyState.ARMED, *, reason=RunEndReason.EXECUTOR_BOUNDARY):
@@ -78,7 +88,13 @@ def revoke_motion(shared, new_state=SafetyState.ARMED, *, reason=RunEndReason.EX
     return True
 
 
-def revoke_motion_if_run_id(shared, expected_run_id, new_state=SafetyState.ARMED, *, reason=RunEndReason.EXECUTOR_BOUNDARY):
+def revoke_motion_if_run_id(
+    shared,
+    expected_run_id,
+    new_state=SafetyState.ARMED,
+    *,
+    reason=RunEndReason.EXECUTOR_BOUNDARY,
+):
     with shared.motion_lock:
         if int(shared.run_id.value) != expected_run_id:
             return False
@@ -86,7 +102,11 @@ def revoke_motion_if_run_id(shared, expected_run_id, new_state=SafetyState.ARMED
 
 
 def transition(shared, new_state):
-    return begin_motion(shared) if new_state == SafetyState.RUNNING else revoke_motion(shared, new_state)
+    return (
+        begin_motion(shared)
+        if new_state == SafetyState.RUNNING
+        else revoke_motion(shared, new_state)
+    )
 
 
 def require_transition(shared, new_state):
@@ -96,9 +116,15 @@ def require_transition(shared, new_state):
 
 def request_policy_start(shared, *, require_physical_home):
     with shared.motion_lock:
-        if (int(shared.safety_state.value) != int(SafetyState.ARMED) or not shared.is_running.value
-                or shared.error_state.value or shared.estop_request.value or shared.workflow_failed.value
-                or shared.stop_request.value or (require_physical_home and not shared.physical_home_completed.value)):
+        if (
+            int(shared.safety_state.value) != int(SafetyState.ARMED)
+            or not shared.is_running.value
+            or shared.error_state.value
+            or shared.estop_request.value
+            or shared.workflow_failed.value
+            or shared.stop_request.value
+            or (require_physical_home and not shared.physical_home_completed.value)
+        ):
             return False
         shared.start_request.value = True
         return True

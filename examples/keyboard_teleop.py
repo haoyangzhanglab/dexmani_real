@@ -7,12 +7,7 @@ The session commands xArm7 and can also command XHand unless ``--no-hand`` is se
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
-
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
 
 import yaml
 
@@ -27,9 +22,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not connect XHand; it must be absent or secured at configured home",
     )
-    parser.add_argument(
-        "--config", type=Path, default=None, help="Validated experiment YAML"
-    )
+    parser.add_argument("--config", type=Path, default=None, help="Validated experiment YAML")
     args = parser.parse_args(argv)
     try:
         runtime = resolve_experiment_config(

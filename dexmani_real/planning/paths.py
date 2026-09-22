@@ -168,9 +168,7 @@ def wrap_nearest_equivalent(
         or lo.shape != result.shape
         or hi.shape != result.shape
     ):
-        raise ValueError(
-            "qpos, reference, and joint limits must be matching 1-D arrays"
-        )
+        raise ValueError("qpos, reference, and joint limits must be matching 1-D arrays")
     if not all(np.all(np.isfinite(values)) for values in (result, ref, lo, hi)):
         raise ValueError("qpos, reference, and joint limits must be finite")
     if np.any(lo > hi):
@@ -262,9 +260,7 @@ def _check_home_path_candidate(
                 False,
                 reason=reason,
                 sample_count=sample_count,
-                collision_waypoint_index=collision_result.get(
-                    "collision_waypoint_index"
-                ),
+                collision_waypoint_index=collision_result.get("collision_waypoint_index"),
                 collision_pairs=pairs,
             )
 
@@ -448,11 +444,7 @@ def compute_joint_home_path(
             )
         )
     else:
-        if (
-            planned.success
-            and planned.qpos_path is not None
-            and len(planned.qpos_path) >= 2
-        ):
+        if planned.success and planned.qpos_path is not None and len(planned.qpos_path) >= 2:
             rrt_milestones = np.asarray(planned.qpos_path, dtype=np.float64)
             if float(np.max(np.abs(rrt_milestones[-1] - target))) > 1e-6:
                 rrt_milestones = np.concatenate(

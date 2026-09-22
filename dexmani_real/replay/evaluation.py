@@ -34,12 +34,8 @@ class ReplayMetrics:
     replayed_frames: int = 0
     matching_frames: int = 0
 
-    arm_joint_mae_deg: np.ndarray = field(
-        default_factory=lambda: np.zeros(ARM_JOINT_SHAPE)
-    )
-    arm_joint_rmse_deg: np.ndarray = field(
-        default_factory=lambda: np.zeros(ARM_JOINT_SHAPE)
-    )
+    arm_joint_mae_deg: np.ndarray = field(default_factory=lambda: np.zeros(ARM_JOINT_SHAPE))
+    arm_joint_rmse_deg: np.ndarray = field(default_factory=lambda: np.zeros(ARM_JOINT_SHAPE))
     arm_joint_mae_overall_deg: float = 0.0
     arm_joint_rmse_overall_deg: float = 0.0
 
@@ -122,9 +118,7 @@ def compute_metrics(
             np.isfinite(rep_ee_pos), axis=1
         )
         if valid_ee.sum() > 0:
-            pos_err = np.linalg.norm(
-                orig_ee_pos[valid_ee] - rep_ee_pos[valid_ee], axis=1
-            )
+            pos_err = np.linalg.norm(orig_ee_pos[valid_ee] - rep_ee_pos[valid_ee], axis=1)
             metrics.eef_pos_error_per_frame_mm = pos_err * 1000.0
             metrics.eef_pos_error_mean_mm = float(np.mean(pos_err) * 1000.0)
             metrics.eef_pos_error_max_mm = float(np.max(pos_err) * 1000.0)
@@ -137,9 +131,7 @@ def compute_metrics(
     ):
         orig_rot6d = original_arm_ee[:frame_count, 3:9]
         rep_rot6d = replay_arm_ee_rot6d[:frame_count]
-        valid_rot = np.all(np.isfinite(orig_rot6d), axis=1) & np.all(
-            np.isfinite(rep_rot6d), axis=1
-        )
+        valid_rot = np.all(np.isfinite(orig_rot6d), axis=1) & np.all(np.isfinite(rep_rot6d), axis=1)
         if valid_rot.sum() > 0:
             rot_errs = []
             for i in np.where(valid_rot)[0]:
@@ -161,20 +153,14 @@ def compute_metrics(
         if hand_frame_count > 0:
             orig_h = original_hand_qpos[:hand_frame_count]
             rep_h = replay_hand_qpos[:hand_frame_count]
-            valid_h = np.all(np.isfinite(orig_h), axis=1) & np.all(
-                np.isfinite(rep_h), axis=1
-            )
+            valid_h = np.all(np.isfinite(orig_h), axis=1) & np.all(np.isfinite(rep_h), axis=1)
             if valid_h.sum() > 0:
                 diff_h = np.abs(orig_h[valid_h] - rep_h[valid_h])
                 metrics.hand_joint_mae_overall_deg = float(np.rad2deg(np.mean(diff_h)))
-                metrics.hand_joint_rmse_overall_deg = float(
-                    np.rad2deg(np.sqrt(np.mean(diff_h**2)))
-                )
+                metrics.hand_joint_rmse_overall_deg = float(np.rad2deg(np.sqrt(np.mean(diff_h**2))))
 
     if frame_count >= _MIN_TRACKING_SEQUENCE_FRAMES:
-        max_lag = max(
-            int(np.ceil(fps * _TRACKING_LAG_WINDOW_S)), _MIN_TRACKING_LAG_FRAMES
-        )
+        max_lag = max(int(np.ceil(fps * _TRACKING_LAG_WINDOW_S)), _MIN_TRACKING_LAG_FRAMES)
         joint_lags: list[int] = []
         for joint_index in range(ARM_JOINT_SHAPE[0]):
             best_lag = 0
@@ -192,9 +178,7 @@ def compute_metrics(
                 finite = np.isfinite(original) & np.isfinite(replayed)
                 if int(np.count_nonzero(finite)) < _MIN_TRACKING_OVERLAP_FRAMES:
                     continue
-                rmse = float(
-                    np.sqrt(np.mean((original[finite] - replayed[finite]) ** 2))
-                )
+                rmse = float(np.sqrt(np.mean((original[finite] - replayed[finite]) ** 2)))
                 candidate_key = (rmse, abs(lag), lag)
                 if candidate_key < best_key:
                     best_key = candidate_key
@@ -207,17 +191,11 @@ def compute_metrics(
     if arm_tracking_error is not None:
         finite_tracking_error = arm_tracking_error[np.isfinite(arm_tracking_error)]
         if finite_tracking_error.size:
-            metrics.arm_tracking_error_mean_deg = float(
-                np.rad2deg(np.mean(finite_tracking_error))
-            )
+            metrics.arm_tracking_error_mean_deg = float(np.rad2deg(np.mean(finite_tracking_error)))
             metrics.arm_tracking_error_p95_deg = float(
-                np.rad2deg(
-                    np.percentile(finite_tracking_error, _TRACKING_ERROR_PERCENTILE)
-                )
+                np.rad2deg(np.percentile(finite_tracking_error, _TRACKING_ERROR_PERCENTILE))
             )
-            metrics.arm_tracking_error_max_deg = float(
-                np.rad2deg(np.max(finite_tracking_error))
-            )
+            metrics.arm_tracking_error_max_deg = float(np.rad2deg(np.max(finite_tracking_error)))
 
     return metrics
 
@@ -227,9 +205,7 @@ def report_consistency(metrics: ReplayMetrics) -> None:
     print("\n" + "=" * 60)
     print("Consistency Evaluation")
     print("=" * 60)
-    print(
-        f"  Frames: {metrics.replayed_frames} replayed / {metrics.original_frames} original"
-    )
+    print(f"  Frames: {metrics.replayed_frames} replayed / {metrics.original_frames} original")
     print(
         f"  Arm joint MAE:  {np.round(metrics.arm_joint_mae_deg, 2)} deg  "
         f"(overall: {metrics.arm_joint_mae_overall_deg:.3f} deg)"
@@ -274,9 +250,7 @@ def evaluate_replay(
 ) -> None:
     """Evaluate and persist samples captured by one physical replay."""
     if replay_data is None:
-        print(
-            "\nNo replay data collected (replay interrupted before any frames captured)."
-        )
+        print("\nNo replay data collected (replay interrupted before any frames captured).")
         return
     if replay_data["arm_qpos"].shape[0] == 0:
         print("\nSkipping metrics: no valid reference or replay data available")
@@ -382,9 +356,7 @@ def save_results(
             "rmse_overall_deg": round(metrics.hand_joint_rmse_overall_deg, 4),
         }
 
-    metrics_path = atomic_json_dump(
-        metrics_dict, output_path / "metrics.json", ensure_ascii=False
-    )
+    metrics_path = atomic_json_dump(metrics_dict, output_path / "metrics.json", ensure_ascii=False)
     print(f"\nMetrics saved: {metrics_path}")
 
     save_replay_data(replay_data, output_dir)

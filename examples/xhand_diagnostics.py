@@ -18,10 +18,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
 from dexmani_real.config.defaults import hand as hand_defaults
 from dexmani_real.robot.model import (
     HAND_DOF,
@@ -52,7 +48,6 @@ _RS485_POST_OPEN_SETTLE_S = hand_defaults.rs485_post_open_settle_s
 _RS485_READ_CRC_RETRY_COUNT = 2
 _RS485_CRC_RETRY_BACKOFF_S = 0.08
 _HARDWARE_WORKER_ARG = "--_xhand-hardware-worker"
-
 
 
 def _joint_payload_problem(state: Any) -> str | None:
@@ -156,9 +151,7 @@ class XHandDiagnostics:
         print(f"  serial_number: {sn}")
         return sn
 
-    def _read_state_response(
-        self, force_update: bool, *, label: str
-    ) -> tuple[Any, Any]:
+    def _read_state_response(self, force_update: bool, *, label: str) -> tuple[Any, Any]:
         """Read state and retry only an RS485 CRC on a live transaction."""
         error_struct, state = self._device.read_state(self._hand_id, force_update)
         code = int(error_struct.error_code)
@@ -172,18 +165,14 @@ class XHandDiagnostics:
                     f"{_RS485_CRC_RETRY_BACKOFF_S:.2f}s"
                 )
                 time.sleep(_RS485_CRC_RETRY_BACKOFF_S)
-                error_struct, state = self._device.read_state(
-                    self._hand_id, force_update
-                )
+                error_struct, state = self._device.read_state(self._hand_id, force_update)
                 code = int(error_struct.error_code)
         return error_struct, state
 
     def read_state(self, finger_id: int = 2, force_update: bool = True) -> bool:
         # Request a live frame before the first command.
         self._header(f"Read state (finger {finger_id})")
-        error_struct, state = self._read_state_response(
-            force_update, label="read_state"
-        )
+        error_struct, state = self._read_state_response(force_update, label="read_state")
         code = int(error_struct.error_code)
         if state is None:
             print(
@@ -191,23 +180,15 @@ class XHandDiagnostics:
                 f"(error_code={code} msg={error_struct.error_message})"
             )
             return False
-        tactile_status = (
-            self._protocol == "RS485" and code in _RS485_TACTILE_STATUS_CODES
-        )
+        tactile_status = self._protocol == "RS485" and code in _RS485_TACTILE_STATUS_CODES
         crc_status = self._protocol == "RS485" and code == _RS485_CRC_ERROR_CODE
         if crc_status:
             joint_problem = _joint_payload_problem(state)
             if joint_problem is not None:
-                print(
-                    "  read_state CRC payload unusable: "
-                    f"{joint_problem} (error_code={code})"
-                )
+                print(f"  read_state CRC payload unusable: {joint_problem} (error_code={code})")
                 return False
         if code != 0 and not tactile_status and not crc_status:
-            print(
-                f"  read_state error: {error_struct.error_message} "
-                f"(error_code={code})"
-            )
+            print(f"  read_state error: {error_struct.error_message} (error_code={code})")
             return False
         combined_force_valid = code == 0 or (
             self._protocol == "RS485"
@@ -225,10 +206,7 @@ class XHandDiagnostics:
             _RS485_CRC_ERROR_CODE,
         }
         if crc_status:
-            print(
-                "  read_state: JOINTS USABLE; CRC UNCONFIRMED; SENSOR UNAVAILABLE; "
-                "continuing"
-            )
+            print("  read_state: JOINTS USABLE; CRC UNCONFIRMED; SENSOR UNAVAILABLE; continuing")
         elif tactile_status:
             print(
                 "  read_state: JOINTS OK; SENSOR PARTIALLY DEGRADED  "

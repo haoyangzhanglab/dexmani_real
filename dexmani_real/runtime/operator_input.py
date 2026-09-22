@@ -200,7 +200,9 @@ class KeyboardInput:
             callback = (
                 self._stop_callback
                 if signal is OperatorCommand.STOP
-                else self._quit_callback if signal is OperatorCommand.QUIT else None
+                else self._quit_callback
+                if signal is OperatorCommand.QUIT
+                else None
             )
         if callback is None:
             return True
@@ -316,8 +318,7 @@ class KeyboardInput:
             from pynput import keyboard  # type: ignore[import-untyped]
         except ImportError:
             raise ImportError(
-                "pynput is required for global keyboard capture. "
-                "Install with: pip install pynput"
+                "pynput is required for global keyboard capture. Install with: pip install pynput"
             ) from None
 
         if self._suppress_echo:
@@ -348,9 +349,7 @@ class KeyboardInput:
                 try:
                     listener = self._listener
                     if listener is None:
-                        raise RuntimeError(
-                            "keyboard listener disappeared during startup"
-                        )
+                        raise RuntimeError("keyboard listener disappeared during startup")
                     listener.wait()
                 except BaseException as exc:
                     startup_errors.append(exc)
@@ -365,9 +364,7 @@ class KeyboardInput:
                     f"keyboard listener startup timed out after {self._startup_timeout_s:.1f}s"
                 )
             if startup_errors:
-                raise RuntimeError(
-                    "keyboard listener failed during startup"
-                ) from startup_errors[0]
+                raise RuntimeError("keyboard listener failed during startup") from startup_errors[0]
             if not self._listener.is_alive():
                 raise RuntimeError("keyboard listener exited during startup")
         except Exception:
@@ -383,9 +380,7 @@ class KeyboardInput:
             try:
                 listener_alive = bool(listener is not None and listener.is_alive())
             except Exception:
-                logger.warning(
-                    "keyboard listener rollback health check failed", exc_info=True
-                )
+                logger.warning("keyboard listener rollback health check failed", exc_info=True)
                 listener_alive = True
             if not listener_alive:
                 self._listener = None
@@ -475,9 +470,7 @@ class KeyboardInput:
         """Whether the listener that owns emergency-stop input is alive."""
         listener = self._listener
         try:
-            healthy = bool(
-                self._running and listener is not None and listener.is_alive()
-            )
+            healthy = bool(self._running and listener is not None and listener.is_alive())
         except Exception:
             logger.error("keyboard listener health check failed", exc_info=True)
             healthy = False

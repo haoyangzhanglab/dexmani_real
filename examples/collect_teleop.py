@@ -8,12 +8,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import sys
-from pathlib import Path
-
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
 
 import yaml
 
@@ -45,9 +39,7 @@ def _positive_float(value: str) -> float:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="VR Teleop xArm7 + XHand with recording"
-    )
+    parser = argparse.ArgumentParser(description="VR Teleop xArm7 + XHand with recording")
     parser.add_argument(
         "--task-name",
         type=_task_name_arg,
@@ -116,9 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     if not bool(runtime.policy.hand_enabled) and not args.no_hand:
-        parser.error(
-            "policy.hand_enabled=false requires explicit --no-hand confirmation"
-        )
+        parser.error("policy.hand_enabled=false requires explicit --no-hand confirmation")
     operator = args.operator
     if bool(runtime.policy.recording_enabled):
         try:

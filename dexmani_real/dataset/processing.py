@@ -19,6 +19,10 @@ from dexmani_real.dataset.pointcloud import (
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
 )
+from dexmani_real.dataset.provenance import (
+    read_provenance_workflow,
+    supports_fixed_dt_teleop,
+)
 from dexmani_real.planning.kinematics.arm_fk import (
     EEF_POSE_ALGORITHM_ID,
     EEF_POSE_COMPONENTS,
@@ -26,19 +30,15 @@ from dexmani_real.planning.kinematics.arm_fk import (
     EEF_POSE_FRAME,
     compute_eef_pose_history_xarm_base,
 )
-from dexmani_real.planning.kinematics.pose import validate_canonical_rot6d
 from dexmani_real.planning.kinematics.fingertip import (
     FINGERTIP_POINTS_DERIVATION,
     FINGERTIP_POLICY_ID,
     compute_fingertip_history_xarm_base,
 )
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
+from dexmani_real.planning.kinematics.pose import validate_canonical_rot6d
 from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.recording.storage.schema import DATASET_SPECS, FRAME_OK
-from dexmani_real.dataset.provenance import (
-    read_provenance_workflow,
-    supports_fixed_dt_teleop,
-)
 from dexmani_real.robot.model import (
     CONTACT_FORCE_REPRESENTATION,
     HAND_FINGER_ORDER_ID,
@@ -55,6 +55,7 @@ from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_SAMPLING,
     POINT_CLOUD_TRANSFORM,
 )
+
 
 def validate_episode(reader) -> int:
     """Admit every row of a complete teleop episode, or reject the whole episode."""
@@ -97,7 +98,9 @@ def validate_episode(reader) -> int:
     load_raw_episode_base_from_color(reader)
     geometry = camera.geometry.color
     depth = source["depth"]
-    if depth.shape != (frames, geometry.height, geometry.width) or depth.dtype != np.dtype(np.uint16):
+    if depth.shape != (frames, geometry.height, geometry.width) or depth.dtype != np.dtype(
+        np.uint16
+    ):
         raise ValueError("depth shape/dtype/frame count mismatch")
     return frames
 
@@ -124,9 +127,7 @@ def load_annotations(path: str | Path | None) -> dict[str, EpisodeAnnotation]:
             raise ValueError(f"annotation for {episode_name} must be a mapping")
         unknown = set(raw) - allowed
         if unknown:
-            raise ValueError(
-                f"annotation for {episode_name} has unknown keys: {sorted(unknown)}"
-            )
+            raise ValueError(f"annotation for {episode_name} has unknown keys: {sorted(unknown)}")
         include = raw.get("include", True)
         task_name = raw.get("task_name")
         if not isinstance(include, bool):
@@ -149,10 +150,7 @@ def validate_annotation_task_name_override(
         return None
     resolved_task_name = validate_task_name(task_name)
     for episode_name, annotation in sorted(annotations.items()):
-        if (
-            annotation.task_name is not None
-            and annotation.task_name != resolved_task_name
-        ):
+        if annotation.task_name is not None and annotation.task_name != resolved_task_name:
             raise ValueError(
                 f"--task-name={resolved_task_name!r} conflicts with annotation task_name="
                 f"{annotation.task_name!r} for {episode_name}"
@@ -255,9 +253,7 @@ def policy_semantics(reader: EpisodeReader, config: ProcessingConfig) -> dict[st
     }
 
 
-def iter_policy_blocks(
-    reader: EpisodeReader, config: ProcessingConfig, *, chunk_frames: int
-):
+def iter_policy_blocks(reader: EpisodeReader, config: ProcessingConfig, *, chunk_frames: int):
     """One episode of numeric state; bounded RGB-D/cloud chunks, never a task in RAM."""
     frames = int(reader.h5f["meta"].attrs["num_frames"])
     camera_model = load_raw_episode_camera_model(reader)
@@ -290,12 +286,8 @@ def iter_policy_blocks(
         joint_state[:, :7],
         joint_state[:, 7:19],
         hand_fk=hand_fk,
-        handbase_position_eef_m=np.asarray(
-            config.handbase_position_eef_m, dtype=np.float64
-        ),
-        handbase_quat_eef_wxyz=np.asarray(
-            config.handbase_quat_eef_wxyz, dtype=np.float64
-        ),
+        handbase_position_eef_m=np.asarray(config.handbase_position_eef_m, dtype=np.float64),
+        handbase_quat_eef_wxyz=np.asarray(config.handbase_quat_eef_wxyz, dtype=np.float64),
         eef_pose_history=eef_pose,
     )
     pointcloud_deriver = RawEpisodePointCloudDeriver(
@@ -330,10 +322,7 @@ def iter_policy_blocks(
             point_cloud=np.stack(clouds),
         )
         for key, value in block.items():
-            if (
-                np.issubdtype(value.dtype, np.floating)
-                and not np.isfinite(value).all()
-            ):
+            if np.issubdtype(value.dtype, np.floating) and not np.isfinite(value).all():
                 raise ValueError(f"{key}: non-finite transformed values")
         validate_canonical_rot6d(block["eef_pose"][:, 3:9], label="eef_pose")
         cloud = block["point_cloud"]

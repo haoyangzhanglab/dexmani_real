@@ -1,8 +1,4 @@
-"""Canonical robot-model resources and joint mappings used across the repository.
-
-The resource paths are shared by planning, replay, deployment, and recording so
-all components use the same static models.
-"""
+"""Robot-model resources, physical limits, and joint mappings."""
 
 from __future__ import annotations
 
@@ -15,8 +11,7 @@ HAND_FINGER_NAMES: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky
 HAND_FINGER_ORDER_ID = "thumb_index_mid_ring_pinky"
 XHAND_TACTILE_SENSOR_FINGER_IDS: tuple[int, ...] = (2, 5, 7, 9, 11)
 XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID = {
-    finger_id: index
-    for index, finger_id in enumerate(XHAND_TACTILE_SENSOR_FINGER_IDS)
+    finger_id: index for index, finger_id in enumerate(XHAND_TACTILE_SENSOR_FINGER_IDS)
 }
 XHAND_FINGERTIP_LINK_NAMES: tuple[str, ...] = (
     "right_hand_thumb_rota_tip",
@@ -30,20 +25,16 @@ if (
     or HAND_FINGER_COUNT != 5
     or len(XHAND_TACTILE_SENSOR_FINGER_IDS) != HAND_FINGER_COUNT
     or len(set(XHAND_TACTILE_SENSOR_FINGER_IDS)) != HAND_FINGER_COUNT
-    or set(XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID.values())
-    != set(range(HAND_FINGER_COUNT))
+    or set(XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID.values()) != set(range(HAND_FINGER_COUNT))
     or len(XHAND_FINGERTIP_LINK_NAMES) != HAND_FINGER_COUNT
 ):
     raise RuntimeError("XHand finger and tactile sensor orders must match five fingers")
 TACTILE_POINTS_PER_FINGER = 120
 TACTILE_AXIS_COUNT = 3
 
-# XHand SDK force-representation vocabulary shared by recording, dataset
-# artifacts, and deployment semantics: contact_force is the aggregate calc_force
-# per finger; tactile_force is the dense raw_force payload.  Both stay in the
-# SDK-native numeric scale (SI Newton unverified) and per-finger sensor axes
-# (taxel spatial geometry unverified); validity comes from the explicit tactile flags,
-# never from payload magnitude.
+# XHand contact_force is per-finger aggregate calc_force; tactile_force is dense
+# raw_force. Both use the SDK-native scale (SI Newton unverified) and per-finger
+# sensor axes (taxel geometry unverified). Tactile flags, not magnitude, give validity.
 CONTACT_FORCE_REPRESENTATION = "xhand_sdk_calc_force_fx_fy_fz_bias_corrected"
 TACTILE_FORCE_REPRESENTATION = "xhand_sdk_raw_force_fx_fy_fz_bias_corrected"
 TACTILE_FORCE_SENSOR_ORDER = "xhand_sdk_sensor_data_order"
@@ -63,8 +54,7 @@ HAND_TACTILE_FORCE_SHAPE = (
 )
 HAND_FINGERTIP_SHAPE = (HAND_FINGER_COUNT, 3)
 
-# Canonical order for every cross-process XHand joint vector. Retargeting,
-# planning, recording, and the device boundary all consume this SDK order.
+# XHand SDK joint order, used for all cross-process joint vectors.
 XHAND_SDK_JOINT_NAMES: tuple[str, ...] = (
     "right_hand_thumb_bend_joint",
     "right_hand_thumb_rota_joint1",
@@ -79,10 +69,7 @@ XHAND_SDK_JOINT_NAMES: tuple[str, ...] = (
     "right_hand_pinky_joint1",
     "right_hand_pinky_joint2",
 )
-if (
-    len(XHAND_SDK_JOINT_NAMES) != HAND_DOF
-    or len(set(XHAND_SDK_JOINT_NAMES)) != HAND_DOF
-):
+if len(XHAND_SDK_JOINT_NAMES) != HAND_DOF or len(set(XHAND_SDK_JOINT_NAMES)) != HAND_DOF:
     raise RuntimeError("XHand SDK joint names must be unique and match HAND_DOF")
 
 XHAND_MODEL_DIR = ASSET_DIR / "robots" / "xhand"
@@ -114,5 +101,21 @@ HAND_SDK_TO_URDF_IDX: tuple[int, ...] = tuple(
 )
 
 # Mechanical limits from the xArm7 robot model, radians.
-XARM7_HARD_LOWER = (-6.28318530718, -2.059, -6.28318530718, -0.19198, -6.28318530718, -1.69297, -6.28318530718)
-XARM7_HARD_UPPER = (6.28318530718, 2.0944, 6.28318530718, 3.927, 6.28318530718, 3.14159265359, 6.28318530718)
+XARM7_HARD_LOWER = (
+    -6.28318530718,
+    -2.059,
+    -6.28318530718,
+    -0.19198,
+    -6.28318530718,
+    -1.69297,
+    -6.28318530718,
+)
+XARM7_HARD_UPPER = (
+    6.28318530718,
+    2.0944,
+    6.28318530718,
+    3.927,
+    6.28318530718,
+    3.14159265359,
+    6.28318530718,
+)

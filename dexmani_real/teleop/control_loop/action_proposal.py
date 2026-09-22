@@ -12,6 +12,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.planning.kinematics.pose import quat_multiply
+
+
 @dataclass(frozen=True)
 class EefTargetProposal:
     """One mapped EEF target in the world frame, before and after filtering."""
@@ -99,7 +101,8 @@ def ema_smooth_pose(
         axis = rv / angle
         half = angle / 2.0
         delta_quat = np.array(
-            [np.cos(half), axis[0] * np.sin(half), axis[1] * np.sin(half), axis[2] * np.sin(half)], dtype=np.float64
+            [np.cos(half), axis[0] * np.sin(half), axis[1] * np.sin(half), axis[2] * np.sin(half)],
+            dtype=np.float64,
         )
         quat = _normalize_quat(quat_multiply(prev_quat, delta_quat), name="smoothed")
 
@@ -124,21 +127,15 @@ def compute_target_eef_pose(
     ema_alpha_rotation: float,
 ) -> EefTargetProposal:
     """Smooth and clamp one mapped world-frame EEF target."""
-    raw_position_world_m = _finite_vector(
-        mapped_position_world_m, (3,), "mapped_position_world_m"
-    )
-    raw_quat_world_wxyz = _finite_vector(
-        mapped_quat_world_wxyz, (4,), "mapped_quat_world_wxyz"
-    )
+    raw_position_world_m = _finite_vector(mapped_position_world_m, (3,), "mapped_position_world_m")
+    raw_quat_world_wxyz = _finite_vector(mapped_quat_world_wxyz, (4,), "mapped_quat_world_wxyz")
     workspace = np.asarray(workspace_bounds_world_m, dtype=np.float64)
     if (
         workspace.shape != (3, 2)
         or not np.all(np.isfinite(workspace))
         or np.any(workspace[:, 0] > workspace[:, 1])
     ):
-        raise ValueError(
-            "workspace_bounds_world_m must be finite shape (3, 2) with lower <= upper"
-        )
+        raise ValueError("workspace_bounds_world_m must be finite shape (3, 2) with lower <= upper")
 
     position_world_m = raw_position_world_m.copy()
     quat_world_wxyz = raw_quat_world_wxyz.copy()

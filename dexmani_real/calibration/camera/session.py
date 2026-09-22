@@ -1,50 +1,12 @@
-"""Interactive xArm7/RealSense lifecycle for ArUco eye-to-hand calibration.
+"""Interactive ArUco eye-to-hand calibration with xArm7 and a fixed RealSense camera.
 
-This module owns workers, GUI interaction, sample capture and cleanup.
-``motion.py`` owns Cartesian jogging, motion revocation and planned home.
-
-Computes T_world_camera by detecting ArUco markers on the end-effector from a
-fixed tripod-mounted camera and solving the hand-eye transform across five
-OpenCV algorithms.
-
-Results are written to ``dexmani_real/config/cameras.json``, compatible with
-the ``CameraExtrinsics`` config loader.
-
-Hardware preparation:
-
-  1. Print an ArUco 7x7_50 marker (ID=1), size 98.2 mm × 98.2 mm.
-  2. Attach the marker flat on the end-effector, facing the camera.
-  3. Fix the RealSense camera on a tripod, covering the workspace.
-  4. Ensure conda environment has: pyrealsense2, opencv-python, scipy.
-
-Usage::
-
-    python examples/calibrate_camera.py --hand-geometry <absent|secured-home> \
-        [--serial SERIAL] [--config YAML]
-
-Controls:
-
-  WASD / arrows     translate EEF
-  ← →              roll (about X)
-  I / K            pitch (about Y)
-  J / L            yaw (about Z)
-  SPACE            capture stationary calibration sample (requires ArUco detection)
-  BACKSPACE         undo last sample
-  X                 delete worst-residual frame (after ENTER evaluation)
-  ENTER             compute calibration and write cameras.json (min 10 samples)
-  R                 return home (collision-safe path)
-  Q                 quit (discard data)
-  ESC               emergency stop (FAULT)
-
-XHand is optional, but ``--hand-geometry`` is a required physical-state assertion,
-not a geometry selector: pass ``absent`` only when no XHand is mounted, or
-``secured-home`` only when an installed hand is physically fixed at its configured
-home pose. Cartesian IK endpoint checks and planned return-home checks use the
-fixed-home XHand envelope for both assertions, so the ``absent`` case is conservative.
+Estimates T_world_camera from an end-effector marker using five OpenCV hand-eye
+methods and saves accepted results to ``dexmani_real/config/cameras.json``.
 """
 
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import os
 import time
@@ -58,8 +20,8 @@ from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 from dexmani_real.calibration.camera.motion import (
     CalibrationLoopState,
     HomeKeyOutcome,
-    handle_calibration_home_key,
     finish_calibration_motion,
+    handle_calibration_home_key,
     read_initial_arm,
     run_calibration_motion_tick,
     set_calibration_fault,
@@ -79,9 +41,6 @@ from dexmani_real.calibration.camera.solver import (
     save_camera_calibration,
 )
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.runtime.observation import sample_is_fresh, read_camera_frame
-from dexmani_real.sensor.camera.worker import CameraLoopConfig, camera_loop
-import json
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
     RuntimeChannelsConfig,
@@ -90,10 +49,12 @@ from dexmani_real.ipc.channels import (
 from dexmani_real.planning import OnlineIKConfig, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.robot.arm_worker import arm_loop
-from dexmani_real.runtime.safety import SafetyState, require_transition
-from dexmani_real.runtime.processes import shutdown_processes_verified
-from dexmani_real.runtime.supervisor import wait_subsystem_ready
+from dexmani_real.runtime.observation import read_camera_frame, sample_is_fresh
 from dexmani_real.runtime.operator_input import KeyboardInput
+from dexmani_real.runtime.processes import shutdown_processes_verified
+from dexmani_real.runtime.safety import SafetyState, require_transition
+from dexmani_real.runtime.supervisor import wait_subsystem_ready
+from dexmani_real.sensor.camera.worker import CameraLoopConfig, camera_loop
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
@@ -124,7 +85,11 @@ def _detect_aruco_stable(
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             frame = read_camera_frame(pipeline)
-            if frame and frame["timestamp_ns"] > last_stamp and sample_is_fresh(frame["timestamp_ns"], max_frame_age_s):
+            if (
+                frame
+                and frame["timestamp_ns"] > last_stamp
+                and sample_is_fresh(frame["timestamp_ns"], max_frame_age_s)
+            ):
                 break
             time.sleep(0.01)
         else:
@@ -154,23 +119,17 @@ def _build_planner(
     planner = XArm7MotionPlanner.create_default(
         teleop_profile=OnlineIKConfig(
             max_pose_error_pos_m=float(runtime.keyboard_teleop.ik_max_pose_error_pos_m),
-            max_pose_error_rot_rad=float(
-                runtime.keyboard_teleop.ik_max_pose_error_rot_rad
-            ),
+            max_pose_error_rot_rad=float(runtime.keyboard_teleop.ik_max_pose_error_rot_rad),
         ),
         static_boxes=tuple(runtime.environment.static_boxes),
         table=runtime.environment.table,
     )
     planner.workspace_bounds = workspace.copy()
-    planner.set_hand_qpos(
-        np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
-    )
+    planner.set_hand_qpos(np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)))
     return planner, workspace
 
 
-def _runtime_issue(
-    shared: RuntimeChannels, arm_process: Any, max_age_s: float
-) -> str | None:
+def _runtime_issue(shared: RuntimeChannels, arm_process: Any, max_age_s: float) -> str | None:
     if shared.estop_request.value:
         return "e-stop is requested"
     if shared.error_state.value:
@@ -254,7 +213,7 @@ def _read_stationary_calibration_arm_state(
     shared: RuntimeChannels,
     runtime: ExperimentConfig,
 ) -> tuple[dict[str, Any] | None, str]:
-    """Read fresh arm feedback and apply the existing homing stationary bound."""
+    """Read fresh arm feedback using the homing stationary bound."""
     arm_state = read_arm_state_dict(shared)
     if arm_state is None:
         return None, "arm state unavailable"
@@ -281,7 +240,7 @@ def _calibration_capture_metadata(
     position_errors_mm: np.ndarray,
     rotation_errors_deg: np.ndarray,
 ) -> dict[str, object]:
-    """Build diagnostic-only camera capture provenance with finite JSON values."""
+    """Build finite JSON camera diagnostics for the captured sample."""
     intrinsic_matrix = np.asarray(intrinsics, dtype=np.float64)
     distortion_values = np.asarray(distortion, dtype=np.float64)
     position_errors = np.asarray(position_errors_mm, dtype=np.float64)
@@ -332,18 +291,17 @@ def _solve_and_save_calibration(
     intrinsics: np.ndarray,
     distortion: np.ndarray,
 ) -> np.ndarray | None:
-    """Solve, report, quality-gate, and explicitly persist accepted samples."""
+    """Solve calibration and save results that pass the quality checks."""
     sample_count = len(samples)
     if sample_count < config.min_samples:
         print(
-            f"  need at least {config.min_samples} samples, have {sample_count} "
-            "— keep collecting"
+            f"  need at least {config.min_samples} samples, have {sample_count} — keep collecting"
         )
         return None
     print(f"\n  computing hand-eye calibration ({sample_count} samples, 5 methods)...")
     try:
-        T_base_camera, method, errors_mm, errors_deg, method_table = (
-            calibrate_and_select(*samples.solver_inputs())
+        T_base_camera, method, errors_mm, errors_deg, method_table = calibrate_and_select(
+            *samples.solver_inputs()
         )
     except Exception as exc:
         logger.warning("solve failed", exc_info=True)
@@ -395,8 +353,7 @@ def _solve_and_save_calibration(
         )
     if rotation_std_deg > config.max_consistency_rot_std_deg:
         rejection_reasons.append(
-            f"rot std={rotation_std_deg:.2f}° > "
-            f"{config.max_consistency_rot_std_deg:.1f}°"
+            f"rot std={rotation_std_deg:.2f}° > {config.max_consistency_rot_std_deg:.1f}°"
         )
     if rejection_reasons:
         print(
@@ -424,8 +381,7 @@ def _solve_and_save_calibration(
         print(f"FAILED — {exc}, skipped")
         return None
     print(
-        f"  ACCEPTED ({method}, pos std={position_std_mm:.1f}mm, "
-        f"rot std={rotation_std_deg:.2f}°)"
+        f"  ACCEPTED ({method}, pos std={position_std_mm:.1f}mm, rot std={rotation_std_deg:.2f}°)"
     )
     return T_world_camera
 
@@ -498,9 +454,7 @@ def _handle_calibration_sample_events(
         elif event == "x":
             removed = state.samples.pop_worst()
             if removed is None:
-                print(
-                    "  (press ENTER first to evaluate quality, then X to remove worst)"
-                )
+                print("  (press ENTER first to evaluate quality, then X to remove worst)")
             else:
                 index, residual_mm = removed
                 print(
@@ -530,7 +484,6 @@ def _run_calibration(
     calib_cfg: CalibrationConfig,
     aruco_cfg: ArucoConfig,
 ) -> int:
-    """Own camera, keyboard, and GUI resources for one calibration session."""
     state = read_initial_arm(shared, runtime)
     if state is None:
         set_calibration_fault(shared, "initial arm feedback is unavailable or unhealthy")
@@ -552,7 +505,10 @@ def _run_calibration(
         pipeline = shared
         serial = shared.camera_serial.value.decode()
         geometry = json.loads(shared.camera_geometry.value.decode())["color"]
-        intrinsics = np.array([[geometry["fx"], 0, geometry["ppx"]], [0, geometry["fy"], geometry["ppy"]], [0, 0, 1]], dtype=np.float64)
+        intrinsics = np.array(
+            [[geometry["fx"], 0, geometry["ppx"]], [0, geometry["fy"], geometry["ppy"]], [0, 0, 1]],
+            dtype=np.float64,
+        )
         distortion = np.asarray(geometry["distortion_coeffs"], dtype=np.float64)
         print(f"  Camera serial: {serial}")
         print(
@@ -613,7 +569,6 @@ def _run_calibration_control_loop(
     calib_cfg: CalibrationConfig,
     aruco_cfg: ArucoConfig,
 ) -> int:
-    """Run control logic while borrowing already-started session resources."""
     max_age = runtime.arm.feedback_max_age_s
     state = CalibrationLoopState.from_arm_state(initial_state)
     marker_corners = marker_corners_3d(aruco_cfg.marker_size_m)
@@ -621,17 +576,13 @@ def _run_calibration_control_loop(
         cv2.aruco.getPredefinedDictionary(ARUCO_DICT),
         cv2.aruco.DetectorParameters(),
     )
-    rate = LoopRate(
-        float(runtime.keyboard_teleop.control_hz), label="camera_calibration"
-    )
+    rate = LoopRate(float(runtime.keyboard_teleop.control_hz), label="camera_calibration")
 
     print(
         f"\n  ArUco: {ARUCO_DICT_NAME} ID={aruco_cfg.target_id} "
         f"size={aruco_cfg.marker_size_m * 1000:.1f}mm"
     )
-    print(
-        "  Controls: WASD/arrows move, ←→/I/J/K/L rotate, SPACE capture, ENTER calibrate"
-    )
+    print("  Controls: WASD/arrows move, ←→/I/J/K/L rotate, SPACE capture, ENTER calibrate")
     print(f"  Preview window: {_WINDOW_NAME} (green=detected, red=not found)")
 
     display_image: np.ndarray | None = None
@@ -711,11 +662,12 @@ def run_camera_calibration(
     calibration_config: CalibrationConfig | None = None,
     aruco_config: ArucoConfig | None = None,
 ) -> int:
-    """Own the arm worker, shared state, camera session, and bounded cleanup.
+    """Run interactive camera calibration with bounded cleanup.
 
-    ``hand_geometry`` is an operator physical-state assertion. IK endpoint and
-    return-home checks use the fixed-home XHand envelope for both accepted
-    values; ``absent`` therefore retains conservative hand geometry.
+    ``hand_geometry`` is an operator physical-state assertion: ``absent`` means no
+    XHand is mounted; ``secured-home`` means it is physically fixed at home.
+    IK endpoint and return-home checks use the fixed-home XHand envelope for both
+    values, so ``absent`` retains conservative hand geometry.
     """
     if hand_geometry not in {"absent", "secured-home"}:
         raise ValueError("hand_geometry must be 'absent' or 'secured-home'")
@@ -744,20 +696,24 @@ def run_camera_calibration(
     try:
         processes = [
             ctx.Process(name="arm", target=arm_loop, args=(shared, runtime.arm)),
-            ctx.Process(name="camera", target=camera_loop, args=(shared, CameraLoopConfig.from_runtime(runtime)))
+            ctx.Process(
+                name="camera",
+                target=camera_loop,
+                args=(shared, CameraLoopConfig.from_runtime(runtime)),
+            ),
         ]
         for process in processes:
             process.start()
         arm_process = processes[0]
         for process in processes:
-            if not wait_subsystem_ready(shared, process, runtime.safety.readiness_timeouts_s[process.name]):
+            if not wait_subsystem_ready(
+                shared, process, runtime.safety.readiness_timeouts_s[process.name]
+            ):
                 raise RuntimeError(f"{process.name} startup failed")
 
         initial_state = read_initial_arm(shared, runtime)
         if initial_state is None:
-            set_calibration_fault(
-                shared, "initial arm feedback is unavailable or unhealthy"
-            )
+            set_calibration_fault(shared, "initial arm feedback is unavailable or unhealthy")
             return 1
 
         require_transition(shared, SafetyState.ARMED)

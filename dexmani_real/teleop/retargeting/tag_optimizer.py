@@ -93,7 +93,9 @@ class HandOptimizer:
         self.dof: int = self.pin_grad.dof
         self.finger_num: int = len(self.pin_grad.tip_frame_ids)
         if self.finger_num != 5:
-            raise ValueError(f"TAG optimizer requires exactly five fingertip frames, got {self.finger_num}")
+            raise ValueError(
+                f"TAG optimizer requires exactly five fingertip frames, got {self.finger_num}"
+            )
 
         lower = np.asarray(joint_limits_lower, dtype=np.float64)
         upper = np.asarray(joint_limits_upper, dtype=np.float64)
@@ -118,7 +120,9 @@ class HandOptimizer:
             or not np.isfinite(finger_scale_boost)
             or finger_scale_boost <= 0
         ):
-            raise ValueError("finger lengths and scale boost must be finite, positive five-finger values")
+            raise ValueError(
+                "finger lengths and scale boost must be finite, positive five-finger values"
+            )
         ratio = robot_lengths / human_lengths
         self.finger_scale: np.ndarray = ratio * finger_scale_boost  # (finger_num,)
 
@@ -169,8 +173,9 @@ class HandOptimizer:
         self._stage2_warn = ThrottledWarner(interval_s=5.0, logger=logger)
         self._bounds_warn = ThrottledWarner(interval_s=5.0, logger=logger)
 
-
-    def solve(self, fingertip_positions: np.ndarray, q_prior: np.ndarray | None = None) -> np.ndarray | None:
+    def solve(
+        self, fingertip_positions: np.ndarray, q_prior: np.ndarray | None = None
+    ) -> np.ndarray | None:
         """Solve one frame: fingertip positions → joint angles.
 
         Args:
@@ -205,8 +210,7 @@ class HandOptimizer:
             q_s1 = self.opt_s1.optimize(warm_start)
         except nlopt.RoundoffLimited:
             self._stage1_warn(
-                "HandOptimizer: Stage 1 reached the NLopt roundoff limit — "
-                "no target produced",
+                "HandOptimizer: Stage 1 reached the NLopt roundoff limit — no target produced",
                 exc_info=True,
             )
             return None
@@ -219,7 +223,9 @@ class HandOptimizer:
             0.0,
             1.0,
         )
-        self.pinch_factors = (1.0 - self.pinch_ema_alpha) * self.pinch_factors + self.pinch_ema_alpha * np.concatenate(
+        self.pinch_factors = (
+            1.0 - self.pinch_ema_alpha
+        ) * self.pinch_factors + self.pinch_ema_alpha * np.concatenate(
             [np.zeros(1, dtype=np.float64), target_factors]
         )
 
@@ -232,8 +238,7 @@ class HandOptimizer:
             q_s2 = self.opt_s2.optimize(q_s1)
         except nlopt.RoundoffLimited:
             self._stage2_warn(
-                "HandOptimizer: Stage 2 reached the NLopt roundoff limit — "
-                "falling back to Stage 1",
+                "HandOptimizer: Stage 2 reached the NLopt roundoff limit — falling back to Stage 1",
                 exc_info=True,
             )
             q_s2 = q_s1.copy()
@@ -258,7 +263,9 @@ class HandOptimizer:
         self.pinch_factors = np.zeros(self.finger_num, dtype=np.float64)
         self.qpos_stage1 = None
 
-    def _bounded_qpos(self, qpos: np.ndarray, label: str, *, warn_on_clip: bool = True) -> np.ndarray:
+    def _bounded_qpos(
+        self, qpos: np.ndarray, label: str, *, warn_on_clip: bool = True
+    ) -> np.ndarray:
         """Validate and project one NLopt state into the configured box bounds."""
         qpos_array = np.asarray(qpos, dtype=np.float64)
         if qpos_array.shape != (self.dof,) or not np.all(np.isfinite(qpos_array)):
@@ -267,7 +274,6 @@ class HandOptimizer:
         if warn_on_clip and np.any(np.abs(bounded - qpos_array) > 1e-9):
             self._bounds_warn("HandOptimizer: projected %s into NLopt bounds", label)
         return bounded
-
 
     def _compute_prior_gradient(self, qpos: np.ndarray) -> tuple[np.ndarray, float]:
         """Human-flexion prior gradient/loss (zeros when disabled)."""
@@ -282,8 +288,13 @@ class HandOptimizer:
         self.qpos_floating[7:] = qpos
         # _current_target is set by solve() before any NLopt callback fires;
         # mypy sees np.ndarray|None but runtime is always np.ndarray here.
-        g_pos, loss_pos = self.pin_grad.compute_position_gradient(self.qpos_floating, self._current_target)  # type: ignore[arg-type]
-        g_smooth, loss_smooth = PinGrad.compute_smoothness_gradient(qpos, self.last_qpos, self._smooth_weight)
+        g_pos, loss_pos = self.pin_grad.compute_position_gradient(
+            self.qpos_floating,
+            self._current_target,  # type: ignore[arg-type]
+        )
+        g_smooth, loss_smooth = PinGrad.compute_smoothness_gradient(
+            qpos, self.last_qpos, self._smooth_weight
+        )
         g_prior, loss_prior = self._compute_prior_gradient(qpos)
         if grad.size > 0:
             grad[:] = g_pos + g_smooth + g_prior
@@ -302,7 +313,9 @@ class HandOptimizer:
             (self.reg_last_weight, self.last_qpos, "last"),
         ]:
             if ref is None:
-                logger.warning("HandOptimizer: _obj_s2 called without %s reference — skipping anchor", label)
+                logger.warning(
+                    "HandOptimizer: _obj_s2 called without %s reference — skipping anchor", label
+                )
                 continue
             g, l = PinGrad.compute_smoothness_gradient(qpos, ref, weight)
             total_loss += l
@@ -314,7 +327,10 @@ class HandOptimizer:
 
         thumb_fid = self.pin_grad.tip_frame_ids[0]
         J_thumb_v = pin.getFrameJacobian(
-            self.pin_grad.model, self.pin_grad.data, thumb_fid, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+            self.pin_grad.model,
+            self.pin_grad.data,
+            thumb_fid,
+            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
         )[:3, 6:]
         p_thumb = self.pin_grad.data.oMf[thumb_fid].translation
 

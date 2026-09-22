@@ -182,7 +182,9 @@ class CollisionModel:
             from hppfcl.hppfcl import Box
 
             for box in normalized_boxes:
-                placement = pin.SE3(self._quat_wxyz_to_matrix(box["quat_wxyz"]), box["center_xyz_m"])
+                placement = pin.SE3(
+                    self._quat_wxyz_to_matrix(box["quat_wxyz"]), box["center_xyz_m"]
+                )
                 geometry = pin.GeometryObject(
                     f"environment::{box['name']}",
                     0,
@@ -193,7 +195,9 @@ class CollisionModel:
                 obstacle_id = int(self._environment_collision_model.addGeometryObject(geometry))
                 self._environment_names[obstacle_id] = str(box["name"])
                 for robot_id in range(self._robot_environment_geom_count):
-                    self._environment_collision_model.addCollisionPair(pin.CollisionPair(robot_id, obstacle_id))
+                    self._environment_collision_model.addCollisionPair(
+                        pin.CollisionPair(robot_id, obstacle_id)
+                    )
             if self._table is not None:
                 table_config = self._table
                 normal = table_config["normal"]
@@ -216,8 +220,12 @@ class CollisionModel:
                     link_name = self._get_environment_geom_link_name(robot_id)
                     if link_name in allowed:
                         continue
-                    self._environment_collision_model.addCollisionPair(pin.CollisionPair(robot_id, table_id))
-                    table_pair_indices.append(len(self._environment_collision_model.collisionPairs) - 1)
+                    self._environment_collision_model.addCollisionPair(
+                        pin.CollisionPair(robot_id, table_id)
+                    )
+                    table_pair_indices.append(
+                        len(self._environment_collision_model.collisionPairs) - 1
+                    )
                 self._table_pair_indices = tuple(table_pair_indices)
         self._environment_collision_data = self._environment_collision_model.createData()
         self._static_boxes = normalized_boxes
@@ -259,7 +267,9 @@ class CollisionModel:
         size = np.asarray(cls._box_value(box, "size_xyz_m"), dtype=np.float64)
         quat = np.asarray(cls._box_value(box, "quat_wxyz"), dtype=np.float64)
         if not name.strip() or name != name.strip() or name == "table":
-            raise ValueError("static collision box name must be non-empty and must not use reserved name 'table'")
+            raise ValueError(
+                "static collision box name must be non-empty and must not use reserved name 'table'"
+            )
         if center.shape != (3,) or size.shape != (3,) or quat.shape != (4,):
             raise ValueError("static collision box center/size/quaternion shapes are invalid")
         if not np.all(np.isfinite(np.concatenate((center, size, quat)))) or np.any(size <= 0.0):
@@ -354,7 +364,9 @@ class CollisionModel:
         """
         hand_qpos = np.asarray(hand_qpos, dtype=np.float64)
         if hand_qpos.shape != (_HAND_DOF_COUNT,):
-            raise ValueError(f"Expected hand_qpos shape ({_HAND_DOF_COUNT},), got {hand_qpos.shape}")
+            raise ValueError(
+                f"Expected hand_qpos shape ({_HAND_DOF_COUNT},), got {hand_qpos.shape}"
+            )
         if not np.all(np.isfinite(hand_qpos)):
             raise ValueError("hand_qpos contains NaN or Inf — FK would silently fail")
         # Reorder user→URDF: _hand_user_to_urdf[i] = which user index maps to URDF slot i
@@ -389,7 +401,12 @@ class CollisionModel:
         qpos = self._to_full_qpos(qpos)
         return bool(
             self._pin.computeCollisions(
-                self._model, self._data, self._collision_model, self._collision_data, qpos, stop_at_first
+                self._model,
+                self._data,
+                self._collision_model,
+                self._collision_data,
+                qpos,
+                stop_at_first,
             )
         )
 
@@ -459,7 +476,9 @@ class CollisionModel:
         if not pairs:
             # Pair enumeration is diagnostic-only; never turn a real collision into a pass.
             return CollisionInfo(in_collision=True, collision_pairs=(), num_contacts=1)
-        return CollisionInfo(in_collision=True, collision_pairs=tuple(pairs), num_contacts=len(pairs))
+        return CollisionInfo(
+            in_collision=True, collision_pairs=tuple(pairs), num_contacts=len(pairs)
+        )
 
     @property
     def has_static_environment(self) -> bool:

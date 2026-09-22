@@ -14,9 +14,8 @@ logger = get_logger(__name__)
 class LoopRate:
     """Rate limiter that preserves an absolute schedule without catch-up bursts.
 
-    ``busy_wait`` is deliberately owner-selected: actuator-facing loops may
-    need the final precision window, while non-actuating service loops should
-    sleep so they do not compete for CPU time merely to preserve poll phase.
+    Actuator loops may need the final busy-wait precision window. Service loops
+    can disable it to avoid competing for CPU time.
     """
 
     def __init__(
@@ -46,9 +45,7 @@ class LoopRate:
         self.period = 1.0 / target_hz
         self._clock = time.perf_counter if clock is None else clock
         self._sleep = time.sleep if sleep is None else sleep
-        # Preserve the existing deterministic-test behavior: injected clocks
-        # default to sleep-only, while production control loops spin for the
-        # final precision window unless their owner explicitly opts out.
+        # Injected clocks default to sleep-only; the real clock defaults to a final spin.
         self._busy_wait = clock is None if busy_wait is None else bool(busy_wait)
         self._warn_on_overrun = warn_on_overrun
         started = self._clock()
@@ -66,7 +63,7 @@ class LoopRate:
         Hybrid strategy:
           1. Compute remaining time to the deadline
           2. If > 2ms: time.sleep(remaining - 1ms)
-          3. Spin or sleep for the final window, as selected by the loop owner
+          3. Spin or sleep for the final window according to busy_wait
 
         Optional caller-measured phases are appended only to an emitted overrun
         warning. They measure host elapsed time, including descheduling within
@@ -89,15 +86,12 @@ class LoopRate:
             self._next_deadline += self.period
         else:
             lateness = -remaining
-            self._missed_slot_count += int(
-                (lateness + self.period * 1e-12) // self.period
-            )
+            self._missed_slot_count += int((lateness + self.period * 1e-12) // self.period)
 
             if lateness > 1.0:
                 self._next_deadline = now + self.period
                 self._overdue_throttle = 0
             else:
-                # Short overrun: emit a throttled warning.
                 if self._warn_on_overrun and self._overdue_throttle <= 0:
                     logger.warning(
                         "Loop deadline missed: loop=%s period_ms=%.1f "
@@ -106,10 +100,10 @@ class LoopRate:
                         self.period * 1000,
                         lateness * 1000,
                         self._missed_slot_count,
-                        "" if phase_ms is None else " " + " ".join(
-                            f"{name}={value:.3f}ms"
-                            for name, value in phase_ms.items()
-                        ),
+                        ""
+                        if phase_ms is None
+                        else " "
+                        + " ".join(f"{name}={value:.3f}ms" for name, value in phase_ms.items()),
                     )
                     self._overdue_throttle = 50
                 elif self._warn_on_overrun:

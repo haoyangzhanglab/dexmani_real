@@ -129,6 +129,16 @@ Do not silently reinterpret an existing persisted field. For a real schema seman
 
 Use dexmani_policy public interfaces.
 
+## Code style
+
+Keep research code direct and readable. Do not compress independent operations to reduce LOC.
+Comment non-obvious robotics, math, frames, units, SDK behavior, experimental rationale,
+attribution, and real safety reasons. Avoid architecture, ownership, contract, validation,
+and control-flow narration when the code already expresses it. Describe current behavior
+rather than implementation history. Private helpers normally do not need docstrings.
+Use Ruff formatting and import sorting when available; do not add abstractions solely
+for style tooling.
+
 ## Checks and handoff
 
 The repository intentionally has no committed tests directory; do not restore it.
@@ -138,7 +148,8 @@ Start with focused one-off offline smoke checks for changed pure logic.
 Useful low-cost checks:
 
     python -m compileall -q dexmani_real examples
-    ruff check --select F401,F821,F822,F823 dexmani_real examples
+    ruff format --check dexmani_real examples
+    ruff check --select F401,F821,F822,F823,I dexmani_real examples
     git diff --check
 
 Protect transforms, FK/IK, retargeting, dataset conversion, simple target clipping, observation history, and real regressions with focused offline checks.

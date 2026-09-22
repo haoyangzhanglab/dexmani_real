@@ -26,8 +26,8 @@ from __future__ import annotations
 import argparse
 import getpass
 import math
-import sys
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -111,11 +111,7 @@ def _safe_selector_parts(selector: Any) -> tuple[str, str, str]:
         raise ValueError("Policy selector must be a string")
     parts = tuple(selector.split("/"))
     if len(parts) != 3 or any(
-        not part
-        or part in {".", ".."}
-        or "/" in part
-        or "\\" in part
-        or Path(part).name != part
+        not part or part in {".", ".."} or "/" in part or "\\" in part or Path(part).name != part
         for part in parts
     ):
         raise ValueError("experiment must be a canonical policy/task/experiment selector")
@@ -163,6 +159,7 @@ def _write_run_config(
     from dexmani_real.config.experiment import config_as_dict
 
     root = Path(__file__).resolve().parents[1]
+
     def git_fact(*args: str) -> str | None:
         try:
             return subprocess.check_output(
@@ -324,13 +321,17 @@ def main(argv: list[str] | None = None) -> int:
         result = 1
 
     from dexmani_real.utils.atomic_io import atomic_json_dump
+
     try:
-        atomic_json_dump({
-            "technical_status": "valid" if result == 0 else "invalid",
-            "termination_reason": "session_finished" if result == 0 else "workflow_failed",
-            "task_success": "unknown",
-            "exit_code": result,
-        }, session_dir / "session_result.json")
+        atomic_json_dump(
+            {
+                "technical_status": "valid" if result == 0 else "invalid",
+                "termination_reason": "session_finished" if result == 0 else "workflow_failed",
+                "task_success": "unknown",
+                "exit_code": result,
+            },
+            session_dir / "session_result.json",
+        )
     except OSError as exc:
         _print_lifecycle_error(f"could not persist session result: {exc}")
         return 1

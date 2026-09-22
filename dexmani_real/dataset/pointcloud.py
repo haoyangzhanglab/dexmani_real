@@ -1,8 +1,6 @@
-"""Current raw-episode camera metadata to canonical xArm-base point-cloud inputs.
+"""Reconstruct xArm-base point clouds from raw RGB-D and camera metadata.
 
-This module owns the persisted-data boundary shared by offline processing and
-raw episode visualization. It performs no hardware IO and does not own or
-close the borrowed :class:`EpisodeReader`.
+The caller closes the supplied ``EpisodeReader``.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ from dexmani_real.sensor.pointcloud import build_point_cloud
 
 @dataclass(frozen=True)
 class RawEpisodeCameraModel:
-    """Validated aligned RGB-D geometry and depth scale from one raw episode."""
+    """Aligned RGB-D geometry and depth scale from one raw episode."""
 
     geometry: RGBDGeometry
     depth_scale_m: float
@@ -66,9 +64,9 @@ def load_raw_episode_camera_model(reader: EpisodeReader) -> RawEpisodeCameraMode
     native_geometry = RGBDGeometry(
         depth=_intrinsics_from_meta(meta, stream="depth"),
         color=_intrinsics_from_meta(meta, stream="color"),
-        T_color_from_depth=np.asarray(
-            meta["camera_T_color_from_depth"], dtype=np.float64
-        ).reshape(4, 4),
+        T_color_from_depth=np.asarray(meta["camera_T_color_from_depth"], dtype=np.float64).reshape(
+            4, 4
+        ),
     )
     depth_scale_m = float(meta["depth_scale"])
     if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
@@ -102,7 +100,7 @@ def load_raw_episode_base_from_color(reader: EpisodeReader) -> np.ndarray:
 
 @dataclass(frozen=True)
 class RawEpisodePointCloudDeriver:
-    """Derive canonical point clouds while the caller owns the episode reader."""
+    """Reconstruct point clouds from an open raw episode reader."""
 
     reader: EpisodeReader
     camera: RawEpisodeCameraModel

@@ -61,12 +61,8 @@ def _pose_to_matrix(position: list[float], orientation: list[float]) -> np.ndarr
     position_value = np.asarray(position, dtype=np.float64)
     orientation_value = np.asarray(orientation, dtype=np.float64)
     if position_value.shape != (3,) or orientation_value.shape != (4,):
-        raise ValueError(
-            "camera pose position/orientation must have shapes (3,) and (4,)"
-        )
-    if not np.all(np.isfinite(position_value)) or not np.all(
-        np.isfinite(orientation_value)
-    ):
+        raise ValueError("camera pose position/orientation must have shapes (3,) and (4,)")
+    if not np.all(np.isfinite(position_value)) or not np.all(np.isfinite(orientation_value)):
         raise ValueError("camera pose must contain only finite values")
     norm = float(np.linalg.norm(orientation_value))
     if norm <= 1e-12:
@@ -107,9 +103,7 @@ class CameraExtrinsicsEntry:
                 value.shape != (4, 4)
                 or not np.all(np.isfinite(value))
                 or not np.allclose(value[3], (0.0, 0.0, 0.0, 1.0), atol=1e-9)
-                or not np.allclose(
-                    value[:3, :3].T @ value[:3, :3], np.eye(3), atol=1e-6
-                )
+                or not np.allclose(value[:3, :3].T @ value[:3, :3], np.eye(3), atol=1e-6)
                 or not np.isclose(np.linalg.det(value[:3, :3]), 1.0, atol=1e-6)
             ):
                 raise ValueError(f"{name} must be a finite rigid homogeneous transform")
@@ -126,7 +120,6 @@ class CameraExtrinsicsEntry:
 
 
 class CameraExtrinsics:
-
     def __init__(self, calib_path: str | None = None):
         if calib_path is None:
             calib_path = self._resolve_default_path()
@@ -154,9 +147,7 @@ class CameraExtrinsics:
 
         for cam_name, cam in raw.items():
             if not isinstance(cam, dict):
-                raise TypeError(
-                    f"camera calibration entry {cam_name!r} must be an object"
-                )
+                raise TypeError(f"camera calibration entry {cam_name!r} must be an object")
             pose = cam.get("pose")
             if not isinstance(pose, dict):
                 raise ValueError(
@@ -173,9 +164,7 @@ class CameraExtrinsics:
                 T_world_camera=T_world_camera,
                 T_eef_camera=T_eef_camera,
             )
-            if any(
-                existing.serial == entry.serial for existing in self._entries.values()
-            ):
+            if any(existing.serial == entry.serial for existing in self._entries.values()):
                 raise ValueError(
                     f"camera calibration serial {entry.serial!r} appears more than once"
                 )
@@ -217,9 +206,7 @@ class CameraExtrinsics:
                 f"Fix cameras.json or select by serial (resolve_name_by_serial)."
             )
 
-    def get_extrinsics(
-        self, cam_name: str, T_base_eef: np.ndarray | None = None
-    ) -> np.ndarray:
+    def get_extrinsics(self, cam_name: str, T_base_eef: np.ndarray | None = None) -> np.ndarray:
         """Return the camera extrinsic (4,4).
 
         For eye_to_hand: returns the static T_world_camera from config (WORLD frame,
@@ -264,7 +251,5 @@ class CameraExtrinsics:
         return meta
 
     def __repr__(self) -> str:
-        cameras = ", ".join(
-            f"{n} ({e.type}, {e.serial})" for n, e in self._entries.items()
-        )
+        cameras = ", ".join(f"{n} ({e.type}, {e.serial})" for n, e in self._entries.items())
         return f"CameraExtrinsics({cameras})"

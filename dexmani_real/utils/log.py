@@ -43,13 +43,9 @@ def _get_file_handler() -> logging.FileHandler | None:
         return _file_handler
     _file_handler_init = True
     try:
-        log_dir = Path(
-            os.environ.get("DEXMANI_LOG_DIR", str(Path.home() / ".dexmani" / "logs"))
-        )
+        log_dir = Path(os.environ.get("DEXMANI_LOG_DIR", str(Path.home() / ".dexmani" / "logs")))
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / (
-            f"dexmani_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.log"
-        )
+        log_path = log_dir / (f"dexmani_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.log")
         handler = logging.FileHandler(str(log_path), encoding="utf-8")
         handler.setFormatter(_FORMATTER)
         handler.setLevel(logging.DEBUG)
@@ -139,9 +135,7 @@ def capture_native_stdout() -> Iterator[CapturedProcessOutput]:
         sink.close()
 
 
-def extract_native_diagnostics(
-    text: str, *, ignore: tuple[str, ...] = ()
-) -> tuple[str, ...]:
+def extract_native_diagnostics(text: str, *, ignore: tuple[str, ...] = ()) -> tuple[str, ...]:
     """Return suspicious vendor-output lines while dropping known chatter."""
     markers = (
         "error",
@@ -169,9 +163,7 @@ class ThrottledWarner:
     (torn reads, stale state, producer mismatch).  Default interval: 5.0 s.
     """
 
-    def __init__(
-        self, interval_s: float = 5.0, logger: logging.Logger | None = None
-    ) -> None:
+    def __init__(self, interval_s: float = 5.0, logger: logging.Logger | None = None) -> None:
         self._interval_ns = int(interval_s * 1e9)
         self._last_ns = 0
         self._logger = logger or _logger

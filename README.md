@@ -12,6 +12,8 @@
 
     python -m pip install -e .
 
+在运行 examples 前，先在所用 Python 环境中完成上述 editable install。examples 直接导入已安装的 `dexmani_real` 包，不自行修改 `sys.path`。下文命令从仓库根目录执行。
+
 xArm、XHand、RealSense、HTS SDK，以及运动学/点云和 dexmani_policy 依赖，按实验机环境安装。
 
 普通 import 和普通配置解析不应连接设备。真实 SDK 连接由对应 owning worker 显式建立：
@@ -259,13 +261,25 @@ Policy process拥有 model / CUDA，保持同步 inference 与 local action chun
 
 输出属于 evaluation telemetry。默认不能因为格式类似就当作 teleop BC source进入 canonical training Zarr。
 
-## 离线检查
+## 代码风格与离线检查
+
+Python 排版和 imports 使用 `pyproject.toml` 中的 Ruff 配置：100 列、Python 3.10 语法目标。代码保持直接、易读，不为减少 LOC 压缩独立操作；注释保留数学、坐标系、单位、SDK 行为、实验 rationale 和实际安全原因，避免重复代码或叙述实现历史。
+
+环境中已有 Ruff 时，先排序 imports，再格式化：
+
+    ruff check --select I --fix dexmani_real examples
+    ruff format dexmani_real examples
+
+离线验收：
 
     python -m compileall -q dexmani_real examples
-    ruff check --select F401,F821,F822,F823 dexmani_real examples
+    ruff format --check dexmani_real examples
+    ruff check --select F401,F821,F822,F823,I dexmani_real examples
     git diff --check
 
-仓库不维护 committed tests 目录。纯逻辑改动使用一次性 offline smoke checks。不要为检查修改实验环境，不运行真实硬件入口。
+Ruff 命令不可用时，可尝试已有的 `python -m ruff`；若仍不可用，报告未完成的 Ruff 检查，不为检查安装或升级实验环境依赖。
+
+仓库不维护 committed tests 目录。纯逻辑改动使用一次性 offline smoke checks，不运行真实硬件入口。
 
 ## 真机 commissioning
 

@@ -10,10 +10,8 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.recording.frame import EpisodeFrame
-from dexmani_real.recording.storage.schema import FRAME_OK, FRAME_IK_FAIL
-from dexmani_real.runtime.safety import (
-    RunEndReason, SafetyState, revoke_motion,
-)
+from dexmani_real.recording.storage.schema import FRAME_IK_FAIL, FRAME_OK
+from dexmani_real.runtime.safety import RunEndReason, SafetyState, revoke_motion
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -38,7 +36,9 @@ class StopRecording:
     retain_partial: bool = False
     technical_status: str = "valid"
     had_pause: bool = False
-    deadline_monotonic_ns: int = field(default_factory=lambda: time.monotonic_ns() + int(RECORDER_STOP_TIMEOUT_S * 1e9))
+    deadline_monotonic_ns: int = field(
+        default_factory=lambda: time.monotonic_ns() + int(RECORDER_STOP_TIMEOUT_S * 1e9)
+    )
 
 
 @dataclass
@@ -96,8 +96,11 @@ class RecorderClient:
     def _fail_recording(self, error: str) -> None:
         """Stop motion when the required recording resource fails."""
         with self.shared.motion_lock:
-            if (int(self.shared.safety_state.value) == int(SafetyState.RUNNING)
-                    and not self.shared.error_state.value and not self.shared.estop_request.value):
+            if (
+                int(self.shared.safety_state.value) == int(SafetyState.RUNNING)
+                and not self.shared.error_state.value
+                and not self.shared.estop_request.value
+            ):
                 revoke_motion(self.shared, SafetyState.ARMED, reason=RunEndReason.RECORDING_FAILURE)
             self.technical_status = "invalid"
             self.shared.workflow_failed.value = True
@@ -184,9 +187,7 @@ class RecorderClient:
             self._fail_transport("unexpected start result")
             return False
         # Supervisor owns failed-worker shutdown, not a cancellation protocol.
-        self._fail_transport(
-            "recorder start acknowledgement timed out or runtime stopped"
-        )
+        self._fail_transport("recorder start acknowledgement timed out or runtime stopped")
         return False
 
     def add_frame(self, sample: EpisodeFrame) -> bool:
@@ -215,12 +216,19 @@ class RecorderClient:
             frame["camera_depth"][0] = sample.camera_depth
             self.shared.record_sample_ring.write(frame)
             self._frame_count += 1
-            if not self._stop_requested and self._max_frames and self._frame_count >= self._max_frames:
+            if (
+                not self._stop_requested
+                and self._max_frames
+                and self._frame_count >= self._max_frames
+            ):
                 status = sample.data["flag_frame_status"]
                 if status != FRAME_OK:
                     self.technical_status = "invalid"
-                    self.stop_episode(save=True, reason="ik_failure" if status == FRAME_IK_FAIL else "retarget_failure",
-                                      retain_partial=True)
+                    self.stop_episode(
+                        save=True,
+                        reason="ik_failure" if status == FRAME_IK_FAIL else "retarget_failure",
+                        retain_partial=True,
+                    )
                 else:
                     self.stop_episode(save=True, reason=self._max_frames_stop_reason)
             if self.shared.workflow_failed.value:
@@ -246,7 +254,14 @@ class RecorderClient:
         self._stop_requested = True
         self._stop_reason = reason or "manual"
         through = int(self.shared.record_sample_ring.latest_sequence)
-        stop = StopRecording(save, self._stop_reason, through, retain_partial, self.technical_status, self.had_pause)
+        stop = StopRecording(
+            save,
+            self._stop_reason,
+            through,
+            retain_partial,
+            self.technical_status,
+            self.had_pause,
+        )
         self._finish_deadline_ns = stop.deadline_monotonic_ns
         self._send_control(stop)
         return None
@@ -262,13 +277,19 @@ class RecorderClient:
 
     def poll_stop(self) -> RecordingResult:
         deadline = self._finish_deadline_ns or int(self.shared.recorder_finish_deadline_ns.value)
-        if (not self.shared.recorder_ready.is_set()
-                or (deadline > 0 and time.monotonic_ns() >= deadline
-                    and not 0 < self.shared.recorder_completed_ns.value < deadline)):
+        if not self.shared.recorder_ready.is_set() or (
+            deadline > 0
+            and time.monotonic_ns() >= deadline
+            and not 0 < self.shared.recorder_completed_ns.value < deadline
+        ):
             if not self._unavailable:
-                self._fail_transport("recorder transport unavailable or finalization deadline expired")
+                self._fail_transport(
+                    "recorder transport unavailable or finalization deadline expired"
+                )
             # A dead/terminated process may have corrupted a Queue lock. Never read it again.
-            return self._last_stop_result or RecordingResult(done=False, error="recorder unavailable")
+            return self._last_stop_result or RecordingResult(
+                done=False, error="recorder unavailable"
+            )
         try:
             event = self.shared.record_result_q.get_nowait()
         except Empty:
@@ -292,8 +313,11 @@ class RecorderClient:
 
     def join_stop(self, timeout: float | None = None) -> RecordingResult:
         if not self._stop_requested and not (
-            self._recording and (self.shared.recorder_finish_deadline_ns.value
-                                 or self.shared.recorder_completed_ns.value)
+            self._recording
+            and (
+                self.shared.recorder_finish_deadline_ns.value
+                or self.shared.recorder_completed_ns.value
+            )
         ):
             if self._last_stop_result is None:
                 return RecordingResult(done=True)
@@ -307,9 +331,12 @@ class RecorderClient:
         timeout_s = RECORDER_STOP_TIMEOUT_S if timeout is None else float(timeout)
         if not np.isfinite(timeout_s) or timeout_s < 0:
             raise ValueError("recorder stop timeout must be finite and non-negative")
-        deadline_ns = min(time.monotonic_ns() + int(timeout_s * 1e9),
-                          self._finish_deadline_ns or int(self.shared.recorder_finish_deadline_ns.value)
-                          or time.monotonic_ns() + int(RECORDER_STOP_TIMEOUT_S * 1e9))
+        deadline_ns = min(
+            time.monotonic_ns() + int(timeout_s * 1e9),
+            self._finish_deadline_ns
+            or int(self.shared.recorder_finish_deadline_ns.value)
+            or time.monotonic_ns() + int(RECORDER_STOP_TIMEOUT_S * 1e9),
+        )
         # Poll once even when the caller arrives after the finish deadline.
         # Completion permits bounded delivery time, never extra finalization time.
         delivery_deadline_ns = time.monotonic_ns() + int(timeout_s * 1e9)
@@ -317,8 +344,9 @@ class RecorderClient:
             result = self.poll_stop()
             if result.done or result.error:
                 return result
-            wait_deadline = (delivery_deadline_ns if self.shared.recorder_completed_ns.value
-                             else deadline_ns)
+            wait_deadline = (
+                delivery_deadline_ns if self.shared.recorder_completed_ns.value else deadline_ns
+            )
             if time.monotonic_ns() >= wait_deadline:
                 break
             time.sleep(_STOP_POLL_INTERVAL_S)
@@ -329,14 +357,18 @@ class RecorderClient:
 def write_recording_failure(shared, reason):
     """A small diagnostic sidecar also prevents a late close from claiming completeness."""
     from pathlib import Path
+
     from dexmani_real.utils.atomic_io import atomic_json_dump
+
     raw_path = shared.record_episode_path.value
     if not raw_path:
         return
     try:
         path = Path(raw_path.decode())
-        atomic_json_dump(dict(technical_status="invalid", termination_reason=reason,
-                              task_success="unknown"), path.with_name(path.name + ".result.json"))
+        atomic_json_dump(
+            dict(technical_status="invalid", termination_reason=reason, task_success="unknown"),
+            path.with_name(path.name + ".result.json"),
+        )
     except Exception:
         shared.workflow_failed.value = True
         logger.exception("could not persist recording failure")

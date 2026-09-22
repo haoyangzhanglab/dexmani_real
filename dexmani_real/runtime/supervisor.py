@@ -1,5 +1,7 @@
 """Process readiness and liveness; observation freshness belongs to control steps."""
+
 import time
+
 from dexmani_real.runtime.safety import SafetyState, revoke_motion
 from dexmani_real.utils.log import get_logger
 
@@ -10,7 +12,12 @@ def wait_subsystem_ready(shared, process, timeout_s):
     event = getattr(shared, f"{process.name}_ready")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if not process.is_alive() or shared.error_state.value or shared.estop_request.value or not shared.is_running.value:
+        if (
+            not process.is_alive()
+            or shared.error_state.value
+            or shared.estop_request.value
+            or not shared.is_running.value
+        ):
             return False
         if event.wait(timeout=0.05):
             return True

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -26,29 +25,23 @@ from pathlib import Path
 # Set a quiet Rerun logging default unless the operator already configured one.
 os.environ.setdefault("RUST_LOG", "error")
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
 import h5py
 import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
-from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.dataset.contracts import ProcessingConfig
-from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
-from dexmani_real.planning.kinematics.fingertip import (
-    compute_fingertip_history_xarm_base,
-)
-from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.dataset.pointcloud import (
     RawEpisodePointCloudDeriver,
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
 )
 from dexmani_real.ipc.schema import validate_point_cloud_array
+from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
+from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
+from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording import EpisodeReader, MergedH5File
 from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE
 from dexmani_real.utils.log import get_logger
@@ -93,11 +86,7 @@ def _eef_position_or_none(eef_row: np.ndarray) -> np.ndarray | None:
 def _fingertip_positions_or_none(fingertip_row: np.ndarray) -> np.ndarray | None:
     """Return finite derived fingertips, or clear an invalid row."""
     row = np.asarray(fingertip_row, dtype=np.float32)
-    if (
-        row.ndim != 2
-        or row.shape != HAND_FINGERTIP_SHAPE
-        or not np.all(np.isfinite(row))
-    ):
+    if row.ndim != 2 or row.shape != HAND_FINGERTIP_SHAPE or not np.all(np.isfinite(row)):
         return None
     return row
 
@@ -191,9 +180,7 @@ class EpisodeVisualizer:
         self._reader = EpisodeReader(h5_path)
         try:
             if not self._reader.min_frames_met:
-                logger.warning(
-                    "Episode is below the configured minimum recording duration"
-                )
+                logger.warning("Episode is below the configured minimum recording duration")
             self._h5f = self._reader.h5f
 
             # Preload the RGB-D sidecars once for Rerun.
@@ -221,9 +208,7 @@ class EpisodeVisualizer:
             self._pc_enabled = point_cloud
             camera_type = str(meta.attrs.get("camera_type", ""))
             if camera_type == "eye_to_hand" or self._pc_enabled:
-                self._T_xarm_base_from_color = load_raw_episode_base_from_color(
-                    self._reader
-                )
+                self._T_xarm_base_from_color = load_raw_episode_base_from_color(self._reader)
 
             self._pointcloud_deriver: RawEpisodePointCloudDeriver | None = None
             self._empty_pointcloud_frames = 0
@@ -231,9 +216,7 @@ class EpisodeVisualizer:
             self._pointcloud_processed_frames = 0
             if self._pc_enabled:
                 if pointcloud_config is None:
-                    raise ValueError(
-                        "point-cloud visualization requires resolved config"
-                    )
+                    raise ValueError("point-cloud visualization requires resolved config")
                 assert self._T_xarm_base_from_color is not None
                 self._pointcloud_deriver = RawEpisodePointCloudDeriver(
                     reader=self._reader,
@@ -277,9 +260,7 @@ class EpisodeVisualizer:
             raise ValueError("episode /meta num_frames must be positive")
         camera_counts = [self._rgb_cache.shape[0], self._depth_cache.shape[0]]
         if any(count != raw for count in camera_counts):
-            raise ValueError(
-                f"camera frame counts {camera_counts} do not match grid length {raw}"
-            )
+            raise ValueError(f"camera frame counts {camera_counts} do not match grid length {raw}")
         if max_frames is not None:
             return min(raw, max_frames)
         return raw
@@ -305,13 +286,9 @@ class EpisodeVisualizer:
         state["arm_ee"] = np.full((self._T, 9), np.nan)
         state["hand_fingertip"] = np.full((self._T, 5, 3), np.nan, dtype=np.float32)
         if np.any(arm_valid):
-            state["arm_ee"][arm_valid] = compute_eef_pose_history_xarm_base(
-                arm[arm_valid]
-            )
+            state["arm_ee"][arm_valid] = compute_eef_pose_history_xarm_base(arm[arm_valid])
         if np.any(hand_valid):
-            hand_fk = HandKinematics(
-                geometry.hand_urdf_path, list(geometry.fingertip_link_names)
-            )
+            hand_fk = HandKinematics(geometry.hand_urdf_path, list(geometry.fingertip_link_names))
             state["hand_fingertip"][hand_valid] = compute_fingertip_history_xarm_base(
                 arm[hand_valid],
                 hand[hand_valid],
@@ -345,11 +322,7 @@ class EpisodeVisualizer:
         if cam_views:
             columns.append(rrb.Vertical(contents=cam_views, name="Camera"))
 
-        if (
-            self._pc_enabled
-            or "hand_fingertip" in self._state
-            or "arm_ee" in self._state
-        ):
+        if self._pc_enabled or "hand_fingertip" in self._state or "arm_ee" in self._state:
             columns.append(
                 rrb.Spatial3DView(
                     origin="/",
@@ -364,14 +337,10 @@ class EpisodeVisualizer:
             state_views = []
             for key in self._available.get("arm", []) + self._available.get("hand", []):
                 if key in self._state and 1 <= self._state[key].ndim <= 2:
-                    state_views.append(
-                        rrb.TimeSeriesView(origin=f"state/{key}", name=key)
-                    )
+                    state_views.append(rrb.TimeSeriesView(origin=f"state/{key}", name=key))
             for fkey in ("hand_contact_mag", "hand_force_thumb", "hand_force_index"):
                 if fkey in self._state:
-                    state_views.append(
-                        rrb.TimeSeriesView(origin=f"state/{fkey}", name=fkey)
-                    )
+                    state_views.append(rrb.TimeSeriesView(origin=f"state/{fkey}", name=fkey))
             if state_views:
                 ts_verticals.append(rrb.Vertical(contents=state_views, name="State"))
 
@@ -379,9 +348,7 @@ class EpisodeVisualizer:
             action_views = []
             for key in self._available.get("action", []):
                 if key in self._state and 1 <= self._state[key].ndim <= 2:
-                    action_views.append(
-                        rrb.TimeSeriesView(origin=f"action/{key}", name=key)
-                    )
+                    action_views.append(rrb.TimeSeriesView(origin=f"action/{key}", name=key))
             if action_views:
                 ts_verticals.append(rrb.Vertical(contents=action_views, name="Action"))
 
@@ -396,9 +363,7 @@ class EpisodeVisualizer:
             if len(ts_verticals) == 1:
                 columns.append(ts_verticals[0])
             else:
-                columns.append(
-                    rrb.Tabs(contents=ts_verticals, active_tab=0, name="Time Series")
-                )
+                columns.append(rrb.Tabs(contents=ts_verticals, active_tab=0, name="Time Series"))
 
         return rrb.Blueprint(rrb.Horizontal(contents=columns))
 
@@ -663,9 +628,7 @@ def main(argv: list[str] | None = None) -> int:
     if runtime is not None:
         pointcloud_config = runtime.pointcloud
         if args.pointcloud_num_points is not None:
-            pointcloud_config = replace(
-                pointcloud_config, num_points=args.pointcloud_num_points
-            )
+            pointcloud_config = replace(pointcloud_config, num_points=args.pointcloud_num_points)
         table = runtime.environment.table
         table_plane_abcd = table.plane_abcd if table.enabled else None
 

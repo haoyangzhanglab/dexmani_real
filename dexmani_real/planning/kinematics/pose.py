@@ -31,6 +31,7 @@ class Pose:
     def copy(self) -> "Pose":
         return Pose(p=self.p.copy(), q=self.q.copy())
 
+
 _WXYZ_TO_XYZW = np.array([1, 2, 3, 0], dtype=np.intp)
 _XYZW_TO_WXYZ = np.array([3, 0, 1, 2], dtype=np.intp)
 _ROT6D_MIN_BASIS_NORM = 1e-4
@@ -174,17 +175,12 @@ def validate_rot6d_geometry(
     first_norm = np.linalg.norm(first, axis=1)
     second_norm = np.linalg.norm(second, axis=1)
     unit_first = first / np.maximum(first_norm[:, None], min_basis_norm)
-    orthogonal_second = (
-        second - np.sum(second * unit_first, axis=1)[:, None] * unit_first
-    )
+    orthogonal_second = second - np.sum(second * unit_first, axis=1)[:, None] * unit_first
     orthogonal_norm = np.linalg.norm(orthogonal_second, axis=1)
     if (
         np.any(first_norm < min_basis_norm)
         or np.any(second_norm < min_basis_norm)
-        or np.any(
-            orthogonal_norm / np.maximum(second_norm, min_basis_norm)
-            < min_orthogonal_ratio
-        )
+        or np.any(orthogonal_norm / np.maximum(second_norm, min_basis_norm) < min_orthogonal_ratio)
     ):
         raise ValueError(f"{label} contains a zero or near-collinear basis")
     return values
@@ -204,12 +200,8 @@ def validate_canonical_rot6d(
     second = values[:, 3:]
     if (
         not np.allclose(np.linalg.norm(first, axis=1), 1.0, rtol=0.0, atol=tolerance)
-        or not np.allclose(
-            np.linalg.norm(second, axis=1), 1.0, rtol=0.0, atol=tolerance
-        )
-        or not np.allclose(
-            np.sum(first * second, axis=1), 0.0, rtol=0.0, atol=tolerance
-        )
+        or not np.allclose(np.linalg.norm(second, axis=1), 1.0, rtol=0.0, atol=tolerance)
+        or not np.allclose(np.sum(first * second, axis=1), 0.0, rtol=0.0, atol=tolerance)
     ):
         raise ValueError(f"{label} must use canonical unit orthogonal columns")
     return values

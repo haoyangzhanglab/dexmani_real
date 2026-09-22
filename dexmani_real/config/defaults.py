@@ -12,7 +12,12 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.robot.model import ARM_JOINT_SHAPE, XHAND_FINGERTIP_LINK_NAMES, XARM7_HARD_LOWER, XARM7_HARD_UPPER
+from dexmani_real.robot.model import (
+    ARM_JOINT_SHAPE,
+    XARM7_HARD_LOWER,
+    XARM7_HARD_UPPER,
+    XHAND_FINGERTIP_LINK_NAMES,
+)
 from dexmani_real.utils.limits import validate_hand_limit_nesting
 
 _READINESS_SUBSYSTEMS = frozenset(
@@ -30,9 +35,7 @@ class HomingParams:
     max_speed_deg_s: float = (
         30.0  # conservative Mode 0 joint speed; hardware validation required before tuning
     )
-    target_timeout_s: float = (
-        0.5  # settling allowance added after distance/speed timing
-    )
+    target_timeout_s: float = 0.5  # settling allowance added after distance/speed timing
     velocity_convergence_rad_s: float = 0.03
     dwell_s: float = 0.30
     convergence_timeout_s: float = 15.0
@@ -202,29 +205,20 @@ class TableCollisionConfig:
         plane = np.asarray(self.plane_abcd, dtype=np.float64)
         size = np.asarray(self.size_xy_m, dtype=np.float64)
         if plane.shape != (4,) or size.shape != (2,):
-            raise ValueError(
-                "table plane_abcd and size_xy_m must have shapes (4,) and (2,)"
-            )
+            raise ValueError("table plane_abcd and size_xy_m must have shapes (4,) and (2,)")
         if not np.all(np.isfinite(np.concatenate((plane, size)))):
             raise ValueError("table plane and size must be finite")
         normal_norm = float(np.linalg.norm(plane[:3]))
         if normal_norm <= 1e-9 or float(plane[2] / normal_norm) <= 0.0:
             raise ValueError("table plane must have a finite upward-pointing normal")
-        if (
-            np.any(size <= 0.0)
-            or not np.isfinite(self.thickness_m)
-            or self.thickness_m <= 0.0
-        ):
+        if np.any(size <= 0.0) or not np.isfinite(self.thickness_m) or self.thickness_m <= 0.0:
             raise ValueError("table size and thickness must be finite and positive")
         if not np.isfinite(self.soft_clearance_m) or self.soft_clearance_m < 0.0:
             raise ValueError("table soft_clearance_m must be finite and non-negative")
         if any(
-            not isinstance(name, str) or not name.strip()
-            for name in self.allowed_contact_links
+            not isinstance(name, str) or not name.strip() for name in self.allowed_contact_links
         ):
-            raise TypeError(
-                "table allowed_contact_links must contain non-empty link names"
-            )
+            raise TypeError("table allowed_contact_links must contain non-empty link names")
         if len(self.allowed_contact_links) != len(set(self.allowed_contact_links)):
             raise ValueError("table allowed_contact_links must be unique")
 
@@ -259,15 +253,12 @@ class ArmParams:
     joint_limit_lower: tuple[float, ...] = XARM7_HARD_LOWER
     joint_limit_upper: tuple[float, ...] = XARM7_HARD_UPPER
 
-    max_joint_velocity_deg_per_s: float = (
-        135.0  # 75% of the 180 deg/s SDK command limit
-    )
+    max_joint_velocity_deg_per_s: float = 135.0  # 75% of the 180 deg/s SDK command limit
     # ~14.14 rad/s²; ~71% of the 20 rad/s² SDK limit.
     max_joint_acceleration_deg_per_s2: float = 810.0
     loop_hz: float = 30.0  # worker command-admission / feedback-update rate
 
     ip: str = "192.168.1.111"
-
 
     table_z_surface_m: float = 0.022
     hand_safety_margin_m: float = 0.05
@@ -301,9 +292,7 @@ class ArmParams:
             or upper.shape != ARM_JOINT_SHAPE
         ):
             raise ValueError("arm home and joint limits must have 7 elements")
-        if not np.all(np.isfinite(np.concatenate((home, lower, upper)))) or np.any(
-            lower >= upper
-        ):
+        if not np.all(np.isfinite(np.concatenate((home, lower, upper)))) or np.any(lower >= upper):
             raise ValueError("arm home and joint limits must be finite and ordered")
         if np.any(lower < XARM7_HARD_LOWER) or np.any(upper > XARM7_HARD_UPPER):
             raise ValueError("operational arm limits must be inside mechanical limits")
@@ -453,7 +442,6 @@ class HandParams:
     loop_hz: float = 30.0  # worker command-admission / feedback-update rate
     state_read_failure_timeout_s: float = 1.0
 
-
     home_timeout_s: float = 1.0
 
     fingertip_link_names: tuple[str, ...] = XHAND_FINGERTIP_LINK_NAMES
@@ -471,9 +459,7 @@ class HandParams:
 
     def validate(self) -> None:
         if self.ethercat_slave_position < -1:
-            raise ValueError(
-                "hand ethercat_slave_position must be -1 (unknown) or non-negative"
-            )
+            raise ValueError("hand ethercat_slave_position must be -1 (unknown) or non-negative")
         if self.comm_type not in ("ethercat", "serial"):
             raise ValueError("hand comm_type must be 'ethercat' or 'serial'")
         if self.device_name is not None and not isinstance(self.device_name, str):
@@ -482,22 +468,15 @@ class HandParams:
             raise ValueError("hand baudrate must be a positive integer")
         if not isinstance(self.device_id, int) or self.device_id < 0:
             raise ValueError("hand device_id must be a non-negative integer")
-        if (
-            not np.isfinite(self.rs485_post_open_settle_s)
-            or self.rs485_post_open_settle_s < 0
-        ):
-            raise ValueError(
-                "hand rs485_post_open_settle_s must be finite and non-negative"
-            )
+        if not np.isfinite(self.rs485_post_open_settle_s) or self.rs485_post_open_settle_s < 0:
+            raise ValueError("hand rs485_post_open_settle_s must be finite and non-negative")
         limit_vectors = (
             self.mechanical_qpos_min_rad,
             self.mechanical_qpos_max_rad,
             self.qpos_min_rad,
             self.qpos_max_rad,
         )
-        if len(self.home_qpos_deg) != 12 or any(
-            len(values) != 12 for values in limit_vectors
-        ):
+        if len(self.home_qpos_deg) != 12 or any(len(values) != 12 for values in limit_vectors):
             raise ValueError("hand home and joint-limit defaults must have 12 elements")
         command_lower = np.asarray(self.qpos_min_rad, dtype=np.float64)
         command_upper = np.asarray(self.qpos_max_rad, dtype=np.float64)
@@ -528,35 +507,27 @@ class HandParams:
             or np.any(home_rad > command_upper + limit_tolerance_rad)
         ):
             raise ValueError("hand home_qpos_deg must be finite and within qpos limits")
-        if len(self.kp) != 12 or any(
-            not isinstance(value, int) or value <= 0 for value in self.kp
-        ):
+        if len(self.kp) != 12 or any(not isinstance(value, int) or value <= 0 for value in self.kp):
             raise ValueError("hand kp must contain twelve positive integer gains")
         if self.ki < 0 or self.kd < 0:
             raise ValueError("hand ki/kd must be non-negative")
         if len(self.tor_max_ma) != 12 or any(
             not isinstance(value, int) or value <= 0 for value in self.tor_max_ma
         ):
-            raise ValueError(
-                "hand tor_max_ma must contain twelve positive integer mA limits"
-            )
+            raise ValueError("hand tor_max_ma must contain twelve positive integer mA limits")
         if not np.isfinite(self.loop_hz) or self.loop_hz <= 0:
             raise ValueError("hand loop_hz must be finite and positive")
-        if not np.isfinite(self.state_read_failure_timeout_s) or self.state_read_failure_timeout_s <= 0:
-            raise ValueError("hand state_read_failure_timeout_s must be finite and positive")
         if (
-            not np.isfinite(self.home_timeout_s)
-            or self.home_timeout_s <= 0
+            not np.isfinite(self.state_read_failure_timeout_s)
+            or self.state_read_failure_timeout_s <= 0
         ):
-            raise ValueError(
-                "hand home_timeout_s must be finite and positive"
-            )
+            raise ValueError("hand state_read_failure_timeout_s must be finite and positive")
+        if not np.isfinite(self.home_timeout_s) or self.home_timeout_s <= 0:
+            raise ValueError("hand home_timeout_s must be finite and positive")
         if len(self.fingertip_link_names) != 5 or any(
             not name for name in self.fingertip_link_names
         ):
-            raise ValueError(
-                "hand fingertip_link_names must contain five non-empty names"
-            )
+            raise ValueError("hand fingertip_link_names must contain five non-empty names")
         transform = np.asarray(
             self.T_eef_handbase_pos_xyz + self.T_eef_handbase_quat_wxyz,
             dtype=np.float64,
@@ -600,7 +571,6 @@ class PolicyParams:
     ik_max_pose_error_rot_rad: float = np.deg2rad(5.0)
     ik_nullspace_step_rate_deg_s: float = 50.0
 
-
     hand_enabled: bool = True
     hand_retargeting_type: str = "tag"
 
@@ -610,9 +580,7 @@ class PolicyParams:
             self.post_teleop_timeout_s,
         )
         if not all(np.isfinite(value) and value > 0 for value in timing):
-            raise ValueError(
-                "policy operator timeouts must be finite and positive"
-            )
+            raise ValueError("policy operator timeouts must be finite and positive")
         if (
             not np.isfinite(self.max_record_duration_s)
             or not np.isfinite(self.min_record_duration_s)
@@ -620,9 +588,7 @@ class PolicyParams:
             or self.min_record_duration_s < 0
             or self.min_record_duration_s > self.max_record_duration_s
         ):
-            raise ValueError(
-                "recording durations must be finite, ordered, and non-negative"
-            )
+            raise ValueError("recording durations must be finite, ordered, and non-negative")
         if not self.episodes_dir:
             raise ValueError("policy episodes_dir must be non-empty")
         if (
@@ -786,20 +752,14 @@ class DexPilotRetargetingParams:
         )
         if not all(np.isfinite(value) for value in numeric):
             raise ValueError("DexPilot retargeting parameters must be finite")
-        if (
-            self.scaling_factor <= 0
-            or self.pinky_scale <= 0
-            or self.pinky_palm_scale <= 0
-        ):
+        if self.scaling_factor <= 0 or self.pinky_scale <= 0 or self.pinky_palm_scale <= 0:
             raise ValueError(
                 "DexPilot scaling_factor, pinky_scale, and pinky_palm_scale must be positive"
             )
         if not 0.0 <= self.low_pass_alpha <= 1.0:
             raise ValueError("DexPilot low_pass_alpha must be in [0, 1]")
         if self.project_dist_m <= 0 or self.escape_dist_m < self.project_dist_m:
-            raise ValueError(
-                "DexPilot distances must satisfy 0 < project_dist_m <= escape_dist_m"
-            )
+            raise ValueError("DexPilot distances must satisfy 0 < project_dist_m <= escape_dist_m")
         if self.prior_weight < 0:
             raise ValueError("DexPilot prior_weight must be non-negative")
 
@@ -842,9 +802,7 @@ class SafetyParams:
             not name or not np.isfinite(value) or value <= 0
             for name, value in self.readiness_timeouts_s.items()
         ):
-            raise ValueError(
-                "readiness timeout names/values must be non-empty, finite, and > 0"
-            )
+            raise ValueError("readiness timeout names/values must be non-empty, finite, and > 0")
         if _READINESS_SUBSYSTEMS - self.readiness_timeouts_s.keys():
             raise ValueError("readiness_timeouts_s is missing a runtime subsystem")
         if not np.isfinite(self.shutdown_timeout_s) or self.shutdown_timeout_s <= 0:
@@ -904,13 +862,8 @@ class CameraParams:
             or isinstance(self.l515_confidence_threshold, bool)
             or not 0 <= self.l515_confidence_threshold <= 3
         ):
-            raise ValueError(
-                "camera l515_confidence_threshold must be in [0, 3] or null"
-            )
-        if (
-            self.frame_queue_capacity <= 0
-            or self.ring_maxlen <= 0
-        ):
+            raise ValueError("camera l515_confidence_threshold must be in [0, 3] or null")
+        if self.frame_queue_capacity <= 0 or self.ring_maxlen <= 0:
             raise ValueError("camera ring and writer capacities must be > 0")
         if self.serial is not None and not self.serial:
             raise ValueError("camera serial must be non-empty when configured")

@@ -1,9 +1,4 @@
-"""Pure native RGB-D camera calibration contract.
-
-This module deliberately contains no camera SDK, shared-memory, or recording
-dependencies.  The driver owns SDK extraction; point-cloud and recording code
-consume this serializable snapshot.
-"""
+"""Serializable native RGB-D intrinsics and depth-to-color extrinsics."""
 
 from __future__ import annotations
 
@@ -114,7 +109,7 @@ class CameraIntrinsics:
         )
 
     def matrix(self, *, dtype: np.typing.DTypeLike = np.float64) -> np.ndarray:
-        """Return the canonical 3x3 pinhole matrix for metadata consumers."""
+        """Return the 3x3 pinhole intrinsic matrix."""
         return np.array(
             [[self.fx, 0.0, self.ppx], [0.0, self.fy, self.ppy], [0.0, 0.0, 1.0]],
             dtype=dtype,
@@ -136,16 +131,12 @@ class RGBDGeometry:
             or not np.all(np.isfinite(transform))
             or not np.allclose(transform[3], (0.0, 0.0, 0.0, 1.0), atol=1e-9)
         ):
-            raise ValueError(
-                "T_color_from_depth must be a finite homogeneous 4x4 matrix"
-            )
+            raise ValueError("T_color_from_depth must be a finite homogeneous 4x4 matrix")
         rotation = transform[:3, :3]
-        if not np.allclose(
-            rotation @ rotation.T, np.eye(3), atol=1e-6
-        ) or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-6):
-            raise ValueError(
-                "T_color_from_depth rotation must be orthonormal with determinant +1"
-            )
+        if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6) or not np.isclose(
+            np.linalg.det(rotation), 1.0, atol=1e-6
+        ):
+            raise ValueError("T_color_from_depth rotation must be orthonormal with determinant +1")
         transform = transform.copy()
         transform.setflags(write=False)
         object.__setattr__(self, "T_color_from_depth", transform)
@@ -188,7 +179,5 @@ class RGBDGeometry:
         return cls(
             depth=CameraIntrinsics.from_dict(depth),
             color=CameraIntrinsics.from_dict(color),
-            T_color_from_depth=np.asarray(
-                value["T_color_from_depth"], dtype=np.float64
-            ),
+            T_color_from_depth=np.asarray(value["T_color_from_depth"], dtype=np.float64),
         )

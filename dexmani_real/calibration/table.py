@@ -75,9 +75,7 @@ class TablePlaneFit:
         }
 
 
-def _normalized_upward_plane(
-    normal: np.ndarray, offset: float
-) -> tuple[np.ndarray, float]:
+def _normalized_upward_plane(normal: np.ndarray, offset: float) -> tuple[np.ndarray, float]:
     norm = float(np.linalg.norm(normal))
     if not np.isfinite(norm) or norm <= 1e-12:
         raise ValueError("table plane normal is degenerate")
@@ -132,9 +130,7 @@ def fit_table_plane(
 
     rng = np.random.default_rng(random_seed)
     if points.shape[0] > max_evaluated_points:
-        evaluated = points[
-            rng.choice(points.shape[0], size=max_evaluated_points, replace=False)
-        ]
+        evaluated = points[rng.choice(points.shape[0], size=max_evaluated_points, replace=False)]
     else:
         evaluated = points
 
@@ -146,9 +142,7 @@ def fit_table_plane(
         triplet = evaluated[rng.choice(evaluated.shape[0], size=3, replace=False)]
         normal = np.cross(triplet[1] - triplet[0], triplet[2] - triplet[0])
         try:
-            normal, offset = _normalized_upward_plane(
-                normal, -float(normal @ triplet[0])
-            )
+            normal, offset = _normalized_upward_plane(normal, -float(normal @ triplet[0]))
         except ValueError:
             continue
         if normal[2] < min_normal_z:
@@ -157,9 +151,7 @@ def fit_table_plane(
         inlier = residual <= distance_threshold_m
         count = int(np.count_nonzero(inlier))
         mean_residual = float(np.mean(residual[inlier])) if count else np.inf
-        if count > best_count or (
-            count == best_count and mean_residual < best_mean_residual
-        ):
+        if count > best_count or (count == best_count and mean_residual < best_mean_residual):
             best_mask = inlier
             best_count = count
             best_mean_residual = mean_residual
@@ -200,19 +192,13 @@ def fit_table_plane(
     )
 
 
-def publish_table_plane(
-    path: str | Path, fit: TablePlaneFit, *, confirmed: bool
-) -> Path | None:
+def publish_table_plane(path: str | Path, fit: TablePlaneFit, *, confirmed: bool) -> Path | None:
     """Atomically publish a confirmed fit and return the backup path, if any."""
     if not confirmed:
-        raise PermissionError(
-            "table calibration publish requires explicit confirmation"
-        )
+        raise PermissionError("table calibration publish requires explicit confirmation")
     target = Path(path)
     if not target.parent.is_dir():
-        raise FileNotFoundError(
-            f"table calibration directory does not exist: {target.parent}"
-        )
+        raise FileNotFoundError(f"table calibration directory does not exist: {target.parent}")
 
     backup: Path | None = None
     if target.exists():

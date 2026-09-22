@@ -12,8 +12,8 @@ import numpy as np
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
-    from .ik_geometry import IKGeometry
     from .arm_fk import XArm7Kinematics
+    from .ik_geometry import IKGeometry
 
 from .pose import Pose, compute_pose_error, ensure_qpos
 
@@ -107,9 +107,7 @@ class OnlineIKSolver:
 
         profile = self.profile
         current_qpos = ensure_qpos(current_qpos, self.kin.dof, "current_qpos")
-        previous_qpos_cmd = ensure_qpos(
-            previous_qpos_cmd, self.kin.dof, "previous_qpos_cmd"
-        )
+        previous_qpos_cmd = ensure_qpos(previous_qpos_cmd, self.kin.dof, "previous_qpos_cmd")
 
         qpos, report = self._solve_position_ik(
             target_eef_pose_world, current_qpos, previous_qpos_cmd, profile
@@ -123,9 +121,7 @@ class OnlineIKSolver:
                 profile=profile,
                 report=report,
             )
-            result.report["ik_timing_ms"] = round(
-                (time.perf_counter() - t_start) * 1000.0, 1
-            )
+            result.report["ik_timing_ms"] = round((time.perf_counter() - t_start) * 1000.0, 1)
         else:
             dt_total_ms = (time.perf_counter() - t_start) * 1000
             diagnostic = self._build_diagnostic(report)
@@ -194,9 +190,9 @@ class OnlineIKSolver:
 
         seeds = self._make_teleop_seeds(previous_qpos_cmd, current_qpos, profile)
 
-        candidates: list[tuple[np.ndarray, str, float, float]] = (
-            []
-        )  # (qpos, seed_name, score, manipulability)
+        candidates: list[
+            tuple[np.ndarray, str, float, float]
+        ] = []  # (qpos, seed_name, score, manipulability)
         seen_qpos: list[np.ndarray] = []
 
         for seed_name, seed in seeds:
@@ -204,7 +200,10 @@ class OnlineIKSolver:
             model = self.ik_mgr.mp_planner
             raw_qpos, success, _ = model.pinocchio_model.compute_IK_CLIK(
                 model.link_name_2_idx[model.move_group],
-                self.kin.to_mplib_pose(target_pose_base), seed, [])
+                self.kin.to_mplib_pose(target_pose_base),
+                seed,
+                [],
+            )
             _solve_ms = (time.perf_counter() - _tik0) * 1000.0
             if not success or raw_qpos is None:
                 attempts.append(f"{seed_name}:mplib_failed({_solve_ms:.1f}ms)")
@@ -253,9 +252,7 @@ class OnlineIKSolver:
                 continue
             seen_qpos.append(qpos.copy())
 
-            jacobian, eef_pose_world = self.kin.compute_eef_jacobian_and_pose_world(
-                qpos
-            )
+            jacobian, eef_pose_world = self.kin.compute_eef_jacobian_and_pose_world(qpos)
             pos_err, rot_err = compute_pose_error(target_eef_pose_world, eef_pose_world)
             mu = self.kin.manipulability_from_jacobian(jacobian)
             if not (
@@ -392,10 +389,7 @@ class OnlineIKSolver:
 
         Returns (passed, tag) — tag is the first failing check name or "ok".
         """
-        if (
-            pos_err > profile.max_pose_error_pos_m
-            or rot_err > profile.max_pose_error_rot_rad
-        ):
+        if pos_err > profile.max_pose_error_pos_m or rot_err > profile.max_pose_error_rot_rad:
             return False, "pose_err"
 
         if (
@@ -440,8 +434,7 @@ class OnlineIKSolver:
         unique: list[tuple[str, np.ndarray]] = []
         for item in seeds:
             if not any(
-                np.allclose(item[1], previous[1], atol=1e-8, rtol=0.0)
-                for previous in unique
+                np.allclose(item[1], previous[1], atol=1e-8, rtol=0.0) for previous in unique
             ):
                 unique.append(item)
         return unique
@@ -470,9 +463,7 @@ class OnlineIKSolver:
             if profile.velocity_joint_weights is not None
             else profile.joint_weights
         )
-        velocity_dist = self.ik_mgr.weighted_joint_distance(
-            qpos, previous_qpos_cmd, vel_weights
-        )
+        velocity_dist = self.ik_mgr.weighted_joint_distance(qpos, previous_qpos_cmd, vel_weights)
 
         # Normalize Yoshikawa manipulability to a unitless [0, 1] score.
         normalized_mu = min(manipulability / max(mu_current, 1e-9), 1.0)
@@ -491,23 +482,15 @@ class OnlineIKSolver:
             + profile.position_ik_pose_accuracy_weight * pose_cost
         )
 
-    def _has_elbow_flip(
-        self, candidate_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
-    ) -> bool:
+    def _has_elbow_flip(self, candidate_qpos: np.ndarray, previous_qpos_cmd: np.ndarray) -> bool:
         """Return True if candidate would cause an elbow branch flip vs previous command."""
         prev_j4 = float(previous_qpos_cmd[self._elbow_joint_index])
         cand_j4 = float(candidate_qpos[self._elbow_joint_index])
         delta_j4 = abs(cand_j4 - prev_j4)
 
-        if (
-            prev_j4 < self._ELBOW_FLIP_NEG_THRESH_RAD
-            and cand_j4 > self._ELBOW_FLIP_POS_THRESH_RAD
-        ):
+        if prev_j4 < self._ELBOW_FLIP_NEG_THRESH_RAD and cand_j4 > self._ELBOW_FLIP_POS_THRESH_RAD:
             return bool(delta_j4 > self._ELBOW_FLIP_MIN_DELTA_RAD)
-        if (
-            cand_j4 < self._ELBOW_FLIP_NEG_THRESH_RAD
-            and prev_j4 > self._ELBOW_FLIP_POS_THRESH_RAD
-        ):
+        if cand_j4 < self._ELBOW_FLIP_NEG_THRESH_RAD and prev_j4 > self._ELBOW_FLIP_POS_THRESH_RAD:
             return bool(delta_j4 > self._ELBOW_FLIP_MIN_DELTA_RAD)
         return False
 
@@ -550,7 +533,8 @@ class OnlineIKSolver:
         """Classify failed IK attempts for local diagnostics."""
         attempts = report.get("attempts")
         classification = (
-            "invalid_output" if report.get("failure_kind") == IKFailureKind.INVALID_OUTPUT
+            "invalid_output"
+            if report.get("failure_kind") == IKFailureKind.INVALID_OUTPUT
             else cls._classify_attempts(attempts or [])
         )
         failure_reason = str(report.get("failure_reason", ""))
@@ -676,7 +660,10 @@ class OnlineIKSolver:
         # Refinement can change a previously collision-free candidate.
         if self.ik_mgr.has_self_collision(qpos_cmd):
             return self._failed_solution(
-                qpos_cmd, current_qpos, "self_collision", report,
+                qpos_cmd,
+                current_qpos,
+                "self_collision",
+                report,
             )
 
         qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
@@ -767,8 +754,6 @@ def apply_nullspace_optimization(
 
     qpos_new = qpos + dq
     # Skip refinement if the projected qpos crosses a hard joint limit.
-    if np.any(qpos_new < joint_limits[:, 0] - 1e-5) or np.any(
-        qpos_new > joint_limits[:, 1] + 1e-5
-    ):
+    if np.any(qpos_new < joint_limits[:, 0] - 1e-5) or np.any(qpos_new > joint_limits[:, 1] + 1e-5):
         return qpos
     return qpos_new

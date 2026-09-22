@@ -1,6 +1,8 @@
 """Dedicated XHand home: success means SDK send success, not physical arrival."""
-from queue import Full, Empty
+
 import time
+from queue import Empty, Full
+
 import numpy as np
 
 from dexmani_real.robot.home import HomeResult, wait_home_result
@@ -12,9 +14,13 @@ def home_hand(shared, runtime, *, abort_requested=None):
     if not runtime.policy.hand_enabled:
         return HomeResult(True)
     cfg = runtime.hand
-    target = validate_hand_command_bounds(np.deg2rad(cfg.home_qpos_deg),
-        np.asarray(cfg.qpos_min_rad), np.asarray(cfg.qpos_max_rad),
-        np.asarray(cfg.mechanical_qpos_min_rad), np.asarray(cfg.mechanical_qpos_max_rad))
+    target = validate_hand_command_bounds(
+        np.deg2rad(cfg.home_qpos_deg),
+        np.asarray(cfg.qpos_min_rad),
+        np.asarray(cfg.qpos_max_rad),
+        np.asarray(cfg.mechanical_qpos_min_rad),
+        np.asarray(cfg.mechanical_qpos_max_rad),
+    )
     if int(shared.safety_state.value) != int(SafetyState.ARMED):
         return HomeResult(False, "hand home requires ARMED")
     revoke_motion(shared)
@@ -33,4 +39,6 @@ def home_hand(shared, runtime, *, abort_requested=None):
         shared.hand_home_q.put_nowait((target, epoch, deadline))
     except Full:
         return HomeResult(False, "hand home queue is full")
-    return wait_home_result(shared, shared.hand_home_result_q, epoch, cfg.home_timeout_s, abort_requested)
+    return wait_home_result(
+        shared, shared.hand_home_result_q, epoch, cfg.home_timeout_s, abort_requested
+    )

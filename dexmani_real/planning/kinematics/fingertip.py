@@ -6,17 +6,17 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.robot.model import (
-    ARM_JOINT_SHAPE,
-    HAND_FINGERTIP_SHAPE,
-    HAND_JOINT_SHAPE,
-)
 from dexmani_real.planning.kinematics.pose import (
     Pose,
     compose_pose,
     normalize_quat_wxyz,
     quat_wxyz_to_rotmat,
     rot6d_to_quat_wxyz,
+)
+from dexmani_real.robot.model import (
+    ARM_JOINT_SHAPE,
+    HAND_FINGERTIP_SHAPE,
+    HAND_JOINT_SHAPE,
 )
 
 # Public dexmani_policy metadata vocabulary; this does not name a storage format.
@@ -65,13 +65,9 @@ def compute_fingertip_points_xarm_base(
             raise ValueError("EEF position must be finite shape (3,)")
         if eef_rot6d.shape != (6,) or not np.all(np.isfinite(eef_rot6d)):
             raise ValueError("EEF rot6d must be finite shape (6,)")
-    eef_pose = Pose(
-        p=np.asarray(eef_pos, dtype=np.float64), q=rot6d_to_quat_wxyz(eef_rot6d)
-    )
+    eef_pose = Pose(p=np.asarray(eef_pos, dtype=np.float64), q=rot6d_to_quat_wxyz(eef_rot6d))
     handbase_pose = compose_pose(eef_pose, Pose(p=mount_p, q=mount_q))
-    tips_hand = np.asarray(
-        hand_fk.compute_tip_positions_in_handbase(hand), dtype=np.float64
-    )
+    tips_hand = np.asarray(hand_fk.compute_tip_positions_in_handbase(hand), dtype=np.float64)
     if tips_hand.shape != HAND_FINGERTIP_SHAPE or not np.all(np.isfinite(tips_hand)):
         raise RuntimeError("hand FK produced malformed fingertip positions")
     rotation = quat_wxyz_to_rotmat(handbase_pose.q)

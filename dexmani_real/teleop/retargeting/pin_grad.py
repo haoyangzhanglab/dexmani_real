@@ -20,7 +20,9 @@ logger = get_logger(__name__)
 _FINGERTIP_ORDER = ("thumb", "index", "mid", "ring", "pinky")
 
 
-def validate_fingertip_frame_names(fingertip_frame_names: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+def validate_fingertip_frame_names(
+    fingertip_frame_names: list[str] | tuple[str, ...],
+) -> tuple[str, ...]:
     """Validate the fixed five-finger XHand optimizer contract."""
     names = tuple(fingertip_frame_names)
     if len(names) != len(_FINGERTIP_ORDER):
@@ -67,7 +69,6 @@ class PinGrad:
             raise ValueError(f"fingertip frames not found in URDF {urdf_path!r}: {missing}")
         self.tip_frame_ids = [int(self.model.getFrameId(name)) for name in names]
 
-
     def update_kinematics(self, qpos_floating: np.ndarray) -> None:
         """Run FK, update frame placements, and compute joint Jacobians.
 
@@ -78,8 +79,9 @@ class PinGrad:
         pin.updateFramePlacements(self.model, self.data)
         pin.computeJointJacobians(self.model, self.data, qpos_floating)
 
-
-    def compute_position_gradient(self, qpos_floating: np.ndarray, target_pos: np.ndarray) -> tuple[np.ndarray, float]:
+    def compute_position_gradient(
+        self, qpos_floating: np.ndarray, target_pos: np.ndarray
+    ) -> tuple[np.ndarray, float]:
         """Analytic gradient of squared fingertip position error.
 
         ∂/∂q  Σ_i ||FK_tip_i(q) - target_i||²
@@ -100,7 +102,9 @@ class PinGrad:
 
         for i in range(len(self.tip_frame_ids)):
             fid = self.tip_frame_ids[i]
-            J_full = pin.getFrameJacobian(self.model, self.data, fid, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+            J_full = pin.getFrameJacobian(
+                self.model, self.data, fid, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+            )
             J_v = J_full[:3, 6:]  # strip FreeFlyer columns, keep joint DOFs
             p_tip = self.data.oMf[fid].translation
             diff = p_tip - target_pos[i]
@@ -109,9 +113,10 @@ class PinGrad:
 
         return grad, loss
 
-
     @staticmethod
-    def compute_smoothness_gradient(q: np.ndarray, q_last: np.ndarray, weight: float) -> tuple[np.ndarray, float]:
+    def compute_smoothness_gradient(
+        q: np.ndarray, q_last: np.ndarray, weight: float
+    ) -> tuple[np.ndarray, float]:
         """Gradient of temporal smoothness penalty:  weight * ||q - q_last||².
 
         Returns:

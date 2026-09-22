@@ -1,5 +1,7 @@
 """Finite absolute operational targets. Workers separately enforce physical limits."""
+
 import numpy as np
+
 from dexmani_real.planning.paths import wrap_nearest_equivalent
 
 

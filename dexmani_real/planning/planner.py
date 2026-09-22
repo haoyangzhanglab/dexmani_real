@@ -25,7 +25,7 @@ from .kinematics.arm_fk import XArm7Kinematics
 from .kinematics.ik import IKResult, OnlineIKConfig, OnlineIKSolver
 from .kinematics.ik_geometry import IKGeometry
 from .kinematics.pose import Pose, ensure_qpos
-from .paths import PathResult, WORKSPACE_BOUNDS_TOLERANCE_M, interpolate_waypoints
+from .paths import WORKSPACE_BOUNDS_TOLERANCE_M, PathResult, interpolate_waypoints
 
 __all__ = [
     "XArm7MotionPlanner",
@@ -88,7 +88,11 @@ class XArm7MotionPlanner:
         self.workspace_bounds = None
         if config.workspace_bounds is not None:
             bounds = np.asarray(config.workspace_bounds, dtype=np.float64)
-            if bounds.shape != (3, 2) or not np.all(np.isfinite(bounds)) or np.any(bounds[:, 0] > bounds[:, 1]):
+            if (
+                bounds.shape != (3, 2)
+                or not np.all(np.isfinite(bounds))
+                or np.any(bounds[:, 0] > bounds[:, 1])
+            ):
                 raise ValueError("workspace_bounds must be finite shape (3, 2) with lower <= upper")
             self.workspace_bounds = bounds.copy()
 
@@ -112,7 +116,9 @@ class XArm7MotionPlanner:
 
         link_names = list(self.pinocchio_model.get_link_names())
         if config.eef_link_name not in link_names:
-            raise ValueError(f"Link {config.eef_link_name!r} not found. Available links: {link_names}")
+            raise ValueError(
+                f"Link {config.eef_link_name!r} not found. Available links: {link_names}"
+            )
         eef_link_id = int(link_names.index(config.eef_link_name))
 
         self._elbow_joint_index = list(self.pinocchio_model.get_joint_names()).index("joint4")
@@ -233,7 +239,6 @@ class XArm7MotionPlanner:
     ) -> IKResult:
         return self.teleop_solver.solve(target_eef_pose_world, current_qpos, previous_qpos_cmd)
 
-
     def plan_joint_qpos_path(
         self,
         target_qpos: np.ndarray,
@@ -282,7 +287,6 @@ class XArm7MotionPlanner:
 
     # __getattr__ to self.kin / self.ik_mgr / self.mplib_planner.
 
-
     def result_from_mplib(
         self,
         result: dict[str, Any],
@@ -311,15 +315,21 @@ class XArm7MotionPlanner:
 
         path = np.asarray(result.get("position", []), dtype=np.float64)
         if len(path) == 0:
-            warnings.warn(f"MPlib {source} returned success but empty position; falling back to current_qpos.")
+            warnings.warn(
+                f"MPlib {source} returned success but empty position; falling back to current_qpos."
+            )
             path = current_qpos.reshape(1, -1)
-        path_result = self.validate_path(path, target_eef_pose_world, current_qpos, source=source, profile=profile)
+        path_result = self.validate_path(
+            path, target_eef_pose_world, current_qpos, source=source, profile=profile
+        )
         path_result.report.update(mplib_status=status)
         return path_result
 
     # Path validation — each returns None on pass, PathResult on failure.
 
-    def shortcut_smooth_path(self, path: np.ndarray, current_qpos: np.ndarray, profile: MotionPlanningConfig) -> np.ndarray:
+    def shortcut_smooth_path(
+        self, path: np.ndarray, current_qpos: np.ndarray, profile: MotionPlanningConfig
+    ) -> np.ndarray:
         limits = self.resolve_planning_limits(profile, current_qpos)
         path = np.asarray(path, dtype=np.float64).copy()
         if len(path) <= 2:
@@ -414,7 +424,9 @@ class XArm7MotionPlanner:
                 # Shortcut smoothing didn't change the path — no point retrying
                 break
 
-            report = self.compute_path_metrics(candidate, target_eef_pose_world, current_qpos, profile)
+            report = self.compute_path_metrics(
+                candidate, target_eef_pose_world, current_qpos, profile
+            )
             failure = None
             for check in (
                 self._check_limit_violation,
@@ -455,7 +467,9 @@ class XArm7MotionPlanner:
 
     @staticmethod
     def _make_failure(reason: str, source: str, report: dict) -> PathResult:
-        return PathResult(success=False, qpos_path=None, source=source, reason=reason, report=report)
+        return PathResult(
+            success=False, qpos_path=None, source=source, reason=reason, report=report
+        )
 
     def _check_limit_violation(self, _path, report, source, _profile):
         """Fail if the planner report flags a joint limit violation."""
@@ -524,10 +538,9 @@ class XArm7MotionPlanner:
                 return False
             if not np.all(np.isfinite(position)):
                 return False
-            if (
-                np.any(position < self.workspace_bounds[:, 0] - WORKSPACE_BOUNDS_TOLERANCE_M)
-                or np.any(position > self.workspace_bounds[:, 1] + WORKSPACE_BOUNDS_TOLERANCE_M)
-            ):
+            if np.any(
+                position < self.workspace_bounds[:, 0] - WORKSPACE_BOUNDS_TOLERANCE_M
+            ) or np.any(position > self.workspace_bounds[:, 1] + WORKSPACE_BOUNDS_TOLERANCE_M):
                 return False
         return True
 
@@ -561,16 +574,24 @@ class XArm7MotionPlanner:
         return None
 
     def compute_path_metrics(
-        self, path: np.ndarray, target_eef_pose_world: Pose, current_qpos: np.ndarray, profile: MotionPlanningConfig
+        self,
+        path: np.ndarray,
+        target_eef_pose_world: Pose,
+        current_qpos: np.ndarray,
+        profile: MotionPlanningConfig,
     ) -> dict[str, Any]:
         diff = np.diff(path, axis=0) if len(path) > 1 else np.zeros((0, self.dof), dtype=np.float64)
         max_step = float(np.max(np.abs(diff))) if len(diff) > 0 else 0.0
         path_length = float(np.sum(np.linalg.norm(diff, axis=1))) if len(diff) > 0 else 0.0
-        terminal_pos_error, terminal_rot_error = self.compute_world_pose_error(target_eef_pose_world, path[-1])
+        terminal_pos_error, terminal_rot_error = self.compute_world_pose_error(
+            target_eef_pose_world, path[-1]
+        )
 
         eef_efficiency = 1.0
         if len(path) >= 3:
-            eef_positions = np.array([self.compute_eef_pose_world(q).p for q in path], dtype=np.float64)
+            eef_positions = np.array(
+                [self.compute_eef_pose_world(q).p for q in path], dtype=np.float64
+            )
             eef_deltas = np.diff(eef_positions, axis=0)
             eef_path_len = float(np.sum(np.linalg.norm(eef_deltas, axis=1)))
             eef_straight = float(np.linalg.norm(eef_positions[-1] - eef_positions[0]))
@@ -583,7 +604,9 @@ class XArm7MotionPlanner:
             "joint_path_length": path_length,
             "max_waypoint_delta_rad": max_step,
             "max_waypoint_delta_deg": float(np.rad2deg(max_step)),
-            "start_qpos_error_rad": float(np.max(np.abs(self.compute_qpos_delta(path[0], current_qpos)))),
+            "start_qpos_error_rad": float(
+                np.max(np.abs(self.compute_qpos_delta(path[0], current_qpos)))
+            ),
             "terminal_pos_error_m": terminal_pos_error,
             "terminal_rot_error_rad": terminal_rot_error,
             "limit_violation": bool(np.any(outside)),
@@ -606,7 +629,11 @@ class XArm7MotionPlanner:
         values = path[:, self._elbow_joint_index]
         v_min, v_max = float(np.min(values)), float(np.max(values))
         span = v_max - v_min
-        if v_min < self._ELBOW_NEG_BAND_RAD and v_max > self._ELBOW_POS_BAND_RAD and span > self._ELBOW_MIN_SPAN_RAD:
+        if (
+            v_min < self._ELBOW_NEG_BAND_RAD
+            and v_max > self._ELBOW_POS_BAND_RAD
+            and span > self._ELBOW_MIN_SPAN_RAD
+        ):
             return True, {
                 "elbow_branch_flip": True,
                 "elbow_min_deg": float(np.rad2deg(v_min)),

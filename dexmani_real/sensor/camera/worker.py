@@ -1,7 +1,9 @@
 """RealSense owner; publish usable aligned RGB-D and host acquisition times."""
-from dataclasses import dataclass, fields
+
 import json
 import time
+from dataclasses import dataclass, fields
+
 import numpy as np
 
 from dexmani_real.config.defaults import CameraParams
@@ -47,14 +49,28 @@ def pack_camera_frame(rgb, depth_raw, *, timestamp_ns, depth_frame_number, color
 
 
 def camera_loop(shared, config):
-    from dexmani_real.sensor.camera.realsense import L515DepthConfig, RealSenseCamera, RealSenseCameraConfig
+    from dexmani_real.sensor.camera.realsense import (
+        L515DepthConfig,
+        RealSenseCamera,
+        RealSenseCameraConfig,
+    )
+
     cfg = config
-    cam = RealSenseCamera(RealSenseCameraConfig(
-        camera_name="realsense", serial=cfg.serial,
-        depth_resolution=(cfg.width, cfg.height), color_resolution=(cfg.width, cfg.height),
-        fps=cfg.fps, warmup_frames=cfg.warmup_frames, frame_queue_capacity=cfg.frame_queue_capacity,
-        l515_depth_config=L515DepthConfig(visual_preset=cfg.l515_visual_preset,
-                                       confidence_threshold=cfg.l515_confidence_threshold)))
+    cam = RealSenseCamera(
+        RealSenseCameraConfig(
+            camera_name="realsense",
+            serial=cfg.serial,
+            depth_resolution=(cfg.width, cfg.height),
+            color_resolution=(cfg.width, cfg.height),
+            fps=cfg.fps,
+            warmup_frames=cfg.warmup_frames,
+            frame_queue_capacity=cfg.frame_queue_capacity,
+            l515_depth_config=L515DepthConfig(
+                visual_preset=cfg.l515_visual_preset,
+                confidence_threshold=cfg.l515_confidence_threshold,
+            ),
+        )
+    )
     try:
         if not cam.connect():
             raise RuntimeError("RealSense connect failed")
@@ -78,9 +94,15 @@ def camera_loop(shared, config):
                 continue
             if frame.rgb is None or frame.depth_aligned_to_color_raw is None:
                 raise RuntimeError("RealSense did not produce aligned RGB-D")
-            shared.camera_ring.write(*pack_camera_frame(frame.rgb, frame.depth_aligned_to_color_raw,
-                timestamp_ns=frame.timestamp_ns, depth_frame_number=frame.depth_frame_number,
-                color_frame_number=frame.color_frame_number or 0))
+            shared.camera_ring.write(
+                *pack_camera_frame(
+                    frame.rgb,
+                    frame.depth_aligned_to_color_raw,
+                    timestamp_ns=frame.timestamp_ns,
+                    depth_frame_number=frame.depth_frame_number,
+                    color_frame_number=frame.color_frame_number or 0,
+                )
+            )
             last_frame, last_good_s = identity, time.monotonic()
             shared.camera_ready.set()
     except Exception:

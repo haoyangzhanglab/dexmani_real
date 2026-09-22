@@ -1,8 +1,4 @@
-"""RuntimeChannels — centralized data plane for cross-process communication.
-
-A single class owns all rings, queues, events, and flags. Processes exchange data
-through it — no direct references, no RPC, no business logic.
-"""
+"""Shared-memory rings, queues, events, and flags for runtime processes."""
 
 from __future__ import annotations
 
@@ -17,8 +13,8 @@ from dexmani_real.ipc.camera_ring import CameraRingBuffer
 from dexmani_real.ipc.ring import SharedMemoryRingBuffer
 from dexmani_real.ipc.schema import (
     ARM_STATE_DTYPE,
-    ROBOT_COMMAND_DTYPE,
     HAND_STATE_DTYPE,
+    ROBOT_COMMAND_DTYPE,
     VR_FRAME_DTYPE,
     make_pointcloud_frame_dtype,
     make_record_sample_dtype,
@@ -27,24 +23,13 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-# ``runtime.safety.SafetyState`` owns the enum; IPC carries this stable wire value
-# without importing the runtime state machine back into the data plane.
+# Wire value of runtime.safety.SafetyState.DISARMED.
 DISARMED_SAFETY_STATE_WIRE_VALUE = 0
 
 
 @dataclass
 class RuntimeChannelsConfig:
-    """Centralized configuration for RuntimeChannels variable sizes and camera defaults.
-
-    Variable ring ``maxlen`` values and camera resolution defaults are gathered
-    here so they have a single source of truth rather than being scattered across
-    entry points. Fixed wire details remain module constants.
-
-    Usage::
-
-        cfg = RuntimeChannelsConfig()
-        shared = RuntimeChannels.create(config=cfg)
-    """
+    """Ring capacities, queue sizes, and camera resolution defaults."""
 
     camera_ring_maxlen: int = field(default_factory=lambda: camera.ring_maxlen)
     vr_ring_maxlen: int = 8
@@ -54,12 +39,8 @@ class RuntimeChannelsConfig:
     pointcloud_num_points: int = 1024
     pointcloud_ring_maxlen: int = 8
 
-    camera_rgb_shape: tuple[int, int, int] = field(
-        default_factory=lambda: camera.rgb_shape
-    )
-    camera_depth_shape: tuple[int, int] = field(
-        default_factory=lambda: camera.depth_shape
-    )
+    camera_rgb_shape: tuple[int, int, int] = field(default_factory=lambda: camera.rgb_shape)
+    camera_depth_shape: tuple[int, int] = field(default_factory=lambda: camera.depth_shape)
 
     arm_home_q_maxsize: int = 2
 
@@ -80,9 +61,7 @@ class RuntimeChannelsConfig:
             or not isinstance(self.pointcloud_num_points, (int, np.integer))
             or self.pointcloud_num_points <= 0
         ):
-            raise ValueError(
-                "RuntimeChannels pointcloud_num_points must be a positive integer"
-            )
+            raise ValueError("RuntimeChannels pointcloud_num_points must be a positive integer")
 
     @classmethod
     def from_runtime(
@@ -112,21 +91,16 @@ _RING_RESOURCE_NAMES = (
 _QUEUE_RESOURCE_NAMES = ("arm_home_q", "arm_home_result_q", "hand_home_q", "hand_home_result_q")
 _RECORDER_QUEUE_RESOURCE_NAMES = ("record_control_q", "record_result_q")
 
+
 @dataclass
 class RuntimeChannels:
-    """Central data plane — all cross-process state in one place.
-
-    Created by Main before spawning child processes. Each process receives a
-    reference and reads/writes its designated rings/queues/flags.
-    """
+    """Runtime channels created in Main before spawning child processes."""
 
     camera_ring: CameraRingBuffer  # camera -> policy
     vr_ring: SharedMemoryRingBuffer  # vr -> policy
     arm_state_ring: SharedMemoryRingBuffer  # arm -> policy
     hand_state_ring: SharedMemoryRingBuffer  # hand -> policy
-    robot_command_ring: (
-        SharedMemoryRingBuffer  # latest current-run target mailbox
-    )
+    robot_command_ring: SharedMemoryRingBuffer  # latest current-run target mailbox
     record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> policy
 
@@ -138,7 +112,7 @@ class RuntimeChannels:
     record_result_q: mp.Queue  # RecorderIO -> RecorderClient (sole consumer)
     run_id: Any  # controller advances it to invalidate old policy proposals
     run_started_monotonic_ns: Any  # start of the current RUNNING observation epoch
-    # Latest software RUNNING terminal snapshot; safety owns writes under motion_lock.
+    # Latest software RUNNING termination; written under motion_lock.
     run_ended_reason: Any
     recorder_finish_deadline_ns: Any  # recorder-owned; zero while idle
     recorder_completed_ns: Any  # close completed before finish deadline; reset on START
@@ -148,27 +122,22 @@ class RuntimeChannels:
 
     is_running: Any  # Main -> all
     is_recording: Any  # policy -> arm/hand/camera
-    # Sticky fail-closed runtime/safety fault latch. When set, supervision
-    # takes the FAULT path. The owning workflow decides which failures require
-    # this disposition.
+    # Sticky runtime/safety fault: supervision takes the FAULT shutdown path.
     error_state: Any
-    # Sticky experiment/session failure latch. When set without a physical/runtime
-    # fault, the owning workflow may use verified non-FAULT shutdown while still
-    # reporting the session as failed.
+    # Session failure can use verified non-FAULT shutdown if no runtime fault occurred.
     estop_request: Any  # policy -> arm/hand
     quit_requested: Any  # policy -> Main
     start_request: Any  # Main -> policy runner: B (start a new policy run)
     # Main/operator -> policy runner: true only after Main completed the
     # authorized hand-home + collision-checked arm-home sequence.
     physical_home_completed: Any
-    # Main/operator -> policy runner: explicit S request.
+    # Main/operator -> policy runner: S request.
     stop_request: Any
 
     safety_state: Any  # SafetyState enum (0-3), Main + policy write
     # Serializes the motion permit and coupled-command ring writer. It is never
     # held across hardware SDK calls.
     motion_lock: Any
-
 
     arm_ready: Any
     hand_ready: Any
@@ -211,9 +180,7 @@ class RuntimeChannels:
             try:
                 cleanup_succeeded = storage.close()
             except BaseException:
-                logger.critical(
-                    "RuntimeChannels allocation rollback raised", exc_info=True
-                )
+                logger.critical("RuntimeChannels allocation rollback raised", exc_info=True)
                 raise RuntimeError(
                     "RuntimeChannels allocation failed and rollback raised"
                 ) from allocation_error
@@ -291,8 +258,7 @@ class RuntimeChannels:
         # Recorder may be killed at any instruction. Its shared status accesses
         # must not acquire mutexes also needed by surviving workers/monitor.
         # Ready events and consumed sequence have one writer; camera
-        # metadata is immutable after camera readiness. These status scalars
-        # need no compound transaction. Motion state keeps its existing locks.
+        # metadata is immutable after camera readiness.
         storage.recorder_finish_deadline_ns = ctx.Value("q", 0, lock=False)
         storage.workflow_failed = ctx.Value("b", False, lock=False)
         storage.recorder_completed_ns = ctx.Value("q", 0, lock=False)
@@ -311,7 +277,6 @@ class RuntimeChannels:
         storage.safety_state = ctx.Value("i", DISARMED_SAFETY_STATE_WIRE_VALUE)
         storage.motion_lock = ctx.RLock()
 
-
         storage.arm_ready = ctx.Event()
         storage.hand_ready = ctx.Event()
         storage.policy_ready = ctx.Event()
@@ -325,39 +290,28 @@ class RuntimeChannels:
         storage.camera_geometry = ctx.Array("c", b"\x00" * 2048, lock=False)
 
     def close(self) -> bool:
-        """Release all shared memory primitives.
+        """Close and unlink shared memory, attempting every resource even after failures.
 
-        ``unlink()`` destroys the POSIX shared-memory segment, preventing
-        Python's resource tracker "leaked shared_memory objects" warning.
-        Cleanup is best-effort across every resource. Underlying close calls are
-        idempotent and an already-unlinked shared-memory segment raises
-        ``FileNotFoundError``, so a retry can simply repeat the full sequence.
-
-        Returns:
-            Whether every owned resource was closed and unlinked successfully.
+        An already-unlinked segment raises ``FileNotFoundError``; close calls are
+        idempotent, so cleanup can be retried. Return whether every resource was
+        closed and unlinked successfully.
         """
         if bool(getattr(self, "_closed", False)):
             return True
 
         errors: list[str] = []
 
-        def _attempt(
-            operation: str, callback: Any, *, missing_ok: bool = False
-        ) -> bool:
+        def _attempt(operation: str, callback: Any, *, missing_ok: bool = False) -> bool:
             try:
                 callback()
             except FileNotFoundError:
                 if not missing_ok:
                     errors.append(operation)
-                    logger.warning(
-                        "RuntimeChannels close: %s failed", operation, exc_info=True
-                    )
+                    logger.warning("RuntimeChannels close: %s failed", operation, exc_info=True)
                     return False
             except Exception:
                 errors.append(operation)
-                logger.warning(
-                    "RuntimeChannels close: %s failed", operation, exc_info=True
-                )
+                logger.warning("RuntimeChannels close: %s failed", operation, exc_info=True)
                 return False
             return True
 
@@ -388,6 +342,7 @@ class RuntimeChannels:
         else:
             logger.error("RuntimeChannels close incomplete: %s", ", ".join(errors))
         return self._closed
+
 
 def read_arm_state(shared: RuntimeChannels) -> np.ndarray | None:
     """Read latest arm state from ring. Returns raw structured array or None."""

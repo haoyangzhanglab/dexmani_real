@@ -1,10 +1,7 @@
-"""Transactional current-raw episode serialization from owned ``EpisodeFrame`` rows.
+"""Serialize each controller sample as one raw episode row.
 
-Each controller-emitted source sample becomes exactly one persisted row.
-The recorder owns transaction lifecycle, camera sidecar coordination, metadata,
-verification, and atomic publication. ``EpisodeDataWriter`` is the sole owner
-of the ``data.h5`` handle, datasets, and append offset. Neither component reads
-shared memory or controls hardware.
+Coordinate RGB-D sidecars and HDF5 writes, verify closed files, then publish
+atomically. EpisodeDataWriter writes data.h5; samples arrive as EpisodeFrame rows.
 """
 
 from __future__ import annotations
@@ -22,15 +19,15 @@ import numpy as np
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.defaults import camera
+from dexmani_real.recording.frame import EpisodeFrame
 from dexmani_real.recording.storage.camera_writer import (
     CameraStreamWriter,
     CameraStreamWriterConfig,
 )
-from dexmani_real.recording.frame import EpisodeFrame
 from dexmani_real.recording.storage.hdf5_writer import EpisodeDataWriter
 from dexmani_real.recording.storage.schema import (
-    EPISODE_SCHEMA_VERSION,
     DATASET_SPECS,
+    EPISODE_SCHEMA_VERSION,
     SOURCE_FRAME_DATASET_NAMES,
     validate_data_layout,
 )
@@ -47,11 +44,9 @@ _MAX_PROVENANCE_VALUE_BYTES = 4096
 def normalize_provenance_metadata(
     provenance: Mapping[str, object] | None,
 ) -> dict[str, str]:
-    """Validate recorder-owned, scalar episode provenance attributes.
+    """Validate scalar episode provenance attributes.
 
-    Provenance is deliberately separate from camera metadata: the recorder
-    owns the ``provenance_*`` namespace and callers may not repurpose it to
-    override schema or camera fields.
+    The ``provenance_*`` namespace cannot override schema or camera metadata.
     """
     if provenance is None:
         return {}
@@ -68,15 +63,13 @@ def normalize_provenance_metadata(
             or key.startswith("provenance_")
         ):
             raise ValueError(
-                "provenance keys must be non-empty ASCII identifiers without "
-                "the provenance_ prefix"
+                "provenance keys must be non-empty ASCII identifiers without the provenance_ prefix"
             )
         if not isinstance(value, str):
             raise TypeError("provenance values must be strings")
         if len(value.encode("utf-8")) > _MAX_PROVENANCE_VALUE_BYTES:
             raise ValueError(
-                "provenance values must be at most "
-                f"{_MAX_PROVENANCE_VALUE_BYTES} UTF-8 bytes"
+                f"provenance values must be at most {_MAX_PROVENANCE_VALUE_BYTES} UTF-8 bytes"
             )
         normalized[key] = value
     return normalized
@@ -103,10 +96,7 @@ def _validate_explicit_episode_name(episode_name: str) -> None:
 
 
 class EpisodeRecorder:
-    """Coordinate one transactional episode around a dedicated data writer.
-
-    Lifecycle: start_episode() → add_frame() × N → finish_episode()
-    """
+    """Write raw episodes through start_episode(), add_frame(), and finish_episode()."""
 
     def __init__(
         self,
@@ -163,11 +153,7 @@ class EpisodeRecorder:
     @property
     def resources_released(self) -> bool:
         """Whether storage owners and temporary transaction files were released."""
-        return (
-            self._camera_writer is None
-            and self._data_writer is None
-            and self._temp_dir is None
-        )
+        return self._camera_writer is None and self._data_writer is None and self._temp_dir is None
 
     @property
     def is_recording(self) -> bool:
@@ -230,9 +216,7 @@ class EpisodeRecorder:
             ep_dir = self.data_dir / episode_name
             tmp_dir = self.data_dir / f".tmp_{episode_name}"
             if ep_dir.exists() or tmp_dir.exists():
-                raise FileExistsError(
-                    f"explicit episode name already exists: {ep_dir}"
-                )
+                raise FileExistsError(f"explicit episode name already exists: {ep_dir}")
 
         self._episode_dir = str(ep_dir)
         self._temp_dir = str(tmp_dir)
@@ -264,9 +248,7 @@ class EpisodeRecorder:
         p = self._pending_meta
         meta.attrs["task_label"] = p.get("task_label", "")
         meta.attrs["operator"] = p.get("operator", "")
-        meta.attrs["control_hz"] = (
-            self.control_hz
-        )  # nominal grid rate; dt = 1/control_hz
+        meta.attrs["control_hz"] = self.control_hz  # nominal grid rate; dt = 1/control_hz
         meta.attrs["fps"] = self.control_hz
         meta.attrs["camera_payload_mode"] = "depth_to_color_aligned_rgbd"
         self._write_camera_meta_attrs(meta)
@@ -290,9 +272,7 @@ class EpisodeRecorder:
         if camera_name is not None:
             meta.attrs["camera_name"] = str(camera_name)
         camera_geometry = p.get("camera_geometry")
-        if camera_geometry is not None and not isinstance(
-            camera_geometry, RGBDGeometry
-        ):
+        if camera_geometry is not None and not isinstance(camera_geometry, RGBDGeometry):
             raise TypeError("camera_geometry must be an RGBDGeometry instance")
         if calib is not None and camera_name is not None:
             # Verify a supplied serial against the named calibration entry.
@@ -305,9 +285,9 @@ class EpisodeRecorder:
                 T_xarm_base_from_color = np.asarray(
                     calib_meta["camera_T_world_camera"], dtype=np.float64
                 ).reshape(4, 4)
-                meta.attrs["camera_T_xarm_base_from_color"] = (
-                    T_xarm_base_from_color.reshape(-1).tolist()
-                )
+                meta.attrs["camera_T_xarm_base_from_color"] = T_xarm_base_from_color.reshape(
+                    -1
+                ).tolist()
                 meta.attrs["camera_T_xarm_base_from_depth"] = (
                     (T_xarm_base_from_color @ camera_geometry.T_color_from_depth)
                     .reshape(-1)
@@ -318,13 +298,9 @@ class EpisodeRecorder:
                     calib_meta["camera_T_eef_camera"], dtype=np.float64
                 ).reshape(4, 4)
                 meta.attrs["camera_T_eef_from_depth"] = (
-                    (T_eef_from_color @ camera_geometry.T_color_from_depth)
-                    .reshape(-1)
-                    .tolist()
+                    (T_eef_from_color @ camera_geometry.T_color_from_depth).reshape(-1).tolist()
                 )
-            meta.attrs["camera_calibration_source_optical_frame"] = (
-                "camera_color_optical"
-            )
+            meta.attrs["camera_calibration_source_optical_frame"] = "camera_color_optical"
 
         if camera_geometry is not None:
             meta.attrs["camera_depth_intrinsics"] = (
@@ -332,9 +308,7 @@ class EpisodeRecorder:
             )
             meta.attrs["camera_depth_width"] = camera_geometry.depth.width
             meta.attrs["camera_depth_height"] = camera_geometry.depth.height
-            meta.attrs["camera_depth_distortion_model"] = (
-                camera_geometry.depth.distortion_model
-            )
+            meta.attrs["camera_depth_distortion_model"] = camera_geometry.depth.distortion_model
             meta.attrs["camera_depth_distortion_coeffs"] = list(
                 camera_geometry.depth.distortion_coeffs
             )
@@ -343,15 +317,13 @@ class EpisodeRecorder:
             )
             meta.attrs["camera_color_width"] = camera_geometry.color.width
             meta.attrs["camera_color_height"] = camera_geometry.color.height
-            meta.attrs["camera_color_distortion_model"] = (
-                camera_geometry.color.distortion_model
-            )
+            meta.attrs["camera_color_distortion_model"] = camera_geometry.color.distortion_model
             meta.attrs["camera_color_distortion_coeffs"] = list(
                 camera_geometry.color.distortion_coeffs
             )
-            meta.attrs["camera_T_color_from_depth"] = (
-                camera_geometry.T_color_from_depth.reshape(-1).tolist()
-            )
+            meta.attrs["camera_T_color_from_depth"] = camera_geometry.T_color_from_depth.reshape(
+                -1
+            ).tolist()
             meta.attrs["camera_geometry_frame_semantics"] = (
                 "native_depth_and_native_color_optical_frames"
             )
@@ -363,14 +335,12 @@ class EpisodeRecorder:
             meta.attrs["depth_scale"] = float(depth_scale)
 
     def add_frame(self, frame: EpisodeFrame) -> bool:
-        """Append an owned control sample; no secondary resampling or state model."""
+        """Append one control sample as one row without resampling."""
         if not self._recording:
             return False
 
         if self._frame_count >= self.max_frames:
-            logger.warning(
-                "Episode reached max_frames=%d, auto-stopping.", self.max_frames
-            )
+            logger.warning("Episode reached max_frames=%d, auto-stopping.", self.max_frames)
             self._max_frames_reached = True
             return False
 
@@ -396,9 +366,7 @@ class EpisodeRecorder:
             return False
         return True
 
-    def _camera_payload(
-        self, frame: EpisodeFrame
-    ) -> tuple[np.ndarray, np.ndarray]:
+    def _camera_payload(self, frame: EpisodeFrame) -> tuple[np.ndarray, np.ndarray]:
         """Every recorded row carries a complete camera sample."""
         rgb = frame.camera_rgb
         depth = frame.camera_depth
@@ -407,7 +375,6 @@ class EpisodeRecorder:
         return rgb, depth
 
     def _ensure_hdf5(self) -> None:
-        """Lazily create the ``data.h5`` owner for the active temp directory."""
         if self._data_writer is not None:
             return
         if self._temp_dir is None:
@@ -431,29 +398,23 @@ class EpisodeRecorder:
         self._pending_rows.clear()
 
     def finish_episode(
-        self, save: bool = True, reason: str = "", *, failure_note: str = "",
-        deadline_monotonic_ns: int | None = None
+        self,
+        save: bool = True,
+        reason: str = "",
+        *,
+        failure_note: str = "",
+        deadline_monotonic_ns: int | None = None,
     ) -> str | None:
-        """Synchronously finish one episode and return its reserved final path.
+        """Finish synchronously and return the reserved final path, including on discard.
 
-        ``save=True`` validates the collected rows and publishes atomically; a
-        technically complete short prefix is a valid episode (``min_frames_met``
-        is a quality label, not an admission gate). Zero source rows are never
-        published as success: a save request downgrades to a clean discard of
-        the empty staging. Discard also returns the reserved path, although no
-        raw episode is published there. Failure raises after cleanup; once
-        every writer confirmed release, the failed transaction's staging is
-        retained under an ``incomplete_*`` name with a failure note instead of
-        being destroyed.
+        Saving validates rows and publishes atomically. Short complete episodes are
+        allowed: ``min_frames_met`` is a quality label, not an admission gate.
+        Empty episodes are discarded. Failures raise after cleanup; staging is kept
+        as ``incomplete_*`` only after all writers release their resources.
 
-        A non-empty ``failure_note`` marks an episode that ended by itself
-        (writer/sampling failure, transport corruption, shutdown while
-        recording) rather than by an explicit operator discard. Those close
-        their partial staging under the same ``incomplete_*`` name even when
-        the finalization itself completes cleanly — only a discard with no
-        failure identity is destructive, and an empty staging is never kept.
-        The caller must serialize this operation with all other recorder
-        access.
+        A non-empty ``failure_note`` also preserves non-empty interrupted staging
+        when finalization succeeds. A clean operator discard deletes staging.
+        The caller must serialize this operation with all other recorder access.
         """
         if self._finishing:
             raise RuntimeError("episode finalization is still active")
@@ -474,8 +435,11 @@ class EpisodeRecorder:
         self._finishing = True
         try:
             self._finish_episode_transaction(
-                save, reason, truncated, failure_note=failure_note,
-                deadline_monotonic_ns=deadline_monotonic_ns
+                save,
+                reason,
+                truncated,
+                failure_note=failure_note,
+                deadline_monotonic_ns=deadline_monotonic_ns,
             )
         finally:
             self._finishing = False
@@ -493,27 +457,22 @@ class EpisodeRecorder:
         """Finalize one transaction; retain any resource that failed cleanup."""
         failure = None
         try:
-            self._finalize_episode_files(save, reason, truncated, deadline_monotonic_ns=deadline_monotonic_ns)
+            self._finalize_episode_files(
+                save, reason, truncated, deadline_monotonic_ns=deadline_monotonic_ns
+            )
         except Exception as exc:
             failure = exc
             logger.error("episode finalization failed", exc_info=True)
             try:
-                self._write_aborted_manifest(
-                    reason=reason, error=f"{type(exc).__name__}: {exc}"
-                )
+                self._write_aborted_manifest(reason=reason, error=f"{type(exc).__name__}: {exc}")
             except Exception:
-                logger.error(
-                    "failed to publish aborted episode manifest", exc_info=True
-                )
+                logger.error("failed to publish aborted episode manifest", exc_info=True)
             try:
                 if self._camera_writer is not None:
                     self._camera_writer.close()
             except Exception:
                 logger.warning("camera writer cleanup failed", exc_info=True)
-            if (
-                self._camera_writer is not None
-                and self._camera_writer.resources_released
-            ):
+            if self._camera_writer is not None and self._camera_writer.resources_released:
                 self._camera_writer = None
             try:
                 if self._data_writer is not None:
@@ -522,7 +481,7 @@ class EpisodeRecorder:
             except Exception:
                 logger.warning("HDF5 cleanup failed", exc_info=True)
         finally:
-            # Retain handles and staging while an owner may still access them.
+            # Keep staging in place until both writers have closed.
             if self._camera_writer is None and self._data_writer is None:
                 try:
                     if self._temp_dir is not None:
@@ -532,19 +491,13 @@ class EpisodeRecorder:
                             else failure_note
                         )
                         if failure is not None or (note and self._frame_count > 0):
-                            # Automatic-failure / interrupted retention: the
-                            # transaction never published, so keep the closed
-                            # partial staging under an explicit incomplete name
-                            # for offline inspection. Only an explicit operator
-                            # discard (no failure identity) is destructive, and
-                            # an empty staging is never worth keeping.
+                            # Preserve failed partial episodes for offline diagnosis.
                             self._preserve_incomplete_staging(
                                 self._temp_dir,
                                 reason=reason,
                                 error=note,
                             )
                         else:
-                            # Clean explicit discard (save=False) stays destructive.
                             self._discard_temp_files(self._temp_dir)
                 except Exception as exc:
                     failure = exc
@@ -552,18 +505,17 @@ class EpisodeRecorder:
                 else:
                     self._reset_episode_state()
         if failure is not None:
-            raise EpisodeFinalizationError(
-                f"{type(failure).__name__}: {failure}"
-            ) from failure
+            raise EpisodeFinalizationError(f"{type(failure).__name__}: {failure}") from failure
 
     def _finalize_episode_files(
         self,
         save: bool,
         reason: str,
         truncated: bool,
-        *, deadline_monotonic_ns: int | None = None,
+        *,
+        deadline_monotonic_ns: int | None = None,
     ) -> None:
-        """Close, validate, and publish files before releasing staging ownership."""
+        """Close and verify files before atomic publication."""
         duration = time.perf_counter() - (self._start_time or 0.0)
 
         writer = self._camera_writer
@@ -607,22 +559,22 @@ class EpisodeRecorder:
             meta.attrs["has_timestamps"] = "timestamp" in data_writer.datasets
             meta.attrs["camera_stream_frames"] = camera_frame_count
             meta.attrs["truncated"] = bool(truncated)
-            meta.attrs["stop_reason"] = reason or (
-                "max_frames" if truncated else "manual"
-            )
+            meta.attrs["stop_reason"] = reason or ("max_frames" if truncated else "manual")
             # Repeat the camera snapshot during finalization before the handle closes.
             self._write_camera_meta_attrs(meta)
 
         data_writer.update_meta(_write_final_meta)
         data_writer.close()
         self._data_writer = None
-        # Atomically rename the temporary directory into its final location.
         _final = self._episode_dir
         _tmp = self._temp_dir
         if _tmp is not None and _final is not None:
             if save:
                 self._validate_temp_episode(Path(_tmp), self._frame_count)
-                if deadline_monotonic_ns is not None and time.monotonic_ns() >= deadline_monotonic_ns:
+                if (
+                    deadline_monotonic_ns is not None
+                    and time.monotonic_ns() >= deadline_monotonic_ns
+                ):
                     raise TimeoutError("episode close exceeded its original finalization deadline")
                 atomic_publish(_tmp, _final)
                 self._last_finish_saved = True
@@ -643,10 +595,8 @@ class EpisodeRecorder:
         self._camera_writer = None
         self._last_timestamp_s = None
 
-    # ── Atomic file finalisation ──────────────────────────────────────
-
     def _write_aborted_manifest(self, *, reason: str, error: str) -> Path:
-        """Persist only small failure provenance; never retain partial payloads."""
+        """Write a small failure report without embedding sample payloads."""
         episode_name = Path(self._episode_dir or "aborted_episode_unknown").name
         target = self.data_dir / f"{episode_name}.aborted.json"
         suffix = 1
@@ -679,17 +629,13 @@ class EpisodeRecorder:
             if meta is None or int(meta.attrs.get("num_frames", -1)) != expected_frames:
                 raise RuntimeError("data.h5 frame count metadata mismatch")
             if int(meta.attrs.get("schema_version", -1)) != EPISODE_SCHEMA_VERSION:
-                raise RuntimeError(
-                    "new writer produced an unexpected raw schema version"
-                )
+                raise RuntimeError("new writer produced an unexpected raw schema version")
             datasets = {
                 key: dataset
                 for key, dataset in data_h5.items()
                 if isinstance(dataset, h5py.Dataset)
             }
-            dataset_shapes = {
-                key: tuple(dataset.shape) for key, dataset in datasets.items()
-            }
+            dataset_shapes = {key: tuple(dataset.shape) for key, dataset in datasets.items()}
             dataset_dtypes = {key: dataset.dtype for key, dataset in datasets.items()}
             layout_errors = validate_data_layout(
                 dataset_shapes,
@@ -697,9 +643,7 @@ class EpisodeRecorder:
                 frame_count=expected_frames,
             )
             if layout_errors:
-                raise RuntimeError(
-                    "data.h5 episode layout mismatch: " + "; ".join(layout_errors)
-                )
+                raise RuntimeError("data.h5 episode layout mismatch: " + "; ".join(layout_errors))
         for key in ("depth",):
             with h5py.File(paths[key], "r") as sidecar:
                 if key not in sidecar or int(sidecar[key].shape[0]) != expected_frames:
@@ -714,20 +658,15 @@ class EpisodeRecorder:
             shutil.rmtree(tmp)
 
     def _preserve_incomplete_staging(self, tmp: str, *, reason: str, error: str) -> None:
-        """Rename failed owned staging to an explicit incomplete location.
+        """Preserve failed partial episodes for offline diagnosis after all writers close.
 
-        Runs only after every writer confirmed resource release, so no active
-        owner can access the moved files. Only this transaction's staging is
-        touched; published user episodes are never inspected or relocated. The
-        retained directory is not a valid raw episode and is never published as
-        one — ``incomplete_*`` names stay outside ``episode_*`` discovery.
+        Only this episode's staging is renamed. ``incomplete_*`` directories are
+        not valid raw episodes and stay outside ``episode_*`` discovery.
         """
         staging = Path(tmp)
         if not staging.exists():
             return
-        episode_name = Path(
-            self._episode_dir or staging.name.removeprefix(".tmp_")
-        ).name
+        episode_name = Path(self._episode_dir or staging.name.removeprefix(".tmp_")).name
         target = self.data_dir / f"incomplete_{episode_name}"
         suffix = 1
         while target.exists():

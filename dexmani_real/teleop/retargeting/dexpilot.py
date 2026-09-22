@@ -1,21 +1,11 @@
-"""DexPilot retargeting with a human-flexion prior (in-repo subclass wrapper).
+"""DexPilot retargeting with a masked quadratic human-flexion prior.
 
-dex-retargeting 0.4.6 dropped the original DexPilot paper's open-hand
-regularizer ``γ·‖q‖²`` (the ``# gamma=2.5e-3`` parameter is commented out in
-``DexPilotOptimizer.__init__``) and keeps only a *gradient-only* temporal term
-``norm_delta·‖x − last_qpos‖²``.  That anchors the under-determined null-space
-(MCP/PIP distribution, thumb bend/rota distribution) to the previous frame, so
-it never collapses onto a natural-looking hand.
-
-This module restores a prior without touching site-packages: it subclasses
-``DexPilotOptimizer`` and wraps the per-frame objective so a prior
-``γ·Σ mask·(x − q_ref)²`` is added to **both** the scalar (so SLSQP's line
-search sees it) and the gradient.  ``q_ref`` is the *per-frame* human flexion
-reference (set via ``set_prior_reference`` before each ``retarget``), masked to
-the 10 flexion joints — this matches the robot's flexion to the operator's
-actual per-frame hand shape rather than a fixed pose. At ``prior_weight == 0``
-successful solves are numerically identical to the vanilla optimizer; solver
-errors propagate instead of returning the stale warm start.
+Adapted from dex-retargeting's ``DexPilotOptimizer`` and ``RetargetingConfig.build``.
+The prior ``γ·Σ mask·(x − q_ref)²`` enters both the scalar objective and gradient
+so SLSQP's line search sees it. The per-frame human reference ``q_ref`` is set
+before retargeting and masked to the 10 flexion joints, resolving ambiguous
+MCP/PIP and thumb bend/rotation distributions toward the operator's hand shape.
+A zero prior weight disables the prior; solver errors propagate.
 """
 
 from __future__ import annotations
@@ -48,7 +38,11 @@ class PriorDexPilotOptimizer(DexPilotOptimizer):
     """
 
     def __init__(
-        self, *args: Any, prior_weight: float = 0.0, prior_mask: np.ndarray | None = None, **kwargs: Any
+        self,
+        *args: Any,
+        prior_weight: float = 0.0,
+        prior_mask: np.ndarray | None = None,
+        **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
         self.prior_weight = float(prior_weight)
@@ -62,7 +56,9 @@ class PriorDexPilotOptimizer(DexPilotOptimizer):
         """Set the current frame's human-flexion reference (target/SDK order)."""
         self._prior_reference = np.asarray(q_prior, dtype=np.float64)
 
-    def get_objective_function(self, target_vector: np.ndarray, fixed_qpos: np.ndarray, last_qpos: np.ndarray):
+    def get_objective_function(
+        self, target_vector: np.ndarray, fixed_qpos: np.ndarray, last_qpos: np.ndarray
+    ):
         base = super().get_objective_function(target_vector, fixed_qpos, last_qpos)
         ref = self._prior_reference
         if ref is None or self.prior_mask is None or self.prior_weight <= 0:
@@ -85,7 +81,7 @@ class PriorDexPilotOptimizer(DexPilotOptimizer):
         fixed_qpos: np.ndarray,
         last_qpos: np.ndarray,
     ) -> np.ndarray:
-        """Optimize one frame without upstream's broad RuntimeError fallback."""
+        """Optimize one frame, propagating solver errors."""
         if len(fixed_qpos) != len(self.idx_pin2fixed):
             raise ValueError(
                 f"Optimizer has {len(self.idx_pin2fixed)} joints but "
@@ -107,19 +103,14 @@ def build_dexpilot_retargeting(
     prior_weight: float,
     prior_mask: np.ndarray | None,
 ) -> SeqRetargeting:
-    """Build a DexPilot ``SeqRetargeting`` with the human-flexion prior.
+    """Build a DexPilot sequence retargeter with the human-flexion prior.
 
-    Mirrors the ``dexpilot`` branch of ``RetargetingConfig.build()``
-    (site-packages ``retargeting_config.py``), but constructs
-    ``PriorDexPilotOptimizer`` instead of ``DexPilotOptimizer``.  ``config``
-    must be a validated ``RetargetingConfig`` (from ``from_dict`` / the YAML).
-
-    The XHand URDF has no ``<mimic>`` joints, so the mimic-adaptor branch is
-    normally dead here; it is retained for parity with upstream in case the URDF
-    ever gains one.
+    ``config`` must come from ``RetargetingConfig.from_dict`` or its YAML loader.
     """
     robot_urdf = urdf.URDF.load(
-        config.urdf_path, add_dummy_free_joints=config.add_dummy_free_joint, build_scene_graph=False
+        config.urdf_path,
+        add_dummy_free_joints=config.add_dummy_free_joint,
+        build_scene_graph=False,
     )
     urdf_name = config.urdf_path.split(os.path.sep)[-1]
     temp_dir = tempfile.mkdtemp(prefix="dex_retargeting-")
@@ -131,7 +122,11 @@ def build_dexpilot_retargeting(
     if config.add_dummy_free_joint and config.target_joint_names is not None:
         joint_names = DUMMY_JOINT_NAMES + config.target_joint_names
     else:
-        joint_names = config.target_joint_names if config.target_joint_names is not None else robot.dof_joint_names
+        joint_names = (
+            config.target_joint_names
+            if config.target_joint_names is not None
+            else robot.dof_joint_names
+        )
 
     optimizer = PriorDexPilotOptimizer(
         robot,
@@ -151,7 +146,9 @@ def build_dexpilot_retargeting(
     else:
         lp_filter = None
 
-    has_mimic_joints, source_names, mimic_names, multipliers, offsets = parse_mimic_joint(robot_urdf)
+    has_mimic_joints, source_names, mimic_names, multipliers, offsets = parse_mimic_joint(
+        robot_urdf
+    )
     if has_mimic_joints and not config.ignore_mimic_joint:
         adaptor = MimicJointKinematicAdaptor(
             robot,

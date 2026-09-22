@@ -73,9 +73,7 @@ def read_live_state_and_error(arm_api: Any) -> LiveStateError:
     _check_sdk_return_code(code, "get_state")
     code, values = arm_api.get_err_warn_code()
     _check_sdk_return_code(code, "get_err_warn_code")
-    return LiveStateError(
-        state=int(state), error_code=int(values[0]), warn_code=int(values[1])
-    )
+    return LiveStateError(state=int(state), error_code=int(values[0]), warn_code=int(values[1]))
 
 
 def _wait_controller_ready(
@@ -114,9 +112,7 @@ def _enter_mode(arm_api: Any, mode: int) -> None:
     _wait_controller_ready(arm_api, expected_mode=mode, timeout_s=1.0)
 
 
-def _decode_joint_states(
-    code: Any, states: Any
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _decode_joint_states(code: Any, states: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Validate position, velocity, and SDK effort at the driver boundary."""
     _check_sdk_return_code(code, "get_joint_states")
     if not isinstance(states, (list, tuple)) or len(states) < 3:
@@ -125,13 +121,13 @@ def _decode_joint_states(
     qvel = np.asarray(states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
     tau = np.asarray(states[2], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
     if any(v.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(v)) for v in (qpos, qvel, tau)):
-        raise RuntimeError("get_joint_states returned invalid qpos/qvel/tau shape or non-finite values")
+        raise RuntimeError(
+            "get_joint_states returned invalid qpos/qvel/tau shape or non-finite values"
+        )
     return qpos, qvel, tau
 
 
-def _estimate_segment_timeout_s(
-    start: np.ndarray, target: np.ndarray, cfg: ArmParams
-) -> float:
+def _estimate_segment_timeout_s(start: np.ndarray, target: np.ndarray, cfg: ArmParams) -> float:
     """Deadline for one firmware-planned home milestone, including settle time."""
     delta_rad = float(np.max(np.abs(np.asarray(target) - np.asarray(start))))
     nominal_s = delta_rad / max(cfg.homing.max_speed_rad_per_s, 1e-6)
@@ -179,18 +175,14 @@ class XArm7:
                 logging.getLogger("origin.print").setLevel(logging.WARNING)
                 self._api = XArmAPI(self.cfg.ip, is_radian=True)
         except Exception as exc:
-            vendor_detail = (
-                sdk_connect_output.text if sdk_connect_output is not None else ""
-            )
+            vendor_detail = sdk_connect_output.text if sdk_connect_output is not None else ""
             raise RuntimeError(
                 f"connect failed: {exc}"
                 + (f"; vendor output:\n{vendor_detail}" if vendor_detail else "")
             ) from exc
         sdk_diagnostics = extract_native_diagnostics(sdk_connect_output.text)
         if sdk_diagnostics:
-            logger.warning(
-                "xArm SDK initialization diagnostics:\n%s", "\n".join(sdk_diagnostics)
-            )
+            logger.warning("xArm SDK initialization diagnostics:\n%s", "\n".join(sdk_diagnostics))
 
         self._wait_for_axis_report()
         self._check_controller_error()
@@ -287,8 +279,7 @@ class XArm7:
         def _converged(target: np.ndarray, q: np.ndarray, v: np.ndarray, tol_rad: float) -> bool:
             return (
                 float(np.max(np.abs(q - target))) <= tol_rad
-                and float(np.max(np.abs(v)))
-                <= self.cfg.homing.velocity_convergence_rad_s
+                and float(np.max(np.abs(v))) <= self.cfg.homing.velocity_convergence_rad_s
             )
 
         def _publish(target: np.ndarray, q: np.ndarray, v: np.ndarray, t: np.ndarray) -> None:
@@ -299,9 +290,7 @@ class XArm7:
             stable_since = time.monotonic()
             while time.monotonic() - stable_since < self.cfg.homing.dwell_s:
                 _raise_abort()
-                time.sleep(
-                    min(self.cfg.homing.step_interval_s, self.cfg.homing.dwell_s)
-                )
+                time.sleep(min(self.cfg.homing.step_interval_s, self.cfg.homing.dwell_s))
                 q, v, t = self.read()
                 if self.read_live_error_code() != 0:
                     raise RuntimeError("controller error during home dwell")
@@ -313,18 +302,13 @@ class XArm7:
         qpos, qvel, _tau = self.read()
 
         if len(waypoints) == 0:
-            if not _converged(
-                final_qpos, qpos, qvel, self.cfg.homing.convergence_rad
-            ):
+            if not _converged(final_qpos, qpos, qvel, self.cfg.homing.convergence_rad):
                 raise RuntimeError("empty home path while away from canonical home")
             _dwell(final_qpos)
             self.enter_mode6()
             return
 
-        if (
-            float(np.max(np.abs(qpos - waypoints[0])))
-            > self.cfg.homing.convergence_rad
-        ):
+        if float(np.max(np.abs(qpos - waypoints[0]))) > self.cfg.homing.convergence_rad:
             raise RuntimeError("current state moved too far from planned path start")
 
         targets = waypoints[1:]
@@ -422,9 +406,7 @@ class XArm7:
                 break
             time.sleep(0.05)
         if self.axis != ARM_JOINT_SHAPE[0]:
-            raise RuntimeError(
-                f"device reports {self.axis} axes, expected {ARM_JOINT_SHAPE[0]}"
-            )
+            raise RuntimeError(f"device reports {self.axis} axes, expected {ARM_JOINT_SHAPE[0]}")
 
     def _check_controller_error(self) -> None:
         """Refuse to proceed on a pre-existing controller error; warn is diagnostic."""
@@ -436,9 +418,7 @@ class XArm7:
                 "refusing to clear"
             )
         if live.warn_code != 0:
-            logger.warning(
-                "xarm7: startup controller warn=%d (diagnostic only)", live.warn_code
-            )
+            logger.warning("xarm7: startup controller warn=%d (diagnostic only)", live.warn_code)
 
     def _apply_config(self) -> None:
         """Apply collision sensitivity, TCP load, and the Mode 6 joint acc cap."""

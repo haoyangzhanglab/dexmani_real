@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Collection, Iterable
 
-from dexmani_real.runtime.safety import SafetyState, RunEndReason, revoke_motion, transition
+from dexmani_real.runtime.safety import RunEndReason, SafetyState, revoke_motion, transition
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -49,8 +49,7 @@ def _finalize_shutdown_state(
         for item in exits
     )
     service_worker_failed = any(
-        (item.exitcode != 0 or item.escalation != "graceful")
-        and item.name in service_process_names
+        (item.exitcode != 0 or item.escalation != "graceful") and item.name in service_process_names
         for item in exits
     )
     faulted = (
@@ -102,10 +101,11 @@ def stop_processes_verified(
     # Fence before any blocking join; record the software end if still RUNNING.
     if int(shared.safety_state.value) == int(SafetyState.RUNNING):
         revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
-    if (shared.is_recording.value and
-            (shared.error_state.value or shared.estop_request.value
-             or shared.workflow_failed.value)):
+    if shared.is_recording.value and (
+        shared.error_state.value or shared.estop_request.value or shared.workflow_failed.value
+    ):
         from dexmani_real.recording.client import write_recording_failure
+
         write_recording_failure(shared, "invalid session interrupted recording")
     shared.is_running.value = False
     exits: list[ProcessExit] = []

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 import tempfile
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,20 +12,20 @@ import numpy as np
 import zarr
 
 from dexmani_real.dataset.contracts import (
-    ProcessingConfig,
     EpisodeAnnotation,
+    ProcessingConfig,
     policy_array_specs,
     validate_task_name,
 )
+from dexmani_real.dataset.pointcloud import load_raw_episode_camera_model
 from dexmani_real.dataset.processing import (
-    validate_episode,
     discover_episode_dirs,
     iter_policy_blocks,
     load_annotations,
     policy_semantics,
     validate_annotation_task_name_override,
+    validate_episode,
 )
-from dexmani_real.dataset.pointcloud import load_raw_episode_camera_model
 from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 
@@ -63,7 +63,11 @@ class PolicyZarrExportConfig:
 
 
 def _validate_staged_policy_zarr(
-    staging: Path, *, attrs: dict, specs: dict, episode_ends: list[int],
+    staging: Path,
+    *,
+    attrs: dict,
+    specs: dict,
+    episode_ends: list[int],
     chunk_frames: int,
 ) -> None:
     """Check persisted structure before atomic publication."""
@@ -73,15 +77,20 @@ def _validate_staged_policy_zarr(
     if dict(root.attrs) != attrs:
         raise ValueError("staged policy required attributes mismatch")
     data, meta = root["data"], root["meta"]
-    if (set(data.array_keys()) != set(specs) or set(data.group_keys())
-            or set(meta.array_keys()) != {"episode_ends"} or set(meta.group_keys())):
+    if (
+        set(data.array_keys()) != set(specs)
+        or set(data.group_keys())
+        or set(meta.array_keys()) != {"episode_ends"}
+        or set(meta.group_keys())
+    ):
         raise ValueError("staged policy array keys mismatch")
     ends = meta["episode_ends"]
     if ends.shape != (len(episode_ends),) or ends.dtype != np.dtype("int64"):
         raise ValueError("staged episode_ends shape/dtype mismatch")
     for start in range(0, len(episode_ends), chunk_frames):
-        if not np.array_equal(ends[start:start + chunk_frames],
-                              episode_ends[start:start + chunk_frames]):
+        if not np.array_equal(
+            ends[start : start + chunk_frames], episode_ends[start : start + chunk_frames]
+        ):
             raise ValueError("staged episode_ends mismatch")
     if not episode_ends or np.any(np.diff([0, *episode_ends]) <= 0):
         raise ValueError("episode_ends must be positive and strictly increasing")
@@ -146,10 +155,7 @@ def export_raw_to_zarr(
                         or annotation.task_name
                         or reader.h5f["meta"].attrs.get("task_label", "")
                     )
-                    if (
-                        config.expected_task_name is not None
-                        and task != config.expected_task_name
-                    ):
+                    if config.expected_task_name is not None and task != config.expected_task_name:
                         raise StaticSemanticsMismatch(
                             f"{episode.name}: task_name={task!r}, expected {config.expected_task_name!r}"
                         )
@@ -160,9 +166,7 @@ def export_raw_to_zarr(
                         camera.height,
                         camera.width,
                     )
-                    tails = {
-                        key: (shape[1:], dtype) for key, (shape, dtype) in specs.items()
-                    }
+                    tails = {key: (shape[1:], dtype) for key, (shape, dtype) in specs.items()}
                     attrs = dict(
                         schema_name=POLICY_ZARR_SCHEMA_NAME,
                         schema_version=POLICY_ZARR_SCHEMA_VERSION,
@@ -184,18 +188,13 @@ def export_raw_to_zarr(
                         )
                     # Bound image/cloud working memory even at native camera resolution.
                     row_bytes = sum(
-                        int(np.prod(tail)) * dtype.itemsize
-                        for tail, dtype in tails.values()
+                        int(np.prod(tail)) * dtype.itemsize for tail, dtype in tails.values()
                     )
-                    chunk = min(
-                        config.chunk_frames, max(1, (64 * 1024 * 1024) // row_bytes)
-                    )
+                    chunk = min(config.chunk_frames, max(1, (64 * 1024 * 1024) // row_bytes))
                     if not dry_run and root is None:
                         target.parent.mkdir(parents=True, exist_ok=True)
                         staging = Path(
-                            tempfile.mkdtemp(
-                                prefix=f".{target.name}.tmp-", dir=target.parent
-                            )
+                            tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent)
                         )
                         root = zarr.open_group(str(staging), mode="w")
                         root.attrs.update(first_attrs)
@@ -253,7 +252,10 @@ def export_raw_to_zarr(
                 "episode_ends", data=np.asarray(ends, dtype=np.int64)
             )
             _validate_staged_policy_zarr(
-                staging, attrs=first_attrs, specs=first_specs, episode_ends=ends,
+                staging,
+                attrs=first_attrs,
+                specs=first_specs,
+                episode_ends=ends,
                 chunk_frames=config.chunk_frames,
             )
             atomic_publish(staging, target)

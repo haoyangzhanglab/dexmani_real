@@ -27,11 +27,7 @@ EEF_POSE_ALGORITHM_ID = "xarm7_custom_eef_pinocchio_fk_v1"
 
 @lru_cache(maxsize=1)
 def make_arm_fk() -> "ArmFK":
-    """Return the shared, URDF-consistent arm FK (cached per process).
-
-    The arm worker no longer computes EEF; any consumer that needs the EEF
-    pose derives it from ``qpos`` through this single factory.
-    """
+    """Return cached per-process FK for deriving the URDF EEF pose from arm qpos."""
     return ArmFK(_ARM_FK_URDF)
 
 
@@ -87,20 +83,16 @@ def compute_eef_pose_history_xarm_base(
     *,
     arm_fk: "ArmFK | None" = None,
 ) -> np.ndarray:
-    """Return finite ``[T,9]`` position+rot6d poses from aligned arm qpos.
+    """Return finite float64 ``[T,9]`` xArm-base position+rot6d poses from aligned qpos.
 
-    Shared canonical EEF history helper for policy dataset conversion and
-    deployment observation assembly: exactly one ``ArmFK.compute()`` per
-    timestep, reusing its rot6d without a second rotation conversion.  The
-    result is float64; callers cast to float32 at their storage/model
-    boundary.  ``eef_pose(t)`` must be derived from causally aligned measured
-    qpos, never from the xArm firmware Cartesian pose.
+    Compute FK once per timestep and reuse its rot6d; callers cast to float32
+    for storage or model input. Derive each pose from aligned measured qpos,
+    never from the xArm firmware Cartesian pose.
     """
     qpos_history = np.asarray(arm_qpos, dtype=np.float64)
     if qpos_history.ndim != 2 or qpos_history.shape[1] != ARM_JOINT_SHAPE[0]:
         raise ValueError(
-            f"arm qpos history must have shape (T, {ARM_JOINT_SHAPE[0]}), "
-            f"got {qpos_history.shape}"
+            f"arm qpos history must have shape (T, {ARM_JOINT_SHAPE[0]}), got {qpos_history.shape}"
         )
     if not np.all(np.isfinite(qpos_history)):
         raise ValueError("arm qpos history contains non-finite values")
@@ -157,7 +149,10 @@ class XArm7Kinematics:
         full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
         self.pinocchio_model.compute_forward_kinematics(full_qpos)
         link_pose = self.pinocchio_model.get_link_pose(self.eef_link_id)
-        return Pose(p=np.asarray(link_pose.p, dtype=np.float64), q=np.asarray(link_pose.q, dtype=np.float64))
+        return Pose(
+            p=np.asarray(link_pose.p, dtype=np.float64),
+            q=np.asarray(link_pose.q, dtype=np.float64),
+        )
 
     def compute_eef_pose_world(self, qpos: np.ndarray) -> Pose:
         pose_base = self.compute_eef_pose_base(qpos)
@@ -174,7 +169,8 @@ class XArm7Kinematics:
         full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
         self.pinocchio_model.compute_forward_kinematics(full_qpos)
         jacobian = np.asarray(
-            self.pinocchio_model.compute_single_link_jacobian(full_qpos, self.eef_link_id, False), dtype=np.float64
+            self.pinocchio_model.compute_single_link_jacobian(full_qpos, self.eef_link_id, False),
+            dtype=np.float64,
         )
         if jacobian.shape[1] < self.dof:
             raise RuntimeError(f"Jacobian has {jacobian.shape[1]} columns but dof is {self.dof}.")
@@ -203,7 +199,9 @@ class XArm7Kinematics:
             dtype=np.float64,
         )
         if jacobian_full.shape[1] < self.dof:
-            raise RuntimeError(f"Jacobian has {jacobian_full.shape[1]} columns but dof is {self.dof}.")
+            raise RuntimeError(
+                f"Jacobian has {jacobian_full.shape[1]} columns but dof is {self.dof}."
+            )
         jacobian_base = jacobian_full[:, : self.dof]
 
         # Pose (base frame) — extracted from already-computed FK, no extra FK call.
@@ -253,7 +251,9 @@ class XArm7Kinematics:
         det = float(np.linalg.det(JJT))
         return np.sqrt(max(det, 0.0))
 
-    def compute_world_pose_error(self, target_eef_pose_world: Pose, qpos: np.ndarray) -> tuple[float, float]:
+    def compute_world_pose_error(
+        self, target_eef_pose_world: Pose, qpos: np.ndarray
+    ) -> tuple[float, float]:
         return compute_pose_error(target_eef_pose_world, self.compute_eef_pose_world(qpos))
 
     def to_mplib_pose(self, pose: Pose) -> Any:

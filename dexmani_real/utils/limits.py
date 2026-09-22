@@ -52,9 +52,7 @@ def validate_hand_limit_nesting(
     if np.any(bounds["mechanical_lower"] < bounds["rated_lower"]) or np.any(
         bounds["mechanical_upper"] > bounds["rated_upper"]
     ):
-        raise ValueError(
-            f"{label} mechanical limits cannot exceed the rated device envelope"
-        )
+        raise ValueError(f"{label} mechanical limits cannot exceed the rated device envelope")
     if np.any(bounds["command_lower"] < bounds["mechanical_lower"]) or np.any(
         bounds["command_upper"] > bounds["mechanical_upper"]
     ):
@@ -75,9 +73,7 @@ def validate_hand_command_bounds(
     mech_lower = np.asarray(mechanical_lower, dtype=np.float64)
     mech_upper = np.asarray(mechanical_upper, dtype=np.float64)
     if command.shape != HAND_JOINT_SHAPE:
-        raise ValueError(
-            f"hand command must have shape {HAND_JOINT_SHAPE}, got {command.shape}"
-        )
+        raise ValueError(f"hand command must have shape {HAND_JOINT_SHAPE}, got {command.shape}")
     if not np.all(np.isfinite(command)):
         raise ValueError("hand command must be finite")
     if np.any(command < op_lower - 1e-12) or np.any(command > op_upper + 1e-12):

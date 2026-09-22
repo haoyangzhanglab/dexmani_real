@@ -7,9 +7,9 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 if TYPE_CHECKING:
-    from .arm_fk import XArm7Kinematics
     from ..collision import CollisionModel
     from ..planner import MotionPlanningConfig
+    from .arm_fk import XArm7Kinematics
 
 from ..collision import CollisionInfo
 from ..paths import wrap_nearest_equivalent
@@ -24,7 +24,9 @@ class IKGeometry:
       - dimos collision_step_size
     """
 
-    def __init__(self, kinematics: XArm7Kinematics, collision_model: CollisionModel | None = None) -> None:
+    def __init__(
+        self, kinematics: XArm7Kinematics, collision_model: CollisionModel | None = None
+    ) -> None:
         self.kin = kinematics
         self.dof = kinematics.dof
         self.joint_limits = kinematics.joint_limits
@@ -34,11 +36,15 @@ class IKGeometry:
         # Equivalent-joint masks already guarantee a range of at least 2π.
         self._periods_arr = np.where(self.equivalent_joint_mask, 2.0 * np.pi, 1.0)
 
-    def resolve_planning_limits(self, profile: MotionPlanningConfig, reference_qpos: np.ndarray | None = None) -> np.ndarray:
+    def resolve_planning_limits(
+        self, profile: MotionPlanningConfig, reference_qpos: np.ndarray | None = None
+    ) -> np.ndarray:
         if profile.planning_limits_deg is not None:
             limits = np.deg2rad(np.asarray(profile.planning_limits_deg, dtype=np.float64))
             if limits.shape != self.joint_limits.shape:
-                raise ValueError(f"planning_limits_deg must have shape {self.joint_limits.shape}, got {limits.shape}.")
+                raise ValueError(
+                    f"planning_limits_deg must have shape {self.joint_limits.shape}, got {limits.shape}."
+                )
             return limits
 
         limits = self.joint_limits.copy()
@@ -49,8 +55,12 @@ class IKGeometry:
         # Allow equivalent solutions near hardware limits by expanding the ±π window.
         mask = self.equivalent_joint_mask
         if np.any(mask):
-            limits[mask, 0] = np.maximum(self.joint_limits[mask, 0], reference_qpos[mask] - 3.0 * np.pi)
-            limits[mask, 1] = np.minimum(self.joint_limits[mask, 1], reference_qpos[mask] + 3.0 * np.pi)
+            limits[mask, 0] = np.maximum(
+                self.joint_limits[mask, 0], reference_qpos[mask] - 3.0 * np.pi
+            )
+            limits[mask, 1] = np.minimum(
+                self.joint_limits[mask, 1], reference_qpos[mask] + 3.0 * np.pi
+            )
         return limits
 
     def _periods(self) -> np.ndarray:
@@ -89,7 +99,9 @@ class IKGeometry:
             path[index] = self.canonicalize_qpos(path[index], path[index - 1], limits)
         return path
 
-    def snap_path_to_nearest_equivalent(self, path: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
+    def snap_path_to_nearest_equivalent(
+        self, path: np.ndarray, reference_qpos: np.ndarray
+    ) -> np.ndarray:
         path = np.asarray(path, dtype=np.float64).copy()
         if path.ndim != 2 or path.shape[1] != self.dof:
             raise ValueError(f"path must have shape (N, {self.dof}), got {path.shape}.")
@@ -220,7 +232,9 @@ class IKGeometry:
         if first:
             return {
                 "path_collision": True,
-                "path_self_collision": any(pair.collision_type != "environment" for pair in first.collision_pairs),
+                "path_self_collision": any(
+                    pair.collision_type != "environment" for pair in first.collision_pairs
+                ),
                 "collision_waypoint_index": 0,
                 "collision_waypoint_count": len(path),
                 "collision_step_size": collision_step_size,
@@ -231,7 +245,9 @@ class IKGeometry:
                 path[index], path[index + 1], collision_step_size
             ):
                 continue
-            info = self._find_combined_collision_in_segment(path[index], path[index + 1], collision_step_size)
+            info = self._find_combined_collision_in_segment(
+                path[index], path[index + 1], collision_step_size
+            )
             return {
                 "path_collision": True,
                 "path_self_collision": info is not None

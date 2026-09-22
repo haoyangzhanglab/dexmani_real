@@ -1,10 +1,4 @@
-"""ArUco eye-to-hand calibration math and persistence without device ownership.
-
-This module does not start cameras, open GUI windows, create worker processes,
-or publish robot commands. ``motion.py`` owns arm-motion state and command
-publication; ``session.py`` owns the
-interactive device, GUI, sampling, and cleanup lifecycle.
-"""
+"""ArUco eye-to-hand calibration math and result persistence."""
 
 from __future__ import annotations
 
@@ -91,10 +85,7 @@ class CalibrationConfig:
             value = float(getattr(self, field_name))
             if not np.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{field_name} must be finite and positive")
-        if (
-            not isinstance(self.status_interval_frames, int)
-            or self.status_interval_frames < 1
-        ):
+        if not isinstance(self.status_interval_frames, int) or self.status_interval_frames < 1:
             raise ValueError("status_interval_frames must be at least 1")
 
 
@@ -177,9 +168,7 @@ def draw_calibration_overlay(
                 flags=cv2.SOLVEPNP_IPPE_SQUARE,
             )
             if ok:
-                cv2.drawFrameAxes(
-                    image, intrinsics, distortion, rv, tv, marker_size_m * 0.5
-                )
+                cv2.drawFrameAxes(image, intrinsics, distortion, rv, tv, marker_size_m * 0.5)
                 detected = True
 
     color = (0, 200, 0) if detected else (0, 0, 255)
@@ -193,13 +182,9 @@ def draw_calibration_overlay(
         2,
     )
     hint = f"samples={n_samples}/{min_samples}  " + (
-        "ENTER=calibrate"
-        if n_samples >= min_samples
-        else f"SPACE=capture (need >={min_samples})"
+        "ENTER=calibrate" if n_samples >= min_samples else f"SPACE=capture (need >={min_samples})"
     )
-    cv2.putText(
-        image, hint, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2
-    )
+    cv2.putText(image, hint, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     return image, detected
 
 
@@ -217,13 +202,10 @@ def _calibrate_eye_to_hand(
     value is T_cam2base == T_base_camera.
     """
     rmat_ee2base = [
-        Rotation.from_euler("xyz", rpy, degrees=False).as_matrix()
-        for rpy in rpy_ee2base
+        Rotation.from_euler("xyz", rpy, degrees=False).as_matrix() for rpy in rpy_ee2base
     ]
     rmat_base2ee = [rmat.T for rmat in rmat_ee2base]
-    tvec_base2ee = [
-        (-rmat.T @ tv).reshape(3, 1) for rmat, tv in zip(rmat_ee2base, tvec_ee2base)
-    ]
+    tvec_base2ee = [(-rmat.T @ tv).reshape(3, 1) for rmat, tv in zip(rmat_ee2base, tvec_ee2base)]
     rmat_marker2cam = [cv2.Rodrigues(rv)[0] for rv in rvec_marker2camera]
     tvec_marker2cam = [tv.reshape(3, 1) for tv in tvec_marker2camera]
 
@@ -266,9 +248,7 @@ def _compute_closed_loop_errors(
         tvec_marker2camera,
     ):
         T_base_ee = np.eye(4)
-        T_base_ee[:3, :3] = Rotation.from_euler(
-            "xyz", rpy_ee, degrees=False
-        ).as_matrix()
+        T_base_ee[:3, :3] = Rotation.from_euler("xyz", rpy_ee, degrees=False).as_matrix()
         T_base_ee[:3, 3] = tvec_ee
 
         T_camera_marker = np.eye(4)
@@ -489,9 +469,7 @@ def save_camera_calibration(
         cam_name = f"camera_{idx}"
 
     if json_path.exists():
-        backup = json_path.with_suffix(
-            f".json.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
+        backup = json_path.with_suffix(f".json.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         # Copy before the atomic write so cameras.json is never briefly absent.
         shutil.copy2(json_path, backup)
         print(f"  backed up previous config → {backup.name}")
@@ -500,8 +478,6 @@ def save_camera_calibration(
     try:
         json.dumps(existing, allow_nan=False)
     except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "camera calibration payload must contain finite JSON values"
-        ) from exc
+        raise ValueError("camera calibration payload must contain finite JSON values") from exc
     atomic_json_dump(existing, json_path, ensure_ascii=False)
     print(f"  calibration written → {json_path} (camera: {cam_name})")

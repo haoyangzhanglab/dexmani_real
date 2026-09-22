@@ -1,12 +1,10 @@
-"""Worker-local XHand driver with intentionally single-shot runtime I/O.
+"""Worker-local XHand driver with one SDK call per runtime read or send.
 
-Runtime reads accept known sensor/CRC statuses only when their returned
-12-DoF joint payload is complete and finite.  Aggregate (``calc_force``) and
-dense (``raw_force``) tactile payloads carry independent validity so an RS485
-distributed-force drop keeps aggregate contact force usable.  Runtime sends
-make one SDK call.  A CRC response leaves delivery unconfirmed but does not
-stop the worker; other SDK errors remain rejected.  There is no retry,
-backoff, watchdog, or recovery state in this driver.
+Reads accept known sensor/CRC statuses only with complete, finite 12-DoF joint
+payloads. Aggregate (``calc_force``) and dense (``raw_force``) tactile validity
+are independent: an RS485 distributed-force drop leaves aggregate contact
+force usable. Send CRC responses leave delivery unconfirmed without stopping
+the worker; other SDK errors are rejected.
 """
 
 from __future__ import annotations
@@ -37,7 +35,6 @@ from dexmani_real.utils.log import (
 logger = get_logger(__name__)
 
 _SDK_PROTOCOL = {"ethercat": "EtherCAT", "serial": "RS485"}
-# Fixed, bounded driver policies; runtime config only carries deployment tuning.
 _OPEN_RETRIES = {"ethercat": 2, "serial": 3}
 _OPEN_RETRY_DELAY_S = 2.0
 _INITIAL_STATE_READ_ATTEMPTS = 3
@@ -49,9 +46,9 @@ _TEMPERATURE_UNAVAILABLE_CODE = 1_501_020
 READ_USABLE_CODES = frozenset(
     {
         0,
-        _COMBINED_FORCE_UNAVAILABLE_CODE,  # combined force unavailable
-        _DISTRIBUTED_FORCE_UNAVAILABLE_CODE,  # distributed force unavailable
-        _TEMPERATURE_UNAVAILABLE_CODE,  # temperature unavailable
+        _COMBINED_FORCE_UNAVAILABLE_CODE,
+        _DISTRIBUTED_FORCE_UNAVAILABLE_CODE,
+        _TEMPERATURE_UNAVAILABLE_CODE,
         _COMMUNICATION_CRC_ERROR_CODE,  # complete joint payload; tactile invalid
     }
 )
@@ -131,9 +128,7 @@ class XHandError(RuntimeError):
         self.operation = str(operation)
         self.code = int(code)
         self.message = str(message)
-        super().__init__(
-            f"XHand {self.operation} failed: code={self.code} msg={self.message}"
-        )
+        super().__init__(f"XHand {self.operation} failed: code={self.code} msg={self.message}")
 
 
 class XHandSendStatus(Enum):
@@ -146,7 +141,7 @@ class XHandSendStatus(Enum):
 
 @dataclass
 class XHandState:
-    """Validated feedback from one successful fresh SDK read."""
+    """Joint feedback and independently valid tactile payloads from one SDK read."""
 
     qpos: np.ndarray
     current_ma: np.ndarray
@@ -160,7 +155,7 @@ class XHandState:
 
 
 class XHand:
-    """Thin stateful adapter around one worker-local SDK controller."""
+    """Worker-local XHand SDK controller."""
 
     def __init__(self, config: HandParams):
         config.validate()
@@ -184,10 +179,7 @@ class XHand:
 
     @property
     def tactile_calibrated(self) -> bool:
-        return (
-            self._tactile_bias_aggregate is not None
-            and self._tactile_bias_dense is not None
-        )
+        return self._tactile_bias_aggregate is not None and self._tactile_bias_dense is not None
 
     def connect(self) -> None:
         """Open the configured device and seed its command buffer from live feedback."""
@@ -228,9 +220,7 @@ class XHand:
             if device_name is None:
                 devices, _ = self._captured_sdk_call(
                     "discovery",
-                    lambda: self._control.enumerate_devices(
-                        _SDK_PROTOCOL[self.cfg.comm_type]
-                    ),
+                    lambda: self._control.enumerate_devices(_SDK_PROTOCOL[self.cfg.comm_type]),
                 )
                 if not devices:
                     self._close_control()
@@ -242,9 +232,7 @@ class XHand:
                 device_name = devices[0]
 
             if self.cfg.comm_type == "serial":
-                open_call = lambda: self._control.open_serial(
-                    device_name, self.cfg.baudrate
-                )
+                open_call = lambda: self._control.open_serial(device_name, self.cfg.baudrate)
             else:
                 open_call = lambda: self._control.open_ethercat(device_name)
             error, output = self._captured_sdk_call(
@@ -304,9 +292,7 @@ class XHand:
         output = capture.text
         diagnostics = extract_native_diagnostics(output, ignore=ignore)
         if diagnostics:
-            logger.warning(
-                "XHand SDK %s diagnostics:\n%s", label, "\n".join(diagnostics)
-            )
+            logger.warning("XHand SDK %s diagnostics:\n%s", label, "\n".join(diagnostics))
         return result, output
 
     def _read_identity(self) -> None:
@@ -320,9 +306,7 @@ class XHand:
                 if _error_ok(error):
                     self.device_identity[key] = str(value)
                 else:
-                    logger.warning(
-                        "XHand %s unavailable: code=%s", key, _error_code(error)
-                    )
+                    logger.warning("XHand %s unavailable: code=%s", key, _error_code(error))
         except Exception:
             logger.warning("XHand identity incomplete", exc_info=True)
         logger.info(
@@ -356,9 +340,7 @@ class XHand:
 
     def _request_ethercat_init(self) -> None:
         if self.cfg.ethercat_slave_position < 0:
-            logger.warning(
-                "XHand EtherCAT slave position unknown; skipping explicit INIT request"
-            )
+            logger.warning("XHand EtherCAT slave position unknown; skipping explicit INIT request")
             return
         try:
             error, _ = self._control.set_firmware_state(
@@ -370,9 +352,7 @@ class XHand:
             if _error_ok(error):
                 time.sleep(0.2)
             else:
-                logger.debug(
-                    "XHand EtherCAT INIT request failed: code=%s", _error_code(error)
-                )
+                logger.debug("XHand EtherCAT INIT request failed: code=%s", _error_code(error))
         except Exception:
             logger.debug("XHand EtherCAT INIT request unavailable", exc_info=True)
 
@@ -401,9 +381,7 @@ class XHand:
         self._tactile_bias_aggregate = bias_aggregate
         self._tactile_bias_dense = bias_dense
         if not self._verify_tactile_bias():
-            logger.error(
-                "Tactile calibration failed post-bias verification; biases cleared"
-            )
+            logger.error("Tactile calibration failed post-bias verification; biases cleared")
             self._tactile_bias_aggregate = None
             self._tactile_bias_dense = None
             return False
@@ -438,12 +416,8 @@ class XHand:
                     "incomplete tactile data during bias capture",
                 )
             samples.append(state)
-        bias_aggregate = np.mean(
-            np.stack([sample.tactile_aggregate for sample in samples]), axis=0
-        )
-        bias_dense = np.mean(
-            np.stack([sample.tactile_dense for sample in samples]), axis=0
-        )
+        bias_aggregate = np.mean(np.stack([sample.tactile_aggregate for sample in samples]), axis=0)
+        bias_dense = np.mean(np.stack([sample.tactile_dense for sample in samples]), axis=0)
         return bias_aggregate, bias_dense
 
     def _verify_tactile_bias(self) -> bool:
@@ -457,11 +431,7 @@ class XHand:
         for _ in range(_TACTILE_VERIFY_SAMPLE_COUNT):
             time.sleep(_TACTILE_BIAS_SAMPLE_INTERVAL_S)
             state = self.get_state()
-            if (
-                state is None
-                or not state.tactile_aggregate_valid
-                or not state.tactile_dense_valid
-            ):
+            if state is None or not state.tactile_aggregate_valid or not state.tactile_dense_valid:
                 logger.warning("tactile post-bias verification frame invalid")
                 return False
             aggregate_peak = max(
@@ -510,9 +480,7 @@ class XHand:
 
         tactile_dense = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
         tactile_aggregate = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
-        aggregate_valid, dense_valid = _tactile_validity(
-            code, comm_type=self.cfg.comm_type
-        )
+        aggregate_valid, dense_valid = _tactile_validity(code, comm_type=self.cfg.comm_type)
         if aggregate_valid:
             try:
                 tactile_aggregate = self._parse_tactile_aggregate(raw_state)
@@ -605,9 +573,7 @@ class XHand:
         lower = np.asarray(self.cfg.mechanical_qpos_min_rad, dtype=np.float64)
         upper = np.asarray(self.cfg.mechanical_qpos_max_rad, dtype=np.float64)
         if np.any(qpos < lower - 1e-12) or np.any(qpos > upper + 1e-12):
-            raise ValueError(
-                "XHand.send_action target violates mechanical joint limits"
-            )
+            raise ValueError("XHand.send_action target violates mechanical joint limits")
 
     @staticmethod
     def _parse_joints(

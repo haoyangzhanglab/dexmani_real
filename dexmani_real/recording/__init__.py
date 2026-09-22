@@ -1,7 +1,7 @@
-"""Transactional episode recording and reading."""
+"""Raw episode recording and reading."""
 
-from .storage.reader import EpisodeReader, EpisodeTiming, MergedH5File
 from .recorder import EpisodeRecorder
+from .storage.reader import EpisodeReader, EpisodeTiming, MergedH5File
 
 __all__ = [
     "EpisodeReader",

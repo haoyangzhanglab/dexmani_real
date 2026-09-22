@@ -12,20 +12,20 @@ from scipy.spatial.transform import Rotation
 
 from dexmani_real.calibration.camera.solver import CalibrationConfig, CalibrationSamples
 from dexmani_real.config.experiment import ExperimentConfig
+from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
+from dexmani_real.planning import Pose, XArm7MotionPlanner
+from dexmani_real.planning.kinematics.pose import quat_multiply
 from dexmani_real.robot.arm_homing import ArmHomeConfig, execute_arm_home
+from dexmani_real.robot.commands import RobotCommand, publish_command
+from dexmani_real.robot.projection import project_arm_command
+from dexmani_real.runtime.observation import sample_is_fresh
+from dexmani_real.runtime.operator_input import KeyboardInput
+from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
 from dexmani_real.teleop.jog import (
     any_jog_key_held,
     compute_cartesian_jog_delta,
     limit_cartesian_pose_lead,
 )
-from dexmani_real.robot.projection import project_arm_command
-from dexmani_real.robot.commands import RobotCommand, publish_command
-from dexmani_real.runtime.observation import sample_is_fresh
-from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
-from dexmani_real.planning import Pose, XArm7MotionPlanner
-from dexmani_real.planning.kinematics.pose import quat_multiply
-from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
-from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
@@ -36,21 +36,19 @@ _IK_WARNING_INTERVAL_S = 1.0
 _BOUNDARY_WARN_INTERVAL_S = 2.0
 
 
-def read_initial_arm(
-    shared: RuntimeChannels, runtime: ExperimentConfig
-) -> dict[str, Any] | None:
+def read_initial_arm(shared: RuntimeChannels, runtime: ExperimentConfig) -> dict[str, Any] | None:
     deadline_s = time.monotonic() + float(runtime.safety.readiness_timeouts_s["arm"])
     while time.monotonic() < deadline_s:
         state = read_arm_state_dict(shared)
-        if state is not None and sample_is_fresh(state["timestamp_ns"], runtime.arm.feedback_max_age_s):
+        if state is not None and sample_is_fresh(
+            state["timestamp_ns"], runtime.arm.feedback_max_age_s
+        ):
             return state
         time.sleep(_INITIAL_STATE_POLL_S)
     return None
 
 
-def set_calibration_fault(
-    shared: RuntimeChannels, reason: str, *, estop: bool = False
-) -> None:
+def set_calibration_fault(shared: RuntimeChannels, reason: str, *, estop: bool = False) -> None:
     logger.error("Calibration fault: %s", reason)
     if estop:
         shared.estop_request.value = True
@@ -73,9 +71,7 @@ class CalibrationLoopState:
     last_boundary_warning_s: float = 0.0
 
     @classmethod
-    def from_arm_state(
-        cls, arm_state: dict[str, Any]
-    ) -> "CalibrationLoopState":
+    def from_arm_state(cls, arm_state: dict[str, Any]) -> "CalibrationLoopState":
         current_qpos = np.asarray(arm_state["qpos"], dtype=np.float64)
         return cls(
             samples=CalibrationSamples(),
@@ -114,9 +110,7 @@ def handle_calibration_home_key(
 
     if int(shared.safety_state.value) == int(SafetyState.RUNNING):
         if not revoke_motion(shared, SafetyState.ARMED):
-            set_calibration_fault(
-                shared, "failed to stop calibration motion before home"
-            )
+            set_calibration_fault(shared, "failed to stop calibration motion before home")
             return HomeKeyOutcome.FAULT
     home_result = execute_arm_home(
         shared,
@@ -171,8 +165,7 @@ def _reject_calibration_motion(
         shared.error_state.value
         or shared.estop_request.value
         or not shared.is_running.value
-        or int(shared.safety_state.value)
-        not in (int(SafetyState.ARMED), int(SafetyState.RUNNING))
+        or int(shared.safety_state.value) not in (int(SafetyState.ARMED), int(SafetyState.RUNNING))
     ):
         set_calibration_fault(shared, reason)
         return
@@ -208,9 +201,7 @@ def run_calibration_motion_tick(
     if safety_state not in (int(SafetyState.ARMED), int(SafetyState.RUNNING)):
         set_calibration_fault(shared, "unexpected calibration motion state")
         return
-    dx, drpy = compute_cartesian_jog_delta(
-        keys, calib_cfg.delta_pos_m, calib_cfg.delta_rpy_rad
-    )
+    dx, drpy = compute_cartesian_jog_delta(keys, calib_cfg.delta_pos_m, calib_cfg.delta_rpy_rad)
     moving = bool(np.any(dx != 0.0) or np.any(drpy != 0.0))
     if not moving:
         if safety_state == int(SafetyState.RUNNING):
@@ -274,8 +265,12 @@ def run_calibration_motion_tick(
         _reject_calibration_motion(shared, state, ik_result.reason or "IK rejected")
         return
 
-    q_cmd = project_arm_command(ik_result.qpos, state.current_qpos,
-        joint_lower_rad=runtime.arm.joint_limit_lower, joint_upper_rad=runtime.arm.joint_limit_upper)
+    q_cmd = project_arm_command(
+        ik_result.qpos,
+        state.current_qpos,
+        joint_lower_rad=runtime.arm.joint_limit_lower,
+        joint_upper_rad=runtime.arm.joint_limit_upper,
+    )
     if publish_command(shared, RobotCommand(epoch, q_cmd)):
         state.previous_command = q_cmd
 

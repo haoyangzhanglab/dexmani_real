@@ -6,17 +6,15 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
 
 from tqdm import tqdm
 
-from dexmani_real.dataset.contracts import ProcessingConfig, validate_task_name
 from dexmani_real.config.experiment import resolve_experiment_config
-from dataclasses import replace
+from dexmani_real.dataset.contracts import ProcessingConfig, validate_task_name
 from dexmani_real.dataset.export import (
     PolicyZarrExportConfig,
     export_raw_to_zarr,
@@ -105,21 +103,17 @@ def _resolve_output_path(
     """
     candidate = default_path if output is None else output
     resolved = candidate.expanduser().resolve(strict=False)
-    protected = [
-        (_REPO_ROOT / name).resolve(strict=False) for name in _PROTECTED_SOURCE_ROOTS
-    ]
+    protected = [(_REPO_ROOT / name).resolve(strict=False) for name in _PROTECTED_SOURCE_ROOTS]
     protected.append(input_root.expanduser().resolve(strict=False))
     for root in protected:
         if resolved == root or root in resolved.parents:
             raise ValueError(
-                f"output target {resolved} must not resolve inside the "
-                f"protected source {root}"
+                f"output target {resolved} must not resolve inside the protected source {root}"
             )
     for parent in resolved.parents:
         if parent.suffix == ".zarr" and parent.exists():
             raise ValueError(
-                f"output target {resolved} must not resolve inside the "
-                f"existing Zarr store {parent}"
+                f"output target {resolved} must not resolve inside the existing Zarr store {parent}"
             )
     # Return the path the checks actually resolved. Without the expansion a
     # ``~``-prefixed --output would be validated at the home directory and
@@ -130,17 +124,18 @@ def _resolve_output_path(
 def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:
     """Derive the policy store path and required task name from one input directory."""
 
-    task_name = input_root.parent.name if (input_root / "data.h5").exists() or input_root.name.startswith("episode_") else input_root.name
+    task_name = (
+        input_root.parent.name
+        if (input_root / "data.h5").exists() or input_root.name.startswith("episode_")
+        else input_root.name
+    )
     if not task_name or task_name in {".", ".."}:
-        raise ValueError(
-            "input_root must name one task directory, e.g. episodes/pick_place_toy"
-        )
+        raise ValueError("input_root must name one task directory, e.g. episodes/pick_place_toy")
     try:
         task_name = validate_task_name(task_name)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            "input_root must name one valid task directory, e.g. "
-            "episodes/pick_place_toy"
+            "input_root must name one valid task directory, e.g. episodes/pick_place_toy"
         ) from exc
     return Path("datasets") / f"{task_name}.zarr", task_name
 
@@ -175,9 +170,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         default_output_path, task_name = _resolve_task_paths(args.input_root)
         # Preflight and real export share the identical output contract.
-        output_path = _resolve_output_path(
-            args.output, default_output_path, args.input_root
-        )
+        output_path = _resolve_output_path(args.output, default_output_path, args.input_root)
         config = PolicyZarrExportConfig(
             chunk_frames=args.chunk_frames,
             compression_level=args.compression_level,
@@ -202,9 +195,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.pointcloud_num_points is not None:
             processing = replace(
                 processing,
-                pointcloud=replace(
-                    processing.pointcloud, num_points=args.pointcloud_num_points
-                ),
+                pointcloud=replace(processing.pointcloud, num_points=args.pointcloud_num_points),
             )
         report = export_raw_to_zarr(
             args.input_root,
@@ -236,7 +227,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{verb} {report['episode_count']} episode(s), {report['total_frames']} frames.",
         file=sys.stderr,
     )
-    print(f"Rejected {len(report['rejected_episodes'])} episode(s); excluded {len(report['excluded_episodes'])} by annotation.", file=sys.stderr)
+    print(
+        f"Rejected {len(report['rejected_episodes'])} episode(s); excluded {len(report['excluded_episodes'])} by annotation.",
+        file=sys.stderr,
+    )
     for rejected in report["rejected_episodes"]:
         print(f"  {rejected['episode']}: {rejected['reason']}", file=sys.stderr)
     return 0

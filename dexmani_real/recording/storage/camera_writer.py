@@ -1,8 +1,11 @@
 """Synchronous camera sidecars, owned by the recorder process."""
+
 from dataclasses import dataclass, field
 from pathlib import Path
+
 import h5py
 import numpy as np
+
 from dexmani_real.recording.storage.video import VideoEncoder, VideoEncoderConfig
 
 
@@ -14,7 +17,11 @@ class CameraStreamWriterConfig:
     video: VideoEncoderConfig = field(default_factory=VideoEncoderConfig)
 
     def __post_init__(self):
-        if len(self.rgb_shape) != 3 or self.rgb_shape[2] != 3 or self.depth_shape != self.rgb_shape[:2]:
+        if (
+            len(self.rgb_shape) != 3
+            or self.rgb_shape[2] != 3
+            or self.depth_shape != self.rgb_shape[:2]
+        ):
             raise ValueError("camera writer requires matching RGB and depth image planes")
         if not np.isfinite(self.fps) or self.fps <= 0:
             raise ValueError("camera writer fps must be finite and positive")
@@ -28,13 +35,20 @@ class CameraStreamWriter:
         self.resources_released = False
         directory = Path(directory)
         try:
-            h,w,_ = config.rgb_shape
-            self.encoder = VideoEncoder(directory / "rgb.mp4", config=config.video,
-                fps=config.fps, width=w, height=h)
+            h, w, _ = config.rgb_shape
+            self.encoder = VideoEncoder(
+                directory / "rgb.mp4", config=config.video, fps=config.fps, width=w, height=h
+            )
             self.depth_file = h5py.File(directory / "depth.h5", "w")
-            self.depth = self.depth_file.create_dataset("depth", shape=(0,*config.depth_shape),
-                maxshape=(None,*config.depth_shape), chunks=(1,*config.depth_shape),
-                dtype=np.uint16, compression="gzip", compression_opts=1)
+            self.depth = self.depth_file.create_dataset(
+                "depth",
+                shape=(0, *config.depth_shape),
+                maxshape=(None, *config.depth_shape),
+                chunks=(1, *config.depth_shape),
+                dtype=np.uint16,
+                compression="gzip",
+                compression_opts=1,
+            )
         except Exception:
             self.close()
             raise
@@ -42,8 +56,12 @@ class CameraStreamWriter:
     def write(self, rgb, depth):
         if self.resources_released:
             raise RuntimeError("camera writer is closed")
-        if (rgb.shape != self.config.rgb_shape or rgb.dtype != np.uint8
-                or depth.shape != self.config.depth_shape or depth.dtype != np.uint16):
+        if (
+            rgb.shape != self.config.rgb_shape
+            or rgb.dtype != np.uint8
+            or depth.shape != self.config.depth_shape
+            or depth.dtype != np.uint16
+        ):
             raise ValueError("RGB/depth shape or dtype mismatch")
         self.encoder.write_frame(rgb)
         self.depth.resize(self.frame_count + 1, axis=0)

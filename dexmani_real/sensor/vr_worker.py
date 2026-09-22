@@ -51,7 +51,12 @@ class VRReceiverConfig:
     @classmethod
     def from_runtime(cls, runtime: object) -> "VRReceiverConfig":
         cfg = getattr(runtime, "vr")
-        return cls(transport=str(cfg.transport), host=str(cfg.host), port=int(cfg.port), hand_side=str(cfg.hand_side))
+        return cls(
+            transport=str(cfg.transport),
+            host=str(cfg.host),
+            port=int(cfg.port),
+            hand_side=str(cfg.hand_side),
+        )
 
 
 def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
@@ -105,16 +110,16 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
     # vr_ready guarantees that the ring already contains one validated
     # right-hand frame; consumers may read it immediately after readiness.
 
-
     for event in client.iter_events():
         if not shared.is_running.value:
             break
 
-
         if isinstance(event, HeadFrame):
             try:
                 head_flu_pos = unity_left_to_flu_position(event.head.x, event.head.y, event.head.z)
-                head_flu_quat = unity_left_to_flu_rotation(event.head.qx, event.head.qy, event.head.qz, event.head.qw)
+                head_flu_quat = unity_left_to_flu_rotation(
+                    event.head.qx, event.head.qy, event.head.qz, event.head.qw
+                )
                 head_pos = _finite_vector(head_flu_pos, (3,), "head_pos")
                 head_quat_wxyz = _normalized_wxyz(xyzw_to_wxyz(*head_flu_quat), "head_quat_wxyz")
                 head_sequence_id = int(event.sequence_id)

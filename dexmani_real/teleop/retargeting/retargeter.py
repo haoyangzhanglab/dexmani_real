@@ -88,9 +88,7 @@ def _human_flexion_rad(landmarks: np.ndarray) -> np.ndarray:
             denominator = np.linalg.norm(first) * np.linalg.norm(second)
             if denominator <= 1e-12:
                 raise ValueError("landmarks contain a degenerate hand bone")
-            ang[joint_index] = np.arccos(
-                np.clip(np.sum(first * second) / denominator, -1.0, 1.0)
-            )
+            ang[joint_index] = np.arccos(np.clip(np.sum(first * second) / denominator, -1.0, 1.0))
         if finger_index == 0:
             flex[0] = ang[0]
             flex[1] = ang[1] + ang[2]
@@ -134,14 +132,12 @@ def validate_landmarks(keypoint_3d_array: np.ndarray) -> tuple[bool, str]:
     if index_length < 0.01 or pinky_length < 0.01:
         return False, "wrist-to-index/pinky MCP baseline is shorter than 1 cm"
     palm_sine = float(
-        np.linalg.norm(np.cross(index_basis, pinky_basis))
-        / (index_length * pinky_length)
+        np.linalg.norm(np.cross(index_basis, pinky_basis)) / (index_length * pinky_length)
     )
     if palm_sine < 0.1:
         return False, "palm basis is collinear"
     shortest_bone = min(
-        float(np.linalg.norm(points[child] - points[parent]))
-        for parent, child in _CONTIGUOUS_BONES
+        float(np.linalg.norm(points[child] - points[parent])) for parent, child in _CONTIGUOUS_BONES
     )
     if shortest_bone < 0.002:
         return False, "a retargeting bone is shorter than 2 mm"
@@ -222,9 +218,7 @@ def adaptive_retargeting_xhand(
 
     # Scale the wrist→MCP baseline independently.
     if palm_scale != 1.0:
-        landmarks[_PINKY_MCP] = (
-            landmarks[0] + (raw[_PINKY_MCP] - landmarks[0]) * palm_scale
-        )
+        landmarks[_PINKY_MCP] = landmarks[0] + (raw[_PINKY_MCP] - landmarks[0]) * palm_scale
 
     # Apply uniform scaling along MCP→PIP→DIP→TIP.
     mcp_to_pip = raw[_PINKY_PIP] - raw[_PINKY_MCP]
@@ -271,9 +265,7 @@ class DexPilotHandRetargeter:
         from dexmani_real.teleop.retargeting.dexpilot import build_dexpilot_retargeting
 
         config_path = (
-            ASSET_DIR
-            / "retargeting"
-            / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
+            ASSET_DIR / "retargeting" / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
         )
 
         with open(str(config_path), "r") as f:
@@ -284,8 +276,7 @@ class DexPilotHandRetargeter:
         configured_joint_names = tuple(cfg.get("target_joint_names", ()))
         if configured_joint_names != XHAND_SDK_JOINT_NAMES:
             raise ValueError(
-                "DexPilot target_joint_names must exactly match the canonical "
-                "XHand SDK joint order"
+                "DexPilot target_joint_names must exactly match the canonical XHand SDK joint order"
             )
 
         if self._dexpilot_config is not None:
@@ -297,9 +288,7 @@ class DexPilotHandRetargeter:
             )
 
         self._prior_weight = (
-            float(self._dexpilot_config.prior_weight)
-            if self._dexpilot_config is not None
-            else 0.0
+            float(self._dexpilot_config.prior_weight) if self._dexpilot_config is not None else 0.0
         )
         prior_mask = _SDK_FLEXION_MASK  # target order == SDK order
 
@@ -343,9 +332,7 @@ class DexPilotHandRetargeter:
         origin_indices = self.indices[0, :]
         task_indices = self.indices[1, :]
 
-        ref_value = (
-            scaled_landmarks[task_indices, :] - scaled_landmarks[origin_indices, :]
-        )
+        ref_value = scaled_landmarks[task_indices, :] - scaled_landmarks[origin_indices, :]
         return ref_value
 
     def retarget(self, landmarks: np.ndarray | None) -> np.ndarray | None:
@@ -379,9 +366,7 @@ class DexPilotHandRetargeter:
 
         ref_value = self._build_ref_value(mano_landmarks)
         try:
-            qpos = self.retargeter.retarget(
-                ref_value, fixed_qpos=self.fixed_joint_values
-            )
+            qpos = self.retargeter.retarget(ref_value, fixed_qpos=self.fixed_joint_values)
         except nlopt.RoundoffLimited:
             logger.warning("Retargeting roundoff limit reached — no target produced")
             return None
@@ -419,9 +404,7 @@ class DexPilotHandRetargeter:
                 idx = self.retargeter.optimizer.idx_pin2target
                 self.retargeter.last_qpos = qpos_retargeter[idx]
             else:
-                logger.warning(
-                    "initial_qpos contains NaN/Inf — falling back to neutral seed"
-                )
+                logger.warning("initial_qpos contains NaN/Inf — falling back to neutral seed")
 
 
 _FINGERTIP_INDICES = np.array([4, 8, 12, 16, 20], dtype=np.intp)
@@ -484,12 +467,8 @@ class TAGHandRetargeter:
             fingertip_frame_names=list(resolved_tip_names),
             joint_limits_lower=joint_lo,
             joint_limits_upper=joint_hi,
-            finger_lengths_robot=np.array(
-                tag_config.robot_finger_lengths, dtype=np.float64
-            ),
-            finger_lengths_human=np.array(
-                tag_config.human_finger_lengths, dtype=np.float64
-            ),
+            finger_lengths_robot=np.array(tag_config.robot_finger_lengths, dtype=np.float64),
+            finger_lengths_human=np.array(tag_config.human_finger_lengths, dtype=np.float64),
             finger_scale_boost=tag_config.finger_scale_boost,
             smooth_weight=tag_config.smooth_weight,
             ftol_abs_s1=tag_config.ftol_abs_s1,
@@ -532,9 +511,7 @@ class TAGHandRetargeter:
             return None
         valid, reason = validate_landmarks(landmarks)
         if not valid:
-            logger.warning(
-                "TAGHandRetargeter: landmarks rejected (%s) — holding position", reason
-            )
+            logger.warning("TAGHandRetargeter: landmarks rejected (%s) — holding position", reason)
             return None
 
         t0 = time.perf_counter() if self.debug else 0.0
@@ -543,17 +520,13 @@ class TAGHandRetargeter:
             wrist_rot = _estimate_palm_frame(landmarks)
             mano = landmarks @ wrist_rot @ _OPERATOR2MANO_RIGHT
         except (ValueError, np.linalg.LinAlgError):
-            logger.warning(
-                "TAGHandRetargeter: coordinate transform failed — holding position"
-            )
+            logger.warning("TAGHandRetargeter: coordinate transform failed — holding position")
             return None
 
         # Use the unscaled landmarks for the human-flexion prior.
         q_prior_model = None
         if self._prior_weight > 0:
-            q_prior_model = _human_flexion_sdk_reference(mano)[
-                self._mapping_sdk_to_model
-            ]
+            q_prior_model = _human_flexion_sdk_reference(mano)[self._mapping_sdk_to_model]
 
         mano = adaptive_retargeting_xhand(
             mano,

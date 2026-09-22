@@ -1,11 +1,15 @@
 """Project real control-row history into the public PolicySpec observation mapping."""
+
 from typing import Any
+
 import numpy as np
+
 from dexmani_real.deployment.config import FingertipAssemblerConfig
-from dexmani_real.planning.kinematics.arm_fk import make_arm_fk, compute_eef_pose_history_xarm_base
-from dexmani_real.planning.kinematics.hand_fk import HandKinematics
+from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base, make_arm_fk
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
+from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.sensor.camera.transforms import resize_rgb
+
 
 def _requested_observation_fields(policy_spec: Any) -> set[str]:
     """Return source names directly from the validated ordered Policy fields."""
@@ -45,10 +49,15 @@ def build_policy_observation(rows, policy_spec, *, fingertip_runtime=None):
     requested = _requested_observation_fields(policy_spec)
     if any(row.hand is None for row in rows):
         return None
-    for name, field in (("contact_force", "tactile_aggregate_valid"), ("tactile_force", "tactile_dense_valid")):
+    for name, field in (
+        ("contact_force", "tactile_aggregate_valid"),
+        ("tactile_force", "tactile_dense_valid"),
+    ):
         if name in requested and not all(bool(row.hand[field][0]) for row in rows):
             return None
-    joint = np.stack([np.concatenate((r.arm["qpos"][0], r.hand["qpos"][0])) for r in rows]).astype(np.float32)
+    joint = np.stack([np.concatenate((r.arm["qpos"][0], r.hand["qpos"][0])) for r in rows]).astype(
+        np.float32
+    )
     arrays = {"joint_state": joint}
     for name, field in (("contact_force", "tactile_aggregate"), ("tactile_force", "tactile_dense")):
         if name in requested:
@@ -59,16 +68,23 @@ def build_policy_observation(rows, policy_spec, *, fingertip_runtime=None):
         arrays["point_cloud"] = np.stack([r.point_cloud for r in rows])
     if "rgb" in requested:
         field = next(f for f in policy_spec.observation_fields if f.name == "rgb")
-        arrays["rgb"] = np.stack([resize_rgb(r.camera["rgb"], height=field.shape[0], width=field.shape[1]) for r in rows])
+        arrays["rgb"] = np.stack(
+            [resize_rgb(r.camera["rgb"], height=field.shape[0], width=field.shape[1]) for r in rows]
+        )
     if requested & {"eef_pose", "fingertip_points"}:
         arm_fk, hand_fk, cfg = fingertip_runtime
         poses = compute_eef_pose_history_xarm_base(joint[:, :7], arm_fk=arm_fk)
         arrays["eef_pose"] = poses.astype(np.float32)
         if "fingertip_points" in requested:
-            arrays["fingertip_points"] = compute_fingertip_history_xarm_base(joint[:, :7], joint[:, 7:],
-                hand_fk=hand_fk, handbase_position_eef_m=np.asarray(cfg.handbase_position_eef_m),
+            arrays["fingertip_points"] = compute_fingertip_history_xarm_base(
+                joint[:, :7],
+                joint[:, 7:],
+                hand_fk=hand_fk,
+                handbase_position_eef_m=np.asarray(cfg.handbase_position_eef_m),
                 handbase_quat_eef_wxyz=np.asarray(cfg.handbase_quat_eef_wxyz),
-                arm_fk=arm_fk, eef_pose_history=poses).astype(np.float32)
+                arm_fk=arm_fk,
+                eef_pose_history=poses,
+            ).astype(np.float32)
     result = {}
     for field in policy_spec.observation_fields:
         values = np.ascontiguousarray(arrays[field.name], dtype=field.dtype)

@@ -1,11 +1,13 @@
 """XHand SDK owner: direct absolute targets and independent tactile validity."""
-from queue import Empty
+
 import time
+from queue import Empty
+
 import numpy as np
 
 from dexmani_real.ipc.schema import HAND_STATE_DTYPE
-from dexmani_real.robot.commands import read_robot_command
 from dexmani_real.robot.command_validation import check_worker_hand_target
+from dexmani_real.robot.commands import read_robot_command
 from dexmani_real.robot.home import HomeResult
 from dexmani_real.runtime.safety import SafetyState, command_may_cross_sdk
 from dexmani_real.utils.log import get_logger
@@ -15,7 +17,9 @@ logger = get_logger(__name__)
 
 
 def _publish_feedback(shared, state, tactile_calibrated):
-    if any(np.shape(x) != (12,) or not np.isfinite(x).all() for x in (state.qpos, state.current_ma)):
+    if any(
+        np.shape(x) != (12,) or not np.isfinite(x).all() for x in (state.qpos, state.current_ma)
+    ):
         raise RuntimeError("unusable hand joint/current feedback")
     frame = np.zeros(1, dtype=HAND_STATE_DTYPE)
     frame["qpos"], frame["current"] = state.qpos, state.current_ma
@@ -28,11 +32,16 @@ def _publish_feedback(shared, state, tactile_calibrated):
 
 
 def _send_target(shared, hand, target, run_id, config, accepted, *, home=False):
-    issue = check_worker_hand_target(target,
+    issue = check_worker_hand_target(
+        target,
         mechanical_lower_rad=np.asarray(config.mechanical_qpos_min_rad),
-        mechanical_upper_rad=np.asarray(config.mechanical_qpos_max_rad))
-    if not command_may_cross_sdk(shared, run_id=run_id,
-            required_safety_state=SafetyState.ARMED if home else SafetyState.RUNNING):
+        mechanical_upper_rad=np.asarray(config.mechanical_qpos_max_rad),
+    )
+    if not command_may_cross_sdk(
+        shared,
+        run_id=run_id,
+        required_safety_state=SafetyState.ARMED if home else SafetyState.RUNNING,
+    ):
         return False
     if issue:
         raise RuntimeError(f"unsafe hand target: {issue}")
@@ -44,6 +53,7 @@ def _send_target(shared, hand, target, run_id, config, accepted, *, home=False):
 
 def hand_loop(shared, config):
     from dexmani_real.robot.drivers.xhand import XHand, XHandSendStatus
+
     hand = XHand(config)
     last_sequence = 0
     failure_started = None
@@ -68,8 +78,10 @@ def hand_loop(shared, config):
             failure_started = None
             if not hand.is_connected:
                 raise RuntimeError("XHand disconnected")
-            errors = tuple(tuple(getattr(state, name)) for name in
-                           ("commboard_err", "jointboard_err", "tipboard_err"))
+            errors = tuple(
+                tuple(getattr(state, name))
+                for name in ("commboard_err", "jointboard_err", "tipboard_err")
+            )
             if errors != previous_errors and any(any(row) for row in errors):
                 logger.warning("XHand board errors (comm, joint, tip): %s", errors)
             previous_errors = errors
@@ -82,8 +94,11 @@ def hand_loop(shared, config):
             if request is not None:
                 target, run_id, expires_ns = request
                 ok = time.monotonic_ns() < expires_ns and _send_target(
-                    shared, hand, target, run_id, config, XHandSendStatus.ACCEPTED, home=True)
-                shared.hand_home_result_q.put((run_id, HomeResult(ok, "" if ok else "home revoked or expired")))
+                    shared, hand, target, run_id, config, XHandSendStatus.ACCEPTED, home=True
+                )
+                shared.hand_home_result_q.put(
+                    (run_id, HomeResult(ok, "" if ok else "home revoked or expired"))
+                )
             else:
                 latest = read_robot_command(shared)
                 if latest is not None:
@@ -91,8 +106,14 @@ def hand_loop(shared, config):
                     if sequence != last_sequence:
                         last_sequence = sequence
                         if command.hand_qpos is not None:
-                            _send_target(shared, hand, command.hand_qpos, command.run_id,
-                                         config, XHandSendStatus.ACCEPTED)
+                            _send_target(
+                                shared,
+                                hand,
+                                command.hand_qpos,
+                                command.run_id,
+                                config,
+                                XHandSendStatus.ACCEPTED,
+                            )
             rate.wait()
     except Exception:
         shared.error_state.value = True

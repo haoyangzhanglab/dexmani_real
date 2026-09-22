@@ -172,9 +172,7 @@ class SharedMemoryRingBuffer:
         self._total_size = self._HEADER_SIZE + maxlen * self._slot_size
 
         if create:
-            self._shm = shared_memory.SharedMemory(
-                name=name, create=True, size=self._total_size
-            )
+            self._shm = shared_memory.SharedMemory(name=name, create=True, size=self._total_size)
         else:
             self._shm = shared_memory.SharedMemory(name=name)
 
@@ -216,11 +214,7 @@ class SharedMemoryRingBuffer:
         Args:
             data: A one-element structured array matching ``self.dtype`` exactly.
         """
-        if (
-            not isinstance(data, np.ndarray)
-            or data.shape != (1,)
-            or data.dtype != self.dtype
-        ):
+        if not isinstance(data, np.ndarray) or data.shape != (1,) or data.dtype != self.dtype:
             raise ValueError(
                 f"ring {self.name!r} requires ndarray shape=(1,) dtype={self.dtype}; "
                 f"got shape={getattr(data, 'shape', None)} "
@@ -249,9 +243,7 @@ class SharedMemoryRingBuffer:
         for _attempt in range(2):
             idx = int(self._write_idx_view()[0])
             slot = self._data_buf[idx]
-            seqlock = SeqlockSlot(
-                self._shm.buf, self._HEADER_SIZE + idx * self._slot_size
-            )
+            seqlock = SeqlockSlot(self._shm.buf, self._HEADER_SIZE + idx * self._slot_size)
             marker1 = seqlock.marker
             if marker1 == 0 and idx == 0 and int(self._write_seq[0]) == 0:
                 return None
@@ -282,17 +274,13 @@ class SharedMemoryRingBuffer:
         )
         for _attempt in range(2):
             marker1 = seqlock.marker
-            if (
-                not seqlock_is_complete(marker1)
-                or seqlock_to_logical(marker1) != sequence
-            ):
+            if not seqlock_is_complete(marker1) or seqlock_to_logical(marker1) != sequence:
                 return None
             timestamp_ns = seqlock.timestamp_ns
             data = slot["data"].copy().reshape(1)
             if seqlock.verify(marker1) and seqlock_to_logical(marker1) == sequence:
                 return data, timestamp_ns, sequence
         return None
-
 
     @property
     def latest_sequence(self) -> int:
@@ -328,18 +316,16 @@ class SharedMemoryRingBuffer:
     def _init_header(self) -> None:
         """Initialize the header region with zeros."""
         self._header[:] = 0
-        np.ndarray(
-            (1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_SLOT_SIZE
-        )[0] = np.uint64(self._slot_size)
-        np.ndarray(
-            (1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAXLEN
-        )[0] = np.uint64(self.maxlen)
+        np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_SLOT_SIZE)[0] = (
+            np.uint64(self._slot_size)
+        )
+        np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAXLEN)[0] = (
+            np.uint64(self.maxlen)
+        )
 
     def _write_idx_view(self) -> np.ndarray:
         """Return a writeable view of the write_idx as a uint64 array of length 1."""
-        return np.ndarray(
-            (1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_WRITE_IDX
-        )
+        return np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_WRITE_IDX)
 
     def _warn_torn_read(self) -> None:
         now_ns = time.monotonic_ns()

@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import math
 import shutil
-import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -24,19 +23,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
 import numpy as np
 import pyrealsense2 as rs
 from scipy.spatial.transform import Rotation as R
 
-from dexmani_real.calibration.table import fit_table_plane, publish_table_plane
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
-from dexmani_real.config.pointcloud import PointCloudConfig
+from dexmani_real.calibration.table import fit_table_plane, publish_table_plane
 from dexmani_real.config.experiment import ExperimentConfig, resolve_experiment_config
+from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
+from dexmani_real.sensor.camera.realsense import (
+    L515DepthConfig,
+    RealSenseCamera,
+    RealSenseCameraConfig,
+)
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
     POINT_CLOUD_POLICY_ID,
@@ -45,11 +45,6 @@ from dexmani_real.sensor.pointcloud import (
     aligned_depth_points_in_base,
     build_point_cloud_with_stats,
     build_raw_point_cloud,
-)
-from dexmani_real.sensor.camera.realsense import (
-    L515DepthConfig,
-    RealSenseCamera,
-    RealSenseCameraConfig,
 )
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
 
@@ -352,9 +347,7 @@ def _save_diagnostic_snapshot(
         "point_cloud_columns": ["x_m", "y_m", "z_m", "r", "g", "b"],
         "raw_point_cloud_semantics": "all_finite_nonzero_aligned_depth_pixels",
         "processed_point_cloud_empty": processed_cloud.shape[0] == 0,
-        "camera": {
-            key: str(camera_info.get(key, "")) for key in ("name", "serial", "firmware")
-        },
+        "camera": {key: str(camera_info.get(key, "")) for key in ("name", "serial", "firmware")},
         "arrays": {
             name: {"shape": list(value.shape), "dtype": str(value.dtype)}
             for name, value in arrays.items()
@@ -419,15 +412,11 @@ def _print_device_info(camera: RealSenseCamera) -> dict:
 
     preset = depth_sensor.get_option(rs.option.visual_preset)
     try:
-        preset_name = depth_sensor.get_option_value_description(
-            rs.option.visual_preset, preset
-        )
+        preset_name = depth_sensor.get_option_value_description(rs.option.visual_preset, preset)
     except RuntimeError:
         preset_name = "unknown"
     print(f"  Runtime preset: {preset} {preset_name}")
-    print(
-        f"  Depth scale:    {camera.get_depth_scale():.6f} (raw_uint16 x scale = meters)"
-    )
+    print(f"  Depth scale:    {camera.get_depth_scale():.6f} (raw_uint16 x scale = meters)")
 
     print("\n  --- Sensor read-back ---")
     for name, opt in _SENSOR_OPTIONS:
@@ -459,9 +448,7 @@ def _capture_frame(
         raise RuntimeError("aligned RGB and depth frame dimensions do not match")
 
     print(f"  RGB:     shape={rgb.shape}, dtype={rgb.dtype}")
-    print(
-        f"  Depth:   shape={depth_m.shape}, valid={int((depth_m > 0).sum())}/{depth_m.size}"
-    )
+    print(f"  Depth:   shape={depth_m.shape}, valid={int((depth_m > 0).sum())}/{depth_m.size}")
     print(f"  Depth scale: {float(frame.depth_scale):.6f} m")
 
     return rgb, depth_raw, depth_m, capture_ms
@@ -668,9 +655,7 @@ def _benchmark_production_pipeline(
     """Measure processing and capture-to-cloud p50/p95 on fresh RGB-D frames."""
     elapsed_ms: list[float] = []
     end_to_end_ms: list[float] = []
-    stage_samples: dict[str, list[float]] = {
-        field: [] for field in _BUILD_TIMING_FIELDS
-    }
+    stage_samples: dict[str, list[float]] = {field: [] for field in _BUILD_TIMING_FIELDS}
     latest = np.zeros((0, 6), dtype=np.float32)
     for _ in range(frame_count):
         frame_started = time.perf_counter()
@@ -705,8 +690,7 @@ def _benchmark_production_pipeline(
         "end_to_end_max": float(np.max(end_to_end_values)),
     }
     stage_p95 = {
-        field: float(np.percentile(stage_samples[field], 95))
-        for field in _BUILD_TIMING_FIELDS
+        field: float(np.percentile(stage_samples[field], 95)) for field in _BUILD_TIMING_FIELDS
     }
     timings.update({f"{field}_p95": value for field, value in stage_p95.items()})
     print(
@@ -879,9 +863,7 @@ def main(argv: list[str] | None = None) -> int:
             table_plane_abcd = None
             table_plane_source = "disabled"
             all_timings["desk_calib"] = math.nan
-            print(
-                "  Table calibration skipped; table crop is disabled by runtime config."
-            )
+            print("  Table calibration skipped; table crop is disabled by runtime config.")
 
         # Use a post-calibration frame for the reported production result;
         # never apply a newly fitted plane to a stale pre-calibration frame.

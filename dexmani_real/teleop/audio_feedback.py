@@ -228,15 +228,9 @@ class AudioFeedback:
         for player_index, player in enumerate(players):
             with self._condition:
                 if request.generation != self._generation or self._closed:
-                    logger.debug(
-                        "Audio cancelled before start: event=%s", request.event
-                    )
+                    logger.debug("Audio cancelled before start: event=%s", request.event)
                     return
-            cmd = (
-                [player, "-q", request.path]
-                if player == "aplay"
-                else [player, request.path]
-            )
+            cmd = [player, "-q", request.path] if player == "aplay" else [player, request.path]
             proc: subprocess.Popen | None = None
             started_s = time.monotonic()
             try:
@@ -249,9 +243,7 @@ class AudioFeedback:
                     if request.generation != self._generation or self._closed:
                         proc.kill()
                         proc.communicate()
-                        logger.debug(
-                            "Audio cancelled during start: event=%s", request.event
-                        )
+                        logger.debug("Audio cancelled during start: event=%s", request.event)
                         return
                     self._current_proc = proc
                 logger.debug(
@@ -310,11 +302,7 @@ class AudioFeedback:
 def _stderr_text(stderr: bytes | str | None) -> str:
     if stderr is None:
         return ""
-    text = (
-        stderr.decode("utf-8", errors="replace")
-        if isinstance(stderr, bytes)
-        else str(stderr)
-    )
+    text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr)
     return " ".join(text.strip().split())[:_STDERR_LOG_LIMIT]
 
 

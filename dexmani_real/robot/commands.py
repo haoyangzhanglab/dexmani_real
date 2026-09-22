@@ -1,6 +1,7 @@
 """Latest absolute targets; lifecycle authority is checked at publication and SDK IO."""
-from dataclasses import dataclass
+
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -44,8 +45,9 @@ def read_robot_command(shared: Any) -> tuple[RobotCommand, int] | None:
 def publish_command(shared: Any, target: RobotCommand) -> int:
     """Return the host publication time, or zero when the motion epoch was revoked."""
     with shared.motion_lock:
-        if not command_may_cross_sdk(shared, run_id=target.run_id,
-                                     required_safety_state=SafetyState.RUNNING):
+        if not command_may_cross_sdk(
+            shared, run_id=target.run_id, required_safety_state=SafetyState.RUNNING
+        ):
             return 0
         frame = np.zeros(1, dtype=ROBOT_COMMAND_DTYPE)
         frame["run_id"] = target.run_id

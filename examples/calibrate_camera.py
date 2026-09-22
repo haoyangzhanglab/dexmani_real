@@ -17,10 +17,6 @@ from pathlib import Path
 
 import yaml
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
 from dexmani_real.calibration.camera.session import run_camera_calibration
 from dexmani_real.calibration.camera.solver import ARUCO_DICT_NAME, ArucoConfig
 from dexmani_real.config.experiment import resolve_experiment_config
@@ -55,8 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 60)
     print("  ArUco Hand-Eye Calibration — xArm7 + RealSense (eye-to-hand)")
     print(
-        f"  ArUco: {ARUCO_DICT_NAME} ID={aruco.target_id} "
-        f"size={aruco.marker_size_m * 1000:.1f}mm"
+        f"  ArUco: {ARUCO_DICT_NAME} ID={aruco.target_id} size={aruco.marker_size_m * 1000:.1f}mm"
     )
     print(f"  hand physical-state assertion: {args.hand_geometry}")
     print("=" * 60)
