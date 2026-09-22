@@ -909,6 +909,8 @@ Do not use zero-image placeholders to make a broken recording look complete.
 
 Static calibration and camera identity/depth scale remain episode metadata.
 
+When multiple raw episodes are exported into one canonical Zarr, batch-level static semantics must agree: image geometry/resolution, camera intrinsics/extrinsics, depth scale, nominal control dt, joint ordering, and other fixed representation-defining metadata. Reject a mixed batch with a clear reason rather than broadcasting per-episode calibration to every row or silently combining incompatible semantics.
+
 ## 16.3 Timing
 
 Raw timestamps are actual monotonic experiment timing.
@@ -973,7 +975,7 @@ This preserves compatibility with dexmani_policy, which currently treats joint_s
 
 Do not broadcast static calibration per frame.
 
-Store once in metadata/attrs where needed:
+Store once in metadata/attrs where needed. This assumes batch-level static semantics were checked consistent during export:
 
 - camera intrinsic;
 - camera extrinsic;
