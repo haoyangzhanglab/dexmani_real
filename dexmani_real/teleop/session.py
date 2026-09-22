@@ -115,7 +115,6 @@ def _build_processes(
             context.Process(name="hand", target=_hand_loop, args=(
                     shared,
                     runtime.hand,
-                    float(runtime.policy.hand_disconnect_timeout_s),
                 ))
         )
     return processes
@@ -131,7 +130,7 @@ def run_teleop_experiment(runtime, *, task_name=DEFAULT_TASK_NAME, operator="", 
         _validate_recording_resources(repo_root)
     ctx = mp.get_context("spawn")
     shared = RuntimeChannels.create(prefix=f"dexmani_collect_{os.getpid()}",
-        config=RuntimeChannelsConfig.from_runtime(runtime, camera_requested=runtime.policy.recording_enabled), mp_context=ctx)
+        config=RuntimeChannelsConfig.from_runtime(runtime), mp_context=ctx)
     started = []
     try:
         processes = _build_processes(ctx, shared, runtime, repo_root=repo_root, task_name=task_name,

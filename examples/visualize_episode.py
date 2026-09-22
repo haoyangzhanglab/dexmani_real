@@ -48,10 +48,7 @@ from dexmani_real.dataset.pointcloud import (
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
 )
-from dexmani_real.ipc.schema import (
-    SUPPORTED_POINT_CLOUD_COUNTS,
-    validate_point_cloud_array,
-)
+from dexmani_real.ipc.schema import validate_point_cloud_array
 from dexmani_real.recording import EpisodeReader, MergedH5File
 from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE
 from dexmani_real.utils.log import get_logger
@@ -639,7 +636,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--pointcloud-num-points",
         type=int,
-        choices=sorted(SUPPORTED_POINT_CLOUD_COUNTS),
         default=None,
         help="Override the current runtime point-cloud count.",
     )

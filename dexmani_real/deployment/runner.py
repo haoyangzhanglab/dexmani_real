@@ -47,6 +47,8 @@ class PolicyRunner:
         self.previous_arm = None
         self.completed = 0
         self.inference_ms = []
+        self.action_step_intervals_ms = []
+        self.previous_step_ns = None
         self.clip_count = 0
         self.max_clip_rad = 0.0
         self.publications = 0
@@ -120,6 +122,7 @@ class PolicyRunner:
                 self.shared.is_recording.value = False
             return
         self.run_id, self.started_ns = epoch
+        self.previous_step_ns = None
         self.shared.physical_home_completed.value = False
         self.history.clear()
         self.actions.clear()
@@ -199,6 +202,9 @@ class PolicyRunner:
         stamp = publish_command(self.shared, command) if self.execute else time.monotonic_ns()
         if not stamp:
             return
+        if self.previous_step_ns is not None:
+            self.action_step_intervals_ms.append((stamp - self.previous_step_ns) / 1e6)
+        self.previous_step_ns = stamp
         self.previous_arm = prepared_arm
         self.publications += 1
         self.next_step_ns = stamp + int(self.spec.control_dt_s*1e9)
@@ -215,9 +221,22 @@ class PolicyRunner:
             raise
         finally:
             self._finish("shutdown", incomplete=bool(self.shared.workflow_failed.value or self.shared.error_state.value or self.shared.estop_request.value))
-            logger.info("policy summary: steps=%d clipped=%d max_clip_rad=%.5f inference_mean_ms=%.2f",
-                self.publications, self.clip_count, self.max_clip_rad,
-                float(np.mean(self.inference_ms)) if self.inference_ms else 0)
+            self._log_summary()
+
+    def _log_summary(self):
+        def statistics(samples):
+            if not samples:
+                return "unavailable"
+            return "mean=%.2f p95=%.2f max=%.2f" % (np.mean(samples), np.percentile(samples, 95), np.max(samples))
+
+        mean_interval_ms = float(np.mean(self.action_step_intervals_ms)) if self.action_step_intervals_ms else 0.0
+        effective_hz = f"{1000 / mean_interval_ms:.2f}" if mean_interval_ms > 0 else "unavailable"
+        logger.info(
+            "policy summary: execute=%s steps=%d clipped=%d max_clip_rad=%.5f configured_action_hz=%.2f "
+            "inference_ms[n=%d %s] action_step_interval_ms[n=%d %s] effective_action_step_hz=%s",
+            self.execute, self.publications, self.clip_count, self.max_clip_rad, 1 / self.spec.control_dt_s,
+            len(self.inference_ms), statistics(self.inference_ms),
+            len(self.action_step_intervals_ms), statistics(self.action_step_intervals_ms), effective_hz)
 
 
 def policy_runner_loop(shared, runtime, config, execute, max_running_s=None, num_episodes=1,

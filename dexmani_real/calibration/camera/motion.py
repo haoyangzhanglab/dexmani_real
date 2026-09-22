@@ -42,7 +42,7 @@ def read_initial_arm(
     deadline_s = time.monotonic() + float(runtime.safety.readiness_timeouts_s["arm"])
     while time.monotonic() < deadline_s:
         state = read_arm_state_dict(shared)
-        if state is not None and sample_is_fresh(state["timestamp_ns"], runtime.policy.arm_state_stale_threshold_s):
+        if state is not None and sample_is_fresh(state["timestamp_ns"], runtime.arm.feedback_max_age_s):
             return state
         time.sleep(_INITIAL_STATE_POLL_S)
     return None

@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.recording.frame import EpisodeFrame
+from dexmani_real.recording.storage.schema import FRAME_OK, FRAME_IK_FAIL
 from dexmani_real.runtime.safety import (
     RunEndReason, SafetyState, revoke_motion,
 )
@@ -215,7 +216,13 @@ class RecorderClient:
             self.shared.record_sample_ring.write(frame)
             self._frame_count += 1
             if not self._stop_requested and self._max_frames and self._frame_count >= self._max_frames:
-                self.stop_episode(save=True, reason=self._max_frames_stop_reason)
+                status = sample.data["flag_frame_status"]
+                if status != FRAME_OK:
+                    self.technical_status = "invalid"
+                    self.stop_episode(save=True, reason="ik_failure" if status == FRAME_IK_FAIL else "retarget_failure",
+                                      retain_partial=True)
+                else:
+                    self.stop_episode(save=True, reason=self._max_frames_stop_reason)
             if self.shared.workflow_failed.value:
                 self._fail_recording("recorder transport lost during sample submission")
                 return False

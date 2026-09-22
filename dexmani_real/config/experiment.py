@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -153,6 +154,13 @@ def validate_config(cfg: ExperimentConfig) -> None:
         section.validate()
     # PointCloudConfig owns its external persisted-policy validation in its
     # constructor, shared with raw-to-policy conversion.
+    limiting_hz = min(cfg.arm.loop_hz, cfg.hand.loop_hz) if cfg.policy.hand_enabled else cfg.arm.loop_hz
+    for name, producer_hz, worker_hz in (
+        ("teleop.control_hz", cfg.teleop.control_hz, limiting_hz),
+        ("keyboard_teleop.control_hz", cfg.keyboard_teleop.control_hz, cfg.arm.loop_hz),
+    ):
+        if producer_hz > worker_hz and not math.isclose(producer_hz, worker_hz, rel_tol=1e-9, abs_tol=1e-9):
+            raise ValueError(f"{name}={producer_hz:g} Hz exceeds limiting worker rate {worker_hz:g} Hz")
     widths = np.diff(cfg.policy.workspace.as_array(), axis=1)
     if 2 * cfg.keyboard_teleop.workspace_command_margin_m >= float(widths.min()):
         raise ValueError(

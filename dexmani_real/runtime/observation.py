@@ -73,9 +73,9 @@ def read_observation(shared, runtime, *, require_hand=True, require_camera=False
     if ((require_camera or require_rgb_cloud_identity) and camera is None) or (require_vr and vr is None):
         return None
     now = time.monotonic_ns()
-    if not sample_is_fresh(arm["timestamp_ns"][0], runtime.policy.arm_state_stale_threshold_s, now):
+    if not sample_is_fresh(arm["timestamp_ns"][0], runtime.arm.feedback_max_age_s, now):
         return None
-    if hand is not None and not sample_is_fresh(hand["timestamp_ns"][0], runtime.policy.hand_state_stale_threshold_s, now):
+    if hand is not None and not sample_is_fresh(hand["timestamp_ns"][0], runtime.hand.feedback_max_age_s, now):
         return None
     if camera is not None and not sample_is_fresh(camera["timestamp_ns"], runtime.camera.max_frame_age_s, now):
         return None

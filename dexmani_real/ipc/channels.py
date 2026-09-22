@@ -19,7 +19,6 @@ from dexmani_real.ipc.schema import (
     ARM_STATE_DTYPE,
     ROBOT_COMMAND_DTYPE,
     HAND_STATE_DTYPE,
-    SUPPORTED_POINT_CLOUD_COUNTS,
     VR_FRAME_DTYPE,
     make_pointcloud_frame_dtype,
     make_record_sample_dtype,
@@ -53,8 +52,6 @@ class RuntimeChannelsConfig:
     hand_state_ring_maxlen: int = 8
     record_sample_ring_maxlen: int = 4
     pointcloud_num_points: int = 1024
-    camera_requested: bool = False
-    pointcloud_requested: bool = False
     pointcloud_ring_maxlen: int = 8
 
     camera_rgb_shape: tuple[int, int, int] = field(
@@ -80,18 +77,12 @@ class RuntimeChannelsConfig:
             raise ValueError("RuntimeChannels ring/queue capacities must be positive")
         if (
             isinstance(self.pointcloud_num_points, bool)
-            or int(self.pointcloud_num_points) not in SUPPORTED_POINT_CLOUD_COUNTS
+            or not isinstance(self.pointcloud_num_points, (int, np.integer))
+            or self.pointcloud_num_points <= 0
         ):
             raise ValueError(
-                "RuntimeChannels pointcloud_num_points must be one of "
-                f"{sorted(SUPPORTED_POINT_CLOUD_COUNTS)}"
+                "RuntimeChannels pointcloud_num_points must be a positive integer"
             )
-        if not isinstance(self.camera_requested, bool):
-            raise TypeError("RuntimeChannels camera_requested must be boolean")
-        if not isinstance(self.pointcloud_requested, bool):
-            raise TypeError("RuntimeChannels pointcloud_requested must be boolean")
-        if self.pointcloud_requested and not self.camera_requested:
-            raise ValueError("pointcloud_requested requires camera_requested")
 
     @classmethod
     def from_runtime(
@@ -99,17 +90,13 @@ class RuntimeChannelsConfig:
         runtime: object,
         *,
         pointcloud_num_points: int = 1024,
-        camera_requested: bool = False,
-        pointcloud_requested: bool = False,
     ) -> "RuntimeChannelsConfig":
         cam = getattr(runtime, "camera")
         return cls(
             camera_ring_maxlen=int(cam.ring_maxlen),
             camera_rgb_shape=(int(cam.height), int(cam.width), 3),
             camera_depth_shape=(int(cam.height), int(cam.width)),
-            pointcloud_num_points=int(pointcloud_num_points),
-            camera_requested=camera_requested,
-            pointcloud_requested=pointcloud_requested,
+            pointcloud_num_points=pointcloud_num_points,
         )
 
 
@@ -170,10 +157,6 @@ class RuntimeChannels:
     # reporting the session as failed.
     estop_request: Any  # policy -> arm/hand
     quit_requested: Any  # policy -> Main
-    camera_requested: (
-        Any  # Main -> camera; keep native RGB-D payload publication active
-    )
-    pointcloud_requested: Any  # Main -> pointcloud worker
     start_request: Any  # Main -> policy runner: B (start a new policy run)
     # Main/operator -> policy runner: true only after Main completed the
     # authorized hand-home + collision-checked arm-home sequence.
@@ -321,8 +304,6 @@ class RuntimeChannels:
         storage.error_state = ctx.Value("b", False)
         storage.estop_request = ctx.Value("b", False)
         storage.quit_requested = ctx.Value("b", False)
-        storage.camera_requested = ctx.Value("b", cfg.camera_requested)
-        storage.pointcloud_requested = ctx.Value("b", cfg.pointcloud_requested)
         storage.start_request = ctx.Value("b", False)
         storage.physical_home_completed = ctx.Value("b", False)
         storage.stop_request = ctx.Value("b", False)

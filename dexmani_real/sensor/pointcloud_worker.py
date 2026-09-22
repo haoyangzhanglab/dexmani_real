@@ -17,7 +17,6 @@ import numpy as np
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.ipc.schema import (
-    SUPPORTED_POINT_CLOUD_COUNTS,
     make_pointcloud_frame_dtype,
     validate_point_cloud_array,
 )
@@ -75,11 +74,6 @@ class PointCloudLoopConfig:
         if not isinstance(self.camera_calibration, CameraExtrinsics):
             raise TypeError(
                 "camera_calibration must be a preloaded CameraExtrinsics snapshot"
-            )
-        if self.pointcloud.num_points not in SUPPORTED_POINT_CLOUD_COUNTS:
-            raise ValueError(
-                "realtime point-cloud count must be one of "
-                f"{sorted(SUPPORTED_POINT_CLOUD_COUNTS)}"
             )
         if self.table_plane_abcd is not None:
             plane = tuple(float(value) for value in self.table_plane_abcd)
@@ -163,8 +157,6 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
     if not isinstance(config, PointCloudLoopConfig):
         raise TypeError("pointcloud_loop requires a PointCloudLoopConfig")
     cfg = config
-    if not bool(shared.pointcloud_requested.value):
-        raise RuntimeError("pointcloud_loop started without pointcloud_requested")
     expected_dtype = make_pointcloud_frame_dtype(cfg.pointcloud.num_points)
     if shared.pointcloud_ring.dtype != expected_dtype:
         raise RuntimeError(

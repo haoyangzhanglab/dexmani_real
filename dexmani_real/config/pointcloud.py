@@ -71,8 +71,10 @@ class PointCloudConfig:
     sampling_coarse_voxel_stride: int = 3
 
     def __post_init__(self) -> None:
+        if isinstance(self.num_points, bool) or not isinstance(self.num_points, (int, np.integer)) or self.num_points <= 0:
+            raise ValueError("num_points must be a positive integer")
+        object.__setattr__(self, "num_points", int(self.num_points))
         integer_fields = (
-            ("num_points", self.num_points, 1),
             ("depth_support_min_neighbors", self.depth_support_min_neighbors, 0),
             ("edge_support_min_neighbors", self.edge_support_min_neighbors, 0),
             ("table_object_seed_min_pixels", self.table_object_seed_min_pixels, 1),

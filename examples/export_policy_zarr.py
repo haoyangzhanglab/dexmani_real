@@ -17,7 +17,6 @@ from tqdm import tqdm
 from dexmani_real.dataset.contracts import ProcessingConfig, validate_task_name
 from dexmani_real.config.experiment import resolve_experiment_config
 from dataclasses import replace
-from dexmani_real.ipc.schema import SUPPORTED_POINT_CLOUD_COUNTS
 from dexmani_real.dataset.export import (
     PolicyZarrExportConfig,
     export_raw_to_zarr,
@@ -69,7 +68,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pointcloud-num-points",
         type=int,
-        choices=sorted(SUPPORTED_POINT_CLOUD_COUNTS),
         default=None,
     )
     parser.add_argument("--chunk-frames", type=int, default=100)

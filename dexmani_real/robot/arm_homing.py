@@ -155,7 +155,7 @@ def home_policy_robot(shared, runtime, planner, *, abort_requested):
     result = execute_arm_home(shared, runtime.arm.home_qpos, planner=planner,
         config=ArmHomeConfig.from_runtime(runtime), cancel_requested=abort_requested,
         estop_requested=lambda: bool(shared.estop_request.value), progress=print,
-        hand_state_max_age_s=runtime.policy.hand_state_stale_threshold_s if runtime.policy.hand_enabled else None)
+        hand_state_max_age_s=runtime.hand.feedback_max_age_s if runtime.policy.hand_enabled else None)
     if not result.ok:
         print(f"Home failed: {result.reason}", flush=True)
     return result.ok

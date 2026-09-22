@@ -1,7 +1,7 @@
 """PolicySpec compatibility and narrow policy-runtime configuration.
 
 Policy owns model shape, modality, horizon, and action-grid spacing. Real
-validates that spacing against its control frequency and owns safety timing.
+validates that cadence against actuator worker service rates.
 This module only validates their boundary and carries pickle-safe experiment
 identity into the spawned worker; it never imports Policy or Torch.
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +21,7 @@ from dexmani_real.config.pointcloud import (
     POINT_CLOUD_SAMPLING,
     POINT_CLOUD_TRANSFORM,
 )
-from dexmani_real.ipc.schema import (
-    POINT_CLOUD_FEATURE_DIM,
-    SUPPORTED_POINT_CLOUD_COUNTS,
-)
+from dexmani_real.ipc.schema import POINT_CLOUD_FEATURE_DIM
 from dexmani_real.planning.kinematics.arm_fk import (
     EEF_POSE_ALGORITHM_ID,
     EEF_POSE_DERIVATION,
@@ -97,10 +95,12 @@ def _validate_real_observation_capability(policy_spec: Any) -> tuple[Any, ...]:
                 len(shape) != 2
                 or shape[1] != POINT_CLOUD_FEATURE_DIM
                 or dtype != "float32"
-                or shape[0] not in SUPPORTED_POINT_CLOUD_COUNTS
+                or isinstance(shape[0], bool)
+                or not isinstance(shape[0], Integral)
+                or shape[0] <= 0
             ):
                 raise ValueError(
-                    "Policy point_cloud must be float32 [N, 6] with a supported N"
+                    "Policy point_cloud must be float32 [N, 6] with positive integer N"
                 )
         elif name == "rgb" and (
             len(shape) != 3
@@ -191,6 +191,10 @@ def _expected_eef_pose_semantics() -> dict[str, str]:
 
 def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> None:
     """Validate only whether Real can run the Policy-owned public contract."""
+    policy_hz = 1.0 / float(policy_spec.control_dt_s)
+    limiting_hz = min(runtime.arm.loop_hz, runtime.hand.loop_hz)
+    if policy_hz > limiting_hz and not math.isclose(policy_hz, limiting_hz, rel_tol=1e-9, abs_tol=1e-9):
+        raise ValueError(f"Policy action rate {policy_hz:g} Hz exceeds limiting worker rate {limiting_hz:g} Hz")
     fields = _validate_real_observation_capability(policy_spec)
     if policy_spec.requires_hand is not True:
         raise ValueError(

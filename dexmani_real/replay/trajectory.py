@@ -1,6 +1,7 @@
 """Current raw teleop targets for nominal-rate physical replay."""
 from dataclasses import dataclass
 from pathlib import Path
+import math
 import numpy as np
 from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.recording.storage.schema import FRAME_OK
@@ -47,6 +48,9 @@ def load_trajectory(episode_path):
 
 
 def verify_replay_preflight(trajectory, runtime):
+    limiting_hz = min(runtime.arm.loop_hz, runtime.hand.loop_hz)
+    if trajectory.fps > limiting_hz and not math.isclose(trajectory.fps, limiting_hz, rel_tol=1e-9, abs_tol=1e-9):
+        raise ValueError(f"Replay rate {trajectory.fps:g} Hz exceeds limiting worker rate {limiting_hz:g} Hz")
     if not runtime.policy.hand_enabled:
         raise ValueError("physical replay requires XHand")
     for values, lower, upper in (

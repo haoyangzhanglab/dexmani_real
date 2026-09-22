@@ -59,7 +59,7 @@ def arm_loop(shared, config):
         arm.connect()
         _publish_feedback(shared, *arm.read())
         shared.arm_ready.set()
-        rate = LoopRate(config.loop_hz, label="arm")
+        rate = LoopRate(config.loop_hz, label="arm", busy_wait=False)
         while shared.is_running.value:
             if shared.estop_request.value:
                 arm.emergency_stop()

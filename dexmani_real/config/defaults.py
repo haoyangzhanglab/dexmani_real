@@ -18,6 +18,7 @@ from dexmani_real.utils.limits import validate_hand_limit_nesting
 _READINESS_SUBSYSTEMS = frozenset(
     {"arm", "hand", "camera", "pointcloud", "recorder", "policy", "vr"}
 )
+_OBSERVATION_MAX_AGE_PERIODS = 4
 
 
 @dataclass(frozen=True)
@@ -263,7 +264,7 @@ class ArmParams:
     )
     # ~14.14 rad/s²; ~71% of the 20 rad/s² SDK limit.
     max_joint_acceleration_deg_per_s2: float = 810.0
-    loop_hz: float = 30.0  # arm_loop servo rate
+    loop_hz: float = 30.0  # worker command-admission / feedback-update rate
 
     ip: str = "192.168.1.111"
 
@@ -277,6 +278,10 @@ class ArmParams:
     tcp_load_cog_mm: tuple[float, float, float] = (16.3, 7.9, 109.5)
 
     homing: HomingParams = field(default_factory=HomingParams)
+
+    @property
+    def feedback_max_age_s(self) -> float:
+        return _OBSERVATION_MAX_AGE_PERIODS / self.loop_hz
 
     @property
     def max_joint_velocity_rad_per_s(self) -> float:
@@ -445,7 +450,8 @@ class HandParams:
         300,
     )
 
-    loop_hz: float = 30.0
+    loop_hz: float = 30.0  # worker command-admission / feedback-update rate
+    state_read_failure_timeout_s: float = 1.0
 
 
     home_timeout_s: float = 1.0
@@ -458,6 +464,10 @@ class HandParams:
         0.707107,
         0.0,
     )
+
+    @property
+    def feedback_max_age_s(self) -> float:
+        return _OBSERVATION_MAX_AGE_PERIODS / self.loop_hz
 
     def validate(self) -> None:
         if self.ethercat_slave_position < -1:
@@ -532,6 +542,8 @@ class HandParams:
             )
         if not np.isfinite(self.loop_hz) or self.loop_hz <= 0:
             raise ValueError("hand loop_hz must be finite and positive")
+        if not np.isfinite(self.state_read_failure_timeout_s) or self.state_read_failure_timeout_s <= 0:
+            raise ValueError("hand state_read_failure_timeout_s must be finite and positive")
         if (
             not np.isfinite(self.home_timeout_s)
             or self.home_timeout_s <= 0
@@ -570,8 +582,6 @@ class TeleopTimingParams:
 class PolicyParams:
     """Shared experiment/control settings; learned policy timing is PolicySpec-owned."""
 
-    arm_state_stale_threshold_s: float = 0.5
-    hand_state_stale_threshold_s: float = 1.0
     quit_save_timeout_s: float = 30.0
     post_teleop_timeout_s: float = 60.0
 
@@ -586,8 +596,6 @@ class PolicyParams:
     min_record_duration_s: float = 1.0
     episodes_dir: str = "episodes"
 
-    max_consecutive_errors: int = 10
-
     ik_max_pose_error_pos_m: float = 0.02
     ik_max_pose_error_rot_rad: float = np.deg2rad(5.0)
     ik_nullspace_step_rate_deg_s: float = 50.0
@@ -595,18 +603,15 @@ class PolicyParams:
 
     hand_enabled: bool = True
     hand_retargeting_type: str = "tag"
-    hand_disconnect_timeout_s: float = 1.0
 
     def validate(self) -> None:
         timing = (
-            self.arm_state_stale_threshold_s,
-            self.hand_state_stale_threshold_s,
             self.quit_save_timeout_s,
             self.post_teleop_timeout_s,
         )
         if not all(np.isfinite(value) and value > 0 for value in timing):
             raise ValueError(
-                "policy action, freshness, and operator timeouts must be finite and positive"
+                "policy operator timeouts must be finite and positive"
             )
         if (
             not np.isfinite(self.max_record_duration_s)
@@ -618,13 +623,8 @@ class PolicyParams:
             raise ValueError(
                 "recording durations must be finite, ordered, and non-negative"
             )
-        if (
-            not self.episodes_dir
-            or self.max_consecutive_errors <= 0
-        ):
-            raise ValueError(
-                "policy output path and diagnostic intervals must be valid"
-            )
+        if not self.episodes_dir:
+            raise ValueError("policy episodes_dir must be non-empty")
         if (
             not np.isfinite(self.ik_max_pose_error_pos_m)
             or not np.isfinite(self.ik_max_pose_error_rot_rad)
@@ -636,11 +636,6 @@ class PolicyParams:
             raise ValueError("policy teleop IK limits must be finite and positive")
         if self.hand_retargeting_type not in {"tag", "dexpilot"}:
             raise ValueError("hand_retargeting_type must be 'tag' or 'dexpilot'")
-        if (
-            not np.isfinite(self.hand_disconnect_timeout_s)
-            or self.hand_disconnect_timeout_s <= 0
-        ):
-            raise ValueError("hand_disconnect_timeout_s must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -865,7 +860,6 @@ class CameraParams:
     height: int = 480
     fps: int = 30
     warmup_frames: int = 10
-    max_frame_age_s: float = 0.25
     # Missing frames beyond this interval fail the camera workflow.
     source_stall_timeout_s: float = 2.0
     l515_visual_preset: int = 5
@@ -876,6 +870,10 @@ class CameraParams:
     ring_maxlen: int = 5
 
     @property
+    def max_frame_age_s(self) -> float:
+        return _OBSERVATION_MAX_AGE_PERIODS / self.fps
+
+    @property
     def rgb_shape(self) -> tuple[int, int, int]:
         return (self.height, self.width, 3)
 
@@ -884,19 +882,16 @@ class CameraParams:
         return (self.height, self.width)
 
     def validate(self) -> None:
-        if self.width <= 0 or self.height <= 0 or self.fps <= 0:
+        if self.width <= 0 or self.height <= 0 or not np.isfinite(self.fps) or self.fps <= 0:
             raise ValueError("camera width, height, and fps must be > 0")
         if self.warmup_frames < 0:
             raise ValueError("camera warmup_frames must be >= 0")
         if (
-            not np.isfinite(self.max_frame_age_s)
-            or self.max_frame_age_s <= 0
-            or not np.isfinite(self.source_stall_timeout_s)
+            not np.isfinite(self.source_stall_timeout_s)
             or self.source_stall_timeout_s <= self.max_frame_age_s
         ):
             raise ValueError(
-                "camera frame age and stall thresholds must be finite and positive, "
-                "with both stall timeouts greater than max frame age"
+                "camera source_stall_timeout_s must be finite and greater than derived max frame age"
             )
         if (
             not isinstance(self.l515_visual_preset, int)

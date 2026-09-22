@@ -33,7 +33,7 @@ def replay_episode(trajectory, runtime, config):
     shared = RuntimeChannels.create(prefix=f"replay_{os.getpid()}",
         config=RuntimeChannelsConfig.from_runtime(runtime), mp_context=ctx)
     processes = [ctx.Process(name="arm", target=arm_loop, args=(shared, runtime.arm)),
-                 ctx.Process(name="hand", target=hand_loop, args=(shared, runtime.hand, runtime.policy.hand_disconnect_timeout_s))]
+                 ctx.Process(name="hand", target=hand_loop, args=(shared, runtime.hand))]
     started = []
     keyboard = KeyboardInput(estop_callback=lambda: setattr(shared.estop_request, "value", True))
     outcome = ReplayOutcome(ReplayStatus.REJECTED, reason="startup failed")

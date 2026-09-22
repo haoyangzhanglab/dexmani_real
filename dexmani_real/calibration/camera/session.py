@@ -113,6 +113,7 @@ def _detect_aruco_stable(
     *,
     marker_size_m: float,
     target_id: int | None,
+    max_frame_age_s: float,
     n_frames: int = 5,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Capture N frames and return median ArUco pose for noise reduction."""
@@ -123,7 +124,7 @@ def _detect_aruco_stable(
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             frame = read_camera_frame(pipeline)
-            if frame and frame["timestamp_ns"] > last_stamp and sample_is_fresh(frame["timestamp_ns"], 0.25):
+            if frame and frame["timestamp_ns"] > last_stamp and sample_is_fresh(frame["timestamp_ns"], max_frame_age_s):
                 break
             time.sleep(0.01)
         else:
@@ -208,6 +209,7 @@ def _capture_calibration_sample(
             distortion,
             marker_size_m=aruco_config.marker_size_m,
             target_id=aruco_config.target_id,
+            max_frame_age_s=runtime.camera.max_frame_age_s,
             n_frames=aruco_config.capture_frames,
         )
     except Exception as exc:
@@ -256,7 +258,7 @@ def _read_stationary_calibration_arm_state(
     arm_state = read_arm_state_dict(shared)
     if arm_state is None:
         return None, "arm state unavailable"
-    if not sample_is_fresh(arm_state["timestamp_ns"], runtime.policy.arm_state_stale_threshold_s):
+    if not sample_is_fresh(arm_state["timestamp_ns"], runtime.arm.feedback_max_age_s):
         return None, "arm feedback stale"
     max_velocity_rad_s = float(np.max(np.abs(np.asarray(arm_state["qvel"]))))
     velocity_convergence_rad_s = float(runtime.arm.homing.velocity_convergence_rad_s)
@@ -438,11 +440,12 @@ def _show_calibration_preview(
     aruco_cfg: ArucoConfig,
     marker_corners: np.ndarray,
     previous_image: np.ndarray | None,
+    max_frame_age_s: float,
 ) -> np.ndarray | None:
     """Poll and display the newest camera preview without blocking control."""
     frame = read_camera_frame(pipeline)
     display_image = previous_image
-    if frame and sample_is_fresh(frame["timestamp_ns"], 0.25):
+    if frame and sample_is_fresh(frame["timestamp_ns"], max_frame_age_s):
         image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
         display_image, _ = draw_calibration_overlay(
             image,
@@ -611,7 +614,7 @@ def _run_calibration_control_loop(
     aruco_cfg: ArucoConfig,
 ) -> int:
     """Run control logic while borrowing already-started session resources."""
-    max_age = runtime.policy.arm_state_stale_threshold_s
+    max_age = runtime.arm.feedback_max_age_s
     state = CalibrationLoopState.from_arm_state(initial_state)
     marker_corners = marker_corners_3d(aruco_cfg.marker_size_m)
     preview_detector = cv2.aruco.ArucoDetector(
@@ -645,6 +648,7 @@ def _run_calibration_control_loop(
             aruco_cfg,
             marker_corners,
             display_image,
+            runtime.camera.max_frame_age_s,
         )
         _handle_calibration_sample_events(
             shared,
@@ -732,7 +736,7 @@ def run_camera_calibration(
     ctx = mp.get_context("spawn")
     shared = RuntimeChannels.create(
         prefix=f"dexmani_calib_{os.getpid()}",
-        config=RuntimeChannelsConfig.from_runtime(runtime, camera_requested=True),
+        config=RuntimeChannelsConfig.from_runtime(runtime),
         mp_context=ctx,
     )
     processes: list[Any] = []

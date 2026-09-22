@@ -79,8 +79,7 @@ def run_policy_deployment(runtime, policy_spec, worker_config, execute, *, prefi
     points = fields["point_cloud"].shape[0] if cloud else runtime.pointcloud.num_points
     ctx = mp.get_context("spawn")
     shared = RuntimeChannels.create(prefix=prefix or f"dexmani_policy_{os.getpid()}", mp_context=ctx,
-        config=RuntimeChannelsConfig.from_runtime(runtime, pointcloud_num_points=points,
-                                                 camera_requested=camera, pointcloud_requested=cloud))
+        config=RuntimeChannelsConfig.from_runtime(runtime, pointcloud_num_points=points))
     started = []
     operator_stop = threading.Event()
     operator_thread = None
@@ -90,7 +89,7 @@ def run_policy_deployment(runtime, policy_spec, worker_config, execute, *, prefi
             FingertipAssemblerConfig.from_runtime(runtime) if "fingertip_points" in fields else None))
         start_processes(shared, [policy], runtime.safety.readiness_timeouts_s, started)
         sensors = [ctx.Process(name="arm", target=arm_loop, args=(shared, runtime.arm)),
-                   ctx.Process(name="hand", target=hand_loop, args=(shared, runtime.hand, runtime.policy.hand_disconnect_timeout_s))]
+                   ctx.Process(name="hand", target=hand_loop, args=(shared, runtime.hand))]
         if camera:
             sensors.append(ctx.Process(name="camera", target=camera_loop, args=(shared, CameraLoopConfig.from_runtime(runtime))))
         if cloud:

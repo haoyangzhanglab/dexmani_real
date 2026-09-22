@@ -8,6 +8,7 @@ from dexmani_real.planning import OnlineIKConfig, XArm7MotionPlanner
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
 from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.recording.client import RecorderClient
+from dexmani_real.recording.storage.schema import FRAME_OK, FRAME_IK_FAIL
 from dexmani_real.runtime.observation import read_observation
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.safety import begin_motion, revoke_motion
@@ -20,6 +21,9 @@ from dexmani_real.teleop.vr_transform import load_vr_transform
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
+_DEBUG_FAILURE_LIMIT = 10
+
+
 def _build_hand_retargeter(config: TeleopConfig):
     """Build the configured hand retargeter without owning runtime state."""
     if not config.runtime.policy.hand_enabled:
@@ -163,6 +167,7 @@ def teleop_loop(shared, config):
                         stop(False, "begin_unavailable")
                         continue
                     active = True
+                    failures = 0
                     shared.is_recording.value = recorder is not None
                     next_tick = time.monotonic()
                     audio.play("begin")
@@ -199,10 +204,14 @@ def teleop_loop(shared, config):
                         next_tick = time.monotonic()
                         audio.play("resume")
                 continue
+            recording = recorder is not None and recorder.is_recording
             status = run_control_grid_tick(controller, shared, row, recorder)
+            if recording and status != FRAME_OK:
+                stop(True, "ik_failure" if status == FRAME_IK_FAIL else "retarget_failure", incomplete=True)
+                continue
             next_tick = tick_started + 1/runtime.teleop.control_hz
-            failures = failures + 1 if status else 0
-            if failures >= runtime.policy.max_consecutive_errors:
+            failures = failures + 1 if status != FRAME_OK else 0
+            if failures >= _DEBUG_FAILURE_LIMIT:
                 pause(True)
     except Exception:
         shared.workflow_failed.value = True

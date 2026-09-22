@@ -16,22 +16,19 @@ from dexmani_real.robot.model import (
     HAND_TACTILE_SUM_SHAPE,
 )
 
-# Realtime point-cloud transport is fixed-size per deployment. Keeping the
-# supported sizes explicit prevents a model/RuntimeChannels shape mismatch from
-# reaching the inference boundary.
+# Realtime point-cloud transport is fixed-size per deployment.
 POINT_CLOUD_FEATURE_DIM = 6
-SUPPORTED_POINT_CLOUD_COUNTS = frozenset({1024, 2048, 4096, 8192})
 
 
 def make_pointcloud_frame_dtype(num_points: int) -> np.dtype:
     """Return the latest-only realtime point-cloud IPC schema."""
     if (
         isinstance(num_points, bool)
-        or int(num_points) not in SUPPORTED_POINT_CLOUD_COUNTS
+        or not isinstance(num_points, (int, np.integer))
+        or num_points <= 0
     ):
         raise ValueError(
-            "point-cloud count must be one of "
-            f"{sorted(SUPPORTED_POINT_CLOUD_COUNTS)}, got {num_points!r}"
+            f"point-cloud count must be a positive integer, got {num_points!r}"
         )
     count = int(num_points)
     return np.dtype(
@@ -51,7 +48,7 @@ def validate_point_cloud_array(
     label: str = "point_cloud",
 ) -> np.ndarray:
     """Validate the canonical finite ``float32[N,6]`` xyzrgb payload."""
-    if isinstance(num_points, bool) or int(num_points) <= 0:
+    if isinstance(num_points, bool) or not isinstance(num_points, (int, np.integer)) or num_points <= 0:
         raise ValueError("num_points must be a positive integer")
     array = np.asarray(value)
     expected_shape = (int(num_points), POINT_CLOUD_FEATURE_DIM)
@@ -137,7 +134,6 @@ __all__ = [
     "ROBOT_COMMAND_DTYPE",
     "HAND_STATE_DTYPE",
     "POINT_CLOUD_FEATURE_DIM",
-    "SUPPORTED_POINT_CLOUD_COUNTS",
     "VR_FRAME_DTYPE",
     "make_pointcloud_frame_dtype",
     "make_record_sample_dtype",

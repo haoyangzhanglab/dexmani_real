@@ -42,7 +42,7 @@ def _send_target(shared, hand, target, run_id, config, accepted, *, home=False):
     return True
 
 
-def hand_loop(shared, config, state_read_failure_timeout_s):
+def hand_loop(shared, config):
     from dexmani_real.robot.drivers.xhand import XHand, XHandSendStatus
     hand = XHand(config)
     last_sequence = 0
@@ -54,14 +54,14 @@ def hand_loop(shared, config, state_read_failure_timeout_s):
             hand.calibrate_tactile()
         except Exception:
             logger.warning("hand tactile calibration failed", exc_info=True)
-        rate = LoopRate(config.loop_hz, label="hand")
+        rate = LoopRate(config.loop_hz, label="hand", busy_wait=False)
         while shared.is_running.value:
             if shared.estop_request.value:
                 break
             state = hand.get_state()
             if state is None:
                 failure_started = failure_started or time.monotonic()
-                if time.monotonic() - failure_started >= state_read_failure_timeout_s:
+                if time.monotonic() - failure_started >= config.state_read_failure_timeout_s:
                     raise RuntimeError("hand joint feedback timed out")
                 rate.wait()
                 continue

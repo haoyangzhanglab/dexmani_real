@@ -28,7 +28,10 @@ xArm、XHand、RealSense、HTS SDK，以及运动学/点云和 dexmani_policy �
     python examples/collect_teleop.py --print-config
     python examples/collect_teleop.py --config experiment.yaml --print-config
 
-VR teleop 的控制频率由 teleop 配置拥有；learned policy 的动作周期由 PolicySpec.control_dt_s 拥有。
+VR teleop 的控制频率由 `teleop.control_hz` 拥有，键盘 / 标定 jog 由 `keyboard_teleop.control_hz` 拥有；learned policy 的动作周期由 `PolicySpec.control_dt_s` 拥有，replay 使用录制轨迹的频率。
+这些动作生产频率不得高于相关执行器的 worker 服务频率（arm-only jog 只受 arm 限制）。`arm.loop_hz` / `hand.loop_hz` 是命令接收和反馈更新频率，不是硬件物理伺服频率。
+正常 arm / hand / camera 观测的新鲜度上限为各自生产周期的 4 倍（30 Hz 时约 133 ms）；点云沿用源相机采集时间。Homing 的 arm 新鲜度、VR 新鲜度和硬件读取失败超时各自独立。
+录制 teleop 的首个 IK / retarget 失败行会保留为诊断数据，并立即停止该无效 episode；录制收尾异步完成。
 
 ## 研究入口
 

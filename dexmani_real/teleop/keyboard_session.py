@@ -28,7 +28,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
         config=RuntimeChannelsConfig.from_runtime(runtime), mp_context=ctx)
     processes = [ctx.Process(name="arm", target=arm_loop, args=(shared, runtime.arm))]
     if runtime.policy.hand_enabled:
-        processes.append(ctx.Process(name="hand", target=hand_loop, args=(shared, runtime.hand, runtime.policy.hand_disconnect_timeout_s)))
+        processes.append(ctx.Process(name="hand", target=hand_loop, args=(shared, runtime.hand)))
     started = []
     keys = KeyboardInput(suppress_echo=True, capture_commands=False,
         estop_callback=lambda: setattr(shared.estop_request, "value", True))
